@@ -1102,13 +1102,26 @@ impl crate::supervisor::SupervisorInner {
         &mut self,
         expected_epoch: Option<u64>,
     ) -> Result<crate::safety::SafetyState, crate::safety::SafetyError> {
-        use crate::safety::SafetyError;
+        use crate::driver::EnableState;
+        use crate::safety::{ClearRefusal, FaultDetail, FaultKind, SafetyError};
         // Single authoritative clear_check FIRST before issuing any recovery disable/reset commands.
         let mut pre_ctx = self.build_mit_recovery_clear_context();
         pre_ctx.expected_epoch = expected_epoch;
-        self.safety
-            .clear_check(&pre_ctx)
-            .map_err(|r| r.into_safety_error())?;
+        pre_ctx.pending_estop = self.estop_request_unapplied();
+        if let Err(refusal) = self.safety.clear_check(&pre_ctx) {
+            if refusal == ClearRefusal::EStopActive {
+                self.consume_pending_estop();
+                if let Some(received) = expected_epoch {
+                    if received != self.safety.epoch_id() {
+                        return Err(SafetyError::EpochMismatch {
+                            expected: self.safety.epoch_id(),
+                            received,
+                        });
+                    }
+                }
+            }
+            return Err(refusal.into_safety_error());
+        }
         let res = match self.driver.as_ref().and_then(|d| d.lock().ok()) {
             Some(mut drv) => drv.mit_expiry_recover(),
             None => Err("no driver".into()),
@@ -1130,20 +1143,111 @@ impl crate::supervisor::SupervisorInner {
         self.mit.last_output = None;
         self.mit.armed_ok = false;
         self.mit.revoke_pending = false;
-        if self.measured_positions.iter().all(|q| q.is_finite()) {
+        self.is_torqued = false;
+        self.disable_pending = false;
+        self.pending_rearm = false;
+
+        // Refresh supervisor feedback from samples received AFTER `drv.mit_expiry_recover()`
+        // confirmed every motor disabled — never evaluate final `clear_check` on pre-recovery
+        // positions or temperatures.
+        let post_read = self.driver.as_ref().and_then(|d| {
+            d.lock().ok().and_then(|mut drv| {
+                let states = drv.read_joint_states().ok()?;
+                let ages = drv.feedback_ages();
+                let loads = drv.joint_loads();
+                let caps = drv.capabilities();
+                let fb_fresh = drv.is_feedback_valid()
+                    && ages.len() == self.config.dof
+                    && ages.iter().all(|a| a.is_some_and(|t| t <= std::time::Duration::from_millis(250)))
+                    && Self::states_valid(&states, caps, self.config.dof, loads.as_deref());
+                let hw_err = drv.check_hardware_status().err().map(|e| e.to_clear_fault_error());
+                let hw_fault = drv.has_hardware_fault();
+                let state = drv.enable_state();
+                let partial = drv.has_known_partial_enable();
+                let enable_known = state != EnableState::Unknown || partial;
+                let oldest_age = ages
+                    .into_iter()
+                    .try_fold(std::time::Duration::ZERO, |m, a| a.map(|t| m.max(t)));
+                Some((
+                    states,
+                    loads,
+                    caps.temperature_feedback,
+                    fb_fresh,
+                    hw_err,
+                    hw_fault,
+                    enable_known,
+                    oldest_age,
+                ))
+            })
+        });
+        let (post_fb_fresh, post_temp_fb, post_hw_err, post_hw_fault, post_enable_known) =
+            if let Some((states, loads, temp_fb, fb_fresh, hw_err, hw_fault, enable_known, oldest_age)) = post_read {
+                self.feedback_numeric_valid = fb_fresh;
+                if fb_fresh {
+                    self.last_can_feedback_instant =
+                        oldest_age.and_then(|age| std::time::Instant::now().checked_sub(age));
+                    Self::apply_feedback(
+                        &mut self.measured_positions,
+                        &mut self.measured_velocities,
+                        &mut self.torques,
+                        &mut self.temperatures,
+                        &mut self.loads,
+                        self.config.dof,
+                        &states,
+                        loads.as_deref(),
+                    );
+                    if temp_fb {
+                        let temps_copy = self.temperatures.clone();
+                        self.update_thermal_cooldown_from_temps(&temps_copy);
+                        if let Some((joint_idx, temperature)) = temps_copy
+                            .iter()
+                            .copied()
+                            .enumerate()
+                            .filter(|(_, t)| t.is_finite() && *t > self.config.max_temperature)
+                            .max_by(|a, b| a.1.total_cmp(&b.1))
+                        {
+                            self.thermal_below_since = None;
+                            self.safety.latch(
+                                FaultKind::ThermalTrip,
+                                FaultDetail::ThermalTrip {
+                                    joint_idx,
+                                    temperature,
+                                    limit: self.config.max_temperature,
+                                },
+                            );
+                        }
+                    } else {
+                        self.thermal_below_since = None;
+                    }
+                } else {
+                    self.last_can_feedback_instant = None;
+                    self.thermal_below_since = None;
+                }
+                (fb_fresh, temp_fb, hw_err, hw_fault, enable_known)
+            } else {
+                self.feedback_numeric_valid = false;
+                self.last_can_feedback_instant = None;
+                self.thermal_below_since = None;
+                (false, false, None, false, false)
+            };
+
+        if post_fb_fresh && self.measured_positions.iter().all(|q| q.is_finite()) {
             crate::rt_core::scratch::copy_into(&mut self.commanded_positions, &self.measured_positions);
             crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.measured_positions);
         }
         self.commanded_velocities.fill(0.0);
         self.commanded_accelerations.fill(0.0);
-        self.is_torqued = false;
-        self.disable_pending = false;
-        self.pending_rearm = false;
-        // an E-stop that arrived while the disables were confirmed wins: never end in Idle.
-        // Clear the resolved MIT fault once clear_check passes, then latch EStop.
+
+        // An E-stop that arrived while the disables were confirmed wins: never end in Idle.
         self.consume_pending_estop();
         let mut post_ctx = self.build_mit_recovery_clear_context();
         post_ctx.expected_epoch = expected_epoch;
+        post_ctx.pending_estop = self.estop_request_unapplied();
+        post_ctx.feedback_fresh = post_fb_fresh;
+        post_ctx.thermal_sensor_available = post_temp_fb;
+        post_ctx.hardware_error = post_hw_err;
+        post_ctx.hardware_reset_required = post_hw_fault;
+        post_ctx.enable_state_known = post_enable_known;
         if let Some(received) = expected_epoch {
             if received != self.safety.epoch_id() {
                 return Err(SafetyError::EpochMismatch {
@@ -1157,10 +1261,20 @@ impl crate::supervisor::SupervisorInner {
             self.apply_stop_policy(crate::safety::StopPolicy::EStopLatch);
             return Err(SafetyError::EStopActive);
         }
-        crate::supervisor::SupervisorInner::check_concurrent_estop(self)?;
-        self.safety
-            .clear_with_check(&post_ctx)
-            .map_err(|r| r.into_safety_error())?;
+        if let Err(refusal) = self.safety.clear_with_check(&post_ctx) {
+            if refusal == ClearRefusal::EStopActive {
+                self.consume_pending_estop();
+                if let Some(received) = expected_epoch {
+                    if received != self.safety.epoch_id() {
+                        return Err(SafetyError::EpochMismatch {
+                            expected: self.safety.epoch_id(),
+                            received,
+                        });
+                    }
+                }
+            }
+            return Err(refusal.into_safety_error());
+        }
         let _ = self.safety.set_torque(false);
         if self.e_stop_latched.load(std::sync::atomic::Ordering::SeqCst) {
             self.apply_stop_policy(crate::safety::StopPolicy::EStopLatch);

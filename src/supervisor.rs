@@ -1672,13 +1672,6 @@ impl SupervisorInner {
         }
     }
 
-    pub(crate) fn check_concurrent_estop(inner: &mut SupervisorInner) -> Result<(), SafetyError> {
-        if inner.consume_pending_estop() {
-            return Err(SafetyError::EStopActive);
-        }
-        Ok(())
-    }
-
     /// Updates continuous cooldown tracking from `temps` against `max_temperature - THERMAL_CLEAR_MARGIN_C`.
     pub(crate) fn update_thermal_cooldown_from_temps(&mut self, temps: &[f32]) {
         let threshold = self.config.max_temperature - THERMAL_CLEAR_MARGIN_C;

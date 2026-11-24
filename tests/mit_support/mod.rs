@@ -160,6 +160,8 @@ pub struct FakeBusState {
     pub immediate_replies: bool,
     /// Called on every disable frame the transport accepts (inject events mid-sequence).
     pub on_disable: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Called on every disable frame with mutable bus state before the disable reply is built.
+    pub on_disable_state: Option<Arc<dyn Fn(&mut FakeBusState) + Send + Sync>>,
     /// Every frame the driver handed to the transport (also the lost and refused ones), with the
     /// fake time.
     pub tx_log: Vec<CanFrame>,
@@ -367,6 +369,7 @@ impl FakeBus {
             inject_on_reg_write: Vec::with_capacity(32),
             immediate_replies: false,
             on_disable: None,
+            on_disable_state: None,
             tx_log: Vec::with_capacity(2048),
             tx_times: Vec::with_capacity(2048),
             record_tx_log: true,
@@ -425,6 +428,7 @@ impl CanTransport for FakeBus {
         }
         if frame.data == damiao::CMD_DISABLE {
             if let Some(h) = s.on_disable.clone() { h(); }
+            if let Some(h) = s.on_disable_state.clone() { h(&mut s); }
         }
         if !s.inject_on_next_tx.is_empty() {
             let state = &mut *s;

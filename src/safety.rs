@@ -922,6 +922,7 @@ impl std::fmt::Display for ClearFaultDriverError {
 #[allow(clippy::large_enum_variant)] // inline stack storage avoids RT heap allocation
 pub enum ClearRefusal {
     EpochMismatch { expected: u64, received: u64 },
+    EStopActive,
     ShutdownCommitted,
     DriverConfigError(BoundedText<256>),
     GravityCompUnconfirmed,
@@ -931,6 +932,7 @@ pub enum ClearRefusal {
     FreshFeedbackRequiredForRestingSupport,
     RestingPoseSupport(RestingSupportViolation),
     BudgetExpired,
+    HardwareResetRequired,
     HardwareResetSent,
     FreshFeedbackRequired,
     TemperatureConfirmationRequired,
@@ -955,6 +957,7 @@ impl ClearRefusal {
     pub fn into_safety_error(self) -> SafetyError {
         match self {
             Self::EpochMismatch { expected, received } => SafetyError::EpochMismatch { expected, received },
+            Self::EStopActive => SafetyError::EStopActive,
             other => SafetyError::ClearFaultRejected(other.render_message()),
         }
     }
@@ -965,6 +968,7 @@ impl std::fmt::Display for ClearRefusal {
         match self {
             Self::EpochMismatch { expected, received } =>
                 write!(f, "Epoch mismatch: expected {expected}, received {received}. Command invalidated by generation change"),
+            Self::EStopActive => f.write_str("E-Stop is latched, motion rejected"),
             Self::ShutdownCommitted => f.write_str("Daemon shutdown is committed"),
             Self::DriverConfigError(err) => write!(f, "Driver limit configuration error: {err}"),
             Self::GravityCompUnconfirmed => f.write_str("Gravity compensation: the switch back to POS_VEL is not confirmed yet"),
@@ -975,6 +979,7 @@ impl std::fmt::Display for ClearRefusal {
             Self::RestingPoseSupport(violation) =>
                 write!(f, "Cannot disable faulted supporting arm joint away from resting pose ({violation}); support the arm at rest first"),
             Self::BudgetExpired => f.write_str("Clear fault budget expired"),
+            Self::HardwareResetRequired => f.write_str("Hardware fault bit active; motor reset is required before re-evaluating clear conditions"),
             Self::HardwareResetSent => f.write_str("Hardware reset sent; wait for fresh fault-free feedback before retrying"),
             Self::FreshFeedbackRequired => f.write_str("Fresh feedback is required before resetting a fault"),
             Self::TemperatureConfirmationRequired => f.write_str("Temperature must be confirmed below the reset threshold"),
@@ -996,6 +1001,7 @@ impl std::fmt::Display for ClearRefusal {
 #[allow(clippy::large_enum_variant)] // inline stack storage avoids RT heap allocation
 pub struct ClearContext {
     pub expected_epoch: Option<u64>,
+    pub pending_estop: bool,
     pub shutdown_committed: bool,
     pub driver_config_error: Option<BoundedText<256>>,
     pub gravity_comp_unconfirmed: bool,
@@ -1010,6 +1016,13 @@ pub struct ClearContext {
     pub lease_heartbeat_fresh: bool,
     pub joints_within_limits: bool,
     pub enable_state_known: bool,
+    /// True when the driver reports a latched motor fault bit that requires a motor reset
+    /// before it can clear. `clear_check` permits this reset ONLY after every OTHER recorded
+    /// kind's condition has passed, returning [`ClearRefusal::HardwareResetRequired`].
+    pub hardware_reset_required: bool,
+    /// True immediately after a permitted motor reset has been transmitted; `clear_check`
+    /// returns [`ClearRefusal::HardwareResetSent`] until fresh fault-free feedback confirms recovery.
+    pub hardware_reset_sent: bool,
     pub hardware_error: Option<ClearFaultDriverError>,
     pub resting_pose_violation: Option<RestingSupportViolation>,
     pub resting_feedback_missing: bool,
@@ -1022,6 +1035,7 @@ impl ClearContext {
     pub const fn all_conditions_met() -> Self {
         Self {
             expected_epoch: None,
+            pending_estop: false,
             shutdown_committed: false,
             driver_config_error: None,
             gravity_comp_unconfirmed: false,
@@ -1036,6 +1050,8 @@ impl ClearContext {
             lease_heartbeat_fresh: true,
             joints_within_limits: true,
             enable_state_known: true,
+            hardware_reset_required: false,
+            hardware_reset_sent: false,
             hardware_error: None,
             resting_pose_violation: None,
             resting_feedback_missing: false,
@@ -1072,6 +1088,7 @@ impl From<ClearFaultRefusal> for ClearFaultError {
     fn from(r: ClearFaultRefusal) -> Self {
         match r {
             ClearFaultRefusal::EpochMismatch { expected, received } => Self::EpochMismatch { expected, received },
+            ClearFaultRefusal::EStopActive => Self::EStopActive,
             other => Self::Rejected(other),
         }
     }
@@ -1812,10 +1829,12 @@ impl SafetyManager {
         self.epoch_id
     }
 
-    /// Single authoritative clear check evaluated BEFORE any clear path resets the fault record.
+    /// Single authoritative clear check evaluated FIRST on every clear path, before any motor
+    /// reset or other side effect.
     ///
-    /// Evaluates common supervisor blockers and the explicit per-kind condition table over EVERY
-    /// recorded bit in `latched_fault_kinds`. Any bit without an explicit rule refuses to clear
+    /// Evaluates universal supervisor blockers and the explicit per-kind condition table over
+    /// EVERY recorded bit in `latched_fault_kinds` BEFORE permitting a motor fault reset
+    /// ([`ClearRefusal::HardwareResetRequired`]). Any unknown kind bit refuses to clear
     /// (fail closed). Performs zero heap allocations.
     #[allow(clippy::result_large_err)] // inline refusal keeps RT clear_fault zero-alloc
     pub fn clear_check(&self, ctx: &ClearContext) -> Result<(), ClearRefusal> {
@@ -1826,6 +1845,9 @@ impl SafetyManager {
                     received,
                 });
             }
+        }
+        if ctx.pending_estop {
+            return Err(ClearRefusal::EStopActive);
         }
         if ctx.shutdown_committed {
             return Err(ClearRefusal::ShutdownCommitted);
@@ -1858,8 +1880,9 @@ impl SafetyManager {
             return Err(ClearRefusal::UnknownFaultKind);
         }
 
-        // Per-kind condition table evaluated over EVERY recorded kind.
-        // Order: BusLoss (fresh feedback) -> hardware/enable -> ThermalTrip -> WatchdogTimeout -> JointLimit -> remaining kinds.
+        // Per-kind condition table evaluated over EVERY recorded kind BEFORE any motor reset
+        // exception (`hardware_reset_required`) or hardware-error check: a motor reset is ONLY
+        // permitted after every OTHER recorded kind's condition has passed.
         const CHECK_ORDER: [FaultKind; FaultKind::COUNT] = [
             FaultKind::BusLoss,
             FaultKind::ThermalTrip,
@@ -1880,19 +1903,10 @@ impl SafetyManager {
                     if !ctx.feedback_fresh {
                         return Err(ClearRefusal::FreshFeedbackRequired);
                     }
-                    if let Some(err) = ctx.hardware_error {
-                        return Err(ClearRefusal::DriverError(err));
-                    }
-                    if ctx.has_driver && !ctx.enable_state_known {
-                        return Err(ClearRefusal::EnableStateUnknown);
-                    }
                 }
                 FaultKind::ThermalTrip => {
                     if ctx.has_driver && !ctx.feedback_fresh {
                         return Err(ClearRefusal::FreshFeedbackRequired);
-                    }
-                    if let Some(err) = ctx.hardware_error {
-                        return Err(ClearRefusal::DriverError(err));
                     }
                     if !ctx.thermal_sensor_available || !ctx.thermal_below_threshold {
                         return Err(if ctx.has_driver {
@@ -1907,47 +1921,26 @@ impl SafetyManager {
                             required_ms: ctx.thermal_cooldown_required_ms,
                         });
                     }
-                    if ctx.has_driver && !ctx.enable_state_known {
-                        return Err(ClearRefusal::EnableStateUnknown);
-                    }
                 }
                 FaultKind::WatchdogTimeout => {
                     if ctx.has_driver && !ctx.feedback_fresh {
                         return Err(ClearRefusal::FreshFeedbackRequired);
                     }
-                    if let Some(err) = ctx.hardware_error {
-                        return Err(ClearRefusal::DriverError(err));
-                    }
                     if ctx.has_active_lease && !ctx.lease_heartbeat_fresh {
                         return Err(ClearRefusal::WatchdogHeartbeatRequired);
-                    }
-                    if ctx.has_driver && !ctx.enable_state_known {
-                        return Err(ClearRefusal::EnableStateUnknown);
                     }
                 }
                 FaultKind::JointLimit => {
                     if ctx.has_driver && !ctx.feedback_fresh {
                         return Err(ClearRefusal::FreshFeedbackRequired);
                     }
-                    if let Some(err) = ctx.hardware_error {
-                        return Err(ClearRefusal::DriverError(err));
-                    }
                     if !ctx.joints_within_limits {
                         return Err(ClearRefusal::JointLimitsNotSatisfied);
-                    }
-                    if ctx.has_driver && !ctx.enable_state_known {
-                        return Err(ClearRefusal::EnableStateUnknown);
                     }
                 }
                 FaultKind::CollisionLatched | FaultKind::Estop | FaultKind::Other => {
                     if ctx.has_driver && !ctx.feedback_fresh {
                         return Err(ClearRefusal::FreshFeedbackRequired);
-                    }
-                    if let Some(err) = ctx.hardware_error {
-                        return Err(ClearRefusal::DriverError(err));
-                    }
-                    if ctx.has_driver && !ctx.enable_state_known {
-                        return Err(ClearRefusal::EnableStateUnknown);
                     }
                 }
             }
@@ -1960,9 +1953,16 @@ impl SafetyManager {
                 return Err(ClearRefusal::UnknownFaultKind);
             }
         }
-        if !checked_any && self.state_arc.is_stopped() {
-            if ctx.has_driver && !ctx.feedback_fresh {
-                return Err(ClearRefusal::FreshFeedbackRequired);
+        if !checked_any && self.state_arc.is_stopped() && ctx.has_driver && !ctx.feedback_fresh {
+            return Err(ClearRefusal::FreshFeedbackRequired);
+        }
+        // Hardware-fault reset & status checks run ONLY after every other recorded kind passed.
+        if checked_any || self.state_arc.is_stopped() {
+            if ctx.hardware_reset_sent {
+                return Err(ClearRefusal::HardwareResetSent);
+            }
+            if ctx.hardware_reset_required {
+                return Err(ClearRefusal::HardwareResetRequired);
             }
             if let Some(err) = ctx.hardware_error {
                 return Err(ClearRefusal::DriverError(err));

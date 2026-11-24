@@ -2134,3 +2134,284 @@ async fn every_latch_advances_epoch_and_stale_clear_refuses_newer_estop_with_epo
     assert_eq!(sup.get_observation().await.safety_state, SafetyState::Fault(FaultReason::BusLoss));
     assert!(sup.e_stop_latched.load(Ordering::SeqCst));
 }
+
+#[test]
+fn clear_check_runs_before_motor_reset_on_legacy_and_executor_paths() {
+    use armd::protocol::damiao;
+
+    for use_executor in [false, true] {
+        let clock = MockClock::new();
+        let limits = dm_limits();
+        let bus = FakeBus::with_clock(&limits, clock.clone());
+        bus.with(|s| {
+            s.immediate_replies = true;
+            s.push_all_feedback();
+        });
+        let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits.clone())
+            .unwrap();
+        drv.read_joint_states().unwrap();
+        drv.check_mapping_ranges();
+        let mut cfg = ArmConfig::rebot_dm();
+        cfg.max_temperature = 75.0;
+        cfg.resting_pose = None;
+        let mut inner = SupervisorInner::new(cfg.clone()).with_driver(Box::new(drv));
+        inner.lease_enabled = false;
+        inner.safety.set_off_thread_reclaim(use_executor);
+        inner.tick(0.02);
+
+        // Latch ThermalTrip (hot 85 C) + JointLimit + motor 0 fault bit (0x0A) with torque off
+        // (so `disable_pending` is false and per-kind `clear_check` conditions gate the motor reset).
+        assert!(!inner.disable_pending);
+        bus.with(|s| {
+            s.motors[0].state_override = Some(0x0A);
+            s.motors[0].temperature_c = 85;
+            s.motors[0].q = cfg.limits[0].max_position + 0.3;
+            s.push_all_feedback();
+        });
+        let _ = inner.poll_hardware(&ServiceBudget::for_release(clock.now(), clock.now() + Duration::from_millis(20)));
+        inner.safety.latch(
+            FaultKind::ThermalTrip,
+            FaultDetail::ThermalTrip { joint_idx: 0, temperature: 85.0, limit: 75.0 },
+        );
+        inner.safety.latch(
+            FaultKind::JointLimit,
+            FaultDetail::formatted(FaultCode::JointLimit, |b| b.push_str("joint 1 out of bounds")),
+        );
+
+        alloc::time_this_thread();
+        let count_resets = || {
+            bus.tx_log()
+                .iter()
+                .filter(|f| f.data == damiao::CMD_CLEAR_FAULTS)
+                .count()
+        };
+
+        // 1. Hot ThermalTrip MUST refuse BEFORE any motor reset command is transmitted!
+        bus.clear_log();
+        if use_executor {
+            let _ = alloc::take();
+            let err = inner.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)).unwrap_err();
+            assert_eq!(alloc::take().calls, 0, "executor thermal refusal before reset allocated");
+            assert_eq!(err, ClearFaultError::Rejected(ClearRefusal::TemperatureConfirmationRequired));
+        } else {
+            let err = inner.clear_fault().unwrap_err();
+            assert!(err.to_string().contains("Temperature must be confirmed below the reset threshold"), "{err}");
+        }
+        assert_eq!(count_resets(), 0, "use_executor={use_executor}: hot ThermalTrip must block motor reset");
+
+        // 2. Cool motor 0, keep joint 0 out of limits -> JointLimit MUST refuse BEFORE any motor reset!
+        bus.with(|s| {
+            s.motors[0].temperature_c = 35;
+            s.push_all_feedback();
+        });
+        let _ = inner.poll_hardware(&ServiceBudget::for_release(clock.now(), clock.now() + Duration::from_millis(20)));
+        bus.clear_log();
+        if use_executor {
+            let _ = alloc::take();
+            let err = inner.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)).unwrap_err();
+            assert_eq!(alloc::take().calls, 0, "executor joint-limit refusal before reset allocated");
+            assert_eq!(err, ClearFaultError::Rejected(ClearRefusal::JointLimitsNotSatisfied));
+        } else {
+            let err = inner.clear_fault().unwrap_err();
+            assert!(err.to_string().contains("within limits"), "{err}");
+        }
+        assert_eq!(count_resets(), 0, "use_executor={use_executor}: JointLimit must block motor reset");
+
+        // 3. Bring joint 0 back within limits, but inject a pending E-stop -> EStopActive MUST refuse BEFORE reset!
+        bus.with(|s| {
+            s.motors[0].q = cfg.home_positions[0];
+            s.push_all_feedback();
+        });
+        let _ = inner.poll_hardware(&ServiceBudget::for_release(clock.now(), clock.now() + Duration::from_millis(20)));
+        inner.requested_estop_count.fetch_add(1, Ordering::SeqCst);
+        bus.clear_log();
+        if use_executor {
+            let _ = alloc::take();
+            let err = inner.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)).unwrap_err();
+            assert_eq!(alloc::take().calls, 0, "executor pending-estop refusal before reset allocated");
+            assert_eq!(err, ClearFaultError::EStopActive);
+        } else {
+            let err = inner.clear_fault().unwrap_err();
+            assert_eq!(err, SafetyError::EStopActive);
+        }
+        assert_eq!(count_resets(), 0, "use_executor={use_executor}: pending E-stop must block motor reset");
+
+        // 4. Now every OTHER recorded kind passes -> motor reset IS permitted once, and clear_check
+        // re-evaluates after reset returning HardwareResetSent.
+        bus.clear_log();
+        if use_executor {
+            let _ = alloc::take();
+            let err = inner.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)).unwrap_err();
+            assert_eq!(alloc::take().calls, 0, "executor HardwareResetSent allocated");
+            assert_eq!(err, ClearFaultError::Rejected(ClearRefusal::HardwareResetSent));
+        } else {
+            let err = inner.clear_fault().unwrap_err();
+            assert!(err.to_string().contains("Hardware reset sent"), "{err}");
+        }
+        assert!(count_resets() >= 1, "use_executor={use_executor}: permitted reset must transmit CMD_CLEAR_FAULTS");
+
+        // 5. Motor clears fault bit & sends fresh fault-free feedback -> subsequent clear passes full clear_check!
+        bus.with(|s| {
+            s.motors[0].state_override = None;
+            s.push_all_feedback();
+        });
+        let _ = inner.poll_hardware(&ServiceBudget::for_release(clock.now(), clock.now() + Duration::from_millis(20)));
+        // Two-stage clear because step 3 consumed pending E-stop into `e_stop_latched`.
+        if use_executor {
+            let s1 = inner.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)).unwrap();
+            assert_eq!(s1, SafetyState::EStop);
+            inner.safety.drain_retired_state_arcs_off_thread();
+            let s2 = inner.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)).unwrap();
+            assert_eq!(s2, SafetyState::Idle);
+        } else {
+            let s1 = inner.clear_fault().unwrap();
+            assert_eq!(s1, SafetyState::EStop);
+            let s2 = inner.clear_fault().unwrap();
+            assert_eq!(s2, SafetyState::Idle);
+        }
+    }
+}
+
+#[test]
+fn mit_expiry_recovery_final_check_uses_post_recovery_feedback() {
+    use armd::mit::{self, MitJointQualification, MitQualificationFile};
+    use armd::protocol::damiao;
+    use armd::tracking::{JointTrackingConfig, TrackingStrategy};
+
+    const DT: f64 = 0.02;
+    let setup_expired_mit = || {
+        let clock = MockClock::new();
+        let limits = dm_limits();
+        let bus = FakeBus::with_clock(&limits, clock.clone());
+        bus.with(|s| {
+            s.motors[3].set_reg_u32(damiao::RID_TIMEOUT, 2000);
+            s.immediate_replies = true;
+            s.push_all_feedback();
+        });
+        let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits.clone())
+            .unwrap();
+        drv.read_joint_states().unwrap();
+        drv.check_mapping_ranges();
+
+        let mut jt = JointTrackingConfig::rebot_dm();
+        jt.enabled = true;
+        for j in &mut jt.joints { j.strategy = TrackingStrategy::Position; }
+        let j4 = &mut jt.joints[3];
+        j4.strategy = TrackingStrategy::Mit;
+        j4.kp = 10.0;
+        j4.kd = 0.3;
+        j4.hold_kp = Some(12.0);
+        j4.hold_kd = Some(0.4);
+        j4.effort_limit_nm = 3.0;
+        j4.gravity_scale = 1.0;
+        let mut cfg = ArmConfig {
+            lease_timeout_ms: 600_000,
+            workspace: None,
+            joint_tracking: Some(jt),
+            max_temperature: 75.0,
+            ..ArmConfig::rebot_dm()
+        };
+        cfg.max_temperature = 75.0;
+        let mut inner = SupervisorInner::new(cfg.clone()).with_driver(Box::new(drv));
+        let l4 = limits[3];
+        let rec = MitQualificationFile {
+            version: mit::QUALIFICATION_VERSION,
+            joints: vec![MitJointQualification {
+                profile_id: "rebot_b601dm".into(),
+                joint: 4,
+                joint_name: ArmConfig::rebot_dm().joint_names[3].clone(),
+                zero_fingerprint: mit::zero_fingerprint(0.0),
+                motor_id: 4,
+                reply_id: 0x14,
+                esc_id: 4,
+                mst_id: 0x14,
+                sw_ver: mit_support::SW_VER,
+                pmax: l4.p_max,
+                vmax: l4.v_max,
+                tmax: l4.t_max,
+                timeout_raw: 2000,
+                timeout_unit_us: damiao::TIMEOUT_UNIT_US_DOCUMENTED,
+                timeout_unit_verified: true,
+                tested_response: "disabled".into(),
+                measured_expiry_ms: 101.0,
+                worst_latency_ms: 8.0,
+                load_envelope: "unloaded, supported".into(),
+                max_kp: 15.0,
+                max_kd: 0.5,
+                effort_ceiling_nm: 4.0,
+                date: "2026-11-22T00:00:00Z".into(),
+                trace_id: "b3-fix4-test".into(),
+            }],
+            invalidated: None,
+        };
+        inner.set_calibration(Some(armd::calibration::CalibrationFile {
+            mit_qualification: serde_json::to_value(&rec).ok(),
+            ..Default::default()
+        }));
+        inner.lease_enabled = false;
+        inner.set_torque(true).unwrap();
+        for _ in 0..3 { inner.tick(DT); }
+        assert!(inner.mit_active());
+        // Inject partial TX failure -> MIT enters MitOwner::Lost (BusLoss) and J4 command watchdog expires (0x0D).
+        bus.with(|s| s.fail_tx_after = Some(3));
+        inner.tick(DT);
+        assert_eq!(inner.mit.owner, mit::MitOwner::Lost);
+        bus.with(|s| s.fail_tx_after = None);
+        for _ in 0..8 {
+            clock.advance(Duration::from_millis(50));
+            inner.tick(DT);
+        }
+        assert!(bus.with(|s| s.motors[3].state_override == Some(0xD) && !s.motors[3].enabled));
+        (inner, bus, cfg)
+    };
+
+    // (a) Motor 0 is cool (35 C) BEFORE recovery, then jumps to 85 C DURING `mit_expiry_recover()` ->
+    // final check MUST inspect post-recovery temperatures and refuse to clear!
+    {
+        let (mut inner, bus, _cfg) = setup_expired_mit();
+        inner.safety.latch(
+            FaultKind::ThermalTrip,
+            FaultDetail::ThermalTrip { joint_idx: 0, temperature: 80.0, limit: 75.0 },
+        );
+        // Pre-recovery temperature is cool (35 C). During disable, motor 0 spikes to 85 C!
+        bus.with(|s| {
+            s.motors[0].temperature_c = 35;
+            s.on_disable_state = Some(Arc::new(|st| {
+                st.motors[0].temperature_c = 85;
+            }));
+        });
+        let err = inner.clear_fault_confirmed(true).unwrap_err();
+        assert!(
+            err.to_string().contains("Temperature must be confirmed below the reset threshold"),
+            "post-recovery hot temperature must refuse final MIT clear: {err}"
+        );
+        assert!(inner.safety.state().is_stopped(), "fault must stay latched after hot post-recovery feedback");
+        assert!(inner.safety.has_latched_fault_kind(FaultKind::ThermalTrip));
+    }
+
+    // (b) Joint 0 is at home BEFORE recovery, then moves beyond soft limit DURING `mit_expiry_recover()` ->
+    // final check MUST inspect post-recovery joint positions and refuse to clear!
+    {
+        let (mut inner, bus, cfg) = setup_expired_mit();
+        inner.safety.latch(
+            FaultKind::JointLimit,
+            FaultDetail::formatted(FaultCode::JointLimit, |b| b.push_str("joint 1 out of limits")),
+        );
+        let over_limit = cfg.limits[0].max_position + 0.3;
+        bus.with(|s| {
+            s.motors[0].q = cfg.home_positions[0];
+            s.on_disable_state = Some(Arc::new(move |st| {
+                st.motors[0].q = over_limit;
+            }));
+        });
+        let err = inner.clear_fault_confirmed(true).unwrap_err();
+        assert!(
+            err.to_string().contains("within limits"),
+            "post-recovery out-of-limit joint position must refuse final MIT clear: {err}"
+        );
+        assert!(inner.safety.state().is_stopped(), "fault must stay latched after out-of-limit post-recovery feedback");
+        assert!(inner.safety.has_latched_fault_kind(FaultKind::JointLimit));
+    }
+}
