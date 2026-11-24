@@ -39,10 +39,12 @@ fn posvel_allows_micro_motion_and_respects_configured_limit() {
 #[test]
 fn queued_feedback_is_consumed_before_recovery_check() {
     let mut driver = DamiaoArmDriver::new(MockCanTransport::new(), vec![1]);
-    driver.can_mut().respond_to_transmit(damiao::build_enable_frame(1), feedback_frame(1, 1, 0.0));
+    let fb = feedback_frame(1, 1, 0.0);
+    driver.can_mut().respond_to_transmit(damiao::build_enable_frame(1), fb);
+    driver.can_mut().respond_to_transmit(damiao::build_refresh_frame(1), fb);
     driver.set_torque(true).unwrap();
     let enable_frames = driver.can_mut().take_tx_frames();
-    assert_eq!(enable_frames.len(), 1);
+    assert_eq!(enable_frames.iter().filter(|f| f.data == CMD_ENABLE).count(), 1);
     assert_eq!(enable_frames[0].data, CMD_ENABLE);
 
     // Make the previous sample stale, then queue a fresh sample before polling.
@@ -55,7 +57,9 @@ fn queued_feedback_is_consumed_before_recovery_check() {
 #[test]
 fn recovery_defers_when_rx_budget_is_exhausted() {
     let mut driver = DamiaoArmDriver::new(MockCanTransport::new(), vec![1]);
-    driver.can_mut().respond_to_transmit(damiao::build_enable_frame(1), feedback_frame(1, 1, 0.0));
+    let fb = feedback_frame(1, 1, 0.0);
+    driver.can_mut().respond_to_transmit(damiao::build_enable_frame(1), fb);
+    driver.can_mut().respond_to_transmit(damiao::build_refresh_frame(1), fb);
     driver.set_torque(true).unwrap();
     let _ = driver.can_mut().take_tx_frames();
 
@@ -84,7 +88,9 @@ fn recovery_defers_when_rx_budget_is_exhausted() {
 fn stale_mit_recovery_uses_mit_frame_id() {
     let mut driver = DamiaoArmDriver::new(MockCanTransport::new(), vec![1])
         .with_control_mode(DamiaoControlMode::Mit);
-    driver.can_mut().respond_to_transmit(damiao::build_enable_frame(1), feedback_frame(1, 1, 0.0));
+    let fb = feedback_frame(1, 1, 0.0);
+    driver.can_mut().respond_to_transmit(damiao::build_enable_frame(1), fb);
+    driver.can_mut().respond_to_transmit(damiao::build_refresh_frame(1), fb);
     driver.set_torque(true).unwrap();
     let _ = driver.can_mut().take_tx_frames();
     driver
@@ -117,7 +123,9 @@ fn stale_posvel_gripper_recovery_uses_posvel_frame() {
     let motor_ids: Vec<u16> = (1..=7).collect();
     let mut driver = DamiaoArmDriver::new(MockCanTransport::new(), motor_ids);
     for id in 1..=7 {
-        driver.can_mut().respond_to_transmit(damiao::build_enable_frame(id as u16), feedback_frame(id, 1, 0.0));
+        let fb = feedback_frame(id, 1, 0.0);
+        driver.can_mut().respond_to_transmit(damiao::build_enable_frame(id as u16), fb);
+        driver.can_mut().respond_to_transmit(damiao::build_refresh_frame(id as u16), fb);
     }
     driver.set_torque(true).unwrap();
     let _ = driver.can_mut().take_tx_frames();
@@ -133,12 +141,14 @@ fn stale_posvel_gripper_recovery_uses_posvel_frame() {
 #[test]
 fn test_damiao_set_torque_fast_path_and_rearm_handshake() {
     let mut driver = DamiaoArmDriver::new(MockCanTransport::new(), vec![1]);
-    driver.can_mut().respond_to_transmit(damiao::build_enable_frame(1), feedback_frame(1, 1, 0.0));
+    let fb = feedback_frame(1, 1, 0.0);
+    driver.can_mut().respond_to_transmit(damiao::build_enable_frame(1), fb);
+    driver.can_mut().respond_to_transmit(damiao::build_refresh_frame(1), fb);
 
     // 1. Initial arming: pending_rearm is true, must execute full handshake
     driver.set_torque(true).unwrap();
     let tx1 = driver.can_mut().take_tx_frames();
-    assert_eq!(tx1.len(), 1);
+    assert_eq!(tx1.iter().filter(|f| f.data == CMD_ENABLE).count(), 1);
     assert_eq!(tx1[0].data, CMD_ENABLE);
 
     // 2. Fast-path: motor enabled, feedback valid, state == 1, pending_rearm is false
@@ -155,7 +165,11 @@ fn test_damiao_set_torque_fast_path_and_rearm_handshake() {
     // 4. Arming again: pending_rearm was set to true, fast-path is bypassed and full handshake executes
     driver.set_torque(true).unwrap();
     let tx3 = driver.can_mut().take_tx_frames();
-    assert_eq!(tx3.len(), 1, "Must broadcast enable frame after pending_rearm was set");
+    assert_eq!(
+        tx3.iter().filter(|f| f.data == CMD_ENABLE).count(),
+        1,
+        "Must broadcast enable frame after pending_rearm was set"
+    );
     assert_eq!(tx3[0].data, CMD_ENABLE);
 }
 
@@ -233,8 +247,11 @@ fn test_damiao_write_targets_defers_on_would_block_without_sleeping() {
 #[test]
 fn expired_feedback_does_not_replay_old_motion_on_recovery() {
     let mut driver = DamiaoArmDriver::new(MockCanTransport::new(), vec![1]);
-    driver.can_mut().respond_to_transmit(damiao::build_enable_frame(1), feedback_frame(1, 1, 0.0));
+    let fb = feedback_frame(1, 1, 0.0);
+    driver.can_mut().respond_to_transmit(damiao::build_enable_frame(1), fb);
+    driver.can_mut().respond_to_transmit(damiao::build_refresh_frame(1), fb);
     driver.set_torque(true).unwrap();
+    driver.can_mut().remove_transmit_response(&damiao::build_refresh_frame(1));
     driver.write_joint_targets(&[JointTarget::position(0.8)]).unwrap();
     driver.can_mut().take_tx_frames();
     thread::sleep(Duration::from_millis(260));
@@ -257,17 +274,21 @@ fn all_motors_reporting_disabled_override_cached_enable_flag() {
     // Motor power dip: an unsolicited 0x0 frame after enable invalidates OnConfirmed to Unknown
     // (never claims Enabled and never uses unsolicited 0x0 to claim OffConfirmed).
     let mut driver = DamiaoArmDriver::new(MockCanTransport::new(), vec![1]);
-    driver.can_mut().respond_to_transmit(damiao::build_enable_frame(1), feedback_frame(1, 1, 0.0));
+    let fb_on = feedback_frame(1, 1, 0.0);
+    let fb_off = feedback_frame(1, 0, 0.0);
+    driver.can_mut().respond_to_transmit(damiao::build_enable_frame(1), fb_on);
+    driver.can_mut().respond_to_transmit(damiao::build_refresh_frame(1), fb_on);
     driver.set_torque(true).unwrap();
     driver.read_joint_states().unwrap();
     assert_eq!(driver.enable_state(), EnableState::Enabled);
     thread::sleep(Duration::from_millis(5));
-    driver.can_mut().provide_rx_frame(feedback_frame(1, 0, 0.0));
+    driver.can_mut().provide_rx_frame(fb_off);
     driver.read_joint_states().unwrap();
     assert_eq!(driver.enable_state(), EnableState::Unknown);
 
     // Only a verified disable transaction with post-disable 0x0 confirms Disabled.
-    driver.can_mut().respond_to_transmit(damiao::build_disable_frame(1), feedback_frame(1, 0, 0.0));
+    driver.can_mut().respond_to_transmit(damiao::build_disable_frame(1), fb_off);
+    driver.can_mut().replace_transmit_response(damiao::build_refresh_frame(1), fb_off);
     driver.set_torque(false).unwrap();
     assert_eq!(driver.enable_state(), EnableState::Disabled);
 }

@@ -39,7 +39,9 @@ const DEFAULT_RANGES: [f32; 3] = [12.5, 30.0, 18.0];
 fn enabled_driver(ids: &[u16]) -> DamiaoArmDriver<MockCanTransport> {
     let mut driver = DamiaoArmDriver::new(MockCanTransport::new(), ids.to_vec());
     for &id in ids {
-        driver.can_mut().respond_to_transmit(damiao::build_enable_frame(id), feedback_frame(id as u8, 1, 0.2));
+        let fb = feedback_frame(id as u8, 1, 0.2);
+        driver.can_mut().respond_to_transmit(damiao::build_enable_frame(id), fb);
+        driver.can_mut().respond_to_transmit(damiao::build_refresh_frame(id), fb);
     }
     driver.set_torque(true).unwrap();
     driver.can_mut().take_tx_frames();

@@ -3552,8 +3552,12 @@ fn production_damiao_operations_under_latched_estop_table() {
                     "expected 7 CMD_DISABLE frames: {tx:?}"
                 );
                 assert!(
-                    tx.iter().all(|f| f.data == damiao::CMD_CLEAR_FAULTS || f.data == damiao::CMD_DISABLE),
-                    "mit_expiry_recover must only transmit CMD_CLEAR_FAULTS and CMD_DISABLE: {tx:?}"
+                    tx.iter().all(|f| {
+                        f.data == damiao::CMD_CLEAR_FAULTS
+                            || f.data == damiao::CMD_DISABLE
+                            || (f.id == 0x7FF && f.data[2] == 0xCC)
+                    }),
+                    "mit_expiry_recover must only transmit CMD_CLEAR_FAULTS, CMD_DISABLE, and read-only 0xCC status probes: {tx:?}"
                 );
             },
         ),

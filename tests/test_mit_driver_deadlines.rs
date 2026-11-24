@@ -74,22 +74,23 @@ fn missing_enable_confirmation_retries_only_the_silent_joint_and_fails_at_the_de
 
 #[test]
 fn late_and_lost_confirmations() {
-    // a reply 30 ms late (B601-DM J3 after a set-zero) confirms inside the window
+    // a reply 30 ms late (B601-DM J3 after a set-zero) confirms inside the window;
+    // after the 25 ms retry resets J3's settle window to 45 ms, the retry reply confirms at 55 ms
     let (mut d, bus, clock) = rig();
     bus.with(|s| s.motors[2].torque_reply_delay = ms(30));
     let t0 = clock.now();
     d.set_torque(true).expect("late reply inside the window");
     let took = clock.now().saturating_duration_since(t0);
-    assert!(took >= ms(30) && took < ms(31), "{took:?}");
+    assert!(took >= ms(55) && took < ms(57), "{took:?}");
     assert_eq!(ids(&torque_frames(&bus, t0)), vec![1, 2, 3, 4, 5, 6, 7, 3], "the 25 ms retry goes to J3 only");
 
-    // the first enable frame to J2 is lost: the retry at 25 ms confirms it
+    // the first enable frame to J2 is lost: the retry at 25 ms confirms after the 20 ms settle window (45 ms)
     let (mut d, bus, clock) = rig();
     bus.with(|s| s.motors[1].drop_torque_frames = 1);
     let t0 = clock.now();
     d.set_torque(true).expect("confirmed by the retry");
     let took = clock.now().saturating_duration_since(t0);
-    assert!(took >= ms(25) && took <= ms(26), "{took:?}");
+    assert!(took >= ms(45) && took <= ms(47), "{took:?}");
 
     // a reply arriving exactly at the deadline does not count (window end exclusive) ...
     let (mut d, bus, clock) = rig();
@@ -126,13 +127,13 @@ fn partial_disable_confirmation_is_unconfirmed_not_success() {
     assert_eq!(f[7].2, ms(25));
     assert_eq!(f[8].2, ms(75));
     assert_eq!(clock.now().saturating_duration_since(t0), ms(150), "served at its deadline");
-    assert!(served <= 4, "woken only at the retries and the deadline: {served} services");
+    assert!(served <= 7, "woken only at the post-settle probes, retries, and deadline: {served} services");
 }
 
 #[test]
 fn success_is_withheld_until_confirmation() {
     let (mut d, bus, clock) = rig();
-    bus.with(|s| s.motors[2].torque_reply_delay = ms(10));
+    bus.with(|s| s.motors[2].torque_reply_delay = ms(22));
     let p = d.begin_torque(true).unwrap();
     assert!(matches!(p, TorqueProgress::Pending { .. }));
     assert!(!d.is_enabled());
@@ -143,7 +144,16 @@ fn success_is_withheld_until_confirmation() {
     assert!(d.begin_torque(true).is_err(), "a second enable while one is pending");
     assert!(matches!(d.poll_torque(clock.now() + RX_PASS).unwrap(), TorqueProgress::Pending { .. }));
     assert!(!d.is_enabled());
+    // Inside the 20 ms settle window: still Pending.
     clock.advance(ms(10));
+    assert!(matches!(d.poll_torque(clock.now() + RX_PASS).unwrap(), TorqueProgress::Pending { .. }));
+    assert!(!d.is_enabled());
+    // At 20 ms: J1,J2,J4..J7 confirm post-settle; J3 is still delayed until 22 ms.
+    clock.advance(ms(10));
+    assert!(matches!(d.poll_torque(clock.now() + RX_PASS).unwrap(), TorqueProgress::Pending { .. }));
+    assert!(!d.is_enabled());
+    // At 22 ms: J3's post-settle reply arrives -> Confirmed.
+    clock.advance(ms(2));
     assert_eq!(d.poll_torque(clock.now() + RX_PASS).unwrap(), TorqueProgress::Done(TorqueOutcome::Confirmed));
     assert!(d.is_enabled());
     d.write_joint_targets(&hold).expect("targets after the confirmation");
@@ -334,13 +344,14 @@ fn service_deadline_caps_the_receive_pass() {
     bus.with(|s| s.rx_step = Duration::from_micros(100));
     let p = d.begin_torque(true).unwrap();
     assert!(matches!(p, TorqueProgress::Pending { .. }));
-    // replies are queued; a service whose deadline already passed reads none of them
-    let _ = d.poll_torque(clock.now()).unwrap(); // moves pending replies into the queue
+    // Advance past the 20 ms causal settle window; a service whose deadline already passed reads none of them.
+    clock.advance(ms(21));
+    bus.with(|s| s.push_all_feedback());
     let before = clock.now();
     assert!(matches!(d.poll_torque(before).unwrap(), TorqueProgress::Pending { .. }), "confirmed without a receive pass");
     assert_eq!(clock.now(), before, "frames read past the service deadline");
     assert!(!d.is_enabled());
-    // within budget: the replies confirm the enable
+    // within budget: the post-settle replies confirm the enable
     let mut p = d.poll_torque(clock.now() + RX_PASS).unwrap();
     for _ in 0..4 {
         if p == TorqueProgress::Done(TorqueOutcome::Confirmed) { break; }

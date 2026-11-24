@@ -34,7 +34,9 @@ fn rebot_dm_driver() -> DamiaoArmDriver<MockCanTransport> {
     let limits = ArmConfig::rebot_dm().damiao_ranges.unwrap().iter().map(DamiaoRange::limits).collect();
     let mut d = DamiaoArmDriver::new(MockCanTransport::new(), (1..=7).collect()).with_joint_limits(limits).unwrap();
     for id in 1..=7u16 {
-        d.can_mut().respond_to_transmit(damiao::build_enable_frame(id), feedback(id as u8, 1));
+        let fb = feedback(id as u8, 1);
+        d.can_mut().respond_to_transmit(damiao::build_enable_frame(id), fb);
+        d.can_mut().respond_to_transmit(damiao::build_refresh_frame(id), fb);
     }
     d
 }

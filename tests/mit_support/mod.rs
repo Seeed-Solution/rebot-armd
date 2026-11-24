@@ -268,12 +268,17 @@ impl FakeBusState {
             let Some(k) = self.motors.iter().position(|m| m.id == id) else { return };
             let now = self.now();
             let poll_feeds = self.poll_feeds_watchdog;
+            let has_delayed = now.is_some_and(|t| {
+                self.delayed
+                    .iter()
+                    .any(|(at, f)| *at > t && u16::from(damiao::feedback_motor_id(f)) == id)
+            });
             let m = &mut self.motors[k];
             if m.silent { return; }
             let reply = match op {
                 0xCC => {
                     if poll_feeds && m.enabled { m.last_cmd_at = now; }
-                    (!m.mute_feedback && !m.no_feedback).then(|| m.feedback_frame())
+                    (!has_delayed && !m.mute_feedback && !m.no_feedback).then(|| m.feedback_frame())
                 }
                 damiao::REG_READ => m.regs.get(&rid).map(|v| m.reg_reply(damiao::REG_READ, rid, *v)),
                 damiao::REG_WRITE => {

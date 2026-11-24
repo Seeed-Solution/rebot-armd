@@ -3300,12 +3300,12 @@ async fn rt_capability_gates_legacy_slcan_preservation_zero_offset_no_sleep_and_
     // (c) Normal `ArmSupervisor::with_driver(...)` (wrapped in `ZeroOffsetDriver`) -> `start_executor(...)`
     // propagates `set_rt_mode(true)` through `ZeroOffsetDriver`: injected `WouldBlock` on target TX
     // performs 1 attempt per frame and ZERO `clock_pause` sleeps!
-    let raw_wb = FakeBus::with_clock(&dm_limits(), clock.clone());
+    let raw_wb = FakeBus::new(&dm_limits());
     raw_wb.with(|s| {
         s.immediate_replies = true;
         s.push_all_feedback();
     });
-    let bus_wb = CountingBus::new(raw_wb.clone(), Some(clock.clone()));
+    let bus_wb = CountingBus::new(raw_wb.clone(), None);
     let pauses_wb = bus_wb.clock_pauses.clone();
     let mut drv_wb = DamiaoArmDriver::new(bus_wb.clone(), vec![1, 2, 3, 4, 5, 6, 7])
         .with_joint_limits(dm_limits())

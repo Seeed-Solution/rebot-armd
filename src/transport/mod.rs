@@ -346,11 +346,10 @@ pub trait CanTransport: Send {
     /// Receive a CAN frame together with its optional transport-measured monotonic receive time
     /// (on the same clock domain as [`Self::clock`], or `Instant::now()` when `clock()` is `None`).
     /// Transports that do not capture arrival timestamps — including Linux SocketCAN
-    /// (`SocketCanTransport`) — inherit the default (`None`) and callers fall back to the host
-    /// decode instant. Because SocketCAN gives no arrival timestamps, TX-probe confirmation
-    /// (`DamiaoArmDriver::probe_tx_ready_inner` / `tx_probe_confirmed`) relies on draining RX and
-    /// snapshotting the RX sequence boundary immediately AFTER the probe write returns
-    /// successfully, requiring confirming feedback to carry a strictly greater RX sequence number.
+    /// (`SocketCanTransport`) — inherit the default (`None`) and callers use the host monotonic
+    /// receive instant. Neither an empty host RX queue nor a no-op [`Self::flush`] establishes
+    /// a causal torque boundary; uncorrelated-RX drivers enforce [`crate::driver::TORQUE_CAUSAL_SETTLE_WINDOW`]
+    /// after `transmit()` returns before accepting feedback as evidence.
     fn receive_timestamped(
         &mut self,
     ) -> Result<(CanFrame, Option<std::time::Instant>), TransportError> {

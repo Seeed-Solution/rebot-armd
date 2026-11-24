@@ -547,10 +547,16 @@ pub fn damiao_fault_name(code: u8) -> Option<&'static str> {
 /// Damiao enable handshake: how long to wait for every motor to report state 1, and when to resend the
 /// enable frame to motors not yet confirmed.
 pub const DAMIAO_ENABLE_CONFIRM: Duration = Duration::from_millis(150);
-/// Resend times of the enable and disable frames to motors not yet confirmed.
+/// Resend times of the enable and disable frames to motors not yet confirmed (spaced past the
+/// 20 ms causal settle window + post-settle 0xCC status probe).
 const DAMIAO_ENABLE_RETRY_AT: [Duration; 2] = [Duration::from_millis(25), Duration::from_millis(75)];
 /// Damiao disable handshake: how long to wait for every motor to report state 0.
 pub const DAMIAO_DISABLE_CONFIRM: Duration = Duration::from_millis(150);
+/// Causal settle window for uncorrelated-RX drivers (Damiao, RobStride): after a torque-changing
+/// write returns from `transmit()`, feedback or register frames received earlier than
+/// `write_done + TORQUE_CAUSAL_SETTLE_WINDOW` are never evidence for that motor's torque state,
+/// mode, or rest pose. An empty host RX queue or a no-op `flush()` is NOT a causal boundary.
+pub const TORQUE_CAUSAL_SETTLE_WINDOW: Duration = Duration::from_millis(20);
 /// Time bound of one Damiao receive pass (with at most 64 frames).
 pub const DAMIAO_RX_PASS: Duration = Duration::from_millis(5);
 /// Maximum age for Damiao joint feedback to still be considered valid.
@@ -3998,10 +4004,14 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     /// a verified disable transaction. Prevents unsolicited `0x0` from ever resolving an
     /// attempted enable.
     motor_enable_attempted: Vec<bool>,
-    /// Per-motor causal boundary of the latest transmitted `CMD_DISABLE` frame.
-    motor_disable_tx: Vec<Option<MotorTxBoundary>>,
-    /// Per-motor causal boundary of the latest transmitted `CMD_ENABLE` frame.
-    motor_enable_tx: Vec<Option<MotorTxBoundary>>,
+    /// Per-motor causal settle boundary of the latest transmitted `CMD_DISABLE` frame.
+    motor_disable_tx: Vec<Option<MotorTorqueSettle>>,
+    /// Per-motor causal settle boundary of the latest transmitted `CMD_ENABLE` frame.
+    motor_enable_tx: Vec<Option<MotorTorqueSettle>>,
+    /// Per-motor earliest host monotonic receive instant (`write_done + TORQUE_CAUSAL_SETTLE_WINDOW`)
+    /// after the latest torque-changing write returned from `can.transmit()`. Frames received
+    /// earlier than this instant are never evidence for that motor's torque state, mode, or rest pose.
+    motor_torque_settle_until: Vec<Option<Instant>>,
     /// True once motor `i` has received causal feedback strictly after its latest `CMD_ENABLE`
     /// transmit (any state, including fault states, so `poll_enable` detects faults causally).
     motor_post_enable_feedback: Vec<bool>,
@@ -4083,18 +4093,15 @@ pub struct DamiaoArmDriver<C: CanTransport> {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum MotorTxBoundary {
-    /// Torque command transmitted at `tx_at`, awaiting a post-TX empty RX queue observation
-    /// (`rx_timestamp` >= `tx_at` satisfies immediately on timestamped transports; untimestamped
-    /// SocketCAN frames cannot confirm until `PostTxEmpty`). `absorbed_untimestamped` records
-    /// whether an untimestamped frame for this motor was drained while awaiting `PostTxEmpty`
-    /// (e.g. a fast SLCAN reply or zero-RX Step 3 reply), signaling that one post-empty `0x7FF 0xCC`
-    /// refresh probe is needed without perturbing silent/delayed motors.
-    AwaitingPostTxEmpty { tx_at: Instant, absorbed_untimestamped: bool },
-    /// Empty RX queue observed strictly after `can.transmit` + `flush` at `post_empty_seq`.
-    /// Untimestamped frames with `seq > post_empty_seq` (or timestamped frames with
-    /// `rx_ts >= tx_at`) are causally proven to have arrived strictly after the write.
-    PostTxEmpty { tx_at: Instant, post_empty_seq: u64, probe_needed: bool },
+struct MotorTorqueSettle {
+    /// Host monotonic instant captured AFTER `can.transmit()` returned `Ok(())`.
+    #[allow(dead_code)]
+    write_done: Instant,
+    /// `write_done + TORQUE_CAUSAL_SETTLE_WINDOW`: frames with host monotonic receive time
+    /// earlier than this instant are never causal evidence for this motor.
+    settle_until: Instant,
+    /// True until one read-only `0x7FF 0xCC` status refresh probe is sent once `now >= settle_until`.
+    probe_needed: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -4131,6 +4138,10 @@ enum TxKind {
     /// refused by the stopped rest-pose rule or 1 s lifetime. Used ONLY for `Thermal` and
     /// `ProcessExit`.
     DisableProtective { reason: DisableProtectiveReason },
+    /// Read-only `0x7FF 0xCC` status probe during an in-flight disable handshake after the causal
+    /// settle window elapses: exempt from motion TX budget and stop gate so an in-flight disable
+    /// can confirm `OffConfirmed` even while an E-stop is pending or latched.
+    DisableProbe,
     /// Motion target frame (`POS_VEL`, `MIT`, or `POS_FORCE`).
     Target,
     /// Non-rollback mode-switch hold frame.
@@ -4593,6 +4604,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             motor_enable_attempted: vec![false; dof],
             motor_disable_tx: vec![None; dof],
             motor_enable_tx: vec![None; dof],
+            motor_torque_settle_until: vec![None; dof],
             motor_post_enable_feedback: vec![false; dof],
             motor_disable_confirmed: vec![false; dof],
             rx_empty_seq: 0,
@@ -4903,7 +4915,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     fn is_disable_tx_kind(kind: TxKind) -> bool {
         matches!(
             kind,
-            TxKind::DisableRequested { .. } | TxKind::DisableProtective { .. }
+            TxKind::DisableRequested { .. } | TxKind::DisableProtective { .. } | TxKind::DisableProbe
         )
     }
 
@@ -5006,7 +5018,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             TxKind::DisableRequested { started_at, rollback } => {
                 self.check_stopped_disable_requested(started_at, rollback)?;
             }
-            TxKind::DisableProtective { .. } => {}
+            TxKind::DisableProtective { .. } | TxKind::DisableProbe => {}
             TxKind::Refresh | TxKind::RollbackHold(_) | TxKind::ClearFault => {
                 if pending {
                     return Err(TxRefusal::StopInhibited);
@@ -5110,17 +5122,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             self.record_tx_pass_attempt();
         }
         let mut torque_tx_info: Option<(usize, bool)> = None;
-        let tx_at = self.now();
         if !frame.is_extended && !frame.is_rtr && frame.dlc == 8 {
             if frame.data == damiao::CMD_ENABLE {
                 if let Some(idx) = self.motor_ids.iter().position(|&id| u32::from(id) == frame.id) {
                     self.motor_evidence[idx] = MotorTorqueEvidence::Unknown;
                     self.motor_enable_attempted[idx] = true;
                     self.motor_disable_tx[idx] = None;
-                    self.motor_enable_tx[idx] = Some(MotorTxBoundary::AwaitingPostTxEmpty {
-                        tx_at,
-                        absorbed_untimestamped: false,
-                    });
+                    self.motor_enable_tx[idx] = None;
                     self.motor_post_enable_feedback[idx] = false;
                     self.motor_disable_confirmed[idx] = false;
                     self.disable_confirmed_sticky = false;
@@ -5130,11 +5138,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 if let Some(idx) = self.motor_ids.iter().position(|&id| u32::from(id) == frame.id) {
                     self.motor_evidence[idx] = MotorTorqueEvidence::Unknown;
                     self.motor_enable_tx[idx] = None;
+                    self.motor_disable_tx[idx] = None;
                     self.motor_post_enable_feedback[idx] = false;
-                    self.motor_disable_tx[idx] = Some(MotorTxBoundary::AwaitingPostTxEmpty {
-                        tx_at,
-                        absorbed_untimestamped: false,
-                    });
                     self.motor_disable_confirmed[idx] = false;
                     self.disable_confirmed_sticky = false;
                     torque_tx_info = Some((idx, false));
@@ -5144,7 +5149,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let t0 = self.now();
         let cpu0 = crate::diagnostics::tick::thread_cpu_ns();
         let res = self.can.transmit(&frame);
-        let wall_ns = self.now().saturating_duration_since(t0).as_nanos().min(u128::from(u64::MAX)) as u64;
+        let write_done = self.now();
+        let wall_ns = write_done.saturating_duration_since(t0).as_nanos().min(u128::from(u64::MAX)) as u64;
         let cpu_ns = crate::diagnostics::tick::thread_cpu_ns().saturating_sub(cpu0);
         let attempt_kind = match &res {
             Ok(()) => crate::diagnostics::tick::TxAttemptKind::Sent,
@@ -5154,17 +5160,29 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         };
         crate::diagnostics::tick::record_tx_attempt(attempt_kind, wall_ns, cpu_ns);
         match res {
-            Ok(()) => Ok(frame),
-            Err(e) => {
-                // Transmit failed: evidence stays Unknown (invalidated above), and clear the
-                // transaction boundary so a failed send can never confirm OffConfirmed/OnConfirmed.
+            Ok(()) => {
+                // Record the causal settle window AFTER `transmit()` returns: frames received
+                // earlier than `write_done + TORQUE_CAUSAL_SETTLE_WINDOW` are never evidence for
+                // this motor's torque state, mode, or rest pose.
                 if let Some((idx, is_enable)) = torque_tx_info {
+                    let settle_until = write_done + TORQUE_CAUSAL_SETTLE_WINDOW;
+                    self.motor_torque_settle_until[idx] = Some(settle_until);
+                    let boundary = MotorTorqueSettle {
+                        write_done,
+                        settle_until,
+                        probe_needed: true,
+                    };
                     if is_enable {
-                        self.motor_enable_tx[idx] = None;
+                        self.motor_enable_tx[idx] = Some(boundary);
                     } else {
-                        self.motor_disable_tx[idx] = None;
+                        self.motor_disable_tx[idx] = Some(boundary);
                     }
                 }
+                Ok(frame)
+            }
+            Err(e) => {
+                // Transmit failed: evidence stays Unknown (invalidated above), and boundaries stay
+                // None so a failed send can never confirm OffConfirmed/OnConfirmed.
                 self.tx_probe = None;
                 if budgeted && e.is_tx_backpressure() {
                     self.mark_tx_pass_backpressured();
@@ -7926,8 +7944,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     return Err(e.into());
                 }
                 tracing::warn!("Retry flush failed: {:?}", e);
-            } else {
-                self.post_tx_empty_drain(deadline);
             }
         }
         Ok(mask)
@@ -7951,8 +7967,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let poll_start = self.now();
         let window = ConfirmWindow::new(TorqueDirection::Enable, self.motor_ids.len(), handshake_start, poll_start,
             DAMIAO_ENABLE_CONFIRM, &DAMIAO_ENABLE_RETRY_AT);
+        let wake = if unsent_mask != 0 {
+            poll_start
+        } else {
+            Self::earliest_settle_wake(&self.motor_enable_tx, 0, poll_start, window.wake())
+        };
         self.torque_hs = Some(DamiaoTorque::Enable { window, unsent_mask });
-        Ok(TorqueProgress::Pending { wake: poll_start })
+        Ok(TorqueProgress::Pending { wake })
     }
 
     /// Effective per-motor causal torque evidence for joint `i` (accounts for RX boundary
@@ -8010,54 +8031,29 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 .is_some_and(|t| self.since(t) <= DAMIAO_FEEDBACK_VALID_WINDOW)
     }
 
-    /// Bounded post-TX RX drain: consumes pre-command frames that arrived between the pre-drain
-    /// and `can.transmit` + `flush` while `motor_*_tx` is still `AwaitingPostTxEmpty`, then
-    /// promotes every `AwaitingPostTxEmpty` boundary to `PostTxEmpty` upon observing an empty RX
-    /// queue (`mark_rx_empty`). Skips RX when `rx_frame_limit == Some(0)` (zero-RX Step 3 commit).
-    fn post_tx_empty_drain(&mut self, deadline: Option<Deadline>) {
-        let limit = self.rx_frame_limit.map_or(128, usize::from);
-        if limit == 0 {
-            return;
-        }
-        let mut frames = 0usize;
-        let mut drained = false;
-        let mut hit_err = false;
-        while frames < limit {
-            if deadline.is_some_and(|d| d.passed(self.now())) {
-                break;
-            }
-            let attempt = self.now();
-            match self.can.receive_timestamped() {
-                Ok((frame, rx_ts)) => {
-                    frames += 1;
-                    self.process_rx_frame(&frame, false, rx_ts);
-                }
-                Err(TransportError::Timeout) | Err(TransportError::WouldBlock) => {
-                    drained = true;
-                    self.mark_rx_empty(attempt);
-                    break;
-                }
-                Err(_) => {
-                    hit_err = true;
-                    break;
-                }
-            }
-        }
-        if self.rx_frame_limit.is_some() {
-            self.account_rx_pass(frames, !drained && !hit_err);
-        }
+    #[inline]
+    fn boundary_satisfied(boundary: MotorTorqueSettle, rx_at: Instant) -> bool {
+        rx_at >= boundary.settle_until
     }
 
-    #[inline]
-    fn boundary_satisfied(boundary: MotorTxBoundary, rx_ts: Option<Instant>, seq: u64) -> bool {
-        match boundary {
-            MotorTxBoundary::AwaitingPostTxEmpty { tx_at, .. } => {
-                rx_ts.is_some_and(|ts| ts >= tx_at)
+    fn earliest_settle_wake(
+        boundaries: &[Option<MotorTorqueSettle>],
+        confirmed_mask: u32,
+        now: Instant,
+        base_wake: Instant,
+    ) -> Instant {
+        let mut wake = base_wake;
+        for (i, slot) in boundaries.iter().enumerate().take(handshake::MAX_MASK_JOINTS) {
+            if (confirmed_mask & (1 << i)) != 0 {
+                continue;
             }
-            MotorTxBoundary::PostTxEmpty { tx_at, post_empty_seq, .. } => {
-                rx_ts.map_or(seq > post_empty_seq, |ts| ts >= tx_at)
+            if let Some(b) = *slot {
+                if now < b.settle_until {
+                    wake = wake.min(b.settle_until);
+                }
             }
         }
+        wake
     }
 
     /// Verified hold mode for joint `i` (None when mode is unverified or cleared, including
@@ -8095,6 +8091,92 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.verified_hold_mode(i).is_some()
     }
 
+    fn finish_enable_confirmed(&mut self, started: Instant) -> TorqueProgress {
+        tracing::info!("All Damiao motors confirmed enabled (state=1) in {:?}", self.since(started));
+        self.is_enabling = false;
+        self.is_enabled = true;
+        self.pending_rearm = false;
+        self.enable_stop_stamp = None;
+        // confirmed enable with the base modes restored: a new MIT handover arms a new fence
+        self.mit_fence = None;
+        self.mit_fence_trip = None;
+        self.mit_fence_acked = false;
+        self.last_mit_recovery_rx_seq = None;
+        self.mit_tracking_used = false;
+        self.mit_fence_last_cmd.fill(None);
+        TorqueProgress::Done(TorqueOutcome::Confirmed)
+    }
+
+    fn enable_confirm_snapshot(&self, unsent_mask: u32) -> (u32, bool, Option<usize>) {
+        let n = self.motor_ids.len().min(handshake::MAX_MASK_JOINTS);
+        let mut confirmed_mask = 0u32;
+        let mut all_post_fb = !self.motor_ids.is_empty() && !self.awaiting_rx_boundary && unsent_mask == 0;
+        for i in 0..n {
+            if (unsent_mask & (1 << i)) == 0 && self.motor_evidence_at(i) == MotorTorqueEvidence::OnConfirmed {
+                confirmed_mask |= 1 << i;
+            }
+            all_post_fb &= self.motor_post_enable_feedback.get(i).copied().unwrap_or(false);
+        }
+        let fault = if all_post_fb {
+            self.motor_status.iter().position(|&st| damiao_fault_name(st).is_some())
+        } else {
+            None
+        };
+        (confirmed_mask, all_post_fb, fault)
+    }
+
+    fn probe_settled_enable_motors(
+        &mut self,
+        eligible_mask: u32,
+        unsent_mask: u32,
+        deadline: Deadline,
+    ) -> Result<bool, ArmDriverError> {
+        if !self.last_read_drained {
+            return Ok(false);
+        }
+        let now = self.now();
+        let mut probed_any = false;
+        for i in 0..self.motor_ids.len().min(handshake::MAX_MASK_JOINTS) {
+            if (eligible_mask & (1 << i)) == 0
+                || (unsent_mask & (1 << i)) != 0
+                || self.motor_evidence_at(i) == MotorTorqueEvidence::OnConfirmed
+            {
+                continue;
+            }
+            let needs_probe = self
+                .motor_enable_tx
+                .get(i)
+                .copied()
+                .flatten()
+                .is_some_and(|b| b.probe_needed && now >= b.settle_until);
+            if !needs_probe {
+                continue;
+            }
+            let id = self.motor_ids[i];
+            match self.send(TxKind::Handshake, self.enable_stop_stamp, Some(deadline), false, |_| {
+                Some(damiao::build_refresh_frame(id))
+            }) {
+                Ok(_) => {
+                    if let Some(Some(b)) = self.motor_enable_tx.get_mut(i) {
+                        b.probe_needed = false;
+                    }
+                    probed_any = true;
+                }
+                Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged) => {
+                    self.abort_enable_for_estop();
+                    return Err(ArmDriverError::EstopInhibited);
+                }
+                Err(_) => break,
+            }
+        }
+        if probed_any {
+            self.enable_estop_inhibited()?;
+            let _ = self.can.flush();
+            let _ = self.receive_feedback();
+        }
+        Ok(probed_any)
+    }
+
     fn poll_enable(&mut self, mut window: ConfirmWindow, mut unsent_mask: u32) -> Result<TorqueProgress, ArmDriverError> {
         self.enable_estop_inhibited()?;
         if window.expire(self.now()).is_some() {
@@ -8115,82 +8197,12 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if unsent_mask != 0 {
             unsent_mask = self.send_enable_masked(unsent_mask, true, Some(deadline))?;
         }
-        // On untimestamped transports (real SocketCAN after zero-RX Step 3 or USB-serial SLCAN
-        // where a fast reply arrived during `post_tx_empty_drain`), send ONE read-only `0x7FF 0xCC`
-        // refresh probe per motor once `PostTxEmpty` is established (never resetting `PostTxEmpty`).
-        if self.last_read_drained {
-            let mut probed_any = false;
-            for i in 0..self.motor_ids.len().min(handshake::MAX_MASK_JOINTS) {
-                if (unsent_mask & (1 << i)) != 0
-                    || self.motor_evidence_at(i) == MotorTorqueEvidence::OnConfirmed
-                {
-                    continue;
-                }
-                let needs_probe = matches!(
-                    self.motor_enable_tx.get(i).copied().flatten(),
-                    Some(MotorTxBoundary::PostTxEmpty { probe_needed: true, .. })
-                );
-                if !needs_probe {
-                    continue;
-                }
-                let id = self.motor_ids[i];
-                match self.send(TxKind::Handshake, self.enable_stop_stamp, Some(deadline), false, |_| {
-                    Some(damiao::build_refresh_frame(id))
-                }) {
-                    Ok(_) => {
-                        if let Some(Some(MotorTxBoundary::PostTxEmpty { probe_needed, .. })) =
-                            self.motor_enable_tx.get_mut(i)
-                        {
-                            *probe_needed = false;
-                        }
-                        probed_any = true;
-                    }
-                    Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged) => {
-                        self.abort_enable_for_estop();
-                        return Err(ArmDriverError::EstopInhibited);
-                    }
-                    Err(TxRefusal::DeadlinePassed | TxRefusal::Deferred) => break,
-                    Err(_) => break,
-                }
-            }
-            if probed_any {
-                self.enable_estop_inhibited()?;
-                let _ = self.can.flush();
-            }
-        }
-        // Derive enable completion SOLELY from per-motor causal torque evidence (`OnConfirmed`)
-        // tied to each motor's latest transmitted `CMD_ENABLE` boundary (never an earlier batch
-        // boundary or a sample decoded before a deferred/retried write).
         let n = self.motor_ids.len().min(handshake::MAX_MASK_JOINTS);
-        let mut confirmed_mask = 0u32;
-        let mut all_post_fb = !self.motor_ids.is_empty() && !self.awaiting_rx_boundary && unsent_mask == 0;
-        for i in 0..n {
-            if (unsent_mask & (1 << i)) == 0 && self.motor_evidence_at(i) == MotorTorqueEvidence::OnConfirmed {
-                confirmed_mask |= 1 << i;
-            }
-            all_post_fb &= self.motor_post_enable_feedback.get(i).copied().unwrap_or(false);
-        }
-        let fault = if all_post_fb {
-            self.motor_status.iter().position(|&st| damiao_fault_name(st).is_some())
-        } else {
-            None
-        };
-        match window.service(self.now(), confirmed_mask, all_post_fb, fault) {
-            Service::Confirmed => {
-                tracing::info!("All Damiao motors confirmed enabled (state=1) in {:?}", self.since(window.started));
-                self.is_enabling = false;
-                self.is_enabled = true;
-                self.pending_rearm = false;
-                self.enable_stop_stamp = None;
-                // confirmed enable with the base modes restored: a new MIT handover arms a new fence
-                self.mit_fence = None;
-                self.mit_fence_trip = None;
-                self.mit_fence_acked = false;
-                self.last_mit_recovery_rx_seq = None;
-                self.mit_tracking_used = false;
-                self.mit_fence_last_cmd.fill(None);
-                Ok(TorqueProgress::Done(TorqueOutcome::Confirmed))
-            }
+        let full = handshake::full_mask(n);
+        let (confirmed_mask, all_post_fb, fault) = self.enable_confirm_snapshot(unsent_mask);
+        let now = self.now();
+        match window.service(now, confirmed_mask, all_post_fb, fault) {
+            Service::Confirmed => Ok(self.finish_enable_confirmed(window.started)),
             Service::Fault { .. } => {
                 let e = self.check_hardware_status().err()
                     .unwrap_or(ArmDriverError::MotorHardwareFault { joint: 0, motor_id: 0, status: 0xFF });
@@ -8198,24 +8210,77 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 Err(e)
             }
             Service::Retry { mask, wake } => {
-                unsent_mask = self.send_enable_masked(unsent_mask | mask, false, Some(deadline))?;
+                // Motors deferred by TX budget (`unsent_mask`) may not yet be 25 ms past their
+                // own `write_done`: probe them if settled rather than prematurely resetting their
+                // settle window with another `CMD_ENABLE`.
+                let mut retry_now_mask = 0u32;
+                let mut probe_instead_mask = 0u32;
+                for i in handshake::mask_joints(mask) {
+                    if let Some(b) = self.motor_enable_tx.get(i).copied().flatten() {
+                        if now.saturating_duration_since(b.write_done) < DAMIAO_ENABLE_RETRY_AT[0] {
+                            if now >= b.settle_until && b.probe_needed {
+                                probe_instead_mask |= 1 << i;
+                            }
+                            continue;
+                        }
+                    }
+                    retry_now_mask |= 1 << i;
+                }
+                let mut probed = false;
+                if probe_instead_mask != 0 {
+                    probed = self.probe_settled_enable_motors(probe_instead_mask, unsent_mask, deadline)?;
+                }
+                if unsent_mask != 0 || retry_now_mask != 0 {
+                    unsent_mask = self.send_enable_masked(unsent_mask | retry_now_mask, false, Some(deadline))?;
+                }
+                if probed {
+                    let (cm2, apf2, fault2) = self.enable_confirm_snapshot(unsent_mask);
+                    if fault2.is_some() {
+                        let e = self.check_hardware_status().err()
+                            .unwrap_or(ArmDriverError::MotorHardwareFault { joint: 0, motor_id: 0, status: 0xFF });
+                        self.enable_failed();
+                        return Err(e);
+                    }
+                    if apf2 && cm2 == full {
+                        return Ok(self.finish_enable_confirmed(window.started));
+                    }
+                }
+                let after = self.now();
+                let (cm_after, _, _) = self.enable_confirm_snapshot(unsent_mask);
                 let wake = if unsent_mask != 0
-                    && self.tx_release_deadline.is_none_or(|cap| self.now() < cap)
+                    && self.tx_release_deadline.is_none_or(|cap| after < cap)
                 {
-                    self.now()
+                    after
                 } else {
-                    wake
+                    Self::earliest_settle_wake(&self.motor_enable_tx, cm_after, after, wake)
                 };
                 self.torque_hs = Some(DamiaoTorque::Enable { window, unsent_mask });
                 Ok(TorqueProgress::Pending { wake })
             }
             Service::Wait { wake } => {
+                // Inside Wait (between settle_until and the next retry), send ONE read-only
+                // `0x7FF 0xCC` status refresh probe per settled unconfirmed motor and immediately
+                // drain its reply so fast buses confirm at `write_done + 20 ms`.
+                if self.probe_settled_enable_motors(full, unsent_mask, deadline)? {
+                    let (cm2, apf2, fault2) = self.enable_confirm_snapshot(unsent_mask);
+                    if fault2.is_some() {
+                        let e = self.check_hardware_status().err()
+                            .unwrap_or(ArmDriverError::MotorHardwareFault { joint: 0, motor_id: 0, status: 0xFF });
+                        self.enable_failed();
+                        return Err(e);
+                    }
+                    if apf2 && cm2 == full {
+                        return Ok(self.finish_enable_confirmed(window.started));
+                    }
+                }
+                let after = self.now();
+                let (cm_after, _, _) = self.enable_confirm_snapshot(unsent_mask);
                 let wake = if unsent_mask != 0
-                    && self.tx_release_deadline.is_none_or(|cap| self.now() < cap)
+                    && self.tx_release_deadline.is_none_or(|cap| after < cap)
                 {
-                    self.now()
+                    after
                 } else {
-                    wake
+                    Self::earliest_settle_wake(&self.motor_enable_tx, cm_after, after, wake)
                 };
                 self.torque_hs = Some(DamiaoTorque::Enable { window, unsent_mask });
                 Ok(TorqueProgress::Pending { wake })
@@ -8308,17 +8373,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
         if let Err(e) = self.can.flush() {
             other_err = Some(e.into());
-        } else if sent_any && max_rx_frames != Some(0) {
-            // Establish the post-TX empty-queue boundary right after `flush()` so any state-0
-            // frame that arrived between the pre-drain and `can.transmit` is drained while
-            // `motor_disable_tx` is still `AwaitingPostTxEmpty` and can never confirm off.
-            if let Some(limit) = max_rx_frames {
-                self.rx_frame_limit = Some(limit.min(64));
-                self.post_tx_empty_drain(None);
-                self.rx_frame_limit = None;
-            } else {
-                self.post_tx_empty_drain(None);
-            }
         }
         if let Some(e) = refused_err.or(other_err) {
             // A failed or partial write cannot establish the physical power state.
@@ -8337,8 +8391,22 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let poll_start = self.now();
         let window = ConfirmWindow::new(TorqueDirection::Disable, self.motor_ids.len(), cmd_start, poll_start,
             DAMIAO_DISABLE_CONFIRM, &DAMIAO_ENABLE_RETRY_AT);
+        let wake = Self::earliest_settle_wake(&self.motor_disable_tx, 0, poll_start, window.wake());
         self.torque_hs = Some(DamiaoTorque::Disable { window, mit_fenced, after_seq, kind });
-        Ok(TorqueProgress::Pending { wake: poll_start })
+        Ok(TorqueProgress::Pending { wake })
+    }
+
+    fn disable_confirm_snapshot(&self) -> (u32, bool) {
+        let n = self.motor_ids.len().min(handshake::MAX_MASK_JOINTS);
+        let mut mask = 0u32;
+        for i in 0..n {
+            if self.motor_evidence_at(i) == MotorTorqueEvidence::OffConfirmed {
+                mask |= 1 << i;
+            }
+        }
+        let all_off = !self.motor_ids.is_empty()
+            && (0..self.motor_ids.len()).all(|i| self.motor_evidence_at(i) == MotorTorqueEvidence::OffConfirmed);
+        (mask, all_off)
     }
 
     fn poll_disable(
@@ -8357,53 +8425,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             return Ok(TorqueProgress::Done(TorqueOutcome::Unconfirmed));
         }
         let _ = self.receive_feedback();
-        // On untimestamped transports (real SocketCAN after zero-RX Step 3 or USB-serial SLCAN
-        // where a fast reply arrived during `post_tx_empty_drain`), send ONE read-only `0x7FF 0xCC`
-        // refresh probe per motor once `PostTxEmpty` is established (never resetting `PostTxEmpty`).
-        if self.last_read_drained {
-            let mut probed_any = false;
-            let deadline = Deadline { at: window.deadline };
-            for i in 0..self.motor_ids.len().min(handshake::MAX_MASK_JOINTS) {
-                if self.motor_evidence_at(i) == MotorTorqueEvidence::OffConfirmed {
-                    continue;
-                }
-                let needs_probe = matches!(
-                    self.motor_disable_tx.get(i).copied().flatten(),
-                    Some(MotorTxBoundary::PostTxEmpty { probe_needed: true, .. })
-                );
-                if !needs_probe {
-                    continue;
-                }
-                let id = self.motor_ids[i];
-                match self.send(TxKind::Refresh, None, Some(deadline), false, |_| {
-                    Some(damiao::build_refresh_frame(id))
-                }) {
-                    Ok(_) => {
-                        if let Some(Some(MotorTxBoundary::PostTxEmpty { probe_needed, .. })) =
-                            self.motor_disable_tx.get_mut(i)
-                        {
-                            *probe_needed = false;
-                        }
-                        probed_any = true;
-                    }
-                    Err(_) => break,
-                }
-            }
-            if probed_any {
-                let _ = self.can.flush();
-            }
-        }
-        // Derive disable completion SOLELY from per-motor causal evidence (`OffConfirmed`).
-        let n = self.motor_ids.len().min(handshake::MAX_MASK_JOINTS);
-        let mut mask = 0u32;
-        for i in 0..n {
-            if self.motor_evidence_at(i) == MotorTorqueEvidence::OffConfirmed {
-                mask |= 1 << i;
-            }
-        }
-        let all_off = !self.motor_ids.is_empty()
-            && (0..self.motor_ids.len()).all(|i| self.motor_evidence_at(i) == MotorTorqueEvidence::OffConfirmed);
-        match window.service(self.now(), mask, all_off, None) {
+        // Derive disable completion SOLELY from per-motor causal post-settle evidence (`OffConfirmed`).
+        let (mask, all_off) = self.disable_confirm_snapshot();
+        let now = self.now();
+        match window.service(now, mask, all_off, None) {
             Service::Confirmed => {
                 tracing::info!("All Damiao motors confirmed disabled (state=0) in {:?}", self.since(window.started));
                 self.disable_confirmed_sticky = true;
@@ -8413,10 +8438,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             // Bounded driver-level handshake retry within `DAMIAO_DISABLE_CONFIRM` (150 ms),
             // carrying the original `DisableKind` into `send`. A send-time choke-point refusal
             // (`TorqueOffWouldDrop` / `DisableRequestExpired`) aborts the handshake immediately.
-            Service::Retry { mask, wake } => {
+            Service::Retry { mask: retry_mask, wake } => {
                 let mut sent_any = false;
                 let mut refused = None;
-                for i in handshake::mask_joints(mask) {
+                for i in handshake::mask_joints(retry_mask) {
                     let Some(&id) = self.motor_ids.get(i) else { continue };
                     tracing::debug!("Retrying disable for motor {} (CAN ID 0x{:X})", i, id);
                     let tx_kind = Self::disable_tx_kind(kind);
@@ -8439,19 +8464,62 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 if sent_any {
                     if let Err(e) = self.can.flush() {
                         tracing::warn!("Retry flush failed: {:?}", e);
-                    } else {
-                        self.post_tx_empty_drain(Some(Deadline { at: window.deadline }));
                     }
                 }
                 if let Some(r) = refused {
                     return Err(Self::refusal_to_driver_err(r));
                 }
+                let wake = Self::earliest_settle_wake(&self.motor_disable_tx, mask, self.now(), wake);
                 self.torque_hs = Some(DamiaoTorque::Disable { window, mit_fenced, after_seq, kind });
                 Ok(TorqueProgress::Pending { wake })
             }
-            // a disable window never reports a fault (no fault index is passed)
+            // Inside Wait (between settle_until and the next retry), send ONE read-only `0x7FF 0xCC`
+            // status refresh probe per settled unconfirmed motor and immediately drain its reply so
+            // fast buses confirm at `write_done + 20 ms`.
             Service::Wait { .. } | Service::Fault { .. } => {
-                let wake = window.wake();
+                if self.last_read_drained {
+                    let deadline = Deadline { at: window.deadline };
+                    let mut probed_any = false;
+                    for i in 0..self.motor_ids.len().min(handshake::MAX_MASK_JOINTS) {
+                        if self.motor_evidence_at(i) == MotorTorqueEvidence::OffConfirmed {
+                            continue;
+                        }
+                        let needs_probe = self
+                            .motor_disable_tx
+                            .get(i)
+                            .copied()
+                            .flatten()
+                            .is_some_and(|b| b.probe_needed && now >= b.settle_until);
+                        if !needs_probe {
+                            continue;
+                        }
+                        let id = self.motor_ids[i];
+                        match self.send(TxKind::DisableProbe, None, Some(deadline), false, |_| {
+                            Some(damiao::build_refresh_frame(id))
+                        }) {
+                            Ok(_) => {
+                                if let Some(Some(b)) = self.motor_disable_tx.get_mut(i) {
+                                    b.probe_needed = false;
+                                }
+                                probed_any = true;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    if probed_any {
+                        let _ = self.can.flush();
+                        let _ = self.receive_feedback();
+                        let (_, all_off_after) = self.disable_confirm_snapshot();
+                        if all_off_after {
+                            tracing::info!("All Damiao motors confirmed disabled (state=0) in {:?}", self.since(window.started));
+                            self.disable_confirmed_sticky = true;
+                            if mit_fenced { self.mit_fence = None; }
+                            return Ok(TorqueProgress::Done(TorqueOutcome::Confirmed));
+                        }
+                    }
+                }
+                let (mask_after, _) = self.disable_confirm_snapshot();
+                let wake = Self::earliest_settle_wake(&self.motor_disable_tx, mask_after, self.now(), window.wake());
                 self.torque_hs = Some(DamiaoTorque::Disable { window, mit_fenced, after_seq, kind });
                 Ok(TorqueProgress::Pending { wake })
             }
@@ -9260,25 +9328,41 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             return Some(Ok(Vec::new()));
         }
 
-        // Send disable to every unconfirmed or stale motor; a send error on one motor must NEVER
-        // stop attempts on the remaining motors unless the step deadline itself has passed.
-        // Panic-disable keeps its own deadline loop and routes every frame through
-        // `send(TxKind::DisableProtective { reason: ProcessExit }, ..)`.
+        // Send disable to every unconfirmed or stale motor on the first pass, after TX failure,
+        // or after the post-settle retry interval (25 ms past settle). Once a motor's 20 ms
+        // causal settle window elapses, send ONE read-only `0xCC` status refresh instead of
+        // repeatedly resending `CMD_DISABLE` (which would keep resetting `settle_until`).
+        // Panic-disable routes every frame through `send(TxKind::DisableProtective { ProcessExit })`.
         let tx_deadline = Deadline { at: deadline };
+        let protective = TxKind::DisableProtective {
+            reason: DisableProtectiveReason::ProcessExit,
+        };
         let mut sent_any = false;
+        let now = self.now();
         for i in unconfirmed_before {
             let Some(&id) = self.motor_ids.get(i) else { continue };
-            match self.send(
-                TxKind::DisableProtective {
-                    reason: DisableProtectiveReason::ProcessExit,
-                },
-                None,
-                Some(tx_deadline),
-                false,
-                |_| Some(damiao::build_disable_frame(id)),
-            ) {
+            let boundary = self.motor_disable_tx.get(i).copied().flatten();
+            let send_disable = first
+                || boundary.is_none()
+                || boundary.is_some_and(|b| now >= b.settle_until + Duration::from_millis(25));
+            let send_probe = !send_disable
+                && boundary.is_some_and(|b| b.probe_needed && now >= b.settle_until);
+            if !send_disable && !send_probe {
+                continue;
+            }
+            let frame = if send_disable {
+                damiao::build_disable_frame(id)
+            } else {
+                damiao::build_refresh_frame(id)
+            };
+            match self.send(protective, None, Some(tx_deadline), false, |_| Some(frame)) {
                 Ok(_) => {
                     sent_any = true;
+                    if send_probe {
+                        if let Some(Some(b)) = self.motor_disable_tx.get_mut(i) {
+                            b.probe_needed = false;
+                        }
+                    }
                 }
                 Err(TxRefusal::DeadlinePassed) => {
                     tracing::warn!(
@@ -9298,10 +9382,10 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 }
             }
         }
-        if let Err(e) = self.can.flush() {
-            tracing::warn!("Panic disable CAN flush failed: {e}");
-        } else if sent_any {
-            self.post_tx_empty_drain(Some(Deadline { at: deadline }));
+        if sent_any {
+            if let Err(e) = self.can.flush() {
+                tracing::warn!("Panic disable CAN flush failed: {e}");
+            }
         }
 
         self.last_poll_rx = None;
@@ -10903,11 +10987,21 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             .filter(|r| self.motor_ids.contains(&r.motor_id))
         {
             // A register reply is not feedback: byte 0 would decode as state 0.
+            // E1: Register replies received earlier than write_done + SETTLE are never evidence
+            // for that motor's mode.
             if record_register_replies {
                 let decode_now = self.now();
                 let rx_at = rx_timestamp.map_or(decode_now, |ts| ts.min(decode_now));
-                if self.register_replies.len() < 64 { self.register_replies.push(reply); }
-                if self.register_reply_log.len() < 64 { self.register_reply_log.push((reply, frame.id, rx_at, self.rx_seq, self.rx_empty_seq)); }
+                let in_settle = self
+                    .motor_ids
+                    .iter()
+                    .position(|&id| id == reply.motor_id)
+                    .and_then(|idx| self.motor_torque_settle_until.get(idx).copied().flatten())
+                    .is_some_and(|until| rx_at < until);
+                if !in_settle {
+                    if self.register_replies.len() < 64 { self.register_replies.push(reply); }
+                    if self.register_reply_log.len() < 64 { self.register_reply_log.push((reply, frame.id, rx_at, self.rx_seq, self.rx_empty_seq)); }
+                }
             }
             return;
         }
@@ -10933,6 +11027,12 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             if let Ok(feedback) = damiao::unpack_feedback_frame(frame, &self.limits[idx]) {
                 let decode_now = self.now();
                 let rx_at = rx_timestamp.map_or(decode_now, |ts| ts.min(decode_now));
+                // E1: After a torque-changing write returns from transmit(), frames received
+                // earlier than `write_done + TORQUE_CAUSAL_SETTLE_WINDOW` are never evidence for
+                // that motor's torque state, mode, or rest pose.
+                if self.motor_torque_settle_until[idx].is_some_and(|until| rx_at < until) {
+                    return;
+                }
                 let queue_bound = self.rx_empty_instant;
                 let seq = self.rx_seq;
                 let prev_rx = self.last_feedback_instant[idx];
@@ -10968,33 +11068,27 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     self.disable_confirmed_sticky = false;
                     self.motor_disable_confirmed[idx] = false;
                 }
-                if rx_timestamp.is_none() {
-                    if let Some(MotorTxBoundary::AwaitingPostTxEmpty { absorbed_untimestamped, .. }) =
-                        self.motor_enable_tx[idx].as_mut()
-                    {
-                        *absorbed_untimestamped = true;
-                    }
-                    if let Some(MotorTxBoundary::AwaitingPostTxEmpty { absorbed_untimestamped, .. }) =
-                        self.motor_disable_tx[idx].as_mut()
-                    {
-                        *absorbed_untimestamped = true;
-                    }
-                }
-                if let Some(en_boundary) = self.motor_enable_tx[idx] {
-                    if !self.awaiting_rx_boundary && Self::boundary_satisfied(en_boundary, rx_timestamp, seq) {
+                if let Some(en_boundary) = self.motor_enable_tx[idx].as_mut() {
+                    if !self.awaiting_rx_boundary && Self::boundary_satisfied(*en_boundary, rx_at) {
+                        en_boundary.probe_needed = false;
                         self.motor_post_enable_feedback[idx] = true;
                     }
                 }
-                // Single owner of per-motor causal torque evidence strictly per §1:
-                // - OffConfirmed ONLY on a verified disable transaction whose post-TX causal
-                //   boundary (`motor_disable_tx[idx]`) excludes pre-disable samples. Startup
-                //   unsolicited `0x0` and post-enable `0x0` NEVER confirm `OffConfirmed`.
-                // - OnConfirmed ONLY on a verified enable transaction whose post-TX causal
-                //   boundary (`motor_enable_tx[idx]`) excludes pre-enable samples.
+                if let Some(dis_boundary) = self.motor_disable_tx[idx].as_mut() {
+                    if !self.awaiting_rx_boundary && Self::boundary_satisfied(*dis_boundary, rx_at) {
+                        dis_boundary.probe_needed = false;
+                    }
+                }
+                // Single owner of per-motor causal torque evidence strictly per §1 + E1:
+                // - OffConfirmed ONLY on a verified disable transaction whose post-settle
+                //   boundary (`rx_at >= write_done + TORQUE_CAUSAL_SETTLE_WINDOW`) excludes
+                //   pre-disable / in-flight samples.
+                // - OnConfirmed ONLY on a verified enable transaction whose post-settle boundary
+                //   excludes pre-enable / in-flight samples.
                 match feedback.state_or_error {
                     0 => {
                         if let Some(boundary) = self.motor_disable_tx[idx] {
-                            if !self.awaiting_rx_boundary && Self::boundary_satisfied(boundary, rx_timestamp, seq) {
+                            if !self.awaiting_rx_boundary && Self::boundary_satisfied(boundary, rx_at) {
                                 self.motor_evidence[idx] = MotorTorqueEvidence::OffConfirmed;
                                 self.motor_disable_confirmed[idx] = true;
                                 self.motor_enable_attempted[idx] = false;
@@ -11007,7 +11101,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     }
                     1 => {
                         if let Some(boundary) = self.motor_enable_tx[idx] {
-                            if !self.awaiting_rx_boundary && Self::boundary_satisfied(boundary, rx_timestamp, seq) {
+                            if !self.awaiting_rx_boundary && Self::boundary_satisfied(boundary, rx_at) {
                                 self.motor_evidence[idx] = MotorTorqueEvidence::OnConfirmed;
                             }
                         } else if self.motor_evidence[idx] == MotorTorqueEvidence::OffConfirmed {
@@ -11055,26 +11149,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.last_read_drained = true;
         self.rx_seq += 1;
         self.rx_empty_seq = self.rx_seq;
-        // Promote every per-motor torque transaction waiting for a post-TX empty RX queue so
-        // only frames arriving strictly after this empty-queue observation can confirm it.
-        for slot in &mut self.motor_disable_tx {
-            if let Some(MotorTxBoundary::AwaitingPostTxEmpty { tx_at, absorbed_untimestamped }) = *slot {
-                *slot = Some(MotorTxBoundary::PostTxEmpty {
-                    tx_at,
-                    post_empty_seq: self.rx_empty_seq,
-                    probe_needed: absorbed_untimestamped,
-                });
-            }
-        }
-        for slot in &mut self.motor_enable_tx {
-            if let Some(MotorTxBoundary::AwaitingPostTxEmpty { tx_at, absorbed_untimestamped }) = *slot {
-                *slot = Some(MotorTxBoundary::PostTxEmpty {
-                    tx_at,
-                    post_empty_seq: self.rx_empty_seq,
-                    probe_needed: absorbed_untimestamped,
-                });
-            }
-        }
+        // Note (E1): An empty host RX queue is NOT a causal torque boundary; `motor_*_tx`
+        // boundaries are satisfied solely by host monotonic receive time >= write_done + SETTLE.
         if self.awaiting_rx_boundary {
             self.awaiting_rx_boundary = false;
             self.last_feedback_instant.fill(None);
@@ -11386,6 +11462,9 @@ pub struct RobStrideArmDriver<C: CanTransport> {
     rx_empty_instant: Option<Instant>,
     /// `rx_empty_instant` when each joint's last sample was decoded.
     feedback_queue_bound: Vec<Option<Instant>>,
+    /// Per-motor causal settle deadline (`write_done + TORQUE_CAUSAL_SETTLE_WINDOW`) after a
+    /// torque-changing write returns from `can.transmit()`.
+    motor_torque_settle_until: Vec<Option<Instant>>,
     fault_flags: Vec<u8>,
     clock: Option<Arc<dyn crate::transport::DriverClock>>,
     abort_flag: Option<Arc<AtomicBool>>,
@@ -11411,6 +11490,7 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
             feedback_continuity_epoch: vec![0; dof],
             rx_empty_instant: None,
             feedback_queue_bound: vec![None; dof],
+            motor_torque_settle_until: vec![None; dof],
             fault_flags: vec![0; dof],
             clock,
             abort_flag: None,
@@ -11498,19 +11578,24 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
 
     /// Per-write transmit choke point for RobStride type-4 stop / fault-clear CAN frames:
     /// re-evaluates stop state, freshness, rest pose, and 1 s request lifetime immediately
-    /// before each `can.transmit`.
-    fn send_type4_frame(&mut self, frame: &CanFrame, kind: DisableKind) -> Result<(), ArmDriverError> {
+    /// before each `can.transmit`, and arms the per-motor causal settle window after `transmit()`
+    /// returns.
+    fn send_type4_frame(&mut self, idx: usize, frame: &CanFrame, kind: DisableKind) -> Result<(), ArmDriverError> {
         if let DisableKind::DisableRequested { started_at, rollback } = kind {
             self.check_disable_requested(started_at, rollback)?;
         }
         self.can.transmit(frame)?;
+        let write_done = self.now();
+        if let Some(slot) = self.motor_torque_settle_until.get_mut(idx) {
+            *slot = Some(write_done + TORQUE_CAUSAL_SETTLE_WINDOW);
+        }
         Ok(())
     }
 
     /// Per-write transmit choke point for RobStride stop/disable CAN frames.
-    fn send_stop_frame(&mut self, id: u8, kind: DisableKind) -> Result<(), ArmDriverError> {
+    fn send_stop_frame(&mut self, idx: usize, id: u8, kind: DisableKind) -> Result<(), ArmDriverError> {
         let frame = robstride::build_stop_frame(id, self.master_id);
-        self.send_type4_frame(&frame, kind)
+        self.send_type4_frame(idx, &frame, kind)
     }
 
     pub fn with_gains(mut self, kp: f32, kd: f32) -> Self {
@@ -11660,31 +11745,44 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
         let mut hit_err = false;
         while frames_processed < max_frames && self.now() < deadline && self.since(t0) < Duration::from_micros(2000) {
             let attempt = self.now();
-            match self.can.receive() {
-                Ok(frame) => {
+            match self.can.receive_timestamped() {
+                Ok((frame, rx_ts)) => {
                     frames_processed += 1;
                     if let Ok(feedback) = robstride::unpack_feedback_frame(&frame, &self.limits) {
                         if let Some(idx) = self.motor_ids.iter().position(|&id| id == feedback.motor_id) {
+                            let decode_now = self.now();
+                            let rx_at = rx_ts.map_or(decode_now, |ts| ts.min(decode_now));
+                            let in_settle = self.motor_torque_settle_until[idx]
+                                .is_some_and(|until| rx_at < until);
                             self.cached_states[idx] = JointState {
                                 position: feedback.position,
                                 velocity: feedback.velocity,
                                 torque: feedback.torque,
                                 temperature: feedback.mos_temperature,
                             };
-                            let now = self.now();
+                            self.fault_flags[idx] = feedback.fault_flags;
+                            if in_settle {
+                                // E1: Feedback received earlier than write_done + SETTLE is never
+                                // evidence for rest pose; clear freshness/queue bounds so it
+                                // cannot authorize a stopped disable.
+                                self.last_feedback_instant[idx] = None;
+                                self.feedback_queue_bound[idx] = None;
+                                self.feedback_continuity_epoch[idx] =
+                                    self.feedback_continuity_epoch[idx].wrapping_add(1);
+                                continue;
+                            }
                             let prev_rx = self.last_feedback_instant[idx];
                             let prev_qb = self.feedback_queue_bound[idx];
-                            if prev_rx.is_none_or(|p| now.saturating_duration_since(p) > STOPPED_DISABLE_FEEDBACK_MAX_AGE)
-                                || prev_qb.is_none_or(|qb| now.saturating_duration_since(qb) > STOPPED_DISABLE_FEEDBACK_MAX_AGE)
+                            if prev_rx.is_none_or(|p| rx_at.saturating_duration_since(p) > STOPPED_DISABLE_FEEDBACK_MAX_AGE)
+                                || prev_qb.is_none_or(|qb| rx_at.saturating_duration_since(qb) > STOPPED_DISABLE_FEEDBACK_MAX_AGE)
                                 || !feedback.position.is_finite()
                             {
                                 self.feedback_continuity_epoch[idx] =
                                     self.feedback_continuity_epoch[idx].wrapping_add(1);
                             }
-                            self.last_feedback_instant[idx] = Some(now);
+                            self.last_feedback_instant[idx] = Some(rx_at);
                             self.feedback_seq[idx] = self.feedback_seq[idx].wrapping_add(1);
                             self.feedback_queue_bound[idx] = self.rx_empty_instant;
-                            self.fault_flags[idx] = feedback.fault_flags;
                         }
                     }
                 }
@@ -11754,7 +11852,7 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
         for idx in 0..self.motor_ids.len() {
             let id = self.motor_ids[idx];
             let frame = robstride::build_clear_fault_frame(id, self.master_id);
-            match self.send_type4_frame(&frame, kind) {
+            match self.send_type4_frame(idx, &frame, kind) {
                 Ok(()) => wrote_any = true,
                 Err(e @ (ArmDriverError::TorqueOffWouldDrop | ArmDriverError::DisableRequestExpired)) => {
                     refused_err = Some(e);
@@ -11799,11 +11897,14 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
             })
         } else {
             let start_stamp = self.current_stop_stamp();
-            for &id in &self.motor_ids {
+            for idx in 0..self.motor_ids.len() {
+                let id = self.motor_ids[idx];
                 self.strict_stop_check(Some(start_stamp))?;
                 let frame = robstride::build_enable_frame(id, self.master_id);
                 self.strict_stop_check(Some(start_stamp))?;
                 self.can.transmit(&frame)?;
+                let write_done = self.now();
+                self.motor_torque_settle_until[idx] = Some(write_done + TORQUE_CAUSAL_SETTLE_WINDOW);
             }
             self.strict_stop_check(Some(start_stamp))?;
             self.can.flush()?;
@@ -11817,7 +11918,7 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
         let mut last_err = None;
         for idx in 0..self.motor_ids.len() {
             let id = self.motor_ids[idx];
-            match self.send_stop_frame(id, kind) {
+            match self.send_stop_frame(idx, id, kind) {
                 Ok(()) => wrote_any = true,
                 Err(e @ (ArmDriverError::TorqueOffWouldDrop | ArmDriverError::DisableRequestExpired)) => {
                     refused_err = Some(e);
@@ -11991,8 +12092,8 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
         while frames_processed < 64 {
             // Taken before the receive: an empty result means the queue was empty after it.
             let attempt = self.now();
-            match self.can.receive() {
-                Ok(frame) => {
+            match self.can.receive_timestamped() {
+                Ok((frame, rx_ts)) => {
                     frames_processed += 1;
                     if let Ok(feedback) = robstride::unpack_feedback_frame(&frame, &self.limits) {
                         if let Some(idx) = self
@@ -12000,26 +12101,41 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
                             .iter()
                             .position(|&id| id == feedback.motor_id)
                         {
+                            let decode_now = self.now();
+                            let rx_at = rx_ts.map_or(decode_now, |ts| ts.min(decode_now));
+                            let in_settle = self.motor_torque_settle_until[idx]
+                                .is_some_and(|until| rx_at < until);
                             self.cached_states[idx] = JointState {
                                 position: feedback.position,
                                 velocity: feedback.velocity,
                                 torque: feedback.torque,
                                 temperature: feedback.mos_temperature,
                             };
-                            let now = self.now();
+                            self.fault_flags[idx] = feedback.fault_flags;
+                            if in_settle {
+                                // E1: Feedback received earlier than write_done + SETTLE is never
+                                // evidence for rest pose.
+                                self.last_feedback_instant[idx] = None;
+                                self.feedback_queue_bound[idx] = None;
+                                self.feedback_continuity_epoch[idx] =
+                                    self.feedback_continuity_epoch[idx].wrapping_add(1);
+                                if frames_processed >= 64 || self.since(t0) >= Duration::from_micros(2000) {
+                                    break;
+                                }
+                                continue;
+                            }
                             let prev_rx = self.last_feedback_instant[idx];
                             let prev_qb = self.feedback_queue_bound[idx];
-                            if prev_rx.is_none_or(|p| now.saturating_duration_since(p) > STOPPED_DISABLE_FEEDBACK_MAX_AGE)
-                                || prev_qb.is_none_or(|qb| now.saturating_duration_since(qb) > STOPPED_DISABLE_FEEDBACK_MAX_AGE)
+                            if prev_rx.is_none_or(|p| rx_at.saturating_duration_since(p) > STOPPED_DISABLE_FEEDBACK_MAX_AGE)
+                                || prev_qb.is_none_or(|qb| rx_at.saturating_duration_since(qb) > STOPPED_DISABLE_FEEDBACK_MAX_AGE)
                                 || !feedback.position.is_finite()
                             {
                                 self.feedback_continuity_epoch[idx] =
                                     self.feedback_continuity_epoch[idx].wrapping_add(1);
                             }
-                            self.last_feedback_instant[idx] = Some(now);
+                            self.last_feedback_instant[idx] = Some(rx_at);
                             self.feedback_seq[idx] = self.feedback_seq[idx].wrapping_add(1);
                             self.feedback_queue_bound[idx] = self.rx_empty_instant;
-                            self.fault_flags[idx] = feedback.fault_flags;
                         }
                     }
                     if frames_processed >= 64 || self.since(t0) >= Duration::from_micros(2000) {
@@ -12124,11 +12240,12 @@ mod tx_chokepoint_tests {
         }
     }
 
-    fn all_tx_kinds(started_at: Instant) -> [TxKind; 11] {
+    fn all_tx_kinds(started_at: Instant) -> [TxKind; 12] {
         [
             TxKind::DisableRequested { started_at, rollback: false },
             TxKind::DisableProtective { reason: DisableProtectiveReason::Thermal },
             TxKind::DisableProtective { reason: DisableProtectiveReason::ProcessExit },
+            TxKind::DisableProbe,
             TxKind::Target,
             TxKind::Hold,
             TxKind::RollbackHold(0),
@@ -12177,15 +12294,20 @@ mod tx_chokepoint_tests {
         if deadline == DeadlineCase::Passed {
             return Expected::RefusedDeadline;
         }
-        // Step 2: Tick TX budget runs before stop gate (DisableRequested / DisableProtective exempt).
+        // Step 2: Tick TX budget runs before stop gate (DisableRequested / DisableProtective / DisableProbe exempt).
         if budget == BudgetCase::Exhausted
-            && !matches!(kind, TxKind::DisableRequested { .. } | TxKind::DisableProtective { .. })
+            && !matches!(
+                kind,
+                TxKind::DisableRequested { .. } | TxKind::DisableProtective { .. } | TxKind::DisableProbe
+            )
         {
             return Expected::Deferred;
         }
         // Step 3: Stop gate by TxKind.
         match kind {
-            TxKind::DisableRequested { .. } | TxKind::DisableProtective { .. } => Expected::Sent,
+            TxKind::DisableRequested { .. }
+            | TxKind::DisableProtective { .. }
+            | TxKind::DisableProbe => Expected::Sent,
             TxKind::Refresh | TxKind::RollbackHold(_) | TxKind::ClearFault => match stop {
                 StopCase::Pending => Expected::RefusedStop,
                 StopCase::NoStop | StopCase::Latched => Expected::Sent,
@@ -12404,7 +12526,12 @@ mod tx_chokepoint_tests {
             let res = drv.send(kind, Some(old_stamp), None, false, |d| {
                 Some(damiao::build_disable_frame(d.motor_ids[0]))
             });
-            if matches!(kind, TxKind::DisableRequested { .. } | TxKind::DisableProtective { .. }) {
+            if matches!(
+                kind,
+                TxKind::DisableRequested { .. }
+                    | TxKind::DisableProtective { .. }
+                    | TxKind::DisableProbe
+            ) {
                 assert!(res.is_ok(), "Disable must ignore stop stamp: {res:?}");
                 assert_eq!(bus.tx_len(), 1);
             } else {
@@ -12740,7 +12867,7 @@ mod tx_chokepoint_tests {
         drv.motor_torque_evidence_into(&mut ev);
         assert_eq!(ev, [MotorTorqueEvidence::Unknown; 3]);
 
-        // Establish prior OffConfirmed explicitly via a verified disable transaction.
+        // Establish prior OffConfirmed explicitly via a verified disable transaction (post-settle).
         assert!(matches!(
             drv.begin_disable_torque(DisableKind::DisableRequested {
                 started_at: clock.now(),
@@ -12749,6 +12876,15 @@ mod tx_chokepoint_tests {
             .unwrap(),
             TorqueProgress::Pending { .. }
         ));
+        for id in 1..=3 {
+            bus.push_feedback(id, 0.50, 0x0, &limits);
+        }
+        let dl_early = clock.now() + Duration::from_millis(5);
+        assert!(matches!(
+            drv.poll_torque(dl_early).unwrap(),
+            TorqueProgress::Pending { .. }
+        ));
+        clock.advance(Duration::from_millis(25));
         for id in 1..=3 {
             bus.push_feedback(id, 0.50, 0x0, &limits);
         }

@@ -2641,7 +2641,12 @@ fn partial_enable_at_raised_pose_then_validation_failure_enters_failed_hold_and_
                 // per-motor evidence recorded, then return `Ok(())` so the unified enable reducer
                 // enters `step_enable_validate` while `safety.state()` is STILL `Idle`.
                 let _ = self.inner.begin_torque(true)?;
+                // Advance past the 20 ms E1 causal settle window so J1..J6 post-enable feedback
+                // establishes causal `OnConfirmed` evidence before `step_enable_validate`.
                 self.bus.with(|s| {
+                    if let Some(c) = &s.clock {
+                        c.advance(Duration::from_millis(22));
+                    }
                     for j in 0..6 {
                         s.motors[j].state_override = None;
                         s.motors[j].enabled = true;
@@ -4643,10 +4648,11 @@ fn review_b01_b02_b03_damiao_causal_evidence_rejects_pre_tx_and_startup_frames()
         );
 
         // Drive remaining motors through enable + retries, injecting another untimestamped state=1
-        // right before J2's retry write: handshake MUST expire EnableTimeout (never Confirmed).
+        // right before J2's 75 ms retry write (step == 13 -> t = 75 ms): handshake MUST expire
+        // EnableTimeout (never Confirmed).
         let mut timed_out = false;
         for step in 0..40 {
-            if step == 10 {
+            if step == 13 {
                 bus.with(|s| s.inject_on_next_tx.push(make_fb(2, 1)));
             }
             clock.advance(Duration::from_millis(5));
@@ -5082,5 +5088,250 @@ fn review_m01_m06_m07_m08_m09_unverified_mode_thermal_late_reply_and_gap_recaptu
         assert_eq!(st3, EnableState::Enabled, "after PING FIFO barrier, genuine 1 confirms Enabled");
         drv2.motor_torque_evidence_into(&mut ev);
         assert_eq!(ev, [MotorTorqueEvidence::OnConfirmed]);
+    }
+}
+
+/// Rule E1 (r8): Causal settle window (`TORQUE_CAUSAL_SETTLE_WINDOW = 20 ms`) on uncorrelated-RX
+/// CAN drivers (Damiao & RobStride).
+/// - An empty host RX queue or a no-op `flush()` is NOT a causal boundary.
+/// - An in-flight `0x0` delivered 5 ms after the disable write MUST NOT confirm `OffConfirmed`,
+///   MUST NOT refresh rest-pose evidence, and a pre-settle `CTRL_MODE` register reply MUST NOT
+///   verify mode.
+/// - The same `0x0` frame delivered at 25 ms (past `write_done + 20 ms`) MUST confirm `OffConfirmed`.
+/// - Same settle invariant holds for enable (`0x1` at 5 ms -> Unknown; at 25 ms -> `OnConfirmed`)
+///   and RobStride rest-pose freshness (5 ms -> not fresh; 25 ms -> fresh).
+#[test]
+fn e1_damiao_causal_settle_window_rejects_5ms_in_flight_and_accepts_25ms() {
+    use armd::driver::{
+        DamiaoArmDriver, DisableKind, MotorTorqueEvidence, RobStrideArmDriver, TorqueOutcome,
+        TorqueProgress, TORQUE_CAUSAL_SETTLE_WINDOW,
+    };
+    use armd::protocol::{damiao, robstride};
+    use armd::transport::{CanFrame, MockCanTransport, MockClock};
+
+    assert_eq!(TORQUE_CAUSAL_SETTLE_WINDOW, Duration::from_millis(20));
+
+    let make_dm_fb = |id: u16, state: u8, pos: f32| -> CanFrame {
+        let lim = limits()[0];
+        let p = damiao::float_to_uint(pos, lim.p_min, lim.p_max, 16);
+        let v = damiao::float_to_uint(0.0, lim.v_min, lim.v_max, 12);
+        let t = damiao::float_to_uint(0.0, lim.t_min, lim.t_max, 12);
+        CanFrame::new_standard(
+            0x10 + id,
+            &[
+                ((state & 0x0f) << 4) | (id as u8 & 0x0f),
+                (p >> 8) as u8,
+                p as u8,
+                (v >> 4) as u8,
+                (((v & 0x0f) << 4) | ((t >> 8) & 0x0f)) as u8,
+                t as u8,
+                30,
+                30,
+            ],
+        )
+        .unwrap()
+    };
+
+    // 1. Disable: in-flight 0x0 delivered 5 ms after disable write -> NO OffConfirmed,
+    //    empty RX queue + no-op flush() is NOT a boundary; same 0x0 at 25 ms -> OffConfirmed!
+    {
+        let clock = MockClock::new();
+        let bus = FakeBus::with_clock(&limits(), clock.clone());
+        bus.with(|s| {
+            s.immediate_replies = false;
+            s.tx_lost = true; // simulate in-flight frame delivery explicitly with untimestamped RX
+            for m in &mut s.motors {
+                m.enabled = true;
+                m.q = 0.0;
+            }
+            s.push_all_feedback();
+        });
+        let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits())
+            .unwrap();
+        drv.read_joint_states().unwrap();
+
+        // Advance 95 ms so the pre-disable pose sample is near the 100 ms staleness edge.
+        clock.advance(Duration::from_millis(95));
+        let started = clock.now();
+        let p0 = drv
+            .begin_disable_torque(DisableKind::DisableRequested {
+                started_at: started,
+                rollback: false,
+            })
+            .unwrap();
+        assert!(matches!(p0, TorqueProgress::Pending { .. }));
+        // Host RX queue is now empty and flush() returned Ok(()) (no-op) — NOT a boundary!
+
+        // Deliver an in-flight untimestamped 0x0 frame at +5 ms (before write_done + 20 ms).
+        clock.advance(Duration::from_millis(5));
+        bus.with(|s| {
+            for id in 1..=7u16 {
+                s.rx.push_back(make_dm_fb(id, 0, 0.0));
+            }
+        });
+        let p5 = drv.poll_torque(clock.now() + Duration::from_millis(5)).unwrap();
+        assert!(
+            matches!(p5, TorqueProgress::Pending { .. }),
+            "5 ms in-flight 0x0 must NOT confirm disable: {p5:?}"
+        );
+        let mut ev = [MotorTorqueEvidence::OnConfirmed; 7];
+        drv.motor_torque_evidence_into(&mut ev);
+        assert_eq!(
+            ev,
+            [MotorTorqueEvidence::Unknown; 7],
+            "5 ms in-flight 0x0 must NEVER produce OffConfirmed"
+        );
+        assert_eq!(drv.enable_state(), EnableState::Unknown);
+
+        // Pre-settle frame at +5 ms must also NOT refresh rest pose: advance 6 ms so the pre-write
+        // sample is 106 ms old (> 100 ms), while the rejected +5 ms frame would be only 6 ms old!
+        clock.advance(Duration::from_millis(6)); // now +11 ms from write_done, 106 ms from pre-write
+        let mut pos_buf = [0.0f32; 6];
+        assert!(
+            !drv.fresh_joint_positions_into(&[0, 1, 2, 3, 4, 5], Duration::from_millis(100), &mut pos_buf),
+            "5 ms pre-settle frame must NOT refresh rest-pose freshness"
+        );
+
+        // Pre-settle CTRL_MODE register reply at +5 ms (< 20 ms) must also NEVER be accepted as
+        // mode evidence, while a post-settle CTRL_MODE reply at +25 ms IS accepted!
+        {
+            let clock_m = MockClock::new();
+            let bus_m = FakeBus::with_clock(&limits(), clock_m.clone());
+            bus_m.with(|s| {
+                s.immediate_replies = false;
+                s.push_all_feedback();
+            });
+            let mut drv_m = DamiaoArmDriver::new(bus_m.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+                .with_joint_limits(limits())
+                .unwrap();
+            drv_m.read_joint_states().unwrap();
+            let started_m = clock_m.now();
+            let _ = drv_m
+                .begin_disable_torque(DisableKind::DisableRequested {
+                    started_at: started_m,
+                    rollback: false,
+                })
+                .unwrap();
+            // Advance 5 ms (inside settle window): replies arriving at +5 ms must be rejected!
+            clock_m.advance(Duration::from_millis(5));
+            let mode_reply_j1 = CanFrame::new_standard(
+                0x11,
+                &[1, 0, damiao::REG_READ, damiao::RID_CTRL_MODE, 2, 0, 0, 0],
+            )
+            .unwrap();
+            bus_m.with(|s| {
+                s.motors[0].silent = true; // no live reply; only our pre-settle queued reply
+                s.rx.push_back(mode_reply_j1);
+            });
+            let rc_early = drv_m.check_mapping_ranges();
+            assert_eq!(
+                rc_early.joints[0].ctrl_mode, None,
+                "5 ms pre-settle CTRL_MODE register reply must NOT be accepted as mode evidence"
+            );
+            // Note: check_mapping_ranges waited 20 ms per motor (140 ms total), now well past
+            // write_done + 20 ms; re-enabling J1 replies confirms post-settle CTRL_MODE IS accepted!
+            bus_m.with(|s| s.motors[0].silent = false);
+            let rc_post = drv_m.check_mapping_ranges();
+            assert_eq!(
+                rc_post.joints[0].ctrl_mode,
+                Some(damiao::CTRL_MODE_POS_VEL),
+                "post-settle CTRL_MODE register reply must be accepted as mode evidence"
+            );
+        }
+
+        // Deliver the exact same 0x0 frame at +25 ms (past write_done + 20 ms) -> OffConfirmed!
+        clock.advance(Duration::from_millis(14)); // total +25 ms from write_done
+        bus.with(|s| {
+            for id in 1..=7u16 {
+                s.rx.push_back(make_dm_fb(id, 0, 0.0));
+            }
+        });
+        let p25 = drv.poll_torque(clock.now() + Duration::from_millis(5)).unwrap();
+        assert_eq!(
+            p25,
+            TorqueProgress::Done(TorqueOutcome::Confirmed),
+            "25 ms post-settle 0x0 must confirm disable"
+        );
+        drv.motor_torque_evidence_into(&mut ev);
+        assert_eq!(ev, [MotorTorqueEvidence::OffConfirmed; 7]);
+        assert_eq!(drv.enable_state(), EnableState::Disabled);
+        assert!(
+            drv.fresh_joint_positions_into(&[0, 1, 2, 3, 4, 5], Duration::from_millis(100), &mut pos_buf),
+            "25 ms post-settle frame must restore fresh rest-pose evidence"
+        );
+    }
+
+    // 2. Enable: in-flight 0x1 delivered at 5 ms -> NO OnConfirmed; at 25 ms -> OnConfirmed!
+    {
+        let clock = MockClock::new();
+        let bus = FakeBus::with_clock(&limits(), clock.clone());
+        bus.with(|s| {
+            s.immediate_replies = false;
+            s.tx_lost = true;
+            s.push_all_feedback();
+        });
+        let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits())
+            .unwrap();
+        drv.read_joint_states().unwrap();
+
+        let p0 = drv.begin_torque(true).unwrap();
+        assert!(matches!(p0, TorqueProgress::Pending { .. }));
+
+        clock.advance(Duration::from_millis(5));
+        bus.with(|s| {
+            for id in 1..=7u16 {
+                s.rx.push_back(make_dm_fb(id, 1, 0.0));
+            }
+        });
+        let p5 = drv.poll_torque(clock.now() + Duration::from_millis(5)).unwrap();
+        assert!(matches!(p5, TorqueProgress::Pending { .. }));
+        let mut ev = [MotorTorqueEvidence::OffConfirmed; 7];
+        drv.motor_torque_evidence_into(&mut ev);
+        assert_eq!(ev, [MotorTorqueEvidence::Unknown; 7], "5 ms in-flight 0x1 must not confirm OnConfirmed");
+
+        clock.advance(Duration::from_millis(20)); // total +25 ms
+        bus.with(|s| {
+            for id in 1..=7u16 {
+                s.rx.push_back(make_dm_fb(id, 1, 0.0));
+            }
+        });
+        let p25 = drv.poll_torque(clock.now() + Duration::from_millis(5)).unwrap();
+        assert_eq!(p25, TorqueProgress::Done(TorqueOutcome::Confirmed));
+        drv.motor_torque_evidence_into(&mut ev);
+        assert_eq!(ev, [MotorTorqueEvidence::OnConfirmed; 7]);
+    }
+
+    // 3. RobStride (uncorrelated RX): feedback delivered at 5 ms after torque-changing write
+    //    must NOT count as fresh rest-pose evidence; at 25 ms it counts as fresh.
+    {
+        let clock = MockClock::new();
+        let can = MockCanTransport::new().with_clock(clock.clone());
+        let mut rs = RobStrideArmDriver::new(can, vec![1]);
+        let fb_id = robstride::build_feedback_extended_id(0x00, 1, 0xFD);
+        let fb = CanFrame::new_extended(fb_id, &[128, 0, 128, 0, 128, 0, 0, 250]).unwrap();
+        // Establish initial empty queue bound, then send torque-changing enable write.
+        let _ = rs.read_joint_states().unwrap();
+        rs.set_torque(true).unwrap();
+
+        // At +5 ms: frame is inside settle window -> NOT fresh rest-pose evidence!
+        clock.advance(Duration::from_millis(5));
+        rs.can_mut().provide_rx_frame(fb);
+        let _ = rs.read_joint_states().unwrap();
+        let mut pos = [0.0f32; 1];
+        assert!(
+            !rs.fresh_joint_positions_into(&[0], Duration::from_millis(100), &mut pos),
+            "RobStride 5 ms pre-settle frame must NOT count as fresh rest-pose evidence"
+        );
+
+        // At +25 ms: frame is past settle window -> fresh rest-pose evidence!
+        clock.advance(Duration::from_millis(20));
+        rs.can_mut().provide_rx_frame(fb);
+        let _ = rs.read_joint_states().unwrap();
+        assert!(
+            rs.fresh_joint_positions_into(&[0], Duration::from_millis(100), &mut pos),
+            "RobStride 25 ms post-settle frame must count as fresh rest-pose evidence"
+        );
     }
 }

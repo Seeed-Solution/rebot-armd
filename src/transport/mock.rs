@@ -375,6 +375,17 @@ impl MockCanTransport {
         self.transmit_responses.push((request, response));
     }
 
+    /// Replace any previously registered response(s) for `request` with `response`.
+    pub fn replace_transmit_response(&mut self, request: CanFrame, response: CanFrame) {
+        self.transmit_responses.retain(|(req, _)| *req != request);
+        self.transmit_responses.push((request, response));
+    }
+
+    /// Remove any previously registered response(s) for `request`.
+    pub fn remove_transmit_response(&mut self, request: &CanFrame) {
+        self.transmit_responses.retain(|(req, _)| req != request);
+    }
+
     pub fn provide_rx_frame(&mut self, frame: CanFrame) {
         self.rx_frames.push_back((frame, None));
     }

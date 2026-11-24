@@ -531,16 +531,19 @@ fn test_damiao_driver_mock_loopback() {
     d1_en[0] = 0x11; // state=1 (enabled), motor_id=1
     let mut d2_en = [0u8; 8];
     d2_en[0] = 0x12; // state=1 (enabled), motor_id=2
-    driver.can_mut().respond_to_transmit(damiao::build_enable_frame(1), CanFrame::new_standard(0x11, &d1_en).unwrap());
-    driver.can_mut().respond_to_transmit(damiao::build_enable_frame(2), CanFrame::new_standard(0x12, &d2_en).unwrap());
+    let f1 = CanFrame::new_standard(0x11, &d1_en).unwrap();
+    let f2 = CanFrame::new_standard(0x12, &d2_en).unwrap();
+    driver.can_mut().respond_to_transmit(damiao::build_enable_frame(1), f1);
+    driver.can_mut().respond_to_transmit(damiao::build_enable_frame(2), f2);
+    driver.can_mut().respond_to_transmit(damiao::build_refresh_frame(1), f1);
+    driver.can_mut().respond_to_transmit(damiao::build_refresh_frame(2), f2);
 
     driver.set_torque(true).unwrap();
     let tx = driver.can_mut().take_tx_frames();
-    assert_eq!(tx.len(), 2);
-    assert_eq!(tx[0].id, 1);
-    assert_eq!(tx[0].data, CMD_ENABLE);
-    assert_eq!(tx[1].id, 2);
-    assert_eq!(tx[1].data, CMD_ENABLE);
+    let enables: Vec<_> = tx.iter().filter(|f| f.data == CMD_ENABLE).collect();
+    assert_eq!(enables.len(), 2);
+    assert_eq!(enables[0].id, 1);
+    assert_eq!(enables[1].id, 2);
 
     // 2. Write joint targets
     let targets = vec![

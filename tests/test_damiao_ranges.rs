@@ -102,7 +102,9 @@ fn answer_ranges(can: &mut MockCanTransport, id: u16, r: [f32; 3]) {
 
 fn enabled(mut driver: DamiaoArmDriver<MockCanTransport>, ids: &[u16]) -> DamiaoArmDriver<MockCanTransport> {
     for &id in ids {
-        driver.can_mut().respond_to_transmit(damiao::build_enable_frame(id), raw_feedback(id as u8));
+        let fb = raw_feedback(id as u8);
+        driver.can_mut().respond_to_transmit(damiao::build_enable_frame(id), fb);
+        driver.can_mut().respond_to_transmit(damiao::build_refresh_frame(id), fb);
     }
     driver.set_torque(true).unwrap();
     driver.can_mut().take_tx_frames();

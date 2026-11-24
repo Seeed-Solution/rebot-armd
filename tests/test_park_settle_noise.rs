@@ -112,6 +112,7 @@ impl Rig {
             let p = damiao::float_to_uint(start[id as usize - 1], l.p_min, l.p_max, 16);
             let f = frame(id, 1, p, 2048, 2048);
             driver.can_mut().respond_to_transmit(damiao::build_enable_frame(id as u16), f);
+            driver.can_mut().respond_to_transmit(damiao::build_refresh_frame(id as u16), f);
             driver.can_mut().respond_to_transmit(damiao::build_disable_frame(id as u16), frame(id, 0, p, 2048, 2048));
             driver.can_mut().provide_rx_frame(f);
         }
@@ -125,6 +126,17 @@ impl Rig {
             inner.measured_positions = start.to_vec();
         }
         sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
+        {
+            let mut d = drv.lock().unwrap();
+            for id in 1..=7u8 {
+                let l = &lim[id as usize - 1];
+                let p = damiao::float_to_uint(start[id as usize - 1], l.p_min, l.p_max, 16);
+                d.can_mut().replace_transmit_response(
+                    damiao::build_refresh_frame(id as u16),
+                    frame(id, 0, p, 2048, 2048),
+                );
+            }
+        }
         Self { sup, drv, clock, lim, q: start.iter().map(|&p| p as f64).collect(), tau: 0.15, blocked: None,
             load: vec![0.0; 7], drift: vec![0.0; 7], noise, rng: Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1) }
     }

@@ -90,6 +90,9 @@ fn damiao_requires_new_enable_feedback_and_exposes_real_sample_age() {
     driver
         .can_mut()
         .respond_to_transmit(damiao::build_enable_frame(1), feedback(1, 30, 32));
+    driver
+        .can_mut()
+        .respond_to_transmit(damiao::build_refresh_frame(1), feedback(1, 30, 32));
     driver.set_torque(true).unwrap();
     assert_eq!(driver.enable_state(), EnableState::Enabled);
     let before = driver.feedback_ages()[0].unwrap();
@@ -119,7 +122,13 @@ fn damiao_disable_needs_feedback_and_failure_does_not_fabricate_disabled_status(
     driver
         .can_mut()
         .respond_to_transmit(damiao::build_enable_frame(1), feedback(1, 30, 32));
+    driver
+        .can_mut()
+        .respond_to_transmit(damiao::build_refresh_frame(1), feedback(1, 30, 32));
     driver.set_torque(true).unwrap();
+    driver
+        .can_mut()
+        .remove_transmit_response(&damiao::build_refresh_frame(1));
     driver
         .can_mut()
         .set_error_on_next_tx(Some("bus offline".into()));
@@ -176,7 +185,13 @@ fn queued_disabled_feedback_cannot_acknowledge_a_later_disable_command() {
     driver
         .can_mut()
         .respond_to_transmit(damiao::build_enable_frame(1), feedback(1, 30, 32));
+    driver
+        .can_mut()
+        .respond_to_transmit(damiao::build_refresh_frame(1), feedback(1, 30, 32));
     driver.set_torque(true).unwrap();
+    driver
+        .can_mut()
+        .remove_transmit_response(&damiao::build_refresh_frame(1));
     driver.can_mut().provide_rx_frame(feedback(0, 30, 32));
     driver.set_torque(false).unwrap();
     assert_eq!(
@@ -195,7 +210,13 @@ fn overloaded_rx_still_sends_disable_but_requires_a_new_feedback_boundary() {
     driver
         .can_mut()
         .respond_to_transmit(damiao::build_enable_frame(1), feedback(1, 30, 32));
+    driver
+        .can_mut()
+        .respond_to_transmit(damiao::build_refresh_frame(1), feedback(1, 30, 32));
     driver.set_torque(true).unwrap();
+    driver
+        .can_mut()
+        .remove_transmit_response(&damiao::build_refresh_frame(1));
     driver.can_mut().take_tx_frames();
     for _ in 0..205 {
         driver.can_mut().provide_rx_frame(feedback(0, 30, 32));
@@ -226,8 +247,14 @@ fn genuine_response_to_disable_confirms_disabled_state() {
         .respond_to_transmit(damiao::build_enable_frame(1), feedback(1, 30, 32));
     driver
         .can_mut()
+        .respond_to_transmit(damiao::build_refresh_frame(1), feedback(1, 30, 32));
+    driver
+        .can_mut()
         .respond_to_transmit(damiao::build_disable_frame(1), feedback(0, 30, 32));
     driver.set_torque(true).unwrap();
+    driver
+        .can_mut()
+        .replace_transmit_response(damiao::build_refresh_frame(1), feedback(0, 30, 32));
     driver.set_torque(false).unwrap();
     assert_eq!(driver.enable_state(), EnableState::Disabled);
 }

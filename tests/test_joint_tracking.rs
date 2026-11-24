@@ -2052,6 +2052,7 @@ fn tracking_gravity_comp_handback_and_mode_switch_hold_loss() {
         let p = damiao::float_to_uint(0.2, limits.p_min, limits.p_max, 16);
         let fb = CanFrame::new_standard(0x11, &[0x11, (p >> 8) as u8, p as u8, 0, 0, 0, 30, 30]).unwrap();
         mock.respond_to_transmit(damiao::build_enable_frame(1), fb);
+        mock.respond_to_transmit(damiao::build_refresh_frame(1), fb);
         let mk_reply = |op: u8, rid: u8, bytes: [u8; 4]| {
             CanFrame::new_standard(0, &[1, 0, op, rid, bytes[0], bytes[1], bytes[2], bytes[3]]).unwrap()
         };
@@ -2888,6 +2889,7 @@ fn damiao_write_modes_preserves_cold_arm_gravity_comp_and_interrupted_rearm() {
         let enabled_fb = CanFrame::new_standard(0x11, &[0x11, (p >> 8) as u8, p as u8, 0, 0, 0, 30, 30]).unwrap();
         let disabled_fb = CanFrame::new_standard(0x11, &[0x01, (p >> 8) as u8, p as u8, 0, 0, 0, 30, 30]).unwrap();
         mock.respond_to_transmit(damiao::build_enable_frame(1), enabled_fb);
+        mock.respond_to_transmit(damiao::build_refresh_frame(1), enabled_fb);
         mock.respond_to_transmit(damiao::build_disable_frame(1), disabled_fb);
         let mk_reply = |op: u8, rid: u8, bytes: [u8; 4]| {
             CanFrame::new_standard(0, &[1, 0, op, rid, bytes[0], bytes[1], bytes[2], bytes[3]]).unwrap()
@@ -2924,9 +2926,17 @@ fn damiao_write_modes_preserves_cold_arm_gravity_comp_and_interrupted_rearm() {
     // 3. Re-arm after interrupted MIT session (motor left in MIT when torque disabled -> restored on set_torque(true))
     drv.set_joint_modes(&[JointMode::Mit], &[JointTarget::mit(0.15, 0.0, 30.0, 1.0, 0.0)])
         .expect("enter MIT before simulated interruption");
+    let limits_rearm = DamiaoLimits::default();
+    let p_rearm = damiao::float_to_uint(0.15, limits_rearm.p_min, limits_rearm.p_max, 16);
+    let disabled_fb_rearm =
+        CanFrame::new_standard(0x11, &[0x01, (p_rearm >> 8) as u8, p_rearm as u8, 0, 0, 0, 30, 30]).unwrap();
+    let enabled_fb_rearm =
+        CanFrame::new_standard(0x11, &[0x11, (p_rearm >> 8) as u8, p_rearm as u8, 0, 0, 0, 30, 30]).unwrap();
+    drv.can_mut().replace_transmit_response(damiao::build_refresh_frame(1), disabled_fb_rearm);
     drv.set_torque(false).expect("disable while in MIT");
     assert!(!drv.is_enabled());
     let _ = drv.can_mut().take_tx_frames();
+    drv.can_mut().replace_transmit_response(damiao::build_refresh_frame(1), enabled_fb_rearm);
     drv.set_torque(true)
         .expect("re-arm after interrupted MIT session must restore POS_VEL with dual-hold and succeed");
     assert!(drv.is_enabled());
@@ -2983,6 +2993,7 @@ fn damiao_recovery_tx_failure_not_recorded_as_sent() {
     let p = damiao::float_to_uint(0.1, limits.p_min, limits.p_max, 16);
     let fb = CanFrame::new_standard(0x11, &[0x11, (p >> 8) as u8, p as u8, 0, 0, 0, 30, 30]).unwrap();
     mock.respond_to_transmit(damiao::build_enable_frame(1), fb);
+    mock.respond_to_transmit(damiao::build_refresh_frame(1), fb);
     let mut drv = DamiaoArmDriver::new(FailRecoveryTxCan { inner: mock, fail_pos_vel: false }, vec![1]);
     drv.set_torque(true).unwrap();
 
@@ -3058,6 +3069,11 @@ fn tracking_damiao_recovery_preserves_unaffected_moving_joint() {
             s.tx_log.push(*frame);
             if frame.data == [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFC] && (1..=7).contains(&frame.id) {
                 s.push_feedback((frame.id - 1) as usize);
+            } else if frame.id == 0x7FF && frame.data[2] == 0xCC {
+                let id = u16::from_le_bytes([frame.data[0], frame.data[1]]);
+                if (1..=7).contains(&id) {
+                    s.push_feedback((id - 1) as usize);
+                }
             } else if (0x101..=0x107).contains(&frame.id) {
                 let idx = (frame.id - 0x101) as usize;
                 if !s.drop_rx[idx] {

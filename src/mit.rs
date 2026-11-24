@@ -1255,6 +1255,9 @@ impl crate::supervisor::SupervisorInner {
             None => (Vec::new(), Err("no driver".into())),
         };
         if let Err(e) = res {
+            if self.estop_request_unapplied() {
+                self.consume_pending_estop();
+            }
             let msg = format!("MIT recovery after a motor timeout failed: {e}; the fault stays latched. \
                 The recovery turns torque off on every joint (support the arm); check the named joints, then clear again");
             tracing::error!("{msg}");

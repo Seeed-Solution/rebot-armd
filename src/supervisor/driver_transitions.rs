@@ -244,6 +244,7 @@ pub(crate) fn bounded_panic_disable_driver_until(
     let mut first_step = true;
     let mut last_step_err: Option<String> = None;
     let mut use_generic = false;
+    let drv_coop_deadline = drv.clock_now() + coop_budget;
     loop {
         let drv_now = drv.clock_now();
         let now = Instant::now();
@@ -257,7 +258,8 @@ pub(crate) fn bounded_panic_disable_driver_until(
             break;
         }
         let rem = coop_deadline.saturating_duration_since(now);
-        if !first_step && rem.is_zero() {
+        let drv_rem = drv_coop_deadline.saturating_duration_since(drv_now);
+        if !first_step && (rem.is_zero() || drv_rem.is_zero()) {
             if enable_fb && DisableConfirm::confirmed(drv) {
                 return PanicDisableOutcome::Confirmed;
             }
@@ -267,7 +269,7 @@ pub(crate) fn bounded_panic_disable_driver_until(
         let step_budget = if rem.is_zero() {
             hard_rem.min(DISABLE_CONFIRM_SERVICE)
         } else {
-            rem.min(hard_rem)
+            rem.min(hard_rem).min(drv_rem.max(DISABLE_CONFIRM_SERVICE))
         };
         let drv_deadline = drv_now + step_budget;
         let step_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -296,10 +298,11 @@ pub(crate) fn bounded_panic_disable_driver_until(
             }
         }
         let rem = coop_deadline.saturating_duration_since(Instant::now());
-        if rem.is_zero() {
+        let drv_rem = drv_coop_deadline.saturating_duration_since(drv.clock_now());
+        if rem.is_zero() || drv_rem.is_zero() {
             break;
         }
-        std::thread::sleep(rem.min(DISABLE_CONFIRM_SERVICE));
+        drv.clock_pause(rem.min(drv_rem).min(DISABLE_CONFIRM_SERVICE));
     }
 
     if !use_generic {

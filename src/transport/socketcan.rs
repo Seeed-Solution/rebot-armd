@@ -170,6 +170,8 @@ impl CanTransport for SocketCanTransport {
         }
     }
 
+    /// No-op on SocketCAN: `transmit()` only enqueues to the kernel socket, so `flush()` does
+    /// not wait for wire completion and is NOT a causal RX boundary.
     fn flush(&mut self) -> Result<(), TransportError> {
         Ok(())
     }
@@ -249,6 +251,8 @@ impl CanTransport for SocketCanTransport {
         ))
     }
 
+    /// No-op on SocketCAN: `transmit()` only enqueues to the kernel socket, so `flush()` does
+    /// not wait for wire completion and is NOT a causal RX boundary.
     fn flush(&mut self) -> Result<(), TransportError> {
         Ok(())
     }

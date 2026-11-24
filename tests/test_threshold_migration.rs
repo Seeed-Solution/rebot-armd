@@ -156,6 +156,7 @@ impl Rig {
         for id in 1..=7u8 {
             let f = frame(id, home[id as usize - 1], ZERO, ZERO);
             driver.can_mut().respond_to_transmit(damiao::build_enable_frame(id as u16), f);
+            driver.can_mut().respond_to_transmit(damiao::build_refresh_frame(id as u16), f);
             driver.can_mut().provide_rx_frame(f);
         }
         let drv = Arc::new(Mutex::new(driver));
