@@ -756,6 +756,7 @@ impl SupervisorInner {
                     holding: None,
                     gripper_gap_rad: None,
                     clear_releasing: false,
+                    is_gripper: false,
                 });
             }
         }
@@ -1127,6 +1128,7 @@ impl SupervisorInner {
         };
         if epoch != self.safety.epoch_id() { return Err(SafetyError::EpochMismatch { expected: self.safety.epoch_id(), received: epoch }.into()); }
         self.action_preconditions()?;
+        self.check_pos_force_gripper_fresh()?;
         self.check_gripper_close_torque_feedback(&request, &policy, gripper_idx)?;
         let close_cap = self.gripper_close_speed_limit();
         let ceiling_est = self.gripper_ceiling_torque_estimate();
@@ -1192,6 +1194,7 @@ impl SupervisorInner {
         let samples = self.workspace_samples(&traj)?;
         self.check_workspace_path(&self.commanded_positions, samples.iter().map(Vec::as_slice))?;
         if self.config.gripper_index().is_some_and(|g| (target[g] - self.commanded_positions[g]).abs() > 1e-4) {
+            self.check_pos_force_gripper_fresh()?;
             self.gripper_hold_vel_ceiling = None;
         }
         self.servo_target = None;
@@ -1271,6 +1274,7 @@ impl SupervisorInner {
             )).into());
         }
         self.action_preconditions()?;
+        self.check_pos_force_gripper_fresh()?;
         self.check_gripper_close_torque_feedback(&request, &policy, gripper_idx)?;
         let close_cap = self.gripper_close_speed_limit();
         let ceiling_est = self.gripper_ceiling_torque_estimate();
@@ -1323,6 +1327,7 @@ impl SupervisorInner {
             return Err(SafetyError::EpochMismatch { expected: self.safety.epoch_id(), received: epoch }.into());
         }
         self.action_preconditions()?;
+        self.check_pos_force_gripper_fresh()?;
         if !self.is_torqued {
             return Err(SafetyError::NotArmed(self.safety.state().clone()).into());
         }
@@ -1605,8 +1610,8 @@ impl SupervisorInner {
         match status {
             StepStatus::Running => None,
             StepStatus::Done { settled, holding, gripper_gap_rad } => {
-                let clear_releasing = self.releasing
-                    && matches!(self.active_trajectory.as_ref().map(|a| &a.reference), Some(Reference::Gripper(_)));
+                let is_gripper = matches!(self.active_trajectory.as_ref().map(|a| &a.reference), Some(Reference::Gripper(_)));
+                let clear_releasing = self.releasing && is_gripper;
                 let target = if macro_sub {
                     match (action_id, self.macro_run.as_ref().and_then(|m| m.ticket())) {
                         (Some(id), Some(ticket)) => DeferredCompletionTarget::MacroSub { action_id: id, ticket },
@@ -1636,6 +1641,7 @@ impl SupervisorInner {
                     holding,
                     gripper_gap_rad,
                     clear_releasing,
+                    is_gripper,
                 })
             }
             StepStatus::Failed { code, message } => {

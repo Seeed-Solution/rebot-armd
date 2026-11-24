@@ -2624,6 +2624,7 @@ impl SupervisorInner {
         self.tracking.invalidate();
         self.tracking.clear_recovery_suspension();
         self.reset_tx_joint_progress();
+        self.reset_hold_tx_joint_progress();
         self.hold_tx_stalled_latched = false;
         self.last_hold_tx_stall_log = None;
         self.j7_stale_since = None;

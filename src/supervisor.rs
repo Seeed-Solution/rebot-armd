@@ -676,6 +676,7 @@ pub(crate) struct DeferredActionDone {
     pub(crate) holding: Option<bool>,
     pub(crate) gripper_gap_rad: Option<f32>,
     pub(crate) clear_releasing: bool,
+    pub(crate) is_gripper: bool,
 }
 
 /// Zero-allocation classification of a bounded driver output write in one release,
@@ -690,6 +691,9 @@ pub(crate) enum TickOutput {
     Complete {
         is_hold: bool,
         now: Instant,
+        max_age: Duration,
+        due_mask: u64,
+        sent_mask: u64,
         pf_status: crate::driver::PosForceTxStatus,
     },
     Deferred {
@@ -697,7 +701,7 @@ pub(crate) enum TickOutput {
         now: Instant,
         max_age: Duration,
         oldest_age: Option<Duration>,
-        hold_stall_age: Option<Duration>,
+        due_mask: u64,
         is_hold: bool,
         sent_mask: u64,
         pf_status: crate::driver::PosForceTxStatus,
@@ -708,24 +712,29 @@ pub(crate) enum TickOutput {
         now: Instant,
         max_age: Duration,
         oldest_age: Option<Duration>,
-        hold_stall_age: Option<Duration>,
+        due_mask: u64,
+        sent_mask: u64,
         is_hold: bool,
         pf_status: crate::driver::PosForceTxStatus,
     },
     Error {
         message: crate::mit::OutputErrorText,
         now: Instant,
+        max_age: Duration,
         is_hold: bool,
         sent_any: bool,
+        due_mask: u64,
+        sent_mask: u64,
         pf_status: crate::driver::PosForceTxStatus,
     },
 }
 
 impl TickOutput {
-    /// True when the active J7 position-force gripper was skipped during this pass due to stale
-    /// feedback (> 100 ms); prevents J7-dependent action completions from committing on that tick.
+    /// True when the active J7 position-force gripper was stale (> 100 ms) during this pass
+    /// (receiving a freeze frame instead of any new target); prevents J7-dependent action
+    /// completions from committing on that tick.
     #[inline]
-    pub(crate) fn j7_skipped(&self) -> bool {
+    pub(crate) fn j7_stale(&self) -> bool {
         matches!(
             self,
             Self::Complete { pf_status: crate::driver::PosForceTxStatus::Stale { .. }, .. }
@@ -1128,6 +1137,13 @@ pub struct SupervisorInner {
     /// Driver-clock instant of the first missed tick in each joint's current no-progress run
     /// (preallocated once at `SupervisorInner::new`; mutated strictly in place -> 0 RT allocs/frees).
     pub(crate) tx_joint_no_progress_since: Vec<Option<Instant>>,
+    /// Per-`(joint, slot)` consecutive stopped-hold ticks in which a due hold frame failed to
+    /// reach the transport (queued, expired, or hard TX error; preallocated once at `new` -> 0 RT
+    /// allocs/frees).
+    pub(crate) hold_tx_no_progress_ticks: Vec<u32>,
+    /// Driver-clock instant of the first missed stopped-hold tick per `(joint, slot)`
+    /// (preallocated once at `new`; mutated strictly in place -> 0 RT allocs/frees).
+    pub(crate) hold_tx_no_progress_since: Vec<Option<Instant>>,
     /// True once `CAN_TX_STALLED` has been installed for the current stopped/fault session
     /// (prevents repeated fault re-latching; cleared in `clear_fault_finish`).
     pub(crate) hold_tx_stalled_latched: bool,
@@ -1788,6 +1804,8 @@ impl SupervisorInner {
             before_publish_hook: None,
             tx_joint_no_progress_ticks: vec![0; dof],
             tx_joint_no_progress_since: vec![None; dof],
+            hold_tx_no_progress_ticks: vec![0; dof.saturating_mul(2)],
+            hold_tx_no_progress_since: vec![None; dof.saturating_mul(2)],
             hold_tx_stalled_latched: false,
             last_hold_tx_stall_log: None,
             last_hold_tx_error_log: None,
@@ -1929,6 +1947,7 @@ impl SupervisorInner {
 
     /// Advance the stop generation under the owner lock whenever a Stop applies.
     pub fn advance_stop_generation(&mut self) -> u64 {
+        self.reset_hold_tx_joint_progress();
         self.stop_gen.fetch_add(1, Ordering::SeqCst) + 1
     }
 
@@ -2875,6 +2894,7 @@ impl SupervisorInner {
         let req = self.requested_estop_count.load(Ordering::SeqCst);
         if req > self.applied_estop_count {
             let first_gen = self.applied_estop_count + 1;
+            self.reset_hold_tx_joint_progress();
             self.e_stop_latched.store(true, Ordering::SeqCst);
             if matches!(self.torque_transition, Some(driver_transitions::TorqueTransition::Enable { .. })) {
                 if let Some(ref d) = self.driver {
@@ -3304,6 +3324,9 @@ impl SupervisorInner {
     /// Exempt from `Admitted` (Invariant 1a): system-initiated stop-direction motion
     /// completing a `NormalUnload` park so the gripper releases safely before torque-off.
     fn step_park_release(&mut self) -> bool {
+        if self.is_pos_force_j7_stale() {
+            return false;
+        }
         let next = match self.park_release {
             None if self.park_gripper_contact => ParkRelease::Opening,
             Some(ParkRelease::Opening) => ParkRelease::Closing,
@@ -3630,6 +3653,156 @@ impl SupervisorInner {
         self.tx_joint_no_progress_since.fill(None);
     }
 
+    /// Reset all per-`(joint, slot)` stopped-hold TX lack-of-progress counters and timestamps.
+    pub(crate) fn reset_hold_tx_joint_progress(&mut self) {
+        self.hold_tx_no_progress_ticks.fill(0);
+        self.hold_tx_no_progress_since.fill(None);
+    }
+
+    /// True when an active position-force gripper (`damiao_gripper.mode == PosForce`) currently
+    /// has stale (`> 100 ms`) or missing feedback. Uses non-blocking `try_lock()` so callers on
+    /// `armd-control` never block on a mutex (falling back to `self.j7_stale_since.is_some()` on
+    /// contention).
+    pub(crate) fn is_pos_force_j7_stale(&self) -> bool {
+        if !self.config.damiao_gripper.as_ref().is_some_and(|g| g.mode == crate::model::DamiaoGripperMode::PosForce) {
+            return false;
+        }
+        let Some(d) = self.driver.as_ref() else {
+            return false;
+        };
+        match d.try_lock() {
+            Ok(drv) => !drv.pos_force_feedback_fresh(),
+            Err(std::sync::TryLockError::Poisoned(p)) => !p.into_inner().pos_force_feedback_fresh(),
+            Err(std::sync::TryLockError::WouldBlock) => self.j7_stale_since.is_some(),
+        }
+    }
+
+    /// Last provably fresh (`<= 100 ms`) J7 position reported by the driver (in user coordinates),
+    /// falling back to finite `measured_positions[g]` or `commanded_positions[g]`. Uses
+    /// non-blocking `try_lock()` so callers on `armd-control` never block on a mutex.
+    pub(crate) fn pos_force_j7_freeze_position(&self) -> Option<f32> {
+        let g = self.config.gripper_index()?;
+        let raw = self
+            .driver
+            .as_ref()
+            .and_then(|d| match d.try_lock() {
+                Ok(drv) => drv.pos_force_last_fresh_position(),
+                Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner().pos_force_last_fresh_position(),
+                Err(std::sync::TryLockError::WouldBlock) => None,
+            })
+            .or_else(|| self.measured_positions.get(g).copied().filter(|p| p.is_finite()))
+            .or_else(|| self.commanded_positions.get(g).copied().filter(|p| p.is_finite()))?;
+        Some(self.config.limits.get(g).map_or(raw, |l| raw.clamp(l.min_position, l.max_position)))
+    }
+
+    /// Refuse new gripper targets while active `PosForce` J7 feedback is stale (`> 100 ms`).
+    pub(crate) fn check_pos_force_gripper_fresh(&self) -> Result<(), ArmError> {
+        if self.is_pos_force_j7_stale() {
+            return Err(ArmError::Rejected {
+                status: 409,
+                code: "J7_FEEDBACK_STALE".into(),
+                message: "Gripper (J7) position-force feedback is stale (> 100 ms); new gripper targets are refused until fresh feedback returns".into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Zero-alloc failure of a running or deferred-done gripper action when active `PosForce` J7
+    /// feedback is stale (`> 100 ms`). Snaps `commanded_positions[joint]` / `target_positions[joint]`
+    /// to the last fresh J7 position and ends the gripper action with code `"J7_FEEDBACK_STALE"`.
+    fn fail_running_gripper_for_j7_stale_rt(&mut self, joint: usize, deferred: Option<DeferredActionDone>) {
+        let freeze_pos = self.pos_force_j7_freeze_position();
+        let active_gripper_id = if self.gripper_reference_active() {
+            let old = self.active_trajectory.take();
+            let id = old.as_ref().and_then(|a| a.action_id);
+            if let Some(traj) = old {
+                self.retire_active_trajectory(traj);
+            }
+            Some(id)
+        } else {
+            None
+        };
+        let deferred_gripper = deferred.filter(|d| d.is_gripper).or_else(|| {
+            self.pending_deferred_done
+                .as_ref()
+                .is_some_and(|d| d.is_gripper)
+                .then(|| self.pending_deferred_done.take())
+                .flatten()
+        });
+        if active_gripper_id.is_none() && deferred_gripper.is_none() {
+            return;
+        }
+        if let Some(fp) = freeze_pos {
+            if joint < self.commanded_positions.len() {
+                self.commanded_positions[joint] = fp;
+            }
+            if joint < self.target_positions.len() {
+                self.target_positions[joint] = fp;
+            }
+        }
+        if joint < self.commanded_velocities.len() {
+            self.commanded_velocities[joint] = 0.0;
+        }
+        if let Some(id_opt) = active_gripper_id {
+            if id_opt.is_none() && self.park_release == Some(ParkRelease::Opening) {
+                self.park_release = None;
+                self.park_gripper_contact = false;
+                self.releasing = false;
+            }
+            if !self.pending_normal_unload {
+                self.safety.mark_motion_finished();
+            }
+            let macro_sub = self.macro_run.as_ref().is_some_and(|m| Some(m.id) == id_opt);
+            if macro_sub {
+                if let Some(m) = self.macro_run.as_mut() {
+                    m.sub = SubState::Failed {
+                        code: crate::safety::BoundedText::new("J7_FEEDBACK_STALE"),
+                        message: crate::motion::StepErrorText::new(
+                            "Gripper (J7) position-force feedback became stale (> 100 ms)",
+                        ),
+                    };
+                }
+            } else if let Some(id) = id_opt {
+                let mut msg = self.take_action_msg_buf(id, 160);
+                msg.clear();
+                msg.push_str("Gripper (J7) position-force feedback became stale (> 100 ms)");
+                self.finish_action(id, "failed", Some("J7_FEEDBACK_STALE"), Some(msg), None, None, None);
+            }
+        }
+        if let Some(done) = deferred_gripper {
+            if !self.pending_normal_unload {
+                self.safety.mark_motion_finished();
+            }
+            match done.target {
+                DeferredCompletionTarget::MacroSub { action_id, ticket } => {
+                    if let Some(m) = self.macro_run.as_mut().filter(|m| {
+                        m.id == action_id && m.ticket() == Some(ticket) && !m.stop_requested && m.sub == SubState::Running
+                    }) {
+                        m.sub = SubState::Failed {
+                            code: crate::safety::BoundedText::new("J7_FEEDBACK_STALE"),
+                            message: crate::motion::StepErrorText::new(
+                                "Gripper (J7) position-force feedback became stale (> 100 ms)",
+                            ),
+                        };
+                    }
+                }
+                DeferredCompletionTarget::Action(id) => {
+                    let mut msg = self.take_action_msg_buf(id, 160);
+                    msg.clear();
+                    msg.push_str("Gripper (J7) position-force feedback became stale (> 100 ms)");
+                    self.finish_action(id, "failed", Some("J7_FEEDBACK_STALE"), Some(msg), None, None, None);
+                }
+                DeferredCompletionTarget::ParkRelease(ParkRelease::Opening) => {
+                    self.park_release = None;
+                    self.park_gripper_contact = false;
+                    self.releasing = false;
+                }
+                DeferredCompletionTarget::ParkRelease(ParkRelease::Closing)
+                | DeferredCompletionTarget::Anonymous => {}
+            }
+        }
+    }
+
     /// Maximum consecutive non-stopped ticks any joint has gone without a completed target TX.
     fn max_tx_joint_no_progress_ticks(&self) -> u32 {
         let n = self.config.dof.min(self.tx_joint_no_progress_ticks.len());
@@ -3672,27 +3845,54 @@ impl SupervisorInner {
         }
     }
 
-    /// Real-backlog-only stopped-hold TX stall accounting across `Deferred` and `Expired`:
-    /// - `CAN_TX_STALLED` latches ONLY when hold frames are actually queued (`queued > 0`) AND
-    ///   the driver's per-`(joint, frame_id)` continuity age reaches `>= max_age`.
-    /// - Zero queued frames (`queued == 0`, including freshness-refused holds and hard-error
-    ///   queue discards) can NEVER latch `CAN_TX_STALLED`.
+    /// Per-motor (`(joint, slot)`) stopped-hold lack-of-progress accounting across ALL hold
+    /// outcomes (`Complete`, `Deferred`, `Expired`, and hard `Error`):
+    /// - Counts ticks in which a due motor's stopped-hold frame failed to reach the transport,
+    ///   whether it remained queued, expired (`pending == 0`), or failed with a hard TX error.
+    /// - When nothing is due (`due_mask == 0`, e.g. idle, disabled, or stop-inhibited), resets
+    ///   progress counters and never latches `CAN_TX_STALLED`.
     fn account_stopped_hold_progress(
         &mut self,
         now: Instant,
         max_age: Duration,
+        due_mask: u64,
+        sent_mask: u64,
         queued: usize,
         dropped: usize,
-        hold_stall_age: Option<Duration>,
     ) {
         self.reset_tx_joint_progress();
-        if queued == 0 {
+        if due_mask == 0 {
+            self.reset_hold_tx_joint_progress();
             return;
         }
-        let Some(observed_age) = hold_stall_age else {
-            return;
-        };
-        if observed_age < max_age {
+        let slots = self
+            .config
+            .dof
+            .saturating_mul(2)
+            .min(self.hold_tx_no_progress_ticks.len())
+            .min(self.hold_tx_no_progress_since.len())
+            .min(64);
+        let mut max_slot_ticks = 0u32;
+        let mut max_slot_age = Duration::ZERO;
+        for s in 0..slots {
+            let bit = 1u64 << s;
+            if (due_mask & bit) == 0 || (sent_mask & bit) != 0 {
+                self.hold_tx_no_progress_ticks[s] = 0;
+                self.hold_tx_no_progress_since[s] = None;
+            } else {
+                let ticks = self.hold_tx_no_progress_ticks[s].saturating_add(1);
+                self.hold_tx_no_progress_ticks[s] = ticks;
+                let since = *self.hold_tx_no_progress_since[s].get_or_insert(now);
+                let age = now.saturating_duration_since(since);
+                if ticks > max_slot_ticks {
+                    max_slot_ticks = ticks;
+                }
+                if age > max_slot_age {
+                    max_slot_age = age;
+                }
+            }
+        }
+        if max_slot_ticks == 0 || max_slot_age < max_age {
             return;
         }
         let mut escalated_now = false;
@@ -3700,9 +3900,9 @@ impl SupervisorInner {
             let detail = crate::safety::TxStallDetail {
                 queued,
                 dropped,
-                age_ms: observed_age.as_millis().min(u128::from(u64::MAX)) as u64,
+                age_ms: max_slot_age.as_millis().min(u128::from(u64::MAX)) as u64,
                 limit_ms: max_age.as_millis().min(u128::from(u64::MAX)) as u64,
-                consecutive_ticks: 0,
+                consecutive_ticks: max_slot_ticks,
                 is_hold: true,
             };
             self.safety.latch(
@@ -3715,7 +3915,7 @@ impl SupervisorInner {
             escalated_now = true;
         }
         if !escalated_now && !self.safety.deferred_logging() && self.should_log_hold_tx_stall(now) {
-            let age_ms = observed_age.as_millis().min(u128::from(u64::MAX)) as u64;
+            let age_ms = max_slot_age.as_millis().min(u128::from(u64::MAX)) as u64;
             let limit_ms = max_age.as_millis().min(u128::from(u64::MAX)) as u64;
             if dropped > 0 {
                 tracing::error!(
@@ -3723,14 +3923,16 @@ impl SupervisorInner {
                     queued,
                     age_ms,
                     limit_ms,
-                    "Stopped hold CAN TX expired without sending any frame"
+                    consecutive_ticks = max_slot_ticks,
+                    "Stopped hold CAN TX expired without reaching transport"
                 );
             } else {
                 tracing::error!(
                     queued,
                     age_ms,
                     limit_ms,
-                    "Stopped hold CAN TX stalled with no frames sent within age limit"
+                    consecutive_ticks = max_slot_ticks,
+                    "Stopped hold CAN TX stalled without reaching transport within age limit"
                 );
             }
         }
@@ -3747,18 +3949,26 @@ impl SupervisorInner {
         let now = drv.clock_now();
         let max_age = drv.tx_frame_max_age();
         let hold_sent_any = is_hold && drv.last_hold_tx_sent_any();
-        let hold_stall_age = if is_hold { drv.last_hold_stall_age() } else { None };
+        let due_mask = if is_hold { drv.last_hold_tx_due_mask() } else { 0 };
+        let hold_sent_mask = if is_hold { drv.last_hold_tx_sent_mask() } else { 0 };
         let pf_status = drv.take_last_pos_force_tx_status();
         match write_res {
-            Ok(TxBatchOutcome::Complete) => TickOutput::Complete { is_hold, now, pf_status },
+            Ok(TxBatchOutcome::Complete) => TickOutput::Complete {
+                is_hold,
+                now,
+                max_age,
+                due_mask,
+                sent_mask: hold_sent_mask,
+                pf_status,
+            },
             Ok(TxBatchOutcome::Deferred { pending }) => TickOutput::Deferred {
                 pending,
                 now,
                 max_age,
                 oldest_age: drv.oldest_pending_tx_age(),
-                hold_stall_age,
+                due_mask,
                 is_hold,
-                sent_mask: if is_hold { 0 } else { drv.last_target_tx_sent_mask() },
+                sent_mask: if is_hold { hold_sent_mask } else { drv.last_target_tx_sent_mask() },
                 pf_status,
             },
             Ok(TxBatchOutcome::Expired { dropped, pending }) => TickOutput::Expired {
@@ -3767,7 +3977,8 @@ impl SupervisorInner {
                 now,
                 max_age,
                 oldest_age: drv.last_tx_expired_age(),
-                hold_stall_age,
+                due_mask,
+                sent_mask: hold_sent_mask,
                 is_hold,
                 pf_status,
             },
@@ -3780,8 +3991,11 @@ impl SupervisorInner {
                 TickOutput::Error {
                     message: buf,
                     now,
+                    max_age,
                     is_hold,
                     sent_any: hold_sent_any,
+                    due_mask,
+                    sent_mask: hold_sent_mask,
                     pf_status,
                 }
             }
@@ -3790,10 +4004,10 @@ impl SupervisorInner {
 
     /// Zero-allocation / zero-free motion halt for an RT fault latch on `skip_joint` (e.g. J7
     /// pos-force staleness): retires any active trajectory off-thread, clears servo/park/stream
-    /// motion state WITHOUT calling allocating `stop_motion()`, and snaps commanded positions to
-    /// fresh measured positions ONLY for healthy joints (`i != skip_joint`) so stale `skip_joint`
-    /// never overwrites its last commanded target.
+    /// motion state WITHOUT calling allocating `stop_motion()`, snaps healthy joints to measured
+    /// positions, and snaps `skip_joint` to its last fresh freeze position (when available).
     fn halt_motion_for_fault_rt(&mut self, skip_joint: usize) {
+        let freeze_pos = self.pos_force_j7_freeze_position();
         self.mit.park_after_hand_back = false;
         self.mit.deferred_park_action = None;
         self.release_servo_target();
@@ -3815,7 +4029,11 @@ impl SupervisorInner {
         self.commanded_accelerations.fill(0.0);
         let dof = self.config.dof.min(self.commanded_positions.len()).min(self.measured_positions.len());
         for i in 0..dof {
-            if i != skip_joint && self.measured_positions[i].is_finite() {
+            if i == skip_joint {
+                if let Some(fp) = freeze_pos {
+                    self.commanded_positions[i] = fp;
+                }
+            } else if self.measured_positions[i].is_finite() {
                 self.commanded_positions[i] = self.measured_positions[i];
             }
         }
@@ -3826,11 +4044,12 @@ impl SupervisorInner {
     /// paths:
     /// - `Fresh`: resets the staleness timer.
     /// - `Unobserved`: leaves state unchanged.
-    /// - `Stale { joint, age }`: advances the continuous staleness duration on the driver clock;
-    ///   while below `damiao_gripper.feedback_stale_fault_ms` (default 250 ms, 200..=450 ms), no
-    ///   fault latches (J7 jaw holds its last pos-force target inside motor firmware while a `0xCC`
-    ///   refresh polls it and J1–J6 continue). At or above the limit, halts motion zero-alloc and
-    ///   latches recoverable [`FaultKind::J7FeedbackStale`] once per fault episode.
+    /// - `Stale { joint, age, fresh_gen }`: immediately terminates any running gripper action with
+    ///   `"J7_FEEDBACK_STALE"` (J7 gets the `vel_raw = 0` freeze frame at the last fresh measured
+    ///   position plus a `0xCC` refresh while J1–J6 continue), and advances the continuous
+    ///   staleness duration on the driver clock; at or above `damiao_gripper.feedback_stale_fault_ms`
+    ///   (default 250 ms, 200..=450 ms), halts motion zero-alloc and latches recoverable
+    ///   [`FaultKind::J7FeedbackStale`] once per fault episode.
     fn handle_j7_feedback_staleness(
         &mut self,
         pf_status: crate::driver::PosForceTxStatus,
@@ -3843,6 +4062,7 @@ impl SupervisorInner {
                 self.j7_stale_since = None;
             }
             PosForceTxStatus::Stale { joint, age, fresh_gen } => {
+                self.fail_running_gripper_for_j7_stale_rt(joint, None);
                 let since = match self.j7_stale_since {
                     Some((gen, t)) if gen == fresh_gen => t,
                     _ => {
@@ -3887,6 +4107,7 @@ impl SupervisorInner {
     ) -> bool {
         match output {
             TickOutput::None => {
+                self.reset_hold_tx_joint_progress();
                 if !self.is_torqued || self.disable_pending || self.shutdown_committed {
                     self.reset_tx_joint_progress();
                     self.j7_stale_since = None;
@@ -3897,6 +4118,7 @@ impl SupervisorInner {
             }
             TickOutput::EstopInhibited { is_hold } => {
                 self.reset_tx_joint_progress();
+                self.reset_hold_tx_joint_progress();
                 if is_hold || self.safety.state().is_stopped() {
                     self.tracking.invalidate();
                     self.commanded_velocities.fill(0.0);
@@ -3927,8 +4149,13 @@ impl SupervisorInner {
                 }
                 false
             }
-            TickOutput::Complete { now, pf_status, .. } => {
+            TickOutput::Complete { is_hold, now, max_age, due_mask, sent_mask, pf_status } => {
                 self.reset_tx_joint_progress();
+                if is_hold || self.safety.state().is_stopped() {
+                    self.account_stopped_hold_progress(now, max_age, due_mask, sent_mask, 0, 0);
+                } else {
+                    self.reset_hold_tx_joint_progress();
+                }
                 self.handle_j7_feedback_staleness(pf_status, now);
                 true
             }
@@ -3937,7 +4164,7 @@ impl SupervisorInner {
                 now,
                 max_age,
                 oldest_age,
-                hold_stall_age,
+                due_mask,
                 is_hold,
                 sent_mask,
                 pf_status,
@@ -3947,20 +4174,16 @@ impl SupervisorInner {
                 // mask a motion TX stall; both conditions record through `SafetyManager::latch`.
                 let treat_as_hold = is_hold || self.safety.state().is_stopped();
                 if treat_as_hold {
-                    self.account_stopped_hold_progress(now, max_age, pending, 0, hold_stall_age);
+                    self.account_stopped_hold_progress(now, max_age, due_mask, sent_mask, pending, 0);
                     self.handle_j7_feedback_staleness(pf_status, now);
                     return false;
                 }
+                self.reset_hold_tx_joint_progress();
 
                 if count_release_streak {
                     // Track per-motor lack of progress: joints that completed a target TX in this pass
                     // reset their streak, while unsent joints advance their own streak & age. Healthy
                     // partial passes where carry-over frames drain every 1-2 ticks never false-fault.
-                    // Exclude a skipped stale J7 from motion TX stall accounting (handled by Item 1).
-                    let skipped_pf_joint = match pf_status {
-                        crate::driver::PosForceTxStatus::Stale { joint, .. } => Some(joint),
-                        _ => None,
-                    };
                     let n = self
                         .config
                         .dof
@@ -3970,7 +4193,7 @@ impl SupervisorInner {
                     let mut max_joint_ticks = 0u32;
                     let mut max_joint_age = Duration::ZERO;
                     for j in 0..n {
-                        if skipped_pf_joint == Some(j) || (sent_mask & (1u64 << j)) != 0 {
+                        if (sent_mask & (1u64 << j)) != 0 {
                             self.tx_joint_no_progress_ticks[j] = 0;
                             self.tx_joint_no_progress_since[j] = None;
                         } else {
@@ -4009,7 +4232,8 @@ impl SupervisorInner {
                 now,
                 max_age,
                 oldest_age,
-                hold_stall_age,
+                due_mask,
+                sent_mask,
                 is_hold,
                 pf_status,
             } => {
@@ -4018,10 +4242,11 @@ impl SupervisorInner {
                 // mask a non-recoverable motion `CAN_TX_STALLED` latch.
                 let treat_as_hold = is_hold || self.safety.state().is_stopped();
                 if treat_as_hold {
-                    self.account_stopped_hold_progress(now, max_age, pending, dropped, hold_stall_age);
+                    self.account_stopped_hold_progress(now, max_age, due_mask, sent_mask, pending, dropped);
                     self.handle_j7_feedback_staleness(pf_status, now);
                     return false;
                 }
+                self.reset_hold_tx_joint_progress();
 
                 let age = oldest_age
                     .or_else(|| self.max_tx_joint_no_progress_age(now))
@@ -4039,7 +4264,7 @@ impl SupervisorInner {
                 self.handle_j7_feedback_staleness(pf_status, now);
                 false
             }
-            TickOutput::Error { message, now, is_hold, sent_any, pf_status } => {
+            TickOutput::Error { message, now, max_age, is_hold, sent_any, due_mask, sent_mask, pf_status } => {
                 // Classify using the pass's original motion vs stopped-hold context BEFORE
                 // `handle_j7_feedback_staleness` so recoverable J7 staleness can never mask a
                 // non-recoverable motion `DRIVER_WRITE_FAILED` latch.
@@ -4052,12 +4277,13 @@ impl SupervisorInner {
                         copy_into(&mut self.commanded_positions, &self.measured_positions);
                         copy_into(&mut self.target_positions, &self.measured_positions);
                     }
-                    // Hard error discarded the hold queue (0 frames queued): NEVER latches
-                    // `CAN_TX_STALLED`; rate-limit the error log on driver clock (<= 1/s) with an
-                    // exact suppressed-event counter on both Legacy and RT Executor paths.
+                    // Rate-limit `"Stopped hold output failed"` (<= 1/s with exact suppressed
+                    // counter) AND account per-motor lack of progress toward `CAN_TX_STALLED`.
                     self.log_stopped_hold_output_failed_throttled(now, sent_any, message.as_str());
+                    self.account_stopped_hold_progress(now, max_age, due_mask, sent_mask, 0, 0);
                 } else {
                     self.reset_tx_joint_progress();
+                    self.reset_hold_tx_joint_progress();
                     self.stop_motion();
                     self.tracking.invalidate();
                     self.commanded_velocities.fill(0.0);
@@ -5312,6 +5538,13 @@ impl SupervisorInner {
         let mut grip_learned: Option<(Option<u64>, crate::gripper_baseline::MoveRecord)> = None;
         let cap_k = self.gripper_cap_ramp.map(|r| r.k_est);
         let mut grip_contact: Option<crate::gripper_baseline::ContactInfo> = None;
+        let j7_pf_stale_before_step = self.is_pos_force_j7_stale();
+        let j7_pf_freeze_pos = if j7_pf_stale_before_step {
+            self.pos_force_j7_freeze_position()
+        } else {
+            None
+        };
+        let last_action_progress = self.last_action.as_ref().map_or(0.0, |a| a.progress);
         let stepped = if let Some(active) = self.active_trajectory.as_mut() {
             let ctx = StepCtx {
                 dt: servo_dt,
@@ -5338,11 +5571,33 @@ impl SupervisorInner {
                 }
                 Reference::Path(path) => { path.step_into(&ctx, &mut step_buf); Stepped::Arm(std::mem::take(&mut step_buf)) }
                 Reference::Gripper(grip) => {
-                    grip.set_cap_stiffness(cap_k);
-                    grip.step_into(&ctx, &mut step_buf);
-                    grip_learned = grip.take_learning().map(|r| (active.action_id, r));
-                    if let Some(c) = grip.last_contact { grip_contact = Some(c); }
-                    Stepped::Action(std::mem::take(&mut step_buf))
+                    if j7_pf_stale_before_step {
+                        let g = grip.gripper_index;
+                        step_buf.positions.clear();
+                        step_buf.positions.extend_from_slice(&self.commanded_positions);
+                        step_buf.velocities.clear();
+                        step_buf.velocities.resize(self.commanded_velocities.len(), 0.0);
+                        if let Some(fp) = j7_pf_freeze_pos {
+                            if g < step_buf.positions.len() {
+                                step_buf.positions[g] = fp;
+                            }
+                        }
+                        step_buf.progress = last_action_progress;
+                        step_buf.clear_gripper_stall = false;
+                        step_buf.status = StepStatus::Failed {
+                            code: "J7_FEEDBACK_STALE",
+                            message: crate::motion::StepErrorText::new(
+                                "Gripper (J7) position-force feedback became stale (> 100 ms)",
+                            ),
+                        };
+                        Stepped::Action(std::mem::take(&mut step_buf))
+                    } else {
+                        grip.set_cap_stiffness(cap_k);
+                        grip.step_into(&ctx, &mut step_buf);
+                        grip_learned = grip.take_learning().map(|r| (active.action_id, r));
+                        if let Some(c) = grip.last_contact { grip_contact = Some(c); }
+                        Stepped::Action(std::mem::take(&mut step_buf))
+                    }
                 }
                 Reference::Replay(replay) => {
                     replay.step_into(&ctx, &mut step_buf);
@@ -6086,7 +6341,7 @@ impl SupervisorInner {
             && self.driver.as_ref().is_some_and(|d| {
                 d.lock().is_ok_and(|drv| drv.pending_motion_tx_len() > 0)
             });
-        let j7_skipped = tick_output.j7_skipped();
+        let j7_stale = tick_output.j7_stale();
         let batch_completed = self.classify_tick_output(tick_output, true, has_pending_motion);
 
         if self.servo_stream_active
@@ -6104,7 +6359,7 @@ impl SupervisorInner {
         let arm_output_accepted =
             (driverless_accepted || (allow_output_accepted && batch_completed))
                 && !self.safety.state().is_stopped();
-        let tick_output_accepted = arm_output_accepted && !j7_skipped;
+        let tick_output_accepted = arm_output_accepted && !j7_stale;
 
         if !gravity_handback_ran {
             let gravity_stiff_hold_completed =
@@ -6114,7 +6369,12 @@ impl SupervisorInner {
 
         if let Some(done) = deferred_done {
             if !self.safety.state().is_stopped() {
-                self.pending_deferred_done = Some(done);
+                if j7_stale && done.is_gripper {
+                    let g = self.config.gripper_index().unwrap_or(self.config.dof.saturating_sub(1));
+                    self.fail_running_gripper_for_j7_stale_rt(g, Some(done));
+                } else {
+                    self.pending_deferred_done = Some(done);
+                }
             }
         }
         if self.macro_run.is_some() {

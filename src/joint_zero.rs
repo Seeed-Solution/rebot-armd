@@ -221,12 +221,18 @@ impl ArmDriver for ZeroOffsetDriver {
         r
     }
     fn last_hold_tx_sent_any(&self) -> bool { self.inner.last_hold_tx_sent_any() }
-    fn last_hold_stall_age(&self) -> Option<Duration> { self.inner.last_hold_stall_age() }
+    fn last_hold_tx_due_mask(&self) -> u64 { self.inner.last_hold_tx_due_mask() }
+    fn last_hold_tx_sent_mask(&self) -> u64 { self.inner.last_hold_tx_sent_mask() }
     fn last_target_tx_sent_mask(&self) -> u64 { self.inner.last_target_tx_sent_mask() }
     fn take_last_pos_force_tx_status(&mut self) -> crate::driver::PosForceTxStatus {
         self.inner.take_last_pos_force_tx_status()
     }
     fn pos_force_feedback_fresh(&self) -> bool { self.inner.pos_force_feedback_fresh() }
+    fn pos_force_last_fresh_position(&self) -> Option<f32> {
+        let pos = self.inner.pos_force_last_fresh_position()?;
+        let offset = self.inner.gripper_pos_force_info().map_or(0.0, |info| self.off(info.joint));
+        Some(pos - offset)
+    }
     fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) { self.inner.feedback_ages_into(out) }
     fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool { self.inner.feedback_all_within(dof, max_age) }
     fn feedback_joints_within(&self, joints: &[usize], max_age: Duration) -> bool {

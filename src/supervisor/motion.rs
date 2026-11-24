@@ -1043,6 +1043,13 @@ impl SupervisorInner {
         self.pending_normal_unload = false;
 
         self.safety.validate_motion_command(epoch_id, target, &self.config.limits)?;
+        if self.config.gripper_index().is_some_and(|g| {
+            target.len() > g
+                && self.commanded_positions.len() > g
+                && (target[g] - self.commanded_positions[g]).abs() > 1e-4
+        }) {
+            self.check_pos_force_gripper_fresh()?;
+        }
         self.torque_hold_filter(target);
         self.power_hold_filter(target);
 
@@ -1193,6 +1200,13 @@ impl SupervisorInner {
             &target_positions,
             &self.config.limits,
         )?;
+        if self.config.gripper_index().is_some_and(|g| {
+            target_positions.len() > g
+                && self.commanded_positions.len() > g
+                && (target_positions[g] - self.commanded_positions[g]).abs() > 1e-4
+        }) {
+            self.check_pos_force_gripper_fresh()?;
+        }
         self.torque_hold_filter(&mut target_positions);
         self.power_hold_filter(&mut target_positions);
 

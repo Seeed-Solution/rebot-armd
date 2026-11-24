@@ -315,6 +315,17 @@ impl SupervisorInner {
         }
         self.torque_hold_filter(targets);
         self.power_hold_filter(targets);
+        if self.is_pos_force_j7_stale() {
+            if let Some(g) = self.config.gripper_index() {
+                if targets.len() > g {
+                    if let Some(freeze_pos) = self.pos_force_j7_freeze_position() {
+                        targets[g] = freeze_pos;
+                    } else if g < self.commanded_positions.len() {
+                        targets[g] = self.commanded_positions[g];
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -322,6 +333,10 @@ impl SupervisorInner {
     /// releases the stall latch on a target away from the stall. A torque-cap latch needs the
     /// target [`GRIPPER_FORCE_RELEASE_MARGIN_RAD`] more open than the hold.
     pub(super) fn release_gripper_stall_on_reverse(&mut self, targets: &[f32]) {
+        if self.is_pos_force_j7_stale() {
+            self.gripper_stream_target = None;
+            return;
+        }
         if let Some(g_idx) = self.config.gripper_index() {
             self.gripper_stream_target = targets.get(g_idx).copied().filter(|t| t.is_finite());
             self.gripper_stream_lease = self.active_lease.as_ref().map(|l| l.generation);
