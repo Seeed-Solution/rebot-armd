@@ -365,7 +365,7 @@ pub enum MaintenanceOp {
     ShutdownReady,
     PlanningSnapshot,
     Observation,
-    ClearFault,
+    ClearFault { expected_epoch: Option<u64> },
     SetJointZeroOffsets { offsets: Vec<f32> },
     SetMotorZero { joint: usize },
     #[doc(hidden)]
@@ -1260,14 +1260,31 @@ impl RtExecutorHandle {
     }
 
     pub fn clear_fault(&self) -> Result<Result<SafetyState, SafetyError>, OwnerError> {
-        match self.call_maintenance(MaintenanceOp::ClearFault)? {
+        self.clear_fault_for_epoch(None)
+    }
+
+    pub fn clear_fault_for_epoch(
+        &self,
+        expected_epoch: Option<u64>,
+    ) -> Result<Result<SafetyState, SafetyError>, OwnerError> {
+        match self.call_maintenance(MaintenanceOp::ClearFault { expected_epoch })? {
             MaintenanceResult::FaultCleared(r) => Ok(r.map_err(SafetyError::from)),
             _ => Err(OwnerError::Protocol),
         }
     }
 
     pub async fn clear_fault_async(&self) -> Result<Result<SafetyState, SafetyError>, OwnerError> {
-        match self.call_maintenance_async(MaintenanceOp::ClearFault).await? {
+        self.clear_fault_for_epoch_async(None).await
+    }
+
+    pub async fn clear_fault_for_epoch_async(
+        &self,
+        expected_epoch: Option<u64>,
+    ) -> Result<Result<SafetyState, SafetyError>, OwnerError> {
+        match self
+            .call_maintenance_async(MaintenanceOp::ClearFault { expected_epoch })
+            .await?
+        {
             MaintenanceResult::FaultCleared(r) => Ok(r.map_err(SafetyError::from)),
             _ => Err(OwnerError::Protocol),
         }
@@ -1704,9 +1721,9 @@ impl ControlState {
                 MaintenanceResult::PlanningSnapshot(core.planning_snapshot(ctx))
             }
             MaintenanceOp::Observation => MaintenanceResult::Observation(Box::new(core.current_observation())),
-            MaintenanceOp::ClearFault => {
+            MaintenanceOp::ClearFault { expected_epoch } => {
                 self.shutdown_committed = false;
-                let res = core.clear_fault_executor_bounded(release_deadline);
+                let res = core.clear_fault_executor_bounded_for_epoch(release_deadline, expected_epoch);
                 if res.is_ok() {
                     *release_flags |= RELEASE_FLAG_CLEAR_OK;
                 } else {

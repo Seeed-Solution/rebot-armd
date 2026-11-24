@@ -358,7 +358,7 @@ impl SupervisorInner {
             self.commanded_velocities[i] = 0.0;
         }
         self.tracking.invalidate();
-        self.target_positions = self.commanded_positions.clone();
+        crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
         let at = self.start_time.elapsed().as_secs_f64();
         if code == "REQUESTED" || code == "STOPPED" {
             tracing::info!("Gravity compensation exit: {code} {message}");
@@ -401,14 +401,14 @@ impl SupervisorInner {
         }))
     }
 
-    /// Joint targets while the mode is on: MIT for J1-J6, position for the gripper.
-    pub fn gravity_comp_targets(&self) -> Option<Vec<JointTarget>> {
-        self.gravity_comp_targets_array().map(|a| a.to_vec())
+    /// Joint targets while the mode is on: MIT for J1-J6, position for the gripper (bounded inline array, 0 heap allocs).
+    pub fn gravity_comp_targets(&self) -> Option<[JointTarget; ARM + 1]> {
+        self.gravity_comp_targets_array()
     }
 
     fn gravity_comp_exit_cause(&mut self, dt: f64) -> Option<(&'static str, String)> {
         let run = self.gravity_comp.as_ref()?;
-        let policy = run.policy.clone();
+        let policy = &run.policy;
         if self.e_stop_latched.load(std::sync::atomic::Ordering::SeqCst) || self.safety.state() == &SafetyState::EStop {
             return Some(("ESTOP", "E-stop".into()));
         }
@@ -435,7 +435,7 @@ impl SupervisorInner {
         if !self.feedback_numeric_valid || !self.hardware_feedback_fresh(Duration::from_millis(policy.feedback_max_age_ms)) {
             return Some(("FEEDBACK_STALE", format!("Feedback older than {} ms", policy.feedback_max_age_ms)));
         }
-        if let Some(msg) = self.gravity_comp_near_limit(&policy) { return Some(("GRAVITY_COMP_JOINT_LIMIT", msg.to_string())); }
+        if let Some(msg) = self.gravity_comp_near_limit(policy) { return Some(("GRAVITY_COMP_JOINT_LIMIT", msg.to_string())); }
         if run.phase == GravityCompPhase::RampIn {
             if let Some((i, d)) = (0..ARM).map(|i| (i, (self.measured_positions[i] - run.entry_pose[i]).abs()))
                 .find(|(_, d)| !d.is_finite() || *d > policy.ramp_max_deviation_rad) {
@@ -460,12 +460,13 @@ impl SupervisorInner {
             let limit = policy.directional_speed_limit(i, v, gravity.as_ref().map(|t| t[i]));
             if speed > limit && fastest.is_none_or(|(_, s, _)| speed > s) { fastest = Some((i, speed, limit)); }
         }
+        let overspeed_ticks = policy.overspeed_ticks;
         let run = self.gravity_comp.as_mut()?;
         run.prev_measured = Some(measured);
         match fastest {
             Some((i, speed, limit)) => {
                 run.overspeed_count += 1;
-                if run.overspeed_count >= policy.overspeed_ticks {
+                if run.overspeed_count >= overspeed_ticks {
                     return Some(("GRAVITY_COMP_OVERSPEED", format!(
                         "Joint {} at {speed:.2} rad/s for {} ticks (limit {limit} rad/s)", i + 1, run.overspeed_count)));
                 }
@@ -485,26 +486,34 @@ impl SupervisorInner {
                     self.exit_gravity_comp(code, message);
                     return;
                 }
-                let Some(run) = self.gravity_comp.as_ref() else { return; };
-                let (policy, scale) = (run.policy.clone(), run.scale);
-                let Some(model) = self.gravity_comp_model_torque(&policy, scale) else {
+                let model = {
+                    let Some(run) = self.gravity_comp.as_ref() else { return; };
+                    self.gravity_comp_model_torque(&run.policy, run.scale)
+                };
+                let Some(model) = model else {
                     self.exit_gravity_comp("GRAVITY_MODEL_UNAVAILABLE", "Gravity torque could not be computed");
                     return;
                 };
                 let measured = arm6(&self.measured_positions);
-                let Some(run) = self.gravity_comp.as_mut() else { return; };
-                run.elapsed_s += dt;
-                let r = run.ramp();
-                for i in 0..ARM {
-                    let lim = policy.torque_limits_nm[i];
-                    run.tau_ff[i] = ((1.0 - r) * run.entry_torque[i] + r * model[i]).clamp(-lim, lim);
-                    run.kp[i] = (1.0 - r) * policy.hold_kp[i];
-                    run.kd[i] = (1.0 - r) * policy.hold_kd[i] + r * run.damping_kd[i];
-                    run.position[i] = if r < 1.0 { run.entry_pose[i] } else { measured[i] };
+                let mut ramp_completed = false;
+                {
+                    let Some(run) = self.gravity_comp.as_mut() else { return; };
+                    run.elapsed_s += dt;
+                    let r = run.ramp();
+                    for i in 0..ARM {
+                        let lim = run.policy.torque_limits_nm[i];
+                        run.tau_ff[i] = ((1.0 - r) * run.entry_torque[i] + r * model[i]).clamp(-lim, lim);
+                        run.kp[i] = (1.0 - r) * run.policy.hold_kp[i];
+                        run.kd[i] = (1.0 - r) * run.policy.hold_kd[i] + r * run.damping_kd[i];
+                        run.position[i] = if r < 1.0 { run.entry_pose[i] } else { measured[i] };
+                    }
+                    if r >= 1.0 && run.phase == GravityCompPhase::RampIn {
+                        run.phase = GravityCompPhase::Active;
+                        ramp_completed = true;
+                    }
                 }
-                if r >= 1.0 && run.phase == GravityCompPhase::RampIn {
-                    run.phase = GravityCompPhase::Active;
-                    tracing::info!("Gravity compensation ramp complete");
+                if ramp_completed {
+                    self.safety.log_gravity_comp_ramp_complete();
                 }
                 // The hand moves the arm: the reference follows the measurement, so the
                 // tracking-error check sees no error from intended motion.
@@ -512,7 +521,7 @@ impl SupervisorInner {
                     self.commanded_positions[i] = measured[i];
                     self.commanded_velocities[i] = 0.0;
                 }
-                self.target_positions = self.commanded_positions.clone();
+                crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
             }
             GravityCompPhase::Exiting { hold, elapsed_s } => {
                 let (exit_hold, max_age_ms, max_vel) = self.gravity_comp.as_ref().map_or((0.1, 100, 0.05), |r| {
@@ -584,8 +593,13 @@ impl SupervisorInner {
                 None => Ok(()),
                 Some(d) => match d.lock() {
                     Ok(mut drv) => {
-                        let mut hold_targets: Vec<JointTarget> = hold.iter().map(|&p| JointTarget::position(p)).collect();
-                        hold_targets.push(JointTarget::position(gripper));
+                        let hold_targets: [JointTarget; ARM + 1] = std::array::from_fn(|i| {
+                            if i < ARM {
+                                JointTarget::position(hold[i])
+                            } else {
+                                JointTarget::position(gripper)
+                            }
+                        });
                         drv.set_joint_modes(&[JointMode::Position; ARM + 1], &hold_targets).map_err(|e| e.to_string())
                     }
                     Err(_) => Err("driver lock poisoned".into()),
@@ -599,7 +613,7 @@ impl SupervisorInner {
                     self.commanded_positions[i] = hold[i];
                     self.commanded_velocities[i] = 0.0;
                 }
-                self.target_positions = self.commanded_positions.clone();
+                crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
                 self.commanded_accelerations.fill(0.0);
                 self.following_error_since = None;
                 if self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled) {
