@@ -414,9 +414,7 @@ pub struct SupervisorInner {
     pub gripper_stalled: bool,
     pub gripper_high_torque_ticks: u32,
     pub gripper_low_torque_ticks: u32,
-    pub gripper_stall_anchor_pos: Option<f32>,
-    pub gripper_stall_anchor_dir: f32,
-    pub gripper_stall_window_s: f64,
+    pub gripper_stall_window: crate::motion::GripperProgressWindow,
     pub gripper_stall_sign: f32,
     pub gripper_prev_hw_overload: bool,
     /// The stall latch was set (or refreshed) by the gripper torque cap.
@@ -444,6 +442,8 @@ pub struct SupervisorInner {
     pub gripper_stream_target: Option<f32>,
     /// Contact regulator of the stream (`gripper_policy.stream_contact_speed_rad_s`).
     pub gripper_stream_contact: Option<GripperStreamContact>,
+    /// Shared net-progress / moving-floor contact detector for the stream contact regulator.
+    pub gripper_stream_contact_detector: crate::motion::GripperContactDetector,
     /// Lease generation the gripper stream target was set under (None without a lease).
     pub gripper_stream_lease: Option<u64>,
     /// A gripper action reference was active at the start of the previous tick ...
@@ -845,9 +845,7 @@ impl SupervisorInner {
             gripper_stalled: false,
             gripper_high_torque_ticks: 0,
             gripper_low_torque_ticks: 0,
-            gripper_stall_anchor_pos: None,
-            gripper_stall_anchor_dir: 0.0,
-            gripper_stall_window_s: 0.0,
+            gripper_stall_window: crate::motion::GripperProgressWindow::default(),
             gripper_stall_sign: 0.0,
             gripper_prev_hw_overload: false,
             gripper_force_capped: false,
@@ -856,6 +854,7 @@ impl SupervisorInner {
             gripper_motion_hold: None,
             gripper_stream_target: None,
             gripper_stream_contact: None,
+            gripper_stream_contact_detector: crate::motion::GripperContactDetector::default(),
             gripper_stream_lease: None,
             gripper_ref_prev: false,
             gripper_ref_done: false,
@@ -1072,13 +1071,12 @@ impl SupervisorInner {
         self.gripper_prev_hw_overload = false;
         self.gripper_high_torque_ticks = 0;
         self.gripper_low_torque_ticks = 0;
-        self.gripper_stall_anchor_pos = None;
-        self.gripper_stall_anchor_dir = 0.0;
-        self.gripper_stall_window_s = 0.0;
+        self.gripper_stall_window.reset();
         self.gripper_force_capped = false;
         self.gripper_force_ticks = 0;
         self.gripper_stream_target = None;
         self.gripper_stream_contact = None;
+        self.gripper_stream_contact_detector.reset();
         self.gripper_stream_lease = None;
         self.gripper_cap_ramp = None;
         self.gripper_over_cap_prev = false;
@@ -1091,6 +1089,7 @@ impl SupervisorInner {
         let active = self.gripper_stream_target.is_some() || self.gripper_stream_contact.is_some();
         self.gripper_stream_target = None;
         self.gripper_stream_contact = None;
+        self.gripper_stream_contact_detector.reset();
         self.gripper_stream_lease = None;
         if !active || !self.is_torqued { return; }
         let Some(g) = self.config.gripper_index() else { return };
@@ -2169,9 +2168,7 @@ impl SupervisorInner {
         self.gripper_stalled = false;
         self.gripper_high_torque_ticks = 0;
         self.gripper_low_torque_ticks = 0;
-        self.gripper_stall_anchor_pos = None;
-        self.gripper_stall_anchor_dir = 0.0;
-        self.gripper_stall_window_s = 0.0;
+        self.gripper_stall_window.reset();
         self.gripper_motion_hold = None;
         if next == ParkRelease::Opening { self.releasing = true; }
         let duration = motion.expected_duration();
@@ -2639,7 +2636,6 @@ impl SupervisorInner {
             let load_g = self.loads.get(g_idx).copied().unwrap_or(0.0);
             let p_cmd = self.commanded_positions.get(g_idx).copied().unwrap_or(0.0);
             let p_meas = self.measured_positions.get(g_idx).copied().unwrap_or(0.0);
-            let v_g = self.measured_velocities.get(g_idx).copied().unwrap_or(0.0);
             let gap = p_cmd - p_meas;
 
             let gripper_hw_overload = is_bus_fresh
@@ -2685,41 +2681,80 @@ impl SupervisorInner {
                 Some(t) => t.clamp(GRIPPER_STALL_LATCH_NM, GRIPPER_STALL_LATCH_NM + GRIPPER_STALL_BASELINE_RAISE_MAX_NM),
                 None => GRIPPER_STALL_LATCH_NM,
             };
-            // Stream contact regulator (gripper_policy.stream_contact_speed_rad_s): from the contact
-            // the closing command creeps at the contact speed while |τ| < contact_torque_nm and
-            // its lead over the jaw is scaled by contact_torque_nm / |τ| above it, so the grip
-            // settles near contact_torque_nm whatever the stiffness. The impact sample itself is
-            // stiffness x the POS_VEL lag at contact: no feedback precedes it.
+            // Stream contact regulator (gripper_policy.stream_contact_speed_rad_s): uses the same
+            // shared `GripperContactDetector` (net-progress watermark window, moving torque floors,
+            // sustained tick counts; no single-sample or instantaneous-velocity shortcuts). From
+            // contact the closing command creeps at the contact speed while |τ| < target_nm and
+            // its lead over the jaw is scaled by target_nm / |τ| above it, so the grip settles
+            // near target_nm whatever the stiffness.
             // A learned baseline moves the contact detection to baseline + margin; the regulated
             // grip torque stays contact_torque_nm, raised by at most GRIPPER_STREAM_TARGET_RAISE_MAX_NM.
+            let v_cmd = self.commanded_velocities.get(g_idx).copied().unwrap_or(0.0);
             let force_cap_nm = self.config.gripper_policy.as_ref().and_then(|p| p.max_close_torque_nm);
+            let contact_torque_nm = self.config.gripper_policy.as_ref().and_then(|p| p.contact_torque_nm);
             let stream_detect_nm = crate::gripper_baseline::closing_contact_threshold(self.gripper_baseline.as_ref(), p_meas,
                 crate::gripper_baseline::SLOW_BAND_MAX_RAD_S * 0.5,
-                self.config.gripper_policy.as_ref().and_then(|p| p.contact_torque_nm), force_cap_nm).map(|t| t.0);
+                contact_torque_nm, force_cap_nm).map(|t| t.0);
             let regulator = self.config.gripper_policy.as_ref()
                 .and_then(|p| Some((p.contact_torque_nm?, p.stream_contact_speed_rad_s?)))
                 .map(|(c, speed)| {
                     let d = stream_detect_nm.unwrap_or(c);
-                    (d, d.clamp(c, c + GRIPPER_STREAM_TARGET_RAISE_MAX_NM), speed)
+                    (d.clamp(c, c + GRIPPER_STREAM_TARGET_RAISE_MAX_NM), speed)
                 })
                 .filter(|_| has_torque_feedback && self.is_torqued);
+            let ceiling_est_nm = self.gripper_ceiling_torque_estimate();
+            let stream_window_speed = {
+                let v = f64::from(v_cmd.abs());
+                if v > 1e-4 {
+                    Some(v)
+                } else {
+                    self.gripper_close_speed_limit().map(f64::from)
+                }
+            };
             match (regulator, self.gripper_stream_target) {
-                (Some((detect_nm, target_nm, speed)), Some(stream_g)) if is_bus_fresh && p_meas.is_finite() && p_cmd.is_finite() => {
+                (Some((target_nm, speed)), Some(stream_g)) if is_bus_fresh && p_meas.is_finite() && p_cmd.is_finite() => {
                     let tau = tau_g.abs();
                     self.gripper_stream_contact = match self.gripper_stream_contact {
                         None => {
                             let pushing = (p_cmd - p_meas) * close_dir > 1e-3 || (stream_g - p_meas) * close_dir > 1e-3;
-                            let still = tau >= stall_nm && v_g.abs() < 0.10;
-                            (pushing && (tau >= detect_nm || still)).then(|| {
-                                let lead = ((p_cmd - p_meas) * close_dir).max(0.0);
-                                let scale = if tau > target_nm { target_nm / tau } else { 1.0 };
-                                GripperStreamContact { at_rad: p_meas, limit_rad: p_meas + close_dir * lead * scale }
-                            })
+                            if !pushing {
+                                self.gripper_stream_contact_detector.reset();
+                                None
+                            } else {
+                                let eval = self.gripper_stream_contact_detector.step(&crate::motion::GripperContactInput {
+                                    baseline: self.gripper_baseline.as_ref(),
+                                    contact_torque_nm,
+                                    max_close_torque_nm: force_cap_nm,
+                                    ceiling_torque_estimate_nm: ceiling_est_nm,
+                                    stopped_stall_nm: Some(stall_nm),
+                                    measured_pos: p_meas,
+                                    dir: close_dir,
+                                    baseline_speed: crate::gripper_baseline::SLOW_BAND_MAX_RAD_S * 0.5,
+                                    window_speed: stream_window_speed,
+                                    tau_abs: tau,
+                                    dt,
+                                    torque_feedback: has_torque_feedback,
+                                    active: pushing,
+                                });
+                                eval.triggered.then(|| {
+                                    self.gripper_stream_contact_detector.reset();
+                                    let lead = ((p_cmd - p_meas) * close_dir).max(0.0);
+                                    let scale = if tau > target_nm { target_nm / tau } else { 1.0 };
+                                    GripperStreamContact { at_rad: p_meas, limit_rad: p_meas + close_dir * lead * scale }
+                                })
+                            }
                         }
                         // the jaw opened past the contact point, or closed on with little torque
-                        Some(c) if (p_meas - c.at_rad) * close_dir <= -GRIPPER_FORCE_RELEASE_MARGIN_RAD => None,
-                        Some(c) if tau < 0.5 * target_nm && (p_meas - c.at_rad) * close_dir > GRIPPER_STREAM_CONTACT_LOST_RAD => None,
+                        Some(c) if (p_meas - c.at_rad) * close_dir <= -GRIPPER_FORCE_RELEASE_MARGIN_RAD => {
+                            self.gripper_stream_contact_detector.reset();
+                            None
+                        }
+                        Some(c) if tau < 0.5 * target_nm && (p_meas - c.at_rad) * close_dir > GRIPPER_STREAM_CONTACT_LOST_RAD => {
+                            self.gripper_stream_contact_detector.reset();
+                            None
+                        }
                         Some(mut c) => {
+                            self.gripper_stream_contact_detector.reset();
                             if tau >= target_nm {
                                 let lead = ((c.limit_rad - p_meas) * close_dir).max(0.0);
                                 c.limit_rad = p_meas + close_dir * lead * (target_nm / tau);
@@ -2732,8 +2767,17 @@ impl SupervisorInner {
                         }
                     };
                 }
-                (Some(_), Some(_)) => {} // late feedback: keep the limit (gripper_lead_cap needs fresh feedback)
-                _ => self.gripper_stream_contact = None,
+                (Some(_), Some(_)) => {
+                    // late feedback: keep an engaged limit (gripper_lead_cap needs fresh feedback),
+                    // but do not carry unlatched contact ticks across stale gaps.
+                    if self.gripper_stream_contact.is_none() {
+                        self.gripper_stream_contact_detector.reset();
+                    }
+                }
+                _ => {
+                    self.gripper_stream_contact = None;
+                    self.gripper_stream_contact_detector.reset();
+                }
             }
 
             // Torque cap: |τ| above max_close_torque_nm while the jaw is driven closed latches
@@ -2743,7 +2787,6 @@ impl SupervisorInner {
             // streams (teleop, policies) and whole-arm references (gripper_hold_filter).
             if !self.gripper_stalled { self.gripper_force_capped = false; }
             if !(self.gripper_stalled && self.gripper_force_capped) { self.gripper_cap_ramp = None; }
-            let v_cmd = self.commanded_velocities.get(g_idx).copied().unwrap_or(0.0);
             let closing = (p_cmd - p_meas) * close_dir > 1e-3 || (desired_g - p_meas) * close_dir > 1e-3 || v_cmd * close_dir > 1e-3;
             let opening = !closing
                 && ((p_cmd - p_meas) * close_dir < -1e-3 || (desired_g - p_meas) * close_dir < -1e-3 || v_cmd * close_dir < -1e-3);
@@ -2769,7 +2812,10 @@ impl SupervisorInner {
                 self.gripper_stall_sign = close_dir;
                 self.gripper_high_torque_ticks = 0;
                 self.gripper_low_torque_ticks = 0;
+                self.gripper_stall_window.reset();
                 self.gripper_stream_target = None;
+                self.gripper_stream_contact = None;
+                self.gripper_stream_contact_detector.reset();
                 let hold_q = if p_meas.is_finite() {
                     if let Some(lim) = self.config.limits.get(g_idx) {
                         p_meas.clamp(lim.min_position, lim.max_position)
@@ -2790,6 +2836,7 @@ impl SupervisorInner {
             } else if !is_bus_fresh {
                 self.gripper_high_torque_ticks = 0;
                 self.gripper_low_torque_ticks = 0;
+                self.gripper_stall_window.reset();
             } else if self.gripper_force_ticks >= GRIPPER_FORCE_CAP_TICKS {
                 // latch, or refresh a latch that still presses, at the measured position; every
                 // new over-cap episode counts a trip (also one that refreshes a latch)
@@ -2810,6 +2857,8 @@ impl SupervisorInner {
                 self.gripper_stall_sign = cap_dir;
                 self.gripper_high_torque_ticks = 0;
                 self.gripper_low_torque_ticks = 0;
+                self.gripper_stall_window.reset();
+                self.gripper_stream_contact_detector.reset();
                 if p_meas.is_finite() {
                     if g_idx < self.commanded_positions.len() { self.commanded_positions[g_idx] = p_meas; }
                     if g_idx < self.commanded_velocities.len() { self.commanded_velocities[g_idx] = 0.0; }
@@ -2844,6 +2893,8 @@ impl SupervisorInner {
                 self.gripper_stall_sign = if dir >= 0.0 { 1.0 } else { -1.0 };
                 self.gripper_low_torque_ticks = 0;
                 self.gripper_high_torque_ticks = 0;
+                self.gripper_stall_window.reset();
+                self.gripper_stream_contact_detector.reset();
                 if let Some(&hold) = self.measured_positions.get(g_idx) {
                     if g_idx < self.commanded_positions.len() {
                         self.commanded_positions[g_idx] = hold;
@@ -2884,10 +2935,7 @@ impl SupervisorInner {
                 });
                 let active_gripper_speed = active_gripper_motion
                     .map(|gm| gm.planned_speed)
-                    .or_else(|| {
-                        let v = f64::from(v_cmd.abs());
-                        (v > 1e-4).then_some(v)
-                    })
+                    .or(stream_window_speed)
                     .filter(|v| v.is_finite() && *v > 0.0);
                 let travel_dir = active_gripper_motion
                     .and_then(|gm| {
@@ -2900,56 +2948,32 @@ impl SupervisorInner {
                     .or_else(|| (tau_g.abs() > 1e-3).then_some(tau_g.signum()))
                     .unwrap_or(close_dir);
                 let base_window_s: f64 = if has_torque_feedback { 0.10 } else { 0.18 };
-                let stall_window_s = match active_gripper_speed {
-                    Some(speed) => base_window_s.max(
-                        (2.0 * f64::from(GRIPPER_STALL_PROGRESS_EPS) / speed + 0.06)
-                            .min(GRIPPER_STALL_WINDOW_MAX_S),
-                    ),
-                    None => base_window_s,
-                };
+                let stall_window_s = crate::motion::gripper_progress_window_s(active_gripper_speed, base_window_s);
 
-                if high_effort && p_meas.is_finite() {
-                    let same_dir = self.gripper_stall_anchor_dir == travel_dir;
-                    // Monotonic net progress along `travel_dir`: backward rebounds or jam
-                    // oscillations never lower the watermark and cannot keep resetting the timer.
-                    let net_progressed = self.gripper_high_torque_ticks > 0
-                        && same_dir
-                        && self.gripper_stall_anchor_pos
-                            .is_some_and(|anchor| (p_meas - anchor) * travel_dir >= GRIPPER_STALL_PROGRESS_EPS);
-                    if self.gripper_high_torque_ticks == 0 || !same_dir || net_progressed {
-                        self.gripper_stall_anchor_pos = Some(p_meas);
-                        self.gripper_stall_anchor_dir = travel_dir;
-                        self.gripper_high_torque_ticks = 1;
-                        self.gripper_stall_window_s = 0.0;
-                    } else {
-                        self.gripper_high_torque_ticks += 1;
-                        self.gripper_stall_window_s += dt;
-                        if self.gripper_high_torque_ticks >= 2
-                            && self.gripper_stall_window_s >= stall_window_s - 1e-9
-                        {
-                            self.gripper_stalled = true;
-                            self.gripper_stall_anchor_pos = None;
-                            self.gripper_stall_anchor_dir = 0.0;
-                            self.gripper_stall_window_s = 0.0;
-                            let dir = if gap.abs() > 1e-3 { gap } else { tau_g };
-                            self.gripper_stall_sign = if dir >= 0.0 { 1.0 } else { -1.0 };
-                            self.gripper_low_torque_ticks = 0;
-                            if let Some(&hold) = self.measured_positions.get(g_idx) {
-                                if g_idx < self.commanded_positions.len() { self.commanded_positions[g_idx] = hold; }
-                                if g_idx < self.target_positions.len() { self.target_positions[g_idx] = hold; }
-                                if let Some(ref mut st) = self.servo_target {
-                                    if st.len() > g_idx {
-                                        st[g_idx] = hold;
-                                    }
-                                }
+                if self.gripper_stall_window.step_sustained(
+                    high_effort,
+                    p_meas,
+                    travel_dir,
+                    dt,
+                    stall_window_s,
+                    &mut self.gripper_high_torque_ticks,
+                    crate::motion::GRIPPER_CONTACT_TICKS,
+                ) {
+                    self.gripper_stalled = true;
+                    self.gripper_stall_window.reset();
+                    self.gripper_stream_contact_detector.reset();
+                    let dir = if gap.abs() > 1e-3 { gap } else { tau_g };
+                    self.gripper_stall_sign = if dir >= 0.0 { 1.0 } else { -1.0 };
+                    self.gripper_low_torque_ticks = 0;
+                    if let Some(&hold) = self.measured_positions.get(g_idx) {
+                        if g_idx < self.commanded_positions.len() { self.commanded_positions[g_idx] = hold; }
+                        if g_idx < self.target_positions.len() { self.target_positions[g_idx] = hold; }
+                        if let Some(ref mut st) = self.servo_target {
+                            if st.len() > g_idx {
+                                st[g_idx] = hold;
                             }
                         }
                     }
-                } else {
-                    self.gripper_high_torque_ticks = 0;
-                    self.gripper_stall_anchor_pos = None;
-                    self.gripper_stall_anchor_dir = 0.0;
-                    self.gripper_stall_window_s = 0.0;
                 }
             } else if self.gripper_stalled && self.gripper_force_capped && self.gripper_stream_target.is_some() {
                 // torque-cap latch under a stream: held until the stream opens (intake) or ends.
@@ -2959,6 +2983,7 @@ impl SupervisorInner {
                 // latches at the measured jaw again (branch above).
                 self.gripper_high_torque_ticks = 0;
                 self.gripper_low_torque_ticks = 0;
+                self.gripper_stall_window.reset();
                 let stream_g = self.gripper_stream_target.unwrap_or(p_cmd);
                 let want = (stream_g - p_cmd) * close_dir;
                 let hold_nm = force_cap.map(|c| GRIPPER_STREAM_CAP_HOLD_FRACTION * c);
@@ -2980,6 +3005,7 @@ impl SupervisorInner {
                 }
             } else if self.gripper_stalled {
                 self.gripper_high_torque_ticks = 0;
+                self.gripper_stall_window.reset();
                 let is_released = if has_torque_feedback {
                     tau_g.abs() < GRIPPER_STALL_RELEASE_NM
                 } else {
@@ -2997,6 +3023,7 @@ impl SupervisorInner {
             } else {
                 self.gripper_high_torque_ticks = 0;
                 self.gripper_low_torque_ticks = 0;
+                self.gripper_stall_window.reset();
             }
         }
 

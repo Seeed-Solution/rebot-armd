@@ -783,27 +783,22 @@ impl SupervisorInner {
         let gripper_idx = self.config.gripper_index()?;
         self.driver.as_ref()
             .and_then(|d| d.lock().ok())
-            .and_then(|drv| drv.motor_current_cap())
-            .filter(|cap| cap.mode == "pos_force" && cap.joint == gripper_idx)
-            .and_then(|cap| cap.close_speed_rad_s)
+            .and_then(|drv| drv.gripper_pos_force_info())
+            .filter(|info| info.joint == gripper_idx)
+            .map(|info| info.close_speed_rad_s)
             .filter(|v| v.is_finite() && *v > 0.0)
     }
 
     /// Estimated motor ceiling torque (N·m) of the attached position-force gripper: calibrated
     /// `ceiling_torque_nm` when available, else the feedback-equivalent estimate from
-    /// `current_raw * 0.0019 N·m/raw`.
+    /// `current_raw * 0.0019 N·m/raw`. Allocation-free on `armd-control`.
     pub(crate) fn gripper_ceiling_torque_estimate(&self) -> Option<f32> {
         let gripper_idx = self.config.gripper_index()?;
         self.driver.as_ref()
             .and_then(|d| d.lock().ok())
-            .and_then(|drv| drv.motor_current_cap())
-            .filter(|cap| cap.mode == "pos_force" && cap.joint == gripper_idx)
-            .and_then(|cap| {
-                cap.ceiling_torque_nm.or_else(|| {
-                    cap.current_raw
-                        .map(|raw| f32::from(raw) * crate::model::DamiaoGripperDrive::FEEDBACK_EQUIVALENT_NM_PER_RAW)
-                })
-            })
+            .and_then(|drv| drv.gripper_pos_force_info())
+            .filter(|info| info.joint == gripper_idx)
+            .and_then(|info| info.ceiling_torque_estimate_nm)
             .filter(|v| v.is_finite() && *v > 0.0)
     }
 
@@ -1170,6 +1165,7 @@ impl SupervisorInner {
         self.gripper_stalled = false;
         self.gripper_high_torque_ticks = 0;
         self.gripper_low_torque_ticks = 0;
+        self.gripper_stall_window.reset();
         self.zero_check_params = Some(ZeroCheckParams {
             action_id: id,
             store_offset,
@@ -1339,6 +1335,7 @@ impl SupervisorInner {
             self.gripper_stalled = false;
             self.gripper_high_torque_ticks = 0;
             self.gripper_low_torque_ticks = 0;
+            self.gripper_stall_window.reset();
         }
         let macro_sub = self.macro_run.as_ref().is_some_and(|m| Some(m.id) == action_id);
         if let (Some(id), Some(a)) = (action_id, self.last_action.as_mut()) {

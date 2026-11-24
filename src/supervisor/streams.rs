@@ -313,6 +313,7 @@ impl SupervisorInner {
                     self.gripper_stalled = false;
                     self.gripper_high_torque_ticks = 0;
                     self.gripper_low_torque_ticks = 0;
+                    self.gripper_stall_window.reset();
                 }
             }
         }

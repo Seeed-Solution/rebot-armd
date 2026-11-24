@@ -600,6 +600,23 @@ pub trait ArmDriver: Send {
     /// The gripper's motor-level current cap (None: the driver has no such notion).
     fn motor_current_cap(&self) -> Option<MotorCurrentCap> { None }
 
+    /// Allocation-free `Copy` summary of an active or configured position-force gripper cap,
+    /// safe to call on `armd-control`.
+    fn gripper_pos_force_info(&self) -> Option<GripperPosForceInfo> {
+        let cap = self.motor_current_cap()?;
+        if cap.mode != "pos_force" { return None; }
+        let close_speed_rad_s = cap.close_speed_rad_s.filter(|v| v.is_finite() && *v > 0.0)?;
+        let ceiling_torque_estimate_nm = cap.ceiling_torque_nm
+            .or_else(|| cap.current_raw.map(|raw| f32::from(raw) * crate::model::DamiaoGripperDrive::FEEDBACK_EQUIVALENT_NM_PER_RAW))
+            .filter(|v| v.is_finite() && *v > 0.0);
+        Some(GripperPosForceInfo {
+            joint: cap.joint,
+            active: cap.active,
+            close_speed_rad_s,
+            ceiling_torque_estimate_nm,
+        })
+    }
+
     /// Check if real physical telemetry feedback has been received for all joints
     fn is_feedback_valid(&self) -> bool {
         false
@@ -2741,6 +2758,16 @@ pub fn gripper_drive_from_profile(cfg: &crate::model::ArmConfig) -> Result<Optio
             })
         }
     }))
+}
+
+/// Allocation-free `Copy` summary of the gripper's position-force motor current cap,
+/// safe to query on the RT control thread (`armd-control`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GripperPosForceInfo {
+    pub joint: usize,
+    pub active: bool,
+    pub close_speed_rad_s: f32,
+    pub ceiling_torque_estimate_nm: Option<f32>,
 }
 
 /// Motor-level current cap of the gripper, as the driver applies it (`ArmDriver::motor_current_cap`).
@@ -7114,6 +7141,24 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         self.legacy_gripper.map(|joint| MotorCurrentCap {
             joint, mode: "pos_vel", current_raw: None, active: false, calibrated: false, ceiling_torque_nm: None,
             torque_reference: None, close_speed_rad_s: None, note: "no motor current cap (legacy POS_VEL gripper)",
+        })
+    }
+
+    fn gripper_pos_force_info(&self) -> Option<GripperPosForceInfo> {
+        let pf = self.pos_force.as_ref()?;
+        if !(pf.close_speed_rad_s.is_finite() && pf.close_speed_rad_s > 0.0) {
+            return None;
+        }
+        let active = self.pos_force_verified
+            && self.joint_modes.get(pf.joint).copied().flatten() == Some(DamiaoControlMode::PosForce);
+        let ceiling_torque_estimate_nm = pf.ceiling_torque_nm
+            .or(Some(f32::from(pf.current_raw) * crate::model::DamiaoGripperDrive::FEEDBACK_EQUIVALENT_NM_PER_RAW))
+            .filter(|v| v.is_finite() && *v > 0.0);
+        Some(GripperPosForceInfo {
+            joint: pf.joint,
+            active,
+            close_speed_rad_s: pf.close_speed_rad_s,
+            ceiling_torque_estimate_nm,
         })
     }
 
