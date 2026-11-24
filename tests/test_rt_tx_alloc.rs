@@ -1597,8 +1597,7 @@ fn rt_macro_retirement_saturation_applies_admission_backpressure_with_zero_alloc
     assert!(inner.macro_run.is_none());
 
     // Drain 1 retired MacroRun off-thread -> admission immediately succeeds again!
-    let reclaimed = inner.pop_retired_macro_run().expect("pop 1 retired macro");
-    drop(reclaimed);
+    let _reclaimed = inner.pop_retired_macro_run().expect("pop 1 retired macro");
     assert_eq!(inner.retired_macro_runs_len(), 7);
     assert!(inner.can_admit_macro_run());
     let ep_ok = inner.safety.epoch_id();
@@ -2474,9 +2473,7 @@ fn rt_r2_stale_j7_refusals_and_r1_epilogue_zero_alloc_and_zero_free() {
     if let Some(a) = inner.last_action.as_mut() {
         a.phase_ms.clear();
     }
-    while let Some(m) = inner.pop_retired_macro_run() {
-        drop(m);
-    }
+    while inner.pop_retired_macro_run().is_some() {}
 
     // 7. `reconcile_action` terminating a live `PolicyRun` when `J7_FEEDBACK_STALE` latches at 250 ms
     //    (without any incoming policy frame): strictly (0, 0) allocs/frees across the latch tick!

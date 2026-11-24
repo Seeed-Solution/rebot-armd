@@ -1745,9 +1745,7 @@ impl OffThreadSinks {
         }
         {
             let mut rx = self.reclaim_macro_rx.lock().unwrap_or_else(|e| e.into_inner());
-            while let Ok(run) = rx.pop() {
-                drop(run);
-            }
+            while let Ok(_run) = rx.pop() {}
         }
         #[cfg(feature = "policy-runtime")]
         {
