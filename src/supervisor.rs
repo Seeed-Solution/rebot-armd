@@ -6462,18 +6462,30 @@ impl ArmSupervisor {
     /// Execute a control cycle step
     pub async fn tick(&self, dt: f64) -> ArmObservation {
         crate::rt_core::executor::assert_not_in_rt_release("ArmSupervisor::tick");
-        self.tick_shared(dt, true).await.expect("tick keeps a copy when asked")
+        self.tick_shared(dt, true, None).await.expect("tick keeps a copy when asked")
     }
 
     /// [`Self::tick`] for the control loop, which does not use the observation: saves a copy.
     pub async fn control_tick(&self, dt: f64) {
         crate::rt_core::executor::assert_not_in_rt_release("ArmSupervisor::control_tick");
-        self.tick_shared(dt, false).await;
+        self.tick_shared(dt, false, None).await;
+    }
+
+    /// [`Self::control_tick`] bounded by the caller's absolute scheduled release grid deadline
+    /// (as passed from [`crate::rt_core::executor::run_periodic_with_deadline`]).
+    pub async fn control_tick_with_deadline(&self, dt: f64, release_deadline: Instant) {
+        crate::rt_core::executor::assert_not_in_rt_release("ArmSupervisor::control_tick_with_deadline");
+        self.tick_shared(dt, false, Some(release_deadline)).await;
     }
 
     /// One tick; publishes its observation (`crate::rt_core::publish`) and returns a copy
     /// when `keep`.
-    async fn tick_shared(&self, dt: f64, keep: bool) -> Option<ArmObservation> {
+    async fn tick_shared(
+        &self,
+        dt: f64,
+        keep: bool,
+        scheduled_deadline: Option<Instant>,
+    ) -> Option<ArmObservation> {
         crate::rt_core::executor::assert_not_in_rt_release("ArmSupervisor::tick_shared");
         if self.owner_mode() != OWNER_LEGACY {
             return None;
@@ -6495,8 +6507,10 @@ impl ArmSupervisor {
             inner.tick_phases_us = [0; 5];
             let body_start = Instant::now();
             inner.tick_phase_mark = Some(body_start);
-            let period = Duration::from_secs_f64(1.0 / f64::from(inner.config.control_frequency_hz.max(1)));
-            let release_deadline = started + period;
+            let release_deadline = scheduled_deadline.unwrap_or_else(|| {
+                let period = Duration::from_secs_f64(1.0 / f64::from(inner.config.control_frequency_hz.max(1)));
+                started + period
+            });
             let TickPublished { kept, body_end } = inner.tick_publish_with_deadline(
                 dt,
                 generation,

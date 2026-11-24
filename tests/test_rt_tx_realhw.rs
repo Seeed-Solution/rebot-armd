@@ -1966,3 +1966,86 @@ fn late_release_healthy_deferral_prioritizes_carryover_and_never_false_faults() 
         );
     }
 }
+
+/// Round-3 Item 2:
+/// Legacy `ArmSupervisor::control_tick_with_deadline` caps TX to the caller's absolute scheduled
+/// release grid deadline (`release_deadline - margin`), NOT `started + period - margin`.
+#[tokio::test]
+async fn legacy_control_tick_with_deadline_uses_scheduled_grid_not_started_plus_period() {
+    let limits = dm_limits();
+    let clock = MockClock::new();
+    let bus = FakeBus::with_clock(&limits, clock.clone());
+    bus.with(|s| {
+        s.immediate_replies = true;
+        s.follow_commands = true;
+        s.tx_step = ms(1);
+        s.push_all_feedback();
+    });
+    let cfg = base_cfg();
+    let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(limits)
+        .unwrap()
+        .with_tx_budget(cfg.damiao_tx_budget());
+    drv.read_joint_states().unwrap();
+    drv.check_mapping_ranges();
+
+    let sup = armd::supervisor::ArmSupervisor::new(cfg).with_driver(Box::new(drv));
+    {
+        let mut inner = sup.inner().write().await;
+        inner.lease_enabled = false;
+        inner.tick(DT);
+        inner.set_torque(true).expect("initial arm");
+        for _ in 0..3 {
+            clock.advance(ms(20));
+            bus.with(|s| s.push_all_feedback());
+            inner.tick(DT);
+        }
+        assert!(inner.safety.state().is_operational());
+    }
+
+    // Case A: Scheduled grid deadline is only 1 ms away (<= 2 ms publish margin), as after waking
+    // at +19 ms into a 20 ms slot. `started + period` would give 18 ms and send all 7 frames;
+    // the scheduled grid deadline leaves 0 ms and MUST transmit 0 frames while deferring all 7.
+    bus.clear_log();
+    clock.advance(ms(19));
+    bus.with(|s| s.push_all_feedback());
+    let past_cutoff_grid = std::time::Instant::now() + ms(1);
+    sup.control_tick_with_deadline(DT, past_cutoff_grid).await;
+    assert_eq!(
+        bus.tx_log().len(),
+        0,
+        "scheduled grid deadline within publish margin must transmit 0 frames, not started + period"
+    );
+
+    // Case B: Next on-time grid deadline (20 ms away -> ~18 ms TX window) drains all 7 frames
+    // cleanly at 1 ms/frame with 0 faults.
+    bus.clear_log();
+    clock.advance(ms(1));
+    bus.with(|s| s.push_all_feedback());
+    let on_time_grid = std::time::Instant::now() + ms(20);
+    sup.control_tick_with_deadline(DT, on_time_grid).await;
+    assert_eq!(
+        bus.tx_log().len(),
+        7,
+        "on-time scheduled grid deadline must drain all 7 frames"
+    );
+
+    // Case C: Scheduled grid deadline 4 ms away (<= 2 ms TX budget after 2 ms margin, at 1 ms/frame):
+    // transmits at most 2 frames (< 7), proving partial capping tracks the scheduled grid deadline.
+    bus.clear_log();
+    clock.advance(ms(16));
+    bus.with(|s| s.push_all_feedback());
+    let partial_grid = std::time::Instant::now() + ms(4);
+    sup.control_tick_with_deadline(DT, partial_grid).await;
+    let partial_sent = bus.tx_log().len();
+    assert!(
+        partial_sent <= 2,
+        "scheduled grid deadline +4 ms (<= 2 ms after publish margin, 1 ms/frame) must cap TX to <= 2 frames, sent {partial_sent}"
+    );
+    let obs = sup.observation().await.expect("observation");
+    assert!(
+        obs.fault.is_none(),
+        "scheduled-grid partial deferral must not fault: {:?}",
+        obs.fault
+    );
+}

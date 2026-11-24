@@ -2886,16 +2886,26 @@ impl Releases {
     pub fn next_ns(&self) -> u64 { self.next_ns }
 }
 
-/// Runs `step(dt)` at every release until `stop` is set. `dt` is the real time since the
-/// previous step's start (seconds). Allocation free.
-pub fn run_periodic(period: Duration, stop: &AtomicBool, stats: &ExecutorStats, mut step: impl FnMut(f64)) {
+/// Runs `step(dt, release_deadline)` at every scheduled grid release until `stop` is set.
+/// `dt` is the real time since the previous step's start (seconds), and `release_deadline` is
+/// the absolute scheduled grid instant of the next release (`releases.next_ns()` mapped onto
+/// `Instant`, matching `control_thread_main`). Allocation free.
+pub fn run_periodic_with_deadline(
+    period: Duration,
+    stop: &AtomicBool,
+    stats: &ExecutorStats,
+    mut step: impl FnMut(f64, Instant),
+) {
     let mut releases = Releases::start(period);
     let mut last = Instant::now();
     while !stop.load(Ordering::Acquire) {
         sleep_until_ns(releases.next_ns());
         let woke = Instant::now();
-        let skipped = releases.advance(mono_now_ns());
+        let now_ns = mono_now_ns();
+        let skipped = releases.advance(now_ns);
         if skipped > 0 { stats.skipped_releases.fetch_add(skipped, Ordering::Relaxed); }
+        let remaining_ns = releases.next_ns().saturating_sub(now_ns);
+        let release_deadline = woke + Duration::from_nanos(remaining_ns);
         let elapsed = woke - last;
         last = woke;
         if elapsed > LATE_LOG_AFTER {
@@ -2903,8 +2913,14 @@ pub fn run_periodic(period: Duration, stop: &AtomicBool, stats: &ExecutorStats, 
             stats.late.fetch_add(1, Ordering::Release);
         }
         stats.steps.fetch_add(1, Ordering::Relaxed);
-        step(elapsed.as_secs_f64());
+        step(elapsed.as_secs_f64(), release_deadline);
     }
+}
+
+/// Runs `step(dt)` at every release until `stop` is set. `dt` is the real time since the
+/// previous step's start (seconds). Allocation free.
+pub fn run_periodic(period: Duration, stop: &AtomicBool, stats: &ExecutorStats, mut step: impl FnMut(f64)) {
+    run_periodic_with_deadline(period, stop, stats, |dt, _| step(dt));
 }
 
 #[cfg(test)]
@@ -2936,6 +2952,47 @@ mod tests {
         assert_eq!(dts.len(), 5);
         assert!(dts.iter().all(|dt| *dt > 0.0 && *dt < 0.5), "{dts:?}");
         assert_eq!(stats.steps.load(Ordering::Relaxed), 5);
+    }
+
+    #[test]
+    fn run_periodic_with_deadline_tracks_scheduled_grid_after_overrun() {
+        let period = Duration::from_millis(20);
+        let stop = AtomicBool::new(false);
+        let stats = ExecutorStats::default();
+        let mut step_idx = 0usize;
+        let mut first_deadline: Option<Instant> = None;
+        let mut second_remaining = Duration::MAX;
+        let mut second_deadline: Option<Instant> = None;
+        run_periodic_with_deadline(period, &stop, &stats, |_dt, release_deadline| {
+            let now = Instant::now();
+            step_idx += 1;
+            if step_idx == 1 {
+                first_deadline = Some(release_deadline);
+                // Overrun past the 20 ms grid boundary into the middle of the next slot (+30 ms).
+                std::thread::sleep(Duration::from_millis(30));
+            } else if step_idx == 2 {
+                second_remaining = release_deadline.saturating_duration_since(now);
+                second_deadline = Some(release_deadline);
+                stop.store(true, Ordering::Release);
+            }
+        });
+        let d1 = first_deadline.expect("step 1 deadline");
+        let d2 = second_deadline.expect("step 2 deadline");
+        assert!(
+            second_remaining < Duration::from_millis(16),
+            "late step 2 must keep the scheduled grid deadline (< 16 ms remaining), not started + 20 ms: {second_remaining:?}"
+        );
+        // Step 2's deadline must align to an integer multiple of `period` from step 1's deadline
+        // (within timer/Instant read jitter).
+        let grid_delta = d2.saturating_duration_since(d1);
+        let periods = ((grid_delta.as_nanos() as f64) / (period.as_nanos() as f64)).round();
+        assert!(periods >= 1.0, "expected >= 1 period advance, got {grid_delta:?}");
+        let expected = Duration::from_nanos((periods as u64) * (period.as_nanos() as u64));
+        let phase_err = grid_delta.abs_diff(expected);
+        assert!(
+            phase_err < Duration::from_millis(3),
+            "scheduled grid phase drifted: d1->d2={grid_delta:?}, expected={expected:?}, err={phase_err:?}"
+        );
     }
 
     #[test]

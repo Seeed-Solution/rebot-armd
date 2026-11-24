@@ -624,10 +624,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     armd::diagnostics::alloc::time_this_thread();
                     info!("Control loop allocator timing on (ARMD_ALLOC_TIMING=1)");
                 }
-                armd::rt_core::executor::run_periodic(period, &control_stop_flag, &loop_stats, |dt| {
-                    let tick_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        runtime.block_on(control_supervisor.control_tick(dt));
-                    }));
+                armd::rt_core::executor::run_periodic_with_deadline(
+                    period,
+                    &control_stop_flag,
+                    &loop_stats,
+                    |dt, release_deadline| {
+                        let tick_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            runtime.block_on(control_supervisor.control_tick_with_deadline(dt, release_deadline));
+                        }));
                     if let Err(e) = tick_res {
                         control_supervisor.e_stop_latched.store(true, Ordering::SeqCst);
                         error!("Control thread panicked during tick: {:?}", e);
