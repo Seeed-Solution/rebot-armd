@@ -900,6 +900,10 @@ pub trait ArmDriver: Send {
     /// Current time of the driver's clock (the transport's deterministic clock in tests).
     fn clock_now(&self) -> Instant { Instant::now() }
 
+    /// Optional lock-free handle to the driver's underlying clock for RT off-thread forwarding
+    /// timestamps (returns `None` when the driver uses wall-clock `Instant::now()`).
+    fn driver_clock(&self) -> Option<std::sync::Arc<dyn crate::transport::DriverClock>> { None }
+
     /// Wait `d` on the driver's clock (the transport's deterministic clock advances in tests).
     fn clock_pause(&self, d: Duration) { std::thread::sleep(d) }
 
@@ -7504,6 +7508,10 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     fn mit_fence_trip(&self) -> Option<String> { self.mit_fence_trip.as_ref().map(|(r, _)| r.to_string()) }
 
     fn clock_now(&self) -> Instant { self.now() }
+
+    fn driver_clock(&self) -> Option<std::sync::Arc<dyn crate::transport::DriverClock>> {
+        self.clock.clone()
+    }
 
     fn mit_fresh_status(&mut self) -> Result<Vec<u8>, String> {
         // Enforce the post-trip quiet period directly without requiring or mutating

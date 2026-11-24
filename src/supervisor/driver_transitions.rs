@@ -438,7 +438,7 @@ impl SupervisorInner {
         }
         let driver: Box<dyn ArmDriver> = Box::new(crate::joint_zero::ZeroOffsetDriver::new(driver, &self.joint_zero_offsets));
         self.apply_driver_limits(driver.as_ref());
-        self.driver = Some(std::sync::Mutex::new(driver));
+        self.install_driver(driver);
         self
     }
 
@@ -2494,6 +2494,7 @@ impl SupervisorInner {
         self.tracking.clear_recovery_suspension();
         self.reset_tx_joint_progress();
         self.hold_tx_stalled_latched = false;
+        self.last_hold_tx_stall_log = None;
         self.j7_stale_since = None;
         // Preserve `self.last_hold_tx_error_log` across fault clears so rapid clear/re-fault
         // cycles cannot bypass the 1/s stopped-hold error log rate limit.

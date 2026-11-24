@@ -739,6 +739,9 @@ pub(crate) struct OffThreadSinks {
     /// `(consumer, last_reported_dropped, shutdown_reported_total)` guarded by one mutex so
     /// best-effort warning deltas never race and never reset `stats.safety_log_dropped`.
     safety_log_rx: Mutex<(Consumer<SafetyLogEvent>, u64, u64)>,
+    /// Final pending `"Stopped hold output failed"` aggregate handed off ONLY during control-thread
+    /// teardown when `safety_log_tx` remained full (never touched on RT ticks).
+    shutdown_hold_error: Arc<Mutex<Option<SafetyLogEvent>>>,
     stats: Arc<ExecutorStats>,
     persist_rep_rx: Arc<Mutex<Consumer<PersistReply>>>,
     persist_worker_exited: Arc<AtomicBool>,
@@ -804,6 +807,14 @@ impl OffThreadSinks {
                 crate::safety::emit_safety_log_dropped(delta, total);
             }
             while let Ok(ev) = log_g.0.pop() {
+                ev.emit();
+            }
+            if let Some(ev) = self
+                .shutdown_hold_error
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
                 ev.emit();
             }
         }
@@ -1216,6 +1227,7 @@ pub(crate) fn spawn_executor(
     let teardown_disable = Arc::new(TeardownDisable::default());
     let stats = Arc::new(ExecutorStats::default());
 
+    let shutdown_hold_error = Arc::new(Mutex::new(None));
     let persist_rep_rx = Arc::new(Mutex::new(persist_rep_rx));
     let maint_client = Arc::new(MaintClient::new(maint_req_tx, maint_rep_rx, exited.clone()));
     let sinks = Arc::new(OffThreadSinks {
@@ -1226,6 +1238,7 @@ pub(crate) fn spawn_executor(
         reclaim_macro_rx: Mutex::new(reclaim_macro_rx),
         reclaim_return_tx: Mutex::new(reclaim_return_tx),
         safety_log_rx: Mutex::new((safety_log_rx, 0, 0)),
+        shutdown_hold_error: shutdown_hold_error.clone(),
         stats: stats.clone(),
         persist_rep_rx: persist_rep_rx.clone(),
         persist_worker_exited: persist_worker_exited.clone(),
@@ -1287,6 +1300,7 @@ pub(crate) fn spawn_executor(
                 reclaim_macro_tx,
                 reclaim_return_rx,
                 safety_log_tx,
+                shutdown_hold_error,
                 persist_job_tx,
                 persist_cmd_rx,
                 persist_rep_tx,
@@ -1362,6 +1376,72 @@ pub(crate) fn spawn_executor(
     Ok((RtExecutorHandle { shared }, sinks))
 }
 
+/// Single production forwarding path from `core.safety`'s inline log ring into the bounded
+/// downstream SPSC `safety_log_tx` ring (zero RT heap allocations, zero frees).
+///
+/// Converges BOTH freshly popped and retained `"Stopped hold output failed"` occurrences into a
+/// single pending aggregate and enforces ONE active-sink delivery gate timestamped on the exact
+/// driver clock right at acceptance (zero double delivery within 1 s, lossless across ring full).
+#[doc(hidden)]
+pub fn forward_deferred_safety_logs(
+    core: &mut SupervisorInner,
+    safety_log_tx: &mut Producer<SafetyLogEvent>,
+    stats: &ExecutorStats,
+    now: Instant,
+) -> bool {
+    let mut drained = false;
+    while let Some(ev) = core.safety.pop_log_event() {
+        match ev {
+            SafetyLogEvent::StoppedHoldOutputFailed {
+                partial,
+                suppressed,
+                message,
+                logged_at,
+            } => {
+                core.hold_tx_error_suppressed = core
+                    .hold_tx_error_suppressed
+                    .saturating_add(1)
+                    .saturating_add(suppressed);
+                core.last_hold_tx_error_log = core.last_hold_tx_error_delivered;
+                core.pending_hold_tx_error_retry = Some((partial, message, logged_at));
+            }
+            other => {
+                if safety_log_tx.push(other).is_err() {
+                    core.safety_log_ring_dropped = core.safety_log_ring_dropped.saturating_add(1);
+                    stats.safety_log_dropped.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        drained = true;
+    }
+    if core.hold_tx_error_suppressed > 0 {
+        if let Some((partial, message, logged_at)) = core.pending_hold_tx_error_retry {
+            let check_at = core.driver_clock_now_or(now);
+            let stamp = check_at.max(logged_at);
+            let window_ready = core
+                .last_hold_tx_error_delivered
+                .is_none_or(|d| stamp.saturating_duration_since(d) >= Duration::from_secs(1));
+            if window_ready {
+                let out_ev = SafetyLogEvent::StoppedHoldOutputFailed {
+                    partial,
+                    suppressed: core.hold_tx_error_suppressed - 1,
+                    message,
+                    logged_at,
+                };
+                if safety_log_tx.push(out_ev).is_ok() {
+                    let delivered_at = core.driver_clock_now_or(stamp).max(stamp);
+                    core.hold_tx_error_suppressed = 0;
+                    core.pending_hold_tx_error_retry = None;
+                    core.last_hold_tx_error_log = Some(delivered_at);
+                    core.last_hold_tx_error_delivered = Some(delivered_at);
+                    drained = true;
+                }
+            }
+        }
+    }
+    drained
+}
+
 struct ControlState {
     shutdown_committed: bool,
     control_stop: Arc<AtomicBool>,
@@ -1373,6 +1453,7 @@ struct ControlState {
     reclaim_macro_tx: Producer<crate::macro_action::MacroRun>,
     reclaim_return_rx: Consumer<Arc<SafetyState>>,
     safety_log_tx: Producer<SafetyLogEvent>,
+    shutdown_hold_error: Arc<Mutex<Option<SafetyLogEvent>>>,
     stats: Arc<ExecutorStats>,
     maint_req_rx: Consumer<MaintRequest>,
     maint_rep_tx: Producer<MaintReply>,
@@ -1410,10 +1491,10 @@ impl ControlState {
         }
     }
 
-    /// Moves retired fault `Arc<SafetyState>` snapshots, retired `ActiveTrajectory` instances, and
-    /// deferred [`SafetyLogEvent`]s off `armd-control` into the bounded SPSC rings, and replenishes
-    /// clean recycled fault slots without allocating or dropping on `armd-control`.
-    fn drain_retired_states(&mut self, core: &mut SupervisorInner) {
+    /// Moves retired fault `Arc<SafetyState>` snapshots, retired `ActiveTrajectory` / `MacroRun`
+    /// instances, and deferred [`SafetyLogEvent`]s off `armd-control` into the bounded SPSC rings,
+    /// and replenishes clean recycled fault slots without allocating or dropping on `armd-control`.
+    fn drain_retired_states(&mut self, core: &mut SupervisorInner, now: Instant) {
         while core.safety.fault_arc_pool_len() < FAULT_ARC_POOL_CAPACITY
             || core.safety.formatted_fault_arc_pool_len() < FORMATTED_FAULT_ARC_POOL_CAPACITY
             || core.safety.joint_limit_arc_pool_len() < JOINT_LIMIT_ARC_POOL_CAPACITY
@@ -1452,14 +1533,40 @@ impl ControlState {
             self.stats.safety_log_dropped.fetch_add(lost_inline, Ordering::Relaxed);
             drained = true;
         }
-        while let Some(ev) = core.safety.pop_log_event() {
-            if self.safety_log_tx.push(ev).is_err() {
-                core.safety_log_ring_dropped = core.safety_log_ring_dropped.saturating_add(1);
-                self.stats.safety_log_dropped.fetch_add(1, Ordering::Relaxed);
-            }
+        if forward_deferred_safety_logs(core, &mut self.safety_log_tx, &self.stats, now) {
             drained = true;
         }
         if drained {
+            core.core.hub().wake();
+        }
+    }
+
+    /// Teardown-only handoff (never called on RT ticks): transfers any retained `"Stopped hold
+    /// output failed"` aggregate that could not fit into a full `safety_log_tx` ring directly to
+    /// `OffThreadSinks` so exact suppressed counts are never lost on executor shutdown.
+    fn flush_pending_hold_error_for_shutdown(&mut self, core: &mut SupervisorInner) {
+        if let Some(ev) = core.take_pending_hold_tx_error_for_shutdown() {
+            let mut slot = self.shutdown_hold_error.lock().unwrap_or_else(|e| e.into_inner());
+            *slot = Some(match slot.take() {
+                None => ev,
+                Some(SafetyLogEvent::StoppedHoldOutputFailed { suppressed: prev_sup, .. }) => {
+                    match ev {
+                        SafetyLogEvent::StoppedHoldOutputFailed {
+                            partial,
+                            suppressed,
+                            message,
+                            logged_at,
+                        } => SafetyLogEvent::StoppedHoldOutputFailed {
+                            partial,
+                            suppressed: suppressed.saturating_add(1).saturating_add(prev_sup),
+                            message,
+                            logged_at,
+                        },
+                        other => other,
+                    }
+                }
+                Some(_) => ev,
+            });
             core.core.hub().wake();
         }
     }
@@ -2358,6 +2465,7 @@ fn control_thread_main(
     reclaim_macro_tx: Producer<crate::macro_action::MacroRun>,
     reclaim_return_rx: Consumer<Arc<SafetyState>>,
     safety_log_tx: Producer<SafetyLogEvent>,
+    shutdown_hold_error: Arc<Mutex<Option<SafetyLogEvent>>>,
     persist_job_tx: Producer<PendingZeroCheckPersist>,
     persist_cmd_rx: Consumer<PersistCmd>,
     persist_rep_tx: Producer<PersistReply>,
@@ -2426,6 +2534,7 @@ fn control_thread_main(
         reclaim_macro_tx,
         reclaim_return_rx,
         safety_log_tx,
+        shutdown_hold_error,
         stats: Arc::clone(&stats),
         maint_req_rx,
         maint_rep_tx,
@@ -2557,7 +2666,7 @@ fn control_thread_main(
             if control_stop.load(Ordering::Acquire) {
                 state.flush_pending_maint_reply(&core);
                 state.emit_estop_ack_if_advanced(&mut core);
-                state.drain_retired_states(&mut core);
+                state.drain_retired_states(&mut core, now_inst());
                 return;
             }
             let (phases, body_end) = core.take_tick_phases();
@@ -2621,7 +2730,7 @@ fn control_thread_main(
             // drain any E-stop acks / retired states produced during Steps 3-7.
             state.flush_pending_maint_reply(&core);
             state.emit_estop_ack_if_advanced(&mut core);
-            state.drain_retired_states(&mut core);
+            state.drain_retired_states(&mut core, now_inst());
             let control_hz = core.config.control_frequency_hz;
             let done = now_inst();
             let allocs = crate::diagnostics::alloc::take();
@@ -2713,7 +2822,7 @@ fn control_thread_main(
                     drop(v);
                 }
                 state.emit_estop_ack_if_advanced(&mut core);
-                state.drain_retired_states(&mut core);
+                state.drain_retired_states(&mut core, now_inst());
                 let wake_allocs = crate::diagnostics::alloc::take();
                 if wake_allocs.calls > 0 {
                     stats.wake_alloc_calls.fetch_add(wake_allocs.calls, Ordering::Relaxed);
@@ -2828,7 +2937,8 @@ fn control_thread_main(
         core.publish(ts, publish_gen);
     }
     state.emit_estop_ack_if_advanced(&mut core);
-    state.drain_retired_states(&mut core);
+    state.drain_retired_states(&mut core, now_inst());
+    state.flush_pending_hold_error_for_shutdown(&mut core);
     exited.store(true, Ordering::Release);
     *control_exited_cv.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
     control_exited_cv.1.notify_all();

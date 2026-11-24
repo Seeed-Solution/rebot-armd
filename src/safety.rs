@@ -883,9 +883,42 @@ pub enum SafetyLogEvent {
     CollisionHoldReleased,
     CollisionTrip { joint: u8, residual: f32, threshold: f32, trips: u32, window_s: f64 },
     CollisionEscalated { trips: u32, window_s: f64 },
+    StoppedHoldOutputFailed {
+        partial: bool,
+        suppressed: u64,
+        message: BoundedText<160>,
+        logged_at: std::time::Instant,
+    },
 }
 
 impl SafetyLogEvent {
+    /// Single authoritative formatting for rate-limited stopped-hold output failure logs
+    /// (shared by Legacy direct logging and RT Executor off-thread deferred logging).
+    pub fn emit_stopped_hold_output_failed(partial: bool, suppressed: u64, message: &str) {
+        match (partial, suppressed) {
+            (true, 0) => tracing::error!(
+                target: "armd::supervisor",
+                suppressed,
+                "Stopped hold output partially failed: {message}"
+            ),
+            (true, n) => tracing::error!(
+                target: "armd::supervisor",
+                suppressed = n,
+                "Stopped hold output partially failed (suppressed {n} events): {message}"
+            ),
+            (false, 0) => tracing::error!(
+                target: "armd::supervisor",
+                suppressed,
+                "Stopped hold output failed: {message}"
+            ),
+            (false, n) => tracing::error!(
+                target: "armd::supervisor",
+                suppressed = n,
+                "Stopped hold output failed (suppressed {n} events): {message}"
+            ),
+        }
+    }
+
     /// Emits the exact tracing event on an off-RT thread.
     pub fn emit(&self) {
         match self {
@@ -907,6 +940,9 @@ impl SafetyLogEvent {
                 target: "armd::collision",
                 "Collision guard: {trips} trips within {window_s:.0} s; latching Fault COLLISION"
             ),
+            Self::StoppedHoldOutputFailed { partial, suppressed, message, .. } => {
+                Self::emit_stopped_hold_output_failed(*partial, *suppressed, message.as_str());
+            }
         }
     }
 }
@@ -1716,6 +1752,55 @@ impl SafetyManager {
                 "Watchdog: lease expired while torqued, not parking ({reason}); holding torque and latching WatchdogTimeout"
             );
         }
+    }
+
+    /// Emits or defers a rate-limited stopped-hold output error with exact suppressed-event count
+    /// (zero RT heap allocation).
+    /// Returns `true` when emitted or queued/coalesced into the deferred ring, or `false` when
+    /// the deferred ring is full of unrelated safety events so the caller retains the count.
+    pub fn log_stopped_hold_output_failed(
+        &mut self,
+        partial: bool,
+        suppressed: u64,
+        message: BoundedText<160>,
+        logged_at: std::time::Instant,
+    ) -> bool {
+        if !self.deferred_logging {
+            SafetyLogEvent::emit_stopped_hold_output_failed(partial, suppressed, message.as_str());
+            return true;
+        }
+        if self.log_len < SAFETY_LOG_CAPACITY {
+            let tail = (self.log_head + self.log_len) % SAFETY_LOG_CAPACITY;
+            self.log_events[tail] = Some(SafetyLogEvent::StoppedHoldOutputFailed {
+                partial,
+                suppressed,
+                message,
+                logged_at,
+            });
+            self.log_len += 1;
+            return true;
+        }
+        // Ring is full: coalesce into an existing queued StoppedHoldOutputFailed slot if present
+        // so suppressed counts are never silently dropped.
+        for offset in 0..self.log_len {
+            let idx = (self.log_head + offset) % SAFETY_LOG_CAPACITY;
+            if let Some(SafetyLogEvent::StoppedHoldOutputFailed {
+                partial: prev_partial,
+                suppressed: prev_suppressed,
+                message: prev_msg,
+                logged_at: prev_at,
+            }) = self.log_events[idx].as_mut()
+            {
+                *prev_partial = partial;
+                *prev_suppressed = prev_suppressed
+                    .saturating_add(1)
+                    .saturating_add(suppressed);
+                *prev_msg = message;
+                *prev_at = logged_at;
+                return true;
+            }
+        }
+        false
     }
 
     /// True when `kind` has been latched since the last successful clear to `Idle`.

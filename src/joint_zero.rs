@@ -319,6 +319,9 @@ impl ArmDriver for ZeroOffsetDriver {
     fn set_mit_deadline_fence(&mut self, deadline: Option<Duration>, holdoff: Duration) { self.inner.set_mit_deadline_fence(deadline, holdoff) }
     fn mit_fence_trip(&self) -> Option<String> { self.inner.mit_fence_trip() }
     fn clock_now(&self) -> std::time::Instant { self.inner.clock_now() }
+    fn driver_clock(&self) -> Option<std::sync::Arc<dyn crate::transport::DriverClock>> {
+        self.inner.driver_clock()
+    }
     fn mit_expiry_recover(&mut self) -> Result<(), String> { self.inner.mit_expiry_recover() }
     fn mit_fresh_status(&mut self) -> Result<Vec<u8>, String> { self.inner.mit_fresh_status() }
     fn acknowledge_mit_fence_trip(&mut self) { self.inner.acknowledge_mit_fence_trip() }

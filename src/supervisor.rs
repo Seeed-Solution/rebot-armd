@@ -792,12 +792,28 @@ pub struct SupervisorInner {
     /// True once `CAN_TX_STALLED` has been installed for the current stopped/fault session
     /// (prevents repeated fault re-latching; cleared in `clear_fault_finish`).
     pub(crate) hold_tx_stalled_latched: bool,
-    /// Last driver-clock instant when a stopped-hold TX error/stall was logged (<= 1/s throttle).
+    /// Last driver-clock instant when a stopped-hold backlog stall diagnostic was logged (<= 1/s).
+    /// Kept separate from `last_hold_tx_error_log` so backlog diagnostics never suppress `"Stopped hold output failed"`.
+    pub(crate) last_hold_tx_stall_log: Option<Instant>,
+    /// Last driver-clock instant when `"Stopped hold output failed"` was logged (<= 1/s throttle).
     pub(crate) last_hold_tx_error_log: Option<Instant>,
+    /// Last driver-clock instant accepted by the active stopped-hold error sink (used on RT
+    /// Executor to roll back `last_hold_tx_error_log` if `safety_log_tx` rejects an event).
+    pub(crate) last_hold_tx_error_delivered: Option<Instant>,
+    /// Exact count of `"Stopped hold output failed"` events suppressed by the 1/s rate limit or
+    /// retained after deferred-log ring saturation; emitted on the next allowed log window.
+    pub(crate) hold_tx_error_suppressed: u64,
+    /// Last rejected `(partial, message, logged_at)` awaiting immediate retry once `safety_log_tx`
+    /// has capacity (zero RT heap allocation).
+    pub(crate) pending_hold_tx_error_retry:
+        Option<(bool, crate::safety::BoundedText<160>, Instant)>,
     /// Driver-clock anchor `(pf_fresh_gen, since)` when continuous J7 position-force staleness
     /// (`> 100 ms`) began for the current feedback generation; cleared on fresh J7 feedback,
     /// feedback-generation advance, or `clear_fault_finish_bounded`.
     pub(crate) j7_stale_since: Option<(u64, Instant)>,
+    /// Lock-free handle to the attached driver's clock (when provided by the driver) so RT
+    /// deferred-log forwarding always timestamps acceptance on the exact driver clock.
+    pub(crate) driver_clock: Option<Arc<dyn crate::transport::DriverClock>>,
     /// Action / macro-sub / park-release completion awaiting bus acceptance (`Complete`) across
     /// one or more transient `Deferred` ticks.
     pub(crate) pending_deferred_done: Option<DeferredActionDone>,
@@ -1236,8 +1252,13 @@ impl SupervisorInner {
             tx_joint_no_progress_ticks: vec![0; dof],
             tx_joint_no_progress_since: vec![None; dof],
             hold_tx_stalled_latched: false,
+            last_hold_tx_stall_log: None,
             last_hold_tx_error_log: None,
+            last_hold_tx_error_delivered: None,
+            hold_tx_error_suppressed: 0,
+            pending_hold_tx_error_retry: None,
             j7_stale_since: None,
+            driver_clock: None,
             pending_deferred_done: None,
             gravity_comp_handback_ready: false,
             action_msg_spare: String::with_capacity(256),
@@ -2750,15 +2771,88 @@ impl SupervisorInner {
         self.safety.can_accept_fault_transition()
     }
 
-    /// Rate-limit stopped-hold TX error/stall logs to at most once per second on the driver clock.
-    fn should_log_hold_tx_error(&mut self, now: Instant) -> bool {
+    /// Attach a driver and cache its lock-free clock handle (if provided).
+    pub(crate) fn install_driver(&mut self, driver: Box<dyn ArmDriver>) {
+        self.driver_clock = driver.driver_clock();
+        self.driver = Some(std::sync::Mutex::new(driver));
+    }
+
+    /// Lock-free read of the driver clock for RT off-thread forwarding timestamps, falling back
+    /// to a non-blocking driver try-lock or `fallback` when no lock-free driver clock is attached.
+    pub(crate) fn driver_clock_now_or(&self, fallback: Instant) -> Instant {
+        self.driver_clock
+            .as_ref()
+            .map(|c| c.now())
+            .or_else(|| {
+                self.driver
+                    .as_ref()
+                    .and_then(|d| d.try_lock().ok())
+                    .map(|d| d.clock_now())
+            })
+            .unwrap_or(fallback)
+    }
+
+    /// Consumes any pending `"Stopped hold output failed"` aggregate retained due to a full
+    /// `safety_log_tx` ring so RT executor teardown can deliver it off-thread without losing count.
+    pub(crate) fn take_pending_hold_tx_error_for_shutdown(
+        &mut self,
+    ) -> Option<crate::safety::SafetyLogEvent> {
+        if self.hold_tx_error_suppressed == 0 {
+            return None;
+        }
+        let (partial, message, logged_at) = self.pending_hold_tx_error_retry.take()?;
+        let suppressed = self.hold_tx_error_suppressed - 1;
+        self.hold_tx_error_suppressed = 0;
+        Some(crate::safety::SafetyLogEvent::StoppedHoldOutputFailed {
+            partial,
+            suppressed,
+            message,
+            logged_at,
+        })
+    }
+
+    /// Rate-limit stopped-hold backlog stall diagnostics to at most once per second on the driver
+    /// clock (independent of `"Stopped hold output failed"` throttling).
+    fn should_log_hold_tx_stall(&mut self, now: Instant) -> bool {
         let should = self
-            .last_hold_tx_error_log
+            .last_hold_tx_stall_log
             .is_none_or(|last| now.saturating_duration_since(last) >= Duration::from_secs(1));
         if should {
-            self.last_hold_tx_error_log = Some(now);
+            self.last_hold_tx_stall_log = Some(now);
         }
         should
+    }
+
+    /// Rate-limit `"Stopped hold output failed"` logs to at most 1/s on the driver clock across
+    /// both Legacy (direct tracing) and RT Executor (zero-alloc deferred safety log) paths,
+    /// maintaining an exact suppressed-event counter even under inline or downstream ring
+    /// saturation (rolling back the throttle window if downstream `safety_log_tx` rejects).
+    pub(crate) fn log_stopped_hold_output_failed_throttled(&mut self, now: Instant, partial: bool, message: &str) {
+        if self
+            .last_hold_tx_error_log
+            .is_some_and(|last| now.saturating_duration_since(last) < Duration::from_secs(1))
+        {
+            self.hold_tx_error_suppressed = self.hold_tx_error_suppressed.saturating_add(1);
+            return;
+        }
+        let mut msg = crate::safety::BoundedText::<160>::empty();
+        msg.push_str(message);
+        if self
+            .safety
+            .log_stopped_hold_output_failed(partial, self.hold_tx_error_suppressed, msg, now)
+        {
+            self.hold_tx_error_suppressed = 0;
+            self.pending_hold_tx_error_retry = None;
+            self.last_hold_tx_error_log = Some(now);
+            if !self.safety.deferred_logging() {
+                self.last_hold_tx_error_delivered = Some(now);
+            }
+        } else {
+            // Deferred safety-log ring is full of unrelated events: retain this occurrence so no
+            // count is lost, and leave `last_hold_tx_error_log` unchanged for immediate retry.
+            self.hold_tx_error_suppressed = self.hold_tx_error_suppressed.saturating_add(1);
+            self.pending_hold_tx_error_retry = Some((partial, msg, now));
+        }
     }
 
     /// Reset all per-joint non-stopped TX lack-of-progress counters and timestamps.
@@ -2805,7 +2899,7 @@ impl SupervisorInner {
                 crate::safety::FaultDetail::CanTxStalled(Some(detail)),
             );
             self.hold_tx_stalled_latched = true;
-            self.last_hold_tx_error_log = Some(now);
+            self.last_hold_tx_stall_log = Some(now);
         }
     }
 
@@ -2848,10 +2942,10 @@ impl SupervisorInner {
             );
             self.hold_tx_stalled_latched = true;
             // Single log event on the transition (emitted or deferred by `SafetyManager::latch`).
-            self.last_hold_tx_error_log = Some(now);
+            self.last_hold_tx_stall_log = Some(now);
             escalated_now = true;
         }
-        if !escalated_now && self.should_log_hold_tx_error(now) && !self.safety.deferred_logging() {
+        if !escalated_now && !self.safety.deferred_logging() && self.should_log_hold_tx_stall(now) {
             let age_ms = observed_age.as_millis().min(u128::from(u64::MAX)) as u64;
             let limit_ms = max_age.as_millis().min(u128::from(u64::MAX)) as u64;
             if dropped > 0 {
@@ -3195,14 +3289,9 @@ impl SupervisorInner {
                         copy_into(&mut self.target_positions, &self.measured_positions);
                     }
                     // Hard error discarded the hold queue (0 frames queued): NEVER latches
-                    // `CAN_TX_STALLED`; rate-limit the error log on driver clock (<= 1/s).
-                    if self.should_log_hold_tx_error(now) && !self.safety.deferred_logging() {
-                        if sent_any {
-                            tracing::error!("Stopped hold output partially failed: {message}");
-                        } else {
-                            tracing::error!("Stopped hold output failed: {message}");
-                        }
-                    }
+                    // `CAN_TX_STALLED`; rate-limit the error log on driver clock (<= 1/s) with an
+                    // exact suppressed-event counter on both Legacy and RT Executor paths.
+                    self.log_stopped_hold_output_failed_throttled(now, sent_any, message.as_str());
                 } else {
                     self.reset_tx_joint_progress();
                     self.stop_motion();
@@ -6152,7 +6241,7 @@ impl ArmSupervisor {
             }
         }
         inner.apply_driver_limits(drv.as_ref());
-        inner.driver = Some(std::sync::Mutex::new(drv));
+        inner.install_driver(drv);
         Ok(())
     }
 
@@ -6172,7 +6261,7 @@ impl ArmSupervisor {
                 }
                 let driver: Box<dyn ArmDriver> = Box::new(crate::joint_zero::ZeroOffsetDriver::new(driver, &inner.joint_zero_offsets));
                 inner.apply_driver_limits(driver.as_ref());
-                inner.driver = Some(std::sync::Mutex::new(driver));
+                inner.install_driver(driver);
             }
         }
         self
