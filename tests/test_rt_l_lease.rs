@@ -3716,3 +3716,379 @@ async fn m2_raw_broker_rejects_unregistered_client_ids_and_binds_client_to_lease
         handle.stop_and_join();
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m3_clear_fault_rechecks_authority_before_hardware_reset_and_final_clear() {
+    use armd::rt_core::requests::lease::install_lease_clear_fault_legacy;
+
+    struct M3HookDriver {
+        dof: usize,
+        positions: Vec<f32>,
+        hw_fault: Arc<AtomicBool>,
+        clear_fault_calls: Arc<AtomicUsize>,
+        on_preflight: Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>,
+    }
+
+    impl ArmDriver for M3HookDriver {
+        fn capabilities(&self) -> DriverCapabilities {
+            DriverCapabilities {
+                enable_feedback: true,
+                velocity_feedback: true,
+                torque_feedback: true,
+                temperature_feedback: true,
+                ..DriverCapabilities::default()
+            }
+        }
+        fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+            if let Some(cb) = self.on_preflight.lock().unwrap().take() {
+                cb();
+            }
+            Ok(self
+                .positions
+                .iter()
+                .map(|&p| JointState {
+                    position: p,
+                    velocity: 0.0,
+                    torque: 0.0,
+                    temperature: 30.0,
+                })
+                .collect())
+        }
+        fn read_joint_states_budgeted(
+            &mut self,
+            out: &mut Vec<JointState>,
+            _deadline: Instant,
+            _max_rx_frames: u16,
+        ) -> Result<(u16, bool), ArmDriverError> {
+            out.clear();
+            for &p in &self.positions {
+                out.push(JointState {
+                    position: p,
+                    velocity: 0.0,
+                    torque: 0.0,
+                    temperature: 30.0,
+                });
+            }
+            Ok((self.dof as u16, false))
+        }
+        fn read_cached_joint_states_into(&self, out: &mut Vec<JointState>) -> Option<()> {
+            out.clear();
+            for &p in &self.positions {
+                out.push(JointState {
+                    position: p,
+                    velocity: 0.0,
+                    torque: 0.0,
+                    temperature: 30.0,
+                });
+            }
+            Some(())
+        }
+        fn write_joint_targets(&mut self, _targets: &[JointTarget]) -> Result<(), ArmDriverError> {
+            Ok(())
+        }
+        fn set_torque(&mut self, _enable: bool) -> Result<(), ArmDriverError> {
+            Ok(())
+        }
+        fn is_enabled(&self) -> bool {
+            false
+        }
+        fn enable_state(&self) -> EnableState {
+            EnableState::Disabled
+        }
+        fn is_feedback_valid(&self) -> bool {
+            true
+        }
+        fn feedback_ages(&self) -> Vec<Option<Duration>> {
+            vec![Some(Duration::from_millis(1)); self.dof]
+        }
+        fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
+            if let Some(cb) = self.on_preflight.lock().unwrap().take() {
+                cb();
+            }
+            out.clear();
+            out.resize(self.dof, Some(Duration::from_millis(1)));
+        }
+        fn check_hardware_status(&self) -> Result<(), ArmDriverError> {
+            if self.hw_fault.load(Ordering::SeqCst) {
+                Err(ArmDriverError::HardwareFault("motor fault latched".into()))
+            } else {
+                Ok(())
+            }
+        }
+        fn has_hardware_fault(&self) -> bool {
+            self.hw_fault.load(Ordering::SeqCst)
+        }
+        fn clear_fault(&mut self) -> Result<(), ArmDriverError> {
+            self.clear_fault_calls.fetch_add(1, Ordering::SeqCst);
+            self.hw_fault.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+        fn clear_fault_budgeted(&mut self, _deadline: Instant) -> Result<(), ArmDriverError> {
+            self.clear_fault_calls.fetch_add(1, Ordering::SeqCst);
+            self.hw_fault.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let make_case = |hw_fault_init: bool, estop: bool| {
+        let cfg = ArmConfig {
+            lease_timeout_ms: 5_000,
+            ..ArmConfig::rebot_dm()
+        };
+        let hw_fault = Arc::new(AtomicBool::new(hw_fault_init));
+        let clear_fault_calls = Arc::new(AtomicUsize::new(0));
+        let on_preflight: Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>> =
+            Arc::new(Mutex::new(None));
+        let drv = M3HookDriver {
+            dof: cfg.dof,
+            positions: cfg.resting_positions().to_vec(),
+            hw_fault: Arc::clone(&hw_fault),
+            clear_fault_calls: Arc::clone(&clear_fault_calls),
+            on_preflight: Arc::clone(&on_preflight),
+        };
+        let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
+        inner.operator_auth_enforced = true;
+        inner.feedback_numeric_valid = true;
+        inner.tick(0.02);
+        let c1 = ConnectionHandle::from_ws_id(1).unwrap();
+        inner.register_live_connection(c1.id()).unwrap();
+        let now = Instant::now();
+        let ctx = LeaseInstallCtx {
+            expected_arm: armd::rt_core::ids::ArmId::LOCAL,
+            expected_boot: BootId(71),
+            stamp_arm: armd::rt_core::ids::ArmId::LOCAL,
+            stamp_boot: BootId(71),
+            now,
+            request_id: 90_001,
+            client: ClientId(c1.id()),
+            deadline: now + Duration::from_secs(5),
+            enforce_single_use: false,
+        };
+        let LeaseOutcome::Granted { generation: g1, .. } = install_lease_acquire(
+            &mut inner,
+            &LeaseAcquire {
+                connection: c1,
+                label: armd::model::HolderLabel::new("m3_holder"),
+                has_label: true,
+            },
+            &ctx,
+        )
+        .unwrap() else {
+            panic!("expected lease grant");
+        };
+        if estop {
+            inner.safety.trigger_e_stop();
+            inner.e_stop_latched.store(true, Ordering::SeqCst);
+        } else {
+            // Non-recoverable HardwareFault
+            inner.safety.latch(
+                armd::FaultKind::Other,
+                armd::safety::FaultDetail::formatted(armd::FaultCode::HardwareFault, |buf| {
+                    buf.push_str("m3 non-recoverable hardware fault");
+                }),
+            );
+        }
+        assert!(
+            !inner.safety.recoverable(),
+            "fault under test must be non-recoverable"
+        );
+        (inner, c1, g1, hw_fault, clear_fault_calls, on_preflight)
+    };
+
+    // 1. Lock operator session DURING driver preflight -> NO hardware reset, NO clear (BOTH owners).
+    for use_rt in [false, true] {
+        let auth = OperatorAuth::enforced("123456", 1800);
+        let (tok, _) = auth.unlock("123456").unwrap();
+        let grant = auth.operator_grant(Some(&tok));
+        let (mut inner, c1, g1, hw_fault, clear_calls, on_preflight) = make_case(true, false);
+        let auth_lock = auth.clone();
+        let tok_lock = tok.clone();
+        *on_preflight.lock().unwrap() = Some(Box::new(move || {
+            auth_lock.lock(Some(&tok_lock));
+        }));
+        let ep = inner.safety.epoch_id();
+        let now = Instant::now();
+        let out = if use_rt {
+            install_lease_clear_fault_rt(
+                &mut inner,
+                c1,
+                g1,
+                Some(ep),
+                true,
+                None,
+                OwnerAuthPolicy::ClearFault,
+                grant,
+                now,
+                now + Duration::from_millis(50),
+            )
+        } else {
+            install_lease_clear_fault_legacy(
+                &mut inner,
+                c1,
+                g1,
+                Some(ep),
+                true,
+                None,
+                false,
+                OwnerAuthPolicy::ClearFault,
+                grant,
+                now,
+            )
+            .unwrap()
+        };
+        assert!(
+            matches!(out, LeaseClearFaultOutcome::OperatorRequired { .. }),
+            "locking operator session during preflight must abort before hardware reset (use_rt={use_rt}): {out:?}"
+        );
+        assert_eq!(
+            clear_calls.load(Ordering::SeqCst),
+            0,
+            "hardware reset MUST NOT be sent once operator session is locked (use_rt={use_rt})"
+        );
+        assert!(hw_fault.load(Ordering::SeqCst), "hardware fault must stay untouched");
+        assert!(
+            inner.safety.state().is_stopped(),
+            "safety fault must NOT clear when session locked during preflight (use_rt={use_rt})"
+        );
+    }
+
+    // 2. Lock operator session DURING driver preflight before final clear (no hw reset needed,
+    //    E-stop latched) -> NO clear on BOTH owners.
+    for use_rt in [false, true] {
+        let auth = OperatorAuth::enforced("123456", 1800);
+        let (tok, _) = auth.unlock("123456").unwrap();
+        let grant = auth.operator_grant(Some(&tok));
+        let (mut inner, c1, g1, _hw_fault, clear_calls, on_preflight) = make_case(false, true);
+        let auth_lock = auth.clone();
+        let tok_lock = tok.clone();
+        *on_preflight.lock().unwrap() = Some(Box::new(move || {
+            auth_lock.lock(Some(&tok_lock));
+        }));
+        let ep = inner.safety.epoch_id();
+        let now = Instant::now();
+        let out = if use_rt {
+            install_lease_clear_fault_rt(
+                &mut inner,
+                c1,
+                g1,
+                Some(ep),
+                true,
+                None,
+                OwnerAuthPolicy::ClearFault,
+                grant,
+                now,
+                now + Duration::from_millis(50),
+            )
+        } else {
+            install_lease_clear_fault_legacy(
+                &mut inner,
+                c1,
+                g1,
+                Some(ep),
+                true,
+                None,
+                false,
+                OwnerAuthPolicy::ClearFault,
+                grant,
+                now,
+            )
+            .unwrap()
+        };
+        assert!(
+            matches!(out, LeaseClearFaultOutcome::OperatorRequired { .. }),
+            "locking operator session during preflight must abort before final clear (use_rt={use_rt}): {out:?}"
+        );
+        assert_eq!(clear_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            *inner.safety.state(),
+            SafetyState::EStop,
+            "E-stop must stay latched when session locked during preflight (use_rt={use_rt})"
+        );
+    }
+
+    // 3. Non-recoverable fault NEVER clears with `OwnerAuthPolicy::None` (non-explicit clear) or
+    //    `OperatorGrant::DENIED`, even if `operator_auth_enforced == false`.
+    {
+        let (mut inner, c1, g1, _hw_fault, clear_calls, _on_preflight) = make_case(false, false);
+        inner.operator_auth_enforced = false;
+        let ep = inner.safety.epoch_id();
+        let now = Instant::now();
+        let out_non_explicit = install_lease_clear_fault_rt(
+            &mut inner,
+            c1,
+            g1,
+            Some(ep),
+            true,
+            None,
+            OwnerAuthPolicy::None,
+            OperatorGrant::unenforced(),
+            now,
+            now + Duration::from_millis(50),
+        );
+        assert!(
+            matches!(out_non_explicit, LeaseClearFaultOutcome::OperatorRequired { .. }),
+            "non-recoverable fault must never clear without explicit operator clear policy: {out_non_explicit:?}"
+        );
+        let out_denied = install_lease_clear_fault_rt(
+            &mut inner,
+            c1,
+            g1,
+            Some(ep),
+            true,
+            None,
+            OwnerAuthPolicy::ClearFault,
+            OperatorGrant::DENIED,
+            now,
+            now + Duration::from_millis(50),
+        );
+        assert!(
+            matches!(out_denied, LeaseClearFaultOutcome::OperatorRequired { .. }),
+            "non-recoverable fault must never clear without a valid session grant: {out_denied:?}"
+        );
+        assert_eq!(clear_calls.load(Ordering::SeqCst), 0);
+        assert!(inner.safety.state().is_stopped());
+
+        // Positive control: explicit operator clear with valid live session succeeds (and triggers
+        // hardware reset when needed).
+        let auth = OperatorAuth::enforced("123456", 1800);
+        let (tok, _) = auth.unlock("123456").unwrap();
+        let grant = auth.operator_grant(Some(&tok));
+        let (mut inner2, c2, g2, hw_fault2, clear_calls2, _hook2) = make_case(true, false);
+        let ep2 = inner2.safety.epoch_id();
+        let now2 = Instant::now();
+        let reset_step = install_lease_clear_fault_rt(
+            &mut inner2,
+            c2,
+            g2,
+            Some(ep2),
+            true,
+            None,
+            OwnerAuthPolicy::ClearFault,
+            grant,
+            now2,
+            now2 + Duration::from_millis(50),
+        );
+        assert!(
+            matches!(reset_step, LeaseClearFaultOutcome::ClearFailed { .. }),
+            "first call with hw fault sends reset and requires fresh post-reset confirmation: {reset_step:?}"
+        );
+        assert_eq!(clear_calls2.load(Ordering::SeqCst), 1, "valid session must reach hardware reset");
+        assert!(!hw_fault2.load(Ordering::SeqCst));
+        let cleared = install_lease_clear_fault_rt(
+            &mut inner2,
+            c2,
+            g2,
+            Some(ep2),
+            true,
+            None,
+            OwnerAuthPolicy::ClearFault,
+            grant,
+            now2,
+            now2 + Duration::from_millis(50),
+        );
+        assert!(
+            matches!(cleared, LeaseClearFaultOutcome::Cleared { safety_state: SafetyState::Idle, .. }),
+            "second call after hw reset with valid session clears cleanly: {cleared:?}"
+        );
+    }
+}

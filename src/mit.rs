@@ -1759,12 +1759,34 @@ impl crate::supervisor::SupervisorInner {
         self.mit.recovery_confirmed = mit_recovery;
         let res = self.clear_fault_for_epoch(expected_epoch);
         self.mit.recovery_confirmed = false;
+        res.map_err(Self::map_clear_fault_mit_err)
+    }
+
+    pub(crate) fn clear_fault_confirmed_for_epoch_with_authority(
+        &mut self,
+        mit_recovery: bool,
+        authority: crate::rt_core::requests::lease::ClearFaultAuthority,
+    ) -> Result<crate::safety::SafetyState, crate::supervisor::ClearFaultLegacyWithAuthError> {
+        self.mit.recovery_confirmed = mit_recovery;
+        let res = self.clear_fault_for_epoch_with_authority(Some(authority.expected_epoch), Some(authority));
+        self.mit.recovery_confirmed = false;
         res.map_err(|e| match e {
+            crate::supervisor::ClearFaultLegacyInnerError::Authority(a) => {
+                crate::supervisor::ClearFaultLegacyWithAuthError::Authority(a)
+            }
+            crate::supervisor::ClearFaultLegacyInnerError::Safety(s) => {
+                crate::supervisor::ClearFaultLegacyWithAuthError::Arm(Self::map_clear_fault_mit_err(s))
+            }
+        })
+    }
+
+    fn map_clear_fault_mit_err(e: crate::safety::SafetyError) -> crate::supervisor::ArmError {
+        match e {
             crate::safety::SafetyError::ClearFaultRejected(m) if m.starts_with(RECOVERY_CONFIRM_CODE) =>
                 crate::supervisor::ArmError::Rejected { status: 409, code: RECOVERY_CONFIRM_CODE.into(), message: RECOVERY_WARNING.into() },
             crate::safety::SafetyError::ClearFaultRejected(m) if m.contains(QUIET_PERIOD_CODE) =>
                 crate::supervisor::ArmError::Rejected { status: 409, code: QUIET_PERIOD_CODE.into(), message: m },
             other => crate::supervisor::ArmError::from(other),
-        })
+        }
     }
 }

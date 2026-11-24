@@ -30,7 +30,10 @@ mod actions;
 /// and the policy runner submit through it once they route through the mailbox.
 pub use streams::targets;
 pub use driver_transitions::{run_with_panic_deadline_observer, PanicDisableOutcome, PANIC_DISABLE_TIMEOUT};
-pub(crate) use driver_transitions::ClearFaultCommit;
+pub(crate) use driver_transitions::{
+    ClearFaultCommit, ClearFaultLegacyInnerError, ClearFaultLegacyWithAuthError,
+    ClearFaultWithAuthError,
+};
 pub(crate) use driver_transitions::{panic_disable_deadlines, run_with_panic_deadline_observer_until};
 
 /// Global monotonic allocator for single-use [`AdmissionStamp::request_id`] values.

@@ -871,12 +871,144 @@ impl LeaseClearFaultOutcome {
     }
 }
 
+/// Live owner-side authority bundle carried through `/api/v1/safety/clear_fault` into the
+/// driver preflight, hardware reset (`drv.clear_fault*`), and final `safety.clear_with_check`
+/// commit inside the same owner transaction (M3).
+#[derive(Debug, Clone, Copy)]
+pub struct ClearFaultAuthority {
+    pub connection: ConnectionHandle,
+    pub lease_generation: u64,
+    pub expected_epoch: u64,
+    pub auth_policy: OwnerAuthPolicy,
+    pub operator: OperatorGrant,
+}
+
+/// Zero-allocation refusal returned when live clear_fault authority expires or is revoked before
+/// hardware reset or before final safety clear (M3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClearFaultAuthorityError {
+    LeaseLost,
+    PendingEstop,
+    EpochMismatch { expected: u64, received: u64 },
+    OperatorRequired { operation: &'static str },
+}
+
+/// Single read-only, lock-free, zero-allocation live authority re-check for `/api/v1/safety/clear_fault`
+/// (M3): verifies connection liveness, active unfenced lease, epoch consistency, live operator
+/// session (`OperatorGrant`), AND forbids clearing a non-recoverable fault/E-stop unless the
+/// caller's policy is an explicit operator clear backed by a live valid operator session.
+///
+/// Safe to invoke while holding the driver mutex right before `drv.clear_fault*` and right before
+/// `safety.clear_with_check` (never locks `self.driver`).
+pub(crate) fn recheck_clear_fault_authority_readonly(
+    inner: &SupervisorInner,
+    auth: ClearFaultAuthority,
+    now: Instant,
+) -> Result<(), ClearFaultAuthorityError> {
+    let check_now = now.max(Instant::now());
+    let lease_ok = auth.lease_generation != 0
+        && inner.check_client_connection_live(auth.connection.id()).is_ok()
+        && inner.is_lease_valid_for_conn_at(
+            auth.connection.as_str(),
+            auth.lease_generation,
+            check_now,
+        );
+    if !lease_ok {
+        return Err(ClearFaultAuthorityError::LeaseLost);
+    }
+    if inner.estop_request_unapplied() {
+        return Err(ClearFaultAuthorityError::PendingEstop);
+    }
+    let epoch = inner.safety.epoch_id();
+    if epoch != auth.expected_epoch {
+        return Err(ClearFaultAuthorityError::EpochMismatch {
+            expected: epoch,
+            received: auth.expected_epoch,
+        });
+    }
+    // Never clear a non-recoverable fault (or E-stop) through this path unless it is an explicit
+    // operator clear backed by a live valid operator session.
+    let non_recoverable = inner.e_stop_latched.load(Ordering::SeqCst)
+        || ((inner.safety.state().is_stopped() || inner.safety.has_latched_fault())
+            && !inner.safety.recoverable());
+    if non_recoverable {
+        let explicit_operator_clear = matches!(
+            auth.auth_policy,
+            OwnerAuthPolicy::ClearFault | OwnerAuthPolicy::Operator(_)
+        );
+        if !explicit_operator_clear
+            || !auth
+                .operator
+                .is_valid_at(check_now, inner.operator_auth_enforced)
+        {
+            return Err(ClearFaultAuthorityError::OperatorRequired {
+                operation: if inner.e_stop_latched.load(Ordering::SeqCst) {
+                    "clear_fault (EStop latched)"
+                } else {
+                    "clear_fault (non-recoverable fault or EStop)"
+                },
+            });
+        }
+    } else if let OwnerAuthPolicy::Operator(label) = auth.auth_policy {
+        if !auth
+            .operator
+            .is_valid_at(check_now, inner.operator_auth_enforced)
+        {
+            return Err(ClearFaultAuthorityError::OperatorRequired {
+                operation: label.unwrap_or("/api/v1/safety/clear_fault"),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn map_clear_fault_authority_err(
+    inner: &mut SupervisorInner,
+    auth: ClearFaultAuthority,
+    err: ClearFaultAuthorityError,
+) -> LeaseClearFaultOutcome {
+    match err {
+        ClearFaultAuthorityError::LeaseLost => LeaseClearFaultOutcome::LeaseLost {
+            epoch_id: inner.safety.epoch_id(),
+        },
+        ClearFaultAuthorityError::PendingEstop => {
+            inner.consume_pending_estop();
+            let epoch = inner.safety.epoch_id();
+            if epoch != auth.expected_epoch {
+                LeaseClearFaultOutcome::EpochMismatch {
+                    expected: epoch,
+                    received: auth.expected_epoch,
+                    consumed_request_id: true,
+                }
+            } else {
+                LeaseClearFaultOutcome::ClearFailed {
+                    err: crate::safety::ClearFaultError::EStopActive,
+                    epoch_id: epoch,
+                }
+            }
+        }
+        ClearFaultAuthorityError::EpochMismatch { expected, received } => {
+            LeaseClearFaultOutcome::EpochMismatch {
+                expected,
+                received,
+                consumed_request_id: true,
+            }
+        }
+        ClearFaultAuthorityError::OperatorRequired { operation } => {
+            LeaseClearFaultOutcome::OperatorRequired {
+                operation,
+                epoch_id: inner.safety.epoch_id(),
+            }
+        }
+    }
+}
+
 /// Shared zero-allocation owner-side preflight for `/api/v1/safety/clear_fault` enforcing the exact
 /// legacy WS precedence:
 /// 1. Connection liveness & active lease (`LEASE_LOST`)
 /// 2. `consume_pending_estop()` + `epoch_id` match (`EPOCH_MISMATCH`, pre-`request_id`)
 /// 3. `request_id` strict monotonicity (`InvalidRequestId`)
-/// 4. Pending E-stop + live [`OperatorGrant`] check (`OPERATOR_REQUIRED` / post-auth `EPOCH_MISMATCH`)
+/// 4. Pending E-stop + live [`OperatorGrant`] + non-recoverable guard (`OPERATOR_REQUIRED` / post-auth `EPOCH_MISMATCH`)
 /// 5. `calibration_busy && motor_zero_busy` (`MOTION_BUSY`)
 /// 6. Command body & `mit_recovery` validation (`INVALID_COMMAND`)
 #[allow(clippy::too_many_arguments, clippy::result_large_err)] // inline outcome keeps RT clear_fault zero-alloc
@@ -890,7 +1022,7 @@ fn check_lease_clear_fault_owner_preflight(
     auth_policy: OwnerAuthPolicy,
     operator: OperatorGrant,
     now: Instant,
-) -> Result<u64, LeaseClearFaultOutcome> {
+) -> Result<ClearFaultAuthority, LeaseClearFaultOutcome> {
     let lease_ok = lease_generation != 0
         && inner
             .check_client_connection_live(connection.id())
@@ -912,6 +1044,16 @@ fn check_lease_clear_fault_owner_preflight(
     }
     if !request_id_valid {
         return Err(LeaseClearFaultOutcome::InvalidRequestId);
+    }
+    let auth = ClearFaultAuthority {
+        connection,
+        lease_generation,
+        expected_epoch: epoch,
+        auth_policy,
+        operator,
+    };
+    if let Err(auth_err) = recheck_clear_fault_authority_readonly(inner, auth, now) {
+        return Err(map_clear_fault_authority_err(inner, auth, auth_err));
     }
     if let Err(auth_err) = evaluate_owner_auth_policy(
         auth_policy,
@@ -948,7 +1090,7 @@ fn check_lease_clear_fault_owner_preflight(
             epoch_id: inner.safety.epoch_id(),
         });
     }
-    Ok(epoch)
+    Ok(auth)
 }
 
 /// Single RT owner-side install function for `MaintenanceOp::LeaseClearFault` (zero heap allocs).
@@ -965,7 +1107,7 @@ pub fn install_lease_clear_fault_rt(
     now: Instant,
     release_deadline: Instant,
 ) -> LeaseClearFaultOutcome {
-    let epoch = match check_lease_clear_fault_owner_preflight(
+    let auth = match check_lease_clear_fault_owner_preflight(
         inner,
         connection,
         lease_generation,
@@ -976,32 +1118,42 @@ pub fn install_lease_clear_fault_rt(
         operator,
         now,
     ) {
-        Ok(ep) => ep,
+        Ok(a) => a,
         Err(out) => return out,
     };
-    match inner.clear_fault_executor_bounded_for_release(now, release_deadline, Some(epoch)) {
+    match inner.clear_fault_executor_bounded_for_release_with_authority(
+        now,
+        release_deadline,
+        auth,
+    ) {
         Ok(safety_state) => LeaseClearFaultOutcome::Cleared {
             safety_state,
             epoch_id: inner.safety.epoch_id(),
             is_torqued: inner.is_torqued,
             control_mode_gravity_comp: inner.gravity_comp_active(),
         },
-        Err(crate::safety::ClearFaultError::EpochMismatch { expected, received }) => {
-            LeaseClearFaultOutcome::EpochMismatch {
-                expected,
-                received,
-                consumed_request_id: true,
+        Err(crate::supervisor::ClearFaultWithAuthError::Authority(auth_err)) => {
+            map_clear_fault_authority_err(inner, auth, auth_err)
+        }
+        Err(crate::supervisor::ClearFaultWithAuthError::Clear(
+            crate::safety::ClearFaultError::EpochMismatch { expected, received },
+        )) => LeaseClearFaultOutcome::EpochMismatch {
+            expected,
+            received,
+            consumed_request_id: true,
+        },
+        Err(crate::supervisor::ClearFaultWithAuthError::Clear(err)) => {
+            LeaseClearFaultOutcome::ClearFailed {
+                err,
+                epoch_id: inner.safety.epoch_id(),
             }
         }
-        Err(err) => LeaseClearFaultOutcome::ClearFailed {
-            err,
-            epoch_id: inner.safety.epoch_id(),
-        },
     }
 }
 
 /// Single legacy owner-side install function for WS `/api/v1/safety/clear_fault`, sharing the
-/// exact same authority/operator preflight as [`install_lease_clear_fault_rt`].
+/// exact same authority/operator preflight and mid-transaction reset/clear re-checks as
+/// [`install_lease_clear_fault_rt`].
 #[allow(clippy::too_many_arguments)]
 pub fn install_lease_clear_fault_legacy(
     inner: &mut SupervisorInner,
@@ -1015,7 +1167,7 @@ pub fn install_lease_clear_fault_legacy(
     operator: OperatorGrant,
     now: Instant,
 ) -> Result<LeaseClearFaultOutcome, (crate::supervisor::ArmError, u64)> {
-    let epoch = match check_lease_clear_fault_owner_preflight(
+    let auth = match check_lease_clear_fault_owner_preflight(
         inner,
         connection,
         lease_generation,
@@ -1026,17 +1178,22 @@ pub fn install_lease_clear_fault_legacy(
         operator,
         now,
     ) {
-        Ok(ep) => ep,
+        Ok(a) => a,
         Err(out) => return Ok(out),
     };
-    match inner.clear_fault_confirmed_for_epoch(mit_recovery, Some(epoch)) {
+    match inner.clear_fault_confirmed_for_epoch_with_authority(mit_recovery, auth) {
         Ok(safety_state) => Ok(LeaseClearFaultOutcome::Cleared {
             safety_state,
             epoch_id: inner.safety.epoch_id(),
             is_torqued: inner.is_torqued,
             control_mode_gravity_comp: inner.gravity_comp_active(),
         }),
-        Err(err) => Err((err, inner.safety.epoch_id())),
+        Err(crate::supervisor::ClearFaultLegacyWithAuthError::Authority(auth_err)) => {
+            Ok(map_clear_fault_authority_err(inner, auth, auth_err))
+        }
+        Err(crate::supervisor::ClearFaultLegacyWithAuthError::Arm(err)) => {
+            Err((err, inner.safety.epoch_id()))
+        }
     }
 }
 

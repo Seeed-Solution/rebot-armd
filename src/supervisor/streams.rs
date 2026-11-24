@@ -230,10 +230,15 @@ impl SupervisorInner {
         self.validate_lease_at(client_id, generation, Instant::now())
     }
 
-    /// Owner-serialized lease validation at `now`: verifies non-detached state, non-zero
-    /// generation, matching connection identity, and non-expiry at `now`, updating
-    /// `last_valid_motion_instant` on success. Zero allocations and zero frees.
-    pub fn validate_lease_at(&mut self, client_id: &str, generation: u64, now: Instant) -> bool {
+    /// Read-only owner-serialized lease check at `now` (zero mutation, zero allocs) used by
+    /// mid-transaction authority re-checks such as M3 `clear_fault` before hardware reset and
+    /// before final safety clear.
+    pub(crate) fn is_lease_valid_for_conn_at(
+        &self,
+        client_id: &str,
+        generation: u64,
+        now: Instant,
+    ) -> bool {
         let fenced_gen = self.effective_fenced_lease_generation();
         if self.detached
             || generation == 0
@@ -244,14 +249,23 @@ impl SupervisorInner {
         {
             return false;
         }
+        self.active_lease.as_ref().is_some_and(|active| {
+            now.saturating_duration_since(active.acquired_at) < self.lease_timeout
+                && active.generation == generation
+                && active.client_id == client_id
+        })
+    }
+
+    /// Owner-serialized lease validation at `now`: verifies non-detached state, non-zero
+    /// generation, matching connection identity, and non-expiry at `now`, updating
+    /// `last_valid_motion_instant` on success. Zero allocations and zero frees.
+    pub fn validate_lease_at(&mut self, client_id: &str, generation: u64, now: Instant) -> bool {
+        if !self.is_lease_valid_for_conn_at(client_id, generation, now) {
+            return false;
+        }
         if let Some(ref mut active) = self.active_lease {
-            let not_expired = now.saturating_duration_since(active.acquired_at) < self.lease_timeout;
-            if not_expired && active.generation == generation && active.client_id == client_id {
-                active.last_valid_motion_instant = Some(now);
-                true
-            } else {
-                false
-            }
+            active.last_valid_motion_instant = Some(now);
+            true
         } else {
             false
         }

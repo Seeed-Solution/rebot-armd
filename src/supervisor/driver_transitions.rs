@@ -586,6 +586,40 @@ fn torque_error_code(e: &SafetyError) -> &'static str {
     }
 }
 
+/// Zero-allocation error returned by RT `clear_fault_executor_bounded_for_release_with_authority`.
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // inline ClearFaultError keeps RT clear_fault strictly zero-alloc
+pub(crate) enum ClearFaultWithAuthError {
+    Authority(crate::rt_core::requests::lease::ClearFaultAuthorityError),
+    Clear(crate::safety::ClearFaultError),
+}
+
+/// Legacy internal error distinguishing M3 live authority revocation from `SafetyError`.
+#[derive(Debug)]
+pub(crate) enum ClearFaultLegacyInnerError {
+    Authority(crate::rt_core::requests::lease::ClearFaultAuthorityError),
+    Safety(SafetyError),
+}
+
+/// Legacy confirmed clear_fault error distinguishing M3 live authority revocation from `ArmError`.
+#[derive(Debug)]
+pub(crate) enum ClearFaultLegacyWithAuthError {
+    Authority(crate::rt_core::requests::lease::ClearFaultAuthorityError),
+    Arm(crate::supervisor::ArmError),
+}
+
+impl From<SafetyError> for ClearFaultLegacyInnerError {
+    fn from(e: SafetyError) -> Self {
+        Self::Safety(e)
+    }
+}
+
+impl From<crate::safety::ClearFaultError> for ClearFaultWithAuthError {
+    fn from(e: crate::safety::ClearFaultError) -> Self {
+        Self::Clear(e)
+    }
+}
+
 impl SupervisorInner {
     pub fn with_driver(mut self, mut driver: Box<dyn ArmDriver>) -> Self {
         driver.set_abort_flag(self.e_stop_latched.clone());
@@ -2779,23 +2813,38 @@ impl SupervisorInner {
     /// `SafetyManager::clear_check` runs FIRST before any motor reset, driver limit mutation,
     /// concurrent E-stop consumption, or other side effect.
     pub fn clear_fault_for_epoch(&mut self, expected_epoch: Option<u64>) -> Result<SafetyState, SafetyError> {
+        match self.clear_fault_for_epoch_with_authority(expected_epoch, None) {
+            Ok(state) => Ok(state),
+            Err(ClearFaultLegacyInnerError::Safety(e)) => Err(e),
+            Err(ClearFaultLegacyInnerError::Authority(_)) => {
+                unreachable!("authority is None on direct clear_fault_for_epoch")
+            }
+        }
+    }
+
+    pub(crate) fn clear_fault_for_epoch_with_authority(
+        &mut self,
+        expected_epoch: Option<u64>,
+        authority: Option<crate::rt_core::requests::lease::ClearFaultAuthority>,
+    ) -> Result<SafetyState, ClearFaultLegacyInnerError> {
+        use crate::rt_core::requests::lease::recheck_clear_fault_authority_readonly;
         use crate::safety::ClearRefusal;
         let had_driver_config_error = self.driver_config_error.is_some();
         let (candidate_limits, driver_err_override, clear_driver_err_field) = match self.probe_driver_limits_legacy() {
             Ok(cand) => (cand, None, had_driver_config_error),
             Err(err) => (None, Some(err), false),
         };
-        let apply_estop_refusal = |this: &mut Self| -> SafetyError {
+        let apply_estop_refusal = |this: &mut Self| -> ClearFaultLegacyInnerError {
             this.consume_pending_estop();
             if let Some(received) = expected_epoch {
                 if received != this.safety.epoch_id() {
-                    return SafetyError::EpochMismatch {
+                    return ClearFaultLegacyInnerError::Safety(SafetyError::EpochMismatch {
                         expected: this.safety.epoch_id(),
                         received,
-                    };
+                    });
                 }
             }
-            SafetyError::EStopActive
+            ClearFaultLegacyInnerError::Safety(SafetyError::EStopActive)
         };
         let commit_probed_limits = |this: &mut Self| {
             if let Some(ref cand) = candidate_limits {
@@ -2839,7 +2888,7 @@ impl SupervisorInner {
             if refusal == ClearRefusal::EStopActive {
                 return Err(apply_estop_refusal(self));
             }
-            return Err(refusal.into_safety_error());
+            return Err(ClearFaultLegacyInnerError::Safety(refusal.into_safety_error()));
         }
         if !self.safety.state().is_stopped() && !self.safety.has_latched_fault() {
             commit_probed_limits(self);
@@ -2942,14 +2991,14 @@ impl SupervisorInner {
                     if refusal == ClearRefusal::EStopActive {
                         return Err(apply_estop_refusal(self));
                     }
-                    return Err(refusal.into_safety_error());
+                    return Err(ClearFaultLegacyInnerError::Safety(refusal.into_safety_error()));
                 }
                 if !self.mit.recovery_confirmed {
-                    return Err(SafetyError::ClearFaultRejected(format!(
+                    return Err(ClearFaultLegacyInnerError::Safety(SafetyError::ClearFaultRejected(format!(
                         "{}: {}",
                         crate::mit::RECOVERY_CONFIRM_CODE,
                         crate::mit::RECOVERY_WARNING
-                    )));
+                    ))));
                 }
                 // Keep operator confirmation, feedback, cooldown, and probed limits staged through
                 // `mit_expiry_recovery_for_epoch`'s final `clear_with_check` decision (fail-closed:
@@ -2960,12 +3009,16 @@ impl SupervisorInner {
                     is_torqued: None,
                     thermal_cooldown: None,
                 };
+                if let Some(auth) = authority {
+                    recheck_clear_fault_authority_readonly(self, auth, Instant::now())
+                        .map_err(ClearFaultLegacyInnerError::Authority)?;
+                }
                 return self.mit_expiry_recovery_for_epoch(
                     expected_epoch,
                     mit_ctx,
                     mit_commit,
                     driver_err_override,
-                );
+                ).map_err(ClearFaultLegacyInnerError::Safety);
             }
         }
 
@@ -2983,7 +3036,7 @@ impl SupervisorInner {
                 Ok(g) => g,
                 Err(_) => {
                     self.ws_eval_bufs = ws_bufs;
-                    return Err(SafetyError::FeedbackUnavailable);
+                    return Err(ClearFaultLegacyInnerError::Safety(SafetyError::FeedbackUnavailable));
                 }
             };
             // Pure read-only telemetry & status snapshot FIRST — ZERO motor resets or side effects.
@@ -2992,7 +3045,7 @@ impl SupervisorInner {
                 Err(e) => {
                     drop(drv);
                     self.ws_eval_bufs = ws_bufs;
-                    return Err(SafetyError::ClearFaultRejected(e.to_string()));
+                    return Err(ClearFaultLegacyInnerError::Safety(SafetyError::ClearFaultRejected(e.to_string())));
                 }
             };
             let ages = drv.feedback_ages();
@@ -3102,6 +3155,14 @@ impl SupervisorInner {
                 // run one read-only refresh/status TX probe and verify fresh post-probe feedback.
                 let (probe_res, drained_after, probe_ok, probe_pending, hw_fault_after, st_after, partial_after, any_en_after, fb_valid_after, j7_fresh_after, ages_after) = {
                     let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
+                    if let Some(auth) = authority {
+                        if let Err(auth_err) =
+                            recheck_clear_fault_authority_readonly(self, auth, Instant::now())
+                        {
+                            drop(drv);
+                            return Err(ClearFaultLegacyInnerError::Authority(auth_err));
+                        }
+                    }
                     let res = drv.probe_tx_ready();
                     (
                         res,
@@ -3148,11 +3209,19 @@ impl SupervisorInner {
                 Err(ClearRefusal::EStopActive) => return Err(apply_estop_refusal(self)),
                 Err(ClearRefusal::HardwareResetRequired) => {
                     // Explicitly modeled exception: every OTHER recorded kind's condition passed,
-                    // so transmitting the motor fault reset is now permitted. Recheck live J7
-                    // freshness and pending E-stop under the SAME driver lock guard before sending
-                    // the reset so there is zero check-to-command gap.
+                    // so transmitting the motor fault reset is now permitted. Recheck live grant,
+                    // lease, operator session (M3), J7 freshness, and pending E-stop under the
+                    // SAME driver lock guard before sending the reset (zero check-to-command gap).
                     let reset_res = {
                         let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
+                        if let Some(auth) = authority {
+                            if let Err(auth_err) =
+                                recheck_clear_fault_authority_readonly(self, auth, Instant::now())
+                            {
+                                drop(drv);
+                                return Err(ClearFaultLegacyInnerError::Authority(auth_err));
+                            }
+                        }
                         ctx.j7_feedback_fresh = drv.pos_force_feedback_fresh();
                         ctx.feedback_fresh = ctx.feedback_fresh && drv.is_feedback_valid();
                         ctx.pending_estop = self.estop_request_unapplied();
@@ -3162,7 +3231,7 @@ impl SupervisorInner {
                                 if refusal == ClearRefusal::EStopActive {
                                     return Err(apply_estop_refusal(self));
                                 }
-                                return Err(refusal.into_safety_error());
+                                return Err(ClearFaultLegacyInnerError::Safety(refusal.into_safety_error()));
                             }
                         }
                         drv.clear_fault()
@@ -3177,12 +3246,20 @@ impl SupervisorInner {
                     if post_refusal == ClearRefusal::EStopActive {
                         return Err(apply_estop_refusal(self));
                     }
-                    return Err(post_refusal.into_safety_error());
+                    return Err(ClearFaultLegacyInnerError::Safety(post_refusal.into_safety_error()));
                 }
                 Err(ClearRefusal::EnableStateUnknown) if fb_fresh && !hw_fault && !partial => {
                     // Every other condition passed; probe enable state once and re-run clear_check.
                     {
                         let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
+                        if let Some(auth) = authority {
+                            if let Err(auth_err) =
+                                recheck_clear_fault_authority_readonly(self, auth, Instant::now())
+                            {
+                                drop(drv);
+                                return Err(ClearFaultLegacyInnerError::Authority(auth_err));
+                            }
+                        }
                         let _ = drv.refresh_enable_state();
                         state = drv.enable_state();
                         partial = drv.has_known_partial_enable();
@@ -3196,7 +3273,7 @@ impl SupervisorInner {
                         if refusal == ClearRefusal::EStopActive {
                             return Err(apply_estop_refusal(self));
                         }
-                        return Err(refusal.into_safety_error());
+                        return Err(ClearFaultLegacyInnerError::Safety(refusal.into_safety_error()));
                     }
                 }
                 Err(refusal) => {
@@ -3206,7 +3283,7 @@ impl SupervisorInner {
                     {
                         self.thermal_cooldown = next_cd;
                     }
-                    return Err(refusal.into_safety_error());
+                    return Err(ClearFaultLegacyInnerError::Safety(refusal.into_safety_error()));
                 }
             }
             if fb_fresh {
@@ -3239,11 +3316,11 @@ impl SupervisorInner {
                 {
                     self.thermal_cooldown = next_cd;
                 }
-                return Err(refusal.into_safety_error());
+                return Err(ClearFaultLegacyInnerError::Safety(refusal.into_safety_error()));
             }
             commit.thermal_cooldown = Some(next_cd);
         }
-        self.clear_fault_finish_bounded(&ctx, commit, move |this| {
+        self.clear_fault_finish_bounded_with_authority(&ctx, commit, authority, None, move |this| {
             if let Some((states, loads, ages)) = staged_feedback {
                 this.feedback_numeric_valid = true;
                 this.last_can_feedback_instant = ages
@@ -3273,22 +3350,29 @@ impl SupervisorInner {
                 );
             }
         })
-        .map_err(SafetyError::from)
+        .map_err(|e| match e {
+            ClearFaultWithAuthError::Authority(a) => ClearFaultLegacyInnerError::Authority(a),
+            ClearFaultWithAuthError::Clear(c) => ClearFaultLegacyInnerError::Safety(SafetyError::from(c)),
+        })
     }
 
     #[allow(clippy::result_large_err)] // inline refusal keeps RT clear_fault zero-alloc
-    fn clear_fault_finish_bounded(
+    fn clear_fault_finish_bounded_with_authority(
         &mut self,
         ctx: &crate::safety::ClearContext,
         commit: ClearFaultCommit,
+        authority: Option<crate::rt_core::requests::lease::ClearFaultAuthority>,
+        now_override: Option<Instant>,
         on_committed: impl FnOnce(&mut Self),
-    ) -> Result<SafetyState, crate::safety::ClearFaultError> {
+    ) -> Result<SafetyState, ClearFaultWithAuthError> {
+        use crate::rt_core::requests::lease::recheck_clear_fault_authority_readonly;
         use crate::safety::{ClearFaultError, ClearRefusal, FaultKind};
         if self.shutdown_committed {
-            return Err(ClearFaultError::Rejected(ClearRefusal::ShutdownCommitted));
+            return Err(ClearFaultWithAuthError::Clear(ClearFaultError::Rejected(ClearRefusal::ShutdownCommitted)));
         }
-        // Build live pre-commit ClearContext right before committing so any concurrent E-stop or
-        // J7 freshness expiry between preflight/probe and commit fails closed with ZERO mutations.
+        // Build live pre-commit ClearContext right before committing so any concurrent E-stop,
+        // authority revocation (M3), or J7 freshness expiry between preflight/probe and commit
+        // fails closed with ZERO mutations.
         let mut final_ctx = *ctx;
         let was_estop = *self.safety.state() == SafetyState::EStop;
         let state = if let Some(ref d) = self.driver {
@@ -3298,13 +3382,21 @@ impl SupervisorInner {
                     final_ctx.j7_feedback_fresh = false;
                     final_ctx.feedback_fresh = false;
                     final_ctx.pending_estop = self.estop_request_unapplied();
-                    return Err(self
-                        .safety
-                        .clear_check(&final_ctx)
-                        .err()
-                        .map_or(ClearFaultError::FeedbackUnavailable, ClearFaultError::from));
+                    return Err(ClearFaultWithAuthError::Clear(
+                        self.safety
+                            .clear_check(&final_ctx)
+                            .err()
+                            .map_or(ClearFaultError::FeedbackUnavailable, ClearFaultError::from),
+                    ));
                 }
             };
+            if let Some(auth) = authority {
+                let check_now = now_override.unwrap_or_else(Instant::now);
+                if let Err(auth_err) = recheck_clear_fault_authority_readonly(self, auth, check_now) {
+                    drop(drv);
+                    return Err(ClearFaultWithAuthError::Authority(auth_err));
+                }
+            }
             final_ctx.pending_estop = self.estop_request_unapplied();
             if self.safety.has_latched_fault_kind(FaultKind::J7FeedbackStale) {
                 final_ctx.j7_feedback_fresh = drv.pos_force_feedback_fresh();
@@ -3316,33 +3408,40 @@ impl SupervisorInner {
                     self.consume_pending_estop();
                     if let Some(received) = final_ctx.expected_epoch {
                         if received != self.safety.epoch_id() {
-                            return Err(ClearFaultError::EpochMismatch {
+                            return Err(ClearFaultWithAuthError::Clear(ClearFaultError::EpochMismatch {
                                 expected: self.safety.epoch_id(),
                                 received,
-                            });
+                            }));
                         }
                     }
-                    return Err(ClearFaultError::EStopActive);
+                    return Err(ClearFaultWithAuthError::Clear(ClearFaultError::EStopActive));
                 }
-                return Err(ClearFaultError::from(refusal));
+                return Err(ClearFaultWithAuthError::Clear(ClearFaultError::from(refusal)));
             }
             if self.estop_request_unapplied() {
                 drop(drv);
                 self.consume_pending_estop();
                 if let Some(received) = final_ctx.expected_epoch {
                     if received != self.safety.epoch_id() {
-                        return Err(ClearFaultError::EpochMismatch {
+                        return Err(ClearFaultWithAuthError::Clear(ClearFaultError::EpochMismatch {
                             expected: self.safety.epoch_id(),
                             received,
-                        });
+                        }));
                     }
                 }
-                return Err(ClearFaultError::EStopActive);
+                return Err(ClearFaultWithAuthError::Clear(ClearFaultError::EStopActive));
             }
             // Commit the safety clear under the SAME driver lock guard before applying staged
             // limits, torque flag, or cleanup (zero check-to-commit gap).
-            self.safety.clear_with_check(&final_ctx).map_err(ClearFaultError::from)?
+            self.safety
+                .clear_with_check(&final_ctx)
+                .map_err(|r| ClearFaultWithAuthError::Clear(ClearFaultError::from(r)))?
         } else {
+            if let Some(auth) = authority {
+                let check_now = now_override.unwrap_or_else(Instant::now);
+                recheck_clear_fault_authority_readonly(self, auth, check_now)
+                    .map_err(ClearFaultWithAuthError::Authority)?;
+            }
             final_ctx.pending_estop = self.estop_request_unapplied();
             if self.safety.has_latched_fault_kind(FaultKind::J7FeedbackStale) {
                 final_ctx.j7_feedback_fresh = false;
@@ -3352,28 +3451,30 @@ impl SupervisorInner {
                     self.consume_pending_estop();
                     if let Some(received) = final_ctx.expected_epoch {
                         if received != self.safety.epoch_id() {
-                            return Err(ClearFaultError::EpochMismatch {
+                            return Err(ClearFaultWithAuthError::Clear(ClearFaultError::EpochMismatch {
                                 expected: self.safety.epoch_id(),
                                 received,
-                            });
+                            }));
                         }
                     }
-                    return Err(ClearFaultError::EStopActive);
+                    return Err(ClearFaultWithAuthError::Clear(ClearFaultError::EStopActive));
                 }
-                return Err(ClearFaultError::from(refusal));
+                return Err(ClearFaultWithAuthError::Clear(ClearFaultError::from(refusal)));
             }
             if self.consume_pending_estop() {
                 if let Some(received) = final_ctx.expected_epoch {
                     if received != self.safety.epoch_id() {
-                        return Err(ClearFaultError::EpochMismatch {
+                        return Err(ClearFaultWithAuthError::Clear(ClearFaultError::EpochMismatch {
                             expected: self.safety.epoch_id(),
                             received,
-                        });
+                        }));
                     }
                 }
-                return Err(ClearFaultError::EStopActive);
+                return Err(ClearFaultWithAuthError::Clear(ClearFaultError::EStopActive));
             }
-            self.safety.clear_with_check(&final_ctx).map_err(ClearFaultError::from)?
+            self.safety
+                .clear_with_check(&final_ctx)
+                .map_err(|r| ClearFaultWithAuthError::Clear(ClearFaultError::from(r)))?
         };
 
         on_committed(self);
@@ -3628,7 +3729,13 @@ impl SupervisorInner {
         deadline: Instant,
         expected_epoch: Option<u64>,
     ) -> Result<SafetyState, crate::safety::ClearFaultError> {
-        self.clear_fault_executor_inner(None, deadline, expected_epoch)
+        match self.clear_fault_executor_inner(None, deadline, expected_epoch, None) {
+            Ok(state) => Ok(state),
+            Err(ClearFaultWithAuthError::Clear(e)) => Err(e),
+            Err(ClearFaultWithAuthError::Authority(_)) => {
+                unreachable!("authority is None on clear_fault_executor_bounded_for_epoch")
+            }
+        }
     }
 
     /// Release-bounded, allocation-free fault clearing for Step 2b of an RT release: caps every
@@ -3643,7 +3750,33 @@ impl SupervisorInner {
         let tx_deadline = release_deadline
             .checked_sub(self.tx_release_publish_margin())
             .unwrap_or(now);
-        self.clear_fault_executor_inner(Some(now), tx_deadline, expected_epoch)
+        match self.clear_fault_executor_inner(Some(now), tx_deadline, expected_epoch, None) {
+            Ok(state) => Ok(state),
+            Err(ClearFaultWithAuthError::Clear(e)) => Err(e),
+            Err(ClearFaultWithAuthError::Authority(_)) => {
+                unreachable!("authority is None on clear_fault_executor_bounded_for_release")
+            }
+        }
+    }
+
+    /// Release-bounded, allocation-free fault clearing carrying M3 live owner authority through
+    /// driver preflight, hardware reset (`drv.clear_fault_budgeted`), and final `safety.clear_with_check`.
+    #[allow(clippy::result_large_err)] // inline refusal keeps RT clear_fault zero-alloc
+    pub(crate) fn clear_fault_executor_bounded_for_release_with_authority(
+        &mut self,
+        now: Instant,
+        release_deadline: Instant,
+        authority: crate::rt_core::requests::lease::ClearFaultAuthority,
+    ) -> Result<SafetyState, ClearFaultWithAuthError> {
+        let tx_deadline = release_deadline
+            .checked_sub(self.tx_release_publish_margin())
+            .unwrap_or(now);
+        self.clear_fault_executor_inner(
+            Some(now),
+            tx_deadline,
+            Some(authority.expected_epoch),
+            Some(authority),
+        )
     }
 
     #[allow(clippy::result_large_err)] // inline refusal keeps RT clear_fault zero-alloc
@@ -3652,19 +3785,21 @@ impl SupervisorInner {
         now_override: Option<Instant>,
         deadline: Instant,
         expected_epoch: Option<u64>,
-    ) -> Result<SafetyState, crate::safety::ClearFaultError> {
+        authority: Option<crate::rt_core::requests::lease::ClearFaultAuthority>,
+    ) -> Result<SafetyState, ClearFaultWithAuthError> {
+        use crate::rt_core::requests::lease::recheck_clear_fault_authority_readonly;
         use crate::safety::{ClearFaultError as E, ClearRefusal as R};
-        let apply_estop_refusal = |this: &mut Self| -> E {
+        let apply_estop_refusal = |this: &mut Self| -> ClearFaultWithAuthError {
             this.consume_pending_estop();
             if let Some(received) = expected_epoch {
                 if received != this.safety.epoch_id() {
-                    return E::EpochMismatch {
+                    return ClearFaultWithAuthError::Clear(E::EpochMismatch {
                         expected: this.safety.epoch_id(),
                         received,
-                    };
+                    });
                 }
             }
-            E::EStopActive
+            ClearFaultWithAuthError::Clear(E::EStopActive)
         };
         let had_driver_config_error = self.driver_config_error.is_some();
         let (candidate_limits, driver_err_override) = if had_driver_config_error {
@@ -3689,7 +3824,7 @@ impl SupervisorInner {
                 if refusal == R::EStopActive {
                     return Err(apply_estop_refusal(self));
                 }
-                return Err(E::from(refusal));
+                return Err(ClearFaultWithAuthError::Clear(E::from(refusal)));
             }
             if let Some(ref cand) = candidate_limits {
                 self.commit_driver_limits_bounded(cand);
@@ -3714,7 +3849,7 @@ impl SupervisorInner {
                     self.scratch.ages = scratch_ages;
                     self.scratch.rx = scratch_rx;
                     self.ws_eval_bufs = ws_bufs;
-                    return Err(E::FeedbackUnavailable);
+                    return Err(ClearFaultWithAuthError::Clear(E::FeedbackUnavailable));
                 }
             };
             // Pure read-only driver snapshot FIRST — ZERO motor resets or mutations.
@@ -3803,7 +3938,7 @@ impl SupervisorInner {
             if clear_res == Err(R::TxProbeRequired) {
                 let now = now_override.unwrap_or_else(Instant::now);
                 if now >= deadline {
-                    return Err(E::Rejected(R::BudgetExpired));
+                    return Err(ClearFaultWithAuthError::Clear(E::Rejected(R::BudgetExpired)));
                 }
                 let mut scratch_ages = std::mem::take(&mut self.scratch.ages);
                 let (probe_res, drained_after, probe_ok, probe_pending, hw_fault_after, st_after, partial_after, any_en_after, fb_valid_after, j7_fresh_after, ages_valid_after) = {
@@ -3811,9 +3946,16 @@ impl SupervisorInner {
                         Ok(g) => g,
                         Err(_) => {
                             self.scratch.ages = scratch_ages;
-                            return Err(E::FeedbackUnavailable);
+                            return Err(ClearFaultWithAuthError::Clear(E::FeedbackUnavailable));
                         }
                     };
+                    if let Some(auth) = authority {
+                        if let Err(auth_err) = recheck_clear_fault_authority_readonly(self, auth, now) {
+                            drop(drv);
+                            self.scratch.ages = scratch_ages;
+                            return Err(ClearFaultWithAuthError::Authority(auth_err));
+                        }
+                    }
                     let drv_deadline = drv.clock_now() + deadline.saturating_duration_since(now);
                     drv.set_tx_release_deadline(Some(drv_deadline));
                     let res = drv.probe_tx_ready_budgeted(drv_deadline);
@@ -3863,15 +4005,23 @@ impl SupervisorInner {
                 Err(R::EStopActive) => return Err(apply_estop_refusal(self)),
                 Err(R::HardwareResetRequired) => {
                     // Explicitly modeled exception: every OTHER recorded kind's condition passed,
-                    // so a budgeted motor reset is now permitted. Recheck live J7 freshness and
-                    // pending E-stop under the SAME driver lock guard before sending the reset so
-                    // there is zero check-to-command gap.
+                    // so a budgeted motor reset is now permitted. Recheck live grant, lease,
+                    // operator session (M3), J7 freshness, and pending E-stop under the SAME
+                    // driver lock guard before sending the reset (zero check-to-command gap).
                     let now = now_override.unwrap_or_else(Instant::now);
                     if now >= deadline {
-                        return Err(E::Rejected(R::BudgetExpired));
+                        return Err(ClearFaultWithAuthError::Clear(E::Rejected(R::BudgetExpired)));
                     }
                     let reset_res = {
-                        let mut drv = d.lock().map_err(|_| E::FeedbackUnavailable)?;
+                        let mut drv = d.lock().map_err(|_| ClearFaultWithAuthError::Clear(E::FeedbackUnavailable))?;
+                        if let Some(auth) = authority {
+                            if let Err(auth_err) =
+                                recheck_clear_fault_authority_readonly(self, auth, now)
+                            {
+                                drop(drv);
+                                return Err(ClearFaultWithAuthError::Authority(auth_err));
+                            }
+                        }
                         ctx.j7_feedback_fresh = drv.pos_force_feedback_fresh();
                         ctx.feedback_fresh = ctx.feedback_fresh && drv.is_feedback_valid();
                         ctx.pending_estop = self.estop_request_unapplied();
@@ -3881,7 +4031,7 @@ impl SupervisorInner {
                                 if refusal == R::EStopActive {
                                     return Err(apply_estop_refusal(self));
                                 }
-                                return Err(E::from(refusal));
+                                return Err(ClearFaultWithAuthError::Clear(E::from(refusal)));
                             }
                         }
                         let drv_deadline = drv.clock_now() + deadline.saturating_duration_since(now);
@@ -3900,7 +4050,7 @@ impl SupervisorInner {
                     if post_refusal == R::EStopActive {
                         return Err(apply_estop_refusal(self));
                     }
-                    return Err(E::from(post_refusal));
+                    return Err(ClearFaultWithAuthError::Clear(E::from(post_refusal)));
                 }
                 Err(refusal) => {
                     if matches!(refusal, R::ThermalCooldownNotElapsed { .. })
@@ -3909,7 +4059,7 @@ impl SupervisorInner {
                     {
                         self.thermal_cooldown = next_cd;
                     }
-                    return Err(E::from(refusal));
+                    return Err(ClearFaultWithAuthError::Clear(E::from(refusal)));
                 }
             }
             commit.is_torqued = Some(state == EnableState::Enabled || partial || any_enabled);
@@ -3941,11 +4091,11 @@ impl SupervisorInner {
                 {
                     self.thermal_cooldown = next_cd;
                 }
-                return Err(E::from(refusal));
+                return Err(ClearFaultWithAuthError::Clear(E::from(refusal)));
             }
             commit.thermal_cooldown = Some(next_cd);
         }
-        self.clear_fault_finish_bounded(&ctx, commit, |_| {})
+        self.clear_fault_finish_bounded_with_authority(&ctx, commit, authority, now_override, |_| {})
     }
 
     /// Bounded fault clearing for the RT executor rendered into [`SafetyError`] for direct callers.
