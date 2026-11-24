@@ -1295,6 +1295,8 @@ body.op-locked :is([data-op], [data-op-mark])::after { content: "\00a0🔒"; fon
 .btn.btn-park-off small { font-size: 11px; font-weight: 500; color: var(--sc-color-text-secondary); }
 .btn.btn-park-off.holding { border-color: var(--sc-color-primary); background: var(--sc-status-normal-bg); }
 .btn.btn-park-off[hidden] { display: none; }
+.torque-off-msg { margin-top: 8px; padding: 8px 10px; border-radius: var(--sc-radius-md); font-size: 12px; line-height: 1.45; background: var(--sc-status-danger-bg); color: var(--sc-status-danger-fg); }
+.torque-off-msg[hidden] { display: none; }
 .btn.btn-preempt { width: 100%; justify-content: center; margin-top: 8px; color: var(--sc-status-warning-fg); border-color: #ffd591; background: var(--sc-status-warning-bg); font-weight: 600; }
 .btn.btn-preempt:hover { color: var(--sc-status-warning-fg); border-color: #faad14; }
 .btn-preempt .preempt-lbl { display: flex; flex-direction: column; align-items: flex-start; line-height: 1.2; }
@@ -2093,6 +2095,11 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
         <button class="btn btn-park-off" id="btn-park-off" type="button" hidden>
           <span data-i18n="en.park_off">停靠并卸力</span><small data-i18n="en.park_off.sub">按住 0.6 秒：回到收纳位后关闭力矩</small>
         </button>
+        <!-- while stopped (E-stop / Fault) with torque on: allow torque off only at the rest pose; no override -->
+        <button class="btn btn-park-off" id="btn-torque-off" type="button" hidden>
+          <span data-i18n="en.torque_off">关闭力矩</span><small data-i18n="en.torque_off.sub">仅收纳位可用 · 故障或急停仍保持锁存</small>
+        </button>
+        <div class="torque-off-msg" id="torque-off-msg" role="alert" aria-live="polite" hidden></div>
         <!-- estimated supply load (observation.power): both modes -->
         <div class="pwr" id="pwr" role="meter" aria-valuemin="0" aria-valuemax="120" aria-valuenow="0" data-i18n-aria="pwr.aria" aria-label="电源负载（估算）" hidden>
           <span class="pwr-lbl" data-i18n="pwr.label">电源负载</span>
@@ -2685,6 +2692,10 @@ const I18N = {
     'mit.recovery.done': '已恢复：所有关节力矩已关闭', 'en.on_unconfirmed': '控制已开启 · 未确认',
     'en.sub_reset': '复位后再长按使能', 'en.sub_off': '按住 0.6 秒：停靠并卸力',
     'en.park_off': '停靠并卸力', 'en.park_off.sub': '按住 0.6 秒：回到收纳位后关闭力矩', 'toast.reset_holding': '已复位，电机仍在保持机械臂：长按「使能」恢复控制，或长按「停靠并卸力」',
+    'en.torque_off': '关闭力矩', 'en.torque_off.sub': '仅收纳位可用 · 故障或急停仍保持锁存',
+    'en.torque_off.would_drop': '力矩保持开启：{joint} 当前在 {pos} rad（收纳位 {rest}）；关闭力矩会导致机械臂下坠。请先清除故障并停靠收纳，或切断电源。',
+    'en.torque_off.would_drop_stale': '力矩保持开启：关节反馈缺失或超过 100 ms，无法确认是否处于收纳位；关闭力矩会导致机械臂下坠。请等待新鲜反馈、清除故障并停靠收纳，或切断电源。',
+    'toast.torque_off_stopped': '力矩已关闭；故障或急停仍保持锁存，需另行清除',
     'estop': '急停', 'estop.aria': '紧急停止',
     'stop': '停止', 'stop.sub': '保持位置', 'stop.aria': '停止运动并保持位置',
     'lock.offline': '遥测断开，控制已锁定', 'lock.observer': '当前为观察模式，其他页面可能正在控制', 'lock.observer_who': '观察模式：{who}正在控制机械臂',
@@ -2929,6 +2940,10 @@ const I18N = {
     'mit.recovery.done': 'Recovered: torque is off on every joint', 'en.on_unconfirmed': 'On · unconfirmed',
     'en.sub_reset': 'Then hold to enable', 'en.sub_off': 'Hold 0.6 s: park and turn torque off',
     'en.park_off': 'Park and turn torque off', 'en.park_off.sub': 'Hold 0.6 s: move to the rest pose, then torque off', 'toast.reset_holding': 'Reset done; the motors still hold the arm. Hold Enable to resume, or hold "Park and turn torque off"',
+    'en.torque_off': 'Turn torque off', 'en.torque_off.sub': 'At rest pose only · fault/E-stop latch stays active',
+    'en.torque_off.would_drop': 'Torque stays on: {joint} is at {pos} rad (rest {rest}); the arm would drop. Clear the fault and park, or cut power.',
+    'en.torque_off.would_drop_stale': 'Torque stays on: feedback is missing or older than 100 ms, so the rest pose cannot be verified; the arm would drop. Wait for fresh feedback, clear the fault and park, or cut power.',
+    'toast.torque_off_stopped': 'Torque turned off; fault/E-stop latch remains active until cleared',
     'estop': 'E-Stop', 'estop.aria': 'Emergency stop',
     'stop': 'Stop', 'stop.sub': 'HOLD', 'stop.aria': 'Stop motion and hold position',
     'lock.offline': 'Telemetry lost, controls locked', 'lock.observer': 'Observer mode: another page may be in control', 'lock.observer_who': 'Observer mode: {who} is controlling the arm',
@@ -9416,14 +9431,42 @@ async function controlledUnload() {
   } finally { unloading = false; }
 }
 
+let torqueOffInflight = false;
+function formatTorqueOffWouldDrop(e) {
+  const r = e && e.reply;
+  if (r && r.joint != null && typeof r.position === 'number' && typeof r.rest === 'number') {
+    return t('en.torque_off.would_drop', {
+      joint: r.joint,
+      pos: r.position.toFixed(3),
+      rest: r.rest.toFixed(3),
+    });
+  }
+  return (e && e.message) || t('en.torque_off.would_drop_stale');
+}
+function showTorqueOffInline(msg) {
+  const tom = $('torque-off-msg');
+  if (!tom) return;
+  if (!msg) {
+    if (!tom.hidden) { tom.hidden = true; setText(tom, ''); }
+    return;
+  }
+  setText(tom, msg);
+  tom.hidden = false;
+}
+
 /* Torque off. A 409 ArmNotAtRestingPose means the arm is in the air: don't cut power,
-   stow it first. */
+   stow it first. A 409 TORQUE_OFF_WOULD_DROP while stopped has no override: show inline. */
 async function disableTorque({ fallback = true } = {}) {
   try {
     await api('/api/v1/torque', { enable: false }, { quiet: true });
-    toast(t('toast.parked_off'), 'ok');
+    showTorqueOffInline('');
+    toast(t(isStopped() ? 'toast.torque_off_stopped' : 'toast.parked_off'), 'ok');
     return true;
   } catch (e) {
+    if (e && e.code === 'TORQUE_OFF_WOULD_DROP') {
+      showTorqueOffInline(formatTorqueOffWouldDrop(e));
+      return false;
+    }
     const notAtRest = e.status === 409 && (e.code === 'ARM_NOT_AT_RESTING_POSE' || e.code === 'ArmNotAtRestingPose' || /ArmNotAtRestingPose/i.test(e.message || ''));
     if (notAtRest && fallback) {
       toast(t('toast.in_air'), 'err');
@@ -9492,6 +9535,21 @@ async function disableTorque({ fallback = true } = {}) {
   });
   for (const ev of ['pointerup', 'pointerleave', 'pointercancel']) btn.addEventListener(ev, cancel);
   btn.addEventListener('contextmenu', (e) => e.preventDefault());
+})();
+// Torque off while stopped (E-stop / Fault): enabled at rest pose only; server refuses elsewhere
+// with TORQUE_OFF_WOULD_DROP and there is no override.
+(() => {
+  const btn = $('btn-torque-off');
+  btn.addEventListener('click', () => {
+    if (torqueOffInflight || !isLive() || !isStopped()) return;
+    torqueOffInflight = true;
+    btn.disabled = true;
+    showTorqueOffInline('');
+    disableTorque({ fallback: false }).finally(() => {
+      torqueOffInflight = false;
+      btn.disabled = !isLive() || !isStopped() || !S.obs?.is_torqued || leaseOther() != null;
+    });
+  });
 })();
 
 /* =================================================================
@@ -13785,6 +13843,11 @@ function frame(ts) {
   // After a fault is cleared the motors may still hold the arm (safety Idle, torque on): say so.
   const holdingIdle = live && !stopped && !en && S.state === 'Idle' && torqued;
   $('btn-park-off').hidden = !holdingIdle || leaseOther() != null;
+  const stoppedTorqueOff = live && stopped && torqued && leaseOther() == null;
+  const tob = $('btn-torque-off');
+  tob.hidden = !stoppedTorqueOff;
+  tob.disabled = !stoppedTorqueOff || torqueOffInflight;
+  if (!stopped || !torqued) showTorqueOffInline('');
   const opClear = live && stopped && opLocked() && clearNeedsOperator();
   $('op-inline').hidden = !opClear;
   if (opClear) setText($('op-inline'), t(S.state === 'EStop' ? 'op.inline' : 'op.inline_fault'));
