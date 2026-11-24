@@ -307,6 +307,7 @@ struct CountingBus {
     clock: Option<MockClock>,
     clock_pauses: Arc<AtomicUsize>,
     estop_on_tx: Option<(Arc<std::sync::atomic::AtomicU64>, usize)>,
+    estop_state_on_tx: Option<(Arc<armd::rt_core::urgent::EstopState>, usize)>,
     tx_seen: Arc<AtomicUsize>,
 }
 
@@ -321,6 +322,7 @@ impl CountingBus {
             clock,
             clock_pauses: Arc::new(AtomicUsize::new(0)),
             estop_on_tx: None,
+            estop_state_on_tx: None,
             tx_seen: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -332,6 +334,11 @@ impl CanTransport for CountingBus {
         if let Some((req_count, after)) = &self.estop_on_tx {
             if n >= *after {
                 req_count.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        if let Some((state, after)) = &self.estop_state_on_tx {
+            if n >= *after {
+                state.fetch_add_generation(1, Ordering::SeqCst);
             }
         }
         self.inner.transmit(frame)
@@ -514,6 +521,7 @@ async fn single_bus_writer_no_tokio_entry_and_handoff_gates() {
     let (drv, enforce, threads, tokio_entered, missing_guard, writes, reads) = ThreadAuditDriver::new(7);
     let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
     sup.set_lease_enabled(false).await;
+    sup.register_ws_connection(1).await.unwrap();
 
     enforce.store(true, Ordering::Release);
     let handle = sup
@@ -888,6 +896,7 @@ fn exact_release_order_and_unconditional_checkpoints() {
         pending: None,
     }));
     inner.lease_enabled = false;
+    inner.register_live_connection(1).unwrap();
     inner.tick(0.02);
 
     let (mut engine, broker, mut tw, stop) =
@@ -1025,6 +1034,7 @@ fn exact_release_order_and_unconditional_checkpoints() {
                 pending: None,
             }));
             i.lease_enabled = false;
+            i.register_live_connection(1).unwrap();
             i.tick(0.02);
             i
         },
@@ -1139,6 +1149,7 @@ fn single_budgeted_rx_pass_and_zero_rx_torque_begin_and_unsupported_serial() {
     let mut inner = SupervisorInner::new(ArmConfig { lease_timeout_ms: 600_000, ..ArmConfig::rebot_dm() })
         .with_driver(Box::new(drv));
     inner.lease_enabled = false;
+    inner.register_live_connection(1).unwrap();
     inner.tick(0.02);
 
     // (a) Queue 100 feedback frames -> Step 2 poll caps at 64 frames (`budget_exhausted == true`),
@@ -1351,6 +1362,7 @@ async fn release_clock_tracks_skipped_releases_and_preserves_real_dt_across_wake
     let drv = drv.with_clock(clock.clone());
     let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
     sup.set_lease_enabled(false).await;
+    sup.register_ws_connection(1).await.unwrap();
     let delay = Arc::new(Mutex::new(None));
     let hooks = PersistTestHooks {
         release_delay_once: Some(delay.clone()),
@@ -1634,6 +1646,7 @@ async fn parity_sim_udp_loopback_and_damiao_and_router_allowlist() {
     let drv_exec = SimArmDriver::connect(&sim_exec.addr, 7).unwrap();
     let sup_exec = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_exec)));
     sup_exec.set_lease_enabled(false).await;
+    sup_exec.register_ws_connection(1).await.unwrap();
     let h_sim = sup_exec
         .start_executor(ExecutorConfig::for_tests(Duration::from_millis(10)))
         .await
@@ -1683,6 +1696,7 @@ async fn parity_sim_udp_loopback_and_damiao_and_router_allowlist() {
     let cfg = ArmConfig { lease_timeout_ms: 80, ..ArmConfig::rebot_dm() };
     let sup_dm = Arc::new(ArmSupervisor::new(cfg).with_driver(Box::new(dm)));
     sup_dm.set_lease_enabled(false).await;
+    sup_dm.register_ws_connection(1).await.unwrap();
     let h_dm = sup_dm
         .start_executor(ExecutorConfig::for_tests(Duration::from_millis(10)))
         .await
@@ -1828,6 +1842,8 @@ async fn parity_sim_udp_loopback_and_damiao_and_router_allowlist() {
         .unwrap();
     assert_eq!(estop_resp.status(), StatusCode::OK);
 
+    // PR L2 enables REST `/api/v1/torque` through the executor gate (serving the connection-lease
+    // conflict from `StateHub`), while unmigrated motion routes still return 503 EXECUTOR_ROUTING_PENDING.
     let torque_resp = app
         .clone()
         .oneshot(
@@ -1840,8 +1856,24 @@ async fn parity_sim_udp_loopback_and_damiao_and_router_allowlist() {
         )
         .await
         .unwrap();
-    assert_eq!(torque_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let body = axum::body::to_bytes(torque_resp.into_body(), 4096).await.unwrap();
+    assert_eq!(torque_resp.status(), StatusCode::CONFLICT);
+    let torque_body = axum::body::to_bytes(torque_resp.into_body(), 4096).await.unwrap();
+    assert!(String::from_utf8_lossy(&torque_body).contains("LEASE_REQUIRED"), "{torque_body:?}");
+
+    let jog_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/motion/jog")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"target_positions":[0,0,0,0,0,0,0]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(jog_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(jog_resp.into_body(), 4096).await.unwrap();
     assert!(String::from_utf8_lossy(&body).contains("EXECUTOR_ROUTING_PENDING"), "{body:?}");
 
     // Stage 3 §2 A1: `/api/v1/ws` is allowed through the executor gate (for WS E-stop and
@@ -1916,7 +1948,8 @@ async fn two_phase_persistence_success_and_dir_sync_unconfirmed() {
     assert!(!h.planning_snapshot().unwrap().config_inhibited);
     h.stop_and_join();
 
-    // (b) Dir-sync EIO -> DurableUnconfirmed (warning recorded, live state active, not reconciling).
+    // (b) Dir-sync EIO -> MUST NOT activate: keeps OLD policy active, enters Reconciling
+    //     (motion stays inhibited), fails action with PERSIST_FAILED + durability_warning.
     let dir2 = tempfile::tempdir().unwrap();
     let path2 = dir2.path().join("gripper_calib.json");
     let (sup2, id2) = prepare_zero_check_supervisor(path2.clone()).await;
@@ -1929,11 +1962,17 @@ async fn two_phase_persistence_success_and_dir_sync_unconfirmed() {
         .await
         .unwrap();
     let a2 = wait_action_terminal(&h2, id2).await;
-    assert_eq!(a2.state, "done", "{a2:?}");
+    assert_eq!(a2.state, "failed", "{a2:?}");
+    assert_eq!(a2.code.as_deref(), Some("PERSIST_FAILED"), "{a2:?}");
     assert_eq!(a2.durability_confirmed, Some(false), "{a2:?}");
     assert!(a2.durability_warning.as_deref().unwrap_or("").contains("simulated EIO"), "{a2:?}");
-    assert!(path2.exists());
-    assert!(!h2.planning_snapshot().unwrap().config_inhibited);
+    assert!(path2.exists(), "rename happened before dir-sync failure");
+    assert!(
+        h2.planning_snapshot().unwrap().config_inhibited,
+        "dir-sync failure must enter Reconciling and keep motion inhibited"
+    );
+    let pub2 = sup2.published_config().await.unwrap();
+    assert_eq!(pub2.gripper_calib_offset, None, "old policy must remain active after dir-sync failure");
     h2.stop_and_join();
 }
 
@@ -1967,11 +2006,11 @@ async fn two_phase_persistence_revocation_before_and_after_rename_and_disconnect
     assert!(!h_c.planning_snapshot().unwrap().config_inhibited, "hold must be Cleared, not Reconciling");
     h_c.stop_and_join();
 
-    // (d) Post-rename revocation: barrier after grant before rename -> trigger E-stop -> allow rename ->
-    // disk has file, live policy unchanged, hold enters Reconciling (`config_inhibited == true`).
+    // (d1) Pre-rename revocation (fresh owner VerifyAuthority before rename): barrier after grant
+    // before rename -> trigger E-stop -> allow VerifyAuthority -> file NOT renamed, hold Cleared!
     let dir_d = tempfile::tempdir().unwrap();
     let path_d = dir_d.path().join("gripper_calib.json");
-    let (sup_d, _id_d) = prepare_zero_check_supervisor(path_d.clone()).await;
+    let (sup_d, id_d) = prepare_zero_check_supervisor(path_d.clone()).await;
     let (at_barrier_tx, at_barrier_rx) = mpsc::sync_channel::<()>(1);
     let (go_tx, go_rx) = mpsc::sync_channel::<()>(1);
     let go_rx = Arc::new(Mutex::new(go_rx));
@@ -1990,12 +2029,44 @@ async fn two_phase_persistence_revocation_before_and_after_rename_and_disconnect
     at_barrier_rx.recv_timeout(Duration::from_secs(3)).unwrap();
     sup_d.trigger_e_stop_checked().await.unwrap();
     go_tx.send(()).unwrap();
+    let a_d = wait_action_terminal(&h_d, id_d).await;
+    assert!(matches!(a_d.state.as_str(), "failed" | "cancelled"), "{a_d:?}");
     wait_until_async(Duration::from_secs(2), || {
-        h_d.planning_snapshot().is_ok_and(|s| s.config_inhibited)
+        h_d.planning_snapshot().is_ok_and(|s| !s.config_inhibited)
     })
     .await;
-    assert!(path_d.exists(), "rename happened before post-rename revocation");
+    assert!(!path_d.exists(), "pre-rename VerifyAuthority must abort before rename");
     h_d.stop_and_join();
+
+    // (d2) Post-rename revocation: barrier after rename + dir-sync before activate -> trigger E-stop ->
+    // allow activate -> disk has file, live policy unchanged, hold enters Reconciling.
+    let dir_d2 = tempfile::tempdir().unwrap();
+    let path_d2 = dir_d2.path().join("gripper_calib.json");
+    let (sup_d2, _id_d2) = prepare_zero_check_supervisor(path_d2.clone()).await;
+    let (at_b2_tx, at_b2_rx) = mpsc::sync_channel::<()>(1);
+    let (go2_tx, go2_rx) = mpsc::sync_channel::<()>(1);
+    let go2_rx = Arc::new(Mutex::new(go2_rx));
+    let hooks_d2 = PersistTestHooks {
+        after_rename_before_activate: Some(Arc::new(move || {
+            let _ = at_b2_tx.send(());
+            let _ = go2_rx.lock().unwrap().recv();
+            false
+        })),
+        ..Default::default()
+    };
+    let h_d2 = sup_d2
+        .start_executor_with_hooks(ExecutorConfig::for_tests(Duration::from_millis(5)), hooks_d2)
+        .await
+        .unwrap();
+    at_b2_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    sup_d2.trigger_e_stop_checked().await.unwrap();
+    go2_tx.send(()).unwrap();
+    wait_until_async(Duration::from_secs(2), || {
+        h_d2.planning_snapshot().is_ok_and(|s| s.config_inhibited)
+    })
+    .await;
+    assert!(path_d2.exists(), "rename happened before post-rename revocation");
+    h_d2.stop_and_join();
 
     // (e) Worker disconnect BEFORE rename -> hold enters Reconciling, action fails PERSIST_FAILED.
     let dir_e = tempfile::tempdir().unwrap();
@@ -2195,7 +2266,14 @@ async fn off_thread_reclamation_and_diagnostics_under_paused_dispatcher() {
         let probe = Box::new(DropProbe { dropped_on: dropped_on.clone() });
         handle.probe_owned_payload(probe).expect("probe maintenance op succeeds while dispatcher paused");
         if i % 4 == 0 {
-            handle.set_joint_zero_offsets(vec![0.0; 7]).unwrap().unwrap();
+            let err = handle
+                .set_joint_zero_offsets(vec![0.0; 7])
+                .unwrap()
+                .expect_err("joint zero must be refused on RT executor");
+            assert!(
+                err.contains("EXECUTOR_UNSUPPORTED"),
+                "expected EXECUTOR_UNSUPPORTED refusal, got: {err}"
+            );
         }
     }
     let tids = dropped_on.lock().unwrap().clone();
@@ -2279,6 +2357,7 @@ async fn cli_startup_gate_allows_mock_and_rejects_non_mock_and_invalid_env() {
         .unwrap();
     let obs_url = format!("http://127.0.0.1:{port}/api/v1/observation");
     let torque_url = format!("http://127.0.0.1:{port}/api/v1/torque");
+    let jog_url = format!("http://127.0.0.1:{port}/api/v1/motion/jog");
 
     let ready_deadline = Instant::now() + Duration::from_secs(5);
     let mut ready = false;
@@ -2297,8 +2376,17 @@ async fn cli_startup_gate_allows_mock_and_rejects_non_mock_and_invalid_env() {
     assert!(ready, "armd with ARMD_RT_OWNER=executor did not serve /api/v1/observation");
 
     let torque_resp = client.post(&torque_url).json(&json!({"enable": true})).send().await.unwrap();
-    assert_eq!(torque_resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
-    assert!(torque_resp.text().await.unwrap().contains("EXECUTOR_ROUTING_PENDING"));
+    assert_eq!(torque_resp.status(), reqwest::StatusCode::CONFLICT);
+    assert!(torque_resp.text().await.unwrap().contains("LEASE_REQUIRED"));
+
+    let jog_resp = client
+        .post(&jog_url)
+        .json(&json!({"target_positions": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(jog_resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert!(jog_resp.text().await.unwrap().contains("EXECUTOR_ROUTING_PENDING"));
 
     // Send SIGTERM and verify clean shutdown exit (0).
     // SAFETY: valid PID of child process spawned above.
@@ -2333,6 +2421,7 @@ fn estop_aborts_pending_damiao_enable_without_tx_and_preserves_torque_state() {
     drv_a.check_mapping_ranges();
     let mut inner_a = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_a));
     inner_a.lease_enabled = false;
+    inner_a.register_live_connection(1).unwrap();
     inner_a.rt_executor_owned = true;
     inner_a.tick(0.02);
 
@@ -2388,6 +2477,7 @@ fn estop_aborts_pending_damiao_enable_without_tx_and_preserves_torque_state() {
     drv_b.check_mapping_ranges();
     let mut inner_b = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_b));
     inner_b.lease_enabled = false;
+    inner_b.register_live_connection(1).unwrap();
     inner_b.rt_executor_owned = true;
     inner_b.tick(0.02);
 
@@ -2439,9 +2529,10 @@ fn estop_aborts_pending_damiao_enable_without_tx_and_preserves_torque_state() {
     });
     let mut inner_c2 = SupervisorInner::new(ArmConfig::rebot_dm());
     inner_c2.lease_enabled = false;
+    inner_c2.register_live_connection(1).unwrap();
     inner_c2.rt_executor_owned = true;
     let mut bus_c2 = CountingBus::new(raw_bus_c2.clone(), Some(clock.clone()));
-    bus_c2.estop_on_tx = Some((inner_c2.requested_estop_count.clone(), 3));
+    bus_c2.estop_state_on_tx = Some((inner_c2.estop_state.clone(), 3));
     let mut drv_c2 = DamiaoArmDriver::new(bus_c2.clone(), vec![1, 2, 3, 4, 5, 6, 7])
         .with_joint_limits(dm_limits())
         .unwrap();
@@ -2496,6 +2587,7 @@ fn rt_torque_paths_refuse_blocking_immediate_and_use_budgeted_disable_cleanup() 
 
     let mut inner = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv));
     inner.lease_enabled = false;
+    inner.register_live_connection(1).unwrap();
     inner.rt_executor_owned = true;
     inner.tick(0.02);
 
@@ -2799,9 +2891,10 @@ fn damiao_mid_retry_and_mode_restore_estop_and_legacy_gravity_comp_exit() {
     });
     let mut inner_r = SupervisorInner::new(ArmConfig::rebot_dm());
     inner_r.lease_enabled = false;
+    inner_r.register_live_connection(1).unwrap();
     inner_r.rt_executor_owned = true;
     let mut bus_r = CountingBus::new(raw_bus_r.clone(), Some(clock.clone()));
-    bus_r.estop_on_tx = Some((inner_r.requested_estop_count.clone(), 9)); // 7 initial + 2 retries
+    bus_r.estop_state_on_tx = Some((inner_r.estop_state.clone(), 9)); // 7 initial + 2 retries
     let mut drv_r = DamiaoArmDriver::new(bus_r.clone(), vec![1, 2, 3, 4, 5, 6, 7])
         .with_joint_limits(dm_limits())
         .unwrap();
@@ -3326,6 +3419,7 @@ async fn rt_capability_gates_legacy_slcan_preservation_zero_offset_no_sleep_and_
     drv_wb.check_mapping_ranges();
     let sup_wb = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_wb)));
     sup_wb.set_lease_enabled(false).await;
+    sup_wb.register_ws_connection(1).await.unwrap();
     let h_wb = sup_wb
         .start_executor(ExecutorConfig::for_tests(Duration::from_millis(8)))
         .await
@@ -3349,6 +3443,7 @@ async fn rt_capability_gates_legacy_slcan_preservation_zero_offset_no_sleep_and_
 fn superseded_install_delivers_terminal_and_ack_strictly_after_publish() {
     let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());
     inner.lease_enabled = false;
+    inner.register_live_connection(1).unwrap();
     { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     inner.tick(0.02);
 
@@ -3501,6 +3596,7 @@ async fn zero_alloc_steady_state_wakes_positive_control_commit_shutdown_and_stop
         let drv = SimArmDriver::connect(&sim.addr, 7).unwrap().with_load_only_feedback(load_only);
         let sup_sim = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
         sup_sim.set_lease_enabled(false).await;
+        sup_sim.register_ws_connection(1).await.unwrap();
         let h_sim = sup_sim.start_executor(cfg.clone()).await.unwrap();
         wait_until_async(Duration::from_secs(2), || {
             h_sim.observation().is_ok_and(|o| (o.positions[0] - 0.05).abs() < 1e-3)
@@ -3539,6 +3635,7 @@ async fn zero_alloc_steady_state_wakes_positive_control_commit_shutdown_and_stop
     drv_dm.check_mapping_ranges();
     let sup_dm = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_dm)));
     sup_dm.set_lease_enabled(false).await;
+    sup_dm.register_ws_connection(1).await.unwrap();
     let h_dm = sup_dm.start_executor(cfg.clone()).await.unwrap();
     let req_dm_on = submit_broker_transition(&h_dm, 1, TransitionOp::TorqueOn);
     assert_eq!(wait_broker_terminal(&h_dm, req_dm_on, Duration::from_secs(2)), Outcome::Completed);
@@ -3559,6 +3656,7 @@ async fn zero_alloc_steady_state_wakes_positive_control_commit_shutdown_and_stop
     let (drv_w, ..) = ThreadAuditDriver::new(7);
     let sup_w = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_w)));
     sup_w.set_lease_enabled(false).await;
+    sup_w.register_ws_connection(1).await.unwrap();
     let inject_flag = Arc::new(AtomicBool::new(false));
     let hooks_w = PersistTestHooks {
         inject_wake_alloc_once: Some(inject_flag.clone()),

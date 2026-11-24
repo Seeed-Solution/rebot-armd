@@ -138,71 +138,39 @@ impl SupervisorInner {
     /// - Checks every arm joint (`config.arm_joints()`, excluding the gripper) against
     ///   `config.resting_positions()` within `config.rest_pose_tolerance_rad` (default 0.05 rad).
     /// - Zero heap allocations.
-    pub fn may_disable_torque_while_stopped(&self) -> Result<(), StoppedTorqueOffRefusal> {
-        if self.driver.is_some() && self.config.resting_pose.is_none() {
+    ///
+    /// Rest-pose gate check against an already-locked hardware driver so callers holding the
+    /// driver mutex (e.g. `mit_expiry_recovery_for_epoch`) can verify Rule A′ with zero
+    /// check-to-command gap and zero lock re-entry.
+    pub(crate) fn check_stopped_torque_off_with_driver(
+        config: &crate::model::ArmConfig,
+        drv: &dyn crate::driver::ArmDriver,
+    ) -> Result<(), StoppedTorqueOffRefusal> {
+        if config.resting_pose.is_none() {
             return Err(StoppedTorqueOffRefusal::NoRestingPoseConfigured);
         }
-
-        let tol = self.config.rest_pose_tolerance_rad;
+        let tol = config.rest_pose_tolerance_rad;
         if !tol.is_finite() || tol <= 0.0 {
             return Err(StoppedTorqueOffRefusal::StaleOrMissingFeedback);
         }
-
-        let rest = self.config.resting_positions();
-        let arm_joints = self.config.arm_joints();
+        let rest = config.resting_positions();
+        let arm_joints = config.arm_joints();
         let mut arm_positions = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
         if arm_joints.is_empty()
             || arm_joints.len() > arm_positions.len()
-            || rest.len() < self.config.dof
+            || rest.len() < config.dof
         {
             return Err(StoppedTorqueOffRefusal::StaleOrMissingFeedback);
         }
-
-        // Hardware (`Some(d)`): freshness and numeric validity are judged strictly on J1..J6
-        // via `fresh_joint_positions_into`; any missing timestamp (`None`) or invalid arm-joint
-        // sample means "not at rest", while gripper freshness/validity and whole-arm
-        // `feedback_numeric_valid` are ignored.
-        // Driverless mock (`None`): keeps working for tests without hardware timestamps
-        // (`last_can_feedback_instant.is_none()` allowed), judging position finiteness on J1..J6.
-        let (positions_fresh, rest_gate_status) = match self.driver.as_ref() {
-            Some(d) => match d.lock() {
-                Ok(drv) => {
-                    let fresh = drv.fresh_joint_positions_into(
-                        &arm_joints,
-                        STOPPED_TORQUE_OFF_FEEDBACK_MAX_AGE,
-                        &mut arm_positions[..arm_joints.len()],
-                    );
-                    let status = drv.rest_pose_gate_status();
-                    (fresh, status)
-                }
-                Err(_) => (false, crate::driver::RestPoseGateStatus::RefusedNonRest),
-            },
-            None => {
-                if !self.feedback_numeric_valid
-                    || self.measured_positions.len() < self.config.dof
-                    || !self
-                        .last_can_feedback_instant
-                        .is_none_or(|t| t.elapsed() <= STOPPED_TORQUE_OFF_FEEDBACK_MAX_AGE)
-                {
-                    (false, crate::driver::RestPoseGateStatus::RefusedNonRest)
-                } else {
-                    let mut ok = true;
-                    for (slot, &i) in arm_positions[..arm_joints.len()].iter_mut().zip(arm_joints.iter()) {
-                        let p = self.measured_positions[i];
-                        if !p.is_finite() {
-                            ok = false;
-                            break;
-                        }
-                        *slot = p;
-                    }
-                    (ok, crate::driver::RestPoseGateStatus::Confirmed)
-                }
-            }
-        };
-        if !positions_fresh {
+        let fresh = drv.fresh_joint_positions_into(
+            &arm_joints,
+            STOPPED_TORQUE_OFF_FEEDBACK_MAX_AGE,
+            &mut arm_positions[..arm_joints.len()],
+        );
+        let status = drv.rest_pose_gate_status();
+        if !fresh {
             return Err(StoppedTorqueOffRefusal::StaleOrMissingFeedback);
         }
-
         for (&i, &pos) in arm_joints.iter().zip(arm_positions[..arm_joints.len()].iter()) {
             let rest_pos = rest[i];
             if !pos.is_finite() || !rest_pos.is_finite() {
@@ -217,8 +185,53 @@ impl SupervisorInner {
                 });
             }
         }
-        if rest_gate_status != crate::driver::RestPoseGateStatus::Confirmed {
+        if status != crate::driver::RestPoseGateStatus::Confirmed {
             return Err(StoppedTorqueOffRefusal::StaleOrMissingFeedback);
+        }
+        Ok(())
+    }
+
+    pub fn may_disable_torque_while_stopped(&self) -> Result<(), StoppedTorqueOffRefusal> {
+        if let Some(d) = self.driver.as_ref() {
+            return match d.lock() {
+                Ok(drv) => Self::check_stopped_torque_off_with_driver(&self.config, drv.as_ref()),
+                Err(_) => Err(StoppedTorqueOffRefusal::StaleOrMissingFeedback),
+            };
+        }
+        let tol = self.config.rest_pose_tolerance_rad;
+        if !tol.is_finite() || tol <= 0.0 {
+            return Err(StoppedTorqueOffRefusal::StaleOrMissingFeedback);
+        }
+        let rest = self.config.resting_positions();
+        let arm_joints = self.config.arm_joints();
+        if arm_joints.is_empty()
+            || arm_joints.len() > crate::rt_core::mailbox::MAX_DOF
+            || rest.len() < self.config.dof
+        {
+            return Err(StoppedTorqueOffRefusal::StaleOrMissingFeedback);
+        }
+        if !self.feedback_numeric_valid
+            || self.measured_positions.len() < self.config.dof
+            || !self
+                .last_can_feedback_instant
+                .is_none_or(|t| t.elapsed() <= STOPPED_TORQUE_OFF_FEEDBACK_MAX_AGE)
+        {
+            return Err(StoppedTorqueOffRefusal::StaleOrMissingFeedback);
+        }
+        for &i in arm_joints.iter() {
+            let pos = self.measured_positions[i];
+            let rest_pos = rest[i];
+            if !pos.is_finite() || !rest_pos.is_finite() {
+                return Err(StoppedTorqueOffRefusal::StaleOrMissingFeedback);
+            }
+            if (pos - rest_pos).abs() > tol {
+                return Err(StoppedTorqueOffRefusal::JointOutsideRest {
+                    joint_index: i,
+                    position: pos,
+                    rest: rest_pos,
+                    tolerance: tol,
+                });
+            }
         }
         Ok(())
     }

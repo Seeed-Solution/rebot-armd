@@ -50,9 +50,9 @@ pub struct FaultDescription {
 pub fn fault_recovery(code: FaultCode) -> &'static [&'static str] {
     use FaultCode::*;
     match code {
-        Estop | WatchdogTimeout | ControlDeadline | JointLimit | EnableFailed | ServoNoBrake
-        | HandoverUnsettled | GravityCompFailed => &["clear_fault", "torque_on"],
-        BusLoss | InvalidTelemetry | DriverWriteFailed | CanTxStalled => &["restore_bus", "clear_fault", "torque_on"],
+        Estop | WatchdogTimeout | ControlDeadline | JointLimit | EnableFailed | ServoNoBrake | HandoverUnsettled
+        | GravityCompFailed => &["clear_fault", "torque_on"],
+        BusLoss | InvalidTelemetry | DriverWriteFailed | CanTxStalled | J7FeedbackStale => &["restore_bus", "clear_fault", "torque_on"],
         ThermalTrip => &["wait_cooldown", "clear_fault", "torque_on"],
         FollowingError | Collision => &["remove_obstruction", "clear_fault", "torque_on"],
         HardwareFault => &["clear_fault", "clear_fault_again", "torque_on"],
@@ -81,12 +81,18 @@ impl SupervisorInner {
 
     /// Body of `GET /api/v1/safety/describe`.
     pub fn safety_describe(&self) -> Value {
-        let c = &self.config;
-        let capabilities = self.schema().capabilities;
-        let recovery = fault_recovery;
-        let temperature_feedback = self.driver.as_ref()
-            .is_none_or(|d| d.lock().is_ok_and(|drv| drv.capabilities().temperature_feedback));
-        let watchdog_effect = self.watchdog_effect();
+        build_safety_describe(&crate::rt_core::requests::config::PublishedConfig::from_inner(self))
+    }
+}
+
+/// Single-authority builder for `GET /api/v1/safety/describe` from published configuration
+/// state (never touches `SupervisorLock` or driver mutexes in `OWNER_EXECUTOR`).
+pub fn build_safety_describe(pub_cfg: &crate::rt_core::requests::config::PublishedConfig) -> Value {
+    let c = &pub_cfg.config;
+    let capabilities = pub_cfg.capabilities();
+    let recovery = fault_recovery;
+    let temperature_feedback = pub_cfg.driver_temperature_feedback;
+    let watchdog_effect = pub_cfg.watchdog_effect();
 
         let mut stops = vec![
             json!({
@@ -198,15 +204,15 @@ impl SupervisorInner {
         }
 
         if capabilities.collision_guard {
-            let p = self.collision_policy();
+            let p = pub_cfg.collision_policy();
             stops.push(json!({
                 "id": "collision_protective_stop",
                 "trigger": "residual torque above threshold_nm for persist_ticks consecutive ticks on any of J1..J6",
-                "enabled": self.collision.enabled,
-                "sensitivity": self.collision.sensitivity,
-                "source": if self.collision.runtime { "runtime" } else { "profile" },
+                "enabled": pub_cfg.collision_enabled,
+                "sensitivity": pub_cfg.collision_sensitivity,
+                "source": if pub_cfg.collision_runtime { "runtime" } else { "profile" },
                 "calibrated": false,
-                "thresholds_nm": self.collision_thresholds(),
+                "thresholds_nm": pub_cfg.collision_thresholds(),
                 "persist_ticks": p.persist_ticks,
                 "lease_required": false,
                 "effect": "cancel_motion_hold_torque_on",
@@ -230,7 +236,7 @@ impl SupervisorInner {
                     "trigger": "|measured torque| at or above ratio x the joint's TMAX for persist_ms on a watched joint (J1..J6, gripper excluded), torqued in position control",
                     "ratio": p.ratio,
                     "persist_ms": p.persist_ms,
-                    "thresholds_nm": self.torque_guard_thresholds(),
+                    "thresholds_nm": pub_cfg.torque_guard_thresholds,
                     "not_watched": ["gravity_comp", "unload_settle", "gripper"],
                     "lease_required": false,
                     "effect": "cancel_motion_hold_torque_on",
@@ -280,7 +286,7 @@ impl SupervisorInner {
         let cap = c.speed_cap;
         let kinematics_configured = c.kinematics.is_some();
         let workspace_configured = c.workspace.is_some();
-        let workspace_policy = self.workspace_policy();
+        let workspace_policy = pub_cfg.workspace_policy();
         let workspace_active = workspace_policy.is_some();
         let geometry_coverage = match workspace_policy {
             Some((ws, _)) if !ws.link_capsules.is_empty() => "end_and_links",
@@ -295,9 +301,9 @@ impl SupervisorInner {
             json!({
                 // the effective floor: max(profile floor, valid calibrated table height - 3 mm)
                 "floor_z_m": ws.floor_z_m,
-                "profile_floor_z_m": self.profile_floor_z_m,
+                "profile_floor_z_m": pub_cfg.profile_floor_z_m,
                 "effective_floor_z_m": ws.floor_z_m,
-                "floor_source": self.floor_source,
+                "floor_source": pub_cfg.floor_source,
                 "floor_rule": "effective floor = max(profile floor_z_m, table_z_m - 0.003) while a camera calibration is in effect and not stale; with table_z_source hover only while its acceptance is valid",
                 "box_min_m": ws.box_min_m,
                 "box_max_m": ws.box_max_m,
@@ -305,7 +311,7 @@ impl SupervisorInner {
                 "check_points_end_m": ws.check_points_end_m,
                 "kinematics_configured": kinematics_configured,
                 // the geometry checks run on the live arm model (kinematic correction included)
-                "kinematics_corrected": self.config.arm_model.correction().is_some(),
+                "kinematics_corrected": c.arm_model.correction().is_some(),
                 "workspace_configured": workspace_configured,
                 "geometry_coverage": geometry_coverage,
                 "camera_mount_covered": cam.offset_m.is_some(),
@@ -314,7 +320,7 @@ impl SupervisorInner {
                 "self_collision_min_clearance_m": ws.self_collision_min_clearance_m,
             })
         });
-        let keepout = self.keepout_state();
+        let keepout = pub_cfg.keepout_state();
         let hw = c.hardware.clone().unwrap_or_default();
         let notes = hw.notes.clone().unwrap_or_else(|| {
             let mut n = Vec::new();
@@ -324,9 +330,8 @@ impl SupervisorInner {
             n
         });
         // gripper motor current cap: what the driver applies, else what the profile configures
-        let driver_cap = self.driver.as_ref().and_then(|d| d.lock().ok().and_then(|drv| drv.motor_current_cap()));
-        let gripper_current_cap = match (driver_cap, &c.damiao_gripper) {
-            (Some(cap), _) => serde_json::to_value(cap).unwrap_or(Value::Null),
+        let gripper_current_cap = match (&pub_cfg.driver_motor_current_cap, &c.damiao_gripper) {
+            (Some(cap), _) => cap.clone(),
             (None, Some(g)) => json!({
                 "joint": c.gripper_index(),
                 "mode": g.mode,
@@ -344,7 +349,7 @@ impl SupervisorInner {
         let hardware = json!({
             "physical_estop": hw.physical_estop,
             "torque_off_on_fault": false,
-            "operator_auth_enforced": self.operator_auth_enforced,
+            "operator_auth_enforced": pub_cfg.operator_auth_enforced,
             "gripper_current_cap": gripper_current_cap,
             "notes": notes,
         });
@@ -352,7 +357,7 @@ impl SupervisorInner {
         let measure_multiview = json!({
                     "available": capabilities.measure_multiview,
                     "lease_required": true,
-                    "operator_required": self.operator_auth_enforced,
+                    "operator_required": pub_cfg.operator_auth_enforced,
                     "speed_scale": crate::measure_multiview::SPEED_SCALE,
                     "baseline_m": crate::measure_multiview::BASELINE_M,
                     "views": [crate::measure_multiview::MIN_VIEWS, crate::measure_multiview::MAX_VIEWS],
@@ -373,12 +378,12 @@ impl SupervisorInner {
                     "return_to_start": "default true: joint-space move back to the start joints after the captures or a measurement failure; not after a stop, fault, collision, torque limit or lease loss",
                     "return_after": crate::measure_multiview::RETURN_AFTER,
                 });
-        let active_tool = self.schema().active_tool;
+        let active_tool = &c.active_tool;
         json!({
             "describe_version": DESCRIBE_VERSION,
             "device": {
                 "armd_version": env!("CARGO_PKG_VERSION"),
-                "follower": self.follower,
+                "follower": pub_cfg.follower,
                 "profile_version": c.profile_version,
                 "dof": c.dof,
                 "joint_names": c.joint_names,
@@ -425,7 +430,7 @@ impl SupervisorInner {
                     // closing speed of grasp / place / sequence closes and calibration strokes
                     // (min of gripper_policy.close_speed_rad_s, joint max_velocity, and
                     // damiao_gripper.close_speed_rad_s when pos_force, wire-quantized in pos_force)
-                    "close_speed_rad_s": self.effective_planned_close_speed(),
+                    "close_speed_rad_s": pub_cfg.effective_planned_close_speed,
                     // grasp contact relative to the learned free-motion torque (crate::gripper_baseline)
                     "contact_baseline": {
                         "rule": "shared net-progress contact detector (actions, macros, streams; no instantaneous-velocity shortcut): once closing net progress stops over the window (<= 0.50 s, 0.002 rad watermark), contact triggers at baseline + max(margin_floor_nm, margin_spreads x spread) when calibrated or contact_torque_nm when uncalibrated for 2 ticks; while moving, contact requires |torque| >= max(threshold, contact_torque_nm, 0.82 N·m, 0.9 x ceiling_estimate) for 3 ticks; lag contact requires following error >= 0.30 rad with no net progress; the torque cap does not depend on it",
@@ -452,5 +457,4 @@ impl SupervisorInner {
             "hardware": hardware,
             "not_a_safety_function": true,
         })
-    }
 }

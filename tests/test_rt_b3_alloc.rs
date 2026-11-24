@@ -810,6 +810,7 @@ fn every_fault_kind_latches_with_zero_alloc_while_pool_is_exhausted() {
     let res_bus = sm.try_trigger_fault_coded(FaultCode::BusLoss, FaultReason::BusLoss);
     let res_wd = sm.try_trigger_fault_coded(FaultCode::WatchdogTimeout, FaultReason::WatchdogTimeout);
     let res_tx = sm.try_trigger_fault_coded(FaultCode::CanTxStalled, FaultReason::CanTxStalled);
+    let res_j7 = sm.try_trigger_fault_coded(FaultCode::J7FeedbackStale, FaultReason::J7FeedbackStale);
     let res_other = sm.try_trigger_fault_coded(FaultCode::HardwareFault, other);
     sm.latch(
         FaultKind::CollisionLatched,
@@ -819,7 +820,7 @@ fn every_fault_kind_latches_with_zero_alloc_while_pool_is_exhausted() {
     let rest_allocs = alloc::take();
     assert_eq!(rest_allocs.calls, 0, "latching all fault kinds with empty pool must do 0 heap ops: {rest_allocs:?}");
 
-    assert!(res_bus.is_ok() && res_wd.is_ok() && res_tx.is_ok(), "cached BusLoss/WatchdogTimeout/CanTxStalled arcs do not need pool slots");
+    assert!(res_bus.is_ok() && res_wd.is_ok() && res_tx.is_ok() && res_j7.is_ok(), "cached BusLoss/WatchdogTimeout/CanTxStalled/J7FeedbackStale arcs do not need pool slots");
     let (_, ret_jl) = res_jl.unwrap_err();
     let (_, ret_th) = res_th.unwrap_err();
     let (_, ret_other) = res_other.unwrap_err();
@@ -830,6 +831,31 @@ fn every_fault_kind_latches_with_zero_alloc_while_pool_is_exhausted() {
     }
     assert_eq!(sm.fault_code(), Some(FaultCode::ThermalTrip), "most severe recorded kind must win reported code");
     assert!(!sm.recoverable());
+
+    // 2b. J7_FEEDBACK_STALE (cached arc) followed by ThermalTrip with exhausted pools matches
+    //     the baseline pool-exhaustion contract (`test_rt_b3_alloc.rs:680`): 0 heap ops, existing
+    //     stopped Arc preserved without allocation, BOTH kinds recorded, `fault_code()` and
+    //     `fault()` report `ThermalTrip`, and `recoverable()` becomes `false`.
+    let mut sm_j7 = SafetyManager::new();
+    sm_j7.set_off_thread_reclaim(true);
+    let held_j7 = sm_j7.drain_fault_arc_pool_for_test();
+    let _ = alloc::take();
+    sm_j7.latch(FaultKind::J7FeedbackStale, FaultDetail::J7FeedbackStale(None));
+    assert_eq!(*sm_j7.state(), SafetyState::Fault(FaultReason::J7FeedbackStale));
+    sm_j7.latch(
+        FaultKind::ThermalTrip,
+        FaultDetail::ThermalTrip { joint_idx: 0, temperature: 91.0, limit: 75.0 },
+    );
+    let j7_upgrade_allocs = alloc::take();
+    assert_eq!(j7_upgrade_allocs.calls, 0, "J7 -> ThermalTrip with empty pool must do 0 heap ops");
+    assert_eq!(*sm_j7.state(), SafetyState::Fault(FaultReason::J7FeedbackStale));
+    assert!(sm_j7.has_latched_fault_kind(FaultKind::J7FeedbackStale));
+    assert!(sm_j7.has_latched_fault_kind(FaultKind::ThermalTrip));
+    assert_eq!(sm_j7.fault_code(), Some(FaultCode::ThermalTrip));
+    assert_eq!(sm_j7.fault().unwrap().code, FaultCode::ThermalTrip);
+    assert!(!sm_j7.recoverable());
+    assert!(!sm_j7.fault().unwrap().recoverable);
+    drop(held_j7);
 
     // 3. Lazy fault when pool is empty skips closure (0 alloc) and records kind with "detail unavailable".
     let mut sm_lazy = SafetyManager::new();
@@ -1318,6 +1344,14 @@ fn clear_check_table_over_every_fault_kind_and_unknown_bit_fail_closed() {
             FaultDetail::Estop,
             ClearContext { feedback_fresh: false, ..driver_met },
             ClearRefusal::FreshFeedbackRequired,
+            driver_met,
+        ),
+        // J7FeedbackStale: requires provably fresh J7 pos-force feedback (<= 100 ms)
+        (
+            FaultKind::J7FeedbackStale,
+            FaultDetail::J7FeedbackStale(None),
+            ClearContext { j7_feedback_fresh: false, ..driver_met },
+            ClearRefusal::J7FeedbackStale,
             driver_met,
         ),
         // Other: keeps existing rule (active hardware error)
@@ -1932,6 +1966,9 @@ async fn watchdog_latch_and_executor_clear_retry_zero_alloc_on_tagged_live_relea
             out.clear(); for _ in 0..self.dof { out.push(Some(Duration::ZERO)); }
         }
         fn feedback_all_within(&self, dof: usize, _: Duration) -> bool { self.dof == dof }
+        fn feedback_joints_within(&self, joints: &[usize], _: Duration) -> bool {
+            joints.iter().all(|&j| j < self.dof)
+        }
         fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) {
             out.clear(); for _ in 0..self.dof { out.push(Some(0)); }
         }
@@ -2599,6 +2636,127 @@ fn mit_expiry_recovery_final_check_uses_post_recovery_feedback() {
         assert!(inner.safety.state().is_stopped(), "fault must stay latched after out-of-limit post-recovery feedback");
         assert!(inner.safety.has_latched_fault_kind(FaultKind::JointLimit));
     }
+
+    // (c) R2 Blocker 3: MIT expiry recovery with `J7FeedbackStale` recorded: if J7 goes stale
+    //     during `mit_expiry_recover()`, final `clear_with_check` MUST refuse with J7FeedbackStale
+    //     WITHOUT committing sampled post-recovery feedback positions or thermal cooldown!
+    {
+        let clock = MockClock::new();
+        let limits = dm_limits();
+        let bus = FakeBus::with_clock(&limits, clock.clone());
+        bus.with(|s| {
+            s.motors[3].set_reg_u32(damiao::RID_TIMEOUT, 2000);
+            s.motors[6].set_reg_u32(damiao::RID_CTRL_MODE, damiao::CTRL_MODE_POS_FORCE);
+            s.immediate_replies = true;
+            s.push_all_feedback();
+        });
+        let mut jt = JointTrackingConfig::rebot_dm();
+        jt.enabled = true;
+        for j in &mut jt.joints { j.strategy = TrackingStrategy::Position; }
+        let j4 = &mut jt.joints[3];
+        j4.strategy = TrackingStrategy::Mit;
+        j4.kp = 10.0;
+        j4.kd = 0.3;
+        j4.hold_kp = Some(12.0);
+        j4.hold_kd = Some(0.4);
+        j4.effort_limit_nm = 3.0;
+        j4.gravity_scale = 1.0;
+        let mut cfg = ArmConfig {
+            lease_timeout_ms: 600_000,
+            workspace: None,
+            joint_tracking: Some(jt),
+            max_temperature: 75.0,
+            ..ArmConfig::rebot_dm()
+        };
+        cfg.max_temperature = 75.0;
+        let grip = armd::driver::gripper_drive_from_profile(&cfg).expect("pos-force drive");
+        let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits.clone())
+            .unwrap()
+            .with_gripper_drive(grip)
+            .unwrap();
+        drv.read_joint_states().unwrap();
+        drv.read_joint_states().unwrap();
+        drv.check_mapping_ranges();
+        let mut inner = SupervisorInner::new(cfg.clone()).with_driver(Box::new(drv));
+        let l4 = limits[3];
+        let rec = MitQualificationFile {
+            version: mit::QUALIFICATION_VERSION,
+            joints: vec![MitJointQualification {
+                profile_id: "rebot_b601dm".into(),
+                joint: 4,
+                joint_name: ArmConfig::rebot_dm().joint_names[3].clone(),
+                zero_fingerprint: mit::zero_fingerprint(0.0),
+                motor_id: 4,
+                reply_id: 0x14,
+                esc_id: 4,
+                mst_id: 0x14,
+                sw_ver: mit_support::SW_VER,
+                pmax: l4.p_max,
+                vmax: l4.v_max,
+                tmax: l4.t_max,
+                timeout_raw: 2000,
+                timeout_unit_us: damiao::TIMEOUT_UNIT_US_DOCUMENTED,
+                timeout_unit_verified: true,
+                tested_response: "disabled".into(),
+                measured_expiry_ms: 101.0,
+                worst_latency_ms: 8.0,
+                load_envelope: "unloaded, supported".into(),
+                max_kp: 15.0,
+                max_kd: 0.5,
+                effort_ceiling_nm: 4.0,
+                date: "2026-11-22T00:00:00Z".into(),
+                trace_id: "r2-blocker3-test".into(),
+            }],
+            invalidated: None,
+        };
+        inner.set_calibration(Some(armd::calibration::CalibrationFile {
+            mit_qualification: serde_json::to_value(&rec).ok(),
+            ..Default::default()
+        }));
+        inner.lease_enabled = false;
+        {
+            let stamp = inner.current_admission_stamp();
+            let adm = inner.check_admission(stamp).unwrap();
+            armd::SupervisorInner::enable_torque(adm).unwrap();
+        }
+        for _ in 0..3 { inner.tick(DT); }
+        assert!(inner.mit_active());
+        bus.with(|s| s.fail_tx_after = Some(3));
+        inner.tick(DT);
+        assert_eq!(inner.mit.owner, mit::MitOwner::Lost);
+        bus.with(|s| s.fail_tx_after = None);
+        for _ in 0..8 {
+            clock.advance(Duration::from_millis(50));
+            inner.tick(DT);
+        }
+        assert!(bus.with(|s| s.motors[3].state_override == Some(0xD) && !s.motors[3].enabled));
+        inner.safety.latch(FaultKind::J7FeedbackStale, FaultDetail::J7FeedbackStale(None));
+
+        // During `mit_expiry_recover()`, move motor 0 to a distinct position AND mute J7 after
+        // advancing > 100 ms so post-recovery J7 freshness fails! Keep motor 0 at rest before
+        // `clear_fault_confirmed(true)` so R10's Rule A′ rest-pose gate passes and exercises
+        // the post-recovery stale-J7 check.
+        let prev_measured_j0 = inner.measured_positions[0];
+        let clock_cb = clock.clone();
+        bus.with(|s| {
+            s.on_disable_state = Some(Arc::new(move |st| {
+                st.motors[0].q = prev_measured_j0 + 0.35;
+                st.motors[6].mute_feedback = true;
+                clock_cb.advance(Duration::from_millis(120));
+            }));
+        });
+        let err = inner.clear_fault_confirmed(true).unwrap_err();
+        assert!(
+            err.to_string().contains("J7") || err.to_string().contains("feedback"),
+            "post-recovery stale J7 must refuse MIT recovery clear: {err}"
+        );
+        assert!(inner.safety.state().is_stopped(), "fault must remain latched");
+        assert_eq!(
+            inner.measured_positions[0], prev_measured_j0,
+            "refused MIT recovery clear must NOT commit sampled feedback positions"
+        );
+    }
 }
 
 #[test]
@@ -2801,6 +2959,9 @@ fn step5_write_output_error_is_bounded_zero_alloc_on_normal_and_estop_hold() {
             for _ in 0..self.dof { out.push(Some(Duration::ZERO)); }
         }
         fn feedback_all_within(&self, dof: usize, _: Duration) -> bool { self.dof == dof }
+        fn feedback_joints_within(&self, joints: &[usize], _: Duration) -> bool {
+            joints.iter().all(|&j| j < self.dof)
+        }
         fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) {
             out.clear();
             for _ in 0..self.dof { out.push(Some(0)); }
@@ -3645,6 +3806,9 @@ async fn collision_escalation_and_gravity_comp_output_zero_alloc_on_control_path
             for _ in 0..self.dof { out.push(Some(Duration::ZERO)); }
         }
         fn feedback_all_within(&self, dof: usize, _: Duration) -> bool { self.dof == dof }
+        fn feedback_joints_within(&self, joints: &[usize], _: Duration) -> bool {
+            joints.iter().all(|&j| j < self.dof)
+        }
         fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) {
             out.clear();
             for _ in 0..self.dof { out.push(Some(0)); }

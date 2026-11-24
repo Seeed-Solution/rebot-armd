@@ -532,7 +532,7 @@ pub struct ControlThreadSched {
     pub priority: i32,
     /// Whether the SCHED_FIFO request succeeded.
     pub realtime: bool,
-    /// Priority asked for (`ARMD_RT_PRIORITY`, default 45; `crate::rt_core::sched`).
+    /// Priority asked for (`ARMD_RT_PRIORITY`, default 79; `crate::rt_core::sched`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested_priority: Option<i32>,
     /// CPU the executor is pinned to (`ARMD_RT_CPU`).
@@ -1587,6 +1587,11 @@ impl TickWindow {
     fn col(&self, f: impl Fn(&TickSample) -> u32) -> Percentiles {
         let mut v: Vec<u32> = self.rows.iter().map(f).collect();
         percentiles(&mut v)
+    }
+
+    /// Thread-CPU-time percentiles of lock-held tick execution (`CLOCK_THREAD_CPUTIME_ID` on Linux).
+    pub fn lock_cpu_us(&self) -> Percentiles {
+        self.col(|r| r.usage.lock_cpu_us)
     }
 
     fn sum(&self, f: impl Fn(&TickSample) -> u32) -> u64 {

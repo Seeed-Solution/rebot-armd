@@ -734,6 +734,29 @@ impl GripperPolicy {
     /// `close_speed_rad_s` or [`DEFAULT_CLOSE_SPEED_RAD_S`] (rad/s).
     pub fn close_speed(&self) -> f64 { f64::from(self.close_speed_rad_s.unwrap_or(DEFAULT_CLOSE_SPEED_RAD_S)) }
 
+    /// Zero-allocation copy of all scalar policy fields with `jaw_opening: None`
+    /// (used on the RT thread when constructing [`crate::motion::GripperMotion`], which never
+    /// reads `jaw_opening`).
+    pub fn clone_without_jaw_opening(&self) -> Self {
+        Self {
+            closed_rad: self.closed_rad,
+            open_rad: self.open_rad,
+            holding_gap_rad: self.holding_gap_rad,
+            holding_torque_nm: self.holding_torque_nm,
+            squeeze_rad: self.squeeze_rad,
+            settle_ms: self.settle_ms,
+            jaw_opening: None,
+            zero_check_supported: self.zero_check_supported,
+            holding_mode: self.holding_mode,
+            holding_load_fraction: self.holding_load_fraction,
+            max_close_torque_nm: self.max_close_torque_nm,
+            contact_torque_nm: self.contact_torque_nm,
+            max_lead_rad: self.max_lead_rad,
+            stream_contact_speed_rad_s: self.stream_contact_speed_rad_s,
+            close_speed_rad_s: self.close_speed_rad_s,
+        }
+    }
+
     /// Thresholds from the MIT-mode project; holding torque and squeeze need verification in POS_VEL.
     /// holding_torque_nm 0.0667 is the former 0.12 read with TMAX 18, converted to the
     /// J7 motor's real TMAX 10 (0.12 × 10 / 18).
@@ -1224,9 +1247,21 @@ pub struct DamiaoGripperDrive {
     /// own torque feedback only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub torque_reference: Option<String>,
+    /// Maximum time (ms) J7 position-force feedback may remain stale (> 100 ms) before latching
+    /// recoverable `J7_FEEDBACK_STALE` (default 250 ms; allowed range 200..=450 ms, i.e.
+    /// >= 2 x 100 ms freshness bound and strictly < 500 ms `BUS_LOSS_TIMEOUT`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feedback_stale_fault_ms: Option<u64>,
 }
 
 impl DamiaoGripperDrive {
+    /// Default bounded staleness limit before latching recoverable `J7_FEEDBACK_STALE` (ms).
+    pub const DEFAULT_FEEDBACK_STALE_FAULT_MS: u64 = 250;
+    /// Minimum configurable staleness fault limit (2 x 100 ms `POS_FORCE_FEEDBACK_MAX_AGE`).
+    pub const MIN_FEEDBACK_STALE_FAULT_MS: u64 = 200;
+    /// Maximum configurable staleness fault limit (strictly below 500 ms `BUS_LOSS_TIMEOUT`).
+    pub const MAX_FEEDBACK_STALE_FAULT_MS: u64 = 450;
+
     /// Feedback-equivalent torque ratio (N·m per raw current unit) measured from office B601-DM J7
     /// stall plateaus on 2026-11-23 (raw 220 -> 0.42 N·m, raw 300 -> 0.55–0.57 N·m).
     pub const FEEDBACK_EQUIVALENT_NM_PER_RAW: f32 = 0.0019;
@@ -1238,7 +1273,13 @@ impl DamiaoGripperDrive {
     /// estimate above the 0.79 N·m free-motion peak near full open, not an external calibration.
     pub fn rebot_dm() -> Self {
         Self { mode: DamiaoGripperMode::PosForce, current_ceiling_raw: 460, close_speed_rad_s: 0.30,
-            calibrated: false, ceiling_torque_nm: None, torque_reference: None }
+            calibrated: false, ceiling_torque_nm: None, torque_reference: None,
+            feedback_stale_fault_ms: None }
+    }
+
+    /// Resolved bounded staleness limit (ms) for J7 position-force feedback.
+    pub fn resolved_feedback_stale_fault_ms(&self) -> u64 {
+        self.feedback_stale_fault_ms.unwrap_or(Self::DEFAULT_FEEDBACK_STALE_FAULT_MS)
     }
 
     /// Legacy profile: J7 in POS_VEL, no motor current cap.
@@ -1292,6 +1333,15 @@ impl DamiaoGripperDrive {
         if let Some(r) = &self.torque_reference {
             if r != "external" && r != "feedback_equivalent" {
                 return Err("damiao_gripper.torque_reference must be external or feedback_equivalent".into());
+            }
+        }
+        if let Some(ms) = self.feedback_stale_fault_ms {
+            if !(Self::MIN_FEEDBACK_STALE_FAULT_MS..=Self::MAX_FEEDBACK_STALE_FAULT_MS).contains(&ms) {
+                return Err(format!(
+                    "damiao_gripper.feedback_stale_fault_ms must be {}..={} ms, got {ms}",
+                    Self::MIN_FEEDBACK_STALE_FAULT_MS,
+                    Self::MAX_FEEDBACK_STALE_FAULT_MS
+                ));
             }
         }
         Ok(())
@@ -1642,6 +1692,22 @@ impl ArmConfig {
     /// otherwise the default `10` ms (`DAMIAO_TX_MAX_DURATION`).
     pub fn resolved_tx_budget_ms(&self) -> u64 {
         self.tx_budget_ms.unwrap_or(10)
+    }
+
+    /// Resolved bounded J7 position-force staleness fault limit (ms), clamped as defense-in-depth
+    /// to `[MIN_FEEDBACK_STALE_FAULT_MS, MAX_FEEDBACK_STALE_FAULT_MS]` (`200..=450` ms, default
+    /// `250` ms).
+    pub fn resolved_j7_stale_fault_ms(&self) -> u64 {
+        self.damiao_gripper
+            .as_ref()
+            .map_or(
+                DamiaoGripperDrive::DEFAULT_FEEDBACK_STALE_FAULT_MS,
+                DamiaoGripperDrive::resolved_feedback_stale_fault_ms,
+            )
+            .clamp(
+                DamiaoGripperDrive::MIN_FEEDBACK_STALE_FAULT_MS,
+                DamiaoGripperDrive::MAX_FEEDBACK_STALE_FAULT_MS,
+            )
     }
 
     /// Damiao per-tick CAN TX budget derived from this profile (`tx_budget_ms` overrides
@@ -2741,6 +2807,11 @@ pub struct ArmObservation {
     /// Active or most recent policy-runtime run; omitted when none has run or feature disabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<PolicyObservation>,
+    /// Reason the lease watchdog held position instead of starting a park (for example
+    /// `"configuration reconciliation active"` or `"configuration hold active"`),
+    /// cleared on fault clear or subsequent park; omitted when null.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watchdog_park_blocked_reason: Option<HolderLabel>,
     /// Monotonic count of deferred safety log events dropped on overflow (never reset); omitted while zero.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub safety_log_dropped: u64,
@@ -2763,7 +2834,7 @@ impl ArmObservation {
             action: None, previous_action: None, control_mode: ControlMode::default(), gravity_comp: GravityCompObservation::default(),
             driver_range_check: None, lease_holder: None, motion_limit: None, workspace_violation: None, motor_errors: Vec::new(),
             fault: None, residual_torques: None, collision: None, power: None, gripper_zero: None, tcp: None, gripper: None,
-            loads: None, policy: None, safety_log_dropped: 0,
+            loads: None, policy: None, watchdog_park_blocked_reason: None, safety_log_dropped: 0,
             safety_text_spare: SafetyTextSpare(String::new()),
         }
     }
@@ -2795,6 +2866,12 @@ impl ArmObservation {
                     self.safety_text_spare.0.reserve(needed - self.safety_text_spare.0.len());
                 }
             }
+        }
+        if self.gravity_comp.tau_ff.capacity() < 6 {
+            self.gravity_comp.tau_ff.reserve(6 - self.gravity_comp.tau_ff.len());
+        }
+        if self.gravity_comp.damping_kd.capacity() < 6 {
+            self.gravity_comp.damping_kd.reserve(6 - self.gravity_comp.damping_kd.len());
         }
     }
 
@@ -2847,6 +2924,7 @@ impl ArmObservation {
                     SafetyState::Fault(FaultReason::BusLoss) => SafetyState::Fault(FaultReason::BusLoss),
                     SafetyState::Fault(FaultReason::WatchdogTimeout) => SafetyState::Fault(FaultReason::WatchdogTimeout),
                     SafetyState::Fault(FaultReason::CanTxStalled) => SafetyState::Fault(FaultReason::CanTxStalled),
+                    SafetyState::Fault(FaultReason::J7FeedbackStale) => SafetyState::Fault(FaultReason::J7FeedbackStale),
                     SafetyState::Fault(FaultReason::ThermalTrip { joint_idx, temperature, limit }) => {
                         SafetyState::Fault(FaultReason::ThermalTrip {
                             joint_idx: *joint_idx,
@@ -2861,7 +2939,7 @@ impl ArmObservation {
     }
 }
 
-crate::fieldwise_clone!(ArmObservation { timestamp, positions, velocities, torques, temperatures, is_torqued, safety_state, epoch_id, gravity_compensated, gravity_torques, driver_capabilities, enable_state, feedback_age_ms, disable_pending, feedback_valid, commanded_positions, action, previous_action, control_mode, gravity_comp, driver_range_check, lease_holder, motion_limit, workspace_violation, motor_errors, fault, residual_torques, collision, power, gripper_zero, tcp, gripper, loads, policy, safety_log_dropped, safety_text_spare });
+crate::fieldwise_clone!(ArmObservation { timestamp, positions, velocities, torques, temperatures, is_torqued, safety_state, epoch_id, gravity_compensated, gravity_torques, driver_capabilities, enable_state, feedback_age_ms, disable_pending, feedback_valid, commanded_positions, action, previous_action, control_mode, gravity_comp, driver_range_check, lease_holder, motion_limit, workspace_violation, motor_errors, fault, residual_torques, collision, power, gripper_zero, tcp, gripper, loads, policy, watchdog_park_blocked_reason, safety_log_dropped, safety_text_spare });
 
 /// Policy runtime execution state published in `observation.policy`.
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq)]

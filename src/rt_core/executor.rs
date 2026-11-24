@@ -19,9 +19,8 @@ use std::time::{Duration, Instant};
 
 use rtrb::{Consumer, Producer, RingBuffer};
 
-use super::broker::{Authority, BootId, Broker, Capacities, ClientId, RequestId, Stamp};
-use super::config_iface::{Activated, CandidateId, ConfigAuthority, ConfigDomain, ConfigProposal, Durability, Reservation, Reserved};
-use super::ids::ArmId;
+use super::broker::{BootId, Broker, Capacities, ClientId};
+use super::config_iface::{ConfigAuthority, ConfigDomain, ConfigProposal, Reservation};
 use super::mailbox::TargetWriter;
 use super::ops::{CoreOps, PlanSlot, PlanningSnapshot, ReleaseEngine, MAX_SERVICE_WAKES};
 use super::publish::StateHub;
@@ -36,7 +35,6 @@ use crate::diagnostics::tick::{
     RELEASE_FLAG_SAFETY_LATCH, RELEASE_FLAG_THERMAL_TRIP, RELEASE_FLAG_WATCHDOG_LATCH,
 };
 use crate::model::{ArmObservation, GripperPolicy, JawOpening};
-use crate::persist::{PublishOutcome, StagedWrite};
 use crate::safety::{
     ClearFaultError, FaultKind, SafetyError, SafetyLogEvent, SafetyState, FAULT_ARC_POOL_CAPACITY,
     FORMATTED_FAULT_ARC_POOL_CAPACITY, JOINT_LIMIT_ARC_POOL_CAPACITY, SAFETY_LOG_CAPACITY,
@@ -61,7 +59,7 @@ pub const RECLAIM_TRAJ_CAPACITY: usize = 8;
 pub const PERSIST_REP_CAPACITY: usize = 8;
 /// Lock-free SPSC capacity for off-thread reclamation (runtime rejected persistence jobs,
 /// deferred `legacy_j6` warnings, and clean-exit overflow payloads when consumer rings stay full).
-/// Sized strictly >= `17 maint + 6 persist + 12 runtime jobs/logs + 64 pending_estop_acks + 64 retired states + 64 retired stops + 8 retired trajectories`.
+/// Sized strictly >= `17 maint + 6 persist + 12 runtime jobs/logs + 64 pending_estop_acks + 64 retired states + 64 retired stops + 8 retired trajectories + 4 retired zero-check contexts`.
 const OFFLOAD_RECLAIM_CAPACITY: usize = MAINT_QUEUE_CAPACITY
     + 1
     + 6
@@ -69,7 +67,9 @@ const OFFLOAD_RECLAIM_CAPACITY: usize = MAINT_QUEUE_CAPACITY
     + ESTOP_ACK_CAPACITY
     + RECLAIM_STATE_CAPACITY
     + URGENT_STOP_CAPACITY
-    + RECLAIM_TRAJ_CAPACITY;
+    + RECLAIM_TRAJ_CAPACITY
+    + 4
+    + 2;
 
 /// Startup owner selection for `ArmCore` and the actuator bus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -834,10 +834,31 @@ pub enum MaintenanceOp {
     PlanningSnapshot,
     Observation,
     ClearFault { expected_epoch: Option<u64> },
-    SetJointZeroOffsets { offsets: Vec<f32> },
+    LeaseClearFault {
+        connection: super::requests::lease::ConnectionHandle,
+        lease_generation: u64,
+        supplied_epoch: Option<u64>,
+        request_id_valid: bool,
+        body_error: Option<&'static str>,
+        auth_policy: super::requests::lease::OwnerAuthPolicy,
+        operator: crate::auth::OperatorGrant,
+    },
+    LeaseTorquePreflight {
+        connection: super::requests::lease::ConnectionHandle,
+        lease_generation: u64,
+        supplied_epoch: Option<u64>,
+        request_id_valid: bool,
+        body_error: Option<&'static str>,
+        auth_policy: super::requests::lease::OwnerAuthPolicy,
+        operator: crate::auth::OperatorGrant,
+    },
+    SetJointZeroOffsets {
+        offsets: Vec<f32>,
+    },
     SetMotorZero { joint: usize },
     TakeBaselinePending {
         fresh_pending: Vec<crate::gripper_baseline::MoveRecord>,
+        fresh_samples: Vec<crate::gripper_baseline::MoveSamples>,
         clear_dirty: bool,
     },
     StoreBaseline {
@@ -846,6 +867,7 @@ pub enum MaintenanceOp {
         mark_dirty: bool,
     },
     MarkBaselineDirty,
+    Config(Box<super::requests::config::ConfigExchange>),
     #[doc(hidden)]
     ProbeOwnedPayload { payload: Box<dyn Any + Send> },
 }
@@ -859,11 +881,15 @@ pub enum MaintenanceResult {
     PlanningSnapshot(PlanningSnapshot),
     Observation(Box<ArmObservation>),
     FaultCleared(Result<SafetyState, ClearFaultError>),
-    JointZeroOffsetsSet(Result<(), String>),
-    MotorZeroSet(Result<(), String>),
+    LeaseFaultCleared(super::requests::lease::LeaseClearFaultOutcome),
+    LeaseTorquePreflight(Result<u64, super::requests::lease::TorquePreflightError>),
+    JointZeroOffsetsSet(Result<(), &'static str>),
+    MotorZeroSet(Result<(), &'static str>),
     BaselineTaken(BaselineTakeReply),
     BaselineStored(bool),
     BaselineDirtyMarked,
+    Config(Box<super::requests::config::ConfigExchange>),
+    StoppedWithConfig(Box<super::requests::config::ConfigExchange>),
     ProbeReturned,
     Stopped,
 }
@@ -880,6 +906,7 @@ struct MaintReply {
     returned_probe: Option<Box<dyn Any + Send>>,
     returned_driver_config_error: Option<String>,
     returned_pending: Option<Vec<crate::gripper_baseline::MoveRecord>>,
+    returned_samples: Option<Vec<crate::gripper_baseline::MoveSamples>>,
     returned_baseline: Option<crate::gripper_baseline::FreeTorqueBaseline>,
 }
 
@@ -916,10 +943,13 @@ impl MaintClientInner {
             drop(reply.returned_probe);
             drop(reply.returned_driver_config_error);
             drop(reply.returned_pending);
+            drop(reply.returned_samples);
             drop(reply.returned_baseline);
             if let Some(waiter) = self.waiters.remove(&reply.id) {
                 let res = match reply.result {
-                    MaintenanceResult::Stopped => Err(OwnerError::Stopped),
+                    MaintenanceResult::Stopped | MaintenanceResult::StoppedWithConfig(_) => {
+                        Err(OwnerError::Stopped)
+                    }
                     other => Ok(other),
                 };
                 waiter.deliver(res);
@@ -1045,6 +1075,38 @@ impl MaintClient {
             match tokio::time::timeout(Duration::from_millis(2), &mut rx).await {
                 Ok(Ok(res)) => return res,
                 Ok(Err(_)) => return Err(OwnerError::Stopped),
+                Err(_) => self.drain_replies(),
+            }
+        }
+    }
+
+    async fn call_try_async(
+        &self,
+        op: MaintenanceOp,
+    ) -> Result<MaintenanceResult, (MaintenanceOp, OwnerError)> {
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        {
+            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            g.drain_replies();
+            if g.closed || g.exited.load(Ordering::Acquire) || g.req_tx.is_abandoned() {
+                return Err((op, OwnerError::Stopped));
+            }
+            if g.in_flight >= MAINT_QUEUE_CAPACITY || g.req_tx.is_full() {
+                return Err((op, OwnerError::QueueFull));
+            }
+            let id = g.next_id;
+            g.next_id += 1;
+            if let Err(rtrb::PushError::Full(req)) = g.req_tx.push(MaintRequest { id, op }) {
+                return Err((req.op, OwnerError::QueueFull));
+            }
+            g.in_flight += 1;
+            g.waiters.insert(id, MaintWaiter::Async(tx));
+        }
+        loop {
+            match tokio::time::timeout(Duration::from_millis(2), &mut rx).await {
+                Ok(Ok(Ok(res))) => return Ok(res),
+                Ok(Ok(Err(e))) => return Err((MaintenanceOp::ShutdownReady, e)),
+                Ok(Err(_)) => return Err((MaintenanceOp::ShutdownReady, OwnerError::Stopped)),
                 Err(_) => self.drain_replies(),
             }
         }
@@ -1440,6 +1502,10 @@ pub struct PersistTestHooks {
     pub on_panic_disable_timeout: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Runs on `armd-control` strictly before Step 6 `StateHub` publication.
     pub before_publish: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Overrides the bounded reconciliation retry interval for `armd-persist` dir-fsync recovery.
+    pub reconcile_retry_interval: Option<Duration>,
+    /// Overrides the maximum reconciliation retry attempts for `armd-persist` dir-fsync recovery.
+    pub reconcile_max_attempts: Option<u32>,
 }
 
 enum PersistCmd {
@@ -1447,9 +1513,21 @@ enum PersistCmd {
         action_id: u64,
         base_revision: u64,
         lease_owner: Option<(crate::model::HolderLabel, u64)>,
+        estop_epoch: u64,
+        stop_gen: u64,
+        deadline: Instant,
         new_policy: GripperPolicy,
         jaw_opening: Option<JawOpening>,
         probe: Option<Box<dyn Any + Send>>,
+        code_buf: String,
+        msg_buf: String,
+    },
+    VerifyAuthority {
+        action_id: u64,
+        reservation: Reservation,
+        proposal: ConfigProposal,
+        auth: super::requests::config::ConfigAuthContext,
+        base_revision: u64,
         code_buf: String,
         msg_buf: String,
     },
@@ -1468,31 +1546,84 @@ enum PersistCmd {
         unused_policy: Option<GripperPolicy>,
         unused_jaw: Option<JawOpening>,
     },
-    Activate {
+    Persisted {
         action_id: u64,
         reservation: Reservation,
-        base_revision: u64,
-        lease_owner: Option<(crate::model::HolderLabel, u64)>,
-        offset_rad: f32,
-        new_policy: GripperPolicy,
-        new_jaw: Option<JawOpening>,
-        durability: Durability,
-        warning: Option<String>,
         code_buf: String,
         msg_buf: String,
     },
+    DirSyncFailed {
+        action_id: u64,
+        reservation: Reservation,
+        warning: String,
+        unused_policy: Option<GripperPolicy>,
+        unused_jaw: Option<JawOpening>,
+        msg_buf: String,
+    },
+    Activate {
+        action_id: u64,
+        reservation: Reservation,
+        proposal: ConfigProposal,
+        auth: super::requests::config::ConfigAuthContext,
+        base_revision: u64,
+        offset_rad: f32,
+        new_policy: GripperPolicy,
+        new_jaw: Option<JawOpening>,
+        operator_revoked: bool,
+        code_buf: String,
+        msg_buf: String,
+    },
+    FinishReconcile {
+        proposal: ConfigProposal,
+        auth: super::requests::config::ConfigAuthContext,
+        base_revision: u64,
+        offset_rad: f32,
+        new_policy: GripperPolicy,
+        new_jaw: Option<JawOpening>,
+        operator_revoked: bool,
+    },
+    LatchConfigReconcileFault {
+        message: crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>,
+    },
 }
 
+// Zero-allocation RT reply enum; boxing `Reserved` would heap-allocate on `armd-control`.
+#[allow(clippy::large_enum_variant)]
 enum PersistReply {
     Reserved {
-        reservation: Option<Reservation>,
+        reservation: Option<(
+            Reservation,
+            ConfigProposal,
+            super::requests::config::ConfigAuthContext,
+        )>,
         policy: Option<GripperPolicy>,
         returned_jaw: Option<JawOpening>,
         _returned_code: Option<String>,
         _returned_msg: Option<String>,
         _returned_probe: Option<Box<dyn Any + Send>>,
     },
+    Verified {
+        reservation: Option<Reservation>,
+        _returned_code: Option<String>,
+        _returned_msg: Option<String>,
+        _returned_probe: Option<Box<dyn Any + Send>>,
+    },
+    Persisted {
+        reservation: Option<Reservation>,
+        _returned_code: Option<String>,
+        _returned_msg: Option<String>,
+        _returned_probe: Option<Box<dyn Any + Send>>,
+    },
     Done {
+        _returned_policy: Option<GripperPolicy>,
+        _returned_jaw: Option<JawOpening>,
+        _returned_code: Option<String>,
+        _returned_msg: Option<String>,
+        _returned_warning: Option<String>,
+        _returned_probe: Option<Box<dyn Any + Send>>,
+    },
+    Activated {
+        activated_revision: u64,
         _returned_policy: Option<GripperPolicy>,
         _returned_jaw: Option<JawOpening>,
         _returned_code: Option<String>,
@@ -1510,12 +1641,378 @@ enum OffloadReclaim {
     MaintReply(MaintReply),
     PersistReply(PersistReply),
     PersistJob(PendingZeroCheckPersist, Option<Box<dyn Any + Send>>),
+    ZeroCheckCtx(Box<crate::supervisor::ZeroCheckPersistContext>),
+    GravityCompRun(crate::gravity_comp::GravityCompRun),
     Probe(Box<dyn Any + Send>),
     SafetyState(Arc<SafetyState>),
     RetiredStop(RetiredStopPayloads),
     ActiveTrajectory(crate::motion::ActiveTrajectory),
+    MacroRun(crate::macro_action::MacroRun),
+    #[cfg(feature = "policy-runtime")]
+    PolicyRun(crate::policy_runtime::PolicyRun),
     Buf(String),
     LogLegacyJ6(crate::joint_zero::ZeroConvention),
+}
+
+/// Off-thread broker dispatcher coordinating `Broker<PlanSlot>` submissions, connection-liveness
+/// linearization against [`ConnLifecycleClient`], and reply/terminal reclamation (even after
+/// caller disconnect or cancellation). Never touched by `armd-control`.
+///
+/// Strict acyclic lock order: `BrokerDispatcher::state` -> `ConnLifecycleClient::inner` -> `broker` -> `reply_router`.
+pub(crate) struct BrokerDispatcher {
+    broker: Arc<Mutex<Broker<PlanSlot>>>,
+    conn_lifecycle: Arc<super::requests::lease::ConnLifecycleClient>,
+    reply_router: Arc<Mutex<ActionReplyRouter>>,
+    state: Mutex<BrokerDispatcherState>,
+}
+
+struct ManagedEntry {
+    client: super::broker::ClientId,
+    waiter: ManagedWaiter,
+}
+
+enum ManagedWaiter {
+    OneShot(Option<tokio::sync::oneshot::Sender<Result<super::broker::Reply, OwnerError>>>),
+    Action {
+        ack: Option<tokio::sync::oneshot::Sender<Result<super::broker::Reply, OwnerError>>>,
+        terminal: Option<tokio::sync::oneshot::Sender<Result<super::broker::Reply, OwnerError>>>,
+        acked: bool,
+    },
+}
+
+struct BrokerDispatcherState {
+    managed: HashMap<super::broker::RequestId, ManagedEntry>,
+    /// True after a client with in-flight managed requests disconnects so `drain_replies`
+    /// continues polling `broker` until every abandoned reservation/plan slot is reclaimed.
+    draining_disconnected: bool,
+    exited: Arc<AtomicBool>,
+}
+
+/// Submission error returned by [`BrokerDispatcher`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrokerDispatchError {
+    Admit(super::broker::AdmitError),
+    Stopped,
+}
+
+impl BrokerDispatcher {
+    fn new(
+        broker: Arc<Mutex<Broker<PlanSlot>>>,
+        conn_lifecycle: Arc<super::requests::lease::ConnLifecycleClient>,
+        reply_router: Arc<Mutex<ActionReplyRouter>>,
+        exited: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            broker,
+            conn_lifecycle,
+            reply_router,
+            state: Mutex::new(BrokerDispatcherState {
+                managed: HashMap::with_capacity(super::broker::REPLY_CAPACITY),
+                draining_disconnected: false,
+                exited,
+            }),
+        }
+    }
+
+    fn submit_one_shot(
+        &self,
+        client: super::broker::ClientId,
+        client_seq: u64,
+        authority: super::broker::Authority,
+        deadline: Instant,
+        what: super::broker::Submit<'_, PlanSlot>,
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<super::broker::Reply, OwnerError>>, BrokerDispatchError>
+    {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.exited.load(Ordering::Acquire) {
+            return Err(BrokerDispatchError::Stopped);
+        }
+        if client.0 == 0 || !self.conn_lifecycle.is_slot_open(client.0) {
+            return Err(BrokerDispatchError::Admit(
+                super::broker::AdmitError::Disconnected,
+            ));
+        }
+        let req = self
+            .broker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .submit(client, client_seq, authority, deadline, what)
+            .map_err(BrokerDispatchError::Admit)?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        st.managed.insert(
+            req,
+            ManagedEntry {
+                client,
+                waiter: ManagedWaiter::OneShot(Some(tx)),
+            },
+        );
+        Ok(rx)
+    }
+
+    fn submit_action(
+        &self,
+        client: super::broker::ClientId,
+        client_seq: u64,
+        authority: super::broker::Authority,
+        deadline: Instant,
+        what: super::broker::Submit<'_, PlanSlot>,
+    ) -> Result<
+        (
+            tokio::sync::oneshot::Receiver<Result<super::broker::Reply, OwnerError>>,
+            tokio::sync::oneshot::Receiver<Result<super::broker::Reply, OwnerError>>,
+        ),
+        BrokerDispatchError,
+    > {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.exited.load(Ordering::Acquire) {
+            return Err(BrokerDispatchError::Stopped);
+        }
+        if client.0 == 0 || !self.conn_lifecycle.is_slot_open(client.0) {
+            return Err(BrokerDispatchError::Admit(
+                super::broker::AdmitError::Disconnected,
+            ));
+        }
+        let req = self
+            .broker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .submit(client, client_seq, authority, deadline, what)
+            .map_err(BrokerDispatchError::Admit)?;
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        let (term_tx, term_rx) = tokio::sync::oneshot::channel();
+        st.managed.insert(
+            req,
+            ManagedEntry {
+                client,
+                waiter: ManagedWaiter::Action {
+                    ack: Some(ack_tx),
+                    terminal: Some(term_tx),
+                    acked: false,
+                },
+            },
+        );
+        Ok((ack_rx, term_rx))
+    }
+
+    /// Linearizes connection teardown off-thread: prevents any subsequent `BrokerDispatcher`
+    /// submission for `connection.id()`, marks the broker client disconnected (retiring its
+    /// managed waiters immediately while continuing broker reclamation), and pushes a
+    /// guaranteed-non-full priority `LifecycleCmd::Disconnect` onto the lifecycle channel.
+    async fn disconnect_connection(
+        &self,
+        connection: super::requests::lease::ConnectionHandle,
+    ) -> Result<super::requests::lease::LeaseOutcome, super::requests::lease::ConnLifecycleError>
+    {
+        let rx = {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            // Strict acyclic lock order: `state` (1) -> `conn_lifecycle` (2) -> `broker` (3).
+            self.conn_lifecycle.enqueue_disconnect_oneshot(connection, tx)?;
+            Self::disconnect_broker_client_locked(&mut st, &self.broker, connection.id());
+            rx
+        };
+        match rx.await {
+            Ok(Ok(super::requests::lease::LifecycleReply::Disconnected { outcome, .. })) => {
+                Ok(outcome)
+            }
+            Ok(Err(e)) => Err(e),
+            _ => Err(super::requests::lease::ConnLifecycleError::Stopped),
+        }
+    }
+
+    fn disconnect_connection_sync(
+        &self,
+        connection: super::requests::lease::ConnectionHandle,
+    ) -> Result<super::requests::lease::LeaseOutcome, super::requests::lease::ConnLifecycleError>
+    {
+        let rx = {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let (tx, rx) = mpsc::sync_channel(1);
+            self.conn_lifecycle.enqueue_disconnect_sync(connection, tx)?;
+            Self::disconnect_broker_client_locked(&mut st, &self.broker, connection.id());
+            rx
+        };
+        match rx.recv() {
+            Ok(Ok(super::requests::lease::LifecycleReply::Disconnected { outcome, .. })) => {
+                Ok(outcome)
+            }
+            Ok(Err(e)) => Err(e),
+            _ => Err(super::requests::lease::ConnLifecycleError::Stopped),
+        }
+    }
+
+    fn enqueue_disconnect_detached(
+        &self,
+        connection: super::requests::lease::ConnectionHandle,
+    ) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        self.conn_lifecycle.enqueue_disconnect_detached(connection);
+        Self::disconnect_broker_client_locked(&mut st, &self.broker, connection.id());
+    }
+
+    fn disconnect_broker_client_locked(
+        st: &mut BrokerDispatcherState,
+        broker: &Mutex<Broker<PlanSlot>>,
+        conn_id: u64,
+    ) {
+        if conn_id == 0 {
+            return;
+        }
+        let client = super::broker::ClientId(conn_id);
+        let before = st.managed.len();
+        st.managed.retain(|_, entry| entry.client != client);
+        let mut guard = broker.lock().unwrap_or_else(|e| e.into_inner());
+        guard.disconnect(client);
+        if st.managed.len() < before || guard.outstanding() > 0 {
+            st.draining_disconnected = true;
+        }
+    }
+
+    fn poll_all_locked(
+        st: &mut BrokerDispatcherState,
+        broker: &Mutex<Broker<PlanSlot>>,
+        reply_router: &Mutex<ActionReplyRouter>,
+        force_poll: bool,
+    ) -> (usize, Option<Arc<dyn ExternalReplySink>>) {
+        use super::broker::DeliveryDecision;
+        let mut guard = broker.lock().unwrap_or_else(|e| e.into_inner());
+        let mut router = reply_router.lock().unwrap_or_else(|e| e.into_inner());
+        let has_consumers = force_poll
+            || !st.managed.is_empty()
+            || st.draining_disconnected
+            || !router.waiters.is_empty()
+            || router.external_sink.is_some();
+        if !has_consumers {
+            return (0, None);
+        }
+        let n = guard.try_poll(|client, reply| {
+            let req = reply.request();
+            if let Some(entry) = st.managed.get_mut(&req) {
+                let delivered = match &mut entry.waiter {
+                    ManagedWaiter::OneShot(slot) => {
+                        let ok = slot.take().is_some_and(|tx| tx.send(Ok(reply)).is_ok());
+                        st.managed.remove(&req);
+                        ok
+                    }
+                    ManagedWaiter::Action { ack, terminal, acked } => match reply {
+                        super::broker::Reply::Ack { .. } => {
+                            *acked = true;
+                            ack.take().is_some_and(|tx| tx.send(Ok(reply)).is_ok())
+                        }
+                        super::broker::Reply::Refused { .. }
+                        | super::broker::Reply::Lease { .. } => {
+                            let ok = ack.take().is_some_and(|tx| tx.send(Ok(reply)).is_ok());
+                            st.managed.remove(&req);
+                            ok
+                        }
+                        super::broker::Reply::Terminal { .. } => {
+                            let ok =
+                                terminal.take().is_some_and(|tx| tx.send(Ok(reply)).is_ok());
+                            st.managed.remove(&req);
+                            ok
+                        }
+                    },
+                };
+                if delivered {
+                    DeliveryDecision::Delivered
+                } else {
+                    DeliveryDecision::Abandoned
+                }
+            } else if let Some(tx) = router.waiters.remove(&req) {
+                let _ = tx.send(reply);
+                DeliveryDecision::Delivered
+            } else if router.external.len() < router.external_cap {
+                router.external.push_back((client, reply));
+                DeliveryDecision::Delivered
+            } else {
+                DeliveryDecision::Backpressured
+            }
+        });
+        guard.reclaim_plans();
+        if guard.outstanding() == 0 && st.managed.is_empty() {
+            st.draining_disconnected = false;
+        }
+        (n, router.external_sink.clone())
+    }
+
+    fn pump_to_router(&self) -> (usize, Option<Arc<dyn ExternalReplySink>>) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Self::poll_all_locked(&mut st, &self.broker, &self.reply_router, true)
+    }
+
+    fn drain_replies(&self) {
+        let sink = {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let (_, sink) = Self::poll_all_locked(&mut st, &self.broker, &self.reply_router, false);
+            if st.exited.load(Ordering::Acquire) {
+                let _ = Self::poll_all_locked(&mut st, &self.broker, &self.reply_router, false);
+                Self::fail_remaining(&mut st.managed, OwnerError::Stopped);
+                st.draining_disconnected = false;
+            }
+            sink
+        };
+        if let Some(sink) = sink {
+            use super::broker::DeliveryDecision;
+            let mut delivered_any = false;
+            loop {
+                let next = self
+                    .reply_router
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .external
+                    .pop_front();
+                let Some((client, reply)) = next else {
+                    break;
+                };
+                match sink.deliver(client, reply) {
+                    DeliveryDecision::Delivered | DeliveryDecision::Abandoned => {
+                        delivered_any = true;
+                    }
+                    DeliveryDecision::Backpressured => {
+                        self.reply_router
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .external
+                            .push_front((client, reply));
+                        break;
+                    }
+                }
+            }
+            if delivered_any {
+                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                let _ = Self::poll_all_locked(&mut st, &self.broker, &self.reply_router, false);
+            }
+        }
+    }
+
+    fn finish_stopped(&self) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = Self::poll_all_locked(&mut st, &self.broker, &self.reply_router, false);
+        Self::fail_remaining(&mut st.managed, OwnerError::Stopped);
+        st.draining_disconnected = false;
+    }
+
+    fn fail_remaining(
+        managed: &mut HashMap<super::broker::RequestId, ManagedEntry>,
+        err: OwnerError,
+    ) {
+        for (_, entry) in managed.drain() {
+            match entry.waiter {
+                ManagedWaiter::OneShot(Some(tx)) => {
+                    let _ = tx.send(Err(err.clone()));
+                }
+                ManagedWaiter::OneShot(None) => {}
+                ManagedWaiter::Action { ack, terminal, .. } => {
+                    if let Some(tx) = ack {
+                        let _ = tx.send(Err(err.clone()));
+                    }
+                    if let Some(tx) = terminal {
+                        let _ = tx.send(Err(err.clone()));
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Off-thread consumer sinks drained by `armd-dispatch`, `tick_stats()`, and `shutdown_and_join()`.
@@ -1527,15 +2024,24 @@ pub(crate) struct OffThreadSinks {
     reclaim_state_rx: Mutex<Consumer<Arc<SafetyState>>>,
     reclaim_stop_rx: Mutex<Consumer<RetiredStopPayloads>>,
     reclaim_traj_rx: Mutex<Consumer<crate::motion::ActiveTrajectory>>,
+    reclaim_macro_rx: Mutex<Consumer<crate::macro_action::MacroRun>>,
+    #[cfg(feature = "policy-runtime")]
+    reclaim_policy_rx: Mutex<Consumer<crate::policy_runtime::PolicyRun>>,
     reclaim_return_tx: Mutex<Producer<Arc<SafetyState>>>,
     /// `(consumer, last_reported_dropped, shutdown_reported_total)` guarded by one mutex so
     /// best-effort warning deltas never race and never reset `stats.safety_log_dropped`.
     safety_log_rx: Mutex<(Consumer<SafetyLogEvent>, u64, u64)>,
+    /// Final pending `"Stopped hold output failed"` aggregate handed off ONLY during control-thread
+    /// teardown when `safety_log_tx` remained full (never touched on RT ticks).
+    shutdown_hold_error: Arc<Mutex<Option<SafetyLogEvent>>>,
     stats: Arc<ExecutorStats>,
     persist_rep_rx: Arc<Mutex<Consumer<PersistReply>>>,
     persist_worker_exited: Arc<AtomicBool>,
     maint_client: Arc<MaintClient>,
     urgent_stop_client: Arc<UrgentStopClient>,
+    conn_lifecycle_client: Arc<super::requests::lease::ConnLifecycleClient>,
+    broker_dispatcher: Arc<BrokerDispatcher>,
+    eviction_rx: Mutex<Consumer<(super::requests::lease::ConnectionHandle, u64)>>,
     offload_reclaim_rx: Mutex<Consumer<OffloadReclaim>>,
 }
 
@@ -1622,6 +2128,17 @@ impl OffThreadSinks {
             }
         }
         {
+            let mut rx = self.reclaim_macro_rx.lock().unwrap_or_else(|e| e.into_inner());
+            while let Ok(_run) = rx.pop() {}
+        }
+        #[cfg(feature = "policy-runtime")]
+        {
+            let mut rx = self.reclaim_policy_rx.lock().unwrap_or_else(|e| e.into_inner());
+            while let Ok(run) = rx.pop() {
+                drop(run);
+            }
+        }
+        {
             let mut log_g = self.safety_log_rx.lock().unwrap_or_else(|e| e.into_inner());
             let total = self.stats.safety_log_dropped.load(Ordering::Relaxed);
             let delta = total.saturating_sub(log_g.1);
@@ -1632,9 +2149,27 @@ impl OffThreadSinks {
             while let Ok(ev) = log_g.0.pop() {
                 ev.emit();
             }
+            if let Some(ev) = self
+                .shutdown_hold_error
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                ev.emit();
+            }
         }
         self.maint_client.drain_replies();
         self.urgent_stop_client.drain_replies();
+        // Preserve owner Step 7 causal ordering off-thread: broker terminals (e.g. an aborted
+        // TorqueOn fenced by Disconnect) resolve strictly BEFORE lifecycle waiters (Disconnect).
+        self.broker_dispatcher.drain_replies();
+        self.conn_lifecycle_client.drain_replies();
+        {
+            let mut ev_rx = self.eviction_rx.lock().unwrap_or_else(|e| e.into_inner());
+            while let Ok((ev_conn, ev_gen)) = ev_rx.pop() {
+                crate::api::ws::notify_evicted_connection(ev_conn.as_str(), ev_gen);
+            }
+        }
         if self.persist_worker_exited.load(Ordering::Acquire) {
             let mut rx = self.persist_rep_rx.lock().unwrap_or_else(|e| e.into_inner());
             while let Ok(rep) = rx.pop() {
@@ -1722,13 +2257,74 @@ impl TeardownDisable {
     }
 }
 
+/// Single plug-in hook for PR L's per-connection WebSocket reply router (A6/A7).
+///
+/// In PR P, WebSocket ordinary commands on `OWNER_EXECUTOR` remain gated at `503
+/// EXECUTOR_ROUTING_PENDING` (`src/api/ws.rs:492, 2461`) because connection lifecycle and
+/// per-client reply routing belong to PR L. PR L installs its per-connection router once via
+/// [`RtExecutorHandle::attach_external_reply_sink`]. Until a sink is attached,
+/// [`crate::macro_action::begin_macro_executor`] refuses new executor macros at admission with
+/// `503 EXECUTOR_ROUTING_PENDING` so no macro can commit without a terminal reply sink.
+pub trait ExternalReplySink: Send + Sync {
+    fn deliver(
+        &self,
+        client: ClientId,
+        reply: super::broker::Reply,
+    ) -> super::broker::DeliveryDecision;
+}
+
+impl<F> ExternalReplySink for F
+where
+    F: Fn(ClientId, super::broker::Reply) -> super::broker::DeliveryDecision + Send + Sync,
+{
+    fn deliver(
+        &self,
+        client: ClientId,
+        reply: super::broker::Reply,
+    ) -> super::broker::DeliveryDecision {
+        (self)(client, reply)
+    }
+}
+
+/// Shared bounded FIFO broker reply dispatcher (A7 / Major 10):
+/// routes replies for internal broker RPCs (`BeginMacro` ACK/Refused, `InstallChild`, `FinishMacro`)
+/// directly to their keyed oneshot waiters without head-of-line blocking behind unrelated replies,
+/// while buffering all other replies (including `BeginMacro` `Terminal`s and external client traffic)
+/// in a bounded (`<= external_cap`) FIFO queue and forwarding them to the attached
+/// [`ExternalReplySink`] (PR L's per-connection WS reply router hook).
+///
+/// Lock order: ALWAYS lock `RtExecutorShared::broker` BEFORE `RtExecutorShared::reply_router`.
+/// NEVER invoke `ExternalReplySink::deliver` while holding either lock.
+struct ActionReplyRouter {
+    waiters: std::collections::HashMap<super::broker::RequestId, tokio::sync::oneshot::Sender<super::broker::Reply>>,
+    external: VecDeque<(ClientId, super::broker::Reply)>,
+    external_cap: usize,
+    external_sink: Option<Arc<dyn ExternalReplySink>>,
+}
+
+impl ActionReplyRouter {
+    fn new(external_cap: usize) -> Self {
+        let cap = external_cap.max(1);
+        Self {
+            waiters: std::collections::HashMap::new(),
+            external: VecDeque::with_capacity(cap),
+            external_cap: cap,
+            external_sink: None,
+        }
+    }
+}
+
 struct RtExecutorShared {
+    boot: BootId,
     broker: Arc<Mutex<Broker<PlanSlot>>>,
+    reply_router: Arc<Mutex<ActionReplyRouter>>,
     target_writer: Arc<Mutex<TargetWriter>>,
     stop_requests: StopRequests,
     stats: Arc<ExecutorStats>,
     maint_client: Arc<MaintClient>,
     urgent_stop_client: Arc<UrgentStopClient>,
+    conn_lifecycle_client: Arc<super::requests::lease::ConnLifecycleClient>,
+    broker_dispatcher: Arc<BrokerDispatcher>,
     hub: Arc<StateHub>,
     tick_stats: Arc<crate::diagnostics::tick::LockFreeTickStats>,
     sinks: Arc<OffThreadSinks>,
@@ -1777,6 +2373,7 @@ impl RtExecutorShared {
         self.persist_park_thread.unpark();
         self.maint_client.close();
         self.urgent_stop_client.close();
+        self.conn_lifecycle_client.close();
         self.stats.signal_stop(&self.control_stop);
         if let Some(clock) = self.clock.as_ref() {
             clock.wake();
@@ -1847,12 +2444,15 @@ impl RtExecutorShared {
         // Final off-thread drain and reclamation.
         self.maint_client.finish_stopped();
         self.urgent_stop_client.finish_stopped();
+        self.conn_lifecycle_client.finish_stopped();
+        self.broker_dispatcher.finish_stopped();
         self.sinks.flush_and_report_shutdown(&self.tick_stats);
         if let Some(ring) = self.hub.record_ring() {
             ring.drain();
         }
         let _ = self.hub.latest();
         self.broker.lock().unwrap_or_else(|e| e.into_inner()).poll(|_, _| true);
+        self.reply_router.lock().unwrap_or_else(|e| e.into_inner()).waiters.clear();
     }
 
     fn teardown_and_join(&self) {
@@ -1873,7 +2473,189 @@ pub struct RtExecutorHandle {
 }
 
 impl RtExecutorHandle {
+    pub fn boot(&self) -> BootId { self.shared.boot }
     pub fn broker(&self) -> &Arc<Mutex<Broker<PlanSlot>>> { &self.shared.broker }
+
+    /// Submits an internal A6/A7 action command (`BeginMacro`, `InstallChild`, `FinishMacro`, or
+    /// `InstallPrepared`) and atomically registers a keyed oneshot waiter in the shared bounded
+    /// FIFO reply router BEFORE releasing the broker lock (preventing ACK stealing and
+    /// head-of-line deadlock behind unrelated replies).
+    ///
+    /// For `BeginMacro` (which produces `Ack` followed later by `Terminal` under the same
+    /// `RequestId`), the oneshot receives ONLY the initial `Ack`/`Refused`; the subsequent
+    /// `Terminal` automatically routes into the external FIFO queue.
+    pub fn submit_internal_action<'a>(
+        &self,
+        client: ClientId,
+        seq: u64,
+        auth: super::broker::Authority,
+        deadline: Instant,
+        sub: super::requests::actions::ActionSubmit<'a, PlanSlot>,
+    ) -> Result<
+        (
+            super::broker::RequestId,
+            tokio::sync::oneshot::Receiver<super::broker::Reply>,
+        ),
+        super::broker::AdmitError,
+    > {
+        if client.0 != 0 && !self.shared.conn_lifecycle_client.is_slot_open(client.0) {
+            return Err(super::broker::AdmitError::Disconnected);
+        }
+        let mut broker = self.shared.broker.lock().unwrap_or_else(|e| e.into_inner());
+        broker.reclaim_plans();
+        let req_id = broker.submit(
+            client,
+            seq,
+            auth,
+            deadline,
+            super::broker::Submit::Action(sub),
+        )?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut router = self
+            .shared
+            .reply_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        router.waiters.insert(req_id, tx);
+        Ok((req_id, rx))
+    }
+
+    /// Removes a previously registered internal waiter (e.g. on timeout/cancellation).
+    pub fn cancel_internal_waiter(&self, req_id: super::broker::RequestId) {
+        self.shared
+            .reply_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .waiters
+            .remove(&req_id);
+    }
+
+    /// Single hook where PR L plugs in its per-connection WebSocket reply router.
+    /// Once attached, [`Self::has_external_reply_sink`] becomes `true`,
+    /// [`crate::macro_action::begin_macro_executor`] admits executor macros, and
+    /// [`Self::pump_broker_replies`] forwards external replies (including `BeginMacro`
+    /// `Reply::Terminal`s) to `sink` in strict FIFO order without holding broker/router locks.
+    pub fn attach_external_reply_sink(&self, sink: Arc<dyn ExternalReplySink>) {
+        self.shared
+            .reply_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .external_sink = Some(sink);
+        self.pump_broker_replies();
+    }
+
+    /// Detaches the external reply sink (returning executor macro admission to fail-closed
+    /// `503 EXECUTOR_ROUTING_PENDING`).
+    pub fn detach_external_reply_sink(&self) {
+        self.shared
+            .reply_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .external_sink = None;
+    }
+
+    /// Returns `true` when an external reply sink (PR L's per-connection WS reply router) is
+    /// currently attached to this executor handle.
+    pub fn has_external_reply_sink(&self) -> bool {
+        self.shared
+            .reply_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .external_sink
+            .is_some()
+    }
+
+    fn pump_broker_to_router(&self) -> (usize, Option<Arc<dyn ExternalReplySink>>) {
+        self.shared.broker_dispatcher.pump_to_router()
+    }
+
+    /// Pumps ready replies from the broker into matching internal waiters or the bounded external
+    /// FIFO buffer (`<= reply_capacity`), forwarding buffered external replies to the attached
+    /// [`ExternalReplySink`] (if any) without holding broker/router locks, and reclaims retired
+    /// plan slots.
+    pub fn pump_broker_replies(&self) -> usize {
+        use super::broker::DeliveryDecision;
+        let (mut total, sink) = self.pump_broker_to_router();
+        if let Some(sink) = sink {
+            let mut delivered_any = false;
+            loop {
+                let next = self
+                    .shared
+                    .reply_router
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .external
+                    .pop_front();
+                let Some((client, reply)) = next else {
+                    break;
+                };
+                match sink.deliver(client, reply) {
+                    DeliveryDecision::Delivered | DeliveryDecision::Abandoned => {
+                        delivered_any = true;
+                    }
+                    DeliveryDecision::Backpressured => {
+                        self.shared
+                            .reply_router
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .external
+                            .push_front((client, reply));
+                        break;
+                    }
+                }
+            }
+            if delivered_any {
+                total += self.pump_broker_to_router().0;
+            }
+        }
+        total
+    }
+
+    /// Drains external (non-internal-waiter) replies in strict broker FIFO order while honouring
+    /// downstream backpressure (`DeliveryDecision::Backpressured` keeps the undelivered reply at
+    /// the front of the bounded queue and never steals internal macro ACKs).
+    pub fn poll_external_replies<F>(&self, mut deliver: F) -> usize
+    where
+        F: FnMut(ClientId, super::broker::Reply) -> super::broker::DeliveryDecision,
+    {
+        use super::broker::DeliveryDecision;
+        self.pump_broker_replies();
+        let mut delivered = 0usize;
+        {
+            let mut router = self
+                .shared
+                .reply_router
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            while let Some((client, reply)) = router.external.pop_front() {
+                match deliver(client, reply) {
+                    DeliveryDecision::Delivered | DeliveryDecision::Abandoned => delivered += 1,
+                    DeliveryDecision::Backpressured => {
+                        router.external.push_front((client, reply));
+                        break;
+                    }
+                }
+            }
+        }
+        if delivered > 0 {
+            self.pump_broker_replies();
+        }
+        delivered
+    }
+
+    /// Number of buffered external replies currently waiting in the bounded router queue.
+    pub fn pending_external_replies(&self) -> usize {
+        self.shared
+            .reply_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .external
+            .len()
+    }
+
+    pub fn disconnect_client(&self, client: ClientId) {
+        self.shared.broker.lock().unwrap_or_else(|e| e.into_inner()).disconnect(client);
+    }
     pub fn target_writer(&self) -> &Arc<Mutex<TargetWriter>> { &self.shared.target_writer }
     pub fn stop_requests(&self) -> &StopRequests { &self.shared.stop_requests }
     pub fn stats(&self) -> &Arc<ExecutorStats> { &self.shared.stats }
@@ -1916,6 +2698,199 @@ impl RtExecutorHandle {
 
     pub fn urgent_stop_in_flight(&self) -> usize {
         self.shared.urgent_stop_client.in_flight()
+    }
+
+    pub fn open_connection_sync(
+        &self,
+        conn_id: u64,
+    ) -> Result<Result<(), &'static str>, super::requests::lease::ConnLifecycleError> {
+        self.shared.conn_lifecycle_client.open_sync(conn_id)
+    }
+
+    pub async fn open_connection_async(
+        &self,
+        conn_id: u64,
+    ) -> Result<Result<(), &'static str>, super::requests::lease::ConnLifecycleError> {
+        self.shared.conn_lifecycle_client.open_async(conn_id).await
+    }
+
+    pub fn disconnect_connection_sync(
+        &self,
+        connection: super::requests::lease::ConnectionHandle,
+    ) -> Result<super::requests::lease::LeaseOutcome, super::requests::lease::ConnLifecycleError>
+    {
+        self.shared
+            .broker_dispatcher
+            .disconnect_connection_sync(connection)
+    }
+
+    pub async fn disconnect_connection_async(
+        &self,
+        connection: super::requests::lease::ConnectionHandle,
+    ) -> Result<super::requests::lease::LeaseOutcome, super::requests::lease::ConnLifecycleError>
+    {
+        self.shared
+            .broker_dispatcher
+            .disconnect_connection(connection)
+            .await
+    }
+
+    /// Non-blocking fire-and-forget disconnect used strictly as a Drop safety net when an async
+    /// WS handler task is aborted externally before reaching its normal async teardown.
+    pub fn enqueue_disconnect_detached(
+        &self,
+        connection: super::requests::lease::ConnectionHandle,
+    ) {
+        self.shared
+            .broker_dispatcher
+            .enqueue_disconnect_detached(connection);
+    }
+
+    pub async fn submit_lease_async(
+        &self,
+        client: super::broker::ClientId,
+        client_seq: u64,
+        authority: super::broker::Authority,
+        deadline: Instant,
+        req: super::requests::lease::LeaseRequest,
+    ) -> Result<super::broker::Reply, BrokerDispatchError> {
+        let rx = self.shared.broker_dispatcher.submit_one_shot(
+            client,
+            client_seq,
+            authority,
+            deadline,
+            super::broker::Submit::Lease(req),
+        )?;
+        match rx.await {
+            Ok(Ok(reply)) => Ok(reply),
+            _ => Err(BrokerDispatchError::Stopped),
+        }
+    }
+
+    pub async fn submit_immediate_async(
+        &self,
+        client: super::broker::ClientId,
+        client_seq: u64,
+        authority: super::broker::Authority,
+        deadline: Instant,
+        op: super::broker::ImmediateOp,
+    ) -> Result<super::broker::Reply, BrokerDispatchError> {
+        let rx = self.shared.broker_dispatcher.submit_one_shot(
+            client,
+            client_seq,
+            authority,
+            deadline,
+            super::broker::Submit::Immediate(op),
+        )?;
+        match rx.await {
+            Ok(Ok(reply)) => Ok(reply),
+            _ => Err(BrokerDispatchError::Stopped),
+        }
+    }
+
+    /// Submits a `TransitionOp` (`TorqueOn` or `TorqueOff`) via `BrokerDispatcher::submit_action`
+    /// and awaits BOTH its Step 3 `Ack`/`Refused` AND (when accepted) its post-confirmation
+    /// `Reply::Terminal`. Never reports success on early `Ack` before hardware confirmation.
+    pub async fn submit_transition_async(
+        &self,
+        client: super::broker::ClientId,
+        client_seq: u64,
+        authority: super::broker::Authority,
+        deadline: Instant,
+        op: super::broker::TransitionOp,
+    ) -> Result<super::broker::Reply, BrokerDispatchError> {
+        let (ack_rx, term_rx) = self.shared.broker_dispatcher.submit_action(
+            client,
+            client_seq,
+            authority,
+            deadline,
+            super::broker::Submit::Transition(op),
+        )?;
+        let ack_reply = match ack_rx.await {
+            Ok(Ok(reply)) => reply,
+            _ => return Err(BrokerDispatchError::Stopped),
+        };
+        match ack_reply {
+            super::broker::Reply::Ack { .. } => match term_rx.await {
+                Ok(Ok(term_reply)) => Ok(term_reply),
+                _ => Err(BrokerDispatchError::Stopped),
+            },
+            other => Ok(other),
+        }
+    }
+
+    /// Routes WS `/api/v1/safety/clear_fault` through the single RT owner via
+    /// [`MaintenanceOp::LeaseClearFault`] with live lock-free [`crate::auth::OperatorGrant`]
+    /// governed by the WS dispatch table's [`super::requests::lease::OwnerAuthPolicy`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn lease_clear_fault_async(
+        &self,
+        connection: super::requests::lease::ConnectionHandle,
+        lease_generation: u64,
+        supplied_epoch: Option<u64>,
+        request_id_valid: bool,
+        body_error: Option<&'static str>,
+        auth_policy: super::requests::lease::OwnerAuthPolicy,
+        operator: crate::auth::OperatorGrant,
+    ) -> Result<super::requests::lease::LeaseClearFaultOutcome, OwnerError> {
+        match self
+            .call_maintenance_async(MaintenanceOp::LeaseClearFault {
+                connection,
+                lease_generation,
+                supplied_epoch,
+                request_id_valid,
+                body_error,
+                auth_policy,
+                operator,
+            })
+            .await?
+        {
+            MaintenanceResult::LeaseFaultCleared(out) => Ok(out),
+            _ => Err(OwnerError::Protocol),
+        }
+    }
+
+    /// Evaluates live owner authority, pending E-stop, operator auth policy, and body/request_id
+    /// precedence on the RT owner for malformed or policy-gated WS `/api/v1/torque` & `/api/v1/arm`
+    /// commands (zero heap allocations on `armd-control`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn lease_torque_preflight_async(
+        &self,
+        connection: super::requests::lease::ConnectionHandle,
+        lease_generation: u64,
+        supplied_epoch: Option<u64>,
+        request_id_valid: bool,
+        body_error: Option<&'static str>,
+        auth_policy: super::requests::lease::OwnerAuthPolicy,
+        operator: crate::auth::OperatorGrant,
+    ) -> Result<Result<u64, super::requests::lease::TorquePreflightError>, OwnerError> {
+        match self
+            .call_maintenance_async(MaintenanceOp::LeaseTorquePreflight {
+                connection,
+                lease_generation,
+                supplied_epoch,
+                request_id_valid,
+                body_error,
+                auth_policy,
+                operator,
+            })
+            .await?
+        {
+            MaintenanceResult::LeaseTorquePreflight(res) => Ok(res),
+            _ => Err(OwnerError::Protocol),
+        }
+    }
+
+    pub fn drain_broker_replies(&self) {
+        self.shared.broker_dispatcher.drain_replies();
+    }
+
+    pub fn drain_conn_lifecycle_replies(&self) {
+        self.shared.conn_lifecycle_client.drain_replies();
+    }
+
+    pub fn live_connection_slots(&self) -> usize {
+        self.shared.conn_lifecycle_client.live_slot_count()
     }
 
     pub fn request_shutdown(&self) -> Result<bool, OwnerError> {
@@ -2000,15 +2975,86 @@ impl RtExecutorHandle {
 
     pub fn set_joint_zero_offsets(&self, offsets: Vec<f32>) -> Result<Result<(), String>, OwnerError> {
         match self.call_maintenance(MaintenanceOp::SetJointZeroOffsets { offsets })? {
-            MaintenanceResult::JointZeroOffsetsSet(r) => Ok(r),
+            MaintenanceResult::JointZeroOffsetsSet(r) => Ok(r.map_err(String::from)),
+            _ => Err(OwnerError::Protocol),
+        }
+    }
+
+    pub async fn set_joint_zero_offsets_async(&self, offsets: Vec<f32>) -> Result<Result<(), String>, OwnerError> {
+        match self
+            .call_maintenance_async(MaintenanceOp::SetJointZeroOffsets { offsets })
+            .await?
+        {
+            MaintenanceResult::JointZeroOffsetsSet(r) => Ok(r.map_err(String::from)),
             _ => Err(OwnerError::Protocol),
         }
     }
 
     pub fn set_motor_zero(&self, joint: usize) -> Result<Result<(), String>, OwnerError> {
         match self.call_maintenance(MaintenanceOp::SetMotorZero { joint })? {
-            MaintenanceResult::MotorZeroSet(r) => Ok(r),
+            MaintenanceResult::MotorZeroSet(r) => Ok(r.map_err(String::from)),
             _ => Err(OwnerError::Protocol),
+        }
+    }
+
+    pub async fn set_motor_zero_async(&self, joint: usize) -> Result<Result<(), String>, OwnerError> {
+        match self.call_maintenance_async(MaintenanceOp::SetMotorZero { joint }).await? {
+            MaintenanceResult::MotorZeroSet(r) => Ok(r.map_err(String::from)),
+            _ => Err(OwnerError::Protocol),
+        }
+    }
+
+    pub fn call_config(
+        &self,
+        req: super::requests::config::ConfigRequest,
+    ) -> Result<super::requests::config::ConfigReply, OwnerError> {
+        let ex = super::requests::config::ConfigExchange::new(req);
+        match self.call_maintenance(MaintenanceOp::Config(ex))? {
+            MaintenanceResult::Config(mut ex) => ex.reply.take().ok_or(OwnerError::Protocol),
+            _ => Err(OwnerError::Protocol),
+        }
+    }
+
+    pub async fn call_config_async(
+        &self,
+        req: super::requests::config::ConfigRequest,
+    ) -> Result<super::requests::config::ConfigReply, OwnerError> {
+        let ex = super::requests::config::ConfigExchange::new(req);
+        match self.call_maintenance_async(MaintenanceOp::Config(ex)).await? {
+            MaintenanceResult::Config(mut ex) => ex.reply.take().ok_or(OwnerError::Protocol),
+            _ => Err(OwnerError::Protocol),
+        }
+    }
+
+    /// Like [`Self::call_config_async`], but if the maintenance queue is full before enqueue,
+    /// returns the untouched `ConfigRequest` (preserving linear `Reservation` tokens for retry).
+    pub async fn call_config_try_async(
+        &self,
+        req: super::requests::config::ConfigRequest,
+    ) -> Result<super::requests::config::ConfigReply, (super::requests::config::ConfigRequest, OwnerError)> {
+        let ex = super::requests::config::ConfigExchange::new(req);
+        match self.shared.maint_client.call_try_async(MaintenanceOp::Config(ex)).await {
+            Ok(MaintenanceResult::Config(mut ex)) => ex
+                .reply
+                .take()
+                .ok_or((
+                    super::requests::config::ConfigRequest::SampleTableCapture,
+                    OwnerError::Protocol,
+                )),
+            Ok(_) => Err((
+                super::requests::config::ConfigRequest::SampleTableCapture,
+                OwnerError::Protocol,
+            )),
+            Err((MaintenanceOp::Config(mut ex), err)) => Err((
+                ex.req
+                    .take()
+                    .unwrap_or(super::requests::config::ConfigRequest::SampleTableCapture),
+                err,
+            )),
+            Err((_, err)) => Err((
+                super::requests::config::ConfigRequest::SampleTableCapture,
+                err,
+            )),
         }
     }
 
@@ -2017,9 +3063,14 @@ impl RtExecutorHandle {
         clear_dirty: bool,
     ) -> Result<BaselineTakeReply, OwnerError> {
         let fresh_pending = Vec::with_capacity(crate::supervisor::GRIPPER_BASELINE_PENDING_MAX);
+        let mut fresh_samples = Vec::with_capacity(crate::supervisor::GRIPPER_BASELINE_PENDING_MAX);
+        for _ in 0..crate::supervisor::GRIPPER_BASELINE_PENDING_MAX {
+            fresh_samples.push(crate::gripper_baseline::MoveSamples::default());
+        }
         match self
             .call_maintenance_async(MaintenanceOp::TakeBaselinePending {
                 fresh_pending,
+                fresh_samples,
                 clear_dirty,
             })
             .await?
@@ -2122,6 +3173,7 @@ pub(crate) fn spawn_executor(
     cfg: ExecutorConfig,
     initial_generation: u64,
     config_write_mutex: Arc<tokio::sync::Mutex<()>>,
+    published_config: Arc<super::requests::config::PublishedConfigHub>,
     estop_reg: Arc<Mutex<EstopRegistry>>,
     tick_stats: Arc<crate::diagnostics::tick::LockFreeTickStats>,
     control_sched: Arc<Mutex<Option<crate::diagnostics::tick::ControlThreadSched>>>,
@@ -2129,7 +3181,7 @@ pub(crate) fn spawn_executor(
     hooks: PersistTestHooks,
 ) -> Result<(RtExecutorHandle, Arc<OffThreadSinks>), (Option<Box<SupervisorInner>>, String)> {
     let hub = core.core.hub().clone();
-    let e_stop_latched = core.e_stop_latched.clone();
+    let estop_state = core.estop_state.clone();
     let baseline_identity = BaselineIdentity {
         tool_id: core.config.active_tool.id.clone(),
         tool_config_digest: core.config.active_tool.config_digest.clone(),
@@ -2137,7 +3189,11 @@ pub(crate) fn spawn_executor(
         path: core.gripper_baseline_path.clone(),
     };
     let (mut engine, broker, target_writer, stop_requests) = ReleaseEngine::new(cfg.boot, cfg.capacities);
+    core.boot_id = cfg.boot;
     core.attach_stop_requests(stop_requests.clone());
+    core.attach_closed_bitset(broker.closed_bitset());
+    core.boot_id = cfg.boot;
+    hub.update_prep_env(Arc::new(super::requests::actions::ActionPrepEnv::from_inner(&core)));
 
     let (diag_tx, diag_rx) = RingBuffer::<TickSample>::new(DIAG_RING_CAPACITY);
     let (diag_amend_tx, diag_amend_rx) = RingBuffer::<(u64, u32)>::new(DIAG_RING_CAPACITY);
@@ -2148,6 +3204,9 @@ pub(crate) fn spawn_executor(
     let (reclaim_stop_tx, reclaim_stop_rx) = RingBuffer::<RetiredStopPayloads>::new(URGENT_STOP_CAPACITY);
     let (reclaim_traj_tx, reclaim_traj_rx) =
         RingBuffer::<crate::motion::ActiveTrajectory>::new(RECLAIM_TRAJ_CAPACITY);
+    let (reclaim_macro_tx, reclaim_macro_rx) = RingBuffer::<crate::macro_action::MacroRun>::new(8);
+    #[cfg(feature = "policy-runtime")]
+    let (reclaim_policy_tx, reclaim_policy_rx) = RingBuffer::<crate::policy_runtime::PolicyRun>::new(8);
     let (reclaim_return_tx, reclaim_return_rx) = RingBuffer::<Arc<SafetyState>>::new(
         FAULT_ARC_POOL_CAPACITY + FORMATTED_FAULT_ARC_POOL_CAPACITY + JOINT_LIMIT_ARC_POOL_CAPACITY,
     );
@@ -2166,12 +3225,29 @@ pub(crate) fn spawn_executor(
         urgent_stop_channel(URGENT_STOP_CAPACITY, exited.clone());
     engine.attach_urgent_stops(urgent_stop_intake);
     let urgent_stop_client = Arc::new(urgent_stop_client);
+    let (conn_lifecycle_client, conn_lifecycle_intake) =
+        super::requests::lease::conn_lifecycle_channel(exited.clone());
+    conn_lifecycle_client.seed_live_connections(core.live_connection_ids());
+    engine.attach_conn_lifecycle(conn_lifecycle_intake);
+    let (eviction_tx, eviction_rx) =
+        RingBuffer::<(super::requests::lease::ConnectionHandle, u64)>::new(32);
+    engine.attach_eviction_tx(eviction_tx);
+    let conn_lifecycle_client = Arc::new(conn_lifecycle_client);
+    let broker = Arc::new(Mutex::new(broker));
+    let reply_router = Arc::new(Mutex::new(ActionReplyRouter::new(cfg.capacities.replies)));
+    let broker_dispatcher = Arc::new(BrokerDispatcher::new(
+        Arc::clone(&broker),
+        Arc::clone(&conn_lifecycle_client),
+        Arc::clone(&reply_router),
+        exited.clone(),
+    ));
     let control_exited_cv = Arc::new((Mutex::new(false), Condvar::new()));
     let persist_worker_exited = Arc::new(AtomicBool::new(false));
     let persist_exited_cv = Arc::new((Mutex::new(false), Condvar::new()));
     let teardown_disable = Arc::new(TeardownDisable::default());
     let stats = Arc::new(ExecutorStats::default());
 
+    let shutdown_hold_error = Arc::new(Mutex::new(None));
     let persist_rep_rx = Arc::new(Mutex::new(persist_rep_rx));
     let maint_client = Arc::new(MaintClient::new(maint_req_tx, maint_rep_rx, exited.clone()));
     let sinks = Arc::new(OffThreadSinks {
@@ -2180,13 +3256,20 @@ pub(crate) fn spawn_executor(
         reclaim_state_rx: Mutex::new(reclaim_state_rx),
         reclaim_stop_rx: Mutex::new(reclaim_stop_rx),
         reclaim_traj_rx: Mutex::new(reclaim_traj_rx),
+        reclaim_macro_rx: Mutex::new(reclaim_macro_rx),
+        #[cfg(feature = "policy-runtime")]
+        reclaim_policy_rx: Mutex::new(reclaim_policy_rx),
         reclaim_return_tx: Mutex::new(reclaim_return_tx),
         safety_log_rx: Mutex::new((safety_log_rx, 0, 0)),
+        shutdown_hold_error: shutdown_hold_error.clone(),
         stats: stats.clone(),
         persist_rep_rx: persist_rep_rx.clone(),
         persist_worker_exited: persist_worker_exited.clone(),
         maint_client: maint_client.clone(),
         urgent_stop_client: urgent_stop_client.clone(),
+        conn_lifecycle_client: conn_lifecycle_client.clone(),
+        broker_dispatcher: broker_dispatcher.clone(),
+        eviction_rx: Mutex::new(eviction_rx),
         offload_reclaim_rx: Mutex::new(offload_reclaim_rx),
     });
 
@@ -2196,6 +3279,7 @@ pub(crate) fn spawn_executor(
         persist_cmd_tx,
         persist_rep_rx.clone(),
         config_write_mutex,
+        Arc::clone(&published_config),
         persist_stop.clone(),
         exited.clone(),
         persist_worker_exited.clone(),
@@ -2244,14 +3328,18 @@ pub(crate) fn spawn_executor(
                 reclaim_state_tx,
                 reclaim_stop_tx,
                 reclaim_traj_tx,
+                reclaim_macro_tx,
+                #[cfg(feature = "policy-runtime")]
+                reclaim_policy_tx,
                 reclaim_return_rx,
                 safety_log_tx,
+                shutdown_hold_error,
                 persist_job_tx,
                 persist_cmd_rx,
                 persist_rep_tx,
                 offload_reclaim_tx,
                 persist_wake,
-                e_stop_latched,
+                estop_state,
                 hub_clone,
                 hooks,
             );
@@ -2293,12 +3381,16 @@ pub(crate) fn spawn_executor(
     let monitor_thread = stats.spawn_monitor(control_stop.clone()).ok();
 
     let shared = Arc::new(RtExecutorShared {
-        broker: Arc::new(Mutex::new(broker)),
+        boot: cfg.boot,
+        broker,
+        reply_router,
         target_writer: Arc::new(Mutex::new(target_writer)),
         stop_requests,
         stats,
         maint_client,
         urgent_stop_client,
+        conn_lifecycle_client,
+        broker_dispatcher,
         hub,
         tick_stats,
         sinks: sinks.clone(),
@@ -2324,6 +3416,72 @@ pub(crate) fn spawn_executor(
     Ok((RtExecutorHandle { shared }, sinks))
 }
 
+/// Single production forwarding path from `core.safety`'s inline log ring into the bounded
+/// downstream SPSC `safety_log_tx` ring (zero RT heap allocations, zero frees).
+///
+/// Converges BOTH freshly popped and retained `"Stopped hold output failed"` occurrences into a
+/// single pending aggregate and enforces ONE active-sink delivery gate timestamped on the exact
+/// driver clock right at acceptance (zero double delivery within 1 s, lossless across ring full).
+#[doc(hidden)]
+pub fn forward_deferred_safety_logs(
+    core: &mut SupervisorInner,
+    safety_log_tx: &mut Producer<SafetyLogEvent>,
+    stats: &ExecutorStats,
+    now: Instant,
+) -> bool {
+    let mut drained = false;
+    while let Some(ev) = core.safety.pop_log_event() {
+        match ev {
+            SafetyLogEvent::StoppedHoldOutputFailed {
+                partial,
+                suppressed,
+                message,
+                logged_at,
+            } => {
+                core.hold_tx_error_suppressed = core
+                    .hold_tx_error_suppressed
+                    .saturating_add(1)
+                    .saturating_add(suppressed);
+                core.last_hold_tx_error_log = core.last_hold_tx_error_delivered;
+                core.pending_hold_tx_error_retry = Some((partial, message, logged_at));
+            }
+            other => {
+                if safety_log_tx.push(other).is_err() {
+                    core.safety_log_ring_dropped = core.safety_log_ring_dropped.saturating_add(1);
+                    stats.safety_log_dropped.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        drained = true;
+    }
+    if core.hold_tx_error_suppressed > 0 {
+        if let Some((partial, message, logged_at)) = core.pending_hold_tx_error_retry {
+            let check_at = core.driver_clock_now_or(now);
+            let stamp = check_at.max(logged_at);
+            let window_ready = core
+                .last_hold_tx_error_delivered
+                .is_none_or(|d| stamp.saturating_duration_since(d) >= Duration::from_secs(1));
+            if window_ready {
+                let out_ev = SafetyLogEvent::StoppedHoldOutputFailed {
+                    partial,
+                    suppressed: core.hold_tx_error_suppressed - 1,
+                    message,
+                    logged_at,
+                };
+                if safety_log_tx.push(out_ev).is_ok() {
+                    let delivered_at = core.driver_clock_now_or(stamp).max(stamp);
+                    core.hold_tx_error_suppressed = 0;
+                    core.pending_hold_tx_error_retry = None;
+                    core.last_hold_tx_error_log = Some(delivered_at);
+                    core.last_hold_tx_error_delivered = Some(delivered_at);
+                    drained = true;
+                }
+            }
+        }
+    }
+    drained
+}
+
 struct ControlState {
     shutdown_committed: bool,
     control_stop: Arc<AtomicBool>,
@@ -2333,8 +3491,12 @@ struct ControlState {
     reclaim_state_tx: Producer<Arc<SafetyState>>,
     reclaim_stop_tx: Producer<RetiredStopPayloads>,
     reclaim_traj_tx: Producer<crate::motion::ActiveTrajectory>,
+    reclaim_macro_tx: Producer<crate::macro_action::MacroRun>,
+    #[cfg(feature = "policy-runtime")]
+    reclaim_policy_tx: Producer<crate::policy_runtime::PolicyRun>,
     reclaim_return_rx: Consumer<Arc<SafetyState>>,
     safety_log_tx: Producer<SafetyLogEvent>,
+    shutdown_hold_error: Arc<Mutex<Option<SafetyLogEvent>>>,
     stats: Arc<ExecutorStats>,
     maint_req_rx: Consumer<MaintRequest>,
     maint_rep_tx: Producer<MaintReply>,
@@ -2408,9 +3570,9 @@ impl ControlState {
     }
 
     /// Clean-exit E-stop drain: moves any remaining pending E-stop acks / retired fault arcs /
-    /// retired stop payloads / retired trajectories into their reclaim rings or lock-free
-    /// `offload_reclaim_tx` so nothing drops on RT.
-    fn drain_estop_and_retired_stopped(&mut self, core: &mut SupervisorInner) {
+    /// retired stop payloads / retired trajectories / retired macro runs into their reclaim rings
+    /// or lock-free `offload_reclaim_tx` so nothing drops on RT.
+    fn drain_estop_and_retired_stopped(&mut self, core: &mut SupervisorInner, now: Instant) {
         self.emit_estop_ack_if_advanced(core);
         while let Some(ack) = core.pending_estop_acks.pop_front() {
             self.estop_overflow_gen.fetch_max(ack.last_gen, Ordering::Release);
@@ -2418,7 +3580,7 @@ impl ControlState {
                 let _ = self.offload_reclaim_tx.push(OffloadReclaim::SafetyState(state));
             }
         }
-        self.drain_retired_states(core);
+        self.drain_retired_states(core, now);
         while let Some(arc) = core.safety.pop_retired_state_arc() {
             if let Err(rtrb::PushError::Full(state)) = self.reclaim_state_tx.push(arc) {
                 let _ = self.offload_reclaim_tx.push(OffloadReclaim::SafetyState(state));
@@ -2434,13 +3596,30 @@ impl ControlState {
                 let _ = self.offload_reclaim_tx.push(OffloadReclaim::ActiveTrajectory(traj));
             }
         }
+        while let Some(run) = core.pop_retired_macro_run() {
+            if let Err(rtrb::PushError::Full(run)) = self.reclaim_macro_tx.push(run) {
+                let _ = self.offload_reclaim_tx.push(OffloadReclaim::MacroRun(run));
+            }
+        }
+        #[cfg(feature = "policy-runtime")]
+        while let Some(run) = core.pop_retired_policy_run() {
+            if let Err(rtrb::PushError::Full(run)) = self.reclaim_policy_tx.push(run) {
+                let _ = self.offload_reclaim_tx.push(OffloadReclaim::PolicyRun(run));
+            }
+        }
+        while let Some(ctx) = core.pop_retired_zero_check_ctx() {
+            let _ = self.offload_reclaim_tx.push(OffloadReclaim::ZeroCheckCtx(ctx));
+        }
+        if let Some(run) = core.retired_gravity_comp.take() {
+            let _ = self.offload_reclaim_tx.push(OffloadReclaim::GravityCompRun(run));
+        }
     }
 
     /// Moves retired fault `Arc<SafetyState>` snapshots, retired heap motion payloads, retired
-    /// `ActiveTrajectory` instances, and deferred [`SafetyLogEvent`]s off `armd-control` into
-    /// bounded SPSC rings, and replenishes
-    /// clean recycled fault slots without allocating or dropping on `armd-control`.
-    fn drain_retired_states(&mut self, core: &mut SupervisorInner) {
+    /// `ActiveTrajectory` / `MacroRun` instances, and deferred [`SafetyLogEvent`]s off
+    /// `armd-control` into bounded SPSC rings, and replenishes clean recycled fault slots without
+    /// allocating or dropping on `armd-control`.
+    fn drain_retired_states(&mut self, core: &mut SupervisorInner, now: Instant) {
         let mut drained = false;
         while !self.reclaim_state_tx.is_full()
             && (core.safety.fault_arc_pool_len() < FAULT_ARC_POOL_CAPACITY
@@ -2476,19 +3655,82 @@ impl ControlState {
             let _ = self.reclaim_traj_tx.push(traj);
             drained = true;
         }
+        while !self.reclaim_macro_tx.is_full() {
+            let Some(run) = core.pop_retired_macro_run() else {
+                break;
+            };
+            let _ = self.reclaim_macro_tx.push(run);
+            drained = true;
+        }
+        #[cfg(feature = "policy-runtime")]
+        while !self.reclaim_policy_tx.is_full() {
+            let Some(run) = core.pop_retired_policy_run() else {
+                break;
+            };
+            let _ = self.reclaim_policy_tx.push(run);
+            drained = true;
+        }
+        while !self.offload_reclaim_tx.is_full() {
+            let Some(ctx) = core.pop_retired_zero_check_ctx() else {
+                break;
+            };
+            let _ = self.offload_reclaim_tx.push(OffloadReclaim::ZeroCheckCtx(ctx));
+            drained = true;
+        }
+        if !self.offload_reclaim_tx.is_full() {
+            if let Some(run) = core.retired_gravity_comp.take() {
+                let _ = self.offload_reclaim_tx.push(OffloadReclaim::GravityCompRun(run));
+                drained = true;
+            }
+        }
         let lost_inline = core.safety.advance_log_dropped_forwarded();
         if lost_inline > 0 {
             self.stats.safety_log_dropped.fetch_add(lost_inline, Ordering::Relaxed);
             drained = true;
         }
-        while let Some(ev) = core.safety.pop_log_event() {
-            if self.safety_log_tx.push(ev).is_err() {
-                core.safety_log_ring_dropped = core.safety_log_ring_dropped.saturating_add(1);
-                self.stats.safety_log_dropped.fetch_add(1, Ordering::Relaxed);
-            }
+        if forward_deferred_safety_logs(core, &mut self.safety_log_tx, &self.stats, now) {
             drained = true;
         }
         if drained {
+            core.core.hub().wake();
+        }
+    }
+
+    /// Teardown-only handoff (never called on RT ticks): transfers any retained `"Stopped hold
+    /// output failed"` aggregate that could not fit into a full `safety_log_tx` ring to
+    /// `OffThreadSinks` without ever blocking `armd-control` on a mutex (`try_lock` with a
+    /// counted drop on contention).
+    fn flush_pending_hold_error_for_shutdown(&mut self, core: &mut SupervisorInner) {
+        if let Some(ev) = core.take_pending_hold_tx_error_for_shutdown() {
+            let mut slot = match self.shutdown_hold_error.try_lock() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    core.safety_log_ring_dropped = core.safety_log_ring_dropped.saturating_add(1);
+                    self.stats.safety_log_dropped.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            };
+            *slot = Some(match slot.take() {
+                None => ev,
+                Some(SafetyLogEvent::StoppedHoldOutputFailed { suppressed: prev_sup, .. }) => {
+                    match ev {
+                        SafetyLogEvent::StoppedHoldOutputFailed {
+                            partial,
+                            suppressed,
+                            message,
+                            logged_at,
+                        } => SafetyLogEvent::StoppedHoldOutputFailed {
+                            partial,
+                            suppressed: suppressed.saturating_add(1).saturating_add(prev_sup),
+                            message,
+                            logged_at,
+                        },
+                        other => other,
+                    }
+                }
+                Some(_) => ev,
+            });
             core.core.hub().wake();
         }
     }
@@ -2527,6 +3769,7 @@ impl ControlState {
         let mut returned_offsets = None;
         let mut returned_probe = None;
         let mut returned_pending = None;
+        let mut returned_samples = None;
         let mut returned_baseline = None;
         let result = match req.op {
             MaintenanceOp::RequestShutdown => {
@@ -2566,39 +3809,80 @@ impl ControlState {
                 self.stats.last_clear_release_seq.store(step_num, Ordering::Release);
                 MaintenanceResult::FaultCleared(res)
             }
+            MaintenanceOp::LeaseClearFault {
+                connection,
+                lease_generation,
+                supplied_epoch,
+                request_id_valid,
+                body_error,
+                auth_policy,
+                operator,
+            } => {
+                let out = super::requests::lease::install_lease_clear_fault_rt(
+                    core,
+                    connection,
+                    lease_generation,
+                    supplied_epoch,
+                    request_id_valid,
+                    body_error,
+                    auth_policy,
+                    operator,
+                    ctx.now,
+                    release_deadline,
+                );
+                if matches!(out, super::requests::lease::LeaseClearFaultOutcome::Cleared { .. }) {
+                    self.shutdown_committed = false;
+                    *release_flags |= RELEASE_FLAG_CLEAR_OK;
+                } else {
+                    *release_flags |= RELEASE_FLAG_CLEAR_REFUSED;
+                }
+                self.stats.last_clear_release_seq.store(step_num, Ordering::Release);
+                MaintenanceResult::LeaseFaultCleared(out)
+            }
+            MaintenanceOp::LeaseTorquePreflight {
+                connection,
+                lease_generation,
+                supplied_epoch,
+                request_id_valid,
+                body_error,
+                auth_policy,
+                operator,
+            } => {
+                let res = super::requests::lease::check_torque_owner_preflight(
+                    core,
+                    connection,
+                    lease_generation,
+                    supplied_epoch,
+                    request_id_valid,
+                    body_error,
+                    auth_policy,
+                    operator,
+                    ctx.now,
+                );
+                MaintenanceResult::LeaseTorquePreflight(res)
+            }
             MaintenanceOp::SetJointZeroOffsets { offsets } => {
-                let res = if *core.safety.state() != SafetyState::Idle
-                    || core.is_torqued
-                    || core.disable_pending
-                    || core.active_trajectory.is_some()
-                {
-                    Err("Arm must be Idle with torque off and no active trajectory to set joint zero offsets".into())
-                } else {
-                    core.set_joint_zero_offsets(&offsets)
-                };
                 returned_offsets = Some(offsets);
-                MaintenanceResult::JointZeroOffsetsSet(res)
+                MaintenanceResult::JointZeroOffsetsSet(Err(
+                    "EXECUTOR_UNSUPPORTED: set_joint_zero_offsets is not available while the RT executor owns the arm; use the legacy owner",
+                ))
             }
-            MaintenanceOp::SetMotorZero { joint } => {
-                let res = if core.driver.is_some() {
-                    Err("UNSUPPORTED: motor zero requires legacy path when hardware driver is attached".into())
-                } else if *core.safety.state() != SafetyState::Idle
-                    || core.is_torqued
-                    || core.disable_pending
-                {
-                    Err("Arm must be Idle with torque off to set motor zero".into())
-                } else {
-                    core.set_motor_zero(joint)
-                };
-                MaintenanceResult::MotorZeroSet(res)
-            }
-            MaintenanceOp::TakeBaselinePending { fresh_pending, clear_dirty } => {
+            MaintenanceOp::SetMotorZero { .. } => MaintenanceResult::MotorZeroSet(Err(
+                "EXECUTOR_UNSUPPORTED: set_motor_zero is not available while the RT executor owns the arm; use the legacy owner",
+            )),
+            MaintenanceOp::TakeBaselinePending { fresh_pending, mut fresh_samples, clear_dirty } => {
                 let moves = if core.gripper_baseline_pending.is_empty() {
                     returned_pending = Some(fresh_pending);
                     Vec::new()
                 } else {
                     std::mem::replace(&mut core.gripper_baseline_pending, fresh_pending)
                 };
+                // Replenish preallocated `MoveSamples` spares without RT allocation or deallocation.
+                while core.move_samples_spares.len() < core.move_samples_spares.capacity() {
+                    let Some(s) = fresh_samples.pop() else { break; };
+                    core.move_samples_spares.push(s);
+                }
+                returned_samples = Some(fresh_samples);
                 let tool = &core.config.active_tool;
                 let stroke = core
                     .config
@@ -2653,6 +3937,10 @@ impl ControlState {
                 core.gripper_baseline_dirty = true;
                 MaintenanceResult::BaselineDirtyMarked
             }
+            MaintenanceOp::Config(mut ex) => {
+                super::requests::config::handle_config_exchange(core, ctx, &mut ex);
+                MaintenanceResult::Config(ex)
+            }
             MaintenanceOp::ProbeOwnedPayload { payload } => {
                 returned_probe = Some(payload);
                 MaintenanceResult::ProbeReturned
@@ -2666,6 +3954,7 @@ impl ControlState {
             returned_probe,
             returned_driver_config_error,
             returned_pending,
+            returned_samples,
             returned_baseline,
         });
     }
@@ -2689,35 +3978,53 @@ impl ControlState {
 
     fn drain_maintenance_stopped(&mut self) {
         if let Some(reply) = self.pending_maint_reply.take() {
-            let returned_pending = match reply.result {
-                MaintenanceResult::BaselineTaken(taken) if !taken.moves.is_empty() => Some(taken.moves),
-                _ => reply.returned_pending,
+            let (result, returned_pending) = match reply.result {
+                MaintenanceResult::BaselineTaken(taken) if !taken.moves.is_empty() => {
+                    (MaintenanceResult::Stopped, Some(taken.moves))
+                }
+                MaintenanceResult::Config(ex) | MaintenanceResult::StoppedWithConfig(ex) => {
+                    (MaintenanceResult::StoppedWithConfig(ex), reply.returned_pending)
+                }
+                _ => (MaintenanceResult::Stopped, reply.returned_pending),
             };
             self.push_maint_reply_or_offload(MaintReply {
                 id: reply.id,
-                result: MaintenanceResult::Stopped,
+                result,
                 returned_offsets: reply.returned_offsets,
                 returned_probe: reply.returned_probe,
                 returned_driver_config_error: reply.returned_driver_config_error,
                 returned_pending,
+                returned_samples: reply.returned_samples,
                 returned_baseline: reply.returned_baseline,
             });
         }
         while let Ok(req) = self.maint_req_rx.pop() {
-            let (returned_offsets, returned_probe, returned_pending, returned_baseline) = match req.op {
-                MaintenanceOp::SetJointZeroOffsets { offsets } => (Some(offsets), None, None, None),
-                MaintenanceOp::ProbeOwnedPayload { payload } => (None, Some(payload), None, None),
-                MaintenanceOp::TakeBaselinePending { fresh_pending, .. } => (None, None, Some(fresh_pending), None),
-                MaintenanceOp::StoreBaseline { baseline, .. } => (None, None, None, Some(baseline)),
-                _ => (None, None, None, None),
+            let (result, returned_offsets, returned_probe, returned_pending, returned_samples, returned_baseline) = match req.op {
+                MaintenanceOp::SetJointZeroOffsets { offsets, .. } => {
+                    (MaintenanceResult::Stopped, Some(offsets), None, None, None, None)
+                }
+                MaintenanceOp::ProbeOwnedPayload { payload } => {
+                    (MaintenanceResult::Stopped, None, Some(payload), None, None, None)
+                }
+                MaintenanceOp::TakeBaselinePending { fresh_pending, fresh_samples, .. } => {
+                    (MaintenanceResult::Stopped, None, None, Some(fresh_pending), Some(fresh_samples), None)
+                }
+                MaintenanceOp::StoreBaseline { baseline, .. } => {
+                    (MaintenanceResult::Stopped, None, None, None, None, Some(baseline))
+                }
+                MaintenanceOp::Config(ex) => {
+                    (MaintenanceResult::StoppedWithConfig(ex), None, None, None, None, None)
+                }
+                _ => (MaintenanceResult::Stopped, None, None, None, None, None),
             };
             self.push_maint_reply_or_offload(MaintReply {
                 id: req.id,
-                result: MaintenanceResult::Stopped,
+                result,
                 returned_offsets,
                 returned_probe,
                 returned_driver_config_error: None,
                 returned_pending,
+                returned_samples,
                 returned_baseline,
             });
         }
@@ -2827,10 +4134,43 @@ impl ControlState {
                     _returned_warning: None,
                     _returned_probe: self.take_reply_probe(),
                 },
+                PersistCmd::VerifyAuthority {
+                    code_buf,
+                    msg_buf,
+                    ..
+                } => PersistReply::Verified {
+                    reservation: None,
+                    _returned_code: Some(code_buf),
+                    _returned_msg: Some(msg_buf),
+                    _returned_probe: self.take_reply_probe(),
+                },
+                PersistCmd::Persisted {
+                    code_buf,
+                    msg_buf,
+                    ..
+                } => PersistReply::Persisted {
+                    reservation: None,
+                    _returned_code: Some(code_buf),
+                    _returned_msg: Some(msg_buf),
+                    _returned_probe: self.take_reply_probe(),
+                },
+                PersistCmd::DirSyncFailed {
+                    warning,
+                    unused_policy,
+                    unused_jaw,
+                    msg_buf,
+                    ..
+                } => PersistReply::Done {
+                    _returned_policy: unused_policy,
+                    _returned_jaw: unused_jaw,
+                    _returned_code: None,
+                    _returned_msg: Some(msg_buf),
+                    _returned_warning: Some(warning),
+                    _returned_probe: self.take_reply_probe(),
+                },
                 PersistCmd::Activate {
                     new_policy,
                     new_jaw,
-                    warning,
                     code_buf,
                     msg_buf,
                     ..
@@ -2839,7 +4179,27 @@ impl ControlState {
                     _returned_jaw: new_jaw,
                     _returned_code: Some(code_buf),
                     _returned_msg: Some(msg_buf),
-                    _returned_warning: warning,
+                    _returned_warning: None,
+                    _returned_probe: self.take_reply_probe(),
+                },
+                PersistCmd::FinishReconcile {
+                    new_policy,
+                    new_jaw,
+                    ..
+                } => PersistReply::Done {
+                    _returned_policy: Some(new_policy),
+                    _returned_jaw: new_jaw,
+                    _returned_code: None,
+                    _returned_msg: None,
+                    _returned_warning: None,
+                    _returned_probe: self.take_reply_probe(),
+                },
+                PersistCmd::LatchConfigReconcileFault { .. } => PersistReply::Done {
+                    _returned_policy: None,
+                    _returned_jaw: None,
+                    _returned_code: None,
+                    _returned_msg: None,
+                    _returned_warning: None,
                     _returned_probe: self.take_reply_probe(),
                 },
             };
@@ -3062,162 +4422,97 @@ impl ControlState {
                 action_id,
                 base_revision,
                 lease_owner,
+                estop_epoch,
+                stop_gen,
+                deadline,
                 new_policy,
                 jaw_opening,
                 probe,
                 code_buf,
                 msg_buf,
             } => {
-                let now = ctx.now;
-                let still_persisting = core.zero_check_persisting == Some(action_id);
-                let action_running = core.last_action.as_ref().is_some_and(|a| a.id == action_id && a.is_running());
-                let lease_ok = match &lease_owner {
-                    None => true,
-                    Some((c, g)) => core.active_lease.as_ref().is_some_and(|l| {
-                        l.acquired_at.elapsed() < core.lease_timeout
-                            && l.generation == *g
-                            && crate::model::HolderLabel::new(&l.client_id).as_str() == c.as_str()
-                    }),
-                };
-                let rev_ok = core.gripper_calib_revision == base_revision;
-                let urgent_pending = core.estop_pending()
-                    || self.stop_requests.current() != self.stop_requests.applied();
-                let stopped = core.safety.state().is_stopped() || urgent_pending;
-
-                if !still_persisting || !action_running || !lease_ok || stopped {
-                    if core.zero_check_persisting == Some(action_id) {
-                        core.zero_check_persisting = None;
-                    }
-                    let (old_code, old_msg) = if action_running {
-                        let (code, msg) = if stopped {
-                            ("STOPPED", "Safety stop intervened before gripper calibration persisted")
-                        } else if !lease_ok {
-                            ("LEASE_LOST", "Control lease lost or expired before gripper calibration persisted")
-                        } else {
-                            ("CANCELLED", "Gripper zero check cancelled before calibration persisted")
-                        };
-                        core.finish_zero_check_action_in_place(
-                            action_id,
-                            "cancelled",
-                            code,
-                            msg,
-                            Some(code_buf),
-                            Some(msg_buf),
-                        )
-                    } else {
-                        (Some(code_buf), Some(msg_buf))
-                    };
-                    self.push_persist_reply_or_retain(
-                        PersistReply::Reserved {
-                            reservation: None,
-                            policy: Some(new_policy),
-                            returned_jaw: jaw_opening,
-                            _returned_code: old_code,
-                            _returned_msg: old_msg,
-                            _returned_probe: probe,
-                        },
-                        core,
-                    );
-                    return;
-                }
-                if !rev_ok {
-                    if core.zero_check_persisting == Some(action_id) {
-                        core.zero_check_persisting = None;
-                    }
-                    let (old_code, old_msg) = core.finish_zero_check_action_in_place(
-                        action_id,
-                        "failed",
-                        "POLICY_REVISION_MISMATCH",
-                        "Gripper calibration revision changed concurrently",
-                        Some(code_buf),
-                        Some(msg_buf),
-                    );
-                    self.push_persist_reply_or_retain(
-                        PersistReply::Reserved {
-                            reservation: None,
-                            policy: Some(new_policy),
-                            returned_jaw: jaw_opening,
-                            _returned_code: old_code,
-                            _returned_msg: old_msg,
-                            _returned_probe: probe,
-                        },
-                        core,
-                    );
-                    return;
-                }
-                if core.driver_config_error.is_some() {
-                    if core.zero_check_persisting == Some(action_id) {
-                        core.zero_check_persisting = None;
-                    }
-                    let (old_code, old_msg) = core.finish_zero_check_action_in_place(
-                        action_id,
-                        "failed",
-                        "INVALID_CALIBRATION",
-                        "Driver limit configuration error prevents gripper calibration",
-                        Some(code_buf),
-                        Some(msg_buf),
-                    );
-                    self.push_persist_reply_or_retain(
-                        PersistReply::Reserved {
-                            reservation: None,
-                            policy: Some(new_policy),
-                            returned_jaw: jaw_opening,
-                            _returned_code: old_code,
-                            _returned_msg: old_msg,
-                            _returned_probe: probe,
-                        },
-                        core,
-                    );
-                    return;
-                }
-                let auth = core.authority(ctx);
                 self.next_persist_req += 1;
-                let proposal = ConfigProposal {
-                    domain: ConfigDomain::GripperCalibration,
-                    expected_revision: base_revision,
-                    candidate: CandidateId(self.next_persist_req),
-                    stamp: Stamp {
-                        arm: ArmId::LOCAL,
-                        boot: ctx.boot,
-                        request: RequestId(self.next_persist_req),
-                        client: ClientId(0),
-                        client_seq: self.next_persist_req,
-                        authority: Authority { lease_generation: auth.lease_generation, ..auth },
-                        deadline: now + Duration::from_secs(5),
-                    },
-                };
-                match ConfigAuthority::reserve(core, &proposal, ctx) {
-                    Reserved::Granted(reservation) => {
+                let req_seq = self.next_persist_req;
+                match super::requests::config::zero_check_owner_reserve(
+                    core,
+                    ctx,
+                    action_id,
+                    base_revision,
+                    lease_owner,
+                    estop_epoch,
+                    stop_gen,
+                    deadline,
+                    &new_policy,
+                    req_seq,
+                    Some(code_buf),
+                    Some(msg_buf),
+                ) {
+                    Ok((reservation, proposal, auth, ret_code, ret_msg)) => {
                         self.persist_granted = Some((action_id, ConfigDomain::GripperCalibration));
                         self.push_persist_reply_or_retain(
                             PersistReply::Reserved {
-                                reservation: Some(reservation),
+                                reservation: Some((reservation, proposal, auth)),
                                 policy: Some(new_policy),
                                 returned_jaw: jaw_opening,
-                                _returned_code: Some(code_buf),
-                                _returned_msg: Some(msg_buf),
+                                _returned_code: ret_code,
+                                _returned_msg: ret_msg,
                                 _returned_probe: probe,
                             },
                             core,
                         );
                     }
-                    Reserved::Refused { code, .. } => {
-                        if core.zero_check_persisting == Some(action_id) {
-                            core.zero_check_persisting = None;
-                        }
-                        let (old_code, old_msg) = core.finish_zero_check_action_in_place(
-                            action_id,
-                            "failed",
-                            code,
-                            "Failed to reserve gripper calibration domain",
-                            Some(code_buf),
-                            Some(msg_buf),
-                        );
+                    Err((old_code, old_msg)) => {
                         self.push_persist_reply_or_retain(
                             PersistReply::Reserved {
                                 reservation: None,
                                 policy: Some(new_policy),
                                 returned_jaw: jaw_opening,
+                                _returned_code: old_code,
+                                _returned_msg: old_msg,
+                                _returned_probe: probe,
+                            },
+                            core,
+                        );
+                    }
+                }
+            }
+            PersistCmd::VerifyAuthority {
+                action_id,
+                reservation,
+                proposal,
+                auth,
+                base_revision,
+                code_buf,
+                msg_buf,
+            } => {
+                let probe = self.take_reply_probe();
+                match super::requests::config::zero_check_owner_verify_authority(
+                    core,
+                    ctx,
+                    action_id,
+                    reservation,
+                    &proposal,
+                    &auth,
+                    base_revision,
+                    Some(code_buf),
+                    Some(msg_buf),
+                ) {
+                    Ok((reservation, ret_code, ret_msg)) => {
+                        self.push_persist_reply_or_retain(
+                            PersistReply::Verified {
+                                reservation: Some(reservation),
+                                _returned_code: ret_code,
+                                _returned_msg: ret_msg,
+                                _returned_probe: probe,
+                            },
+                            core,
+                        );
+                    }
+                    Err((old_code, old_msg)) => {
+                        self.persist_granted = None;
+                        self.push_persist_reply_or_retain(
+                            PersistReply::Verified {
+                                reservation: None,
                                 _returned_code: old_code,
                                 _returned_msg: old_msg,
                                 _returned_probe: probe,
@@ -3247,142 +4542,210 @@ impl ControlState {
                     core,
                 );
             }
-            PersistCmd::Activate {
+            PersistCmd::Persisted {
                 action_id,
                 reservation,
-                base_revision,
-                lease_owner,
-                offset_rad,
-                new_policy,
-                new_jaw,
-                durability,
-                warning,
                 code_buf,
                 msg_buf,
             } => {
-                self.persist_granted = None;
                 let simulated_err = self
                     .hooks
                     .fail_persisted_once
                     .as_ref()
                     .is_some_and(|f| f.swap(false, Ordering::AcqRel));
-                let persisted_res = if simulated_err {
-                    Err("SIMULATED_PERSISTED_ERR")
-                } else {
-                    ConfigAuthority::persisted(core, &reservation, durability)
-                };
-                if persisted_res.is_err() {
-                    // Persistence #5: disk may already have been renamed — unconditionally force
-                    // Reconciling (inhibiting motion even if another domain occupied the slot).
-                    let active_rev = ConfigAuthority::revision(core, ConfigDomain::GripperCalibration);
-                    core.core.config_mut().force_reconcile(ConfigDomain::GripperCalibration, active_rev);
-                    if core.zero_check_persisting == Some(action_id) {
-                        core.zero_check_persisting = None;
+                let probe = self.take_reply_probe();
+                match super::requests::config::zero_check_owner_persisted(
+                    core,
+                    action_id,
+                    reservation,
+                    simulated_err,
+                    Some(code_buf),
+                    Some(msg_buf),
+                ) {
+                    Ok((reservation, ret_code, ret_msg)) => {
+                        self.push_persist_reply_or_retain(
+                            PersistReply::Persisted {
+                                reservation: Some(reservation),
+                                _returned_code: ret_code,
+                                _returned_msg: ret_msg,
+                                _returned_probe: probe,
+                            },
+                            core,
+                        );
                     }
-                    let (old_code, old_msg) = core.finish_zero_check_action_in_place(
+                    Err((old_code, old_msg)) => {
+                        self.persist_granted = None;
+                        self.push_persist_reply_or_retain(
+                            PersistReply::Persisted {
+                                reservation: None,
+                                _returned_code: old_code,
+                                _returned_msg: old_msg,
+                                _returned_probe: probe,
+                            },
+                            core,
+                        );
+                    }
+                }
+            }
+            PersistCmd::DirSyncFailed {
+                action_id,
+                reservation,
+                warning,
+                unused_policy,
+                unused_jaw,
+                msg_buf,
+            } => {
+                self.persist_granted = None;
+                let (old_msg, old_warn) =
+                    super::requests::config::zero_check_owner_reconcile_dir_sync_failed(
+                        core,
                         action_id,
-                        "failed",
-                        "PERSIST_FAILED",
-                        "Failed to record post-rename persistence state; reconciling required",
-                        Some(code_buf),
+                        reservation,
+                        warning,
                         Some(msg_buf),
                     );
-                    let probe = self.take_reply_probe();
-                    self.push_persist_reply_or_retain(
-                        PersistReply::Done {
-                            _returned_policy: Some(new_policy),
-                            _returned_jaw: new_jaw,
-                            _returned_code: old_code,
-                            _returned_msg: old_msg,
-                            _returned_warning: warning,
-                            _returned_probe: probe,
-                        },
-                        core,
-                    );
-                    return;
+                let probe = self.take_reply_probe();
+                self.push_persist_reply_or_retain(
+                    PersistReply::Done {
+                        _returned_policy: unused_policy,
+                        _returned_jaw: unused_jaw,
+                        _returned_code: None,
+                        _returned_msg: old_msg,
+                        _returned_warning: old_warn,
+                        _returned_probe: probe,
+                    },
+                    core,
+                );
+            }
+            PersistCmd::Activate {
+                action_id,
+                reservation,
+                proposal,
+                auth,
+                base_revision,
+                offset_rad,
+                new_policy,
+                new_jaw,
+                operator_revoked,
+                code_buf,
+                msg_buf,
+            } => {
+                self.persist_granted = None;
+                let probe = self.take_reply_probe();
+                match super::requests::config::zero_check_owner_activate(
+                    core,
+                    ctx,
+                    action_id,
+                    reservation,
+                    &proposal,
+                    &auth,
+                    base_revision,
+                    offset_rad,
+                    new_policy,
+                    new_jaw,
+                    operator_revoked,
+                    Some(code_buf),
+                    Some(msg_buf),
+                ) {
+                    Ok((old_policy, old_jaw, ret_code, ret_msg)) => {
+                        let activated_revision = core.gripper_calib_revision;
+                        self.push_persist_reply_or_retain(
+                            PersistReply::Activated {
+                                activated_revision,
+                                _returned_policy: old_policy,
+                                _returned_jaw: old_jaw,
+                                _returned_code: ret_code,
+                                _returned_msg: ret_msg,
+                                _returned_warning: None,
+                                _returned_probe: probe,
+                            },
+                            core,
+                        );
+                    }
+                    Err((ret_policy, ret_jaw, old_code, old_msg)) => {
+                        self.push_persist_reply_or_retain(
+                            PersistReply::Done {
+                                _returned_policy: ret_policy,
+                                _returned_jaw: ret_jaw,
+                                _returned_code: old_code,
+                                _returned_msg: old_msg,
+                                _returned_warning: None,
+                                _returned_probe: probe,
+                            },
+                            core,
+                        );
+                    }
                 }
-
-                let still_persisting = core.zero_check_persisting == Some(action_id);
-                let action_running = core.last_action.as_ref().is_some_and(|a| a.id == action_id && a.is_running());
-                let lease_ok = match &lease_owner {
-                    None => true,
-                    Some((c, g)) => core.active_lease.as_ref().is_some_and(|l| {
-                        l.acquired_at.elapsed() < core.lease_timeout
-                            && l.generation == *g
-                            && crate::model::HolderLabel::new(&l.client_id).as_str() == c.as_str()
-                    }),
-                };
-                let rev_ok = core.gripper_calib_revision == base_revision;
-                let urgent_pending = core.estop_pending()
-                    || self.stop_requests.current() != self.stop_requests.applied();
-                let stopped = core.safety.state().is_stopped() || urgent_pending;
-
-                if still_persisting && action_running && lease_ok && rev_ok && !stopped {
-                    let (old_policy, old_jaw) = core.swap_gripper_calibration_in_place(offset_rad, new_policy, new_jaw);
-                    if !matches!(ConfigAuthority::activate(core, reservation), Activated::Active { .. }) {
-                        let active_rev = ConfigAuthority::revision(core, ConfigDomain::GripperCalibration);
-                        core.core.config_mut().force_reconcile(ConfigDomain::GripperCalibration, active_rev);
+            }
+            PersistCmd::FinishReconcile {
+                proposal,
+                auth,
+                base_revision,
+                offset_rad,
+                new_policy,
+                new_jaw,
+                operator_revoked,
+            } => {
+                let probe = self.take_reply_probe();
+                match super::requests::config::zero_check_owner_finish_reconcile(
+                    core,
+                    ctx,
+                    &proposal,
+                    &auth,
+                    base_revision,
+                    offset_rad,
+                    new_policy,
+                    new_jaw,
+                    operator_revoked,
+                ) {
+                    Ok((old_policy, old_jaw)) => {
+                        let activated_revision = core.gripper_calib_revision;
+                        self.push_persist_reply_or_retain(
+                            PersistReply::Activated {
+                                activated_revision,
+                                _returned_policy: old_policy,
+                                _returned_jaw: old_jaw,
+                                _returned_code: None,
+                                _returned_msg: None,
+                                _returned_warning: None,
+                                _returned_probe: probe,
+                            },
+                            core,
+                        );
                     }
-                    if core.zero_check_persisting == Some(action_id) {
-                        core.zero_check_persisting = None;
+                    Err((_code, ret_policy, ret_jaw)) => {
+                        self.push_persist_reply_or_retain(
+                            PersistReply::Done {
+                                _returned_policy: ret_policy,
+                                _returned_jaw: ret_jaw,
+                                _returned_code: None,
+                                _returned_msg: None,
+                                _returned_warning: None,
+                                _returned_probe: probe,
+                            },
+                            core,
+                        );
                     }
-                    let unused_warning = core.complete_zero_check_action(action_id, durability, warning);
-                    // Return unused scratch strings + any displaced warning/policy/jaw off-thread.
-                    let probe = self.take_reply_probe();
-                    self.push_persist_reply_or_retain(
-                        PersistReply::Done {
-                            _returned_policy: old_policy,
-                            _returned_jaw: old_jaw,
-                            _returned_code: Some(code_buf),
-                            _returned_msg: Some(msg_buf),
-                            _returned_warning: unused_warning,
-                            _returned_probe: probe,
-                        },
-                        core,
-                    );
-                } else {
-                    // Post-rename revocation: keep live state/revision unchanged and enter Reconciling.
-                    let code = if stopped {
-                        "STOPPED"
-                    } else if !lease_ok {
-                        "LEASE_LOST"
-                    } else if !rev_ok {
-                        "POLICY_REVISION_MISMATCH"
-                    } else {
-                        "CANCELLED"
-                    };
-                    if !matches!(core.core.config_mut().activation_failed(reservation, code), Activated::Reconciling { .. }) {
-                        let active_rev = ConfigAuthority::revision(core, ConfigDomain::GripperCalibration);
-                        core.core.config_mut().force_reconcile(ConfigDomain::GripperCalibration, active_rev);
-                    }
-                    if core.zero_check_persisting == Some(action_id) {
-                        core.zero_check_persisting = None;
-                    }
-                    let (old_code, old_msg) = if action_running {
-                        core.finish_zero_check_action_in_place(
-                            action_id,
-                            "cancelled",
-                            code,
-                            "Gripper calibration revoked after disk rename; reconciliation required",
-                            Some(code_buf),
-                            Some(msg_buf),
-                        )
-                    } else {
-                        (Some(code_buf), Some(msg_buf))
-                    };
-                    let probe = self.take_reply_probe();
-                    self.push_persist_reply_or_retain(
-                        PersistReply::Done {
-                            _returned_policy: Some(new_policy),
-                            _returned_jaw: new_jaw,
-                            _returned_code: old_code,
-                            _returned_msg: old_msg,
-                            _returned_warning: warning,
-                            _returned_probe: probe,
-                        },
-                        core,
-                    );
                 }
+            }
+            PersistCmd::LatchConfigReconcileFault { message } => {
+                super::requests::config::install_latch_config_reconcile_fault(
+                    core,
+                    ConfigDomain::GripperCalibration,
+                    message,
+                );
+                let probe = self.take_reply_probe();
+                self.push_persist_reply_or_retain(
+                    PersistReply::Done {
+                        _returned_policy: None,
+                        _returned_jaw: None,
+                        _returned_code: None,
+                        _returned_msg: None,
+                        _returned_warning: None,
+                        _returned_probe: probe,
+                    },
+                    core,
+                );
             }
         }
     }
@@ -3394,6 +4757,7 @@ fn spawn_persist_worker(
     mut cmd_tx: Producer<PersistCmd>,
     rep_rx: Arc<Mutex<Consumer<PersistReply>>>,
     config_write_mutex: Arc<tokio::sync::Mutex<()>>,
+    published_config: Arc<super::requests::config::PublishedConfigHub>,
     persist_stop: Arc<AtomicBool>,
     control_exited: Arc<AtomicBool>,
     persist_worker_exited: Arc<AtomicBool>,
@@ -3412,6 +4776,7 @@ fn spawn_persist_worker(
     }
 
     thread::Builder::new().name("armd-persist".into()).spawn(move || {
+        let hub_for_refresh = Arc::clone(&hub);
         let _exit_guard = ExitFlag(persist_worker_exited, persist_exited_cv, hub);
         let push_cmd = |tx: &mut Producer<PersistCmd>, cmd: PersistCmd, stop: &AtomicBool, dead: &AtomicBool| -> bool {
             let mut pending = Some(cmd);
@@ -3462,6 +4827,7 @@ fn spawn_persist_worker(
                 }
             };
             let auth_ok = job
+                .ctx
                 .operator_auth
                 .as_ref()
                 .is_none_or(|(a, tok)| !a.is_enforced() || a.is_operator(tok.as_deref()));
@@ -3473,7 +4839,7 @@ fn spawn_persist_worker(
                         code: "OPERATOR_REQUIRED".into(),
                         message: "Operator session expired or locked before gripper calibration persisted".into(),
                         unused_policy: None,
-                        unused_jaw: job.jaw_opening,
+                        unused_jaw: job.ctx.jaw_opening,
                     },
                     &persist_stop,
                     &control_exited,
@@ -3481,14 +4847,14 @@ fn spawn_persist_worker(
                 let _ = wait_reply(&rep_rx, &persist_stop, &control_exited);
                 continue;
             }
-            // Validate & build candidate GripperPolicy completely off `armd-control`.
+            // Validate, build candidate GripperPolicy, and serialize JSON completely off `armd-control`.
             let candidate_policy = match SupervisorInner::validate_gripper_calibration_off_thread(
-                job.base_gripper_policy.as_ref(),
-                job.current_calib_jaw.as_ref(),
-                job.gripper_limit.as_ref(),
-                job.active_tool_is_stock,
+                job.ctx.base_gripper_policy.as_ref(),
+                job.ctx.jaw_opening.as_ref(),
+                job.ctx.gripper_limit.as_ref(),
+                job.ctx.active_tool_is_stock,
                 Some(job.offset_rad),
-                job.jaw_opening.as_ref(),
+                job.ctx.jaw_opening.as_ref(),
             ) {
                 Ok(p) => p,
                 Err(e) => {
@@ -3499,7 +4865,7 @@ fn spawn_persist_worker(
                             code: "INVALID_CALIBRATION".into(),
                             message: e,
                             unused_policy: None,
-                            unused_jaw: job.jaw_opening,
+                            unused_jaw: job.ctx.jaw_opening,
                         },
                         &persist_stop,
                         &control_exited,
@@ -3509,169 +4875,501 @@ fn spawn_persist_worker(
                     continue;
                 }
             };
-            let staged = match StagedWrite::stage(job.write.path.clone(), job.write.text.clone()) {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = push_cmd(
-                        &mut cmd_tx,
-                        PersistCmd::Fail {
-                            action_id: job.action_id,
-                            code: "PERSIST_FAILED".into(),
-                            message: format!("Failed to stage gripper calibration: {e}"),
-                            unused_policy: Some(candidate_policy),
-                            unused_jaw: job.jaw_opening,
-                        },
-                        &persist_stop,
-                        &control_exited,
-                    );
-                    let _ = wait_reply(&rep_rx, &persist_stop, &control_exited);
-                    continue;
-                }
+            let mut backend = ExecutorPersistBackend {
+                cmd_tx: &mut cmd_tx,
+                rep_rx: &rep_rx,
+                config_write_mutex: &config_write_mutex,
+                cw_guard: Some(_cw),
+                published_config: &published_config,
+                hub: &hub_for_refresh,
+                persist_stop: &persist_stop,
+                control_exited: &control_exited,
+                hooks: &hooks,
+                job,
+                candidate_policy: Some(candidate_policy),
+                new_policy: None,
+                new_jaw: None,
+                reservation: None,
+                proposal: None,
+                auth: None,
             };
-            let lease_owner_inline = job
-                .lease_owner
-                .as_ref()
-                .map(|(c, g)| (crate::model::HolderLabel::new(c), *g));
-            let payload_probe = hooks
-                .payload_drop_probe
-                .as_ref()
-                .and_then(|p| p.lock().ok().and_then(|mut g| g.take()));
-            if !push_cmd(
-                &mut cmd_tx,
-                PersistCmd::Reserve {
-                    action_id: job.action_id,
-                    base_revision: job.base_revision,
-                    lease_owner: lease_owner_inline,
-                    new_policy: candidate_policy,
-                    jaw_opening: job.jaw_opening,
-                    probe: payload_probe,
-                    code_buf: String::with_capacity(64),
-                    msg_buf: String::with_capacity(160),
-                },
-                &persist_stop,
-                &control_exited,
-            ) {
-                staged.abort();
-                break;
-            }
-            let Some(PersistReply::Reserved {
-                reservation,
-                policy,
-                returned_jaw,
-                _returned_code,
-                _returned_msg,
-                _returned_probe,
-            }) = wait_reply(&rep_rx, &persist_stop, &control_exited)
-            else {
-                staged.abort();
-                break;
-            };
-            drop(_returned_code);
-            drop(_returned_msg);
-            drop(_returned_probe);
-            let (reservation, new_policy, new_jaw) = match (reservation, policy) {
-                (Some(reservation), Some(new_policy)) => (reservation, new_policy, returned_jaw),
-                (_, returned_policy) => {
-                    drop(returned_policy);
-                    drop(returned_jaw);
-                    staged.abort();
-                    if hooks.exit_after_first_job { break; }
-                    continue;
-                }
-            };
-            if hooks.after_grant_before_rename.as_ref().is_some_and(|h| h()) {
-                // Simulated worker crash/disconnect before rename (reservation dropped with worker).
-                staged.abort();
-                break;
-            }
-            // Re-verify operator authorization immediately before rename (operator session may
-            // have expired or locked during staging or reservation wait).
-            let auth_still_ok = job
-                .operator_auth
-                .as_ref()
-                .is_none_or(|(a, tok)| !a.is_enforced() || a.is_operator(tok.as_deref()));
-            if !auth_still_ok {
-                staged.abort();
-                let _ = push_cmd(
-                    &mut cmd_tx,
-                    PersistCmd::Abort {
-                        action_id: job.action_id,
-                        reservation,
-                        code: "OPERATOR_REQUIRED".into(),
-                        message: "Operator session expired or locked before gripper calibration persisted".into(),
-                        unused_policy: Some(new_policy),
-                        unused_jaw: new_jaw,
-                    },
-                    &persist_stop,
-                    &control_exited,
-                );
-                if !hooks.leave_final_reply_queued {
-                    let _ = wait_reply(&rep_rx, &persist_stop, &control_exited);
-                }
-                if hooks.exit_after_first_job { break; }
-                continue;
-            }
-            let dir_sync = match staged.rename_only() {
-                Ok(ds) => ds,
-                Err(e) => {
-                    let _ = push_cmd(
-                        &mut cmd_tx,
-                        PersistCmd::Abort {
-                            action_id: job.action_id,
-                            reservation,
-                            code: "PERSIST_FAILED".into(),
-                            message: format!("Failed to rename gripper calibration: {e}"),
-                            unused_policy: Some(new_policy),
-                            unused_jaw: new_jaw,
-                        },
-                        &persist_stop,
-                        &control_exited,
-                    );
-                    if !hooks.leave_final_reply_queued {
-                        let _ = wait_reply(&rep_rx, &persist_stop, &control_exited);
-                    }
-                    if hooks.exit_after_first_job { break; }
-                    continue;
-                }
-            };
-            let outcome = match hooks.dir_sync_override.as_ref() {
-                Some(f) => dir_sync.sync_with(|dir| f(dir)),
-                None => dir_sync.sync_parent_dir(),
-            };
-            let (durability, warning) = match outcome {
-                PublishOutcome::Published => (Durability::Durable, None),
-                PublishOutcome::PublishedDurabilityUnconfirmed(w) => (Durability::DurableUnconfirmed, Some(w)),
-            };
-            if hooks.after_rename_before_activate.as_ref().is_some_and(|h| h()) {
-                // Simulated worker crash/disconnect after rename without pushing Activate.
-                break;
-            }
-            let _ = push_cmd(
-                &mut cmd_tx,
-                PersistCmd::Activate {
-                    action_id: job.action_id,
-                    reservation,
-                    base_revision: job.base_revision,
-                    lease_owner: lease_owner_inline,
-                    offset_rad: job.offset_rad,
-                    new_policy,
-                    new_jaw,
-                    durability,
-                    warning,
-                    code_buf: String::with_capacity(64),
-                    msg_buf: String::with_capacity(160),
-                },
-                &persist_stop,
-                &control_exited,
-            );
-            if !hooks.leave_final_reply_queued {
-                let _ = wait_reply(&rep_rx, &persist_stop, &control_exited);
-            }
-            if hooks.exit_after_first_job {
+            let res = super::requests::config::run_common_commit_sync(&mut backend);
+            if matches!(res, Err(super::requests::config::ZeroCheckCommitStop::WorkerDisconnected))
+                || hooks.exit_after_first_job
+            {
                 break;
             }
         }
     })
+}
+
+struct ExecutorPersistBackend<'a> {
+    cmd_tx: &'a mut Producer<PersistCmd>,
+    rep_rx: &'a Arc<Mutex<Consumer<PersistReply>>>,
+    config_write_mutex: &'a Arc<tokio::sync::Mutex<()>>,
+    cw_guard: Option<tokio::sync::MutexGuard<'a, ()>>,
+    published_config: &'a Arc<super::requests::config::PublishedConfigHub>,
+    hub: &'a Arc<StateHub>,
+    persist_stop: &'a Arc<AtomicBool>,
+    control_exited: &'a Arc<AtomicBool>,
+    hooks: &'a PersistTestHooks,
+    job: PendingZeroCheckPersist,
+    candidate_policy: Option<GripperPolicy>,
+    new_policy: Option<GripperPolicy>,
+    new_jaw: Option<JawOpening>,
+    reservation: Option<Reservation>,
+    proposal: Option<ConfigProposal>,
+    auth: Option<super::requests::config::ConfigAuthContext>,
+}
+
+impl ExecutorPersistBackend<'_> {
+    fn push_cmd(&mut self, cmd: PersistCmd) -> bool {
+        let mut pending = Some(cmd);
+        while let Some(c) = pending.take() {
+            if self.persist_stop.load(Ordering::Acquire)
+                || self.control_exited.load(Ordering::Acquire)
+                || self.cmd_tx.is_abandoned()
+            {
+                return false;
+            }
+            match self.cmd_tx.push(c) {
+                Ok(()) => return true,
+                Err(rtrb::PushError::Full(c)) => {
+                    pending = Some(c);
+                    thread::park_timeout(Duration::from_millis(1));
+                }
+            }
+        }
+        true
+    }
+
+    fn wait_reply(&self) -> Option<PersistReply> {
+        loop {
+            if let Ok(rep) = self.rep_rx.lock().unwrap_or_else(|e| e.into_inner()).pop() {
+                return Some(rep);
+            }
+            if self.persist_stop.load(Ordering::Acquire) || self.control_exited.load(Ordering::Acquire) {
+                return None;
+            }
+            thread::park_timeout(Duration::from_millis(1));
+        }
+    }
+
+    fn op_auth_ok(&self) -> bool {
+        self.job
+            .ctx
+            .operator_auth
+            .as_ref()
+            .is_none_or(|(a, tok)| !a.is_enforced() || a.is_operator(tok.as_deref()))
+    }
+}
+
+impl super::requests::config::CommonCommitWorker for ExecutorPersistBackend<'_> {
+    type Ok = ();
+    type Err = super::requests::config::ZeroCheckCommitStop;
+    const RUN_BLOCKING_ON_TOKIO: bool = false;
+
+    fn dir_sync_override(&self) -> Option<super::requests::config::DirSyncOverride> {
+        self.hooks.dir_sync_override.clone()
+    }
+
+    async fn reserve(&mut self) -> Result<(), Self::Err> {
+        use super::requests::config::ZeroCheckCommitStop;
+        let new_policy = self
+            .candidate_policy
+            .take()
+            .expect("candidate_policy validated before reserve");
+        let payload_probe = self
+            .hooks
+            .payload_drop_probe
+            .as_ref()
+            .and_then(|p| p.lock().ok().and_then(|mut g| g.take()));
+        if !self.push_cmd(PersistCmd::Reserve {
+            action_id: self.job.action_id,
+            base_revision: self.job.base_revision,
+            lease_owner: self.job.lease_owner,
+            estop_epoch: self.job.estop_epoch,
+            stop_gen: self.job.stop_gen,
+            deadline: self.job.deadline,
+            new_policy,
+            jaw_opening: self.job.ctx.jaw_opening.clone(),
+            probe: payload_probe,
+            code_buf: String::with_capacity(64),
+            msg_buf: String::with_capacity(160),
+        }) {
+            return Err(ZeroCheckCommitStop::WorkerDisconnected);
+        }
+        let Some(PersistReply::Reserved {
+            reservation,
+            policy,
+            returned_jaw,
+            _returned_code,
+            _returned_msg,
+            _returned_probe,
+        }) = self.wait_reply()
+        else {
+            return Err(ZeroCheckCommitStop::WorkerDisconnected);
+        };
+        drop(_returned_code);
+        drop(_returned_msg);
+        drop(_returned_probe);
+        match (reservation, policy) {
+            (Some((r, p, a)), Some(pol)) => {
+                self.reservation = Some(r);
+                self.proposal = Some(p);
+                self.auth = Some(a);
+                self.new_policy = Some(pol);
+                self.new_jaw = returned_jaw;
+                Ok(())
+            }
+            (_, returned_policy) => {
+                drop(returned_policy);
+                drop(returned_jaw);
+                Err(ZeroCheckCommitStop::Aborted)
+            }
+        }
+    }
+
+    async fn prepare_write_after_reserve(
+        &mut self,
+    ) -> Result<Option<crate::persist::PendingWrite>, Self::Err> {
+        Ok(Some(self.job.ctx.serialize_write(self.job.offset_rad)))
+    }
+
+    fn after_reserve_before_rename(&mut self) -> bool {
+        self.hooks
+            .after_grant_before_rename
+            .as_ref()
+            .is_some_and(|h| h())
+    }
+
+    async fn verify_authority_before_rename(&mut self) -> Result<(), Self::Err> {
+        use super::requests::config::ZeroCheckCommitStop;
+        if !self.op_auth_ok() {
+            if let Some(reservation) = self.reservation.take() {
+                let unused_policy = self.new_policy.take();
+                let unused_jaw = self.new_jaw.take();
+                let _ = self.push_cmd(PersistCmd::Abort {
+                    action_id: self.job.action_id,
+                    reservation,
+                    code: "OPERATOR_REQUIRED".into(),
+                    message: "Operator session expired or locked before gripper calibration persisted"
+                        .into(),
+                    unused_policy,
+                    unused_jaw,
+                });
+                if !self.hooks.leave_final_reply_queued {
+                    let _ = self.wait_reply();
+                }
+            }
+            return Err(ZeroCheckCommitStop::Aborted);
+        }
+        let reservation = self.reservation.take().expect("reservation held");
+        let proposal = self.proposal.expect("proposal held");
+        let auth = self.auth.expect("auth held");
+        if !self.push_cmd(PersistCmd::VerifyAuthority {
+            action_id: self.job.action_id,
+            reservation,
+            proposal,
+            auth,
+            base_revision: self.job.base_revision,
+            code_buf: String::with_capacity(64),
+            msg_buf: String::with_capacity(160),
+        }) {
+            return Err(ZeroCheckCommitStop::WorkerDisconnected);
+        }
+        match self.wait_reply() {
+            Some(PersistReply::Verified { reservation: Some(r), .. }) => {
+                self.reservation = Some(r);
+                Ok(())
+            }
+            Some(_) => {
+                drop(self.new_policy.take());
+                drop(self.new_jaw.take());
+                Err(ZeroCheckCommitStop::Aborted)
+            }
+            None => {
+                drop(self.new_policy.take());
+                drop(self.new_jaw.take());
+                Err(ZeroCheckCommitStop::WorkerDisconnected)
+            }
+        }
+    }
+
+    async fn mark_persisted(&mut self) -> Result<(), Self::Err> {
+        use super::requests::config::ZeroCheckCommitStop;
+        let reservation = self.reservation.take().expect("reservation held");
+        if !self.push_cmd(PersistCmd::Persisted {
+            action_id: self.job.action_id,
+            reservation,
+            code_buf: String::with_capacity(64),
+            msg_buf: String::with_capacity(160),
+        }) {
+            return Err(ZeroCheckCommitStop::WorkerDisconnected);
+        }
+        match self.wait_reply() {
+            Some(PersistReply::Persisted { reservation: Some(r), .. }) => {
+                self.reservation = Some(r);
+                Ok(())
+            }
+            Some(_) => {
+                drop(self.new_policy.take());
+                drop(self.new_jaw.take());
+                Err(ZeroCheckCommitStop::Aborted)
+            }
+            None => {
+                drop(self.new_policy.take());
+                drop(self.new_jaw.take());
+                Err(ZeroCheckCommitStop::WorkerDisconnected)
+            }
+        }
+    }
+
+    async fn reconcile_after_dir_sync_failure(
+        &mut self,
+        target_path: std::path::PathBuf,
+        warn: String,
+    ) -> Self::Err {
+        use super::requests::config::{
+            ZeroCheckCommitStop, DEFAULT_RECONCILE_MAX_ATTEMPTS, DEFAULT_RECONCILE_RETRY_INTERVAL,
+        };
+        if let Some(reservation) = self.reservation.take() {
+            let keep_for_retry = !self.hooks.leave_final_reply_queued && !self.hooks.exit_after_first_job;
+            let (unused_policy, unused_jaw) = if keep_for_retry {
+                (None, None)
+            } else {
+                (self.new_policy.take(), self.new_jaw.take())
+            };
+            let _ = self.push_cmd(PersistCmd::DirSyncFailed {
+                action_id: self.job.action_id,
+                reservation,
+                warning: warn.clone(),
+                unused_policy,
+                unused_jaw,
+                msg_buf: String::with_capacity(160),
+            });
+            if !self.hooks.leave_final_reply_queued {
+                let _ = self.wait_reply();
+            }
+            if keep_for_retry {
+                if let (Some(proposal), Some(auth), Some(new_policy)) = (
+                    self.proposal,
+                    self.auth,
+                    self.new_policy.take(),
+                ) {
+                    let new_jaw = self.new_jaw.take();
+                    let interval = self
+                        .hooks
+                        .reconcile_retry_interval
+                        .unwrap_or(DEFAULT_RECONCILE_RETRY_INTERVAL);
+                    let max_attempts = self
+                        .hooks
+                        .reconcile_max_attempts
+                        .unwrap_or(DEFAULT_RECONCILE_MAX_ATTEMPTS)
+                        .max(1);
+                    let file_name = target_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| target_path.display().to_string());
+                    let mut last_warn = warn;
+                    let mut policy_opt = Some(new_policy);
+                    let mut jaw_opt = new_jaw;
+                    // Release `config_write_mutex` during reconciliation retry backoff so
+                    // concurrent config writes immediately observe `HoldState::Reconciling`
+                    // (`CONFIG_BUSY`) rather than stalling behind the sleep.
+                    drop(self.cw_guard.take());
+                    for attempt in 1..=max_attempts {
+                        let wake_at = Instant::now() + interval;
+                        while Instant::now() < wake_at {
+                            if self.persist_stop.load(Ordering::Acquire)
+                                || self.control_exited.load(Ordering::Acquire)
+                            {
+                                return ZeroCheckCommitStop::WorkerDisconnected;
+                            }
+                            let rem = wake_at.saturating_duration_since(Instant::now());
+                            thread::park_timeout(rem.min(Duration::from_millis(5)));
+                        }
+                        if self.persist_stop.load(Ordering::Acquire)
+                            || self.control_exited.load(Ordering::Acquire)
+                        {
+                            return ZeroCheckCommitStop::WorkerDisconnected;
+                        }
+                        let pds = crate::persist::PendingDirSync::for_path(&target_path);
+                        let outcome = match self.hooks.dir_sync_override.as_ref() {
+                            Some(f) => pds.sync_with(|dir| f(dir)),
+                            None => pds.sync_parent_dir(),
+                        };
+                        match outcome {
+                            crate::persist::PublishOutcome::Published => {}
+                            crate::persist::PublishOutcome::PublishedDurabilityUnconfirmed(w) => {
+                                last_warn = w;
+                                tracing::warn!(
+                                    "Executor zero_check reconciliation retry {attempt}/{max_attempts} for {file_name} failed dir fsync: {last_warn}"
+                                );
+                                continue;
+                            }
+                        }
+                        let _cw_reconcile = loop {
+                            if self.persist_stop.load(Ordering::Acquire)
+                                || self.control_exited.load(Ordering::Acquire)
+                            {
+                                return ZeroCheckCommitStop::WorkerDisconnected;
+                            }
+                            match self.config_write_mutex.try_lock() {
+                                Ok(guard) => break guard,
+                                Err(_) => thread::park_timeout(Duration::from_millis(2)),
+                            }
+                        };
+                        let operator_revoked = !self.op_auth_ok();
+                        let Some(pol) = policy_opt.take() else {
+                            return ZeroCheckCommitStop::Aborted;
+                        };
+                        let pub_pol = pol.clone();
+                        let jaw = jaw_opt.take();
+                        let pub_jaw = jaw.clone();
+                        if !self.push_cmd(PersistCmd::FinishReconcile {
+                            proposal,
+                            auth,
+                            base_revision: self.job.base_revision,
+                            offset_rad: self.job.offset_rad,
+                            new_policy: pol,
+                            new_jaw: jaw,
+                            operator_revoked,
+                        }) {
+                            return ZeroCheckCommitStop::WorkerDisconnected;
+                        }
+                        match self.wait_reply() {
+                            Some(PersistReply::Activated { activated_revision, .. }) => {
+                                let prep_pol = pub_pol.clone();
+                                self.published_config.apply_zero_check_commit(
+                                    self.job.offset_rad,
+                                    pub_pol,
+                                    pub_jaw,
+                                    activated_revision,
+                                );
+                                if let Some(cur) = self.hub.prep_env() {
+                                    let mut next = (*cur).clone();
+                                    next.config.gripper_policy = Some(prep_pol);
+                                    next.gripper_calib_revision = activated_revision;
+                                    self.hub.update_prep_env(Arc::new(next));
+                                }
+                                tracing::info!(
+                                    "Executor zero_check reconciliation succeeded for {file_name} on retry {attempt}/{max_attempts}"
+                                );
+                                return ZeroCheckCommitStop::Aborted;
+                            }
+                            Some(_) => {
+                                let msg = format!(
+                                    "Configuration persistence failed for {file_name}: post-rename reconciliation rejected"
+                                );
+                                tracing::error!("{msg}");
+                                if self.push_cmd(PersistCmd::LatchConfigReconcileFault {
+                                    message: crate::safety::BoundedText::new(&msg),
+                                }) {
+                                    let _ = self.wait_reply();
+                                }
+                                return ZeroCheckCommitStop::Aborted;
+                            }
+                            None => return ZeroCheckCommitStop::WorkerDisconnected,
+                        }
+                    }
+                    let msg = format!(
+                        "Configuration persistence failed for {file_name} after {max_attempts} reconciliation attempts: {last_warn}"
+                    );
+                    tracing::error!("{msg}");
+                    if self.push_cmd(PersistCmd::LatchConfigReconcileFault {
+                        message: crate::safety::BoundedText::new(&msg),
+                    }) {
+                        let _ = self.wait_reply();
+                    }
+                }
+            }
+        }
+        ZeroCheckCommitStop::Aborted
+    }
+
+    fn after_rename_before_activate(&mut self) -> bool {
+        self.hooks
+            .after_rename_before_activate
+            .as_ref()
+            .is_some_and(|h| h())
+    }
+
+    async fn activate_and_publish(&mut self, _disk_published: bool) -> Result<Self::Ok, Self::Err> {
+        let operator_revoked = !self.op_auth_ok();
+        let reservation = self.reservation.take().expect("reservation held");
+        let proposal = self.proposal.expect("proposal held");
+        let auth = self.auth.expect("auth held");
+        let new_policy = self.new_policy.take().expect("new_policy held");
+        let new_jaw = self.new_jaw.take();
+        let pub_policy = new_policy.clone();
+        let pub_jaw = new_jaw.clone();
+        let _ = self.push_cmd(PersistCmd::Activate {
+            action_id: self.job.action_id,
+            reservation,
+            proposal,
+            auth,
+            base_revision: self.job.base_revision,
+            offset_rad: self.job.offset_rad,
+            new_policy,
+            new_jaw,
+            operator_revoked,
+            code_buf: String::with_capacity(64),
+            msg_buf: String::with_capacity(160),
+        });
+        if !self.hooks.leave_final_reply_queued {
+            if let Some(PersistReply::Activated { activated_revision, .. }) = self.wait_reply() {
+                let prep_pol = pub_policy.clone();
+                self.published_config.apply_zero_check_commit(
+                    self.job.offset_rad,
+                    pub_policy,
+                    pub_jaw,
+                    activated_revision,
+                );
+                if let Some(cur) = self.hub.prep_env() {
+                    let mut next = (*cur).clone();
+                    next.config.gripper_policy = Some(prep_pol);
+                    next.gripper_calib_revision = activated_revision;
+                    self.hub.update_prep_env(Arc::new(next));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn release_pre_rename(&mut self) {
+        // Owner already released the reservation inside VerifyAuthority / Abort if taken.
+        drop(self.new_policy.take());
+        drop(self.new_jaw.take());
+    }
+
+    async fn abort_pre_rename_fs(&mut self, phase: &'static str, err: String) -> Self::Err {
+        use super::requests::config::ZeroCheckCommitStop;
+        if let Some(reservation) = self.reservation.take() {
+            let unused_policy = self.new_policy.take();
+            let unused_jaw = self.new_jaw.take();
+            let _ = self.push_cmd(PersistCmd::Abort {
+                action_id: self.job.action_id,
+                reservation,
+                code: "PERSIST_FAILED".into(),
+                message: format!("Failed to {phase} gripper calibration: {err}"),
+                unused_policy,
+                unused_jaw,
+            });
+            if !self.hooks.leave_final_reply_queued {
+                let _ = self.wait_reply();
+            }
+        }
+        ZeroCheckCommitStop::Aborted
+    }
+
+    async fn reconcile_rename_join_error(&mut self, _err: String) -> Self::Err {
+        super::requests::config::ZeroCheckCommitStop::Aborted
+    }
+
+    fn worker_disconnected_err(&mut self) -> Self::Err {
+        super::requests::config::ZeroCheckCommitStop::WorkerDisconnected
+    }
 }
 
 /// RAII allocation-counting window for one whole release or one sub-release wake.
@@ -3740,14 +5438,18 @@ fn control_thread_main(
     reclaim_state_tx: Producer<Arc<SafetyState>>,
     reclaim_stop_tx: Producer<RetiredStopPayloads>,
     reclaim_traj_tx: Producer<crate::motion::ActiveTrajectory>,
+    reclaim_macro_tx: Producer<crate::macro_action::MacroRun>,
+    #[cfg(feature = "policy-runtime")]
+    reclaim_policy_tx: Producer<crate::policy_runtime::PolicyRun>,
     reclaim_return_rx: Consumer<Arc<SafetyState>>,
     safety_log_tx: Producer<SafetyLogEvent>,
+    shutdown_hold_error: Arc<Mutex<Option<SafetyLogEvent>>>,
     persist_job_tx: Producer<PendingZeroCheckPersist>,
     persist_cmd_rx: Consumer<PersistCmd>,
     persist_rep_tx: Producer<PersistReply>,
     offload_reclaim_tx: Producer<OffloadReclaim>,
     persist_wake: Thread,
-    e_stop_latched: Arc<AtomicBool>,
+    estop_state: Arc<crate::rt_core::urgent::EstopState>,
     hub: Arc<StateHub>,
     hooks: PersistTestHooks,
 ) {
@@ -3815,8 +5517,12 @@ fn control_thread_main(
         reclaim_state_tx,
         reclaim_stop_tx,
         reclaim_traj_tx,
+        reclaim_macro_tx,
+        #[cfg(feature = "policy-runtime")]
+        reclaim_policy_tx,
         reclaim_return_rx,
         safety_log_tx,
+        shutdown_hold_error,
         stats: Arc::clone(&stats),
         maint_req_rx,
         maint_rep_tx,
@@ -4031,8 +5737,10 @@ fn control_thread_main(
                         }
                         state.flush_pending_maint_reply(&core);
                         state.emit_estop_ack_if_advanced(&mut core);
-                        state.drain_retired_states(&mut core);
-                        if engine.take_urgent_replies_flushed() {
+                        state.drain_retired_states(&mut core, now_inst());
+                        if engine.take_urgent_replies_flushed()
+                            || engine.take_lifecycle_replies_flushed()
+                        {
                             hub.wake();
                         }
                         return None;
@@ -4040,7 +5748,8 @@ fn control_thread_main(
                     let (phases, body_end) = core.take_tick_phases();
                     let body_end = body_end.unwrap_or_else(now_inst);
                     core.defer_zero_check_persist = false;
-                    if let Some(job) = core.pending_zero_check_persist.take() {
+                    if let Some(mut job) = core.pending_zero_check_persist.take() {
+                        job.stop_gen = state.stop_requests.current();
                         match state.persist_job_tx.push(job) {
                             Ok(()) => {
                                 state.persist_wake.unpark();
@@ -4092,7 +5801,7 @@ fn control_thread_main(
                     // drain any E-stop acks / retired states produced during Steps 3-7.
                     state.flush_pending_maint_reply(&core);
                     state.emit_estop_ack_if_advanced(&mut core);
-                    state.drain_retired_states(&mut core);
+                    state.drain_retired_states(&mut core, now_inst());
                     let control_hz = core.config.control_frequency_hz;
                     let done = now_inst();
                     let allocs = crate::diagnostics::alloc::take();
@@ -4198,7 +5907,8 @@ fn control_thread_main(
                                 publish_gen + 1,
                                 &mut report,
                             );
-                            let urgent_flushed = engine.take_urgent_replies_flushed();
+                            let urgent_flushed = engine.take_urgent_replies_flushed()
+                                || engine.take_lifecycle_replies_flushed();
                             if published {
                                 publish_gen += 1;
                             }
@@ -4216,7 +5926,7 @@ fn control_thread_main(
                                 drop(v);
                             }
                             state.emit_estop_ack_if_advanced(&mut core);
-                            state.drain_retired_states(&mut core);
+                            state.drain_retired_states(&mut core, now_inst());
                             let _wake_tail_local =
                                 state.run_tail_alloc_probe(&state.hooks.inject_wake_tail_once);
                             report.poll.wake_before(release_deadline)
@@ -4266,6 +5976,7 @@ fn control_thread_main(
                 diag_dropped_delta = 1;
             }
             let _ = engine.take_urgent_replies_flushed();
+            let _ = engine.take_lifecycle_replies_flushed();
             hub.wake();
         }
         // Positive-control tail probe (strictly AFTER `diag_tx.push` and `hub.wake()`);
@@ -4326,7 +6037,7 @@ fn control_thread_main(
 
         if let Err(err) = step_res {
             panicked = true;
-            e_stop_latched.store(true, Ordering::SeqCst);
+            estop_state.request_and_latch();
             tracing::error!("RT executor thread panicked during release: {:?}", err);
             let disable_timeout = state
                 .hooks
@@ -4444,18 +6155,24 @@ fn control_thread_main(
     state.drain_maintenance_stopped();
     state.drain_persistence_stopped(&core);
     if !panicked {
-        if !core.pending_estop_acks.is_empty() || engine.has_applied_urgent_stop_pending() {
+        if !core.pending_estop_acks.is_empty()
+            || engine.has_applied_urgent_stop_pending()
+            || engine.has_pending_lifecycle_replies()
+        {
             publish_gen += 1;
             let ts = core.now_timestamp();
             core.publish(ts, publish_gen);
         }
         engine.drain_urgent_stops_stopped(true);
+        engine.drain_conn_lifecycle_stopped(true);
         state.emit_estop_ack_if_advanced(&mut core);
     } else {
         engine.drain_urgent_stops_stopped(false);
+        engine.drain_conn_lifecycle_stopped(false);
         state.retire_unpublished_estop_acks(&mut core);
     }
-    state.drain_estop_and_retired_stopped(&mut core);
+    state.drain_estop_and_retired_stopped(&mut core, now_inst());
+    state.flush_pending_hold_error_for_shutdown(&mut core);
     exited.store(true, Ordering::Release);
     *control_exited_cv.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
     control_exited_cv.1.notify_all();
@@ -5166,6 +6883,7 @@ mod tests {
                     returned_probe: None,
                     returned_driver_config_error: None,
                     returned_pending: None,
+                    returned_samples: None,
                     returned_baseline: None,
                 })
                 .unwrap();
@@ -5308,6 +7026,9 @@ mod tests {
         let (reclaim_state_tx, _) = RingBuffer::<Arc<SafetyState>>::new(2);
         let (reclaim_stop_tx, _) = RingBuffer::<RetiredStopPayloads>::new(2);
         let (reclaim_traj_tx, _) = RingBuffer::<crate::motion::ActiveTrajectory>::new(2);
+        let (reclaim_macro_tx, _) = RingBuffer::<crate::macro_action::MacroRun>::new(2);
+        #[cfg(feature = "policy-runtime")]
+        let (reclaim_policy_tx, _) = RingBuffer::<crate::policy_runtime::PolicyRun>::new(2);
         let (_, reclaim_return_rx) = RingBuffer::<Arc<SafetyState>>::new(2);
         let (safety_log_tx, _) = RingBuffer::<SafetyLogEvent>::new(2);
         let (persist_job_tx, _) = RingBuffer::<PendingZeroCheckPersist>::new(2);
@@ -5340,8 +7061,12 @@ mod tests {
             reclaim_state_tx,
             reclaim_stop_tx,
             reclaim_traj_tx,
+            reclaim_macro_tx,
+            #[cfg(feature = "policy-runtime")]
+            reclaim_policy_tx,
             reclaim_return_rx,
             safety_log_tx,
+            shutdown_hold_error: Arc::new(Mutex::new(None)),
             stats: Arc::new(ExecutorStats::default()),
             maint_req_rx,
             maint_rep_tx,
@@ -5399,6 +7124,245 @@ mod tests {
     }
 
     #[test]
+    fn drain_retired_states_conserves_hold_error_counts_and_retries_immediately_on_overflow() {
+        let mut core = SupervisorInner::new(crate::model::ArmConfig::rebot_dm());
+        core.lease_enabled = false;
+        {
+            let stamp = core.current_admission_stamp();
+            let admitted = core.check_admission(stamp).unwrap();
+            SupervisorInner::enable_torque(admitted).unwrap();
+        }
+        core.rt_executor_owned = true;
+        core.safety.set_off_thread_reclaim(true);
+
+        let (_, maint_req_rx) = RingBuffer::<MaintRequest>::new(2);
+        let (maint_rep_tx, _) = RingBuffer::<MaintReply>::new(2);
+        let (estop_ack_tx, _) = RingBuffer::<EstopAck>::new(2);
+        let (reclaim_state_tx, _) = RingBuffer::<Arc<SafetyState>>::new(2);
+        let (reclaim_stop_tx, _) = RingBuffer::<RetiredStopPayloads>::new(2);
+        let (reclaim_traj_tx, _) = RingBuffer::<crate::motion::ActiveTrajectory>::new(2);
+        let (reclaim_macro_tx, mut reclaim_macro_rx) = RingBuffer::<crate::macro_action::MacroRun>::new(2);
+        #[cfg(feature = "policy-runtime")]
+        let (reclaim_policy_tx, _) = RingBuffer::<crate::policy_runtime::PolicyRun>::new(2);
+        let (_, reclaim_return_rx) = RingBuffer::<Arc<SafetyState>>::new(2);
+        let (mut safety_log_tx, mut safety_log_rx) = RingBuffer::<SafetyLogEvent>::new(2);
+        let (persist_job_tx, _) = RingBuffer::<PendingZeroCheckPersist>::new(2);
+        let (_, persist_cmd_rx) = RingBuffer::<PersistCmd>::new(2);
+        let (persist_rep_tx, _) = RingBuffer::<PersistReply>::new(2);
+        let (offload_reclaim_tx, _) = RingBuffer::<OffloadReclaim>::new(OFFLOAD_RECLAIM_CAPACITY);
+
+        // Pre-fill downstream `safety_log_tx` (cap 2) with 2 unrelated events.
+        safety_log_tx.push(SafetyLogEvent::GravityCompRampComplete).unwrap();
+        safety_log_tx.push(SafetyLogEvent::GravityCompRampComplete).unwrap();
+
+        let (_, _, _, stop_requests) = ReleaseEngine::new(BootId(1), Capacities::default());
+        let mut state = ControlState {
+            shutdown_committed: false,
+            control_stop: Arc::new(AtomicBool::new(false)),
+            stop_requests,
+            estop_ack_tx,
+            estop_overflow_gen: Arc::new(AtomicU64::new(0)),
+            reclaim_state_tx,
+            reclaim_stop_tx,
+            reclaim_traj_tx,
+            reclaim_macro_tx,
+            #[cfg(feature = "policy-runtime")]
+            reclaim_policy_tx,
+            reclaim_return_rx,
+            safety_log_tx,
+            shutdown_hold_error: Arc::new(Mutex::new(None)),
+            stats: Arc::new(ExecutorStats::default()),
+            maint_req_rx,
+            maint_rep_tx,
+            pending_maint_reply: None,
+            persist_job_tx,
+            persist_cmd_rx,
+            persist_rep_tx,
+            pending_persist_reply: None,
+            retained_persist_job: None,
+            offload_reclaim_tx,
+            persist_wake: thread::current(),
+            persist_granted: None,
+            next_persist_req: 1,
+            disconnect_code_buf: None,
+            disconnect_msg_buf: None,
+            sat_msg_buf: None,
+            hooks: PersistTestHooks::default(),
+        };
+
+        let t0 = Instant::now();
+        // 1. Hold error at t0 queues into inline ring, then `drain_retired_states` hits full
+        //    downstream `safety_log_tx`: count conserved (1), NOT dropped, throttle rolled back!
+        core.log_stopped_hold_output_failed_throttled(t0, false, "tx err #1");
+        assert_eq!(core.hold_tx_error_suppressed(), 0);
+        assert_eq!(core.last_hold_tx_error_log, Some(t0));
+        state.drain_retired_states(&mut core, t0);
+        assert_eq!(core.hold_tx_error_suppressed(), 1, "rejected event must fold back into suppressed counter");
+        assert_eq!(core.safety_log_ring_dropped, 0, "hold error must not be dropped on downstream full");
+        assert_eq!(core.last_hold_tx_error_log, None, "throttle timestamp must roll back when sink rejects");
+
+        // 2. Consumer drains `safety_log_rx` just 20 ms later -> next hold error at t0 + 20 ms
+        //    MUST deliver immediately (NOT wait 1 s!) with exact `suppressed == 1` (1 + 1 = 2)!
+        assert!(matches!(safety_log_rx.pop(), Ok(SafetyLogEvent::GravityCompRampComplete)));
+        assert!(matches!(safety_log_rx.pop(), Ok(SafetyLogEvent::GravityCompRampComplete)));
+        let t1 = t0 + Duration::from_millis(20);
+        core.log_stopped_hold_output_failed_throttled(t1, false, "tx err #2");
+        state.drain_retired_states(&mut core, t1);
+        match safety_log_rx.pop().expect("immediate delivery after consumer drain") {
+            SafetyLogEvent::StoppedHoldOutputFailed { partial, suppressed, message, logged_at } => {
+                assert!(!partial);
+                assert_eq!(suppressed, 1, "must carry exact 1 prior rejected occurrence");
+                assert_eq!(message.as_str(), "tx err #2");
+                assert_eq!(logged_at, t1);
+            }
+            other => panic!("unexpected log event: {other:?}"),
+        }
+        assert_eq!(core.hold_tx_error_suppressed(), 0);
+        assert_eq!(core.last_hold_tx_error_delivered, Some(t1));
+
+        // 3. Subsequent error 20 ms later (within 1 s of delivered t1) IS throttled cleanly.
+        let t2 = t1 + Duration::from_millis(20);
+        core.log_stopped_hold_output_failed_throttled(t2, false, "tx err #3");
+        state.drain_retired_states(&mut core, t2);
+        assert!(safety_log_rx.pop().is_err(), "error within 1 s of delivered event must stay throttled");
+        assert_eq!(core.hold_tx_error_suppressed(), 1);
+
+        // 4. Delayed recovery (R2 Major 1): past 1 s (t3 = t1 + 1050 ms), downstream ring is full
+        //    -> rejected (total 2). Consumer drains much later at t4 = t3 + 1200 ms with NO
+        //    intervening hold error -> retry delivers with diagnostic `logged_at == t3`, AND
+        //    starts the new 1 s throttle window at acceptance time `t4` so a new error 20 ms later
+        //    at `t4 + 20 ms` IS throttled (no back-to-back burst!).
+        state.safety_log_tx.push(SafetyLogEvent::GravityCompRampComplete).unwrap();
+        state.safety_log_tx.push(SafetyLogEvent::GravityCompRampComplete).unwrap();
+        let t3 = t1 + Duration::from_millis(1050);
+        core.log_stopped_hold_output_failed_throttled(t3, true, "tx err #4");
+        state.drain_retired_states(&mut core, t3);
+        assert_eq!(core.hold_tx_error_suppressed(), 2);
+        assert_eq!(core.last_hold_tx_error_log, Some(t1), "rolled back to last delivered t1");
+        assert!(safety_log_rx.pop().is_ok());
+        assert!(safety_log_rx.pop().is_ok());
+        let t4 = t3 + Duration::from_millis(1200);
+        state.drain_retired_states(&mut core, t4);
+        match safety_log_rx.pop().expect("retained retry must flush as soon as downstream ring drains") {
+            SafetyLogEvent::StoppedHoldOutputFailed { partial, suppressed, message, logged_at } => {
+                assert!(partial);
+                assert_eq!(suppressed, 1, "1 emitted + 1 suppressed == 2 exact occurrences (t2 + t3)");
+                assert_eq!(message.as_str(), "tx err #4");
+                assert_eq!(logged_at, t3, "event retains original occurrence timestamp for diagnostics");
+            }
+            other => panic!("unexpected log event: {other:?}"),
+        }
+        assert_eq!(core.hold_tx_error_suppressed(), 0);
+        assert_eq!(core.last_hold_tx_error_log, Some(t4), "throttle window must start at retry acceptance t4");
+        assert_eq!(core.last_hold_tx_error_delivered, Some(t4));
+        // New error 20 ms after retry acceptance (`t4 + 20 ms`) MUST be throttled!
+        let t5 = t4 + Duration::from_millis(20);
+        core.log_stopped_hold_output_failed_throttled(t5, false, "tx err #5");
+        state.drain_retired_states(&mut core, t5);
+        assert!(safety_log_rx.pop().is_err(), "error 20 ms after delayed retry acceptance must be throttled");
+        assert_eq!(core.hold_tx_error_suppressed(), 1);
+
+        // 5. Production macro reclaim forwarding: fill downstream `reclaim_macro_tx` (cap 2) +
+        //    local `retired_macro_runs` (cap 8) -> admission backpressures -> drain downstream ->
+        //    forwarding frees local slots -> admission resumes!
+        for _ in 0..10 {
+            let ep = core.safety.epoch_id();
+            let stamp = core.current_admission_stamp();
+            let admitted = core.check_admission(stamp).unwrap();
+            let _ = SupervisorInner::begin_sequence_action(admitted, None, ep).expect("admit macro");
+            core.request_macro_stop();
+            state.drain_retired_states(&mut core, t5);
+        }
+        assert!(!core.can_admit_macro_run(), "2 in reclaim_macro_tx + 8 in retired_macro_runs == saturated");
+        let ep = core.safety.epoch_id();
+        {
+            let stamp = core.current_admission_stamp();
+            let admitted = core.check_admission(stamp).unwrap();
+            assert!(
+                SupervisorInner::begin_sequence_action(admitted, None, ep).is_err(),
+                "admission must backpressure when full"
+            );
+        }
+        // Off-thread consumer drains `reclaim_macro_rx` -> next drain forwards -> admission resumes!
+        assert!(reclaim_macro_rx.pop().is_ok());
+        assert!(reclaim_macro_rx.pop().is_ok());
+        state.drain_retired_states(&mut core, t5);
+        assert!(core.can_admit_macro_run());
+        {
+            let stamp = core.current_admission_stamp();
+            let admitted = core.check_admission(stamp).unwrap();
+            assert!(SupervisorInner::begin_sequence_action(admitted, None, ep).is_ok());
+        }
+
+        // 6. R3 Major 4 (single-sink throttle enforcement): even if an extra
+        //    `StoppedHoldOutputFailed` enters the inline ring within 1 s of the last accepted
+        //    delivery (`t4`), `forward_deferred_safety_logs` enforces `window_ready` at the single
+        //    push site so two events are NEVER accepted within one driver-clock second!
+        let t6 = t4 + Duration::from_millis(500);
+        let mut msg = crate::safety::BoundedText::<160>::empty();
+        msg.push_str("tx err #6");
+        assert!(core.safety.log_stopped_hold_output_failed(false, 0, msg, t6));
+        state.drain_retired_states(&mut core, t6);
+        assert!(
+            safety_log_rx.pop().is_err(),
+            "single-sink gate must never accept a second hold error within 1 s of delivered t4"
+        );
+        assert_eq!(core.hold_tx_error_suppressed(), 2, "t5 (1) + t6 (1) must be conserved");
+
+        // 7. R3 Major 5 (lossless shutdown when downstream `safety_log_tx` remains full):
+        //    fill `safety_log_tx` to capacity and advance past 1 s, run final drain + shutdown
+        //    handoff -> exact pending aggregate (2 occurrences => suppressed == 1) transfers to
+        //    `shutdown_hold_error` so `OffThreadSinks` emits it without losing any count!
+        state.safety_log_tx.push(SafetyLogEvent::GravityCompRampComplete).unwrap();
+        state.safety_log_tx.push(SafetyLogEvent::GravityCompRampComplete).unwrap();
+        let t7 = t4 + Duration::from_millis(1200);
+        state.drain_retired_states(&mut core, t7);
+        assert_eq!(core.hold_tx_error_suppressed(), 2, "full ring keeps exact count pending");
+        state.flush_pending_hold_error_for_shutdown(&mut core);
+        assert_eq!(core.hold_tx_error_suppressed(), 0);
+        let shutdown_ev = state
+            .shutdown_hold_error
+            .lock()
+            .unwrap()
+            .take()
+            .expect("shutdown handoff must capture pending hold error when ring is full");
+        match shutdown_ev {
+            SafetyLogEvent::StoppedHoldOutputFailed { partial, suppressed, message, logged_at } => {
+                assert!(!partial);
+                assert_eq!(suppressed, 1, "1 emitted + 1 suppressed == 2 exact pending occurrences");
+                assert_eq!(message.as_str(), "tx err #6");
+                assert_eq!(logged_at, t6);
+            }
+            other => panic!("unexpected shutdown handoff event: {other:?}"),
+        }
+
+        // 8. Round 4 non-blocking teardown handoff: when `shutdown_hold_error` is contended,
+        //    `flush_pending_hold_error_for_shutdown` MUST NOT block `armd-control`; it uses
+        //    `try_lock()` and records a counted drop on both `core.safety_log_ring_dropped` and
+        //    `state.stats.safety_log_dropped`.
+        let t8 = t7 + Duration::from_millis(1200);
+        let mut msg8 = crate::safety::BoundedText::<160>::empty();
+        msg8.push_str("tx err #8");
+        assert!(core.safety.log_stopped_hold_output_failed(false, 0, msg8, t8));
+        state.drain_retired_states(&mut core, t8);
+        assert_eq!(core.hold_tx_error_suppressed(), 1);
+        let ring_dropped_before = core.safety_log_ring_dropped;
+        let stats_dropped_before = state.stats.safety_log_dropped.load(Ordering::Relaxed);
+        {
+            let lock = Arc::clone(&state.shutdown_hold_error);
+            let _held = lock.lock().unwrap();
+            state.flush_pending_hold_error_for_shutdown(&mut core);
+        }
+        assert_eq!(core.hold_tx_error_suppressed(), 0);
+        assert_eq!(core.safety_log_ring_dropped, ring_dropped_before + 1);
+        assert_eq!(
+            state.stats.safety_log_dropped.load(Ordering::Relaxed),
+            stats_dropped_before + 1
+        );
+        assert!(state.shutdown_hold_error.lock().unwrap().is_none());
+    }
+
+    #[test]
     fn saturated_estop_and_reclaim_rings_retain_retired_fault_and_offload_on_drain_or_exit() {
         let mut core = SupervisorInner::new(crate::model::ArmConfig::rebot_dm());
         core.safety.set_off_thread_reclaim(true);
@@ -5418,6 +7382,11 @@ mod tests {
         let (reclaim_stop_tx, _reclaim_stop_rx) = RingBuffer::<RetiredStopPayloads>::new(2);
         let (reclaim_traj_tx, mut reclaim_traj_rx) =
             RingBuffer::<crate::motion::ActiveTrajectory>::new(2);
+        let (reclaim_macro_tx, _reclaim_macro_rx) =
+            RingBuffer::<crate::macro_action::MacroRun>::new(2);
+        #[cfg(feature = "policy-runtime")]
+        let (reclaim_policy_tx, _reclaim_policy_rx) =
+            RingBuffer::<crate::policy_runtime::PolicyRun>::new(2);
         let (mut reclaim_return_tx, reclaim_return_rx) = RingBuffer::<Arc<SafetyState>>::new(2);
         let (safety_log_tx, _safety_log_rx) = RingBuffer::<SafetyLogEvent>::new(2);
         let (_, maint_req_rx) = RingBuffer::<MaintRequest>::new(2);
@@ -5449,8 +7418,12 @@ mod tests {
             reclaim_state_tx,
             reclaim_stop_tx,
             reclaim_traj_tx,
+            reclaim_macro_tx,
+            #[cfg(feature = "policy-runtime")]
+            reclaim_policy_tx,
             reclaim_return_rx,
             safety_log_tx,
+            shutdown_hold_error: Arc::new(Mutex::new(None)),
             stats: Arc::new(ExecutorStats::default()),
             maint_req_rx,
             maint_rep_tx,
@@ -5504,17 +7477,17 @@ mod tests {
         )));
         let rejected_ptr = Arc::as_ptr(&rejected_ret);
         reclaim_return_tx.push(rejected_ret).unwrap();
-        state.drain_retired_states(&mut core);
+        state.drain_retired_states(&mut core, Instant::now());
         assert_eq!(reclaim_return_tx.slots(), 1, "rejected return must stay queued while reclaim_state_tx is full");
 
         // Free 1 slot in `reclaim_state_rx`: `drain_retired_states` pops the rejected return and
         // forwards the exact same `Arc` into `reclaim_state_tx` (not dropped on RT).
         let _ = reclaim_state_rx.pop().unwrap();
-        state.drain_retired_states(&mut core);
+        state.drain_retired_states(&mut core, Instant::now());
         assert_eq!(reclaim_return_tx.slots(), 2, "rejected return popped once reclaim_state_tx had a free slot");
 
         // Clean-exit drain while both rings remain full moves fault_b into lock-free `offload_reclaim_tx`.
-        state.drain_estop_and_retired_stopped(&mut core);
+        state.drain_estop_and_retired_stopped(&mut core, Instant::now());
         assert!(core.pending_estop_acks.is_empty());
         assert!(weak_b.upgrade().is_some(), "fault_b must stay alive until off-thread drain");
 
@@ -5543,6 +7516,9 @@ mod tests {
         let (reclaim_state_tx, _) = RingBuffer::<Arc<SafetyState>>::new(2);
         let (reclaim_stop_tx, _) = RingBuffer::<RetiredStopPayloads>::new(2);
         let (reclaim_traj_tx, _) = RingBuffer::<crate::motion::ActiveTrajectory>::new(2);
+        let (reclaim_macro_tx, _) = RingBuffer::<crate::macro_action::MacroRun>::new(2);
+        #[cfg(feature = "policy-runtime")]
+        let (reclaim_policy_tx, _) = RingBuffer::<crate::policy_runtime::PolicyRun>::new(2);
         let (_reclaim_return_tx, reclaim_return_rx) = RingBuffer::<Arc<SafetyState>>::new(2);
         let (safety_log_tx, _safety_log_rx) = RingBuffer::<SafetyLogEvent>::new(2);
         let (persist_job_tx, _) = RingBuffer::<PendingZeroCheckPersist>::new(2);
@@ -5561,6 +7537,7 @@ mod tests {
                     returned_probe: None,
                     returned_driver_config_error: None,
                     returned_pending: None,
+                    returned_samples: None,
                     returned_baseline: None,
                 })
                 .unwrap();
@@ -5591,6 +7568,9 @@ mod tests {
             action_id: 1,
             base_revision: 0,
             lease_owner: None,
+            estop_epoch: 1,
+            stop_gen: 0,
+            deadline: Instant::now() + Duration::from_secs(5),
             new_policy: crate::model::GripperPolicy::rebot_dm(),
             jaw_opening: None,
             probe: Some(Box::new(FlagDrop(persist_probe_dropped.clone()))),
@@ -5609,8 +7589,12 @@ mod tests {
             reclaim_state_tx,
             reclaim_stop_tx,
             reclaim_traj_tx,
+            reclaim_macro_tx,
+            #[cfg(feature = "policy-runtime")]
+            reclaim_policy_tx,
             reclaim_return_rx,
             safety_log_tx,
+            shutdown_hold_error: Arc::new(Mutex::new(None)),
             stats: Arc::new(ExecutorStats::default()),
             maint_req_rx,
             maint_rep_tx,
@@ -5643,18 +7627,23 @@ mod tests {
         let sample_job = PendingZeroCheckPersist {
             action_id: 7,
             offset_rad: 0.01,
-            jaw_opening: None,
             base_revision: 0,
             lease_owner: None,
-            operator_auth: None,
-            write: crate::persist::PendingWrite::new(
-                std::path::PathBuf::from("/tmp/armd-unused-test.json"),
-                "{}".to_string(),
-            ),
-            base_gripper_policy: Some(crate::model::GripperPolicy::rebot_dm()),
-            current_calib_jaw: None,
-            gripper_limit: None,
-            active_tool_is_stock: true,
+            estop_epoch: 1,
+            stop_gen: 0,
+            deadline: Instant::now() + Duration::from_secs(5),
+            ctx: Box::new(crate::supervisor::ZeroCheckPersistContext {
+                path: std::path::PathBuf::from("/tmp/armd-unused-test.json"),
+                jaw_opening: None,
+                stale: None,
+                tool_id: "stock".into(),
+                tool_config_digest: String::new(),
+                active_tool_is_stock: true,
+                base_gripper_policy: Some(crate::model::GripperPolicy::rebot_dm()),
+                gripper_limit: None,
+                operator_auth: None,
+                sat_msg_buf: String::with_capacity(64),
+            }),
         };
         state.reject_saturated_persist_job(
             &mut core,

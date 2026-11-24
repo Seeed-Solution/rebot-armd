@@ -175,10 +175,12 @@ pub fn build_pos_vel_frame(base_id: u16, motor_id: u16, pos: f32, vel: f32) -> C
 /// Unit: 0.01 rad/s (2000 corresponds to 20.00 rad/s).
 pub const DAMIAO_GRIPPER_POSFORCE_VEL_RAW: u16 = 2000;
 
-/// Build Position-Force mode CAN frame (CAN ID = base_id + motor_id, float32 pos, u16 vel_raw, u16 i_des)
+/// Encode the 8-byte Damiao Position-Force payload (`float32 pos, u16 vel_raw, u16 i_des`).
 ///
 /// `vel_raw` is in units of 0.01 rad/s (e.g. `DAMIAO_GRIPPER_POSFORCE_VEL_RAW` = 2000 for 20.00 rad/s).
-pub fn build_pos_force_frame(base_id: u16, motor_id: u16, pos: f32, vel_raw: u16, i_des: u16) -> CanFrame {
+/// This is a pure byte encoder; constructing a `0x300 + motor_id` `CanFrame` is sealed to
+/// `crate::driver::pos_force_emitter` via [`build_pos_force_frame`].
+pub fn encode_pos_force_payload(pos: f32, vel_raw: u16, i_des: u16) -> [u8; 8] {
     let p_bytes = pos.to_le_bytes();
     let v_bytes = vel_raw.to_le_bytes();
     let i_bytes = i_des.to_le_bytes();
@@ -186,6 +188,23 @@ pub fn build_pos_force_frame(base_id: u16, motor_id: u16, pos: f32, vel_raw: u16
     data[0..4].copy_from_slice(&p_bytes);
     data[4..6].copy_from_slice(&v_bytes);
     data[6..8].copy_from_slice(&i_bytes);
+    data
+}
+
+/// Build Position-Force mode CAN frame (`CAN ID = base_id + motor_id`, `float32 pos, u16 vel_raw, u16 i_des`).
+///
+/// Sealed by the Rust type system to private `crate::driver::pos_force_emitter`: only that module
+/// can construct [`crate::driver::PosForceSendToken`], preventing any other module from building a
+/// `0x307` `CanFrame` at compile time.
+pub(crate) fn build_pos_force_frame(
+    _token: &crate::driver::PosForceSendToken,
+    base_id: u16,
+    motor_id: u16,
+    pos: f32,
+    vel_raw: u16,
+    i_des: u16,
+) -> CanFrame {
+    let data = encode_pos_force_payload(pos, vel_raw, i_des);
     CanFrame::new_standard(base_id + motor_id, &data).unwrap()
 }
 

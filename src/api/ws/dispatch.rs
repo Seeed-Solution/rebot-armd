@@ -113,6 +113,9 @@ pub(super) enum AuthRequirement {
     /// Always requires an operator session when operator auth is enforced.
     /// Optional label overrides the operation name in `ApiError::operator_required`; `None` uses `path`.
     Operator(Option<&'static str>),
+    /// Owner-side operator authorization policy evaluated live against a lock-free [`OperatorGrant`]
+    /// (shared across legacy lock and RT executor with zero heap allocation).
+    OwnerGrant(crate::rt_core::requests::lease::OwnerAuthPolicy),
     /// Conditional operator privilege evaluated under the supervisor write lock by a family predicate.
     Conditional(fn(&WsAuth, &mut SupervisorInner, &str, &Value, u64) -> Option<ApiError>),
     /// Conditional operator privilege evaluated pre-lock for lease-free commands.
@@ -122,6 +125,18 @@ pub(super) enum AuthRequirement {
 }
 
 impl AuthRequirement {
+    /// Converts a table-declared auth policy into the zero-alloc owner-side policy used by
+    /// `DispatchHandler::CommandAsync` handlers across legacy and RT executor owners.
+    pub(super) fn owner_auth_policy(self) -> Option<crate::rt_core::requests::lease::OwnerAuthPolicy> {
+        use crate::rt_core::requests::lease::OwnerAuthPolicy;
+        match self {
+            Self::None => Some(OwnerAuthPolicy::None),
+            Self::Operator(label) => Some(OwnerAuthPolicy::Operator(label)),
+            Self::OwnerGrant(policy) => Some(policy),
+            Self::Conditional(_) | Self::ConditionalLeaseFree(_) | Self::InHandler => None,
+        }
+    }
+
     /// Enforce operator privilege for an owner-locked command row directly from the table entry.
     pub(super) fn check_owner(
         self,
@@ -138,6 +153,29 @@ impl AuthRequirement {
                     None
                 } else {
                     Some(ApiError::operator_required(label.unwrap_or(path)))
+                }
+            }
+            Self::OwnerGrant(policy) => {
+                use crate::rt_core::requests::lease::{evaluate_owner_auth_policy, OwnerAuthError};
+                match evaluate_owner_auth_policy(
+                    policy,
+                    ws_auth.operator_grant(),
+                    inner,
+                    epoch,
+                    std::time::Instant::now(),
+                    "/api/v1/safety/clear_fault",
+                ) {
+                    Ok(()) => None,
+                    Err(OwnerAuthError::EpochMismatch { expected, received }) => Some(
+                        crate::supervisor::ArmError::Safety(crate::safety::SafetyError::EpochMismatch {
+                            expected,
+                            received,
+                        })
+                        .into(),
+                    ),
+                    Err(OwnerAuthError::OperatorRequired { operation }) => {
+                        Some(ApiError::operator_required(operation))
+                    }
                 }
             }
             Self::Conditional(pred) => pred(ws_auth, inner, path, body, epoch),
@@ -162,7 +200,7 @@ impl AuthRequirement {
                 }
             }
             Self::ConditionalLeaseFree(pred) => pred(ws_auth, path, body),
-            Self::Conditional(_) => {
+            Self::Conditional(_) | Self::OwnerGrant(_) => {
                 unreachable!("lease-free row cannot use an owner-locked auth predicate")
             }
         }
@@ -235,11 +273,6 @@ pub(super) struct OwnerDispatchCtx<'a> {
     pub(super) value: &'a Value,
     pub(super) epoch: u64,
     pub(super) local_generation: u64,
-    pub(super) recv_conn_id: u64,
-    pub(super) recv_connection: &'a str,
-    pub(super) recv_generation: &'a AtomicU64,
-    pub(super) recv_client_label: &'a Mutex<Option<String>>,
-    pub(super) worker_closing: &'a AtomicBool,
     pub(super) ws_auth: &'a WsAuth,
     pub(super) recv_supervisor: &'a Arc<ArmSupervisor>,
     pub(super) recv_deps: &'a crate::grasp::GraspDeps,
@@ -247,11 +280,51 @@ pub(super) struct OwnerDispatchCtx<'a> {
     #[cfg(feature = "policy-runtime")]
     pub(super) pending_policy_loads: &'a AtomicUsize,
     pub(super) last_sequence: &'a mut Option<u64>,
-    pub(super) evicted_notify: &'a mut Option<(String, u64)>,
     pub(super) action_pending: &'a mut actions::ActionPending,
-    pub(super) pending_config_write: &'a mut Option<(Value, config::PreparedConfigWrite, u64, u64)>,
+    pub(super) pending_config_write: &'a mut Option<config::PendingConfigJob>,
     pub(super) pending_calibration: &'a mut Option<(Value, calibration::CalibJob, u64, u64, bool)>,
 }
+
+/// Boxed future returned by the table-bound unified heartbeat handler.
+pub(super) type HeartbeatFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Option<Value>> + Send + 'a>>;
+
+/// Arguments passed to unified async session handlers (`acquire_lease`, `release_lease`).
+pub(super) struct SessionDispatchCtx<'a> {
+    pub(super) supervisor: &'a ArmSupervisor,
+    pub(super) value: &'a Value,
+    pub(super) conn_handle: crate::rt_core::requests::lease::ConnectionHandle,
+    pub(super) recv_generation: &'a AtomicU64,
+    pub(super) recv_client_label: &'a Mutex<Option<String>>,
+    pub(super) worker_closing: &'a AtomicBool,
+    pub(super) ws_auth: &'a WsAuth,
+    pub(super) last_sequence: &'a mut Option<u64>,
+}
+
+/// Boxed future returned by table-bound unified async session handlers (`acquire_lease`, `release_lease`).
+pub(super) type SessionFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = (Option<Value>, Option<(String, u64)>)> + Send + 'a>,
+>;
+
+/// Arguments passed to unified async command handlers (`/api/v1/torque`, `/api/v1/arm`,
+/// `/api/v1/safety/clear_fault`) routed through the active owner (legacy or RT executor).
+///
+/// Both `local_generation` (from `entry.lease`) and `auth_policy` (from `entry.auth`) are enforced
+/// and supplied directly by the dispatcher from the [`DispatchEntry`] row.
+pub(super) struct CommandAsyncCtx<'a> {
+    pub(super) supervisor: &'a ArmSupervisor,
+    pub(super) value: &'a Value,
+    pub(super) stamp: AdmissionStamp,
+    pub(super) conn_handle: crate::rt_core::requests::lease::ConnectionHandle,
+    pub(super) local_generation: u64,
+    pub(super) auth_policy: crate::rt_core::requests::lease::OwnerAuthPolicy,
+    pub(super) operator: crate::auth::OperatorGrant,
+    pub(super) last_ordinary_request: &'a mut Option<u64>,
+}
+
+/// Boxed future returned by table-bound unified async command handlers.
+pub(super) type CommandAsyncFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Value> + Send + 'a>>;
 
 /// Concrete executable handler binding stored in each [`DispatchEntry`].
 #[derive(Clone, Copy)]
@@ -262,16 +335,21 @@ pub(super) enum DispatchHandler {
     UrgentStop(fn(&mut UrgentStopCtx<'_>) -> bool),
     /// Dedicated off-reader auth frame processor (`auth`).
     Auth(fn(&WsAuth, &Value) -> Value),
-    /// Dedicated latest-wins heartbeat processor (`heartbeat`).
+    /// Dedicated latest-wins heartbeat processor (`heartbeat`), routed through the active owner.
     Heartbeat(
-        fn(
-            &mut SupervisorInner,
-            &Value,
-            &str,
-            &AtomicU64,
-            &Mutex<Option<String>>,
-        ) -> Option<Value>,
+        for<'a> fn(
+            &'a ArmSupervisor,
+            &'a Value,
+            crate::rt_core::requests::lease::ConnectionHandle,
+            &'a AtomicU64,
+            &'a Mutex<Option<String>>,
+        ) -> HeartbeatFuture<'a>,
     ),
+    /// Unified async session handler (`acquire_lease`, `release_lease`), routed through the active owner.
+    SessionAsync(for<'a> fn(SessionDispatchCtx<'a>) -> SessionFuture<'a>),
+    /// Unified async command handler (`/api/v1/torque`, `/api/v1/arm`, `/api/v1/safety/clear_fault`),
+    /// routed through the active owner (legacy or RT executor) with immediate wire reply.
+    CommandAsync(for<'a> fn(CommandAsyncCtx<'a>) -> CommandAsyncFuture<'a>),
     /// Pre-lock lease-free command handler (`depth_measure`, `teach`).
     LeaseFree(fn(LeaseFreeCtx<'_>)),
     /// Owner-locked handler executed under `supervisor.inner().write()`.
@@ -363,6 +441,31 @@ fn validate_entry(entry: &DispatchEntry) {
                 "{:?}",
                 entry.key
             );
+        }
+        DispatchHandler::SessionAsync(_) => {
+            assert_eq!(entry.admission, AdmissionClass::OrdinarySession, "{:?}", entry.key);
+            assert_eq!(entry.reply, ReplyPolicy::LeaseReply, "{:?}", entry.key);
+        }
+        DispatchHandler::CommandAsync(_) => {
+            assert!(
+                matches!(
+                    entry.admission,
+                    AdmissionClass::OrdinaryTorqueOrStopExempt | AdmissionClass::Ordinary
+                ),
+                "CommandAsync handler must use Ordinary/OrdinaryTorqueOrStopExempt admission: {:?}",
+                entry.key
+            );
+            assert!(
+                matches!(entry.lease, LeaseRequirement::Required | LeaseRequirement::None),
+                "CommandAsync handler must declare Required or None lease policy: {:?}",
+                entry.key
+            );
+            assert!(
+                entry.auth.owner_auth_policy().is_some(),
+                "CommandAsync handler must declare None, Operator, or OwnerGrant auth policy: {:?}",
+                entry.key
+            );
+            assert_eq!(entry.reply, ReplyPolicy::CommandImmediate, "{:?}", entry.key);
         }
         DispatchHandler::LeaseFree(_) => {
             assert_eq!(entry.admission, AdmissionClass::Ordinary, "{:?}", entry.key);

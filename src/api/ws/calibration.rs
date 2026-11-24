@@ -61,6 +61,25 @@ pub(super) const ENTRIES: &[DispatchEntry] = &[
     },
 ];
 
+/// Returns true if `path` is one of the WS calibration / motor-zero / joint-zero / MIT endpoints.
+pub(super) fn is_calibration_path(path: &str) -> bool {
+    ENTRIES.iter().any(|e| e.key.path == Some(path))
+}
+
+/// Fail-closed capability refusal for calibration, motor-zero, joint-zero, and MIT endpoints
+/// while the RT executor owns the arm (never touches disk or live state).
+pub(super) fn dispatch_executor_calibration_command(path: &str, value: &Value, epoch: u64) -> Value {
+    json!({
+        "type": "command_reject",
+        "request_id": value["request_id"],
+        "status": 409,
+        "code": "EXECUTOR_UNSUPPORTED",
+        "error": "EXECUTOR_UNSUPPORTED",
+        "message": format!("{path} is not available while the RT executor owns the arm; use the legacy owner"),
+        "epoch_id": epoch,
+    })
+}
+
 fn dispatch_calibration_entry(ctx: &mut OwnerDispatchCtx<'_>) -> Option<Value> {
     dispatch_calibration_command(
         ctx.inner,

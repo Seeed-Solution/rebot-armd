@@ -250,6 +250,21 @@ impl ConfigHold {
         Ok(())
     }
 
+    /// Upgrades a `PersistedAwaitingActivation` hold to `Durability::Durable` once parent-directory
+    /// fsync has completed before activation.
+    pub fn confirm_durable(&mut self, r: &Reservation) -> Result<(), &'static str> {
+        let h = self.mine(r).ok_or("NOT_HELD")?;
+        match h.state {
+            HoldState::PersistedAwaitingActivation { .. } => {
+                h.state = HoldState::PersistedAwaitingActivation {
+                    durability: Durability::Durable,
+                };
+                Ok(())
+            }
+            _ => Err("INVALID_STATE"),
+        }
+    }
+
     /// Ends the hold of an activated reservation; false when `r` does not hold it (or it is
     /// reconciling).
     pub fn activated(&mut self, r: &Reservation) -> bool {

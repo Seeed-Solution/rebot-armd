@@ -54,9 +54,22 @@ fn targets(j7: f32) -> Vec<JointTarget> {
 
 #[test]
 fn pos_force_frame_bytes() {
-    let f = damiao::build_pos_force_frame(damiao::POS_FORCE_BASE_ID, 7, 1.0, damiao::pos_force_vel_raw(0.30), 220);
-    assert_eq!(f.id, 0x307);
-    assert_eq!(f.data, [0x00, 0x00, 0x80, 0x3F, 0x1E, 0x00, 0xDC, 0x00]);
+    let payload = damiao::encode_pos_force_payload(1.0, damiao::pos_force_vel_raw(0.30), 220);
+    assert_eq!(payload, [0x00, 0x00, 0x80, 0x3F, 0x1E, 0x00, 0xDC, 0x00]);
+    // Verify the single emitter actually transmits CAN ID 0x307 with this exact payload layout.
+    let (mut d, bus, _) = rig(true);
+    bus.with(|s| s.motors[J7].q = -1.0);
+    d.read_joint_states().unwrap();
+    d.set_torque(true).expect("enable");
+    bus.clear_log();
+    let mut t = targets(1.0);
+    t[J7].velocity = Some(0.30);
+    d.begin_tx_tick();
+    d.write_joint_targets_bounded(&t).expect("write");
+    let j7 = j7_commands(&bus.tx_log());
+    assert_eq!(j7.len(), 1);
+    assert_eq!(j7[0].id, 0x307);
+    assert_eq!(j7[0].data, [0x00, 0x00, 0x80, 0x3F, 0x1E, 0x00, 0xDC, 0x00]);
     assert_eq!(damiao::pos_force_vel_raw(2.0), 200);
     assert_eq!(damiao::pos_force_vel_raw(-0.304), 30);
     assert_eq!(damiao::pos_force_vel_raw(0.306), 30, "must quantize downward so wire speed <= ceiling");
@@ -86,7 +99,7 @@ fn enable_writes_mode_4_reads_it_back_then_enables() {
     let hold_vel = u16::from_le_bytes([cmds[0].data[4], cmds[0].data[5]]);
     let hold_cur = u16::from_le_bytes([cmds[0].data[6], cmds[0].data[7]]);
     assert!((hold_pos - (-1.0)).abs() < 1e-3, "hold position {hold_pos}");
-    assert!(hold_vel <= damiao::pos_force_vel_raw(0.30), "hold velocity {hold_vel}");
+    assert_eq!(hold_vel, 0, "pre-enable hold must be zero-velocity Hold (vel_raw=0), got {hold_vel}");
     assert_eq!(hold_cur, RAW);
     assert_eq!(log.iter().filter(|f| f.id == 0x7FF && f.data[2] == damiao::REG_WRITE).count(), 1, "only J7's mode is written");
     assert_eq!(bus.with(|s| s.motors[J7].ctrl_mode()), damiao::CTRL_MODE_POS_FORCE);
@@ -134,11 +147,18 @@ fn enable_after_restart_with_j7_already_in_mode_4_emits_readback_hold_enable() {
     let hold_vel = u16::from_le_bytes([cmds[0].data[4], cmds[0].data[5]]);
     let hold_cur = u16::from_le_bytes([cmds[0].data[6], cmds[0].data[7]]);
     assert!((hold_pos - (-1.75)).abs() < 1e-3, "hold position {hold_pos}");
-    assert_eq!(hold_vel, 30, "pre-enable hold must quantize 0.306 downward to 30 (0.30 rad/s), got {hold_vel}");
+    assert_eq!(hold_vel, 0, "pre-enable hold must be zero-velocity Hold (vel_raw=0), got {hold_vel}");
     assert_eq!(hold_cur, RAW);
     let last_pf = bus.with(|s| s.motors[J7].last_pos_force).expect("motor received pre-enable hold");
-    assert!((last_pf.0 - (-1.75)).abs() < 1e-3 && last_pf.1 == 30 && last_pf.2 == RAW, "{last_pf:?}");
+    assert!((last_pf.0 - (-1.75)).abs() < 1e-3 && last_pf.1 == 0 && last_pf.2 == RAW, "{last_pf:?}");
     assert!(d.is_enabled() && d.motor_current_cap().unwrap().active);
+    // Subsequent closing target still quantizes 0.306 downward to 30 (0.30 rad/s).
+    bus.clear_log();
+    d.write_joint_targets(&targets(-1.0)).expect("closing target");
+    let close_cmds = j7_commands(&bus.tx_log());
+    assert_eq!(close_cmds.len(), 1);
+    let close_vel = u16::from_le_bytes([close_cmds[0].data[4], close_cmds[0].data[5]]);
+    assert_eq!(close_vel, 30, "closing target must quantize 0.306 downward to 30 (0.30 rad/s), got {close_vel}");
 
     // Without fresh J7 feedback after restart (mode already 4), enable must fail closed before sending a hold or enable.
     let clock = MockClock::new();
@@ -751,12 +771,35 @@ fn stale_j7_recovery_caps_speed_and_fails_closed_without_fresh_feedback() {
     assert!(j7_commands(&log).is_empty(), "emitted J7 motion frame without fresh feedback: {:?}", j7_commands(&log));
     assert!(log.iter().any(|f| f.id == 0x7FF && f.data[0] == 7 && f.data[2] == 0xCC), "expected 0xCC refresh: {log:?}");
 
-    // 3. While J7 feedback is stale (> 100 ms), write_joint_targets must refuse the batch
-    //    before sending any frame (no changed target reaches J7 during the outage).
+    // 3. While J7 feedback is stale (> 100 ms), unfenced write_joint_targets NEVER skips J7 and
+    //    NEVER sends the new target (-2.0): it sends the 0x307 FREEZE frame (pos = last fresh
+    //    measured J7 position -1.0, vel_raw = 0, same current cap), lets J1-J6 continue, emits
+    //    a J7 0xCC refresh, and reports Stale via take_last_pos_force_tx_status.
     bus.clear_log();
-    let stale_err = d.write_joint_targets(&targets(-2.0)).unwrap_err().to_string();
-    assert!(stale_err.contains("feedback stale"), "{stale_err}");
-    assert!(bus.tx_log().is_empty(), "frames sent during J7 stale outage: {:?}", bus.tx_log());
+    d.begin_tx_tick();
+    d.write_joint_targets(&targets(-2.0)).unwrap();
+    let stale_log = bus.tx_log();
+    let stale_j7 = j7_commands(&stale_log);
+    assert_eq!(stale_j7.len(), 1, "expected 1 0x307 freeze frame while stale: {stale_j7:?}");
+    assert_eq!(stale_j7[0].id, 0x307);
+    let freeze_pos = f32::from_le_bytes(stale_j7[0].data[0..4].try_into().unwrap());
+    let freeze_vel = u16::from_le_bytes([stale_j7[0].data[4], stale_j7[0].data[5]]);
+    let freeze_cur = u16::from_le_bytes([stale_j7[0].data[6], stale_j7[0].data[7]]);
+    assert!((freeze_pos - (-1.0)).abs() < 1e-3, "freeze must hold last fresh pos -1.0, got {freeze_pos}");
+    assert_eq!(freeze_vel, 0, "freeze frame must carry vel_raw == 0");
+    assert_eq!(freeze_cur, RAW, "freeze frame must preserve current cap");
+    assert!(
+        (1..=6u32).all(|id| stale_log.iter().any(|f| f.id == 0x100 + id)),
+        "expected J1-J6 commands to continue while J7 is stale: {stale_log:?}"
+    );
+    assert!(
+        stale_log.iter().any(|f| f.id == 0x7FF && f.data[0] == 7 && f.data[2] == 0xCC),
+        "expected J7 0xCC refresh during stale outage: {stale_log:?}"
+    );
+    assert!(
+        matches!(d.take_last_pos_force_tx_status(), armd::driver::PosForceTxStatus::Stale { joint: J7, .. }),
+        "expected Stale status after emitting J7 freeze frame"
+    );
 
     // 4. Fresh feedback returns with jaw physically opened to -2.5: ramping back toward -1.0 closes at <= close_speed;
     //    a non-finite J7 target refuses the entire batch before sending J1-J6; strictly opening allows opening speed.
@@ -822,20 +865,46 @@ fn pos_force_mid_batch_expiry_and_invalid_handover_fail_closed() {
     use armd::driver::JointMode;
 
     // 1. Mid-batch expiry: feedback is 99 ms old at batch entry, J1-J6 take 1 ms each ->
-    //    J7 is 105 ms old when its frame is built -> write_joint_targets returns Err and emits NO 0x307 frame.
+    //    J7 is 105 ms old when its frame is built -> unfenced write_joint_targets sends J1-J6,
+    //    emits a 0x307 FREEZE frame (pos = last fresh measured J7, vel_raw = 0, NOT -2.0!),
+    //    requests a J7 0xCC refresh, and reports Stale.
     let (mut d, bus, clock) = rig(true);
     d.set_torque(true).unwrap();
     d.read_joint_states().unwrap();
     d.read_joint_states().unwrap();
+    let last_fresh_j7 = bus.with(|s| s.motors[J7].q);
     clock.advance(Duration::from_millis(99));
     bus.with(|s| s.tx_step = Duration::from_millis(1));
     bus.clear_log();
-    let err = d.write_joint_targets(&targets(-2.0)).unwrap_err().to_string();
-    assert!(err.contains("feedback stale"), "{err}");
-    assert!(j7_commands(&bus.tx_log()).is_empty(), "emitted 0x307 after mid-batch expiry: {:?}", j7_commands(&bus.tx_log()));
+    d.begin_tx_tick();
+    d.write_joint_targets(&targets(-2.0)).unwrap();
+    let mid_log = bus.tx_log();
+    let mid_j7 = j7_commands(&mid_log);
+    assert_eq!(mid_j7.len(), 1, "expected 1 0x307 freeze frame after mid-batch expiry: {mid_j7:?}");
+    assert_eq!(mid_j7[0].id, 0x307);
+    let mid_pos = f32::from_le_bytes(mid_j7[0].data[0..4].try_into().unwrap());
+    let mid_vel = u16::from_le_bytes([mid_j7[0].data[4], mid_j7[0].data[5]]);
+    let mid_cur = u16::from_le_bytes([mid_j7[0].data[6], mid_j7[0].data[7]]);
+    assert!((mid_pos - last_fresh_j7).abs() < 1e-3, "mid-batch freeze pos={mid_pos} != {last_fresh_j7}");
+    assert_eq!(mid_vel, 0, "mid-batch freeze must carry vel_raw == 0");
+    assert_eq!(mid_cur, RAW);
+    assert!(
+        (1..=6u32).all(|id| mid_log.iter().any(|f| f.id == 0x100 + id)),
+        "expected J1-J6 to be sent before J7 expired: {mid_log:?}"
+    );
+    assert!(
+        mid_log.iter().any(|f| f.id == 0x7FF && f.data[0] == 7 && f.data[2] == 0xCC),
+        "expected J7 0xCC refresh after mid-batch expiry: {mid_log:?}"
+    );
+    assert!(
+        matches!(d.take_last_pos_force_tx_status(), armd::driver::PosForceTxStatus::Stale { joint: J7, .. }),
+        "expected Stale status after mid-batch expiry"
+    );
 
     // 2. WouldBlock stall crossing 100 ms: single-joint pos-force driver at 99 ms tries once,
-    //    stall advances clock to 101 ms -> retry re-checks freshness and fails closed without a 2nd attempt.
+    //    stall advances clock to 101 ms -> backpressured pass stops without retrying the moving
+    //    target, reports Stale, and on the next tick sends priority 0xCC refresh AND a 0x301
+    //    FREEZE frame (pos = -1.0, vel_raw = 0, NEVER the new target -2.0!).
     let clock = MockClock::new();
     let one_limit = vec![b601_limits()[J7]];
     let bus = FakeBus::with_clock(&one_limit, clock.clone());
@@ -855,9 +924,32 @@ fn pos_force_mid_batch_expiry_and_invalid_handover_fail_closed() {
     clock.advance(Duration::from_millis(99));
     bus.with(|s| { s.tx_stall = true; s.stall_step = Duration::from_millis(2); });
     bus.clear_log();
-    let err = d.write_joint_targets(&[JointTarget::position(-2.0)]).unwrap_err().to_string();
-    assert!(err.contains("feedback stale before transmit"), "{err}");
-    assert_eq!(bus.tx_log().len(), 1, "retried transmit past freshness bound: {:?}", bus.tx_log());
+    d.begin_tx_tick();
+    let _ = d.write_joint_targets_bounded(&[JointTarget::position(-2.0)]).unwrap();
+    let stall_log = bus.tx_log();
+    let pf_attempts = stall_log.iter().filter(|f| f.id == 0x301).count();
+    assert_eq!(pf_attempts, 1, "retried pos-force transmit past freshness bound: {stall_log:?}");
+    assert!(
+        matches!(d.take_last_pos_force_tx_status(), armd::driver::PosForceTxStatus::Stale { joint: 0, .. }),
+        "expected Stale status after stall crossed 100 ms"
+    );
+    bus.with(|s| { s.tx_stall = false; });
+    bus.clear_log();
+    d.begin_tx_tick();
+    d.write_joint_targets(&[JointTarget::position(-2.0)]).unwrap();
+    let next_log = bus.tx_log();
+    let next_pf: Vec<_> = next_log.iter().copied().filter(|f| f.id == 0x301).collect();
+    assert_eq!(next_pf.len(), 1, "expected 1 0x301 freeze frame on next tick: {next_log:?}");
+    let fpos = f32::from_le_bytes(next_pf[0].data[0..4].try_into().unwrap());
+    let fvel = u16::from_le_bytes([next_pf[0].data[4], next_pf[0].data[5]]);
+    let fcur = u16::from_le_bytes([next_pf[0].data[6], next_pf[0].data[7]]);
+    assert!((fpos - (-1.0)).abs() < 1e-3, "expected freeze at last fresh -1.0 (not -2.0), got {fpos}");
+    assert_eq!(fvel, 0, "expected freeze vel_raw == 0");
+    assert_eq!(fcur, RAW);
+    assert!(
+        next_log.iter().any(|f| f.id == 0x7FF && f.data[0] == 1 && f.data[2] == 0xCC),
+        "expected priority 0xCC refresh on next tick after backpressured stall: {next_log:?}"
+    );
 
     // 3. Non-finite velocity (NaN / Inf) on an opening target refuses the entire batch before J1.
     let (mut d, bus, _) = rig(true);
@@ -2173,7 +2265,7 @@ fn enable_refresh_transmit_boundary_and_live_safety_veto() {
             let hold_pos = f32::from_le_bytes([hold_f.data[0], hold_f.data[1], hold_f.data[2], hold_f.data[3]]);
             let hold_vel = u16::from_le_bytes([hold_f.data[4], hold_f.data[5]]);
             assert!((hold_pos - (-1.2)).abs() < 1e-3, "expected newest validated hold position -1.2, got {hold_pos}");
-            assert!(hold_vel <= damiao::pos_force_vel_raw(0.30), "pre-enable hold exceeded close_speed_rad_s: vel_raw={hold_vel}");
+            assert_eq!(hold_vel, 0, "pre-enable hold must be zero-velocity Hold (vel_raw=0), got {hold_vel}");
         }
     }
 
@@ -2421,7 +2513,7 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
         inner_bus.with(|s| s.push_all_feedback());
         d.read_joint_states().unwrap();
         d.check_mapping_ranges();
-        let mut sup = SupervisorInner::new(cfg).with_driver(Box::new(d));
+        let mut sup = Box::new(SupervisorInner::new(cfg).with_driver(Box::new(d)));
         sup.lease_enabled = false;
         sup.tick(DT);
         { let __s = sup.current_admission_stamp(); sup.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
@@ -2609,8 +2701,15 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
         inner_lim.clear_log();
         clock_lim.advance(Duration::from_millis(20));
         sup_lim.tick(DT);
-        assert!(j7_commands(&inner_lim.tx_log()).is_empty(),
-            "sub-quantum J7 limit 0.005 was silently bumped and transmitted: {:?}", inner_lim.tx_log());
+        let lim_tx = inner_lim.tx_log();
+        let lim_arm: Vec<_> = lim_tx.iter().filter(|f| (0x101..=0x106).contains(&f.id)).collect();
+        assert!(lim_arm.is_empty(), "sub-quantum J7 limit 0.005 must not send arm motion frames: {lim_tx:?}");
+        let lim_j7 = j7_commands(&lim_tx);
+        assert_eq!(lim_j7.len(), 1, "expected 1 stationary vel_raw=0 hold frame from R1 tick epilogue: {lim_j7:?}");
+        let lim_pos = f32::from_le_bytes(lim_j7[0].data[0..4].try_into().unwrap());
+        let lim_vel = u16::from_le_bytes([lim_j7[0].data[4], lim_j7[0].data[5]]);
+        assert!((lim_pos - (-1.0)).abs() < 1e-3, "invalid target -0.5 must not reach wire: {lim_pos}");
+        assert_eq!(lim_vel, 0, "sub-quantum J7 limit 0.005 must not be bumped to vel_raw >= 1: {lim_j7:?}");
         assert!(sup_lim.safety.state().is_stopped(), "expected fault on unrepresentable stream ceiling");
     }
 
@@ -2767,15 +2866,25 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
         assert!(rec_15_raws.iter().all(|&r| r == 15),
             "autonomous recovery bypassed J7 ceiling 0.15: {rec_15_raws:?}");
 
-        // 7c. Unvalidated sub-quantum J7 ceiling (0.005) on a zero-velocity tick fails closed (0 frames).
+        // 7c. Unvalidated sub-quantum J7 ceiling (0.005) on a zero-velocity tick fails closed:
+        //     0 arm motion frames, latches fault, and the single J7 tick-epilogue emitter sends
+        //     only a stationary hold (vel_raw == 0 at measured -1.0; never bumping 0.005 to vel_raw >= 1).
         inner_low.with(|s| { s.motors[J7].mute_feedback = false; s.push_all_feedback(); });
         sup_low.tick(DT);
         sup_low.config.limits[J7].max_velocity = 0.005;
         inner_low.clear_log();
         clock_low.advance(Duration::from_millis(20));
         sup_low.tick(DT);
-        assert!(j7_commands(&inner_low.tx_log()).is_empty(),
-            "zero-velocity tick bypassed unrepresentable ceiling 0.005: {:?}", inner_low.tx_log());
+        let j7_7c = j7_commands(&inner_low.tx_log());
+        assert_eq!(j7_7c.len(), 1, "single J7 epilogue emitter must send 1 stationary hold: {:?}", inner_low.tx_log());
+        assert_eq!(
+            u16::from_le_bytes([j7_7c[0].data[4], j7_7c[0].data[5]]),
+            0,
+            "zero-velocity tick bypassed unrepresentable ceiling 0.005 (must hold at vel_raw=0): {:?}",
+            j7_7c[0]
+        );
+        let hold_p_7c = f32::from_le_bytes(j7_7c[0].data[0..4].try_into().unwrap());
+        assert!((hold_p_7c - (-1.0)).abs() < 1e-2, "hold pos {hold_p_7c} != measured -1.0");
         assert!(sup_low.safety.state().is_stopped());
     }
 
@@ -2791,7 +2900,7 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
             let sup = Arc::new(armd::supervisor::ArmSupervisor::new(ArmConfig::rebot_dm()));
             let (id, stamp) = {
                 let mut inner = sup.inner().write().await;
-                *inner = sup_inner;
+                *inner = *sup_inner;
                 let ep = inner.safety.epoch_id();
                 let stamp = inner.current_admission_stamp();
                 ({ let __s = stamp; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_sequence_action(__a, None, ep)) }.unwrap(), stamp)
@@ -2820,7 +2929,7 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
             let sup2 = Arc::new(armd::supervisor::ArmSupervisor::new(ArmConfig::rebot_dm()));
             let (id2, stamp2) = {
                 let mut inner = sup2.inner().write().await;
-                *inner = sup_inner2;
+                *inner = *sup_inner2;
                 let ep = inner.safety.epoch_id();
                 let stamp = inner.current_admission_stamp();
                 ({ let __s = stamp; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_sequence_action(__a, None, ep)) }.unwrap(), stamp)
@@ -2863,7 +2972,7 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
                 let sup3 = Arc::new(armd::supervisor::ArmSupervisor::new(ArmConfig::rebot_dm()));
                 let (id3, stamp3) = {
                     let mut inner = sup3.inner().write().await;
-                    *inner = sup_inner3;
+                    *inner = *sup_inner3;
                     let ep = inner.safety.epoch_id();
                     let stamp = inner.current_admission_stamp();
                     ({ let __s = stamp; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_sequence_action(__a, None, ep)) }.unwrap(), stamp)
@@ -2993,7 +3102,7 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
                         assert!(inner.active_trajectory.is_none());
                         assert_ne!(inner.macro_sub(id), Some(armd::macro_action::SubState::Running));
                     }
-                    *sup_b.inner().write().await = inner;
+                    *sup_b.inner().write().await = *inner;
                     (id, stamp)
                 };
                 let guard = sup_b.inner().write().await;
@@ -3988,6 +4097,549 @@ fn enable_refresh_waits_for_empty_queue_and_reports_queued_fault_or_motion_beyon
     }
 }
 
+/// Major 1 regression: driving the driver clock across 100 ms specifically between the entry
+/// freshness gate (`check_pos_force_freshness_for_tx`) and staging (`pending_target_cmds_checked`)
+/// MUST NOT abort the arm batch with `PosForceTargetUnavailable` in EITHER motion
+/// (`write_joint_targets_bounded`) or stopped-hold (`write_estop_hold_bounded`); it must skip
+/// only J7, send healthy J1–J6 frames, request a J7 `0xCC` refresh, and report `Stale`.
+#[test]
+fn pos_force_crossing_100ms_between_entry_and_staging_skips_j7_in_motion_and_hold() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Instant;
+    use armd::driver::{PosForceTxStatus, TxBatchOutcome};
+    use armd::transport::{CanTransport, DriverClock, TransportError};
+
+    struct LeapOnNthNowClock {
+        inner: MockClock,
+        armed: AtomicBool,
+        target_call: AtomicUsize,
+        calls: AtomicUsize,
+        jump: Duration,
+    }
+    impl DriverClock for LeapOnNthNowClock {
+        fn clock_id(&self) -> u64 {
+            self.inner.clock_id()
+        }
+        fn now(&self) -> Instant {
+            if self.armed.load(Ordering::SeqCst) {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if n == self.target_call.load(Ordering::SeqCst) {
+                    self.inner.advance(self.jump);
+                }
+            }
+            self.inner.now()
+        }
+        fn sleep(&self, dur: Duration) {
+            self.inner.sleep(dur);
+        }
+        fn yield_now(&self) {
+            self.inner.yield_now();
+        }
+    }
+
+    #[derive(Clone)]
+    struct LeapBus {
+        inner: FakeBus,
+        clock: Arc<LeapOnNthNowClock>,
+    }
+    impl CanTransport for LeapBus {
+        fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
+            self.inner.transmit(frame)
+        }
+        fn receive(&mut self) -> Result<CanFrame, TransportError> {
+            self.inner.receive()
+        }
+        fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<Instant>), TransportError> {
+            self.inner.receive_timestamped()
+        }
+        fn flush(&mut self) -> Result<(), TransportError> {
+            self.inner.flush()
+        }
+        fn flush_is_noop(&self) -> bool {
+            self.inner.flush_is_noop()
+        }
+        fn supports_nonblocking_rt(&self) -> bool {
+            self.inner.supports_nonblocking_rt()
+        }
+        fn supports_bounded_flush(&self) -> bool {
+            self.inner.supports_bounded_flush()
+        }
+        fn clock(&self) -> Option<Arc<dyn DriverClock>> {
+            Some(self.clock.clone())
+        }
+    }
+
+    for is_hold in [false, true] {
+        // Sweep the clock jump across every `now()` call from entry through staging & drain so
+        // crossing 100 ms between entry and staging (and mid-staging / mid-drain) is covered.
+        for jump_on_call in 1..=6usize {
+            let base_clock = MockClock::new();
+            let raw_bus = FakeBus::with_clock(&b601_limits(), base_clock.clone());
+            raw_bus.with(|s| {
+                for (i, m) in s.motors.iter_mut().enumerate() {
+                    m.q = 0.1 * i as f32;
+                }
+                s.motors[J7].q = -1.0;
+                s.immediate_replies = true;
+            });
+            let leap_clock = Arc::new(LeapOnNthNowClock {
+                inner: base_clock.clone(),
+                armed: AtomicBool::new(false),
+                target_call: AtomicUsize::new(jump_on_call),
+                calls: AtomicUsize::new(0),
+                jump: Duration::from_millis(5),
+            });
+            let bus = LeapBus { inner: raw_bus.clone(), clock: leap_clock.clone() };
+            let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+                .with_joint_limits(b601_limits())
+                .unwrap()
+                .with_gripper_pos_force(pf())
+                .unwrap();
+            d.read_joint_states().unwrap();
+            raw_bus.with(|s| s.push_all_feedback());
+            d.read_joint_states().unwrap();
+            d.check_mapping_ranges();
+            d.set_torque(true).expect("enable");
+
+            // Keep J1–J6 fresh (queue_bound <= 10 ms) while parking J7 at 98 ms (still <= 100 ms!).
+            raw_bus.with(|s| {
+                s.immediate_replies = false;
+                s.motors[J7].mute_feedback = true;
+            });
+            base_clock.advance(Duration::from_millis(88));
+            raw_bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+            d.read_joint_states().unwrap();
+            base_clock.advance(Duration::from_millis(10));
+            raw_bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+            d.read_joint_states().unwrap();
+            // Now J7 age = 98 ms (passes entry gate!), J1–J6 age = 0 ms (queue_bound = 10 ms).
+            assert!(d.pos_force_feedback_fresh(), "J7 must start fresh at 98 ms");
+
+            raw_bus.clear_log();
+            d.begin_tx_tick();
+            leap_clock.calls.store(0, Ordering::SeqCst);
+            leap_clock.armed.store(true, Ordering::SeqCst);
+            let ts = targets(-1.2);
+            let res = if is_hold {
+                d.write_estop_hold_bounded(&ts)
+            } else {
+                d.write_joint_targets_bounded(&ts)
+            };
+            leap_clock.armed.store(false, Ordering::SeqCst);
+            assert!(
+                leap_clock.calls.load(Ordering::SeqCst) >= jump_on_call,
+                "is_hold={is_hold} jump_on_call={jump_on_call}: jump must have fired"
+            );
+            assert_eq!(
+                res.unwrap_or_else(|e| panic!("is_hold={is_hold} jump={jump_on_call}: must skip J7 cleanly, not fail: {e:?}")),
+                TxBatchOutcome::Complete,
+                "is_hold={is_hold} jump={jump_on_call}: healthy arm batch must complete"
+            );
+            assert!(
+                matches!(d.take_last_pos_force_tx_status(), PosForceTxStatus::Stale { joint: J7, .. }),
+                "is_hold={is_hold} jump={jump_on_call}: expected PosForceTxStatus::Stale for J7"
+            );
+            let log = raw_bus.tx_log();
+            let j7_cmds = j7_commands(&log);
+            assert_eq!(
+                j7_cmds.len(),
+                1,
+                "is_hold={is_hold} jump={jump_on_call}: expected 1 0x307 freeze frame: {log:?}"
+            );
+            assert_eq!(j7_cmds[0].id, 0x307);
+            let fpos = f32::from_le_bytes(j7_cmds[0].data[0..4].try_into().unwrap());
+            let fvel = u16::from_le_bytes([j7_cmds[0].data[4], j7_cmds[0].data[5]]);
+            let fcur = u16::from_le_bytes([j7_cmds[0].data[6], j7_cmds[0].data[7]]);
+            assert!(
+                (fpos - (-1.0)).abs() < 1e-3,
+                "is_hold={is_hold} jump={jump_on_call}: freeze pos={fpos} must hold last fresh -1.0 (not -1.2)"
+            );
+            assert_eq!(fvel, 0, "is_hold={is_hold} jump={jump_on_call}: freeze vel_raw must be 0");
+            assert_eq!(fcur, RAW);
+            assert!(
+                log.iter().any(|f| f.id == 0x7FF && f.data[0] == 7 && f.data[2] == 0xCC),
+                "is_hold={is_hold} jump={jump_on_call}: expected J7 0xCC refresh: {log:?}"
+            );
+            for id in 1u32..=6 {
+                assert!(
+                    log.iter().any(|f| f.id == 0x100 + id),
+                    "is_hold={is_hold} jump={jump_on_call}: J{id} frame missing: {log:?}"
+                );
+            }
+        }
+    }
+}
+
+/// Blocker 2 driver unit regression: `pos_force_feedback_fresh()` resolves the configured J7
+/// independently of `pos_force_verified` or active TX mode (disabled/unverified, unknown mode,
+/// MIT mode) and enforces the inclusive `<= 100 ms` receive + queue-bound + finite-position check.
+#[test]
+fn pos_force_feedback_fresh_fail_closed_across_unverified_unknown_mode_and_100ms_boundary() {
+    let (mut d, bus, clock) = rig(true);
+    bus.with(|s| s.immediate_replies = true);
+    d.set_torque(true).expect("enable pos-force");
+
+    // 1. Inclusive 100 ms boundary: exact 100 ms -> true; 101 ms -> false.
+    bus.with(|s| s.push_all_feedback());
+    d.read_joint_states().unwrap();
+    d.read_joint_states().unwrap();
+    clock.advance(Duration::from_millis(100));
+    assert!(d.pos_force_feedback_fresh(), "exact 100 ms age must be fresh (inclusive)");
+    clock.advance(Duration::from_millis(1));
+    assert!(!d.pos_force_feedback_fresh(), "101 ms age must be stale");
+
+    // 2. Disabled / unverified mode (`set_torque(false)`): J7 aged 150 ms (still <= 250 ms
+    //    `is_feedback_valid`) MUST still report `pos_force_feedback_fresh() == false`.
+    bus.with(|s| s.push_all_feedback());
+    d.read_joint_states().unwrap();
+    d.set_torque(false).expect("disable torque");
+    bus.with(|s| s.motors[J7].mute_feedback = true);
+    clock.advance(Duration::from_millis(140));
+    bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+    d.read_joint_states().unwrap();
+    clock.advance(Duration::from_millis(10));
+    bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+    d.read_joint_states().unwrap();
+    assert!(d.is_feedback_valid(), "J7 at 150 ms is still within 250 ms general feedback validity");
+    assert!(
+        !d.pos_force_feedback_fresh(),
+        "disabled/unverified J7 at 150 ms must NOT bypass 100 ms freshness check"
+    );
+
+    // 3. Unknown J7 mode (`joint_modes[6] = None` after dropped CTRL_MODE write reply):
+    //    J7 aged 150 ms MUST still report `pos_force_feedback_fresh() == false`.
+    bus.with(|s| {
+        s.motors[J7].mute_feedback = false;
+        s.push_all_feedback();
+    });
+    d.read_joint_states().unwrap();
+    d.read_joint_states().unwrap();
+    d.set_torque(true).expect("re-enable");
+    bus.with(|s| s.motors[J7].no_write_ack = true);
+    let mut modes = vec![armd::driver::JointMode::Position; 7];
+    modes[J7] = armd::driver::JointMode::Mit;
+    let holds = targets(-1.0);
+    let _ = d.set_joint_modes(&modes, &holds);
+    bus.with(|s| {
+        s.motors[J7].no_write_ack = false;
+        s.motors[J7].mute_feedback = true;
+    });
+    assert!(d.joint_modes_uncertain(), "J7 mode must now be unknown");
+    clock.advance(Duration::from_millis(140));
+    bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+    d.read_joint_states().unwrap();
+    clock.advance(Duration::from_millis(10));
+    bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+    d.read_joint_states().unwrap();
+    assert!(d.is_feedback_valid());
+    assert!(
+        !d.pos_force_feedback_fresh(),
+        "unknown-mode J7 at 150 ms must NOT bypass 100 ms freshness check"
+    );
+    // Fresh J7 reply (<= 100 ms) restores freshness even while mode is unknown.
+    bus.with(|s| {
+        s.motors[J7].mute_feedback = false;
+        s.push_all_feedback();
+    });
+    d.read_joint_states().unwrap();
+    assert!(d.pos_force_feedback_fresh(), "fresh <= 100 ms J7 must satisfy pos_force_feedback_fresh");
+}
+
+/// R2 Blocker 1 regression:
+/// - A J7-only carried-over frame parked at exact 100 ms whose FIFO age also crosses `frame_max_age`
+///   (45 ms) MUST NOT be counted as FIFO `Expired` (`CAN_TX_STALLED`) even when the clock crosses
+///   100 ms on any `now()` call during preflight, mid-drain, or post-flush cleanup (shared single
+///   clock sample at each cleanup boundary).
+/// - Negative control: a carried-over J1–J6 frame aged past 45 ms STILL returns `TxBatchOutcome::Expired`.
+#[test]
+fn pos_force_carryover_j7_at_100ms_boundary_never_counted_as_fifo_expired() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Instant;
+    use armd::driver::{PosForceTxStatus, TxBatchOutcome, TxBudget};
+    use armd::transport::{CanTransport, DriverClock, TransportError};
+
+    struct LeapOnNthNowClock {
+        inner: MockClock,
+        armed: AtomicBool,
+        target_call: AtomicUsize,
+        calls: AtomicUsize,
+        jump: Duration,
+    }
+    impl DriverClock for LeapOnNthNowClock {
+        fn clock_id(&self) -> u64 {
+            self.inner.clock_id()
+        }
+        fn now(&self) -> Instant {
+            if self.armed.load(Ordering::SeqCst) {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if n == self.target_call.load(Ordering::SeqCst) {
+                    self.inner.advance(self.jump);
+                }
+            }
+            self.inner.now()
+        }
+        fn sleep(&self, dur: Duration) {
+            self.inner.sleep(dur);
+        }
+        fn yield_now(&self) {
+            self.inner.yield_now();
+        }
+    }
+
+    #[derive(Clone)]
+    struct LeapBus {
+        inner: FakeBus,
+        clock: Arc<LeapOnNthNowClock>,
+    }
+    impl CanTransport for LeapBus {
+        fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
+            self.inner.transmit(frame)
+        }
+        fn receive(&mut self) -> Result<CanFrame, TransportError> {
+            self.inner.receive()
+        }
+        fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<Instant>), TransportError> {
+            self.inner.receive_timestamped()
+        }
+        fn flush(&mut self) -> Result<(), TransportError> {
+            self.inner.flush()
+        }
+        fn flush_is_noop(&self) -> bool {
+            self.inner.flush_is_noop()
+        }
+        fn supports_nonblocking_rt(&self) -> bool {
+            self.inner.supports_nonblocking_rt()
+        }
+        fn supports_bounded_flush(&self) -> bool {
+            self.inner.supports_bounded_flush()
+        }
+        fn clock(&self) -> Option<Arc<dyn DriverClock>> {
+            Some(self.clock.clone())
+        }
+    }
+
+    // 1. J7-only carry-over parked at exact 100 ms (and queued_age = 44 ms), jumping +2 ms across
+    //    both 100 ms freshness and 45 ms FIFO expiry on EVERY `now()` call (1..=8): MUST NEVER
+    //    return `TxBatchOutcome::Expired`!
+    for jump_on_call in 1..=8usize {
+        let base_clock = MockClock::new();
+        let raw_bus = FakeBus::with_clock(&b601_limits(), base_clock.clone());
+        raw_bus.with(|s| {
+            for (i, m) in s.motors.iter_mut().enumerate() {
+                m.q = 0.1 * i as f32;
+            }
+            s.motors[J7].q = -1.0;
+            s.immediate_replies = true;
+        });
+        let leap_clock = Arc::new(LeapOnNthNowClock {
+            inner: base_clock.clone(),
+            armed: AtomicBool::new(false),
+            target_call: AtomicUsize::new(jump_on_call),
+            calls: AtomicUsize::new(0),
+            jump: Duration::from_millis(2),
+        });
+        let bus = LeapBus { inner: raw_bus.clone(), clock: leap_clock.clone() };
+        let b6 = TxBudget {
+            max_frames: 6,
+            max_duration: Duration::from_millis(10),
+            frame_max_age: Duration::from_millis(45),
+        };
+        let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(b601_limits())
+            .unwrap()
+            .with_gripper_pos_force(pf())
+            .unwrap()
+            .with_tx_budget(b6);
+        d.read_joint_states().unwrap();
+        raw_bus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+        d.check_mapping_ranges();
+        d.set_torque(true).expect("enable");
+        // Establish fresh empty-RX boundary + J1-J7 samples at t = 0 right after enable handshake.
+        d.read_joint_states().unwrap();
+        raw_bus.with(|s| {
+            s.immediate_replies = false;
+            s.push_all_feedback();
+        });
+        d.read_joint_states().unwrap();
+        raw_bus.with(|s| s.motors[J7].mute_feedback = true);
+
+        // Advance 56 ms (keeping J1-J6 fresh), then emit batch with budget=6 -> J1-J6 send, ONLY J7 deferred!
+        base_clock.advance(Duration::from_millis(56));
+        raw_bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+        d.read_joint_states().unwrap();
+        d.begin_tx_tick();
+        assert_eq!(
+            d.write_joint_targets_bounded(&targets(-1.1)).unwrap(),
+            TxBatchOutcome::Deferred { pending: 1 }
+        );
+        // Advance 44 ms more -> J7 feedback age = exact 100 ms, carried-over J7 queue age = 44 ms (< 45 ms).
+        base_clock.advance(Duration::from_millis(44));
+        raw_bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+        d.read_joint_states().unwrap();
+        assert!(d.pos_force_feedback_fresh(), "J7 starts at exact 100 ms");
+
+        raw_bus.clear_log();
+        d.begin_tx_tick();
+        leap_clock.calls.store(0, Ordering::SeqCst);
+        leap_clock.armed.store(true, Ordering::SeqCst);
+        let outcome = d
+            .write_joint_targets_bounded(&targets(-1.2))
+            .unwrap_or_else(|e| panic!("jump={jump_on_call}: unexpected error {e:?}"));
+        leap_clock.armed.store(false, Ordering::SeqCst);
+        assert!(
+            !matches!(outcome, TxBatchOutcome::Expired { .. }),
+            "jump={jump_on_call}: J7-only carry-over crossing 100 ms must NEVER return Expired, got {outcome:?}"
+        );
+        assert!(
+            matches!(d.take_last_pos_force_tx_status(), PosForceTxStatus::Stale { joint: J7, .. }),
+            "jump={jump_on_call}: expected Stale status for J7"
+        );
+        // Under `max_frames = 6`, budget reservation emits J7's freeze frame immediately (deferring
+        // 1 arm joint); if J7 itself was deferred on the first pass, draining completes it cleanly.
+        if matches!(outcome, TxBatchOutcome::Deferred { pending: 1 })
+            && j7_commands(&raw_bus.tx_log()).is_empty()
+        {
+            d.begin_tx_tick();
+            let drain = d.drain_pending_tx().unwrap();
+            assert_eq!(drain, TxBatchOutcome::Complete, "jump={jump_on_call}: freeze frame must drain cleanly");
+        }
+        let j7_cmds = j7_commands(&raw_bus.tx_log());
+        assert_eq!(
+            j7_cmds.len(),
+            1,
+            "jump={jump_on_call}: expected 1 0x307 freeze frame instead of stale target: {j7_cmds:?}"
+        );
+        let fpos = f32::from_le_bytes(j7_cmds[0].data[0..4].try_into().unwrap());
+        let fvel = u16::from_le_bytes([j7_cmds[0].data[4], j7_cmds[0].data[5]]);
+        let fcur = u16::from_le_bytes([j7_cmds[0].data[6], j7_cmds[0].data[7]]);
+        assert!((fpos - (-1.0)).abs() < 1e-3, "jump={jump_on_call}: freeze pos={fpos} != -1.0");
+        assert_eq!(fvel, 0, "jump={jump_on_call}: freeze vel_raw must be 0");
+        assert_eq!(fcur, RAW);
+    }
+
+    // 1b. True J7 carry-over at index 0 (no intermediate recovery write wiping `pending_tx`),
+    //     parked at exact 100 ms feedback age and 44 ms queue age, jumping +2 ms on EVERY `now()`
+    //     call (1..=8): converts in-place to `PosForceFreeze` (NEVER `Expired`) and emits the
+    //     exact 0x307 freeze frame on that very tick!
+    for jump_on_call in 1..=8usize {
+        let base_clock = MockClock::new();
+        let raw_bus = FakeBus::with_clock(&b601_limits(), base_clock.clone());
+        raw_bus.with(|s| {
+            for (i, m) in s.motors.iter_mut().enumerate() {
+                m.q = 0.1 * i as f32;
+            }
+            s.motors[J7].q = -1.0;
+            s.immediate_replies = true;
+        });
+        let leap_clock = Arc::new(LeapOnNthNowClock {
+            inner: base_clock.clone(),
+            armed: AtomicBool::new(false),
+            target_call: AtomicUsize::new(jump_on_call),
+            calls: AtomicUsize::new(0),
+            jump: Duration::from_millis(2),
+        });
+        let bus = LeapBus { inner: raw_bus.clone(), clock: leap_clock.clone() };
+        let b6 = TxBudget {
+            max_frames: 6,
+            max_duration: Duration::from_millis(10),
+            frame_max_age: Duration::from_millis(45),
+        };
+        let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(b601_limits())
+            .unwrap()
+            .with_gripper_pos_force(pf())
+            .unwrap()
+            .with_tx_budget(b6);
+        d.read_joint_states().unwrap();
+        raw_bus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+        d.check_mapping_ranges();
+        d.set_torque(true).expect("enable");
+        d.read_joint_states().unwrap();
+        raw_bus.with(|s| {
+            s.immediate_replies = false;
+            s.push_all_feedback();
+        });
+        d.read_joint_states().unwrap();
+        raw_bus.with(|s| s.motors[J7].mute_feedback = true);
+
+        base_clock.advance(Duration::from_millis(56));
+        raw_bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+        d.read_joint_states().unwrap();
+        d.begin_tx_tick();
+        assert_eq!(
+            d.write_joint_targets_bounded(&targets(-1.1)).unwrap(),
+            TxBatchOutcome::Deferred { pending: 1 }
+        );
+        // Advance 44 ms WITHOUT `read_joint_states()` so carried-over J7 stays at index 0
+        // (`queued_age = 44 ms`, `j7_age = 100 ms`).
+        base_clock.advance(Duration::from_millis(44));
+        assert!(d.pos_force_feedback_fresh(), "carryover jump={jump_on_call}: J7 starts at exact 100 ms");
+
+        raw_bus.clear_log();
+        d.begin_tx_tick();
+        leap_clock.calls.store(0, Ordering::SeqCst);
+        leap_clock.armed.store(true, Ordering::SeqCst);
+        let outcome = d
+            .write_joint_targets_bounded(&targets(-1.2))
+            .unwrap_or_else(|e| panic!("carryover jump={jump_on_call}: unexpected error {e:?}"));
+        leap_clock.armed.store(false, Ordering::SeqCst);
+        assert!(
+            !matches!(outcome, TxBatchOutcome::Expired { .. }),
+            "carryover jump={jump_on_call}: J7 carry-over crossing 100 ms + 45 ms must NEVER return Expired, got {outcome:?}"
+        );
+        let j7_cmds = j7_commands(&raw_bus.tx_log());
+        assert_eq!(
+            j7_cmds.len(),
+            1,
+            "carryover jump={jump_on_call}: expected immediate 0x307 freeze frame at index 0: {j7_cmds:?}"
+        );
+        let fpos = f32::from_le_bytes(j7_cmds[0].data[0..4].try_into().unwrap());
+        let fvel = u16::from_le_bytes([j7_cmds[0].data[4], j7_cmds[0].data[5]]);
+        let fcur = u16::from_le_bytes([j7_cmds[0].data[6], j7_cmds[0].data[7]]);
+        assert!((fpos - (-1.0)).abs() < 1e-3, "carryover jump={jump_on_call}: freeze pos={fpos} != -1.0");
+        assert_eq!(fvel, 0, "carryover jump={jump_on_call}: freeze vel_raw must be 0");
+        assert_eq!(fcur, RAW);
+        assert!(
+            matches!(d.take_last_pos_force_tx_status(), PosForceTxStatus::Stale { joint: J7, .. }),
+            "carryover jump={jump_on_call}: expected Stale status for J7"
+        );
+    }
+
+    // 2. Negative control: an expired J1–J6 carry-over frame (> 45 ms) alongside stale J7 MUST
+    //    still return `TxBatchOutcome::Expired { dropped: 1, pending: 0 }`.
+    let (mut d, bus, clock) = rig(true);
+    bus.with(|s| s.immediate_replies = true);
+    d.set_torque(true).expect("enable");
+    d = d.with_tx_budget(TxBudget {
+        max_frames: 5,
+        max_duration: Duration::from_millis(10),
+        frame_max_age: Duration::from_millis(45),
+    });
+    bus.with(|s| {
+        s.immediate_replies = false;
+        s.motors[J7].mute_feedback = true;
+    });
+    d.begin_tx_tick();
+    // Budget 5 -> sends J1-J5, defers J6 + J7.
+    assert_eq!(
+        d.write_joint_targets_bounded(&targets(-1.1)).unwrap(),
+        TxBatchOutcome::Deferred { pending: 2 }
+    );
+    clock.advance(Duration::from_millis(105));
+    bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+    d.read_joint_states().unwrap();
+    d.begin_tx_tick();
+    assert_eq!(
+        d.write_joint_targets_bounded(&targets(-1.2)).unwrap(),
+        TxBatchOutcome::Expired { dropped: 1, pending: 0 },
+        "stale J7 is dropped by freshness gate, while expired J6 MUST still return Expired"
+    );
+}
+
 /// I16 Item 2: Calibration close at raw 29 must be quantized ONCE and sent on CAN 0x307 as
 /// raw 29 (never double-floored raw 29 -> 0.29_f64 -> raw 28).
 #[tokio::test]
@@ -4133,4 +4785,176 @@ async fn calibration_close_at_raw_29_is_sent_as_raw_29() {
         }
         tokio::time::sleep(Duration::from_millis(30)).await;
     }
+}
+
+/// Round 5 M1 + Round 8 D1 regression:
+/// 1. A J7 feedback frame that sat 150 ms in the RX queue (both WITH a transport `rx_timestamp`
+///    near `queue_bound` and WITHOUT `rx_timestamp`) MUST fail the exact same live freshness
+///    predicate at decode time and NEVER overwrite `pf_last_fresh_position` / freeze target.
+/// 2. With no provably fresh J7 sample ever decoded since boot (`pf_last_fresh_position == None`),
+///    `POS_FORCE_BOOT_FALLBACK` is `NoOutputUntilFresh`: no `0x307` frame is sent before the first
+///    fresh sample, and enable fails closed.
+#[test]
+fn pos_force_freeze_cache_rejects_150ms_queued_sample_and_boot_fallback_no_output_until_fresh() {
+    use armd::driver::{PosForceBootFallback, POS_FORCE_BOOT_FALLBACK};
+    use armd::transport::{CanTransport, TransportError};
+    use std::sync::{Arc, Mutex};
+    assert_eq!(POS_FORCE_BOOT_FALLBACK, PosForceBootFallback::NoOutputUntilFresh);
+
+    #[derive(Clone)]
+    struct TimestampOverrideBus {
+        inner: FakeBus,
+        next_j7_ts: Arc<Mutex<Option<std::time::Instant>>>,
+    }
+    impl CanTransport for TimestampOverrideBus {
+        fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
+            self.inner.transmit(frame)
+        }
+        fn receive(&mut self) -> Result<CanFrame, TransportError> {
+            self.inner.receive()
+        }
+        fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<std::time::Instant>), TransportError> {
+            let (f, inner_ts) = self.inner.receive_timestamped()?;
+            let ts = if f.id == 0x17 {
+                self.next_j7_ts.lock().unwrap().take().or(inner_ts)
+            } else {
+                inner_ts
+            };
+            Ok((f, ts))
+        }
+        fn flush(&mut self) -> Result<(), TransportError> {
+            self.inner.flush()
+        }
+        fn flush_is_noop(&self) -> bool {
+            self.inner.flush_is_noop()
+        }
+        fn supports_nonblocking_rt(&self) -> bool {
+            self.inner.supports_nonblocking_rt()
+        }
+        fn supports_bounded_flush(&self) -> bool {
+            self.inner.supports_bounded_flush()
+        }
+        fn clock(&self) -> Option<Arc<dyn armd::transport::DriverClock>> {
+            self.inner.clock()
+        }
+    }
+
+    // --- (1) Frame sitting 150 ms in RX queue NEVER becomes the freeze target ---
+    let clock = MockClock::new();
+    let raw_bus = FakeBus::with_clock(&b601_limits(), clock.clone());
+    raw_bus.with(|s| {
+        for (i, m) in s.motors.iter_mut().enumerate() {
+            m.q = 0.1 * i as f32;
+        }
+        s.motors[J7].q = -2.0;
+        s.immediate_replies = true;
+    });
+    let ts_slot = Arc::new(Mutex::new(None));
+    let bus = TimestampOverrideBus { inner: raw_bus.clone(), next_j7_ts: ts_slot.clone() };
+    let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(b601_limits())
+        .unwrap()
+        .with_gripper_pos_force(pf())
+        .unwrap();
+    d.read_joint_states().unwrap();
+    raw_bus.with(|s| s.push_all_feedback());
+    d.read_joint_states().unwrap();
+    d.check_mapping_ranges();
+    d.set_torque(true).expect("enable");
+    // Fresh boundary at t = 0 with J7 at -2.0 rad.
+    d.read_joint_states().unwrap();
+    raw_bus.with(|s| {
+        s.immediate_replies = false;
+        s.rx.clear();
+        s.pending.clear();
+        s.motors[J7].q = -2.0;
+        s.push_all_feedback();
+    });
+    d.read_joint_states().unwrap();
+    let fresh_pos = d.pos_force_last_fresh_position().expect("fresh -2.0 cached");
+    assert!((fresh_pos - (-2.0)).abs() < 1e-2, "expected -2.0, got {fresh_pos}");
+
+    // Case 1a: Frame with hardware `rx_timestamp` = t0 + 10 ms (only 10 ms after `queue_bound`)
+    // that sat in the RX queue until `decode_now` = t0 + 160 ms (150 ms old when decoded!).
+    let t_bound = clock.now();
+    *ts_slot.lock().unwrap() = Some(t_bound + Duration::from_millis(10));
+    raw_bus.with(|s| {
+        s.rx.clear();
+        s.pending.clear();
+        s.motors[J7].q = -0.5;
+        s.push_feedback(J7);
+        s.motors[J7].mute_feedback = true;
+    });
+    clock.advance(Duration::from_millis(160));
+    raw_bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+    d.read_joint_states().unwrap();
+    assert!(
+        !d.pos_force_feedback_fresh(),
+        "150 ms queued J7 sample must not be considered fresh"
+    );
+    let cached_after_ts = d.pos_force_last_fresh_position().expect("old fresh pos preserved");
+    assert!(
+        (cached_after_ts - fresh_pos).abs() < 1e-5,
+        "150 ms queued frame (with rx_timestamp) poisoned freeze cache: {cached_after_ts} != {fresh_pos}"
+    );
+    raw_bus.clear_log();
+    d.begin_tx_tick();
+    let _ = d.write_joint_targets_bounded(&targets(0.0)).unwrap();
+    let j7_tx = j7_commands(&raw_bus.tx_log());
+    assert_eq!(j7_tx.len(), 1, "expected 1 freeze frame: {j7_tx:?}");
+    let p_wire = f32::from_le_bytes(j7_tx[0].data[0..4].try_into().unwrap());
+    let v_wire = u16::from_le_bytes([j7_tx[0].data[4], j7_tx[0].data[5]]);
+    let i_wire = u16::from_le_bytes([j7_tx[0].data[6], j7_tx[0].data[7]]);
+    assert!((p_wire - fresh_pos).abs() < 1e-5, "freeze frame used stale -0.5: {p_wire}");
+    assert_eq!(v_wire, 0);
+    assert_eq!(i_wire, RAW);
+
+    // Case 1b: Frame without `rx_timestamp` (`None`) sitting 150 ms past `queue_bound`.
+    raw_bus.with(|s| {
+        s.motors[J7].mute_feedback = false;
+        s.motors[J7].q = -0.25;
+        s.push_feedback(J7);
+        s.motors[J7].mute_feedback = true;
+    });
+    clock.advance(Duration::from_millis(150));
+    raw_bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+    d.read_joint_states().unwrap();
+    let cached_after_qb = d.pos_force_last_fresh_position().expect("old fresh pos still preserved");
+    assert!(
+        (cached_after_qb - fresh_pos).abs() < 1e-5,
+        "150 ms queued frame (via queue_bound) poisoned freeze cache: {cached_after_qb} != {fresh_pos}"
+    );
+
+    // --- (2) Unbounded pre-drain sample since boot NEVER populates freeze cache, and enable fails closed ---
+    let clock2 = MockClock::new();
+    let bus2 = FakeBus::with_clock(&b601_limits(), clock2.clone());
+    bus2.with(|s| {
+        for (i, m) in s.motors.iter_mut().enumerate() {
+            m.q = 0.1 * i as f32;
+        }
+        s.motors[J7].q = -1.5;
+        s.motors[J7].set_reg_u32(damiao::RID_CTRL_MODE, damiao::CTRL_MODE_POS_FORCE);
+        s.immediate_replies = true;
+    });
+    let mut d2 = DamiaoArmDriver::new(bus2.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(b601_limits())
+        .unwrap()
+        .with_gripper_pos_force(pf())
+        .unwrap();
+    // Push J7 feedback BEFORE the first empty-queue drain (unbounded) -> never qualifies as fresh!
+    bus2.with(|s| {
+        s.push_all_feedback();
+        s.motors[J7].mute_feedback = true;
+    });
+    d2.read_joint_states().unwrap();
+    assert_eq!(
+        d2.pos_force_last_fresh_position(),
+        None,
+        "unbounded pre-drain feedback must NOT populate pf_last_fresh_position"
+    );
+    assert!(
+        d2.set_torque(true).is_err(),
+        "enable must still fail closed when no provably fresh J7 sample has been observed since boot"
+    );
+    assert_eq!(d2.pos_force_last_fresh_position(), None);
 }

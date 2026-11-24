@@ -220,7 +220,8 @@ pub enum TransitionOp {
 }
 
 /// What a descriptor asks the RT to do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(clippy::large_enum_variant)] // Fixed-size `Copy` SPSC ring descriptor (32 slots): boxing would allocate on RT.
 pub enum CommandKind {
     /// Install the primitive of a plan slot; starts an action (a terminal reply follows the ACK).
     Install { plan: PlanHandle },
@@ -228,12 +229,31 @@ pub enum CommandKind {
     Immediate(ImmediateOp),
     /// Start a driver transition; a terminal reply follows the ACK.
     Transition(TransitionOp),
+    /// Lease lifecycle operation (`Acquire`, `Preempt`, `Release`, `Disconnect`); single `Reply::Lease` or `Refused`.
+    Lease(super::requests::lease::LeaseRequest),
+    /// Action-family prepared commands and macro lifecycle (A6 + A7).
+    #[cfg(not(target_arch = "wasm32"))]
+    Action(super::requests::actions::ActionCommand),
 }
 
 impl CommandKind {
-    /// A terminal reply follows the ACK (an install or a transition).
-    pub fn starts_action(&self) -> bool { matches!(self, Self::Install { .. } | Self::Transition(_)) }
-    pub fn plan(&self) -> Option<PlanHandle> { match self { Self::Install { plan } => Some(*plan), _ => None } }
+    /// A terminal reply follows the ACK (an install, transition, prepared action, or `BeginMacro`).
+    pub fn starts_action(&self) -> bool {
+        match self {
+            Self::Install { .. } | Self::Transition(_) => true,
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::Action(a) => a.starts_action(),
+            Self::Immediate(_) | Self::Lease(_) => false,
+        }
+    }
+    pub fn plan(&self) -> Option<PlanHandle> {
+        match self {
+            Self::Install { plan } => Some(*plan),
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::Action(a) => a.plan(),
+            Self::Immediate(_) | Self::Transition(_) | Self::Lease(_) => None,
+        }
+    }
 }
 
 /// One entry of the command ring.
@@ -264,6 +284,12 @@ pub enum Outcome {
 pub enum Reply {
     /// Committed: `commit_seq` is the RT commit sequence, `action` the committed action.
     Ack { request: RequestId, commit_seq: u64, action: Option<ActionId> },
+    /// Lease lifecycle outcome (`CommandKind::Lease`).
+    Lease {
+        request: RequestId,
+        commit_seq: u64,
+        outcome: super::requests::lease::LeaseOutcome,
+    },
     /// Not committed (nothing changed on the RT side; a plan slot was retired).
     Refused { request: RequestId, code: &'static str },
     /// The physical completion of an acknowledged action; `children`: the child primitives
@@ -273,7 +299,12 @@ pub enum Reply {
 
 impl Reply {
     pub fn request(&self) -> RequestId {
-        match self { Self::Ack { request, .. } | Self::Refused { request, .. } | Self::Terminal { request, .. } => *request }
+        match self {
+            Self::Ack { request, .. }
+            | Self::Lease { request, .. }
+            | Self::Refused { request, .. }
+            | Self::Terminal { request, .. } => *request,
+        }
     }
 }
 
@@ -595,11 +626,27 @@ struct Pending {
     terminal: bool,
 }
 
+/// Outcome of one caller delivery attempt in [`Broker::try_poll`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryDecision {
+    /// Delivered to the downstream receiver; release its reservation.
+    Delivered,
+    /// Downstream writer is temporarily full; keep the reply stashed in the broker and retain
+    /// its reservation (no drop, no unbounded queue, exact FIFO preserved).
+    Backpressured,
+    /// Downstream client is gone; drop the reply, count it as abandoned, and release its reservation.
+    Abandoned,
+}
+
 /// What a command asks for, with the plan to stage for an install.
+#[allow(clippy::large_enum_variant)] // Matches `CommandKind` zero-alloc value passing without heap boxing.
 pub enum Submit<'a, P> {
     Install(&'a dyn Fn(&mut P)),
     Immediate(ImmediateOp),
     Transition(TransitionOp),
+    Lease(super::requests::lease::LeaseRequest),
+    #[cfg(not(target_arch = "wasm32"))]
+    Action(super::requests::actions::ActionSubmit<'a, P>),
 }
 
 /// Capacities of one broker (tests use tiny ones).
@@ -621,11 +668,14 @@ pub struct Broker<P> {
     next_request: u64,
     commands: rtrb::Producer<Descriptor>,
     replies: rtrb::Consumer<Reply>,
+    stashed_reply: Option<Reply>,
     plans: PlanWriter<P>,
     reply_capacity: usize,
     reserved: usize,
     pending: HashMap<RequestId, Pending>,
     disconnected: std::collections::HashSet<ClientId>,
+    #[cfg(not(target_arch = "wasm32"))]
+    closed_bitset: Arc<super::requests::actions::ClosedBitset>,
     stats: BrokerStats,
 }
 
@@ -692,8 +742,22 @@ pub fn channel<P: Send>(arm: ArmId, boot: BootId, caps: Capacities, make: impl F
     let (rtx, rrx) = rtrb::RingBuffer::new(caps.replies);
     let (pw, pr) = plan_slots(caps.plans, make);
     (
-        Broker { arm, boot, next_request: 0, commands: ctx, replies: rrx, plans: pw, reply_capacity: caps.replies, reserved: 0,
-            pending: HashMap::new(), disconnected: Default::default(), stats: BrokerStats::default() },
+        Broker {
+            arm,
+            boot,
+            next_request: 0,
+            commands: ctx,
+            replies: rrx,
+            stashed_reply: None,
+            plans: pw,
+            reply_capacity: caps.replies,
+            reserved: 0,
+            pending: HashMap::new(),
+            disconnected: Default::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            closed_bitset: Arc::new(super::requests::actions::ClosedBitset::new()),
+            stats: BrokerStats::default(),
+        },
         RtIntake { arm, boot, commands: crx, replies: rtx, plans: pr, commit_seq: 0, release: 0, taken_in: 0, installed: 0, reply_overflow: 0 },
     )
 }
@@ -704,15 +768,26 @@ impl<P> Broker<P> {
     pub fn plan_capacity(&self) -> usize { self.plans.capacity() }
     pub fn stats(&self) -> BrokerStats { BrokerStats { retired: self.plans.retired_total(), ..self.stats } }
 
+    /// Shared lock-free closed-connection bitset read on `armd-control` before every action commit.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn closed_bitset(&self) -> Arc<super::requests::actions::ClosedBitset> {
+        Arc::clone(&self.closed_bitset)
+    }
+
+    /// Reclaims retired plan slots whose [`PlanSlotRef`] pin count has reached zero.
+    pub fn reclaim_plans(&mut self) -> usize { self.plans.reclaim() }
+
     /// Reply slots currently reserved.
     pub fn reserved(&self) -> usize { self.reserved }
 
     /// Requests waiting for an ACK or a terminal.
     pub fn outstanding(&self) -> usize { self.pending.len() }
 
-    /// The client is gone: its later replies are dropped (counted as abandoned); commands it
-    /// already queued stay queued (lease loss is what invalidates them).
+    /// The client is gone: its later replies are dropped (counted as abandoned) and its
+    /// connection ID is marked closed in the lock-free fence read on `armd-control`.
     pub fn disconnect(&mut self, client: ClientId) {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.closed_bitset.mark_closed(client.0);
         if self.pending.values().any(|p| p.client == client) { self.disconnected.insert(client); }
     }
 
@@ -722,7 +797,12 @@ impl<P> Broker<P> {
             self.stats.refused_admission += 1;
             return Err(AdmitError::Disconnected);
         }
-        let terminal = matches!(what, Submit::Install(_) | Submit::Transition(_));
+        let terminal = match &what {
+            Submit::Install(_) | Submit::Transition(_) => true,
+            #[cfg(not(target_arch = "wasm32"))]
+            Submit::Action(a) => a.starts_action(),
+            Submit::Immediate(_) | Submit::Lease(_) => false,
+        };
         let need = 1 + usize::from(terminal);
         let refused = if self.commands.slots() == 0 { Some(AdmitError::CommandsFull) }
             else if self.reserved + need > self.reply_capacity { Some(AdmitError::RepliesFull) }
@@ -741,13 +821,70 @@ impl<P> Broker<P> {
             },
             Submit::Immediate(op) => CommandKind::Immediate(op),
             Submit::Transition(op) => CommandKind::Transition(op),
+            Submit::Lease(req) => CommandKind::Lease(req),
+            #[cfg(not(target_arch = "wasm32"))]
+            Submit::Action(a) => {
+                use super::requests::actions::{ActionCommand, ActionSubmit};
+                match a {
+                    ActionSubmit::InstallPrepared {
+                        write,
+                        kind,
+                        prepared_boot,
+                        admission_request_id,
+                        check_workspace_revision,
+                        poses_revision,
+                        calibration_revision,
+                        gripper_calib_revision,
+                        power_budget_revision,
+                    } => match self.plans.stage(write) {
+                        Some(plan) => CommandKind::Action(ActionCommand::InstallPrepared {
+                            plan,
+                            kind,
+                            prepared_boot,
+                            admission_request_id,
+                            check_workspace_revision,
+                            poses_revision,
+                            calibration_revision,
+                            gripper_calib_revision,
+                            power_budget_revision,
+                        }),
+                        None => {
+                            self.stats.refused_admission += 1;
+                            return Err(AdmitError::PlansFull);
+                        }
+                    },
+                    ActionSubmit::BeginMacro(spec) => CommandKind::Action(ActionCommand::BeginMacro(spec)),
+                    ActionSubmit::InstallChild {
+                        write,
+                        prepared_boot,
+                        check_workspace_revision,
+                        calibration_revision,
+                        gripper_calib_revision,
+                        power_budget_revision,
+                    } => match self.plans.stage(write) {
+                        Some(plan) => CommandKind::Action(ActionCommand::InstallChild {
+                            plan,
+                            prepared_boot,
+                            check_workspace_revision,
+                            calibration_revision,
+                            gripper_calib_revision,
+                            power_budget_revision,
+                        }),
+                        None => {
+                            self.stats.refused_admission += 1;
+                            return Err(AdmitError::PlansFull);
+                        }
+                    },
+                    ActionSubmit::FinishMacro(spec) => CommandKind::Action(ActionCommand::FinishMacro(spec)),
+                }
+            }
         };
         self.next_request += 1;
         let request = RequestId(self.next_request);
         let d = Descriptor { stamp: Stamp { arm: self.arm, boot: self.boot, request, client, client_seq, authority, deadline }, kind };
         if self.commands.push(d).is_err() {
             // single producer and slots() > 0 above: unreachable; keep it side-effect free
-            if let CommandKind::Install { plan } = kind { self.plans.unpublish(plan); }
+            if let Some(plan) = kind.plan() { self.plans.unpublish(plan); }
             self.stats.refused_admission += 1;
             return Err(AdmitError::CommandsFull);
         }
@@ -757,50 +894,90 @@ impl<P> Broker<P> {
         Ok(request)
     }
 
-    /// Drains the RT's replies, delivering each with `deliver(client, reply)` (false: the
-    /// client is gone, the reply is abandoned). Releases reservations and reclaims retired
-    /// plan slots. Returns the number of replies drained.
-    pub fn poll(&mut self, mut deliver: impl FnMut(ClientId, Reply) -> bool) -> usize {
+    /// Drains the RT's replies in exact global FIFO order with bounded backpressure: when
+    /// `deliver` returns [`DeliveryDecision::Backpressured`], the reply is stashed in the broker
+    /// with its reservation intact and polling stops until the caller retries. Returns the
+    /// number of replies processed (delivered or abandoned).
+    pub fn try_poll(&mut self, mut deliver: impl FnMut(ClientId, Reply) -> DeliveryDecision) -> usize {
         let mut n = 0;
-        while let Ok(reply) = self.replies.pop() {
-            n += 1;
-            let request = reply.request();
-            // a reply is delivered only against its own reservation: one ACK or refusal per
-            // request, one terminal per acknowledged install (anything else is counted)
-            let Some(p) = self.pending.get_mut(&request) else { self.stats.unexpected += 1; continue; };
-            let expected = match reply {
-                Reply::Ack { .. } | Reply::Refused { .. } => p.ack,
-                Reply::Terminal { .. } => p.terminal && !p.ack,
+        loop {
+            let reply = match self.stashed_reply.take() {
+                Some(r) => r,
+                None => match self.replies.pop() {
+                    Ok(r) => r,
+                    Err(_) => break,
+                },
             };
-            if !expected { self.stats.unexpected += 1; continue; }
-            match reply {
-                Reply::Ack { .. } => {
-                    self.stats.acked += 1;
-                    p.ack = false;
-                    self.reserved -= 1;
-                }
-                Reply::Refused { .. } => {
-                    self.stats.refused_by_rt += 1;
-                    p.ack = false;
-                    self.reserved -= 1;
-                    if p.terminal { p.terminal = false; self.reserved -= 1; }
-                }
-                Reply::Terminal { .. } => {
-                    self.stats.terminals += 1;
-                    p.terminal = false;
-                    self.reserved -= 1;
-                }
+            let request = reply.request();
+            let Some((client, expected)) = self.pending.get(&request).map(|p| {
+                let expected = match reply {
+                    Reply::Ack { .. } | Reply::Lease { .. } | Reply::Refused { .. } => p.ack,
+                    Reply::Terminal { .. } => p.terminal && !p.ack,
+                };
+                (p.client, expected)
+            }) else {
+                n += 1;
+                self.stats.unexpected += 1;
+                continue;
+            };
+            if !expected {
+                n += 1;
+                self.stats.unexpected += 1;
+                continue;
             }
-            let client = p.client;
-            let done = !p.ack && !p.terminal;
+            let decision = if self.disconnected.contains(&client) {
+                DeliveryDecision::Abandoned
+            } else {
+                deliver(client, reply)
+            };
+            if decision == DeliveryDecision::Backpressured {
+                self.stashed_reply = Some(reply);
+                break;
+            }
+            n += 1;
+            let done = {
+                let p = self.pending.get_mut(&request).expect("checked above");
+                match reply {
+                    Reply::Ack { .. } | Reply::Lease { .. } => {
+                        self.stats.acked += 1;
+                        p.ack = false;
+                        self.reserved -= 1;
+                    }
+                    Reply::Refused { .. } => {
+                        self.stats.refused_by_rt += 1;
+                        p.ack = false;
+                        self.reserved -= 1;
+                        if p.terminal { p.terminal = false; self.reserved -= 1; }
+                    }
+                    Reply::Terminal { .. } => {
+                        self.stats.terminals += 1;
+                        p.terminal = false;
+                        self.reserved -= 1;
+                    }
+                }
+                !p.ack && !p.terminal
+            };
             if done { self.pending.remove(&request); }
-            if self.disconnected.contains(&client) || !deliver(client, reply) { self.stats.abandoned += 1; }
+            if decision == DeliveryDecision::Abandoned { self.stats.abandoned += 1; }
             if done && self.disconnected.contains(&client) && !self.pending.values().any(|p| p.client == client) {
                 self.disconnected.remove(&client);
             }
         }
         self.plans.reclaim();
         n
+    }
+
+    /// Drains the RT's replies, delivering each with `deliver(client, reply)` (false: the
+    /// client is gone, the reply is abandoned). Releases reservations and reclaims retired
+    /// plan slots. Returns the number of replies drained.
+    pub fn poll(&mut self, mut deliver: impl FnMut(ClientId, Reply) -> bool) -> usize {
+        self.try_poll(|client, reply| {
+            if deliver(client, reply) {
+                DeliveryDecision::Delivered
+            } else {
+                DeliveryDecision::Abandoned
+            }
+        })
     }
 }
 
@@ -855,6 +1032,9 @@ impl<P> RtIntake<P> {
         self.installed -= 1;
         self.reply(Reply::Terminal { request: i.request, action: i.action, outcome, children });
     }
+
+    /// Retires a standalone or macro-child plan slot handle directly (zero alloc/free).
+    pub fn retire_plan(&mut self, plan: PlanHandle) -> bool { self.plans.retire(plan) }
 
     /// Emits a deferred reply previously built by [`Taken::ack_deferred`] (used by
     /// `ReleaseEngine` so supersession terminals and their accompanying ACK are both
@@ -926,12 +1106,39 @@ impl<P> Taken<'_, P> {
         Ok((Acked { commit_seq, installed }, reply))
     }
 
+    /// Records a lease commit without emitting the reply yet (emitted in Step 7 strictly after
+    /// Step 6 `StateHub` publication via [`RtIntake::emit_reply`]).
+    pub fn ack_lease_deferred(
+        mut self,
+        outcome: super::requests::lease::LeaseOutcome,
+    ) -> (u64, Reply) {
+        self.answered = true;
+        let intake = &mut *self.intake;
+        intake.commit_seq += 1;
+        let commit_seq = intake.commit_seq;
+        let request = self.d.stamp.request;
+        (commit_seq, Reply::Lease { request, commit_seq, outcome })
+    }
+
+    /// Refuses the command without emitting the reply yet (retires any plan slot now; the
+    /// `Reply::Refused` is emitted in Step 7 strictly after Step 6 publication).
+    pub fn refuse_deferred(mut self, code: &'static str) -> Reply {
+        self.answered = true;
+        if let Some(plan) = self.d.kind.plan() {
+            self.intake.plans.retire(plan);
+        }
+        Reply::Refused {
+            request: self.d.stamp.request,
+            code,
+        }
+    }
+
     /// Refuses the command with `code`; retires its plan slot.
     pub fn refuse(mut self, code: &'static str) { self.refuse_now(code); }
 
     fn refuse_now(&mut self, code: &'static str) {
         self.answered = true;
-        if let CommandKind::Install { plan } = self.d.kind { self.intake.plans.retire(plan); }
+        if let Some(plan) = self.d.kind.plan() { self.intake.plans.retire(plan); }
         let request = self.d.stamp.request;
         self.intake.reply(Reply::Refused { request, code });
     }

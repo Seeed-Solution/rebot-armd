@@ -195,6 +195,8 @@ pub struct FakeBusState {
     pub fail_tx_after: Option<usize>,
     /// Transmits to these command CAN IDs fail.
     pub fail_tx_ids: Vec<u32>,
+    /// Transmits to these command CAN IDs report ENOBUFS backpressure.
+    pub backpressure_tx_ids: Vec<u32>,
     /// Fake time each dequeued frame / each transmit takes (slow host, queued controller).
     pub rx_step: Duration,
     pub tx_step: Duration,
@@ -438,6 +440,7 @@ impl FakeBus {
             stall_step: Duration::from_millis(1),
             fail_tx_after: None,
             fail_tx_ids: Vec::new(),
+            backpressure_tx_ids: Vec::new(),
             rx_step: Duration::ZERO,
             tx_step: Duration::ZERO,
             tx_spike_every: 0,
@@ -482,7 +485,7 @@ impl CanTransport for FakeBus {
         if s.stall_reg_writes && frame.id == 0x7FF && frame.data[2] == damiao::REG_WRITE {
             return Err(TransportError::WouldBlock);
         }
-        if s.tx_enobufs {
+        if s.tx_enobufs || s.backpressure_tx_ids.contains(&frame.id) {
             return Err(TransportError::NoBufferSpace);
         }
         if s.tx_stall {

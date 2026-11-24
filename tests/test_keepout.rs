@@ -375,26 +375,49 @@ static ACK_TIMING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delayed_persist_ack_carries_the_epoch_at_send_time() {
     use futures_util::StreamExt;
+    struct StagePauseReset;
+    impl Drop for StagePauseReset {
+        fn drop(&mut self) {
+            armd::persist::clear_test_stage_pause();
+        }
+    }
     let _serial = ACK_TIMING.lock().await;
+    let _reset = StagePauseReset;
     let dir = tempfile::tempdir().unwrap();
+    let keepout_path = dir.path().join("keepout.json");
     let supervisor = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
-    armd::keepout::load_into(&supervisor, &dir.path().join("keepout.json")).await.unwrap();
+    armd::keepout::load_into(&supervisor, &keepout_path).await.unwrap();
     let (mut ws, generation, epoch, sup, _) = common::torqued_rig(supervisor, &INSPECT).await;
-    armd::persist::TEST_WRITE_DELAY_MS.store(300, std::sync::atomic::Ordering::Relaxed);
+    // Pause deterministically inside `StagedWrite::stage` for this fixture's exact target path so
+    // command 777 is guaranteed to have passed initial admission and entered staging before E-stop
+    // is sent, and stays paused until `epoch_sync` arrives (no sleep-based race under CPU load).
+    let (stage_entered_rx, stage_release_tx) = armd::persist::arm_test_stage_pause(keepout_path);
     common::send(&mut ws, json!({"type":"command", "request_id": 777, "generation": generation, "epoch_id": epoch,
         "path": "/api/v1/workspace/keepout", "body": {"boxes": [cube("t", [0.3, 0.3, 0.3])]}})).await;
+    tokio::task::spawn_blocking(move || {
+        stage_entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("command 777 must enter StagedWrite::stage before estop")
+    })
+    .await
+    .unwrap();
     common::send(&mut ws, json!({"type":"estop"})).await;
     let (mut ack, mut sync) = (None, None);
+    let mut stage_release = Some(stage_release_tx);
     while ack.is_none() || sync.is_none() {
-        let text = tokio::time::timeout(std::time::Duration::from_secs(3), ws.next()).await.unwrap().unwrap().unwrap().into_text().unwrap();
+        let text = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next()).await.unwrap().unwrap().unwrap().into_text().unwrap();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         match v["type"].as_str() {
             Some("command_ack") | Some("command_reject") if v["request_id"] == 777 => ack = Some((v, sync.is_some())),
-            Some("epoch_sync") => sync = Some(v),
+            Some("epoch_sync") => {
+                sync = Some(v);
+                if let Some(tx) = stage_release.take() {
+                    let _ = tx.send(());
+                }
+            }
             _ => {}
         }
     }
-    armd::persist::TEST_WRITE_DELAY_MS.store(0, std::sync::atomic::Ordering::Relaxed);
     let (ack, after_sync) = ack.unwrap();
     let sync = sync.unwrap();
     // E-stop during staging aborts the staged write at the new epoch rather than publishing post-EStop.

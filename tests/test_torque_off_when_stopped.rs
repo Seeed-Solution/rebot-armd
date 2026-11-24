@@ -56,6 +56,7 @@ fn make_driver_rig() -> (SupervisorInner, FakeBus, MockClock) {
     })
     .with_driver(Box::new(d));
     inner.lease_enabled = false;
+    inner.register_live_connection(1).unwrap();
     inner.tick(0.02);
     (inner, bus, clock)
 }
@@ -460,6 +461,7 @@ fn executor_raised_in_fault_refuses_with_torque_off_would_drop_both_transition_a
     // 2. Driverless executor: ImmediateOp::TorqueOff
     let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());
     inner.lease_enabled = false;
+    inner.register_live_connection(1).unwrap();
     enable_torque_admitted(&mut inner).unwrap();
     inner.measured_positions[1] = 0.25;
     inner.safety.trigger_fault_coded(
@@ -871,7 +873,8 @@ fn hardware_without_calibrated_resting_pose_refuses_stopped_torque_off_on_both_o
     assert!(inner.is_torqued);
 
     // 2. Executor owner
-    let (inner, bus, clock) = make_uncalibrated();
+    let (mut inner, bus, clock) = make_uncalibrated();
+    inner.register_live_connection(1).unwrap();
     let (mut fx, mut b, _tw, _stop) = ReleaseFixture::new(
         inner,
         BOOT,
@@ -3551,6 +3554,7 @@ fn spec_b3_damiao_pos_force_gripper_cleared_mode_verification_does_not_veto_arm_
     })
     .with_driver(Box::new(dm));
     inner.lease_enabled = false;
+    inner.register_live_connection(1).unwrap();
     inner.tick(0.02);
 
     let (mut fx, mut b, _tw, _stop) = ReleaseFixture::new(
@@ -4165,8 +4169,8 @@ fn spec_7_failed_enable_at_rest_pose_does_not_roll_back_automatically() {
 /// and preserve `SafetyState::EStop`.
 #[test]
 fn review_b04_fashionstar_and_robstride_mid_batch_estop_aborts_with_zero_later_enables() {
-    use std::sync::atomic::{AtomicBool, AtomicU64};
     use armd::driver::{FashionStarArmDriver, RobStrideArmDriver};
+    use armd::rt_core::urgent::EstopState;
     use armd::transport::{CanFrame, CanTransport, MockTransport, Transport};
 
     // Part A: FashionStar mid-batch E-stop after servo 1 enable write -> 0 enable writes to servos 2..6.
@@ -4175,8 +4179,7 @@ fn review_b04_fashionstar_and_robstride_mid_batch_estop_aborts_with_zero_later_e
             inner: MockTransport,
             enable_writes: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
             servo1_enable: Vec<u8>,
-            estop_req: Arc<AtomicU64>,
-            estop_flag: Arc<AtomicBool>,
+            estop_state: Arc<EstopState>,
             tripped: bool,
         }
         impl Transport for EstopAfterFirstWriteSerial {
@@ -4189,8 +4192,7 @@ fn review_b04_fashionstar_and_robstride_mid_batch_estop_aborts_with_zero_later_e
                 // Trip E-stop right after servo 1's torque-enable packet is written.
                 if !self.tripped && buf == self.servo1_enable.as_slice() {
                     self.tripped = true;
-                    self.estop_flag.store(true, Ordering::SeqCst);
-                    self.estop_req.fetch_add(1, Ordering::SeqCst);
+                    let _ = self.estop_state.request_and_latch();
                 }
                 res
             }
@@ -4216,8 +4218,7 @@ fn review_b04_fashionstar_and_robstride_mid_batch_estop_aborts_with_zero_later_e
             inner: MockTransport::new(),
             enable_writes: Arc::clone(&enable_writes),
             servo1_enable: armd::protocol::fashionstar::build_set_torque(1, true),
-            estop_req: inner.requested_estop_count.clone(),
-            estop_flag: inner.e_stop_latched.clone(),
+            estop_state: inner.estop_state.clone(),
             tripped: false,
         };
         let drv = FashionStarArmDriver::new(serial, vec![1, 2, 3, 4, 5, 6]);
@@ -4245,8 +4246,7 @@ fn review_b04_fashionstar_and_robstride_mid_batch_estop_aborts_with_zero_later_e
     {
         struct EstopAfterFirstEnableCan {
             tx: Arc<std::sync::Mutex<Vec<CanFrame>>>,
-            estop_req: Arc<AtomicU64>,
-            estop_flag: Arc<AtomicBool>,
+            estop_state: Arc<EstopState>,
             tripped: bool,
         }
         impl CanTransport for EstopAfterFirstEnableCan {
@@ -4255,8 +4255,7 @@ fn review_b04_fashionstar_and_robstride_mid_batch_estop_aborts_with_zero_later_e
                 let comm_type = (frame.id >> 24) & 0x1F;
                 if !self.tripped && comm_type == 3 {
                     self.tripped = true;
-                    self.estop_flag.store(true, Ordering::SeqCst);
-                    self.estop_req.fetch_add(1, Ordering::SeqCst);
+                    let _ = self.estop_state.request_and_latch();
                 }
                 Ok(())
             }
@@ -4277,8 +4276,7 @@ fn review_b04_fashionstar_and_robstride_mid_batch_estop_aborts_with_zero_later_e
         inner.lease_enabled = false;
         let can = EstopAfterFirstEnableCan {
             tx: Arc::clone(&tx),
-            estop_req: inner.requested_estop_count.clone(),
-            estop_flag: inner.e_stop_latched.clone(),
+            estop_state: inner.estop_state.clone(),
             tripped: false,
         };
         let drv = RobStrideArmDriver::new(can, vec![1, 2, 3, 4, 5, 6]);
@@ -4491,6 +4489,7 @@ fn review_m01_m06_m07_m08_m09_unverified_mode_thermal_late_reply_and_gap_recaptu
         })
         .with_driver(Box::new(drv));
         inner.lease_enabled = false;
+        inner.register_live_connection(1).unwrap();
         inner.rt_executor_owned = true;
         inner.tick(0.02);
 
@@ -5297,6 +5296,7 @@ fn t1_thermal_checks_active_during_enabling_rt_and_legacy() {
         })
         .with_driver(Box::new(drv));
         inner.lease_enabled = false;
+        inner.register_live_connection(1).unwrap();
         inner.rt_executor_owned = true;
         inner.tick(0.02);
 
@@ -5387,6 +5387,7 @@ fn t1_thermal_checks_active_during_enabling_rt_and_legacy() {
         })
         .with_driver(Box::new(drv));
         inner.lease_enabled = false;
+        inner.register_live_connection(1).unwrap();
         inner.rt_executor_owned = true;
         inner.tick(0.02);
 
@@ -5541,6 +5542,7 @@ fn t2_thermal_trip_upgrades_pending_disable_with_single_broker_terminal() {
         })
         .with_driver(Box::new(drv));
         inner.lease_enabled = false;
+        inner.register_live_connection(1).unwrap();
         inner.rt_executor_owned = true;
         // Arm normally first.
         inner.tick(0.02);
@@ -5643,6 +5645,7 @@ fn t2_thermal_trip_upgrades_pending_disable_with_single_broker_terminal() {
         })
         .with_driver(Box::new(drv));
         inner.lease_enabled = false;
+        inner.register_live_connection(1).unwrap();
         inner.rt_executor_owned = true;
         inner.tick(0.02);
         assert!(enable_torque_admitted(&mut inner).is_ok());
@@ -7096,6 +7099,7 @@ fn r10_feetech_defers_incomplete_rest_window_within_1s_lifetime() {
 
         let mut inner = SupervisorInner::new(feetech_6dof_config()).with_driver(Box::new(drv));
         inner.lease_enabled = false;
+        inner.register_live_connection(1).unwrap();
         inner.rt_executor_owned = true;
         inner.apply_stop_policy(StopPolicy::EStopLatch);
 
@@ -7526,6 +7530,7 @@ fn l2_missing_ctrl_mode_with_range_replies_never_energizes() {
         })
         .with_driver(Box::new(dm));
         inner.lease_enabled = false;
+        inner.register_live_connection(1).unwrap();
         inner.tick(0.02);
         let (mut fx, mut broker, _tw, _stop) = ReleaseFixture::new(
             inner,

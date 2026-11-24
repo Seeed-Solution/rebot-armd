@@ -56,6 +56,11 @@ pub struct Committed {
 impl Committed {
     fn authorized(d: &Descriptor, action: Option<ActionId>) -> Self { Self { request: d.stamp.request, action } }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn for_action(d: &Descriptor, action: Option<ActionId>) -> Self {
+        Self { request: d.stamp.request, action }
+    }
+
     /// The request whose command was committed.
     pub fn request(&self) -> RequestId { self.request }
 
@@ -97,6 +102,9 @@ pub enum Primitive {
     /// [`CoreOps::commit_prepared`] without IK or file I/O. `start` is the commanded position
     /// it was prepared from (checked as for `JointQuintic`); `child` names a macro parent.
     Prepared { child: Option<ChildSpec>, dof: u8, start: [f32; MAX_DOF], kind: PathKind, duration_s: f64, power_scale: Option<f64> },
+    /// Prepared action-family command or macro child staged for [`super::requests::actions`] (A6 + A7).
+    #[cfg(not(target_arch = "wasm32"))]
+    Action(super::requests::actions::StagedAction),
 }
 
 /// What a [`Primitive::Prepared`] path is.
@@ -106,11 +114,21 @@ pub enum PathKind {
     /// run over `duration_s` with the quintic time law of a Cartesian path.
     Cartesian,
     /// Recorded samples every `sample_dt` s of recorded time (`duration_s` recorded), played
-    /// at `speed` after an approach quintic from the commanded position to the first sample
-    /// (planned at the commit: no IK). `gripper` false keeps the gripper's command.
+    /// at `speed` after a pre-planned approach quintic (`approach_duration_s`, optional
+    /// `approach_power_scale`) from the commanded position to the first sample (planned,
+    /// power-fitted, and workspace-swept off-thread at prepare time; install verifies start
+    /// position only). `gripper` false keeps the gripper's command.
     /// `tool_digest`: [`tool_digest_hash`] of the active tool the worker checked the
     /// episode's tool provenance against (`TOOL_MISMATCH` at the commit when it changed).
-    Replay { episode: EpisodeRef, speed: f32, gripper: bool, sample_dt: f64, tool_digest: u64 },
+    Replay {
+        episode: EpisodeRef,
+        speed: f32,
+        gripper: bool,
+        sample_dt: f64,
+        approach_duration_s: f64,
+        approach_power_scale: Option<f64>,
+        tool_digest: u64,
+    },
 }
 
 /// FNV-1a hash of a tool configuration digest (no allocation): the prepared replay names the
@@ -189,11 +207,14 @@ impl PreparedPath {
     }
 }
 
-/// One plan slot: the primitive and the prepared path a [`Primitive::Prepared`] reads.
+/// One plan slot: the primitive, the prepared path a [`Primitive::Prepared`] reads, and (for
+/// prepared replays) the exact off-thread fitted & workspace-swept approach quintic.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlanSlot {
     pub primitive: Primitive,
     pub path: PreparedPath,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub replay_approach: Option<crate::replay::PreparedReplayApproach>,
 }
 
 impl Default for PlanSlot {
@@ -202,22 +223,41 @@ impl Default for PlanSlot {
 }
 
 impl PlanSlot {
-    pub fn with_path_capacity(n: usize) -> Self { Self { primitive: Primitive::None, path: PreparedPath::with_capacity(n) } }
+    pub fn with_path_capacity(n: usize) -> Self {
+        Self {
+            primitive: Primitive::None,
+            path: PreparedPath::with_capacity(n),
+            #[cfg(not(target_arch = "wasm32"))]
+            replay_approach: None,
+        }
+    }
 
     /// Payload bytes reserved by this slot's [`PreparedPath`] buffers.
     pub fn payload_bytes(&self) -> usize { self.path.payload_bytes() }
 
-    /// Stages a primitive that reads no path (the path is cleared).
+    /// Stages a primitive that reads no path (the path and replay approach are cleared).
     pub fn set(&mut self, p: Primitive) {
         self.primitive = p;
         self.path.clear();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.replay_approach = None;
+        }
     }
 
     /// Stages a slot the worker prepared (`PLAN_TOO_LARGE`: nothing staged; the slot is empty).
     pub fn copy_from(&mut self, other: &PlanSlot) -> Result<(), &'static str> {
         self.primitive = Primitive::None;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.replay_approach = None;
+        }
         self.path.copy_from(&other.path)?;
         self.primitive = other.primitive;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.replay_approach = other.replay_approach;
+        }
         Ok(())
     }
 }
@@ -281,6 +321,8 @@ impl Primitive {
             Self::None | Self::JointQuintic { .. } => None,
             Self::CartesianPath { child, .. } | Self::Gripper { child, .. } | Self::JointQuinticLimited { child, .. } | Self::Replay { child, .. }
             | Self::Prepared { child, .. } => child.as_ref(),
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::Action(a) => a.child(),
         }
     }
 
@@ -300,18 +342,19 @@ impl Primitive {
 /// Codes an action can end with ([`Outcome`] carries them as `&'static str`).
 pub const TERMINAL_CODES: &[&str] = &[
     // stop / ownership / epoch
-    "STOPPED", "CANCELLED", "SUPERSEDED", "LEASE_LOST", "EPOCH_MISMATCH", "PLAN_STALE", "CALIBRATION_CHANGED", "CONFIG_BUSY",
-    "DEPLOYMENT_CHANGED", "TOOL_MISMATCH", "DATA_STALE", "NOT_ARMED", "MOTION_BUSY", "INTERNAL", "UNSUPPORTED",
+    "STOPPED", "CANCELLED", "SUPERSEDED", "LEASE_LOST", "DISCONNECTED", "EPOCH_MISMATCH", "PLAN_STALE", "CALIBRATION_CHANGED", "CONFIG_BUSY",
+    "DEPLOYMENT_CHANGED", "TOOL_MISMATCH", "DATA_STALE", "NOT_ARMED", "MOTION_BUSY", "TRANSITION_BUSY", "HANDOVER_SETTLING", "DISABLE_PENDING",
+    "INTERNAL", "UNSUPPORTED",
     // faults and holds (FaultCode, SCREAMING_SNAKE_CASE)
     "ESTOP", "ESTOP_ACTIVE", "FAULT", "FAULT_ACTIVE", "BUS_LOSS", "THERMAL_TRIP", "JOINT_LIMIT", "WATCHDOG", "WATCHDOG_TIMEOUT",
-    "FOLLOWING_ERROR", "CONTROL_DEADLINE", "INVALID_TELEMETRY", "DRIVER_WRITE_FAILED", "CAN_TX_STALLED", "HARDWARE_FAULT", "ENABLE_FAILED",
+    "FOLLOWING_ERROR", "CONTROL_DEADLINE", "INVALID_TELEMETRY", "DRIVER_WRITE_FAILED", "CAN_TX_STALLED", "J7_FEEDBACK_STALE", "HARDWARE_FAULT", "ENABLE_FAILED",
     "SERVO_NO_BRAKE", "HANDOVER_UNSETTLED", "GRAVITY_COMP_FAILED", "COLLISION", "COLLISION_HOLD", "BLOCKED_HOLD", "WORKSPACE_HOLD",
     "TORQUE_LIMIT", "TRACKING_STALL", "SAFETY_ERROR", "SAFETY_REJECTED", "SOFT_LIMIT_EXCEEDED", "FEEDBACK_UNAVAILABLE",
     "FEEDBACK_UNCONFIRMED", "FEEDBACK_STALE", "INVALID_FEEDBACK", "UNLOAD_FAILED",
     // motion and action failures
     "IK_UNREACHABLE", "IK_BRANCH_FLIP", "WORKSPACE_VIOLATION", "INVALID_COMMAND", "INVALID_TARGET", "JUMP_LIMIT", "STEP_LIMIT",
     "SERVO_INFEASIBLE", "SERVO_TARGET_DISCARDED", "STALE_INPUT", "MOTION_TIMEOUT", "GRIPPER_TIMEOUT", "GRASP_TIMEOUT",
-    "PLACE_TIMEOUT", "TARGET_TIMEOUT", "SEQUENCE_TIMEOUT", "MAX_SECONDS", "NOT_HOLDING", "TARGET_LOST", "TARGET_DISPLACED",
+    "PLACE_TIMEOUT", "TARGET_TIMEOUT", "SEQUENCE_TIMEOUT", "HOVER_TIMEOUT", "MEASURE_TIMEOUT", "MAX_SECONDS", "NOT_HOLDING", "TARGET_LOST", "TARGET_DISPLACED",
     "DROPPED", "OBJECT_HELD", "OBJECT_TOO_TALL", "TOO_WIDE", "CENTRING_FAILED", "DETECTION_UNAVAILABLE", "TASK_UNSUPPORTED",
     "OBSERVATION_UNAVAILABLE", "PERSIST_FAILED", "POLICY_NOT_ACTIVE", "POWER_LIMIT",
 ];
@@ -458,6 +501,38 @@ pub trait CoreOps {
     /// Installs `primitive` for `d` after rechecking its stamp; refusal leaves active motion unchanged.
     fn commit_primitive(&mut self, d: &Descriptor, primitive: &Primitive, ctx: &CommitCtx) -> Result<Committed, &'static str>;
     fn commit_immediate(&mut self, d: &Descriptor, op: ImmediateOp, ctx: &CommitCtx) -> Result<Committed, &'static str>;
+    /// Executes one lease lifecycle request (`LeaseAcquire`, `LeasePreempt`, `LeaseRelease`, `LeaseDisconnect`).
+    fn commit_lease(
+        &mut self,
+        _d: &Descriptor,
+        _req: super::requests::lease::LeaseRequest,
+        _ctx: &CommitCtx,
+    ) -> Result<super::requests::lease::LeaseOutcome, &'static str> {
+        Err("NOT_WIRED")
+    }
+    /// Applies one priority connection lifecycle command (`Open` / `Disconnect`) at the owner.
+    fn handle_conn_lifecycle(
+        &mut self,
+        cmd: super::requests::lease::LifecycleCmd,
+        _now: Instant,
+    ) -> super::requests::lease::LifecycleReply {
+        use super::requests::lease::{LeaseOutcome, LifecycleCmd, LifecycleReply};
+        match cmd {
+            LifecycleCmd::Open { seq, conn_id } => LifecycleReply::Opened {
+                seq,
+                conn_id,
+                result: Ok(()),
+            },
+            LifecycleCmd::Disconnect { seq, connection } => LifecycleReply::Disconnected {
+                seq,
+                conn_id: connection.id(),
+                outcome: LeaseOutcome::Disconnected {
+                    released: false,
+                    displaced_generation: 0,
+                },
+            },
+        }
+    }
     /// Installs a [`Primitive::Prepared`] with its slot's `path` after rechecking its stamp
     /// (as `commit_primitive`); no IK and no file I/O. Default: `UNSUPPORTED`.
     fn commit_prepared(&mut self, _d: &Descriptor, _primitive: &Primitive, _path: &PreparedPath, _ctx: &CommitCtx) -> Result<Committed, &'static str> {
@@ -493,8 +568,22 @@ pub trait CoreOps {
     fn consume_target(&mut self, frame: &TargetFrame, ctx: &CommitCtx) -> Result<(), Refusal>;
     /// Applies any pending urgent E-stop request; returns true when an E-stop was applied.
     fn apply_estop(&mut self) -> bool { false }
+    /// Synchronizes any non-blocking socket-close lease fence (lock-free, zero allocations)
+    /// before command commit, target intake, or bus output.
+    fn sync_disconnect_fence(&mut self, _now: Instant) -> bool { false }
     /// An authorized stop was requested: stop active motion.
     fn apply_stop(&mut self);
+    /// Applies an authorized stop at `generation` and synchronizes the owner's stop counter.
+    fn apply_stop_at(&mut self, _generation: u64) {
+        self.apply_stop();
+    }
+    /// Consumes a failed/aborted transition outcome recorded after Step 2 (e.g. an in-flight enable
+    /// aborted by `LeasePreempt`, `LeaseRelease`, `LeaseDisconnect`, Step 5 lease expiry, or
+    /// thermal supersede) so Step 6 publishes `torque_transition_pending == false` and Step 7
+    /// delivers the terminal strictly after publication and strictly before lifecycle/grant replies.
+    fn take_aborted_transition(&mut self) -> Option<&'static str> {
+        None
+    }
     /// Authorizes and applies one bounded urgent [`UrgentStop`] request at the owner.
     /// Only an authorized stop advances `stops` (`StopRequests`), inhibits output, and
     /// applies stop semantics before marking `stops` applied.
@@ -552,11 +641,42 @@ pub trait CoreOps {
     ) -> f64 {
         self.advance_output(dt, generation)
     }
+    /// Release-bounded [`Self::advance_output`] carrying a live monotonic clock sampler `now_fn`
+    /// and absolute `release_deadline` so pre-step and transmit-point deadline checks take fresh
+    /// clock reads rather than reusing `Checkpoint::BeforeOutput`.
+    fn advance_output_with_clock(
+        &mut self,
+        dt: f64,
+        generation: u64,
+        now_fn: &mut dyn FnMut() -> Instant,
+        release_deadline: Instant,
+    ) -> f64 {
+        let now = now_fn();
+        self.advance_output_with_deadline(dt, generation, now, release_deadline)
+    }
     /// Publishes the state computed by [`Self::advance_output`] at `timestamp` with `generation`.
     fn publish(&mut self, _timestamp: f64, _generation: u64) {}
     /// Current local monotonic observation timestamp (seconds), used when publishing after
     /// a sub-release transition wake before delivering its terminal.
     fn now_timestamp(&self) -> f64 { 0.0 }
+    /// Commits one action-family broker command (`InstallPrepared`, `BeginMacro`, `InstallChild`, `FinishMacro`).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn commit_action(
+        &mut self,
+        _d: &Descriptor,
+        _cmd: super::requests::actions::ActionCommand,
+        _slot: Option<PlanSlotRef<PlanSlot>>,
+        _ctx: &CommitCtx,
+    ) -> Result<Committed, &'static str> {
+        Err("UNSUPPORTED")
+    }
+    /// True while a macro parent's current child still owns trajectory, settle, or deferred TX.
+    fn macro_child_running(&self, _parent: ActionId) -> bool { false }
+    /// Attaches the broker's lock-free closed-connection bitset for RT commit checks.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn attach_closed_bitset(&mut self, _bitset: std::sync::Arc<super::requests::actions::ClosedBitset>) {}
+    /// Synchronizes the core's published [`BootId`] with the owning executor / fixture.
+    fn set_boot_id(&mut self, _boot: BootId) {}
 }
 
 /// Diagnostic fields recorded on the RT thread when an authorized stop arrives during a
@@ -677,9 +797,9 @@ pub(crate) fn static_code(e: ArmError) -> &'static str {
     use crate::safety::SafetyError as S;
     const KNOWN: &[&str] = &[
         "MOTION_BUSY", "NOT_ARMED", "ESTOP_ACTIVE", "FAULT_ACTIVE", "EPOCH_MISMATCH", "INVALID_COMMAND", "IK_UNREACHABLE",
-        "WORKSPACE_VIOLATION", "JOINT_LIMIT", "PLAN_STALE", "LEASE_LOST", "NO_LEASE", "COLLISION_HOLD", "COMMISSIONING_REQUIRED",
-        "INVALID_VALUE", "UNSUPPORTED", "INTERNAL", "FEEDBACK_STALE", "CONFIG_BUSY", "ARM_NOT_AT_RESTING_POSE", "TOOL_MISMATCH",
-        "MOTION_FORBIDDEN_IN_FAULT_STATE", "TORQUE_OFF_WOULD_DROP", "STOPPED", "TERMINALS_BUSY", "STAMP_REUSED",
+        "WORKSPACE_VIOLATION", "JOINT_LIMIT", "PLAN_STALE", "LEASE_LOST", "NO_LEASE", "DISCONNECTED", "COLLISION_HOLD", "COMMISSIONING_REQUIRED",
+        "INVALID_VALUE", "UNSUPPORTED", "INTERNAL", "FEEDBACK_STALE", "J7_FEEDBACK_STALE", "FEEDBACK_UNAVAILABLE", "CONFIG_BUSY", "ARM_NOT_AT_RESTING_POSE", "TOOL_MISMATCH",
+        "MOTION_FORBIDDEN_IN_FAULT_STATE", "TORQUE_OFF_WOULD_DROP", "STOPPED", "TERMINALS_BUSY", "STAMP_REUSED", "HANDOVER_SETTLING", "DISABLE_PENDING", "TRANSITION_BUSY",
     ];
     match &e {
         ArmError::Motion(m) => m.code(),
@@ -691,6 +811,8 @@ pub(crate) fn static_code(e: ArmError) -> &'static str {
             S::CollisionHold(_) => "COLLISION_HOLD",
             S::CommissioningRequired(_) => "COMMISSIONING_REQUIRED",
             S::MotionBusy => "MOTION_BUSY",
+            S::HandoverSettling => "HANDOVER_SETTLING",
+            S::FeedbackUnavailable => "FEEDBACK_UNAVAILABLE",
             S::WorkspaceViolation { .. } => "WORKSPACE_VIOLATION",
             S::ArmNotAtRestingPose { .. } => "ARM_NOT_AT_RESTING_POSE",
             S::MotionForbiddenInFaultState(_) => "MOTION_FORBIDDEN_IN_FAULT_STATE",
@@ -703,6 +825,7 @@ pub(crate) fn static_code(e: ArmError) -> &'static str {
         },
         ArmError::Unsupported(_) => "UNSUPPORTED",
         ArmError::WorkspaceRejected { .. } => "WORKSPACE_VIOLATION",
+        ArmError::RejectedStatic { code, .. } => code,
         ArmError::Rejected { code, .. } | ArmError::Detailed { code, .. } => {
             KNOWN.iter().find(|k| **k == code.as_str()).copied().unwrap_or("REJECTED")
         }
@@ -711,24 +834,34 @@ pub(crate) fn static_code(e: ArmError) -> &'static str {
 }
 
 impl SupervisorInner {
-    /// The lease valid at `now` (its generation names its holder).
-    fn lease_valid_at(&self, now: Instant) -> Option<&crate::supervisor::ActiveLease> {
-        self.active_lease.as_ref().filter(|l| now.saturating_duration_since(l.acquired_at) < self.lease_timeout)
+    /// The lease valid at `now` (unexpired, unfenced, and owning connection not closed).
+    pub(crate) fn lease_valid_at(&self, now: Instant) -> Option<&crate::supervisor::ActiveLease> {
+        let fenced = self.effective_fenced_lease_generation();
+        if self.active_lease_conn_id != 0 && self.is_connection_closed(self.active_lease_conn_id) {
+            return None;
+        }
+        self.active_lease.as_ref().filter(|l| {
+            l.generation > fenced
+                && now.saturating_duration_since(l.acquired_at) < self.lease_timeout
+        })
     }
 
-    /// The stamp checks every commit shares: identity, deadline, the current authority, and
-    /// a lease when leases are enforced.
+    /// The stamp checks every commit shares: registered live connection, identity, deadline,
+    /// current authority, and binding `d.stamp.client` to the active lease holder when leases are
+    /// enforced (M2).
     fn check_commit(&self, d: &Descriptor, ctx: &CommitCtx) -> Result<(), &'static str> {
+        self.check_client_connection_live(d.stamp.client.0)?;
         if let Some(code) = d.stamp.check(ctx.arm, ctx.boot, ctx.now, &self.authority(ctx)) { return Err(code); }
-        if self.lease_enabled && d.stamp.authority.lease_generation == 0 { return Err("NO_LEASE"); }
+        self.check_descriptor_lease_owner(d.stamp.client.0, d.stamp.authority.lease_generation)?;
         Ok(())
     }
 
     /// Stop-direction variant of [`Self::check_commit`]: exempt from `stop_generation` checks
     /// so an authorized Stop never blocks a queued torque disable.
     fn check_commit_stop_direction(&self, d: &Descriptor, ctx: &CommitCtx) -> Result<(), &'static str> {
+        self.check_client_connection_live(d.stamp.client.0)?;
         if let Some(code) = d.stamp.check_stop_direction(ctx.arm, ctx.boot, ctx.now, &self.authority(ctx)) { return Err(code); }
-        if self.lease_enabled && d.stamp.authority.lease_generation == 0 { return Err("NO_LEASE"); }
+        self.check_descriptor_lease_owner(d.stamp.client.0, d.stamp.authority.lease_generation)?;
         Ok(())
     }
 }
@@ -789,6 +922,8 @@ impl CoreOps for SupervisorInner {
         match primitive {
             // a prepared path is installed with its slot's samples (`commit_prepared`)
             Primitive::None | Primitive::Prepared { .. } => Err("INVALID_COMMAND"),
+            #[cfg(not(target_arch = "wasm32"))]
+            Primitive::Action(_) => Err("INVALID_COMMAND"),
             // macro children (track E): installed for the running macro named by the ticket;
             // the committed action is the parent (its terminal carries the child count)
             Primitive::CartesianPath { .. } | Primitive::Gripper { .. } | Primitive::JointQuinticLimited { .. } | Primitive::Replay { .. } => {
@@ -804,7 +939,9 @@ impl CoreOps for SupervisorInner {
                 if n == 0 || n > MAX_DOF {
                     return Err("INVALID_COMMAND");
                 }
-                if !start_matches(&start[..n], &self.commanded_positions) {
+                let mut eff_start = [0.0f32; MAX_DOF];
+                let (eff_dof, _) = self.post_quiesce_commanded_positions(&mut eff_start);
+                if !start_matches(&start[..n], &eff_start[..eff_dof]) {
                     return Err("PLAN_STALE");
                 }
                 self.jog_precheck_static()?;
@@ -858,15 +995,20 @@ impl CoreOps for SupervisorInner {
                 }
                 match child {
                     None => {
+                        let _ = self.validate_prepared_replay(n, path, kind, duration_s, epoch)?;
                         let prepared = self.prepared_replay_motion(n, path, kind, duration_s, power_scale, epoch).map_err(static_code)?;
                         let admitted = self.check_admission(stamp).map_err(|e| static_code(ArmError::Safety(e)))?;
                         committed(SupervisorInner::install_prepared_replay(admitted, prepared).map(|(id, _)| id))
                     }
-                    Some(spec) => self.commit_child_install(spec, &start[..n], ctx.now, move |this, id| {
-                        let prepared = this.prepared_replay_motion(n, path, kind, duration_s, power_scale, epoch)?;
-                        let admitted = this.check_admission(stamp).map_err(ArmError::from)?;
-                        SupervisorInner::install_macro_prepared_replay(admitted, id, prepared).map(drop)
-                    }).map(|parent| Committed::authorized(d, Some(parent))),
+                    Some(spec) => {
+                        self.commit_child_checks(&spec, &start[..n])?;
+                        let _ = self.validate_prepared_replay(n, path, kind, duration_s, epoch)?;
+                        self.commit_child_install(spec, &start[..n], ctx.now, move |this, id| {
+                            let prepared = this.prepared_replay_motion(n, path, kind, duration_s, power_scale, epoch)?;
+                            let admitted = this.check_admission(stamp).map_err(ArmError::from)?;
+                            SupervisorInner::install_macro_prepared_replay(admitted, id, prepared).map(drop)
+                        }).map(|parent| Committed::authorized(d, Some(parent)))
+                    }
                 }
             }
         }
@@ -911,71 +1053,98 @@ impl CoreOps for SupervisorInner {
                     }).map(|parent| Committed::authorized(d, Some(parent))),
                 }
             }
-            PathKind::Replay { .. } => {
+            PathKind::Replay { approach_duration_s, approach_power_scale, .. } => {
                 if !start_matches(&start[..n], &self.commanded_positions) {
                     return Err("PLAN_STALE");
                 }
                 match child {
                     None => {
                         let checked = self.validate_prepared_replay(n, &slot.path, kind, duration_s, epoch)?;
-                        let prepared = self.prepared_replay_from_slot_checked(n, slot, checked, duration_s, power_scale, epoch).map_err(static_code)?;
+                        let prepared = self.prepared_replay_from_slot_preplanned(
+                            n,
+                            &start[..n],
+                            slot,
+                            checked,
+                            duration_s,
+                            power_scale,
+                            approach_duration_s,
+                            approach_power_scale,
+                        )?;
                         let admitted = self.check_admission(stamp).map_err(|e| static_code(ArmError::Safety(e)))?;
                         committed(SupervisorInner::install_prepared_replay(admitted, prepared).map(|(id, _)| id))
                     }
-                    Some(spec) => self.commit_child_install(spec, &start[..n], ctx.now, move |this, id| {
-                        let prepared = this.prepared_replay_from_slot(n, slot, kind, duration_s, power_scale, epoch)?;
-                        let admitted = this.check_admission(stamp).map_err(ArmError::from)?;
-                        SupervisorInner::install_macro_prepared_replay(admitted, id, prepared).map(drop)
-                    }).map(|parent| Committed::authorized(d, Some(parent))),
+                    Some(spec) => {
+                        self.commit_child_checks(&spec, &start[..n])?;
+                        let checked = self.validate_prepared_replay(n, &slot.path, kind, duration_s, epoch)?;
+                        let prepared = self.prepared_replay_from_slot_preplanned(
+                            n,
+                            &start[..n],
+                            slot,
+                            checked,
+                            duration_s,
+                            power_scale,
+                            approach_duration_s,
+                            approach_power_scale,
+                        )?;
+                        self.commit_child_install(spec, &start[..n], ctx.now, move |this, id| {
+                            let admitted = this.check_admission(stamp).map_err(ArmError::from)?;
+                            SupervisorInner::install_macro_prepared_replay(admitted, id, prepared).map(drop)
+                        }).map(|parent| Committed::authorized(d, Some(parent)))
+                    }
                 }
             }
         }
     }
 
     fn commit_immediate(&mut self, d: &Descriptor, op: ImmediateOp, ctx: &CommitCtx) -> Result<Committed, &'static str> {
+        if matches!(op, ImmediateOp::Heartbeat) {
+            return super::requests::lease::install_broker_heartbeat(self, d, ctx)
+                .map(|()| Committed::authorized(d, None));
+        }
         match op {
             ImmediateOp::TorqueOff => self.check_commit_stop_direction(d, ctx)?,
-            ImmediateOp::Heartbeat | ImmediateOp::TorqueOn => self.check_commit(d, ctx)?,
+            ImmediateOp::TorqueOn => self.check_commit(d, ctx)?,
+            ImmediateOp::Heartbeat => unreachable!(),
         }
-        let r = match op {
-            // renews the lease the command was admitted under, if it is still valid at the
-            // commit instant (a queued renewal cannot resurrect an expired lease)
-            ImmediateOp::Heartbeat => {
-                let generation = d.stamp.authority.lease_generation;
-                match self.active_lease.as_mut().filter(|l| l.generation == generation && generation != 0) {
-                    Some(l) => {
-                        l.acquired_at = ctx.now;
-                        self.last_heartbeat = ctx.now;
-                        Ok(())
-                    }
-                    None => return Err(if generation == 0 { "NO_LEASE" } else { "LEASE_LOST" }),
-                }
-            }
+        match op {
+            ImmediateOp::Heartbeat => unreachable!(),
             ImmediateOp::TorqueOn => {
-                if self.driver.is_some() {
-                    return Err("UNSUPPORTED");
-                }
                 self.sync_stop_generation(ctx.stop_generation);
-                let stamp = crate::supervisor::AdmissionStamp::from_broker(
+                let stamp = crate::supervisor::AdmissionStamp::from_broker_conn(
                     d.stamp.authority.stop_generation,
                     d.stamp.authority.epoch,
                     d.stamp.authority.lease_generation,
+                    d.stamp.client.0,
                     d.stamp.request.0,
                 );
-                self.check_admission(stamp)
-                    .and_then(SupervisorInner::enable_torque)
-                    .map(drop)
-                    .map_err(ArmError::Safety)
+                let admitted = self
+                    .check_admission(stamp)
+                    .map_err(|e| static_code(ArmError::Safety(e)))?;
+                SupervisorInner::enable_torque_immediate_rt(admitted, ctx.now)?;
             }
             // Stop-direction action: exempt from stop-generation checks and Admitted.
             ImmediateOp::TorqueOff => {
-                if self.driver.is_some() {
-                    return Err("UNSUPPORTED");
-                }
-                return self.torque_off_rt_immediate().map(|()| Committed::authorized(d, None));
+                self.disable_torque_immediate_rt(ctx.now)?;
             }
-        };
-        r.map(|_| Committed::authorized(d, None)).map_err(static_code)
+        }
+        Ok(Committed::authorized(d, None))
+    }
+
+    fn commit_lease(
+        &mut self,
+        d: &Descriptor,
+        req: super::requests::lease::LeaseRequest,
+        ctx: &CommitCtx,
+    ) -> Result<super::requests::lease::LeaseOutcome, &'static str> {
+        super::requests::lease::commit_lease_descriptor(self, d, req, ctx)
+    }
+
+    fn handle_conn_lifecycle(
+        &mut self,
+        cmd: super::requests::lease::LifecycleCmd,
+        now: Instant,
+    ) -> super::requests::lease::LifecycleReply {
+        super::requests::lease::apply_conn_lifecycle(self, cmd, now)
     }
 
     fn commit_transition(&mut self, d: &Descriptor, op: TransitionOp, ctx: &CommitCtx) -> Result<Committed, &'static str> {
@@ -989,18 +1158,20 @@ impl CoreOps for SupervisorInner {
         let progress = match op {
             TransitionOp::TorqueOn => {
                 self.sync_stop_generation(ctx.stop_generation);
-                let stamp = crate::supervisor::AdmissionStamp::from_broker(
+                let stamp = crate::supervisor::AdmissionStamp::from_broker_conn(
                     d.stamp.authority.stop_generation,
                     d.stamp.authority.epoch,
                     d.stamp.authority.lease_generation,
+                    d.stamp.client.0,
                     d.stamp.request.0,
                 );
-                self.check_admission(stamp)
-                    .and_then(SupervisorInner::begin_enable_torque_transition)
-                    .map_err(|e| static_code(ArmError::Safety(e)))?
+                let admitted = self
+                    .check_admission(stamp)
+                    .map_err(|e| static_code(ArmError::Safety(e)))?;
+                super::requests::lease::install_torque_on_transition(admitted)?
             }
             // Stop-direction action: exempt from stop-generation checks and Admitted.
-            TransitionOp::TorqueOff => self.begin_disable_torque_transition()?,
+            TransitionOp::TorqueOff => super::requests::lease::install_torque_off_transition(self)?,
         };
         // the next service is the next poll (the begin's wake is on the driver's clock)
         self.core.begin_transition(progress.map(|p| match p { TorqueProgress::Pending { .. } => TorqueProgress::Pending { wake: ctx.now }, done => done }));
@@ -1030,8 +1201,25 @@ impl CoreOps for SupervisorInner {
 
     fn apply_estop(&mut self) -> bool { self.consume_pending_estop() }
 
+    fn sync_disconnect_fence(&mut self, now: Instant) -> bool {
+        self.sync_nonblocking_disconnect_fence(now)
+    }
+
     // ends client motion; a running watchdog park belongs to the lease watchdog and continues
     fn apply_stop(&mut self) { self.authorized_stop(); }
+
+    fn apply_stop_at(&mut self, generation: u64) {
+        self.authorized_stop();
+        self.sync_stop_generation(generation);
+    }
+
+    fn take_aborted_transition(&mut self) -> Option<&'static str> {
+        if self.torque_transition.is_none() {
+            self.core.take_aborted_transition()
+        } else {
+            None
+        }
+    }
 
     fn handle_urgent_stop(
         &mut self,
@@ -1143,12 +1331,46 @@ impl CoreOps for SupervisorInner {
         self.tick_control_with_deadline(dt, now, release_deadline)
     }
 
+    fn advance_output_with_clock(
+        &mut self,
+        dt: f64,
+        _generation: u64,
+        now_fn: &mut dyn FnMut() -> Instant,
+        release_deadline: Instant,
+    ) -> f64 {
+        self.tick_control_with_clock(dt, now_fn, release_deadline)
+    }
+
     fn publish(&mut self, timestamp: f64, generation: u64) {
         drop(self.publish_at(timestamp, generation, false));
     }
 
     fn now_timestamp(&self) -> f64 {
         self.now_s()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn commit_action(
+        &mut self,
+        d: &Descriptor,
+        cmd: super::requests::actions::ActionCommand,
+        slot: Option<PlanSlotRef<PlanSlot>>,
+        ctx: &CommitCtx,
+    ) -> Result<Committed, &'static str> {
+        super::requests::actions::commit_action(self, d, cmd, slot, ctx)
+    }
+
+    fn macro_child_running(&self, parent: ActionId) -> bool {
+        SupervisorInner::macro_child_running(self, parent.0)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn attach_closed_bitset(&mut self, bitset: std::sync::Arc<super::requests::actions::ClosedBitset>) {
+        SupervisorInner::attach_closed_bitset(self, bitset);
+    }
+
+    fn set_boot_id(&mut self, boot: BootId) {
+        self.boot_id = boot;
     }
 }
 
@@ -1326,13 +1548,43 @@ impl crate::transport::DriverClock for VirtualClock {
 /// 5. Urgent recheck (`BeforeOutput`), then advance control output (`dt`).
 /// 6. Publish observation and RT inputs.
 /// 7. Deliver terminals (completed transition terminal, then active-action terminal).
+enum ActiveSlot {
+    Standalone(Installed),
+    #[cfg(not(target_arch = "wasm32"))]
+    Macro {
+        parent: Installed,
+        child_plan: Option<super::broker::PlanHandle>,
+    },
+}
+
+impl ActiveSlot {
+    fn action(&self) -> ActionId {
+        match self {
+            Self::Standalone(i) => i.action(),
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::Macro { parent, .. } => parent.action(),
+        }
+    }
+
+    fn into_parts(self) -> (Installed, Option<super::broker::PlanHandle>) {
+        match self {
+            Self::Standalone(i) => (i, None),
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::Macro { parent, child_plan } => (parent, child_plan),
+        }
+    }
+}
+
 pub struct ReleaseEngine {
     intake: RtIntake<PlanSlot>,
     targets: TargetReader,
     stop: StopRequests,
     urgent_stops: Option<UrgentStopIntake>,
     urgent_replies_flushed: bool,
-    active: Option<Installed>,
+    conn_lifecycle: Option<super::requests::lease::ConnLifecycleIntake>,
+    lifecycle_replies_flushed: bool,
+    eviction_tx: Option<rtrb::Producer<(super::requests::lease::ConnectionHandle, u64)>>,
+    active: Option<ActiveSlot>,
     /// The driver transition in flight.
     transition: Option<Installed>,
     releases: u64,
@@ -1352,6 +1604,9 @@ impl ReleaseEngine {
                 stop: stop.clone(),
                 urgent_stops: None,
                 urgent_replies_flushed: false,
+                conn_lifecycle: None,
+                lifecycle_replies_flushed: false,
+                eviction_tx: None,
                 active: None,
                 transition: None,
                 releases: 0,
@@ -1367,6 +1622,44 @@ impl ReleaseEngine {
     /// checkpoint (`BeforeCommit`, `BeforeTarget`, `BeforeOutput`), and sub-release wakes.
     pub fn attach_urgent_stops(&mut self, intake: UrgentStopIntake) {
         self.urgent_stops = Some(intake);
+    }
+
+    /// Attaches the dedicated priority connection lifecycle intake (`Open` / `Disconnect`),
+    /// drained at Step 1, every checkpoint, and sub-release wakes, with replies flushed after Step 6 publish.
+    pub fn attach_conn_lifecycle(&mut self, intake: super::requests::lease::ConnLifecycleIntake) {
+        self.conn_lifecycle = Some(intake);
+    }
+
+    /// Attaches the bounded post-publication lease eviction notification ring (0 RT allocs) so
+    /// committed preemptions deliver `lease_lost(reason: "preempted")` to the evictee even if the
+    /// preempting requester disconnects before receiving its own `Reply::Lease`.
+    pub fn attach_eviction_tx(
+        &mut self,
+        tx: rtrb::Producer<(super::requests::lease::ConnectionHandle, u64)>,
+    ) {
+        self.eviction_tx = Some(tx);
+    }
+
+    pub fn has_pending_lifecycle_replies(&self) -> bool {
+        self.conn_lifecycle
+            .as_ref()
+            .is_some_and(super::requests::lease::ConnLifecycleIntake::has_pending_replies)
+    }
+
+    pub fn flush_lifecycle_replies(&mut self) -> bool {
+        self.conn_lifecycle
+            .as_mut()
+            .is_some_and(super::requests::lease::ConnLifecycleIntake::flush_replies)
+    }
+
+    pub fn take_lifecycle_replies_flushed(&mut self) -> bool {
+        std::mem::take(&mut self.lifecycle_replies_flushed)
+    }
+
+    pub fn drain_conn_lifecycle_stopped(&mut self, flush_existing: bool) -> bool {
+        self.conn_lifecycle
+            .as_mut()
+            .is_some_and(|intake| intake.drain_stopped(flush_existing))
     }
 
     pub fn has_pending_urgent_stop_replies(&self) -> bool {
@@ -1401,7 +1694,7 @@ impl ReleaseEngine {
 
     pub fn boot(&self) -> BootId { self.intake.boot() }
     pub fn releases(&self) -> u64 { self.releases }
-    pub fn active(&self) -> Option<ActionId> { self.active.as_ref().map(Installed::action) }
+    pub fn active(&self) -> Option<ActionId> { self.active.as_ref().map(ActiveSlot::action) }
     pub fn transition(&self) -> Option<ActionId> { self.transition.as_ref().map(Installed::action) }
     pub fn reply_overflow(&self) -> u64 { self.intake.reply_overflow() }
     pub fn stop_requests(&self) -> &StopRequests { &self.stop }
@@ -1416,15 +1709,18 @@ impl ReleaseEngine {
     pub fn apply_pending_stop<O: CoreOps>(&mut self, core: &mut O) -> bool {
         let generation = self.stop.current();
         if generation == self.stop.applied() { return false; }
-        core.apply_stop();
+        core.apply_stop_at(generation);
         self.stop.mark_applied(generation);
         true
     }
 
-    /// Applies any pending urgent E-stop, bounded urgent `Stop` handoffs (authorized against
-    /// the owner's lease at `now`), and/or direct `StopRequests`; true when any applied.
+    /// Applies any pending urgent E-stop, priority connection lifecycle (`Open`/`Disconnect`),
+    /// bounded urgent `Stop` handoffs (authorized against the owner's lease at `now`), and/or
+    /// direct `StopRequests`; true when any urgent stop applied.
     pub fn apply_pending_urgent_at<O: CoreOps>(&mut self, core: &mut O, now: Instant) -> bool {
         let estop = core.apply_estop();
+        let _lifecycle = self.drain_conn_lifecycle_at(core, now);
+        let _fence = core.sync_disconnect_fence(now);
         let urgent_handoff = if let Some(intake) = self.urgent_stops.as_mut() {
             let stops = &self.stop;
             intake.drain_requests(|req| core.handle_urgent_stop(req, stops, now))
@@ -1433,6 +1729,15 @@ impl ReleaseEngine {
         };
         let stop = self.apply_pending_stop(core);
         estop || urgent_handoff || stop
+    }
+
+    /// Drains pending priority connection lifecycle commands (`Open` / `Disconnect`) at `now`.
+    fn drain_conn_lifecycle_at<O: CoreOps>(&mut self, core: &mut O, now: Instant) -> bool {
+        if let Some(intake) = self.conn_lifecycle.as_mut() {
+            intake.drain_requests(|cmd| core.handle_conn_lifecycle(cmd, now))
+        } else {
+            false
+        }
     }
 
     /// Applies any pending urgent E-stop and/or authorized-stop requests at `Instant::now()`.
@@ -1463,6 +1768,26 @@ impl ReleaseEngine {
             if let Some(t) = self.transition.take() {
                 report.transition_ended = Some((t.action(), outcome));
                 return Some((t, outcome));
+            }
+        }
+        None
+    }
+
+    /// Consumes a mid-release aborted transition (`Err(code)`) at the common pre-publish boundary
+    /// so Step 6 publishes `torque_transition_pending == false` while Step 7 emits the terminal
+    /// strictly AFTER publication and strictly BEFORE lifecycle or replacement-lease replies.
+    fn take_aborted_transition<O: CoreOps>(
+        &mut self,
+        core: &mut O,
+        report: &mut ReleaseReport,
+    ) -> Option<(Installed, Outcome)> {
+        if self.transition.is_some() {
+            if let Some(code) = core.take_aborted_transition() {
+                return self.transition.take().map(|t| {
+                    let outcome = Outcome::Failed(code);
+                    report.transition_ended = Some((t.action(), outcome));
+                    (t, outcome)
+                });
             }
         }
         None
@@ -1511,66 +1836,207 @@ impl ReleaseEngine {
         let pre_ctx = self.ctx(now_fn());
         let stopping = pre_commit(core, &pre_ctx);
         if stopping {
+            let ended_transition = finished_transition
+                .or_else(|| self.take_aborted_transition(core, &mut report));
             // Single publication boundary: publish any Step 1-2b state changes (such as an E-stop
-            // or finished transition) strictly BEFORE delivering terminals, maintenance replies,
-            // urgent stop replies, or E-stop acknowledgements.
+            // or finished/aborted transition) strictly BEFORE delivering terminals, urgent stop
+            // replies, lifecycle replies, maintenance replies, or E-stop acknowledgements.
             let ts = core.now_timestamp();
             core.publish(ts, publish_generation);
+            if let Some((t, outcome)) = ended_transition {
+                self.intake.terminal(t, outcome);
+            }
             if self.flush_urgent_stop_replies() {
                 self.urgent_replies_flushed = true;
             }
-            if let Some((t, outcome)) = finished_transition {
-                self.intake.terminal(t, outcome);
+            if self.flush_lifecycle_replies() {
+                self.lifecycle_replies_flushed = true;
             }
             return report;
         }
-        // 3. Urgent recheck + at most one ordinary command
+        // 3. Urgent recheck + at most one ordinary command (replies deferred until strictly AFTER Step 6 publish)
         self.intake.begin_release(self.releases);
         let ctx = self.checkpoint(core, Checkpoint::BeforeCommit, &mut now_fn, &mut report);
-        let mut superseded_and_ack: Option<(Installed, super::broker::Reply)> = None;
+        let mut superseded_and_ack: Option<(Installed, Outcome, u32, super::broker::Reply)> = None;
+        let mut deferred_step3_reply: Option<super::broker::Reply> = None;
+        let mut deferred_eviction: Option<(super::requests::lease::ConnectionHandle, u64)> = None;
+        let mut retire_after_take: Option<super::broker::PlanHandle> = None;
+        let mut transition_installed_this_release = false;
         if let Some(t) = self.intake.take() {
             let d = *t.descriptor();
-            let result = match d.kind {
-                CommandKind::Install { .. } => match t.plan() {
-                    None => Err("PLAN_RETIRED"),
-                    Some(slot) if matches!(slot.primitive, Primitive::Prepared { .. }) => match t.plan_ref() {
-                        Some(slot_ref) => core.commit_prepared_slot(&d, slot_ref, &ctx),
-                        None => Err("PLAN_RETIRED"),
-                    },
-                    Some(slot) => core.commit_primitive(&d, &slot.primitive, &ctx),
-                },
-                CommandKind::Immediate(op) => core.commit_immediate(&d, op, &ctx),
-                CommandKind::Transition(op) => core.commit_transition_for_release(&d, op, &ctx, release_deadline),
-            };
-            report.command = Some((d.stamp.request, match result {
-                Ok(c) => {
-                    let install = matches!(d.kind, CommandKind::Install { .. });
-                    let supersedes = install && c.action().is_some() && c.request() == d.stamp.request && self.active.is_some();
-                    if supersedes {
-                        t.ack_deferred(c).map(|(acked, ack_reply)| {
-                            let old = self.active.take().expect("checked active.is_some()");
-                            superseded_and_ack = Some((old, ack_reply));
-                            if let Some(i) = acked.installed {
-                                self.active = Some(i);
+            match d.kind {
+                CommandKind::Lease(req) => {
+                    let result = core.commit_lease(&d, req, &ctx);
+                    report.command = Some((d.stamp.request, match result {
+                        Ok(outcome) => {
+                            if let super::requests::lease::LeaseOutcome::Granted {
+                                evicted_connection: Some(ev_conn),
+                                evicted_generation: ev_gen,
+                                ..
+                            } = outcome
+                            {
+                                deferred_eviction = Some((ev_conn, ev_gen));
                             }
-                            acked.commit_seq
+                            let (commit_seq, reply) = t.ack_lease_deferred(outcome);
+                            deferred_step3_reply = Some(reply);
+                            Ok(commit_seq)
+                        }
+                        Err(code) => {
+                            deferred_step3_reply = Some(t.refuse_deferred(code));
+                            Err(code)
+                        }
+                    }));
+                }
+                _ => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let is_begin_macro = matches!(d.kind, CommandKind::Action(super::requests::actions::ActionCommand::BeginMacro(_)));
+                    #[cfg(target_arch = "wasm32")]
+                    let is_begin_macro = false;
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let is_action_cmd = matches!(d.kind, CommandKind::Action(_));
+                    #[cfg(target_arch = "wasm32")]
+                    let is_action_cmd = false;
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let is_child_cmd = matches!(d.kind, CommandKind::Action(super::requests::actions::ActionCommand::InstallChild { .. }));
+                    #[cfg(target_arch = "wasm32")]
+                    let is_child_cmd = false;
+                    let starts_top_action = match d.kind {
+                        CommandKind::Install { .. } => true,
+                        #[cfg(not(target_arch = "wasm32"))]
+                        CommandKind::Action(a) => a.starts_action(),
+                        CommandKind::Immediate(_) | CommandKind::Transition(_) | CommandKind::Lease(_) => false,
+                    };
+                    // Provisional read-only capture before Step 3 mutates `core`: if a Step-1 Stop
+                    // already ended the prior active action/macro, preserve its exact outcome & children
+                    // ONLY if the new command commits (refusal leaves `self.active` untouched).
+                    let prior_ended = if starts_top_action {
+                        self.active.as_ref().map(ActiveSlot::action).and_then(|old_id| {
+                            core.action_outcome(old_id).map(|o| (o, core.action_children(old_id)))
                         })
                     } else {
-                        t.ack(c).map(|acked| {
-                            match acked.installed {
-                                Some(i) if install => self.active = Some(i),
-                                Some(i) => self.transition = Some(i),
-                                None => {}
+                        None
+                    };
+                    let result = match d.kind {
+                        CommandKind::Install { .. } => {
+                            #[cfg(not(target_arch = "wasm32"))]
+                            let mixed_a7_child = matches!(self.active, Some(ActiveSlot::Macro { .. }))
+                                && t.plan().is_some_and(|p| p.primitive.child().is_some());
+                            #[cfg(target_arch = "wasm32")]
+                            let mixed_a7_child = false;
+                            if mixed_a7_child {
+                                Err("UNSUPPORTED")
+                            } else {
+                                match t.plan() {
+                                    None => Err("PLAN_RETIRED"),
+                                    Some(slot) if matches!(slot.primitive, Primitive::Prepared { .. }) => match t.plan_ref() {
+                                        Some(slot_ref) => core.commit_prepared_slot(&d, slot_ref, &ctx),
+                                        None => Err("PLAN_RETIRED"),
+                                    },
+                                    Some(slot) => core.commit_primitive(&d, &slot.primitive, &ctx),
+                                }
                             }
-                            acked.commit_seq
-                        })
-                    }
+                        }
+                        CommandKind::Immediate(op) => core.commit_immediate(&d, op, &ctx),
+                        CommandKind::Transition(op) => core.commit_transition_for_release(&d, op, &ctx, release_deadline),
+                        #[cfg(not(target_arch = "wasm32"))]
+                        CommandKind::Action(cmd) => {
+                            let slot_res = if cmd.plan().is_some() {
+                                t.plan_ref().map(Some).ok_or("PLAN_RETIRED")
+                            } else {
+                                Ok(None)
+                            };
+                            match slot_res {
+                                Ok(slot_ref) => core.commit_action(&d, cmd, slot_ref, &ctx),
+                                Err(code) => Err(code),
+                            }
+                        }
+                        CommandKind::Lease(_) => unreachable!(),
+                    };
+                    report.command = Some((d.stamp.request, match result {
+                        Ok(c) => {
+                            let install = matches!(d.kind, CommandKind::Install { .. });
+                            let supersedes = starts_top_action && c.action().is_some() && c.request() == d.stamp.request && self.active.is_some();
+                            if supersedes {
+                                t.ack_deferred(c).map(|(acked, ack_reply)| {
+                                    let old_slot = self.active.take().expect("checked active.is_some()");
+                                    let (old_installed, old_child_plan) = old_slot.into_parts();
+                                    retire_after_take = old_child_plan;
+                                    let (old_outcome, old_children) = prior_ended
+                                        .unwrap_or_else(|| (Outcome::Superseded, core.action_children(old_installed.action())));
+                                    superseded_and_ack = Some((old_installed, old_outcome, old_children, ack_reply));
+                                    if let Some(i) = acked.installed {
+                                        #[cfg(not(target_arch = "wasm32"))]
+                                        {
+                                            self.active = Some(if is_begin_macro {
+                                                ActiveSlot::Macro { parent: i, child_plan: None }
+                                            } else {
+                                                ActiveSlot::Standalone(i)
+                                            });
+                                        }
+                                        #[cfg(target_arch = "wasm32")]
+                                        {
+                                            let _ = is_begin_macro;
+                                            self.active = Some(ActiveSlot::Standalone(i));
+                                        }
+                                    }
+                                    acked.commit_seq
+                                })
+                            } else if is_action_cmd {
+                                t.ack_deferred(c).map(|(acked, ack_reply)| {
+                                    deferred_step3_reply = Some(ack_reply);
+                                    if is_child_cmd {
+                                        #[cfg(not(target_arch = "wasm32"))]
+                                        if let Some(new_cp) = d.kind.plan() {
+                                            if let Some(ActiveSlot::Macro { child_plan, .. }) = self.active.as_mut() {
+                                                retire_after_take = child_plan.replace(new_cp);
+                                            } else {
+                                                retire_after_take = Some(new_cp);
+                                            }
+                                        }
+                                    } else if let Some(i) = acked.installed {
+                                        #[cfg(not(target_arch = "wasm32"))]
+                                        {
+                                            self.active = Some(if is_begin_macro {
+                                                ActiveSlot::Macro { parent: i, child_plan: None }
+                                            } else {
+                                                ActiveSlot::Standalone(i)
+                                            });
+                                        }
+                                        #[cfg(target_arch = "wasm32")]
+                                        {
+                                            self.active = Some(ActiveSlot::Standalone(i));
+                                        }
+                                    }
+                                    acked.commit_seq
+                                })
+                            } else if install {
+                                t.ack(c).map(|acked| {
+                                    if let Some(i) = acked.installed {
+                                        self.active = Some(ActiveSlot::Standalone(i));
+                                    }
+                                    acked.commit_seq
+                                })
+                            } else {
+                                t.ack_deferred(c).map(|(acked, ack_reply)| {
+                                    if let Some(i) = acked.installed {
+                                        self.transition = Some(i);
+                                        transition_installed_this_release = true;
+                                    }
+                                    deferred_step3_reply = Some(ack_reply);
+                                    acked.commit_seq
+                                })
+                            }
+                        }
+                        Err(code) => {
+                            deferred_step3_reply = Some(t.refuse_deferred(code));
+                            Err(code)
+                        }
+                    }));
                 }
-                Err(code) => {
-                    t.refuse(code);
-                    Err(code)
-                }
-            }));
+            }
+        }
+        if let Some(cp) = retire_after_take {
+            self.intake.retire_plan(cp);
         }
         // 4. Unconditional urgent recheck + consume at most one latest target
         let ctx = self.checkpoint(core, Checkpoint::BeforeTarget, &mut now_fn, &mut report);
@@ -1580,25 +2046,69 @@ impl ReleaseEngine {
             report.target_refusal = result.err();
             report.target = Some((f.seq, result.map_err(|r| r.code)));
         }
-        // 5. Urgent recheck + advance control output
-        let out_ctx = self.checkpoint(core, Checkpoint::BeforeOutput, &mut now_fn, &mut report);
-        let timestamp = core.advance_output_with_deadline(dt, publish_generation, out_ctx.now, release_deadline);
+        // 5. Urgent recheck + advance control output (passes live `now_fn` so pre-step and
+        //    transmit-point macro deadline checks always take fresh clock reads).
+        let _out_ctx = self.checkpoint(core, Checkpoint::BeforeOutput, &mut now_fn, &mut report);
+        let timestamp = core.advance_output_with_clock(dt, publish_generation, &mut now_fn, release_deadline);
+        // Consume any transition aborted during Steps 2b-5 (including one installed in Step 3 and
+        // fenced by Disconnect/expiry in Steps 4-5) at the single pre-publish boundary so Step 6
+        // publishes `torque_transition_pending == false`, while Step 7 delivers replies strictly
+        // AFTER publication (and emits a same-release transition's own broker ACK before its
+        // abort Terminal, both strictly BEFORE lifecycle replies).
+        let aborted_transition = if finished_transition.is_none() {
+            self.take_aborted_transition(core, &mut report)
+        } else {
+            None
+        };
         // 6. Publish
         core.publish(timestamp, publish_generation);
-        // 7. Deliver urgent stop replies and terminals strictly AFTER publish
+        // 7. Deliver aborted/finished transition terminals, urgent stop replies, lifecycle replies,
+        //    Step 3 replies, and active-action terminals strictly AFTER publish.
+        if transition_installed_this_release {
+            if let Some((t, outcome)) = aborted_transition {
+                if let Some(ack_reply) = deferred_step3_reply.take() {
+                    self.intake.emit_reply(ack_reply);
+                }
+                self.intake.terminal(t, outcome);
+            } else if let Some((t, outcome)) = finished_transition {
+                self.intake.terminal(t, outcome);
+            }
+        } else if let Some((t, outcome)) = finished_transition.or(aborted_transition) {
+            self.intake.terminal(t, outcome);
+        }
         if self.flush_urgent_stop_replies() {
             self.urgent_replies_flushed = true;
         }
-        if let Some((t, outcome)) = finished_transition {
-            self.intake.terminal(t, outcome);
+        if self.flush_lifecycle_replies() {
+            self.lifecycle_replies_flushed = true;
         }
-        if let Some((old, ack_reply)) = superseded_and_ack {
-            self.intake.terminal(old, Outcome::Superseded);
+        if let Some((old, outcome, children, ack_reply)) = superseded_and_ack {
+            self.intake.terminal_with_children(old, outcome, children);
             self.intake.emit_reply(ack_reply);
+        }
+        if let Some(reply) = deferred_step3_reply {
+            self.intake.emit_reply(reply);
+        }
+        if let Some(eviction) = deferred_eviction {
+            if let Some(tx) = self.eviction_tx.as_mut() {
+                let _ = tx.push(eviction);
+            }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(ActiveSlot::Macro { parent, child_plan }) = self.active.as_mut() {
+            if child_plan.is_some() && !core.macro_child_running(parent.action()) {
+                if let Some(cp) = child_plan.take() {
+                    self.intake.retire_plan(cp);
+                }
+            }
         }
         if let Some(action) = self.active() {
             if let Some(outcome) = core.action_outcome(action) {
-                let installed = self.active.take().expect("active above");
+                let slot = self.active.take().expect("active above");
+                let (installed, child_plan) = slot.into_parts();
+                if let Some(cp) = child_plan {
+                    self.intake.retire_plan(cp);
+                }
                 let children = core.action_children(action);
                 self.intake.terminal_with_children(installed, outcome, children);
                 report.ended = Some((action, outcome));
@@ -1608,9 +2118,9 @@ impl ReleaseEngine {
     }
 
     /// Runs one sub-release transition wake on `core` (no full feedback poll, no output step).
-    /// When the transition completes or an urgent stop applies on this wake, publishes the
-    /// updated state at `publish_generation` BEFORE delivering replies/terminals and returns `true`.
-    /// Refusal-only urgent stops still flush their replies promptly without publishing.
+    /// When the transition completes, a lifecycle command mutated state, or an urgent stop applies
+    /// on this wake, publishes the updated state at `publish_generation` BEFORE delivering
+    /// replies/terminals and returns `true`.
     pub fn service_wake<O: CoreOps>(
         &mut self,
         core: &mut O,
@@ -1620,18 +2130,24 @@ impl ReleaseEngine {
         report: &mut ReleaseReport,
     ) -> bool {
         let urgent_applied = self.apply_pending_urgent_at(core, now);
+        let lifecycle_pending = self.has_pending_lifecycle_replies();
         if urgent_applied { report.stopped = true; }
         let budget = ServiceBudget::for_release(now, release_deadline);
         report.poll = core.poll_transition_wake_for_release(&budget, release_deadline);
-        let finished = self.take_finished_transition(report);
-        if urgent_applied || finished.is_some() {
+        let finished = self
+            .take_finished_transition(report)
+            .or_else(|| self.take_aborted_transition(core, report));
+        if urgent_applied || lifecycle_pending || finished.is_some() {
             let ts = core.now_timestamp();
             core.publish(ts, publish_generation);
+            if let Some((t, outcome)) = finished {
+                self.intake.terminal(t, outcome);
+            }
             if self.flush_urgent_stop_replies() {
                 self.urgent_replies_flushed = true;
             }
-            if let Some((t, outcome)) = finished {
-                self.intake.terminal(t, outcome);
+            if self.flush_lifecycle_replies() {
+                self.lifecycle_replies_flushed = true;
             }
             return true;
         }
@@ -1676,12 +2192,15 @@ impl<O: CoreOps> ReleaseFixture<O> {
 
     /// [`Self::new`] driven by a caller-supplied shared [`VirtualClock`].
     pub fn new_with_clock(
-        core: O,
+        mut core: O,
         boot: BootId,
         caps: Capacities,
         clock: VirtualClock,
     ) -> (Self, Broker<PlanSlot>, TargetWriter, StopRequests) {
         let (engine, broker, tw, stop) = ReleaseEngine::new(boot, caps);
+        #[cfg(not(target_arch = "wasm32"))]
+        core.attach_closed_bitset(broker.closed_bitset());
+        core.set_boot_id(boot);
         (Self { core, engine, clock, dt: 0.02 }, broker, tw, stop)
     }
 
@@ -1699,6 +2218,11 @@ impl<O: CoreOps> ReleaseFixture<O> {
     /// Attaches a bounded urgent-stop intake for deterministic fixture tests.
     pub fn attach_urgent_stops(&mut self, intake: UrgentStopIntake) {
         self.engine.attach_urgent_stops(intake);
+    }
+
+    /// Attaches a priority connection lifecycle intake for deterministic fixture tests.
+    pub fn attach_conn_lifecycle(&mut self, intake: super::requests::lease::ConnLifecycleIntake) {
+        self.engine.attach_conn_lifecycle(intake);
     }
 
     /// The fixture's virtual clock (clone it to advance time from a test).
@@ -1720,11 +2244,18 @@ impl<O: CoreOps> ReleaseFixture<O> {
 
     /// One release.
     pub fn step(&mut self) -> ReleaseReport {
+        let clock = self.clock.clone();
+        self.step_with_clock(move || clock.now())
+    }
+
+    /// One release using an explicit live clock sampler `now_fn` for all in-release timestamps
+    /// (`BeforeCommit`, `BeforeTarget`, `BeforeOutput`, pre-step, transmit, and post-output),
+    /// while release scheduling/deadline remains anchored to `self.clock`.
+    pub fn step_with_clock(&mut self, now_fn: impl FnMut() -> Instant) -> ReleaseReport {
         let started = self.clock.now();
         let release_deadline = started + Duration::from_secs_f64(self.dt);
         let next_gen = self.engine.releases() + 1;
-        let clock = &self.clock;
-        let mut report = self.engine.step(&mut self.core, || clock.now(), self.dt, release_deadline, next_gen);
+        let mut report = self.engine.step(&mut self.core, now_fn, self.dt, release_deadline, next_gen);
         // Extra sub-release hardware services at a pending transition's wake before the next release
         // (a transition committed in this release is first served at the next one).
         let mut next = report.poll.wake_before(release_deadline);

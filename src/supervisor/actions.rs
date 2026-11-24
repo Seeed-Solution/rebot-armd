@@ -28,31 +28,24 @@ impl SupervisorInner {
         self.table_still_anchor_positions.clear();
     }
 
-    pub fn check_table_capture_stillness(&self) -> Result<(), ArmError> {
+    /// Zero-allocation stillness check backing [`Self::check_table_capture_stillness`].
+    pub(crate) fn check_table_capture_stillness_static(&self) -> Result<(), &'static str> {
         if !self.feedback_numeric_valid {
-            return Err(MotionError::InvalidCommand(
-                "table_z_from_tcp requires valid joint feedback".into(),
-            ).into());
+            return Err("table_z_from_tcp requires valid joint feedback");
         }
         if self.driver.is_some() && !self.hardware_feedback_fresh(Duration::from_millis(250)) {
-            return Err(MotionError::InvalidCommand(
-                "table_z_from_tcp requires fresh joint feedback".into(),
-            ).into());
+            return Err("table_z_from_tcp requires fresh joint feedback");
         }
         if self.active_trajectory.is_some()
             || self.servo_target.is_some()
             || self.commanded_velocities.iter().any(|v| v.abs() > 1e-3)
         {
-            return Err(MotionError::InvalidCommand(
-                "table_z_from_tcp requires the arm to be stationary".into(),
-            ).into());
+            return Err("table_z_from_tcp requires the arm to be stationary");
         }
         if self.measured_velocities.len() != self.config.dof
             || self.measured_velocities.iter().any(|v| !v.is_finite() || v.abs() > 0.02)
         {
-            return Err(MotionError::InvalidCommand(
-                "table_z_from_tcp requires measured joint velocities <= 0.02 rad/s".into(),
-            ).into());
+            return Err("table_z_from_tcp requires measured joint velocities <= 0.02 rad/s");
         }
         if self.driver.is_some() || self.still_window_ever_moved {
             let settled = if self.driver.is_some() {
@@ -75,12 +68,15 @@ impl SupervisorInner {
                         .all(|(m, a)| m.is_finite() && (m - a).abs() <= UNLOAD_STILL_POSITION_SPAN_RAD)
             };
             if !settled {
-                return Err(MotionError::InvalidCommand(
-                    "table_z_from_tcp requires the arm to remain still for at least 0.2 s with fresh distinct hardware samples".into(),
-                ).into());
+                return Err("table_z_from_tcp requires the arm to remain still for at least 0.2 s with fresh distinct hardware samples");
             }
         }
         Ok(())
+    }
+
+    pub fn check_table_capture_stillness(&self) -> Result<(), ArmError> {
+        self.check_table_capture_stillness_static()
+            .map_err(|msg| MotionError::InvalidCommand(msg.into()).into())
     }
 
     /// Start a new action record; a running one is cancelled as SUPERSEDED.
@@ -96,8 +92,15 @@ impl SupervisorInner {
 
     fn begin_action_inner(&mut self, kind: &str, tag: Option<String>, format_superseded_msg: bool) -> u64 {
         let now = self.now_s();
+        // Clean up old macro bookkeeping without overwriting the newly prepared motion's
+        // `target_positions` or resetting `safety` back to `Armed` (caller already quiesced
+        // any old macro gripper hold before building the replacement trajectory).
+        if let Some(old_id) = self.macro_run.as_ref().map(|m| m.id) {
+            if self.quintic_settle.as_ref().is_some_and(|(sid, _)| *sid == old_id) {
+                self.quintic_settle = None;
+            }
+        }
         self.pending_deferred_done = None;
-        // any new action ends a running macro (its orchestrator sees the record cancelled)
         self.drop_macro_run("cancelled", Some("SUPERSEDED"));
         #[cfg(feature = "policy-runtime")]
         if let Some(mut run) = self.policy_run.take() {
@@ -224,10 +227,24 @@ impl SupervisorInner {
         }
     }
 
+    pub(crate) fn retire_zero_check_ctx(&mut self, ctx: Box<ZeroCheckPersistContext>) {
+        if self.retired_zero_check_ctx.len() < self.retired_zero_check_ctx.capacity() {
+            self.retired_zero_check_ctx.push_back(ctx);
+        } else {
+            // Only reachable if off-thread drain was never attached (standalone legacy tests).
+            drop(ctx);
+        }
+    }
+
+    pub(crate) fn pop_retired_zero_check_ctx(&mut self) -> Option<Box<ZeroCheckPersistContext>> {
+        self.retired_zero_check_ctx.pop_front()
+    }
+
     pub fn finish_action(&mut self, id: u64, state: &str, code: Option<&str>, message: Option<String>,
                      settled: Option<bool>, holding: Option<bool>, gap: Option<f32>) {
         let now = self.now_s();
-        let mut store_offset_req: Option<(f32, Option<(crate::auth::OperatorAuth, Option<String>)>)> = None;
+        let mut store_offset_req: Option<(f32, Box<ZeroCheckPersistContext>)> = None;
+        let mut retired_ctx: Option<Box<ZeroCheckPersistContext>> = None;
         let mut incoming_message = message;
         let mut displaced_message: Option<String> = None;
         if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id && a.is_running()) {
@@ -245,28 +262,33 @@ impl SupervisorInner {
             if settled.is_some() { a.settled = settled; }
             if holding.is_some() { a.holding = holding; }
             if gap.is_some() { a.gripper_gap_rad = gap; }
-            if a.kind == "gripper_zero_check" {
-                if let Some(params) = self.zero_check_params.take().filter(|p| p.action_id == id) {
-                    if state == "done" {
-                        let stop_rad = self.config.gripper_index().and_then(|idx| self.measured_positions.get(idx)).copied().unwrap_or(0.0);
-                        let offset_rad = stop_rad - params.base_closed_rad;
-                        let pass = offset_rad.abs() <= params.threshold_rad;
-                        a.stop_rad = Some(stop_rad);
-                        a.offset_rad = Some(offset_rad);
-                        a.pass = Some(pass);
-                        self.gripper_zero_checked = true;
-                        self.last_zero_check_offset = Some(offset_rad);
-                        if params.store_offset {
-                            if offset_rad.abs() <= 0.5 {
-                                store_offset_req = Some((offset_rad, params.operator_auth));
-                            } else {
-                                tracing::warn!("Gripper zero check offset {offset_rad:.4} exceeds 0.5 rad; storing refused");
+            if a.kind == "gripper_zero_check"
+                && self.zero_check_params.as_ref().is_some_and(|p| p.action_id == id)
+            {
+                let params = self.zero_check_params.take().expect("checked action_id match");
+                let mut unused_ctx = params.persist_ctx;
+                if state == "done" {
+                    let stop_rad = self.config.gripper_index().and_then(|idx| self.measured_positions.get(idx)).copied().unwrap_or(0.0);
+                    let offset_rad = stop_rad - params.base_closed_rad;
+                    let pass = offset_rad.abs() <= params.threshold_rad;
+                    a.stop_rad = Some(stop_rad);
+                    a.offset_rad = Some(offset_rad);
+                    a.pass = Some(pass);
+                    self.gripper_zero_checked = true;
+                    self.last_zero_check_offset = Some(offset_rad);
+                    if params.store_offset {
+                        if offset_rad.abs() <= 0.5 {
+                            if let Some(ctx) = unused_ctx.take() {
+                                store_offset_req = Some((offset_rad, ctx));
                             }
+                        } else if !self.rt_executor_owned && !self.defer_zero_check_persist {
+                            tracing::warn!("Gripper zero check offset {offset_rad:.4} exceeds 0.5 rad; storing refused");
                         }
                     }
                 }
+                retired_ctx = unused_ctx;
             }
-            if !self.rt_executor_owned {
+            if !self.rt_executor_owned && !self.defer_zero_check_persist {
                 tracing::info!(
                     "Action {} ({}) {}{}{}",
                     id,
@@ -280,109 +302,56 @@ impl SupervisorInner {
         if let Some(unused_msg) = displaced_message.or(incoming_message) {
             self.recycle_action_msg_spare(unused_msg);
         }
-        if let Some((offset_rad, operator_auth)) = store_offset_req {
-            let candidate_jaw = self.gripper_calib_jaw_opening.clone();
-            match self.build_gripper_calibration_candidate(Some(offset_rad), candidate_jaw.clone()) {
-                Err(e) => {
-                    tracing::warn!("Failed to apply gripper calibration after zero_check: {e}");
+        if let Some(ctx) = retired_ctx {
+            self.retire_zero_check_ctx(ctx);
+        }
+        if let Some((offset_rad, mut ctx)) = store_offset_req {
+            if self.defer_zero_check_persist {
+                // Zero-allocation RT path: candidate validation and JSON serialization run
+                // completely off `armd-control` (on `armd-persist` or the legacy async worker).
+                if !self.persist_capacity_available {
                     if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
-                        a.state = "failed".into();
-                        a.code = Some("INVALID_CALIBRATION".into());
-                        a.message = Some(format!("Gripper calibration rejected: {e}"));
-                    }
-                }
-                Ok((cand, _)) => {
-                    let path = self.gripper_calib_path.clone().unwrap_or_else(crate::gripper_calib::path_from_env);
-                    let file = crate::gripper_calib::GripperCalibFile {
-                        offset_rad: Some(offset_rad),
-                        jaw_opening: candidate_jaw.clone(),
-                        ts: Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())),
-                        stale: self.gripper_calib_stale.clone(),
-                        tool_id: Some(self.config.active_tool.id.clone()),
-                        tool_config_digest: Some(self.config.active_tool.config_digest.clone()),
-                    };
-                    let text = serde_json::to_string_pretty(&file).unwrap_or_default();
-                    if self.defer_zero_check_persist {
-                        if !self.persist_capacity_available {
-                            tracing::warn!("Persistence worker unavailable or saturated; failing zero_check(store_offset=true) cleanly");
-                            if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
-                                a.state = "failed".into();
-                                a.code = Some("PERSIST_FAILED".into());
-                                a.message = Some("Persistence channel unavailable or saturated".into());
-                            }
-                        } else {
-                            // Hold action as running until atomic persist-before-commit completes outside the lock.
-                            if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
-                                a.state = crate::model::HolderLabel::new("running");
-                                a.finished_at = None;
-                            }
-                            self.zero_check_persisting = Some(id);
-                            let gripper_limit = self.config.gripper_index().and_then(|idx| self.config.limits.get(idx)).cloned();
-                            self.pending_zero_check_persist = Some(PendingZeroCheckPersist {
-                                action_id: id,
-                                offset_rad,
-                                jaw_opening: candidate_jaw,
-                                base_revision: self.gripper_calib_revision,
-                                lease_owner: self.active_lease.as_ref().map(|l| (l.client_id.clone(), l.generation)),
-                                operator_auth,
-                                write: crate::persist::PendingWrite::new(path, text),
-                                base_gripper_policy: self.base_gripper_policy.clone().or_else(|| self.config.gripper_policy.clone()),
-                                current_calib_jaw: self.gripper_calib_jaw_opening.clone(),
-                                gripper_limit,
-                                active_tool_is_stock: self.config.active_tool.is_stock,
-                            });
-                        }
-                    } else {
-                        let auth_ok = operator_auth.as_ref().is_none_or(|(a, tok)| !a.is_enforced() || a.is_operator(tok.as_deref()));
-                        if !auth_ok {
-                            if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
-                                a.state = "failed".into();
-                                a.code = Some("OPERATOR_REQUIRED".into());
-                                a.message = Some("Operator session expired or locked before gripper calibration persisted".into());
-                            }
-                        } else {
-                            match crate::persist::StagedWrite::stage(path, text) {
-                                Err(e) => {
-                                    tracing::warn!("Failed to stage gripper calibration after zero_check: {e}");
-                                    if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
-                                        a.state = "failed".into();
-                                        a.code = Some("PERSIST_FAILED".into());
-                                        a.message = Some(format!("Failed to persist gripper calibration: {e}"));
-                                    }
-                                }
-                                Ok(staged) => match staged.rename_only() {
-                                    Err(e) => {
-                                        tracing::warn!("Failed to publish gripper calibration after zero_check: {e}");
-                                        if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
-                                            a.state = "failed".into();
-                                            a.code = Some("PERSIST_FAILED".into());
-                                            a.message = Some(format!("Failed to persist gripper calibration: {e}"));
-                                        }
-                                    }
-                                    Ok(dir_sync) => {
-                                        self.commit_gripper_calibration_candidate(cand);
-                                        self.gripper_calib_revision += 1;
-                                        let outcome = dir_sync.sync_parent_dir();
-                                        if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
-                                            match outcome {
-                                                crate::persist::PublishOutcome::Published => {
-                                                    a.durability_confirmed = Some(true);
-                                                }
-                                                crate::persist::PublishOutcome::PublishedDurabilityUnconfirmed(w) => {
-                                                    a.durability_confirmed = Some(false);
-                                                    a.durability_warning = Some(w);
-                                                }
-                                            }
-                                        }
-                                    }
-                                },
-                            }
+                        a.state = crate::model::HolderLabel::new("failed");
+                        a.code = Some(crate::model::HolderLabel::new("PERSIST_FAILED"));
+                        let mut msg = std::mem::take(&mut ctx.sat_msg_buf);
+                        msg.clear();
+                        msg.push_str("Persistence channel unavailable or saturated");
+                        if let Some(old_msg) = a.message.replace(msg) {
+                            ctx.sat_msg_buf = old_msg;
                         }
                     }
+                    self.retire_zero_check_ctx(ctx);
+                } else {
+                    // Hold action as running until atomic persist-before-commit completes off-thread.
+                    if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
+                        a.state = crate::model::HolderLabel::new("running");
+                        a.finished_at = None;
+                    }
+                    self.zero_check_persisting = Some(id);
+                    let lease_owner = self
+                        .active_lease
+                        .as_ref()
+                        .map(|l| (crate::model::HolderLabel::new(&l.client_id), l.generation));
+                    self.pending_zero_check_persist = Some(PendingZeroCheckPersist {
+                        action_id: id,
+                        offset_rad,
+                        base_revision: self.gripper_calib_revision,
+                        lease_owner,
+                        estop_epoch: self.safety.epoch_id(),
+                        stop_gen: self.current_stop_gen(),
+                        deadline: Instant::now() + crate::supervisor::config::CONFIG_PROPOSAL_BUDGET,
+                        ctx,
+                    });
                 }
+            } else {
+                // Non-deferred legacy path (direct `SupervisorInner::tick` tests): route through
+                // the EXACT same common commit state machine (`reserve -> serialize + stage + fsync
+                // -> fresh authority recheck -> rename -> parent-dir fsync -> authority recheck
+                // -> activate`, with dir-sync failure entering `Reconciling`).
+                crate::rt_core::requests::config::commit_zero_check_sync(self, id, offset_rad, ctx);
             }
         }
-        if holding == Some(false) { self.held = None; }
+        if holding == Some(false) { self.clear_held_rt(); }
         // a standalone close that detected an object counts as holding until a release completes
         if holding == Some(true) && self.held.is_none() {
             self.held = Some(HeldObject { label: String::new(), spill_safe: false });
@@ -392,7 +361,9 @@ impl SupervisorInner {
             if let Some((state, code)) = self.last_action.as_ref().filter(|a| a.id == id && !a.is_running()).map(|a| (a.state, a.code)) {
                 self.record_macro_terminal(id, &state, code.as_deref());
             }
-            self.macro_run = None;
+            if let Some(run) = self.macro_run.take() {
+                self.retire_macro_run(run);
+            }
         }
         self.record_finished_action_by_id(id);
     }
@@ -431,6 +402,27 @@ impl SupervisorInner {
         Ok(Some(id))
     }
 
+    /// Zero-allocation mirror of [`Self::action_preconditions`] returning static terminal codes
+    /// for RT commit paths (`armd-control`).
+    pub(crate) fn action_preconditions_static(&self) -> Result<(), &'static str> {
+        if self.handover_settling_since.is_some() { return Err("REJECTED"); }
+        if self.e_stop_latched.load(Ordering::SeqCst) { return Err("ESTOP_ACTIVE"); }
+        match self.safety.state() {
+            SafetyState::EStop => return Err("ESTOP_ACTIVE"),
+            SafetyState::Fault(_) => return Err("FAULT_ACTIVE"),
+            s if !s.is_operational() => return Err("NOT_ARMED"),
+            _ => {}
+        }
+        if self.pending_rearm || self.pending_normal_unload {
+            return Err("NOT_ARMED");
+        }
+        if self.collision.hold.is_some() { return Err("COLLISION_HOLD"); }
+        if self.core.motion_inhibited_by_config() { return Err("CONFIG_BUSY"); }
+        if self.mit_motion_blocked() { return Err("MOTION_BUSY"); }
+        if self.has_busy_reason() { return Err("MOTION_BUSY"); }
+        Ok(())
+    }
+
     /// Preconditions shared by Cartesian and gripper actions.
     pub(crate) fn action_preconditions(&self) -> Result<(), ArmError> {
         if self.handover_settling_since.is_some() { return Err(SafetyError::HandoverSettling.into()); }
@@ -461,6 +453,12 @@ impl SupervisorInner {
     pub(crate) fn begin_macro_inner(&mut self, proof: &crate::supervisor::AdmittedProof, kind: &str, input: &PlanInput, tag: Option<String>) -> Result<u64, ArmError> {
         self.check_terminal_fifo_for_new_action()?;
         self.check_plan_fresh(input)?;
+        if !self.can_admit_macro_run() {
+            return Err(MotionError::MotionBusy(
+                "RT macro reclamation queue is full; retry after drain".into(),
+            )
+            .into());
+        }
         let id = self.begin_action(kind, tag);
         self.macro_run = Some(MacroRun::new(id, input.epoch, proof.stamp()));
         self.set_action_phase(id, "start", 0.0, None, None);
@@ -486,34 +484,46 @@ impl SupervisorInner {
         }
         self.action_preconditions()?;
         self.gravity_comp_motion_busy()?;
+        if !self.can_admit_macro_run() {
+            return Err(MotionError::MotionBusy(
+                "RT macro reclamation queue is full; retry after drain".into(),
+            )
+            .into());
+        }
         let id = self.begin_action(kind, tag);
         self.macro_run = Some(MacroRun::new(id, epoch, proof.stamp()));
         self.set_action_phase(id, "start", 0.0, None, None);
         Ok(id)
     }
 
-    /// The macro action `id` is still the running action.
+    /// The macro action `id` is still the running action (and not already in its terminal
+    /// finishing transition awaiting bus acceptance).
     pub fn macro_alive(&self, id: u64) -> bool {
-        self.macro_run.as_ref().is_some_and(|m| m.id == id && !m.stop_requested)
+        self.macro_run
+            .as_ref()
+            .is_some_and(|m| m.id == id && !m.stop_requested && !m.finishing)
             && self.last_action.as_ref().is_some_and(|a| a.id == id && a.is_running())
     }
 
     pub fn macro_sub(&self, id: u64) -> Option<SubState> {
-        self.macro_run.as_ref().filter(|m| m.id == id).map(|m| m.sub.clone())
+        self.macro_run.as_ref().filter(|m| m.id == id).map(|m| m.sub)
     }
 
     /// Set `phase` / `progress` (and centring stats) of the running action `id`.
     pub fn set_action_phase(&mut self, id: u64, phase: &str, progress: f32, iteration: Option<u32>, error_px: Option<f32>) {
+        let rt_owned = self.rt_executor_owned;
         if let Some(m) = self.macro_run.as_mut().filter(|m| m.id == id) {
             let now = Instant::now();
             if m.phase.as_deref() != Some(phase) {
                 if let (Some(prev_phase), Some(phase_start)) = (m.phase.take(), m.phase_start.take()) {
-                    let elapsed_ms = now.duration_since(phase_start).as_millis() as u32;
-                    if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
-                        *a.phase_ms.entry(prev_phase).or_insert(0) += elapsed_ms;
+                    if !rt_owned {
+                        let elapsed_ms = now.duration_since(phase_start).as_millis() as u32;
+                        if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
+                            *a.phase_ms.entry(prev_phase.as_str().to_owned()).or_insert(0) += elapsed_ms;
+                        }
                     }
                 }
-                m.phase = Some(phase.to_string());
+                m.phase = Some(crate::model::HolderLabel::new(phase));
                 m.phase_start = Some(now);
             }
         }
@@ -626,7 +636,7 @@ impl SupervisorInner {
     /// replaced, or `t` is not its current child (a late result is never read as another's).
     pub fn macro_child_state(&self, t: ChildTicket) -> Option<SubState> {
         if !self.macro_alive(t.parent.0) { return None; }
-        self.macro_run.as_ref().filter(|m| m.ticket() == Some(t)).map(|m| m.sub.clone())
+        self.macro_run.as_ref().filter(|m| m.ticket() == Some(t)).map(|m| m.sub)
     }
 
     /// What the contact guard of child `t` saw (also after the parent ended, until the next child).
@@ -676,23 +686,141 @@ impl SupervisorInner {
             .is_some_and(|d| now > d + grace)
     }
 
-    /// Ends the running child of the current macro when its deadline passed: the motion
-    /// stops and the child fails with the macro's timeout code (the parent stays running, its
-    /// worker ends it with that code). True when it did.
-    pub fn expire_macro_child(&mut self, now: Instant) -> bool {
-        let Some(m) = self.macro_run.as_ref() else { return false; };
-        if m.stop_requested || m.sub != SubState::Running || !m.child.deadline.is_some_and(|d| now > d) { return false; }
-        let id = m.id;
-        if self.macro_child_active_or_pending(id) { self.stop_motion(); }
-        if self.quintic_settle.as_ref().is_some_and(|(sid, _)| *sid == id) { self.quintic_settle = None; }
-        let Some(m) = self.macro_run.as_mut().filter(|m| m.id == id) else { return false; };
-        let (code, message) = m.child.timeout.take().unwrap_or_else(|| (
-            crate::safety::BoundedText::new("TIMEOUT"),
-            crate::motion::StepErrorText::new("Sub-motion did not finish in time"),
-        ));
+    /// Earliest live owner-clock action/macro deadline across the active macro parent
+    /// (`m.deadline`) and active running macro child (`m.child.deadline`), or `None` when no
+    /// live deadline is armed (or the macro is already stopping/finishing).
+    ///
+    /// Combined ONCE per tick with the control-release deadline (`effective_cutoff = min(...)`)
+    /// and installed at the driver TX choke point.
+    pub(crate) fn active_action_deadline(&self) -> Option<Instant> {
+        let m = self.macro_run.as_ref()?;
+        if m.stop_requested || m.finishing {
+            return None;
+        }
+        let child_dl = (m.sub == SubState::Running).then_some(m.child.deadline).flatten();
+        match (m.deadline, child_dl) {
+            (Some(p), Some(c)) => Some(p.min(c)),
+            (Some(p), None) => Some(p),
+            (None, Some(c)) => Some(c),
+            (None, None) => None,
+        }
+    }
+
+    /// True when macro `action_id` has an elapsed parent deadline or elapsed running-child
+    /// deadline at `now` (inclusive `now >= deadline`, matching the driver TX cutoff).
+    pub(super) fn macro_deadline_elapsed(&self, action_id: u64, now: Instant) -> bool {
+        self.macro_run.as_ref().is_some_and(|m| {
+            m.id == action_id
+                && !m.stop_requested
+                && !m.finishing
+                && (m.deadline.is_some_and(|d| now >= d)
+                    || (m.sub == SubState::Running && m.child.deadline.is_some_and(|d| now >= d)))
+        })
+    }
+
+    /// **Single owner-side macro deadline enforcement**: checks BOTH the whole-macro parent
+    /// deadline (`m.deadline`, highest priority) and the running child deadline
+    /// (`m.child.deadline`) against `now` (inclusive `now >= deadline`, matching the driver TX
+    /// cutoff). Used pre-step to avoid advancing the reference after expiry, and post-output
+    /// in `reconcile_action` (including after a deadline-refused TX) to end the expired macro
+    /// or child exactly once with its timeout terminal. Returns `true` iff a deadline expired.
+    pub fn enforce_macro_deadlines(&mut self, now: Instant) -> bool {
+        enum MacroExpiry {
+            Parent {
+                id: u64,
+                timeout_code: crate::safety::BoundedText<48>,
+            },
+            Child {
+                id: u64,
+            },
+        }
+        let expiry = self.macro_run.as_ref().and_then(|m| {
+            if m.stop_requested || m.finishing {
+                return None;
+            }
+            if m.deadline.is_some_and(|d| now >= d) {
+                return Some(MacroExpiry::Parent {
+                    id: m.id,
+                    timeout_code: m.timeout_code,
+                });
+            }
+            if m.sub == SubState::Running && m.child.deadline.is_some_and(|d| now >= d) {
+                return Some(MacroExpiry::Child { id: m.id });
+            }
+            None
+        });
+        let Some(expiry) = expiry else {
+            return false;
+        };
+        match expiry {
+            MacroExpiry::Parent { id, timeout_code } => self.finish_expired_macro_parent(id, timeout_code),
+            MacroExpiry::Child { id } => self.finish_expired_macro_child(id),
+        }
+    }
+
+    fn finish_expired_macro_parent(
+        &mut self,
+        id: u64,
+        timeout_code: crate::safety::BoundedText<48>,
+    ) -> bool {
+        let code_str = if timeout_code.is_empty() { "TIMEOUT" } else { timeout_code.as_str() };
+        self.enter_macro_finish_rt(
+            id,
+            "failed",
+            Some(code_str),
+            crate::motion::StepErrorText::empty(),
+            None,
+            None,
+            None,
+            false,
+        )
+        .is_ok()
+    }
+
+    fn finish_expired_macro_child(&mut self, id: u64) -> bool {
+        let _ = self.quiesce_macro_children_rt(id);
+        let Some(m) = self.macro_run.as_mut().filter(|m| m.id == id) else {
+            return false;
+        };
+        let (code, message) = m.child.timeout.take().unwrap_or_else(|| {
+            (
+                crate::safety::BoundedText::new("TIMEOUT"),
+                crate::motion::StepErrorText::new("Sub-motion did not finish in time"),
+            )
+        });
         m.child.deadline = None;
         m.sub = SubState::Failed { code, message };
         true
+    }
+
+    /// Ends the current macro when `m.deadline` has passed by entering
+    /// [`Self::enter_macro_finish_rt`]. Prefer [`Self::enforce_macro_deadlines`] on tick paths.
+    pub fn expire_macro_parent(&mut self, now: Instant) -> bool {
+        let Some((id, timeout_code)) = self
+            .macro_run
+            .as_ref()
+            .filter(|m| !m.stop_requested && !m.finishing)
+            .and_then(|m| m.deadline.filter(|d| now >= *d).map(|_| (m.id, m.timeout_code)))
+        else {
+            return false;
+        };
+        self.finish_expired_macro_parent(id, timeout_code)
+    }
+
+    /// Ends the running child of the current macro when its deadline passed: the motion
+    /// stops cleanly to a zero-velocity hold and the child fails with the macro's timeout code
+    /// (the parent stays running, its worker ends it with that code). True when it did.
+    pub fn expire_macro_child(&mut self, now: Instant) -> bool {
+        let Some(m) = self.macro_run.as_ref() else { return false; };
+        if m.stop_requested
+            || m.finishing
+            || m.sub != SubState::Running
+            || m.deadline.is_some_and(|d| now >= d)
+            || !m.child.deadline.is_some_and(|d| now >= d)
+        {
+            return false;
+        }
+        self.finish_expired_macro_child(m.id)
     }
 
     /// The contact guard of the current macro child, once per tick while its motion runs
@@ -742,6 +870,7 @@ impl SupervisorInner {
                     holding: None,
                     gripper_gap_rad: None,
                     clear_releasing: false,
+                    is_gripper: false,
                 });
             }
         }
@@ -773,6 +902,55 @@ impl SupervisorInner {
         if matches!(primitive, Primitive::CartesianPath { n, .. } if *n != 1) {
             this.commit_child_checks(&spec, start)?;
             return Err("UNSUPPORTED");
+        }
+        // Zero-allocation stale-J7 fast-fail before entering `commit_child_install` (preserves
+        // exact refusal precedence while keeping `armd-control` strictly 0 alloc / 0 free).
+        match primitive {
+            Primitive::Gripper { .. } => {
+                this.commit_child_checks(&spec, start)?;
+                if this.config.gripper_index().is_none() || this.config.gripper_policy.is_none() {
+                    return Err("UNSUPPORTED");
+                }
+                let epoch = this.macro_run.as_ref().map(|m| m.epoch).unwrap_or(0);
+                if epoch != this.safety.epoch_id() {
+                    return Err("EPOCH_MISMATCH");
+                }
+                this.action_preconditions_static()?;
+                this.check_pos_force_gripper_fresh_static()?;
+            }
+            Primitive::JointQuinticLimited { dof, q, .. } => {
+                this.commit_child_checks(&spec, start)?;
+                let epoch = this.macro_run.as_ref().map(|m| m.epoch).unwrap_or(0);
+                if epoch != this.safety.epoch_id() {
+                    return Err("PLAN_STALE");
+                }
+                this.action_preconditions_static()?;
+                if this.gravity_comp.is_some() {
+                    return Err("MOTION_BUSY");
+                }
+                let n = usize::from(*dof).min(q.len());
+                this.safety
+                    .validate_motion_command(Some(epoch), &q[..n], &this.config.limits)
+                    .map_err(|e| crate::rt_core::ops::static_code(e.into()))?;
+                if this.config.gripper_index().is_some_and(|g| {
+                    n > g
+                        && this.commanded_positions.len() > g
+                        && (q[g] - this.commanded_positions[g]).abs() > 1e-4
+                }) {
+                    this.check_pos_force_gripper_fresh_static()?;
+                }
+            }
+            Primitive::Replay { gripper, .. } => {
+                this.commit_child_checks(&spec, start)?;
+                if *gripper && this.config.gripper_index().is_some() {
+                    if this.config.active_tool.commissioning_required {
+                        return Err("COMMISSIONING_REQUIRED");
+                    }
+                    this.replay_preconditions_static()?;
+                    this.check_pos_force_gripper_fresh_static()?;
+                }
+            }
+            _ => {}
         }
         let primitive = *primitive;
         this.commit_child_install(spec, start, now, move |this, id| match primitive {
@@ -813,7 +991,7 @@ impl SupervisorInner {
     /// The checks of a child commit before anything is installed: the ticket's parent is the
     /// running macro, the ticket is its next child, no child runs, and `start` is the
     /// commanded position (every joint, gripper included, `>= START_TOLERANCE`).
-    fn commit_child_checks(&self, spec: &crate::rt_core::ops::ChildSpec, start: &[f32]) -> Result<u64, &'static str> {
+    pub(crate) fn commit_child_checks(&self, spec: &crate::rt_core::ops::ChildSpec, start: &[f32]) -> Result<u64, &'static str> {
         use crate::rt_core::ops::START_TOLERANCE;
         let id = spec.ticket.parent.0;
         let Some(run) = self.macro_run.as_ref().filter(|m| m.id == id && self.macro_alive(id)) else { return Err("PARENT_REPLACED"); };
@@ -831,15 +1009,11 @@ impl SupervisorInner {
     /// leaves no guard armed. Returns the parent.
     pub(crate) fn commit_child_install(&mut self, spec: crate::rt_core::ops::ChildSpec, start: &[f32], now: Instant,
         install: impl FnOnce(&mut Self, u64) -> Result<(), ArmError>) -> Result<crate::rt_core::broker::ActionId, &'static str> {
-        let code = |e: ArmError| -> &'static str {
-            let c = crate::api::rest::ApiError::from(e).code.unwrap_or_default();
-            crate::rt_core::ops::TERMINAL_CODES.iter().find(|k| **k == c).copied().unwrap_or("REJECTED")
-        };
         let id = self.commit_child_checks(&spec, start)?;
         self.guard_next_macro_child(id, spec.contact);
         if let Err(e) = install(self, id) {
             self.guard_next_macro_child(id, None);
-            return Err(code(e));
+            return Err(crate::rt_core::ops::static_code(e));
         }
         let deadline = now + Duration::from_secs_f64(if spec.timeout_s.is_finite() { spec.timeout_s.clamp(0.0, 1e6) } else { 1e6 });
         self.arm_macro_child_bounded(
@@ -893,7 +1067,9 @@ impl SupervisorInner {
     pub(crate) fn drop_macro_run(&mut self, state: &str, code: Option<&str>) {
         let Some(id) = self.macro_run.as_ref().map(|m| m.id) else { return; };
         if self.core.last_macro().is_none_or(|m| m.action.0 != id) { self.record_macro_terminal(id, state, code); }
-        self.macro_run = None;
+        if let Some(run) = self.macro_run.take() {
+            self.retire_macro_run(run);
+        }
     }
 
     /// Keeps the terminal record of macro `id` (outcome with its code, child count) in the
@@ -921,7 +1097,7 @@ impl SupervisorInner {
         Ok(duration + 0.5)
     }
 
-    pub(super) fn check_gripper_close_torque_feedback(&self, request: &GripperRequest, policy: &crate::model::GripperPolicy, gripper_idx: usize) -> Result<(), ArmError> {
+    pub(crate) fn check_gripper_close_torque_feedback(&self, request: &GripperRequest, policy: &crate::model::GripperPolicy, gripper_idx: usize) -> Result<(), ArmError> {
         if policy.max_close_torque_nm.is_none() {
             return Ok(());
         }
@@ -951,6 +1127,9 @@ impl SupervisorInner {
     /// Effective closing speed limit enforced by the attached driver in position-force mode
     /// (`None` for legacy POS_VEL or drivers without a pos-force motor current cap).
     pub(crate) fn gripper_close_speed_limit(&self) -> Option<f32> {
+        if self.rt_executor_owned {
+            return self.driver_gripper_close_speed_limit;
+        }
         let gripper_idx = self.config.gripper_index()?;
         self.driver.as_ref()
             .and_then(|d| d.lock().ok())
@@ -962,8 +1141,11 @@ impl SupervisorInner {
 
     /// Estimated motor ceiling torque (N·m) of the attached position-force gripper: calibrated
     /// `ceiling_torque_nm` when available, else the feedback-equivalent estimate from
-    /// `current_raw * 0.0019 N·m/raw`. Allocation-free on `armd-control`.
+    /// `current_raw * 0.0019 N·m/raw`. Allocation-free and lock-free on `armd-control`.
     pub(crate) fn gripper_ceiling_torque_estimate(&self) -> Option<f32> {
+        if self.rt_executor_owned {
+            return self.driver_gripper_ceiling_torque_estimate;
+        }
         let gripper_idx = self.config.gripper_index()?;
         self.driver.as_ref()
             .and_then(|d| d.lock().ok())
@@ -1111,6 +1293,7 @@ impl SupervisorInner {
         };
         if epoch != self.safety.epoch_id() { return Err(SafetyError::EpochMismatch { expected: self.safety.epoch_id(), received: epoch }.into()); }
         self.action_preconditions()?;
+        self.check_pos_force_gripper_fresh()?;
         self.check_gripper_close_torque_feedback(&request, &policy, gripper_idx)?;
         let close_cap = self.gripper_close_speed_limit();
         let ceiling_est = self.gripper_ceiling_torque_estimate();
@@ -1168,6 +1351,10 @@ impl SupervisorInner {
         self.gravity_comp_motion_busy()?;
         let mut target = target;
         self.safety.validate_motion_command(Some(epoch), &target, &self.config.limits)?;
+        let moves_gripper = self.config.gripper_index().is_some_and(|g| (target[g] - self.commanded_positions[g]).abs() > 1e-4);
+        if moves_gripper {
+            self.check_pos_force_gripper_fresh()?;
+        }
         self.torque_hold_filter(&mut target);
         self.power_hold_filter(&mut target);
         let traj = TrajectoryPlanner::plan(&self.commanded_positions, &self.commanded_velocities, &target,
@@ -1175,7 +1362,7 @@ impl SupervisorInner {
         let (traj, power_scale) = self.power_fit_quintic(traj, &self.commanded_positions, &self.commanded_velocities, &target, limits, true)?;
         let samples = self.workspace_samples(&traj)?;
         self.check_workspace_path(&self.commanded_positions, samples.iter().map(Vec::as_slice))?;
-        if self.config.gripper_index().is_some_and(|g| (target[g] - self.commanded_positions[g]).abs() > 1e-4) {
+        if moves_gripper {
             self.gripper_hold_vel_ceiling = None;
         }
         self.servo_target = None;
@@ -1191,20 +1378,116 @@ impl SupervisorInner {
         Ok(duration + crate::motion::SETTLE_MAX_S)
     }
 
-    /// End macro action `id` from its orchestrator (no-op when it already ended).
+    /// End macro action `id` from its orchestrator (no-op when it already ended or is finishing).
     pub fn finish_macro(&mut self, id: u64, state: &str, code: Option<&str>, message: Option<String>, holding: Option<bool>, gap: Option<f32>) {
         if !self.macro_alive(id) { return; }
-        if self.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(id)) { self.stop_motion(); }
+        self.finish_macro_inner(id, state, code, message, holding, gap);
+    }
+
+    /// Commits a macro terminal transition for `id` (shared by immediate finish and post-TX
+    /// accepted `DeferredCompletionTarget::MacroFinish`, even when `m.finishing == true`).
+    pub(crate) fn finish_macro_inner(&mut self, id: u64, state: &str, code: Option<&str>, message: Option<String>, holding: Option<bool>, gap: Option<f32>) {
+        let still_running = self.macro_run.as_ref().is_some_and(|m| m.id == id)
+            && self.last_action.as_ref().is_some_and(|a| a.id == id && a.is_running());
+        if !still_running { return; }
+        if self.rt_executor_owned {
+            let _ = self.quiesce_macro_children_rt(id);
+        } else if self.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(id)) {
+            self.stop_motion();
+        }
         if state == "done" { self.set_action_phase(id, "done", 1.0, None, None); }
+        let rt_owned = self.rt_executor_owned;
         if let Some(m) = self.macro_run.as_mut().filter(|m| m.id == id) {
             if let (Some(prev_phase), Some(phase_start)) = (m.phase.take(), m.phase_start.take()) {
-                let ms = Instant::now().duration_since(phase_start).as_millis() as u32;
-                if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
-                    *a.phase_ms.entry(prev_phase).or_insert(0) += ms;
+                if !rt_owned {
+                    let ms = Instant::now().duration_since(phase_start).as_millis() as u32;
+                    if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
+                        *a.phase_ms.entry(prev_phase.as_str().to_owned()).or_insert(0) += ms;
+                    }
                 }
             }
         }
         self.finish_action(id, state, code, message, None, holding, gap);
+    }
+
+    /// **Single owner-side macro finishing state machine** shared across explicit `FinishMacro`
+    /// and parent `deadline` expiry:
+    /// - Enforces `m.finishing` idempotency (`PARENT_REPLACED` on duplicate finishes while bus hold
+    ///   acceptance is pending).
+    /// - Quiesces active child trajectory/settle/deferred `MacroSub` (preserving gripper measured hold).
+    /// - Defers final terminal commit through `DeferredCompletionTarget::MacroFinish` whenever a
+    ///   driver-backed RT owner quiesced active motion OR has an unaccepted replacement hold.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn enter_macro_finish_rt(
+        &mut self,
+        id: u64,
+        state_str: &str,
+        code: Option<&str>,
+        msg_bounded: crate::motion::StepErrorText,
+        legacy_msg: Option<String>,
+        holding: Option<bool>,
+        gripper_gap_rad: Option<f32>,
+        clear_held: bool,
+    ) -> Result<(), &'static str> {
+        let Some(run) = self.macro_run.as_ref().filter(|m| m.id == id) else {
+            return Err("PARENT_REPLACED");
+        };
+        if run.stop_requested || run.finishing
+            || !self.last_action.as_ref().is_some_and(|a| a.id == id && a.is_running())
+        {
+            return Err("PARENT_REPLACED");
+        }
+        let prev_hold_pending = run.hold_pending_bus_accept;
+        let child_active = self.macro_child_running(id);
+        let quiesced_any = if child_active {
+            self.quiesce_macro_children_rt(id)
+        } else {
+            false
+        };
+        let needs_bus_accept =
+            self.is_rt_owner() && self.driver.is_some() && (quiesced_any || prev_hold_pending);
+        if let Some(m) = self.macro_run.as_mut().filter(|m| m.id == id) {
+            m.finishing = true;
+            if needs_bus_accept {
+                m.hold_pending_bus_accept = true;
+            }
+        }
+        if needs_bus_accept {
+            self.pending_deferred_done = Some(super::DeferredActionDone {
+                target: DeferredCompletionTarget::MacroFinish {
+                    action_id: id,
+                    state: crate::model::HolderLabel::new(state_str),
+                    code: code.map(crate::model::HolderLabel::new),
+                    message: msg_bounded,
+                    clear_held,
+                },
+                epoch_id: self.safety.epoch_id(),
+                lease_generation: self.active_lease.as_ref().map(|l| l.generation),
+                settled: None,
+                holding,
+                gripper_gap_rad,
+                clear_releasing: false,
+                is_gripper: false,
+            });
+            return Ok(());
+        }
+        if clear_held {
+            self.clear_held_rt();
+        }
+        let msg = if self.rt_executor_owned {
+            if !msg_bounded.is_empty() {
+                let mut buf = self.take_action_msg_buf(id, msg_bounded.as_str().len().max(160));
+                buf.clear();
+                buf.push_str(msg_bounded.as_str());
+                Some(buf)
+            } else {
+                None
+            }
+        } else {
+            legacy_msg.or_else(|| (!msg_bounded.is_empty()).then(|| msg_bounded.as_str().to_owned()))
+        };
+        self.finish_macro_inner(id, state_str, code, msg, holding, gripper_gap_rad);
+        Ok(())
     }
 
     /// `/motion/stop`: ends the running macro action now, under the caller's lock, so its
@@ -1214,14 +1497,30 @@ impl SupervisorInner {
         self.record_macro_terminal(id, "cancelled", Some("STOPPED"));
         let Some(mut m) = self.macro_run.take() else { return; };
         m.stop_requested = true;
-        if self.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(id)) { self.stop_motion(); }
+        if self.rt_executor_owned {
+            self.quiesce_macro_children_rt(id);
+        } else if self.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(id)) {
+            self.stop_motion();
+        }
+        let rt_owned = self.rt_executor_owned;
         if let (Some(prev_phase), Some(phase_start)) = (m.phase.take(), m.phase_start.take()) {
-            let ms = Instant::now().duration_since(phase_start).as_millis() as u32;
-            if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
-                *a.phase_ms.entry(prev_phase).or_insert(0) += ms;
+            if !rt_owned {
+                let ms = Instant::now().duration_since(phase_start).as_millis() as u32;
+                if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
+                    *a.phase_ms.entry(prev_phase.as_str().to_owned()).or_insert(0) += ms;
+                }
             }
         }
-        self.finish_action(id, "cancelled", Some("STOPPED"), Some("Motion stopped".into()), None, None, None);
+        self.retire_macro_run(m);
+        let msg = if rt_owned {
+            let mut buf = self.take_action_msg_buf(id, 32);
+            buf.clear();
+            buf.push_str("Motion stopped");
+            Some(buf)
+        } else {
+            Some("Motion stopped".into())
+        };
+        self.finish_action(id, "cancelled", Some("STOPPED"), msg, None, None, None);
     }
 
     /// Start a gripper action. Returns (action id, expected duration).
@@ -1254,6 +1553,7 @@ impl SupervisorInner {
             )).into());
         }
         self.action_preconditions()?;
+        self.check_pos_force_gripper_fresh()?;
         self.check_gripper_close_torque_feedback(&request, &policy, gripper_idx)?;
         let close_cap = self.gripper_close_speed_limit();
         let ceiling_est = self.gripper_ceiling_torque_estimate();
@@ -1306,6 +1606,7 @@ impl SupervisorInner {
             return Err(SafetyError::EpochMismatch { expected: self.safety.epoch_id(), received: epoch }.into());
         }
         self.action_preconditions()?;
+        self.check_pos_force_gripper_fresh()?;
         if !self.is_torqued {
             return Err(SafetyError::NotArmed(self.safety.state().clone()).into());
         }
@@ -1355,12 +1656,17 @@ impl SupervisorInner {
         self.gripper_high_torque_ticks = 0;
         self.gripper_low_torque_ticks = 0;
         self.gripper_stall_window.reset();
+        let persist_ctx = if store_offset {
+            Some(Box::new(ZeroCheckPersistContext::from_inner(self, operator_auth)))
+        } else {
+            None
+        };
         self.zero_check_params = Some(ZeroCheckParams {
             action_id: id,
             store_offset,
             threshold_rad,
             base_closed_rad,
-            operator_auth,
+            persist_ctx,
         });
         Ok((id, duration))
     }
@@ -1403,7 +1709,7 @@ impl SupervisorInner {
     }
 
     /// Single place that ends a running action whose reference went away (spec 2.3).
-    pub(super) fn reconcile_action(&mut self, dt: f64, tick_output_accepted: bool) {
+    pub(super) fn reconcile_action(&mut self, dt: f64, tick_output_accepted: bool, now: Instant) {
         let Some(action) = self.last_action.as_ref().filter(|a| a.is_running()) else { return; };
         let (id, is_park, is_replay) = (action.id, action.kind == "park", action.kind == "replay");
         let is_macro = self.macro_run.as_ref().is_some_and(|m| m.id == id);
@@ -1425,6 +1731,9 @@ impl SupervisorInner {
             }
             SafetyState::Fault(FaultReason::CanTxStalled) => {
                 Some(ReconcileCause::SafetyMessage("failed", "CAN_TX_STALLED"))
+            }
+            SafetyState::Fault(FaultReason::J7FeedbackStale) => {
+                Some(ReconcileCause::SafetyMessage("failed", "J7_FEEDBACK_STALE"))
             }
             SafetyState::Fault(FaultReason::Other(_)) => {
                 Some(ReconcileCause::SafetyMessage("failed", "FAULT"))
@@ -1474,6 +1783,7 @@ impl SupervisorInner {
                     "WATCHDOG" => "WATCHDOG_TIMEOUT",
                     "LEASE_LOST" => "LEASE_LOST",
                     "CAN_TX_STALLED" => "CAN_TX_STALLED",
+                    "J7_FEEDBACK_STALE" => "J7_FEEDBACK_STALE",
                     _ => "FAULT",
                 };
                 self.terminate_policy_run(reason, state, Some(code), Some(message));
@@ -1486,13 +1796,20 @@ impl SupervisorInner {
             return;
         }
         if self.macro_run.as_ref().is_some_and(|m| m.id == id) {
-            self.expire_macro_child(Instant::now());
+            // Post-output reconciliation through the single `enforce_macro_deadlines` entry point
+            // (also enforced pre-step to avoid reference advance, and via the single per-tick
+            // `effective_cutoff` at the driver TX choke point).
+            if self.enforce_macro_deadlines(now) && self.macro_run.as_ref().is_none_or(|m| m.finishing) {
+                return;
+            }
         }
         let carried = self.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(id));
         let pending_done_for_id = self.pending_deferred_done.as_ref().is_some_and(|d| {
             matches!(
                 d.target,
-                DeferredCompletionTarget::Action(aid) | DeferredCompletionTarget::MacroSub { action_id: aid, .. }
+                DeferredCompletionTarget::Action(aid)
+                    | DeferredCompletionTarget::MacroSub { action_id: aid, .. }
+                    | DeferredCompletionTarget::MacroFinish { action_id: aid, .. }
                     if aid == id
             )
         });
@@ -1505,7 +1822,10 @@ impl SupervisorInner {
                 self.finish_action(id, "cancelled", Some("SUPERSEDED"), None, None, None, None);
                 return;
             }
-            if carried || (pending_done_for_id && !run.stop_requested && run.sub == SubState::Running) || self.zero_check_persisting == Some(id) {
+            let pending_finish = self.pending_deferred_done.as_ref().is_some_and(|d| {
+                matches!(d.target, DeferredCompletionTarget::MacroFinish { action_id, .. } if action_id == id)
+            });
+            if carried || pending_finish || (pending_done_for_id && !run.stop_requested && run.sub == SubState::Running) || self.zero_check_persisting == Some(id) {
                 return;
             }
             // a joint-space sub-motion (sequence pose step) settles before it counts as done
@@ -1584,8 +1904,9 @@ impl SupervisorInner {
         match status {
             StepStatus::Running => None,
             StepStatus::Done { settled, holding, gripper_gap_rad } => {
-                let clear_releasing = self.releasing
-                    && matches!(self.active_trajectory.as_ref().map(|a| &a.reference), Some(Reference::Gripper(_)));
+                let is_gripper_ref = matches!(self.active_trajectory.as_ref().map(|a| &a.reference), Some(Reference::Gripper(_)));
+                let is_gripper = self.active_reference_drives_gripper();
+                let clear_releasing = self.releasing && is_gripper_ref;
                 let target = if macro_sub {
                     match (action_id, self.macro_run.as_ref().and_then(|m| m.ticket())) {
                         (Some(id), Some(ticket)) => DeferredCompletionTarget::MacroSub { action_id: id, ticket },
@@ -1615,6 +1936,7 @@ impl SupervisorInner {
                     holding,
                     gripper_gap_rad,
                     clear_releasing,
+                    is_gripper,
                 })
             }
             StepStatus::Failed { code, message } => {

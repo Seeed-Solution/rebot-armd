@@ -276,6 +276,7 @@ fn build_armed_fixture(q_j2: f32) -> (ReleaseFixture<SupervisorInner>, Broker<Pl
     })
     .with_driver(Box::new(drv));
     inner.lease_enabled = false;
+    inner.register_live_connection(1).unwrap();
     inner.tick(0.02);
 
     let (mut fx, mut b, _tw, _stop) = ReleaseFixture::new(
@@ -431,9 +432,14 @@ fn stopped_torque_off_tx_failure_zero_alloc() {
     clock.advance(RELEASE);
     assert!(rep.command.unwrap().1.is_ok(), "commit starts transition and records terminal failure");
 
-    let (rep2, a2, f2) = counted(|| fx.step());
-    clock.advance(RELEASE);
-    assert!(matches!(rep2.transition_ended, Some((_, Outcome::Failed(_)))), "{rep2:?}");
+    let (ended, a2, f2) = if rep.transition_ended.is_some() {
+        (rep.transition_ended, 0u64, 0u64)
+    } else {
+        let (rep2, a2, f2) = counted(|| fx.step());
+        clock.advance(RELEASE);
+        (rep2.transition_ended, a2, f2)
+    };
+    assert!(matches!(ended, Some((_, Outcome::Failed(_)))), "{rep:?}");
     assert_eq!(*fx.core.safety.state(), SafetyState::EStop);
     assert_eq!(fx.core.safety.epoch_id(), epoch_before);
     assert_eq!(fx.core.safety.latched_fault_kinds(), kinds_before);
@@ -592,6 +598,7 @@ fn rt_enable_failure_with_motor_fault_and_failed_hold_ticks_zero_alloc() {
         })
         .with_driver(Box::new(drv));
         inner.lease_enabled = false;
+        inner.register_live_connection(1).unwrap();
         inner.safety.set_off_thread_reclaim(true);
         inner.tick(0.02);
 

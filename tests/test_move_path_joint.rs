@@ -342,7 +342,10 @@ async fn joint_move_replans_under_the_lock_when_the_start_changed() {
 /// Line of the `path: "joint"` install's write guard in src/api/ws/actions.rs.
 fn install_line() -> u32 {
     let src = include_str!("../src/api/ws/actions.rs");
-    let at = src.find("SupervisorInner::install_joint_goal_prepared(").unwrap();
+    let at = src
+        .find("req::install_move_joint(")
+        .or_else(|| src.find("SupervisorInner::install_joint_goal_prepared("))
+        .unwrap();
     let before = &src[..at];
     let guard = before.rfind("let mut inner = recv_supervisor.inner().write().await;").unwrap();
     // the partial last line is the guard's line

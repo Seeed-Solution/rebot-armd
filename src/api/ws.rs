@@ -60,7 +60,11 @@ pub fn connection_registry() -> ConnectionRegistry {
     CONNECTION_REGISTRY.clone()
 }
 
-static NEXT_CONNECTION: AtomicU64 = AtomicU64::new(1);
+/// Delivers a post-publication `lease_lost(reason: "preempted")` notice to an evicted WS socket
+/// (called by `armd-dispatch` in executor mode and by `worker_task` in legacy mode).
+pub(crate) fn notify_evicted_connection(evicted_conn: &str, evicted_gen: u64) {
+    lease::notify_evicted(evicted_conn, evicted_gen);
+}
 
 /// Test hook: pause (ms) between stamping a delayed command ack with the current epoch and
 /// enqueueing it. 0 (no pause) outside tests.
@@ -69,6 +73,13 @@ pub static TEST_ACK_STAMP_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 /// Test hook: pause (ms) after `acquire_lease` releases the owner lock and before enqueueing
 /// `lease_granted` onto `ordinary_out_tx`, allowing heartbeat-triggered `lease_lost` to race ahead.
 pub static TEST_LEASE_GRANTED_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Test hook: pause (ms) after a deferred action install (`complete_pending_plan` /
+/// `complete_pending_replay` / `complete_macro_check`) releases the owner lock and before
+/// enqueueing its `command_ack` onto `ordinary_out_tx`, allowing a concurrent Stop/terminal to
+/// race against the ACK gate. 0 (no pause) outside tests.
+#[doc(hidden)]
+pub static TEST_DEFERRED_ACK_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 
 static TEST_WS_WRITE_HOOKS_ACTIVE: AtomicBool = AtomicBool::new(false);
 static TEST_WS_WRITE_PAUSED_CONNS: LazyLock<Mutex<HashMap<String, usize>>> =
@@ -346,13 +357,18 @@ pub async fn ws_handler(ws: WebSocketUpgrade, State(supervisor): State<Arc<ArmSu
                         axum::Extension(calib): axum::Extension<crate::calibration::CalibrationDeps>,
                         axum::Extension(sandbox): axum::Extension<Arc<crate::api::sandbox::SandboxState>>,
                         axum::Extension(auth): axum::Extension<crate::auth::OperatorAuth>) -> axum::response::Response {
-    let control_hz = supervisor.control_frequency_hz().max(1);
     let obs_rate = match query.get("obs_hz") {
         None => None,
-        Some(v) => match v.trim().parse::<u64>() {
-            Ok(n) => Some(ObsRate { hz: n.clamp(1, u64::from(control_hz)) as f64, control_hz: f64::from(control_hz) }),
-            Err(_) => return (StatusCode::BAD_REQUEST, "obs_hz must be an integer >= 0 (0 and 1 mean 1 Hz; values above control_frequency_hz are clamped)").into_response(),
-        },
+        Some(v) => {
+            let control_hz = match supervisor.control_frequency_hz_checked().await {
+                Ok(hz) => hz.max(1),
+                Err(err) => return ApiError::from(err).into_response(),
+            };
+            match v.trim().parse::<u64>() {
+                Ok(n) => Some(ObsRate { hz: n.clamp(1, u64::from(control_hz)) as f64, control_hz: f64::from(control_hz) }),
+                Err(_) => return (StatusCode::BAD_REQUEST, "obs_hz must be an integer >= 0 (0 and 1 mean 1 Hz; values above control_frequency_hz are clamped)").into_response(),
+            }
+        }
     };
     let explicit_auth = query
         .get("auth")
@@ -712,6 +728,33 @@ impl WsWriterHandle {
 
     fn try_send_stop_best_effort(&self, reply: Value) -> bool {
         self.stop_tx.try_send(reply).is_ok()
+    }
+}
+
+/// Per-connection RAII gate pausing `subscribe_action_terminals` delivery for this connection
+/// while `worker_task` executes an immediate owner command and enqueues its reply on `ordinary_tx`.
+/// Returning `false` from the subscriber callback keeps pending terminals at the head of
+/// `TerminalBroadcaster`'s bounded FIFO (preserving capacity accounting and holding back newer
+/// telemetry broadcasts) until this guard drops and wakes `armd-dispatch`.
+pub(super) struct CommandReplyGateGuard {
+    active: Arc<AtomicBool>,
+    hub: Arc<crate::rt_core::publish::StateHub>,
+}
+
+impl CommandReplyGateGuard {
+    pub(super) fn enter(active: &Arc<AtomicBool>, hub: &Arc<crate::rt_core::publish::StateHub>) -> Self {
+        active.store(true, Ordering::Release);
+        Self {
+            active: Arc::clone(active),
+            hub: Arc::clone(hub),
+        }
+    }
+}
+
+impl Drop for CommandReplyGateGuard {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+        self.hub.wake();
     }
 }
 
@@ -1452,6 +1495,14 @@ impl WsAuth {
         !s.auth.is_enforced() || s.auth.is_operator(s.token.as_deref())
     }
 
+    fn operator_grant(&self) -> crate::auth::OperatorGrant {
+        let s = self.0.read().unwrap_or_else(|e| e.into_inner());
+        if s.explicit_auth && !s.explicit_authed {
+            return crate::auth::OperatorGrant::DENIED;
+        }
+        s.auth.operator_grant(s.token.as_deref())
+    }
+
     fn is_enforced(&self) -> bool {
         self.0.read().unwrap_or_else(|e| e.into_inner()).auth.is_enforced()
     }
@@ -1808,10 +1859,81 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
         urgent_done_notify: urgent_done_notify.clone(),
     };
 
-    // This identity never comes from a client payload and is never disclosed.
-    let conn_id = NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed);
-    let connection = format!("connection:{conn_id}");
+    // Reserve one off-thread WS connection slot (`<= MAX_LIVE_CONNECTIONS = 64`) and allocate a
+    // strictly monotonic connection ID WITHOUT awaiting the RT executor:
+    // - Rejected upgrades never consume an ID (no permanent holes in `ClosedConnections`).
+    // - The cap applies uniformly to every retained socket, including degraded E-stop sockets.
+    // - `reader_task` starts immediately so urgent E-stop can latch even if the executor is stalled.
+    let conn_handle = match supervisor.try_claim_ws_slot() {
+        Ok(h) => h,
+        Err(err) => {
+            let api = ApiError::from(err);
+            let err_frame = json!({
+                "type": "error",
+                "status": api.status.as_u16(),
+                "code": api.code,
+                "error": api.error,
+                "message": api.message,
+            });
+            let close = CloseFrame {
+                code: 1013,
+                reason: api
+                    .code
+                    .as_deref()
+                    .unwrap_or("CONNECTION_REJECTED")
+                    .to_owned()
+                    .into(),
+            };
+            let _ = tokio::time::timeout(Duration::from_millis(100), async {
+                let _ = sender.send(Message::Text(err_frame.to_string().into())).await;
+                let _ = sender.send(Message::Close(Some(close))).await;
+                let _ = sender.flush().await;
+                let _ = sender.close().await;
+            })
+            .await;
+            return;
+        }
+    };
+    let conn_id = conn_handle.id();
+    let connection = conn_handle.as_str().to_owned();
     let connection_generation = Arc::new(AtomicU64::new(0));
+
+    struct WsSlotGuard {
+        supervisor: Arc<ArmSupervisor>,
+        conn: crate::rt_core::requests::lease::ConnectionHandle,
+        generation: Arc<AtomicU64>,
+        disarmed: bool,
+    }
+    impl Drop for WsSlotGuard {
+        fn drop(&mut self) {
+            if !self.disarmed {
+                let closing_gen = self.generation.swap(0, Ordering::SeqCst);
+                self.supervisor
+                    .fence_ws_connection_immediate(self.conn, closing_gen);
+                self.supervisor.finish_ws_connection_detached(self.conn);
+            }
+        }
+    }
+    let mut ws_slot_guard = WsSlotGuard {
+        supervisor: supervisor.clone(),
+        conn: conn_handle,
+        generation: connection_generation.clone(),
+        disarmed: false,
+    };
+
+    // Register this admitted slot with the active owner concurrently so `reader_task` is live
+    // immediately for urgent E-stop while `worker_task` and `heartbeat_task` gate ordinary/lease
+    // traffic until owner registration settles (`Some(true)` registered, `Some(false)` stopped/degraded).
+    let (reg_tx, reg_rx) = tokio::sync::watch::channel::<Option<bool>>(None);
+    let reg_supervisor = supervisor.clone();
+    let mut reg_task = tokio::spawn(async move {
+        let ok = reg_supervisor
+            .register_ws_connection_for_slot(conn_id)
+            .await
+            .is_ok();
+        let _ = reg_tx.send(Some(ok));
+    });
+
     let client_label: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     // Urgent Stop request_id ordering is tracked independently of ordinary RPCs so an urgent Stop
     // overtaking queued ordinary requests never causes earlier ordinary IDs to fail INVALID_COMMAND.
@@ -1859,8 +1981,16 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
 
     // Route unseen action terminals into this connection's lossless ordinary control queue
     // (never dropped by telemetry broadcast lag; overflow closes the connection with an error).
+    // Returning `false` while `command_reply_pending` is set keeps terminals at the head of
+    // `TerminalBroadcaster`'s bounded FIFO (and gates telemetry broadcast) until the in-flight
+    // command's own reply is enqueued on `ordinary_tx`.
+    let command_reply_pending = Arc::new(AtomicBool::new(false));
     let term_writer = writer.clone();
+    let term_pending = Arc::clone(&command_reply_pending);
     let _terminal_sub = supervisor.subscribe_action_terminals(move |obs| {
+        if term_pending.load(Ordering::Acquire) {
+            return false;
+        }
         let Ok(val) = serde_json::to_value(obs) else { return true; };
         term_writer.try_send_ordinary_control(val)
     });
@@ -2160,11 +2290,12 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
 
     // Dedicated latest-wins heartbeat processor isolated from ordinary backlog and slow worker IO.
     let hb_supervisor = supervisor.clone();
-    let hb_connection = connection.clone();
+    let hb_conn_handle = conn_handle;
     let hb_generation = connection_generation.clone();
     let hb_client_label = client_label.clone();
     let hb_slot = heartbeat_slot.clone();
     let hb_writer = writer.clone();
+    let mut hb_reg_rx = reg_rx.clone();
     let heartbeat_task = tokio::spawn(async move {
         let Some(DispatchHandler::Heartbeat(hb_handler)) =
             dispatch::lookup(FrameKind::Heartbeat, None).map(|e| e.handler)
@@ -2172,19 +2303,17 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             unreachable!("FrameKind::Heartbeat must bind DispatchHandler::Heartbeat");
         };
         while let Some(value) = hb_slot.pop().await {
-            if hb_supervisor.owner_mode() != crate::supervisor::OWNER_LEGACY {
-                continue;
+            if hb_reg_rx.borrow().is_none() {
+                let _ = hb_reg_rx.wait_for(|v| v.is_some()).await;
             }
-            let reply = {
-                let mut inner = hb_supervisor.inner().write().await;
-                hb_handler(
-                    &mut inner,
-                    &value,
-                    &hb_connection,
-                    &hb_generation,
-                    &hb_client_label,
-                )
-            };
+            let reply = hb_handler(
+                &hb_supervisor,
+                &value,
+                hb_conn_handle,
+                &hb_generation,
+                &hb_client_label,
+            )
+            .await;
             if let Some(reply) = reply {
                 if !hb_writer.send_ordinary_control(reply).await {
                     break;
@@ -2321,11 +2450,13 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     // may await planning, replay, dry-run, and the detector without blocking reader/urgent paths.
     let recv_supervisor = supervisor.clone();
     let recv_conn_id = conn_id;
+    let recv_conn_handle = conn_handle;
     let recv_connection = connection.clone();
     let recv_generation = connection_generation.clone();
     let recv_client_label = client_label.clone();
     let worker_ordinary_queue = ordinary_queue.clone();
     let worker_writer = writer.clone();
+    let worker_command_reply_pending = Arc::clone(&command_reply_pending);
     let worker_tasks = tasks.clone();
     let worker_closing = connection_closing.clone();
     let recv_deps = deps;
@@ -2335,6 +2466,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     #[cfg(feature = "policy-runtime")]
     let worker_ws_closed = ws_closed.clone();
     let worker_ws_auth = ws_auth.clone();
+    let mut worker_reg_rx = reg_rx;
     let worker_task = tokio::spawn(async move {
         // the operator session of this connection: from the upgrade request, updated by `auth` messages in reader
         let ws_auth = worker_ws_auth;
@@ -2372,25 +2504,10 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     continue;
                 }
                 Some(mut reply) = ack_rx.recv() => {
-                    let stamped_from_legacy = if recv_supervisor.owner_mode() == crate::supervisor::OWNER_LEGACY {
-                        let inner = recv_supervisor.inner().read().await;
-                        if !inner.detached {
-                            reply["epoch_id"] = json!(inner.safety.epoch_id());
-                            reply["safety_state"] = json!(inner.safety.state());
-                            reply["is_torqued"] = json!(inner.is_torqued);
-                            true
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    };
-                    if !stamped_from_legacy {
-                        if let Some(s) = recv_supervisor.hub().latest() {
-                            reply["epoch_id"] = json!(s.obs.epoch_id);
-                            reply["safety_state"] = json!(s.obs.safety_state);
-                            reply["is_torqued"] = json!(s.obs.is_torqued);
-                        }
+                    if let Ok(s) = recv_supervisor.fresh_snapshot(None).await {
+                        reply["epoch_id"] = json!(s.obs.epoch_id);
+                        reply["safety_state"] = json!(s.obs.safety_state);
+                        reply["is_torqued"] = json!(s.obs.is_torqued);
                     }
                     test_ack_stamp_delay().await;
                     if !worker_writer.send_ordinary_control(reply).await { break; }
@@ -2398,7 +2515,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 }
                 joined = async { (&mut macro_check.as_mut().expect("guarded by the precondition").rx).await }, if macro_active => {
                     let MacroCheck { request_id, generation, stamp, .. } = macro_check.take().expect("checked above");
-                    let Some(reply) = actions::complete_macro_check(
+                    let Some((reply, macro_gate)) = actions::complete_macro_check(
                         request_id,
                         generation,
                         stamp,
@@ -2408,8 +2525,17 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         &recv_generation,
                         &recv_deps,
                         &worker_closing,
+                        &worker_command_reply_pending,
                     ).await else { break; };
-                    if !worker_writer.send_ordinary_control(reply).await { break; }
+                    if reply.get("type").and_then(Value::as_str) == Some("command_ack") {
+                        let delay_ms = TEST_DEFERRED_ACK_DELAY_MS.load(Ordering::Relaxed);
+                        if delay_ms > 0 {
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        }
+                    }
+                    let sent = worker_writer.send_ordinary_control(reply).await;
+                    drop(macro_gate);
+                    if !sent { break; }
                     continue;
                 }
                 item = worker_ordinary_queue.pop(macro_active) => match item {
@@ -2418,12 +2544,132 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 }
             };
             let QueuedOrdinary { value, stamp } = queued;
+            if worker_reg_rx.borrow().is_none() {
+                let _ = worker_reg_rx.wait_for(|v| v.is_some()).await;
+            }
             let raw_kind = value.get("type").and_then(Value::as_str).unwrap_or("");
             let (frame_kind, entry) = dispatch::classify(&value);
+            // Unified table-bound async session handlers (`acquire_lease`, `release_lease`)
+            // dispatched strictly through `entry.handler` (single authority in `dispatch.rs`).
+            let owner_mode = recv_supervisor.owner_mode();
+            if let Some(DispatchHandler::SessionAsync(handler)) = entry.map(|e| e.handler) {
+                if matches!(
+                    owner_mode,
+                    crate::supervisor::OWNER_LEGACY | crate::supervisor::OWNER_EXECUTOR
+                ) {
+                    maybe_pause_worker_before_lock(&recv_connection).await;
+                    let (response, evicted_notify) = handler(dispatch::SessionDispatchCtx {
+                        supervisor: &recv_supervisor,
+                        value: &value,
+                        conn_handle: recv_conn_handle,
+                        recv_generation: &recv_generation,
+                        recv_client_label: &recv_client_label,
+                        worker_closing: &worker_closing,
+                        ws_auth: &ws_auth,
+                        last_sequence: &mut last_sequence,
+                    })
+                    .await;
+                    if let Some((evicted_conn, evicted_gen)) = evicted_notify {
+                        lease::notify_evicted(&evicted_conn, evicted_gen);
+                    }
+                    if let Some(response) = response {
+                        if response.get("type").and_then(Value::as_str) == Some("lease_granted") {
+                            let delay_ms = TEST_LEASE_GRANTED_DELAY_MS.load(Ordering::Relaxed);
+                            if delay_ms > 0 {
+                                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                            }
+                        }
+                        if !worker_writer.send_ordinary_control(response).await {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+            }
+            // Unified table-bound async command handlers (`/api/v1/torque`, `/api/v1/arm`,
+            // `/api/v1/safety/clear_fault`) routed identically across legacy and RT executor.
+            // Both `entry.lease` and `entry.auth` are enforced directly from the dispatch table row.
+            if let Some((lease_req, auth_req, DispatchHandler::CommandAsync(handler))) =
+                entry.map(|e| (e.lease, e.auth, e.handler))
+            {
+                if matches!(
+                    owner_mode,
+                    crate::supervisor::OWNER_LEGACY | crate::supervisor::OWNER_EXECUTOR
+                ) {
+                    let local_generation = match lease_req {
+                        LeaseRequirement::Required => {
+                            let Some(gen) = lease::check_local_command_lease(
+                                &value,
+                                &recv_generation,
+                                &recv_client_label,
+                            ) else {
+                                let req_id_val = value.get("request_id").unwrap_or(&Value::Null);
+                                let epoch_id = lease::current_reject_epoch(&recv_supervisor).await;
+                                let response =
+                                    lease::format_command_lease_lost(req_id_val, epoch_id);
+                                if !worker_writer.send_ordinary_control(response).await {
+                                    break;
+                                }
+                                continue;
+                            };
+                            gen
+                        }
+                        LeaseRequirement::None => 0,
+                        _ => unreachable!("validate_entry restricts CommandAsync lease policy"),
+                    };
+                    let auth_policy = auth_req
+                        .owner_auth_policy()
+                        .expect("validate_entry restricts CommandAsync auth policy");
+                    let operator = ws_auth.operator_grant();
+                    maybe_pause_worker_before_lock(&recv_connection).await;
+                    let response = handler(dispatch::CommandAsyncCtx {
+                        supervisor: &recv_supervisor,
+                        value: &value,
+                        stamp,
+                        conn_handle: recv_conn_handle,
+                        local_generation,
+                        auth_policy,
+                        operator,
+                        last_ordinary_request: &mut last_ordinary_request,
+                    })
+                    .await;
+                    if !worker_writer.send_ordinary_control(response).await {
+                        break;
+                    }
+                    continue;
+                }
+            }
             // Fail closed before any legacy lock/reader path (including depth/teach) whenever
             // `ArmCore` is not owned by the legacy supervisor lock.
-            let owner_mode = recv_supervisor.owner_mode();
             if owner_mode != crate::supervisor::OWNER_LEGACY {
+                if owner_mode == crate::supervisor::OWNER_EXECUTOR {
+                    if let Some(opt_reply) = config::handle_executor_ws_command(
+                        frame_kind,
+                        entry,
+                        &value,
+                        stamp,
+                        recv_conn_id,
+                        &recv_connection,
+                        &recv_generation,
+                        &recv_client_label,
+                        &mut last_ordinary_request,
+                        &ws_auth,
+                        &recv_supervisor,
+                        &recv_deps,
+                        &recv_calib,
+                        &ack_tx,
+                        &worker_tasks,
+                    )
+                    .await
+                    {
+                        if let Some(reply) = opt_reply {
+                            if !worker_writer.send_ordinary_control(reply).await {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                }
                 if let Some(reply) = executor_routing_reject(&value, owner_mode) {
                     if !worker_writer.send_ordinary_control(reply).await { break; }
                 }
@@ -2448,11 +2694,11 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 last_ordinary_request = request_id;
                 let path = value.get("path").and_then(Value::as_str).unwrap_or("");
                 if let Some(error) = auth_req.check_lease_free(&ws_auth, path, &value["body"]) {
-                    let mut reply = rejection(
-                        error,
-                        "command_reject",
-                        recv_supervisor.inner().read().await.safety.epoch_id(),
-                    );
+                    let reject_epoch = recv_supervisor
+                        .fresh_snapshot(None)
+                        .await
+                        .map_or_else(|_| recv_supervisor.estop_epoch(), |s| s.obs.epoch_id);
+                    let mut reply = rejection(error, "command_reject", reject_epoch);
                     reply["request_id"] = value["request_id"].clone();
                     if !worker_writer.send_ordinary_control(reply).await {
                         break;
@@ -2471,7 +2717,8 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 continue;
             }
             let mut response: Option<Value>;
-            let mut evicted_notify: Option<(String, u64)> = None;
+            let mut response_sent = false;
+            let evicted_notify: Option<(String, u64)> = None;
             let mut action_pending = actions::ActionPending {
                 plan: None,
                 macro_action: None,
@@ -2480,9 +2727,10 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 policy: None,
                 dry_run_grasp: None,
             };
-            let mut pending_config_write: Option<(Value, PreparedConfigWrite, u64, u64)> = None;
+            let mut pending_config_write: Option<config::PendingConfigJob> = None;
             let mut pending_calibration: Option<(Value, CalibJob, u64, u64, bool)> = None;
             maybe_pause_worker_before_lock(&recv_connection).await;
+            let mut reply_gate_guard;
             {
                 let mut inner = recv_supervisor.inner().write().await;
                 if inner.detached {
@@ -2492,6 +2740,10 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     }
                     continue;
                 }
+                reply_gate_guard = Some(CommandReplyGateGuard::enter(
+                    &worker_command_reply_pending,
+                    recv_supervisor.hub(),
+                ));
                 macro_rules! call_owner {
                     ($handler:expr, $path:expr, $epoch:expr, $gen:expr) => {{
                         let mut ctx = OwnerDispatchCtx {
@@ -2501,11 +2753,6 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             value: &value,
                             epoch: $epoch,
                             local_generation: $gen,
-                            recv_conn_id,
-                            recv_connection: &recv_connection,
-                            recv_generation: &recv_generation,
-                            recv_client_label: &recv_client_label,
-                            worker_closing: &worker_closing,
                             ws_auth: &ws_auth,
                             recv_supervisor: &recv_supervisor,
                             recv_deps: &recv_deps,
@@ -2513,7 +2760,6 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             #[cfg(feature = "policy-runtime")]
                             pending_policy_loads: &pending_policy_loads,
                             last_sequence: &mut last_sequence,
-                            evicted_notify: &mut evicted_notify,
                             action_pending: &mut action_pending,
                             pending_config_write: &mut pending_config_write,
                             pending_calibration: &mut pending_calibration,
@@ -2521,12 +2767,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         ($handler)(&mut ctx)
                     }};
                 }
-                if frame_kind == FrameKind::AcquireLease {
-                    let Some(DispatchHandler::Owner(handler)) = entry.map(|e| e.handler) else {
-                        unreachable!("AcquireLease must have an owner handler");
-                    };
-                    response = call_owner!(handler, "", 0, 0);
-                } else {
+                {
                     let (local_generation, authorized) = lease::check_lease_authority(
                         &mut inner,
                         raw_kind,
@@ -2545,11 +2786,6 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         response = Some(reject);
                     } else if !authorized && !is_dry_run {
                         response = Some(lease::lease_loss_reply(&inner, raw_kind, &value, &recv_connection, local_generation));
-                    } else if frame_kind == FrameKind::ReleaseLease {
-                        let Some(DispatchHandler::Owner(handler)) = entry.map(|e| e.handler) else {
-                            unreachable!("ReleaseLease must have an owner handler");
-                        };
-                        response = call_owner!(handler, "", 0, local_generation);
                     } else {
                         inner.consume_pending_estop();
                         let epoch = inner.safety.epoch_id();
@@ -2596,12 +2832,40 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         }
                     }
                 }
+                // Enqueue immediate control replies before dropping `inner` and before releasing
+                // `reply_gate_guard` so any terminal caused by this command (either via
+                // `record_finished_action` inside `inner` or via a subsequent tick's telemetry)
+                // cannot overtake this command's ack on the wire.
+                if evicted_notify.is_none()
+                    && response
+                        .as_ref()
+                        .is_some_and(|r| r.get("type").and_then(Value::as_str) != Some("lease_granted"))
+                    && !worker_writer.is_fatal()
+                {
+                    if let Some(reply) = response.take() {
+                        match worker_writer.ordinary_tx.try_send(reply) {
+                            Ok(()) => {
+                                response_sent = true;
+                            }
+                            Err(mpsc::error::TrySendError::Full(reply)) => {
+                                response = Some(reply);
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                drop(reply_gate_guard.take());
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if response.is_none() {
+                drop(reply_gate_guard.take());
             }
 
             let allows_deferred = entry.is_some_and(|e| e.reply == ReplyPolicy::CommandDeferred);
             if allows_deferred {
                 if let Some((plan, generation)) = action_pending.plan.take() {
-                    let Some(next) = actions::complete_pending_plan(
+                    let Some((next, gate)) = actions::complete_pending_plan(
                         plan,
                         generation,
                         stamp,
@@ -2609,7 +2873,9 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         &recv_connection,
                         &recv_generation,
                         &worker_closing,
+                        &worker_command_reply_pending,
                     ).await else { break; };
+                    reply_gate_guard = gate;
                     response = next;
                 }
 
@@ -2627,7 +2893,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 }
 
                 if let Some((request_id, input, generation)) = action_pending.replay.take() {
-                    let Some(next) = actions::complete_pending_replay(
+                    let Some((next, gate)) = actions::complete_pending_replay(
                         request_id,
                         input,
                         generation,
@@ -2636,7 +2902,9 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         &recv_connection,
                         &recv_generation,
                         &worker_closing,
+                        &worker_command_reply_pending,
                     ).await else { break; };
+                    reply_gate_guard = gate;
                     response = next;
                 }
                 #[cfg(feature = "policy-runtime")]
@@ -2680,20 +2948,20 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         &worker_tasks,
                     );
                 }
-                // Atomic two-phase persist-before-commit config writes (track B, `config::persist_and_activate`).
-                if let Some((request_id, prepared, generation, epoch)) = pending_config_write.take() {
-                    config::spawn_config_write(
-                        request_id,
-                        prepared,
-                        generation,
-                        epoch,
+                // Atomic two-phase persist-before-commit config writes (PR C / A8, off-lock prepare + requests::config).
+                if let Some(job) = pending_config_write.take() {
+                    response = config::complete_or_spawn_config_write(
+                        job,
+                        recv_conn_id,
                         &recv_supervisor,
+                        &recv_deps,
                         &ack_tx,
                         &ws_auth,
                         &recv_connection,
                         &recv_generation,
                         &worker_tasks,
-                    );
+                    )
+                    .await;
                 }
             } else {
                 #[cfg(feature = "policy-runtime")]
@@ -2713,7 +2981,8 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 );
                 if unexpected_deferred
                     || (entry.is_some_and(|e| e.reply == ReplyPolicy::CommandImmediate)
-                        && response.is_none())
+                        && response.is_none()
+                        && !response_sent)
                 {
                     tracing::error!(
                         "WS dispatch contract violation: immediate entry {:?} produced no immediate reply or populated deferred slot",
@@ -2729,9 +2998,6 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     }));
                 }
             }
-                if let Some((evicted_conn, evicted_gen)) = evicted_notify {
-                    lease::notify_evicted(evicted_conn, evicted_gen);
-                }
             // Control replies are never silently dropped: saturation closes the connection with an error.
             if let Some(response) = response {
                 if response.get("type").and_then(Value::as_str) == Some("lease_granted") {
@@ -2739,9 +3005,20 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     if delay_ms > 0 {
                         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                     }
+                } else if reply_gate_guard.is_some()
+                    && response.get("type").and_then(Value::as_str) == Some("command_ack")
+                {
+                    let delay_ms = TEST_DEFERRED_ACK_DELAY_MS.load(Ordering::Relaxed);
+                    if delay_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    }
                 }
-                if !worker_writer.send_ordinary_control(response).await { break; }
+                if !worker_writer.send_ordinary_control(response).await {
+                    drop(reply_gate_guard.take());
+                    break;
+                }
             }
+            drop(reply_gate_guard.take());
         }
     });
     // Only the writer (fatal close after urgent flush, or socket error) and reader (client
@@ -2753,21 +3030,19 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
         _ = &mut writer_task => FirstExit::Writer,
         _ = &mut reader_task => FirstExit::Reader,
     };
-    // Mark connection closing and record `connection_closed` under the owner lock FIRST,
-    // before awaiting ANY task join, so no resuming async install (policy/start after deployment
-    // lookup, planning, macro) or stale `Admitted` token from this connection can win the owner
-    // lock while teardown waits on worker/heartbeat/auth/writer/reader/child joins.
+    // M1: The VERY FIRST action on socket close is a non-blocking owner-side fence of this
+    // connection's lease generation BEFORE any task abort, join, or cleanup, so zero bus output
+    // from that generation can escape while teardown runs.
+    let closing_gen = connection_generation.swap(0, Ordering::SeqCst);
+    supervisor.fence_ws_connection_immediate(conn_handle, closing_gen);
+
     connection_closing.store(true, Ordering::SeqCst);
     #[cfg(feature = "policy-runtime")]
     ws_closed.store(true, Ordering::SeqCst);
     ordinary_queue.close();
     heartbeat_slot.close();
-    if supervisor.owner_mode() == crate::supervisor::OWNER_LEGACY {
-        let mut inner = supervisor.inner().write().await;
-        if !inner.detached {
-            inner.mark_connection_closed(conn_id);
-        }
-    }
+    reg_task.abort();
+    let _ = (&mut reg_task).await;
 
     // Stop and JOIN all primary tasks so none outlives teardown; give writer <= 1 s grace on fatal overflow.
     worker_task.abort();
@@ -2808,13 +3083,10 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
 
     if supervisor.owner_mode() == crate::supervisor::OWNER_LEGACY {
         supervisor.recorder_connection_closed(&connection).await;
-        // Take the owner lock FIRST, keep connection marked closed, and stop motion before
-        // releasing whichever lease this connection currently holds.
-        let mut inner = supervisor.inner().write().await;
-        if !inner.detached {
-            inner.mark_connection_closed(conn_id);
-            let _ = inner.release_lease_for_connection_and_stop(&connection);
-        }
-        connection_generation.store(0, Ordering::SeqCst);
     }
+    if !ws_slot_guard.disarmed {
+        supervisor.finish_ws_connection(conn_handle).await;
+        ws_slot_guard.disarmed = true;
+    }
+    connection_generation.store(0, Ordering::SeqCst);
 }

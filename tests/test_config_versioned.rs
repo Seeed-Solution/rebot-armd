@@ -154,6 +154,7 @@ fn apply_failure_after_the_rename_reconciles() {
 fn a_held_reservation_refuses_rt_installs_and_leaves_motion_untouched() {
     let mut inner = SupervisorInner::new(ArmConfig { lease_timeout_ms: 600_000, ..ArmConfig::rebot_dm() });
     inner.lease_enabled = false;
+    inner.register_live_connection(1).unwrap();
     inner.tick(0.02);
     { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     let (mut fx, mut b, _tw, _stop) = ReleaseFixture::new(inner, BootId(7), Capacities { commands: 4, plans: 2, replies: 6 });
@@ -341,14 +342,15 @@ async fn competing_updates_activate_once() {
     assert_motion_eligible(&mut ws, g, epoch, &sup).await;
 }
 
-/// A motion stop while the candidate persists does not cancel the change.
+/// An authorized stop during post-reserve staging advances `stop_generation` before the
+/// pre-rename authority recheck, aborting the staged file and releasing the reservation cleanly.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stop_during_persistence_still_activates() {
+async fn stop_during_persistence_aborts_before_rename() {
     let _serial = WRITE_DELAY.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("keepout.json");
     let (mut ws, g, epoch, sup) = rig(Some(&path)).await;
-    let ack = {
+    let reject = {
         let _d = Delay::set(250);
         let id_9201 = next_id();
         common::send(&mut ws, keepout_cmd(id_9201, g, epoch, vec![cube("kept", 0.3)], 1)).await;
@@ -357,10 +359,11 @@ async fn stop_during_persistence_still_activates() {
         assert_eq!(stop["type"], "command_ack", "{stop}");
         reply_for(&mut ws, id_9201).await
     };
-    assert_eq!((ack["type"].as_str(), ack["revision"].as_u64()), (Some("command_ack"), Some(2)), "{ack}");
-    assert_eq!(disk_boxes(&path).unwrap(), ["kept"]);
-    assert_eq!(sup.inner().read().await.keepout.revision, 2);
-    assert_eq!(files(dir.path()), ["keepout.json"]);
+    assert_eq!(reject["type"], "command_reject", "{reject}");
+    assert_eq!(reject["code"], "STOPPED", "{reject}");
+    assert!(!path.exists(), "pre-rename stop must not publish candidate to disk");
+    assert_eq!(sup.inner().read().await.keepout.revision, 1);
+    assert!(files(dir.path()).is_empty(), "aborted staged file must be removed: {:?}", files(dir.path()));
     assert_motion_eligible(&mut ws, g, epoch, &sup).await;
 }
 

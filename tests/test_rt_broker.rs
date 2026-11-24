@@ -19,6 +19,7 @@ const BOOT: BootId = BootId(42);
 fn supervisor() -> SupervisorInner {
     let mut inner = SupervisorInner::new(ArmConfig { lease_timeout_ms: 600_000, ..ArmConfig::rebot_dm() });
     inner.lease_enabled = false;
+    inner.register_live_connection(1).unwrap();
     inner.tick(0.02);
     { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.expect("arm");
     inner
@@ -89,9 +90,9 @@ fn saturated_admission_and_a_stalled_consumer_leave_the_active_motion_unchanged(
     // the only plan slot is held by the active action
     assert_eq!(submit_install(&mut b, 2, a, later(), quintic(&fx, -0.2, 2.0)), Err(AdmitError::PlansFull));
     // stalled consumer: no release runs; immediate commands fill the ring, then reply capacity
-    b.submit(ClientId(2), 1, a, later(), Submit::Immediate(ImmediateOp::Heartbeat)).unwrap();
-    b.submit(ClientId(2), 2, a, later(), Submit::Immediate(ImmediateOp::Heartbeat)).unwrap();
-    assert_eq!(b.submit(ClientId(2), 3, a, later(), Submit::Immediate(ImmediateOp::Heartbeat)), Err(AdmitError::CommandsFull));
+    b.submit(ClientId(1), 2, a, later(), Submit::Immediate(ImmediateOp::Heartbeat)).unwrap();
+    b.submit(ClientId(1), 3, a, later(), Submit::Immediate(ImmediateOp::Heartbeat)).unwrap();
+    assert_eq!(b.submit(ClientId(1), 4, a, later(), Submit::Immediate(ImmediateOp::Heartbeat)), Err(AdmitError::CommandsFull));
     assert_eq!(b.stats().refused_admission, 2);
     assert_eq!((target_of(&fx), fx.core.commanded_positions.clone()), before, "refused admission touched the core");
     assert_eq!(fx.active(), Some(active));
@@ -243,11 +244,44 @@ fn a_planning_snapshot_is_stamped_with_the_publication_and_authority() {
 /// A supervisor that enforces leases, with `client` holding one (`lease_timeout_ms`).
 fn leased(lease_timeout_ms: u64) -> (Fx, u64) { leased_with(lease_timeout_ms, Capacities { commands: 4, plans: 2, replies: 16 }) }
 
+fn acquire_ws1_lease(inner: &mut SupervisorInner, label: &str) -> u64 {
+    use armd::model::HolderLabel;
+    use armd::rt_core::requests::lease::{
+        install_lease_acquire, ConnectionHandle, LeaseAcquire, LeaseInstallCtx, LeaseOutcome,
+    };
+    inner.register_live_connection(1).unwrap();
+    let now = Instant::now();
+    let ctx = LeaseInstallCtx {
+        expected_arm: ArmId::LOCAL,
+        expected_boot: BOOT,
+        stamp_arm: ArmId::LOCAL,
+        stamp_boot: BOOT,
+        now,
+        request_id: 999_001,
+        client: ClientId(1),
+        deadline: now + Duration::from_secs(10),
+        enforce_single_use: false,
+    };
+    let LeaseOutcome::Granted { generation, .. } = install_lease_acquire(
+        inner,
+        &LeaseAcquire {
+            connection: ConnectionHandle::from_ws_id(1).unwrap(),
+            label: HolderLabel::new(label),
+            has_label: true,
+        },
+        &ctx,
+    )
+    .expect("lease") else {
+        panic!("expected Granted lease");
+    };
+    generation
+}
+
 fn leased_with(lease_timeout_ms: u64, caps: Capacities) -> (Fx, u64) {
     let mut inner = SupervisorInner::new(ArmConfig { lease_timeout_ms, ..ArmConfig::rebot_dm() });
     inner.lease_enabled = true;
     inner.tick(0.02);
-    let generation = inner.acquire_lease("client").expect("lease");
+    let generation = acquire_ws1_lease(&mut inner, "client");
     { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.expect("arm");
     (ReleaseFixture::new(inner, BOOT, caps), generation)
 }
@@ -350,7 +384,7 @@ fn a_terminal_keeps_the_cause_of_a_lease_loss() {
     submit_install(&mut b, 1, auth(&fx), later(), quintic(&fx, 0.2, 2.0)).unwrap();
     fx.step();
     let action = fx.active().unwrap();
-    assert!(fx.core.release_lease("client", generation));
+    assert!(fx.core.release_lease("connection:1", generation));
     let mut ended = None;
     for _ in 0..10 { if let Some(e) = fx.step().ended { ended = Some(e); break; } }
     assert_eq!(ended, Some((action, Outcome::Cancelled("LEASE_LOST"))));
@@ -538,7 +572,7 @@ fn a_buffered_frame_is_refused_once_its_lease_was_released_and_the_stream_hears_
         vision_at: None, vision_frame_id: Some(77), deadline: later(), dof: q.len() as u8, q: arr, replaceable: true };
     assert_eq!(tw.submit(frame), Submitted::Accepted);
     // the WS closes: its lease is released while the frame is buffered
-    fx.core.release_lease("client", generation);
+    fx.core.release_lease("connection:1", generation);
     let rep = fx.step();
     assert_eq!(rep.target, Some((1, Err("LEASE_LOST"))));
     assert_eq!(rep.target_refusal, Some(Refusal { code: "LEASE_LOST", detail: RefusalDetail::LeaseLoss { reason: "expired" } }));
@@ -566,7 +600,7 @@ fn parking_arm() -> (Fx, u64) {
     let mut inner = SupervisorInner::new(config);
     inner.tick(0.02);
     { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.expect("arm");
-    let generation = inner.acquire_lease("client-a").expect("lease");
+    let generation = acquire_ws1_lease(&mut inner, "client-a");
     (ReleaseFixture::new(inner, BOOT, Capacities { commands: 4, plans: 2, replies: 8 }), generation)
 }
 

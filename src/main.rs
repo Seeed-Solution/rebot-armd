@@ -1,5 +1,4 @@
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
@@ -8,6 +7,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use armd::{create_router_with_auth, ArmConfig, ArmSupervisor, OperatorAuth};
 #[cfg(test)]
 use armd::SupervisorInner;
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 
 #[derive(Debug, Default)]
 struct CliArgs {
@@ -336,8 +337,7 @@ where
             Ok(Err(e)) => {
                 error!("Final shutdown commit refused by RT owner: {e}");
                 server_handle.abort();
-                supervisor.e_stop_latched.store(true, Ordering::SeqCst);
-                supervisor.requested_estop_count.fetch_add(1, Ordering::SeqCst);
+                supervisor.estop_state.request_and_latch();
                 let h_disable = handle.clone();
                 let outcome = tokio::task::spawn_blocking(move || h_disable.emergency_disable_and_join())
                     .await
@@ -350,8 +350,7 @@ where
             Err(je) => {
                 error!("Final shutdown commit task failed: {je}");
                 server_handle.abort();
-                supervisor.e_stop_latched.store(true, Ordering::SeqCst);
-                supervisor.requested_estop_count.fetch_add(1, Ordering::SeqCst);
+                supervisor.estop_state.request_and_latch();
                 let h_disable = handle.clone();
                 let outcome = tokio::task::spawn_blocking(move || h_disable.emergency_disable_and_join())
                     .await
@@ -372,8 +371,7 @@ where
         if !confirmed {
             error!("Final legacy shutdown recheck refused: hardware disable is not confirmed");
             server_handle.abort();
-            supervisor.e_stop_latched.store(true, Ordering::SeqCst);
-            supervisor.requested_estop_count.fetch_add(1, Ordering::SeqCst);
+            supervisor.estop_state.request_and_latch();
             // Stop the legacy periodic loop first so it stops competing for the supervisor lock
             // and actuator bus while bounded emergency disable runs.
             supervisor.signal_legacy_stop(&control_stop);
@@ -642,7 +640,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }));
                     if let Err(e) = tick_res {
                         armd::rt_core::executor::account_periodic_overrun_on_panic_exit(&loop_stats);
-                        control_supervisor.e_stop_latched.store(true, Ordering::SeqCst);
+                        control_supervisor.estop_state.request_and_latch();
                         error!("Control thread panicked during tick: {:?}", e);
                         let outcome = control_supervisor
                             .attempt_legacy_panic_disable(armd::supervisor::PANIC_DISABLE_TIMEOUT);

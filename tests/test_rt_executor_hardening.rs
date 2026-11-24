@@ -546,6 +546,7 @@ async fn position_lead_enable_completion_on_sub_release_wake_does_zero_allocs() 
     let drv = DelayedWakeDriver::new(7, Duration::from_millis(14));
     let sup = Arc::new(ArmSupervisor::new(cfg).with_driver(Box::new(drv)));
     sup.set_lease_enabled(false).await;
+    sup.register_ws_connection(1).await.unwrap();
     let mut exec_cfg = ExecutorConfig::for_tests(Duration::from_millis(10));
     exec_cfg.alloc_timing = true;
     let handle = sup.start_executor(exec_cfg).await.expect("PositionLead profile admitted");
@@ -1225,6 +1226,7 @@ async fn sim_driver_estop_gate_and_pre_publish_maintenance_ordering() {
     drv_m.check_mapping_ranges();
     let sup_m = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_m)));
     sup_m.set_lease_enabled(false).await;
+    sup_m.register_ws_connection(1).await.unwrap();
     // Use a long period (80 ms) so if maintenance had mutated state AFTER Step 6 publish,
     // immediately inspecting `hub().latest()` upon receiving the reply would observe the stale
     // pre-mutation state for up to 80 ms!
@@ -2577,6 +2579,7 @@ fn j7_refresh_drain_counts_against_release_rx_budget_and_reports_consumed_frames
     let mut inner = SupervisorInner::new(ArmConfig { lease_timeout_ms: 600_000, ..ArmConfig::rebot_dm() })
         .with_driver(Box::new(drv));
     inner.lease_enabled = false;
+    inner.register_live_connection(1).unwrap();
     let (mut fx, mut broker, _tw, _stop) =
         ReleaseFixture::new(inner, BootId(11), Capacities { commands: 4, plans: 2, replies: 8 });
     let a = fx.core.authority(&fx.ctx(fx.now()));
@@ -2647,6 +2650,7 @@ fn j7_refresh_drain_counts_against_release_rx_budget_and_reports_consumed_frames
     let mut inner_b = SupervisorInner::new(ArmConfig { lease_timeout_ms: 600_000, ..ArmConfig::rebot_dm() })
         .with_driver(Box::new(drv_b));
     inner_b.lease_enabled = false;
+    inner_b.register_live_connection(1).unwrap();
     let (mut fx_b, mut broker_b, _tw_b, _stop_b) =
         ReleaseFixture::new(inner_b, BootId(12), Capacities { commands: 4, plans: 2, replies: 8 });
     let a_b = fx_b.core.authority(&fx_b.ctx(fx_b.now()));
@@ -2762,6 +2766,7 @@ fn j7_refresh_drain_counts_against_release_rx_budget_and_reports_consumed_frames
     let mut inner_c = SupervisorInner::new(ArmConfig { lease_timeout_ms: 600_000, ..ArmConfig::rebot_dm() })
         .with_driver(Box::new(nc_drv));
     inner_c.lease_enabled = false;
+    inner_c.register_live_connection(1).unwrap();
     let (mut fx_c, mut broker_c, _tw_c, _stop_c) =
         ReleaseFixture::new(inner_c, BootId(13), Capacities { commands: 4, plans: 2, replies: 8 });
     let a_c = fx_c.core.authority(&fx_c.ctx(fx_c.now()));
