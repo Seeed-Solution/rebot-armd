@@ -322,6 +322,7 @@ impl StateHub {
             if st.consumer.front().obs.is_none() {
                 if let Some(tmpl) = self.prewarm_template.get() {
                     let mut obs = tmpl.clone();
+                    obs.ensure_rt_safety_text_spare();
                     let dof = obs.positions.len();
                     obs.gravity_torques.reserve(dof);
                     obs.motor_errors.reserve(dof);

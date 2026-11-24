@@ -1424,6 +1424,7 @@ impl SupervisorInner {
         let tmpl = self.current_observation();
         self.core.try_prewarm_observations(|| {
             let mut obs = tmpl.clone();
+            obs.ensure_rt_safety_text_spare();
             obs.gravity_torques.reserve(arm_dof);
             obs.motor_errors.reserve(dof);
             obs
