@@ -412,6 +412,15 @@ fn check_operator_privilege(
     body: &Value,
     epoch: u64,
 ) -> Option<ApiError> {
+    if path == "/api/v1/safety/clear_fault"
+        && inner.consume_pending_estop()
+        && inner.safety.epoch_id() != epoch
+    {
+        return Some(ArmError::Safety(SafetyError::EpochMismatch {
+            expected: inner.safety.epoch_id(),
+            received: epoch,
+        }).into());
+    }
     if ws_auth.is_operator() {
         return None;
     }
@@ -464,10 +473,10 @@ fn check_operator_privilege(
             if inner.e_stop_latched.load(Ordering::SeqCst) {
                 return Some(ApiError::operator_required("clear_fault (EStop latched)"));
             }
-            if let Some(fault) = inner.safety.fault() {
-                if !fault.recoverable || fault.code == crate::safety::FaultCode::Collision {
-                    return Some(ApiError::operator_required("clear_fault (non-recoverable fault or EStop)"));
-                }
+            if (inner.safety.state().is_stopped() || inner.safety.has_latched_fault())
+                && !inner.safety.recoverable()
+            {
+                return Some(ApiError::operator_required("clear_fault (non-recoverable fault or EStop)"));
             }
             None
         }
@@ -856,6 +865,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             inner.stop_motion();
                             response = Some(json!({"type":"lease_released", "success":released}));
                         } else {
+                            inner.consume_pending_estop();
                             let epoch = inner.safety.epoch_id();
                             if !is_dry_run && value.get("epoch_id").and_then(Value::as_u64) != Some(epoch) {
                                 response = Some(if kind == "command" {

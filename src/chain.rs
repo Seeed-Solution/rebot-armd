@@ -1062,6 +1062,31 @@ pub struct EvalBufs {
     cap_reaches: Vec<[f64; MAX_CHAIN_JOINTS]>,
     self_pairs: Vec<Option<(usize, usize, [f64; MAX_CHAIN_JOINTS])>>,
     keepouts: Vec<([f64; 3], [f64; 3])>,
+    slots: Vec<f64>,
+    pub(crate) world_caps: Vec<([f64; 3], [f64; 3], f64)>,
+}
+
+impl EvalBufs {
+    /// Pre-sizes overflow buffers off the RT thread so evaluating `ws` (including workspaces with
+    /// more than [`k::MAX_STACK_WORKSPACE_SLOTS`] slots) allocates zero heap memory on RT paths.
+    pub fn prepare_for(
+        &mut self,
+        model: &ArmModel,
+        ws: &crate::model::WorkspacePolicy,
+        cam: &crate::model::CameraMount,
+        tcp_offset: [f64; 3],
+    ) {
+        let eval = WorkspaceEvaluator::new_with_tcp_in(model, ws, cam, tcp_offset, self);
+        let need_slots = eval.total_slots;
+        let need_caps = eval.capsules.len();
+        eval.recycle(self);
+        if need_slots > k::MAX_STACK_WORKSPACE_SLOTS && self.slots.capacity() < need_slots {
+            self.slots.reserve(need_slots - self.slots.len());
+        }
+        if need_caps > crate::model::MAX_LINK_CAPSULES && self.world_caps.capacity() < need_caps {
+            self.world_caps.reserve(need_caps - self.world_caps.len());
+        }
+    }
 }
 
 /// Precomputed per-constraint workspace evaluator (points + optional link capsules + optional self-collision pairs).
@@ -1242,6 +1267,28 @@ impl<'a> WorkspaceEvaluator<'a> {
         k::SlotBuf::zeros(self.total_slots)
     }
 
+    /// Allocates or reuses a [`k::SlotBuf`] backed by `bufs.slots` when `total_slots` exceeds
+    /// [`k::MAX_STACK_WORKSPACE_SLOTS`] (0 heap allocs after [`EvalBufs::prepare_for`]).
+    pub fn alloc_buf_in(&self, bufs: &mut EvalBufs) -> k::SlotBuf {
+        if self.total_slots <= k::MAX_STACK_WORKSPACE_SLOTS {
+            k::SlotBuf::Stack { data: [0.0; k::MAX_STACK_WORKSPACE_SLOTS], len: self.total_slots }
+        } else {
+            let mut v = std::mem::take(&mut bufs.slots);
+            v.clear();
+            v.resize(self.total_slots, 0.0);
+            k::SlotBuf::Heap(v)
+        }
+    }
+
+    /// Returns a spilled [`k::SlotBuf::Heap`] buffer to `bufs` without freeing on the RT thread.
+    pub fn recycle_buf(buf: k::SlotBuf, bufs: &mut EvalBufs) {
+        if let k::SlotBuf::Heap(v) = buf {
+            if v.capacity() >= bufs.slots.capacity() {
+                bufs.slots = v;
+            }
+        }
+    }
+
     /// Geometry index for slot `slot`.
     #[inline]
     pub fn slot_geom(&self, slot: usize) -> usize {
@@ -1266,6 +1313,18 @@ impl<'a> WorkspaceEvaluator<'a> {
     /// Evaluate clearances of all `(geometry, constraint)` slots at `q` into `out`.
     /// Returns `Err` if FK fails or a capsule references an unknown frame.
     pub fn eval_into(&self, q: &[f32], out: &mut k::SlotBuf, phase: &str) -> Result<(), WorkspaceFailure> {
+        let mut heap_caps = Vec::new();
+        self.eval_into_in(q, out, &mut heap_caps, phase)
+    }
+
+    /// [`Self::eval_into`] reusing `heap_caps` when `capsules.len() > MAX_LINK_CAPSULES` (0 alloc).
+    pub fn eval_into_in(
+        &self,
+        q: &[f32],
+        out: &mut k::SlotBuf,
+        heap_caps: &mut Vec<([f64; 3], [f64; 3], f64)>,
+        phase: &str,
+    ) -> Result<(), WorkspaceFailure> {
         let Some(f) = self.model.frames_f32(q) else {
             return Err(WorkspaceFailure::invalid(phase, "non-finite or incomplete joint positions"));
         };
@@ -1286,12 +1345,12 @@ impl<'a> WorkspaceEvaluator<'a> {
             }
         }
         let mut stack_caps = [([0.0f64; 3], [0.0f64; 3], 0.0f64); crate::model::MAX_LINK_CAPSULES];
-        let mut heap_caps = Vec::new();
         let world_caps: &mut [([f64; 3], [f64; 3], f64)] = if self.capsules.len() <= stack_caps.len() {
             &mut stack_caps[..self.capsules.len()]
         } else {
+            heap_caps.clear();
             heap_caps.resize(self.capsules.len(), ([0.0; 3], [0.0; 3], 0.0));
-            &mut heap_caps
+            heap_caps.as_mut_slice()
         };
         for (ci, (fr_opt, a_local, b_local, radius)) in self.capsules.iter().enumerate() {
             let Some(fr) = fr_opt else {

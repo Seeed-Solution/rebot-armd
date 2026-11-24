@@ -79,22 +79,46 @@ impl TransportError {
     }
 }
 
-struct OsErrorDisplay {
+pub(crate) struct OsErrorDisplay {
     errno: Option<i32>,
     kind: std::io::ErrorKind,
+}
+
+#[cfg(unix)]
+fn write_raw_os_error(code: i32, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    let mut buf = [0u8; 128];
+    // SAFETY: `buf` is a valid writable stack buffer of length `buf.len()`.
+    // Rust's `libc::strerror_r` exposes the XSI `c_int` signature on glibc, musl, and macOS.
+    let rc = unsafe { libc::strerror_r(code, buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if rc == 0 {
+        let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        if let Ok(msg) = std::str::from_utf8(&buf[..len]) {
+            if !msg.is_empty() {
+                return write!(f, "{msg} (os error {code})");
+            }
+        }
+    }
+    write!(f, "os error {code}")
 }
 
 impl fmt::Display for OsErrorDisplay {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(code) = self.errno {
-            write!(f, "{}", std::io::Error::from_raw_os_error(code))
+            #[cfg(unix)]
+            {
+                write_raw_os_error(code, f)
+            }
+            #[cfg(not(unix))]
+            {
+                write!(f, "{}", std::io::Error::from_raw_os_error(code))
+            }
         } else {
             write!(f, "{:?}", self.kind)
         }
     }
 }
 
-fn format_os_error(errno: Option<i32>, kind: std::io::ErrorKind) -> OsErrorDisplay {
+pub(crate) fn format_os_error(errno: Option<i32>, kind: std::io::ErrorKind) -> OsErrorDisplay {
     OsErrorDisplay { errno, kind }
 }
 

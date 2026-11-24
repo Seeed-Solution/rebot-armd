@@ -67,7 +67,7 @@ pub use model::{ArmConfig, ArmObservation, ARM_PROFILE_VERSION, JointLimit, Join
     lerobot_arrow_schema, read_frames_from_parquet, write_frames_to_parquet, EpisodeRecorder,
     EpisodeState, RecordFrame,
 };
-pub use safety::{FaultCode, FaultInfo, FaultReason, SafetyError, SafetyManager, SafetyState, StopPolicy};
+pub use safety::{FaultCode, FaultInfo, FaultKind, FaultReason, SafetyError, SafetyManager, SafetyState, StopPolicy};
 #[cfg(not(target_arch = "wasm32"))] pub use supervisor::{ArmError, ArmSupervisor, PreemptError, SupervisorInner};
 pub use trajectory::{
     MultiJointQuinticTrajectory, QuinticPolynomial, TrajectoryError, TrajectoryPlanner,
