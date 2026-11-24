@@ -1762,6 +1762,10 @@ impl SupervisorInner {
         } else {
             self.thermal_below_since = None;
         }
+        // Protective-cut exception (decision b, 2026-11-24): thermal trip is NOT a user
+        // torque-off request; it intentionally bypasses `may_disable_torque_while_stopped` and
+        // disables the motors in any pose (leaving an overheating motor energized is worse than
+        // the arm dropping).
         if (self.is_torqued || self.disable_pending || was_active)
             && temperature_available
             && !self.safety.has_latched_fault_kind(crate::safety::FaultKind::ThermalTrip)
@@ -1828,6 +1832,10 @@ impl SupervisorInner {
             self.e_stop_latched.store(true, Ordering::SeqCst);
             return true;
         }
+        // Protective-cut exception (decision b, 2026-11-24): process shutdown/panic is NOT a user
+        // torque-off request; it intentionally bypasses `may_disable_torque_while_stopped` and
+        // disables the motors in any pose (leaving energized motors with no controller when
+        // Damiao TIMEOUT = 0 is worse than the arm dropping).
         if !self.safety.state().is_stopped() {
             self.execute_stop(StopPolicy::EStopLatch);
         }

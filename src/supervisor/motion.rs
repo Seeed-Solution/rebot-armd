@@ -389,6 +389,9 @@ impl SupervisorInner {
                 self.driver = driver;
             }
             StopPolicy::ThermalTrip => {
+                // Protective-cut exception (decision b, 2026-11-24): thermal trip is NOT a user
+                // torque-off request; it intentionally bypasses `may_disable_torque_while_stopped`
+                // and disables the motors in any pose (the arm may drop).
                 self.stop_motion();
                 self.commanded_velocities.fill(0.0);
                 self.commanded_accelerations.fill(0.0);

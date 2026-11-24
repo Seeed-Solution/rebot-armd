@@ -1161,3 +1161,70 @@ fn fresh_driver_timestamps_never_vouch_for_stale_measured_positions_and_zero_off
     inner_z.tick(0.02);
     assert_eq!(inner_z.may_disable_torque_while_stopped(), Ok(()));
 }
+
+#[test]
+fn thermal_trip_and_shutdown_disable_at_raised_pose_without_consulting_rest_pose_decision() {
+    // 1. ThermalTrip protective cut: raised pose AND resting_pose = None (so the rest-pose
+    // decision would refuse with NoRestingPoseConfigured) -> thermal trip STILL disables all
+    // motors and does NOT consult `eval_stopped_torque_off` (`last_stopped_torque_off_refusal`
+    // stays None).
+    let (mut inner_t, bus_t, _clock_t) = make_driver_rig();
+    inner_t.config.resting_pose = None;
+    inner_t.set_torque(true).unwrap();
+    bus_t.with(|s| {
+        s.follow_commands = false;
+        s.motors[1].q = 0.45;
+        s.motors[0].temperature_c = 90;
+        s.push_all_feedback();
+    });
+    inner_t.tick(0.02);
+    assert!(
+        matches!(inner_t.safety.state(), SafetyState::Fault(_)),
+        "overheating motor must latch ThermalTrip"
+    );
+    assert_eq!(inner_t.safety.fault_code(), Some(FaultCode::ThermalTrip));
+    assert!(!inner_t.is_torqued, "ThermalTrip must disable motors at a raised pose");
+    assert!(
+        bus_t.with(|s| s.motors.iter().all(|m| !m.enabled)),
+        "all motors must be disabled on wire after ThermalTrip at a raised pose"
+    );
+    assert_eq!(
+        inner_t.last_stopped_torque_off_refusal(),
+        None,
+        "ThermalTrip must NOT consult eval_stopped_torque_off"
+    );
+
+    // 2. Process shutdown / panic protective cut: raised pose AND resting_pose = None ->
+    // `attempt_panic_disable` and `request_shutdown` disable motors regardless of pose without
+    // consulting `eval_stopped_torque_off`.
+    let (mut inner_s, bus_s, _clock_s) = make_driver_rig();
+    inner_s.config.resting_pose = None;
+    inner_s.set_torque(true).unwrap();
+    bus_s.with(|s| {
+        s.follow_commands = false;
+        s.motors[1].q = 0.45;
+        s.push_all_feedback();
+    });
+    inner_s.tick(0.02);
+    assert!(inner_s.is_torqued);
+
+    // First request_shutdown while torqued latches E-Stop (not yet shutdown_ready);
+    // panic/forced teardown disables motors unconditionally at the raised pose.
+    assert!(!inner_s.request_shutdown());
+    assert_eq!(*inner_s.safety.state(), SafetyState::EStop);
+    assert_eq!(inner_s.last_stopped_torque_off_refusal(), None);
+
+    let outcome = inner_s.attempt_panic_disable(Duration::from_secs(1));
+    assert_eq!(outcome, armd::supervisor::PanicDisableOutcome::Confirmed);
+    assert!(!inner_s.is_torqued, "panic/shutdown disable must cut torque at a raised pose");
+    assert!(
+        bus_s.with(|s| s.motors.iter().all(|m| !m.enabled)),
+        "all motors must be disabled on wire after shutdown/panic disable at a raised pose"
+    );
+    assert!(inner_s.request_shutdown(), "shutdown_ready must be true once disabled");
+    assert_eq!(
+        inner_s.last_stopped_torque_off_refusal(),
+        None,
+        "shutdown/panic disable must NOT consult eval_stopped_torque_off"
+    );
+}
