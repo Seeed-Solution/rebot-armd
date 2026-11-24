@@ -422,6 +422,21 @@ pub trait ArmDriver: Send {
         let ages = self.feedback_ages();
         joints.iter().all(|&i| ages.get(i).copied().flatten().is_some_and(|age| age <= max_age))
     }
+    /// Read fresh positions for the listed `joints` from the same driver feedback snapshot whose
+    /// timestamps (and receive-queue bounds, when tracked) are checked against `max_age`.
+    ///
+    /// Writes each listed joint's latest driver-cached position into `out[k]` (matching
+    /// `joints[k]`). Returns `true` only when every listed joint has a non-missing timestamp
+    /// within `max_age` and a finite cached position from that same feedback snapshot; unlisted
+    /// joints (such as the gripper) are ignored. Zero heap allocations when overridden.
+    fn fresh_joint_positions_into(
+        &self,
+        _joints: &[usize],
+        _max_age: Duration,
+        _out: &mut [f32],
+    ) -> bool {
+        false
+    }
     /// [`Self::feedback_ages`] as whole milliseconds (the observation's `feedback_age_ms`).
     fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) {
         out.clear();
@@ -1760,6 +1775,36 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         self.last_feedback_instant.clone()
     }
 
+    fn fresh_joint_positions_into(
+        &self,
+        joints: &[usize],
+        max_age: Duration,
+        out: &mut [f32],
+    ) -> bool {
+        if joints.is_empty() || out.len() < joints.len() {
+            return false;
+        }
+        for (slot, &i) in out.iter_mut().zip(joints.iter()) {
+            let fresh = self
+                .last_feedback_instant
+                .get(i)
+                .copied()
+                .flatten()
+                .is_some_and(|t| self.elapsed_since(t) <= max_age);
+            if !fresh {
+                return false;
+            }
+            let Some(s) = self.cached_states.get(i) else {
+                return false;
+            };
+            if !s.position.is_finite() {
+                return false;
+            }
+            *slot = s.position;
+        }
+        true
+    }
+
     fn is_feedback_valid(&self) -> bool {
         if self.last_feedback_instant.is_empty() {
             return false;
@@ -2526,6 +2571,36 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
 
     fn feedback_receive_instants(&self) -> Vec<Option<Instant>> {
         self.last_feedback_instant.clone()
+    }
+
+    fn fresh_joint_positions_into(
+        &self,
+        joints: &[usize],
+        max_age: Duration,
+        out: &mut [f32],
+    ) -> bool {
+        if joints.is_empty() || out.len() < joints.len() {
+            return false;
+        }
+        for (slot, &i) in out.iter_mut().zip(joints.iter()) {
+            let fresh = self
+                .last_feedback_instant
+                .get(i)
+                .copied()
+                .flatten()
+                .is_some_and(|t| t.elapsed() <= max_age);
+            if !fresh {
+                return false;
+            }
+            let Some(s) = self.cached_states.get(i) else {
+                return false;
+            };
+            if !s.position.is_finite() {
+                return false;
+            }
+            *slot = s.position;
+        }
+        true
     }
 
     fn is_feedback_valid(&self) -> bool {
@@ -7684,6 +7759,41 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     .is_some_and(|b| self.since(b) <= max_age)
         })
     }
+    fn fresh_joint_positions_into(
+        &self,
+        joints: &[usize],
+        max_age: Duration,
+        out: &mut [f32],
+    ) -> bool {
+        if joints.is_empty() || out.len() < joints.len() {
+            return false;
+        }
+        for (slot, &i) in out.iter_mut().zip(joints.iter()) {
+            let fresh = self
+                .last_feedback_instant
+                .get(i)
+                .copied()
+                .flatten()
+                .is_some_and(|t| self.since(t) <= max_age)
+                && self
+                    .feedback_queue_bound
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|b| self.since(b) <= max_age);
+            if !fresh {
+                return false;
+            }
+            let Some(s) = self.cached_states.get(i) else {
+                return false;
+            };
+            if !s.position.is_finite() {
+                return false;
+            }
+            *slot = s.position;
+        }
+        true
+    }
     fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) {
         out.clear();
         out.extend(self.last_feedback_instant.iter().map(|t| t.map(|t| self.since(t).as_millis().min(u64::MAX as u128) as u64)));
@@ -8211,6 +8321,42 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
                     .flatten()
                     .is_some_and(|b| b.elapsed() <= max_age)
         })
+    }
+
+    fn fresh_joint_positions_into(
+        &self,
+        joints: &[usize],
+        max_age: Duration,
+        out: &mut [f32],
+    ) -> bool {
+        if joints.is_empty() || out.len() < joints.len() {
+            return false;
+        }
+        for (slot, &i) in out.iter_mut().zip(joints.iter()) {
+            let fresh = self
+                .last_feedback_instant
+                .get(i)
+                .copied()
+                .flatten()
+                .is_some_and(|t| t.elapsed() <= max_age)
+                && self
+                    .feedback_queue_bound
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|b| b.elapsed() <= max_age);
+            if !fresh {
+                return false;
+            }
+            let Some(s) = self.cached_states.get(i) else {
+                return false;
+            };
+            if !s.position.is_finite() {
+                return false;
+            }
+            *slot = s.position;
+        }
+        true
     }
 
     fn is_feedback_valid(&self) -> bool {

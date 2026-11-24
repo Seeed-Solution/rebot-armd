@@ -952,3 +952,103 @@ fn queued_old_can_frames_exceeding_queue_bound_are_rejected_as_stale() {
     inner.tick(0.02);
     assert_eq!(inner.may_disable_torque_while_stopped(), Ok(()));
 }
+
+#[test]
+fn fresh_driver_timestamps_never_vouch_for_stale_measured_positions_and_zero_offset_applies() {
+    // 1. Reproduce the clear_fault / silent-gripper split: supervisor.measured_positions is stale
+    // at rest (0.0), while the driver's fresh J1..J6 feedback (read during clear_fault) shows J2
+    // raised to 0.45 rad. The rest check MUST use the fresh driver positions and refuse.
+    let (mut inner, bus, clock) = make_driver_rig();
+    inner.set_torque(true).unwrap();
+    inner.safety.trigger_fault_coded(FaultCode::BusLoss, FaultReason::BusLoss);
+    assert!((inner.measured_positions[1] - 0.0).abs() < 1e-3);
+
+    // Silence the gripper and advance past 250 ms so clear_fault's whole-arm fb_fresh is false.
+    bus.with(|s| {
+        s.follow_commands = false;
+        s.rx.clear();
+        s.pending.clear();
+        s.motors[6].silent = true;
+    });
+    clock.advance(Duration::from_millis(300));
+    // Observe empty RX queue so the next J1..J6 frames get a fresh queue bound.
+    {
+        let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+        let _ = drv.read_joint_states();
+    }
+    // Lift J2 to 0.45 rad and push fresh J1..J6 feedback only; call clear_fault (fails because
+    // gripper is stale, so supervisor.measured_positions stays stale at 0.0 while driver has fresh
+    // timestamps and cached_states[1].position = 0.45).
+    bus.with(|s| {
+        s.motors[1].q = 0.45;
+        for j in 0..6 {
+            s.push_feedback(j);
+        }
+    });
+    assert!(inner.clear_fault().is_err());
+    assert!(
+        inner.measured_positions[1].abs() < 1e-3,
+        "test precondition: supervisor.measured_positions[1] must still be stale at 0.0, got {}",
+        inner.measured_positions[1]
+    );
+
+    // Rest check MUST refuse naming joint_2 with the fresh ~0.45 rad driver position.
+    let err = inner.set_torque(false).unwrap_err();
+    match err {
+        SafetyError::TorqueOffWouldDrop {
+            joint: Some(ref j),
+            position: Some(p),
+            ..
+        } => {
+            assert_eq!(j, "joint_2");
+            assert!(
+                (p - 0.45).abs() < 0.02,
+                "expected fresh driver position ~0.45 rad, got {p}"
+            );
+        }
+        other => panic!("expected TorqueOffWouldDrop naming joint_2 at ~0.45 rad, got {other:?}"),
+    }
+    assert!(inner.is_torqued);
+
+    // Move J2 back to rest with fresh J1..J6 feedback (gripper STILL silent, feedback_numeric_valid
+    // forced false): admission MUST succeed using fresh J1..J6 driver positions.
+    inner.feedback_numeric_valid = false;
+    bus.with(|s| {
+        s.motors[1].q = 0.0;
+        for j in 0..6 {
+            s.push_feedback(j);
+        }
+    });
+    {
+        let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+        let _ = drv.read_joint_states();
+    }
+    assert_eq!(inner.may_disable_torque_while_stopped(), Ok(()));
+
+    // 2. ZeroOffsetDriver must apply joint-zero offsets in fresh_joint_positions_into.
+    let (mut inner_z, bus_z, _clock_z) = make_driver_rig();
+    let mut offsets = vec![0.0; 7];
+    offsets[1] = 0.40;
+    inner_z.set_joint_zero_offsets(&offsets).unwrap();
+    inner_z.set_torque(true).unwrap();
+    inner_z.safety.trigger_fault_coded(FaultCode::Other, FaultReason::Other("fault".into()));
+    // Motor raw q = 0.0 with offset 0.40 => logical q = -0.40 (outside rest).
+    bus_z.with(|s| {
+        s.follow_commands = false;
+        s.motors[1].q = 0.0;
+        s.push_all_feedback();
+    });
+    inner_z.tick(0.02);
+    assert!(matches!(
+        inner_z.may_disable_torque_while_stopped(),
+        Err(StoppedTorqueOffRefusal::JointOutsideRest { joint_index: 1, position, .. })
+            if (position + 0.40).abs() < 0.02
+    ));
+    // Motor raw q = 0.40 with offset 0.40 => logical q = 0.0 (at rest).
+    bus_z.with(|s| {
+        s.motors[1].q = 0.40;
+        s.push_all_feedback();
+    });
+    inner_z.tick(0.02);
+    assert_eq!(inner_z.may_disable_torque_while_stopped(), Ok(()));
+}

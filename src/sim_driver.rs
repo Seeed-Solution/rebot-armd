@@ -599,6 +599,30 @@ impl ArmDriver for SimArmDriver {
         self.rx_metadata().1.map(|t| t.elapsed()).is_some_and(|age| age <= max_age)
     }
 
+    fn fresh_joint_positions_into(
+        &self,
+        joints: &[usize],
+        max_age: Duration,
+        out: &mut [f32],
+    ) -> bool {
+        if joints.is_empty() || out.len() < joints.len() {
+            return false;
+        }
+        if !self.feedback_joints_within(joints, max_age) {
+            return false;
+        }
+        for (slot, &i) in out.iter_mut().zip(joints.iter()) {
+            let Some(s) = self.cached.get(i) else {
+                return false;
+            };
+            if !s.position.is_finite() {
+                return false;
+            }
+            *slot = s.position;
+        }
+        true
+    }
+
     fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
         let age = self.rx_metadata().1.map(|t| t.elapsed());
         out.clear();
