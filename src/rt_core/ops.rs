@@ -1665,12 +1665,17 @@ impl ReleaseEngine {
                                     }
                                     acked.commit_seq
                                 })
+                            } else if install {
+                                t.ack(c).map(|acked| {
+                                    if let Some(i) = acked.installed {
+                                        self.active = Some(i);
+                                    }
+                                    acked.commit_seq
+                                })
                             } else {
                                 t.ack_deferred(c).map(|(acked, ack_reply)| {
-                                    match acked.installed {
-                                        Some(i) if install => self.active = Some(i),
-                                        Some(i) => self.transition = Some(i),
-                                        None => {}
+                                    if let Some(i) = acked.installed {
+                                        self.transition = Some(i);
                                     }
                                     deferred_step3_reply = Some(ack_reply);
                                     acked.commit_seq

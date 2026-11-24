@@ -12,7 +12,7 @@ use super::dispatch::{
 pub(super) const ENTRIES: &[DispatchEntry] = &[
     DispatchEntry {
         key: DispatchKey::frame(FrameKind::Heartbeat),
-        handler: DispatchHandler::Heartbeat(handle_heartbeat_task_step),
+        handler: DispatchHandler::Heartbeat(dispatch_heartbeat_ws),
         admission: AdmissionClass::Heartbeat,
         lease: LeaseRequirement::RequiredAllowZeroGeneration,
         auth: AuthRequirement::None,
@@ -207,42 +207,258 @@ pub(super) fn execute_clear_fault(
     Ok(None)
 }
 
-/// Process one latest-wins heartbeat in `heartbeat_task` under the supervisor write lock.
-pub(super) fn handle_heartbeat_task_step(
-    inner: &mut SupervisorInner,
+/// Table-bound unified WS `heartbeat` handler invoked by `heartbeat_task`.
+fn dispatch_heartbeat_ws<'a>(
+    supervisor: &'a ArmSupervisor,
+    value: &'a Value,
+    conn_handle: crate::rt_core::requests::lease::ConnectionHandle,
+    hb_generation: &'a AtomicU64,
+    hb_client_label: &'a Mutex<Option<String>>,
+) -> super::dispatch::HeartbeatFuture<'a> {
+    Box::pin(handle_heartbeat_ws_async(
+        supervisor,
+        value,
+        conn_handle,
+        hb_generation,
+        hb_client_label,
+    ))
+}
+
+/// Unified owner-routed WS `heartbeat` handler shared by both legacy and RT executor owners.
+///
+/// Off-lock preparation runs from a published snapshot via [`ArmSupervisor::heartbeat_ws`],
+/// preserving the connection-bound omission rule (`generation == 0` allowed when connection owns
+/// a valid lease), `epoch_sync`, and `lease_lost` wire format (omitting `"reason"` at gen 0).
+pub(super) async fn handle_heartbeat_ws_async(
+    supervisor: &ArmSupervisor,
     value: &Value,
-    hb_connection: &str,
+    conn_handle: crate::rt_core::requests::lease::ConnectionHandle,
     hb_generation: &AtomicU64,
     hb_client_label: &Mutex<Option<String>>,
 ) -> Option<Value> {
-    if inner.detached {
-        None
+    use crate::rt_core::requests::lease::HeartbeatInstallOutcome;
+    let local_generation = hb_generation.load(Ordering::SeqCst);
+    let supplied_generation = value.get("generation").and_then(Value::as_u64).unwrap_or(0);
+    let local_label = hb_client_label
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let supplied_client_id = value.get("client_id").map(Value::as_str);
+    let supplied_epoch = value.get("epoch_id").and_then(Value::as_u64);
+    match supervisor
+        .heartbeat_ws(
+            conn_handle,
+            local_generation,
+            supplied_generation,
+            local_label.as_deref(),
+            supplied_client_id,
+            supplied_epoch,
+        )
+        .await
+    {
+        Ok(HeartbeatInstallOutcome::Renewed) => None,
+        Ok(HeartbeatInstallOutcome::LeaseLost { generation, reason }) => Some(match reason {
+            Some(r) => json!({"type":"lease_lost", "generation":generation, "reason":r}),
+            None => json!({"type":"lease_lost", "generation":generation}),
+        }),
+        Ok(HeartbeatInstallOutcome::EpochSync { epoch, safety_state }) => {
+            Some(json!({"type":"epoch_sync", "epoch_id":epoch, "safety_state":safety_state}))
+        }
+        Err(_) => None,
+    }
+}
+
+/// Unified owner-routed WS `acquire_lease` (`force == false` and `force == true` preemption)
+/// shared by both legacy and RT executor owners.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn handle_acquire_lease_unified(
+    supervisor: &ArmSupervisor,
+    value: &Value,
+    conn_handle: crate::rt_core::requests::lease::ConnectionHandle,
+    recv_generation: &AtomicU64,
+    recv_client_label: &Mutex<Option<String>>,
+    worker_closing: &AtomicBool,
+    ws_auth: &WsAuth,
+    last_sequence: &mut Option<u64>,
+) -> (Option<Value>, Option<(String, u64)>) {
+    use crate::rt_core::requests::lease::LeaseOutcome;
+    if worker_closing.load(Ordering::SeqCst) {
+        let _ = supervisor.disconnect_ws_connection(conn_handle).await;
+        recv_generation.store(0, Ordering::SeqCst);
+        return (None, None);
+    }
+    let label = value.get("client_id").and_then(Value::as_str).unwrap_or("");
+    let seq = value.get("seq").and_then(Value::as_u64);
+    let force_val = value.get("force");
+
+    let with_seq = |mut reply: Value| -> Value {
+        if let Some(s) = seq {
+            reply["seq"] = json!(s);
+        }
+        reply
+    };
+
+    if label.is_empty() || label.len() > 128 {
+        return (
+            Some(with_seq(json!({"type":"lease_rejected", "error":"invalid_client_id"}))),
+            None,
+        );
+    }
+    match force_val {
+        Some(v) if !v.is_boolean() && !v.is_null() => {
+            return (
+                Some(with_seq(json!({
+                    "type": "lease_rejected",
+                    "status": 400,
+                    "error": "invalid_argument",
+                    "message": "force must be a boolean"
+                }))),
+                None,
+            );
+        }
+        _ => {}
+    }
+
+    let force = force_val.and_then(Value::as_bool).unwrap_or(false);
+    let client_seq = seq.unwrap_or(0);
+    let outcome = if force {
+        let grant = ws_auth.operator_grant();
+        supervisor
+            .preempt_lease_ws(conn_handle, label, grant, client_seq)
+            .await
     } else {
-        let local_generation = hb_generation.load(Ordering::SeqCst);
-        let generation = value.get("generation").and_then(Value::as_u64).unwrap_or(0);
-        let label_matches = {
-            let lbl = hb_client_label.lock().unwrap_or_else(|e| e.into_inner());
-            value.get("client_id").is_none_or(|id| id.as_str() == lbl.as_deref())
-        };
-        let supplied_generation_ok = generation == local_generation || generation == 0;
-        let authorized = local_generation != 0
-            && supplied_generation_ok
-            && label_matches
-            && inner.validate_servo_lease(hb_connection, local_generation);
-        if !authorized {
-            Some(if local_generation == 0 {
-                json!({"type":"lease_lost", "generation":0})
-            } else {
-                json!({"type":"lease_lost", "generation":local_generation, "reason":inner.lease_loss_reason(hb_connection, local_generation)})
-            })
-        } else {
-            let epoch = inner.safety.epoch_id();
-            if value.get("epoch_id").and_then(Value::as_u64) != Some(epoch) {
-                Some(json!({"type":"epoch_sync", "epoch_id":epoch, "safety_state":inner.safety.state()}))
-            } else {
-                let _ = inner.heartbeat(hb_connection, epoch);
-                None
+        supervisor
+            .acquire_lease_ws(conn_handle, label, client_seq)
+            .await
+    };
+
+    match outcome {
+        Ok(LeaseOutcome::Granted {
+            generation,
+            evicted_connection,
+            evicted_generation,
+        }) => {
+            let evicted_notify = evicted_connection
+                .map(|c| (c.as_str().to_owned(), evicted_generation));
+            if worker_closing.load(Ordering::SeqCst) {
+                let _ = supervisor.disconnect_ws_connection(conn_handle).await;
+                recv_generation.store(0, Ordering::SeqCst);
+                return (None, evicted_notify);
             }
+            let previous = recv_generation.swap(generation, Ordering::SeqCst);
+            *recv_client_label.lock().unwrap_or_else(|e| e.into_inner()) = Some(label.to_owned());
+            if previous != generation {
+                *last_sequence = None;
+            }
+            let reply = with_seq(json!({
+                "type": "lease_granted",
+                "client_id": label,
+                "generation": generation
+            }));
+            (Some(reply), evicted_notify)
+        }
+        Ok(LeaseOutcome::Busy { .. }) => (
+            Some(with_seq(json!({"type":"lease_rejected", "error":"controller_busy"}))),
+            None,
+        ),
+        Ok(LeaseOutcome::Cooldown { remaining_ms }) => (
+            Some(with_seq(json!({
+                "type": "lease_rejected",
+                "error": "preemption_cooldown",
+                "remaining_ms": remaining_ms
+            }))),
+            None,
+        ),
+        Ok(LeaseOutcome::OperatorRequired) => (
+            Some(with_seq(json!({
+                "type": "lease_rejected",
+                "status": 403,
+                "code": "OPERATOR_REQUIRED",
+                "error": "operator_required",
+                "message": "Operator unlock is required for force lease preemption"
+            }))),
+            None,
+        ),
+        Ok(LeaseOutcome::Released { .. } | LeaseOutcome::Disconnected { .. }) => (None, None),
+        Err(ArmError::Rejected { code, .. }) if code == "DISCONNECTED" => {
+            let _ = supervisor.disconnect_ws_connection(conn_handle).await;
+            recv_generation.store(0, Ordering::SeqCst);
+            (None, None)
+        }
+        Err(ArmError::Rejected { code, .. }) if code == "OWNER_TRANSFERRED" => (
+            Some(with_seq(json!({
+                "type": "lease_rejected",
+                "error": "owner_transferred",
+                "code": "OWNER_TRANSFERRED"
+            }))),
+            None,
+        ),
+        Err(err) => {
+            let api = ApiError::from(err);
+            (
+                Some(with_seq(json!({
+                    "type": "lease_rejected",
+                    "status": api.status.as_u16(),
+                    "code": api.code,
+                    "error": api.error,
+                    "message": api.message
+                }))),
+                None,
+            )
+        }
+    }
+}
+
+/// Unified owner-routed WS `release_lease` shared by both legacy and RT executor owners.
+pub(super) async fn handle_release_lease_unified(
+    supervisor: &ArmSupervisor,
+    value: &Value,
+    conn_handle: crate::rt_core::requests::lease::ConnectionHandle,
+    recv_generation: &AtomicU64,
+    recv_client_label: &Mutex<Option<String>>,
+) -> Option<Value> {
+    use crate::rt_core::requests::lease::LeaseOutcome;
+    let local_generation = recv_generation.load(Ordering::SeqCst);
+    let supplied_generation = value.get("generation").and_then(Value::as_u64).unwrap_or(0);
+    let label_matches = {
+        let lbl = recv_client_label.lock().unwrap_or_else(|e| e.into_inner());
+        value
+            .get("client_id")
+            .is_none_or(|id| id.as_str() == lbl.as_deref())
+    };
+    if local_generation == 0 || supplied_generation != local_generation || !label_matches {
+        return Some(json!({"type":"lease_released", "success":false}));
+    }
+    match supervisor
+        .release_lease_ws(conn_handle, local_generation)
+        .await
+    {
+        Ok(LeaseOutcome::Released { released, .. }) => {
+            if released {
+                let _ = recv_generation.compare_exchange(
+                    local_generation,
+                    0,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
+                *recv_client_label.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
+            Some(json!({"type":"lease_released", "success":released}))
+        }
+        Ok(_) => Some(json!({"type":"lease_released", "success":false})),
+        Err(ArmError::Rejected { code, .. }) if code == "DISCONNECTED" => {
+            Some(json!({"type":"lease_released", "success":false}))
+        }
+        Err(err) => {
+            let api = ApiError::from(err);
+            Some(json!({
+                "type": "lease_released",
+                "success": false,
+                "status": api.status.as_u16(),
+                "code": api.code,
+                "error": api.error,
+                "message": api.message
+            }))
         }
     }
 }

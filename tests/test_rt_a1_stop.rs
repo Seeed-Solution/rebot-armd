@@ -246,8 +246,13 @@ async fn stale_and_foreign_callers_rest_restrictions_and_legacy_semantics() {
     assert_eq!((r_rest.status(), r_rest.json::<serde_json::Value>().await.unwrap()["code"].as_str()), (reqwest::StatusCode::SERVICE_UNAVAILABLE, Some("EXECUTOR_ROUTING_PENDING")));
 
     let (mut ws_foreign, _) = connect_async(format!("ws://{addr}/api/v1/ws")).await.unwrap();
+    // PR L1 routes `acquire_lease` through the RT executor: foreign acquire sees `controller_busy`
+    // while `ws_owner` holds the lease, whereas an unmigrated motion command still fails closed
+    // with `503 EXECUTOR_ROUTING_PENDING`.
     let acq = ws_reply(&mut ws_foreign, json!({"type": "acquire_lease", "client_id": "intruder", "seq": 1}), &["lease_rejected"]).await;
-    assert_eq!((acq["status"].as_u64(), acq["code"].as_str()), (Some(503), Some("EXECUTOR_ROUTING_PENDING")), "{acq}");
+    assert_eq!(acq["error"].as_str(), Some("controller_busy"), "{acq}");
+    let unmigrated = ws_reply(&mut ws_foreign, json!({"type": "command", "request_id": 1, "generation": gen, "epoch_id": ep, "path": "/api/v1/motion/jog", "body": {"target_positions": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]}}), &["command_reject"]).await;
+    assert_eq!((unmigrated["status"].as_u64(), unmigrated["code"].as_str()), (Some(503), Some("EXECUTOR_ROUTING_PENDING")), "{unmigrated}");
     let spoof = ws_reply(&mut ws_foreign, json!({"type": "command", "request_id": 1, "generation": gen, "client_id": "test_controller", "epoch_id": ep, "path": "/api/v1/motion/stop", "body": {}}), &["command_reject"]).await;
     assert_eq!((spoof["status"].as_u64(), spoof["code"].as_str(), spoof["epoch_id"].as_u64()), (Some(409), Some("LEASE_LOST"), Some(ep)), "{spoof}");
     assert_eq!(handle.stop_requests().current(), 0);

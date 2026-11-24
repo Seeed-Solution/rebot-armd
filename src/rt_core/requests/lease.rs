@@ -399,7 +399,7 @@ pub fn prepare_heartbeat(
     local_generation: u64,
     supplied_generation: u64,
     local_label: Option<&str>,
-    supplied_client_id: Option<&str>,
+    supplied_client_id: Option<Option<&str>>,
     supplied_epoch: Option<u64>,
     now: Instant,
     deadline: Instant,
@@ -410,7 +410,7 @@ pub fn prepare_heartbeat(
             reason: None,
         };
     }
-    let label_matches = supplied_client_id.is_none_or(|id| Some(id) == local_label);
+    let label_matches = supplied_client_id.is_none_or(|id| id == local_label);
     let supplied_generation_ok = supplied_generation == local_generation || supplied_generation == 0;
     if !supplied_generation_ok || !label_matches {
         return PreparedHeartbeat::LeaseLost {
@@ -883,13 +883,13 @@ pub fn commit_lease_descriptor(
     }
 }
 
-/// Owner-side legacy heartbeat outcome mirroring `ws/lease.rs`.
+/// Owner-side heartbeat outcome mirroring `ws/lease.rs`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HeartbeatInstallOutcome {
     Renewed,
     LeaseLost {
         generation: u64,
-        reason: &'static str,
+        reason: Option<&'static str>,
     },
     EpochSync {
         epoch: u64,
@@ -916,7 +916,7 @@ pub fn install_legacy_heartbeat(
     if !lease_valid {
         return Ok(HeartbeatInstallOutcome::LeaseLost {
             generation: local_generation,
-            reason: inner.lease_loss_reason(connection.as_str(), local_generation),
+            reason: Some(inner.lease_loss_reason(connection.as_str(), local_generation)),
         });
     }
     let epoch = inner.safety.epoch_id();
@@ -1256,6 +1256,17 @@ impl ConnLifecycleClient {
             == Some(&SlotState::Open)
     }
 
+    /// Seeds connections already registered under legacy mode before ownership handoff to the
+    /// RT executor so their liveness check and 1:1 disconnect slot carry across handoff.
+    pub fn seed_live_connections<I: IntoIterator<Item = u64>>(&self, ids: I) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        for id in ids {
+            if id != 0 && g.slots.len() < MAX_LIVE_CONNECTIONS {
+                g.slots.insert(id, SlotState::Open);
+            }
+        }
+    }
+
     fn enqueue_open_inner(
         &self,
         conn_id: u64,
@@ -1322,6 +1333,22 @@ impl ConnLifecycleClient {
         }
         g.waiters.insert(seq, waiter);
         Ok(())
+    }
+
+    pub(crate) fn enqueue_disconnect_oneshot(
+        &self,
+        connection: ConnectionHandle,
+        tx: tokio::sync::oneshot::Sender<Result<LifecycleReply, ConnLifecycleError>>,
+    ) -> Result<(), ConnLifecycleError> {
+        self.enqueue_disconnect_inner(connection, LifecycleWaiter::Async(tx))
+    }
+
+    pub(crate) fn enqueue_disconnect_sync(
+        &self,
+        connection: ConnectionHandle,
+        tx: mpsc::SyncSender<Result<LifecycleReply, ConnLifecycleError>>,
+    ) -> Result<(), ConnLifecycleError> {
+        self.enqueue_disconnect_inner(connection, LifecycleWaiter::Sync(tx))
     }
 
     pub fn open_sync(&self, conn_id: u64) -> Result<Result<(), &'static str>, ConnLifecycleError> {

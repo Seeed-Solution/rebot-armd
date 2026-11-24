@@ -1375,7 +1375,6 @@ pub const MAX_LIVE_CONNECTIONS: usize = 64;
 pub(crate) struct LiveConnections {
     ids: [u64; MAX_LIVE_CONNECTIONS],
     len: usize,
-    ever_registered: bool,
 }
 
 impl Default for LiveConnections {
@@ -1389,7 +1388,6 @@ impl LiveConnections {
         Self {
             ids: [0; MAX_LIVE_CONNECTIONS],
             len: 0,
-            ever_registered: false,
         }
     }
 
@@ -1412,7 +1410,6 @@ impl LiveConnections {
         }
         self.ids[self.len] = id;
         self.len += 1;
-        self.ever_registered = true;
         Ok(())
     }
 
@@ -1434,11 +1431,6 @@ impl LiveConnections {
     #[inline]
     pub(crate) fn contains(&self, id: u64) -> bool {
         id != 0 && self.ids[..self.len].contains(&id)
-    }
-
-    #[inline]
-    pub(crate) fn ever_registered(&self) -> bool {
-        self.ever_registered
     }
 
     #[inline]
@@ -1976,11 +1968,22 @@ impl SupervisorInner {
             && self.live_connections.contains(connection_id)
     }
 
+    /// Number of currently open registered WS connections (`<= MAX_LIVE_CONNECTIONS`).
+    pub fn live_connection_count(&self) -> usize {
+        self.live_connections.len()
+    }
+
+    /// Currently registered live WS connection IDs (used to seed `ConnLifecycleClient` on
+    /// legacy -> executor ownership transfer).
+    pub fn live_connection_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.live_connections.ids[..self.live_connections.len].iter().copied()
+    }
+
     /// Single owner-side connection liveness check for broker commits:
     /// - `client_id == 0`: non-WS / internal caller -> allowed.
-    /// - `client_id != 0`: always refuses closed IDs; when `require_registered` is true (all
-    ///   `LeaseRequest` ops, and all broker commands once any WS connection has registered),
-    ///   also refuses unknown / unregistered non-zero IDs fail-closed.
+    /// - `client_id != 0`: always refuses closed IDs (`DISCONNECTED`); when `require_registered`
+    ///   is true (all WS `LeaseRequest` ops), also refuses unknown / unregistered non-zero IDs
+    ///   fail-closed.
     pub(crate) fn check_client_connection_live(
         &self,
         client_id: u64,
@@ -1992,9 +1995,7 @@ impl SupervisorInner {
         if self.closed_connections.is_closed(client_id) {
             return Err("DISCONNECTED");
         }
-        if (require_registered || self.live_connections.ever_registered())
-            && !self.live_connections.contains(client_id)
-        {
+        if require_registered && !self.live_connections.contains(client_id) {
             return Err("DISCONNECTED");
         }
         Ok(())
@@ -7824,6 +7825,541 @@ impl ArmSupervisor {
             return false;
         }
         inner.release_lease(client_id, generation)
+    }
+
+    /// Registers a live WS connection ID (`>= 1`) through the active owner (fail-closed at
+    /// [`MAX_LIVE_CONNECTIONS`]). If ownership transfer (`OWNER_TRANSFERRING`) is momentarily
+    /// in flight, waits up to a bounded 200 ms window for handoff to settle before registering.
+    pub async fn register_ws_connection(&self, conn_id: u64) -> Result<(), ArmError> {
+        use crate::rt_core::requests::lease::ConnLifecycleError;
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let mode = loop {
+            let m = self.owner_mode();
+            if m != OWNER_TRANSFERRING || Instant::now() >= deadline {
+                break m;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        };
+        match mode {
+            OWNER_LEGACY => {
+                let mut inner = self.inner.write().await;
+                if self.check_legacy_under_guard(&inner).is_err() {
+                    drop(inner);
+                    if self.owner_mode() == OWNER_EXECUTOR {
+                        if let Some(handle) = self.executor_handle() {
+                            return match handle.open_connection_async(conn_id).await {
+                                Ok(Ok(())) => Ok(()),
+                                Ok(Err(code)) => {
+                                    let status = if code == "TOO_MANY_CONNECTIONS" { 503 } else { 409 };
+                                    Err(ArmError::Rejected {
+                                        status,
+                                        code: code.into(),
+                                        message: format!("Connection registration rejected: {code}"),
+                                    })
+                                }
+                                Err(ConnLifecycleError::TooManyConnections) => Err(ArmError::Rejected {
+                                    status: 503,
+                                    code: "TOO_MANY_CONNECTIONS".into(),
+                                    message: "Maximum live WebSocket connections reached".into(),
+                                }),
+                                Err(ConnLifecycleError::AlreadyClosed | ConnLifecycleError::InvalidConnection) => {
+                                    Err(ArmError::Rejected {
+                                        status: 409,
+                                        code: "DISCONNECTED".into(),
+                                        message: "Connection identity is closed or invalid".into(),
+                                    })
+                                }
+                                Err(ConnLifecycleError::Stopped) => Err(executor_unavailable()),
+                            };
+                        }
+                    }
+                    return Err(executor_unavailable());
+                }
+                inner.register_live_connection(conn_id).map_err(|code| {
+                    let status = if code == "TOO_MANY_CONNECTIONS" { 503 } else { 409 };
+                    ArmError::Rejected {
+                        status,
+                        code: code.into(),
+                        message: format!("Connection registration rejected: {code}"),
+                    }
+                })
+            }
+            OWNER_EXECUTOR => {
+                let Some(handle) = self.executor_handle() else {
+                    return Err(executor_unavailable());
+                };
+                match handle.open_connection_async(conn_id).await {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(code)) => {
+                        let status = if code == "TOO_MANY_CONNECTIONS" { 503 } else { 409 };
+                        Err(ArmError::Rejected {
+                            status,
+                            code: code.into(),
+                            message: format!("Connection registration rejected: {code}"),
+                        })
+                    }
+                    Err(ConnLifecycleError::TooManyConnections) => Err(ArmError::Rejected {
+                        status: 503,
+                        code: "TOO_MANY_CONNECTIONS".into(),
+                        message: "Maximum live WebSocket connections reached".into(),
+                    }),
+                    Err(ConnLifecycleError::AlreadyClosed | ConnLifecycleError::InvalidConnection) => {
+                        Err(ArmError::Rejected {
+                            status: 409,
+                            code: "DISCONNECTED".into(),
+                            message: "Connection identity is closed or invalid".into(),
+                        })
+                    }
+                    Err(ConnLifecycleError::Stopped) => Err(executor_unavailable()),
+                }
+            }
+            _ => Err(executor_unavailable()),
+        }
+    }
+
+    /// Unified owner-routed WS connection disconnect (same `prepare_lease_disconnect` +
+    /// `install_lease_disconnect` split on both legacy and executor; priority lossless channel
+    /// on executor, never dropped when the ordinary broker ring is full).
+    pub async fn disconnect_ws_connection(
+        &self,
+        conn: crate::rt_core::requests::lease::ConnectionHandle,
+    ) -> crate::rt_core::requests::lease::LeaseOutcome {
+        use crate::rt_core::requests::lease::{
+            install_lease_disconnect, prepare_lease_disconnect, LeaseOutcome,
+        };
+        let prep = prepare_lease_disconnect(conn);
+        match self.owner_mode() {
+            OWNER_LEGACY => {
+                let mut inner = self.inner.write().await;
+                if self.check_legacy_under_guard(&inner).is_ok() {
+                    return install_lease_disconnect(&mut inner, &prep.request, Instant::now());
+                }
+                drop(inner);
+                if let Some(handle) = self.executor_handle() {
+                    if let Ok(outcome) = handle.disconnect_connection_async(conn).await {
+                        return outcome;
+                    }
+                }
+                LeaseOutcome::Disconnected {
+                    released: false,
+                    displaced_generation: 0,
+                }
+            }
+            OWNER_EXECUTOR => {
+                if let Some(handle) = self.executor_handle() {
+                    if let Ok(outcome) = handle.disconnect_connection_async(conn).await {
+                        return outcome;
+                    }
+                }
+                LeaseOutcome::Disconnected {
+                    released: false,
+                    displaced_generation: 0,
+                }
+            }
+            _ => LeaseOutcome::Disconnected {
+                released: false,
+                displaced_generation: 0,
+            },
+        }
+    }
+
+    /// Drop-time non-blocking disconnect safety net for aborted WS handler tasks.
+    pub fn disconnect_ws_connection_detached(
+        &self,
+        conn: crate::rt_core::requests::lease::ConnectionHandle,
+    ) {
+        if self.owner_mode() == OWNER_EXECUTOR {
+            if let Some(handle) = self.executor_handle() {
+                handle.enqueue_disconnect_detached(conn);
+            }
+        } else if let Ok(mut inner) = self.inner.try_write() {
+            if !inner.detached {
+                let prep = crate::rt_core::requests::lease::prepare_lease_disconnect(conn);
+                let _ = crate::rt_core::requests::lease::install_lease_disconnect(
+                    &mut inner,
+                    &prep.request,
+                    Instant::now(),
+                );
+            }
+        }
+    }
+
+    fn map_lease_install_err(code: &'static str) -> ArmError {
+        let status = match code {
+            "OWNER_TRANSFERRED" | "DISCONNECTED" | "LEASE_LOST" | "NO_LEASE" | "STAMP_REUSED" => 409,
+            "DEADLINE_EXPIRED" => 408,
+            "MOTION_BUSY" => 503,
+            _ => 400,
+        };
+        ArmError::Rejected {
+            status,
+            code: code.into(),
+            message: format!("Lease operation refused: {code}"),
+        }
+    }
+
+    fn map_broker_dispatch_err(
+        err: crate::rt_core::executor::BrokerDispatchError,
+    ) -> ArmError {
+        use crate::rt_core::executor::BrokerDispatchError;
+        match err {
+            BrokerDispatchError::Admit(e) => {
+                let code = e.code();
+                let status = if code == "DISCONNECTED" { 409 } else { 503 };
+                ArmError::Rejected {
+                    status,
+                    code: code.into(),
+                    message: format!("Broker admission refused: {code}"),
+                }
+            }
+            BrokerDispatchError::Stopped => executor_unavailable(),
+        }
+    }
+
+    /// Unified owner-routed WS `acquire_lease` (`force == false`): off-lock preparation from
+    /// published snapshot + single owner-side [`install_lease_acquire`].
+    pub async fn acquire_lease_ws(
+        &self,
+        conn: crate::rt_core::requests::lease::ConnectionHandle,
+        label: &str,
+        client_seq: u64,
+    ) -> Result<crate::rt_core::requests::lease::LeaseOutcome, ArmError> {
+        use crate::rt_core::broker::Reply;
+        use crate::rt_core::requests::lease::{
+            install_lease_acquire, prepare_lease_acquire, LeaseInstallCtx, LeasePrepareError,
+            LeaseRequest, DEFAULT_LEASE_REQUEST_DEADLINE,
+        };
+        let snap = self.fresh_snapshot(None).await?;
+        let now = Instant::now();
+        let deadline = now + DEFAULT_LEASE_REQUEST_DEADLINE;
+        let prep = prepare_lease_acquire(&snap.owner, conn, label, client_seq, now, deadline)
+            .map_err(|e| match e {
+                LeasePrepareError::InvalidClientId => ArmError::Rejected {
+                    status: 400,
+                    code: "INVALID_CLIENT_ID".into(),
+                    message: "client_id must be 1..=128 bytes".into(),
+                },
+                LeasePrepareError::InvalidConnection => ArmError::Rejected {
+                    status: 400,
+                    code: "INVALID_CONNECTION".into(),
+                    message: "Invalid connection handle".into(),
+                },
+                LeasePrepareError::SnapshotUnavailable => observation_unavailable(),
+            })?;
+
+        match self.owner_mode() {
+            OWNER_LEGACY => {
+                let mut inner = self.inner.write().await;
+                self.check_legacy_under_guard(&inner)?;
+                let ctx = LeaseInstallCtx {
+                    expected_arm: inner.core.id(),
+                    expected_boot: inner.boot_id,
+                    stamp_arm: prep.arm,
+                    stamp_boot: prep.boot,
+                    now: Instant::now(),
+                    request_id: prep.request_id,
+                    client: prep.client,
+                    deadline: prep.deadline,
+                    enforce_single_use: true,
+                };
+                install_lease_acquire(&mut inner, &prep.request, &ctx)
+                    .map_err(Self::map_lease_install_err)
+            }
+            OWNER_EXECUTOR => {
+                let Some(handle) = self.executor_handle() else {
+                    return Err(executor_unavailable());
+                };
+                match handle
+                    .submit_lease_async(
+                        prep.client,
+                        prep.client_seq,
+                        prep.authority,
+                        prep.deadline,
+                        LeaseRequest::Acquire(prep.request),
+                    )
+                    .await
+                    .map_err(Self::map_broker_dispatch_err)?
+                {
+                    Reply::Lease { outcome, .. } => Ok(outcome),
+                    Reply::Refused { code, .. } => Err(Self::map_lease_install_err(code)),
+                    _ => Err(ArmError::Internal("Unexpected broker reply for LeaseAcquire".into())),
+                }
+            }
+            _ => Err(executor_unavailable()),
+        }
+    }
+
+    /// Unified owner-routed WS `acquire_lease` (`force == true`): off-lock preparation from
+    /// published snapshot + single owner-side [`install_lease_preempt`] with live [`OperatorGrant`].
+    pub async fn preempt_lease_ws(
+        &self,
+        conn: crate::rt_core::requests::lease::ConnectionHandle,
+        label: &str,
+        operator: crate::auth::OperatorGrant,
+        client_seq: u64,
+    ) -> Result<crate::rt_core::requests::lease::LeaseOutcome, ArmError> {
+        use crate::rt_core::broker::Reply;
+        use crate::rt_core::requests::lease::{
+            install_lease_preempt, prepare_lease_preempt, LeaseInstallCtx, LeasePrepareError,
+            LeaseRequest, DEFAULT_LEASE_REQUEST_DEADLINE,
+        };
+        let snap = self.fresh_snapshot(None).await?;
+        let now = Instant::now();
+        let deadline = now + DEFAULT_LEASE_REQUEST_DEADLINE;
+        let prep =
+            prepare_lease_preempt(&snap.owner, conn, label, operator, client_seq, now, deadline)
+                .map_err(|e| match e {
+                    LeasePrepareError::InvalidClientId => ArmError::Rejected {
+                        status: 400,
+                        code: "INVALID_CLIENT_ID".into(),
+                        message: "client_id must be 1..=128 bytes".into(),
+                    },
+                    LeasePrepareError::InvalidConnection => ArmError::Rejected {
+                        status: 400,
+                        code: "INVALID_CONNECTION".into(),
+                        message: "Invalid connection handle".into(),
+                    },
+                    LeasePrepareError::SnapshotUnavailable => observation_unavailable(),
+                })?;
+
+        match self.owner_mode() {
+            OWNER_LEGACY => {
+                let mut inner = self.inner.write().await;
+                self.check_legacy_under_guard(&inner)?;
+                let ctx = LeaseInstallCtx {
+                    expected_arm: inner.core.id(),
+                    expected_boot: inner.boot_id,
+                    stamp_arm: prep.arm,
+                    stamp_boot: prep.boot,
+                    now: Instant::now(),
+                    request_id: prep.request_id,
+                    client: prep.client,
+                    deadline: prep.deadline,
+                    enforce_single_use: true,
+                };
+                install_lease_preempt(&mut inner, &prep.request, &ctx)
+                    .map_err(Self::map_lease_install_err)
+            }
+            OWNER_EXECUTOR => {
+                let Some(handle) = self.executor_handle() else {
+                    return Err(executor_unavailable());
+                };
+                match handle
+                    .submit_lease_async(
+                        prep.client,
+                        prep.client_seq,
+                        prep.authority,
+                        prep.deadline,
+                        LeaseRequest::Preempt(prep.request),
+                    )
+                    .await
+                    .map_err(Self::map_broker_dispatch_err)?
+                {
+                    Reply::Lease { outcome, .. } => Ok(outcome),
+                    Reply::Refused { code, .. } => Err(Self::map_lease_install_err(code)),
+                    _ => Err(ArmError::Internal("Unexpected broker reply for LeasePreempt".into())),
+                }
+            }
+            _ => Err(executor_unavailable()),
+        }
+    }
+
+    /// Unified owner-routed WS `release_lease`: off-lock preparation from published snapshot +
+    /// single owner-side [`install_lease_release`].
+    pub async fn release_lease_ws(
+        &self,
+        conn: crate::rt_core::requests::lease::ConnectionHandle,
+        generation: u64,
+    ) -> Result<crate::rt_core::requests::lease::LeaseOutcome, ArmError> {
+        use crate::rt_core::broker::Reply;
+        use crate::rt_core::requests::lease::{
+            install_lease_release, prepare_lease_release, LeaseInstallCtx, LeaseRequest,
+            DEFAULT_LEASE_REQUEST_DEADLINE,
+        };
+        let snap = self.fresh_snapshot(None).await?;
+        let now = Instant::now();
+        let deadline = now + DEFAULT_LEASE_REQUEST_DEADLINE;
+        let prep = prepare_lease_release(&snap.owner, conn, generation, now, deadline)
+            .map_err(|_| observation_unavailable())?;
+
+        match self.owner_mode() {
+            OWNER_LEGACY => {
+                let mut inner = self.inner.write().await;
+                self.check_legacy_under_guard(&inner)?;
+                let ctx = LeaseInstallCtx {
+                    expected_arm: inner.core.id(),
+                    expected_boot: inner.boot_id,
+                    stamp_arm: prep.arm,
+                    stamp_boot: prep.boot,
+                    now: Instant::now(),
+                    request_id: prep.request_id,
+                    client: prep.client,
+                    deadline: prep.deadline,
+                    enforce_single_use: true,
+                };
+                install_lease_release(&mut inner, &prep.request, &ctx)
+                    .map_err(Self::map_lease_install_err)
+            }
+            OWNER_EXECUTOR => {
+                let Some(handle) = self.executor_handle() else {
+                    return Err(executor_unavailable());
+                };
+                match handle
+                    .submit_lease_async(
+                        prep.client,
+                        generation,
+                        prep.authority,
+                        prep.deadline,
+                        LeaseRequest::Release(prep.request),
+                    )
+                    .await
+                    .map_err(Self::map_broker_dispatch_err)?
+                {
+                    Reply::Lease { outcome, .. } => Ok(outcome),
+                    Reply::Refused { code, .. } => Err(Self::map_lease_install_err(code)),
+                    _ => Err(ArmError::Internal("Unexpected broker reply for LeaseRelease".into())),
+                }
+            }
+            _ => Err(executor_unavailable()),
+        }
+    }
+
+    /// Unified owner-routed WS `heartbeat`: off-lock preparation from published snapshot +
+    /// `ImmediateOp::Heartbeat` in executor mode or `install_legacy_heartbeat` in legacy mode.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn heartbeat_ws(
+        &self,
+        conn: crate::rt_core::requests::lease::ConnectionHandle,
+        local_generation: u64,
+        supplied_generation: u64,
+        local_label: Option<&str>,
+        supplied_client_id: Option<Option<&str>>,
+        supplied_epoch: Option<u64>,
+    ) -> Result<crate::rt_core::requests::lease::HeartbeatInstallOutcome, ArmError> {
+        use crate::rt_core::broker::{ImmediateOp, Reply};
+        use crate::rt_core::requests::lease::{
+            install_legacy_heartbeat, prepare_heartbeat, HeartbeatInstallOutcome,
+            PreparedHeartbeat, DEFAULT_LEASE_REQUEST_DEADLINE,
+        };
+        let mode = self.owner_mode();
+        if mode == OWNER_TRANSFERRING
+            || mode == OWNER_FAILED
+            || (mode == OWNER_EXECUTOR && self.executor_handle().is_none_or(|h| h.is_exited()))
+        {
+            return Err(observation_unavailable());
+        }
+        if local_generation == 0 {
+            return Ok(HeartbeatInstallOutcome::LeaseLost {
+                generation: 0,
+                reason: None,
+            });
+        }
+        let snap = self.fresh_snapshot(None).await?;
+        let now = Instant::now();
+        let deadline = now + DEFAULT_LEASE_REQUEST_DEADLINE;
+        match prepare_heartbeat(
+            &snap.owner,
+            conn,
+            local_generation,
+            supplied_generation,
+            local_label,
+            supplied_client_id,
+            supplied_epoch,
+            now,
+            deadline,
+        ) {
+            PreparedHeartbeat::LeaseLost { generation, reason } => {
+                Ok(HeartbeatInstallOutcome::LeaseLost { generation, reason })
+            }
+            PreparedHeartbeat::Submit {
+                connection,
+                local_generation,
+                supplied_epoch,
+                mut authority,
+                client,
+                deadline,
+                ..
+            } => match self.owner_mode() {
+                OWNER_LEGACY => {
+                    let mut inner = self.inner.write().await;
+                    self.check_legacy_under_guard(&inner)?;
+                    install_legacy_heartbeat(
+                        &mut inner,
+                        connection,
+                        local_generation,
+                        supplied_epoch,
+                        Instant::now(),
+                    )
+                    .map_err(Self::map_lease_install_err)
+                }
+                OWNER_EXECUTOR => {
+                    let Some(handle) = self.executor_handle() else {
+                        return Err(executor_unavailable());
+                    };
+                    // Bounded retry (at most 1) only when `stop_generation` or `config_revision`
+                    // moved between snapshot preparation and commit: an ordinary Stop or config
+                    // change must not cause a spurious `lease_lost` on heartbeat.
+                    for attempt in 0..2 {
+                        let reply = handle
+                            .submit_immediate_async(
+                                client,
+                                0,
+                                authority,
+                                deadline,
+                                ImmediateOp::Heartbeat,
+                            )
+                            .await
+                            .map_err(Self::map_broker_dispatch_err)?;
+                        match reply {
+                            Reply::Ack { .. } => return Ok(HeartbeatInstallOutcome::Renewed),
+                            Reply::Refused { code: "STOPPED" | "PLAN_STALE", .. } if attempt == 0 => {
+                                let fresh = self.fresh_snapshot(None).await?;
+                                let mut next_auth = fresh.owner.authority_at(Instant::now());
+                                next_auth.lease_generation = local_generation;
+                                next_auth.epoch = supplied_epoch.unwrap_or(u64::MAX);
+                                authority = next_auth;
+                            }
+                            Reply::Refused { code: "EPOCH_MISMATCH", .. } => {
+                                let latest = self.fresh_snapshot(None).await?;
+                                return Ok(HeartbeatInstallOutcome::EpochSync {
+                                    epoch: latest.obs.epoch_id,
+                                    safety_state: latest.obs.safety_state.clone(),
+                                });
+                            }
+                            Reply::Refused {
+                                code: "LEASE_LOST" | "NO_LEASE" | "DISCONNECTED",
+                                ..
+                            } => {
+                                let reason = self
+                                    .hub
+                                    .latest()
+                                    .map_or("expired", |s| {
+                                        s.owner.lease_loss_reason(conn.as_str(), local_generation)
+                                    });
+                                return Ok(HeartbeatInstallOutcome::LeaseLost {
+                                    generation: local_generation,
+                                    reason: Some(reason),
+                                });
+                            }
+                            Reply::Refused { code, .. } => {
+                                return Err(Self::map_lease_install_err(code));
+                            }
+                            _ => {
+                                return Err(ArmError::Internal(
+                                    "Unexpected broker reply for Heartbeat".into(),
+                                ));
+                            }
+                        }
+                    }
+                    Err(ArmError::Rejected {
+                        status: 409,
+                        code: "STOPPED".into(),
+                        message: "Heartbeat superseded by concurrent stop".into(),
+                    })
+                }
+                _ => Err(executor_unavailable()),
+            },
+        }
     }
 
     fn executor_lease_active(&self) -> bool {

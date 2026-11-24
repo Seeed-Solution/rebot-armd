@@ -253,6 +253,10 @@ pub(super) struct OwnerDispatchCtx<'a> {
     pub(super) pending_calibration: &'a mut Option<(Value, calibration::CalibJob, u64, u64, bool)>,
 }
 
+/// Boxed future returned by the table-bound unified heartbeat handler.
+pub(super) type HeartbeatFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Option<Value>> + Send + 'a>>;
+
 /// Concrete executable handler binding stored in each [`DispatchEntry`].
 #[derive(Clone, Copy)]
 pub(super) enum DispatchHandler {
@@ -262,15 +266,15 @@ pub(super) enum DispatchHandler {
     UrgentStop(fn(&mut UrgentStopCtx<'_>) -> bool),
     /// Dedicated off-reader auth frame processor (`auth`).
     Auth(fn(&WsAuth, &Value) -> Value),
-    /// Dedicated latest-wins heartbeat processor (`heartbeat`).
+    /// Dedicated latest-wins heartbeat processor (`heartbeat`), routed through the active owner.
     Heartbeat(
-        fn(
-            &mut SupervisorInner,
-            &Value,
-            &str,
-            &AtomicU64,
-            &Mutex<Option<String>>,
-        ) -> Option<Value>,
+        for<'a> fn(
+            &'a ArmSupervisor,
+            &'a Value,
+            crate::rt_core::requests::lease::ConnectionHandle,
+            &'a AtomicU64,
+            &'a Mutex<Option<String>>,
+        ) -> HeartbeatFuture<'a>,
     ),
     /// Pre-lock lease-free command handler (`depth_measure`, `teach`).
     LeaseFree(fn(LeaseFreeCtx<'_>)),

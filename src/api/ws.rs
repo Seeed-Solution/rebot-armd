@@ -346,16 +346,18 @@ pub async fn ws_handler(ws: WebSocketUpgrade, State(supervisor): State<Arc<ArmSu
                         axum::Extension(calib): axum::Extension<crate::calibration::CalibrationDeps>,
                         axum::Extension(sandbox): axum::Extension<Arc<crate::api::sandbox::SandboxState>>,
                         axum::Extension(auth): axum::Extension<crate::auth::OperatorAuth>) -> axum::response::Response {
-    let control_hz = match supervisor.control_frequency_hz_checked().await {
-        Ok(hz) => hz.max(1),
-        Err(err) => return ApiError::from(err).into_response(),
-    };
     let obs_rate = match query.get("obs_hz") {
         None => None,
-        Some(v) => match v.trim().parse::<u64>() {
-            Ok(n) => Some(ObsRate { hz: n.clamp(1, u64::from(control_hz)) as f64, control_hz: f64::from(control_hz) }),
-            Err(_) => return (StatusCode::BAD_REQUEST, "obs_hz must be an integer >= 0 (0 and 1 mean 1 Hz; values above control_frequency_hz are clamped)").into_response(),
-        },
+        Some(v) => {
+            let control_hz = match supervisor.control_frequency_hz_checked().await {
+                Ok(hz) => hz.max(1),
+                Err(err) => return ApiError::from(err).into_response(),
+            };
+            match v.trim().parse::<u64>() {
+                Ok(n) => Some(ObsRate { hz: n.clamp(1, u64::from(control_hz)) as f64, control_hz: f64::from(control_hz) }),
+                Err(_) => return (StatusCode::BAD_REQUEST, "obs_hz must be an integer >= 0 (0 and 1 mean 1 Hz; values above control_frequency_hz are clamped)").into_response(),
+            }
+        }
     };
     let explicit_auth = query
         .get("auth")
@@ -1455,6 +1457,14 @@ impl WsAuth {
         !s.auth.is_enforced() || s.auth.is_operator(s.token.as_deref())
     }
 
+    fn operator_grant(&self) -> crate::auth::OperatorGrant {
+        let s = self.0.read().unwrap_or_else(|e| e.into_inner());
+        if s.explicit_auth && !s.explicit_authed {
+            return crate::auth::OperatorGrant::DENIED;
+        }
+        s.auth.operator_grant(s.token.as_deref())
+    }
+
     fn is_enforced(&self) -> bool {
         self.0.read().unwrap_or_else(|e| e.into_inner()).auth.is_enforced()
     }
@@ -1813,7 +1823,67 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
 
     // This identity never comes from a client payload and is never disclosed.
     let conn_id = NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed);
-    let connection = format!("connection:{conn_id}");
+    let conn_handle = crate::rt_core::requests::lease::ConnectionHandle::from_ws_id(conn_id)
+        .expect("monotonic WS conn_id >= 1");
+    let connection = conn_handle.as_str().to_owned();
+    let mut registered_live_slot = true;
+    if let Err(err) = supervisor.register_ws_connection(conn_id).await {
+        let hard_reject = matches!(
+            &err,
+            ArmError::Rejected { code, .. }
+                if matches!(code.as_str(), "TOO_MANY_CONNECTIONS" | "DISCONNECTED" | "INVALID_CONNECTION")
+        );
+        if hard_reject {
+            let api = ApiError::from(err);
+            let err_frame = json!({
+                "type": "error",
+                "status": api.status.as_u16(),
+                "code": api.code,
+                "error": api.error,
+                "message": api.message,
+            });
+            let close = CloseFrame {
+                code: 1013,
+                reason: api
+                    .code
+                    .as_deref()
+                    .unwrap_or("CONNECTION_REJECTED")
+                    .to_owned()
+                    .into(),
+            };
+            let _ = tokio::time::timeout(Duration::from_millis(100), async {
+                let _ = sender.send(Message::Text(err_frame.to_string().into())).await;
+                let _ = sender.send(Message::Close(Some(close))).await;
+                let _ = sender.flush().await;
+                let _ = sender.close().await;
+            })
+            .await;
+            return;
+        }
+        // Executor is already stopped or failed: keep the WS socket open in degraded mode so
+        // urgent E-stop can still latch and return explicit `503 EXECUTOR_STOPPED` (`latched: true`)
+        // while all ordinary / lease operations continue to fail closed.
+        registered_live_slot = false;
+    }
+
+    struct ConnDisconnectGuard {
+        supervisor: Arc<ArmSupervisor>,
+        conn: crate::rt_core::requests::lease::ConnectionHandle,
+        disarmed: bool,
+    }
+    impl Drop for ConnDisconnectGuard {
+        fn drop(&mut self) {
+            if !self.disarmed {
+                self.supervisor.disconnect_ws_connection_detached(self.conn);
+            }
+        }
+    }
+    let mut conn_disconnect_guard = ConnDisconnectGuard {
+        supervisor: supervisor.clone(),
+        conn: conn_handle,
+        disarmed: !registered_live_slot,
+    };
+
     let connection_generation = Arc::new(AtomicU64::new(0));
     let client_label: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     // Urgent Stop request_id ordering is tracked independently of ordinary RPCs so an urgent Stop
@@ -2163,7 +2233,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
 
     // Dedicated latest-wins heartbeat processor isolated from ordinary backlog and slow worker IO.
     let hb_supervisor = supervisor.clone();
-    let hb_connection = connection.clone();
+    let hb_conn_handle = conn_handle;
     let hb_generation = connection_generation.clone();
     let hb_client_label = client_label.clone();
     let hb_slot = heartbeat_slot.clone();
@@ -2175,19 +2245,14 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             unreachable!("FrameKind::Heartbeat must bind DispatchHandler::Heartbeat");
         };
         while let Some(value) = hb_slot.pop().await {
-            if hb_supervisor.owner_mode() != crate::supervisor::OWNER_LEGACY {
-                continue;
-            }
-            let reply = {
-                let mut inner = hb_supervisor.inner().write().await;
-                hb_handler(
-                    &mut inner,
-                    &value,
-                    &hb_connection,
-                    &hb_generation,
-                    &hb_client_label,
-                )
-            };
+            let reply = hb_handler(
+                &hb_supervisor,
+                &value,
+                hb_conn_handle,
+                &hb_generation,
+                &hb_client_label,
+            )
+            .await;
             if let Some(reply) = reply {
                 if !hb_writer.send_ordinary_control(reply).await {
                     break;
@@ -2324,6 +2389,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     // may await planning, replay, dry-run, and the detector without blocking reader/urgent paths.
     let recv_supervisor = supervisor.clone();
     let recv_conn_id = conn_id;
+    let recv_conn_handle = conn_handle;
     let recv_connection = connection.clone();
     let recv_generation = connection_generation.clone();
     let recv_client_label = client_label.clone();
@@ -2412,9 +2478,60 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             let QueuedOrdinary { value, stamp } = queued;
             let raw_kind = value.get("type").and_then(Value::as_str).unwrap_or("");
             let (frame_kind, entry) = dispatch::classify(&value);
+            // Unified owner-routed lease lifecycle (`acquire_lease`, `release_lease`) shared by
+            // both legacy and RT executor owners; `dispatch::classify` remains the single authority.
+            let owner_mode = recv_supervisor.owner_mode();
+            if matches!(frame_kind, FrameKind::AcquireLease | FrameKind::ReleaseLease)
+                && entry.is_some_and(|e| e.admission == AdmissionClass::OrdinarySession)
+                && matches!(
+                    owner_mode,
+                    crate::supervisor::OWNER_LEGACY | crate::supervisor::OWNER_EXECUTOR
+                )
+            {
+                maybe_pause_worker_before_lock(&recv_connection).await;
+                let (response, evicted_notify) = if frame_kind == FrameKind::AcquireLease {
+                    lease::handle_acquire_lease_unified(
+                        &recv_supervisor,
+                        &value,
+                        recv_conn_handle,
+                        &recv_generation,
+                        &recv_client_label,
+                        &worker_closing,
+                        &ws_auth,
+                        &mut last_sequence,
+                    )
+                    .await
+                } else {
+                    (
+                        lease::handle_release_lease_unified(
+                            &recv_supervisor,
+                            &value,
+                            recv_conn_handle,
+                            &recv_generation,
+                            &recv_client_label,
+                        )
+                        .await,
+                        None,
+                    )
+                };
+                if let Some((evicted_conn, evicted_gen)) = evicted_notify {
+                    lease::notify_evicted(evicted_conn, evicted_gen);
+                }
+                if let Some(response) = response {
+                    if response.get("type").and_then(Value::as_str) == Some("lease_granted") {
+                        let delay_ms = TEST_LEASE_GRANTED_DELAY_MS.load(Ordering::Relaxed);
+                        if delay_ms > 0 {
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        }
+                    }
+                    if !worker_writer.send_ordinary_control(response).await {
+                        break;
+                    }
+                }
+                continue;
+            }
             // Fail closed before any legacy lock/reader path (including depth/teach) whenever
             // `ArmCore` is not owned by the legacy supervisor lock.
-            let owner_mode = recv_supervisor.owner_mode();
             if owner_mode != crate::supervisor::OWNER_LEGACY {
                 if let Some(reply) = executor_routing_reject(&value, owner_mode) {
                     if !worker_writer.send_ordinary_control(reply).await { break; }
@@ -2759,6 +2876,9 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
         if !inner.detached {
             inner.mark_connection_closed(conn_id);
         }
+    } else if supervisor.owner_mode() == crate::supervisor::OWNER_EXECUTOR {
+        let _ = supervisor.disconnect_ws_connection(conn_handle).await;
+        conn_disconnect_guard.disarmed = true;
     }
 
     // Stop and JOIN all primary tasks so none outlives teardown; give writer <= 1 s grace on fatal overflow.
@@ -2800,13 +2920,10 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
 
     if supervisor.owner_mode() == crate::supervisor::OWNER_LEGACY {
         supervisor.recorder_connection_closed(&connection).await;
-        // Take the owner lock FIRST, keep connection marked closed, and stop motion before
-        // releasing whichever lease this connection currently holds.
-        let mut inner = supervisor.inner().write().await;
-        if !inner.detached {
-            inner.mark_connection_closed(conn_id);
-            let _ = inner.release_lease_for_connection_and_stop(&connection);
-        }
-        connection_generation.store(0, Ordering::SeqCst);
     }
+    if !conn_disconnect_guard.disarmed {
+        let _ = supervisor.disconnect_ws_connection(conn_handle).await;
+        conn_disconnect_guard.disarmed = true;
+    }
+    connection_generation.store(0, Ordering::SeqCst);
 }

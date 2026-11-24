@@ -1518,6 +1518,302 @@ enum OffloadReclaim {
     LogLegacyJ6(crate::joint_zero::ZeroConvention),
 }
 
+/// Off-thread broker dispatcher coordinating `Broker<PlanSlot>` submissions, connection-liveness
+/// linearization against [`ConnLifecycleClient`], and reply/terminal reclamation (even after
+/// caller disconnect or cancellation). Never touched by `armd-control`.
+///
+/// Strict acyclic lock order: `BrokerDispatcher::state` -> `ConnLifecycleClient::inner` -> `broker`.
+pub(crate) struct BrokerDispatcher {
+    broker: Arc<Mutex<Broker<PlanSlot>>>,
+    conn_lifecycle: Arc<super::requests::lease::ConnLifecycleClient>,
+    state: Mutex<BrokerDispatcherState>,
+}
+
+struct ManagedEntry {
+    client: super::broker::ClientId,
+    waiter: ManagedWaiter,
+}
+
+enum ManagedWaiter {
+    OneShot(Option<tokio::sync::oneshot::Sender<Result<super::broker::Reply, OwnerError>>>),
+    Action {
+        ack: Option<tokio::sync::oneshot::Sender<Result<super::broker::Reply, OwnerError>>>,
+        terminal: Option<tokio::sync::oneshot::Sender<Result<super::broker::Reply, OwnerError>>>,
+        acked: bool,
+    },
+}
+
+struct BrokerDispatcherState {
+    managed: HashMap<super::broker::RequestId, ManagedEntry>,
+    /// True after a client with in-flight managed requests disconnects so `drain_replies`
+    /// continues polling `broker` until every abandoned reservation/plan slot is reclaimed.
+    draining_disconnected: bool,
+    exited: Arc<AtomicBool>,
+}
+
+/// Submission error returned by [`BrokerDispatcher`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrokerDispatchError {
+    Admit(super::broker::AdmitError),
+    Stopped,
+}
+
+impl BrokerDispatcher {
+    fn new(
+        broker: Arc<Mutex<Broker<PlanSlot>>>,
+        conn_lifecycle: Arc<super::requests::lease::ConnLifecycleClient>,
+        exited: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            broker,
+            conn_lifecycle,
+            state: Mutex::new(BrokerDispatcherState {
+                managed: HashMap::with_capacity(super::broker::REPLY_CAPACITY),
+                draining_disconnected: false,
+                exited,
+            }),
+        }
+    }
+
+    fn submit_one_shot(
+        &self,
+        client: super::broker::ClientId,
+        client_seq: u64,
+        authority: super::broker::Authority,
+        deadline: Instant,
+        what: super::broker::Submit<'_, PlanSlot>,
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<super::broker::Reply, OwnerError>>, BrokerDispatchError>
+    {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.exited.load(Ordering::Acquire) {
+            return Err(BrokerDispatchError::Stopped);
+        }
+        if client.0 != 0 && !self.conn_lifecycle.is_slot_open(client.0) {
+            return Err(BrokerDispatchError::Admit(
+                super::broker::AdmitError::Disconnected,
+            ));
+        }
+        let req = self
+            .broker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .submit(client, client_seq, authority, deadline, what)
+            .map_err(BrokerDispatchError::Admit)?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        st.managed.insert(
+            req,
+            ManagedEntry {
+                client,
+                waiter: ManagedWaiter::OneShot(Some(tx)),
+            },
+        );
+        Ok(rx)
+    }
+
+    #[allow(dead_code)] // Used by L2 TransitionOp::{TorqueOn, TorqueOff}.
+    fn submit_action(
+        &self,
+        client: super::broker::ClientId,
+        client_seq: u64,
+        authority: super::broker::Authority,
+        deadline: Instant,
+        what: super::broker::Submit<'_, PlanSlot>,
+    ) -> Result<
+        (
+            tokio::sync::oneshot::Receiver<Result<super::broker::Reply, OwnerError>>,
+            tokio::sync::oneshot::Receiver<Result<super::broker::Reply, OwnerError>>,
+        ),
+        BrokerDispatchError,
+    > {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.exited.load(Ordering::Acquire) {
+            return Err(BrokerDispatchError::Stopped);
+        }
+        if client.0 != 0 && !self.conn_lifecycle.is_slot_open(client.0) {
+            return Err(BrokerDispatchError::Admit(
+                super::broker::AdmitError::Disconnected,
+            ));
+        }
+        let req = self
+            .broker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .submit(client, client_seq, authority, deadline, what)
+            .map_err(BrokerDispatchError::Admit)?;
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        let (term_tx, term_rx) = tokio::sync::oneshot::channel();
+        st.managed.insert(
+            req,
+            ManagedEntry {
+                client,
+                waiter: ManagedWaiter::Action {
+                    ack: Some(ack_tx),
+                    terminal: Some(term_tx),
+                    acked: false,
+                },
+            },
+        );
+        Ok((ack_rx, term_rx))
+    }
+
+    /// Linearizes connection teardown off-thread: prevents any subsequent `BrokerDispatcher`
+    /// submission for `connection.id()`, marks the broker client disconnected (retiring its
+    /// managed waiters immediately while continuing broker reclamation), and pushes a
+    /// guaranteed-non-full priority `LifecycleCmd::Disconnect` onto the lifecycle channel.
+    async fn disconnect_connection(
+        &self,
+        connection: super::requests::lease::ConnectionHandle,
+    ) -> Result<super::requests::lease::LeaseOutcome, super::requests::lease::ConnLifecycleError>
+    {
+        let rx = {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            // Strict acyclic lock order: `state` (1) -> `conn_lifecycle` (2) -> `broker` (3).
+            self.conn_lifecycle.enqueue_disconnect_oneshot(connection, tx)?;
+            Self::disconnect_broker_client_locked(&mut st, &self.broker, connection.id());
+            rx
+        };
+        match rx.await {
+            Ok(Ok(super::requests::lease::LifecycleReply::Disconnected { outcome, .. })) => {
+                Ok(outcome)
+            }
+            Ok(Err(e)) => Err(e),
+            _ => Err(super::requests::lease::ConnLifecycleError::Stopped),
+        }
+    }
+
+    fn disconnect_connection_sync(
+        &self,
+        connection: super::requests::lease::ConnectionHandle,
+    ) -> Result<super::requests::lease::LeaseOutcome, super::requests::lease::ConnLifecycleError>
+    {
+        let rx = {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let (tx, rx) = mpsc::sync_channel(1);
+            self.conn_lifecycle.enqueue_disconnect_sync(connection, tx)?;
+            Self::disconnect_broker_client_locked(&mut st, &self.broker, connection.id());
+            rx
+        };
+        match rx.recv() {
+            Ok(Ok(super::requests::lease::LifecycleReply::Disconnected { outcome, .. })) => {
+                Ok(outcome)
+            }
+            Ok(Err(e)) => Err(e),
+            _ => Err(super::requests::lease::ConnLifecycleError::Stopped),
+        }
+    }
+
+    fn enqueue_disconnect_detached(
+        &self,
+        connection: super::requests::lease::ConnectionHandle,
+    ) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let _ = self.conn_lifecycle.enqueue_disconnect_oneshot(connection, tx);
+        Self::disconnect_broker_client_locked(&mut st, &self.broker, connection.id());
+    }
+
+    fn disconnect_broker_client_locked(
+        st: &mut BrokerDispatcherState,
+        broker: &Mutex<Broker<PlanSlot>>,
+        conn_id: u64,
+    ) {
+        if conn_id == 0 {
+            return;
+        }
+        let client = super::broker::ClientId(conn_id);
+        let before = st.managed.len();
+        st.managed.retain(|_, entry| entry.client != client);
+        let mut guard = broker.lock().unwrap_or_else(|e| e.into_inner());
+        guard.disconnect(client);
+        if st.managed.len() < before || guard.outstanding() > 0 {
+            st.draining_disconnected = true;
+        }
+    }
+
+    fn poll_managed_locked(
+        st: &mut BrokerDispatcherState,
+        broker: &Mutex<Broker<PlanSlot>>,
+    ) {
+        if st.managed.is_empty() && !st.draining_disconnected {
+            return;
+        }
+        let mut guard = broker.lock().unwrap_or_else(|e| e.into_inner());
+        guard.poll(|_client, reply| {
+            let req = reply.request();
+            let Some(entry) = st.managed.get_mut(&req) else {
+                return true;
+            };
+            match &mut entry.waiter {
+                ManagedWaiter::OneShot(slot) => {
+                    let delivered = slot.take().is_some_and(|tx| tx.send(Ok(reply)).is_ok());
+                    st.managed.remove(&req);
+                    delivered
+                }
+                ManagedWaiter::Action { ack, terminal, acked } => match reply {
+                    super::broker::Reply::Ack { .. } => {
+                        *acked = true;
+                        ack.take().is_some_and(|tx| tx.send(Ok(reply)).is_ok())
+                    }
+                    super::broker::Reply::Refused { .. } | super::broker::Reply::Lease { .. } => {
+                        let delivered = ack.take().is_some_and(|tx| tx.send(Ok(reply)).is_ok());
+                        st.managed.remove(&req);
+                        delivered
+                    }
+                    super::broker::Reply::Terminal { .. } => {
+                        let delivered =
+                            terminal.take().is_some_and(|tx| tx.send(Ok(reply)).is_ok());
+                        st.managed.remove(&req);
+                        delivered
+                    }
+                },
+            }
+        });
+        if guard.outstanding() == 0 && st.managed.is_empty() {
+            st.draining_disconnected = false;
+        }
+    }
+
+    fn drain_replies(&self) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Self::poll_managed_locked(&mut st, &self.broker);
+        if st.exited.load(Ordering::Acquire) {
+            Self::poll_managed_locked(&mut st, &self.broker);
+            Self::fail_remaining(&mut st.managed, OwnerError::Stopped);
+            st.draining_disconnected = false;
+        }
+    }
+
+    fn finish_stopped(&self) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Self::poll_managed_locked(&mut st, &self.broker);
+        Self::fail_remaining(&mut st.managed, OwnerError::Stopped);
+        st.draining_disconnected = false;
+    }
+
+    fn fail_remaining(
+        managed: &mut HashMap<super::broker::RequestId, ManagedEntry>,
+        err: OwnerError,
+    ) {
+        for (_, entry) in managed.drain() {
+            match entry.waiter {
+                ManagedWaiter::OneShot(Some(tx)) => {
+                    let _ = tx.send(Err(err.clone()));
+                }
+                ManagedWaiter::OneShot(None) => {}
+                ManagedWaiter::Action { ack, terminal, .. } => {
+                    if let Some(tx) = ack {
+                        let _ = tx.send(Err(err.clone()));
+                    }
+                    if let Some(tx) = terminal {
+                        let _ = tx.send(Err(err.clone()));
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Off-thread consumer sinks drained by `armd-dispatch`, `tick_stats()`, and `shutdown_and_join()`.
 pub(crate) struct OffThreadSinks {
     /// Pair of preallocated SPSC diagnostic consumers (`diag_rx`, `diag_amend_rx`) under one
@@ -1536,6 +1832,8 @@ pub(crate) struct OffThreadSinks {
     persist_worker_exited: Arc<AtomicBool>,
     maint_client: Arc<MaintClient>,
     urgent_stop_client: Arc<UrgentStopClient>,
+    conn_lifecycle_client: Arc<super::requests::lease::ConnLifecycleClient>,
+    broker_dispatcher: Arc<BrokerDispatcher>,
     offload_reclaim_rx: Mutex<Consumer<OffloadReclaim>>,
 }
 
@@ -1635,6 +1933,8 @@ impl OffThreadSinks {
         }
         self.maint_client.drain_replies();
         self.urgent_stop_client.drain_replies();
+        self.conn_lifecycle_client.drain_replies();
+        self.broker_dispatcher.drain_replies();
         if self.persist_worker_exited.load(Ordering::Acquire) {
             let mut rx = self.persist_rep_rx.lock().unwrap_or_else(|e| e.into_inner());
             while let Ok(rep) = rx.pop() {
@@ -1729,6 +2029,8 @@ struct RtExecutorShared {
     stats: Arc<ExecutorStats>,
     maint_client: Arc<MaintClient>,
     urgent_stop_client: Arc<UrgentStopClient>,
+    conn_lifecycle_client: Arc<super::requests::lease::ConnLifecycleClient>,
+    broker_dispatcher: Arc<BrokerDispatcher>,
     hub: Arc<StateHub>,
     tick_stats: Arc<crate::diagnostics::tick::LockFreeTickStats>,
     sinks: Arc<OffThreadSinks>,
@@ -1777,6 +2079,7 @@ impl RtExecutorShared {
         self.persist_park_thread.unpark();
         self.maint_client.close();
         self.urgent_stop_client.close();
+        self.conn_lifecycle_client.close();
         self.stats.signal_stop(&self.control_stop);
         if let Some(clock) = self.clock.as_ref() {
             clock.wake();
@@ -1847,6 +2150,8 @@ impl RtExecutorShared {
         // Final off-thread drain and reclamation.
         self.maint_client.finish_stopped();
         self.urgent_stop_client.finish_stopped();
+        self.conn_lifecycle_client.finish_stopped();
+        self.broker_dispatcher.finish_stopped();
         self.sinks.flush_and_report_shutdown(&self.tick_stats);
         if let Some(ring) = self.hub.record_ring() {
             ring.drain();
@@ -1916,6 +2221,106 @@ impl RtExecutorHandle {
 
     pub fn urgent_stop_in_flight(&self) -> usize {
         self.shared.urgent_stop_client.in_flight()
+    }
+
+    pub fn open_connection_sync(
+        &self,
+        conn_id: u64,
+    ) -> Result<Result<(), &'static str>, super::requests::lease::ConnLifecycleError> {
+        self.shared.conn_lifecycle_client.open_sync(conn_id)
+    }
+
+    pub async fn open_connection_async(
+        &self,
+        conn_id: u64,
+    ) -> Result<Result<(), &'static str>, super::requests::lease::ConnLifecycleError> {
+        self.shared.conn_lifecycle_client.open_async(conn_id).await
+    }
+
+    pub fn disconnect_connection_sync(
+        &self,
+        connection: super::requests::lease::ConnectionHandle,
+    ) -> Result<super::requests::lease::LeaseOutcome, super::requests::lease::ConnLifecycleError>
+    {
+        self.shared
+            .broker_dispatcher
+            .disconnect_connection_sync(connection)
+    }
+
+    pub async fn disconnect_connection_async(
+        &self,
+        connection: super::requests::lease::ConnectionHandle,
+    ) -> Result<super::requests::lease::LeaseOutcome, super::requests::lease::ConnLifecycleError>
+    {
+        self.shared
+            .broker_dispatcher
+            .disconnect_connection(connection)
+            .await
+    }
+
+    /// Non-blocking fire-and-forget disconnect used strictly as a Drop safety net when an async
+    /// WS handler task is aborted externally before reaching its normal async teardown.
+    pub fn enqueue_disconnect_detached(
+        &self,
+        connection: super::requests::lease::ConnectionHandle,
+    ) {
+        self.shared
+            .broker_dispatcher
+            .enqueue_disconnect_detached(connection);
+    }
+
+    pub async fn submit_lease_async(
+        &self,
+        client: super::broker::ClientId,
+        client_seq: u64,
+        authority: super::broker::Authority,
+        deadline: Instant,
+        req: super::requests::lease::LeaseRequest,
+    ) -> Result<super::broker::Reply, BrokerDispatchError> {
+        let rx = self.shared.broker_dispatcher.submit_one_shot(
+            client,
+            client_seq,
+            authority,
+            deadline,
+            super::broker::Submit::Lease(req),
+        )?;
+        match rx.await {
+            Ok(Ok(reply)) => Ok(reply),
+            _ => Err(BrokerDispatchError::Stopped),
+        }
+    }
+
+    pub async fn submit_immediate_async(
+        &self,
+        client: super::broker::ClientId,
+        client_seq: u64,
+        authority: super::broker::Authority,
+        deadline: Instant,
+        op: super::broker::ImmediateOp,
+    ) -> Result<super::broker::Reply, BrokerDispatchError> {
+        let rx = self.shared.broker_dispatcher.submit_one_shot(
+            client,
+            client_seq,
+            authority,
+            deadline,
+            super::broker::Submit::Immediate(op),
+        )?;
+        match rx.await {
+            Ok(Ok(reply)) => Ok(reply),
+            _ => Err(BrokerDispatchError::Stopped),
+        }
+    }
+
+    pub fn drain_broker_replies(&self) {
+        self.shared.broker_dispatcher.drain_replies();
+    }
+
+    pub fn drain_conn_lifecycle_replies(&self) {
+        self.shared.conn_lifecycle_client.drain_replies();
+    }
+
+    pub fn live_connection_slots(&self) -> usize {
+        self.shared.conn_lifecycle_client.live_slot_count()
     }
 
     pub fn request_shutdown(&self) -> Result<bool, OwnerError> {
@@ -2167,6 +2572,17 @@ pub(crate) fn spawn_executor(
         urgent_stop_channel(URGENT_STOP_CAPACITY, exited.clone());
     engine.attach_urgent_stops(urgent_stop_intake);
     let urgent_stop_client = Arc::new(urgent_stop_client);
+    let (conn_lifecycle_client, conn_lifecycle_intake) =
+        super::requests::lease::conn_lifecycle_channel(exited.clone());
+    conn_lifecycle_client.seed_live_connections(core.live_connection_ids());
+    engine.attach_conn_lifecycle(conn_lifecycle_intake);
+    let conn_lifecycle_client = Arc::new(conn_lifecycle_client);
+    let broker = Arc::new(Mutex::new(broker));
+    let broker_dispatcher = Arc::new(BrokerDispatcher::new(
+        Arc::clone(&broker),
+        Arc::clone(&conn_lifecycle_client),
+        exited.clone(),
+    ));
     let control_exited_cv = Arc::new((Mutex::new(false), Condvar::new()));
     let persist_worker_exited = Arc::new(AtomicBool::new(false));
     let persist_exited_cv = Arc::new((Mutex::new(false), Condvar::new()));
@@ -2188,6 +2604,8 @@ pub(crate) fn spawn_executor(
         persist_worker_exited: persist_worker_exited.clone(),
         maint_client: maint_client.clone(),
         urgent_stop_client: urgent_stop_client.clone(),
+        conn_lifecycle_client: conn_lifecycle_client.clone(),
+        broker_dispatcher: broker_dispatcher.clone(),
         offload_reclaim_rx: Mutex::new(offload_reclaim_rx),
     });
 
@@ -2294,12 +2712,14 @@ pub(crate) fn spawn_executor(
     let monitor_thread = stats.spawn_monitor(control_stop.clone()).ok();
 
     let shared = Arc::new(RtExecutorShared {
-        broker: Arc::new(Mutex::new(broker)),
+        broker,
         target_writer: Arc::new(Mutex::new(target_writer)),
         stop_requests,
         stats,
         maint_client,
         urgent_stop_client,
+        conn_lifecycle_client,
+        broker_dispatcher,
         hub,
         tick_stats,
         sinks: sinks.clone(),
@@ -4033,7 +4453,9 @@ fn control_thread_main(
                         state.flush_pending_maint_reply(&core);
                         state.emit_estop_ack_if_advanced(&mut core);
                         state.drain_retired_states(&mut core);
-                        if engine.take_urgent_replies_flushed() {
+                        if engine.take_urgent_replies_flushed()
+                            || engine.take_lifecycle_replies_flushed()
+                        {
                             hub.wake();
                         }
                         return None;
@@ -4199,7 +4621,8 @@ fn control_thread_main(
                                 publish_gen + 1,
                                 &mut report,
                             );
-                            let urgent_flushed = engine.take_urgent_replies_flushed();
+                            let urgent_flushed = engine.take_urgent_replies_flushed()
+                                || engine.take_lifecycle_replies_flushed();
                             if published {
                                 publish_gen += 1;
                             }
@@ -4267,6 +4690,7 @@ fn control_thread_main(
                 diag_dropped_delta = 1;
             }
             let _ = engine.take_urgent_replies_flushed();
+            let _ = engine.take_lifecycle_replies_flushed();
             hub.wake();
         }
         // Positive-control tail probe (strictly AFTER `diag_tx.push` and `hub.wake()`);
@@ -4445,15 +4869,20 @@ fn control_thread_main(
     state.drain_maintenance_stopped();
     state.drain_persistence_stopped(&core);
     if !panicked {
-        if !core.pending_estop_acks.is_empty() || engine.has_applied_urgent_stop_pending() {
+        if !core.pending_estop_acks.is_empty()
+            || engine.has_applied_urgent_stop_pending()
+            || engine.has_pending_lifecycle_replies()
+        {
             publish_gen += 1;
             let ts = core.now_timestamp();
             core.publish(ts, publish_gen);
         }
         engine.drain_urgent_stops_stopped(true);
+        engine.drain_conn_lifecycle_stopped(true);
         state.emit_estop_ack_if_advanced(&mut core);
     } else {
         engine.drain_urgent_stops_stopped(false);
+        engine.drain_conn_lifecycle_stopped(false);
         state.retire_unpublished_estop_acks(&mut core);
     }
     state.drain_estop_and_retired_stopped(&mut core);
