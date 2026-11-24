@@ -618,10 +618,10 @@ pub trait ArmDriver: Send {
         self.begin_torque(enabled)
     }
 
-    /// Starts a client-initiated park disable whose FIRST motor disable frame is gated against
-    /// pending Stop / stop-generation advances immediately before transmit (`DamiaoArmDriver::send`).
-    /// Once the first disable frame transmits, remaining motors disable unconditionally so the bus
-    /// never stays half-disabled. Watchdog / fault disables continue using [`Self::begin_torque_budgeted`].
+    /// Starts a client-initiated park disable whose EVERY per-motor disable write is gated against
+    /// pending Stop, E-stop latch, and `expected_stop_gen` immediately before transmit (e.g.,
+    /// `DamiaoArmDriver::send(TxKind::ClientParkDisable)` and `FeetechArmDriver::disable_torque_inner`).
+    /// Watchdog / fault disables continue using [`Self::begin_torque_budgeted`] / [`Self::begin_torque`].
     fn begin_client_park_disable(
         &mut self,
         max_rx_frames: Option<u16>,
@@ -961,6 +961,7 @@ pub struct FeetechArmDriver<T: Transport> {
     partial_enable_known: bool,
     joint_torque_enabled: Vec<Option<bool>>,
     abort_flag: Option<Arc<AtomicBool>>,
+    estop_gate: Option<crate::rt_core::urgent::EstopGate>,
     pub last_enable_poll: Option<Instant>,
     gripper_index: Option<usize>,
     pub hw_angle_limits: Vec<Option<(u16, u16)>>,
@@ -1010,6 +1011,7 @@ impl<T: Transport> FeetechArmDriver<T> {
             partial_enable_known: false,
             joint_torque_enabled: vec![None; dof],
             abort_flag: None,
+            estop_gate: None,
             last_enable_poll: None,
             gripper_index: None,
             hw_angle_limits: vec![None; dof],
@@ -1369,6 +1371,87 @@ impl<T: Transport> FeetechArmDriver<T> {
         }
 
         Ok(drained)
+    }
+
+    /// Per-write Stop / E-stop / stop-generation gate for client-initiated park disable on
+    /// Feetech / SO-ARM101 servos (rechecked before EVERY per-servo disable write).
+    fn client_park_stop_check(
+        &self,
+        initial_estop_gen: Option<u64>,
+        expected_stop_gen: Option<u64>,
+    ) -> Result<(), ArmDriverError> {
+        if self.is_aborted() {
+            return Err(ArmDriverError::EstopInhibited);
+        }
+        if let Some(ref gate) = self.estop_gate {
+            if gate.pending() {
+                return Err(ArmDriverError::EstopInhibited);
+            }
+            let (estop_gen, stop_gen) = gate.generations();
+            if initial_estop_gen.is_some_and(|expected| estop_gen != expected)
+                || expected_stop_gen.is_some_and(|expected| stop_gen != expected)
+            {
+                return Err(ArmDriverError::EstopInhibited);
+            }
+        }
+        Ok(())
+    }
+
+    fn disable_torque_inner(
+        &mut self,
+        client_park: bool,
+        expected_stop_gen: Option<u64>,
+    ) -> Result<(), ArmDriverError> {
+        self.assert_clock_matches_transport();
+        self.invalidate_partial_pos_rx();
+        let initial_estop_gen = self.estop_gate.as_ref().map(|g| g.generations().0);
+        if client_park {
+            self.client_park_stop_check(initial_estop_gen, expected_stop_gen)?;
+        }
+        let ids = self.servo_ids.clone();
+        let mut write_err = None;
+        let mut any_sent = false;
+        for &id in &ids {
+            if client_park {
+                if let Err(e) = self.client_park_stop_check(initial_estop_gen, expected_stop_gen) {
+                    if !any_sent {
+                        return Err(e);
+                    }
+                    write_err = Some(ArmDriverError::HardwareFault(
+                        "Client park disable stopped mid-batch after partial servo disable".into(),
+                    ));
+                    break;
+                }
+            }
+            let pkt = feetech::build_set_torque(id, false);
+            match self.transport.write_all(&pkt) {
+                Ok(()) => {
+                    any_sent = true;
+                }
+                Err(e) => {
+                    write_err = Some(e.into());
+                }
+            }
+            let _ = self.transport.flush();
+            let _ = self.drain_tx_echo(&pkt);
+        }
+
+        if any_sent || !client_park {
+            let (count_0, _, _) = self.read_torque_enable_states(&ids);
+            if count_0 == ids.len() {
+                self.confirmed_enable_state = EnableState::Disabled;
+                self.partial_enable_known = false;
+            } else {
+                self.confirmed_enable_state = EnableState::Unknown;
+                self.partial_enable_known = false;
+            }
+        }
+
+        if let Some(e) = write_err {
+            Err(e)
+        } else {
+            Ok(())
+        }
     }
 
     /// Reads REG_TORQUE_ENABLE from each servo in `ids` (indexed like `servo_ids`), records
@@ -1988,6 +2071,20 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         self.abort_flag = Some(flag);
     }
 
+    fn set_estop_gate(&mut self, gate: crate::rt_core::urgent::EstopGate) {
+        self.assert_clock_matches_transport();
+        self.estop_gate = Some(gate);
+    }
+
+    fn begin_client_park_disable(
+        &mut self,
+        _max_rx_frames: Option<u16>,
+        expected_stop_gen: Option<u64>,
+    ) -> Result<TorqueProgress, ArmDriverError> {
+        self.disable_torque_inner(true, expected_stop_gen)
+            .map(|()| TorqueProgress::Done(TorqueOutcome::Confirmed))
+    }
+
     fn refresh_enable_state(&mut self) -> Result<EnableState, ArmDriverError> {
         self.assert_clock_matches_transport();
         if self.servo_ids.is_empty() {
@@ -2257,31 +2354,7 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                 Err(ArmDriverError::HardwareFault(err_msg))
             }
         } else {
-            let mut write_err = None;
-            for &id in &ids {
-                let pkt = feetech::build_set_torque(id, false);
-                if let Err(e) = self.transport.write_all(&pkt) {
-                    write_err = Some(e.into());
-                }
-                let _ = self.transport.flush();
-                let _ = self.drain_tx_echo(&pkt);
-            }
-
-            let (count_0, _, _) = self.read_torque_enable_states(&ids);
-
-            if count_0 == ids.len() {
-                self.confirmed_enable_state = EnableState::Disabled;
-                self.partial_enable_known = false;
-            } else {
-                self.confirmed_enable_state = EnableState::Unknown;
-                self.partial_enable_known = false;
-            }
-
-            if let Some(e) = write_err {
-                Err(e)
-            } else {
-                Ok(())
-            }
+            self.disable_torque_inner(false, None)
         }
     }
 
@@ -3079,10 +3152,10 @@ struct StopStamp {
 enum TxKind {
     /// Safety torque-off (`CMD_DISABLE`): never stop-gated and exempt from the motion TX budget.
     Disable,
-    /// First motor disable frame of a client-initiated park (`CMD_DISABLE`): exempt from the
+    /// Per-motor disable frame of a client-initiated park (`CMD_DISABLE`): exempt from the
     /// motion TX budget, but stop-gated (pending Stop/E-stop, E-stop latch, and stop-generation
-    /// stamp rechecked immediately before `can.transmit`). Remaining motors use `Disable`.
-    ClientParkFirstDisable,
+    /// stamp rechecked immediately before EVERY motor's `can.transmit`).
+    ClientParkDisable,
     /// Motion target frame (`POS_VEL`, `MIT`, or `POS_FORCE`).
     Target,
     /// Non-rollback mode-switch hold frame.
@@ -3800,7 +3873,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let latched = self.is_stop_latched();
         match kind {
             TxKind::Disable => {}
-            TxKind::ClientParkFirstDisable => {
+            TxKind::ClientParkDisable => {
                 if pending || latched {
                     return Err(TxRefusal::StopInhibited);
                 }
@@ -3852,7 +3925,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
 
         // 2. Tick TX budget check (Disable / panic-disable / client-park disable exempt from motion TX budget).
-        let budgeted = !matches!(kind, TxKind::Disable | TxKind::ClientParkFirstDisable);
+        let budgeted = !matches!(kind, TxKind::Disable | TxKind::ClientParkDisable);
         if budgeted {
             let _ = self.ensure_tx_pass();
             if !self.can_start_tick_tx() {
@@ -6861,65 +6934,103 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             }
             None => !self.drain_rx_before_command(),
         };
+        let after_seq = self.rx_seq;
+        let mut cmd_start = self.now();
         let mut last_err = None;
-        let first_idx = if client_park {
+        let mut any_sent = false;
+        if client_park {
             if self.motor_ids.is_empty() {
                 self.strict_stop_check(expected_stamp)?;
-                0
-            } else {
-                // Linearize client park's FIRST disable transmit inside `send()` (Step 3 + Step 5
-                // recheck of pending Stop, E-stop latch, and stop-generation stamp immediately
-                // before `can.transmit`). On stop refusal, zero frames were sent and driver state
-                // remains untouched.
-                match self.send(TxKind::ClientParkFirstDisable, expected_stamp, None, false, |d| {
-                    Some(damiao::build_disable_frame(d.motor_ids[0]))
-                }) {
-                    Ok(_) => 1,
-                    Err(r @ (TxRefusal::StopInhibited | TxRefusal::StopStampChanged)) => {
-                        return Err(Self::refusal_to_driver_err(r));
+                self.refresh_capture = None;
+                if let Some(hs) = self.torque_hs.take() {
+                    if matches!(hs, DamiaoTorque::DrainBeforeEnable(_)) {
+                        self.awaiting_rx_boundary = false;
                     }
-                    Err(r) => {
-                        last_err = Some(Self::refusal_to_driver_err(r));
-                        1
+                    if !matches!(hs, DamiaoTorque::Disable { .. }) {
+                        self.enable_failed();
+                    }
+                }
+                self.discard_all_pending_tx();
+                self.begin_tx_tick();
+                self.refresh_unfinished = 0;
+                if self.mit_fence.is_some() || self.mit_fence_trip.is_some() {
+                    self.clear_cached_targets();
+                }
+                self.awaiting_rx_boundary = awaiting_rx_boundary;
+                cmd_start = self.now();
+                self.last_enable_command = Some(cmd_start);
+                self.last_enable_command_rx_seq = Some(self.rx_seq);
+                self.last_command_was_disable = true;
+                self.disable_confirmed_sticky = false;
+            } else {
+                // Linearize EVERY motor's client-park disable frame inside `send()` (Step 3 + Step 5
+                // recheck of pending Stop, E-stop latch, and stop-generation stamp immediately before
+                // `can.transmit`). A WouldBlock/error on motor 0 followed by a Stop refuses motor 1
+                // with `EstopInhibited` and leaves driver state untouched; a Stop arriving after an
+                // earlier motor already transmitted stops remaining writes and reports partial disable.
+                for idx in 0..self.motor_ids.len() {
+                    match self.send(TxKind::ClientParkDisable, expected_stamp, None, false, |d| {
+                        Some(damiao::build_disable_frame(d.motor_ids[idx]))
+                    }) {
+                        Ok(_) => {
+                            if !any_sent {
+                                any_sent = true;
+                                self.refresh_capture = None;
+                                if let Some(hs) = self.torque_hs.take() {
+                                    if matches!(hs, DamiaoTorque::DrainBeforeEnable(_)) {
+                                        self.awaiting_rx_boundary = false;
+                                    }
+                                    if !matches!(hs, DamiaoTorque::Disable { .. }) {
+                                        self.enable_failed();
+                                    }
+                                }
+                                self.discard_all_pending_tx();
+                                self.begin_tx_tick();
+                                self.refresh_unfinished = 0;
+                                if self.mit_fence.is_some() || self.mit_fence_trip.is_some() {
+                                    self.clear_cached_targets();
+                                }
+                                self.awaiting_rx_boundary = awaiting_rx_boundary;
+                                cmd_start = self.now();
+                                self.last_enable_command = Some(cmd_start);
+                                self.last_enable_command_rx_seq = Some(self.rx_seq);
+                                self.last_command_was_disable = true;
+                                self.disable_confirmed_sticky = false;
+                            }
+                        }
+                        Err(r @ (TxRefusal::StopInhibited | TxRefusal::StopStampChanged)) => {
+                            if !any_sent {
+                                return Err(Self::refusal_to_driver_err(r));
+                            }
+                            last_err = Some(ArmDriverError::HardwareFault(
+                                "Client park disable stopped mid-batch after partial motor disable".into(),
+                            ));
+                            break;
+                        }
+                        Err(r) => {
+                            last_err = Some(Self::refusal_to_driver_err(r));
+                        }
                     }
                 }
             }
         } else {
-            0
-        };
-        if client_park {
-            self.refresh_capture = None;
-            if let Some(hs) = self.torque_hs.take() {
-                if matches!(hs, DamiaoTorque::DrainBeforeEnable(_)) {
-                    self.awaiting_rx_boundary = false;
+            self.awaiting_rx_boundary = awaiting_rx_boundary;
+            self.last_enable_command = Some(cmd_start);
+            self.last_enable_command_rx_seq = Some(self.rx_seq);
+            self.last_command_was_disable = true;
+            self.disable_confirmed_sticky = false;
+            for idx in 0..self.motor_ids.len() {
+                if let Err(r) = self.send(TxKind::Disable, None, None, false, |d| {
+                    Some(damiao::build_disable_frame(d.motor_ids[idx]))
+                }) {
+                    last_err = Some(Self::refusal_to_driver_err(r));
                 }
-                if !matches!(hs, DamiaoTorque::Disable { .. }) {
-                    self.enable_failed();
-                }
-            }
-            self.discard_all_pending_tx();
-            self.begin_tx_tick();
-            self.refresh_unfinished = 0;
-            if self.mit_fence.is_some() || self.mit_fence_trip.is_some() {
-                self.clear_cached_targets();
             }
         }
-        self.awaiting_rx_boundary = awaiting_rx_boundary;
-        let after_seq = self.rx_seq;
-        let cmd_start = self.now();
-        self.last_enable_command = Some(cmd_start);
-        self.last_enable_command_rx_seq = Some(self.rx_seq);
-        self.last_command_was_disable = true;
-        self.disable_confirmed_sticky = false;
-        for idx in first_idx..self.motor_ids.len() {
-            if let Err(r) = self.send(TxKind::Disable, None, None, false, |d| {
-                Some(damiao::build_disable_frame(d.motor_ids[idx]))
-            }) {
-                last_err = Some(Self::refusal_to_driver_err(r));
+        if any_sent || !client_park {
+            if let Err(e) = self.can.flush() {
+                last_err = Some(e.into());
             }
-        }
-        if let Err(e) = self.can.flush() {
-            last_err = Some(e.into());
         }
         if let Some(e) = last_err {
             // A failed or partial write cannot establish the physical power state.
@@ -9474,7 +9585,7 @@ mod tx_chokepoint_tests {
 
     const ALL_TX_KINDS: [TxKind; 10] = [
         TxKind::Disable,
-        TxKind::ClientParkFirstDisable,
+        TxKind::ClientParkDisable,
         TxKind::Target,
         TxKind::Hold,
         TxKind::RollbackHold(0),
@@ -9522,14 +9633,14 @@ mod tx_chokepoint_tests {
         if deadline == DeadlineCase::Passed {
             return Expected::RefusedDeadline;
         }
-        // Step 2: Tick TX budget runs before stop gate (Disable / ClientParkFirstDisable exempt).
-        if budget == BudgetCase::Exhausted && !matches!(kind, TxKind::Disable | TxKind::ClientParkFirstDisable) {
+        // Step 2: Tick TX budget runs before stop gate (Disable / ClientParkDisable exempt).
+        if budget == BudgetCase::Exhausted && !matches!(kind, TxKind::Disable | TxKind::ClientParkDisable) {
             return Expected::Deferred;
         }
         // Step 3: Stop gate by TxKind.
         match kind {
             TxKind::Disable => Expected::Sent,
-            TxKind::ClientParkFirstDisable => match stop {
+            TxKind::ClientParkDisable => match stop {
                 StopCase::NoStop => Expected::Sent,
                 StopCase::Pending | StopCase::Latched => Expected::RefusedStop,
             },

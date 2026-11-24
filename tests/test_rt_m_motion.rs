@@ -1586,14 +1586,17 @@ async fn m2_off_thread_watchdog_park_bare_quintic_refusal_mit_handback_and_zero_
 
 #[test]
 fn m3_client_park_first_disable_frame_rechecks_stop_at_driver_tx_gate() {
+    use armd::driver::FeetechArmDriver;
+    use armd::protocol::feetech;
     use armd::rt_core::urgent::{EstopGate, StopRequests};
-    use armd::transport::{CanFrame, CanTransport, DriverClock, TransportError};
+    use armd::transport::{CanFrame, CanTransport, DriverClock, Transport, TransportError};
 
     struct RaceStopCan {
         inner: FakeBus,
         nonblocking_rt: bool,
         fire_stop_on_receive: Arc<AtomicBool>,
         fire_stop_on_first_disable_tx: Arc<AtomicBool>,
+        would_block_and_stop_on_first_disable_tx: Arc<AtomicBool>,
         stops: StopRequests,
         disable_tx_count: Arc<std::sync::atomic::AtomicUsize>,
     }
@@ -1602,6 +1605,10 @@ fn m3_client_park_first_disable_frame_rechecks_stop_at_driver_tx_gate() {
         fn clock(&self) -> Option<Arc<dyn DriverClock>> { self.inner.clock() }
         fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
             let is_disable = frame.data == [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD];
+            if is_disable && self.would_block_and_stop_on_first_disable_tx.swap(false, Ordering::SeqCst) {
+                let _ = self.stops.request();
+                return Err(TransportError::WouldBlock);
+            }
             if is_disable {
                 self.disable_tx_count.fetch_add(1, Ordering::SeqCst);
             }
@@ -1633,12 +1640,14 @@ fn m3_client_park_first_disable_frame_rechecks_stop_at_driver_tx_gate() {
         let app_estop = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let fire_rx = Arc::new(AtomicBool::new(false));
         let fire_tx = Arc::new(AtomicBool::new(false));
+        let wb_stop = Arc::new(AtomicBool::new(false));
         let disable_tx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let can = RaceStopCan {
             inner: bus.clone(),
             nonblocking_rt: true,
             fire_stop_on_receive: fire_rx.clone(),
             fire_stop_on_first_disable_tx: fire_tx.clone(),
+            would_block_and_stop_on_first_disable_tx: wb_stop.clone(),
             stops: stops.clone(),
             disable_tx_count: disable_tx.clone(),
         };
@@ -1651,7 +1660,7 @@ fn m3_client_park_first_disable_frame_rechecks_stop_at_driver_tx_gate() {
         assert_eq!(disable_tx.load(Ordering::SeqCst), 0);
 
         // (1) Client Stop fires inside `begin_client_park_disable`'s RX drain RIGHT BEFORE motor 0 TX:
-        //     Step 3/Step 5 inside `send(TxKind::ClientParkFirstDisable)` inhibits motor 0 -> 0 frames sent,
+        //     Step 3/Step 5 inside `send(TxKind::ClientParkDisable)` inhibits motor 0 -> 0 frames sent,
         //     driver stays Enabled with no torque transition mutation.
         fire_rx.store(true, Ordering::SeqCst);
         let err = drv.begin_client_park_disable(None, Some(0)).unwrap_err();
@@ -1670,15 +1679,28 @@ fn m3_client_park_first_disable_frame_rechecks_stop_at_driver_tx_gate() {
         assert_eq!(disable_tx.load(Ordering::SeqCst), 0);
         assert_eq!(drv.enable_state(), EnableState::Enabled);
 
-        // (3) Once motor 0's disable frame transmits, a client Stop arriving BEFORE motor 1 must NOT
-        //     leave the bus half-disabled: motor 1 sends unconditional `TxKind::Disable`.
-        fire_tx.store(true, Ordering::SeqCst);
-        drv.begin_client_park_disable(Some(0), Some(sg)).expect("motor 0 passed gate; motor 1 completes disable");
-        assert_eq!(disable_tx.load(Ordering::SeqCst), 2, "both motors must receive disable once motor 0 transmits");
+        // (3) WouldBlock on motor 0 followed by client Stop BEFORE motor 1:
+        //     per-motor recheck refuses motor 1 -> 0 disable frames transmitted, driver stays Enabled.
+        wb_stop.store(true, Ordering::SeqCst);
+        let err3 = drv.begin_client_park_disable(Some(0), Some(sg)).unwrap_err();
+        assert!(armd::driver::is_estop_inhibited(&err3), "WouldBlock + Stop before motor 1 must return EstopInhibited, got {err3:?}");
+        assert_eq!(disable_tx.load(Ordering::SeqCst), 0, "motor 1 disable must NOT transmit after motor 0 WouldBlock + Stop");
+        assert_eq!(drv.enable_state(), EnableState::Enabled);
+        assert!(!drv.torque_transition_pending());
 
-        // (4) Watchdog park (`begin_torque_budgeted(false, 0)`) ignores pending client Stop and disables all motors.
+        // (4) Motor 0 transmits disable, then client Stop arrives BEFORE motor 1:
+        //     per-motor recheck blocks motor 1's disable write (only motor 0 transmitted) and reports error.
+        let sg_wb = stops.current();
+        assert!(sg_wb > sg && stops.pending());
+        stops.mark_applied(sg_wb);
+        fire_tx.store(true, Ordering::SeqCst);
+        let err4 = drv.begin_client_park_disable(Some(0), Some(sg_wb)).unwrap_err();
+        assert!(!armd::driver::is_estop_inhibited(&err4), "partial disable must not be masked as clean pre-tx inhibit: {err4:?}");
+        assert_eq!(disable_tx.load(Ordering::SeqCst), 1, "motor 1 must NOT transmit once Stop arrives after motor 0");
+
+        // (5) Watchdog park (`begin_torque_budgeted(false, 0)`) ignores pending client Stop and disables all motors.
         let sg2 = stops.current();
-        assert!(sg2 > sg && stops.pending());
+        assert!(sg2 > sg_wb && stops.pending());
         stops.mark_applied(sg2);
         drv.set_torque(false).unwrap();
         drv.set_torque(true).unwrap();
@@ -1689,21 +1711,23 @@ fn m3_client_park_first_disable_frame_rechecks_stop_at_driver_tx_gate() {
         assert_eq!(disable_tx.load(Ordering::SeqCst), 2);
     }
 
-    // 10b. End-to-end `SupervisorInner::begin_park_disable_transition`: client Stop fires inside the
-    //      driver lock AFTER supervisor's outer check passed and RIGHT BEFORE motor 0's `can.transmit`
-    //      -> zero disable frames transmitted, torque stays ON, !disable_pending, park cancelled STOPPED.
+    // 10b. End-to-end `SupervisorInner::begin_park_disable_transition` on Damiao:
+    //      motor 0 hits WouldBlock and fires client Stop right before motor 1 -> zero disable frames
+    //      transmitted, torque stays ON, !disable_pending, park cancelled STOPPED.
     {
         let clock = armd::transport::MockClock::new();
         let bus = FakeBus::with_clock(&limits, clock);
         let stops = StopRequests::default();
         let fire_rx = Arc::new(AtomicBool::new(false));
         let fire_tx = Arc::new(AtomicBool::new(false));
+        let wb_stop = Arc::new(AtomicBool::new(false));
         let disable_tx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let can = RaceStopCan {
             inner: bus.clone(),
-            nonblocking_rt: false, // exercises `begin_client_park_disable(None, ...)` RX drain right before motor 0 TX
-            fire_stop_on_receive: fire_rx.clone(),
+            nonblocking_rt: false,
+            fire_stop_on_receive: fire_rx,
             fire_stop_on_first_disable_tx: fire_tx,
+            would_block_and_stop_on_first_disable_tx: wb_stop.clone(),
             stops: stops.clone(),
             disable_tx_count: disable_tx.clone(),
         };
@@ -1721,23 +1745,254 @@ fn m3_client_park_first_disable_frame_rechecks_stop_at_driver_tx_gate() {
         let ep = inner.safety.epoch_id();
         req::install_park(&mut inner, stamp, &park.slot, None, Some(ep), false).unwrap();
 
-        // Advance until trajectory finishes and settle is one tick away from disable, then arm the
-        // pre-motor-0 client Stop race inside `can.receive()`!
-        for _ in 0..220 {
+        let mut armed = false;
+        for _ in 0..320 {
             bus.with(|s| s.push_all_feedback());
             inner.tick(0.01);
-            if inner.unload_settle.as_ref().is_some_and(|u| u.held_s >= 0.45) {
-                fire_rx.store(true, Ordering::SeqCst);
+            if !armed && inner.unload_settle.as_ref().is_some_and(|u| u.held_s >= 0.70) {
+                armed = true;
+                wb_stop.store(true, Ordering::SeqCst);
             }
             if !inner.pending_normal_unload {
                 break;
             }
         }
-        assert!(!fire_rx.load(Ordering::SeqCst), "pre-motor-0 Stop race must have fired during park disable");
-        assert_eq!(disable_tx.load(Ordering::SeqCst), 0, "zero disable frames transmitted on racing client Stop");
+        assert!(armed, "Damiao unload_settle must reach >= 0.70s");
+        assert!(!wb_stop.load(Ordering::SeqCst), "motor 0 WouldBlock + Stop race must have fired during park disable");
+        assert_eq!(disable_tx.load(Ordering::SeqCst), 0, "zero disable frames transmitted on motor 0 WouldBlock + Stop");
         assert!(inner.is_torqued && !inner.disable_pending, "torque must remain held and disable_pending false");
         assert_eq!(inner.last_action.as_ref().and_then(|a| a.code.as_deref()), Some("STOPPED"));
         assert_ne!(inner.safety.fault_code(), Some(FaultCode::DriverWriteFailed));
+    }
+
+    // 10c. SO-ARM101 / Feetech (`FeetechArmDriver`) per-servo Stop / stop_gen gate:
+    //      direct driver checks (pending Stop, stale stop_gen, WouldBlock on servo 1 + Stop before
+    //      servo 2, Stop after servo 1, watchdog fallback) + end-to-end `begin_park_disable_transition`.
+    {
+        struct RaceStopFeetechTransport {
+            clock: Arc<armd::transport::MockClock>,
+            rx: std::collections::VecDeque<u8>,
+            torque_enabled: [bool; 2],
+            disable_writes: Arc<std::sync::atomic::AtomicUsize>,
+            wb_and_stop_on_first_disable: Arc<AtomicBool>,
+            stop_after_first_disable: Arc<AtomicBool>,
+            stops: StopRequests,
+        }
+
+        impl RaceStopFeetechTransport {
+            fn feetech_resp(id: u8, params: &[u8]) -> Vec<u8> {
+                let len = (params.len() + 2) as u8;
+                let mut sum: u32 = u32::from(id) + u32::from(len);
+                for &b in params { sum += u32::from(b); }
+                let checksum = !(sum as u8);
+                let mut pkt = vec![0xFF, 0xFF, id, len, 0x00];
+                pkt.extend_from_slice(params);
+                pkt.push(checksum);
+                pkt
+            }
+        }
+
+        impl Transport for RaceStopFeetechTransport {
+            fn clock(&self) -> Option<Arc<dyn DriverClock>> { Some(self.clock.clone()) }
+            fn read(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
+                if self.rx.is_empty() {
+                    return Err(TransportError::WouldBlock);
+                }
+                let n = buf.len().min(self.rx.len());
+                for b in buf.iter_mut().take(n) {
+                    *b = self.rx.pop_front().unwrap();
+                }
+                Ok(n)
+            }
+            fn write(&mut self, buf: &[u8]) -> Result<usize, TransportError> {
+                // Feetech WRITE packet: [0xFF, 0xFF, id, 4, INST_WRITE(3), REG_TORQUE_ENABLE(40), val, csum]
+                if buf.len() >= 8
+                    && buf[0] == 0xFF
+                    && buf[1] == 0xFF
+                    && buf[4] == feetech::INST_WRITE
+                    && buf[5] == feetech::REG_TORQUE_ENABLE
+                {
+                    let id = buf[2];
+                    let val = buf[6];
+                    if val == 0 {
+                        if self.wb_and_stop_on_first_disable.swap(false, Ordering::SeqCst) {
+                            let _ = self.stops.request();
+                            return Err(TransportError::WouldBlock);
+                        }
+                        self.disable_writes.fetch_add(1, Ordering::SeqCst);
+                        if (1..=2).contains(&id) {
+                            self.torque_enabled[(id - 1) as usize] = false;
+                        }
+                        if self.stop_after_first_disable.swap(false, Ordering::SeqCst) {
+                            let _ = self.stops.request();
+                        }
+                    } else if (1..=2).contains(&id) {
+                        self.torque_enabled[(id - 1) as usize] = true;
+                    }
+                } else if buf.len() >= 8
+                    && buf[0] == 0xFF
+                    && buf[1] == 0xFF
+                    && buf[4] == feetech::INST_READ
+                    && buf[5] == feetech::REG_TORQUE_ENABLE
+                {
+                    let id = buf[2];
+                    let val = if (1..=2).contains(&id) && self.torque_enabled[(id - 1) as usize] { 1u8 } else { 0u8 };
+                    self.rx.extend(Self::feetech_resp(id, &[val]));
+                } else if buf.len() >= 8
+                    && buf[0] == 0xFF
+                    && buf[1] == 0xFF
+                    && buf[2] == feetech::BROADCAST_ID
+                    && buf[4] == feetech::INST_SYNC_READ
+                {
+                    let reg = buf[5];
+                    let data_len = buf[6];
+                    let ids = &buf[7..buf.len() - 1];
+                    for &id in ids {
+                        if reg == feetech::REG_TORQUE_ENABLE && data_len == 1 {
+                            let val = if (1..=2).contains(&id) && self.torque_enabled[(id - 1) as usize] { 1u8 } else { 0u8 };
+                            self.rx.extend(Self::feetech_resp(id, &[val]));
+                        } else if reg == feetech::REG_PRESENT_POSITION_L && data_len == 8 {
+                            // Neutral position (2048 steps = 0 rad), velocity 0, load 0, voltage 120, temp 25.
+                            let pos = 2048u16.to_le_bytes();
+                            self.rx.extend(Self::feetech_resp(id, &[pos[0], pos[1], 0, 0, 0, 0, 120, 25]));
+                        }
+                    }
+                }
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> Result<(), TransportError> { Ok(()) }
+            fn clear_input_buffer(&mut self) { self.rx.clear(); }
+        }
+
+        // Direct FeetechArmDriver checks
+        {
+            let clock = Arc::new(armd::transport::MockClock::new());
+            let stops = StopRequests::default();
+            let req_estop = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let app_estop = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let disable_writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let wb_stop = Arc::new(AtomicBool::new(false));
+            let stop_after = Arc::new(AtomicBool::new(false));
+            let transport = RaceStopFeetechTransport {
+                clock: clock.clone(),
+                rx: std::collections::VecDeque::new(),
+                torque_enabled: [false, false],
+                disable_writes: disable_writes.clone(),
+                wb_and_stop_on_first_disable: wb_stop.clone(),
+                stop_after_first_disable: stop_after.clone(),
+                stops: stops.clone(),
+            };
+            let mut drv = FeetechArmDriver::new(transport, vec![1, 2])
+                .with_calibrated(true)
+                .with_tx_echo(Some(false));
+            drv.set_estop_gate(EstopGate::new(req_estop, app_estop).with_stops(stops.clone()));
+            drv.read_joint_states().unwrap();
+            drv.set_torque(true).unwrap();
+            assert_eq!(drv.enable_state(), EnableState::Enabled);
+            assert_eq!(disable_writes.load(Ordering::SeqCst), 0);
+
+            // (1) Pending client Stop before servo 1 -> EstopInhibited, 0 writes, stays Enabled.
+            let sg1 = stops.request();
+            let err1 = drv.begin_client_park_disable(None, Some(0)).unwrap_err();
+            assert!(armd::driver::is_estop_inhibited(&err1), "expected EstopInhibited, got {err1:?}");
+            assert_eq!(disable_writes.load(Ordering::SeqCst), 0);
+            assert_eq!(drv.enable_state(), EnableState::Enabled);
+
+            // (2) Applied Stop with stale expected_stop_gen -> EstopInhibited, 0 writes.
+            stops.mark_applied(sg1);
+            let err2 = drv.begin_client_park_disable(None, Some(0)).unwrap_err();
+            assert!(armd::driver::is_estop_inhibited(&err2), "stale stop_gen must be refused: {err2:?}");
+            assert_eq!(disable_writes.load(Ordering::SeqCst), 0);
+            assert_eq!(drv.enable_state(), EnableState::Enabled);
+
+            // (3) WouldBlock on servo 1 followed by Stop before servo 2 -> EstopInhibited, 0 writes!
+            wb_stop.store(true, Ordering::SeqCst);
+            let err3 = drv.begin_client_park_disable(None, Some(sg1)).unwrap_err();
+            assert!(armd::driver::is_estop_inhibited(&err3), "WouldBlock + Stop before servo 2 must return EstopInhibited, got {err3:?}");
+            assert_eq!(disable_writes.load(Ordering::SeqCst), 0, "servo 2 disable must NOT write after servo 1 WouldBlock + Stop");
+            assert_eq!(drv.enable_state(), EnableState::Enabled);
+
+            // (4) Servo 1 succeeds, then Stop arrives before servo 2 -> servo 2 MUST NOT write!
+            let sg2 = stops.current();
+            assert!(sg2 > sg1 && stops.pending());
+            stops.mark_applied(sg2);
+            stop_after.store(true, Ordering::SeqCst);
+            let err4 = drv.begin_client_park_disable(None, Some(sg2)).unwrap_err();
+            assert!(!armd::driver::is_estop_inhibited(&err4), "partial servo disable must report error: {err4:?}");
+            assert_eq!(disable_writes.load(Ordering::SeqCst), 1, "servo 2 must NOT be disabled after Stop arrives mid-batch");
+
+            // (5) Safety/watchdog `set_torque(false)` ignores pending client Stop and disables all servos.
+            let sg3 = stops.current();
+            assert!(sg3 > sg2 && stops.pending());
+            stops.mark_applied(sg3);
+            drv.set_torque(false).unwrap();
+            drv.read_joint_states().unwrap();
+            drv.set_torque(true).unwrap();
+            let _ = stops.request();
+            assert!(stops.pending());
+            disable_writes.store(0, Ordering::SeqCst);
+            drv.set_torque(false).expect("watchdog/safety disable must ignore client Stop");
+            assert_eq!(disable_writes.load(Ordering::SeqCst), 2);
+            assert_eq!(drv.enable_state(), EnableState::Disabled);
+        }
+
+        // End-to-end `SupervisorInner::begin_park_disable_transition` on FeetechArmDriver:
+        // servo 1 WouldBlock + Stop before servo 2 -> 0 writes, torque stays ON, park cancelled STOPPED.
+        {
+            let clock = Arc::new(armd::transport::MockClock::new());
+            let stops = StopRequests::default();
+            let disable_writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let wb_stop = Arc::new(AtomicBool::new(false));
+            let stop_after = Arc::new(AtomicBool::new(false));
+            let transport = RaceStopFeetechTransport {
+                clock: clock.clone(),
+                rx: std::collections::VecDeque::new(),
+                torque_enabled: [false, false],
+                disable_writes: disable_writes.clone(),
+                wb_and_stop_on_first_disable: wb_stop.clone(),
+                stop_after_first_disable: stop_after,
+                stops: stops.clone(),
+            };
+            let drv = FeetechArmDriver::new(transport, vec![1, 2])
+                .with_calibrated(true)
+                .with_tx_echo(Some(false));
+            let mut cfg = parkable_2dof_config();
+            if let Some(rp) = cfg.resting_pose.as_mut() {
+                rp.support_torque_limits.clear();
+                rp.support_load_limits = vec![(0, 1.0)];
+            }
+            let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
+            inner.attach_stop_requests(stops.clone());
+            inner.tick(0.01);
+            let stamp = inner.current_admission_stamp();
+            SupervisorInner::enable_torque(inner.check_admission(stamp).unwrap()).unwrap();
+            inner.tick(0.01);
+
+            let snap = MotionPlanSnapshot::from_supervisor(&inner);
+            let park = req::prepare_motion(&snap, &MotionRequest::park()).unwrap();
+            let stamp = inner.current_admission_stamp();
+            let ep = inner.safety.epoch_id();
+            req::install_park(&mut inner, stamp, &park.slot, None, Some(ep), false).unwrap();
+
+            let mut armed = false;
+            for _ in 0..320 {
+                clock.advance(Duration::from_millis(10));
+                inner.tick(0.01);
+                if !armed && inner.unload_settle.as_ref().is_some_and(|u| u.held_s >= 0.70) {
+                    armed = true;
+                    wb_stop.store(true, Ordering::SeqCst);
+                }
+                if !inner.pending_normal_unload {
+                    break;
+                }
+            }
+            assert!(armed, "Feetech unload_settle must reach >= 0.70s");
+            assert!(!wb_stop.load(Ordering::SeqCst), "Feetech servo 1 WouldBlock + Stop race must have fired");
+            assert_eq!(disable_writes.load(Ordering::SeqCst), 0, "zero Feetech disable writes on servo 1 WouldBlock + Stop");
+            assert!(inner.is_torqued && !inner.disable_pending, "Feetech torque must stay held");
+            assert_eq!(inner.last_action.as_ref().and_then(|a| a.code.as_deref()), Some("STOPPED"));
+            assert_ne!(inner.safety.fault_code(), Some(FaultCode::DriverWriteFailed));
+        }
     }
 }
 

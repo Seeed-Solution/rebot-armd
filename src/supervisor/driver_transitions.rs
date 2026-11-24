@@ -1803,9 +1803,9 @@ impl SupervisorInner {
         let stop_before_write = Arc::clone(&self.e_stop_latched);
         let expected_stop_gen = self.stop_requests.as_ref().map(|s| s.applied());
         let started = d.lock().ok().map(|mut drv| {
-            // Linearize client Stop and hardware E-stop against the first disable transmit
-            // both inside the driver lock AND inside `DamiaoArmDriver::send(TxKind::ClientParkFirstDisable)`
-            // immediately before motor 0's `can.transmit`.
+            // Linearize client Stop and hardware E-stop against EVERY motor's disable transmit
+            // both inside the driver lock AND inside the driver's per-motor gate
+            // (`DamiaoArmDriver::send(TxKind::ClientParkDisable)` / `FeetechArmDriver::disable_torque_inner`).
             if !watchdog && self.urgent_stop_unapplied() {
                 return None;
             }
@@ -1826,9 +1826,10 @@ impl SupervisorInner {
                 && !stop_before_write.load(Ordering::SeqCst)
                 && !self.estop_pending()
                 && !self.safety.state().is_stopped()
-                && self.urgent_stop_unapplied()
+                && (self.urgent_stop_unapplied()
+                    || expected_stop_gen.is_some_and(|g| self.current_stop_gen() != g))
             {
-                // Driver stop-gated motor 0's first disable frame for a racing client Stop:
+                // Driver stop-gated client park before any disable frame reached the wire:
                 // zero disable frames were transmitted, so cancel cleanly and hold torque.
                 return None;
             }
