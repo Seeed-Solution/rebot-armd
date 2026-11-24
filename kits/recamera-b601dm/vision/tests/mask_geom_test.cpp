@@ -358,19 +358,61 @@ static void test_contour_trace() {
     m[3 * w] = 1;
     m[4 * w] = 1;
     m[4 * w + 5] = 255;
-    Contour c = mask_exterior_contour(m.data(), w, h, w);
-    const Contour want = {{0, 0}, {3, 0}, {3, 3}, {1, 3}, {1, 5}, {0, 5}};
+    Contour c = mask_exterior_contour(m.data(), w, h, w, kMaxContourVertices, 0.01f);
+    // without logits: the midpoints of the boundary cell edges (corners cut by half a cell)
+    const Contour want = {{0.5f, 0}, {2.5f, 0}, {3, 0.5f}, {3, 2.5f}, {2.5f, 3}, {1.5f, 3}, {1, 3.5f}, {1, 4.5f},
+                          {0.5f, 5}, {0, 4.5f}, {0, 0.5f}};
     CHECK(c == want);
+    if (!(c == want)) for (auto& p : c) std::printf("  (%g, %g)\n", p[0], p[1]);
     // stride larger than the width
     std::vector<uint8_t> padded(w * 2 * h, 7);
     for (int y = 0; y < h; ++y)
         for (int x = 0; x < w; ++x) padded[y * w * 2 + x] = m[y * w + x];
-    CHECK(mask_exterior_contour(padded.data(), w, h, w * 2) == want);
+    CHECK(mask_exterior_contour(padded.data(), w, h, w * 2, kMaxContourVertices, 0.01f) == want);
     // absent masks
     std::vector<uint8_t> empty(16, 0);
     CHECK(mask_exterior_contour(empty.data(), 4, 4, 4).empty());
     CHECK(mask_exterior_contour(nullptr, 4, 4, 4).empty());
     CHECK(mask_exterior_contour(empty.data(), 0, 4, 4).empty());
+}
+
+static void test_contour_logits() {
+    // a straight edge: logit = 10.3 - x at cell centres x + 0.5 -> the 0.5 level at x = 10.3,
+    // where the binary cells alone put the edge at 10 or 11
+    const int w = 20, h = 8;
+    std::vector<float> lg(w * h);
+    std::vector<uint8_t> m(w * h);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            lg[y * w + x] = 10.3f - (x + 0.5f);
+            m[y * w + x] = lg[y * w + x] > 0;
+        }
+    Contour c = mask_exterior_contour(m.data(), w, h, w, kMaxContourVertices, 0.7f, lg.data(), w);
+    float xmax = 0;
+    for (const auto& p : c) xmax = std::max(xmax, p[0]);
+    CHECK(std::abs(xmax - 10.3f) < 1e-4f);
+    Contour cb = mask_exterior_contour(m.data(), w, h, w);
+    float xb = 0;
+    for (const auto& p : cb) xb = std::max(xb, p[0]);
+    CHECK(xb == 10.0f);
+    // a disk of radius 20.3 cells (logit = signed distance): area and extent of the 0.5 level
+    const int n = 50;
+    std::vector<float> dl(n * n);
+    std::vector<uint8_t> dm(n * n);
+    for (int y = 0; y < n; ++y)
+        for (int x = 0; x < n; ++x) {
+            const float r = std::hypot(x + 0.5f - 25.0f, y + 0.5f - 25.0f);
+            dl[y * n + x] = 20.3f - r;
+            dm[y * n + x] = dl[y * n + x] > 0;
+        }
+    Contour d = mask_exterior_contour(dm.data(), n, n, n, 1000, 0.05f, dl.data(), n);
+    float x0 = 1e9f, x1 = -1e9f;
+    for (const auto& p : d) {
+        x0 = std::min(x0, p[0]);
+        x1 = std::max(x1, p[0]);
+    }
+    CHECK(std::abs((x1 - x0) - 40.6f) < 0.1f);
+    CHECK(std::abs(contour_area(d) - M_PI * 20.3 * 20.3) < 0.01 * M_PI * 20.3 * 20.3);
 }
 
 static void test_contour_bounded() {
@@ -413,7 +455,7 @@ static void test_contour_comb_and_worst_case() {
     CHECK(c.size() >= 3 && c.size() <= static_cast<size_t>(kMaxContourVertices));
     float x0, y0, x1, y1;
     bbox(c, x0, y0, x1, y1);
-    CHECK(x0 == 0 && y0 == 0 && x1 >= 158 && y1 >= 14);
+    CHECK(x0 <= 0.5f && y0 <= 0.5f && x1 >= 158 && y1 >= 14);
     CHECK(contour_area(c) > 0.3 * w * 3);
     // worst case on a 160 x 160 crop: a comb with 1-cell teeth on both sides of every other row
     // (tens of thousands of boundary corners); bounded time
@@ -430,9 +472,13 @@ static void test_contour_comb_and_worst_case() {
     CHECK(ms < 20.0);
     // degenerate shapes keep at least 3 vertices: one cell, a 1-cell line
     std::vector<uint8_t> one(1, 1);
-    CHECK(mask_exterior_contour(one.data(), 1, 1, 1).size() == 4);
+    const size_t n1 = mask_exterior_contour(one.data(), 1, 1, 1).size();
+    CHECK(n1 >= 3 && n1 <= 4);
     std::vector<uint8_t> line(200, 1);
-    CHECK(mask_exterior_contour(line.data(), 200, 1, 200).size() == 4);
+    Contour ln = mask_exterior_contour(line.data(), 200, 1, 200);
+    float lx0, ly0, lx1, ly1;
+    bbox(ln, lx0, ly0, lx1, ly1);
+    CHECK(ln.size() >= 3 && ln.size() <= 6 && lx1 - lx0 >= 199);
 }
 
 static void test_contour_mapping() {
@@ -470,6 +516,7 @@ static void test_contour_mapping() {
 int main() {
     std::printf("Running mask_geom tests...\n");
     test_contour_trace();
+    test_contour_logits();
     test_contour_bounded();
     test_contour_comb_and_worst_case();
     test_contour_mapping();

@@ -256,3 +256,40 @@ fn default_timeout_covers_a_full_stroke() {
     let a = run(&mut inner, id, 5.0);
     assert_eq!((a.state.as_str(), a.code.as_deref()), ("failed", Some("GRIPPER_TIMEOUT")), "{a:?}");
 }
+
+
+/// The deadline covers the squeeze: a grasp whose squeeze would end after timeout_s fails
+/// GRIPPER_TIMEOUT at the deadline; J7 then holds the measured jaw.
+#[test]
+fn deadline_covers_the_squeeze() {
+    // contact at -2.0 after about 3.4 s from -5.0 at 1 rad/s: find when the squeeze starts
+    let (mut inner, _rig) = rig(-5.0, Some(-2.0), false);
+    let epoch = inner.safety.epoch_id();
+    let (id, _) = inner.start_gripper(request(GripperCommand::Close, None, true, 8.0), epoch).unwrap();
+    let mut done_at = 0.0;
+    for k in 0..400 {
+        inner.tick(DT);
+        if !inner.last_action.as_ref().unwrap().is_running() { done_at = (k + 1) as f64 * DT; break; }
+    }
+    assert!(done_at > 1.0, "{done_at}");
+    // the same grasp with a deadline 0.1 s before it would have finished (inside the squeeze)
+    let (mut inner, _rig) = rig(-5.0, Some(-2.0), false);
+    let epoch = inner.safety.epoch_id();
+    let timeout = done_at - 0.1;
+    let (id2, _) = inner.start_gripper(request(GripperCommand::Close, None, true, timeout), epoch).unwrap();
+    let mut t = 0.0;
+    let a = loop {
+        inner.tick(DT);
+        t += DT;
+        let a = inner.last_action.clone().unwrap();
+        if !a.is_running() { break a; }
+        assert!(t < done_at + 1.0);
+    };
+    eprintln!("full grasp done after {done_at:.2} s; with timeout {timeout:.2} s: {} {:?} after {t:.2} s, J7 command {:.3}", a.state, a.code, inner.commanded_positions[6]);
+    assert_eq!((a.id, a.state.as_str(), a.code.as_deref()), (id2, "failed", Some("GRIPPER_TIMEOUT")), "{a:?}");
+    assert!(t <= timeout + 2.0 * DT + 1e-9, "{t} > {timeout}");
+    // an action that ends without finishing holds the measured jaw (no further compression)
+    inner.tick(DT);
+    assert!((inner.commanded_positions[6] - inner.measured_positions[6]).abs() < 1e-3, "J7 command {} vs jaw {}", inner.commanded_positions[6], inner.measured_positions[6]);
+    let _ = id;
+}

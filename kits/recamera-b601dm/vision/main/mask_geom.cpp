@@ -486,14 +486,28 @@ Contour simplify_closed(const Contour& in, double eps, int max_vertices) {
     Contour out;
     for (size_t k = 0; k < poly.size(); ++k)
         if (keep[k]) out.push_back(poly[k]);
-    // a pass that dropped below 3 (a degenerate chain) keeps the input instead
-    if (out.size() < 3) out = poly;
+    // a thin outline can lose all but its two extremes: add the vertex farthest from their chord
+    if (out.size() < 3) {
+        size_t bi = 0;
+        double bd = -1;
+        for (size_t k = 0; k < poly.size(); ++k) {
+            const double dd = seg_dist(poly[k], poly[0], poly[far]);
+            if (k != 0 && k != far && dd > bd) {
+                bd = dd;
+                bi = k;
+            }
+        }
+        out.clear();
+        for (size_t k = 0; k < poly.size(); ++k)
+            if (k == 0 || k == far || k == bi) out.push_back(poly[k]);
+    }
     return subsample(out, cap);
 }
 
 }  // namespace
 
-Contour mask_exterior_contour(const uint8_t* m, int w, int h, int stride, int max_vertices, float eps_cells) {
+Contour mask_exterior_contour(const uint8_t* m, int w, int h, int stride, int max_vertices, float eps_cells,
+                              const float* logits, int logit_stride) {
     Contour out;
     if (m == nullptr || w <= 0 || h <= 0 || stride < w) return out;
     // label the 4-connected components; keep the largest
@@ -541,37 +555,39 @@ Contour mask_exterior_contour(const uint8_t* m, int w, int h, int stride, int ma
     }
     // crack following, the component on the right: 0 right, 1 down, 2 left, 3 up (y down)
     static const int D[4][2] = {{1, 0}, {0, 1}, {-1, 0}, {0, -1}};
+    // cells (FL outside, FR inside) on either side of a step along direction d from vertex (x, y)
+    static const int FL[4][2] = {{0, -1}, {0, 0}, {-1, 0}, {-1, -1}};
+    static const int FR[4][2] = {{0, 0}, {-1, 0}, {-1, -1}, {0, -1}};
+    const int ls = logit_stride > 0 ? logit_stride : w;
+    auto logit = [&](int cx, int cy, float& v) {
+        if (logits == nullptr || cx < 0 || cy < 0 || cx >= w || cy >= h) return false;
+        v = logits[static_cast<size_t>(cy) * ls + cx];
+        return std::isfinite(v);
+    };
     int x = sx, y = sy, d = 0;
     Contour raw;
     const size_t limit = 4 * (static_cast<size_t>(w) + 1) * (h + 1) + 8;
     for (size_t it = 0; it < limit; ++it) {
-        bool fl, fr;
-        switch (d) {
-            case 0: fl = at(x, y - 1); fr = at(x, y); break;
-            case 1: fl = at(x, y); fr = at(x - 1, y); break;
-            case 2: fl = at(x - 1, y); fr = at(x - 1, y - 1); break;
-            default: fl = at(x - 1, y - 1); fr = at(x, y - 1); break;
-        }
+        const bool fl = at(x + FL[d][0], y + FL[d][1]);
+        const bool fr = at(x + FR[d][0], y + FR[d][1]);
         const int nd = !fr ? (d + 1) % 4 : (fl ? (d + 3) % 4 : d);
-        if (nd != d) raw.push_back({static_cast<float>(x), static_cast<float>(y)});
         d = nd;
         if (!fr || fl) {
             if (x == sx && y == sy && d == 0 && !raw.empty()) break;
             continue;
         }
+        // one boundary step between an inside and an outside cell: the vertex on the line
+        // between their centres where the mask crosses 0.5 (logit 0), linearly interpolated;
+        // halfway (the cell edge's midpoint) without logits or outside the crop
+        const int ix = x + FR[d][0], iy = y + FR[d][1], ox = x + FL[d][0], oy = y + FL[d][1];
+        float t = 0.5f, a = 0, b = 0;
+        if (logit(ix, iy, a) && logit(ox, oy, b) && a > 0 && b <= 0) t = a / (a - b);
+        raw.push_back({static_cast<float>(ix) + 0.5f + t * static_cast<float>(ox - ix),
+                       static_cast<float>(iy) + 0.5f + t * static_cast<float>(oy - iy)});
         x += D[d][0];
         y += D[d][1];
         if (x == sx && y == sy && d == 0) break;
     }
-    // start at the top-left corner of the first cell; drop a repeated closing vertex
-    for (size_t k = 0; k < raw.size(); ++k) {
-        if (raw[k][0] == static_cast<float>(sx) && raw[k][1] == static_cast<float>(sy)) {
-            std::rotate(raw.begin(), raw.begin() + static_cast<long>(k), raw.end());
-            break;
-        }
-    }
-    raw.erase(std::unique(raw.begin(), raw.end()), raw.end());
-    if (raw.size() > 1 && raw.front() == raw.back()) raw.pop_back();
     return simplify_closed(raw, eps_cells, max_vertices);
 }
 

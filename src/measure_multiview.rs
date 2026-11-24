@@ -733,9 +733,22 @@ async fn settle(ctx: &MacroCtx, plan: &Plan, min_s: f64) -> Result<f64, Stop> {
     // enters the window only when every arm joint has new feedback since the previous one, so the
     // window holds STILL_WINDOW distinct samples, never re-reads of a cached one
     let mut last_seqs: Option<Vec<u64>> = None;
+    // per arm joint: the sequence counter at the start of the still rule and the largest feedback
+    // age seen (for the failure's diagnostics)
+    let t_rule = Instant::now();
+    let mut first_seqs: Option<Vec<u64>> = None;
+    let mut cur_seqs: Vec<u64> = Vec::new();
+    let mut max_age_ms: Vec<f64> = vec![0.0; arm.len()];
     loop {
         ctx.check().await?;
-        let (pos, vel, _, seqs) = ctx.sup.arm_feedback_snapshot(&arm).await;
+        let (pos, vel, instants, seqs) = ctx.sup.arm_feedback_snapshot(&arm).await;
+        let now = Instant::now();
+        for (m, t) in max_age_ms.iter_mut().zip(&instants) {
+            let age = t.map_or(f64::INFINITY, |t| now.saturating_duration_since(t).as_secs_f64() * 1000.0);
+            *m = m.max(age);
+        }
+        if first_seqs.is_none() { first_seqs = Some(seqs.clone()); }
+        cur_seqs.clone_from(&seqs);
         if last_seqs.as_deref().is_some_and(|prev| feedback_advanced(prev, &seqs)) {
             win.push_back((pos, vel));
             if win.len() > STILL_WINDOW { win.pop_front(); }
@@ -743,7 +756,26 @@ async fn settle(ctx: &MacroCtx, plan: &Plan, min_s: f64) -> Result<f64, Stop> {
         if last_seqs.as_deref().is_none_or(|prev| feedback_advanced(prev, &seqs)) { last_seqs = Some(seqs); }
         if win.len() == STILL_WINDOW && is_still(&win, &arm) { return Ok(t0.elapsed().as_secs_f64()); }
         if t0.elapsed().as_secs_f64() > max_s {
-            return Err(fail("NOT_SETTLED", format!("the arm did not come to rest within {max_s} s (median |velocity| <= {STILL_VEL} rad/s and range <= {STILL_RANGE_RAD} rad over {STILL_WINDOW} samples with new feedback; {} taken)", win.len())));
+            let span_s = t_rule.elapsed().as_secs_f64();
+            let first = first_seqs.clone().unwrap_or_default();
+            let joints: Vec<Value> = arm.iter().enumerate().map(|(k, &j)| {
+                let n = cur_seqs.get(k).zip(first.get(k)).map_or(0, |(c, f)| c.wrapping_sub(*f));
+                json!({"joint": j + 1, "updates": n, "rate_hz": (n as f64 / span_s.max(1e-3) * 10.0).round() / 10.0,
+                    "max_age_ms": if max_age_ms[k].is_finite() { json!(max_age_ms[k].round()) } else { Value::Null }})
+            }).collect();
+            let summary: Vec<String> = joints.iter().map(|v| format!("J{} {} ({} Hz, max age {} ms)", v["joint"], v["updates"], v["rate_hz"], v["max_age_ms"])).collect();
+            // the window never filled: too few samples with new feedback on every arm joint to
+            // judge rest (a stalled or slow joint), not an arm seen moving
+            let code = if win.len() < STILL_WINDOW { "FEEDBACK_SLOW" } else { "NOT_SETTLED" };
+            let raw = json!({"code": code, "max_settle_s": max_s, "rule_s": (span_s * 100.0).round() / 100.0, "window_samples": win.len(),
+                "window_needed": STILL_WINDOW, "joints": joints});
+            ctx.sup.inner().write().await.update_action(ctx.id, |a| a.measurement = Some(json!({"why": code, "settle": raw})));
+            let msg = if code == "FEEDBACK_SLOW" {
+                format!("arm joint feedback too slow to judge rest within {max_s} s: {} of {STILL_WINDOW} samples with new feedback on every arm joint; feedback updates per joint over {span_s:.2} s: {}", win.len(), summary.join(", "))
+            } else {
+                format!("the arm did not come to rest within {max_s} s (median |velocity| <= {STILL_VEL} rad/s and range <= {STILL_RANGE_RAD} rad over {STILL_WINDOW} samples with new feedback; {} taken); feedback updates per joint over {span_s:.2} s: {}", win.len(), summary.join(", "))
+            };
+            return Err(fail(code, msg));
         }
         tokio::time::sleep(STILL_SAMPLE).await;
     }
@@ -1578,6 +1610,8 @@ pub fn footprint_value(sils: &[ViewSilhouette], fp: &Option<Result<mview_stereo:
             "view_spans_mm": f.view_spans_m.iter().map(|s| [r1(s[0] * 1000.0), r1(s[1] * 1000.0)]).collect::<Vec<_>>(),
             "height_sensitivity_mm": f.height_sensitivity_m.map(|x| if x.is_finite() { json!(r1(x * 1000.0)) } else { Value::Null }),
             "max_ray_angle_deg": r1(f.max_ray_angle_deg),
+            "view_shifts_mm": f.view_shifts_m.iter().map(|s| [r1(s[0] * 1000.0), r1(s[1] * 1000.0)]).collect::<Vec<_>>(),
+            "chord_length_mm": r1(f.chord_length_m * 1000.0), "chord_width_mm": r1(f.chord_width_m * 1000.0),
             "rejected": f.rejected.iter().map(|(v, r)| json!({"view": v, "reason": r})).collect::<Vec<_>>(),
         }), Value::Null),
         Some(Err(e)) => (Value::Null, json!(e)),
@@ -1701,7 +1735,7 @@ pub fn plane_value(plane: &Option<mview_stereo::TablePlane>) -> Value {
     let r2 = |x: f64| (x * 100.0).round() / 100.0;
     plane.as_ref().map_or(Value::Null, |t| json!({
         "n_points": t.n_points, "n_inliers": t.n_inliers, "offset_mm": r2(t.offset_mm), "tilt_deg": r2(t.tilt_deg),
-        "mad_mm": r2(t.mad_mm), "threshold_mm": r2(t.threshold_mm),
+        "mad_mm": r2(t.mad_mm), "threshold_mm": r2(t.threshold_mm), "mode": t.mode, "max_gap_deg": r2(t.max_gap_deg),
     }))
 }
 
