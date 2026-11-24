@@ -191,7 +191,16 @@ impl PublishedConfig {
             gravity_comp_supported: inner.gravity_comp_support().is_ok(),
             torque_guard_thresholds: inner.torque_guard_thresholds(),
             effective_planned_close_speed: inner.effective_planned_close_speed(),
-            policy_live_allowed: inner.policy_live_allowed(),
+            policy_live_allowed: {
+                #[cfg(feature = "policy-runtime")]
+                {
+                    inner.policy_live_allowed()
+                }
+                #[cfg(not(feature = "policy-runtime"))]
+                {
+                    false
+                }
+            },
             fallback_measured_positions: inner.measured_positions.clone(),
         }
     }

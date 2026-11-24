@@ -730,6 +730,77 @@ mod runtime {
             Ok(d1 + d2 + crate::motion::SETTLE_MAX_S)
         }
 
+        /// Installs an off-thread-resolved Cartesian path + optional pre-validated second-leg
+        /// same-side quintic segment without re-planning under the owner lock.
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn install_resolved_path(
+            admitted: crate::supervisor::Admitted<'_>,
+            input: &crate::motion::PlanInput,
+            path: JointPath,
+            approach_seg: Option<(MultiJointQuinticTrajectory, Vec<f32>, Option<f64>)>,
+            outcome: Option<&Outcome>,
+            kind: &str,
+            tag: Option<String>,
+        ) -> Result<(u64, f64), ArmError> {
+            let (this, proof) = admitted.consume()?;
+            let (id, d1) = this.install_path_inner(&proof, input, path, kind, tag)?;
+            let total = if let Some((seg, target, seg_scale)) = approach_seg {
+                let d2 = seg.duration;
+                if let Some(active) = this.active_trajectory.take() {
+                    let mut wrapped = ActiveTrajectory::with_approach(active.action_id, active.reference, seg);
+                    wrapped.motion_limits = active.motion_limits;
+                    this.active_trajectory = Some(wrapped);
+                }
+                this.target_positions = target;
+                if let Some(s) = seg_scale {
+                    this.note_action_power_scale(id, s);
+                }
+                if let Some(a) = this.last_action.as_mut().filter(|a| a.id == id) {
+                    a.phase = Some("move".into());
+                }
+                d1 + d2
+            } else {
+                d1
+            };
+            if let Some(o) = outcome {
+                this.record_approach(id, o);
+            }
+            Ok((id, total))
+        }
+
+        /// Installs an off-thread-resolved macro Cartesian child + optional pre-validated
+        /// second-leg same-side quintic segment without re-planning under the owner lock.
+        pub(crate) fn install_resolved_macro_path(
+            admitted: crate::supervisor::Admitted<'_>,
+            id: u64,
+            input: &crate::motion::PlanInput,
+            path: JointPath,
+            approach_seg: Option<(MultiJointQuinticTrajectory, Vec<f32>, Option<f64>)>,
+            outcome: Option<&Outcome>,
+        ) -> Result<f64, ArmError> {
+            let (this, proof) = admitted.consume()?;
+            let d1 = this.install_macro_path_inner(&proof, id, input, path)?;
+            let total = if let Some((seg, target, seg_scale)) = approach_seg {
+                let d2 = seg.duration;
+                if let Some(active) = this.active_trajectory.take() {
+                    let mut wrapped = ActiveTrajectory::with_approach(active.action_id, active.reference, seg);
+                    wrapped.motion_limits = active.motion_limits;
+                    this.active_trajectory = Some(wrapped);
+                }
+                this.target_positions = target;
+                if let Some(s) = seg_scale {
+                    this.note_action_power_scale(id, s);
+                }
+                d1 + d2 + crate::motion::SETTLE_MAX_S
+            } else {
+                d1
+            };
+            if let Some(o) = outcome {
+                this.record_approach(id, o);
+            }
+            Ok(total)
+        }
+
         /// Expected extra duration (s) of the short segment for motion `use_` (0 when the
         /// approach does not apply); for the ack of grasp / place.
         pub fn approach_estimate_s(&self, use_: &str, request: Request) -> f64 {

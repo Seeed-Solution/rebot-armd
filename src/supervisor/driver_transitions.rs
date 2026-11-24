@@ -1211,7 +1211,7 @@ impl SupervisorInner {
             && (self.gravity_comp.is_some()
                 || self.mit_active()
                 || self.mit.revoke_pending
-                || !crate::mit::mit_joints(&self.config).is_empty())
+                || crate::mit::mit_joint_mask(&self.config) != 0)
         {
             return Err(SafetyError::ClearFaultRejected(
                 "UNSUPPORTED: MIT mode qualification/handover and gravity compensation are not supported under synchronous RT executor step 1".into(),
