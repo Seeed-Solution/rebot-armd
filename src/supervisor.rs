@@ -1242,6 +1242,28 @@ impl SupervisorInner {
         obs
     }
 
+    /// Pre-warms RT-owned scratch/history buffers and empty triple-buffer observation slots for
+    /// the RT executor before the first release runs (nonblocking under reader contention; leaves
+    /// `published_seq` unchanged).
+    pub(crate) fn prewarm_observation_slots(&mut self) {
+        let dof = self.config.dof;
+        let arm_dof = self.config.arm_dof();
+        self.still_anchor_positions.reserve(dof);
+        self.table_still_anchor_positions.reserve(dof);
+        self.table_still_first_rx_instants.reserve(dof);
+        self.table_still_last_rx_instants.reserve(dof);
+        self.joint_feedback_queue_bounds.reserve(dof);
+        self.motor_errors.reserve(dof);
+        self.gravity_torques.reserve(arm_dof);
+        let tmpl = self.current_observation();
+        self.core.try_prewarm_observations(|| {
+            let mut obs = tmpl.clone();
+            obs.gravity_torques.reserve(arm_dof);
+            obs.motor_errors.reserve(dof);
+            obs
+        });
+    }
+
     /// [`Self::current_observation`] at `timestamp` written into `out`, reusing its memory: the
     /// control tick fills its published sample this way, without allocating while no value
     /// changes its shape (armd 1.6 RT core). Every field is overwritten.
@@ -1354,10 +1376,11 @@ impl SupervisorInner {
         })
     }
 
-    fn resting_policy(&self) -> Option<RestingPosePolicy> {
+    fn resting_policy(&self) -> Option<&RestingPosePolicy> {
+        static DEFAULT_REBOT_DM: std::sync::OnceLock<RestingPosePolicy> = std::sync::OnceLock::new();
         match &self.config.resting_pose {
-            Some(policy) => Some(policy.clone()),
-            None if self.driver.is_none() => Some(RestingPosePolicy::rebot_dm()),
+            Some(policy) => Some(policy),
+            None if self.driver.is_none() => Some(DEFAULT_REBOT_DM.get_or_init(RestingPosePolicy::rebot_dm)),
             None => None,
         }
     }

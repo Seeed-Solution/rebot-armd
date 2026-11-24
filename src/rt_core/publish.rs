@@ -195,6 +195,47 @@ impl StatePublisher {
     /// `ArmCore::take_observation_buffer`).
     pub fn take_back_observation(&mut self) -> Option<ArmObservation> { self.producer.back_mut().obs.take() }
 
+    /// Pre-populates empty triple-buffer observation slots off the release loop without blocking
+    /// on a contended reader. Leaves `meta` and `published_seq` untouched.
+    ///
+    /// - If `hub.state` is uncontended (`try_lock`), warms all 3 slots directly.
+    /// - If a reader holds `hub.state`, warms the producer's writable slot(s) without waiting
+    ///   (both `back` and `middle` when nothing has been published yet via `swap_unfresh`) and
+    ///   stores a template in `hub.prewarm_template` so `StateHub::refresh` warms `front`
+    ///   off-thread before rotating it back to the producer.
+    pub fn try_prewarm_observations(&mut self, mut make: impl FnMut() -> ArmObservation) {
+        let _ = self.hub.prewarm_template.set(make());
+        match self.hub.state.try_lock() {
+            Ok(mut st) => {
+                self.producer.for_each_slot_mut(&mut st.consumer, |slot| {
+                    if slot.obs.is_none() {
+                        slot.obs = Some(make());
+                    }
+                });
+            }
+            Err(std::sync::TryLockError::Poisoned(p)) => {
+                let mut st = p.into_inner();
+                self.producer.for_each_slot_mut(&mut st.consumer, |slot| {
+                    if slot.obs.is_none() {
+                        slot.obs = Some(make());
+                    }
+                });
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let back = self.producer.back_mut();
+                if back.obs.is_none() {
+                    back.obs = Some(make());
+                }
+                if self.producer.swap_unfresh() {
+                    let other = self.producer.back_mut();
+                    if other.obs.is_none() {
+                        other.obs = Some(make());
+                    }
+                }
+            }
+        }
+    }
+
     /// Puts `obs` into the back slot when it is empty (else back to the retire ring; never
     /// freed here when that ring has room). `ArmCore::publish`'s fallback for a displaced
     /// observation, which its encapsulation makes unreachable.
@@ -232,6 +273,9 @@ pub struct StateHub {
     retire: RetireRing,
     /// Displaced observations the tick had to free itself (retire ring full).
     tick_frees: AtomicU64,
+    /// Pre-sized observation template recorded at executor startup so a contended reader warms
+    /// its own `front` slot off-thread before handing it back to the RT producer.
+    prewarm_template: OnceLock<ArmObservation>,
 }
 
 /// A publisher for an arm with `dof` joints and its hub.
@@ -246,6 +290,7 @@ pub fn state_channel(dof: usize) -> (StatePublisher, Arc<StateHub>) {
         record: OnceLock::new(),
         retire: RetireRing::new(),
         tick_frees: AtomicU64::new(0),
+        prewarm_template: OnceLock::new(),
     });
     (StatePublisher { producer, seq: 0, retire_head: 0, hub: hub.clone() }, hub)
 }
@@ -268,6 +313,15 @@ impl StateHub {
     fn refresh(&self, st: &mut HubState) -> Option<Arc<Snapshot>> {
         self.retire.free_all();
         super::ops::stop_diag().drain_and_log_once();
+        if st.consumer.front().obs.is_none() {
+            if let Some(tmpl) = self.prewarm_template.get() {
+                let mut obs = tmpl.clone();
+                let dof = obs.positions.len();
+                obs.gravity_torques.reserve(dof);
+                obs.motor_errors.reserve(dof);
+                st.consumer.front_mut().obs = Some(obs);
+            }
+        }
         if st.consumer.refresh() {
             let slot = st.consumer.front_mut();
             // copied, not moved: the slot keeps its memory for the tick to fill again (the

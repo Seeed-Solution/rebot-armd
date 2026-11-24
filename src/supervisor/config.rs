@@ -122,13 +122,18 @@ impl SupervisorInner {
         if self.zero_check_prev_torqued && !self.is_torqued { self.zero_check_pending = true; }
         self.zero_check_prev_torqued = self.is_torqued;
         if !self.zero_check_pending || self.is_torqued || self.calibration_busy { return; }
-        let Some(rest) = self.zero_reference_joints() else { self.zero_check_pending = false; return; };
+        if self.config.zero_reference.is_none() {
+            self.zero_check_pending = false;
+            return;
+        }
         if let Some(d) = self.driver.as_ref() {
             if !d.lock().is_ok_and(|drv| drv.is_feedback_valid()) { return; }
         }
-        let tol = self.resting_policy().map(|p| p.position_tolerances).unwrap_or_else(|| vec![0.08; 6]);
         self.zero_check_pending = false;
-        let Some(v) = crate::joint_zero::check_convention(&self.measured_positions, &rest, &tol) else { return; };
+        let rest = self.config.home_positions.as_slice();
+        let default_tol = [0.08f32; 6];
+        let tol = self.resting_policy().map_or(&default_tol[..], |p| p.position_tolerances.as_slice());
+        let Some(v) = crate::joint_zero::check_convention(&self.measured_positions, rest, tol) else { return; };
         if self.zero_convention.status == "legacy_j6" && v.status != "legacy_j6" { return; }
         if v.status == "legacy_j6" && self.zero_convention.status != "legacy_j6" {
             tracing::warn!("Joint zero check: {}", v.message.as_deref().unwrap_or(""));

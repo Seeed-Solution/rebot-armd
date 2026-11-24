@@ -44,6 +44,12 @@ pub const MAINT_QUEUE_CAPACITY: usize = 16;
 pub const ESTOP_ACK_CAPACITY: usize = 64;
 /// Bounded capacity of the off-thread fault-state `Arc<SafetyState>` reclamation ring.
 pub const RECLAIM_STATE_CAPACITY: usize = 64;
+/// Capacity of the persistence reply ring (`armd-control` -> `armd-persist` / `OffThreadSinks`).
+pub const PERSIST_REP_CAPACITY: usize = 8;
+/// Lock-free SPSC capacity for clean-exit reclamation when consumer rings remain full at teardown.
+/// Sized strictly >= sum of all bounded owner queues + retained slots + pending E-stop acks.
+const EXIT_RECLAIM_CAPACITY: usize =
+    MAINT_QUEUE_CAPACITY + 2 + PERSIST_REP_CAPACITY + 8 + ESTOP_ACK_CAPACITY;
 
 /// Startup owner selection for `ArmCore` and the actuator bus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -191,11 +197,50 @@ impl ExecutorConfig {
     }
 }
 
+/// Cumulative per-operation heap counters recorded on `armd-control` outside the droppable
+/// diagnostic ring (zero unless `alloc_timing` is enabled with [`crate::diagnostics::alloc::TimedAlloc`]).
+#[derive(Debug, Default)]
+pub struct AtomicAllocCounters {
+    pub alloc: AtomicU64,
+    pub alloc_zeroed: AtomicU64,
+    pub realloc: AtomicU64,
+    pub dealloc: AtomicU64,
+}
+
+impl AtomicAllocCounters {
+    #[inline]
+    pub fn record(&self, delta: crate::diagnostics::alloc::AllocCounts) {
+        if delta.alloc > 0 {
+            self.alloc.fetch_add(delta.alloc, Ordering::AcqRel);
+        }
+        if delta.alloc_zeroed > 0 {
+            self.alloc_zeroed.fetch_add(delta.alloc_zeroed, Ordering::AcqRel);
+        }
+        if delta.realloc > 0 {
+            self.realloc.fetch_add(delta.realloc, Ordering::AcqRel);
+        }
+        if delta.dealloc > 0 {
+            self.dealloc.fetch_add(delta.dealloc, Ordering::AcqRel);
+        }
+    }
+
+    pub fn snapshot(&self) -> crate::diagnostics::alloc::AllocCounts {
+        crate::diagnostics::alloc::AllocCounts {
+            alloc: self.alloc.load(Ordering::Acquire),
+            alloc_zeroed: self.alloc_zeroed.load(Ordering::Acquire),
+            realloc: self.realloc.load(Ordering::Acquire),
+            dealloc: self.dealloc.load(Ordering::Acquire),
+        }
+    }
+}
+
 /// Counters the executor thread updates with plain atomic stores.
 #[derive(Debug, Default)]
 pub struct ExecutorStats {
-    /// Steps run.
+    /// Steps started.
     pub steps: AtomicU64,
+    /// Whole releases completed (Release-incremented strictly AFTER `release_allocs` is updated).
+    pub completed_releases: AtomicU64,
     /// Steps whose elapsed time exceeded [`LATE_LOG_AFTER`].
     pub late: AtomicU64,
     /// Elapsed time of the latest late step, microseconds.
@@ -204,13 +249,27 @@ pub struct ExecutorStats {
     pub skipped_releases: AtomicU64,
     /// Diagnostic `TickSample` values dropped because the off-thread ring was full.
     pub diag_dropped: AtomicU64,
-    /// Sub-release transition wakes executed by `armd-control`.
+    /// Sub-release transition wakes started by `armd-control`.
     pub wakes: AtomicU64,
+    /// Sub-release transition wakes completed (Release-incremented strictly AFTER `wake_allocs` is updated).
+    pub completed_wakes: AtomicU64,
     /// Allocator calls observed across full sub-release wake bodies (when `alloc_timing` is enabled).
     pub wake_alloc_calls: AtomicU64,
+    /// Cumulative per-op heap counts across whole releases (entry through diagnostic enqueue,
+    /// publication, maintenance, reply handling, and local destruction; disjoint from wakes).
+    pub release_allocs: AtomicAllocCounters,
+    /// Cumulative per-op heap counts across all sub-release wakes (entry through wake service,
+    /// publication, reply/ack handling, and local destruction; disjoint from releases).
+    pub wake_allocs: AtomicAllocCounters,
 }
 
 impl ExecutorStats {
+    /// Combined cumulative heap counts across both whole releases and sub-release wakes
+    /// (independent of the droppable diagnostic ring).
+    pub fn total_allocs(&self) -> crate::diagnostics::alloc::AllocCounts {
+        self.release_allocs.snapshot().saturating_add(self.wake_allocs.snapshot())
+    }
+
     /// A normal-priority thread that logs late steps, at most once per second.
     pub fn spawn_monitor(self: &Arc<Self>, stop: Arc<AtomicBool>) -> std::io::Result<JoinHandle<()>> {
         let stats = self.clone();
@@ -599,6 +658,78 @@ pub trait ExecutorClock: Send + Sync {
     fn wake(&self) {}
 }
 
+/// RAII owner of one raw heap allocation created for allocation-counter positive controls.
+/// Freed on drop (typically off-thread, or at release/wake local destruction for final-free controls).
+#[doc(hidden)]
+pub struct ParkedAlloc {
+    ptr: *mut u8,
+    layout: std::alloc::Layout,
+}
+
+// SAFETY: uniquely owns the raw allocation until dropped or reallocated.
+unsafe impl Send for ParkedAlloc {}
+
+impl ParkedAlloc {
+    /// Allocates `size` bytes (align 8) via `std::alloc::alloc` and writes a sentinel byte.
+    pub fn new_alloc(size: usize) -> Self {
+        let layout = std::alloc::Layout::from_size_align(size.max(8), 8).expect("valid layout");
+        // SAFETY: layout has non-zero size.
+        let ptr = unsafe { std::alloc::alloc(layout) };
+        assert!(!ptr.is_null(), "allocation failed");
+        // SAFETY: ptr is valid for `layout.size()` bytes.
+        unsafe { *ptr = 0xA5; }
+        Self { ptr, layout }
+    }
+
+    /// Allocates `size` zeroed bytes (align 8) via `std::alloc::alloc_zeroed`.
+    pub fn new_alloc_zeroed(size: usize) -> Self {
+        let layout = std::alloc::Layout::from_size_align(size.max(8), 8).expect("valid layout");
+        // SAFETY: layout has non-zero size.
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!ptr.is_null(), "zeroed allocation failed");
+        Self { ptr, layout }
+    }
+
+    /// Reallocates this buffer in place via `std::alloc::realloc` without triggering `Drop`.
+    pub fn realloc_to(self, new_size: usize) -> Self {
+        let this = std::mem::ManuallyDrop::new(self);
+        let new_size = new_size.max(8);
+        let new_layout = std::alloc::Layout::from_size_align(new_size, this.layout.align()).expect("valid layout");
+        // SAFETY: `this.ptr` was allocated with `this.layout`, `new_size > 0`, and `ManuallyDrop` prevents double-free.
+        let ptr = unsafe { std::alloc::realloc(this.ptr, this.layout, new_size) };
+        assert!(!ptr.is_null(), "reallocation failed");
+        Self { ptr, layout: new_layout }
+    }
+}
+
+impl Drop for ParkedAlloc {
+    fn drop(&mut self) {
+        // SAFETY: `self.ptr` was allocated with `self.layout` and is uniquely owned here.
+        unsafe { std::alloc::dealloc(self.ptr, self.layout); }
+    }
+}
+
+/// Allocation-free positive-control descriptor injected in the release tail or sub-release wake tail
+/// (exact 1-for-1 heap-op counts with zero wrapper allocations or frees).
+#[doc(hidden)]
+pub enum TailAllocProbe {
+    /// Performs exactly 1 `GlobalAlloc::alloc` and parks it off-thread (`alloc=1, dealloc=0`).
+    AllocOnce { park: Arc<Mutex<Option<ParkedAlloc>>> },
+    /// Performs exactly 1 `GlobalAlloc::alloc_zeroed` and parks it off-thread (`alloc_zeroed=1`).
+    AllocZeroedOnce { park: Arc<Mutex<Option<ParkedAlloc>>> },
+    /// Performs exactly 1 `GlobalAlloc::realloc` on a pre-allocated buffer and parks it off-thread (`realloc=1`).
+    ReallocOnce { existing: Option<ParkedAlloc>, park: Arc<Mutex<Option<ParkedAlloc>>> },
+    /// Moves a pre-allocated buffer into a release/wake-scope local so its final `dealloc` runs
+    /// during scope-exit local destruction (`dealloc=1`).
+    FinalFreeLocal { local: Option<ParkedAlloc> },
+    /// Performs BOTH 1 `GlobalAlloc::alloc` (parked off-thread) AND 1 final `dealloc` via
+    /// scope-exit local destruction (`alloc=1, dealloc=1`).
+    AllocAndFinalFreeLocal {
+        local: Option<ParkedAlloc>,
+        park: Arc<Mutex<Option<ParkedAlloc>>>,
+    },
+}
+
 /// Deterministic test hooks for persistence barriers, failure injection, and overrun tests.
 #[doc(hidden)]
 #[derive(Clone, Default)]
@@ -634,6 +765,15 @@ pub struct PersistTestHooks {
     pub payload_drop_probe: Option<Arc<Mutex<Option<Box<dyn Any + Send>>>>>,
     /// Positive control: performs one deliberate heap allocation+drop inside the next sub-release wake body.
     pub inject_wake_alloc_once: Option<Arc<AtomicBool>>,
+    /// Positive control: exact one-shot heap probe run in the release tail (strictly AFTER `diag_tx.push`
+    /// and `hub.wake()`) whose `local` drops at release-scope local destruction.
+    pub inject_release_tail_once: Option<Arc<Mutex<Option<TailAllocProbe>>>>,
+    /// Positive control: exact one-shot heap probe run in the sub-release wake tail (strictly AFTER
+    /// `service_wake` / ack / reclaim drains) whose `local` drops at wake-scope local destruction.
+    pub inject_wake_tail_once: Option<Arc<Mutex<Option<TailAllocProbe>>>>,
+    /// Injects one pre-built `PendingZeroCheckPersist` into `core.pending_zero_check_persist` on the
+    /// next release (tests executor release-tail `persist_job_tx` saturation with 0 allocations in `actions.rs`).
+    pub inject_pending_persist_job_once: Option<Arc<Mutex<Option<PendingZeroCheckPersist>>>>,
     /// Runs on `armd-control` while handling `MaintenanceOp::CommitShutdown` before replying.
     pub on_commit_shutdown: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Overrides `PANIC_DISABLE_TIMEOUT` for deterministic deadline-observer tests.
@@ -702,7 +842,19 @@ enum PersistReply {
         _returned_msg: Option<String>,
         _returned_warning: Option<String>,
         _returned_probe: Option<Box<dyn Any + Send>>,
+        _returned_job: Option<PendingZeroCheckPersist>,
     },
+}
+
+/// Lock-free SPSC clean-exit handoff for bounded owner payloads when consumer rings remain full
+/// at teardown; guaranteed nonblocking on `armd-control` and dropped off-thread in `OffThreadSinks`.
+#[allow(dead_code)]
+enum ExitReclaim {
+    MaintReply(MaintReply),
+    PersistReply(PersistReply),
+    PersistJob(PendingZeroCheckPersist),
+    SafetyState(Arc<SafetyState>),
+    Buf(String),
 }
 
 /// Off-thread consumer sinks drained by `armd-dispatch`, `tick_stats()`, and `shutdown_and_join()`.
@@ -713,6 +865,7 @@ pub(crate) struct OffThreadSinks {
     persist_rep_rx: Arc<Mutex<Consumer<PersistReply>>>,
     persist_worker_exited: Arc<AtomicBool>,
     maint_client: Arc<MaintClient>,
+    exit_reclaim_rx: Mutex<Consumer<ExitReclaim>>,
 }
 
 impl OffThreadSinks {
@@ -745,6 +898,12 @@ impl OffThreadSinks {
             let mut rx = self.persist_rep_rx.lock().unwrap_or_else(|e| e.into_inner());
             while let Ok(rep) = rx.pop() {
                 drop(rep);
+            }
+        }
+        {
+            let mut rx = self.exit_reclaim_rx.lock().unwrap_or_else(|e| e.into_inner());
+            while let Ok(item) = rx.pop() {
+                drop(item);
             }
         }
     }
@@ -1102,7 +1261,8 @@ pub(crate) fn spawn_executor(
     let (reclaim_state_tx, reclaim_state_rx) = RingBuffer::<Arc<SafetyState>>::new(RECLAIM_STATE_CAPACITY);
     let (persist_job_tx, persist_job_rx) = RingBuffer::<PendingZeroCheckPersist>::new(4);
     let (persist_cmd_tx, persist_cmd_rx) = RingBuffer::<PersistCmd>::new(2);
-    let (persist_rep_tx, persist_rep_rx) = RingBuffer::<PersistReply>::new(4);
+    let (persist_rep_tx, persist_rep_rx) = RingBuffer::<PersistReply>::new(PERSIST_REP_CAPACITY);
+    let (exit_reclaim_tx, exit_reclaim_rx) = RingBuffer::<ExitReclaim>::new(EXIT_RECLAIM_CAPACITY);
 
     let estop_overflow_gen = Arc::new(AtomicU64::new(0));
     let control_stop = Arc::new(AtomicBool::new(false));
@@ -1123,6 +1283,7 @@ pub(crate) fn spawn_executor(
         persist_rep_rx: persist_rep_rx.clone(),
         persist_worker_exited: persist_worker_exited.clone(),
         maint_client: maint_client.clone(),
+        exit_reclaim_rx: Mutex::new(exit_reclaim_rx),
     });
 
     // Spawn dedicated persistence worker first so its thread handle can be woken on job push.
@@ -1179,6 +1340,7 @@ pub(crate) fn spawn_executor(
                 persist_job_tx,
                 persist_cmd_rx,
                 persist_rep_tx,
+                exit_reclaim_tx,
                 persist_wake,
                 e_stop_latched,
                 hub_clone,
@@ -1266,23 +1428,58 @@ struct ControlState {
     persist_job_tx: Producer<PendingZeroCheckPersist>,
     persist_cmd_rx: Consumer<PersistCmd>,
     persist_rep_tx: Producer<PersistReply>,
+    /// Retained persistence reply if `persist_rep_tx` was temporarily full (flushed before popping).
+    pending_persist_reply: Option<PersistReply>,
+    /// Retained persistence job if `persist_job_tx` and `persist_rep_tx` were both saturated.
+    retained_persist_job: Option<PendingZeroCheckPersist>,
+    /// Lock-free SPSC handoff used ONLY on clean exit when consumer rings remain full.
+    exit_reclaim_tx: Producer<ExitReclaim>,
     persist_wake: Thread,
     persist_granted: Option<(u64, ConfigDomain)>,
     next_persist_req: u64,
     disconnect_code_buf: Option<String>,
     disconnect_msg_buf: Option<String>,
+    /// Preallocated message buffer for release-tail persistence queue saturation (recycled if returned).
+    sat_msg_buf: Option<String>,
     hooks: PersistTestHooks,
+}
+
+/// True when `armd-control` itself permanently or currently holds another strong reference to
+/// `ack.state` inside `core.safety`, proving that dropping `ack` on `armd-control` cannot be
+/// the final `Arc` drop (single-thread guaranteed, zero race with `armd-dispatch`).
+#[inline]
+fn is_owner_retained_state(ack: &EstopAck, core: &SupervisorInner) -> bool {
+    !matches!(*ack.state, SafetyState::Fault(_))
+        || std::ptr::eq(Arc::as_ptr(&ack.state), core.safety.state() as *const SafetyState)
 }
 
 impl ControlState {
     fn emit_estop_ack_if_advanced(&mut self, core: &mut SupervisorInner) {
         let mut woke = false;
-        while let Some(ack) = core.pending_estop_acks.pop_front() {
-            let last_gen = ack.last_gen;
-            if self.estop_ack_tx.push(ack).is_err() {
-                self.estop_overflow_gen.fetch_max(last_gen, Ordering::Release);
+        while let Some(front) = core.pending_estop_acks.front() {
+            if !self.estop_ack_tx.is_full() {
+                let ack = core.pending_estop_acks.pop_front().expect("checked front");
+                let _ = self.estop_ack_tx.push(ack);
+                woke = true;
+            } else if is_owner_retained_state(front, core) {
+                let ack = core.pending_estop_acks.pop_front().expect("checked front");
+                self.estop_overflow_gen.fetch_max(ack.last_gen, Ordering::Release);
+                // Safe: `core.safety` retains a live strong ref on this thread (`is_owner_retained_state`).
+                drop(ack);
+                woke = true;
+            } else if !self.reclaim_state_tx.is_full() {
+                let ack = core.pending_estop_acks.pop_front().expect("checked front");
+                self.estop_overflow_gen.fetch_max(ack.last_gen, Ordering::Release);
+                let _ = self.reclaim_state_tx.push(ack.state);
+                woke = true;
+            } else {
+                // Both `estop_ack_tx` and `reclaim_state_tx` are full and `front.state` is a
+                // retired Fault that may own the final strong reference: record the overflow
+                // watermark and leave it in bounded `core.pending_estop_acks` until a ring drains.
+                self.estop_overflow_gen.fetch_max(front.last_gen, Ordering::Release);
+                woke = true;
+                break;
             }
-            woke = true;
         }
         if core.estop_ack_overflow_gen > 0 {
             let ov = std::mem::replace(&mut core.estop_ack_overflow_gen, 0);
@@ -1291,6 +1488,24 @@ impl ControlState {
         }
         if woke {
             core.core.hub().wake();
+        }
+    }
+
+    /// Clean-exit E-stop drain: moves any remaining pending E-stop acks / retired fault arcs into
+    /// `estop_ack_tx`, `reclaim_state_tx`, or lock-free `exit_reclaim_tx` so nothing drops on RT.
+    fn drain_estop_and_retired_stopped(&mut self, core: &mut SupervisorInner) {
+        self.emit_estop_ack_if_advanced(core);
+        while let Some(ack) = core.pending_estop_acks.pop_front() {
+            self.estop_overflow_gen.fetch_max(ack.last_gen, Ordering::Release);
+            if let Err(rtrb::PushError::Full(state)) = self.reclaim_state_tx.push(ack.state) {
+                let _ = self.exit_reclaim_tx.push(ExitReclaim::SafetyState(state));
+            }
+        }
+        self.drain_retired_states(core);
+        while let Some(arc) = core.safety.pop_retired_state_arc() {
+            if let Err(rtrb::PushError::Full(state)) = self.reclaim_state_tx.push(arc) {
+                let _ = self.exit_reclaim_tx.push(ExitReclaim::SafetyState(state));
+            }
         }
     }
 
@@ -1316,6 +1531,9 @@ impl ControlState {
         ctx: &super::ops::CommitCtx,
         release_deadline: Instant,
     ) {
+        if self.pending_maint_reply.is_some() || self.maint_rep_tx.is_full() {
+            return;
+        }
         let Ok(req) = self.maint_req_rx.pop() else { return; };
         let mut returned_offsets = None;
         let mut returned_probe = None;
@@ -1388,14 +1606,24 @@ impl ControlState {
 
     fn flush_pending_maint_reply(&mut self, core: &SupervisorInner) {
         if let Some(reply) = self.pending_maint_reply.take() {
-            let _ = self.maint_rep_tx.push(reply);
-            core.core.hub().wake();
+            match self.maint_rep_tx.push(reply) {
+                Ok(()) => core.core.hub().wake(),
+                Err(rtrb::PushError::Full(reply)) => {
+                    self.pending_maint_reply = Some(reply);
+                }
+            }
+        }
+    }
+
+    fn push_maint_reply_or_exit_reclaim(&mut self, reply: MaintReply) {
+        if let Err(rtrb::PushError::Full(reply)) = self.maint_rep_tx.push(reply) {
+            let _ = self.exit_reclaim_tx.push(ExitReclaim::MaintReply(reply));
         }
     }
 
     fn drain_maintenance_stopped(&mut self) {
         if let Some(reply) = self.pending_maint_reply.take() {
-            let _ = self.maint_rep_tx.push(MaintReply {
+            self.push_maint_reply_or_exit_reclaim(MaintReply {
                 id: reply.id,
                 result: MaintenanceResult::Stopped,
                 returned_offsets: reply.returned_offsets,
@@ -1408,7 +1636,7 @@ impl ControlState {
                 MaintenanceOp::ProbeOwnedPayload { payload } => (None, Some(payload)),
                 _ => (None, None),
             };
-            let _ = self.maint_rep_tx.push(MaintReply {
+            self.push_maint_reply_or_exit_reclaim(MaintReply {
                 id: req.id,
                 result: MaintenanceResult::Stopped,
                 returned_offsets,
@@ -1417,11 +1645,73 @@ impl ControlState {
         }
     }
 
+    fn push_persist_reply_or_retain(&mut self, reply: PersistReply, core: &SupervisorInner) {
+        match self.persist_rep_tx.push(reply) {
+            Ok(()) => {
+                self.persist_wake.unpark();
+                core.core.hub().wake();
+            }
+            Err(rtrb::PushError::Full(reply)) => {
+                debug_assert!(
+                    self.pending_persist_reply.is_none(),
+                    "persist reply headroom rule violated: pending_persist_reply already occupied"
+                );
+                self.pending_persist_reply = Some(reply);
+            }
+        }
+    }
+
+    fn push_persist_reply_or_exit_reclaim(&mut self, reply: PersistReply) {
+        if let Err(rtrb::PushError::Full(reply)) = self.persist_rep_tx.push(reply) {
+            let _ = self.exit_reclaim_tx.push(ExitReclaim::PersistReply(reply));
+        }
+    }
+
+    fn flush_retained_persist(&mut self, core: &SupervisorInner) {
+        let mut woke = false;
+        if let Some(reply) = self.pending_persist_reply.take() {
+            match self.persist_rep_tx.push(reply) {
+                Ok(()) => woke = true,
+                Err(rtrb::PushError::Full(reply)) => {
+                    self.pending_persist_reply = Some(reply);
+                }
+            }
+        }
+        if let Some(job) = self.retained_persist_job.take() {
+            if !self.persist_rep_tx.is_full() {
+                let _ = self.persist_rep_tx.push(PersistReply::Done {
+                    _returned_policy: None,
+                    _returned_jaw: None,
+                    _returned_code: None,
+                    _returned_msg: None,
+                    _returned_warning: None,
+                    _returned_probe: None,
+                    _returned_job: Some(job),
+                });
+                woke = true;
+            } else {
+                self.retained_persist_job = Some(job);
+            }
+        }
+        if woke {
+            self.persist_wake.unpark();
+            core.core.hub().wake();
+        }
+    }
+
     /// Exit-path persistence drain: returns any queued `PersistCmd` heap payloads off-thread
-    /// via `persist_rep_tx` and wakes `armd-persist` WITHOUT performing any unpublished live
-    /// state mutations (`last_action`, `gripper_calib_revision`, `force_reconcile`).
+    /// via `persist_rep_tx` (falling back to lock-free `exit_reclaim_tx` if full) and wakes
+    /// `armd-persist` WITHOUT performing any unpublished live state mutations.
     fn drain_persistence_stopped(&mut self, core: &SupervisorInner) {
         let mut woke = false;
+        if let Some(reply) = self.pending_persist_reply.take() {
+            self.push_persist_reply_or_exit_reclaim(reply);
+            woke = true;
+        }
+        if let Some(job) = self.retained_persist_job.take() {
+            let _ = self.exit_reclaim_tx.push(ExitReclaim::PersistJob(job));
+            woke = true;
+        }
         while let Ok(cmd) = self.persist_cmd_rx.pop() {
             let reply = match cmd {
                 PersistCmd::Reserve {
@@ -1459,6 +1749,7 @@ impl ControlState {
                     _returned_msg: Some(message),
                     _returned_warning: None,
                     _returned_probe: self.take_reply_probe(),
+                    _returned_job: None,
                 },
                 PersistCmd::Activate {
                     new_policy,
@@ -1474,21 +1765,29 @@ impl ControlState {
                     _returned_msg: Some(msg_buf),
                     _returned_warning: warning,
                     _returned_probe: self.take_reply_probe(),
+                    _returned_job: None,
                 },
             };
-            let _ = self.persist_rep_tx.push(reply);
+            self.push_persist_reply_or_exit_reclaim(reply);
             woke = true;
         }
         self.persist_granted = None;
         if self.disconnect_code_buf.is_some() || self.disconnect_msg_buf.is_some() {
-            let _ = self.persist_rep_tx.push(PersistReply::Done {
+            let code = self.disconnect_code_buf.take();
+            let msg = self.disconnect_msg_buf.take();
+            self.push_persist_reply_or_exit_reclaim(PersistReply::Done {
                 _returned_policy: None,
                 _returned_jaw: None,
-                _returned_code: self.disconnect_code_buf.take(),
-                _returned_msg: self.disconnect_msg_buf.take(),
+                _returned_code: code,
+                _returned_msg: msg,
                 _returned_warning: None,
                 _returned_probe: None,
+                _returned_job: None,
             });
+            woke = true;
+        }
+        if let Some(buf) = self.sat_msg_buf.take() {
+            let _ = self.exit_reclaim_tx.push(ExitReclaim::Buf(buf));
             woke = true;
         }
         if woke {
@@ -1498,6 +1797,7 @@ impl ControlState {
     }
 
     fn service_persistence(&mut self, core: &mut SupervisorInner, ctx: &super::ops::CommitCtx) {
+        self.flush_retained_persist(core);
         // B1 race-free abandonment rule: sample `is_abandoned()` BEFORE draining queued commands!
         // Because `rtrb` preserves queued items after producer drop, nothing can be pushed after
         // `abandoned == true` is observed.
@@ -1505,10 +1805,18 @@ impl ControlState {
         if let Some(hook) = self.hooks.after_abandoned_check_before_pop.as_ref() {
             hook();
         }
-        while let Ok(cmd) = self.persist_cmd_rx.pop() {
+        // Capacity rule: pop `persist_cmd_rx` only while `persist_rep_tx` retains >= 3 free slots
+        // (1 for this command's reply + 1 reserved for one-shot disconnect + 1 for release-tail
+        // job rejection), so no `PersistReply` is ever dropped on `armd-control`.
+        while self.pending_persist_reply.is_none() && self.persist_rep_tx.slots() >= 3 {
+            let Ok(cmd) = self.persist_cmd_rx.pop() else { break; };
             self.handle_persist_cmd(core, ctx, cmd);
         }
-        if abandoned {
+        if abandoned
+            && self.persist_cmd_rx.is_empty()
+            && self.pending_persist_reply.is_none()
+            && self.persist_rep_tx.slots() >= 2
+        {
             if let Some((action_id, domain)) = self.persist_granted.take() {
                 let active_rev = ConfigAuthority::revision(core, domain);
                 core.core.config_mut().force_reconcile(domain, active_rev);
@@ -1524,16 +1832,139 @@ impl ControlState {
                     self.disconnect_msg_buf.take(),
                 );
                 if old_code.is_some() || old_msg.is_some() {
-                    let _ = self.persist_rep_tx.push(PersistReply::Done {
-                        _returned_policy: None,
-                        _returned_jaw: None,
-                        _returned_code: old_code,
-                        _returned_msg: old_msg,
-                        _returned_warning: None,
-                        _returned_probe: None,
-                    });
-                    core.core.hub().wake();
+                    self.push_persist_reply_or_retain(
+                        PersistReply::Done {
+                            _returned_policy: None,
+                            _returned_jaw: None,
+                            _returned_code: old_code,
+                            _returned_msg: old_msg,
+                            _returned_warning: None,
+                            _returned_probe: None,
+                            _returned_job: None,
+                        },
+                        core,
+                    );
                 }
+            }
+        }
+    }
+
+    /// Release-tail handler when `persist_job_tx.push(job)` fails: marks the action failed without
+    /// heap allocation (recycling `sat_msg_buf` or updating inline `HolderLabel`s when depleted)
+    /// and returns `job` off-thread via `persist_rep_tx` or `retained_persist_job`.
+    fn reject_saturated_persist_job(&mut self, core: &mut SupervisorInner, job: PendingZeroCheckPersist) {
+        let mut returned_msg: Option<String> = None;
+        let can_offload_msg = !self.persist_rep_tx.is_full() || self.pending_persist_reply.is_none();
+        if let Some(id) = core.zero_check_persisting.take() {
+            const SAT_MSG: &str = "Persistence queue saturated";
+            if can_offload_msg {
+                if let Some(buf) = self.sat_msg_buf.take() {
+                    let (_, old_msg) = core.finish_zero_check_action_in_place(
+                        id,
+                        "failed",
+                        "PERSIST_FAILED",
+                        SAT_MSG,
+                        None,
+                        Some(buf),
+                    );
+                    if let Some(m) = old_msg {
+                        if m.capacity() >= SAT_MSG.len() {
+                            self.sat_msg_buf = Some(m);
+                        } else {
+                            returned_msg = Some(m);
+                        }
+                    }
+                } else {
+                    Self::fail_zero_check_inline_only(core, id, SAT_MSG);
+                }
+            } else {
+                Self::fail_zero_check_inline_only(core, id, SAT_MSG);
+            }
+        }
+        if !self.persist_rep_tx.is_full() {
+            self.push_persist_reply_or_retain(
+                PersistReply::Done {
+                    _returned_policy: None,
+                    _returned_jaw: None,
+                    _returned_code: None,
+                    _returned_msg: returned_msg,
+                    _returned_warning: None,
+                    _returned_probe: None,
+                    _returned_job: Some(job),
+                },
+                core,
+            );
+        } else if self.pending_persist_reply.is_none() {
+            self.pending_persist_reply = Some(PersistReply::Done {
+                _returned_policy: None,
+                _returned_jaw: None,
+                _returned_code: None,
+                _returned_msg: returned_msg,
+                _returned_warning: None,
+                _returned_probe: None,
+                _returned_job: Some(job),
+            });
+        } else {
+            // `can_offload_msg` was false so `returned_msg` is guaranteed `None`; retain `job`
+            // until `flush_retained_persist` drains a slot.
+            debug_assert!(returned_msg.is_none());
+            debug_assert!(self.retained_persist_job.is_none());
+            self.retained_persist_job = Some(job);
+        }
+    }
+
+    /// Marks a running zero-check action failed using only inline `HolderLabel`s (reusing an
+    /// existing `String` buffer ONLY if its capacity already fits `msg` — zero heap operations).
+    fn fail_zero_check_inline_only(core: &mut SupervisorInner, id: u64, msg: &str) {
+        let now = core.now_s();
+        if let Some(a) = core.last_action.as_mut().filter(|a| a.id == id && a.is_running()) {
+            a.state = crate::model::HolderLabel::new("failed");
+            a.code = Some(crate::model::HolderLabel::new("PERSIST_FAILED"));
+            if let Some(existing) = a.message.as_mut() {
+                if existing.capacity() >= msg.len() {
+                    existing.clear();
+                    existing.push_str(msg);
+                }
+            }
+            a.finished_at = Some(now);
+        }
+    }
+
+    /// Executes one optional positive-control heap probe in the release/wake tail, returning any
+    /// `ParkedAlloc` bound to the caller's scope so its final `dealloc` runs at local destruction.
+    fn run_tail_alloc_probe(&self, slot: &Option<Arc<Mutex<Option<TailAllocProbe>>>>) -> Option<ParkedAlloc> {
+        let probe = slot.as_ref().and_then(|p| p.lock().ok().and_then(|mut g| g.take()))?;
+        match probe {
+            TailAllocProbe::AllocOnce { park } => {
+                let a = ParkedAlloc::new_alloc(64);
+                if let Ok(mut g) = park.lock() {
+                    *g = Some(a);
+                }
+                None
+            }
+            TailAllocProbe::AllocZeroedOnce { park } => {
+                let a = ParkedAlloc::new_alloc_zeroed(64);
+                if let Ok(mut g) = park.lock() {
+                    *g = Some(a);
+                }
+                None
+            }
+            TailAllocProbe::ReallocOnce { existing, park } => {
+                if let Some(a) = existing {
+                    let resized = a.realloc_to(128);
+                    if let Ok(mut g) = park.lock() {
+                        *g = Some(resized);
+                    }
+                }
+                None
+            }
+            TailAllocProbe::FinalFreeLocal { local } => local,
+            TailAllocProbe::AllocAndFinalFreeLocal { local, park } => {
+                let a = ParkedAlloc::new_alloc(64);
+                if let Ok(mut g) = park.lock() {
+                    *g = Some(a);
+                }
+                local
             }
         }
     }
@@ -1552,16 +1983,19 @@ impl ControlState {
                     core.zero_check_persisting = None;
                 }
                 let (old_code, old_msg) = core.fail_zero_check_action_owned(action_id, code, message);
-                let _ = self.persist_rep_tx.push(PersistReply::Done {
-                    _returned_policy: unused_policy,
-                    _returned_jaw: unused_jaw,
-                    _returned_code: old_code,
-                    _returned_msg: old_msg,
-                    _returned_warning: None,
-                    _returned_probe: self.take_reply_probe(),
-                });
-                self.persist_wake.unpark();
-                core.core.hub().wake();
+                let probe = self.take_reply_probe();
+                self.push_persist_reply_or_retain(
+                    PersistReply::Done {
+                        _returned_policy: unused_policy,
+                        _returned_jaw: unused_jaw,
+                        _returned_code: old_code,
+                        _returned_msg: old_msg,
+                        _returned_warning: None,
+                        _returned_probe: probe,
+                        _returned_job: None,
+                    },
+                    core,
+                );
             }
             PersistCmd::Reserve {
                 action_id,
@@ -1612,16 +2046,17 @@ impl ControlState {
                     } else {
                         (Some(code_buf), Some(msg_buf))
                     };
-                    let _ = self.persist_rep_tx.push(PersistReply::Reserved {
-                        reservation: None,
-                        policy: Some(new_policy),
-                        returned_jaw: jaw_opening,
-                        _returned_code: old_code,
-                        _returned_msg: old_msg,
-                        _returned_probe: probe,
-                    });
-                    self.persist_wake.unpark();
-                    core.core.hub().wake();
+                    self.push_persist_reply_or_retain(
+                        PersistReply::Reserved {
+                            reservation: None,
+                            policy: Some(new_policy),
+                            returned_jaw: jaw_opening,
+                            _returned_code: old_code,
+                            _returned_msg: old_msg,
+                            _returned_probe: probe,
+                        },
+                        core,
+                    );
                     return;
                 }
                 if !rev_ok {
@@ -1636,16 +2071,17 @@ impl ControlState {
                         Some(code_buf),
                         Some(msg_buf),
                     );
-                    let _ = self.persist_rep_tx.push(PersistReply::Reserved {
-                        reservation: None,
-                        policy: Some(new_policy),
-                        returned_jaw: jaw_opening,
-                        _returned_code: old_code,
-                        _returned_msg: old_msg,
-                        _returned_probe: probe,
-                    });
-                    self.persist_wake.unpark();
-                    core.core.hub().wake();
+                    self.push_persist_reply_or_retain(
+                        PersistReply::Reserved {
+                            reservation: None,
+                            policy: Some(new_policy),
+                            returned_jaw: jaw_opening,
+                            _returned_code: old_code,
+                            _returned_msg: old_msg,
+                            _returned_probe: probe,
+                        },
+                        core,
+                    );
                     return;
                 }
                 if core.driver_config_error.is_some() {
@@ -1660,16 +2096,17 @@ impl ControlState {
                         Some(code_buf),
                         Some(msg_buf),
                     );
-                    let _ = self.persist_rep_tx.push(PersistReply::Reserved {
-                        reservation: None,
-                        policy: Some(new_policy),
-                        returned_jaw: jaw_opening,
-                        _returned_code: old_code,
-                        _returned_msg: old_msg,
-                        _returned_probe: probe,
-                    });
-                    self.persist_wake.unpark();
-                    core.core.hub().wake();
+                    self.push_persist_reply_or_retain(
+                        PersistReply::Reserved {
+                            reservation: None,
+                            policy: Some(new_policy),
+                            returned_jaw: jaw_opening,
+                            _returned_code: old_code,
+                            _returned_msg: old_msg,
+                            _returned_probe: probe,
+                        },
+                        core,
+                    );
                     return;
                 }
                 let auth = core.authority(ctx);
@@ -1691,14 +2128,17 @@ impl ControlState {
                 match ConfigAuthority::reserve(core, &proposal, ctx) {
                     Reserved::Granted(reservation) => {
                         self.persist_granted = Some((action_id, ConfigDomain::GripperCalibration));
-                        let _ = self.persist_rep_tx.push(PersistReply::Reserved {
-                            reservation: Some(reservation),
-                            policy: Some(new_policy),
-                            returned_jaw: jaw_opening,
-                            _returned_code: Some(code_buf),
-                            _returned_msg: Some(msg_buf),
-                            _returned_probe: probe,
-                        });
+                        self.push_persist_reply_or_retain(
+                            PersistReply::Reserved {
+                                reservation: Some(reservation),
+                                policy: Some(new_policy),
+                                returned_jaw: jaw_opening,
+                                _returned_code: Some(code_buf),
+                                _returned_msg: Some(msg_buf),
+                                _returned_probe: probe,
+                            },
+                            core,
+                        );
                     }
                     Reserved::Refused { code, .. } => {
                         if core.zero_check_persisting == Some(action_id) {
@@ -1712,18 +2152,19 @@ impl ControlState {
                             Some(code_buf),
                             Some(msg_buf),
                         );
-                        let _ = self.persist_rep_tx.push(PersistReply::Reserved {
-                            reservation: None,
-                            policy: Some(new_policy),
-                            returned_jaw: jaw_opening,
-                            _returned_code: old_code,
-                            _returned_msg: old_msg,
-                            _returned_probe: probe,
-                        });
+                        self.push_persist_reply_or_retain(
+                            PersistReply::Reserved {
+                                reservation: None,
+                                policy: Some(new_policy),
+                                returned_jaw: jaw_opening,
+                                _returned_code: old_code,
+                                _returned_msg: old_msg,
+                                _returned_probe: probe,
+                            },
+                            core,
+                        );
                     }
                 }
-                self.persist_wake.unpark();
-                core.core.hub().wake();
             }
             PersistCmd::Abort { action_id, reservation, code, message, unused_policy, unused_jaw } => {
                 self.persist_granted = None;
@@ -1732,16 +2173,19 @@ impl ControlState {
                     core.zero_check_persisting = None;
                 }
                 let (old_code, old_msg) = core.fail_zero_check_action_owned(action_id, code, message);
-                let _ = self.persist_rep_tx.push(PersistReply::Done {
-                    _returned_policy: unused_policy,
-                    _returned_jaw: unused_jaw,
-                    _returned_code: old_code,
-                    _returned_msg: old_msg,
-                    _returned_warning: None,
-                    _returned_probe: self.take_reply_probe(),
-                });
-                self.persist_wake.unpark();
-                core.core.hub().wake();
+                let probe = self.take_reply_probe();
+                self.push_persist_reply_or_retain(
+                    PersistReply::Done {
+                        _returned_policy: unused_policy,
+                        _returned_jaw: unused_jaw,
+                        _returned_code: old_code,
+                        _returned_msg: old_msg,
+                        _returned_warning: None,
+                        _returned_probe: probe,
+                        _returned_job: None,
+                    },
+                    core,
+                );
             }
             PersistCmd::Activate {
                 action_id,
@@ -1783,16 +2227,19 @@ impl ControlState {
                         Some(code_buf),
                         Some(msg_buf),
                     );
-                    let _ = self.persist_rep_tx.push(PersistReply::Done {
-                        _returned_policy: Some(new_policy),
-                        _returned_jaw: new_jaw,
-                        _returned_code: old_code,
-                        _returned_msg: old_msg,
-                        _returned_warning: warning,
-                        _returned_probe: self.take_reply_probe(),
-                    });
-                    self.persist_wake.unpark();
-                    core.core.hub().wake();
+                    let probe = self.take_reply_probe();
+                    self.push_persist_reply_or_retain(
+                        PersistReply::Done {
+                            _returned_policy: Some(new_policy),
+                            _returned_jaw: new_jaw,
+                            _returned_code: old_code,
+                            _returned_msg: old_msg,
+                            _returned_warning: warning,
+                            _returned_probe: probe,
+                            _returned_job: None,
+                        },
+                        core,
+                    );
                     return;
                 }
 
@@ -1822,14 +2269,19 @@ impl ControlState {
                     }
                     let unused_warning = core.complete_zero_check_action(action_id, durability, warning);
                     // Return unused scratch strings + any displaced warning/policy/jaw off-thread.
-                    let _ = self.persist_rep_tx.push(PersistReply::Done {
-                        _returned_policy: old_policy,
-                        _returned_jaw: old_jaw,
-                        _returned_code: Some(code_buf),
-                        _returned_msg: Some(msg_buf),
-                        _returned_warning: unused_warning,
-                        _returned_probe: self.take_reply_probe(),
-                    });
+                    let probe = self.take_reply_probe();
+                    self.push_persist_reply_or_retain(
+                        PersistReply::Done {
+                            _returned_policy: old_policy,
+                            _returned_jaw: old_jaw,
+                            _returned_code: Some(code_buf),
+                            _returned_msg: Some(msg_buf),
+                            _returned_warning: unused_warning,
+                            _returned_probe: probe,
+                            _returned_job: None,
+                        },
+                        core,
+                    );
                 } else {
                     // Post-rename revocation: keep live state/revision unchanged and enter Reconciling.
                     let code = if stopped {
@@ -1860,17 +2312,20 @@ impl ControlState {
                     } else {
                         (Some(code_buf), Some(msg_buf))
                     };
-                    let _ = self.persist_rep_tx.push(PersistReply::Done {
-                        _returned_policy: Some(new_policy),
-                        _returned_jaw: new_jaw,
-                        _returned_code: old_code,
-                        _returned_msg: old_msg,
-                        _returned_warning: warning,
-                        _returned_probe: self.take_reply_probe(),
-                    });
+                    let probe = self.take_reply_probe();
+                    self.push_persist_reply_or_retain(
+                        PersistReply::Done {
+                            _returned_policy: Some(new_policy),
+                            _returned_jaw: new_jaw,
+                            _returned_code: old_code,
+                            _returned_msg: old_msg,
+                            _returned_warning: warning,
+                            _returned_probe: probe,
+                            _returned_job: None,
+                        },
+                        core,
+                    );
                 }
-                self.persist_wake.unpark();
-                core.core.hub().wake();
             }
         }
     }
@@ -2162,6 +2617,48 @@ fn spawn_persist_worker(
     })
 }
 
+/// RAII allocation-counting window for one whole release or one sub-release wake.
+///
+/// Declared FIRST in its lexical scope so Rust drops it LAST — strictly after all locals
+/// (including `TickSample`, `ReleaseGuard`, reply/ack drains, and tail probes) are destroyed —
+/// and updates `ExecutorStats`'s cumulative counters outside the droppable diagnostic ring before
+/// Release-incrementing `completed_releases` / `completed_wakes`.
+struct WholeReleaseAllocGuard<'a> {
+    stats: &'a ExecutorStats,
+    start: crate::diagnostics::alloc::AllocCounts,
+    is_wake: bool,
+}
+
+impl<'a> WholeReleaseAllocGuard<'a> {
+    #[inline]
+    fn enter(stats: &'a ExecutorStats, is_wake: bool) -> Self {
+        Self {
+            stats,
+            start: crate::diagnostics::alloc::snapshot_counts(),
+            is_wake,
+        }
+    }
+}
+
+impl Drop for WholeReleaseAllocGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        let delta = crate::diagnostics::alloc::snapshot_counts().delta_since(self.start);
+        if self.is_wake {
+            if delta.total() > 0 {
+                self.stats.wake_allocs.record(delta);
+                self.stats.wake_alloc_calls.fetch_add(delta.total(), Ordering::AcqRel);
+            }
+            self.stats.completed_wakes.fetch_add(1, Ordering::Release);
+        } else {
+            if delta.total() > 0 {
+                self.stats.release_allocs.record(delta);
+            }
+            self.stats.completed_releases.fetch_add(1, Ordering::Release);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn control_thread_main(
     mut core: SupervisorInner,
@@ -2185,6 +2682,7 @@ fn control_thread_main(
     persist_job_tx: Producer<PendingZeroCheckPersist>,
     persist_cmd_rx: Consumer<PersistCmd>,
     persist_rep_tx: Producer<PersistReply>,
+    exit_reclaim_tx: Producer<ExitReclaim>,
     persist_wake: Thread,
     e_stop_latched: Arc<AtomicBool>,
     hub: Arc<StateHub>,
@@ -2205,8 +2703,9 @@ fn control_thread_main(
     }
 
     // Complete driver RT mode handoff (including any startup transport writer synchronization)
-    // BEFORE applying SCHED_FIFO so normal-priority helper threads (e.g. `armd-sim-rx`) can
-    // never suffer single-CPU priority inversion during startup.
+    // and nonblocking observation-slot prewarming BEFORE applying SCHED_FIFO so normal-priority
+    // helper threads (e.g. `armd-sim-rx`) can never suffer priority inversion during startup and
+    // release #1 allocates nothing even under stalled readers.
     core.rt_executor_owned = true;
     core.before_publish_hook = hooks.before_publish.clone();
     core.safety.set_off_thread_reclaim(true);
@@ -2215,6 +2714,7 @@ fn control_thread_main(
             drv.set_rt_mode(true);
         }
     }
+    core.prewarm_observation_slots();
 
     if cfg.apply_rt_sched {
         let s = sched::apply_to_current_thread(&cfg.rt_sched, &cfg.memory_lock);
@@ -2252,11 +2752,15 @@ fn control_thread_main(
         persist_job_tx,
         persist_cmd_rx,
         persist_rep_tx,
+        pending_persist_reply: None,
+        retained_persist_job: None,
+        exit_reclaim_tx,
         persist_wake,
         persist_granted: None,
         next_persist_req: 0,
         disconnect_code_buf: Some(String::with_capacity(64)),
         disconnect_msg_buf: Some(String::with_capacity(160)),
+        sat_msg_buf: Some(String::with_capacity(160)),
         hooks,
     };
 
@@ -2295,207 +2799,252 @@ fn control_thread_main(
     let mut publish_gen = initial_generation;
     let mut panicked = false;
 
+    // Compile-time check: only `Copy` state crosses from Window 1 (whole release) into Window 2
+    // (sub-release wakes), ensuring zero uncounted destruction across the boundary.
+    const _: () = {
+        const fn assert_copy<T: Copy>() {}
+        assert_copy::<(super::ops::ReleaseReport, Instant, u64)>();
+    };
+
     while !control_stop.load(Ordering::Acquire) {
-        sleep_until(releases.next_ns());
+        let scheduled_ns = releases.next_ns();
+        sleep_until(scheduled_ns);
         if control_stop.load(Ordering::Acquire) {
             break;
         }
-        let release_start = now_inst();
-        let usage_start = UsageMark::now();
-        let now_ns = now_ns_fn();
-        let skipped = releases.advance(now_ns);
-        if skipped > 0 {
-            stats.skipped_releases.fetch_add(skipped, Ordering::Relaxed);
-        }
-        let elapsed = release_start.saturating_duration_since(last_release_start);
-        last_release_start = release_start;
-        if elapsed > LATE_LOG_AFTER {
-            stats.last_late_us.store(elapsed.as_micros() as u64, Ordering::Relaxed);
-            stats.late.fetch_add(1, Ordering::Release);
-        }
-        let step_num = stats.steps.fetch_add(1, Ordering::Relaxed) + 1;
-        let dt = elapsed.as_secs_f64();
-        let next_release_ns = releases.next_ns();
-        let remaining_ns = next_release_ns.saturating_sub(now_ns_fn());
-        let release_deadline = now_inst() + Duration::from_nanos(remaining_ns);
-        publish_gen += 1;
 
-        let step_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = ReleaseGuard::enter();
-            assert!(
-                tokio::runtime::Handle::try_current().is_err(),
-                "RT executor thread must never enter a Tokio runtime during a release"
-            );
-            if state.hooks.panic_on_release == Some(step_num) {
-                panic!("simulated RT executor panic on release {step_num}");
+        // ---- Window 1: Whole release (disjoint from sub-release wakes) ----
+        let release_res = {
+            // Declared FIRST -> drops LAST, after catch_unwind and ALL release locals drop!
+            let _alloc_scope = WholeReleaseAllocGuard::enter(&stats, false);
+            let release_start = now_inst();
+            let usage_start = UsageMark::now();
+            let now_ns = now_ns_fn();
+            let skipped = releases.advance(now_ns);
+            if skipped > 0 {
+                stats.skipped_releases.fetch_add(skipped, Ordering::Relaxed);
             }
-            if let Some(delay) = state
-                .hooks
-                .release_delay_once
-                .as_ref()
-                .and_then(|d| d.lock().ok().and_then(|mut g| g.take()))
-            {
-                sleep_dur(delay);
+            let elapsed = release_start.saturating_duration_since(last_release_start);
+            last_release_start = release_start;
+            if elapsed > LATE_LOG_AFTER {
+                stats.last_late_us.store(elapsed.as_micros() as u64, Ordering::Relaxed);
+                stats.late.fetch_add(1, Ordering::Release);
             }
-            let _ = crate::diagnostics::alloc::take();
-            let body_start = now_inst();
-            core.defer_zero_check_persist = true;
-            core.persist_capacity_available =
-                !state.persist_job_tx.is_abandoned() && state.persist_job_tx.slots() > 0;
-            core.begin_tick_phases(body_start);
+            let step_num = stats.steps.fetch_add(1, Ordering::Relaxed) + 1;
+            let dt = elapsed.as_secs_f64();
+            let next_release_ns = releases.next_ns();
+            let remaining_ns = next_release_ns.saturating_sub(now_ns_fn());
+            let release_deadline = now_inst() + Duration::from_nanos(remaining_ns);
+            publish_gen += 1;
 
-            let mut report = engine.step_with_pre_commit(
-                &mut core,
-                now_inst,
-                dt,
-                release_deadline,
-                publish_gen,
-                |core, ctx| {
-                    // Run persistence reconciliation and at most one bounded maintenance op
-                    // strictly AFTER Step 2 fresh feedback intake and strictly BEFORE Step 3
-                    // commit, Step 5 output, and Step 6 publication. Hold E-stop acknowledgements
-                    // in `core.pending_estop_acks` (keeping their `Arc<SafetyState>` alive) and
-                    // deliver them ONLY after Step 6 publishes the corresponding snapshot.
-                    state.service_persistence(core, ctx);
-                    state.service_one_maintenance(core, ctx, release_deadline);
-                    control_stop.load(Ordering::Acquire)
-                },
-            );
-            if control_stop.load(Ordering::Acquire) {
-                state.flush_pending_maint_reply(&core);
-                state.emit_estop_ack_if_advanced(&mut core);
-                state.drain_retired_states(&mut core);
-                return;
-            }
-            let (phases, body_end) = core.take_tick_phases();
-            let body_end = body_end.unwrap_or_else(now_inst);
-            core.defer_zero_check_persist = false;
-            if let Some(job) = core.pending_zero_check_persist.take() {
-                if state.persist_job_tx.push(job).is_err() {
-                    if let Some(id) = core.zero_check_persisting.take() {
-                        let (old_code, old_msg) = core.finish_zero_check_action_in_place(
-                            id,
-                            "failed",
-                            "PERSIST_FAILED",
-                            "Persistence queue saturated",
-                            state.disconnect_code_buf.take(),
-                            state.disconnect_msg_buf.take(),
-                        );
-                        if old_code.is_some() || old_msg.is_some() {
-                            let _ = state.persist_rep_tx.push(PersistReply::Done {
-                                _returned_policy: None,
-                                _returned_jaw: None,
-                                _returned_code: old_code,
-                                _returned_msg: old_msg,
-                                _returned_warning: None,
-                                _returned_probe: None,
-                            });
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || -> Option<(super::ops::ReleaseReport, Instant, u64)> {
+                    let _guard = ReleaseGuard::enter();
+                    assert!(
+                        tokio::runtime::Handle::try_current().is_err(),
+                        "RT executor thread must never enter a Tokio runtime during a release"
+                    );
+                    if state.hooks.panic_on_release == Some(step_num) {
+                        panic!("simulated RT executor panic on release {step_num}");
+                    }
+                    if let Some(delay) = state
+                        .hooks
+                        .release_delay_once
+                        .as_ref()
+                        .and_then(|d| d.lock().ok().and_then(|mut g| g.take()))
+                    {
+                        sleep_dur(delay);
+                    }
+                    let _ = crate::diagnostics::alloc::take();
+                    let body_start = now_inst();
+                    core.defer_zero_check_persist = true;
+                    core.persist_capacity_available = !state.persist_job_tx.is_abandoned()
+                        && state.persist_job_tx.slots() > 0
+                        && !state.persist_rep_tx.is_full()
+                        && state.retained_persist_job.is_none();
+                    core.begin_tick_phases(body_start);
+
+                    let report = engine.step_with_pre_commit(
+                        &mut core,
+                        now_inst,
+                        dt,
+                        release_deadline,
+                        publish_gen,
+                        |core, ctx| {
+                            // Run persistence reconciliation and at most one bounded maintenance op
+                            // strictly AFTER Step 2 fresh feedback intake and strictly BEFORE Step 3
+                            // commit, Step 5 output, and Step 6 publication. Hold E-stop acknowledgements
+                            // in `core.pending_estop_acks` (keeping their `Arc<SafetyState>` alive) and
+                            // deliver them ONLY after Step 6 publishes the corresponding snapshot.
+                            state.service_persistence(core, ctx);
+                            state.service_one_maintenance(core, ctx, release_deadline);
+                            control_stop.load(Ordering::Acquire)
+                        },
+                    );
+                    if control_stop.load(Ordering::Acquire) {
+                        state.flush_pending_maint_reply(&core);
+                        state.emit_estop_ack_if_advanced(&mut core);
+                        state.drain_retired_states(&mut core);
+                        return None;
+                    }
+                    let (phases, body_end) = core.take_tick_phases();
+                    let body_end = body_end.unwrap_or_else(now_inst);
+                    core.defer_zero_check_persist = false;
+                    if core.pending_zero_check_persist.is_none() {
+                        if let Some(injected) = state
+                            .hooks
+                            .inject_pending_persist_job_once
+                            .as_ref()
+                            .and_then(|slot| slot.lock().ok().and_then(|mut g| g.take()))
+                        {
+                            core.pending_zero_check_persist = Some(injected);
                         }
                     }
-                } else {
-                    state.persist_wake.unpark();
-                }
-            }
-            // Deliver the pre-commit maintenance reply strictly AFTER Step 6 publication, then
-            // drain any E-stop acks / retired states produced during Steps 3-7.
-            state.flush_pending_maint_reply(&core);
-            state.emit_estop_ack_if_advanced(&mut core);
-            state.drain_retired_states(&mut core);
-            let control_hz = core.config.control_frequency_hz;
-            let done = now_inst();
-            let allocs = crate::diagnostics::alloc::take();
-            let usage_done = UsageMark::now();
-            control_period_us.store((1e6 / f64::from(control_hz.max(1))) as u64, Ordering::Relaxed);
+                    if let Some(job) = core.pending_zero_check_persist.take() {
+                        match state.persist_job_tx.push(job) {
+                            Ok(()) => state.persist_wake.unpark(),
+                            Err(rtrb::PushError::Full(job)) => {
+                                state.reject_saturated_persist_job(&mut core, job);
+                            }
+                        }
+                    }
+                    // Deliver the pre-commit maintenance reply strictly AFTER Step 6 publication, then
+                    // drain any E-stop acks / retired states produced during Steps 3-7.
+                    state.flush_pending_maint_reply(&core);
+                    state.emit_estop_ack_if_advanced(&mut core);
+                    state.drain_retired_states(&mut core);
+                    let control_hz = core.config.control_frequency_hz;
+                    let done = now_inst();
+                    let allocs = crate::diagnostics::alloc::take();
+                    let usage_done = UsageMark::now();
+                    control_period_us.store((1e6 / f64::from(control_hz.max(1))) as u64, Ordering::Relaxed);
 
-            let sample = TickSample {
-                tick_us: crate::diagnostics::tick::us(done.saturating_duration_since(release_start)),
-                wait_us: 0,
-                lock_us: crate::diagnostics::tick::us(done.saturating_duration_since(body_start)),
-                post_us: 0,
-                period_us: if dt.is_finite() && dt >= 0.0 {
-                    crate::diagnostics::tick::us(Duration::from_secs_f64(dt.min(4.0e3)))
-                } else {
-                    0
-                },
-                reader_hold_us: 0,
-                writer_hold_us: 0,
-                reader_acquire_us: 0,
-                writer_acquire_us: 0,
-                stats_wait_us: 0,
-                phases: LockPhases {
-                    pre_us: crate::diagnostics::tick::us(body_start.saturating_duration_since(release_start)),
-                    rx_us: phases[0],
-                    control_us: phases[1],
-                    tx_us: phases[2],
-                    finish_us: phases[3],
-                    obs_us: phases[4],
-                    publish_us: crate::diagnostics::tick::us(done.saturating_duration_since(body_end)),
-                },
-                usage: ThreadUsage {
-                    lock_alloc_calls: allocs.calls.min(u64::from(u32::MAX)) as u32,
-                    lock_alloc_us: (allocs.total_ns / 1000).min(u64::from(u32::MAX)) as u32,
-                    lock_alloc_max_us: (allocs.max_ns / 1000).min(u64::from(u32::MAX)) as u32,
-                    ..crate::diagnostics::tick::thread_usage(&usage_start, &usage_start, &usage_done)
-                },
-                waited_for: None,
-                longest_hold: None,
-                late: !dt.is_finite() || dt > 2.0 / f64::from(control_hz.max(1)),
-            };
-            if diag_tx.push(sample).is_err() {
-                stats.diag_dropped.fetch_add(1, Ordering::Relaxed);
-            }
-            hub.wake();
-
-            // Sub-release transition wakes before `next_release_ns` (never resetting `last_release_start`).
-            let mut wakes = 0u32;
-            let mut next_wake = report.poll.wake_before(release_deadline);
-            drop(_guard);
-            while let Some(wake) = next_wake {
-                if wakes >= MAX_SERVICE_WAKES || control_stop.load(Ordering::Acquire) {
-                    break;
-                }
-                let now = now_inst();
-                if wake > now {
-                    let wake_ns = now_ns_fn()
-                        .saturating_add(wake.saturating_duration_since(now).as_nanos().min(u128::from(u64::MAX)) as u64);
-                    sleep_until(wake_ns.min(next_release_ns));
-                }
-                if control_stop.load(Ordering::Acquire) {
-                    break;
-                }
-                wakes += 1;
-                stats.wakes.fetch_add(1, Ordering::Relaxed);
-                let _wake_guard = ReleaseGuard::enter();
-                let _ = crate::diagnostics::alloc::take();
-                assert!(
-                    tokio::runtime::Handle::try_current().is_err(),
-                    "RT executor thread must never enter a Tokio runtime during a sub-release wake"
-                );
-                let published = engine
-                    .service_wake(&mut core, now_inst(), release_deadline, publish_gen + 1, &mut report);
-                if published {
-                    publish_gen += 1;
+                    let sample = TickSample {
+                        tick_us: crate::diagnostics::tick::us(done.saturating_duration_since(release_start)),
+                        wait_us: 0,
+                        lock_us: crate::diagnostics::tick::us(done.saturating_duration_since(body_start)),
+                        post_us: 0,
+                        period_us: if dt.is_finite() && dt >= 0.0 {
+                            crate::diagnostics::tick::us(Duration::from_secs_f64(dt.min(4.0e3)))
+                        } else {
+                            0
+                        },
+                        reader_hold_us: 0,
+                        writer_hold_us: 0,
+                        reader_acquire_us: 0,
+                        writer_acquire_us: 0,
+                        stats_wait_us: 0,
+                        phases: LockPhases {
+                            pre_us: crate::diagnostics::tick::us(body_start.saturating_duration_since(release_start)),
+                            rx_us: phases[0],
+                            control_us: phases[1],
+                            tx_us: phases[2],
+                            finish_us: phases[3],
+                            obs_us: phases[4],
+                            publish_us: crate::diagnostics::tick::us(done.saturating_duration_since(body_end)),
+                        },
+                        usage: ThreadUsage {
+                            lock_alloc_calls: allocs.calls.min(u64::from(u32::MAX)) as u32,
+                            lock_alloc_us: (allocs.total_ns / 1000).min(u64::from(u32::MAX)) as u32,
+                            lock_alloc_max_us: (allocs.max_ns / 1000).min(u64::from(u32::MAX)) as u32,
+                            ..crate::diagnostics::tick::thread_usage(&usage_start, &usage_start, &usage_done)
+                        },
+                        waited_for: None,
+                        longest_hold: None,
+                        late: !dt.is_finite() || dt > 2.0 / f64::from(control_hz.max(1)),
+                    };
+                    if diag_tx.push(sample).is_err() {
+                        stats.diag_dropped.fetch_add(1, Ordering::Relaxed);
+                    }
                     hub.wake();
+
+                    // Positive-control tail probe (strictly AFTER `diag_tx.push` and `hub.wake()`);
+                    // `_tail_local` drops at release-scope exit BEFORE `_alloc_scope` drops.
+                    let _tail_local = state.run_tail_alloc_probe(&state.hooks.inject_release_tail_once);
+                    let next_wake = report.poll.wake_before(release_deadline);
+                    drop(_guard);
+                    next_wake.map(|_| (report, release_deadline, next_release_ns))
+                },
+            ))
+        };
+
+        // ---- Window 2: Disjoint sub-release transition wakes before `next_release_ns` ----
+        let step_res: Result<(), Box<dyn Any + Send>> = match release_res {
+            Err(err) => Err(err),
+            Ok(None) => Ok(()),
+            Ok(Some((mut report, release_deadline, next_release_ns))) => {
+                let mut wakes = 0u32;
+                let mut next_wake = report.poll.wake_before(release_deadline);
+                let mut wake_err: Option<Box<dyn Any + Send>> = None;
+                while let Some(wake) = next_wake {
+                    if wakes >= MAX_SERVICE_WAKES || control_stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let now = now_inst();
+                    if wake > now {
+                        let wake_ns = now_ns_fn().saturating_add(
+                            wake.saturating_duration_since(now)
+                                .as_nanos()
+                                .min(u128::from(u64::MAX)) as u64,
+                        );
+                        sleep_until(wake_ns.min(next_release_ns));
+                    }
+                    if control_stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    wakes += 1;
+                    let wake_res = {
+                        // Declared FIRST -> drops LAST, after ALL wake locals drop!
+                        let _wake_alloc_scope = WholeReleaseAllocGuard::enter(&stats, true);
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Option<Instant> {
+                            stats.wakes.fetch_add(1, Ordering::Relaxed);
+                            let _wake_guard = ReleaseGuard::enter();
+                            assert!(
+                                tokio::runtime::Handle::try_current().is_err(),
+                                "RT executor thread must never enter a Tokio runtime during a sub-release wake"
+                            );
+                            let published = engine.service_wake(
+                                &mut core,
+                                now_inst(),
+                                release_deadline,
+                                publish_gen + 1,
+                                &mut report,
+                            );
+                            if published {
+                                publish_gen += 1;
+                                hub.wake();
+                            }
+                            if state
+                                .hooks
+                                .inject_wake_alloc_once
+                                .as_ref()
+                                .is_some_and(|f| f.swap(false, Ordering::AcqRel))
+                            {
+                                let v: Vec<u8> = vec![0xA5; 64];
+                                std::hint::black_box(&v);
+                                drop(v);
+                            }
+                            state.emit_estop_ack_if_advanced(&mut core);
+                            state.drain_retired_states(&mut core);
+                            let _wake_tail_local =
+                                state.run_tail_alloc_probe(&state.hooks.inject_wake_tail_once);
+                            report.poll.wake_before(release_deadline)
+                        }))
+                    };
+                    match wake_res {
+                        Ok(next) => next_wake = next,
+                        Err(err) => {
+                            wake_err = Some(err);
+                            break;
+                        }
+                    }
                 }
-                if state
-                    .hooks
-                    .inject_wake_alloc_once
-                    .as_ref()
-                    .is_some_and(|f| f.swap(false, Ordering::AcqRel))
-                {
-                    let v: Vec<u8> = vec![0xA5; 64];
-                    std::hint::black_box(&v);
-                    drop(v);
+                match wake_err {
+                    Some(err) => Err(err),
+                    None => Ok(()),
                 }
-                state.emit_estop_ack_if_advanced(&mut core);
-                state.drain_retired_states(&mut core);
-                let wake_allocs = crate::diagnostics::alloc::take();
-                if wake_allocs.calls > 0 {
-                    stats.wake_alloc_calls.fetch_add(wake_allocs.calls, Ordering::Relaxed);
-                }
-                next_wake = report.poll.wake_before(release_deadline);
             }
-        }));
+        };
 
         if let Err(err) = step_res {
             panicked = true;
@@ -2602,8 +3151,7 @@ fn control_thread_main(
         let ts = core.now_timestamp();
         core.publish(ts, publish_gen);
     }
-    state.emit_estop_ack_if_advanced(&mut core);
-    state.drain_retired_states(&mut core);
+    state.drain_estop_and_retired_stopped(&mut core);
     exited.store(true, Ordering::Release);
     *control_exited_cv.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
     control_exited_cv.1.notify_all();
@@ -2831,7 +3379,8 @@ mod tests {
         let (reclaim_state_tx, _) = RingBuffer::<Arc<SafetyState>>::new(2);
         let (persist_job_tx, _) = RingBuffer::<PendingZeroCheckPersist>::new(2);
         let (mut persist_cmd_tx, persist_cmd_rx) = RingBuffer::<PersistCmd>::new(2);
-        let (persist_rep_tx, mut persist_rep_rx) = RingBuffer::<PersistReply>::new(4);
+        let (persist_rep_tx, mut persist_rep_rx) = RingBuffer::<PersistReply>::new(PERSIST_REP_CAPACITY);
+        let (exit_reclaim_tx, _exit_reclaim_rx) = RingBuffer::<ExitReclaim>::new(EXIT_RECLAIM_CAPACITY);
 
         let probe_dropped_on = Arc::new(Mutex::new(None::<ThreadId>));
         struct DropTracker(Arc<Mutex<Option<ThreadId>>>);
@@ -2861,11 +3410,15 @@ mod tests {
             persist_job_tx,
             persist_cmd_rx,
             persist_rep_tx,
+            pending_persist_reply: None,
+            retained_persist_job: None,
+            exit_reclaim_tx,
             persist_wake: thread::current(),
             persist_granted: Some((action_id, ConfigDomain::GripperCalibration)),
             next_persist_req: 1,
             disconnect_code_buf: Some(String::from("buf")),
             disconnect_msg_buf: Some(String::from("msg")),
+            sat_msg_buf: Some(String::with_capacity(64)),
             hooks,
         };
 
@@ -2904,5 +3457,190 @@ mod tests {
         }
         assert_eq!(drained, 2, "expected returned Fail payload reply and disconnect buffer reply");
         assert!(probe_dropped_on.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn saturated_estop_and_reclaim_rings_retain_retired_fault_and_offload_on_drain_or_exit() {
+        let mut core = SupervisorInner::new(crate::model::ArmConfig::rebot_dm());
+        core.safety.set_off_thread_reclaim(true);
+
+        let (mut estop_ack_tx, mut estop_ack_rx) = RingBuffer::<EstopAck>::new(2);
+        let (mut reclaim_state_tx, mut reclaim_state_rx) = RingBuffer::<Arc<SafetyState>>::new(2);
+        let (_, maint_req_rx) = RingBuffer::<MaintRequest>::new(2);
+        let (maint_rep_tx, _) = RingBuffer::<MaintReply>::new(2);
+        let (persist_job_tx, _) = RingBuffer::<PendingZeroCheckPersist>::new(2);
+        let (_, persist_cmd_rx) = RingBuffer::<PersistCmd>::new(2);
+        let (persist_rep_tx, _) = RingBuffer::<PersistReply>::new(PERSIST_REP_CAPACITY);
+        let (exit_reclaim_tx, mut exit_reclaim_rx) = RingBuffer::<ExitReclaim>::new(EXIT_RECLAIM_CAPACITY);
+
+        // Fill both `estop_ack_tx` and `reclaim_state_tx` to 100% capacity.
+        for g in 1..=2 {
+            estop_ack_tx
+                .push(EstopAck { first_gen: g, last_gen: g, state: Arc::new(SafetyState::EStop), epoch: g })
+                .unwrap();
+            reclaim_state_tx.push(Arc::new(SafetyState::Idle)).unwrap();
+        }
+        assert!(estop_ack_tx.is_full());
+        assert!(reclaim_state_tx.is_full());
+
+        let estop_overflow_gen = Arc::new(AtomicU64::new(0));
+        let (_, _, _, stop_requests) = ReleaseEngine::new(BootId(1), Capacities::default());
+        let mut state = ControlState {
+            shutdown_committed: false,
+            control_stop: Arc::new(AtomicBool::new(false)),
+            stop_requests,
+            estop_ack_tx,
+            estop_overflow_gen: estop_overflow_gen.clone(),
+            reclaim_state_tx,
+            maint_req_rx,
+            maint_rep_tx,
+            pending_maint_reply: None,
+            persist_job_tx,
+            persist_cmd_rx,
+            persist_rep_tx,
+            pending_persist_reply: None,
+            retained_persist_job: None,
+            exit_reclaim_tx,
+            persist_wake: thread::current(),
+            persist_granted: None,
+            next_persist_req: 0,
+            disconnect_code_buf: None,
+            disconnect_msg_buf: None,
+            sat_msg_buf: None,
+            hooks: PersistTestHooks::default(),
+        };
+
+        // Queue two retired sole-ref Fault acks (not equal to `core.safety.state()`, which is Idle).
+        let fault_a = Arc::new(SafetyState::Fault(crate::safety::FaultReason::Other("sole-a".into())));
+        let weak_a = Arc::downgrade(&fault_a);
+        let fault_b = Arc::new(SafetyState::Fault(crate::safety::FaultReason::Other("sole-b".into())));
+        let weak_b = Arc::downgrade(&fault_b);
+        core.pending_estop_acks.push_back(EstopAck { first_gen: 10, last_gen: 10, state: fault_a, epoch: 10 });
+        core.pending_estop_acks.push_back(EstopAck { first_gen: 11, last_gen: 11, state: fault_b, epoch: 11 });
+
+        // Both rings full: overflow watermark advances, neither sole-ref Fault is dropped on RT.
+        state.emit_estop_ack_if_advanced(&mut core);
+        assert_eq!(estop_overflow_gen.load(Ordering::Acquire), 10);
+        assert_eq!(core.pending_estop_acks.len(), 2);
+        assert!(weak_a.upgrade().is_some(), "sole-ref fault_a must not drop while both rings are full");
+        assert!(weak_b.upgrade().is_some(), "sole-ref fault_b must not drop while both rings are full");
+
+        // Free 1 slot in `reclaim_state_rx`: fault_a moves to `reclaim_state_tx`, fault_b stays queued.
+        let _ = reclaim_state_rx.pop().unwrap();
+        state.emit_estop_ack_if_advanced(&mut core);
+        assert_eq!(core.pending_estop_acks.len(), 1);
+        assert_eq!(estop_overflow_gen.load(Ordering::Acquire), 11);
+        assert!(weak_a.upgrade().is_some(), "fault_a must stay alive in reclaim_state_tx");
+        assert!(weak_b.upgrade().is_some(), "fault_b must stay alive in pending_estop_acks");
+
+        // Clean-exit drain while both rings remain full moves fault_b into lock-free `exit_reclaim_tx`.
+        state.drain_estop_and_retired_stopped(&mut core);
+        assert!(core.pending_estop_acks.is_empty());
+        assert!(weak_b.upgrade().is_some(), "fault_b must stay alive until off-thread drain");
+
+        // Off-thread drain drops both cleanly.
+        while let Ok(a) = estop_ack_rx.pop() { drop(a); }
+        while let Ok(a) = reclaim_state_rx.pop() { drop(a); }
+        while let Ok(item) = exit_reclaim_rx.pop() { drop(item); }
+        assert!(weak_a.upgrade().is_none(), "fault_a dropped off-thread");
+        assert!(weak_b.upgrade().is_none(), "fault_b dropped off-thread");
+    }
+
+    #[test]
+    fn saturated_persist_and_maint_reply_rings_backpressure_and_hand_off_at_exit() {
+        let mut core = SupervisorInner::new(crate::model::ArmConfig::rebot_dm());
+        let (mut maint_req_tx, maint_req_rx) = RingBuffer::<MaintRequest>::new(2);
+        let (mut maint_rep_tx, mut maint_rep_rx) = RingBuffer::<MaintReply>::new(2);
+        let (estop_ack_tx, _) = RingBuffer::<EstopAck>::new(2);
+        let (reclaim_state_tx, _) = RingBuffer::<Arc<SafetyState>>::new(2);
+        let (persist_job_tx, _) = RingBuffer::<PendingZeroCheckPersist>::new(2);
+        let (mut persist_cmd_tx, persist_cmd_rx) = RingBuffer::<PersistCmd>::new(2);
+        let (mut persist_rep_tx, mut persist_rep_rx) = RingBuffer::<PersistReply>::new(PERSIST_REP_CAPACITY);
+        let (exit_reclaim_tx, mut exit_reclaim_rx) = RingBuffer::<ExitReclaim>::new(EXIT_RECLAIM_CAPACITY);
+
+        // Fill `maint_rep_tx` to full (2/2) and `persist_rep_tx` to slots() == 2 (6/8).
+        for id in 1..=2 {
+            maint_rep_tx.push(MaintReply { id, result: MaintenanceResult::ProbeReturned, returned_offsets: None, returned_probe: None }).unwrap();
+        }
+        for _ in 0..(PERSIST_REP_CAPACITY - 2) {
+            persist_rep_tx.push(PersistReply::Done {
+                _returned_policy: None, _returned_jaw: None, _returned_code: None,
+                _returned_msg: None, _returned_warning: None, _returned_probe: None, _returned_job: None,
+            }).unwrap();
+        }
+        assert_eq!(persist_rep_tx.slots(), 2);
+
+        let maint_probe_dropped = Arc::new(AtomicBool::new(false));
+        let persist_probe_dropped = Arc::new(AtomicBool::new(false));
+        struct FlagDrop(Arc<AtomicBool>);
+        impl Drop for FlagDrop { fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); } }
+
+        maint_req_tx.push(MaintRequest {
+            id: 99,
+            op: MaintenanceOp::ProbeOwnedPayload { payload: Box::new(FlagDrop(maint_probe_dropped.clone())) },
+        }).unwrap();
+        persist_cmd_tx.push(PersistCmd::Reserve {
+            action_id: 1,
+            base_revision: 0,
+            lease_owner: None,
+            new_policy: crate::model::GripperPolicy::rebot_dm(),
+            jaw_opening: None,
+            probe: Some(Box::new(FlagDrop(persist_probe_dropped.clone()))),
+            code_buf: String::with_capacity(32),
+            msg_buf: String::with_capacity(64),
+        }).unwrap();
+
+        let (engine, _, _, stop_requests) = ReleaseEngine::new(BootId(1), Capacities::default());
+        let ctx = engine.ctx(Instant::now());
+        let mut state = ControlState {
+            shutdown_committed: false,
+            control_stop: Arc::new(AtomicBool::new(false)),
+            stop_requests,
+            estop_ack_tx,
+            estop_overflow_gen: Arc::new(AtomicU64::new(0)),
+            reclaim_state_tx,
+            maint_req_rx,
+            maint_rep_tx,
+            pending_maint_reply: None,
+            persist_job_tx,
+            persist_cmd_rx,
+            persist_rep_tx,
+            pending_persist_reply: None,
+            retained_persist_job: None,
+            exit_reclaim_tx,
+            persist_wake: thread::current(),
+            persist_granted: None,
+            next_persist_req: 0,
+            disconnect_code_buf: Some(String::with_capacity(64)),
+            disconnect_msg_buf: Some(String::with_capacity(160)),
+            sat_msg_buf: Some(String::with_capacity(160)),
+            hooks: PersistTestHooks::default(),
+        };
+
+        // Under saturation: neither maint nor persist pops or drops its payload.
+        state.service_one_maintenance(&mut core, &ctx, Instant::now() + Duration::from_millis(20));
+        state.service_persistence(&mut core, &ctx);
+        assert!(!maint_probe_dropped.load(Ordering::SeqCst), "maint payload must not drop under full reply ring");
+        assert!(!persist_probe_dropped.load(Ordering::SeqCst), "persist payload must not drop when slots() < 3");
+
+        // Fill remaining 2 slots of `persist_rep_tx` so exit drain must spill into `exit_reclaim_tx`.
+        for _ in 0..2 {
+            state.persist_rep_tx.push(PersistReply::Done {
+                _returned_policy: None, _returned_jaw: None, _returned_code: None,
+                _returned_msg: None, _returned_warning: None, _returned_probe: None, _returned_job: None,
+            }).unwrap();
+        }
+        assert!(state.persist_rep_tx.is_full());
+        state.drain_maintenance_stopped();
+        state.drain_persistence_stopped(&core);
+        assert!(!maint_probe_dropped.load(Ordering::SeqCst), "maint payload must stay alive in exit_reclaim_tx");
+        assert!(!persist_probe_dropped.load(Ordering::SeqCst), "persist payload must stay alive in exit_reclaim_tx");
+
+        // Off-thread drain drops everything cleanly.
+        while let Ok(r) = maint_rep_rx.pop() { drop(r); }
+        while let Ok(r) = persist_rep_rx.pop() { drop(r); }
+        while let Ok(item) = exit_reclaim_rx.pop() { drop(item); }
+        assert!(maint_probe_dropped.load(Ordering::SeqCst));
+        assert!(persist_probe_dropped.load(Ordering::SeqCst));
     }
 }
