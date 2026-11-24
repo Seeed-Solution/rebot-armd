@@ -1108,11 +1108,6 @@ impl SupervisorInner {
             return Ok(());
         };
         let mut drv = d.lock().map_err(|_| "FEEDBACK_UNAVAILABLE")?;
-        if DisableConfirm::confirmed(&**drv) {
-            drop(drv);
-            self.disable_confirmed();
-            return Ok(());
-        }
         let res = drv.begin_torque_budgeted(false, 0);
         let drv_now = drv.clock_now();
         match res {
