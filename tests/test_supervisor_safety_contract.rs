@@ -412,12 +412,13 @@ async fn test_zero_check_store_offset_limit_rejection_marks_action_failed() {
     let action_id = inner.begin_action("gripper_zero_check", None);
     // Set parameters: threshold_rad=0.5, store_offset=true, base_closed_rad=0.0
     // Measured offset is 0.4 rad, which when applied shifts jaw outside dm limits
+    let persist_ctx = Some(Box::new(armd::supervisor::ZeroCheckPersistContext::from_inner(&inner, None)));
     inner.zero_check_params = Some(armd::supervisor::ZeroCheckParams {
         action_id,
         store_offset: true,
         threshold_rad: 0.5,
         base_closed_rad: 0.0,
-        operator_auth: None,
+        persist_ctx,
     });
     // Measured position 0.4 rad (offset = 0.4 rad <= threshold 0.5 rad, so mechanical check passes)
     inner.measured_positions[6] = 0.4;

@@ -700,6 +700,26 @@ pub fn grasp_width_check_json(inner: &SupervisorInner, max_w: f64) -> Value {
     }
 }
 
+/// Published-config counterpart of [`grasp_width_check_json`] (zero `SupervisorLock`).
+pub fn grasp_width_check_json_from_published(
+    pub_cfg: &crate::rt_core::requests::config::PublishedConfig,
+    max_w: f64,
+) -> Value {
+    match pub_cfg.grasp_width_check(max_w) {
+        Some(c) => {
+            let has_curve = pub_cfg.config.gripper_policy.as_ref().is_some_and(|g| g.jaw_opening.is_some());
+            serde_json::json!({
+                "status": c.status(),
+                "jaw_curve": if has_curve { "present" } else { "missing" },
+                "max_grasp_width_m": max_w,
+                "effective_max_grasp_width_m": c.effective_max_m(max_w),
+                "curve_max_opening_m": c.curve_max_m(),
+            })
+        }
+        None => Value::Null,
+    }
+}
+
 /// What the WS / REST handlers need for grasps: the detection source and the setup file.
 #[derive(Clone)]
 pub struct GraspDeps {

@@ -24,6 +24,7 @@ pub(crate) struct CandidateDriverLimits {
     min: [f32; crate::rt_core::mailbox::MAX_DOF],
     max: [f32; crate::rt_core::mailbox::MAX_DOF],
     vel: [f32; crate::rt_core::mailbox::MAX_DOF],
+    raw_pos: [Option<(f32, f32)>; crate::rt_core::mailbox::MAX_DOF],
 }
 
 /// Result of a bounded last-chance hardware disable attempt on a panic or forced teardown path.
@@ -598,6 +599,9 @@ impl SupervisorInner {
         trigger_fault: bool,
     ) {
         self.driver_config_error = None;
+        for (i, slot) in self.cached_driver_pos_limits.iter_mut().enumerate() {
+            *slot = pos_limits.get(i).copied().flatten();
+        }
         let mut candidate = self.config.clone();
 
         for (i, limit) in candidate.limits.iter_mut().enumerate() {
@@ -745,6 +749,61 @@ impl SupervisorInner {
         }
     }
 
+    /// Zero-allocation check whether a candidate `GripperPolicy` satisfies both profile and
+    /// driver hardware position limits without mutating `self`.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn validate_gripper_policy_against_driver_bounded(
+        &self,
+        gp: &crate::model::GripperPolicy,
+    ) -> Result<(), crate::safety::BoundedText<256>> {
+        use crate::safety::BoundedText;
+        let Some(g_idx) = self.config.gripper_index() else {
+            return Err(BoundedText::new("Gripper calibration requires a gripper joint"));
+        };
+        let Some(lim) = self.config.limits.get(g_idx) else {
+            return Err(BoundedText::new("Gripper calibration requires gripper joint limits"));
+        };
+        let mut lo = lim.min_position;
+        let mut hi = lim.max_position;
+        if self.rt_executor_owned {
+            if let Some((d_min, d_max)) = self.cached_driver_pos_limits.get(g_idx).copied().flatten() {
+                if !d_min.is_finite() || !d_max.is_finite() || d_min >= d_max {
+                    return Err(BoundedText::new("Driver position limits for gripper joint are invalid"));
+                }
+                lo = lo.max(d_min);
+                hi = hi.min(d_max);
+            }
+        } else if let Some(d) = self.driver.as_ref() {
+            let drv = d
+                .lock()
+                .map_err(|_| BoundedText::new("driver unavailable while validating gripper calibration"))?;
+            if let Some((d_min, d_max)) = drv.position_limits(g_idx) {
+                if !d_min.is_finite() || !d_max.is_finite() || d_min >= d_max {
+                    return Err(BoundedText::new("Driver position limits for gripper joint are invalid"));
+                }
+                lo = lo.max(d_min);
+                hi = hi.min(d_max);
+            }
+        }
+        if self.driver_config_error.is_some() && self.driver.is_none() {
+            return Err(self
+                .driver_config_error
+                .as_deref()
+                .map(BoundedText::new)
+                .unwrap_or_else(|| BoundedText::new("Driver limit configuration error prevents gripper calibration")));
+        }
+        let in_lim = |v: f32| v.is_finite() && v >= lo && v <= hi;
+        if !(in_lim(gp.closed_rad)
+            && in_lim(gp.open_rad)
+            && gp.jaw_opening.as_ref().is_none_or(|jo| jo.points.iter().all(|&[q, _]| in_lim(q))))
+        {
+            return Err(BoundedText::new(
+                "Driver limits violated config invariants: Invalid gripper policy (open/closed inside the gripper joint limits, 0 <= squeeze_rad <= 0.5)",
+            ));
+        }
+        Ok(())
+    }
+
     /// Pure read-only validation of driver position/velocity limits into bounded stack storage
     /// (zero allocations, zero mutations to `self`).
     #[allow(clippy::result_large_err)] // inline bounded text avoids RT heap allocation
@@ -883,6 +942,7 @@ impl SupervisorInner {
             min: cand_min,
             max: cand_max,
             vel: cand_vel,
+            raw_pos: pos_limits,
         })
     }
 
@@ -893,6 +953,7 @@ impl SupervisorInner {
             self.config.limits[i].min_position = cand.min[i];
             self.config.limits[i].max_position = cand.max[i];
             self.config.limits[i].max_velocity = cand.vel[i];
+            self.cached_driver_pos_limits[i] = cand.raw_pos[i];
         }
         if let Some(prev) = self.driver_config_error.take() {
             if self.retired_driver_config_error.is_none() {
@@ -1859,6 +1920,7 @@ impl SupervisorInner {
             shutdown_committed: self.shutdown_committed,
             driver_config_error: driver_config_error_override
                 .or_else(|| self.driver_config_error.as_deref().map(BoundedText::new)),
+            config_reconcile_fault: self.config_reconcile_fault,
             gravity_comp_unconfirmed: self.gravity_comp_blocks_clear(),
             disable_pending: self.disable_pending,
             has_driver: self.driver.is_some(),
@@ -2483,6 +2545,7 @@ impl SupervisorInner {
         self.last_commanded_velocities.fill(0.0);
         self.commanded_accelerations.fill(0.0);
         self.following_error_since = None;
+        self.watchdog_park_blocked_reason = None;
         self.bus_loss_instant = None;
         self.reset_gripper_stall();
         if self.consume_pending_estop() {

@@ -2476,6 +2476,34 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             // `ArmCore` is not owned by the legacy supervisor lock.
             let owner_mode = recv_supervisor.owner_mode();
             if owner_mode != crate::supervisor::OWNER_LEGACY {
+                if owner_mode == crate::supervisor::OWNER_EXECUTOR {
+                    if let Some(opt_reply) = config::handle_executor_ws_command(
+                        frame_kind,
+                        entry,
+                        &value,
+                        stamp,
+                        recv_conn_id,
+                        &recv_connection,
+                        &recv_generation,
+                        &recv_client_label,
+                        &mut last_ordinary_request,
+                        &ws_auth,
+                        &recv_supervisor,
+                        &recv_deps,
+                        &recv_calib,
+                        &ack_tx,
+                        &worker_tasks,
+                    )
+                    .await
+                    {
+                        if let Some(reply) = opt_reply {
+                            if !worker_writer.send_ordinary_control(reply).await {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                }
                 if let Some(reply) = executor_routing_reject(&value, owner_mode) {
                     if !worker_writer.send_ordinary_control(reply).await { break; }
                 }
@@ -2533,7 +2561,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 policy: None,
                 dry_run_grasp: None,
             };
-            let mut pending_config_write: Option<(Value, PreparedConfigWrite, u64, u64)> = None;
+            let mut pending_config_write: Option<config::PendingConfigJob> = None;
             let mut pending_calibration: Option<(Value, CalibJob, u64, u64, bool)> = None;
             maybe_pause_worker_before_lock(&recv_connection).await;
             let mut reply_gate_guard;
@@ -2770,20 +2798,20 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         &worker_tasks,
                     );
                 }
-                // Atomic two-phase persist-before-commit config writes (track B, `config::persist_and_activate`).
-                if let Some((request_id, prepared, generation, epoch)) = pending_config_write.take() {
-                    config::spawn_config_write(
-                        request_id,
-                        prepared,
-                        generation,
-                        epoch,
+                // Atomic two-phase persist-before-commit config writes (PR C / A8, off-lock prepare + requests::config).
+                if let Some(job) = pending_config_write.take() {
+                    response = config::complete_or_spawn_config_write(
+                        job,
+                        recv_conn_id,
                         &recv_supervisor,
+                        &recv_deps,
                         &ack_tx,
                         &ws_auth,
                         &recv_connection,
                         &recv_generation,
                         &worker_tasks,
-                    );
+                    )
+                    .await;
                 }
             } else {
                 #[cfg(feature = "policy-runtime")]

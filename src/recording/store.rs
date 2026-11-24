@@ -378,6 +378,60 @@ struct Catalog {
     loaded: bool,
     episodes: HashMap<String, Entry>,
     datasets: DatasetsManifest,
+    /// Reference count of episodes currently pinned by an in-flight `ConfigDomain::Sequences`
+    /// reservation (or post-rename `Reconciling` state). Prevents concurrent episode deletion
+    /// without acquiring any lock on `armd-control`.
+    pinned_episodes: HashMap<String, usize>,
+}
+
+/// RAII pin guard holding episode IDs in [`Catalog::pinned_episodes`] across a `Sequences` commit
+/// reservation. Drops cleanly on `Cleared` or post-activation; call [`Self::keep_pinned_for_reconcile`]
+/// on post-rename `Reconciling` so on-disk sequence references stay protected.
+pub struct EpisodePinGuard {
+    catalog: Arc<Mutex<Catalog>>,
+    ids: Vec<String>,
+}
+
+impl EpisodePinGuard {
+    /// Retains the episode pins in the catalog when the commit enters post-rename `Reconciling`.
+    pub fn keep_pinned_for_reconcile(mut self) {
+        self.ids.clear();
+    }
+}
+
+impl Drop for EpisodePinGuard {
+    fn drop(&mut self) {
+        if self.ids.is_empty() {
+            return;
+        }
+        let mut cat = self.catalog.lock().unwrap_or_else(|e| e.into_inner());
+        for id in &self.ids {
+            if let Some(count) = cat.pinned_episodes.get_mut(id) {
+                if *count <= 1 {
+                    cat.pinned_episodes.remove(id);
+                } else {
+                    *count -= 1;
+                }
+            }
+        }
+    }
+}
+
+/// Atomic outcome of [`EpisodeStore::take_if_unpinned_and_rev_matches`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TakeEpisodeOutcome {
+    Removed,
+    NotFound,
+    Pinned,
+    SequenceRevisionChanged,
+}
+
+/// Atomic outcome of [`EpisodeStore::take_dataset_if_unpinned_and_rev_matches`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TakeDatasetOutcome {
+    Removed(Vec<String>),
+    Pinned(String),
+    SequenceRevisionChanged,
 }
 
 type SummaryCache = Arc<Mutex<HashMap<String, (SystemTime, u64, EpisodeInfo)>>>;
@@ -671,6 +725,106 @@ impl EpisodeStore {
     /// Remove `id` from the catalog (no I/O; the caller deletes the files with
     /// [`delete_files`](Self::delete_files)). Returns whether it was listed.
     pub fn take_for_delete(&self, id: &str) -> bool { self.cat().episodes.remove(id).is_some() }
+
+    /// Atomically verifies that every `(step_idx, episode_id)` exists in the catalog and pins
+    /// them against concurrent deletion while a `Sequences` reservation is held.
+    /// Returns `Err((step_idx, episode_id))` on the first missing episode without pinning any.
+    pub fn pin_episodes_for_sequence(
+        &self,
+        step_episodes: &[(usize, String)],
+    ) -> Result<EpisodePinGuard, (usize, String)> {
+        let mut cat = self.cat();
+        for (step, id) in step_episodes {
+            if !cat.episodes.contains_key(id) {
+                return Err((*step, id.clone()));
+            }
+        }
+        let mut ids = Vec::with_capacity(step_episodes.len());
+        for (_, id) in step_episodes {
+            *cat.pinned_episodes.entry(id.clone()).or_insert(0) += 1;
+            ids.push(id.clone());
+        }
+        Ok(EpisodePinGuard {
+            catalog: Arc::clone(&self.catalog),
+            ids,
+        })
+    }
+
+    /// True if `id` is currently pinned by an active `Sequences` save reservation or reconciling state.
+    pub fn is_pinned(&self, id: &str) -> bool {
+        self.cat()
+            .pinned_episodes
+            .get(id)
+            .copied()
+            .unwrap_or(0)
+            > 0
+    }
+
+    /// Atomically checks that `id` is not pinned and `seq_rev` still equals `expected_rev`,
+    /// then removes `id` from the catalog under one lock acquisition.
+    pub fn take_if_unpinned_and_rev_matches(
+        &self,
+        id: &str,
+        seq_rev: &AtomicU64,
+        expected_rev: u64,
+    ) -> TakeEpisodeOutcome {
+        let mut cat = self.cat();
+        if cat.pinned_episodes.get(id).copied().unwrap_or(0) > 0 {
+            return TakeEpisodeOutcome::Pinned;
+        }
+        if seq_rev.load(Ordering::Acquire) != expected_rev {
+            return TakeEpisodeOutcome::SequenceRevisionChanged;
+        }
+        if cat.episodes.remove(id).is_some() {
+            TakeEpisodeOutcome::Removed
+        } else {
+            TakeEpisodeOutcome::NotFound
+        }
+    }
+
+    /// Atomically verifies none of `ids` are pinned and `seq_rev` still equals `expected_rev`,
+    /// then removes all of them from the catalog in one all-or-nothing lock acquisition.
+    pub fn take_dataset_if_unpinned_and_rev_matches(
+        &self,
+        ids: &[String],
+        seq_rev: &AtomicU64,
+        expected_rev: u64,
+    ) -> TakeDatasetOutcome {
+        let mut cat = self.cat();
+        for id in ids {
+            if cat.pinned_episodes.get(id).copied().unwrap_or(0) > 0 {
+                return TakeDatasetOutcome::Pinned(id.clone());
+            }
+        }
+        if seq_rev.load(Ordering::Acquire) != expected_rev {
+            return TakeDatasetOutcome::SequenceRevisionChanged;
+        }
+        let mut removed = Vec::with_capacity(ids.len());
+        for id in ids {
+            if cat.episodes.remove(id).is_some() {
+                removed.push(id.clone());
+            }
+        }
+        TakeDatasetOutcome::Removed(removed)
+    }
+
+    /// Delete dataset manifest entry plus already-catalog-removed episode files (blocking).
+    pub fn delete_dataset_taken_files(&self, name: &str, taken_ids: &[String]) -> Result<Vec<String>, StoreError> {
+        let dir = self.require_dir()?;
+        for id in taken_ids {
+            match self.delete_files(id) {
+                Ok(()) | Err(StoreError::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let _w = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut manifest = self.cat().datasets.clone();
+        if manifest.datasets.remove(name).is_some() {
+            self.write_manifest(dir, &manifest)?;
+            self.cat().datasets = manifest;
+        }
+        Ok(taken_ids.to_vec())
+    }
 
     /// Remove `<id>.parquet`, `<id>.json` and a legacy `<id>.meta.json` (blocking).
     pub fn delete_files(&self, id: &str) -> Result<(), StoreError> {

@@ -112,6 +112,15 @@ pub struct RunPins {
     pub episode_ids: Vec<String>,
 }
 
+/// Pose and episode ids pinned by an in-flight `ConfigDomain::Sequences` reservation
+/// (held from `Reserve` through `Activate` or `Reconciling`; cleared on `Cleared`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ReservedSequencePins {
+    pub sequence_id: String,
+    pub pose_ids: Vec<String>,
+    pub episode_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SequenceStore {
     pub file: SequenceFile,
@@ -119,6 +128,8 @@ pub struct SequenceStore {
     pub path: Option<PathBuf>,
     /// The running sequence's references.
     pub pins: Option<RunPins>,
+    /// References pinned by an active `Sequences` save reservation (or post-rename `Reconciling`).
+    pub reserved_pins: Option<ReservedSequencePins>,
     /// Store revision: incremented by every committed save / delete (`expected_revision`).
     pub revision: u64,
 }
@@ -126,7 +137,39 @@ pub struct SequenceStore {
 impl SequenceStore {
     pub fn get(&self, id: &str) -> Option<&Sequence> { self.file.sequences.iter().find(|s| s.id == id) }
 
-    /// Ids of the sequences that reference pose `id` (and the running one when it pinned it).
+    /// Zero-allocation check whether any stored, running, or reserved sequence references pose `id`.
+    pub fn is_pose_in_use(&self, id: &str) -> bool {
+        if id.is_empty() {
+            return false;
+        }
+        self.file.sequences.iter().any(|s| s.pose_ids().any(|p| p == id))
+            || self
+                .pins
+                .as_ref()
+                .is_some_and(|p| p.pose_ids.iter().any(|x| x == id))
+            || self
+                .reserved_pins
+                .as_ref()
+                .is_some_and(|p| p.pose_ids.iter().any(|x| x == id))
+    }
+
+    /// Zero-allocation check whether any stored, running, or reserved sequence references episode `id`.
+    pub fn is_episode_in_use(&self, id: &str) -> bool {
+        if id.is_empty() {
+            return false;
+        }
+        self.file.sequences.iter().any(|s| s.episode_ids().any(|e| e == id))
+            || self
+                .pins
+                .as_ref()
+                .is_some_and(|p| p.episode_ids.iter().any(|x| x == id))
+            || self
+                .reserved_pins
+                .as_ref()
+                .is_some_and(|p| p.episode_ids.iter().any(|x| x == id))
+    }
+
+    /// Ids of the sequences that reference pose `id` (including running or reserved saves).
     pub fn using_pose(&self, id: &str) -> Vec<String> {
         self.using_pose_with_pins(id, self.pins.as_ref())
     }
@@ -136,10 +179,17 @@ impl SequenceStore {
         if let Some(p) = active_pins.filter(|p| p.pose_ids.iter().any(|x| x == id)) {
             if !out.contains(&p.sequence_id) { out.push(p.sequence_id.clone()); }
         }
+        if let Some(p) = self.reserved_pins.as_ref().filter(|p| p.pose_ids.iter().any(|x| x == id)) {
+            if !p.sequence_id.is_empty() && !out.contains(&p.sequence_id) {
+                out.push(p.sequence_id.clone());
+            } else if p.sequence_id.is_empty() && out.is_empty() {
+                out.push("pending_save".to_string());
+            }
+        }
         out
     }
 
-    /// Ids of the sequences that reference episode `id` (and the running one when it pinned it).
+    /// Ids of the sequences that reference episode `id` (including running or reserved saves).
     pub fn using_episode(&self, id: &str) -> Vec<String> {
         self.using_episode_with_pins(id, self.pins.as_ref())
     }
@@ -148,6 +198,13 @@ impl SequenceStore {
         let mut out: Vec<String> = self.file.sequences.iter().filter(|s| s.episode_ids().any(|e| e == id)).map(|s| s.id.clone()).collect();
         if let Some(p) = active_pins.filter(|p| p.episode_ids.iter().any(|x| x == id)) {
             if !out.contains(&p.sequence_id) { out.push(p.sequence_id.clone()); }
+        }
+        if let Some(p) = self.reserved_pins.as_ref().filter(|p| p.episode_ids.iter().any(|x| x == id)) {
+            if !p.sequence_id.is_empty() && !out.contains(&p.sequence_id) {
+                out.push(p.sequence_id.clone());
+            } else if p.sequence_id.is_empty() && out.is_empty() {
+                out.push("pending_save".to_string());
+            }
         }
         out
     }
