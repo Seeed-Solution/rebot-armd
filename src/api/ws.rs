@@ -40,6 +40,12 @@ use dispatch::{
     OwnerDispatchCtx, ReplyPolicy, UrgentEStopCtx, UrgentStopCtx,
 };
 
+/// Initialises the WS dispatch tables ahead of the first connection (see
+/// `dispatch::prewarm_tables`).
+pub fn prewarm_dispatch_tables() {
+    dispatch::prewarm_tables();
+}
+
 pub type ConnectionRegistry = Arc<Mutex<HashMap<String, mpsc::Sender<Message>>>>;
 
 static CONNECTION_REGISTRY: LazyLock<ConnectionRegistry> =

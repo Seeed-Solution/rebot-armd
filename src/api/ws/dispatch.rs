@@ -428,6 +428,13 @@ static COMMAND_TABLE: LazyLock<HashMap<&'static str, &'static DispatchEntry>> =
         map
     });
 
+/// Builds both dispatch tables. Called once when the router is created, before any connection is
+/// accepted, so that a connection's reader never waits on the lazy initialisation (run by
+/// another connection's task) before it latches an E-stop or hands over a Stop.
+pub(super) fn prewarm_tables() {
+    LazyLock::force(&COMMAND_TABLE);
+}
+
 /// Normalize an inbound WS JSON frame into its canonical [`FrameKind`], preserving exact
 /// alias precedence (explicit `type` > `mode: "cartesian_joint_stream"` > implicit `positions`).
 pub(super) fn normalize_frame_kind(value: &Value) -> FrameKind {
