@@ -3517,6 +3517,7 @@ impl SupervisorInner {
             let _ = self.snapshot_measured_hold();
         }
         if cancel_contended {
+            self.detached_cancel_restore_intent = None;
             self.retain_detached_enable_cancel_if_clear(_was_torqued);
         }
         // 4. Record captured measured positions and enter FailedHold (no cached-command fallback).
@@ -3919,6 +3920,7 @@ impl SupervisorInner {
             let wake = budget.map_or_else(Instant::now, |b| b.now);
             return EnableStepOutcome::Pending { wake };
         }
+        let restore_intent = self.detached_cancel_restore_intent.take();
         if reducer.was_torqued || drv_any_enabled {
             let dof = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
             for j in 0..dof {
@@ -3940,6 +3942,16 @@ impl SupervisorInner {
             self.is_torqued = true;
             self.torque_intent = TorqueIntent::On;
             self.pending_rearm = true;
+        } else if let Some(prev_intent) = restore_intent {
+            // Reconcile provisional FailedHold from contended clean Stop once driver confirms
+            // zero enable frames were dispatched and zero joints are energized (R5 M5).
+            if !self.safety.state().is_stopped() && !self.estop_pending() {
+                self.enable_lifecycle = EnableLifecycle::Disarmed;
+                self.is_torqued = false;
+                self.torque_intent = prev_intent;
+                self.pending_rearm = false;
+                self.measured_hold.clear();
+            }
         }
         EnableStepOutcome::Failed {
             rt_code: "CANCELLED",
@@ -4177,7 +4189,7 @@ impl SupervisorInner {
                 let mut scratch_bounds = std::mem::take(&mut self.scratch.fb.bounds);
                 let lock_res = {
                     let d = self.driver.as_ref().expect("checked is_some");
-                    let guard = if budget.is_some() {
+                    let guard = if budget.is_some() || reducer.budgeted {
                         match d.try_lock() {
                             Ok(g) => Ok(g),
                             Err(std::sync::TryLockError::WouldBlock) => Err(true),
@@ -4212,7 +4224,14 @@ impl SupervisorInner {
                                 .and_then(|a| (a.lease_generation != 0).then_some(a.lease_generation));
                             drv.set_enable_authority(tx_dl, expected_lease_gen);
                             let (r, rx) = if let Some(b) = budget {
-                                let span = b.deadline.saturating_duration_since(b.now);
+                                // Use remaining budget at the moment of the driver call so time
+                                // already spent under the guard is never re-granted (R5 M2).
+                                let span = match reducer.origin {
+                                    EnableOrigin::LegacyWs { .. } => {
+                                        b.deadline.saturating_duration_since(Instant::now())
+                                    }
+                                    _ => b.deadline.saturating_duration_since(b.now),
+                                };
                                 let r = if reducer.budgeted {
                                     drv.poll_torque_budgeted(drv_now + span, b.max_rx_frames)
                                 } else {
@@ -4383,7 +4402,14 @@ impl SupervisorInner {
                                 }
                             }
                         }
-                        let estop_interrupted = crate::driver::is_estop_inhibited(&e);
+                        let live_estop = self.estop_pending()
+                            || self.e_stop_latched.load(Ordering::SeqCst)
+                            || matches!(self.safety.state(), SafetyState::EStop);
+                        let estop_interrupted =
+                            crate::driver::is_estop_inhibited(&e) || live_estop;
+                        if live_estop {
+                            rt_code = "ESTOP_ACTIVE";
+                        }
                         let message = self.enter_failed_hold(reducer.was_torqued, |buf| {
                             e.write_bounded(buf);
                         });
@@ -4440,6 +4466,20 @@ impl SupervisorInner {
             deadline,
         } = reducer.origin
         {
+            if self.estop_pending()
+                || self.e_stop_latched.load(Ordering::SeqCst)
+                || matches!(self.safety.state(), SafetyState::EStop)
+            {
+                let message = self.enter_failed_hold(was_torqued, |buf| {
+                    buf.push_str("interrupted by E-stop before validation");
+                });
+                return EnableStepOutcome::Failed {
+                    rt_code: "ESTOP_ACTIVE",
+                    message,
+                    feedback_unavailable: false,
+                    estop_interrupted: true,
+                };
+            }
             if Instant::now() >= deadline {
                 let message = self.enter_failed_hold(was_torqued, |buf| {
                     buf.push_str("enable request deadline expired before validation");
@@ -4494,7 +4534,7 @@ impl SupervisorInner {
             let mut scratch_loads = std::mem::take(&mut self.scratch.loads);
             let (validate_res, temp_fb) = {
                 let d = self.driver.as_ref().expect("checked is_some");
-                let guard = if budget.is_some() {
+                let guard = if budget.is_some() || reducer.budgeted {
                     match d.try_lock() {
                         Ok(g) => Ok(g),
                         Err(std::sync::TryLockError::WouldBlock) => Err(true),
@@ -4621,6 +4661,20 @@ impl SupervisorInner {
             deadline,
         } = reducer.origin
         {
+            if self.estop_pending()
+                || self.e_stop_latched.load(Ordering::SeqCst)
+                || matches!(self.safety.state(), SafetyState::EStop)
+            {
+                let message = self.enter_failed_hold(was_torqued, |buf| {
+                    buf.push_str("interrupted by E-stop before arming");
+                });
+                return EnableStepOutcome::Failed {
+                    rt_code: "ESTOP_ACTIVE",
+                    message,
+                    feedback_unavailable: false,
+                    estop_interrupted: true,
+                };
+            }
             if Instant::now() >= deadline {
                 let message = self.enter_failed_hold(was_torqued, |buf| {
                     buf.push_str("enable request deadline expired before arming");
@@ -4747,6 +4801,20 @@ impl SupervisorInner {
             deadline,
         } = reducer.origin
         {
+            if self.estop_pending()
+                || self.e_stop_latched.load(Ordering::SeqCst)
+                || matches!(self.safety.state(), SafetyState::EStop)
+            {
+                let message = self.enter_failed_hold(was_torqued, |buf| {
+                    buf.push_str("interrupted by E-stop before validation");
+                });
+                return EnableStepOutcome::Failed {
+                    rt_code: "ESTOP_ACTIVE",
+                    message,
+                    feedback_unavailable: false,
+                    estop_interrupted: true,
+                };
+            }
             if Instant::now() >= deadline {
                 let message = self.enter_failed_hold(was_torqued, |buf| {
                     buf.push_str("enable request deadline expired before validation");
@@ -5659,7 +5727,12 @@ impl SupervisorInner {
             self.settle_legacy_ws_failed(token, slot, LegacyTorqueFailure::EStopActive);
             return true;
         }
-        let (drv_any_enabled, _) = self.abort_enable_driver_nonblocking(was_torqued, true);
+        let (drv_any_enabled, contended) = self.abort_enable_driver_nonblocking(was_torqued, true);
+        if contended && !was_torqued {
+            self.detached_cancel_restore_intent = Some(prev_torque_intent);
+        } else {
+            self.detached_cancel_restore_intent = None;
+        }
         let any_energized = was_torqued || drv_any_enabled;
         if !any_energized {
             self.enable_lifecycle = EnableLifecycle::Disarmed;
@@ -5855,6 +5928,13 @@ impl SupervisorInner {
         &mut self,
         deadline: Instant,
     ) -> Result<LegacyTorqueStart, SafetyError> {
+        if Instant::now() >= deadline {
+            return Ok(LegacyTorqueStart::ImmediateRejected {
+                failure: LegacyTorqueFailure::StaticCode("DEADLINE_EXPIRED"),
+                epoch_id: self.safety.epoch_id(),
+                safety_state: self.safety.state().clone(),
+            });
+        }
         if self.calibration_busy && self.motor_zero_busy {
             return Err(SafetyError::MotionBusy);
         }
@@ -5918,9 +5998,6 @@ impl SupervisorInner {
 
         let use_budgeted =
             self.driver_supports_rt_executor || self.driver_supports_budgeted_disable_await;
-        let step_budget = deadline
-            .saturating_duration_since(now_wall)
-            .min(Duration::from_millis(1));
         let locked = {
             let d = self.driver.as_ref().expect("checked is_some");
             match d.try_lock() {
@@ -5932,6 +6009,9 @@ impl SupervisorInner {
                         let disable_kind = crate::driver::DisableKind::DisableRequested {
                             started_at: requested_at,
                         };
+                        let step_budget = deadline
+                            .saturating_duration_since(Instant::now())
+                            .min(Duration::from_millis(1));
                         if use_budgeted {
                             drv.set_tx_release_deadline(Some(requested_at + step_budget));
                         }
@@ -7389,7 +7469,13 @@ impl SupervisorInner {
                     }
                     return Some(TransitionPoll { progress: Err("INTERNAL"), rx: None, broker_owned });
                 }
-                let span = budget.deadline.saturating_duration_since(budget.now);
+                let req_deadline = match origin {
+                    DisableOrigin::LegacyWs { deadline, .. } => Some(deadline),
+                    DisableOrigin::Detached { deadline } => deadline,
+                    _ => None,
+                };
+                let is_protective =
+                    matches!(kind, crate::driver::DisableKind::DisableProtective { .. });
                 let control_release_seq = self.control_release_seq;
                 let nonblocking_lock = self.rt_executor_owned
                     || broker_owned
@@ -7413,15 +7499,37 @@ impl SupervisorInner {
                                 drv.begin_control_release(control_release_seq);
                             }
                             let drv_now = drv.clock_now();
+                            // Compute remaining service budget at the moment of the driver call,
+                            // and bound any undispatched non-protective WS/Detached disable by its
+                            // remaining request deadline so first dispatch never crosses expiry (R5 B2/M2).
+                            let span = match origin {
+                                DisableOrigin::LegacyWs { .. } | DisableOrigin::Detached { .. } => {
+                                    budget.deadline.saturating_duration_since(Instant::now())
+                                }
+                                _ => budget.deadline.saturating_duration_since(budget.now),
+                            };
+                            let mut eff_span = span;
+                            let mut applied_ws_dl = false;
+                            if let Some(dl) = req_deadline {
+                                if !is_protective && !drv.disable_frames_dispatched() {
+                                    let req_rem = dl.saturating_duration_since(Instant::now());
+                                    eff_span = span.min(req_rem);
+                                    drv.set_tx_release_deadline(Some(drv_now + eff_span));
+                                    applied_ws_dl = true;
+                                }
+                            }
                             let use_budgeted = broker_owned
                                 || self.rt_executor_owned
                                 || self.driver_supports_rt_executor
                                 || self.driver_supports_budgeted_disable_await;
                             let r = if use_budgeted {
-                                drv.poll_torque_budgeted(drv_now + span, budget.max_rx_frames)
+                                drv.poll_torque_budgeted(drv_now + eff_span, budget.max_rx_frames)
                             } else {
-                                drv.poll_torque(drv_now + span)
+                                drv.poll_torque(drv_now + eff_span)
                             };
+                            if applied_ws_dl {
+                                drv.set_tx_release_deadline(None);
+                            }
                             let frames_dispatched = drv.disable_frames_dispatched();
                             let dispatched_mask = drv.disable_dispatched_mask();
                             let rx = drv.take_last_poll_rx();

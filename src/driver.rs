@@ -6754,6 +6754,8 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     /// Optional admitted client lease generation checked against the atomic lease fence
     /// immediately before transmitting every `CMD_ENABLE` frame.
     enable_lease_gen: Option<u64>,
+    /// True once at least one `CMD_ENABLE` frame has been transmitted in the current enable attempt.
+    enable_frames_sent_any: bool,
     /// Active/confirmed CAN transmit probe recorded for clearing `CAN_TX_STALLED` (zero alloc).
     tx_probe: Option<TxProbeState>,
     /// Attempt-scoped J7 position-force freshness status observed in the most recent bounded TX pass.
@@ -7613,6 +7615,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             tx_release_deadline: None,
             enable_tx_deadline: None,
             enable_lease_gen: None,
+            enable_frames_sent_any: false,
             tx_probe: None,
             last_tx_pf_status: PosForceTxStatus::Unobserved,
             pf_fresh_gen: 0,
@@ -8318,30 +8321,20 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             return Err(TxRefusal::Deferred);
         }
 
-        // 6. Account budget attempt, re-verify `CMD_ENABLE` authority at the final instant before
-        //    mutating feedback boundaries or invoking `can.transmit`, transmit, and record metrics.
+        // 6. Account budget attempt, precompute indices and CPU timestamp, reset non-enable
+        //    boundaries, then run the final observable `CMD_ENABLE` authority check immediately
+        //    before `can.transmit` (zero intervening work or boundary mutation on refusal).
         if budgeted {
             self.record_tx_pass_attempt();
         }
-        let t0 = self.now();
-        let cpu0 = crate::diagnostics::tick::thread_cpu_ns();
-        if is_cmd_enable {
-            if self.enable_lease_gen.is_some_and(|g| self.is_lease_fenced(g)) {
-                return Err(TxRefusal::LeaseFenced);
-            }
-            if self.enable_tx_deadline.is_some_and(|dl| t0 >= dl) {
-                return Err(TxRefusal::EnableAuthorityExpired);
-            }
-        }
+        let enable_motor_idx = if is_cmd_enable {
+            self.motor_ids.iter().position(|&id| u32::from(id) == frame.id)
+        } else {
+            None
+        };
         let mut motion_idx: Option<usize> = None;
-        if !frame.is_extended && !frame.is_rtr && frame.dlc == 8 {
-            if is_cmd_enable {
-                if let Some(idx) = self.motor_ids.iter().position(|&id| u32::from(id) == frame.id) {
-                    self.motor_post_enable_feedback[idx] = false;
-                    self.motor_enable_seq[idx] = self.rx_seq;
-                    self.mode_readback_boundary[idx] = None;
-                }
-            } else if frame.data == damiao::CMD_DISABLE {
+        if !frame.is_extended && !frame.is_rtr && frame.dlc == 8 && !is_cmd_enable {
+            if frame.data == damiao::CMD_DISABLE {
                 if let Some(idx) = self.motor_ids.iter().position(|&id| u32::from(id) == frame.id) {
                     self.motor_post_enable_feedback[idx] = false;
                 }
@@ -8360,7 +8353,24 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 }
             }
         }
+        let cpu0 = crate::diagnostics::tick::thread_cpu_ns();
+        let t0 = self.now();
+        if is_cmd_enable {
+            if self.enable_tx_deadline.is_some_and(|dl| t0 >= dl) {
+                return Err(TxRefusal::EnableAuthorityExpired);
+            }
+            if self.enable_lease_gen.is_some_and(|g| self.is_lease_fenced(g)) {
+                return Err(TxRefusal::LeaseFenced);
+            }
+        }
         let res = self.can.transmit(&frame);
+        if res.is_ok() {
+            if let Some(idx) = enable_motor_idx {
+                self.motor_post_enable_feedback[idx] = false;
+                self.motor_enable_seq[idx] = self.rx_seq;
+                self.mode_readback_boundary[idx] = None;
+            }
+        }
         let write_done = self.now();
         let write_done_clock = if motion_idx.is_some() && res.is_ok() {
             Some(self.capture_rx_clock_sample(write_done))
@@ -10715,6 +10725,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.enable_stop_stamp = None;
         self.enable_tx_deadline = None;
         self.enable_lease_gen = None;
+        self.enable_frames_sent_any = false;
     }
 
     /// Checks whether the installed enable authority (atomic lease fence or driver-clock ceiling
@@ -10768,6 +10779,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
         self.refresh_unfinished = 0;
         self.enable_stop_stamp = None;
+        self.enable_frames_sent_any = false;
         self.enable_estop_inhibited()?;
         // Fast-path: only if !pending_rearm && is_enabled && feedback_valid && all state == 1
         // (never after an MIT deadline trip: the rearm restores the modes and re-enables;
@@ -11852,6 +11864,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 Ok(_) => {
                     mask &= !(1 << i);
                     sent_any = true;
+                    self.enable_frames_sent_any = true;
                 }
                 Err(TxRefusal::DeadlinePassed | TxRefusal::Deferred) => break,
                 Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged) => {
@@ -12022,6 +12035,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.enable_stop_stamp = None;
         self.enable_tx_deadline = None;
         self.enable_lease_gen = None;
+        self.enable_frames_sent_any = false;
         // confirmed enable with the base modes restored: a new MIT handover arms a new fence
         self.mit_fence = None;
         self.mit_fence_trip = None;
@@ -13616,7 +13630,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     }
 
     fn enable_frames_dispatched(&self) -> bool {
-        matches!(self.torque_hs, Some(DamiaoTorque::Enable { .. }))
+        self.enable_frames_sent_any
             || self.has_any_joint_enabled()
             || self.has_known_partial_enable()
     }

@@ -913,6 +913,10 @@ pub struct SupervisorInner {
     /// Lock-free mirror of [`Self::has_detached_torque_transition`] so off-lock headless waiters
     /// schedule bounded detached cleanup after any settlement (Stop, lease loss, or timeout).
     pub(crate) detached_torque_pending_atomic: Arc<AtomicBool>,
+    /// When a contended clean Stop during legacy enable installs `DetachedCancel` provisionally
+    /// as `FailedHold`, preserves the prior `TorqueIntent` so `step_enable_cancel` restores
+    /// `Disarmed` if the driver later confirms zero frames dispatched and zero joints enabled.
+    pub(crate) detached_cancel_restore_intent: Option<driver_transitions::TorqueIntent>,
     /// Static torque direction (`"on"` / `"off"`) set by [`Self::service_torque_transition`] ONLY
     /// on ticks that serviced a legacy WS torque handshake step (not Park / BrokerTransition),
     /// consumed by `tick_shared` for `/api/v1/torque` diagnostics attribution.
@@ -2191,6 +2195,7 @@ impl SupervisorInner {
             nonblocking_driver_release: false,
             legacy_torque_settled_this_tick: false,
             detached_torque_pending_atomic: Arc::new(AtomicBool::new(false)),
+            detached_cancel_restore_intent: None,
             last_tick_torque_ws_direction: None,
             enable_lifecycle: driver_transitions::EnableLifecycle::Disarmed,
             torque_intent: driver_transitions::TorqueIntent::Off,
@@ -4738,6 +4743,11 @@ impl SupervisorInner {
                 }
             }
             self.apply_stop_policy(StopPolicy::EStopLatch);
+            // Retain `DetachedCancel` (setting `detached_torque_pending_atomic`) BEFORE settling
+            // the legacy WS slot so the waking waiter always observes the pending drain flag (R5 M4).
+            if let Some(was_t) = estop_cancel_was_torqued {
+                self.retain_detached_enable_cancel_if_clear(was_t);
+            }
             // Settle any in-flight legacy WS enable immediately as `ESTOP_ACTIVE` so a concurrent
             // or subsequent request timeout can never beat an already-requested E-stop (R4 M5).
             if let Some((token, slot)) = estop_legacy_ws {
@@ -4746,9 +4756,6 @@ impl SupervisorInner {
                     slot,
                     driver_transitions::LegacyTorqueFailure::EStopActive,
                 );
-            }
-            if let Some(was_t) = estop_cancel_was_torqued {
-                self.retain_detached_enable_cancel_if_clear(was_t);
             }
             self.applied_estop_count = req;
             self.estop_applied.store(req, Ordering::SeqCst);
@@ -7492,7 +7499,10 @@ impl SupervisorInner {
         let mut sc = std::mem::take(&mut self.scratch);
         sc.recovered.clear();
         if let Some(ref d) = self.driver {
-            let guard_res = if self.rt_executor_owned || budget.is_some() {
+            let guard_res = if self.rt_executor_owned
+                || self.nonblocking_driver_release
+                || budget.is_some()
+            {
                 match d.try_lock() {
                     Ok(g) => Some(Ok(g)),
                     Err(std::sync::TryLockError::WouldBlock) => None,
@@ -13620,9 +13630,11 @@ impl ArmSupervisor {
             deadline,
         )
         .map_err(|_| observation_unavailable())?;
-
         match self.owner_mode() {
             OWNER_LEGACY => {
+                // Drop the pre-admission snapshot immediately so the off-lock wait never pins a
+                // `StateHub` publication slot during the legacy torque transition.
+                drop(snap);
                 use crate::supervisor::driver_transitions::{
                     LegacyTorqueFailure, LegacyTorqueOutcome, LegacyTorqueSlot, LegacyTorqueStart,
                 };
@@ -13958,13 +13970,12 @@ impl ArmSupervisor {
                     }
                 };
                 // Schedule bounded headless cleanup if ANY settlement path (contended Stop,
-                // E-stop, lease loss, or timeout) left a detached transition while no live
-                // control loop is ticking (R4 Major 4).
+                // E-stop, lease loss, or timeout) left a detached transition pending (R5 M4):
+                // if a live ticker is running, the drain task exits on its first wake once
+                // `control_release_seq` advances.
                 if self.detached_torque_pending_atomic.load(Ordering::Acquire) {
                     let cur_seq = tick_seq_counter.load(Ordering::Acquire);
-                    if cur_seq == last_tick_seq {
-                        self.spawn_headless_detached_drain_if_needed(cur_seq);
-                    }
+                    self.spawn_headless_detached_drain_if_needed(cur_seq);
                 }
 
                 match outcome {
@@ -14978,13 +14989,13 @@ impl ArmSupervisor {
             let (mut inner, generation) = self.inner.write_tick().await;
             let locked = Instant::now();
             let usage_locked = UsageMark::now();
+            let _ = crate::diagnostics::alloc::take();
             if inner.detached || self.owner_mode() != OWNER_LEGACY {
                 return None;
             }
             if self.pending_disconnect_hold.load(Ordering::Acquire) > 0 {
                 let _ = self.drain_pending_disconnects_under_guard(&mut inner, None);
             }
-            let _ = crate::diagnostics::alloc::take();
             // No other guard exists now: the log is complete up to the guard waited for.
             let log = self.inner.take_log();
             inner.defer_zero_check_persist = true;

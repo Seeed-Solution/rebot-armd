@@ -120,6 +120,7 @@ impl Holds {
         io_timing: Option<HoldIoTiming>,
         called: Instant,
         acquired: Instant,
+        released: Instant,
     ) {
         let r = HoldRecord {
             kind,
@@ -130,7 +131,7 @@ impl Holds {
             io_timing,
             called,
             acquired,
-            released: Instant::now(),
+            released,
         };
         self.log.lock().unwrap_or_else(|e| e.into_inner()).add(r);
         if self.history_enabled.load(Ordering::Relaxed) {
@@ -383,8 +384,10 @@ pub struct SupReadGuard<'a, T> {
 
 impl<T> Drop for SupReadGuard<'_, T> {
     fn drop(&mut self) {
-        // Release the underlying RwLock guard BEFORE sampling `released` and acquiring
-        // hold-log / history mutexes so lock recording never extends the actual hold duration.
+        // Sample `released` right before dropping the underlying guard (so post-unlock scheduling
+        // delay never inflates `hold()`), then unlock BEFORE acquiring hold-log / history mutexes
+        // so lock recording never extends the actual hold duration.
+        let released = Instant::now();
         // SAFETY: dropped once, here; the field is not used afterwards.
         unsafe { ManuallyDrop::drop(&mut self.guard) };
         self.holds.record(
@@ -396,6 +399,7 @@ impl<T> Drop for SupReadGuard<'_, T> {
             self.t.io_timing,
             self.t.called,
             self.t.acquired,
+            released,
         );
     }
 }
@@ -439,8 +443,7 @@ impl<T> SupWriteGuard<'_, T> {
 
 impl<T> Drop for SupWriteGuard<'_, T> {
     fn drop(&mut self) {
-        // Release the underlying RwLock guard BEFORE sampling `released` and acquiring
-        // hold-log / history mutexes so lock recording never extends the actual hold duration.
+        let released = Instant::now();
         // SAFETY: dropped once, here; the field is not used afterwards.
         unsafe { ManuallyDrop::drop(&mut self.guard) };
         self.holds.record(
@@ -452,6 +455,7 @@ impl<T> Drop for SupWriteGuard<'_, T> {
             self.t.io_timing,
             self.t.called,
             self.t.acquired,
+            released,
         );
     }
 }
@@ -499,8 +503,7 @@ impl<T> SupOwnedWriteGuard<T> {
 
 impl<T> Drop for SupOwnedWriteGuard<T> {
     fn drop(&mut self) {
-        // Release the underlying RwLock guard BEFORE sampling `released` and acquiring
-        // hold-log / history mutexes so lock recording never extends the actual hold duration.
+        let released = Instant::now();
         // SAFETY: dropped once, here; the field is not used afterwards.
         unsafe { ManuallyDrop::drop(&mut self.guard) };
         self.holds.record(
@@ -512,6 +515,7 @@ impl<T> Drop for SupOwnedWriteGuard<T> {
             self.t.io_timing,
             self.t.called,
             self.t.acquired,
+            released,
         );
     }
 }
