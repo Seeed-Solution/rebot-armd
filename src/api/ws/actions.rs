@@ -510,7 +510,6 @@ pub(super) async fn handle_executor_ws_grasp(
         })));
     }
     *last_ordinary_request = request_id;
-    let req_id = request_id.unwrap();
 
     // 4. Operator auth check from dispatch table.
     if let AuthRequirement::Operator(label) = entry.auth {
@@ -523,12 +522,13 @@ pub(super) async fn handle_executor_ws_grasp(
         }
     }
 
-    // 5. Capture original connection admission stamp and prepare adaptive grasp off-lock.
+    // 5. Capture original connection admission stamp (preserving the server-allocated single-use
+    //    A1 `stamp.request_id` from WS frame arrival — never overwriting with client wire IDs)
+    //    and prepare adaptive grasp off-lock.
     let mut ws_stamp = stamp;
     ws_stamp.connection_id = recv_conn_id;
     ws_stamp.lease_gen = local_generation;
     ws_stamp.estop_epoch = epoch;
-    ws_stamp.request_id = req_id;
     let deadline = Instant::now() + crate::rt_core::requests::actions::DEFAULT_ACTION_DEADLINE;
     let snap = match crate::rt_core::requests::actions::ActionSnapshot::capture(
         recv_supervisor,

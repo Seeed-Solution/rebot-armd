@@ -398,6 +398,7 @@ async fn gate_executor_owner(
                         | "/api/v1/motion/servo"
                         | "/api/v1/diagnostics/tick/mark"
                         | "/api/v1/tool/commissioning/confirm"
+                        | "/api/v1/action/grasp"
                 ),
                 _ => false,
             };
