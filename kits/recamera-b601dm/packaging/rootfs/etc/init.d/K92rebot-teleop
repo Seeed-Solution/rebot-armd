@@ -78,6 +78,10 @@ STA_PASS=""
 # Operator PIN (console setting security.operator_pin, 4-12 digits). Empty: armd writes a random
 # PIN to /userdata/rebot-teleop/operator.pin (root only) at every start.
 OPERATOR_PIN=""
+# Control-loop owner (arm.armd_owner or top-level armd_owner in rebot-teleop.config.json):
+# legacy (default) or executor (explicit opt-in for rebot-dm and mock).
+ARMD_OWNER="legacy"
+ARMD_OWNER_INVALID=""
 
 CONFIG_JSON="/userdata/local/apps/$NAME.config.json"
 
@@ -96,6 +100,12 @@ try:
     sec = cfg.get('security', {})
     if 'follower_model' in arm and arm['follower_model']: put('FOLLOWER_MODEL', arm['follower_model'])
     if 'serial_port' in arm and arm['serial_port']: put('FOLLOWER_PORT', arm['serial_port'])
+    owner_raw = arm.get('armd_owner')
+    if owner_raw is None:
+        owner_raw = cfg.get('armd_owner', '')
+    owner = str(owner_raw or '').strip()
+    if owner in ('legacy', 'executor'): put('ARMD_OWNER', owner)
+    elif owner: put('ARMD_OWNER_INVALID', '1')
     if 'port' in cfg and cfg['port']: put('PORT', cfg['port'])
     if 'ap_ssid' in net and net['ap_ssid']: put('AP_SSID', net['ap_ssid'])
     if 'ap_password' in net and net['ap_password']: put('AP_PASS', net['ap_password'])
@@ -744,6 +754,7 @@ start_vision() {
 # command line, which every process can read in /proc/<pid>/cmdline.
 launch_armd() {
     (
+        unset ARMD_RT_OWNER
         if [ -n "$OPERATOR_PIN" ]; then
             ARMD_OPERATOR_PIN=$OPERATOR_PIN
             export ARMD_OPERATOR_PIN
@@ -829,6 +840,10 @@ start() {
     # armd runs as root; it falls back to stdout only when these cannot be written
     mkdir -p "$PERSIST_LOG_DIR" "$BLACKBOX_DIR" "$EPISODES_DIR" 2>/dev/null || true
     DAEMON_OPTS="$DAEMON_OPTS --log-dir $PERSIST_LOG_DIR --blackbox-dir $BLACKBOX_DIR --episodes-dir $EPISODES_DIR"
+    if [ "$ARMD_OWNER_INVALID" = 1 ]; then
+        echo "[rebot-teleop] armd_owner setting ignored (use 'legacy' or 'executor'); defaulting to legacy"
+    fi
+    DAEMON_OPTS="$DAEMON_OPTS --owner $ARMD_OWNER"
 
     if [ "$OPERATOR_PIN_INVALID" = 1 ]; then
         echo "[rebot-teleop] Operator PIN setting ignored (use 4-12 digits); armd writes a random PIN to /userdata/rebot-teleop/operator.pin"

@@ -52,6 +52,17 @@
             "title": "Baud Rate",
             "title_zh": "波特率",
             "default": 1000000
+          },
+          {
+            "key": "armd_owner",
+            "type": "select",
+            "title": "Control Loop Owner (legacy = default supervisor-lock loop; executor = synchronous RT executor opt-in for rebot-dm and mock)",
+            "title_zh": "控制循环所有者（legacy = 默认 supervisor 锁循环；executor = 同步实时执行器，仅显式启用用于 rebot-dm 和 mock）",
+            "options": [
+              "legacy",
+              "executor"
+            ],
+            "default": "legacy"
           }
         ]
       },

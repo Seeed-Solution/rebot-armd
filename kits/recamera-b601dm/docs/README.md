@@ -71,6 +71,10 @@ init 脚本把 `can0` 设为 1 Mbit/s，与机械臂一致。
    "Install on reCamera") and open `http://<camera-address>:8765/`.
 5. With a tilted mount (such as v8 at 38°), set the camera tilt (see [../calibration/](../calibration/README.md)).
 
+### Control-loop owner (`armd_owner`)
+
+`K92rebot-teleop` passes `--owner <legacy|executor>` to `armd`, read from `/userdata/local/apps/rebot-teleop.config.json` (`arm.armd_owner`, falling back to top-level `armd_owner`). The default is `legacy`. Setting `"armd_owner": "executor"` opts into the synchronous RT executor (`armd-control`) on `rebot-dm` (or `mock`); other followers reject `executor` at startup, MIT-configured profiles remain legacy-only, and a recoverable executor startup failure on `rebot-dm` falls back to the `legacy` owner holding without torque-off.
+
 ### 组装
 
 1. 打印相机支架：v5（当前使用）或 v8（38° 下倾，未打印、未试装），主体与顶条分开打印；文件与未验证项见 [../hardware/](../hardware/README.md)。
@@ -78,6 +82,10 @@ init 脚本把 `can0` 设为 1 Mbit/s，与机械臂一致。
 3. 机械臂的 CAN 线与电源接到 B4 底板 J2（见上）。
 4. 安装 `rebot-teleop` deb（`./scripts/build_deb.sh`，见仓库 README「在 reCamera 上安装」），打开 `http://<相机地址>:8765/`。
 5. 使用倾斜支架（如 v8 38°）时设置相机俯角（见 [../calibration/](../calibration/README.md)）。
+
+### 控制循环所有者（`armd_owner`）
+
+`K92rebot-teleop` 从 `/userdata/local/apps/rebot-teleop.config.json` 读取 `arm.armd_owner`（未设置时回退到顶层 `armd_owner`），并通过 `--owner <legacy|executor>` 传给 `armd`。默认值为 `legacy`。设为 `"executor"` 可在 `rebot-dm`（或 `mock`）上显式启用同步实时执行器（`armd-control`）；其余从手在通过验证前会在启动时拒绝 `executor`，MIT 配置保持仅限 `legacy`，`rebot-dm` 上执行器启动可恢复失败时会回退至 `legacy` 保持姿态而不断力。
 
 ## Verified capabilities
 
