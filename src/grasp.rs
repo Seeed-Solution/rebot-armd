@@ -4589,7 +4589,7 @@ impl Orchestrator {
         pa: &PlannedAdaptive,
     ) -> Result<(bool, Option<f32>), Stop> {
         use crate::grasp_select::feasibility::{
-            check_carried_object_volume, max_joint_diff, plan_swept_joint_path,
+            max_joint_diff, plan_swept_joint_path,
             BRANCH_CONSISTENCY_TOL_RAD, SEPARATION_M,
         };
         use crate::grasp_select::{
@@ -4906,15 +4906,18 @@ impl Orchestrator {
             ));
         }
 
-        // Compute actual conservative carried-object TCP box (expanded by actual contact offset).
+        // Compute actual conservative carried-object TCP box via full SE(3) relative transform
+        // `actual_contact_tcp^{-1} * route.plan.grasp` (covers BOTH translation and rotation error).
         let rt_actual = kinematics::transpose(&actual_contact_tcp.r);
-        let actual_offset_tcp = kinematics::mat_vec(
+        let rel_r = kinematics::mat_mul(&rt_actual, &route.plan.grasp.r);
+        let rel_p = kinematics::mat_vec(
             &rt_actual,
             &kinematics::sub(&route.plan.grasp.p, &actual_contact_tcp.p),
         );
-        let obj_box = route.obj_box_tcp.expanded_by_tcp_offset(&actual_offset_tcp);
+        let rel_pose = Pose::new(rel_r, rel_p);
+        let obj_box = route.obj_box_nominal_tcp.transformed_by_relative_pose(&rel_pose);
 
-        // Separation (+SEPARATION_M straight up, fixed orientation, swept carried-object check)
+        // Separation (+SEPARATION_M straight up, fixed orientation, single converged loaded-leg validator)
         self.phase("separation", 0.80).await?;
         let snap_sep = self.adaptive_snapshot_fenced("separation", rev).await?;
         let input_sep = snap_sep
@@ -4922,7 +4925,7 @@ impl Orchestrator {
             .map_err(crate::macro_action::arm_fail)?;
         let cur_sep_tcp = motion::end_to_tcp(&input_sep.arm.fk(&input_sep.q0), &self.tcp_offset);
         let sep_goal = Pose::new(
-            route.plan.grasp.r,
+            actual_contact_tcp.r,
             [
                 cur_sep_tcp.p[0],
                 cur_sep_tcp.p[1],
@@ -4931,6 +4934,11 @@ impl Orchestrator {
         );
         let loaded_speed = Speed { linear: route.loaded_mps, angular: motion::DEFAULT_ANGULAR_RPS };
         let env_pts = self.envelope.clone();
+        let table_z_m = s.table_z_m;
+        let phase_timeout_s = s.phase_timeout_s;
+        let payload_kg = route.payload_kg;
+        let torque_limits = route.torque_limits.clone();
+        let has_gravity_model = route.has_gravity_model;
         let (input_sep, sep_path) = tokio::task::spawn_blocking(move || {
             let res: Result<motion::JointPath, ArmError> = (|| {
                 let p = motion::plan_cartesian_opts(
@@ -4939,28 +4947,25 @@ impl Orchestrator {
                     loaded_speed,
                     motion::PathOpts::default(),
                 )?;
-                crate::backlash::check_table_clear(
-                    &input_sep.arm,
-                    &env_pts,
-                    table_bound_z,
-                    p.q.iter().map(|q| q.as_slice()),
-                )
-                .map_err(|v| ArmError::from(v.into_motion_error()))?;
-                if let Some(ws) = input_sep.ws.as_ref() {
-                    check_carried_object_volume(
-                        &input_sep.arm,
-                        &input_sep.tcp_offset,
-                        ws,
-                        &obj_box,
-                        &p,
-                        "separation",
-                    )
+                let leg_params = crate::grasp_select::feasibility::LoadedLegParams {
+                    arm: &input_sep.arm,
+                    tcp_offset: &input_sep.tcp_offset,
+                    ws: input_sep.ws.as_ref(),
+                    envelope: &env_pts,
+                    table_z_m,
+                    phase_timeout_s,
+                    obj_box: &obj_box,
+                    payload_kg,
+                    torque_limits: torque_limits.as_deref(),
+                    has_gravity_model,
+                    fail_on_insufficient_evidence: true,
+                };
+                crate::grasp_select::feasibility::validate_loaded_leg(&leg_params, &p, "separation")
                     .map_err(|r| ArmError::Rejected {
                         status: 422,
                         code: r.code,
                         message: r.message,
                     })?;
-                }
                 Ok(p)
             })();
             (input_sep, res)
@@ -4971,19 +4976,13 @@ impl Orchestrator {
             Stop::Fail(c, m) => Stop::Fail(c, format!("[separation] {m}")),
             other => other,
         })?;
-        if sep_path.duration + 0.5 > s.phase_timeout_s {
-            return Err(fail(
-                "GRASP_TIMEOUT",
-                format!("[separation] planned duration {:.2} s exceeds phase_timeout_s {:.2} s", sep_path.duration, s.phase_timeout_s),
-            ));
-        }
         let _ = self
             .ctx
             .install_adaptive_path_child("separation", &snap_sep, &input_sep, sep_goal, sep_path, rev, None)
             .await
             .map_err(|(stop, _)| stop)?;
 
-        // Lift (to lift_z, fixed orientation, swept carried-object check)
+        // Lift (to lift_z, fixed orientation, single converged loaded-leg validator)
         self.phase("lift", 0.88).await?;
         let snap_lift = self.adaptive_snapshot_fenced("lift", rev).await?;
         let input_lift = snap_lift
@@ -4992,9 +4991,10 @@ impl Orchestrator {
         let cur_lift_tcp = motion::end_to_tcp(&input_lift.arm.fk(&input_lift.q0), &self.tcp_offset);
         let lift_z = route.plan.lift.p[2].max(cur_lift_tcp.p[2]);
         if lift_z > cur_lift_tcp.p[2] + 1e-4 {
-            let lift_goal = Pose::new(route.plan.lift.r, [cur_lift_tcp.p[0], cur_lift_tcp.p[1], lift_z]);
+            let lift_goal = Pose::new(actual_contact_tcp.r, [cur_lift_tcp.p[0], cur_lift_tcp.p[1], lift_z]);
             let q_lift_ref = route.plan.q_lift;
             let env_pts = self.envelope.clone();
+            let torque_limits = route.torque_limits.clone();
             let (input_lift, lift_path) = tokio::task::spawn_blocking(move || {
                 let res: Result<motion::JointPath, ArmError> = (|| {
                     let p = motion::plan_cartesian_opts(
@@ -5003,28 +5003,25 @@ impl Orchestrator {
                         loaded_speed,
                         motion::PathOpts::default(),
                     )?;
-                    crate::backlash::check_table_clear(
-                        &input_lift.arm,
-                        &env_pts,
-                        table_bound_z,
-                        p.q.iter().map(|q| q.as_slice()),
-                    )
-                    .map_err(|v| ArmError::from(v.into_motion_error()))?;
-                    if let Some(ws) = input_lift.ws.as_ref() {
-                        check_carried_object_volume(
-                            &input_lift.arm,
-                            &input_lift.tcp_offset,
-                            ws,
-                            &obj_box,
-                            &p,
-                            "lift",
-                        )
+                    let leg_params = crate::grasp_select::feasibility::LoadedLegParams {
+                        arm: &input_lift.arm,
+                        tcp_offset: &input_lift.tcp_offset,
+                        ws: input_lift.ws.as_ref(),
+                        envelope: &env_pts,
+                        table_z_m,
+                        phase_timeout_s,
+                        obj_box: &obj_box,
+                        payload_kg,
+                        torque_limits: torque_limits.as_deref(),
+                        has_gravity_model,
+                        fail_on_insufficient_evidence: true,
+                    };
+                    crate::grasp_select::feasibility::validate_loaded_leg(&leg_params, &p, "lift")
                         .map_err(|r| ArmError::Rejected {
                             status: 422,
                             code: r.code,
                             message: r.message,
                         })?;
-                    }
                     let q_end: [f64; 6] = std::array::from_fn(|i| f64::from(p.last()[i]));
                     let jd = max_joint_diff(&q_end, &q_lift_ref, input_lift.arm.arm_dof());
                     if jd > BRANCH_CONSISTENCY_TOL_RAD {
@@ -5048,12 +5045,6 @@ impl Orchestrator {
                 Stop::Fail(c, m) => Stop::Fail(c, format!("[lift] {m}")),
                 other => other,
             })?;
-            if lift_path.duration + 0.5 > s.phase_timeout_s {
-                return Err(fail(
-                    "GRASP_TIMEOUT",
-                    format!("[lift] planned duration {:.2} s exceeds phase_timeout_s {:.2} s", lift_path.duration, s.phase_timeout_s),
-                ));
-            }
             let _ = self
                 .ctx
                 .install_adaptive_path_child("lift", &snap_lift, &input_lift, lift_goal, lift_path, rev, None)

@@ -199,6 +199,16 @@ pub fn estimate_gripper_duration_s(
     Ok((mot.expected_duration(), mot.timeout_s, is_pf))
 }
 
+/// Maximum wait window (s) allowed for a single adaptive vision revalidation step (shared by
+/// whole-route preflight budgeting AND live `fresh_match_adaptive` timeouts).
+pub const ADAPTIVE_VISION_WINDOW_CAP_S: f64 = 2.5;
+
+/// Unified per-step vision revalidation budget (s): settle delay + bounded observation wait.
+/// Shared by both `preflight_candidate_from_start` and live `Orchestrator::fresh_match_adaptive`.
+pub fn adaptive_vision_budget_s(st: &crate::grasp::GraspSetup) -> f64 {
+    st.settle_delay_s.max(0.0) + st.lost_timeout_s.min(ADAPTIVE_VISION_WINDOW_CAP_S)
+}
+
 /// Single authoritative executable route for Phase B adaptive grasp: drives adaptive dry-run
 /// reporting, pre-`BeginMacro` whole-route preflight & budget admission, [`SelectedGraspMacro`]
 /// construction, and runtime `Orchestrator::run_adaptive` execution.
@@ -209,9 +219,16 @@ pub struct AdaptiveRoute {
     pub tilt_deg: f64,
     pub plan: ExecutionPlan,
     pub pregrasp_mode: PregraspMode,
-    /// Conservative TCP-frame object volume (includes horizontal `hard_error_m`, vertical
-    /// `TABLE_ERROR_M`, and early-contact offset when `descend_contact_stop_nm` is armed).
+    /// Nominal TCP-frame carried-object box at `plan.grasp` (low/high projection hull +
+    /// `hard_error_m` + `TABLE_ERROR_M`); live execution transforms this by the exact SE(3)
+    /// relative contact pose `actual_contact_tcp^{-1} * plan.grasp`.
+    pub obj_box_nominal_tcp: CarriedObjectBox,
+    /// Conservative preflight TCP-frame object volume (expanded over the full accepted contact
+    /// translation + rotation envelope).
     pub obj_box_tcp: CarriedObjectBox,
+    pub payload_kg: Option<f64>,
+    pub torque_limits: Option<Vec<f64>>,
+    pub has_gravity_model: bool,
     pub target_centroid: [f64; 2],
     pub target_table_z: f64,
     pub target_height: [f64; 2],
@@ -619,8 +636,10 @@ fn prescore(s: &Snapshot, t: &snapshot::Target, ch: &Chord, hy: &Hypothesis, q_g
     score::contact_quality(s, t, ch, hy) - score::preference_penalty(&s.prefs, hy) + 0.2 * feasibility::joint_margin(&s.input, q_g)
 }
 
-/// Whether every vertex of `poly` (base xy) at mid-height `z_mid` projects inside the camera
-/// image with a 4 px inset when the TCP is at `tcp`.
+/// Whether the target is meaningfully visible in the camera image when the TCP is at `tcp`:
+/// centroid projects inside the 4 px inset AND at least half of footprint vertices project
+/// inside the image frame (so a single slightly clipped corner cannot silently skip pre-grasp
+/// vision revalidation).
 pub fn visible_at_pose(
     cam: &crate::grasp::CamModel,
     tcp_offset: &[f64; 3],
@@ -628,12 +647,27 @@ pub fn visible_at_pose(
     z_mid: f64,
     tcp: &Pose,
 ) -> bool {
+    if poly.is_empty() {
+        return false;
+    }
     let end = crate::motion::tcp_to_end(tcp, tcp_offset);
     let m = 4.0;
-    poly.iter().all(|v| {
-        cam.project(&end, &[v[0], v[1], z_mid])
-            .is_some_and(|p| p[0] >= m && p[1] >= m && p[0] <= cam.size[0] - m && p[1] <= cam.size[1] - m)
-    })
+    let centroid = geometry::centroid(poly);
+    let Some(cp) = cam.project(&end, &[centroid[0], centroid[1], z_mid]) else {
+        return false;
+    };
+    if !(cp[0] >= m && cp[1] >= m && cp[0] <= cam.size[0] - m && cp[1] <= cam.size[1] - m) {
+        return false;
+    }
+    let in_frame = poly
+        .iter()
+        .filter(|v| {
+            cam.project(&end, &[v[0], v[1], z_mid]).is_some_and(|p| {
+                p[0] >= 0.0 && p[1] >= 0.0 && p[0] <= cam.size[0] && p[1] <= cam.size[1]
+            })
+        })
+        .count();
+    in_frame * 2 >= poly.len()
 }
 
 fn visible(s: &Snapshot, t: &snapshot::Target, tcp: &Pose) -> bool {
@@ -846,6 +880,7 @@ pub fn select_adaptive_route(
                         work: &mut Work,
                         entries: &mut Vec<(Candidate, AdaptiveRoute)>,
                         deepest: &mut Option<(usize, Rejection)>| {
+        let budget_check = || se.out_of_budget();
         match preflight_candidate_from_start(
             s,
             &t,
@@ -857,6 +892,7 @@ pub fn select_adaptive_route(
             close_speed_limit,
             has_gravity_model,
             work,
+            &budget_check,
         ) {
             Ok((checked, mut route)) => {
                 let rob = score::robustness(s, &t, hy, &checked, work);
@@ -1009,6 +1045,17 @@ pub fn select_adaptive_route(
     se.stats.work = work;
     se.stats.lattice_tests = cheap.lattice_tests;
     se.stats.fully_checked = entries.len();
+    // Enforce absolute search budget right before publishing a route so the last evaluation
+    // cannot exceed `budget_ms` and still return `Outcome::Selected`.
+    if se.out_of_budget() {
+        let n = entries.len();
+        return AdaptiveSelection {
+            selection: se.exhausted(n, ev),
+            route: None,
+            failing_phase: Some("budget"),
+            checked_hint: None,
+        };
+    }
     entries.sort_by(|a, b| {
         let ia = a.0.checked.insufficient_evidence.is_some();
         let ib = b.0.checked.insufficient_evidence.is_some();
@@ -1095,6 +1142,8 @@ pub fn select_adaptive_route(
 }
 
 /// Whole-route actual-start preflight of one hypothesis `hy` directly from `s.input.q0`.
+/// Uses the single converged [`feasibility::validate_loaded_leg`] validator for nominal AND
+/// guarded-contact `separation` / `lift` legs and enforces the shared absolute search budget.
 #[allow(clippy::too_many_arguments)]
 fn preflight_candidate_from_start(
     s: &Snapshot,
@@ -1107,7 +1156,15 @@ fn preflight_candidate_from_start(
     close_speed_limit: Option<f32>,
     has_gravity_model: bool,
     work: &mut Work,
+    out_of_budget: &dyn Fn() -> bool,
 ) -> Result<(Checked, AdaptiveRoute), Rejection> {
+    let check_budget = || -> Result<(), Rejection> {
+        if out_of_budget() {
+            return Err(Rejection::new("budget", "BUDGET_EXHAUSTED", "selection budget exceeded"));
+        }
+        Ok(())
+    };
+    check_budget()?;
     let st = &s.setup;
     let pre = hy.pregrasp_pose();
     let grasp_pose = hy.grasp_pose();
@@ -1162,6 +1219,7 @@ fn preflight_candidate_from_start(
         ));
     }
     let q_pre = q6_of(&pregrasp_path.last());
+    check_budget()?;
 
     // 2. Pre-open budget (shared GripperMotion estimator)
     let (pre_open_cmd, pre_open_frac) = (GripperCommand::Open, None);
@@ -1204,6 +1262,7 @@ fn preflight_candidate_from_start(
         ));
     }
     let q_grasp = q6_of(&insertion.last());
+    check_budget()?;
 
     // 4. Close: shared GripperMotion capped pos-force estimator
     let (close_s, close_timeout_s, is_pos_force_close) = estimate_gripper_duration_s(
@@ -1224,19 +1283,43 @@ fn preflight_candidate_from_start(
         ));
     }
 
-    // Contact window + conservative carried-object TCP box
+    // Contact window + conservative carried-object TCP box (full projection hull + SE(3) envelope)
     let contact_stop_armed = st.descend_contact_stop_nm.is_some();
     let contact_window_m = CONTACT_WINDOW_M.min(hy.insertion_m * 0.5);
-    let mut obj_box = CarriedObjectBox::from_target_grasp(t, &grasp_pose);
-    if contact_stop_armed {
-        // When jaws stop up to `contact_window_m` early along -a (TCP -x), the object sits up to
-        // `+contact_window_m` further forward along TCP +x, plus accepted lateral error.
-        obj_box = obj_box
-            .expanded_by_tcp_offset(&[contact_window_m, CONTACT_LATERAL_TOL_M, CONTACT_LATERAL_TOL_M])
-            .expanded_by_tcp_offset(&[0.0, -CONTACT_LATERAL_TOL_M, -CONTACT_LATERAL_TOL_M]);
-    }
+    let obj_box_nom = CarriedObjectBox::from_target_grasp(t, &grasp_pose);
+    let obj_box = obj_box_nom.expanded_by_contact_envelope(
+        if contact_stop_armed { contact_window_m } else { 0.0 },
+        CONTACT_LATERAL_TOL_M,
+        CONTACT_ROT_TOL_RAD,
+    );
+    let torque_limits_slice = s.torque_limits.as_ref().map(|(l, _)| l.as_slice());
+    let loaded_params = feasibility::LoadedLegParams {
+        arm: &s.input.arm,
+        tcp_offset: &s.input.tcp_offset,
+        ws: s.input.ws.as_ref(),
+        envelope: &s.envelope,
+        table_z_m: st.table_z_m,
+        phase_timeout_s: st.phase_timeout_s,
+        obj_box: &obj_box,
+        payload_kg: s.evidence.payload_kg,
+        torque_limits: torque_limits_slice,
+        has_gravity_model,
+        fail_on_insufficient_evidence: false,
+    };
+    let mut worst_capacity: Option<(f64, usize)> = None;
+    let mut insufficient: Option<String> = None;
+    let mut merge_verdict = |v: feasibility::LoadedLegVerdict| {
+        if let Some((c, j)) = v.payload_capacity {
+            if worst_capacity.is_none_or(|(wc, _)| c < wc) {
+                worst_capacity = Some((c, j));
+            }
+        }
+        if insufficient.is_none() {
+            insufficient = v.insufficient_evidence;
+        }
+    };
 
-    // 5. Separation + Lift (nominal pose) with conservative swept OBB SAT across BOTH legs
+    // 5. Separation + Lift (nominal pose) via single converged `validate_loaded_leg`
     let sep = Pose::new(hy.r, kinematics::add(&hy.g, &[0.0, 0.0, feasibility::SEPARATION_M]));
     let separation = feasibility::phase(
         s,
@@ -1247,26 +1330,7 @@ fn preflight_candidate_from_start(
         st.descend_speed_mps,
         work,
     )?;
-    if separation.duration + 0.5 > st.phase_timeout_s {
-        return Err(Rejection::new(
-            "separation",
-            "GRASP_TIMEOUT",
-            format!(
-                "separation duration {:.2} s + settle exceeds phase_timeout_s {:.2} s",
-                separation.duration, st.phase_timeout_s
-            ),
-        ));
-    }
-    if let Some(ws) = s.input.ws.as_ref() {
-        feasibility::check_carried_object_volume(
-            &s.input.arm,
-            &s.input.tcp_offset,
-            ws,
-            &obj_box,
-            &separation,
-            "separation",
-        )?;
-    }
+    merge_verdict(feasibility::validate_loaded_leg(&loaded_params, &separation, "separation")?);
     let q_sep = q6_of(&separation.last());
     let lift_z = (st.table_z_m + st.lift_height_m).max(sep.p[2]);
     let lift = Pose::new(hy.r, [hy.g[0], hy.g[1], lift_z]);
@@ -1280,79 +1344,15 @@ fn preflight_candidate_from_start(
             st.descend_speed_mps,
             work,
         )?;
-        if lp.duration + 0.5 > st.phase_timeout_s {
-            return Err(Rejection::new(
-                "lift",
-                "GRASP_TIMEOUT",
-                format!(
-                    "lift duration {:.2} s + settle exceeds phase_timeout_s {:.2} s",
-                    lp.duration, st.phase_timeout_s
-                ),
-            ));
-        }
-        if let Some(ws) = s.input.ws.as_ref() {
-            feasibility::check_carried_object_volume(
-                &s.input.arm,
-                &s.input.tcp_offset,
-                ws,
-                &obj_box,
-                &lp,
-                "lift",
-            )?;
-        }
+        merge_verdict(feasibility::validate_loaded_leg(&loaded_params, &lp, "lift")?);
         let q = q6_of(&lp.last());
         (Some(lp), q)
     } else {
         (None, q_sep)
     };
+    check_budget()?;
 
-    // 6. Loaded payload torque across initial loaded pose + separation + lift using exact 8-corner CoM box
-    let mut loaded: Vec<[f64; 6]> = Vec::with_capacity(1 + separation.q.len() + lift_path.as_ref().map_or(0, |p| p.q.len()));
-    loaded.push(q_grasp);
-    loaded.extend(separation.q.iter().map(q6_of));
-    if let Some(lp) = &lift_path {
-        loaded.extend(lp.q.iter().map(q6_of));
-    }
-    let capacity = feasibility::payload_capacity_box(s, &loaded, &obj_box);
-    let mut payload_assumed = false;
-    let mut insufficient = None;
-    match capacity {
-        Some((cap, joint)) => {
-            let (bound, given) = match s.evidence.payload_kg {
-                Some(m) => (m, true),
-                None => (feasibility::ASSUMED_PAYLOAD_KG, false),
-            };
-            if cap < 0.0 {
-                return Err(Rejection::new(
-                    "lift",
-                    "LIFT_TORQUE",
-                    format!("J{} holding torque exceeds its derated limit without payload", joint + 1),
-                )
-                .with(cap, 0.0));
-            }
-            if cap < bound {
-                if given {
-                    return Err(Rejection::new(
-                        "lift",
-                        "LIFT_TORQUE",
-                        format!("J{} allows {cap:.3} kg of payload across CoM envelope, bound is {bound:.3} kg", joint + 1),
-                    )
-                    .with(cap, bound));
-                }
-                insufficient = Some(format!(
-                    "J{} allows {cap:.3} kg across CoM envelope; payload bound is unknown (assumed {bound:.2} kg)",
-                    joint + 1
-                ));
-            }
-            payload_assumed = !given;
-        }
-        None if has_gravity_model => {
-            insufficient = Some("gravity model is configured without derated torque limits; payload capacity cannot be bounded".into());
-        }
-        None => {}
-    }
-
-    // 7. Closed-jaw withdrawal (empty-grasp NOT_HOLDING recovery: jaws stay closed, straight back along -a)
+    // 6. Closed-jaw withdrawal (empty-grasp NOT_HOLDING recovery: jaws stay closed, straight back along -a)
     let withdrawal = feasibility::phase(
         s,
         "withdrawal",
@@ -1373,8 +1373,9 @@ fn preflight_candidate_from_start(
         ));
     }
 
-    // 8. When contact guard is armed, preflight contact-window stations along -a for separation,
-    //    lift, closed-jaw withdrawal, AND open-jaw obstruction withdrawal.
+    // 7. When contact guard is armed, preflight contact-window stations along -a through the
+    //    EXACT same `validate_loaded_leg` (timeout + table clear + OBB SAT + 8-corner torque)
+    //    plus closed & open withdrawal timeout/path checks.
     let mut worst_sep_s = separation.duration;
     let mut worst_lift_s = lift_path.as_ref().map_or(0.0, |p| p.duration);
     let mut worst_withdraw_s = withdrawal.duration;
@@ -1388,8 +1389,19 @@ fn preflight_candidate_from_start(
             st.descend_speed_mps,
             work,
         )?;
+        if open_withdraw.duration + 0.5 > st.phase_timeout_s {
+            return Err(Rejection::new(
+                "withdrawal",
+                "GRASP_TIMEOUT",
+                format!(
+                    "open-jaw withdrawal duration {:.2} s + settle exceeds phase_timeout_s {:.2} s",
+                    open_withdraw.duration, st.phase_timeout_s
+                ),
+            ));
+        }
         worst_withdraw_s = worst_withdraw_s.max(open_withdraw.duration);
         for d in [0.005_f64, 0.010, contact_window_m] {
+            check_budget()?;
             if d > contact_window_m + 1e-9 || d <= 1e-4 {
                 continue;
             }
@@ -1400,28 +1412,35 @@ fn preflight_candidate_from_start(
             let p_cw = motion::end_to_tcp(&s.input.arm.fk(&q_cw), &s.input.tcp_offset).p;
             let sep_cw = Pose::new(hy.r, [p_cw[0], p_cw[1], (p_cw[2] + feasibility::SEPARATION_M).max(sep.p[2])]);
             let sp = feasibility::phase(s, "separation", q_cw, s.closed_rad, sep_cw, st.descend_speed_mps, work)?;
-            if let Some(ws) = s.input.ws.as_ref() {
-                feasibility::check_carried_object_volume(&s.input.arm, &s.input.tcp_offset, ws, &obj_box, &sp, "separation")?;
-            }
+            merge_verdict(feasibility::validate_loaded_leg(&loaded_params, &sp, "separation")?);
             worst_sep_s = worst_sep_s.max(sp.duration);
             let q_sp = q6_of(&sp.last());
             let lift_cw_z = (st.table_z_m + st.lift_height_m).max(sep_cw.p[2]);
             if lift_cw_z > sep_cw.p[2] + 1e-4 {
                 let lift_cw = Pose::new(hy.r, [p_cw[0], p_cw[1], lift_cw_z]);
                 let lp = feasibility::phase(s, "lift", q_sp, s.closed_rad, lift_cw, st.descend_speed_mps, work)?;
-                if let Some(ws) = s.input.ws.as_ref() {
-                    feasibility::check_carried_object_volume(&s.input.arm, &s.input.tcp_offset, ws, &obj_box, &lp, "lift")?;
-                }
+                merge_verdict(feasibility::validate_loaded_leg(&loaded_params, &lp, "lift")?);
                 worst_lift_s = worst_lift_s.max(lp.duration);
             }
             let wd = feasibility::phase(s, "withdrawal", q_cw, s.closed_rad, pre, st.descend_speed_mps, work)?;
+            if wd.duration + 0.5 > st.phase_timeout_s {
+                return Err(Rejection::new(
+                    "withdrawal",
+                    "GRASP_TIMEOUT",
+                    format!(
+                        "contact-window withdrawal duration {:.2} s + settle exceeds phase_timeout_s {:.2} s",
+                        wd.duration, st.phase_timeout_s
+                    ),
+                ));
+            }
             worst_withdraw_s = worst_withdraw_s.max(wd.duration);
         }
     }
+    let payload_assumed = worst_capacity.is_some() && s.evidence.payload_kg.is_none();
 
-    // 9. Unified parent deadline budget check (transition + vision + open + insert + capped close + loaded/recovery + settle)
+    // 8. Unified parent deadline budget check (transition + vision + open + insert + close + loaded/recovery + settle)
     let vis = visible(s, t, &pre);
-    let vision_step_s = st.settle_delay_s + st.lost_timeout_s.min(1.5);
+    let vision_step_s = adaptive_vision_budget_s(st);
     let start_vision_s = vision_step_s;
     let pregrasp_vision_s = if vis { vision_step_s } else { 0.0 };
     let post_lift_settle_s = st.post_lift_settle_ms as f64 / 1000.0;
@@ -1505,7 +1524,7 @@ fn preflight_candidate_from_start(
         joint_limit: jm,
         sigma_min: sig,
         table_clearance_m: hy.table_clearance_m,
-        payload_capacity_kg: capacity.map(|c| c.0),
+        payload_capacity_kg: worst_capacity.map(|c| c.0),
     };
     let checked = Checked {
         q_pre,
@@ -1551,7 +1570,11 @@ fn preflight_candidate_from_start(
         tilt_deg: hy.tilt_deg,
         plan,
         pregrasp_mode,
+        obj_box_nominal_tcp: obj_box_nom,
         obj_box_tcp: obj_box,
+        payload_kg: s.evidence.payload_kg,
+        torque_limits: s.torque_limits.as_ref().map(|(l, _)| l.clone()),
+        has_gravity_model,
         target_centroid: t.centroid,
         target_table_z: t.table_z,
         target_height: t.height,

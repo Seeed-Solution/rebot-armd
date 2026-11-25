@@ -289,11 +289,12 @@ fn capture_from_parts(
     Ok(snap)
 }
 
-/// FNV-1a over the inputs that decide the selection (not the budget).
+/// FNV-1a over the inputs that decide the selection (not the wall search budget).
 pub fn snapshot_id(s: &Snapshot) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     let mut eat = |x: f64| for b in x.to_bits().to_le_bytes() { h ^= u64::from(b); h = h.wrapping_mul(0x0100_0000_01b3); };
     s.input.q0.iter().for_each(|v| eat(*v));
+    eat(f64::from(s.input.j7));
     s.input.tcp_offset.iter().for_each(|v| eat(*v));
     s.box_norm.iter().for_each(|v| eat(*v));
     for p in s.evidence.contour_norm.iter().flatten() { eat(p[0]); eat(p[1]); }
@@ -301,16 +302,29 @@ pub fn snapshot_id(s: &Snapshot) -> String {
     for v in [s.evidence.angle_deg, s.evidence.angle_conf, s.evidence.payload_kg].into_iter().flatten() { eat(v); }
     for v in s.evidence.height_m.iter().flatten() { eat(*v); }
     let st = &s.setup;
-    for v in [st.table_z_m, st.approach_height_m, st.grasp_height_m, st.lift_height_m, st.camera_tilt_deg, st.fx_px, st.fy_px,
-              st.approach_speed_mps, st.descend_speed_mps, st.max_grasp_width_m] { eat(v); }
+    for v in [
+        st.table_z_m, st.approach_height_m, st.grasp_height_m, st.lift_height_m, st.camera_tilt_deg, st.fx_px, st.fy_px,
+        st.approach_speed_mps, st.descend_speed_mps, st.max_grasp_width_m,
+        st.timeout_s, st.phase_timeout_s, st.settle_delay_s, st.lost_timeout_s,
+        st.post_lift_settle_ms as f64, st.descend_contact_stop_nm.unwrap_or(-1.0),
+    ] { eat(v); }
     for p in &s.envelope { p.iter().for_each(|v| eat(*v)); }
-    for v in [s.tool.open_width_m, s.tool.max_grasp_width_m, f64::from(s.open_rad)] { eat(v); }
+    for v in [s.tool.open_width_m, s.tool.max_grasp_width_m, f64::from(s.open_rad), f64::from(s.closed_rad)] { eat(v); }
+    if let Some((lim, _)) = &s.torque_limits {
+        eat(lim.len() as f64);
+        for v in lim { eat(*v); }
+    } else {
+        eat(-1.0);
+    }
     eat(s.prefs.vertical_weight);
     eat(s.prefs.preferred_max_tilt_deg.unwrap_or(-1.0));
     eat(s.prefs.hard_max_tilt_deg.unwrap_or(-1.0));
     eat(s.prefs.approach_side as u8 as f64);
     eat(s.input.workspace_revision as f64);
-    if let Some(ws) = &s.input.ws { for k in &ws.keepout_boxes { k.min_m.iter().chain(&k.max_m).for_each(|v| eat(f64::from(*v))); } }
+    if let Some(ws) = &s.input.ws {
+        eat(f64::from(ws.floor_z_m));
+        for k in &ws.keepout_boxes { k.min_m.iter().chain(&k.max_m).for_each(|v| eat(f64::from(*v))); }
+    }
     format!("{h:016x}")
 }
 
@@ -330,6 +344,10 @@ impl FootprintSource {
 pub struct Target {
     /// Counter-clockwise base-frame footprint, projected at the mid-height plane.
     pub poly: Vec<V2>,
+    /// Base-frame footprint projected onto the table plane (`table_z`).
+    pub poly_lo: Vec<V2>,
+    /// Base-frame footprint projected onto the object top plane (`table_z + height[1]`).
+    pub poly_hi: Vec<V2>,
     pub source: FootprintSource,
     /// Why better evidence was not used (contour rejected, ray missed, ...).
     pub fallback_reason: Option<String>,
@@ -417,7 +435,7 @@ pub fn target(s: &Snapshot) -> Result<Target, String> {
     let he_e = HAND_EYE_ERROR_DEG.to_radians().tan() * dist;
     let contour_e = CONTOUR_ERROR_PX * dist / s.cam.fx.min(s.cam.fy);
     Ok(Target {
-        poly, source, fallback_reason: if source == FootprintSource::Contour { None } else { fallback }, table_z: table, height, height_source,
+        poly, poly_lo: lo, poly_hi: hi, source, fallback_reason: if source == FootprintSource::Contour { None } else { fallback }, table_z: table, height, height_source,
         centroid: c, axis, aspect, axis_ambiguous: source == FootprintSource::Box || aspect < 1.2,
         projection_spread_m: spread, hard_error_m: scale_e.max(he_e) + contour_e, scale_error_m: scale_e, hand_eye_error_m: he_e,
         contour_error_m: contour_e, view_distance_m: dist,
