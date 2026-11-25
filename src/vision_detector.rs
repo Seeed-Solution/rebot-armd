@@ -611,4 +611,156 @@ mod tests {
         assert!(DetectorDefaults::default().validate().is_ok());
         assert!(DetectorDefaults { detect: vec![String::new()], segment: vec![] }.validate().is_err());
     }
+
+    #[test]
+    fn md5_rfc1321_vectors() {
+        assert_eq!(md5_bytes(b""), "d41d8cd98f00b204e9800998ecf8427e");
+        assert_eq!(md5_bytes(b"a"), "0cc175b9c0f1b6a831c399e269772661");
+        assert_eq!(md5_bytes(b"abc"), "900150983cd24fb0d6963f7d28e17f72");
+        assert_eq!(md5_bytes(b"message digest"), "f96b697d7cb7938d525a2f31aaf161d0");
+        assert_eq!(md5_bytes(b"abcdefghijklmnopqrstuvwxyz"), "c3fcd3d76192e4007dfb496cca67e13b");
+    }
+
+    #[test]
+    fn manifest_matches_detector_defaults() {
+        let disk_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kits/recamera-b601dm/vision/models/models.tsv");
+        let disk_tsv = fs::read_to_string(&disk_path).expect("models.tsv must exist");
+        assert_eq!(disk_tsv, EMBEDDED_MODELS_TSV);
+        let entries = parse_manifest(&disk_tsv);
+
+        let by_role = |role: &str| -> &ManifestEntry {
+            entries
+                .iter()
+                .find(|e| e.role == role)
+                .unwrap_or_else(|| panic!("missing role {role} in models.tsv"))
+        };
+        let det = by_role("detector-detect");
+        let seg = by_role("detector-segment");
+        let seg_fb = by_role("detector-segment-fallback");
+        let depth = by_role("depth");
+
+        let defaults = DetectorDefaults::default();
+        assert_eq!(defaults.detect, vec![model_file_stem(&det.file).to_string()]);
+        assert_eq!(
+            defaults.segment,
+            vec![
+                model_file_stem(&seg.file).to_string(),
+                model_file_stem(&seg_fb.file).to_string(),
+            ]
+        );
+
+        // Verify required manifest fields and tuned tabletop/seg384 hashes.
+        for e in [det, seg, seg_fb, depth] {
+            assert_eq!(e.md5.len(), 32, "bad md5 for {}", e.role);
+            assert!(e.md5.chars().all(|c| c.is_ascii_hexdigit()), "non-hex md5 for {}", e.role);
+            assert!(e.size > 0, "zero size for {}", e.role);
+            assert!(e.ion_mb > 0.0, "zero ion_mb for {}", e.role);
+        }
+        assert_eq!(seg.ship, "bundled");
+        assert_eq!(depth.ship, "bundled");
+        assert!(seg.url.starts_with("https://"));
+        assert!(depth.url.starts_with("https://"));
+        assert_eq!(seg.md5, "5ad01b51727c5259abc1448f2bd0cec6");
+        assert_eq!(depth.md5, "d0a6ee396c12680188a1cb8d56cd4a94");
+    }
+
+    #[test]
+    fn evaluate_model_config_reports_bundled_cdn_user_missing_and_mismatched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let bundled = root.join("usr/share/rebot-teleop/models");
+        let local = root.join("userdata/local/models");
+        let os_dir = root.join("usr/share/supervisor/models");
+        fs::create_dir_all(&bundled).unwrap();
+        fs::create_dir_all(&local).unwrap();
+        fs::create_dir_all(&os_dir).unwrap();
+
+        let seg_bytes = b"seg384-test-payload";
+        let dep_bytes = b"zipdepth-tabletop-payload";
+        let det_bytes = b"os-detect-payload";
+        fs::write(bundled.join("seg.cvimodel"), seg_bytes).unwrap();
+        fs::write(bundled.join("dep.cvimodel"), dep_bytes).unwrap();
+        fs::write(os_dir.join("det.cvimodel"), det_bytes).unwrap();
+
+        let manifest = vec![
+            ManifestEntry {
+                role: "detector-segment".into(),
+                file: "seg.cvimodel".into(),
+                md5: md5_bytes(seg_bytes),
+                size: seg_bytes.len() as u64,
+                ion_mb: 13.1,
+                url: "https://example.invalid/seg".into(),
+                ship: "bundled".into(),
+            },
+            ManifestEntry {
+                role: "detector-detect".into(),
+                file: "det.cvimodel".into(),
+                md5: md5_bytes(det_bytes),
+                size: det_bytes.len() as u64,
+                ion_mb: 8.5,
+                url: "-".into(),
+                ship: "os".into(),
+            },
+            ManifestEntry {
+                role: "depth".into(),
+                file: "dep.cvimodel".into(),
+                md5: md5_bytes(dep_bytes),
+                size: dep_bytes.len() as u64,
+                ion_mb: 20.0,
+                url: "https://example.invalid/dep".into(),
+                ship: "bundled".into(),
+            },
+        ];
+
+        let mode_all = json!({
+            "model": {"name": "seg", "path": "/userdata/local/models/seg.cvimodel"},
+            "depth_model": {"name": "dep", "path": "/userdata/local/models/dep.cvimodel"},
+            "models": {"catalogue": [
+                {"name": "det", "path": "/usr/share/supervisor/models/det.cvimodel"},
+                {"name": "seg", "path": "/userdata/local/models/seg.cvimodel"},
+                {"name": "dep", "path": "/userdata/local/models/dep.cvimodel"}
+            ]}
+        });
+
+        // 1. Missing when symlinks have not been created yet
+        let st = evaluate_model_config(&mode_all, &manifest, root);
+        assert!(!st.optimal);
+        assert_eq!(st.missing, vec!["seg.cvimodel", "dep.cvimodel"]);
+        assert!(st.mismatched.is_empty());
+
+        // 2. Linked to bundled -> optimal + source="bundled"
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(bundled.join("seg.cvimodel"), local.join("seg.cvimodel")).unwrap();
+            std::os::unix::fs::symlink(bundled.join("dep.cvimodel"), local.join("dep.cvimodel")).unwrap();
+            let st = evaluate_model_config(&mode_all, &manifest, root);
+            assert!(st.optimal, "{st:?}");
+            assert!(st.missing.is_empty());
+            assert!(st.mismatched.is_empty());
+            assert_eq!(st.source, "bundled");
+        }
+
+        // 3. Regular file recorded as cdn -> optimal + source="cdn"
+        fs::remove_file(local.join("dep.cvimodel")).unwrap();
+        fs::write(local.join("dep.cvimodel"), dep_bytes).unwrap();
+        fs::write(local.join(".rebot-model-sources"), "seg.cvimodel\tbundled\ndep.cvimodel\tcdn\n").unwrap();
+        let st = evaluate_model_config(&mode_all, &manifest, root);
+        assert!(st.optimal);
+        assert_eq!(st.source, "cdn");
+
+        // 4. Wrong md5 -> not optimal, listed in mismatched
+        fs::write(local.join("dep.cvimodel"), b"old-room-scale-bytes").unwrap();
+        let st = evaluate_model_config(&mode_all, &manifest, root);
+        assert!(!st.optimal);
+        assert!(st.missing.is_empty());
+        assert_eq!(st.mismatched, vec!["dep.cvimodel"]);
+
+        // 5. User-supplied valid regular file without cdn marker -> optimal + source="user"
+        fs::write(local.join("dep.cvimodel"), dep_bytes).unwrap();
+        fs::remove_file(local.join(".rebot-model-sources")).unwrap();
+        let st = evaluate_model_config(&mode_all, &manifest, root);
+        assert!(st.optimal);
+        assert_eq!(st.source, "user");
+    }
 }
