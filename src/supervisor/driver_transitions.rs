@@ -1474,6 +1474,7 @@ impl SupervisorInner {
                             let res = drv.begin_disable_torque_budgeted(kind, 0);
                             let post_now = drv.clock_now();
                             let frames_dispatched = drv.disable_frames_dispatched();
+                            let dispatched_mask = drv.disable_dispatched_mask();
                             let mut ages_buf = std::mem::take(&mut self.scratch.ages);
                             let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
                             let snap = OwnerDriverSnapshot::capture_from_driver(
@@ -1486,13 +1487,13 @@ impl SupervisorInner {
                             );
                             self.scratch.ages = ages_buf;
                             self.scratch.fb.bounds = bounds_buf;
-                            Ok((res, drv_now, post_now, frames_dispatched, snap))
+                            Ok((res, drv_now, post_now, frames_dispatched, dispatched_mask, snap))
                         }
                         Err(std::sync::TryLockError::WouldBlock) => Err(true),
                         Err(std::sync::TryLockError::Poisoned(_)) => Err(false),
                     }
                 };
-                let (res, drv_now, post_now, frames_dispatched, snap) = match outcome {
+                let (res, drv_now, post_now, frames_dispatched, dispatched_mask, snap) = match outcome {
                     Ok(v) => {
                         self.reset_disable_lock_contention();
                         v
@@ -1531,16 +1532,27 @@ impl SupervisorInner {
                         let mut message = crate::safety::BoundedText::empty();
                         message.push_str("Torque disable transmission failed: ");
                         e.write_bounded(&mut message);
+                        let partial_remaining = self.is_partial_disable_remaining(dispatched_mask);
+                        let partial_retry = self.commit_partial_disable_retry_kind(
+                            kind,
+                            post_now,
+                            frames_dispatched,
+                            partial_remaining,
+                        );
                         let code = if pending_disable {
                             self.torque_transition = None;
-                            if !refused {
+                            if let Some(rk) = partial_retry {
+                                let _ = self.arm_background_disable_retry_immediate_with_kind(rk, post_now);
+                            } else if !refused {
                                 let _ = self.arm_background_disable_retry_with_kind(kind, post_now);
                             }
-                            let code = self.disable_step_failed(e);
+                            let code = self.disable_step_failed_inner(e, partial_retry.is_some());
                             self.core.begin_transition(Err(code));
                             code
                         } else {
-                            if refused {
+                            if let Some(rk) = partial_retry {
+                                let _ = self.arm_background_disable_retry_immediate_with_kind(rk, post_now);
+                            } else if refused {
                                 self.disable_pending = false;
                                 self.active_disable_kind = None;
                                 self.last_disable_attempt = None;
@@ -1555,7 +1567,7 @@ impl SupervisorInner {
                         return Err(RequestDisableError {
                             code,
                             message,
-                            refused_by_chokepoint: refused,
+                            refused_by_chokepoint: refused && !frames_dispatched,
                         });
                     }
                 };
@@ -1633,18 +1645,27 @@ impl SupervisorInner {
                                 crate::driver::ArmDriverError::TorqueOffWouldDrop
                                     | crate::driver::ArmDriverError::DisableRequestExpired
                             );
+                            let post_now = drv.clock_now();
+                            let frames_dispatched = drv.disable_frames_dispatched() || true;
+                            let dispatched_mask = drv.disable_dispatched_mask();
                             let mut message = crate::safety::BoundedText::empty();
                             message.push_str("Torque disable transmission failed: ");
                             e.write_bounded(&mut message);
                             drop(drv);
-                            self.disable_first_frame_accepted();
+                            let partial_remaining = self.is_partial_disable_remaining(dispatched_mask);
+                            let partial_retry = self.commit_partial_disable_retry_kind(
+                                kind,
+                                post_now,
+                                frames_dispatched,
+                                partial_remaining,
+                            );
                             let code = if pending_disable {
                                 self.torque_transition = None;
-                                let code = self.disable_step_failed(e);
+                                let code = self.disable_step_failed_inner(e, partial_retry.is_some());
                                 self.core.begin_transition(Err(code));
                                 code
                             } else {
-                                if refused {
+                                if refused && partial_retry.is_none() {
                                     self.disable_pending = false;
                                     self.active_disable_kind = None;
                                     self.last_disable_attempt = None;
@@ -1657,7 +1678,7 @@ impl SupervisorInner {
                             return Err(RequestDisableError {
                                 code,
                                 message,
-                                refused_by_chokepoint: refused,
+                                refused_by_chokepoint: refused && !frames_dispatched,
                             });
                         }
                     }
@@ -1667,17 +1688,27 @@ impl SupervisorInner {
                             crate::driver::ArmDriverError::TorqueOffWouldDrop
                                 | crate::driver::ArmDriverError::DisableRequestExpired
                         );
+                        let post_now = drv.clock_now();
+                        let frames_dispatched = drv.disable_frames_dispatched();
+                        let dispatched_mask = drv.disable_dispatched_mask();
                         let mut message = crate::safety::BoundedText::empty();
                         message.push_str("Torque disable transmission failed: ");
                         e.write_bounded(&mut message);
                         drop(drv);
+                        let partial_remaining = self.is_partial_disable_remaining(dispatched_mask);
+                        let partial_retry = self.commit_partial_disable_retry_kind(
+                            kind,
+                            post_now,
+                            frames_dispatched,
+                            partial_remaining,
+                        );
                         let code = if pending_disable {
                             self.torque_transition = None;
-                            let code = self.disable_step_failed(e);
+                            let code = self.disable_step_failed_inner(e, partial_retry.is_some());
                             self.core.begin_transition(Err(code));
                             code
                         } else {
-                            if refused {
+                            if refused && partial_retry.is_none() {
                                 self.disable_pending = false;
                                 self.active_disable_kind = None;
                                 self.last_disable_attempt = None;
@@ -1690,7 +1721,7 @@ impl SupervisorInner {
                         return Err(RequestDisableError {
                             code,
                             message,
-                            refused_by_chokepoint: refused,
+                            refused_by_chokepoint: refused && !frames_dispatched,
                         });
                     }
                 }
@@ -1700,17 +1731,27 @@ impl SupervisorInner {
                     crate::driver::ArmDriverError::TorqueOffWouldDrop
                         | crate::driver::ArmDriverError::DisableRequestExpired
                 );
+                let post_now = drv.clock_now();
+                let frames_dispatched = drv.disable_frames_dispatched();
+                let dispatched_mask = drv.disable_dispatched_mask();
                 let mut message = crate::safety::BoundedText::empty();
                 message.push_str("Torque disable transmission failed: ");
                 e.write_bounded(&mut message);
                 drop(drv);
+                let partial_remaining = self.is_partial_disable_remaining(dispatched_mask);
+                let partial_retry = self.commit_partial_disable_retry_kind(
+                    kind,
+                    post_now,
+                    frames_dispatched,
+                    partial_remaining,
+                );
                 let code = if pending_disable {
                     self.torque_transition = None;
-                    let code = self.disable_step_failed(e);
+                    let code = self.disable_step_failed_inner(e, partial_retry.is_some());
                     self.core.begin_transition(Err(code));
                     code
                 } else {
-                    if refused {
+                    if refused && partial_retry.is_none() {
                         self.disable_pending = false;
                         self.active_disable_kind = None;
                         self.last_disable_attempt = None;
@@ -1723,7 +1764,7 @@ impl SupervisorInner {
                 return Err(RequestDisableError {
                     code,
                     message,
-                    refused_by_chokepoint: refused,
+                    refused_by_chokepoint: refused && !frames_dispatched,
                 });
             }
             let mut ages_buf = std::mem::take(&mut self.scratch.ages);
@@ -2190,9 +2231,12 @@ impl SupervisorInner {
             Some(d) => match d.try_lock() {
                 Ok(mut drv) => {
                     drv.set_mit_ownership_lost(self.mit.owner == crate::mit::MitOwner::Lost);
-                    drv.drop_pending_holds_outside_mask(keep_queued_mask);
+                    let dispatched_mask = drv.disable_dispatched_mask();
+                    let effective_hold_mask = hold_mask & !dispatched_mask;
+                    let effective_keep_mask = keep_queued_mask & !dispatched_mask;
+                    drv.drop_pending_holds_outside_mask(effective_keep_mask);
                     drv.set_pending_pos_force_hold_hint(true);
-                    let r = drv.write_measured_hold_masked(hold_mask, &targets);
+                    let r = drv.write_measured_hold_masked(effective_hold_mask, &targets);
                     let now = drv.clock_now();
                     let max_age = drv.tx_frame_max_age();
                     let oldest_pending = drv.oldest_pending_tx_age();
@@ -2358,6 +2402,90 @@ impl SupervisorInner {
         out
     }
 
+    #[inline]
+    fn all_joints_mask(&self) -> u64 {
+        let dof = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
+        if dof >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << dof) - 1
+        }
+    }
+
+    #[inline]
+    fn is_partial_disable_remaining(&self, dispatched_mask: u64) -> bool {
+        let all = self.all_joints_mask();
+        dispatched_mask != 0 && (dispatched_mask & all) != all
+    }
+
+    /// R12 B3: Once ANY motor has received a disable frame (`frames_dispatched == true`), the
+    /// disable is committed (`torque_intent = Off`, holds stopped). When undispatched motors
+    /// remain (`partial_remaining`), preserve `disable_pending = true` and return the retry
+    /// `DisableKind` so the retry path finishes the remaining motors (keeping original `started_at`
+    /// while within 1 s, or starting a bounded continuation pass if expiry fired mid-batch after
+    /// at least one motor was already disabled).
+    fn commit_partial_disable_retry_kind(
+        &mut self,
+        kind: crate::driver::DisableKind,
+        post_now: Instant,
+        frames_dispatched: bool,
+        partial_remaining: bool,
+    ) -> Option<crate::driver::DisableKind> {
+        if !frames_dispatched {
+            return None;
+        }
+        self.disable_first_frame_accepted();
+        if !partial_remaining {
+            return None;
+        }
+        let retry_kind = match kind {
+            crate::driver::DisableKind::DisableRequested { started_at }
+                if post_now.saturating_duration_since(started_at)
+                    >= crate::driver::STOPPED_DISABLE_REQUEST_LIFETIME =>
+            {
+                crate::driver::DisableKind::DisableRequested { started_at: post_now }
+            }
+            other => other,
+        };
+        self.disable_pending = true;
+        self.active_disable_kind = Some(retry_kind);
+        Some(retry_kind)
+    }
+
+    /// Arms bounded [`BackgroundDisableRetry`] retrying immediately on the next release
+    /// (`next_retry_at: drv_now`), used for committed partial disables (R12 B3) and contended
+    /// protective thermal cuts (R12 B4).
+    fn arm_background_disable_retry_immediate_with_kind(
+        &mut self,
+        kind: crate::driver::DisableKind,
+        drv_now: Instant,
+    ) -> bool {
+        if matches!(
+            self.background_disable_retry,
+            Some(BackgroundDisableRetry::Exhausted)
+        ) {
+            return false;
+        }
+        let origin = match kind {
+            crate::driver::DisableKind::DisableRequested { started_at, .. } => started_at,
+            crate::driver::DisableKind::DisableProtective { .. } => drv_now,
+        };
+        let window = self.background_disable_window_for(kind);
+        if drv_now.saturating_duration_since(origin) >= window {
+            self.exhaust_background_disable_retry();
+            return false;
+        }
+        if self.background_disable_retry.is_none() {
+            self.background_disable_retry = Some(BackgroundDisableRetry::Active {
+                attempts: 0,
+                kind,
+                started_at: origin,
+                next_retry_at: drv_now,
+            });
+        }
+        true
+    }
+
     /// Arms bounded [`BackgroundDisableRetry`] preserving the original [`crate::driver::DisableKind`]
     /// (`started_at` on the driver clock for `DisableRequested`) so every retry passes through the
     /// driver's single `begin_disable_torque_budgeted(kind, 0)` choke point and rest-pose gate
@@ -2426,19 +2554,31 @@ impl SupervisorInner {
             return false;
         };
         let control_release_seq = self.control_release_seq;
+        let retry_kind = self.active_disable_kind;
         let step = {
             let Ok(mut drv) = d.lock() else {
                 return false;
             };
-            if !drv.torque_transition_pending() {
+            let pending_hs = drv.torque_transition_pending();
+            let partial_dispatched = drv.disable_dispatched_mask() != 0;
+            if !pending_hs && !partial_dispatched {
                 return false;
             }
             if control_release_seq > 0 {
                 drv.begin_control_release(control_release_seq);
             }
             let drv_now = drv.clock_now();
-            let poll_res = drv.poll_torque(drv_now + Duration::from_millis(8));
+            let poll_res = if pending_hs {
+                drv.poll_torque(drv_now + Duration::from_millis(8))
+            } else {
+                let k = retry_kind.unwrap_or(crate::driver::DisableKind::DisableRequested {
+                    started_at: drv_now,
+                });
+                drv.begin_disable_torque(k)
+            };
+            let post_now = drv.clock_now();
             let frames_dispatched = drv.disable_frames_dispatched();
+            let dispatched_mask = drv.disable_dispatched_mask();
             let mut ages_buf = std::mem::take(&mut self.scratch.ages);
             let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
             let snap = OwnerDriverSnapshot::capture_from_driver(
@@ -2451,10 +2591,14 @@ impl SupervisorInner {
             );
             self.scratch.ages = ages_buf;
             self.scratch.fb.bounds = bounds_buf;
-            (poll_res, frames_dispatched, snap)
+            (poll_res, post_now, frames_dispatched, dispatched_mask, snap)
         };
-        let (poll_res, frames_dispatched, snap) = step;
+        let (poll_res, post_now, frames_dispatched, dispatched_mask, snap) = step;
         self.owner_driver_snapshot = snap;
+        let partial_remaining = self.is_partial_disable_remaining(dispatched_mask);
+        let active_kind = self.active_disable_kind.unwrap_or(
+            crate::driver::DisableKind::DisableRequested { started_at: post_now },
+        );
         match poll_res {
             Ok(crate::driver::TorqueProgress::Done(_)) => {
                 self.disable_accepted();
@@ -2471,6 +2615,27 @@ impl SupervisorInner {
             ) => {
                 if frames_dispatched {
                     self.disable_first_frame_accepted();
+                    if !partial_remaining {
+                        self.disable_pending = false;
+                        self.active_disable_kind = None;
+                        self.last_disable_attempt = None;
+                    } else if let crate::driver::DisableKind::DisableRequested { started_at } = active_kind {
+                        if post_now.saturating_duration_since(started_at)
+                            >= crate::driver::STOPPED_DISABLE_REQUEST_LIFETIME
+                        {
+                            if self.background_disable_retry.is_none() {
+                                let rk = crate::driver::DisableKind::DisableRequested {
+                                    started_at: post_now,
+                                };
+                                self.active_disable_kind = Some(rk);
+                                let _ = self.arm_background_disable_retry_immediate_with_kind(rk, post_now);
+                            } else {
+                                self.exhaust_background_disable_retry();
+                                self.disable_pending = false;
+                                self.active_disable_kind = None;
+                            }
+                        }
+                    }
                 } else {
                     self.disable_pending = false;
                     self.active_disable_kind = None;
@@ -4026,6 +4191,7 @@ impl SupervisorInner {
                         };
                         let res = drv.begin_disable_torque_budgeted(disable_kind, 0);
                         let frames_dispatched = drv.disable_frames_dispatched();
+                        let dispatched_mask = drv.disable_dispatched_mask();
                         let post_now = drv.clock_now();
                         let mut ages_buf = std::mem::take(&mut self.scratch.ages);
                         let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
@@ -4039,21 +4205,21 @@ impl SupervisorInner {
                         );
                         self.scratch.ages = ages_buf;
                         self.scratch.fb.bounds = bounds_buf;
-                        Ok((res, requested_at, post_now, disable_kind, frames_dispatched, snap))
+                        Ok((res, requested_at, post_now, disable_kind, frames_dispatched, dispatched_mask, snap))
                     }
                     Err(std::sync::TryLockError::WouldBlock) => Err(true),
                     Err(std::sync::TryLockError::Poisoned(_)) => Err(false),
                 }
             };
             match locked {
-                Ok((res, requested_at, post_now, disable_kind, frames_dispatched, snap)) => {
+                Ok((res, requested_at, post_now, disable_kind, frames_dispatched, dispatched_mask, snap)) => {
                     self.reset_disable_lock_contention();
                     self.owner_driver_snapshot = snap;
                     self.stop_motion();
                     self.commanded_velocities.fill(0.0);
                     self.background_disable_retry = None;
                     self.disable_requested_at(requested_at);
-                    Some((res, post_now, disable_kind, frames_dispatched))
+                    Some((res, post_now, disable_kind, frames_dispatched, dispatched_mask))
                 }
                 Err(true) => {
                     self.record_disable_lock_contention();
@@ -4064,7 +4230,7 @@ impl SupervisorInner {
                 }
             }
         };
-        if let Some((_, _, disable_kind, _)) = started {
+        if let Some((_, _, disable_kind, _, _)) = started {
             self.active_disable_kind = Some(disable_kind);
         }
         Ok(match started {
@@ -4072,41 +4238,54 @@ impl SupervisorInner {
                 self.disable_accepted();
                 self.torque_off_finish_rt().map(|()| Rt::Done)
             }
-            Some((Ok(crate::driver::TorqueProgress::Pending { .. }), post_now, disable_kind, frames_dispatched)) => {
+            Some((Ok(crate::driver::TorqueProgress::Pending { .. }), post_now, disable_kind, frames_dispatched, _)) => {
                 if frames_dispatched {
                     self.disable_first_frame_accepted();
                 }
                 self.torque_transition = Some(TorqueTransition::Disable { kind: disable_kind });
                 Ok(Rt::Pending { wake: post_now })
             }
-            Some((Ok(crate::driver::TorqueProgress::Done(_)), _, _, _)) => {
+            Some((Ok(crate::driver::TorqueProgress::Done(_)), _, _, _, _)) => {
                 self.disable_accepted();
                 self.torque_off_finish_rt().map(|()| Rt::Done)
             }
-            Some((Err(e), post_now, disable_kind, _)) => {
+            Some((Err(e), post_now, disable_kind, frames_dispatched, dispatched_mask)) => {
                 let refused = matches!(
                     e,
                     crate::driver::ArmDriverError::TorqueOffWouldDrop
                         | crate::driver::ArmDriverError::DisableRequestExpired
                 );
-                if !refused {
+                let partial_remaining = self.is_partial_disable_remaining(dispatched_mask);
+                let partial_retry = self.commit_partial_disable_retry_kind(
+                    disable_kind,
+                    post_now,
+                    frames_dispatched,
+                    partial_remaining,
+                );
+                if let Some(rk) = partial_retry {
+                    let _ = self.arm_background_disable_retry_immediate_with_kind(rk, post_now);
+                } else if !refused {
                     let _ = self.arm_background_disable_retry_with_kind(disable_kind, post_now);
                 }
-                Err(self.disable_step_failed(e))
+                Err(self.disable_step_failed_inner(e, partial_retry.is_some()))
             }
         })
     }
 
-    /// A disable step failed: `disable_pending` stays set for transport errors (and
-    /// `DRIVER_WRITE_FAILED` latches when not already stopped), while a choke-point refusal
+    /// A disable step failed: `disable_pending` stays set for transport errors or committed
+    /// partial dispatches (`committed_partial`), while an uncommitted choke-point refusal
     /// (`TorqueOffWouldDrop` / `DisableRequestExpired`) cleanly ends the request.
-    fn disable_step_failed(&mut self, e: crate::driver::ArmDriverError) -> &'static str {
+    fn disable_step_failed_inner(
+        &mut self,
+        e: crate::driver::ArmDriverError,
+        committed_partial: bool,
+    ) -> &'static str {
         let refused = matches!(
             e,
             crate::driver::ArmDriverError::TorqueOffWouldDrop
                 | crate::driver::ArmDriverError::DisableRequestExpired
         );
-        if refused {
+        if refused && !committed_partial {
             self.disable_pending = false;
             self.active_disable_kind = None;
             self.last_disable_attempt = None;
@@ -4167,6 +4346,7 @@ impl SupervisorInner {
                 post_now: Instant,
                 still_pending: bool,
                 frames_dispatched: bool,
+                dispatched_mask: u64,
             },
             Idle {
                 drv_now: Instant,
@@ -4200,12 +4380,14 @@ impl SupervisorInner {
                         self.scratch.fb.bounds = bounds_buf;
                         let still_pending = drv.torque_transition_pending();
                         let frames_dispatched = drv.disable_frames_dispatched();
+                        let dispatched_mask = drv.disable_dispatched_mask();
                         BgPollStep::Polled {
                             poll_res,
                             rx,
                             post_now,
                             still_pending,
                             frames_dispatched,
+                            dispatched_mask,
                         }
                     } else {
                         BgPollStep::Idle { drv_now }
@@ -4225,8 +4407,10 @@ impl SupervisorInner {
                 post_now,
                 still_pending,
                 frames_dispatched,
+                dispatched_mask,
             } => {
                 self.reset_disable_lock_contention();
+                let partial_remaining = self.is_partial_disable_remaining(dispatched_mask);
                 match poll_res {
                     Ok(crate::driver::TorqueProgress::Done(_)) => {
                         self.disable_accepted();
@@ -4236,10 +4420,58 @@ impl SupervisorInner {
                         crate::driver::ArmDriverError::TorqueOffWouldDrop
                         | crate::driver::ArmDriverError::DisableRequestExpired,
                     ) => {
-                        self.disable_pending = false;
-                        self.active_disable_kind = None;
-                        self.last_disable_attempt = None;
-                        self.background_disable_retry = None;
+                        if frames_dispatched {
+                            self.disable_first_frame_accepted();
+                        }
+                        if partial_remaining {
+                            match self.background_disable_retry {
+                                None => {
+                                    let base_kind = self.active_disable_kind.unwrap_or(
+                                        crate::driver::DisableKind::DisableRequested {
+                                            started_at: post_now,
+                                        },
+                                    );
+                                    if let Some(rk) = self.commit_partial_disable_retry_kind(
+                                        base_kind,
+                                        post_now,
+                                        true,
+                                        true,
+                                    ) {
+                                        let _ = self.arm_background_disable_retry_immediate_with_kind(
+                                            rk,
+                                            post_now,
+                                        );
+                                    }
+                                }
+                                Some(BackgroundDisableRetry::Active {
+                                    attempts,
+                                    kind,
+                                    started_at,
+                                    ..
+                                }) => {
+                                    let window = self.background_disable_window_for(kind);
+                                    if post_now.saturating_duration_since(started_at) >= window
+                                        || attempts >= BACKGROUND_DISABLE_MAX_RETRIES
+                                    {
+                                        self.exhaust_background_disable_retry();
+                                    } else {
+                                        self.background_disable_retry =
+                                            Some(BackgroundDisableRetry::Active {
+                                                attempts,
+                                                kind,
+                                                started_at,
+                                                next_retry_at: post_now,
+                                            });
+                                    }
+                                }
+                                Some(BackgroundDisableRetry::Exhausted) => {}
+                            }
+                        } else {
+                            self.disable_pending = false;
+                            self.active_disable_kind = None;
+                            self.last_disable_attempt = None;
+                            self.background_disable_retry = None;
+                        }
                     }
                     Ok(crate::driver::TorqueProgress::Pending { .. }) => {
                         if frames_dispatched {
@@ -4255,6 +4487,7 @@ impl SupervisorInner {
                             if post_now.saturating_duration_since(started_at) >= window {
                                 if matches!(kind, crate::driver::DisableKind::DisableRequested { .. })
                                     && self.torque_off_stopped()
+                                    && !frames_dispatched
                                 {
                                     self.disable_pending = false;
                                     self.active_disable_kind = None;
@@ -4267,6 +4500,9 @@ impl SupervisorInner {
                         }
                     }
                     Err(_) => {
+                        if frames_dispatched {
+                            self.disable_first_frame_accepted();
+                        }
                         match self.background_disable_retry {
                             Some(BackgroundDisableRetry::Active {
                                 attempts,
@@ -4280,6 +4516,7 @@ impl SupervisorInner {
                                 if window_expired
                                     && matches!(kind, crate::driver::DisableKind::DisableRequested { .. })
                                     && self.torque_off_stopped()
+                                    && !frames_dispatched
                                 {
                                     self.disable_pending = false;
                                     self.active_disable_kind = None;
@@ -4295,7 +4532,11 @@ impl SupervisorInner {
                                             attempts,
                                             kind,
                                             started_at,
-                                            next_retry_at: post_now + BACKGROUND_DISABLE_RETRY_INTERVAL,
+                                            next_retry_at: if partial_remaining {
+                                                post_now
+                                            } else {
+                                                post_now + BACKGROUND_DISABLE_RETRY_INTERVAL
+                                            },
                                         });
                                 }
                             }
@@ -4306,7 +4547,16 @@ impl SupervisorInner {
                                         started_at: post_now,
                                     },
                                 );
-                                let _ = self.arm_background_disable_retry_with_kind(kind, post_now);
+                                if let Some(rk) = self.commit_partial_disable_retry_kind(
+                                    kind,
+                                    post_now,
+                                    frames_dispatched,
+                                    partial_remaining,
+                                ) {
+                                    let _ = self.arm_background_disable_retry_immediate_with_kind(rk, post_now);
+                                } else {
+                                    let _ = self.arm_background_disable_retry_with_kind(kind, post_now);
+                                }
                             }
                         }
                     }
@@ -4333,6 +4583,7 @@ impl SupervisorInner {
         if window_expired
             && matches!(kind, crate::driver::DisableKind::DisableRequested { .. })
             && self.torque_off_stopped()
+            && self.torque_intent != TorqueIntent::Off
         {
             self.disable_pending = false;
             self.active_disable_kind = None;
@@ -4357,6 +4608,7 @@ impl SupervisorInner {
                     let res = drv.begin_disable_torque_budgeted(kind, 0);
                     let handshake_pending = drv.torque_transition_pending();
                     let frames_dispatched = drv.disable_frames_dispatched();
+                    let dispatched_mask = drv.disable_dispatched_mask();
                     let post_now = drv.clock_now();
                     let mut ages_buf = std::mem::take(&mut self.scratch.ages);
                     let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
@@ -4370,11 +4622,11 @@ impl SupervisorInner {
                     );
                     self.scratch.ages = ages_buf;
                     self.scratch.fb.bounds = bounds_buf;
-                    Ok((res, handshake_pending, frames_dispatched, post_now, snap))
+                    Ok((res, handshake_pending, frames_dispatched, dispatched_mask, post_now, snap))
                 }
             }
         };
-        let (res, handshake_pending, frames_dispatched, post_now, snap) = match retry_out {
+        let (res, handshake_pending, frames_dispatched, dispatched_mask, post_now, snap) = match retry_out {
             Ok(v) => {
                 self.reset_disable_lock_contention();
                 v
@@ -4386,6 +4638,7 @@ impl SupervisorInner {
             Err(false) => return None,
         };
         self.owner_driver_snapshot = snap;
+        let partial_remaining = self.is_partial_disable_remaining(dispatched_mask);
 
         match res {
             Ok(crate::driver::TorqueProgress::Done(_)) => {
@@ -4397,18 +4650,27 @@ impl SupervisorInner {
                 crate::driver::ArmDriverError::TorqueOffWouldDrop
                 | crate::driver::ArmDriverError::DisableRequestExpired,
             ) => {
-                self.disable_pending = false;
-                self.active_disable_kind = None;
-                self.last_disable_attempt = None;
-                self.background_disable_retry = None;
-                return None;
+                if frames_dispatched {
+                    self.disable_first_frame_accepted();
+                }
+                if !partial_remaining {
+                    self.disable_pending = false;
+                    self.active_disable_kind = None;
+                    self.last_disable_attempt = None;
+                    self.background_disable_retry = None;
+                    return None;
+                }
             }
             Ok(crate::driver::TorqueProgress::Pending { .. }) => {
                 if frames_dispatched {
                     self.disable_first_frame_accepted();
                 }
             }
-            Err(_) => {}
+            Err(_) => {
+                if frames_dispatched {
+                    self.disable_first_frame_accepted();
+                }
+            }
         }
 
         let next_attempts = attempts.saturating_add(1);
@@ -4416,6 +4678,7 @@ impl SupervisorInner {
         if window_expired
             && matches!(kind, crate::driver::DisableKind::DisableRequested { .. })
             && self.torque_off_stopped()
+            && !frames_dispatched
         {
             self.disable_pending = false;
             self.active_disable_kind = None;
@@ -4429,7 +4692,11 @@ impl SupervisorInner {
                 attempts: next_attempts,
                 kind,
                 started_at,
-                next_retry_at: post_now + BACKGROUND_DISABLE_RETRY_INTERVAL,
+                next_retry_at: if partial_remaining {
+                    post_now
+                } else {
+                    post_now + BACKGROUND_DISABLE_RETRY_INTERVAL
+                },
             });
         }
         None
@@ -4473,6 +4740,7 @@ impl SupervisorInner {
                             let drv_now = drv.clock_now();
                             let r = drv.poll_torque_budgeted(drv_now + span, budget.max_rx_frames);
                             let frames_dispatched = drv.disable_frames_dispatched();
+                            let dispatched_mask = drv.disable_dispatched_mask();
                             let rx = drv.take_last_poll_rx();
                             let post_now = drv.clock_now();
                             let mut ages_buf = std::mem::take(&mut self.scratch.ages);
@@ -4487,11 +4755,11 @@ impl SupervisorInner {
                             );
                             self.scratch.ages = ages_buf;
                             self.scratch.fb.bounds = bounds_buf;
-                            Ok((drv_now, r, frames_dispatched, rx, post_now, snap))
+                            Ok((drv_now, r, frames_dispatched, dispatched_mask, rx, post_now, snap))
                         }
                     }
                 };
-                let (drv_now, r, frames_dispatched, rx, post_now, snap) = match poll_out {
+                let (drv_now, r, frames_dispatched, dispatched_mask, rx, post_now, snap) = match poll_out {
                     Ok(v) => {
                         self.reset_disable_lock_contention();
                         v
@@ -4529,10 +4797,22 @@ impl SupervisorInner {
                             crate::driver::ArmDriverError::TorqueOffWouldDrop
                                 | crate::driver::ArmDriverError::DisableRequestExpired
                         );
-                        if !refused {
+                        let partial_remaining = self.is_partial_disable_remaining(dispatched_mask);
+                        let partial_retry = self.commit_partial_disable_retry_kind(
+                            kind,
+                            post_now,
+                            frames_dispatched,
+                            partial_remaining,
+                        );
+                        if let Some(rk) = partial_retry {
+                            let _ = self.arm_background_disable_retry_immediate_with_kind(rk, post_now);
+                        } else if !refused {
                             let _ = self.arm_background_disable_retry_with_kind(kind, post_now);
                         }
-                        Some(TransitionPoll { progress: Err(self.disable_step_failed(e)), rx })
+                        Some(TransitionPoll {
+                            progress: Err(self.disable_step_failed_inner(e, partial_retry.is_some())),
+                            rx,
+                        })
                     }
                 }
             }

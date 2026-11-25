@@ -1402,9 +1402,13 @@ pub trait ArmDriver: Send {
     fn torque_transition_pending(&self) -> bool { false }
 
     /// True once an active disable handshake has passed its rest-pose gate and transmitted at
-    /// least one disable frame (e.g. `DamiaoTorque::Disable` repeat passes). False while still
-    /// awaiting rest-pose evidence (`AwaitRestGate`) or idle.
+    /// least one disable frame (e.g. `DamiaoTorque::Disable` repeat passes or partial per-motor
+    /// dispatch). False while still awaiting rest-pose evidence (`AwaitRestGate`) or idle.
     fn disable_frames_dispatched(&self) -> bool { false }
+
+    /// Bitmask of 0-based joint indices that have already received a disable frame in the
+    /// active/partial disable sequence (R12 B3). Cleared when all joints complete or on enable.
+    fn disable_dispatched_mask(&self) -> u64 { 0 }
 
     /// Completes remaining bounded disable repeats for an already-dispatched disable
     /// (`disable_frames_dispatched() == true`) without re-invoking `begin_disable_torque`.
@@ -1779,6 +1783,9 @@ pub struct FeetechArmDriver<T: Transport> {
     /// Pending stopped disable awaiting rest-pose K=3 confirmation or poisoned-line drain within
     /// the single 1 s request lifetime (0 torque-off packets transmitted while pending).
     pending_disable: Option<DisableKind>,
+    /// Bitmask of 0-based servo indices that have already received `TORQUE_ENABLE = 0` in an
+    /// active/partial disable sequence (R12 B3). Cleared on full completion or `set_torque(true)`.
+    disable_dispatched_mask: u64,
     /// Per-servo host monotonic instant of the last motion/enable write (`write_joint_targets` or
     /// `set_torque(true)`): rest-pose samples must come from requests sent at/after this instant.
     last_motion_write_at: Vec<Option<Instant>>,
@@ -1852,6 +1859,7 @@ impl<T: Transport> FeetechArmDriver<T> {
             control_release_managed: false,
             last_read_release_id: 0,
             pending_disable: None,
+            disable_dispatched_mask: 0,
             last_motion_write_at: vec![None; dof],
             last_poll_rx: None,
             rest_pose_window: vec![CausalWindow::default(); dof],
@@ -3203,14 +3211,27 @@ impl<T: Transport> FeetechArmDriver<T> {
         self.assert_clock_matches_transport();
         self.invalidate_partial_pos_rx();
         let n = self.servo_ids.len().min(crate::rt_core::mailbox::MAX_DOF);
+        let all_mask = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+        if (self.disable_dispatched_mask & all_mask) == all_mask {
+            self.disable_dispatched_mask = 0;
+        }
+        let skip_dispatched = matches!(kind, DisableKind::DisableRequested { .. });
         let mut ids = [0u8; crate::rt_core::mailbox::MAX_DOF];
         ids[..n].copy_from_slice(&self.servo_ids[..n]);
         let mut wrote_any = false;
         let mut refused_err = None;
         let mut write_err = None;
-        for &id in &ids[..n] {
+        for (idx, &id) in ids[..n].iter().enumerate() {
+            if skip_dispatched && idx < 64 && (self.disable_dispatched_mask & (1u64 << idx)) != 0 {
+                continue;
+            }
             match self.write_torque_off(id, kind) {
-                Ok(()) => wrote_any = true,
+                Ok(()) => {
+                    wrote_any = true;
+                    if idx < 64 {
+                        self.disable_dispatched_mask |= 1u64 << idx;
+                    }
+                }
                 Err(e @ (ArmDriverError::TorqueOffWouldDrop | ArmDriverError::DisableRequestExpired)) => {
                     if refused_err.is_none() {
                         refused_err = Some(e);
@@ -3221,17 +3242,21 @@ impl<T: Transport> FeetechArmDriver<T> {
                 }
             }
         }
-        if !wrote_any {
+        if !wrote_any && self.disable_dispatched_mask == 0 {
             if let Some(e) = refused_err.take().or_else(|| write_err.take()) {
                 return Err(e);
             }
         }
-        let _ = self.read_torque_enable_states(&ids[..n]);
-        if let Some(e) = refused_err.or(write_err) {
-            Err(e)
-        } else {
-            Ok(())
+        if wrote_any {
+            let _ = self.read_torque_enable_states(&ids[..n]);
         }
+        if let Some(e) = refused_err.or(write_err) {
+            return Err(e);
+        }
+        if (self.disable_dispatched_mask & all_mask) == all_mask {
+            self.disable_dispatched_mask = 0;
+        }
+        Ok(())
     }
 
     fn read_joint_states_inner(&mut self, advance_unmanaged_release: bool) -> Result<Vec<JointState>, ArmDriverError> {
@@ -3784,6 +3809,14 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         self.pending_disable.is_some()
     }
 
+    fn disable_frames_dispatched(&self) -> bool {
+        self.disable_dispatched_mask != 0
+    }
+
+    fn disable_dispatched_mask(&self) -> u64 {
+        self.disable_dispatched_mask
+    }
+
     fn motor_status(&self) -> Option<Vec<u8>> {
         Some(self.motor_status.clone())
     }
@@ -3992,6 +4025,7 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         let ids = self.servo_ids.clone();
         if enabled {
             self.pending_disable = None;
+            self.disable_dispatched_mask = 0;
             self.check_hardware_status()?;
             if self.is_aborted() {
                 return Err(ArmDriverError::HardwareFault("Aborted by emergency stop".into()));
@@ -4207,6 +4241,10 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         let mut stale_mask = 0u64;
         let default_calib = feetech::FeetechJointCalib::default();
         for (i, target) in targets.iter().enumerate().take(dof) {
+            if i < 64 && (self.disable_dispatched_mask & (1u64 << i)) != 0 {
+                report.joint_status[i] = JointHoldStatus::SkippedOff;
+                continue;
+            }
             let fresh = self.fresh_measured_position_for(i, STOPPED_DISABLE_FEEDBACK_MAX_AGE);
             if (hold_mask & (1u64 << i)) == 0 {
                 report.joint_status[i] = if fresh.is_none() {
@@ -4347,6 +4385,7 @@ pub struct FashionStarArmDriver<T: Transport> {
     estop_gate: Option<crate::rt_core::urgent::EstopGate>,
     stopped_disable_gate: Option<StoppedDisableGate>,
     tx_release_deadline: Option<Instant>,
+    disable_dispatched_mask: u64,
 }
 
 impl<T: Transport> FashionStarArmDriver<T> {
@@ -4372,6 +4411,7 @@ impl<T: Transport> FashionStarArmDriver<T> {
             estop_gate: None,
             stopped_disable_gate: None,
             tx_release_deadline: None,
+            disable_dispatched_mask: 0,
         }
     }
 
@@ -4639,6 +4679,7 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
                 started_at: self.now(),
             })
         } else {
+            self.disable_dispatched_mask = 0;
             let start_stamp = self.current_stop_stamp();
             for (idx, &id) in self.servo_ids.iter().enumerate() {
                 self.strict_stop_check(Some(start_stamp))?;
@@ -4653,14 +4694,36 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
         }
     }
 
+    fn disable_frames_dispatched(&self) -> bool {
+        self.disable_dispatched_mask != 0
+    }
+
+    fn disable_dispatched_mask(&self) -> u64 {
+        self.disable_dispatched_mask
+    }
+
     fn disable_torque(&mut self, kind: DisableKind) -> Result<(), ArmDriverError> {
+        let n = self.servo_ids.len().min(64);
+        let all_mask = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+        if (self.disable_dispatched_mask & all_mask) == all_mask {
+            self.disable_dispatched_mask = 0;
+        }
+        let skip_dispatched = matches!(kind, DisableKind::DisableRequested { .. });
         let mut wrote_any = false;
         let mut refused_err = None;
         let mut last_err = None;
         for idx in 0..self.servo_ids.len() {
+            if skip_dispatched && idx < 64 && (self.disable_dispatched_mask & (1u64 << idx)) != 0 {
+                continue;
+            }
             let id = self.servo_ids[idx];
             match self.write_torque_off(id, kind) {
-                Ok(()) => wrote_any = true,
+                Ok(()) => {
+                    wrote_any = true;
+                    if idx < 64 {
+                        self.disable_dispatched_mask |= 1u64 << idx;
+                    }
+                }
                 Err(e @ (ArmDriverError::TorqueOffWouldDrop | ArmDriverError::DisableRequestExpired)) => {
                     refused_err = Some(e);
                     break;
@@ -4675,6 +4738,9 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
         }
         if let Some(e) = refused_err.or(last_err) {
             return Err(e);
+        }
+        if (self.disable_dispatched_mask & all_mask) == all_mask {
+            self.disable_dispatched_mask = 0;
         }
         Ok(())
     }
@@ -4727,6 +4793,10 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
         let mut sent_mask = 0u64;
         let mut stale_mask = 0u64;
         for (i, target) in targets.iter().enumerate().take(dof) {
+            if i < 64 && (self.disable_dispatched_mask & (1u64 << i)) != 0 {
+                report.joint_status[i] = JointHoldStatus::SkippedOff;
+                continue;
+            }
             let fresh = self.fresh_measured_position_for(i, STOPPED_DISABLE_FEEDBACK_MAX_AGE);
             if (hold_mask & (1u64 << i)) == 0 {
                 report.joint_status[i] = if fresh.is_none() {
@@ -5144,6 +5214,9 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     mit_tracking_used: bool,
     /// Pending torque transition (`begin_torque` / `poll_torque`); None = idle.
     torque_hs: Option<DamiaoTorque>,
+    /// Bitmask of 0-based motor indices that have already received `CMD_DISABLE` in an active
+    /// or partial disable sequence (R12 B3). Cleared on full disable completion or enable.
+    disable_dispatched_mask: u64,
     /// Service deadline capping the receive pass of the current `poll_torque` (None: 5 ms only).
     rx_deadline: Option<Instant>,
     /// Frame limit capping the receive pass of the current budgeted read/poll (None: 64 frames).
@@ -5965,6 +6038,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             last_mit_recovery_rx_seq: None,
             mit_tracking_used: false,
             torque_hs: None,
+            disable_dispatched_mask: 0,
             rx_deadline: None,
             rx_frame_limit: None,
             last_poll_rx: None,
@@ -8992,6 +9066,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.enable_stop_stamp = Some(self.current_stop_stamp());
         self.is_enabling = true;
         self.last_command_was_disable = false;
+        self.disable_dispatched_mask = 0;
 
         let budget_armed = match max_rx_frames {
             Some(limit) => {
@@ -9972,6 +10047,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.is_enabling = false;
         self.is_enabled = true;
         self.pending_rearm = false;
+        self.disable_dispatched_mask = 0;
         self.enable_stop_stamp = None;
         // confirmed enable with the base modes restored: a new MIT handover arms a new fence
         self.mit_fence = None;
@@ -10128,17 +10204,29 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     ) -> Result<TorqueProgress, ArmDriverError> {
         let after_seq = self.rx_seq;
         let cmd_start = self.now();
+        let n = self.motor_ids.len().min(64);
+        let all_mask = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+        if (self.disable_dispatched_mask & all_mask) == all_mask {
+            self.disable_dispatched_mask = 0;
+        }
+        let skip_dispatched = matches!(kind, DisableKind::DisableRequested { .. });
         let mut sent_any = false;
         let mut wait_evidence = false;
         let mut refused_err = None;
         let mut other_err = None;
         for idx in 0..self.motor_ids.len() {
+            if skip_dispatched && idx < 64 && (self.disable_dispatched_mask & (1u64 << idx)) != 0 {
+                continue;
+            }
             let tx_kind = Self::disable_tx_kind(kind);
             match self.send(tx_kind, None, None, false, |d| {
                 Some(damiao::build_disable_frame(d.motor_ids[idx]))
             }) {
                 Ok(_) => {
                     sent_any = true;
+                    if idx < 64 {
+                        self.disable_dispatched_mask |= 1u64 << idx;
+                    }
                 }
                 Err(TxRefusal::DisableWaitEvidence) => {
                     wait_evidence = true;
@@ -10155,9 +10243,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
         if !sent_any && other_err.is_none() {
             if let Some(e) = refused_err {
-                // Choke point refused every disable frame before touching the transport (0 CAN
-                // frames attempted): preserve prior enable/feedback state, while keeping
-                // `awaiting_rx_boundary` latched if the drain did not complete (`!last_read_drained`).
+                // Choke point refused every disable frame attempted in this pass. If a prior pass
+                // already dispatched at least one motor (`disable_dispatched_mask != 0`), preserve
+                // that committed progress; otherwise preserve prior enable/feedback state cleanly.
                 self.awaiting_rx_boundary = prev_awaiting_rx_boundary || !self.last_read_drained;
                 return Err(e);
             }
@@ -10186,10 +10274,18 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 return Ok(TorqueProgress::Pending { wake });
             }
         }
-        // MIT tracking: once any disable frame is transmitted, discard cached targets so no
-        // later recovery can replay one, whatever the disable's outcome (the fence stays
-        // armed until the disable is confirmed).
-        if self.mit_fence.is_some() || self.mit_fence_trip.is_some() {
+        // R12 B3: Once ANY motor has received a disable frame (`sent_any || disable_dispatched_mask != 0`),
+        // commit driver-side torque-off state immediately so cached targets cannot replay and already-disabled
+        // motors never receive holds, even if a later motor in the batch expired or failed.
+        let any_dispatched = sent_any || self.disable_dispatched_mask != 0;
+        if any_dispatched {
+            self.is_enabled = false;
+            self.pending_rearm = true;
+            self.pos_force_verified = false;
+            self.slot_in_unchanged_hold = [false; MAX_MODE_JOINTS * 2];
+            self.pf_next_intent_is_hold = false;
+            self.clear_cached_targets();
+        } else if self.mit_fence.is_some() || self.mit_fence_trip.is_some() {
             self.clear_cached_targets();
         }
         if refused_err.is_none() && !wait_evidence {
@@ -10206,18 +10302,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if wait_evidence {
             return Err(ArmDriverError::TorqueOffWouldDrop);
         }
-        self.is_enabled = false;
-        self.pending_rearm = true;
-        self.pos_force_verified = false;
-        self.slot_in_unchanged_hold = [false; MAX_MODE_JOINTS * 2];
-        self.pf_next_intent_is_hold = false;
-        self.clear_cached_targets();
         let mit_fenced = self.mit_fence.is_some() || self.mit_fence_trip.is_some();
         self.last_query_instant = Some(self.now());
         if self.motor_ids.is_empty() || DAMIAO_DISABLE_REPEATS <= 1 {
             if mit_fenced {
                 self.mit_fence = None;
             }
+            self.disable_dispatched_mask = 0;
             return Ok(TorqueProgress::Done(TorqueOutcome::Confirmed));
         }
         let now = self.now();
@@ -10362,6 +10453,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             if mit_fenced {
                 self.mit_fence = None;
             }
+            self.disable_dispatched_mask = 0;
             return Ok(TorqueProgress::Done(TorqueOutcome::Confirmed));
         }
         let now = self.now();
@@ -10422,6 +10514,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             if mit_fenced {
                 self.mit_fence = None;
             }
+            self.disable_dispatched_mask = 0;
             return Ok(TorqueProgress::Done(TorqueOutcome::Confirmed));
         }
         next_repeat_at = self.now() + DAMIAO_DISABLE_REPEAT_INTERVAL;
@@ -11445,7 +11538,11 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     }
 
     fn disable_frames_dispatched(&self) -> bool {
-        matches!(self.torque_hs, Some(DamiaoTorque::Disable { .. }))
+        self.disable_dispatched_mask != 0 || matches!(self.torque_hs, Some(DamiaoTorque::Disable { .. }))
+    }
+
+    fn disable_dispatched_mask(&self) -> u64 {
+        self.disable_dispatched_mask
     }
 
     fn finish_dispatched_disable(&mut self) -> Result<(), ArmDriverError> {
@@ -12185,6 +12282,11 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         let mut active_mask = 0u64;
         let mut stale_mask = 0u64;
         for i in 0..n {
+            if i < 64 && (self.disable_dispatched_mask & (1u64 << i)) != 0 {
+                let _ = self.pending_hold_tx.drop_joint(i);
+                report.joint_status[i] = JointHoldStatus::SkippedOff;
+                continue;
+            }
             let fresh_ok = self.fresh_measured_position(i, STOPPED_DISABLE_FEEDBACK_MAX_AGE).is_some();
             let mode = self.verified_hold_mode(i);
             let mode_ok = mode.is_some();
@@ -14598,6 +14700,7 @@ pub struct RobStrideArmDriver<C: CanTransport> {
     estop_gate: Option<crate::rt_core::urgent::EstopGate>,
     stopped_disable_gate: Option<StoppedDisableGate>,
     tx_release_deadline: Option<Instant>,
+    disable_dispatched_mask: u64,
 }
 
 impl<C: CanTransport> RobStrideArmDriver<C> {
@@ -14630,6 +14733,7 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
             estop_gate: None,
             stopped_disable_gate: None,
             tx_release_deadline: None,
+            disable_dispatched_mask: 0,
         }
     }
 
@@ -14921,13 +15025,27 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
                 !drained
             }
         };
+        let n = self.motor_ids.len().min(64);
+        let all_mask = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+        if (self.disable_dispatched_mask & all_mask) == all_mask {
+            self.disable_dispatched_mask = 0;
+        }
+        let skip_dispatched = matches!(kind, DisableKind::DisableRequested { .. });
         let mut wrote_any = false;
         let mut refused_err = None;
         let mut last_err = None;
         for idx in 0..self.motor_ids.len() {
+            if skip_dispatched && idx < 64 && (self.disable_dispatched_mask & (1u64 << idx)) != 0 {
+                continue;
+            }
             let id = self.motor_ids[idx];
             match self.send_stop_frame(idx, id, kind) {
-                Ok(()) => wrote_any = true,
+                Ok(()) => {
+                    wrote_any = true;
+                    if idx < 64 {
+                        self.disable_dispatched_mask |= 1u64 << idx;
+                    }
+                }
                 Err(e @ (ArmDriverError::TorqueOffWouldDrop | ArmDriverError::DisableRequestExpired)) => {
                     refused_err = Some(e);
                     break;
@@ -14935,7 +15053,7 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
                 Err(e) => last_err = Some(e),
             }
         }
-        if !wrote_any && last_err.is_none() {
+        if !wrote_any && last_err.is_none() && self.disable_dispatched_mask == 0 {
             if let Some(e) = refused_err {
                 self.awaiting_rx_boundary = prev_awaiting || !self.last_read_drained;
                 return Err(e);
@@ -14948,6 +15066,9 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
         }
         if let Some(e) = refused_err.or(last_err) {
             return Err(e);
+        }
+        if (self.disable_dispatched_mask & all_mask) == all_mask {
+            self.disable_dispatched_mask = 0;
         }
         Ok(())
     }
@@ -15213,6 +15334,7 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
                 started_at: self.now(),
             })
         } else {
+            self.disable_dispatched_mask = 0;
             let start_stamp = self.current_stop_stamp();
             for idx in 0..self.motor_ids.len() {
                 let id = self.motor_ids[idx];
@@ -15225,6 +15347,14 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
             self.can.flush()?;
             Ok(())
         }
+    }
+
+    fn disable_frames_dispatched(&self) -> bool {
+        self.disable_dispatched_mask != 0
+    }
+
+    fn disable_dispatched_mask(&self) -> u64 {
+        self.disable_dispatched_mask
     }
 
     fn disable_torque(&mut self, kind: DisableKind) -> Result<(), ArmDriverError> {
@@ -15280,6 +15410,10 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
         let mut sent_mask = 0u64;
         let mut stale_mask = 0u64;
         for (i, target) in targets.iter().enumerate().take(dof) {
+            if i < 64 && (self.disable_dispatched_mask & (1u64 << i)) != 0 {
+                report.joint_status[i] = JointHoldStatus::SkippedOff;
+                continue;
+            }
             let fresh = self.fresh_measured_position_for(i, STOPPED_DISABLE_FEEDBACK_MAX_AGE);
             if (hold_mask & (1u64 << i)) == 0 {
                 report.joint_status[i] = if fresh.is_none() {

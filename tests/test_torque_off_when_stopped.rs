@@ -9491,3 +9491,207 @@ fn r12_b2_mit_lost_falls_back_to_verified_posvel_hold_or_faults_under_l2_bound()
         );
     }
 }
+
+/// R12 B3: Partial disable dispatch (expiry right after J1):
+/// 1. Once J1 receives `CMD_DISABLE` for an accepted request and the 1 s lifetime expires before
+///    J2, the disable is committed immediately: `torque_intent == TorqueIntent::Off`, per-motor
+///    dispatch progress (`disable_dispatched_mask == 0b0000001`) is recorded, and NO hold frame
+///    is ever sent to J1 (neither through supervisor ticks nor direct `write_measured_hold_masked`).
+/// 2. Subsequent releases retry the remaining undispatched motors (J2..J7) to completion on BOTH
+///    RT executor (`service_background_disable`) and legacy (`service_legacy_pending_disable`)
+///    owners without ever reverting `torque_intent` to `On`.
+#[test]
+fn r12_b3_partial_disable_commits_intent_off_retries_remaining_and_skips_holds_on_disabled_motors() {
+    use armd::driver::{JointHoldStatus, JointTarget};
+    use armd::transport::CanFrame;
+    use armd::TorqueIntent;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+    // Part 1: RT executor owner — mid-batch expiry right after J1.
+    {
+        let mut r = ExecRig::new();
+        r.arm_now();
+        r.fx.core.apply_stop_policy(StopPolicy::EStopLatch);
+        for _ in 0..4 {
+            r.bus.with(|s| {
+                s.rx.clear();
+                s.push_all_feedback();
+            });
+            r.step();
+        }
+        let tripped = Arc::new(AtomicBool::new(false));
+        let tripped_cb = tripped.clone();
+        let clock_cb = r.clock.clone();
+        r.bus.with(|s| {
+            // Advance clock past the 1 s request lifetime immediately when J1 transmits CMD_DISABLE.
+            // `on_disable` fires right before J1's reply is processed; use `on_disable_state` to
+            // advance AFTER J1's transmit succeeded (wait: `on_disable` fires during J1's `transmit`
+            // AFTER `send()` already passed J1's pre-TX 1 s check, so J1 succeeds and J2 hits expiry!).
+            s.on_disable = Some(Arc::new(move || {
+                if !tripped_cb.swap(true, AtomicOrdering::SeqCst) {
+                    clock_cb.advance(Duration::from_millis(1_050));
+                }
+            }));
+        });
+        r.bus.clear_log();
+        r.submit_transition(TransitionOp::TorqueOff);
+        let step1 = r.step();
+        assert!(
+            matches!(step1.transition_ended, Some((_, Outcome::Failed(_)))),
+            "R12 B3 (RT): mid-batch expiry after J1 must report transition failure on initial pass: {step1:?}"
+        );
+        assert!(tripped.load(AtomicOrdering::SeqCst), "expiry hook must have fired after J1");
+        assert_eq!(
+            r.fx.core.torque_intent,
+            TorqueIntent::Off,
+            "R12 B3 (RT): partial dispatch after J1 must commit torque_intent=Off"
+        );
+        assert!(
+            r.fx.core.disable_pending,
+            "R12 B3 (RT): disable_pending must stay true to retry remaining motors"
+        );
+        {
+            let drv = r.fx.core.driver.as_ref().unwrap().lock().unwrap();
+            assert!(drv.disable_frames_dispatched());
+            assert_eq!(
+                drv.disable_dispatched_mask(),
+                0b0000_0001,
+                "R12 B3 (RT): only J1 (bit 0) should be recorded dispatched after expiry"
+            );
+        }
+        let tx_initial = r.bus.tx_log();
+        assert!(tx_initial.iter().any(|f| f.id == 1 && f.data == damiao::CMD_DISABLE));
+        assert!(
+            (2u32..=7).all(|id| !tx_initial.iter().any(|f| f.id == id && f.data == damiao::CMD_DISABLE)),
+            "R12 B3 (RT): J2..J7 must NOT have been dispatched after 1s expiry: {tx_initial:?}"
+        );
+        // Direct driver hold call must skip already-disabled J1.
+        {
+            r.bus.clear_log();
+            let mut drv = r.fx.core.driver.as_ref().unwrap().lock().unwrap();
+            let targets = vec![
+                JointTarget {
+                    position: 0.0,
+                    velocity: Some(0.0),
+                    kp: None,
+                    kd: None,
+                    torque: Some(0.0),
+                };
+                7
+            ];
+            let report = drv.write_measured_hold_masked(0b111_1111, &targets).unwrap();
+            assert_eq!(report.joint_status[0], JointHoldStatus::SkippedOff);
+            assert!(r.bus.tx_log().iter().all(|f| f.id != 0x101 && f.id != 0x001));
+        }
+        // Subsequent RT releases retry J2..J7 to completion with zero holds on J1.
+        let mut all_retry_tx: Vec<CanFrame> = Vec::new();
+        for _ in 0..16 {
+            r.bus.with(|s| {
+                s.rx.clear();
+                s.push_all_feedback();
+            });
+            r.bus.clear_log();
+            r.step();
+            let step_tx = r.bus.tx_log();
+            assert!(
+                step_tx.iter().all(|f| f.id != 0x101),
+                "R12 B3 (RT): zero hold frames allowed on already-disabled J1 during retry: {step_tx:?}"
+            );
+            all_retry_tx.extend(step_tx);
+            assert_eq!(r.fx.core.torque_intent, TorqueIntent::Off);
+            if !r.fx.core.disable_pending && !r.fx.core.is_torqued {
+                break;
+            }
+        }
+        assert!(
+            !r.fx.core.disable_pending && !r.fx.core.is_torqued,
+            "R12 B3 (RT): remaining motors J2..J7 must complete disable through retry path"
+        );
+        for id in 2u32..=7 {
+            assert!(
+                all_retry_tx.iter().any(|f| f.id == id && f.data == damiao::CMD_DISABLE),
+                "R12 B3 (RT): remaining motor J{id} must receive CMD_DISABLE on retry: {all_retry_tx:?}"
+            );
+        }
+        let drv = r.fx.core.driver.as_ref().unwrap().lock().unwrap();
+        assert_eq!(drv.disable_dispatched_mask(), 0);
+    }
+
+    // Part 2: Legacy owner — mid-batch expiry right after J1.
+    {
+        let (mut inner, bus, clock) = make_driver_rig();
+        bus.with(|s| {
+            s.follow_commands = false;
+            s.immediate_replies = true;
+            for m in s.motors.iter_mut() {
+                m.q = 0.0;
+            }
+        });
+        enable_torque_admitted(&mut inner).unwrap();
+        inner.apply_stop_policy(StopPolicy::EStopLatch);
+        for _ in 0..4 {
+            clock.advance(Duration::from_millis(20));
+            bus.with(|s| {
+                s.rx.clear();
+                s.push_all_feedback();
+            });
+            inner.tick(0.02);
+        }
+        let tripped = Arc::new(AtomicBool::new(false));
+        let tripped_cb = tripped.clone();
+        let clock_cb = clock.clone();
+        bus.with(|s| {
+            s.on_disable = Some(Arc::new(move || {
+                if !tripped_cb.swap(true, AtomicOrdering::SeqCst) {
+                    clock_cb.advance(Duration::from_millis(1_050));
+                }
+            }));
+        });
+        bus.clear_log();
+        let res = inner.disable_torque();
+        assert!(
+            res.is_err(),
+            "R12 B3 (legacy): mid-batch expiry after J1 must report error on initial pass"
+        );
+        assert!(tripped.load(AtomicOrdering::SeqCst));
+        assert_eq!(inner.torque_intent, TorqueIntent::Off);
+        assert!(inner.disable_pending);
+        {
+            let drv = inner.driver.as_ref().unwrap().lock().unwrap();
+            assert!(drv.disable_frames_dispatched());
+            assert_eq!(drv.disable_dispatched_mask(), 0b0000_0001);
+        }
+        let mut all_retry_tx: Vec<CanFrame> = Vec::new();
+        for _ in 0..16 {
+            clock.advance(Duration::from_millis(20));
+            bus.with(|s| {
+                s.rx.clear();
+                s.push_all_feedback();
+            });
+            bus.clear_log();
+            inner.tick(0.02);
+            let step_tx = bus.tx_log();
+            assert!(
+                step_tx.iter().all(|f| f.id != 0x101),
+                "R12 B3 (legacy): zero hold frames allowed on already-disabled J1 during retry: {step_tx:?}"
+            );
+            all_retry_tx.extend(step_tx);
+            assert_eq!(inner.torque_intent, TorqueIntent::Off);
+            if !inner.disable_pending && !inner.is_torqued {
+                break;
+            }
+        }
+        assert!(
+            !inner.disable_pending && !inner.is_torqued,
+            "R12 B3 (legacy): remaining motors J2..J7 must complete disable through retry path"
+        );
+        for id in 2u32..=7 {
+            assert!(
+                all_retry_tx.iter().any(|f| f.id == id && f.data == damiao::CMD_DISABLE),
+                "R12 B3 (legacy): remaining motor J{id} must receive CMD_DISABLE on retry: {all_retry_tx:?}"
+            );
+        }
+        let drv = inner.driver.as_ref().unwrap().lock().unwrap();
+        assert_eq!(drv.disable_dispatched_mask(), 0);
+    }
+}
