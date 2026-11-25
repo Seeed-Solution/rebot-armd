@@ -8783,6 +8783,8 @@ fn r11_m1_reported_enable_state_is_telemetry_when_holding_and_keeps_holds_on_mot
         .unwrap();
     assert!(inner.active_trajectory.is_some());
 
+    // Sample 1 during active motion: stops motion immediately, keeps holds (`torque_intent == On`),
+    // and does NOT latch `UnexpectedTorqueLoss` on a single report (R12 M2).
     bus.with(|s| {
         for m in &mut s.motors {
             m.enabled = false;
@@ -8793,21 +8795,54 @@ fn r11_m1_reported_enable_state_is_telemetry_when_holding_and_keeps_holds_on_mot
     bus.clear_log();
     inner.tick(0.02);
 
+    assert!(inner.active_trajectory.is_none(), "M2: active motion must stop on sample 1");
+    assert_eq!(
+        *inner.safety.state(),
+        SafetyState::Armed,
+        "M2: single reported torque-loss sample must NOT latch UnexpectedTorqueLoss"
+    );
+    assert_eq!(inner.torque_intent, TorqueIntent::On, "M2: torque_intent stays On so holds continue");
+    assert_eq!(
+        bus.tx_log().iter().filter(|f| (0x101..=0x107).contains(&f.id)).count(),
+        7,
+        "M2: arm must keep sending stationary holds after stopping active motion"
+    );
+
+    // Sample 2: still < K=3 -> no fault yet, holds continue.
+    clock.advance(Duration::from_millis(20));
+    bus.with(|s| s.push_all_feedback());
+    bus.clear_log();
+    inner.tick(0.02);
+    assert_eq!(
+        *inner.safety.state(),
+        SafetyState::Armed,
+        "M2: 2nd causal sample (< K=3) must NOT latch UnexpectedTorqueLoss"
+    );
+    assert_eq!(
+        bus.tx_log().iter().filter(|f| (0x101..=0x107).contains(&f.id)).count(),
+        7,
+    );
+
+    // Sample 3 (K=3): latches `UnexpectedTorqueLoss` while keeping holds active (`torque_intent == On`).
+    clock.advance(Duration::from_millis(20));
+    bus.with(|s| s.push_all_feedback());
+    bus.clear_log();
+    inner.tick(0.02);
+
     assert!(
         inner.safety.state().is_stopped(),
-        "M1: reported torque loss during active motion must latch UnexpectedTorqueLoss fault"
+        "M2: 3rd consecutive causal sample must latch UnexpectedTorqueLoss fault"
     );
     assert_eq!(
         inner.safety.fault().map(|f| f.message.to_string()),
         Some("Unexpected motor torque loss detected while operational".to_string()),
-        "M1: fault message must be UnexpectedTorqueLoss"
+        "M2: fault message must be UnexpectedTorqueLoss"
     );
-    assert!(inner.active_trajectory.is_none(), "active motion must stop on UnexpectedTorqueLoss");
-    assert_eq!(inner.torque_intent, TorqueIntent::On, "M1: torque_intent stays On so holds continue");
+    assert_eq!(inner.torque_intent, TorqueIntent::On, "M2: torque_intent stays On so holds continue");
     assert_eq!(
         bus.tx_log().iter().filter(|f| (0x101..=0x107).contains(&f.id)).count(),
         7,
-        "M1: arm must keep sending stationary holds on the UnexpectedTorqueLoss tick"
+        "M2: arm must keep sending stationary holds on the UnexpectedTorqueLoss tick"
     );
 
     // Subsequent tick while faulted also keeps sending holds on all 7 joints!
@@ -8818,7 +8853,7 @@ fn r11_m1_reported_enable_state_is_telemetry_when_holding_and_keeps_holds_on_mot
     assert_eq!(
         bus.tx_log().iter().filter(|f| (0x101..=0x107).contains(&f.id)).count(),
         7,
-        "M1: arm must continue sending holds after UnexpectedTorqueLoss"
+        "M2: arm must continue sending holds after UnexpectedTorqueLoss"
     );
 }
 
@@ -10091,5 +10126,134 @@ fn r12_m1_feetech_disable_decodes_queued_rx_before_clear_and_defers_if_window_ag
             6,
             "M1 Part 2: all 6 servos must receive TORQUE_ENABLE=0 once K=3 confirms"
         );
+    }
+}
+
+/// R12 M2: During active motion, a reported unexpected torque loss stops active motion immediately
+/// while keeping holds (`torque_intent == On`), never latches `UnexpectedTorqueLoss` on a single
+/// report or cached repeats, resets if hardware reports `Enabled` before K=3, and latches
+/// `UnexpectedTorqueLoss` only after persisting across K=3 distinct causal samples.
+#[test]
+fn r12_m2_active_motion_reported_torque_loss_requires_k3_causal_samples() {
+    use armd::TorqueIntent;
+
+    let (mut inner, bus, clock) = make_driver_rig();
+    bus.with(|s| {
+        s.follow_commands = false;
+        s.immediate_replies = true;
+        for m in &mut s.motors {
+            m.q = 0.0;
+            m.v = 0.0;
+        }
+        s.push_all_feedback();
+    });
+    inner.tick(0.02);
+    enable_torque_admitted(&mut inner).unwrap();
+    assert_eq!(*inner.safety.state(), SafetyState::Armed);
+
+    // Part 1: Start active motion; 1 causal status=0 sample stops motion & keeps holds, NO fault.
+    let stamp = inner.current_admission_stamp();
+    let admitted = inner.check_admission(stamp).unwrap();
+    SupervisorInner::jog(admitted, vec![0.3, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), None)
+        .unwrap();
+    assert!(inner.active_trajectory.is_some());
+
+    bus.with(|s| {
+        s.motors[0].enabled = false;
+        s.push_all_feedback();
+    });
+    clock.advance(Duration::from_millis(20));
+    bus.clear_log();
+    inner.tick(0.02);
+    assert!(inner.active_trajectory.is_none(), "M2: sample 1 must stop active motion");
+    assert_eq!(*inner.safety.state(), SafetyState::Armed, "M2: sample 1 must NOT latch fault");
+    assert_eq!(inner.torque_intent, TorqueIntent::On);
+    assert_eq!(
+        bus.tx_log().iter().filter(|f| (0x101..=0x107).contains(&f.id)).count(),
+        7,
+        "M2: arm must keep holding on sample 1"
+    );
+
+    // Part 2: Subsequent ticks WITHOUT any new status=0 feedback frame from motor 0 (motor 0 is
+    // silenced so only cached status=0 remains while motors 1..6 keep sending status=1) must NOT
+    // advance the causal counter or latch a fault.
+    bus.with(|s| {
+        s.motors[0].silent = true;
+        s.rx.clear();
+        s.pending.clear();
+    });
+    for _ in 0..3 {
+        clock.advance(Duration::from_millis(20));
+        bus.clear_log();
+        inner.tick(0.02);
+        assert_eq!(
+            *inner.safety.state(),
+            SafetyState::Armed,
+            "M2: cached status=0 without new causal hardware samples must NOT latch fault"
+        );
+        assert_eq!(inner.torque_intent, TorqueIntent::On);
+    }
+
+    // Part 3: Sample 2 arrives, then hardware reports Enabled again -> resets counter, NO fault.
+    bus.with(|s| {
+        s.motors[0].silent = false;
+        s.push_all_feedback();
+    });
+    clock.advance(Duration::from_millis(20));
+    inner.tick(0.02);
+    assert_eq!(*inner.safety.state(), SafetyState::Armed, "M2: sample 2 (< K=3) must NOT latch");
+
+    bus.with(|s| {
+        s.motors[0].enabled = true;
+        s.push_all_feedback();
+    });
+    clock.advance(Duration::from_millis(20));
+    inner.tick(0.02);
+    assert_eq!(
+        *inner.safety.state(),
+        SafetyState::Armed,
+        "M2: transient recovery before K=3 must reset persistence counter without faulting"
+    );
+
+    // Part 4: Start active motion again; 3 consecutive causal status=0 samples across 3 releases
+    // -> samples 1 and 2 stay Armed (motion stopped on 1), sample 3 latches UnexpectedTorqueLoss
+    // while keeping `torque_intent == On` and continuing stationary holds.
+    let stamp = inner.current_admission_stamp();
+    let admitted = inner.check_admission(stamp).unwrap();
+    SupervisorInner::jog(admitted, vec![0.3, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), None)
+        .unwrap();
+    assert!(inner.active_trajectory.is_some());
+
+    bus.with(|s| {
+        s.motors[0].enabled = false;
+    });
+    for sample in 1..=3 {
+        clock.advance(Duration::from_millis(20));
+        bus.with(|s| s.push_all_feedback());
+        bus.clear_log();
+        inner.tick(0.02);
+        assert_eq!(inner.torque_intent, TorqueIntent::On);
+        assert_eq!(
+            bus.tx_log().iter().filter(|f| (0x101..=0x107).contains(&f.id)).count(),
+            7,
+            "M2: holds must continue on sample {sample}"
+        );
+        if sample < 3 {
+            assert_eq!(
+                *inner.safety.state(),
+                SafetyState::Armed,
+                "M2: sample {sample} (< K=3) must NOT latch UnexpectedTorqueLoss"
+            );
+            assert!(inner.active_trajectory.is_none());
+        } else {
+            assert!(
+                inner.safety.state().is_stopped(),
+                "M2: sample 3 (K=3) must latch UnexpectedTorqueLoss"
+            );
+            assert_eq!(
+                inner.safety.fault().map(|f| f.message.to_string()),
+                Some("Unexpected motor torque loss detected while operational".to_string()),
+            );
+        }
     }
 }

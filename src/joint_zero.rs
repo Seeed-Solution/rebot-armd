@@ -124,6 +124,9 @@ impl ZeroOffsetDriver {
 impl ArmDriver for ZeroOffsetDriver {
     fn capabilities(&self) -> DriverCapabilities { self.inner.capabilities() }
     fn enable_state(&self) -> EnableState { self.inner.enable_state() }
+    fn reported_torque_loss_sample_seq(&self) -> Option<u64> {
+        self.inner.reported_torque_loss_sample_seq()
+    }
     fn has_driver_fresh_position_api(&self) -> bool {
         self.inner.has_driver_fresh_position_api()
     }

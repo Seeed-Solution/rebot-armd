@@ -1620,12 +1620,12 @@ async fn test_feetech_periodic_enable_poll_detects_torque_loss_and_triggers_faul
         assert!(obs.fault.is_none());
     }
 
-    // On 8th tick (poll 10), driver does a SYNC_READ of REG_TORQUE_ENABLE.
-    // Provide normal feedback followed by torque enable response reporting 0 (torque lost!)
+    // On 8th tick (poll 10), driver does a SYNC_READ of REG_TORQUE_ENABLE BEFORE position SYNC_READ.
+    // Provide torque-enable response (0 = torque lost) first, followed by normal position feedback.
     let cs_tq0 = calculate_checksum(1, 3, 0x00, &[0]);
     let rx_tq0 = vec![0xFF, 0xFF, 1, 3, 0x00, 0, cs_tq0];
-    mock.lock().unwrap().provide_rx(&rx_normal);
     mock.lock().unwrap().provide_rx(&rx_tq0);
+    mock.lock().unwrap().provide_rx(&rx_normal);
 
     // M1: While stationary/holding (no active motion), reported torque loss is telemetry +
     // warning only — it does NOT latch UnexpectedTorqueLoss and holds remain active.
@@ -1634,16 +1634,59 @@ async fn test_feetech_periodic_enable_poll_detects_torque_loss_and_triggers_faul
     assert!(obs.fault.is_none(), "M1: stationary hold must not fault on reported enable_state alone");
     assert_eq!(supervisor.inner().read().await.torque_intent, armd::TorqueIntent::On);
 
-    // During active motion, the same reported torque loss latches UnexpectedTorqueLoss
-    // (FaultCode::HardwareFault) while keeping torque_intent == On so holds continue.
+    // R12 M2: During active motion, sample 1 of reported torque loss stops active motion
+    // immediately while keeping `torque_intent == On` (holds continue), and does NOT latch
+    // `UnexpectedTorqueLoss` until it persists across K=3 distinct causal REG_TORQUE_ENABLE samples.
     {
         let mut inner = supervisor.inner().write().await;
         inner.servo_stream_active = true;
     }
     mock.lock().unwrap().provide_rx(&rx_normal);
-    let obs_moving = supervisor.tick(0.02).await;
-    assert!(obs_moving.fault.is_some(), "M1: active motion must latch UnexpectedTorqueLoss");
-    assert_eq!(obs_moving.fault.unwrap().code, FaultCode::HardwareFault);
+    let obs_sample1 = supervisor.tick(0.02).await;
+    assert!(
+        !supervisor.inner().read().await.servo_stream_active,
+        "M2: sample 1 during active motion must stop motion"
+    );
+    assert!(
+        obs_sample1.fault.is_none(),
+        "M2: sample 1 alone must NOT latch UnexpectedTorqueLoss"
+    );
+    assert_eq!(supervisor.inner().read().await.torque_intent, armd::TorqueIntent::On);
+
+    // Polls 12..19 carry only position replies (no new causal REG_TORQUE_ENABLE read) -> count stays 1.
+    for _ in 0..8 {
+        mock.lock().unwrap().provide_rx(&rx_normal);
+        let obs_mid = supervisor.tick(0.02).await;
+        assert!(obs_mid.fault.is_none(), "M2: cached enable state without new causal sample must not fault");
+    }
+
+    // Poll 20: 2nd causal REG_TORQUE_ENABLE == 0 sample -> still < K=3, no fault yet.
+    mock.lock().unwrap().provide_rx(&rx_tq0);
+    mock.lock().unwrap().provide_rx(&rx_normal);
+    let obs_sample2 = supervisor.tick(0.02).await;
+    assert!(
+        obs_sample2.fault.is_none(),
+        "M2: 2nd causal sample (< K=3) must NOT latch UnexpectedTorqueLoss yet"
+    );
+    assert_eq!(supervisor.inner().read().await.torque_intent, armd::TorqueIntent::On);
+
+    // Polls 21..29 carry only position replies.
+    for _ in 0..9 {
+        mock.lock().unwrap().provide_rx(&rx_normal);
+        let obs_mid = supervisor.tick(0.02).await;
+        assert!(obs_mid.fault.is_none());
+    }
+
+    // Poll 30: 3rd causal REG_TORQUE_ENABLE == 0 sample (K=3) -> latches UnexpectedTorqueLoss
+    // while keeping `torque_intent == On` so holds continue.
+    mock.lock().unwrap().provide_rx(&rx_tq0);
+    mock.lock().unwrap().provide_rx(&rx_normal);
+    let obs_sample3 = supervisor.tick(0.02).await;
+    assert!(
+        obs_sample3.fault.is_some(),
+        "M2: 3rd causal sample (K=3) must latch UnexpectedTorqueLoss"
+    );
+    assert_eq!(obs_sample3.fault.unwrap().code, FaultCode::HardwareFault);
     assert_eq!(supervisor.inner().read().await.torque_intent, armd::TorqueIntent::On);
 }
 

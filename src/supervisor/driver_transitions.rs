@@ -1856,6 +1856,13 @@ impl SupervisorInner {
         self.measured_hold.clear();
     }
 
+    pub(crate) fn reset_reported_torque_loss(&mut self) {
+        self.reported_torque_loss_count = 0;
+        self.reported_torque_loss_last_release = 0;
+        self.reported_torque_loss_last_sample_seq = None;
+        self.reported_torque_loss_from_motion = false;
+    }
+
     /// State once an explicit disable (passing the rest-pose gate) or protective disable has been
     /// accepted and transmitted: records `torque_intent = Off` by decision and stops holding.
     pub(crate) fn disable_accepted(&mut self) {
@@ -1869,6 +1876,7 @@ impl SupervisorInner {
         self.gripper_hold_vel_ceiling = None;
         self.enable_lifecycle = EnableLifecycle::Disarmed;
         self.measured_hold.clear();
+        self.reset_reported_torque_loss();
     }
 
     /// Persistent enable lifecycle owned by the transition reducer.

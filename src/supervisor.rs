@@ -872,6 +872,14 @@ pub struct SupervisorInner {
     pub(crate) last_stopped_torque_off_refusal: Option<StoppedTorqueOffRefusal>,
     /// Rate-limit timestamp for non-motion telemetry warnings when hardware reports `enable_state != Enabled`.
     pub(crate) last_reported_torque_loss_warn: Option<Instant>,
+    /// Consecutive causal samples of reported unexpected torque loss initiated during active motion (R12 M2).
+    pub(crate) reported_torque_loss_count: u8,
+    /// Control release sequence of the last counted active-motion reported torque-loss sample (R12 M2).
+    pub(crate) reported_torque_loss_last_release: u64,
+    /// Driver causal sample sequence of the last counted active-motion reported torque-loss sample (R12 M2).
+    pub(crate) reported_torque_loss_last_sample_seq: Option<u64>,
+    /// True after an active-motion reported torque loss stopped motion and is tracking persistence to K=3 (R12 M2).
+    pub(crate) reported_torque_loss_from_motion: bool,
     /// Consecutive RT disable dispatch/poll ticks skipped due to `driver.try_lock()` contention (M4).
     pub(crate) disable_lock_contended_skips: u32,
     /// Latched once the consecutive RT disable lock contention threshold (`N = 25`) escalates.
@@ -1539,6 +1547,8 @@ pub(crate) struct PendingRxPoll {
     pub active: bool,
     pub invalid_feedback: bool,
     pub driver_torque_lost: bool,
+    pub driver_enable_confirmed_ok: bool,
+    pub driver_torque_loss_sample_seq: Option<u64>,
     pub bus_feedback_fresh: bool,
     pub recovery_ages: bool,
     pub hw_rx: bool,
@@ -2024,6 +2034,10 @@ impl SupervisorInner {
             active_disable_kind: None,
             last_stopped_torque_off_refusal: None,
             last_reported_torque_loss_warn: None,
+            reported_torque_loss_count: 0,
+            reported_torque_loss_last_release: 0,
+            reported_torque_loss_last_sample_seq: None,
+            reported_torque_loss_from_motion: false,
             disable_lock_contended_skips: 0,
             disable_lock_contended_escalated: false,
             output_suspended: false,
@@ -6781,10 +6795,14 @@ impl SupervisorInner {
                         && self.safety.state().is_operational()
                         && driver.capabilities().enable_feedback
                         && driver.is_feedback_valid()
-                        && driver.enable_state() != EnableState::Enabled
-                        && !(self.pending_rearm && driver.has_known_partial_enable())
                     {
-                        out.driver_torque_lost = true;
+                        if driver.enable_state() == EnableState::Enabled {
+                            out.driver_enable_confirmed_ok = true;
+                        } else if !(self.pending_rearm && driver.has_known_partial_enable()) {
+                            out.driver_torque_lost = true;
+                            out.driver_torque_loss_sample_seq =
+                                driver.reported_torque_loss_sample_seq();
+                        }
                     }
                     // R1/B2: Sync MIT ownership loss before capturing hold-mode verification so
                     // MIT-configured joints in verified `PosVel` fall back to position-mode holds
@@ -6981,6 +6999,8 @@ impl SupervisorInner {
         };
         let invalid_feedback = rx.invalid_feedback;
         let driver_torque_lost = rx.driver_torque_lost;
+        let driver_enable_confirmed_ok = rx.driver_enable_confirmed_ok;
+        let driver_torque_loss_sample_seq = rx.driver_torque_loss_sample_seq;
         let bus_feedback_fresh = rx.bus_feedback_fresh;
         let recovery_ages = rx.recovery_ages;
         let hw_rx = rx.hw_rx;
@@ -7065,9 +7085,13 @@ impl SupervisorInner {
                 || self.mit.owner == crate::mit::MitOwner::Active
                 || policy_running;
             if in_active_motion {
-                // M1: During active motion, `UnexpectedTorqueLoss` stays a fault, while
-                // `torque_intent` stays `On` so the arm keeps sending stationary holds.
+                // R12 M2: During active motion, a report of unexpected torque loss may stop
+                // motion immediately (safety) while keeping `torque_intent == On` so stationary
+                // holds continue. Do not latch a fault on the report alone: require persistence
+                // across K=3 causal samples below.
                 self.stop_motion();
+                self.servo_stream_active = false;
+                self.quintic_settle = None;
                 self.tracking.invalidate();
                 if self.measured_positions.iter().all(|p| p.is_finite()) {
                     copy_into(&mut self.commanded_positions, &self.measured_positions);
@@ -7075,13 +7099,35 @@ impl SupervisorInner {
                 }
                 self.commanded_velocities.fill(0.0);
                 self.commanded_accelerations.fill(0.0);
-                self.safety.latch(
-                    crate::safety::FaultKind::Other,
-                    crate::safety::FaultDetail::Static(crate::safety::StaticFault::UnexpectedTorqueLoss),
-                );
+                self.reported_torque_loss_from_motion = true;
+            }
+            if self.reported_torque_loss_from_motion {
+                let release_seq = self.control_release_seq;
+                let distinct_release =
+                    release_seq != 0 && release_seq != self.reported_torque_loss_last_release;
+                let fresh_causal_sample = match driver_torque_loss_sample_seq {
+                    Some(seq) => seq != 0 && Some(seq) != self.reported_torque_loss_last_sample_seq,
+                    None => hw_rx,
+                };
+                if distinct_release && fresh_causal_sample {
+                    self.reported_torque_loss_last_release = release_seq;
+                    if let Some(seq) = driver_torque_loss_sample_seq {
+                        self.reported_torque_loss_last_sample_seq = Some(seq);
+                    }
+                    self.reported_torque_loss_count =
+                        self.reported_torque_loss_count.saturating_add(1);
+                    if self.reported_torque_loss_count >= crate::driver::EVIDENCE_WINDOW_SAMPLES {
+                        self.safety.latch(
+                            crate::safety::FaultKind::Other,
+                            crate::safety::FaultDetail::Static(
+                                crate::safety::StaticFault::UnexpectedTorqueLoss,
+                            ),
+                        );
+                    }
+                }
             } else {
-                // M1: When holding / not actively moving, reported enable state is telemetry +
-                // warning only — never latch `UnexpectedTorqueLoss` or stop/drop holds.
+                // R11 M1 / R12 M2: When holding / not actively moving, reported enable state is
+                // telemetry + warning only — never latch `UnexpectedTorqueLoss` or stop/drop holds.
                 let now = Instant::now();
                 let should_warn = self
                     .last_reported_torque_loss_warn
@@ -7095,6 +7141,12 @@ impl SupervisorInner {
                     }
                 }
             }
+        } else if driver_enable_confirmed_ok
+            || !self.is_torqued
+            || self.disable_pending
+            || self.torque_intent == TorqueIntent::Off
+        {
+            self.reset_reported_torque_loss();
         }
 
         // A single late tick only shortens integration (dt is clamped below); the motors

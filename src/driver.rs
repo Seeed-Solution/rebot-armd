@@ -922,6 +922,13 @@ pub trait ArmDriver: Send {
     /// never an input to hold, disable, rollback, or recovery decisions).
     fn enable_state(&self) -> EnableState { EnableState::Unknown }
 
+    /// Monotonic counter incremented strictly when a fresh causal hardware sample carrying
+    /// non-enabled torque state (`enable_state != Enabled`) is decoded from the bus (R12 M2).
+    /// Returns `None` for drivers without an explicit per-sample counter.
+    fn reported_torque_loss_sample_seq(&self) -> Option<u64> {
+        None
+    }
+
     /// True when this driver implements [`Self::fresh_measured_position_for`] directly from
     /// its own transport-provenance feedback cache (true for all real hardware and sim drivers).
     fn has_driver_fresh_position_api(&self) -> bool { false }
@@ -1739,6 +1746,11 @@ pub struct FeetechArmDriver<T: Transport> {
     feedback_continuity_epoch: Vec<u64>,
     /// Reported per-servo `REG_TORQUE_ENABLE` telemetry (`Some(0 | 1)` or `None`, observation/UI only).
     reported_enable: Vec<Option<u8>>,
+    /// True after torque enable was commanded until a torque-off write is dispatched; keeps
+    /// periodic causal `REG_TORQUE_ENABLE` telemetry polling active even if a servo reports 0 (R12 M2).
+    torque_enable_commanded: bool,
+    /// Monotonic counter bumped strictly when a causal `REG_TORQUE_ENABLE == 0` reply is decoded (R12 M2).
+    reported_torque_loss_sample_seq: u64,
     /// True after a 1-byte register read to servo `i` timed out: a late 1-byte reply may still
     /// be in flight, so causal torque readback requires a 0-byte `PING` FIFO barrier first.
     unmatched_1b_read: Vec<bool>,
@@ -1829,6 +1841,8 @@ impl<T: Transport> FeetechArmDriver<T> {
             feedback_seq: vec![0; dof],
             feedback_continuity_epoch: vec![0; dof],
             reported_enable: vec![None; dof],
+            torque_enable_commanded: false,
+            reported_torque_loss_sample_seq: 0,
             unmatched_1b_read: vec![false; dof],
             tx_echo: None,
             tx_echo_auto: false,
@@ -2518,6 +2532,7 @@ impl<T: Transport> FeetechArmDriver<T> {
         if let Some(idx) = self.servo_ids.iter().position(|&id| id == servo_id) {
             self.reported_enable[idx] = None;
         }
+        self.torque_enable_commanded = false;
         let pkt = feetech::build_set_torque(servo_id, false);
         self.transport.write_all(&pkt)?;
         let _ = self.transport.flush();
@@ -2826,6 +2841,10 @@ impl<T: Transport> FeetechArmDriver<T> {
                 self.reported_enable[idx] = Some(val);
                 self.last_enable_confirmed[idx] = Some(rx_at);
                 self.missed_enable_polls[idx] = 0;
+                if val == 0 {
+                    self.reported_torque_loss_sample_seq =
+                        self.reported_torque_loss_sample_seq.wrapping_add(1).max(1);
+                }
             }
             _ => {
                 self.reported_enable[idx] = None;
@@ -3598,7 +3617,7 @@ impl<T: Transport> FeetechArmDriver<T> {
         }
 
         let did_enable_poll = self.incomplete_chunk_idx.is_none()
-            && self.reported_enable.contains(&Some(1))
+            && (self.reported_enable.contains(&Some(1)) || self.torque_enable_commanded)
             && (self.read_poll_count.is_multiple_of(10) || self.last_enable_poll.is_none_or(|t| self.elapsed_since(t) >= Duration::from_millis(200)));
         if did_enable_poll {
             self.last_enable_poll = Some(self.clock_now());
@@ -3874,6 +3893,10 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         } else {
             EnableState::Unknown
         }
+    }
+
+    fn reported_torque_loss_sample_seq(&self) -> Option<u64> {
+        Some(self.reported_torque_loss_sample_seq)
     }
 
     fn has_driver_fresh_position_api(&self) -> bool { true }
@@ -4358,6 +4381,7 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                     write_err = Some(e.into());
                     break;
                 }
+                self.torque_enable_commanded = true;
                 if let Err(e) = self.strict_stop_check(Some(start_stamp)) {
                     write_err = Some(e);
                     break;
@@ -5459,6 +5483,9 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     /// True once motor `i` has received feedback strictly after its latest `CMD_ENABLE`
     /// transmit (any state, including fault states, so `poll_enable` detects faults causally).
     motor_post_enable_feedback: Vec<bool>,
+    /// Monotonic counter bumped strictly when a post-enable motor feedback frame carries
+    /// `state_or_error != 1` (R12 M2).
+    reported_torque_loss_sample_seq: u64,
     /// Per-joint transmit completion flags for the active panic-disable sequence.
     panic_disable_tx_ok: Vec<bool>,
     /// MIT tracking deadline fence (`set_mit_deadline_fence`); None = off (unchanged behaviour).
@@ -6290,6 +6317,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             rest_pose_window: vec![CausalWindow::default(); dof],
             motor_enable_seq: vec![0; dof],
             motor_post_enable_feedback: vec![false; dof],
+            reported_torque_loss_sample_seq: 0,
             panic_disable_tx_ok: vec![false; dof],
             rx_empty_seq: 0,
             last_read_drained: false,
@@ -10908,6 +10936,10 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
     }
 
+    fn reported_torque_loss_sample_seq(&self) -> Option<u64> {
+        Some(self.reported_torque_loss_sample_seq)
+    }
+
     fn has_driver_fresh_position_api(&self) -> bool { true }
 
     fn fresh_measured_position_for(&self, joint: usize, max_age: Duration) -> Option<f32> {
@@ -14013,6 +14045,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 }
                 if !self.awaiting_rx_boundary && seq > self.motor_enable_seq[idx] {
                     self.motor_post_enable_feedback[idx] = true;
+                    if feedback.state_or_error != 1 {
+                        self.reported_torque_loss_sample_seq =
+                            self.reported_torque_loss_sample_seq.wrapping_add(1).max(1);
+                    }
                 }
                 match boundary_check {
                     RestBoundaryCheck::OffsetDrifted => unreachable!(),
