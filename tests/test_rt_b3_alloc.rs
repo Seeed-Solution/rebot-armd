@@ -2100,6 +2100,7 @@ fn arm_driver_error_write_bounded_and_clear_fault_error_cover_all_variants_zero_
             ArmDriverError::DisableMitFenceUnconfirmed => "DisableMitFenceUnconfirmed",
             ArmDriverError::LeaseFenced => "LeaseFenced",
             ArmDriverError::EnableAuthorityExpired => "EnableAuthorityExpired",
+            ArmDriverError::PartialDisable { .. } => "PartialDisable",
         }
     }
 
@@ -2168,6 +2169,13 @@ fn arm_driver_error_write_bounded_and_clear_fault_error_cover_all_variants_zero_
         ArmDriverError::DisableMitFenceUnconfirmed,
         ArmDriverError::LeaseFenced,
         ArmDriverError::EnableAuthorityExpired,
+        ArmDriverError::PartialDisable {
+            reason: armd::driver::PartialDisableReason::Estop,
+            applied_mask: 0b0000_0011,
+            uncertain_mask: 0,
+            remaining_mask: 0b0111_1100,
+            dof: 7,
+        },
     ];
     #[cfg(unix)]
     {
