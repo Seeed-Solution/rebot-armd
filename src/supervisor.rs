@@ -9129,7 +9129,7 @@ impl SupervisorInner {
         let has_legacy_transition =
             !self.pending_rx_poll.active && self.has_non_broker_torque_transition();
         self.nonblocking_driver_release = has_legacy_transition;
-        let legacy_step_start = has_legacy_transition.then(|| now_fn());
+        let legacy_step_start = has_legacy_transition.then(&mut *now_fn);
         let legacy_step_deadline = legacy_step_start.map(|t| t + LEGACY_TORQUE_STEP_BUDGET);
         let (applied_rx_tx_cap, rx_tx_cap_expired) = if !self.pending_rx_poll.active && self.driver.is_some() {
             let margin = self.tx_release_publish_margin();
