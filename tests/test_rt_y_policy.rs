@@ -102,6 +102,61 @@ async fn serve(
     addr
 }
 
+async fn confirm_clock_handshake(
+    client: &reqwest::Client,
+    addr: SocketAddr,
+    op_token: &str,
+    producer_epoch: u64,
+) -> u64 {
+    for attempt in 0..5 {
+        let now_ms = armd::policy_runtime::vision::monotonic_now_ms() as i64;
+        let hs1: Value = client
+            .post(format!("http://{addr}/api/v1/vision/clock-handshake"))
+            .header("Authorization", format!("Bearer {op_token}"))
+            .json(&json!({
+                "phase": "init",
+                "producer_epoch": producer_epoch,
+                "producer_monotonic_ms": now_ms
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let challenge_id = hs1["challenge_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected challenge_id in {hs1}"));
+        let confirm_ms = armd::policy_runtime::vision::monotonic_now_ms() as i64;
+        let hs2 = client
+            .post(format!("http://{addr}/api/v1/vision/clock-handshake"))
+            .header("Authorization", format!("Bearer {op_token}"))
+            .json(&json!({
+                "phase": "confirm",
+                "challenge_id": challenge_id,
+                "producer_epoch": producer_epoch,
+                "producer_monotonic_ms": confirm_ms,
+                "producer_uncertainty_ms": 0,
+                "rtt_ms": 0,
+                "ttl_ms": 5000
+            }))
+            .send()
+            .await
+            .unwrap();
+        if hs2.status() == 200 {
+            let hs2_val: Value = hs2.json().await.unwrap();
+            return hs2_val["handshake_generation"].as_u64().expect("hs_gen");
+        }
+        let status = hs2.status();
+        let body = hs2.text().await.unwrap();
+        assert!(
+            status == 400 && attempt < 4,
+            "clock-handshake confirm failed (status={status}, attempt={attempt}): {body}"
+        );
+    }
+    unreachable!()
+}
+
 async fn connect_ws(addr: SocketAddr) -> TestSocket {
     connect_async(format!("ws://{addr}/api/v1/ws")).await.unwrap().0
 }
@@ -737,16 +792,30 @@ async fn y3_j7_pos_force_fresh_emits_stale_refused_and_rejected_installs_no_stam
         })
     })
     .await;
-    let j7_tx: Vec<f32> = bus
+    let j7_frames: Vec<(f32, u16)> = bus
         .tx_log()
         .iter()
-        .filter(|f| f.id == 0x307 && f.data.len() >= 4)
-        .map(decode_pos_f32)
+        .filter(|f| f.id == 0x307 && f.data.len() >= 6)
+        .map(|f| (decode_pos_f32(f), decode_j7_pf_vel_raw(f)))
         .collect();
+    let j7_tx: Vec<f32> = j7_frames.iter().map(|&(p, _)| p).collect();
     assert!(
         j7_tx.iter().any(|&p| (p - cur[6]).abs() > 0.01),
         "fresh J7 policy target must emit PosForce J7 CAN frames (0x307): {j7_tx:?}"
     );
+    // Major 5: verify encoded 0x307 PosForce velocity honors `release_gate.max_speed_scale = 0.25`.
+    let max_j7_vel_scaled = ArmConfig::rebot_dm().limits[6].max_velocity * 0.25;
+    let max_v_raw_scaled = armd::protocol::damiao::pos_force_vel_raw(max_j7_vel_scaled);
+    assert!(
+        j7_frames.iter().any(|&(_, v)| v > 0 && v <= max_v_raw_scaled),
+        "moving J7 PosForce frames must emit positive velocity <= {max_v_raw_scaled} (0.25x): {j7_frames:?}"
+    );
+    for &(p, v_raw) in &j7_frames {
+        assert!(
+            v_raw <= max_v_raw_scaled,
+            "gated J7 PosForce frame exceeded 0.25x velocity cap ({v_raw} > {max_v_raw_scaled}, pos={p})"
+        );
+    }
 
     // (b) Rejected policy frame (JUMP_LIMIT on J1 while J7 also changes): zero J7 TX for rejected target!
     let cur2 = sup.hub().latest().unwrap().obs.commanded_positions.clone();
@@ -1141,42 +1210,8 @@ async fn y5_rest_off_lock_embedding_ticket_operator_lock_and_qualification_ledge
         &enc_sha,
         &pre_sha,
     );
+    let hs_gen = confirm_clock_handshake(&client, addr, &op_token, 1).await;
     let now_ms = armd::policy_runtime::vision::monotonic_now_ms() as i64;
-    let hs1: Value = client
-        .post(format!("http://{addr}/api/v1/vision/clock-handshake"))
-        .header("Authorization", format!("Bearer {op_token}"))
-        .json(&json!({
-            "phase": "init",
-            "producer_epoch": 1,
-            "producer_monotonic_ms": now_ms
-        }))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let challenge_id = hs1["challenge_id"]
-        .as_str()
-        .unwrap_or_else(|| panic!("expected challenge_id in {hs1}"));
-    let hs2 = client
-        .post(format!("http://{addr}/api/v1/vision/clock-handshake"))
-        .header("Authorization", format!("Bearer {op_token}"))
-        .json(&json!({
-            "phase": "confirm",
-            "challenge_id": challenge_id,
-            "producer_epoch": 1,
-            "producer_monotonic_ms": now_ms,
-            "producer_uncertainty_ms": 2,
-            "rtt_ms": 2,
-            "ttl_ms": 5000
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(hs2.status(), 200);
-    let hs2_val: Value = hs2.json().await.unwrap();
-    let hs_gen = hs2_val["handshake_generation"].as_u64().expect("hs_gen");
 
     let ing = client
         .post(format!("http://{addr}/api/v1/vision/embedding"))
@@ -1292,34 +1327,7 @@ async fn y5_rest_off_lock_embedding_ticket_operator_lock_and_qualification_ledge
     })
     .await;
     // Switch producer_epoch -> clears embedding buffer & invalidates InferenceTicket -> VISION_STALE stop.
-    let now_ms3 = armd::policy_runtime::vision::monotonic_now_ms() as i64;
-    let hs3: Value = client
-        .post(format!("http://{addr}/api/v1/vision/clock-handshake"))
-        .header("Authorization", format!("Bearer {op_token}"))
-        .json(&json!({"phase": "init", "producer_epoch": 2, "producer_monotonic_ms": now_ms3}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let ch3 = hs3["challenge_id"].as_str().unwrap();
-    let hs4 = client
-        .post(format!("http://{addr}/api/v1/vision/clock-handshake"))
-        .header("Authorization", format!("Bearer {op_token}"))
-        .json(&json!({
-            "phase": "confirm",
-            "challenge_id": ch3,
-            "producer_epoch": 2,
-            "producer_monotonic_ms": now_ms3,
-            "producer_uncertainty_ms": 2,
-            "rtt_ms": 2,
-            "ttl_ms": 5000
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(hs4.status(), 200);
+    let _hs_gen2 = confirm_clock_handshake(&client, addr, &op_token, 2).await;
     wait_until(Duration::from_secs(2), || {
         sup.hub().latest().is_some_and(|s| {
             s.obs.policy.as_ref().is_some_and(|p| p.action_id == aid_emb && !p.active)
@@ -1626,5 +1634,277 @@ async fn y6_executor_policy_zero_alloc_and_zero_supervisor_lock_proof() {
     );
 
     drop(_detached_writer);
+    handle.stop_and_join();
+}
+
+// ============================================================================
+// 7. Independent-review regression coverage (Blocker 1 + Major 4 end-to-end):
+//    - Stopping a supervised live run records `passed=false / STOPPED` (never
+//      synthesizes a false pass) and blocks `production_release` (`QUALIFICATION_REQUIRED`)
+//    - Stopping during a delayed policy load cancels promptly and frees backend permits
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn y7_review_regressions_qualification_stop_and_load_cancel() {
+    ensure_tracing_subscriber();
+    let dir = tempdir().unwrap();
+    let ledger_path = dir.path().join("qual_y7.jsonl");
+    let sandbox = Arc::new(SandboxState::new(dir.path().to_path_buf()));
+    let cfg = ArmConfig {
+        lease_timeout_ms: 10_000,
+        ..ArmConfig::rebot_dm()
+    };
+    let (sup, _bus) = make_fakebus_supervisor(cfg, false);
+    {
+        let mut inner = sup.inner().write().await;
+        inner.policy_ledger_path = Some(ledger_path.clone());
+    }
+    let auth = OperatorAuth::enforced("1234", 600);
+    sup.set_operator_auth_enforced(true).await;
+
+    let handle = sup
+        .start_executor(ExecutorConfig::for_tests(Duration::from_millis(10)))
+        .await
+        .unwrap();
+    wait_until(Duration::from_secs(2), || sup.hub().latest().is_some()).await;
+    let addr = serve(sup.clone(), sandbox.clone(), auth).await;
+
+    let client = reqwest::Client::new();
+    let unlock: Value = client
+        .post(format!("http://{addr}/api/v1/auth/unlock"))
+        .json(&json!({"pin": "1234"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let op_token = unlock["token"].as_str().expect("operator token").to_string();
+
+    let mut ws_req = tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(
+        format!("ws://{addr}/api/v1/ws"),
+    )
+    .unwrap();
+    ws_req.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {op_token}").parse().unwrap(),
+    );
+    let (mut ws, _) = connect_async(ws_req).await.unwrap();
+    let g = acquire(&mut ws, "y7-client", false, 1).await;
+    let ep = sup.fresh_snapshot(None).await.unwrap().obs.epoch_id;
+    arm_via_ws(&mut ws, g, ep, 1).await;
+
+    let (scene_id, tool_id) = sandbox.active_scene_and_tool().await;
+    let dig = write_dm_rmlp_pack(
+        dir.path(),
+        "p_y7",
+        dm_bias_from_home(0.03, 0.0),
+        json!({}),
+    );
+    let gate_sup = make_release_gate_json(
+        &dig,
+        "supervised_first_run",
+        20,
+        0.25,
+        &scene_id,
+        &tool_id,
+        EMPTY_CALIBRATION_DIGEST,
+    );
+    let gate_prod = make_release_gate_json(
+        &dig,
+        "production_release",
+        20,
+        0.25,
+        &scene_id,
+        &tool_id,
+        EMPTY_CALIBRATION_DIGEST,
+    );
+
+    // Part A (Blocker 1): Start a SupervisedFirstRun live policy, stop it mid-run, and verify:
+    //  1. Ledger records `passed == false` with `stop_reason == "STOPPED"` (never optimistic pass).
+    //  2. Subsequent `production_release` start is refused with `QUALIFICATION_REQUIRED`.
+    send(
+        &mut ws,
+        json!({
+            "type": "command",
+            "path": "/api/v1/action/policy/start",
+            "body": {
+                "policy_id": "p_y7",
+                "mode": "live",
+                "fps": 20.0,
+                "max_seconds": 5.0,
+                "i_am_at_the_arm": true,
+                "release_gate": gate_sup
+            },
+            "generation": g,
+            "epoch_id": ep,
+            "request_id": 10,
+        }),
+    )
+    .await;
+    let ack = next_of_any(&mut ws, &["command_ack", "command_reject"]).await;
+    assert_eq!(ack["type"], "command_ack", "y7 supervised start failed: {ack}");
+    let aid = ack["action_id"].as_u64().unwrap();
+    wait_until(Duration::from_secs(2), || {
+        sup.hub().latest().is_some_and(|s| {
+            s.obs
+                .policy
+                .as_ref()
+                .is_some_and(|p| p.action_id == aid && p.active && p.steps >= 1)
+        })
+    })
+    .await;
+
+    send(
+        &mut ws,
+        json!({
+            "type": "command",
+            "path": "/api/v1/action/policy/stop",
+            "body": {},
+            "generation": g,
+            "epoch_id": ep,
+            "request_id": 11,
+        }),
+    )
+    .await;
+    let stop_ack = next_of(&mut ws, "command_ack").await;
+    assert_eq!(stop_ack["stopped"], true, "{stop_ack}");
+
+    wait_until(Duration::from_secs(3), || {
+        ledger_path.exists()
+            && fs::read_to_string(&ledger_path)
+                .map(|s| s.contains(&format!("\"action_id\":{aid}")))
+                .unwrap_or(false)
+    })
+    .await;
+    let recs = armd::policy_runtime::qualification::load_records(&ledger_path).unwrap();
+    let rec = recs
+        .iter()
+        .find(|r| r.action_id == aid)
+        .expect("stopped supervised run ledger record");
+    assert!(
+        !rec.passed,
+        "stopped supervised run must record passed=false: {rec:?}"
+    );
+    assert_eq!(
+        rec.stop_reason, "STOPPED",
+        "stopped supervised run must preserve immutable owner stop_reason: {rec:?}"
+    );
+
+    // ProductionRelease MUST be refused `QUALIFICATION_REQUIRED`!
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    send(
+        &mut ws,
+        json!({
+            "type": "command",
+            "path": "/api/v1/action/policy/start",
+            "body": {
+                "policy_id": "p_y7",
+                "mode": "live",
+                "fps": 20.0,
+                "max_seconds": 0.5,
+                "i_am_at_the_arm": true,
+                "release_gate": gate_prod
+            },
+            "generation": g,
+            "epoch_id": ep,
+            "request_id": 12,
+        }),
+    )
+    .await;
+    let prod_rej = next_of(&mut ws, "command_reject").await;
+    assert_eq!(
+        prod_rej["code"], "QUALIFICATION_REQUIRED",
+        "production_release after stopped supervised run must fail closed: {prod_rej}"
+    );
+
+    // Part B (Major 4): Stop cancels an in-flight delayed blocking policy load promptly and
+    // releases its backend permit so a subsequent start succeeds cleanly.
+    sandbox.set_policy_load_delay_ms(600);
+    let t0 = Instant::now();
+    send(
+        &mut ws,
+        json!({
+            "type": "command",
+            "path": "/api/v1/action/policy/start",
+            "body": {
+                "policy_id": "p_y7",
+                "mode": "shadow",
+                "fps": 20.0,
+                "max_seconds": 0.5
+            },
+            "generation": g,
+            "epoch_id": ep,
+            "request_id": 13,
+        }),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    send(
+        &mut ws,
+        json!({
+            "type": "command",
+            "path": "/api/v1/action/policy/stop",
+            "body": {},
+            "generation": g,
+            "epoch_id": ep,
+            "request_id": 14,
+        }),
+    )
+    .await;
+    let mut got_load_reject = false;
+    let mut got_stop_ack = false;
+    while !(got_load_reject && got_stop_ack) {
+        let msg = next_of_any(&mut ws, &["command_ack", "command_reject"]).await;
+        if msg["request_id"] == 13 {
+            assert_eq!(msg["type"], "command_reject", "cancelled load must reject: {msg}");
+            assert_eq!(msg["code"], "STOPPED", "cancelled load must return STOPPED: {msg}");
+            got_load_reject = true;
+        } else if msg["request_id"] == 14 {
+            assert_eq!(msg["type"], "command_ack", "policy/stop must ack: {msg}");
+            got_stop_ack = true;
+        }
+    }
+    let elapsed = t0.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(400),
+        "stopping a 600ms delayed load must cancel promptly (took {elapsed:?})"
+    );
+
+    // Permit freed -> immediate subsequent Shadow start succeeds!
+    sandbox.set_policy_load_delay_ms(0);
+    send(
+        &mut ws,
+        json!({
+            "type": "command",
+            "path": "/api/v1/action/policy/start",
+            "body": {
+                "policy_id": "p_y7",
+                "mode": "shadow",
+                "fps": 20.0,
+                "max_seconds": 0.25
+            },
+            "generation": g,
+            "epoch_id": ep,
+            "request_id": 15,
+        }),
+    )
+    .await;
+    let ack_after = next_of_any(&mut ws, &["command_ack", "command_reject"]).await;
+    assert_eq!(
+        ack_after["type"], "command_ack",
+        "start after cancelled load must succeed once permit is released: {ack_after}"
+    );
+    let aid_after = ack_after["action_id"].as_u64().unwrap();
+    wait_until(Duration::from_secs(2), || {
+        sup.hub().latest().is_some_and(|s| {
+            s.obs
+                .policy
+                .as_ref()
+                .is_some_and(|p| p.action_id == aid_after && !p.active)
+        })
+    })
+    .await;
+
     handle.stop_and_join();
 }

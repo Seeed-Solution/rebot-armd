@@ -882,6 +882,15 @@ impl GripperForceDiagSlot {
         self.stream_stop_count.fetch_add(1, Ordering::Release);
     }
 
+    #[cfg(test)]
+    pub fn counts(&self) -> (u64, u64, u64) {
+        (
+            self.unavail_count.load(Ordering::Acquire),
+            self.cap_trip_count.load(Ordering::Acquire),
+            self.stream_stop_count.load(Ordering::Acquire),
+        )
+    }
+
     pub fn drain_and_log_once(&self) {
         loop {
             let prev = self.unavail_drained.load(Ordering::Acquire);

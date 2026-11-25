@@ -1499,4 +1499,468 @@ mod pr_y_policy_unit_tests {
             "concurrent general Stop interleaved before EndPolicy::Stop must stop unrelated active trajectory"
         );
     }
+
+    #[test]
+    fn policy_review_regression_pre_gripper_revocation_and_force_diag_off_rt() {
+        let mut r = rig();
+        let g_idx = r.fx.core.config.gripper_index().expect("gripper joint");
+        let close_dir = r
+            .fx
+            .core
+            .config
+            .gripper_policy
+            .as_ref()
+            .map_or(1.0_f32, |p| if p.closed_rad >= p.open_rad { 1.0 } else { -1.0 });
+        let aid = begin_rt_policy_via_broker(
+            &mut r,
+            1,
+            1,
+            0,
+            PolicyMode::Live,
+            0.25,
+            Some(0.25),
+            200,
+            None,
+            false,
+            Some(0.25),
+        );
+        // Step 1: accept a live policy target moving J7 toward closing so `gripper_stream_target`
+        // is owned by the live policy run.
+        let gen0 = r.fx.core.rt_policy_auth.current();
+        let mut q = r.fx.core.commanded_positions.clone();
+        let g_before = q[g_idx];
+        q[g_idx] = (g_before + close_dir * 0.12).clamp(
+            r.fx.core.config.limits[g_idx].min_position,
+            r.fx.core.config.limits[g_idx].max_position,
+        );
+        let mut frame = r.raw_frame(policy_stream(aid), r.authority(), 0.0);
+        frame.q[..q.len()].copy_from_slice(&q);
+        frame.policy_generation = gen0;
+        frame.replaceable = false;
+        assert_eq!(r.consume(&frame), Ok(()));
+        assert!(r.fx.core.gripper_stream_target.is_some());
+
+        // Revoke authorization BEFORE the next tick (with NO new target frame):
+        // Step 0.0b MUST run BEFORE 0.1 Gripper stall protection, clearing `gripper_stream_target`
+        // and `servo_target` so neither CapRamp nor servo advances J7.
+        r.fx.core.rt_policy_auth.revoke();
+        let g_pre_step = r.fx.core.commanded_positions[g_idx];
+        let _ = r.fx.step();
+        assert_eq!(
+            r.fx.core.gripper_stream_target, None,
+            "pre-gripper revocation must clear policy-owned gripper_stream_target"
+        );
+        assert_eq!(r.fx.core.servo_target, None);
+        assert!(
+            (r.fx.core.commanded_positions[g_idx] - g_pre_step).abs() < 1e-6,
+            "revoked policy must not advance J7 on tick"
+        );
+
+        // Blocker 4: on `rt_executor_owned == true`, gripper force-cap trip path
+        // records into lock-free `GripperForceDiagSlot` instead of calling `tracing::warn!`.
+        if let Some(cap_nm) = r
+            .fx
+            .core
+            .config
+            .gripper_policy
+            .as_ref()
+            .and_then(|p| p.max_close_torque_nm)
+        {
+            let (_, cap_before, _) = crate::rt_core::ops::gripper_force_diag().counts();
+            r.fx.core.gripper_stalled = false;
+            r.fx.core.gripper_force_capped = false;
+            r.fx.core.gripper_over_cap_prev = false;
+            r.fx.core.gripper_stream_target = Some(q[g_idx]);
+            r.fx.core.gripper_stream_lease = Some(r.gen);
+            r.fx.core.commanded_positions[g_idx] = g_before + close_dir * 0.05;
+            r.fx.core.measured_positions[g_idx] = g_before;
+            r.fx.core.torques[g_idx] = cap_nm + 1.0;
+            let _ = r.fx.step();
+            let (_, cap_after, _) = crate::rt_core::ops::gripper_force_diag().counts();
+            assert!(
+                cap_after > cap_before,
+                "RT gripper force diag must record cap trip off-RT ({cap_before} -> {cap_after})"
+            );
+            crate::rt_core::ops::gripper_force_diag().drain_and_log_once();
+        }
+    }
+
+    #[test]
+    fn policy_review_regression_lease_expired_tx_fail_closed_and_j7_speed_scale() {
+        use crate::driver::PosForceIntentKind;
+        use crate::supervisor::TickOutput;
+
+        let mut r = rig();
+        let g_idx = r.fx.core.config.gripper_index().expect("gripper joint");
+        let prof_j7_v = r.fx.core.config.limits[g_idx].max_velocity;
+
+        let aid = begin_rt_policy_via_broker(
+            &mut r,
+            1,
+            1,
+            0,
+            PolicyMode::Live,
+            0.25,
+            Some(0.25),
+            200,
+            None,
+            false,
+            Some(0.25),
+        );
+        // Major 5: even when `retained_motion_limits` holds unscaled profile limits, a live gated
+        // policy with `RtGateBinding { max_speed_scale: 0.25 }` clamps J7 velocity ceiling to 0.25x.
+        r.fx.core.tracking.retained_motion_limits = Some(r.fx.core.config.limits.clone());
+        let ceil = r
+            .fx
+            .core
+            .active_joint_velocity_ceiling(g_idx)
+            .expect("j7 velocity ceiling");
+        assert!(
+            (ceil - prof_j7_v * 0.25).abs() < 1e-5,
+            "J7 ceiling must obey RtGateBinding max_speed_scale=0.25 even with retained_motion_limits (got {ceil} vs {})",
+            prof_j7_v * 0.25
+        );
+
+        // Submit a valid target so live policy is actively driving output.
+        let gen0 = r.fx.core.rt_policy_auth.current();
+        let mut frame = r.raw_frame(policy_stream(aid), r.authority(), 0.02);
+        frame.policy_generation = gen0;
+        frame.replaceable = false;
+        assert_eq!(r.consume(&frame), Ok(()));
+
+        // Blocker 3: expire the active lease between top-of-tick fence and TX staging; calling
+        // `write_output_slice` directly MUST fail closed (`TickOutput::None` + J7 Hold intent),
+        // never downgrading `output_lease_gen` to lease-exempt `0`.
+        r.fx.core.lease_timeout = Duration::ZERO;
+        if let Some(ref mut lease) = r.fx.core.active_lease {
+            lease.acquired_at = std::time::Instant::now() - Duration::from_secs(5);
+        }
+        r.fx.core.j7_intent = None;
+        let mut targets: Vec<crate::driver::JointTarget> = r
+            .fx
+            .core
+            .commanded_positions
+            .iter()
+            .map(|&p| crate::driver::JointTarget::position(p))
+            .collect();
+        let out = r.fx.core.write_output_slice(&mut targets, 0.01, None);
+        assert!(
+            matches!(out, TickOutput::None),
+            "expired live policy lease must fail closed in write_output_slice, got {out:?}"
+        );
+        assert!(
+            matches!(
+                r.fx.core.j7_intent.map(|i| i.kind),
+                Some(PosForceIntentKind::Hold)
+            ),
+            "expired live policy lease must set J7 PosForce Hold intent, got {:?}",
+            r.fx.core.j7_intent
+        );
+    }
+
+    #[test]
+    fn policy_review_regression_coalesced_bookkeeping_validity_bounds_and_rt_deadline() {
+        use crate::rt_core::mailbox::{PolicyValidityBounds, Submitted};
+
+        let mut r = rig();
+        let aid = begin_rt_policy_via_broker(
+            &mut r,
+            1,
+            1,
+            0,
+            PolicyMode::Live,
+            0.25,
+            Some(0.25),
+            200,
+            Some(200),
+            true,
+            None,
+        );
+        // Major 1: submit a replaceable servo frame (unconsumed in mailbox), then submit a policy
+        // frame that coalesces it -> `TargetPort::submit_policy_with_validity` returns `Coalesced`
+        // AND still tracks `aid` in `open_policy_actions` (not leaked/untracked).
+        assert_eq!(r.servo(Some(1), 0.005), None);
+        let q = r.pose(0.01);
+        let gen0 = r.fx.core.rt_policy_auth.current();
+        let sub = r.port.submit_policy_with_validity(
+            &PolicyTarget {
+                action_id: aid,
+                stamp: PolicyStamp {
+                    authority: r.authority(),
+                    authorization: gen0,
+                    max_input_age: Duration::from_millis(200),
+                },
+                targets: &q,
+                input_at: r.fx.now(),
+                vision_at: Some(r.fx.now()),
+                vision_frame_id: Some(7),
+            },
+            PolicyValidityBounds {
+                vision_window_expires_at: Some(r.fx.now() - Duration::from_millis(1)),
+                handshake_expires_at: Some(r.fx.now() + Duration::from_secs(5)),
+            },
+        );
+        assert!(
+            matches!(sub, Submitted::Coalesced { .. }),
+            "policy frame replacing unconsumed servo frame must return Coalesced: {sub:?}"
+        );
+        assert!(!r.port.is_policy_closed(aid));
+
+        // Major 2 (part a): elapsed `vision_window_expires_at` -> `VISION_STALE` (hold mode keeps run).
+        let rep = r.fx.step();
+        assert_eq!(rep.target.map(|(_, res)| res), Some(Err("VISION_STALE")));
+        assert!(r.fx.core.policy_run.is_some());
+        assert_eq!(r.target0(), None);
+
+        // Major 2 (part b): elapsed `handshake_expires_at` -> `HANDSHAKE_EXPIRED` & terminates run!
+        let gen1 = r.fx.core.rt_policy_auth.current();
+        let sub2 = r.port.submit_policy_with_validity(
+            &PolicyTarget {
+                action_id: aid,
+                stamp: PolicyStamp {
+                    authority: r.authority(),
+                    authorization: gen1,
+                    max_input_age: Duration::from_millis(200),
+                },
+                targets: &q,
+                input_at: r.fx.now(),
+                vision_at: Some(r.fx.now()),
+                vision_frame_id: Some(8),
+            },
+            PolicyValidityBounds {
+                vision_window_expires_at: Some(r.fx.now() + Duration::from_secs(5)),
+                handshake_expires_at: Some(r.fx.now() - Duration::from_millis(1)),
+            },
+        );
+        assert_eq!(sub2, Submitted::Accepted);
+        let rep2 = r.fx.step();
+        assert_eq!(rep2.target.map(|(_, res)| res), Some(Err("HANDSHAKE_EXPIRED")));
+        assert!(r.fx.core.policy_run.is_none());
+        assert_eq!(
+            r.fx.core
+                .last_policy_obs
+                .as_ref()
+                .and_then(|o| o.stop_reason.as_deref()),
+            Some("HANDSHAKE_EXPIRED")
+        );
+
+        // Major 2 (part c): RT `PolicyRun::deadline` (`max_seconds`) enforced directly on `armd-control`
+        // even with NO new target frame!
+        let aid2 = begin_rt_policy_via_broker(
+            &mut r,
+            1,
+            2,
+            1,
+            PolicyMode::Live,
+            0.25,
+            Some(0.25),
+            200,
+            None,
+            false,
+            None,
+        );
+        let dl = r.fx.now() + Duration::from_millis(30);
+        r.fx.core.policy_run.as_mut().unwrap().deadline = Some(dl);
+        let gen2 = r.fx.core.rt_policy_auth.current();
+        let mut f_ok = r.raw_frame(policy_stream(aid2), r.authority(), 0.02);
+        f_ok.policy_generation = gen2;
+        f_ok.replaceable = false;
+        assert_eq!(r.consume(&f_ok), Ok(()));
+        assert!(r.fx.core.servo_target.is_some());
+
+        // Advance past deadline with NO new frame -> next release terminates run with `MAX_SECONDS`!
+        r.fx.clock().advance(Duration::from_millis(40));
+        let _ = r.fx.step();
+        assert!(
+            r.fx.core.policy_run.is_none(),
+            "elapsed PolicyRun::deadline must terminate run on RT tick"
+        );
+        assert_eq!(r.fx.core.servo_target, None);
+        assert_eq!(
+            r.fx.core
+                .last_policy_obs
+                .as_ref()
+                .and_then(|o| o.stop_reason.as_deref()),
+            Some("MAX_SECONDS")
+        );
+    }
+
+    #[test]
+    fn policy_review_regression_fenced_embedding_binding_and_action_scoped_auth() {
+        use crate::policy_runtime::manifest::VideoEmbeddingSpec;
+        use crate::policy_runtime::vision::VideoEmbeddingHub;
+        use crate::policy_runtime::{PolicyAuthorization, VisionStalePolicy};
+
+        // Action-scoped `PolicyAuthorization`: old run 100 cannot revoke or unbind active run 200.
+        let auth = PolicyAuthorization::default();
+        let g100 = auth.bind_action(100);
+        assert_ne!(g100, 0);
+        let g200 = auth.bind_action(200);
+        assert_ne!(g200, g100);
+        assert!(
+            !auth.revoke_for_action(100),
+            "stale action 100 must not revoke active action 200"
+        );
+        assert_eq!(auth.current(), g200);
+        auth.unbind_action(100);
+        assert_eq!(auth.current(), g200, "stale unbind_action(100) must leave action 200 intact");
+        assert!(
+            auth.revoke_for_action(200),
+            "active action 200 must revoke its own generation"
+        );
+        let g200_rev = auth.current();
+        assert_ne!(g200_rev, g200);
+        assert_eq!(g200_rev >> 32, g200 >> 32, "action tag preserved on self-revoke");
+
+        // Monotonically fenced `VideoEmbeddingHub::bind_policy_fenced`: late older run 100 cannot
+        // overwrite newer run 200 or perturb its authorization, while unbinding 200 DOES revoke 200.
+        let hub = VideoEmbeddingHub::new();
+        let spec = VideoEmbeddingSpec {
+            embedding_dim: 4,
+            history_len: 1,
+            max_staleness_ms: 200,
+            max_window_span_ms: 400,
+            fps_staleness_budget_ms: None,
+            encoder_artifact_sha256: "a".repeat(64),
+            preprocess_config_sha256: "b".repeat(64),
+            embedding_norm: None,
+            on_stale: VisionStalePolicy::Hold,
+        };
+        assert!(hub.bind_policy_fenced(200, spec.clone(), 20.0, Some(auth.clone())));
+        let g_after_bind200 = auth.current();
+        assert!(
+            !hub.bind_policy_fenced(100, spec, 20.0, Some(auth.clone())),
+            "late older runner 100 must be refused by bind_policy_fenced"
+        );
+        assert_eq!(
+            auth.current(),
+            g_after_bind200,
+            "refused stale bind_policy_fenced(100) must not revoke active run 200"
+        );
+        hub.unbind_policy(200);
+        assert_ne!(
+            auth.current(),
+            g_after_bind200,
+            "unbinding active run 200 must revoke run 200's scoped authorization"
+        );
+    }
+
+    #[test]
+    fn policy_review_regression_qualification_pending_fence_and_immutable_outcomes() {
+        use crate::policy_runtime::manifest::StrictPolicyContract;
+        use crate::policy_runtime::qualification::QualificationRecord;
+        use crate::policy_runtime::release_gate::{ActiveDeploymentContext, ReleaseGate};
+        use crate::rt_core::requests::policy::{
+            PolicyQualificationCoordinator, PolicyTerminalOutcome,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = dir.path().join("qual.jsonl");
+        let sha = "c".repeat(64);
+        let cal = "d".repeat(64);
+        let cfg = ArmConfig::rebot_dm();
+        let pj = json!({
+            "format": "rebot-onnx-policy/v1",
+            "name": "qual_unit",
+            "unit_mode": "rad",
+            "action_dim": 7,
+            "action_space": "joint_positions",
+            "joint_names": ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6", "gripper"],
+            "model_file": "model.rmlp"
+        });
+        let contract = StrictPolicyContract::parse(&serde_json::to_vec(&pj).unwrap()).unwrap();
+        let ctx = ActiveDeploymentContext {
+            scene_id: "scene_1".into(),
+            tool_id: "tool_1".into(),
+            calibration_digest: cal.clone(),
+        };
+        let make_gate = |tier: &str| {
+            let raw = json!({
+                "schema_version": "rebot-release-gate/v1",
+                "authorization_tier": tier,
+                "policy_sha256": sha,
+                "scene_id": "scene_1",
+                "tool_id": "tool_1",
+                "profile_id": "rebot_dm",
+                "calibration_digest": cal,
+                "runner_config": {
+                    "fps": 20,
+                    "max_speed_scale": 0.25,
+                    "unit_mode": "rad",
+                    "action_space": "joint_positions"
+                },
+                "sim_eval": {
+                    "seeds_total": 10,
+                    "seeds_passed": 10,
+                    "min_success_rate": 0.8,
+                    "collisions": 0,
+                    "keepout_violations": 0
+                },
+                "prerequisites": {
+                    "calibration_verified": true,
+                    "power_cut_witnessed": true,
+                    "shadow_run_passed": true
+                }
+            });
+            ReleaseGate::parse_and_verify(&raw, &sha, &cfg, &contract, 20.0, &ctx)
+                .expect("verify gate")
+        };
+
+        let sup_gate = make_gate("supervised_first_run");
+        let prod_gate = make_gate("production_release");
+
+        let (mut tx, coord) = PolicyQualificationCoordinator::channel();
+        // Seed ledger with `MIN_SUPERVISED_PASSES` prior passing supervised records.
+        for aid in 1..=(crate::policy_runtime::qualification::MIN_SUPERVISED_PASSES as u64) {
+            let rec_pass = QualificationRecord::for_run(&sup_gate, aid, 5, "MAX_SECONDS", true);
+            coord
+                .append_and_release_pending(&ledger, &rec_pass, None)
+                .expect("append pass");
+        }
+        assert!(
+            coord.check_production_qualified_locked(&ledger, &prod_gate).is_ok(),
+            "prior passes qualify production release when no run is pending"
+        );
+
+        // Register a pending supervised run: MUST block `ProductionRelease` fail-closed!
+        let mut guard = coord.register_pending(11, &sup_gate);
+        let err = coord
+            .check_production_qualified_locked(&ledger, &prod_gate)
+            .expect_err("pending supervised run must block production release");
+        assert_eq!(
+            crate::api::rest::ApiError::from(err).code.as_deref(),
+            Some("QUALIFICATION_REQUIRED")
+        );
+
+        // Immutable owner terminal outcome ring records exact non-pass reason (`STOPPED`/`cancelled`).
+        tx.push(PolicyTerminalOutcome {
+            action_id: 11,
+            stop_reason: HolderLabel::new("STOPPED"),
+            action_state: HolderLabel::new("cancelled"),
+            steps: 3,
+            stats: PolicyStats::default(),
+        });
+        assert!(coord.take_terminal_outcome(999).is_none());
+        let out = coord
+            .take_terminal_outcome(11)
+            .expect("immutable outcome for action 11");
+        assert_eq!(out.stop_reason.as_str(), "STOPPED");
+        assert_eq!(out.action_state.as_str(), "cancelled");
+        assert_eq!(out.steps, 3);
+
+        // Atomically append the failed record and release the pending guard; latest record is now
+        // non-passing (`passed == false`), so `check_production_qualified_locked` STILL refuses!
+        let rec_fail = QualificationRecord::for_run(&sup_gate, 11, out.steps, out.stop_reason.as_str(), false);
+        coord
+            .append_and_release_pending(&ledger, &rec_fail, Some(&mut guard))
+            .expect("append fail");
+        assert!(!coord.has_pending_for(&prod_gate));
+        let err2 = coord
+            .check_production_qualified_locked(&ledger, &prod_gate)
+            .expect_err("failed latest supervised run must revoke production qualification");
+        assert_eq!(
+            crate::api::rest::ApiError::from(err2).code.as_deref(),
+            Some("QUALIFICATION_REQUIRED")
+        );
+    }
 }

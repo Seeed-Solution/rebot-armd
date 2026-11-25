@@ -848,7 +848,7 @@ impl crate::supervisor::SupervisorInner {
 
     /// Velocity ceiling (rad/s) currently authorized for joint `g` by the active motion,
     /// persistent gripper hold, fallback ramp, servo stream, or profile limit.
-    fn active_joint_velocity_ceiling(&self, g: usize) -> Option<f32> {
+    pub(crate) fn active_joint_velocity_ceiling(&self, g: usize) -> Option<f32> {
         #[cfg(feature = "policy-runtime")]
         let policy_scale = self
             .policy_run
@@ -896,7 +896,7 @@ impl crate::supervisor::SupervisorInner {
         Some(self.gripper_hold_vel_ceiling.map_or(ceiling, |hold_v| ceiling.min(hold_v)))
     }
 
-    fn write_output_slice(
+    pub(crate) fn write_output_slice(
         &mut self,
         targets: &mut [JointTarget],
         dt: f64,
