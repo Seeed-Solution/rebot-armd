@@ -2758,8 +2758,17 @@ impl crate::supervisor::SupervisorInner {
             }
         }
         // Fresh rest evidence: ALWAYS required for irreversible hardware commissioning writes
-        // (fail-closed; no relaxation for `force`).
-        if drv.rest_pose_gate_status() != crate::driver::RestPoseGateStatus::Confirmed {
+        // (fail-closed; no relaxation for `force`). During a multi-joint `MotorZeroWriteVerify`
+        // batch, once >=1 joint has already received `CMD_SET_ZERO` (whose raw position jumped
+        // to 0 while `ZeroOffsetDriver` intentionally keeps the old offsets until atomic swap),
+        // the initial rest-pose gate was already verified before TX #0 and every subsequent joint
+        // continues to enforce stationary velocity, disabled feedback, fault-free state, and live
+        // authority right before `can.transmit`.
+        let skip_rest_recheck_mid_zero_batch =
+            kind == CommissioningOpKind::MotorZeroWriteVerify && self.commissioning.zero_sent_mask != 0;
+        if !skip_rest_recheck_mid_zero_batch
+            && drv.rest_pose_gate_status() != crate::driver::RestPoseGateStatus::Confirmed
+        {
             return Err(if is_zero {
                 (409, "ARM_NOT_AT_RESTING_POSE", "hardware motor zero requires fresh confirmed rest-pose evidence")
             } else {
@@ -2770,6 +2779,7 @@ impl crate::supervisor::SupervisorInner {
     }
 
     /// Starts one tick-driven commissioning operation on the exclusive RT owner (zero alloc).
+    #[allow(clippy::result_large_err)]
     pub(crate) fn start_commissioning_rt(
         &mut self,
         req: CommissioningStartRequest,
@@ -3012,7 +3022,8 @@ impl crate::supervisor::SupervisorInner {
         }
 
         // Compute bounded release cutoff on driver clock, sharing Step 2's remaining RX budget.
-        let publish_margin = self.tx_release_publish_margin();
+        let total_span = release_deadline.saturating_duration_since(owner_now);
+        let publish_margin = self.tx_release_publish_margin().min(total_span / 2);
         let owner_cutoff = release_deadline
             .checked_sub(publish_margin)
             .unwrap_or(owner_now);
@@ -3155,6 +3166,7 @@ impl crate::supervisor::SupervisorInner {
     /// Drives one joint's 8-register identity read (`COMM_IDENTITY_RIDS`), sending ONE register
     /// read at a time with a fresh post-drain submission mark `(tx_seq, tx_started, tx_offset_ns)`
     /// per accepted request so a delayed reply from an earlier request or retry can NEVER match.
+    #[allow(clippy::result_large_err)]
     fn step_one_identity_read(
         &mut self,
         drv: &mut dyn crate::driver::ArmDriver,
@@ -3323,6 +3335,7 @@ impl crate::supervisor::SupervisorInner {
         }
     }
 
+    #[allow(clippy::result_large_err)]
     fn step_read_identity_with_drv(
         &mut self,
         drv: &mut dyn crate::driver::ArmDriver,
@@ -3351,6 +3364,7 @@ impl crate::supervisor::SupervisorInner {
             )? {
                 Some(ident) => {
                     self.commissioning.outcomes[idx].disposition = JointCommissioningDisposition::Applied;
+                    self.commissioning.outcomes[idx].before = Some(ident);
                     self.commissioning.outcomes[idx].readback = Some(ident);
                     self.commissioning.joint_idx += 1;
                 }
@@ -3361,6 +3375,7 @@ impl crate::supervisor::SupervisorInner {
         Ok(())
     }
 
+    #[allow(clippy::result_large_err)]
     fn step_write_timeout_with_drv(
         &mut self,
         drv: &mut dyn crate::driver::ArmDriver,
@@ -3640,6 +3655,7 @@ impl crate::supervisor::SupervisorInner {
         Ok(())
     }
 
+    #[allow(clippy::result_large_err)]
     fn step_motor_zero_disable_with_drv(
         &mut self,
         drv: &mut dyn crate::driver::ArmDriver,
@@ -3739,6 +3755,7 @@ impl crate::supervisor::SupervisorInner {
         Ok(())
     }
 
+    #[allow(clippy::result_large_err)]
     fn step_motor_zero_write_verify_with_drv(
         &mut self,
         drv: &mut dyn crate::driver::ArmDriver,

@@ -7686,22 +7686,45 @@ impl SupervisorInner {
                 out.bus_feedback_fresh = self.feedback_numeric_valid
                     && driver.feedback_all_within(self.config.dof, BUS_LOSS_TIMEOUT);
                 if driver.motor_status_into(&mut sc.status) {
+                    let rt_owned = self.rt_executor_owned;
                     let changed = sc.status.len() != self.motor_errors.len()
-                        || sc.status.iter().zip(&self.motor_errors).any(|(code, e)| {
+                        || sc.status.iter().zip(&self.motor_errors).any(|(&code, e)| {
                             let decoded = e.as_ref().map(|e| e.code);
-                            decoded != Some(*code) && !(decoded.is_none() && driver.decode_motor_error(*code).is_none())
+                            let has_name = driver.decode_motor_error_static(code).is_some()
+                                || (!rt_owned && driver.decode_motor_error(code).is_some());
+                            decoded != Some(code) && !(decoded.is_none() && !has_name)
                         });
                     if changed {
-                        new_motor_errors = Some(
-                            sc.status
-                                .iter()
-                                .map(|&code| {
-                                    driver
-                                        .decode_motor_error(code)
-                                        .map(|name| crate::model::MotorError { code, name })
-                                })
-                                .collect(),
-                        );
+                        if rt_owned {
+                            // Zero-alloc in-place update on `armd-control` using pre-reserved
+                            // `self.motor_errors` capacity and static fault names.
+                            self.motor_errors.resize_with(sc.status.len(), || None);
+                            for (slot, &code) in self.motor_errors.iter_mut().zip(sc.status.iter()) {
+                                *slot = driver.decode_motor_error_static(code).map(|name| {
+                                    crate::model::MotorError {
+                                        code,
+                                        name: std::borrow::Cow::Borrowed(name),
+                                    }
+                                });
+                            }
+                        } else {
+                            new_motor_errors = Some(
+                                sc.status
+                                    .iter()
+                                    .map(|&code| {
+                                        driver
+                                            .decode_motor_error_static(code)
+                                            .map(std::borrow::Cow::Borrowed)
+                                            .or_else(|| {
+                                                driver
+                                                    .decode_motor_error(code)
+                                                    .map(std::borrow::Cow::Owned)
+                                            })
+                                            .map(|name| crate::model::MotorError { code, name })
+                                    })
+                                    .collect(),
+                            );
+                        }
                     }
                 }
                 if self.is_torqued

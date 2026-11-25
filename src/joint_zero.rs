@@ -433,6 +433,9 @@ impl ArmDriver for ZeroOffsetDriver {
     fn motor_status(&self) -> Option<Vec<u8>> { self.inner.motor_status() }
     fn joint_loads(&self) -> Option<Vec<f32>> { self.inner.joint_loads() }
     fn decode_motor_error(&self, code: u8) -> Option<String> { self.inner.decode_motor_error(code) }
+    fn decode_motor_error_static(&self, code: u8) -> Option<&'static str> {
+        self.inner.decode_motor_error_static(code)
+    }
     fn set_torque_flag(&mut self, enabled: bool) { self.inner.set_torque_flag(enabled) }
     fn set_pending_rearm(&mut self, pending: bool) { self.inner.set_pending_rearm(pending) }
     fn supports_mit_mode_switch(&self) -> bool { self.inner.supports_mit_mode_switch() }

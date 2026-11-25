@@ -1161,6 +1161,7 @@ impl SupervisorInner {
 
     /// Probes driver limits for candidate `new_offsets` BEFORE mutating `ZeroOffsetDriver`
     /// (zero heap allocations).
+    #[allow(clippy::result_large_err)]
     pub(crate) fn probe_driver_limits_for_offsets_bounded(
         &self,
         new_offsets: &[f32],
@@ -1168,6 +1169,7 @@ impl SupervisorInner {
         self.probe_driver_limits_with_offset_shift_bounded(Some(new_offsets))
     }
 
+    #[allow(clippy::result_large_err)]
     fn probe_driver_limits_with_offset_shift_bounded(
         &self,
         candidate_offsets: Option<&[f32]>,

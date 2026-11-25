@@ -1712,6 +1712,11 @@ pub trait ArmDriver: Send {
         damiao_fault_name(code).map(str::to_string)
     }
 
+    /// Zero-allocation static motor fault name for the RT control thread.
+    fn decode_motor_error_static(&self, code: u8) -> Option<&'static str> {
+        damiao_fault_name(code)
+    }
+
     /// Update internal software enabled flag without transmitting physical frames
     fn set_torque_flag(&mut self, _enabled: bool) {}
 
@@ -5135,6 +5140,10 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
 
     fn decode_motor_error(&self, code: u8) -> Option<String> {
         feetech::feetech_error_name(code)
+    }
+
+    fn decode_motor_error_static(&self, _code: u8) -> Option<&'static str> {
+        None
     }
 
     fn check_hardware_status(&self) -> Result<(), ArmDriverError> {

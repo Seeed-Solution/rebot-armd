@@ -362,7 +362,7 @@ async fn motor_error_codes_are_published_per_joint() {
     arm.lock().unwrap().status[2] = 0xA;
     let obs = tick(&supervisor).await;
     let e = obs.motor_errors[2].clone().expect("J3 error");
-    assert_eq!((e.code, e.name.as_str()), (0xA, "Overcurrent"));
+    assert_eq!((e.code, e.name.as_ref()), (0xA, "Overcurrent"));
     assert!(obs.motor_errors.iter().enumerate().all(|(i, e)| i == 2 || e.is_none()));
     let json = serde_json::to_value(&obs).unwrap();
     assert_eq!(json["motor_errors"][2]["name"], "Overcurrent");

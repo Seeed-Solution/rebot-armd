@@ -4006,7 +4006,7 @@ crate::fieldwise_clone!(GripperZeroObservation { state, j7, offset_rad });
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MotorError {
     pub code: u8,
-    pub name: String,
+    pub name: std::borrow::Cow<'static, str>,
 }
 
 crate::fieldwise_clone!(MotorError { code, name });
