@@ -9944,7 +9944,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                                 wk,
                                 crate::torque::WriteKind::DisableRequested
                             ) && outcome == crate::torque::MotorWriteOutcome::Deferred
-                                && self.pending_disable_shadow.is_some();
+                                && (self.pending_disable_shadow.is_some()
+                                    || self.disable_dispatched_mask != 0);
                             if !paused_mid_multitick {
                                 let mut outcomes = [crate::torque::MotorWriteOutcome::NotTargeted;
                                     crate::torque::MAX_CHANNELS];
@@ -14796,8 +14797,12 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         && skip_dispatched
                         && (sent_any || self.disable_dispatched_mask != 0)
                     {
+                        let moved_joint = match self.evaluate_remaining_arm_joints_rest() {
+                            RemainingRestStatus::MovedBeyondRest { joint } => joint,
+                            _ => idx,
+                        };
                         abort_reason = Some(PartialDisableReason::MotionBeyondRest {
-                            joint: idx.min(u8::MAX as usize) as u8,
+                            joint: moved_joint.min(u8::MAX as usize) as u8,
                         });
                         break;
                     }
@@ -15465,8 +15470,12 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         break;
                     }
                     Err(TxRefusal::TorqueOffWouldDrop) => {
+                        let moved_joint = match self.evaluate_remaining_arm_joints_rest() {
+                            RemainingRestStatus::MovedBeyondRest { joint } => joint,
+                            _ => idx,
+                        };
                         abort_reason = Some(PartialDisableReason::MotionBeyondRest {
-                            joint: idx.min(u8::MAX as usize) as u8,
+                            joint: moved_joint.min(u8::MAX as usize) as u8,
                         });
                         break;
                     }

@@ -20,7 +20,7 @@ use armd::protocol::damiao::{self, DamiaoLimits};
 use armd::rt_core::broker::{
     BootId, Capacities, ClientId, Outcome, Reply, Submit, TransitionOp,
 };
-use armd::rt_core::ops::{CoreOps, ReleaseFixture, ServiceBudget};
+use armd::rt_core::ops::{CoreOps, ReleaseFixture};
 use armd::rt_core::requests::lease::{OwnerAuthPolicy, TorqueWsOutcome};
 use armd::safety::StopPolicy;
 use armd::transport::{
@@ -31,7 +31,6 @@ use armd::{ArmConfig, ArmSupervisor, SafetyState, SupervisorInner, TorqueIntent}
 const BOOT: BootId = BootId(0xB601_0001);
 const RELEASE_PERIOD: Duration = Duration::from_millis(20);
 const SG2002_TX_COST: Duration = Duration::from_micros(500);
-const STEP_WINDOW: Duration = Duration::from_millis(1);
 
 #[derive(Clone, Copy)]
 struct SgMotor {
@@ -646,9 +645,10 @@ async fn sg2002_multitick_7motor_rest_disable_succeeds_and_shadow_zero_divergenc
         shadow_diag.unexplained_divergences_total,
     );
 
-    // Part B: RT Executor / Broker path with REAL 1 ms ServiceBudget deadline on Step 2
-    // (0.5 ms/frame TX -> J1+J2 hit 1 ms DeadlinePassed, Step 5 uses full 20 ms tick budget to
-    // hold J3..J7) + torque shadow ENABLED.
+    // Part B: RT Executor / Broker path driven end-to-end via `ReleaseFixture::step_with_clock`
+    // with SG2002 0.5 ms/frame TX, 1–3 ms replies, 1 ms disable burst window (2 disables/tick),
+    // normal 20 ms tick budget for holds, torque shadow ENABLED, and verified single Broker
+    // `Reply::Terminal { outcome: Outcome::Completed }`.
     {
         let rt_clock = Arc::new(MockClock::new());
         let rt_bus = Sg2002Bus::new(rt_clock.clone(), Duration::ZERO);
@@ -670,7 +670,7 @@ async fn sg2002_multitick_7motor_rest_disable_succeeds_and_shadow_zero_divergenc
         );
         // Baseline feedback tick so shadow sees fresh feedback before TorqueOn.
         rt_bus.with(|s| s.push_all_feedback_now());
-        let _ = fx.step();
+        let _ = fx.step_with_clock(|| rt_clock.now());
         // Arm the arm.
         let auth = fx.core.authority(&fx.ctx(fx.now()));
         b.submit(
@@ -681,33 +681,38 @@ async fn sg2002_multitick_7motor_rest_disable_succeeds_and_shadow_zero_divergenc
             Submit::Transition(TransitionOp::TorqueOn),
         )
         .unwrap();
-        assert!(fx.step().command.unwrap().1.is_ok());
+        assert!(fx.step_with_clock(|| rt_clock.now()).command.unwrap().1.is_ok());
         for _ in 0..15 {
             rt_clock.advance(RELEASE_PERIOD);
             rt_bus.with(|s| s.push_all_feedback_now());
-            let r = fx.step();
+            let r = fx.step_with_clock(|| rt_clock.now());
             if let Some((_, Outcome::Completed)) = r.transition_ended {
                 break;
             }
         }
         assert!(fx.core.is_torqued);
+        // Drain TorqueOn replies before submitting TorqueOff.
+        b.poll(|_, _| true);
 
-        // Switch bus to SG2002 0.5 ms/frame (NO artificial WouldBlock — pure 1 ms ServiceBudget!).
+        // Switch bus to SG2002 0.5 ms/frame + 2 disable frames/tick (1 ms disable burst window)
+        // while leaving the normal 20 ms tick budget for holds on remaining joints.
         rt_bus.with(|s| {
             s.tx_step = SG2002_TX_COST;
-            s.max_disables_per_tick = None;
+            s.max_disables_per_tick = Some(2);
+            s.disables_this_tick = 0;
         });
         rt_bus.clear_log();
 
         let auth2 = fx.core.authority(&fx.ctx(fx.now()));
-        b.submit(
-            ClientId(1),
-            2,
-            auth2,
-            fx.now() + Duration::from_secs(5),
-            Submit::Transition(TransitionOp::TorqueOff),
-        )
-        .unwrap();
+        let req_id = b
+            .submit(
+                ClientId(1),
+                2,
+                auth2,
+                fx.now() + Duration::from_secs(5),
+                Submit::Transition(TransitionOp::TorqueOff),
+            )
+            .unwrap();
 
         let mut rt_ended = None;
         let mut rt_ticks = 0usize;
@@ -715,40 +720,17 @@ async fn sg2002_multitick_7motor_rest_disable_succeeds_and_shadow_zero_divergenc
         let mut rt_per_tick: Vec<(usize, Vec<usize>)> = Vec::new();
         let mut rt_seen = [false; 7];
         let mut rt_partial_hold_ticks = 0usize;
+        let mut prev_dispatched_mask = 0u64;
 
         for tick in 1..=40 {
+            rt_bus.begin_tick();
             rt_clock.advance(RELEASE_PERIOD);
-            let tick_now = rt_clock.now();
             let log_before = rt_bus.tx_log().len();
 
-            // Drive Step 2 with an explicit 1 ms ServiceBudget (2 frames at 0.5 ms/frame) while
-            // Step 5 has the full 20 ms release deadline to hold all still-enabled joints!
-            let step2_budget = ServiceBudget {
-                now: tick_now,
-                deadline: tick_now + STEP_WINDOW,
-                max_rx_frames: 64,
-            };
-            let release_dl = tick_now + RELEASE_PERIOD;
-            let mut now_fn = || rt_clock.now();
-            let poll = fx.core.poll_hardware_for_release_with_clock(
-                &step2_budget,
-                release_dl,
-                &mut now_fn,
-            );
-            let rep = if tick == 1 {
-                // First tick commits the broker's TorqueOff command (establishing AwaitRestGate).
-                fx.step()
-            } else {
-                let mut now_fn2 = || rt_clock.now();
-                fx.core.tick_control_with_clock(0.02, &mut now_fn2, release_dl);
-                if let Some(res) = poll.torque {
-                    if let Ok(armd::rt_core::ops::TorqueProgress::Done) = res {
-                        rt_ended = Some(Outcome::Completed);
-                    }
-                }
-                armd::rt_core::ops::ReleaseReport::default()
-            };
-            let _ = rep;
+            let rep = fx.step_with_clock(|| rt_clock.now());
+            if let Some((_, o)) = rep.transition_ended {
+                rt_ended = Some(o);
+            }
 
             let (drv_enable_state, dispatched_mask) = {
                 let drv = fx.core.driver.as_ref().unwrap().read().unwrap();
@@ -776,17 +758,39 @@ async fn sg2002_multitick_7motor_rest_disable_succeeds_and_shadow_zero_divergenc
                     "RT tick {tick}: enable_state must not be Disabled while partial"
                 );
                 for j in 0..7 {
-                    let held = slice
-                        .iter()
-                        .any(|r| is_hold_frame_for_motor(&r.frame, (j + 1) as u16));
-                    if (dispatched_mask & (1u64 << j)) != 0 {
-                        assert!(!held, "RT tick {tick}: disabled J{} must not get holds", j + 1);
+                    let mid = (j + 1) as u16;
+                    if (prev_dispatched_mask & (1u64 << j)) != 0 {
+                        // Already disabled before this release -> ZERO hold frames in this release.
+                        assert!(
+                            !slice.iter().any(|r| is_hold_frame_for_motor(&r.frame, mid)),
+                            "RT tick {tick}: already-disabled J{} must not get holds",
+                            j + 1
+                        );
+                    } else if (dispatched_mask & (1u64 << j)) != 0 {
+                        // Newly disabled during this release (e.g. on sub-release wake after Step 5)
+                        // -> ZERO hold frames AFTER its CMD_DISABLE frame.
+                        if let Some(d_pos) =
+                            slice.iter().position(|r| is_disable_frame_for_motor(&r.frame, mid))
+                        {
+                            assert!(
+                                !slice[d_pos + 1..]
+                                    .iter()
+                                    .any(|r| is_hold_frame_for_motor(&r.frame, mid)),
+                                "RT tick {tick}: newly-disabled J{} must not get holds after CMD_DISABLE",
+                                j + 1
+                            );
+                        }
                     } else {
-                        assert!(held, "RT tick {tick}: enabled J{} must get holds", j + 1);
+                        assert!(
+                            slice.iter().any(|r| is_hold_frame_for_motor(&r.frame, mid)),
+                            "RT tick {tick}: still-enabled J{} must get holds",
+                            j + 1
+                        );
                     }
                 }
                 rt_partial_hold_ticks += 1;
             }
+            prev_dispatched_mask = dispatched_mask;
 
             rt_ticks = tick;
             if rt_ended.is_some() {
@@ -797,7 +801,7 @@ async fn sg2002_multitick_7motor_rest_disable_succeeds_and_shadow_zero_divergenc
         assert_eq!(
             rt_per_tick.len(),
             4,
-            "RT 1 ms ServiceBudget must dispatch 7 motors across 4 ticks: {rt_per_tick:?}"
+            "RT multi-tick disable must dispatch 7 motors across 4 ticks: {rt_per_tick:?}"
         );
         assert_eq!(rt_partial_hold_ticks, 3);
         assert_eq!(rt_order, vec![1, 2, 3, 4, 5, 6, 7]);
@@ -807,6 +811,25 @@ async fn sg2002_multitick_7motor_rest_disable_succeeds_and_shadow_zero_divergenc
             fx.core.driver.as_ref().unwrap().read().unwrap().enable_state(),
             EnableState::Disabled
         );
+        let mut replies = Vec::new();
+        b.poll(|_, r: Reply| {
+            replies.push(r);
+            true
+        });
+        let terminals: Vec<_> = replies
+            .iter()
+            .filter(|r| matches!(r, Reply::Terminal { request, .. } if *request == req_id))
+            .collect();
+        assert_eq!(
+            terminals.len(),
+            1,
+            "RT client must see exactly one terminal reply for TorqueOff: {replies:?}"
+        );
+        assert!(
+            matches!(terminals[0], Reply::Terminal { outcome: Outcome::Completed, .. }),
+            "RT terminal reply must be Outcome::Completed: {:?}",
+            terminals[0]
+        );
         fx.core.test_flush_and_drain_torque_shadow();
         let rt_diag = fx.core.torque_shadow_diagnostics();
         assert_eq!(
@@ -815,20 +838,17 @@ async fn sg2002_multitick_7motor_rest_disable_succeeds_and_shadow_zero_divergenc
             rt_diag.recent_divergences
         );
         println!(
-            "[SG2002-MULTITICK-RT] ticks_used={} initial_dispatch_ticks={:?} disable_order={:?} partial_hold_ticks={} final_is_torqued={} final_enable_state={:?} shadow_comparisons={} shadow_divergences={}",
+            "[SG2002-MULTITICK-RT] ticks_used={} initial_dispatch_ticks={:?} disable_order={:?} partial_hold_ticks={} final_is_torqued={} final_enable_state={:?} broker_terminals={} shadow_comparisons={} shadow_divergences={}",
             rt_ticks,
             rt_per_tick,
             rt_order,
             rt_partial_hold_ticks,
             fx.core.is_torqued,
             fx.core.driver.as_ref().unwrap().read().unwrap().enable_state(),
+            terminals.len(),
             rt_diag.comparisons_total,
             rt_diag.unexplained_divergences_total,
         );
-        let _ = b.poll(|_, r: Reply| {
-            let _ = r;
-            true
-        });
     }
 }
 
