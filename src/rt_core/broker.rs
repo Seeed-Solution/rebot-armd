@@ -967,6 +967,20 @@ impl<P> Broker<P> {
         Ok(request)
     }
 
+    /// Disposes all remaining pending broker reservations and queued replies/commands strictly
+    /// AFTER the RT producer thread (`armd-control`) has exited and been joined.
+    ///
+    /// Never call while `armd-control` is still running (e.g. if emergency teardown detached a
+    /// stalled RT thread).
+    pub fn discard_stopped_after_rt_exit(&mut self) {
+        self.stashed_reply = None;
+        while self.replies.pop().is_ok() {}
+        self.pending.clear();
+        self.disconnected.clear();
+        self.reserved = 0;
+        self.plans.reclaim();
+    }
+
     /// Drains the RT's replies in exact global FIFO order with bounded backpressure: when
     /// `deliver` returns [`DeliveryDecision::Backpressured`], the reply is stashed in the broker
     /// with its reservation intact and polling stops until the caller retries. Returns the
@@ -982,12 +996,12 @@ impl<P> Broker<P> {
                 },
             };
             let request = reply.request();
-            let Some((client, expected)) = self.pending.get(&request).map(|p| {
+            let Some((client, expected, p_ack, p_terminal)) = self.pending.get(&request).map(|p| {
                 let expected = match reply {
                     Reply::Ack { .. } | Reply::Lease { .. } | Reply::Refused { .. } => p.ack,
                     Reply::Terminal { .. } => p.terminal && !p.ack,
                 };
-                (p.client, expected)
+                (p.client, expected, p.ack, p.terminal)
             }) else {
                 n += 1;
                 self.stats.unexpected += 1;
@@ -996,6 +1010,27 @@ impl<P> Broker<P> {
             if !expected {
                 n += 1;
                 self.stats.unexpected += 1;
+                // Early terminal before ACK: recover both broker and router credits cleanly by
+                // removing the broken pending entry and notifying the router with PROTOCOL_ERROR.
+                if matches!(reply, Reply::Terminal { .. }) && p_ack {
+                    let release = usize::from(p_ack) + usize::from(p_terminal);
+                    self.reserved = self.reserved.saturating_sub(release);
+                    self.pending.remove(&request);
+                    if !self.disconnected.contains(&client) {
+                        let _ = deliver(
+                            client,
+                            Reply::Refused {
+                                request,
+                                code: "PROTOCOL_ERROR",
+                            },
+                        );
+                    }
+                    if self.disconnected.contains(&client)
+                        && !self.pending.values().any(|p| p.client == client)
+                    {
+                        self.disconnected.remove(&client);
+                    }
+                }
                 continue;
             }
             let decision = if self.disconnected.contains(&client) {
@@ -1011,6 +1046,14 @@ impl<P> Broker<P> {
             let done = {
                 let p = self.pending.get_mut(&request).expect("checked above");
                 match reply {
+                    Reply::Ack { action: None, .. } | Reply::Lease { .. } if p.terminal => {
+                        // Malformed ACK/Lease for an action-starting command cannot produce a
+                        // valid ActionId terminal: release BOTH ACK and terminal credits now.
+                        self.stats.unexpected += 1;
+                        p.ack = false;
+                        p.terminal = false;
+                        self.reserved = self.reserved.saturating_sub(2);
+                    }
                     Reply::Ack { .. } | Reply::Lease { .. } => {
                         self.stats.acked += 1;
                         p.ack = false;

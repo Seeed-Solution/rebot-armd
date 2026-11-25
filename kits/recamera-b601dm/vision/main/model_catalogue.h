@@ -4,6 +4,7 @@
 #ifndef REBOT_VISION_MODEL_CATALOGUE_H_
 #define REBOT_VISION_MODEL_CATALOGUE_H_
 
+#include <cstdint>
 #include <functional>
 #include <optional>
 #include <string>
@@ -79,12 +80,43 @@ bool valid_model_name(const std::string& name);
  */
 void parse_catalogue(const std::string& config, Catalogue& out, std::vector<std::string>& warnings);
 
+/** One row of models.tsv (single source of truth for model roles, files, md5 and ION). */
+struct ManifestEntry {
+    std::string role;
+    std::string file;
+    std::string md5;
+    uint64_t size = 0;
+    double ion_mb = 0;
+    std::string url;
+    std::string ship;
+};
+
+/** Default on-device path to models.tsv installed by the rebot-teleop package. */
+inline constexpr const char* kDefaultManifestPath = "/usr/share/rebot-teleop/models/models.tsv";
+
+/** Parse tab-separated models.tsv content (comments '#' and empty lines skipped). */
+std::vector<ManifestEntry> parse_manifest(const std::string& tsv_text);
+
+/** Compiled-in mirror of kits/recamera-b601dm/vision/models/models.tsv. */
+std::vector<ManifestEntry> builtin_manifest();
+
+/** Load models.tsv from `path`; falls back to builtin_manifest() when missing or empty. */
+std::vector<ManifestEntry> load_manifest_or_builtin(const std::string& path = kDefaultManifestPath);
+
+/** Default startup YOLO search paths ordered by manifest roles (detector-segment first). */
+std::vector<std::string> default_detector_candidates(const std::vector<ManifestEntry>& manifest);
+
+/** Default startup depth search paths ordered by manifest role `depth`. */
+std::vector<std::string> default_depth_candidates(const std::vector<ManifestEntry>& manifest);
+
 /**
- * The built-in catalogue, used when vision.json has no `models` key: the reCamera OS detect and
- * segment models and the models of models/models.tsv, each at the first of its paths that
- * `exists`, named by file stem (the name a startup model without a catalogue gets). Measured
- * ion_mb (docs/detection_api.md "Model switching"); the OBB entry carries the DOTAv1 class names.
+ * The built-in catalogue, used when vision.json has no `models` key: driven from `manifest`
+ * (models/models.tsv), searching /userdata/local/models, /userdata/rebot-teleop/models,
+ * /usr/share/rebot-teleop/models (and /usr/share/supervisor/models first for OS models).
+ * Each entry is named by file stem; OBB carries DOTAv1 class names.
  */
+void add_default_models(Catalogue& cat, const std::function<bool(const std::string&)>& exists,
+                        const std::vector<ManifestEntry>& manifest);
 void add_default_models(Catalogue& cat, const std::function<bool(const std::string&)>& exists);
 
 struct BudgetCheck {

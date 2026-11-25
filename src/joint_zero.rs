@@ -360,6 +360,9 @@ impl ArmDriver for ZeroOffsetDriver {
     fn supports_budgeted_disable_await(&self) -> bool {
         self.inner.supports_budgeted_disable_await()
     }
+    fn set_enable_authority(&mut self, deadline: Option<Instant>, expected_lease_gen: Option<u64>) {
+        self.inner.set_enable_authority(deadline, expected_lease_gen)
+    }
     fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool { self.inner.feedback_all_within(dof, max_age) }
     fn feedback_joints_within(&self, joints: &[usize], max_age: Duration) -> bool { self.inner.feedback_joints_within(joints, max_age) }
     fn fresh_joint_positions_into(&self, joints: &[usize], max_age: Duration, out: &mut [f32]) -> bool {
@@ -397,6 +400,9 @@ impl ArmDriver for ZeroOffsetDriver {
     fn begin_torque_budgeted(&mut self, enabled: bool, max_rx_frames: u16) -> Result<crate::driver::TorqueProgress, ArmDriverError> {
         self.inner.begin_torque_budgeted(enabled, max_rx_frames)
     }
+    fn begin_torque_budgeted_with_range_retry(&mut self, enabled: bool, max_rx_frames: u16) -> Result<crate::driver::TorqueProgress, ArmDriverError> {
+        self.inner.begin_torque_budgeted_with_range_retry(enabled, max_rx_frames)
+    }
     fn begin_disable_torque_budgeted(&mut self, kind: DisableKind, max_rx_frames: u16) -> Result<crate::driver::TorqueProgress, ArmDriverError> {
         self.inner.begin_disable_torque_budgeted(kind, max_rx_frames)
     }
@@ -427,6 +433,8 @@ impl ArmDriver for ZeroOffsetDriver {
     fn finish_dispatched_disable(&mut self) -> Result<(), ArmDriverError> { self.inner.finish_dispatched_disable() }
     fn abort_enable(&mut self) { self.inner.abort_enable() }
     fn prepare_safe_hold(&mut self) { self.inner.prepare_safe_hold() }
+    fn enable_frames_dispatched(&self) -> bool { self.inner.enable_frames_dispatched() }
+    fn abort_pending_disable(&mut self) -> bool { self.inner.abort_pending_disable() }
     fn panic_disable_step(&mut self, first: bool, deadline: Instant) -> Option<Result<Vec<usize>, ArmDriverError>> {
         self.inner.panic_disable_step(first, deadline)
     }
@@ -513,6 +521,35 @@ impl ArmDriver for ZeroOffsetDriver {
     fn begin_control_release(&mut self, release_seq: u64) { self.inner.begin_control_release(release_seq) }
     fn driver_clock(&self) -> Option<std::sync::Arc<dyn crate::transport::DriverClock>> {
         self.inner.driver_clock()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    fn shadow_vendor_kind(&self) -> crate::torque::VendorKind {
+        self.inner.shadow_vendor_kind()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    fn set_shadow_enabled(&mut self, enabled: bool) {
+        self.inner.set_shadow_enabled(enabled);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    fn drain_shadow_observations(
+        &mut self,
+        out: &mut [Option<crate::torque::shadow::ShadowDriverObs>],
+    ) -> (usize, u64) {
+        let (count, dropped) = self.inner.drain_shadow_observations(out);
+        for slot in out.iter_mut().take(count) {
+            if let Some(crate::torque::shadow::ShadowDriverObs::CausalSample {
+                channel,
+                position_rad,
+                ..
+            }) = slot
+            {
+                let o = self.off(usize::from(*channel));
+                if o != 0.0 {
+                    *position_rad -= o;
+                }
+            }
+        }
+        (count, dropped)
     }
     fn mit_expiry_recover(&mut self) -> Result<(), String> { self.inner.mit_expiry_recover() }
     fn mit_fresh_status(&mut self) -> Result<Vec<u8>, String> { self.inner.mit_fresh_status() }

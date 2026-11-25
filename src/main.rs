@@ -175,11 +175,19 @@ fn start_blackbox(supervisor: &ArmSupervisor, cli_dir: Option<&str>, system: &ar
         .and_then(|rec| diagnostics::blackbox::open(&dir, rec.boot, started).map(|bb| (rec, bb)));
     match result {
         Ok((rec, bb)) => {
+            #[cfg(not(target_arch = "wasm32"))]
+            let bb = bb.with_shadow_atomics(supervisor.torque_shadow_overflow_atomics());
             info!("Previous start: {}", diagnostics::boot::summary(&rec));
             info!("Black box recording to {} (boot {})", dir.display(), rec.boot);
             if let Err(e) = diagnostics::blackbox::spawn_recorder(supervisor, bb) {
                 warn!("Black box off: {e}");
                 return;
+            }
+            // Start decoupled shadow blackbox AFTER primary recorder is live; file open happens
+            // inside the `"armd-shadow-bb"` thread so shadow disk I/O never gates primary startup.
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Err(e) = supervisor.torque_shadow_hub().attach_blackbox_dir(&dir, rec.boot, started) {
+                warn!("Torque shadow blackbox {} unavailable ({e})", dir.display());
             }
             DiagnosticsState::set_global(DiagnosticsState { blackbox_dir: Some(dir), boot: rec.boot });
         }
@@ -452,6 +460,10 @@ where
                 after_legacy_commit_before_abort().await;
                 server_handle.abort();
                 supervisor.signal_legacy_stop(&control_stop);
+                #[cfg(not(target_arch = "wasm32"))]
+                supervisor
+                    .torque_shadow_hub()
+                    .stop_and_flush_bounded(Duration::from_millis(100));
                 info!("armd stopped after shutdown readiness confirmation");
                 return Ok(());
             }
@@ -459,6 +471,10 @@ where
     }
 
     server_handle.abort();
+    #[cfg(not(target_arch = "wasm32"))]
+    supervisor
+        .torque_shadow_hub()
+        .stop_and_flush_bounded(Duration::from_millis(100));
     info!("armd stopped after shutdown readiness confirmation");
     Ok(())
 }
@@ -526,7 +542,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rt_owner = armd::rt_core::executor::RtOwner::from_env()?;
     armd::rt_core::executor::validate_startup_owner(rt_owner, follower)?;
     let config = resolve_follower_config(follower, cli.config.as_deref())?;
-    let config = apply_cli_tool(config, cli.tool.as_deref())?;
+    let mut config = apply_cli_tool(config, cli.tool.as_deref())?;
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let shadow_env = std::env::var(armd::torque::shadow::ENV_TORQUE_SHADOW).ok();
+        config.torque_shadow_enabled = armd::torque::shadow::resolve_shadow_enabled(
+            config.torque_shadow_enabled,
+            shadow_env.as_deref(),
+        )?;
+    }
     config.validate_step1_driver_parity(follower)?;
     if follower == "mock" && cli.follower_port.is_some() {
         return Err("--follower-port requires a hardware follower".into());

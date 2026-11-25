@@ -31,6 +31,8 @@ pub mod executor;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod safe_hold;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod reply_router;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod record_ring;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod sched;

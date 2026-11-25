@@ -1207,3 +1207,98 @@ async fn atomic_startup_activation_and_commit_shutdown_expiry_and_release_unwind
     thread::spawn(move || flag2.store(true, Ordering::Release));
     wait_until(Duration::from_secs(1), "flag set", || flag.load(Ordering::Acquire));
 }
+
+// ============================================================================
+// 8. Integration: SAFE-HOLD and handback emit & flush torque shadow events
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn safe_hold_and_handback_emit_and_flush_torque_shadow() {
+    let raised = [0.40, -0.30, 0.50, 0.20, -0.20, 0.10, -1.20];
+
+    // (a) Energized handback flushes torque shadow and restores ShadowOwner::Legacy.
+    {
+        let (sup, bus) = make_energized_dm_supervisor(raised, None, false);
+        sup.set_lease_enabled(false).await;
+        sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
+        let cfg = ExecutorConfig::for_tests(Duration::from_millis(5));
+        let _handle = sup.start_executor(cfg).await.unwrap();
+        wait_until_async(Duration::from_secs(2), "shadow worker sees Executor owner", || {
+            sup.torque_shadow_hub().drain_now();
+            let d = sup.torque_shadow_diagnostics();
+            d.enabled && d.owner == armd::torque::shadow::ShadowOwner::Executor && d.events_processed > 0
+        })
+        .await;
+        let before_hb = sup.torque_shadow_diagnostics().events_processed;
+
+        let (legacy_stop, legacy_jh) = sup
+            .handback_to_legacy_with_live_loop(Duration::from_secs(2), Duration::from_millis(5))
+            .await
+            .expect("energized handback must succeed");
+        sup.torque_shadow_hub().drain_now();
+        let after_hb = sup.torque_shadow_diagnostics();
+        assert_eq!(
+            after_hb.owner,
+            armd::torque::shadow::ShadowOwner::Legacy,
+            "handback must restore shadow owner to Legacy"
+        );
+        assert!(
+            after_hb.events_processed >= before_hb,
+            "handback must flush shadow events without resetting session counter"
+        );
+        assert!(
+            bus.with(|s| s.motors.iter().all(|m| m.enabled)),
+            "handback away from rest must never disable torque"
+        );
+        sup.signal_legacy_stop(&legacy_stop);
+        let _ = legacy_jh.join();
+    }
+
+    // (b) Control-thread panic into SAFE-HOLD emits shadow events and flushes on ProcessExit.
+    {
+        let (sup, bus) = make_energized_dm_supervisor(raised, None, false);
+        sup.set_lease_enabled(false).await;
+        sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
+        let mut cfg = ExecutorConfig::for_tests(Duration::from_millis(5));
+        cfg.panic_policy = PanicPolicy::StopExecutor;
+        let handle = sup
+            .start_executor_with_hooks(
+                cfg,
+                PersistTestHooks {
+                    panic_on_release: Some(2),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        wait_until_async(Duration::from_secs(2), "executor entered SAFE-HOLD", || {
+            handle.is_in_safe_hold() && handle.safe_hold_control().ticks() >= 4
+        })
+        .await;
+        sup.torque_shadow_hub().drain_now();
+        let in_sh_1 = sup.torque_shadow_diagnostics().events_processed;
+        assert!(in_sh_1 > 0, "SAFE-HOLD must emit and flush shadow events");
+        let ticks_1 = handle.safe_hold_control().ticks();
+        wait_until_async(Duration::from_secs(2), "SAFE-HOLD advances shadow events", || {
+            sup.torque_shadow_hub().drain_now();
+            handle.safe_hold_control().ticks() >= ticks_1 + 3
+                && sup.torque_shadow_diagnostics().events_processed > in_sh_1
+        })
+        .await;
+        assert!(
+            bus.with(|s| s.motors.iter().all(|m| m.enabled)),
+            "SAFE-HOLD away from rest must never disable torque before ProcessExit"
+        );
+        let in_sh_2 = sup.torque_shadow_diagnostics().events_processed;
+        let outcome = sup
+            .emergency_process_exit_disable_until(Instant::now() + Duration::from_secs(2))
+            .await;
+        assert_eq!(outcome, PanicDisableOutcome::Confirmed);
+        sup.torque_shadow_hub().drain_now();
+        let after_exit = sup.torque_shadow_diagnostics();
+        assert!(
+            after_exit.events_processed > in_sh_2,
+            "ProcessExit disable must emit and flush shadow events"
+        );
+    }
+}

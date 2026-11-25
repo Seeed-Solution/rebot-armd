@@ -16,6 +16,9 @@ set -euo pipefail
 #                      scripts/build_vision.sh (see that script for the paths)
 #                      REBOT_SDK_DIR=<rebot-companion checkout>: its rebot/ Python
 #                      package goes to /usr/share/rebot-teleop/python (required)
+#                      REBOT_MODELS_DIR=<cache dir>: local cache for bundled vision
+#                      models from models.tsv (default: target/models-cache; missing
+#                      files are fetched from the CDN via scripts/fetch_models.sh)
 #   --flavor lite      core only: the armd binary with LICENSE and
 #                      THIRD_PARTY_NOTICES.md, no init script, no kit files
 #                      -> dist/armd-lite_<VERSION>_riscv64.tar.gz
@@ -224,6 +227,64 @@ if [ -f "${REPO_ROOT}/profiles/so_arm100.json" ]; then
     cp -f "${REPO_ROOT}/profiles/so_arm100.json" "${STAGING_DIR}/usr/share/rebot-teleop/profile/so_arm100.json"
 fi
 
+# Bundled vision models from kits/recamera-b601dm/vision/models/models.tsv ->
+# /usr/share/rebot-teleop/models/ (read-only package payload, owned by the package).
+MODELS_MANIFEST="${REPO_ROOT}/kits/recamera-b601dm/vision/models/models.tsv"
+MODELS_CACHE_DIR="${REBOT_MODELS_DIR:-${REPO_ROOT}/target/models-cache}"
+MODELS_DEST="${STAGING_DIR}/usr/share/rebot-teleop/models"
+if [ ! -f "${MODELS_MANIFEST}" ]; then
+    echo "Error: vision models manifest not found at ${MODELS_MANIFEST}" >&2
+    exit 1
+fi
+mkdir -p "${MODELS_DEST}" "${MODELS_CACHE_DIR}"
+cp -f "${MODELS_MANIFEST}" "${MODELS_DEST}/models.tsv"
+{
+    missing_cache=0
+    while IFS=$'\t' read -r m_role m_file m_md5 m_size m_ion m_url m_ship _rest; do
+        [ -n "${m_role}" ] || continue
+        case "${m_role}" in '#'*) continue ;; esac
+        [ "${m_ship}" = "bundled" ] || continue
+        if [ ! -f "${MODELS_CACHE_DIR}/${m_file}" ]; then
+            missing_cache=1
+        fi
+    done < "${MODELS_MANIFEST}"
+    if [ "${missing_cache}" -eq 1 ]; then
+        echo "      Fetching missing bundled vision models into ${MODELS_CACHE_DIR}..."
+        REBOT_MODELS_TSV="${MODELS_MANIFEST}" "${SCRIPT_DIR}/fetch_models.sh" "${MODELS_CACHE_DIR}" bundled
+    fi
+    bundled_count=0
+    bundled_bytes=0
+    while IFS=$'\t' read -r m_role m_file m_md5 m_size m_ion m_url m_ship _rest; do
+        [ -n "${m_role}" ] || continue
+        case "${m_role}" in '#'*) continue ;; esac
+        [ "${m_ship}" = "bundled" ] || continue
+        src="${MODELS_CACHE_DIR}/${m_file}"
+        if [ ! -f "${src}" ]; then
+            echo "Error: bundled model missing from cache: ${src}" >&2
+            exit 1
+        fi
+        got_md5="$(md5sum "${src}" | awk '{print $1}')"
+        if [ "${got_md5}" != "${m_md5}" ]; then
+            echo "Error: md5 mismatch for bundled model ${m_file}: got ${got_md5}, expected ${m_md5}" >&2
+            exit 1
+        fi
+        got_size="$(wc -c < "${src}" | tr -d ' ')"
+        if [ -n "${m_size}" ] && [ "${m_size}" != "-" ] && [ "${got_size}" != "${m_size}" ]; then
+            echo "Error: size mismatch for bundled model ${m_file}: got ${got_size}, expected ${m_size}" >&2
+            exit 1
+        fi
+        cp -f "${src}" "${MODELS_DEST}/${m_file}"
+        bundled_count=$((bundled_count + 1))
+        bundled_bytes=$((bundled_bytes + got_size))
+        echo "      Bundled model (${m_role}): ${m_file} (${got_size} B, md5 ${got_md5})"
+    done < "${MODELS_MANIFEST}"
+    if [ "${bundled_count}" -eq 0 ]; then
+        echo "Error: no bundled models listed in ${MODELS_MANIFEST}" >&2
+        exit 1
+    fi
+    echo "      Bundled ${bundled_count} model(s) into /usr/share/rebot-teleop/models (${bundled_bytes} B raw)"
+}
+
 # Visual models and meshes (URDF + rbm1 binary bundle)
 mkdir -p "${STAGING_DIR}/usr/share/rebot-teleop/assets/so101_meshes"
 if [ -f "${REPO_ROOT}/assets/so101_new_calib.urdf" ]; then
@@ -247,6 +308,7 @@ if ! grep -q "^  \"version\": \"${VERSION}\"," "${MANIFEST}"; then
 fi
 find "${STAGING_DIR}/usr/share/rebot-teleop" -type f -exec chmod 0644 {} +
 chmod 0755 "${STAGING_DIR}/usr/share/rebot-teleop/rebot-vision-run"
+chmod 0755 "${STAGING_DIR}/usr/share/rebot-teleop/rebot-models-check"
 chmod 0755 "${STAGING_DIR}/usr/share/rebot-teleop/rebot-app-run"
 chmod 0755 "${STAGING_DIR}/usr/share/rebot-teleop/rebot-app-user"
 
@@ -289,8 +351,9 @@ dpkg-deb -I "${OUTPUT_DEB}"
 echo "---------------------------------------------------------------------"
 dpkg-deb -c "${OUTPUT_DEB}"
 
+DEB_BYTES=$(wc -c < "${OUTPUT_DEB}" | tr -d ' ')
 echo "====================================================================="
 echo "Build complete!"
 echo "Package artifact: ${OUTPUT_DEB}"
-echo "Package size:     $(ls -lh "${OUTPUT_DEB}" | awk '{print $5}')"
+echo "Package size:     $(ls -lh "${OUTPUT_DEB}" | awk '{print $5}') (${DEB_BYTES} B)"
 echo "====================================================================="

@@ -24,6 +24,24 @@ async fn blocking(f: impl FnOnce() -> String + Send + 'static) -> Response {
     }
 }
 
+/// `GET /api/v1/diagnostics`: structured daemon diagnostics (shadow `TorqueController` telemetry).
+pub async fn get_diagnostics(
+    axum::extract::State(supervisor): axum::extract::State<std::sync::Arc<crate::supervisor::ArmSupervisor>>,
+) -> Response {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        axum::Json(serde_json::json!({
+            "torque_shadow": supervisor.torque_shadow_diagnostics(),
+        }))
+        .into_response()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = supervisor;
+        axum::Json(serde_json::json!({})).into_response()
+    }
+}
+
 /// `GET /api/v1/diagnostics/boots`
 pub async fn get_boots(Extension(state): Extension<DiagnosticsState>) -> Response {
     blocking(move || boots_body(&state)).await

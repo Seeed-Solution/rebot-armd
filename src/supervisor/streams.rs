@@ -1347,6 +1347,40 @@ impl SupervisorInner {
         }
     }
 
+    /// Exact oldest joint-feedback instant (no millisecond floor loss) together with the
+    /// integer-millisecond `(min, max)` telemetry age range at `now`.
+    pub fn policy_input_age_and_oldest_at(
+        &self,
+        now: std::time::Instant,
+    ) -> Option<((u64, u64), std::time::Instant)> {
+        match &self.driver {
+            None => Some(((0, 0), now)),
+            Some(d) => d.with_ref(|drv| {
+                let ages = drv.feedback_ages();
+                if ages.len() != self.config.dof {
+                    return None;
+                }
+                let durs = ages.into_iter().collect::<Option<Vec<_>>>()?;
+                let mut min_ms = u64::MAX;
+                let mut max_ms = 0u64;
+                let mut max_dur = std::time::Duration::ZERO;
+                for dur in durs {
+                    if dur > max_dur {
+                        max_dur = dur;
+                    }
+                    let ms = dur.as_millis().min(u64::MAX as u128) as u64;
+                    min_ms = min_ms.min(ms);
+                    max_ms = max_ms.max(ms);
+                }
+                if min_ms > max_ms {
+                    return None;
+                }
+                let oldest = now.checked_sub(max_dur).unwrap_or(now);
+                Some(((min_ms, max_ms), oldest))
+            })?,
+        }
+    }
+
     /// Preconditions checked under lock before loading a policy pack outside the lock.
     pub fn check_policy_start_preconditions(
         &self,
@@ -3256,12 +3290,12 @@ pub mod targets {
         }
 
         #[cfg(not(feature = "policy-runtime"))]
-        fn policy_target_refused(&mut self, _code: &str, _frame: &TargetFrame) {}
+        pub(crate) fn policy_target_refused(&mut self, _code: &str, _frame: &TargetFrame) {}
 
         /// A target of the active run was refused by the consumption check: hold or end the
         /// run where the legacy commit holds or ends it (zero heap allocations / frees on RT).
         #[cfg(feature = "policy-runtime")]
-        fn policy_target_refused(&mut self, code: &str, frame: &TargetFrame) {
+        pub(crate) fn policy_target_refused(&mut self, code: &str, frame: &TargetFrame) {
             let Some(run) = self.policy_run.as_ref().filter(|r| frame.stream == policy_stream(r.action_id)) else { return; };
             let (action_id, hold_on_stale) = (run.action_id, run.vision_stale_hold);
             match code {

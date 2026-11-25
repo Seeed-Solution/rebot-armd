@@ -600,6 +600,10 @@ impl StatePublisher {
 
     pub fn hub(&self) -> &Arc<StateHub> { &self.hub }
 
+    /// Exact sequence number the next [`Self::publish_with_owner`] will store in `hub.published`.
+    #[inline]
+    pub fn next_seq(&self) -> u64 { self.seq + 1 }
+
     /// Moves the observation out of the slot the next [`Self::publish`] writes (see
     /// `ArmCore::take_observation_buffer`).
     pub fn take_back_observation(&mut self) -> Option<ArmObservation> { self.producer.back_mut().obs.take() }
@@ -1142,7 +1146,8 @@ impl StateHub {
         self.prep_env.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    /// Records an off-RT measurement payload for action `id` (bounded to 16 entries) and patches
+    /// Records an off-RT measurement payload for action `id` (bounded to `TERMINAL_FIFO_CAPACITY`
+    /// entries so sidecars survive across the full terminal reservation window) and patches
     /// the cached latest snapshot if it already carries `id` without a measurement. Never called
     /// on `armd-control`; lock order is strictly `state -> action_measurements` (never nested in
     /// reverse).
@@ -1153,7 +1158,7 @@ impl StateHub {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             map.insert(id, value.clone());
-            while map.len() > 16 {
+            while map.len() > crate::supervisor::TERMINAL_FIFO_CAPACITY {
                 if let Some(&oldest) = map.keys().min() {
                     map.remove(&oldest);
                 } else {
@@ -1203,6 +1208,20 @@ impl StateHub {
             .unwrap_or_else(|e| e.into_inner())
             .get(&id)
             .cloned()
+    }
+
+    /// Populates `action.measurement` from the off-RT sidecar store when missing.
+    pub fn attach_action_measurement_to_action(&self, action: &mut crate::motion::ActionStatus) {
+        if action.measurement.is_some() {
+            return;
+        }
+        let map = self
+            .action_measurements
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(v) = map.get(&action.id) {
+            action.measurement = Some(v.clone());
+        }
     }
 
     /// Populates `obs.action.measurement` and `obs.previous_action.measurement` from the off-RT

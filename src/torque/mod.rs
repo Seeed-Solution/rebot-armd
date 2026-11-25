@@ -128,6 +128,8 @@
 
 pub mod invariants;
 pub mod reducer;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod shadow;
 pub mod types;
 
 pub use invariants::{check_invariants, Violation, ViolationKind};

@@ -1,5 +1,34 @@
-# Models rebot-vision loads that are not part of reCamera OS. Columns (tab separated):
-# kind	file name on the device (a name rebot-vision searches, README "YOLO model")	url	md5	license	source
-obb	yolo11n_obb_cv181x_int8_fuse_qout.cvimodel	https://sensecraft-statics.seeed.cc/solution-app/rebot/models/yolo11n_obb_cv181x_int8_fuse-d9607b70.cvimodel	d9607b7039dda5981fb62b957f678bdf	AGPL-3.0 (Ultralytics YOLO11n-obb, DOTAv1 classes)	converted with TPU-MLIR, INT8, fused decoupled head
-depth	zipdepth_metric_384x224_bf16_rgb.cvimodel	https://sensecraft-statics.seeed.cc/solution-app/rebot/models/zipdepth_metric_384x224_bf16_rgb-33478718.cvimodel	3347871853ddda346e7a96d2cec50a98	MIT (ZipDepth); distilled from Depth-Anything-V2-Metric-Indoor-Large (CC-BY-NC-4.0)	BF16, RGB_PACKED uint8 input 384x224
-segment	yolo11n_seg_384x640_cv181x_int8_fuse.cvimodel	https://sensecraft-statics.seeed.cc/solution-app/rebot/models/yolo11n_seg_384x640_cv181x_int8_fuse-5ad01b51.cvimodel	5ad01b51727c5259abc1448f2bd0cec6	AGPL-3.0 (Ultralytics YOLO11n-seg, COCO classes)	converted with TPU-MLIR, INT8, cut before the head decode (10 outputs), input 384x640
+# Single source of truth for rebot-vision models on reCamera (SG2002 / CV181x).
+# Columns (tab-separated):
+# role	file	md5	size	ion_mb	url	ship	license	notes
+#
+# Role defaults:
+#   detector-segment          = yolo11n_seg_384x640_cv181x_int8_fuse.cvimodel (bundled; fallback: detector-segment-fallback)
+#   detector-segment-fallback = yolo11n_segment_cv181x_int8.cvimodel (reCamera OS /usr/share/supervisor/models)
+#   detector-detect           = yolo11n_detection_cv181x_int8.cvimodel (reCamera OS /usr/share/supervisor/models)
+#   depth                     = zipdepth_metric_384x224_bf16_rgb.cvimodel (bundled; tabletop re-distill round 1)
+#   detector-obb              = yolo11n_obb_cv181x_int8_fuse_qout.cvimodel (optional; CDN only)
+#
+# Delivery (ship column):
+#   bundled  = copied into /usr/share/rebot-teleop/models in the .deb; CDN is fallback/update source; required for optimal
+#   os       = ships with reCamera OS in /usr/share/supervisor/models
+#   optional = CDN only; not bundled in the .deb and not required for optimal
+#
+# Measured numbers (SG2002 reCamera):
+#   detector-segment (seg384 fuse, 5ad01b51): model_tool ION 12.54 MB (catalogue 13.1 MB), standalone CVI_NN_Forward
+#     32.0 ms (vs 71.2 ms stock 640x640), live yolo.ms p50 67.0-73.6 ms, decode p50 7.7-9.9 ms, mask p50 24.1 ms,
+#     total ION 34.31 MB alone / 54.29 MB with ZipDepth (8.6 MB free of 62.9 MB carveout).
+#   depth (zipdepth tabletop round 1, d0a6ee39): model_tool ION 19.10 MB (catalogue 20.0 MB), pure TPU 54.9 ms,
+#     live depth.ms p50 71.3-74.2 ms, held-out table abs median 33.8 mm (4.0 mm after per-frame plane fit),
+#     on-device 8/8 poses 4-19 mm residual (vs 2,245.3 mm for retired room-scale Stage C 33478718).
+#   detector-detect (stock OS, 7819bd8d): model_tool ION 7.69 MB (catalogue 8.5 MB), 80 COCO classes.
+#   detector-segment-fallback (stock OS 640x640, b3312af4): model_tool ION 17.91 MB (catalogue 19.5 MB); cannot coexist with depth.
+#   detector-obb (optional, d9607b70): model_tool ION 7.24 MB (catalogue 8.0 MB), 15 DOTAv1 classes.
+#
+# Retired history:
+# depth	zipdepth_metric_384x224_bf16_rgb.cvimodel	3347871853ddda346e7a96d2cec50a98	12918008	20.0	https://sensecraft-statics.seeed.cc/solution-app/rebot/models/zipdepth_metric_384x224_bf16_rgb-33478718.cvimodel	retired	MIT (ZipDepth); distilled from Depth-Anything-V2-Metric-Indoor-Large (CC-BY-NC-4.0)	room-scale Stage C (replaced 2026-11-25 by tabletop round 1 d0a6ee39; fails close-up tabletop depth at ~2.2 m)
+detector-segment	yolo11n_seg_384x640_cv181x_int8_fuse.cvimodel	5ad01b51727c5259abc1448f2bd0cec6	3333080	13.1	https://sensecraft-statics.seeed.cc/solution-app/rebot/models/yolo11n_seg_384x640_cv181x_int8_fuse-5ad01b51.cvimodel	bundled	AGPL-3.0 (Ultralytics YOLO11n-seg, COCO classes)	TPU-MLIR INT8 fused preprocess, 10 raw conv outputs, 384x640
+detector-segment-fallback	yolo11n_segment_cv181x_int8.cvimodel	b3312af49a5d59a2533c973695a2267a	4043296	19.5	-	os	AGPL-3.0 (Ultralytics YOLO11n-seg, COCO classes)	reCamera OS stock 640x640 segment model (/usr/share/supervisor/models)
+detector-detect	yolo11n_detection_cv181x_int8.cvimodel	7819bd8d3958f5184fb20cd8b0490525	3113208	8.5	-	os	AGPL-3.0 (Ultralytics YOLO11n, COCO classes)	reCamera OS stock 640x640 detect model (/usr/share/supervisor/models)
+depth	zipdepth_metric_384x224_bf16_rgb.cvimodel	d0a6ee396c12680188a1cb8d56cd4a94	12918008	20.0	https://sensecraft-statics.seeed.cc/solution-app/rebot/models/zipdepth_metric_384x224_bf16_rgb-d0a6ee39.cvimodel	bundled	MIT (ZipDepth); distilled from Depth-Anything-V2-Metric-Indoor-Large (CC-BY-NC-4.0)	tabletop re-distill round 1, BF16, RGB_PACKED uint8 input 384x224
+detector-obb	yolo11n_obb_cv181x_int8_fuse_qout.cvimodel	d9607b7039dda5981fb62b957f678bdf	3187696	8.0	https://sensecraft-statics.seeed.cc/solution-app/rebot/models/yolo11n_obb_cv181x_int8_fuse-d9607b70.cvimodel	optional	AGPL-3.0 (Ultralytics YOLO11n-obb, DOTAv1 classes)	TPU-MLIR INT8 fused decoupled head, quantised int8 outputs

@@ -38,7 +38,8 @@ targets; they are not packaged by the script.
 ## Contracts
 
 Core and kits interact only through these four contracts. Versions are those in the code at
-the time of writing.
+the time of writing. For the learned-policy package and runtime contract (`rebot-onnx-policy/v1`,
+backends, freshness fences, and action chunking), see [policy_runtime.md](policy_runtime.md).
 
 ### 1. Arm profile
 

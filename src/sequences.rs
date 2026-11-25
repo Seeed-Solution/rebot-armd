@@ -1180,6 +1180,44 @@ pub async fn begin_executor(
     stamp: crate::supervisor::AdmissionStamp,
     plan: RunPlan,
 ) -> Result<(u64, f64), ArmError> {
+    let ((id, expected), guard) = begin_executor_inner(
+        sup,
+        stamp,
+        plan,
+        crate::rt_core::reply_router::ExternalDestinationPolicy::ConnectionOrGlobal,
+        false,
+        None,
+    )
+    .await?;
+    let _ = guard.confirm_enqueued();
+    Ok((id, expected))
+}
+
+pub(crate) async fn begin_executor_ws(
+    sup: &Arc<ArmSupervisor>,
+    stamp: crate::supervisor::AdmissionStamp,
+    plan: RunPlan,
+    wire_tracker: Arc<crate::rt_core::reply_router::WsWireAckTracker>,
+) -> Result<((u64, f64), crate::rt_core::reply_router::AckCommitGuard), ArmError> {
+    begin_executor_inner(
+        sup,
+        stamp,
+        plan,
+        crate::rt_core::reply_router::ExternalDestinationPolicy::ConnectionOnly,
+        true,
+        Some(wire_tracker),
+    )
+    .await
+}
+
+async fn begin_executor_inner(
+    sup: &Arc<ArmSupervisor>,
+    stamp: crate::supervisor::AdmissionStamp,
+    plan: RunPlan,
+    policy: crate::rt_core::reply_router::ExternalDestinationPolicy,
+    require_ack_commit: bool,
+    wire_tracker: Option<Arc<crate::rt_core::reply_router::WsWireAckTracker>>,
+) -> Result<((u64, f64), crate::rt_core::reply_router::AckCommitGuard), ArmError> {
     use crate::rt_core::requests::actions::{ActionStamp, DEFAULT_ACTION_DEADLINE};
     if plan.request.record.is_some() {
         return Err(crate::motion::MotionError::Unsupported(
@@ -1216,9 +1254,16 @@ pub async fn begin_executor(
         parent_generation: 0,
         deadline: now + DEFAULT_ACTION_DEADLINE,
     };
-    let (id, _req_id) =
-        crate::macro_action::begin_macro_executor(sup, &action_stamp, spec, action_stamp.deadline)
-            .await?;
+    let (id, _req_id, ack_guard) = crate::macro_action::begin_macro_executor_with_barrier(
+        sup,
+        &action_stamp,
+        spec,
+        action_stamp.deadline,
+        policy,
+        require_ack_commit,
+        wire_tracker,
+    )
+    .await?;
     let pins = run_pins_for_plan(&plan, id);
     let _ = sup
         .dispatch_config_request_owned_reliable(
@@ -1246,7 +1291,7 @@ pub async fn begin_executor(
         let panic = worker.await.err().map(|e| e.to_string());
         cleanup(&sup, id, &sequence_id, stamp, deadline, panic).await;
     });
-    Ok((id, expected))
+    Ok(((id, expected), ack_guard))
 }
 
 /// After the orchestrator: discard an unfinished repeat's recording, release the pins, end

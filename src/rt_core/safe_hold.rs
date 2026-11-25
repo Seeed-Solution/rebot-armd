@@ -430,6 +430,20 @@ impl SafeHoldBuffers {
         release_deadline: Instant,
         now_fn: &mut dyn FnMut() -> Instant,
     ) {
+        self.step_driver_with_shadow(drv, ctrl, release_deadline, now_fn, None);
+    }
+
+    /// Executes ONE zero-allocation, zero-lock SAFE-HOLD tick on an exclusively owned driver,
+    /// emitting causal shadow events (`Release`, driver observations, `Thermal`, `BusLoss`,
+    /// `LiveHoldCheckpoint`) and flushing at the outer post-write boundary when `shadow` is active.
+    pub fn step_driver_with_shadow(
+        &mut self,
+        drv: &mut dyn ArmDriver,
+        ctrl: &SafeHoldControl,
+        release_deadline: Instant,
+        now_fn: &mut dyn FnMut() -> Instant,
+        mut shadow: Option<&mut crate::torque::shadow::ShadowRuntime>,
+    ) {
         let dof = self.dof.min(MAX_DOF);
         // 1. Conservative driver-clock-first release cap; reject expired cutoffs before staging.
         let Some(owner_cap) = release_deadline.checked_sub(self.tx_publish_margin) else {
@@ -443,6 +457,16 @@ impl SafeHoldBuffers {
             return;
         };
         drv.set_tx_release_deadline(Some(drv_cap));
+        let release_seq = ctrl.ticks.load(Ordering::Acquire).saturating_add(1);
+        let thermal_confirmed = ctrl.thermal_disable_confirmed.load(Ordering::Acquire);
+        if let Some(ref mut sh) = shadow {
+            sh.enqueue(crate::torque::shadow::ShadowInputKind::Release {
+                release_seq,
+                live_intent: crate::torque::TorqueIntent::On,
+                live_is_torqued: !thermal_confirmed,
+                live_stopped: true,
+            });
+        }
 
         // 2. Zero-alloc live RX intake across all supported drivers (Damiao, RobStride, Feetech).
         let rx_deadline = drv_cap.min(drv_now + crate::rt_core::ops::RX_TIME_BUDGET);
@@ -450,6 +474,9 @@ impl SafeHoldBuffers {
             .read_joint_states_safe_hold(&mut self.rx_states, rx_deadline, RX_FRAME_BUDGET)
             .is_ok()
             || drv.read_cached_joint_states_into(&mut self.rx_states).is_some();
+        if let Some(ref mut sh) = shadow {
+            sh.drain_from_driver(drv);
+        }
 
         // 3. Zero-alloc feedback ages and fresh measured position capture.
         drv.feedback_ages_into(&mut self.ages_buf);
@@ -484,7 +511,7 @@ impl SafeHoldBuffers {
         // 4. Thermal check BEFORE hold TX: over-temperature is an approved protective disable.
         let temp_fb = drv.capabilities().temperature_feedback;
         if temp_fb && rx_ok && !ctrl.thermal_tripped.load(Ordering::Acquire) {
-            let mut hot = false;
+            let mut hot: Option<(usize, f32)> = None;
             for j in 0..dof {
                 let fresh = self
                     .ages_buf
@@ -495,14 +522,23 @@ impl SafeHoldBuffers {
                 if fresh {
                     if let Some(st) = self.rx_states.get(j) {
                         if st.temperature.is_finite() && st.temperature > self.max_temperature {
-                            hot = true;
+                            hot = Some((j, st.temperature));
                             break;
                         }
                     }
                 }
             }
-            if hot {
+            if let Some((hot_j, hot_temp)) = hot {
                 ctrl.thermal_tripped.store(true, Ordering::Release);
+                if let Some(ref mut sh) = shadow {
+                    sh.enqueue(crate::torque::shadow::ShadowInputKind::Thermal {
+                        channel: hot_j as u8,
+                        temperature_c: hot_temp,
+                        live_intent: crate::torque::TorqueIntent::On,
+                        live_is_torqued: true,
+                        live_stopped: true,
+                    });
+                }
             }
         }
 
@@ -519,8 +555,14 @@ impl SafeHoldBuffers {
                 {
                     ctrl.thermal_disable_confirmed.store(true, Ordering::Release);
                 }
+                if let Some(ref mut sh) = shadow {
+                    sh.drain_from_driver(drv);
+                }
             }
             drv.set_tx_release_deadline(None);
+            if let Some(ref mut sh) = shadow {
+                sh.flush_deferred_steps();
+            }
             ctrl.ticks.fetch_add(1, Ordering::Release);
             return;
         }
@@ -538,7 +580,18 @@ impl SafeHoldBuffers {
             numeric_ok && drv.is_feedback_valid() && drv.feedback_all_within(dof, BUS_LOSS_TIMEOUT);
         if !all_bus_fresh {
             ctrl.holding_unconfirmed.store(true, Ordering::Release);
-            ctrl.bus_loss_latched.store(true, Ordering::Release);
+            let was_latched = ctrl.bus_loss_latched.swap(true, Ordering::AcqRel);
+            if !was_latched {
+                if let Some(ref mut sh) = shadow {
+                    sh.enqueue(crate::torque::shadow::ShadowInputKind::BusLoss {
+                        device: 0,
+                        multi_device_gap: false,
+                        live_intent: crate::torque::TorqueIntent::On,
+                        live_is_torqued: true,
+                        live_stopped: true,
+                    });
+                }
+            }
         } else {
             ctrl.holding_unconfirmed.store(false, Ordering::Release);
         }
@@ -556,6 +609,7 @@ impl SafeHoldBuffers {
                 }
             }
         }
+        let mut sent_hold_mask = 0u64;
         if hold_mask != 0 || self.gripper_is_pos_force {
             // Acknowledge any pending external E-stop/stop generations while keeping LATCH_BIT set
             // so `EstopGate::pending()` never suppresses SAFE-HOLD measured-position hold frames.
@@ -565,6 +619,18 @@ impl SafeHoldBuffers {
             {
                 if report.sent_any {
                     ctrl.hold_tx_count.fetch_add(1, Ordering::Release);
+                }
+                for j in 0..dof.min(report.dof) {
+                    if matches!(
+                        report.joint_status[j],
+                        crate::driver::JointHoldStatus::Held
+                            | crate::driver::JointHoldStatus::HeldStaleTarget
+                    ) {
+                        sent_hold_mask |= 1u64 << j;
+                    }
+                }
+                if sent_hold_mask == 0 && report.sent_any {
+                    sent_hold_mask = hold_mask;
                 }
                 if let Some(j7) = self.gripper_index {
                     if self.gripper_is_pos_force
@@ -576,9 +642,24 @@ impl SafeHoldBuffers {
                         )
                     {
                         ctrl.j7_tx_count.fetch_add(1, Ordering::Release);
+                        sent_hold_mask |= 1u64 << j7;
                     }
                 }
             }
+            if let Some(ref mut sh) = shadow {
+                sh.drain_from_driver(drv);
+            }
+        }
+        if let Some(ref mut sh) = shadow {
+            sh.enqueue(crate::torque::shadow::ShadowInputKind::LiveHoldCheckpoint {
+                hold_mask: crate::torque::ChannelMask(sent_hold_mask as u32),
+                contended: false,
+                escalated: false,
+                live_intent: crate::torque::TorqueIntent::On,
+                live_is_torqued: true,
+                live_stopped: true,
+            });
+            sh.flush_deferred_steps();
         }
 
         drv.set_tx_release_deadline(None);
@@ -595,8 +676,26 @@ impl SafeHoldBuffers {
         drv: &mut dyn ArmDriver,
         ctrl: &SafeHoldControl,
         reason: SafeHoldReason,
+        now_fn: FNow,
+        sleep_dur: FSleep,
+    ) -> Instant
+    where
+        FNow: FnMut() -> Instant,
+        FSleep: FnMut(Duration),
+    {
+        self.run_loop_until_process_exit_with_shadow(drv, ctrl, reason, now_fn, sleep_dur, None)
+    }
+
+    /// Shadow-aware variant of [`Self::run_loop_until_process_exit`]: emits causal SAFE-HOLD
+    /// shadow events and flushes at every tick's outer post-write boundary with zero allocs/locks.
+    pub fn run_loop_until_process_exit_with_shadow<FNow, FSleep>(
+        &mut self,
+        drv: &mut dyn ArmDriver,
+        ctrl: &SafeHoldControl,
+        reason: SafeHoldReason,
         mut now_fn: FNow,
         mut sleep_dur: FSleep,
+        mut shadow: Option<&mut crate::torque::shadow::ShadowRuntime>,
     ) -> Instant
     where
         FNow: FnMut() -> Instant,
@@ -612,7 +711,13 @@ impl SafeHoldBuffers {
             let tick_start = now_fn();
             let release_deadline = tick_start + period;
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.step_driver(drv, ctrl, release_deadline, &mut now_fn);
+                self.step_driver_with_shadow(
+                    drv,
+                    ctrl,
+                    release_deadline,
+                    &mut now_fn,
+                    shadow.as_deref_mut(),
+                );
             }));
             if ctrl.process_exit_requested.load(Ordering::Acquire) {
                 continue;
@@ -641,8 +746,31 @@ impl SafeHoldBuffers {
         FNow: FnMut() -> Instant,
         FSleep: FnMut(Duration),
     {
-        let hard_deadline =
-            self.run_loop_until_process_exit(drv, ctrl, reason, now_fn, sleep_dur);
+        self.run_loop_with_shadow(drv, ctrl, reason, now_fn, sleep_dur, None)
+    }
+
+    /// Shadow-aware variant of [`Self::run_loop`] (used by Legacy SAFE-HOLD extraction).
+    pub fn run_loop_with_shadow<FNow, FSleep>(
+        &mut self,
+        drv: &mut dyn ArmDriver,
+        ctrl: &SafeHoldControl,
+        reason: SafeHoldReason,
+        now_fn: FNow,
+        sleep_dur: FSleep,
+        mut shadow: Option<&mut crate::torque::shadow::ShadowRuntime>,
+    ) -> PanicDisableOutcome
+    where
+        FNow: FnMut() -> Instant,
+        FSleep: FnMut(Duration),
+    {
+        let hard_deadline = self.run_loop_until_process_exit_with_shadow(
+            drv,
+            ctrl,
+            reason,
+            now_fn,
+            sleep_dur,
+            shadow.as_deref_mut(),
+        );
         let origin = Instant::now();
         let remaining = hard_deadline.saturating_duration_since(origin);
         let (coop_deadline, _) = panic_disable_deadlines(origin, remaining);
@@ -653,6 +781,26 @@ impl SafeHoldBuffers {
         .unwrap_or_else(|_| {
             PanicDisableOutcome::Failed("panic during safe-hold process-exit disable".into())
         });
+        if let Some(ref mut sh) = shadow {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                sh.enqueue(crate::torque::shadow::ShadowInputKind::ProcessExit {
+                    live_intent: crate::torque::TorqueIntent::On,
+                    live_is_torqued: !ctrl.thermal_disable_confirmed.load(Ordering::Acquire),
+                    live_stopped: true,
+                });
+                match &outcome {
+                    PanicDisableOutcome::Confirmed
+                    | PanicDisableOutcome::Unconfirmed
+                    | PanicDisableOutcome::NoDriver => {
+                        sh.drain_from_driver(drv);
+                    }
+                    PanicDisableOutcome::TimedOut | PanicDisableOutcome::Failed(_) => {
+                        sh.record_external_staging_loss(1);
+                    }
+                }
+                sh.flush_deferred_steps();
+            }));
+        }
         ctrl.record_process_exit_outcome_lockfree(&outcome);
         ctrl.mark_exited();
         outcome
