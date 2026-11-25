@@ -1637,3 +1637,81 @@ fn r11_m4_rt_disable_dispatch_and_polling_never_block_on_driver_mutex() {
         });
     });
 }
+
+/// Shadow PR1 lock proof: with `torque_shadow_enabled = true` on the production RT executor
+/// (`DamiaoArmDriver<FakeBus>`), while the detached legacy `SupervisorLock` writer is held on
+/// another OS thread AND an off-thread reader continuously polls `torque_shadow_diagnostics()`,
+/// `armd-control` performs strictly ZERO `SupervisorLock` attempts, advances publications, and
+/// publishes live `owner == Executor` shadow diagnostics.
+#[test]
+fn rt_executor_torque_shadow_on_zero_locks_and_diagnostics_readable() {
+    run_bounded_fixture(Duration::from_secs(10), "torque_shadow_zero_locks", |deadline| {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut cfg = ArmConfig::rebot_dm();
+        cfg.torque_shadow_enabled = true;
+        let limits = dm_limits();
+        let bus = FakeBus::new(&limits);
+        let mut drv = DamiaoArmDriver::new(bus.clone(), (1..=7).collect())
+            .with_joint_limits(limits)
+            .unwrap();
+        drv.check_mapping_ranges();
+        let sup = Arc::new(ArmSupervisor::new(cfg));
+        rt.block_on(async {
+            sup.set_driver(Box::new(drv)).await;
+            sup.start_dispatcher().unwrap();
+        });
+        let handle = rt
+            .block_on(sup.start_executor_with_hooks(
+                ExecutorConfig::for_tests(Duration::from_millis(10)),
+                PersistTestHooks::default(),
+            ))
+            .unwrap();
+        assert_eq!(sup.owner_mode(), OWNER_EXECUTOR);
+
+        // Hold the detached legacy SupervisorLock writer on a separate OS thread throughout!
+        let hold_stop = Arc::new(AtomicBool::new(false));
+        let hold_ready = Arc::new(AtomicBool::new(false));
+        let sup_hold = Arc::clone(&sup);
+        let hs = Arc::clone(&hold_stop);
+        let hr = Arc::clone(&hold_ready);
+        let holder = thread::spawn(move || {
+            let _w = sup_hold.inner().blocking_write();
+            hr.store(true, Ordering::Release);
+            while !hs.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(2));
+            }
+        });
+        wait_until_deadline(deadline, "detached writer held", || {
+            hold_ready.load(Ordering::Acquire)
+        });
+
+        let start_seq = sup.hub().latest().map_or(0, |s| s.meta.seq);
+        let mut saw_shadow_events = false;
+        wait_until_deadline(deadline, "RT advances with shadow ON and writer held", || {
+            let d = sup.torque_shadow_diagnostics();
+            if d.enabled && d.owner == armd::torque::shadow::ShadowOwner::Executor && d.events_processed > 0 {
+                saw_shadow_events = true;
+            }
+            let seq = sup.hub().latest().map_or(0, |s| s.meta.seq);
+            saw_shadow_events && seq >= start_seq + 5
+        });
+
+        assert_eq!(
+            sup.inner().control_thread_attempts(),
+            0,
+            "RT control thread must perform strictly 0 SupervisorLock attempts with torque shadow ON"
+        );
+        let diag = sup.torque_shadow_diagnostics();
+        assert!(diag.enabled);
+        assert_eq!(diag.owner, armd::torque::shadow::ShadowOwner::Executor);
+        assert!(diag.events_processed > 0);
+        assert_eq!(diag.taxonomy.invariant_violation, 0);
+
+        hold_stop.store(true, Ordering::Release);
+        holder.join().unwrap();
+        handle.stop_and_join();
+    });
+}

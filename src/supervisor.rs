@@ -5989,6 +5989,13 @@ impl SupervisorInner {
         self.torque_shadow.flush_and_drain_sync();
     }
 
+    /// Test-only flush of pending shadow steps without blocking on the off-thread consumer.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[doc(hidden)]
+    pub fn torque_shadow_flush_for_test(&mut self) {
+        self.flush_torque_shadow();
+    }
+
     /// Read current torque shadow diagnostics from `SupervisorInner`'s paired hub.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn torque_shadow_diagnostics(&self) -> crate::torque::shadow::TorqueShadowDiagnostics {
