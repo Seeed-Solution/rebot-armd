@@ -1250,7 +1250,34 @@ async fn safe_hold_and_handback_emit_and_flush_torque_shadow() {
             bus.with(|s| s.motors.iter().all(|m| m.enabled)),
             "handback away from rest must never disable torque"
         );
+        // Ordinary Legacy stop while energized transitions into SAFE-HOLD instead of abandoning
+        // the arm (DRV-F1 B2), and only explicit ProcessExit disables and exits cleanly.
         sup.signal_legacy_stop(&legacy_stop);
+        wait_until_async(Duration::from_secs(2), "legacy ordinary stop enters SAFE-HOLD", || {
+            sup.legacy_safe_hold_control().is_active()
+        })
+        .await;
+        assert!(
+            bus.with(|s| s.motors.iter().all(|m| m.enabled)),
+            "ordinary Legacy stop away from rest must retain torque in SAFE-HOLD"
+        );
+        // B1: While detached SAFE-HOLD holds the arm, try_set_driver must be refused before I/O.
+        let dummy_bus = FakeBus::new(&dm_limits(), raised, None);
+        let dummy_drv = DamiaoArmDriver::new(dummy_bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(dm_limits())
+            .unwrap();
+        assert!(
+            sup.try_set_driver(Box::new(dummy_drv)).await.is_err(),
+            "try_set_driver must reject installing a second bus writer while SAFE-HOLD is active"
+        );
+        assert!(
+            dummy_bus.with(|s| s.tx_log.is_empty()),
+            "rejected try_set_driver must perform zero I/O on incoming driver"
+        );
+        let outcome = sup
+            .emergency_process_exit_disable_until(Instant::now() + Duration::from_secs(2))
+            .await;
+        assert_eq!(outcome, PanicDisableOutcome::Confirmed);
         let _ = legacy_jh.join();
     }
 
@@ -1300,5 +1327,144 @@ async fn safe_hold_and_handback_emit_and_flush_torque_shadow() {
             after_exit.events_processed > in_sh_2,
             "ProcessExit disable must emit and flush shadow events"
         );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_blockers_b3_b7_b8_b10_enforced() {
+    let raised = [0.40, -0.30, 0.50, 0.20, -0.20, 0.10, -1.20];
+
+    // B3: Replacing an energized Legacy driver must fail BEFORE any incoming-driver I/O.
+    // B7: Unauthorized `attempt_legacy_panic_disable` must be rejected with zero CMD_DISABLE frames.
+    {
+        let (sup, bus) = make_energized_dm_supervisor(raised, None, false);
+        sup.set_lease_enabled(false).await;
+        sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
+        bus.with(|s| s.tx_log.clear());
+
+        let incoming_bus = FakeBus::new(&dm_limits(), raised, None);
+        let incoming_drv = DamiaoArmDriver::new(incoming_bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(dm_limits())
+            .unwrap();
+        let err = sup
+            .try_set_driver(Box::new(incoming_drv))
+            .await
+            .expect_err("energized predecessor must reject try_set_driver");
+        assert!(
+            format!("{err:?}").contains("DRIVER_ENERGIZED"),
+            "expected DRIVER_ENERGIZED, got {err:?}"
+        );
+        assert!(
+            incoming_bus.with(|s| s.tx_log.is_empty()),
+            "rejected try_set_driver must perform zero incoming-driver I/O"
+        );
+
+        let sup_unauth = sup.clone();
+        let unauth = tokio::task::spawn_blocking(move || {
+            sup_unauth.attempt_legacy_panic_disable(Duration::from_millis(100))
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(unauth, PanicDisableOutcome::Failed(_)),
+            "unauthorized attempt_legacy_panic_disable must fail closed, got {unauth:?}"
+        );
+        assert!(
+            !bus.with(|s| s.tx_log.iter().any(|f| f.data == damiao::CMD_DISABLE)),
+            "unauthorized attempt_legacy_panic_disable must emit zero CMD_DISABLE frames"
+        );
+        assert!(bus.with(|s| s.motors.iter().all(|m| m.enabled)));
+        let outcome = sup
+            .emergency_process_exit_disable_until(Instant::now() + Duration::from_secs(2))
+            .await;
+        assert_eq!(outcome, PanicDisableOutcome::Confirmed);
+    }
+
+    // B8: SAFE-HOLD thermal disable must NOT mark confirmed on Unconfirmed/Err and must retry.
+    {
+        use armd::driver::{DisableKind, TorqueOutcome, TorqueProgress};
+        use armd::rt_core::safe_hold::{SafeHoldBuffers, SafeHoldControl};
+        use std::sync::atomic::AtomicUsize;
+
+        struct UnconfirmedThermalDriver {
+            begin_calls: Arc<AtomicUsize>,
+            confirm_on_call: usize,
+        }
+        impl ArmDriver for UnconfirmedThermalDriver {
+            fn capabilities(&self) -> DriverCapabilities {
+                DriverCapabilities {
+                    velocity_feedback: true,
+                    torque_feedback: true,
+                    temperature_feedback: true,
+                    torque_feedforward: false,
+                    enable_feedback: true,
+                    load_feedback: false,
+                }
+            }
+            fn enable_state(&self) -> EnableState {
+                if self.begin_calls.load(Ordering::Acquire) >= self.confirm_on_call {
+                    EnableState::Disabled
+                } else {
+                    EnableState::Enabled
+                }
+            }
+            fn is_feedback_valid(&self) -> bool { true }
+            fn feedback_all_within(&self, _dof: usize, _max_age: Duration) -> bool { true }
+            fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
+                out.clear();
+                out.resize(7, Some(Duration::from_millis(5)));
+            }
+            fn read_joint_states(&mut self) -> Result<Vec<armd::model::JointState>, ArmDriverError> {
+                Ok(vec![
+                    armd::model::JointState { position: 0.2, temperature: 95.0, ..Default::default() };
+                    7
+                ])
+            }
+            fn read_joint_states_safe_hold(
+                &mut self,
+                out: &mut Vec<armd::model::JointState>,
+                _deadline: Instant,
+                _max_rx_frames: u16,
+            ) -> Result<(u16, bool), ArmDriverError> {
+                out.clear();
+                out.resize(
+                    7,
+                    armd::model::JointState { position: 0.2, temperature: 95.0, ..Default::default() },
+                );
+                Ok((7, false))
+            }
+            fn write_joint_targets(&mut self, _targets: &[armd::driver::JointTarget]) -> Result<(), ArmDriverError> { Ok(()) }
+            fn set_torque(&mut self, _enabled: bool) -> Result<(), ArmDriverError> { Ok(()) }
+            fn begin_disable_torque_budgeted(
+                &mut self,
+                _kind: DisableKind,
+                _max_rx_frames: u16,
+            ) -> Result<TorqueProgress, ArmDriverError> {
+                let n = self.begin_calls.fetch_add(1, Ordering::AcqRel) + 1;
+                if n == 1 {
+                    Ok(TorqueProgress::Done(TorqueOutcome::Unconfirmed))
+                } else {
+                    Ok(TorqueProgress::Done(TorqueOutcome::Confirmed))
+                }
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut drv = UnconfirmedThermalDriver {
+            begin_calls: Arc::clone(&calls),
+            confirm_on_call: 2,
+        };
+        let mut bufs = SafeHoldBuffers::from_config(&ArmConfig::rebot_dm(), Duration::from_millis(20));
+        let ctrl = SafeHoldControl::new();
+        let mut now = Instant::now;
+        bufs.step_driver(&mut drv, &ctrl, Instant::now() + Duration::from_millis(20), &mut now);
+        assert!(ctrl.thermal_tripped());
+        assert!(
+            !ctrl.thermal_disable_confirmed(),
+            "Unconfirmed thermal disable must NOT mark thermal_disable_confirmed"
+        );
+        bufs.step_driver(&mut drv, &ctrl, Instant::now() + Duration::from_millis(20), &mut now);
+        assert_eq!(calls.load(Ordering::Acquire), 2, "SAFE-HOLD must retry unconfirmed thermal disable");
+        assert!(ctrl.thermal_disable_confirmed());
     }
 }

@@ -1035,6 +1035,7 @@ async fn damiao_fresh_unknown_shutdown_gate_and_panic_disable_paths() {
     bus_leg.with(|s| s.tx_log.clear());
 
     let sup_leg_ref = sup_leg.clone();
+    sup_leg_ref.authorize_process_exit_for_test();
     let outcome = tokio::task::spawn_blocking(move || {
         sup_leg_ref.attempt_legacy_panic_disable(Duration::from_millis(250))
     })
@@ -1710,6 +1711,7 @@ async fn panic_disable_deadline_observer_fires_on_blocking_driver_and_preserves_
     sup3.set_lease_enabled(false).await;
     sup3.enable_torque(sup3.capture_admission_stamp()).await.unwrap();
     let sup3_c = sup3.clone();
+    sup3_c.authorize_process_exit_for_test();
     let t_leg = Instant::now();
     let outcome3 = tokio::task::spawn_blocking(move || {
         sup3_c.attempt_legacy_panic_disable(Duration::from_millis(60))
@@ -2186,6 +2188,7 @@ async fn panic_disable_retries_transient_j3_send_failure_and_disables_all_motors
     inner_leg.with(|s| s.tx_log.clear());
 
     let sup_leg_c = sup_leg.clone();
+    sup_leg_c.authorize_process_exit_for_test();
     let outcome = tokio::task::spawn_blocking(move || {
         sup_leg_c.attempt_legacy_panic_disable(Duration::from_millis(300))
     })
@@ -2221,6 +2224,7 @@ async fn panic_disable_retries_transient_j3_send_failure_and_disables_all_motors
     inner_perm.with(|s| s.tx_log.clear());
 
     let sup_perm_c = sup_perm.clone();
+    sup_perm_c.authorize_process_exit_for_test();
     let t_perm = Instant::now();
     let out_perm = tokio::task::spawn_blocking(move || {
         sup_perm_c.attempt_legacy_panic_disable(Duration::from_millis(80))

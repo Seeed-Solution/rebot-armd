@@ -1027,6 +1027,17 @@ pub trait ArmDriver: Send {
     /// never an input to hold, disable, rollback, or recovery decisions).
     fn enable_state(&self) -> EnableState { EnableState::Unknown }
 
+    /// Driver-owned physical disarm proof for lifecycle teardown / replacement (DRV-F1 B6):
+    /// returns `true` ONLY when hardware has confirmed all joints disabled with fresh, causal
+    /// evidence (invalidated by staleness, ambiguous writes, or subsequent enable/motion writes).
+    fn is_hardware_disarmed_confirmed(&self) -> bool {
+        self.enable_state() == EnableState::Disabled
+            && self.is_feedback_valid()
+            && !self.has_any_joint_enabled()
+            && !self.has_known_partial_enable()
+            && !self.torque_transition_pending()
+    }
+
     /// Monotonic counter incremented strictly when a fresh causal hardware sample carrying
     /// non-enabled torque state (`enable_state != Enabled`) is decoded from the bus (R12 M2).
     /// Returns `None` for drivers without an explicit per-sample counter.
@@ -2971,15 +2982,24 @@ impl<T: Transport> FeetechArmDriver<T> {
                 }
             }
         }
+        let eff_deadline = match (deadline, self.tx_release_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        if eff_deadline.is_some_and(|dl| self.clock_now() >= dl) {
+            return Ok(false);
+        }
         // Invalidate per-motor torque windows immediately BEFORE the torque-changing write reaches
         // the transport; a gate refusal above leaves evidence intact. (Keep `rest_pose_window`
         // intact across the atomic multi-servo disable batch so servo 0's write does not poison
         // servos 1..N microseconds later; non-rest feedback or >100 ms staleness still invalidates it.)
         let servo_idx = self.servo_ids.iter().position(|&id| id == servo_id);
         let prev_reported = servo_idx.and_then(|idx| self.reported_enable[idx]);
+        let prev_confirmed = servo_idx.and_then(|idx| self.last_enable_confirmed[idx]);
         let prev_commanded = self.torque_enable_commanded;
         if let Some(idx) = servo_idx {
             self.reported_enable[idx] = None;
+            self.last_enable_confirmed[idx] = None;
         }
         self.torque_enable_commanded = false;
         let pkt = feetech::build_set_torque_array(servo_id, false);
@@ -2987,6 +3007,7 @@ impl<T: Transport> FeetechArmDriver<T> {
             if matches!(e, TransportError::WouldBlock) {
                 if let Some(idx) = servo_idx {
                     self.reported_enable[idx] = prev_reported;
+                    self.last_enable_confirmed[idx] = prev_confirmed;
                 }
                 self.torque_enable_commanded = prev_commanded;
             }
@@ -2995,8 +3016,8 @@ impl<T: Transport> FeetechArmDriver<T> {
         let flush_res = self.transport.flush();
         let flush_ok = flush_res.is_ok();
         let _ = flush_res;
-        if *rx_budget > 0 && deadline.is_none_or(|dl| self.clock_now() < dl) {
-            let _ = self.drain_tx_echo_until(&pkt, deadline);
+        if *rx_budget > 0 && eff_deadline.is_none_or(|dl| self.clock_now() < dl) {
+            let _ = self.drain_tx_echo_until(&pkt, eff_deadline);
         }
         // Record pure stack-only flush ambiguity flag; shadow clock sampling and staging are
         // deferred strictly until AFTER the entire disable batch + readback deadline check.
@@ -3461,6 +3482,7 @@ impl<T: Transport> FeetechArmDriver<T> {
             }
             _ => {
                 self.reported_enable[idx] = None;
+                self.last_enable_confirmed[idx] = None;
             }
         }
     }
@@ -3511,12 +3533,14 @@ impl<T: Transport> FeetechArmDriver<T> {
                 }
                 Ok(_) => {
                     self.reported_enable[idx] = None;
+                    self.last_enable_confirmed[idx] = None;
                     if first_error.is_none() {
                         first_error = Some((id, "FEETECH_UNEXPECTED_TORQUE_ENABLE_VALUE"));
                     }
                 }
                 Err(e) => {
                     self.reported_enable[idx] = None;
+                    self.last_enable_confirmed[idx] = None;
                     if first_error.is_none() {
                         first_error = Some((id, Self::readback_error_code(&e)));
                     }
@@ -3894,6 +3918,7 @@ impl<T: Transport> FeetechArmDriver<T> {
                 _ => {
                     if joint_idx < self.reported_enable.len() {
                         self.reported_enable[joint_idx] = None;
+                        self.last_enable_confirmed[joint_idx] = None;
                     }
                     all_enabled = false;
                     all_disabled = false;
@@ -4296,6 +4321,10 @@ impl<T: Transport> FeetechArmDriver<T> {
             [crate::torque::MotorWriteOutcome::NotTargeted; crate::torque::MAX_CHANNELS];
         #[cfg(not(target_arch = "wasm32"))]
         let mut shadow_ambiguous_gap = false;
+        let eff_deadline = match (deadline, self.tx_release_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         for (idx, &id) in ids[..n].iter().enumerate() {
             if skip_dispatched && idx < 64 && (self.disable_dispatched_mask & (1u64 << idx)) != 0 {
                 continue;
@@ -4311,7 +4340,7 @@ impl<T: Transport> FeetechArmDriver<T> {
                     break;
                 }
             }
-            match self.write_torque_off_checked_budgeted(id, kind, client_park, deadline, &mut rx_remaining) {
+            match self.write_torque_off_checked_budgeted(id, kind, client_park, eff_deadline, &mut rx_remaining) {
                 Ok(true) => {
                     wrote_any = true;
                     if idx < 64 {
@@ -5033,6 +5062,7 @@ impl<T: Transport> FeetechArmDriver<T> {
                     let id = self.servo_ids[idx];
                     if self.unmatched_1b_read.get(idx).copied().unwrap_or(false) {
                         self.reported_enable[idx] = None;
+                        self.last_enable_confirmed[idx] = None;
                         continue;
                     }
                     match replies.get(&id).copied() {
@@ -5041,6 +5071,7 @@ impl<T: Transport> FeetechArmDriver<T> {
                         }
                         Some(_) => {
                             self.reported_enable[idx] = None;
+                            self.last_enable_confirmed[idx] = None;
                         }
                         None => {
                             self.missed_enable_polls[idx] = self.missed_enable_polls[idx].saturating_add(1);
@@ -5048,6 +5079,7 @@ impl<T: Transport> FeetechArmDriver<T> {
                                 || self.last_enable_confirmed[idx].is_none_or(|t| now.saturating_duration_since(t) > Duration::from_millis(600))
                             {
                                 self.reported_enable[idx] = None;
+                                self.last_enable_confirmed[idx] = None;
                             }
                         }
                     }
@@ -5256,6 +5288,21 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         } else {
             EnableState::Unknown
         }
+    }
+
+    fn is_hardware_disarmed_confirmed(&self) -> bool {
+        !self.servo_ids.is_empty()
+            && !self.torque_enable_commanded
+            && self.pending_disable.is_none()
+            && self.disable_dispatched_mask == 0
+            && self.is_feedback_valid()
+            && self.reported_enable.len() == self.servo_ids.len()
+            && self.last_enable_confirmed.len() == self.servo_ids.len()
+            && self.reported_enable.iter().all(|v| *v == Some(0))
+            && self
+                .last_enable_confirmed
+                .iter()
+                .all(|ts| ts.is_some_and(|t| self.elapsed_since(t) <= Duration::from_millis(600)))
     }
 
     fn reported_torque_loss_sample_seq(&self) -> Option<u64> {
@@ -5744,6 +5791,7 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                 // Invalidate this servo's reported enable telemetry and rest-pose window BEFORE
                 // the write reaches the transport.
                 self.reported_enable[idx] = None;
+                self.last_enable_confirmed[idx] = None;
                 self.rest_pose_window[idx].reset();
                 if let Err(e) = self.discard_pending_rx_for_request() {
                     write_err = Some(e);
@@ -5936,8 +5984,12 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                 }
             }
         }
-        let (done, rx_used, exhausted) =
-            self.execute_disable_writes_budgeted(kind, None, None, Some(max_rx_frames))?;
+        let (done, rx_used, exhausted) = self.execute_disable_writes_budgeted(
+            kind,
+            None,
+            self.tx_release_deadline,
+            Some(max_rx_frames),
+        )?;
         self.last_poll_rx = Some((rx_used, exhausted));
         if done {
             Ok(TorqueProgress::Done(TorqueOutcome::Confirmed))
@@ -6374,6 +6426,9 @@ impl<T: Transport> FashionStarArmDriver<T> {
         let pkt = fashionstar::build_set_torque(id, false);
         if let DisableKind::DisableRequested { started_at } = kind {
             self.check_disable_requested(started_at)?;
+        }
+        if self.tx_release_deadline.is_some_and(|dl| self.now() >= dl) {
+            return Err(ArmDriverError::Transport(TransportError::WouldBlock));
         }
         let res = self.transport.write_all(&pkt);
         #[cfg(not(target_arch = "wasm32"))]

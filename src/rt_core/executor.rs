@@ -3042,6 +3042,10 @@ pub(crate) struct LifecycleControl {
     handback_token: AtomicU64,
     handback_deadline_ns: AtomicU64,
     handback_state: AtomicU8,
+    /// True ONLY when the caller prepared a live periodic legacy receiver before requesting
+    /// handback; bare `handback_to_legacy()` passes `false` so `armd-control` refuses energized
+    /// or unknown-state transfers atomically at the owner-side commit point (DRV-F1 B4).
+    handback_has_live_receiver: AtomicBool,
     /// Single-slot lock-free ownership handoff pointer stored BEFORE `CAS(HB_PENDING -> HB_HANDED_BACK)`
     /// so `HB_HANDED_BACK` guarantees immediate payload availability without post-deadline spins (B1).
     handback_slot: std::sync::atomic::AtomicPtr<SupervisorInner>,
@@ -3075,6 +3079,7 @@ impl LifecycleControl {
             handback_token: AtomicU64::new(0),
             handback_deadline_ns: AtomicU64::new(0),
             handback_state: AtomicU8::new(HB_IDLE),
+            handback_has_live_receiver: AtomicBool::new(false),
             handback_slot: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
             safe_hold,
         }
@@ -3201,15 +3206,22 @@ impl LifecycleControl {
         self.commit_state.load(Ordering::Acquire) == COMMIT_ACCEPTED
     }
 
-    /// Arms a token-bound energized handback obligation BEFORE signaling `control_stop`.
-    pub(crate) fn begin_handback(&self, deadline: Instant) -> u64 {
+    /// Arms a token-bound handback obligation BEFORE signaling `control_stop`.
+    pub(crate) fn begin_handback(&self, deadline: Instant, has_live_receiver: bool) -> u64 {
         let token = self.next_token.fetch_add(1, Ordering::AcqRel);
+        self.handback_has_live_receiver
+            .store(has_live_receiver, Ordering::Release);
         self.handback_deadline_ns
             .store(self.to_rel_ns(deadline), Ordering::Release);
         self.handback_token.store(token, Ordering::Release);
         self.handback_state.store(HB_PENDING, Ordering::Release);
         self.raise_request(LC_REQ_HANDBACK);
         token
+    }
+
+    #[inline]
+    pub(crate) fn handback_has_live_receiver(&self) -> bool {
+        self.handback_has_live_receiver.load(Ordering::Acquire)
     }
 
     /// Owner-side lock-free handback commit at a release boundary (0 allocs, 0 frees, 0 locks).
@@ -4323,6 +4335,7 @@ impl RtExecutorShared {
             }
         }
         let mut entered_safe_hold = false;
+        let mut retained_after_process_exit = false;
         let mut finished = false;
         while !finished {
             let owner_st = self.lifecycle.owner_state();
@@ -4332,6 +4345,10 @@ impl RtExecutorShared {
             }
             if self.exited.load(Ordering::Acquire) {
                 finished = true;
+                break;
+            }
+            if is_process_exit && owner_st == LC_OWNER_PROCESS_EXIT_DONE {
+                retained_after_process_exit = true;
                 break;
             }
             if is_process_exit && self.teardown_disable.timed_out.load(Ordering::Acquire) {
@@ -4345,7 +4362,7 @@ impl RtExecutorShared {
         }
 
         if let Some(jh) = self.control_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            if finished && !entered_safe_hold {
+            if finished && !entered_safe_hold && !retained_after_process_exit {
                 let joined = join_or_detach_until(jh, deadline, "armd-control");
                 self.control_rt_state.store(
                     if joined {
@@ -4355,13 +4372,13 @@ impl RtExecutorShared {
                     },
                     Ordering::Release,
                 );
-            } else if entered_safe_hold {
-                // `armd-control` retained exclusive ownership of an energized/unknown driver in
-                // SAFE-HOLD: detach the handle without destroying the driver, issuing
-                // unauthorized torque-off, or falsely marking `exited` while SAFE-HOLD is live.
+            } else if entered_safe_hold || retained_after_process_exit {
+                // `armd-control` retained exclusive ownership of an energized/unconfirmed driver in
+                // SAFE-HOLD: detach the handle without destroying the driver, issuing unauthorized
+                // torque-off, or falsely marking `exited` while SAFE-HOLD is live (DRV-F1 B5).
                 self.control_rt_state.store(RT_STATE_DETACHED, Ordering::Release);
                 tracing::warn!(
-                    "Teardown: detaching `armd-control` in SAFE-HOLD (energized/unconfirmed driver remains exclusively held until thermal trip or deliberate process exit)"
+                    "Teardown: detaching `armd-control` in SAFE-HOLD (energized/unconfirmed driver remains exclusively held)"
                 );
                 drop(jh);
             } else {
@@ -5471,8 +5488,9 @@ impl RtExecutorHandle {
     pub(crate) fn take_handback_core_until(
         &self,
         deadline: Instant,
+        has_live_receiver: bool,
     ) -> Result<Box<SupervisorInner>, HandbackFailure> {
-        let token = self.shared.lifecycle.begin_handback(deadline);
+        let token = self.shared.lifecycle.begin_handback(deadline, has_live_receiver);
         self.shared.persist_stop.store(true, Ordering::Release);
         self.shared.persist_park_thread.unpark();
         self.shared.maint_client.close();
@@ -8341,9 +8359,9 @@ pub(crate) fn core_is_confirmed_disarmed(core: &SupervisorInner) -> bool {
     }
     matches!(
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            slot.try_with_ref(|drv| drv.enable_state())
+            slot.try_with_ref(|drv| drv.is_hardware_disarmed_confirmed())
         })),
-        Ok(Ok(crate::driver::EnableState::Disabled))
+        Ok(Ok(true))
     )
 }
 
@@ -8440,6 +8458,73 @@ fn mark_control_exited(
 ) {
     exited.store(true, Ordering::Release);
     hub.wake();
+}
+
+/// Publishes the `ProcessExit` disable outcome immediately and drops `core` ONLY when hardware
+/// disarm is confirmed (`Confirmed`, `NoDriver`, or `core_is_confirmed_disarmed`). On any
+/// non-confirmed outcome (`Unconfirmed`, `TimedOut`, `Failed`), retains sole ownership of `core`
+/// in post-exit SAFE-HOLD so an energized/unconfirmed driver is NEVER dropped (DRV-F1 B5).
+#[allow(clippy::too_many_arguments)]
+fn finalize_process_exit_or_retain_safe_hold(
+    mut core: Box<SupervisorInner>,
+    outcome: &crate::supervisor::PanicDisableOutcome,
+    safe_hold_bufs: &mut super::safe_hold::SafeHoldBuffers,
+    lifecycle: &Arc<LifecycleControl>,
+    exited: &Arc<AtomicBool>,
+    control_exited_cv: &Arc<(Mutex<ControlExitState>, Condvar)>,
+    hub: &Arc<StateHub>,
+    clock_hook: &Option<Arc<dyn ExecutorClock>>,
+    control_stop: &Arc<AtomicBool>,
+) {
+    let disarmed = matches!(
+        outcome,
+        crate::supervisor::PanicDisableOutcome::Confirmed
+            | crate::supervisor::PanicDisableOutcome::NoDriver
+    ) || core_is_confirmed_disarmed(&core);
+    lifecycle.safe_hold.record_process_exit_outcome_lockfree(outcome);
+    lifecycle.safe_hold.mark_exited();
+    if disarmed {
+        lifecycle.set_owner_state(LC_OWNER_PROCESS_EXIT_DONE);
+        drop(core);
+        mark_control_exited(exited, control_exited_cv, hub);
+        return;
+    }
+    // Outcome is non-confirmed (`Unconfirmed` / `TimedOut` / `Failed`): publish completion to
+    // callers immediately so teardown does not hang, then retain `core` in SAFE-HOLD forever
+    // without dropping the energized/unconfirmed driver.
+    lifecycle.set_owner_state(LC_OWNER_PROCESS_EXIT_DONE);
+    hub.wake();
+    let has_drv = core
+        .driver
+        .as_ref()
+        .is_some_and(crate::supervisor_lock::DriverSlot::is_exclusive);
+    if has_drv {
+        let now_inst = || clock_hook.as_ref().map_or_else(Instant::now, |c| c.now());
+        let sleep_dur = |d: Duration| {
+            if let Some(c) = clock_hook.as_ref() {
+                c.sleep(d, control_stop);
+            } else {
+                thread::park_timeout(d);
+            }
+        };
+        let core_ref = &mut *core;
+        let drv = core_ref
+            .driver
+            .as_mut()
+            .and_then(crate::supervisor_lock::DriverSlot::as_exclusive_mut)
+            .expect("checked exclusive driver");
+        safe_hold_bufs.run_post_exit_hold_forever(
+            drv,
+            &lifecycle.safe_hold,
+            now_inst,
+            sleep_dur,
+            Some(&mut core_ref.torque_shadow),
+        );
+    } else {
+        loop {
+            thread::park();
+        }
+    }
 }
 
 /// Enters preallocated, lock-free, zero-allocation SAFE-HOLD on `armd-control` while retaining
@@ -8541,16 +8626,24 @@ fn run_executor_safe_hold(
             None,
             Some(hard_deadline),
         );
-        lifecycle.safe_hold.record_process_exit_outcome_lockfree(&outcome);
-        lifecycle.safe_hold.mark_exited();
-        lifecycle.set_owner_state(LC_OWNER_PROCESS_EXIT_DONE);
+        finalize_process_exit_or_retain_safe_hold(
+            core,
+            &outcome,
+            safe_hold_bufs,
+            lifecycle,
+            exited,
+            control_exited_cv,
+            hub,
+            clock_hook,
+            control_stop,
+        );
     } else {
         lifecycle.safe_hold.mark_active(reason);
         lifecycle.safe_hold.mark_exited();
         lifecycle.set_owner_state(LC_OWNER_DISARMED_EXITED);
+        drop(core);
+        mark_control_exited(exited, control_exited_cv, hub);
     }
-    drop(core);
-    mark_control_exited(exited, control_exited_cv, hub);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9552,21 +9645,28 @@ fn control_thread_main(
             None,
             explicit_dl,
         );
-        lifecycle
-            .safe_hold
-            .record_process_exit_outcome_lockfree(&outcome);
-        lifecycle.set_owner_state(LC_OWNER_PROCESS_EXIT_DONE);
-        drop(core);
-        mark_control_exited(&exited, &control_exited_cv, &hub);
+        finalize_process_exit_or_retain_safe_hold(
+            core,
+            &outcome,
+            &mut safe_hold_bufs,
+            &lifecycle,
+            &exited,
+            &control_exited_cv,
+            &hub,
+            &clock_hook,
+            &control_stop,
+        );
         return;
     }
 
     if req_kind == LC_REQ_HANDBACK {
-        // Quiesce any active motion, verify fresh hold coverage if energized, restore legacy
-        // driver mode — ALL inside `catch_unwind` while keeping `core` in outer ownership (B2/B6).
+        // Quiesce any active motion, verify receiver readiness + fresh hold coverage if energized,
+        // restore legacy driver mode — ALL inside `catch_unwind` while keeping `core` in outer
+        // ownership (B2/B4/B6).
+        let has_live_receiver = lifecycle.handback_has_live_receiver();
         let prep_ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let disarmed = core_is_confirmed_disarmed(&core);
-            if !disarmed && !core.quiesce_motion_and_refresh_hold_for_handback() {
+            if !disarmed && (!has_live_receiver || !core.quiesce_motion_and_refresh_hold_for_handback()) {
                 return false;
             }
             let core_ref = &mut *core;
@@ -9635,12 +9735,17 @@ fn control_thread_main(
                         None,
                         explicit_dl,
                     );
-                    lifecycle
-                        .safe_hold
-                        .record_process_exit_outcome_lockfree(&outcome);
-                    lifecycle.set_owner_state(LC_OWNER_PROCESS_EXIT_DONE);
-                    drop(core);
-                    mark_control_exited(&exited, &control_exited_cv, &hub);
+                    finalize_process_exit_or_retain_safe_hold(
+                        core,
+                        &outcome,
+                        &mut safe_hold_bufs,
+                        &lifecycle,
+                        &exited,
+                        &control_exited_cv,
+                        &hub,
+                        &clock_hook,
+                        &control_stop,
+                    );
                 } else if core_is_confirmed_disarmed(&core) {
                     lifecycle.set_owner_state(LC_OWNER_DISARMED_EXITED);
                     drop(core);

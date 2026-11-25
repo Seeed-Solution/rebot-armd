@@ -124,6 +124,9 @@ impl ZeroOffsetDriver {
 impl ArmDriver for ZeroOffsetDriver {
     fn capabilities(&self) -> DriverCapabilities { self.inner.capabilities() }
     fn enable_state(&self) -> EnableState { self.inner.enable_state() }
+    fn is_hardware_disarmed_confirmed(&self) -> bool {
+        self.inner.is_hardware_disarmed_confirmed()
+    }
     fn reported_torque_loss_sample_seq(&self) -> Option<u64> {
         self.inner.reported_torque_loss_sample_seq()
     }

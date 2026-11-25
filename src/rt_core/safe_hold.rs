@@ -548,12 +548,40 @@ impl SafeHoldBuffers {
                     reason: DisableProtectiveReason::Thermal,
                 };
                 if !self.thermal_disable_started {
-                    let _ = drv.begin_disable_torque_budgeted(kind, 0);
-                    self.thermal_disable_started = true;
+                    match drv.begin_disable_torque_budgeted(kind, 0) {
+                        Ok(TorqueProgress::Done(crate::driver::TorqueOutcome::Confirmed)) => {
+                            self.thermal_disable_started = true;
+                            ctrl.thermal_disable_confirmed.store(true, Ordering::Release);
+                        }
+                        Ok(TorqueProgress::Done(crate::driver::TorqueOutcome::Unconfirmed)) => {
+                            // Never falsely mark unconfirmed thermal disable as confirmed; retry.
+                            self.thermal_disable_started = false;
+                        }
+                        Ok(TorqueProgress::Pending { .. }) => {
+                            self.thermal_disable_started = true;
+                        }
+                        Err(_) => {
+                            self.thermal_disable_started = false;
+                        }
+                    }
                 }
-                if let Ok(TorqueProgress::Done(_)) = drv.poll_torque_budgeted(drv_cap, RX_FRAME_BUDGET)
+                if self.thermal_disable_started
+                    && !ctrl.thermal_disable_confirmed.load(Ordering::Acquire)
                 {
-                    ctrl.thermal_disable_confirmed.store(true, Ordering::Release);
+                    match drv.poll_torque_budgeted(drv_cap, RX_FRAME_BUDGET) {
+                        Ok(TorqueProgress::Done(crate::driver::TorqueOutcome::Confirmed)) => {
+                            ctrl.thermal_disable_confirmed.store(true, Ordering::Release);
+                        }
+                        Ok(TorqueProgress::Done(crate::driver::TorqueOutcome::Unconfirmed)) => {
+                            self.thermal_disable_started = false;
+                        }
+                        Ok(TorqueProgress::Pending { .. }) => {}
+                        Err(_) => {
+                            if !drv.torque_transition_pending() {
+                                self.thermal_disable_started = false;
+                            }
+                        }
+                    }
                 }
                 if let Some(ref mut sh) = shadow {
                     sh.drain_from_driver(drv);
@@ -749,14 +777,49 @@ impl SafeHoldBuffers {
         self.run_loop_with_shadow(drv, ctrl, reason, now_fn, sleep_dur, None)
     }
 
+    /// Runs the periodic SAFE-HOLD loop indefinitely after a failed/unconfirmed/timed-out
+    /// `ProcessExit` disable so an energized or unconfirmed driver is NEVER dropped (DRV-F1 B5).
+    pub fn run_post_exit_hold_forever<FNow, FSleep>(
+        &mut self,
+        drv: &mut dyn ArmDriver,
+        ctrl: &SafeHoldControl,
+        mut now_fn: FNow,
+        mut sleep_dur: FSleep,
+        mut shadow: Option<&mut crate::torque::shadow::ShadowRuntime>,
+    ) -> !
+    where
+        FNow: FnMut() -> Instant,
+        FSleep: FnMut(Duration),
+    {
+        self.prepare_driver_on_entry(drv);
+        let period = self.period.max(Duration::from_millis(1));
+        loop {
+            let tick_start = now_fn();
+            let release_deadline = tick_start + period;
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.step_driver_with_shadow(
+                    drv,
+                    ctrl,
+                    release_deadline,
+                    &mut now_fn,
+                    shadow.as_deref_mut(),
+                );
+            }));
+            let elapsed = now_fn().saturating_duration_since(tick_start);
+            if let Some(rem) = period.checked_sub(elapsed) {
+                sleep_dur(rem);
+            }
+        }
+    }
+
     /// Shadow-aware variant of [`Self::run_loop`] (used by Legacy SAFE-HOLD extraction).
     pub fn run_loop_with_shadow<FNow, FSleep>(
         &mut self,
         drv: &mut dyn ArmDriver,
         ctrl: &SafeHoldControl,
         reason: SafeHoldReason,
-        now_fn: FNow,
-        sleep_dur: FSleep,
+        mut now_fn: FNow,
+        mut sleep_dur: FSleep,
         mut shadow: Option<&mut crate::torque::shadow::ShadowRuntime>,
     ) -> PanicDisableOutcome
     where
@@ -767,8 +830,8 @@ impl SafeHoldBuffers {
             drv,
             ctrl,
             reason,
-            now_fn,
-            sleep_dur,
+            &mut now_fn,
+            &mut sleep_dur,
             shadow.as_deref_mut(),
         );
         let origin = Instant::now();
@@ -801,8 +864,20 @@ impl SafeHoldBuffers {
                 sh.flush_deferred_steps();
             }));
         }
+        // Publish outcome and wake caller FIRST so failed/unconfirmed/timed-out ProcessExit never
+        // hangs caller; retain sole driver ownership in SAFE-HOLD on any non-confirmed outcome (B5).
         ctrl.record_process_exit_outcome_lockfree(&outcome);
         ctrl.mark_exited();
+        let disarmed = matches!(
+            outcome,
+            PanicDisableOutcome::Confirmed | PanicDisableOutcome::NoDriver
+        ) || std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drv.is_hardware_disarmed_confirmed()
+        }))
+        .unwrap_or(false);
+        if !disarmed {
+            self.run_post_exit_hold_forever(drv, ctrl, now_fn, sleep_dur, shadow);
+        }
         outcome
     }
 }

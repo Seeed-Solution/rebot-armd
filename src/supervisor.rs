@@ -973,6 +973,8 @@ pub struct SupervisorInner {
     /// Owner-owned torque decision state (`On` by default on hardware until an accepted disable
     /// or `DisableProtective` sets `Off`; never inferred from feedback telemetry).
     pub torque_intent: driver_transitions::TorqueIntent,
+    /// Explicit owner-bound ProcessExit authorization flag (DRV-F1 B7).
+    pub(crate) process_exit_authorized: bool,
     /// Monotonic control-release sequence counter pushed to the driver once per release so
     /// rest-pose K=3 ticks count control releases, never individual RX receive passes.
     pub(crate) control_release_seq: u64,
@@ -2376,6 +2378,7 @@ impl SupervisorInner {
             last_tick_torque_ws_direction: None,
             enable_lifecycle: driver_transitions::EnableLifecycle::Disarmed,
             torque_intent: driver_transitions::TorqueIntent::Off,
+            process_exit_authorized: false,
             control_release_seq: 0,
             control_release_seq_atomic: Arc::new(AtomicU64::new(0)),
             #[cfg(not(target_arch = "wasm32"))]
@@ -5986,7 +5989,16 @@ impl SupervisorInner {
         if !self.safety.state().is_stopped() {
             self.execute_stop(StopPolicy::EStopLatch);
         }
-        let unaccepted_idle = self.torque_intent == TorqueIntent::On && (!self.is_torqued || self.disable_pending);
+        let hw_known_enabled = self.driver.as_ref().is_some_and(|d| {
+            d.try_with_ref(|drv| {
+                drv.enable_state() == EnableState::Enabled
+                    || drv.has_any_joint_enabled()
+                    || drv.has_known_partial_enable()
+            })
+            .unwrap_or(true)
+        });
+        let unaccepted_idle =
+            self.torque_intent == TorqueIntent::On && (!self.is_torqued || self.disable_pending);
         if unaccepted_idle && self.shutdown_refused_unknown {
             let exit_kind = crate::driver::DisableKind::DisableProtective {
                 reason: crate::driver::DisableProtectiveReason::ProcessExit,
@@ -6006,7 +6018,8 @@ impl SupervisorInner {
                 return true;
             }
         }
-        self.shutdown_refused_unknown = unaccepted_idle;
+        // Only arm repeated-shutdown Unknown fallback when hardware is NOT known enabled (DRV-F1 B7).
+        self.shutdown_refused_unknown = unaccepted_idle && !hw_known_enabled;
         false
     }
 
@@ -9193,7 +9206,22 @@ impl SupervisorInner {
                     live_is_torqued: self.is_torqued,
                     live_stopped: self.safety.state().is_stopped(),
                 });
-            if !rx_tx_cap_expired && self.has_non_broker_torque_transition() {
+            if rx_tx_cap_expired {
+                // Cutoff already expired: read cached feedback ONLY so unbudgeted RX can never
+                // emit Damiao recovery TX past the release cutoff (DRV-F1 B9).
+                let expired_now = now_fn();
+                let expired_budget = crate::rt_core::ops::ServiceBudget {
+                    now: expired_now,
+                    deadline: expired_now,
+                    max_rx_frames: 0,
+                };
+                self.poll_hardware_rx_with_clock(
+                    Some(&expired_budget),
+                    None,
+                    release_deadline,
+                    now_fn,
+                )
+            } else if self.has_non_broker_torque_transition() {
                 let now = legacy_step_start.unwrap_or_else(&mut *now_fn);
                 let deadline = legacy_step_deadline.unwrap_or_else(|| now + LEGACY_TORQUE_STEP_BUDGET);
                 let budget = crate::rt_core::ops::ServiceBudget {
@@ -12559,6 +12587,65 @@ enum Fresh<'a> {
 
 impl Drop for ArmSupervisor {
     fn drop(&mut self) {
+        // DRV-F1 B2: NEVER destroy an energized or unconfirmed Legacy driver on Drop.
+        // If this Legacy shell still holds a non-disarmed driver, extract it and hand it to a
+        // detached SAFE-HOLD writer thread.
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.owner_mode.load(Ordering::Acquire) == OWNER_LEGACY
+            && !self.process_exit_requested.load(Ordering::Acquire)
+        {
+            if let Ok(mut guard) = self.inner.try_write() {
+                if !guard.detached
+                    && !guard.shutdown_committed
+                    && !crate::rt_core::executor::core_is_confirmed_disarmed(&guard)
+                {
+                    let period = Duration::from_secs_f64(
+                        1.0 / f64::from(guard.config.control_frequency_hz.max(1)),
+                    );
+                    let mut safe_hold_bufs =
+                        crate::rt_core::safe_hold::SafeHoldBuffers::from_config(&guard.config, period);
+                    safe_hold_bufs.attach_stop_mirrors(
+                        Arc::clone(&self.estop_state),
+                        Arc::clone(&guard.estop_applied),
+                        guard.stop_requests.clone(),
+                    );
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        safe_hold_bufs.seed_on_entry(&guard);
+                    }));
+                    let extracted = guard
+                        .driver
+                        .take()
+                        .map(crate::supervisor_lock::DriverSlot::into_driver_recover_for_safe_hold);
+                    let mut extracted_shadow = {
+                        let disabled =
+                            crate::torque::shadow::ShadowRuntime::disabled(&guard.config);
+                        std::mem::replace(&mut guard.torque_shadow, disabled)
+                    };
+                    if let Some(mut drv) = extracted {
+                        guard.detached = true;
+                        let sh_ctrl = Arc::clone(&self.legacy_safe_hold);
+                        let spawn_res = std::thread::Builder::new()
+                            .name("armd-safe-hold-drop".into())
+                            .spawn(move || {
+                                let _ = safe_hold_bufs.run_loop_with_shadow(
+                                    drv.as_mut(),
+                                    &sh_ctrl,
+                                    crate::rt_core::safe_hold::SafeHoldReason::TeardownWhileEnergized,
+                                    Instant::now,
+                                    std::thread::sleep,
+                                    Some(&mut extracted_shadow),
+                                );
+                                drop(drv);
+                            });
+                        if let Err(e) = spawn_res {
+                            tracing::error!(
+                                "Failed to spawn SAFE-HOLD retention thread on ArmSupervisor::drop: {e}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
         self.hub.close();
         #[cfg(not(target_arch = "wasm32"))]
         self.torque_shadow
@@ -12945,24 +13032,34 @@ impl ArmSupervisor {
             },
         );
 
-        if panicked {
-            // Fence all new commands/rearm immediately and mark SAFE-HOLD active BEFORE acquiring
-            // the shell write guard. Never abandon an energized driver on transient lock contention
-            // (B7): keep retrying `try_write()` until the driver is extracted or confirmed disarmed
-            // (hardware-verified, B5), or deliberate ProcessExit wakes us.
-            safe_hold_ctrl.mark_active(crate::rt_core::safe_hold::SafeHoldReason::ControlPanic);
-            #[cfg(not(target_arch = "wasm32"))]
-            self.torque_shadow.wake();
+        // Unified Legacy loop exit disposition (DRV-F1 B1/B2/B5):
+        // - Confirmed disarm, completed ownership transfer (`guard.detached`), committed shutdown,
+        //   or explicit ProcessExit authorization exits cleanly without abandoning an energized arm.
+        // - Control panic OR ordinary stop while energized/unconfirmed atomically detaches the
+        //   shell (`guard.detached = true`), publishes `OwnerSlot::Failed` + `DetachedSafeHold`,
+        //   and retains exclusive ownership in SAFE-HOLD until thermal trip or deliberate ProcessExit.
+        let need_safe_hold_check = panicked || !self.process_exit_requested.load(Ordering::Acquire);
+        if need_safe_hold_check {
+            let reason = if panicked {
+                crate::rt_core::safe_hold::SafeHoldReason::ControlPanic
+            } else {
+                crate::rt_core::safe_hold::SafeHoldReason::TeardownWhileEnergized
+            };
+            if panicked {
+                safe_hold_ctrl.mark_active(reason);
+                #[cfg(not(target_arch = "wasm32"))]
+                self.torque_shadow.wake();
+            }
             let mut extracted_driver: Option<Box<dyn ArmDriver>> = None;
             #[cfg(not(target_arch = "wasm32"))]
             let mut extracted_shadow: Option<crate::torque::shadow::ShadowRuntime> = None;
             loop {
                 if let Ok(mut guard) = self.inner.try_write() {
-                    if !guard.detached {
+                    if !guard.detached && !guard.shutdown_committed {
                         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             safe_hold_bufs.seed_on_entry(&guard);
                             #[cfg(not(target_arch = "wasm32"))]
-                            {
+                            if panicked {
                                 let live_intent = guard.shadow_live_intent();
                                 let live_is_torqued = guard.is_torqued;
                                 guard.torque_shadow.enqueue(
@@ -12976,12 +13073,38 @@ impl ArmSupervisor {
                                 guard.flush_torque_shadow();
                             }
                         }));
-                        if !crate::rt_core::executor::core_is_confirmed_disarmed(&guard) {
+                        if !crate::rt_core::executor::core_is_confirmed_disarmed(&guard)
+                            && !self.process_exit_requested.load(Ordering::Acquire)
+                        {
+                            self.estop_state.latch();
+                            self.internal_fault_lane.latch_control_safe_hold_fence();
+                            safe_hold_ctrl.mark_active(reason);
+                            #[cfg(not(target_arch = "wasm32"))]
+                            if !panicked {
+                                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    let live_intent = guard.shadow_live_intent();
+                                    let live_is_torqued = guard.is_torqued;
+                                    guard.torque_shadow.enqueue(
+                                        crate::torque::shadow::ShadowInputKind::Stop {
+                                            kind: crate::torque::StopKind::EStop,
+                                            live_intent,
+                                            live_is_torqued,
+                                            live_stopped: true,
+                                        },
+                                    );
+                                    guard.flush_torque_shadow();
+                                }));
+                            }
                             extracted_driver = guard
                                 .driver
                                 .take()
                                 .map(crate::supervisor_lock::DriverSlot::into_driver_recover_for_safe_hold);
                             if extracted_driver.is_some() {
+                                // Atomically detach the shell AND publish `OwnerSlot::Failed` +
+                                // `WriterEndpoint::DetachedSafeHold` inside the same write-guard
+                                // transaction so `try_set_driver()` and `start_executor()` can
+                                // NEVER admit a second bus writer while SAFE-HOLD runs (DRV-F1 B1).
+                                guard.detached = true;
                                 #[cfg(not(target_arch = "wasm32"))]
                                 {
                                     let disabled =
@@ -12991,9 +13114,6 @@ impl ArmSupervisor {
                                         disabled,
                                     ));
                                 }
-                                // Publish exclusive SAFE-HOLD transition atomically under `guard`
-                                // so `try_set_driver()` and `start_executor()` can NEVER install a
-                                // second bus writer while SAFE-HOLD owns the hardware (B4).
                                 {
                                     let mut slot =
                                         self.owner.lock().unwrap_or_else(|e| e.into_inner());
@@ -13018,11 +13138,15 @@ impl ArmSupervisor {
                 if safe_hold_ctrl.process_exit_requested() {
                     // Process exit requested while shell write guard is still contended: run
                     // bounded legacy panic disable once the lock frees within the exit deadline.
+                    self.process_exit_requested.store(true, Ordering::Release);
                     let dl = safe_hold_ctrl.process_exit_deadline();
                     let rem = dl.saturating_duration_since(Instant::now());
                     let outcome = self.attempt_legacy_panic_disable(rem);
                     safe_hold_ctrl.record_process_exit_outcome_lockfree(&outcome);
                     safe_hold_ctrl.mark_exited();
+                    return;
+                }
+                if !panicked && self.process_exit_requested.load(Ordering::Acquire) {
                     return;
                 }
                 std::thread::sleep(Duration::from_millis(1));
@@ -13032,7 +13156,7 @@ impl ArmSupervisor {
                 let _ = safe_hold_bufs.run_loop_with_shadow(
                     drv.as_mut(),
                     &safe_hold_ctrl,
-                    crate::rt_core::safe_hold::SafeHoldReason::ControlPanic,
+                    reason,
                     Instant::now,
                     std::thread::sleep,
                     extracted_shadow.as_mut(),
@@ -13041,12 +13165,12 @@ impl ArmSupervisor {
                 let _ = safe_hold_bufs.run_loop(
                     drv.as_mut(),
                     &safe_hold_ctrl,
-                    crate::rt_core::safe_hold::SafeHoldReason::ControlPanic,
+                    reason,
                     Instant::now,
                     std::thread::sleep,
                 );
                 drop(drv);
-            } else {
+            } else if panicked {
                 safe_hold_ctrl.mark_exited();
             }
         }
@@ -13427,9 +13551,10 @@ impl ArmSupervisor {
     }
 
     fn check_legacy_under_guard(&self, inner: &SupervisorInner) -> Result<(), ArmError> {
-        if !inner.detached {
+        let mode = self.owner_mode.load(Ordering::Acquire);
+        if !inner.detached && mode == OWNER_LEGACY && !self.has_detached_safe_hold() {
             Ok(())
-        } else if self.owner_mode.load(Ordering::Acquire) == OWNER_EXECUTOR {
+        } else if mode == OWNER_EXECUTOR {
             Err(owner_transferred())
         } else {
             Err(executor_unavailable())
@@ -13904,8 +14029,8 @@ impl ArmSupervisor {
         }
 
         // Zero `.await` points below: commit handback request on `armd-control` within the SAME
-        // deadline. Disarm the cancel guard only after we commit to either Legacy or Failed/SafeHold.
-        match handle.take_handback_core_until(deadline) {
+        // deadline, carrying `live_receiver.is_some()` to the owner-side commit point (DRV-F1 B4).
+        match handle.take_handback_core_until(deadline, live_receiver.is_some()) {
             Ok(mut core) => {
                 if let Some(slot) = core.driver.take() {
                     core.driver = Some(slot.into_legacy(Arc::clone(&self.driver_lock_attempts)));
@@ -14937,9 +15062,19 @@ impl ArmSupervisor {
     }
 
     pub async fn try_set_driver(&self, mut driver: Box<dyn ArmDriver>) -> Result<(), ArmError> {
-        driver.set_estop_state(self.estop_state.clone());
+        // Acquire the legacy shell lock and verify authoritative writer/disarm state BEFORE
+        // performing ANY I/O on the incoming driver (DRV-F1 B1/B3).
         let mut inner = self.inner.write().await;
         self.check_legacy_under_guard(&inner)?;
+        #[cfg(not(target_arch = "wasm32"))]
+        if inner.driver.is_some() && !crate::rt_core::executor::core_is_confirmed_disarmed(&inner) {
+            return Err(ArmError::Rejected {
+                status: 409,
+                code: "DRIVER_ENERGIZED".into(),
+                message: "Cannot replace an energized or unconfirmed hardware driver".into(),
+            });
+        }
+        driver.set_estop_state(self.estop_state.clone());
         driver.set_estop_gate(inner.estop_gate());
         driver.set_gripper_index(inner.config.gripper_index());
         let mut drv: Box<dyn ArmDriver> = Box::new(crate::joint_zero::ZeroOffsetDriver::new(driver, &inner.joint_zero_offsets));
@@ -14973,9 +15108,14 @@ impl ArmSupervisor {
     }
 
     pub fn with_driver(self, mut driver: Box<dyn ArmDriver>) -> Self {
-        driver.set_estop_state(self.estop_state.clone());
         if let Ok(mut inner) = self.inner.try_write() {
-            if self.check_legacy_under_guard(&inner).is_ok() {
+            #[cfg(not(target_arch = "wasm32"))]
+            let replaceable = inner.driver.is_none()
+                || crate::rt_core::executor::core_is_confirmed_disarmed(&inner);
+            #[cfg(target_arch = "wasm32")]
+            let replaceable = inner.driver.is_none();
+            if self.check_legacy_under_guard(&inner).is_ok() && replaceable {
+                driver.set_estop_state(self.estop_state.clone());
                 driver.set_estop_gate(inner.estop_gate());
                 driver.set_gripper_index(inner.config.gripper_index());
                 driver.set_strict_mode_handover(inner.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled));
@@ -16961,7 +17101,27 @@ impl ArmSupervisor {
     /// blocking transport syscall stalls). `timeout` is the hard upper bound, with a small
     /// internal cooperative reserve so clean `Unconfirmed` exhaustion finishes logging, lock
     /// release, and channel handoff before `rx.recv_timeout` triggers `TimedOut`.
+    /// Explicit test-only authorization hook for legacy `ProcessExit` protective disable tests.
+    #[doc(hidden)]
+    pub fn authorize_process_exit_for_test(&self) {
+        self.process_exit_requested.store(true, Ordering::Release);
+    }
+
+    /// Bounded legacy `DisableProtective { ProcessExit }` helper. Requires explicit owner-bound
+    /// `ProcessExit` authorization (`emergency_process_exit_disable_until`, `shutdown_committed`,
+    /// or `authorize_process_exit_for_test`) so ad-hoc callers cannot issue a protective cut
+    /// outside process exit (DRV-F1 B7).
     pub fn attempt_legacy_panic_disable(&self, timeout: Duration) -> PanicDisableOutcome {
+        let exit_authorized = self.process_exit_requested.load(Ordering::Acquire)
+            || self
+                .inner
+                .try_read()
+                .is_ok_and(|g| !g.detached && g.shutdown_committed);
+        if !exit_authorized {
+            return PanicDisableOutcome::Failed(
+                "legacy protective disable requires explicit ProcessExit authorization".into(),
+            );
+        }
         self.estop_state.request_and_latch();
         let run_inline = |inner: Arc<SupervisorLock<SupervisorInner>>,
                           coop_deadline: Instant,

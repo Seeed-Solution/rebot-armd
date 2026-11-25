@@ -1439,6 +1439,7 @@ fn thermal_trip_and_shutdown_disable_at_raised_pose_without_consulting_rest_pose
         s.push_all_feedback();
     });
     inner_p.tick(0.02);
+    inner_p.authorize_process_exit_for_test();
     let outcome = inner_p.attempt_panic_disable(Duration::from_secs(1));
     assert_eq!(outcome, armd::supervisor::PanicDisableOutcome::Confirmed);
     assert!(!inner_p.is_torqued, "panic/forced teardown must cut torque at a raised pose");

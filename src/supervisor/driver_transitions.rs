@@ -9987,10 +9987,22 @@ impl SupervisorInner {
         self.disable_requested();
     }
 
-    /// Bounded last-chance disable on a caught-panic path owned by this `SupervisorInner`.
-    /// Seals the live `PanicDisableOutcome` strictly BEFORE running shadow drain/flush so
-    /// shadow processing can never turn a confirmed panic disable into a hard deadline timeout.
+    /// Explicit test-only ProcessExit authorization on `SupervisorInner` (DRV-F1 B7).
+    #[doc(hidden)]
+    pub fn authorize_process_exit_for_test(&mut self) {
+        self.process_exit_authorized = true;
+    }
+
+    /// Bounded last-chance disable reserved for explicit `ProcessExit` paths owned by this
+    /// `SupervisorInner`. Refuses protective cuts unless explicit owner-bound ProcessExit
+    /// authorization is set (`process_exit_authorized` or `shutdown_committed`, DRV-F1 B7).
+    #[doc(hidden)]
     pub fn attempt_panic_disable(&mut self, timeout: Duration) -> PanicDisableOutcome {
+        if !self.process_exit_authorized && !self.shutdown_committed {
+            return PanicDisableOutcome::Failed(
+                "protective disable requires explicit ProcessExit authorization".into(),
+            );
+        }
         self.attempt_bounded_teardown_disable(timeout, true)
     }
 
@@ -10618,6 +10630,7 @@ mod panic_disable_tests {
             let _ = rel_rx.recv();
         });
         locked_rx.recv().unwrap();
+        sup.authorize_process_exit_for_test();
         let legacy_outcome = sup.attempt_legacy_panic_disable(Duration::from_millis(12));
         rel_tx.send(()).unwrap();
         holder.join().unwrap();

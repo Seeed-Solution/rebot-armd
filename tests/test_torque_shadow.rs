@@ -1766,6 +1766,7 @@ fn shutdown_refused_vs_accepted_and_caught_panic_ordering() {
     assert!(!inner.shutdown_committed);
 
     // Caught panic disable records Panic BEFORE panic-disable writes and flushes cleanly!
+    inner.authorize_process_exit_for_test();
     let outcome = inner.attempt_panic_disable(Duration::from_millis(200));
     assert_eq!(outcome, armd::supervisor::PanicDisableOutcome::Confirmed);
     inner.test_flush_and_drain_torque_shadow();
