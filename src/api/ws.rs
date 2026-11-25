@@ -2534,11 +2534,12 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     continue;
                 }
                 joined = async { (&mut macro_check.as_mut().expect("guarded by the precondition").rx).await }, if macro_active => {
-                    let MacroCheck { request_id, generation, stamp, .. } = macro_check.take().expect("checked above");
+                    let MacroCheck { request_id, generation, stamp, executor, .. } = macro_check.take().expect("checked above");
                     let Some((reply, macro_gate)) = actions::complete_macro_check(
                         request_id,
                         generation,
                         stamp,
+                        executor,
                         joined,
                         &recv_supervisor,
                         &recv_connection,
@@ -2718,6 +2719,36 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         if let Some(reply) = opt_reply {
                             if !worker_writer.send_ordinary_control(reply).await {
                                 break;
+                            }
+                        }
+                        continue;
+                    }
+                    if let Some(grasp_disp) = actions::handle_executor_ws_grasp(
+                        frame_kind,
+                        entry,
+                        &value,
+                        stamp,
+                        recv_conn_id,
+                        &recv_connection,
+                        &recv_generation,
+                        &recv_client_label,
+                        &mut last_ordinary_request,
+                        &ws_auth,
+                        &recv_supervisor,
+                        &recv_deps,
+                        &worker_closing,
+                        &worker_tasks,
+                    )
+                    .await
+                    {
+                        match grasp_disp {
+                            actions::ExecutorGraspDispatch::Reply(reply) => {
+                                if !worker_writer.send_ordinary_control(reply).await {
+                                    break;
+                                }
+                            }
+                            actions::ExecutorGraspDispatch::Macro(check) => {
+                                macro_check = Some(check);
                             }
                         }
                         continue;
