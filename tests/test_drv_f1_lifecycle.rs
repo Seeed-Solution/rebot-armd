@@ -1751,3 +1751,267 @@ async fn drv_f1_blocker1_process_exit_requires_causal_disarm_proof_and_retains_d
         .await;
     }
 }
+
+/// Blocker 2 regression:
+/// Energized handback MUST require fresh (`<= 100 ms`), mode-verified J1–J6 hold coverage right
+/// at the handback commit boundary. Stale feedback OR unverified hold mode after a previously
+/// valid capture must abort handback and retain sole driver ownership in SAFE-HOLD (NEVER
+/// publish `OWNER_LEGACY` or emit `CMD_DISABLE`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drv_f1_blocker2_energized_handback_rejects_stale_or_unverified_hold_coverage() {
+    // Part A: Stale feedback on J3 after a previously valid J1–J6 capture.
+    {
+        let raised = [0.35, -0.25, 0.45, 0.15, -0.15, 0.05, -0.90];
+        let (sup, bus) = make_energized_dm_supervisor(raised, None, false);
+        sup.set_lease_enabled(false).await;
+        sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
+
+        let handle = sup
+            .start_executor(ExecutorConfig::for_tests(Duration::from_millis(5)))
+            .await
+            .unwrap();
+        wait_until_async(Duration::from_secs(2), "executor running ticks", || {
+            handle.stats().steps.load(Ordering::Relaxed) >= 4
+        })
+        .await;
+
+        // Latch E-stop while fresh so `measured_hold.captured_positions[0..6]` is populated
+        // with a previously valid capture.
+        sup.trigger_e_stop().await;
+        wait_until_async(Duration::from_secs(2), "executor holding captured pose", || {
+            handle.stats().steps.load(Ordering::Relaxed) >= 8
+        })
+        .await;
+
+        // Silence J3 and let its feedback age past `STOPPED_DISABLE_FEEDBACK_MAX_AGE` (100 ms)
+        // while keeping `measured_hold.captured_positions[2]` retained from the earlier capture.
+        bus.with(|s| {
+            s.tx_log.clear();
+            s.motors[2].silent = true;
+        });
+        tokio::time::sleep(Duration::from_millis(140)).await;
+
+        let res = sup
+            .handback_to_legacy_with_live_loop(Duration::from_millis(300), Duration::from_millis(5))
+            .await;
+        assert!(
+            res.is_err(),
+            "energized handback must reject stale J3 feedback even after a previously valid capture"
+        );
+        assert_eq!(
+            sup.owner_mode(),
+            OWNER_FAILED,
+            "rejected stale handback must NEVER publish OWNER_LEGACY"
+        );
+        wait_until_async(Duration::from_secs(2), "rejected handback entered SAFE-HOLD", || {
+            sup.is_detached_safe_hold_active()
+        })
+        .await;
+        assert_eq!(
+            sup.active_safe_hold_control().reason(),
+            SafeHoldReason::HandbackStalled
+        );
+        let disables = bus.with(|s| {
+            s.tx_log
+                .iter()
+                .filter(|f| f.data == damiao::CMD_DISABLE)
+                .count()
+        });
+        assert_eq!(disables, 0, "rejected handback must retain SAFE-HOLD with 0 CMD_DISABLE");
+
+        // Unsilence J3 and cleanly finish via deliberate ProcessExit.
+        bus.with(|s| s.motors[2].silent = false);
+        let outcome = sup
+            .emergency_process_exit_disable_until(Instant::now() + Duration::from_secs(2))
+            .await;
+        assert_eq!(outcome, PanicDisableOutcome::Confirmed);
+    }
+
+    // Part B: Unverified hold mode on J4 after a previously valid capture.
+    {
+        struct ModeToggleDriver {
+            inner: DamiaoArmDriver<FakeBus>,
+            j4_mode_verified: Arc<AtomicBool>,
+        }
+        impl ArmDriver for ModeToggleDriver {
+            fn capabilities(&self) -> DriverCapabilities { self.inner.capabilities() }
+            fn enable_state(&self) -> EnableState { self.inner.enable_state() }
+            fn is_hardware_disarmed_confirmed(&self) -> bool { self.inner.is_hardware_disarmed_confirmed() }
+            fn has_driver_fresh_position_api(&self) -> bool { self.inner.has_driver_fresh_position_api() }
+            fn fresh_measured_position_for(&self, joint: usize, max_age: Duration) -> Option<f32> {
+                self.inner.fresh_measured_position_for(joint, max_age)
+            }
+            fn fresh_measured_sample_for(&self, joint: usize, max_age: Duration) -> Option<(f32, u64)> {
+                self.inner.fresh_measured_sample_for(joint, max_age)
+            }
+            fn joint_hold_mode_verified(&self, joint: usize) -> bool {
+                if joint == 3 && !self.j4_mode_verified.load(Ordering::Acquire) {
+                    return false;
+                }
+                self.inner.joint_hold_mode_verified(joint)
+            }
+            fn is_feedback_valid(&self) -> bool { self.inner.is_feedback_valid() }
+            fn is_enabled(&self) -> bool { self.inner.is_enabled() }
+            fn has_any_joint_enabled(&self) -> bool { self.inner.has_any_joint_enabled() }
+            fn has_known_partial_enable(&self) -> bool { self.inner.has_known_partial_enable() }
+            fn torque_transition_pending(&self) -> bool { self.inner.torque_transition_pending() }
+            fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) { self.inner.feedback_ages_into(out) }
+            fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool {
+                self.inner.feedback_all_within(dof, max_age)
+            }
+            fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+                self.inner.read_joint_states()
+            }
+            fn read_joint_states_budgeted(
+                &mut self,
+                out: &mut Vec<JointState>,
+                deadline: Instant,
+                max_rx_frames: u16,
+            ) -> Result<(u16, bool), ArmDriverError> {
+                self.inner.read_joint_states_budgeted(out, deadline, max_rx_frames)
+            }
+            fn read_joint_states_safe_hold(
+                &mut self,
+                out: &mut Vec<JointState>,
+                deadline: Instant,
+                max_rx_frames: u16,
+            ) -> Result<(u16, bool), ArmDriverError> {
+                self.inner.read_joint_states_safe_hold(out, deadline, max_rx_frames)
+            }
+            fn read_cached_joint_states_into(&self, out: &mut Vec<JointState>) -> Option<()> {
+                self.inner.read_cached_joint_states_into(out)
+            }
+            fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
+                self.inner.write_joint_targets(targets)
+            }
+            fn write_joint_targets_bounded(
+                &mut self,
+                targets: &[JointTarget],
+            ) -> Result<armd::driver::TxBatchOutcome, ArmDriverError> {
+                self.inner.write_joint_targets_bounded(targets)
+            }
+            fn write_measured_hold_masked(
+                &mut self,
+                hold_mask: u64,
+                targets: &[JointTarget],
+            ) -> Result<HoldPassReport, ArmDriverError> {
+                self.inner.write_measured_hold_masked(hold_mask, targets)
+            }
+            fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> {
+                self.inner.set_torque(enabled)
+            }
+            fn begin_torque(&mut self, enabled: bool) -> Result<TorqueProgress, ArmDriverError> {
+                self.inner.begin_torque(enabled)
+            }
+            fn poll_torque(&mut self, deadline: Instant) -> Result<TorqueProgress, ArmDriverError> {
+                self.inner.poll_torque(deadline)
+            }
+            fn begin_torque_budgeted(
+                &mut self,
+                enabled: bool,
+                max_rx_frames: u16,
+            ) -> Result<TorqueProgress, ArmDriverError> {
+                self.inner.begin_torque_budgeted(enabled, max_rx_frames)
+            }
+            fn poll_torque_budgeted(
+                &mut self,
+                deadline: Instant,
+                max_rx_frames: u16,
+            ) -> Result<TorqueProgress, ArmDriverError> {
+                self.inner.poll_torque_budgeted(deadline, max_rx_frames)
+            }
+            fn panic_disable_step(
+                &mut self,
+                first: bool,
+                deadline: Instant,
+            ) -> Option<Result<Vec<usize>, ArmDriverError>> {
+                self.inner.panic_disable_step(first, deadline)
+            }
+            fn unconfirmed_disable_joints(&self) -> Vec<usize> {
+                self.inner.unconfirmed_disable_joints()
+            }
+            fn supports_rt_executor(&self) -> Result<(), &'static str> {
+                self.inner.supports_rt_executor()
+            }
+            fn set_rt_mode(&mut self, rt: bool) { self.inner.set_rt_mode(rt) }
+            fn set_tx_release_deadline(&mut self, deadline: Option<Instant>) {
+                self.inner.set_tx_release_deadline(deadline)
+            }
+            fn set_estop_state(&mut self, state: Arc<armd::rt_core::urgent::EstopState>) {
+                self.inner.set_estop_state(state)
+            }
+            fn set_estop_gate(&mut self, gate: armd::rt_core::urgent::EstopGate) {
+                self.inner.set_estop_gate(gate)
+            }
+            fn prepare_safe_hold(&mut self) { self.inner.prepare_safe_hold() }
+            fn clock_now(&self) -> Instant { self.inner.clock_now() }
+            fn clock_pause(&self, d: Duration) { self.inner.clock_pause(d) }
+            fn position_limits(&self, joint: usize) -> Option<(f32, f32)> {
+                self.inner.position_limits(joint)
+            }
+        }
+
+        let raised = [0.35, -0.25, 0.45, 0.15, -0.15, 0.05, -0.90];
+        let bus = FakeBus::new(&dm_limits(), raised, None);
+        bus.with(|s| s.push_all_feedback());
+        let mut dm = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(dm_limits())
+            .unwrap();
+        dm.read_joint_states().unwrap();
+        bus.with(|s| s.push_all_feedback());
+        dm.read_joint_states().unwrap();
+        dm.check_mapping_ranges();
+        let j4_mode_verified = Arc::new(AtomicBool::new(true));
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(
+            ModeToggleDriver {
+                inner: dm,
+                j4_mode_verified: Arc::clone(&j4_mode_verified),
+            },
+        )));
+        sup.set_lease_enabled(false).await;
+        sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
+
+        let handle = sup
+            .start_executor(ExecutorConfig::for_tests(Duration::from_millis(5)))
+            .await
+            .unwrap();
+        sup.trigger_e_stop().await;
+        wait_until_async(Duration::from_secs(2), "executor captured valid hold", || {
+            handle.stats().steps.load(Ordering::Relaxed) >= 6
+        })
+        .await;
+
+        // Drop mode verification on J4 while feedback remains fresh and previously captured.
+        bus.with(|s| s.tx_log.clear());
+        j4_mode_verified.store(false, Ordering::Release);
+
+        let res = sup
+            .handback_to_legacy_with_live_loop(Duration::from_millis(300), Duration::from_millis(5))
+            .await;
+        assert!(
+            res.is_err(),
+            "energized handback must reject unverified J4 hold mode even with fresh feedback"
+        );
+        assert_eq!(sup.owner_mode(), OWNER_FAILED);
+        wait_until_async(Duration::from_secs(2), "unverified-mode handback entered SAFE-HOLD", || {
+            sup.is_detached_safe_hold_active()
+        })
+        .await;
+        assert_eq!(
+            sup.active_safe_hold_control().reason(),
+            SafeHoldReason::HandbackStalled
+        );
+        let disables = bus.with(|s| {
+            s.tx_log
+                .iter()
+                .filter(|f| f.data == damiao::CMD_DISABLE)
+                .count()
+        });
+        assert_eq!(disables, 0);
+
+        let outcome = sup
+            .emergency_process_exit_disable_until(Instant::now() + Duration::from_secs(2))
+            .await;
+        assert_eq!(outcome, PanicDisableOutcome::Confirmed);
+    }
+}

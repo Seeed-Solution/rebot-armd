@@ -5817,7 +5817,8 @@ impl SupervisorInner {
     /// Quiesces active motion/targets, refreshes live measured-position hold provenance directly
     /// from the attached driver at a release boundary (zero allocs, zero locks on `Exclusive`),
     /// aligns `commanded_positions`/`target_positions` to fresh measured positions, and returns
-    /// `true` ONLY when every arm joint has verified finite hold coverage (DRV-F1 B2).
+    /// `true` ONLY when every arm joint (J1–J6) has fresh, finite, mode-verified hold coverage
+    /// right now (never accepting stale retained `captured_positions` or unverified modes).
     pub(crate) fn quiesce_motion_and_refresh_hold_for_handback(&mut self) -> bool {
         #[cfg(not(target_arch = "wasm32"))]
         self.cancel_active_commissioning_on_stop("HANDBACK");
@@ -5831,18 +5832,35 @@ impl SupervisorInner {
         self.commanded_velocities.fill(0.0);
         self.commanded_accelerations.fill(0.0);
         self.refresh_measured_hold_for_handback();
+        let snap = self.owner_driver_snapshot;
+        if !snap.valid {
+            return false;
+        }
         let dof = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
+        let gripper_idx = self.config.gripper_index();
         let arm_dof = self.config.arm_dof().min(dof);
         let mut all_arm_covered = true;
         for j in 0..dof {
-            if let Some(pos) = self.measured_hold.captured_positions[j].filter(|p| p.is_finite()) {
+            let is_arm_joint = j < arm_dof && gripper_idx != Some(j);
+            let fresh_pos = snap.fresh_samples[j]
+                .map(|(p, _)| p)
+                .filter(|p| p.is_finite());
+            let mode_verified = snap.hold_mode_verified[j];
+            let status_fresh = matches!(
+                self.measured_hold.joint_status[j],
+                crate::driver::JointHoldStatus::Held | crate::driver::JointHoldStatus::Queued
+            );
+            if let (Some(live_pos), true, true) = (fresh_pos, mode_verified, status_fresh) {
+                let hold_pos = self.measured_hold.captured_positions[j]
+                    .filter(|p| p.is_finite())
+                    .unwrap_or(live_pos);
                 if j < self.commanded_positions.len() {
-                    self.commanded_positions[j] = pos;
+                    self.commanded_positions[j] = hold_pos;
                 }
                 if j < self.target_positions.len() {
-                    self.target_positions[j] = pos;
+                    self.target_positions[j] = hold_pos;
                 }
-            } else if j < arm_dof {
+            } else if is_arm_joint {
                 all_arm_covered = false;
             }
         }
@@ -5853,6 +5871,7 @@ impl SupervisorInner {
     /// release boundary (zero allocations, zero locks on `DriverSlot::Exclusive`) immediately
     /// before energized handback to Legacy ownership.
     pub(crate) fn refresh_measured_hold_for_handback(&mut self) {
+        self.owner_driver_snapshot.invalidate();
         let dof = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
         if let Some(d) = self.driver.as_ref() {
             let mut ages = std::mem::take(&mut self.scratch.ages);
