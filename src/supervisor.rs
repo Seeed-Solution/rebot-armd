@@ -862,6 +862,8 @@ pub struct SupervisorInner {
     /// Active background/transition disable intent carried into driver sends and periodic retries.
     pub(crate) active_disable_kind: Option<crate::driver::DisableKind>,
     pub(crate) last_stopped_torque_off_refusal: Option<StoppedTorqueOffRefusal>,
+    /// Rate-limit timestamp for non-motion telemetry warnings when hardware reports `enable_state != Enabled`.
+    pub(crate) last_reported_torque_loss_warn: Option<Instant>,
     pub output_suspended: bool,
     pub feedback_numeric_valid: bool,
     pub(crate) sim_time_s: f64,
@@ -2009,6 +2011,7 @@ impl SupervisorInner {
             last_disable_attempt: None,
             active_disable_kind: None,
             last_stopped_torque_off_refusal: None,
+            last_reported_torque_loss_warn: None,
             output_suspended: false,
             feedback_numeric_valid: true,
             sim_time_s: 0.0,
@@ -3706,10 +3709,6 @@ impl SupervisorInner {
                 return true;
             }
             if has_support_load && !caps.load_feedback {
-                return true;
-            }
-            let enable = drv.enable_state();
-            if enable != EnableState::Enabled && !drv.has_known_partial_enable() {
                 return true;
             }
             if self.safety.state().is_stopped() {
@@ -6852,18 +6851,55 @@ impl SupervisorInner {
             }
         }
         if driver_torque_lost && self.is_torqued && !self.disable_pending {
-            self.stop_motion();
-            self.tracking.invalidate();
-            if self.measured_positions.iter().all(|p| p.is_finite()) {
-                copy_into(&mut self.commanded_positions, &self.measured_positions);
-                copy_into(&mut self.target_positions, &self.measured_positions);
+            let policy_running = {
+                #[cfg(feature = "policy-runtime")]
+                {
+                    self.policy_run.is_some()
+                }
+                #[cfg(not(feature = "policy-runtime"))]
+                {
+                    false
+                }
+            };
+            let in_active_motion = self.active_trajectory.is_some()
+                || self.servo_target.is_some()
+                || self.servo_stream_active
+                || self.pending_normal_unload
+                || self.quintic_settle.is_some()
+                || self.gripper_stream_target.is_some()
+                || self.mit.owner == crate::mit::MitOwner::Active
+                || policy_running;
+            if in_active_motion {
+                // M1: During active motion, `UnexpectedTorqueLoss` stays a fault, while
+                // `torque_intent` stays `On` so the arm keeps sending stationary holds.
+                self.stop_motion();
+                self.tracking.invalidate();
+                if self.measured_positions.iter().all(|p| p.is_finite()) {
+                    copy_into(&mut self.commanded_positions, &self.measured_positions);
+                    copy_into(&mut self.target_positions, &self.measured_positions);
+                }
+                self.commanded_velocities.fill(0.0);
+                self.commanded_accelerations.fill(0.0);
+                self.safety.latch(
+                    crate::safety::FaultKind::Other,
+                    crate::safety::FaultDetail::Static(crate::safety::StaticFault::UnexpectedTorqueLoss),
+                );
+            } else {
+                // M1: When holding / not actively moving, reported enable state is telemetry +
+                // warning only — never latch `UnexpectedTorqueLoss` or stop/drop holds.
+                let now = Instant::now();
+                let should_warn = self
+                    .last_reported_torque_loss_warn
+                    .is_none_or(|prev| now.saturating_duration_since(prev) >= Duration::from_secs(1));
+                if should_warn {
+                    self.last_reported_torque_loss_warn = Some(now);
+                    if !self.safety.deferred_logging() {
+                        tracing::warn!(
+                            "Motor feedback reports disabled/unknown while holding (telemetry only; holds remain active)"
+                        );
+                    }
+                }
             }
-            self.commanded_velocities.fill(0.0);
-            self.commanded_accelerations.fill(0.0);
-            self.safety.latch(
-                crate::safety::FaultKind::Other,
-                crate::safety::FaultDetail::Static(crate::safety::StaticFault::UnexpectedTorqueLoss),
-            );
         }
 
         // A single late tick only shortens integration (dt is clamped below); the motors

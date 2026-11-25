@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use rtrb::{Consumer, Producer, RingBuffer};
 
 use crate::auth::OperatorGrant;
-use crate::model::{EnableState, HolderLabel};
+use crate::model::HolderLabel;
 use crate::rt_core::broker::{Authority, BootId, ClientId, Descriptor};
 use crate::rt_core::ids::ArmId;
 use crate::rt_core::ops::CommitCtx;
@@ -1421,25 +1421,12 @@ pub fn install_lease_preempt(
         }
     }
 
-    let confirmed_hardware_disabled = match &inner.driver {
-        None => {
-            !inner.is_torqued
-                && !inner.disable_pending
-                && inner.safety.state() == &SafetyState::Idle
-        }
-        Some(driver) => {
-            !inner.is_torqued
-                && !inner.disable_pending
-                && inner.safety.state() == &SafetyState::Idle
-                && driver.lock().is_ok_and(|drv| {
-                    if !drv.capabilities().enable_feedback {
-                        true
-                    } else {
-                        drv.enable_state() == EnableState::Disabled
-                    }
-                })
-        }
-    };
+    // M1: Hardware-disabled readiness is owned strictly by decision state (`torque_intent == Off`),
+    // never inferred from feedback-reported `enable_state()`.
+    let confirmed_hardware_disabled = !inner.is_torqued
+        && inner.torque_intent == crate::supervisor::TorqueIntent::Off
+        && !inner.disable_pending
+        && inner.safety.state() == &SafetyState::Idle;
 
     let evicted = inner
         .active_lease

@@ -19,7 +19,7 @@
 
 use std::time::Duration;
 
-use crate::driver::{EnableState, JointMode, JointTarget, RangeCheckStatus};
+use crate::driver::{JointMode, JointTarget, RangeCheckStatus};
 use crate::model::{GravityCompExit, GravityCompObservation, GravityCompPolicy, ModeReason};
 use crate::motion::MotionError;
 use crate::safety::{FaultReason, SafetyError, SafetyState};
@@ -514,14 +514,16 @@ impl SupervisorInner {
         nonblocking: bool,
     ) -> crate::supervisor::TickOutput {
         use crate::supervisor::TickOutput;
-        if !self.is_torqued || self.disable_pending { return TickOutput::None; }
+        if !self.is_torqued
+            || self.disable_pending
+            || self.torque_intent != crate::supervisor::TorqueIntent::On
+        {
+            return TickOutput::None;
+        }
         let Some(targets) = self.gravity_comp_targets_array() else { return TickOutput::None; };
         let Some(d) = driver else { return TickOutput::None; };
         let guard = if nonblocking { d.try_lock().ok() } else { d.lock().ok() };
         let Some(mut drv) = guard else { return TickOutput::None; };
-        if drv.enable_state() == EnableState::Disabled {
-            return TickOutput::None;
-        }
         let is_hold = use_estop_hold
             || self.safety.state().is_stopped()
             || self.e_stop_latched.load(std::sync::atomic::Ordering::SeqCst);
@@ -589,14 +591,11 @@ impl SupervisorInner {
             }
             _ => {}
         }
-        if !self.is_torqued || self.disable_pending {
+        if !self.is_torqued
+            || self.disable_pending
+            || self.torque_intent != crate::supervisor::TorqueIntent::On
+        {
             return Some(("TORQUE_LOST", HolderLabel::new("Torque is off")));
-        }
-        if let Some(d) = &self.driver {
-            let enabled = d.lock().is_ok_and(|drv| !drv.capabilities().enable_feedback || drv.enable_state() == EnableState::Enabled);
-            if !enabled {
-                return Some(("TORQUE_LOST", HolderLabel::new("Motors no longer report enabled")));
-            }
         }
         if self.lease_enabled {
             if self.last_heartbeat.elapsed() > self.lease_timeout {

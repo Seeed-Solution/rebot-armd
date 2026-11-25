@@ -3134,13 +3134,16 @@ async fn zero_alloc_rt_l2_torque_and_clear_fault_with_tracing_enabled() {
 
         let _ = armd::diagnostics::alloc::take();
 
-        // 1. TorqueOff refused ARM_NOT_AT_RESTING_POSE (enable state Disabled / not at rest) -> 0 alloc.
+        // 1. TorqueOff refused ARM_NOT_AT_RESTING_POSE (arm raised off rest pose) -> 0 alloc.
         let ep1 = core.safety.epoch_id();
+        let saved_j1 = core.measured_positions[1];
+        core.measured_positions[1] = saved_j1 + 0.5;
         let d_off_refuse = mk_tr(10, TransitionOp::TorqueOff, ep1);
         assert_eq!(
             core.commit_transition(&d_off_refuse, TransitionOp::TorqueOff, &cctx),
             Err("ARM_NOT_AT_RESTING_POSE")
         );
+        core.measured_positions[1] = saved_j1;
 
         // 2. TorqueOn start -> poll confirmed -> TorqueOff start -> poll confirmed -> 0 alloc.
         ctrl.allow_enable_confirm.store(true, Ordering::SeqCst);

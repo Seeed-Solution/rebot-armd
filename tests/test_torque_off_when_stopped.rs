@@ -8473,3 +8473,113 @@ fn r11_b4_feetech_disable_rechecks_stopped_state_and_rest_evidence_after_drain()
         );
     }
 }
+
+/// R11 M1: Reported `enable_state()` is telemetry only when holding/stopped (never latches
+/// `UnexpectedTorqueLoss` or drops holds), while during active motion `UnexpectedTorqueLoss`
+/// stays a fault AND the arm keeps sending holds (`torque_intent == On`).
+#[test]
+fn r11_m1_reported_enable_state_is_telemetry_when_holding_and_keeps_holds_on_motion_fault() {
+    use armd::TorqueIntent;
+
+    let (mut inner, bus, clock) = make_driver_rig();
+    bus.with(|s| {
+        s.follow_commands = false;
+        s.immediate_replies = true;
+        for m in &mut s.motors {
+            m.q = 0.0;
+            m.v = 0.0;
+        }
+        s.push_all_feedback();
+    });
+    inner.tick(0.02);
+    enable_torque_admitted(&mut inner).unwrap();
+    assert_eq!(*inner.safety.state(), SafetyState::Armed);
+    assert_eq!(inner.torque_intent, TorqueIntent::On);
+
+    // Part 1: Stationary / holding (no active motion) — motor feedback reports disabled (status=0).
+    // Must NOT latch `UnexpectedTorqueLoss` and must keep sending control/hold frames while
+    // exposing `EnableState::Disabled` in telemetry!
+    bus.with(|s| {
+        for m in &mut s.motors {
+            m.enabled = false;
+        }
+    });
+    for _ in 0..3 {
+        clock.advance(Duration::from_millis(20));
+        bus.with(|s| s.push_all_feedback());
+        bus.clear_log();
+        inner.tick(0.02);
+        assert_eq!(
+            *inner.safety.state(),
+            SafetyState::Armed,
+            "M1: reported enable_state == Disabled while holding must NOT latch UnexpectedTorqueLoss"
+        );
+        assert_eq!(inner.torque_intent, TorqueIntent::On);
+        assert_eq!(
+            inner.current_observation().enable_state,
+            EnableState::Disabled,
+            "M1: reported enable_state must still be published in telemetry"
+        );
+        assert_eq!(
+            bus.tx_log().iter().filter(|f| (0x101..=0x107).contains(&f.id)).count(),
+            7,
+            "M1: holding frames must continue when feedback claims disabled"
+        );
+    }
+
+    // Restore reported enabled=true, start active motion (jog trajectory), then inject status=0:
+    // During active motion, `UnexpectedTorqueLoss` MUST latch as a fault AND the arm MUST keep
+    // sending stopped holds (`torque_intent == On`)!
+    bus.with(|s| {
+        for m in &mut s.motors {
+            m.enabled = true;
+        }
+        s.push_all_feedback();
+    });
+    clock.advance(Duration::from_millis(20));
+    inner.tick(0.02);
+
+    let stamp = inner.current_admission_stamp();
+    let admitted = inner.check_admission(stamp).unwrap();
+    SupervisorInner::jog(admitted, vec![0.3, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), None)
+        .unwrap();
+    assert!(inner.active_trajectory.is_some());
+
+    bus.with(|s| {
+        for m in &mut s.motors {
+            m.enabled = false;
+        }
+    });
+    clock.advance(Duration::from_millis(20));
+    bus.with(|s| s.push_all_feedback());
+    bus.clear_log();
+    inner.tick(0.02);
+
+    assert!(
+        inner.safety.state().is_stopped(),
+        "M1: reported torque loss during active motion must latch UnexpectedTorqueLoss fault"
+    );
+    assert_eq!(
+        inner.safety.fault().map(|f| f.message.to_string()),
+        Some("Unexpected motor torque loss detected while operational".to_string()),
+        "M1: fault message must be UnexpectedTorqueLoss"
+    );
+    assert!(inner.active_trajectory.is_none(), "active motion must stop on UnexpectedTorqueLoss");
+    assert_eq!(inner.torque_intent, TorqueIntent::On, "M1: torque_intent stays On so holds continue");
+    assert_eq!(
+        bus.tx_log().iter().filter(|f| (0x101..=0x107).contains(&f.id)).count(),
+        7,
+        "M1: arm must keep sending stationary holds on the UnexpectedTorqueLoss tick"
+    );
+
+    // Subsequent tick while faulted also keeps sending holds on all 7 joints!
+    clock.advance(Duration::from_millis(20));
+    bus.with(|s| s.push_all_feedback());
+    bus.clear_log();
+    inner.tick(0.02);
+    assert_eq!(
+        bus.tx_log().iter().filter(|f| (0x101..=0x107).contains(&f.id)).count(),
+        7,
+        "M1: arm must continue sending holds after UnexpectedTorqueLoss"
+    );
+}

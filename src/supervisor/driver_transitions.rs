@@ -1688,13 +1688,7 @@ impl SupervisorInner {
     /// Single shared clear-fault enable context for BOTH legacy and RT clear owners:
     /// reported enable state from feedback is telemetry only (never blocks recovery).
     #[inline]
-    fn populate_enable_clear_context(
-        &self,
-        ctx: &mut crate::safety::ClearContext,
-        _state: EnableState,
-        _partial: bool,
-        enable_fb: bool,
-    ) {
+    fn populate_enable_clear_context(&self, ctx: &mut crate::safety::ClearContext, enable_fb: bool) {
         ctx.enable_state_known = true;
         ctx.failed_hold_recovery_allowed = self.enable_lifecycle == EnableLifecycle::FailedHold
             && enable_fb
@@ -4487,9 +4481,6 @@ impl SupervisorInner {
             let caps = drv.capabilities();
             let disabling = drv.clear_fault_disables_joints();
             let hw_fault = drv.check_hardware_status().is_err();
-            let mut state = drv.enable_state();
-            let mut partial = drv.has_known_partial_enable();
-            let mut any_enabled = drv.has_any_joint_enabled();
             let fb_valid = drv.is_feedback_valid();
             let mut j7_fb_fresh = drv.pos_force_feedback_fresh();
             let tx_queue_drained = drv.pending_tx_len_total() == 0;
@@ -4500,7 +4491,9 @@ impl SupervisorInner {
                 && ages.len() == self.config.dof
                 && !ages.iter().any(|a| a.is_none_or(|t| t > Duration::from_millis(250)))
                 && states_ok;
-            let needs_resting_check = (self.is_torqued || any_enabled || state != EnableState::Disabled)
+            // M1: Resting-pose check necessity follows owner decision state (`torque_intent == On`
+            // or `is_torqued`), never feedback-reported `enable_state()`.
+            let needs_resting_check = (self.is_torqued || self.torque_intent == TorqueIntent::On)
                 && disabling.iter().any(|&j| j < self.config.arm_dof());
             let max_rest_age = self
                 .resting_policy()
@@ -4578,15 +4571,15 @@ impl SupervisorInner {
             ctx.resting_feedback_missing = resting_feedback_missing;
             ctx.resting_pose_violation = resting_pose_violation;
             ctx.hardware_reset_required = hw_fault;
-            self.populate_enable_clear_context(&mut ctx, state, partial, caps.enable_feedback);
+            self.populate_enable_clear_context(&mut ctx, caps.enable_feedback);
 
-            // Evaluate `clear_check` FIRST over EVERY recorded kind before any TX probe, motor
-            // reset, or `refresh_enable_state` side effect.
+            // Evaluate `clear_check` FIRST over EVERY recorded kind before any TX probe or motor
+            // reset side effect.
             let mut clear_res = self.safety.clear_check(&ctx);
             if clear_res == Err(ClearRefusal::TxProbeRequired) {
                 // Every OTHER recorded kind's condition passed and the software TX queue is empty:
                 // run one read-only refresh/status TX probe and verify fresh post-probe feedback.
-                let (probe_res, drained_after, probe_ok, probe_pending, hw_fault_after, st_after, partial_after, any_en_after, fb_valid_after, j7_fresh_after, ages_after) = {
+                let (probe_res, drained_after, probe_ok, probe_pending, hw_fault_after, fb_valid_after, j7_fresh_after, ages_after) = {
                     let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
                     if let Some(auth) = authority {
                         if let Err(auth_err) =
@@ -4603,20 +4596,14 @@ impl SupervisorInner {
                         drv.tx_probe_confirmed(),
                         drv.tx_probe_pending(),
                         drv.check_hardware_status().is_err(),
-                        drv.enable_state(),
-                        drv.has_known_partial_enable(),
-                        drv.has_any_joint_enabled(),
                         drv.is_feedback_valid(),
                         drv.pos_force_feedback_fresh(),
                         drv.feedback_ages(),
                     )
                 };
-                state = st_after;
-                partial = partial_after;
-                any_enabled = any_en_after;
                 j7_fb_fresh = j7_fresh_after;
                 ctx.tx_queue_drained = drained_after;
-                self.populate_enable_clear_context(&mut ctx, state, partial, caps.enable_feedback);
+                self.populate_enable_clear_context(&mut ctx, caps.enable_feedback);
                 ctx.hardware_reset_required = hw_fault_after;
                 ctx.j7_feedback_fresh = j7_fb_fresh;
                 ctx.pending_estop = self.estop_request_unapplied();
@@ -4706,34 +4693,6 @@ impl SupervisorInner {
                     }
                     return Err(ClearFaultLegacyInnerError::Safety(post_refusal.into_safety_error()));
                 }
-                Err(ClearRefusal::EnableStateUnknown) if fb_fresh && !hw_fault && !partial => {
-                    // Every other condition passed; probe enable state once and re-run clear_check.
-                    {
-                        let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
-                        if let Some(auth) = authority {
-                            if let Err(auth_err) =
-                                recheck_clear_fault_authority_readonly(self, auth, Instant::now())
-                            {
-                                drop(drv);
-                                return Err(ClearFaultLegacyInnerError::Authority(auth_err));
-                            }
-                        }
-                        let _ = drv.refresh_enable_state();
-                        state = drv.enable_state();
-                        partial = drv.has_known_partial_enable();
-                        any_enabled = drv.has_any_joint_enabled();
-                        j7_fb_fresh = drv.pos_force_feedback_fresh();
-                    }
-                    self.populate_enable_clear_context(&mut ctx, state, partial, caps.enable_feedback);
-                    ctx.j7_feedback_fresh = j7_fb_fresh;
-                    ctx.pending_estop = self.estop_request_unapplied();
-                    if let Err(refusal) = self.safety.clear_check(&ctx) {
-                        if refusal == ClearRefusal::EStopActive {
-                            return Err(apply_estop_refusal(self));
-                        }
-                        return Err(ClearFaultLegacyInnerError::Safety(refusal.into_safety_error()));
-                    }
-                }
                 Err(refusal) => {
                     if matches!(refusal, ClearRefusal::ThermalCooldownNotElapsed { .. })
                         && (!self.safety.has_latched_fault_kind(crate::safety::FaultKind::J7FeedbackStale)
@@ -4753,7 +4712,6 @@ impl SupervisorInner {
             } else if self.enable_lifecycle == EnableLifecycle::FailedHold {
                 commit.is_torqued = Some(true);
             }
-            let _ = any_enabled;
             commit.thermal_cooldown = Some(next_cd);
         } else {
             let next_cd = self.evaluate_thermal_cooldown_driverless(Instant::now());
@@ -5363,10 +5321,9 @@ impl SupervisorInner {
             let caps = drv.capabilities();
             let temp_fb = caps.temperature_feedback;
             let enable_fb = caps.enable_feedback;
-            let mut state = drv.enable_state();
-            let mut partial = drv.has_known_partial_enable();
-            let mut any_enabled = drv.has_any_joint_enabled();
-            let needs_resting_check = (self.is_torqued || any_enabled || state != EnableState::Disabled)
+            // M1: Resting-pose check necessity follows owner decision state (`torque_intent == On`
+            // or `is_torqued`), never feedback-reported `enable_state()`.
+            let needs_resting_check = (self.is_torqued || self.torque_intent == TorqueIntent::On)
                 && drv.clear_fault_disables_arm_joint(self.config.arm_dof());
             let mut resting_feedback_missing = false;
             let mut resting_pose_violation = None;
@@ -5430,7 +5387,7 @@ impl SupervisorInner {
             ctx.resting_feedback_missing = resting_feedback_missing;
             ctx.resting_pose_violation = resting_pose_violation;
             ctx.hardware_reset_required = hw_fault;
-            self.populate_enable_clear_context(&mut ctx, state, partial, enable_fb);
+            self.populate_enable_clear_context(&mut ctx, enable_fb);
 
             // Evaluate `clear_check` FIRST over EVERY recorded kind before any TX probe, motor
             // reset, or concurrent E-stop / config mutation.
@@ -5441,7 +5398,7 @@ impl SupervisorInner {
                     return Err(ClearFaultWithAuthError::Clear(E::Rejected(R::BudgetExpired)));
                 }
                 let mut scratch_ages = std::mem::take(&mut self.scratch.ages);
-                let (probe_res, drained_after, probe_ok, probe_pending, hw_fault_after, st_after, partial_after, any_en_after, fb_valid_after, j7_fresh_after, ages_valid_after) = {
+                let (probe_res, drained_after, probe_ok, probe_pending, hw_fault_after, fb_valid_after, j7_fresh_after, ages_valid_after) = {
                     let mut drv = match d.lock() {
                         Ok(g) => g,
                         Err(_) => {
@@ -5469,20 +5426,14 @@ impl SupervisorInner {
                         drv.tx_probe_confirmed(),
                         drv.tx_probe_pending(),
                         drv.has_hardware_fault(),
-                        drv.enable_state(),
-                        drv.has_known_partial_enable(),
-                        drv.has_any_joint_enabled(),
                         drv.is_feedback_valid(),
                         drv.pos_force_feedback_fresh(),
                         ages_ok,
                     )
                 };
                 self.scratch.ages = scratch_ages;
-                state = st_after;
-                partial = partial_after;
-                any_enabled = any_en_after;
                 ctx.tx_queue_drained = drained_after;
-                self.populate_enable_clear_context(&mut ctx, state, partial, enable_fb);
+                self.populate_enable_clear_context(&mut ctx, enable_fb);
                 ctx.hardware_reset_required = hw_fault_after;
                 ctx.j7_feedback_fresh = j7_fresh_after;
                 ctx.pending_estop = self.estop_request_unapplied();
@@ -5591,7 +5542,6 @@ impl SupervisorInner {
             } else if self.enable_lifecycle == EnableLifecycle::FailedHold {
                 commit.is_torqued = Some(true);
             }
-            let _ = any_enabled;
             commit.thermal_cooldown = Some(next_cd);
         } else {
             // Driverless simulation mode: evaluate cooldown without pre-committing (0 alloc).
