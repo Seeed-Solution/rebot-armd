@@ -5036,37 +5036,34 @@ async fn cf1_r4_verify_authority_lease_precedence_and_watchdog_park_inhibit() {
         assert_eq!(reply_zero["code"], "LEASE_LOST", "stale lease must return LEASE_LOST before CONFIG_BUSY: {reply_zero}");
         assert_eq!(reply_zero["epoch_id"], rig.epoch);
 
-        // ws2 (the active lease holder) sends bogus software-zero & apply bodies while
-        // calibration_busy == true -> MUST get CONFIG_BUSY before body parsing.
-        let reply_busy = ws_send_recv(
-            &mut ws2,
-            json!({
-                "type": "command",
-                "request_id": 702,
-                "generation": gen2,
-                "epoch_id": rig.epoch,
-                "path": motor_zero::PATH,
-                "body": { "method": "software", "bogus": true },
-            }),
-        )
-        .await;
-        assert_eq!(reply_busy["type"], "command_reject");
-        assert_eq!(reply_busy["code"], "CONFIG_BUSY", "active owner while busy must get CONFIG_BUSY before parse: {reply_busy}");
-
-        let reply_apply_busy = ws_send_recv(
-            &mut ws2,
-            json!({
-                "type": "command",
-                "request_id": 703,
-                "generation": gen2,
-                "epoch_id": rig.epoch,
-                "path": "/api/v1/calibration/apply",
-                "body": { "bogus": true },
-            }),
-        )
-        .await;
-        assert_eq!(reply_apply_busy["type"], "command_reject");
-        assert_eq!(reply_apply_busy["code"], "CONFIG_BUSY", "active owner apply while busy must get CONFIG_BUSY before parse: {reply_apply_busy}");
+        // ws2 (the active lease holder) sends bogus bodies for all 4 in-scope commands while
+        // calibration_busy == true -> MUST match legacy ws.rs:2902 rejection() envelope
+        // (CONFIG_BUSY + epoch_id + safety_state) BEFORE body parsing.
+        for (req_id, path, body) in [
+            (702u64, motor_zero::PATH, json!({ "method": "software", "bogus": true })),
+            (703u64, motor_zero::RESTORE_PATH, json!({ "bogus": true })),
+            (704u64, "/api/v1/calibration/apply", json!({ "bogus": true })),
+            (705u64, "/api/v1/calibration/restore", json!(123)),
+        ] {
+            let reply_busy = ws_send_recv(
+                &mut ws2,
+                json!({
+                    "type": "command",
+                    "request_id": req_id,
+                    "generation": gen2,
+                    "epoch_id": rig.epoch,
+                    "path": path,
+                    "body": body,
+                }),
+            )
+            .await;
+            assert_eq!(reply_busy["type"], "command_reject");
+            assert_eq!(reply_busy["status"], 409);
+            assert_eq!(reply_busy["code"], "CONFIG_BUSY", "active owner {path} while busy must get CONFIG_BUSY before parse: {reply_busy}");
+            assert_eq!(reply_busy["error"], "CONFIG_BUSY");
+            assert_eq!(reply_busy["epoch_id"], rig.epoch, "concurrent busy reply must include epoch_id: {reply_busy}");
+            assert!(reply_busy.get("safety_state").is_some(), "concurrent busy reply must include safety_state key: {reply_busy}");
+        }
 
         let _ = rig
             .sup

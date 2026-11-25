@@ -50,14 +50,23 @@ pub enum PublishOutcome {
 }
 
 /// Durably create `dir` and any missing ancestor directories, syncing each newly created
-/// directory link AND syncing every ancestor directory link on the same filesystem up to its
-/// durable root so retries after an earlier parent-dir fsync failure still establish durability.
+/// directory link AND syncing every ancestor directory link up to `durable_root` (or the same
+/// filesystem mount root when `durable_root` is `None`). Fails closed on every fsync error
+/// (including `PermissionDenied`) so retries never report durability for an unsynced link.
 pub(crate) fn create_dir_all_durable(dir: &Path) -> std::io::Result<()> {
-    create_dir_all_durable_with(dir, |d| std::fs::File::open(d)?.sync_all())
+    create_dir_all_durable_under(dir, None)
+}
+
+pub(crate) fn create_dir_all_durable_under(
+    dir: &Path,
+    durable_root: Option<&Path>,
+) -> std::io::Result<()> {
+    create_dir_all_durable_with(dir, durable_root, |d| std::fs::File::open(d)?.sync_all())
 }
 
 pub(crate) fn create_dir_all_durable_with(
     dir: &Path,
+    durable_root: Option<&Path>,
     mut sync_dir: impl FnMut(&Path) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     if dir.as_os_str().is_empty() || dir == Path::new(".") {
@@ -87,10 +96,10 @@ pub(crate) fn create_dir_all_durable_with(
             .filter(|d| !d.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
         sync_dir(parent).map_err(|e| {
-            std::io::Error::other(format!(
-                "parent dir fsync after creating {}: {e}",
-                path.display()
-            ))
+            std::io::Error::new(
+                e.kind(),
+                format!("parent dir fsync after creating {}: {e}", path.display()),
+            )
         })?;
     }
     if !dir.is_dir() {
@@ -99,10 +108,21 @@ pub(crate) fn create_dir_all_durable_with(
             format!("{} exists but is not a directory", dir.display()),
         ));
     }
-    // Walk up from the canonicalized target directory syncing every ancestor directory link
-    // on the same filesystem so a retry after an earlier `mkdir` + parent-fsync failure on a
-    // higher ancestor still syncs that ancestor's parent.
+    // Walk up from the canonicalized target directory syncing every ancestor directory link up
+    // to the explicit known-durable root (or the filesystem mount root) so a retry after an
+    // earlier `mkdir` + parent-fsync failure on a higher ancestor still syncs or fails closed.
     let canonical = std::fs::canonicalize(dir)?;
+    let canon_stop = match durable_root {
+        Some(r) if r.is_dir() => {
+            let cr = std::fs::canonicalize(r)?;
+            if canonical.starts_with(&cr) {
+                Some(cr)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
     #[cfg(unix)]
     let target_dev = {
         use std::os::unix::fs::MetadataExt;
@@ -114,34 +134,23 @@ pub(crate) fn create_dir_all_durable_with(
         if parent.as_os_str().is_empty() || parent == child {
             break;
         }
-        #[cfg(unix)]
-        if depth > 0 {
-            use std::os::unix::fs::MetadataExt;
-            match std::fs::metadata(parent) {
-                Ok(m) if m.dev() != target_dev => break,
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => break,
-                Err(e) => return Err(e),
+        if canon_stop.is_none() {
+            #[cfg(unix)]
+            if depth > 0 {
+                use std::os::unix::fs::MetadataExt;
+                if std::fs::metadata(parent)?.dev() != target_dev {
+                    break;
+                }
             }
         }
-        match sync_dir(parent) {
-            Ok(()) => {}
-            Err(e)
-                if depth > 0
-                    && matches!(
-                        e.kind(),
-                        std::io::ErrorKind::PermissionDenied
-                            | std::io::ErrorKind::ReadOnlyFilesystem
-                    ) =>
-            {
-                break;
-            }
-            Err(e) => {
-                return Err(std::io::Error::other(format!(
-                    "parent dir fsync for {}: {e}",
-                    child.display()
-                )));
-            }
+        sync_dir(parent).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("parent dir fsync for {}: {e}", child.display()),
+            )
+        })?;
+        if canon_stop.as_deref() == Some(parent) {
+            break;
         }
         child = parent;
         depth += 1;
@@ -237,8 +246,10 @@ impl StagedWrite {
             .filter(|d| !d.as_os_str().is_empty())
             .unwrap_or(Path::new("."))
             .to_path_buf();
-        create_dir_all_durable(&dir)
-            .map_err(|e| format!("create_dir_all_durable {}: {e}", dir.display()))?;
+        if !dir.is_dir() {
+            create_dir_all_durable(&dir)
+                .map_err(|e| format!("create_dir_all_durable {}: {e}", dir.display()))?;
+        }
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -551,7 +562,7 @@ mod tests {
 
         // Attempt 1: `mkdir state/new` succeeds, then `fsync(state)` fails before `nested` exists.
         let mut fail_once = true;
-        let err = create_dir_all_durable_with(&nested, |d| {
+        let err = create_dir_all_durable_with(&nested, Some(&state), |d| {
             if fail_once && d == state {
                 fail_once = false;
                 return Err(std::io::Error::other("simulated parent dir fsync EIO"));
@@ -563,24 +574,31 @@ mod tests {
         assert!(state.join("new").is_dir());
         assert!(!nested.exists());
 
-        // Attempt 2 (retry): `state/new` already exists, `nested` is created; retry MUST still
-        // sync both `state/new` AND `state` (the ancestor whose parent fsync failed earlier).
+        // Attempt 2 (retry) with persistent PermissionDenied on `state`: MUST still fail closed
+        // (never ignore PermissionDenied on a higher ancestor below durable_root).
+        let canon_state = std::fs::canonicalize(&state).unwrap();
+        let err_perm = create_dir_all_durable_with(&nested, Some(&state), |d| {
+            if d == state || d == canon_state {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "simulated unreadable ancestor",
+                ));
+            }
+            Ok(())
+        })
+        .expect_err("retry must fail closed on PermissionDenied for unsynced ancestor");
+        assert_eq!(err_perm.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(nested.is_dir());
+
+        // Attempt 3 (retry after permissions restored): MUST sync both `state/new` AND `state`,
+        // and stop cleanly at `state` (known-durable root).
         let mut synced: Vec<PathBuf> = Vec::new();
-        create_dir_all_durable_with(&nested, |d| {
+        create_dir_all_durable_with(&nested, Some(&state), |d| {
             synced.push(d.to_path_buf());
             Ok(())
         })
-        .expect("retry should succeed");
-        assert!(nested.is_dir());
-        let canon_state = std::fs::canonicalize(&state).unwrap();
+        .expect("retry should succeed once state is syncable");
         let canon_new = std::fs::canonicalize(state.join("new")).unwrap();
-        assert!(
-            synced.iter().any(|p| p == &canon_new || p == &state.join("new")),
-            "retry must sync state/new; synced={synced:?}"
-        );
-        assert!(
-            synced.iter().any(|p| p == &canon_state || p == &state),
-            "retry must also sync higher ancestor state; synced={synced:?}"
-        );
+        assert_eq!(synced, vec![canon_new, canon_state]);
     }
 }

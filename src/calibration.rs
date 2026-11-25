@@ -1350,7 +1350,8 @@ async fn write_backup(deps: &CalibrationDeps, reason: &str, vision: &Value, stat
         "tool_id": state.tool_id, "tool_config_digest": state.tool_config_digest});
     let vision = vision.clone();
     blocking(move || {
-        crate::persist::create_dir_all_durable(&root)?;
+        let durable_root = calib.parent().filter(|p| p.is_dir());
+        crate::persist::create_dir_all_durable_under(&root, durable_root)?;
         let dir = root.join(backup_name(&root));
         std::fs::create_dir(&dir)?;
         let mut files = vec!["vision_intrinsics.json", "manifest.json"];

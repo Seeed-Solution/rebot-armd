@@ -435,7 +435,8 @@ async fn write_zero_backup_with_companions(
     let (root, calib) = (deps.backup_dir.clone(), deps.path.clone());
     let manifest = json!({"created_at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true), "reason": reason, "joint_zero_offsets": offsets});
     crate::calibration::blocking(move || {
-        crate::persist::create_dir_all_durable(&root)?;
+        let durable_root = calib.parent().filter(|p| p.is_dir());
+        crate::persist::create_dir_all_durable_under(&root, durable_root)?;
         let dir = root.join(crate::calibration::backup_name(&root));
         std::fs::create_dir(&dir)?;
         let mut files = vec!["manifest.json"];

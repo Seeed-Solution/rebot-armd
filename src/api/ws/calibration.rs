@@ -103,7 +103,8 @@ pub(super) async fn is_executor_calibration_unsupported(
 
 /// Formats a synchronous WS ingress calibration error from the RT owner, preserving the exact
 /// legacy ingress lease-loss reply (`This connection does not own an active lease` + `epoch_id`)
-/// when the connection's local generation was stale against an expired owner lease.
+/// and legacy `ws.rs:2902` concurrent `CONFIG_BUSY` envelope (`epoch_id` + `safety_state`) when
+/// another calibration transaction is already running.
 fn ingress_calib_reject(
     request_id: &Value,
     epoch: u64,
@@ -120,6 +121,15 @@ fn ingress_calib_reject(
             "message": "This connection does not own an active lease",
             "epoch_id": epoch,
         }),
+        ConfigError::Busy(msg) if msg == "a calibration apply, restore or motor zero is running" => {
+            let mut reply = rejection(
+                ApiError(StatusCode::CONFLICT, msg.into(), "CONFIG_BUSY".into()),
+                "command_reject",
+                epoch,
+            );
+            reply["request_id"] = request_id.clone();
+            reply
+        }
         other => calibration_reject(request_id, &crate::calibration::calib_error_from_config(other)),
     }
 }
