@@ -1670,8 +1670,12 @@ enum OffloadReclaim {
 /// linearization against [`ConnLifecycleClient`], and reply/terminal reclamation (even after
 /// caller disconnect or cancellation). Never touched by `armd-control`.
 ///
-/// Strict acyclic lock order: `BrokerDispatcher::state` -> `ConnLifecycleClient::inner` -> `broker` -> `reply_router`.
+/// Strict acyclic lock order:
+/// `SerialDrainGate` (0) -> `BrokerDispatcher::state` (1) -> `ConnLifecycleClient::inner` (2) -> `broker` (3) -> `reply_router` (4).
+/// `BrokerDispatcher::state` serializes every `submit_*` and `disconnect_*` mutation against
+/// `ConnLifecycleClient`, preventing TOCTOU admission races with connection teardown.
 pub(crate) struct BrokerDispatcher {
+    drain_gate: super::reply_router::SerialDrainGate,
     broker: Arc<Mutex<Broker<PlanSlot>>>,
     conn_lifecycle: Arc<super::requests::lease::ConnLifecycleClient>,
     reply_router: Arc<Mutex<ActionReplyRouter>>,
@@ -1715,6 +1719,7 @@ impl BrokerDispatcher {
         exited: Arc<AtomicBool>,
     ) -> Self {
         Self {
+            drain_gate: super::reply_router::SerialDrainGate::new(),
             broker,
             conn_lifecycle,
             reply_router,
@@ -1806,6 +1811,236 @@ impl BrokerDispatcher {
         Ok((ack_rx, term_rx))
     }
 
+    /// Atomically verifies connection liveness, resolves the bound destination, reserves bounded
+    /// reply capacity, submits an external action (`BeginMacro` or `InstallPrepared`), and binds
+    /// `RequestId -> ReplyTarget` with an RAII [`AckCommitGuard`].
+    #[allow(clippy::too_many_arguments)]
+    fn submit_external_action<'a>(
+        &self,
+        client: super::broker::ClientId,
+        client_seq: u64,
+        authority: super::broker::Authority,
+        deadline: Instant,
+        sub: super::requests::actions::ActionSubmit<'a, PlanSlot>,
+        policy: ExternalDestinationPolicy,
+        require_ack_commit: bool,
+        wire_tracker: Option<Arc<WsWireAckTracker>>,
+    ) -> Result<
+        (
+            super::broker::RequestId,
+            tokio::sync::oneshot::Receiver<Result<super::broker::Reply, OwnerError>>,
+            AckCommitGuard,
+        ),
+        ExternalSubmitError,
+    > {
+        if !sub.starts_action() {
+            return Err(ExternalSubmitError::NotAnExternalAction);
+        }
+        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.exited.load(Ordering::Acquire) {
+            return Err(ExternalSubmitError::Stopped);
+        }
+        if (client.0 == 0 && policy == ExternalDestinationPolicy::ConnectionOnly)
+            || (client.0 != 0 && !self.conn_lifecycle.is_slot_open(client.0))
+        {
+            return Err(ExternalSubmitError::Admit(
+                super::broker::AdmitError::Disconnected,
+            ));
+        }
+        let mut broker = self.broker.lock().unwrap_or_else(|e| e.into_inner());
+        broker.reclaim_plans();
+        let mut router = self.reply_router.lock().unwrap_or_else(|e| e.into_inner());
+        let target = router.check_external_admission(client, policy)?;
+        let req_id = broker
+            .submit(
+                client,
+                client_seq,
+                authority,
+                deadline,
+                super::broker::Submit::Action(sub),
+            )
+            .map_err(ExternalSubmitError::Admit)?;
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        router.commit_external_route(
+            req_id,
+            client,
+            target,
+            ack_tx,
+            require_ack_commit,
+            wire_tracker.clone(),
+        );
+        let guard = AckCommitGuard::new(
+            Arc::clone(&self.reply_router),
+            req_id,
+            wire_tracker,
+            require_ack_commit,
+        );
+        Ok((req_id, ack_rx, guard))
+    }
+
+    /// Submits an internal non-action macro RPC (`InstallChild` or `FinishMacro`) under the
+    /// unified lock order and registers its private ACK waiter in `internal_waiters`.
+    /// Rejects `starts_action()` commands (`BeginMacro`, `InstallPrepared`) fail-closed.
+    fn submit_internal_action<'a>(
+        &self,
+        client: super::broker::ClientId,
+        client_seq: u64,
+        authority: super::broker::Authority,
+        deadline: Instant,
+        sub: super::requests::actions::ActionSubmit<'a, PlanSlot>,
+    ) -> Result<
+        (
+            super::broker::RequestId,
+            tokio::sync::oneshot::Receiver<super::broker::Reply>,
+        ),
+        super::broker::AdmitError,
+    > {
+        if sub.starts_action() {
+            return Err(super::broker::AdmitError::RepliesFull);
+        }
+        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.exited.load(Ordering::Acquire) {
+            return Err(super::broker::AdmitError::Disconnected);
+        }
+        if client.0 != 0 && !self.conn_lifecycle.is_slot_open(client.0) {
+            return Err(super::broker::AdmitError::Disconnected);
+        }
+        let mut broker = self.broker.lock().unwrap_or_else(|e| e.into_inner());
+        broker.reclaim_plans();
+        let req_id = broker.submit(
+            client,
+            client_seq,
+            authority,
+            deadline,
+            super::broker::Submit::Action(sub),
+        )?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.reply_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .internal_waiters
+            .insert(req_id, tx);
+        Ok((req_id, rx))
+    }
+
+    fn cancel_internal_waiter(&self, req_id: super::broker::RequestId) {
+        self.reply_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .internal_waiters
+            .remove(&req_id);
+    }
+
+    fn register_connection_reply_sink(
+        &self,
+        client: super::broker::ClientId,
+        sink: Arc<ConnectionReplySink>,
+        per_conn_cap: Option<usize>,
+    ) -> Result<super::reply_router::ConnectionSlotToken, super::broker::AdmitError> {
+        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.exited.load(Ordering::Acquire) {
+            return Err(super::broker::AdmitError::Disconnected);
+        }
+        if client.0 == 0 || !self.conn_lifecycle.is_slot_open(client.0) {
+            return Err(super::broker::AdmitError::Disconnected);
+        }
+        self.reply_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .register_connection(client, sink, per_conn_cap)
+    }
+
+    fn seed_connection_reply_sinks(
+        &self,
+        sinks: impl IntoIterator<Item = (u64, Arc<ConnectionReplySink>)>,
+    ) {
+        let _st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut router = self.reply_router.lock().unwrap_or_else(|e| e.into_inner());
+        for (conn_id, sink) in sinks {
+            if conn_id != 0 && self.conn_lifecycle.is_slot_open(conn_id) {
+                let _ = router.register_connection(ClientId(conn_id), sink, None);
+            }
+        }
+    }
+
+    async fn open_connection_with_reply_sink(
+        self: &Arc<Self>,
+        conn_id: u64,
+        sink: Arc<ConnectionReplySink>,
+    ) -> Result<Result<(), &'static str>, super::requests::lease::ConnLifecycleError> {
+        struct OpenRollbackGuard {
+            dispatcher: Arc<BrokerDispatcher>,
+            conn_id: u64,
+            token: Option<super::reply_router::ConnectionSlotToken>,
+            committed: bool,
+        }
+        impl Drop for OpenRollbackGuard {
+            fn drop(&mut self) {
+                if !self.committed {
+                    if let Some(tok) = self.token.take() {
+                        let _st = self
+                            .dispatcher
+                            .state
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        self.dispatcher
+                            .reply_router
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .rollback_unopened_connection(tok);
+                    }
+                    if let Some(conn) =
+                        super::requests::lease::ConnectionHandle::from_ws_id(self.conn_id)
+                    {
+                        self.dispatcher.enqueue_disconnect_detached(conn);
+                    }
+                }
+            }
+        }
+
+        let (rx, token) = {
+            let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if st.exited.load(Ordering::Acquire) {
+                return Err(super::requests::lease::ConnLifecycleError::Stopped);
+            }
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            // Lock order: state (1) -> conn_lifecycle (2) -> reply_router (4).
+            self.conn_lifecycle.enqueue_open_oneshot(conn_id, tx)?;
+            let tok = match self
+                .reply_router
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .register_connection(ClientId(conn_id), sink, None)
+            {
+                Ok(t) => t,
+                Err(_) => {
+                    if let Some(conn) =
+                        super::requests::lease::ConnectionHandle::from_ws_id(conn_id)
+                    {
+                        self.conn_lifecycle.enqueue_disconnect_detached(conn);
+                    }
+                    return Err(super::requests::lease::ConnLifecycleError::TooManyConnections);
+                }
+            };
+            (rx, tok)
+        };
+        let mut rollback = OpenRollbackGuard {
+            dispatcher: Arc::clone(self),
+            conn_id,
+            token: Some(token),
+            committed: false,
+        };
+        let res = match rx.await {
+            Ok(Ok(super::requests::lease::LifecycleReply::Opened { result, .. })) => Ok(result),
+            Ok(Err(e)) => Err(e),
+            _ => Err(super::requests::lease::ConnLifecycleError::Stopped),
+        };
+        if matches!(res, Ok(Ok(()))) {
+            rollback.committed = true;
+        }
+        res
+    }
+
     #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
     fn submit_policy_command(
         &self,
@@ -1873,9 +2108,10 @@ impl BrokerDispatcher {
     }
 
     /// Linearizes connection teardown off-thread: prevents any subsequent `BrokerDispatcher`
-    /// submission for `connection.id()`, marks the broker client disconnected (retiring its
-    /// managed waiters immediately while continuing broker reclamation), and pushes a
-    /// guaranteed-non-full priority `LifecycleCmd::Disconnect` onto the lifecycle channel.
+    /// submission for `connection.id()`, marks the broker client and reply router slot closed
+    /// (retiring its managed/external waiters immediately while continuing broker reclamation),
+    /// and pushes a guaranteed-non-full priority `LifecycleCmd::Disconnect` onto the lifecycle
+    /// channel. Always runs broker + router cleanup even if lifecycle enqueue returns an error.
     async fn disconnect_connection(
         &self,
         connection: super::requests::lease::ConnectionHandle,
@@ -1884,9 +2120,15 @@ impl BrokerDispatcher {
         let rx = {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let (tx, rx) = tokio::sync::oneshot::channel();
-            // Strict acyclic lock order: `state` (1) -> `conn_lifecycle` (2) -> `broker` (3).
-            self.conn_lifecycle.enqueue_disconnect_oneshot(connection, tx)?;
-            Self::disconnect_broker_client_locked(&mut st, &self.broker, connection.id());
+            // Strict acyclic lock order: `state` (1) -> `conn_lifecycle` (2) -> `broker` (3) -> `reply_router` (4).
+            let enq = self.conn_lifecycle.enqueue_disconnect_oneshot(connection, tx);
+            Self::disconnect_broker_client_locked(
+                &mut st,
+                &self.broker,
+                &self.reply_router,
+                connection.id(),
+            );
+            enq?;
             rx
         };
         match rx.await {
@@ -1906,8 +2148,14 @@ impl BrokerDispatcher {
         let rx = {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let (tx, rx) = mpsc::sync_channel(1);
-            self.conn_lifecycle.enqueue_disconnect_sync(connection, tx)?;
-            Self::disconnect_broker_client_locked(&mut st, &self.broker, connection.id());
+            let enq = self.conn_lifecycle.enqueue_disconnect_sync(connection, tx);
+            Self::disconnect_broker_client_locked(
+                &mut st,
+                &self.broker,
+                &self.reply_router,
+                connection.id(),
+            );
+            enq?;
             rx
         };
         match rx.recv() {
@@ -1925,12 +2173,23 @@ impl BrokerDispatcher {
     ) {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         self.conn_lifecycle.enqueue_disconnect_detached(connection);
-        Self::disconnect_broker_client_locked(&mut st, &self.broker, connection.id());
+        Self::disconnect_broker_client_locked(
+            &mut st,
+            &self.broker,
+            &self.reply_router,
+            connection.id(),
+        );
+    }
+
+    fn disconnect_client_only(&self, client: super::broker::ClientId) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Self::disconnect_broker_client_locked(&mut st, &self.broker, &self.reply_router, client.0);
     }
 
     fn disconnect_broker_client_locked(
         st: &mut BrokerDispatcherState,
         broker: &Mutex<Broker<PlanSlot>>,
+        reply_router: &Mutex<ActionReplyRouter>,
         conn_id: u64,
     ) {
         if conn_id == 0 {
@@ -1941,6 +2200,10 @@ impl BrokerDispatcher {
         st.managed.retain(|_, entry| entry.client != client);
         let mut guard = broker.lock().unwrap_or_else(|e| e.into_inner());
         guard.disconnect(client);
+        reply_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .close_connection(client);
         if st.managed.len() < before || guard.outstanding() > 0 {
             st.draining_disconnected = true;
         }
@@ -1951,17 +2214,16 @@ impl BrokerDispatcher {
         broker: &Mutex<Broker<PlanSlot>>,
         reply_router: &Mutex<ActionReplyRouter>,
         force_poll: bool,
-    ) -> (usize, Option<Arc<dyn ExternalReplySink>>) {
+    ) -> usize {
         use super::broker::DeliveryDecision;
         let mut guard = broker.lock().unwrap_or_else(|e| e.into_inner());
         let mut router = reply_router.lock().unwrap_or_else(|e| e.into_inner());
         let has_consumers = force_poll
             || !st.managed.is_empty()
             || st.draining_disconnected
-            || !router.waiters.is_empty()
-            || router.external_sink.is_some();
+            || router.has_external_consumers();
         if !has_consumers {
-            return (0, None);
+            return 0;
         }
         let n = guard.try_poll(|client, reply| {
             let req = reply.request();
@@ -1972,12 +2234,19 @@ impl BrokerDispatcher {
                         st.managed.remove(&req);
                         ok
                     }
-                    ManagedWaiter::Action { ack, terminal, acked } => match reply {
-                        super::broker::Reply::Ack { .. } => {
+                    ManagedWaiter::Action {
+                        ack,
+                        terminal,
+                        acked,
+                    } => match reply {
+                        super::broker::Reply::Ack {
+                            action: Some(_), ..
+                        } => {
                             *acked = true;
                             ack.take().is_some_and(|tx| tx.send(Ok(reply)).is_ok())
                         }
-                        super::broker::Reply::Refused { .. }
+                        super::broker::Reply::Ack { action: None, .. }
+                        | super::broker::Reply::Refused { .. }
                         | super::broker::Reply::Lease { .. } => {
                             let ok = ack.take().is_some_and(|tx| tx.send(Ok(reply)).is_ok());
                             st.managed.remove(&req);
@@ -1996,78 +2265,226 @@ impl BrokerDispatcher {
                 } else {
                     DeliveryDecision::Abandoned
                 }
-            } else if let Some(tx) = router.waiters.remove(&req) {
-                let _ = tx.send(reply);
-                DeliveryDecision::Delivered
-            } else if router.external.len() < router.external_cap {
-                router.external.push_back((client, reply));
-                DeliveryDecision::Delivered
             } else {
-                DeliveryDecision::Backpressured
+                router.route_broker_reply(client, reply)
             }
         });
         guard.reclaim_plans();
         if guard.outstanding() == 0 && st.managed.is_empty() {
             st.draining_disconnected = false;
         }
-        (n, router.external_sink.clone())
+        n
     }
 
-    fn pump_to_router(&self) -> (usize, Option<Arc<dyn ExternalReplySink>>) {
-        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        Self::poll_all_locked(&mut st, &self.broker, &self.reply_router, true)
-    }
+    /// Executes one full serialized delivery pass (called ONLY while holding `self.drain_gate`).
+    fn deliver_ready_under_gate(&self, force_poll: bool) -> usize {
+        use super::broker::DeliveryDecision;
+        use super::reply_router::ReplyTarget;
+        use crate::supervisor::MAX_LIVE_CONNECTIONS;
 
-    fn drain_replies(&self) {
-        let sink = {
-            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let (_, sink) = Self::poll_all_locked(&mut st, &self.broker, &self.reply_router, false);
-            if st.exited.load(Ordering::Acquire) {
-                let _ = Self::poll_all_locked(&mut st, &self.broker, &self.reply_router, false);
-                Self::fail_remaining(&mut st.managed, OwnerError::Stopped);
-                st.draining_disconnected = false;
-            }
-            sink
-        };
-        if let Some(sink) = sink {
-            use super::broker::DeliveryDecision;
+        let mut total = 0usize;
+        let mut backpressured_slots = [false; MAX_LIVE_CONNECTIONS];
+        let mut global_backpressured = false;
+
+        loop {
+            let polled = {
+                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                Self::poll_all_locked(&mut st, &self.broker, &self.reply_router, force_poll)
+            };
+            total += polled;
+
             let mut delivered_any = false;
             loop {
                 let next = self
                     .reply_router
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .external
-                    .pop_front();
-                let Some((client, reply)) = next else {
+                    .pop_next_delivery(&mut backpressured_slots, global_backpressured);
+                let Some(item) = next else {
                     break;
                 };
-                match sink.deliver(client, reply) {
-                    DeliveryDecision::Delivered | DeliveryDecision::Abandoned => {
+                let decision = if item
+                    .closed
+                    .as_ref()
+                    .is_some_and(|c| c.load(Ordering::Acquire))
+                {
+                    DeliveryDecision::Abandoned
+                } else {
+                    item.sink.deliver(item.client, item.reply)
+                };
+                match (decision, item.target) {
+                    (
+                        DeliveryDecision::Backpressured,
+                        ReplyTarget::Connection { slot_idx, .. },
+                    ) => {
+                        backpressured_slots[slot_idx] = true;
+                    }
+                    (DeliveryDecision::Backpressured, ReplyTarget::GlobalSink { .. }) => {
+                        global_backpressured = true;
+                    }
+                    (DeliveryDecision::Delivered | DeliveryDecision::Abandoned, _) => {
                         delivered_any = true;
                     }
-                    DeliveryDecision::Backpressured => {
-                        self.reply_router
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .external
-                            .push_front((client, reply));
-                        break;
-                    }
                 }
+                self.reply_router
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .reconcile_in_flight(item, decision);
             }
-            if delivered_any {
-                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                let _ = Self::poll_all_locked(&mut st, &self.broker, &self.reply_router, false);
+
+            if !delivered_any {
+                break;
             }
+        }
+        total
+    }
+
+    fn run_deferred_and_release_gate(&self) {
+        while let Some(rt_joined) = self.drain_gate.try_release_or_take_deferred() {
+            self.finalize_stopped_under_gate(rt_joined);
         }
     }
 
-    fn finish_stopped(&self) {
+    fn pump_replies(&self, force_poll: bool) -> usize {
+        if !matches!(
+            self.drain_gate.enter(),
+            super::reply_router::DrainEnter::Entered
+        ) {
+            return 0;
+        }
+        let n = self.deliver_ready_under_gate(force_poll);
+        self.run_deferred_and_release_gate();
+        n
+    }
+
+    fn drain_replies(&self) {
+        if !matches!(
+            self.drain_gate.enter(),
+            super::reply_router::DrainEnter::Entered
+        ) {
+            return;
+        }
+        let _ = self.deliver_ready_under_gate(false);
+        let exited = {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if st.exited.load(Ordering::Acquire) {
+                let _ = Self::poll_all_locked(&mut st, &self.broker, &self.reply_router, false);
+                Self::fail_remaining(&mut st.managed, OwnerError::Stopped);
+                st.draining_disconnected = false;
+                true
+            } else {
+                false
+            }
+        };
+        if exited {
+            let _ = self.deliver_ready_under_gate(false);
+            self.reply_router
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .fail_pending_waiters_on_stop();
+        }
+        self.run_deferred_and_release_gate();
+    }
+
+    /// Drains ONLY unrouted raw-broker replies (never steals replies bound to a per-connection
+    /// slot or global sink) under the single serial drain gate.
+    fn poll_unrouted_external<F>(&self, mut deliver: F) -> usize
+    where
+        F: FnMut(ClientId, super::broker::Reply) -> super::broker::DeliveryDecision,
+    {
+        use super::broker::DeliveryDecision;
+        if !matches!(
+            self.drain_gate.enter(),
+            super::reply_router::DrainEnter::Entered
+        ) {
+            return 0;
+        }
+        let _ = self.deliver_ready_under_gate(true);
+        let mut delivered = 0usize;
+        loop {
+            let next = self
+                .reply_router
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pop_unrouted();
+            let Some((client, reply)) = next else {
+                break;
+            };
+            match deliver(client, reply) {
+                DeliveryDecision::Delivered | DeliveryDecision::Abandoned => {
+                    delivered += 1;
+                }
+                DeliveryDecision::Backpressured => {
+                    self.reply_router
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push_front_unrouted(client, reply);
+                    break;
+                }
+            }
+        }
+        if delivered > 0 {
+            let _ = self.deliver_ready_under_gate(true);
+        }
+        self.run_deferred_and_release_gate();
+        delivered
+    }
+
+    fn finalize_stopped_under_gate(&self, rt_joined: bool) {
+        // 1. Final delivery attempt for any replies RT already emitted before exiting.
+        let _ = self.deliver_ready_under_gate(true);
+        // 2. Finalize all remaining off-RT state and recover reservations.
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = Self::poll_all_locked(&mut st, &self.broker, &self.reply_router, false);
         Self::fail_remaining(&mut st.managed, OwnerError::Stopped);
         st.draining_disconnected = false;
+        let mut broker = self.broker.lock().unwrap_or_else(|e| e.into_inner());
+        let mut router = self.reply_router.lock().unwrap_or_else(|e| e.into_inner());
+        router.finalize_stopped(false);
+        if rt_joined {
+            broker.discard_stopped_after_rt_exit();
+        } else {
+            broker.reclaim_plans();
+        }
+    }
+
+    fn finish_stopped_inner(&self, emergency_bound: Option<Duration>, rt_joined: bool) {
+        // Step 1 (lock-only, NEVER waits on SerialDrainGate): wake all waiting callers immediately.
+        {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            Self::fail_remaining(&mut st.managed, OwnerError::Stopped);
+            st.draining_disconnected = false;
+            self.reply_router
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .fail_pending_waiters_on_stop();
+        }
+        // Step 2: acquire SerialDrainGate (bounded for emergency teardown; deferred on same-thread
+        // re-entry or emergency timeout so teardown never deadlocks or hangs behind a slow sink).
+        match self
+            .drain_gate
+            .enter_for_shutdown(emergency_bound, rt_joined)
+        {
+            super::reply_router::DrainEnter::Entered => {
+                self.finalize_stopped_under_gate(rt_joined);
+                self.run_deferred_and_release_gate();
+            }
+            super::reply_router::DrainEnter::SameThreadReentrant => {
+                // Deferred finalization is recorded atomically under `drain_gate` and will run
+                // before the outer active drain releases the gate.
+            }
+            super::reply_router::DrainEnter::TimedOut => {
+                // Emergency bound elapsed while another thread is blocked inside a sink callback:
+                // clear all non-in-flight state without invoking callbacks; deferred finalization
+                // runs when that callback eventually unwinds.
+                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                Self::fail_remaining(&mut st.managed, OwnerError::Stopped);
+                st.draining_disconnected = false;
+                self.reply_router
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .finalize_stopped(true);
+            }
+        }
     }
 
     fn fail_remaining(
@@ -2125,6 +2542,10 @@ pub(crate) struct OffThreadSinks {
     servo_dispatcher: Arc<ServoTargetDispatcher>,
     hub: Arc<StateHub>,
     offload_reclaim_rx: Mutex<Consumer<OffloadReclaim>>,
+    rt_terminal_rx: Mutex<Consumer<RtTerminalStatus>>,
+    rt_terminal_popped: Arc<AtomicU64>,
+    rt_terminal_overflow: Arc<AtomicU64>,
+    terminals: Option<Arc<crate::supervisor::TerminalBroadcaster>>,
 }
 
 impl OffThreadSinks {
@@ -2181,6 +2602,14 @@ impl OffThreadSinks {
     }
 
     pub(crate) fn drain_all(&self, tick_stats: &crate::diagnostics::tick::LockFreeTickStats) {
+        self.drain_all_inner(tick_stats, true);
+    }
+
+    fn drain_all_inner(
+        &self,
+        tick_stats: &crate::diagnostics::tick::LockFreeTickStats,
+        drain_broker: bool,
+    ) {
         self.drain_diag(tick_stats);
         self.estop_reg.lock().unwrap_or_else(|e| e.into_inner()).drain();
         {
@@ -2242,9 +2671,12 @@ impl OffThreadSinks {
         }
         self.maint_client.drain_replies();
         self.urgent_stop_client.drain_replies();
+        self.drain_rt_terminals();
         // Preserve owner Step 7 causal ordering off-thread: broker terminals (e.g. an aborted
         // TorqueOn fenced by Disconnect) resolve strictly BEFORE lifecycle waiters (Disconnect).
-        self.broker_dispatcher.drain_replies();
+        if drain_broker {
+            self.broker_dispatcher.drain_replies();
+        }
         self.conn_lifecycle_client.drain_replies();
         {
             let mut ev_rx = self.eviction_rx.lock().unwrap_or_else(|e| e.into_inner());
@@ -2288,13 +2720,50 @@ impl OffThreadSinks {
 
     /// Final off-thread drain at executor/dispatcher shutdown: emits any remaining events and a
     /// shutdown summary carrying the authoritative monotonic safety drop count.
-    pub(crate) fn flush_and_report_shutdown(&self, tick_stats: &crate::diagnostics::tick::LockFreeTickStats) {
-        self.drain_all(tick_stats);
+    pub(crate) fn flush_and_report_shutdown(
+        &self,
+        tick_stats: &crate::diagnostics::tick::LockFreeTickStats,
+    ) {
+        self.flush_and_report_shutdown_inner(tick_stats, true);
+    }
+
+    pub(crate) fn flush_and_report_shutdown_without_broker(
+        &self,
+        tick_stats: &crate::diagnostics::tick::LockFreeTickStats,
+    ) {
+        self.flush_and_report_shutdown_inner(tick_stats, false);
+    }
+
+    fn flush_and_report_shutdown_inner(
+        &self,
+        tick_stats: &crate::diagnostics::tick::LockFreeTickStats,
+        drain_broker: bool,
+    ) {
+        self.drain_all_inner(tick_stats, drain_broker);
         let mut log_g = self.safety_log_rx.lock().unwrap_or_else(|e| e.into_inner());
         let total = self.stats.safety_log_dropped.load(Ordering::Relaxed);
         if total > 0 && total != log_g.2 {
             log_g.2 = total;
             crate::safety::emit_safety_log_shutdown_summary(total);
+        }
+    }
+
+    pub(crate) fn rt_terminal_overflow(&self) -> u64 {
+        self.rt_terminal_overflow.load(Ordering::Acquire)
+    }
+
+    fn drain_rt_terminals(&self) {
+        let mut rx = self
+            .rt_terminal_rx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        while let Ok(rec) = rx.pop() {
+            self.rt_terminal_popped.fetch_add(1, Ordering::Release);
+            if let Some(terminals) = self.terminals.as_ref() {
+                let measurement = self.hub.action_measurement(rec.id);
+                let status = rec.into_action_status(measurement);
+                terminals.record_finished(&status);
+            }
         }
     }
 }
@@ -2352,62 +2821,11 @@ impl TeardownDisable {
     }
 }
 
-/// Single plug-in hook for PR L's per-connection WebSocket reply router (A6/A7).
-///
-/// In PR P, WebSocket ordinary commands on `OWNER_EXECUTOR` remain gated at `503
-/// EXECUTOR_ROUTING_PENDING` (`src/api/ws.rs:492, 2461`) because connection lifecycle and
-/// per-client reply routing belong to PR L. PR L installs its per-connection router once via
-/// [`RtExecutorHandle::attach_external_reply_sink`]. Until a sink is attached,
-/// [`crate::macro_action::begin_macro_executor`] refuses new executor macros at admission with
-/// `503 EXECUTOR_ROUTING_PENDING` so no macro can commit without a terminal reply sink.
-pub trait ExternalReplySink: Send + Sync {
-    fn deliver(
-        &self,
-        client: ClientId,
-        reply: super::broker::Reply,
-    ) -> super::broker::DeliveryDecision;
-}
-
-impl<F> ExternalReplySink for F
-where
-    F: Fn(ClientId, super::broker::Reply) -> super::broker::DeliveryDecision + Send + Sync,
-{
-    fn deliver(
-        &self,
-        client: ClientId,
-        reply: super::broker::Reply,
-    ) -> super::broker::DeliveryDecision {
-        (self)(client, reply)
-    }
-}
-
-/// Shared bounded FIFO broker reply dispatcher (A7 / Major 10):
-/// routes replies for internal broker RPCs (`BeginMacro` ACK/Refused, `InstallChild`, `FinishMacro`)
-/// directly to their keyed oneshot waiters without head-of-line blocking behind unrelated replies,
-/// while buffering all other replies (including `BeginMacro` `Terminal`s and external client traffic)
-/// in a bounded (`<= external_cap`) FIFO queue and forwarding them to the attached
-/// [`ExternalReplySink`] (PR L's per-connection WS reply router hook).
-///
-/// Lock order: ALWAYS lock `RtExecutorShared::broker` BEFORE `RtExecutorShared::reply_router`.
-/// NEVER invoke `ExternalReplySink::deliver` while holding either lock.
-struct ActionReplyRouter {
-    waiters: std::collections::HashMap<super::broker::RequestId, tokio::sync::oneshot::Sender<super::broker::Reply>>,
-    external: VecDeque<(ClientId, super::broker::Reply)>,
-    external_cap: usize,
-    external_sink: Option<Arc<dyn ExternalReplySink>>,
-}
-
-impl ActionReplyRouter {
-    fn new(external_cap: usize) -> Self {
-        let cap = external_cap.max(1);
-        Self {
-            waiters: std::collections::HashMap::new(),
-            external: VecDeque::with_capacity(cap),
-            external_cap: cap,
-            external_sink: None,
-        }
-    }
-}
+pub use super::reply_router::{
+    AckCommitGuard, ConnectionReplySink, ConnectionSlotToken, ExternalDestinationPolicy,
+    ExternalReplySink, ExternalSubmitError, ReplyRouterStats, RtTerminalStatus, WsWireAckTracker,
+};
+use super::reply_router::ActionReplyRouter;
 
 /// Outcome of a correlated WS `/api/v1/motion/servo` command routed through [`TargetPort::submit_servo`].
 pub(crate) enum ServoCommandOutcome {
@@ -3234,6 +3652,7 @@ impl RtExecutorShared {
             clock.wake();
         }
 
+        let mut rt_joined = false;
         if let Some(bound) = emergency_bound {
             // Wait up to `bound` for `armd-control` to finish its bounded disable and exit;
             // if a driver syscall stalls past the bound, take and detach the join handle so no
@@ -3244,6 +3663,7 @@ impl RtExecutorShared {
             if let Some(jh) = self.control_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
                 if finished {
                     let _ = jh.join();
+                    rt_joined = true;
                 } else {
                     self.exited.store(true, Ordering::Release);
                     tracing::error!(
@@ -3252,6 +3672,8 @@ impl RtExecutorShared {
                     );
                     drop(jh);
                 }
+            } else {
+                rt_joined = !self.teardown_disable.timed_out.load(Ordering::Acquire);
             }
         } else if self.teardown_disable.timed_out.load(Ordering::Acquire) {
             // A prior panic or emergency deadline observer already recorded `TimedOut`:
@@ -3260,6 +3682,7 @@ impl RtExecutorShared {
             if let Some(jh) = self.control_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
                 if finished {
                     let _ = jh.join();
+                    rt_joined = true;
                 } else {
                     self.exited.store(true, Ordering::Release);
                     tracing::error!(
@@ -3270,6 +3693,9 @@ impl RtExecutorShared {
             }
         } else if let Some(jh) = self.control_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let _ = jh.join();
+            rt_joined = true;
+        } else {
+            rt_joined = !self.teardown_disable.timed_out.load(Ordering::Acquire);
         }
 
         if let Some(jh) = self.monitor_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
@@ -3296,19 +3722,19 @@ impl RtExecutorShared {
             let _ = jh.join();
         }
 
-        // Final off-thread drain and reclamation.
+        // Final off-thread drain and reclamation (single finalization owner for broker/router).
         self.maint_client.finish_stopped();
         self.urgent_stop_client.finish_stopped();
         self.conn_lifecycle_client.finish_stopped();
-        self.broker_dispatcher.finish_stopped();
-        self.sinks.flush_and_report_shutdown(&self.tick_stats);
+        self.broker_dispatcher
+            .finish_stopped_inner(emergency_bound, rt_joined);
+        self.sinks
+            .flush_and_report_shutdown_without_broker(&self.tick_stats);
         self.servo_dispatcher.finish_stopped(&self.hub);
         if let Some(ring) = self.hub.record_ring() {
             ring.drain();
         }
         let _ = self.hub.latest();
-        self.broker.lock().unwrap_or_else(|e| e.into_inner()).poll(|_, _| true);
-        self.reply_router.lock().unwrap_or_else(|e| e.into_inner()).waiters.clear();
     }
 
     fn teardown_and_join(&self) {
@@ -3330,16 +3756,51 @@ pub struct RtExecutorHandle {
 
 impl RtExecutorHandle {
     pub fn boot(&self) -> BootId { self.shared.boot }
+
+    /// Test-fixture-only raw broker accessor for isolated RT-alloc / broker-ring unit fixtures.
+    /// Production code must never call this directly; use `submit_external_action`,
+    /// `submit_internal_action`, or the typed `submit_*_async` methods instead.
+    #[doc(hidden)]
     pub fn broker(&self) -> &Arc<Mutex<Broker<PlanSlot>>> { &self.shared.broker }
 
-    /// Submits an internal A6/A7 action command (`BeginMacro`, `InstallChild`, `FinishMacro`, or
-    /// `InstallPrepared`) and atomically registers a keyed oneshot waiter in the shared bounded
-    /// FIFO reply router BEFORE releasing the broker lock (preventing ACK stealing and
-    /// head-of-line deadlock behind unrelated replies).
-    ///
-    /// For `BeginMacro` (which produces `Ack` followed later by `Terminal` under the same
-    /// `RequestId`), the oneshot receives ONLY the initial `Ack`/`Refused`; the subsequent
-    /// `Terminal` automatically routes into the external FIFO queue.
+    /// Atomically verifies connection liveness, reserves bounded per-connection + global reply
+    /// capacity, submits an external action (`BeginMacro` or `InstallPrepared`), and binds its
+    /// terminal destination + RAII [`AckCommitGuard`] before releasing the broker lock.
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_external_action<'a>(
+        &self,
+        client: ClientId,
+        seq: u64,
+        auth: super::broker::Authority,
+        deadline: Instant,
+        sub: super::requests::actions::ActionSubmit<'a, PlanSlot>,
+        policy: ExternalDestinationPolicy,
+        require_ack_commit: bool,
+        wire_tracker: Option<Arc<WsWireAckTracker>>,
+    ) -> Result<
+        (
+            super::broker::RequestId,
+            tokio::sync::oneshot::Receiver<Result<super::broker::Reply, OwnerError>>,
+            AckCommitGuard,
+        ),
+        ExternalSubmitError,
+    > {
+        self.shared.broker_dispatcher.submit_external_action(
+            client,
+            seq,
+            auth,
+            deadline,
+            sub,
+            policy,
+            require_ack_commit,
+            wire_tracker,
+        )
+    }
+
+    /// Submits an internal non-action macro RPC (`InstallChild` or `FinishMacro`) and atomically
+    /// registers its private ACK waiter in the separate `internal_waiters` table under the
+    /// unified dispatcher lock order. Rejects `starts_action()` commands (`BeginMacro`,
+    /// `InstallPrepared`) fail-closed.
     pub fn submit_internal_action<'a>(
         &self,
         client: ClientId,
@@ -3354,163 +3815,140 @@ impl RtExecutorHandle {
         ),
         super::broker::AdmitError,
     > {
-        if client.0 != 0 && !self.shared.conn_lifecycle_client.is_slot_open(client.0) {
-            return Err(super::broker::AdmitError::Disconnected);
-        }
-        let mut broker = self.shared.broker.lock().unwrap_or_else(|e| e.into_inner());
-        broker.reclaim_plans();
-        let req_id = broker.submit(
-            client,
-            seq,
-            auth,
-            deadline,
-            super::broker::Submit::Action(sub),
-        )?;
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let mut router = self
-            .shared
-            .reply_router
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        router.waiters.insert(req_id, tx);
-        Ok((req_id, rx))
+        self.shared
+            .broker_dispatcher
+            .submit_internal_action(client, seq, auth, deadline, sub)
     }
 
     /// Removes a previously registered internal waiter (e.g. on timeout/cancellation).
     pub fn cancel_internal_waiter(&self, req_id: super::broker::RequestId) {
+        self.shared.broker_dispatcher.cancel_internal_waiter(req_id);
+    }
+
+    /// Registers a per-connection reply sink for an already-open connection slot.
+    pub fn register_connection_reply_sink(
+        &self,
+        client: ClientId,
+        sink: Arc<ConnectionReplySink>,
+        per_conn_cap: Option<usize>,
+    ) -> Result<ConnectionSlotToken, super::broker::AdmitError> {
+        self.shared
+            .broker_dispatcher
+            .register_connection_reply_sink(client, sink, per_conn_cap)
+    }
+
+    /// Seeds per-connection reply sinks for connections that were already live prior to executor
+    /// handover (called under `OWNER_TRANSFERRING` before publishing `OWNER_EXECUTOR`).
+    pub(crate) fn seed_connection_reply_sinks(
+        &self,
+        sinks: impl IntoIterator<Item = (u64, Arc<ConnectionReplySink>)>,
+    ) {
+        self.shared
+            .broker_dispatcher
+            .seed_connection_reply_sinks(sinks);
+    }
+
+    /// Opens a live connection slot on RT and atomically binds its per-connection reply sink in
+    /// the router (rolling back both router slot and RT registration on rejection or cancellation).
+    pub async fn open_connection_with_reply_sink_async(
+        &self,
+        conn_id: u64,
+        sink: Arc<ConnectionReplySink>,
+    ) -> Result<Result<(), &'static str>, super::requests::lease::ConnLifecycleError> {
+        self.shared
+            .broker_dispatcher
+            .open_connection_with_reply_sink(conn_id, sink)
+            .await
+    }
+
+    /// Returns `true` when `client` currently has an open per-connection reply slot registered.
+    pub fn has_connection_reply_sink(&self, client: ClientId) -> bool {
         self.shared
             .reply_router
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .waiters
-            .remove(&req_id);
+            .has_connection_slot(client)
     }
 
-    /// Single hook where PR L plugs in its per-connection WebSocket reply router.
-    /// Once attached, [`Self::has_external_reply_sink`] becomes `true`,
-    /// [`crate::macro_action::begin_macro_executor`] admits executor macros, and
-    /// [`Self::pump_broker_replies`] forwards external replies (including `BeginMacro`
-    /// `Reply::Terminal`s) to `sink` in strict FIFO order without holding broker/router locks.
+    /// Configures the per-connection bounded reply capacity (for saturation testing).
+    pub fn set_per_connection_reply_cap(&self, cap: usize) {
+        self.shared
+            .reply_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_per_connection_cap(cap);
+    }
+
+    /// Snapshot of reply router reservations, routes, and invariant counters.
+    pub fn reply_router_stats(&self) -> ReplyRouterStats {
+        self.shared
+            .reply_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .stats()
+    }
+
+    /// Attaches a fallback global [`ExternalReplySink`] for non-WS callers/tests.
+    /// WS sockets always bind via per-connection slots (`ConnectionOnly`) and never fall back
+    /// to this global sink.
     pub fn attach_external_reply_sink(&self, sink: Arc<dyn ExternalReplySink>) {
         self.shared
             .reply_router
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .external_sink = Some(sink);
+            .attach_global_sink(sink);
         self.pump_broker_replies();
     }
 
-    /// Detaches the external reply sink (returning executor macro admission to fail-closed
-    /// `503 EXECUTOR_ROUTING_PENDING`).
+    /// Detaches the fallback global external reply sink and retires old-generation credits.
     pub fn detach_external_reply_sink(&self) {
         self.shared
             .reply_router
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .external_sink = None;
+            .detach_global_sink();
     }
 
-    /// Returns `true` when an external reply sink (PR L's per-connection WS reply router) is
-    /// currently attached to this executor handle.
+    /// Returns `true` when a fallback global external reply sink is currently attached.
     pub fn has_external_reply_sink(&self) -> bool {
         self.shared
             .reply_router
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .external_sink
-            .is_some()
+            .has_global_sink()
     }
 
-    fn pump_broker_to_router(&self) -> (usize, Option<Arc<dyn ExternalReplySink>>) {
-        self.shared.broker_dispatcher.pump_to_router()
-    }
-
-    /// Pumps ready replies from the broker into matching internal waiters or the bounded external
-    /// FIFO buffer (`<= reply_capacity`), forwarding buffered external replies to the attached
-    /// [`ExternalReplySink`] (if any) without holding broker/router locks, and reclaims retired
-    /// plan slots.
+    /// Pumps ready replies from the broker through the single serial off-RT drain gate into
+    /// matching managed waiters, internal ACK waiters, per-connection slots, or the attached
+    /// global sink, and reclaims retired plan slots.
     pub fn pump_broker_replies(&self) -> usize {
-        use super::broker::DeliveryDecision;
-        let (mut total, sink) = self.pump_broker_to_router();
-        if let Some(sink) = sink {
-            let mut delivered_any = false;
-            loop {
-                let next = self
-                    .shared
-                    .reply_router
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .external
-                    .pop_front();
-                let Some((client, reply)) = next else {
-                    break;
-                };
-                match sink.deliver(client, reply) {
-                    DeliveryDecision::Delivered | DeliveryDecision::Abandoned => {
-                        delivered_any = true;
-                    }
-                    DeliveryDecision::Backpressured => {
-                        self.shared
-                            .reply_router
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .external
-                            .push_front((client, reply));
-                        break;
-                    }
-                }
-            }
-            if delivered_any {
-                total += self.pump_broker_to_router().0;
-            }
-        }
-        total
+        self.shared.broker_dispatcher.pump_replies(true)
     }
 
-    /// Drains external (non-internal-waiter) replies in strict broker FIFO order while honouring
-    /// downstream backpressure (`DeliveryDecision::Backpressured` keeps the undelivered reply at
-    /// the front of the bounded queue and never steals internal macro ACKs).
-    pub fn poll_external_replies<F>(&self, mut deliver: F) -> usize
+    /// Drains ONLY unrouted raw-broker replies (never steals replies bound to a per-connection
+    /// slot or attached global sink) under the single serial off-RT drain gate.
+    pub fn poll_external_replies<F>(&self, deliver: F) -> usize
     where
         F: FnMut(ClientId, super::broker::Reply) -> super::broker::DeliveryDecision,
     {
-        use super::broker::DeliveryDecision;
-        self.pump_broker_replies();
-        let mut delivered = 0usize;
-        {
-            let mut router = self
-                .shared
-                .reply_router
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            while let Some((client, reply)) = router.external.pop_front() {
-                match deliver(client, reply) {
-                    DeliveryDecision::Delivered | DeliveryDecision::Abandoned => delivered += 1,
-                    DeliveryDecision::Backpressured => {
-                        router.external.push_front((client, reply));
-                        break;
-                    }
-                }
-            }
-        }
-        if delivered > 0 {
-            self.pump_broker_replies();
-        }
-        delivered
+        self.shared
+            .broker_dispatcher
+            .poll_unrouted_external(deliver)
     }
 
-    /// Number of buffered external replies currently waiting in the bounded router queue.
+    /// Number of buffered external replies currently waiting in the router queues.
     pub fn pending_external_replies(&self) -> usize {
         self.shared
             .reply_router
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .external
-            .len()
+            .pending_external_count()
     }
 
     pub fn disconnect_client(&self, client: ClientId) {
-        self.shared.broker.lock().unwrap_or_else(|e| e.into_inner()).disconnect(client);
+        self.shared
+            .broker_dispatcher
+            .disconnect_client_only(client);
     }
     pub fn target_writer(&self) -> &TargetWriterHandle { &self.shared.target_writer }
 
@@ -4238,6 +4676,17 @@ pub(crate) fn spawn_executor(
     let (watchdog_plan_tx, watchdog_plan_rx) = RingBuffer::<WatchdogParkPlan>::new(2);
     let (offload_reclaim_tx, offload_reclaim_rx) =
         RingBuffer::<OffloadReclaim>::new(OFFLOAD_RECLAIM_CAPACITY);
+    let rt_terminal_cap = cfg.capacities.replies.max(64).saturating_mul(2);
+    let (rt_terminal_tx_raw, rt_terminal_rx) = RingBuffer::<RtTerminalStatus>::new(rt_terminal_cap);
+    let rt_terminal_popped = Arc::new(AtomicU64::new(0));
+    let rt_terminal_tx = super::reply_router::RtTerminalTx::new(
+        rt_terminal_tx_raw,
+        rt_terminal_cap,
+        Arc::clone(&rt_terminal_popped),
+    );
+    let rt_terminal_overflow = Arc::new(AtomicU64::new(0));
+    let terminals_handle = core.terminals_handle();
+    core.attach_rt_terminal_tx(rt_terminal_tx, Arc::clone(&rt_terminal_overflow));
 
     let estop_overflow_gen = Arc::new(AtomicU64::new(0));
     let control_stop = Arc::new(AtomicBool::new(false));
@@ -4320,6 +4769,10 @@ pub(crate) fn spawn_executor(
         servo_dispatcher: Arc::clone(&servo_dispatcher),
         hub: Arc::clone(&hub),
         offload_reclaim_rx: Mutex::new(offload_reclaim_rx),
+        rt_terminal_rx: Mutex::new(rt_terminal_rx),
+        rt_terminal_popped,
+        rt_terminal_overflow,
+        terminals: terminals_handle,
     });
 
     // Spawn dedicated persistence worker first so its thread handle can be woken on job push.

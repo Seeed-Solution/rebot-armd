@@ -2249,6 +2249,14 @@ impl ConnLifecycleClient {
         Ok(())
     }
 
+    pub(crate) fn enqueue_open_oneshot(
+        &self,
+        conn_id: u64,
+        tx: tokio::sync::oneshot::Sender<Result<LifecycleReply, ConnLifecycleError>>,
+    ) -> Result<(), ConnLifecycleError> {
+        self.enqueue_open_inner(conn_id, LifecycleWaiter::Async(tx))
+    }
+
     pub(crate) fn enqueue_disconnect_oneshot(
         &self,
         connection: ConnectionHandle,
