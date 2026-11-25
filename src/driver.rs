@@ -8287,6 +8287,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             }
         }
         let submit_now = self.now();
+        let is_cmd_enable =
+            !frame.is_extended && !frame.is_rtr && frame.dlc == 8 && frame.data == damiao::CMD_ENABLE;
         if let Some(pf_joint) = self.frame_pos_force_joint(&frame) {
             // Type-system capability guard: NO caller outside private `mod pos_force_emitter`
             // can construct a `PosForceSendToken`, so any forged `0x307` frame is rejected here.
@@ -8299,14 +8301,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 return Err(TxRefusal::PosForceFeedbackExpired(pf_joint));
             }
         }
-        if deadline.is_some_and(|d| d.passed(submit_now)) {
-            return Err(TxRefusal::DeadlinePassed);
-        }
-        // Final observable software authority fence immediately before feedback-boundary mutation
-        // and `can.transmit` for every `CMD_ENABLE` frame: enforces both the concurrent atomic
-        // lease fence (disconnect/preemption) and the absolute request/lease authority deadline.
-        if !frame.is_extended && !frame.is_rtr && frame.dlc == 8 && frame.data == damiao::CMD_ENABLE
-        {
+        // Terminal `CMD_ENABLE` authority check MUST run BEFORE per-release `DeadlinePassed` so
+        // revoked/expired authority never degrades into a retryable budget deferral.
+        if is_cmd_enable {
             if self.enable_lease_gen.is_some_and(|g| self.is_lease_fenced(g)) {
                 return Err(TxRefusal::LeaseFenced);
             }
@@ -8314,18 +8311,31 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 return Err(TxRefusal::EnableAuthorityExpired);
             }
         }
+        if deadline.is_some_and(|d| d.passed(submit_now)) {
+            return Err(TxRefusal::DeadlinePassed);
+        }
         if budgeted && !self.can_start_tick_tx() {
             return Err(TxRefusal::Deferred);
         }
 
-        // 6. Account budget attempt, reset per-motor rest-pose/enable boundaries BEFORE any
-        //    motion/enable/mode write reaches the transport, transmit, and record diagnostics.
+        // 6. Account budget attempt, re-verify `CMD_ENABLE` authority at the final instant before
+        //    mutating feedback boundaries or invoking `can.transmit`, transmit, and record metrics.
         if budgeted {
             self.record_tx_pass_attempt();
         }
+        let t0 = self.now();
+        let cpu0 = crate::diagnostics::tick::thread_cpu_ns();
+        if is_cmd_enable {
+            if self.enable_lease_gen.is_some_and(|g| self.is_lease_fenced(g)) {
+                return Err(TxRefusal::LeaseFenced);
+            }
+            if self.enable_tx_deadline.is_some_and(|dl| t0 >= dl) {
+                return Err(TxRefusal::EnableAuthorityExpired);
+            }
+        }
         let mut motion_idx: Option<usize> = None;
         if !frame.is_extended && !frame.is_rtr && frame.dlc == 8 {
-            if frame.data == damiao::CMD_ENABLE {
+            if is_cmd_enable {
                 if let Some(idx) = self.motor_ids.iter().position(|&id| u32::from(id) == frame.id) {
                     self.motor_post_enable_feedback[idx] = false;
                     self.motor_enable_seq[idx] = self.rx_seq;
@@ -8350,8 +8360,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 }
             }
         }
-        let t0 = self.now();
-        let cpu0 = crate::diagnostics::tick::thread_cpu_ns();
         let res = self.can.transmit(&frame);
         let write_done = self.now();
         let write_done_clock = if motion_idx.is_some() && res.is_ok() {
@@ -12258,11 +12266,15 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let mut wait_evidence = false;
         let mut refused_err = None;
         let mut other_err = None;
+        let step_dl = skip_dispatched
+            .then_some(self.tx_release_deadline)
+            .flatten()
+            .map(|at| Deadline { at });
         for idx in 0..self.motor_ids.len() {
             if skip_dispatched && idx < 64 && (self.disable_dispatched_mask & (1u64 << idx)) != 0 {
                 continue;
             }
-            match self.send(tx_kind, expected_stamp, None, false, |d| {
+            match self.send(tx_kind, expected_stamp, step_dl, false, |d| {
                 Some(damiao::build_disable_frame(d.motor_ids[idx]))
             }) {
                 Ok(_) => {
@@ -12298,6 +12310,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 }
                 Err(TxRefusal::DisableWaitEvidence) => {
                     wait_evidence = true;
+                }
+                Err(TxRefusal::DeadlinePassed | TxRefusal::Deferred) if skip_dispatched => {
+                    wait_evidence = true;
+                    break;
                 }
                 Err(r @ (TxRefusal::TorqueOffWouldDrop | TxRefusal::DisableRequestExpired)) => {
                     if refused_err.is_none() {

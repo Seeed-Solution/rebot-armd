@@ -3959,6 +3959,11 @@ impl SupervisorInner {
             )
     }
 
+    pub(crate) fn sync_detached_torque_flag(&self) {
+        self.detached_torque_pending_atomic
+            .store(self.has_detached_torque_transition(), Ordering::Release);
+    }
+
     /// Retains `EnableOrigin::DetachedCancel` (`Cancelling` phase) when a driver mutex was
     /// contended during an enable abort, provided no newer transition or protective disable owns
     /// the slot. A later release drains `drv.abort_enable()` with zero enable TX.
@@ -3973,6 +3978,7 @@ impl SupervisorInner {
                 budgeted: true,
             }));
         }
+        self.sync_detached_torque_flag();
     }
 
     /// Single non-blocking enable-abort helper shared across Stop, ParkRearm abort, timeout, and
@@ -5556,7 +5562,7 @@ impl SupervisorInner {
         }
     }
 
-    fn settle_legacy_ws_failed(&mut self, token: u64, slot: u8, failure: LegacyTorqueFailure) {
+    pub(crate) fn settle_legacy_ws_failed(&mut self, token: u64, slot: u8, failure: LegacyTorqueFailure) {
         let epoch_id = self.safety.epoch_id();
         let safety_state = self.safety.state_arc();
         if let Some(s) = self.legacy_torque_slots.get(usize::from(slot)) {
@@ -5622,6 +5628,8 @@ impl SupervisorInner {
             LegacyTorqueFailure::EpochMismatch
         } else if rt_code == "STOPPED" {
             LegacyTorqueFailure::Stopped
+        } else if rt_code == "DEADLINE_EXPIRED" {
+            LegacyTorqueFailure::StaticCode("DEADLINE_EXPIRED")
         } else {
             LegacyTorqueFailure::EnableFailed {
                 detail,
@@ -5898,9 +5906,21 @@ impl SupervisorInner {
                 "A torque transition is pending".into(),
             ));
         };
+        let now_wall = Instant::now();
+        if now_wall >= deadline {
+            slot.release_unstarted(token);
+            return Ok(LegacyTorqueStart::ImmediateRejected {
+                failure: LegacyTorqueFailure::StaticCode("DEADLINE_EXPIRED"),
+                epoch_id: self.safety.epoch_id(),
+                safety_state: self.safety.state().clone(),
+            });
+        }
 
         let use_budgeted =
             self.driver_supports_rt_executor || self.driver_supports_budgeted_disable_await;
+        let step_budget = deadline
+            .saturating_duration_since(now_wall)
+            .min(Duration::from_millis(1));
         let locked = {
             let d = self.driver.as_ref().expect("checked is_some");
             match d.try_lock() {
@@ -5912,11 +5932,17 @@ impl SupervisorInner {
                         let disable_kind = crate::driver::DisableKind::DisableRequested {
                             started_at: requested_at,
                         };
+                        if use_budgeted {
+                            drv.set_tx_release_deadline(Some(requested_at + step_budget));
+                        }
                         let res = if use_budgeted {
                             drv.begin_disable_torque_budgeted(disable_kind, 0)
                         } else {
                             drv.begin_disable_torque(disable_kind)
                         };
+                        if use_budgeted {
+                            drv.set_tx_release_deadline(None);
+                        }
                         let frames_dispatched = drv.disable_frames_dispatched();
                         let dispatched_mask = drv.disable_dispatched_mask();
                         let post_now = drv.clock_now();
@@ -6128,6 +6154,7 @@ impl SupervisorInner {
                 });
             }
         }
+        self.sync_detached_torque_flag();
         decision
     }
 
@@ -6188,7 +6215,14 @@ impl SupervisorInner {
                     }
                 }
             }
-            let failure = LegacyTorqueFailure::StaticCode("DEADLINE_EXPIRED");
+            let is_estop = self.estop_pending()
+                || self.e_stop_latched.load(Ordering::SeqCst)
+                || matches!(self.safety.state(), SafetyState::EStop);
+            let failure = if is_estop {
+                LegacyTorqueFailure::EStopActive
+            } else {
+                LegacyTorqueFailure::StaticCode("DEADLINE_EXPIRED")
+            };
             if settle_slot {
                 self.settle_legacy_ws_failed(token, slot_idx, failure);
             }
@@ -7263,7 +7297,9 @@ impl SupervisorInner {
             }
             _ => {}
         }
-        self.service_torque_transition_post_deadline(t, budget)
+        let out = self.service_torque_transition_post_deadline(t, budget);
+        self.sync_detached_torque_flag();
+        out
     }
 
     fn service_torque_transition_post_deadline(

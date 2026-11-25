@@ -549,4 +549,45 @@ async fn legacy_control_release_zero_alloc_across_enable_disable_rangecheck_stop
             "EnableFailed fault code must remain latched"
         );
     }
+
+    // 4. Production `tick_shared` (`control_tick`, `keep = false`) records zero allocations
+    //    across the full write guard (including disconnect check, tick, publish, E-stop flush,
+    //    and terminal-action check) during legacy WS torque enable & disable.
+    {
+        let (sup, bus, clock, conn, gen) = setup_sup(false).await;
+        // Warm up steady-state publication slots once.
+        for _ in 0..3 {
+            clock.advance(Duration::from_millis(20));
+            sup.control_tick(0.02).await;
+        }
+        bus.with(|s| s.motors[2].drop_enable = true);
+        let ep = sup.inner().read().await.safety.epoch_id();
+        let enable_task = spawn_torque_ws(&sup, conn, gen, ep, 5, true);
+        wait_transition_pending(&sup).await;
+        let samples_before = sup.tick_samples().len();
+        for step in 0..8 {
+            if step == 2 {
+                bus.with(|s| s.motors[2].drop_enable = false);
+            }
+            clock.advance(Duration::from_millis(25));
+            sup.control_tick(0.02).await;
+            if !sup.inner().read().await.torque_transition_pending() {
+                break;
+            }
+        }
+        let res = enable_task.await.unwrap().unwrap();
+        assert!(
+            matches!(res, TorqueWsOutcome::Accepted { is_torqued: true, .. }),
+            "expected Accepted enable via tick_shared: {res:?}"
+        );
+        let samples = sup.tick_samples();
+        let new_samples = &samples[samples_before..];
+        assert!(!new_samples.is_empty(), "tick_shared must record samples");
+        for (idx, s) in new_samples.iter().enumerate() {
+            assert_eq!(
+                s.usage.lock_alloc_calls, 0,
+                "production tick_shared write guard sample {idx} must record 0 alloc calls: {s:?}"
+            );
+        }
+    }
 }
