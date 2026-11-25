@@ -167,7 +167,7 @@ pub struct TrajectoryPoint {
 }
 
 /// Maximum joint count stored inline in [`JointPolynomials`] without heap allocation.
-pub const INLINE_POLYS: usize = 8;
+pub const INLINE_POLYS: usize = crate::model::MAX_MOTION_DOF;
 
 /// Fixed-storage polynomial array for up to [`INLINE_POLYS`] joints (zero allocations and
 /// zero frees on RT jog and replay approach commits), falling back to `Vec` above that.

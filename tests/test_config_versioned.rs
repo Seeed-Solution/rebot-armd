@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 use armd::model::KeepoutBox;
 use armd::rt_core::broker::{BootId, Capacities, ClientId, Submit};
 use armd::rt_core::config_iface::{Activated, ConfigAuthority, ConfigDomain, Durability, HoldState, Released, Reserved};
-use armd::rt_core::ops::{CoreOps, PlanSlot, Primitive, ReleaseFixture};
+use armd::rt_core::ops::{CoreOps, PlanSlot, ReleaseFixture};
 use armd::supervisor::ArmError;
 use armd::{ArmConfig, ArmSupervisor, SupervisorInner};
 use common::INSPECT;
@@ -165,17 +165,22 @@ fn a_held_reservation_refuses_rt_installs_and_leaves_motion_untouched() {
     let start = fx.core.commanded_positions.clone();
     let mut q = start.clone();
     q[0] += 0.05;
-    let prim = Primitive::joint_quintic(&start, &q, 0.2).unwrap();
     let later = fx.now() + Duration::from_secs(10);
+    let mut plan_snap = armd::rt_core::requests::motion::MotionPlanSnapshot::from_supervisor(&fx.core);
+    plan_snap.authority.deadline = later;
+    let plan = armd::rt_core::requests::motion::prepare_motion(
+        &plan_snap,
+        &armd::rt_core::requests::motion::MotionRequest::jog(q, Some(0.2), None),
+    ).unwrap();
     let a = fx.core.authority(&fx.ctx(fx.now()));
-    let req = b.submit(ClientId(1), 1, a, later, Submit::Install(&move |s: &mut PlanSlot| s.set(prim))).unwrap();
+    let req = b.submit(ClientId(1), 1, a, later, Submit::Install(&move |s: &mut PlanSlot| armd::rt_core::requests::motion::stage_jog(s, &plan.slot))).unwrap();
     let rep = fx.step();
     assert_eq!(rep.command, Some((req, Err("CONFIG_BUSY"))));
     assert!(fx.core.active_trajectory.is_none(), "no motion installed while the reservation is held");
 
     assert_eq!(fx.core.release(r), Released::Cleared);
     let a = fx.core.authority(&fx.ctx(fx.now()));
-    let req2 = b.submit(ClientId(1), 2, a, later, Submit::Install(&move |s: &mut PlanSlot| s.set(prim))).unwrap();
+    let req2 = b.submit(ClientId(1), 2, a, later, Submit::Install(&move |s: &mut PlanSlot| armd::rt_core::requests::motion::stage_jog(s, &plan.slot))).unwrap();
     let rep = fx.step();
     assert!(matches!(rep.command, Some((r2, Ok(_))) if r2 == req2), "{rep:?}");
     assert!(fx.core.active_trajectory.is_some());

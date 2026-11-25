@@ -54,7 +54,7 @@ pub struct Committed {
 }
 
 impl Committed {
-    fn authorized(d: &Descriptor, action: Option<ActionId>) -> Self { Self { request: d.stamp.request, action } }
+    pub(super) fn authorized(d: &Descriptor, action: Option<ActionId>) -> Self { Self { request: d.stamp.request, action } }
 
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn for_action(d: &Descriptor, action: Option<ActionId>) -> Self {
@@ -207,12 +207,14 @@ impl PreparedPath {
     }
 }
 
-/// One plan slot: the primitive, the prepared path a [`Primitive::Prepared`] reads, and (for
-/// prepared replays) the exact off-thread fitted & workspace-swept approach quintic.
+/// One plan slot: the primitive, the prepared path a [`Primitive::Prepared`] reads, optional
+/// `Copy` prepared motion plan (`PlanSlot::motion`), and (for prepared replays) the exact
+/// off-thread fitted & workspace-swept approach quintic.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlanSlot {
     pub primitive: Primitive,
     pub path: PreparedPath,
+    pub motion: Option<super::requests::motion::PreparedMotionSlot>,
     #[cfg(not(target_arch = "wasm32"))]
     pub replay_approach: Option<crate::replay::PreparedReplayApproach>,
 }
@@ -227,6 +229,7 @@ impl PlanSlot {
         Self {
             primitive: Primitive::None,
             path: PreparedPath::with_capacity(n),
+            motion: None,
             #[cfg(not(target_arch = "wasm32"))]
             replay_approach: None,
         }
@@ -235,10 +238,11 @@ impl PlanSlot {
     /// Payload bytes reserved by this slot's [`PreparedPath`] buffers.
     pub fn payload_bytes(&self) -> usize { self.path.payload_bytes() }
 
-    /// Stages a primitive that reads no path (the path and replay approach are cleared).
+    /// Stages a primitive that reads no path (the path, prepared motion slot, and replay approach are cleared).
     pub fn set(&mut self, p: Primitive) {
         self.primitive = p;
         self.path.clear();
+        self.motion = None;
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.replay_approach = None;
@@ -248,12 +252,14 @@ impl PlanSlot {
     /// Stages a slot the worker prepared (`PLAN_TOO_LARGE`: nothing staged; the slot is empty).
     pub fn copy_from(&mut self, other: &PlanSlot) -> Result<(), &'static str> {
         self.primitive = Primitive::None;
+        self.motion = None;
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.replay_approach = None;
         }
         self.path.copy_from(&other.path)?;
         self.primitive = other.primitive;
+        self.motion = other.motion;
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.replay_approach = other.replay_approach;
@@ -472,12 +478,22 @@ pub struct HardwarePoll {
     /// The driver transition in flight (None: none): progress, or its failure code (the
     /// transition's terminal is `Failed(code)`).
     pub torque: Option<Result<TorqueProgress, &'static str>>,
+    /// Sub-release wake for an internal park transition (`ParkRearm` or `Park` disable);
+    /// separate from `torque` so broker `ReleaseEngine::transition` stays isolated.
+    pub park_wake: Option<Instant>,
+    /// True when a park `ParkRearm` or `Park` disable transition finished on this poll,
+    /// requiring a Step-6 / sub-release publication.
+    pub park_state_changed: bool,
 }
 
 impl HardwarePoll {
-    /// When the bus owner wants to be serviced before the next release (a pending transition).
+    /// When the bus owner wants to be serviced before the next release (a pending broker or park transition).
     pub fn wake(&self) -> Option<Instant> {
-        match self.torque { Some(Ok(TorqueProgress::Pending { wake })) => Some(wake), _ => None }
+        let torque_wake = match self.torque { Some(Ok(TorqueProgress::Pending { wake })) => Some(wake), _ => None };
+        match (torque_wake, self.park_wake) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     /// The executor's extra service within the release ending at `release`: the pending
@@ -501,6 +517,22 @@ pub trait CoreOps {
     fn planning_snapshot(&self, ctx: &CommitCtx) -> PlanningSnapshot;
     /// Installs `primitive` for `d` after rechecking its stamp; refusal leaves active motion unchanged.
     fn commit_primitive(&mut self, d: &Descriptor, primitive: &Primitive, ctx: &CommitCtx) -> Result<Committed, &'static str>;
+    /// Installs an off-lock prepared jog (`PreparedMotionSlot`) for `d` with zero RT planning.
+    fn commit_install_slot(&mut self, _d: &Descriptor, _slot: &super::requests::motion::PreparedMotionSlot, _ctx: &CommitCtx) -> Result<Committed, &'static str> {
+        Err("UNSUPPORTED")
+    }
+    /// Installs an off-lock prepared `home` motion (`PreparedMotionSlot`) for `d`.
+    fn commit_home(&mut self, _d: &Descriptor, _slot: &super::requests::motion::PreparedMotionSlot, _ctx: &CommitCtx) -> Result<Committed, &'static str> {
+        Err("UNSUPPORTED")
+    }
+    /// Installs an off-lock prepared `park` motion (or `holding_after_clear` rearm) for `d`.
+    fn commit_park(&mut self, _d: &Descriptor, _slot: &super::requests::motion::PreparedMotionSlot, _ctx: &CommitCtx) -> Result<Committed, &'static str> {
+        Err("UNSUPPORTED")
+    }
+    /// Installs an off-lock prepared continuation trajectory onto an existing deferred `park` action.
+    fn commit_park_continuation(&mut self, _d: &Descriptor, _slot: &super::requests::motion::PreparedMotionSlot, _ctx: &CommitCtx) -> Result<Committed, &'static str> {
+        Err("UNSUPPORTED")
+    }
     fn commit_immediate(&mut self, d: &Descriptor, op: ImmediateOp, ctx: &CommitCtx) -> Result<Committed, &'static str>;
     /// Executes one lease lifecycle request (`LeaseAcquire`, `LeasePreempt`, `LeaseRelease`, `LeaseDisconnect`).
     fn commit_lease(
@@ -955,6 +987,7 @@ pub(crate) fn static_code(e: ArmError) -> &'static str {
         "WORKSPACE_VIOLATION", "JOINT_LIMIT", "PLAN_STALE", "LEASE_LOST", "NO_LEASE", "DISCONNECTED", "COLLISION_HOLD", "COMMISSIONING_REQUIRED",
         "INVALID_VALUE", "UNSUPPORTED", "INTERNAL", "FEEDBACK_STALE", "J7_FEEDBACK_STALE", "FEEDBACK_UNAVAILABLE", "CONFIG_BUSY", "ARM_NOT_AT_RESTING_POSE", "TOOL_MISMATCH",
         "MOTION_FORBIDDEN_IN_FAULT_STATE", "STOPPED", "TERMINALS_BUSY", "STAMP_REUSED", "HANDOVER_SETTLING", "DISABLE_PENDING", "TRANSITION_BUSY",
+        "WRONG_TARGET", "DEADLINE_EXPIRED",
     ];
     match &e {
         ArmError::Motion(m) => m.code(),
@@ -1008,6 +1041,10 @@ impl SupervisorInner {
         if let Some(code) = d.stamp.check(ctx.arm, ctx.boot, ctx.now, &self.authority(ctx)) { return Err(code); }
         self.check_descriptor_lease_owner(d.stamp.client.0, d.stamp.authority.lease_generation)?;
         Ok(())
+    }
+
+    pub(crate) fn check_commit_for_motion(&self, d: &Descriptor, ctx: &CommitCtx) -> Result<(), &'static str> {
+        self.check_commit(d, ctx)
     }
 
     /// Stop-direction variant of [`Self::check_commit`]: exempt from `stop_generation` checks
@@ -1087,24 +1124,28 @@ impl CoreOps for SupervisorInner {
                 let admitted = self.check_admission(stamp).map_err(|e| static_code(ArmError::Safety(e)))?;
                 SupervisorInner::commit_macro_child(admitted, primitive, ctx.now).map(|parent| Committed::authorized(d, Some(parent)))
             }
-            Primitive::JointQuintic { dof, start, q, duration_s } => {
-                // the fields are public: a hand-built primitive may name more joints than it holds
-                let n = usize::from(*dof);
-                if n == 0 || n > MAX_DOF {
-                    return Err("INVALID_COMMAND");
-                }
-                let mut eff_start = [0.0f32; MAX_DOF];
-                let (eff_dof, _) = self.post_quiesce_commanded_positions(&mut eff_start);
-                if !start_matches(&start[..n], &eff_start[..eff_dof]) {
-                    return Err("PLAN_STALE");
-                }
-                self.jog_precheck_static()?;
-                let admitted = self.check_admission(stamp).map_err(|e| static_code(ArmError::Safety(e)))?;
-                SupervisorInner::jog_action_slice(admitted, &q[..n], Some(*duration_s), Some(d.stamp.authority.epoch), "joint_move")
-                    .map(|(_, id, _)| Committed::authorized(d, Some(ActionId(id))))
-                    .map_err(static_code)
+            Primitive::JointQuintic { .. } => {
+                // Joint quintic plans must be prepared off armd-control and staged as a
+                // `PreparedMotionSlot` (`PlanSlot::motion` via `req::stage_jog`); never plan on RT.
+                Err("INVALID_COMMAND")
             }
         }
+    }
+
+    fn commit_install_slot(&mut self, d: &Descriptor, slot: &super::requests::motion::PreparedMotionSlot, ctx: &CommitCtx) -> Result<Committed, &'static str> {
+        super::requests::motion::commit_install_slot(self, d, slot, ctx)
+    }
+
+    fn commit_home(&mut self, d: &Descriptor, slot: &super::requests::motion::PreparedMotionSlot, ctx: &CommitCtx) -> Result<Committed, &'static str> {
+        super::requests::motion::commit_home(self, d, slot, ctx)
+    }
+
+    fn commit_park(&mut self, d: &Descriptor, slot: &super::requests::motion::PreparedMotionSlot, ctx: &CommitCtx) -> Result<Committed, &'static str> {
+        super::requests::motion::commit_park(self, d, slot, ctx)
+    }
+
+    fn commit_park_continuation(&mut self, d: &Descriptor, slot: &super::requests::motion::PreparedMotionSlot, ctx: &CommitCtx) -> Result<Committed, &'static str> {
+        super::requests::motion::commit_park_continuation(self, d, slot, ctx)
     }
 
     fn commit_prepared(&mut self, d: &Descriptor, primitive: &Primitive, path: &PreparedPath, ctx: &CommitCtx) -> Result<Committed, &'static str> {
@@ -1480,17 +1521,35 @@ impl CoreOps for SupervisorInner {
     }
 
     fn poll_transition_wake(&mut self, budget: &ServiceBudget) -> HardwarePoll {
+        self.last_clock_now = Some(budget.now);
         let trans = self.service_torque_transition(budget);
+        let mut park_wake = None;
+        let mut park_state_changed = false;
         let (rx_frames, trans_exhausted) = match trans {
             Some(tp) => {
-                self.core.begin_transition(tp.progress);
+                if tp.broker_owned {
+                    self.core.begin_transition(tp.progress);
+                } else {
+                    match tp.progress {
+                        Ok(TorqueProgress::Pending { wake }) => park_wake = Some(wake),
+                        Ok(TorqueProgress::Done) | Err(_) => park_state_changed = true,
+                    }
+                }
                 tp.rx.unwrap_or((0, false))
             }
             None => (0, false),
         };
         let budget_exhausted = budget.now > budget.deadline || trans_exhausted;
         let Some(driver) = self.driver.as_ref() else {
-            return HardwarePoll { driverless: true, rx_frames, budget_exhausted, torque: self.core.poll_transition(), ..HardwarePoll::default() };
+            return HardwarePoll {
+                driverless: true,
+                rx_frames,
+                budget_exhausted,
+                torque: self.core.poll_transition(),
+                park_wake,
+                park_state_changed,
+                ..HardwarePoll::default()
+            };
         };
         let d = driver.lock().unwrap_or_else(|e| e.into_inner());
         d.feedback_ages_into(&mut self.scratch.ages);
@@ -1503,6 +1562,8 @@ impl CoreOps for SupervisorInner {
             rx_frames,
             budget_exhausted,
             torque: self.core.poll_transition(),
+            park_wake,
+            park_state_changed,
         }
     }
 
@@ -1576,7 +1637,6 @@ impl CoreOps for SupervisorInner {
     fn attach_closed_bitset(&mut self, bitset: std::sync::Arc<super::requests::actions::ClosedBitset>) {
         SupervisorInner::attach_closed_bitset(self, bitset);
     }
-
     fn set_boot_id(&mut self, boot: BootId) {
         self.boot_id = boot;
     }
@@ -2148,12 +2208,17 @@ impl ReleaseEngine {
                     #[cfg(target_arch = "wasm32")]
                     let is_child_cmd = false;
                     let starts_top_action = match d.kind {
-                        CommandKind::Install { .. } => true,
+                        CommandKind::Install { .. }
+                        | CommandKind::InstallHome { .. }
+                        | CommandKind::InstallPark { .. } => true,
                         #[cfg(not(target_arch = "wasm32"))]
                         CommandKind::Action(a) => a.starts_action(),
                         #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
                         CommandKind::Policy(p) => p.starts_action(),
-                        CommandKind::Immediate(_) | CommandKind::Transition(_) | CommandKind::Lease(_) => false,
+                        CommandKind::ContinuePark { .. }
+                        | CommandKind::Immediate(_)
+                        | CommandKind::Transition(_)
+                        | CommandKind::Lease(_) => false,
                     };
                     // Provisional read-only capture before Step 3 mutates `core`: if a Step-1 Stop
                     // already ended the prior active action/macro, preserve its exact outcome & children
@@ -2177,6 +2242,10 @@ impl ReleaseEngine {
                             } else {
                                 match t.plan() {
                                     None => Err("PLAN_RETIRED"),
+                                    Some(slot) if slot.motion.is_some() => {
+                                        let m = slot.motion.expect("checked is_some");
+                                        core.commit_install_slot(&d, &m, &ctx)
+                                    }
                                     Some(slot) if matches!(slot.primitive, Primitive::Prepared { .. }) => match t.plan_ref() {
                                         Some(slot_ref) => core.commit_prepared_slot(&d, slot_ref, &ctx),
                                         None => Err("PLAN_RETIRED"),
@@ -2185,6 +2254,18 @@ impl ReleaseEngine {
                                 }
                             }
                         }
+                        CommandKind::InstallHome { .. } => match t.plan().and_then(|s| s.motion) {
+                            Some(m) => core.commit_home(&d, &m, &ctx),
+                            None => Err("PLAN_RETIRED"),
+                        },
+                        CommandKind::InstallPark { .. } => match t.plan().and_then(|s| s.motion) {
+                            Some(m) => core.commit_park(&d, &m, &ctx),
+                            None => Err("PLAN_RETIRED"),
+                        },
+                        CommandKind::ContinuePark { .. } => match t.plan().and_then(|s| s.motion) {
+                            Some(m) => core.commit_park_continuation(&d, &m, &ctx),
+                            None => Err("PLAN_RETIRED"),
+                        },
                         CommandKind::Immediate(op) => core.commit_immediate(&d, op, &ctx),
                         CommandKind::Transition(op) => core.commit_transition_for_release(&d, op, &ctx, release_deadline),
                         #[cfg(not(target_arch = "wasm32"))]
@@ -2209,7 +2290,7 @@ impl ReleaseEngine {
                     };
                     report.command = Some((d.stamp.request, match result {
                         Ok(c) => {
-                            let install = matches!(d.kind, CommandKind::Install { .. });
+                            let install = d.kind.is_install();
                             let supersedes = starts_top_action && c.action().is_some() && c.request() == d.stamp.request && self.active.is_some();
                             if supersedes {
                                 t.ack_deferred(c).map(|(acked, ack_reply)| {
@@ -2402,16 +2483,29 @@ impl ReleaseEngine {
         let finished = self
             .take_finished_transition(report)
             .or_else(|| self.take_aborted_transition(core, report));
+        let active_ended = self.active().and_then(|a| core.action_outcome(a).map(|o| (a, o)));
         if urgent_applied
             || lifecycle_pending
             || core.has_pending_servo_closes()
             || core.has_pending_policy_close()
             || finished.is_some()
+            || active_ended.is_some()
+            || report.poll.park_state_changed
         {
             let ts = core.now_timestamp();
             core.publish(ts, publish_generation);
             if let Some((t, outcome)) = finished {
                 self.intake.terminal(t, outcome);
+            }
+            if let Some((action, outcome)) = active_ended {
+                let old_slot = self.active.take().expect("active above");
+                let (installed, child_plan) = old_slot.into_parts();
+                if let Some(cp) = child_plan {
+                    self.intake.retire_plan(cp);
+                }
+                let children = core.action_children(action);
+                self.intake.terminal_with_children(installed, outcome, children);
+                report.ended = Some((action, outcome));
             }
             if self.flush_urgent_stop_replies() {
                 self.urgent_replies_flushed = true;
@@ -2471,6 +2565,7 @@ impl<O: CoreOps> ReleaseFixture<O> {
         caps: Capacities,
         clock: VirtualClock,
     ) -> (Self, Broker<PlanSlot>, TargetWriter, StopRequests) {
+        core.set_boot_id(boot);
         let (engine, broker, tw, stop) = ReleaseEngine::new(boot, caps);
         #[cfg(not(target_arch = "wasm32"))]
         core.attach_closed_bitset(broker.closed_bitset());

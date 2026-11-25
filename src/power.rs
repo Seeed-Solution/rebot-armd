@@ -52,7 +52,7 @@ use crate::model::MotionLimitReason;
 use crate::supervisor::SupervisorInner;
 
 /// Most joints the per-tick arrays hold.
-pub const MAX_JOINTS: usize = 8;
+pub const MAX_JOINTS: usize = crate::model::MAX_MOTION_DOF;
 /// Time constant (s) of the fast filter (the governor input). At 50 Hz this is 2 ticks.
 pub const FAST_FILTER_S: f32 = 0.04;
 /// A joint counts as heavy for the hold rule at this share of the joints' load above idle.
@@ -720,7 +720,7 @@ pub(crate) fn power_fit_quintic_with(budget: Option<&PowerBudget>, arm: &crate::
             Err(_) => p.min_scale,
         };
         let full = traj.duration;
-        let zero_buf = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
+        let zero_buf = [0.0f32; crate::model::MAX_MOTION_DOF];
         let zero_vec;
         let zeros: &[f32] = if target.len() <= zero_buf.len() {
             &zero_buf[..target.len()]

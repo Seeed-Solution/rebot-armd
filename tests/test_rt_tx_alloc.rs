@@ -2281,9 +2281,9 @@ fn rt_r2_stale_j7_refusals_and_r1_epilogue_zero_alloc_and_zero_free() {
     let _ = inner.core.hub().latest();
     assert!(inner.safety.state().is_operational(), "must stay operational at 120 ms J7 age");
 
-    // 3-5. Standalone `commit_prepared_slot`, `commit_prepared`, and `commit_primitive` (`JointQuintic`)
+    // 3-5. Standalone `commit_prepared_slot`, `commit_prepared`, and `commit_install_slot` (jog)
     //      while J7 is stale: strictly (0, 0) allocs/frees!
-    let boot = BootId(7);
+    let boot = inner.boot_id();
     let now = std::time::Instant::now();
     let deadline = now + Duration::from_secs(5);
     let ctx = CommitCtx {
@@ -2328,12 +2328,27 @@ fn rt_r2_stale_j7_refusals_and_r1_epilogue_zero_alloc_and_zero_free() {
         duration_s: 0.2,
         power_scale: None,
     };
-    let jog_j7_prim = Primitive::JointQuintic {
-        dof: 7,
-        start,
-        q: goal_j7,
-        duration_s: 0.5,
-    };
+    let jog_cfg = std::sync::Arc::new(
+        armd::rt_core::requests::motion::MotionConfigSnapshot::from_supervisor(&inner),
+    );
+    let jog_snap =
+        armd::rt_core::requests::motion::MotionPlanSnapshot::from_supervisor_with_authority(
+            &inner,
+            jog_cfg,
+            armd::rt_core::requests::motion::PlanAuthority {
+                boot,
+                epoch: auth.epoch,
+                lease_generation: auth.lease_generation,
+                stop_generation: auth.stop_generation,
+                deadline,
+            },
+        );
+    let jog_j7_slot = armd::rt_core::requests::motion::prepare_motion(
+        &jog_snap,
+        &armd::rt_core::requests::motion::MotionRequest::jog(goal_j7[..7].to_vec(), Some(0.5), None),
+    )
+    .expect("prepare jog moving J7")
+    .slot;
 
     let (mut pw, mut pr) = plan_slots(4, PlanSlot::default);
     let h_rep = pw.stage(|s| s.copy_from(&replay_slot).unwrap()).unwrap();
@@ -2358,7 +2373,7 @@ fn rt_r2_stale_j7_refusals_and_r1_epilogue_zero_alloc_and_zero_free() {
         let c_prep = inner
             .commit_prepared(&d2, &replay_slot.primitive, &replay_slot.path, &ctx)
             .unwrap_err();
-        let c_jog = inner.commit_primitive(&d3, &jog_j7_prim, &ctx).unwrap_err();
+        let c_jog = inner.commit_install_slot(&d3, &jog_j7_slot, &ctx).unwrap_err();
         [c_slot, c_prep, c_jog]
     });
     assert_eq!(

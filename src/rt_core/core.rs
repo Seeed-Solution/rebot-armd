@@ -8,7 +8,7 @@ use super::config_iface::{ConfigDomain, ConfigHold, HeldConfig};
 use super::mailbox::TargetAuthority;
 use super::ops::TorqueProgress;
 use super::ids::{ArmId, BusId};
-use super::publish::{state_channel, ObservationSpares, OwnerStateSnapshot, PublishedOwnerMeta, RtInputs, StateHub, StatePublisher};
+use super::publish::{state_channel, ObservationSpares, OwnerStateSnapshot, PublishedOwnerMeta, RtInputs, RtMotionMeta, StateHub, StatePublisher};
 use super::record_ring::{Fence, Finished, RecordProducer, RecordRing};
 use crate::driver::ArmDriver;
 use crate::model::ArmObservation;
@@ -202,11 +202,12 @@ impl ArmCore {
             &[],
             &[],
             PublishedOwnerMeta::default(),
+            RtMotionMeta::default(),
         );
     }
 
     /// In-place zero-alloc publication carrying [`OwnerStateSnapshot`], commanded joints, driver
-    /// RX queue bounds, and live `Copy` [`PublishedOwnerMeta`] alongside the observation.
+    /// RX queue bounds, live `Copy` [`PublishedOwnerMeta`], and [`RtMotionMeta`] alongside the observation.
     #[allow(clippy::too_many_arguments)]
     pub fn publish_with_rt_meta(
         &mut self,
@@ -221,6 +222,7 @@ impl ArmCore {
         commanded_velocities: &[f32],
         feedback_queue_bounds: &[Option<Instant>],
         owner: PublishedOwnerMeta,
+        meta: RtMotionMeta,
     ) {
         self.buffer_out = false;
         self.publisher.restore_back_spares(buffer.1);
@@ -233,6 +235,7 @@ impl ArmCore {
             feedback_seqs: &self.feedback.seqs,
             feedback_queue_bounds,
             owner,
+            meta,
         };
         let displaced = self.publisher.publish_with_owner(generation, sampled_at, valid_until, buffer.0, owner_state, rt);
         // the slot was emptied by take_observation_buffer and nothing wrote it since
@@ -257,6 +260,7 @@ impl ArmCore {
             feedback_seqs: &self.feedback.seqs,
             feedback_queue_bounds: &[],
             owner: PublishedOwnerMeta::default(),
+            meta: RtMotionMeta::default(),
         };
         Ok(self.publisher.publish(generation, sampled_at, valid_until, obs, rt))
     }

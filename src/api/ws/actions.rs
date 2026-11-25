@@ -9,7 +9,7 @@ use super::*;
 type _PlanInputImportKeep = PlanInput;
 use super::dispatch::{
     AdmissionClass, AuthRequirement, DispatchEntry, DispatchHandler, DispatchKey, LeaseFreeCtx,
-    LeaseRequirement, OwnerDispatchCtx, ReplyPolicy,
+    LeaseRequirement, OwnerDispatchCtx, OwnerReply, ReplyPolicy,
 };
 
 pub(super) const ENTRIES: &[DispatchEntry] = &[
@@ -209,7 +209,7 @@ fn record_stop_auth_check(ws_auth: &WsAuth, path: &str, body: &Value) -> Option<
     Some(ApiError::operator_required(path))
 }
 
-fn dispatch_action_entry(ctx: &mut OwnerDispatchCtx<'_>) -> Option<Value> {
+fn dispatch_action_entry(ctx: &mut OwnerDispatchCtx<'_>) -> Option<OwnerReply> {
     dispatch_action_command(
         ctx.inner,
         ctx.stamp,
@@ -285,6 +285,18 @@ pub(super) enum PendingPlanKind {
     Replay,
 }
 
+impl PendingPlanKind {
+    pub(super) const fn command_path(self) -> &'static str {
+        match self {
+            Self::MoveTo => "/api/v1/action/move_to",
+            Self::MoveRelative => "/api/v1/action/move_relative",
+            Self::MoveToPose => "/api/v1/action/move_to_pose",
+            Self::Gripper => "/api/v1/action/gripper",
+            Self::Replay => "/api/v1/action/replay",
+        }
+    }
+}
+
 /// A prepared action waiting for off-lock planning from a captured [`ActionSnapshot`].
 pub(super) struct PendingPlan {
     pub(super) request_id: Value,
@@ -306,6 +318,13 @@ pub(super) enum PlannedMacro {
 }
 
 impl PendingMacro {
+    pub(super) const fn command_path(&self) -> &'static str {
+        match self {
+            Self::Grasp(_) => "/api/v1/action/grasp",
+            Self::Place(_) => "/api/v1/action/place",
+        }
+    }
+
     pub(super) fn plan(self) -> Result<PlannedMacro, ArmError> {
         match self {
             Self::Grasp(g) => crate::grasp::plan(g).map(PlannedMacro::Grasp),
@@ -345,6 +364,7 @@ impl Drop for AbortOnDrop {
 /// tracked connection task, aborted automatically on drop so preflight never outlives the socket.
 pub(super) struct MacroCheck {
     pub(super) request_id: Value,
+    pub(super) command_path: &'static str,
     pub(super) generation: u64,
     pub(super) stamp: crate::supervisor::AdmissionStamp,
     pub(super) abort: AbortOnDrop,
@@ -477,7 +497,7 @@ pub(super) fn dispatch_action_command(
     recv_deps: &crate::grasp::GraspDeps,
     recv_calib: &crate::calibration::CalibrationDeps,
     pending: &mut ActionPending,
-) -> Option<Value> {
+) -> Option<OwnerReply> {
     let (auth_snap, token_snap) = ws_auth.auth_and_token();
     match prepare_action(
         inner,
@@ -489,9 +509,10 @@ pub(super) fn dispatch_action_command(
         &auth_snap,
         token_snap.as_deref(),
     ) {
-        Ok(ActionStart::Started(id, duration)) => {
-            Some(command_ack(inner, &value["request_id"], Some((id, duration))))
-        }
+        Ok(ActionStart::Started(id, duration)) => Some(OwnerReply::CommandAck {
+            snap: AckSnapshot::from_inner(inner),
+            started: Some((id, duration)),
+        }),
         Ok(ActionStart::Plan(plan)) => {
             pending.plan = Some((*plan, local_generation));
             None
@@ -506,8 +527,14 @@ pub(super) fn dispatch_action_command(
         }
         Ok(ActionStart::Sequence(plan)) => Some(
             match crate::sequences::begin_with_stamp(inner, stamp, recv_supervisor, *plan) {
-                Ok(started) => command_ack(inner, &value["request_id"], Some(started)),
-                Err(error) => command_reject(inner, &value["request_id"], error.into()),
+                Ok(started) => OwnerReply::CommandAck {
+                    snap: AckSnapshot::from_inner(inner),
+                    started: Some(started),
+                },
+                Err(error) => OwnerReply::CommandReject {
+                    epoch: inner.safety.epoch_id(),
+                    error: error.into(),
+                },
             },
         ),
         Ok(ActionStart::CalibHover(plan)) => Some(
@@ -519,12 +546,15 @@ pub(super) fn dispatch_action_command(
                 recv_calib.upstream.clone(),
                 crate::calib_hover::jobs_dir(&recv_calib.path),
             ) {
-                Ok((id, duration, job_id)) => {
-                    let mut ack = command_ack(inner, &value["request_id"], Some((id, duration)));
-                    ack["job_id"] = json!(job_id);
-                    ack
-                }
-                Err(error) => command_reject(inner, &value["request_id"], error.into()),
+                Ok((id, duration, job_id)) => OwnerReply::CommandAckJob {
+                    snap: AckSnapshot::from_inner(inner),
+                    started: Some((id, duration)),
+                    job_id,
+                },
+                Err(error) => OwnerReply::CommandReject {
+                    epoch: inner.safety.epoch_id(),
+                    error: error.into(),
+                },
             },
         ),
         Ok(ActionStart::GripperCalibrate(epoch, tag)) => Some(
@@ -534,8 +564,14 @@ pub(super) fn dispatch_action_command(
                 .and_then(|admitted| {
                     crate::gripper_calib::begin_calibration(admitted, recv_supervisor, epoch, tag)
                 }) {
-                Ok(started) => command_ack(inner, &value["request_id"], Some(started)),
-                Err(error) => command_reject(inner, &value["request_id"], error.into()),
+                Ok(started) => OwnerReply::CommandAck {
+                    snap: AckSnapshot::from_inner(inner),
+                    started: Some(started),
+                },
+                Err(error) => OwnerReply::CommandReject {
+                    epoch: inner.safety.epoch_id(),
+                    error: error.into(),
+                },
             },
         ),
         Ok(ActionStart::MeasureMultiview(plan)) => Some(
@@ -546,11 +582,20 @@ pub(super) fn dispatch_action_command(
                 *plan,
                 recv_deps.source.clone(),
             ) {
-                Ok(started) => command_ack(inner, &value["request_id"], Some(started)),
-                Err(error) => command_reject(inner, &value["request_id"], error.into()),
+                Ok(started) => OwnerReply::CommandAck {
+                    snap: AckSnapshot::from_inner(inner),
+                    started: Some(started),
+                },
+                Err(error) => OwnerReply::CommandReject {
+                    epoch: inner.safety.epoch_id(),
+                    error: error.into(),
+                },
             },
         ),
-        Err(error) => Some(command_reject(inner, &value["request_id"], error)),
+        Err(error) => Some(OwnerReply::CommandReject {
+            epoch: inner.safety.epoch_id(),
+            error,
+        }),
     }
 }
 
@@ -558,6 +603,7 @@ pub(super) fn dispatch_action_command(
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn complete_macro_check(
     request_id: Value,
+    command_path: &'static str,
     generation: u64,
     stamp: crate::supervisor::AdmissionStamp,
     joined: Result<Result<PlannedMacro, ArmError>, tokio::sync::oneshot::error::RecvError>,
@@ -581,41 +627,83 @@ pub(super) async fn complete_macro_check(
     if recv_supervisor.owner_mode() != crate::supervisor::OWNER_LEGACY {
         return Some((owner_transferred(), None));
     }
+    enum MacroFinishOutcome {
+        Closed,
+        Detached,
+        LeaseLost { epoch: u64 },
+        Ack { snap: AckSnapshot, started: Started },
+        Reject { epoch: u64, error: ApiError },
+    }
     let gate = CommandReplyGateGuard::enter(command_reply_pending, recv_supervisor.hub());
-    let mut inner = recv_supervisor.inner().write().await;
-    if worker_closing.load(Ordering::SeqCst) {
-        drop(inner);
-        return None;
-    }
-    if inner.detached {
-        drop(inner);
-        return Some((owner_transferred(), None));
-    }
-    let reply = if let Err(err) = inner.preflight_admission(stamp) {
-        command_reject(&inner, &request_id, ArmError::from(err).into())
-    } else {
-        match joined {
-            Err(e) => command_reject(
-                &inner,
-                &request_id,
-                ArmError::Internal(format!("planner task failed: {e}")).into(),
-            ),
-            Ok(Err(error)) => command_reject(&inner, &request_id, error.into()),
-            Ok(Ok(planned)) => {
-                if recv_generation.load(Ordering::SeqCst) != generation
-                    || !inner.validate_servo_lease(recv_connection, generation)
-                {
-                    json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while planning", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
-                } else {
-                    match planned.start(&mut inner, stamp, recv_supervisor, recv_deps) {
-                        Ok(started) => command_ack(&inner, &request_id, Some(started)),
-                        Err(error) => command_reject(&inner, &request_id, error.into()),
+    let outcome = {
+        let mut inner = recv_supervisor.inner().write().await;
+        inner.set_command(command_path);
+        if worker_closing.load(Ordering::SeqCst) {
+            MacroFinishOutcome::Closed
+        } else if inner.detached {
+            MacroFinishOutcome::Detached
+        } else if let Err(err) = inner.preflight_admission(stamp) {
+            MacroFinishOutcome::Reject {
+                epoch: inner.safety.epoch_id(),
+                error: ArmError::from(err).into(),
+            }
+        } else {
+            match joined {
+                Err(e) => MacroFinishOutcome::Reject {
+                    epoch: inner.safety.epoch_id(),
+                    error: ArmError::Internal(format!("planner task failed: {e}")).into(),
+                },
+                Ok(Err(error)) => MacroFinishOutcome::Reject {
+                    epoch: inner.safety.epoch_id(),
+                    error: error.into(),
+                },
+                Ok(Ok(planned)) => {
+                    if recv_generation.load(Ordering::SeqCst) != generation
+                        || !inner.validate_servo_lease(recv_connection, generation)
+                    {
+                        MacroFinishOutcome::LeaseLost {
+                            epoch: inner.safety.epoch_id(),
+                        }
+                    } else {
+                        match planned.start(&mut inner, stamp, recv_supervisor, recv_deps) {
+                            Ok(started) => {
+                                inner.set_action_id(started.0);
+                                MacroFinishOutcome::Ack {
+                                    snap: AckSnapshot::from_inner(&inner),
+                                    started: Some(started),
+                                }
+                            }
+                            Err(error) => MacroFinishOutcome::Reject {
+                                epoch: inner.safety.epoch_id(),
+                                error: error.into(),
+                            },
+                        }
                     }
                 }
             }
         }
     };
-    Some((reply, Some(gate)))
+    // Write guard is now released; build every JSON reply strictly off-lock while keeping `gate`
+    // active for ACKs so action terminals cannot overtake the ACK on the wire.
+    match outcome {
+        MacroFinishOutcome::Closed => None,
+        MacroFinishOutcome::Detached => {
+            drop(gate);
+            Some((owner_transferred(), None))
+        }
+        MacroFinishOutcome::LeaseLost { epoch } => {
+            drop(gate);
+            let reply = json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while planning", "error":"LEASE_LOST", "epoch_id":epoch});
+            Some((reply, None))
+        }
+        MacroFinishOutcome::Reject { epoch, error } => {
+            drop(gate);
+            Some((command_reject_at(epoch, &request_id, error), None))
+        }
+        MacroFinishOutcome::Ack { snap, started } => {
+            Some((command_ack_from_snap(&snap, &request_id, started), Some(gate)))
+        }
+    }
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -688,119 +776,160 @@ pub(super) async fn complete_pending_plan(
     if worker_closing.load(Ordering::SeqCst) {
         return None;
     }
+    enum PlanInstallOutcome {
+        Closed,
+        Detached,
+        NoReply,
+        LeaseLost { epoch: u64 },
+        Ack { snap: AckSnapshot, started: Started },
+        Reject { epoch: u64, error: ApiError },
+    }
     // M2: Keep the per-connection reply gate closed from BEFORE acquiring the install lock until
     // the caller enqueues `command_ack` onto `ordinary_tx` so terminals (e.g. from an immediate
     // Stop) can never overtake the ACK for gripper / move_to_pose / move_to / replay.
     let gate = CommandReplyGateGuard::enter(command_reply_pending, recv_supervisor.hub());
-    let mut inner = recv_supervisor.inner().write().await;
-    if worker_closing.load(Ordering::SeqCst) {
-        return None;
-    }
-    if inner.detached {
-        let msg = if is_replay {
-            "Ownership transferred to RT executor while checking replay"
+    let outcome = {
+        let mut inner = recv_supervisor.inner().write().await;
+        inner.set_command(kind.command_path());
+        if worker_closing.load(Ordering::SeqCst) {
+            PlanInstallOutcome::Closed
+        } else if inner.detached {
+            PlanInstallOutcome::Detached
         } else {
-            "Ownership transferred to RT executor while planning"
-        };
-        let mut r = json!({"type":"command_reject", "request_id":request_id, "status":503, "code":"OWNER_TRANSFERRED", "error":"OWNER_TRANSFERRED", "message":msg});
-        if let Some(s) = recv_supervisor.hub().latest() {
-            r["epoch_id"] = json!(s.obs.epoch_id);
-        }
-        return Some((Some(r), None));
-    }
-    if let Some(hook) = inner.before_install_hook.take() {
-        hook(&mut inner);
-    }
-    if let Err(err) = inner.preflight_admission(stamp) {
-        return Some((
-            Some(command_reject(
-                &inner,
-                &request_id,
-                ArmError::from(err).into(),
-            )),
-            None,
-        ));
-    }
-    let reply = match prepared {
-        Ok(None) => None,
-        Err(e) => {
-            let label = if is_replay {
-                "replay check task failed"
-            } else {
-                "planner task failed"
-            };
-            Some(command_reject(
-                &inner,
-                &request_id,
-                ArmError::Internal(format!("{label}: {e}")).into(),
-            ))
-        }
-        Ok(Some(Err((error, joint_hint)))) => {
-            let mut api: ApiError = error.into();
-            if joint_hint {
-                api.message.push_str(crate::motion::JOINT_PATH_HINT);
+            if let Some(hook) = inner.before_install_hook.take() {
+                hook(&mut inner);
             }
-            Some(command_reject(&inner, &request_id, api))
-        }
-        Ok(Some(Ok(prepared))) => Some(
-            if recv_generation.load(Ordering::SeqCst) != generation
-                || !inner.validate_servo_lease(recv_connection, generation)
-            {
-                let msg = if is_replay {
-                    "This connection lost the lease while the episode was checked"
-                } else {
-                    "This connection lost the lease while planning"
-                };
-                json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":msg, "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
-            } else {
-                let ctx = req::OwnerCheckCtx::for_legacy(&inner);
-                let res = match prepared {
-                    PreparedWsAction::Cartesian(c) => {
-                        let s = c.stamp;
-                        req::install_move_cartesian(
-                            &mut inner,
-                            &s,
-                            &ctx,
-                            req::CartesianInstallPayload::Legacy(Box::new(c)),
-                        )
-                    }
-                    PreparedWsAction::Joint(j) => {
-                        let s = j.stamp;
-                        req::install_move_joint(
-                            &mut inner,
-                            &s,
-                            &ctx,
-                            req::JointInstallPayload::Legacy(Box::new(j)),
-                        )
-                    }
-                    PreparedWsAction::Gripper(g) => {
-                        let s = g.stamp;
-                        req::install_gripper(
-                            &mut inner,
-                            &s,
-                            &ctx,
-                            req::GripperInstallPayload::Legacy(Box::new(g)),
-                        )
-                    }
-                    PreparedWsAction::Replay(r) => {
-                        let s = r.stamp;
-                        req::install_replay(
-                            &mut inner,
-                            &s,
-                            &ctx,
-                            req::ReplayInstallPayload::Legacy(Box::new(r)),
-                        )
-                    }
-                };
-                match res {
-                    Ok(started) => command_ack(&inner, &request_id, Some(started)),
-                    Err(error) => command_reject(&inner, &request_id, error.into()),
+            if let Err(err) = inner.preflight_admission(stamp) {
+                PlanInstallOutcome::Reject {
+                    epoch: inner.safety.epoch_id(),
+                    error: ArmError::from(err).into(),
                 }
-            },
-        ),
+            } else {
+                match prepared {
+                    Ok(None) => PlanInstallOutcome::NoReply,
+                    Err(e) => {
+                        let label = if is_replay {
+                            "replay check task failed"
+                        } else {
+                            "planner task failed"
+                        };
+                        PlanInstallOutcome::Reject {
+                            epoch: inner.safety.epoch_id(),
+                            error: ArmError::Internal(format!("{label}: {e}")).into(),
+                        }
+                    }
+                    Ok(Some(Err((error, joint_hint)))) => {
+                        let mut api: ApiError = error.into();
+                        if joint_hint {
+                            api.message.push_str(crate::motion::JOINT_PATH_HINT);
+                        }
+                        PlanInstallOutcome::Reject {
+                            epoch: inner.safety.epoch_id(),
+                            error: api,
+                        }
+                    }
+                    Ok(Some(Ok(prepared))) => {
+                        if recv_generation.load(Ordering::SeqCst) != generation
+                            || !inner.validate_servo_lease(recv_connection, generation)
+                        {
+                            PlanInstallOutcome::LeaseLost {
+                                epoch: inner.safety.epoch_id(),
+                            }
+                        } else {
+                            let ctx = req::OwnerCheckCtx::for_legacy(&inner);
+                            let res = match prepared {
+                                PreparedWsAction::Cartesian(c) => {
+                                    let s = c.stamp;
+                                    req::install_move_cartesian(
+                                        &mut inner,
+                                        &s,
+                                        &ctx,
+                                        req::CartesianInstallPayload::Legacy(Box::new(c)),
+                                    )
+                                }
+                                PreparedWsAction::Joint(j) => {
+                                    let s = j.stamp;
+                                    req::install_move_joint(
+                                        &mut inner,
+                                        &s,
+                                        &ctx,
+                                        req::JointInstallPayload::Legacy(Box::new(j)),
+                                    )
+                                }
+                                PreparedWsAction::Gripper(g) => {
+                                    let s = g.stamp;
+                                    req::install_gripper(
+                                        &mut inner,
+                                        &s,
+                                        &ctx,
+                                        req::GripperInstallPayload::Legacy(Box::new(g)),
+                                    )
+                                }
+                                PreparedWsAction::Replay(r) => {
+                                    let s = r.stamp;
+                                    req::install_replay(
+                                        &mut inner,
+                                        &s,
+                                        &ctx,
+                                        req::ReplayInstallPayload::Legacy(Box::new(r)),
+                                    )
+                                }
+                            };
+                            match res {
+                                Ok(started) => {
+                                    inner.set_action_id(started.0);
+                                    PlanInstallOutcome::Ack {
+                                        snap: AckSnapshot::from_inner(&inner),
+                                        started: Some(started),
+                                    }
+                                }
+                                Err(error) => PlanInstallOutcome::Reject {
+                                    epoch: inner.safety.epoch_id(),
+                                    error: error.into(),
+                                },
+                            }
+                        }
+                    }
+                }
+            }
+        }
     };
-    let keep_gate = reply.is_some().then_some(gate);
-    Some((reply, keep_gate))
+    // Build every WS reply strictly AFTER the write guard is released.
+    match outcome {
+        PlanInstallOutcome::Closed => None,
+        PlanInstallOutcome::NoReply => Some((None, None)),
+        PlanInstallOutcome::Detached => {
+            drop(gate);
+            let msg = if is_replay {
+                "Ownership transferred to RT executor while checking replay"
+            } else {
+                "Ownership transferred to RT executor while planning"
+            };
+            let mut r = json!({"type":"command_reject", "request_id":request_id, "status":503, "code":"OWNER_TRANSFERRED", "error":"OWNER_TRANSFERRED", "message":msg});
+            if let Some(s) = recv_supervisor.hub().latest() {
+                r["epoch_id"] = json!(s.obs.epoch_id);
+            }
+            Some((Some(r), None))
+        }
+        PlanInstallOutcome::LeaseLost { epoch } => {
+            drop(gate);
+            let msg = if is_replay {
+                "This connection lost the lease while the episode was checked"
+            } else {
+                "This connection lost the lease while planning"
+            };
+            let r = json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":msg, "error":"LEASE_LOST", "epoch_id":epoch});
+            Some((Some(r), None))
+        }
+        PlanInstallOutcome::Reject { epoch, error } => {
+            drop(gate);
+            Some((Some(command_reject_at(epoch, &request_id, error)), None))
+        }
+        PlanInstallOutcome::Ack { snap, started } => {
+            let reply = command_ack_from_snap(&snap, &request_id, started);
+            Some((Some(reply), Some(gate)))
+        }
+    }
 }
 
 /// Spawn a tracked macro planning/preflight task and return its [`MacroCheck`] handle.
@@ -815,6 +944,7 @@ pub(super) fn spawn_macro_check(
     recv_connection: &str,
     worker_tasks: &ConnectionTasks,
 ) -> MacroCheck {
+    let command_path = pending.command_path();
     let source = recv_deps.source.clone();
     let cancel = worker_closing.clone();
     let plan_conn = recv_connection.to_string();
@@ -854,6 +984,7 @@ pub(super) fn spawn_macro_check(
     });
     MacroCheck {
         request_id,
+        command_path,
         generation,
         stamp,
         abort: AbortOnDrop(abort),
@@ -892,54 +1023,92 @@ pub(super) async fn complete_pending_replay(
     if worker_closing.load(Ordering::SeqCst) {
         return None;
     }
-    let gate = CommandReplyGateGuard::enter(command_reply_pending, recv_supervisor.hub());
-    let mut inner = recv_supervisor.inner().write().await;
-    if worker_closing.load(Ordering::SeqCst) {
-        return None;
+    enum ReplayInstallOutcome {
+        Closed,
+        Detached,
+        NoReply,
+        LeaseLost { epoch: u64 },
+        Ack { snap: AckSnapshot, started: Started },
+        Reject { epoch: u64, error: ApiError },
     }
-    if inner.detached {
-        let mut r = json!({"type":"command_reject", "request_id":request_id, "status":503, "code":"OWNER_TRANSFERRED", "error":"OWNER_TRANSFERRED", "message":"Ownership transferred to RT executor while checking replay"});
-        if let Some(s) = recv_supervisor.hub().latest() {
-            r["epoch_id"] = json!(s.obs.epoch_id);
-        }
-        Some((Some(r), None))
-    } else if let Err(err) = inner.preflight_admission(stamp) {
-        Some((
-            Some(command_reject(
-                &inner,
-                &request_id,
-                ArmError::from(err).into(),
-            )),
-            None,
-        ))
-    } else {
-        let reply = match planned {
-            Ok(None) => None,
-            Err(e) => Some(command_reject(
-                &inner,
-                &request_id,
-                ArmError::Internal(format!("replay check task failed: {e}")).into(),
-            )),
-            Ok(Some(Err(error))) => Some(command_reject(&inner, &request_id, error.into())),
-            Ok(Some(Ok(plan))) => Some(
-                if recv_generation.load(Ordering::SeqCst) != generation
-                    || !inner.validate_servo_lease(recv_connection, generation)
-                {
-                    json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while the episode was checked", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
-                } else {
-                    match inner
-                        .check_admission(stamp)
-                        .map_err(ArmError::from)
-                        .and_then(|admitted| SupervisorInner::install_replay(admitted, plan))
-                    {
-                        Ok(started) => command_ack(&inner, &request_id, Some(started)),
-                        Err(error) => command_reject(&inner, &request_id, error.into()),
-                    }
+    let gate = CommandReplyGateGuard::enter(command_reply_pending, recv_supervisor.hub());
+    let outcome = {
+        let mut inner = recv_supervisor.inner().write().await;
+        inner.set_command("/api/v1/action/replay");
+        if worker_closing.load(Ordering::SeqCst) {
+            ReplayInstallOutcome::Closed
+        } else if inner.detached {
+            ReplayInstallOutcome::Detached
+        } else if let Err(err) = inner.preflight_admission(stamp) {
+            ReplayInstallOutcome::Reject {
+                epoch: inner.safety.epoch_id(),
+                error: ArmError::from(err).into(),
+            }
+        } else {
+            match planned {
+                Ok(None) => ReplayInstallOutcome::NoReply,
+                Err(e) => ReplayInstallOutcome::Reject {
+                    epoch: inner.safety.epoch_id(),
+                    error: ArmError::Internal(format!("replay check task failed: {e}")).into(),
                 },
-            ),
-        };
-        let keep_gate = reply.is_some().then_some(gate);
-        Some((reply, keep_gate))
+                Ok(Some(Err(error))) => ReplayInstallOutcome::Reject {
+                    epoch: inner.safety.epoch_id(),
+                    error: error.into(),
+                },
+                Ok(Some(Ok(plan))) => {
+                    if recv_generation.load(Ordering::SeqCst) != generation
+                        || !inner.validate_servo_lease(recv_connection, generation)
+                    {
+                        ReplayInstallOutcome::LeaseLost {
+                            epoch: inner.safety.epoch_id(),
+                        }
+                    } else {
+                        match inner
+                            .check_admission(stamp)
+                            .map_err(ArmError::from)
+                            .and_then(|admitted| SupervisorInner::install_replay(admitted, plan))
+                        {
+                            Ok(started) => {
+                                inner.set_action_id(started.0);
+                                ReplayInstallOutcome::Ack {
+                                    snap: AckSnapshot::from_inner(&inner),
+                                    started: Some(started),
+                                }
+                            }
+                            Err(error) => ReplayInstallOutcome::Reject {
+                                epoch: inner.safety.epoch_id(),
+                                error: error.into(),
+                            },
+                        }
+                    }
+                }
+            }
+        }
+    };
+    match outcome {
+        ReplayInstallOutcome::Closed => None,
+        ReplayInstallOutcome::NoReply => Some((None, None)),
+        ReplayInstallOutcome::Detached => {
+            drop(gate);
+            let mut r = json!({"type":"command_reject", "request_id":request_id, "status":503, "code":"OWNER_TRANSFERRED", "error":"OWNER_TRANSFERRED", "message":"Ownership transferred to RT executor while checking replay"});
+            if let Some(s) = recv_supervisor.hub().latest() {
+                r["epoch_id"] = json!(s.obs.epoch_id);
+            }
+            Some((Some(r), None))
+        }
+        ReplayInstallOutcome::LeaseLost { epoch } => {
+            drop(gate);
+            let r = json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while the episode was checked", "error":"LEASE_LOST", "epoch_id":epoch});
+            Some((Some(r), None))
+        }
+        ReplayInstallOutcome::Reject { epoch, error } => {
+            drop(gate);
+            Some((Some(command_reject_at(epoch, &request_id, error)), None))
+        }
+        ReplayInstallOutcome::Ack { snap, started } => {
+            let reply = command_ack_from_snap(&snap, &request_id, started);
+            Some((Some(reply), Some(gate)))
+        }
     }
 }
 
@@ -951,21 +1120,26 @@ pub(super) async fn complete_dry_run_grasp(
     recv_deps: &crate::grasp::GraspDeps,
 ) -> Value {
     let dry = crate::grasp::dry_run_task(recv_supervisor, recv_deps.source.as_ref(), &body).await;
-    let mut ack = {
+    let snap = {
         let inner = recv_supervisor.inner().read().await;
         if !inner.detached {
-            command_ack(&inner, &request_id, None)
+            AckSnapshot::from_inner(&inner)
         } else if let Some(s) = recv_supervisor.hub().latest() {
-            let control_mode = if s.obs.control_mode == crate::model::ControlMode::GravityComp {
-                "gravity_comp"
-            } else {
-                "position"
-            };
-            json!({"type":"command_ack", "request_id":request_id, "status":"accepted", "epoch_id":s.obs.epoch_id, "safety_state":s.obs.safety_state, "is_torqued":s.obs.is_torqued, "control_mode":control_mode})
+            AckSnapshot {
+                epoch_id: s.obs.epoch_id,
+                safety_state: s.obs.safety_state.clone(),
+                is_torqued: s.obs.is_torqued,
+                control_mode: if s.obs.control_mode == crate::model::ControlMode::GravityComp {
+                    "gravity_comp"
+                } else {
+                    "position"
+                },
+            }
         } else {
-            command_ack(&inner, &request_id, None)
+            AckSnapshot::from_inner(&inner)
         }
     };
+    let mut ack = command_ack_from_snap(&snap, &request_id, None);
     for (k, v) in dry.fields() {
         ack[k.as_str()] = v;
     }

@@ -760,9 +760,9 @@ fn rt_policy_lifecycle_reserve_begin_step_hold_supersede_and_terminate_zero_allo
         );
     }
 
-    // 7. Re-acquire lease off-measurement, then verify `commit_primitive` is refused `MOTION_BUSY`
-    //    while a populated live policy is active, followed by `EndPolicy::Finish` and `EndPolicy::Stop`
-    //    + `EndPolicy::Fail` — all with 0 allocs / 0 frees.
+    // 7. Re-acquire lease off-measurement, then verify `commit_install_slot` (PR M prepared jog)
+    //    is refused `MOTION_BUSY` while a populated live policy is active, followed by
+    //    `EndPolicy::Finish` and `EndPolicy::Stop` + `EndPolicy::Fail` — all with 0 allocs / 0 frees.
     let gen3 = inner.acquire_lease(CONN).expect("re-acquire lease");
     inner.lease_enabled = false;
     let auth3 = Authority {
@@ -770,6 +770,29 @@ fn rt_policy_lifecycle_reserve_begin_step_hold_supersede_and_terminate_zero_allo
         stop_generation: inner.current_stop_gen(),
         ..auth
     };
+    let mut sup_goal_vec = inner.commanded_positions.clone();
+    sup_goal_vec[0] += 0.12;
+    let jog_cfg = std::sync::Arc::new(
+        armd::rt_core::requests::motion::MotionConfigSnapshot::from_supervisor(&inner),
+    );
+    let jog_snap =
+        armd::rt_core::requests::motion::MotionPlanSnapshot::from_supervisor_with_authority(
+            &inner,
+            jog_cfg,
+            armd::rt_core::requests::motion::PlanAuthority {
+                boot: inner.boot_id(),
+                epoch: auth3.epoch,
+                lease_generation: auth3.lease_generation,
+                stop_generation: auth3.stop_generation,
+                deadline: now + Duration::from_secs(10),
+            },
+        );
+    let jog_slot = armd::rt_core::requests::motion::prepare_motion(
+        &jog_snap,
+        &armd::rt_core::requests::motion::MotionRequest::jog(sup_goal_vec, Some(0.5), None),
+    )
+    .expect("prepare jog off-measurement")
+    .slot;
     let reserve_3 = ReservePolicyLoadSpec {
         load_token: 3,
         admission_request_id: 1003,
@@ -804,18 +827,11 @@ fn rt_policy_lifecycle_reserve_begin_step_hold_supersede_and_terminate_zero_allo
         inner.consume_target(&f3, &ctx(now)).expect("populate run 3 live target");
         inner.tick_control(0.02);
 
-        // Concurrent motion primitive refused `MOTION_BUSY` with 0 allocs / 0 frees.
-        let mut cur_cmd = [0.0f32; MAX_DOF];
-        let mut sup_goal = [0.0f32; MAX_DOF];
-        cur_cmd[..base.len()].copy_from_slice(&inner.commanded_positions);
-        sup_goal[..base.len()].copy_from_slice(&inner.commanded_positions);
-        sup_goal[0] += 0.12;
-        let jog_prim = Primitive::joint_quintic(&cur_cmd[..base.len()], &sup_goal[..base.len()], 0.5)
-            .expect("jog prim");
+        // Concurrent prepared motion install refused `MOTION_BUSY` with 0 allocs / 0 frees.
         let sup_desc = Descriptor {
             stamp: Stamp {
                 arm: ArmId::LOCAL,
-                boot: BOOT,
+                boot: inner.boot_id(),
                 client: ClientId(1),
                 client_seq: 51,
                 request: RequestId(51),
@@ -828,7 +844,7 @@ fn rt_policy_lifecycle_reserve_begin_step_hold_supersede_and_terminate_zero_allo
             kind: CommandKind::Immediate(armd::rt_core::broker::ImmediateOp::Heartbeat),
         };
         assert_eq!(
-            inner.commit_primitive(&sup_desc, &jog_prim, &ctx(now)).unwrap_err(),
+            inner.commit_install_slot(&sup_desc, &jog_slot, &ctx(now)).unwrap_err(),
             "MOTION_BUSY"
         );
         assert!(inner.policy_run.is_some());

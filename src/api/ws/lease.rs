@@ -676,24 +676,6 @@ pub(super) fn check_lease_authority(
 }
 
 /// Format the lease-loss reply for an unauthorized ordinary frame.
-pub(super) fn lease_loss_reply(
-    inner: &SupervisorInner,
-    kind: &str,
-    value: &Value,
-    recv_connection: &str,
-    local_generation: u64,
-) -> Value {
-    if kind == "command" {
-        json!({"type":"command_reject", "request_id":value.get("request_id"), "status":409, "code":"LEASE_LOST", "message":"This connection does not own an active lease", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
-    } else if kind == "release_lease" {
-        json!({"type":"lease_released", "success":false})
-    } else if local_generation == 0 {
-        json!({"type":"lease_lost", "generation":0})
-    } else {
-        json!({"type":"lease_lost", "generation":local_generation, "reason":inner.lease_loss_reason(recv_connection, local_generation)})
-    }
-}
-
 /// Deliver a `lease_lost` (`reason: "preempted"`) notice to an evicted connection via the registry.
 pub(super) fn notify_evicted(evicted_conn: &str, evicted_gen: u64) {
     let (sender_opt, closer_opt) = {

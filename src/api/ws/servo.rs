@@ -6,7 +6,7 @@
 use super::*;
 use super::dispatch::{
     AdmissionClass, AuthRequirement, DispatchEntry, DispatchHandler, DispatchKey, FrameKind,
-    LeaseRequirement, OwnerDispatchCtx, ReplyPolicy,
+    LeaseRequirement, OwnerDispatchCtx, OwnerReply, ReplyPolicy,
 };
 
 pub(super) const ENTRIES: &[DispatchEntry] = &[
@@ -36,18 +36,24 @@ pub(super) const ENTRIES: &[DispatchEntry] = &[
     },
 ];
 
-fn dispatch_servo_frame(ctx: &mut OwnerDispatchCtx<'_>) -> Option<Value> {
+fn dispatch_servo_frame(ctx: &mut OwnerDispatchCtx<'_>) -> Option<OwnerReply> {
     handle_servo_frame(ctx.inner, ctx.stamp, ctx.value, ctx.epoch, ctx.last_sequence)
 }
 
-fn dispatch_servo_command(ctx: &mut OwnerDispatchCtx<'_>) -> Option<Value> {
+fn dispatch_servo_command(ctx: &mut OwnerDispatchCtx<'_>) -> Option<OwnerReply> {
     let body = &ctx.value["body"];
     let result = validate_command_body_common(body)
         .map_err(invalid_command)
         .and_then(|()| execute_servo_command(ctx.inner, ctx.stamp, body, ctx.epoch));
     Some(match result {
-        Ok(started) => command_ack(ctx.inner, &ctx.value["request_id"], started),
-        Err(error) => command_reject(ctx.inner, &ctx.value["request_id"], error),
+        Ok(started) => OwnerReply::CommandAck {
+            snap: AckSnapshot::from_inner(ctx.inner),
+            started,
+        },
+        Err(error) => OwnerReply::CommandReject {
+            epoch: ctx.inner.safety.epoch_id(),
+            error,
+        },
     })
 }
 
@@ -66,14 +72,9 @@ pub(super) fn is_servo_frame(kind: &str, value: &Value) -> bool {
 }
 
 /// Pre-lease missing-generation check for explicit / cartesian-stream servo frames.
-pub(super) fn missing_generation_reject(kind: &str, value: &Value) -> Option<Value> {
-    if is_explicit_or_cartesian_servo(kind, value)
+pub(super) fn is_missing_generation(kind: &str, value: &Value) -> bool {
+    is_explicit_or_cartesian_servo(kind, value)
         && value.get("generation").and_then(Value::as_u64).is_none()
-    {
-        Some(json!({"type":"servo_reject", "reason":"missing_generation"}))
-    } else {
-        None
-    }
 }
 
 /// Execute `/api/v1/motion/servo` command under the supervisor write lock.
@@ -90,26 +91,25 @@ pub(super) fn execute_servo_command(
 }
 
 /// Handle a streaming servo frame (explicit, `cartesian_joint_stream`, or implicit `positions`)
-/// under the supervisor write lock. Returns `None` on acceptance or `Some(servo_reject)` on error.
+/// under the supervisor write lock. Returns `None` on acceptance or `Some(OwnerReply)` on error
+/// (formatted into JSON strictly off-lock).
 pub(super) fn handle_servo_frame(
     inner: &mut SupervisorInner,
     stamp: crate::supervisor::AdmissionStamp,
     value: &Value,
     epoch: u64,
     last_sequence: &mut Option<u64>,
-) -> Option<Value> {
+) -> Option<OwnerReply> {
     match value.get("sequence_id").and_then(Value::as_u64) {
-        _ if inner.calibration_busy => {
-            Some(json!({"type":"servo_reject", "reason":"calibration_busy"}))
-        }
-        None => Some(json!({"type":"servo_reject", "reason":"missing_sequence_id"})),
+        _ if inner.calibration_busy => Some(OwnerReply::ServoRejectReason("calibration_busy")),
+        None => Some(OwnerReply::ServoRejectReason("missing_sequence_id")),
         Some(sequence)
             if last_sequence.is_some_and(|last| {
                 let delta = sequence.wrapping_sub(last);
                 delta == 0 || delta > 1000
             }) =>
         {
-            Some(json!({"type":"servo_reject", "reason":"invalid_sequence_id"}))
+            Some(OwnerReply::ServoRejectReason("invalid_sequence_id"))
         }
         Some(sequence) => {
             *last_sequence = Some(sequence);
@@ -121,14 +121,7 @@ pub(super) fn handle_servo_frame(
                     .map_err(|error| ApiError::from(ArmError::from(error)))
             }) {
                 Ok(()) => None,
-                Err(error) => {
-                    let stopped = error.code.as_deref() == Some("STOPPED");
-                    let mut r = rejection(error, "servo_reject", epoch);
-                    if stopped {
-                        r["reason"] = json!("stopped");
-                    }
-                    Some(r)
-                }
+                Err(error) => Some(OwnerReply::ServoRejectApi { epoch, error }),
             }
         }
     }

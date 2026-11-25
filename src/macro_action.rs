@@ -648,6 +648,8 @@ impl MacroCtx {
             return;
         }
         let mut inner = self.sup.inner().write().await;
+        inner.set_command("macro:finish");
+        inner.set_action_id(self.id);
         if !inner.macro_alive(self.id) {
             return;
         }
@@ -867,6 +869,8 @@ impl MacroCtx {
             child_spec.ticket
         } else {
             let mut inner = self.sup.inner().write().await;
+            inner.set_command("macro_child:cartesian");
+            inner.set_action_id(self.id);
             let Some(next_seq) = inner
                 .macro_run
                 .as_ref()
@@ -1025,7 +1029,35 @@ impl MacroCtx {
             .map_err(before)?;
             child_spec.ticket
         } else {
+            let rev_ok = (!check_workspace_rev
+                || snap.env.workspace_revision == child_stamp.config_revision)
+                && calibration_rev.is_none_or(|c| c == snap.env.calibration_revision);
+            let (snap, target, limits, prepared_res) = if rev_ok {
+                tokio::task::spawn_blocking(move || {
+                    let r = req::build_prepared_quintic_off_lock(&snap, &target, &limits);
+                    (snap, target, limits, Some(r))
+                })
+                .await
+                .map_err(|e| before(fail("INTERNAL", format!("planner task failed: {e}"))))?
+            } else {
+                (snap, target, limits, None)
+            };
+            let prepared = match prepared_res {
+                Some(Ok(p)) => Some(p),
+                Some(Err(e)) => {
+                    let mut inner = self.sup.inner().write().await;
+                    inner.set_command("macro_child:joint");
+                    inner.set_action_id(self.id);
+                    if let Some(detail) = e.workspace_detail() {
+                        inner.set_action_workspace_violation(self.id, detail);
+                    }
+                    return Err(before(self.map_install_err(&mut inner, e)));
+                }
+                None => None,
+            };
             let mut inner = self.sup.inner().write().await;
+            inner.set_command("macro_child:joint");
+            inner.set_action_id(self.id);
             let Some(next_seq) = inner
                 .macro_run
                 .as_ref()
@@ -1054,6 +1086,7 @@ impl MacroCtx {
                     start: snap.commanded_positions,
                     target,
                     limits,
+                    prepared,
                 },
             ) {
                 Ok(v) => v.ticket,
@@ -1120,6 +1153,8 @@ impl MacroCtx {
             child_spec.ticket
         } else {
             let mut inner = self.sup.inner().write().await;
+            inner.set_command("macro_child:replay");
+            inner.set_action_id(self.id);
             let Some(next_seq) = inner
                 .macro_run
                 .as_ref()
@@ -1244,6 +1279,8 @@ impl MacroCtx {
             child_spec.ticket
         } else {
             let mut inner = self.sup.inner().write().await;
+            inner.set_command("macro_child:gripper");
+            inner.set_action_id(self.id);
             let Some(next_seq) = inner
                 .macro_run
                 .as_ref()

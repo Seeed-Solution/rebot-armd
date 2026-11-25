@@ -225,6 +225,12 @@ pub enum TransitionOp {
 pub enum CommandKind {
     /// Install the primitive of a plan slot; starts an action (a terminal reply follows the ACK).
     Install { plan: PlanHandle },
+    /// Install a prepared home motion from a plan slot; starts a `home` action.
+    InstallHome { plan: PlanHandle },
+    /// Install a prepared park motion (or `holding_after_clear` park rearm); starts a `park` action.
+    InstallPark { plan: PlanHandle },
+    /// Attach a prepared park continuation trajectory to an existing `park` action (ACK/Refused only).
+    ContinuePark { plan: PlanHandle },
     /// A command without a plan; ACK or refusal only.
     Immediate(ImmediateOp),
     /// Start a driver transition; a terminal reply follows the ACK.
@@ -240,20 +246,30 @@ pub enum CommandKind {
 }
 
 impl CommandKind {
+    /// True for action-installing commands that supersede and own `ReleaseEngine::active`.
+    pub fn is_install(&self) -> bool {
+        matches!(self, Self::Install { .. } | Self::InstallHome { .. } | Self::InstallPark { .. })
+    }
     /// A terminal reply follows the ACK (an install, transition, prepared action, `BeginMacro`, or `BeginPolicy`).
     pub fn starts_action(&self) -> bool {
         match self {
-            Self::Install { .. } | Self::Transition(_) => true,
+            Self::Install { .. }
+            | Self::InstallHome { .. }
+            | Self::InstallPark { .. }
+            | Self::Transition(_) => true,
             #[cfg(not(target_arch = "wasm32"))]
             Self::Action(a) => a.starts_action(),
             #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
             Self::Policy(p) => p.starts_action(),
-            Self::Immediate(_) | Self::Lease(_) => false,
+            Self::ContinuePark { .. } | Self::Immediate(_) | Self::Lease(_) => false,
         }
     }
     pub fn plan(&self) -> Option<PlanHandle> {
         match self {
-            Self::Install { plan } => Some(*plan),
+            Self::Install { plan }
+            | Self::InstallHome { plan }
+            | Self::InstallPark { plan }
+            | Self::ContinuePark { plan } => Some(*plan),
             #[cfg(not(target_arch = "wasm32"))]
             Self::Action(a) => a.plan(),
             #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
@@ -649,6 +665,9 @@ pub enum DeliveryDecision {
 #[allow(clippy::large_enum_variant)] // Matches `CommandKind` zero-alloc value passing without heap boxing.
 pub enum Submit<'a, P> {
     Install(&'a dyn Fn(&mut P)),
+    InstallHome(&'a dyn Fn(&mut P)),
+    InstallPark(&'a dyn Fn(&mut P)),
+    ContinuePark(&'a dyn Fn(&mut P)),
     Immediate(ImmediateOp),
     Transition(TransitionOp),
     Lease(super::requests::lease::LeaseRequest),
@@ -821,12 +840,15 @@ impl<P> Broker<P> {
             return Err(AdmitError::Disconnected);
         }
         let terminal = match &what {
-            Submit::Install(_) | Submit::Transition(_) => true,
+            Submit::Install(_)
+            | Submit::InstallHome(_)
+            | Submit::InstallPark(_)
+            | Submit::Transition(_) => true,
             #[cfg(not(target_arch = "wasm32"))]
             Submit::Action(a) => a.starts_action(),
             #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
             Submit::Policy(p) => p.starts_action(),
-            Submit::Immediate(_) | Submit::Lease(_) => false,
+            Submit::ContinuePark(_) | Submit::Immediate(_) | Submit::Lease(_) => false,
         };
         let need = 1 + usize::from(terminal);
         let refused = if self.commands.slots() == 0 { Some(AdmitError::CommandsFull) }
@@ -839,6 +861,27 @@ impl<P> Broker<P> {
         let kind = match what {
             Submit::Install(write) => match self.plans.stage(write) {
                 Some(plan) => CommandKind::Install { plan },
+                None => {
+                    self.stats.refused_admission += 1;
+                    return Err(AdmitError::PlansFull);
+                }
+            },
+            Submit::InstallHome(write) => match self.plans.stage(write) {
+                Some(plan) => CommandKind::InstallHome { plan },
+                None => {
+                    self.stats.refused_admission += 1;
+                    return Err(AdmitError::PlansFull);
+                }
+            },
+            Submit::InstallPark(write) => match self.plans.stage(write) {
+                Some(plan) => CommandKind::InstallPark { plan },
+                None => {
+                    self.stats.refused_admission += 1;
+                    return Err(AdmitError::PlansFull);
+                }
+            },
+            Submit::ContinuePark(write) => match self.plans.stage(write) {
+                Some(plan) => CommandKind::ContinuePark { plan },
                 None => {
                     self.stats.refused_admission += 1;
                     return Err(AdmitError::PlansFull);
@@ -1108,7 +1151,10 @@ impl<P> Taken<'_, P> {
         intake.reply(Reply::Ack { request, commit_seq, action: committed.action() });
         let installed = match (terminal, committed.action()) {
             (true, Some(action)) => { intake.installed += 1; Some(Installed { request, plan: self.d.kind.plan(), action }) }
-            _ => None,
+            _ => {
+                if let Some(plan) = self.d.kind.plan() { intake.plans.retire(plan); }
+                None
+            }
         };
         Ok(Acked { commit_seq, installed })
     }
@@ -1129,7 +1175,10 @@ impl<P> Taken<'_, P> {
         let reply = Reply::Ack { request, commit_seq, action: committed.action() };
         let installed = match (terminal, committed.action()) {
             (true, Some(action)) => { intake.installed += 1; Some(Installed { request, plan: self.d.kind.plan(), action }) }
-            _ => None,
+            _ => {
+                if let Some(plan) = self.d.kind.plan() { intake.plans.retire(plan); }
+                None
+            }
         };
         Ok((Acked { commit_seq, installed }, reply))
     }

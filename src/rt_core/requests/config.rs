@@ -1192,6 +1192,26 @@ pub enum ConfigRequest {
     CheckEpisodeDeleteAllowed(HolderLabel),
 }
 
+impl ConfigRequest {
+    /// Static command path attributed to this config request in lock diagnostics (zero allocation).
+    pub fn command_label(&self) -> &'static str {
+        match self {
+            Self::Reserve(r) => r.proposal.domain.command_path(),
+            Self::VerifyAuthority { domain, .. }
+            | Self::LatchConfigReconcileFault { domain, .. }
+            | Self::ForceReconcile(domain)
+            | Self::InspectHold(domain) => domain.command_path(),
+            Self::Persisted(p) => p.reservation.domain().command_path(),
+            Self::Activate(a) => a.reservation.domain().command_path(),
+            Self::FinishReconcile(f) => f.domain.command_path(),
+            Self::Release(r) => r.reservation.domain().command_path(),
+            Self::SampleTableCapture => "/api/v1/grasp/setup",
+            Self::GravityComp(_) => "/api/v1/mode/gravity_comp",
+            Self::CheckEpisodeDeleteAllowed(_) => "/api/v1/episodes/delete",
+        }
+    }
+}
+
 /// Reply produced on the owner and read off-thread from `ConfigExchange`.
 pub enum ConfigReply {
     Reserved(Result<Reservation, ConfigError>),

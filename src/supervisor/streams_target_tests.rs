@@ -726,6 +726,7 @@ fn expired_lease_during_pending_torque_enable_preserves_step2_timing_and_revokes
 
     // Simulate an in-flight TorqueTransition::Enable owned by g1.
     fx.core.torque_transition = Some(TorqueTransition::Enable {
+        origin: crate::supervisor::driver_transitions::EnableOrigin::BrokerTransition,
         was_torqued: false,
         prev_gripper_cmd: None,
         authority: EnableAuthority {
@@ -1456,7 +1457,7 @@ mod pr_y_policy_unit_tests {
         let ep = r.epoch();
         let stamp = r.fx.core.current_admission_stamp();
         let adm = r.fx.core.check_admission(stamp).unwrap();
-        let _ = SupervisorInner::jog_action_slice(adm, &jog_goal, Some(1.0), Some(ep), "jog")
+        let _ = SupervisorInner::jog_action(adm, jog_goal, Some(1.0), Some(ep), "jog")
             .expect("start active jog");
         assert!(r.fx.core.active_trajectory.is_some());
 

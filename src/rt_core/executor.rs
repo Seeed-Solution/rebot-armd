@@ -4211,10 +4211,9 @@ pub(crate) fn spawn_executor(
         path: core.gripper_baseline_path.clone(),
     };
     let (mut engine, broker, target_writer, stop_requests) = ReleaseEngine::new(cfg.boot, cfg.capacities);
-    core.boot_id = cfg.boot;
+    core.set_boot_id(cfg.boot);
     core.attach_stop_requests(stop_requests.clone());
     core.attach_closed_bitset(broker.closed_bitset());
-    core.boot_id = cfg.boot;
     hub.update_prep_env(Arc::new(super::requests::actions::ActionPrepEnv::from_inner(&core)));
 
     let (diag_tx, diag_rx) = RingBuffer::<TickSample>::new(DIAG_RING_CAPACITY);
@@ -4236,6 +4235,7 @@ pub(crate) fn spawn_executor(
     let (persist_job_tx, persist_job_rx) = RingBuffer::<PendingZeroCheckPersist>::new(4);
     let (persist_cmd_tx, persist_cmd_rx) = RingBuffer::<PersistCmd>::new(2);
     let (persist_rep_tx, persist_rep_rx) = RingBuffer::<PersistReply>::new(PERSIST_REP_CAPACITY);
+    let (watchdog_plan_tx, watchdog_plan_rx) = RingBuffer::<WatchdogParkPlan>::new(2);
     let (offload_reclaim_tx, offload_reclaim_rx) =
         RingBuffer::<OffloadReclaim>::new(OFFLOAD_RECLAIM_CAPACITY);
 
@@ -4327,6 +4327,7 @@ pub(crate) fn spawn_executor(
         persist_job_rx,
         persist_cmd_tx,
         persist_rep_rx.clone(),
+        watchdog_plan_tx,
         config_write_mutex,
         Arc::clone(&published_config),
         persist_stop.clone(),
@@ -4386,6 +4387,7 @@ pub(crate) fn spawn_executor(
                 persist_job_tx,
                 persist_cmd_rx,
                 persist_rep_tx,
+                watchdog_plan_rx,
                 offload_reclaim_tx,
                 persist_wake,
                 estop_state,
@@ -4464,6 +4466,15 @@ pub(crate) fn spawn_executor(
         baseline_identity,
     });
     Ok((RtExecutorHandle { shared }, sinks))
+}
+
+/// Copy-only off-RT watchdog park preparation result pushed by `armd-persist` and installed on
+/// `armd-control` with zero heap allocations and zero frees.
+#[derive(Clone, Copy)]
+struct WatchdogParkPlan {
+    generation: u64,
+    attempt: u8,
+    plan: Result<super::requests::motion::PreparedMotionSlot, crate::safety::BoundedText<160>>,
 }
 
 /// Single production forwarding path from `core.safety`'s inline log ring into the bounded
@@ -4556,6 +4567,9 @@ struct ControlState {
     persist_job_tx: Producer<PendingZeroCheckPersist>,
     persist_cmd_rx: Consumer<PersistCmd>,
     persist_rep_tx: Producer<PersistReply>,
+    /// Precomputed off-RT watchdog park plans (Copy-only, 0 alloc / 0 free on `armd-control`).
+    watchdog_plan_rx: Consumer<WatchdogParkPlan>,
+    last_woken_watchdog_park: Option<(u64, u8)>,
     /// Retained persistence reply if `persist_rep_tx` was temporarily full (flushed before popping).
     pending_persist_reply: Option<PersistReply>,
     /// Retained rejected persistence job if `persist_job_tx` and `offload_reclaim_tx` were both saturated.
@@ -4799,6 +4813,37 @@ impl ControlState {
         core.estop_ack_overflow_gen = 0;
         if drained {
             core.core.hub().wake();
+        }
+    }
+
+    fn service_watchdog_park_plan(&mut self, core: &mut SupervisorInner) {
+        use super::requests::motion as req;
+        const MAX_DRIFT_RETRIES: u8 = 5;
+        let Ok(wp) = self.watchdog_plan_rx.pop() else { return; };
+        if !core.watchdog_park_pending.is_some_and(|p| p.generation == wp.generation && p.attempt == wp.attempt) {
+            return;
+        }
+        match wp.plan {
+            Ok(slot) => match req::install_watchdog_park(core, wp.generation, &slot, None) {
+                Ok(_) | Err(req::MotionInstallError::ContinuationMismatch) => {}
+                Err(req::MotionInstallError::StartDrifted) => {
+                    if let Some(p) = core.watchdog_park_pending.as_mut().filter(|p| p.generation == wp.generation) {
+                        if p.attempt.saturating_add(1) < MAX_DRIFT_RETRIES {
+                            p.attempt = p.attempt.saturating_add(1);
+                            return;
+                        }
+                    }
+                    req::fail_watchdog_park_plan(
+                        core,
+                        wp.generation,
+                        crate::safety::BoundedText::new("watchdog park drifted repeatedly"),
+                    );
+                }
+                Err(e) => {
+                    req::fail_watchdog_park_plan(core, wp.generation, crate::safety::BoundedText::new(e.code()));
+                }
+            },
+            Err(reason) => req::fail_watchdog_park_plan(core, wp.generation, reason),
         }
     }
 
@@ -5806,6 +5851,7 @@ fn spawn_persist_worker(
     mut job_rx: Consumer<PendingZeroCheckPersist>,
     mut cmd_tx: Producer<PersistCmd>,
     rep_rx: Arc<Mutex<Consumer<PersistReply>>>,
+    mut watchdog_plan_tx: Producer<WatchdogParkPlan>,
     config_write_mutex: Arc<tokio::sync::Mutex<()>>,
     published_config: Arc<super::requests::config::PublishedConfigHub>,
     persist_stop: Arc<AtomicBool>,
@@ -5826,8 +5872,10 @@ fn spawn_persist_worker(
     }
 
     thread::Builder::new().name("armd-persist".into()).spawn(move || {
+        let hub_watch = Arc::clone(&hub);
         let hub_for_refresh = Arc::clone(&hub);
         let _exit_guard = ExitFlag(persist_worker_exited, persist_exited_cv, hub);
+        let mut last_sent_watchdog_park: Option<(u64, u8)> = None;
         let push_cmd = |tx: &mut Producer<PersistCmd>, cmd: PersistCmd, stop: &AtomicBool, dead: &AtomicBool| -> bool {
             let mut pending = Some(cmd);
             while let Some(c) = pending.take() {
@@ -5857,6 +5905,33 @@ fn spawn_persist_worker(
         };
 
         while !persist_stop.load(Ordering::Acquire) && !control_exited.load(Ordering::Acquire) {
+            if let Some(snap) = hub_watch.latest() {
+                let wd_gen = snap.rt.watchdog_park_pending_gen;
+                if wd_gen != 0 {
+                    let key = (wd_gen, snap.rt.watchdog_park_pending_attempt);
+                    if last_sent_watchdog_park != Some(key) {
+                        let plan = match hub_watch.motion_config().and_then(|cfg| {
+                            super::requests::motion::MotionPlanSnapshot::from_published(&snap, cfg)
+                        }) {
+                            Some(plan_snap) => match super::requests::motion::prepare_motion(
+                                &plan_snap,
+                                &super::requests::motion::MotionRequest::park(),
+                            ) {
+                                Ok(p) => Ok(p.slot),
+                                Err(e) => {
+                                    let mut msg = crate::safety::BoundedText::<160>::empty();
+                                    let _ = core::fmt::write(&mut msg, format_args!("watchdog park could not be planned: {e}"));
+                                    Err(msg)
+                                }
+                            },
+                            None => Err(crate::safety::BoundedText::new("watchdog park snapshot or motion config unavailable")),
+                        };
+                        if watchdog_plan_tx.push(WatchdogParkPlan { generation: key.0, attempt: key.1, plan }).is_ok() {
+                            last_sent_watchdog_park = Some(key);
+                        }
+                    }
+                }
+            }
             if hooks.pause_persist_worker.as_ref().is_some_and(|p| p.load(Ordering::Acquire)) {
                 thread::park_timeout(Duration::from_millis(2));
                 continue;
@@ -6497,6 +6572,7 @@ fn control_thread_main(
     persist_job_tx: Producer<PendingZeroCheckPersist>,
     persist_cmd_rx: Consumer<PersistCmd>,
     persist_rep_tx: Producer<PersistReply>,
+    watchdog_plan_rx: Consumer<WatchdogParkPlan>,
     offload_reclaim_tx: Producer<OffloadReclaim>,
     persist_wake: Thread,
     estop_state: Arc<crate::rt_core::urgent::EstopState>,
@@ -6586,6 +6662,8 @@ fn control_thread_main(
         persist_job_tx,
         persist_cmd_rx,
         persist_rep_tx,
+        watchdog_plan_rx,
+        last_woken_watchdog_park: None,
         pending_persist_reply: None,
         retained_persist_job: None,
         offload_reclaim_tx,
@@ -6774,6 +6852,7 @@ fn control_thread_main(
                             // in `core.pending_estop_acks` (keeping their `Arc<SafetyState>` alive) and
                             // deliver them ONLY after Step 6 publishes the corresponding snapshot.
                             state.service_persistence(core, ctx);
+                            state.service_watchdog_park_plan(core);
                             state.service_one_maintenance(
                                 core,
                                 ctx,
@@ -6805,6 +6884,15 @@ fn control_thread_main(
                     let (phases, body_end) = core.take_tick_phases();
                     let body_end = body_end.unwrap_or_else(now_inst);
                     core.defer_zero_check_persist = false;
+                    if let Some(p) = core.watchdog_park_pending.filter(|p| !p.waiting_mit_handback) {
+                        let key = (p.generation, p.attempt);
+                        if state.last_woken_watchdog_park != Some(key) {
+                            state.last_woken_watchdog_park = Some(key);
+                            state.persist_wake.unpark();
+                        }
+                    } else {
+                        state.last_woken_watchdog_park = None;
+                    }
                     if let Some(mut job) = core.pending_zero_check_persist.take() {
                         job.stop_gen = state.stop_requests.current();
                         match state.persist_job_tx.push(job) {
@@ -8135,6 +8223,8 @@ mod tests {
             persist_job_tx,
             persist_cmd_rx,
             persist_rep_tx,
+            watchdog_plan_rx: RingBuffer::<WatchdogParkPlan>::new(2).1,
+            last_woken_watchdog_park: None,
             pending_persist_reply: None,
             retained_persist_job: None,
             offload_reclaim_tx,
@@ -8210,6 +8300,7 @@ mod tests {
         let (persist_job_tx, _) = RingBuffer::<PendingZeroCheckPersist>::new(2);
         let (_, persist_cmd_rx) = RingBuffer::<PersistCmd>::new(2);
         let (persist_rep_tx, _) = RingBuffer::<PersistReply>::new(2);
+        let (_, watchdog_plan_rx) = RingBuffer::<WatchdogParkPlan>::new(4);
         let (offload_reclaim_tx, _) = RingBuffer::<OffloadReclaim>::new(OFFLOAD_RECLAIM_CAPACITY);
 
         // Pre-fill downstream `safety_log_tx` (cap 2) with 2 unrelated events.
@@ -8241,6 +8332,8 @@ mod tests {
             persist_rep_tx,
             pending_persist_reply: None,
             retained_persist_job: None,
+            watchdog_plan_rx,
+            last_woken_watchdog_park: None,
             offload_reclaim_tx,
             persist_wake: thread::current(),
             persist_granted: None,
@@ -8492,6 +8585,8 @@ mod tests {
             persist_job_tx,
             persist_cmd_rx,
             persist_rep_tx,
+            watchdog_plan_rx: RingBuffer::<WatchdogParkPlan>::new(2).1,
+            last_woken_watchdog_park: None,
             pending_persist_reply: None,
             retained_persist_job: None,
             offload_reclaim_tx,
@@ -8663,6 +8758,8 @@ mod tests {
             persist_job_tx,
             persist_cmd_rx,
             persist_rep_tx,
+            watchdog_plan_rx: RingBuffer::<WatchdogParkPlan>::new(2).1,
+            last_woken_watchdog_park: None,
             pending_persist_reply: None,
             retained_persist_job: None,
             offload_reclaim_tx,
