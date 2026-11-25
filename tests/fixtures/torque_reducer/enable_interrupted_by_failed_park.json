@@ -1,14 +1,17 @@
 {
   "name": "enable_interrupted_by_failed_park",
-  "description": "Auto-shrunk from model test seq=203: ParkSettled(succeeded=false) while ReadyToSwitchOn must enter FailedHold + ENABLE_FAILED without rollback.",
+  "description": "Regression for B3: an unsolicited ParkSettled(succeeded=false) with no active park capability leaves ReadyToSwitchOn unchanged.",
   "topology": {
     "kind": "single_arm",
     "joints": 1
   },
   "events": [
     { "type": "enable_start", "group": 0, "now_us": 0 },
-    { "type": "park_settled", "group": 0, "succeeded": false, "now_us": 0 }
+    { "type": "park_settled", "group": 0, "park_id": 99, "succeeded": false, "now_us": 0 }
+  ],
+  "step_checks": [
+    { "step": 1, "group": 0, "expect_intent": "on", "expect_state": "ready_to_switch_on", "expect_disable": false, "expect_hold_ch0": null }
   ],
   "expected_group_intents": ["on"],
-  "expected_group_states": ["failed_hold"]
+  "expected_group_states": ["ready_to_switch_on"]
 }

@@ -18,11 +18,16 @@
     { "type": "mode_verified", "channel": 10, "mode": "position_force", "now_us": 0 },
     { "type": "mode_verified", "channel": 11, "mode": "position_force", "now_us": 0 },
     { "type": "enable_start", "group": 0, "now_us": 0 },
-    { "type": "handshake_result", "group": 0, "now_us": 1, "confirmed_mask": 63, "outcome": "confirmed" },
+    { "type": "handshake_result", "group": 0, "attempt_id": 1, "now_us": 1, "confirmed_mask": 63, "outcome": "confirmed" },
     { "type": "enable_start", "group": 1, "now_us": 1 },
-    { "type": "handshake_result", "group": 1, "now_us": 2, "confirmed_mask": 4032, "outcome": "confirmed" },
+    { "type": "handshake_result", "group": 1, "attempt_id": 2, "now_us": 2, "confirmed_mask": 4032, "outcome": "confirmed" },
     { "type": "panic", "tier": { "worker_panic": { "thread_tag": 1 } }, "now_us": 10000 },
-    { "type": "park_settled", "group": 0, "succeeded": true, "now_us": 30000 }
+    { "type": "park_accepted", "group": 0, "park_id": 3, "now_us": 10500 },
+    { "type": "park_settled", "group": 0, "park_id": 3, "succeeded": true, "now_us": 30000 }
+  ],
+  "step_checks": [
+    { "step": 18, "group": 0, "expect_intent": "on", "expect_state": "fault", "expect_disable": false, "expect_hold_ch0": null },
+    { "step": 18, "group": 1, "expect_intent": "on", "expect_state": "fault", "expect_disable": false, "expect_hold_ch0": null }
   ],
   "expected_group_intents": ["on", "on"],
   "expected_group_states": ["fault", "fault"]
