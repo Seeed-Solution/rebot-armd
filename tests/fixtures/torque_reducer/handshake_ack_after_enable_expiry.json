@@ -1,0 +1,20 @@
+{
+  "name": "handshake_ack_after_enable_expiry",
+  "description": "Regression for B2: a late handshake-only ACK arriving past the enable deadline neither arms enable nor mutates captures; Release at deadline enters FailedHold without rollback.",
+  "topology": {
+    "kind": "single_arm",
+    "joints": 1
+  },
+  "events": [
+    { "type": "enable_start", "group": 0, "now_us": 0 },
+    { "type": "causal_sample", "channel": 0, "sample_id": 1, "rx_timestamp_us": 0, "now_us": 0, "clock_offset_drift_us": 0, "position_rad": 0.0, "velocity_rad_s": 0.0, "temperature_c": null, "reported_enabled": true, "correlated_after_write_done_us": null, "poll_issued_us": null, "release_evidence": "unknown", "is_handshake_ack_only": false },
+    { "type": "causal_sample", "channel": 0, "sample_id": 2, "rx_timestamp_us": 500000, "now_us": 500000, "clock_offset_drift_us": 0, "position_rad": 0.0, "velocity_rad_s": 0.0, "temperature_c": null, "reported_enabled": true, "correlated_after_write_done_us": null, "poll_issued_us": null, "release_evidence": "verified_empty_grasp", "is_handshake_ack_only": true },
+    { "type": "release", "now_us": 500000 }
+  ],
+  "step_checks": [
+    { "step": 2, "group": 0, "expect_intent": "on", "expect_state": "ready_to_switch_on", "expect_disable": false, "expect_hold_ch0": null },
+    { "step": 3, "group": 0, "expect_intent": "on", "expect_state": "failed_hold", "expect_disable": false, "expect_hold_ch0": false }
+  ],
+  "expected_group_intents": ["on"],
+  "expected_group_states": ["failed_hold"]
+}

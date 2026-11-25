@@ -136,7 +136,7 @@ const DEVICE_PROFILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/kits/recamera
 /// (the reply queue is preallocated: the bus itself does not allocate per frame).
 struct FakeDamiaoBus {
     motors: Vec<(u16, DamiaoLimits, f32, bool)>,
-    rx: VecDeque<CanFrame>,
+    rx: VecDeque<(CanFrame, Option<Instant>)>,
     clock: std::sync::Arc<MockClock>,
 }
 
@@ -156,7 +156,9 @@ impl FakeDamiaoBus {
         let t = damiao::float_to_uint(0.0, l.t_min, l.t_max, 12);
         let data = [(u8::from(enabled) << 4) | (id as u8 & 0x0f), (p >> 8) as u8, p as u8, (v >> 4) as u8,
             (((v & 0x0f) << 4) | ((t >> 8) & 0x0f)) as u8, t as u8, 30, 30];
-        if self.rx.len() < self.rx.capacity() { self.rx.push_back(CanFrame::new_standard(0x10 + id, &data).unwrap()); }
+        if self.rx.len() < self.rx.capacity() {
+            self.rx.push_back((CanFrame::new_standard(0x10 + id, &data).unwrap(), Some(self.clock.now())));
+        }
     }
 }
 
@@ -167,7 +169,17 @@ impl CanTransport for FakeDamiaoBus {
         let find = |m: &[(u16, DamiaoLimits, f32, bool)], id: u16| m.iter().position(|x| x.0 == id);
         if id == 0x7FF {
             let mid = u16::from_le_bytes([frame.data[0], frame.data[1]]);
-            if let Some(k) = find(&self.motors, mid) { if frame.data[2] == 0xCC { self.reply(k); } }
+            if let Some(k) = find(&self.motors, mid) {
+                if frame.data[2] == 0xCC {
+                    self.reply(k);
+                } else if frame.data[2] == damiao::REG_READ && frame.data[3] == damiao::RID_CTRL_MODE {
+                    let m = damiao::CTRL_MODE_POS_VEL.to_le_bytes();
+                    let data = [mid as u8, (mid >> 8) as u8, damiao::REG_READ, damiao::RID_CTRL_MODE, m[0], m[1], m[2], m[3]];
+                    if self.rx.len() < self.rx.capacity() {
+                        self.rx.push_back((CanFrame::new_standard(0x10 + mid, &data).unwrap(), Some(self.clock.now())));
+                    }
+                }
+            }
         } else if let Some(k) = find(&self.motors, id) {
             if frame.data == damiao::CMD_ENABLE { self.motors[k].3 = true; }
             if frame.data == damiao::CMD_DISABLE { self.motors[k].3 = false; }
@@ -178,7 +190,8 @@ impl CanTransport for FakeDamiaoBus {
         }
         Ok(())
     }
-    fn receive(&mut self) -> Result<CanFrame, TransportError> { self.rx.pop_front().ok_or(TransportError::WouldBlock) }
+    fn receive(&mut self) -> Result<CanFrame, TransportError> { self.rx.pop_front().map(|(f, _)| f).ok_or(TransportError::WouldBlock) }
+    fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<Instant>), TransportError> { self.rx.pop_front().ok_or(TransportError::WouldBlock) }
     fn flush(&mut self) -> Result<(), TransportError> { Ok(()) }
 }
 

@@ -224,7 +224,7 @@ impl SupervisorInner {
             ws.floor_z_m = floor;
             self.workspace_revision += 1;
             self.bump_motion_config_revision();
-            self.servo_ws_min_depths = None;
+            self.clear_servo_ws_min_depths_rt();
         }
     }
 
@@ -234,7 +234,7 @@ impl SupervisorInner {
         if self.config.camera_mount != mount {
             self.workspace_revision += 1;
             self.bump_motion_config_revision();
-            self.servo_ws_min_depths = None;
+            self.clear_servo_ws_min_depths_rt();
         }
         self.config.camera_mount = mount;
         let tilt = f64::from(self.config.camera_mount.tilt_deg);
@@ -258,7 +258,7 @@ impl SupervisorInner {
         // the servo escape baseline was measured with the old model
         self.workspace_revision += 1;
         self.bump_motion_config_revision();
-        self.servo_ws_min_depths = None;
+        self.clear_servo_ws_min_depths_rt();
         self.calibration_revision += 1;
         self.refresh_pose_tcps();
         self.refresh_effective_floor();
@@ -273,7 +273,7 @@ impl SupervisorInner {
         if self.config.camera_mount.tilt_deg != setup.camera_tilt_deg as f32 {
             self.workspace_revision += 1;
             self.bump_motion_config_revision();
-            self.servo_ws_min_depths = None;
+            self.clear_servo_ws_min_depths_rt();
         }
         self.config.camera_mount.tilt_deg = setup.camera_tilt_deg as f32;
         self.config.grasp = Some(setup);

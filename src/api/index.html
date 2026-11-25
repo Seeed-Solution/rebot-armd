@@ -1298,6 +1298,8 @@ body.op-locked .tool-item[data-op] > b::after { content: "\00a0🔒"; font-size:
 .btn.btn-park-off small { font-size: 11px; font-weight: 500; color: var(--sc-color-text-secondary); }
 .btn.btn-park-off.holding { border-color: var(--sc-color-primary); background: var(--sc-status-normal-bg); }
 .btn.btn-park-off[hidden] { display: none; }
+.torque-off-msg { margin-top: 8px; padding: 8px 10px; border-radius: var(--sc-radius-md); font-size: 12px; line-height: 1.45; background: var(--sc-status-danger-bg); color: var(--sc-status-danger-fg); }
+.torque-off-msg[hidden] { display: none; }
 .btn.btn-preempt { width: 100%; justify-content: center; margin-top: 8px; color: var(--sc-status-warning-fg); border-color: #ffd591; background: var(--sc-status-warning-bg); font-weight: 600; }
 .btn.btn-preempt:hover { color: var(--sc-status-warning-fg); border-color: #faad14; }
 .btn-preempt .preempt-lbl { display: flex; flex-direction: column; align-items: flex-start; line-height: 1.2; }
@@ -1871,6 +1873,133 @@ body.controls-unavailable .grip-slider input[type=range]::-moz-range-thumb { bor
 .act-row.one { grid-template-columns: repeat(var(--n, 2), minmax(0, 1fr)); }
 .act-row.one > .act-full { grid-column: auto; }
 .act-row > .act-back:not(.armed):not(:disabled), .act-row > .tch-del:not(.armed) { background: transparent; box-shadow: none; color: var(--sc-color-text-secondary); }
+/* ===== simple mode (2026-11-25): one mode entry, recognition panel, object card, grasp tasks ===== */
+#ui-seg { display: none !important; }
+.ui-mode-btn { flex: none; display: inline-flex; align-items: center; gap: 6px; height: 36px; margin: 0 auto; padding: 0 14px; border-radius: 18px; border: 1px solid rgba(255,255,255,0.35);
+  background: var(--sc-color-primary-dark); color: #fff; font: 600 13px/1 inherit; font-family: inherit; white-space: nowrap; cursor: pointer; touch-action: manipulation; }
+.ui-mode-btn svg { width: 16px; height: 16px; flex: none; }
+.ui-mode-btn:focus-visible { outline: 2px solid var(--sc-color-primary); outline-offset: 2px; }
+body.ui-simple .ui-mode-btn { margin: 0; }
+body.ui-simple #det-ctl, body.ui-simple.vis-open #det-ctl:not([hidden]) { display: none !important; }
+body.ui-simple #det-chip { display: none !important; }
+body.ui-simple #cam-chip.is-ok { display: none; }
+body.ui-simple #btn-task:not(.is-live) { display: none; }
+body.ui-simple #tool-badge.is-stock { display: none !important; }
+body.ui-simple #btn-vis { min-height: 32px; padding: 0 12px; font-size: 13px; }
+/* recognition panel */
+.s-vis { display: none; }
+body.ui-simple.vis-open .s-vis:not([hidden]) {
+  display: block; position: fixed; z-index: 30; left: var(--sv-l, 50%); bottom: var(--sv-b, 64px); transform: translateX(-50%); width: var(--sv-w, min(400px, calc(100vw - 24px)));
+  max-height: var(--sv-maxh, calc(100dvh - 140px)); overflow-y: auto; overscroll-behavior: contain; pointer-events: auto; box-sizing: border-box;
+  padding: 12px; border-radius: 20px; color: var(--sc-color-text); background: rgba(255,255,255,0.88); border: 1px solid rgba(255,255,255,0.75);
+  box-shadow: 0 12px 36px rgba(0,0,0,0.28); backdrop-filter: blur(14px) saturate(140%); -webkit-backdrop-filter: blur(14px) saturate(140%);
+}
+.sv-head { display: flex; align-items: center; gap: 8px; }
+.sv-x { display: none; }
+body.ui-simple.oc-slot .sv-x { display: inline-grid; place-items: center; flex: none; width: 36px; height: 36px; padding: 0; border: 0; border-radius: 18px; background: rgba(15,23,42,0.06); font-size: 20px; line-height: 1; color: var(--sc-color-text); cursor: pointer; }
+.sv-head b { flex: none; font-size: 15px; white-space: nowrap; }
+.sv-meta { flex: 1 1 auto; min-width: 0; font-size: 12px; line-height: 1.35; color: var(--sc-color-text-secondary); }
+/* short landscape screens: head on top, then kind | display + grasp settings | other vision side by side */
+body.ui-simple.vis-open .s-vis.wide:not([hidden]) { display: grid; grid-template-columns: 1.25fr 1fr 1fr; column-gap: 14px; align-items: start; }
+.s-vis.wide .sv-head { grid-column: 1 / -1; }
+.s-vis.wide .sv-sec { margin-top: 8px; padding-top: 8px; }
+.s-vis.wide .sv-foot { grid-column: 2; margin-top: 6px; }
+.s-vis.wide .sv-row { min-height: 34px; }
+.sv-sec { margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(15,23,42,0.08); }
+.sv-sec[hidden] { display: none; }
+.sv-k { margin-bottom: 6px; font-size: 12px; color: var(--sc-color-text-secondary); }
+.sv-note { margin-top: 6px; font-size: 12px; line-height: 1.45; color: var(--sc-color-text-secondary); }
+.sv-note.warn { color: var(--sc-status-warning-fg); }
+.svt { position: relative; flex: none; margin-left: auto; width: 46px; height: 28px; padding: 0; border-radius: 14px; border: 0; background: rgba(120,120,128,0.22); cursor: pointer; touch-action: manipulation; transition: background .15s; }
+.svt i { position: absolute; top: 3px; left: 3px; width: 22px; height: 22px; border-radius: 50%; background: #fff; box-shadow: 0 2px 6px rgba(0,0,0,0.2); transition: left .15s; }
+.svt[aria-checked="true"] { background: rgba(140,192,32,0.95); }
+.svt[aria-checked="true"] i { left: 21px; }
+.svt.sm { width: 40px; height: 24px; }
+.svt.sm i { width: 18px; height: 18px; }
+.svt.sm[aria-checked="true"] i { left: 19px; }
+.svt:disabled { opacity: 0.45; cursor: default; }
+.svt:focus-visible { outline: 2px solid var(--sc-color-primary); outline-offset: 2px; }
+.seg2 { display: flex; padding: 2px; border-radius: 12px; background: rgba(15,23,42,0.06); }
+.seg2 button { flex: 1 1 0; min-height: 36px; padding: 0 8px; border: 0; border-radius: 10px; background: transparent; font: inherit; font-size: 13px; color: var(--sc-color-text); cursor: pointer; touch-action: manipulation; }
+.seg2 button[aria-checked="true"] { background: #fff; box-shadow: 0 2px 8px rgba(0,0,0,0.08); font-weight: 600; color: var(--sc-color-primary-dark); }
+.seg2 button:disabled { opacity: 0.5; cursor: default; }
+.sv-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.ck { display: inline-flex; align-items: center; gap: 4px; min-height: 36px; padding: 0 12px; border-radius: 18px; border: 1px solid rgba(15,23,42,0.1); background: rgba(255,255,255,0.8); font: inherit; font-size: 13px; color: var(--sc-color-text); cursor: pointer; touch-action: manipulation; }
+.ck[aria-pressed="true"] { background: rgba(239,252,232,0.95); border-color: rgba(140,192,32,0.8); color: var(--sc-color-primary-dark); font-weight: 600; }
+.ck[aria-pressed="true"]::before { content: "\2713"; }
+.sv-row { display: flex; align-items: center; gap: 8px; min-height: 40px; font-size: 13px; font-weight: 600; }
+.sv-row[hidden] { display: none; }
+.sv-foot { display: flex; gap: 8px; margin-top: 10px; }
+.sv-foot[hidden] { display: none; }
+.btn.sv-lnk { min-height: 36px; padding: 0 12px; border-radius: 12px; font-size: 13px; background: rgba(255,255,255,0.8); }
+/* hint above the recognition chip */
+.s-objhint { display: none; }
+body.ui-simple .s-objhint:not([hidden]) { display: block; position: absolute; z-index: 8; left: calc((var(--band-l, 176px) + 100vw - var(--band-r, 176px)) / 2);
+  bottom: calc(16px + var(--hud-h, 32px) + 8px); transform: translateX(-50%); box-sizing: border-box;
+  width: max-content; max-width: min(460px, calc(100vw - var(--band-l, 176px) - var(--band-r, 176px) - 8px)); padding: 5px 14px; border-radius: 14px; font-size: 13px; line-height: 1.4;
+  text-align: center; color: #fff; background: rgba(15,23,42,0.6); pointer-events: none; }
+/* selected-object card (#grasp-bar in simple mode) */
+.oc-src, .oc-x, .oc-sub, .oc-task { display: none; }
+body.ui-simple .grasp-bar { flex-direction: column; align-items: stretch; flex-wrap: nowrap; gap: 0; width: 276px; max-width: calc(100vw - 24px); box-sizing: border-box; padding: 10px; border-radius: 18px;
+  background: rgba(255,255,255,0.88); border-color: rgba(255,255,255,0.75); box-shadow: 0 12px 32px rgba(0,0,0,0.28); backdrop-filter: blur(14px) saturate(140%); -webkit-backdrop-filter: blur(14px) saturate(140%); }
+body.ui-simple .grasp-bar.placed { position: fixed; transform: none; left: var(--oc-x); top: var(--oc-y); bottom: auto; z-index: 26; }
+body.ui-simple .grasp-bar.placed::before { content: ""; position: absolute; top: var(--oc-ay, 22px); left: -7px; width: 12px; height: 12px; background: inherit; transform: rotate(45deg);
+  border-left: 1px solid rgba(255,255,255,0.75); border-bottom: 1px solid rgba(255,255,255,0.75); }
+body.ui-simple .grasp-bar.placed.flip::before { left: auto; right: -7px; transform: rotate(-135deg); }
+body.ui-simple .grasp-bar.placed.below::before, body.ui-simple .grasp-bar.placed.above::before { display: none; }
+body.ui-simple .grasp-info { align-items: center; }
+body.ui-simple .grasp-info b { font-size: 15px; max-width: 120px; }
+body.ui-simple .oc-src:not(:empty) { display: inline-block; padding: 1px 6px; border-radius: 6px; font-size: 11px; background: rgba(239,252,232,0.95); color: var(--sc-status-normal-fg); white-space: nowrap; }
+body.ui-simple .oc-x { display: inline-grid; place-items: center; margin-left: auto; width: 32px; height: 32px; padding: 0; border: 0; border-radius: 16px; background: rgba(15,23,42,0.06); font-size: 18px; line-height: 1; color: var(--sc-color-text); cursor: pointer; touch-action: manipulation; }
+body.ui-simple .grasp-bar .grasp-prog { margin-top: 8px; }
+body.ui-simple .grasp-acts { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
+body.ui-simple .grasp-acts .btn { min-height: 44px; padding: 0 8px; border-radius: 12px; font-size: 14px; font-weight: 600; }
+body.ui-simple .grasp-acts #grasp-go:only-child, body.ui-simple .grasp-acts.one #grasp-go, body.ui-simple .grasp-acts .grasp-stop { grid-column: 1 / -1; }
+body.ui-simple .grasp-acts #meas-go { background: rgba(255,255,255,0.92); color: var(--sc-color-primary-dark); border-color: rgba(91,125,21,0.45); }
+body.ui-simple #grasp-cancel { display: none; }
+body.ui-simple .oc-sub:not([hidden]) { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 4px; font-size: 11px; text-align: center; color: var(--sc-color-text-secondary); white-space: nowrap; }
+body.ui-simple .oc-task:not([hidden]) { display: flex; align-items: center; gap: 6px; width: 100%; min-height: 36px; margin-top: 8px; padding: 0 10px; border-radius: 10px;
+  border: 1px solid rgba(15,23,42,0.08); background: rgba(15,23,42,0.03); font: inherit; font-size: 12px; color: var(--sc-color-text-secondary); text-align: left; cursor: pointer; touch-action: manipulation; }
+body.ui-simple .oc-task b { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--sc-color-text); font-weight: 600; }
+body.ui-simple .oc-task .oc-task-set { margin-left: auto; white-space: nowrap; }
+body.ui-simple .meas-card.placed { position: fixed; left: var(--ms-x); top: var(--ms-y); bottom: auto; width: var(--ms-w, 276px); max-height: var(--ms-h, 60dvh); z-index: 27; }
+/* stacked layouts (portrait phone and tablet): object card, hint and measurement under the video, panel as a bottom sheet */
+.s-slot { display: none; }
+body.ui-simple.oc-slot .s-slot { display: grid; gap: 8px; margin-top: 8px; }
+body.ui-simple.oc-slot .s-slot:not(:has(> :not([hidden]))) { display: none; }
+body.ui-simple.oc-slot .grasp-bar { position: static; transform: none; width: auto; max-width: none; }
+body.ui-simple.oc-slot .s-objhint:not([hidden]) { position: static; transform: none; width: auto; max-width: none; padding: 9px 12px; color: var(--sc-color-text-secondary);
+  background: rgba(255,255,255,0.65); border: 1px solid rgba(255,255,255,0.8); }
+/* the size measurement moves the arm: a bottom sheet below the safety card, so Stop / E-stop stay on screen */
+body.ui-simple.oc-slot .meas-card { position: fixed; top: var(--sv-top, 50%); left: 0; right: 0; bottom: 0; width: auto; max-height: none; border-radius: 22px 22px 0 0; z-index: 1035; }
+body.ui-simple.oc-slot.vis-open .s-vis:not([hidden]) { position: fixed; top: var(--sv-top, 50%); left: 0; right: 0; bottom: 0; transform: none; width: auto; max-height: none;
+  border-radius: 22px 22px 0 0; padding: 14px 16px 20px; z-index: 1035; }
+/* grasp tasks in the grasp settings */
+.gset-tasks { display: grid; gap: 6px; }
+.gset-tasks[hidden] { display: none; }
+.gset-tasks-h { font-size: 12px; color: var(--sc-color-text-secondary); }
+.gset-task { display: flex; gap: 10px; align-items: flex-start; width: 100%; padding: 10px; border-radius: 12px; border: 1px solid var(--sc-color-border); background: var(--sc-color-bg-container);
+  font: inherit; text-align: left; color: var(--sc-color-text); cursor: pointer; touch-action: manipulation; }
+.gset-task::before { content: ""; flex: none; width: 16px; height: 16px; margin-top: 2px; border-radius: 50%; border: 2px solid #cbd5e1; box-sizing: border-box; }
+.gset-task[aria-checked="true"] { border-color: rgba(140,192,32,0.8); background: var(--sc-status-normal-bg); }
+.gset-task[aria-checked="true"]::before { border: 5px solid var(--sc-color-primary); }
+.gset-task b { display: block; font-size: 14px; }
+.gset-task small { display: block; margin-top: 2px; font-size: 12px; line-height: 1.45; color: var(--sc-color-text-secondary); }
+#gset-task-list { display: grid; gap: 6px; }
+.gset-tasks-note { font-size: 12px; color: var(--sc-color-text-secondary); }
+.gset-tasks-note[hidden] { display: none; }
+@media (orientation: landscape) and (max-height: 1200px) {
+  /* presets: dark glass so white labels read on a light table; a vertical stack inside the safe margin */
+  body.ui-simple .presets { display: flex; flex-direction: column; gap: 6px; }
+  body.ui-simple .preset { height: 36px; padding: 0 12px 0 10px; font-size: 13px; background: rgba(15,23,42,0.34); }
+  body.ui-simple .pose-btn { background: rgba(15,23,42,0.30); }
+  body.ui-simple .hud .sc-status-badge { background: rgba(15,23,42,0.34); }
+  /* grasp settings: a glass sheet on the right, below the status island; the safety capsule stays on top */
+  body.ui-simple #gset { background: transparent; backdrop-filter: none; -webkit-backdrop-filter: none; pointer-events: none; }
+  body.ui-simple #gset .calib-drawer { pointer-events: auto; }
+  body.ui-simple #gset .calib-drawer { position: fixed; top: 52px; right: max(12px, env(safe-area-inset-right)); bottom: 12px; width: min(380px, calc(100vw - 24px)); height: auto;
+    padding: 14px; border-radius: 22px; border: 1px solid rgba(255,255,255,0.75); background: rgba(255,255,255,0.92); box-shadow: 0 16px 40px rgba(0,0,0,0.3); }
+}
 /* keep toasts clear of open drawer headers and top controls (phone bottom-sheet & tablet side-drawer) */
 body:has(.calib-mask:not([hidden])) .toasts { top: auto; bottom: max(16px, env(safe-area-inset-bottom)); left: 50%; max-width: calc(100vw - 32px); flex-direction: column-reverse; }
 @media (min-width: 820px) {
@@ -1904,6 +2033,9 @@ body:has(.calib-mask:not([hidden])) .toasts { top: auto; bottom: max(16px, env(s
       <button data-ui="simple" role="radio"><span class="full" data-i18n="ui.simple">简化模式</span><span class="short" data-i18n="ui.simple.s">简</span></button>
       <button data-ui="expert" role="radio"><span class="full" data-i18n="ui.expert">专家模式</span><span class="short" data-i18n="ui.expert.s">专</span></button>
     </div>
+    <button class="ui-mode-btn" id="btn-ui" type="button" data-i18n-title="ui.to_expert.t" title="切换到专家模式：关节点动、遥测、标定、录制和全部抓取参数">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 6h10M4 12h16M4 18h7"/><circle cx="17" cy="6" r="2"/><circle cx="14" cy="18" r="2"/></svg><span id="btn-ui-txt" data-i18n="ui.to_expert">专家模式</span>
+    </button>
     <div class="head-stats">
       <button class="speed-pill" id="speed-pill" data-i18n-aria="speed.adjust" aria-label="速度调节">60% ▾</button>
       <span class="sc-status-badge plain" id="tool-badge" hidden></span>
@@ -1960,6 +2092,24 @@ body:has(.calib-mask:not([hidden])) .toasts { top: auto; bottom: max(16px, env(s
         <div class="hud">
           <button class="btn det-btn vis-chip only-simple" id="btn-vis" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="det-ctl" hidden>识别</button>
           <span class="det-ctl" id="det-ctl" hidden><button class="btn det-btn" id="btn-det" type="button" aria-pressed="false" data-op="/api/v1/detection/inference" disabled>识别</button><span class="seg seg-sm vmode" id="vmode" role="group" aria-label="视觉模式" hidden><span class="vm-k" id="vm-k" aria-hidden="true" hidden>显示</span><button type="button" aria-pressed="false" data-vm="off" data-i18n="vm.off">关</button><button type="button" aria-pressed="false" data-vm="yolo" data-op="/api/v1/vision/mode" data-i18n="vm.yolo">YOLO</button><button type="button" aria-pressed="false" data-vm="aruco" data-op="/api/v1/vision/mode" data-i18n="vm.aruco">ArUco</button><button type="button" aria-pressed="false" data-vm="depth" data-op="/api/v1/vision/depth" data-i18n="depth.btn" aria-controls="depth-panel">深度（估计）</button></span><button class="btn det-btn det-trig" id="btn-trigger" type="button" data-op="/api/v1/detection/trigger" disabled>单次识别</button><span class="fps-pill" id="fps-pill" role="status" aria-live="polite">待机 -- FPS</span><button class="btn det-btn det-gset" id="btn-gset" type="button" data-op="/api/v1/grasp/setup" data-op-mode="offer" data-i18n="gset.open" hidden>抓取设置</button></span>
+          <div class="s-vis only-simple" id="s-vis" role="dialog" data-i18n-aria="sv.title" aria-label="识别" hidden>
+            <div class="sv-head"><b data-i18n="sv.title">识别</b><span class="sv-meta mono" id="sv-meta"></span><button class="svt" id="sv-on" type="button" role="switch" aria-checked="false" data-i18n-aria="sv.on.aria" aria-label="识别开关"><i></i></button><button class="sv-x" id="sv-x" type="button" data-i18n-aria="op.close" aria-label="关闭">×</button></div>
+            <div class="sv-sec" id="sv-kind-sec" hidden>
+              <div class="sv-k" data-i18n="sv.kind">识别方式</div>
+              <div class="seg2" id="sv-kind" role="radiogroup" data-i18n-aria="sv.kind" aria-label="识别方式"><button type="button" role="radio" data-kind="detect" data-op="/api/v1/vision/detector" data-i18n="sv.kind.detect">检测（框）</button><button type="button" role="radio" data-kind="segment" data-op="/api/v1/vision/detector" data-i18n="sv.kind.segment">分割（轮廓）</button></div>
+              <div class="sv-note" id="sv-kind-note"></div>
+            </div>
+            <div class="sv-sec">
+              <div class="sv-k" data-i18n="sv.show">画面上显示</div>
+              <div class="sv-chips" id="sv-show"><button type="button" class="ck" data-show="contour" aria-pressed="true" data-i18n="sv.show.contour">轮廓</button><button type="button" class="ck" data-show="box" aria-pressed="false" data-i18n="sv.show.box">框</button><button type="button" class="ck" data-show="label" aria-pressed="true" data-i18n="sv.show.label">标签</button></div>
+            </div>
+            <div class="sv-sec" id="sv-other">
+              <div class="sv-k" data-i18n="sv.other">其他视觉</div>
+              <div class="sv-row" id="sv-aruco-row"><span data-i18n="sv.aruco">ArUco 标记</span><button class="svt sm" id="sv-aruco" type="button" role="switch" aria-checked="false" data-i18n-aria="sv.aruco" aria-label="ArUco 标记"><i></i></button></div>
+              <div class="sv-row" id="sv-depth-row"><span data-i18n="depth.btn">深度（估计）</span><button class="svt sm" id="sv-depth" type="button" role="switch" aria-checked="false" data-i18n-aria="depth.btn" aria-label="深度（估计）"><i></i></button></div>
+            </div>
+            <div class="sv-foot"><button class="btn sv-lnk" id="sv-gset" type="button" data-i18n="sv.gset">抓取设置 ›</button></div>
+          </div>
           <span class="sc-status-badge" id="cam-chip" data-i18n="v.chip.connecting">连接中</span>
           <span class="sc-status-badge plain" id="vstat" hidden>-- ms</span>
           <span class="sc-status-badge plain" id="det-chip" data-i18n="det.none" hidden>检测 --</span>
@@ -1974,7 +2124,7 @@ body:has(.calib-mask:not([hidden])) .toasts { top: auto; bottom: max(16px, env(s
           <div class="v3-legend"><span class="k-meas"><i></i><b data-i18n="v3.leg.meas">实测</b></span><span class="k-cmd"><i></i><b data-i18n="v3.leg.cmd">指令</b></span><span class="k-ws"><i></i><b data-i18n="v3.leg.ws">工作空间</b></span><span class="k-ko"><i></i><b data-i18n="v3.leg.ko">禁入区</b></span></div>
         </div>
         <div class="grasp-bar" id="grasp-bar" role="group" data-i18n-aria="grasp.aria" aria-label="点框抓取" hidden>
-          <div class="grasp-info" id="grasp-info"><b id="grasp-label">--</b><span class="mono" id="grasp-score">--</span></div>
+          <div class="grasp-info" id="grasp-info"><b id="grasp-label">--</b><span class="mono" id="grasp-score">--</span><span class="oc-src only-simple" id="grasp-src"></span><button class="oc-x only-simple" id="grasp-x" type="button" data-i18n-aria="oc.x" aria-label="取消选择">×</button></div>
           <div class="grasp-prog" id="grasp-prog" hidden><span id="grasp-phase">--</span><div class="calib-bar"><i id="grasp-fill"></i></div></div>
           <div class="grasp-acts">
             <button class="btn btn-primary" id="grasp-go" type="button" data-i18n="grasp.go">抓取</button>
@@ -1982,7 +2132,10 @@ body:has(.calib-mask:not([hidden])) .toasts { top: auto; bottom: max(16px, env(s
             <button class="btn" id="grasp-cancel" type="button" data-i18n="grasp.cancel">取消</button>
             <button class="btn grasp-stop" id="grasp-stop" type="button" data-i18n="grasp.stop" hidden>停止</button>
           </div>
+          <div class="oc-sub only-simple" id="grasp-sub"><span></span><span id="meas-sub"></span></div>
+          <button class="oc-task only-simple" id="grasp-task" type="button" data-op="/api/v1/grasp/setup" data-op-mode="offer"><span data-i18n="oc.task">抓取任务</span><b id="grasp-task-name">默认</b><span class="oc-task-set" data-i18n="oc.task.set">设置 ›</span></button>
         </div>
+        <div class="s-objhint only-simple" id="s-objhint" role="status" hidden></div>
         <div class="meas-card" id="meas-card" role="region" aria-live="polite" data-i18n-aria="ms.title" aria-label="尺寸测量" hidden></div>
         <div class="depth-panel" id="depth-panel" role="group" aria-label="深度（模型估计）" hidden>
           <div class="dp-row"><b class="dp-title" id="dp-title">深度（模型估计）</b><button class="btn dp-btn" id="dp-live" type="button" aria-pressed="false">连续</button><button class="btn dp-btn" id="dp-refresh" type="button">刷新</button><button class="btn dp-btn dp-x" id="dp-x" type="button" aria-label="关闭深度显示">×</button></div>
@@ -1993,6 +2146,8 @@ body:has(.calib-mask:not([hidden])) .toasts { top: auto; bottom: max(16px, env(s
         <div class="grasp-pick" id="grasp-pick" role="status" hidden><span data-i18n="gset.grip.tap">点击画面中夹爪之间物体的中心</span><button class="btn" id="grasp-pick-x" type="button" data-i18n="grasp.cancel">取消</button></div>
         <div class="banner" data-i18n="banner.lock">遥测断开 · 控制已锁定</div>
       </div>
+      <!-- simple, portrait / stacked: the hint, the object card and the measurement card go here, under the video -->
+      <div class="s-slot only-simple" id="s-slot"></div>
     </section>
 
     <!-- ===== expert: fine control ===== -->
@@ -2169,6 +2324,11 @@ body:has(.calib-mask:not([hidden])) .toasts { top: auto; bottom: max(16px, env(s
         <button class="btn btn-park-off" id="btn-park-off" type="button" hidden>
           <span data-i18n="en.park_off">停靠并卸力</span><small data-i18n="en.park_off.sub">按住 0.6 秒：回到收纳位后关闭力矩</small>
         </button>
+        <!-- while stopped (E-stop / Fault) with torque on: allow torque off only at the rest pose; no override -->
+        <button class="btn btn-park-off" id="btn-torque-off" type="button" hidden>
+          <span data-i18n="en.torque_off">关闭力矩</span><small data-i18n="en.torque_off.sub">仅收纳位可用 · 故障或急停仍保持锁存</small>
+        </button>
+        <div class="torque-off-msg" id="torque-off-msg" role="alert" aria-live="polite" hidden></div>
         <!-- estimated supply load (observation.power): both modes -->
         <div class="pwr" id="pwr" role="meter" aria-valuemin="0" aria-valuemax="120" aria-valuenow="0" data-i18n-aria="pwr.aria" aria-label="电源负载（估算）" hidden>
           <span class="pwr-lbl" data-i18n="pwr.label">电源负载</span>
@@ -2505,6 +2665,11 @@ body:has(.calib-mask:not([hidden])) .toasts { top: auto; bottom: max(16px, env(s
       <h3 id="gset-title" data-i18n="gset.title">抓取设置</h3>
       <button class="btn calib-x" id="gset-close" type="button" data-i18n-aria="calib.close" aria-label="关闭">×</button>
     </div>
+    <div class="gset-tasks" id="gset-tasks" role="radiogroup" data-i18n-aria="gset.tasks" aria-label="抓取任务" hidden>
+      <div class="gset-tasks-h" data-i18n="gset.tasks">抓取任务</div>
+      <div id="gset-task-list"></div>
+      <small class="gset-tasks-note" id="gset-tasks-note" hidden></small>
+    </div>
     <p class="calib-hint" data-i18n="gset.hint">选择 YOLO（或开启「识别」）后点画面里的框即可抓取。下面三项每次换桌面或相机支架后设置一次，保存在机械臂上。</p>
     <div class="gset-row">
       <div class="gset-k"><span data-i18n="gset.table">桌面高度</span><b class="mono" id="gset-table">--</b></div>
@@ -2695,7 +2860,7 @@ const I18N = {
     'det.fps.idle': '待机 {n} FPS', 'det.fps.work': '工作 {n} FPS', 'det.fps.snap': '抓拍中', 'det.fps.tip': '相机推理帧率：待机 {idle} FPS / 工作 {active} FPS',
     'grasp.aria': '点框抓取', 'grasp.go': '抓取', 'grasp.cancel': '取消', 'grasp.stop': '停止',
     'grasp.gap': '抓取设置仍是默认值（{g}），抓取位置可能对不准。', 'grasp.gap.grip': '夹爪位置没有在画面上点选', 'grasp.gap.cam': '相机没有标定',
-    'ms.go': '尺寸测量', 'ms.title': '尺寸测量', 'ms.confirm': '机械臂将以当前位置为中心，左右各移动约 {cm} cm，在 {n} 个视角拍照（速度 {sp}%），结束后回到起点。实测 3 个视角约 15 秒。',
+    'ms.go': '测量尺寸', 'ms.title': '尺寸测量', 'ms.confirm': '机械臂将以当前位置为中心，左右各移动约 {cm} cm，在 {n} 个视角拍照（速度 {sp}%），结束后回到起点。实测 3 个视角约 15 秒。',
     'ms.stop_note': '请站在急停按钮旁，确认物体周围没有障碍。', 'ms.start': '开始测量', 'ms.quick': '快速估计（不移动）',
     'ms.ph.start': '准备中', 'ms.ph.view': '移到视角 {k} / {n}', 'ms.ph.capture': '拍摄视角 {k} / {n}', 'ms.ph.compute': '计算中', 'ms.ph.return': '回到起点',
     'ms.hwl': '高 × 宽 × 长（多视角三角测量）', 'ms.r.centroid': '中心（基座坐标）', 'ms.r.points': '物体点数', 'ms.r.edges': '边缘点', 'ms.r.rms': '重投影 RMS',
@@ -2790,11 +2955,15 @@ const I18N = {
     'gc.x.GRAVITY_COMP_OVERSPEED': '关节速度过快（可能在下坠）：已锁定位置', 'gc.x.GRAVITY_COMP_SAG': '补偿不足，机械臂在下沉：已锁定位置',
     'gc.x.GRAVITY_COMP_JOINT_LIMIT': '关节接近限位：已锁定位置', 'gc.x.GRAVITY_MODEL_UNAVAILABLE': '重力模型不可用：已锁定位置', 'gc.x.other': '已退出拖动示教：{m}',
     'en.enable': '使能', 'en.holding': '保持中 · 按住恢复', 'en.hold': '按住 0.6 秒', 'en.reset_estop': '⚠️ 点击复位急停', 'en.reset_estop_s': '⚠️ 复位急停', 'en.clear_fault_s': '⚠️ 清除故障', 'en.clear_fault': '⚠️ 点击清除故障',
-    'mit.recovery.confirm': '电机指令超时已到期。清除故障会关闭所有关节的力矩，机械臂会像收纳断电一样下落。请先托住机械臂或让它处于支撑位，再在提示消失前点一次确认。',
     'mit.recovery.done': '已恢复：所有关节力矩已关闭', 'en.on_unconfirmed': '控制已开启 · 未确认',
     'en.armed_readonly': '力矩已开 · 未控制', 'en.sub_readonly': '按住 0.6 秒：先确认控制权，再停靠卸力',
     'en.sub_reset': '复位后再长按使能', 'en.sub_off': '按住 0.6 秒：停靠并卸力',
     'en.park_off': '停靠并卸力', 'en.park_off.sub': '按住 0.6 秒：回到收纳位后关闭力矩', 'toast.reset_holding': '已复位，电机仍在保持机械臂：长按「使能」恢复控制，或长按「停靠并卸力」',
+    'en.torque_off': '关闭力矩', 'en.torque_off.sub': '仅收纳位可用 · 故障或急停仍保持锁存',
+    'en.torque_off.would_drop': '力矩保持开启：{joint} 当前在 {pos} rad（收纳位 {rest}）；关闭力矩会导致机械臂下坠。请先清除故障并停靠收纳，或切断电源。',
+    'en.torque_off.would_drop_stale': '力矩保持开启：关节反馈缺失或超过 100 ms，无法确认是否处于收纳位；关闭力矩会导致机械臂下坠。请等待新鲜反馈、清除故障并停靠收纳，或切断电源。',
+    'en.torque_off.no_rest_pose': '力矩保持开启：当前 profile 未配置已标定的收纳位，无法安全断力矩；关闭力矩会导致机械臂下坠。请清除故障并停靠，或切断电源。',
+    'toast.torque_off_stopped': '力矩已关闭；故障或急停仍保持锁存，需另行清除',
     'estop': '急停', 'estop.aria': '紧急停止',
     'stop': '停止', 'stop.sub': '保持位置', 'stop.aria': '停止运动并保持位置',
     'lock.offline': '遥测断开，控制已锁定', 'lock.observer': '当前为观察模式，其他页面可能正在控制', 'lock.observer_who': '观察模式：{who} 正在控制机械臂',
@@ -3055,11 +3224,15 @@ const I18N = {
     'gc.x.GRAVITY_COMP_OVERSPEED': 'Joint too fast (falling?): pose held', 'gc.x.GRAVITY_COMP_SAG': 'Compensation too weak, the arm sagged: pose held',
     'gc.x.GRAVITY_COMP_JOINT_LIMIT': 'Joint near its limit: pose held', 'gc.x.GRAVITY_MODEL_UNAVAILABLE': 'Gravity model unavailable: pose held', 'gc.x.other': 'Hand-guiding ended: {m}',
     'en.enable': 'Enable', 'en.holding': 'Holding · hold to resume', 'en.hold': 'Hold 0.6 s', 'en.reset_estop': '⚠️ Tap to reset E-Stop', 'en.reset_estop_s': '⚠️ Reset E‑Stop', 'en.clear_fault_s': '⚠️ Clear fault', 'en.clear_fault': '⚠️ Tap to clear fault',
-    'mit.recovery.confirm': 'A motor command timeout expired. Clearing turns torque off on every joint and the arm drops like a park torque-off. Support the arm or bring it to rest, then tap again while this warning is shown to confirm.',
     'mit.recovery.done': 'Recovered: torque is off on every joint', 'en.on_unconfirmed': 'On · unconfirmed',
     'en.armed_readonly': 'Torque on · not in control', 'en.sub_readonly': 'Hold 0.6 s: confirm control, then park & torque off',
     'en.sub_reset': 'Then hold to enable', 'en.sub_off': 'Hold 0.6 s: park and turn torque off',
     'en.park_off': 'Park and turn torque off', 'en.park_off.sub': 'Hold 0.6 s: move to the rest pose, then torque off', 'toast.reset_holding': 'Reset done; the motors still hold the arm. Hold Enable to resume, or hold "Park and turn torque off"',
+    'en.torque_off': 'Turn torque off', 'en.torque_off.sub': 'At rest pose only · fault/E-stop latch stays active',
+    'en.torque_off.would_drop': 'Torque stays on: {joint} is at {pos} rad (rest {rest}); the arm would drop. Clear the fault and park, or cut power.',
+    'en.torque_off.would_drop_stale': 'Torque stays on: feedback is missing or older than 100 ms, so the rest pose cannot be verified; the arm would drop. Wait for fresh feedback, clear the fault and park, or cut power.',
+    'en.torque_off.no_rest_pose': 'Torque stays on: profile has no calibrated resting_pose configured; the arm would drop. Clear the fault and park, or cut power.',
+    'toast.torque_off_stopped': 'Torque turned off; fault/E-stop latch remains active until cleared',
     'estop': 'E-Stop', 'estop.aria': 'Emergency stop',
     'stop': 'Stop', 'stop.sub': 'HOLD', 'stop.aria': 'Stop motion and hold position',
     'lock.offline': 'Telemetry lost, controls locked', 'lock.observer': 'Observer mode: another page may be in control', 'lock.observer_who': 'Observer mode: {who} is controlling the arm',
@@ -3194,6 +3367,47 @@ const I18N = {
     'ec.vision_down': 'The vision service does not answer: check that rebot-vision runs, then try again', 'ec.vision_timeout': 'The vision service did not answer in time: try again shortly', 'op.why.take': 'Forcing a takeover of control needs operator access', 'op.why.default': 'This action needs operator access', 'op.retry': 'The action continues after the unlock.',
   },
 };
+// simple mode: mode entry, recognition panel, object card, grasp tasks
+Object.assign(I18N.zh, {
+  'ui.to_expert': '专家模式', 'ui.to_simple': '简易模式',
+  'ui.to_expert.t': '切换到专家模式：关节点动、遥测、标定、录制和全部抓取参数', 'ui.to_simple.t': '回到简易模式：画面、摇杆和点选抓取',
+  'sv.title': '识别', 'sv.chip.n': '识别 · {n} 个物体', 'sv.chip.0': '识别 · 无物体', 'sv.chip.wait': '识别 · 开', 'sv.on.aria': '识别开关',
+  'sv.meta.video': '视频 {fps} fps · {ms} ms', 'sv.meta.det': '识别 {fps} fps', 'sv.meta.off': '识别已关闭',
+  'sv.kind': '识别方式', 'sv.kind.detect': '检测（框）', 'sv.kind.segment': '分割（轮廓）',
+  'sv.kind.note': '切换约 0.7 s，期间画面不更新；抓取和测量也随之改变。', 'sv.kind.busy': '正在切换识别方式…',
+  'sv.kind.other': '当前模型 {name}（{kind}）由专家模式或抓取任务加载，这里不能切换。', 'sv.kind.na': '视觉服务不能切换模型（需要更新 rebot-teleop）。',
+  'sv.kind.ok': '识别方式：{k}', 'sv.kind.fail': '识别方式未切换', 'sv.kind.armbusy': '抓取或测量进行中，结束后再切换。',
+  'sv.show': '画面上显示', 'sv.show.contour': '轮廓', 'sv.show.box': '框', 'sv.show.label': '标签',
+  'sv.other': '其他视觉', 'sv.aruco': 'ArUco 标记', 'sv.gset': '抓取设置 ›',
+  'sv.hint': '点选画面中的物体，可抓取或测量尺寸', 'sv.hint0': '画面中没有识别到物体。物体进入画面并被识别后，点选它可抓取或测量尺寸',
+  'oc.x': '取消选择', 'oc.src.seg': '分割轮廓', 'oc.src.box': '检测框', 'oc.meas.sub': '臂会移动 ±{cm} cm · 约 15 s',
+  'oc.task': '抓取任务', 'oc.task.def': '默认', 'oc.task.set': '设置 ›',
+  'gset.tasks': '抓取任务', 'gset.task.def.d': '用下面的高度和夹爪位置抓取选中的物体。',
+  'gset.tasks.hidden': '另有 {n} 个任务需要别的识别模型，简易模式不列出（在专家模式使用）。',
+  'lease.tq.on': '扭矩开', 'lease.tq.off': '扭矩关',
+  'ec.vision_busy': '抓取或测量正在使用识别：结束（或按停止）后再切换', 'ec.ion_budget': '相机内存不够同时加载这个模型和已加载的模型：保持当前识别方式',
+  'ec.model_nf': '设备上没有这种识别方式的默认模型：在设备上安装模型，或在机械臂配置的 vision_detectors 中指定',
+});
+Object.assign(I18N.en, {
+  'ui.to_expert': 'Expert mode', 'ui.to_simple': 'Simple mode',
+  'ui.to_expert.t': 'Switch to expert mode: joint jog, telemetry, calibration, recording and every grasp parameter', 'ui.to_simple.t': 'Back to simple mode: video, sticks and tap to grasp',
+  'sv.title': 'Recognition', 'sv.chip.n': 'Recognition · {n} objects', 'sv.chip.0': 'Recognition · no objects', 'sv.chip.wait': 'Recognition · on', 'sv.on.aria': 'Recognition on/off',
+  'sv.meta.video': 'video {fps} fps · {ms} ms', 'sv.meta.det': 'recognition {fps} fps', 'sv.meta.off': 'recognition off',
+  'sv.kind': 'Detection kind', 'sv.kind.detect': 'Detect (boxes)', 'sv.kind.segment': 'Segment (outlines)',
+  'sv.kind.note': 'Switching takes about 0.7 s and pauses the overlay; grasp and measure use the new kind too.', 'sv.kind.busy': 'Switching the detection kind…',
+  'sv.kind.other': 'The current model {name} ({kind}) was loaded in expert mode or by a grasp task; it cannot be switched here.', 'sv.kind.na': 'The vision service cannot switch models (update rebot-teleop).',
+  'sv.kind.ok': 'Detection kind: {k}', 'sv.kind.fail': 'Detection kind not switched', 'sv.kind.armbusy': 'A grasp or measurement is running; switch after it ends.',
+  'sv.show': 'Show on video', 'sv.show.contour': 'Outlines', 'sv.show.box': 'Boxes', 'sv.show.label': 'Labels',
+  'sv.other': 'Other vision', 'sv.aruco': 'ArUco markers', 'sv.gset': 'Grasp settings ›',
+  'sv.hint': 'Tap an object in the video to grasp it or measure its size', 'sv.hint0': 'No object recognised. Once an object is in view and recognised, tap it to grasp it or measure its size',
+  'oc.x': 'Clear selection', 'oc.src.seg': 'outline', 'oc.src.box': 'box', 'oc.meas.sub': 'arm moves ±{cm} cm · about 15 s',
+  'oc.task': 'Grasp task', 'oc.task.def': 'Default', 'oc.task.set': 'Settings ›',
+  'gset.tasks': 'Grasp task', 'gset.task.def.d': 'Grasps the selected object with the heights and gripper position below.',
+  'gset.tasks.hidden': '{n} more tasks need another detection model and are not listed in simple mode (use expert mode).',
+  'lease.tq.on': 'torque on', 'lease.tq.off': 'torque off',
+  'ec.vision_busy': 'A grasp or measurement is using recognition: switch after it ends (or press Stop)', 'ec.ion_budget': 'Not enough camera memory for this model next to the loaded ones: keep the current kind',
+  'ec.model_nf': 'The device has no default model of this kind: install the model on the device, or name one in vision_detectors of the arm profile',
+});
 // calibration tools (settings drawer, gripper tool)
 Object.assign(I18N.zh, {
   'tools.title': '工具', 'tools.order': '推荐顺序：零位标定 → 精校 → 夹爪标定。相机标定在不做精校时单独使用。',
@@ -3918,6 +4132,7 @@ const EC_KEYS = {
   OPERATOR_REQUIRED: 'err.operator_required', LEASE_REQUIRED: 'err.nolease', NO_LEASE: 'err.nolease', LEASE_BUSY: 'ec.lease_busy',
   LEASE_LOST: 'ec.lease_lost', NOT_ARMED: 'ec.not_armed', RATE_LIMITED: 'ec.rate', INSECURE_TRANSPORT: 'ec.insecure',
   VISION_DOWN: 'ec.vision_down', VISION_TIMEOUT: 'ec.vision_timeout', MODEL_NOT_LOADED: 'vm.noyolo', COMMAND_TIMEOUT: 'err.cmdtimeout',
+  VISION_BUSY: 'ec.vision_busy', ION_BUDGET: 'ec.ion_budget', MODEL_NOT_FOUND: 'ec.model_nf',
 };
 const errWhy = (code) => (EC_KEYS[code] ? t(EC_KEYS[code]) : '');
 function toast(msg, kind = '', code = '', opts = null) {
@@ -4196,7 +4411,7 @@ function applyObservation(o, fromWs) {
     if (cur == null) { closePreemptModal(); toast(t('preempt.cleared'), 'info'); }
     else if (cur !== preemptTargetHolder) { preemptTargetHolder = cur; preemptChangedAck = true; preemptChangedUntil = Date.now() + 800; renderPreemptModal(); }
   }
-  mitRecoveryObserve(); detHoldOnObs(o); depthOnObs(o); gcOnObs(o);
+  detHoldOnObs(o); depthOnObs(o); gcOnObs(o);
   renderMotionLimit(o); tkOnObs(o); renderPower(o); graspOnObs(o); msOnObs(o); epOnObs(o); teachOnObs(o);
   syncEpoch(o.epoch_id);
   const st = parseState(o.safety_state), wasStopped = isStopped();
@@ -4997,6 +5212,14 @@ function parseDetections(rawData, refRes) {
       obbCorners = item.obb_corners.map(([u, v]) => (isPixelUnit ? [Number(u) / refW, Number(v) / refH] : [Number(u), Number(v)]));
     }
 
+    // segment models: exterior outline of the mask, same unit as the box (rebot-vision HTTP results)
+    let contour = null;
+    if (Array.isArray(item.contour) && item.contour.length >= 3) {
+      contour = item.contour.filter((c) => Array.isArray(c) && c.length >= 2).map(([u, v]) => (isPixelUnit ? [Number(u) / refW, Number(v) / refH] : [Number(u), Number(v)]))
+        .filter(([u, v]) => Number.isFinite(u) && Number.isFinite(v));
+      if (contour.length < 3) contour = null;
+    }
+
     results.push({
       x0, y0, x1, y1,
       cx, cy, w, h,
@@ -5004,7 +5227,8 @@ function parseDetections(rawData, refRes) {
       score,
       track_id: track_id != null ? track_id : null,
       aruco,
-      obbCorners
+      obbCorners,
+      contour
     });
   }
   return results;
@@ -5110,12 +5334,15 @@ function detApply(data) {
 function visPopOpen(open) {
   const body = document.body, chip = $('btn-vis');
   if (open === body.classList.contains('vis-open')) return;
+
   body.classList.toggle('vis-open', open);
   if (chip) chip.setAttribute('aria-expanded', String(open));
+  if (open && typeof svSheetPlace === 'function') svSheetPlace();
+  if (!open && typeof SV !== 'undefined' && SV.scrollBack != null) { const y = SV.scrollBack; SV.scrollBack = null; if ($('meas-card').hidden) window.scrollTo(0, y); }
 }
 document.addEventListener('pointerdown', (e) => {
   if (!document.body.classList.contains('vis-open')) return;
-  if (e.target.closest && e.target.closest('#det-ctl, #btn-vis')) return;
+  if (e.target.closest && e.target.closest('#det-ctl, #btn-vis, #s-vis')) return;
   visPopOpen(false);
 }, true);
 function renderDetToggle() {
@@ -5135,7 +5362,7 @@ function renderDetToggle() {
   const vis = $('btn-vis');
   if (vis) {
     vis.hidden = wrap.hidden;
-    setText(vis, btn.textContent);
+    setText(vis, S.ui === 'simple' ? svChipText() : btn.textContent);
     vis.classList.toggle('btn-primary', !!(DET.avail && DET.enabled));
     vis.title = t('vis.tip');
     vis.setAttribute('aria-label', btn.textContent + ' · ' + t('vis.tip'));
@@ -5468,6 +5695,8 @@ function vmApply(data) {
   VM.depthMetric = VM.depth && !!(data.depth_model && data.depth_model.metric === true);
   VM.models = data.models && typeof data.models === 'object' ? data.models : null;
   VM.ion = data.ion && typeof data.ion === 'object' ? data.ion : null;
+  VM.kind = data.model && typeof data.model.kind === 'string' ? data.model.kind : null;
+  VM.modelName = data.model && typeof data.model.name === 'string' ? data.model.name : null;
   if (typeof data.enabled === 'boolean') detApply({ enabled: data.enabled, fps: data.fps, active_fps: data.active_fps, idle_fps: data.idle_fps });
   renderVisionMode();
 }
@@ -5540,6 +5769,7 @@ function renderVisionMode() {
     if (tip) b.title = tip; else b.removeAttribute('title');
   }
   depthRender();
+  if (typeof renderSVis === 'function') renderSVis();
 }
 /* A tap on the selector: Off clears everything, YOLO / ArUco / Depth toggle independently. */
 function vmToggle(m) {
@@ -8409,8 +8639,8 @@ function faultText() {
   const c = S.faultCode;
   if (!c || c === 'ESTOP' || I18N.zh['fc.' + c] === undefined) return null;
   let title = t('fc.' + c, { d: S.fault || t('unknown') });
-  // joint limit / over-temperature details name the joint
-  if ((c === 'JOINT_LIMIT' || c === 'THERMAL_TRIP') && S.fault && !/^[A-Z][A-Za-z]+$/.test(S.fault)) title += (LANG === 'zh' ? '（' + S.fault + '）' : ' (' + S.fault + ')');
+  // joint limit / over-temperature / failed-enable details name per-joint status
+  if ((c === 'JOINT_LIMIT' || c === 'THERMAL_TRIP' || c === 'ENABLE_FAILED') && S.fault && !/^[A-Z][A-Za-z]+$/.test(S.fault)) title += (LANG === 'zh' ? '（' + S.fault + '）' : ' (' + S.fault + ')');
   return { title, todo: t('fc.' + c + '.do') };
 }
 function lockReason() {
@@ -9909,33 +10139,21 @@ $('mode-seg').addEventListener('click', (e) => { const b = e.target.closest('but
 $('input-seg').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) setMode(S.ctl, b.dataset.input); });
 
 /* clear E-stop / fault (shared by the enable button and the status bar) */
-/* MIT expiry recovery: armd refuses the first clear with MIT_RECOVERY_CONFIRM_REQUIRED (torque goes off
-   on every joint). The second tap confirms only while that warning toast is still shown and only for
-   the same fault instance (code, message, epoch); any state change removes the warning and disarms. */
-let mitRecovery = null; // { el, key }
-function mitFaultKey() {
-  const f = S.obs && S.obs.fault;
-  return f ? f.code + '|' + f.message + '|' + S.epoch : null;
-}
-function mitRecoveryObserve() {
-  if (mitRecovery && (!mitRecovery.el.isConnected || mitRecovery.key !== mitFaultKey())) {
-    mitRecovery.el.remove();
-    mitRecovery = null;
-  }
-}
+/* Clear fault (including MIT expiry recovery): there is no second-tap override when torque
+   would drop a raised arm; the server enforces Rule A' and returns TORQUE_OFF_WOULD_DROP,
+   which is shown inline with the same text as stopped torque-off. */
 function clearFault(opts) {
-  // the fault this tap is about, read now: a later observation may already show another fault
-  const tapKey = mitFaultKey();
-  const confirmed = !!tapKey && !!mitRecovery && mitRecovery.el.isConnected && mitRecovery.key === tapKey;
-  if (mitRecovery) { mitRecovery.el.remove(); mitRecovery = null; }
+  const mitLost = !!(S.obs && S.obs.fault && /MIT_LOST/.test(S.obs.fault.message || ''));
   const apiOpts = opts && opts.directLease ? { quiet: true, directLease: true } : { quiet: true };
-  return api('/api/v1/safety/clear_fault', confirmed ? { mit_recovery: 'torque_off_all' } : undefined, apiOpts)
-    .then((d) => toast(t(d && d.is_torqued ? 'toast.reset_holding' : (confirmed ? 'mit.recovery.done' : 'toast.reset_ok')), 'ok'))
+  return api('/api/v1/safety/clear_fault', mitLost ? { mit_recovery: 'torque_off_all' } : undefined, apiOpts)
+    .then((d) => {
+      showTorqueOffInline('');
+      toast(t(d && d.is_torqued ? 'toast.reset_holding' : (mitLost ? 'mit.recovery.done' : 'toast.reset_ok')), 'ok');
+    })
     .catch((e) => {
       if (e && (e.cancelled || e.code === 'CONTROL_CANCELLED')) return;
-      if (e && e.code === 'MIT_RECOVERY_CONFIRM_REQUIRED') {
-        // arm only if the fault is still the one this tap was sent for (else drop the late reply)
-        if (tapKey && mitFaultKey() === tapKey) mitRecovery = { el: toast(t('mit.recovery.confirm'), 'err', e.code), key: tapKey };
+      if (e && e.code === 'TORQUE_OFF_WOULD_DROP') {
+        showTorqueOffInline(formatTorqueOffWouldDrop(e));
         return;
       }
       toast(e && e.message ? e.message : String(e), 'err', e && e.code);
@@ -9977,15 +10195,45 @@ async function controlledUnload() {
   } finally { unloading = false; }
 }
 
+let torqueOffInflight = false;
+function formatTorqueOffWouldDrop(e) {
+  const r = e && e.reply;
+  if (r && r.joint != null && typeof r.position === 'number' && typeof r.rest === 'number') {
+    return t('en.torque_off.would_drop', {
+      joint: r.joint,
+      pos: r.position.toFixed(3),
+      rest: r.rest.toFixed(3),
+    });
+  }
+  if (r && r.reason === 'no_resting_pose') return t('en.torque_off.no_rest_pose');
+  if (r && r.reason === 'stale_feedback') return t('en.torque_off.would_drop_stale');
+  return (e && e.message) || t('en.torque_off.would_drop_stale');
+}
+function showTorqueOffInline(msg) {
+  const tom = $('torque-off-msg');
+  if (!tom) return;
+  if (!msg) {
+    if (!tom.hidden) { tom.hidden = true; setText(tom, ''); }
+    return;
+  }
+  setText(tom, msg);
+  tom.hidden = false;
+}
+
 /* Torque off. A 409 ArmNotAtRestingPose means the arm is in the air: don't cut power,
-   stow it first. */
+   stow it first. A 409 TORQUE_OFF_WOULD_DROP while stopped has no override: show inline. */
 async function disableTorque({ fallback = true } = {}) {
   try {
     await api('/api/v1/torque', { enable: false }, { quiet: true });
-    toast(t('toast.parked_off'), 'ok');
+    showTorqueOffInline('');
+    toast(t(isStopped() ? 'toast.torque_off_stopped' : 'toast.parked_off'), 'ok');
     return true;
   } catch (e) {
     if (e && (e.cancelled || e.code === 'CONTROL_CANCELLED')) return false;
+    if (e && e.code === 'TORQUE_OFF_WOULD_DROP') {
+      showTorqueOffInline(formatTorqueOffWouldDrop(e));
+      return false;
+    }
     const notAtRest = e.status === 409 && (e.code === 'ARM_NOT_AT_RESTING_POSE' || e.code === 'ArmNotAtRestingPose' || /ArmNotAtRestingPose/i.test(e.message || ''));
     if (notAtRest && fallback) {
       toast(t('toast.in_air'), 'err');
@@ -10073,6 +10321,21 @@ async function disableTorque({ fallback = true } = {}) {
   });
   for (const ev of ['pointerup', 'pointerleave', 'pointercancel']) btn.addEventListener(ev, cancel);
   btn.addEventListener('contextmenu', (e) => e.preventDefault());
+})();
+// Torque off while stopped (E-stop / Fault): enabled at rest pose only; server refuses elsewhere
+// with TORQUE_OFF_WOULD_DROP and there is no override.
+(() => {
+  const btn = $('btn-torque-off');
+  btn.addEventListener('click', () => {
+    if (torqueOffInflight || !isLive() || !isStopped()) return;
+    torqueOffInflight = true;
+    btn.disabled = true;
+    showTorqueOffInline('');
+    disableTorque({ fallback: false }).finally(() => {
+      torqueOffInflight = false;
+      btn.disabled = !isLive() || !isStopped() || !S.obs?.is_torqued || leaseOther() != null;
+    });
+  });
 })();
 
 /* =================================================================
@@ -10345,6 +10608,12 @@ function setUi(ui) {
     const on = b.dataset.ui === ui;
     b.classList.toggle('on', on); b.setAttribute('aria-checked', String(on));
   }
+  // one mode entry in the top bar: it names the other mode
+  const mb = $('btn-ui'), next = ui === 'simple' ? 'expert' : 'simple';
+  mb.dataset.ui = next;
+  $('btn-ui-txt').dataset.i18n = 'ui.to_' + next; setText($('btn-ui-txt'), t('ui.to_' + next));
+  mb.dataset.i18nTitle = 'ui.to_' + next + '.t'; mb.title = t('ui.to_' + next + '.t');
+  if (typeof renderSVis === 'function') { placeSlot(); renderSVis(); renderGrasp(); }
   // simple mode always drives the TCP (cartesian); expert restores its own last choice
   // simple: safety lives inside the cockpit; expert: first card of the side column
   if (ui !== 'simple') visPopOpen(false);
@@ -10363,6 +10632,7 @@ function setUi(ui) {
   }
 }
 $('ui-seg').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) { S.uiUserSet = true; setUi(b.dataset.ui); } });
+$('btn-ui').addEventListener('click', () => { S.uiUserSet = true; setUi($('btn-ui').dataset.ui); });
 
 /* =================================================================
    Dataset recording
@@ -10883,7 +11153,7 @@ function drawOverlay() {
       g.closePath();
       g.fill();
       g.globalAlpha = alpha;
-    } else {
+    } else if (showOpt('box')) {
       g.strokeStyle = color;
       g.lineWidth = 2;
       g.strokeRect(bx, by, bw, bh);
@@ -10892,12 +11162,30 @@ function drawOverlay() {
       g.globalAlpha = alpha * 0.08;
       g.fillRect(bx, by, bw, bh);
       g.globalAlpha = alpha;
+    } else {
+      // simple mode, boxes off: a faint dashed box (the tap target)
+      g.save();
+      g.setLineDash([5, 4]); g.lineWidth = 1; g.strokeStyle = 'rgba(255,255,255,0.55)';
+      g.strokeRect(bx, by, bw, bh);
+      g.restore();
     }
+    // segment models: the mask outline (dashed and dimmer while another object is selected)
+    if (d.contour && showOpt('contour')) {
+      const other = !!GR.sel && !(GR.sel.label === d.label && graspIou(GR.sel.box, [d.x0, d.y0, d.x1, d.y1]) > 0.5);
+      g.save();
+      contourPath(g, rect, d.contour);
+      g.fillStyle = 'rgba(255,255,255,0.10)'; if (!other) g.fill();
+      g.setLineDash(other ? [6, 5] : []); g.lineJoin = 'round'; g.lineWidth = 2; g.strokeStyle = other ? 'rgba(255,255,255,0.6)' : 'rgba(255,255,255,0.9)';
+      g.stroke();
+      g.restore();
+    }
+    if (S.ui === 'simple' && !showOpt('label')) { g.restore(); continue; }
 
     // 2. 目标中心微型十字准星 (半径 4px，带白色中心点与半透明外圈)
     const cx = rect.x + d.cx * rect.w;
     const cy = rect.y + d.cy * rect.h;
 
+    if (S.ui !== 'simple') {
     // 半透明外圈
     g.strokeStyle = 'rgba(255, 255, 255, 0.6)';
     g.lineWidth = 1;
@@ -10917,6 +11205,7 @@ function drawOverlay() {
     g.beginPath();
     g.arc(cx, cy, 1.5, 0, Math.PI * 2);
     g.fill();
+    }
 
     // 3. 半透明圆角药丸 Label Badge (高度 18px，内嵌类别名与百分比置信度，贴顶 y < 22px 自动下翻至内部)
     const scorePct = Math.round(d.score * 100);
@@ -11475,6 +11764,8 @@ const graspCodeKey = (code) => (/^IK_/.test(code || '') ? 'IK' : code);
 function graspCodeText(code, message) {
   const k = 'grasp.code.' + graspCodeKey(code);
   const s = t(k);
+  // a refused request: armd's message says which value (e.g. the box ray misses the table)
+  if (s !== k && code === 'INVALID_COMMAND' && message) return s + ': ' + message;
   return s !== k ? s : (message || code || t('err.rejected'));
 }
 function graspRunningAction() {
@@ -11613,12 +11904,28 @@ function graspDraw(g, rect, fresh) {
   if (s) {
     const stale = performance.now() - s.seenAt > 800;
     const x = rect.x + s.box[0] * rect.w, y = rect.y + s.box[1] * rect.h, w = (s.box[2] - s.box[0]) * rect.w, h = (s.box[3] - s.box[1]) * rect.h;
+    // the outline when one was read (selContour); then the box is only a faint dashed frame
+    const sc = showOpt('contour') ? (selContour(s) || (() => {
+      const d = (S.detections || []).find((q) => q.contour && q.label === s.label && graspIou(s.box, [q.x0, q.y0, q.x1, q.y1]) > 0.5);
+      return d ? { pts: d.contour, shift: null } : null;
+    })()) : null;
     g.save();
     g.setLineDash(stale ? [6, 5] : []);
-    g.lineWidth = 5; g.strokeStyle = 'rgba(255,255,255,0.95)'; g.strokeRect(x - 2, y - 2, w + 4, h + 4);
-    g.lineWidth = 3; g.strokeStyle = '#8CC020'; g.strokeRect(x - 2, y - 2, w + 4, h + 4);
+    if (sc) {
+      contourPath(g, rect, sc.pts, sc.shift);
+      g.fillStyle = 'rgba(140,192,32,0.16)'; g.fill();
+      g.lineJoin = 'round';
+      g.lineWidth = 5; g.strokeStyle = 'rgba(255,255,255,0.9)'; g.stroke();
+      g.lineWidth = 3; g.strokeStyle = '#8CC020'; g.stroke();
+      g.setLineDash([5, 4]); g.lineWidth = 1; g.strokeStyle = 'rgba(255,255,255,0.6)'; g.strokeRect(x, y, w, h);
+    } else {
+      g.lineWidth = 5; g.strokeStyle = 'rgba(255,255,255,0.95)'; g.strokeRect(x - 2, y - 2, w + 4, h + 4);
+      g.lineWidth = 3; g.strokeStyle = '#8CC020'; g.strokeRect(x - 2, y - 2, w + 4, h + 4);
+    }
     g.restore();
+    graspContourPoll();
   }
+  placeObjCard(rect);
   // grip point marker while selecting, grasping or picking it
   const gp = GR.camDown !== true && GR.setup && GR.setup.grip_pixel_norm;
   if (gp && (s || GR.pickGrip || graspRunningAction() || !$('gset').hidden)) {
@@ -11642,7 +11949,8 @@ async function graspGo() {
   GR.sending = true; renderGrasp();
   try {
     const b = s.box.map((v) => Math.round(Math.min(1, Math.max(0, v)) * 10000) / 10000);
-    const ack = await graspRPC('/api/v1/action/grasp', { label: s.label, box_norm: b, ts_ms: Date.now(), tag: 'cockpit' });
+    const task = graspTaskCur();
+    const ack = await graspRPC('/api/v1/action/grasp', { label: s.label, box_norm: b, ts_ms: Date.now(), tag: 'cockpit', ...(task ? { task } : {}) });
     GR.id = ack.action_id ?? null;
     if (GR.setup == null) graspLoadSetup(true);
   } catch (_) {
@@ -11658,13 +11966,22 @@ function renderGrasp() {
   bar.hidden = !show || GR.pickGrip;
   $('grasp-pick').hidden = !GR.pickGrip;
   const gs = $('btn-gset');
-  if (gs) gs.hidden = S.dof !== 7;
-  if (!show) return;
+  if (gs) gs.hidden = !(GR.supported || (S.caps && S.caps.grasp));
+  if (!show) { placeObjCard(null); return; }
   $('grasp-info').hidden = !GR.sel;
   if (GR.sel) {
     setText($('grasp-label'), GR.sel.label);
     setText($('grasp-score'), Math.round(GR.sel.score * 100) + '%');
+    setText($('grasp-src'), VM.kind === 'segment' && selContour(GR.sel) ? t('oc.src.seg') : VM.kind === 'segment' ? '' : t('oc.src.box'));
   }
+  // simple: measuring note under the measure button, the grasp task row (Settings opens the grasp settings)
+  const measOk = !!(S.caps && S.caps.measure_multiview);
+  $('grasp-sub').hidden = !!run || !measOk;
+  setText($('meas-sub'), t('oc.meas.sub', { cm: (MS_REQ.baseline_m * 50).toFixed(0) }));
+  $('grasp-task').hidden = !!run || !(GR.supported || (S.caps && S.caps.grasp));
+  const tk = graspTaskCur();
+  setText($('grasp-task-name'), tk || t('oc.task.def'));
+  bar.querySelector('.grasp-acts').classList.toggle('one', !!run || !measOk);
   $('grasp-prog').hidden = !run;
   $('grasp-go').hidden = !!run;
   $('grasp-cancel').hidden = !!run;
@@ -11718,7 +12035,9 @@ async function msCopy() {
 function msRender() {
   const c = $('meas-card');
   if (!c) return;
+  const wasHidden = c.hidden;
   c.hidden = !MS.state;
+  if (wasHidden && !c.hidden && typeof svSheetPlace === 'function') requestAnimationFrame(svSheetPlace);
   if (!MS.state) return;
   c.textContent = '';
   const head = cwEl('h4', '', t('ms.title'));
@@ -11836,6 +12155,7 @@ const mm = (m) => (Number.isFinite(m) ? Math.round(m * 1000) : null);
 const tilt1 = (v) => (Number.isFinite(v) ? (Math.round(v * 10) / 10).toFixed(1) : null);
 function gsetRender(status) {
   const s = GR.setup;
+  if (typeof gsetTasksRender === 'function') gsetTasksRender();
   setText($('gset-table'), s ? (mm(s.table_z_m) + ' mm') : '--');
   // camera-down acquisition centres on the image centre: the grip pixel is not used, so it is not shown
   const cd = !!s && GR.camDown === true;
@@ -11864,6 +12184,7 @@ async function graspLoadSetup(quiet) {
     GR.supported = !!d.supported; GR.setup = d.setup || null; GR.path = d.path || null;
     GR.camDown = typeof d.camera_down === 'boolean' ? d.camera_down : null;
     if (typeof d.revision === 'number') GR.rev = d.revision;
+    if (typeof renderSVis === 'function') { renderSVis(); renderGrasp(); }
     if (!quiet) gsetRender(!GR.supported ? t('gset.na') : GR.path ? t('gset.path', { p: GR.path }) : '--');
   } catch (e) {
     if (!quiet) gsetRender(t('gset.err', { e: e.message }));
@@ -11915,6 +12236,303 @@ $('gset-save').addEventListener('click', () => {
 });
 i18nHooks.push(() => { renderGrasp(); if (!$('gset').hidden) gsetRender(); });
 graspLoadSetup(true);
+
+/* ---- simple mode: recognition panel (#s-vis), detection kind switch, display options, object card, grasp tasks ----
+   The kind switch (POST /api/v1/vision/detector) moves the detector between the two default models of armd; any other
+   model (obb, a variant) shows as text and is changed in expert mode or by a grasp task. Grasp tasks whose required
+   detection kind or detector model differs from the loaded one are not listed in simple mode (no switching from here). */
+const SV = { kindBusy: false, scrollBack: null };
+const SHOW = (() => { try { const v = JSON.parse(store('rebot.sv.show') || 'null'); if (v && typeof v === 'object') return { contour: v.contour !== false, box: !!v.box, label: v.label !== false }; } catch (_) {} return { contour: true, box: false, label: true }; })();
+// expert mode draws everything as before
+const showOpt = (k) => (S.ui === 'simple' ? SHOW[k] : true);
+const svArmBusy = () => !!(graspRunningAction() || ['starting', 'running'].includes(MS.state) || (S.obs && S.obs.action && S.obs.action.kind === 'measure_multiview' && S.obs.action.state === 'running'));
+function svChipText() {
+  if (!DET.avail) return t('det.na');
+  if (!DET.enabled) return t('det.off');
+  const age = S.detLastReceivedAt ? performance.now() - S.detLastReceivedAt : Infinity;
+  if (!isFinite(age) || age > 2000) return t('sv.chip.wait');
+  const n = (S.detections || []).filter((d) => !d.aruco).length;
+  return n ? t('sv.chip.n', { n }) : t('sv.chip.0');
+}
+function svOn() { return VM.state === 'ok' ? vmSel().yolo : DET.enabled; }
+function simpleVisSet(on) {
+  if (!DET.avail) return;
+  if (VM.state === 'ok') return setVisionMode(vmModeOf(on, vmSel().aruco));
+  if (DET.enabled !== on) return toggleDet();
+}
+function renderSVis() {
+  const p = $('s-vis');
+  if (!p) return;
+  p.hidden = DET.avail === null;
+  const ok = VM.state === 'ok', on = !!DET.avail && svOn();
+  const sw = $('sv-on');
+  sw.setAttribute('aria-checked', String(on));
+  sw.disabled = !DET.avail || VM.busy || DET.busy || DET.snap || (ok && !VM.yolo && !on);
+  // detection kind: the provider's model.kind; the two defaults switch here, any other kind is shown as text
+  const kind = VM.kind, std = kind === 'detect' || kind === 'segment';
+  const capOff = S.caps && S.caps.vision && S.caps.vision.detector_switch === false;
+  $('sv-kind-sec').hidden = !ok || capOff || (!kind && !VM.models);
+  const armBusy = svArmBusy();
+  for (const b of $('sv-kind').querySelectorAll('button[data-kind]')) {
+    b.setAttribute('aria-checked', String(b.dataset.kind === kind));
+    b.disabled = !VM.models || !std || SV.kindBusy || armBusy;
+  }
+  const note = $('sv-kind-note');
+  const other = kind && !std;
+  setText(note, SV.kindBusy ? t('sv.kind.busy') : !VM.models ? t('sv.kind.na')
+    : other ? t('sv.kind.other', { name: VM.modelName || '--', kind }) : armBusy ? t('sv.kind.armbusy') : t('sv.kind.note'));
+  note.classList.toggle('warn', !!(other || armBusy || !VM.models));
+  for (const b of $('sv-show').querySelectorAll('button[data-show]')) {
+    b.setAttribute('aria-pressed', String(!!SHOW[b.dataset.show]));
+    if (b.dataset.show === 'contour') b.hidden = kind !== 'segment';
+  }
+  const sel = ok ? vmSel() : { aruco: false };
+  $('sv-other').hidden = !ok;
+  $('sv-aruco').setAttribute('aria-checked', String(!!sel.aruco));
+  $('sv-aruco').disabled = VM.busy || DET.snap;
+  const dBlock = ok ? depthBlock() : t('vm.tip.na');
+  $('sv-depth').setAttribute('aria-checked', String(!!DEPTH.on));
+  $('sv-depth').disabled = !DEPTH.on && !!dBlock;
+  $('sv-depth-row').title = dBlock || t('depth.tip');
+  $('sv-gset').closest('.sv-foot').hidden = !(GR.supported || (S.caps && S.caps.grasp));
+}
+function renderSVisMeta() {
+  const m = $('sv-meta');
+  if (!m || !document.body.classList.contains('vis-open')) return;
+  const parts = [];
+  if (V.playing && V.mode !== 'mjpeg') parts.push(t('sv.meta.video', { fps: V.fps == null ? '--' : V.fps, ms: V.lat == null ? '--' : Math.round(V.lat) }));
+  parts.push(DET.enabled ? t('sv.meta.det', { fps: DET.fps ?? DET.activeFps ?? '--' }) : t('sv.meta.off'));
+  setText(m, parts.join(' · '));
+}
+async function svKindSet(kind, retried = false) {
+  if (SV.kindBusy || VM.kind === kind || !['detect', 'segment'].includes(kind)) return;
+  if (svArmBusy()) { toast(t('sv.kind.fail'), 'warn', 'VISION_BUSY'); return; }
+  SV.kindBusy = true; renderSVis();
+  let unlock = false;
+  try {
+    const ctl = new AbortController();
+    const tm = setTimeout(() => ctl.abort(), 9000); // armd waits up to 5 s for the provider's swap
+    let res, data = null;
+    try {
+      res = await fetch('/api/v1/vision/detector', { method: 'POST', signal: ctl.signal, cache: 'no-store', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ kind }) });
+      try { data = await res.json(); } catch (_) {}
+    } finally { clearTimeout(tm); }
+    const code = (data && data.code) || '';
+    if (res.status === 403 && code === 'OPERATOR_REQUIRED' && !retried) unlock = true;
+    else if (!res.ok) {
+      const mb = /needs ([\d.]+) MB, limit ([\d.]+) MB/.exec((data && data.message) || '');
+      const known = { DETECTION_UNAVAILABLE: 'VISION_DOWN' }[code] || code;
+      const extra = EC_KEYS[known] ? (mb ? ` (${mb[1]} / ${mb[2]} MB)` : '') : code === 'UNSUPPORTED' ? ': ' + t('sv.kind.na') : (data && data.message ? ': ' + data.message : '');
+      toast(t('sv.kind.fail') + extra, 'err', known || String(res.status), code === 'OPERATOR_REQUIRED' ? { path: '/api/v1/vision/detector' } : null);
+    } else toast(t('sv.kind.ok', { k: t('sv.kind.' + kind) }), 'ok');
+  } catch (e) {
+    toast(t('sv.kind.fail'), 'err', e && e.name === 'AbortError' ? 'VISION_TIMEOUT' : 'VISION_DOWN');
+  } finally {
+    SV.kindBusy = false;
+    await vmRefresh();
+    renderSVis(); gsetTasksRender();
+  }
+  if (unlock && await opRequire('/api/v1/vision/detector')) return svKindSet(kind, true);
+}
+function initSVis() {
+  $('sv-on').addEventListener('click', () => simpleVisSet(!svOn()));
+  $('sv-x').addEventListener('click', () => visPopOpen(false));
+  $('sv-kind').addEventListener('click', (e) => { const b = e.target.closest('button[data-kind]'); if (b && !b.disabled) svKindSet(b.dataset.kind); });
+  $('sv-show').addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-show]');
+    if (!b) return;
+    SHOW[b.dataset.show] = !SHOW[b.dataset.show];
+    store('rebot.sv.show', JSON.stringify(SHOW));
+    renderSVis();
+  });
+  $('sv-aruco').addEventListener('click', () => { if (VM.state === 'ok') { const c = vmSel(); setVisionMode(vmModeOf(c.yolo, !c.aruco)); } });
+  $('sv-depth').addEventListener('click', () => vmToggle('depth'));
+  $('sv-gset').addEventListener('click', () => { visPopOpen(false); gsetOpen(true); });
+  $('grasp-x').addEventListener('click', () => { GR.sel = null; renderGrasp(); });
+  $('grasp-task').addEventListener('click', () => gsetOpen(true));
+  i18nHooks.push(renderSVis);
+  renderSVis();
+}
+
+/* Outline of the selected object. The detection WebSocket (rebot-vision's /results stream) carries boxes only; the
+   HTTP result (GET /api/v1/detection/latest) carries `contour` for segment models. With the segment kind the page
+   reads it for the selected object only, at most every 500 ms, and draws it shifted with the tracked box. */
+const CT = { busy: false, at: 0 };
+async function graspContourPoll() {
+  const s = GR.sel;
+  if (!s || CT.busy || !graspDetOn() || VM.kind !== 'segment' || performance.now() - CT.at < 500) return;
+  if ((S.detections || []).some((d) => d.contour)) return; // the stream carries outlines itself
+  CT.busy = true; CT.at = performance.now();
+  try {
+    const dets = parseDetections(await detLatest(''), videoSrcRes()).filter((d) => d.contour && d.label === s.label);
+    let best = null, bi = 0.3;
+    for (const d of dets) { const i = graspIou([d.x0, d.y0, d.x1, d.y1], s.box); if (i > bi) { bi = i; best = d; } }
+    if (GR.sel === s) {
+      if (best) { s.contour = best.contour; s.contourBox = [best.x0, best.y0, best.x1, best.y1]; s.contourAt = performance.now(); }
+      else if (performance.now() - (s.contourAt || 0) > 2000) s.contour = null;
+    }
+  } catch (_) {} finally { CT.busy = false; }
+}
+// outline in canvas pixels; shifted by how far the tracked box moved since the outline was read
+function contourPath(g, rect, pts, shift) {
+  const [dx, dy] = shift || [0, 0];
+  g.beginPath();
+  pts.forEach(([u, v], i) => { const x = rect.x + (u + dx) * rect.w, y = rect.y + (v + dy) * rect.h; if (i) g.lineTo(x, y); else g.moveTo(x, y); });
+  g.closePath();
+}
+function selContour(s) {
+  if (!s || !s.contour || performance.now() - (s.contourAt || 0) > 3000) return null;
+  const c = (b) => [(b[0] + b[2]) / 2, (b[1] + b[3]) / 2];
+  const a = c(s.contourBox), b = c(s.box);
+  return { pts: s.contour, shift: [b[0] - a[0], b[1] - a[1]] };
+}
+
+/* Object card placement (simple, landscape): beside the selected object (right, else left, below, above), clear of the
+   safety capsule, the status island, the presets and the thumb controls; else the band between the thumb controls.
+   The size measurement card opens under (or over) it. */
+const OC_MQ = window.matchMedia('(orientation: landscape) and (max-height: 1200px)');
+const OC = { x: null, y: null };
+function ocObstacles() {
+  const ids = ['safety', 'view-switch', 'pose-card', 'pad-sxy', 'btn-pose', 'pad-srot', 'pad-sz', 'pad-sgrip', 's-grip-readout', 'btn-vis', 's-objhint'];
+  const els = ids.map((id) => $(id)).concat([document.querySelector('.topbar'), document.querySelector('.presets')]);
+  return els.map((el) => { if (!el) return null; const r = el.getBoundingClientRect(); return r.width && r.height ? r : null; }).filter(Boolean);
+}
+function placeObjCard(rect) {
+  const bar = $('grasp-bar');
+  const on = S.ui === 'simple' && OC_MQ.matches && !bar.hidden;
+  // layout reads are not free on a tablet: at most every 120 ms while the card is up (it follows a slow object)
+  const now = performance.now();
+  if (on && bar.classList.contains('placed') && now - (OC.at || 0) < 120) return;
+  OC.at = now;
+  if (!on) {
+    if (bar.classList.contains('placed')) { bar.classList.remove('placed', 'flip', 'below', 'above'); OC.x = OC.y = null; }
+    placeMeasCard(null);
+    return;
+  }
+  const W = innerWidth, H = innerHeight, cw = bar.offsetWidth, ch = bar.offsetHeight, m = 8, gap = 14;
+  const obs = ocObstacles();
+  const free = (x, y) => x >= m && y >= m && x + cw <= W - m && y + ch <= H - m
+    && !obs.some((r) => !(x + cw <= r.left || r.right <= x || y + ch <= r.top || r.bottom <= y));
+  const s = GR.sel, vb = $('video-box').getBoundingClientRect();
+  const cands = [];
+  if (s && rect) {
+    const l = vb.left + rect.x + s.box[0] * rect.w, tp = vb.top + rect.y + s.box[1] * rect.h;
+    const r = vb.left + rect.x + s.box[2] * rect.w, b = vb.top + rect.y + s.box[3] * rect.h, cx = (l + r) / 2;
+    const yS = Math.min(Math.max(tp + 10, 56), H - m - ch);
+    cands.push(['', r + gap, yS], ['flip', l - gap - cw, yS], ['below', cx - cw / 2, b + 12], ['above', cx - cw / 2, tp - 12 - ch]);
+    // nudge sideways placements up or down to clear an obstacle
+    for (const dy of [-80, 80, -160, 160]) cands.push(['', r + gap, yS + dy], ['flip', l - gap - cw, yS + dy]);
+  }
+  const bl = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--band-l')) || 176;
+  const br = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--band-r')) || 176;
+  const hudH = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--hud-h')) || 32;
+  const fallback = ['below', (bl + W - br) / 2 - cw / 2, H - 16 - hudH - 8 - ch];
+  const pick = cands.find(([, x, y]) => free(x, y)) || fallback;
+  let [cls, x, y] = pick;
+  x = Math.round(Math.min(Math.max(x, m), W - m - cw)); y = Math.round(Math.min(Math.max(y, m), H - m - ch));
+  if (OC.x == null || Math.abs(OC.x - x) > 3 || Math.abs(OC.y - y) > 3 || OC.cls !== cls) {
+    OC.x = x; OC.y = y; OC.cls = cls;
+    bar.style.setProperty('--oc-x', x + 'px'); bar.style.setProperty('--oc-y', y + 'px');
+    bar.classList.add('placed');
+    bar.classList.toggle('flip', cls === 'flip'); bar.classList.toggle('below', cls === 'below'); bar.classList.toggle('above', cls === 'above');
+  }
+  if (s && rect && !cls) {
+    const cy = vb.top + rect.y + (s.box[1] + s.box[3]) / 2 * rect.h;
+    bar.style.setProperty('--oc-ay', Math.round(Math.min(Math.max(cy - y - 6, 14), ch - 26)) + 'px');
+  } else if (s && rect && cls === 'flip') {
+    const cy = vb.top + rect.y + (s.box[1] + s.box[3]) / 2 * rect.h;
+    bar.style.setProperty('--oc-ay', Math.round(Math.min(Math.max(cy - y - 6, 14), ch - 26)) + 'px');
+  }
+  placeMeasCard({ x, y, w: cw, h: ch });
+}
+/* stacked layouts: the slot under the video holds the hint, the object card and the measurement card (page flow, the video
+   stays clear); the recognition panel is a bottom sheet whose top edge stays below the safety card (svSheetPlace) */
+function placeSlot() {
+  const slot = S.ui === 'simple' && !OC_MQ.matches;
+  document.body.classList.toggle('oc-slot', slot);
+  const host = slot ? $('s-slot') : $('video-box');
+  for (const id of ['s-objhint', 'grasp-bar', 'meas-card']) { const el = $(id); if (el.parentElement !== host) host.appendChild(el); }
+  svSheetPlace();
+}
+function svSheetPlace() {
+  const body = document.body;
+  if (!body.classList.contains('oc-slot') || (!body.classList.contains('vis-open') && $('meas-card').hidden)) return;
+  const need = 260; // room for the panel's switch, kind and display rows
+  let sr = $('safety').getBoundingClientRect();
+  if (sr.height && sr.bottom > innerHeight - need) {
+    if (SV.scrollBack == null) SV.scrollBack = window.scrollY; // where the page was before the sheet scrolled it
+    window.scrollBy(0, sr.bottom - (innerHeight - need)); sr = $('safety').getBoundingClientRect();
+  }
+  document.documentElement.style.setProperty('--sv-top', Math.round(Math.max(56, sr.height ? sr.bottom + 8 : innerHeight / 2)) + 'px');
+}
+addEventListener('scroll', () => requestAnimationFrame(svSheetPlace), { passive: true });
+OC_MQ.addEventListener('change', placeSlot);
+addEventListener('resize', () => { if (document.body.classList.contains('oc-slot')) placeSlot(); });
+function placeMeasCard(card) {
+  const mc = $('meas-card');
+  if (!mc) return;
+  if (!card || mc.hidden || document.body.classList.contains('oc-slot')) { mc.classList.remove('placed'); return; }
+  // under the object card, else over it, else beside it; clear of the thumb controls and the safety capsule
+  const W = innerWidth, H = innerHeight, m = 8;
+  mc.style.setProperty('--ms-w', card.w + 'px');
+  mc.style.setProperty('--ms-h', (H - 2 * m) + 'px');
+  mc.classList.add('placed');
+  const w = mc.offsetWidth, h = Math.min(mc.scrollHeight, H - 2 * m);
+  const obs = ocObstacles();
+  const free = (x, y) => x >= m && y >= m && x + w <= W - m && y + h <= H - m
+    && !obs.some((r) => !(x + w <= r.left || r.right <= x || y + h <= r.top || r.bottom <= y));
+  const cands = [[card.x, card.y + card.h + 8], [card.x, card.y - 8 - h], [card.x - 8 - w, card.y], [card.x + card.w + 8, card.y],
+    [card.x - 8 - w, card.y + card.h - h], [card.x + card.w + 8, card.y + card.h - h]];
+  const [x, y] = cands.find(([cx, cy]) => free(cx, cy)) || cands[0];
+  mc.style.setProperty('--ms-x', Math.round(Math.min(Math.max(x, m), W - m - w)) + 'px');
+  mc.style.setProperty('--ms-y', Math.round(Math.min(Math.max(y, m), H - m - h)) + 'px');
+  mc.style.setProperty('--ms-h', Math.round(h) + 'px');
+}
+
+/* Grasp tasks (GET /api/v1/grasp/setup setup.tasks): "Default" (no task) plus every stored task. Simple mode lists only the
+   tasks the loaded detector serves without a switch (requires.model_kind = the loaded kind, models.detector = the loaded
+   model or unset). The choice stays in this browser (rebot.grasp.task) and goes into the grasp request as `task`. */
+GR.task = store('rebot.grasp.task') || null;
+function graspTasks() { return (GR.setup && GR.setup.tasks && typeof GR.setup.tasks === 'object') ? GR.setup.tasks : {}; }
+function taskUsable(tk) {
+  if (S.ui !== 'simple' || !tk) return true;
+  const kind = tk.requires && tk.requires.model_kind;
+  if (kind && kind !== VM.kind) return false;
+  const det = tk.models && tk.models.detector;
+  const resident = VM.models && VM.models.resident ? VM.models.resident.detector : null;
+  return det === undefined || det === resident;
+}
+function graspTaskCur() {
+  const tasks = graspTasks();
+  return GR.task && tasks[GR.task] && taskUsable(tasks[GR.task]) ? GR.task : null;
+}
+function gsetTasksRender() {
+  const box = $('gset-tasks');
+  if (!box) return;
+  const tasks = graspTasks(), names = Object.keys(tasks);
+  box.hidden = !GR.setup;
+  const list = $('gset-task-list');
+  list.textContent = '';
+  const cur = graspTaskCur();
+  const add = (name, title, desc) => {
+    const b = document.createElement('button');
+    b.type = 'button'; b.className = 'gset-task'; b.setAttribute('role', 'radio'); b.setAttribute('aria-checked', String(cur === name));
+    const d = document.createElement('div');
+    d.append(cwEl('b', '', title), cwEl('small', '', desc));
+    b.appendChild(d);
+    b.addEventListener('click', () => { GR.task = name; store('rebot.grasp.task', name || ''); gsetTasksRender(); renderGrasp(); });
+    list.appendChild(b);
+  };
+  add(null, t('oc.task.def'), t('gset.task.def.d'));
+  let hidden = 0;
+  for (const n of names) {
+    if (!taskUsable(tasks[n])) { hidden++; continue; }
+    add(n, n, tasks[n].description || '');
+  }
+  const note = $('gset-tasks-note');
+  note.hidden = !hidden;
+  setText(note, t('gset.tasks.hidden', { n: hidden }));
+}
 
 /* =================================================================
    Collision guard (capability collision_guard, observation.collision, WS /api/v1/safety/collision):
@@ -14458,7 +15076,7 @@ function frame(ts) {
     const [cls, txt] = leaseOp && leaseOp.kind === 'release' ? ['is-checking', t('lease.releasing')]
       : leaseOp && leaseOp.kind === 'refresh' ? ['is-checking', t('lease.refreshing')]
       : !fresh ? ['is-checking', t('lease.checking')]
-      : S.leaseGeneration != null ? ['is-own', t('lease.own')]
+      : S.leaseGeneration != null ? ['is-own', t('lease.own') + (S.ui === 'simple' ? ' · ' + t(torqued ? 'lease.tq.on' : 'lease.tq.off') : '')]
       : holder != null ? ['is-other', t('lease.other', { who: leaseHolderDetail(holder) })]
       : S.leaseReleased != null ? ['is-released', t('lease.released.tag')]
       : ['is-readonly', t('lease.readonly')];
@@ -14481,6 +15099,11 @@ function frame(ts) {
   const holdingIdle = live && !stopped && !en && S.state === 'Idle' && torqued;
   $('btn-park-off').hidden = !holdingIdle || holder != null;
   $('btn-park-off').disabled = !fresh || !!leaseOp || holder != null;
+  const stoppedTorqueOff = live && stopped && torqued && holder == null;
+  const tob = $('btn-torque-off');
+  tob.hidden = !stoppedTorqueOff;
+  tob.disabled = !stoppedTorqueOff || !fresh || !!leaseOp || torqueOffInflight;
+  if (!stopped || !torqued) showTorqueOffInline('');
   const opClear = live && stopped && opLocked() && clearNeedsOperator();
   $('op-inline').hidden = !opClear;
   if (opClear) setText($('op-inline'), t(S.state === 'EStop' ? 'op.inline' : 'op.inline_fault'));
@@ -14546,6 +15169,17 @@ function frame(ts) {
   const detActive = !!(dets && dets.length > 0 && detAge <= 400);
   $('det-chip').hidden = !detActive;
   if (detActive) setText($('det-chip'), t('det.n', { n: dets.length }));
+  // simple: the recognition chip counts the objects; a hint above it until one is selected
+  if (simple) {
+    const vis = $('btn-vis');
+    if (!vis.hidden) setText(vis, svChipText());
+    const hint = $('s-objhint');
+    const showHint = !!(DET.avail && DET.enabled && !GR.sel && !graspRunningAction() && !GR.pickGrip && !MS.state && !document.body.classList.contains('v3-open')
+      && !document.body.classList.contains('vis-open') && S.detLastReceivedAt && performance.now() - S.detLastReceivedAt < 2000);
+    hint.hidden = !showHint;
+    if (showHint) setText(hint, (dets || []).some((d) => !d.aruco) && detAge <= 2000 ? t('sv.hint') : t('sv.hint0'));
+    renderSVisMeta();
+  } else $('s-objhint').hidden = true;
 
   // telemetry
   const vel = S.obs ? S.obs.velocities || [] : [];
@@ -16010,6 +16644,7 @@ connectDetectionWS();
 initDetToggle();
 initVisionMode();
 initDepth();
+initSVis();
 initCalib();
 initCwiz();
 videoStart();
@@ -16068,6 +16703,28 @@ applyI18n();
     root.style.setProperty('--pop-l', Math.round((lo + hi) / 2) + 'px');
     root.style.setProperty('--pop-w', Math.max(160, Math.round(hi - lo)) + 'px');
     root.style.setProperty('--pop-b', Math.round(H - rowTop + 8) + 'px');
+    // recognition panel (#s-vis): above its chip, inside the band between the thumb controls when that is wide enough
+    // (else the popover span above the joystick row), its top below whatever sits above it in that span
+    // Candidates in order: the band (one column, 400 px), the popover span (one column), the popover span in three
+    // columns (short screens); the first whose height fits the panel wins, else the tallest.
+    const chip = shown(document.getElementById('btn-vis'));
+    const bandW = W - bandL - bandR, span = hi - lo;
+    const cands = [];
+    if (bandW >= 300) cands.push({ l: (bandL + W - bandR) / 2, w: Math.min(400, bandW), b: H - (chip ? chip.top : H - 16) + 8, need: 400 });
+    if (span >= 300) cands.push({ l: (lo + hi) / 2, w: Math.min(400, span), b: H - rowTop + 8, need: 400 });
+    if (span >= 520) cands.push({ l: (lo + hi) / 2, w: Math.min(680, span), b: H - rowTop + 8, need: 200, wide: true });
+    if (!cands.length) cands.push({ l: (lo + hi) / 2, w: Math.max(160, span), b: H - rowTop + 8, need: 0 });
+    const blockers = [document.querySelector('.safety'), body.classList.contains('pc-nofit') ? null : pc, document.getElementById('view-switch'), tb, document.querySelector('.presets')].map(shown).filter(Boolean);
+    for (const c of cands) {
+      const topLim = blockers.filter((r) => r.right > c.l - c.w / 2 && r.left < c.l + c.w / 2).reduce((m, r) => Math.max(m, r.bottom), 8) + 8;
+      c.maxh = H - c.b - topLim;
+    }
+    const sv = cands.find((c) => c.maxh >= c.need) || cands.reduce((a, c) => (c.maxh > a.maxh ? c : a));
+    root.style.setProperty('--sv-l', Math.round(sv.l) + 'px');
+    root.style.setProperty('--sv-w', Math.round(sv.w) + 'px');
+    root.style.setProperty('--sv-b', Math.round(sv.b) + 'px');
+    root.style.setProperty('--sv-maxh', Math.max(120, Math.round(sv.maxh)) + 'px');
+    document.getElementById('s-vis')?.classList.toggle('wide', !!sv.wide);
   }
   function place() {
     if (busy) return; busy = true;

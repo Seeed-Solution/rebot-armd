@@ -322,6 +322,10 @@ pub struct TrackingRuntime {
     /// toward this hold pose within the active limits, one tick at a time, until it
     /// is at rest (also while the rejection fault is latched).
     pub fallback_ramp: Option<FallbackRamp>,
+    /// True after a tracking rejection fallback finished braking (or stopped infeasible at the
+    /// last confirmed issued pose) while the rejection fault stays latched on an `Armed` arm.
+    /// Cleared on E-stop, FailedHold, clear_fault, or any new motion.
+    pub holding_fallback_pose: bool,
     /// Reference rest sample: a fresh measured arm position of an earlier control tick, with
     /// the receive time of its newest joint sample, kept while the arm stays within
     /// tolerance of it (`SupervisorInner::note_tracking_position_sample`): stationarity
@@ -434,6 +438,7 @@ impl TrackingRuntime {
             self.recovery_suspended = false;
             self.recovery_joints.clear();
             self.fallback_ramp = None;
+            self.holding_fallback_pose = false;
         } else {
             self.invalidate();
         }
@@ -592,6 +597,7 @@ impl TrackingRuntime {
         retired.ws_min_depths = self.ws_min_depths.take();
         retired.ws_keepout_min_depths = self.ws_keepout_min_depths.take();
         retired.fallback_ramp = self.fallback_ramp.take();
+        self.holding_fallback_pose = false;
         retired
     }
 
@@ -623,6 +629,7 @@ impl TrackingRuntime {
         self.ws_min_depths = None;
         self.ws_keepout_min_depths = None;
         self.fallback_ramp = None;
+        self.holding_fallback_pose = false;
     }
 
     /// Nominal history entry for an output issued this tick against nominal `q_d`: `q_d`
@@ -683,12 +690,21 @@ impl crate::supervisor::SupervisorInner {
     /// Receive times of the oldest and newest joint feedback sample, when every joint has one
     /// (`ArmDriver::feedback_instants`: the driver's own receive instants, not now - age).
     fn feedback_instant_range(&self) -> Option<(std::time::Instant, std::time::Instant)> {
-        let instants = self.driver.as_ref()?.lock().ok()?.feedback_instants();
+        self.driver.as_ref()?;
+        // R1: Read the owner-held feedback instants populated by `poll_hardware_rx` /
+        // `step_enable_validate` with zero driver lock and zero heap allocation.
+        let instants = self.core.feedback().instants();
         if instants.len() != self.config.dof {
             return None;
         }
-        let instants: Vec<std::time::Instant> = instants.into_iter().collect::<Option<Vec<_>>>()?;
-        Some((*instants.iter().min()?, *instants.iter().max()?))
+        let mut min_t: Option<std::time::Instant> = None;
+        let mut max_t: Option<std::time::Instant> = None;
+        for opt in instants {
+            let t = (*opt)?;
+            min_t = Some(min_t.map_or(t, |m| m.min(t)));
+            max_t = Some(max_t.map_or(t, |m| m.max(t)));
+        }
+        Some((min_t?, max_t?))
     }
 
     /// Positive evidence that the arm joints are at rest, from fresh feedback: measured
@@ -758,8 +774,19 @@ impl crate::supervisor::SupervisorInner {
                 && arm.iter().all(|&j| (self.measured_positions[j] - q_ref[j]).abs() <= STATIONARY_POSITION_TOL_RAD)
         });
         if !keep {
-            self.tracking.position_sample =
-                range.map(|(oldest, newest)| (oldest, newest, self.measured_positions.clone()));
+            match (range, self.tracking.position_sample.as_mut()) {
+                (Some((oldest, newest)), Some((o, n, q_ref))) => {
+                    *o = oldest;
+                    *n = newest;
+                    crate::rt_core::scratch::copy_into(q_ref, &self.measured_positions);
+                }
+                (Some((oldest, newest)), None) => {
+                    self.tracking.position_sample = Some((oldest, newest, self.measured_positions.clone()));
+                }
+                (None, _) => {
+                    self.tracking.position_sample = None;
+                }
+            }
         }
     }
 

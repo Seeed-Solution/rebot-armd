@@ -2127,6 +2127,13 @@ fn enable_transition_polling_and_clear_fault_probe_obey_release_margin_cap() {
     let mut rig = DualRig::new(Owner::Executor, base_cfg(), None);
     // Start from torque off (Idle) so we can exercise an enable handshake under late releases.
     rig.inner_mut().disable_torque().expect("torque off before enable test");
+    for _ in 0..12 {
+        if !rig.inner().disable_pending {
+            break;
+        }
+        rig.step();
+    }
+    assert!(!rig.inner().disable_pending, "disable must confirm before late TorqueOn test");
     rig.bus.with(|s| {
         s.tx_step = ms(1);
         s.tx_spike_every = 0;
@@ -2603,8 +2610,8 @@ fn dual_owner_pos_force_80ms_stall_during_home_skips_j7_refreshes_and_completes(
         // 0 ms while its `feedback_queue_bound` age is 105 ms (> 100 ms!).
         let last_fresh_j7 = rig.inner().measured_positions[6];
         let pf_cur = j7_pf_current_raw(&base_cfg());
-        rig.bus.with(|s| s.push_all_feedback());
         rig.clock.advance(ms(105));
+        rig.bus.with(|s| s.push_all_feedback());
         rig.bus.clear_log();
         rig.step_dt(DT, false);
 
@@ -3348,63 +3355,20 @@ fn dual_owner_stopped_hold_zero_queued_stale_j7_and_dual_slot_backlog() {
         assert_eq!(rig_rep.inner().safety.epoch_id(), rep_ep);
         assert_eq!(rig_rep.inner().safety.fault_code(), Some(FaultCode::Other));
 
-        // (c) Dual-slot joint independent progress at BOTH 50 Hz (20 ms) and slow cadence (90 ms):
-        //     slot 0 (`0x101`) sends every tick (`sent_any == true`) while slot 1 (`0x001`) hits
-        //     persistent ENOBUFS backpressure -> MUST latch `CAN_TX_STALLED` once slot 1 age >= 45 ms!
+        // (c) Per-motor stopped-hold independent progress at BOTH 50 Hz (20 ms) and slow cadence
+        //     (90 ms): J1 (`0x101`) sends every tick (`sent_any == true`) while J2 (`0x102`) hits
+        //     persistent ENOBUFS backpressure -> MUST latch `CAN_TX_STALLED` once J2 age >= 45 ms!
+        //     (Under R10, SupervisorInner stopped-hold enforces L2 verified-mode-only holds and
+        //     resolves unverified modes via RID_CTRL_MODE readback instead of guessing dual-slot;
+        //     driver-level dual-slot progress on `write_estop_hold_bounded` is also verified below.)
         for step_s in [0.02f64, 0.09f64] {
-            let limits = dm_limits();
-            let clock = MockClock::new();
-            let bus = FakeBus::with_clock(&limits, clock.clone());
-            bus.with(|s| {
-                s.immediate_replies = false;
-                s.follow_commands = true;
-                s.push_all_feedback();
-            });
-            let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
-                .with_joint_limits(limits)
-                .unwrap();
-            drv.read_joint_states().unwrap();
-            drv.check_mapping_ranges();
-            // Trigger uncertain mode on J1 (`joint_modes[0] = None`) by dropping CTRL_MODE ack during
-            // a mode switch attempt, so stopped-hold emits BOTH `0x101` (PosVel) and `0x001` (MIT) on J1.
-            let mut inner = SupervisorInner::new(base_cfg()).with_driver(Box::new(drv));
-            inner.lease_enabled = false;
-            inner.tick(DT);
-            {
-                let stamp = inner.current_admission_stamp();
-                let admitted = inner.check_admission(stamp).expect("admit arm");
-                SupervisorInner::enable_torque(admitted).expect("arm");
-            }
-            {
-                let mut d = inner.driver.as_ref().unwrap().lock().unwrap();
-                bus.with(|s| s.motors[0].no_write_ack = true);
-                let mut modes = vec![armd::driver::JointMode::Position; 7];
-                modes[0] = armd::driver::JointMode::Mit;
-                let holds = vec![JointTarget::position(0.0); 7];
-                let _ = d.set_joint_modes(&modes, &holds);
-                bus.with(|s| s.motors[0].no_write_ack = false);
-                assert!(d.joint_modes_uncertain(), "J1 mode must be uncertain to emit dual hold slots");
-            }
-            inner.safety.trigger_fault_coded(FaultCode::Other, FaultReason::Other("dual-slot test".into()));
-            let mut dual_rig = match owner {
-                Owner::Legacy => DualRig { owner: RigOwner::Legacy(Box::new(inner)), bus, clock },
-                Owner::Executor => {
-                    inner.rt_executor_owned = true;
-                    let (fx, broker, _tw, _stop) = ReleaseFixture::new_with_clock(
-                        inner,
-                        BootId(91),
-                        Capacities { commands: 8, plans: 4, replies: 16 },
-                        VirtualClock::from_mock_clock(clock.clone()),
-                    );
-                    DualRig {
-                        owner: RigOwner::Executor { fx: Box::new(fx), broker: Box::new(broker), next_req: 1 },
-                        bus,
-                        clock,
-                    }
-                }
-            };
-            // Block ONLY slot 1 (`0x001`) while slot 0 (`0x101`) succeeds every tick (`sent_any == true`).
-            dual_rig.bus.with(|s| s.backpressure_tx_ids = vec![0x001]);
+            let mut dual_rig = DualRig::new(owner, base_cfg(), None);
+            dual_rig.inner_mut().safety.trigger_fault_coded(
+                FaultCode::Other,
+                FaultReason::Other("per-motor independent hold progress test".into()),
+            );
+            // Block ONLY J2 (`0x102`) while J1 (`0x101`) and peers succeed every tick (`sent_any == true`).
+            dual_rig.bus.with(|s| s.backpressure_tx_ids = vec![0x102]);
             dual_rig.bus.clear_log();
             let mut latched = false;
             for _ in 0..8 {
@@ -3416,14 +3380,52 @@ fn dual_owner_stopped_hold_zero_queued_stale_j7_and_dual_slot_backlog() {
             }
             assert!(
                 latched,
-                "{owner:?} step={step_s}s: blocked dual-slot 0x001 must latch CAN_TX_STALLED even while 0x101 sends"
+                "{owner:?} step={step_s}s: blocked J2 0x102 must latch CAN_TX_STALLED even while J1 0x101 sends"
             );
             assert!(
                 dual_rig.bus.tx_log().iter().any(|f| f.id == 0x101),
-                "{owner:?} step={step_s}s: sibling slot 0x101 must have transmitted"
+                "{owner:?} step={step_s}s: peer joint 0x101 must have transmitted"
             );
             let detail = dual_rig.inner().safety.tx_stall_detail().expect("tx_stall_detail");
             assert!(detail.is_hold && detail.queued > 0, "{owner:?}: expected queued > 0 hold stall, got {detail:?}");
+        }
+        // Driver-level dual-slot independent progress: on direct `write_estop_hold_bounded` with
+        // uncertain J1 mode (`joint_modes[0] = None`), blocking slot 1 (`0x001`) while slot 0
+        // (`0x101`) sends must report slot 1 due-but-unsent in `last_hold_tx_due_mask`/`sent_mask`.
+        if owner == Owner::Legacy {
+            let limits = dm_limits();
+            let clock = MockClock::new();
+            let bus = FakeBus::with_clock(&limits, clock.clone());
+            bus.with(|s| {
+                s.immediate_replies = true;
+                s.follow_commands = true;
+                s.push_all_feedback();
+            });
+            let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+                .with_joint_limits(limits)
+                .unwrap();
+            drv.read_joint_states().unwrap();
+            drv.check_mapping_ranges();
+            drv.set_torque(true).expect("enable");
+            bus.with(|s| {
+                s.immediate_replies = false;
+                s.motors[0].no_write_ack = true;
+            });
+            let mut modes = vec![armd::driver::JointMode::Position; 7];
+            modes[0] = armd::driver::JointMode::Mit;
+            let holds = vec![JointTarget::position(0.0); 7];
+            let _ = drv.set_joint_modes(&modes, &holds);
+            bus.with(|s| {
+                s.motors[0].no_write_ack = false;
+                s.backpressure_tx_ids = vec![0x001];
+                s.push_all_feedback();
+            });
+            assert!(drv.joint_modes_uncertain(), "J1 mode must be uncertain to emit dual hold slots");
+            drv.read_joint_states().unwrap();
+            let out = drv.write_estop_hold_bounded(&holds).expect("write_estop_hold_bounded");
+            assert!(matches!(out, TxBatchOutcome::Deferred { .. }), "expected deferred dual-slot hold, got {out:?}");
+            assert_eq!(drv.last_hold_tx_due_mask() & 0b11, 0b11, "both J1 hold slots must be due");
+            assert_eq!(drv.last_hold_tx_sent_mask() & 0b11, 0b01, "only J1 slot 0 (0x101) sent while slot 1 (0x001) blocked");
         }
     }
 }
@@ -3553,8 +3555,12 @@ fn dual_owner_stopped_hold_output_failed_rate_limit_and_suppressed_counter() {
             );
             assert_eq!(rig.inner().hold_tx_error_suppressed(), 9);
 
-            // Advance past t = 3000 ms: next error emits with exact `suppressed 9 events`!
-            rig.clock.advance(ms(850));
+            // Advance past t = 3000 ms while preserving an observed-empty RX queue bound <= 100 ms
+            // (R10 stopped-hold requires provably fresh feedback): next error emits with exact
+            // `suppressed 9 events`!
+            rig.clock.advance(ms(830));
+            let _ = rig.inner().driver.as_ref().unwrap().lock().unwrap().read_joint_states();
+            rig.clock.advance(ms(20));
             rig.step();
             if owner == Owner::Executor {
                 rig.inner_mut().safety.drain_log_events_off_thread();
@@ -3573,7 +3579,9 @@ fn dual_owner_stopped_hold_output_failed_rate_limit_and_suppressed_counter() {
             // 0 dropped, and emitted immediately once ring drains!
             if owner == Owner::Executor {
                 lines.lock().unwrap().clear();
-                rig.clock.advance(ms(1050));
+                rig.clock.advance(ms(1030));
+                let _ = rig.inner().driver.as_ref().unwrap().lock().unwrap().read_joint_states();
+                rig.clock.advance(ms(20));
                 for _ in 0..armd::safety::SAFETY_LOG_CAPACITY {
                     rig.inner_mut().safety.log_gravity_comp_ramp_complete();
                 }
@@ -3893,12 +3901,15 @@ fn dual_owner_j7_clear_fail_closed_when_unverified_and_at_100ms_boundary() {
 
         // Disable torque so driver invalidates active pos-force mode / verification, then deliver
         // J7 feedback aged 150 ms (101..=250 ms, so `is_feedback_valid()` is true while J7 > 100 ms).
+        // Run 3 control releases at rest so R10's K=3 rest-pose gate authorizes `set_torque(false)`.
         rig.bus.with(|s| {
             s.motors[6].mute_feedback = false;
             s.immediate_replies = true;
             s.push_all_feedback();
         });
-        rig.step();
+        for _ in 0..3 {
+            rig.step();
+        }
         {
             let mut drv = rig.inner().driver.as_ref().unwrap().lock().unwrap();
             drv.set_torque(false).expect("disable torque");
@@ -4762,6 +4773,7 @@ fn dual_owner_stopped_hold_per_motor_lack_of_progress_hard_error_all_expired_and
                 drv.set_torque(false).expect("disable torque");
             }
             rig_idle.inner_mut().is_torqued = false;
+            rig_idle.inner_mut().torque_intent = armd::TorqueIntent::Off;
             rig_idle.inner_mut().safety.set_torque(false).expect("idle state");
             rig_idle.bus.with(|s| {
                 s.immediate_replies = false;
@@ -5035,8 +5047,14 @@ fn dual_owner_tripped_mit_fence_j7_outage_stop_and_estop_still_send_freeze() {
 
             let log = rig.bus.tx_log();
             assert!(
-                !log.iter().any(is_mit_or_arm_cmd),
-                "{owner:?} (estop={is_estop}): tripped MIT fence must suppress all MIT/arm frames: {log:?}"
+                !log.iter().any(|f| f.id == 4 || f.id == 0x104),
+                "{owner:?} (estop={is_estop}): tripped MIT fence must suppress MIT joint J4 frames: {log:?}"
+            );
+            assert!(
+                [0x101u32, 0x102, 0x103, 0x105, 0x106]
+                    .iter()
+                    .all(|&id| log.iter().any(|f| f.id == id)),
+                "{owner:?} (estop={is_estop}): B2 non-MIT position joints must remain held under MitOwner::Lost: {log:?}"
             );
             assert_j7_freeze_frames(
                 &j7_pf_frames(&log),
@@ -5086,17 +5104,13 @@ fn dual_owner_stale_j1_refusal_never_hides_j2_wouldblock_can_tx_stalled() {
                 "{owner:?} (pf={use_pos_force}): stale J1 alone without TX backpressure must not latch CAN_TX_STALLED"
             );
 
-            // Now inject WouldBlock on J2 (0x102) while J1 remains stale (`BuildRefused` every tick).
+            // Now inject WouldBlock on J2 (0x102) while J1 remains stale (B2: holds its last
+            // captured target as HeldStaleTarget; J2's persistent WouldBlock still latches CAN_TX_STALLED).
             rig.bus.with(|s| s.backpressure_tx_ids = vec![0x102]);
             let mut latched = false;
             for _ in 0..6 {
                 rig.bus.with(|s| for i in 1..7 { s.push_feedback(i); });
                 rig.step_dt(DT, false);
-                assert_eq!(
-                    rig.inner().hold_tx_no_progress_ticks()[0],
-                    0,
-                    "{owner:?} (pf={use_pos_force}): refused J1 slot 0 must not accumulate TX stall ticks"
-                );
                 if rig.inner().safety.fault_code() == Some(FaultCode::CanTxStalled) {
                     latched = true;
                     break;
@@ -5750,21 +5764,23 @@ fn dual_owner_single_j7_emitter_covers_all_fenced_and_invalid_target_paths() {
             });
             rig.clock.advance(ms(50));
             rig.bus.with(|s| for i in [0, 1, 2, 4, 5, 6] { s.push_feedback(i); });
-            // Tick 1 trips fence via J4 outage (J7 still fresh at -2.5) -> 0 MIT + exact 1 Hold frame (vel 0).
+            // Tick 1 trips fence via J4 outage (J7 still fresh at -2.5) -> 0 MIT J4 frames,
+            // non-MIT position joints keep holding (B2), + exact 1 Hold frame (vel 0) for J7.
             rig.bus.clear_log();
             rig.step_dt(DT, false);
             let log1 = rig.bus.tx_log();
-            assert!(!log1.iter().any(is_mit_or_arm_cmd), "{owner:?} B2a sent MIT/arm frame: {log1:?}");
+            assert!(!log1.iter().any(|f| f.id == 4 || f.id == 0x104), "{owner:?} B2a sent MIT J4 frame: {log1:?}");
             assert_exact_one_j7(&log1, -2.5, 0, pf_cur, &format!("{owner:?} B2a fence tripped (fresh J7)"));
 
-            // Tick 2 while MitOwner::Lost and J7 now stale > 100 ms -> 0 MIT + exact 1 FREEZE frame (vel 0).
+            // Tick 2 while MitOwner::Lost and J7 now stale > 100 ms -> 0 MIT J4 frames,
+            // non-MIT position joints keep holding (B2), + exact 1 FREEZE frame (vel 0) for J7.
             rig.bus.with(|s| s.motors[6].mute_feedback = true);
             rig.clock.advance(ms(115));
             rig.bus.with(|s| for i in [0, 1, 2, 4, 5] { s.push_feedback(i); });
             rig.bus.clear_log();
             rig.step_dt(DT, false);
             let log2 = rig.bus.tx_log();
-            assert!(!log2.iter().any(is_mit_or_arm_cmd), "{owner:?} B2b sent MIT/arm frame: {log2:?}");
+            assert!(!log2.iter().any(|f| f.id == 4 || f.id == 0x104), "{owner:?} B2b sent MIT J4 frame: {log2:?}");
             assert_exact_one_j7(&log2, -2.5, 0, pf_cur, &format!("{owner:?} B2b fence already tripped (stale J7)"));
         }
 

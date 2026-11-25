@@ -203,9 +203,15 @@ impl SupervisorInner {
             }
         }
         // (the message is built only when a run ends: a stop without one does not allocate)
+        #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+        if self.policy_load_reservation.take().is_some() {
+            self.policy_loading = false;
+            self.policy_cancel_slots.set_active_load_token(0);
+            self.reconcile_target_stream_authority(Instant::now());
+        }
         #[cfg(feature = "policy-runtime")]
         if self.policy_run.is_some() {
-            self.terminate_policy_run("STOPPED", "cancelled", Some("STOPPED"), Some("Motion stopped".into()));
+            self.terminate_policy_run_static("STOPPED", "cancelled", Some("STOPPED"), Some("Motion stopped"));
         }
         if self.gripper_reference_active() { self.hold_gripper_at_measured(); }
         self.servo_settled_ticks.fill(0);
@@ -226,6 +232,44 @@ impl SupervisorInner {
         self.apply_stop_policy_in_tick(policy, true);
     }
 
+    /// Dispatches or arms `DisableProtective { Thermal }` without re-latching `ThermalTrip` or
+    /// churning `epoch_id` (R12 B4: a thermal latch must never suppress its own protective cut).
+    pub(crate) fn redispatch_thermal_protective_disable(&mut self) {
+        // Cancel any in-flight enable through the reducer before protective thermal cut
+        // takes over, preserving the thermal latch (highest severity) and protective cut.
+        self.interrupt_enable_for_thermal();
+        let already_protective = matches!(
+            self.active_disable_kind,
+            Some(crate::driver::DisableKind::DisableProtective { .. })
+        );
+        let thermal_disable = crate::driver::DisableKind::DisableProtective {
+            reason: crate::driver::DisableProtectiveReason::Thermal,
+        };
+        self.active_disable_kind = Some(thermal_disable);
+        let rt_needs_redispatch = self.rt_executor_owned
+            && self.background_disable_retry.is_none()
+            && (self.is_torqued || self.torque_intent == TorqueIntent::On)
+            && !self
+                .driver
+                .as_ref()
+                .is_some_and(|d| d.try_lock().is_ok_and(|drv| drv.torque_transition_pending()));
+        // T2 / R12 B4: Upgrading from a user `DisableRequested` to `DisableProtective { Thermal }`
+        // (or redispatching after a thermal cut whose retry is not yet armed) MUST bypass
+        // the 250 ms throttle so the driver immediately dispatches/arms protective disable.
+        if !self.disable_pending
+            || !already_protective
+            || rt_needs_redispatch
+            || (!self.rt_executor_owned
+                && self.last_disable_attempt.is_none_or(|t| t.elapsed() >= Duration::from_millis(250)))
+        {
+            if let Err(e) = self.request_disable_bounded(thermal_disable) {
+                if !self.safety.deferred_logging() {
+                    tracing::error!("Thermal shutdown not confirmed: {}", e.message.as_str());
+                }
+            }
+        }
+    }
+
     /// Execute the `StopPolicy::EStopLatch` transition without ever blocking on `driver`.
     /// Separated from `self.driver` so tests can verify real multi-thread mutex contention
     /// against the exact production latch path in safe Rust.
@@ -243,36 +287,40 @@ impl SupervisorInner {
         self.gripper_stream_contact_detector.reset();
         self.gripper_stream_lease = None;
 
-        // Lock onto measured_positions only when finite and the supervisor's own coherent
-        // feedback snapshot (`core.feedback()` + `joint_feedback_queue_bounds`, captured
-        // alongside `measured_positions`) is provably within the 250 ms freshness bound
-        // against the driver's clock. Use non-blocking `try_lock` so E-stop never waits on
-        // a contended driver mutex; if contended, poisoned, stale, or unbounded, hold
-        // `commanded_positions`.
+        // Clear any prior captured stopped-hold targets and recapture fresh (`<= 100 ms`) measured
+        // positions through the single owner-snapshot capture kernel (never blocking on a contended
+        // driver mutex and never falling back to old cached `commanded_positions`). Also update
+        // `commanded_positions` for observation telemetry when the coherent feedback snapshot is
+        // fresh and finite.
+        self.measured_hold.clear();
         const ESTOP_FEEDBACK_MAX_AGE: Duration = Duration::from_millis(250);
         let (driver_contended, snapshot_fresh) = match driver {
             None => (false, self.feedback_numeric_valid),
             Some(d) => match d.try_lock() {
-                Err(_) => (true, false),
+                Err(_) => {
+                    self.owner_driver_snapshot.invalidate();
+                    (true, false)
+                }
                 Ok(drv) => {
                     let now = drv.clock_now();
                     let dof = self.config.dof;
                     let fb = self.core.feedback();
+                    drv.feedback_queue_bounds_into(&mut self.scratch.fb.bounds);
+                    let has_bounds = !self.scratch.fb.bounds.is_empty();
                     let fresh = self.feedback_numeric_valid
                         && (0..dof).all(|i| {
                             fb.instant(i).is_some_and(|t| now.saturating_duration_since(t) <= ESTOP_FEEDBACK_MAX_AGE)
                         })
-                        && {
-                            drv.feedback_queue_bounds_into(&mut self.scratch.fb.bounds);
-                            if self.scratch.fb.bounds.is_empty() {
-                                true
-                            } else {
-                                self.joint_feedback_queue_bounds.len() == dof
-                                    && self.joint_feedback_queue_bounds.iter().all(|b| {
-                                        b.is_some_and(|t| now.saturating_duration_since(t) <= ESTOP_FEEDBACK_MAX_AGE)
-                                    })
-                            }
-                        };
+                        && (!has_bounds
+                            || (self.joint_feedback_queue_bounds.len() == dof
+                                && self.joint_feedback_queue_bounds.iter().all(|b| {
+                                    b.is_some_and(|t| now.saturating_duration_since(t) <= ESTOP_FEEDBACK_MAX_AGE)
+                                })));
+                    // Refresh owner-held snapshot while already holding the uncontended `try_lock`
+                    // guard, then capture measured hold from owner state (0 alloc, 0 extra lock).
+                    self.refresh_owner_driver_snapshot_from_ref(drv.as_ref());
+                    drop(drv);
+                    let _ = self.capture_measured_hold_from_owner();
                     (false, fresh)
                 }
             },
@@ -348,20 +396,25 @@ impl SupervisorInner {
     }
 
     pub(crate) fn apply_stop_policy_in_tick(&mut self, policy: StopPolicy, in_tick: bool) {
+        #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+        if self.policy_load_reservation.take().is_some() {
+            self.policy_loading = false;
+            self.policy_cancel_slots.set_active_load_token(0);
+        }
         #[cfg(feature = "policy-runtime")]
         if self.policy_run.is_some() {
             match policy {
                 StopPolicy::NormalUnload => {
-                    self.terminate_policy_run("STOPPED", "cancelled", Some("STOPPED"), Some("Arm unloading".into()));
+                    self.terminate_policy_run_static("STOPPED", "cancelled", Some("STOPPED"), Some("Arm unloading"));
                 }
                 StopPolicy::EStopLatch => {
-                    self.terminate_policy_run("ESTOP", "failed", Some("ESTOP_ACTIVE"), Some("E-stop latched".into()));
+                    self.terminate_policy_run_static("ESTOP", "failed", Some("ESTOP_ACTIVE"), Some("E-stop latched"));
                 }
                 StopPolicy::ThermalTrip => {
-                    self.terminate_policy_run("THERMAL_TRIP", "failed", Some("THERMAL_TRIP"), Some("Thermal trip".into()));
+                    self.terminate_policy_run_static("THERMAL_TRIP", "failed", Some("THERMAL_TRIP"), Some("Thermal trip"));
                 }
                 StopPolicy::BusLossFallback => {
-                    self.terminate_policy_run("BUS_LOSS", "failed", Some("BUS_LOSS"), Some("CAN feedback lost".into()));
+                    self.terminate_policy_run_static("BUS_LOSS", "failed", Some("BUS_LOSS"), Some("CAN feedback lost"));
                 }
             }
         }
@@ -523,9 +576,10 @@ impl SupervisorInner {
                         return;
                     }
                 }
-                // If the arm is torqued, maintain holding torque if motion cannot be planned or arm is not operational!
-                // NEVER cut power under gravity when motion planning fails or arm is in stopped/idle state!
-                if self.is_torqued {
+                // If the arm is torqued or torque_intent is On, maintain holding torque if motion
+                // cannot be planned or arm is not operational! NEVER cut power or bypass the rest
+                // gate under gravity when motion planning fails or arm is not operational.
+                if self.is_torqued || self.torque_intent == crate::supervisor::TorqueIntent::On {
                     tracing::warn!("NormalUnload cannot plan motion or arm not operational; maintaining holding torque to prevent dropping arm");
                     self.pending_normal_unload = false;
                     self.unload_settle = None;
@@ -533,7 +587,8 @@ impl SupervisorInner {
                     self.servo_target = None;
                     return;
                 }
-                // If not torqued, ensure state is clean
+                // Already cleanly disarmed (`!is_torqued && torque_intent == Off`): clean up motion state
+                // without issuing an ungated hardware disable.
                 self.pending_normal_unload = false;
                 self.unload_settle = None;
                 self.is_torqued = false;
@@ -546,11 +601,6 @@ impl SupervisorInner {
                 }
                 let _ = self.safety.set_torque(false);
                 self.mit_torque_off();
-                if let Some(ref d) = self.driver {
-                    if let Ok(mut driver) = d.lock() {
-                        let _ = driver.set_torque(false);
-                    }
-                }
             }
             StopPolicy::EStopLatch => {
                 let driver = self.driver.take();
@@ -558,6 +608,9 @@ impl SupervisorInner {
                 self.driver = driver;
             }
             StopPolicy::ThermalTrip => {
+                // Protective-cut exception (decision b, 2026-11-24): thermal trip is NOT a user
+                // torque-off request; it intentionally bypasses `may_disable_torque_while_stopped`
+                // and disables the motors in any pose (the arm may drop).
                 self.stop_motion();
                 self.commanded_velocities.fill(0.0);
                 self.commanded_accelerations.fill(0.0);
@@ -572,17 +625,7 @@ impl SupervisorInner {
                         limit: self.config.max_temperature,
                     },
                 );
-                if self.rt_executor_owned {
-                    if !self.disable_pending {
-                        if let Err(code) = self.request_disable_rt() {
-                            tracing::error!(code, "Thermal shutdown not confirmed");
-                        }
-                    }
-                } else if !self.disable_pending
-                    || self.last_disable_attempt.is_none_or(|t| t.elapsed() >= Duration::from_millis(250))
-                {
-                    if let Err(e) = self.request_disable() { tracing::error!("Thermal shutdown not confirmed: {e}"); }
-                }
+                self.redispatch_thermal_protective_disable();
             }
             StopPolicy::BusLossFallback => {
                 self.exit_gravity_comp_inner("BUS_LOSS", "CAN feedback lost", !in_tick);
@@ -642,23 +685,14 @@ impl SupervisorInner {
 
         #[cfg(feature = "policy-runtime")]
         if self.policy_run.is_some() {
-            self.terminate_policy_run("LEASE_LOST", "cancelled", Some("LEASE_LOST"), Some("Control lease preempted".into()));
+            self.terminate_policy_run_static("LEASE_LOST", "cancelled", Some("LEASE_LOST"), Some("Control lease preempted"));
         }
 
-        // Four-category state categorization (strictly fail-closed, no unwrap/panic, driver lock poison returns false)
-        let confirmed_hardware_disabled = match &self.driver {
-            None => !self.is_torqued && !self.disable_pending && self.safety.state() == &SafetyState::Idle,
-            Some(driver) => !self.is_torqued
-                && !self.disable_pending
-                && self.safety.state() == &SafetyState::Idle
-                && driver.lock().is_ok_and(|drv| {
-                    if !drv.capabilities().enable_feedback {
-                        true
-                    } else {
-                        drv.enable_state() == EnableState::Disabled
-                    }
-                }),
-        };
+        // Decision-based hardware disabled check (never inferred from feedback telemetry).
+        let confirmed_hardware_disabled = !self.is_torqued
+            && !self.disable_pending
+            && self.safety.state() == &SafetyState::Idle
+            && (self.driver.is_none() || self.torque_intent == crate::supervisor::TorqueIntent::Off);
 
         let old_gen = self.active_lease.as_ref().map_or(0, |a| a.generation);
         let needs_stop = !(confirmed_hardware_disabled
@@ -715,7 +749,7 @@ impl SupervisorInner {
         self.cancel_watchdog_park_for_new_lease(client_id);
         #[cfg(feature = "policy-runtime")]
         if self.policy_run.is_some() {
-            self.terminate_policy_run("LEASE_LOST", "cancelled", Some("LEASE_LOST"), Some("Control lease acquired by new controller".into()));
+            self.terminate_policy_run_static("LEASE_LOST", "cancelled", Some("LEASE_LOST"), Some("Control lease acquired by new controller"));
         }
         if let Some(old_gen) = self.active_lease.as_ref().map(|a| a.generation) {
             self.fence_displaced_lease_generation(old_gen, true);
@@ -931,7 +965,7 @@ impl SupervisorInner {
     pub(crate) fn latch_watchdog_fault(&mut self) {
         #[cfg(feature = "policy-runtime")]
         if self.policy_run.is_some() {
-            self.terminate_policy_run("WATCHDOG_TIMEOUT", "failed", Some("WATCHDOG_TIMEOUT"), Some("Lease watchdog expired".into()));
+            self.terminate_policy_run_static("WATCHDOG_TIMEOUT", "failed", Some("WATCHDOG_TIMEOUT"), Some("Lease watchdog expired"));
         }
         if !self.safety.state().is_stopped() {
             // Preserve a torque-guard backed-off command before updating commanded_positions in place.
@@ -958,7 +992,7 @@ impl SupervisorInner {
             self.gripper_stream_contact_detector.reset();
             self.gripper_stream_lease = None;
             self.servo_settled_ticks.fill(0);
-            self.servo_ws_min_depths = None;
+            self.clear_servo_ws_min_depths_rt();
             self.servo_stream_active = false;
             self.tracking.invalidate();
             crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
@@ -987,7 +1021,7 @@ impl SupervisorInner {
                 self.fence_displaced_lease_generation(displaced, false);
                 #[cfg(feature = "policy-runtime")]
                 if self.policy_run.is_some() {
-                    self.terminate_policy_run("LEASE_LOST", "cancelled", Some("LEASE_LOST"), Some("Control lease released".into()));
+                    self.terminate_policy_run_static("LEASE_LOST", "cancelled", Some("LEASE_LOST"), Some("Control lease released"));
                 }
                 return valid;
             }
@@ -1375,7 +1409,7 @@ impl SupervisorInner {
             self.gripper_hold_vel_ceiling = None;
         }
         self.release_servo_target();
-        self.servo_ws_min_depths = None;
+        self.clear_servo_ws_min_depths_rt();
         crate::rt_core::scratch::copy_into(&mut self.target_positions, &target_positions);
         self.safety.mark_motion_started()?;
         let duration = traj.duration;
@@ -1737,7 +1771,8 @@ impl SupervisorInner {
         if self.rt_executor_owned {
             return self.last_poll_feedback_valid;
         }
-        self.driver.as_ref().is_none_or(|d| d.lock().is_ok_and(|drv| drv.is_feedback_valid()))
+        self.lock_driver_for_tick()
+            .is_some_and(|drv| drv.is_feedback_valid())
     }
 
     /// The refusal code when a primitive admitted under `admitted` may not be installed,
@@ -1817,7 +1852,7 @@ impl SupervisorInner {
         self.safety.validate_motion_command(Some(epoch), last, &self.config.limits)?;
         self.release_servo_target();
         self.servo_settled_ticks.fill(0);
-        self.servo_ws_min_depths = None;
+        self.clear_servo_ws_min_depths_rt();
         crate::rt_core::scratch::copy_into(&mut self.target_positions, last);
         self.safety.mark_motion_started()?;
         self.last_heartbeat = Instant::now();

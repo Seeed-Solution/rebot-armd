@@ -6,13 +6,8 @@
 #[allow(unused_imports)]
 use super::*;
 
-use crate::driver::handshake::Deadline;
-
-/// Supervisor-side disable confirmation after the driver's own window: fresh valid feedback
-/// and `EnableState::Disabled`, within this time.
-pub const DISABLE_CONFIRM_WINDOW: Duration = Duration::from_millis(25);
-/// Interval between services of [`DisableConfirm`] in the blocking `request_disable`.
-pub const DISABLE_CONFIRM_SERVICE: Duration = Duration::from_millis(2);
+/// Interval between service polls in bounded panic-disable teardown.
+pub const PANIC_DISABLE_SERVICE: Duration = Duration::from_millis(2);
 /// Upper wall-clock bound for last-chance hardware disable attempts on panic or forced teardown.
 pub const PANIC_DISABLE_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -34,7 +29,17 @@ pub(crate) struct ClearFaultCommit {
     pub(crate) candidate_limits: Option<CandidateDriverLimits>,
     pub(crate) reapply_legacy_limits: bool,
     pub(crate) is_torqued: Option<bool>,
+    pub(crate) reset_disarmed_hold: bool,
     pub(crate) thermal_cooldown: Option<ThermalCooldown>,
+}
+
+/// Bounded, inline error returned by [`SupervisorInner::request_disable_bounded`] (0 heap allocs).
+pub(crate) struct RequestDisableError {
+    pub(crate) code: &'static str,
+    pub(crate) message: crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>,
+    /// True when the driver transmit choke point refused `DisableRequested` (Rule A′ or 1 s
+    /// request lifetime expiry), so the pending disable request ended cleanly without TX.
+    pub(crate) refused_by_chokepoint: bool,
 }
 
 /// Result of a bounded last-chance hardware disable attempt on a panic or forced teardown path.
@@ -246,6 +251,7 @@ pub(crate) fn bounded_panic_disable_driver_until(
     let mut first_step = true;
     let mut last_step_err: Option<String> = None;
     let mut use_generic = false;
+    let drv_coop_deadline = drv.clock_now() + coop_budget;
     loop {
         let drv_now = drv.clock_now();
         let now = Instant::now();
@@ -253,23 +259,18 @@ pub(crate) fn bounded_panic_disable_driver_until(
             if first_step {
                 return PanicDisableOutcome::TimedOut;
             }
-            if enable_fb && DisableConfirm::confirmed(drv) {
-                return PanicDisableOutcome::Confirmed;
-            }
             break;
         }
         let rem = coop_deadline.saturating_duration_since(now);
-        if !first_step && rem.is_zero() {
-            if enable_fb && DisableConfirm::confirmed(drv) {
-                return PanicDisableOutcome::Confirmed;
-            }
+        let drv_rem = drv_coop_deadline.saturating_duration_since(drv_now);
+        if !first_step && (rem.is_zero() || drv_rem.is_zero()) {
             break;
         }
         let hard_rem = hard_deadline.saturating_duration_since(now);
         let step_budget = if rem.is_zero() {
-            hard_rem.min(DISABLE_CONFIRM_SERVICE)
+            hard_rem.min(PANIC_DISABLE_SERVICE)
         } else {
-            rem.min(hard_rem)
+            rem.min(hard_rem).min(drv_rem.max(PANIC_DISABLE_SERVICE))
         };
         let drv_deadline = drv_now + step_budget;
         let step_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -287,7 +288,7 @@ pub(crate) fn bounded_panic_disable_driver_until(
                 if !enable_fb {
                     return PanicDisableOutcome::Unconfirmed;
                 }
-                if unconfirmed.is_empty() && DisableConfirm::confirmed(drv) {
+                if unconfirmed.is_empty() {
                     return PanicDisableOutcome::Confirmed;
                 }
             }
@@ -298,10 +299,11 @@ pub(crate) fn bounded_panic_disable_driver_until(
             }
         }
         let rem = coop_deadline.saturating_duration_since(Instant::now());
-        if rem.is_zero() {
+        let drv_rem = drv_coop_deadline.saturating_duration_since(drv.clock_now());
+        if rem.is_zero() || drv_rem.is_zero() {
             break;
         }
-        std::thread::sleep(rem.min(DISABLE_CONFIRM_SERVICE));
+        drv.clock_pause(rem.min(drv_rem).min(PANIC_DISABLE_SERVICE));
     }
 
     if !use_generic {
@@ -315,9 +317,8 @@ pub(crate) fn bounded_panic_disable_driver_until(
         return PanicDisableOutcome::Unconfirmed;
     }
 
-    // Generic retry loop for drivers that do not implement `panic_disable_step`: retry disable
-    // sends and feedback confirmation until confirmed or `coop_deadline` is spent.
-    let mut states_buf = Vec::new();
+    // Generic retry loop for drivers that do not implement `panic_disable_step`: transmit
+    // bounded protective disable frames until the driver finishes or `coop_deadline` is spent.
     let mut any_send_ok = false;
     let mut last_err: Option<String> = None;
     let mut attempt = 0u32;
@@ -338,7 +339,13 @@ pub(crate) fn bounded_panic_disable_driver_until(
             if now >= hard_deadline || (attempt > 1 && now >= coop_deadline) {
                 return Err(None);
             }
-            drv.begin_torque_budgeted(false, 0).map_err(Some)
+            drv.begin_disable_torque_budgeted(
+                crate::driver::DisableKind::DisableProtective {
+                    reason: crate::driver::DisableProtectiveReason::ProcessExit,
+                },
+                0,
+            )
+            .map_err(Some)
         }));
         match begin_res {
             Err(_) => return PanicDisableOutcome::Failed("driver panicked during begin_torque(false)".into()),
@@ -385,8 +392,18 @@ pub(crate) fn bounded_panic_disable_driver_until(
                         if rem.is_zero() {
                             break;
                         }
-                        std::thread::sleep(rem.min(DISABLE_CONFIRM_SERVICE));
+                        std::thread::sleep(rem.min(PANIC_DISABLE_SERVICE));
                     }
+                }
+                if matches!(
+                    progress,
+                    crate::driver::TorqueProgress::Done(crate::driver::TorqueOutcome::Confirmed)
+                ) {
+                    return if enable_fb {
+                        PanicDisableOutcome::Confirmed
+                    } else {
+                        PanicDisableOutcome::Unconfirmed
+                    };
                 }
             }
         }
@@ -394,37 +411,13 @@ pub(crate) fn bounded_panic_disable_driver_until(
         if !enable_fb && any_send_ok {
             return PanicDisableOutcome::Unconfirmed;
         }
-        if enable_fb && DisableConfirm::confirmed(drv) {
-            return PanicDisableOutcome::Confirmed;
-        }
-        let drv_now = drv.clock_now();
-        let now = Instant::now();
-        let rem = coop_deadline
-            .saturating_duration_since(now)
-            .min(hard_deadline.saturating_duration_since(now));
-        if rem.is_zero() {
-            break;
-        }
-        let drv_deadline = drv_now + rem;
-        let read_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            drv.read_joint_states_budgeted(&mut states_buf, drv_deadline, 64)
-        }));
-        if read_res.is_err() {
-            return PanicDisableOutcome::Failed("driver panicked while confirming disable".into());
-        }
-        if enable_fb && DisableConfirm::confirmed(drv) {
-            return PanicDisableOutcome::Confirmed;
-        }
         let rem = coop_deadline.saturating_duration_since(Instant::now());
         if rem.is_zero() {
             break;
         }
-        std::thread::sleep(rem.min(DISABLE_CONFIRM_SERVICE));
+        std::thread::sleep(rem.min(PANIC_DISABLE_SERVICE));
     }
 
-    if enable_fb && DisableConfirm::confirmed(drv) {
-        return PanicDisableOutcome::Confirmed;
-    }
     let unconfirmed = drv.unconfirmed_disable_joints();
     tracing::error!(
         "Bounded panic disable budget ({} ms) exhausted; unconfirmed motors: [{}]{}",
@@ -439,15 +432,6 @@ pub(crate) fn bounded_panic_disable_driver_until(
     }
 }
 
-/// Result of one budgeted [`DisableConfirm::serve_budgeted`] call.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DisableServe {
-    pub outcome: Option<bool>,
-    pub did_rx: bool,
-    pub rx_frames: u16,
-    pub budget_exhausted: bool,
-}
-
 /// Outcome of one [`SupervisorInner::service_torque_transition`] call, with the exact
 /// RX work performed by this call (None when no bus receive pass ran).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -457,54 +441,229 @@ pub(crate) struct TransitionPoll {
     pub broker_owned: bool,
 }
 
-/// The supervisor's disable confirmation as an absolute-deadline wait (no sleep inside): served
-/// once per call, it reads feedback once and reports `Some(confirmed)` when finished.
-#[derive(Clone, Copy, Debug)]
-pub struct DisableConfirm { deadline: Deadline }
+/// Owner-owned torque decision state (never inferred from motor feedback).
+///
+/// Holds are the default while stopped whenever `torque_intent == On`. Transitions to `Off`
+/// ONLY by an accepted explicit disable (passing the rest-pose gate when stopped) or
+/// `DisableProtective` (thermal / process exit / panic). A later enable sets `On`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TorqueIntent {
+    Off,
+    On,
+}
 
-impl DisableConfirm {
-    pub fn start(now: Instant) -> Self { Self { deadline: Deadline::after(now, DISABLE_CONFIRM_WINDOW) } }
+/// Persistent enable-lifecycle state owned by the single enable transition reducer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnableLifecycle {
+    /// Torque is off by accepted disable (or driverless startup).
+    Disarmed,
+    /// Enable transition reducer is active (`Enable` / `Validate`).
+    Enabling,
+    /// Enable and post-enable validation succeeded; arm is armed.
+    Armed,
+    /// Enable failed or was interrupted at any stage: queued enable work cancelled,
+    /// `ENABLE_FAILED` latched, and measured-position holds are serviced for EVERY joint.
+    FailedHold,
+}
 
-    /// End of the confirmation window (driver clock).
-    pub fn deadline(&self) -> Instant { self.deadline.at }
+/// Maximum time an energized joint may remain with an unverified control mode before latching a
+/// non-recoverable fault naming the joint (L2).
+pub const UNVERIFIED_MODE_READBACK_TIMEOUT: Duration = Duration::from_millis(200);
 
-    /// Fresh valid feedback reports every motor disabled.
-    pub fn confirmed(drv: &dyn ArmDriver) -> bool { drv.is_feedback_valid() && drv.enable_state() == EnableState::Disabled }
+/// Consecutive stopped-hold `driver.try_lock()` skips (0.5 s at 50 Hz) before escalating with
+/// a counted warning and latching a non-recoverable [`FaultCode::HardwareFault`].
+pub const STOPPED_HOLD_CONTENTION_ESCALATE_SKIPS: u32 = 25;
 
-    /// One service: past the deadline -> `Some(false)` without a read (unless already confirmed);
-    /// else one receive pass, `Some(true)` once confirmed, `None` to serve again.
-    pub fn serve(&mut self, drv: &mut dyn ArmDriver) -> Option<bool> {
-        if self.deadline.passed(drv.clock_now()) { return Some(Self::confirmed(drv)); }
-        let _ = drv.read_joint_states();
-        Self::confirmed(drv).then_some(true)
+/// Inline per-joint measured-position hold state (0 heap allocations on RT).
+#[derive(Debug, Clone, Copy)]
+pub struct MeasuredHoldTracker {
+    /// Fixed captured target position per joint while feedback stays fresh (<= 100 ms).
+    /// Cleared to `None` when feedback goes stale/missing, continuity breaks across a `> 100 ms`
+    /// gap, or mode becomes unverified, and recaptured when fresh feedback returns.
+    pub captured_positions: [Option<f32>; crate::rt_core::mailbox::MAX_DOF],
+    /// Driver-reported per-joint feedback continuity epoch at capture time (detects `> 100 ms`
+    /// gaps even if feedback resumed before the next service pass).
+    pub captured_continuity_epoch: [Option<u64>; crate::rt_core::mailbox::MAX_DOF],
+    /// Driver-clock timestamp when this joint's capture was last confirmed continuously fresh.
+    pub last_seen_fresh_at: [Option<Instant>; crate::rt_core::mailbox::MAX_DOF],
+    /// Driver-clock timestamp when a joint was first seen with an unverified hold mode
+    /// (L2: per-tick `RID_CTRL_MODE` readback, non-recoverable fault at 200 ms).
+    pub unverified_mode_since: [Option<Instant>; crate::rt_core::mailbox::MAX_DOF],
+    /// Bitmask of joints that have already latched the 200 ms unverified-mode fault.
+    pub unverified_mode_faulted_mask: u64,
+    /// Owner-held bitmask of joints with pending/queued stopped-hold TX frames on the driver (L3).
+    pub owner_pending_hold_mask: u64,
+    /// Owner-held active stopped-hold mask for the current pass (L3).
+    pub owner_hold_mask: u64,
+    /// Owner-held inline stopped-hold target queue for the current pass (L3; zero alloc).
+    pub owner_hold_targets: [f32; crate::rt_core::mailbox::MAX_DOF],
+    /// Most recent per-joint hold status observed during hold evaluation/servicing.
+    pub joint_status: [crate::driver::JointHoldStatus; crate::rt_core::mailbox::MAX_DOF],
+    /// Original failure cause stored on `FailedHold` entry so live `ENABLE_FAILED` messages
+    /// reflect updated per-joint hold status without relatching or bumping `epoch_id`.
+    pub enable_failed_cause: crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>,
+    /// Consecutive stopped-hold TX ticks skipped due to `driver.try_lock()` contention.
+    pub consecutive_lock_contended: u32,
+    /// True once the current contiguous contention streak has escalated (>= 25 skips).
+    pub lock_contended_escalated: bool,
+    pub dof: usize,
+}
+
+impl MeasuredHoldTracker {
+    pub fn new(dof: usize) -> Self {
+        Self {
+            captured_positions: [None; crate::rt_core::mailbox::MAX_DOF],
+            captured_continuity_epoch: [None; crate::rt_core::mailbox::MAX_DOF],
+            last_seen_fresh_at: [None; crate::rt_core::mailbox::MAX_DOF],
+            unverified_mode_since: [None; crate::rt_core::mailbox::MAX_DOF],
+            unverified_mode_faulted_mask: 0,
+            owner_pending_hold_mask: 0,
+            owner_hold_mask: 0,
+            owner_hold_targets: [0.0; crate::rt_core::mailbox::MAX_DOF],
+            joint_status: [crate::driver::JointHoldStatus::SkippedOff; crate::rt_core::mailbox::MAX_DOF],
+            enable_failed_cause: crate::safety::BoundedText::empty(),
+            consecutive_lock_contended: 0,
+            lock_contended_escalated: false,
+            dof: dof.min(crate::rt_core::mailbox::MAX_DOF),
+        }
     }
 
-    /// Budgeted service for the RT executor: skips bus RX once the deadline has passed,
-    /// otherwise performs a single budgeted receive pass into `buf`.
-    pub fn serve_budgeted(
-        &mut self,
-        drv: &mut dyn ArmDriver,
-        deadline: Instant,
-        max_rx_frames: u16,
-        buf: &mut Vec<crate::model::JointState>,
-    ) -> DisableServe {
-        if self.deadline.passed(drv.clock_now()) {
-            return DisableServe {
-                outcome: Some(Self::confirmed(drv)),
-                did_rx: false,
-                rx_frames: 0,
-                budget_exhausted: false,
+    pub fn clear(&mut self) {
+        self.captured_positions.fill(None);
+        self.captured_continuity_epoch.fill(None);
+        self.last_seen_fresh_at.fill(None);
+        self.unverified_mode_since.fill(None);
+        self.unverified_mode_faulted_mask = 0;
+        self.owner_pending_hold_mask = 0;
+        self.owner_hold_mask = 0;
+        self.owner_hold_targets.fill(0.0);
+        self.joint_status.fill(crate::driver::JointHoldStatus::SkippedOff);
+        self.enable_failed_cause = crate::safety::BoundedText::empty();
+        self.consecutive_lock_contended = 0;
+        self.lock_contended_escalated = false;
+    }
+
+    /// Append concise per-joint hold status (`[J1:held,...]`) into a bounded text
+    /// buffer without heap allocation.
+    pub fn write_summary(&self, buf: &mut crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>) {
+        if self.dof == 0 {
+            return;
+        }
+        buf.push_str("[");
+        for i in 0..self.dof {
+            if i > 0 {
+                buf.push_str(",");
+            }
+            let _ = core::fmt::write(
+                buf,
+                format_args!(
+                    "J{}:{}",
+                    i + 1,
+                    self.joint_status[i].short_tag()
+                ),
+            );
+        }
+        buf.push_str("]");
+    }
+
+    /// Format the live `ENABLE_FAILED` message (`Enable failed [J1:...]: <cause>`) without heap
+    /// allocation so observations reflect current per-joint hold status.
+    pub fn write_fault_message(
+        &self,
+        buf: &mut crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>,
+    ) {
+        *buf = crate::safety::BoundedText::empty();
+        buf.push_str("Enable failed ");
+        self.write_summary(buf);
+        if !self.enable_failed_cause.is_empty() {
+            buf.push_str(": ");
+            buf.push_str(self.enable_failed_cause.as_str());
+        }
+    }
+}
+
+/// Inline owner-held driver snapshot refreshed whenever the owner already holds the driver lock
+/// (`poll_hardware_rx`, torque transitions, `enter_failed_hold`, `apply_estop_latch_with_driver`).
+/// Allows stopped-hold capture and MIT stopped-hold preparation to run with zero heap allocation
+/// and zero driver mutex acquisition (Rule R1).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OwnerDriverSnapshot {
+    pub(crate) valid: bool,
+    pub(crate) captured_at: Option<Instant>,
+    pub(crate) fresh_samples: [Option<(f32, u64)>; crate::rt_core::mailbox::MAX_DOF],
+    pub(crate) feedback_ages: [Option<Duration>; crate::rt_core::mailbox::MAX_DOF],
+    pub(crate) hold_mode_verified: [bool; crate::rt_core::mailbox::MAX_DOF],
+}
+
+impl OwnerDriverSnapshot {
+    pub(crate) fn new(_dof: usize) -> Self {
+        Self {
+            valid: false,
+            captured_at: None,
+            fresh_samples: [None; crate::rt_core::mailbox::MAX_DOF],
+            feedback_ages: [None; crate::rt_core::mailbox::MAX_DOF],
+            hold_mode_verified: [false; crate::rt_core::mailbox::MAX_DOF],
+        }
+    }
+
+    #[inline]
+    pub(crate) fn invalidate(&mut self) {
+        self.valid = false;
+        self.captured_at = None;
+        self.fresh_samples.fill(None);
+        self.feedback_ages.fill(None);
+        self.hold_mode_verified.fill(false);
+    }
+
+    /// Captures all driver-owned state needed for stopped-hold evaluation and MIT stopped-hold
+    /// preparation using caller-provided preallocated scratch buffers (zero heap allocations).
+    pub(crate) fn capture_from_driver(
+        drv: &dyn crate::driver::ArmDriver,
+        dof: usize,
+        feedback_numeric_valid: bool,
+        measured_positions: &[f32],
+        ages_buf: &mut Vec<Option<Duration>>,
+        bounds_buf: &mut Vec<Option<Instant>>,
+    ) -> Self {
+        use crate::driver::STOPPED_DISABLE_FEEDBACK_MAX_AGE;
+        let dof = dof.min(crate::rt_core::mailbox::MAX_DOF);
+        let mut snap = Self::new(dof);
+        let drv_now = drv.clock_now();
+        snap.captured_at = Some(drv_now);
+        let has_drv_fresh = drv.has_driver_fresh_position_api();
+        drv.feedback_ages_into(ages_buf);
+        for j in 0..dof {
+            snap.feedback_ages[j] = ages_buf.get(j).copied().flatten();
+        }
+        let mut has_bounds = false;
+        if !has_drv_fresh {
+            drv.feedback_queue_bounds_into(bounds_buf);
+            has_bounds = !bounds_buf.is_empty();
+        }
+        for j in 0..dof {
+            snap.fresh_samples[j] = if has_drv_fresh {
+                drv.fresh_measured_sample_for(j, STOPPED_DISABLE_FEEDBACK_MAX_AGE)
+            } else {
+                let age_ok = snap.feedback_ages[j]
+                    .is_some_and(|a| a <= STOPPED_DISABLE_FEEDBACK_MAX_AGE);
+                let bound_ok = !has_bounds
+                    || bounds_buf.get(j).copied().flatten().is_some_and(|b| {
+                        drv_now.saturating_duration_since(b) <= STOPPED_DISABLE_FEEDBACK_MAX_AGE
+                    });
+                if feedback_numeric_valid && age_ok && bound_ok {
+                    measured_positions
+                        .get(j)
+                        .copied()
+                        .filter(|p| p.is_finite())
+                        .map(|p| (p, 0u64))
+                } else {
+                    None
+                }
             };
+            snap.hold_mode_verified[j] = drv.joint_hold_mode_verified(j);
         }
-        let (rx_frames, budget_exhausted) = drv
-            .read_joint_states_budgeted(buf, deadline, max_rx_frames)
-            .unwrap_or_default();
-        DisableServe {
-            outcome: Self::confirmed(drv).then_some(true),
-            did_rx: true,
-            rx_frames,
-            budget_exhausted,
-        }
+        snap.valid = true;
+        snap
     }
 }
 
@@ -517,13 +676,17 @@ pub enum EnableOrigin {
 }
 
 /// Origin of a [`TorqueTransition::Disable`] handshake so broker torque-off and park
-/// torque-off share the single bounded disable + [`DisableConfirm`] authority.
-/// Hook for `feat/torque-off-when-stopped` per-motor disable evidence extends this
-/// single choke point rather than introducing a parallel disable state machine.
+/// torque-off share the single bounded, rest-pose-gated disable authority.
+/// Per-motor disable evidence extends this single choke point rather than introducing
+/// a parallel disable state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisableOrigin {
     BrokerTransition,
-    Park { watchdog: bool, action_id: Option<u64> },
+    Park {
+        watchdog: bool,
+        action_id: Option<u64>,
+        expected_stop_gen: Option<u64>,
+    },
 }
 
 /// Immediate outcome of starting a park `holding_after_clear` rearm transition.
@@ -544,25 +707,30 @@ pub const BACKGROUND_DISABLE_RETRY_INTERVAL: Duration = Duration::from_millis(25
 pub const BACKGROUND_DISABLE_MAX_WINDOW: Duration = Duration::from_millis(500);
 
 /// Single executor-owned bounded retry state machine for a background hardware disable whose
-/// initial disable attempt failed or ended unconfirmed.
+/// initial disable attempt failed on transport TX.
 ///
-/// Every retry is funneled strictly through the driver's single `begin_torque_budgeted(false, 0)`
-/// (`send(TxKind::Disable, ...)`) choke point so torque-off rest rules apply uniformly.
-/// Once [`Self::Exhausted`] is entered, retries stop permanently until hardware confirms disabled
-/// (`disable_confirmed`) or an explicit recovery action clears the fault.
+/// Every retry is funneled strictly through the driver's single `begin_disable_torque_budgeted(kind, 0)`
+/// (`send(TxKind::DisableRequested | DisableProtective, ...)`) choke point carrying the ORIGINAL
+/// `DisableKind` (`started_at`) so the rest-pose gate and single 1 s lifetime apply uniformly.
+/// Once [`Self::Exhausted`] is entered, retries stop permanently until an accepted disable or
+/// explicit recovery clears the fault.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BackgroundDisableRetry {
     Active {
         attempts: u8,
+        kind: crate::driver::DisableKind,
         started_at: Instant,
         next_retry_at: Instant,
+        /// When `Some(expected_stop_gen)`, this retry belongs to a client-initiated park and MUST
+        /// dispatch via `begin_client_park_disable_with_kind` (cancelling immediately if Stop arrived).
+        client_park: Option<Option<u64>>,
     },
     Exhausted,
 }
 
 /// Authority tuple captured from [`AdmittedProof`] when a `TorqueTransition::Enable` starts,
-/// re-verified before every subsequent enable retry TX so a displaced lease, disconnect, E-stop,
-/// fault, or epoch change aborts immediately.
+/// re-verified before every subsequent enable retry TX and before arming so a displaced lease,
+/// disconnect, E-stop, fault, or epoch change aborts immediately into `FailedHold`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct EnableAuthority {
     pub lease_generation: u64,
@@ -570,29 +738,71 @@ pub struct EnableAuthority {
     pub admitted_epoch: u64,
 }
 
-/// A torque transition started by the owner ([`crate::rt_core::ops::CoreOps::commit_transition`]
-/// or park rearm/disable) and served once per [`crate::rt_core::ops::CoreOps::poll_hardware`]: the driver's
-/// handshake (`ArmDriver::begin_torque` / `poll_torque`), then, for a disable, the
-/// supervisor's own confirmation ([`DisableConfirm`]). Its outcome is applied to the
-/// supervisor state when it ends (torque flags, safety state, fault on failure), exactly as
-/// the blocking `set_torque` applies it.
+/// Phase of the single budgeted enable transition reducer (`Enable -> Validate -> Armed | FailedHold`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnableReducerPhase {
+    /// Driving the driver's enable handshake (`begin_torque` / `poll_torque`).
+    Enable,
+    /// Driver enable completed; validating fresh feedback and enable state before arming.
+    Validate,
+}
+
+/// State of the single enable transition reducer shared by blocking `set_torque(true)`, RT
+/// `begin_enable_torque_transition` / `service_torque_transition`, and park `holding_after_clear`
+/// rearm (`EnableOrigin::ParkRearm`).
+#[derive(Debug, Clone, Copy)]
+pub struct EnableReducer {
+    pub origin: EnableOrigin,
+    pub phase: EnableReducerPhase,
+    pub was_torqued: bool,
+    pub prev_gripper_cmd: Option<f32>,
+    pub authority: Option<EnableAuthority>,
+    pub budgeted: bool,
+}
+
+/// Result of one step of the unified enable reducer (stack-only, 0 heap allocs on RT).
+#[allow(clippy::large_enum_variant)] // inline bounded text avoids RT heap allocation
+enum EnableStepOutcome {
+    Pending {
+        wake: Instant,
+    },
+    Armed(SafetyState),
+    Failed {
+        rt_code: &'static str,
+        message: crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>,
+        feedback_unavailable: bool,
+        estop_interrupted: bool,
+    },
+}
+
+/// A torque transition in flight: either the single budgeted enable reducer
+/// (`Enable -> Validate -> Armed | FailedHold`) or an explicit/park/protective disable handshake
+/// (rest-pose gate defer + bounded disable repeats within the 1 s request lifetime).
 #[derive(Debug, Clone, Copy)]
 pub enum TorqueTransition {
-    /// Waiting for the driver's enable confirmation under `authority`.
-    Enable {
-        origin: EnableOrigin,
-        was_torqued: bool,
-        prev_gripper_cmd: Option<f32>,
-        authority: EnableAuthority,
-    },
-    /// Waiting for the driver's disable handshake (`confirm` None), then for fresh feedback
-    /// reporting every motor disabled, anchored to the original `DisableRequested` timestamp
-    /// (`requested_at`, driver clock) so any background retries keep the request's original lifetime.
+    /// Single budgeted enable transition reducer (`Enable -> Validate -> Armed | FailedHold`).
+    Enable(EnableReducer),
+    /// Driver disable handshake in flight (rest-pose gate wait or bounded disable repeats),
+    /// carrying the `origin` (broker vs park) and original `DisableKind` (`started_at`) so any
+    /// transport-failure background retry keeps the request's original timestamp and rest-pose gate.
     Disable {
         origin: DisableOrigin,
-        confirm: Option<DisableConfirm>,
-        requested_at: Instant,
+        kind: crate::driver::DisableKind,
     },
+}
+
+/// RT terminal code for a driver error during enable without moving the error (zero alloc).
+fn enable_driver_err_code(e: &crate::driver::ArmDriverError) -> &'static str {
+    use crate::driver::ArmDriverError as E;
+    if crate::driver::is_estop_inhibited(e) {
+        "ESTOP_ACTIVE"
+    } else {
+        match e {
+            E::TorqueOffWouldDrop | E::DisableRequestExpired => "TORQUE_OFF_WOULD_DROP",
+            E::Transport(_) => "DRIVER_WRITE_FAILED",
+            _ => "ENABLE_FAILED",
+        }
+    }
 }
 
 /// Static protocol code for an admission refusal on RT torque paths (zero allocations).
@@ -617,6 +827,7 @@ fn torque_error_code(e: &SafetyError) -> &'static str {
         SafetyError::FeedbackUnavailable => "FEEDBACK_UNAVAILABLE",
         SafetyError::FaultActive(_) => "FAULT_ACTIVE",
         SafetyError::NotArmed(_) => "NOT_ARMED",
+        SafetyError::TorqueOffWouldDrop { .. } => "TORQUE_OFF_WOULD_DROP",
         _ => "ENABLE_FAILED",
     }
 }
@@ -1190,21 +1401,36 @@ impl SupervisorInner {
         loads: Option<&[f32]>,
     ) -> bool {
         states.len() == dof
-            && states.iter().all(|s| {
-                s.position.is_finite()
-                    && (!caps.velocity_feedback || s.velocity.is_finite())
-                    && (!caps.torque_feedback || s.torque.is_finite())
-                    && (!caps.temperature_feedback || s.temperature.is_finite())
-            })
+            && states.iter().all(|s| crate::driver::joint_state_valid(s, caps))
             && (!caps.load_feedback
                 || loads.is_some_and(|l| l.len() == dof && l.iter().all(|x| x.is_finite())))
+    }
+
+    /// Per-joint subset numeric validity (e.g., J1..J6 arm joints excluding the gripper).
+    #[allow(dead_code)]
+    pub(crate) fn states_valid_joints(
+        states: &[crate::model::JointState],
+        caps: DriverCapabilities,
+        joints: &[usize],
+        loads: Option<&[f32]>,
+    ) -> bool {
+        !joints.is_empty()
+            && joints.iter().all(|&i| {
+                states.get(i).is_some_and(|s| crate::driver::joint_state_valid(s, caps))
+                    && (!caps.load_feedback
+                        || loads.and_then(|l| l.get(i)).is_some_and(|x| x.is_finite()))
+            })
     }
 
     pub fn hardware_feedback_fresh(&self, max_age: Duration) -> bool {
         if !self.feedback_numeric_valid { return false; }
         // Ages alone decide: drivers' is_feedback_valid() hard-codes 250 ms,
         // which would silently cap callers asking for a longer bound.
-        self.driver.as_ref().is_none_or(|d| d.lock().is_ok_and(|drv| drv.feedback_all_within(self.config.dof, max_age)))
+        if self.driver.is_none() {
+            return true;
+        }
+        self.lock_driver_for_tick()
+            .is_some_and(|drv| drv.feedback_all_within(self.config.dof, max_age))
     }
 
     /// True when every arm joint (excluding a `PosForce` Damiao gripper) has valid numeric
@@ -1217,7 +1443,11 @@ impl SupervisorInner {
             return self.hardware_feedback_fresh(max_age);
         }
         let arm = self.config.arm_joints();
-        self.driver.as_ref().is_none_or(|d| d.lock().is_ok_and(|drv| drv.feedback_joints_within(&arm, max_age)))
+        if self.driver.is_none() {
+            return true;
+        }
+        self.lock_driver_for_tick()
+            .is_some_and(|drv| drv.feedback_joints_within(&arm, max_age))
     }
 
     /// Per arm joint, an instant before which its last sample cannot have been enqueued: the
@@ -1245,167 +1475,1197 @@ impl SupervisorInner {
         (self.measured_positions.clone(), vels, instants, seqs)
     }
 
-    /// Zero-allocation RT executor background disable entry point: routes strictly through the
-    /// driver's single `begin_torque_budgeted(false, 0)` choke point and respects the single
-    /// [`BackgroundDisableRetry`] exhaustion state so exhausted disables never restart.
-    pub(super) fn request_disable_rt(&mut self) -> Result<(), &'static str> {
-        // On RT executor ownership, if a park disable transition is already in flight on the single
-        // TorqueTransition::Disable authority, keep it as the owner so its bounded DisableConfirm
-        // deadline and FEEDBACK_UNCONFIRMED terminal are preserved when a safety event joins.
-        if matches!(
-            self.torque_transition,
-            Some(TorqueTransition::Disable { origin: DisableOrigin::Park { .. }, .. })
-        ) {
-            self.disable_requested();
-            return Ok(());
-        }
-        // Supersede any in-flight torque transition before issuing a safety/shutdown disable.
-        if let Some(t) = self.torque_transition.take() {
-            match t {
-                TorqueTransition::Enable { origin: EnableOrigin::BrokerTransition, .. }
-                | TorqueTransition::Disable { origin: DisableOrigin::BrokerTransition, .. } => {
-                    self.core.begin_transition(Err("SUPERSEDED"));
-                }
-                TorqueTransition::Enable { origin: EnableOrigin::ParkRearm { action_id, .. }, .. } => {
-                    self.finish_park_rearm_failed(action_id, "UNLOAD_FAILED");
-                }
-                TorqueTransition::Disable { origin: DisableOrigin::Park { .. }, .. } => {}
-            }
-        }
-        if matches!(
-            self.background_disable_retry,
-            Some(BackgroundDisableRetry::Exhausted)
-        ) {
-            return Err("DISABLE_UNCONFIRMED");
-        }
-        self.disable_requested();
-        let Some(ref d) = self.driver else {
-            self.disable_confirmed();
-            return Ok(());
+    /// Bounded, zero-allocation error from [`Self::request_disable_bounded`].
+    #[allow(clippy::result_large_err)] // inline bounded error keeps RT disable retry zero-alloc
+    pub(crate) fn request_disable_bounded(
+        &mut self,
+        kind: crate::driver::DisableKind,
+    ) -> Result<(), RequestDisableError> {
+        use crate::rt_core::ops::TorqueProgress as Rt;
+        // T2: Never silently discard a pending broker/park `Disable` transition when upgrading to
+        // protective disable (e.g. thermal trip). Non-disable transitions (such as an uncancelled
+        // `Enable`) end `SUPERSEDED` / `UNLOAD_FAILED`; a pending `Disable` stays attached to the
+        // upgraded driver disable handshake (or completes/fails here) so its request receives a
+        // terminal delivered exactly once.
+        let pending_disable_origin = match self.torque_transition {
+            Some(TorqueTransition::Disable { origin, .. }) => Some(origin),
+            _ => None,
         };
-        let mut drv = d.lock().map_err(|_| "FEEDBACK_UNAVAILABLE")?;
-        let res = drv.begin_torque_budgeted(false, 0);
-        let drv_now = drv.clock_now();
-        match res {
-            Ok(progress) => {
-                let confirmed_now = matches!(
-                    progress,
-                    crate::driver::TorqueProgress::Done(crate::driver::TorqueOutcome::Confirmed)
-                ) && DisableConfirm::confirmed(&**drv);
-                drop(drv);
-                if confirmed_now {
-                    self.disable_confirmed();
-                } else {
-                    self.is_torqued = true;
-                    self.arm_background_disable_retry(drv_now);
-                }
-                Ok(())
-            }
-            Err(_) => {
-                drop(drv);
-                self.is_torqued = true;
-                self.arm_background_disable_retry(drv_now);
-                Err("DRIVER_WRITE_FAILED")
-            }
+        let pending_disable = pending_disable_origin.is_some();
+        let is_protective = matches!(kind, crate::driver::DisableKind::DisableProtective { .. });
+        let prev_protective = matches!(
+            self.active_disable_kind,
+            Some(crate::driver::DisableKind::DisableProtective { .. })
+        );
+        if is_protective && !prev_protective {
+            // Upgrading from a non-protective disable to thermal/exit protective disable clears
+            // any prior non-protective retry exhaustion so the protective cut always runs.
+            self.background_disable_retry = None;
         }
-    }
-
-    /// A successful transport write is not confirmation that torque was removed.
-    pub(super) fn request_disable(&mut self) -> Result<(), SafetyError> {
-        if self.rt_executor_owned {
-            return self
-                .request_disable_rt()
-                .map_err(|_| SafetyError::FeedbackUnavailable);
-        }
-        // a blocking disable (park, thermal trip, fault path) replaces a transition in flight
-        // (the driver's disable replaces its pending enable): only broker transitions emit SUPERSEDED
-        let mut joined_park: Option<(bool, Option<u64>)> = None;
-        if let Some(t) = self.torque_transition.take() {
-            match t {
-                TorqueTransition::Enable { origin: EnableOrigin::BrokerTransition, .. }
-                | TorqueTransition::Disable { origin: DisableOrigin::BrokerTransition, .. } => {
-                    self.core.begin_transition(Err("SUPERSEDED"));
-                }
-                TorqueTransition::Enable { origin: EnableOrigin::ParkRearm { action_id, .. }, .. } => {
-                    self.finish_park_rearm_failed(action_id, "UNLOAD_FAILED");
-                }
-                TorqueTransition::Disable { origin: DisableOrigin::Park { watchdog, action_id }, .. } => {
-                    joined_park = Some((watchdog, action_id));
+        if !pending_disable {
+            if let Some(t) = self.torque_transition.take() {
+                match t {
+                    TorqueTransition::Enable(EnableReducer {
+                        origin: EnableOrigin::BrokerTransition,
+                        ..
+                    }) => {
+                        self.core.begin_transition(Err("SUPERSEDED"));
+                    }
+                    TorqueTransition::Enable(EnableReducer {
+                        origin: EnableOrigin::ParkRearm { action_id, .. },
+                        ..
+                    }) => {
+                        self.finish_park_rearm_failed(action_id, "UNLOAD_FAILED");
+                    }
+                    TorqueTransition::Disable { .. } => {}
                 }
             }
         }
+        if self.rt_executor_owned
+            && !pending_disable
+            && matches!(self.background_disable_retry, Some(BackgroundDisableRetry::Exhausted))
+        {
+            return Err(RequestDisableError {
+                code: "DISABLE_UNCONFIRMED",
+                message: crate::safety::BoundedText::new("Background torque disable retries exhausted"),
+                refused_by_chokepoint: false,
+            });
+        }
+        if is_protective {
+            self.mit_torque_off();
+            self.active_disable_client_park = None;
+        }
+        self.active_disable_kind = Some(kind);
         self.disable_requested();
-        if let Some(ref d) = self.driver {
-            let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
-            if let Err(e) = drv.set_torque(false) {
-                drop(drv);
-                if let Some((watchdog, action_id)) = joined_park {
-                    self.finish_park_disable_failed(watchdog, action_id, "DRIVER_WRITE_FAILED", "Torque disable transmission failed");
+        if self.driver.is_some() {
+            if self.rt_executor_owned {
+                let outcome = {
+                    let d = self.driver.as_ref().expect("checked is_some");
+                    match d.try_lock() {
+                        Ok(mut drv) => {
+                            let drv_now = drv.clock_now();
+                            let res = drv.begin_disable_torque_budgeted(kind, 0);
+                            let post_now = drv.clock_now();
+                            let frames_dispatched = drv.disable_frames_dispatched();
+                            let dispatched_mask = drv.disable_dispatched_mask();
+                            let mut ages_buf = std::mem::take(&mut self.scratch.ages);
+                            let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
+                            let snap = OwnerDriverSnapshot::capture_from_driver(
+                                drv.as_ref(),
+                                self.config.dof,
+                                self.feedback_numeric_valid,
+                                &self.measured_positions,
+                                &mut ages_buf,
+                                &mut bounds_buf,
+                            );
+                            self.scratch.ages = ages_buf;
+                            self.scratch.fb.bounds = bounds_buf;
+                            Ok((res, drv_now, post_now, frames_dispatched, dispatched_mask, snap))
+                        }
+                        Err(std::sync::TryLockError::WouldBlock) => Err(true),
+                        Err(std::sync::TryLockError::Poisoned(_)) => Err(false),
+                    }
+                };
+                let (res, drv_now, post_now, frames_dispatched, dispatched_mask, snap) = match outcome {
+                    Ok(v) => {
+                        self.reset_disable_lock_contention();
+                        v
+                    }
+                    Err(true) => {
+                        self.record_disable_lock_contention();
+                        if let Some(origin) = pending_disable_origin {
+                            self.torque_transition = Some(TorqueTransition::Disable { origin, kind });
+                        } else if is_protective {
+                            // R12 B4: A contended first protective (thermal / exit) cut MUST arm
+                            // a bounded per-release retry (`next_retry_at: now`) on the driver's
+                            // lock-free clock so `service_background_disable` retries every
+                            // release until dispatched.
+                            let retry_now = self.driver_clock_now_or(Instant::now());
+                            let _ = self.arm_background_disable_retry_immediate_with_kind(
+                                kind,
+                                retry_now,
+                            );
+                        }
+                        return Err(RequestDisableError {
+                            code: "DRIVER_BUSY",
+                            message: crate::safety::BoundedText::new("Driver mutex contended on RT disable"),
+                            refused_by_chokepoint: false,
+                        });
+                    }
+                    Err(false) => {
+                        if let Some(origin) = pending_disable_origin {
+                            self.torque_transition = None;
+                            match origin {
+                                DisableOrigin::BrokerTransition => {
+                                    self.core.begin_transition(Err("FEEDBACK_UNAVAILABLE"));
+                                }
+                                DisableOrigin::Park { watchdog, action_id, .. } => {
+                                    self.finish_park_disable_failed(
+                                        watchdog,
+                                        action_id,
+                                        "FEEDBACK_UNAVAILABLE",
+                                        "Feedback unavailable",
+                                    );
+                                }
+                            }
+                        }
+                        return Err(RequestDisableError {
+                            code: "FEEDBACK_UNAVAILABLE",
+                            message: crate::safety::BoundedText::new("Feedback unavailable"),
+                            refused_by_chokepoint: false,
+                        });
+                    }
+                };
+                let res = match res {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let refused = matches!(
+                            e,
+                            crate::driver::ArmDriverError::TorqueOffWouldDrop
+                                | crate::driver::ArmDriverError::DisableRequestExpired
+                        );
+                        let mut message = crate::safety::BoundedText::empty();
+                        message.push_str("Torque disable transmission failed: ");
+                        e.write_bounded(&mut message);
+                        let partial_remaining = self.is_partial_disable_remaining(dispatched_mask);
+                        let partial_retry = self.commit_partial_disable_retry_kind(
+                            kind,
+                            post_now,
+                            frames_dispatched,
+                            partial_remaining,
+                        );
+                        let code = if let Some(origin) = pending_disable_origin {
+                            self.torque_transition = None;
+                            if let Some(rk) = partial_retry {
+                                let _ = self.arm_background_disable_retry_immediate_with_kind(rk, post_now);
+                            } else if is_protective {
+                                let _ = self.arm_background_disable_retry_immediate_with_kind(kind, post_now);
+                            } else if !refused {
+                                let _ = self.arm_background_disable_retry_with_kind(kind, post_now);
+                            }
+                            let code = self.disable_step_failed_inner(e, partial_retry.is_some());
+                            match origin {
+                                DisableOrigin::BrokerTransition => {
+                                    self.core.begin_transition(Err(code));
+                                }
+                                DisableOrigin::Park { watchdog, action_id, .. } => {
+                                    self.finish_park_disable_failed(
+                                        watchdog,
+                                        action_id,
+                                        code,
+                                        "Torque disable transmission failed",
+                                    );
+                                }
+                            }
+                            code
+                        } else {
+                            if let Some(rk) = partial_retry {
+                                let _ = self.arm_background_disable_retry_immediate_with_kind(rk, post_now);
+                            } else if is_protective {
+                                let _ = self.arm_background_disable_retry_immediate_with_kind(kind, post_now);
+                            } else if refused {
+                                self.disable_pending = false;
+                                self.active_disable_kind = None;
+                                self.last_disable_attempt = None;
+                                self.background_disable_retry = None;
+                            } else {
+                                let _ = self.arm_background_disable_retry_with_kind(kind, post_now);
+                            }
+                            crate::driver::handshake::rt_progress(false, Err(e))
+                                .err()
+                                .unwrap_or("HARDWARE_FAULT")
+                        };
+                        return Err(RequestDisableError {
+                            code,
+                            message,
+                            refused_by_chokepoint: refused && !frames_dispatched,
+                        });
+                    }
+                };
+                self.owner_driver_snapshot = snap;
+                let done_now = matches!(res, crate::driver::TorqueProgress::Done(_));
+                if done_now {
+                    self.disable_accepted();
+                    if let Some(origin) = pending_disable_origin {
+                        self.torque_transition = None;
+                        match origin {
+                            DisableOrigin::BrokerTransition => {
+                                let terminal = self.torque_off_finish_rt().map(|()| Rt::Done);
+                                self.core.begin_transition(terminal);
+                            }
+                            DisableOrigin::Park { watchdog, action_id, .. } => {
+                                self.finish_park_disable_after_accepted(watchdog, action_id);
+                            }
+                        }
+                    }
+                } else {
+                    if frames_dispatched {
+                        self.disable_first_frame_accepted();
+                    }
+                    if let Some(origin) = pending_disable_origin {
+                        self.torque_transition = Some(TorqueTransition::Disable { origin, kind });
+                    } else {
+                        let _ = self.arm_background_disable_retry_with_kind(kind, drv_now);
+                    }
                 }
-                return Err(SafetyError::ClearFaultRejected(format!("Torque disable transmission failed: {e}")));
+                return Ok(());
             }
-            let mut confirm = DisableConfirm::start(drv.clock_now());
-            while confirm.serve(&mut **drv).is_none() {
-                drv.clock_pause(DISABLE_CONFIRM_SERVICE);
-            }
-            if !DisableConfirm::confirmed(&**drv) {
-                drop(drv);
-                if let Some((watchdog, action_id)) = joined_park {
-                    self.finish_park_disable_failed(watchdog, action_id, "FEEDBACK_UNCONFIRMED", "Torque disable not confirmed by fresh hardware feedback");
+            if self.driver.as_ref().expect("checked is_some").is_poisoned() {
+                if let Some(origin) = pending_disable_origin {
+                    self.torque_transition = None;
+                    match origin {
+                        DisableOrigin::BrokerTransition => {
+                            self.core.begin_transition(Err("FEEDBACK_UNAVAILABLE"));
+                        }
+                        DisableOrigin::Park { watchdog, action_id, .. } => {
+                            self.finish_park_disable_failed(
+                                watchdog,
+                                action_id,
+                                "FEEDBACK_UNAVAILABLE",
+                                "Feedback unavailable",
+                            );
+                        }
+                    }
                 }
-                return Err(SafetyError::ClearFaultRejected("Torque disable has not been confirmed by fresh hardware feedback".into()));
+                return Err(RequestDisableError {
+                    code: "FEEDBACK_UNAVAILABLE",
+                    message: crate::safety::BoundedText::new("Feedback unavailable"),
+                    refused_by_chokepoint: false,
+                });
             }
+            let d = self.driver.as_ref().expect("checked is_some");
+            let mut drv = match d.lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    return Err(RequestDisableError {
+                        code: "FEEDBACK_UNAVAILABLE",
+                        message: crate::safety::BoundedText::new("Feedback unavailable"),
+                        refused_by_chokepoint: false,
+                    });
+                }
+            };
+            // R12 B1: Never hold the driver mutex while waiting/sleeping for K=3 rest-pose
+            // evidence on legacy owners. Drivers supporting deferred per-release rest-gate wait
+            // (`FeetechArmDriver`, `DamiaoArmDriver`) begin non-blockingly: if awaiting K=3
+            // (`Pending` with `!frames_dispatched`), release the mutex immediately so subsequent
+            // legacy releases advance one bounded poll step while holds keep running between
+            // releases.
+            if drv.supports_budgeted_disable_await() {
+                match drv.begin_disable_torque(kind) {
+                    Ok(crate::driver::TorqueProgress::Done(_)) => {}
+                    Ok(crate::driver::TorqueProgress::Pending { .. }) => {
+                        let frames_dispatched = drv.disable_frames_dispatched();
+                        if !frames_dispatched {
+                            let mut ages_buf = std::mem::take(&mut self.scratch.ages);
+                            let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
+                            self.owner_driver_snapshot = OwnerDriverSnapshot::capture_from_driver(
+                                drv.as_ref(),
+                                self.config.dof,
+                                self.feedback_numeric_valid,
+                                &self.measured_positions,
+                                &mut ages_buf,
+                                &mut bounds_buf,
+                            );
+                            self.scratch.ages = ages_buf;
+                            self.scratch.fb.bounds = bounds_buf;
+                            drop(drv);
+                            if let Some(origin) = pending_disable_origin {
+                                self.torque_transition = Some(TorqueTransition::Disable { origin, kind });
+                            }
+                            return Ok(());
+                        }
+                        // Frame 1 already dispatched (`torque_intent = Off`): complete remaining
+                        // bounded disable repeats without re-sending repeat 1 or starving holds.
+                        if let Err(e) = drv.finish_dispatched_disable() {
+                            let refused = matches!(
+                                e,
+                                crate::driver::ArmDriverError::TorqueOffWouldDrop
+                                    | crate::driver::ArmDriverError::DisableRequestExpired
+                            );
+                            let post_now = drv.clock_now();
+                            let frames_dispatched = drv.disable_frames_dispatched() || true;
+                            let dispatched_mask = drv.disable_dispatched_mask();
+                            let mut message = crate::safety::BoundedText::empty();
+                            message.push_str("Torque disable transmission failed: ");
+                            e.write_bounded(&mut message);
+                            drop(drv);
+                            let partial_remaining = self.is_partial_disable_remaining(dispatched_mask);
+                            let partial_retry = self.commit_partial_disable_retry_kind(
+                                kind,
+                                post_now,
+                                frames_dispatched,
+                                partial_remaining,
+                            );
+                            let code = if let Some(origin) = pending_disable_origin {
+                                self.torque_transition = None;
+                                let code = self.disable_step_failed_inner(e, partial_retry.is_some());
+                                match origin {
+                                    DisableOrigin::BrokerTransition => {
+                                        self.core.begin_transition(Err(code));
+                                    }
+                                    DisableOrigin::Park { watchdog, action_id, .. } => {
+                                        self.finish_park_disable_failed(
+                                            watchdog,
+                                            action_id,
+                                            code,
+                                            "Torque disable transmission failed",
+                                        );
+                                    }
+                                }
+                                code
+                            } else {
+                                if refused && partial_retry.is_none() {
+                                    self.disable_pending = false;
+                                    self.active_disable_kind = None;
+                                    self.last_disable_attempt = None;
+                                    self.background_disable_retry = None;
+                                }
+                                crate::driver::handshake::rt_progress(false, Err(e))
+                                    .err()
+                                    .unwrap_or("HARDWARE_FAULT")
+                            };
+                            return Err(RequestDisableError {
+                                code,
+                                message,
+                                refused_by_chokepoint: refused && !frames_dispatched,
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        let refused = matches!(
+                            e,
+                            crate::driver::ArmDriverError::TorqueOffWouldDrop
+                                | crate::driver::ArmDriverError::DisableRequestExpired
+                        );
+                        let post_now = drv.clock_now();
+                        let frames_dispatched = drv.disable_frames_dispatched();
+                        let dispatched_mask = drv.disable_dispatched_mask();
+                        let mut message = crate::safety::BoundedText::empty();
+                        message.push_str("Torque disable transmission failed: ");
+                        e.write_bounded(&mut message);
+                        drop(drv);
+                        let partial_remaining = self.is_partial_disable_remaining(dispatched_mask);
+                        let partial_retry = self.commit_partial_disable_retry_kind(
+                            kind,
+                            post_now,
+                            frames_dispatched,
+                            partial_remaining,
+                        );
+                        let code = if let Some(origin) = pending_disable_origin {
+                            self.torque_transition = None;
+                            let code = self.disable_step_failed_inner(e, partial_retry.is_some());
+                            match origin {
+                                DisableOrigin::BrokerTransition => {
+                                    self.core.begin_transition(Err(code));
+                                }
+                                DisableOrigin::Park { watchdog, action_id, .. } => {
+                                    self.finish_park_disable_failed(
+                                        watchdog,
+                                        action_id,
+                                        code,
+                                        "Torque disable transmission failed",
+                                    );
+                                }
+                            }
+                            code
+                        } else {
+                            if refused && partial_retry.is_none() {
+                                self.disable_pending = false;
+                                self.active_disable_kind = None;
+                                self.last_disable_attempt = None;
+                                self.background_disable_retry = None;
+                            }
+                            crate::driver::handshake::rt_progress(false, Err(e))
+                                .err()
+                                .unwrap_or("HARDWARE_FAULT")
+                        };
+                        return Err(RequestDisableError {
+                            code,
+                            message,
+                            refused_by_chokepoint: refused && !frames_dispatched,
+                        });
+                    }
+                }
+            } else if let Err(e) = drv.disable_torque(kind) {
+                let refused = matches!(
+                    e,
+                    crate::driver::ArmDriverError::TorqueOffWouldDrop
+                        | crate::driver::ArmDriverError::DisableRequestExpired
+                );
+                let post_now = drv.clock_now();
+                let frames_dispatched = drv.disable_frames_dispatched();
+                let dispatched_mask = drv.disable_dispatched_mask();
+                let mut message = crate::safety::BoundedText::empty();
+                message.push_str("Torque disable transmission failed: ");
+                e.write_bounded(&mut message);
+                drop(drv);
+                let partial_remaining = self.is_partial_disable_remaining(dispatched_mask);
+                let partial_retry = self.commit_partial_disable_retry_kind(
+                    kind,
+                    post_now,
+                    frames_dispatched,
+                    partial_remaining,
+                );
+                let code = if let Some(origin) = pending_disable_origin {
+                    self.torque_transition = None;
+                    let code = self.disable_step_failed_inner(e, partial_retry.is_some());
+                    match origin {
+                        DisableOrigin::BrokerTransition => {
+                            self.core.begin_transition(Err(code));
+                        }
+                        DisableOrigin::Park { watchdog, action_id, .. } => {
+                            self.finish_park_disable_failed(
+                                watchdog,
+                                action_id,
+                                code,
+                                "Torque disable transmission failed",
+                            );
+                        }
+                    }
+                    code
+                } else {
+                    if refused && partial_retry.is_none() {
+                        self.disable_pending = false;
+                        self.active_disable_kind = None;
+                        self.last_disable_attempt = None;
+                        self.background_disable_retry = None;
+                    }
+                    crate::driver::handshake::rt_progress(false, Err(e))
+                        .err()
+                        .unwrap_or("HARDWARE_FAULT")
+                };
+                return Err(RequestDisableError {
+                    code,
+                    message,
+                    refused_by_chokepoint: refused && !frames_dispatched,
+                });
+            }
+            let mut ages_buf = std::mem::take(&mut self.scratch.ages);
+            let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
+            self.owner_driver_snapshot = OwnerDriverSnapshot::capture_from_driver(
+                drv.as_ref(),
+                self.config.dof,
+                self.feedback_numeric_valid,
+                &self.measured_positions,
+                &mut ages_buf,
+                &mut bounds_buf,
+            );
+            self.scratch.ages = ages_buf;
+            self.scratch.fb.bounds = bounds_buf;
+            drop(drv);
         }
-        self.disable_confirmed();
-        if let Some((watchdog, action_id)) = joined_park {
-            self.finish_park_disable_ok(watchdog, action_id);
+        self.disable_accepted();
+        if let Some(origin) = pending_disable_origin {
+            self.torque_transition = None;
+            match origin {
+                DisableOrigin::BrokerTransition => {
+                    let terminal = self
+                        .torque_off_finish_in_place()
+                        .map(|()| Rt::Done)
+                        .map_err(|e| torque_error_code(&e));
+                    self.core.begin_transition(terminal);
+                }
+                DisableOrigin::Park { watchdog, action_id, .. } => {
+                    self.finish_park_disable_after_accepted(watchdog, action_id);
+                }
+            }
         }
         Ok(())
     }
 
-    /// State at the first disable frame: MIT off, `disable_pending` until confirmed.
+    /// A successful transport write is not confirmation that torque was removed.
+    pub(super) fn request_disable(&mut self, kind: crate::driver::DisableKind) -> Result<(), SafetyError> {
+        self.request_disable_bounded(kind).map_err(|e| {
+            if e.code == "FEEDBACK_UNAVAILABLE" {
+                SafetyError::FeedbackUnavailable
+            } else if e.code == "TORQUE_OFF_WOULD_DROP" {
+                let r = self
+                    .may_disable_torque_while_stopped()
+                    .err()
+                    .unwrap_or(crate::supervisor::StoppedTorqueOffRefusal::StaleOrMissingFeedback);
+                self.last_stopped_torque_off_refusal = Some(r);
+                r.into_safety_error(&self.config.joint_names)
+            } else {
+                SafetyError::ClearFaultRejected(e.message.as_str().to_string())
+            }
+        })
+    }
+
+    /// State when a disable request is in flight: `disable_pending` blocks new motion and
+    /// enable/clear-fault transitions, while holds and MIT hold context stay active until the
+    /// rest gate passes and the first disable frame is actually dispatched.
     fn disable_requested(&mut self) {
         self.disable_requested_at(Instant::now());
     }
 
     fn disable_requested_at(&mut self, now: Instant) {
-        self.mit_torque_off();
         self.disable_pending = true;
         self.tracking.invalidate();
         self.tracking.clear_recovery_suspension();
         self.last_disable_attempt = Some(now);
     }
 
-    /// State once fresh feedback confirmed the disable.
-    pub(super) fn disable_confirmed(&mut self) {
+    /// State once the rest-pose gate has passed and the first disable frame has been dispatched
+    /// (while bounded repeat frames are still finishing): records `torque_intent = Off` and stops
+    /// holds while keeping `disable_pending = true` until the handshake completes.
+    pub(crate) fn disable_first_frame_accepted(&mut self) {
+        self.mit_torque_off();
+        self.torque_intent = TorqueIntent::Off;
+        self.measured_hold.clear();
+    }
+
+    pub(crate) fn reset_reported_torque_loss(&mut self) {
+        self.reported_torque_loss_count = 0;
+        self.reported_torque_loss_last_release = 0;
+        self.reported_torque_loss_last_sample_seq = None;
+        self.reported_torque_loss_from_motion = false;
+    }
+
+    /// State once an explicit disable (passing the rest-pose gate) or protective disable has been
+    /// accepted and transmitted: records `torque_intent = Off` by decision and stops holding.
+    pub(crate) fn disable_accepted(&mut self) {
+        self.mit_torque_off();
+        self.torque_intent = TorqueIntent::Off;
         self.is_torqued = false;
         self.pending_rearm = false;
         self.disable_pending = false;
+        self.active_disable_kind = None;
+        self.active_disable_client_park = None;
         self.background_disable_retry = None;
         self.gripper_hold_vel_ceiling = None;
+        self.enable_lifecycle = EnableLifecycle::Disarmed;
+        self.measured_hold.clear();
+        self.reset_reported_torque_loss();
         self.last_poll_enable_state = EnableState::Disabled;
         self.last_poll_partial_enable = false;
     }
 
-    /// Hook point for `feat/torque-off-when-stopped` (torque-off rest/policy rules before a
-    /// background disable retry). Pass-through on PR L so we never duplicate that branch's rules
-    /// while ensuring every retry routes strictly through the driver's single
-    /// `begin_torque_budgeted(false, 0)` (`send(TxKind::Disable, ...)`) choke point.
+    /// Persistent enable lifecycle owned by the transition reducer.
+    pub fn enable_lifecycle(&self) -> EnableLifecycle {
+        self.enable_lifecycle
+    }
+
+    /// Owner-owned torque decision state (`Off` only after an accepted disable or protective cut).
+    pub fn torque_intent(&self) -> TorqueIntent {
+        self.torque_intent
+    }
+
+    /// Latest per-joint hold status observed by the stopped/failed-hold tracker.
+    pub fn joint_hold_status(&self) -> &[crate::driver::JointHoldStatus] {
+        &self.measured_hold.joint_status[..self.measured_hold.dof]
+    }
+
+    /// Single shared clear-fault enable context for BOTH legacy and RT clear owners:
+    /// reported enable state from feedback is telemetry only (never blocks recovery).
     #[inline]
-    fn torque_off_when_stopped_hook(&self) -> bool {
-        true
+    fn populate_enable_clear_context(&self, ctx: &mut crate::safety::ClearContext, enable_fb: bool) {
+        ctx.enable_state_known = true;
+        ctx.failed_hold_recovery_allowed = self.enable_lifecycle == EnableLifecycle::FailedHold
+            && enable_fb
+            && self.safety.has_latched_fault_code(FaultCode::EnableFailed)
+            && !self.safety.has_latched_fault_kind(crate::safety::FaultKind::BusLoss)
+            && !self.safety.has_latched_fault_kind(crate::safety::FaultKind::ThermalTrip);
     }
 
-    fn arm_background_disable_retry(&mut self, drv_now: Instant) {
-        let _ = self.arm_background_disable_retry_with_origin(drv_now, drv_now);
+    /// Stopped-hold eligibility derived strictly from the owner's decision state (`torque_intent`):
+    /// holds are the default after any stop, fault, E-stop, failed/interrupted enable, lease loss,
+    /// or watchdog event, and stop ONLY after an accepted disable records `torque_intent = Off`.
+    #[inline]
+    pub(crate) fn stopped_hold_eligible(&self) -> bool {
+        self.torque_intent == TorqueIntent::On
+            && !matches!(
+                self.active_disable_kind,
+                Some(crate::driver::DisableKind::DisableProtective { .. })
+            )
     }
 
-    /// Arms bounded [`BackgroundDisableRetry`] preserving the original `DisableRequested`
-    /// timestamp (`requested_at`, driver clock) so retries stay bounded within the request's
-    /// original `BACKGROUND_DISABLE_MAX_WINDOW` lifetime (M4).
-    fn arm_background_disable_retry_with_origin(
+    /// Refreshes [`Self::owner_driver_snapshot`] from an already-locked driver reference without
+    /// acquiring `self.driver` and without heap allocations (Rule R1).
+    pub(crate) fn refresh_owner_driver_snapshot_from_ref(&mut self, drv: &dyn crate::driver::ArmDriver) {
+        let mut ages_buf = std::mem::take(&mut self.scratch.ages);
+        let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
+        self.owner_driver_snapshot = OwnerDriverSnapshot::capture_from_driver(
+            drv,
+            self.config.dof,
+            self.feedback_numeric_valid,
+            &self.measured_positions,
+            &mut ages_buf,
+            &mut bounds_buf,
+        );
+        self.scratch.ages = ages_buf;
+        self.scratch.fb.bounds = bounds_buf;
+    }
+
+    /// L2: For every joint while torqued or holding while stopped (`torqued_or_stopped`) whose
+    /// control mode is unverified, request a `RID_CTRL_MODE` readback every tick while already
+    /// holding the driver lock in `poll_hardware_rx`. If still unverified after 200 ms, latch a
+    /// non-recoverable fault naming the joint(s) and report the joint unheld
+    /// (`UnheldNoVerifiedMode`). Zero heap allocations.
+    pub(crate) fn enforce_unverified_mode_readback_parts(
+        measured_hold: &mut MeasuredHoldTracker,
+        safety: &mut crate::safety::SafetyManager,
+        snap: &OwnerDriverSnapshot,
+        transition_pending: bool,
+        torqued_or_stopped: bool,
+        config_dof: usize,
+        driver: &mut dyn crate::driver::ArmDriver,
+    ) {
+        use crate::driver::JointHoldStatus;
+        if !snap.valid || transition_pending {
+            return;
+        }
+        let drv_now = snap.captured_at.unwrap_or_else(|| driver.clock_now());
+        let dof = config_dof.min(crate::rt_core::mailbox::MAX_DOF);
+        measured_hold.dof = dof;
+        let mut unverified_mask = 0u64;
+        let mut timed_out_mask = 0u64;
+        for j in 0..dof {
+            if !torqued_or_stopped || snap.hold_mode_verified[j] {
+                measured_hold.unverified_mode_since[j] = None;
+                measured_hold.unverified_mode_faulted_mask &= !(1u64 << j);
+                continue;
+            }
+            unverified_mask |= 1u64 << j;
+            measured_hold.joint_status[j] = JointHoldStatus::UnheldNoVerifiedMode;
+            let since = *measured_hold.unverified_mode_since[j].get_or_insert(drv_now);
+            if drv_now.saturating_duration_since(since) >= UNVERIFIED_MODE_READBACK_TIMEOUT
+                && (measured_hold.unverified_mode_faulted_mask & (1u64 << j)) == 0
+            {
+                timed_out_mask |= 1u64 << j;
+            }
+        }
+        if unverified_mask != 0 {
+            let _ = driver.request_mode_readback_budgeted(unverified_mask);
+        }
+        if timed_out_mask != 0 {
+            measured_hold.unverified_mode_faulted_mask |= timed_out_mask;
+            let detail = crate::safety::FaultDetail::formatted(FaultCode::HardwareFault, |buf| {
+                let mut first = true;
+                for j in 0..dof {
+                    if (timed_out_mask & (1u64 << j)) != 0 {
+                        if !first {
+                            buf.push_str(", ");
+                        }
+                        first = false;
+                        let _ = core::fmt::write(buf, format_args!("J{}", j + 1));
+                    }
+                }
+                buf.push_str(" control mode unverified after 200 ms readback timeout; joint unheld");
+            });
+            safety.latch(crate::safety::FaultKind::Other, detail);
+        }
+    }
+
+    /// Single shared stopped-hold capture kernel reading strictly from the owner's inline
+    /// [`Self::owner_driver_snapshot`] with ZERO driver mutex acquisition and ZERO heap
+    /// allocations (Rule R1). Commands holds to EVERY joint with fresh (`<= 100 ms`) finite
+    /// measured position and verified hold mode, regardless of reported motor enable telemetry.
+    /// Returns `(hold_mask, invalidated_mask)`.
+    pub(crate) fn capture_measured_hold_from_owner(&mut self) -> (u64, u64) {
+        use crate::driver::{JointHoldStatus, STOPPED_DISABLE_FEEDBACK_MAX_AGE};
+        let dof = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
+        self.measured_hold.dof = dof;
+        if !self.owner_driver_snapshot.valid {
+            let mut hold_mask = 0u64;
+            let mut invalidated_mask = 0u64;
+            for j in 0..dof {
+                if self.measured_hold.captured_positions[j].is_some() {
+                    if self.owner_driver_snapshot.hold_mode_verified[j] {
+                        self.measured_hold.joint_status[j] = JointHoldStatus::HeldStaleTarget;
+                        hold_mask |= 1u64 << j;
+                    } else {
+                        self.measured_hold.joint_status[j] = JointHoldStatus::UnheldNoVerifiedMode;
+                    }
+                } else {
+                    self.measured_hold.captured_continuity_epoch[j] = None;
+                    self.measured_hold.last_seen_fresh_at[j] = None;
+                    self.measured_hold.joint_status[j] = JointHoldStatus::UnheldNoFreshFeedback;
+                    invalidated_mask |= 1u64 << j;
+                }
+            }
+            return (hold_mask, invalidated_mask);
+        }
+        let snap = self.owner_driver_snapshot;
+        let drv_now = snap.captured_at.unwrap_or_else(Instant::now);
+        let mut hold_mask = 0u64;
+        let mut invalidated_mask = 0u64;
+        for j in 0..dof {
+            let Some((pos, epoch)) = snap.fresh_samples[j] else {
+                // B2: Never drop an already-captured hold while torque_intent == On.
+                // Keep the last captured target and report `HeldStaleTarget` ("hold target stale")
+                // once mode is verified; if mode is unverified, follow L2 (200 ms readback -> fault)
+                // while preserving the captured hold target.
+                if self.measured_hold.captured_positions[j].is_some() {
+                    if snap.hold_mode_verified[j] {
+                        self.measured_hold.joint_status[j] = JointHoldStatus::HeldStaleTarget;
+                        hold_mask |= 1u64 << j;
+                    } else {
+                        self.measured_hold.joint_status[j] = JointHoldStatus::UnheldNoVerifiedMode;
+                    }
+                } else {
+                    self.measured_hold.captured_continuity_epoch[j] = None;
+                    self.measured_hold.last_seen_fresh_at[j] = None;
+                    self.measured_hold.joint_status[j] = JointHoldStatus::UnheldNoFreshFeedback;
+                    invalidated_mask |= 1u64 << j;
+                }
+                continue;
+            };
+            if !snap.hold_mode_verified[j] {
+                // L2: 200 ms readback -> else fault; preserve any already-captured hold target.
+                self.measured_hold.joint_status[j] = JointHoldStatus::UnheldNoVerifiedMode;
+                invalidated_mask |= 1u64 << j;
+                continue;
+            }
+            let continuity_broken = self.measured_hold.captured_positions[j].is_none()
+                || self.measured_hold.captured_continuity_epoch[j] != Some(epoch)
+                || self.measured_hold.last_seen_fresh_at[j].is_some_and(|prev| {
+                    drv_now.saturating_duration_since(prev) > STOPPED_DISABLE_FEEDBACK_MAX_AGE
+                });
+            if continuity_broken {
+                self.measured_hold.captured_positions[j] = Some(pos);
+                self.measured_hold.captured_continuity_epoch[j] = Some(epoch);
+                self.measured_hold.joint_status[j] = JointHoldStatus::Queued;
+                invalidated_mask |= 1u64 << j;
+            } else if !matches!(
+                self.measured_hold.joint_status[j],
+                JointHoldStatus::Held | JointHoldStatus::Queued
+            ) {
+                self.measured_hold.joint_status[j] = JointHoldStatus::Queued;
+            }
+            self.measured_hold.last_seen_fresh_at[j] = Some(drv_now);
+            hold_mask |= 1u64 << j;
+        }
+        (hold_mask, invalidated_mask)
+    }
+
+    /// Evaluates each joint independently from fresh (`<= 100 ms`) finite measured position with
+    /// transport provenance and continuity tracking, and verified hold mode without acquiring the
+    /// driver mutex (Rule R1; zero heap allocations).
+    pub fn snapshot_measured_hold_with_invalidated(&mut self) -> (u64, u64) {
+        use crate::driver::JointHoldStatus;
+        let dof = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
+        self.measured_hold.dof = dof;
+        if self.driver.is_none() {
+            for j in 0..dof {
+                if self.is_torqued || self.torque_intent == TorqueIntent::On {
+                    if let Some(p) = self.measured_positions.get(j).copied().filter(|p| p.is_finite()) {
+                        let _ = self.measured_hold.captured_positions[j].get_or_insert(p);
+                        self.measured_hold.joint_status[j] = JointHoldStatus::Held;
+                    } else {
+                        self.measured_hold.captured_positions[j] = None;
+                        self.measured_hold.joint_status[j] = JointHoldStatus::UnheldNoFreshFeedback;
+                    }
+                } else {
+                    self.measured_hold.captured_positions[j] = None;
+                    self.measured_hold.joint_status[j] = JointHoldStatus::SkippedOff;
+                }
+            }
+            return (0, 0);
+        }
+        self.capture_measured_hold_from_owner()
+    }
+
+    pub(crate) fn snapshot_measured_hold(&mut self) -> u64 {
+        self.snapshot_measured_hold_with_invalidated().0
+    }
+
+    /// Test-only wrapper around [`Self::service_stopped_measured_hold`] returning `true` when the
+    /// stopped-hold pass completed without exposing private `TickOutput`.
+    #[doc(hidden)]
+    pub fn service_stopped_measured_hold_complete(
         &mut self,
-        requested_at: Instant,
+        dt: f64,
+        gravity_output_enabled: bool,
+    ) -> bool {
+        matches!(
+            self.service_stopped_measured_hold(dt, gravity_output_enabled),
+            crate::supervisor::TickOutput::Complete { is_hold: true, .. }
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn owner_hold_mask(&self) -> u64 {
+        self.measured_hold.owner_hold_mask
+    }
+
+    #[doc(hidden)]
+    pub fn owner_pending_hold_mask(&self) -> u64 {
+        self.measured_hold.owner_pending_hold_mask
+    }
+
+    #[doc(hidden)]
+    pub fn invalidate_owner_driver_snapshot_for_test(&mut self) {
+        self.owner_driver_snapshot.invalidate();
+    }
+
+    /// Test-only helper (L3): holds `self.driver`'s mutex on a separate OS thread while running
+    /// `f(self)` (which must not replace or drop `self.driver`), then releases and joins the
+    /// holder thread before returning.
+    #[doc(hidden)]
+    pub fn with_contended_driver_for_test<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let Some(driver_ref) = self.driver.as_ref() else {
+            return f(self);
+        };
+        let addr = (driver_ref as *const std::sync::Mutex<Box<dyn crate::driver::ArmDriver>>) as usize;
+        let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let holder = std::thread::spawn(move || {
+            // SAFETY: `self.driver` stays in place for the duration of `f(self)` and this thread
+            // is strictly joined before `with_contended_driver_for_test` returns (even on panic).
+            let mutex = unsafe { &*(addr as *const std::sync::Mutex<Box<dyn crate::driver::ArmDriver>>) };
+            let _guard = mutex.lock().unwrap();
+            let _ = locked_tx.send(());
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+        });
+        locked_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("holder acquired driver mutex");
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
+        let _ = release_tx.send(());
+        let _ = holder.join();
+        match res {
+            Ok(v) => v,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    /// Services one masked measured-position hold pass while stopped or in `FailedHold`
+    /// (zero heap allocation on RT; hold capture and MIT preparation read owner-held data without
+    /// locking the driver mutex; never falls back to cached `commanded_positions`).
+    pub(crate) fn service_stopped_measured_hold(
+        &mut self,
+        dt: f64,
+        gravity_output_enabled: bool,
+    ) -> crate::supervisor::TickOutput {
+        use crate::driver::{JointHoldStatus, TxBatchOutcome};
+        use crate::supervisor::TickOutput;
+        if self.urgent_stop_unapplied() {
+            return TickOutput::None;
+        }
+        if self.driver.is_none() {
+            return TickOutput::None;
+        }
+        let dof = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
+        let (mut hold_mask, invalidated_mask) = self.snapshot_measured_hold_with_invalidated();
+
+        let mut targets = std::mem::take(&mut self.scratch.targets);
+        targets.clear();
+        for i in 0..self.config.dof {
+            let pos = if i < dof {
+                self.measured_hold.captured_positions[i].unwrap_or(0.0)
+            } else {
+                0.0
+            };
+            targets.push(crate::driver::JointTarget {
+                position: pos,
+                velocity: Some(0.0),
+                torque: if gravity_output_enabled {
+                    self.gravity_torques_ramped.get(i).copied()
+                } else {
+                    Some(0.0)
+                },
+                kp: None,
+                kd: None,
+            });
+        }
+
+        // Per-joint masked MIT hold preparation (Rule R1: zero alloc, no feedback-age Vec,
+        // no `last_ff.clone()`, and no driver mutex lock).
+        let mut ff_buf = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
+        let mit_prepared = if self.mit.owner == crate::mit::MitOwner::Active && hold_mask != 0 {
+            let before_mask = hold_mask;
+            let (filtered_mask, any_mit) =
+                self.mit_prepare_masked_into(hold_mask, &mut targets, dt, &mut ff_buf);
+            let rejected = before_mask & !filtered_mask;
+            if rejected != 0 {
+                for j in 0..dof {
+                    if (rejected & (1u64 << j)) != 0 {
+                        self.measured_hold.joint_status[j] = if self.measured_hold.captured_positions[j].is_some() {
+                            JointHoldStatus::HeldStaleTarget
+                        } else {
+                            JointHoldStatus::UnheldNoFreshFeedback
+                        };
+                    }
+                }
+            }
+            hold_mask = filtered_mask;
+            any_mit
+        } else {
+            false
+        };
+
+        // L3: The stopped-hold queue and mask are owner state. Record them inline before TX.
+        self.measured_hold.owner_hold_mask = hold_mask;
+        for (slot, target) in self.measured_hold.owner_hold_targets[..dof]
+            .iter_mut()
+            .zip(targets.iter())
+        {
+            *slot = target.position;
+        }
+
+        // L3: An empty mask with no owner-tracked queued holds takes NO driver lock at all.
+        let keep_queued_mask = hold_mask & !invalidated_mask;
+        let needs_prune = (self.measured_hold.owner_pending_hold_mask & !keep_queued_mask) != 0;
+        if hold_mask == 0 && !needs_prune {
+            self.measured_hold.consecutive_lock_contended = 0;
+            self.measured_hold.lock_contended_escalated = false;
+            self.scratch.targets = targets;
+            return TickOutput::None;
+        }
+
+        // L3: Non-blocking `try_lock` for stopped-hold TX: on contention, skip this tick's send
+        // and increment the diagnostics counter; escalate after `STOPPED_HOLD_CONTENTION_ESCALATE_SKIPS`
+        // (25 consecutive skips, 0.5 s at 50 Hz) with a counted warning and a non-recoverable fault
+        // (zero heap allocation on RT).
+        let mut lock_contended = false;
+        let write_result = match self.driver.as_ref() {
+            Some(d) => match d.try_lock() {
+                Ok(mut drv) => {
+                    drv.set_mit_ownership_lost(self.mit.owner == crate::mit::MitOwner::Lost);
+                    let dispatched_mask = drv.disable_dispatched_mask();
+                    let effective_hold_mask = hold_mask & !dispatched_mask;
+                    let effective_keep_mask = keep_queued_mask & !dispatched_mask;
+                    drv.drop_pending_holds_outside_mask(effective_keep_mask);
+                    drv.set_pending_pos_force_hold_hint(true);
+                    let r = drv.write_measured_hold_masked(effective_hold_mask, &targets);
+                    let now = drv.clock_now();
+                    let max_age = drv.tx_frame_max_age();
+                    let oldest_pending = drv.oldest_pending_tx_age();
+                    let last_expired = drv.last_tx_expired_age();
+                    let sent_any_fallback = drv.last_hold_tx_sent_any();
+                    let due_mask = drv.last_hold_tx_due_mask();
+                    let sent_mask = drv.last_hold_tx_sent_mask();
+                    let pf_status = drv.take_last_pos_force_tx_status();
+                    let has_pending_holds = drv.pending_tx_len_total() > 0;
+                    Some((
+                        r,
+                        now,
+                        max_age,
+                        oldest_pending,
+                        last_expired,
+                        sent_any_fallback,
+                        due_mask,
+                        sent_mask,
+                        pf_status,
+                        has_pending_holds,
+                    ))
+                }
+                Err(_) => {
+                    lock_contended = true;
+                    None
+                }
+            },
+            None => None,
+        };
+        self.scratch.targets = targets;
+
+        if lock_contended {
+            crate::diagnostics::tick::record_stopped_hold_lock_contended();
+            self.measured_hold.consecutive_lock_contended =
+                self.measured_hold.consecutive_lock_contended.saturating_add(1);
+            if self.measured_hold.consecutive_lock_contended >= STOPPED_HOLD_CONTENTION_ESCALATE_SKIPS
+                && !self.measured_hold.lock_contended_escalated
+            {
+                self.measured_hold.lock_contended_escalated = true;
+                crate::diagnostics::tick::record_stopped_hold_contention_escalation();
+                let skips = self.measured_hold.consecutive_lock_contended;
+                let detail = crate::safety::FaultDetail::formatted(FaultCode::HardwareFault, |buf| {
+                    let _ = core::fmt::write(
+                        buf,
+                        format_args!(
+                            "Stopped-hold TX skipped {} consecutive ticks due to driver mutex contention",
+                            skips
+                        ),
+                    );
+                });
+                self.safety.latch(crate::safety::FaultKind::Other, detail);
+            }
+            return TickOutput::None;
+        }
+        self.measured_hold.consecutive_lock_contended = 0;
+        self.measured_hold.lock_contended_escalated = false;
+
+        let Some((
+            write_res,
+            now,
+            max_age,
+            oldest_pending,
+            last_expired,
+            sent_any_fallback,
+            due_mask,
+            sent_mask,
+            pf_status,
+            has_pending_holds,
+        )) = write_result
+        else {
+            return TickOutput::None;
+        };
+
+        let out = match write_res {
+            Ok(report) => {
+                let n = report.dof.min(dof);
+                let mut next_pending_mask = 0u64;
+                for j in 0..n {
+                    self.measured_hold.joint_status[j] = report.joint_status[j];
+                    if report.joint_status[j] == JointHoldStatus::Queued
+                        || (report.joint_status[j] == JointHoldStatus::HeldStaleTarget
+                            && has_pending_holds)
+                    {
+                        next_pending_mask |= 1u64 << j;
+                    }
+                    // B2: Preserve captured hold targets while torque_intent == On; only clear
+                    // when explicitly SkippedOff (UnheldNoVerifiedMode preserves captured_positions).
+                    if report.joint_status[j] == JointHoldStatus::SkippedOff {
+                        self.measured_hold.captured_positions[j] = None;
+                        self.measured_hold.captured_continuity_epoch[j] = None;
+                        self.measured_hold.last_seen_fresh_at[j] = None;
+                    }
+                }
+                if has_pending_holds && next_pending_mask == 0 {
+                    next_pending_mask = hold_mask;
+                }
+                self.measured_hold.owner_pending_hold_mask = next_pending_mask;
+                if hold_mask == 0 && !report.sent_any && matches!(report.outcome, TxBatchOutcome::Complete) {
+                    TickOutput::None
+                } else {
+                    match report.outcome {
+                        TxBatchOutcome::Complete => TickOutput::Complete {
+                            is_hold: true,
+                            now,
+                            max_age,
+                            due_mask,
+                            sent_mask,
+                            pf_status,
+                        },
+                        TxBatchOutcome::Deferred { pending } => TickOutput::Deferred {
+                            pending,
+                            now,
+                            max_age,
+                            oldest_age: oldest_pending,
+                            due_mask,
+                            is_hold: true,
+                            sent_mask,
+                            pf_status,
+                        },
+                        TxBatchOutcome::Expired { dropped, pending } => TickOutput::Expired {
+                            dropped,
+                            pending,
+                            now,
+                            max_age,
+                            oldest_age: last_expired,
+                            due_mask,
+                            sent_mask,
+                            is_hold: true,
+                            pf_status,
+                        },
+                    }
+                }
+            }
+            Err(crate::driver::ArmDriverError::EstopInhibited) => {
+                TickOutput::EstopInhibited { is_hold: true }
+            }
+            Err(e) => {
+                let mut buf = crate::mit::OutputErrorText::empty();
+                e.write_bounded(&mut buf);
+                TickOutput::Error {
+                    message: buf,
+                    now,
+                    max_age,
+                    is_hold: true,
+                    sent_any: sent_any_fallback,
+                    due_mask,
+                    sent_mask,
+                    pf_status,
+                }
+            }
+        };
+
+        if mit_prepared && matches!(out, TickOutput::Complete { .. }) {
+            let ff_n = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
+            if self.mit.last_ff.len() == ff_n {
+                self.mit.last_ff.copy_from_slice(&ff_buf[..ff_n]);
+            } else {
+                self.mit.last_ff.clear();
+                self.mit.last_ff.extend_from_slice(&ff_buf[..ff_n]);
+            }
+            self.mit.last_output = Some(now);
+        }
+        out
+    }
+
+    #[inline]
+    fn all_joints_mask(&self) -> u64 {
+        let dof = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
+        if dof >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << dof) - 1
+        }
+    }
+
+    #[inline]
+    fn is_partial_disable_remaining(&self, dispatched_mask: u64) -> bool {
+        let all = self.all_joints_mask();
+        dispatched_mask != 0 && (dispatched_mask & all) != all
+    }
+
+    /// R12 B3: Once ANY motor has received a disable frame (`frames_dispatched == true`), the
+    /// disable is committed (`torque_intent = Off`, holds stopped). When undispatched motors
+    /// remain (`partial_remaining`), preserve `disable_pending = true` and return the retry
+    /// `DisableKind` so the retry path finishes the remaining motors (keeping original `started_at`
+    /// while within 1 s, or starting a bounded continuation pass if expiry fired mid-batch after
+    /// at least one motor was already disabled).
+    fn commit_partial_disable_retry_kind(
+        &mut self,
+        kind: crate::driver::DisableKind,
+        post_now: Instant,
+        frames_dispatched: bool,
+        partial_remaining: bool,
+    ) -> Option<crate::driver::DisableKind> {
+        if !frames_dispatched {
+            return None;
+        }
+        self.disable_first_frame_accepted();
+        if !partial_remaining {
+            return None;
+        }
+        let retry_kind = match kind {
+            crate::driver::DisableKind::DisableRequested { started_at }
+                if post_now.saturating_duration_since(started_at)
+                    >= crate::driver::STOPPED_DISABLE_REQUEST_LIFETIME =>
+            {
+                crate::driver::DisableKind::DisableRequested { started_at: post_now }
+            }
+            other => other,
+        };
+        self.disable_pending = true;
+        self.active_disable_kind = Some(retry_kind);
+        Some(retry_kind)
+    }
+
+    #[inline]
+    pub(crate) fn client_park_stop_invalidated(&self, expected_stop_gen: Option<u64>) -> bool {
+        self.e_stop_latched.load(Ordering::SeqCst)
+            || self.estop_pending()
+            || self.urgent_stop_unapplied()
+            || expected_stop_gen.is_some_and(|g| self.current_stop_gen() != g)
+    }
+
+    #[inline]
+    pub(crate) fn clear_active_disable_retry_state(&mut self) {
+        self.disable_pending = false;
+        self.active_disable_kind = None;
+        self.active_disable_client_park = None;
+        self.last_disable_attempt = None;
+        self.background_disable_retry = None;
+    }
+
+    /// Arms bounded [`BackgroundDisableRetry`] retrying immediately on the next release
+    /// (`next_retry_at: drv_now`), used for committed partial disables (R12 B3) and contended
+    /// protective thermal cuts (R12 B4).
+    fn arm_background_disable_retry_immediate_with_kind(
+        &mut self,
+        kind: crate::driver::DisableKind,
         drv_now: Instant,
     ) -> bool {
         if matches!(
@@ -1414,18 +2674,91 @@ impl SupervisorInner {
         ) {
             return false;
         }
-        if drv_now.saturating_duration_since(requested_at) >= BACKGROUND_DISABLE_MAX_WINDOW {
+        let client_park = if matches!(kind, crate::driver::DisableKind::DisableProtective { .. }) {
+            None
+        } else {
+            self.active_disable_client_park
+        };
+        if let Some(expected_stop_gen) = client_park {
+            if self.client_park_stop_invalidated(expected_stop_gen) {
+                return false;
+            }
+        }
+        let origin = match kind {
+            crate::driver::DisableKind::DisableRequested { started_at, .. } => started_at,
+            crate::driver::DisableKind::DisableProtective { .. } => drv_now,
+        };
+        let window = self.background_disable_window_for(kind);
+        if drv_now.saturating_duration_since(origin) >= window {
             self.exhaust_background_disable_retry();
             return false;
         }
         if self.background_disable_retry.is_none() {
             self.background_disable_retry = Some(BackgroundDisableRetry::Active {
                 attempts: 0,
-                started_at: requested_at,
-                next_retry_at: drv_now + BACKGROUND_DISABLE_RETRY_INTERVAL,
+                kind,
+                started_at: origin,
+                next_retry_at: drv_now,
+                client_park,
             });
         }
         true
+    }
+
+    /// Arms bounded [`BackgroundDisableRetry`] preserving the original [`crate::driver::DisableKind`]
+    /// (`started_at` on the driver clock for `DisableRequested`) so every retry passes through the
+    /// driver's single `begin_disable_torque_budgeted(kind, 0)` choke point and rest-pose gate
+    /// within the original request's lifetime.
+    fn arm_background_disable_retry_with_kind(
+        &mut self,
+        kind: crate::driver::DisableKind,
+        drv_now: Instant,
+    ) -> bool {
+        if matches!(
+            self.background_disable_retry,
+            Some(BackgroundDisableRetry::Exhausted)
+        ) {
+            return false;
+        }
+        let client_park = if matches!(kind, crate::driver::DisableKind::DisableProtective { .. }) {
+            None
+        } else {
+            self.active_disable_client_park
+        };
+        if let Some(expected_stop_gen) = client_park {
+            if self.client_park_stop_invalidated(expected_stop_gen) {
+                return false;
+            }
+        }
+        let origin = match kind {
+            crate::driver::DisableKind::DisableRequested { started_at, .. } => started_at,
+            crate::driver::DisableKind::DisableProtective { .. } => drv_now,
+        };
+        let window = self.background_disable_window_for(kind);
+        if drv_now.saturating_duration_since(origin) >= window {
+            self.exhaust_background_disable_retry();
+            return false;
+        }
+        if self.background_disable_retry.is_none() {
+            self.background_disable_retry = Some(BackgroundDisableRetry::Active {
+                attempts: 0,
+                kind,
+                started_at: origin,
+                next_retry_at: drv_now + BACKGROUND_DISABLE_RETRY_INTERVAL,
+                client_park,
+            });
+        }
+        true
+    }
+
+    #[inline]
+    fn background_disable_window_for(&self, kind: crate::driver::DisableKind) -> Duration {
+        match kind {
+            crate::driver::DisableKind::DisableRequested { .. } => {
+                crate::driver::STOPPED_DISABLE_REQUEST_LIFETIME
+            }
+            crate::driver::DisableKind::DisableProtective { .. } => BACKGROUND_DISABLE_MAX_WINDOW,
+        }
     }
 
     fn exhaust_background_disable_retry(&mut self) {
@@ -1436,46 +2769,139 @@ impl SupervisorInner {
         );
     }
 
-    /// Single merge-time choke point for every PR L rollback disable triggered by a failed or
-    /// interrupted torque-enable transition (`enable_finish_rt`, `enable_step_failed`,
-    /// `abort_enable_transition_for_fenced_lease_impl`, `service_torque_transition` authority
-    /// revocation). Routes strictly through the driver's single `begin_torque_budgeted(false, 0)`
-    /// choke point (zero RX, zero sleep, zero RT allocs) and arms bounded
-    /// [`BackgroundDisableRetry`] whenever torque-off is not immediately confirmed.
+    /// R12 B1: Advances an in-flight deferred legacy disable (`FeetechArmDriver::pending_disable`
+    /// or `DamiaoArmDriver::AwaitRestGate` / `Disable`) by ONE bounded poll step per control
+    /// release, releasing the driver mutex immediately afterward so `service_stopped_measured_hold`
+    /// keeps servicing holds between releases.
     ///
-    /// TODO(torque-off-merge): Replace this rollback disable with `feat/torque-off-when-stopped`'s
-    /// `FailedHold` reducer when integrating both branches (no automatic rollback disable at any
-    /// pose, while carrying PR L's live authority revocation / fencing checks into `FailedHold`).
-    fn rollback_disable_after_failed_or_interrupted_enable(&mut self, now: Instant) {
-        self.disable_requested_at(now);
-        let Some(ref d) = self.driver else {
-            self.disable_confirmed();
-            return;
+    /// Returns `true` when the driver had a pending disable transition that was serviced this
+    /// release (suppressing the 250 ms fallback restart on the same tick).
+    pub(crate) fn service_legacy_pending_disable(&mut self) -> bool {
+        if self.rt_executor_owned || !self.disable_pending || self.torque_transition.is_some() {
+            return false;
+        }
+        let Some(d) = self.driver.as_ref() else {
+            return false;
         };
-        let outcome = match d.lock() {
-            Ok(mut driver) => {
-                driver.abort_enable();
-                let sent = driver.begin_torque_budgeted(false, 0);
-                let confirmed_now = matches!(
-                    sent,
-                    Ok(crate::driver::TorqueProgress::Done(crate::driver::TorqueOutcome::Confirmed))
-                ) && DisableConfirm::confirmed(&**driver);
-                let drv_now = driver.clock_now();
-                Some((confirmed_now, drv_now))
-            }
-            Err(_) => None,
-        };
-        match outcome {
-            Some((true, _)) => self.disable_confirmed(),
-            Some((false, drv_now)) => {
-                self.is_torqued = true;
-                self.arm_background_disable_retry(drv_now);
-            }
-            None => {
-                self.is_torqued = true;
-                self.arm_background_disable_retry(now);
+        let control_release_seq = self.control_release_seq;
+        let retry_kind = self.active_disable_kind;
+        let client_park = self.active_disable_client_park;
+        if let Some(expected_stop_gen) = client_park {
+            if self.client_park_stop_invalidated(expected_stop_gen) {
+                self.clear_active_disable_retry_state();
+                return true;
             }
         }
+        let step = {
+            let Ok(mut drv) = d.lock() else {
+                return false;
+            };
+            let pending_hs = drv.torque_transition_pending();
+            let partial_dispatched = drv.disable_dispatched_mask() != 0;
+            if !pending_hs && !partial_dispatched {
+                return false;
+            }
+            if control_release_seq > 0 {
+                drv.begin_control_release(control_release_seq);
+            }
+            let drv_now = drv.clock_now();
+            let poll_res = if pending_hs {
+                drv.poll_torque(drv_now + Duration::from_millis(8))
+            } else {
+                let k = retry_kind.unwrap_or(crate::driver::DisableKind::DisableRequested {
+                    started_at: drv_now,
+                });
+                if let Some(expected_stop_gen) = client_park {
+                    drv.begin_client_park_disable_with_kind(k, None, expected_stop_gen)
+                } else {
+                    drv.begin_disable_torque(k)
+                }
+            };
+            let post_now = drv.clock_now();
+            let frames_dispatched = drv.disable_frames_dispatched();
+            let dispatched_mask = drv.disable_dispatched_mask();
+            let mut ages_buf = std::mem::take(&mut self.scratch.ages);
+            let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
+            let snap = OwnerDriverSnapshot::capture_from_driver(
+                drv.as_ref(),
+                self.config.dof,
+                self.feedback_numeric_valid,
+                &self.measured_positions,
+                &mut ages_buf,
+                &mut bounds_buf,
+            );
+            self.scratch.ages = ages_buf;
+            self.scratch.fb.bounds = bounds_buf;
+            (poll_res, post_now, frames_dispatched, dispatched_mask, snap)
+        };
+        let (poll_res, post_now, frames_dispatched, dispatched_mask, snap) = step;
+        self.owner_driver_snapshot = snap;
+        let partial_remaining = self.is_partial_disable_remaining(dispatched_mask);
+        let active_kind = self.active_disable_kind.unwrap_or(
+            crate::driver::DisableKind::DisableRequested { started_at: post_now },
+        );
+        match poll_res {
+            Ok(crate::driver::TorqueProgress::Done(_)) => {
+                self.disable_accepted();
+                let _ = self.torque_off_finish_in_place();
+            }
+            Ok(crate::driver::TorqueProgress::Pending { .. }) => {
+                if frames_dispatched {
+                    self.disable_first_frame_accepted();
+                }
+            }
+            Err(
+                crate::driver::ArmDriverError::TorqueOffWouldDrop
+                | crate::driver::ArmDriverError::DisableRequestExpired,
+            ) => {
+                if frames_dispatched {
+                    self.disable_first_frame_accepted();
+                    if !partial_remaining {
+                        self.disable_pending = false;
+                        self.active_disable_kind = None;
+                        self.last_disable_attempt = None;
+                    } else if let crate::driver::DisableKind::DisableRequested { started_at } = active_kind {
+                        if post_now.saturating_duration_since(started_at)
+                            >= crate::driver::STOPPED_DISABLE_REQUEST_LIFETIME
+                        {
+                            if self.background_disable_retry.is_none() {
+                                let rk = crate::driver::DisableKind::DisableRequested {
+                                    started_at: post_now,
+                                };
+                                self.active_disable_kind = Some(rk);
+                                let _ = self.arm_background_disable_retry_immediate_with_kind(rk, post_now);
+                            } else {
+                                self.exhaust_background_disable_retry();
+                                self.disable_pending = false;
+                                self.active_disable_kind = None;
+                            }
+                        }
+                    }
+                } else {
+                    self.disable_pending = false;
+                    self.active_disable_kind = None;
+                    self.last_disable_attempt = None;
+                    self.background_disable_retry = None;
+                }
+            }
+            Err(e) => {
+                if let Some(expected_stop_gen) = client_park {
+                    if crate::driver::is_estop_inhibited(&e)
+                        || self.client_park_stop_invalidated(expected_stop_gen)
+                    {
+                        self.clear_active_disable_retry_state();
+                        return true;
+                    }
+                }
+                if frames_dispatched {
+                    self.disable_first_frame_accepted();
+                }
+                if !self.safety.deferred_logging() {
+                    tracing::warn!("Legacy deferred torque disable step failed: {e}");
+                }
+            }
+        }
+        true
     }
 
     pub fn enable_torque(admitted: Admitted<'_>) -> Result<SafetyState, SafetyError> {
@@ -1490,11 +2916,50 @@ impl SupervisorInner {
         // Torque changes and re-arming are refused in gravity compensation: exit first.
         self.gravity_comp_servo_busy()?;
         let (was_torqued, prev_gripper_cmd) = self.enable_prepare()?;
-        if let Some(ref d) = self.driver {
-            let r = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?.set_torque(true);
-            if let Err(e) = r { return Err(self.enable_failed(was_torqued, &e)); }
+        let mut outcome = self.start_enable_reducer(
+            EnableOrigin::BrokerTransition,
+            was_torqued,
+            prev_gripper_cmd,
+            None,
+            false,
+        );
+        let mut first = true;
+        loop {
+            match outcome {
+                EnableStepOutcome::Armed(state) => return Ok(state),
+                EnableStepOutcome::Failed {
+                    message,
+                    feedback_unavailable,
+                    estop_interrupted,
+                    ..
+                } => {
+                    return Err(if feedback_unavailable {
+                        SafetyError::FeedbackUnavailable
+                    } else if estop_interrupted {
+                        SafetyError::EStopActive
+                    } else {
+                        SafetyError::ClearFaultRejected(message.as_str().to_string())
+                    });
+                }
+                EnableStepOutcome::Pending { .. } => {
+                    if !first {
+                        if let Some(ref d) = self.driver {
+                            if let Ok(drv) = d.lock() {
+                                drv.clock_pause(Duration::from_micros(500));
+                            }
+                        }
+                    }
+                    first = false;
+                    let Some(TorqueTransition::Enable(reducer)) = self.torque_transition.take() else {
+                        return Err(SafetyError::ClearFaultRejected(
+                            "Enable transition reducer state lost".into(),
+                        ));
+                    };
+                    let (next, _) = self.poll_enable_reducer(reducer, None);
+                    outcome = next;
+                }
+            }
         }
-        self.enable_finish(was_torqued, prev_gripper_cmd)
     }
 
     /// Exempt from `Admitted` (Invariant 1c): torque disable is a stop-direction action that
@@ -1511,7 +2976,7 @@ impl SupervisorInner {
 
     /// Enable, before the driver's handshake: every refusal (gravity compensation, driver
     /// limits, handover, pending disable, E-stop, fault, MIT gate), then the feedback read
-    /// that seeds the commanded state. Returns (torque was on, gripper command to keep).
+    /// that seeds the commanded state. Returns `(was_torqued, prev_gripper_cmd)`.
     fn enable_prepare(&mut self) -> Result<(bool, Option<f32>), SafetyError> {
         self.enable_prepare_inner(true, true)
     }
@@ -1582,22 +3047,21 @@ impl SupervisorInner {
         }
         self.mit_gate_error = None;
 
-        // Enable hardware torque so bus devices wake up and publish state, then verify physical feedback
-        let any_driver_enabled = self.driver.as_ref().is_some_and(|d| d.lock().is_ok_and(|drv| drv.has_any_joint_enabled()));
-        let was_torqued = self.is_torqued || any_driver_enabled;
-        let prev_gripper_cmd = if was_torqued {
-            self.config.gripper_index().and_then(|i| self.commanded_positions.get(i).copied())
-        } else {
-            None
-        };
-
-        if let Some(ref d) = self.driver {
+        // Enable hardware torque so bus devices wake up and publish state, then verify physical feedback.
+        if let Some(d) = self.driver.take() {
             // Secondary double-check latch right before hardware actuation
             if self.estop_pending() {
+                self.driver = Some(d);
                 return Err(SafetyError::EStopActive);
             }
-            let mut driver = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
+            let Ok(mut driver) = d.lock() else {
+                self.owner_driver_snapshot.invalidate();
+                self.driver = Some(d);
+                return Err(SafetyError::FeedbackUnavailable);
+            };
             if self.estop_pending() {
+                drop(driver);
+                self.driver = Some(d);
                 return Err(SafetyError::EStopActive);
             }
             if allow_bus_read && !driver.is_feedback_valid() {
@@ -1623,33 +3087,156 @@ impl SupervisorInner {
                     }
                 }
             }
+            self.refresh_owner_driver_snapshot_from_ref(driver.as_ref());
+            drop(driver);
+            self.driver = Some(d);
         }
+        let was_torqued = self.is_torqued;
+        let prev_gripper_cmd = if was_torqued {
+            self.config.gripper_index().and_then(|i| self.commanded_positions.get(i).copied())
+        } else {
+            None
+        };
         Ok((was_torqued, prev_gripper_cmd))
     }
 
-    /// The driver's enable failed with `e`: an arm that was not torqued is disabled again
-    /// (confirmed or left `disable_pending`), and the fault `ENABLE_FAILED` latches.
-    fn enable_failed(&mut self, was_torqued: bool, e: &dyn std::fmt::Display) -> SafetyError {
-        if !was_torqued {
-            if let Some(ref d) = self.driver {
-                if let Ok(mut driver) = d.lock() {
-                    let sent = driver.set_torque(false).is_ok();
-                    let _ = driver.read_joint_states();
-                    let confirmed_off = sent && driver.is_feedback_valid() && driver.enable_state() == EnableState::Disabled;
-                    self.is_torqued = !confirmed_off;
-                    self.disable_pending = !confirmed_off;
-                    self.last_disable_attempt = Some(Instant::now());
+    /// Single unified failure transition of the enable reducer (shared by begin errors, poll
+    /// errors, interruption, and post-enable validation failures; zero heap allocations on RT):
+    /// 1. Preserves any unapplied pending E-stop latch before snapshotting holds.
+    /// 2. Cancels queued enable work on the driver (`abort_enable`) without sending any rollback
+    ///    disable frame at any pose.
+    /// 3. Evaluates per-motor torque evidence and per-joint measured-position holds independently
+    ///    (`snapshot_measured_hold`) and drops queued driver holds outside the eligible hold mask.
+    /// 4. Transitions `enable_lifecycle` to [`EnableLifecycle::FailedHold`], keeps `torque_intent = On`
+    ///    and `is_torqued = true` (every joint held), and latches non-recoverable
+    ///    [`FaultCode::EnableFailed`] carrying per-joint hold status while preserving
+    ///    any existing E-stop or thermal latch.
+    fn enter_failed_hold(
+        &mut self,
+        _was_torqued: bool,
+        write_cause: impl FnOnce(&mut crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>),
+    ) -> crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }> {
+        // 1. Preserve any pending E-stop before snapshotting holds (consume_pending_estop clears
+        //    the previous hold snapshot via apply_stop_policy).
+        if self.estop_request_unapplied() {
+            self.consume_pending_estop();
+        }
+        // 2 & 3. Cancel queued enable work (NEVER send automatic rollback disable frames),
+        // refresh owner-held driver snapshot in the SAME single lock, capture per-joint holds from
+        // owner data (no extra driver lock), and drop queued driver holds outside `hold_mask`.
+        if let Some(d) = self.driver.take() {
+            match d.lock() {
+                Ok(mut drv) => {
+                    drv.abort_enable();
+                    self.refresh_owner_driver_snapshot_from_ref(drv.as_ref());
+                    let (hold_mask, _) = self.capture_measured_hold_from_owner();
+                    drv.drop_pending_holds_outside_mask(hold_mask);
+                }
+                Err(_) => {
+                    self.owner_driver_snapshot.invalidate();
+                    let _ = self.capture_measured_hold_from_owner();
+                }
+            }
+            self.driver = Some(d);
+        } else {
+            let _ = self.snapshot_measured_hold();
+        }
+        // 4. Record captured measured positions and enter FailedHold (no cached-command fallback).
+        let dof = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
+        for j in 0..dof {
+            if let Some(pos) = self.measured_hold.captured_positions[j] {
+                if j < self.measured_positions.len() {
+                    self.measured_positions[j] = pos;
+                }
+                if j < self.commanded_positions.len() {
+                    self.commanded_positions[j] = pos;
+                }
+                if j < self.target_positions.len() {
+                    self.target_positions[j] = pos;
                 }
             }
         }
-        let err_msg = format!("Hardware torque enable failed: {}", e);
+        self.commanded_velocities.fill(0.0);
+        self.commanded_accelerations.fill(0.0);
+        self.enable_lifecycle = EnableLifecycle::FailedHold;
+        self.torque_intent = TorqueIntent::On;
+        self.is_torqued = true;
+        self.pending_rearm = true;
+        self.disable_pending = false;
+        self.active_disable_kind = None;
+        self.last_disable_attempt = None;
+
+        // 5. Store cause and latch non-recoverable ENABLE_FAILED with per-joint torque & hold
+        //    status first so the joint report is never truncated by a verbose driver error string.
+        let mut cause = crate::safety::BoundedText::<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>::empty();
+        write_cause(&mut cause);
+        self.measured_hold.enable_failed_cause = cause;
+        let mut msg = crate::safety::BoundedText::<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>::empty();
+        self.measured_hold.write_fault_message(&mut msg);
+        let msg_copy = msg;
         self.safety.latch(
             crate::safety::FaultKind::Other,
             crate::safety::FaultDetail::formatted(FaultCode::EnableFailed, |buf| {
-                buf.push_str(&err_msg);
+                buf.push_str(msg_copy.as_str());
             }),
         );
-        SafetyError::ClearFaultRejected(err_msg)
+        msg
+    }
+
+    /// Enforces thermal protection inside the enable reducer (`Enabling` and post-enable
+    /// `Validate` before arming): any finite joint temperature above `max_temperature` aborts
+    /// the enable through `enter_failed_hold`, latches `FaultKind::ThermalTrip`, and starts
+    /// `DisableProtective { Thermal }` without ever arming.
+    fn check_enable_thermal_trip(
+        &mut self,
+        was_torqued: bool,
+        temperature_available: bool,
+    ) -> Option<EnableStepOutcome> {
+        if !temperature_available
+            || !self
+                .temperatures
+                .iter()
+                .any(|t| t.is_finite() && *t > self.config.max_temperature)
+        {
+            return None;
+        }
+        // Run `enter_failed_hold` BEFORE `StopPolicy::ThermalTrip` because `enter_failed_hold`
+        // clears `disable_pending` / `active_disable_kind`; `ThermalTrip` then latches
+        // highest-severity `FaultKind::ThermalTrip` and starts `DisableProtective { Thermal }`.
+        let message = self.enter_failed_hold(was_torqued, |buf| {
+            buf.push_str("thermal trip during enable");
+        });
+        self.apply_stop_policy(StopPolicy::ThermalTrip);
+        Some(EnableStepOutcome::Failed {
+            rt_code: "THERMAL_TRIP",
+            message,
+            feedback_unavailable: false,
+            estop_interrupted: false,
+        })
+    }
+
+    /// Reducer-owned cancellation of an in-flight enable when `StopPolicy::ThermalTrip` takes
+    /// over: cancels queued enable work, records the `ENABLE_FAILED` diagnostic with per-joint
+    /// status (while `ThermalTrip` retains highest display precedence), and ends any pending RT
+    /// `TorqueOn` command with `THERMAL_TRIP` before thermal protection starts `DisableProtective`.
+    pub(crate) fn interrupt_enable_for_thermal(&mut self) {
+        if !matches!(self.torque_transition, Some(TorqueTransition::Enable(_))) {
+            return;
+        }
+        let Some(TorqueTransition::Enable(reducer)) = self.torque_transition.take() else {
+            return;
+        };
+        match reducer.origin {
+            EnableOrigin::BrokerTransition => {
+                self.core.begin_transition(Err("THERMAL_TRIP"));
+            }
+            EnableOrigin::ParkRearm { action_id, .. } => {
+                self.finish_park_rearm_failed(action_id, "THERMAL_TRIP");
+            }
+        }
+        let _ = self.enter_failed_hold(reducer.was_torqued, |buf| {
+            buf.push_str("interrupted by thermal trip");
+        });
     }
 
     /// Zero-allocation RT preflight for torque enable (all refusal paths return static codes).
@@ -1685,20 +3272,20 @@ impl SupervisorInner {
                 "ESTOP_ACTIVE"
             });
         }
-        if self.mit_active() || self.mit.revoke_pending || crate::mit::has_mit_joints(&self.config) {
+        if self.mit_active()
+            || self.mit.revoke_pending
+            || crate::mit::mit_joint_mask(&self.config) != 0
+        {
             return Err("UNSUPPORTED");
         }
         Ok(())
     }
 
     /// Zero-allocation RT enable prepare (runs after [`Self::enable_prepare_rt_precheck`]).
+    /// Never infers `was_torqued` from feedback-reported enable state (R10 decision-owned torque).
     fn enable_prepare_rt(&mut self) -> Result<(bool, Option<f32>), &'static str> {
         self.enable_prepare_rt_precheck()?;
-        let any_driver_enabled = self
-            .driver
-            .as_ref()
-            .is_some_and(|d| d.lock().is_ok_and(|drv| drv.has_any_joint_enabled()));
-        let was_torqued = self.is_torqued || any_driver_enabled;
+        let was_torqued = self.is_torqued;
         let prev_gripper_cmd = if was_torqued {
             self.config
                 .gripper_index()
@@ -1706,323 +3293,547 @@ impl SupervisorInner {
         } else {
             None
         };
-        if let Some(ref d) = self.driver {
+        if let Some(d) = self.driver.take() {
             if self.estop_pending() {
+                self.driver = Some(d);
                 return Err("ESTOP_ACTIVE");
             }
-            let _driver = d.lock().map_err(|_| "FEEDBACK_UNAVAILABLE")?;
+            let Ok(driver) = d.lock() else {
+                self.owner_driver_snapshot.invalidate();
+                self.driver = Some(d);
+                return Err("FEEDBACK_UNAVAILABLE");
+            };
             if self.estop_pending() {
+                drop(driver);
+                self.driver = Some(d);
                 return Err("ESTOP_ACTIVE");
             }
+            self.refresh_owner_driver_snapshot_from_ref(driver.as_ref());
+            drop(driver);
+            self.driver = Some(d);
         }
         Ok((was_torqued, prev_gripper_cmd))
     }
 
-    /// Zero-allocation RT enable finish using cached driver feedback and bounded background disable
-    /// cleanup on feedback validation failure.
-    fn enable_finish_rt(
+    /// Starts the single budgeted enable reducer (`Enable -> Validate -> Armed | FailedHold`).
+    fn start_enable_reducer(
         &mut self,
+        origin: EnableOrigin,
         was_torqued: bool,
         prev_gripper_cmd: Option<f32>,
-        now: Instant,
-    ) -> Result<(), &'static str> {
-        if let Some(ref d) = self.driver {
-            let mut scratch_states = std::mem::take(&mut self.scratch.states);
-            let mut scratch_ages = std::mem::take(&mut self.scratch.ages);
-            let mut scratch_loads = std::mem::take(&mut self.scratch.loads);
-            let mut driver = match d.lock() {
-                Ok(g) => g,
-                Err(_) => {
-                    self.scratch.states = scratch_states;
-                    self.scratch.ages = scratch_ages;
-                    self.scratch.loads = scratch_loads;
-                    return Err("FEEDBACK_UNAVAILABLE");
-                }
-            };
-            let read_res = if driver.read_cached_joint_states_into(&mut scratch_states).is_some() {
-                Ok(())
-            } else {
-                driver.read_joint_states_into(&mut scratch_states)
-            };
-            if read_res.is_err() {
-                drop(driver);
-                self.scratch.states = scratch_states;
-                self.scratch.ages = scratch_ages;
-                self.scratch.loads = scratch_loads;
-                if !was_torqued {
-                    self.rollback_disable_after_failed_or_interrupted_enable(now);
-                }
-                return Err("FEEDBACK_UNAVAILABLE");
-            }
-            let has_loads = driver.joint_loads_into(&mut scratch_loads);
-            let loads_slice = has_loads.then_some(scratch_loads.as_slice());
-            if !driver.is_feedback_valid()
-                || !Self::states_valid(&scratch_states, driver.capabilities(), self.config.dof, loads_slice)
-                || (driver.capabilities().enable_feedback && driver.enable_state() != EnableState::Enabled)
-            {
-                drop(driver);
-                self.scratch.states = scratch_states;
-                self.scratch.ages = scratch_ages;
-                self.scratch.loads = scratch_loads;
-                if !was_torqued {
-                    self.rollback_disable_after_failed_or_interrupted_enable(now);
-                }
-                return Err("FEEDBACK_UNAVAILABLE");
-            }
-            driver.feedback_ages_into(&mut scratch_ages);
-            let oldest_age = if scratch_ages.iter().all(Option::is_some) {
-                scratch_ages.iter().flatten().copied().max()
-            } else {
-                None
-            };
-            self.feedback_numeric_valid = true;
-            self.last_can_feedback_instant = oldest_age.and_then(|age| now.checked_sub(age));
-            self.core.poll_feedback(
-                &mut self.joint_feedback_queue_bounds,
-                self.config.dof,
-                driver.as_ref(),
-                &mut self.scratch.fb,
+        authority: Option<EnableAuthority>,
+        budgeted: bool,
+    ) -> EnableStepOutcome {
+        use crate::driver::{TorqueOutcome, TorqueProgress as Drv};
+        let reducer = EnableReducer {
+            origin,
+            phase: EnableReducerPhase::Enable,
+            was_torqued,
+            prev_gripper_cmd,
+            authority,
+            budgeted,
+        };
+        self.torque_intent = TorqueIntent::On;
+        self.enable_lifecycle = EnableLifecycle::Enabling;
+        let Some(ref d) = self.driver else {
+            return self.step_enable_validate(
+                EnableReducer { phase: EnableReducerPhase::Validate, ..reducer },
+                None,
+                budgeted,
             );
-            Self::apply_feedback(
-                &mut self.measured_positions,
-                &mut self.measured_velocities,
-                &mut self.torques,
-                &mut self.temperatures,
-                &mut self.loads,
-                self.config.dof,
-                &scratch_states,
-                loads_slice,
-            );
-            drop(driver);
-            self.scratch.states = scratch_states;
-            self.scratch.ages = scratch_ages;
-            self.scratch.loads = scratch_loads;
-        }
-
-        copy_into(&mut self.commanded_positions, &self.measured_positions);
-        copy_into(&mut self.target_positions, &self.measured_positions);
-        if let Some(g_cmd) = prev_gripper_cmd {
-            if let Some(grip_idx) = self.config.gripper_index() {
-                self.commanded_positions[grip_idx] = g_cmd;
-                self.target_positions[grip_idx] = g_cmd;
-            }
-        }
-        self.commanded_velocities.fill(0.0);
-        self.commanded_accelerations.fill(0.0);
-        if self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled) {
-            let arm_indices = self.config.arm_joints();
-            let has_vel_fb = self.driver.as_ref().is_none_or(|d| {
-                d.lock().is_ok_and(|drv| drv.capabilities().velocity_feedback)
-            });
-            let arm_stationary = has_vel_fb
-                && arm_indices.iter().all(|&j| {
-                    self.measured_velocities
-                        .get(j)
-                        .is_some_and(|v| v.is_finite() && v.abs() <= crate::tracking::STATIONARY_VELOCITY_RAD_S)
+        };
+        let mut ages_buf = std::mem::take(&mut self.scratch.ages);
+        let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
+        let (started, enable_fb, drv_now, snap) = {
+            let Ok(mut drv) = d.lock() else {
+                self.scratch.ages = ages_buf;
+                self.scratch.fb.bounds = bounds_buf;
+                self.owner_driver_snapshot.invalidate();
+                let message = self.enter_failed_hold(was_torqued, |buf| {
+                    buf.push_str("driver mutex poisoned during enable");
                 });
-            let aligned_with_issued = !self
-                .tracking
-                .has_residual_lead(&self.commanded_positions, &arm_indices);
-            if was_torqued && self.tracking.last_issued_positions.is_some() {
-                if arm_stationary && aligned_with_issued {
-                    self.tracking.seed(&self.commanded_positions);
-                } else {
-                    self.tracking.ws_min_depths = None;
+                return EnableStepOutcome::Failed {
+                    rt_code: "FEEDBACK_UNAVAILABLE",
+                    message,
+                    feedback_unavailable: true,
+                    estop_interrupted: false,
+                };
+            };
+            let enable_fb = drv.capabilities().enable_feedback;
+            let drv_now = drv.clock_now();
+            let started = if budgeted {
+                drv.begin_torque_budgeted(true, 0)
+            } else {
+                drv.begin_torque(true)
+            };
+            let snap = OwnerDriverSnapshot::capture_from_driver(
+                drv.as_ref(),
+                self.config.dof,
+                self.feedback_numeric_valid,
+                &self.measured_positions,
+                &mut ages_buf,
+                &mut bounds_buf,
+            );
+            (started, enable_fb, drv_now, snap)
+        };
+        self.scratch.ages = ages_buf;
+        self.scratch.fb.bounds = bounds_buf;
+        self.owner_driver_snapshot = snap;
+        match started {
+            Ok(Drv::Pending { wake }) => {
+                self.torque_transition = Some(TorqueTransition::Enable(reducer));
+                EnableStepOutcome::Pending {
+                    wake: if budgeted { drv_now } else { wake },
                 }
-            } else if arm_stationary {
-                self.tracking.seed(&self.commanded_positions);
-            } else {
-                self.tracking.invalidate();
             }
-        } else {
-            self.tracking.invalidate();
+            Ok(Drv::Done(TorqueOutcome::Confirmed)) => self.step_enable_validate(
+                EnableReducer { phase: EnableReducerPhase::Validate, ..reducer },
+                None,
+                budgeted,
+            ),
+            Ok(Drv::Done(TorqueOutcome::Unconfirmed)) if !enable_fb => self.step_enable_validate(
+                EnableReducer { phase: EnableReducerPhase::Validate, ..reducer },
+                None,
+                budgeted,
+            ),
+            Ok(Drv::Done(TorqueOutcome::Unconfirmed)) => {
+                let message = self.enter_failed_hold(was_torqued, |buf| {
+                    buf.push_str("enable not confirmed");
+                });
+                EnableStepOutcome::Failed {
+                    rt_code: "FEEDBACK_UNCONFIRMED",
+                    message,
+                    feedback_unavailable: false,
+                    estop_interrupted: false,
+                }
+            }
+            Err(e) => {
+                let rt_code = enable_driver_err_code(&e);
+                let estop_interrupted = crate::driver::is_estop_inhibited(&e);
+                let message = self.enter_failed_hold(was_torqued, |buf| {
+                    e.write_bounded(buf);
+                });
+                EnableStepOutcome::Failed {
+                    rt_code,
+                    message,
+                    feedback_unavailable: false,
+                    estop_interrupted,
+                }
+            }
         }
-        if self.driver.is_none() {
-            self.measured_velocities.fill(0.0);
-        }
-        self.retire_motion_payloads();
-        self.pending_normal_unload = false;
-        self.watchdog_park = None;
-        self.servo_stream_active = false;
-        self.gripper_hold_vel_ceiling = None;
-
-        if self.estop_pending() || self.safety.state().is_stopped() {
-            self.is_torqued = true;
-            self.pending_rearm = true;
-            return Err(if !self.estop_pending() && matches!(self.safety.state(), SafetyState::Fault(_)) {
-                "FAULT_ACTIVE"
-            } else {
-                "ESTOP_ACTIVE"
-            });
-        }
-        self.safety.set_torque_rt(true)?;
-        self.is_torqued = true;
-        self.pending_rearm = false;
-        self.disable_pending = false;
-        self.background_disable_retry = None;
-        self.mit.armed_ok = self
-            .config
-            .joint_tracking
-            .as_ref()
-            .is_some_and(|jt| jt.mit_requested());
-        self.last_heartbeat = now;
-        self.last_motion_frame = now;
-        Ok(())
     }
 
-    /// Enable, after the driver confirmed it: validates fresh feedback (a failure disables
-    /// an arm that was not torqued again), seeds commanded / target / tracking state from it,
-    /// and records torque on.
-    fn enable_finish(&mut self, was_torqued: bool, prev_gripper_cmd: Option<f32>) -> Result<SafetyState, SafetyError> {
-        self.enable_finish_inner(was_torqued, prev_gripper_cmd, false)
-    }
-
-    fn enable_finish_inner(&mut self, was_torqued: bool, prev_gripper_cmd: Option<f32>, use_cached: bool) -> Result<SafetyState, SafetyError> {
+    /// Cancels an in-flight `EnableOrigin::ParkRearm` cleanly on client Stop without latching
+    /// `EnableFailed`, preserving holding torque on any energized joints.
+    fn cancel_park_rearm_on_stop(&mut self, action_id: u64, was_torqued: bool) {
         if let Some(ref d) = self.driver {
+            if let Ok(mut drv) = d.lock() {
+                drv.abort_enable();
+            }
+        }
+        self.is_torqued = was_torqued || self.driver_any_enabled();
+        self.pending_rearm = true;
+        if self.park_continuation.is_some_and(|c| c.action_id == action_id) {
+            self.park_continuation = None;
+            self.notify_park_continuation();
+        }
+        if self
+            .last_action
+            .as_ref()
+            .is_some_and(|a| a.id == action_id && a.is_running())
+        {
+            self.finish_action(action_id, "cancelled", Some("STOPPED"), None, None, None, None);
+        }
+    }
+
+    /// Advances the single budgeted enable reducer by one poll step (`Enable -> Validate -> Armed | FailedHold`).
+    /// Re-verifies live [`EnableAuthority`] BEFORE any subsequent enable retry TX so a displaced
+    /// lease, disconnect, E-stop, fault, or epoch change transitions immediately to `FailedHold`
+    /// without sending rollback disable frames.
+    fn poll_enable_reducer(
+        &mut self,
+        reducer: EnableReducer,
+        budget: Option<&crate::rt_core::ops::ServiceBudget>,
+    ) -> (EnableStepOutcome, Option<(u16, bool)>) {
+        use crate::driver::{TorqueOutcome, TorqueProgress as Drv};
+        if let Some(auth) = reducer.authority {
+            let check_now = budget.map_or_else(Instant::now, |b| b.now);
+            if let Some(code) = self.enable_authority_revoked(auth, check_now) {
+                let estop = code == "ESTOP_ACTIVE";
+                let message = self.enter_failed_hold(reducer.was_torqued, |buf| {
+                    buf.push_str("enable authority revoked: ");
+                    buf.push_str(code);
+                });
+                return (
+                    EnableStepOutcome::Failed {
+                        rt_code: code,
+                        message,
+                        feedback_unavailable: false,
+                        estop_interrupted: estop,
+                    },
+                    None,
+                );
+            }
+        }
+        if let EnableOrigin::ParkRearm { action_id, stop_gen } = reducer.origin {
+            if self.urgent_stop_unapplied()
+                || self.current_stop_gen() != stop_gen
+                || !self
+                    .park_continuation
+                    .is_some_and(|c| c.action_id == action_id && c.stop_gen == stop_gen)
+            {
+                self.cancel_park_rearm_on_stop(action_id, reducer.was_torqued);
+                return (
+                    EnableStepOutcome::Failed {
+                        rt_code: "STOPPED",
+                        message: crate::safety::BoundedText::new("park rearm cancelled by stop"),
+                        feedback_unavailable: false,
+                        estop_interrupted: false,
+                    },
+                    None,
+                );
+            }
+        }
+        if self.estop_pending() || self.safety.state().is_stopped() {
+            let estop = self.estop_pending() || matches!(self.safety.state(), SafetyState::EStop);
+            let rt_code = if estop { "ESTOP_ACTIVE" } else { "FAULT_ACTIVE" };
+            let message = self.enter_failed_hold(reducer.was_torqued, |buf| {
+                buf.push_str(if estop {
+                    "interrupted by E-stop"
+                } else {
+                    "interrupted by active fault"
+                });
+            });
+            return (
+                EnableStepOutcome::Failed {
+                    rt_code,
+                    message,
+                    feedback_unavailable: false,
+                    estop_interrupted: estop,
+                },
+                None,
+            );
+        }
+        match reducer.phase {
+            EnableReducerPhase::Validate => (
+                self.step_enable_validate(reducer, budget, budget.is_some()),
+                None,
+            ),
+            EnableReducerPhase::Enable => {
+                let Some(ref d) = self.driver else {
+                    let message = self.enter_failed_hold(reducer.was_torqued, |buf| {
+                        buf.push_str("driver missing during enable poll");
+                    });
+                    return (
+                        EnableStepOutcome::Failed {
+                            rt_code: "INTERNAL",
+                            message,
+                            feedback_unavailable: false,
+                            estop_interrupted: false,
+                        },
+                        None,
+                    );
+                };
+                let mut scratch_states = std::mem::take(&mut self.scratch.states);
+                let mut scratch_ages = std::mem::take(&mut self.scratch.ages);
+                let mut scratch_bounds = std::mem::take(&mut self.scratch.fb.bounds);
+                let lock_res = {
+                    let Ok(mut drv) = d.lock() else {
+                        self.scratch.states = scratch_states;
+                        self.scratch.ages = scratch_ages;
+                        self.scratch.fb.bounds = scratch_bounds;
+                        self.owner_driver_snapshot.invalidate();
+                        let message = self.enter_failed_hold(reducer.was_torqued, |buf| {
+                            buf.push_str("driver mutex poisoned during enable poll");
+                        });
+                        return (
+                            EnableStepOutcome::Failed {
+                                rt_code: "FEEDBACK_UNAVAILABLE",
+                                message,
+                                feedback_unavailable: true,
+                                estop_interrupted: false,
+                            },
+                            None,
+                        );
+                    };
+                    let caps = drv.capabilities();
+                    let enable_fb = caps.enable_feedback;
+                    let temp_fb = caps.temperature_feedback;
+                    let drv_now = drv.clock_now();
+                    let (r, rx) = if let Some(b) = budget {
+                        let span = b.deadline.saturating_duration_since(b.now);
+                        let r = if reducer.budgeted {
+                            drv.poll_torque_budgeted(drv_now + span, b.max_rx_frames)
+                        } else {
+                            drv.poll_torque(drv_now + span)
+                        };
+                        let rx = drv.take_last_poll_rx();
+                        (r, rx)
+                    } else {
+                        let r = drv.poll_torque(drv_now + crate::driver::DAMIAO_RX_PASS);
+                        (r, None)
+                    };
+                    let mut cached_temps_read = false;
+                    if temp_fb && drv.read_cached_joint_states_into(&mut scratch_states).is_some() {
+                        drv.feedback_ages_into(&mut scratch_ages);
+                        cached_temps_read = true;
+                    }
+                    let snap = OwnerDriverSnapshot::capture_from_driver(
+                        drv.as_ref(),
+                        self.config.dof,
+                        self.feedback_numeric_valid,
+                        &self.measured_positions,
+                        &mut scratch_ages,
+                        &mut scratch_bounds,
+                    );
+                    (r, rx, enable_fb, temp_fb, drv_now, cached_temps_read, snap)
+                };
+                let (poll_res, rx, enable_fb, temp_fb, drv_now, cached_temps_read, snap) = lock_res;
+                self.owner_driver_snapshot = snap;
+                if cached_temps_read {
+                    let n = self.config.dof.min(self.temperatures.len()).min(scratch_states.len());
+                    for i in 0..n {
+                        if scratch_ages.get(i).copied().flatten().is_some()
+                            && scratch_states[i].temperature.is_finite()
+                        {
+                            self.temperatures[i] = scratch_states[i].temperature;
+                        }
+                    }
+                }
+                self.scratch.states = scratch_states;
+                self.scratch.ages = scratch_ages;
+                self.scratch.fb.bounds = scratch_bounds;
+                if let Some(failed) = self.check_enable_thermal_trip(reducer.was_torqued, temp_fb) {
+                    return (failed, rx);
+                }
+                match poll_res {
+                    Ok(Drv::Pending { wake }) => {
+                        self.torque_transition = Some(TorqueTransition::Enable(reducer));
+                        let mapped_wake = match budget {
+                            Some(b) => b.now + wake.saturating_duration_since(drv_now),
+                            None => wake,
+                        };
+                        (EnableStepOutcome::Pending { wake: mapped_wake }, rx)
+                    }
+                    Ok(Drv::Done(TorqueOutcome::Confirmed)) => (
+                        self.step_enable_validate(
+                            EnableReducer { phase: EnableReducerPhase::Validate, ..reducer },
+                            budget,
+                            budget.is_some(),
+                        ),
+                        rx,
+                    ),
+                    Ok(Drv::Done(TorqueOutcome::Unconfirmed)) if !enable_fb => (
+                        self.step_enable_validate(
+                            EnableReducer { phase: EnableReducerPhase::Validate, ..reducer },
+                            budget,
+                            budget.is_some(),
+                        ),
+                        rx,
+                    ),
+                    Ok(Drv::Done(TorqueOutcome::Unconfirmed)) => {
+                        let message = self.enter_failed_hold(reducer.was_torqued, |buf| {
+                            buf.push_str("enable not confirmed");
+                        });
+                        (
+                            EnableStepOutcome::Failed {
+                                rt_code: "FEEDBACK_UNCONFIRMED",
+                                message,
+                                feedback_unavailable: false,
+                                estop_interrupted: false,
+                            },
+                            rx,
+                        )
+                    }
+                    Err(e) => {
+                        let rt_code = enable_driver_err_code(&e);
+                        let estop_interrupted = crate::driver::is_estop_inhibited(&e);
+                        let message = self.enter_failed_hold(reducer.was_torqued, |buf| {
+                            e.write_bounded(buf);
+                        });
+                        (
+                            EnableStepOutcome::Failed {
+                                rt_code,
+                                message,
+                                feedback_unavailable: false,
+                                estop_interrupted,
+                            },
+                            rx,
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    /// Post-enable validation phase of the single enable reducer (`Validate -> Armed | FailedHold`).
+    /// Any validation failure or interruption routes through [`Self::enter_failed_hold`] (zero
+    /// automatic rollback at any pose).
+    fn step_enable_validate(
+        &mut self,
+        reducer: EnableReducer,
+        budget: Option<&crate::rt_core::ops::ServiceBudget>,
+        use_cached: bool,
+    ) -> EnableStepOutcome {
+        let was_torqued = reducer.was_torqued;
+        let prev_gripper_cmd = reducer.prev_gripper_cmd;
+        let check_now = budget.map_or_else(Instant::now, |b| b.now);
+        if let Some(auth) = reducer.authority {
+            if let Some(code) = self.enable_authority_revoked(auth, check_now) {
+                let estop = code == "ESTOP_ACTIVE";
+                let message = self.enter_failed_hold(was_torqued, |buf| {
+                    buf.push_str("enable authority revoked before validation: ");
+                    buf.push_str(code);
+                });
+                return EnableStepOutcome::Failed {
+                    rt_code: code,
+                    message,
+                    feedback_unavailable: false,
+                    estop_interrupted: estop,
+                };
+            }
+        }
+        if self.estop_pending() || self.safety.state().is_stopped() {
+            let estop = self.estop_pending() || matches!(self.safety.state(), SafetyState::EStop);
+            let rt_code = if estop { "ESTOP_ACTIVE" } else { "FAULT_ACTIVE" };
+            let message = self.enter_failed_hold(was_torqued, |buf| {
+                buf.push_str(if estop {
+                    "interrupted by E-stop before validation"
+                } else {
+                    "interrupted by active fault before validation"
+                });
+            });
+            return EnableStepOutcome::Failed {
+                rt_code,
+                message,
+                feedback_unavailable: false,
+                estop_interrupted: estop,
+            };
+        }
+
+        if self.driver.is_some() {
             let mut scratch_states = std::mem::take(&mut self.scratch.states);
             let mut scratch_ages = std::mem::take(&mut self.scratch.ages);
             let mut scratch_loads = std::mem::take(&mut self.scratch.loads);
-            let mut driver = match d.lock() {
-                Ok(g) => g,
-                Err(_) => {
-                    self.scratch.states = scratch_states;
-                    self.scratch.ages = scratch_ages;
-                    self.scratch.loads = scratch_loads;
-                    return Err(SafetyError::FeedbackUnavailable);
-                }
-            };
-            let read_res = if use_cached {
-                if driver.read_cached_joint_states_into(&mut scratch_states).is_some() {
-                    Ok(())
-                } else {
-                    driver.read_joint_states_into(&mut scratch_states)
-                }
-            } else {
-                driver.read_joint_states_into(&mut scratch_states)
-            };
-            if read_res.is_err() {
-                let disable_outcome = if !was_torqued {
-                    if use_cached {
-                        let sent = driver.begin_torque_budgeted(false, 0);
-                        Some(
-                            matches!(
-                                sent,
-                                Ok(crate::driver::TorqueProgress::Done(crate::driver::TorqueOutcome::Confirmed))
-                            ) && driver.is_feedback_valid()
-                                && driver.enable_state() == EnableState::Disabled,
-                        )
-                    } else {
-                        let sent = driver.set_torque(false).is_ok();
-                        let _ = driver.read_joint_states();
-                        Some(sent && driver.is_feedback_valid() && driver.enable_state() == EnableState::Disabled)
-                    }
-                } else {
-                    None
-                };
-                drop(driver);
-                self.scratch.states = scratch_states;
-                self.scratch.ages = scratch_ages;
-                self.scratch.loads = scratch_loads;
-                if let Some(confirmed_off) = disable_outcome {
-                    if use_cached {
-                        if confirmed_off {
-                            self.disable_confirmed();
+            let (validate_res, temp_fb) = {
+                let d = self.driver.as_ref().expect("checked is_some");
+                match d.lock() {
+                    Err(_) => (Err("driver mutex poisoned during validation"), false),
+                    Ok(mut driver) => {
+                        let temp_fb = driver.capabilities().temperature_feedback;
+                        let read_res: Result<(), ()> = if use_cached {
+                            if driver.read_cached_joint_states_into(&mut scratch_states).is_some() {
+                                Ok(())
+                            } else if let Some(b) = budget {
+                                let span = b.deadline.saturating_duration_since(b.now);
+                                let drv_deadline = driver.clock_now() + span;
+                                driver
+                                    .read_joint_states_budgeted(&mut scratch_states, drv_deadline, b.max_rx_frames)
+                                    .map(|_| ())
+                                    .map_err(|_| ())
+                            } else {
+                                Err(())
+                            }
                         } else {
-                            self.is_torqued = true;
-                            self.disable_requested();
-                        }
-                    } else {
-                        self.is_torqued = !confirmed_off;
-                        self.disable_pending = !confirmed_off;
-                        self.last_disable_attempt = Some(Instant::now());
-                    }
-                }
-                return Err(SafetyError::FeedbackUnavailable);
-            }
-            let has_loads = driver.joint_loads_into(&mut scratch_loads);
-            let loads_slice = has_loads.then_some(scratch_loads.as_slice());
-            if !driver.is_feedback_valid()
-                || !Self::states_valid(&scratch_states, driver.capabilities(), self.config.dof, loads_slice)
-                || (driver.capabilities().enable_feedback && driver.enable_state() != EnableState::Enabled)
-            {
-                let disable_outcome = if !was_torqued {
-                    if use_cached {
-                        let sent = driver.begin_torque_budgeted(false, 0);
-                        Some(
-                            matches!(
-                                sent,
-                                Ok(crate::driver::TorqueProgress::Done(crate::driver::TorqueOutcome::Confirmed))
-                            ) && driver.is_feedback_valid()
-                                && driver.enable_state() == EnableState::Disabled,
-                        )
-                    } else {
-                        let sent = driver.set_torque(false).is_ok();
-                        let _ = driver.read_joint_states();
-                        Some(sent && driver.is_feedback_valid() && driver.enable_state() == EnableState::Disabled)
-                    }
-                } else {
-                    None
-                };
-                drop(driver);
-                self.scratch.states = scratch_states;
-                self.scratch.ages = scratch_ages;
-                self.scratch.loads = scratch_loads;
-                if let Some(confirmed_off) = disable_outcome {
-                    if use_cached {
-                        if confirmed_off {
-                            self.disable_confirmed();
+                            driver.read_joint_states_into(&mut scratch_states).map_err(|_| ())
+                        };
+                        if read_res.is_err() {
+                            (Err("post-enable feedback unavailable"), temp_fb)
                         } else {
-                            self.is_torqued = true;
-                            self.disable_requested();
+                            let has_loads = driver.joint_loads_into(&mut scratch_loads);
+                            let loads_slice = has_loads.then_some(scratch_loads.as_slice());
+                            if !driver.is_feedback_valid()
+                                || !Self::states_valid(&scratch_states, driver.capabilities(), self.config.dof, loads_slice)
+                                || (driver.capabilities().enable_feedback && driver.enable_state() != EnableState::Enabled)
+                            {
+                                // Preserve any finite received temperatures for thermal enforcement
+                                // even when another joint failed post-enable validation.
+                                if temp_fb {
+                                    driver.feedback_ages_into(&mut scratch_ages);
+                                    let n = self.config.dof.min(self.temperatures.len()).min(scratch_states.len());
+                                    for i in 0..n {
+                                        if scratch_ages.get(i).copied().flatten().is_some()
+                                            && scratch_states[i].temperature.is_finite()
+                                        {
+                                            self.temperatures[i] = scratch_states[i].temperature;
+                                        }
+                                    }
+                                }
+                                (Err("post-enable feedback invalid or enable unconfirmed"), temp_fb)
+                            } else {
+                                driver.feedback_ages_into(&mut scratch_ages);
+                                let oldest_age = if scratch_ages.iter().all(Option::is_some) {
+                                    scratch_ages.iter().flatten().copied().max()
+                                } else {
+                                    None
+                                };
+                                self.driver_caps = driver.capabilities();
+                                self.feedback_numeric_valid = true;
+                                self.last_can_feedback_instant = oldest_age.and_then(|age| Instant::now().checked_sub(age));
+                                self.last_poll_enable_state = driver.enable_state();
+                                self.last_poll_partial_enable = driver.has_known_partial_enable();
+                                self.last_poll_feedback_valid = true;
+                                self.last_poll_oldest_age = oldest_age;
+                                self.core.poll_feedback(&mut self.joint_feedback_queue_bounds, self.config.dof, driver.as_ref(), &mut self.scratch.fb);
+                                Self::apply_feedback(
+                                    &mut self.measured_positions,
+                                    &mut self.measured_velocities,
+                                    &mut self.torques,
+                                    &mut self.temperatures,
+                                    &mut self.loads,
+                                    self.config.dof,
+                                    &scratch_states,
+                                    loads_slice,
+                                );
+                                self.owner_driver_snapshot = OwnerDriverSnapshot::capture_from_driver(
+                                    driver.as_ref(),
+                                    self.config.dof,
+                                    self.feedback_numeric_valid,
+                                    &self.measured_positions,
+                                    &mut scratch_ages,
+                                    &mut self.scratch.fb.bounds,
+                                );
+                                (Ok(()), temp_fb)
+                            }
                         }
-                    } else {
-                        self.is_torqued = !confirmed_off;
-                        self.disable_pending = !confirmed_off;
-                        self.last_disable_attempt = Some(Instant::now());
                     }
                 }
-                return Err(SafetyError::FeedbackUnavailable);
-            }
-            driver.feedback_ages_into(&mut scratch_ages);
-            let oldest_age = if scratch_ages.iter().all(Option::is_some) {
-                scratch_ages.iter().flatten().copied().max()
-            } else {
-                None
             };
-            self.driver_caps = driver.capabilities();
-            self.feedback_numeric_valid = true;
-            self.last_can_feedback_instant = oldest_age.and_then(|age| Instant::now().checked_sub(age));
-            self.last_poll_enable_state = driver.enable_state();
-            self.last_poll_partial_enable = driver.has_known_partial_enable();
-            self.last_poll_feedback_valid = true;
-            self.last_poll_oldest_age = oldest_age;
-            self.core.poll_feedback(&mut self.joint_feedback_queue_bounds, self.config.dof, driver.as_ref(), &mut self.scratch.fb);
-            Self::apply_feedback(
-                &mut self.measured_positions,
-                &mut self.measured_velocities,
-                &mut self.torques,
-                &mut self.temperatures,
-                &mut self.loads,
-                self.config.dof,
-                &scratch_states,
-                loads_slice,
-            );
-            drop(driver);
             self.scratch.states = scratch_states;
             self.scratch.ages = scratch_ages;
             self.scratch.loads = scratch_loads;
+            if let Some(failed) = self.check_enable_thermal_trip(was_torqued, temp_fb) {
+                return failed;
+            }
+            if let Err(cause) = validate_res {
+                let message = self.enter_failed_hold(was_torqued, |buf| {
+                    buf.push_str(cause);
+                });
+                return EnableStepOutcome::Failed {
+                    rt_code: "FEEDBACK_UNAVAILABLE",
+                    message,
+                    feedback_unavailable: true,
+                    estop_interrupted: false,
+                };
+            }
+        } else if let Some(failed) = self.check_enable_thermal_trip(was_torqued, true) {
+            return failed;
         }
 
-        // Check E-stop / fault BEFORE mutating commanded/target/tracking/trajectory state so a
-        // concurrent stop during synchronous enable confirmation leaves motion state untouched
-        // while keeping honest physical torque bookkeeping (`is_torqued = true`, `pending_rearm = true`).
-        if self.estop_pending() || self.safety.state().is_stopped() {
-            self.is_torqued = true;
-            self.pending_rearm = true;
-            return Err(match self.safety.state() {
-                SafetyState::Fault(reason) if !self.estop_pending() => SafetyError::FaultActive(reason.clone()),
-                _ => SafetyError::EStopActive,
-            });
+        if let EnableOrigin::ParkRearm { action_id, stop_gen } = reducer.origin {
+            let cont_lost = budget.is_some()
+                && !self
+                    .park_continuation
+                    .is_some_and(|c| c.action_id == action_id && c.stop_gen == stop_gen);
+            if self.urgent_stop_unapplied() || self.current_stop_gen() != stop_gen || cont_lost {
+                self.cancel_park_rearm_on_stop(action_id, was_torqued);
+                return EnableStepOutcome::Failed {
+                    rt_code: "STOPPED",
+                    message: crate::safety::BoundedText::new("park rearm cancelled by stop"),
+                    feedback_unavailable: false,
+                    estop_interrupted: false,
+                };
+            }
         }
 
         // Initialize commanded_positions to verified measured_positions to prevent sudden jumps
@@ -2078,67 +3889,214 @@ impl SupervisorInner {
         self.servo_ws_min_depths = None;
         self.gripper_hold_vel_ceiling = None;
 
-        let state = self.safety.set_torque(true)?;
-        self.is_torqued = true;
-        self.pending_rearm = false;
-        self.disable_pending = false;
-        self.mit.armed_ok = self.config.joint_tracking.as_ref().is_some_and(|jt| jt.mit_requested());
-        self.mit.handover_error = None;
-        let now = Instant::now();
-        self.last_heartbeat = now;
-        self.last_motion_frame = now;
-        Ok(state)
+        if let Some(auth) = reducer.authority {
+            let post_now = budget.map_or_else(Instant::now, |b| b.now);
+            if let Some(code) = self.enable_authority_revoked(auth, post_now) {
+                let estop = code == "ESTOP_ACTIVE";
+                let message = self.enter_failed_hold(was_torqued, |buf| {
+                    buf.push_str("enable authority revoked before arming: ");
+                    buf.push_str(code);
+                });
+                return EnableStepOutcome::Failed {
+                    rt_code: code,
+                    message,
+                    feedback_unavailable: false,
+                    estop_interrupted: estop,
+                };
+            }
+        }
+        if self.estop_pending() || self.safety.state().is_stopped() {
+            let estop = self.estop_pending() || matches!(self.safety.state(), SafetyState::EStop);
+            let rt_code = if estop { "ESTOP_ACTIVE" } else { "FAULT_ACTIVE" };
+            let message = self.enter_failed_hold(was_torqued, |buf| {
+                buf.push_str(if estop {
+                    "interrupted by E-stop before arming"
+                } else {
+                    "interrupted by active fault before arming"
+                });
+            });
+            return EnableStepOutcome::Failed {
+                rt_code,
+                message,
+                feedback_unavailable: false,
+                estop_interrupted: estop,
+            };
+        }
+        let armed_now = budget.map_or_else(Instant::now, |b| b.now);
+        if use_cached {
+            match self.safety.set_torque_rt(true) {
+                Ok(()) => {
+                    self.enable_lifecycle = EnableLifecycle::Armed;
+                    self.measured_hold.clear();
+                    self.is_torqued = true;
+                    self.pending_rearm = false;
+                    self.disable_pending = false;
+                    self.background_disable_retry = None;
+                    self.mit.armed_ok = self.config.joint_tracking.as_ref().is_some_and(|jt| jt.mit_requested());
+                    self.mit.handover_error = None;
+                    self.last_heartbeat = armed_now;
+                    self.last_motion_frame = armed_now;
+                    EnableStepOutcome::Armed(SafetyState::Armed)
+                }
+                Err(rt_code) => {
+                    let estop_interrupted = rt_code == "ESTOP_ACTIVE";
+                    let message = self.enter_failed_hold(was_torqued, |buf| {
+                        buf.push_str(rt_code);
+                    });
+                    EnableStepOutcome::Failed {
+                        rt_code,
+                        message,
+                        feedback_unavailable: false,
+                        estop_interrupted,
+                    }
+                }
+            }
+        } else {
+            match self.safety.set_torque(true) {
+                Ok(state) => {
+                    self.enable_lifecycle = EnableLifecycle::Armed;
+                    self.measured_hold.clear();
+                    self.is_torqued = true;
+                    self.pending_rearm = false;
+                    self.disable_pending = false;
+                    self.background_disable_retry = None;
+                    self.mit.armed_ok = self.config.joint_tracking.as_ref().is_some_and(|jt| jt.mit_requested());
+                    self.mit.handover_error = None;
+                    self.last_heartbeat = armed_now;
+                    self.last_motion_frame = armed_now;
+                    EnableStepOutcome::Armed(state)
+                }
+                Err(e) => {
+                    let rt_code = torque_error_code(&e);
+                    let estop_interrupted = matches!(e, SafetyError::EStopActive);
+                    let message = self.enter_failed_hold(was_torqued, |buf| {
+                        buf.push_str(rt_code);
+                    });
+                    EnableStepOutcome::Failed {
+                        rt_code,
+                        message,
+                        feedback_unavailable: false,
+                        estop_interrupted,
+                    }
+                }
+            }
+        }
     }
 
     /// Torque off at the resting pose. `stillness_verified` is set by the unload settle,
     /// which judged stationarity over its hold window; otherwise the current velocity
     /// sample must be within the resting-pose limit.
     pub(super) fn torque_off(&mut self, stillness_verified: bool) -> Result<SafetyState, SafetyError> {
-        self.torque_off_check(stillness_verified)?;
-        self.stop_motion();
-        self.commanded_velocities.fill(0.0);
-        if let Err(error) = self.request_disable() {
-            self.safety.latch(
-                crate::safety::FaultKind::Other,
-                crate::safety::FaultDetail::formatted(FaultCode::DriverWriteFailed, |buf| {
-                    let _ = core::fmt::write(buf, format_args!("{error}"));
-                }),
-            );
-            return Err(error);
-        }
-        self.torque_off_finish()
+        self.torque_off_in_place(stillness_verified)?;
+        Ok(self.safety.state().clone())
     }
 
-    /// The refusals of a torque off: E-stop / fault, not at the resting pose.
-    fn torque_off_check(&self, stillness_verified: bool) -> Result<(), SafetyError> {
-        if self.safety.state().is_stopped() || self.e_stop_latched.load(Ordering::SeqCst) {
-            return Err(SafetyError::MotionForbiddenInFaultState(
-                "Cannot disable torque in EStop or Fault. Call clear_fault first.".into(),
-            ));
-        }
+    /// True when E-stop, a Fault state, any latched fault kind bit, or a pending E-stop
+    /// keeps the arm stopped: torque-off must apply Rule A′ and must never clear or mutate
+    /// the fault record or epoch.
+    #[inline]
+    fn torque_off_stopped(&self) -> bool {
+        self.safety.state().is_stopped()
+            || self.safety.has_latched_fault()
+            || self.estop_pending()
+    }
 
-        let violation = if stillness_verified { self.resting_pose_static_violation() } else { self.resting_pose_violation() };
-        if let Some(reason) = violation {
-            tracing::warn!("Torque off refused, not at resting pose: {reason}");
-            return Err(SafetyError::ArmNotAtRestingPose {
-                current: self.measured_positions.clone(),
-                expected: self.config.resting_positions().to_vec(),
-                reason: Some(reason),
-            });
+    fn torque_off_in_place(&mut self, stillness_verified: bool) -> Result<(), SafetyError> {
+        self.torque_off_check(stillness_verified)?;
+        let started_at = self.driver_clock_now();
+        let disable_kind = crate::driver::DisableKind::DisableRequested { started_at };
+        self.stop_motion();
+        self.commanded_velocities.fill(0.0);
+        if let Err(error) = self.request_disable(disable_kind) {
+            let refused = matches!(error, SafetyError::TorqueOffWouldDrop { .. });
+            if !refused && !self.torque_off_stopped() {
+                self.safety.latch(
+                    crate::safety::FaultKind::Other,
+                    crate::safety::FaultDetail::formatted(FaultCode::DriverWriteFailed, |buf| {
+                        let _ = core::fmt::write(buf, format_args!("{error}"));
+                    }),
+                );
+            }
+            return Err(error);
+        }
+        if !self.disable_pending {
+            self.torque_off_finish_in_place()?;
         }
         Ok(())
     }
 
-    /// Torque off after the confirmed disable: safety state, gripper stall reset.
-    fn torque_off_finish(&mut self) -> Result<SafetyState, SafetyError> {
-        let state = self.safety.set_torque(false)?;
-        self.reset_gripper_stall();
-        self.gripper_hold_vel_ceiling = None;
-        if self.driver.is_none() { self.measured_velocities.fill(0.0); }
-        Ok(state)
+    /// Record one contended `driver.try_lock()` skip on an RT disable dispatch or poll path (M4).
+    /// Escalates at `STOPPED_HOLD_CONTENTION_ESCALATE_SKIPS` (25 consecutive skips, 0.5 s at 50 Hz)
+    /// with a counted diagnostic escalation and a non-recoverable `HardwareFault` (zero allocation).
+    pub(crate) fn record_disable_lock_contention(&mut self) {
+        crate::diagnostics::tick::record_disable_lock_contended();
+        self.disable_lock_contended_skips = self.disable_lock_contended_skips.saturating_add(1);
+        if self.disable_lock_contended_skips >= STOPPED_HOLD_CONTENTION_ESCALATE_SKIPS
+            && !self.disable_lock_contended_escalated
+        {
+            self.disable_lock_contended_escalated = true;
+            crate::diagnostics::tick::record_disable_contention_escalation();
+            let skips = self.disable_lock_contended_skips;
+            let detail = crate::safety::FaultDetail::formatted(FaultCode::HardwareFault, |buf| {
+                let _ = core::fmt::write(
+                    buf,
+                    format_args!(
+                        "RT torque-disable path skipped {} consecutive ticks due to driver mutex contention",
+                        skips
+                    ),
+                );
+            });
+            self.safety.latch(crate::safety::FaultKind::Other, detail);
+        }
     }
 
-    /// Zero-allocation RT torque-off precheck (static protocol error codes).
+    #[inline]
+    pub(crate) fn reset_disable_lock_contention(&mut self) {
+        self.disable_lock_contended_skips = 0;
+        self.disable_lock_contended_escalated = false;
+    }
+
+    /// True when the driver can keep a stopped disable pending inside its 1 s lifetime while an
+    /// exhausted RX drain, incomplete K=3 rest-pose window, or stale/missing evidence on a drained
+    /// bus runs the probe loop (L1/M3). Non-blocking variant for `armd-control` (M4).
+    fn can_defer_stopped_disable_to_driver_nonblocking(&self) -> Result<bool, ()> {
+        let Some(d) = self.driver.as_ref() else {
+            return Ok(false);
+        };
+        match d.try_lock() {
+            Ok(drv) => Ok(drv.supports_budgeted_disable_await()
+                && matches!(
+                    drv.rest_pose_gate_status(),
+                    crate::driver::RestPoseGateStatus::PendingDrainOrWindow
+                        | crate::driver::RestPoseGateStatus::StaleOrMissing
+                )),
+            Err(std::sync::TryLockError::WouldBlock) => Err(()),
+            Err(std::sync::TryLockError::Poisoned(_)) => Ok(false),
+        }
+    }
+
+    /// True when the driver can keep a stopped disable pending inside its 1 s lifetime while an
+    /// exhausted RX drain, incomplete K=3 rest-pose window, or stale/missing evidence on a drained
+    /// bus runs the probe loop (L1/M3). Zero heap allocations.
+    fn can_defer_stopped_disable_to_driver(&self) -> bool {
+        if self.rt_executor_owned {
+            return self.can_defer_stopped_disable_to_driver_nonblocking().unwrap_or(false);
+        }
+        self.driver.as_ref().is_some_and(|d| {
+            d.lock().is_ok_and(|drv| {
+                drv.supports_budgeted_disable_await()
+                    && matches!(
+                        drv.rest_pose_gate_status(),
+                        crate::driver::RestPoseGateStatus::PendingDrainOrWindow
+                            | crate::driver::RestPoseGateStatus::StaleOrMissing
+                    )
+            })
+        })
+    }
+
+    /// Zero-allocation RT torque-off precheck (static protocol error codes): enforces the
+    /// unified rest-pose gate in EVERY safety state (operational and stopped alike), plus the
+    /// operational stillness/support-torque/workspace check when not stopped.
     fn torque_off_check_rt(&mut self, stillness_verified: bool) -> Result<(), &'static str> {
         if self.calibration_busy && self.motor_zero_busy {
             return Err("MOTION_BUSY");
@@ -2149,18 +4107,118 @@ impl SupervisorInner {
         if self.gravity_comp.is_some() {
             return Err("MOTION_BUSY");
         }
-        if self.safety.state().is_stopped() || self.e_stop_latched.load(Ordering::SeqCst) {
-            return Err("MOTION_FORBIDDEN_IN_FAULT_STATE");
-        }
-        if self.has_resting_pose_violation_rt(stillness_verified) {
+        if !self.torque_off_stopped() && self.has_resting_pose_violation_rt(stillness_verified) {
             return Err("ARM_NOT_AT_RESTING_POSE");
         }
+        self.eval_stopped_torque_off()
+            .map_err(|_| "TORQUE_OFF_WOULD_DROP")
+    }
+
+    /// Zero-allocation, non-blocking rest-pose gate for ALL RT budgeted torque-off transitions
+    /// (operational and stopped alike): uses `driver.try_lock()` with counted escalation on
+    /// contention, checks operational stillness/support-torque/workspace when not stopped,
+    /// defers incomplete drains / K=3 windows / stale-or-missing evidence to `AwaitRestGate`,
+    /// and refuses off-rest poses with zero heap allocations.
+    fn torque_off_check_rt_transition(&mut self) -> Result<(), &'static str> {
+        if self.calibration_busy && self.motor_zero_busy {
+            return Err("MOTION_BUSY");
+        }
+        if self.torque_transition.is_some() {
+            return Err("TRANSITION_BUSY");
+        }
+        if self.gravity_comp.is_some() {
+            return Err("MOTION_BUSY");
+        }
+        if !self.torque_off_stopped() {
+            match self.check_resting_pose_rt(false) {
+                super::RtRestingCheck::AtRest => {}
+                super::RtRestingCheck::OffRest => return Err("ARM_NOT_AT_RESTING_POSE"),
+                super::RtRestingCheck::LockContended => {
+                    self.record_disable_lock_contention();
+                    return Err("DRIVER_BUSY");
+                }
+            }
+        }
+        match self.may_disable_torque_while_stopped_nonblocking() {
+            Err(()) => {
+                self.record_disable_lock_contention();
+                Err("DRIVER_BUSY")
+            }
+            Ok(Ok(())) => {
+                self.last_stopped_torque_off_refusal = None;
+                Ok(())
+            }
+            Ok(Err(crate::supervisor::StoppedTorqueOffRefusal::StaleOrMissingFeedback)) => {
+                match self.can_defer_stopped_disable_to_driver_nonblocking() {
+                    Err(()) => {
+                        self.record_disable_lock_contention();
+                        Err("DRIVER_BUSY")
+                    }
+                    Ok(true) => {
+                        self.last_stopped_torque_off_refusal = None;
+                        Ok(())
+                    }
+                    Ok(false) => {
+                        self.last_stopped_torque_off_refusal =
+                            Some(crate::supervisor::StoppedTorqueOffRefusal::StaleOrMissingFeedback);
+                        Err("TORQUE_OFF_WOULD_DROP")
+                    }
+                }
+            }
+            Ok(Err(r)) => {
+                self.last_stopped_torque_off_refusal = Some(r);
+                Err("TORQUE_OFF_WOULD_DROP")
+            }
+        }
+    }
+
+    /// Unified torque-off refusals for operational and stopped states alike: when operational,
+    /// checks the resting-pose stillness/support-torque/workspace policy first, then ALWAYS
+    /// enforces the authoritative K=3 rest-pose gate (`eval_stopped_torque_off`).
+    fn torque_off_check(&mut self, stillness_verified: bool) -> Result<(), SafetyError> {
+        if !self.torque_off_stopped() {
+            let violation = if stillness_verified {
+                self.resting_pose_static_violation()
+            } else {
+                self.resting_pose_violation()
+            };
+            if let Some(reason) = violation {
+                tracing::warn!("Torque off refused, not at resting pose: {reason}");
+                return Err(SafetyError::ArmNotAtRestingPose {
+                    current: self.measured_positions.clone(),
+                    expected: self.config.resting_positions().to_vec(),
+                    reason: Some(reason),
+                });
+            }
+        }
+        match self.eval_stopped_torque_off() {
+            Ok(()) => Ok(()),
+            Err(crate::supervisor::StoppedTorqueOffRefusal::StaleOrMissingFeedback)
+                if self.can_defer_stopped_disable_to_driver() =>
+            {
+                self.last_stopped_torque_off_refusal = None;
+                Ok(())
+            }
+            Err(r) => Err(r.into_safety_error(&self.config.joint_names)),
+        }
+    }
+
+    /// Torque off after the accepted disable without cloning `SafetyState` (zero-alloc on RT).
+    fn torque_off_finish_in_place(&mut self) -> Result<(), SafetyError> {
+        if !self.torque_off_stopped() {
+            let _ = self.safety.set_torque(false)?;
+        }
+        self.reset_gripper_stall();
+        self.gripper_hold_vel_ceiling = None;
+        if self.driver.is_none() { self.measured_velocities.fill(0.0); }
         Ok(())
     }
 
-    /// Zero-allocation RT torque-off finish after confirmed disable.
+    /// Zero-allocation RT torque-off finish after accepted disable (preserves stopped Fault/EStop).
     fn torque_off_finish_rt(&mut self) -> Result<(), &'static str> {
-        self.safety.set_torque_rt(false)?;
+        if !self.torque_off_stopped() {
+            self.safety.set_torque_rt(false)?;
+        }
         self.reset_gripper_stall();
         self.gripper_hold_vel_ceiling = None;
         if self.driver.is_none() {
@@ -2218,56 +4276,35 @@ impl SupervisorInner {
     }
 
     /// Aborts any in-flight `TorqueTransition::Enable` owned by `displaced_gen` (called by
-    /// `fence_displaced_lease_generation` on release, expiry, preemption, or disconnect).
+    /// `fence_displaced_lease_generation` on release, expiry, preemption, or disconnect),
+    /// transitioning through [`Self::enter_failed_hold`] (no rollback disable frames at any pose).
     pub(crate) fn abort_enable_transition_for_fenced_lease_impl(&mut self, displaced_gen: u64) {
         let matches = matches!(
             self.torque_transition,
-            Some(TorqueTransition::Enable { authority, .. })
-                if displaced_gen != 0 && authority.lease_generation == displaced_gen
+            Some(TorqueTransition::Enable(reducer))
+                if displaced_gen != 0
+                    && reducer
+                        .authority
+                        .is_some_and(|a| a.lease_generation == displaced_gen)
         );
         if !matches {
             return;
         }
-        let Some(TorqueTransition::Enable {
-            origin,
-            was_torqued,
-            authority,
-            ..
-        }) = self.torque_transition.take()
-        else {
+        let Some(TorqueTransition::Enable(reducer)) = self.torque_transition.take() else {
             return;
         };
-        let code = if authority.owner_conn_id != 0
-            && self.is_connection_closed(authority.owner_conn_id)
-        {
-            "DISCONNECTED"
-        } else {
-            "LEASE_LOST"
-        };
-        let stopped = self.estop_pending() || self.safety.state().is_stopped();
-        if stopped {
-            let still_enabled = self.driver.as_ref().is_some_and(|d| {
-                d.lock().is_ok_and(|mut drv| {
-                    drv.abort_enable();
-                    drv.enable_state() != EnableState::Disabled
-                        || drv.has_any_joint_enabled()
-                        || drv.has_known_partial_enable()
-                })
+        let closed = reducer.authority.is_some_and(|a| {
+            a.owner_conn_id != 0 && self.is_connection_closed(a.owner_conn_id)
+        });
+        let code = if closed { "DISCONNECTED" } else { "LEASE_LOST" };
+        let _ = self.enter_failed_hold(reducer.was_torqued, |buf| {
+            buf.push_str(if closed {
+                "interrupted by disconnect"
+            } else {
+                "interrupted by lease loss"
             });
-            self.is_torqued = was_torqued || still_enabled;
-            self.pending_rearm = true;
-        } else if !was_torqued {
-            self.rollback_disable_after_failed_or_interrupted_enable(Instant::now());
-        } else {
-            if let Some(ref d) = self.driver {
-                if let Ok(mut drv) = d.lock() {
-                    drv.abort_enable();
-                }
-            }
-            self.is_torqued = true;
-            self.pending_rearm = true;
-        }
-        match origin {
+        });
+        match reducer.origin {
             EnableOrigin::BrokerTransition => self.core.begin_transition(Err(code)),
             EnableOrigin::ParkRearm { action_id, .. } => self.finish_park_rearm_failed(action_id, code),
         }
@@ -2290,7 +4327,13 @@ impl SupervisorInner {
     }
 
     pub(crate) fn has_non_broker_torque_transition(&self) -> bool {
-        matches!(self.torque_transition, Some(TorqueTransition::Enable { origin: EnableOrigin::ParkRearm { .. }, .. } | TorqueTransition::Disable { origin: DisableOrigin::Park { .. }, .. }))
+        matches!(
+            self.torque_transition,
+            Some(
+                TorqueTransition::Enable(EnableReducer { origin: EnableOrigin::ParkRearm { .. }, .. })
+                    | TorqueTransition::Disable { origin: DisableOrigin::Park { .. }, .. }
+            )
+        )
     }
 
     fn driver_any_enabled(&self) -> bool {
@@ -2300,7 +4343,9 @@ impl SupervisorInner {
     }
 
     /// Starts a torque-enable transition without waiting for its confirmation (the RT's
-    /// `commit_transition`). Requires a valid [`AdmissionStamp`] checked first under the owner lock.
+    /// `commit_transition`). Requires a valid [`AdmissionStamp`] checked first under the owner lock
+    /// and drives the single authoritative budgeted enable reducer (`Enable -> Validate -> Armed | FailedHold`)
+    /// carrying live [`EnableAuthority`] checks (lease generation, owner conn, epoch) into `FailedHold`.
     pub(crate) fn begin_enable_torque_transition(
         admitted: Admitted<'_>,
     ) -> Result<Result<crate::rt_core::ops::TorqueProgress, &'static str>, &'static str> {
@@ -2316,7 +4361,6 @@ impl SupervisorInner {
         this.begin_enable_torque_transition_inner(
             EnableOrigin::BrokerTransition,
             authority,
-            Instant::now(),
             false,
             false,
         )
@@ -2327,14 +4371,31 @@ impl SupervisorInner {
         admitted: Admitted<'_>,
         now: Instant,
     ) -> Result<(), &'static str> {
-        let (this, _proof) = admitted
+        let (this, proof) = admitted
             .consume()
             .map_err(|e| torque_admission_error_code(&e))?;
         if this.driver.is_some() {
             return Err("UNSUPPORTED");
         }
+        let s = proof.stamp();
+        let authority = EnableAuthority {
+            lease_generation: s.lease_gen,
+            owner_conn_id: s.connection_id,
+            admitted_epoch: s.estop_epoch,
+        };
         let (was_torqued, prev_gripper_cmd) = this.enable_prepare_rt()?;
-        this.enable_finish_rt(was_torqued, prev_gripper_cmd, now)
+        let _ = now;
+        match this.start_enable_reducer(
+            EnableOrigin::BrokerTransition,
+            was_torqued,
+            prev_gripper_cmd,
+            Some(authority),
+            true,
+        ) {
+            EnableStepOutcome::Armed(_) => Ok(()),
+            EnableStepOutcome::Failed { rt_code, .. } => Err(rt_code),
+            EnableStepOutcome::Pending { .. } => Err("INTERNAL"),
+        }
     }
 
     /// Driverless immediate torque-disable on RT (zero-alloc, exempt from `Admitted`).
@@ -2346,7 +4407,7 @@ impl SupervisorInner {
         self.stop_motion();
         self.commanded_velocities.fill(0.0);
         self.disable_requested_at(now);
-        self.disable_confirmed();
+        self.disable_accepted();
         self.torque_off_finish_rt()
     }
 
@@ -2354,7 +4415,6 @@ impl SupervisorInner {
         &mut self,
         origin: EnableOrigin,
         authority: EnableAuthority,
-        now: Instant,
         allow_sync_mit: bool,
         allow_legacy_fallback: bool,
     ) -> Result<Result<crate::rt_core::ops::TorqueProgress, &'static str>, &'static str> {
@@ -2370,52 +4430,25 @@ impl SupervisorInner {
             self.enable_prepare_inner(false, allow_sync_mit)
                 .map_err(|e| torque_error_code(&e))?
         };
-        let started = match self.driver.as_ref() {
-            None => None,
-            Some(d) => {
-                let mut drv = d.lock().map_err(|_| "FEEDBACK_UNAVAILABLE")?;
-                let drv_now = drv.clock_now();
-                let res = if !allow_legacy_fallback || self.rt_executor_owned || drv.supports_rt_executor().is_ok() {
-                    drv.begin_torque_budgeted(true, 0)
-                } else {
-                    drv.begin_torque(true)
-                };
-                Some((res, drv_now))
-            }
-        };
-        Ok(match started {
-            None
-            | Some((
-                Ok(crate::driver::TorqueProgress::Done(
-                    crate::driver::TorqueOutcome::Confirmed,
-                )),
-                _,
-            )) => {
-                if use_rt_path {
-                    self.enable_finish_rt(was_torqued, prev_gripper_cmd, now)
-                        .map(|()| Rt::Done)
-                } else {
-                    self.enable_finish_inner(was_torqued, prev_gripper_cmd, true)
-                        .map(|_| Rt::Done)
-                        .map_err(|e| torque_error_code(&e))
-                }
-            }
-            Some((Ok(crate::driver::TorqueProgress::Pending { .. }), drv_now)) => {
-                self.torque_transition = Some(TorqueTransition::Enable {
-                    origin,
-                    was_torqued,
-                    prev_gripper_cmd,
-                    authority,
-                });
-                Ok(Rt::Pending { wake: drv_now })
-            }
-            Some((Err(ref e), _)) if crate::driver::is_estop_inhibited(e) => {
-                self.is_torqued = was_torqued || self.driver_any_enabled();
-                self.pending_rearm = true;
-                return Err("ESTOP_ACTIVE");
-            }
-            Some((r, _)) => self.enable_step_failed(was_torqued, now, r),
-        })
+        let budgeted = !allow_legacy_fallback
+            || self.rt_executor_owned
+            || self
+                .driver
+                .as_ref()
+                .is_none_or(|d| d.lock().is_ok_and(|drv| drv.supports_rt_executor().is_ok()));
+        Ok(
+            match self.start_enable_reducer(
+                origin,
+                was_torqued,
+                prev_gripper_cmd,
+                Some(authority),
+                budgeted,
+            ) {
+                EnableStepOutcome::Armed(_) => Ok(Rt::Done),
+                EnableStepOutcome::Pending { wake } => Ok(Rt::Pending { wake }),
+                EnableStepOutcome::Failed { rt_code, .. } => Err(rt_code),
+            },
+        )
     }
 
     /// Starts a bounded, confirmed `TorqueTransition::Enable` inside park `action_id` when
@@ -2445,12 +4478,10 @@ impl SupervisorInner {
             "MOTION_BUSY" | "TRANSITION_BUSY" | "DISABLE_PENDING" => MotionInstallError::MotionBusy,
             _ => MotionInstallError::EnableFailed,
         };
-        let now = self.driver_clock_now_or(Instant::now());
         match self
             .begin_enable_torque_transition_inner(
                 EnableOrigin::ParkRearm { action_id, stop_gen },
                 authority,
-                now,
                 !self.rt_executor_owned,
                 true,
             )
@@ -2464,7 +4495,14 @@ impl SupervisorInner {
 
     /// Aborts a pending `ParkRearm` enable transition safely (preserving holding torque).
     pub(crate) fn abort_park_rearm_transition(&mut self) {
-        let Some(TorqueTransition::Enable { origin: EnableOrigin::ParkRearm { .. }, was_torqued, .. }) = self.torque_transition else { return; };
+        let Some(TorqueTransition::Enable(EnableReducer {
+            origin: EnableOrigin::ParkRearm { .. },
+            was_torqued,
+            ..
+        })) = self.torque_transition
+        else {
+            return;
+        };
         self.torque_transition = None;
         if let Some(ref d) = self.driver { if let Ok(mut drv) = d.lock() { drv.abort_enable(); } }
         self.is_torqued = was_torqued || self.driver_any_enabled();
@@ -2475,77 +4513,245 @@ impl SupervisorInner {
     ///
     /// Exempt from `Admitted` (Invariant 1c): torque disable is a stop-direction action that
     /// removes actuator output and must never be blocked by a Stop or admission check (still
-    /// governed by resting-pose and torque-off safety checks).
+    /// governed by resting-pose and torque-off safety checks, zero-alloc on RT).
     pub(crate) fn begin_disable_torque_transition(
         &mut self,
     ) -> Result<Result<crate::rt_core::ops::TorqueProgress, &'static str>, &'static str> {
         use crate::rt_core::ops::TorqueProgress as Rt;
-        self.torque_off_check_rt(false)?;
-        self.stop_motion();
-        self.commanded_velocities.fill(0.0);
-        self.background_disable_retry = None;
-        let started = match self.driver.as_ref() {
-            None => {
-                self.disable_requested();
-                None
-            }
-            Some(d) => {
-                let (res, requested_at, post_now) = {
-                    let mut drv = d.lock().map_err(|_| "FEEDBACK_UNAVAILABLE")?;
-                    let requested_at = drv.clock_now();
-                    let res = drv.begin_torque_budgeted(false, 0);
-                    let post_now = drv.clock_now();
-                    (res, requested_at, post_now)
-                };
-                self.disable_requested_at(requested_at);
-                Some((res, requested_at, post_now))
+        self.torque_off_check_rt_transition()?;
+        let started = if self.driver.is_none() {
+            self.stop_motion();
+            self.commanded_velocities.fill(0.0);
+            self.background_disable_retry = None;
+            self.disable_requested();
+            None
+        } else {
+            let locked = {
+                let d = self.driver.as_ref().expect("checked is_some");
+                match d.try_lock() {
+                    Ok(mut drv) => {
+                        let requested_at = drv.clock_now();
+                        let disable_kind = crate::driver::DisableKind::DisableRequested {
+                            started_at: requested_at,
+                        };
+                        let res = drv.begin_disable_torque_budgeted(disable_kind, 0);
+                        let frames_dispatched = drv.disable_frames_dispatched();
+                        let dispatched_mask = drv.disable_dispatched_mask();
+                        let post_now = drv.clock_now();
+                        let mut ages_buf = std::mem::take(&mut self.scratch.ages);
+                        let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
+                        let snap = OwnerDriverSnapshot::capture_from_driver(
+                            drv.as_ref(),
+                            self.config.dof,
+                            self.feedback_numeric_valid,
+                            &self.measured_positions,
+                            &mut ages_buf,
+                            &mut bounds_buf,
+                        );
+                        self.scratch.ages = ages_buf;
+                        self.scratch.fb.bounds = bounds_buf;
+                        Ok((res, requested_at, post_now, disable_kind, frames_dispatched, dispatched_mask, snap))
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => Err(true),
+                    Err(std::sync::TryLockError::Poisoned(_)) => Err(false),
+                }
+            };
+            match locked {
+                Ok((res, requested_at, post_now, disable_kind, frames_dispatched, dispatched_mask, snap)) => {
+                    self.reset_disable_lock_contention();
+                    self.owner_driver_snapshot = snap;
+                    self.stop_motion();
+                    self.commanded_velocities.fill(0.0);
+                    self.background_disable_retry = None;
+                    self.disable_requested_at(requested_at);
+                    Some((res, post_now, disable_kind, frames_dispatched, dispatched_mask))
+                }
+                Err(true) => {
+                    self.record_disable_lock_contention();
+                    return Err("DRIVER_BUSY");
+                }
+                Err(false) => {
+                    return Err("FEEDBACK_UNAVAILABLE");
+                }
             }
         };
+        if let Some((_, _, disable_kind, _, _)) = started {
+            self.active_disable_kind = Some(disable_kind);
+            self.active_disable_client_park = None;
+        }
         Ok(match started {
             None => {
-                self.disable_confirmed();
+                self.disable_accepted();
                 self.torque_off_finish_rt().map(|()| Rt::Done)
             }
-            Some((Ok(crate::driver::TorqueProgress::Pending { .. }), requested_at, post_now)) => {
+            Some((Ok(crate::driver::TorqueProgress::Pending { .. }), post_now, disable_kind, frames_dispatched, _)) => {
+                if frames_dispatched {
+                    self.disable_first_frame_accepted();
+                }
                 self.torque_transition = Some(TorqueTransition::Disable {
                     origin: DisableOrigin::BrokerTransition,
-                    confirm: None,
-                    requested_at,
+                    kind: disable_kind,
                 });
                 Ok(Rt::Pending { wake: post_now })
             }
-            // the frames went out: the supervisor's confirmation follows (as in request_disable)
-            Some((Ok(crate::driver::TorqueProgress::Done(_)), requested_at, post_now)) => {
-                self.torque_transition = Some(TorqueTransition::Disable {
-                    origin: DisableOrigin::BrokerTransition,
-                    confirm: Some(DisableConfirm::start(post_now)),
-                    requested_at,
-                });
-                Ok(Rt::Pending { wake: post_now })
+            Some((Ok(crate::driver::TorqueProgress::Done(_)), _, _, _, _)) => {
+                self.disable_accepted();
+                self.torque_off_finish_rt().map(|()| Rt::Done)
             }
-            Some((Err(e), requested_at, post_now)) => {
-                let _ = self.arm_background_disable_retry_with_origin(requested_at, post_now);
-                Err(self.disable_step_failed(e))
+            Some((Err(e), post_now, disable_kind, frames_dispatched, dispatched_mask)) => {
+                let refused = matches!(
+                    e,
+                    crate::driver::ArmDriverError::TorqueOffWouldDrop
+                        | crate::driver::ArmDriverError::DisableRequestExpired
+                );
+                let partial_remaining = self.is_partial_disable_remaining(dispatched_mask);
+                let partial_retry = self.commit_partial_disable_retry_kind(
+                    disable_kind,
+                    post_now,
+                    frames_dispatched,
+                    partial_remaining,
+                );
+                if let Some(rk) = partial_retry {
+                    let _ = self.arm_background_disable_retry_immediate_with_kind(rk, post_now);
+                } else if !refused {
+                    let _ = self.arm_background_disable_retry_with_kind(disable_kind, post_now);
+                }
+                Err(self.disable_step_failed_inner(e, partial_retry.is_some()))
             }
         })
     }
 
-    /// Park terminal torque-off routed through the single `TorqueTransition::Disable` +
-    /// [`DisableConfirm`] authority (zero-alloc on RT; hook point for `feat/torque-off-when-stopped`).
-    /// Client Stop is linearized against the first disable transmit at the driver boundary;
-    /// watchdog park is exempt from client Stop.
+    /// Single park terminal torque-off function routed strictly through the torque-off rest-pose
+    /// gate (`may_disable_torque_while_stopped_nonblocking` / `eval_stopped_torque_off` + driver
+    /// `DisableRequested` K=3 rest-pose gate) and the single `TorqueTransition::Disable` authority
+    /// (zero-alloc on RT). Client Stop is linearized against every motor's disable transmit at the
+    /// driver boundary; watchdog park is exempt from client Stop while still rest-pose gated.
     pub(crate) fn begin_park_disable_transition(&mut self, watchdog: bool, action_id: Option<u64>) {
         if !watchdog && self.urgent_stop_unapplied() {
             self.cancel_park_before_disable(action_id);
             return;
         }
-        if self.torque_transition.is_some() || self.safety.state().is_stopped() || self.e_stop_latched.load(Ordering::SeqCst)
-            || self.estop_pending() || !self.is_resting_pose_static_ok()
+        if self.torque_transition.is_some()
+            || self.safety.state().is_stopped()
+            || self.e_stop_latched.load(Ordering::SeqCst)
+            || self.estop_pending()
         {
-            self.finish_park_disable_failed(watchdog, action_id, "UNLOAD_FAILED", "Park torque-off refused at resting pose");
+            self.finish_park_disable_failed(
+                watchdog,
+                action_id,
+                "UNLOAD_FAILED",
+                "Park torque-off refused at resting pose",
+            );
             return;
         }
-        let Some(d) = self.driver.as_ref() else {
+        // Route park disable through the torque-off rest-pose gate (both RT non-blocking and legacy).
+        if self.rt_executor_owned {
+            match self.may_disable_torque_while_stopped_nonblocking() {
+                Err(()) => {
+                    self.record_disable_lock_contention();
+                    self.finish_park_disable_failed(
+                        watchdog,
+                        action_id,
+                        "DRIVER_BUSY",
+                        "Driver busy during park torque-off",
+                    );
+                    return;
+                }
+                Ok(Ok(())) => {
+                    self.last_stopped_torque_off_refusal = None;
+                }
+                Ok(Err(crate::supervisor::StoppedTorqueOffRefusal::StaleOrMissingFeedback)) => {
+                    match self.can_defer_stopped_disable_to_driver_nonblocking() {
+                        Err(()) => {
+                            self.record_disable_lock_contention();
+                            self.finish_park_disable_failed(
+                                watchdog,
+                                action_id,
+                                "DRIVER_BUSY",
+                                "Driver busy during park torque-off",
+                            );
+                            return;
+                        }
+                        Ok(true) => {
+                            self.last_stopped_torque_off_refusal = None;
+                        }
+                        Ok(false) => {
+                            self.last_stopped_torque_off_refusal = Some(
+                                crate::supervisor::StoppedTorqueOffRefusal::StaleOrMissingFeedback,
+                            );
+                            self.finish_park_disable_failed(
+                                watchdog,
+                                action_id,
+                                "TORQUE_OFF_WOULD_DROP",
+                                "Park torque-off refused by rest-pose gate",
+                            );
+                            return;
+                        }
+                    }
+                }
+                Ok(Err(r)) => {
+                    self.last_stopped_torque_off_refusal = Some(r);
+                    self.finish_park_disable_failed(
+                        watchdog,
+                        action_id,
+                        "TORQUE_OFF_WOULD_DROP",
+                        "Park torque-off refused by rest-pose gate",
+                    );
+                    return;
+                }
+            }
+            match self.check_resting_pose_rt(true) {
+                super::RtRestingCheck::AtRest => {}
+                super::RtRestingCheck::OffRest => {
+                    self.finish_park_disable_failed(
+                        watchdog,
+                        action_id,
+                        "ARM_NOT_AT_RESTING_POSE",
+                        "Park torque-off refused at resting pose",
+                    );
+                    return;
+                }
+                super::RtRestingCheck::LockContended => {
+                    self.record_disable_lock_contention();
+                    self.finish_park_disable_failed(
+                        watchdog,
+                        action_id,
+                        "DRIVER_BUSY",
+                        "Driver busy during park torque-off",
+                    );
+                    return;
+                }
+            }
+        } else {
+            match self.eval_stopped_torque_off() {
+                Ok(()) => {}
+                Err(crate::supervisor::StoppedTorqueOffRefusal::StaleOrMissingFeedback)
+                    if self.can_defer_stopped_disable_to_driver() =>
+                {
+                    self.last_stopped_torque_off_refusal = None;
+                }
+                Err(_) => {
+                    self.finish_park_disable_failed(
+                        watchdog,
+                        action_id,
+                        "TORQUE_OFF_WOULD_DROP",
+                        "Park torque-off refused by rest-pose gate",
+                    );
+                    return;
+                }
+            }
+            if !self.is_resting_pose_static_ok() {
+                self.finish_park_disable_failed(
+                    watchdog,
+                    action_id,
+                    "ARM_NOT_AT_RESTING_POSE",
+                    "Park torque-off refused at resting pose",
+                );
+                return;
+            }
+        }
+
+        if self.driver.is_none() {
             if !watchdog && self.urgent_stop_unapplied() {
                 self.cancel_park_before_disable(action_id);
                 return;
@@ -2556,99 +4762,272 @@ impl SupervisorInner {
             crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
             self.commanded_velocities.fill(0.0);
             self.disable_requested();
-            self.complete_park_disable_confirmed(watchdog, action_id);
+            self.complete_park_disable_accepted(watchdog, action_id);
             return;
-        };
+        }
+
+        #[allow(clippy::large_enum_variant)] // inline zero-alloc RT stack enum
+        enum ParkDisableStart {
+            CancelBeforeDisable,
+            Contended,
+            Poisoned,
+            Outcome {
+                res: Result<crate::driver::TorqueProgress, crate::driver::ArmDriverError>,
+                requested_at: Instant,
+                post_now: Instant,
+                disable_kind: crate::driver::DisableKind,
+                frames_dispatched: bool,
+                dispatched_mask: u64,
+                snap: OwnerDriverSnapshot,
+            },
+        }
+
         let stop_before_write = self.e_stop_latched.clone();
         let expected_stop_gen = self.stop_requests.as_ref().map(|s| s.applied());
-        let started = d.lock().ok().map(|mut drv| {
-            // Linearize client Stop and hardware E-stop against EVERY motor's disable transmit
-            // both inside the driver lock AND inside the driver's per-motor gate
-            // (`DamiaoArmDriver::send(TxKind::ClientParkDisable)` / `FeetechArmDriver::disable_torque_inner`).
-            if !watchdog && self.urgent_stop_unapplied() {
-                return None;
-            }
-            if stop_before_write.load(Ordering::SeqCst) || self.estop_pending() {
-                let now = drv.clock_now();
-                return Some((Err(crate::driver::ArmDriverError::EstopInhibited), now, now, false));
-            }
-            let requested_at = drv.clock_now();
-            let res = if !watchdog {
-                let max_rx = if self.rt_executor_owned || drv.supports_rt_executor().is_ok() { Some(0) } else { None };
-                drv.begin_client_park_disable(max_rx, expected_stop_gen)
-            } else if self.rt_executor_owned || drv.supports_rt_executor().is_ok() {
-                drv.begin_torque_budgeted(false, 0)
+        let start = {
+            let d = self.driver.as_ref().expect("checked is_some");
+            let guard = if self.rt_executor_owned {
+                match d.try_lock() {
+                    Ok(g) => Ok(g),
+                    Err(std::sync::TryLockError::WouldBlock) => Err(true),
+                    Err(std::sync::TryLockError::Poisoned(_)) => Err(false),
+                }
             } else {
-                drv.begin_torque(false)
+                d.lock().map_err(|_| false)
             };
-            let post_now = drv.clock_now();
-            if !watchdog
-                && matches!(&res, Err(e) if crate::driver::is_estop_inhibited(e))
-                && !stop_before_write.load(Ordering::SeqCst)
-                && !self.estop_pending()
-                && !self.safety.state().is_stopped()
-                && (self.urgent_stop_unapplied()
-                    || expected_stop_gen.is_some_and(|g| self.current_stop_gen() != g))
-            {
-                // Driver stop-gated client park before any disable frame reached the wire:
-                // zero disable frames were transmitted, so cancel cleanly and hold torque.
-                return None;
+            match guard {
+                Err(true) => ParkDisableStart::Contended,
+                Err(false) => ParkDisableStart::Poisoned,
+                Ok(mut drv) => {
+                    // Linearize client Stop and hardware E-stop against EVERY motor's disable transmit
+                    // both inside the driver lock AND inside the driver's per-motor gate
+                    // (`DamiaoArmDriver::send(TxKind::ClientParkDisable)` /
+                    // `FeetechArmDriver::write_torque_off_checked_budgeted`).
+                    if !watchdog && self.urgent_stop_unapplied() {
+                        ParkDisableStart::CancelBeforeDisable
+                    } else if stop_before_write.load(Ordering::SeqCst) || self.estop_pending() {
+                        let now = drv.clock_now();
+                        let disable_kind =
+                            crate::driver::DisableKind::DisableRequested { started_at: now };
+                        let mut ages_buf = std::mem::take(&mut self.scratch.ages);
+                        let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
+                        let snap = OwnerDriverSnapshot::capture_from_driver(
+                            drv.as_ref(),
+                            self.config.dof,
+                            self.feedback_numeric_valid,
+                            &self.measured_positions,
+                            &mut ages_buf,
+                            &mut bounds_buf,
+                        );
+                        self.scratch.ages = ages_buf;
+                        self.scratch.fb.bounds = bounds_buf;
+                        ParkDisableStart::Outcome {
+                            res: Err(crate::driver::ArmDriverError::EstopInhibited),
+                            requested_at: now,
+                            post_now: now,
+                            disable_kind,
+                            frames_dispatched: false,
+                            dispatched_mask: 0,
+                            snap,
+                        }
+                    } else {
+                        let requested_at = drv.clock_now();
+                        let disable_kind = crate::driver::DisableKind::DisableRequested {
+                            started_at: requested_at,
+                        };
+                        let res = if !watchdog {
+                            let max_rx = if self.rt_executor_owned
+                                || drv.supports_rt_executor().is_ok()
+                            {
+                                Some(0)
+                            } else {
+                                None
+                            };
+                            drv.begin_client_park_disable(max_rx, expected_stop_gen)
+                        } else if self.rt_executor_owned || drv.supports_rt_executor().is_ok() {
+                            drv.begin_disable_torque_budgeted(disable_kind, 0)
+                        } else {
+                            drv.begin_disable_torque(disable_kind)
+                        };
+                        let frames_dispatched = drv.disable_frames_dispatched();
+                        let dispatched_mask = drv.disable_dispatched_mask();
+                        let post_now = drv.clock_now();
+                        if !watchdog
+                            && !frames_dispatched
+                            && matches!(&res, Err(e) if crate::driver::is_estop_inhibited(e))
+                            && !stop_before_write.load(Ordering::SeqCst)
+                            && !self.estop_pending()
+                            && !self.safety.state().is_stopped()
+                            && (self.urgent_stop_unapplied()
+                                || expected_stop_gen
+                                    .is_some_and(|g| self.current_stop_gen() != g))
+                        {
+                            // Driver stop-gated client park before any disable frame reached the wire:
+                            // zero disable frames were transmitted, so cancel cleanly and hold torque.
+                            ParkDisableStart::CancelBeforeDisable
+                        } else {
+                            let mut ages_buf = std::mem::take(&mut self.scratch.ages);
+                            let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
+                            let snap = OwnerDriverSnapshot::capture_from_driver(
+                                drv.as_ref(),
+                                self.config.dof,
+                                self.feedback_numeric_valid,
+                                &self.measured_positions,
+                                &mut ages_buf,
+                                &mut bounds_buf,
+                            );
+                            self.scratch.ages = ages_buf;
+                            self.scratch.fb.bounds = bounds_buf;
+                            ParkDisableStart::Outcome {
+                                res,
+                                requested_at,
+                                post_now,
+                                disable_kind,
+                                frames_dispatched,
+                                dispatched_mask,
+                                snap,
+                            }
+                        }
+                    }
+                }
             }
-            let confirmed_now = matches!(res, Ok(crate::driver::TorqueProgress::Done(_))) && DisableConfirm::confirmed(&**drv);
-            Some((res, requested_at, post_now, confirmed_now))
-        });
-        let started = match started {
-            Some(None) => {
-                self.cancel_park_before_disable(action_id);
-                return;
-            }
-            Some(Some(outcome)) => Some(outcome),
-            None => None,
         };
+
+        let (res, requested_at, post_now, disable_kind, frames_dispatched, dispatched_mask, snap) =
+            match start {
+                ParkDisableStart::CancelBeforeDisable => {
+                    self.cancel_park_before_disable(action_id);
+                    return;
+                }
+                ParkDisableStart::Contended => {
+                    self.record_disable_lock_contention();
+                    self.finish_park_disable_failed(
+                        watchdog,
+                        action_id,
+                        "DRIVER_BUSY",
+                        "Driver busy during park disable",
+                    );
+                    return;
+                }
+                ParkDisableStart::Poisoned => {
+                    self.finish_park_disable_failed(
+                        watchdog,
+                        action_id,
+                        "FEEDBACK_UNAVAILABLE",
+                        "Driver unavailable during park disable",
+                    );
+                    return;
+                }
+                ParkDisableStart::Outcome {
+                    res,
+                    requested_at,
+                    post_now,
+                    disable_kind,
+                    frames_dispatched,
+                    dispatched_mask,
+                    snap,
+                } => {
+                    self.reset_disable_lock_contention();
+                    (
+                        res,
+                        requested_at,
+                        post_now,
+                        disable_kind,
+                        frames_dispatched,
+                        dispatched_mask,
+                        snap,
+                    )
+                }
+            };
+
+        self.owner_driver_snapshot = snap;
         self.retire_motion_payloads();
         self.pending_deferred_done = None;
         self.end_gripper_stream();
         crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
         self.commanded_velocities.fill(0.0);
         self.background_disable_retry = None;
-        if let Some((_, requested_at, _, _)) = &started {
-            self.disable_requested_at(*requested_at);
-        } else {
-            self.disable_requested();
-        }
-        match started {
-            None => self.finish_park_disable_failed(watchdog, action_id, "FEEDBACK_UNAVAILABLE", "Driver unavailable during park disable"),
-            Some((Ok(crate::driver::TorqueProgress::Pending { .. }), requested_at, _, _)) => {
+        self.active_disable_kind = Some(disable_kind);
+        self.active_disable_client_park = (!watchdog).then_some(expected_stop_gen);
+        self.disable_requested_at(requested_at);
+
+        match res {
+            Ok(crate::driver::TorqueProgress::Pending { .. }) => {
+                if frames_dispatched {
+                    self.disable_first_frame_accepted();
+                }
                 self.torque_transition = Some(TorqueTransition::Disable {
-                    origin: DisableOrigin::Park { watchdog, action_id },
-                    confirm: None,
-                    requested_at,
+                    origin: DisableOrigin::Park {
+                        watchdog,
+                        action_id,
+                        expected_stop_gen,
+                    },
+                    kind: disable_kind,
                 });
             }
-            Some((Ok(crate::driver::TorqueProgress::Done(_)), _, _, true)) => {
-                self.complete_park_disable_confirmed(watchdog, action_id);
+            Ok(crate::driver::TorqueProgress::Done(_)) => {
+                self.complete_park_disable_accepted(watchdog, action_id);
             }
-            Some((Ok(crate::driver::TorqueProgress::Done(_)), requested_at, post_now, false)) => {
-                self.torque_transition = Some(TorqueTransition::Disable {
-                    origin: DisableOrigin::Park { watchdog, action_id },
-                    confirm: Some(DisableConfirm::start(post_now)),
-                    requested_at,
-                });
-            }
-            Some((Err(ref e), _, _, _)) if crate::driver::is_estop_inhibited(e) => {
-                // Keep `disable_pending` set (torque is not confirmed off) and do not latch `DriverWriteFailed`.
+            Err(ref e) if crate::driver::is_estop_inhibited(e) => {
+                // Keep `disable_pending` set when E-stop intervened and do not latch `DriverWriteFailed`.
                 if let Some(id) = action_id {
-                    if self.last_action.as_ref().is_some_and(|a| a.id == id && a.is_running()) {
+                    if self
+                        .last_action
+                        .as_ref()
+                        .is_some_and(|a| a.id == id && a.is_running())
+                    {
                         let mut msg = self.take_action_msg_buf(id, 64);
-                        msg.clear(); msg.push_str("E-stop latched during park disable");
-                        self.finish_action(id, "failed", Some("ESTOP_ACTIVE"), Some(msg), None, None, None);
+                        msg.clear();
+                        msg.push_str("E-stop latched during park disable");
+                        self.finish_action(
+                            id,
+                            "failed",
+                            Some("ESTOP_ACTIVE"),
+                            Some(msg),
+                            None,
+                            None,
+                            None,
+                        );
                     }
                 }
             }
-            Some((Err(e), requested_at, post_now, _)) => {
-                let _ = self.arm_background_disable_retry_with_origin(requested_at, post_now);
-                let code = self.disable_step_failed(e);
-                self.finish_park_disable_failed(watchdog, action_id, code, "Torque disable transmission failed");
+            Err(e) => {
+                let refused = matches!(
+                    e,
+                    crate::driver::ArmDriverError::TorqueOffWouldDrop
+                        | crate::driver::ArmDriverError::DisableRequestExpired
+                );
+                let client_park_stopped =
+                    !watchdog && self.client_park_stop_invalidated(expected_stop_gen);
+                let (code, text) = if client_park_stopped {
+                    // Stop arrived mid-batch after partial motor disable: NEVER hand the remaining
+                    // undispatched motors to an unstamped retry; hold remaining energized motors
+                    // and latch `DriverWriteFailed`.
+                    self.clear_active_disable_retry_state();
+                    let code = self.disable_step_failed_inner(e, false);
+                    (code, "Client park disable stopped mid-batch")
+                } else {
+                    let partial_remaining = self.is_partial_disable_remaining(dispatched_mask);
+                    let partial_retry = self.commit_partial_disable_retry_kind(
+                        disable_kind,
+                        post_now,
+                        frames_dispatched,
+                        partial_remaining,
+                    );
+                    if let Some(rk) = partial_retry {
+                        let _ = self.arm_background_disable_retry_immediate_with_kind(rk, post_now);
+                    } else if !refused {
+                        let _ = self.arm_background_disable_retry_with_kind(disable_kind, post_now);
+                    }
+                    let code = self.disable_step_failed_inner(e, partial_retry.is_some());
+                    let text = if refused && !frames_dispatched {
+                        "Park torque-off refused by rest-pose gate"
+                    } else {
+                        "Torque disable transmission failed"
+                    };
+                    (code, text)
+                };
+                self.finish_park_disable_failed(watchdog, action_id, code, text);
             }
         }
     }
@@ -2662,10 +5041,14 @@ impl SupervisorInner {
         }
     }
 
-    /// Zero-allocation completion when fresh feedback confirms park torque-off: preserves a
-    /// latched E-stop/Fault safety state without constructing a heap `SafetyError` on RT.
-    fn complete_park_disable_confirmed(&mut self, watchdog: bool, action_id: Option<u64>) {
-        self.disable_confirmed();
+    /// Zero-allocation completion when park torque-off is accepted through the rest-pose gate:
+    /// records `torque_intent = Off` and preserves any latched E-stop/Fault safety state.
+    fn complete_park_disable_accepted(&mut self, watchdog: bool, action_id: Option<u64>) {
+        self.disable_accepted();
+        self.finish_park_disable_after_accepted(watchdog, action_id);
+    }
+
+    fn finish_park_disable_after_accepted(&mut self, watchdog: bool, action_id: Option<u64>) {
         if !self.safety.state().is_stopped() {
             let _ = self.torque_off_finish_rt();
         } else {
@@ -2691,7 +5074,9 @@ impl SupervisorInner {
 
     fn finish_park_disable_failed(&mut self, watchdog: bool, action_id: Option<u64>, code: &'static str, text: &str) {
         self.safety.mark_motion_finished();
-        if watchdog && self.is_torqued && !self.safety.state().is_stopped() { self.latch_watchdog_fault(); }
+        if watchdog && (self.is_torqued || self.torque_intent == TorqueIntent::On) && !self.safety.state().is_stopped() {
+            self.latch_watchdog_fault();
+        }
         if let Some(id) = action_id {
             if self.last_action.as_ref().is_some_and(|a| a.id == id && a.is_running()) {
                 let mut msg = self.take_action_msg_buf(id, 96);
@@ -2701,53 +5086,54 @@ impl SupervisorInner {
         }
     }
 
-    /// An enable step that is not a confirmation: zero-allocation RT contract code
-    /// (`handshake::rt_progress`), bounded background disable cleanup via the driver's single
-    /// disable choke point, and inline bounded `FaultDetail::formatted`.
-    fn enable_step_failed(
+    /// A disable step failed: `disable_pending` stays set for transport errors or committed
+    /// partial dispatches (`committed_partial`), while an uncommitted choke-point refusal
+    /// (`TorqueOffWouldDrop` / `DisableRequestExpired`) cleanly ends the request.
+    fn disable_step_failed_inner(
         &mut self,
-        was_torqued: bool,
-        now: Instant,
-        r: Result<crate::driver::TorqueProgress, crate::driver::ArmDriverError>,
-    ) -> Result<crate::rt_core::ops::TorqueProgress, &'static str> {
-        let detail = crate::safety::FaultDetail::formatted(FaultCode::EnableFailed, |buf| {
-            buf.push_str("Hardware torque enable failed: ");
-            match &r {
-                Err(e) => e.write_bounded(buf),
-                Ok(_) => buf.push_str("enable not confirmed"),
+        e: crate::driver::ArmDriverError,
+        committed_partial: bool,
+    ) -> &'static str {
+        let refused = matches!(
+            e,
+            crate::driver::ArmDriverError::TorqueOffWouldDrop
+                | crate::driver::ArmDriverError::DisableRequestExpired
+        );
+        if refused && !committed_partial {
+            self.disable_pending = false;
+            self.active_disable_kind = None;
+            self.last_disable_attempt = None;
+            self.background_disable_retry = None;
+            if self.torque_off_stopped() {
+                let _ = self.eval_stopped_torque_off();
             }
-        });
-        let code = crate::driver::handshake::rt_progress(true, r)
-            .err()
-            .unwrap_or("ENABLE_FAILED");
-        if !was_torqued {
-            self.rollback_disable_after_failed_or_interrupted_enable(now);
         }
-        self.safety.latch(crate::safety::FaultKind::Other, detail);
-        Err(code)
-    }
-
-    /// A disable step failed: `disable_pending` stays set and `DRIVER_WRITE_FAILED` latches
-    /// (as in `torque_off`).
-    fn disable_step_failed(&mut self, e: crate::driver::ArmDriverError) -> &'static str {
-        let detail = crate::safety::FaultDetail::formatted(FaultCode::DriverWriteFailed, |buf| {
-            buf.push_str("Torque disable transmission failed: ");
-            e.write_bounded(buf);
+        let already_stopped = self.torque_off_stopped();
+        let detail = (!already_stopped && !refused).then(|| {
+            crate::safety::FaultDetail::formatted(FaultCode::DriverWriteFailed, |buf| {
+                buf.push_str("Torque disable transmission failed: ");
+                e.write_bounded(buf);
+            })
         });
         let code = crate::driver::handshake::rt_progress(false, Err(e))
             .err()
             .unwrap_or("HARDWARE_FAULT");
-        self.safety.latch(crate::safety::FaultKind::Other, detail);
+        if let Some(detail) = detail {
+            self.safety.latch(crate::safety::FaultKind::Other, detail);
+        }
         code
     }
 
     /// Serves any background (non-broker) disable handshake and bounded [`BackgroundDisableRetry`]
-    /// started by enable-failure cleanup, fenced-enable abort, or `request_disable` under RT
-    /// executor ownership, sharing Step 2's single RX budget.
+    /// started by `request_disable_bounded` or a transport-failed broker disable under RT executor
+    /// ownership, sharing Step 2's single RX budget.
     ///
-    /// Every retry routes strictly through the driver's single `begin_torque_budgeted(false, 0)`
-    /// (`send(TxKind::Disable, ...)`) choke point; exhausting retries or the time bound latches
-    /// `StaticFault::DisableUnconfirmed` with zero heap allocations.
+    /// Every retry routes strictly through the driver's single
+    /// `begin_disable_torque_budgeted(kind, 0)` (`send(DisableRequested | DisableProtective, ...)`)
+    /// choke point with the ORIGINAL `DisableKind` (`started_at`) and rest-pose gate within the
+    /// single request lifetime. Exhausting retries or the window latches
+    /// `StaticFault::DisableUnconfirmed` with zero heap allocations; choke-point refusals
+    /// (`TorqueOffWouldDrop` / `DisableRequestExpired`) terminate cleanly without retrying.
     pub(crate) fn service_background_disable(
         &mut self,
         budget: &crate::rt_core::ops::ServiceBudget,
@@ -2755,119 +5141,417 @@ impl SupervisorInner {
         if !self.disable_pending || self.torque_transition.is_some() {
             return None;
         }
-        let d = self.driver.as_ref()?;
-        let mut drv = d.lock().ok()?;
-        let drv_now = drv.clock_now();
-        let span = budget.deadline.saturating_duration_since(budget.now);
-
-        if DisableConfirm::confirmed(&**drv) {
-            drop(drv);
-            self.disable_confirmed();
-            return None;
-        }
-        // Once exhausted, never poll or re-issue disable TX again; passive feedback confirmation
-        // above (or an explicit recovery after clear_fault) still clears `disable_pending`.
+        self.driver.as_ref()?;
         if matches!(
             self.background_disable_retry,
             Some(BackgroundDisableRetry::Exhausted)
         ) {
-            drop(drv);
             return None;
         }
-
-        if drv.torque_transition_pending() {
-            let poll_res = drv.poll_torque_budgeted(drv_now + span, budget.max_rx_frames);
-            let rx = drv.take_last_poll_rx();
-            let confirmed_now = DisableConfirm::confirmed(&**drv);
-            let still_pending = drv.torque_transition_pending();
-            let post_now = drv.clock_now();
-            drop(drv);
-            if confirmed_now {
-                self.disable_confirmed();
-            } else {
-                match self.background_disable_retry {
-                    Some(BackgroundDisableRetry::Active {
-                        attempts,
-                        started_at,
-                        ..
-                    }) => {
-                        let window_expired = post_now.saturating_duration_since(started_at)
-                            >= BACKGROUND_DISABLE_MAX_WINDOW;
-                        let finished_unconfirmed = !still_pending
-                            && !matches!(
-                                poll_res,
-                                Ok(crate::driver::TorqueProgress::Pending { .. })
-                            );
-                        if window_expired
-                            || (finished_unconfirmed && attempts >= BACKGROUND_DISABLE_MAX_RETRIES)
-                        {
-                            self.exhaust_background_disable_retry();
-                        } else if finished_unconfirmed {
-                            self.background_disable_retry =
-                                Some(BackgroundDisableRetry::Active {
-                                    attempts,
-                                    started_at,
-                                    next_retry_at: post_now + BACKGROUND_DISABLE_RETRY_INTERVAL,
-                                });
-                        }
+        let span = budget.deadline.saturating_duration_since(budget.now);
+        let control_release_seq = self.control_release_seq;
+        // Probe / poll phase under non-blocking try_lock (M4).
+        enum BgPollStep {
+            Contended,
+            Poisoned,
+            Polled {
+                poll_res: Result<crate::driver::TorqueProgress, crate::driver::ArmDriverError>,
+                rx: Option<(u16, bool)>,
+                post_now: Instant,
+                still_pending: bool,
+                frames_dispatched: bool,
+                dispatched_mask: u64,
+            },
+            Idle {
+                drv_now: Instant,
+            },
+        }
+        let step = {
+            let d = self.driver.as_ref().expect("checked is_some");
+            match d.try_lock() {
+                Err(std::sync::TryLockError::WouldBlock) => BgPollStep::Contended,
+                Err(std::sync::TryLockError::Poisoned(_)) => BgPollStep::Poisoned,
+                Ok(mut drv) => {
+                    if control_release_seq > 0 {
+                        drv.begin_control_release(control_release_seq);
                     }
-                    Some(BackgroundDisableRetry::Exhausted) => {}
-                    None => {
-                        self.arm_background_disable_retry(post_now);
+                    let drv_now = drv.clock_now();
+                    if drv.torque_transition_pending() {
+                        let poll_res = drv.poll_torque_budgeted(drv_now + span, budget.max_rx_frames);
+                        let rx = drv.take_last_poll_rx();
+                        let post_now = drv.clock_now();
+                        let mut ages_buf = std::mem::take(&mut self.scratch.ages);
+                        let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
+                        self.owner_driver_snapshot = OwnerDriverSnapshot::capture_from_driver(
+                            drv.as_ref(),
+                            self.config.dof,
+                            self.feedback_numeric_valid,
+                            &self.measured_positions,
+                            &mut ages_buf,
+                            &mut bounds_buf,
+                        );
+                        self.scratch.ages = ages_buf;
+                        self.scratch.fb.bounds = bounds_buf;
+                        let still_pending = drv.torque_transition_pending();
+                        let frames_dispatched = drv.disable_frames_dispatched();
+                        let dispatched_mask = drv.disable_dispatched_mask();
+                        BgPollStep::Polled {
+                            poll_res,
+                            rx,
+                            post_now,
+                            still_pending,
+                            frames_dispatched,
+                            dispatched_mask,
+                        }
+                    } else {
+                        BgPollStep::Idle { drv_now }
                     }
                 }
             }
-            return rx;
-        }
+        };
+        let drv_now = match step {
+            BgPollStep::Contended => {
+                self.record_disable_lock_contention();
+                return None;
+            }
+            BgPollStep::Poisoned => return None,
+            BgPollStep::Polled {
+                poll_res,
+                rx,
+                post_now,
+                still_pending,
+                frames_dispatched,
+                dispatched_mask,
+            } => {
+                self.reset_disable_lock_contention();
+                let partial_remaining = self.is_partial_disable_remaining(dispatched_mask);
+                match poll_res {
+                    Ok(crate::driver::TorqueProgress::Done(_)) => {
+                        self.disable_accepted();
+                        let _ = self.torque_off_finish_rt();
+                    }
+                    Err(
+                        crate::driver::ArmDriverError::TorqueOffWouldDrop
+                        | crate::driver::ArmDriverError::DisableRequestExpired,
+                    ) => {
+                        if frames_dispatched {
+                            self.disable_first_frame_accepted();
+                        }
+                        if partial_remaining {
+                            match self.background_disable_retry {
+                                None => {
+                                    let base_kind = self.active_disable_kind.unwrap_or(
+                                        crate::driver::DisableKind::DisableRequested {
+                                            started_at: post_now,
+                                        },
+                                    );
+                                    if let Some(rk) = self.commit_partial_disable_retry_kind(
+                                        base_kind,
+                                        post_now,
+                                        true,
+                                        true,
+                                    ) {
+                                        let _ = self.arm_background_disable_retry_immediate_with_kind(
+                                            rk,
+                                            post_now,
+                                        );
+                                    }
+                                }
+                                Some(BackgroundDisableRetry::Active {
+                                    attempts,
+                                    kind,
+                                    started_at,
+                                    client_park,
+                                    ..
+                                }) => {
+                                    if let Some(expected_stop_gen) = client_park {
+                                        if self.client_park_stop_invalidated(expected_stop_gen) {
+                                            self.clear_active_disable_retry_state();
+                                            return rx;
+                                        }
+                                    }
+                                    let window = self.background_disable_window_for(kind);
+                                    if post_now.saturating_duration_since(started_at) >= window
+                                        || attempts >= BACKGROUND_DISABLE_MAX_RETRIES
+                                    {
+                                        self.exhaust_background_disable_retry();
+                                    } else {
+                                        self.background_disable_retry =
+                                            Some(BackgroundDisableRetry::Active {
+                                                attempts,
+                                                kind,
+                                                started_at,
+                                                next_retry_at: post_now,
+                                                client_park,
+                                            });
+                                    }
+                                }
+                                Some(BackgroundDisableRetry::Exhausted) => {}
+                            }
+                        } else {
+                            self.disable_pending = false;
+                            self.active_disable_kind = None;
+                            self.last_disable_attempt = None;
+                            self.background_disable_retry = None;
+                        }
+                    }
+                    Ok(crate::driver::TorqueProgress::Pending { .. }) => {
+                        if frames_dispatched {
+                            self.disable_first_frame_accepted();
+                        }
+                        if let Some(BackgroundDisableRetry::Active {
+                            kind,
+                            started_at,
+                            ..
+                        }) = self.background_disable_retry
+                        {
+                            let window = self.background_disable_window_for(kind);
+                            if post_now.saturating_duration_since(started_at) >= window {
+                                if matches!(kind, crate::driver::DisableKind::DisableRequested { .. })
+                                    && self.torque_off_stopped()
+                                    && !frames_dispatched
+                                {
+                                    self.disable_pending = false;
+                                    self.active_disable_kind = None;
+                                    self.last_disable_attempt = None;
+                                    self.background_disable_retry = None;
+                                } else {
+                                    self.exhaust_background_disable_retry();
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        if frames_dispatched {
+                            self.disable_first_frame_accepted();
+                        }
+                        match self.background_disable_retry {
+                            Some(BackgroundDisableRetry::Active {
+                                attempts,
+                                kind,
+                                started_at,
+                                client_park,
+                                ..
+                            }) => {
+                                if let Some(expected_stop_gen) = client_park {
+                                    if self.client_park_stop_invalidated(expected_stop_gen) {
+                                        self.clear_active_disable_retry_state();
+                                        return rx;
+                                    }
+                                }
+                                let window = self.background_disable_window_for(kind);
+                                let window_expired =
+                                    post_now.saturating_duration_since(started_at) >= window;
+                                if window_expired
+                                    && matches!(kind, crate::driver::DisableKind::DisableRequested { .. })
+                                    && self.torque_off_stopped()
+                                    && !frames_dispatched
+                                {
+                                    self.clear_active_disable_retry_state();
+                                } else if window_expired
+                                    || (!still_pending && attempts >= BACKGROUND_DISABLE_MAX_RETRIES)
+                                {
+                                    self.exhaust_background_disable_retry();
+                                } else if !still_pending {
+                                    let is_protective = matches!(
+                                        kind,
+                                        crate::driver::DisableKind::DisableProtective { .. }
+                                    );
+                                    self.background_disable_retry =
+                                        Some(BackgroundDisableRetry::Active {
+                                            attempts,
+                                            kind,
+                                            started_at,
+                                            next_retry_at: if partial_remaining || is_protective {
+                                                post_now
+                                            } else {
+                                                post_now + BACKGROUND_DISABLE_RETRY_INTERVAL
+                                            },
+                                            client_park,
+                                        });
+                                }
+                            }
+                            Some(BackgroundDisableRetry::Exhausted) => {}
+                            None => {
+                                let kind = self.active_disable_kind.unwrap_or(
+                                    crate::driver::DisableKind::DisableRequested {
+                                        started_at: post_now,
+                                    },
+                                );
+                                let is_protective = matches!(
+                                    kind,
+                                    crate::driver::DisableKind::DisableProtective { .. }
+                                );
+                                if let Some(rk) = self.commit_partial_disable_retry_kind(
+                                    kind,
+                                    post_now,
+                                    frames_dispatched,
+                                    partial_remaining,
+                                ) {
+                                    let _ = self.arm_background_disable_retry_immediate_with_kind(rk, post_now);
+                                } else if is_protective {
+                                    let _ = self.arm_background_disable_retry_immediate_with_kind(kind, post_now);
+                                } else {
+                                    let _ = self.arm_background_disable_retry_with_kind(kind, post_now);
+                                }
+                            }
+                        }
+                    }
+                }
+                return rx;
+            }
+            BgPollStep::Idle { drv_now } => {
+                self.reset_disable_lock_contention();
+                drv_now
+            }
+        };
 
         let Some(BackgroundDisableRetry::Active {
             attempts,
+            kind,
             started_at,
             next_retry_at,
+            client_park,
         }) = self.background_disable_retry
         else {
-            drop(drv);
             return None;
         };
-        if attempts >= BACKGROUND_DISABLE_MAX_RETRIES
-            || drv_now.saturating_duration_since(started_at) >= BACKGROUND_DISABLE_MAX_WINDOW
+        if let Some(expected_stop_gen) = client_park {
+            if self.client_park_stop_invalidated(expected_stop_gen) {
+                self.clear_active_disable_retry_state();
+                return None;
+            }
+        }
+        let window = self.background_disable_window_for(kind);
+        let window_expired = drv_now.saturating_duration_since(started_at) >= window;
+        if window_expired
+            && matches!(kind, crate::driver::DisableKind::DisableRequested { .. })
+            && self.torque_off_stopped()
+            && self.torque_intent != TorqueIntent::Off
         {
-            drop(drv);
+            self.clear_active_disable_retry_state();
+            return None;
+        }
+        if attempts >= BACKGROUND_DISABLE_MAX_RETRIES || window_expired {
             self.exhaust_background_disable_retry();
             return None;
         }
-        if drv_now < next_retry_at || !self.torque_off_when_stopped_hook() {
-            drop(drv);
+        if drv_now < next_retry_at {
             return None;
         }
 
-        let res = drv.begin_torque_budgeted(false, 0);
-        let confirmed_now = matches!(
-            res,
-            Ok(crate::driver::TorqueProgress::Done(
-                crate::driver::TorqueOutcome::Confirmed
-            ))
-        ) && DisableConfirm::confirmed(&**drv);
-        let handshake_pending = drv.torque_transition_pending();
-        let post_now = drv.clock_now();
-        drop(drv);
+        let retry_out = {
+            let d = self.driver.as_ref().expect("checked is_some");
+            match d.try_lock() {
+                Err(std::sync::TryLockError::WouldBlock) => Err(true),
+                Err(std::sync::TryLockError::Poisoned(_)) => Err(false),
+                Ok(mut drv) => {
+                    let res = if let Some(expected_stop_gen) = client_park {
+                        drv.begin_client_park_disable_with_kind(kind, Some(0), expected_stop_gen)
+                    } else {
+                        drv.begin_disable_torque_budgeted(kind, 0)
+                    };
+                    let handshake_pending = drv.torque_transition_pending();
+                    let frames_dispatched = drv.disable_frames_dispatched();
+                    let dispatched_mask = drv.disable_dispatched_mask();
+                    let post_now = drv.clock_now();
+                    let mut ages_buf = std::mem::take(&mut self.scratch.ages);
+                    let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
+                    let snap = OwnerDriverSnapshot::capture_from_driver(
+                        drv.as_ref(),
+                        self.config.dof,
+                        self.feedback_numeric_valid,
+                        &self.measured_positions,
+                        &mut ages_buf,
+                        &mut bounds_buf,
+                    );
+                    self.scratch.ages = ages_buf;
+                    self.scratch.fb.bounds = bounds_buf;
+                    Ok((res, handshake_pending, frames_dispatched, dispatched_mask, post_now, snap))
+                }
+            }
+        };
+        let (res, handshake_pending, frames_dispatched, dispatched_mask, post_now, snap) = match retry_out {
+            Ok(v) => {
+                self.reset_disable_lock_contention();
+                v
+            }
+            Err(true) => {
+                self.record_disable_lock_contention();
+                return None;
+            }
+            Err(false) => return None,
+        };
+        self.owner_driver_snapshot = snap;
+        let partial_remaining = self.is_partial_disable_remaining(dispatched_mask);
 
-        if confirmed_now {
-            self.disable_confirmed();
-            return None;
+        match res {
+            Ok(crate::driver::TorqueProgress::Done(_)) => {
+                self.disable_accepted();
+                let _ = self.torque_off_finish_rt();
+                return None;
+            }
+            Err(
+                crate::driver::ArmDriverError::TorqueOffWouldDrop
+                | crate::driver::ArmDriverError::DisableRequestExpired,
+            ) => {
+                if frames_dispatched {
+                    self.disable_first_frame_accepted();
+                }
+                if !partial_remaining {
+                    self.disable_pending = false;
+                    self.active_disable_kind = None;
+                    self.last_disable_attempt = None;
+                    self.background_disable_retry = None;
+                    return None;
+                }
+            }
+            Ok(crate::driver::TorqueProgress::Pending { .. }) => {
+                if frames_dispatched {
+                    self.disable_first_frame_accepted();
+                }
+            }
+            Err(e) => {
+                if let Some(expected_stop_gen) = client_park {
+                    if crate::driver::is_estop_inhibited(&e)
+                        || self.client_park_stop_invalidated(expected_stop_gen)
+                    {
+                        self.clear_active_disable_retry_state();
+                        return None;
+                    }
+                }
+                if frames_dispatched {
+                    self.disable_first_frame_accepted();
+                }
+            }
         }
 
         let next_attempts = attempts.saturating_add(1);
-        let window_expired =
-            post_now.saturating_duration_since(started_at) >= BACKGROUND_DISABLE_MAX_WINDOW;
-        if window_expired || (!handshake_pending && next_attempts >= BACKGROUND_DISABLE_MAX_RETRIES)
+        let window_expired = post_now.saturating_duration_since(started_at) >= window;
+        if window_expired
+            && matches!(kind, crate::driver::DisableKind::DisableRequested { .. })
+            && self.torque_off_stopped()
+            && !frames_dispatched
+        {
+            self.clear_active_disable_retry_state();
+        } else if window_expired || (!handshake_pending && next_attempts >= BACKGROUND_DISABLE_MAX_RETRIES)
         {
             self.exhaust_background_disable_retry();
         } else {
+            let is_protective = matches!(
+                kind,
+                crate::driver::DisableKind::DisableProtective { .. }
+            );
             self.background_disable_retry = Some(BackgroundDisableRetry::Active {
                 attempts: next_attempts,
+                kind,
                 started_at,
-                next_retry_at: post_now + BACKGROUND_DISABLE_RETRY_INTERVAL,
+                next_retry_at: if partial_remaining || is_protective {
+                    post_now
+                } else {
+                    post_now + BACKGROUND_DISABLE_RETRY_INTERVAL
+                },
+                client_park,
             });
         }
         None
@@ -2880,300 +5564,255 @@ impl SupervisorInner {
         &mut self,
         budget: &crate::rt_core::ops::ServiceBudget,
     ) -> Option<TransitionPoll> {
-        use crate::driver::{TorqueOutcome, TorqueProgress as Drv};
+        use crate::driver::TorqueProgress as Drv;
         use crate::rt_core::ops::TorqueProgress as Rt;
         let t = self.torque_transition.take()?;
         let broker_owned = matches!(
             t,
-            TorqueTransition::Enable { origin: EnableOrigin::BrokerTransition, .. }
+            TorqueTransition::Enable(EnableReducer { origin: EnableOrigin::BrokerTransition, .. })
                 | TorqueTransition::Disable { origin: DisableOrigin::BrokerTransition, .. }
         );
-        let Some(d) = self.driver.as_ref() else {
-            return Some(TransitionPoll { progress: Err("INTERNAL"), rx: None, broker_owned });
-        };
-        let Ok(mut drv) = d.lock() else {
-            return Some(TransitionPoll { progress: Err("FEEDBACK_UNAVAILABLE"), rx: None, broker_owned });
-        };
-        let drv_now = drv.clock_now();
-        let span = budget.deadline.saturating_duration_since(budget.now);
-        let to_exec = |wake: Instant| budget.now + wake.saturating_duration_since(drv_now);
-        let use_budgeted = broker_owned || self.rt_executor_owned || drv.supports_rt_executor().is_ok();
         match t {
-            TorqueTransition::Enable {
-                origin,
-                was_torqued,
-                prev_gripper_cmd,
-                authority,
-            } => {
-                // Re-verify live enable authority BEFORE any CMD_ENABLE retry TX.
-                if let Some(code) = self.enable_authority_revoked(authority, budget.now) {
-                    drv.abort_enable();
-                    let still_enabled = drv.enable_state() != EnableState::Disabled
-                        || drv.has_any_joint_enabled()
-                        || drv.has_known_partial_enable();
-                    drop(drv);
-                    if matches!(code, "ESTOP_ACTIVE" | "FAULT_ACTIVE") {
-                        self.is_torqued = was_torqued || still_enabled;
-                        self.pending_rearm = true;
-                    } else if !was_torqued {
-                        self.rollback_disable_after_failed_or_interrupted_enable(budget.now);
-                    } else {
-                        self.is_torqued = true;
-                        self.pending_rearm = true;
-                    }
-                    if let EnableOrigin::ParkRearm { action_id, .. } = origin {
-                        self.finish_park_rearm_failed(action_id, code);
-                    }
-                    return Some(TransitionPoll { progress: Err(code), rx: None, broker_owned });
-                }
-                if let EnableOrigin::ParkRearm { action_id, stop_gen } = origin {
-                    if self.urgent_stop_unapplied()
-                        || self.current_stop_gen() != stop_gen
-                        || !self.park_continuation.is_some_and(|c| c.action_id == action_id && c.stop_gen == stop_gen)
-                    {
-                        drv.abort_enable();
-                        let still_enabled = drv.enable_state() != EnableState::Disabled
-                            || drv.has_any_joint_enabled()
-                            || drv.has_known_partial_enable();
-                        drop(drv);
-                        self.is_torqued = was_torqued || still_enabled;
-                        self.pending_rearm = true;
-                        if self.park_continuation.is_some_and(|c| c.action_id == action_id) {
-                            self.park_continuation = None;
+            TorqueTransition::Enable(reducer) => {
+                let origin = reducer.origin;
+                let (outcome, rx) = self.poll_enable_reducer(reducer, Some(budget));
+                let progress = match outcome {
+                    EnableStepOutcome::Armed(_) => {
+                        if let EnableOrigin::ParkRearm { action_id, stop_gen } = origin {
+                            if let Some(c) = self
+                                .park_continuation
+                                .as_mut()
+                                .filter(|c| c.action_id == action_id && c.stop_gen == stop_gen)
+                            {
+                                c.phase = super::ParkContinuationPhase::ReadyForPlan;
+                            }
                             self.notify_park_continuation();
                         }
-                        if self.last_action.as_ref().is_some_and(|a| a.id == action_id && a.is_running()) {
-                            self.finish_action(action_id, "cancelled", Some("STOPPED"), None, None, None, None);
-                        }
-                        return Some(TransitionPoll { progress: Err("STOPPED"), rx: None, broker_owned });
+                        Ok(Rt::Done)
                     }
-                }
-                let r = if use_budgeted {
-                    drv.poll_torque_budgeted(drv_now + span, budget.max_rx_frames)
-                } else {
-                    drv.poll_torque(drv_now + span)
-                };
-                let rx = drv.take_last_poll_rx();
-                let estop_inhibited = matches!(&r, Err(e) if crate::driver::is_estop_inhibited(e));
-                let still_enabled = if estop_inhibited {
-                    drv.enable_state() != EnableState::Disabled
-                        || drv.has_any_joint_enabled()
-                        || drv.has_known_partial_enable()
-                } else {
-                    false
-                };
-                drop(drv);
-                if estop_inhibited {
-                    self.is_torqued = was_torqued || still_enabled;
-                    self.pending_rearm = true;
-                    if let EnableOrigin::ParkRearm { action_id, .. } = origin {
-                        self.finish_park_rearm_failed(action_id, "ESTOP_ACTIVE");
-                    }
-                    return Some(TransitionPoll { progress: Err("ESTOP_ACTIVE"), rx, broker_owned });
-                }
-                let progress = match r {
-                    Ok(Drv::Pending { wake }) => {
-                        self.torque_transition = Some(t);
-                        Ok(Rt::Pending { wake: to_exec(wake) })
-                    }
-                    Ok(Drv::Done(TorqueOutcome::Confirmed)) => {
-                        if let EnableOrigin::ParkRearm { action_id, stop_gen } = origin {
-                            if self.urgent_stop_unapplied()
-                                || self.current_stop_gen() != stop_gen
-                                || !self.park_continuation.is_some_and(|c| c.action_id == action_id && c.stop_gen == stop_gen)
-                            {
-                                self.is_torqued = true;
-                                self.pending_rearm = true;
-                                if self.park_continuation.is_some_and(|c| c.action_id == action_id) {
-                                    self.park_continuation = None;
-                                    self.notify_park_continuation();
-                                }
-                                if self.last_action.as_ref().is_some_and(|a| a.id == action_id && a.is_running()) {
-                                    self.finish_action(action_id, "cancelled", Some("STOPPED"), None, None, None, None);
-                                }
-                                return Some(TransitionPoll { progress: Err("STOPPED"), rx, broker_owned });
+                    EnableStepOutcome::Pending { wake } => Ok(Rt::Pending { wake }),
+                    EnableStepOutcome::Failed { rt_code, .. } => {
+                        if let EnableOrigin::ParkRearm { action_id, .. } = origin {
+                            if rt_code != "STOPPED" {
+                                self.finish_park_rearm_failed(action_id, rt_code);
                             }
                         }
-                        let finish_res = if self.rt_executor_owned || broker_owned {
-                            self.enable_finish_rt(was_torqued, prev_gripper_cmd, budget.now)
-                        } else {
-                            self.enable_finish_inner(was_torqued, prev_gripper_cmd, true)
-                                .map(|_| ())
-                                .map_err(|e| torque_error_code(&e))
-                        };
-                        match finish_res {
-                            Ok(()) => {
-                                if let EnableOrigin::ParkRearm { action_id, stop_gen } = origin {
-                                    if let Some(c) = self.park_continuation.as_mut().filter(|c| c.action_id == action_id && c.stop_gen == stop_gen) {
-                                        c.phase = super::ParkContinuationPhase::ReadyForPlan;
-                                    }
-                                    self.notify_park_continuation();
-                                }
-                                Ok(Rt::Done)
-                            }
-                            Err(code) => {
-                                if let EnableOrigin::ParkRearm { action_id, .. } = origin {
-                                    self.finish_park_rearm_failed(action_id, code);
-                                }
-                                Err(code)
-                            }
-                        }
-                    }
-                    r => {
-                        let res = self.enable_step_failed(was_torqued, budget.now, r);
-                        if let (EnableOrigin::ParkRearm { action_id, .. }, Err(code)) = (origin, res) {
-                            self.finish_park_rearm_failed(action_id, code);
-                        }
-                        res
+                        Err(rt_code)
                     }
                 };
                 Some(TransitionPoll { progress, rx, broker_owned })
             }
-            TorqueTransition::Disable {
-                origin,
-                confirm: None,
-                requested_at,
-            } => {
-                let r = if use_budgeted {
-                    drv.poll_torque_budgeted(drv_now + span, budget.max_rx_frames)
-                } else {
-                    drv.poll_torque(drv_now + span)
-                };
-                let rx = drv.take_last_poll_rx();
-                let post_now = drv.clock_now();
-                match r {
-                    Ok(Drv::Pending { wake }) => {
-                        drop(drv);
-                        self.torque_transition = Some(t);
-                        Some(TransitionPoll { progress: Ok(Rt::Pending { wake: to_exec(wake) }), rx, broker_owned })
-                    }
-                    // confirmed or not by the driver's window: the supervisor's confirmation decides
-                    // (an unconfirmed disable is never success; `request_disable` does the same)
-                    Ok(Drv::Done(_)) => {
-                        drop(drv);
-                        self.torque_transition = Some(TorqueTransition::Disable {
-                            origin,
-                            confirm: Some(DisableConfirm::start(post_now)),
-                            requested_at,
-                        });
-                        Some(TransitionPoll { progress: Ok(Rt::Pending { wake: budget.now }), rx, broker_owned })
-                    }
-                    Err(ref e) if crate::driver::is_estop_inhibited(e) => {
-                        drop(drv);
-                        if let DisableOrigin::Park { watchdog, action_id } = origin {
-                            self.finish_park_disable_failed(watchdog, action_id, "ESTOP_ACTIVE", "E-stop inhibited park disable");
-                        }
-                        Some(TransitionPoll { progress: Err("ESTOP_ACTIVE"), rx, broker_owned })
-                    }
-                    Err(e) => {
-                        drop(drv);
-                        let _ = self.arm_background_disable_retry_with_origin(requested_at, post_now);
-                        let code = self.disable_step_failed(e);
-                        if let DisableOrigin::Park { watchdog, action_id } = origin {
-                            self.finish_park_disable_failed(watchdog, action_id, code, "Torque disable transmission failed");
-                        }
-                        Some(TransitionPoll { progress: Err(code), rx, broker_owned })
-                    }
-                }
-            }
-            TorqueTransition::Disable {
-                origin,
-                confirm: Some(mut c),
-                requested_at,
-            } => {
-                let mut states = std::mem::take(&mut self.scratch.states);
-                let served = c.serve_budgeted(&mut **drv, drv_now + span, budget.max_rx_frames, &mut states);
-                let post_now = drv.clock_now();
-                self.scratch.states = states;
-                drop(drv);
-                let rx = served.did_rx.then_some((served.rx_frames, served.budget_exhausted));
-                let progress = match served.outcome {
-                    None => {
-                        self.torque_transition = Some(TorqueTransition::Disable {
-                            origin,
-                            confirm: Some(c),
-                            requested_at,
-                        });
-                        let wake = (drv_now + DISABLE_CONFIRM_SERVICE).min(c.deadline());
-                        Ok(Rt::Pending { wake: to_exec(wake) })
-                    }
-                    Some(true) => {
-                        match origin {
-                            DisableOrigin::BrokerTransition => {
-                                self.disable_confirmed();
-                                self.torque_off_finish_rt().map(|()| Rt::Done)
-                            }
-                            DisableOrigin::Park { watchdog, action_id } => {
-                                self.complete_park_disable_confirmed(watchdog, action_id);
-                                Ok(Rt::Done)
-                            }
-                        }
-                    }
-                    Some(false) => {
-                        // M4: Sends succeeded but confirmation timed out — arm bounded
-                        // BackgroundDisableRetry keeping the original DisableRequested timestamp
-                        // BEFORE latching the fault so background service keeps retrying within
-                        // the request's original lifetime.
-                        let _ = self.arm_background_disable_retry_with_origin(requested_at, post_now);
-                        self.safety.latch(
-                            crate::safety::FaultKind::Other,
-                            crate::safety::FaultDetail::Static(
-                                crate::safety::StaticFault::DisableUnconfirmed,
-                            ),
+            TorqueTransition::Disable { origin, kind } => {
+                if self.driver.is_none() {
+                    if let DisableOrigin::Park { watchdog, action_id, .. } = origin {
+                        self.finish_park_disable_failed(
+                            watchdog,
+                            action_id,
+                            "INTERNAL",
+                            "Driver missing during park disable",
                         );
-                        if let DisableOrigin::Park { watchdog, action_id } = origin {
+                    }
+                    return Some(TransitionPoll { progress: Err("INTERNAL"), rx: None, broker_owned });
+                }
+                let span = budget.deadline.saturating_duration_since(budget.now);
+                let control_release_seq = self.control_release_seq;
+                let poll_out = {
+                    let d = self.driver.as_ref().expect("checked is_some");
+                    let guard = if self.rt_executor_owned || broker_owned {
+                        match d.try_lock() {
+                            Ok(g) => Ok(g),
+                            Err(std::sync::TryLockError::WouldBlock) => Err(true),
+                            Err(std::sync::TryLockError::Poisoned(_)) => Err(false),
+                        }
+                    } else {
+                        d.lock().map_err(|_| false)
+                    };
+                    match guard {
+                        Err(true) => Err(true),
+                        Err(false) => Err(false),
+                        Ok(mut drv) => {
+                            if control_release_seq > 0 {
+                                drv.begin_control_release(control_release_seq);
+                            }
+                            let drv_now = drv.clock_now();
+                            let use_budgeted = broker_owned
+                                || self.rt_executor_owned
+                                || drv.supports_rt_executor().is_ok();
+                            let r = if use_budgeted {
+                                drv.poll_torque_budgeted(drv_now + span, budget.max_rx_frames)
+                            } else {
+                                drv.poll_torque(drv_now + span)
+                            };
+                            let frames_dispatched = drv.disable_frames_dispatched();
+                            let dispatched_mask = drv.disable_dispatched_mask();
+                            let rx = drv.take_last_poll_rx();
+                            let post_now = drv.clock_now();
+                            let mut ages_buf = std::mem::take(&mut self.scratch.ages);
+                            let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
+                            let snap = OwnerDriverSnapshot::capture_from_driver(
+                                drv.as_ref(),
+                                self.config.dof,
+                                self.feedback_numeric_valid,
+                                &self.measured_positions,
+                                &mut ages_buf,
+                                &mut bounds_buf,
+                            );
+                            self.scratch.ages = ages_buf;
+                            self.scratch.fb.bounds = bounds_buf;
+                            Ok((drv_now, r, frames_dispatched, dispatched_mask, rx, post_now, snap))
+                        }
+                    }
+                };
+                let (drv_now, r, frames_dispatched, dispatched_mask, rx, post_now, snap) = match poll_out {
+                    Ok(v) => {
+                        self.reset_disable_lock_contention();
+                        v
+                    }
+                    Err(true) => {
+                        self.torque_transition = Some(TorqueTransition::Disable { origin, kind });
+                        self.record_disable_lock_contention();
+                        return Some(TransitionPoll {
+                            progress: Ok(Rt::Pending { wake: budget.now }),
+                            rx: None,
+                            broker_owned,
+                        });
+                    }
+                    Err(false) => {
+                        if let DisableOrigin::Park { watchdog, action_id, .. } = origin {
                             self.finish_park_disable_failed(
                                 watchdog,
                                 action_id,
-                                "FEEDBACK_UNCONFIRMED",
-                                "Torque disable not confirmed by fresh hardware feedback",
+                                "FEEDBACK_UNAVAILABLE",
+                                "Driver unavailable during park disable",
                             );
                         }
-                        Err("FEEDBACK_UNCONFIRMED")
+                        return Some(TransitionPoll {
+                            progress: Err("FEEDBACK_UNAVAILABLE"),
+                            rx: None,
+                            broker_owned,
+                        });
                     }
                 };
-                Some(TransitionPoll { progress, rx, broker_owned })
+                self.owner_driver_snapshot = snap;
+                let to_exec = |wake: Instant| budget.now + wake.saturating_duration_since(drv_now);
+                match r {
+                    Ok(Drv::Pending { wake }) => {
+                        if frames_dispatched {
+                            self.disable_first_frame_accepted();
+                        }
+                        self.torque_transition = Some(TorqueTransition::Disable { origin, kind });
+                        Some(TransitionPoll {
+                            progress: Ok(Rt::Pending { wake: to_exec(wake) }),
+                            rx,
+                            broker_owned,
+                        })
+                    }
+                    Ok(Drv::Done(_)) => match origin {
+                        DisableOrigin::BrokerTransition => {
+                            self.disable_accepted();
+                            let progress = self.torque_off_finish_rt().map(|()| Rt::Done);
+                            Some(TransitionPoll { progress, rx, broker_owned })
+                        }
+                        DisableOrigin::Park { watchdog, action_id, .. } => {
+                            self.complete_park_disable_accepted(watchdog, action_id);
+                            Some(TransitionPoll { progress: Ok(Rt::Done), rx, broker_owned })
+                        }
+                    },
+                    Err(e) => {
+                        if let DisableOrigin::Park {
+                            watchdog: false,
+                            action_id,
+                            ..
+                        } = origin
+                        {
+                            if !frames_dispatched
+                                && crate::driver::is_estop_inhibited(&e)
+                                && !self.e_stop_latched.load(Ordering::SeqCst)
+                                && !self.estop_pending()
+                                && !self.safety.state().is_stopped()
+                            {
+                                self.clear_active_disable_retry_state();
+                                self.cancel_park_before_disable(action_id);
+                                return Some(TransitionPoll {
+                                    progress: Err("STOPPED"),
+                                    rx,
+                                    broker_owned,
+                                });
+                            }
+                        }
+                        if crate::driver::is_estop_inhibited(&e) {
+                            if let DisableOrigin::Park { watchdog, action_id, .. } = origin {
+                                self.finish_park_disable_failed(
+                                    watchdog,
+                                    action_id,
+                                    "ESTOP_ACTIVE",
+                                    "E-stop inhibited park disable",
+                                );
+                            }
+                            return Some(TransitionPoll {
+                                progress: Err("ESTOP_ACTIVE"),
+                                rx,
+                                broker_owned,
+                            });
+                        }
+                        let refused = matches!(
+                            e,
+                            crate::driver::ArmDriverError::TorqueOffWouldDrop
+                                | crate::driver::ArmDriverError::DisableRequestExpired
+                        );
+                        let client_park_stopped = matches!(
+                            origin,
+                            DisableOrigin::Park {
+                                watchdog: false,
+                                expected_stop_gen,
+                                ..
+                            } if self.client_park_stop_invalidated(expected_stop_gen)
+                        );
+                        let (code, text) = if client_park_stopped {
+                            self.clear_active_disable_retry_state();
+                            let code = self.disable_step_failed_inner(e, false);
+                            (code, "Client park disable stopped mid-batch")
+                        } else {
+                            if let DisableOrigin::Park {
+                                watchdog: false,
+                                expected_stop_gen,
+                                ..
+                            } = origin
+                            {
+                                self.active_disable_client_park = Some(expected_stop_gen);
+                            }
+                            let partial_remaining = self.is_partial_disable_remaining(dispatched_mask);
+                            let partial_retry = self.commit_partial_disable_retry_kind(
+                                kind,
+                                post_now,
+                                frames_dispatched,
+                                partial_remaining,
+                            );
+                            if let Some(rk) = partial_retry {
+                                let _ = self.arm_background_disable_retry_immediate_with_kind(rk, post_now);
+                            } else if !refused {
+                                let _ = self.arm_background_disable_retry_with_kind(kind, post_now);
+                            }
+                            let code = self.disable_step_failed_inner(e, partial_retry.is_some());
+                            let text = if refused && !frames_dispatched {
+                                "Park torque-off refused by rest-pose gate"
+                            } else {
+                                "Torque disable transmission failed"
+                            };
+                            (code, text)
+                        };
+                        if let DisableOrigin::Park { watchdog, action_id, .. } = origin {
+                            self.finish_park_disable_failed(watchdog, action_id, code, text);
+                        }
+                        Some(TransitionPoll {
+                            progress: Err(code),
+                            rx,
+                            broker_owned,
+                        })
+                    }
+                }
             }
         }
-    }
-
-    /// In Fault / EStop with torque on: fresh feedback from every motor reporting Disabled
-    /// (Damiao: all fresh 0xCC / feedback states 0) means the motors lost torque, e.g. a
-    /// motor power reset during a bus loss (real arm, 2026-11-12: all seven motors came
-    /// back Disabled after BusLoss and armd kept `is_torqued: true`). armd then records
-    /// torque off (`is_torqued` false, re-arm needs the full enable handshake) and keeps the
-    /// Fault until `clear_fault`. Not applied during gravity compensation (its exit path
-    /// owns the motor modes) or while a disable is pending.
-    pub(super) fn sync_torque_state_after_stop(&mut self) {
-        if !self.is_torqued || self.disable_pending || self.gravity_comp.is_some() || !self.safety.state().is_stopped() {
-            return;
-        }
-        let Some(d) = self.driver.as_ref() else { return; };
-        let off = d.lock().is_ok_and(|drv| drv.capabilities().enable_feedback && drv.is_feedback_valid()
-            && drv.enable_state() == EnableState::Disabled);
-        if !off || !self.hardware_feedback_fresh(Duration::from_millis(250)) { return; }
-        if let Ok(mut drv) = d.lock() { drv.set_torque_flag(false); }
-        tracing::warn!("Motors report Disabled with fresh feedback in {:?}: torque is off (is_torqued = false); the fault stays latched until clear_fault",
-            self.safety.state());
-        self.is_torqued = false;
-        self.pending_rearm = true;
-        self.output_suspended = false;
-        self.gripper_stalled = false;
-        self.gripper_high_torque_ticks = 0;
-        self.gripper_low_torque_ticks = 0;
-        self.gripper_stall_window.reset();
-        self.gripper_stall_sign = 0.0;
-        self.gripper_prev_hw_overload = false;
-        self.gripper_hold_vel_ceiling = None;
-        self.stop_motion();
-        self.servo_stream_active = false;
-        self.tracking.invalidate();
-        if self.measured_positions.iter().all(|q| q.is_finite()) {
-            self.commanded_positions = self.measured_positions.clone();
-            self.target_positions = self.measured_positions.clone();
-        }
-        self.commanded_velocities.fill(0.0);
-        self.commanded_accelerations.fill(0.0);
     }
 
     /// Builds the common zero-allocation [`crate::safety::ClearContext`] baseline from current
@@ -3220,6 +5859,7 @@ impl SupervisorInner {
             lease_heartbeat_fresh,
             joint_limit_violation: self.joint_limit_clear_violation(),
             enable_state_known: self.driver.is_none(),
+            failed_hold_recovery_allowed: false,
             hardware_reset_required: false,
             hardware_reset_sent: false,
             hardware_error: None,
@@ -3509,6 +6149,10 @@ impl SupervisorInner {
                     }
                     return Err(ClearFaultLegacyInnerError::Safety(refusal.into_safety_error()));
                 }
+                // MIT expiry recovery disables every motor on the bus and therefore always passes
+                // the single Rule A′ rest-pose decision with no override or already-off bypass.
+                self.eval_stopped_torque_off()
+                    .map_err(|r| r.into_safety_error(&self.config.joint_names))?;
                 if !self.mit.recovery_confirmed {
                     return Err(ClearFaultLegacyInnerError::Safety(SafetyError::ClearFaultRejected(format!(
                         "{}: {}",
@@ -3523,6 +6167,7 @@ impl SupervisorInner {
                     candidate_limits,
                     reapply_legacy_limits: clear_driver_err_field && candidate_limits.is_none(),
                     is_torqued: None,
+                    reset_disarmed_hold: false,
                     thermal_cooldown: None,
                 };
                 if let Some(auth) = authority {
@@ -3543,6 +6188,7 @@ impl SupervisorInner {
             candidate_limits,
             reapply_legacy_limits: clear_driver_err_field && candidate_limits.is_none(),
             is_torqued: None,
+            reset_disarmed_hold: false,
             thermal_cooldown: None,
         };
         let mut staged_feedback = None;
@@ -3569,9 +6215,6 @@ impl SupervisorInner {
             let caps = drv.capabilities();
             let disabling = drv.clear_fault_disables_joints();
             let hw_fault = drv.check_hardware_status().is_err();
-            let mut state = drv.enable_state();
-            let mut partial = drv.has_known_partial_enable();
-            let mut any_enabled = drv.has_any_joint_enabled();
             let fb_valid = drv.is_feedback_valid();
             let mut j7_fb_fresh = drv.pos_force_feedback_fresh();
             let tx_queue_drained = drv.pending_tx_len_total() == 0;
@@ -3582,7 +6225,9 @@ impl SupervisorInner {
                 && ages.len() == self.config.dof
                 && !ages.iter().any(|a| a.is_none_or(|t| t > Duration::from_millis(250)))
                 && states_ok;
-            let needs_resting_check = (self.is_torqued || any_enabled || state != EnableState::Disabled)
+            // M1: Resting-pose check necessity follows owner decision state (`torque_intent == On`
+            // or `is_torqued`), never feedback-reported `enable_state()`.
+            let needs_resting_check = (self.is_torqued || self.torque_intent == TorqueIntent::On)
                 && disabling.iter().any(|&j| j < self.config.arm_dof());
             let max_rest_age = self
                 .resting_policy()
@@ -3635,7 +6280,6 @@ impl SupervisorInner {
                     );
                 }
             }
-            let enable_known = state != EnableState::Unknown || partial;
             drop(drv);
             self.ws_eval_bufs = ws_bufs;
 
@@ -3661,15 +6305,15 @@ impl SupervisorInner {
             ctx.resting_feedback_missing = resting_feedback_missing;
             ctx.resting_pose_violation = resting_pose_violation;
             ctx.hardware_reset_required = hw_fault;
-            ctx.enable_state_known = enable_known;
+            self.populate_enable_clear_context(&mut ctx, caps.enable_feedback);
 
-            // Evaluate `clear_check` FIRST over EVERY recorded kind before any TX probe, motor
-            // reset, or `refresh_enable_state` side effect.
+            // Evaluate `clear_check` FIRST over EVERY recorded kind before any TX probe or motor
+            // reset side effect.
             let mut clear_res = self.safety.clear_check(&ctx);
             if clear_res == Err(ClearRefusal::TxProbeRequired) {
                 // Every OTHER recorded kind's condition passed and the software TX queue is empty:
                 // run one read-only refresh/status TX probe and verify fresh post-probe feedback.
-                let (probe_res, drained_after, probe_ok, probe_pending, hw_fault_after, st_after, partial_after, any_en_after, fb_valid_after, j7_fresh_after, ages_after) = {
+                let (probe_res, drained_after, probe_ok, probe_pending, hw_fault_after, fb_valid_after, j7_fresh_after, ages_after) = {
                     let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
                     if let Some(auth) = authority {
                         if let Err(auth_err) =
@@ -3686,20 +6330,14 @@ impl SupervisorInner {
                         drv.tx_probe_confirmed(),
                         drv.tx_probe_pending(),
                         drv.check_hardware_status().is_err(),
-                        drv.enable_state(),
-                        drv.has_known_partial_enable(),
-                        drv.has_any_joint_enabled(),
                         drv.is_feedback_valid(),
                         drv.pos_force_feedback_fresh(),
                         drv.feedback_ages(),
                     )
                 };
-                state = st_after;
-                partial = partial_after;
-                any_enabled = any_en_after;
                 j7_fb_fresh = j7_fresh_after;
                 ctx.tx_queue_drained = drained_after;
-                ctx.enable_state_known = state != EnableState::Unknown || partial;
+                self.populate_enable_clear_context(&mut ctx, caps.enable_feedback);
                 ctx.hardware_reset_required = hw_fault_after;
                 ctx.j7_feedback_fresh = j7_fb_fresh;
                 ctx.pending_estop = self.estop_request_unapplied();
@@ -3726,8 +6364,9 @@ impl SupervisorInner {
                 Err(ClearRefusal::HardwareResetRequired) => {
                     // Explicitly modeled exception: every OTHER recorded kind's condition passed,
                     // so transmitting the motor fault reset is now permitted. Recheck live grant,
-                    // lease, operator session (M3), J7 freshness, and pending E-stop under the
-                    // SAME driver lock guard before sending the reset (zero check-to-command gap).
+                    // lease, operator session (M3), J7 freshness, Rule A′ rest-pose gate (when the
+                    // reset itself disables an arm joint, e.g. Feetech STS3215), and pending E-stop
+                    // under the SAME driver lock guard before sending the reset (zero gap).
                     let reset_res = {
                         let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
                         if let Some(auth) = authority {
@@ -3736,6 +6375,17 @@ impl SupervisorInner {
                             {
                                 drop(drv);
                                 return Err(ClearFaultLegacyInnerError::Authority(auth_err));
+                            }
+                        }
+                        if needs_resting_check {
+                            if let Err(r) =
+                                Self::check_stopped_torque_off_with_driver(&self.config, drv.as_ref())
+                            {
+                                drop(drv);
+                                self.last_stopped_torque_off_refusal = Some(r);
+                                return Err(ClearFaultLegacyInnerError::Safety(
+                                    r.into_safety_error(&self.config.joint_names),
+                                ));
                             }
                         }
                         ctx.j7_feedback_fresh = drv.pos_force_feedback_fresh();
@@ -3756,6 +6406,19 @@ impl SupervisorInner {
                     ctx.pending_estop = self.estop_request_unapplied();
                     match reset_res {
                         Ok(()) => ctx.hardware_reset_sent = true,
+                        Err(
+                            crate::driver::ArmDriverError::TorqueOffWouldDrop
+                            | crate::driver::ArmDriverError::DisableRequestExpired,
+                        ) => {
+                            let r = self
+                                .may_disable_torque_while_stopped()
+                                .err()
+                                .unwrap_or(crate::supervisor::StoppedTorqueOffRefusal::StaleOrMissingFeedback);
+                            self.last_stopped_torque_off_refusal = Some(r);
+                            return Err(ClearFaultLegacyInnerError::Safety(
+                                r.into_safety_error(&self.config.joint_names),
+                            ));
+                        }
                         Err(e) => ctx.hardware_error = Some(clear_fault_driver_error(&e)),
                     }
                     let post_refusal = self.safety.clear_check(&ctx).unwrap_err();
@@ -3763,34 +6426,6 @@ impl SupervisorInner {
                         return Err(apply_estop_refusal(self));
                     }
                     return Err(ClearFaultLegacyInnerError::Safety(post_refusal.into_safety_error()));
-                }
-                Err(ClearRefusal::EnableStateUnknown) if fb_fresh && !hw_fault && !partial => {
-                    // Every other condition passed; probe enable state once and re-run clear_check.
-                    {
-                        let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
-                        if let Some(auth) = authority {
-                            if let Err(auth_err) =
-                                recheck_clear_fault_authority_readonly(self, auth, Instant::now())
-                            {
-                                drop(drv);
-                                return Err(ClearFaultLegacyInnerError::Authority(auth_err));
-                            }
-                        }
-                        let _ = drv.refresh_enable_state();
-                        state = drv.enable_state();
-                        partial = drv.has_known_partial_enable();
-                        any_enabled = drv.has_any_joint_enabled();
-                        j7_fb_fresh = drv.pos_force_feedback_fresh();
-                    }
-                    ctx.enable_state_known = state != EnableState::Unknown || partial;
-                    ctx.j7_feedback_fresh = j7_fb_fresh;
-                    ctx.pending_estop = self.estop_request_unapplied();
-                    if let Err(refusal) = self.safety.clear_check(&ctx) {
-                        if refusal == ClearRefusal::EStopActive {
-                            return Err(apply_estop_refusal(self));
-                        }
-                        return Err(ClearFaultLegacyInnerError::Safety(refusal.into_safety_error()));
-                    }
                 }
                 Err(refusal) => {
                     if matches!(refusal, ClearRefusal::ThermalCooldownNotElapsed { .. })
@@ -3805,7 +6440,12 @@ impl SupervisorInner {
             if fb_fresh {
                 staged_feedback = Some((states, loads, ages));
             }
-            commit.is_torqued = Some(state == EnableState::Enabled || partial || any_enabled);
+            if self.torque_intent == TorqueIntent::Off {
+                commit.is_torqued = Some(false);
+                commit.reset_disarmed_hold = true;
+            } else if self.enable_lifecycle == EnableLifecycle::FailedHold {
+                commit.is_torqued = Some(true);
+            }
             commit.thermal_cooldown = Some(next_cd);
         } else {
             let next_cd = self.evaluate_thermal_cooldown_driverless(Instant::now());
@@ -4003,6 +6643,10 @@ impl SupervisorInner {
         if let Some(is_torqued) = commit.is_torqued {
             self.is_torqued = is_torqued;
         }
+        if commit.reset_disarmed_hold {
+            self.enable_lifecycle = EnableLifecycle::Disarmed;
+            self.measured_hold.clear();
+        }
         if let Some(cd) = commit.thermal_cooldown {
             self.thermal_cooldown = cd;
         }
@@ -4035,6 +6679,7 @@ impl SupervisorInner {
         self.following_error_since = None;
         self.watchdog_park_blocked_reason = None;
         self.bus_loss_instant = None;
+        self.output_suspended = false;
         self.reset_gripper_stall();
         self.handover_settling_since = None;
         if let Some(hook) = self.before_estop_unlatch_hook.take() {
@@ -4397,6 +7042,7 @@ impl SupervisorInner {
             candidate_limits,
             reapply_legacy_limits: false,
             is_torqued: None,
+            reset_disarmed_hold: false,
             thermal_cooldown: None,
         };
         if let Some(ref d) = self.driver {
@@ -4422,11 +7068,12 @@ impl SupervisorInner {
             let tx_probe_confirmed = drv.tx_probe_confirmed();
             let tx_probe_sent = drv.tx_probe_pending();
             let hw_fault = drv.has_hardware_fault();
-            let temp_fb = drv.capabilities().temperature_feedback;
-            let mut state = drv.enable_state();
-            let mut partial = drv.has_known_partial_enable();
-            let mut any_enabled = drv.has_any_joint_enabled();
-            let needs_resting_check = (self.is_torqued || any_enabled || state != EnableState::Disabled)
+            let caps = drv.capabilities();
+            let temp_fb = caps.temperature_feedback;
+            let enable_fb = caps.enable_feedback;
+            // M1: Resting-pose check necessity follows owner decision state (`torque_intent == On`
+            // or `is_torqued`), never feedback-reported `enable_state()`.
+            let needs_resting_check = (self.is_torqued || self.torque_intent == TorqueIntent::On)
                 && drv.clear_fault_disables_arm_joint(self.config.arm_dof());
             let mut resting_feedback_missing = false;
             let mut resting_pose_violation = None;
@@ -4490,7 +7137,7 @@ impl SupervisorInner {
             ctx.resting_feedback_missing = resting_feedback_missing;
             ctx.resting_pose_violation = resting_pose_violation;
             ctx.hardware_reset_required = hw_fault;
-            ctx.enable_state_known = state != EnableState::Unknown || partial;
+            self.populate_enable_clear_context(&mut ctx, enable_fb);
 
             // Evaluate `clear_check` FIRST over EVERY recorded kind before any TX probe, motor
             // reset, or concurrent E-stop / config mutation.
@@ -4501,7 +7148,7 @@ impl SupervisorInner {
                     return Err(ClearFaultWithAuthError::Clear(E::Rejected(R::BudgetExpired)));
                 }
                 let mut scratch_ages = std::mem::take(&mut self.scratch.ages);
-                let (probe_res, drained_after, probe_ok, probe_pending, hw_fault_after, st_after, partial_after, any_en_after, fb_valid_after, j7_fresh_after, ages_valid_after) = {
+                let (probe_res, drained_after, probe_ok, probe_pending, hw_fault_after, fb_valid_after, j7_fresh_after, ages_valid_after) = {
                     let mut drv = match d.lock() {
                         Ok(g) => g,
                         Err(_) => {
@@ -4529,20 +7176,14 @@ impl SupervisorInner {
                         drv.tx_probe_confirmed(),
                         drv.tx_probe_pending(),
                         drv.has_hardware_fault(),
-                        drv.enable_state(),
-                        drv.has_known_partial_enable(),
-                        drv.has_any_joint_enabled(),
                         drv.is_feedback_valid(),
                         drv.pos_force_feedback_fresh(),
                         ages_ok,
                     )
                 };
                 self.scratch.ages = scratch_ages;
-                state = st_after;
-                partial = partial_after;
-                any_enabled = any_en_after;
                 ctx.tx_queue_drained = drained_after;
-                ctx.enable_state_known = state != EnableState::Unknown || partial;
+                self.populate_enable_clear_context(&mut ctx, enable_fb);
                 ctx.hardware_reset_required = hw_fault_after;
                 ctx.j7_feedback_fresh = j7_fresh_after;
                 ctx.pending_estop = self.estop_request_unapplied();
@@ -4566,8 +7207,9 @@ impl SupervisorInner {
                 Err(R::HardwareResetRequired) => {
                     // Explicitly modeled exception: every OTHER recorded kind's condition passed,
                     // so a budgeted motor reset is now permitted. Recheck live grant, lease,
-                    // operator session (M3), J7 freshness, and pending E-stop under the SAME
-                    // driver lock guard before sending the reset (zero check-to-command gap).
+                    // operator session (M3), J7 freshness, Rule A′ rest-pose gate (when the reset
+                    // itself disables an arm joint, e.g. Feetech STS3215), and pending E-stop under
+                    // the SAME driver lock guard before sending the reset (zero gap, zero alloc).
                     let now = now_override.unwrap_or_else(Instant::now);
                     if now >= deadline {
                         return Err(ClearFaultWithAuthError::Clear(E::Rejected(R::BudgetExpired)));
@@ -4580,6 +7222,17 @@ impl SupervisorInner {
                             {
                                 drop(drv);
                                 return Err(ClearFaultWithAuthError::Authority(auth_err));
+                            }
+                        }
+                        if needs_resting_check {
+                            if let Err(refusal) =
+                                Self::check_stopped_torque_off_with_driver(&self.config, drv.as_ref())
+                            {
+                                drop(drv);
+                                self.last_stopped_torque_off_refusal = Some(refusal);
+                                return Err(ClearFaultWithAuthError::Clear(
+                                    refusal.into_clear_fault_error(),
+                                ));
                             }
                         }
                         ctx.j7_feedback_fresh = drv.pos_force_feedback_fresh();
@@ -4604,6 +7257,17 @@ impl SupervisorInner {
                     ctx.pending_estop = self.estop_request_unapplied();
                     match reset_res {
                         Ok(()) => ctx.hardware_reset_sent = true,
+                        Err(
+                            crate::driver::ArmDriverError::TorqueOffWouldDrop
+                            | crate::driver::ArmDriverError::DisableRequestExpired,
+                        ) => {
+                            let r = self
+                                .may_disable_torque_while_stopped()
+                                .err()
+                                .unwrap_or(crate::supervisor::StoppedTorqueOffRefusal::StaleOrMissingFeedback);
+                            self.last_stopped_torque_off_refusal = Some(r);
+                            return Err(ClearFaultWithAuthError::Clear(r.into_clear_fault_error()));
+                        }
                         Err(e) => ctx.hardware_error = Some(clear_fault_driver_error(&e)),
                     }
                     let post_refusal = self.safety.clear_check(&ctx).unwrap_err();
@@ -4622,7 +7286,12 @@ impl SupervisorInner {
                     return Err(ClearFaultWithAuthError::Clear(E::from(refusal)));
                 }
             }
-            commit.is_torqued = Some(state == EnableState::Enabled || partial || any_enabled);
+            if self.torque_intent == TorqueIntent::Off {
+                commit.is_torqued = Some(false);
+                commit.reset_disarmed_hold = true;
+            } else if self.enable_lifecycle == EnableLifecycle::FailedHold {
+                commit.is_torqued = Some(true);
+            }
             commit.thermal_cooldown = Some(next_cd);
         } else {
             // Driverless simulation mode: evaluate cooldown without pre-committing (0 alloc).
@@ -4673,13 +7342,20 @@ impl SupervisorInner {
             .map_err(SafetyError::from)
     }
 
+    fn mark_panic_disable_requested(&mut self) {
+        self.estop_state.latch();
+        self.active_disable_kind = Some(crate::driver::DisableKind::DisableProtective {
+            reason: crate::driver::DisableProtectiveReason::ProcessExit,
+        });
+        self.disable_requested();
+    }
+
     /// Bounded last-chance disable on a panic or forced teardown path owned by this `SupervisorInner`.
     /// Uses bounded `try_lock()` so a contended driver mutex cannot block indefinitely past `timeout`.
     /// Runs synchronously on the caller holding `&mut SupervisorInner` (preserving exclusive driver
     /// ownership) while logging timeout independently at `hard_deadline`.
     pub fn attempt_panic_disable(&mut self, timeout: Duration) -> PanicDisableOutcome {
-        self.estop_state.latch();
-        self.disable_requested();
+        self.mark_panic_disable_requested();
         let origin = Instant::now();
         let (coop_deadline, hard_deadline) = panic_disable_deadlines(origin, timeout);
         let coop_budget = coop_deadline.saturating_duration_since(origin);
@@ -4700,10 +7376,9 @@ impl SupervisorInner {
         hard_deadline: Instant,
         coop_budget: Duration,
     ) -> PanicDisableOutcome {
-        self.estop_state.latch();
-        self.disable_requested();
+        self.mark_panic_disable_requested();
         let Some(ref d) = self.driver else {
-            self.disable_confirmed();
+            self.disable_accepted();
             return PanicDisableOutcome::NoDriver;
         };
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -4727,16 +7402,14 @@ impl SupervisorInner {
         }))
         .unwrap_or_else(|_| PanicDisableOutcome::Failed("panic during driver panic-disable".into()));
         if outcome == PanicDisableOutcome::Confirmed {
-            self.disable_confirmed();
+            self.disable_accepted();
         }
         outcome
     }
 
     pub fn driver_feedback_confirmed(&self) -> bool {
-        match &self.driver {
-            None => false,
-            Some(d) => d.lock().is_ok_and(|drv| drv.is_feedback_valid()),
-        }
+        self.lock_driver_for_tick()
+            .is_some_and(|drv| drv.is_feedback_valid())
     }
 }
 

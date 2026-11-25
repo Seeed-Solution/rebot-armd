@@ -2944,6 +2944,26 @@ pub fn parse_grasp(body: &Value, base: &GraspSetup) -> Result<GraspRequest, Moti
     Ok(GraspRequest { label, box_norm, frame_id, setup, tag, task, requires, models, approach })
 }
 
+/// Adaptive grasp preparation state captured under the owner snapshot (`strategy: "adaptive"`).
+pub struct PendingAdaptive {
+    pub snapshot: crate::grasp_select::Snapshot,
+    pub start_positions: Vec<f32>,
+    pub revisions: crate::grasp_select::AdaptiveRevisions,
+    pub gripper_policy: crate::model::GripperPolicy,
+    pub gripper_limit: crate::model::JointLimit,
+    pub close_speed_limit: Option<f32>,
+    pub has_gravity_model: bool,
+}
+
+/// Adaptive grasp planned state (`strategy: "adaptive"`) carrying the single authoritative
+/// [`crate::grasp_select::AdaptiveRoute`], start positions, and captured revisions.
+pub struct PlannedAdaptive {
+    pub route: crate::grasp_select::AdaptiveRoute,
+    pub start_positions: Vec<f32>,
+    pub revisions: crate::grasp_select::AdaptiveRevisions,
+    pub expected_generation: Option<u64>,
+}
+
 /// A request checked under the lock, ready to be planned outside it.
 pub struct PendingGrasp {
     pub input: PlanInput,
@@ -2951,9 +2971,11 @@ pub struct PendingGrasp {
     pub request: Box<GraspRequest>,
     pub open_rad: f32,
     pub physical_contact_end_m: Option<[f64; 3]>,
+    /// Populated only when `strategy: "adaptive"` is requested (`None` for legacy).
+    pub adaptive: Option<Box<PendingAdaptive>>,
 }
 
-/// A grasp whose coarse approach was found reachable.
+/// A grasp whose coarse approach (legacy) or whole adaptive route was found reachable.
 pub struct PlannedGrasp {
     pub input: PlanInput,
     pub request: GraspRequest,
@@ -2964,19 +2986,90 @@ pub struct PlannedGrasp {
     pub camera_down: bool,
     /// Estimated duration of the camera-down → tool-vertical move (0 without camera-down).
     pub transition_duration: f64,
-    /// The provider's mode read by [`preflight`] (a task with requirements); the orchestrator
-    /// reads it itself when None.
+    /// The provider's mode read by [`preflight`] (a task with requirements or adaptive grasp);
+    /// the orchestrator reads it itself when None.
     pub mode: Option<Result<ModeInfo, String>>,
+    /// Populated only when `strategy: "adaptive"` is requested (`None` for legacy).
+    pub adaptive: Option<Box<PlannedAdaptive>>,
 }
 
-/// Under the lock: parse and check preconditions. `strategy: "adaptive"` is refused: it is a
-/// dry-run strategy ([`crate::grasp_select`]).
+fn adaptive_prep_err(phase: &'static str, err: ArmError) -> ArmError {
+    if matches!(err, ArmError::Detailed { .. }) {
+        return err;
+    }
+    let api = ApiError::from(err);
+    let status = api.status.as_u16();
+    let code = api.code.unwrap_or(api.error);
+    let msg = if api.message.starts_with(&format!("[{phase}]")) {
+        api.message
+    } else {
+        format!("[{phase}] {}", api.message)
+    };
+    ArmError::Detailed {
+        status,
+        code,
+        message: msg,
+        details: Box::new(serde_json::json!({
+            "failing_phase": phase,
+            "outcome": "infeasible",
+        })),
+    }
+}
+
+/// Under the lock: parse and check preconditions for both `strategy: "legacy"` (default) and
+/// `strategy: "adaptive"` (phase B live execution).
 pub fn prepare(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<PendingGrasp, ArmError> {
-    if body.is_object() { crate::grasp_select::refuse_execution(body)?; }
-    prepare_any(inner, body, epoch)
+    let strategy = if body.is_object() {
+        crate::grasp_select::parse_strategy(body)?
+    } else {
+        crate::grasp_select::Strategy::Legacy
+    };
+    let mut pending = match prepare_any(inner, body, epoch) {
+        Ok(p) => p,
+        Err(e) if strategy == crate::grasp_select::Strategy::Adaptive => {
+            return Err(adaptive_prep_err("request", e));
+        }
+        Err(e) => return Err(e),
+    };
+    if strategy == crate::grasp_select::Strategy::Adaptive {
+        let snap = crate::grasp_select::capture(inner, &pending, body)
+            .map_err(|e| adaptive_prep_err("snapshot", e))?;
+        let gripper_idx = inner
+            .config
+            .gripper_index()
+            .ok_or_else(|| adaptive_prep_err("snapshot", ArmError::from(MotionError::Unsupported("Grasp needs a gripper joint".into()))))?;
+        let gripper_policy = inner
+            .config
+            .gripper_policy
+            .clone()
+            .ok_or_else(|| adaptive_prep_err("snapshot", ArmError::from(MotionError::Unsupported("Grasp needs a gripper policy".into()))))?;
+        let gripper_limit = inner
+            .config
+            .limits
+            .get(gripper_idx)
+            .cloned()
+            .ok_or_else(|| adaptive_prep_err("snapshot", ArmError::from(MotionError::Unsupported("Grasp needs a gripper joint limit".into()))))?;
+        let revisions = crate::grasp_select::AdaptiveRevisions {
+            workspace_revision: inner.workspace_revision,
+            calibration_revision: inner.calibration_revision,
+            grasp_setup_revision: inner.grasp_setup_revision,
+            gripper_calib_revision: inner.gripper_calib_revision,
+            power_budget_revision: inner.power_budget_revision,
+        };
+        pending.adaptive = Some(Box::new(PendingAdaptive {
+            snapshot: snap,
+            start_positions: inner.commanded_positions.clone(),
+            revisions,
+            gripper_policy,
+            gripper_limit,
+            close_speed_limit: inner.gripper_close_speed_limit(),
+            has_gravity_model: inner.config.gravity_model.is_some(),
+        }));
+    }
+    Ok(pending)
 }
 
-/// [`prepare`] for any strategy (the dry run).
+/// [`prepare`] for any strategy (used by legacy and dry-run paths).
 fn prepare_any(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<PendingGrasp, ArmError> {
     if !body.is_object() { return Err(MotionError::InvalidCommand("Command body must be an object".into()).into()); }
     inner.check_commissioning_for_ordinary_motion("grasp")?;
@@ -2997,41 +3090,103 @@ fn prepare_any(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<Pend
         request: Box::new(request),
         open_rad: policy.open_rad,
         physical_contact_end_m: inner.config.effective_physical_contact_end_m(),
+        adaptive: None,
     })
 }
 
+fn prepare_from_env_parts(
+    env: &crate::rt_core::requests::actions::ActionPrepEnv,
+    commanded_positions: &[f32],
+    input: PlanInput,
+    body: &Value,
+    strategy: crate::grasp_select::Strategy,
+) -> Result<PendingGrasp, ArmError> {
+    let wrap = |phase: &'static str, e: ArmError| {
+        if strategy == crate::grasp_select::Strategy::Adaptive {
+            adaptive_prep_err(phase, e)
+        } else {
+            e
+        }
+    };
+    if !body.is_object() {
+        return Err(wrap("request", MotionError::InvalidCommand("Command body must be an object".into()).into()));
+    }
+    if env.config.active_tool.commissioning_required {
+        return Err(wrap(
+            "request",
+            crate::safety::SafetyError::CommissioningRequired(
+                "grasp (blocked while active tool requires commissioning; use jog/move_to/move_relative/gripper at speed_scale <= 0.2)".into(),
+            )
+            .into(),
+        ));
+    }
+    let Some(base) = env.grasp_setup.clone() else {
+        return Err(wrap(
+            "snapshot",
+            MotionError::Unsupported(
+                "Grasp needs a profile with kinematics, a gripper policy and a grasp setup".into(),
+            )
+            .into(),
+        ));
+    };
+    if env.camera_calibrated {
+        refuse_calibrated_request(&base, body).map_err(|e| wrap("request", e.into()))?;
+    }
+    let Some(policy) = env.config.gripper_policy.clone() else {
+        return Err(wrap("snapshot", MotionError::Unsupported("Grasp needs a gripper policy".into()).into()));
+    };
+    let request = parse_grasp(body, &base).map_err(|e| wrap("request", e.into()))?;
+    let mut pending = PendingGrasp {
+        input,
+        request: Box::new(request),
+        open_rad: policy.open_rad,
+        physical_contact_end_m: env.config.effective_physical_contact_end_m(),
+        adaptive: None,
+    };
+    if strategy == crate::grasp_select::Strategy::Adaptive {
+        let gsnap = crate::grasp_select::capture_from_env(env, &pending, body)
+            .map_err(|e| adaptive_prep_err("snapshot", e))?;
+        let gripper_idx = env
+            .config
+            .gripper_index()
+            .ok_or_else(|| adaptive_prep_err("snapshot", ArmError::from(MotionError::Unsupported("Grasp needs a gripper joint".into()))))?;
+        let gripper_limit = env
+            .config
+            .limits
+            .get(gripper_idx)
+            .cloned()
+            .ok_or_else(|| adaptive_prep_err("snapshot", ArmError::from(MotionError::Unsupported("Grasp needs a gripper joint limit".into()))))?;
+        let revisions = crate::grasp_select::AdaptiveRevisions {
+            workspace_revision: env.workspace_revision,
+            calibration_revision: env.calibration_revision,
+            grasp_setup_revision: env.grasp_setup_revision,
+            gripper_calib_revision: env.gripper_calib_revision,
+            power_budget_revision: env.power_budget_revision,
+        };
+        pending.adaptive = Some(Box::new(PendingAdaptive {
+            snapshot: gsnap,
+            start_positions: commanded_positions.to_vec(),
+            revisions,
+            gripper_policy: policy,
+            gripper_limit,
+            close_speed_limit: env.gripper_close_speed_limit,
+            has_gravity_model: env.config.gravity_model.is_some(),
+        }));
+    }
+    Ok(pending)
+}
+
 /// Prepare a `grasp` action from a published [`ActionSnapshot`] (0 `SupervisorLock` on
-/// `OWNER_EXECUTOR`). Preserves Phase A refusal of live `strategy: "adaptive"`.
+/// `OWNER_EXECUTOR`) for both `strategy: "legacy"` and `strategy: "adaptive"`.
 pub fn prepare_from_snapshot(
     snap: &crate::rt_core::requests::actions::ActionSnapshot,
     body: &Value,
     epoch: u64,
 ) -> Result<PendingGrasp, ArmError> {
-    if body.is_object() {
-        crate::grasp_select::refuse_execution(body)?;
-    }
     if !body.is_object() {
         return Err(MotionError::InvalidCommand("Command body must be an object".into()).into());
     }
-    if snap.env.config.active_tool.commissioning_required {
-        return Err(crate::safety::SafetyError::CommissioningRequired(
-            "grasp (blocked while active tool requires commissioning; use jog/move_to/move_relative/gripper at speed_scale <= 0.2)".into(),
-        )
-        .into());
-    }
-    let Some(base) = snap.env.grasp_setup.clone() else {
-        return Err(MotionError::Unsupported(
-            "Grasp needs a profile with kinematics, a gripper policy and a grasp setup".into(),
-        )
-        .into());
-    };
-    if snap.env.camera_calibrated {
-        refuse_calibrated_request(&base, body)?;
-    }
-    let Some(policy) = snap.env.config.gripper_policy.clone() else {
-        return Err(MotionError::Unsupported("Grasp needs a gripper policy".into()).into());
-    };
-    let request = parse_grasp(body, &base)?;
+    let strategy = crate::grasp_select::parse_strategy(body)?;
     if epoch != snap.owner.authority.epoch {
         return Err(crate::safety::SafetyError::EpochMismatch {
             expected: snap.owner.authority.epoch,
@@ -3040,12 +3195,18 @@ pub fn prepare_from_snapshot(
         .into());
     }
     let input = snap.plan_input_in(GoalFrame::EndLink)?;
-    Ok(PendingGrasp {
-        input,
-        request: Box::new(request),
-        open_rad: policy.open_rad,
-        physical_contact_end_m: snap.env.config.effective_physical_contact_end_m(),
-    })
+    prepare_from_env_parts(&snap.env, &snap.commanded_positions, input, body, strategy)
+}
+
+/// Lease-free read-only preparation from a [`crate::rt_core::requests::actions::ReadOnlySnapshot`]
+/// (0 `SupervisorLock` on `OWNER_EXECUTOR`, used by `dry_run_plan`).
+fn prepare_from_read_only(
+    ro: &crate::rt_core::requests::actions::ReadOnlySnapshot,
+    body: &Value,
+    strategy: crate::grasp_select::Strategy,
+) -> Result<PendingGrasp, ArmError> {
+    let input = ro.plan_input_in(GoalFrame::EndLink)?;
+    prepare_from_env_parts(&ro.env, &ro.commanded_positions, input, body, strategy)
 }
 
 /// TCP height of the grasp plane (where box centres are assumed to lie).
@@ -3057,9 +3218,70 @@ fn approach_pose(r_now: &Mat3, target: &Vec3, setup: &GraspSetup) -> Pose {
 }
 
 /// Outside the lock: estimate the target from the box-centre ray and plan the approach
-/// with the gripper open (feasibility check, so an unreachable target is rejected up front).
+/// (legacy) or select & preflight the whole adaptive route (`strategy: "adaptive"`).
 pub fn plan(pending: PendingGrasp) -> Result<PlannedGrasp, ArmError> {
-    let PendingGrasp { input, request, open_rad, physical_contact_end_m } = pending;
+    let PendingGrasp { input, request, open_rad, physical_contact_end_m, adaptive } = pending;
+    if let Some(pa) = adaptive {
+        let sel = crate::grasp_select::select_adaptive_route(
+            &pa.snapshot,
+            &pa.gripper_policy,
+            &pa.gripper_limit,
+            pa.close_speed_limit,
+            pa.has_gravity_model,
+        );
+        if let Some(route) = sel.route.filter(|_| sel.selection.outcome == crate::grasp_select::Outcome::Selected) {
+            let target = [route.target_centroid[0], route.target_centroid[1], route.plan.grasp.p[2]];
+            let approach_duration = route.budget.pregrasp_s;
+            return Ok(PlannedGrasp {
+                input,
+                request: *request,
+                target,
+                approach_duration,
+                camera_down: pa.snapshot.camera_down,
+                transition_duration: 0.0,
+                mode: None,
+                adaptive: Some(Box::new(PlannedAdaptive {
+                    route,
+                    start_positions: pa.start_positions,
+                    revisions: pa.revisions,
+                    expected_generation: None,
+                })),
+            });
+        }
+        let code = sel.selection.code.unwrap_or_else(|| "NO_CANDIDATE".into());
+        let phase = sel.failing_phase.unwrap_or("selection");
+        let base_msg = sel.selection.message.unwrap_or_else(|| "adaptive grasp infeasible".into());
+        // Preserve dry-run/live parity for checked-only hints: only emit the legacy hint when
+        // the legacy route actually passes on this exact snapshot.
+        let checked_hint = sel.checked_hint.or_else(|| {
+            let legacy_pending = PendingGrasp {
+                input,
+                request,
+                open_rad,
+                physical_contact_end_m,
+                adaptive: None,
+            };
+            plan(legacy_pending)
+                .ok()
+                .map(|_| "legacy strategy passed dry_run for this target".to_string())
+        });
+        let message = match &checked_hint {
+            Some(hint) => format!("[{phase}] {base_msg}; hint: {hint}"),
+            None => format!("[{phase}] {base_msg}"),
+        };
+        let mut details = serde_json::Map::new();
+        details.insert("failing_phase".into(), serde_json::json!(phase));
+        details.insert("outcome".into(), serde_json::json!(sel.selection.outcome.name()));
+        if let Some(hint) = checked_hint {
+            details.insert("hint".into(), serde_json::json!(hint));
+        }
+        return Err(ArmError::Detailed {
+            status: 422,
+            code,
+            message,
+            details: Box::new(Value::Object(details)),
+        });
+    }
     let request = *request;
     let setup = &request.setup;
     let pose_end = input.arm.fk(&input.q0);
@@ -3111,7 +3333,7 @@ pub fn plan(pending: PendingGrasp) -> Result<PlannedGrasp, ArmError> {
     };
     let grasp_pose = Pose::new(tool.r, [target[0], target[1], setup.table_z_m + setup.grasp_height_m]);
     let _descend_path = motion::plan_cartesian_ex(&cur, grasp_pose, Speed { linear: setup.descend_speed_mps, angular: motion::DEFAULT_ANGULAR_RPS }, is_5dof)?;
-    Ok(PlannedGrasp { input, request, target, approach_duration: path.duration, camera_down, transition_duration, mode: None })
+    Ok(PlannedGrasp { input, request, target, approach_duration: path.duration, camera_down, transition_duration, mode: None, adaptive: None })
 }
 
 /// Duration of the transition from the camera-down pose `from` to the tool-vertical pose
@@ -3126,6 +3348,9 @@ pub fn transition_estimate(from: &Pose, target: &Vec3, setup: &GraspSetup) -> f6
 
 /// Rough total duration for the ack.
 pub fn expected_duration(planned: &PlannedGrasp) -> f64 {
+    if let Some(pa) = &planned.adaptive {
+        return pa.route.budget.nominal_total_s;
+    }
     let s = &planned.request.setup;
     let descend = (s.approach_height_m - s.grasp_height_m) * 1.875 / s.descend_speed_mps;
     let lift = (s.lift_height_m - s.grasp_height_m) * 1.875 / s.descend_speed_mps;
@@ -3147,7 +3372,7 @@ fn task_unsupported(message: String) -> ArmError {
 }
 
 /// One model-changing preflight at a time (armd talks to one provider; its swap is one at a time).
-static MODEL_SWITCH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(crate) static MODEL_SWITCH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// How long a preflight waits for the provider's swap (`/api/mode` polled).
 const MODEL_SWITCH_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -3158,20 +3383,74 @@ const MODEL_SWITCH_TIMEOUT: Duration = Duration::from_secs(5);
 /// provider that cannot be read is not a task failure (the grasp then fails as without a task).
 pub async fn preflight(source: &dyn DetectionSource, planned: &mut PlannedGrasp) -> Result<(), ArmError> {
     let request = &planned.request;
-    let Some(task) = request.task.as_deref().filter(|_| !request.requires.is_empty() || request.models.is_some()) else { return Ok(()); };
-    let _serial = if request.models.is_some() { Some(MODEL_SWITCH.lock().await) } else { None };
-    let mut mode = source.mode_info().await;
-    if let (Some(models), Ok(m)) = (&request.models, &mode) {
-        if let Some(body) = models.switch_body(m) {
-            mode = switch_models(source, &body, task).await?;
+    let has_task_reqs = request.task.as_deref().is_some_and(|_| !request.requires.is_empty() || request.models.is_some());
+    if has_task_reqs {
+        let task = request.task.as_deref().unwrap();
+        let _serial = if request.models.is_some() { Some(MODEL_SWITCH.lock().await) } else { None };
+        let mut mode = source.mode_info().await;
+        if let (Some(models), Ok(m)) = (&request.models, &mode) {
+            if let Some(body) = models.switch_body(m) {
+                mode = switch_models(source, &body, task).await?;
+            }
         }
+        let verdict = match &mode {
+            Ok(m) => request.requires.check(task, m),
+            Err(e) if planned.adaptive.is_some() => {
+                return Err(ArmError::Detailed {
+                    status: 503,
+                    code: "DETECTION_UNAVAILABLE".into(),
+                    message: format!("[vision_preflight] vision provider unreachable: {e}"),
+                    details: Box::new(serde_json::json!({
+                        "failing_phase": "vision_preflight",
+                        "outcome": "infeasible",
+                    })),
+                });
+            }
+            Err(_) => Ok(()),
+        };
+        planned.mode = Some(mode);
+        verdict.map_err(|why| {
+            if planned.adaptive.is_some() {
+                ArmError::Detailed {
+                    status: 422,
+                    code: TASK_UNSUPPORTED.to_string(),
+                    message: format!("[task] {why}"),
+                    details: Box::new(serde_json::json!({
+                        "failing_phase": "task",
+                        "outcome": "infeasible",
+                    })),
+                }
+            } else {
+                task_unsupported(why)
+            }
+        })?;
+    } else if planned.adaptive.is_some() && planned.mode.is_none() {
+        // Bind vision provider model generation before BeginMacro so a model switch between
+        // planning/preflight and live revalidation is rejected, and fail closed if the provider
+        // is unreachable before starting motion.
+        let mode = source.mode_info().await;
+        if let Err(ref e) = mode {
+            return Err(ArmError::Detailed {
+                status: 503,
+                code: "DETECTION_UNAVAILABLE".into(),
+                message: format!("[vision_preflight] vision provider unreachable: {e}"),
+                details: Box::new(serde_json::json!({
+                    "failing_phase": "vision_preflight",
+                    "outcome": "infeasible",
+                })),
+            });
+        }
+        planned.mode = Some(mode);
     }
-    let verdict = match &mode {
-        Ok(m) => request.requires.check(task, m),
-        Err(_) => Ok(()),
-    };
-    planned.mode = Some(mode);
-    verdict.map_err(task_unsupported)
+    if let Some(pa) = planned.adaptive.as_mut() {
+        pa.expected_generation = planned
+            .mode
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
+            .and_then(|m| m.models.as_ref())
+            .map(|pm| pm.generation);
+    }
+    Ok(())
 }
 
 /// `POST /api/models`, then `/api/mode` polled until the provider published the returned
@@ -3273,27 +3552,44 @@ pub async fn dry_run(supervisor: &Arc<ArmSupervisor>, body: &Value) -> (bool, Op
 /// request's task has requirements or models, none otherwise; never a model switch. The task
 /// result does not change `reachable`.
 pub async fn dry_run_task(supervisor: &Arc<ArmSupervisor>, source: &dyn DetectionSource, body: &Value) -> DryRun {
-    let (reachable, code, message, request, adaptive) = dry_run_plan(supervisor, body).await;
+    let (mut reachable, mut code, mut message, request, mut adaptive) = dry_run_plan(supervisor, body).await;
+    let is_adaptive = adaptive.is_some();
     let task = match request {
         Some((Some(name), requires, models)) => Some(if requires.is_empty() && models.is_none() {
             (true, None)
         } else {
             match source.mode_info().await {
                 Ok(m) => task_verdict(&name, &requires, models.as_ref(), &m),
+                Err(e) if is_adaptive => (false, Some(format!("vision provider unreachable: {e}"))),
                 Err(_) => (true, None),
             }
         }),
         _ => None,
     };
+    if is_adaptive {
+        if let Some((false, ref reason)) = task {
+            let is_unreach = reason.as_deref().is_some_and(|r| r.starts_with("vision provider unreachable:"));
+            let err_code = if is_unreach { "DETECTION_UNAVAILABLE" } else { TASK_UNSUPPORTED };
+            let phase = if is_unreach { "vision_preflight" } else { "task" };
+            reachable = false;
+            code = Some(err_code.to_string());
+            message = reason.clone();
+            if let Some(Value::Object(ref mut obj)) = adaptive {
+                obj.insert("outcome".into(), serde_json::json!("infeasible"));
+                obj.insert("failing_phase".into(), serde_json::json!(phase));
+            }
+        }
+    }
     DryRun { reachable, code, message, task, adaptive }
 }
 
 /// Dry-run verdict: (reachable, code, message, (task, requires, models) when the request parsed,
 /// the adaptive selection reply when `strategy` is `"adaptive"`).
 ///
-/// Read-only planning/selection path (acquires only a read lock on `SupervisorInner` and runs
-/// off-lock in `spawn_blocking`): never starts motion or actuator output, so no `Admitted` token
-/// is required; real execution of `strategy: "adaptive"` is unconditionally refused in [`prepare`].
+/// Read-only planning/selection path (acquires only a read lock on `SupervisorInner` on Legacy,
+/// or a lock-free [`crate::rt_core::requests::actions::ReadOnlySnapshot`] on `OWNER_EXECUTOR`,
+/// and runs off-lock in `spawn_blocking`): never starts motion or actuator output, so no
+/// `Admitted` token is required.
 type DryRunPlan = (bool, Option<String>, Option<String>, Option<(Option<String>, TaskRequires, Option<TaskModels>)>, Option<Value>);
 
 async fn dry_run_plan(supervisor: &Arc<ArmSupervisor>, body: &Value) -> DryRunPlan {
@@ -3305,52 +3601,141 @@ async fn dry_run_plan(supervisor: &Arc<ArmSupervisor>, body: &Value) -> DryRunPl
         Ok(s) => s,
         Err(e) => { let (r, c, m) = rejected(e.into()); return (r, c, m, None, None); }
     };
-    let pending_res = {
-        let inner = supervisor.inner().read().await;
-        prepare_any(&inner, body, inner.safety.epoch_id()).and_then(|p| {
-            let snap = match strategy {
-                crate::grasp_select::Strategy::Adaptive => Some(crate::grasp_select::capture(&inner, &p, body)?),
-                crate::grasp_select::Strategy::Legacy => None,
-            };
-            Ok((p, snap))
-        })
-    };
+    let pending_res: Result<(PendingGrasp, Option<Box<PendingAdaptive>>), ArmError> =
+        if supervisor.owner_mode() == crate::supervisor::OWNER_EXECUTOR {
+            // Lease-free read-only snapshot on RT Executor (0 SupervisorLock, no AdmissionStamp).
+            match crate::rt_core::requests::actions::ReadOnlySnapshot::capture(supervisor).await {
+                Ok(ro) => prepare_from_read_only(&ro, body, strategy).map(|mut p| {
+                    let pa = p.adaptive.take();
+                    (p, pa)
+                }),
+                Err(e) => Err(e),
+            }
+        } else {
+            let inner = supervisor.inner().read().await;
+            prepare_any(&inner, body, inner.safety.epoch_id()).and_then(|p| {
+                let pa = match strategy {
+                    crate::grasp_select::Strategy::Adaptive => {
+                        let snap = crate::grasp_select::capture(&inner, &p, body)?;
+                        let g_idx = inner.config.gripper_index().ok_or_else(|| {
+                            ArmError::from(MotionError::Unsupported("Grasp needs a gripper joint".into()))
+                        })?;
+                        let gripper_policy = inner.config.gripper_policy.clone().ok_or_else(|| {
+                            ArmError::from(MotionError::Unsupported("Grasp needs a gripper policy".into()))
+                        })?;
+                        let gripper_limit = inner.config.limits.get(g_idx).cloned().ok_or_else(|| {
+                            ArmError::from(MotionError::Unsupported("Grasp needs a gripper joint limit".into()))
+                        })?;
+                        let revisions = crate::grasp_select::AdaptiveRevisions {
+                            workspace_revision: inner.workspace_revision,
+                            calibration_revision: inner.calibration_revision,
+                            grasp_setup_revision: inner.grasp_setup_revision,
+                            gripper_calib_revision: inner.gripper_calib_revision,
+                            power_budget_revision: inner.power_budget_revision,
+                        };
+                        Some(Box::new(PendingAdaptive {
+                            snapshot: snap,
+                            start_positions: inner.commanded_positions.clone(),
+                            revisions,
+                            gripper_policy,
+                            gripper_limit,
+                            close_speed_limit: inner.gripper_close_speed_limit(),
+                            has_gravity_model: inner.config.gravity_model.is_some(),
+                        }))
+                    }
+                    crate::grasp_select::Strategy::Legacy => None,
+                };
+                Ok((p, pa))
+            })
+        };
     match pending_res {
-        Ok((pending, snap)) => {
+        Ok((pending, pa)) => {
             let task = Some((pending.request.task.clone(), pending.request.requires, pending.request.models.clone()));
             let joined = tokio::task::spawn_blocking(move || {
                 let legacy = plan(pending).map(|_| ());
-                let selection = snap.map(|s| { let sel = crate::grasp_select::select(&s); let v = sel.to_json(&s); (sel.reachable(), sel.code, sel.message, v) });
-                (legacy, selection)
+                let adaptive_sel = pa.map(|pa| {
+                    let sel = crate::grasp_select::select_adaptive_route(
+                        &pa.snapshot,
+                        &pa.gripper_policy,
+                        &pa.gripper_limit,
+                        pa.close_speed_limit,
+                        pa.has_gravity_model,
+                    );
+                    (pa.snapshot, sel)
+                });
+                (legacy, adaptive_sel)
             }).await;
             match joined {
                 Ok((legacy, None)) => {
                     let (reachable, code, message) = match legacy { Ok(()) => (true, None, None), Err(e) => rejected(e) };
                     (reachable, code, message, task, None)
                 }
-                Ok((legacy, Some((reachable, code, message, mut v)))) => {
+                Ok((legacy, Some((snap, sel)))) => {
                     let (lr, lc, lm) = match legacy { Ok(()) => (true, None, None), Err(e) => rejected(e) };
+                    let mut v = sel.to_json(&snap, Some((lr, lc.as_deref(), lm.as_deref())));
                     v["legacy"] = serde_json::json!({"reachable": lr, "code": lc, "message": lm});
+                    let reachable = sel.reachable();
+                    let code = sel.selection.code;
+                    let message = sel.selection.message;
                     (reachable, code, message, task, Some(v))
                 }
                 Err(e) => (false, Some("INTERNAL".into()), Some(format!("planner task failed: {e}")), task, None),
             }
         }
         Err(e) => {
+            let failing_phase = match &e {
+                ArmError::Detailed { details, .. } => details
+                    .get("failing_phase")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                _ => None,
+            };
             let (reachable, code, message) = rejected(e);
-            (reachable, code, message, None, None)
+            let adaptive = (strategy == crate::grasp_select::Strategy::Adaptive).then(|| {
+                serde_json::json!({
+                    "strategy": "adaptive",
+                    "outcome": "infeasible",
+                    "failing_phase": failing_phase.as_deref().unwrap_or("request"),
+                })
+            });
+            (reachable, code, message, None, adaptive)
         }
     }
 }
 
 /// Build the A7 [`BeginMacroSpec`] for a planned `grasp` macro (shared by Legacy and RT Executor).
+/// For `strategy: "adaptive"`, builds P's [`crate::grasp_select::SelectedGraspMacro`] directly
+/// from the authoritative [`crate::grasp_select::AdaptiveRoute`].
 pub fn begin_macro_spec(
     planned: &PlannedGrasp,
     prepared_boot: crate::rt_core::broker::BootId,
     dof: usize,
     gripper_idx: Option<usize>,
     deadline: Instant,
-) -> crate::rt_core::requests::actions::BeginMacroSpec {
+) -> Result<crate::rt_core::requests::actions::BeginMacroSpec, ArmError> {
+    if let Some(pa) = &planned.adaptive {
+        let m = pa
+            .route
+            .into_selected_macro(
+                prepared_boot,
+                &pa.start_positions,
+                deadline,
+                planned.request.tag.as_deref(),
+                planned.request.task.as_deref(),
+                pa.revisions,
+                0,
+            )
+            .map_err(|code| ArmError::Detailed {
+                status: 400,
+                code: code.into(),
+                message: format!("[begin] failed to construct adaptive BeginMacroSpec: {code}"),
+                details: Box::new(serde_json::json!({
+                    "failing_phase": "begin",
+                    "outcome": "infeasible",
+                })),
+            })?;
+        return Ok(m.begin);
+    }
     use crate::rt_core::requests::actions::{BeginMacroSpec, MacroKind};
     let mut start = vec![0.0f32; dof];
     let arm_dof = planned.input.arm.arm_dof().min(dof).min(6);
@@ -3373,7 +3758,7 @@ pub fn begin_macro_spec(
     if let Some(task) = planned.request.task.as_deref() {
         spec.task = crate::model::HolderLabel::new(task);
     }
-    spec
+    Ok(spec)
 }
 
 /// Begin a planned grasp under a short write lock through the single owner-side
@@ -3396,18 +3781,19 @@ pub fn begin_with_stamp(
         inner.config.dof,
         inner.config.gripper_index(),
         deadline,
-    );
+    )?;
+    let adaptive_rev = planned.adaptive.as_ref().map(|pa| pa.revisions);
     let action_stamp = ActionStamp {
         arm: inner.core.id(),
         boot: inner.boot_id,
         admission: stamp,
-        config_revision: planned.input.workspace_revision,
-        calibration_revision: None,
+        config_revision: adaptive_rev.map_or(planned.input.workspace_revision, |r| r.workspace_revision),
+        calibration_revision: adaptive_rev.map(|r| r.calibration_revision),
         poses_revision: None,
         sequences_revision: None,
-        grasp_setup_revision: None,
-        gripper_calib_revision: None,
-        power_budget_revision: None,
+        grasp_setup_revision: adaptive_rev.map(|r| r.grasp_setup_revision),
+        gripper_calib_revision: adaptive_rev.map(|r| r.gripper_calib_revision),
+        power_budget_revision: adaptive_rev.map(|r| r.power_budget_revision),
         parent_generation: 0,
         deadline: Instant::now() + DEFAULT_ACTION_DEADLINE,
     };
@@ -3421,8 +3807,12 @@ pub fn begin_with_stamp(
         planned.request.task.clone(),
     )
     .map_err(|r| r.into_arm_error(inner))?;
-    let duration = expected_duration(&planned)
-        + inner.approach_estimate_s("grasp_final", planned.request.approach);
+    let duration = if planned.adaptive.is_some() {
+        expected_duration(&planned)
+    } else {
+        expected_duration(&planned)
+            + inner.approach_estimate_s("grasp_final", planned.request.approach)
+    };
     spawn_with_deadline(supervisor.clone(), source, id, planned, stamp, deadline);
     Ok((id, duration))
 }
@@ -3432,6 +3822,9 @@ pub fn begin_with_stamp(
 pub fn begin(admitted: crate::supervisor::Admitted<'_>, supervisor: &Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, planned: PlannedGrasp) -> Result<(u64, f64), ArmError> {
     let deadline = Instant::now() + Duration::from_secs_f64(planned.request.setup.timeout_s);
     let (inner, proof) = admitted.consume()?;
+    if planned.adaptive.is_some() {
+        inner.j7_admitted_stamp = None;
+    }
     let stamp = proof.stamp();
     let spec = begin_macro_spec(
         &planned,
@@ -3439,9 +3832,16 @@ pub fn begin(admitted: crate::supervisor::Admitted<'_>, supervisor: &Arc<ArmSupe
         inner.config.dof,
         inner.config.gripper_index(),
         deadline,
-    );
-    let duration = expected_duration(&planned) + inner.approach_estimate_s("grasp_final", planned.request.approach);
-    let ws_rev = planned.input.workspace_revision;
+    )?;
+    let duration = if planned.adaptive.is_some() {
+        expected_duration(&planned)
+    } else {
+        expected_duration(&planned) + inner.approach_estimate_s("grasp_final", planned.request.approach)
+    };
+    let ws_rev = planned
+        .adaptive
+        .as_ref()
+        .map_or(planned.input.workspace_revision, |pa| pa.revisions.workspace_revision);
     let id = crate::rt_core::requests::actions::install_begin_macro_with_proof(
         inner,
         &proof,
@@ -3499,35 +3899,40 @@ pub async fn begin_executor(
         .map_or((planned.input.limits.len(), planned.input.limits.len().checked_sub(1)), |e| {
             (e.config.dof, e.config.gripper_index())
         });
-    let mut spec = begin_macro_spec(&planned, boot, dof, gripper_idx, deadline);
+    let mut spec = begin_macro_spec(&planned, boot, dof, gripper_idx, deadline)?;
     spec.admission_request_id = stamp.request_id;
+    let adaptive_rev = planned.adaptive.as_ref().map(|pa| pa.revisions);
     let action_stamp = ActionStamp {
         arm,
         boot,
         admission: stamp,
-        config_revision: planned.input.workspace_revision,
-        calibration_revision: None,
+        config_revision: adaptive_rev.map_or(planned.input.workspace_revision, |r| r.workspace_revision),
+        calibration_revision: adaptive_rev.map(|r| r.calibration_revision),
         poses_revision: None,
         sequences_revision: None,
-        grasp_setup_revision: None,
-        gripper_calib_revision: None,
-        power_budget_revision: None,
+        grasp_setup_revision: adaptive_rev.map(|r| r.grasp_setup_revision),
+        gripper_calib_revision: adaptive_rev.map(|r| r.gripper_calib_revision),
+        power_budget_revision: adaptive_rev.map(|r| r.power_budget_revision),
         parent_generation: 0,
         deadline: now + DEFAULT_ACTION_DEADLINE,
     };
     let (id, _req_id) =
         crate::macro_action::begin_macro_executor(supervisor, &action_stamp, spec, action_stamp.deadline)
             .await?;
-    let approach_extra = supervisor
-        .hub()
-        .prep_env()
-        .and_then(|env| env.approach_plan("grasp_final", planned.request.approach).ok())
-        .map_or(0.0, |p| {
-            (1.875 * f64::from(p.policy.delta_rad()) / f64::from(p.policy.speed_rad_s))
-                .max(crate::backlash::MIN_SEGMENT_S)
-                + 0.5
-        });
-    let duration = expected_duration(&planned) + approach_extra;
+    let duration = if planned.adaptive.is_some() {
+        expected_duration(&planned)
+    } else {
+        let approach_extra = supervisor
+            .hub()
+            .prep_env()
+            .and_then(|env| env.approach_plan("grasp_final", planned.request.approach).ok())
+            .map_or(0.0, |p| {
+                (1.875 * f64::from(p.policy.delta_rad()) / f64::from(p.policy.speed_rad_s))
+                    .max(crate::backlash::MIN_SEGMENT_S)
+                    + 0.5
+            });
+        expected_duration(&planned) + approach_extra
+    };
     spawn_with_deadline(supervisor.clone(), source, id, planned, stamp, deadline);
     Ok((id, duration))
 }
@@ -3778,6 +4183,1143 @@ impl Orchestrator {
                 return Err(fail("TARGET_LOST", format!("Target '{}' not seen for {unmatched} frames / {:.1} s", tracker.label, started.elapsed().as_secs_f64())));
             }
         }
+    }
+
+    /// Dispatches either Phase B adaptive execution or legacy visual-servo execution.
+    async fn run_selected(&self, planned: &PlannedGrasp) -> Result<(bool, Option<f32>), Stop> {
+        if let Some(pa) = planned.adaptive.as_ref() {
+            self.run_adaptive(planned, pa).await
+        } else {
+            self.run(planned).await
+        }
+    }
+
+    fn check_adaptive_revisions(
+        phase: &str,
+        env: &crate::rt_core::requests::actions::ActionPrepEnv,
+        rev: crate::grasp_select::AdaptiveRevisions,
+    ) -> Result<(), Stop> {
+        if env.calibration_revision != rev.calibration_revision {
+            return Err(fail(
+                "CALIBRATION_CHANGED",
+                format!("[{phase}] calibration changed during adaptive grasp"),
+            ));
+        }
+        if env.workspace_revision != rev.workspace_revision
+            || env.grasp_setup_revision != rev.grasp_setup_revision
+            || env.gripper_calib_revision != rev.gripper_calib_revision
+            || env.power_budget_revision != rev.power_budget_revision
+        {
+            return Err(fail(
+                "PLAN_STALE",
+                format!("[{phase}] configuration changed during adaptive grasp"),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn adaptive_snapshot_fenced(
+        &self,
+        phase: &str,
+        rev: crate::grasp_select::AdaptiveRevisions,
+    ) -> Result<crate::rt_core::requests::actions::ActionSnapshot, Stop> {
+        let snap = self.ctx.snapshot(self.deadline).await?;
+        Self::check_adaptive_revisions(phase, &snap.env, rev)?;
+        Ok(snap)
+    }
+
+    /// Coherent, revision-fenced, epoch-checked, freshness-verified measured joint state and TCP
+    /// pose on both Legacy and RT Executor owners (0 `SupervisorLock` on `OWNER_EXECUTOR`).
+    /// Never falls back silently to commanded FK when physical driver feedback is stale or missing.
+    async fn measured_state_fenced(
+        &self,
+        phase: &str,
+        rev: crate::grasp_select::AdaptiveRevisions,
+    ) -> Result<(Vec<f32>, Pose), Stop> {
+        if self.is_executor() {
+            let Some(env) = self.sup.hub().prep_env() else {
+                return Err(fail("OBSERVATION_UNAVAILABLE", format!("[{phase}] no published planning environment")));
+            };
+            Self::check_adaptive_revisions(phase, &env, rev)?;
+            let Some(snap) = self.sup.hub().latest() else {
+                return Err(fail("OBSERVATION_UNAVAILABLE", format!("[{phase}] no published telemetry snapshot")));
+            };
+            if snap.rt.owner.authority.epoch != self.ctx.stamp.estop_epoch {
+                return Err(Stop::Cancelled);
+            }
+            if !snap.rt.owner.macro_state.alive || snap.rt.owner.macro_state.active_id != self.id {
+                return Err(Stop::Cancelled);
+            }
+            if env.driver_present {
+                let now = Instant::now();
+                let fresh = !snap.rt.feedback_instants.is_empty()
+                    && snap.rt.feedback_instants.iter().all(|t| {
+                        t.is_some_and(|ts| now.saturating_duration_since(ts) <= Duration::from_millis(250))
+                    });
+                if !fresh {
+                    return Err(fail(
+                        "FEEDBACK_STALE",
+                        format!("[{phase}] measured joint feedback is stale or unavailable"),
+                    ));
+                }
+            }
+            if snap.rt.positions.iter().any(|v| !v.is_finite()) {
+                return Err(fail(
+                    "FEEDBACK_STALE",
+                    format!("[{phase}] measured joint positions contain non-finite values"),
+                ));
+            }
+            let Some(end) = env.config.arm_model.fk_f32(&snap.rt.positions) else {
+                return Err(fail(
+                    "OBSERVATION_UNAVAILABLE",
+                    format!("[{phase}] cannot compute measured FK"),
+                ));
+            };
+            Ok((snap.rt.positions.clone(), motion::end_to_tcp(&end, &self.tcp_offset)))
+        } else {
+            let inner = self.sup.inner().read().await;
+            if !inner.macro_alive(self.id) || inner.safety.epoch_id() != self.ctx.stamp.estop_epoch {
+                return Err(Stop::Cancelled);
+            }
+            if inner.calibration_revision != rev.calibration_revision {
+                return Err(fail("CALIBRATION_CHANGED", format!("[{phase}] calibration changed during adaptive grasp")));
+            }
+            if inner.workspace_revision != rev.workspace_revision
+                || inner.grasp_setup_revision != rev.grasp_setup_revision
+                || inner.gripper_calib_revision != rev.gripper_calib_revision
+                || inner.power_budget_revision != rev.power_budget_revision
+            {
+                return Err(fail("PLAN_STALE", format!("[{phase}] configuration changed during adaptive grasp")));
+            }
+            if inner.driver.is_some() && !inner.hardware_feedback_fresh(Duration::from_millis(250)) {
+                return Err(fail(
+                    "FEEDBACK_STALE",
+                    format!("[{phase}] measured hardware feedback is stale or unavailable"),
+                ));
+            }
+            if inner.measured_positions.iter().any(|v| !v.is_finite()) {
+                return Err(fail(
+                    "FEEDBACK_STALE",
+                    format!("[{phase}] measured joint positions contain non-finite values"),
+                ));
+            }
+            let Some(end) = inner.config.arm_model.fk_f32(&inner.measured_positions) else {
+                return Err(fail(
+                    "OBSERVATION_UNAVAILABLE",
+                    format!("[{phase}] cannot compute measured FK"),
+                ));
+            };
+            Ok((inner.measured_positions.clone(), motion::end_to_tcp(&end, &self.tcp_offset)))
+        }
+    }
+
+    /// Strict post-settle vision revalidation for Phase B adaptive grasps:
+    /// - Enforces strict `model_generation` equality when the provider reports generations
+    ///   (`DETECTION_UNAVAILABLE` on mismatch or omission).
+    /// - Rejects stale/cached frames (`frame_id <= after`, `captured_at < not_before`,
+    ///   `policy_captured_at < not_before`, and in stream mode without `age_ms`, requires a
+    ///   strictly newer frame past a post-settle barrier frame).
+    /// - Verifies target label, rejects ambiguous same-label duplicates, checks pixel error,
+    ///   base-frame XY displacement on the target mid-plane, projected box area ratio, and
+    ///   orientation consistency (contour principal axis / angle / elongated box aspect).
+    #[allow(clippy::too_many_arguments)]
+    async fn fresh_match_adaptive(
+        &self,
+        phase: &str,
+        label: &str,
+        route: &crate::grasp_select::AdaptiveRoute,
+        expected_gen: &mut Option<u64>,
+        pose_end: &Pose,
+        since: Instant,
+        after: &mut Option<u64>,
+    ) -> Result<Detection, Stop> {
+        let s = &self.setup;
+        let z_mid = route.target_table_z + (route.target_height[0] + route.target_height[1]) / 4.0;
+        let target_mid = [route.target_centroid[0], route.target_centroid[1], z_mid];
+        let Some(pred_px) = self.cam.project(pose_end, &target_mid) else {
+            return Err(fail(
+                "TARGET_LOST",
+                format!("[{phase}] expected target centre is behind the camera"),
+            ));
+        };
+        if !(pred_px[0] >= 0.0
+            && pred_px[0] <= self.cam.size[0]
+            && pred_px[1] >= 0.0
+            && pred_px[1] <= self.cam.size[1])
+        {
+            return Err(fail(
+                "TARGET_LOST",
+                format!("[{phase}] expected target centre projects outside the camera view"),
+            ));
+        }
+
+        // Expected projected bounding box at `pose_end` from the planned target footprint.
+        let mut exp_min = [f64::INFINITY; 2];
+        let mut exp_max = [f64::NEG_INFINITY; 2];
+        let mut any_proj = false;
+        for z in [route.target_table_z, route.target_table_z + route.target_height[1]] {
+            for v in &route.target_poly {
+                if let Some(px) = self.cam.project(pose_end, &[v[0], v[1], z]) {
+                    exp_min[0] = exp_min[0].min(px[0]);
+                    exp_min[1] = exp_min[1].min(px[1]);
+                    exp_max[0] = exp_max[0].max(px[0]);
+                    exp_max[1] = exp_max[1].max(px[1]);
+                    any_proj = true;
+                }
+            }
+        }
+        let (exp_w, exp_h, exp_area, focus_box) = if any_proj {
+            let w = (exp_max[0] - exp_min[0]).max(1.0);
+            let h = (exp_max[1] - exp_min[1]).max(1.0);
+            let lo = self.cam.to_norm([exp_min[0].clamp(0.0, self.cam.size[0]), exp_min[1].clamp(0.0, self.cam.size[1])]);
+            let hi = self.cam.to_norm([exp_max[0].clamp(0.0, self.cam.size[0]), exp_max[1].clamp(0.0, self.cam.size[1])]);
+            (w, h, w * h, [lo[0], lo[1], hi[0], hi[1]])
+        } else {
+            let c = self.cam.to_norm(pred_px);
+            (0.0, 0.0, 0.0, [(c[0] - 0.08).clamp(0.0, 1.0), (c[1] - 0.08).clamp(0.0, 1.0), (c[0] + 0.08).clamp(0.0, 1.0), (c[1] + 0.08).clamp(0.0, 1.0)])
+        };
+
+        // Unified vision deadline matching `preflight_candidate_from_start::adaptive_vision_budget_s`.
+        let vision_budget_s = crate::grasp_select::adaptive_vision_budget_s(s);
+        let not_before = since + Duration::from_secs_f64(s.settle_delay_s.max(0.0));
+        let started = Instant::now();
+        let observe_until = (since + Duration::from_secs_f64(vision_budget_s)).min(self.deadline);
+        let mut unmatched = 0u32;
+        let mut stream_barrier_id: Option<u64> = None;
+
+        loop {
+            self.check().await?;
+            let now_pre = Instant::now();
+            if now_pre > observe_until {
+                return Err(fail(
+                    "TARGET_LOST",
+                    format!("[{phase}] vision revalidation budget ({vision_budget_s:.2} s) exceeded"),
+                ));
+            }
+            let source = self.source.clone();
+            let prev_id = *after;
+            let triggered = self.triggered;
+            let focus = MaskFocus {
+                label: Some(label.to_string()),
+                box_norm: focus_box,
+                ttl_ms: 2000,
+            };
+            let rem_ms = observe_until
+                .saturating_duration_since(now_pre)
+                .as_millis()
+                .clamp(1, TRIGGER_WAIT_MS as u128) as u64;
+            let get = async move {
+                if triggered {
+                    let wait = not_before.saturating_duration_since(Instant::now());
+                    if !wait.is_zero() {
+                        tokio::time::sleep(wait).await;
+                    }
+                    let trig_ms = observe_until
+                        .saturating_duration_since(Instant::now())
+                        .as_millis()
+                        .clamp(1, TRIGGER_WAIT_MS as u128) as u64;
+                    source
+                        .trigger_with_focus(GRASP_PIPELINES, trig_ms, Some(&focus))
+                        .await
+                } else {
+                    source.next_frame(prev_id, rem_ms.min(200)).await
+                }
+            };
+            let next = tokio::select! {
+                r = get => r,
+                _ = async {
+                    loop {
+                        tokio::time::sleep(POLL).await;
+                        if !self.alive().await || Instant::now() > observe_until {
+                            break;
+                        }
+                    }
+                } => {
+                    self.check().await?;
+                    return Err(fail(
+                        "TARGET_LOST",
+                        format!("[{phase}] no fresh detection frame within vision budget ({vision_budget_s:.2} s)"),
+                    ));
+                }
+            };
+            let mut frame = match next {
+                Ok(Some(frame)) => frame,
+                Ok(None) => {
+                    if Instant::now() > observe_until {
+                        return Err(fail(
+                            "TARGET_LOST",
+                            format!("[{phase}] no fresh detection frames arrived within {vision_budget_s:.2} s"),
+                        ));
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    return Err(fail(
+                        "DETECTION_UNAVAILABLE",
+                        format!("[{phase}] detection source failed: {e}"),
+                    ));
+                }
+            };
+            let now = Instant::now();
+            if now > observe_until {
+                return Err(fail(
+                    "TARGET_LOST",
+                    format!("[{phase}] detection frame arrived past vision budget ({vision_budget_s:.2} s)"),
+                ));
+            }
+
+            // Strict model generation provenance check (latching first observed generation if
+            // `/api/mode` reported none so mid-grasp model swaps are still caught).
+            if let Some(exp_g) = *expected_gen {
+                if frame.model_generation != Some(exp_g) {
+                    return Err(fail(
+                        "DETECTION_UNAVAILABLE",
+                        format!(
+                            "[{phase}] vision model generation changed (expected {exp_g}, got {:?})",
+                            frame.model_generation
+                        ),
+                    ));
+                }
+            } else {
+                if !self.same_models(&frame) {
+                    return Err(fail(
+                        "DETECTION_UNAVAILABLE",
+                        format!("[{phase}] vision model changed during adaptive grasp"),
+                    ));
+                }
+                if let Some(g) = frame.model_generation {
+                    *expected_gen = Some(g);
+                }
+            }
+
+            rescale_frame_to_cam(&mut frame, &self.cam);
+
+            // Monotonic frame ID check: never reuse the request frame or an earlier frame.
+            if prev_id.is_some_and(|a| frame.frame_id <= a) {
+                if now > observe_until {
+                    return Err(fail(
+                        "TARGET_LOST",
+                        format!("[{phase}] no new frame arrived after frame_id {} within {vision_budget_s:.2} s", prev_id.unwrap_or(0)),
+                    ));
+                }
+                tokio::time::sleep(POLL).await;
+                continue;
+            }
+            *after = Some(frame.frame_id);
+
+            // Freshness check: must be captured at or after settle deadline.
+            let stale_time = frame.captured_at < not_before
+                || frame.policy_captured_at.is_some_and(|pt| pt < not_before);
+            if stale_time {
+                if now > observe_until {
+                    return Err(fail(
+                        "TARGET_LOST",
+                        format!("[{phase}] no frame captured after settle within {vision_budget_s:.2} s"),
+                    ));
+                }
+                continue;
+            }
+            // In continuous stream mode without upstream `age_ms` (`policy_captured_at == None`),
+            // only arm the post-settle barrier AFTER `not_before` has elapsed and require a
+            // strictly newer frame past that barrier so pre-settle queued frames cannot pass.
+            if !self.triggered && frame.policy_captured_at.is_none() {
+                if now < not_before {
+                    continue;
+                }
+                match stream_barrier_id {
+                    None => {
+                        stream_barrier_id = Some(frame.frame_id);
+                        if now > observe_until {
+                            return Err(fail(
+                                "TARGET_LOST",
+                                format!("[{phase}] no post-settle stream frame arrived within {vision_budget_s:.2} s"),
+                            ));
+                        }
+                        continue;
+                    }
+                    Some(b_id) if frame.frame_id <= b_id => {
+                        if now > observe_until {
+                            return Err(fail(
+                                "TARGET_LOST",
+                                format!("[{phase}] stream frame did not advance past settle barrier within {vision_budget_s:.2} s"),
+                            ));
+                        }
+                        continue;
+                    }
+                    Some(_) => {}
+                }
+            }
+
+            // Collect same-label candidates within `acquire_dist_px` of expected projection.
+            let mut matches: Vec<(&Detection, [f64; 2], f64)> = frame
+                .detections
+                .iter()
+                .filter(|d| d.label.eq_ignore_ascii_case(label))
+                .filter(|d| d.box_norm.iter().all(|v| v.is_finite()) && d.box_norm[2] > d.box_norm[0] && d.box_norm[3] > d.box_norm[1])
+                .map(|d| {
+                    let c = self.cam.to_px(box_centre(&d.box_norm));
+                    let dist = (c[0] - pred_px[0]).hypot(c[1] - pred_px[1]);
+                    (d, c, dist)
+                })
+                .filter(|(_, _, dist)| *dist <= s.acquire_dist_px)
+                .collect();
+
+            if matches.is_empty() {
+                unmatched += 1;
+                if unmatched >= s.lost_frames || now > observe_until {
+                    return Err(fail(
+                        "TARGET_LOST",
+                        format!("[{phase}] target '{label}' not seen for {unmatched} frames / {:.1} s", started.elapsed().as_secs_f64()),
+                    ));
+                }
+                continue;
+            }
+            matches.sort_by(|a, b| a.2.total_cmp(&b.2).then(b.0.score.total_cmp(&a.0.score)));
+            let (best, best_c, best_dist) = matches[0];
+
+            // Unconditionally reject ambiguous duplicate same-label detection inside dup_gate.
+            let dup_gate = s.match_dist_px.max(s.recheck_tol_px);
+            if let Some((_, _, second_dist)) = matches.get(1).copied() {
+                if second_dist <= dup_gate {
+                    return Err(fail(
+                        "TARGET_DISPLACED",
+                        format!("[{phase}] ambiguous duplicate '{label}' detection at {:.1} px vs {:.1} px", best_dist, second_dist),
+                    ));
+                }
+            }
+
+            // Pixel recheck tolerance.
+            if best_dist > s.recheck_tol_px {
+                return Err(fail(
+                    "TARGET_DISPLACED",
+                    format!("[{phase}] target '{label}' shifted {best_dist:.1} px (recheck_tol_px {:.1})", s.recheck_tol_px),
+                ));
+            }
+
+            // Base-frame XY displacement strictly bounded by the selected candidate's opening reserve.
+            if let Some(meas_pt) = self.cam.plane_point(pose_end, best_c, z_mid) {
+                let dxy = (meas_pt[0] - route.target_centroid[0])
+                    .hypot(meas_pt[1] - route.target_centroid[1]);
+                let xy_tol = route.opening_reserve_m.clamp(0.005, 0.015);
+                if dxy > xy_tol {
+                    return Err(fail(
+                        "TARGET_DISPLACED",
+                        format!("[{phase}] target '{label}' moved {dxy:.3} m on table (tol {xy_tol:.3} m)"),
+                    ));
+                }
+            }
+
+            // Projected bounding box area sanity check.
+            let meas_w = ((best.box_norm[2] - best.box_norm[0]) * self.cam.size[0]).max(1.0);
+            let meas_h = ((best.box_norm[3] - best.box_norm[1]) * self.cam.size[1]).max(1.0);
+            let meas_area = meas_w * meas_h;
+            if exp_area > 16.0 {
+                let ratio = meas_area / exp_area;
+                if !(0.40..=2.20).contains(&ratio) {
+                    return Err(fail(
+                        "TARGET_DISPLACED",
+                        format!("[{phase}] target '{label}' projected area ratio {ratio:.2} outside [0.40, 2.20]"),
+                    ));
+                }
+            }
+
+            // Orientation consistency when target long axis is non-ambiguous (tightened to 12 deg).
+            if !route.target_axis_ambiguous {
+                let exp_axis = route.target_axis;
+                let axis_angle_deg = |obs: [f64; 2]| -> f64 {
+                    let c = (obs[0] * exp_axis[0] + obs[1] * exp_axis[1]).abs().clamp(0.0, 1.0);
+                    c.acos().to_degrees()
+                };
+                if let Some(Ok(ref pts)) = best.contour_norm {
+                    if pts.len() >= 3 {
+                        let world_pts: Option<Vec<[f64; 2]>> = pts
+                            .iter()
+                            .map(|v| self.cam.plane_point(pose_end, self.cam.to_px(*v), z_mid).map(|p| [p[0], p[1]]))
+                            .collect();
+                        if let Some(wpts) = world_pts {
+                            let (obs_axis, obs_ratio) = crate::grasp_select::geometry::principal_axis(&wpts);
+                            if obs_ratio >= 1.15 {
+                                let deg = axis_angle_deg(obs_axis);
+                                if deg > 12.0 {
+                                    return Err(fail(
+                                        "TARGET_DISPLACED",
+                                        format!("[{phase}] target '{label}' contour rotated by {deg:.1} deg (limit 12.0 deg)"),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                } else if let (Some(a_deg), Some(conf)) = (best.angle_deg, best.angle_conf) {
+                    if conf >= s.align_min_angle_conf {
+                        let (ca, sa) = (a_deg.to_radians().cos(), a_deg.to_radians().sin());
+                        if let (Some(p0), Some(p1)) = (
+                            self.cam.plane_point(pose_end, best_c, z_mid),
+                            self.cam.plane_point(pose_end, [best_c[0] + 20.0 * ca, best_c[1] + 20.0 * sa], z_mid),
+                        ) {
+                            let obs_axis = crate::grasp_select::geometry::unit2([p1[0] - p0[0], p1[1] - p0[1]]);
+                            let deg = axis_angle_deg(obs_axis);
+                            if deg > 12.0 {
+                                return Err(fail(
+                                    "TARGET_DISPLACED",
+                                    format!("[{phase}] target '{label}' orientation rotated by {deg:.1} deg (limit 12.0 deg)"),
+                                ));
+                            }
+                        }
+                    }
+                } else if route.has_oriented_evidence && exp_w > 1.0 && exp_h > 1.0 {
+                    let exp_elong = exp_w.max(exp_h) / exp_w.min(exp_h);
+                    if exp_elong >= 1.4 {
+                        let ratio = (meas_w / meas_h) / (exp_w / exp_h);
+                        if (ratio - 1.0).abs() > 0.30 {
+                            return Err(fail(
+                                "TARGET_DISPLACED",
+                                format!("[{phase}] target '{label}' box aspect shifted by {:.0}% (limit 30%)", (ratio - 1.0).abs() * 100.0),
+                            ));
+                        }
+                    }
+                }
+            }
+
+            return Ok(best.clone());
+        }
+    }
+
+    /// Best-effort safe straight-line TCP withdrawal along `-insertion_dir` back to `pregrasp`
+    /// without changing J7 (closed-jaw after `NOT_HOLDING`, open-jaw after early `COLLISION`).
+    /// Never moves blindly: rechecks table/workspace/branch from a fresh fenced snapshot and holds
+    /// safely in place if withdrawal is unsafe. Always propagates `Stop::Cancelled`.
+    async fn adaptive_withdraw(
+        &self,
+        phase: &str,
+        route: &crate::grasp_select::AdaptiveRoute,
+        rev: crate::grasp_select::AdaptiveRevisions,
+    ) -> Result<(), Stop> {
+        if !self.alive().await {
+            return Err(Stop::Cancelled);
+        }
+        let snap = match self.adaptive_snapshot_fenced(phase, rev).await {
+            Ok(s) => s,
+            Err(Stop::Cancelled) => return Err(Stop::Cancelled),
+            Err(e) => {
+                tracing::warn!("Adaptive grasp {}: skipping withdrawal ({e:?})", self.id);
+                return Ok(());
+            }
+        };
+        let input = match snap.plan_input_in(GoalFrame::Tcp) {
+            Ok(i) => i,
+            Err(e) => {
+                tracing::warn!("Adaptive grasp {}: withdrawal plan_input failed ({e:?}), holding in place", self.id);
+                return Ok(());
+            }
+        };
+        let cur_tcp = motion::end_to_tcp(&input.arm.fk(&input.q0), &self.tcp_offset);
+        // Fixed-orientation straight TCP translation strictly along `-insertion_dir` from the
+        // actual pose (never introducing lateral scrape or wrist rotation near the object).
+        let retreat_along = kinematics::dot(
+            &kinematics::sub(&cur_tcp.p, &route.plan.pregrasp.p),
+            &route.plan.insertion_dir,
+        )
+        .clamp(0.0, route.plan.insertion_m + 0.01);
+        if retreat_along < 1e-3 {
+            return Ok(());
+        }
+        let withdraw_goal = Pose::new(
+            cur_tcp.r,
+            kinematics::sub(
+                &cur_tcp.p,
+                &route.plan.insertion_dir.map(|x| x * retreat_along),
+            ),
+        );
+        let q_pre_ref = route.plan.q_pregrasp;
+        let speed = Speed { linear: route.insert_mps, angular: motion::DEFAULT_ANGULAR_RPS };
+        let env_pts = self.envelope.clone();
+        let table_bound_z = self.setup.table_z_m + TABLE_CLEARANCE_M;
+        let planned = tokio::task::spawn_blocking(move || {
+            let path = motion::plan_cartesian_opts(&input, withdraw_goal, speed, motion::PathOpts::default())?;
+            crate::backlash::check_table_clear(
+                &input.arm,
+                &env_pts,
+                table_bound_z,
+                path.q.iter().map(|q| q.as_slice()),
+            )
+            .map_err(|v| v.into_motion_error())?;
+            let q_end: [f64; 6] = std::array::from_fn(|i| f64::from(path.last()[i]));
+            let jd = crate::grasp_select::feasibility::max_joint_diff(
+                &q_end,
+                &q_pre_ref,
+                input.arm.arm_dof(),
+            );
+            if jd > crate::grasp_select::feasibility::BRANCH_CONSISTENCY_TOL_RAD {
+                let joint = (0..input.arm.arm_dof().min(6))
+                    .max_by(|&a, &b| (q_end[a] - q_pre_ref[a]).abs().total_cmp(&(q_end[b] - q_pre_ref[b]).abs()))
+                    .unwrap_or(0);
+                return Err(MotionError::IkBranchFlip {
+                    s: 1.0,
+                    joint,
+                    dq: jd,
+                    yaw_off_deg: None,
+                });
+            }
+            Ok((input, path))
+        })
+        .await;
+        let (input, path) = match planned {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(e)) => {
+                tracing::warn!("Adaptive grasp {}: withdrawal unsafe ({e}), holding safely in place", self.id);
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::warn!("Adaptive grasp {}: withdrawal planner join error ({e}), holding in place", self.id);
+                return Ok(());
+            }
+        };
+        let remaining_s = self.deadline.saturating_duration_since(Instant::now()).as_secs_f64();
+        if path.duration + 0.5 > self.setup.phase_timeout_s || path.duration + 0.5 > remaining_s {
+            tracing::warn!("Adaptive grasp {}: withdrawal exceeds remaining budget, holding safely in place", self.id);
+            return Ok(());
+        }
+        match self
+            .ctx
+            .install_adaptive_path_child(phase, &snap, &input, withdraw_goal, path, rev, None)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err((Stop::Cancelled, _)) => Err(Stop::Cancelled),
+            Err((e, _)) => {
+                tracing::warn!("Adaptive grasp {}: withdrawal child failed ({e:?}), holding safely in place", self.id);
+                Ok(())
+            }
+        }
+    }
+
+    /// Phase B adaptive grasp orchestrator (both `OWNER_LEGACY` and `OWNER_EXECUTOR`, 0
+    /// `SupervisorLock` on `OWNER_EXECUTOR`).
+    ///
+    /// Executes the preflighted [`crate::grasp_select::AdaptiveRoute`]:
+    /// 0. `revalidate_start`: fresh post-settle vision check at start pose.
+    /// 1. `pregrasp` + `pre_open`: Cartesian or swept-joint verbatim `JointPath` (J7 locked,
+    ///    never `yaw_outward`), then J7 intent `pre_open`.
+    /// 2. `revalidate` + `insert`: recheck target identity/pose/orientation when visible, verify
+    ///    pregrasp pose & IK branch, straight TCP line along `insertion_dir` at fixed orientation
+    ///    with optional J2/J3 contact guard. Early contact outside `contact_window_m` triggers
+    ///    safe open-jaw withdrawal (or safe hold) and returns `COLLISION`.
+    /// 3. `close` -> `separation` -> `lift` -> `lift_confirm`: J7 pos-force close; `NOT_HOLDING`
+    ///    triggers closed-jaw withdrawal along `-insertion_dir` (never opens jaws at contact);
+    ///    loaded `separation` and `lift` recheck swept carried-object OBB SAT; `lift_confirm`
+    ///    settles with live revision fencing and NO automatic regrip retry (`DROPPED`).
+    async fn run_adaptive(
+        &self,
+        planned: &PlannedGrasp,
+        pa: &PlannedAdaptive,
+    ) -> Result<(bool, Option<f32>), Stop> {
+        use crate::grasp_select::feasibility::{
+            max_joint_diff, plan_swept_joint_path,
+            BRANCH_CONSISTENCY_TOL_RAD, SEPARATION_M,
+        };
+        use crate::grasp_select::{
+            visible_at_pose, PregraspMode, CONTACT_LATERAL_TOL_M, CONTACT_ROT_TOL_RAD,
+        };
+
+        let route = &pa.route;
+        let rev = pa.revisions;
+        let s = &self.setup;
+        let table_bound_z = s.table_z_m + TABLE_CLEARANCE_M;
+        let z_mid = route.target_table_z + (route.target_height[0] + route.target_height[1]) / 4.0;
+        let mut expected_gen = pa.expected_generation.or(self.generation);
+        let mut after = planned.request.frame_id;
+
+        // ---- Stage 0: Revalidate target at start pose (with coherent measured start check) ----
+        self.phase("revalidate_start", 0.05).await?;
+        let snap0 = self.adaptive_snapshot_fenced("revalidate_start", rev).await?;
+        for (a, b) in snap0.commanded_positions.iter().zip(pa.start_positions.iter()) {
+            if (a - b).abs() > 0.01 {
+                return Err(fail(
+                    "PLAN_STALE",
+                    "[revalidate_start] arm moved away from planned start pose before execution",
+                ));
+            }
+        }
+        let (meas0, _) = self.measured_state_fenced("revalidate_start", rev).await?;
+        let arm_dof0 = snap0.env.config.arm_dof().min(meas0.len()).min(snap0.commanded_positions.len());
+        for i in 0..arm_dof0 {
+            if (meas0[i] - snap0.commanded_positions[i]).abs() > 0.05 {
+                return Err(fail(
+                    "TRACKING_STALL",
+                    format!(
+                        "[revalidate_start] measured J{} ({:.3} rad) diverges from commanded ({:.3} rad)",
+                        i + 1, meas0[i], snap0.commanded_positions[i]
+                    ),
+                ));
+            }
+        }
+        let input0 = snap0
+            .plan_input_in(GoalFrame::Tcp)
+            .map_err(crate::macro_action::arm_fail)?;
+        let pose0_end = input0.arm.fk(&input0.q0);
+        self.fresh_match_adaptive(
+            "revalidate_start",
+            &planned.request.label,
+            route,
+            &mut expected_gen,
+            &pose0_end,
+            Instant::now(),
+            &mut after,
+        )
+        .await?;
+        let confirmed_at = Instant::now();
+
+        // ---- Stage 1: Pre-grasp (preserving jaw orientation & IK branch, J7 locked) + Pre-open ----
+        self.phase("pregrasp", 0.20).await?;
+        let snap_pre = self.adaptive_snapshot_fenced("pregrasp", rev).await?;
+        let input_pre = snap_pre
+            .plan_input_in(GoalFrame::Tcp)
+            .map_err(crate::macro_action::arm_fail)?;
+        let pre_goal = route.plan.pregrasp;
+        let q_pre_target = route.plan.q_pregrasp;
+        let pre_mode = route.pregrasp_mode;
+        let pre_speed = Speed { linear: route.approach_mps, angular: motion::DEFAULT_ANGULAR_RPS };
+        let env_pts = self.envelope.clone();
+        let (input_pre, pre_path) = tokio::task::spawn_blocking(move || {
+            let plan_res: Result<motion::JointPath, ArmError> = (|| {
+                if pre_mode == PregraspMode::Cartesian {
+                    if let Ok(p) = motion::plan_cartesian_opts(
+                        &input_pre,
+                        pre_goal,
+                        pre_speed,
+                        motion::PathOpts::default(),
+                    ) {
+                        let q_end: [f64; 6] = std::array::from_fn(|i| f64::from(p.last()[i]));
+                        let table_ok = crate::backlash::check_table_clear(
+                            &input_pre.arm,
+                            &env_pts,
+                            table_bound_z,
+                            p.q.iter().map(|q| q.as_slice()),
+                        )
+                        .is_ok();
+                        if table_ok
+                            && max_joint_diff(&q_end, &q_pre_target, input_pre.arm.arm_dof())
+                                <= BRANCH_CONSISTENCY_TOL_RAD
+                        {
+                            return Ok(p);
+                        }
+                    }
+                }
+                plan_swept_joint_path(&input_pre, q_pre_target, &env_pts, table_bound_z)
+                    .map_err(ArmError::from)
+            })();
+            (input_pre, plan_res)
+        })
+        .await
+        .map_err(|e| fail("INTERNAL", format!("[pregrasp] planner task failed: {e}")))?;
+        let pre_path = pre_path.map_err(|e| {
+            let s = crate::macro_action::arm_fail(e);
+            match s {
+                Stop::Fail(c, m) => Stop::Fail(c, format!("[pregrasp] {m}")),
+                other => other,
+            }
+        })?;
+        if pre_path.duration + 0.5 > s.phase_timeout_s {
+            return Err(fail(
+                "GRASP_TIMEOUT",
+                format!("[pregrasp] planned duration {:.2} s exceeds phase_timeout_s {:.2} s", pre_path.duration, s.phase_timeout_s),
+            ));
+        }
+        let _ = self
+            .ctx
+            .install_adaptive_path_child("pregrasp", &snap_pre, &input_pre, pre_goal, pre_path, rev, None)
+            .await
+            .map_err(|(stop, _)| stop)?;
+
+        // Open jaws at pre-grasp strictly via J7 intent.
+        let _ = self
+            .ctx
+            .run_gripper_fenced(
+                "pre_open",
+                0.35,
+                route.pre_open_command,
+                route.pre_open_fraction,
+                false,
+                rev,
+            )
+            .await?;
+        let pre_open_done_at = Instant::now();
+
+        // ---- Stage 2: Revalidate at pre-grasp (when visible) + Straight TCP insertion ----
+        self.phase("revalidate", 0.45).await?;
+        let snap_rev = self.adaptive_snapshot_fenced("revalidate", rev).await?;
+        let input_rev = snap_rev
+            .plan_input_in(GoalFrame::Tcp)
+            .map_err(crate::macro_action::arm_fail)?;
+        let actual_pre_end = input_rev.arm.fk(&input_rev.q0);
+        let actual_pre_tcp = motion::end_to_tcp(&actual_pre_end, &self.tcp_offset);
+        let pre_pos_err = kinematics::norm(&kinematics::sub(&actual_pre_tcp.p, &route.plan.pregrasp.p));
+        let pre_rot_err = kinematics::angle_between(&actual_pre_tcp.r, &route.plan.pregrasp.r);
+        let pre_j_err = max_joint_diff(&input_rev.q0, &route.plan.q_pregrasp, input_rev.arm.arm_dof());
+        if pre_pos_err > 0.006
+            || pre_rot_err > 2.5f64.to_radians()
+            || pre_j_err > BRANCH_CONSISTENCY_TOL_RAD
+        {
+            return Err(fail(
+                "PLAN_STALE",
+                format!(
+                    "[revalidate] arm drifted from pregrasp pose/branch (pos {pre_pos_err:.4} m, rot {:.2} deg, joint {pre_j_err:.3} rad)",
+                    pre_rot_err.to_degrees()
+                ),
+            ));
+        }
+        if visible_at_pose(
+            &self.cam,
+            &self.tcp_offset,
+            &route.target_poly,
+            z_mid,
+            &actual_pre_tcp,
+        ) {
+            self.fresh_match_adaptive(
+                "revalidate",
+                &planned.request.label,
+                route,
+                &mut expected_gen,
+                &actual_pre_end,
+                pre_open_done_at,
+                &mut after,
+            )
+            .await?;
+        } else {
+            let max_obscured_s = (route.budget.pregrasp_s + route.budget.pre_open_s + 2.5).min(s.phase_timeout_s);
+            if confirmed_at.elapsed().as_secs_f64() > max_obscured_s {
+                return Err(fail(
+                    "TARGET_LOST",
+                    format!(
+                        "[revalidate] target confirmation expired ({:.1} s > {:.1} s) while obscured at oblique pregrasp",
+                        confirmed_at.elapsed().as_secs_f64(),
+                        max_obscured_s
+                    ),
+                ));
+            }
+        }
+
+        self.phase("insert", 0.55).await?;
+        let snap_ins = self.adaptive_snapshot_fenced("insert", rev).await?;
+        let input_ins = snap_ins
+            .plan_input_in(GoalFrame::Tcp)
+            .map_err(crate::macro_action::arm_fail)?;
+        // Fixed-orientation straight TCP translation strictly along `insertion_dir` from the
+        // actual pregrasp pose (zero lateral drift or wrist rotation during insertion).
+        let actual_ins_start = motion::end_to_tcp(&input_ins.arm.fk(&input_ins.q0), &self.tcp_offset);
+        let rem_ins = kinematics::dot(
+            &kinematics::sub(&route.plan.grasp.p, &actual_ins_start.p),
+            &route.plan.insertion_dir,
+        )
+        .clamp(0.0, route.plan.insertion_m + 0.006);
+        let grasp_goal = Pose::new(
+            actual_ins_start.r,
+            kinematics::add(&actual_ins_start.p, &route.plan.insertion_dir.map(|x| x * rem_ins)),
+        );
+        let q_grasp_ref = route.plan.q_grasp;
+        let ins_speed = Speed { linear: route.insert_mps, angular: motion::DEFAULT_ANGULAR_RPS };
+        let env_pts = self.envelope.clone();
+        let (input_ins, ins_path) = tokio::task::spawn_blocking(move || {
+            let res: Result<motion::JointPath, ArmError> = (|| {
+                let p = motion::plan_cartesian_opts(
+                    &input_ins,
+                    grasp_goal,
+                    ins_speed,
+                    motion::PathOpts::default(),
+                )?;
+                crate::backlash::check_table_clear(
+                    &input_ins.arm,
+                    &env_pts,
+                    table_bound_z,
+                    p.q.iter().map(|q| q.as_slice()),
+                )
+                .map_err(|v| ArmError::from(v.into_motion_error()))?;
+                let q_end: [f64; 6] = std::array::from_fn(|i| f64::from(p.last()[i]));
+                let jd = max_joint_diff(&q_end, &q_grasp_ref, input_ins.arm.arm_dof());
+                if jd > BRANCH_CONSISTENCY_TOL_RAD {
+                    let joint = (0..input_ins.arm.arm_dof().min(6))
+                        .max_by(|&a, &b| (q_end[a] - q_grasp_ref[a]).abs().total_cmp(&(q_end[b] - q_grasp_ref[b]).abs()))
+                        .unwrap_or(0);
+                    return Err(ArmError::from(MotionError::IkBranchFlip {
+                        s: 1.0,
+                        joint,
+                        dq: jd,
+                        yaw_off_deg: None,
+                    }));
+                }
+                Ok(p)
+            })();
+            (input_ins, res)
+        })
+        .await
+        .map_err(|e| fail("INTERNAL", format!("[insert] planner task failed: {e}")))?;
+        let ins_path = ins_path.map_err(|e| match crate::macro_action::arm_fail(e) {
+            Stop::Fail(c, m) => Stop::Fail(c, format!("[insert] {m}")),
+            other => other,
+        })?;
+        if ins_path.duration + 0.5 > s.phase_timeout_s {
+            return Err(fail(
+                "GRASP_TIMEOUT",
+                format!("[insert] planned duration {:.2} s exceeds phase_timeout_s {:.2} s", ins_path.duration, s.phase_timeout_s),
+            ));
+        }
+        let ins_res = self
+            .ctx
+            .install_adaptive_path_child(
+                "insert",
+                &snap_ins,
+                &input_ins,
+                grasp_goal,
+                ins_path,
+                rev,
+                Some(route.contact_guard),
+            )
+            .await;
+        let (_ins_done, watch) = match ins_res {
+            Ok(pair) => pair,
+            Err((stop, _)) => return Err(stop),
+        };
+        if !self.is_executor() {
+            let contact_h = watch
+                .contact_joint
+                .map(|_| watch.contact_tcp_z_m.unwrap_or(f64::NAN) - s.table_z_m);
+            self.update_action_if_legacy(|a| {
+                a.descend_peak_residual_nm = watch.peak_residual_nm;
+                a.descend_peak_tracking_rad = watch.peak_tracking_rad;
+                if let Some(h) = contact_h {
+                    a.descend_contact = Some(true);
+                    a.descend_contact_height_m = Some(h as f32);
+                }
+            })
+            .await;
+        }
+
+        // Verify post-insertion coherent measured TCP pose against nominal / contact-window
+        // envelope (never silently falling back to commanded FK on stale hardware feedback).
+        let (_meas_post_ins, actual_contact_tcp) = self.measured_state_fenced("insert", rev).await?;
+        let delta = kinematics::sub(&route.plan.grasp.p, &actual_contact_tcp.p);
+        let rem_along = kinematics::dot(&delta, &route.plan.insertion_dir);
+        let along = route.plan.insertion_dir.map(|x| x * rem_along);
+        let perp = kinematics::sub(&delta, &along);
+        let lat_err = kinematics::norm(&perp);
+        let rot_err = kinematics::angle_between(&actual_contact_tcp.r, &route.plan.grasp.r);
+        let contact_triggered = watch.contact_joint.is_some();
+        let within_contact_window = rem_along >= -CONTACT_LATERAL_TOL_M
+            && rem_along <= route.contact_window_m + 1e-4
+            && lat_err <= CONTACT_LATERAL_TOL_M
+            && rot_err <= CONTACT_ROT_TOL_RAD;
+        let reached_nominal = rem_along.abs() <= CONTACT_LATERAL_TOL_M
+            && lat_err <= CONTACT_LATERAL_TOL_M
+            && rot_err <= CONTACT_ROT_TOL_RAD;
+
+        if contact_triggered && !within_contact_window {
+            // Unexpected early obstruction during open-jaw insertion: safe open-jaw withdrawal.
+            self.adaptive_withdraw("withdrawal", route, rev).await?;
+            return Err(fail(
+                "COLLISION",
+                format!(
+                    "[insert] early contact {:.3} m before target (window {:.3} m, lat {:.3} m, rot {:.2} deg)",
+                    rem_along,
+                    route.contact_window_m,
+                    lat_err,
+                    rot_err.to_degrees()
+                ),
+            ));
+        }
+        if !contact_triggered && !reached_nominal {
+            return Err(fail(
+                "TRACKING_STALL",
+                format!(
+                    "[insert] insertion did not reach grasp pose (rem {:.3} m, lat {:.3} m, rot {:.2} deg)",
+                    rem_along,
+                    lat_err,
+                    rot_err.to_degrees()
+                ),
+            ));
+        }
+
+        // ---- Stage 3: Close -> Separation -> Lift -> Post-lift holding confirmation ----
+        let closed = self
+            .ctx
+            .run_gripper_fenced("close", 0.70, GripperCommand::Close, None, true, rev)
+            .await?;
+        if let Some(w) = self.held_width_m().await {
+            self.update_action_if_legacy(|a| a.held_width_m = Some(w)).await;
+        }
+        if closed.holding != Some(true) {
+            // Empty grasp: NEVER open jaws at contact; withdraw closed along -insertion_dir.
+            self.adaptive_withdraw("withdrawal", route, rev).await?;
+            return Err(fail(
+                "NOT_HOLDING",
+                format!(
+                    "[close] jaws closed without holding target (gap {:.2} rad)",
+                    closed.gripper_gap_rad.unwrap_or(0.0)
+                ),
+            ));
+        }
+
+        // Compute actual conservative carried-object TCP box via full SE(3) relative transform
+        // `actual_contact_tcp^{-1} * route.plan.grasp` (covers BOTH translation and rotation error).
+        let rt_actual = kinematics::transpose(&actual_contact_tcp.r);
+        let rel_r = kinematics::mat_mul(&rt_actual, &route.plan.grasp.r);
+        let rel_p = kinematics::mat_vec(
+            &rt_actual,
+            &kinematics::sub(&route.plan.grasp.p, &actual_contact_tcp.p),
+        );
+        let rel_pose = Pose::new(rel_r, rel_p);
+        let obj_box = route.obj_box_nominal_tcp.transformed_by_relative_pose(&rel_pose);
+
+        // Separation (+SEPARATION_M straight up, fixed orientation, single converged loaded-leg validator)
+        self.phase("separation", 0.80).await?;
+        let snap_sep = self.adaptive_snapshot_fenced("separation", rev).await?;
+        let input_sep = snap_sep
+            .plan_input_in(GoalFrame::Tcp)
+            .map_err(crate::macro_action::arm_fail)?;
+        let cur_sep_tcp = motion::end_to_tcp(&input_sep.arm.fk(&input_sep.q0), &self.tcp_offset);
+        let sep_goal = Pose::new(
+            actual_contact_tcp.r,
+            [
+                cur_sep_tcp.p[0],
+                cur_sep_tcp.p[1],
+                (cur_sep_tcp.p[2] + SEPARATION_M).max(route.plan.separation.p[2]),
+            ],
+        );
+        let loaded_speed = Speed { linear: route.loaded_mps, angular: motion::DEFAULT_ANGULAR_RPS };
+        let env_pts = self.envelope.clone();
+        let table_z_m = s.table_z_m;
+        let phase_timeout_s = s.phase_timeout_s;
+        let payload_kg = route.payload_kg;
+        let torque_limits = route.torque_limits.clone();
+        let has_gravity_model = route.has_gravity_model;
+        let (input_sep, sep_path) = tokio::task::spawn_blocking(move || {
+            let res: Result<motion::JointPath, ArmError> = (|| {
+                let p = motion::plan_cartesian_opts(
+                    &input_sep,
+                    sep_goal,
+                    loaded_speed,
+                    motion::PathOpts::default(),
+                )?;
+                let leg_params = crate::grasp_select::feasibility::LoadedLegParams {
+                    arm: &input_sep.arm,
+                    tcp_offset: &input_sep.tcp_offset,
+                    ws: input_sep.ws.as_ref(),
+                    envelope: &env_pts,
+                    table_z_m,
+                    phase_timeout_s,
+                    obj_box: &obj_box,
+                    payload_kg,
+                    torque_limits: torque_limits.as_deref(),
+                    has_gravity_model,
+                    fail_on_insufficient_evidence: true,
+                };
+                crate::grasp_select::feasibility::validate_loaded_leg(&leg_params, &p, "separation")
+                    .map_err(|r| ArmError::Rejected {
+                        status: 422,
+                        code: r.code,
+                        message: r.message,
+                    })?;
+                Ok(p)
+            })();
+            (input_sep, res)
+        })
+        .await
+        .map_err(|e| fail("INTERNAL", format!("[separation] planner task failed: {e}")))?;
+        let sep_path = sep_path.map_err(|e| match crate::macro_action::arm_fail(e) {
+            Stop::Fail(c, m) => Stop::Fail(c, format!("[separation] {m}")),
+            other => other,
+        })?;
+        let _ = self
+            .ctx
+            .install_adaptive_path_child("separation", &snap_sep, &input_sep, sep_goal, sep_path, rev, None)
+            .await
+            .map_err(|(stop, _)| stop)?;
+
+        // Lift (to lift_z, fixed orientation, single converged loaded-leg validator)
+        self.phase("lift", 0.88).await?;
+        let snap_lift = self.adaptive_snapshot_fenced("lift", rev).await?;
+        let input_lift = snap_lift
+            .plan_input_in(GoalFrame::Tcp)
+            .map_err(crate::macro_action::arm_fail)?;
+        let cur_lift_tcp = motion::end_to_tcp(&input_lift.arm.fk(&input_lift.q0), &self.tcp_offset);
+        let lift_z = route.plan.lift.p[2].max(cur_lift_tcp.p[2]);
+        if lift_z > cur_lift_tcp.p[2] + 1e-4 {
+            let lift_goal = Pose::new(actual_contact_tcp.r, [cur_lift_tcp.p[0], cur_lift_tcp.p[1], lift_z]);
+            let q_lift_ref = route.plan.q_lift;
+            let env_pts = self.envelope.clone();
+            let torque_limits = route.torque_limits.clone();
+            let (input_lift, lift_path) = tokio::task::spawn_blocking(move || {
+                let res: Result<motion::JointPath, ArmError> = (|| {
+                    let p = motion::plan_cartesian_opts(
+                        &input_lift,
+                        lift_goal,
+                        loaded_speed,
+                        motion::PathOpts::default(),
+                    )?;
+                    let leg_params = crate::grasp_select::feasibility::LoadedLegParams {
+                        arm: &input_lift.arm,
+                        tcp_offset: &input_lift.tcp_offset,
+                        ws: input_lift.ws.as_ref(),
+                        envelope: &env_pts,
+                        table_z_m,
+                        phase_timeout_s,
+                        obj_box: &obj_box,
+                        payload_kg,
+                        torque_limits: torque_limits.as_deref(),
+                        has_gravity_model,
+                        fail_on_insufficient_evidence: true,
+                    };
+                    crate::grasp_select::feasibility::validate_loaded_leg(&leg_params, &p, "lift")
+                        .map_err(|r| ArmError::Rejected {
+                            status: 422,
+                            code: r.code,
+                            message: r.message,
+                        })?;
+                    let q_end: [f64; 6] = std::array::from_fn(|i| f64::from(p.last()[i]));
+                    let jd = max_joint_diff(&q_end, &q_lift_ref, input_lift.arm.arm_dof());
+                    if jd > BRANCH_CONSISTENCY_TOL_RAD {
+                        let joint = (0..input_lift.arm.arm_dof().min(6))
+                            .max_by(|&a, &b| (q_end[a] - q_lift_ref[a]).abs().total_cmp(&(q_end[b] - q_lift_ref[b]).abs()))
+                            .unwrap_or(0);
+                        return Err(ArmError::from(MotionError::IkBranchFlip {
+                            s: 1.0,
+                            joint,
+                            dq: jd,
+                            yaw_off_deg: None,
+                        }));
+                    }
+                    Ok(p)
+                })();
+                (input_lift, res)
+            })
+            .await
+            .map_err(|e| fail("INTERNAL", format!("[lift] planner task failed: {e}")))?;
+            let lift_path = lift_path.map_err(|e| match crate::macro_action::arm_fail(e) {
+                Stop::Fail(c, m) => Stop::Fail(c, format!("[lift] {m}")),
+                other => other,
+            })?;
+            let _ = self
+                .ctx
+                .install_adaptive_path_child("lift", &snap_lift, &input_lift, lift_goal, lift_path, rev, None)
+                .await
+                .map_err(|(stop, _)| stop)?;
+        }
+
+        // Post-lift holding confirmation with live 5-revision fencing and NO automatic retry.
+        self.phase("lift_confirm", 0.95).await?;
+        let (held, gap) = self.holding_now_fenced(Some(rev)).await?;
+        if held {
+            self.update_action_if_legacy(|a| a.post_lift = Some("held".into())).await;
+            return Ok((true, closed.gripper_gap_rad.or(Some(gap))));
+        }
+        self.update_action_if_legacy(|a| {
+            a.post_lift = Some("dropped".into());
+            a.gripper_gap_rad = Some(gap);
+        })
+        .await;
+        Err(fail(
+            "DROPPED",
+            format!("[lift_confirm] object no longer held after lift (gap {gap:.2} rad)"),
+        ))
     }
 
     async fn run(&self, planned: &PlannedGrasp) -> Result<(bool, Option<f32>), Stop> {
@@ -4119,16 +5661,34 @@ impl Orchestrator {
     /// `holding` after `post_lift_settle_ms` from the measured gripper joint, with the gripper policy's rule
     /// (matching GripperMotion in motion.rs). Returns (holding, gap).
     async fn holding_now(&self) -> Result<(bool, f32), Stop> {
-        let until = Instant::now() + Duration::from_millis(self.setup.post_lift_settle_ms);
+        self.holding_now_fenced(None).await
+    }
+
+    /// Revision-fenced variant of [`Self::holding_now`]: when `fence` is `Some(rev)`, verifies
+    /// all five adaptive revisions on every settle poll iteration on both Legacy and RT Executor
+    /// owners (0 `SupervisorLock` on `OWNER_EXECUTOR`).
+    async fn holding_now_fenced(
+        &self,
+        fence: Option<crate::grasp_select::AdaptiveRevisions>,
+    ) -> Result<(bool, f32), Stop> {
+        let confirm_start = Instant::now();
+        let until = confirm_start + Duration::from_millis(self.setup.post_lift_settle_ms);
+        let strict_adaptive = fence.is_some();
         let mut taus = Vec::new();
         let mut loads = Vec::new();
         let mut vels = Vec::new();
+        let mut last_j7_ts: Option<Instant> = None;
+        let mut last_j7_seq: Option<u64> = None;
+        let mut last_fresh_gap: Option<f32> = None;
         loop {
             self.check().await?;
-            let (gap, tau, load, vel, policy, feedback_fresh, torque_feedback, load_feedback) = if self.is_executor() {
+            let (gap, tau, load, vel, policy, feedback_fresh, torque_feedback, load_feedback, driver_present, sample_ts, sample_seq) = if self.is_executor() {
                 let Some(env) = self.sup.hub().prep_env() else {
                     return Err(fail("OBSERVATION_UNAVAILABLE", "No published planning environment"));
                 };
+                if let Some(rev) = fence {
+                    Self::check_adaptive_revisions("lift_confirm", &env, rev)?;
+                }
                 let Some(snap) = self.sup.hub().latest() else {
                     return Err(fail("OBSERVATION_UNAVAILABLE", "No published telemetry snapshot"));
                 };
@@ -4148,17 +5708,42 @@ impl Orchestrator {
                     .unwrap_or(0.0)
                     .abs();
                 let vel = snap.rt.velocities.get(g_idx).copied().unwrap_or(0.0);
+                let j7_ts = snap.rt.feedback_instants.get(g_idx).copied().flatten();
+                let j7_seq = if env.driver_present {
+                    snap.rt.feedback_seqs.get(g_idx).copied()
+                } else {
+                    Some(snap.meta.seq)
+                };
                 let fresh = if env.driver_present {
                     let now = Instant::now();
-                    snap.rt.feedback_instants.iter().all(|t| {
-                        t.is_some_and(|ts| now.saturating_duration_since(ts) <= Duration::from_millis(250))
-                    })
+                    !snap.rt.feedback_instants.is_empty()
+                        && snap.rt.feedback_instants.iter().all(|t| {
+                            t.is_some_and(|ts| now.saturating_duration_since(ts) <= Duration::from_millis(250))
+                        })
                 } else {
                     true
                 };
-                (gap, tau, load, vel, policy, fresh, env.has_torque_feedback, env.has_load_feedback)
+                (gap, tau, load, vel, policy, fresh, env.has_torque_feedback, env.has_load_feedback, env.driver_present, j7_ts, j7_seq)
             } else {
                 let inner = self.sup.inner().read().await;
+                if let Some(rev) = fence {
+                    if inner.calibration_revision != rev.calibration_revision {
+                        return Err(fail(
+                            "CALIBRATION_CHANGED",
+                            "[lift_confirm] calibration changed during adaptive grasp",
+                        ));
+                    }
+                    if inner.workspace_revision != rev.workspace_revision
+                        || inner.grasp_setup_revision != rev.grasp_setup_revision
+                        || inner.gripper_calib_revision != rev.gripper_calib_revision
+                        || inner.power_budget_revision != rev.power_budget_revision
+                    {
+                        return Err(fail(
+                            "PLAN_STALE",
+                            "[lift_confirm] configuration changed during adaptive grasp",
+                        ));
+                    }
+                }
                 let Some(policy) = inner.config.gripper_policy.clone() else {
                     return Err(fail("UNSUPPORTED", "No gripper policy"));
                 };
@@ -4169,6 +5754,8 @@ impl Orchestrator {
                 let tau = inner.torques.get(g_idx).copied().unwrap_or(0.0).abs();
                 let load = inner.loads.get(g_idx).copied().unwrap_or(0.0).abs();
                 let vel = inner.measured_velocities.get(g_idx).copied().unwrap_or(0.0);
+                let j7_ts = inner.core.feedback().instants().get(g_idx).copied().flatten();
+                let j7_seq = inner.core.feedback().seqs().get(g_idx).copied();
 
                 let (torque_fb, load_fb) = if let Some(ref d) = inner.driver {
                     if let Ok(driver) = d.lock() {
@@ -4180,43 +5767,80 @@ impl Orchestrator {
                 } else {
                     (true, !inner.loads.is_empty())
                 };
-                let fresh = if inner.driver.is_some() {
+                let driver_present = inner.driver.is_some();
+                let fresh = if driver_present {
                     inner.hardware_feedback_fresh(Duration::from_millis(250))
                 } else {
                     true
                 };
 
-                (gap, tau, load, vel, policy, fresh, torque_fb, load_fb)
+                (gap, tau, load, vel, policy, fresh, torque_fb, load_fb, driver_present, j7_ts, j7_seq)
             };
-            taus.push(f64::from(tau));
-            loads.push(f64::from(load));
-            vels.push(f64::from(vel));
+            let accept_sample = if strict_adaptive {
+                if !feedback_fresh || !gap.is_finite() {
+                    false
+                } else if driver_present {
+                    // Require fresh post-lift J7 observation distinct from previously recorded sample.
+                    let post_lift = sample_ts.is_some_and(|ts| ts >= confirm_start);
+                    let distinct_ts = sample_ts.is_some() && sample_ts != last_j7_ts;
+                    let distinct_seq = sample_seq.is_some() && sample_seq != last_j7_seq;
+                    post_lift && (distinct_ts || distinct_seq)
+                } else {
+                    sample_seq.is_none() || sample_seq != last_j7_seq
+                }
+            } else {
+                true
+            };
+            if accept_sample {
+                taus.push(f64::from(tau));
+                loads.push(f64::from(load));
+                vels.push(f64::from(vel));
+                if sample_ts.is_some() {
+                    last_j7_ts = sample_ts;
+                }
+                if sample_seq.is_some() {
+                    last_j7_seq = sample_seq;
+                }
+                last_fresh_gap = Some(gap);
+            }
 
             if Instant::now() >= until {
                 let tau_median = if taus.is_empty() { 0.0 } else { median(&mut taus) };
                 let load_median = if loads.is_empty() { 0.0 } else { median(&mut loads) };
                 let vel_median = if vels.is_empty() { 0.0 } else { median(&mut vels) };
-
-                let holding = match policy.holding_mode {
-                    HoldingMode::TorqueAndGap => {
-                        torque_feedback
-                            && gap >= policy.holding_gap_rad
-                            && tau_median >= f64::from(policy.holding_torque_nm)
+                let current_gap = if strict_adaptive {
+                    if feedback_fresh && gap.is_finite() {
+                        gap
+                    } else {
+                        last_fresh_gap.unwrap_or(f32::NAN)
                     }
-                    HoldingMode::PositionGap => {
-                        feedback_fresh
-                            && vel_median.abs() < motion::SETTLE_VEL
-                            && gap >= policy.holding_gap_rad
-                    }
-                    HoldingMode::LoadAndGap => {
-                        let req = policy.holding_load_fraction.unwrap_or(0.15) as f64;
-                        feedback_fresh
-                            && load_feedback
-                            && gap >= policy.holding_gap_rad
-                            && load_median >= req
-                    }
+                } else {
+                    gap
                 };
-                return Ok((holding, gap));
+                let adaptive_fresh_ok = !strict_adaptive
+                    || (feedback_fresh && !taus.is_empty() && current_gap.is_finite());
+
+                let holding = adaptive_fresh_ok
+                    && match policy.holding_mode {
+                        HoldingMode::TorqueAndGap => {
+                            torque_feedback
+                                && current_gap >= policy.holding_gap_rad
+                                && tau_median >= f64::from(policy.holding_torque_nm)
+                        }
+                        HoldingMode::PositionGap => {
+                            feedback_fresh
+                                && vel_median.abs() < motion::SETTLE_VEL
+                                && current_gap >= policy.holding_gap_rad
+                        }
+                        HoldingMode::LoadAndGap => {
+                            let req = policy.holding_load_fraction.unwrap_or(0.15) as f64;
+                            feedback_fresh
+                                && load_feedback
+                                && current_gap >= policy.holding_gap_rad
+                                && load_median >= req
+                        }
+                    };
+                return Ok((holding, current_gap));
             }
             tokio::time::sleep(POLL).await;
         }
@@ -5241,18 +6865,18 @@ async fn run(
         Err(fail("DETECTION_UNAVAILABLE", format!("Cannot reach the vision provider: {e}")))
     } else if triggered {
         // perception API 2: a ["yolo"] trigger per centring step, no mode change to restore
-        orch.run(&planned).await
+        orch.run_selected(&planned).await
     } else { match vision {
         // perception API 1 (rebot-vision 1.2): YOLO (both when ArUco was running) with inference
         // on for the duration, then the previous mode
         Ok(Some(prev)) => {
             let want = VisionMode { mode: grasp_mode(&prev.mode).to_string(), enabled: true };
             if want == prev {
-                orch.run(&planned).await
+                orch.run_selected(&planned).await
             } else {
                 match source.set_vision_mode(&want).await {
                     Ok(()) => {
-                        let r = orch.run(&planned).await;
+                        let r = orch.run_selected(&planned).await;
                         if let Err(e) = source.set_vision_mode(&prev).await {
                             tracing::warn!("Grasp could not restore vision mode {} (enabled {}): {e}", prev.mode, prev.enabled);
                         }
@@ -5270,7 +6894,7 @@ async fn run(
                 Err(e) => Err(e),
             };
             let r = match &enabled_by_us {
-                Ok(_) => orch.run(&planned).await,
+                Ok(_) => orch.run_selected(&planned).await,
                 Err(e) => Err(fail("DETECTION_UNAVAILABLE", format!("Cannot read the detection state: {e}"))),
             };
             if enabled_by_us == Ok(true) {
@@ -5297,9 +6921,40 @@ async fn run(
             } else {
                 HeldUpdate::Unchanged
             };
-            orch.ctx
-                .finish(FinishState::Done, None, None, Some(holding), gap, held)
-                .await;
+            let adaptive_rev = planned.adaptive.as_ref().map(|pa| pa.revisions);
+            if let Err(refusal_code) = orch
+                .ctx
+                .finish_fenced(
+                    FinishState::Done,
+                    None,
+                    None,
+                    Some(holding),
+                    gap,
+                    held,
+                    adaptive_rev,
+                )
+                .await
+            {
+                let msg = format!(
+                    "[lift_confirm] finish refused on live parent before completion ({refusal_code})"
+                );
+                for _ in 0..5 {
+                    orch.ctx
+                        .finish(
+                            FinishState::Failed,
+                            Some(refusal_code),
+                            Some(msg.clone()),
+                            Some(false),
+                            None,
+                            HeldUpdate::Clear,
+                        )
+                        .await;
+                    if !orch.ctx.alive().await {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
         }
         Err(Stop::Fail(code, message)) => {
             let holding = if code == "NOT_HOLDING" || code == "DROPPED" {

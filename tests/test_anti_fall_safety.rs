@@ -81,6 +81,26 @@ impl ArmDriver for DummyDriver {
         self.feedback_valid.load(Ordering::SeqCst)
     }
 
+    fn has_driver_fresh_position_api(&self) -> bool {
+        true
+    }
+
+    fn fresh_joint_positions_into(&self, joints: &[usize], _max_age: Duration, out: &mut [f32]) -> bool {
+        if joints.is_empty() || out.len() < joints.len() || !self.feedback_valid.load(Ordering::SeqCst) {
+            return false;
+        }
+        for (slot, &i) in out.iter_mut().zip(joints.iter()) {
+            let Some(st) = self.states.get(i) else {
+                return false;
+            };
+            if !st.position.is_finite() {
+                return false;
+            }
+            *slot = st.position;
+        }
+        true
+    }
+
     fn is_enabled(&self) -> bool {
         self.is_enabled
     }
@@ -302,28 +322,62 @@ async fn test_set_torque_false_safety_gates() {
         inner.measured_velocities = vec![0.0, 0.0];
     }
 
-    // 2. In E-Stop: set_torque(false) must be rejected with MotionForbiddenInFaultState
+    // 2. In E-Stop away from resting pose: set_torque(false) must be rejected with TorqueOffWouldDrop
+    {
+        let mut inner = supervisor.inner().write().await;
+        inner.measured_positions = vec![0.5, -0.3];
+    }
     supervisor.trigger_e_stop().await;
-    let res_estop = supervisor.disable_torque().await;
+    let res_estop_raised = supervisor.disable_torque().await;
     assert!(matches!(
-        res_estop,
-        Err(ArmError::Safety(SafetyError::MotionForbiddenInFaultState(_)))
+        res_estop_raised,
+        Err(ArmError::Safety(SafetyError::TorqueOffWouldDrop { .. }))
     ));
+    assert!(supervisor.get_observation().await.is_torqued, "Torque must stay on away from rest in E-Stop");
 
-    // Clear fault
+    // In E-Stop at resting pose: disable_torque() is allowed and keeps E-Stop latched
+    {
+        let mut inner = supervisor.inner().write().await;
+        inner.measured_positions = vec![0.0, 0.0];
+        inner.measured_velocities = vec![0.0, 0.0];
+    }
+    let res_estop_rest = supervisor.disable_torque().await;
+    assert_eq!(res_estop_rest.unwrap(), SafetyState::EStop);
+    let obs_estop = supervisor.get_observation().await;
+    assert_eq!(obs_estop.safety_state, SafetyState::EStop);
+    assert!(!obs_estop.is_torqued);
+
+    // Clear fault -> Idle
     supervisor.clear_fault().await.unwrap();
 
-    // 3. In Fault (e.g. BusLoss): set_torque(false) must be rejected with MotionForbiddenInFaultState
+    // 3. In Fault (e.g. BusLoss) away from rest: disable_torque() rejected with TorqueOffWouldDrop
     supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
+    {
+        let mut inner = supervisor.inner().write().await;
+        inner.measured_positions = vec![0.5, -0.3];
+    }
     supervisor.apply_stop_policy(StopPolicy::BusLossFallback).await;
     assert!(matches!(supervisor.get_observation().await.safety_state, SafetyState::Fault(_)));
-    let res_fault = supervisor.disable_torque().await;
+    let res_fault_raised = supervisor.disable_torque().await;
     assert!(matches!(
-        res_fault,
-        Err(ArmError::Safety(SafetyError::MotionForbiddenInFaultState(_)))
+        res_fault_raised,
+        Err(ArmError::Safety(SafetyError::TorqueOffWouldDrop { .. }))
     ));
+    assert!(supervisor.get_observation().await.is_torqued);
 
-    // Clear fault, arm at resting pose: now set_torque(false) succeeds
+    // At resting pose in Fault: disable_torque() is allowed and keeps Fault latched
+    {
+        let mut inner = supervisor.inner().write().await;
+        inner.measured_positions = vec![0.0, 0.0];
+        inner.measured_velocities = vec![0.0, 0.0];
+    }
+    let res_fault_rest = supervisor.disable_torque().await;
+    assert!(matches!(res_fault_rest, Ok(SafetyState::Fault(_))));
+    let obs_fault = supervisor.get_observation().await;
+    assert!(matches!(obs_fault.safety_state, SafetyState::Fault(_)));
+    assert!(!obs_fault.is_torqued);
+
+    // Clear fault, arm at resting pose: now Idle and set_torque(false) still succeeds
     supervisor.clear_fault().await.unwrap();
     let res_ok = supervisor.disable_torque().await;
     assert!(res_ok.is_ok());
@@ -471,7 +525,9 @@ async fn test_bus_loss_fallback_duration_and_silence_after_3000ms() {
         assert_eq!(guard[0].velocity, Some(0.0));
     }
 
-    // Simulate duration > 3000ms after feedback loss
+    // Simulate duration > 3000ms after feedback loss: under R11 B2, holds are NEVER dropped while
+    // `torque_intent == On` — the joint keeps holding its LAST captured target (0.35 rad, v=0.0)
+    // and is reported `HeldStaleTarget` ("hold target stale").
     feedback_valid.store(false, Ordering::SeqCst);
     {
         let mut inner = supervisor.inner().write().await;
@@ -481,8 +537,17 @@ async fn test_bus_loss_fallback_duration_and_silence_after_3000ms() {
     supervisor.tick(0.02).await;
     let writes_after = write_count.load(Ordering::SeqCst);
     assert!(
-        writes_after == writes_before,
-        "Stale feedback must suppress old control targets until feedback recovers"
+        writes_after > writes_before,
+        "B2: stale feedback must keep holding the last captured target while torque_intent == On"
+    );
+    {
+        let guard = written.lock().unwrap();
+        assert_eq!(guard[0].position, 0.35);
+        assert_eq!(guard[0].velocity, Some(0.0));
+    }
+    assert_eq!(
+        supervisor.inner().read().await.joint_hold_status()[0],
+        armd::driver::JointHoldStatus::HeldStaleTarget
     );
 }
 
@@ -622,16 +687,28 @@ async fn test_clear_fault_mutually_exclusive_branches() {
         assert!((inner.commanded_positions[1] - (-0.1)).abs() < 1e-4);
     }
 
-    // --- Branch B: Verified Disarmed ---
-    // Condition: feedback valid, all motor_status == 0
-    // Action: is_torqued = false, driver.set_torque_flag(false), pending_rearm = true, state Idle
+    // --- Branch B: Disarmed Telemetry Only ---
+    // Condition: feedback valid, all motor_status == 0 (telemetry only under R10)
+    // Action: clear_fault() clears stop to Idle while keeping is_torqued = true and pending_rearm = true
+    // until an explicit disable_torque() is accepted.
     {
         let dummy = DummyDriver::new(vec![
             JointState { position: 0.0, velocity: 0.0, torque: 0.0, temperature: 25.0 },
             JointState { position: 0.0, velocity: 0.0, torque: 0.0, temperature: 25.0 },
         ]);
         let motor_status = dummy.motor_status.clone();
-        let supervisor = ArmSupervisor::new(config.clone());
+        let mut branch_b_config = config.clone();
+        branch_b_config.resting_pose = Some(armd::model::RestingPosePolicy {
+            positions: None,
+            position_tolerances: vec![0.08, 0.08],
+            max_total_deviation: 0.16,
+            max_velocity: 0.015,
+            joint_max_velocities: vec![],
+            support_torque_limits: vec![],
+            support_load_limits: vec![],
+            feedback_max_age_ms: 100,
+        });
+        let supervisor = ArmSupervisor::new(branch_b_config);
         supervisor.set_driver(Box::new(dummy)).await;
         supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
 
@@ -641,35 +718,53 @@ async fn test_clear_fault_mutually_exclusive_branches() {
 
         let obs = supervisor.get_observation().await;
         assert_eq!(obs.safety_state, SafetyState::Idle);
-        assert!(!obs.is_torqued, "Branch B: must mark is_torqued = false");
+        assert_eq!(obs.enable_state, armd::driver::EnableState::Disabled);
+        assert!(obs.is_torqued, "Branch B: Disabled feedback is telemetry only; holds stay active until disable_torque");
 
-        let inner = supervisor.inner().read().await;
-        assert!(inner.pending_rearm, "Branch B: must latch pending_rearm = true");
+        {
+            let inner = supervisor.inner().read().await;
+            assert!(inner.pending_rearm, "Branch B: must latch pending_rearm = true");
+        }
+
+        supervisor.disable_torque().await.unwrap();
+        let obs_after_disable = supervisor.get_observation().await;
+        assert!(!obs_after_disable.is_torqued, "Branch B: explicit disable_torque must mark is_torqued = false");
+        assert!(!supervisor.inner().read().await.pending_rearm);
     }
 
     // --- Branch C: Unknown / Mixed / Degraded ---
-    // Condition: feedback invalid or mixed status (e.g. motor 0 is 1, motor 1 is 0)
-    // Action: pending_rearm = true, continuous holding output, state Idle
+    // Condition: (1) invalid feedback blocks clear_fault while holding; (2) fresh feedback with
+    // mixed/unknown enable status (e.g. motor 0 is 1, motor 1 is 0) is telemetry only under R10:
+    // clear_fault succeeds to Idle with pending_rearm = true, is_torqued = true, and continuous hold output.
     {
         let dummy = DummyDriver::new(vec![
             JointState { position: 0.25, velocity: 0.0, torque: 0.1, temperature: 25.0 },
             JointState { position: -0.15, velocity: 0.0, torque: 0.1, temperature: 25.0 },
         ]);
         let motor_status = dummy.motor_status.clone();
+        let feedback_valid = dummy.feedback_valid.clone();
         let write_count = dummy.write_count.clone();
         let supervisor = ArmSupervisor::new(config.clone());
         supervisor.set_driver(Box::new(dummy)).await;
         supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
 
         *motor_status.lock().unwrap() = vec![1, 0];
+        feedback_valid.store(false, Ordering::SeqCst);
         supervisor.trigger_e_stop().await;
-        assert!(supervisor.clear_fault().await.is_err());
+        assert!(supervisor.clear_fault().await.is_err(), "Invalid feedback must block clear_fault");
+        assert_eq!(supervisor.get_observation().await.safety_state, SafetyState::EStop);
+        assert!(supervisor.inner().read().await.is_torqued, "Invalid feedback must not claim torque is off");
+
+        feedback_valid.store(true, Ordering::SeqCst);
+        supervisor.clear_fault().await.unwrap();
 
         let obs = supervisor.get_observation().await;
-        assert_eq!(obs.safety_state, SafetyState::EStop);
+        assert_eq!(obs.safety_state, SafetyState::Idle);
+        assert_eq!(obs.enable_state, armd::driver::EnableState::Unknown);
 
         let inner = supervisor.inner().read().await;
         assert!(inner.is_torqued, "Unknown state must not claim torque is off");
+        assert!(inner.pending_rearm, "Branch C: must latch pending_rearm = true");
         drop(inner);
 
         // Control loop tick continues to output holding target to driver

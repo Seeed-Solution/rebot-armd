@@ -204,6 +204,22 @@ Catalogue in `vision.json` (optional) / `vision.json` 中的目录（可选）:
 - `available`, `model` and `depth_model` in the mode body follow the resident set; every result carries `model_generation`. A pending swap is dropped at shutdown. 模式中的 `available`、`model` 与 `depth_model` 随常驻组合变化；每个结果带 `model_generation`。退出时丢弃待处理的切换。
 - Measured on a reCamera (SG2002), 20 cycles det+depth → seg → obb+depth → det+depth (60 swaps, 2026-11-15, rebot-vision md5 39ec34a1): ION per model set identical in every cycle (39.90 / 48.73 / 49.21 MB), back to 0 after exit; internal swap time median 199 ms (→ seg), 511 ms (→ obb+depth), 552 ms (→ det+depth), POST to idle 514–909 ms median. 实机测量（reCamera SG2002，det+depth → seg → obb+depth → det+depth 循环 20 次共 60 次切换，2026-11-15）：每套模型的 ION 每轮完全一致（39.90 / 48.73 / 49.21 MB），退出后回到 0；内部切换耗时中位数 199 ms（→ seg）、511 ms（→ obb+depth）、552 ms（→ det+depth），POST 到空闲中位数 514–909 ms。
 
+### Detection kind switch (armd) / 识别方式切换（armd）
+
+`POST /api/v1/vision/detector` (operator only; capability `vision.detector_switch`) loads the default detector model of a kind, for the cockpit's simple mode. Body `{"kind": "detect" | "segment"}`. armd takes the first name of the profile section `vision_detectors` (`{"detect": [...], "segment": [...]}`; default `detect` = `yolo11n_detection_cv181x_int8`, `segment` = `yolo11n_seg_384x640_cv181x_int8_fuse`, then `yolo11n_segment_cv181x_int8`) that the provider's `models.catalogue` lists, sends `POST /api/models {"detector": name}` and polls `GET /api/mode` until the swap is done (at most 5 s). Other models (obb, variants) are loaded by grasp tasks.
+
+`POST /api/v1/vision/detector`（仅操作员；能力 `vision.detector_switch`）为驾驶舱简易模式加载某一识别方式的默认检测模型。请求体 `{"kind": "detect" | "segment"}`。armd 取 profile 段 `vision_detectors`（`{"detect": [...], "segment": [...]}`；默认 `detect` 为 `yolo11n_detection_cv181x_int8`，`segment` 依次为 `yolo11n_seg_384x640_cv181x_int8_fuse`、`yolo11n_segment_cv181x_int8`）中第一个出现在感知服务 `models.catalogue` 里的名称，发送 `POST /api/models {"detector": name}`，并轮询 `GET /api/mode` 直到切换完成（最长 5 s）。其他模型（obb、变体）由抓取任务加载。
+
+| Reply / 回复 | When / 条件 |
+|---|---|
+| 200 `{"kind","model","changed","generation"}` | loaded (`changed` false: it was already resident) / 已加载（`changed` 为 false：原本已常驻） |
+| 400 `INVALID_COMMAND` | another kind or field / 其他类型或字段 |
+| 403 `OPERATOR_REQUIRED` | no operator session / 无操作员会话 |
+| 409 `VISION_BUSY` | a grasp, a `measure_multiview`, a depth measurement (`/api/v1/grasp/measure`) or another model switch runs, or the provider's swap is busy / 抓取、多视角测量、深度测量或其他模型切换进行中，或感知服务正在切换 |
+| 409 `ION_BUDGET` | the provider's budget refusal, with `need_mb` / `limit_mb` in the message / 感知服务的内存预算拒绝，消息中带 `need_mb` / `limit_mb` |
+| 422 `MODEL_NOT_FOUND`, `UNSUPPORTED` | no default name in the catalogue; the provider cannot switch models / 目录中没有默认名称；感知服务不能切换模型 |
+| 502 / 503 / 504 `DETECTION_UNAVAILABLE` | provider unreachable, unexpected reply, or the swap did not finish in time / 感知服务不可达、回复异常或切换未按时完成 |
+
 The MuJoCo simulator's perception server has the same route and budget numbers (catalogue `seg`, `det`, `depth`; [simulation](simulation.md)). MuJoCo 仿真的感知服务提供同样的路由与预算数值（目录 `seg`、`det`、`depth`）。
 
 ## Depth map / 深度图

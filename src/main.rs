@@ -787,6 +787,21 @@ mod shutdown_tests {
         fn is_feedback_valid(&self) -> bool {
             true
         }
+        fn has_driver_fresh_position_api(&self) -> bool {
+            true
+        }
+        fn fresh_joint_positions_into(
+            &self,
+            joints: &[usize],
+            _max_age: Duration,
+            out: &mut [f32],
+        ) -> bool {
+            if out.len() < joints.len() {
+                return false;
+            }
+            out[..joints.len()].fill(0.0);
+            true
+        }
         fn feedback_ages(&self) -> Vec<Option<Duration>> {
             vec![Some(Duration::ZERO); 6]
         }
@@ -812,6 +827,8 @@ mod shutdown_tests {
         if state == EnableState::Enabled {
             inner.is_torqued = true;
             inner.safety.set_torque(true).unwrap();
+        } else if state == EnableState::Disabled {
+            inner.torque_intent = armd::TorqueIntent::Off;
         }
         inner
     }
@@ -894,6 +911,21 @@ mod shutdown_tests {
             *self.state.lock().unwrap() == EnableState::Enabled
         }
         fn is_feedback_valid(&self) -> bool {
+            true
+        }
+        fn has_driver_fresh_position_api(&self) -> bool {
+            true
+        }
+        fn fresh_joint_positions_into(
+            &self,
+            joints: &[usize],
+            _max_age: Duration,
+            out: &mut [f32],
+        ) -> bool {
+            if out.len() < joints.len() {
+                return false;
+            }
+            out[..joints.len()].fill(0.0);
             true
         }
         fn feedback_ages(&self) -> Vec<Option<Duration>> {
@@ -1025,6 +1057,7 @@ mod shutdown_tests {
         };
         let sup_ok = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_ok)));
         sup_ok.set_lease_enabled(false).await;
+        sup_ok.disable_torque().await.unwrap();
         let handle_ok = sup_ok
             .start_executor(armd::rt_core::executor::ExecutorConfig::for_tests(Duration::from_millis(5)))
             .await
@@ -1079,6 +1112,7 @@ mod shutdown_tests {
         };
         let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
         sup.set_lease_enabled(false).await;
+        sup.inner().write().await.torque_intent = armd::TorqueIntent::Off;
         let _ = sup.trigger_e_stop().await;
         assert!(sup.request_shutdown().await.unwrap());
 

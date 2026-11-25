@@ -206,6 +206,41 @@ impl ArmDriver for WakeDriver {
         true
     }
 
+    fn has_driver_fresh_position_api(&self) -> bool {
+        true
+    }
+
+    fn fresh_joint_positions_into(
+        &self,
+        joints: &[usize],
+        max_age: Duration,
+        out: &mut [f32],
+    ) -> bool {
+        if joints.is_empty() || out.len() < joints.len() {
+            return false;
+        }
+        let now = self.now();
+        for (slot, &i) in out.iter_mut().zip(joints.iter()) {
+            let fresh = self
+                .rx_at
+                .get(i)
+                .copied()
+                .flatten()
+                .is_some_and(|t| now.saturating_duration_since(t) <= max_age);
+            if !fresh {
+                return false;
+            }
+            let Some(&p) = self.q.get(i) else {
+                return false;
+            };
+            if !p.is_finite() {
+                return false;
+            }
+            *slot = p;
+        }
+        true
+    }
+
     fn feedback_ages(&self) -> Vec<Option<Duration>> {
         let now = self.now();
         self.rx_at.iter().map(|t| t.map(|t| now.saturating_duration_since(t))).collect()

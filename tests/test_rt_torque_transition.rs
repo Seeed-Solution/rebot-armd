@@ -12,13 +12,12 @@ use std::time::Duration;
 use armd::driver::{ArmDriver, DamiaoArmDriver, GripperPosForce};
 use armd::protocol::damiao::{self, DamiaoLimits};
 use armd::rt_core::broker::{Authority, BootId, Broker, Capacities, ClientId, Outcome, Reply, Submit, TransitionOp};
-use armd::rt_core::ops::{CoreOps, PlanSlot, ReleaseFixture, ReleaseReport};
+use armd::rt_core::ops::{CoreOps, PlanSlot, ReleaseFixture, ReleaseReport, VirtualClock};
 use armd::transport::MockClock;
 use armd::{ArmConfig, SupervisorInner};
 use mit_support::FakeBus;
 
 const BOOT: BootId = BootId(11);
-const RELEASE: Duration = Duration::from_millis(20);
 
 fn limits() -> Vec<DamiaoLimits> { ArmConfig::rebot_dm().damiao_ranges.unwrap().iter().map(|r| r.limits()).collect() }
 
@@ -26,6 +25,7 @@ struct Rig {
     fx: ReleaseFixture<SupervisorInner>,
     b: Broker<PlanSlot>,
     bus: FakeBus,
+    #[allow(dead_code)]
     clock: MockClock,
     seq: u64,
 }
@@ -50,7 +50,12 @@ fn rig_with(drive: impl FnOnce(DamiaoArmDriver<FakeBus>) -> DamiaoArmDriver<Fake
     inner.lease_enabled = false;
     inner.register_live_connection(1).unwrap();
     inner.tick(0.02);
-    let (fx, b, _tw, _stop) = ReleaseFixture::new(inner, BOOT, Capacities { commands: 4, plans: 1, replies: 8 });
+    let (fx, b, _tw, _stop) = ReleaseFixture::new_with_clock(
+        inner,
+        BOOT,
+        Capacities { commands: 4, plans: 1, replies: 8 },
+        VirtualClock::from_mock_clock(clock.clone()),
+    );
     Rig { fx, b, bus, clock, seq: 0 }
 }
 
@@ -63,11 +68,9 @@ impl Rig {
         self.b.submit(ClientId(1), self.seq, a, self.fx.now() + Duration::from_secs(5), Submit::Transition(op)).unwrap();
     }
 
-    /// One release; the driver's clock moves with the executor's.
+    /// One release; executor and driver share `self.clock` so sub-release wakes advance driver time too.
     fn step(&mut self) -> ReleaseReport {
-        let r = self.fx.step();
-        self.clock.advance(RELEASE);
-        r
+        self.fx.step()
     }
 
     /// Releases until the transition ends: (release count, outcome, reports).
@@ -114,6 +117,9 @@ fn an_enable_is_withheld_until_the_driver_confirms_it_then_applied_to_the_superv
 
 #[test]
 fn an_enable_a_motor_never_confirms_fails_with_the_fault_and_torque_stays_off() {
+    // 1. Silent motor (> 100 ms stale at 150 ms enable timeout): no automatic rollback,
+    //    enters FailedHold, keeps holding healthy joints, and latches non-recoverable
+    //    `ENABLE_FAILED` (alongside `BUS_LOSS` because motor 4 is actually silent while torqued).
     let mut r = rig();
     r.bus.with(|s| s.motors[3].silent = true);
     r.submit(TransitionOp::TorqueOn);
@@ -122,14 +128,105 @@ fn an_enable_a_motor_never_confirms_fails_with_the_fault_and_torque_stays_off() 
     assert_eq!(outcome, Outcome::Failed("ENABLE_FAILED"));
     let inner = &r.fx.core;
     assert!(!inner.torque_transition_pending());
-    assert!(!inner.is_torqued || inner.disable_pending, "torque off or its disable pending ({}, {})", inner.is_torqued, inner.disable_pending);
+    assert_eq!(inner.enable_lifecycle(), armd::supervisor::EnableLifecycle::FailedHold);
+    assert!(inner.is_torqued && !inner.disable_pending, "failed enable must hold without rollback ({}, {})", inner.is_torqued, inner.disable_pending);
     assert!(matches!(inner.safety.state(), armd::SafetyState::Fault(_)), "{:?}", inner.safety.state());
+    assert!(inner.safety.has_latched_fault_code(armd::FaultCode::EnableFailed));
+    assert!(!inner.safety.recoverable());
+    assert_eq!(
+        r.bus.tx_log().iter().filter(|f| f.data == damiao::CMD_DISABLE).count(),
+        0,
+        "failed enable must send ZERO automatic rollback disable frames"
+    );
     // a second enable while the fault latches is refused at the commit, before any frame
     r.bus.with(|s| s.motors[3].silent = false);
     let before = r.enable_frames();
     r.submit(TransitionOp::TorqueOn);
     assert!(r.step().command.unwrap().1.is_err());
     assert_eq!(r.enable_frames(), before);
+
+    // 2. Raised pose with fresh feedback and non-confirming motor: NO automatic rollback
+    //    (0 disables), enters FailedHold, and latches non-recoverable `ENABLE_FAILED` with
+    //    per-joint status.
+    let mut r_raised = rig();
+    r_raised.bus.with(|s| {
+        s.follow_commands = false;
+        s.motors[1].q = 0.40;
+        s.motors[3].drop_torque_frames = 10;
+        s.push_all_feedback();
+    });
+    r_raised.step();
+    r_raised.bus.clear_log();
+    r_raised.submit(TransitionOp::TorqueOn);
+    assert!(r_raised.step().command.unwrap().1.is_ok());
+    let mut raised_outcome = None;
+    for _ in 0..30 {
+        r_raised.bus.with(|s| s.push_all_feedback());
+        let rep = r_raised.step();
+        if let Some((_, o)) = rep.transition_ended {
+            raised_outcome = Some(o);
+            break;
+        }
+    }
+    assert_eq!(raised_outcome, Some(Outcome::Failed("ENABLE_FAILED")));
+    assert_eq!(r_raised.fx.core.enable_lifecycle(), armd::supervisor::EnableLifecycle::FailedHold);
+    assert!(r_raised.fx.core.is_torqued && !r_raised.fx.core.disable_pending);
+    assert_eq!(
+        r_raised.bus.tx_log().iter().filter(|f| f.data == damiao::CMD_DISABLE).count(),
+        0,
+        "raised failed enable must send ZERO automatic rollback disable frames"
+    );
+    let raised_fault = r_raised.fx.core.safety.fault().expect("ENABLE_FAILED fault expected");
+    assert_eq!(raised_fault.code, armd::FaultCode::EnableFailed);
+    assert!(!r_raised.fx.core.safety.recoverable(), "ENABLE_FAILED must be non-recoverable");
+    assert!(raised_fault.message.contains("J4:queued"), "missing initial per-joint status: {}", raised_fault.message);
+    r_raised.bus.with(|s| s.push_all_feedback());
+    r_raised.step();
+    let live_fault = r_raised.fx.core.current_observation().fault.expect("live observation fault expected");
+    assert!(live_fault.message.contains("J4:held"), "missing live post-hold per-joint status: {}", live_fault.message);
+
+    // 3. Rest pose with non-confirming motor: STILL NO automatic rollback (0 disables), enters
+    //    FailedHold + non-recoverable `ENABLE_FAILED`; a later explicit TorqueOff at rest
+    //    passes the rest gate and disables torque cleanly.
+    let mut r2 = rig();
+    r2.bus.with(|s| s.motors[3].drop_torque_frames = 10);
+    r2.bus.clear_log();
+    r2.submit(TransitionOp::TorqueOn);
+    assert!(r2.step().command.unwrap().1.is_ok());
+    let mut rest_outcome = None;
+    for _ in 0..30 {
+        r2.bus.with(|s| s.push_all_feedback());
+        let rep = r2.step();
+        if let Some((_, o)) = rep.transition_ended {
+            rest_outcome = Some(o);
+            break;
+        }
+    }
+    assert_eq!(rest_outcome, Some(Outcome::Failed("ENABLE_FAILED")));
+    assert_eq!(
+        r2.bus.tx_log().iter().filter(|f| f.data == damiao::CMD_DISABLE).count(),
+        0,
+        "failed enable at rest must NOT automatically roll back"
+    );
+    let inner2 = &r2.fx.core;
+    assert!(!inner2.torque_transition_pending());
+    assert_eq!(inner2.enable_lifecycle(), armd::supervisor::EnableLifecycle::FailedHold);
+    assert!(inner2.is_torqued && !inner2.disable_pending);
+    assert_eq!(inner2.safety.fault().map(|f| f.code), Some(armd::FaultCode::EnableFailed));
+    assert!(!inner2.safety.recoverable());
+
+    // Explicit TorqueOff at the rest pose succeeds through the rest gate (K=3 rest-pose ticks)!
+    r2.bus.with(|s| s.motors[3].drop_torque_frames = 0);
+    for _ in 0..3 {
+        r2.bus.with(|s| s.push_all_feedback());
+        r2.step();
+    }
+    r2.submit(TransitionOp::TorqueOff);
+    assert!(r2.step().command.unwrap().1.is_ok());
+    let (_, off_outcome, _) = r2.until_ended(30);
+    assert_eq!(off_outcome, Outcome::Completed);
+    assert!(!r2.fx.core.is_torqued);
+    assert_eq!(r2.fx.core.enable_lifecycle(), armd::supervisor::EnableLifecycle::Disarmed);
 }
 
 #[test]
@@ -145,15 +242,18 @@ fn a_disable_waits_for_fresh_disabled_feedback_and_holds_no_output_meanwhile() {
     assert!(first.command.unwrap().1.is_ok(), "{first:?}");
     assert!(r.fx.core.disable_pending && r.fx.core.is_torqued, "pending until confirmed: {first:?} {} {} {}", r.fx.core.disable_pending, r.fx.core.is_torqued, r.fx.core.torque_transition_pending());
     r.bus.clear_log();
-    let (_, outcome, reports) = r.until_ended(20);
+    let (_, outcome, reports) = r.until_ended(30);
     assert_eq!(outcome, Outcome::Completed);
-    // no target frame while the transition owned the bus (only disable retries / polls)
+    // no target frame while the transition owned the bus (only 0xCC rest probes and disable repeats)
     let targets = r.bus.tx_log().iter().filter(|f| (1..=7).contains(&f.id) && f.data != damiao::CMD_DISABLE).count();
     assert_eq!(targets, 0, "{:?}", r.bus.tx_log());
+    let disables = r.bus.tx_log().iter().filter(|f| f.data == damiao::CMD_DISABLE).count();
+    assert_eq!(disables, 21, "all 3 bounded disable repeats across 7 motors after K=3 rest gate: {disables}");
     let inner = &r.fx.core;
+    assert_eq!(inner.torque_intent(), armd::TorqueIntent::Off);
     assert!(!inner.is_torqued && !inner.disable_pending && !inner.pending_rearm && !inner.torque_transition_pending());
     assert_eq!(*inner.safety.state(), armd::SafetyState::Idle);
-    assert!(reports.iter().map(|p| p.wakes).sum::<u32>() > 0, "the confirmation was served between releases");
+    assert!(reports.len() >= 2, "bounded 20 ms repeats execute across release ticks");
 }
 
 

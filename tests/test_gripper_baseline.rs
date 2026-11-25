@@ -686,8 +686,39 @@ fn lubricated_finger_one_open_then_air_closes() {
 
 // ---- gripper_calibrate action (orchestrator in armd) ----
 
+/// Drop-guard and tick counter for [`calib_rig`]'s background ticker task.
+struct CalibTicker {
+    ticks: Arc<std::sync::atomic::AtomicU64>,
+    notify: Arc<tokio::sync::Notify>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl CalibTicker {
+    async fn wait_ticks(&self, count: u64) {
+        use std::sync::atomic::Ordering;
+        let target = self.ticks.load(Ordering::Acquire).saturating_add(count);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let notified = self.notify.notified();
+            if self.ticks.load(Ordering::Acquire) >= target {
+                return;
+            }
+            tokio::time::timeout_at(deadline, notified)
+                .await
+                .unwrap_or_else(|_| panic!("calib ticker did not advance by {count} ticks"));
+        }
+    }
+}
+
+impl Drop for CalibTicker {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 /// Supervisor with the rig driver, ticked at 20 ms of simulated time every millisecond.
-async fn calib_rig(finger: Finger) -> (Arc<armd::ArmSupervisor>, Arc<Mutex<Rig>>) {
+async fn calib_rig(finger: Finger) -> (Arc<armd::ArmSupervisor>, Arc<Mutex<Rig>>, CalibTicker) {
+    use std::sync::atomic::{AtomicU64, Ordering};
     let rig = Arc::new(Mutex::new(Rig { q: INSPECT, v: [0.0; 7], tau: [0.0; 7], enabled: EnableState::Disabled,
         finger, load: Load::Free, seed: 11, offset: 0.0, broke: false, peak_tau: 0.0, pressed: 0 }));
     let sup = Arc::new(armd::ArmSupervisor::new(ArmConfig::rebot_dm()));
@@ -701,12 +732,21 @@ async fn calib_rig(finger: Finger) -> (Arc<armd::ArmSupervisor>, Arc<Mutex<Rig>>
         let admitted = inner.check_admission(stamp).unwrap();
         armd::SupervisorInner::enable_torque(admitted).unwrap();
     }
+    let ticks = Arc::new(AtomicU64::new(0));
+    let notify = Arc::new(tokio::sync::Notify::new());
     let ticker = sup.clone();
-    tokio::spawn(async move {
+    let ticks_bg = Arc::clone(&ticks);
+    let notify_bg = Arc::clone(&notify);
+    let task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(1));
-        loop { interval.tick().await; ticker.tick(DT).await; }
+        loop {
+            interval.tick().await;
+            ticker.tick(DT).await;
+            ticks_bg.fetch_add(1, Ordering::Release);
+            notify_bg.notify_waiters();
+        }
     });
-    (sup, rig)
+    (sup, rig, CalibTicker { ticks, notify, task })
 }
 
 async fn calib_wait(sup: &armd::ArmSupervisor, id: u64, mut each: impl FnMut(&armd::motion::ActionStatus)) -> armd::motion::ActionStatus {
@@ -723,7 +763,7 @@ async fn calib_wait(sup: &armd::ArmSupervisor, id: u64, mut each: impl FnMut(&ar
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn calibration_action_learns_from_free_strokes() {
-    let (sup, _rig) = calib_rig(Finger::New).await;
+    let (sup, _rig, _ticker) = calib_rig(Finger::New).await;
     let (id, expected) = armd::gripper_calib::start_calibration(&sup, sup.capture_admission_stamp()).await.unwrap();
     assert!(expected > 60.0, "{expected}");
     let mut phases = Vec::new();
@@ -742,7 +782,7 @@ async fn calibration_action_learns_from_free_strokes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn calibration_action_obstructed_or_stopped_learns_nothing() {
     for case in ["soft", "drag", "stop"] {
-        let (sup, rig) = calib_rig(Finger::New).await;
+        let (sup, rig, _ticker) = calib_rig(Finger::New).await;
         let before = {
             let mut inner = sup.inner().write().await;
             inner.gripper_baseline_for_motion();
@@ -819,15 +859,19 @@ async fn calibration_fails_on_a_thin_obstruction_before_the_closed_stroke_end() 
     let p = GripperPolicy::rebot_dm();
     let target = p.closed_rad + 0.05 * (p.open_rad - p.closed_rad);
     for k in [3.0f32, 20.0] {
-        let (sup, rig) = calib_rig(Finger::New).await;
+        let (sup, rig, ticker) = calib_rig(Finger::New).await;
         let before = { let mut inner = sup.inner().write().await; inner.gripper_baseline_for_motion(); inner.gripper_baseline.clone() };
         rig.lock().unwrap().load = Load::CloseBlock(target - 0.10, k);
         let (id, _) = armd::gripper_calib::start_calibration(&sup, sup.capture_admission_stamp()).await.unwrap();
         let a = calib_wait(&sup, id, |_| {}).await;
         for _ in 0..200 {
             if sup.inner().read().await.gripper_calibration.is_none() { break; }
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            ticker.wait_ticks(1).await;
         }
+        // `SupervisorInner::tick_control` clears a stopped-short gripper's leading command on the
+        // next control tick (`hold_gripper_at_measured`) and sends the hold to `RigDriver`; wait
+        // for two full post-termination ticks before inspecting J7 and resetting `peak_tau`.
+        ticker.wait_ticks(2).await;
         let inner = sup.inner().read().await;
         eprintln!("thin obstruction k {k}: {} {:?} {:?} (phase {:?})", a.state, a.code, a.message, a.phase);
         assert_eq!((a.state.as_str(), a.code.as_deref(), a.phase.as_deref()), ("failed", Some("CALIBRATION_OBSTRUCTED"), Some("stroke:1/14")), "k {k}: {a:?}");
@@ -838,8 +882,8 @@ async fn calibration_fails_on_a_thin_obstruction_before_the_closed_stroke_end() 
         eprintln!("thin obstruction k {k}: J7 command {cmd:.4}, jaw {meas:.4}");
         assert!((cmd - meas).abs() < 1e-3, "k {k}: command {cmd} vs jaw {meas}");
         rig.lock().unwrap().peak_tau = 0.0;
-        // the ticker runs a 20 ms tick every millisecond: 200 ms of wall time covers 50+ ticks
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Wait for 50 simulated control ticks deterministically instead of a wall-clock sleep.
+        ticker.wait_ticks(50).await;
         let peak = rig.lock().unwrap().peak_tau;
         assert!(peak <= 0.01, "k {k}: still pressing, {peak} N·m");
     }

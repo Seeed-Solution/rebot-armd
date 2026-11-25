@@ -194,6 +194,8 @@ pub struct PublishedConfig {
     pub torque_guard_thresholds: Vec<Option<f32>>,
     pub effective_planned_close_speed: f64,
     pub policy_live_allowed: bool,
+    #[cfg(feature = "policy-runtime")]
+    pub policy_ledger_path: Option<PathBuf>,
     pub fallback_measured_positions: Vec<f32>,
 }
 
@@ -213,6 +215,8 @@ impl PublishedConfig {
             .as_ref()
             .and_then(|d| d.lock().ok().and_then(|drv| drv.motor_current_cap()))
             .and_then(|cap| serde_json::to_value(cap).ok());
+        let mut sequences = inner.sequences.clone();
+        sequences.pins = inner.active_sequence_pins().cloned();
         Self {
             config: inner.config.clone(),
             follower: inner.follower.clone(),
@@ -232,7 +236,7 @@ impl PublishedConfig {
             gripper_calib_stale: inner.gripper_calib_stale.clone(),
             gripper_calib_revision: inner.gripper_calib_revision,
             poses: inner.poses.clone(),
-            sequences: inner.sequences.clone(),
+            sequences,
             episodes: inner.episodes.clone(),
             grasp_setup_revision: inner.grasp_setup_revision,
             tool_commissioning_path: inner.tool_commissioning_path.clone(),
@@ -272,6 +276,8 @@ impl PublishedConfig {
                     false
                 }
             },
+            #[cfg(feature = "policy-runtime")]
+            policy_ledger_path: inner.policy_ledger_path.clone(),
             fallback_measured_positions: inner.measured_positions.clone(),
         }
     }
@@ -404,6 +410,11 @@ impl PublishedConfig {
             .is_some_and(|c| c.camera_mount.q_end_cam.is_some())
     }
 
+    #[cfg(feature = "policy-runtime")]
+    pub fn active_calibration_digest(&self) -> String {
+        SupervisorInner::calibration_digest_of(self.calibration.as_ref())
+    }
+
     pub fn pose_tcp(&self, q: &[f32]) -> Option<PoseTcp> {
         self.config.kinematics?;
         let pose = self.config.tcp_pose_f32(q)?;
@@ -488,6 +499,13 @@ impl PublishedConfig {
         Value::Object(obj)
     }
 
+    /// True when sequence `id` is actively running in this published snapshot.
+    /// `ArmSupervisor::published_config` guarantees `self.sequences.pins` holds only active pins.
+    pub fn is_sequence_running(&self, id: &str) -> bool {
+        self.sequences
+            .is_sequence_running_with_pins(id, self.sequences.pins.as_ref())
+    }
+
     pub fn sequence_view(&self, s: &Sequence) -> Value {
         let mut stale = Vec::new();
         let mut missing = Vec::new();
@@ -509,7 +527,7 @@ impl PublishedConfig {
         let mut v = serde_json::to_value(s).unwrap_or_default();
         v["stale_steps"] = json!(stale);
         v["missing_steps"] = json!(missing);
-        v["running"] = json!(self.sequences.pins.as_ref().is_some_and(|p| p.sequence_id == s.id));
+        v["running"] = json!(self.is_sequence_running(&s.id));
         v
     }
 
@@ -1360,7 +1378,7 @@ pub enum ConfigRequest {
     GravityComp(GravityCompOp),
     InspectHold(ConfigDomain),
     /// Zero-alloc check on live owner whether `episode_id` may be deleted (not referenced by
-    /// saved sequences, running sequence pins, or an active `Sequences` save reservation).
+    /// saved sequences, active running sequence pins, or an active `Sequences` save reservation).
     CheckEpisodeDeleteAllowed(HolderLabel),
     /// Zero-alloc start/preflight of an executor calibration or software-zero transaction.
     BeginCalibrationTxn {
@@ -1388,6 +1406,12 @@ pub enum ConfigRequest {
         require_zero_state_checks: bool,
         check_authority: bool,
     },
+    /// Installs active `RunPins` on the live owner (`OWNER_EXECUTOR`) with zero alloc/free on
+    /// `armd-control`; any displaced or stale pins are retired off-thread via `ConfigRetiredPayloads`.
+    InstallSequenceRunPins(crate::sequences::RunPins),
+    /// Clears `RunPins` for `action_id` on the live owner (`OWNER_EXECUTOR`) with zero free on
+    /// `armd-control`.
+    ClearSequenceRunPins { action_id: u64 },
 }
 
 impl ConfigRequest {
@@ -1409,6 +1433,9 @@ impl ConfigRequest {
             Self::BeginCalibrationTxn { .. }
             | Self::EndCalibrationTxn { .. }
             | Self::SampleCalibrationState { .. } => "/api/v1/calibration",
+            Self::InstallSequenceRunPins(_) | Self::ClearSequenceRunPins { .. } => {
+                "/api/v1/action/run_sequence"
+            }
         }
     }
 }
@@ -1432,6 +1459,7 @@ pub enum ConfigReply {
     CalibrationTxnBegan(Result<CalibrationStateSample, ConfigError>),
     CalibrationTxnEnded(bool),
     CalibrationStateSampled(Result<CalibrationStateSample, ConfigError>),
+    SequenceRunPinsUpdated,
 }
 
 /// Displaced or unused heap payloads carried back inside the SAME `Box<ConfigExchange>`
@@ -1448,6 +1476,7 @@ pub struct ConfigRetiredPayloads {
     pub pose_list: Option<PoseList>,
     pub sequence_file: Option<SequenceFile>,
     pub reserved_sequence_pins: Option<crate::sequences::ReservedSequencePins>,
+    pub run_sequence_pins: Option<crate::sequences::RunPins>,
     pub steps: Option<Vec<Step>>,
     pub grasp_setup: Option<GraspSetup>,
     pub string_a: Option<String>,
@@ -1545,7 +1574,21 @@ pub(crate) fn handle_config_exchange(
             state: core.core.config_held(domain).map(|h| h.state),
         },
         ConfigRequest::CheckEpisodeDeleteAllowed(episode_id) => {
-            ConfigReply::EpisodeDeleteAllowed(!core.sequences.is_episode_in_use(episode_id.as_str()))
+            ConfigReply::EpisodeDeleteAllowed(!core.is_episode_in_use(episode_id.as_str()))
+        }
+        ConfigRequest::InstallSequenceRunPins(pins) => {
+            if core.running_action_id() == Some(pins.action_id) {
+                ex.retired.run_sequence_pins = core.sequences.pins.replace(pins);
+            } else {
+                ex.retired.run_sequence_pins = Some(pins);
+            }
+            ConfigReply::SequenceRunPinsUpdated
+        }
+        ConfigRequest::ClearSequenceRunPins { action_id } => {
+            if core.sequences.pins.as_ref().is_some_and(|p| p.action_id == action_id) {
+                ex.retired.run_sequence_pins = core.sequences.pins.take();
+            }
+            ConfigReply::SequenceRunPinsUpdated
         }
         ConfigRequest::BeginCalibrationTxn {
             txn_id,
@@ -1659,7 +1702,7 @@ fn run_reserve_precheck(
             if core.calibration_busy {
                 return Err(ConfigError::Busy("a camera calibration apply or restore is running"));
             }
-            if !deleting_pose_id.is_empty() && core.sequences.is_pose_in_use(deleting_pose_id.as_str()) {
+            if !deleting_pose_id.is_empty() && core.is_pose_in_use(deleting_pose_id.as_str()) {
                 return Err(ConfigError::PoseInUse);
             }
             Ok(())
@@ -1683,11 +1726,7 @@ fn run_reserve_precheck(
                     }
                 }
                 if let Some(del_id) = deleting_sequence_id {
-                    if core
-                        .sequences
-                        .pins
-                        .as_ref()
-                        .is_some_and(|p| p.sequence_id == del_id.as_str())
+                    if core.is_sequence_running(del_id.as_str())
                         && core.sequences.get(del_id.as_str()).is_some()
                     {
                         return Err(ConfigError::SequenceRunning);
@@ -4814,6 +4853,7 @@ where
             cfg.workspace_revision = activated.workspace_revision;
             update_published(cfg, activated);
         });
+        sync_prep_env_from_published(&self.sup);
         drop(self.episode_pin_guard.take());
 
         Ok(ConfigCommitOutcome {
@@ -5032,6 +5072,27 @@ where
     execute_common_commit(&mut backend).await
 }
 
+fn sync_prep_env_from_published(sup: &ArmSupervisor) {
+    let Some(pub_cfg) = sup.published_config_hub().latest() else {
+        return;
+    };
+    let Some(cur) = sup.hub().prep_env() else {
+        return;
+    };
+    let mut next = (*cur).clone();
+    next.config = pub_cfg.config.clone();
+    next.workspace_policy = pub_cfg.workspace_policy().map(|(ws, _)| ws.clone());
+    next.poses = pub_cfg.poses.list.clone();
+    next.sequences = pub_cfg.sequences.clone();
+    next.grasp_setup = pub_cfg.config.grasp.clone();
+    next.workspace_revision = pub_cfg.workspace_revision;
+    next.poses_revision = pub_cfg.poses.revision;
+    next.sequences_revision = pub_cfg.sequences.revision;
+    next.grasp_setup_revision = pub_cfg.grasp_setup_revision;
+    next.gripper_calib_revision = pub_cfg.gripper_calib_revision;
+    sup.hub().update_prep_env(Arc::new(next));
+}
+
 fn target_file_label(path: &std::path::Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -5211,6 +5272,7 @@ fn spawn_config_reconcile_retry<FAuth, FPub>(
                             cfg.workspace_revision = activated.workspace_revision;
                             update_pub(cfg, activated);
                         });
+                        sync_prep_env_from_published(&sup);
                     }
                     if let Some(mp) = pending_marker_path.take() {
                         let rm_res = tokio::task::spawn_blocking(move || {

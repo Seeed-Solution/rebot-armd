@@ -319,6 +319,7 @@ pub fn create_router_full_with_sandbox(
                 .post(proxy::post_vision_mode)
                 .layer(middleware::from_fn(require_operator_for_writes)),
         )
+        .route(crate::vision_detector::PATH, post(rest::post_vision_detector).layer(middleware::from_fn(require_operator)))
         .route("/api/v1/vision/subscribe", post(proxy::post_vision_subscribe).layer(middleware::from_fn(require_operator)))
         .route("/api/v1/vision/subscribe/{id}", axum::routing::delete(proxy::delete_vision_subscribe).layer(middleware::from_fn(require_operator)))
         .route("/api/v1/vision/subscribe/{id}/keepalive", post(proxy::post_vision_keepalive).layer(middleware::from_fn(require_operator)))
@@ -396,8 +397,13 @@ async fn gate_executor_owner(
                         | "/api/v1/auth/lock"
                         | "/api/v1/heartbeat"
                         | "/api/v1/motion/servo"
+                        | "/api/v1/action/policy/start"
+                        | "/api/v1/action/policy/stop"
+                        | "/api/v1/vision/clock-handshake"
+                        | "/api/v1/vision/embedding"
                         | "/api/v1/diagnostics/tick/mark"
                         | "/api/v1/tool/commissioning/confirm"
+                        | "/api/v1/action/grasp"
                 ),
                 _ => false,
             };

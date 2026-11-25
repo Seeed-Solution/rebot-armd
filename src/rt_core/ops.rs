@@ -356,13 +356,15 @@ pub const TERMINAL_CODES: &[&str] = &[
     "FOLLOWING_ERROR", "CONTROL_DEADLINE", "INVALID_TELEMETRY", "DRIVER_WRITE_FAILED", "CAN_TX_STALLED", "J7_FEEDBACK_STALE", "HARDWARE_FAULT", "ENABLE_FAILED",
     "SERVO_NO_BRAKE", "HANDOVER_UNSETTLED", "GRAVITY_COMP_FAILED", "COLLISION", "COLLISION_HOLD", "BLOCKED_HOLD", "WORKSPACE_HOLD",
     "TORQUE_LIMIT", "TRACKING_STALL", "SAFETY_ERROR", "SAFETY_REJECTED", "SOFT_LIMIT_EXCEEDED", "FEEDBACK_UNAVAILABLE",
-    "FEEDBACK_UNCONFIRMED", "FEEDBACK_STALE", "INVALID_FEEDBACK", "UNLOAD_FAILED",
+    "FEEDBACK_UNCONFIRMED", "FEEDBACK_STALE", "INVALID_FEEDBACK", "UNLOAD_FAILED", "TORQUE_OFF_WOULD_DROP", "ARM_NOT_AT_RESTING_POSE", "DRIVER_BUSY",
     // motion and action failures
     "IK_UNREACHABLE", "IK_BRANCH_FLIP", "WORKSPACE_VIOLATION", "INVALID_COMMAND", "INVALID_TARGET", "JUMP_LIMIT", "STEP_LIMIT",
     "SERVO_INFEASIBLE", "SERVO_TARGET_DISCARDED", "STALE_INPUT", "MOTION_TIMEOUT", "GRIPPER_TIMEOUT", "GRASP_TIMEOUT",
     "PLACE_TIMEOUT", "TARGET_TIMEOUT", "SEQUENCE_TIMEOUT", "HOVER_TIMEOUT", "MEASURE_TIMEOUT", "MAX_SECONDS", "NOT_HOLDING", "TARGET_LOST", "TARGET_DISPLACED",
     "DROPPED", "OBJECT_HELD", "OBJECT_TOO_TALL", "TOO_WIDE", "CENTRING_FAILED", "DETECTION_UNAVAILABLE", "TASK_UNSUPPORTED",
     "OBSERVATION_UNAVAILABLE", "PERSIST_FAILED", "POLICY_NOT_ACTIVE", "POWER_LIMIT",
+    "LIFT_TORQUE", "INSUFFICIENT_EVIDENCE", "BUDGET_EXHAUSTED",
+    "VISION_STALE", "INFERENCE_ERROR", "POLICY_REVOKED", "POLICY_FAILED", "MODEL_CHANGED", "HANDSHAKE_EXPIRED",
 ];
 
 /// The static form of an action's code (None: it named none or an unlisted one).
@@ -598,6 +600,15 @@ pub trait CoreOps {
     /// `frame.positions()` (a slice of the frame) into the core's preallocated target state.
     /// (The foundation adapter still delegates to `servo(Vec)`, which allocates: track D.)
     fn consume_target(&mut self, frame: &TargetFrame, ctx: &CommitCtx) -> Result<(), Refusal>;
+    /// Applies one target together with its atomic [`super::mailbox::PolicyValidityBounds`].
+    fn consume_target_with_validity(
+        &mut self,
+        frame: &TargetFrame,
+        _validity: super::mailbox::PolicyValidityBounds,
+        ctx: &CommitCtx,
+    ) -> Result<(), Refusal> {
+        self.consume_target(frame, ctx)
+    }
     /// Applies any pending urgent E-stop request; returns true when an E-stop was applied.
     fn apply_estop(&mut self) -> bool { false }
     /// Synchronizes any non-blocking socket-close lease fence (lock-free, zero allocations)
@@ -608,6 +619,10 @@ pub trait CoreOps {
     /// Drains displaced lease generations queued since the last drain (zero allocs) so the
     /// release engine can dispatch off-thread `close_servo(old_generation)` strictly after publish.
     fn drain_servo_closes(&mut self, _each: &mut dyn FnMut(u64)) {}
+    /// True when terminated policy action IDs await post-publication atomic close watermark flush.
+    fn has_pending_policy_close(&self) -> bool { false }
+    /// Advances the durable post-publication policy close watermark (zero allocs, lossless).
+    fn flush_policy_close_watermark(&mut self) -> u64 { 0 }
     /// An authorized stop was requested: stop active motion.
     fn apply_stop(&mut self);
     /// Applies an authorized stop at `generation` and synchronizes the owner's stop counter.
@@ -707,6 +722,20 @@ pub trait CoreOps {
     ) -> Result<Committed, &'static str> {
         Err("UNSUPPORTED")
     }
+    /// Commits one policy lifecycle broker command (`ReserveLoad`, `BeginPolicy`, `EndPolicy`).
+    #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+    fn commit_policy(
+        &mut self,
+        _d: &Descriptor,
+        _cmd: super::requests::policy::PolicyCommand,
+        _ctx: &CommitCtx,
+    ) -> Result<Committed, &'static str> {
+        Err("UNSUPPORTED")
+    }
+    /// Publishes the post-completion request watermark strictly AFTER `commit_policy` (or refusal)
+    /// finishes reading cancellation slots and updating active load/run tokens.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+    fn finish_policy_command(&mut self, _req_id: u64) {}
     /// True while a macro parent's current child still owns trajectory, settle, or deferred TX.
     fn macro_child_running(&self, _parent: ActionId) -> bool { false }
     /// Attaches the broker's lock-free closed-connection bitset for RT commit checks.
@@ -828,6 +857,128 @@ static STOP_DIAG: StopDiagSlot = StopDiagSlot::new();
 /// moves it onto `ArmCore` / `ExecutorStats`.
 pub fn stop_diag() -> &'static StopDiagSlot { &STOP_DIAG }
 
+/// Lock-free fixed-size diagnostic slot for RT gripper force-cap warnings (0 allocs, 0 tracing
+/// calls on `armd-control`; drained and emitted off-thread in `StateHub::refresh`).
+pub struct GripperForceDiagSlot {
+    unavail_count: AtomicU64,
+    unavail_drained: AtomicU64,
+    unavail_bus_fresh: std::sync::atomic::AtomicBool,
+    unavail_has_torque: std::sync::atomic::AtomicBool,
+    cap_trip_count: AtomicU64,
+    cap_trip_drained: AtomicU64,
+    cap_tau_milli_nm: AtomicU32,
+    cap_limit_milli_nm: AtomicU32,
+    cap_pos_milli_rad: std::sync::atomic::AtomicI32,
+    cap_trips: AtomicU32,
+    stream_stop_count: AtomicU64,
+    stream_stop_drained: AtomicU64,
+    stream_stop_max_trips: AtomicU32,
+}
+
+impl GripperForceDiagSlot {
+    pub const fn new() -> Self {
+        Self {
+            unavail_count: AtomicU64::new(0),
+            unavail_drained: AtomicU64::new(0),
+            unavail_bus_fresh: std::sync::atomic::AtomicBool::new(false),
+            unavail_has_torque: std::sync::atomic::AtomicBool::new(false),
+            cap_trip_count: AtomicU64::new(0),
+            cap_trip_drained: AtomicU64::new(0),
+            cap_tau_milli_nm: AtomicU32::new(0),
+            cap_limit_milli_nm: AtomicU32::new(0),
+            cap_pos_milli_rad: std::sync::atomic::AtomicI32::new(0),
+            cap_trips: AtomicU32::new(0),
+            stream_stop_count: AtomicU64::new(0),
+            stream_stop_drained: AtomicU64::new(0),
+            stream_stop_max_trips: AtomicU32::new(0),
+        }
+    }
+
+    pub fn record_feedback_unavailable(&self, bus_fresh: bool, has_torque: bool) {
+        self.unavail_bus_fresh.store(bus_fresh, Ordering::Relaxed);
+        self.unavail_has_torque.store(has_torque, Ordering::Relaxed);
+        self.unavail_count.fetch_add(1, Ordering::Release);
+    }
+
+    pub fn record_cap_trip(&self, tau_abs: f32, limit_nm: f32, pos_rad: f32, trips: u32) {
+        let to_u32 = |v: f32| if v.is_finite() && v >= 0.0 { (v * 1000.0).min(u32::MAX as f32) as u32 } else { 0 };
+        let to_i32 = |v: f32| if v.is_finite() { (v * 1000.0).clamp(i32::MIN as f32, i32::MAX as f32) as i32 } else { 0 };
+        self.cap_tau_milli_nm.store(to_u32(tau_abs), Ordering::Relaxed);
+        self.cap_limit_milli_nm.store(to_u32(limit_nm), Ordering::Relaxed);
+        self.cap_pos_milli_rad.store(to_i32(pos_rad), Ordering::Relaxed);
+        self.cap_trips.store(trips, Ordering::Relaxed);
+        self.cap_trip_count.fetch_add(1, Ordering::Release);
+    }
+
+    pub fn record_stream_stopped(&self, max_trips: u32) {
+        self.stream_stop_max_trips.store(max_trips, Ordering::Relaxed);
+        self.stream_stop_count.fetch_add(1, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub fn counts(&self) -> (u64, u64, u64) {
+        (
+            self.unavail_count.load(Ordering::Acquire),
+            self.cap_trip_count.load(Ordering::Acquire),
+            self.stream_stop_count.load(Ordering::Acquire),
+        )
+    }
+
+    pub fn drain_and_log_once(&self) {
+        loop {
+            let prev = self.unavail_drained.load(Ordering::Acquire);
+            let now = self.unavail_count.load(Ordering::Acquire);
+            if now == prev { break; }
+            if self.unavail_drained.compare_exchange(prev, now, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                tracing::warn!(
+                    "Gripper close stopped ({} event(s)): feedback_fresh={} torque_feedback={} while max_close_torque_nm is active; holding",
+                    now.wrapping_sub(prev),
+                    self.unavail_bus_fresh.load(Ordering::Relaxed),
+                    self.unavail_has_torque.load(Ordering::Relaxed),
+                );
+                break;
+            }
+        }
+        loop {
+            let prev = self.cap_trip_drained.load(Ordering::Acquire);
+            let now = self.cap_trip_count.load(Ordering::Acquire);
+            if now == prev { break; }
+            if self.cap_trip_drained.compare_exchange(prev, now, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                tracing::warn!(
+                    "Gripper torque cap ({} event(s)): |tau| {:.2} N·m above {:.2} N·m at {:.3} rad (trip {} on this contact); holding",
+                    now.wrapping_sub(prev),
+                    self.cap_tau_milli_nm.load(Ordering::Relaxed) as f32 / 1000.0,
+                    self.cap_limit_milli_nm.load(Ordering::Relaxed) as f32 / 1000.0,
+                    self.cap_pos_milli_rad.load(Ordering::Relaxed) as f32 / 1000.0,
+                    self.cap_trips.load(Ordering::Relaxed),
+                );
+                break;
+            }
+        }
+        loop {
+            let prev = self.stream_stop_drained.load(Ordering::Acquire);
+            let now = self.stream_stop_count.load(Ordering::Acquire);
+            if now == prev { break; }
+            if self.stream_stop_drained.compare_exchange(prev, now, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                tracing::warn!(
+                    "Gripper torque cap tripped {} times on one contact under a stream ({} event(s)); stopping the stream",
+                    self.stream_stop_max_trips.load(Ordering::Relaxed),
+                    now.wrapping_sub(prev),
+                );
+                break;
+            }
+        }
+    }
+}
+
+impl Default for GripperForceDiagSlot {
+    fn default() -> Self { Self::new() }
+}
+
+static GRIPPER_FORCE_DIAG: GripperForceDiagSlot = GripperForceDiagSlot::new();
+
+pub(crate) fn gripper_force_diag() -> &'static GripperForceDiagSlot { &GRIPPER_FORCE_DIAG }
+
 /// The protocol code of a delegated error, as a static string without allocating
 /// (unknown codes: `REJECTED`).
 pub(crate) fn static_code(e: ArmError) -> &'static str {
@@ -836,7 +987,7 @@ pub(crate) fn static_code(e: ArmError) -> &'static str {
         "MOTION_BUSY", "NOT_ARMED", "ESTOP_ACTIVE", "FAULT_ACTIVE", "EPOCH_MISMATCH", "INVALID_COMMAND", "IK_UNREACHABLE",
         "WORKSPACE_VIOLATION", "JOINT_LIMIT", "PLAN_STALE", "LEASE_LOST", "NO_LEASE", "DISCONNECTED", "COLLISION_HOLD", "COMMISSIONING_REQUIRED",
         "INVALID_VALUE", "UNSUPPORTED", "INTERNAL", "FEEDBACK_STALE", "J7_FEEDBACK_STALE", "FEEDBACK_UNAVAILABLE", "CONFIG_BUSY", "ARM_NOT_AT_RESTING_POSE", "TOOL_MISMATCH",
-        "MOTION_FORBIDDEN_IN_FAULT_STATE", "STOPPED", "TERMINALS_BUSY", "STAMP_REUSED", "HANDOVER_SETTLING", "DISABLE_PENDING", "TRANSITION_BUSY",
+        "MOTION_FORBIDDEN_IN_FAULT_STATE", "TORQUE_OFF_WOULD_DROP", "STOPPED", "TERMINALS_BUSY", "STAMP_REUSED", "HANDOVER_SETTLING", "DISABLE_PENDING", "TRANSITION_BUSY",
         "WRONG_TARGET", "DEADLINE_EXPIRED",
     ];
     match &e {
@@ -854,6 +1005,7 @@ pub(crate) fn static_code(e: ArmError) -> &'static str {
             S::WorkspaceViolation { .. } => "WORKSPACE_VIOLATION",
             S::ArmNotAtRestingPose { .. } => "ARM_NOT_AT_RESTING_POSE",
             S::MotionForbiddenInFaultState(_) => "MOTION_FORBIDDEN_IN_FAULT_STATE",
+            S::TorqueOffWouldDrop { .. } => "TORQUE_OFF_WOULD_DROP",
             S::Stopped => "STOPPED",
             S::LeaseLost => "LEASE_LOST",
             S::TerminalsBusy => "TERMINALS_BUSY",
@@ -1244,6 +1396,15 @@ impl CoreOps for SupervisorInner {
         self.consume_target_frame(frame, ctx)
     }
 
+    fn consume_target_with_validity(
+        &mut self,
+        frame: &TargetFrame,
+        validity: super::mailbox::PolicyValidityBounds,
+        ctx: &CommitCtx,
+    ) -> Result<(), Refusal> {
+        self.consume_target_frame_with_validity(frame, validity, ctx)
+    }
+
     fn apply_estop(&mut self) -> bool { self.consume_pending_estop() }
 
     fn sync_disconnect_fence(&mut self, now: Instant) -> bool {
@@ -1256,6 +1417,28 @@ impl CoreOps for SupervisorInner {
 
     fn drain_servo_closes(&mut self, each: &mut dyn FnMut(u64)) {
         self.drain_pending_servo_closes(each);
+    }
+
+    fn has_pending_policy_close(&self) -> bool {
+        #[cfg(feature = "policy-runtime")]
+        {
+            self.has_pending_policy_close()
+        }
+        #[cfg(not(feature = "policy-runtime"))]
+        {
+            false
+        }
+    }
+
+    fn flush_policy_close_watermark(&mut self) -> u64 {
+        #[cfg(feature = "policy-runtime")]
+        {
+            self.flush_pending_policy_close_watermark()
+        }
+        #[cfg(not(feature = "policy-runtime"))]
+        {
+            0
+        }
     }
 
     // ends client motion; a running watchdog park belongs to the lease watchdog and continues
@@ -1370,19 +1553,49 @@ impl CoreOps for SupervisorInner {
                 ..HardwarePoll::default()
             };
         };
-        let d = driver.lock().unwrap_or_else(|e| e.into_inner());
-        d.feedback_ages_into(&mut self.scratch.ages);
-        let oldest = self.scratch.ages.iter().copied().try_fold(Duration::ZERO, |m, a| a.map(|a| m.max(a)));
-        HardwarePoll {
-            driverless: false,
-            feedback_valid: d.is_feedback_valid(),
-            enable_state: Some(d.enable_state()),
-            oldest_feedback_age: oldest,
-            rx_frames,
-            budget_exhausted,
-            torque: self.core.poll_transition(),
-            park_wake,
-            park_state_changed,
+        match driver.try_lock() {
+            Ok(d) => {
+                d.feedback_ages_into(&mut self.scratch.ages);
+                let oldest = self.scratch.ages.iter().copied().try_fold(Duration::ZERO, |m, a| a.map(|a| m.max(a)));
+                HardwarePoll {
+                    driverless: false,
+                    feedback_valid: d.is_feedback_valid(),
+                    enable_state: Some(d.enable_state()),
+                    oldest_feedback_age: oldest,
+                    rx_frames,
+                    budget_exhausted,
+                    torque: self.core.poll_transition(),
+                    park_wake,
+                    park_state_changed,
+                }
+            }
+            Err(std::sync::TryLockError::WouldBlock) => HardwarePoll {
+                driverless: false,
+                feedback_valid: false,
+                enable_state: Some(crate::driver::EnableState::Unknown),
+                oldest_feedback_age: None,
+                rx_frames,
+                budget_exhausted,
+                torque: self.core.poll_transition(),
+                park_wake,
+                park_state_changed,
+            },
+            Err(std::sync::TryLockError::Poisoned(e)) => {
+                let d = e.into_inner();
+                d.feedback_ages_into(&mut self.scratch.ages);
+                let oldest = self.scratch.ages.iter().copied().try_fold(Duration::ZERO, |m, a| a.map(|a| m.max(a)));
+                HardwarePoll {
+                    driverless: false,
+                    feedback_valid: d.is_feedback_valid(),
+                    enable_state: Some(d.enable_state()),
+                    oldest_feedback_age: oldest,
+                    rx_frames,
+                    budget_exhausted,
+                    torque: self.core.poll_transition(),
+                    park_wake,
+                    park_state_changed,
+                }
+            }
         }
     }
 
@@ -1431,6 +1644,21 @@ impl CoreOps for SupervisorInner {
         ctx: &CommitCtx,
     ) -> Result<Committed, &'static str> {
         super::requests::actions::commit_action(self, d, cmd, slot, ctx)
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+    fn commit_policy(
+        &mut self,
+        d: &Descriptor,
+        cmd: super::requests::policy::PolicyCommand,
+        ctx: &CommitCtx,
+    ) -> Result<Committed, &'static str> {
+        super::requests::policy::commit_policy(self, d, cmd, ctx)
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+    fn finish_policy_command(&mut self, req_id: u64) {
+        self.policy_cancel_slots.mark_policy_req_completed(req_id);
     }
 
     fn macro_child_running(&self, parent: ActionId) -> bool {
@@ -1958,6 +2186,9 @@ impl ReleaseEngine {
                 self.lifecycle_replies_flushed = true;
             }
             let _ = self.flush_servo_closes(core);
+        if core.flush_policy_close_watermark() != 0 {
+            self.servo_closes_flushed = true;
+        }
             return report;
         }
         // 3. Urgent recheck + at most one ordinary command (replies deferred until strictly AFTER Step 6 publish)
@@ -1998,7 +2229,9 @@ impl ReleaseEngine {
                     let is_begin_macro = matches!(d.kind, CommandKind::Action(super::requests::actions::ActionCommand::BeginMacro(_)));
                     #[cfg(target_arch = "wasm32")]
                     let is_begin_macro = false;
-                    #[cfg(not(target_arch = "wasm32"))]
+                    #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+                    let is_action_cmd = matches!(d.kind, CommandKind::Action(_) | CommandKind::Policy(_));
+                    #[cfg(all(not(target_arch = "wasm32"), not(feature = "policy-runtime")))]
                     let is_action_cmd = matches!(d.kind, CommandKind::Action(_));
                     #[cfg(target_arch = "wasm32")]
                     let is_action_cmd = false;
@@ -2012,6 +2245,8 @@ impl ReleaseEngine {
                         | CommandKind::InstallPark { .. } => true,
                         #[cfg(not(target_arch = "wasm32"))]
                         CommandKind::Action(a) => a.starts_action(),
+                        #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+                        CommandKind::Policy(p) => p.starts_action(),
                         CommandKind::ContinuePark { .. }
                         | CommandKind::Immediate(_)
                         | CommandKind::Transition(_)
@@ -2076,6 +2311,12 @@ impl ReleaseEngine {
                                 Ok(slot_ref) => core.commit_action(&d, cmd, slot_ref, &ctx),
                                 Err(code) => Err(code),
                             }
+                        }
+                        #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+                        CommandKind::Policy(cmd) => {
+                            let r = core.commit_policy(&d, cmd, &ctx);
+                            core.finish_policy_command(d.stamp.request.0);
+                            r
                         }
                         CommandKind::Lease(_) => unreachable!(),
                     };
@@ -2170,8 +2411,8 @@ impl ReleaseEngine {
         //    so off-thread command waiters always observe the post-motion published snapshot.
         let ctx = self.checkpoint(core, Checkpoint::BeforeTarget, &mut now_fn, &mut report);
         let mut deferred_target_outcome: Option<TargetOutcome> = None;
-        if let Some(f) = self.targets.take() {
-            let result = core.consume_target(&f, &ctx);
+        if let Some((f, validity)) = self.targets.take_with_validity() {
+            let result = core.consume_target_with_validity(&f, validity, &ctx);
             deferred_target_outcome = Some(TargetOutcome { stream: f.stream, seq: f.seq, result });
             report.target_refusal = result.err();
             report.target = Some((f.seq, result.map_err(|r| r.code)));
@@ -2228,6 +2469,9 @@ impl ReleaseEngine {
             }
         }
         let _ = self.flush_servo_closes(core);
+        if core.flush_policy_close_watermark() != 0 {
+            self.servo_closes_flushed = true;
+        }
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(ActiveSlot::Macro { parent, child_plan }) = self.active.as_mut() {
             if child_plan.is_some() && !core.macro_child_running(parent.action()) {
@@ -2275,6 +2519,7 @@ impl ReleaseEngine {
         if urgent_applied
             || lifecycle_pending
             || core.has_pending_servo_closes()
+            || core.has_pending_policy_close()
             || finished.is_some()
             || active_ended.is_some()
             || report.poll.park_state_changed
@@ -2301,6 +2546,9 @@ impl ReleaseEngine {
                 self.lifecycle_replies_flushed = true;
             }
             let _ = self.flush_servo_closes(core);
+            if core.flush_policy_close_watermark() != 0 {
+                self.servo_closes_flushed = true;
+            }
             return true;
         }
         if self.has_pending_urgent_stop_replies() && self.flush_urgent_stop_replies() {

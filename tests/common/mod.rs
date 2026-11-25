@@ -141,6 +141,25 @@ impl ArmDriver for TestArm {
     fn is_feedback_valid(&self) -> bool { true }
     fn is_enabled(&self) -> bool { self.0.lock().unwrap().torqued }
     fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::ZERO); 7] }
+    fn fresh_joint_positions_into(
+        &self,
+        indices: &[usize],
+        _max_age: Duration,
+        out: &mut [f32],
+    ) -> bool {
+        if out.len() < indices.len() {
+            return false;
+        }
+        let s = self.0.lock().unwrap();
+        for (slot, &i) in out.iter_mut().zip(indices.iter()) {
+            let Some(&p) = s.q.get(i) else { return false; };
+            if !p.is_finite() {
+                return false;
+            }
+            *slot = p;
+        }
+        true
+    }
     fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
         let s = self.0.lock().unwrap();
         let mut q6 = [0.0; 6];

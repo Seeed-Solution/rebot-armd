@@ -5079,3 +5079,541 @@ async fn cf1_r4_verify_authority_lease_precedence_and_watchdog_park_inhibit() {
         rig.shutdown().await;
     }
 }
+
+// ============================================================================
+// 18. Active sequence pins on both Legacy and Executor owners (no stale 409)
+// ============================================================================
+
+async fn ws_acquire_lease(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> u64 {
+    ws.send(Message::Text(
+        json!({"type": "acquire_lease", "client_id": "seq_pins_ctrl", "seq": 1})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let rem = deadline.saturating_duration_since(Instant::now());
+        assert!(!rem.is_zero(), "timed out waiting for lease_granted");
+        let msg = tokio::time::timeout(rem, ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if let Message::Text(t) = msg {
+            let v: Value = serde_json::from_str(&t).unwrap();
+            if v.get("type").and_then(Value::as_str) == Some("lease_granted") {
+                return v["generation"].as_u64().unwrap();
+            }
+        }
+    }
+}
+
+async fn wait_executor_prep_env_synced(
+    rx: &mut tokio::sync::broadcast::Receiver<armd::ArmObservation>,
+    sup: &Arc<ArmSupervisor>,
+) {
+    let synced = || {
+        match (sup.hub().latest(), sup.hub().prep_env()) {
+            (Some(snap), Some(env)) => env.matches_owner_meta(&snap.rt.owner),
+            _ => false,
+        }
+    };
+    if synced() {
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Ok(_)) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
+                if synced() {
+                    return;
+                }
+            }
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                panic!("telemetry channel closed waiting for prep_env sync");
+            }
+            Err(_) => {
+                panic!("timed out waiting for executor StateHub revisions to match prep_env");
+            }
+        }
+    }
+}
+
+async fn wait_telemetry_action_terminal(
+    rx: &mut tokio::sync::broadcast::Receiver<armd::ArmObservation>,
+    sup: &Arc<ArmSupervisor>,
+    action_id: u64,
+    expected_state: &str,
+) {
+    let is_terminal_in = |obs: &armd::ArmObservation| -> bool {
+        obs.action
+            .iter()
+            .chain(obs.previous_action.iter())
+            .any(|a| a.id == action_id && !a.is_running() && a.state == expected_state)
+    };
+    if sup.hub().latest().is_some_and(|s| is_terminal_in(&s.obs)) {
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Ok(obs)) if is_terminal_in(&obs) => return,
+            Ok(Ok(_)) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
+                if sup.hub().latest().is_some_and(|s| is_terminal_in(&s.obs)) {
+                    return;
+                }
+            }
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                panic!("telemetry channel closed waiting for action {action_id} terminal");
+            }
+            Err(_) => {
+                panic!("timed out waiting for action {action_id} terminal ({expected_state})");
+            }
+        }
+    }
+}
+
+async fn run_sequence_pins_lifecycle_test(owner: RtOwner) {
+    struct CleanupPauseReset;
+    impl Drop for CleanupPauseReset {
+        fn drop(&mut self) {
+            armd::sequences::clear_test_cleanup_pause();
+        }
+    }
+    let _reset = CleanupPauseReset;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = ArmConfig::rebot_dm();
+    cfg.lease_timeout_ms = 600_000;
+    let sup = Arc::new(ArmSupervisor::new(cfg));
+    armd::poses::load_into(&sup, &dir.path().join("poses.json")).await;
+    armd::sequences::load_into(&sup, &dir.path().join("sequences.json")).await;
+    {
+        let mut inner = sup.inner().write().await;
+        inner.measured_positions = INSPECT.to_vec();
+        inner.commanded_positions = INSPECT.to_vec();
+        inner.target_positions = INSPECT.to_vec();
+    }
+
+    let mut telemetry_rx = sup.subscribe_telemetry().expect("telemetry subscriber");
+
+    if owner == RtOwner::Executor {
+        let mut ecfg = ExecutorConfig::for_tests(Duration::from_millis(2));
+        ecfg.alloc_timing = true;
+        let handle = sup.start_executor(ecfg).await.expect("start RT executor");
+        handle.attach_external_reply_sink(Arc::new(|_, _| {
+            armd::rt_core::broker::DeliveryDecision::Delivered
+        }));
+        let init_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while sup.hub().latest().is_none() {
+            let _ = tokio::time::timeout_at(init_deadline, telemetry_rx.recv())
+                .await
+                .expect("timed out waiting for initial executor snapshot");
+        }
+        assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO);
+    }
+
+    let _detached = if owner == RtOwner::Executor {
+        Some(sup.inner().write().await)
+    } else {
+        None
+    };
+
+    let router = armd::create_router(sup.clone(), OperatorAuth::disabled());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_jh = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/api/v1/ws"))
+        .await
+        .unwrap();
+    let lease_gen = ws_acquire_lease(&mut ws).await;
+    let mut req_id = 10u64;
+    let mut next_req = || {
+        req_id += 1;
+        req_id
+    };
+
+    let current_epoch = || -> u64 {
+        sup.hub()
+            .latest()
+            .map_or_else(|| sup.estop_epoch(), |s| s.obs.epoch_id)
+    };
+
+    // Enable torque via WS (works on both Legacy and Executor owners).
+    let epoch = if owner == RtOwner::Legacy {
+        sup.get_observation().await.epoch_id
+    } else {
+        current_epoch()
+    };
+    let torque_ack = ws_send_recv(
+        &mut ws,
+        json!({
+            "type": "command",
+            "request_id": next_req(),
+            "generation": lease_gen,
+            "epoch_id": epoch,
+            "path": "/api/v1/torque",
+            "body": { "enable": true }
+        }),
+    )
+    .await;
+    assert_eq!(torque_ack["type"], "command_ack", "{torque_ack}");
+
+    // Save pose P via WS.
+    let pose_ack = ws_send_recv(
+        &mut ws,
+        json!({
+            "type": "command",
+            "request_id": next_req(),
+            "generation": lease_gen,
+            "epoch_id": epoch,
+            "path": "/api/v1/poses/save",
+            "body": { "name": "pin_pose", "positions": INSPECT }
+        }),
+    )
+    .await;
+    assert_eq!(pose_ack["type"], "command_ack", "{pose_ack}");
+    let pose_id = pose_ack["pose"]["id"].as_str().unwrap().to_string();
+
+    // ------------------------------------------------------------------------
+    // Part A: While a sequence is running, deleting it is refused SEQUENCE_RUNNING
+    // and poses pinned only by the running sequence are protected (IN_USE / PosesDelete).
+    // ------------------------------------------------------------------------
+    let seq_run_ack = ws_send_recv(
+        &mut ws,
+        json!({
+            "type": "command",
+            "request_id": next_req(),
+            "generation": lease_gen,
+            "epoch_id": epoch,
+            "path": "/api/v1/sequences/save",
+            "body": {
+                "name": "seq_running_pins",
+                "steps": [
+                    { "type": "wait", "s": 10.0 },
+                    { "type": "pose", "pose_id": pose_id }
+                ]
+            }
+        }),
+    )
+    .await;
+    assert_eq!(seq_run_ack["type"], "command_ack", "{seq_run_ack}");
+    let seq_run_id = seq_run_ack["sequence"]["id"].as_str().unwrap().to_string();
+
+    let (run_cleanup_entered_rx, run_cleanup_release_tx) =
+        armd::sequences::arm_test_cleanup_pause(seq_run_id.clone());
+
+    let run_action_id = if owner == RtOwner::Legacy {
+        let ack = ws_send_recv(
+            &mut ws,
+            json!({
+                "type": "command",
+                "request_id": next_req(),
+                "generation": lease_gen,
+                "epoch_id": epoch,
+                "path": "/api/v1/action/run_sequence",
+                "body": { "id": seq_run_id }
+            }),
+        )
+        .await;
+        assert_eq!(ack["type"], "command_ack", "{ack}");
+        ack["action_id"].as_u64().unwrap()
+    } else {
+        wait_executor_prep_env_synced(&mut telemetry_rx, &sup).await;
+        let mut adm = sup.capture_admission_stamp();
+        adm.connection_id = 1;
+        adm.lease_gen = lease_gen;
+        adm.estop_epoch = epoch;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let snap = armd::rt_core::requests::actions::ActionSnapshot::capture(&sup, adm, deadline)
+            .await
+            .expect("capture ActionSnapshot for running sequence");
+        let plan = armd::sequences::prepare_run_from_snapshot(
+            &snap,
+            &json!({ "id": seq_run_id }),
+            epoch,
+            true,
+        )
+        .expect("prepare_run_from_snapshot");
+        let (aid, _) = armd::sequences::begin_executor(&sup, adm, plan)
+            .await
+            .expect("begin_executor");
+        aid
+    };
+
+    // 1. Delete while running MUST be refused with 409 SEQUENCE_RUNNING.
+    let del_running = ws_send_recv(
+        &mut ws,
+        json!({
+            "type": "command",
+            "request_id": next_req(),
+            "generation": lease_gen,
+            "epoch_id": epoch,
+            "path": "/api/v1/sequences/delete",
+            "body": { "id": seq_run_id }
+        }),
+    )
+    .await;
+    assert_eq!(del_running["type"], "command_reject", "{del_running}");
+    assert_eq!(del_running["status"], 409, "{del_running}");
+    assert_eq!(del_running["code"], "SEQUENCE_RUNNING", "{del_running}");
+
+    // 2. Edit the saved sequence to drop pose P while the running run still pins P in `RunPins`:
+    //    `poses/delete` MUST STILL fail with 409 IN_USE (proving `RunPins::pose_ids` protects P
+    //    in both `prepare_config_write_off_thread` and `ReservePrecheck::PosesDelete`).
+    let edit_ack = ws_send_recv(
+        &mut ws,
+        json!({
+            "type": "command",
+            "request_id": next_req(),
+            "generation": lease_gen,
+            "epoch_id": epoch,
+            "path": "/api/v1/sequences/save",
+            "body": {
+                "id": seq_run_id,
+                "name": "seq_running_pins",
+                "steps": [{ "type": "wait", "s": 10.0 }]
+            }
+        }),
+    )
+    .await;
+    assert_eq!(edit_ack["type"], "command_ack", "{edit_ack}");
+
+    let del_pose_running = ws_send_recv(
+        &mut ws,
+        json!({
+            "type": "command",
+            "request_id": next_req(),
+            "generation": lease_gen,
+            "epoch_id": epoch,
+            "path": "/api/v1/poses/delete",
+            "body": { "name": "pin_pose" }
+        }),
+    )
+    .await;
+    assert_eq!(del_pose_running["type"], "command_reject", "{del_pose_running}");
+    assert_eq!(del_pose_running["status"], 409, "{del_pose_running}");
+    assert_eq!(del_pose_running["code"], "IN_USE", "{del_pose_running}");
+
+    // Cancel the running sequence so it reaches terminal (`cancelled`) and pauses in `cleanup()`.
+    if owner == RtOwner::Legacy {
+        let stop_ack = ws_send_recv(
+            &mut ws,
+            json!({
+                "type": "command",
+                "request_id": next_req(),
+                "generation": lease_gen,
+                "epoch_id": epoch,
+                "path": "/api/v1/motion/stop",
+                "body": {}
+            }),
+        )
+        .await;
+        assert_eq!(stop_ack["type"], "command_ack", "{stop_ack}");
+    } else {
+        let handle = sup.executor_handle().expect("executor handle");
+        let _ = handle.stop_requests().request();
+    }
+
+    tokio::task::spawn_blocking(move || {
+        run_cleanup_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("running sequence must enter cleanup() after stop")
+    })
+    .await
+    .unwrap();
+
+    if owner == RtOwner::Executor {
+        wait_telemetry_action_terminal(&mut telemetry_rx, &sup, run_action_id, "cancelled").await;
+    }
+
+    // While `cleanup()` is STILL paused with stale `RunPins` intact:
+    // pose P (no longer referenced by saved sequences) and `seq_run_id` MUST both delete cleanly.
+    let del_pose_after = ws_send_recv(
+        &mut ws,
+        json!({
+            "type": "command",
+            "request_id": next_req(),
+            "generation": lease_gen,
+            "epoch_id": epoch,
+            "path": "/api/v1/poses/delete",
+            "body": { "name": "pin_pose" }
+        }),
+    )
+    .await;
+    assert_eq!(del_pose_after["type"], "command_ack", "{del_pose_after}");
+
+    let del_run_after = ws_send_recv(
+        &mut ws,
+        json!({
+            "type": "command",
+            "request_id": next_req(),
+            "generation": lease_gen,
+            "epoch_id": epoch,
+            "path": "/api/v1/sequences/delete",
+            "body": { "id": seq_run_id }
+        }),
+    )
+    .await;
+    assert_eq!(del_run_after["type"], "command_ack", "{del_run_after}");
+
+    let _ = run_cleanup_release_tx.send(());
+
+    // ------------------------------------------------------------------------
+    // Part B: Natural `done` terminal (`Step::Wait { s: 0.0 }`) with `cleanup()` held paused —
+    // exact reproduction of the session 13 post-terminal delete race on BOTH owners.
+    // ------------------------------------------------------------------------
+    let seq_done_ack = ws_send_recv(
+        &mut ws,
+        json!({
+            "type": "command",
+            "request_id": next_req(),
+            "generation": lease_gen,
+            "epoch_id": epoch,
+            "path": "/api/v1/sequences/save",
+            "body": {
+                "name": "seq_done_cleanup_pause",
+                "steps": [{ "type": "wait", "s": 0.0 }]
+            }
+        }),
+    )
+    .await;
+    assert_eq!(seq_done_ack["type"], "command_ack", "{seq_done_ack}");
+    let seq_done_id = seq_done_ack["sequence"]["id"].as_str().unwrap().to_string();
+
+    let (done_cleanup_entered_rx, done_cleanup_release_tx) =
+        armd::sequences::arm_test_cleanup_pause(seq_done_id.clone());
+
+    let done_action_id = if owner == RtOwner::Legacy {
+        let ack = ws_send_recv(
+            &mut ws,
+            json!({
+                "type": "command",
+                "request_id": next_req(),
+                "generation": lease_gen,
+                "epoch_id": epoch,
+                "path": "/api/v1/action/run_sequence",
+                "body": { "id": seq_done_id }
+            }),
+        )
+        .await;
+        assert_eq!(ack["type"], "command_ack", "{ack}");
+        ack["action_id"].as_u64().unwrap()
+    } else {
+        wait_executor_prep_env_synced(&mut telemetry_rx, &sup).await;
+        let mut adm = sup.capture_admission_stamp();
+        adm.connection_id = 1;
+        adm.lease_gen = lease_gen;
+        adm.estop_epoch = epoch;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let snap = armd::rt_core::requests::actions::ActionSnapshot::capture(&sup, adm, deadline)
+            .await
+            .expect("capture ActionSnapshot for done sequence");
+        let plan = armd::sequences::prepare_run_from_snapshot(
+            &snap,
+            &json!({ "id": seq_done_id }),
+            epoch,
+            true,
+        )
+        .expect("prepare_run_from_snapshot");
+        let (aid, _) = armd::sequences::begin_executor(&sup, adm, plan)
+            .await
+            .expect("begin_executor");
+        aid
+    };
+
+    tokio::task::spawn_blocking(move || {
+        done_cleanup_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("done sequence must enter cleanup() after terminal")
+    })
+    .await
+    .unwrap();
+
+    if owner == RtOwner::Executor {
+        wait_telemetry_action_terminal(&mut telemetry_rx, &sup, done_action_id, "done").await;
+        // Raw hub still holds uncleared pins while `cleanup()` is paused, but `published_config()`
+        // filters them out via active-pins rule.
+        assert!(
+            sup.published_config_hub()
+                .latest()
+                .unwrap()
+                .sequences
+                .pins
+                .as_ref()
+                .is_some_and(|p| p.action_id == done_action_id),
+            "expected raw pins to remain uncleared while cleanup() is paused on Executor"
+        );
+        assert!(
+            sup.published_config().await.unwrap().sequences.pins.is_none(),
+            "published_config() must filter stale pins after terminal on Executor"
+        );
+    } else {
+        let inner = sup.inner().read().await;
+        assert!(
+            inner
+                .sequences
+                .pins
+                .as_ref()
+                .is_some_and(|p| p.action_id == done_action_id),
+            "expected raw pins to remain uncleared while cleanup() is paused on Legacy"
+        );
+        assert!(inner.active_sequence_pins().is_none());
+        drop(inner);
+        assert!(
+            sup.published_config().await.unwrap().sequences.pins.is_none(),
+            "published_config() must filter stale pins after terminal on Legacy"
+        );
+    }
+
+    // Delete via WS while `cleanup()` is STILL paused MUST succeed with `command_ack`!
+    let del_done = ws_send_recv(
+        &mut ws,
+        json!({
+            "type": "command",
+            "request_id": next_req(),
+            "generation": lease_gen,
+            "epoch_id": epoch,
+            "path": "/api/v1/sequences/delete",
+            "body": { "id": seq_done_id }
+        }),
+    )
+    .await;
+    assert_eq!(del_done["type"], "command_ack", "{del_done}");
+
+    let _ = done_cleanup_release_tx.send(());
+
+    if let Some(handle) = sup.executor_handle() {
+        assert_eq!(
+            handle.stats().total_allocs(),
+            AllocCounts::ZERO,
+            "armd-control must remain zero-alloc across sequence pin install/clear/delete"
+        );
+        assert_eq!(sup.inner().control_thread_attempts(), 0);
+    }
+
+    drop(_detached);
+    server_jh.abort();
+    if let Some(handle) = sup.executor_handle() {
+        handle.stop_and_join();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sequence_pins_enforced_while_running_and_released_before_cleanup_legacy() {
+    run_sequence_pins_lifecycle_test(RtOwner::Legacy).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sequence_pins_enforced_while_running_and_released_before_cleanup_executor() {
+    run_sequence_pins_lifecycle_test(RtOwner::Executor).await;
+}

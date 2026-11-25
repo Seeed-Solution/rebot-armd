@@ -214,6 +214,45 @@ fn invalid(m: String) -> ArmError { MotionError::InvalidCommand(m).into() }
 /// Under the lock: bind the parsed request (`pending`) and the request's evidence to the
 /// supervisor state.
 pub fn capture(inner: &SupervisorInner, pending: &PendingGrasp, body: &Value) -> Result<Snapshot, ArmError> {
+    let policy = inner.config.gripper_policy.clone()
+        .ok_or_else(|| ArmError::from(MotionError::Unsupported("Grasp needs a gripper policy".into())))?;
+    capture_from_parts(
+        pending,
+        body,
+        &policy,
+        inner.requires_real_jaw_curve(),
+        inner.config.gravity_comp.as_ref(),
+        inner.config.damiao_ranges.as_deref(),
+    )
+}
+
+/// Zero-lock capture from a published [`crate::rt_core::requests::actions::ActionPrepEnv`]
+/// (used by both live `ActionSnapshot` and lease-free `ReadOnlySnapshot` on `OWNER_EXECUTOR`).
+pub fn capture_from_env(
+    env: &crate::rt_core::requests::actions::ActionPrepEnv,
+    pending: &PendingGrasp,
+    body: &Value,
+) -> Result<Snapshot, ArmError> {
+    let policy = env.config.gripper_policy.clone()
+        .ok_or_else(|| ArmError::from(MotionError::Unsupported("Grasp needs a gripper policy".into())))?;
+    capture_from_parts(
+        pending,
+        body,
+        &policy,
+        env.requires_real_jaw_curve,
+        env.config.gravity_comp.as_ref(),
+        env.config.damiao_ranges.as_deref(),
+    )
+}
+
+fn capture_from_parts(
+    pending: &PendingGrasp,
+    body: &Value,
+    policy: &crate::model::GripperPolicy,
+    requires_real_jaw_curve: bool,
+    gravity_comp: Option<&crate::model::GravityCompPolicy>,
+    damiao_ranges: Option<&[crate::model::DamiaoRange]>,
+) -> Result<Snapshot, ArmError> {
     let evidence = parse_evidence(body).map_err(invalid)?;
     let prefs = parse_preferences(body).map_err(invalid)?;
     let wall_ms = parse_budget(body).map_err(invalid)?;
@@ -227,19 +266,18 @@ pub fn capture(inner: &SupervisorInner, pending: &PendingGrasp, body: &Value) ->
     let cam = CamModel::assumed(&input.arm, &setup, &input.cam);
     let camera_down = grasp::camera_down_mode(&setup, &input.cam).map_err(invalid)?;
     let envelope = grasp::envelope_with_contact(input.ws.as_ref(), &input.cam, &cam.rec, pending.physical_contact_end_m);
-    let policy = inner.config.gripper_policy.clone()
-        .ok_or_else(|| ArmError::from(MotionError::Unsupported("Grasp needs a gripper policy".into())))?;
     let open_width = f64::from(policy.opening_m(policy.open_rad));
     let max_w = if policy.is_calibrated() {
         let calib = open_width - setup.pre_open_margin_m;
         if setup.max_grasp_width_m > 0.0 { setup.max_grasp_width_m.min(calib) } else { calib }
     } else {
-        inner.grasp_width_check(setup.max_grasp_width_m).map_or(setup.max_grasp_width_m, |c| c.effective_max_m(setup.max_grasp_width_m))
+        let check = crate::model::check_grasp_width(policy, setup.max_grasp_width_m, requires_real_jaw_curve);
+        check.effective_max_m(setup.max_grasp_width_m)
     };
-    let torque_limits = inner.config.gravity_comp.as_ref()
+    let torque_limits = gravity_comp
         .filter(|gc| gc.torque_limits_nm.len() >= 6)
         .map(|gc| (gc.torque_limits_nm.iter().take(6).map(|t| f64::from(*t)).collect(), "gravity_comp.torque_limits_nm"))
-        .or_else(|| inner.config.damiao_ranges.as_ref().filter(|r| r.len() >= 6)
+        .or_else(|| damiao_ranges.filter(|r| r.len() >= 6)
             .map(|r| (r.iter().take(6).map(|d| 0.5 * f64::from(d.t_max)).collect(), "damiao_ranges.t_max x 0.5")));
     let mut snap = Snapshot {
         id: String::new(), input, setup, cam, camera_down, label: request.label.clone(), box_norm: request.box_norm,
@@ -251,11 +289,12 @@ pub fn capture(inner: &SupervisorInner, pending: &PendingGrasp, body: &Value) ->
     Ok(snap)
 }
 
-/// FNV-1a over the inputs that decide the selection (not the budget).
+/// FNV-1a over the inputs that decide the selection (not the wall search budget).
 pub fn snapshot_id(s: &Snapshot) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     let mut eat = |x: f64| for b in x.to_bits().to_le_bytes() { h ^= u64::from(b); h = h.wrapping_mul(0x0100_0000_01b3); };
     s.input.q0.iter().for_each(|v| eat(*v));
+    eat(f64::from(s.input.j7));
     s.input.tcp_offset.iter().for_each(|v| eat(*v));
     s.box_norm.iter().for_each(|v| eat(*v));
     for p in s.evidence.contour_norm.iter().flatten() { eat(p[0]); eat(p[1]); }
@@ -263,16 +302,29 @@ pub fn snapshot_id(s: &Snapshot) -> String {
     for v in [s.evidence.angle_deg, s.evidence.angle_conf, s.evidence.payload_kg].into_iter().flatten() { eat(v); }
     for v in s.evidence.height_m.iter().flatten() { eat(*v); }
     let st = &s.setup;
-    for v in [st.table_z_m, st.approach_height_m, st.grasp_height_m, st.lift_height_m, st.camera_tilt_deg, st.fx_px, st.fy_px,
-              st.approach_speed_mps, st.descend_speed_mps, st.max_grasp_width_m] { eat(v); }
+    for v in [
+        st.table_z_m, st.approach_height_m, st.grasp_height_m, st.lift_height_m, st.camera_tilt_deg, st.fx_px, st.fy_px,
+        st.approach_speed_mps, st.descend_speed_mps, st.max_grasp_width_m,
+        st.timeout_s, st.phase_timeout_s, st.settle_delay_s, st.lost_timeout_s,
+        st.post_lift_settle_ms as f64, st.descend_contact_stop_nm.unwrap_or(-1.0),
+    ] { eat(v); }
     for p in &s.envelope { p.iter().for_each(|v| eat(*v)); }
-    for v in [s.tool.open_width_m, s.tool.max_grasp_width_m, f64::from(s.open_rad)] { eat(v); }
+    for v in [s.tool.open_width_m, s.tool.max_grasp_width_m, f64::from(s.open_rad), f64::from(s.closed_rad)] { eat(v); }
+    if let Some((lim, _)) = &s.torque_limits {
+        eat(lim.len() as f64);
+        for v in lim { eat(*v); }
+    } else {
+        eat(-1.0);
+    }
     eat(s.prefs.vertical_weight);
     eat(s.prefs.preferred_max_tilt_deg.unwrap_or(-1.0));
     eat(s.prefs.hard_max_tilt_deg.unwrap_or(-1.0));
     eat(s.prefs.approach_side as u8 as f64);
     eat(s.input.workspace_revision as f64);
-    if let Some(ws) = &s.input.ws { for k in &ws.keepout_boxes { k.min_m.iter().chain(&k.max_m).for_each(|v| eat(f64::from(*v))); } }
+    if let Some(ws) = &s.input.ws {
+        eat(f64::from(ws.floor_z_m));
+        for k in &ws.keepout_boxes { k.min_m.iter().chain(&k.max_m).for_each(|v| eat(f64::from(*v))); }
+    }
     format!("{h:016x}")
 }
 
@@ -292,6 +344,10 @@ impl FootprintSource {
 pub struct Target {
     /// Counter-clockwise base-frame footprint, projected at the mid-height plane.
     pub poly: Vec<V2>,
+    /// Base-frame footprint projected onto the table plane (`table_z`).
+    pub poly_lo: Vec<V2>,
+    /// Base-frame footprint projected onto the object top plane (`table_z + height[1]`).
+    pub poly_hi: Vec<V2>,
     pub source: FootprintSource,
     /// Why better evidence was not used (contour rejected, ray missed, ...).
     pub fallback_reason: Option<String>,
@@ -379,7 +435,7 @@ pub fn target(s: &Snapshot) -> Result<Target, String> {
     let he_e = HAND_EYE_ERROR_DEG.to_radians().tan() * dist;
     let contour_e = CONTOUR_ERROR_PX * dist / s.cam.fx.min(s.cam.fy);
     Ok(Target {
-        poly, source, fallback_reason: if source == FootprintSource::Contour { None } else { fallback }, table_z: table, height, height_source,
+        poly, poly_lo: lo, poly_hi: hi, source, fallback_reason: if source == FootprintSource::Contour { None } else { fallback }, table_z: table, height, height_source,
         centroid: c, axis, aspect, axis_ambiguous: source == FootprintSource::Box || aspect < 1.2,
         projection_spread_m: spread, hard_error_m: scale_e.max(he_e) + contour_e, scale_error_m: scale_e, hand_eye_error_m: he_e,
         contour_error_m: contour_e, view_distance_m: dist,

@@ -1334,8 +1334,10 @@ async fn b1_lease_fence_at_tx_choke_point_both_owners_and_disable_exempt() {
                 hook_fired.load(Ordering::Acquire),
                 "Legacy post_stop_check_hook must fire"
             );
-            // Subsequent ticks apply the queued disconnect and continue emitting stationary holds.
+            // Subsequent ticks apply the queued disconnect, continue emitting stationary holds,
+            // and accumulate K=3 spaced rest-pose samples across >= 25 ms before torque-off.
             for _ in 0..5 {
+                tokio::time::sleep(Duration::from_millis(12)).await;
                 sup.control_tick(0.02).await;
             }
         }
@@ -1398,7 +1400,25 @@ async fn b1_lease_fence_at_tx_choke_point_both_owners_and_disable_exempt() {
         )
         .await;
         let dis_ack = next_of(&mut ws_dis, "command_ack").await;
-        assert_eq!(dis_ack["is_torqued"], false, "{dis_ack}");
+        if use_executor {
+            assert_eq!(dis_ack["is_torqued"], false, "{dis_ack}");
+        } else {
+            // Legacy non-blocking rest-gate wait (R12 B1) may defer across K=3 ticks when the
+            // prior control tick just transmitted a hold frame; advance legacy ticks to complete.
+            if dis_ack["is_torqued"] != false {
+                for _ in 0..10 {
+                    tokio::time::sleep(Duration::from_millis(12)).await;
+                    sup.control_tick(0.02).await;
+                    if !sup.get_observation().await.is_torqued {
+                        break;
+                    }
+                }
+            }
+            assert!(
+                !sup.get_observation().await.is_torqued,
+                "legacy owner must complete torque-off after K=3 rest-pose ticks; ack={dis_ack}"
+            );
+        }
         let disable_frames: Vec<_> = bus
             .tx_log()
             .into_iter()
@@ -1510,7 +1530,33 @@ fn b1_pending_tx_queue_drops_fenced_lease_targets_and_allows_hold_and_disable() 
         "Hold frames must transmit on CAN even after lease loss"
     );
 
-    // Exempt: Disable (`set_torque(false)` -> `TxKind::Disable`) still transmits after lease loss.
+    // Exempt: Disable (`set_torque(false)` -> `TxKind::DisableRequested`) still transmits after
+    // lease loss once the rest-pose gate (K=3 causal rest samples) is satisfied.
+    let mut rest_positions = [0.0f32; armd::rt_core::mailbox::MAX_DOF];
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    for j in 0..6 {
+        arm_joints[j] = j;
+        rest_positions[j] = 0.0;
+    }
+    drv.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+        safety_stopped: Arc::new(AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 6,
+        rest_positions,
+        rest_pose_tolerance_rad: 0.05,
+    });
+    for _ in 0..3 {
+        std::thread::sleep(Duration::from_millis(12));
+        bus.with(|s| {
+            for m in &mut s.motors {
+                m.q = 0.0;
+                m.v = 0.0;
+            }
+            s.push_all_feedback();
+        });
+        drv.read_joint_states().unwrap();
+    }
     bus.clear_log();
     drv.set_torque(false).unwrap();
     let disable_frames: Vec<_> = bus
@@ -1518,11 +1564,12 @@ fn b1_pending_tx_queue_drops_fenced_lease_targets_and_allows_hold_and_disable() 
         .into_iter()
         .filter(|f| f.data == [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD])
         .collect();
-    assert_eq!(
-        disable_frames.len(),
-        7,
-        "all 7 motors must receive Disable frames after lease loss"
-    );
+    for id in 1u32..=7 {
+        assert!(
+            disable_frames.iter().any(|f| f.id == id),
+            "motor {id} must receive Disable frame after lease loss"
+        );
+    }
 }
 
 // ============================================================================

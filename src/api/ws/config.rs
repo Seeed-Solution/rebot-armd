@@ -144,7 +144,7 @@ impl PreparedOffThreadConfig {
     }
 }
 
-fn off_lock_command_reject(request_id: &Value, epoch: u64, error: ApiError) -> Value {
+pub(super) fn off_lock_command_reject(request_id: &Value, epoch: u64, error: ApiError) -> Value {
     let mut reply = rejection(error, "command_reject", epoch);
     reply["request_id"] = request_id.clone();
     reply
@@ -823,12 +823,7 @@ async fn prepare_config_write_off_thread(
                 code: "INVALID_COMMAND".into(),
                 message: "id must be a string".into(),
             })?;
-            if pub_cfg
-                .sequences
-                .pins
-                .as_ref()
-                .is_some_and(|p| p.sequence_id == id)
-            {
+            if pub_cfg.is_sequence_running(id) {
                 return Err(ArmError::Rejected {
                     status: 409,
                     code: "SEQUENCE_RUNNING".into(),
@@ -1426,7 +1421,7 @@ async fn commit_prepared_config(
     }
 }
 
-fn current_epoch_off_lock(sup: &ArmSupervisor, fallback: u64) -> u64 {
+pub(super) fn current_epoch_off_lock(sup: &ArmSupervisor, fallback: u64) -> u64 {
     let hub_ep = sup.hub().latest().map_or(fallback, |s| s.obs.epoch_id);
     hub_ep.max(sup.estop_epoch())
 }

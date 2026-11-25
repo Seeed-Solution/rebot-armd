@@ -216,6 +216,7 @@ fn submit_child(
             prepared_boot,
             check_workspace_revision,
             calibration_revision: None,
+            grasp_setup_revision: None,
             gripper_calib_revision: None,
             power_budget_revision: None,
         }),
@@ -1371,14 +1372,13 @@ async fn a7_dual_owner_macro_ctx_runs_end_to_end_on_live_rt_executor_zero_lock()
 }
 
 #[test]
-fn a7_grasp_select_phase_a_live_refusal_and_phase_b_macro_hook() {
-    // Live strategy="adaptive" stays refused (Phase A).
-    assert!(armd::grasp_select::refuse_execution(&json!({"strategy": "legacy"})).is_ok());
-    let err = armd::grasp_select::refuse_execution(&json!({"strategy": "adaptive"})).unwrap_err();
-    assert!(
-        matches!(err, armd::motion::MotionError::Unsupported(_)),
-        "live adaptive strategy must stay refused: {err:?}"
-    );
+fn a7_grasp_select_phase_b_capability_and_macro_hook() {
+    // Phase B capability gating: 6-DOF rebot_dm advertises grasp_select_exec; 5-DOF does not.
+    let dm_caps = armd::model::Capabilities::from_config(&ArmConfig::rebot_dm());
+    assert!(dm_caps.grasp_select && dm_caps.grasp_select_exec);
+    let so101 = armd::tool::baseline_arm_config_for_robot("so101").unwrap();
+    let so_caps = armd::model::Capabilities::from_config(&so101);
+    assert!(!so_caps.grasp_select && !so_caps.grasp_select_exec);
 
     // Phase B hook: ExecutionPlan -> SelectedGraspMacro installs cleanly as an A7 BeginMacro!
     let (mut fx, mut b, _clock, _stop) = fixture();
@@ -2341,6 +2341,7 @@ fn review_m4_m5_gripper_calib_and_power_budget_revision_fencing() {
                 prepared_boot: BOOT,
                 check_workspace_revision: false,
                 calibration_revision: None,
+                grasp_setup_revision: None,
                 gripper_calib_revision: Some(old_g_rev),
                 power_budget_revision: None,
             }),
@@ -2367,6 +2368,7 @@ fn review_m4_m5_gripper_calib_and_power_budget_revision_fencing() {
                 prepared_boot: BOOT,
                 check_workspace_revision: true,
                 calibration_revision: None,
+                grasp_setup_revision: None,
                 gripper_calib_revision: None,
                 power_budget_revision: Some(old_p_rev),
             }),

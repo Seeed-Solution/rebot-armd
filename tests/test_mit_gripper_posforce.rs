@@ -406,8 +406,36 @@ fn handshake_drain_applies_queued_telemetry_before_mode_write_checks() {
 
 #[test]
 fn every_full_enable_reads_the_mode_back_and_a_motor_reset_is_rewritten() {
-    let (mut d, bus, _) = rig(true);
+    let (mut d, bus, clock) = rig(true);
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    for i in 0..6 {
+        arm_joints[i] = i;
+    }
+    let mut rest_positions = [0.0f32; armd::rt_core::mailbox::MAX_DOF];
+    for i in 0..6 {
+        rest_positions[i] = 0.1 * i as f32;
+    }
+    rest_positions[J7] = -1.0;
+    d.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+        safety_stopped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 6,
+        rest_positions,
+        rest_pose_tolerance_rad: 0.05,
+    });
+    let collect_k3 = |d: &mut DamiaoArmDriver<FakeBus>| {
+        clock.advance(Duration::from_millis(21));
+        for step in 0..3 {
+            if step > 0 {
+                clock.advance(Duration::from_millis(11));
+            }
+            bus.with(|s| s.push_all_feedback());
+            d.read_joint_states().unwrap();
+        }
+    };
     d.set_torque(true).unwrap();
+    collect_k3(&mut d);
     d.set_torque(false).unwrap();
     bus.clear_log();
     d.set_torque(true).unwrap();
@@ -415,6 +443,7 @@ fn every_full_enable_reads_the_mode_back_and_a_motor_reset_is_rewritten() {
     assert!(!log.iter().any(|f| f.id == 0x7FF && f.data[2] == damiao::REG_WRITE), "mode rewritten on a re-enable");
     assert_eq!(log.iter().filter(|f| is_reg_read(f, 7, damiao::RID_CTRL_MODE)).count(), 1, "readback on the re-enable");
     // the motor lost its RAM mode (power cycle): the readback fails, the next enable rewrites it
+    collect_k3(&mut d);
     d.set_torque(false).unwrap();
     bus.with(|s| s.motors[J7].set_reg_u32(damiao::RID_CTRL_MODE, damiao::CTRL_MODE_POS_VEL));
     assert!(d.set_torque(true).unwrap_err().to_string().contains("reads 2"));
@@ -1046,6 +1075,9 @@ fn mode_handover_hold_backpressure_past_100ms_sends_no_stale_hold() {
         }
         fn receive(&mut self) -> Result<CanFrame, TransportError> {
             self.inner.receive()
+        }
+        fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<std::time::Instant>), TransportError> {
+            self.inner.receive_timestamped()
         }
         fn flush(&mut self) -> Result<(), TransportError> {
             self.inner.flush()
@@ -1808,6 +1840,23 @@ fn enable_refresh_deadline_boundaries_and_failure_paths() {
     // 6. Mid-refresh begin_torque(false) abandons cleanly and completes disable.
     for already_mode_4 in [false, true] {
         let (mut d, bus, clock) = make_stale(already_mode_4);
+        let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+        for i in 0..6 {
+            arm_joints[i] = i;
+        }
+        let mut rest_positions = [0.0f32; armd::rt_core::mailbox::MAX_DOF];
+        for i in 0..6 {
+            rest_positions[i] = 0.1 * i as f32;
+        }
+        rest_positions[J7] = -1.6;
+        d.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+            safety_stopped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            has_resting_pose: true,
+            arm_joints,
+            arm_joints_len: 6,
+            rest_positions,
+            rest_pose_tolerance_rad: 0.05,
+        });
         bus.with(|s| s.motors[J7].mute_feedback = true);
         let _ = d.begin_torque(true).unwrap();
         while !bus.tx_log().iter().any(is_j7_refresh) {
@@ -2026,14 +2075,14 @@ fn enable_refresh_transmit_boundary_and_live_safety_veto() {
                 }
                 return Ok(item);
             }
-            match self.inner.receive() {
-                Ok(frame) => {
+            match self.inner.receive_timestamped() {
+                Ok((frame, ts)) => {
                     if let Some(d) = self.advance_schedule.lock().unwrap().pop_front() {
                         if !d.is_zero() {
                             self.clock.advance(d);
                         }
                     }
-                    Ok((frame, None))
+                    Ok((frame, ts))
                 }
                 Err(e @ (TransportError::Timeout | TransportError::WouldBlock)) => {
                     if let Some(injected) = self.inject_on_wouldblock.lock().unwrap().take() {
@@ -2484,6 +2533,7 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
             Ok(())
         }
         fn receive(&mut self) -> Result<CanFrame, TransportError> { self.inner.receive() }
+        fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<std::time::Instant>), TransportError> { self.inner.receive_timestamped() }
         fn flush(&mut self) -> Result<(), TransportError> { self.inner.flush() }
     }
 
@@ -4273,6 +4323,23 @@ fn pos_force_crossing_100ms_between_entry_and_staging_skips_j7_in_motion_and_hol
 #[test]
 fn pos_force_feedback_fresh_fail_closed_across_unverified_unknown_mode_and_100ms_boundary() {
     let (mut d, bus, clock) = rig(true);
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    for i in 0..6 {
+        arm_joints[i] = i;
+    }
+    let mut rest_positions = [0.0f32; armd::rt_core::mailbox::MAX_DOF];
+    for i in 0..6 {
+        rest_positions[i] = 0.1 * i as f32;
+    }
+    rest_positions[J7] = -1.0;
+    d.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+        safety_stopped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 6,
+        rest_positions,
+        rest_pose_tolerance_rad: 0.05,
+    });
     bus.with(|s| s.immediate_replies = true);
     d.set_torque(true).expect("enable pos-force");
 
@@ -4287,8 +4354,13 @@ fn pos_force_feedback_fresh_fail_closed_across_unverified_unknown_mode_and_100ms
 
     // 2. Disabled / unverified mode (`set_torque(false)`): J7 aged 150 ms (still <= 250 ms
     //    `is_feedback_valid`) MUST still report `pos_force_feedback_fresh() == false`.
-    bus.with(|s| s.push_all_feedback());
-    d.read_joint_states().unwrap();
+    for step in 0..3 {
+        if step > 0 {
+            clock.advance(Duration::from_millis(11));
+        }
+        bus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+    }
     d.set_torque(false).expect("disable torque");
     bus.with(|s| s.motors[J7].mute_feedback = true);
     clock.advance(Duration::from_millis(140));
@@ -4682,6 +4754,7 @@ async fn calibration_close_at_raw_29_is_sent_as_raw_29() {
             Ok(())
         }
         fn receive(&mut self) -> Result<CanFrame, TransportError> { self.inner.receive() }
+        fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<std::time::Instant>), TransportError> { self.inner.receive_timestamped() }
         fn flush(&mut self) -> Result<(), TransportError> { self.inner.flush() }
     }
 
@@ -4809,11 +4882,11 @@ fn pos_force_freeze_cache_rejects_150ms_queued_sample_and_boot_fallback_no_outpu
             self.inner.receive()
         }
         fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<std::time::Instant>), TransportError> {
-            let f = self.inner.receive()?;
+            let (f, inner_ts) = self.inner.receive_timestamped()?;
             let ts = if f.id == 0x17 {
-                self.next_j7_ts.lock().unwrap().take()
+                self.next_j7_ts.lock().unwrap().take().or(inner_ts)
             } else {
-                None
+                inner_ts
             };
             Ok((f, ts))
         }

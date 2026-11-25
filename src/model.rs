@@ -1372,6 +1372,14 @@ fn default_servo_max_lead_rad() -> f32 {
     DEFAULT_SERVO_MAX_LEAD_RAD
 }
 
+/// Default for [`ArmConfig::rest_pose_tolerance_rad`]: maximum per-joint deviation from
+/// the profile's rest pose that permits torque disable while stopped (E-stop or Fault).
+pub const DEFAULT_REST_POSE_TOLERANCE_RAD: f32 = 0.05;
+
+fn default_rest_pose_tolerance_rad() -> f32 {
+    DEFAULT_REST_POSE_TOLERANCE_RAD
+}
+
 /// Upper bound on planned motion speed (`speed_cap` in the profile). Each entry is
 /// applied as min() with the request and with `planned_max_velocity`; absent entries
 /// do not cap. Not changeable at runtime.
@@ -1426,6 +1434,11 @@ pub struct ArmConfig {
     /// None forbids automatic hardware torque release without a calibrated profile.
     #[serde(default)]
     pub resting_pose: Option<RestingPosePolicy>,
+    /// Per-joint tolerance (rad) from the profile's rest pose for allowing torque disable while
+    /// stopped (E-stop or Fault). Checked on arm joints (excluding the gripper) against fresh
+    /// feedback (<= 100 ms). Default: 0.05 rad.
+    #[serde(default = "default_rest_pose_tolerance_rad")]
+    pub rest_pose_tolerance_rad: f32,
     #[serde(default)]
     pub following_error: FollowingErrorPolicy,
     /// Soft jerk preference; braking/position constraints take precedence.
@@ -1463,6 +1476,11 @@ pub struct ArmConfig {
     #[serde(default)]
     #[cfg(not(target_arch = "wasm32"))]
     pub grasp: Option<crate::grasp::GraspSetup>,
+    /// Default detector models of the detection kinds (`POST /api/v1/vision/detector`); None =
+    /// the built-in rebot-vision names ([`crate::vision_detector::DetectorDefaults::default`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg(not(target_arch = "wasm32"))]
+    pub vision_detectors: Option<crate::vision_detector::DetectorDefaults>,
     /// Gravity compensation (hand-guiding); None means unsupported.
     #[serde(default)]
     pub gravity_comp: Option<GravityCompPolicy>,
@@ -1623,6 +1641,7 @@ impl Default for ArmConfig {
             max_temperature: 70.0,
             control_frequency_hz: 50,
             resting_pose: None,
+            rest_pose_tolerance_rad: DEFAULT_REST_POSE_TOLERANCE_RAD,
             following_error: FollowingErrorPolicy::default(),
             max_jerk: None,
             gravity_model: None,
@@ -1634,6 +1653,7 @@ impl Default for ArmConfig {
             camera_mount: CameraMount::default(),
             gripper_policy: None,
             #[cfg(not(target_arch = "wasm32"))] grasp: None,
+            #[cfg(not(target_arch = "wasm32"))] vision_detectors: None,
             gravity_comp: None,
             joint_tracking: None,
             damiao_ranges: None,
@@ -2149,6 +2169,12 @@ impl ArmConfig {
                 "servo_max_lead_rad {} must be positive and below the following-error bound {} rad",
                 self.servo_max_lead_rad, self.following_error.max_error_rad));
         }
+        if !self.rest_pose_tolerance_rad.is_finite() || self.rest_pose_tolerance_rad <= 0.0 {
+            return Err(format!(
+                "rest_pose_tolerance_rad {} must be finite and positive",
+                self.rest_pose_tolerance_rad
+            ));
+        }
         let builtin = self.kinematics == Some(KinematicsModel::RebotDevArm) || self.gravity_model == Some(GravityModel::RebotDevArm);
         if builtin && self.uses_urdf() {
             return Err("kinematics and gravity_model must both be RebotDevArm or both Urdf".into());
@@ -2248,6 +2274,8 @@ impl ArmConfig {
         }
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(g) = &self.grasp { g.validate().map_err(|e| format!("Invalid grasp setup: {e}"))?; }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(d) = &self.vision_detectors { d.validate()?; }
         if let Some(policy) = &self.resting_pose {
             if policy.position_tolerances.len() < self.resting_arm_joints() {
                 return Err(format!("resting_pose.position_tolerances needs a value for each of the {} arm joints",
@@ -3397,6 +3425,7 @@ impl ArmConfig {
             max_temperature: 70.0,
             control_frequency_hz: 50,
             resting_pose: Some(RestingPosePolicy::rebot_dm()),
+            rest_pose_tolerance_rad: DEFAULT_REST_POSE_TOLERANCE_RAD,
             following_error: FollowingErrorPolicy::default(),
             max_jerk: Some(50.0),
             gravity_model: Some(GravityModel::RebotDevArm),
@@ -3409,6 +3438,7 @@ impl ArmConfig {
             camera_mount: CameraMount::default(),
             gripper_policy: Some(GripperPolicy::rebot_dm()),
             #[cfg(not(target_arch = "wasm32"))] grasp: Some(crate::grasp::GraspSetup::default()),
+            #[cfg(not(target_arch = "wasm32"))] vision_detectors: None,
             gravity_comp: Some(GravityCompPolicy::rebot_dm()),
             joint_tracking: Some(JointTrackingConfig::rebot_dm()),
             damiao_ranges: Some(vec![
@@ -3940,6 +3970,26 @@ pub struct PolicyObservation {
 
 crate::fieldwise_clone!(PolicyObservation { active, action_id, policy_id, artifact_digest, backend, mode, steps, last_input_age_ms, last_vision_age_ms, vision_frame_id, last_shadow_target, stop_reason });
 
+impl PolicyObservation {
+    /// Preallocated empty `PolicyObservation` reused by `armd-control` spares (0 RT alloc/free).
+    pub fn preallocated_rt() -> Self {
+        Self {
+            active: false,
+            action_id: 0,
+            policy_id: String::with_capacity(HolderLabel::CAPACITY),
+            artifact_digest: String::with_capacity(HolderLabel::CAPACITY),
+            backend: String::with_capacity(64),
+            mode: String::with_capacity(16),
+            steps: 0,
+            last_input_age_ms: None,
+            last_vision_age_ms: None,
+            vision_frame_id: None,
+            last_shadow_target: None,
+            stop_reason: None,
+        }
+    }
+}
+
 /// Gripper zero state published in `observation.gripper_zero`.
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct GripperZeroObservation {
@@ -4076,6 +4126,11 @@ pub struct VisionCapabilities {
     /// armd proxies a detector's API under `/api/v1/detection/*` (upstream
     /// `ARMD_DETECTOR_URL`). Whether a detector is reachable is not checked here.
     pub detection_proxy: bool,
+    /// `POST /api/v1/vision/detector` (operator): switch the detector between the default
+    /// `detect` and `segment` models (`vision_detectors` profile section). Whether the provider
+    /// can switch models shows in `GET /api/v1/vision/mode` `models`.
+    #[serde(default)]
+    pub detector_switch: bool,
     /// armd proxies the provider's mode API at this route (`GET`/`POST`). Present from
     /// capabilities version 2; whether the provider has it shows in `modes`.
     pub mode_endpoint: String,
@@ -4195,6 +4250,10 @@ pub struct Capabilities {
     /// (false) from older armd.
     #[serde(default)]
     pub grasp_select: bool,
+    /// Live grasp execution with `strategy: "adaptive"` (`grasp_select` phase B): `grasp` on a
+    /// 6-DOF arm. Absent (false) from older armd (phase A was dry-run only).
+    #[serde(default)]
+    pub grasp_select_exec: bool,
     /// Action `/api/v1/action/measure_multiview` (lease, operator session): motion-stereo object
     /// measurement from views around the object (`ActionStatus.measurement`); same value as `grasp`.
     /// Absent (false) from older armd.
@@ -4525,6 +4584,7 @@ impl Capabilities {
             move_path_joint: arm_with_gripper && kin,
             grasp_measure: grasp,
             grasp_select: grasp && config.arm_dof() == 6,
+            grasp_select_exec: grasp && config.arm_dof() == 6,
             measure_multiview: grasp,
             calibration_apply: grasp,
             calibration_kinematics: grasp && config.arm_model.chain().is_none(),
@@ -4534,7 +4594,7 @@ impl Capabilities {
             teach: Some(TeachCapabilities { version: TEACH_VERSION, episodes: true, sequences: true }),
             #[cfg(target_arch = "wasm32")]
             teach: None,
-            vision: VisionCapabilities { detection_proxy: true, mode_endpoint: VISION_MODE_ENDPOINT.to_string(), ..Default::default() },
+            vision: VisionCapabilities { detection_proxy: true, detector_switch: cfg!(not(target_arch = "wasm32")), mode_endpoint: VISION_MODE_ENDPOINT.to_string(), ..Default::default() },
             policy_runtime,
         }
     }
@@ -4586,6 +4646,9 @@ pub struct ObservationSchema {
     /// when the profile has none and in older schemas.
     #[serde(default)]
     pub resting_pose: Option<RestingPosePolicy>,
+    /// Per-joint tolerance (rad) around the rest pose for torque disable while stopped; null in older schemas.
+    #[serde(default)]
+    pub rest_pose_tolerance_rad: Option<f32>,
     /// Torque-saturation guard policy; null when the profile has none (and in older schemas).
     #[serde(default)]
     pub torque_guard: Option<crate::torque_guard::TorqueGuardInfo>,
@@ -4715,6 +4778,7 @@ impl ObservationSchema {
             backlash_approach: config.backlash_approach.clone(),
             home_positions: Some(config.home_positions.clone()),
             resting_pose: config.resting_pose.clone(),
+            rest_pose_tolerance_rad: Some(config.rest_pose_tolerance_rad),
             torque_guard: crate::torque_guard::TorqueGuardInfo::from_config(config),
             model_joint_map: config.arm_model.joint_map(),
             kinematics_correction: config.arm_model.correction().copied(),

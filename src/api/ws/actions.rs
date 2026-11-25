@@ -367,8 +367,228 @@ pub(super) struct MacroCheck {
     pub(super) command_path: &'static str,
     pub(super) generation: u64,
     pub(super) stamp: crate::supervisor::AdmissionStamp,
+    /// True when admitted on `OWNER_EXECUTOR` (0 `SupervisorLock`, commits via `begin_executor`).
+    pub(super) executor: bool,
     pub(super) abort: AbortOnDrop,
     pub(super) rx: tokio::sync::oneshot::Receiver<Result<PlannedMacro, ArmError>>,
+}
+
+/// Dispatch result for Executor-owner `/api/v1/action/grasp` WS commands.
+pub(super) enum ExecutorGraspDispatch {
+    Reply(Value),
+    Macro(MacroCheck),
+}
+
+fn off_lock_grasp_reject(request_id: &Value, epoch: u64, error: ApiError) -> Value {
+    let mut r = rejection(error, "command_reject", epoch);
+    r["request_id"] = request_id.clone();
+    r
+}
+
+fn off_lock_grasp_ack(
+    supervisor: &ArmSupervisor,
+    request_id: &Value,
+    started: Started,
+    fallback_epoch: u64,
+) -> Value {
+    let (epoch_id, safety_state, is_torqued, control_mode) =
+        if let Some(s) = supervisor.hub().latest() {
+            let cm = if s.obs.control_mode == crate::model::ControlMode::GravityComp {
+                "gravity_comp"
+            } else {
+                "position"
+            };
+            (s.obs.epoch_id, json!(s.obs.safety_state), s.obs.is_torqued, cm)
+        } else {
+            (fallback_epoch, json!("unknown"), false, "position")
+        };
+    let mut v = json!({
+        "type": "command_ack",
+        "request_id": request_id,
+        "status": "accepted",
+        "epoch_id": epoch_id,
+        "safety_state": safety_state,
+        "is_torqued": is_torqued,
+        "control_mode": control_mode,
+    });
+    if let Some((id, duration)) = started {
+        v["action_id"] = json!(id);
+        v["expected_duration_s"] = json!(duration);
+    }
+    v
+}
+
+/// Executor-owner WebSocket router for `/api/v1/action/grasp`:
+/// - `dry_run: true` (any strategy): lease-free, zero `SupervisorLock`, runs `dry_run_task`
+///   via `ReadOnlySnapshot`.
+/// - Live `strategy: "adaptive"`: enforces lease, epoch, monotonic `request_id`, and operator
+///   auth off-lock, captures `ActionSnapshot::capture_executor` with the original connection
+///   `AdmissionStamp`, plans/preflights off-thread via the shared `MacroCheck` pipeline, and
+///   commits via `grasp::begin_executor`.
+///
+/// Returns `None` for any other path/strategy so unmigrated routes stay fail-closed.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn handle_executor_ws_grasp(
+    frame_kind: FrameKind,
+    entry: Option<&'static DispatchEntry>,
+    value: &Value,
+    stamp: crate::supervisor::AdmissionStamp,
+    recv_conn_id: u64,
+    recv_connection: &str,
+    recv_generation: &Arc<AtomicU64>,
+    recv_client_label: &Mutex<Option<String>>,
+    last_ordinary_request: &mut Option<u64>,
+    ws_auth: &WsAuth,
+    recv_supervisor: &Arc<ArmSupervisor>,
+    recv_deps: &crate::grasp::GraspDeps,
+    worker_closing: &Arc<AtomicBool>,
+    worker_tasks: &ConnectionTasks,
+) -> Option<ExecutorGraspDispatch> {
+    if frame_kind != FrameKind::Command {
+        return None;
+    }
+    let entry = entry?;
+    if entry.key.path != Some("/api/v1/action/grasp") {
+        return None;
+    }
+    let body = &value["body"];
+    let request_id_val = value.get("request_id").cloned().unwrap_or(Value::Null);
+    let is_dry_run = body.get("dry_run").and_then(Value::as_bool) == Some(true);
+    let epoch = recv_supervisor
+        .hub()
+        .latest()
+        .map_or_else(|| recv_supervisor.estop_epoch(), |s| s.obs.epoch_id);
+
+    if is_dry_run {
+        let request_id = value.get("request_id").and_then(Value::as_u64);
+        if request_id.is_none() || last_ordinary_request.is_some_and(|last| request_id.unwrap() <= last) {
+            return Some(ExecutorGraspDispatch::Reply(json!({
+                "type": "command_reject",
+                "request_id": request_id_val,
+                "status": 400,
+                "code": "INVALID_COMMAND",
+                "message": "request_id must be present and strictly increase",
+                "error": "INVALID_COMMAND"
+            })));
+        }
+        *last_ordinary_request = request_id;
+        let dry = crate::grasp::dry_run_task(recv_supervisor, recv_deps.source.as_ref(), body).await;
+        let mut ack = off_lock_grasp_ack(recv_supervisor, &request_id_val, None, epoch);
+        for (k, v) in dry.fields() {
+            ack[k.as_str()] = v;
+        }
+        return Some(ExecutorGraspDispatch::Reply(ack));
+    }
+
+    // Live `/api/v1/action/grasp`: route `strategy: "adaptive"` on `OWNER_EXECUTOR`; keep
+    // unmigrated legacy strategy untouched (`None` -> `EXECUTOR_ROUTING_PENDING`).
+    if body.get("strategy").and_then(Value::as_str) != Some("adaptive") {
+        return None;
+    }
+
+    // 1. Lease authority check (off-lock).
+    let local_generation = recv_generation.load(Ordering::SeqCst);
+    let supplied_generation = value.get("generation").and_then(Value::as_u64).unwrap_or(0);
+    let label_matches = {
+        let lbl = recv_client_label.lock().unwrap_or_else(|e| e.into_inner());
+        value.get("client_id").is_none_or(|id| id.as_str() == lbl.as_deref())
+    };
+    if local_generation == 0 || supplied_generation != local_generation || !label_matches {
+        return Some(ExecutorGraspDispatch::Reply(json!({
+            "type": "command_reject",
+            "request_id": request_id_val,
+            "status": 409,
+            "code": "LEASE_LOST",
+            "error": "LEASE_LOST",
+            "message": "This connection does not hold the active lease",
+            "epoch_id": epoch
+        })));
+    }
+
+    // 2. Epoch check against live published state + atomic E-stop counter.
+    if value.get("epoch_id").and_then(Value::as_u64) != Some(epoch) {
+        return Some(ExecutorGraspDispatch::Reply(json!({
+            "type": "command_reject",
+            "request_id": request_id_val,
+            "status": 409,
+            "code": "EPOCH_MISMATCH",
+            "message": "Command epoch is no longer current",
+            "error": "EPOCH_MISMATCH",
+            "epoch_id": epoch
+        })));
+    }
+
+    // 3. Monotonic request_id check.
+    let request_id = value.get("request_id").and_then(Value::as_u64);
+    if request_id.is_none() || last_ordinary_request.is_some_and(|last| request_id.unwrap() <= last) {
+        return Some(ExecutorGraspDispatch::Reply(json!({
+            "type": "command_reject",
+            "request_id": request_id_val,
+            "status": 400,
+            "code": "INVALID_COMMAND",
+            "message": "request_id must be present and strictly increase",
+            "error": "INVALID_COMMAND"
+        })));
+    }
+    *last_ordinary_request = request_id;
+
+    // 4. Operator auth check from dispatch table.
+    if let AuthRequirement::Operator(label) = entry.auth {
+        if !ws_auth.is_operator() {
+            return Some(ExecutorGraspDispatch::Reply(off_lock_grasp_reject(
+                &request_id_val,
+                epoch,
+                ApiError::operator_required(label.unwrap_or("/api/v1/action/grasp")),
+            )));
+        }
+    }
+
+    // 5. Capture original connection admission stamp (preserving the server-allocated single-use
+    //    A1 `stamp.request_id` from WS frame arrival — never overwriting with client wire IDs)
+    //    and prepare adaptive grasp off-lock.
+    let mut ws_stamp = stamp;
+    ws_stamp.connection_id = recv_conn_id;
+    ws_stamp.lease_gen = local_generation;
+    ws_stamp.estop_epoch = epoch;
+    let deadline = Instant::now() + crate::rt_core::requests::actions::DEFAULT_ACTION_DEADLINE;
+    let snap = match crate::rt_core::requests::actions::ActionSnapshot::capture(
+        recv_supervisor,
+        ws_stamp,
+        deadline,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            return Some(ExecutorGraspDispatch::Reply(off_lock_grasp_reject(
+                &request_id_val,
+                epoch,
+                e.into(),
+            )));
+        }
+    };
+    let pending = match crate::grasp::prepare_from_snapshot(&snap, body, epoch) {
+        Ok(p) => p,
+        Err(e) => {
+            return Some(ExecutorGraspDispatch::Reply(off_lock_grasp_reject(
+                &request_id_val,
+                epoch,
+                e.into(),
+            )));
+        }
+    };
+    let mut check = spawn_macro_check(
+        request_id_val,
+        PendingMacro::Grasp(pending),
+        local_generation,
+        ws_stamp,
+        recv_deps,
+        worker_closing,
+        recv_connection,
+        worker_tasks,
+    );
+    check.executor = true;
+    Some(ExecutorGraspDispatch::Macro(check))
 }
 
 // Under the write lock, after lease / epoch / request_id checks.
@@ -606,6 +826,7 @@ pub(super) async fn complete_macro_check(
     command_path: &'static str,
     generation: u64,
     stamp: crate::supervisor::AdmissionStamp,
+    executor: bool,
     joined: Result<Result<PlannedMacro, ArmError>, tokio::sync::oneshot::error::RecvError>,
     recv_supervisor: &Arc<ArmSupervisor>,
     recv_connection: &str,
@@ -614,6 +835,104 @@ pub(super) async fn complete_macro_check(
     worker_closing: &AtomicBool,
     command_reply_pending: &Arc<AtomicBool>,
 ) -> Option<(Value, Option<CommandReplyGateGuard>)> {
+    if worker_closing.load(Ordering::SeqCst) {
+        return None;
+    }
+    if executor {
+        let epoch = recv_supervisor
+            .hub()
+            .latest()
+            .map_or_else(|| recv_supervisor.estop_epoch(), |s| s.obs.epoch_id);
+        if recv_supervisor.owner_mode() != crate::supervisor::OWNER_EXECUTOR {
+            return Some((
+                off_lock_grasp_reject(
+                    &request_id,
+                    epoch,
+                    ArmError::Rejected {
+                        status: 503,
+                        code: "EXECUTOR_UNAVAILABLE".into(),
+                        message: "RT executor is no longer active".into(),
+                    }
+                    .into(),
+                ),
+                None,
+            ));
+        }
+        if recv_generation.load(Ordering::SeqCst) != generation {
+            return Some((
+                json!({
+                    "type": "command_reject",
+                    "request_id": request_id,
+                    "status": 409,
+                    "code": "LEASE_LOST",
+                    "message": "This connection lost the lease while planning",
+                    "error": "LEASE_LOST",
+                    "epoch_id": epoch
+                }),
+                None,
+            ));
+        }
+        let planned = match joined {
+            Err(e) => {
+                return Some((
+                    off_lock_grasp_reject(
+                        &request_id,
+                        epoch,
+                        ArmError::Internal(format!("planner task failed: {e}")).into(),
+                    ),
+                    None,
+                ));
+            }
+            Ok(Err(error)) => {
+                return Some((off_lock_grasp_reject(&request_id, epoch, error.into()), None));
+            }
+            Ok(Ok(PlannedMacro::Grasp(g))) => g,
+            Ok(Ok(_)) => {
+                return Some((
+                    off_lock_grasp_reject(
+                        &request_id,
+                        epoch,
+                        ArmError::Rejected {
+                            status: 503,
+                            code: "EXECUTOR_ROUTING_PENDING".into(),
+                            message: "Macro kind is not routed on RT executor".into(),
+                        }
+                        .into(),
+                    ),
+                    None,
+                ));
+            }
+        };
+        // Attach the WS broker-reply drain sink on demand so broker external terminals drain
+        // cleanly while every connected WS client receives lossless `ArmObservation` terminals
+        // via `subscribe_action_terminals` (keeping sinkless direct tests fail-closed).
+        if let Some(handle) = recv_supervisor.executor_handle() {
+            if !handle.has_external_reply_sink() {
+                handle.attach_external_reply_sink(Arc::new(|_, _| {
+                    crate::rt_core::broker::DeliveryDecision::Delivered
+                }));
+            }
+        }
+        let gate = CommandReplyGateGuard::enter(command_reply_pending, recv_supervisor.hub());
+        let reply = match crate::grasp::begin_executor(
+            recv_supervisor,
+            stamp,
+            recv_deps.source.clone(),
+            planned,
+        )
+        .await
+        {
+            Ok(started) => off_lock_grasp_ack(recv_supervisor, &request_id, Some(started), epoch),
+            Err(error) => {
+                let cur_epoch = recv_supervisor
+                    .hub()
+                    .latest()
+                    .map_or(epoch, |s| s.obs.epoch_id);
+                off_lock_grasp_reject(&request_id, cur_epoch, error.into())
+            }
+        };
+        return Some((reply, Some(gate)));
+    }
     let owner_transferred = || {
         let mut r = json!({"type":"command_reject", "request_id":request_id, "status":503, "code":"OWNER_TRANSFERRED", "error":"OWNER_TRANSFERRED", "message":"Ownership transferred to RT executor while planning macro"});
         if let Some(s) = recv_supervisor.hub().latest() {
@@ -621,9 +940,6 @@ pub(super) async fn complete_macro_check(
         }
         r
     };
-    if worker_closing.load(Ordering::SeqCst) {
-        return None;
-    }
     if recv_supervisor.owner_mode() != crate::supervisor::OWNER_LEGACY {
         return Some((owner_transferred(), None));
     }
@@ -987,6 +1303,7 @@ pub(super) fn spawn_macro_check(
         command_path,
         generation,
         stamp,
+        executor: false,
         abort: AbortOnDrop(abort),
         rx: res_rx,
     }

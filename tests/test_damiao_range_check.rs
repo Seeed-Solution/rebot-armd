@@ -34,7 +34,9 @@ fn rebot_dm_driver() -> DamiaoArmDriver<MockCanTransport> {
     let limits = ArmConfig::rebot_dm().damiao_ranges.unwrap().iter().map(DamiaoRange::limits).collect();
     let mut d = DamiaoArmDriver::new(MockCanTransport::new(), (1..=7).collect()).with_joint_limits(limits).unwrap();
     for id in 1..=7u16 {
-        d.can_mut().respond_to_transmit(damiao::build_enable_frame(id), feedback(id as u8, 1));
+        let fb = feedback(id as u8, 1);
+        d.can_mut().respond_to_transmit(damiao::build_enable_frame(id), fb);
+        d.can_mut().respond_to_transmit(damiao::build_refresh_frame(id), fb);
     }
     d
 }
@@ -103,7 +105,17 @@ fn silent_motor_is_unverified_within_the_time_budget() {
     assert!(check.joints[3].reported.is_none() && check.joints[3].ctrl_mode.is_none());
     assert!(check.message.contains("[4]"), "{}", check.message);
     assert!(one_silent < Duration::from_millis(60), "{one_silent:?}");
-    // arming still works with the configured ranges (the check is retried before enable)
+    // L2: while motor 4 is also silent on CTRL_MODE, enable MUST refuse with 0 CMD_ENABLE frames.
+    d.can_mut().take_tx_frames();
+    assert!(d.set_torque(true).is_err(), "L2: missing CTRL_MODE must refuse enable");
+    assert!(!sent_enable(&d.can_mut().take_tx_frames()), "L2: no enable frame while CTRL_MODE is unverified");
+    assert!(!d.is_enabled());
+    // Once motor 4 answers causal CTRL_MODE (ranges still silent -> RangeCheckStatus::Unverified),
+    // arming works with the configured ranges while keeping ranges Unverified.
+    d.can_mut().respond_to_transmit(
+        damiao::build_read_register_frame(4, damiao::RID_CTRL_MODE),
+        reply(4, damiao::RID_CTRL_MODE, damiao::CTRL_MODE_POS_VEL.to_le_bytes()),
+    );
     d.set_torque(true).unwrap();
     assert!(d.is_enabled());
     assert_eq!(d.range_check().unwrap().status, RangeCheckStatus::Unverified);

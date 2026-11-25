@@ -274,6 +274,33 @@ impl From<ArmError> for ApiError {
                     current_revision: None,
                     retry_after_s: None,
                 },
+                crate::safety::SafetyError::TorqueOffWouldDrop {
+                    ref joint,
+                    position,
+                    rest,
+                    ref reason,
+                    ref message,
+                } => ApiError {
+                    status: StatusCode::CONFLICT,
+                    error: "TORQUE_OFF_WOULD_DROP".to_string(),
+                    message: message.clone(),
+                    code: Some("TORQUE_OFF_WOULD_DROP".to_string()),
+                    safety_state: None,
+                    details: match (joint, position, rest) {
+                        (Some(j), Some(pos), Some(r)) => Some(Box::new(serde_json::json!({
+                            "reason": reason.as_deref().unwrap_or("outside_rest_pose"),
+                            "joint": j,
+                            "position": pos,
+                            "rest": r,
+                        }))),
+                        _ => reason
+                            .as_deref()
+                            .map(|r| Box::new(serde_json::json!({ "reason": r }))),
+                    },
+                    workspace_violation: None,
+                    current_revision: None,
+                    retry_after_s: None,
+                },
                 crate::safety::SafetyError::ClearFaultRejected(msg) => ApiError {
                     status: StatusCode::CONFLICT,
                     error: "ClearFaultRejected".to_string(),
@@ -542,7 +569,7 @@ pub async fn action_requires_lease(
             return Err(ApiError::operator_required(uri.path()));
         }
         #[cfg(feature = "policy-runtime")]
-        if uri.path() == "/api/v1/action/policy/start" && !supervisor.inner().read().await.policy_live_allowed() {
+        if uri.path() == "/api/v1/action/policy/start" && !supervisor.policy_live_allowed_off_lock().await {
             return Err(ApiError::operator_required("policy/start (real arm)"));
         }
         if uri.path() == "/api/v1/action/gripper_zero_check" {
@@ -834,6 +861,17 @@ pub async fn post_grasp_measure(
         serde_json::from_slice(&body).map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("Body is not JSON: {e}"), "INVALID_COMMAND".into()))?
     };
     Ok(Json(crate::depth_measure::measure(&supervisor, deps.source.as_ref(), &body).await?))
+}
+
+/// `POST /api/v1/vision/detector` (operator): switch the detector to the default model of a
+/// detection kind (`crate::vision_detector`).
+pub async fn post_vision_detector(
+    State(supervisor): State<Arc<ArmSupervisor>>,
+    axum::Extension(deps): axum::Extension<crate::grasp::GraspDeps>,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let body: serde_json::Value = serde_json::from_slice(&body).map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("Body is not JSON ({e}): send {{\"kind\": \"detect\" | \"segment\"}}"), "INVALID_COMMAND".into()))?;
+    Ok(Json(crate::vision_detector::switch(&supervisor, deps.source.as_ref(), &body).await?))
 }
 
 /// `GET /api/v1/calibration`: the camera calibration in effect, the live mount and grasp
