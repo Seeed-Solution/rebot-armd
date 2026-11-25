@@ -1908,6 +1908,9 @@ pub enum ConnLifecycleError {
     AlreadyClosed,
     InvalidConnection,
     Stopped,
+    /// Caller invoked a synchronous lifecycle wait from inside the active `SerialDrainGate`
+    /// callback thread (would deadlock waiting for itself to drain the lifecycle reply).
+    ReentrantCallback,
 }
 
 /// Applies one [`LifecycleCmd`] on the single owner (0 alloc / 0 free on RT).
@@ -2283,6 +2286,14 @@ impl ConnLifecycleClient {
             g.waiters.entry(seq).or_default().push(w);
         }
         Ok(())
+    }
+
+    pub(crate) fn enqueue_open_oneshot(
+        &self,
+        conn_id: u64,
+        tx: tokio::sync::oneshot::Sender<Result<LifecycleReply, ConnLifecycleError>>,
+    ) -> Result<(), ConnLifecycleError> {
+        self.enqueue_open_inner(conn_id, LifecycleWaiter::Async(tx))
     }
 
     pub(crate) fn enqueue_disconnect_oneshot(

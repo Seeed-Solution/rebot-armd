@@ -859,15 +859,153 @@ def infer_nominal_period_us(samples: list[LoadSample], override_us: int | None) 
     return max(1000, int(round(med / 1000.0) * 1000))
 
 
+RELEASE_PHASE_KEYS = (
+    "alloc_read",
+    "ack_flush",
+    "terminal",
+    "guard_drop",
+    "post",
+    "publish",
+)
+
+SCHED_SWITCH_RE = re.compile(
+    r"\[\d+\]\s+\S+\s+(?P<ts>\d+\.\d+):\s+sched_switch:\s+"
+    r"prev_comm=(?P<prev_comm>.+?)\s+prev_pid=(?P<prev_pid>\d+)\s+"
+    r"prev_prio=(?P<prev_prio>-?\d+)\s+prev_state=(?P<prev_state>\S+)\s+==>\s+"
+    r"next_comm=(?P<next_comm>.+?)\s+next_pid=(?P<next_pid>\d+)\s+"
+    r"next_prio=(?P<next_prio>-?\d+)\s*$"
+)
+
+
+def get_signed_int(d: dict[str, Any], key: str) -> int | None:
+    v = d.get(key)
+    if isinstance(v, int) and not isinstance(v, bool):
+        return int(v)
+    return None
+
+
+@dataclass
+class SchedSwitchOut:
+    ts_out: float
+    ts_in: float
+    duration_us: int
+    prev_state: str
+    prev_prio: int
+    next_comm: str
+    next_pid: int
+    next_prio: int
+
+    @property
+    def duration_ms(self) -> float:
+        return self.duration_us / 1000.0
+
+
+@dataclass
+class SchedTraceAnalysis:
+    control_tid: int
+    min_duration_ms: float
+    total_switch_events: int
+    control_switch_outs: int
+    long_switch_outs: list[SchedSwitchOut]
+
+
+def parse_sched_trace(
+    path: Path,
+    control_tid: int,
+    min_duration_ms: float = 2.0,
+) -> SchedTraceAnalysis:
+    """Parse Linux ftrace output and list switch-outs of `control_tid` strictly longer than `min_duration_ms`."""
+    min_us = int(round(min_duration_ms * 1000.0))
+    total_events = 0
+    control_outs = 0
+    long_outs: list[SchedSwitchOut] = []
+    # Active switch-out state: (ts_out, prev_state, prev_prio, next_comm, next_pid, next_prio)
+    pending_out: tuple[float, str, int, str, int, int] | None = None
+
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if not line or line.startswith("#") or "sched_switch:" not in line:
+                continue
+            m = SCHED_SWITCH_RE.search(line)
+            if not m:
+                continue
+            total_events += 1
+            ts = float(m.group("ts"))
+            prev_pid = int(m.group("prev_pid"))
+            next_pid = int(m.group("next_pid"))
+            prev_prio = int(m.group("prev_prio"))
+            next_prio = int(m.group("next_prio"))
+            prev_state = m.group("prev_state")
+            next_comm = m.group("next_comm")
+
+            if prev_pid == control_tid and next_pid != control_tid:
+                control_outs += 1
+                pending_out = (ts, prev_state, prev_prio, next_comm, next_pid, next_prio)
+            elif next_pid == control_tid and pending_out is not None:
+                ts_out, p_state, p_prio, n_comm, n_pid, n_prio = pending_out
+                pending_out = None
+                if ts >= ts_out:
+                    dur_us = int(round((ts - ts_out) * 1_000_000.0))
+                    if dur_us > min_us:
+                        long_outs.append(
+                            SchedSwitchOut(
+                                ts_out=ts_out,
+                                ts_in=ts,
+                                duration_us=dur_us,
+                                prev_state=p_state,
+                                prev_prio=p_prio,
+                                next_comm=n_comm,
+                                next_pid=n_pid,
+                                next_prio=n_prio,
+                            )
+                        )
+
+    long_outs.sort(key=lambda e: e.duration_us, reverse=True)
+    return SchedTraceAnalysis(
+        control_tid=control_tid,
+        min_duration_ms=min_duration_ms,
+        total_switch_events=total_events,
+        control_switch_outs=control_outs,
+        long_switch_outs=long_outs,
+    )
+
+
+def render_sched_trace_section(trace: SchedTraceAnalysis, heading: str = "## 7. Scheduler Switch-Outs (`sched_trace`)") -> list[str]:
+    out: list[str] = [
+        heading,
+        "",
+        f"- **Target TID (`armd-control`)**: `{trace.control_tid}` | "
+        f"**Threshold**: `> {trace.min_duration_ms:.2f} ms` | "
+        f"**Total `sched_switch` events**: `{trace.total_switch_events}` | "
+        f"**`armd-control` switch-outs**: `{trace.control_switch_outs}` | "
+        f"**Over threshold**: `{len(trace.long_switch_outs)}`",
+        "",
+    ]
+    if not trace.long_switch_outs:
+        out.append(f"_No switch-outs of TID `{trace.control_tid}` longer than {trace.min_duration_ms:.2f} ms._")
+        out.append("")
+        return out
+    out.append("| # | Out TS (s) | In TS (s) | Duration (ms) | Prev State | Next Task | Next PID | Next Prio |")
+    out.append("|---:|---:|---:|---:|---|---|---:|---:|")
+    for idx, ev in enumerate(trace.long_switch_outs, start=1):
+        out.append(
+            f"| {idx} | `{ev.ts_out:.6f}` | `{ev.ts_in:.6f}` | **{ev.duration_ms:.3f}** | "
+            f"`{ev.prev_state}` | `{ev.next_comm}` | {ev.next_pid} | {ev.next_prio} |"
+        )
+    out.append("")
+    return out
+
+
 def collect_unique_breakdowns(samples: list[LoadSample]) -> list[tuple[str, str, int, dict[str, Any]]]:
     """Return deduplicated (kind, phase, sample_idx, breakdown) sorted by release_us/tick_us desc."""
     by_sig: dict[tuple[Any, ...], list[Any]] = {}
     for s in samples:
-        for kind in ("max_release", "max_tick", "max_lock"):
+        for kind in ("max_release", "max_tick", "max_lock", "max_wait"):
             bd = s.tick.get(kind)
             if not isinstance(bd, dict):
                 continue
             holder = bd.get("waited_for")
+            phases_us = bd.get("phases_us")
             sig = (
                 bd.get("release_us"),
                 bd.get("tick_us"),
@@ -880,8 +1018,14 @@ def collect_unique_breakdowns(samples: list[LoadSample]) -> list[tuple[str, str,
                 bd.get("obs_us"),
                 bd.get("lock_cpu_us"),
                 bd.get("lock_ivcsw"),
+                bd.get("mid_nvcsw"),
+                bd.get("mid_nivcsw"),
+                bd.get("handoff_us"),
+                tuple(phases_us.get(k) for k in RELEASE_PHASE_KEYS) if isinstance(phases_us, dict) else None,
                 holder.get("location") if isinstance(holder, dict) else None,
+                holder.get("command") if isinstance(holder, dict) else None,
                 holder.get("hold_us") if isinstance(holder, dict) else None,
+                holder.get("released_before_lock_us") if isinstance(holder, dict) else None,
             )
             if sig not in by_sig:
                 by_sig[sig] = [[kind], s.phase, s.index, bd]
@@ -891,7 +1035,49 @@ def collect_unique_breakdowns(samples: list[LoadSample]) -> list[tuple[str, str,
     rows.sort(
         key=lambda r: (
             get_nonneg_int(r[3], "release_us") or get_nonneg_int(r[3], "tick_us") or 0,
+            get_nonneg_int(r[3], "wait_us") or 0,
             get_nonneg_int(r[3], "lock_us") or 0,
+        ),
+        reverse=True,
+    )
+    return rows
+
+
+def collect_unique_kind_breakdowns(
+    samples: list[LoadSample],
+    kind: str,
+    sort_key: str,
+) -> list[tuple[str, int, dict[str, Any]]]:
+    """Return deduplicated (phase, sample_idx, breakdown) for one slot (`max_release` or `max_wait`)."""
+    by_sig: dict[tuple[Any, ...], tuple[str, int, dict[str, Any]]] = {}
+    for s in samples:
+        bd = s.tick.get(kind)
+        if not isinstance(bd, dict):
+            continue
+        holder = bd.get("waited_for")
+        phases_us = bd.get("phases_us")
+        sig = (
+            bd.get("release_us"),
+            bd.get("tick_us"),
+            bd.get("wait_us"),
+            bd.get("lock_us"),
+            bd.get("mid_nvcsw"),
+            bd.get("mid_nivcsw"),
+            bd.get("handoff_us"),
+            tuple(phases_us.get(k) for k in RELEASE_PHASE_KEYS) if isinstance(phases_us, dict) else None,
+            holder.get("kind") if isinstance(holder, dict) else None,
+            holder.get("location") if isinstance(holder, dict) else None,
+            holder.get("command") if isinstance(holder, dict) else None,
+            holder.get("hold_us") if isinstance(holder, dict) else None,
+            holder.get("released_before_lock_us") if isinstance(holder, dict) else None,
+        )
+        if sig not in by_sig:
+            by_sig[sig] = (s.phase, s.index, bd)
+    rows = list(by_sig.values())
+    rows.sort(
+        key=lambda r: (
+            get_nonneg_int(r[2], sort_key) or 0,
+            get_nonneg_int(r[2], "release_us") or get_nonneg_int(r[2], "tick_us") or 0,
         ),
         reverse=True,
     )
@@ -957,6 +1143,7 @@ def analyze(
     devstat: DevstatRun | None,
     nominal_period_us: int | None = None,
     top_intervals: int = 5,
+    sched_trace: SchedTraceAnalysis | None = None,
 ) -> str:
     samples = load_run.samples
     if not samples:
@@ -2277,11 +2464,18 @@ def analyze(
         csw_str = f"{bd.get('lock_vcsw', 0)}/{bd.get('lock_ivcsw', 0)}"
         flt_str = f"{bd.get('lock_majflt', 0)}/{bd.get('lock_minflt', 0)}"
         wf = bd.get("waited_for")
-        wf_str = (
-            f"`{wf.get('kind')}@{wf.get('location')}` ({fmt_ms(us_to_ms(wf.get('hold_us')))} ms)"
-            if isinstance(wf, dict)
-            else "none"
-        )
+        if isinstance(wf, dict):
+            wf_cmd = f" cmd=`{wf['command']}`" if wf.get("command") else ""
+            wf_handoff = get_signed_int(bd, "handoff_us")
+            if wf_handoff is None:
+                wf_handoff = get_signed_int(wf, "released_before_lock_us")
+            wf_hf = f" handoff={wf_handoff}us" if wf_handoff is not None else ""
+            wf_str = (
+                f"`{wf.get('kind')}@{wf.get('location')}`{wf_cmd} "
+                f"({fmt_ms(us_to_ms(wf.get('hold_us')))} ms{wf_hf})"
+            )
+        else:
+            wf_str = "none"
         rel_or_tick = get_nonneg_int(bd, "release_us")
         if rel_or_tick is None or rel_or_tick == 0:
             rel_or_tick = get_nonneg_int(bd, "tick_us")
@@ -2291,6 +2485,71 @@ def analyze(
             f"{bd.get('lock_alloc_calls', 0)} | {wf_str} |"
         )
     out.append("")
+
+    max_release_rows = collect_unique_kind_breakdowns(samples, "max_release", "release_us")
+    max_release_with_phases = [
+        r for r in max_release_rows
+        if isinstance(r[2].get("phases_us"), dict)
+        or r[2].get("mid_nvcsw") is not None
+        or r[2].get("mid_nivcsw") is not None
+    ]
+    if max_release_with_phases:
+        out.append("### Release Phase Marks (`max_release`)")
+        out.append("")
+        out.append(
+            "| Phase | `release` (ms) | `lock` (ms) | `alloc_read` (µs) | `ack_flush` (µs) | "
+            "`terminal` (µs) | `guard_drop` (µs) | `post` (µs) | `publish` (µs) | `mid_nvcsw`/`mid_nivcsw` |"
+        )
+        out.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+        for ph, _sidx, bd in max_release_with_phases[:12]:
+            pu = bd.get("phases_us") if isinstance(bd.get("phases_us"), dict) else {}
+            mid_csw = f"{fmt_int(get_nonneg_int(bd, 'mid_nvcsw'))}/{fmt_int(get_nonneg_int(bd, 'mid_nivcsw'))}"
+            out.append(
+                f"| `{ph}` | **{fmt_ms(us_to_ms(get_nonneg_int(bd, 'release_us')))}** | "
+                f"{fmt_ms(us_to_ms(get_nonneg_int(bd, 'lock_us')))} | "
+                f"{fmt_int(get_nonneg_int(pu, 'alloc_read'))} | "
+                f"{fmt_int(get_nonneg_int(pu, 'ack_flush'))} | "
+                f"{fmt_int(get_nonneg_int(pu, 'terminal'))} | "
+                f"{fmt_int(get_nonneg_int(pu, 'guard_drop'))} | "
+                f"{fmt_int(get_nonneg_int(pu, 'post'))} | "
+                f"{fmt_int(get_nonneg_int(pu, 'publish'))} | "
+                f"{mid_csw} |"
+            )
+        out.append("")
+
+    max_wait_rows = collect_unique_kind_breakdowns(samples, "max_wait", "wait_us")
+    if max_wait_rows:
+        out.append("### Worst Lock Wait Breakdown (`max_wait`)")
+        out.append("")
+        out.append(
+            "| Phase | `wait_us` (ms) | `release` (ms) | Last Holder (`kind@location`) | "
+            "Command | Holder Hold (ms) | Handoff (µs) |"
+        )
+        out.append("|---|---:|---:|---|---|---:|---:|")
+        for ph, _sidx, bd in max_wait_rows[:12]:
+            wf = bd.get("waited_for")
+            if isinstance(wf, dict):
+                holder_loc = f"`{wf.get('kind')}@{wf.get('location')}`"
+                holder_cmd = f"`{wf['command']}`" if wf.get("command") else "n/a"
+                holder_hold = fmt_ms(us_to_ms(get_nonneg_int(wf, "hold_us")))
+                handoff = get_signed_int(bd, "handoff_us")
+                if handoff is None:
+                    handoff = get_signed_int(wf, "released_before_lock_us")
+                handoff_str = fmt_int(handoff)
+            else:
+                holder_loc = "none"
+                holder_cmd = "n/a"
+                holder_hold = "n/a"
+                handoff_str = "n/a"
+            rel_or_tick = get_nonneg_int(bd, "release_us")
+            if rel_or_tick is None or rel_or_tick == 0:
+                rel_or_tick = get_nonneg_int(bd, "tick_us")
+            out.append(
+                f"| `{ph}` | **{fmt_ms(us_to_ms(get_nonneg_int(bd, 'wait_us')))}** | "
+                f"{fmt_ms(us_to_ms(rel_or_tick))} | {holder_loc} | {holder_cmd} | "
+                f"{holder_hold} | {handoff_str} |"
+            )
+        out.append("")
 
     # 5. Devstat Attribution (IRQ / SoftIRQ / CAN / Threads)
     if devstat is not None:
@@ -2551,29 +2810,72 @@ def analyze(
         out.append(f"- {g}")
     out.append("")
 
+    if sched_trace is not None:
+        out.extend(render_sched_trace_section(sched_trace))
+
     return "\n".join(out)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Analyze SG2002 RT qualification load.jsonl + devstat.txt.")
-    p.add_argument("--load", required=True, help="Path to load.jsonl (or legacy dev6 tickload.json)")
+    p = argparse.ArgumentParser(description="Analyze SG2002 RT qualification load.jsonl + devstat.txt + ftrace sched_trace.")
+    p.add_argument("--load", default=None, help="Path to load.jsonl (or legacy dev6 tickload.json)")
     p.add_argument("--devstat", default=None, help="Optional path to devstat.txt from reCamera")
+    p.add_argument("--sched-trace", default=None, help="Optional path to ftrace sched_switch capture from sched_trace.sh")
+    p.add_argument("--control-tid", type=int, default=None, help="TID of armd-control for --sched-trace analysis (auto-detected from --devstat if omitted)")
+    p.add_argument("--min-switch-out-ms", type=float, default=2.0, help="Minimum switch-out duration (ms) to list from --sched-trace (default: 2.0)")
     p.add_argument("--output", default=None, help="Optional output Markdown path (default: stdout)")
     p.add_argument("--nominal-period-us", type=int, default=None, help="Nominal control period in us (default: inferred from period_us.p50)")
     p.add_argument("--top-intervals", type=int, default=5, help="Number of worst release intervals to join with IRQ deltas")
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if args.load is None and args.sched_trace is None:
+        p.error("at least one of --load or --sched-trace is required")
+    return args
+
+
+def _resolve_control_tid(explicit_tid: int | None, devstat: DevstatRun | None) -> int | None:
+    if explicit_tid is not None:
+        return explicit_tid
+    if devstat is not None and devstat.samples:
+        ctl = find_armd_control_task(devstat.samples[0].armd_tasks)
+        if ctl is not None and isinstance(ctl.get("tid"), int):
+            return int(ctl["tid"])
+    return None
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    load_run = load_input(Path(args.load))
     devstat = parse_devstat(Path(args.devstat)) if args.devstat else None
-    report = analyze(
-        load_run,
-        devstat,
-        nominal_period_us=args.nominal_period_us,
-        top_intervals=args.top_intervals,
-    )
+    sched_trace: SchedTraceAnalysis | None = None
+    if args.sched_trace:
+        tid = _resolve_control_tid(args.control_tid, devstat)
+        if tid is None:
+            print(
+                "Error: --control-tid is required with --sched-trace (or supply --devstat containing armd-control)",
+                file=sys.stderr,
+            )
+            return 2
+        sched_trace = parse_sched_trace(
+            Path(args.sched_trace),
+            control_tid=tid,
+            min_duration_ms=args.min_switch_out_ms,
+        )
+    if args.load:
+        load_run = load_input(Path(args.load))
+        report = analyze(
+            load_run,
+            devstat,
+            nominal_period_us=args.nominal_period_us,
+            top_intervals=args.top_intervals,
+            sched_trace=sched_trace,
+        )
+    else:
+        assert sched_trace is not None
+        report = "\n".join(
+            render_sched_trace_section(
+                sched_trace,
+                heading="# Scheduler Switch-Out Report (`sched_trace`)",
+            )
+        )
     if args.output:
         out_path = Path(args.output)
         out_path.parent.mkdir(parents=True, exist_ok=True)

@@ -132,9 +132,24 @@ static SEND_DROPS: AtomicU64 = AtomicU64::new(0);
 /// Send without blocking the control tick (the socket itself stays blocking for the
 /// receiver thread, which shares it): a full buffer drops the datagram and counts it, like a
 /// lost CAN frame. Other errors are ignored for the same reason.
-fn send_nonblocking(socket: &UdpSocket, bytes: &[u8]) {
+#[cfg(not(target_arch = "wasm32"))]
+fn send_nonblocking(socket: &UdpSocket, bytes: &[u8]) -> crate::torque::MotorWriteOutcome {
     use std::os::fd::AsRawFd;
     // SAFETY: valid fd and buffer for the duration of the call.
+    let n = unsafe { libc::send(socket.as_raw_fd(), bytes.as_ptr().cast(), bytes.len(), libc::MSG_DONTWAIT) };
+    if n >= 0 {
+        crate::torque::MotorWriteOutcome::Sent
+    } else if std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock {
+        SEND_DROPS.fetch_add(1, Ordering::Relaxed);
+        crate::torque::MotorWriteOutcome::Deferred
+    } else {
+        crate::torque::MotorWriteOutcome::Failed
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn send_nonblocking(socket: &UdpSocket, bytes: &[u8]) {
+    use std::os::fd::AsRawFd;
     let n = unsafe { libc::send(socket.as_raw_fd(), bytes.as_ptr().cast(), bytes.len(), libc::MSG_DONTWAIT) };
     if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock {
         SEND_DROPS.fetch_add(1, Ordering::Relaxed);
@@ -220,6 +235,10 @@ pub struct SimArmDriver {
     /// Deterministic test hook invoked inside `send_ref` strictly after JSON serialization and
     /// immediately before the final E-stop send gate and socket transmit.
     before_send_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Last `(session, seq)` staged into shadow observations to avoid duplicate samples on re-reads.
+    last_shadow_sample: Option<(u64, u64)>,
+    #[cfg(not(target_arch = "wasm32"))]
+    shadow_staging: crate::torque::shadow::ShadowDriverStaging,
 }
 
 impl SimArmDriver {
@@ -300,6 +319,9 @@ impl SimArmDriver {
             stopped_disable_gate: None,
             tx_release_deadline: None,
             before_send_hook: None,
+            last_shadow_sample: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            shadow_staging: crate::torque::shadow::ShadowDriverStaging::new(false),
         })
     }
 
@@ -477,8 +499,51 @@ impl SimArmDriver {
         if serialized {
             // A lost datagram is equivalent to a lost CAN frame: the missing feedback,
             // not the write error, is what the supervisor acts on (BUS_LOSS).
-            send_nonblocking(&self.socket, &self.tx_buf);
+            let send_outcome = send_nonblocking(&self.socket, &self.tx_buf);
             self.last_send_ms.store(self.epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+            #[cfg(not(target_arch = "wasm32"))]
+            if self.shadow_staging.is_enabled() {
+                let now = Instant::now();
+                let write_kind = match (enable, with_hold_targets, with_targets, gate) {
+                    (Some(true), _, _, _) => Some(crate::torque::WriteKind::Enable),
+                    (Some(false), _, _, SendGate::DisableRequested { .. }) => {
+                        Some(crate::torque::WriteKind::DisableRequested)
+                    }
+                    (Some(false), _, _, SendGate::DisableProtective { .. }) => {
+                        Some(crate::torque::WriteKind::DisableProtective)
+                    }
+                    (None, true, _, _) => Some(crate::torque::WriteKind::Hold),
+                    (None, false, true, _) => Some(crate::torque::WriteKind::Motion),
+                    _ => None,
+                };
+                if let Some(kind) = write_kind {
+                    let mut mask = crate::torque::ChannelMask::EMPTY;
+                    let mut outcomes = [crate::torque::MotorWriteOutcome::NotTargeted;
+                        crate::torque::MAX_CHANNELS];
+                    let n = self.dof.min(crate::torque::MAX_CHANNELS);
+                    for (i, slot) in outcomes.iter_mut().take(n).enumerate() {
+                        let include = !with_hold_targets
+                            || self.cmd_hold_targets.get(i).is_some_and(Option::is_some);
+                        if include {
+                            mask.insert(i as u8);
+                            *slot = send_outcome;
+                        }
+                    }
+                    if !mask.is_empty() {
+                        self.shadow_staging.push(
+                            crate::torque::shadow::ShadowDriverObs::WriteResult {
+                                device: 0,
+                                kind,
+                                write_done: now,
+                                now,
+                                target_mask: mask,
+                                outcomes,
+                                ambiguous_gap: false,
+                            },
+                        );
+                    }
+                }
+            }
         }
         Ok(self.seq)
     }
@@ -505,8 +570,10 @@ impl SimArmDriver {
         } else {
             self.shared.lock().ok()
         };
+        let mut fresh_shadow: Option<(u64, u64, bool, Option<Instant>)> = None;
         if let Some(s) = guard {
             if let Some(ref state) = s.latest {
+                fresh_shadow = Some((state.session, state.seq, state.enabled, s.received_at));
                 self.cached_ack = state.ack;
                 self.cached_enabled = state.enabled;
                 self.cached_received_at = s.received_at;
@@ -534,6 +601,41 @@ impl SimArmDriver {
                         torque: if self.load_only_feedback { 0.0 } else { state.tau[i] },
                         temperature: state.temp[i],
                     };
+                }
+            }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some((session, seq, enabled, rx_at_opt)) = fresh_shadow {
+            if self.shadow_staging.is_enabled() && self.last_shadow_sample != Some((session, seq)) {
+                self.last_shadow_sample = Some((session, seq));
+                let decode_now = Instant::now();
+                let stamp = match rx_at_opt {
+                    Some(rx_at) if rx_at > decode_now => crate::torque::shadow::RxStampKind::Future,
+                    Some(rx_at) => crate::torque::shadow::RxStampKind::Valid {
+                        rx_at,
+                        drift_ns: 0,
+                        live_post_settle: true,
+                    },
+                    None => crate::torque::shadow::RxStampKind::Missing { reset_window: false },
+                };
+                let n = self.cached.len().min(crate::torque::MAX_CHANNELS);
+                for (i, js) in self.cached.iter().take(n).enumerate() {
+                    let sample_id = self.shadow_staging.next_sample_id();
+                    self.shadow_staging.push(
+                        crate::torque::shadow::ShadowDriverObs::CausalSample {
+                            channel: i as u8,
+                            sample_id,
+                            stamp,
+                            decode_now,
+                            position_rad: js.position,
+                            velocity_rad_s: Some(js.velocity),
+                            temperature_c: Some(js.temperature),
+                            reported_enabled: Some(enabled),
+                            correlated_after_write_done: None,
+                            poll_issued: None,
+                            provenance: crate::torque::shadow::EvidenceProvenance::SimDriver,
+                        },
+                    );
                 }
             }
         }
@@ -1182,6 +1284,28 @@ impl ArmDriver for SimArmDriver {
 
     fn set_tx_release_deadline(&mut self, deadline: Option<Instant>) {
         self.tx_release_deadline = deadline;
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn shadow_vendor_kind(&self) -> crate::torque::VendorKind {
+        if self.load_only_feedback {
+            crate::torque::VendorKind::Feetech
+        } else {
+            crate::torque::VendorKind::Damiao
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn set_shadow_enabled(&mut self, enabled: bool) {
+        self.shadow_staging.set_enabled(enabled);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn drain_shadow_observations(
+        &mut self,
+        out: &mut [Option<crate::torque::shadow::ShadowDriverObs>],
+    ) -> (usize, u64) {
+        self.shadow_staging.drain_into(out)
     }
 
     fn supports_mit_mode_switch(&self) -> bool { true }

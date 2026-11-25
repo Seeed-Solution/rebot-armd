@@ -1412,6 +1412,413 @@ fn production_executor_mock_positive_control_counts_and_catches_try_read_on_armd
     });
 }
 
+#[test]
+fn terminal_capture_lock_proof_action_completion_dwell_saturation_and_positive_controls() {
+    use armd::driver::{ArmDriverError, DriverCapabilities, EnableState, JointTarget};
+    use armd::model::JointState;
+    use std::sync::atomic::AtomicUsize;
+
+    struct CaptureAuditDriver {
+        dof: usize,
+        positions: Vec<f32>,
+        in_capture: Arc<AtomicBool>,
+        driver_calls_during_capture: Arc<AtomicUsize>,
+    }
+
+    impl CaptureAuditDriver {
+        fn note_call(&self) {
+            if self.in_capture.load(Ordering::Acquire) {
+                self.driver_calls_during_capture.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+    }
+
+    impl armd::driver::ArmDriver for CaptureAuditDriver {
+        fn capabilities(&self) -> DriverCapabilities {
+            self.note_call();
+            DriverCapabilities {
+                velocity_feedback: true,
+                torque_feedback: true,
+                temperature_feedback: true,
+                torque_feedforward: false,
+                enable_feedback: true,
+                load_feedback: false,
+            }
+        }
+        fn enable_state(&self) -> EnableState {
+            self.note_call();
+            EnableState::Enabled
+        }
+        fn is_feedback_valid(&self) -> bool {
+            self.note_call();
+            true
+        }
+        fn feedback_ages(&self) -> Vec<Option<Duration>> {
+            self.note_call();
+            vec![Some(Duration::from_millis(5)); self.dof]
+        }
+        fn feedback_instants(&self) -> Vec<Option<Instant>> {
+            self.note_call();
+            vec![Some(Instant::now()); self.dof]
+        }
+        fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool {
+            self.note_call();
+            dof == self.dof && max_age >= Duration::from_millis(5)
+        }
+        fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+            self.note_call();
+            Ok(self
+                .positions
+                .iter()
+                .map(|&p| JointState {
+                    position: p,
+                    velocity: 0.0,
+                    torque: 0.0,
+                    temperature: 30.0,
+                })
+                .collect())
+        }
+        fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
+            self.note_call();
+            for (dst, t) in self.positions.iter_mut().zip(targets.iter()) {
+                *dst = t.position;
+            }
+            Ok(())
+        }
+        fn set_torque(&mut self, _enable: bool) -> Result<(), ArmDriverError> {
+            self.note_call();
+            Ok(())
+        }
+        fn supports_rt_executor(&self) -> Result<(), &'static str> {
+            Ok(())
+        }
+    }
+
+    run_bounded_fixture(Duration::from_secs(15), "terminal-capture-lock-proof", |deadline| {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let in_capture = Arc::new(AtomicBool::new(false));
+            let driver_calls_during_capture = Arc::new(AtomicUsize::new(0));
+            let drv = CaptureAuditDriver {
+                dof: 7,
+                positions: vec![0.0; 7],
+                in_capture: Arc::clone(&in_capture),
+                driver_calls_during_capture: Arc::clone(&driver_calls_during_capture),
+            };
+            let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
+            sup.set_lease_enabled(false).await;
+            sup.test_set_terminal_capture_drain_paused(true);
+            sup.test_set_terminal_capture_push_cap(3);
+
+            // 1) Hold `TerminalBroadcaster`'s internal mutex on another OS thread throughout
+            //    action completion, 30 dwell ticks, and ring saturation (6 actions > cap 3).
+            //    If `tick_shared`, `finish_action` (with defer), or `capture_edge_terminals`
+            //    ever locked `TerminalBroadcaster`, this would deadlock / trip timeout.
+            let (held_tx, held_rx) = mpsc::channel();
+            let (rel_tx, rel_rx) = mpsc::channel();
+            let sup_h = Arc::clone(&sup);
+            let tb_holder = thread::spawn(move || {
+                let _guard = sup_h.test_lock_terminal_broadcaster();
+                let _ = held_tx.send(());
+                let _ = rel_rx.recv();
+            });
+            held_rx.recv_timeout(Duration::from_secs(2)).expect("broadcaster lock held");
+
+            // Track driver calls strictly across the entire `capture_edge_terminals` body.
+            let in_cap_hook = Arc::clone(&in_capture);
+            sup.inner().write().await.terminal_capture_test_hook =
+                Some(Arc::new(move |_, entering| {
+                    in_cap_hook.store(entering, Ordering::Release);
+                }));
+
+            // Also exercise an in-tick supersession (early `capture_from` via
+            // `record_terminal_transition_for`) so that path is audited for 0 driver locks too.
+            {
+                let mut inner = sup.inner().write().await;
+                let _superseded = inner.test_start_zero_heap_jog_rt(0.02, 0.20);
+                let _replacement = inner.test_start_zero_heap_jog_rt(-0.02, 0.04);
+            }
+            for _ in 0..40 {
+                sup.control_tick(0.02).await;
+                let st = sup.test_terminal_capture_stats();
+                if st.captured + st.saturated >= 2 {
+                    break;
+                }
+            }
+
+            // Real in-tick trajectory completions + 30 dwell ticks + saturation (6 total actions
+            // into push_cap=3). `terminal_capture_test_hook` spans `capture_edge_terminals` AND
+            // early `capture_from` paths so any driver mutex call in record construction or ring
+            // flush is caught.
+            let baseline_total = {
+                let st = sup.test_terminal_capture_stats();
+                st.captured + st.saturated
+            };
+            for i in 0..6 {
+                let delta = if i % 2 == 0 { 0.02 } else { -0.02 };
+                sup.inner().write().await.test_start_zero_heap_jog_rt(delta, 0.04);
+                let target_total = baseline_total + (i + 1) as u64;
+                for _ in 0..40 {
+                    sup.control_tick(0.02).await;
+                    let st = sup.test_terminal_capture_stats();
+                    if st.captured + st.saturated >= target_total {
+                        break;
+                    }
+                }
+                if i == 0 {
+                    let cap_after_first = sup.test_terminal_capture_stats().captured;
+                    // 30 dwell ticks after first completion: 0 extra captures, 0 broadcaster locks.
+                    for _ in 0..30 {
+                        sup.control_tick(0.02).await;
+                    }
+                    assert_eq!(sup.test_terminal_capture_stats().captured, cap_after_first);
+                }
+            }
+            let stats = sup.test_terminal_capture_stats();
+            assert_eq!(stats.captured, 3, "push_cap=3: {stats:?}");
+            assert!(stats.saturated >= 3, "actions past push_cap=3 must saturate: {stats:?}");
+            assert!(stats.ever_saturated);
+            assert_eq!(
+                driver_calls_during_capture.load(Ordering::Acquire),
+                0,
+                "capture_edge_terminals must acquire ZERO driver mutexes"
+            );
+
+            // 2) Positive controls inside `capture_edge_terminals`:
+            //    (a) Injected broadcaster mutex try_lock fails (`WouldBlock`) while held;
+            //    (b) Injected driver mutex call (`hardware_feedback_fresh`) increments driver counter 0 -> 1.
+            let sup_probe = Arc::clone(&sup);
+            let tb_try_locked = Arc::new(AtomicBool::new(true));
+            let tb_try_locked_c = Arc::clone(&tb_try_locked);
+            let in_cap_pos = Arc::clone(&in_capture);
+            sup.inner().write().await.terminal_capture_test_hook =
+                Some(Arc::new(move |inner, entering| {
+                    in_cap_pos.store(entering, Ordering::Release);
+                    if entering {
+                        tb_try_locked_c.store(
+                            sup_probe.test_try_lock_terminal_broadcaster(),
+                            Ordering::Release,
+                        );
+                        let _ = inner.hardware_feedback_fresh(Duration::from_millis(250));
+                    }
+                }));
+            sup.control_tick(0.02).await;
+            sup.inner().write().await.terminal_capture_test_hook = None;
+
+            assert!(
+                !tb_try_locked.load(Ordering::Acquire),
+                "positive control: injected broadcaster lock inside capture MUST fail contention check"
+            );
+            assert!(
+                driver_calls_during_capture.load(Ordering::Acquire) >= 1,
+                "positive control: injected driver mutex call inside capture MUST be detected"
+            );
+
+            let _ = rel_tx.send(());
+            tb_holder.join().unwrap();
+
+            // 3) RT Executor lock proof + positive controls on `armd-control`:
+            //    Attach `CaptureAuditDriver`, hold `TerminalCaptureChannel::rx`,
+            //    `TerminalCaptureChannel::rich_action_cache`, `TerminalBroadcaster`, AND
+            //    `DetachedLegacyWriterHold` simultaneously while completing a real RT jog + dwell.
+            //    Verify 0 `SupervisorLock`, 0 `TerminalCaptureChannel` (`rx` / `rich_action_cache`),
+            //    and 0 driver mutex calls during capture; then verify positive controls catch
+            //    injected `SupervisorLock::try_read`, uncontended `channel.rx.lock()`, and
+            //    uncontended `rich_action_cache.lock()` on `armd-control`.
+            let rt_in_capture = Arc::new(AtomicBool::new(false));
+            let rt_driver_calls = Arc::new(AtomicUsize::new(0));
+            let rt_drv = CaptureAuditDriver {
+                dof: 7,
+                in_capture: Arc::clone(&rt_in_capture),
+                driver_calls_during_capture: Arc::clone(&rt_driver_calls),
+                positions: vec![0.0; 7],
+            };
+            let sup_rt = Arc::new(
+                ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(rt_drv)),
+            );
+            sup_rt.set_lease_enabled(false).await;
+            sup_rt.register_ws_connection(1).await.unwrap();
+            sup_rt
+                .enable_torque(sup_rt.capture_admission_stamp())
+                .await
+                .unwrap();
+            let inner_lock = Arc::clone(sup_rt.inner());
+            let sup_rt_for_hook = Arc::clone(&sup_rt);
+            let rt_in_capture_hook = Arc::clone(&rt_in_capture);
+            let probe_armed = Arc::new(AtomicBool::new(false));
+            let probe_caught = Arc::new(AtomicBool::new(false));
+            let armed_c = Arc::clone(&probe_armed);
+            let caught_c = Arc::clone(&probe_caught);
+            sup_rt.inner().write().await.terminal_capture_test_hook =
+                Some(Arc::new(move |inner, entering| {
+                    // Span the ENTIRE `capture_edge_terminals` body (`capture_from` + SPSC push):
+                    // `entering == true` arms the driver audit window BEFORE record construction,
+                    // `entering == false` clears it strictly AFTER the push loop completes.
+                    rt_in_capture_hook.store(entering, Ordering::Release);
+                    if !entering || !armed_c.swap(false, Ordering::AcqRel) {
+                        return;
+                    }
+                    assert!(on_rt_control_thread());
+                    let res_sup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let _ = inner_lock.try_read();
+                    }));
+                    assert!(
+                        res_sup.is_err(),
+                        "injected SupervisorLock::try_read in capture must panic"
+                    );
+                    let res_rx = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        sup_rt_for_hook.test_touch_terminal_capture_rx_lock();
+                    }));
+                    assert!(
+                        res_rx.is_err(),
+                        "injected uncontended TerminalCaptureChannel::rx.lock() in capture must panic"
+                    );
+                    let res_cache = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        sup_rt_for_hook.test_touch_terminal_capture_rich_cache_lock();
+                    }));
+                    assert!(
+                        res_cache.is_err(),
+                        "injected uncontended TerminalCaptureChannel::rich_action_cache.lock() in capture must panic"
+                    );
+                    // Positive control: injected driver mutex acquisition strictly inside the
+                    // capture window MUST be detected by `rt_driver_calls`.
+                    let _ = inner.hardware_feedback_fresh(Duration::from_millis(250));
+                    caught_c.store(true, Ordering::Release);
+                }));
+
+            let cfg_snap = Arc::new(
+                armd::rt_core::requests::motion::MotionConfigSnapshot::from_supervisor(
+                    &*sup_rt.inner().read().await,
+                ),
+            );
+            let handle = sup_rt
+                .start_executor_with_hooks(
+                    ExecutorConfig::for_tests(Duration::from_millis(5)),
+                    PersistTestHooks::default(),
+                )
+                .await
+                .unwrap();
+            let writer_hold = DetachedLegacyWriterHold::acquire(Arc::clone(&sup_rt), deadline);
+            // Hold ALL three capture/broadcaster mutexes simultaneously while `armd-control`
+            // runs jog completion + dwell: any lock attempt would deadlock/fail before deadline.
+            let _hold_rx = sup_rt.test_lock_terminal_capture_rx();
+            let _hold_rich = sup_rt.test_lock_terminal_capture_rich_cache();
+            let _hold_tb = sup_rt.test_lock_terminal_broadcaster();
+            // Drive an actual RT jog completion + dwell under all four held locks.
+            wait_until_deadline(deadline, "initial RT publication", || {
+                sup_rt.hub().published_seq() >= 2
+            });
+            let snap = sup_rt.hub().latest().unwrap();
+            let from = snap.rt.commanded_positions.clone();
+            let mut to = from.clone();
+            to[0] += 0.02;
+            let msnap = armd::rt_core::requests::motion::MotionPlanSnapshot {
+                config: cfg_snap,
+                commanded_positions: from.clone(),
+                commanded_velocities: vec![0.0; from.len()],
+                measured_positions: from,
+                torque_hold: None,
+                power_hold: None,
+                holding_after_clear: false,
+                mit_active: false,
+                authority: armd::rt_core::requests::motion::PlanAuthority {
+                    boot: snap.rt.boot_id,
+                    epoch: snap.obs.epoch_id,
+                    lease_generation: 0,
+                    stop_generation: snap.rt.stop_generation,
+                    deadline: Instant::now() + Duration::from_secs(5),
+                },
+                workspace_revision: snap.rt.workspace_revision,
+                motion_config_revision: snap.rt.motion_config_revision,
+            };
+            let jog_slot = armd::rt_core::requests::motion::prepare_motion(
+                &msnap,
+                &armd::rt_core::requests::motion::MotionRequest::jog(to, Some(0.05), None),
+            )
+            .unwrap()
+            .slot;
+            let auth = armd::rt_core::broker::Authority {
+                lease_generation: 0,
+                epoch: snap.obs.epoch_id,
+                stop_generation: snap.rt.stop_generation,
+                config_revision: 0,
+                parent_generation: 0,
+            };
+            let _ = handle
+                .broker()
+                .lock()
+                .unwrap()
+                .submit(
+                    armd::rt_core::broker::ClientId(1),
+                    1,
+                    auth,
+                    Instant::now() + Duration::from_secs(5),
+                    armd::rt_core::broker::Submit::Install(&move |s: &mut armd::rt_core::ops::PlanSlot| {
+                        armd::rt_core::requests::motion::stage_jog(s, &jog_slot);
+                    }),
+                )
+                .unwrap();
+            wait_until_deadline(deadline, "RT jog completion captured under all held locks", || {
+                sup_rt.test_terminal_capture_stats().captured >= 1
+            });
+            let cap_after_jog = sup_rt.test_terminal_capture_stats().captured;
+            let seq0 = sup_rt.hub().published_seq();
+            wait_until_deadline(deadline, "RT dwell releases under all held locks", || {
+                sup_rt.hub().published_seq() >= seq0 + 5
+            });
+            assert_eq!(
+                sup_rt.test_terminal_capture_stats().captured,
+                cap_after_jog,
+                "RT dwell must not re-capture completed jog"
+            );
+            assert_eq!(sup_rt.inner().control_thread_attempts(), 0);
+            assert_eq!(
+                sup_rt.test_terminal_capture_control_lock_attempts(),
+                0,
+                "armd-control must perform 0 TerminalCaptureChannel rx/rich_cache lock attempts"
+            );
+            assert_eq!(
+                rt_driver_calls.load(Ordering::Acquire),
+                0,
+                "armd-control capture must perform 0 driver mutex calls"
+            );
+
+            // Release the test mutex holds so the positive controls exercise UNCONTENDED
+            // channel.rx.lock() and rich_action_cache.lock() on `armd-control`.
+            drop(_hold_tb);
+            drop(_hold_rich);
+            drop(_hold_rx);
+
+            probe_armed.store(true, Ordering::Release);
+            wait_until_deadline(deadline, "capture hook lock positive controls", || {
+                probe_caught.load(Ordering::Acquire)
+            });
+            assert_eq!(sup_rt.inner().control_thread_attempts(), 1);
+            assert_eq!(
+                sup_rt.test_terminal_capture_control_lock_attempts(),
+                2,
+                "positive controls must catch BOTH uncontended rx.lock() and rich_action_cache.lock() on armd-control"
+            );
+            assert!(
+                rt_driver_calls.load(Ordering::Acquire) >= 1,
+                "positive control: injected driver call inside RT capture window MUST be detected"
+            );
+            assert_eq!(
+                sup_rt.driver_lock_attempts(),
+                0,
+                "exclusive RT executor must perform 0 DriverLock attempts"
+            );
+
+            writer_hold.release();
+            handle.stop_and_join();
+        });
+    });
+}
+
 // ============================================================================
 // 4. DRV-LOCK: DriverLock positive control, lock-free scripted CAN transport
 //    (0 lock attempts + AllocCounts::ZERO), Legacy vs Executor bus-trace parity,
@@ -2465,7 +2872,11 @@ impl ArmDriver for OwnershipAuditDriver {
         _deadline: Instant,
         _max_rx_frames: u16,
     ) -> Result<(u16, bool), ArmDriverError> {
-        let count = self.release_reads.fetch_add(1, Ordering::SeqCst) + 1;
+        let count = if in_rt_release() {
+            self.release_reads.fetch_add(1, Ordering::SeqCst) + 1
+        } else {
+            0
+        };
         if count >= 2 {
             if let Some((entered, gate)) = &self.block_release_read_gate {
                 entered.store(true, Ordering::Release);
@@ -2720,11 +3131,10 @@ fn single_writer_ownership_across_start_failures_and_shutdown_paths() {
             }
 
             // 4a. Non-recoverable init failure (`fail_init: Some(false)`) when torqued:
-            //     runs bounded disable on `armd-control`, drops driver on `armd-control`,
-            //     transitions to OWNER_FAILED, detached shell has `driver.is_none()`.
+            //     under DRV-F1, NEVER disables away from rest; retains exclusive driver in SAFE-HOLD
+            //     until explicit ProcessExit disable, transitions to OWNER_FAILED, detached shell has `driver.is_none()`.
             // 4b. Non-recoverable init failure when `is_torqued == false` and `disable_pending == None`
-            //     but hardware driver reports `EnableState::Enabled` (partial/unconfirmed energization):
-            //     still runs bounded disable fail-closed!
+            //     but hardware driver reports `EnableState::Enabled`: same SAFE-HOLD until ProcessExit.
             for supervisor_torqued in [true, false] {
                 let enabled = Arc::new(AtomicBool::new(true));
                 let disables = Arc::new(AtomicUsize::new(0));
@@ -2747,11 +3157,28 @@ fn single_writer_ownership_across_start_failures_and_shutdown_paths() {
                     .is_err());
                 assert_eq!(sup.owner_mode(), OWNER_FAILED);
                 assert!(sup.inner().read().await.driver.is_none(), "detached shell must not retain driver");
-                assert!(
-                    disables.load(Ordering::SeqCst) >= 1,
-                    "non-recoverable init fail with enabled driver must attempt disable (supervisor_torqued={supervisor_torqued})"
+                wait_until_deadline(
+                    deadline,
+                    "non-recoverable init fail entered SAFE-HOLD",
+                    || sup.is_detached_safe_hold_active(),
                 );
+                assert_eq!(
+                    disables.load(Ordering::SeqCst),
+                    0,
+                    "DRV-F1: startup failure away from rest must NEVER disable torque (supervisor_torqued={supervisor_torqued})"
+                );
+                assert!(enabled.load(Ordering::SeqCst));
+                assert!(drop_t.lock().unwrap().is_none(), "SAFE-HOLD must keep driver alive until ProcessExit");
+                // Deliberate ProcessExit protective disable reaches the detached SAFE-HOLD writer.
+                let outcome = sup
+                    .emergency_process_exit_disable_until(Instant::now() + Duration::from_secs(2))
+                    .await;
+                assert_eq!(outcome, PanicDisableOutcome::Confirmed);
+                assert!(disables.load(Ordering::SeqCst) >= 1);
                 assert!(!enabled.load(Ordering::SeqCst));
+                wait_until_deadline(deadline, "detached SAFE-HOLD dropped driver on ProcessExit", || {
+                    drop_t.lock().unwrap().is_some()
+                });
                 let (dtid, on_ctrl) = drop_t.lock().unwrap().expect("driver dropped on control thread");
                 assert_ne!(dtid, main_tid);
                 assert!(on_ctrl);
@@ -2760,8 +3187,9 @@ fn single_writer_ownership_across_start_failures_and_shutdown_paths() {
 
             // 4c. Non-recoverable init failure (`fail_init: Some(false)`) with owner torque flags
             //     clear and a driver that PANICS inside `enable_state()`:
-            //     probe panic is caught as unknown enable state, bounded disable still runs,
-            //     startup returns Err, OWNER_FAILED, SupervisorLock released, Legacy never gets driver.
+            //     probe panic is caught as unknown enable state -> retains driver in SAFE-HOLD
+            //     (0 disables away from rest), OWNER_FAILED, SupervisorLock released, Legacy never gets driver;
+            //     deliberate ProcessExit disables and drops on `armd-control`.
             {
                 let enabled = Arc::new(AtomicBool::new(true));
                 let disables = Arc::new(AtomicUsize::new(0));
@@ -2787,8 +3215,20 @@ fn single_writer_ownership_across_start_failures_and_shutdown_paths() {
                 assert_eq!(sup.owner_mode(), OWNER_FAILED);
                 assert!(sup.inner().try_write().is_ok(), "SupervisorLock must be released");
                 assert!(sup.inner().read().await.driver.is_none(), "Legacy must never receive driver");
-                assert!(disables.load(Ordering::SeqCst) >= 1, "panicking enable_state probe must trigger bounded disable");
+                wait_until_deadline(deadline, "panicking enable_state probe entered SAFE-HOLD", || {
+                    sup.is_detached_safe_hold_active()
+                });
+                assert_eq!(disables.load(Ordering::SeqCst), 0, "unknown enable state must not disable away from rest");
+                assert!(enabled.load(Ordering::SeqCst));
+                let outcome = sup
+                    .emergency_process_exit_disable_until(Instant::now() + Duration::from_secs(2))
+                    .await;
+                assert_eq!(outcome, PanicDisableOutcome::Confirmed);
+                assert!(disables.load(Ordering::SeqCst) >= 1);
                 assert!(!enabled.load(Ordering::SeqCst));
+                wait_until_deadline(deadline, "4c SAFE-HOLD dropped driver on ProcessExit", || {
+                    drop_t.lock().unwrap().is_some()
+                });
                 let (dtid, on_ctrl) = drop_t.lock().unwrap().expect("driver dropped on control thread");
                 assert_ne!(dtid, main_tid);
                 assert!(on_ctrl);
@@ -2921,18 +3361,28 @@ fn single_writer_ownership_across_start_failures_and_shutdown_paths() {
                     *lock.lock().unwrap() = true;
                     cvar.notify_all();
                 }
-                wait_until_deadline(deadline, "late startup worker tore down after unblock", || {
-                    drop_t.lock().unwrap().is_some()
+                wait_until_deadline(deadline, "late startup worker entered SAFE-HOLD after unblock", || {
+                    sup.is_detached_safe_hold_active()
                 });
                 assert_eq!(
                     release_reads.load(Ordering::SeqCst),
                     0,
                     "late startup worker must NEVER enter release loop after timeout"
                 );
-                assert!(
-                    disables.load(Ordering::SeqCst) >= 1,
-                    "late startup worker must run bounded disable before dropping driver"
+                assert_eq!(
+                    disables.load(Ordering::SeqCst),
+                    0,
+                    "DRV-F1: late startup timeout-loser must hold in SAFE-HOLD without disabling away from rest"
                 );
+                assert!(drop_t.lock().unwrap().is_none());
+                let outcome = sup
+                    .emergency_process_exit_disable_until(Instant::now() + Duration::from_secs(2))
+                    .await;
+                assert_eq!(outcome, PanicDisableOutcome::Confirmed);
+                wait_until_deadline(deadline, "late startup worker dropped driver on ProcessExit", || {
+                    drop_t.lock().unwrap().is_some()
+                });
+                assert!(disables.load(Ordering::SeqCst) >= 1);
                 let (dtid, on_ctrl) = drop_t.lock().unwrap().unwrap();
                 assert_ne!(dtid, main_tid);
                 assert!(on_ctrl);
@@ -3024,23 +3474,33 @@ fn single_writer_ownership_across_start_failures_and_shutdown_paths() {
                     *lock.lock().unwrap() = true;
                     cvar.notify_all();
                 }
-                wait_until_deadline(deadline, "late preflight worker disabled and dropped driver", || {
-                    drop_t.lock().unwrap().is_some()
+                wait_until_deadline(deadline, "late preflight worker entered SAFE-HOLD", || {
+                    sup.is_detached_safe_hold_active()
                 });
                 assert_eq!(release_reads.load(Ordering::SeqCst), 0);
-                assert!(
-                    disables.load(Ordering::SeqCst) >= 1,
-                    "late preflight worker must run bounded disable even on late Err (stall_in_supports={stall_in_supports})"
+                assert_eq!(
+                    disables.load(Ordering::SeqCst),
+                    0,
+                    "DRV-F1: late preflight worker must retain energized driver in SAFE-HOLD (stall_in_supports={stall_in_supports})"
                 );
+                assert!(enabled.load(Ordering::SeqCst));
+                let outcome = sup
+                    .emergency_process_exit_disable_until(Instant::now() + Duration::from_secs(2))
+                    .await;
+                assert_eq!(outcome, PanicDisableOutcome::Confirmed);
+                wait_until_deadline(deadline, "late preflight worker disabled and dropped driver on ProcessExit", || {
+                    drop_t.lock().unwrap().is_some()
+                });
+                assert!(disables.load(Ordering::SeqCst) >= 1);
                 assert!(!enabled.load(Ordering::SeqCst));
                 let (dtid, on_ctrl) = drop_t.lock().unwrap().unwrap();
                 assert_ne!(dtid, main_tid);
                 assert!(on_ctrl);
                 assert_eq!(sup.driver_lock_attempts(), 0);
             }
-            // 5b. Startup panic inside `set_estop_gate(...)` (on `armd-control`, never caller thread):
-            //     caught cleanly, runs bounded panic-disable on `armd-control`, drops driver on
-            //     `armd-control`, transitions to OWNER_FAILED (NEVER OWNER_LEGACY), 0 DriverLock attempts.
+            // 5b. Startup panic inside `set_estop_gate(...)` / `set_rt_mode(...)` (on `armd-control`):
+            //     caught cleanly, enters SAFE-HOLD without disabling away from rest, transitions to
+            //     OWNER_FAILED (NEVER OWNER_LEGACY); deliberate ProcessExit disables and drops on `armd-control`.
             for panic_in_gate in [false, true] {
                 let enabled = Arc::new(AtomicBool::new(true));
                 let disables = Arc::new(AtomicUsize::new(0));
@@ -3069,24 +3529,36 @@ fn single_writer_ownership_across_start_failures_and_shutdown_paths() {
                 assert!(sup.start_executor(cfg).await.is_err());
                 assert_eq!(sup.owner_mode(), OWNER_FAILED);
                 assert!(sup.inner().read().await.driver.is_none());
-                assert!(
-                    disables.load(Ordering::SeqCst) >= 1,
-                    "startup panic must run bounded panic-disable (panic_in_gate={panic_in_gate})"
+                wait_until_deadline(deadline, "startup panic entered SAFE-HOLD", || {
+                    sup.is_detached_safe_hold_active()
+                });
+                assert_eq!(
+                    disables.load(Ordering::SeqCst),
+                    0,
+                    "DRV-F1: startup panic while torqued must hold in SAFE-HOLD without disabling (panic_in_gate={panic_in_gate})"
                 );
+                assert!(enabled.load(Ordering::SeqCst));
+                let outcome = sup
+                    .emergency_process_exit_disable_until(Instant::now() + Duration::from_secs(2))
+                    .await;
+                assert_eq!(outcome, PanicDisableOutcome::Confirmed);
+                assert!(disables.load(Ordering::SeqCst) >= 1);
                 assert!(!enabled.load(Ordering::SeqCst));
+                wait_until_deadline(deadline, "startup panic SAFE-HOLD dropped driver on ProcessExit", || {
+                    drop_t.lock().unwrap().is_some()
+                });
                 let (dtid, on_ctrl) = drop_t
                     .lock()
                     .unwrap()
-                    .expect("driver dropped on control thread after startup panic");
+                    .expect("driver dropped on control thread after ProcessExit");
                 assert_ne!(dtid, main_tid);
                 assert!(on_ctrl);
                 assert_eq!(sup.driver_lock_attempts(), 0);
             }
 
-            // 5c. Startup disable hang (`fail_init: Some(false)` with `begin_torque_budgeted(false, 0)`
-            //     blocking past `panic_disable_timeout`): `start_executor` must return `Err` within
-            //     the bounded timeout, transition to OWNER_FAILED, release SupervisorLock, and leave
-            //     sole driver ownership on the stalled control thread until it unblocks.
+            // 5c. Startup failure while torqued enters SAFE-HOLD, then deliberate ProcessExit disable
+            //     stalls past bound: returns TimedOut within bound while `armd-control` retains sole
+            //     ownership until unblocked.
             {
                 let enabled = Arc::new(AtomicBool::new(true));
                 let disables = Arc::new(AtomicUsize::new(0));
@@ -3112,20 +3584,29 @@ fn single_writer_ownership_across_start_failures_and_shutdown_paths() {
                     panic_disable_timeout: Some(Duration::from_millis(40)),
                     ..Default::default()
                 };
-                let t0 = Instant::now();
                 let res = sup.start_executor_with_hooks(cfg, hooks).await;
-                let elapsed = t0.elapsed();
-                assert!(res.is_err(), "stalled startup teardown must return Err");
-                assert!(
-                    elapsed < Duration::from_millis(500),
-                    "stalled startup teardown must return within bounded timeout, took {elapsed:?}"
-                );
+                assert!(res.is_err(), "fail_init must return Err");
                 assert_eq!(sup.owner_mode(), OWNER_FAILED);
                 assert!(
                     sup.inner().try_write().is_ok(),
                     "SupervisorLock must be released (not stuck in OWNER_TRANSFERRING)"
                 );
                 assert!(sup.inner().read().await.driver.is_none());
+                wait_until_deadline(deadline, "startup panic entered SAFE-HOLD", || {
+                    sup.is_detached_safe_hold_active()
+                });
+                assert_eq!(disables.load(Ordering::SeqCst), 0);
+
+                let t0 = Instant::now();
+                let outcome = sup
+                    .emergency_process_exit_disable_until(Instant::now() + Duration::from_millis(60))
+                    .await;
+                let elapsed = t0.elapsed();
+                assert_eq!(outcome, PanicDisableOutcome::TimedOut);
+                assert!(
+                    elapsed < Duration::from_millis(500),
+                    "stalled ProcessExit disable must return within bounded timeout, took {elapsed:?}"
+                );
                 assert!(
                     drop_t.lock().unwrap().is_none(),
                     "stalled control thread must retain sole ownership until unblocked"
@@ -3180,8 +3661,21 @@ fn single_writer_ownership_across_start_failures_and_shutdown_paths() {
                     assert!(disables.load(Ordering::SeqCst) >= 1);
                     assert!(!enabled.load(Ordering::SeqCst));
                 } else {
+                    // DRV-F1: ordinary stop_and_join while energized retains driver in SAFE-HOLD
+                    // without disabling away from rest; deliberate ProcessExit then disables and drops.
                     handle.stop_and_join();
+                    assert!(handle.is_in_safe_hold());
+                    assert_eq!(disables.load(Ordering::SeqCst), 0);
+                    assert!(enabled.load(Ordering::SeqCst));
+                    assert!(drop_t.lock().unwrap().is_none());
+                    let outcome = handle.emergency_disable_and_join();
+                    assert_eq!(outcome, PanicDisableOutcome::Confirmed);
+                    assert!(disables.load(Ordering::SeqCst) >= 1);
+                    assert!(!enabled.load(Ordering::SeqCst));
                 }
+                wait_until_deadline(deadline, "driver dropped on armd-control", || {
+                    drop_t.lock().unwrap().is_some()
+                });
                 let (dtid, on_ctrl) = drop_t.lock().unwrap().expect("driver dropped on armd-control");
                 assert_eq!(dtid, exec_tid);
                 assert!(on_ctrl);
@@ -3286,28 +3780,35 @@ fn single_writer_ownership_across_start_failures_and_shutdown_paths() {
                     .await
                     .expect("start executor for ordinary teardown racing release panic");
                 let exec_tid = handle.executor_thread_id();
-                wait_until_deadline(deadline, "release panic entered stalled disable", || {
-                    disable_entered.load(Ordering::Acquire)
+                wait_until_deadline(deadline, "release panic entered SAFE-HOLD", || {
+                    handle.is_in_safe_hold()
                 });
-                // Call ordinary `stop_and_join()` immediately while disable is stalled and BEFORE
-                // the 80 ms timeout observer has recorded `TimedOut`.
+                assert_eq!(disables.load(Ordering::SeqCst), 0, "release panic must hold without disabling");
+                // Ordinary stop_and_join detaches cleanly while SAFE-HOLD remains active.
                 let t0 = Instant::now();
                 handle.stop_and_join();
                 let elapsed = t0.elapsed();
                 assert!(
                     elapsed < Duration::from_millis(500),
-                    "ordinary stop_and_join racing stalled release panic must detach cleanly, took {elapsed:?}"
+                    "ordinary stop_and_join during SAFE-HOLD must detach cleanly, took {elapsed:?}"
                 );
+                assert!(drop_t.lock().unwrap().is_none());
+                // Deliberate ProcessExit then enters stalled disable and returns TimedOut within bound.
+                let t1 = Instant::now();
+                let outcome = handle.emergency_disable_and_join();
+                assert_eq!(outcome, PanicDisableOutcome::TimedOut);
+                assert!(t1.elapsed() < Duration::from_millis(500));
+                assert!(disable_entered.load(Ordering::Acquire));
                 assert!(
                     drop_t.lock().unwrap().is_none(),
-                    "stalled panic-disable thread must retain sole ownership until unblocked"
+                    "stalled ProcessExit disable thread must retain sole ownership until unblocked"
                 );
                 {
                     let (lock, cvar) = &*disable_gate;
                     *lock.lock().unwrap() = true;
                     cvar.notify_all();
                 }
-                wait_until_deadline(deadline, "stalled release-panic disable finished after unblock", || {
+                wait_until_deadline(deadline, "stalled ProcessExit disable finished after unblock", || {
                     drop_t.lock().unwrap().is_some()
                 });
                 let (dtid, on_ctrl) = drop_t.lock().unwrap().unwrap();
@@ -3318,7 +3819,7 @@ fn single_writer_ownership_across_start_failures_and_shutdown_paths() {
 
             // 7c. Forced ordinary teardown (`stop_and_join`) detaching a stalled, still-torqued
             //     release: must latch shared E-stop BEFORE detaching, and once unblocked the late
-            //     worker must run bounded disable before destroying `core`.
+            //     worker must enter SAFE-HOLD (0 disables away from rest) until ProcessExit.
             {
                 let enabled = Arc::new(AtomicBool::new(true));
                 let disables = Arc::new(AtomicUsize::new(0));
@@ -3367,13 +3868,21 @@ fn single_writer_ownership_across_start_failures_and_shutdown_paths() {
                     *lock.lock().unwrap() = true;
                     cvar.notify_all();
                 }
-                wait_until_deadline(deadline, "resumed worker ran disable and dropped driver", || {
+                wait_until_deadline(deadline, "resumed worker entered SAFE-HOLD without disabling", || {
+                    handle.is_in_safe_hold()
+                });
+                assert_eq!(
+                    disables.load(Ordering::SeqCst),
+                    0,
+                    "DRV-F1: resumed detached torqued worker must hold in SAFE-HOLD, not disable away from rest"
+                );
+                assert!(enabled.load(Ordering::SeqCst));
+                let outcome = handle.emergency_disable_and_join();
+                assert_eq!(outcome, PanicDisableOutcome::Confirmed);
+                wait_until_deadline(deadline, "ProcessExit disabled and dropped driver", || {
                     drop_t.lock().unwrap().is_some()
                 });
-                assert!(
-                    disables.load(Ordering::SeqCst) >= 1,
-                    "resumed detached torqued worker must run bounded disable before drop"
-                );
+                assert!(disables.load(Ordering::SeqCst) >= 1);
                 assert!(!enabled.load(Ordering::SeqCst));
                 let (dtid, on_ctrl) = drop_t.lock().unwrap().unwrap();
                 assert_eq!(dtid, exec_tid);
@@ -3759,5 +4268,89 @@ fn r11_m4_rt_disable_dispatch_and_polling_never_block_on_driver_mutex() {
                 assert!(core.safety.has_latched_fault_code(armd::FaultCode::HardwareFault));
             });
         }
+    });
+}
+
+/// Shadow PR1 lock proof: with `torque_shadow_enabled = true` on the production RT executor
+/// (`DamiaoArmDriver<FakeBus>`), while the detached legacy `SupervisorLock` writer is held on
+/// another OS thread AND an off-thread reader continuously polls `torque_shadow_diagnostics()`,
+/// `armd-control` performs strictly ZERO `SupervisorLock` attempts, advances publications, and
+/// publishes live `owner == Executor` shadow diagnostics.
+#[test]
+fn rt_executor_torque_shadow_on_zero_locks_and_diagnostics_readable() {
+    run_bounded_fixture(Duration::from_secs(10), "torque_shadow_zero_locks", |deadline| {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut cfg = ArmConfig::rebot_dm();
+        cfg.torque_shadow_enabled = true;
+        let limits = dm_limits();
+        let bus = FakeBus::new(&limits);
+        let mut drv = DamiaoArmDriver::new(bus.clone(), (1..=7).collect())
+            .with_joint_limits(limits)
+            .unwrap();
+        drv.check_mapping_ranges();
+        let sup = Arc::new(ArmSupervisor::new(cfg));
+        rt.block_on(async {
+            sup.set_driver(Box::new(drv)).await;
+            sup.start_dispatcher().unwrap();
+        });
+        let handle = rt
+            .block_on(sup.start_executor_with_hooks(
+                ExecutorConfig::for_tests(Duration::from_millis(10)),
+                PersistTestHooks::default(),
+            ))
+            .unwrap();
+        assert_eq!(sup.owner_mode(), OWNER_EXECUTOR);
+
+        // Hold the detached legacy SupervisorLock writer on a separate OS thread throughout!
+        let hold_stop = Arc::new(AtomicBool::new(false));
+        let hold_ready = Arc::new(AtomicBool::new(false));
+        let sup_hold = Arc::clone(&sup);
+        let hs = Arc::clone(&hold_stop);
+        let hr = Arc::clone(&hold_ready);
+        let holder = thread::spawn(move || {
+            let _w = sup_hold.inner().blocking_write();
+            hr.store(true, Ordering::Release);
+            while !hs.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(2));
+            }
+        });
+        wait_until_deadline(deadline, "detached writer held", || {
+            hold_ready.load(Ordering::Acquire)
+        });
+
+        let start_seq = sup.hub().latest().map_or(0, |s| s.meta.seq);
+        let mut saw_shadow_events = false;
+        wait_until_deadline(deadline, "RT advances with shadow ON and writer held", || {
+            let d = sup.torque_shadow_diagnostics();
+            if d.enabled && d.owner == armd::torque::shadow::ShadowOwner::Executor && d.events_processed > 0 {
+                saw_shadow_events = true;
+            }
+            let seq = sup.hub().latest().map_or(0, |s| s.meta.seq);
+            saw_shadow_events && seq >= start_seq + 5
+        });
+
+        assert_eq!(
+            sup.inner().control_thread_attempts(),
+            0,
+            "RT control thread must perform strictly 0 SupervisorLock attempts with torque shadow ON"
+        );
+        let diag = sup.torque_shadow_diagnostics();
+        assert!(diag.enabled);
+        assert_eq!(diag.owner, armd::torque::shadow::ShadowOwner::Executor);
+        assert!(diag.events_processed > 0);
+        assert_eq!(diag.taxonomy.invariant_violation, 0);
+
+        hold_stop.store(true, Ordering::Release);
+        holder.join().unwrap();
+        handle.stop_and_join();
+        // Verify off-thread reclamation of `ShadowRuntimeInner` allocations retired on `armd-control` exit (M19).
+        sup.torque_shadow_hub().drain_now();
+        assert!(
+            sup.torque_shadow_hub().test_retired_reclaimed_count() >= 1,
+            "ShadowRuntimeInner must be retired lock-free on armd-control exit and reclaimed off-thread"
+        );
     });
 }

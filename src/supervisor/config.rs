@@ -87,12 +87,17 @@ impl SupervisorInner {
             return Err(format!("joint zero needs {} finite offsets", self.config.dof));
         }
         let old = std::mem::replace(&mut self.joint_zero_offsets, offsets.to_vec());
+        let changed = old != offsets;
         self.tracking.invalidate();
-        if old != offsets { self.calibration_revision += 1; self.refresh_effective_floor(); }
+        if changed { self.calibration_revision += 1; self.refresh_effective_floor(); }
         if let Some(d) = self.driver.as_mut() {
             let dof = self.config.dof;
+            #[cfg(not(target_arch = "wasm32"))]
+            let shadow_rt = &mut self.torque_shadow;
             let has_pos_limits = d
                 .with_mut(|drv| {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    shadow_rt.drain_from_driver(drv);
                     drv.set_joint_zero_offsets(offsets);
                     (0..dof).any(|i| drv.position_limits(i).is_some())
                 })
@@ -114,6 +119,14 @@ impl SupervisorInner {
             self.zero_convention = Default::default();
         }
         self.zero_check_pending = true;
+        #[cfg(not(target_arch = "wasm32"))]
+        if changed {
+            self.torque_shadow
+                .enqueue(crate::torque::shadow::ShadowInputKind::JointZeroRecalibrated);
+            if !self.rt_executor_owned {
+                self.flush_torque_shadow();
+            }
+        }
         Ok(())
     }
 
@@ -537,7 +550,7 @@ impl SupervisorInner {
                 }
             };
             a.finished_at = Some(now);
-            self.record_finished_action_by_id(action_id);
+            self.record_terminal_transition_by_id(action_id);
             return (code_buf, old_msg);
         }
         (code_buf, msg_buf)
@@ -558,7 +571,7 @@ impl SupervisorInner {
             a.code = Some(crate::model::HolderLabel::new(&code));
             let old_msg = a.message.replace(message);
             a.finished_at = Some(now);
-            self.record_finished_action_by_id(action_id);
+            self.record_terminal_transition_by_id(action_id);
             return (Some(code), old_msg);
         }
         (Some(code), Some(message))
@@ -571,11 +584,13 @@ impl SupervisorInner {
         warning: Option<String>,
     ) -> Option<String> {
         let now = self.now_s();
+        let mut transitioned_terminal = false;
         let ret = if let Some(a) = self.last_action.as_mut().filter(|a| a.id == action_id) {
             if a.is_running() {
                 a.state = crate::model::HolderLabel::new("done");
                 a.progress = 1.0;
                 a.finished_at = Some(now);
+                transitioned_terminal = true;
             }
             match durability {
                 crate::rt_core::config_iface::Durability::Durable => {
@@ -598,7 +613,9 @@ impl SupervisorInner {
         } else {
             return warning;
         };
-        self.record_finished_action_by_id(action_id);
+        if transitioned_terminal {
+            self.record_terminal_transition_by_id(action_id);
+        }
         ret
     }
 
@@ -613,11 +630,13 @@ impl SupervisorInner {
         mut msg_buf: Option<String>,
     ) -> (Option<String>, Option<String>) {
         let now = self.now_s();
+        let mut transitioned_terminal = false;
         if let Some(a) = self.last_action.as_mut().filter(|a| a.id == action_id) {
             if a.is_running() {
                 a.state = crate::model::HolderLabel::new("failed");
                 a.code = Some(crate::model::HolderLabel::new("PERSIST_FAILED"));
                 a.finished_at = Some(now);
+                transitioned_terminal = true;
             }
             a.durability_confirmed = Some(false);
             let old_warn = a.durability_warning.replace(warning);
@@ -634,7 +653,9 @@ impl SupervisorInner {
                 }
                 None => None,
             };
-            self.record_finished_action_by_id(action_id);
+            if transitioned_terminal {
+                self.record_terminal_transition_by_id(action_id);
+            }
             return (old_msg, old_warn);
         }
         (msg_buf, Some(warning))

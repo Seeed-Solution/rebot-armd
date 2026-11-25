@@ -410,15 +410,23 @@ impl crate::supervisor::SupervisorInner {
     pub fn mit_timeout_command(&mut self, body: &Value) -> Result<Value, CalibError> {
         let cmd = parse_timeout_command(&self.config, body)?;
         self.mit_torque_off_checks()?;
-        let d = self.driver.as_mut().expect("checked above");
         let unit = json!({"unit_us": damiao::TIMEOUT_UNIT_US_DOCUMENTED, "unit_verified": false,
             "note": "50 us per count is documented by Damiao and not verified on this firmware; RAM only (0x55), lost at power-off"});
-        d.with_mut(|driver| {
+        #[cfg(not(target_arch = "wasm32"))]
+        let shadow_rt = &mut self.torque_shadow;
+        let d = self.driver.as_mut().expect("checked above");
+        let res = d.with_mut(|driver| {
             if cmd.dry_run {
-                let rb = driver.read_motor_identity(&cmd.joints).map_err(|e| CalibError::new(502, "MIT_TIMEOUT_READ", e.to_string()))?;
+                let rb = driver.read_motor_identity(&cmd.joints);
+                #[cfg(not(target_arch = "wasm32"))]
+                shadow_rt.drain_from_driver(driver);
+                let rb = rb.map_err(|e| CalibError::new(502, "MIT_TIMEOUT_READ", e.to_string()))?;
                 return Ok(json!({"dry_run": true, "readback": rb, "timeout_unit": unit}));
             }
-            let res = driver.commission_motor_timeout(&cmd.joints, cmd.timeout_counts).map_err(|e| {
+            let res = driver.commission_motor_timeout(&cmd.joints, cmd.timeout_counts);
+            #[cfg(not(target_arch = "wasm32"))]
+            shadow_rt.drain_from_driver(driver);
+            let res = res.map_err(|e| {
                 let one = |v: &[usize]| v.iter().map(|j| j + 1).collect::<Vec<_>>();
                 let mut err = CalibError::new(502, "MIT_TIMEOUT_FAILED", format!("{}; applied {:?}, uncertain {:?} (write sent, not confirmed), not attempted {:?}",
                     e.error, e.applied.iter().map(|c| c.before.joint).collect::<Vec<_>>(), one(&e.uncertain), one(&e.not_attempted)));
@@ -431,7 +439,12 @@ impl crate::supervisor::SupervisorInner {
             tracing::warn!("MIT TIMEOUT commissioned (RAM) for joints {:?}: {} counts", cmd.joints.iter().map(|j| j + 1).collect::<Vec<_>>(), cmd.timeout_counts);
             Ok(json!({"dry_run": false, "timeout_counts": cmd.timeout_counts, "commissioning": res, "timeout_unit": unit}))
         })
-        .ok_or_else(|| CalibError::new(500, "DRIVER", "driver lock poisoned"))?
+        .ok_or_else(|| CalibError::new(500, "DRIVER", "driver lock poisoned"))?;
+        #[cfg(not(target_arch = "wasm32"))]
+        if !self.rt_executor_owned {
+            self.flush_torque_shadow();
+        }
+        res
     }
 
     /// Check of WS [`QUALIFICATION_PATH`] `{record}` under the lock: the record is valid and, for
@@ -1200,6 +1213,8 @@ impl crate::supervisor::SupervisorInner {
         });
         let mut computed_j7_intent: Option<PosForceIntent> = None;
         let cutoff = self.active_tx_cutoff;
+        #[cfg(not(target_arch = "wasm32"))]
+        let shadow_rt = &mut self.torque_shadow;
         let res = self.driver.as_mut().and_then(|d| {
             d.with_mut(|drv| {
                 // Resolve the J7 PosForce intent (never writing a 0x307 frame here: the tick
@@ -1289,6 +1304,8 @@ impl crate::supervisor::SupervisorInner {
                     r
                 };
                 let now = drv.clock_now();
+                #[cfg(not(target_arch = "wasm32"))]
+                shadow_rt.drain_from_driver(drv);
                 if !is_hold
                     && matches!(
                         write_res,
@@ -1368,6 +1385,22 @@ impl crate::supervisor::SupervisorInner {
         code: crate::safety::FaultCode,
     ) {
         self.safety.log_mit_tracking_cancelled(reason);
+        #[cfg(not(target_arch = "wasm32"))]
+        if !self.mit.joints.is_empty() {
+            let mut mask = crate::torque::ChannelMask::EMPTY;
+            for &j in &self.mit.joints {
+                if j < crate::torque::MAX_CHANNELS {
+                    mask.insert(j as u8);
+                }
+            }
+            self.torque_shadow.enqueue(
+                crate::torque::shadow::ShadowInputKind::MitOwnershipChange {
+                    channels: mask,
+                    target_mode: crate::motor_mode::ControlMode::PositionVelocity,
+                    device_wide: true,
+                },
+            );
+        }
         self.mit.owner = MitOwner::Lost;
         self.mit.lost_reason = Some(reason);
         self.mit.last_output = None;
@@ -1548,6 +1581,8 @@ impl crate::supervisor::SupervisorInner {
             .map(|i| if joints.contains(&i) { crate::driver::JointMode::Mit } else { crate::driver::JointMode::Position }).collect();
         let holdoff = self.mit_holdoff();
         let (res, uncertain) = {
+            #[cfg(not(target_arch = "wasm32"))]
+            let shadow_rt = &mut self.torque_shadow;
             let Some(out) = self.driver.as_mut().and_then(|d| {
                 d.with_mut(|drv| {
                     // armed before the first MIT-capable switch frame: a lost acknowledgement or a slow
@@ -1559,6 +1594,8 @@ impl crate::supervisor::SupervisorInner {
                         // switched back and confirmed in position control: nothing to fence
                         drv.set_mit_deadline_fence(None, Duration::ZERO);
                     }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    shadow_rt.drain_from_driver(drv);
                     (res, uncertain || drv.mit_fence_trip().is_some())
                 })
             }) else { return };
@@ -1576,6 +1613,22 @@ impl crate::supervisor::SupervisorInner {
                 self.mit.last_ff = ff;
                 self.mit.last_output = Some(self.mit_now());
                 self.mit.handover_error = None;
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let mut mask = crate::torque::ChannelMask::EMPTY;
+                    for &j in &joints {
+                        if j < crate::torque::MAX_CHANNELS {
+                            mask.insert(j as u8);
+                        }
+                    }
+                    self.torque_shadow.enqueue(
+                        crate::torque::shadow::ShadowInputKind::MitOwnershipChange {
+                            channels: mask,
+                            target_mode: crate::motor_mode::ControlMode::Impedance,
+                            device_wide: false,
+                        },
+                    );
+                }
                 tracing::warn!("MIT tracking owns joints {:?}", joints.iter().map(|j| j + 1).collect::<Vec<_>>());
             }
             Err(e) => {
@@ -1621,10 +1674,14 @@ impl crate::supervisor::SupervisorInner {
         }
         let modes = vec![crate::driver::JointMode::Position; self.config.dof];
         let (res, uncertain) = {
+            #[cfg(not(target_arch = "wasm32"))]
+            let shadow_rt = &mut self.torque_shadow;
             let Some(d) = self.driver.as_mut() else { return Err("no driver".into()) };
             d.with_mut(|drv| {
                 let res = drv.set_joint_modes_confirmed(&modes, &hold);
                 if res.is_ok() { drv.set_mit_deadline_fence(None, Duration::ZERO); }
+                #[cfg(not(target_arch = "wasm32"))]
+                shadow_rt.drain_from_driver(drv);
                 (res, drv.joint_modes_uncertain())
             })
             .ok_or_else(|| "driver lock poisoned".to_string())?
@@ -1639,6 +1696,22 @@ impl crate::supervisor::SupervisorInner {
                 self.mit.owner = MitOwner::Off;
                 self.mit.joints.clear();
                 self.mit.last_output = None;
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let mut mask = crate::torque::ChannelMask::EMPTY;
+                    for &j in &joints {
+                        if j < crate::torque::MAX_CHANNELS {
+                            mask.insert(j as u8);
+                        }
+                    }
+                    self.torque_shadow.enqueue(
+                        crate::torque::shadow::ShadowInputKind::MitOwnershipChange {
+                            channels: mask,
+                            target_mode: crate::motor_mode::ControlMode::PositionVelocity,
+                            device_wide: false,
+                        },
+                    );
+                }
                 tracing::warn!("MIT tracking handed back to position control ({why})");
                 Ok(())
             }
@@ -1670,10 +1743,36 @@ impl crate::supervisor::SupervisorInner {
     /// Torque goes off: MIT owns nothing; the motors keep CTRL_MODE MIT in RAM until the next
     /// enable restores the base mode. A cancelled group stays cancelled until cleared.
     pub(crate) fn mit_torque_off(&mut self) {
+        self.mit_torque_off_inner(true);
+    }
+
+    /// Same as [`Self::mit_torque_off`], optionally deferring shadow emission (zero shadow clock
+    /// sampling inside timed panic-disable closures before the live outcome is sealed).
+    pub(crate) fn mit_torque_off_inner(&mut self, emit_shadow: bool) {
         self.mit.armed_ok = false;
         if self.mit.owner == MitOwner::Active {
             // The driver fence stays armed through the disable (no recovery replay, no invented
             // hold even when the disable fails); a confirmed disable or enable disarms it.
+            #[cfg(not(target_arch = "wasm32"))]
+            if !self.mit.joints.is_empty() {
+                let mut mask = crate::torque::ChannelMask::EMPTY;
+                for &j in &self.mit.joints {
+                    if j < crate::torque::MAX_CHANNELS {
+                        mask.insert(j as u8);
+                    }
+                }
+                if emit_shadow {
+                    self.torque_shadow.enqueue(
+                        crate::torque::shadow::ShadowInputKind::MitOwnershipChange {
+                            channels: mask,
+                            target_mode: crate::motor_mode::ControlMode::PositionVelocity,
+                            device_wide: false,
+                        },
+                    );
+                } else {
+                    self.torque_shadow.note_deferred_mit_off(mask);
+                }
+            }
             self.mit.owner = MitOwner::Off;
             self.mit.joints.clear();
             self.mit.last_output = None;
@@ -3315,6 +3414,8 @@ impl crate::supervisor::SupervisorInner {
             };
 
             drv.set_tx_release_deadline(None);
+            #[cfg(not(target_arch = "wasm32"))]
+            self.torque_shadow.drain_from_driver(drv);
             Some(res)
         } else {
             None
@@ -3903,7 +4004,26 @@ impl crate::supervisor::SupervisorInner {
         owner_now_fn: &dyn Fn() -> std::time::Instant,
     ) -> Result<(), (u16, &'static str, crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>)> {
         let now = drv.clock_now();
+        let first_attempt = self.commissioning.disable_started_at.is_none();
         let started_at = *self.commissioning.disable_started_at.get_or_insert(now);
+        #[cfg(not(target_arch = "wasm32"))]
+        if first_attempt {
+            let live_op_id = self.torque_shadow.alloc_live_op_id();
+            let live_intent = self.shadow_live_intent();
+            let live_is_torqued = self.is_torqued;
+            let live_stopped = self.safety.state().is_stopped();
+            self.torque_shadow.enqueue_at(
+                started_at,
+                crate::torque::shadow::ShadowInputKind::DisableRequest {
+                    live_op_id,
+                    explicit_release_authorized: false,
+                    live_refusal: None,
+                    live_intent,
+                    live_is_torqued,
+                    live_stopped,
+                },
+            );
+        }
         let deadline = *self
             .commissioning
             .disable_deadline

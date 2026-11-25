@@ -3221,6 +3221,9 @@ pub fn install_move_joint(
                 if let Some(a) = this.last_action.as_mut().filter(|a| a.id == id) {
                     outcome.apply(a);
                 }
+                if let Some(a) = this.last_action.as_ref().filter(|a| a.id == id) {
+                    this.mirror_rich_action_off_rt(a);
+                }
             }
             Ok((id, duration))
         }
@@ -3743,6 +3746,9 @@ pub fn install_begin_macro(
         if inner.gravity_comp.is_some() {
             return Err(ActionRefusal::new("MOTION_BUSY"));
         }
+        inner
+            .check_terminal_fifo_for_new_action()
+            .map_err(|e| ActionRefusal::new(static_code(e.into())))?;
         inner
             .check_prepared_fresh_static(stamp.admission.estop_epoch)
             .map_err(ActionRefusal::new)?;

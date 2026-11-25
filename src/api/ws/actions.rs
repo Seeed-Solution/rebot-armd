@@ -373,19 +373,24 @@ pub(super) struct MacroCheck {
     pub(super) rx: tokio::sync::oneshot::Receiver<Result<PlannedMacro, ArmError>>,
 }
 
-/// Dispatch result for Executor-owner `/api/v1/action/grasp` WS commands.
-pub(super) enum ExecutorGraspDispatch {
-    Reply(Value),
+/// Dispatch result for Executor-owner `/api/v1/action/*`, `calib_hover`, and `measure_multiview` WS commands.
+pub(super) enum ExecutorActionDispatch {
+    Reply {
+        reply: Value,
+        gate: Option<CommandReplyGateGuard>,
+        ack_guard: Option<crate::rt_core::reply_router::AckCommitGuard>,
+    },
     Macro(MacroCheck),
+    Closed,
 }
 
-fn off_lock_grasp_reject(request_id: &Value, epoch: u64, error: ApiError) -> Value {
+fn off_lock_action_reject(request_id: &Value, epoch: u64, error: ApiError) -> Value {
     let mut r = rejection(error, "command_reject", epoch);
     r["request_id"] = request_id.clone();
     r
 }
 
-fn off_lock_grasp_ack(
+fn off_lock_action_ack(
     supervisor: &ArmSupervisor,
     request_id: &Value,
     started: Started,
@@ -418,17 +423,233 @@ fn off_lock_grasp_ack(
     v
 }
 
-/// Executor-owner WebSocket router for `/api/v1/action/grasp`:
-/// - `dry_run: true` (any strategy): lease-free, zero `SupervisorLock`, runs `dry_run_task`
-///   via `ReadOnlySnapshot`.
-/// - Live `strategy: "adaptive"`: enforces lease, epoch, monotonic `request_id`, and operator
-///   auth off-lock, captures `ActionSnapshot::capture_executor` with the original connection
-///   `AdmissionStamp`, plans/preflights off-thread via the shared `MacroCheck` pipeline, and
-///   commits via `grasp::begin_executor`.
+async fn submit_prepared_executor_ws(
+    sup: &Arc<ArmSupervisor>,
+    conn_id: u64,
+    prepared: PreparedWsAction,
+    wire_tracker: Arc<crate::rt_core::reply_router::WsWireAckTracker>,
+) -> Result<((u64, f64), crate::rt_core::reply_router::AckCommitGuard), ArmError> {
+    use crate::rt_core::broker::{AdmitError, ClientId, Reply};
+    use crate::rt_core::ops::PlanSlot;
+    use crate::rt_core::reply_router::{ExternalDestinationPolicy, ExternalSubmitError};
+    use crate::rt_core::requests::actions::{
+        ActionRefusal, ActionSubmit, PreparedActionKind, DEFAULT_ACTION_DEADLINE,
+    };
+
+    let handle = sup.executor_handle().ok_or_else(|| ArmError::Rejected {
+        status: 503,
+        code: "EXECUTOR_UNAVAILABLE".into(),
+        message: "RT executor is not active".into(),
+    })?;
+    let (
+        slot,
+        kind,
+        stamp,
+        check_workspace_revision,
+        poses_revision,
+        calibration_revision,
+        gripper_calib_revision,
+        power_budget_revision,
+        expected_duration_s,
+    ) = match prepared {
+        PreparedWsAction::Cartesian(c) => {
+            let slot = c
+                .to_plan_slot(None)
+                .map_err(|code| ActionRefusal::new(code).into_arm_error_with_epoch(c.stamp.admission.estop_epoch))?;
+            (
+                slot,
+                c.kind,
+                c.stamp,
+                true,
+                None,
+                c.stamp.calibration_revision,
+                c.stamp.gripper_calib_revision,
+                c.stamp.power_budget_revision,
+                c.expected_duration_s,
+            )
+        }
+        PreparedWsAction::Joint(j) => {
+            let slot = j
+                .to_plan_slot(None)
+                .map_err(|code| ActionRefusal::new(code).into_arm_error_with_epoch(j.stamp.admission.estop_epoch))?;
+            (
+                slot,
+                j.kind,
+                j.stamp,
+                true,
+                j.stamp.poses_revision,
+                j.stamp.calibration_revision,
+                j.stamp.gripper_calib_revision,
+                j.stamp.power_budget_revision,
+                j.expected_duration_s,
+            )
+        }
+        PreparedWsAction::Gripper(g) => {
+            let slot = g
+                .to_plan_slot(None)
+                .map_err(|code| ActionRefusal::new(code).into_arm_error_with_epoch(g.stamp.admission.estop_epoch))?;
+            (
+                slot,
+                PreparedActionKind::Gripper,
+                g.stamp,
+                false,
+                None,
+                g.stamp.calibration_revision,
+                g.stamp.gripper_calib_revision,
+                g.stamp.power_budget_revision,
+                g.expected_duration_s,
+            )
+        }
+        PreparedWsAction::Replay(r) => {
+            let slot = r
+                .to_plan_slot(None)
+                .map_err(|code| ActionRefusal::new(code).into_arm_error_with_epoch(r.stamp.admission.estop_epoch))?;
+            (
+                slot,
+                PreparedActionKind::Replay,
+                r.stamp,
+                true,
+                None,
+                r.stamp.calibration_revision,
+                r.stamp.gripper_calib_revision,
+                r.stamp.power_budget_revision,
+                r.expected_duration_s,
+            )
+        }
+    };
+
+    let client = ClientId(conn_id);
+    let auth = stamp.broker_authority();
+    let submit_deadline = stamp.deadline.max(Instant::now() + DEFAULT_ACTION_DEADLINE);
+    let prepared_boot = stamp.boot;
+    let admission_request_id = stamp.admission.request_id;
+    let retry_until = Instant::now() + Duration::from_millis(50);
+
+    let (_req_id, mut rx, ack_guard) = loop {
+        let write = |dst: &mut PlanSlot| *dst = slot.clone();
+        match handle.submit_external_action(
+            client,
+            0,
+            auth,
+            submit_deadline,
+            ActionSubmit::InstallPrepared {
+                write: &write,
+                kind,
+                prepared_boot,
+                admission_request_id,
+                check_workspace_revision,
+                poses_revision,
+                calibration_revision,
+                gripper_calib_revision,
+                power_budget_revision,
+            },
+            ExternalDestinationPolicy::ConnectionOnly,
+            true,
+            Some(Arc::clone(&wire_tracker)),
+        ) {
+            Ok(triple) => break triple,
+            Err(ExternalSubmitError::NoDestination) => {
+                return Err(ArmError::Rejected {
+                    status: 503,
+                    code: "EXECUTOR_ROUTING_PENDING".into(),
+                    message: "RT executor has no per-connection reply route bound".into(),
+                });
+            }
+            Err(ExternalSubmitError::Stopped) => {
+                return Err(ArmError::Rejected {
+                    status: 503,
+                    code: "EXECUTOR_UNAVAILABLE".into(),
+                    message: "RT executor stopped before admitting prepared action".into(),
+                });
+            }
+            Err(ExternalSubmitError::NotAnExternalAction) => {
+                return Err(ArmError::Internal("InstallPrepared rejected as non-external".into()));
+            }
+            Err(ExternalSubmitError::Admit(AdmitError::Disconnected)) => {
+                return Err(ActionRefusal::new("LEASE_LOST").into_arm_error_with_epoch(auth.epoch));
+            }
+            Err(ExternalSubmitError::Admit(AdmitError::RepliesFull)) => {
+                handle.pump_broker_replies();
+                if Instant::now() >= retry_until || Instant::now() > submit_deadline {
+                    return Err(ActionRefusal::new("TERMINALS_BUSY")
+                        .into_arm_error_with_epoch(auth.epoch));
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            Err(ExternalSubmitError::Admit(AdmitError::CommandsFull | AdmitError::PlansFull)) => {
+                handle.pump_broker_replies();
+                let now = Instant::now();
+                if now > submit_deadline {
+                    return Err(ActionRefusal::new("DEADLINE_EXPIRED")
+                        .into_arm_error_with_epoch(auth.epoch));
+                }
+                if now >= retry_until {
+                    return Err(ArmError::Rejected {
+                        status: 503,
+                        code: "MOTION_BUSY".into(),
+                        message: "RT executor command or plan queue is saturated".into(),
+                    });
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+    };
+
+    let wait_limit = submit_deadline + Duration::from_secs(2);
+    loop {
+        handle.pump_broker_replies();
+        let remaining = wait_limit.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            drop(ack_guard);
+            return Err(ActionRefusal::new("DEADLINE_EXPIRED").into_arm_error_with_epoch(auth.epoch));
+        }
+        let step = remaining.min(Duration::from_millis(2));
+        match tokio::time::timeout(step, &mut rx).await {
+            Ok(Ok(Ok(Reply::Ack { action: Some(id), .. }))) => {
+                return Ok(((id.0, expected_duration_s), ack_guard));
+            }
+            Ok(Ok(Ok(Reply::Ack { action: None, .. }))) => {
+                drop(ack_guard);
+                return Err(ArmError::Internal("InstallPrepared ACK omitted ActionId".into()));
+            }
+            Ok(Ok(Ok(Reply::Refused { code, .. }))) => {
+                drop(ack_guard);
+                let cur_epoch = sup
+                    .hub()
+                    .latest()
+                    .map_or(auth.epoch, |s| s.rt.owner.authority.epoch);
+                return Err(ActionRefusal::new(code).into_arm_error_with_epoch(cur_epoch));
+            }
+            Ok(Ok(Ok(Reply::Terminal { .. } | Reply::Lease { .. }))) => {
+                drop(ack_guard);
+                return Err(ArmError::Internal("unexpected reply variant for InstallPrepared".into()));
+            }
+            Ok(Ok(Err(_))) | Ok(Err(_)) => {
+                drop(ack_guard);
+                return Err(ArmError::Rejected {
+                    status: 503,
+                    code: "EXECUTOR_UNAVAILABLE".into(),
+                    message: "RT executor stopped before acknowledging prepared action".into(),
+                });
+            }
+            Err(_) => {}
+        }
+    }
+}
+
+/// Executor-owner WebSocket router for family P prepared actions and macro actions (P-F1):
+/// - Prepared actions: `/api/v1/action/move_to`, `move_relative`, `move_to_pose`, `gripper`, `replay`
+/// - Macro actions: `/api/v1/action/grasp` (`dry_run: true`, live `adaptive` and `legacy`),
+///   `/api/v1/action/place`, `/api/v1/action/run_sequence`, `/api/v1/calib/hover`,
+///   `/api/v1/measure/multiview`
 ///
-/// Returns `None` for any other path/strategy so unmigrated routes stay fail-closed.
+/// Every external action binds its terminal destination atomically to this connection's per-connection
+/// reply slot (`ExternalDestinationPolicy::ConnectionOnly`) and enforces the wire-ACK enqueue barrier
+/// via `CommandReplyGateGuard` + `AckCommitGuard`.
+///
+/// Returns `None` for any non-P path (leaving M's `/api/v1/motion/jog`, C's calibration, S, Y untouched).
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn handle_executor_ws_grasp(
+pub(super) async fn handle_executor_ws_action(
     frame_kind: FrameKind,
     entry: Option<&'static DispatchEntry>,
     value: &Value,
@@ -441,49 +662,69 @@ pub(super) async fn handle_executor_ws_grasp(
     ws_auth: &WsAuth,
     recv_supervisor: &Arc<ArmSupervisor>,
     recv_deps: &crate::grasp::GraspDeps,
+    recv_calib: &crate::calibration::CalibrationDeps,
     worker_closing: &Arc<AtomicBool>,
+    command_reply_pending: &Arc<AtomicBool>,
+    wire_ack_tracker: &Arc<crate::rt_core::reply_router::WsWireAckTracker>,
     worker_tasks: &ConnectionTasks,
-) -> Option<ExecutorGraspDispatch> {
+) -> Option<ExecutorActionDispatch> {
     if frame_kind != FrameKind::Command {
         return None;
     }
     let entry = entry?;
-    if entry.key.path != Some("/api/v1/action/grasp") {
+    let path = entry.key.path?;
+    let is_prepared = matches!(
+        path,
+        "/api/v1/action/move_to"
+            | "/api/v1/action/move_relative"
+            | "/api/v1/action/move_to_pose"
+            | "/api/v1/action/gripper"
+            | "/api/v1/action/replay"
+    );
+    let is_macro = path == "/api/v1/action/grasp"
+        || path == "/api/v1/action/place"
+        || path == "/api/v1/action/run_sequence"
+        || path == crate::calib_hover::PATH
+        || path == crate::measure_multiview::PATH;
+    if !is_prepared && !is_macro {
         return None;
     }
+
     let body = &value["body"];
     let request_id_val = value.get("request_id").cloned().unwrap_or(Value::Null);
-    let is_dry_run = body.get("dry_run").and_then(Value::as_bool) == Some(true);
     let epoch = recv_supervisor
         .hub()
         .latest()
         .map_or_else(|| recv_supervisor.estop_epoch(), |s| s.obs.epoch_id);
 
-    if is_dry_run {
+    let immediate = |reply: Value| {
+        Some(ExecutorActionDispatch::Reply {
+            reply,
+            gate: None,
+            ack_guard: None,
+        })
+    };
+
+    // Lease-free dry-run grasp stays on its planning-result contract.
+    if path == "/api/v1/action/grasp" && body.get("dry_run").and_then(Value::as_bool) == Some(true) {
         let request_id = value.get("request_id").and_then(Value::as_u64);
         if request_id.is_none() || last_ordinary_request.is_some_and(|last| request_id.unwrap() <= last) {
-            return Some(ExecutorGraspDispatch::Reply(json!({
+            return immediate(json!({
                 "type": "command_reject",
                 "request_id": request_id_val,
                 "status": 400,
                 "code": "INVALID_COMMAND",
                 "message": "request_id must be present and strictly increase",
                 "error": "INVALID_COMMAND"
-            })));
+            }));
         }
         *last_ordinary_request = request_id;
         let dry = crate::grasp::dry_run_task(recv_supervisor, recv_deps.source.as_ref(), body).await;
-        let mut ack = off_lock_grasp_ack(recv_supervisor, &request_id_val, None, epoch);
+        let mut ack = off_lock_action_ack(recv_supervisor, &request_id_val, None, epoch);
         for (k, v) in dry.fields() {
             ack[k.as_str()] = v;
         }
-        return Some(ExecutorGraspDispatch::Reply(ack));
-    }
-
-    // Live `/api/v1/action/grasp`: route `strategy: "adaptive"` on `OWNER_EXECUTOR`; keep
-    // unmigrated legacy strategy untouched (`None` -> `EXECUTOR_ROUTING_PENDING`).
-    if body.get("strategy").and_then(Value::as_str) != Some("adaptive") {
-        return None;
+        return immediate(ack);
     }
 
     // 1. Lease authority check (off-lock).
@@ -494,7 +735,7 @@ pub(super) async fn handle_executor_ws_grasp(
         value.get("client_id").is_none_or(|id| id.as_str() == lbl.as_deref())
     };
     if local_generation == 0 || supplied_generation != local_generation || !label_matches {
-        return Some(ExecutorGraspDispatch::Reply(json!({
+        return immediate(json!({
             "type": "command_reject",
             "request_id": request_id_val,
             "status": 409,
@@ -502,12 +743,12 @@ pub(super) async fn handle_executor_ws_grasp(
             "error": "LEASE_LOST",
             "message": "This connection does not hold the active lease",
             "epoch_id": epoch
-        })));
+        }));
     }
 
     // 2. Epoch check against live published state + atomic E-stop counter.
     if value.get("epoch_id").and_then(Value::as_u64) != Some(epoch) {
-        return Some(ExecutorGraspDispatch::Reply(json!({
+        return immediate(json!({
             "type": "command_reject",
             "request_id": request_id_val,
             "status": 409,
@@ -515,37 +756,57 @@ pub(super) async fn handle_executor_ws_grasp(
             "message": "Command epoch is no longer current",
             "error": "EPOCH_MISMATCH",
             "epoch_id": epoch
-        })));
+        }));
     }
 
     // 3. Monotonic request_id check.
     let request_id = value.get("request_id").and_then(Value::as_u64);
     if request_id.is_none() || last_ordinary_request.is_some_and(|last| request_id.unwrap() <= last) {
-        return Some(ExecutorGraspDispatch::Reply(json!({
+        return immediate(json!({
             "type": "command_reject",
             "request_id": request_id_val,
             "status": 400,
             "code": "INVALID_COMMAND",
             "message": "request_id must be present and strictly increase",
             "error": "INVALID_COMMAND"
-        })));
+        }));
     }
     *last_ordinary_request = request_id;
 
     // 4. Operator auth check from dispatch table.
-    if let AuthRequirement::Operator(label) = entry.auth {
-        if !ws_auth.is_operator() {
-            return Some(ExecutorGraspDispatch::Reply(off_lock_grasp_reject(
+    match entry.auth {
+        AuthRequirement::Operator(label) => {
+            if !ws_auth.is_operator() {
+                return immediate(off_lock_action_reject(
+                    &request_id_val,
+                    epoch,
+                    ApiError::operator_required(label.unwrap_or(path)),
+                ));
+            }
+        }
+        AuthRequirement::Conditional(_)
+            if path == "/api/v1/action/run_sequence"
+                && !ws_auth.is_operator()
+                && body.get("record").is_some_and(|r| !r.is_null()) =>
+        {
+            return immediate(off_lock_action_reject(
                 &request_id_val,
                 epoch,
-                ApiError::operator_required(label.unwrap_or("/api/v1/action/grasp")),
-            )));
+                ApiError::operator_required("run_sequence (record)"),
+            ));
         }
+        _ => {}
     }
 
-    // 5. Capture original connection admission stamp (preserving the server-allocated single-use
-    //    A1 `stamp.request_id` from WS frame arrival — never overwriting with client wire IDs)
-    //    and prepare adaptive grasp off-lock.
+    if !body.is_object() {
+        return immediate(off_lock_action_reject(
+            &request_id_val,
+            epoch,
+            invalid_command("Command body must be an object"),
+        ));
+    }
+
+    // 5. Capture original connection admission stamp (preserving single-use A1 `stamp.request_id`).
     let mut ws_stamp = stamp;
     ws_stamp.connection_id = recv_conn_id;
     ws_stamp.lease_gen = local_generation;
@@ -560,35 +821,301 @@ pub(super) async fn handle_executor_ws_grasp(
     {
         Ok(s) => s,
         Err(e) => {
-            return Some(ExecutorGraspDispatch::Reply(off_lock_grasp_reject(
-                &request_id_val,
-                epoch,
-                e.into(),
-            )));
+            return immediate(off_lock_action_reject(&request_id_val, epoch, e.into()));
         }
     };
-    let pending = match crate::grasp::prepare_from_snapshot(&snap, body, epoch) {
-        Ok(p) => p,
-        Err(e) => {
-            return Some(ExecutorGraspDispatch::Reply(off_lock_grasp_reject(
-                &request_id_val,
-                epoch,
-                e.into(),
-            )));
+
+    // 6. Dispatch prepared action vs macro action.
+    if is_prepared {
+        use crate::rt_core::requests::actions as req;
+        let kind = match path {
+            "/api/v1/action/move_to" => PendingPlanKind::MoveTo,
+            "/api/v1/action/move_relative" => PendingPlanKind::MoveRelative,
+            "/api/v1/action/move_to_pose" => PendingPlanKind::MoveToPose,
+            "/api/v1/action/gripper" => PendingPlanKind::Gripper,
+            "/api/v1/action/replay" => PendingPlanKind::Replay,
+            _ => unreachable!(),
+        };
+        let is_replay = kind == PendingPlanKind::Replay;
+        let body_owned = body.clone();
+        let cancel = Arc::clone(worker_closing);
+        let plan_conn = recv_connection.to_string();
+        let prepared = tokio::task::spawn_blocking(move || {
+            maybe_pause_blocking_plan(&plan_conn);
+            if cancel.load(Ordering::Acquire) {
+                return None;
+            }
+            let res: Result<PreparedWsAction, (ArmError, bool)> = match kind {
+                PendingPlanKind::MoveTo => {
+                    req::prepare_move_with_branch_hint(&snap, &body_owned, false).map(|m| match m {
+                        req::PreparedMoveAction::Cartesian(c) => PreparedWsAction::Cartesian(c),
+                        req::PreparedMoveAction::Joint(j) => PreparedWsAction::Joint(j),
+                    })
+                }
+                PendingPlanKind::MoveRelative => {
+                    req::prepare_move_with_branch_hint(&snap, &body_owned, true).map(|m| match m {
+                        req::PreparedMoveAction::Cartesian(c) => PreparedWsAction::Cartesian(c),
+                        req::PreparedMoveAction::Joint(j) => PreparedWsAction::Joint(j),
+                    })
+                }
+                PendingPlanKind::MoveToPose => req::prepare_saved_pose(&snap, &body_owned)
+                    .map(PreparedWsAction::Joint)
+                    .map_err(|e| (e, false)),
+                PendingPlanKind::Gripper => {
+                    req::prepare_gripper(&snap, &body_owned, crate::supervisor::GripperBaselineCmd::None)
+                        .map(PreparedWsAction::Gripper)
+                        .map_err(|e| (e, false))
+                }
+                PendingPlanKind::Replay => req::prepare_replay(&snap, &body_owned)
+                    .map(PreparedWsAction::Replay)
+                    .map_err(|e| (e, false)),
+            };
+            if cancel.load(Ordering::Acquire) {
+                return None;
+            }
+            Some(res)
+        })
+        .await;
+
+        if worker_closing.load(Ordering::SeqCst) {
+            return Some(ExecutorActionDispatch::Closed);
         }
-    };
-    let mut check = spawn_macro_check(
-        request_id_val,
-        PendingMacro::Grasp(pending),
-        local_generation,
-        ws_stamp,
-        recv_deps,
-        worker_closing,
-        recv_connection,
-        worker_tasks,
-    );
-    check.executor = true;
-    Some(ExecutorGraspDispatch::Macro(check))
+        let cur_epoch = recv_supervisor
+            .hub()
+            .latest()
+            .map_or(epoch, |s| s.obs.epoch_id);
+        if recv_supervisor.owner_mode() != crate::supervisor::OWNER_EXECUTOR {
+            return immediate(off_lock_action_reject(
+                &request_id_val,
+                cur_epoch,
+                ArmError::Rejected {
+                    status: 503,
+                    code: "EXECUTOR_UNAVAILABLE".into(),
+                    message: "RT executor is no longer active".into(),
+                }
+                .into(),
+            ));
+        }
+        let prepared = match prepared {
+            Ok(None) => return Some(ExecutorActionDispatch::Closed),
+            Err(e) => {
+                let label = if is_replay {
+                    "replay check task failed"
+                } else {
+                    "planner task failed"
+                };
+                return immediate(off_lock_action_reject(
+                    &request_id_val,
+                    cur_epoch,
+                    ArmError::Internal(format!("{label}: {e}")).into(),
+                ));
+            }
+            Ok(Some(Err((error, joint_hint)))) => {
+                let mut api: ApiError = error.into();
+                if joint_hint {
+                    api.message.push_str(crate::motion::JOINT_PATH_HINT);
+                }
+                return immediate(off_lock_action_reject(&request_id_val, cur_epoch, api));
+            }
+            Ok(Some(Ok(p))) => p,
+        };
+        if recv_generation.load(Ordering::SeqCst) != local_generation {
+            let msg = if is_replay {
+                "This connection lost the lease while the episode was checked"
+            } else {
+                "This connection lost the lease while planning"
+            };
+            return immediate(json!({
+                "type": "command_reject",
+                "request_id": request_id_val,
+                "status": 409,
+                "code": "LEASE_LOST",
+                "message": msg,
+                "error": "LEASE_LOST",
+                "epoch_id": cur_epoch
+            }));
+        }
+
+        let gate = CommandReplyGateGuard::enter_with_tracker(
+            command_reply_pending,
+            recv_supervisor.hub(),
+            wire_ack_tracker,
+        );
+        match submit_prepared_executor_ws(
+            recv_supervisor,
+            recv_conn_id,
+            prepared,
+            Arc::clone(wire_ack_tracker),
+        )
+        .await
+        {
+            Ok((started, ack_guard)) => {
+                let reply = off_lock_action_ack(recv_supervisor, &request_id_val, Some(started), cur_epoch);
+                return Some(ExecutorActionDispatch::Reply {
+                    reply,
+                    gate: Some(gate),
+                    ack_guard: Some(ack_guard),
+                });
+            }
+            Err(error) => {
+                drop(gate);
+                let post_ep = recv_supervisor
+                    .hub()
+                    .latest()
+                    .map_or(cur_epoch, |s| s.obs.epoch_id);
+                return immediate(off_lock_action_reject(&request_id_val, post_ep, error.into()));
+            }
+        }
+    }
+
+    match path {
+        "/api/v1/action/grasp" => {
+            let pending = match crate::grasp::prepare_from_snapshot(&snap, body, epoch) {
+                Ok(p) => p,
+                Err(e) => return immediate(off_lock_action_reject(&request_id_val, epoch, e.into())),
+            };
+            let mut check = spawn_macro_check(
+                request_id_val,
+                PendingMacro::Grasp(pending),
+                local_generation,
+                ws_stamp,
+                recv_deps,
+                worker_closing,
+                recv_connection,
+                worker_tasks,
+            );
+            check.executor = true;
+            Some(ExecutorActionDispatch::Macro(check))
+        }
+        "/api/v1/action/place" => {
+            let pending = match crate::place::prepare_from_snapshot(&snap, body, epoch) {
+                Ok(p) => p,
+                Err(e) => return immediate(off_lock_action_reject(&request_id_val, epoch, e.into())),
+            };
+            let mut check = spawn_macro_check(
+                request_id_val,
+                PendingMacro::Place(pending),
+                local_generation,
+                ws_stamp,
+                recv_deps,
+                worker_closing,
+                recv_connection,
+                worker_tasks,
+            );
+            check.executor = true;
+            Some(ExecutorActionDispatch::Macro(check))
+        }
+        "/api/v1/action/run_sequence" => {
+            let plan = match crate::sequences::prepare_run_from_snapshot(&snap, body, epoch, true) {
+                Ok(p) => p,
+                Err(e) => return immediate(off_lock_action_reject(&request_id_val, epoch, e.into())),
+            };
+            let gate = CommandReplyGateGuard::enter_with_tracker(
+                command_reply_pending,
+                recv_supervisor.hub(),
+                wire_ack_tracker,
+            );
+            match crate::sequences::begin_executor_ws(
+                recv_supervisor,
+                ws_stamp,
+                plan,
+                Arc::clone(wire_ack_tracker),
+            )
+            .await
+            {
+                Ok((started, ack_guard)) => {
+                    let reply = off_lock_action_ack(recv_supervisor, &request_id_val, Some(started), epoch);
+                    Some(ExecutorActionDispatch::Reply {
+                        reply,
+                        gate: Some(gate),
+                        ack_guard: Some(ack_guard),
+                    })
+                }
+                Err(error) => {
+                    drop(gate);
+                    let cur_epoch = recv_supervisor.hub().latest().map_or(epoch, |s| s.obs.epoch_id);
+                    immediate(off_lock_action_reject(&request_id_val, cur_epoch, error.into()))
+                }
+            }
+        }
+        p if p == crate::calib_hover::PATH => {
+            let existing_jobs = recv_supervisor.hover_jobs_snapshot().await;
+            let plan = match crate::calib_hover::prepare_from_snapshot(&snap, &existing_jobs, body, epoch) {
+                Ok(p) => p,
+                Err(e) => return immediate(off_lock_action_reject(&request_id_val, epoch, e.into())),
+            };
+            let gate = CommandReplyGateGuard::enter_with_tracker(
+                command_reply_pending,
+                recv_supervisor.hub(),
+                wire_ack_tracker,
+            );
+            match crate::calib_hover::begin_executor_ws(
+                recv_supervisor,
+                ws_stamp,
+                plan,
+                recv_calib.upstream.clone(),
+                crate::calib_hover::jobs_dir(&recv_calib.path),
+                Arc::clone(wire_ack_tracker),
+            )
+            .await
+            {
+                Ok(((id, duration, job_id), ack_guard)) => {
+                    let mut reply = off_lock_action_ack(
+                        recv_supervisor,
+                        &request_id_val,
+                        Some((id, duration)),
+                        epoch,
+                    );
+                    reply["job_id"] = json!(job_id);
+                    Some(ExecutorActionDispatch::Reply {
+                        reply,
+                        gate: Some(gate),
+                        ack_guard: Some(ack_guard),
+                    })
+                }
+                Err(error) => {
+                    drop(gate);
+                    let cur_epoch = recv_supervisor.hub().latest().map_or(epoch, |s| s.obs.epoch_id);
+                    immediate(off_lock_action_reject(&request_id_val, cur_epoch, error.into()))
+                }
+            }
+        }
+        p if p == crate::measure_multiview::PATH => {
+            let plan = match crate::measure_multiview::prepare_from_snapshot(&snap, body, epoch) {
+                Ok(p) => p,
+                Err(e) => return immediate(off_lock_action_reject(&request_id_val, epoch, e.into())),
+            };
+            let gate = CommandReplyGateGuard::enter_with_tracker(
+                command_reply_pending,
+                recv_supervisor.hub(),
+                wire_ack_tracker,
+            );
+            match crate::measure_multiview::begin_executor_ws(
+                recv_supervisor,
+                ws_stamp,
+                plan,
+                recv_deps.source.clone(),
+                Arc::clone(wire_ack_tracker),
+            )
+            .await
+            {
+                Ok((started, ack_guard)) => {
+                    let reply = off_lock_action_ack(recv_supervisor, &request_id_val, Some(started), epoch);
+                    Some(ExecutorActionDispatch::Reply {
+                        reply,
+                        gate: Some(gate),
+                        ack_guard: Some(ack_guard),
+                    })
+                }
+                Err(error) => {
+                    drop(gate);
+                    let cur_epoch = recv_supervisor.hub().latest().map_or(epoch, |s| s.obs.epoch_id);
+                    immediate(off_lock_action_reject(&request_id_val, cur_epoch, error.into()))
+                }
+            }
+        }
+        _ => None,
+    }
 }
 
 // Under the write lock, after lease / epoch / request_id checks.
@@ -834,7 +1361,12 @@ pub(super) async fn complete_macro_check(
     recv_deps: &crate::grasp::GraspDeps,
     worker_closing: &AtomicBool,
     command_reply_pending: &Arc<AtomicBool>,
-) -> Option<(Value, Option<CommandReplyGateGuard>)> {
+    wire_ack_tracker: &Arc<crate::rt_core::reply_router::WsWireAckTracker>,
+) -> Option<(
+    Value,
+    Option<CommandReplyGateGuard>,
+    Option<crate::rt_core::reply_router::AckCommitGuard>,
+)> {
     if worker_closing.load(Ordering::SeqCst) {
         return None;
     }
@@ -845,7 +1377,7 @@ pub(super) async fn complete_macro_check(
             .map_or_else(|| recv_supervisor.estop_epoch(), |s| s.obs.epoch_id);
         if recv_supervisor.owner_mode() != crate::supervisor::OWNER_EXECUTOR {
             return Some((
-                off_lock_grasp_reject(
+                off_lock_action_reject(
                     &request_id,
                     epoch,
                     ArmError::Rejected {
@@ -855,6 +1387,7 @@ pub(super) async fn complete_macro_check(
                     }
                     .into(),
                 ),
+                None,
                 None,
             ));
         }
@@ -870,68 +1403,70 @@ pub(super) async fn complete_macro_check(
                     "epoch_id": epoch
                 }),
                 None,
+                None,
             ));
         }
         let planned = match joined {
             Err(e) => {
                 return Some((
-                    off_lock_grasp_reject(
+                    off_lock_action_reject(
                         &request_id,
                         epoch,
                         ArmError::Internal(format!("planner task failed: {e}")).into(),
                     ),
                     None,
-                ));
-            }
-            Ok(Err(error)) => {
-                return Some((off_lock_grasp_reject(&request_id, epoch, error.into()), None));
-            }
-            Ok(Ok(PlannedMacro::Grasp(g))) => g,
-            Ok(Ok(_)) => {
-                return Some((
-                    off_lock_grasp_reject(
-                        &request_id,
-                        epoch,
-                        ArmError::Rejected {
-                            status: 503,
-                            code: "EXECUTOR_ROUTING_PENDING".into(),
-                            message: "Macro kind is not routed on RT executor".into(),
-                        }
-                        .into(),
-                    ),
                     None,
                 ));
             }
-        };
-        // Attach the WS broker-reply drain sink on demand so broker external terminals drain
-        // cleanly while every connected WS client receives lossless `ArmObservation` terminals
-        // via `subscribe_action_terminals` (keeping sinkless direct tests fail-closed).
-        if let Some(handle) = recv_supervisor.executor_handle() {
-            if !handle.has_external_reply_sink() {
-                handle.attach_external_reply_sink(Arc::new(|_, _| {
-                    crate::rt_core::broker::DeliveryDecision::Delivered
-                }));
+            Ok(Err(error)) => {
+                return Some((off_lock_action_reject(&request_id, epoch, error.into()), None, None));
             }
-        }
-        let gate = CommandReplyGateGuard::enter(command_reply_pending, recv_supervisor.hub());
-        let reply = match crate::grasp::begin_executor(
-            recv_supervisor,
-            stamp,
-            recv_deps.source.clone(),
-            planned,
-        )
-        .await
-        {
-            Ok(started) => off_lock_grasp_ack(recv_supervisor, &request_id, Some(started), epoch),
+            Ok(Ok(p)) => p,
+        };
+        let gate = CommandReplyGateGuard::enter_with_tracker(
+            command_reply_pending,
+            recv_supervisor.hub(),
+            wire_ack_tracker,
+        );
+        let begin_res = match planned {
+            PlannedMacro::Grasp(g) => {
+                crate::grasp::begin_executor_ws(
+                    recv_supervisor,
+                    stamp,
+                    recv_deps.source.clone(),
+                    g,
+                    Arc::clone(wire_ack_tracker),
+                )
+                .await
+            }
+            PlannedMacro::Place(p) => {
+                crate::place::begin_executor_ws(
+                    recv_supervisor,
+                    stamp,
+                    p,
+                    Arc::clone(wire_ack_tracker),
+                )
+                .await
+            }
+        };
+        match begin_res {
+            Ok((started, ack_guard)) => {
+                let reply = off_lock_action_ack(recv_supervisor, &request_id, Some(started), epoch);
+                return Some((reply, Some(gate), Some(ack_guard)));
+            }
             Err(error) => {
+                drop(gate);
                 let cur_epoch = recv_supervisor
                     .hub()
                     .latest()
                     .map_or(epoch, |s| s.obs.epoch_id);
-                off_lock_grasp_reject(&request_id, cur_epoch, error.into())
+                return Some((
+                    off_lock_action_reject(&request_id, cur_epoch, error.into()),
+                    None,
+                    None,
+                ));
             }
-        };
-        return Some((reply, Some(gate)));
+        }
     }
     let owner_transferred = || {
         let mut r = json!({"type":"command_reject", "request_id":request_id, "status":503, "code":"OWNER_TRANSFERRED", "error":"OWNER_TRANSFERRED", "message":"Ownership transferred to RT executor while planning macro"});
@@ -941,7 +1476,7 @@ pub(super) async fn complete_macro_check(
         r
     };
     if recv_supervisor.owner_mode() != crate::supervisor::OWNER_LEGACY {
-        return Some((owner_transferred(), None));
+        return Some((owner_transferred(), None, None));
     }
     enum MacroFinishOutcome {
         Closed,
@@ -1005,19 +1540,19 @@ pub(super) async fn complete_macro_check(
         MacroFinishOutcome::Closed => None,
         MacroFinishOutcome::Detached => {
             drop(gate);
-            Some((owner_transferred(), None))
+            Some((owner_transferred(), None, None))
         }
         MacroFinishOutcome::LeaseLost { epoch } => {
             drop(gate);
             let reply = json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while planning", "error":"LEASE_LOST", "epoch_id":epoch});
-            Some((reply, None))
+            Some((reply, None, None))
         }
         MacroFinishOutcome::Reject { epoch, error } => {
             drop(gate);
-            Some((command_reject_at(epoch, &request_id, error), None))
+            Some((command_reject_at(epoch, &request_id, error), None, None))
         }
         MacroFinishOutcome::Ack { snap, started } => {
-            Some((command_ack_from_snap(&snap, &request_id, started), Some(gate)))
+            Some((command_ack_from_snap(&snap, &request_id, started), Some(gate), None))
         }
     }
 }

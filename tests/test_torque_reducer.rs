@@ -1345,12 +1345,38 @@ fn fu_panic_park_authority_b3_m1_m2_and_safehold_b11_b12() {
     assert_eq!(s2.devices[0].safe_hold_bus_loss_since_us, Some(120_000));
     assert_eq!(s2.devices[1].safe_hold_bus_loss_since_us, Some(360_000));
 
-    // At t = 560_000 (Dev 1 elapsed 200ms >= 200ms): trips ProtectivePanicBusLoss!
+    // At t = 560_000 (Dev 1 elapsed 200ms >= 200ms): DRV-F1 governing rule — bus loss alone
+    // latches BusLoss fault and leaves holding unconfirmed without issuing any protective disable.
     let r_trip = checked_step(&mut s2, Event::Release { now_us: 560_000 });
-    let dp = r_trip.disable_for(0).expect("Dev 1 crossed its own 200 ms limit");
-    assert_eq!(dp.origin, DisableOrigin::ProtectivePanicBusLoss);
+    assert!(
+        !r_trip.any_disable(),
+        "DRV-F1: bus loss alone in SafeHold must NOT emit protective disable"
+    );
+    assert_eq!(s2.groups[0].drive_state, DriveState::SafeHold);
+    assert!(s2.groups[0].faults.contains(TorqueFaultKind::BusLoss));
+    assert_eq!(s2.groups[0].torque_intent, TorqueIntent::On);
 
-    // B12: All protective writes fail/defer through deadline expiry -> resumes SafeHold and holds once feedback returns!
+    // B12: Thermal protective disable during SafeHold with zero-write expiry resumes SafeHold and
+    // holds once feedback returns!
+    checked_step(
+        &mut s2,
+        Event::Thermal {
+            channel: 0,
+            temperature_c: 95.0,
+            now_us: 560_000,
+        },
+    );
+    let r_therm = checked_step(&mut s2, Event::Release { now_us: 560_000 });
+    let dp = r_therm.disable_for(0).expect("thermal trip in SafeHold must emit ProtectiveThermal");
+    assert_eq!(dp.origin, DisableOrigin::ProtectiveThermal);
+    checked_step(
+        &mut s2,
+        Event::Thermal {
+            channel: 0,
+            temperature_c: 30.0,
+            now_us: 560_000 + DEFAULT_DISABLE_DEADLINE_US,
+        },
+    );
     checked_step(
         &mut s2,
         Event::WriteResult(WriteResult::uniform(

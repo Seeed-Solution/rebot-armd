@@ -1,6 +1,9 @@
 #include "model_catalogue.h"
 
 #include <cmath>
+#include <cstdlib>
+#include <fstream>
+#include <sstream>
 
 #include "json.hpp"
 
@@ -64,42 +67,163 @@ bool valid_model_name(const std::string& name) {
     return true;
 }
 
-void add_default_models(Catalogue& cat, const std::function<bool(const std::string&)>& exists) {
-    struct Default {
-        const char* kind;
-        double ion_mb;
-        std::vector<const char*> paths;
+namespace {
+
+std::string trim_cr(std::string s) {
+    if (!s.empty() && s.back() == '\r') s.pop_back();
+    return s;
+}
+
+std::string kind_of_role(const std::string& role) {
+    if (role == "detector-detect") return "detect";
+    if (role == "detector-segment" || role == "detector-segment-fallback") return "segment";
+    if (role == "detector-obb") return "obb";
+    if (role == "depth") return "depth";
+    return "";
+}
+
+std::vector<std::string> paths_for_entry(const ManifestEntry& e) {
+    if (e.ship == "os") {
+        return {
+            "/usr/share/supervisor/models/" + e.file,
+            "/userdata/local/models/" + e.file,
+            "/usr/share/rebot-teleop/models/" + e.file,
+        };
+    }
+    return {
+        "/userdata/local/models/" + e.file,
+        "/userdata/rebot-teleop/models/" + e.file,
+        "/usr/share/rebot-teleop/models/" + e.file,
     };
-    static const std::vector<Default> kDefaults = {
-        {"detect", 8.5, {"/usr/share/supervisor/models/yolo11n_detection_cv181x_int8.cvimodel",
-                         "/userdata/local/models/yolo11n_detection_cv181x_int8.cvimodel"}},
-        {"segment", 19.5, {"/usr/share/supervisor/models/yolo11n_segment_cv181x_int8.cvimodel",
-                           "/userdata/local/models/yolo11n_segment_cv181x_int8.cvimodel"}},
-        {"segment", 13.1, {"/userdata/local/models/yolo11n_seg_384x640_cv181x_int8_fuse.cvimodel",
-                           "/userdata/rebot-teleop/models/yolo11n_seg_384x640_cv181x_int8_fuse.cvimodel"}},
-        {"obb", 8.0, {"/userdata/local/models/yolo11n_obb_cv181x_int8_fuse_qout.cvimodel",
-                      "/userdata/rebot-teleop/models/yolo11n_obb_cv181x_int8_fuse_qout.cvimodel"}},
-        {"depth", 20.0, {"/userdata/local/models/zipdepth_metric_384x224_bf16_rgb.cvimodel",
-                         "/userdata/rebot-teleop/models/zipdepth_metric_384x224_bf16_rgb.cvimodel"}},
+}
+
+void append_role_paths(std::vector<std::string>& out, const std::vector<ManifestEntry>& manifest, const char* role) {
+    for (const ManifestEntry& e : manifest) {
+        if (e.role != role) continue;
+        for (const std::string& p : paths_for_entry(e)) out.push_back(p);
+    }
+}
+
+}  // namespace
+
+std::vector<ManifestEntry> parse_manifest(const std::string& tsv_text) {
+    std::vector<ManifestEntry> out;
+    std::istringstream ss(tsv_text);
+    std::string line;
+    while (std::getline(ss, line)) {
+        line = trim_cr(line);
+        size_t first = line.find_first_not_of(" \t");
+        if (first == std::string::npos || line[first] == '#') continue;
+        std::vector<std::string> cols;
+        size_t pos = 0;
+        while (true) {
+            const size_t tab = line.find('\t', pos);
+            if (tab == std::string::npos) {
+                cols.push_back(line.substr(pos));
+                break;
+            }
+            cols.push_back(line.substr(pos, tab - pos));
+            pos = tab + 1;
+        }
+        if (cols.size() < 7 || cols[0].empty() || cols[1].empty()) continue;
+        ManifestEntry e;
+        e.role = cols[0];
+        e.file = cols[1];
+        e.md5 = cols[2];
+        e.size = std::strtoull(cols[3].c_str(), nullptr, 10);
+        e.ion_mb = std::strtod(cols[4].c_str(), nullptr);
+        if (!std::isfinite(e.ion_mb) || e.ion_mb < 0) e.ion_mb = 0;
+        e.url = cols[5];
+        e.ship = cols[6];
+        out.push_back(std::move(e));
+    }
+    return out;
+}
+
+std::vector<ManifestEntry> builtin_manifest() {
+    return {
+        {"detector-segment", "yolo11n_seg_384x640_cv181x_int8_fuse.cvimodel", "5ad01b51727c5259abc1448f2bd0cec6",
+         3333080, 13.1,
+         "https://sensecraft-statics.seeed.cc/solution-app/rebot/models/yolo11n_seg_384x640_cv181x_int8_fuse-5ad01b51.cvimodel",
+         "bundled"},
+        {"detector-segment-fallback", "yolo11n_segment_cv181x_int8.cvimodel", "b3312af49a5d59a2533c973695a2267a",
+         4043296, 19.5, "-", "os"},
+        {"detector-detect", "yolo11n_detection_cv181x_int8.cvimodel", "7819bd8d3958f5184fb20cd8b0490525",
+         3113208, 8.5, "-", "os"},
+        {"depth", "zipdepth_metric_384x224_bf16_rgb.cvimodel", "d0a6ee396c12680188a1cb8d56cd4a94",
+         12918008, 20.0,
+         "https://sensecraft-statics.seeed.cc/solution-app/rebot/models/zipdepth_metric_384x224_bf16_rgb-d0a6ee39.cvimodel",
+         "bundled"},
+        {"detector-obb", "yolo11n_obb_cv181x_int8_fuse_qout.cvimodel", "d9607b7039dda5981fb62b957f678bdf",
+         3187696, 8.0,
+         "https://sensecraft-statics.seeed.cc/solution-app/rebot/models/yolo11n_obb_cv181x_int8_fuse-d9607b70.cvimodel",
+         "optional"},
     };
+}
+
+std::vector<ManifestEntry> load_manifest_or_builtin(const std::string& path) {
+    if (!path.empty()) {
+        std::ifstream f(path);
+        if (f) {
+            std::ostringstream buf;
+            buf << f.rdbuf();
+            std::vector<ManifestEntry> parsed = parse_manifest(buf.str());
+            if (!parsed.empty()) return parsed;
+        }
+    }
+    return builtin_manifest();
+}
+
+std::vector<std::string> default_detector_candidates(const std::vector<ManifestEntry>& manifest) {
+    std::vector<std::string> out;
+    // seg384 first: resident segmentation gives masks (grasp angle, measure_multiview contours)
+    // without a model swap and coexists with depth inside the 62.9 MB ION carveout.
+    append_role_paths(out, manifest, "detector-segment");
+    out.push_back("/userdata/rebot-teleop/models/yolo11n.cvimodel");
+    append_role_paths(out, manifest, "detector-detect");
+    out.push_back("/userdata/local/models/yolo11n_cv181x_int8.cvimodel");
+    out.push_back("/userdata/rebot-teleop/models/yolo11n-obb.cvimodel");
+    append_role_paths(out, manifest, "detector-obb");
+    out.push_back("/userdata/local/models/yolo11n_obb_cv181x_int8.cvimodel");
+    out.push_back("/userdata/local/models/yolo26n_obb_cv181x_int8.cvimodel");
+    append_role_paths(out, manifest, "detector-segment-fallback");
+    return out;
+}
+
+std::vector<std::string> default_depth_candidates(const std::vector<ManifestEntry>& manifest) {
+    std::vector<std::string> out;
+    append_role_paths(out, manifest, "depth");
+    out.push_back("/userdata/rebot-teleop/models/zipdepth_base_384x224_bf16_rgb.cvimodel");
+    out.push_back("/userdata/local/models/zipdepth_base_384x224_bf16_rgb.cvimodel");
+    return out;
+}
+
+void add_default_models(Catalogue& cat, const std::function<bool(const std::string&)>& exists,
+                        const std::vector<ManifestEntry>& manifest) {
     static const std::vector<std::string> kDota = {
         "plane", "ship", "storage tank", "baseball diamond", "tennis court", "basketball court",
         "ground track field", "harbor", "bridge", "large vehicle", "small vehicle", "helicopter",
         "roundabout", "soccer ball field", "swimming pool"};
-    for (const Default& d : kDefaults) {
-        for (const char* p : d.paths) {
+    for (const ManifestEntry& m : manifest) {
+        const std::string kind = kind_of_role(m.role);
+        if (kind.empty()) continue;
+        for (const std::string& p : paths_for_entry(m)) {
             if (!exists(p)) continue;
             ModelEntry e;
             e.name = file_stem(p);
             e.path = p;
-            e.kind = d.kind;
-            e.ion_mb = d.ion_mb;
+            e.kind = kind;
+            e.ion_mb = m.ion_mb;
             if (e.kind == "depth") e.metric = true;
             if (e.kind == "obb") e.classes = kDota;
             if (cat.find(e.name) == nullptr) cat.models.push_back(e);
             break;
         }
     }
+}
+
+void add_default_models(Catalogue& cat, const std::function<bool(const std::string&)>& exists) {
+    add_default_models(cat, exists, load_manifest_or_builtin());
 }
 
 void parse_catalogue(const std::string& text, Catalogue& out, std::vector<std::string>& warnings) {

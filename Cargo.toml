@@ -89,7 +89,7 @@ lto = "fat"
 codegen-units = 1
 opt-level = "z"
 strip = true
-panic = "abort"
+panic = "unwind"
 
 # The policy runtime's numeric kernels are optimised for speed; the rest of armd stays size-optimised.
 # Measured on the SG2002 (2026-11-21): the 1.98 M-parameter MLP takes 47.5 ms per step in armd with tract at

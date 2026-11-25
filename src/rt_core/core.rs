@@ -169,10 +169,24 @@ impl ArmCore {
     /// `seq` of the last publication (0: none yet).
     pub fn published_seq(&self) -> u64 { self.hub().published_seq() }
 
+    /// Exact publication sequence number the next [`Self::publish_with_rt_meta`] will assign.
+    #[inline]
+    pub fn next_publish_seq(&self) -> u64 { self.publisher.next_seq() }
+
     /// Pre-warms empty triple-buffer observation slots before the RT release loop begins,
     /// without blocking on a contended reader or advancing `published_seq`.
     pub fn try_prewarm_observations(&mut self, make: impl FnMut() -> ArmObservation) {
         self.publisher.try_prewarm_observations(make);
+    }
+
+    /// Installs privately staged pre-warmed producer observation slots without locking `hub`.
+    pub fn install_prewarmed_producer_slots(
+        &mut self,
+        back_obs: ArmObservation,
+        mid_obs: ArmObservation,
+    ) -> (Option<ArmObservation>, Option<ArmObservation>) {
+        self.publisher
+            .install_prewarmed_producer_slots(back_obs, mid_obs)
     }
 
     /// The observation of the publication slot the next [`Self::publish`] writes, moved

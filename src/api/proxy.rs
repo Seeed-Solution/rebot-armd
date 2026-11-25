@@ -711,10 +711,35 @@ pub fn apply_vision_status(caps: &mut crate::model::VisionCapabilities, v: &serd
     caps.subscriptions = v.get("subscriptions").and_then(|b| b.as_bool()) == Some(true);
 }
 
+async fn augment_mode_body(body: Vec<u8>) -> Vec<u8> {
+    let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return body;
+    };
+    let Some(obj) = v.as_object_mut() else {
+        return body;
+    };
+    if obj.contains_key("model_config") {
+        return body;
+    }
+    let snapshot = v.clone();
+    let cfg = tokio::task::spawn_blocking(move || crate::vision_detector::model_config_status(&snapshot))
+        .await
+        .ok();
+    if let Some(cfg) = cfg {
+        if let Ok(mc) = serde_json::to_value(cfg) {
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("model_config".to_string(), mc);
+            }
+        }
+    }
+    serde_json::to_vec(&v).unwrap_or(body)
+}
+
 async fn forward_mode(up: &DetectorUpstream, cache: &VisionCache, method: Method, body: Option<Bytes>) -> Response {
     match fetch(up, method, "/api/mode", body.as_deref(), TIMEOUT_MARGIN).await {
-        Some(r) => {
+        Some(mut r) => {
             if r.status.is_success() {
+                r.body = augment_mode_body(r.body).await;
                 cache.store(&r.body);
             }
             passthrough(r)

@@ -282,10 +282,41 @@ async fn run_motor(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, req: MotorZ
     let (before, r, t_disable) = locked_step(sup, check, grant, "disable", |inner| {
         let q = readings(inner)?;
         if let Some(d) = inner.driver.as_mut() {
-            d.with_mut(|drv| {
-                let started_at = drv.clock_now();
-                drv.disable_torque(crate::driver::DisableKind::DisableRequested { started_at })
-            })
+            let started_at = d
+                .with_ref(|drv| drv.clock_now())
+                .ok_or_else(|| CalibError::new(500, "INTERNAL", "driver unavailable"))?;
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let live_op_id = inner.torque_shadow.alloc_live_op_id();
+                let live_intent = inner.shadow_live_intent();
+                let live_is_torqued = inner.is_torqued;
+                let live_stopped = inner.safety.state().is_stopped();
+                inner.torque_shadow.enqueue_at(
+                    started_at,
+                    crate::torque::shadow::ShadowInputKind::DisableRequest {
+                        live_op_id,
+                        explicit_release_authorized: false,
+                        live_refusal: None,
+                        live_intent,
+                        live_is_torqued,
+                        live_stopped,
+                    },
+                );
+            }
+            let disable_res = {
+                #[cfg(not(target_arch = "wasm32"))]
+                let shadow_rt = &mut inner.torque_shadow;
+                let d = inner.driver.as_mut().expect("checked is_some");
+                d.with_mut(|drv| {
+                    let res = drv.disable_torque(crate::driver::DisableKind::DisableRequested { started_at });
+                    #[cfg(not(target_arch = "wasm32"))]
+                    shadow_rt.drain_from_driver(drv);
+                    res
+                })
+            };
+            #[cfg(not(target_arch = "wasm32"))]
+            inner.flush_torque_shadow();
+            disable_res
                 .ok_or_else(|| CalibError::new(500, "INTERNAL", "driver unavailable"))?
                 .map_err(|e| CalibError::new(500, "MOTOR_ZERO_NOT_DISABLED", format!("disable failed: {e}")))?;
         }

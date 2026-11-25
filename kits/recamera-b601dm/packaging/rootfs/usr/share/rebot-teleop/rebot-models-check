@@ -1,0 +1,229 @@
+#!/bin/sh
+# rebot-models-check: ensure required manifest vision models exist with the expected md5 where
+# rebot-vision searches (/userdata/local/models). Bundled read-only payloads live in
+# /usr/share/rebot-teleop/models; CDN is the fallback when a bundled file is absent or corrupt.
+#
+# Rules:
+# - BusyBox 1.33.0 ash compatible: no bashisms, no background children, no blocking `wait`.
+# - Never deletes user models; a mismatched regular file at a manifest target is moved aside
+#   to <file>.user-bak only after a verified replacement is ready.
+# - Logs every action to stdout and syslog (rebot-models).
+#
+# Environment overrides (used by host tests against a fake rootfs):
+#   REBOT_ROOT, REBOT_BUNDLED_DIR, REBOT_INSTALL_DIR, REBOT_OS_MODELS_DIR,
+#   REBOT_MODELS_TSV, REBOT_CDN_CONNECT_TIMEOUT, REBOT_CDN_MAX_TIME,
+#   REBOT_NO_SYSLOG, REBOT_FETCH_CMD
+
+ROOT=${REBOT_ROOT:-}
+BUNDLED_DIR=${REBOT_BUNDLED_DIR:-${ROOT}/usr/share/rebot-teleop/models}
+INSTALL_DIR=${REBOT_INSTALL_DIR:-${ROOT}/userdata/local/models}
+OS_DIR=${REBOT_OS_MODELS_DIR:-${ROOT}/usr/share/supervisor/models}
+MANIFEST=${REBOT_MODELS_TSV:-${BUNDLED_DIR}/models.tsv}
+SOURCES_FILE=${INSTALL_DIR}/.rebot-model-sources
+CDN_CONNECT_TIMEOUT=${REBOT_CDN_CONNECT_TIMEOUT:-10}
+CDN_MAX_TIME=${REBOT_CDN_MAX_TIME:-60}
+
+log() {
+    echo "[rebot-models] $*"
+    if [ "${REBOT_NO_SYSLOG:-0}" != "1" ] && command -v logger >/dev/null 2>&1; then
+        logger -t rebot-models "$*" 2>/dev/null || true
+    fi
+}
+
+file_md5() {
+    md5sum "$1" 2>/dev/null | cut -d' ' -f1
+}
+
+record_source() {
+    rs_file=$1
+    rs_src=$2
+    rs_tab=$(printf '\t')
+    rs_tmp="${SOURCES_FILE}.tmp.$$"
+    {
+        if [ -f "$SOURCES_FILE" ]; then
+            while IFS= read -r rs_line; do
+                case "$rs_line" in
+                    "${rs_file}${rs_tab}"*) ;;
+                    '') ;;
+                    *) printf '%s\n' "$rs_line" ;;
+                esac
+            done < "$SOURCES_FILE"
+        fi
+        printf '%s\t%s\n' "$rs_file" "$rs_src"
+    } > "$rs_tmp" 2>/dev/null && mv -f "$rs_tmp" "$SOURCES_FILE" 2>/dev/null || rm -f "$rs_tmp" 2>/dev/null
+}
+
+backup_regular_dst() {
+    bk_dst=$1
+    bk_role=$2
+    bk_got=$3
+    bk_want=$4
+    if [ -f "$bk_dst" ] && [ ! -L "$bk_dst" ]; then
+        bk_bak="${bk_dst}.user-bak"
+        if [ -e "$bk_bak" ]; then
+            bk_bak="${bk_dst}.user-bak.$(date +%s)"
+        fi
+        if mv "$bk_dst" "$bk_bak"; then
+            log "backup ($bk_role): preserved mismatched regular file $bk_dst (md5 ${bk_got:-unknown} != $bk_want) at $bk_bak"
+        else
+            log "error ($bk_role): failed to back up mismatched file $bk_dst"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+fetch_url() {
+    fu_url=$1
+    fu_out=$2
+    if [ -n "${REBOT_FETCH_CMD:-}" ]; then
+        "$REBOT_FETCH_CMD" "$fu_url" "$fu_out"
+        return $?
+    fi
+    if command -v curl >/dev/null 2>&1; then
+        curl -fLsS --connect-timeout "$CDN_CONNECT_TIMEOUT" --max-time "$CDN_MAX_TIME" -o "$fu_out" "$fu_url"
+        return $?
+    fi
+    if command -v wget >/dev/null 2>&1; then
+        if command -v timeout >/dev/null 2>&1; then
+            timeout "$CDN_MAX_TIME" wget -q -T "$CDN_CONNECT_TIMEOUT" -O "$fu_out" "$fu_url"
+        else
+            wget -q -T "$CDN_CONNECT_TIMEOUT" -O "$fu_out" "$fu_url"
+        fi
+        return $?
+    fi
+    return 127
+}
+
+main() {
+    if [ ! -r "$MANIFEST" ]; then
+        log "error: manifest not found at $MANIFEST"
+        return 1
+    fi
+
+    errs=0
+    tab=$(printf '\t')
+    while IFS="$tab" read -r role file md5 size ion_mb url ship license notes; do
+        [ -n "$role" ] || continue
+        case "$role" in
+            '#'*|' '#*) continue ;;
+        esac
+
+        case "$ship" in
+            optional)
+                continue
+                ;;
+            os)
+                if [ -f "${OS_DIR}/${file}" ]; then
+                    got=$(file_md5 "${OS_DIR}/${file}")
+                    if [ "$got" = "$md5" ]; then
+                        log "ok ($role): ${OS_DIR}/${file} (os, md5 $md5)"
+                    else
+                        log "warn ($role): ${OS_DIR}/${file} md5 $got != expected $md5 (os model left untouched)"
+                    fi
+                elif [ -f "${INSTALL_DIR}/${file}" ]; then
+                    got=$(file_md5 "${INSTALL_DIR}/${file}")
+                    if [ "$got" = "$md5" ]; then
+                        log "ok ($role): ${INSTALL_DIR}/${file} (user, md5 $md5)"
+                    else
+                        log "warn ($role): ${INSTALL_DIR}/${file} md5 $got != expected $md5"
+                    fi
+                else
+                    log "warn ($role): missing OS model ${OS_DIR}/${file}"
+                fi
+                continue
+                ;;
+            bundled)
+                ;;
+            *)
+                continue
+                ;;
+        esac
+
+        mkdir -p "$INSTALL_DIR" 2>/dev/null || {
+            log "error ($role): cannot create $INSTALL_DIR"
+            errs=$((errs + 1))
+            continue
+        }
+
+        dst="${INSTALL_DIR}/${file}"
+        bundled="${BUNDLED_DIR}/${file}"
+        got=""
+        if [ -f "$dst" ]; then
+            got=$(file_md5 "$dst")
+            if [ "$got" = "$md5" ]; then
+                if [ -L "$dst" ]; then
+                    log "ok ($role): $dst -> $(readlink "$dst" 2>/dev/null) (bundled, md5 $md5)"
+                else
+                    log "ok ($role): $dst (present, md5 $md5)"
+                fi
+                continue
+            fi
+            log "mismatch ($role): $dst md5 ${got:-unreadable} != expected $md5"
+        elif [ -L "$dst" ]; then
+            log "missing ($role): broken symlink $dst"
+        else
+            log "missing ($role): $dst"
+        fi
+
+        # 1. Try bundled read-only payload in /usr/share/rebot-teleop/models
+        if [ -f "$bundled" ]; then
+            b_md5=$(file_md5 "$bundled")
+            if [ "$b_md5" = "$md5" ]; then
+                if backup_regular_dst "$dst" "$role" "$got" "$md5" && ln -sf "$bundled" "$dst"; then
+                    if [ "$(file_md5 "$dst")" = "$md5" ]; then
+                        record_source "$file" "bundled"
+                        log "repaired ($role): linked $dst -> $bundled (bundled, md5 $md5)"
+                        continue
+                    fi
+                fi
+                log "warn ($role): linking $bundled to $dst failed; trying CDN"
+            else
+                log "warn ($role): bundled $bundled md5 ${b_md5:-unreadable} != expected $md5; trying CDN"
+            fi
+        else
+            log "warn ($role): bundled $bundled not found; trying CDN"
+        fi
+
+        # 2. Fallback: download from CDN with timeout and verify md5
+        case "$url" in
+            ''|-|os)
+                log "error ($role): no CDN URL configured for $file"
+                errs=$((errs + 1))
+                continue
+                ;;
+        esac
+
+        part="${dst}.part.$$"
+        rm -f "$part"
+        log "download ($role): fetching $file from $url (timeout ${CDN_MAX_TIME}s)"
+        if fetch_url "$url" "$part"; then
+            p_md5=$(file_md5 "$part")
+            if [ "$p_md5" = "$md5" ]; then
+                if backup_regular_dst "$dst" "$role" "$got" "$md5" && mv -f "$part" "$dst"; then
+                    chmod 0644 "$dst" 2>/dev/null || true
+                    record_source "$file" "cdn"
+                    log "repaired ($role): downloaded $dst from CDN (md5 $md5)"
+                    continue
+                else
+                    rm -f "$part"
+                    log "error ($role): failed to install downloaded $file to $dst"
+                    errs=$((errs + 1))
+                fi
+            else
+                rm -f "$part"
+                log "error ($role): CDN download md5 mismatch for $file (got ${p_md5:-empty}, expected $md5)"
+                errs=$((errs + 1))
+            fi
+        else
+            rm -f "$part"
+            log "error ($role): CDN download failed for $file from $url"
+            errs=$((errs + 1))
+        fi
+    done < "$MANIFEST"
+
+    [ "$errs" -eq 0 ]
+}
+
+main "$@"
+exit $?

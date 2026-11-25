@@ -286,6 +286,7 @@ pub fn create_router_full_with_sandbox(
         .route("/api/v1/sequences", get(rest::get_sequences))
         .route("/api/v1/sequences/{id}", get(rest::get_sequence))
         .route("/api/v1/action/run_sequence", post(rest::action_requires_lease))
+        .route("/api/v1/diagnostics", get(diagnostics::get_diagnostics))
         .route("/api/v1/diagnostics/boots", get(diagnostics::get_boots))
         .route("/api/v1/diagnostics/blackbox", get(diagnostics::get_blackbox))
         .route("/api/v1/diagnostics/tick", get(diagnostics::get_tick))
@@ -357,6 +358,23 @@ async fn gate_executor_owner(
     request: Request<Body>,
     next: Next,
 ) -> Response {
+    if supervisor.internal_fault_fenced() {
+        let method = request.method();
+        let path = request.uri().path();
+        let allowed_under_internal_fault = *method == axum::http::Method::GET
+            || *method == axum::http::Method::HEAD
+            || matches!(
+                path,
+                "/api/v1/safety/e_stop" | "/api/v1/auth/unlock" | "/api/v1/auth/lock"
+            );
+        if !allowed_under_internal_fault {
+            return axum::response::IntoResponse::into_response(rest::ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Internal fault or SAFE-HOLD active; commands and rearm are fenced".into(),
+                "INTERNAL_FAULT".into(),
+            ));
+        }
+    }
     match supervisor.owner_mode() {
         crate::supervisor::OWNER_LEGACY => next.run(request).await,
         crate::supervisor::OWNER_EXECUTOR => {
@@ -372,6 +390,7 @@ async fn gate_executor_owner(
                             "/api/v1/observation"
                                 | "/api/v1/observation/schema"
                                 | "/api/v1/auth/status"
+                                | "/api/v1/diagnostics"
                                 | "/api/v1/diagnostics/tick"
                                 | "/api/v1/diagnostics/boots"
                                 | "/api/v1/diagnostics/blackbox"
