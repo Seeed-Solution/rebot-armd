@@ -9615,12 +9615,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             if is_cmd_disable && deadline.is_some_and(|d| d.passed(t0)) {
                 break 'send_body Err(TxRefusal::DeadlinePassed);
             }
-            // B1: Capture the causal submission mark after all section-6 bookkeeping, then run the
-            // terminal authority (`pre_tx_gate`, stop latch/stamp) and transaction/frame deadline
-            // re-checks immediately before `can.transmit` with ZERO intervening bookkeeping.
-            let tx_seq_mark = self.rx_seq;
-            let tx_started_mark = t0;
-            let (_, tx_offset_ns_mark) = self.capture_rx_clock_sample(tx_started_mark);
+            // B1: Run optional test hook and terminal stop/authority checks BEFORE capturing
+            // `(tx_seq_mark, tx_started_mark, tx_offset_ns_mark)` immediately adjacent to
+            // `can.transmit(&frame)` so no pre-TX frame arriving during hooks/bookkeeping can
+            // satisfy `rx_at >= tx_started_mark`.
             if let Some(ref hook) = self.before_final_tx_gate_hook {
                 hook(&frame);
             }
@@ -9645,9 +9643,12 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     break 'send_body Err(TxRefusal::LeaseFenced);
                 }
             }
-            if deadline.is_some_and(|d| d.passed(self.now())) {
+            let tx_seq_mark = self.rx_seq;
+            let tx_started_mark = self.now();
+            if deadline.is_some_and(|d| d.passed(tx_started_mark)) {
                 break 'send_body Err(TxRefusal::DeadlinePassed);
             }
+            let (_, tx_offset_ns_mark) = self.capture_rx_clock_sample(tx_started_mark);
             let res = self.can.transmit(&frame);
             if res.is_ok() {
                 if let Some(idx) = enable_motor_idx {

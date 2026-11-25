@@ -9972,6 +9972,14 @@ fn control_thread_main_inner(
                 drv.set_rt_mode(false);
             }
             core_ref.flush_torque_shadow();
+            // Re-validate fresh, mode-verified J1–J6 hold coverage strictly AFTER `drain_from_driver`,
+            // `set_rt_mode(false)`, and `flush_torque_shadow` immediately before `try_commit_handback`
+            // so a mode-switch stall/clock advance cannot commit handback with stale feedback.
+            if !core_is_confirmed_disarmed(core_ref)
+                && (!has_live_receiver || !core_ref.quiesce_motion_and_refresh_hold_for_handback())
+            {
+                return false;
+            }
             core_ref.rt_executor_owned = false;
             core_ref.before_publish_hook = None;
             core_ref.safety.set_off_thread_reclaim(false);
