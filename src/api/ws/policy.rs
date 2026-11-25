@@ -348,7 +348,7 @@ pub(super) fn spawn_policy_start(
             Started {
                 snap: AckSnapshot,
                 action_id: u64,
-                prepared_policy: crate::policy_runtime::PreparedPolicy,
+                prepared_policy: Box<crate::policy_runtime::PreparedPolicy>,
                 fps: f64,
                 deadline: Option<std::time::Instant>,
                 speed: crate::policy_runtime::SpeedGateReport,
@@ -473,7 +473,7 @@ pub(super) fn spawn_policy_start(
                                         PolicyStartOutcome::Started {
                                             snap: AckSnapshot::from_inner(&inner),
                                             action_id,
-                                            prepared_policy,
+                                            prepared_policy: Box::new(prepared_policy),
                                             fps,
                                             deadline,
                                             speed,
@@ -532,7 +532,7 @@ pub(super) fn spawn_policy_start(
                 crate::policy_runtime::spawn_policy_runner(
                     sup.clone(),
                     action_id,
-                    prepared_policy,
+                    *prepared_policy,
                     fps,
                     deadline,
                     vision_source,
