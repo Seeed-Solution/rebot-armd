@@ -91,6 +91,11 @@ struct WallBusState {
     sustained_rx_backlog: bool,
     /// When true, `CMD_DISABLE` transmits fail with `TransportError::WouldBlock`.
     fail_disable_tx: bool,
+    /// One-shot sleep injected inside `receive_timestamped` (testing mid-RX authority expiry
+    /// before retry `CMD_ENABLE` TX inside `poll_torque_budgeted`).
+    rx_delay_once: Duration,
+    /// Timestamps of every `CMD_ENABLE` frame actually transmitted on the bus.
+    enable_tx_instants: Vec<Instant>,
 }
 
 impl WallBusState {
@@ -133,6 +138,8 @@ impl WallClockDelayedBus {
             tx_log: Vec::new(),
             sustained_rx_backlog: false,
             fail_disable_tx: false,
+            rx_delay_once: Duration::ZERO,
+            enable_tx_instants: Vec::new(),
         })))
     }
 
@@ -228,6 +235,7 @@ impl CanTransport for WallClockDelayedBus {
                 return Ok(());
             }
             if frame.data == damiao::CMD_ENABLE {
+                s.enable_tx_instants.push(now);
                 if s.motors[k].drop_enable {
                     return Ok(());
                 }
@@ -301,6 +309,13 @@ impl CanTransport for WallClockDelayedBus {
     }
 
     fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<Instant>), TransportError> {
+        let sleep_once = {
+            let mut s = self.0.lock().unwrap();
+            std::mem::replace(&mut s.rx_delay_once, Duration::ZERO)
+        };
+        if !sleep_once.is_zero() {
+            std::thread::sleep(sleep_once);
+        }
         let now = Instant::now();
         let mut s = self.0.lock().unwrap();
         s.drain_matured(now);
@@ -1033,11 +1048,13 @@ async fn legacy_ws_sustained_rx_backlog_at_50hz_stays_under_2ms() {
         s.motors[2].enable_reply_delay = Duration::from_millis(35);
         s.sustained_rx_backlog = true;
     });
+    let t_before = ticks.load(Ordering::Acquire);
     let ep = sup.get_observation().await.epoch_id;
     sup.inner().set_hold_history_enabled(true);
     let reply = common::rpc(&mut ws, gen, ep, "/api/v1/torque", json!({"enable": true})).await;
     let holds = sup.inner().take_hold_history();
     sup.inner().set_hold_history_enabled(false);
+    let t_after = ticks.load(Ordering::Acquire);
     stop_flag.store(true, Ordering::Relaxed);
 
     // Under continuous RX flood, transition may succeed or fail cleanly (RxDrainTimeout),
@@ -1045,6 +1062,18 @@ async fn legacy_ws_sustained_rx_backlog_at_50hz_stays_under_2ms() {
     assert!(
         reply["type"] == "command_ack" || reply["type"] == "command_reject",
         "{reply}"
+    );
+    assert!(
+        !holds.is_empty(),
+        "hold history must be non-empty during sustained RX backlog test"
+    );
+    assert!(
+        t_after > t_before,
+        "live 50 Hz control loop must have executed ticks during the transition (before={t_before}, after={t_after})"
+    );
+    assert!(
+        holds.iter().any(|h| h.command == Some("/api/v1/torque")),
+        "hold history must include attributed /api/v1/torque guards"
     );
     let max_hold = holds.iter().map(|h| h.hold()).max().unwrap_or(Duration::ZERO);
     assert!(
@@ -1372,5 +1401,491 @@ async fn legacy_ws_torque_off_cannot_clobber_active_protective_disable() {
     assert!(
         inner.disable_pending,
         "protective disable work must remain active and unreplaced"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn legacy_ws_real_socket_deadline_cleans_up_enable_and_detaches_dispatched_disable() {
+    // Subcase 1 (R2 Major 1 + Major 5): Real WebSocket `/api/v1/torque {"enable": true}` over
+    // TCP with a 120 ms deadline override and paused ticker -> serialized JSON `command_reject`
+    // has `code == "DEADLINE_EXPIRED"` AND Damiao's `torque_hs` is cancelled so holds succeed.
+    {
+        let bus = WallClockDelayedBus::new();
+        bus.with(|s| s.push_all_feedback());
+        let mut dm = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(dm_limits())
+            .unwrap();
+        dm.read_joint_states().unwrap();
+        dm.check_mapping_ranges();
+        let sup = Arc::new(
+            ArmSupervisor::new(ArmConfig {
+                lease_timeout_ms: 5_000,
+                ..ArmConfig::rebot_dm()
+            })
+            .with_driver(Box::new(dm)),
+        );
+        sup.set_legacy_torque_deadline_for_test(Some(Duration::from_millis(120)));
+        sup.control_tick(0.02).await;
+
+        let router = create_router(sup.clone(), OperatorAuth::disabled());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let (mut ws, gen) = common::controller(addr).await;
+        // Withhold motor 3 longer than our 120 ms WS deadline, and keep control loop paused.
+        bus.with(|s| s.motors[2].enable_reply_delay = Duration::from_millis(450));
+        let ep = sup.get_observation().await.epoch_id;
+        let reply = common::rpc(&mut ws, gen, ep, "/api/v1/torque", json!({"enable": true})).await;
+
+        assert_eq!(reply["type"], "command_reject", "{reply}");
+        assert_eq!(
+            reply["code"], "DEADLINE_EXPIRED",
+            "real WS socket must serialize DEADLINE_EXPIRED on stalled enable: {reply}"
+        );
+        let mut inner = sup.inner().write().await;
+        assert!(!inner.torque_transition_pending(), "enable transition must be cleaned up");
+        assert!(
+            !inner
+                .driver
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .torque_transition_pending(),
+            "Damiao driver torque_hs must be cancelled on real WS deadline"
+        );
+        inner.tick_control(0.02);
+    }
+
+    // Subcase 2: Real WebSocket `/api/v1/torque {"enable": false}` over TCP with 120 ms deadline
+    // during partially dispatched disable -> JSON `DEADLINE_EXPIRED`, disable stays Detached,
+    // and resuming control ticks completes hardware torque-off.
+    {
+        let bus = WallClockDelayedBus::new();
+        bus.with(|s| s.push_all_feedback());
+        let mut dm = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(dm_limits())
+            .unwrap();
+        dm.read_joint_states().unwrap();
+        dm.check_mapping_ranges();
+        let sup = Arc::new(
+            ArmSupervisor::new(ArmConfig {
+                lease_timeout_ms: 5_000,
+                ..ArmConfig::rebot_dm()
+            })
+            .with_driver(Box::new(dm)),
+        );
+        sup.set_legacy_torque_deadline_for_test(Some(Duration::from_millis(120)));
+        {
+            let mut inner = sup.inner().write().await;
+            let stamp = inner.current_admission_stamp();
+            inner
+                .check_admission(stamp)
+                .and_then(armd::SupervisorInner::enable_torque)
+                .unwrap();
+            for _ in 0..4 {
+                inner.tick_control(0.02);
+            }
+        }
+        let router = create_router(sup.clone(), OperatorAuth::disabled());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let (mut ws, gen) = common::controller(addr).await;
+        bus.with(|s| s.motors[4].disable_reply_delay = Duration::from_millis(260));
+        let ep = sup.get_observation().await.epoch_id;
+        let sup_bg = sup.clone();
+        let tick_helper = tokio::spawn(async move {
+            for _ in 0..4 {
+                tokio::time::sleep(Duration::from_millis(12)).await;
+                sup_bg.control_tick(0.02).await;
+            }
+        });
+        let reply = common::rpc(&mut ws, gen, ep, "/api/v1/torque", json!({"enable": false})).await;
+        let _ = tick_helper.await;
+
+        assert_eq!(reply["type"], "command_reject", "{reply}");
+        assert_eq!(
+            reply["code"], "DEADLINE_EXPIRED",
+            "real WS socket must serialize DEADLINE_EXPIRED on delayed dispatched disable: {reply}"
+        );
+        assert!(
+            sup.inner().read().await.torque_transition_pending(),
+            "dispatched disable must remain active as Detached after real WS deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(220)).await;
+        for _ in 0..10 {
+            sup.control_tick(0.02).await;
+            if !sup.inner().read().await.torque_transition_pending() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let inner = sup.inner().read().await;
+        assert!(!inner.torque_transition_pending());
+        assert!(!inner.is_torqued);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn legacy_ws_damiao_mid_rx_lease_expiry_emits_zero_post_expiry_enable_tx() {
+    // R2 Blocker 1: If the lease expires DURING RX intake inside `poll_torque_budgeted` right
+    // before Damiao's 50 ms retry `send_enable_masked`, the driver's pre-TX `enable_tx_deadline`
+    // fence MUST abort with ZERO post-expiry `CMD_ENABLE` frames transmitted on the bus.
+    let bus = WallClockDelayedBus::new();
+    bus.with(|s| s.push_all_feedback());
+    let mut dm = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(dm_limits())
+        .unwrap();
+    dm.read_joint_states().unwrap();
+    dm.check_mapping_ranges();
+    let sup = Arc::new(
+        ArmSupervisor::new(ArmConfig {
+            lease_timeout_ms: 80,
+            ..ArmConfig::rebot_dm()
+        })
+        .with_driver(Box::new(dm)),
+    );
+    sup.control_tick(0.02).await;
+    let router = create_router(sup.clone(), OperatorAuth::disabled());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    let (mut ws, gen) = common::controller(addr).await;
+    // Capture the exact lease expiry instant from the live owner.
+    let lease_expiry = {
+        let inner = sup.inner().read().await;
+        let lease = inner.active_lease.as_ref().expect("controller holds lease");
+        lease.acquired_at + Duration::from_millis(80)
+    };
+    // Motor 3 drops enable so Damiao arms its 50 ms retry timer.
+    bus.with(|s| {
+        s.motors[2].drop_enable = true;
+        s.enable_tx_instants.clear();
+    });
+    let ep = sup.get_observation().await.epoch_id;
+    common::send(
+        &mut ws,
+        json!({"type": "command", "request_id": 401, "generation": gen, "epoch_id": ep, "path": "/api/v1/torque", "body": {"enable": true}}),
+    )
+    .await;
+
+    // Wait for WS admission to install the pending transition and dispatch the first enable pass.
+    let wait_dl = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < wait_dl {
+        if sup.inner().read().await.torque_transition_pending() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert!(sup.inner().read().await.torque_transition_pending());
+    // Step once immediately so the initial CMD_ENABLE wave goes out while lease is valid.
+    sup.control_tick(0.02).await;
+    assert!(bus.enable_tx_count() > 0, "initial CMD_ENABLE wave must have been sent");
+
+    // Wait until ~55 ms after lease acquisition (past Damiao's 50 ms retry interval, still ~25 ms
+    // before the 80 ms lease expiry), then inject a 40 ms one-shot delay inside `receive_timestamped`
+    // so the lease expires MID-RX right before `send_enable_masked` runs inside `poll_torque_budgeted`!
+    let target_tick_at = lease_expiry.checked_sub(Duration::from_millis(25)).unwrap_or_else(Instant::now);
+    let now = Instant::now();
+    if target_tick_at > now {
+        tokio::time::sleep(target_tick_at - now).await;
+    }
+    bus.with(|s| {
+        s.rx_delay_once = Duration::from_millis(40);
+        s.push_all_feedback();
+    });
+    sup.control_tick(0.02).await;
+
+    let reply = common::next_of(&mut ws, &["command_ack", "command_reject"]).await;
+    assert_eq!(reply["type"], "command_reject", "{reply}");
+    assert!(
+        reply["code"] == "LEASE_LOST" || reply["code"] == "NO_LEASE",
+        "expected LEASE_LOST rejection when lease expired mid-RX: {reply}"
+    );
+    let post_expiry_tx = bus.with(|s| {
+        s.enable_tx_instants
+            .iter()
+            .filter(|&&t| t >= lease_expiry)
+            .count()
+    });
+    assert_eq!(
+        post_expiry_tx, 0,
+        "driver pre-TX authority fence must emit ZERO CMD_ENABLE frames at/after lease expiry"
+    );
+    assert!(
+        !sup.inner().read().await.safety.state().is_operational(),
+        "arm must not enter Armed after mid-RX lease expiry"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn legacy_ws_feetech_budgeted_enable_keeps_guard_holds_under_2ms() {
+    use armd::driver::FeetechArmDriver;
+    use armd::protocol::feetech::{
+        self, calculate_checksum, INST_PING, INST_READ, INST_SYNC_READ, INST_WRITE,
+        REG_TORQUE_ENABLE,
+    };
+    use armd::transport::Transport;
+
+    struct DelayedFeetechState {
+        rx: VecDeque<u8>,
+        torque_ready_at: [Option<Instant>; 8],
+        enable_delay: Duration,
+    }
+
+    #[derive(Clone)]
+    struct DelayedFeetechTransport(Arc<Mutex<DelayedFeetechState>>);
+
+    impl DelayedFeetechTransport {
+        fn new(enable_delay: Duration) -> Self {
+            Self(Arc::new(Mutex::new(DelayedFeetechState {
+                rx: VecDeque::with_capacity(256),
+                torque_ready_at: [None; 8],
+                enable_delay,
+            })))
+        }
+
+        fn push_status(rx: &mut VecDeque<u8>, id: u8, params: &[u8]) {
+            let len = (params.len() + 2) as u8;
+            let cksum = calculate_checksum(id, len, 0, params);
+            rx.push_back(0xFF);
+            rx.push_back(0xFF);
+            rx.push_back(id);
+            rx.push_back(len);
+            rx.push_back(0);
+            for &b in params {
+                rx.push_back(b);
+            }
+            rx.push_back(cksum);
+        }
+    }
+
+    impl Transport for DelayedFeetechTransport {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
+            let mut s = self.0.lock().unwrap();
+            if s.rx.is_empty() {
+                return Err(TransportError::WouldBlock);
+            }
+            let n = buf.len().min(s.rx.len());
+            for slot in buf.iter_mut().take(n) {
+                *slot = s.rx.pop_front().unwrap();
+            }
+            Ok(n)
+        }
+
+        fn write(&mut self, buf: &[u8]) -> Result<usize, TransportError> {
+            let mut s = self.0.lock().unwrap();
+            if buf.len() >= 6 && buf[0] == 0xFF && buf[1] == 0xFF {
+                let id = buf[2];
+                let inst = buf[4];
+                match inst {
+                    INST_PING => {
+                        Self::push_status(&mut s.rx, id, &[]);
+                    }
+                    INST_SYNC_READ => {
+                        // Frame: FF FF FE len 82 start_addr data_len id1 id2 ... cksum
+                        let data_len = buf.get(6).copied().unwrap_or(8) as usize;
+                        let ids = &buf[7..buf.len().saturating_sub(1)];
+                        for &sid in ids {
+                            // 8 bytes: pos=2048 (0x0800), vel=0, load=0, volt=74, temp=25
+                            let mut payload = vec![0u8; data_len];
+                            if data_len >= 2 {
+                                payload[0] = 0x00;
+                                payload[1] = 0x08;
+                            }
+                            if data_len >= 8 {
+                                payload[6] = 74;
+                                payload[7] = 25;
+                            }
+                            Self::push_status(&mut s.rx, sid, &payload);
+                        }
+                    }
+                    INST_WRITE if buf.len() >= 8 && buf[5] == REG_TORQUE_ENABLE => {
+                        let val = buf[6];
+                        let idx = usize::from(id);
+                        if idx < s.torque_ready_at.len() {
+                            if val == 1 {
+                                let now = Instant::now();
+                                s.torque_ready_at[idx] = Some(now + s.enable_delay);
+                            } else {
+                                s.torque_ready_at[idx] = None;
+                            }
+                        }
+                    }
+                    INST_READ if buf.len() >= 8 && buf[5] == REG_TORQUE_ENABLE => {
+                        let idx = usize::from(id);
+                        let ready = s
+                            .torque_ready_at
+                            .get(idx)
+                            .copied()
+                            .flatten()
+                            .is_some_and(|at| Instant::now() >= at);
+                        Self::push_status(&mut s.rx, id, &[u8::from(ready)]);
+                    }
+                    _ => {}
+                }
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn clears_input_buffer(&self) -> bool {
+            true
+        }
+
+        fn clear_input_buffer(&mut self) {
+            self.0.lock().unwrap().rx.clear();
+        }
+    }
+
+    let _ = feetech::REG_PRESENT_POSITION_L;
+    let transport = DelayedFeetechTransport::new(Duration::from_millis(35));
+    let mut driver = FeetechArmDriver::new(transport, vec![1, 2, 3, 4, 5, 6]);
+    driver.read_joint_states().unwrap();
+    assert!(
+        driver.supports_budgeted_enable_await(),
+        "FeetechArmDriver must support budgeted enable await"
+    );
+
+    let cfg = ArmConfig {
+        lease_timeout_ms: 5_000,
+        ..ArmConfig::default()
+    };
+    let sup = Arc::new(ArmSupervisor::new(cfg).with_driver(Box::new(driver)));
+    sup.control_tick(0.02).await;
+
+    let router = create_router(sup.clone(), OperatorAuth::disabled());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let ticks = Arc::new(AtomicU64::new(0));
+    let sup_tick = sup.clone();
+    let stop_tick = stop_flag.clone();
+    let ticks_bg = ticks.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(20));
+        while !stop_tick.load(Ordering::Relaxed) {
+            interval.tick().await;
+            sup_tick.control_tick(0.02).await;
+            ticks_bg.fetch_add(1, Ordering::Release);
+        }
+    });
+
+    let (mut ws, gen) = common::controller(addr).await;
+    let ep = sup.get_observation().await.epoch_id;
+    let t_before = ticks.load(Ordering::Acquire);
+    sup.inner().set_hold_history_enabled(true);
+    let t0 = Instant::now();
+    let ack = common::rpc(&mut ws, gen, ep, "/api/v1/torque", json!({"enable": true})).await;
+    let elapsed = t0.elapsed();
+    let holds = sup.inner().take_hold_history();
+    sup.inner().set_hold_history_enabled(false);
+    let t_after = ticks.load(Ordering::Acquire);
+    stop_flag.store(true, Ordering::Relaxed);
+
+    assert_eq!(ack["type"], "command_ack", "{ack}");
+    assert_eq!(ack["is_torqued"], true, "{ack}");
+    assert!(
+        elapsed >= Duration::from_millis(30),
+        "Feetech enable must wait for 35 ms confirmation (elapsed={elapsed:?})"
+    );
+    assert!(t_after > t_before, "live 50 Hz ticks must advance Feetech budgeted enable");
+    assert!(!holds.is_empty());
+    let max_hold = holds.iter().map(|h| h.hold()).max().unwrap_or(Duration::ZERO);
+    assert!(
+        max_hold <= Duration::from_millis(2),
+        "Feetech budgeted enable must keep EVERY SupervisorLock hold <= 2 ms (got {max_hold:?})"
+    );
+    let tq_on_holds = holds
+        .iter()
+        .filter(|h| h.command == Some("/api/v1/torque") && h.direction == Some("on"))
+        .count();
+    assert!(
+        tq_on_holds >= 2,
+        "Feetech budgeted enable must span >= 2 attributed /api/v1/torque holds (got {tq_on_holds})"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn legacy_ws_disable_transport_error_preserves_clear_fault_rejected_wire_code() {
+    // R2 Major 4: Legacy WS torque-off transport failure must preserve `CLEAR_FAULT_REJECTED`
+    // wire code + driver error detail (matching legacy `disable_torque` wire contract).
+    let bus = WallClockDelayedBus::new();
+    let (addr, sup, stop_flag, ticks) = spawn_legacy_rig(bus.clone(), true).await;
+    let (mut ws, gen) = common::controller(addr).await;
+
+    // Arm cleanly first and let K=3 rest-pose samples accumulate on live 50 Hz ticks.
+    let ep = sup.get_observation().await.epoch_id;
+    let ack = common::rpc(&mut ws, gen, ep, "/api/v1/torque", json!({"enable": true})).await;
+    assert_eq!(ack["type"], "command_ack", "{ack}");
+    let t0 = ticks.load(Ordering::Acquire);
+    while ticks.load(Ordering::Acquire) < t0 + 4 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Inject disable TX failure so CMD_DISABLE fails on transport.
+    bus.with(|s| s.fail_disable_tx = true);
+    let ep = sup.get_observation().await.epoch_id;
+    let reply = common::rpc(&mut ws, gen, ep, "/api/v1/torque", json!({"enable": false})).await;
+    stop_flag.store(true, Ordering::Relaxed);
+
+    assert_eq!(reply["type"], "command_reject", "{reply}");
+    assert_eq!(
+        reply["code"], "CLEAR_FAULT_REJECTED",
+        "legacy WS disable transport failure must map to CLEAR_FAULT_REJECTED: {reply}"
+    );
+    let msg = reply["message"].as_str().unwrap_or("");
+    assert!(
+        !msg.is_empty(),
+        "disable transport failure reply must preserve non-empty driver error detail: {reply}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn legacy_ws_preflight_rejection_still_tags_torque_direction() {
+    // R2 Minor 2: A syntactically valid `{"enable": false}` rejected in preflight (stale epoch)
+    // must still tag its `/api/v1/torque` guard hold with `direction == Some("off")`.
+    let bus = WallClockDelayedBus::new();
+    let (addr, sup, stop_flag, _) = spawn_legacy_rig(bus.clone(), false).await;
+    let (mut ws, gen) = common::controller(addr).await;
+
+    let ep = sup.get_observation().await.epoch_id;
+    sup.inner().set_hold_history_enabled(true);
+    let reply = common::rpc(
+        &mut ws,
+        gen,
+        ep.wrapping_add(999),
+        "/api/v1/torque",
+        json!({"enable": false}),
+    )
+    .await;
+    let holds = sup.inner().take_hold_history();
+    sup.inner().set_hold_history_enabled(false);
+    stop_flag.store(true, Ordering::Relaxed);
+
+    assert_eq!(reply["type"], "command_reject", "{reply}");
+    assert_eq!(reply["code"], "EPOCH_MISMATCH", "{reply}");
+    assert!(
+        holds
+            .iter()
+            .any(|h| h.command == Some("/api/v1/torque") && h.direction == Some("off")),
+        "preflight-rejected valid torque-off must still record direction='off': {holds:?}"
     );
 }

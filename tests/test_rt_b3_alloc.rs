@@ -2099,6 +2099,7 @@ fn arm_driver_error_write_bounded_and_clear_fault_error_cover_all_variants_zero_
             ArmDriverError::MotorHardwareFault { .. } => "MotorHardwareFault",
             ArmDriverError::DisableMitFenceUnconfirmed => "DisableMitFenceUnconfirmed",
             ArmDriverError::LeaseFenced => "LeaseFenced",
+            ArmDriverError::EnableAuthorityExpired => "EnableAuthorityExpired",
         }
     }
 
@@ -2166,6 +2167,7 @@ fn arm_driver_error_write_bounded_and_clear_fault_error_cover_all_variants_zero_
         ArmDriverError::MotorHardwareFault { joint: 2, motor_id: 3, status: 0x08 },
         ArmDriverError::DisableMitFenceUnconfirmed,
         ArmDriverError::LeaseFenced,
+        ArmDriverError::EnableAuthorityExpired,
     ];
     #[cfg(unix)]
     {

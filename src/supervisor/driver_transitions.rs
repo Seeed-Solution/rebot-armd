@@ -679,6 +679,7 @@ pub enum EnableOrigin {
         slot: u8,
         stop_gen: u64,
         prev_torque_intent: TorqueIntent,
+        deadline: Instant,
     },
     /// Enable cancellation retained in the reducer after Stop, timeout, or owner transfer when
     /// `driver.try_lock()` was contended; drains `drv.abort_enable()` with zero enable TX.
@@ -700,6 +701,7 @@ pub enum DisableOrigin {
     LegacyWs {
         token: u64,
         slot: u8,
+        deadline: Instant,
     },
     /// Legacy WS disable whose waiter timed out after disable frames were dispatched or after
     /// upgrading to a protective disable; the control tick completes the hardware disable cleanly.
@@ -721,6 +723,9 @@ pub(crate) enum LegacyTorqueFailure {
         detail: crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>,
         feedback_unavailable: bool,
         estop_interrupted: bool,
+    },
+    DisableFailed {
+        detail: crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>,
     },
     Stopped,
     LeaseLost,
@@ -749,111 +754,168 @@ pub(crate) enum LegacyTorqueOutcome {
     OwnerTransferred,
 }
 
-#[derive(Debug)]
-#[allow(clippy::large_enum_variant)] // preallocated inline slot avoids heap alloc on control release
-enum LegacyTorqueSlotState {
-    Idle,
-    InFlight { token: u64, abandoned: bool },
-    Settled { token: u64, outcome: LegacyTorqueOutcome },
+const SLOT_IDLE: u64 = 0;
+const SLOT_IN_FLIGHT: u64 = 1;
+const SLOT_SETTLED: u64 = 2;
+const SLOT_ABANDONED: u64 = 3;
+const SLOT_STATE_MASK: u64 = 0b11;
+
+#[inline]
+const fn pack_slot(token: u64, state: u64) -> u64 {
+    (token << 2) | (state & SLOT_STATE_MASK)
 }
 
-/// Preallocated per-request completion slot shared between a legacy WS waiter and the control tick.
+/// Preallocated, lock-free per-request completion slot shared between a legacy WS waiter and the
+/// control tick. Packs `(token << 2) | state` into a single `AtomicU64` so token and state always
+/// transition atomically (zero skew/ABA, 0 mutexes, 0 heap allocs/frees on control release).
 pub(crate) struct LegacyTorqueSlot {
-    state: std::sync::Mutex<LegacyTorqueSlotState>,
+    packed: std::sync::atomic::AtomicU64,
+    outcome: std::cell::UnsafeCell<Option<LegacyTorqueOutcome>>,
     notify: tokio::sync::Notify,
 }
+
+// SAFETY: Access to `outcome` is strictly serialized by the single-word atomic state machine:
+// - The owner (serialized by `SupervisorLock::write`) writes `outcome` ONLY while
+//   `packed == pack_slot(token, SLOT_IN_FLIGHT)` and publishes via
+//   `SLOT_IN_FLIGHT -> SLOT_SETTLED` (Release); on concurrent waiter abandon (`Err(SLOT_ABANDONED)`),
+//   the waiter never touches `outcome` and the owner clears it before storing `SLOT_IDLE` (Release).
+// - The single WS waiter owning `token` reads `outcome` ONLY after observing
+//   `packed == pack_slot(token, SLOT_SETTLED)` (Acquire) and releases to `SLOT_IDLE` (Release).
+unsafe impl Sync for LegacyTorqueSlot {}
 
 impl LegacyTorqueSlot {
     pub(crate) fn new() -> Self {
         Self {
-            state: std::sync::Mutex::new(LegacyTorqueSlotState::Idle),
+            packed: std::sync::atomic::AtomicU64::new(SLOT_IDLE),
+            outcome: std::cell::UnsafeCell::new(None),
             notify: tokio::sync::Notify::new(),
         }
     }
 
     pub(crate) fn try_reserve(&self, token: u64) -> bool {
-        let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if matches!(*g, LegacyTorqueSlotState::Idle) {
-            *g = LegacyTorqueSlotState::InFlight { token, abandoned: false };
-            true
-        } else {
-            false
-        }
+        debug_assert!(token != 0 && token < (1u64 << 62));
+        self.packed
+            .compare_exchange(
+                SLOT_IDLE,
+                pack_slot(token, SLOT_IN_FLIGHT),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 
     pub(crate) fn release_unstarted(&self, token: u64) {
-        let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if matches!(*g, LegacyTorqueSlotState::InFlight { token: t, .. } if t == token) {
-            *g = LegacyTorqueSlotState::Idle;
-        }
+        let _ = self
+            .packed
+            .compare_exchange(
+                pack_slot(token, SLOT_IN_FLIGHT),
+                SLOT_IDLE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .or_else(|_| {
+                self.packed.compare_exchange(
+                    pack_slot(token, SLOT_ABANDONED),
+                    SLOT_IDLE,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+            });
     }
 
-    /// Settles an in-flight slot without allocating or freeing on the control release.
+    /// Wait-free settlement on the control release (never blocks on a preempted waiter, 0 allocs).
     /// When the waiter already abandoned the slot, skips invoking `make` and returns the slot to `Idle`.
     pub(crate) fn settle_with(&self, token: u64, make: impl FnOnce() -> LegacyTorqueOutcome) {
-        let should_notify = {
-            let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            match *g {
-                LegacyTorqueSlotState::InFlight { token: t, abandoned: false } if t == token => {
-                    *g = LegacyTorqueSlotState::Settled { token, outcome: make() };
-                    true
-                }
-                LegacyTorqueSlotState::InFlight { token: t, abandoned: true } if t == token => {
-                    *g = LegacyTorqueSlotState::Idle;
-                    false
-                }
-                _ => false,
+        let in_flight = pack_slot(token, SLOT_IN_FLIGHT);
+        let settled = pack_slot(token, SLOT_SETTLED);
+        let abandoned = pack_slot(token, SLOT_ABANDONED);
+        let cur = self.packed.load(Ordering::Acquire);
+        if cur == abandoned {
+            let _ = self
+                .packed
+                .compare_exchange(abandoned, SLOT_IDLE, Ordering::AcqRel, Ordering::Acquire);
+            return;
+        }
+        if cur != in_flight {
+            return;
+        }
+        // SAFETY: owner has exclusive write access to `outcome` while in `SLOT_IN_FLIGHT`.
+        unsafe { *self.outcome.get() = Some(make()) };
+        match self
+            .packed
+            .compare_exchange(in_flight, settled, Ordering::Release, Ordering::Acquire)
+        {
+            Ok(_) => self.notify.notify_one(),
+            Err(v) if v == abandoned => {
+                // Waiter abandoned concurrently; waiter will not read `outcome`.
+                // SAFETY: exclusive ownership stays with owner until `SLOT_IDLE`.
+                unsafe { *self.outcome.get() = None };
+                self.packed.store(SLOT_IDLE, Ordering::Release);
             }
-        };
-        if should_notify {
-            self.notify.notify_one();
+            Err(_) => {}
         }
     }
 
     pub(crate) fn settle_owner_transferred(&self) {
-        let should_notify = {
-            let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            match *g {
-                LegacyTorqueSlotState::InFlight { token, abandoned: false } => {
-                    *g = LegacyTorqueSlotState::Settled {
-                        token,
-                        outcome: LegacyTorqueOutcome::OwnerTransferred,
-                    };
-                    true
-                }
-                LegacyTorqueSlotState::InFlight { abandoned: true, .. } => {
-                    *g = LegacyTorqueSlotState::Idle;
-                    false
-                }
-                _ => false,
+        let cur = self.packed.load(Ordering::Acquire);
+        let st = cur & SLOT_STATE_MASK;
+        let tok_bits = cur & !SLOT_STATE_MASK;
+        match st {
+            SLOT_ABANDONED => {
+                let _ = self
+                    .packed
+                    .compare_exchange(cur, SLOT_IDLE, Ordering::AcqRel, Ordering::Acquire);
             }
-        };
-        if should_notify {
-            self.notify.notify_one();
+            SLOT_IN_FLIGHT => {
+                // SAFETY: owner has exclusive write access to `outcome` while in `SLOT_IN_FLIGHT`.
+                unsafe { *self.outcome.get() = Some(LegacyTorqueOutcome::OwnerTransferred) };
+                match self.packed.compare_exchange(
+                    cur,
+                    tok_bits | SLOT_SETTLED,
+                    Ordering::Release,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => self.notify.notify_one(),
+                    Err(v) if v == (tok_bits | SLOT_ABANDONED) => {
+                        // SAFETY: waiter abandoned concurrently and will not read `outcome`.
+                        unsafe { *self.outcome.get() = None };
+                        self.packed.store(SLOT_IDLE, Ordering::Release);
+                    }
+                    Err(_) => {}
+                }
+            }
+            _ => {}
         }
     }
 
     pub(crate) fn take_settled(&self, token: u64) -> Option<LegacyTorqueOutcome> {
-        let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if matches!(*g, LegacyTorqueSlotState::Settled { token: t, .. } if t == token) {
-            let prev = std::mem::replace(&mut *g, LegacyTorqueSlotState::Idle);
-            if let LegacyTorqueSlotState::Settled { outcome, .. } = prev {
-                return Some(outcome);
-            }
+        if self.packed.load(Ordering::Acquire) == pack_slot(token, SLOT_SETTLED) {
+            // SAFETY: single waiter owning `token` observed `SLOT_SETTLED` with Acquire.
+            let out = unsafe { (*self.outcome.get()).take() };
+            self.packed.store(SLOT_IDLE, Ordering::Release);
+            out
+        } else {
+            None
         }
-        None
     }
 
     pub(crate) fn abandon(&self, token: u64) {
-        let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        match *g {
-            LegacyTorqueSlotState::InFlight { token: t, ref mut abandoned } if t == token => {
-                *abandoned = true;
+        let in_flight = pack_slot(token, SLOT_IN_FLIGHT);
+        let settled = pack_slot(token, SLOT_SETTLED);
+        let abandoned = pack_slot(token, SLOT_ABANDONED);
+        match self
+            .packed
+            .compare_exchange(in_flight, abandoned, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => {}
+            Err(v) if v == settled => {
+                // SAFETY: owner already published `SLOT_SETTLED` and will not touch `outcome`.
+                unsafe {
+                    let _ = (*self.outcome.get()).take();
+                }
+                self.packed.store(SLOT_IDLE, Ordering::Release);
             }
-            LegacyTorqueSlotState::Settled { token: t, .. } if t == token => {
-                *g = LegacyTorqueSlotState::Idle;
-            }
-            _ => {}
+            Err(_) => {}
         }
     }
 
@@ -997,6 +1059,7 @@ fn enable_driver_err_code(e: &crate::driver::ArmDriverError) -> &'static str {
     } else {
         match e {
             E::TorqueOffWouldDrop | E::DisableRequestExpired => "TORQUE_OFF_WOULD_DROP",
+            E::EnableAuthorityExpired => "LEASE_LOST",
             E::Transport(_) => "DRIVER_WRITE_FAILED",
             _ => "ENABLE_FAILED",
         }
@@ -1815,7 +1878,7 @@ impl SupervisorInner {
                                         "Feedback unavailable",
                                     );
                                 }
-                                DisableOrigin::LegacyWs { token, slot } => {
+                                DisableOrigin::LegacyWs { token, slot, .. } => {
                                     self.settle_legacy_ws_failed(
                                         token,
                                         slot,
@@ -1872,8 +1935,13 @@ impl SupervisorInner {
                                         "Torque disable transmission failed",
                                     );
                                 }
-                                DisableOrigin::LegacyWs { token, slot } => {
-                                    self.settle_legacy_ws_disable_failed(token, slot, code);
+                                DisableOrigin::LegacyWs { token, slot, .. } => {
+                                    self.settle_legacy_ws_disable_failed(
+                                        token,
+                                        slot,
+                                        code,
+                                        Some(message),
+                                    );
                                 }
                                 DisableOrigin::Detached => {}
                             }
@@ -1916,10 +1984,12 @@ impl SupervisorInner {
                             DisableOrigin::Park { watchdog, action_id, .. } => {
                                 self.finish_park_disable_after_accepted(watchdog, action_id);
                             }
-                            DisableOrigin::LegacyWs { token, slot } => {
+                            DisableOrigin::LegacyWs { token, slot, .. } => {
                                 match self.torque_off_finish_rt() {
                                     Ok(()) => self.settle_legacy_ws_accepted(token, slot),
-                                    Err(code) => self.settle_legacy_ws_disable_failed(token, slot, code),
+                                    Err(code) => {
+                                        self.settle_legacy_ws_disable_failed(token, slot, code, None)
+                                    }
                                 }
                             }
                             DisableOrigin::Detached => {
@@ -1954,7 +2024,7 @@ impl SupervisorInner {
                                 "Feedback unavailable",
                             );
                         }
-                        DisableOrigin::LegacyWs { token, slot } => {
+                        DisableOrigin::LegacyWs { token, slot, .. } => {
                             self.settle_legacy_ws_failed(
                                 token,
                                 slot,
@@ -2048,8 +2118,13 @@ impl SupervisorInner {
                                             "Torque disable transmission failed",
                                         );
                                     }
-                                    DisableOrigin::LegacyWs { token, slot } => {
-                                        self.settle_legacy_ws_disable_failed(token, slot, code);
+                                    DisableOrigin::LegacyWs { token, slot, .. } => {
+                                        self.settle_legacy_ws_disable_failed(
+                                            token,
+                                            slot,
+                                            code,
+                                            Some(message),
+                                        );
                                     }
                                     DisableOrigin::Detached => {}
                                 }
@@ -2107,8 +2182,13 @@ impl SupervisorInner {
                                         "Torque disable transmission failed",
                                     );
                                 }
-                                DisableOrigin::LegacyWs { token, slot } => {
-                                    self.settle_legacy_ws_disable_failed(token, slot, code);
+                                DisableOrigin::LegacyWs { token, slot, .. } => {
+                                    self.settle_legacy_ws_disable_failed(
+                                        token,
+                                        slot,
+                                        code,
+                                        Some(message),
+                                    );
                                 }
                                 DisableOrigin::Detached => {}
                             }
@@ -2166,8 +2246,13 @@ impl SupervisorInner {
                                 "Torque disable transmission failed",
                             );
                         }
-                        DisableOrigin::LegacyWs { token, slot } => {
-                            self.settle_legacy_ws_disable_failed(token, slot, code);
+                        DisableOrigin::LegacyWs { token, slot, .. } => {
+                            self.settle_legacy_ws_disable_failed(
+                                token,
+                                slot,
+                                code,
+                                Some(message),
+                            );
                         }
                         DisableOrigin::Detached => {}
                     }
@@ -2217,10 +2302,12 @@ impl SupervisorInner {
                 DisableOrigin::Park { watchdog, action_id, .. } => {
                     self.finish_park_disable_after_accepted(watchdog, action_id);
                 }
-                DisableOrigin::LegacyWs { token, slot } => {
+                DisableOrigin::LegacyWs { token, slot, .. } => {
                     match self.torque_off_finish_rt() {
                         Ok(()) => self.settle_legacy_ws_accepted(token, slot),
-                        Err(code) => self.settle_legacy_ws_disable_failed(token, slot, code),
+                        Err(code) => {
+                            self.settle_legacy_ws_disable_failed(token, slot, code, None)
+                        }
                     }
                 }
                 DisableOrigin::Detached => {
@@ -3617,6 +3704,36 @@ impl SupervisorInner {
         self.start_enable_reducer_inner(origin, was_torqued, prev_gripper_cmd, authority, budgeted, false)
     }
 
+    /// Computes the driver-clock authority ceiling (`min(lease_expiry, request_deadline)`) so
+    /// Damiao/Feetech enforce authority immediately before every `CMD_ENABLE` / torque-on frame.
+    fn compute_enable_tx_deadline_for_driver(
+        &self,
+        drv_now: Instant,
+        owner_now: Instant,
+        auth: Option<EnableAuthority>,
+        req_deadline: Option<Instant>,
+    ) -> Option<Instant> {
+        let lease_exp = auth.and_then(|a| {
+            if self.lease_enabled && a.lease_generation != 0 {
+                Some(
+                    self.active_lease
+                        .as_ref()
+                        .filter(|l| l.generation == a.lease_generation)
+                        .map_or(owner_now, |l| l.acquired_at + self.lease_timeout),
+                )
+            } else {
+                None
+            }
+        });
+        let owner_dl = match (lease_exp, req_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }?;
+        Some(drv_now + owner_dl.saturating_duration_since(owner_now))
+    }
+
     fn start_enable_reducer_inner(
         &mut self,
         origin: EnableOrigin,
@@ -3656,6 +3773,17 @@ impl SupervisorInner {
             guard.map(|mut drv| {
                 let enable_fb = drv.capabilities().enable_feedback;
                 let drv_now = drv.clock_now();
+                let req_dl = match origin {
+                    EnableOrigin::LegacyWs { deadline, .. } => Some(deadline),
+                    _ => None,
+                };
+                let tx_dl = self.compute_enable_tx_deadline_for_driver(
+                    drv_now,
+                    Instant::now(),
+                    authority,
+                    req_dl,
+                );
+                drv.set_enable_tx_deadline(tx_dl);
                 let started = if budgeted && retry_unverified_ranges {
                     drv.begin_torque_budgeted_with_range_retry(true, 0)
                 } else if budgeted {
@@ -3869,6 +3997,7 @@ impl SupervisorInner {
             slot,
             stop_gen,
             prev_torque_intent,
+            ..
         } = reducer.origin
         {
             if self.urgent_stop_unapplied() || self.current_stop_gen() != stop_gen {
@@ -3974,6 +4103,21 @@ impl SupervisorInner {
                             let enable_fb = caps.enable_feedback;
                             let temp_fb = caps.temperature_feedback;
                             let drv_now = drv.clock_now();
+                            let owner_now = match reducer.origin {
+                                EnableOrigin::LegacyWs { .. } => Instant::now(),
+                                _ => budget.map_or_else(Instant::now, |b| b.now),
+                            };
+                            let req_dl = match reducer.origin {
+                                EnableOrigin::LegacyWs { deadline, .. } => Some(deadline),
+                                _ => None,
+                            };
+                            let tx_dl = self.compute_enable_tx_deadline_for_driver(
+                                drv_now,
+                                owner_now,
+                                reducer.authority,
+                                req_dl,
+                            );
+                            drv.set_enable_tx_deadline(tx_dl);
                             let (r, rx) = if let Some(b) = budget {
                                 let span = b.deadline.saturating_duration_since(b.now);
                                 let r = if reducer.budgeted {
@@ -4090,7 +4234,20 @@ impl SupervisorInner {
                         )
                     }
                     Err(e) => {
-                        let rt_code = enable_driver_err_code(&e);
+                        let mut rt_code = enable_driver_err_code(&e);
+                        if matches!(e, crate::driver::ArmDriverError::EnableAuthorityExpired) {
+                            if let EnableOrigin::LegacyWs { deadline, .. } = reducer.origin {
+                                let now = Instant::now();
+                                let auth_revoked = reducer
+                                    .authority
+                                    .and_then(|a| self.enable_authority_revoked(a, now));
+                                if let Some(code) = auth_revoked {
+                                    rt_code = code;
+                                } else if now >= deadline {
+                                    rt_code = "DEADLINE_EXPIRED";
+                                }
+                            }
+                        }
                         let estop_interrupted = crate::driver::is_estop_inhibited(&e);
                         let message = self.enter_failed_hold(reducer.was_torqued, |buf| {
                             e.write_bounded(buf);
@@ -4145,8 +4302,20 @@ impl SupervisorInner {
             slot,
             stop_gen,
             prev_torque_intent,
+            deadline,
         } = reducer.origin
         {
+            if Instant::now() >= deadline {
+                let message = self.enter_failed_hold(was_torqued, |buf| {
+                    buf.push_str("enable request deadline expired before validation");
+                });
+                return EnableStepOutcome::Failed {
+                    rt_code: "DEADLINE_EXPIRED",
+                    message,
+                    feedback_unavailable: false,
+                    estop_interrupted: false,
+                };
+            }
             if self.urgent_stop_unapplied() || self.current_stop_gen() != stop_gen {
                 let estop = self.cancel_legacy_enable_on_stop(
                     token,
@@ -4314,8 +4483,20 @@ impl SupervisorInner {
             slot,
             stop_gen,
             prev_torque_intent,
+            deadline,
         } = reducer.origin
         {
+            if Instant::now() >= deadline {
+                let message = self.enter_failed_hold(was_torqued, |buf| {
+                    buf.push_str("enable request deadline expired before arming");
+                });
+                return EnableStepOutcome::Failed {
+                    rt_code: "DEADLINE_EXPIRED",
+                    message,
+                    feedback_unavailable: false,
+                    estop_interrupted: false,
+                };
+            }
             if self.urgent_stop_unapplied() || self.current_stop_gen() != stop_gen {
                 let estop = self.cancel_legacy_enable_on_stop(
                     token,
@@ -4428,8 +4609,20 @@ impl SupervisorInner {
             slot,
             stop_gen,
             prev_torque_intent,
+            deadline,
         } = reducer.origin
         {
+            if Instant::now() >= deadline {
+                let message = self.enter_failed_hold(was_torqued, |buf| {
+                    buf.push_str("enable request deadline expired before validation");
+                });
+                return EnableStepOutcome::Failed {
+                    rt_code: "DEADLINE_EXPIRED",
+                    message,
+                    feedback_unavailable: false,
+                    estop_interrupted: false,
+                };
+            }
             if self.urgent_stop_unapplied() || self.current_stop_gen() != stop_gen {
                 let estop = self.cancel_legacy_enable_on_stop(
                     token,
@@ -5237,7 +5430,13 @@ impl SupervisorInner {
         }
     }
 
-    fn settle_legacy_ws_disable_failed(&mut self, token: u64, slot: u8, code: &'static str) {
+    fn settle_legacy_ws_disable_failed(
+        &mut self,
+        token: u64,
+        slot: u8,
+        code: &'static str,
+        detail: Option<crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>>,
+    ) {
         let failure = match code {
             "TORQUE_OFF_WOULD_DROP" => {
                 let refusal = self
@@ -5253,7 +5452,16 @@ impl SupervisorInner {
             }
             "ESTOP_ACTIVE" => LegacyTorqueFailure::EStopActive,
             "FEEDBACK_UNAVAILABLE" => LegacyTorqueFailure::FeedbackUnavailable,
-            other => LegacyTorqueFailure::StaticCode(other),
+            "DEADLINE_EXPIRED" | "DRIVER_BUSY" | "SUPERSEDED" | "STOPPED" | "MOTION_BUSY" => {
+                LegacyTorqueFailure::StaticCode(code)
+            }
+            _ => {
+                if let Some(detail) = detail {
+                    LegacyTorqueFailure::DisableFailed { detail }
+                } else {
+                    LegacyTorqueFailure::StaticCode(code)
+                }
+            }
         };
         self.settle_legacy_ws_failed(token, slot, failure);
     }
@@ -5413,9 +5621,10 @@ impl SupervisorInner {
     }
 
     /// Starts a bounded, ticked legacy WS torque-enable transition under a short write guard
-    /// without blocking or sleeping on CAN confirmation (consumes A1's [`Admitted`] by value).
+    /// without blocking or sleeping on CAN/serial confirmation (consumes A1's [`Admitted`] by value).
     pub(crate) fn begin_enable_torque_transition_legacy(
         admitted: Admitted<'_>,
+        deadline: Instant,
     ) -> Result<LegacyTorqueStart, SafetyError> {
         let (this, proof) = admitted.consume()?;
         if this.calibration_busy && this.motor_zero_busy {
@@ -5440,12 +5649,15 @@ impl SupervisorInner {
             admitted_epoch: s.estop_epoch,
         };
         let prev_torque_intent = this.torque_intent;
-        let budgeted = this.driver.is_none() || this.driver_supports_rt_executor;
+        let budgeted = this.driver.is_none()
+            || this.driver_supports_rt_executor
+            || this.driver_supports_budgeted_enable_await;
         let origin = EnableOrigin::LegacyWs {
             token,
             slot: slot_idx,
             stop_gen: s.stop_gen,
             prev_torque_intent,
+            deadline,
         };
         match this.start_enable_reducer_inner(
             origin,
@@ -5536,6 +5748,7 @@ impl SupervisorInner {
     /// without blocking on rest-gate probes or disable repeat sleeps. Exempt from `Admitted`.
     pub(crate) fn begin_disable_torque_transition_legacy(
         &mut self,
+        deadline: Instant,
     ) -> Result<LegacyTorqueStart, SafetyError> {
         if self.calibration_busy && self.motor_zero_busy {
             return Err(SafetyError::MotionBusy);
@@ -5693,6 +5906,7 @@ impl SupervisorInner {
                     origin: DisableOrigin::LegacyWs {
                         token,
                         slot: slot_idx,
+                        deadline,
                     },
                     kind: disable_kind,
                 });
@@ -5704,6 +5918,9 @@ impl SupervisorInner {
             }
             Err(e) => {
                 slot.release_unstarted(token);
+                let mut err_detail =
+                    crate::safety::BoundedText::<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>::empty();
+                e.write_bounded(&mut err_detail);
                 let refused = matches!(
                     e,
                     crate::driver::ArmDriverError::TorqueOffWouldDrop
@@ -5737,7 +5954,7 @@ impl SupervisorInner {
                     }
                     "ESTOP_ACTIVE" => LegacyTorqueFailure::EStopActive,
                     "FEEDBACK_UNAVAILABLE" => LegacyTorqueFailure::FeedbackUnavailable,
-                    other => LegacyTorqueFailure::StaticCode(other),
+                    _ => LegacyTorqueFailure::DisableFailed { detail: err_detail },
                 };
                 Ok(LegacyTorqueStart::ImmediateRejected {
                     failure,
@@ -5748,23 +5965,30 @@ impl SupervisorInner {
         }
     }
 
-    /// Resolves a waiter deadline atomically under the owner write guard against any concurrent
-    /// completion. Never cancels a protective disable or an already-dispatched disable.
-    pub(crate) fn timeout_legacy_torque_transition(
+    /// Resolves an expired legacy WS torque transition under the owner write guard.
+    /// - When `settle_slot` is `false` (waiter-driven timeout): checks for an already-settled
+    ///   outcome first, releases the slot, cleans up/detaches the transition, and returns the
+    ///   terminal outcome directly to the waiter.
+    /// - When `settle_slot` is `true` (control-tick authoritative deadline fence): cleans up/detaches
+    ///   the transition and publishes the terminal outcome into the waiter slot so the waiter wakes.
+    fn expire_legacy_torque_transition_inner(
         &mut self,
         token: u64,
         slot_idx: u8,
         enabled: bool,
+        settle_slot: bool,
     ) -> LegacyTorqueOutcome {
-        if let Some(settled) = self
-            .legacy_torque_slots
-            .get(usize::from(slot_idx))
-            .and_then(|s| s.take_settled(token))
-        {
-            return settled;
-        }
-        if let Some(s) = self.legacy_torque_slots.get(usize::from(slot_idx)) {
-            s.release_unstarted(token);
+        if !settle_slot {
+            if let Some(settled) = self
+                .legacy_torque_slots
+                .get(usize::from(slot_idx))
+                .and_then(|s| s.take_settled(token))
+            {
+                return settled;
+            }
+            if let Some(s) = self.legacy_torque_slots.get(usize::from(slot_idx)) {
+                s.release_unstarted(token);
+            }
         }
         if enabled {
             let matches_ours = matches!(
@@ -5824,8 +6048,12 @@ impl SupervisorInner {
                     }
                 }
             }
+            let failure = LegacyTorqueFailure::StaticCode("DEADLINE_EXPIRED");
+            if settle_slot {
+                self.settle_legacy_ws_failed(token, slot_idx, failure);
+            }
             LegacyTorqueOutcome::Failed {
-                failure: LegacyTorqueFailure::StaticCode("DEADLINE_EXPIRED"),
+                failure,
                 epoch_id: self.safety.epoch_id(),
                 safety_state: self.safety.state_arc(),
             }
@@ -5882,12 +6110,26 @@ impl SupervisorInner {
             } else {
                 LegacyTorqueFailure::StaticCode("DEADLINE_EXPIRED")
             };
+            if settle_slot {
+                self.settle_legacy_ws_failed(token, slot_idx, failure);
+            }
             LegacyTorqueOutcome::Failed {
                 failure,
                 epoch_id: self.safety.epoch_id(),
                 safety_state: self.safety.state_arc(),
             }
         }
+    }
+
+    /// Resolves a waiter deadline atomically under the owner write guard against any concurrent
+    /// completion. Never cancels a protective disable or an already-dispatched disable.
+    pub(crate) fn timeout_legacy_torque_transition(
+        &mut self,
+        token: u64,
+        slot_idx: u8,
+        enabled: bool,
+    ) -> LegacyTorqueOutcome {
+        self.expire_legacy_torque_transition_inner(token, slot_idx, enabled, false)
     }
 
     /// Single park terminal torque-off function routed strictly through the torque-off rest-pose
@@ -6374,7 +6616,9 @@ impl SupervisorInner {
             self.last_disable_attempt = None;
             self.background_disable_retry = None;
             if self.torque_off_stopped() {
-                let _ = self.eval_stopped_torque_off();
+                // Non-blocking refresh of refusal details so refusal handling never stalls on a
+                // contended driver mutex under `SupervisorLock::write()` or `armd-control`.
+                let _ = self.eval_stopped_torque_off_nonblocking();
             }
         }
         let already_stopped = self.torque_off_stopped();
@@ -6836,10 +7080,46 @@ impl SupervisorInner {
         use crate::driver::TorqueProgress as Drv;
         use crate::rt_core::ops::TorqueProgress as Rt;
         let t = self.torque_transition.take()?;
-        self.last_tick_torque_direction = Some(match t {
-            TorqueTransition::Enable(_) => "on",
-            TorqueTransition::Disable { .. } => "off",
-        });
+        let ws_origin_dir = match t {
+            TorqueTransition::Enable(EnableReducer {
+                origin: EnableOrigin::LegacyWs { .. } | EnableOrigin::DetachedCancel,
+                ..
+            }) => Some("on"),
+            TorqueTransition::Disable {
+                origin: DisableOrigin::LegacyWs { .. } | DisableOrigin::Detached,
+                ..
+            } => Some("off"),
+            _ => None,
+        };
+        self.last_tick_torque_ws_direction = ws_origin_dir;
+        // Enforce authoritative request deadline BEFORE dispatch, retry, or arming (Major 1).
+        match t {
+            TorqueTransition::Enable(EnableReducer {
+                origin: EnableOrigin::LegacyWs { token, slot, deadline, .. },
+                ..
+            }) if Instant::now() >= deadline => {
+                self.torque_transition = Some(t);
+                let _ = self.expire_legacy_torque_transition_inner(token, slot, true, true);
+                return Some(TransitionPoll {
+                    progress: Err("DEADLINE_EXPIRED"),
+                    rx: None,
+                    broker_owned: false,
+                });
+            }
+            TorqueTransition::Disable {
+                origin: DisableOrigin::LegacyWs { token, slot, deadline },
+                ..
+            } if Instant::now() >= deadline => {
+                self.torque_transition = Some(t);
+                let _ = self.expire_legacy_torque_transition_inner(token, slot, false, true);
+                return Some(TransitionPoll {
+                    progress: Err("DEADLINE_EXPIRED"),
+                    rx: None,
+                    broker_owned: false,
+                });
+            }
+            _ => {}
+        }
         let broker_owned = matches!(
             t,
             TorqueTransition::Enable(EnableReducer { origin: EnableOrigin::BrokerTransition, .. })
@@ -6909,7 +7189,7 @@ impl SupervisorInner {
                                 "Driver missing during park disable",
                             );
                         }
-                        DisableOrigin::LegacyWs { token, slot } => {
+                        DisableOrigin::LegacyWs { token, slot, .. } => {
                             self.settle_legacy_ws_failed(
                                 token,
                                 slot,
@@ -6997,7 +7277,7 @@ impl SupervisorInner {
                                     "Driver unavailable during park disable",
                                 );
                             }
-                            DisableOrigin::LegacyWs { token, slot } => {
+                            DisableOrigin::LegacyWs { token, slot, .. } => {
                                 self.settle_legacy_ws_failed(
                                     token,
                                     slot,
@@ -7037,7 +7317,7 @@ impl SupervisorInner {
                             self.complete_park_disable_accepted(watchdog, action_id);
                             Some(TransitionPoll { progress: Ok(Rt::Done), rx, broker_owned })
                         }
-                        DisableOrigin::LegacyWs { token, slot } => {
+                        DisableOrigin::LegacyWs { token, slot, .. } => {
                             self.disable_accepted();
                             let progress = match self.torque_off_finish_rt() {
                                 Ok(()) => {
@@ -7045,7 +7325,7 @@ impl SupervisorInner {
                                     Ok(Rt::Done)
                                 }
                                 Err(code) => {
-                                    self.settle_legacy_ws_disable_failed(token, slot, code);
+                                    self.settle_legacy_ws_disable_failed(token, slot, code, None);
                                     Err(code)
                                 }
                             };
@@ -7089,7 +7369,7 @@ impl SupervisorInner {
                                         "E-stop inhibited park disable",
                                     );
                                 }
-                                DisableOrigin::LegacyWs { token, slot } => {
+                                DisableOrigin::LegacyWs { token, slot, .. } => {
                                     self.settle_legacy_ws_failed(
                                         token,
                                         slot,
@@ -7117,6 +7397,9 @@ impl SupervisorInner {
                                 ..
                             } if self.client_park_stop_invalidated(expected_stop_gen)
                         );
+                        let mut err_detail =
+                            crate::safety::BoundedText::<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>::empty();
+                        e.write_bounded(&mut err_detail);
                         let (code, text) = if client_park_stopped {
                             self.clear_active_disable_retry_state();
                             let code = self.disable_step_failed_inner(e, false);
@@ -7154,8 +7437,13 @@ impl SupervisorInner {
                             DisableOrigin::Park { watchdog, action_id, .. } => {
                                 self.finish_park_disable_failed(watchdog, action_id, code, text);
                             }
-                            DisableOrigin::LegacyWs { token, slot } => {
-                                self.settle_legacy_ws_disable_failed(token, slot, code);
+                            DisableOrigin::LegacyWs { token, slot, .. } => {
+                                self.settle_legacy_ws_disable_failed(
+                                    token,
+                                    slot,
+                                    code,
+                                    Some(err_detail),
+                                );
                             }
                             DisableOrigin::BrokerTransition | DisableOrigin::Detached => {}
                         }
@@ -9433,7 +9721,12 @@ mod panic_disable_tests {
             let stamp = inner.current_admission_stamp();
             let start = inner
                 .check_admission(stamp)
-                .and_then(SupervisorInner::begin_enable_torque_transition_legacy)
+                .and_then(|a| {
+                    SupervisorInner::begin_enable_torque_transition_legacy(
+                        a,
+                        Instant::now() + Duration::from_secs(5),
+                    )
+                })
                 .expect("start enable");
             let (token, slot_idx, slot) = match start {
                 LegacyTorqueStart::Pending { token, slot_idx, slot } => (token, slot_idx, slot),
@@ -9470,7 +9763,7 @@ mod panic_disable_tests {
             inner.is_torqued = true;
             inner.tick_control(0.02);
             let start = inner
-                .begin_disable_torque_transition_legacy()
+                .begin_disable_torque_transition_legacy(Instant::now() + Duration::from_secs(5))
                 .expect("start disable");
             let (token, slot_idx, _slot) = match start {
                 LegacyTorqueStart::Pending { token, slot_idx, slot } => (token, slot_idx, slot),

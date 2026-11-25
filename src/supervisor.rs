@@ -900,11 +900,17 @@ pub struct SupervisorInner {
     pub(crate) legacy_torque_slots: [Arc<driver_transitions::LegacyTorqueSlot>; driver_transitions::LEGACY_TORQUE_SLOTS],
     /// Immutable driver capability cache captured on [`Self::install_driver`] so capability checks
     /// never lock `self.driver` or mistake mutex contention for missing capability.
+    pub(crate) driver_has_load_feedback: bool,
     pub(crate) driver_supports_rt_executor: bool,
+    pub(crate) driver_supports_budgeted_enable_await: bool,
     pub(crate) driver_supports_budgeted_disable_await: bool,
-    /// Static torque direction (`"on"` / `"off"`) set by [`Self::service_torque_transition`] on
-    /// ticks that serviced a torque handshake step, consumed by `tick_shared` for diagnostics.
-    pub(crate) last_tick_torque_direction: Option<&'static str>,
+    /// True for the duration of a legacy control release servicing an in-flight non-broker torque
+    /// transition so every driver lock acquisition (`lock_driver_for_tick`) stays non-blocking.
+    pub(crate) nonblocking_driver_release: bool,
+    /// Static torque direction (`"on"` / `"off"`) set by [`Self::service_torque_transition`] ONLY
+    /// on ticks that serviced a legacy WS torque handshake step (not Park / BrokerTransition),
+    /// consumed by `tick_shared` for `/api/v1/torque` diagnostics attribution.
+    pub(crate) last_tick_torque_ws_direction: Option<&'static str>,
     /// Persistent enable-lifecycle state owned by the single enable transition reducer.
     pub(crate) enable_lifecycle: driver_transitions::EnableLifecycle,
     /// Owner-owned torque decision state (`On` by default on hardware until an accepted disable
@@ -2173,9 +2179,12 @@ impl SupervisorInner {
             torque_transition: None,
             legacy_torque_seq: 0,
             legacy_torque_slots: std::array::from_fn(|_| Arc::new(driver_transitions::LegacyTorqueSlot::new())),
+            driver_has_load_feedback: false,
             driver_supports_rt_executor: false,
+            driver_supports_budgeted_enable_await: false,
             driver_supports_budgeted_disable_await: false,
-            last_tick_torque_direction: None,
+            nonblocking_driver_release: false,
+            last_tick_torque_ws_direction: None,
             enable_lifecycle: driver_transitions::EnableLifecycle::Disarmed,
             torque_intent: driver_transitions::TorqueIntent::Off,
             control_release_seq: 0,
@@ -3269,7 +3278,7 @@ impl SupervisorInner {
     pub fn schema(&self) -> ObservationSchema {
         let mut schema = ObservationSchema::from_config(&self.config);
         schema.capabilities.gravity_comp = self.gravity_comp_support().is_ok();
-        let torque_feedback = self.lock_driver_for_tick().is_some_and(|drv| drv.capabilities().torque_feedback);
+        let torque_feedback = self.driver.is_some() && self.driver_has_torque_feedback;
         schema.capabilities.collision_guard &= torque_feedback;
         schema.capabilities.torque_guard &= torque_feedback;
         schema.capabilities.power_budget &= torque_feedback;
@@ -5915,8 +5924,11 @@ impl SupervisorInner {
         driver.set_external_pos_force_emitter(true);
         driver.set_stopped_disable_gate(self.stopped_disable_gate());
         self.driver_clock = driver.driver_clock();
-        self.driver_has_torque_feedback = driver.capabilities().torque_feedback;
+        let caps = driver.capabilities();
+        self.driver_has_torque_feedback = caps.torque_feedback;
+        self.driver_has_load_feedback = caps.load_feedback;
         self.driver_supports_rt_executor = driver.supports_rt_executor().is_ok();
+        self.driver_supports_budgeted_enable_await = driver.supports_budgeted_enable_await();
         self.driver_supports_budgeted_disable_await = driver.supports_budgeted_disable_await();
         if let Some(pf) = self
             .config
@@ -7706,13 +7718,15 @@ impl SupervisorInner {
         self.tick_control_inner(dt, None, now_fn)
     }
 
-    /// Non-blocking `try_lock` on `armd-control` (`rt_executor_owned == true`); blocking `lock` on legacy.
+    /// Non-blocking `try_lock` on `armd-control` (`rt_executor_owned == true`) or during a legacy
+    /// control release servicing an in-flight torque transition (`nonblocking_driver_release`);
+    /// blocking `lock` on ordinary legacy releases.
     #[inline]
     pub(crate) fn lock_driver_for_tick(
         &self,
     ) -> Option<std::sync::MutexGuard<'_, Box<dyn ArmDriver>>> {
         let d = self.driver.as_ref()?;
-        if self.rt_executor_owned {
+        if self.rt_executor_owned || self.nonblocking_driver_release {
             d.try_lock().ok()
         } else {
             d.lock().ok()
@@ -7800,14 +7814,11 @@ impl SupervisorInner {
         const LEGACY_TORQUE_STEP_BUDGET: Duration = Duration::from_millis(1);
         let has_legacy_transition =
             !self.pending_rx_poll.active && self.has_non_broker_torque_transition();
+        self.nonblocking_driver_release = has_legacy_transition;
         let legacy_step_start = has_legacy_transition.then(Instant::now);
         let legacy_step_deadline = legacy_step_start.map(|t| t + LEGACY_TORQUE_STEP_BUDGET);
         let applied_rx_tx_cap = if !self.pending_rx_poll.active {
-            let guard = if has_legacy_transition {
-                self.driver.as_ref().and_then(|d| d.try_lock().ok())
-            } else {
-                self.lock_driver_for_tick()
-            };
+            let guard = self.lock_driver_for_tick();
             if let Some(mut drv) = guard {
                 let drv_now = drv.clock_now();
                 let mut cap = match release_deadline {
@@ -8581,7 +8592,7 @@ impl SupervisorInner {
             Some(tau) => { self.gravity_torques.clear(); self.gravity_torques.extend_from_slice(&tau[..arm_dof]); }
             None => self.gravity_torques.clear(),
         }
-        let torque_feedback = self.lock_driver_for_tick().is_some_and(|drv| drv.capabilities().torque_feedback);
+        let torque_feedback = self.driver.is_some() && self.driver_has_torque_feedback;
         self.collision.torque_feedback = torque_feedback;
         // Residuals and the collision guard are per joint of a 6-joint arm.
         self.residual_torques = model_gravity.filter(|_| arm_dof == 6 && torque_feedback && self.feedback_numeric_valid && self.torques.len() >= 6)
@@ -8624,8 +8635,9 @@ impl SupervisorInner {
         if self.is_torqued {
             if let Some(ref d) = self.driver {
                 let guard = if self.rt_executor_owned
+                    || self.nonblocking_driver_release
                     || self.has_non_broker_torque_transition()
-                    || self.last_tick_torque_direction.is_some()
+                    || self.last_tick_torque_ws_direction.is_some()
                 {
                     d.try_lock().ok()
                 } else {
@@ -8897,12 +8909,7 @@ impl SupervisorInner {
         let mut step_buf = std::mem::take(&mut self.scratch.step_out);
         let time_scale = self.motion_time_scale();
         let (torque_feedback, load_feedback) = if self.driver.is_some() {
-            if let Some(driver) = self.lock_driver_for_tick() {
-                let caps = driver.capabilities();
-                (caps.torque_feedback, caps.load_feedback)
-            } else {
-                (false, false)
-            }
+            (self.driver_has_torque_feedback, self.driver_has_load_feedback)
         } else {
             (true, false) // Default in simulation / without physical driver
         };
@@ -10264,6 +10271,7 @@ impl SupervisorInner {
                 drv.set_tx_release_deadline(None);
             }
         }
+        self.nonblocking_driver_release = false;
 
         timestamp
     }
@@ -10725,6 +10733,8 @@ pub struct ArmSupervisor {
     /// Off-RT sidecar store of `calib_hover` jobs when `OWNER_EXECUTOR` is active (never touched
     /// by `armd-control`; bounded to `calib_hover::KEEP_JOBS`).
     executor_hover_jobs: std::sync::Mutex<Vec<crate::calib_hover::HoverJob>>,
+    /// Test-only override for legacy WS `/api/v1/torque` request deadline in ms (0 = default).
+    legacy_torque_deadline_override_ms: AtomicU64,
 }
 
 static NEXT_WS_CONN_ID: AtomicU64 = AtomicU64::new(1);
@@ -11089,7 +11099,16 @@ impl ArmSupervisor {
             instance_id,
             watchdog_park_planning: Arc::new(AtomicBool::new(false)),
             executor_hover_jobs: std::sync::Mutex::new(Vec::new()),
+            legacy_torque_deadline_override_ms: AtomicU64::new(0),
         }
+    }
+
+    /// Test-only override for legacy WS `/api/v1/torque` request deadline (0 / `None` = default 5 s).
+    #[doc(hidden)]
+    pub fn set_legacy_torque_deadline_for_test(&self, deadline: Option<Duration>) {
+        let ms = deadline.map_or(0, |d| d.as_millis().clamp(1, u128::from(u64::MAX)) as u64);
+        self.legacy_torque_deadline_override_ms
+            .store(ms, Ordering::Release);
     }
 
     /// Owner-aware storage of a `measure_multiview` measurement payload for action `id`.
@@ -13343,6 +13362,12 @@ impl ArmSupervisor {
         operator: crate::auth::OperatorGrant,
         stamp: AdmissionStamp,
     ) -> Result<crate::rt_core::requests::lease::TorqueWsOutcome, ArmError> {
+        let override_ms = self.legacy_torque_deadline_override_ms.load(Ordering::Acquire);
+        let request_deadline = if override_ms > 0 {
+            Duration::from_millis(override_ms)
+        } else {
+            crate::rt_core::requests::lease::DEFAULT_LEASE_REQUEST_DEADLINE
+        };
         self.torque_ws_with_deadline(
             conn,
             local_generation,
@@ -13353,7 +13378,7 @@ impl ArmSupervisor {
             auth_policy,
             operator,
             stamp,
-            crate::rt_core::requests::lease::DEFAULT_LEASE_REQUEST_DEADLINE,
+            request_deadline,
         )
         .await
     }
@@ -13472,6 +13497,20 @@ impl ArmSupervisor {
                                 epoch_id,
                             }
                         }
+                        LegacyTorqueFailure::DisableFailed { detail } => {
+                            // Preserve exact legacy WS wire mapping (`SafetyError::ClearFaultRejected`
+                            // -> `CLEAR_FAULT_REJECTED` with `safety_state: "Fault"`), while Safety
+                            // still latches `FaultCode::DriverWriteFailed` internally.
+                            let msg = if detail.as_str().is_empty() {
+                                "Torque disable transmission failed".to_string()
+                            } else {
+                                detail.as_str().to_string()
+                            };
+                            TorqueWsOutcome::Rejected {
+                                error: ArmError::Safety(SafetyError::ClearFaultRejected(msg)).into(),
+                                epoch_id,
+                            }
+                        }
                         LegacyTorqueFailure::Stopped => TorqueWsOutcome::Rejected {
                             error: ArmError::Safety(SafetyError::Stopped).into(),
                             epoch_id,
@@ -13499,6 +13538,9 @@ impl ArmSupervisor {
                     let mut inner = self.inner.write().await;
                     let io_scope = crate::diagnostics::tick::HoldIoScope::enter();
                     inner.set_command("/api/v1/torque");
+                    if let Ok(en) = enable {
+                        inner.set_direction(if en { "on" } else { "off" });
+                    }
                     if let Err(e) = self.check_legacy_under_guard(&inner) {
                         inner.set_io_timing(io_scope.finish());
                         return Err(e);
@@ -13518,7 +13560,6 @@ impl ArmSupervisor {
                         return Ok(map_preflight_err(err));
                     }
                     let enabled = prep_ws.enable.expect("checked by check_torque_owner_preflight");
-                    inner.set_direction(if enabled { "on" } else { "off" });
                     let joint_names = if !enabled {
                         inner.config.joint_names.clone()
                     } else {
@@ -13529,11 +13570,13 @@ impl ArmSupervisor {
                     let res = if enabled {
                         inner
                             .check_admission(prep_ws.stamp)
-                            .and_then(SupervisorInner::begin_enable_torque_transition_legacy)
+                            .and_then(|a| {
+                                SupervisorInner::begin_enable_torque_transition_legacy(a, deadline)
+                            })
                             .map_err(ArmError::from)
                     } else {
                         inner
-                            .begin_disable_torque_transition_legacy()
+                            .begin_disable_torque_transition_legacy(deadline)
                             .map_err(ArmError::from)
                     };
                     let epoch_id = inner.safety.epoch_id();
@@ -13645,20 +13688,41 @@ impl ArmSupervisor {
                         if cur_tick_seq != last_tick_seq {
                             last_tick_seq = cur_tick_seq;
                         } else if Instant::now() < deadline {
-                            let mut inner = self.inner.write().await;
-                            let io_scope = crate::diagnostics::tick::HoldIoScope::enter();
-                            inner.set_command("/api/v1/torque");
-                            inner.set_direction(if enabled { "on" } else { "off" });
-                            if !inner.detached && inner.has_legacy_torque_transition_token(token) {
+                            let expired_out = {
+                                let mut inner = self.inner.write().await;
+                                let io_scope = crate::diagnostics::tick::HoldIoScope::enter();
+                                inner.set_command("/api/v1/torque");
+                                inner.set_direction(if enabled { "on" } else { "off" });
                                 let step_now = Instant::now();
-                                let budget = crate::rt_core::ops::ServiceBudget {
-                                    now: step_now,
-                                    deadline: step_now + FALLBACK_STEP_BUDGET,
-                                    max_rx_frames: crate::rt_core::ops::RX_FRAME_BUDGET,
+                                let out = if step_now >= deadline {
+                                    Some(if inner.detached {
+                                        slot.take_settled(token)
+                                            .unwrap_or(LegacyTorqueOutcome::OwnerTransferred)
+                                    } else {
+                                        inner.timeout_legacy_torque_transition(
+                                            token, slot_idx, enabled,
+                                        )
+                                    })
+                                } else {
+                                    if !inner.detached
+                                        && inner.has_legacy_torque_transition_token(token)
+                                    {
+                                        let budget = crate::rt_core::ops::ServiceBudget {
+                                            now: step_now,
+                                            deadline: step_now + FALLBACK_STEP_BUDGET,
+                                            max_rx_frames: crate::rt_core::ops::RX_FRAME_BUDGET,
+                                        };
+                                        let _ = inner.service_torque_transition(&budget);
+                                    }
+                                    None
                                 };
-                                let _ = inner.service_torque_transition(&budget);
+                                inner.set_io_timing(io_scope.finish());
+                                out
+                            };
+                            if let Some(done) = expired_out {
+                                slot_guard.consumed = true;
+                                break done;
                             }
-                            inner.set_io_timing(io_scope.finish());
                             last_tick_seq = tick_seq_counter.load(Ordering::Acquire);
                         }
                     }
@@ -14687,7 +14751,7 @@ impl ArmSupervisor {
             inner.defer_zero_check_persist = true;
             inner.defer_watchdog_park_plan = true;
             inner.tick_phases_us = [0; 5];
-            inner.last_tick_torque_direction = None;
+            inner.last_tick_torque_ws_direction = None;
             let io_scope = crate::diagnostics::tick::HoldIoScope::enter();
             let body_start = Instant::now();
             inner.tick_phase_mark = Some(body_start);
@@ -14702,7 +14766,7 @@ impl ArmSupervisor {
                 Some(release_deadline),
             );
             let tick_io = io_scope.finish();
-            let tick_tq_dir = inner.last_tick_torque_direction.take();
+            let tick_tq_dir = inner.last_tick_torque_ws_direction.take();
             let body_end = body_end.unwrap_or(body_start);
             let phases = inner.tick_phases_us;
             inner.defer_zero_check_persist = false;
@@ -14727,17 +14791,17 @@ impl ArmSupervisor {
         };
         let released = Instant::now();
         let usage_released = UsageMark::now();
-        if let Some(dir) = tick_tq_dir {
-            self.inner.record_tick_hold_for_history(
-                std::panic::Location::caller(),
-                Some("/api/v1/torque"),
-                Some(dir),
-                Some(tick_io),
-                started,
-                locked,
-                released,
-            );
-        }
+        // Record EVERY control-tick guard into opt-in test history (single Relaxed load when
+        // disabled) so slow non-torque ticks are never hidden from lock-proof assertions.
+        self.inner.record_tick_hold_for_history(
+            std::panic::Location::caller(),
+            tick_tq_dir.map(|_| "/api/v1/torque"),
+            tick_tq_dir,
+            tick_tq_dir.map(|_| tick_io),
+            started,
+            locked,
+            released,
+        );
         if let Some(ref tobs) = terminal_obs {
             self.terminals.record_from_observation(tobs);
             if self.terminals.has_pending() {

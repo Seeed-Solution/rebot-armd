@@ -277,4 +277,21 @@ impl SupervisorInner {
             }
         }
     }
+
+    /// Non-blocking [`Self::eval_stopped_torque_off`] using `driver.try_lock()`: never stalls on a
+    /// contended driver mutex; preserves prior `last_stopped_torque_off_refusal` on `Err(())`.
+    pub(crate) fn eval_stopped_torque_off_nonblocking(
+        &mut self,
+    ) -> Result<Result<(), StoppedTorqueOffRefusal>, ()> {
+        match self.may_disable_torque_while_stopped_nonblocking()? {
+            Ok(()) => {
+                self.last_stopped_torque_off_refusal = None;
+                Ok(Ok(()))
+            }
+            Err(r) => {
+                self.last_stopped_torque_off_refusal = Some(r);
+                Ok(Err(r))
+            }
+        }
+    }
 }

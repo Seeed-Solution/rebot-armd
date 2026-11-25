@@ -281,6 +281,9 @@ pub enum ArmDriverError {
 
     #[error("Hardware fault: Disable failed to complete; the MIT fence stays")]
     DisableMitFenceUnconfirmed,
+
+    #[error("Enable authority expired before hardware transmit")]
+    EnableAuthorityExpired,
 }
 
 /// Maximum feedback age accepted at the transmit choke point for proving the arm is at
@@ -1061,6 +1064,17 @@ pub trait ArmDriver: Send {
     fn supports_budgeted_disable_await(&self) -> bool {
         false
     }
+
+    /// True when `begin_torque_budgeted(true, _)` + `poll_torque_budgeted` advance torque-on
+    /// in bounded per-tick steps without synchronous sleeps or blocking serial/bus loops.
+    fn supports_budgeted_enable_await(&self) -> bool {
+        false
+    }
+
+    /// Installs or clears an absolute driver-clock authority ceiling (`min(lease_expiry, request_deadline)`)
+    /// checked immediately before transmitting every `CMD_ENABLE` / torque-on frame so expired
+    /// authority can never emit an unauthorized enable after mid-poll RX.
+    fn set_enable_tx_deadline(&mut self, _deadline: Option<Instant>) {}
 
     /// Notify the driver that a new control release (`release_seq`) has begun.
     /// Once invoked by the owner, rest-pose K=3 ticks count distinct `release_seq` values
@@ -1911,6 +1925,17 @@ struct PendingFeetechDisable {
     client_park: Option<(Option<u64>, Option<u64>)>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PendingFeetechEnable {
+    started_at: Instant,
+    next_write: usize,
+    next_read: usize,
+    confirmed: usize,
+    start_stamp: (u64, u64),
+    had_write_err: bool,
+    first_error: Option<&'static str>,
+}
+
 pub struct FeetechArmDriver<T: Transport> {
     transport: T,
     clock: Option<Arc<dyn crate::transport::DriverClock>>,
@@ -1974,6 +1999,10 @@ pub struct FeetechArmDriver<T: Transport> {
     /// Pending stopped disable awaiting rest-pose K=3 confirmation or poisoned-line drain within
     /// the single 1 s request lifetime (0 torque-off packets transmitted while pending).
     pending_disable: Option<PendingFeetechDisable>,
+    /// Pending budgeted torque-on advancing one servo write / confirmation read per bounded tick.
+    pending_enable: Option<PendingFeetechEnable>,
+    /// Optional absolute driver-clock authority ceiling enforced before every Feetech enable write.
+    enable_tx_deadline: Option<Instant>,
     /// Bitmask of 0-based servo indices that have already received `TORQUE_ENABLE = 0` in an
     /// active/partial disable sequence (R12 B3). Cleared on full completion or `set_torque(true)`.
     disable_dispatched_mask: u64,
@@ -2052,6 +2081,8 @@ impl<T: Transport> FeetechArmDriver<T> {
             control_release_managed: false,
             last_read_release_id: 0,
             pending_disable: None,
+            pending_enable: None,
+            enable_tx_deadline: None,
             disable_dispatched_mask: 0,
             last_motion_write_at: vec![None; dof],
             last_poll_rx: None,
@@ -4413,6 +4444,155 @@ impl<T: Transport> FeetechArmDriver<T> {
 
     /// Shared zero-allocation disable poll step for `poll_torque` and `poll_torque_budgeted`
     /// honouring both `deadline` and `max_rx_frames` (R12 B1/M1/M3).
+    fn poll_enable_step(
+        &mut self,
+        deadline: Instant,
+        max_rx_frames: u16,
+    ) -> Result<TorqueProgress, ArmDriverError> {
+        self.assert_clock_matches_transport();
+        let Some(mut pe) = self.pending_enable.take() else {
+            return Err(ArmDriverError::ProtocolStatic("NO_TORQUE_TRANSITION_PENDING"));
+        };
+        if let Err(e) = self.strict_stop_check(Some(pe.start_stamp)) {
+            self.enable_tx_deadline = None;
+            return Err(e);
+        }
+        if self.enable_tx_deadline.is_some_and(|dl| self.clock_now() >= dl) {
+            self.enable_tx_deadline = None;
+            return Err(ArmDriverError::EnableAuthorityExpired);
+        }
+        let n = self.servo_ids.len();
+        let mut rx_budget = max_rx_frames.max(1);
+        let start_rx = rx_budget;
+
+        // Phase 1: send TORQUE_ENABLE = 1 one servo at a time within `deadline` (zero blocking).
+        const FEETECH_ENABLE_TOTAL_TIMEOUT: Duration = Duration::from_millis(500);
+        while pe.next_write < n {
+            if self.clock_now() >= deadline && pe.next_write > 0 {
+                self.pending_enable = Some(pe);
+                self.last_poll_rx = Some((start_rx.saturating_sub(rx_budget), false));
+                return Ok(TorqueProgress::Pending { wake: self.clock_now() });
+            }
+            if let Err(e) = self.strict_stop_check(Some(pe.start_stamp)) {
+                self.enable_tx_deadline = None;
+                return Err(e);
+            }
+            if self.enable_tx_deadline.is_some_and(|dl| self.clock_now() >= dl) {
+                self.enable_tx_deadline = None;
+                return Err(ArmDriverError::EnableAuthorityExpired);
+            }
+            if !self.poll_poisoned_line_idle() {
+                if self.clock_now().saturating_duration_since(pe.started_at)
+                    < FEETECH_ENABLE_TOTAL_TIMEOUT
+                {
+                    self.pending_enable = Some(pe);
+                    self.last_poll_rx = Some((start_rx.saturating_sub(rx_budget), false));
+                    return Ok(TorqueProgress::Pending { wake: self.clock_now() });
+                }
+                pe.had_write_err = true;
+                pe.first_error.get_or_insert("FEETECH_LINE_BUSY");
+                break;
+            }
+            let id = self.servo_ids[pe.next_write];
+            let write_res = (|| -> Result<(), ArmDriverError> {
+                self.invalidate_partial_pos_rx();
+                self.transport.clear_input_buffer();
+                self.clear_rx();
+                let pkt = feetech::build_set_torque(id, true);
+                self.transport.write_all(&pkt)?;
+                self.torque_enable_commanded = true;
+                self.strict_stop_check(Some(pe.start_stamp))?;
+                self.transport.flush()?;
+                let _ = self.drain_tx_echo_until(&pkt, Some(deadline))?;
+                Ok(())
+            })();
+            pe.next_write += 1;
+            if let Err(e) = write_res {
+                if is_estop_inhibited(&e) {
+                    self.enable_tx_deadline = None;
+                    return Err(e);
+                }
+                pe.had_write_err = true;
+                break;
+            }
+            // Yield after one servo if budget is tight so guard hold stays bounded.
+            if self.clock_now() >= deadline && pe.next_write < n {
+                self.pending_enable = Some(pe);
+                self.last_poll_rx = Some((start_rx.saturating_sub(rx_budget), false));
+                return Ok(TorqueProgress::Pending { wake: self.clock_now() });
+            }
+        }
+
+        // Phase 2: causal TORQUE_ENABLE confirmation readback within `deadline`.
+        while pe.next_read < n {
+            if rx_budget == 0 || self.clock_now() >= deadline {
+                self.pending_enable = Some(pe);
+                self.last_poll_rx = Some((start_rx.saturating_sub(rx_budget), rx_budget == 0));
+                return Ok(TorqueProgress::Pending { wake: self.clock_now() });
+            }
+            if let Err(e) = self.strict_stop_check(Some(pe.start_stamp)) {
+                self.enable_tx_deadline = None;
+                return Err(e);
+            }
+            let idx = pe.next_read;
+            let id = self.servo_ids[idx];
+            let within_total =
+                self.clock_now().saturating_duration_since(pe.started_at)
+                    < FEETECH_ENABLE_TOTAL_TIMEOUT;
+            match self.read_torque_enable_causal_budgeted(idx, id, Some(deadline), &mut rx_budget) {
+                Ok((1, rx_at)) => {
+                    self.record_reported_enable(idx, 1, rx_at);
+                    pe.confirmed += 1;
+                    pe.next_read += 1;
+                }
+                Ok((0, rx_at)) => {
+                    self.record_reported_enable(idx, 0, rx_at);
+                    if within_total {
+                        self.pending_enable = Some(pe);
+                        self.last_poll_rx = Some((start_rx.saturating_sub(rx_budget), false));
+                        return Ok(TorqueProgress::Pending { wake: self.clock_now() });
+                    }
+                    pe.next_read += 1;
+                }
+                Ok((_, _)) => {
+                    pe.next_read += 1;
+                }
+                Err(e) => {
+                    if is_estop_inhibited(&e) {
+                        self.enable_tx_deadline = None;
+                        return Err(e);
+                    }
+                    let budget_retryable = matches!(
+                        e,
+                        ArmDriverError::Timeout(_)
+                            | ArmDriverError::ProtocolStatic("FEETECH_LINE_BUSY")
+                    );
+                    if budget_retryable && within_total {
+                        self.pending_enable = Some(pe);
+                        self.last_poll_rx =
+                            Some((start_rx.saturating_sub(rx_budget), rx_budget == 0));
+                        return Ok(TorqueProgress::Pending { wake: self.clock_now() });
+                    }
+                    if pe.first_error.is_none() {
+                        pe.first_error = Some("FEETECH_ENABLE_READ_FAILED");
+                    }
+                    pe.next_read += 1;
+                }
+            }
+        }
+
+        self.last_poll_rx = Some((start_rx.saturating_sub(rx_budget), false));
+        self.enable_tx_deadline = None;
+        if !pe.had_write_err && pe.confirmed == n {
+            self.last_enable_poll = Some(self.clock_now());
+            Ok(TorqueProgress::Done(TorqueOutcome::Confirmed))
+        } else {
+            Err(ArmDriverError::ProtocolStatic(
+                pe.first_error.unwrap_or("FEETECH_ENABLE_UNCONFIRMED"),
+            ))
+        }
+    }
+
     fn poll_disable_step(
         &mut self,
         deadline: Instant,
@@ -4834,6 +5014,14 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         true
     }
 
+    fn supports_budgeted_enable_await(&self) -> bool {
+        true
+    }
+
+    fn set_enable_tx_deadline(&mut self, deadline: Option<Instant>) {
+        self.enable_tx_deadline = deadline;
+    }
+
     fn begin_control_release(&mut self, release_seq: u64) {
         self.control_release_managed = true;
         self.control_release_id = release_seq;
@@ -4989,15 +5177,49 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         Some(())
     }
 
-    fn begin_torque_budgeted(&mut self, _enabled: bool, _max_rx_frames: u16) -> Result<TorqueProgress, ArmDriverError> {
-        Err(ArmDriverError::ProtocolStatic("UNSUPPORTED: serial driver does not support budgeted torque transitions"))
+    fn begin_torque_budgeted(&mut self, enabled: bool, _max_rx_frames: u16) -> Result<TorqueProgress, ArmDriverError> {
+        if !enabled {
+            let started_at = self.clock_now();
+            return self.begin_disable_torque_budgeted(
+                DisableKind::DisableRequested { started_at },
+                _max_rx_frames,
+            );
+        }
+        self.assert_clock_matches_transport();
+        if self.pending_disable.is_some() || self.pending_enable.is_some() {
+            return Err(ArmDriverError::ProtocolStatic("a torque transition is pending"));
+        }
+        let start_stamp = self.current_stop_stamp();
+        self.strict_stop_check(Some(start_stamp))?;
+        if self.enable_tx_deadline.is_some_and(|dl| self.clock_now() >= dl) {
+            self.enable_tx_deadline = None;
+            return Err(ArmDriverError::EnableAuthorityExpired);
+        }
+        self.disable_dispatched_mask = 0;
+        let started_at = self.clock_now();
+        self.pending_enable = Some(PendingFeetechEnable {
+            started_at,
+            next_write: 0,
+            next_read: 0,
+            confirmed: 0,
+            start_stamp,
+            had_write_err: false,
+            first_error: None,
+        });
+        Ok(TorqueProgress::Pending { wake: started_at })
     }
 
     fn poll_torque(&mut self, deadline: Instant) -> Result<TorqueProgress, ArmDriverError> {
+        if self.pending_enable.is_some() {
+            return self.poll_enable_step(deadline, u16::MAX);
+        }
         self.poll_disable_step(deadline, u16::MAX)
     }
 
     fn poll_torque_budgeted(&mut self, deadline: Instant, max_rx_frames: u16) -> Result<TorqueProgress, ArmDriverError> {
+        if self.pending_enable.is_some() {
+            return self.poll_enable_step(deadline, max_rx_frames);
+        }
         if self.pending_disable.is_some() {
             return self.poll_disable_step(deadline, max_rx_frames);
         }
@@ -5009,7 +5231,18 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
     }
 
     fn torque_transition_pending(&self) -> bool {
-        self.pending_disable.is_some()
+        self.pending_disable.is_some() || self.pending_enable.is_some()
+    }
+
+    fn abort_enable(&mut self) {
+        self.pending_enable = None;
+        self.enable_tx_deadline = None;
+    }
+
+    fn enable_frames_dispatched(&self) -> bool {
+        self.torque_enable_commanded
+            || self.has_any_joint_enabled()
+            || self.has_known_partial_enable()
     }
 
     fn disable_frames_dispatched(&self) -> bool {
@@ -6729,6 +6962,9 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     /// Optional absolute driver-clock ceiling on the active control release's TX start-cutoff
     /// (`release_deadline - publish_margin`), set during a release and cleared afterwards.
     tx_release_deadline: Option<Instant>,
+    /// Optional absolute driver-clock authority ceiling (`min(lease_expiry, request_deadline)`)
+    /// checked immediately before transmitting every `CMD_ENABLE` frame.
+    enable_tx_deadline: Option<Instant>,
     /// Active/confirmed CAN transmit probe recorded for clearing `CAN_TX_STALLED` (zero alloc).
     tx_probe: Option<TxProbeState>,
     /// Attempt-scoped J7 position-force freshness status observed in the most recent bounded TX pass.
@@ -7582,6 +7818,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             pf_last_fresh_feedback: None,
             pf_last_fresh_position: None,
             tx_release_deadline: None,
+            enable_tx_deadline: None,
             tx_probe: None,
             last_tx_pf_status: PosForceTxStatus::Unobserved,
             pf_fresh_gen: 0,
@@ -10661,6 +10898,19 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.pending_rearm = true;
         self.refresh_capture = None;
         self.enable_stop_stamp = None;
+        self.enable_tx_deadline = None;
+    }
+
+    /// Checks whether the installed enable authority ceiling (`min(lease_expiry, request_deadline)`)
+    /// has expired on the driver clock, aborting the enable handshake immediately before any TX.
+    #[inline]
+    fn check_enable_tx_authority(&mut self) -> Result<(), ArmDriverError> {
+        if self.enable_tx_deadline.is_some_and(|dl| self.now() >= dl) {
+            self.torque_hs = None;
+            self.enable_failed();
+            return Err(ArmDriverError::EnableAuthorityExpired);
+        }
+        Ok(())
     }
 
     /// Aborts an enable handshake if E-stop is latched, an urgent stop is pending, or a
@@ -11755,8 +12005,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         deadline: Option<Deadline>,
     ) -> Result<u32, ArmDriverError> {
         self.enable_estop_inhibited()?;
+        self.check_enable_tx_authority()?;
         let mut sent_any = false;
         for i in handshake::mask_joints(mask) {
+            self.check_enable_tx_authority()?;
             let Some(&id) = self.motor_ids.get(i) else {
                 mask &= !(1 << i);
                 continue;
@@ -11938,6 +12190,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.pending_rearm = false;
         self.disable_dispatched_mask = 0;
         self.enable_stop_stamp = None;
+        self.enable_tx_deadline = None;
         // confirmed enable with the base modes restored: a new MIT handover arms a new fence
         self.mit_fence = None;
         self.mit_fence_trip = None;
@@ -12782,6 +13035,14 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
     fn supports_budgeted_disable_await(&self) -> bool {
         self.can.supports_nonblocking_rt()
+    }
+
+    fn supports_budgeted_enable_await(&self) -> bool {
+        self.can.supports_nonblocking_rt()
+    }
+
+    fn set_enable_tx_deadline(&mut self, deadline: Option<Instant>) {
+        self.enable_tx_deadline = deadline;
     }
 
     fn begin_control_release(&mut self, release_seq: u64) {
