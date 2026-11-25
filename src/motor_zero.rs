@@ -659,8 +659,8 @@ fn zero_entry_from_published(
     Some(Some(crate::joint_zero::JointZero::new(new, method, &name)))
 }
 
-/// Synchronous preflight for executor-mode software joint zero (`/api/v1/calibration/motor_zero`).
-/// Hardware `method == "motor"` and driver-backed software zero fail closed with `409 EXECUTOR_UNSUPPORTED`.
+/// Synchronous preflight for executor-mode joint zero (`/api/v1/calibration/motor_zero`,
+/// both `method == "motor"` and `method == "software"`).
 pub(crate) async fn check_software_executor(
     sup: &Arc<ArmSupervisor>,
     body: &Value,
@@ -678,21 +678,17 @@ pub(crate) async fn check_software_executor(
     }
     let method = method_of(&req, &tool);
     req.method = Some(method.into());
-    if method == "motor" {
+    if method == "motor" && !tool.motor {
         return Err(CalibError::new(
-            409,
-            "EXECUTOR_UNSUPPORTED",
-            format!("{PATH} is not available while the RT executor owns the arm; use the legacy owner"),
+            400,
+            "UNSUPPORTED",
+            format!(
+                "motor zero is not supported by this driver; use method \"software\" ({})",
+                tool.support.notes.join("; ")
+            ),
         ));
     }
-    if pub_cfg.has_driver {
-        return Err(CalibError::new(
-            409,
-            "EXECUTOR_UNSUPPORTED",
-            format!("{PATH} is not available while the RT executor owns the arm; use the legacy owner"),
-        ));
-    }
-    if !tool.software {
+    if method == "software" && !tool.software {
         return Err(CalibError::new(
             400,
             "UNSUPPORTED",
@@ -716,6 +712,15 @@ pub(crate) async fn check_software_executor(
     };
     let mut pre_guard = (!req.dry_run)
         .then(|| crate::calibration::ExecutorTxnGuard::new(Arc::clone(sup), txn_id));
+    let txn_kind = if method == "motor" {
+        crate::rt_core::requests::config::CalibrationTxnKind::MotorZero {
+            set_busy: !req.dry_run,
+        }
+    } else {
+        crate::rt_core::requests::config::CalibrationTxnKind::SoftwareZero {
+            set_busy: !req.dry_run,
+        }
+    };
     let sample = match sup
         .dispatch_config_request(
             crate::rt_core::requests::config::ConfigRequest::BeginCalibrationTxn {
@@ -724,9 +729,7 @@ pub(crate) async fn check_software_executor(
                 operator_grant: auth.operator_grant,
                 expected_epoch: auth.admission.estop_epoch,
                 expected_stop_gen: auth.admission.stop_gen,
-                kind: crate::rt_core::requests::config::CalibrationTxnKind::SoftwareZero {
-                    set_busy: !req.dry_run,
-                },
+                kind: txn_kind,
             },
         )
         .await
@@ -754,7 +757,11 @@ pub(crate) async fn check_software_executor(
     let q = sample.positions[..sample.dof].to_vec();
     let r = reference_from_published(&pub_cfg);
     let rows = joint_rows(&req, &q, &r);
-    let persist = Some("calibration_file".to_string());
+    let persist = if method == "software" {
+        Some("calibration_file".to_string())
+    } else {
+        tool.support.persist.clone()
+    };
     if req.dry_run {
         let far_j: Vec<usize> = req
             .joints
@@ -768,10 +775,10 @@ pub(crate) async fn check_software_executor(
             "needs_force": !far_j.is_empty(),
             "far_joints": far_j,
             "invalidates": invalidates_from_published(&pub_cfg, &req, &q, &r),
-            "zero_method": "software",
+            "zero_method": method,
             "method": tool.support.method,
             "persist": persist,
-            "persist_verified": true,
+            "persist_verified": method == "software" || tool.support.persist_verified,
             "max_offset_deg": MOTOR_ZERO_MAX_OFFSET_DEG,
         })));
     }
@@ -833,13 +840,6 @@ pub(crate) async fn check_restore_executor(
         return Err(invalid("only the field backup is allowed"));
     }
     let pub_cfg = sup.published_config().await.map_err(CalibError::from)?;
-    if pub_cfg.has_driver {
-        return Err(CalibError::new(
-            409,
-            "EXECUTOR_UNSUPPORTED",
-            format!("{RESTORE_PATH} is not available while the RT executor owns the arm; use the legacy owner"),
-        ));
-    }
     if pub_cfg.config.zero_reference.is_none() {
         return Err(CalibError::new(
             400,
@@ -944,6 +944,12 @@ async fn commit_software_zero_via_worker(
     new_zero: Option<Option<crate::joint_zero::JointZero>>,
     backup_path: &std::path::Path,
     reason_label: &str,
+    held_reservation: Option<crate::rt_core::config_iface::Reservation>,
+    hw_mutated: bool,
+    is_hardware_motor_zero: bool,
+    zeroed_mask: u64,
+    raw_after: [f32; crate::rt_core::mailbox::MAX_DOF],
+    existing_marker: Option<std::path::PathBuf>,
 ) -> Result<(crate::rt_core::requests::config::ConfigCommitOutcome, Value), CalibError> {
     use crate::calibration::{
         effective_floor_for_with_legacy, file_fingerprints, legacy_file_fingerprint,
@@ -952,8 +958,9 @@ async fn commit_software_zero_via_worker(
     use crate::rt_core::config_iface::ConfigDomain;
     use crate::rt_core::requests::config::{
         build_config_proposal_with_deadline, pending_commit_marker_path,
-        prepare_eval_bufs_off_thread, run_config_commit_detailed, ConfigAuthContext,
-        ConfigCandidate, ConfigCommitPlan, ConfigWriteOp, FileWriteOp, ReservePrecheck,
+        prepare_eval_bufs_off_thread, run_config_commit_detailed,
+        run_config_commit_on_held_reservation, ConfigAuthContext, ConfigCandidate, ConfigCommitPlan,
+        ConfigWriteOp, FileWriteOp, ReservePrecheck,
     };
 
     let pub_cfg = sup.published_config().await.map_err(CalibError::from)?;
@@ -1179,7 +1186,7 @@ async fn commit_software_zero_via_worker(
     }
     // Journal EVERY effectful C-F1 commit (single-file or multi-file) so an authority loss or
     // crash after rename is quarantined on restart rather than silently activating rejected offsets.
-    let pending_marker = if !file_ops.is_empty() {
+    let pending_marker = if existing_marker.is_none() && !file_ops.is_empty() {
         let marker_path = pending_commit_marker_path(&deps.path);
         let marker_text = json!({
             "reason": reason_label,
@@ -1196,10 +1203,13 @@ async fn commit_software_zero_via_worker(
     offsets_arr[..dof].copy_from_slice(new_offsets);
 
     let lease_gen = auth.lease_holder.map_or(0, |(_, g)| g);
+    let expected_calib_rev = held_reservation
+        .as_ref()
+        .map_or(pub_cfg.calibration_revision, |r| r.from());
     let proposal = build_config_proposal_with_deadline(
         sup,
         ConfigDomain::Calibration,
-        pub_cfg.calibration_revision,
+        expected_calib_rev,
         auth.admission,
         lease_gen,
         pub_cfg.workspace_revision,
@@ -1225,10 +1235,14 @@ async fn commit_software_zero_via_worker(
             expected_txn_id: Some(txn_id),
             operator_grant: auth.operator_grant,
             expected_gripper_calib_revision,
+            is_hardware_motor_zero,
         },
         candidate: ConfigCandidate::SoftwareJointZero {
             new_offsets: offsets_arr,
             dof,
+            is_hardware_motor_zero,
+            zeroed_mask,
+            raw_after,
             calibration: file,
             #[cfg(feature = "policy-runtime")]
             calibration_digest: SupervisorInner::calibration_digest_of(pub_cal.as_ref()),
@@ -1244,13 +1258,13 @@ async fn commit_software_zero_via_worker(
             replacement_baseline,
             replacement_baseline_pending,
         },
-        write: if file_ops.is_empty() {
+        write: if file_ops.is_empty() && existing_marker.is_none() {
             ConfigWriteOp::Volatile
         } else {
             ConfigWriteOp::Batch {
                 ops: file_ops,
                 pending_marker,
-                existing_marker: None,
+                existing_marker,
             }
         },
         expected_workspace_revision: Some(pub_cfg.workspace_revision),
@@ -1258,44 +1272,54 @@ async fn commit_software_zero_via_worker(
     };
 
     let auth_cb = Arc::clone(&auth.auth_check);
-    let outcome = run_config_commit_detailed(
-        sup,
-        plan,
-        move || (auth_cb)(),
-        move |cfg, act| {
-            if cfg.joint_zero_offsets.len() > 5
-                && pub_offsets.len() > 5
-                && cfg.joint_zero_offsets[5] != pub_offsets[5]
-            {
-                cfg.zero_convention = Default::default();
+    let update_pub = move |cfg: &mut crate::rt_core::requests::config::PublishedConfig,
+                           act: crate::rt_core::requests::config::ConfigActivated| {
+        if cfg.joint_zero_offsets.len() > 5
+            && pub_offsets.len() > 5
+            && cfg.joint_zero_offsets[5] != pub_offsets[5]
+        {
+            cfg.zero_convention = Default::default();
+        }
+        cfg.joint_zero_offsets = pub_offsets;
+        cfg.calibration = pub_cal;
+        if let Some(m) = pub_arm {
+            cfg.config.arm_model = m;
+        }
+        if let Some((pl, bump)) = pub_poses {
+            cfg.poses.list = pl;
+            if bump {
+                cfg.poses.revision = act.poses_revision;
             }
-            cfg.joint_zero_offsets = pub_offsets;
-            cfg.calibration = pub_cal;
-            if let Some(m) = pub_arm {
-                cfg.config.arm_model = m;
+        }
+        if let Some(st) = pub_grip_stale {
+            cfg.gripper_calib_stale = Some(st);
+            cfg.gripper_calib_revision = act.gripper_calib_revision;
+        }
+        if let Some((eff, src)) = pub_floor {
+            cfg.floor_source = src;
+            if let Some(ws) = cfg.config.workspace.as_mut() {
+                ws.floor_z_m = eff;
             }
-            if let Some((pl, bump)) = pub_poses {
-                cfg.poses.list = pl;
-                if bump {
-                    cfg.poses.revision = act.poses_revision;
-                }
-            }
-            if let Some(st) = pub_grip_stale {
-                cfg.gripper_calib_stale = Some(st);
-                cfg.gripper_calib_revision = act.gripper_calib_revision;
-            }
-            if let Some((eff, src)) = pub_floor {
-                cfg.floor_source = src;
-                if let Some(ws) = cfg.config.workspace.as_mut() {
-                    ws.floor_z_m = eff;
-                }
-            }
-            cfg.calibration_revision = act.calibration_revision;
-            cfg.workspace_revision = act.workspace_revision;
-        },
-    )
-    .await
-    .map_err(|e| crate::calibration::calib_error_from_commit(e, "apply", Some(backup_path)))?;
+        }
+        cfg.calibration_revision = act.calibration_revision;
+        cfg.workspace_revision = act.workspace_revision;
+    };
+    let commit_res = match held_reservation {
+        Some(res) => {
+            run_config_commit_on_held_reservation(
+                sup,
+                plan,
+                res,
+                hw_mutated,
+                move || (auth_cb)(),
+                update_pub,
+            )
+            .await
+        }
+        None => run_config_commit_detailed(sup, plan, move || (auth_cb)(), update_pub).await,
+    };
+    let outcome = commit_res
+        .map_err(|e| crate::calibration::calib_error_from_commit(e, "apply", Some(backup_path)))?;
 
     let inv = json!({
         "kinematics_removed": removed.is_some() || had_live_kin,
@@ -1392,15 +1416,14 @@ pub(crate) async fn run_software_executor_with_guard(
     auth: crate::calibration::ExecutorCalibAuth,
     existing_guard: Option<crate::calibration::ExecutorTxnGuard>,
 ) -> Result<Value, CalibError> {
+    if req.method.as_deref() == Some("motor") {
+        return run_motor_executor_with_guard(sup, deps, req, auth, existing_guard).await;
+    }
     if req.method.as_deref() != Some("software") {
         if let Some(g) = existing_guard {
             g.release().await;
         }
-        return Err(CalibError::new(
-            409,
-            "EXECUTOR_UNSUPPORTED",
-            format!("{PATH} is not available while the RT executor owns the arm; use the legacy owner"),
-        ));
+        return Err(invalid("method must be \"motor\" or \"software\""));
     }
     let sup_w = Arc::clone(sup);
     let deps_w = deps.clone();
@@ -1463,13 +1486,6 @@ pub(crate) async fn run_software_executor_with_guard(
             let run_res = async {
                 let started = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
                 let pub_cfg = sup_w.published_config().await.map_err(CalibError::from)?;
-                if pub_cfg.has_driver {
-                    return Err(CalibError::new(
-                        409,
-                        "EXECUTOR_UNSUPPORTED",
-                        format!("{PATH} is not available while the RT executor owns the arm; use the legacy owner"),
-                    ));
-                }
                 let r = reference_from_published(&pub_cfg);
                 let n = pub_cfg.config.dof;
                 // 1. Capture mean of fresh readings over SOFTWARE_CAPTURE while checking authority & state.
@@ -1563,6 +1579,12 @@ pub(crate) async fn run_software_executor_with_guard(
                     entry,
                     &backup,
                     "software_zero",
+                    None,
+                    false,
+                    false,
+                    0,
+                    [0.0; crate::rt_core::mailbox::MAX_DOF],
+                    None,
                 )
                 .await?;
                 // 4. Verify readings newer than activation + write audit log.
@@ -1750,13 +1772,6 @@ pub(crate) async fn restore_executor_with_guard(
 
                 let _ = sample_zero_state_executor(&sup_w, &auth, Some(txn_id), "restore", true, true).await?;
                 let pub_cfg = sup_w.published_config().await.map_err(CalibError::from)?;
-                if pub_cfg.has_driver {
-                    return Err(CalibError::new(
-                        409,
-                        "EXECUTOR_UNSUPPORTED",
-                        format!("{RESTORE_PATH} is not available while the RT executor owns the arm; use the legacy owner"),
-                    ));
-                }
                 let n = pub_cfg.config.dof;
                 let new = target.as_ref().map_or_else(|| vec![0.0; n], |z| z.offsets());
                 if let Some(z) = &target {
@@ -1795,6 +1810,12 @@ pub(crate) async fn restore_executor_with_guard(
                     entry,
                     &backup,
                     "joint_zero_restore",
+                    None,
+                    false,
+                    false,
+                    0,
+                    [0.0; crate::rt_core::mailbox::MAX_DOF],
+                    None,
                 )
                 .await?;
                 tracing::warn!(
@@ -1817,6 +1838,662 @@ pub(crate) async fn restore_executor_with_guard(
     });
     done_rx.await.unwrap_or_else(|e| {
         tracing::error!("joint zero restore worker failed: {e}");
+        Err(CalibError::new(
+            500,
+            "INTERNAL",
+            "calibration task failed: channel closed; check GET /api/v1/calibration and the backups",
+        ))
+    })
+}
+
+/// Executor-mode hardware motor zero (`method == "motor"`) routed through the RT tick-driven
+/// commissioning state machine and PR C's single held-reservation commit path (C-F1 part 2).
+pub(crate) async fn run_motor_executor_with_guard(
+    sup: &Arc<ArmSupervisor>,
+    deps: &CalibrationDeps,
+    req: MotorZeroRequest,
+    auth: crate::calibration::ExecutorCalibAuth,
+    existing_guard: Option<crate::calibration::ExecutorTxnGuard>,
+) -> Result<Value, CalibError> {
+    use crate::mit::{
+        run_rt_commissioning_op, CommissioningAuthority, CommissioningOpKind, CommissioningOpState,
+        CommissioningStartRequest, JointCommissioningDisposition,
+    };
+    use crate::rt_core::config_iface::ConfigDomain;
+    use crate::rt_core::requests::config::{
+        build_config_proposal_with_deadline, pending_commit_marker_path,
+        remove_pending_commit_marker, write_pending_commit_marker, ConfigAuthContext, ConfigReply,
+        ConfigRequest, ReleaseConfig, ReservationGuard, ReserveConfig, ReservePrecheck,
+        VerifyDomainChecks,
+    };
+
+    let sup_w = Arc::clone(sup);
+    let deps_w = deps.clone();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let res = async move {
+            let mut txn_guard = match existing_guard {
+                Some(g) => g,
+                None => match auth.txn_id {
+                    Some(id) => crate::calibration::ExecutorTxnGuard::new(Arc::clone(&sup_w), id),
+                    None => {
+                        if let Err((_, arm_err)) = (auth.auth_check)() {
+                            return Err(CalibError::from(arm_err));
+                        }
+                        let tid = crate::rt_core::requests::config::next_calibration_txn_id();
+                        let cfg_auth = ConfigAuthContext {
+                            admission: auth.admission,
+                            lease_holder: auth.lease_holder,
+                        };
+                        let pre_g = crate::calibration::ExecutorTxnGuard::new(Arc::clone(&sup_w), tid);
+                        match sup_w
+                            .dispatch_config_request(ConfigRequest::BeginCalibrationTxn {
+                                txn_id: tid,
+                                auth: cfg_auth,
+                                operator_grant: auth.operator_grant,
+                                expected_epoch: auth.admission.estop_epoch,
+                                expected_stop_gen: auth.admission.stop_gen,
+                                kind: crate::rt_core::requests::config::CalibrationTxnKind::MotorZero {
+                                    set_busy: true,
+                                },
+                            })
+                            .await
+                        {
+                            Ok(ConfigReply::CalibrationTxnBegan(Ok(_))) => {
+                                sup_w.published_config_hub().update(|cfg| {
+                                    cfg.calibration_busy = true;
+                                    cfg.calibration_txn_id = Some(tid);
+                                });
+                                pre_g
+                            }
+                            Ok(ConfigReply::CalibrationTxnBegan(Err(e))) => {
+                                let _ = pre_g.disarm();
+                                return Err(crate::calibration::calib_error_from_config(e));
+                            }
+                            Err(e) => {
+                                pre_g.release().await;
+                                return Err(crate::calibration::calib_error_from_config(e));
+                            }
+                            _ => {
+                                pre_g.release().await;
+                                return Err(CalibError::new(500, "INTERNAL", "unexpected begin motor zero reply"));
+                            }
+                        }
+                    }
+                },
+            };
+            let txn_id = txn_guard.txn_id();
+
+            let run_res = async {
+                let started = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                let pub_cfg = sup_w.published_config().await.map_err(CalibError::from)?;
+                let dof = pub_cfg.config.dof;
+                if dof > crate::rt_core::mailbox::MAX_DOF || req.joints.len() > crate::rt_core::mailbox::MAX_DOF {
+                    return Err(invalid("too many joints"));
+                }
+                let r = reference_from_published(&pub_cfg);
+                let old = pub_cfg.joint_zero_offsets.clone();
+                let sample = sample_zero_state_executor(&sup_w, &auth, Some(txn_id), "disable", true, true).await?;
+                let before = sample.positions[..sample.dof].to_vec();
+
+                let mut joints_arr = [0usize; crate::rt_core::mailbox::MAX_DOF];
+                for (i, &j) in req.joints.iter().enumerate() {
+                    joints_arr[i] = j;
+                }
+                let mut ref_arr = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
+                for (i, &rv) in r.iter().enumerate().take(crate::rt_core::mailbox::MAX_DOF) {
+                    ref_arr[i] = rv;
+                }
+
+                // 1. Acquire ONE single ConfigDomain::Calibration reservation held across disable,
+                //    pre-HW MIT invalidation, hardware set_zero + raw verify, and final commit (M4).
+                let lease_gen = auth.lease_holder.map_or(0, |(_, g)| g);
+                let cfg_auth = ConfigAuthContext {
+                    admission: auth.admission,
+                    lease_holder: auth.lease_holder,
+                };
+                let txn_deadline = Instant::now() + Duration::from_secs(20);
+                let proposal = build_config_proposal_with_deadline(
+                    &sup_w,
+                    ConfigDomain::Calibration,
+                    pub_cfg.calibration_revision,
+                    auth.admission,
+                    lease_gen,
+                    pub_cfg.workspace_revision,
+                    txn_deadline,
+                );
+                let reservation = match sup_w
+                    .dispatch_config_request_owned_reliable(ConfigRequest::Reserve(ReserveConfig {
+                        proposal,
+                        auth: cfg_auth,
+                        precheck: ReservePrecheck::SoftwareJointZero {
+                            allow_during_calibration_busy: true,
+                            expected_txn_id: Some(txn_id),
+                            operator_grant: auth.operator_grant,
+                            expected_gripper_calib_revision: None,
+                            is_hardware_motor_zero: true,
+                        },
+                        expected_workspace_revision: Some(pub_cfg.workspace_revision),
+                        expected_poses_revision: None,
+                    }))
+                    .await
+                {
+                    Ok(ConfigReply::Reserved(Ok(res))) => res,
+                    Ok(ConfigReply::Reserved(Err(e))) => {
+                        return Err(crate::calibration::calib_error_from_config(e).at("disable"));
+                    }
+                    Err(e) => return Err(crate::calibration::calib_error_from_config(e).at("disable")),
+                    _ => {
+                        return Err(CalibError::new(500, "INTERNAL", "unexpected calibration reserve reply").at("disable"));
+                    }
+                };
+                let grant_id = reservation.grant();
+                let mut res_guard = ReservationGuard::new(Arc::clone(&sup_w), reservation);
+
+                // 2. Non-blocking RT disable-all + per-motor disabled confirmation (M1).
+                let disable_req = CommissioningStartRequest {
+                    kind: CommissioningOpKind::MotorZeroDisable,
+                    joints: joints_arr,
+                    joint_len: req.joints.len(),
+                    timeout_counts: 0,
+                    references: ref_arr,
+                    authority: CommissioningAuthority {
+                        conn_id: auth.admission.connection_id,
+                        lease_holder: auth.lease_holder,
+                        operator_grant: auth.operator_grant,
+                        expected_epoch: auth.admission.estop_epoch,
+                        expected_stop_gen: auth.admission.stop_gen,
+                        grant_id: Some(grant_id),
+                        txn_id,
+                    },
+                    txn_deadline,
+                    prior_disk_mutated: false,
+                };
+                let disable_snap = match run_rt_commissioning_op(&sup_w, disable_req, auth.auth_check.as_ref()).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        if let Some(r_tok) = res_guard.take() {
+                            let _ = sup_w
+                                .dispatch_config_request_owned_reliable(ConfigRequest::Release(ReleaseConfig {
+                                    reservation: r_tok,
+                                }))
+                                .await;
+                        }
+                        return Err(e.at("disable"));
+                    }
+                };
+                if disable_snap.state != CommissioningOpState::Done {
+                    if let Some(r_tok) = res_guard.take() {
+                        let _ = sup_w
+                            .dispatch_config_request_owned_reliable(ConfigRequest::Release(ReleaseConfig {
+                                reservation: r_tok,
+                            }))
+                            .await;
+                    }
+                    let status = if disable_snap.error_status != 0 { disable_snap.error_status } else { 409 };
+                    let code = if disable_snap.error_code.is_empty() { "MOTOR_ZERO_NOT_DISABLED" } else { disable_snap.error_code };
+                    let msg = if disable_snap.error_msg.is_empty() {
+                        format!(
+                            "joints {:?} did not confirm disabled within {} ms; nothing was changed",
+                            req.joints.iter().map(|j| j + 1).collect::<Vec<_>>(),
+                            DISABLE_CONFIRM_TIMEOUT.as_millis()
+                        )
+                    } else {
+                        disable_snap.error_msg.as_str().to_string()
+                    };
+                    return Err(CalibError::new(status, code, msg).at("disable"));
+                }
+
+                // 3. Off-thread backup + durable pending marker BEFORE any irreversible flash TX.
+                let backup = write_zero_backup_with_companions(
+                    &deps_w,
+                    "motor_zero",
+                    &old,
+                    pub_cfg.poses.path.clone(),
+                    pub_cfg.gripper_calib_path.clone(),
+                )
+                .await
+                .map_err(|e| {
+                    CalibError::new(500, "PERSIST_FAILED", format!("backup: {e}; nothing was changed"))
+                })?;
+
+                let one_based_req: Vec<usize> = req.joints.iter().map(|j| j + 1).collect();
+                let marker_path = pending_commit_marker_path(&deps_w.path);
+                let marker_text = json!({
+                    "reason": "hardware_motor_zero",
+                    "backup": backup.display().to_string(),
+                    "joints": one_based_req,
+                })
+                .to_string();
+                let mp_w = marker_path.clone();
+                if let Err(e) = tokio::task::spawn_blocking(move || write_pending_commit_marker(&mp_w, &marker_text))
+                    .await
+                    .map_err(|e| e.to_string())
+                    .and_then(|r| r)
+                {
+                    if let Some(r_tok) = res_guard.take() {
+                        let _ = sup_w
+                            .dispatch_config_request_owned_reliable(ConfigRequest::Release(ReleaseConfig {
+                                reservation: r_tok,
+                            }))
+                            .await;
+                    }
+                    return Err(CalibError::new(
+                        500,
+                        "PERSIST_FAILED",
+                        format!("pending commit marker could not be written: {e}; nothing was changed"),
+                    ));
+                }
+
+                // 4. Pre-HW MIT qualification invalidation: commit BOTH disk AND live core.calibration
+                //    atomically on the HELD reservation BEFORE sending any CMD_SET_ZERO frame (B3),
+                //    so disk and live already agree if zero is refused before the first TX!
+                if let Some(mut c) = pub_cfg.calibration.clone() {
+                    let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                    let reason = format!(
+                        "motor zero of joints {one_based_req:?}; the MIT qualification was measured with the old zero"
+                    );
+                    if crate::mit::invalidate_record(&mut c, &one_based_req, &reason, &at) {
+                        if let Err((_, arm_err)) = (auth.auth_check)() {
+                            let mp_rm = marker_path.clone();
+                            let _ = tokio::task::spawn_blocking(move || remove_pending_commit_marker(&mp_rm)).await;
+                            if let Some(r_tok) = res_guard.take() {
+                                let _ = sup_w
+                                    .dispatch_config_request_owned_reliable(ConfigRequest::Release(ReleaseConfig {
+                                        reservation: r_tok,
+                                    }))
+                                    .await;
+                            }
+                            return Err(CalibError::from(arm_err).at("mit_invalidate"));
+                        }
+                        let verify_res = sup_w
+                            .dispatch_config_request_owned_reliable(ConfigRequest::VerifyAuthority {
+                                domain: ConfigDomain::Calibration,
+                                grant: grant_id,
+                                proposal,
+                                auth: cfg_auth,
+                                expected_workspace_revision: Some(pub_cfg.workspace_revision),
+                                expected_poses_revision: None,
+                                domain_checks: VerifyDomainChecks {
+                                    expected_grasp_setup_revision: None,
+                                    expected_gripper_calib_revision: None,
+                                    require_workspace_unblocked: false,
+                                    require_kinematics_disarmed: false,
+                                    require_software_zero_idle: true,
+                                    require_mit_torque_off: false,
+                                    expected_txn_id: Some(txn_id),
+                                    operator_grant: Some(auth.operator_grant),
+                                },
+                            })
+                            .await;
+                        if !matches!(verify_res, Ok(ConfigReply::AuthorityVerified(Ok(())))) {
+                            let mp_rm = marker_path.clone();
+                            let _ = tokio::task::spawn_blocking(move || remove_pending_commit_marker(&mp_rm)).await;
+                            if let Some(r_tok) = res_guard.take() {
+                                let _ = sup_w
+                                    .dispatch_config_request_owned_reliable(ConfigRequest::Release(ReleaseConfig {
+                                        reservation: r_tok,
+                                    }))
+                                    .await;
+                            }
+                            return Err(match verify_res {
+                                Ok(ConfigReply::AuthorityVerified(Err(e))) => {
+                                    crate::calibration::calib_error_from_deferred_config(e).at("mit_invalidate")
+                                }
+                                Err(e) => crate::calibration::calib_error_from_deferred_config(e).at("mit_invalidate"),
+                                _ => CalibError::new(500, "INTERNAL", "unexpected verify reply").at("mit_invalidate"),
+                            });
+                        }
+                        let text = serde_json::to_string_pretty(&c)
+                            .map_err(|e| CalibError::new(500, "INTERNAL", e.to_string()))?;
+                        let path_c = deps_w.path.clone();
+                        let stage_res = tokio::task::spawn_blocking(move || -> Result<(), (bool, String)> {
+                            let staged = crate::persist::StagedWrite::stage(path_c.clone(), text)
+                                .map_err(|e| (false, e))?;
+                            let ds = staged.rename_only().map_err(|e| (false, e))?;
+                            match ds.sync_parent_dir() {
+                                crate::persist::PublishOutcome::Published => Ok(()),
+                                crate::persist::PublishOutcome::PublishedDurabilityUnconfirmed(w) => {
+                                    Err((true, format!("dir fsync failed: {w}")))
+                                }
+                            }
+                        })
+                        .await
+                        .map_err(|e| (true, e.to_string()))
+                        .and_then(|r| r);
+                        match stage_res {
+                            Ok(()) => {
+                                let pub_c = Some(c.clone());
+                                #[cfg(feature = "policy-runtime")]
+                                let cal_digest = SupervisorInner::calibration_digest_of(pub_c.as_ref());
+                                let r_tok = res_guard.take().expect("reservation held");
+                                match sup_w
+                                    .dispatch_config_request_owned_reliable(
+                                        ConfigRequest::CommitIntermediateCalibration {
+                                            reservation: r_tok,
+                                            auth: cfg_auth,
+                                            calibration: Some(c),
+                                            #[cfg(feature = "policy-runtime")]
+                                            calibration_digest: cal_digest,
+                                            expected_txn_id: txn_id,
+                                            operator_grant: auth.operator_grant,
+                                        },
+                                    )
+                                    .await
+                                {
+                                    Ok(ConfigReply::IntermediateCalibrationCommitted(Ok((new_r, new_rev)))) => {
+                                        sup_w.published_config_hub().update(|cfg| {
+                                            cfg.calibration = pub_c;
+                                            cfg.calibration_revision = new_rev;
+                                        });
+                                        res_guard = ReservationGuard::new(Arc::clone(&sup_w), new_r);
+                                    }
+                                    Ok(ConfigReply::IntermediateCalibrationCommitted(Err(e))) => {
+                                        txn_guard.mark_remote_mutated();
+                                        return Err(crate::calibration::calib_error_from_deferred_config(e).at("mit_invalidate"));
+                                    }
+                                    Err(e) => {
+                                        txn_guard.mark_remote_mutated();
+                                        let _ = sup_w
+                                            .dispatch_config_request_reliable(|| {
+                                                ConfigRequest::ForceReconcile(ConfigDomain::Calibration)
+                                            })
+                                            .await;
+                                        return Err(crate::calibration::calib_error_from_deferred_config(e).at("mit_invalidate"));
+                                    }
+                                    _ => {
+                                        txn_guard.mark_remote_mutated();
+                                        let _ = sup_w
+                                            .dispatch_config_request_reliable(|| {
+                                                ConfigRequest::ForceReconcile(ConfigDomain::Calibration)
+                                            })
+                                            .await;
+                                        return Err(CalibError::new(
+                                            500,
+                                            "INTERNAL",
+                                            "unexpected intermediate calibration commit reply",
+                                        ));
+                                    }
+                                }
+                            }
+                            Err((false, e)) => {
+                                let mp_rm = marker_path.clone();
+                                let _ = tokio::task::spawn_blocking(move || remove_pending_commit_marker(&mp_rm)).await;
+                                if let Some(r_tok) = res_guard.take() {
+                                    let _ = sup_w
+                                        .dispatch_config_request_owned_reliable(ConfigRequest::Release(ReleaseConfig {
+                                            reservation: r_tok,
+                                        }))
+                                        .await;
+                                }
+                                return Err(CalibError::new(
+                                    500,
+                                    "PERSIST_FAILED",
+                                    format!(
+                                        "the MIT qualification could not be invalidated in {} ({e}); the zero was refused, nothing was changed",
+                                        deps_w.path.display()
+                                    ),
+                                ));
+                            }
+                            Err((true, e)) => {
+                                res_guard.mark_hw_mutated();
+                                txn_guard.mark_remote_mutated();
+                                let _ = sup_w
+                                    .dispatch_config_request_reliable(|| {
+                                        ConfigRequest::ForceReconcile(ConfigDomain::Calibration)
+                                    })
+                                    .await;
+                                return Err(CalibError::new(
+                                    500,
+                                    "PERSIST_FAILED",
+                                    format!(
+                                        "MIT qualification invalidation renamed {} but durability failed ({e}); reconciling required",
+                                        deps_w.path.display()
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                }
+
+                // 5. Run tick-driven RT hardware CMD_SET_ZERO + raw post-command verification (M2).
+                let zero_req = CommissioningStartRequest {
+                    kind: CommissioningOpKind::MotorZeroWriteVerify,
+                    joints: joints_arr,
+                    joint_len: req.joints.len(),
+                    timeout_counts: 0,
+                    references: ref_arr,
+                    authority: CommissioningAuthority {
+                        conn_id: auth.admission.connection_id,
+                        lease_holder: auth.lease_holder,
+                        operator_grant: auth.operator_grant,
+                        expected_epoch: auth.admission.estop_epoch,
+                        expected_stop_gen: auth.admission.stop_gen,
+                        grant_id: Some(grant_id),
+                        txn_id,
+                    },
+                    txn_deadline,
+                    prior_disk_mutated: false,
+                };
+                let snap = match run_rt_commissioning_op(&sup_w, zero_req, auth.auth_check.as_ref()).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let mp_rm = marker_path.clone();
+                        let rm_ok = tokio::task::spawn_blocking(move || remove_pending_commit_marker(&mp_rm))
+                            .await
+                            .map_err(|re| re.to_string())
+                            .and_then(|r| r)
+                            .is_ok();
+                        if rm_ok {
+                            if let Some(r_tok) = res_guard.take() {
+                                let _ = sup_w
+                                    .dispatch_config_request_owned_reliable(ConfigRequest::Release(ReleaseConfig {
+                                        reservation: r_tok,
+                                    }))
+                                    .await;
+                            }
+                        } else {
+                            res_guard.mark_hw_mutated();
+                            txn_guard.mark_remote_mutated();
+                        }
+                        return Err(e.at("set_zero"));
+                    }
+                };
+
+                let mut applied_joints = Vec::new();
+                let mut uncertain_joints = Vec::new();
+                let mut not_attempted_joints = Vec::new();
+                let mut rows = Vec::with_capacity(snap.joint_len);
+                let mut zeroed_mask = 0u64;
+                let mut raw_after = [f32::NAN; crate::rt_core::mailbox::MAX_DOF];
+                for i in 0..snap.joint_len {
+                    let o = &snap.outcomes[i];
+                    let j = o.joint;
+                    let sent = o.disposition != JointCommissioningDisposition::Unattempted;
+                    match o.disposition {
+                        JointCommissioningDisposition::Applied => {
+                            applied_joints.push(j + 1);
+                            zeroed_mask |= 1u64 << j;
+                            raw_after[j] = o.raw_after;
+                        }
+                        JointCommissioningDisposition::Uncertain => {
+                            uncertain_joints.push(j + 1);
+                        }
+                        JointCommissioningDisposition::Unattempted => {
+                            not_attempted_joints.push(j + 1);
+                        }
+                    }
+                    rows.push(json!({
+                        "joint": j + 1,
+                        "before_rad": before[j],
+                        "after_rad": o.joint_after,
+                        "reference_rad": r[j],
+                        "sent": sent,
+                        "fresh": o.fresh,
+                        "verified": o.verified,
+                    }));
+                }
+
+                // Case A: Zero irreversible TX left host -> clean rollback & release.
+                if !snap.hw_mutated {
+                    let mp_rm = marker_path.clone();
+                    let rm_ok = tokio::task::spawn_blocking(move || remove_pending_commit_marker(&mp_rm))
+                        .await
+                        .map_err(|re| re.to_string())
+                        .and_then(|r| r)
+                        .is_ok();
+                    if rm_ok {
+                        if let Some(r_tok) = res_guard.take() {
+                            let _ = sup_w
+                                .dispatch_config_request_owned_reliable(ConfigRequest::Release(ReleaseConfig {
+                                    reservation: r_tok,
+                                }))
+                                .await;
+                        }
+                    } else {
+                        res_guard.mark_hw_mutated();
+                        txn_guard.mark_remote_mutated();
+                    }
+                    let status = if snap.error_status != 0 { snap.error_status } else { 500 };
+                    let code = if snap.error_code.is_empty() { "MOTOR_ZERO_FAILED" } else { snap.error_code };
+                    let mut msg = if snap.error_msg.is_empty() {
+                        "motor zero failed".to_string()
+                    } else {
+                        snap.error_msg.as_str().to_string()
+                    };
+                    if !msg.contains("no zero was changed") && code == "MOTOR_ZERO_FAILED" {
+                        msg.push_str("; no zero was changed");
+                    }
+                    return Err(CalibError::new(status, code, msg).at("set_zero"));
+                }
+
+                // Hardware mutated: mark guards immediately so any drop/error keeps Reconciling + marker.
+                res_guard.mark_hw_mutated();
+                txn_guard.mark_remote_mutated();
+
+                let all_applied = snap.state == CommissioningOpState::Done
+                    && uncertain_joints.is_empty()
+                    && not_attempted_joints.is_empty()
+                    && applied_joints.len() == snap.joint_len;
+
+                // Case B: Partial batch, cancelled after TX, or unverified raw zero ->
+                // NEVER claim clean completion; keep HoldState::Reconciling + pending marker!
+                if !all_applied {
+                    let _ = sup_w
+                        .dispatch_config_request_reliable(|| {
+                            ConfigRequest::ForceReconcile(ConfigDomain::Calibration)
+                        })
+                        .await;
+                    let fault_msg = format!(
+                        "Hardware motor zero incomplete: applied {applied_joints:?}, uncertain {uncertain_joints:?}, not attempted {not_attempted_joints:?}; reconcile hardware and disk before resuming"
+                    );
+                    let bounded = crate::safety::BoundedText::<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>::new(&fault_msg);
+                    let _ = sup_w
+                        .dispatch_config_request_reliable(|| ConfigRequest::LatchConfigReconcileFault {
+                            domain: ConfigDomain::Calibration,
+                            message: bounded,
+                        })
+                        .await;
+                    let result_tag = if !not_attempted_joints.is_empty() {
+                        "partial"
+                    } else {
+                        "unverified"
+                    };
+                    let inv_none = json!({
+                        "kinematics_removed": false,
+                        "camera_stale": false,
+                        "poses_stale": [],
+                        "gripper_calibration_stale": false,
+                        "reconciling": true,
+                    });
+                    let log = write_log(&deps_w, &started, &req, &before, &rows, result_tag, &inv_none).await;
+                    let status = if snap.error_status != 0 { snap.error_status } else { 500 };
+                    let code = if snap.error_code.is_empty() { "MOTOR_ZERO_UNVERIFIED" } else { snap.error_code };
+                    let base = if snap.error_msg.is_empty() {
+                        format!(
+                            "the set-zero commands were sent but not every joint verified within {MOTOR_ZERO_VERIFY_MRAD} mrad"
+                        )
+                    } else {
+                        snap.error_msg.as_str().to_string()
+                    };
+                    let msg = format!(
+                        "{base}; applied {applied_joints:?}, uncertain {uncertain_joints:?}, not attempted {not_attempted_joints:?}"
+                    );
+                    let mut err = CalibError::new(status, code, msg);
+                    err.extra.insert("joints".into(), json!(rows));
+                    err.extra.insert("applied".into(), json!(applied_joints));
+                    err.extra.insert("uncertain".into(), json!(uncertain_joints));
+                    err.extra.insert("not_attempted".into(), json!(not_attempted_joints));
+                    err.extra.insert("invalidated".into(), inv_none);
+                    err.extra.insert("log".into(), log);
+                    return Err(err);
+                }
+
+                // Case C: ALL joints sent CMD_SET_ZERO and verified raw ~= 0.0 from fresh feedback!
+                // Now persist invalidations + joint_zero offsets and atomically activate on the HELD reservation.
+                let pub_now = sup_w.published_config().await.map_err(CalibError::from)?;
+                let mut new_offsets = pub_now.joint_zero_offsets.clone();
+                for &j in &req.joints {
+                    new_offsets[j] = -r[j];
+                }
+                let changes: Vec<f32> = req.joints.iter().map(|&j| r[j] - before[j]).collect();
+                let entry = zero_entry_from_published(&pub_now, &new_offsets, "motor");
+                let held_r = res_guard.take().expect("reservation held");
+                let (_outcome, inv) = commit_software_zero_via_worker(
+                    &sup_w,
+                    &deps_w,
+                    &auth,
+                    txn_id,
+                    &new_offsets,
+                    &applied_joints,
+                    &changes,
+                    "motor",
+                    entry,
+                    &backup,
+                    "hardware_motor_zero",
+                    Some(held_r),
+                    true,
+                    true,
+                    zeroed_mask,
+                    raw_after,
+                    Some(marker_path),
+                )
+                .await?;
+
+                // Commit succeeded cleanly (disk + parent dir fsync + RT swap + PublishedConfigHub + marker removed)!
+                txn_guard.clear_remote_mutated();
+                let log = write_log(&deps_w, &started, &req, &before, &rows, "verified", &inv).await;
+                let tool = sup_w
+                    .published_config()
+                    .await
+                    .map_err(CalibError::from)?
+                    .calibration_tools()
+                    .motor_zero;
+                tracing::warn!(
+                    "Motor zero of joints {applied_joints:?} (executor, readings before {:?}): verified",
+                    req.joints.iter().map(|&j| before[j]).collect::<Vec<_>>()
+                );
+                Ok(json!({
+                    "joints": rows,
+                    "invalidated": inv,
+                    "log": log,
+                    "zero_method": "motor",
+                    "method": tool.support.method,
+                    "persist": tool.support.persist,
+                    "persist_verified": tool.support.persist_verified,
+                    "torque": "off",
+                }))
+            }
+            .await;
+
+            txn_guard.release().await;
+            run_res
+        }
+        .await;
+        let _ = done_tx.send(res);
+    });
+    done_rx.await.unwrap_or_else(|e| {
+        tracing::error!("hardware motor zero worker failed: {e}");
         Err(CalibError::new(
             500,
             "INTERNAL",

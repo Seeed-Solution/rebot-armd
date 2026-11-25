@@ -4976,6 +4976,7 @@ impl ControlState {
                 }
                 let valid = self.shutdown_committed && core.commit_shutdown();
                 if valid {
+                    core.cancel_active_commissioning_on_stop("shutdown");
                     self.control_stop.store(true, Ordering::Release);
                 } else {
                     self.shutdown_committed = false;
@@ -7450,6 +7451,9 @@ fn control_thread_main(
                                 &mut release_flags,
                                 &mut maint_req_id,
                             );
+                            if !control_stop.load(Ordering::Acquire) {
+                                core.service_commissioning_release(ctx, release_deadline, &now_inst);
+                            }
                             control_stop.load(Ordering::Acquire)
                         },
                     );

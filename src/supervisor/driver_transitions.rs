@@ -1156,6 +1156,22 @@ impl SupervisorInner {
     pub(crate) fn probe_driver_limits_bounded(
         &self,
     ) -> Result<CandidateDriverLimits, crate::safety::BoundedText<256>> {
+        self.probe_driver_limits_with_offset_shift_bounded(None)
+    }
+
+    /// Probes driver limits for candidate `new_offsets` BEFORE mutating `ZeroOffsetDriver`
+    /// (zero heap allocations).
+    pub(crate) fn probe_driver_limits_for_offsets_bounded(
+        &self,
+        new_offsets: &[f32],
+    ) -> Result<CandidateDriverLimits, crate::safety::BoundedText<256>> {
+        self.probe_driver_limits_with_offset_shift_bounded(Some(new_offsets))
+    }
+
+    fn probe_driver_limits_with_offset_shift_bounded(
+        &self,
+        candidate_offsets: Option<&[f32]>,
+    ) -> Result<CandidateDriverLimits, crate::safety::BoundedText<256>> {
         use crate::safety::BoundedText;
         const MAX_DOF: usize = crate::rt_core::mailbox::MAX_DOF;
         let dof = self.config.dof;
@@ -1172,7 +1188,16 @@ impl SupervisorInner {
             d.with_ref(|drv| {
                 for i in 0..dof {
                     vel_limits[i] = drv.max_command_velocity(i);
-                    pos_limits[i] = drv.position_limits(i);
+                    pos_limits[i] = drv.position_limits(i).map(|(lo, hi)| {
+                        if let Some(new_off) = candidate_offsets {
+                            let old = self.joint_zero_offsets.get(i).copied().unwrap_or(0.0);
+                            let next = new_off.get(i).copied().unwrap_or(old);
+                            let shift = old - next;
+                            (lo + shift, hi + shift)
+                        } else {
+                            (lo, hi)
+                        }
+                    });
                 }
             })
             .is_some()
@@ -3000,6 +3025,11 @@ impl SupervisorInner {
         if self.shutdown_committed {
             return Err(SafetyError::EStopActive);
         }
+        if self.core.motion_inhibited_by_config() {
+            return Err(SafetyError::ClearFaultRejected(
+                "CONFIG_BUSY: configuration or hardware commissioning reconciliation is active; rearm is blocked".into(),
+            ));
+        }
         if let Some(ref err) = self.driver_config_error {
             return Err(SafetyError::MotionForbiddenInFaultState(format!("Driver limit configuration error: {err}")));
         }
@@ -3259,8 +3289,11 @@ impl SupervisorInner {
 
     /// Zero-allocation RT preflight for torque enable (all refusal paths return static codes).
     fn enable_prepare_rt_precheck(&self) -> Result<(), &'static str> {
-        if self.calibration_busy && self.motor_zero_busy {
+        if (self.calibration_busy && self.motor_zero_busy) || self.commissioning.is_active() {
             return Err("MOTION_BUSY");
+        }
+        if self.core.motion_inhibited_by_config() {
+            return Err("CONFIG_BUSY");
         }
         if self.torque_transition.is_some() {
             return Err("TRANSITION_BUSY");
@@ -4506,6 +4539,7 @@ impl SupervisorInner {
             "FAULT_ACTIVE" => MotionInstallError::FaultActive,
             "HANDOVER_SETTLING" => MotionInstallError::HandoverSettling,
             "FEEDBACK_UNAVAILABLE" | "FEEDBACK_STALE" => MotionInstallError::FeedbackStale,
+            "CONFIG_BUSY" => MotionInstallError::ConfigBusy,
             "MOTION_BUSY" | "TRANSITION_BUSY" | "DISABLE_PENDING" => MotionInstallError::MotionBusy,
             _ => MotionInstallError::EnableFailed,
         };

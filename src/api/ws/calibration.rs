@@ -67,37 +67,13 @@ pub(super) fn is_calibration_path(path: &str) -> bool {
 }
 
 /// Returns true if `path` (and its request body) is an out-of-scope hardware commissioning
-/// operation that must still fail closed with `409 EXECUTOR_UNSUPPORTED` on the RT executor.
+/// operation that must fail closed with `409 EXECUTOR_UNSUPPORTED` on the RT executor.
+/// With C-F1 part 2, all six calibration / zero / MIT endpoints route through the executor.
 pub(super) async fn is_executor_calibration_unsupported(
-    path: &str,
-    body: &Value,
-    sup: &Arc<ArmSupervisor>,
+    _path: &str,
+    _body: &Value,
+    _sup: &Arc<ArmSupervisor>,
 ) -> bool {
-    if path == crate::mit::TIMEOUT_PATH || path == crate::mit::QUALIFICATION_PATH {
-        return true;
-    }
-    if path == crate::motor_zero::RESTORE_PATH {
-        return sup
-            .published_config()
-            .await
-            .map_or(true, |cfg| cfg.has_driver);
-    }
-    if path == crate::motor_zero::PATH {
-        let Ok(pub_cfg) = sup.published_config().await else {
-            return true;
-        };
-        if pub_cfg.has_driver {
-            return true;
-        }
-        return match body.get("method") {
-            Some(Value::String(m)) if m == "motor" => true,
-            Some(Value::String(m)) if m == "software" => false,
-            None | Some(Value::Null) => pub_cfg.calibration_tools().motor_zero.motor,
-            // Invalid method values (non-string or unknown string) fall through to software
-            // validation so they return the exact legacy `400 INVALID_COMMAND` reply.
-            Some(_) => false,
-        };
-    }
     false
 }
 
@@ -231,7 +207,11 @@ pub(super) async fn handle_executor_calibration_ws(
         lease_holder: auth.lease_holder,
     };
 
-    if path == crate::motor_zero::PATH || path == crate::motor_zero::RESTORE_PATH {
+    if path == crate::motor_zero::PATH
+        || path == crate::motor_zero::RESTORE_PATH
+        || path == crate::mit::TIMEOUT_PATH
+        || path == crate::mit::QUALIFICATION_PATH
+    {
         // Match legacy `ws.rs:2902` precedence authoritatively on RT: validate live owner lease,
         // epoch, stop_gen, and operator grant BEFORE checking `calibration_busy` and BEFORE body parsing.
         match recv_supervisor
@@ -263,6 +243,80 @@ pub(super) async fn handle_executor_calibration_ws(
                         "unexpected ingress check reply",
                     ),
                 ));
+            }
+        }
+    }
+
+    if path == crate::mit::TIMEOUT_PATH {
+        match crate::mit::check_mit_timeout_executor(recv_supervisor, &body, &auth).await {
+            Ok((cmd, pre_guard)) => {
+                if let Some(ref g) = pre_guard {
+                    auth.txn_id = Some(g.txn_id());
+                }
+                let (sup, calib, tx) = (recv_supervisor.clone(), recv_calib.clone(), ack_tx.clone());
+                let req_id_job = request_id.clone();
+                let job = tokio::spawn(async move {
+                    match crate::mit::run_mit_timeout_executor_with_guard(
+                        &sup,
+                        &calib,
+                        cmd,
+                        auth,
+                        pre_guard,
+                    )
+                    .await
+                    {
+                        Ok(v) => fields_ack(&req_id_job, v),
+                        Err(e) => calibration_reject(&req_id_job, &e),
+                    }
+                });
+                forward_deferred_calib_job(worker_tasks, job, request_id, tx);
+                return None;
+            }
+            Err(e) => {
+                if e.code == "LEASE_LOST" {
+                    return Some(ingress_calib_reject(
+                        &request_id,
+                        epoch,
+                        crate::rt_core::requests::config::ConfigError::LeaseLost,
+                    ));
+                }
+                return Some(calibration_reject(&request_id, &e));
+            }
+        }
+    }
+
+    if path == crate::mit::QUALIFICATION_PATH {
+        match crate::mit::check_mit_qualification_executor(recv_supervisor, &body, &auth).await {
+            Ok((rec, pre_guard)) => {
+                auth.txn_id = Some(pre_guard.txn_id());
+                let (sup, calib, tx) = (recv_supervisor.clone(), recv_calib.clone(), ack_tx.clone());
+                let req_id_job = request_id.clone();
+                let job = tokio::spawn(async move {
+                    match crate::mit::run_mit_qualification_executor_with_guard(
+                        &sup,
+                        &calib,
+                        rec,
+                        auth,
+                        Some(pre_guard),
+                    )
+                    .await
+                    {
+                        Ok(v) => fields_ack(&req_id_job, v),
+                        Err(e) => calibration_reject(&req_id_job, &e),
+                    }
+                });
+                forward_deferred_calib_job(worker_tasks, job, request_id, tx);
+                return None;
+            }
+            Err(e) => {
+                if e.code == "LEASE_LOST" {
+                    return Some(ingress_calib_reject(
+                        &request_id,
+                        epoch,
+                        crate::rt_core::requests::config::ConfigError::LeaseLost,
+                    ));
+                }
+                return Some(calibration_reject(&request_id, &e));
             }
         }
     }

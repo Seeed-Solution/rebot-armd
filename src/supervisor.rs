@@ -1154,6 +1154,9 @@ pub struct SupervisorInner {
     /// Active executor calibration transaction token bound to `calibration_busy` / `motor_zero_busy`
     /// so stale cleanup can never clear a newer transaction's busy flags.
     pub(crate) calibration_txn_id: Option<u64>,
+    /// Single preallocated tick-driven hardware commissioning state machine (C-F1 part 2).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) commissioning: crate::mit::CommissioningMachine,
     /// True when startup found an incomplete or unreadable pending calibration commit marker.
     pub(crate) calibration_quarantined: bool,
     /// Cached raw driver position limits (updated off-RT / on bounded driver-limit commits) so
@@ -2365,6 +2368,8 @@ impl SupervisorInner {
             calibration_busy: false,
             motor_zero_busy: false,
             calibration_txn_id: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            commissioning: crate::mit::CommissioningMachine::default(),
             calibration_quarantined: false,
             cached_driver_pos_limits: [None; crate::rt_core::mailbox::MAX_DOF],
             calibration_load_error: None,
@@ -5120,6 +5125,8 @@ impl SupervisorInner {
         if !ready {
             return false;
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        self.cancel_active_commissioning_on_stop("shutdown");
         self.shutdown_committed = true;
         self.estop_state.latch();
         self.stop_motion();

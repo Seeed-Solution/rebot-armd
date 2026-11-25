@@ -570,7 +570,7 @@ pub fn check_torque_owner_preflight(
             }
         });
     }
-    if inner.calibration_busy && inner.motor_zero_busy {
+    if (inner.calibration_busy && inner.motor_zero_busy) || inner.commissioning.is_active() {
         return Err(TorquePreflightError::MotionBusy { epoch_id: epoch });
     }
     if let Some(message) = body_error {
@@ -768,6 +768,11 @@ pub fn map_torque_code_to_api_error(
         }
         "HANDOVER_SETTLING" => ArmError::Safety(SafetyError::HandoverSettling).into(),
         "MOTION_BUSY" => ArmError::Safety(SafetyError::MotionBusy).into(),
+        "CONFIG_BUSY" => ApiError(
+            StatusCode::CONFLICT,
+            "a configuration change is being activated or reconciled; torque enable is refused until it ends".to_string(),
+            "CONFIG_BUSY".to_string(),
+        ),
         "STOPPED" => ArmError::Safety(SafetyError::Stopped).into(),
         "LEASE_LOST" | "NO_LEASE" | "DISCONNECTED" => ArmError::Safety(SafetyError::LeaseLost).into(),
         "EPOCH_MISMATCH" => ApiError(
@@ -1505,6 +1510,10 @@ pub fn install_lease_preempt(
         inner.handover_settling_since = None;
     }
     if old_gen != 0 {
+        #[cfg(not(target_arch = "wasm32"))]
+        if evicted.is_some() {
+            inner.cancel_active_commissioning_on_stop("LEASE_LOST");
+        }
         inner.fence_displaced_lease_generation(old_gen, needs_stop);
     } else if needs_stop {
         inner.stop_motion();
@@ -1572,6 +1581,8 @@ pub fn install_lease_release(
             Some("Control lease released"),
         );
     }
+    #[cfg(not(target_arch = "wasm32"))]
+    inner.cancel_active_commissioning_on_stop("LEASE_LOST");
     // Fence and stop active motion when valid OR when this release first observes expiry while
     // no autonomous watchdog park is active (preserving any running watchdog park explicitly).
     let stop_client_motion = valid
@@ -1619,6 +1630,10 @@ pub fn install_lease_disconnect(
         }
     });
 
+    #[cfg(not(target_arch = "wasm32"))]
+    if matches_owner.is_some() {
+        inner.cancel_active_commissioning_on_stop("LEASE_LOST");
+    }
     let Some((gen, valid)) = matches_owner else {
         return LeaseOutcome::Disconnected {
             released: false,

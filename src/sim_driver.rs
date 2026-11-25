@@ -292,7 +292,7 @@ impl SimArmDriver {
             tx_buf: Vec::with_capacity(1024),
             keepalive_bytes,
             load_only_feedback: false,
-            zero_offsets: None,
+            zero_offsets: Some(vec![0.0; dof]),
             torque_hs: None,
             abort_flag: None,
             estop_state: None,
@@ -1219,6 +1219,84 @@ impl ArmDriver for SimArmDriver {
         off[joint] = state.q[joint];
         self.cached[joint].position = 0.0;
         Ok(())
+    }
+
+    fn supports_nonblocking_motor_zero(&self) -> bool {
+        true
+    }
+
+    fn commissioning_disable_step(
+        &mut self,
+        started_at: Instant,
+        _deadline: Instant,
+        pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> crate::mit::CommissioningDisableStep {
+        if let Err(code) = pre_tx_gate() {
+            return crate::mit::CommissioningDisableStep::Revoked(code);
+        }
+        let tx_started = Instant::now();
+        let boundary_seq = self.cached_ack;
+        match self.begin_disable_torque(crate::driver::DisableKind::DisableRequested { started_at }) {
+            Ok(_) => crate::mit::CommissioningDisableStep::AllDispatched {
+                boundary_seq,
+                tx_started,
+                tx_offset_ns: None,
+            },
+            Err(ArmDriverError::TorqueOffWouldDrop) => {
+                crate::mit::CommissioningDisableStep::Refused("ARM_NOT_AT_RESTING_POSE")
+            }
+            Err(_) => crate::mit::CommissioningDisableStep::Refused("disable failed"),
+        }
+    }
+
+    fn commissioning_try_send_set_zero(
+        &mut self,
+        joint: usize,
+        _deadline: Instant,
+        pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> crate::mit::CommissioningTxStatus {
+        if let Err(code) = pre_tx_gate() {
+            return crate::mit::CommissioningTxStatus::Revoked(code);
+        }
+        if joint >= self.dof {
+            return crate::mit::CommissioningTxStatus::Refused("joint out of range");
+        }
+        if self.enable_requested || self.enable_state() != EnableState::Disabled {
+            return crate::mit::CommissioningTxStatus::Refused("set-zero needs torque off");
+        }
+        let Some(rx_at) = self.cached_received_at else {
+            return crate::mit::CommissioningTxStatus::Refused("no simulator state");
+        };
+        if rx_at.elapsed() > crate::driver::ZERO_FEEDBACK_MAX_AGE {
+            return crate::mit::CommissioningTxStatus::Refused("simulator state stale");
+        }
+        let tx_started = Instant::now();
+        let tx_seq = self.cached_ack;
+        if let Some(off) = self.zero_offsets.as_mut() {
+            if joint < off.len() {
+                off[joint] += self.cached[joint].position;
+            }
+        }
+        self.cached[joint].position = 0.0;
+        crate::mit::CommissioningTxStatus::Sent {
+            tx_seq,
+            tx_started,
+            tx_offset_ns: None,
+        }
+    }
+
+    fn commissioning_raw_feedback(&self, joint: usize) -> Option<crate::mit::CommissioningFeedback> {
+        let s = self.cached.get(joint)?;
+        let rx_at = self.cached_received_at?;
+        Some(crate::mit::CommissioningFeedback {
+            raw_position: s.position,
+            joint_position: s.position,
+            velocity: s.velocity,
+            motor_status: u8::from(self.cached_enabled),
+            rx_seq: self.cached_ack.saturating_add(1),
+            rx_at,
+            queue_bound: Some(rx_at),
+        })
     }
 }
 

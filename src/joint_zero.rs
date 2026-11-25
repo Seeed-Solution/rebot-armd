@@ -462,7 +462,11 @@ impl ArmDriver for ZeroOffsetDriver {
     fn motor_zero_support(&self) -> MotorZeroSupport { self.inner.motor_zero_support() }
     fn set_zero_position(&mut self, joint: usize) -> Result<(), ArmDriverError> { self.inner.set_zero_position(joint) }
     fn set_joint_zero_offsets(&mut self, offsets: &[f32]) {
-        self.offsets = offsets.to_vec();
+        if self.offsets.len() == offsets.len() {
+            self.offsets.copy_from_slice(offsets);
+        } else {
+            self.offsets = offsets.to_vec();
+        }
         if let Some(ref gate) = self.stopped_disable_gate {
             self.inner.set_stopped_disable_gate(gate.with_motor_offsets(&self.offsets));
         }
@@ -496,6 +500,74 @@ impl ArmDriver for ZeroOffsetDriver {
     fn read_motor_identity(&mut self, joints: &[usize]) -> Result<Vec<crate::mit::MotorIdentity>, ArmDriverError> { self.inner.read_motor_identity(joints) }
     fn commission_motor_timeout(&mut self, joints: &[usize], counts: u32) -> Result<Vec<crate::mit::TimeoutCommissioning>, crate::mit::TimeoutBatchError> {
         self.inner.commission_motor_timeout(joints, counts)
+    }
+    fn supports_nonblocking_commissioning(&self) -> bool {
+        self.inner.supports_nonblocking_commissioning()
+    }
+    fn supports_nonblocking_motor_zero(&self) -> bool {
+        self.inner.supports_nonblocking_motor_zero()
+    }
+    fn commissioning_motor_id(&self, joint: usize) -> Option<u16> {
+        self.inner.commissioning_motor_id(joint)
+    }
+    fn commissioning_drain_rx_step(&mut self, max_frames: u16, deadline: Instant) -> Result<(u16, bool), ArmDriverError> {
+        self.inner.commissioning_drain_rx_step(max_frames, deadline)
+    }
+    fn commissioning_clear_register_log(&mut self) {
+        self.inner.commissioning_clear_register_log();
+    }
+    fn commissioning_try_send_register_read(
+        &mut self,
+        joint: usize,
+        rid: u8,
+        deadline: Instant,
+        pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> crate::mit::CommissioningTxStatus {
+        self.inner.commissioning_try_send_register_read(joint, rid, deadline, pre_tx_gate)
+    }
+    fn commissioning_try_send_timeout_write(
+        &mut self,
+        joint: usize,
+        counts: u32,
+        deadline: Instant,
+        pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> crate::mit::CommissioningTxStatus {
+        self.inner.commissioning_try_send_timeout_write(joint, counts, deadline, pre_tx_gate)
+    }
+    fn commissioning_find_register_reply(
+        &self,
+        joint: usize,
+        write: bool,
+        rid: u8,
+        after_tx_seq: u64,
+        min_rx_at: Instant,
+        tx_offset_ns: Option<i128>,
+    ) -> Option<crate::mit::CommissioningRegReply> {
+        self.inner.commissioning_find_register_reply(joint, write, rid, after_tx_seq, min_rx_at, tx_offset_ns)
+    }
+    fn commissioning_disable_step(
+        &mut self,
+        started_at: Instant,
+        deadline: Instant,
+        pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> crate::mit::CommissioningDisableStep {
+        self.inner.commissioning_disable_step(started_at, deadline, pre_tx_gate)
+    }
+    fn commissioning_try_send_set_zero(
+        &mut self,
+        joint: usize,
+        deadline: Instant,
+        pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> crate::mit::CommissioningTxStatus {
+        self.inner.commissioning_try_send_set_zero(joint, deadline, pre_tx_gate)
+    }
+    fn commissioning_raw_feedback(&self, joint: usize) -> Option<crate::mit::CommissioningFeedback> {
+        let mut fb = self.inner.commissioning_raw_feedback(joint)?;
+        let o = self.off(joint);
+        if o != 0.0 {
+            fb.joint_position = fb.raw_position - o;
+        }
+        Some(fb)
     }
 }
 

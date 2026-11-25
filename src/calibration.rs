@@ -581,12 +581,31 @@ pub async fn load_into_with_marker_state(
 ) -> Result<(), String> {
     let quarantine_reason = match marker_state {
         PendingMarkerState::Absent => None,
-        PendingMarkerState::Present(marker_path) => Some(format!(
-            "Incomplete calibration commit marker {} found at startup; uncertain files quarantined and motion inhibited. \
-             Perform offline recovery: inspect the referenced backup directory, restore the complete affected file set \
-             (calibration.json, grasp_setup.json, poses.json, gripper_calib.json) and rebot-vision intrinsics, remove the marker file, and restart armd",
-            marker_path.display()
-        )),
+        PendingMarkerState::Present(marker_path) => {
+            let reason_tag = std::fs::read_to_string(marker_path)
+                .ok()
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                .and_then(|v| v.get("reason").and_then(|r| r.as_str()).map(String::from));
+            let guidance = match reason_tag.as_deref() {
+                Some("hardware_motor_zero") => format!(
+                    "Incomplete hardware motor-zero commissioning marker {} found at startup; motor flash zeros and on-disk config may diverge, so uncertain files are quarantined and motion/rearm are inhibited. \
+                     Perform offline hardware recovery: mechanically verify the physical arm pose and each joint's motor zero reading, re-run motor zero if a partial batch occurred, reconcile calibration.json / poses.json / gripper_calib.json from the referenced backup directory to match physical hardware, remove the marker file, and restart armd",
+                    marker_path.display()
+                ),
+                Some("mit_timeout_commissioning") => format!(
+                    "Incomplete MIT TIMEOUT commissioning marker {} found at startup; motor RAM TIMEOUT registers may be partially updated, so uncertain files are quarantined and motion/rearm are inhibited. \
+                     Perform offline hardware recovery: power-cycle the motors (clearing volatile RAM TIMEOUT) or re-commission RAM TIMEOUT on every affected joint and verify readbacks match mit_qualification, remove the marker file, and restart armd",
+                    marker_path.display()
+                ),
+                _ => format!(
+                    "Incomplete calibration commit marker {} found at startup; uncertain files quarantined and motion inhibited. \
+                     Perform offline recovery: inspect the referenced backup directory, restore the complete affected file set \
+                     (calibration.json, grasp_setup.json, poses.json, gripper_calib.json) and rebot-vision intrinsics, remove the marker file, and restart armd",
+                    marker_path.display()
+                ),
+            };
+            Some(guidance)
+        }
         PendingMarkerState::Error(err) => Some(format!(
             "Pending calibration commit marker check failed at startup ({err}); uncertain files quarantined and motion inhibited until resolved offline and restarted"
         )),

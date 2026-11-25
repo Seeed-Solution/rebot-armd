@@ -265,6 +265,17 @@ impl ConfigHold {
         Ok(())
     }
 
+    /// Advances the expected base revision of an active `Reserved` hold after an intermediate
+    /// durable commit (e.g. pre-hardware MIT qualification invalidation during `motor_zero`)
+    /// without releasing the single held reservation.
+    pub fn advance_from(&mut self, r: &mut Reservation, new_from: u64) -> Result<(), &'static str> {
+        let h = self.mine(r).ok_or("NOT_HELD")?;
+        if h.state != HoldState::Reserved { return Err("INVALID_STATE"); }
+        h.from = new_from;
+        r.from = new_from;
+        Ok(())
+    }
+
     /// Upgrades a `PersistedAwaitingActivation` hold to `Durability::Durable` once parent-directory
     /// fsync has completed before activation.
     pub fn confirm_durable(&mut self, r: &Reservation) -> Result<(), &'static str> {
