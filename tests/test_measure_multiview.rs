@@ -365,7 +365,7 @@ async fn rig_scene(config: ArmConfig, plain: bool, plain_table: bool, driver: Op
     let sup = Arc::new(ArmSupervisor::new(config));
     if let Some(d) = driver {
         d.inner.0.lock().unwrap().q = START;
-        sup.inner().write().await.driver = Some(std::sync::Mutex::new(Box::new(d)));
+        sup.inner().write().await.driver = Some(armd::supervisor_lock::DriverSlot::legacy(Box::new(d)));
     }
     let mut scene = Scene::new(0.0, vec![BoxObj { xy: [look[0], look[1]], yaw: 0.3, size: [0.05, 0.03, HEIGHT] }]);
     scene.plain_boxes = plain;
@@ -1416,7 +1416,7 @@ impl ArmDriver for QueuedFeedbackArm {
 async fn rig_with_driver(config: ArmConfig, driver: Box<dyn ArmDriver>) -> Rig {
     let (cam, _, look) = geometry(&config);
     let sup = Arc::new(ArmSupervisor::new(config));
-    sup.inner().write().await.driver = Some(std::sync::Mutex::new(driver));
+    sup.inner().write().await.driver = Some(armd::supervisor_lock::DriverSlot::legacy(driver));
     let scene = Scene::new(0.0, vec![BoxObj { xy: [look[0], look[1]], yaw: 0.3, size: [0.05, 0.03, HEIGHT] }]);
     let vision = Arc::new(FakeVision { sup: sup.clone(), cam, scene: Arc::new(scene), hide_after_start: AtomicBool::new(false), frame: AtomicU64::new(0),
         snapshots: AtomicU64::new(0), snapshot_delay_ms: AtomicU64::new(0), trigger_delay_ms: AtomicU64::new(0), freeze_snapshot: AtomicBool::new(false),

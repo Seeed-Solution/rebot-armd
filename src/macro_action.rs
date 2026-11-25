@@ -1010,6 +1010,9 @@ impl MacroCtx {
                         });
                     }
                 }
+                if let Some(a) = inner.last_action.as_ref().filter(|a| a.id == self.id) {
+                    inner.mirror_rich_action_off_rt(a);
+                }
             }
         }
         sub_res.map(|done| (done, watch)).map_err(|s| (s, true))
@@ -1152,6 +1155,9 @@ impl MacroCtx {
                             contact: contact_flag,
                         });
                     }
+                }
+                if let Some(a) = inner.last_action.as_ref().filter(|a| a.id == self.id) {
+                    inner.mirror_rich_action_off_rt(a);
                 }
             }
         }

@@ -3372,7 +3372,7 @@ fn task_unsupported(message: String) -> ArmError {
 }
 
 /// One model-changing preflight at a time (armd talks to one provider; its swap is one at a time).
-static MODEL_SWITCH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(crate) static MODEL_SWITCH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// How long a preflight waits for the provider's swap (`/api/mode` polled).
 const MODEL_SWITCH_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -5758,12 +5758,11 @@ impl Orchestrator {
                 let j7_seq = inner.core.feedback().seqs().get(g_idx).copied();
 
                 let (torque_fb, load_fb) = if let Some(ref d) = inner.driver {
-                    if let Ok(driver) = d.lock() {
+                    d.with_ref(|driver| {
                         let caps = driver.capabilities();
                         (caps.torque_feedback, caps.load_feedback)
-                    } else {
-                        (false, false)
-                    }
+                    })
+                    .unwrap_or((false, false))
                 } else {
                     (true, !inner.loads.is_empty())
                 };

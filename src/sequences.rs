@@ -2,7 +2,8 @@
 //! References are by id (poses: [`crate::poses::NamedPose::id`], episodes: the episode id);
 //! a referenced pose or episode cannot be deleted (IN_USE).
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -137,36 +138,53 @@ pub struct SequenceStore {
 impl SequenceStore {
     pub fn get(&self, id: &str) -> Option<&Sequence> { self.file.sequences.iter().find(|s| s.id == id) }
 
-    /// Zero-allocation check whether any stored, running, or reserved sequence references pose `id`.
-    pub fn is_pose_in_use(&self, id: &str) -> bool {
+    /// Active running-sequence pins filtered by the currently running action id (`None` once the
+    /// owning action is no longer running, even before async `cleanup` clears `self.pins`).
+    pub fn active_pins(&self, running_action_id: Option<u64>) -> Option<&RunPins> {
+        self.pins
+            .as_ref()
+            .filter(|p| running_action_id == Some(p.action_id))
+    }
+
+    /// Zero-allocation check whether `id` is currently running given `active_pins`.
+    pub(crate) fn is_sequence_running_with_pins(&self, id: &str, active_pins: Option<&RunPins>) -> bool {
+        !id.is_empty() && active_pins.is_some_and(|p| p.sequence_id == id)
+    }
+
+    /// Zero-allocation check whether any stored, actively running, or reserved sequence references pose `id`.
+    pub(crate) fn is_pose_in_use_with_pins(&self, id: &str, active_pins: Option<&RunPins>) -> bool {
         if id.is_empty() {
             return false;
         }
         self.file.sequences.iter().any(|s| s.pose_ids().any(|p| p == id))
-            || self
-                .pins
-                .as_ref()
-                .is_some_and(|p| p.pose_ids.iter().any(|x| x == id))
+            || active_pins.is_some_and(|p| p.pose_ids.iter().any(|x| x == id))
             || self
                 .reserved_pins
                 .as_ref()
                 .is_some_and(|p| p.pose_ids.iter().any(|x| x == id))
     }
 
-    /// Zero-allocation check whether any stored, running, or reserved sequence references episode `id`.
-    pub fn is_episode_in_use(&self, id: &str) -> bool {
+    /// Zero-allocation check whether any stored, running, or reserved sequence references pose `id`.
+    pub fn is_pose_in_use(&self, id: &str) -> bool {
+        self.is_pose_in_use_with_pins(id, self.pins.as_ref())
+    }
+
+    /// Zero-allocation check whether any stored, actively running, or reserved sequence references episode `id`.
+    pub(crate) fn is_episode_in_use_with_pins(&self, id: &str, active_pins: Option<&RunPins>) -> bool {
         if id.is_empty() {
             return false;
         }
         self.file.sequences.iter().any(|s| s.episode_ids().any(|e| e == id))
-            || self
-                .pins
-                .as_ref()
-                .is_some_and(|p| p.episode_ids.iter().any(|x| x == id))
+            || active_pins.is_some_and(|p| p.episode_ids.iter().any(|x| x == id))
             || self
                 .reserved_pins
                 .as_ref()
                 .is_some_and(|p| p.episode_ids.iter().any(|x| x == id))
+    }
+
+    /// Zero-allocation check whether any stored, running, or reserved sequence references episode `id`.
+    pub fn is_episode_in_use(&self, id: &str) -> bool {
+        self.is_episode_in_use_with_pins(id, self.pins.as_ref())
     }
 
     /// Ids of the sequences that reference pose `id` (including running or reserved saves).
@@ -224,14 +242,35 @@ pub fn validate_file(file: &SequenceFile) -> Result<(), String> {
 }
 
 impl SupervisorInner {
+    /// Action id currently in a running state, or `None` once terminal / idle.
+    pub fn running_action_id(&self) -> Option<u64> {
+        self.last_action.as_ref().filter(|a| a.is_running()).map(|a| a.id)
+    }
+
     /// Pins for the currently running sequence action; returns `None` immediately once the
     /// action reaches a terminal state (even before the async orchestrator `cleanup` runs).
     pub fn active_sequence_pins(&self) -> Option<&RunPins> {
-        self.sequences.pins.as_ref().filter(|p| {
-            self.last_action
-                .as_ref()
-                .is_some_and(|a| a.id == p.action_id && a.is_running())
-        })
+        self.sequences.active_pins(self.running_action_id())
+    }
+
+    /// Zero-allocation check whether sequence `id` is currently running.
+    pub fn is_sequence_running(&self, id: &str) -> bool {
+        self.sequences
+            .is_sequence_running_with_pins(id, self.active_sequence_pins())
+    }
+
+    /// Zero-allocation check whether pose `id` is referenced by any stored, actively running, or
+    /// reserved sequence.
+    pub fn is_pose_in_use(&self, id: &str) -> bool {
+        self.sequences
+            .is_pose_in_use_with_pins(id, self.active_sequence_pins())
+    }
+
+    /// Zero-allocation check whether episode `id` is referenced by any stored, actively running, or
+    /// reserved sequence.
+    pub fn is_episode_in_use(&self, id: &str) -> bool {
+        self.sequences
+            .is_episode_in_use_with_pins(id, self.active_sequence_pins())
     }
 
     /// Sequences that reference pose `id` (IN_USE on delete).
@@ -242,6 +281,7 @@ impl SupervisorInner {
 
     /// Sequences that reference episode `id` (IN_USE on delete).
     pub fn sequences_using_episode(&self, id: &str) -> Vec<String> {
+        if id.is_empty() { return Vec::new(); }
         self.sequences.using_episode_with_pins(id, self.active_sequence_pins())
     }
 
@@ -962,6 +1002,79 @@ pub fn begin_macro_spec(
     spec
 }
 
+type CleanupPauseHook = (String, mpsc::SyncSender<()>, mpsc::Receiver<()>);
+static TEST_CLEANUP_PAUSE_ARMED: AtomicBool = AtomicBool::new(false);
+static TEST_CLEANUP_PAUSE: OnceLock<std::sync::Mutex<Option<CleanupPauseHook>>> = OnceLock::new();
+
+/// Test hook: pauses `cleanup()` for `sequence_id` immediately after the sequence action reaches
+/// its terminal state and before `sequences.pins` is cleared, signalling `entered_rx` when paused
+/// until `release_tx` is signalled or dropped.
+#[doc(hidden)]
+pub fn arm_test_cleanup_pause(sequence_id: String) -> (mpsc::Receiver<()>, mpsc::SyncSender<()>) {
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let slot = TEST_CLEANUP_PAUSE.get_or_init(|| std::sync::Mutex::new(None));
+    *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some((sequence_id, entered_tx, release_rx));
+    TEST_CLEANUP_PAUSE_ARMED.store(true, Ordering::Release);
+    (entered_rx, release_tx)
+}
+
+/// Clears any armed [`arm_test_cleanup_pause`] hook (for RAII test cleanup).
+#[doc(hidden)]
+pub fn clear_test_cleanup_pause() {
+    TEST_CLEANUP_PAUSE_ARMED.store(false, Ordering::Release);
+    if let Some(slot) = TEST_CLEANUP_PAUSE.get() {
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+async fn maybe_pause_test_cleanup(sequence_id: &str) {
+    if !TEST_CLEANUP_PAUSE_ARMED.load(Ordering::Acquire) {
+        return;
+    }
+    let hook = TEST_CLEANUP_PAUSE.get().and_then(|m| {
+        let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+        if g.as_ref().is_some_and(|(target, _, _)| target == sequence_id) {
+            TEST_CLEANUP_PAUSE_ARMED.store(false, Ordering::Release);
+            g.take()
+        } else {
+            None
+        }
+    });
+    if let Some((_, entered_tx, release_rx)) = hook {
+        let _ = entered_tx.send(());
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = release_rx.recv();
+        })
+        .await;
+    }
+}
+
+fn run_pins_for_plan(plan: &RunPlan, action_id: u64) -> RunPins {
+    let pose_ids = plan
+        .steps
+        .iter()
+        .filter_map(|(_, s)| match s {
+            PinnedStep::Pose { pose_id, .. } => Some(pose_id.clone()),
+            _ => None,
+        })
+        .collect();
+    let episode_ids = plan
+        .steps
+        .iter()
+        .filter_map(|(_, s)| match s {
+            PinnedStep::Replay { episode_id, .. } => Some(episode_id.clone()),
+            _ => None,
+        })
+        .collect();
+    RunPins {
+        sequence_id: plan.sequence.id.clone(),
+        action_id,
+        pose_ids,
+        episode_ids,
+    }
+}
+
 fn finish_begin_setup(
     inner: &mut SupervisorInner,
     sup: &Arc<ArmSupervisor>,
@@ -970,9 +1083,8 @@ fn finish_begin_setup(
     stamp: crate::supervisor::AdmissionStamp,
     deadline: Instant,
 ) -> (u64, f64) {
-    let pose_ids = plan.steps.iter().filter_map(|(_, s)| match s { PinnedStep::Pose { pose_id, .. } => Some(pose_id.clone()), _ => None }).collect();
-    let episode_ids = plan.steps.iter().filter_map(|(_, s)| match s { PinnedStep::Replay { episode_id, .. } => Some(episode_id.clone()), _ => None }).collect();
-    inner.sequences.pins = Some(RunPins { sequence_id: plan.sequence.id.clone(), action_id: id, pose_ids, episode_ids });
+    let sequence_id = plan.sequence.id.clone();
+    inner.sequences.pins = Some(run_pins_for_plan(&plan, id));
     let first = plan.steps.first().map(|(i, s)| (*i, s.kind()));
     inner.update_action(id, |a| {
         a.sequence_id = Some(plan.sequence.id.clone());
@@ -988,7 +1100,7 @@ fn finish_begin_setup(
     tokio::spawn(async move {
         let worker = { let sup = sup.clone(); tokio::spawn(async move { run(sup, id, plan, stamp, deadline).await }) };
         let outcome = worker.await;
-        cleanup(&sup, id, stamp, deadline, outcome.err().map(|e| e.to_string())).await;
+        cleanup(&sup, id, &sequence_id, stamp, deadline, outcome.err().map(|e| e.to_string())).await;
     });
     (id, duration)
 }
@@ -1107,6 +1219,15 @@ pub async fn begin_executor(
     let (id, _req_id) =
         crate::macro_action::begin_macro_executor(sup, &action_stamp, spec, action_stamp.deadline)
             .await?;
+    let pins = run_pins_for_plan(&plan, id);
+    let _ = sup
+        .dispatch_config_request_owned_reliable(
+            crate::rt_core::requests::config::ConfigRequest::InstallSequenceRunPins(pins.clone()),
+        )
+        .await;
+    sup.published_config_hub().update(|cfg| {
+        cfg.sequences.pins = Some(pins);
+    });
     tracing::info!(
         "Sequence {} ('{}', id {}) started on RT executor ({} steps, {} repeats)",
         id,
@@ -1115,6 +1236,7 @@ pub async fn begin_executor(
         plan.steps.len(),
         plan.repeats
     );
+    let sequence_id = plan.sequence.id.clone();
     let sup = sup.clone();
     tokio::spawn(async move {
         let worker = {
@@ -1122,7 +1244,7 @@ pub async fn begin_executor(
             tokio::spawn(async move { run(sup, id, plan, stamp, deadline).await })
         };
         let panic = worker.await.err().map(|e| e.to_string());
-        cleanup(&sup, id, stamp, deadline, panic).await;
+        cleanup(&sup, id, &sequence_id, stamp, deadline, panic).await;
     });
     Ok((id, expected))
 }
@@ -1132,10 +1254,12 @@ pub async fn begin_executor(
 async fn cleanup(
     sup: &Arc<ArmSupervisor>,
     id: u64,
+    sequence_id: &str,
     stamp: crate::supervisor::AdmissionStamp,
     deadline: Instant,
     panic: Option<String>,
 ) {
+    maybe_pause_test_cleanup(sequence_id).await;
     if sup.owner_mode() == crate::supervisor::OWNER_EXECUTOR {
         if let Some(e) = panic {
             tracing::error!("Sequence {id} orchestrator failed: {e}");
@@ -1158,6 +1282,18 @@ async fn cleanup(
             )
             .await;
         }
+        let _ = sup
+            .dispatch_config_request_owned_reliable(
+                crate::rt_core::requests::config::ConfigRequest::ClearSequenceRunPins {
+                    action_id: id,
+                },
+            )
+            .await;
+        sup.published_config_hub().update(|cfg| {
+            if cfg.sequences.pins.as_ref().is_some_and(|p| p.action_id == id) {
+                cfg.sequences.pins = None;
+            }
+        });
         return;
     }
     let owned = sup.inner().read().await.recording.as_ref()

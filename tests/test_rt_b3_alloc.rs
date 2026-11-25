@@ -570,7 +570,7 @@ async fn clear_fault_refusals_zero_alloc_unchanged_outcome_and_identical_api_tex
     rs.measured_velocities[0] = 0.25;
     rs.measured_positions[1] = rs.config.resting_positions()[1] + 0.5;
     rs.torques[1] = 4.0;
-    let legacy_reason = rs.resting_pose_support_violation_with_driver(Some(rs.driver.as_ref().unwrap().lock().unwrap().as_ref())).unwrap();
+    let legacy_reason = rs.resting_pose_support_violation_with_driver(Some(rs.driver.as_ref().unwrap().read().unwrap().as_ref())).unwrap();
     let _ = alloc::take();
     let err_rs = rs.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)).unwrap_err();
     assert_eq!(alloc::take().calls, 0, "resting support refusal allocated");
@@ -582,7 +582,7 @@ async fn clear_fault_refusals_zero_alloc_unchanged_outcome_and_identical_api_tex
     rs.torques.fill(0.0);
     rs.measured_positions = rs.config.resting_positions().to_vec();
     for j in 0..5 { rs.measured_positions[j] += 0.06; }
-    let legacy_tot = rs.resting_pose_support_violation_with_driver(Some(rs.driver.as_ref().unwrap().lock().unwrap().as_ref())).unwrap();
+    let legacy_tot = rs.resting_pose_support_violation_with_driver(Some(rs.driver.as_ref().unwrap().read().unwrap().as_ref())).unwrap();
     let _ = alloc::take();
     let err_tot = rs.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)).unwrap_err();
     assert_eq!(alloc::take().calls, 0, "total-deviation resting refusal allocated");
@@ -591,7 +591,7 @@ async fn clear_fault_refusals_zero_alloc_unchanged_outcome_and_identical_api_tex
     // Workspace violation -> exact parity with legacy.
     rs.measured_positions = rs.config.resting_positions().to_vec();
     if let Some(ws) = rs.config.workspace.as_mut() { ws.floor_z_m = 2.0; }
-    let legacy_ws = rs.resting_pose_support_violation_with_driver(Some(rs.driver.as_ref().unwrap().lock().unwrap().as_ref())).unwrap();
+    let legacy_ws = rs.resting_pose_support_violation_with_driver(Some(rs.driver.as_ref().unwrap().read().unwrap().as_ref())).unwrap();
     let _ = alloc::take();
     let err_ws = rs.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)).unwrap_err();
     assert_eq!(alloc::take().calls, 0, "workspace resting refusal allocated");
@@ -1028,7 +1028,7 @@ async fn remaining_safety_paths_zero_alloc_fault_producers_gravity_comp_estop_an
     ws_inner.measured_velocities = vec![0.0; ws_inner.config.dof];
     ws_inner.torques = vec![0.0; ws_inner.config.dof];
     let legacy_ws_msg = ws_inner
-        .resting_pose_support_violation_with_driver(Some(ws_inner.driver.as_ref().unwrap().lock().unwrap().as_ref()))
+        .resting_pose_support_violation_with_driver(Some(ws_inner.driver.as_ref().unwrap().read().unwrap().as_ref()))
         .unwrap();
 
     let _ = alloc::take();
@@ -1166,7 +1166,7 @@ fn api_clear_fault_messages_mark_resting_overflow_and_utf8_driver_truncation() {
     inner.torques = vec![5.0; inner.config.dof]; // fails all 37 torque limits
 
     let legacy_reason = inner
-        .resting_pose_support_violation_with_driver(Some(inner.driver.as_ref().unwrap().lock().unwrap().as_ref()))
+        .resting_pose_support_violation_with_driver(Some(inner.driver.as_ref().unwrap().read().unwrap().as_ref()))
         .unwrap();
     assert!(legacy_reason.ends_with(" (+6 more)"), "37 torque + 1 workspace = 38 -> +6 more: {legacy_reason}");
     assert_eq!(legacy_reason.matches("; ").count(), MAX_RESTING_SUPPORT_ITEMS - 1, "{legacy_reason}");
@@ -3640,7 +3640,7 @@ fn mit_recovery_no_fence_ack_or_state_change_before_clear_check_passes() {
                 clock.advance(Duration::from_millis(12));
             }
             bus.with(|s| s.push_all_feedback());
-            let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+            let mut drv = inner.driver.as_mut().unwrap().write().unwrap();
             drv.begin_control_release(100 + i as u64);
             drv.read_joint_states().unwrap();
         }

@@ -25,6 +25,7 @@ pub(crate) mod config;
 mod motion;
 pub(crate) mod streams;
 mod actions;
+pub(crate) mod terminal_capture;
 mod torque_off;
 
 /// Broker side of the servo, teleop and policy latest-target path (track D); the WS loop
@@ -825,6 +826,16 @@ pub struct TickPublished {
     pub kept: Option<ArmObservation>,
     /// End of the tick body (the tick phase mark), None without phase timing.
     pub body_end: Option<Instant>,
+    /// Wall duration (µs) spent in edge-triggered terminal-action capture before publish.
+    pub phase_terminal_us: u32,
+    /// Wall duration (µs) spent strictly in `StatePublisher::publish_with_rt_meta` (disjoint from
+    /// terminal capture, including early supersession/materialization).
+    pub publish_only_us: u32,
+    /// True if at least one newly terminal action record was pushed during this publish.
+    pub captured_any: bool,
+    /// Context-switch baseline sampled strictly before `capture_edge_terminals` so `mid_nvcsw`
+    /// attributes any voluntary switch during terminal capture, publish, ACK flush, or guard drop.
+    pub mid_csw_start: Option<crate::diagnostics::tick::CswMark>,
 }
 
 /// Phase of an off-owner deferred park continuation (MIT moving-park handback or bounded
@@ -1181,6 +1192,11 @@ pub struct SupervisorInner {
     /// A motor zero runs (`crate::motor_zero`, with `calibration_busy`): torque on and
     /// clear_fault are refused too.
     pub motor_zero_busy: bool,
+    /// Active executor calibration transaction token bound to `calibration_busy` / `motor_zero_busy`
+    /// so stale cleanup can never clear a newer transaction's busy flags.
+    pub(crate) calibration_txn_id: Option<u64>,
+    /// True when startup found an incomplete or unreadable pending calibration commit marker.
+    pub(crate) calibration_quarantined: bool,
     /// Cached raw driver position limits (updated off-RT / on bounded driver-limit commits) so
     /// RT gripper calibration validation never acquires the driver mutex on `armd-control`.
     pub(crate) cached_driver_pos_limits: [Option<(f32, f32)>; crate::rt_core::mailbox::MAX_DOF],
@@ -1216,7 +1232,9 @@ pub struct SupervisorInner {
     /// Episode store (`--episodes-dir`, `src/recording/store.rs`).
     pub episodes: crate::recording::EpisodeStore,
     pub start_time: Instant,
-    pub driver: Option<std::sync::Mutex<Box<dyn ArmDriver>>>,
+    pub driver: Option<crate::supervisor_lock::DriverSlot>,
+    /// Shared counter of forbidden `DriverLock` acquisitions attempted on `armd-control`.
+    pub(crate) driver_lock_attempts: Arc<AtomicU64>,
     pub gravity_compensated: bool,
     pub gravity_torques: Vec<f32>,
     pub gravity_scale: f32,
@@ -1390,7 +1408,7 @@ pub struct SupervisorInner {
     pub(crate) pending_retired_stops: std::collections::VecDeque<crate::rt_core::urgent::RetiredStopPayloads>,
     /// Coalesced sorted inclusive intervals `(lo, hi)` of closed WS connection IDs (`>= 1`),
     /// set under the owner lock during teardown and checked on every motion/output install.
-    closed_connections: ClosedConnections,
+    pub(crate) closed_connections: ClosedConnections,
     /// Fixed-capacity table of currently registered live WS connection IDs (`MAX_LIVE_CONNECTIONS`).
     /// Zero heap allocations; rejects unknown or closed non-zero connection IDs fail-closed.
     pub(crate) live_connections: LiveConnections,
@@ -1405,6 +1423,39 @@ pub struct SupervisorInner {
     /// Shared per-connection bounded action-terminal FIFO broadcaster (wired by `ArmSupervisor::new`;
     /// `None` on standalone `SupervisorInner::new`, never locked on `armd-control`).
     terminals: Option<Arc<TerminalBroadcaster>>,
+    /// When true (inside `ArmSupervisor::tick_shared` write guard), terminal action transitions
+    /// stage into `staged_terminals` and flush via the lock-free SPSC ring instead of touching
+    /// `TerminalBroadcaster`'s mutex under the tick guard.
+    pub(crate) defer_terminal_capture: bool,
+    /// Lock-free SPSC producer for edge-triggered fixed-size terminal records (`&mut self` only).
+    terminal_capture_tx: Option<terminal_capture::TerminalCaptureTx>,
+    /// Shared off-thread consumer + atomic accounting for terminal captures (`rx` never locked on RT).
+    terminal_capture_channel: Option<Arc<terminal_capture::TerminalCaptureChannel>>,
+    /// Inline fixed-size staging buffer for terminal transitions within one release before publish.
+    staged_terminals: terminal_capture::StagedTerminalBuf,
+    /// Fixed-size dedupe tracker keyed by `(action_id, terminal_seq)` preventing dwell re-capture.
+    terminal_edge_tracker: terminal_capture::TerminalEdgeTracker,
+    /// Accumulated wall time (µs) spent in `capture_edge_terminals` during the latest release.
+    last_phase_terminal_us: u32,
+    /// Wall time (µs) spent strictly in `StatePublisher::publish_with_rt_meta` during the latest
+    /// release (disjoint from `last_phase_terminal_us`).
+    last_publish_only_us: u32,
+    /// Context-switch baseline sampled right before the FIRST terminal capture of the release
+    /// (whether early supersession/materialization or `capture_edge_terminals`), consumed by
+    /// `publish_at` / RT Executor so `mid_nvcsw` attributes stalls in every capture path.
+    first_terminal_csw_mark: Option<crate::diagnostics::tick::CswMark>,
+    /// Preserved `mid_csw_start` from the latest `publish_at` so RT Executor (`CoreOps::publish`
+    /// drops `TickPublished`) can still compute `mid_nvcsw`/`mid_nivcsw` across capture+publish.
+    last_mid_csw_start: Option<crate::diagnostics::tick::CswMark>,
+    /// Dedicated per-tick cached driver state read exclusively by terminal capture (isolated
+    /// from hardware park/torque-off interlock fields `last_poll_*`).
+    pub(crate) capture_driver_cache: terminal_capture::CaptureDriverCache,
+    /// Prebuilt template observation used only by off-tick terminal drain when `hub` has not published.
+    template_obs_for_drain: Option<Arc<ArmObservation>>,
+    /// Doc-hidden deterministic test seam invoked at entry (`true`) and exit (`false`) of
+    /// `capture_edge_terminals` (`None` in production, 0 alloc).
+    #[doc(hidden)]
+    pub terminal_capture_test_hook: Option<Arc<dyn Fn(&SupervisorInner, bool) + Send + Sync>>,
     /// Monotonic count of deferred safety log events dropped at the RT->off-thread SPSC ring.
     pub(crate) safety_log_ring_dropped: u64,
     /// Deterministic test hook invoked inside `publish_at` strictly before `core.publish(...)`.
@@ -1522,7 +1573,7 @@ pub struct SupervisorInner {
     /// Monotonic revision for `config.power_budget` (starts at 1; checked by prepared actions).
     pub power_budget_revision: u64,
     /// Lock-free exact closed-connection bitset shared with the RT `Broker` (checked on RT commits).
-    rt_closed_connections: Option<Arc<crate::rt_core::requests::actions::ClosedBitset>>,
+    pub(crate) rt_closed_connections: Option<Arc<crate::rt_core::requests::actions::ClosedBitset>>,
 }
 
 /// Single-sample snapshot of active J7 `PosForce` freshness and freeze position.
@@ -2020,6 +2071,70 @@ impl ClosedConnections {
     }
 }
 
+/// Borrowed snapshot of owner-side live disconnect fence & E-stop state checked immediately before
+/// transmitting gravity-comp targets (shared by periodic and immediate write paths).
+#[derive(Clone, Copy)]
+pub(crate) struct LiveDisconnectFenceView<'a> {
+    e_stop_latched: &'a crate::rt_core::urgent::EstopLatchView,
+    pending_disconnect_hold: &'a AtomicU64,
+    atomic_fenced_lease_gen: &'a AtomicU64,
+    fenced_lease_generation: u64,
+    active_lease_conn_id: u64,
+    active_lease_gen: Option<u64>,
+    closed_connections: &'a ClosedConnections,
+    rt_closed_connections: Option<&'a crate::rt_core::requests::actions::ClosedBitset>,
+    shared_closed_bitset: &'a crate::rt_core::requests::actions::ClosedBitset,
+}
+
+impl<'a> LiveDisconnectFenceView<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        e_stop_latched: &'a crate::rt_core::urgent::EstopLatchView,
+        pending_disconnect_hold: &'a AtomicU64,
+        atomic_fenced_lease_gen: &'a AtomicU64,
+        fenced_lease_generation: u64,
+        active_lease_conn_id: u64,
+        active_lease_gen: Option<u64>,
+        closed_connections: &'a ClosedConnections,
+        rt_closed_connections: Option<&'a crate::rt_core::requests::actions::ClosedBitset>,
+        shared_closed_bitset: &'a crate::rt_core::requests::actions::ClosedBitset,
+    ) -> Self {
+        Self {
+            e_stop_latched,
+            pending_disconnect_hold,
+            atomic_fenced_lease_gen,
+            fenced_lease_generation,
+            active_lease_conn_id,
+            active_lease_gen,
+            closed_connections,
+            rt_closed_connections,
+            shared_closed_bitset,
+        }
+    }
+
+    pub(crate) fn estop_latched(&self) -> bool {
+        self.e_stop_latched.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn blocks_non_hold(&self) -> bool {
+        if self.pending_disconnect_hold.load(Ordering::SeqCst) > 0 {
+            return true;
+        }
+        if self.atomic_fenced_lease_gen.load(Ordering::SeqCst) > self.fenced_lease_generation {
+            return true;
+        }
+        let conn_closed = self.active_lease_conn_id != 0
+            && (self.closed_connections.is_closed(self.active_lease_conn_id)
+                || self
+                    .rt_closed_connections
+                    .is_some_and(|b| b.is_closed(self.active_lease_conn_id))
+                || self
+                    .shared_closed_bitset
+                    .is_closed(self.active_lease_conn_id));
+        conn_closed && self.active_lease_gen.is_some_and(|g| g > self.fenced_lease_generation)
+    }
+}
+
 /// Preallocated capacity for [`ConsumedStamps`] disjoint intervals above `watermark`.
 const CONSUMED_STAMPS_INTERVAL_CAP: usize = 256;
 
@@ -2334,6 +2449,8 @@ impl SupervisorInner {
             hover_jobs: Vec::new(),
             calibration_busy: false,
             motor_zero_busy: false,
+            calibration_txn_id: None,
+            calibration_quarantined: false,
             cached_driver_pos_limits: [None; crate::rt_core::mailbox::MAX_DOF],
             calibration_load_error: None,
             joint_zero_offsets: vec![0.0; dof],
@@ -2352,6 +2469,7 @@ impl SupervisorInner {
             episodes: crate::recording::EpisodeStore::new(Some(PathBuf::from(crate::recording::store::FALLBACK_EPISODES_DIR))),
             start_time: now,
             driver: None,
+            driver_lock_attempts: Arc::new(AtomicU64::new(0)),
             gravity_compensated,
             gravity_torques: Vec::new(),
             gravity_scale: 0.5,
@@ -2448,6 +2566,18 @@ impl SupervisorInner {
             consumed_stamps: ConsumedStamps::new(),
             consumed_broker_stamps: ConsumedStamps::new(),
             terminals: None,
+            defer_terminal_capture: false,
+            terminal_capture_tx: None,
+            terminal_capture_channel: None,
+            staged_terminals: terminal_capture::StagedTerminalBuf::default(),
+            terminal_edge_tracker: terminal_capture::TerminalEdgeTracker::default(),
+            last_phase_terminal_us: 0,
+            last_publish_only_us: 0,
+            first_terminal_csw_mark: None,
+            last_mid_csw_start: None,
+            capture_driver_cache: terminal_capture::CaptureDriverCache::default(),
+            template_obs_for_drain: None,
+            terminal_capture_test_hook: None,
             safety_log_ring_dropped: 0,
             before_publish_hook: None,
             tx_joint_no_progress_ticks: vec![0; dof],
@@ -2587,12 +2717,22 @@ impl SupervisorInner {
     }
 
     /// Current owner-serialized stop generation.
-    pub fn current_stop_gen(&self) -> u64 {
-        let local = self.stop_gen.load(Ordering::SeqCst);
-        match self.stop_requests.as_ref() {
+    /// Single authoritative computation of the effective stop generation combining owner-local
+    /// `stop_gen` with the lock-free `StopRequests` handle when attached.
+    #[inline]
+    pub(crate) fn compute_current_stop_gen(
+        stop_gen: &AtomicU64,
+        stop_requests: Option<&crate::rt_core::urgent::StopRequests>,
+    ) -> u64 {
+        let local = stop_gen.load(Ordering::SeqCst);
+        match stop_requests {
             Some(stops) => local.max(stops.current()),
             None => local,
         }
+    }
+
+    pub fn current_stop_gen(&self) -> u64 {
+        Self::compute_current_stop_gen(&self.stop_gen, self.stop_requests.as_ref())
     }
 
     /// Effective highest fenced lease generation, combining owner-local and lock-free immediate
@@ -3131,48 +3271,504 @@ impl SupervisorInner {
         self.abort_enable_transition_for_fenced_lease_impl(displaced_gen);
     }
 
-    /// Ensures every subscribed connection's bounded terminal FIFO has room for any action
-    /// superseded by this start plus the new action's eventual terminal (never drops a terminal).
+    /// Ensures every subscribed connection's bounded terminal FIFO (plus staged and in-flight
+    /// SPSC captures) has room for any action superseded by this start plus the new action's
+    /// eventual terminal (never drops a terminal).
     pub(crate) fn check_terminal_fifo_for_new_action(&self) -> Result<(), SafetyError> {
         let Some(terminals) = self.terminals.as_ref() else {
             return Ok(());
         };
         let has_running = self.last_action.as_ref().is_some_and(|a| a.is_running());
-        if !terminals.can_start_action(has_running, self.rt_executor_owned) {
+        let staged = self.staged_terminals.len();
+        let (inflight, ring_admission_cap) = match self.terminal_capture_channel.as_ref() {
+            Some(ch) => (ch.inflight(), ch.admission_cap()),
+            None => (0, TERMINAL_FIFO_CAPACITY),
+        };
+        if !terminals.can_start_action_with_inflight(
+            has_running,
+            self.rt_executor_owned || self.defer_terminal_capture,
+            staged,
+            inflight,
+            ring_admission_cap,
+        ) {
             return Err(SafetyError::TerminalsBusy);
         }
         Ok(())
     }
 
-    /// Records a finished action (`!is_running()`) into every subscribed connection's bounded
-    /// terminal FIFO (deduped by action ID) and wakes `armd-dispatch` immediately. Skipped on
-    /// `armd-control` (`rt_executor_owned == true`) so RT ticks stay lock-free/zero-alloc.
-    pub(crate) fn record_finished_action(&self, action: &ActionStatus) {
-        if self.rt_executor_owned || action.is_running() {
+    /// Lock-free read of the attached driver's clock without ever acquiring `self.driver.lock()`.
+    #[inline]
+    pub(crate) fn cached_driver_clock_now(&self) -> Instant {
+        self.driver_clock.as_ref().map_or_else(Instant::now, |c| c.now())
+    }
+
+    /// Per-tick cached hardware enable state for terminal capture (zero driver mutex acquisitions,
+    /// isolated from hardware interlock `last_poll_enable_state`).
+    #[inline]
+    pub(crate) fn cached_enable_state(&self) -> EnableState {
+        if self.driver.is_some() {
+            self.capture_driver_cache.enable_state
+        } else if self.is_torqued {
+            EnableState::Enabled
+        } else {
+            EnableState::Disabled
+        }
+    }
+
+    /// Per-tick cached driver capabilities for terminal capture (zero driver mutex acquisitions).
+    #[inline]
+    pub(crate) fn cached_capture_driver_caps(&self) -> DriverCapabilities {
+        if self.driver.is_some() {
+            self.capture_driver_cache.driver_caps
+        } else {
+            self.driver_caps
+        }
+    }
+
+    /// Per-tick cached hardware feedback freshness within `max_age` (zero driver mutex acquisitions).
+    /// Derives freshness from the exact same per-joint age computation used for `feedback_age_ms`
+    /// in `TerminalCaptureRecord`, never mutating `ArmCore::feedback().instants()` or hardware park
+    /// interlock fields.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn cached_hardware_feedback_fresh(&self, max_age: Duration) -> bool {
+        let dof = self.config.dof.min(terminal_capture::CAPTURE_MAX_DOF);
+        terminal_capture::evaluate_cached_feedback_fresh(
+            self.feedback_numeric_valid,
+            self.capture_driver_cache.feedback_valid,
+            self.driver.is_some(),
+            dof,
+            self.core.feedback().instants(),
+            &self.capture_driver_cache.ages[..usize::from(self.capture_driver_cache.ages_len)],
+            self.capture_driver_cache.feedback_at,
+            self.cached_driver_clock_now(),
+            max_age,
+        )
+    }
+
+    /// Returns a cloned handle to the shared off-thread `TerminalCaptureChannel` (wired by
+    /// `ArmSupervisor::new`, `None` on standalone `SupervisorInner::new`).
+    pub(crate) fn terminal_capture_channel(
+        &self,
+    ) -> Option<Arc<terminal_capture::TerminalCaptureChannel>> {
+        self.terminal_capture_channel.clone()
+    }
+
+    /// Shared record-construction entry point wrapping `TerminalCaptureRecord::capture_from` so
+    /// early capture paths (immediate supersession, pre-overwrite materialization, staged
+    /// eviction) are audited by `terminal_capture_test_hook` identically to `capture_edge_terminals`.
+    #[inline]
+    fn capture_terminal_record(
+        &self,
+        action: &ActionStatus,
+        terminal_seq: u64,
+        obs_timestamp: f64,
+        invoke_hook: bool,
+    ) -> terminal_capture::TerminalCaptureRecord {
+        if invoke_hook {
+            if let Some(hook) = self.terminal_capture_test_hook.as_ref() {
+                hook(self, true);
+            }
+        }
+        let rec = terminal_capture::TerminalCaptureRecord::capture_from(
+            self,
+            action,
+            terminal_seq,
+            obs_timestamp,
+        );
+        if invoke_hook {
+            if let Some(hook) = self.terminal_capture_test_hook.as_ref() {
+                hook(self, false);
+            }
+        }
+        rec
+    }
+
+    /// Off-RT helper mirroring a rich macro `ActionStatus` into `TerminalCaptureChannel`'s
+    /// bounded sidecar cache so delayed dispatch past the 2 s window preserves every field.
+    /// Never called on `armd-control` (`rt_executor_owned || defer_terminal_capture`).
+    pub(crate) fn mirror_rich_action_off_rt(&self, action: &ActionStatus) {
+        if self.rt_executor_owned || self.defer_terminal_capture {
+            return;
+        }
+        if let Some(ch) = self.terminal_capture_channel.as_ref() {
+            ch.mirror_rich_action(action);
+        }
+    }
+
+    /// Off-tick Legacy helper: drains any queued SPSC terminal captures into `TerminalBroadcaster`
+    /// while `previous_action` and `last_action` are still live so no rich macro payload can be
+    /// evicted before preservation. Early-returns without touching `hub` or `rx` when empty.
+    pub(crate) fn drain_terminal_captures_with_live_slots(&self) {
+        if self.rt_executor_owned || self.defer_terminal_capture {
+            return;
+        }
+        let (Some(ch), Some(terminals)) = (self.terminal_capture_channel.as_ref(), self.terminals.as_ref()) else {
+            return;
+        };
+        if ch.inflight() == 0 {
+            return;
+        }
+        let latest = self.core.hub().latest();
+        let live_slots = [
+            self.previous_action.as_ref().map(|(a, _)| a),
+            self.last_action.as_ref(),
+        ];
+        if let Some(tmpl) = self.template_obs_for_drain.as_ref() {
+            ch.drain_into(
+                terminals,
+                self.core.hub(),
+                latest.as_deref(),
+                &live_slots,
+                tmpl,
+                false,
+            );
+        } else {
+            let fallback = ArmObservation::blank();
+            ch.drain_into(
+                terminals,
+                self.core.hub(),
+                latest.as_deref(),
+                &live_slots,
+                &fallback,
+                false,
+            );
+        }
+    }
+
+    /// Allocates the next monotonic `terminal_seq` from the shared channel (or returns 0 on
+    /// standalone `SupervisorInner::new` without an `ArmSupervisor`).
+    #[inline]
+    fn alloc_terminal_seq(&self) -> u64 {
+        self.terminal_capture_channel
+            .as_ref()
+            .map_or(0, |ch| ch.alloc_terminal_seq())
+    }
+
+    #[inline]
+    fn find_terminal_slot(&self, action_id: u64) -> Option<&ActionStatus> {
+        if let Some(a) = self.last_action.as_ref().filter(|a| a.id == action_id && !a.is_running()) {
+            return Some(a);
+        }
+        self.previous_action
+            .as_ref()
+            .map(|(a, _)| a)
+            .filter(|a| a.id == action_id && !a.is_running())
+    }
+
+    #[inline]
+    fn flush_evicted_staged(
+        &mut self,
+        evicted: terminal_capture::StagedTerminal,
+        obs_timestamp: f64,
+        publish_seq: Option<u64>,
+        charge_timing: bool,
+    ) {
+        if self.first_terminal_csw_mark.is_none() {
+            self.first_terminal_csw_mark = Some(crate::diagnostics::tick::CswMark::now());
+        }
+        let t0 = charge_timing.then(Instant::now);
+        let rec = match evicted {
+            terminal_capture::StagedTerminal::Captured(mut r) => {
+                r.publish_seq = publish_seq;
+                r.obs_timestamp = obs_timestamp;
+                Some(r)
+            }
+            terminal_capture::StagedTerminal::Deferred {
+                action_id,
+                terminal_seq,
+            } => self.find_terminal_slot(action_id).map(|a| {
+                let mut r =
+                    self.capture_terminal_record(a, terminal_seq, obs_timestamp, true);
+                r.publish_seq = publish_seq;
+                r
+            }),
+        };
+        if let (Some(r), Some(tx)) = (rec, self.terminal_capture_tx.as_mut()) {
+            let _ = tx.try_push(r);
+        }
+        if let Some(t0) = t0 {
+            self.last_phase_terminal_us = self
+                .last_phase_terminal_us
+                .saturating_add(crate::diagnostics::tick::us(t0.elapsed()));
+        }
+    }
+
+    /// Materializes a `StagedTerminal::Deferred` entry in-place into `StagedTerminal::Captured`
+    /// right before `action_id`'s live slot (`previous_action` / `last_action`) is overwritten so
+    /// no deferred terminal can ever be silently skipped at `capture_edge_terminals`.
+    pub(crate) fn materialize_deferred_staged_by_id(&mut self, action_id: u64, obs_timestamp: f64) {
+        if self.first_terminal_csw_mark.is_none() {
+            self.first_terminal_csw_mark = Some(crate::diagnostics::tick::CswMark::now());
+        }
+        let t0 = Instant::now();
+        let Some(seq) = self.staged_terminals.deferred_seq_for(action_id) else {
+            return;
+        };
+        let Some(action) = self.find_terminal_slot(action_id) else {
+            return;
+        };
+        let rec = self.capture_terminal_record(action, seq, obs_timestamp, true);
+        self.staged_terminals.replace_deferred_with_captured(action_id, rec);
+        self.last_phase_terminal_us = self
+            .last_phase_terminal_us
+            .saturating_add(crate::diagnostics::tick::us(t0.elapsed()));
+    }
+
+    /// Authoritative `running -> !running` transition handler for a superseded `ActionStatus`
+    /// (called from `begin_action_inner` when `old` is moving into `previous_action`).
+    /// - Off-tick Legacy (`!rt_executor_owned && !defer_terminal_capture`): drains any earlier SPSC
+    ///   captures first (preserving strict `terminal_seq` order) and inserts the full `ActionStatus`
+    ///   directly into `TerminalBroadcaster`.
+    /// - In-tick Legacy or RT Executor (`defer_terminal_capture || rt_executor_owned`): captures a
+    ///   fixed-size `Copy` `TerminalCaptureRecord` into inline `staged_terminals` (0 alloc, 0 lock)
+    ///   and accounts its construction time in `last_phase_terminal_us`.
+    pub(crate) fn record_terminal_transition_for(&mut self, action: &ActionStatus) {
+        if action.is_running() || action.id == 0 {
+            return;
+        }
+        if self.terminal_edge_tracker.has_seen_action(action.id) {
+            return;
+        }
+        if self.rt_executor_owned || self.defer_terminal_capture {
+            if self.first_terminal_csw_mark.is_none() {
+                self.first_terminal_csw_mark = Some(crate::diagnostics::tick::CswMark::now());
+            }
+            let t0 = Instant::now();
+            let seq = self.alloc_terminal_seq();
+            if !self.terminal_edge_tracker.record_edge(action.id, seq) {
+                return;
+            }
+            let ts = self.now_s();
+            let rec = self.capture_terminal_record(action, seq, ts, true);
+            if let Some(oldest) = self
+                .staged_terminals
+                .push_evicting_oldest(terminal_capture::StagedTerminal::Captured(rec))
+            {
+                let next_pub_seq = Some(self.core.next_publish_seq());
+                self.flush_evicted_staged(oldest, ts, next_pub_seq, false);
+            }
+            self.last_phase_terminal_us = self
+                .last_phase_terminal_us
+                .saturating_add(crate::diagnostics::tick::us(t0.elapsed()));
+            return;
+        }
+        self.drain_terminal_captures_with_live_slots();
+        let seq = self.alloc_terminal_seq();
+        if !self.terminal_edge_tracker.record_edge(action.id, seq) {
             return;
         }
         if let Some(terminals) = self.terminals.as_ref() {
-            if terminals.record_finished(action) {
+            if terminals.record_finished_with_seq(seq, action.clone(), None, None) {
                 self.core.hub().wake();
             }
         }
     }
 
-    /// Convenience helper: if `self.last_action` matches `id` and is terminal, record it.
-    pub(crate) fn record_finished_action_by_id(&self, id: u64) {
-        if self.rt_executor_owned {
-            return;
-        }
+    /// Convenience wrapper: emits the authoritative terminal transition when `self.last_action`
+    /// matches `id` and is terminal (`!is_running()`).
+    /// On RT/guarded ticks, stages a lightweight `Deferred { action_id, terminal_seq }` edge so
+    /// `TerminalCaptureRecord::capture_from` runs inside `capture_edge_terminals` (covered by
+    /// `phases_us.terminal`, `terminal_capture_test_hook`, and capture alloc/lock proofs).
+    pub(crate) fn record_terminal_transition_by_id(&mut self, id: u64) {
         if let Some(a) = self.last_action.as_ref().filter(|a| a.id == id && !a.is_running()) {
-            self.record_finished_action(a);
+            if self.terminal_edge_tracker.has_seen_action(a.id) {
+                return;
+            }
+            if self.rt_executor_owned || self.defer_terminal_capture {
+                let action_id = a.id;
+                let seq = self.alloc_terminal_seq();
+                let _ = self.terminal_edge_tracker.record_edge(action_id, seq);
+                let ts = self.now_s();
+                if let Some(oldest) = self.staged_terminals.push_evicting_oldest(
+                    terminal_capture::StagedTerminal::Deferred {
+                        action_id,
+                        terminal_seq: seq,
+                    },
+                ) {
+                    let next_pub_seq = Some(self.core.next_publish_seq());
+                    self.flush_evicted_staged(oldest, ts, next_pub_seq, true);
+                }
+                return;
+            }
+            // Off-tick Legacy: drain ring with live slots first, then enqueue full ActionStatus.
+            self.drain_terminal_captures_with_live_slots();
+            let seq = self.alloc_terminal_seq();
+            if !self.terminal_edge_tracker.record_edge(id, seq) {
+                return;
+            }
+            if let Some(a) = self.last_action.as_ref().filter(|a| a.id == id && !a.is_running()) {
+                if let Some(terminals) = self.terminals.as_ref() {
+                    if terminals.record_finished_with_seq(seq, a.clone(), None, None) {
+                        self.core.hub().wake();
+                    }
+                }
+            }
         }
     }
 
+    /// Edge-triggered, allocation-free, lock-free capture and flush of staged terminal transitions
+    /// (plus once-per-id fallback for direct test struct mutations to `previous_action`/`last_action`)
+    /// into the preallocated SPSC ring strictly before `StatePublisher::publish_with_owner`.
+    ///
+    /// Returns `(total_terminal_phase_us, captured_any)` covering both record construction and
+    /// SPSC push.
+    pub(crate) fn capture_edge_terminals(
+        &mut self,
+        obs_timestamp: f64,
+        publish_seq: Option<u64>,
+    ) -> (u32, bool) {
+        let t0 = Instant::now();
+        if let Some(hook) = self.terminal_capture_test_hook.as_ref() {
+            hook(self, true);
+        }
+        // Fallback edge check for direct test mutations that bypassed `finish_action` /
+        // `begin_action_inner`. Respects the 2 s `previous_action` window and checks
+        // `previous_action` before `last_action` for chronological FIFO order.
+        if let Some((prev, until)) = self.previous_action.as_ref() {
+            if !prev.is_running()
+                && obs_timestamp < *until
+                && prev.id != 0
+                && !self.terminal_edge_tracker.has_seen_edge(prev.id, 0)
+            {
+                let prev_id = prev.id;
+                let seq = self.alloc_terminal_seq();
+                let _ = self.terminal_edge_tracker.record_edge(prev_id, seq);
+                if let Some(oldest) = self.staged_terminals.push_evicting_oldest(
+                    terminal_capture::StagedTerminal::Deferred {
+                        action_id: prev_id,
+                        terminal_seq: seq,
+                    },
+                ) {
+                    self.flush_evicted_staged(oldest, obs_timestamp, publish_seq, false);
+                }
+            }
+        }
+        if let Some(cur) = self.last_action.as_ref() {
+            if !cur.is_running()
+                && cur.id != 0
+                && !self.terminal_edge_tracker.has_seen_edge(cur.id, 0)
+            {
+                let cur_id = cur.id;
+                let seq = self.alloc_terminal_seq();
+                let _ = self.terminal_edge_tracker.record_edge(cur_id, seq);
+                if let Some(oldest) = self.staged_terminals.push_evicting_oldest(
+                    terminal_capture::StagedTerminal::Deferred {
+                        action_id: cur_id,
+                        terminal_seq: seq,
+                    },
+                ) {
+                    self.flush_evicted_staged(oldest, obs_timestamp, publish_seq, false);
+                }
+            }
+        }
+
+        let mut captured_any = false;
+        while let Some(staged) = self.staged_terminals.pop_front() {
+            let rec = match staged {
+                terminal_capture::StagedTerminal::Captured(mut r) => {
+                    r.publish_seq = publish_seq;
+                    r.obs_timestamp = obs_timestamp;
+                    Some(r)
+                }
+                terminal_capture::StagedTerminal::Deferred {
+                    action_id,
+                    terminal_seq,
+                } => self.find_terminal_slot(action_id).map(|a| {
+                    let mut r = terminal_capture::TerminalCaptureRecord::capture_from(
+                        self,
+                        a,
+                        terminal_seq,
+                        obs_timestamp,
+                    );
+                    r.publish_seq = publish_seq;
+                    r
+                }),
+            };
+            if let (Some(r), Some(tx)) = (rec, self.terminal_capture_tx.as_mut()) {
+                if tx.try_push(r) {
+                    captured_any = true;
+                }
+            }
+        }
+        let elapsed_us = crate::diagnostics::tick::us(t0.elapsed());
+        if let Some(hook) = self.terminal_capture_test_hook.as_ref() {
+            hook(self, false);
+        }
+        let total_us = self.last_phase_terminal_us.saturating_add(elapsed_us);
+        self.last_phase_terminal_us = total_us;
+        (total_us, captured_any)
+    }
+
+    /// Test-only helper: begins and immediately finishes a zero-alloc RT action inside the
+    /// deferred terminal-capture staging buffer so unit/integration tests can stage an edge.
+    #[doc(hidden)]
+    pub fn test_stage_completed_action_rt(&mut self, kind: &str) -> u64 {
+        let prev = self.defer_terminal_capture;
+        self.defer_terminal_capture = true;
+        let id = self.begin_action_rt(kind);
+        self.finish_action(id, "done", None, None, Some(true), None, None);
+        self.defer_terminal_capture = prev;
+        id
+    }
+
+    /// Test-only helper: installs a short zero-heap inline `ActiveTrajectory::quintic` (no
+    /// `motion_limits` heap Vec) so Legacy `control_tick` runs the real in-tick trajectory
+    /// completion -> `finish_action` -> `capture_from` -> SPSC push path with zero unrelated
+    /// trajectory deallocations.
+    #[doc(hidden)]
+    pub fn test_start_zero_heap_jog_rt(&mut self, delta_j0: f32, duration_s: f64) -> u64 {
+        let prev = self.defer_terminal_capture;
+        self.defer_terminal_capture = true;
+        let id = self.begin_action_rt("jog");
+        let start = self.commanded_positions.clone();
+        let mut target = start.clone();
+        if let Some(q0) = target.first_mut() {
+            *q0 += delta_j0;
+        }
+        let zeros = vec![0.0f32; start.len()];
+        let traj = MultiJointQuinticTrajectory::new(&start, &zeros, &target, &zeros, duration_s)
+            .expect("zero-heap quintic trajectory");
+        self.active_trajectory = Some(ActiveTrajectory::quintic(traj, Some(id)));
+        self.target_positions = target;
+        let _ = self.safety.set_torque_rt(true);
+        let _ = self.safety.mark_motion_started();
+        self.is_torqued = true;
+        self.defer_terminal_capture = prev;
+        id
+    }
+
+    /// Consumes and resets the accumulated `phases_us.terminal` duration (µs) and first-capture
+    /// CSW baseline for the current release.
+    #[inline]
+    pub(crate) fn take_phase_terminal_us(&mut self) -> u32 {
+        self.first_terminal_csw_mark = None;
+        std::mem::replace(&mut self.last_phase_terminal_us, 0)
+    }
+
+    /// Consumes the capture-window `CswMark` recorded at the first terminal capture or `publish_at`
+    /// of the current release (used by RT Executor to attribute `mid_nvcsw`/`mid_nivcsw`).
+    #[inline]
+    pub(crate) fn take_mid_csw_start(&mut self) -> Option<crate::diagnostics::tick::CswMark> {
+        self.last_mid_csw_start
+            .take()
+            .or_else(|| self.first_terminal_csw_mark.take())
+    }
+
+    /// Consumes and resets the disjoint `StatePublisher::publish_with_rt_meta` duration (µs) for
+    /// the current release (excludes `phases_us.terminal`).
+    #[inline]
+    pub(crate) fn take_publish_only_us(&mut self) -> u32 {
+        std::mem::replace(&mut self.last_publish_only_us, 0)
+    }
+
     /// Patches `failed_step` on a queued terminal action if still awaiting dispatcher drain.
+    /// Drains any pending SPSC captures first so an in-tick capture is never missed.
     pub(crate) fn update_recorded_terminal_failed_step(&self, id: u64, step: Option<usize>) {
         if self.rt_executor_owned {
             return;
         }
+        self.drain_terminal_captures_with_live_slots();
         if let Some(terminals) = self.terminals.as_ref() {
             terminals.update_failed_step(id, step);
         }
@@ -3339,7 +3935,7 @@ impl SupervisorInner {
         }
         self.driver
             .as_ref()
-            .and_then(|d| d.lock().ok().map(|drv| drv.clock_now()))
+            .and_then(|d| d.with_ref(|drv| drv.clock_now()))
             .unwrap_or_else(Instant::now)
     }
 
@@ -3379,10 +3975,8 @@ impl SupervisorInner {
     pub fn attach_stop_requests(&mut self, stops: crate::rt_core::urgent::StopRequests) {
         self.stop_requests = Some(stops);
         let gate = self.estop_gate();
-        if let Some(ref d) = self.driver {
-            if let Ok(mut drv) = d.lock() {
-                drv.set_estop_gate(gate);
-            }
+        if let Some(d) = self.driver.as_mut() {
+            let _ = d.with_mut(|drv| drv.set_estop_gate(gate));
         }
     }
 
@@ -3674,7 +4268,7 @@ impl SupervisorInner {
             && self.config.dof >= self.config.arm_dof()
             && (self.driver.is_none()
                 || self
-                    .lock_driver_for_tick()
+                    .read_driver_for_tick()
                     .is_some_and(|drv| drv.capabilities().torque_feedforward))
     }
 
@@ -3895,6 +4489,16 @@ impl SupervisorInner {
             watchdog_park_pending_attempt: wd_attempt,
         };
         let owner = self.published_owner_meta();
+        let next_pub_seq = self.core.next_publish_seq();
+        let mid_csw = self
+            .first_terminal_csw_mark
+            .take()
+            .unwrap_or_else(crate::diagnostics::tick::CswMark::now);
+        self.last_mid_csw_start = Some(mid_csw);
+        let mid_csw_start = Some(mid_csw);
+        let (phase_terminal_us, captured_any) =
+            self.capture_edge_terminals(timestamp, Some(next_pub_seq));
+        let publish_start = Instant::now();
         let SupervisorInner {
             core,
             measured_positions,
@@ -3918,7 +4522,16 @@ impl SupervisorInner {
             owner,
             meta,
         );
-        TickPublished { kept, body_end }
+        let publish_only_us = crate::diagnostics::tick::us(publish_start.elapsed());
+        self.last_publish_only_us = publish_only_us;
+        TickPublished {
+            kept,
+            body_end,
+            phase_terminal_us,
+            publish_only_us,
+            captured_any,
+            mid_csw_start,
+        }
     }
 
     /// The control loop's tick under the write guard of lock generation `generation`:
@@ -3959,7 +4572,8 @@ impl SupervisorInner {
     /// Pre-warms RT-owned scratch/history buffers, static fallback policies, and empty
     /// triple-buffer observation slots for the RT executor before the first release runs
     /// (nonblocking under reader contention; leaves `published_seq` unchanged).
-    pub(crate) fn prewarm_observation_slots(&mut self) {
+    #[doc(hidden)]
+    pub fn prewarm_observation_slots(&mut self) {
         let _ = Self::default_rebot_dm_resting_pose();
         let dof = self.config.dof;
         let arm_dof = self.config.arm_dof();
@@ -4006,15 +4620,14 @@ impl SupervisorInner {
         self.driver_has_torque_feedback = self
             .driver
             .as_ref()
-            .is_none_or(|d| d.lock().is_ok_and(|drv| drv.capabilities().torque_feedback));
+            .is_none_or(|d| d.with_ref(|drv| drv.capabilities().torque_feedback).unwrap_or(false));
         let pf_info = self
             .config
             .gripper_index()
             .and_then(|g| {
                 self.driver
                     .as_ref()
-                    .and_then(|d| d.lock().ok())
-                    .and_then(|drv| drv.gripper_pos_force_info())
+                    .and_then(|d| d.with_ref(|drv| drv.gripper_pos_force_info()).flatten())
                     .filter(|info| info.joint == g)
             });
         self.driver_gripper_close_speed_limit = pf_info
@@ -4093,7 +4706,7 @@ impl SupervisorInner {
         } else {
             None
         };
-        let driver_capabilities = self.lock_driver_for_tick().map(|drv| drv.capabilities()).unwrap_or_default();
+        let driver_capabilities = self.read_driver_for_tick().map(|drv| drv.capabilities()).unwrap_or_default();
         out.timestamp = timestamp;
         out.positions.clone_from(&self.measured_positions);
         out.velocities.clone_from(&self.measured_velocities);
@@ -4121,9 +4734,9 @@ impl SupervisorInner {
         out.enable_state = if self.driver.is_none() {
             if self.is_torqued { EnableState::Enabled } else { EnableState::Disabled }
         } else {
-            self.lock_driver_for_tick().map_or(EnableState::Unknown, |drv| drv.enable_state())
+            self.read_driver_for_tick().map_or(EnableState::Unknown, |drv| drv.enable_state())
         };
-        match self.lock_driver_for_tick() {
+        match self.read_driver_for_tick() {
             Some(drv) => drv.feedback_age_ms_into(&mut out.feedback_age_ms),
             None => fill_n(&mut out.feedback_age_ms, Some(0), self.config.dof),
         }
@@ -4143,7 +4756,7 @@ impl SupervisorInner {
         sync_action_obs(&mut out.previous_action, prev_src, prev_action_spare);
         out.control_mode = if self.gravity_comp.is_some() { crate::model::ControlMode::GravityComp } else { crate::model::ControlMode::Position };
         self.gravity_comp_observation_into(&mut out.gravity_comp);
-        match self.lock_driver_for_tick() {
+        match self.read_driver_for_tick() {
             Some(drv) => drv.with_range_check(&mut |rc| set_opt_eq(&mut out.driver_range_check, rc)),
             None => out.driver_range_check = None,
         }
@@ -4206,28 +4819,36 @@ impl SupervisorInner {
         let has_support_torque = !policy.support_torque_limits.is_empty();
         let has_support_load = !policy.support_load_limits.is_empty();
         if let Some(ref d) = self.driver {
-            let drv = match d.try_lock() {
-                Ok(g) => g,
-                Err(std::sync::TryLockError::WouldBlock) => return RtRestingCheck::LockContended,
-                Err(std::sync::TryLockError::Poisoned(_)) => return RtRestingCheck::OffRest,
-            };
-            let caps = drv.capabilities();
-            if !caps.velocity_feedback || !caps.enable_feedback {
-                return RtRestingCheck::OffRest;
-            }
-            if has_support_torque && !caps.torque_feedback {
-                return RtRestingCheck::OffRest;
-            }
-            if has_support_load && !caps.load_feedback {
-                return RtRestingCheck::OffRest;
-            }
-            if self.safety.state().is_stopped() {
-                return RtRestingCheck::OffRest;
-            }
-            let fresh = self.feedback_numeric_valid
-                && drv.feedback_all_within(dof, feedback_max_age);
-            if !fresh {
-                return RtRestingCheck::OffRest;
+            let check = d.try_with_ref(|drv| {
+                let caps = drv.capabilities();
+                if !caps.velocity_feedback || !caps.enable_feedback {
+                    return RtRestingCheck::OffRest;
+                }
+                if has_support_torque && !caps.torque_feedback {
+                    return RtRestingCheck::OffRest;
+                }
+                if has_support_load && !caps.load_feedback {
+                    return RtRestingCheck::OffRest;
+                }
+                if self.safety.state().is_stopped() {
+                    return RtRestingCheck::OffRest;
+                }
+                let fresh = self.feedback_numeric_valid
+                    && drv.feedback_all_within(dof, feedback_max_age);
+                if !fresh {
+                    return RtRestingCheck::OffRest;
+                }
+                RtRestingCheck::AtRest
+            });
+            match check {
+                Ok(RtRestingCheck::AtRest) => {}
+                Ok(other) => return other,
+                Err(crate::supervisor_lock::DriverTryError::WouldBlock) => {
+                    return RtRestingCheck::LockContended;
+                }
+                Err(crate::supervisor_lock::DriverTryError::Poisoned) => {
+                    return RtRestingCheck::OffRest;
+                }
             }
         }
         let rest = self.config.resting_positions();
@@ -4311,19 +4932,25 @@ impl SupervisorInner {
         }
         let Some(policy) = self.resting_policy() else { return Some("no resting pose configured".into()); };
         if let Some(ref d) = self.driver {
-            let Ok(drv) = d.lock() else { return Some("driver lock poisoned".into()); };
-            let caps = drv.capabilities();
-            if !caps.velocity_feedback || !caps.enable_feedback {
-                return Some("driver lacks velocity/enable feedback".into());
+            let pre_violation = d
+                .with_ref(|drv| {
+                    let caps = drv.capabilities();
+                    if !caps.velocity_feedback || !caps.enable_feedback {
+                        return Some("driver lacks velocity/enable feedback".into());
+                    }
+                    if !policy.support_torque_limits.is_empty() && !caps.torque_feedback {
+                        return Some("driver lacks torque feedback for support torque limits".into());
+                    }
+                    if !policy.support_load_limits.is_empty() && !caps.load_feedback {
+                        return Some("driver lacks load feedback for support load limits".into());
+                    }
+                    if self.safety.state().is_stopped() { return Some(format!("safety state {:?}", self.safety.state())); }
+                    None
+                })
+                .unwrap_or_else(|| Some("driver lock poisoned".into()));
+            if let Some(msg) = pre_violation {
+                return Some(msg);
             }
-            if !policy.support_torque_limits.is_empty() && !caps.torque_feedback {
-                return Some("driver lacks torque feedback for support torque limits".into());
-            }
-            if !policy.support_load_limits.is_empty() && !caps.load_feedback {
-                return Some("driver lacks load feedback for support load limits".into());
-            }
-            if self.safety.state().is_stopped() { return Some(format!("safety state {:?}", self.safety.state())); }
-            drop(drv);
             if !self.hardware_feedback_fresh(Duration::from_millis(policy.feedback_max_age_ms)) {
                 return Some(format!("feedback older than {} ms", policy.feedback_max_age_ms));
             }
@@ -4719,8 +5346,8 @@ impl SupervisorInner {
             self.reset_hold_tx_joint_progress();
             self.estop_state.latch();
             // Non-blocking driver abort on E-stop (never stall behind a contended driver mutex
-            // before latching EStop and publishing `estop_applied`); retain `DetachedCancel` on
-            // `WouldBlock` so the next release drains `drv.abort_enable()` with zero enable TX.
+            // before latching EStop and publishing `estop_applied`); zero-lock on `DriverSlot::Exclusive`
+            // and retains `DetachedCancel` on `WouldBlock` so the next release drains `drv.abort_enable()`.
             let mut estop_cancel_was_torqued: Option<bool> = None;
             let mut estop_legacy_ws: Option<(u64, u8)> = None;
             if let Some(driver_transitions::TorqueTransition::Enable(ref reducer)) =
@@ -4732,13 +5359,13 @@ impl SupervisorInner {
                 {
                     estop_legacy_ws = Some((token, slot));
                 }
-                if let Some(ref d) = self.driver {
-                    match d.try_lock() {
-                        Ok(mut drv) => drv.abort_enable(),
-                        Err(std::sync::TryLockError::WouldBlock) => {
+                if let Some(d) = self.driver.as_mut() {
+                    match d.try_with_mut(|drv| drv.abort_enable()) {
+                        Ok(()) => {}
+                        Err(crate::supervisor_lock::DriverTryError::WouldBlock) => {
                             estop_cancel_was_torqued = Some(was_t);
                         }
-                        Err(std::sync::TryLockError::Poisoned(_)) => {}
+                        Err(crate::supervisor_lock::DriverTryError::Poisoned) => {}
                     }
                 }
             }
@@ -4791,14 +5418,31 @@ impl SupervisorInner {
         thermal_below: bool,
         rx_scratch: &mut Vec<Option<Instant>>,
     ) -> ThermalCooldown {
+        Self::evaluate_thermal_cooldown_fields(
+            self.config.dof,
+            self.thermal_cooldown,
+            drv,
+            ages,
+            thermal_below,
+            rx_scratch,
+        )
+    }
+
+    pub(crate) fn evaluate_thermal_cooldown_fields(
+        dof: usize,
+        current_cooldown: ThermalCooldown,
+        drv: &dyn ArmDriver,
+        ages: &[Option<Duration>],
+        thermal_below: bool,
+        rx_scratch: &mut Vec<Option<Instant>>,
+    ) -> ThermalCooldown {
         if !thermal_below {
             return ThermalCooldown::default();
         }
-        let dof = self.config.dof;
         if dof == 0 {
             return ThermalCooldown::default();
         }
-        let mut next = self.thermal_cooldown;
+        let mut next = current_cooldown;
         drv.feedback_receive_instants_into(rx_scratch);
         if rx_scratch.len() != dof || rx_scratch.iter().any(Option::is_none) {
             drv.feedback_instants_into(rx_scratch);
@@ -4934,40 +5578,43 @@ impl SupervisorInner {
             Some(d) => {
                 let mut scratch_ages = std::mem::take(&mut self.scratch.ages);
                 let mut scratch_rx = std::mem::take(&mut self.scratch.rx);
-                let lock_res = if nonblocking {
-                    match d.try_lock() {
-                        Ok(g) => Some(Ok(g)),
-                        Err(std::sync::TryLockError::WouldBlock) => None,
-                        Err(std::sync::TryLockError::Poisoned(_)) => Some(Err(())),
+                let eval = |drv: &dyn ArmDriver| {
+                    let avail = drv.capabilities().temperature_feedback;
+                    drv.feedback_ages_into(&mut scratch_ages);
+                    let fresh = avail
+                        && self.feedback_numeric_valid
+                        && drv.is_feedback_valid()
+                        && scratch_ages.len() == self.config.dof
+                        && scratch_ages
+                            .iter()
+                            .all(|a| a.is_some_and(|t| t <= THERMAL_FEEDBACK_FRESHNESS_LIMIT));
+                    let threshold = self.config.max_temperature - THERMAL_CLEAR_MARGIN_C;
+                    let thermal_below = fresh
+                        && !self.temperatures.is_empty()
+                        && self.temperatures.iter().all(|t| t.is_finite() && *t <= threshold);
+                    let cd = Self::evaluate_thermal_cooldown_fields(
+                        self.config.dof,
+                        self.thermal_cooldown,
+                        drv,
+                        &scratch_ages,
+                        thermal_below,
+                        &mut scratch_rx,
+                    );
+                    (avail, cd)
+                };
+                let (avail, next_cd) = if nonblocking {
+                    match d.try_with_ref(eval) {
+                        Ok(res) => res,
+                        Err(crate::supervisor_lock::DriverTryError::WouldBlock) => {
+                            (false, self.thermal_cooldown)
+                        }
+                        Err(crate::supervisor_lock::DriverTryError::Poisoned) => {
+                            (false, ThermalCooldown::default())
+                        }
                     }
                 } else {
-                    Some(d.lock().map_err(|_| ()))
-                };
-                let (avail, next_cd) = match lock_res {
-                    None => (false, self.thermal_cooldown),
-                    Some(Ok(drv)) => {
-                        let avail = drv.capabilities().temperature_feedback;
-                        drv.feedback_ages_into(&mut scratch_ages);
-                        let fresh = avail
-                            && self.feedback_numeric_valid
-                            && drv.is_feedback_valid()
-                            && scratch_ages.len() == self.config.dof
-                            && scratch_ages
-                                .iter()
-                                .all(|a| a.is_some_and(|t| t <= THERMAL_FEEDBACK_FRESHNESS_LIMIT));
-                        let threshold = self.config.max_temperature - THERMAL_CLEAR_MARGIN_C;
-                        let thermal_below = fresh
-                            && !self.temperatures.is_empty()
-                            && self.temperatures.iter().all(|t| t.is_finite() && *t <= threshold);
-                        let cd = self.evaluate_thermal_cooldown_with_driver(
-                            drv.as_ref(),
-                            &scratch_ages,
-                            thermal_below,
-                            &mut scratch_rx,
-                        );
-                        (avail, cd)
-                    }
-                    Some(Err(())) => (false, ThermalCooldown::default()),
+                    d.with_ref(eval)
+                        .unwrap_or((false, ThermalCooldown::default()))
                 };
                 self.scratch.ages = scratch_ages;
                 self.scratch.rx = scratch_rx;
@@ -5023,7 +5670,7 @@ impl SupervisorInner {
             && self
                 .driver
                 .as_ref()
-                .is_some_and(|d| d.try_lock().is_ok_and(|drv| drv.torque_transition_pending()))
+                .is_some_and(|d| d.try_with_ref(|drv| drv.torque_transition_pending()).unwrap_or(false))
     }
 
     pub fn shutdown_ready(&self) -> bool {
@@ -5035,7 +5682,6 @@ impl SupervisorInner {
             Some(_) => !self.is_torqued && self.torque_intent == TorqueIntent::Off,
         }
     }
-
     /// Authoritative shutdown gate shared by legacy lock and RT executor ownership paths.
     /// Returns `true` when safe to stop the control loop and exit; returns `false` after
     /// latching stop when no accepted disable has recorded `torque_intent = Off` yet. When
@@ -5110,7 +5756,7 @@ impl SupervisorInner {
         let (has_velocity_capability, is_valid) = if self.driver.is_none() {
             (true, true)
         } else {
-            self.lock_driver_for_tick()
+            self.read_driver_for_tick()
                 .map_or((false, false), |drv| (drv.capabilities().velocity_feedback, drv.is_feedback_valid()))
         };
 
@@ -5974,8 +6620,10 @@ impl SupervisorInner {
     }
 
     /// Attach a driver, bind tick-epilogue ownership of the single J7 `PosForce` emitter, wire
-    /// the stopped-disable gate, cache its lock-free clock and gripper capabilities, capture the
-    /// owner driver snapshot, and initialize owner torque intent to `On` (R10 hold-by-default).
+    /// the stopped-disable gate, cache its lock-free clock, gripper capabilities, and
+    /// terminal-capture-only initial snapshot (without mutating hardware park/torque-off
+    /// interlock `last_poll_*` fields before the first poll), capture the owner driver snapshot,
+    /// and initialize owner torque intent to `On` (R10 hold-by-default).
     pub(crate) fn install_driver(&mut self, mut driver: Box<dyn ArmDriver>) {
         driver.set_estop_gate(self.estop_gate());
         driver.set_external_pos_force_emitter(true);
@@ -5998,10 +6646,25 @@ impl SupervisorInner {
                 .ceiling_torque_estimate_nm
                 .filter(|v| v.is_finite() && *v > 0.0);
         }
-        self.driver_feedback_confirmed_cached = driver.is_feedback_valid();
+        let driver_valid = driver.is_feedback_valid();
+        self.driver_feedback_confirmed_cached = driver_valid;
+        let poll_before = self.cached_driver_clock_now();
+        let mut ages = Vec::with_capacity(self.config.dof);
+        driver.feedback_ages_into(&mut ages);
+        let mut cache = terminal_capture::CaptureDriverCache {
+            enable_state: EnableState::Unknown,
+            driver_caps: caps,
+            feedback_valid: driver_valid,
+            ..terminal_capture::CaptureDriverCache::default()
+        };
+        cache.copy_ages_from(&ages, self.config.dof, poll_before);
+        self.capture_driver_cache = cache;
         self.refresh_owner_driver_snapshot_from_ref(driver.as_ref());
         self.torque_intent = crate::supervisor::TorqueIntent::On;
-        self.driver = Some(std::sync::Mutex::new(driver));
+        self.driver = Some(crate::supervisor_lock::DriverSlot::legacy_with_counter(
+            driver,
+            Arc::clone(&self.driver_lock_attempts),
+        ));
     }
 
     /// Lock-free Step-2 cached hardware feedback confirmation (`false` when driverless, lock failed,
@@ -6044,8 +6707,7 @@ impl SupervisorInner {
             .or_else(|| {
                 self.driver
                     .as_ref()
-                    .and_then(|d| d.try_lock().ok())
-                    .map(|d| d.clock_now())
+                    .and_then(|d| d.try_with_ref(|drv| drv.clock_now()).ok())
             })
             .unwrap_or(fallback)
     }
@@ -6136,26 +6798,19 @@ impl SupervisorInner {
         let Some(d) = self.driver.as_ref() else {
             return false;
         };
-        match d.try_lock() {
-            Ok(drv) => !drv.pos_force_feedback_fresh(),
-            Err(std::sync::TryLockError::Poisoned(p)) => !p.into_inner().pos_force_feedback_fresh(),
-            Err(std::sync::TryLockError::WouldBlock) => self.j7_stale_since.is_some(),
-        }
+        d.try_with_ref_recover(|drv| !drv.pos_force_feedback_fresh())
+            .unwrap_or_else(|| self.j7_stale_since.is_some())
     }
 
     /// Last provably fresh (`<= 100 ms`) J7 position reported by the driver (in user coordinates),
-    /// falling back to finite `measured_positions[g]` or `commanded_positions[g]`. Uses
-    /// non-blocking `try_lock()` so callers on `armd-control` never block on a mutex.
+    /// falling back to finite `measured_positions[g]` or `commanded_positions[g]`. Zero-lock in
+    /// `DriverSlot::Exclusive`, non-blocking `try_lock` in `DriverSlot::Legacy`.
     pub(crate) fn pos_force_j7_freeze_position(&self) -> Option<f32> {
         let g = self.config.gripper_index()?;
         let raw = self
             .driver
             .as_ref()
-            .and_then(|d| match d.try_lock() {
-                Ok(drv) => drv.pos_force_last_fresh_position(),
-                Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner().pos_force_last_fresh_position(),
-                Err(std::sync::TryLockError::WouldBlock) => None,
-            })
+            .and_then(|d| d.try_with_ref_recover(|drv| drv.pos_force_last_fresh_position()).flatten())
             .or_else(|| self.measured_positions.get(g).copied().filter(|p| p.is_finite()))
             .or_else(|| self.commanded_positions.get(g).copied().filter(|p| p.is_finite()))?;
         Some(self.config.limits.get(g).map_or(raw, |l| raw.clamp(l.min_position, l.max_position)))
@@ -6330,11 +6985,11 @@ impl SupervisorInner {
     /// Zero-allocation motion stall latch (`CAN_TX_STALLED`) routed through `SafetyManager::latch`.
     fn latch_can_tx_stalled_motion(&mut self, detail: crate::safety::TxStallDetail, now: Instant) {
         self.reset_tx_joint_progress();
-        if let Some(ref d) = self.driver {
-            if let Ok(mut drv) = d.try_lock() {
+        if let Some(d) = self.driver.as_mut() {
+            let _ = d.try_with_mut(|drv| {
                 drv.discard_pending_tx();
                 drv.clear_tx_probe();
-            }
+            });
         }
         self.stop_motion();
         self.tracking.invalidate();
@@ -6815,8 +7470,8 @@ impl SupervisorInner {
         hold_status_update
     }
 
-    /// Tick-epilogue wrapper invoking [`Self::emit_and_merge_pos_force_j7`] under a non-blocking
-    /// `try_lock()` on the driver mutex (zero blocking locks on `armd-control`).
+    /// Tick-epilogue wrapper invoking [`Self::emit_and_merge_pos_force_j7`] directly on an
+    /// exclusive RT driver (zero locks) or via non-blocking `try_lock()` on a legacy driver.
     fn emit_j7_tick_epilogue(
         &mut self,
         j7_is_hold: bool,
@@ -6825,18 +7480,13 @@ impl SupervisorInner {
         tick_output: &mut TickOutput,
         allow_output_accepted: &mut bool,
     ) {
-        let Some(ref d) = self.driver else {
+        let cutoff = self.active_tx_cutoff;
+        let Some(d) = self.driver.as_mut() else {
             return;
         };
-        let cutoff = self.active_tx_cutoff;
-        let hold_update = {
-            let mut drv = match d.try_lock() {
-                Ok(g) => g,
-                Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
-                Err(std::sync::TryLockError::WouldBlock) => return,
-            };
+        let Some(hold_update) = d.try_with_mut_recover(|drv| {
             Self::emit_and_merge_pos_force_j7(
-                &mut **drv,
+                drv,
                 j7_is_hold,
                 intent,
                 current_stamp,
@@ -6844,6 +7494,8 @@ impl SupervisorInner {
                 tick_output,
                 allow_output_accepted,
             )
+        }) else {
+            return;
         };
         if j7_is_hold {
             if let Some((joint, status)) = hold_update {
@@ -7239,6 +7891,84 @@ impl SupervisorInner {
         }
     }
 
+    /// Snapshot of owner-side live disconnect fence & E-stop state borrowed across a driver closure.
+    pub(crate) fn live_disconnect_fence_view(&self) -> LiveDisconnectFenceView<'_> {
+        LiveDisconnectFenceView::new(
+            &self.e_stop_latched,
+            &self.pending_disconnect_hold,
+            &self.atomic_fenced_lease_gen,
+            self.fenced_lease_generation,
+            self.active_lease_conn_id,
+            self.active_lease.as_ref().map(|a| a.generation),
+            &self.closed_connections,
+            self.rt_closed_connections.as_deref(),
+            &self.shared_closed_bitset,
+        )
+    }
+
+    /// Shared gravity-comp target write helper used by both the periodic tick path and the
+    /// immediate write path. Samples the live E-stop latch and live disconnect fence AFTER
+    /// acquiring the driver, reading `enable_state()`, AND staging `output_lease_gen` (final
+    /// normal-write boundary), switching to `write_estop_hold_bounded` (with lease gen `0`) if
+    /// E-stop latched or suppressing non-hold output on disconnect, and returns `(output, effective_hold)`
+    /// so callers align J7 intent and output acceptance with the actual write path.
+    pub(crate) fn write_gravity_comp_targets_checked(
+        drv: &mut dyn crate::driver::ArmDriver,
+        targets: &[crate::driver::JointTarget],
+        is_hold: bool,
+        output_lease_gen: u64,
+        fence: &LiveDisconnectFenceView<'_>,
+    ) -> Option<(TickOutput, bool)> {
+        if drv.enable_state() == EnableState::Disabled {
+            return None;
+        }
+        let mut effective_hold = is_hold || fence.estop_latched();
+        let write_res = if effective_hold {
+            drv.set_output_lease_gen(0);
+            drv.write_estop_hold_bounded(targets)
+        } else {
+            drv.set_output_lease_gen(output_lease_gen);
+            if fence.estop_latched() {
+                drv.set_output_lease_gen(0);
+                effective_hold = true;
+                drv.write_estop_hold_bounded(targets)
+            } else if fence.blocks_non_hold() {
+                drv.set_output_lease_gen(0);
+                return None;
+            } else {
+                let r = drv.write_joint_targets_bounded(targets);
+                drv.set_output_lease_gen(0);
+                r
+            }
+        };
+        Some((
+            Self::tick_output_from_driver_write(drv, effective_hold, write_res),
+            effective_hold,
+        ))
+    }
+
+    /// Runs `f(&SupervisorInner, &mut dyn ArmDriver)` with a single implementation across both
+    /// `DriverSlot::Legacy` (holding the `DriverLock` continuously across `f`) and
+    /// `DriverSlot::Exclusive` (direct mutable access with panic-safe slot restoration).
+    pub(crate) fn with_driver_and_owner_ref<R>(
+        &mut self,
+        f: impl FnOnce(&SupervisorInner, &mut dyn crate::driver::ArmDriver) -> R,
+    ) -> Option<R> {
+        if let Some(lock) = self.driver.as_ref().and_then(|d| d.as_legacy_lock()) {
+            let mut drv = lock.lock().ok()?;
+            return Some(f(self, &mut **drv));
+        }
+        let mut slot = self.driver.take()?;
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            slot.as_exclusive_mut().map(|drv| f(self, drv))
+        }));
+        self.driver = Some(slot);
+        match res {
+            Ok(out) => out,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
     /// Publication margin reserved at the end of a control release when bounding per-tick CAN TX
     /// (`DAMIAO_TX_RELEASE_PUBLISH_MARGIN`, capped to `period / 2` for sub-4 ms control periods).
     pub(crate) fn tx_release_publish_margin(&self) -> Duration {
@@ -7246,46 +7976,32 @@ impl SupervisorInner {
         crate::driver::DAMIAO_TX_RELEASE_PUBLISH_MARGIN.min(period / 2)
     }
 
-    /// Translates an executor/caller `(now, release_deadline)` pair into the absolute driver-clock
-    /// TX start-cutoff `drv_now + (release_deadline - now - margin)`.
-    pub(crate) fn driver_tx_release_cap(
-        &self,
-        drv_now: Instant,
+    /// Installs `driver.set_tx_release_deadline(Some(cap))` for `(now, release_deadline)` and
+    /// returns `true` when a driver cap was installed.
+    pub(crate) fn install_driver_tx_release_cap(
+        &mut self,
         now: Instant,
         release_deadline: Instant,
-    ) -> Instant {
+    ) -> bool {
         let margin = self.tx_release_publish_margin();
         let remaining = release_deadline
             .saturating_duration_since(now)
             .saturating_sub(margin);
-        drv_now + remaining
-    }
-
-    /// Installs `driver.set_tx_release_deadline(Some(cap))` for `(now, release_deadline)` and
-    /// returns `true` when a driver cap was installed.
-    pub(crate) fn install_driver_tx_release_cap(
-        &self,
-        now: Instant,
-        release_deadline: Instant,
-    ) -> bool {
-        let Some(ref d) = self.driver else {
+        let Some(d) = self.driver.as_mut() else {
             return false;
         };
-        let Ok(mut driver) = d.try_lock() else {
-            return false;
-        };
-        let drv_now = driver.clock_now();
-        let cap = self.driver_tx_release_cap(drv_now, now, release_deadline);
-        driver.set_tx_release_deadline(Some(cap));
-        true
+        d.try_with_mut(|driver| {
+            let cap = driver.clock_now() + remaining;
+            driver.set_tx_release_deadline(Some(cap));
+            true
+        })
+        .unwrap_or(false)
     }
 
     /// Clears any active per-release TX deadline cap on the attached driver.
-    pub(crate) fn clear_driver_tx_release_cap(&self) {
-        if let Some(ref d) = self.driver {
-            if let Ok(mut driver) = d.try_lock() {
-                driver.set_tx_release_deadline(None);
-            }
+    pub(crate) fn clear_driver_tx_release_cap(&mut self) {
+        if let Some(d) = self.driver.as_mut() {
+            let _ = d.try_with_mut(|driver| driver.set_tx_release_deadline(None));
         }
     }
 
@@ -7374,10 +8090,15 @@ impl SupervisorInner {
             .damiao_gripper
             .as_ref()
             .is_some_and(|g| g.mode == crate::model::DamiaoGripperMode::PosForce);
-        let (poll, pf_gate) = match driver.try_lock() {
-            Ok(d) => {
+        let (poll, pf_gate) = driver
+            .try_with_ref_recover(|d| {
                 d.feedback_ages_into(&mut self.scratch.ages);
-                let oldest = self.scratch.ages.iter().copied().try_fold(Duration::ZERO, |m, a| a.map(|a| m.max(a)));
+                let oldest = self
+                    .scratch
+                    .ages
+                    .iter()
+                    .copied()
+                    .try_fold(Duration::ZERO, |m, a| a.map(|a| m.max(a)));
                 let gate = if is_pf {
                     let stale = !d.pos_force_feedback_fresh();
                     let freeze_pos = self.config.gripper_index().and_then(|g| {
@@ -7408,8 +8129,8 @@ impl SupervisorInner {
                     park_state_changed,
                 };
                 (poll, gate)
-            }
-            Err(std::sync::TryLockError::WouldBlock) => {
+            })
+            .unwrap_or_else(|| {
                 let gate = if is_pf {
                     let freeze_pos = self.config.gripper_index().and_then(|g| {
                         let raw = self
@@ -7441,43 +8162,7 @@ impl SupervisorInner {
                     park_state_changed,
                 };
                 (poll, gate)
-            }
-            Err(std::sync::TryLockError::Poisoned(e)) => {
-                let d = e.into_inner();
-                d.feedback_ages_into(&mut self.scratch.ages);
-                let oldest = self.scratch.ages.iter().copied().try_fold(Duration::ZERO, |m, a| a.map(|a| m.max(a)));
-                let gate = if is_pf {
-                    let stale = !d.pos_force_feedback_fresh();
-                    let freeze_pos = self.config.gripper_index().and_then(|g| {
-                        let raw = d
-                            .pos_force_last_fresh_position()
-                            .or_else(|| self.measured_positions.get(g).copied().filter(|p| p.is_finite()))
-                            .or_else(|| self.commanded_positions.get(g).copied().filter(|p| p.is_finite()))?;
-                        Some(
-                            self.config
-                                .limits
-                                .get(g)
-                                .map_or(raw, |l| raw.clamp(l.min_position, l.max_position)),
-                        )
-                    });
-                    J7PosForceGate { stale, freeze_pos }
-                } else {
-                    J7PosForceGate::default()
-                };
-                let poll = crate::rt_core::ops::HardwarePoll {
-                    driverless: false,
-                    feedback_valid: d.is_feedback_valid(),
-                    enable_state: Some(d.enable_state()),
-                    oldest_feedback_age: oldest,
-                    rx_frames,
-                    budget_exhausted,
-                    torque: self.core.poll_transition(),
-                    park_wake,
-                    park_state_changed,
-                };
-                (poll, gate)
-            }
-        };
+            });
         self.rt_j7_pf_gate = Some(pf_gate);
         poll
     }
@@ -7498,225 +8183,245 @@ impl SupervisorInner {
         let mut new_motor_errors = None;
         let mut sc = std::mem::take(&mut self.scratch);
         sc.recovered.clear();
-        if let Some(ref d) = self.driver {
-            let guard_res = if self.rt_executor_owned
-                || self.nonblocking_driver_release
-                || budget.is_some()
-            {
-                match d.try_lock() {
-                    Ok(g) => Some(Ok(g)),
-                    Err(std::sync::TryLockError::WouldBlock) => None,
-                    Err(std::sync::TryLockError::Poisoned(_)) => Some(Err(())),
+        let margin = self.tx_release_publish_margin();
+        let use_try = self.rt_executor_owned || self.nonblocking_driver_release || budget.is_some();
+        if let Some(d) = self.driver.as_mut() {
+            let run_poll = |driver: &mut dyn ArmDriver| {
+                self.feedback_numeric_valid = false;
+                if self.control_release_seq > 0 {
+                    driver.begin_control_release(self.control_release_seq);
                 }
-            } else {
-                Some(d.lock().map_err(|_| ()))
-            };
-            match guard_res {
-                None => {
-                    // M4: On `armd-control`, never block on a contended driver mutex during Step-2 RX poll.
-                    self.driver_feedback_confirmed_cached = false;
-                }
-                Some(Ok(mut driver)) => {
-                    self.feedback_numeric_valid = false;
-                    if self.control_release_seq > 0 {
-                        driver.begin_control_release(self.control_release_seq);
-                    }
-                    let applied_step2_tx_cap = if let (Some(b), Some(rd)) = (budget, release_deadline) {
-                        let drv_now = driver.clock_now();
-                        let cap = self.driver_tx_release_cap(drv_now, b.now, rd);
-                        driver.set_tx_release_deadline(Some(cap));
-                        true
-                    } else {
-                        false
-                    };
-                    let read_res = match (budget, transition_rx) {
-                        (Some(b), Some((frames, exhausted))) => {
-                            if driver.read_cached_joint_states_into(&mut sc.states).is_some() {
-                                Ok((frames, exhausted))
+                let applied_step2_tx_cap = if let (Some(b), Some(rd)) = (budget, release_deadline) {
+                    let drv_now = driver.clock_now();
+                    let remaining = rd.saturating_duration_since(b.now).saturating_sub(margin);
+                    driver.set_tx_release_deadline(Some(drv_now + remaining));
+                    true
+                } else {
+                    false
+                };
+                let read_res = match (budget, transition_rx) {
+                    (Some(b), Some((frames, exhausted))) => {
+                        if driver.read_cached_joint_states_into(&mut sc.states).is_some() {
+                            Ok((frames, exhausted))
+                        } else {
+                            let remaining = b.max_rx_frames.saturating_sub(frames);
+                            if remaining == 0 {
+                                Ok((frames, true))
                             } else {
-                                let remaining = b.max_rx_frames.saturating_sub(frames);
-                                if remaining == 0 {
-                                    Ok((frames, true))
-                                } else {
-                                    let drv_now = driver.clock_now();
-                                    let span = b.deadline.saturating_duration_since(b.now);
-                                    driver
-                                        .read_joint_states_budgeted(&mut sc.states, drv_now + span, remaining)
-                                        .map(|(f2, ex2)| (frames.saturating_add(f2), exhausted || ex2))
-                                }
+                                let drv_now = driver.clock_now();
+                                let span = b.deadline.saturating_duration_since(b.now);
+                                driver
+                                    .read_joint_states_budgeted(&mut sc.states, drv_now + span, remaining)
+                                    .map(|(f2, ex2)| (frames.saturating_add(f2), exhausted || ex2))
                             }
                         }
-                        (Some(b), None) => {
-                            let drv_now = driver.clock_now();
-                            let span = b.deadline.saturating_duration_since(b.now);
-                            driver.read_joint_states_budgeted(&mut sc.states, drv_now + span, b.max_rx_frames)
-                        }
-                        (None, _) => driver.read_joint_states_into(&mut sc.states).map(|()| (0, false)),
-                    };
-                    if applied_step2_tx_cap {
-                        driver.set_tx_release_deadline(None);
                     }
-                    match read_res {
-                        Ok((frames, exhausted)) => {
-                            out.rx_frames = frames;
-                            out.budget_exhausted = exhausted;
-                            driver.take_recovery_writes_into(&mut sc.recovered);
-                            let has_loads = driver.joint_loads_into(&mut sc.loads);
-                            self.feedback_numeric_valid = Self::states_valid(
-                                &sc.states,
-                                driver.capabilities(),
+                    (Some(b), None) => {
+                        let drv_now = driver.clock_now();
+                        let span = b.deadline.saturating_duration_since(b.now);
+                        driver.read_joint_states_budgeted(&mut sc.states, drv_now + span, b.max_rx_frames)
+                    }
+                    (None, _) => driver.read_joint_states_into(&mut sc.states).map(|()| (0, false)),
+                };
+                if applied_step2_tx_cap {
+                    driver.set_tx_release_deadline(None);
+                }
+                match read_res {
+                    Ok((frames, exhausted)) => {
+                        out.rx_frames = frames;
+                        out.budget_exhausted = exhausted;
+                        driver.take_recovery_writes_into(&mut sc.recovered);
+                        let has_loads = driver.joint_loads_into(&mut sc.loads);
+                        self.feedback_numeric_valid = Self::states_valid(
+                            &sc.states,
+                            driver.capabilities(),
+                            self.config.dof,
+                            has_loads.then_some(sc.loads.as_slice()),
+                        );
+                        out.invalid_feedback = !self.feedback_numeric_valid;
+                        let poll_before = self.driver_clock.as_ref().map_or_else(Instant::now, |c| c.now());
+                        driver.feedback_ages_into(&mut sc.ages);
+                        if !sc.recovered.is_empty() || self.tracking.recovery_suspended {
+                            out.recovery_ages = true;
+                        }
+                        let driver_valid = driver.is_feedback_valid();
+                        self.driver_feedback_confirmed_cached = driver_valid;
+                        let all_ages = sc.ages.len() == self.config.dof && sc.ages.iter().all(Option::is_some);
+                        let caps = driver.capabilities();
+                        let enable_state = driver.enable_state();
+                        self.driver_caps = caps;
+                        self.last_poll_enable_state = enable_state;
+                        self.last_poll_partial_enable = driver.has_known_partial_enable();
+                        self.last_poll_feedback_valid = driver_valid;
+                        self.last_poll_oldest_age = if all_ages {
+                            sc.ages.iter().flatten().copied().max()
+                        } else {
+                            None
+                        };
+                        let mut cap_cache = terminal_capture::CaptureDriverCache {
+                            enable_state,
+                            driver_caps: caps,
+                            feedback_valid: driver_valid && self.feedback_numeric_valid,
+                            ..terminal_capture::CaptureDriverCache::default()
+                        };
+                        if self.feedback_numeric_valid {
+                            cap_cache.copy_ages_from(&sc.ages, self.config.dof, poll_before);
+                        }
+                        self.capture_driver_cache = cap_cache;
+                        let all_fresh_age = sc.ages.len() == self.config.dof
+                            && sc.ages.iter().all(|a| a.is_some_and(|age| age <= Duration::from_millis(250)));
+                        if self.feedback_numeric_valid && sc.ages.len() == self.config.dof && driver_valid {
+                            let oldest = sc.ages.iter().try_fold(Duration::ZERO, |m, a| a.map(|a| m.max(a)));
+                            self.last_can_feedback_instant = oldest
+                                .filter(|_| !sc.ages.is_empty())
+                                .and_then(|age| Instant::now().checked_sub(age));
+                        } else {
+                            self.last_can_feedback_instant = None;
+                        }
+                        if self.feedback_numeric_valid {
+                            self.core.poll_feedback(
+                                &mut self.joint_feedback_queue_bounds,
                                 self.config.dof,
+                                driver,
+                                &mut sc.fb,
+                            );
+                            Self::apply_feedback(
+                                &mut self.measured_positions,
+                                &mut self.measured_velocities,
+                                &mut self.torques,
+                                &mut self.temperatures,
+                                &mut self.loads,
+                                self.config.dof,
+                                &sc.states,
                                 has_loads.then_some(sc.loads.as_slice()),
                             );
-                            out.invalid_feedback = !self.feedback_numeric_valid;
-                            driver.feedback_ages_into(&mut sc.ages);
-                            if !sc.recovered.is_empty() || self.tracking.recovery_suspended {
-                                out.recovery_ages = true;
-                            }
-                            let driver_valid = driver.is_feedback_valid();
-                            self.driver_feedback_confirmed_cached = driver_valid;
-                            let all_ages = sc.ages.len() == self.config.dof && sc.ages.iter().all(Option::is_some);
-                            self.driver_caps = driver.capabilities();
-                            self.last_poll_enable_state = driver.enable_state();
-                            self.last_poll_partial_enable = driver.has_known_partial_enable();
-                            self.last_poll_feedback_valid = driver_valid;
-                            self.last_poll_oldest_age = if all_ages {
-                                sc.ages.iter().flatten().copied().max()
-                            } else {
-                                None
-                            };
-                            let all_fresh_age = sc.ages.len() == self.config.dof
-                                && sc.ages.iter().all(|a| a.is_some_and(|age| age <= Duration::from_millis(250)));
-                            if self.feedback_numeric_valid && sc.ages.len() == self.config.dof && driver_valid {
-                                let oldest = sc.ages.iter().try_fold(Duration::ZERO, |m, a| a.map(|a| m.max(a)));
-                                self.last_can_feedback_instant = oldest
-                                    .filter(|_| !sc.ages.is_empty())
-                                    .and_then(|age| Instant::now().checked_sub(age));
-                            } else {
-                                self.last_can_feedback_instant = None;
-                            }
-                            if self.feedback_numeric_valid {
-                                self.core.poll_feedback(
-                                    &mut self.joint_feedback_queue_bounds,
-                                    self.config.dof,
-                                    driver.as_ref(),
-                                    &mut sc.fb,
-                                );
-                                Self::apply_feedback(
-                                    &mut self.measured_positions,
-                                    &mut self.measured_velocities,
-                                    &mut self.torques,
-                                    &mut self.temperatures,
-                                    &mut self.loads,
-                                    self.config.dof,
-                                    &sc.states,
-                                    has_loads.then_some(sc.loads.as_slice()),
-                                );
-                            }
-                            if self.feedback_numeric_valid && all_fresh_age && driver_valid {
-                                driver.feedback_receive_instants_into(&mut sc.rx);
-                                if sc.rx.len() == self.config.dof && sc.rx.iter().all(Option::is_some) {
-                                    sc.rx_vals.clear();
-                                    sc.rx_vals.extend(sc.rx.iter().map(|t| t.unwrap()));
-                                    out.hw_rx = true;
-                                }
-                                let threshold = self.config.max_temperature - THERMAL_CLEAR_MARGIN_C;
-                                let thermal_below = driver.capabilities().temperature_feedback
-                                    && !self.temperatures.is_empty()
-                                    && self.temperatures.iter().all(|t| t.is_finite() && *t <= threshold);
-                                self.thermal_cooldown = self.evaluate_thermal_cooldown_with_driver(
-                                    driver.as_ref(),
-                                    &sc.ages,
-                                    thermal_below,
-                                    &mut sc.rx,
-                                );
-                            } else {
-                                // Stale or invalid temperature feedback resets thermal cooldown.
-                                self.thermal_cooldown.reset();
-                            }
                         }
-                        Err(_) => {
-                            self.driver_feedback_confirmed_cached = false;
-                            self.last_can_feedback_instant = None;
-                            self.last_poll_feedback_valid = false;
-                            self.last_poll_oldest_age = None;
-                            self.thermal_cooldown.reset();
-                            out.reset_stillness_on_read_err = true;
-                        }
-                    }
-                    out.bus_feedback_fresh = self.feedback_numeric_valid
-                        && driver.feedback_all_within(self.config.dof, BUS_LOSS_TIMEOUT);
-                    if driver.motor_status_into(&mut sc.status) {
-                        let changed = sc.status.len() != self.motor_errors.len()
-                            || sc.status.iter().zip(&self.motor_errors).any(|(code, e)| {
-                                let decoded = e.as_ref().map(|e| e.code);
-                                decoded != Some(*code) && !(decoded.is_none() && driver.decode_motor_error(*code).is_none())
-                            });
-                        if changed {
-                            new_motor_errors = Some(
-                                sc.status
-                                    .iter()
-                                    .map(|&code| {
-                                        driver
-                                            .decode_motor_error(code)
-                                            .map(|name| crate::model::MotorError { code, name })
-                                    })
-                                    .collect(),
+                        if self.feedback_numeric_valid && all_fresh_age && driver_valid {
+                            driver.feedback_receive_instants_into(&mut sc.rx);
+                            if sc.rx.len() == self.config.dof && sc.rx.iter().all(Option::is_some) {
+                                sc.rx_vals.clear();
+                                sc.rx_vals.extend(sc.rx.iter().map(|t| t.unwrap()));
+                                out.hw_rx = true;
+                            }
+                            let threshold = self.config.max_temperature - THERMAL_CLEAR_MARGIN_C;
+                            let thermal_below = caps.temperature_feedback
+                                && !self.temperatures.is_empty()
+                                && self.temperatures.iter().all(|t| t.is_finite() && *t <= threshold);
+                            self.thermal_cooldown = Self::evaluate_thermal_cooldown_fields(
+                                self.config.dof,
+                                self.thermal_cooldown,
+                                driver,
+                                &sc.ages,
+                                thermal_below,
+                                &mut sc.rx,
                             );
+                        } else {
+                            // Stale or invalid temperature feedback resets thermal cooldown.
+                            self.thermal_cooldown.reset();
                         }
                     }
-                    if self.is_torqued
-                        && !self.disable_pending
-                        && self.gravity_comp.is_none()
-                        && self.safety.state().is_operational()
-                        && driver.capabilities().enable_feedback
-                        && driver.is_feedback_valid()
-                    {
-                        if driver.enable_state() == EnableState::Enabled {
-                            out.driver_enable_confirmed_ok = true;
-                        } else if !(self.pending_rearm && driver.has_known_partial_enable()) {
-                            out.driver_torque_lost = true;
-                            out.driver_torque_loss_sample_seq =
-                                driver.reported_torque_loss_sample_seq();
-                        }
+                    Err(_) => {
+                        self.driver_feedback_confirmed_cached = false;
+                        self.last_can_feedback_instant = None;
+                        self.last_poll_feedback_valid = false;
+                        self.last_poll_oldest_age = None;
+                        self.capture_driver_cache.enable_state = driver.enable_state();
+                        self.capture_driver_cache.feedback_valid = false;
+                        self.capture_driver_cache.clear_ages();
+                        self.thermal_cooldown.reset();
+                        out.reset_stillness_on_read_err = true;
                     }
-                    // R1/B2: Sync MIT ownership loss before capturing hold-mode verification so
-                    // MIT-configured joints in verified `PosVel` fall back to position-mode holds
-                    // while joints still in `Mit` mode enter L2's 200 ms readback -> fault bound.
-                    driver.set_mit_ownership_lost(self.mit.owner == crate::mit::MitOwner::Lost);
-                    // R1: Refresh the owner-held driver snapshot while already holding the driver
-                    // lock so stopped-hold capture and MIT stopped-hold preparation never lock
-                    // `self.driver` or allocate.
-                    self.owner_driver_snapshot =
-                        driver_transitions::OwnerDriverSnapshot::capture_from_driver(
-                            driver.as_ref(),
-                            self.config.dof,
-                            self.feedback_numeric_valid,
-                            &self.measured_positions,
-                            &mut sc.ages,
-                            &mut sc.fb.bounds,
-                        );
-                    let torqued_or_stopped = self.is_torqued
-                        || (self.torque_intent == TorqueIntent::On
-                            && (self.safety.state().is_stopped()
-                                || matches!(
-                                    self.enable_lifecycle,
-                                    EnableLifecycle::FailedHold | EnableLifecycle::Armed
-                                )));
-                    Self::enforce_unverified_mode_readback_parts(
-                        &mut self.measured_hold,
-                        &mut self.safety,
-                        &self.owner_driver_snapshot,
-                        self.torque_transition.is_some(),
-                        torqued_or_stopped,
-                        self.config.dof,
-                        &mut **driver,
-                    );
                 }
-                Some(Err(())) => {
+                out.bus_feedback_fresh = self.feedback_numeric_valid
+                    && driver.feedback_all_within(self.config.dof, BUS_LOSS_TIMEOUT);
+                if driver.motor_status_into(&mut sc.status) {
+                    let changed = sc.status.len() != self.motor_errors.len()
+                        || sc.status.iter().zip(&self.motor_errors).any(|(code, e)| {
+                            let decoded = e.as_ref().map(|e| e.code);
+                            decoded != Some(*code) && !(decoded.is_none() && driver.decode_motor_error(*code).is_none())
+                        });
+                    if changed {
+                        new_motor_errors = Some(
+                            sc.status
+                                .iter()
+                                .map(|&code| {
+                                    driver
+                                        .decode_motor_error(code)
+                                        .map(|name| crate::model::MotorError { code, name })
+                                })
+                                .collect(),
+                        );
+                    }
+                }
+                if self.is_torqued
+                    && !self.disable_pending
+                    && self.gravity_comp.is_none()
+                    && self.safety.state().is_operational()
+                    && driver.capabilities().enable_feedback
+                    && driver.is_feedback_valid()
+                {
+                    if driver.enable_state() == EnableState::Enabled {
+                        out.driver_enable_confirmed_ok = true;
+                    } else if !(self.pending_rearm && driver.has_known_partial_enable()) {
+                        out.driver_torque_lost = true;
+                        out.driver_torque_loss_sample_seq =
+                            driver.reported_torque_loss_sample_seq();
+                    }
+                }
+                // R1/B2: Sync MIT ownership loss before capturing hold-mode verification so
+                // MIT-configured joints in verified `PosVel` fall back to position-mode holds
+                // while joints still in `Mit` mode enter L2's 200 ms readback -> fault bound.
+                driver.set_mit_ownership_lost(self.mit.owner == crate::mit::MitOwner::Lost);
+                // R1: Refresh the owner-held driver snapshot while already holding the driver
+                // so stopped-hold capture and MIT stopped-hold preparation never lock
+                // `self.driver` or allocate.
+                self.owner_driver_snapshot =
+                    driver_transitions::OwnerDriverSnapshot::capture_from_driver(
+                        &*driver,
+                        self.config.dof,
+                        self.feedback_numeric_valid,
+                        &self.measured_positions,
+                        &mut sc.ages,
+                        &mut sc.fb.bounds,
+                    );
+                let torqued_or_stopped = self.is_torqued
+                    || (self.torque_intent == TorqueIntent::On
+                        && (self.safety.state().is_stopped()
+                            || matches!(
+                                self.enable_lifecycle,
+                                EnableLifecycle::FailedHold | EnableLifecycle::Armed
+                            )));
+                Self::enforce_unverified_mode_readback_parts(
+                    &mut self.measured_hold,
+                    &mut self.safety,
+                    &self.owner_driver_snapshot,
+                    self.torque_transition.is_some(),
+                    torqued_or_stopped,
+                    self.config.dof,
+                    driver,
+                );
+            };
+            let poll_res = if use_try {
+                d.try_with_mut(run_poll)
+            } else {
+                d.with_mut(run_poll)
+                    .ok_or(crate::supervisor_lock::DriverTryError::Poisoned)
+            };
+            match poll_res {
+                Ok(()) => {}
+                Err(crate::supervisor_lock::DriverTryError::WouldBlock) => {
+                    // M4: Never block on a contended legacy driver mutex during Step-2 RX poll.
+                    self.driver_feedback_confirmed_cached = false;
+                    self.capture_driver_cache.feedback_valid = false;
+                    self.capture_driver_cache.clear_ages();
+                }
+                Err(crate::supervisor_lock::DriverTryError::Poisoned) => {
                     self.feedback_numeric_valid = false;
                     self.driver_feedback_confirmed_cached = false;
                     self.last_can_feedback_instant = None;
+                    self.capture_driver_cache.enable_state = EnableState::Unknown;
+                    self.capture_driver_cache.feedback_valid = false;
+                    self.capture_driver_cache.clear_ages();
                     self.thermal_cooldown.reset();
                     self.owner_driver_snapshot.invalidate();
                     out.reset_stillness_on_read_err = true;
@@ -7777,18 +8482,33 @@ impl SupervisorInner {
         self.tick_control_inner(dt, None, now_fn)
     }
 
-    /// Non-blocking `try_lock` on `armd-control` (`rt_executor_owned == true`) or during a legacy
-    /// control release servicing an in-flight torque transition (`nonblocking_driver_release`);
-    /// blocking `lock` on ordinary legacy releases.
+    /// Zero-lock immutable borrow in `DriverSlot::Exclusive`; non-blocking `try_read` when
+    /// `rt_executor_owned` or `nonblocking_driver_release` in `DriverSlot::Legacy`; blocking
+    /// `read` on ordinary legacy releases.
     #[inline]
-    pub(crate) fn lock_driver_for_tick(
+    pub(crate) fn read_driver_for_tick(
         &self,
-    ) -> Option<std::sync::MutexGuard<'_, Box<dyn ArmDriver>>> {
+    ) -> Option<crate::supervisor_lock::DriverReadGuard<'_>> {
         let d = self.driver.as_ref()?;
         if self.rt_executor_owned || self.nonblocking_driver_release {
-            d.try_lock().ok()
+            d.try_read()
         } else {
-            d.lock().ok()
+            d.read()
+        }
+    }
+
+    /// Zero-lock mutable borrow in `DriverSlot::Exclusive`; non-blocking `try_write` when
+    /// `rt_executor_owned` or `nonblocking_driver_release` in `DriverSlot::Legacy`; blocking
+    /// `write` on ordinary legacy releases.
+    #[inline]
+    pub(crate) fn write_driver_for_tick(
+        &mut self,
+    ) -> Option<crate::supervisor_lock::DriverWriteGuard<'_>> {
+        let d = self.driver.as_mut()?;
+        if self.rt_executor_owned || self.nonblocking_driver_release {
+            d.try_write()
+        } else {
+            d.write()
         }
     }
 
@@ -7797,29 +8517,24 @@ impl SupervisorInner {
     /// translated into the driver clock domain, and installs it as THE deadline on `self.driver`
     /// via `set_tx_release_deadline`. Safety/stopped holds are never clipped by an action deadline.
     fn install_effective_tx_cutoff(
-        &self,
+        &mut self,
         release_deadline: Option<Instant>,
         now_fn: &mut dyn FnMut() -> Instant,
     ) -> (bool, Option<EffectiveTxCutoff>) {
-        let Some(mut drv) = self.lock_driver_for_tick() else {
+        if self.driver.is_none() {
             return (false, None);
-        };
-        let owner_now = now_fn();
-        let drv_now = drv.clock_now();
-        let drv_release_cap = match release_deadline {
-            Some(rd) => self.driver_tx_release_cap(drv_now, owner_now, rd),
-            None => {
-                let period = Duration::from_secs_f64(1.0 / f64::from(self.config.control_frequency_hz.max(1)));
-                drv_now + period.saturating_sub(self.tx_release_publish_margin())
-            }
-        };
-        let drv_action_cutoff = if self.safety.state().is_stopped()
-            || self.enable_lifecycle == driver_transitions::EnableLifecycle::FailedHold
-        {
+        }
+        let margin = self.tx_release_publish_margin();
+        let period = Duration::from_secs_f64(1.0 / f64::from(self.config.control_frequency_hz.max(1)));
+        let is_stopped = self.safety.state().is_stopped()
+            || self.enable_lifecycle == driver_transitions::EnableLifecycle::FailedHold;
+        #[allow(unused_mut)]
+        let mut fail_closed_action_dl = false;
+        let owner_dl = if is_stopped {
             None
         } else {
             #[allow(unused_mut)]
-            let mut owner_dl = self.active_action_deadline();
+            let mut dl = self.active_action_deadline();
             #[cfg(feature = "policy-runtime")]
             if self.watchdog_park.is_none() && !self.pending_normal_unload {
                 if let Some(run) = self
@@ -7827,34 +8542,65 @@ impl SupervisorInner {
                     .as_ref()
                     .filter(|r| r.mode == crate::policy_runtime::PolicyMode::Live)
                 {
-                    if let Some(dl) = run.deadline {
-                        owner_dl = Some(owner_dl.map_or(dl, |cur| cur.min(dl)));
+                    if let Some(run_dl) = run.deadline {
+                        dl = Some(dl.map_or(run_dl, |cur| cur.min(run_dl)));
                     }
                     if self.lease_enabled {
-                        // Include absolute lease expiry (fail-closed to `owner_now` if lease is
-                        // missing or mismatched) so a policy target can never transmit after expiry.
-                        let lease_exp = self
+                        // Include absolute lease expiry (fail-closed to immediate expiry if lease
+                        // is missing or mismatched) so a policy target can never transmit after expiry.
+                        if let Some(l) = self
                             .active_lease
                             .as_ref()
                             .filter(|l| l.generation == run.lease_generation)
-                            .map_or(owner_now, |l| l.acquired_at + self.lease_timeout);
-                        owner_dl = Some(owner_dl.map_or(lease_exp, |cur| cur.min(lease_exp)));
+                        {
+                            let lease_exp = l.acquired_at + self.lease_timeout;
+                            dl = Some(dl.map_or(lease_exp, |cur| cur.min(lease_exp)));
+                        } else {
+                            fail_closed_action_dl = true;
+                        }
                     }
                 }
             }
-            owner_dl.map(|dl| drv_now + dl.saturating_duration_since(owner_now))
+            dl
         };
-        let drv_effective = drv_action_cutoff.map_or(drv_release_cap, |ac| drv_release_cap.min(ac));
-        drv.set_tx_release_deadline(Some(drv_effective));
-        (
-            true,
-            Some(EffectiveTxCutoff {
-                drv_release_cap,
-                drv_action_cutoff,
-                owner_anchor: owner_now,
-                drv_anchor: drv_now,
-            }),
-        )
+        let use_try = self.rt_executor_owned || self.nonblocking_driver_release;
+        let Some(d) = self.driver.as_mut() else {
+            return (false, None);
+        };
+        let apply = |drv: &mut dyn ArmDriver| {
+            // Sample owner clock and driver clock together inside the driver boundary so mutex
+            // contention or thread preemption before acquiring the driver cannot extend TX cutoffs.
+            let owner_now = now_fn();
+            let drv_now = drv.clock_now();
+            let drv_release_cap = match release_deadline {
+                Some(rd) => {
+                    let remaining = rd.saturating_duration_since(owner_now).saturating_sub(margin);
+                    drv_now + remaining
+                }
+                None => drv_now + period.saturating_sub(margin),
+            };
+            let drv_action_cutoff = if fail_closed_action_dl {
+                Some(drv_now)
+            } else {
+                owner_dl.map(|dl| drv_now + dl.saturating_duration_since(owner_now))
+            };
+            let drv_effective = drv_action_cutoff.map_or(drv_release_cap, |ac| drv_release_cap.min(ac));
+            drv.set_tx_release_deadline(Some(drv_effective));
+            (
+                true,
+                Some(EffectiveTxCutoff {
+                    drv_release_cap,
+                    drv_action_cutoff,
+                    owner_anchor: owner_now,
+                    drv_anchor: drv_now,
+                }),
+            )
+        };
+        if use_try {
+            d.try_with_mut(apply).unwrap_or((false, None))
+        } else {
+            d.with_mut(apply).unwrap_or((false, None))
+        }
     }
 
     fn tick_control_inner(
@@ -7876,16 +8622,17 @@ impl SupervisorInner {
         self.nonblocking_driver_release = has_legacy_transition;
         let legacy_step_start = has_legacy_transition.then(Instant::now);
         let legacy_step_deadline = legacy_step_start.map(|t| t + LEGACY_TORQUE_STEP_BUDGET);
-        let applied_rx_tx_cap = if !self.pending_rx_poll.active {
-            let guard = self.lock_driver_for_tick();
-            if let Some(mut drv) = guard {
+        let applied_rx_tx_cap = if !self.pending_rx_poll.active && self.driver.is_some() {
+            let margin = self.tx_release_publish_margin();
+            let period = Duration::from_secs_f64(1.0 / f64::from(self.config.control_frequency_hz.max(1)));
+            if let Some(mut drv) = self.write_driver_for_tick() {
                 let drv_now = drv.clock_now();
                 let mut cap = match release_deadline {
-                    Some(rd) => self.driver_tx_release_cap(drv_now, now_fn(), rd),
-                    None => {
-                        let period = Duration::from_secs_f64(1.0 / f64::from(self.config.control_frequency_hz.max(1)));
-                        drv_now + period.saturating_sub(self.tx_release_publish_margin())
+                    Some(rd) => {
+                        let owner_now = now_fn();
+                        drv_now + rd.saturating_duration_since(owner_now).saturating_sub(margin)
                     }
+                    None => drv_now + period.saturating_sub(margin),
                 };
                 if let (Some(step_start), Some(step_dl)) = (legacy_step_start, legacy_step_deadline) {
                     let step_cap = drv_now + step_dl.saturating_duration_since(step_start);
@@ -8195,7 +8942,7 @@ impl SupervisorInner {
         }
         if let Some(g_idx) = self.config.gripper_index() {
             let (is_bus_fresh, has_torque_feedback, has_load_feedback, pos_force_info) = if self.driver.is_some() {
-                if let Some(driver) = self.lock_driver_for_tick() {
+                if let Some(driver) = self.read_driver_for_tick() {
                     let fresh = self.feedback_numeric_valid
                         && self.last_can_feedback_instant.is_some_and(|t| t.elapsed() < Duration::from_millis(50))
                         && driver.is_feedback_valid();
@@ -8692,69 +9439,63 @@ impl SupervisorInner {
 
         // Check hardware motor faults / error flags from feedback (0 heap allocs on RT).
         if self.is_torqued {
-            if let Some(ref d) = self.driver {
-                let guard = if self.rt_executor_owned
-                    || self.nonblocking_driver_release
-                    || self.has_non_broker_torque_transition()
-                    || self.last_tick_torque_ws_direction.is_some()
-                {
-                    d.try_lock().ok()
+            let hw_fault_status = self.read_driver_for_tick().and_then(|driver| {
+                if driver.has_hardware_fault() {
+                    let hw_err = if !self.safety.has_latched_fault_code(FaultCode::HardwareFault)
+                        || !self.safety.has_latched_fault_kind(crate::safety::FaultKind::Other)
+                    {
+                        driver.check_hardware_status().err()
+                    } else {
+                        None
+                    };
+                    Some(hw_err)
                 } else {
-                    d.lock().ok()
-                };
-                if let Some(driver) = guard {
-                    if driver.has_hardware_fault() {
-                        let hw_err = if !self.safety.has_latched_fault_code(FaultCode::HardwareFault)
-                            || !self.safety.has_latched_fault_kind(crate::safety::FaultKind::Other)
-                        {
-                            driver.check_hardware_status().err()
-                        } else {
-                            None
-                        };
-                        if !self.safety.has_latched_fault_kind(crate::safety::FaultKind::Other) {
-                            if let Some(ref e) = hw_err {
-                                tracing::error!("Hardware fault detected on driver: {}", e);
-                            }
-                        }
-                        if self.measured_positions.iter().all(|p| p.is_finite())
-                            && self.measured_positions.len() == self.config.dof
-                        {
-                            copy_into(&mut self.commanded_positions, &self.measured_positions);
-                        }
-                        self.pending_normal_unload = false;
-                        self.unload_settle = None;
-                        self.active_trajectory = None;
-                        // release_servo_target inline (the driver guard borrows self)
-                        if let Some(v) = self.servo_target.take() {
-                            if v.capacity() >= self.servo_target_spare.capacity() { self.servo_target_spare = v; }
-                        }
-                        self.servo_settled_ticks.fill(0);
-                        if let Some((_, old)) = self.servo_ws_min_depths.take() {
-                            if old.is_heap() && self.ws_eval_bufs.min_depths_spare.is_none() {
-                                self.ws_eval_bufs.min_depths_spare = Some(old);
-                            } else if old.is_heap() && self.rt_executor_owned && self.pending_retired_stops.len() < self.pending_retired_stops.capacity() {
-                                self.pending_retired_stops.push_back(crate::rt_core::urgent::RetiredStopPayloads {
-                                    servo_ws_min_depths: Some((0, old)),
-                                    ..Default::default()
-                                });
-                            }
-                        }
-                        self.tracking.invalidate();
-                        copy_into(&mut self.target_positions, &self.commanded_positions);
-                        self.commanded_velocities.fill(0.0);
-                        if !self.safety.has_latched_fault_code(FaultCode::HardwareFault) {
-                            self.safety.latch(
-                                crate::safety::FaultKind::Other,
-                                crate::safety::FaultDetail::formatted(FaultCode::HardwareFault, |buf| {
-                                    if let Some(ref e) = hw_err {
-                                        e.write_bounded(buf);
-                                    } else {
-                                        buf.push_str("Hardware motor fault");
-                                    }
-                                }),
-                            );
-                        }
+                    None
+                }
+            });
+            if let Some(hw_err) = hw_fault_status {
+                if !self.safety.has_latched_fault_kind(crate::safety::FaultKind::Other) {
+                    if let Some(ref e) = hw_err {
+                        tracing::error!("Hardware fault detected on driver: {}", e);
                     }
+                }
+                if self.measured_positions.iter().all(|p| p.is_finite())
+                    && self.measured_positions.len() == self.config.dof
+                {
+                    copy_into(&mut self.commanded_positions, &self.measured_positions);
+                }
+                self.pending_normal_unload = false;
+                self.unload_settle = None;
+                self.active_trajectory = None;
+                self.release_servo_target();
+                self.servo_settled_ticks.fill(0);
+                if let Some((_, old)) = self.servo_ws_min_depths.take() {
+                    if old.is_heap() && self.ws_eval_bufs.min_depths_spare.is_none() {
+                        self.ws_eval_bufs.min_depths_spare = Some(old);
+                    } else if old.is_heap()
+                        && self.rt_executor_owned
+                        && self.pending_retired_stops.len() < self.pending_retired_stops.capacity()
+                    {
+                        self.pending_retired_stops.push_back(crate::rt_core::urgent::RetiredStopPayloads {
+                            servo_ws_min_depths: Some((0, old)),
+                            ..Default::default()
+                        });
+                    }
+                }
+                self.tracking.invalidate();
+                copy_into(&mut self.target_positions, &self.commanded_positions);
+                self.commanded_velocities.fill(0.0);
+                if !self.safety.has_latched_fault_code(FaultCode::HardwareFault) {
+                    self.safety.latch(
+                        crate::safety::FaultKind::Other,
+                        crate::safety::FaultDetail::formatted(FaultCode::HardwareFault, |buf| {
+                            if let Some(ref e) = hw_err {
+                                e.write_bounded(buf);
+                            } else {
+                                buf.push_str("Hardware motor fault");
+                            }
+                        }),
+                    );
                 }
             }
         }
@@ -9646,31 +10387,43 @@ impl SupervisorInner {
                 if self.driver.is_none() {
                     driverless_accepted = true;
                     gravity_driverless_ok = true;
-                } else if let (Some(targets), Some(d)) = (self.gravity_comp_targets_array(), self.driver.as_ref()) {
-                    let guard = if self.rt_executor_owned {
-                        d.try_lock().ok()
-                    } else {
-                        d.lock().ok()
-                    };
-                    if let Some(mut driver) = guard {
-                        if self.torque_intent == TorqueIntent::On {
-                            let is_hold = self.safety.state().is_stopped();
-                            if is_hold || !self.disconnect_fence_blocks_output() {
-                                let output_lease_gen = if is_hold || gravity_exiting_or_failed {
-                                    0
-                                } else {
-                                    self.current_active_lease_gen()
-                                };
-                                let write_res = if is_hold {
-                                    driver.set_output_lease_gen(0);
-                                    driver.write_estop_hold_bounded(&targets)
-                                } else {
-                                    driver.set_output_lease_gen(output_lease_gen);
-                                    let r = driver.write_joint_targets_bounded(&targets);
-                                    driver.set_output_lease_gen(0);
-                                    r
-                                };
-                                tick_output = Self::tick_output_from_driver_write(&mut **driver, is_hold, write_res);
+                } else if let Some(targets) = self.gravity_comp_targets_array() {
+                    if self.torque_intent == TorqueIntent::On {
+                        let is_hold = self.safety.state().is_stopped();
+                        let output_lease_gen = if is_hold || gravity_exiting_or_failed {
+                            0
+                        } else {
+                            self.current_active_lease_gen()
+                        };
+                        let fence = LiveDisconnectFenceView::new(
+                            &self.e_stop_latched,
+                            &self.pending_disconnect_hold,
+                            &self.atomic_fenced_lease_gen,
+                            self.fenced_lease_generation,
+                            self.active_lease_conn_id,
+                            self.active_lease.as_ref().map(|a| a.generation),
+                            &self.closed_connections,
+                            self.rt_closed_connections.as_deref(),
+                            &self.shared_closed_bitset,
+                        );
+                        let rt_owned = self.rt_executor_owned;
+                        if let Some(d) = self.driver.as_mut() {
+                            let write_fn = |driver: &mut dyn ArmDriver| {
+                                Self::write_gravity_comp_targets_checked(
+                                    driver,
+                                    &targets,
+                                    is_hold,
+                                    output_lease_gen,
+                                    &fence,
+                                )
+                            };
+                            let written = if rt_owned {
+                                d.try_with_mut(write_fn).ok().flatten()
+                            } else {
+                                d.with_mut(write_fn).flatten()
+                            };
+                            if let Some((out, _effective_hold)) = written {
+                                tick_output = out;
                                 if matches!(tick_output, TickOutput::Complete { is_hold: false, .. }) {
                                     allow_output_accepted = true;
                                 }
@@ -10047,7 +10800,7 @@ impl SupervisorInner {
         let has_pending_motion = matches!(tick_output, TickOutput::None)
             && self.max_tx_joint_no_progress_ticks() > 0
             && self
-                .lock_driver_for_tick()
+                .read_driver_for_tick()
                 .is_some_and(|drv| drv.pending_motion_tx_len() > 0);
         let j7_stale = tick_output.j7_stale();
         let batch_completed = self.classify_tick_output(tick_output, true, has_pending_motion);
@@ -10328,7 +11081,7 @@ impl SupervisorInner {
         self.active_tx_cutoff = None;
         self.rt_j7_pf_gate = None;
         if applied_rx_tx_cap || applied_output_tx_cap {
-            if let Some(mut drv) = self.lock_driver_for_tick() {
+            if let Some(mut drv) = self.write_driver_for_tick() {
                 drv.set_tx_release_deadline(None);
             }
         }
@@ -10496,9 +11249,16 @@ pub const TERMINAL_FIFO_CAPACITY: usize = 64;
 
 type TerminalSinkFn = Box<dyn Fn(&ArmObservation) -> bool + Send + Sync>;
 
+struct QueuedTerminal {
+    action: ActionStatus,
+    obs_override: Option<ArmObservation>,
+    required_publish_seq: Option<u64>,
+}
+
 struct ConnectionTerminalQueue {
     sub_id: u64,
-    fifo: std::collections::VecDeque<ActionStatus>,
+    min_terminal_seq: u64,
+    fifo: std::collections::VecDeque<QueuedTerminal>,
     seen: std::collections::VecDeque<u64>,
     sink: TerminalSinkFn,
 }
@@ -10510,10 +11270,10 @@ struct TerminalBroadcasterInner {
 }
 
 /// Lossless off-RT per-connection bounded FIFO of finished actions: every terminal action
-/// (`!is_running()`) is appended in exact order to each subscribed connection's bounded FIFO,
-/// from which `armd-dispatch` drains every terminal in order onto that connection's lossless
-/// ordinary control queue. Never drops a terminal; if full, new action starts are refused with
-/// [`SafetyError::TerminalsBusy`] until drained. Never locks on `armd-control`.
+/// (`!is_running()`) is appended in exact `terminal_seq` order to each subscribed connection's
+/// bounded FIFO, from which `armd-dispatch` drains every terminal in order onto that connection's
+/// lossless ordinary control queue. Never drops a terminal; if full, new action starts are refused
+/// with [`SafetyError::TerminalsBusy`] until drained. Never locks on `armd-control`.
 pub(crate) struct TerminalBroadcaster {
     subscriber_count: AtomicUsize,
     pending_total: AtomicUsize,
@@ -10557,13 +11317,19 @@ impl TerminalBroadcaster {
         self.capacity_atomic.store(g.capacity, Ordering::Release);
     }
 
+    #[cfg(test)]
     pub(crate) fn subscribe(&self, sink: TerminalSinkFn) -> u64 {
+        self.subscribe_with_cutoff(sink, 0)
+    }
+
+    pub(crate) fn subscribe_with_cutoff(&self, sink: TerminalSinkFn, min_terminal_seq: u64) -> u64 {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let id = g.next_id;
         g.next_id += 1;
         let cap = g.capacity;
         g.sinks.push(ConnectionTerminalQueue {
             sub_id: id,
+            min_terminal_seq,
             fifo: std::collections::VecDeque::with_capacity(cap.min(TERMINAL_FIFO_CAPACITY)),
             seen: std::collections::VecDeque::with_capacity(cap.max(128)),
             sink,
@@ -10572,23 +11338,65 @@ impl TerminalBroadcaster {
         id
     }
 
+    /// Atomically reads `read_cutoff()` and installs `min_terminal_seq` under `self.inner.lock()`
+    /// so no concurrent enqueue can observe the temporary `u64::MAX` filter after the cutoff is read.
+    pub(crate) fn activate_subscriber_cutoff(
+        &self,
+        sub_id: u64,
+        read_cutoff: impl FnOnce() -> u64,
+    ) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let cutoff = read_cutoff();
+        if let Some(q) = g.sinks.iter_mut().find(|q| q.sub_id == sub_id) {
+            q.min_terminal_seq = cutoff;
+        }
+    }
+
     pub(crate) fn unsubscribe(&self, id: u64) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.sinks.retain(|q| q.sub_id != id);
         self.recompute_atomics(&g);
     }
 
+    #[cfg(test)]
     pub(crate) fn can_start_action(&self, has_running_action: bool, lock_free: bool) -> bool {
+        self.can_start_action_with_inflight(
+            has_running_action,
+            lock_free,
+            0,
+            0,
+            TERMINAL_FIFO_CAPACITY,
+        )
+    }
+
+    /// End-to-end admission check charging `staged + inflight + fifo + needed` against both the
+    /// per-connection FIFO capacity and the capture ring's admission cap.
+    ///
+    /// Caller reads `inflight` with `Acquire` strictly BEFORE this method reads `max_fifo_len`
+    /// with `Acquire`, matching the inverse write order in `TerminalCaptureChannel::drain_into`
+    /// (`max_fifo_len` Release -> `inflight` Release) so handoffs never under-count.
+    pub(crate) fn can_start_action_with_inflight(
+        &self,
+        has_running_action: bool,
+        lock_free: bool,
+        staged: usize,
+        inflight: usize,
+        ring_admission_cap: usize,
+    ) -> bool {
         if self.subscriber_count.load(Ordering::Acquire) == 0 {
             return true;
         }
         // Reserve 1 slot for the new action's eventual terminal, plus 1 immediate slot if a
         // currently running action will be superseded right now.
         let needed = if has_running_action { 2 } else { 1 };
+        let in_pipeline = staged.saturating_add(inflight);
+        if in_pipeline.saturating_add(needed) > ring_admission_cap {
+            return false;
+        }
         if lock_free {
             let cap = self.capacity_atomic.load(Ordering::Acquire);
             let max_len = self.max_fifo_len.load(Ordering::Acquire);
-            return max_len.saturating_add(needed) <= cap;
+            return max_len.saturating_add(in_pipeline).saturating_add(needed) <= cap;
         }
         let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if g.sinks.is_empty() {
@@ -10596,10 +11404,26 @@ impl TerminalBroadcaster {
         }
         g.sinks
             .iter()
-            .all(|q| q.fifo.len().saturating_add(needed) <= g.capacity)
+            .all(|q| q.fifo.len().saturating_add(in_pipeline).saturating_add(needed) <= g.capacity)
     }
 
+    #[cfg(test)]
     pub(crate) fn record_finished(&self, action: &ActionStatus) -> bool {
+        self.record_finished_with_seq(0, action.clone(), None, None)
+    }
+
+    /// Enqueues a terminal action with authoritative `terminal_seq` (0 when unassigned in direct
+    /// unit tests) into every subscriber whose `min_terminal_seq < terminal_seq` (or 0) and that
+    /// has not already seen `action.id`. Carries `required_publish_seq` through to delivery so
+    /// `drain_all` never pairs a terminal with a snapshot older than its required publication.
+    /// Updates `max_fifo_len` and `pending_total` with `Release`.
+    pub(crate) fn record_finished_with_seq(
+        &self,
+        terminal_seq: u64,
+        action: ActionStatus,
+        obs_override: Option<ArmObservation>,
+        required_publish_seq: Option<u64>,
+    ) -> bool {
         if action.is_running() || self.subscriber_count.load(Ordering::Acquire) == 0 {
             return false;
         }
@@ -10610,18 +11434,25 @@ impl TerminalBroadcaster {
         let cap = g.capacity;
         let mut enqueued = false;
         for q in &mut g.sinks {
+            if terminal_seq != 0 && terminal_seq <= q.min_terminal_seq {
+                continue;
+            }
             if q.seen.contains(&action.id) {
                 continue;
             }
             // Never drop or skip a finished action's terminal even if `q.fifo.len() >= cap`:
-            // `can_start_action` refuses NEW starts with `TERMINALS_BUSY` once `len >= cap`,
-            // while any already-running action's terminal is preserved in strict FIFO order.
+            // `can_start_action_with_inflight` refuses NEW starts with `TERMINALS_BUSY` once
+            // `len >= cap`, while any already-running action's terminal is preserved in strict FIFO order.
             let seen_cap = cap.max(128).max(q.fifo.len() + 1);
             if q.seen.len() >= seen_cap {
                 q.seen.pop_front();
             }
             q.seen.push_back(action.id);
-            q.fifo.push_back(action.clone());
+            q.fifo.push_back(QueuedTerminal {
+                action: action.clone(),
+                obs_override: obs_override.clone(),
+                required_publish_seq,
+            });
             enqueued = true;
         }
         if enqueued {
@@ -10630,48 +11461,19 @@ impl TerminalBroadcaster {
         enqueued
     }
 
-    pub(crate) fn has_subscribers(&self) -> bool {
-        self.subscriber_count.load(Ordering::Acquire) > 0
-    }
-
-    pub(crate) fn record_finished_pair(
-        &self,
-        prev: Option<&crate::motion::ActionStatus>,
-        last: Option<&crate::motion::ActionStatus>,
-    ) {
-        if !self.has_subscribers() {
-            return;
-        }
-        for act in [prev, last].into_iter().flatten() {
-            if !act.is_running() {
-                self.record_finished(act);
-            }
-        }
-    }
-
-    pub(crate) fn record_from_observation(&self, obs: &ArmObservation) {
-        if self.subscriber_count.load(Ordering::Acquire) == 0 {
-            return;
-        }
-        // Check `previous_action` before `action` to preserve chronological FIFO order.
-        for act in [obs.previous_action.as_ref(), obs.action.as_ref()]
-            .into_iter()
-            .flatten()
-        {
-            if !act.is_running() {
-                self.record_finished(act);
-            }
-        }
-    }
-
     pub(crate) fn update_failed_step(&self, action_id: u64, step: Option<usize>) {
         if self.subscriber_count.load(Ordering::Acquire) == 0 {
             return;
         }
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         for q in &mut g.sinks {
-            if let Some(a) = q.fifo.iter_mut().find(|a| a.id == action_id) {
-                a.failed_step = step;
+            if let Some(entry) = q.fifo.iter_mut().find(|e| e.action.id == action_id) {
+                entry.action.failed_step = step;
+                if let Some(obs) = entry.obs_override.as_mut() {
+                    if let Some(a) = obs.action.as_mut().filter(|a| a.id == action_id) {
+                        a.failed_step = step;
+                    }
+                }
             }
         }
     }
@@ -10681,20 +11483,33 @@ impl TerminalBroadcaster {
             && self.pending_total.load(Ordering::Acquire) > 0
     }
 
-    pub(crate) fn drain_all(&self, base_obs: &ArmObservation) {
+    /// Drains ready queued terminals onto subscriber sinks, enforcing `required_publish_seq <= base_seq`
+    /// whenever an entry relies on `base_obs`. Returns `true` if any subscriber FIFO stopped at a
+    /// head entry waiting for a newer snapshot (`base_seq < required_publish_seq`).
+    pub(crate) fn drain_all(&self, base_obs: &ArmObservation, base_seq: u64) -> bool {
         if self.dispatch_paused.load(Ordering::Acquire)
             || self.pending_total.load(Ordering::Acquire) == 0
         {
-            return;
+            return false;
         }
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut blocked_on_seq = false;
         // Pop a terminal ONLY after its sink confirms a successful enqueue. On failure
-        // (e.g., outbound queue full -> fatal close triggered), keep the terminal at the
-        // head of the FIFO and keep the subscriber until connection teardown unsubscribes it.
+        // (e.g., outbound queue full -> fatal close triggered) or when `base_seq < required_publish_seq`,
+        // keep the terminal at the head of the FIFO to preserve strict FIFO order and snapshot parity.
         for q in &mut g.sinks {
-            while let Some(finished) = q.fifo.front() {
-                let mut obs = base_obs.clone();
-                obs.action = Some(finished.clone());
+            while let Some(entry) = q.fifo.front() {
+                if let Some(req_seq) = entry.required_publish_seq {
+                    if entry.obs_override.is_none() && base_seq < req_seq {
+                        blocked_on_seq = true;
+                        break;
+                    }
+                }
+                let mut obs = match entry.obs_override.as_ref() {
+                    Some(captured) => captured.clone(),
+                    None => base_obs.clone(),
+                };
+                obs.action = Some(entry.action.clone());
                 obs.previous_action = None;
                 if (q.sink)(&obs) {
                     q.fifo.pop_front();
@@ -10704,6 +11519,7 @@ impl TerminalBroadcaster {
             }
         }
         self.recompute_atomics(&g);
+        blocked_on_seq
     }
 
     pub(crate) fn set_capacity(&self, capacity: usize) {
@@ -10718,6 +11534,14 @@ impl TerminalBroadcaster {
 
     pub(crate) fn pending_total(&self) -> usize {
         self.pending_total.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn lock_for_test(&self) -> impl Drop + '_ {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(crate) fn try_lock_for_test(&self) -> bool {
+        self.inner.try_lock().is_ok()
     }
 }
 
@@ -10739,6 +11563,7 @@ pub struct ArmSupervisor {
     inner: Arc<SupervisorLock<SupervisorInner>>,
     telemetry_tx: broadcast::Sender<ArmObservation>,
     terminals: Arc<TerminalBroadcaster>,
+    terminal_capture_channel: Arc<terminal_capture::TerminalCaptureChannel>,
     /// Single authoritative atomic state packing `(generation << 1) | latched` for E-stop.
     pub estop_state: Arc<crate::rt_core::urgent::EstopState>,
     pub e_stop_latched: crate::rt_core::urgent::EstopLatchView,
@@ -10823,6 +11648,8 @@ pub struct ArmSupervisor {
     headless_detached_drain_active: Arc<AtomicBool>,
     /// Lock-free mirror of `SupervisorInner::has_detached_torque_transition()`.
     detached_torque_pending_atomic: Arc<AtomicBool>,
+    /// Shared counter of forbidden `DriverLock` attempts on `armd-control`.
+    driver_lock_attempts: Arc<AtomicU64>,
 }
 
 static NEXT_WS_CONN_ID: AtomicU64 = AtomicU64::new(1);
@@ -11096,6 +11923,8 @@ impl ArmSupervisor {
         #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
         let policy_backend_permits = Arc::new(tokio::sync::Semaphore::new(2));
         let terminals = Arc::new(TerminalBroadcaster::default());
+        let (terminal_capture_tx, terminal_capture_channel) =
+            terminal_capture::TerminalCaptureChannel::new();
         let mut inner = SupervisorInner::new(config);
         inner.estop_state = estop_state.clone();
         inner.e_stop_latched = e_stop_latched.clone();
@@ -11120,7 +11949,11 @@ impl ArmSupervisor {
             inner.policy_terminal_tx = Some(policy_terminal_tx);
         }
         inner.terminals = Some(Arc::clone(&terminals));
+        inner.terminal_capture_tx = Some(terminal_capture_tx);
+        inner.terminal_capture_channel = Some(Arc::clone(&terminal_capture_channel));
+        let driver_lock_attempts = Arc::clone(&inner.driver_lock_attempts);
         let template_obs = inner.current_observation();
+        inner.template_obs_for_drain = Some(Arc::new(template_obs.clone()));
         let initial_pub_cfg = crate::rt_core::requests::config::PublishedConfig::from_inner(&inner);
         let estop_epoch = inner.safety.epoch_mirror();
         let hub = inner.core.hub().clone();
@@ -11140,6 +11973,7 @@ impl ArmSupervisor {
             inner: Arc::new(SupervisorLock::new(inner)),
             telemetry_tx: tx,
             terminals,
+            terminal_capture_channel,
             estop_state,
             e_stop_latched,
             requested_estop_count,
@@ -11192,7 +12026,19 @@ impl ArmSupervisor {
             legacy_torque_notify: Arc::new(tokio::sync::Notify::new()),
             headless_detached_drain_active: Arc::new(AtomicBool::new(false)),
             detached_torque_pending_atomic,
+            driver_lock_attempts,
         }
+    }
+
+    /// Forbidden legacy `DriverLock` acquisition attempts observed on `armd-control`.
+    pub fn driver_lock_attempts(&self) -> u64 {
+        self.driver_lock_attempts.load(Ordering::Acquire)
+    }
+
+    /// Shared atomic counter for positive-control tests verifying `DriverLock` instrumentation.
+    #[doc(hidden)]
+    pub fn driver_lock_attempts_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.driver_lock_attempts)
     }
 
     /// Spawns at most one bounded off-lock cleanup task in headless mode (when no live control
@@ -11670,46 +12516,21 @@ impl ArmSupervisor {
                 ),
             });
         }
-        if let Some(ref d) = guard.driver {
-            let mut cached_pos = [None; crate::rt_core::mailbox::MAX_DOF];
-            let dof = guard.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
-            let cap_res = match d.lock() {
-                Ok(drv) => {
-                    for (i, slot) in cached_pos.iter_mut().take(dof).enumerate() {
-                        *slot = drv.position_limits(i);
-                    }
-                    drv.supports_rt_executor()
-                }
-                Err(_) => Err("driver mutex poisoned"),
-            };
-            guard.cached_driver_pos_limits = cached_pos;
-            if let Err(reason) = cap_res {
-                restore_legacy(&mut rollback);
-                return Err(ArmError::Rejected {
-                    status: 503,
-                    code: "UNSUPPORTED_RT_DRIVER".into(),
-                    message: format!("Cannot transfer ownership: {reason}"),
-                });
-            }
-        }
-
         // Flush any legacy E-stop acks already applied before handoff so waiting callers
         // receive their exact recorded (state, epoch) instead of stalling after transfer,
         // and drop any legacy retired fault Arcs off-thread before transferring ownership.
+        // Driver preflight (`position_limits` / `supports_rt_executor`) executes inside
+        // `armd-control`'s bounded `StartupSlot` transaction so no driver callback can stall
+        // or unwind on the caller thread while `SupervisorLock` is held.
         Self::flush_legacy_estop_acks_into(&self.estop_reg, &mut guard);
         guard.safety.drain_retired_state_arcs_off_thread();
+        guard.tracking.normalize_spares_off_thread();
         guard.prepare_workspace_eval_bufs();
         guard.prepare_park_release_spare();
-        guard.core.hub().set_motion_config(Arc::new(
-            crate::rt_core::requests::motion::MotionConfigSnapshot::from_supervisor(&guard),
-        ));
         guard.refresh_schema_cache();
 
         let initial_gen = self.inner.generation();
-        self.published_config.publish(
-            crate::rt_core::requests::config::PublishedConfig::from_inner(&guard),
-            initial_gen,
-        );
+        let candidate_pub_cfg = crate::rt_core::requests::config::PublishedConfig::from_inner(&guard);
         let shell = SupervisorInner::detached_shell(
             &guard.config,
             self.estop_state.clone(),
@@ -11725,8 +12546,8 @@ impl ArmSupervisor {
         //   an abandoned legacy WS enable and cleanly calls `drv.abort_enable()`.
         // - LegacyWs disable -> Detached so dispatched/protective hardware disables complete cleanly.
         // Waiters are settled as `OwnerTransferred` ONLY AFTER `spawn_executor` commits (or fails
-        // unrecoverably); on rollback (`Err((Some(real), _))`), the original transition and waiter
-        // remain intact.
+        // unrecoverably); on rollback (`Recoverable` or `into_exclusive` failure), the original
+        // transition and waiter remain intact.
         let handoff_slots = guard.legacy_torque_slots.clone();
         let saved_legacy_transition = guard.torque_transition;
         match guard.torque_transition {
@@ -11759,7 +12580,23 @@ impl ArmSupervisor {
             }
             _ => {}
         }
-        let real = std::mem::replace(&mut *guard, shell);
+        let mut real = std::mem::replace(&mut *guard, shell);
+        if let Some(slot) = real.driver.take() {
+            match slot.into_exclusive() {
+                Ok(exclusive) => real.driver = Some(exclusive),
+                Err((legacy_slot, reason)) => {
+                    real.driver = Some(legacy_slot);
+                    *guard = real;
+                    guard.torque_transition = saved_legacy_transition;
+                    restore_legacy(&mut rollback);
+                    return Err(ArmError::Rejected {
+                        status: 503,
+                        code: "UNSUPPORTED_RT_DRIVER".into(),
+                        message: format!("Cannot transfer ownership: {reason}"),
+                    });
+                }
+            }
+        }
 
         match crate::rt_core::executor::spawn_executor(
             real,
@@ -11778,6 +12615,7 @@ impl ArmSupervisor {
                 for slot in &handoff_slots {
                     any_settled |= slot.settle_owner_transferred();
                 }
+                self.published_config.publish(candidate_pub_cfg, initial_gen);
                 *self.sinks.lock().unwrap_or_else(|e| e.into_inner()) = Some(sinks);
                 self.executor_base_gen.store(initial_gen, Ordering::Release);
                 {
@@ -11796,17 +12634,32 @@ impl ArmSupervisor {
                 self.hub.wake();
                 Ok(handle)
             }
-            Err((Some(real), msg)) => {
-                *guard = *real;
+            Err(crate::rt_core::executor::SpawnExecutorError::Recoverable {
+                mut core,
+                unsupported_reason,
+                msg,
+            }) => {
+                if let Some(slot) = core.driver.take() {
+                    core.driver = Some(slot.into_legacy(Arc::clone(&self.driver_lock_attempts)));
+                }
+                *guard = *core;
                 guard.torque_transition = saved_legacy_transition;
                 let _ = self.drain_pending_disconnects_under_guard(&mut guard, None);
                 guard.purge_closed_live_connections();
                 restore_legacy(&mut rollback);
                 drop(guard);
                 self.try_drain_pending_disconnects_legacy();
-                Err(ArmError::Internal(msg))
+                if let Some(reason) = unsupported_reason {
+                    Err(ArmError::Rejected {
+                        status: 503,
+                        code: "UNSUPPORTED_RT_DRIVER".into(),
+                        message: format!("Cannot transfer ownership: {reason}"),
+                    })
+                } else {
+                    Err(ArmError::Internal(msg))
+                }
             }
-            Err((None, msg)) => {
+            Err(crate::rt_core::executor::SpawnExecutorError::Fatal(msg)) => {
                 let mut any_settled = false;
                 for slot in &handoff_slots {
                     any_settled |= slot.settle_owner_transferred();
@@ -11835,6 +12688,28 @@ impl ArmSupervisor {
         &self.published_config
     }
 
+    /// Filters `PublishedConfig::sequences.pins` on `OWNER_EXECUTOR` against the live published
+    /// `StateHub` action state so stale sequence pins are never exposed once the owning action has
+    /// reached a terminal state (even before async `cleanup()` clears `pins`).
+    fn filter_executor_published_config(
+        &self,
+        cfg: Arc<crate::rt_core::requests::config::PublishedConfig>,
+    ) -> Arc<crate::rt_core::requests::config::PublishedConfig> {
+        if cfg.sequences.pins.is_none() {
+            return cfg;
+        }
+        let running_action_id = self
+            .hub()
+            .latest()
+            .and_then(|s| s.obs.action.as_ref().filter(|a| a.is_running()).map(|a| a.id));
+        if cfg.sequences.active_pins(running_action_id).is_some() {
+            return cfg;
+        }
+        let mut filtered = (*cfg).clone();
+        filtered.sequences.pins = None;
+        Arc::new(filtered)
+    }
+
     /// Returns the latest published configuration snapshot without touching `SupervisorLock`
     /// in `OWNER_EXECUTOR` mode. Fails closed with `503 CONFIG_UNAVAILABLE` if ownership is
     /// transitioning or failed.
@@ -11849,9 +12724,11 @@ impl ArmSupervisor {
                 if handle.is_exited() {
                     return Err(crate::rt_core::requests::config::config_unavailable());
                 }
-                self.published_config
+                let cfg = self
+                    .published_config
                     .latest()
-                    .ok_or_else(crate::rt_core::requests::config::config_unavailable)
+                    .ok_or_else(crate::rt_core::requests::config::config_unavailable)?;
+                Ok(self.filter_executor_published_config(cfg))
             }
             OWNER_LEGACY => {
                 let current_gen = self.inner.generation();
@@ -11869,10 +12746,11 @@ impl ArmSupervisor {
                         if handle.is_exited() {
                             return Err(crate::rt_core::requests::config::config_unavailable());
                         }
-                        return self
+                        let cfg = self
                             .published_config
                             .latest()
-                            .ok_or_else(crate::rt_core::requests::config::config_unavailable);
+                            .ok_or_else(crate::rt_core::requests::config::config_unavailable)?;
+                        return Ok(self.filter_executor_published_config(cfg));
                     }
                     return Err(crate::rt_core::requests::config::config_unavailable());
                 }
@@ -12085,15 +12963,42 @@ impl ArmSupervisor {
 
     /// Subscribes a WS connection's lossless ordinary control queue to unseen action-terminal
     /// observations so terminals are never lost to telemetry broadcast lag.
+    ///
+    /// Uses a race-free 0->1 / N->N+1 registration protocol under `(channel.rx -> terminals.inner)`:
+    /// 1. Register the queue with `min_terminal_seq = u64::MAX` (activates admission backpressure
+    ///    immediately while ignoring pre-existing records).
+    /// 2. Under `channel.rx`, drain ready pre-subscription captures (enforcing the publish barrier
+    ///    so unpublished RT captures are never exposed early), then atomically read
+    ///    `latest_terminal_seq()` and set `min_terminal_seq` inside `terminals.inner`.
     pub(crate) fn subscribe_action_terminals(
         &self,
         sink: impl Fn(&ArmObservation) -> bool + Send + Sync + 'static,
     ) -> TerminalSubscription {
-        let id = self.terminals.subscribe(Box::new(sink));
+        let id = self
+            .terminals
+            .subscribe_with_cutoff(Box::new(sink), u64::MAX);
+        let latest = self.hub.latest();
+        self.terminal_capture_channel
+            .drain_and_activate_subscriber(
+                id,
+                &self.terminals,
+                &self.hub,
+                latest.as_deref(),
+                &self.template_obs,
+            );
         TerminalSubscription {
             broadcaster: Arc::clone(&self.terminals),
             id,
         }
+    }
+
+    /// True if `action_id` has been emitted via a synthetic post-publish terminal (`obs_override`)
+    /// across any consumer. Used by `ws.rs` writer lag-recovery and buffered telemetry send to
+    /// prevent sending a stale `running` frame after a synthetic terminal for the same action.
+    #[inline]
+    pub(crate) fn is_action_synthetically_terminated(&self, action_id: u64) -> bool {
+        self.terminal_capture_channel
+            .was_synthetically_terminated(action_id)
     }
 
     /// Starts the dispatcher thread (armd does at startup, before the control loop): it
@@ -12108,26 +13013,129 @@ impl ArmSupervisor {
         if self.hub.has_dispatcher() { return Ok(()); }
         let _start = self.dispatcher_start.lock().unwrap_or_else(|e| e.into_inner());
         if self.hub.has_dispatcher() { return Ok(()); }
-        let (hub, tx, terminals, sinks, tick_stats, template_obs) = (
+        let (hub, tx, terminals, terminal_capture, sinks, tick_stats, template_obs) = (
             Arc::clone(&self.hub),
             self.telemetry_tx.clone(),
             Arc::clone(&self.terminals),
+            Arc::clone(&self.terminal_capture_channel),
             Arc::clone(&self.sinks),
             Arc::clone(&self.tick_stats),
             self.template_obs.clone(),
         );
         let handle = std::thread::Builder::new()
             .name("armd-dispatch".into())
-            .spawn(move || dispatch_loop(&hub, &tx, &terminals, &sinks, &tick_stats, &template_obs))
+            .spawn(move || {
+                dispatch_loop(
+                    &hub,
+                    &tx,
+                    &terminals,
+                    &terminal_capture,
+                    &sinks,
+                    &tick_stats,
+                    &template_obs,
+                )
+            })
             .map_err(|e| ArmError::Internal(format!("cannot start the observation dispatcher thread: {e}")))?;
         self.hub.set_dispatcher(handle.thread().clone());
         Ok(())
     }
 
-    /// Test-only hook: configure per-connection bounded terminal FIFO capacity.
+    /// Test-only hook: configure per-connection bounded terminal FIFO and capture admission capacity.
     #[doc(hidden)]
     pub fn test_set_terminal_fifo_capacity(&self, capacity: usize) {
         self.terminals.set_capacity(capacity);
+        self.terminal_capture_channel.set_admission_cap(capacity);
+    }
+
+    /// Test-only hook: pause or resume draining of the SPSC terminal capture ring.
+    #[doc(hidden)]
+    pub fn test_set_terminal_capture_drain_paused(&self, paused: bool) {
+        self.terminal_capture_channel.set_drain_paused(paused);
+        if !paused {
+            self.hub.wake();
+        }
+    }
+
+    /// Test-only hook: configure effective push capacity of the SPSC terminal capture ring
+    /// (for deterministic ring-saturation tests).
+    #[doc(hidden)]
+    pub fn test_set_terminal_capture_push_cap(&self, cap: usize) {
+        self.terminal_capture_channel.set_test_push_cap(cap);
+    }
+
+    /// Test-only hook: synchronously drain ready SPSC terminal capture records into
+    /// `TerminalBroadcaster` and flush subscriber queues (for deterministic tests without waiting
+    /// on dispatcher wake jitter).
+    #[doc(hidden)]
+    pub fn test_drain_terminal_captures(&self) -> usize {
+        let latest = self.hub.latest();
+        let drained = self.terminal_capture_channel.drain_into(
+            &self.terminals,
+            &self.hub,
+            latest.as_deref(),
+            &[],
+            &self.template_obs,
+            true,
+        );
+        if self.terminals.has_pending() {
+            let base = latest
+                .as_ref()
+                .map(|s| &s.obs)
+                .unwrap_or(&self.template_obs);
+            let base_seq = latest.as_ref().map_or(0, |s| s.meta.seq);
+            let _ = self.terminals.drain_all(base, base_seq);
+        }
+        drained
+    }
+
+    /// Test-only accessor for lock-free terminal capture statistics.
+    #[doc(hidden)]
+    pub fn test_terminal_capture_stats(&self) -> crate::diagnostics::tick::TerminalCaptureStats {
+        self.terminal_capture_channel.stats()
+    }
+
+    /// Test-only accessor for forbidden `TerminalCaptureChannel` (`rx` / `rich_action_cache`)
+    /// lock attempts detected on the marked RT control thread.
+    #[doc(hidden)]
+    pub fn test_terminal_capture_control_lock_attempts(&self) -> u64 {
+        self.terminal_capture_channel.control_thread_lock_attempts()
+    }
+
+    /// Test-only hook: hold `TerminalCaptureChannel::rx` mutex (for executor lock proofs).
+    #[doc(hidden)]
+    pub fn test_lock_terminal_capture_rx(&self) -> impl Drop + '_ {
+        self.terminal_capture_channel.lock_rx_for_test()
+    }
+
+    /// Test-only hook: hold `TerminalCaptureChannel::rich_action_cache` mutex (for executor lock proofs).
+    #[doc(hidden)]
+    pub fn test_lock_terminal_capture_rich_cache(&self) -> impl Drop + '_ {
+        self.terminal_capture_channel.lock_rich_cache_for_test()
+    }
+
+    /// Test-only positive control: attempt `TerminalCaptureChannel::rx` lock on the current thread.
+    #[doc(hidden)]
+    pub fn test_touch_terminal_capture_rx_lock(&self) {
+        self.terminal_capture_channel.touch_rx_lock_for_test();
+    }
+
+    /// Test-only positive control: attempt `TerminalCaptureChannel::rich_action_cache` lock on the current thread.
+    #[doc(hidden)]
+    pub fn test_touch_terminal_capture_rich_cache_lock(&self) {
+        self.terminal_capture_channel.touch_rich_cache_lock_for_test();
+    }
+
+    /// Test-only hook: hold `TerminalBroadcaster`'s internal mutex (for deterministic lock proofs).
+    #[doc(hidden)]
+    pub fn test_lock_terminal_broadcaster(&self) -> impl Drop + '_ {
+        self.terminals.lock_for_test()
+    }
+
+    /// Test-only hook: non-blocking `try_lock` on `TerminalBroadcaster`'s internal mutex
+    /// (positive control for lock proofs).
+    #[doc(hidden)]
+    pub fn test_try_lock_terminal_broadcaster(&self) -> bool {
+        self.terminals.try_lock_for_test()
     }
 
     /// Test-only hook: pause or resume draining of per-connection terminal FIFOs in `armd-dispatch`.
@@ -12140,8 +13148,20 @@ impl ArmSupervisor {
     }
 
     /// Test-only accessor for total pending finished actions across subscribed terminal FIFOs.
+    /// Drains any ready SPSC terminal captures into `TerminalBroadcaster` first (respecting
+    /// `drain_paused`, without flushing subscriber sinks) so immediate post-tick checks observe
+    /// deterministic FIFO occupancy.
     #[doc(hidden)]
     pub fn test_pending_terminal_count(&self) -> usize {
+        let latest = self.hub.latest();
+        let _ = self.terminal_capture_channel.drain_into(
+            &self.terminals,
+            &self.hub,
+            latest.as_deref(),
+            &[],
+            &self.template_obs,
+            true,
+        );
         self.terminals.pending_total()
     }
 
@@ -14982,24 +16002,47 @@ impl ArmSupervisor {
         if self.owner_mode() != OWNER_LEGACY {
             return None;
         }
-        use crate::diagnostics::tick::{us, UsageMark};
+        use crate::diagnostics::tick::{mid_csw_delta, us, CswMark, ReleasePhasesUs, UsageMark};
         let started = Instant::now();
         let usage_start = UsageMark::now();
-        let (mut obs, terminal_actions, wait, control_hz, pending_zc, pending_wd, phases, log, locked, usage_locked, pre, publish, allocs, tick_tq_dir, tick_io, settled_legacy) = {
+        let (
+            mut obs,
+            captured_any,
+            wait,
+            control_hz,
+            pending_zc,
+            pending_wd,
+            phases,
+            log,
+            locked,
+            usage_locked,
+            pre,
+            publish,
+            mid_csw_start,
+            phase_ack_flush,
+            phase_terminal,
+            lock_end,
+            tick_tq_dir,
+            tick_io,
+            settled_legacy,
+        ) = {
             let (mut inner, generation) = self.inner.write_tick().await;
-            let locked = Instant::now();
-            let usage_locked = UsageMark::now();
-            let _ = crate::diagnostics::alloc::take();
             if inner.detached || self.owner_mode() != OWNER_LEGACY {
                 return None;
             }
+            let locked = Instant::now();
+            let usage_locked = UsageMark::now();
+            // Reset allocator counters and enable deferral BEFORE draining pending disconnects so
+            // any terminal or allocation inside the entire guarded interval is covered.
+            let _ = crate::diagnostics::alloc::take();
+            inner.defer_terminal_capture = true;
+            inner.defer_zero_check_persist = true;
+            inner.defer_watchdog_park_plan = true;
             if self.pending_disconnect_hold.load(Ordering::Acquire) > 0 {
                 let _ = self.drain_pending_disconnects_under_guard(&mut inner, None);
             }
             // No other guard exists now: the log is complete up to the guard waited for.
             let log = self.inner.take_log();
-            inner.defer_zero_check_persist = true;
-            inner.defer_watchdog_park_plan = true;
             inner.tick_phases_us = [0; 5];
             inner.last_tick_torque_ws_direction = None;
             let io_scope = crate::diagnostics::tick::HoldIoScope::enter();
@@ -15009,7 +16052,14 @@ impl ArmSupervisor {
                 let period = Duration::from_secs_f64(1.0 / f64::from(inner.config.control_frequency_hz.max(1)));
                 started + period
             });
-            let TickPublished { kept, body_end } = inner.tick_publish_with_deadline(
+            let TickPublished {
+                kept,
+                body_end,
+                phase_terminal_us,
+                publish_only_us,
+                captured_any,
+                mid_csw_start,
+            } = inner.tick_publish_with_deadline(
                 dt,
                 generation,
                 keep,
@@ -15017,40 +16067,52 @@ impl ArmSupervisor {
             );
             let tick_io = io_scope.finish();
             let tick_tq_dir = inner.last_tick_torque_ws_direction.take();
-            let body_end = body_end.unwrap_or(body_start);
+            let _ = body_end.unwrap_or(body_start);
             let phases = inner.tick_phases_us;
+            let _ = inner.take_phase_terminal_us();
+            inner.defer_terminal_capture = false;
             inner.defer_zero_check_persist = false;
             inner.defer_watchdog_park_plan = false;
             let pending_zc = inner.pending_zero_check_persist.take();
             let pending_wd = inner.watchdog_park_pending.filter(|p| !p.waiting_mit_handback);
             let control_hz = inner.config.control_frequency_hz;
+            let mid_csw_start = mid_csw_start.unwrap_or_else(CswMark::now);
+            let after_publish = Instant::now();
             Self::flush_legacy_estop_acks_into(&self.estop_reg, &mut inner);
-            // Capture finished actions for `TerminalBroadcaster` ONLY when subscribers exist
-            // (without calling `current_observation()` and allocating joint vectors under the
-            // write guard; zero allocs/frees on steady-state and torque ticks, R4 Major 7).
-            let terminal_actions = if self.terminals.has_subscribers() {
-                let prev = inner
-                    .previous_action
-                    .as_ref()
-                    .filter(|(a, _)| !a.is_running())
-                    .map(|(a, _)| a.clone());
-                let last = inner
-                    .last_action
-                    .as_ref()
-                    .filter(|a| !a.is_running())
-                    .cloned();
-                (prev, last)
-            } else {
-                (None, None)
-            };
+            let after_ack_flush = Instant::now();
             let settled_legacy =
                 std::mem::replace(&mut inner.legacy_torque_settled_this_tick, false);
-            let allocs = crate::diagnostics::alloc::take();
             let lock_end = Instant::now();
-            (kept, terminal_actions, locked - started, control_hz, pending_zc, pending_wd, phases, log, locked, usage_locked,
-                body_start - locked, lock_end - body_end, allocs, tick_tq_dir, tick_io, settled_legacy)
+            (
+                kept,
+                captured_any,
+                locked.saturating_duration_since(started),
+                control_hz,
+                pending_zc,
+                pending_wd,
+                phases,
+                log,
+                locked,
+                usage_locked,
+                body_start.saturating_duration_since(locked),
+                publish_only_us,
+                mid_csw_start,
+                us(after_ack_flush.saturating_duration_since(after_publish)),
+                phase_terminal_us,
+                lock_end,
+                tick_tq_dir,
+                tick_io,
+                settled_legacy,
+            )
         };
         let released = Instant::now();
+        // Sample allocator totals immediately after write-guard drop so the alloc proof covers
+        // disconnect drain, tick control, edge-triggered terminal capture, publish, ACK flush,
+        // and write-guard teardown, and `phases_us.alloc_read` measures the actual `alloc::take()`.
+        let alloc_read_start = Instant::now();
+        let allocs = crate::diagnostics::alloc::take();
+        let phase_alloc_read = us(alloc_read_start.elapsed());
+        let phase_guard_drop = us(released.saturating_duration_since(lock_end));
         let usage_released = UsageMark::now();
         let lock_held = released.saturating_duration_since(locked);
         if settled_legacy {
@@ -15067,14 +16129,9 @@ impl ArmSupervisor {
             locked,
             released,
         );
-        if terminal_actions.0.is_some() || terminal_actions.1.is_some() {
-            self.terminals.record_finished_pair(
-                terminal_actions.0.as_ref(),
-                terminal_actions.1.as_ref(),
-            );
-            if self.terminals.has_pending() {
-                self.hub.wake();
-            }
+        let (mid_nvcsw, mid_nivcsw) = mid_csw_delta(&mid_csw_start, &usage_released);
+        if captured_any {
+            self.hub.wake();
         }
         self.control_period_us.store((1e6 / f64::from(control_hz.max(1))) as u64, Ordering::Relaxed);
         if let Some(wd) = pending_wd {
@@ -15109,6 +16166,7 @@ impl ArmSupervisor {
         }
         let late = !dt.is_finite() || dt > 2.0 / f64::from(control_hz.max(1));
         let done = Instant::now();
+        let post_us = us(done.saturating_duration_since(released));
         let log = log.unwrap_or_default();
         let holder = |r: crate::supervisor_lock::HoldRecord| {
             let signed = |a: Instant, b: Instant| if a >= b { us(a - b) as i64 } else { -(us(b - a) as i64) };
@@ -15125,12 +16183,12 @@ impl ArmSupervisor {
                 released_before_lock_us: signed(locked, r.released),
             }
         };
-        let mut sample = crate::diagnostics::tick::TickSample {
-            tick_us: us(done - started),
+        let sample = crate::diagnostics::tick::TickSample {
+            tick_us: us(done.saturating_duration_since(started)),
             release_us: 0,
             wait_us: us(wait),
             lock_us: us(lock_held),
-            post_us: us(done - released),
+            post_us,
             period_us: if dt.is_finite() && dt >= 0.0 { us(Duration::from_secs_f64(dt.min(4.0e3))) } else { 0 },
             wake_lateness_us,
             reader_hold_us: us(log.reader_hold),
@@ -15141,9 +16199,19 @@ impl ArmSupervisor {
             phases: crate::diagnostics::tick::LockPhases {
                 pre_us: us(pre),
                 rx_us: phases[0], control_us: phases[1], tx_us: phases[2], finish_us: phases[3], obs_us: phases[4],
-                publish_us: us(publish),
+                publish_us: publish,
+            },
+            phases_us: ReleasePhasesUs {
+                alloc_read: phase_alloc_read,
+                ack_flush: phase_ack_flush,
+                terminal: phase_terminal,
+                guard_drop: phase_guard_drop,
+                post: post_us,
+                publish: 0,
             },
             usage: crate::diagnostics::tick::ThreadUsage {
+                mid_nvcsw,
+                mid_nivcsw,
                 lock_alloc_calls: allocs.calls.min(u64::from(u32::MAX)) as u32,
                 lock_alloc_us: (allocs.total_ns / 1000).min(u64::from(u32::MAX)) as u32,
                 lock_alloc_max_us: (allocs.max_ns / 1000).min(u64::from(u32::MAX)) as u32,
@@ -15166,11 +16234,17 @@ impl ArmSupervisor {
         };
         if crate::diagnostics::tick::periodic_defers_sample_publish() {
             // Single-completion point in `run_periodic_with_clock` will stamp full `release_us`
-            // (covering wake through `block_on` return and stats publication) and record once.
-            crate::diagnostics::tick::stash_periodic_sample(sample);
+            // and `phases_us.publish` (covering wake through `block_on` return and stats
+            // publication) and record once.
+            crate::diagnostics::tick::stash_periodic_sample_with_post_end(sample, done);
         } else {
-            sample.release_us = us(started.elapsed());
-            let _ = self.tick_stats.record(&sample);
+            let _ = self.tick_stats.record_staged_with_publish(&sample, || {
+                let now = Instant::now();
+                (
+                    us(now.saturating_duration_since(started)),
+                    us(now.saturating_duration_since(done)),
+                )
+            });
         }
         obs
     }
@@ -15322,6 +16396,7 @@ impl ArmSupervisor {
             published: self.hub.published_seq(),
             tick_frees: self.hub.tick_frees(),
         };
+        snap.terminal_capture = self.terminal_capture_channel.stats();
         snap.safety_log_dropped = self
             .sinks
             .lock()
@@ -15363,6 +16438,7 @@ fn dispatch_loop(
     hub: &crate::rt_core::publish::StateHub,
     tx: &broadcast::Sender<ArmObservation>,
     terminals: &TerminalBroadcaster,
+    terminal_capture: &terminal_capture::TerminalCaptureChannel,
     sinks: &std::sync::Mutex<Option<Arc<crate::rt_core::executor::OffThreadSinks>>>,
     tick_stats: &crate::diagnostics::tick::LockFreeTickStats,
     template_obs: &ArmObservation,
@@ -15386,44 +16462,111 @@ fn dispatch_loop(
     };
     let mut last = 0u64;
     let mut last_diag = 0u64;
+    let mut latest_snap: Option<Arc<crate::rt_core::publish::Snapshot>> = None;
+    let mut pending_telemetry: Option<ArmObservation> = None;
     while !hub.is_closed() {
         drain_sinks();
         if let Some(ring) = hub.record_ring() { ring.drain(); }
-        let mut new_obs: Option<ArmObservation> = None;
         if hub.published_seq() != last {
             if let Some(s) = hub.latest().filter(|s| s.meta.seq > last) {
                 last = s.meta.seq;
                 last_diag = last_diag.max(s.policy_diag_seq);
-                terminals.record_from_observation(&s.obs);
-                new_obs = Some(s.obs.clone());
+                pending_telemetry = Some(s.obs.clone());
+                latest_snap = Some(s);
             }
         } else if hub.policy_diag_seq() != last_diag {
             if let Some(s) = hub.latest() {
                 if s.meta.seq > last {
                     last = s.meta.seq;
                     last_diag = last_diag.max(s.policy_diag_seq);
-                    terminals.record_from_observation(&s.obs);
-                    new_obs = Some(s.obs.clone());
+                    pending_telemetry = Some(s.obs.clone());
+                    latest_snap = Some(s);
                 } else if s.policy_diag_seq > last_diag {
                     last_diag = s.policy_diag_seq;
                     // Diagnostic-only overlay update (Shadow steps / timing stats): forward
                     // telemetry without re-enqueuing action terminals.
-                    new_obs = Some(s.obs.clone());
+                    pending_telemetry = Some(s.obs.clone());
+                    latest_snap = Some(s);
                 }
+            }
+        }
+        // Single authoritative terminal ingestion path: drain ready SPSC capture records into
+        // `TerminalBroadcaster` in strict `terminal_seq` order, binding publish-barrier eligibility
+        // strictly to `latest_snap.meta.seq`.
+        let _ = terminal_capture.drain_into(
+            terminals,
+            hub,
+            latest_snap.as_deref(),
+            &[],
+            template_obs,
+            true,
+        );
+        // If a new publication landed concurrently while draining, refresh `latest_snap` once so a
+        // waiting `publish_seq`-gated capture consumes against the matching snapshot immediately.
+        if hub.published_seq() != last {
+            if let Some(s) = hub.latest().filter(|s| s.meta.seq > last) {
+                last = s.meta.seq;
+                last_diag = last_diag.max(s.policy_diag_seq);
+                pending_telemetry = Some(s.obs.clone());
+                latest_snap = Some(s);
+                let _ = terminal_capture.drain_into(
+                    terminals,
+                    hub,
+                    latest_snap.as_deref(),
+                    &[],
+                    template_obs,
+                    true,
+                );
             }
         }
         // Drain every connection's bounded terminal FIFO into its higher-priority `ordinary_out_tx`
         // BEFORE forwarding telemetry so a newer telemetry snapshot can never overtake earlier
         // terminals on the wire.
         if terminals.has_pending() {
-            let base = new_obs
-                .clone()
-                .or_else(|| hub.latest().map(|s| s.obs.clone()));
-            terminals.drain_all(base.as_ref().unwrap_or(template_obs));
+            let (base, base_seq) = match latest_snap.as_ref() {
+                Some(s) => (&s.obs, s.meta.seq),
+                None => (pending_telemetry.as_ref().unwrap_or(template_obs), 0),
+            };
+            if terminals.drain_all(base, base_seq) {
+                // At least one terminal is gated on `required_publish_seq > base_seq` (e.g., an
+                // off-tick Legacy drain moved a terminal into the broadcaster while `latest_snap`
+                // was still at N). Refresh `latest_snap` once so it pairs with the matching snapshot.
+                if let Some(s) = hub.latest().filter(|s| s.meta.seq > last) {
+                    last = s.meta.seq;
+                    last_diag = last_diag.max(s.policy_diag_seq);
+                    pending_telemetry = Some(s.obs.clone());
+                    latest_snap = Some(s);
+                    let _ = terminal_capture.drain_into(
+                        terminals,
+                        hub,
+                        latest_snap.as_deref(),
+                        &[],
+                        template_obs,
+                        true,
+                    );
+                    if let Some(s_ref) = latest_snap.as_ref() {
+                        let _ = terminals.drain_all(&s_ref.obs, s_ref.meta.seq);
+                    }
+                }
+            }
         }
-        if let Some(obs) = new_obs {
-            if terminals.pending_total() == 0 && tx.receiver_count() > 0 {
-                let _ = tx.send(obs);
+        // Telemetry forwarding gate: read `terminal_capture.inflight()` (Acquire) FIRST, then
+        // `terminals.pending_total()` (Acquire) SECOND — the exact inverse of `drain_into`'s
+        // write order (`pending_total` Release -> `inflight` Release) so `(0, 0)` cannot be
+        // observed while a terminal is moving into the FIFO. Keep `pending_telemetry` across
+        // iterations so a gated snapshot is still forwarded once terminals clear without requiring
+        // another publication, while suppressing any stale `running` observation for an action
+        // already delivered via a synthetic post-publish terminal (across all consumers and
+        // diagnostic-only refreshes).
+        if terminal_capture.inflight() == 0 && terminals.pending_total() == 0 {
+            if let Some(obs) = pending_telemetry.take() {
+                let stale_running = obs
+                    .action
+                    .as_ref()
+                    .is_some_and(|a| a.is_running() && terminal_capture.was_synthetically_terminated(a.id));
+                if !stale_running && tx.receiver_count() > 0 {
+                    let _ = tx.send(obs);
+                }
             }
         }
         std::thread::park_timeout(Duration::from_millis(50));
@@ -15435,12 +16578,18 @@ fn dispatch_loop(
         s.flush_and_report_shutdown(tick_stats);
     }
     if let Some(ring) = hub.record_ring() { ring.drain(); }
-    let latest_obs = hub.latest().map(|s| s.obs.clone());
-    if let Some(obs) = latest_obs.as_ref() {
-        terminals.record_from_observation(obs);
-    }
+    let final_snap = hub.latest().or(latest_snap);
+    terminal_capture.drain_into(
+        terminals,
+        hub,
+        final_snap.as_deref(),
+        &[],
+        template_obs,
+        false,
+    );
     if terminals.has_pending() {
-        terminals.drain_all(latest_obs.as_ref().unwrap_or(template_obs));
+        let final_seq = final_snap.as_ref().map_or(0, |s| s.meta.seq);
+        let _ = terminals.drain_all(final_snap.as_ref().map_or(template_obs, |s| &s.obs), final_seq);
     }
 }
 
@@ -15847,13 +16996,13 @@ mod observation_snapshot_tests {
         // Sink rejects (outbound queue full): drain_all MUST NOT pop action 1 and MUST NOT remove
         // the subscriber.
         let base_obs = factory.current_observation();
-        tb.drain_all(&base_obs);
+        let _ = tb.drain_all(&base_obs, 0);
         assert_eq!(tb.pending_total(), 3, "failed enqueue must not pop terminal or drop subscriber");
         assert!(delivered.lock().unwrap().is_empty());
 
         // Once sink accepts again, all 3 terminals pop and deliver in exact FIFO order.
         accept.store(true, Ordering::SeqCst);
-        tb.drain_all(&base_obs);
+        let _ = tb.drain_all(&base_obs, 0);
         assert_eq!(tb.pending_total(), 0);
         assert_eq!(*delivered.lock().unwrap(), vec![a1.id, a2.id, a3.id]);
         assert!(tb.can_start_action(false, false));
@@ -15889,5 +17038,693 @@ mod observation_snapshot_tests {
             assert!(id1.boot_id.as_deref().is_some_and(|s| !s.is_empty()));
             assert!(id1.process_start_unix_ns.is_some_and(|ns| ns > 0));
         }
+    }
+
+    #[test]
+    fn drv_lock_release_helpers_positive_control_legacy_panics_exclusive_succeeds() {
+        use crate::driver::{
+            ArmDriver, ArmDriverError, DriverCapabilities, EnableState, JointTarget,
+            PosForceEmitOutcome, PosForceIntent, PosForceIntentKind, PosForceIntentStamp,
+        };
+        use crate::model::JointState;
+        use crate::rt_core::executor::{ControlThreadGuard, ReleaseGuard};
+        use crate::rt_core::ops::ServiceBudget;
+        use crate::supervisor_lock::DriverSlot;
+        use std::sync::atomic::AtomicUsize;
+
+        struct ObservableReleaseDriver {
+            dof: usize,
+            rx_pos: f32,
+            writes: Arc<AtomicUsize>,
+            last_j0_cmd: Arc<std::sync::atomic::AtomicU32>,
+            j7_epilogue_calls: Arc<AtomicUsize>,
+        }
+
+        impl ArmDriver for ObservableReleaseDriver {
+            fn capabilities(&self) -> DriverCapabilities {
+                DriverCapabilities {
+                    enable_feedback: true,
+                    velocity_feedback: true,
+                    torque_feedback: true,
+                    temperature_feedback: true,
+                    ..DriverCapabilities::default()
+                }
+            }
+            fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+                let mut v = vec![JointState { position: 0.0, velocity: 0.0, torque: 0.0, temperature: 30.0 }; self.dof];
+                v[0].position = self.rx_pos;
+                Ok(v)
+            }
+            fn read_joint_states_budgeted(
+                &mut self,
+                out: &mut Vec<JointState>,
+                _deadline: Instant,
+                _max_rx_frames: u16,
+            ) -> Result<(u16, bool), ArmDriverError> {
+                out.clear();
+                out.resize(self.dof, JointState { position: 0.0, velocity: 0.0, torque: 0.0, temperature: 30.0 });
+                out[0].position = self.rx_pos;
+                Ok((self.dof as u16, false))
+            }
+            fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
+                self.writes.fetch_add(1, Ordering::SeqCst);
+                if let Some(t0) = targets.first() {
+                    self.last_j0_cmd.store(t0.position.to_bits(), Ordering::SeqCst);
+                }
+                Ok(())
+            }
+            fn set_torque(&mut self, _enable: bool) -> Result<(), ArmDriverError> {
+                Ok(())
+            }
+            fn supports_rt_executor(&self) -> Result<(), &'static str> {
+                Ok(())
+            }
+            fn is_feedback_valid(&self) -> bool {
+                true
+            }
+            fn is_enabled(&self) -> bool {
+                true
+            }
+            fn enable_state(&self) -> EnableState {
+                EnableState::Enabled
+            }
+            fn feedback_ages(&self) -> Vec<Option<Duration>> {
+                vec![Some(Duration::from_millis(1)); self.dof]
+            }
+            fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
+                out.clear();
+                out.resize(self.dof, Some(Duration::from_millis(1)));
+            }
+            fn feedback_instants(&self) -> Vec<Option<Instant>> {
+                vec![Some(Instant::now()); self.dof]
+            }
+            fn feedback_seqs(&self) -> Vec<u64> {
+                vec![1; self.dof]
+            }
+            fn emit_pos_force_j7(
+                &mut self,
+                _intent: PosForceIntent,
+                _current_stamp: PosForceIntentStamp,
+            ) -> Result<PosForceEmitOutcome, ArmDriverError> {
+                self.j7_epilogue_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(PosForceEmitOutcome::NotApplicable)
+            }
+        }
+
+        let make_inner = |exclusive: bool| {
+            let writes = Arc::new(AtomicUsize::new(0));
+            let last_j0_cmd = Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let j7_epilogue_calls = Arc::new(AtomicUsize::new(0));
+            let drv = ObservableReleaseDriver {
+                dof: 7,
+                rx_pos: 0.42,
+                writes: Arc::clone(&writes),
+                last_j0_cmd: Arc::clone(&last_j0_cmd),
+                j7_epilogue_calls: Arc::clone(&j7_epilogue_calls),
+            };
+            let counter = Arc::new(AtomicU64::new(0));
+            let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());
+            inner.lease_enabled = false;
+            inner.is_torqued = true;
+            inner.rt_executor_owned = true;
+            inner.safety.set_torque(true).unwrap();
+            inner.driver_lock_attempts = Arc::clone(&counter);
+            inner.driver = Some(if exclusive {
+                DriverSlot::exclusive(Box::new(drv))
+            } else {
+                DriverSlot::legacy_with_counter(Box::new(drv), Arc::clone(&counter))
+            });
+            (inner, counter, writes, last_j0_cmd, j7_epilogue_calls)
+        };
+
+        // 1. Positive control: Legacy DriverSlot panics + increments `driver_lock_attempts` on
+        //    EVERY one of the 4 release-path helpers under ControlThreadGuard + ReleaseGuard.
+        {
+            let (mut inner, counter, writes, _last_j0, j7_calls) = make_inner(false);
+            let mut obs = inner.current_observation();
+            let _cg = ControlThreadGuard::enter();
+            let _rg = ReleaseGuard::enter();
+            let now = Instant::now();
+            let budget = ServiceBudget::for_release(now, now + Duration::from_millis(5));
+
+            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = inner.poll_hardware_rx(Some(&budget), None, Some(now + Duration::from_millis(5)));
+            })).is_err());
+            assert_eq!(counter.load(Ordering::Acquire), 1, "poll_hardware_rx must count +1");
+
+            let mut targets = vec![JointTarget::position(0.15); 7];
+            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = inner.write_output_slice(&mut targets, 0.02, None);
+            })).is_err());
+            assert_eq!(counter.load(Ordering::Acquire), 2, "write_output_slice must count +1");
+            assert_eq!(writes.load(Ordering::SeqCst), 0);
+
+            let stamp = PosForceIntentStamp { stop_gen: 1, estop_epoch: 0, lease_gen: 0 };
+            let mut tick_out = TickOutput::None;
+            let mut allow_acc = true;
+            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                inner.emit_j7_tick_epilogue(
+                    false,
+                    PosForceIntent { kind: PosForceIntentKind::Hold, stamp },
+                    stamp,
+                    &mut tick_out,
+                    &mut allow_acc,
+                );
+            })).is_err());
+            assert_eq!(counter.load(Ordering::Acquire), 3, "emit_j7_tick_epilogue must count +1");
+            assert_eq!(j7_calls.load(Ordering::SeqCst), 0);
+
+            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                inner.fill_observation(1.0, &mut obs);
+            })).is_err());
+            assert_eq!(counter.load(Ordering::Acquire), 4, "fill_observation must count +1");
+        }
+
+        // 2. Exclusive DriverSlot succeeds across ALL 4 release-path helpers under
+        //    ControlThreadGuard + ReleaseGuard with 0 attempts AND observable side effects.
+        {
+            let (mut inner, counter, writes, last_j0, j7_calls) = make_inner(true);
+            let _cg = ControlThreadGuard::enter();
+            let _rg = ReleaseGuard::enter();
+            let now = Instant::now();
+            let budget = ServiceBudget::for_release(now, now + Duration::from_millis(5));
+
+            let rx = inner.poll_hardware_rx(Some(&budget), None, Some(now + Duration::from_millis(5)));
+            assert!(rx.active);
+            assert!((inner.measured_positions[0] - 0.42).abs() < 1e-5, "poll_hardware_rx must update measured_positions");
+
+            let mut targets = vec![JointTarget::position(0.15); 7];
+            let out = inner.write_output_slice(&mut targets, 0.02, None);
+            assert!(matches!(out, TickOutput::Complete { .. }), "write_output_slice must complete: {out:?}");
+            assert_eq!(writes.load(Ordering::SeqCst), 1);
+            assert!((f32::from_bits(last_j0.load(Ordering::SeqCst)) - 0.15).abs() < 1e-5);
+
+            let stamp = PosForceIntentStamp { stop_gen: 1, estop_epoch: 0, lease_gen: 0 };
+            let mut tick_out = TickOutput::None;
+            let mut allow_acc = true;
+            inner.emit_j7_tick_epilogue(
+                false,
+                PosForceIntent { kind: PosForceIntentKind::Hold, stamp },
+                stamp,
+                &mut tick_out,
+                &mut allow_acc,
+            );
+            assert_eq!(j7_calls.load(Ordering::SeqCst), 1, "emit_j7_tick_epilogue must invoke driver");
+
+            let mut obs = inner.current_observation();
+            inner.fill_observation(1.0, &mut obs);
+            assert!(obs.driver_capabilities.enable_feedback);
+            assert!((obs.positions[0] - 0.42).abs() < 1e-5);
+            assert_eq!(counter.load(Ordering::Acquire), 0, "Exclusive slot must record 0 lock attempts");
+        }
+    }
+
+    #[test]
+    fn drv_lock_major6_tx_cutoff_samples_owner_clock_at_driver_boundary() {
+        use crate::driver::{ArmDriver, ArmDriverError, DriverCapabilities, EnableState, JointTarget};
+        use crate::model::JointState;
+        use crate::supervisor_lock::DriverSlot;
+        use crate::transport::MockClock;
+
+        struct DeadlineProbeDriver {
+            dof: usize,
+            clock: MockClock,
+            installed_deadlines: Arc<std::sync::Mutex<Vec<Option<Instant>>>>,
+        }
+        impl ArmDriver for DeadlineProbeDriver {
+            fn capabilities(&self) -> DriverCapabilities { DriverCapabilities::default() }
+            fn clock_now(&self) -> Instant { self.clock.now() }
+            fn set_tx_release_deadline(&mut self, deadline: Option<Instant>) {
+                self.installed_deadlines.lock().unwrap().push(deadline);
+            }
+            fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+                Ok(vec![JointState { position: 0.0, velocity: 0.0, torque: 0.0, temperature: 30.0 }; self.dof])
+            }
+            fn write_joint_targets(&mut self, _targets: &[JointTarget]) -> Result<(), ArmDriverError> { Ok(()) }
+            fn set_torque(&mut self, _enable: bool) -> Result<(), ArmDriverError> { Ok(()) }
+            fn is_feedback_valid(&self) -> bool { true }
+            fn is_enabled(&self) -> bool { true }
+            fn enable_state(&self) -> EnableState { EnableState::Enabled }
+            fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::from_millis(1)); self.dof] }
+            fn feedback_instants(&self) -> Vec<Option<Instant>> { vec![Some(self.clock.now()); self.dof] }
+            fn feedback_seqs(&self) -> Vec<u64> { vec![1; self.dof] }
+        }
+
+        let clock = MockClock::new();
+        let deadlines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let drv = DeadlineProbeDriver {
+            dof: 7,
+            clock: clock.clone(),
+            installed_deadlines: Arc::clone(&deadlines),
+        };
+        let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());
+        inner.lease_enabled = false;
+        inner.is_torqued = true;
+        inner.safety.set_torque(true).unwrap();
+        inner.driver = Some(DriverSlot::exclusive(Box::new(drv)));
+
+        let t0 = Instant::now();
+        let rd = t0 + Duration::from_millis(10);
+        // Simulate clock advancing past `rd` right at the driver-boundary sample.
+        let mut calls = 0usize;
+        let mut now_fn = || {
+            calls += 1;
+            if calls == 1 { t0 } else { rd + Duration::from_millis(5) }
+        };
+        let _ = inner.tick_control_inner(0.02, Some(rd), &mut now_fn);
+        let captured = deadlines.lock().unwrap().clone();
+        // First non-None deadline is the RX-recovery cap installed inside `d.with_mut`:
+        // since call #2 (`owner_now`) is already past `rd`, remaining must be ZERO (`clock.now()`).
+        let first_some = captured.iter().copied().flatten().next().expect("RX cap installed");
+        assert_eq!(first_some, clock.now(), "expired RX recovery cap must not extend past driver now");
+
+        // Also verify `install_effective_tx_cutoff` directly when `owner_now` is past `rd`.
+        deadlines.lock().unwrap().clear();
+        let mut expired_now = || rd + Duration::from_millis(10);
+        let (installed, cutoff) = inner.install_effective_tx_cutoff(Some(rd), &mut expired_now);
+        assert!(installed);
+        let cutoff = cutoff.expect("cutoff returned");
+        assert_eq!(cutoff.drv_release_cap, clock.now());
+        assert_eq!(cutoff.owner_anchor, rd + Duration::from_millis(10));
+    }
+
+    #[test]
+    fn drv_lock_major7_gravity_comp_rechecks_disconnect_fence_after_enable_state() {
+        use crate::driver::{ArmDriver, ArmDriverError, DriverCapabilities, EnableState, JointTarget};
+        use crate::gravity_comp::{GravityCompPhase, GravityCompRun};
+        use crate::model::{GravityCompPolicy, JointState};
+        use crate::supervisor_lock::DriverSlot;
+
+        #[derive(Clone, Copy)]
+        enum InjectPoint {
+            EnableState,
+            SetOutputLeaseGen,
+            None,
+        }
+
+        struct DisconnectInjectDriver {
+            dof: usize,
+            inject_at: InjectPoint,
+            pending_disconnect_hold: Arc<AtomicU64>,
+            writes: Arc<AtomicUsize>,
+            hold_writes: Arc<AtomicUsize>,
+            last_lease_gen: Arc<AtomicU64>,
+        }
+        impl ArmDriver for DisconnectInjectDriver {
+            fn capabilities(&self) -> DriverCapabilities { DriverCapabilities::default() }
+            fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+                Ok(vec![JointState { position: 0.0, velocity: 0.0, torque: 0.0, temperature: 30.0 }; self.dof])
+            }
+            fn set_output_lease_gen(&mut self, gen: u64) {
+                self.last_lease_gen.store(gen, Ordering::SeqCst);
+                if matches!(self.inject_at, InjectPoint::SetOutputLeaseGen) && gen != 0 {
+                    self.pending_disconnect_hold.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            fn write_joint_targets(&mut self, _targets: &[JointTarget]) -> Result<(), ArmDriverError> {
+                self.writes.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn write_estop_hold_bounded(
+                &mut self,
+                targets: &[JointTarget],
+            ) -> Result<crate::driver::TxBatchOutcome, ArmDriverError> {
+                self.hold_writes.fetch_add(1, Ordering::SeqCst);
+                self.write_joint_targets_bounded(targets)
+            }
+            fn set_torque(&mut self, _enable: bool) -> Result<(), ArmDriverError> { Ok(()) }
+            fn is_feedback_valid(&self) -> bool { true }
+            fn is_enabled(&self) -> bool { true }
+            fn enable_state(&self) -> EnableState {
+                if matches!(self.inject_at, InjectPoint::EnableState) {
+                    self.pending_disconnect_hold.fetch_add(1, Ordering::SeqCst);
+                }
+                EnableState::Enabled
+            }
+            fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::from_millis(1)); self.dof] }
+            fn feedback_instants(&self) -> Vec<Option<Instant>> { vec![Some(Instant::now()); self.dof] }
+            fn feedback_seqs(&self) -> Vec<u64> { vec![1; self.dof] }
+        }
+
+        let make_run = |phase: GravityCompPhase, lease_generation: Option<u64>| GravityCompRun {
+            phase,
+            policy: GravityCompPolicy::rebot_dm(),
+            elapsed_s: 1.0,
+            scale: 1.0,
+            damping_kd: [0.0; 6],
+            entry_pose: [0.0; 6],
+            entry_torque: [0.0; 6],
+            tau_ff: [0.0; 6],
+            kp: [0.0; 6],
+            kd: [0.0; 6],
+            position: [0.0; 6],
+            overspeed_count: 0,
+            prev_measured: Some([0.0; 6]),
+            lease_generation,
+        };
+
+        // (a) Periodic output suppresses non-hold write when disconnect arrives in `enable_state()`
+        //     OR in `set_output_lease_gen()`, and resets staged `output_lease_gen` to 0.
+        for inject_at in [InjectPoint::EnableState, InjectPoint::SetOutputLeaseGen] {
+            let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());
+            inner.lease_enabled = true;
+            let gen = inner.acquire_lease("c1").unwrap();
+            assert!(gen > 0);
+            inner.is_torqued = true;
+            inner.torque_intent = TorqueIntent::On;
+            inner.safety.set_torque(true).unwrap();
+            let writes = Arc::new(AtomicUsize::new(0));
+            let hold_writes = Arc::new(AtomicUsize::new(0));
+            let last_lease_gen = Arc::new(AtomicU64::new(999));
+            let drv = DisconnectInjectDriver {
+                dof: 7,
+                inject_at,
+                pending_disconnect_hold: Arc::clone(&inner.pending_disconnect_hold),
+                writes: Arc::clone(&writes),
+                hold_writes: Arc::clone(&hold_writes),
+                last_lease_gen: Arc::clone(&last_lease_gen),
+            };
+            inner.driver = Some(DriverSlot::exclusive(Box::new(drv)));
+            inner.gravity_comp = Some(make_run(GravityCompPhase::Active, Some(gen)));
+
+            let _ = inner.tick_control(0.02);
+            assert_eq!(
+                writes.load(Ordering::SeqCst),
+                0,
+                "periodic non-hold write must be suppressed"
+            );
+            assert!(
+                inner.pending_disconnect_hold.load(Ordering::SeqCst) >= 1,
+                "disconnect injection must have fired"
+            );
+            assert_eq!(
+                last_lease_gen.load(Ordering::SeqCst),
+                0,
+                "staged output_lease_gen must be cleared to 0 on suppression"
+            );
+        }
+
+        // (b) Immediate gravity-comp output suppresses non-hold writes on live disconnect in BOTH
+        //     Active and Exiting (output_lease_gen == 0) phases, while preserving E-stop hold!
+        for exiting in [false, true] {
+            let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());
+            inner.lease_enabled = false;
+            inner.is_torqued = true;
+            inner.torque_intent = TorqueIntent::On;
+            inner.safety.set_torque(true).unwrap();
+            inner.pending_disconnect_hold.store(1, Ordering::SeqCst);
+            let writes = Arc::new(AtomicUsize::new(0));
+            let hold_writes = Arc::new(AtomicUsize::new(0));
+            let last_lease_gen = Arc::new(AtomicU64::new(999));
+            let drv = DisconnectInjectDriver {
+                dof: 7,
+                inject_at: InjectPoint::None,
+                pending_disconnect_hold: Arc::clone(&inner.pending_disconnect_hold),
+                writes: Arc::clone(&writes),
+                hold_writes: Arc::clone(&hold_writes),
+                last_lease_gen: Arc::clone(&last_lease_gen),
+            };
+            inner.driver = Some(DriverSlot::exclusive(Box::new(drv)));
+            inner.gravity_comp = Some(make_run(
+                if exiting {
+                    GravityCompPhase::Exiting {
+                        hold: [0.0; 6],
+                        elapsed_s: 0.0,
+                    }
+                } else {
+                    GravityCompPhase::Active
+                },
+                None,
+            ));
+
+            let out_non_hold = inner.write_gravity_comp_immediate_inner(None, false, false);
+            assert!(matches!(out_non_hold, TickOutput::None), "immediate non-hold write must be suppressed (exiting={exiting})");
+            assert_eq!(writes.load(Ordering::SeqCst), 0);
+            assert_eq!(last_lease_gen.load(Ordering::SeqCst), 0);
+
+            let out_hold = inner.write_gravity_comp_immediate_inner(None, true, false);
+            assert!(matches!(out_hold, TickOutput::Complete { .. }), "immediate E-stop hold must still transmit");
+            assert_eq!(hold_writes.load(Ordering::SeqCst), 1);
+        }
+
+        // (c) Live E-stop latching during `enable_state()` OR during `set_output_lease_gen()` on
+        //     BOTH immediate AND periodic gravity-comp switches to `write_estop_hold_bounded`,
+        //     clears staged lease gen to 0, and sets immediate J7 intent to `Stop`.
+        for (inject_in_setter, immediate) in [(false, true), (true, true), (true, false)] {
+            struct EstopInjectDriver {
+                dof: usize,
+                inject_in_setter: bool,
+                estop_state: Arc<crate::rt_core::urgent::EstopState>,
+                writes: Arc<AtomicUsize>,
+                hold_writes: Arc<AtomicUsize>,
+                last_lease_gen: Arc<AtomicU64>,
+            }
+            impl ArmDriver for EstopInjectDriver {
+                fn capabilities(&self) -> DriverCapabilities { DriverCapabilities::default() }
+                fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+                    Ok(vec![JointState { position: 0.0, velocity: 0.0, torque: 0.0, temperature: 30.0 }; self.dof])
+                }
+                fn set_output_lease_gen(&mut self, gen: u64) {
+                    self.last_lease_gen.store(gen, Ordering::SeqCst);
+                    if self.inject_in_setter && gen != 0 {
+                        self.estop_state.request_and_latch();
+                    }
+                }
+                fn write_joint_targets(&mut self, _targets: &[JointTarget]) -> Result<(), ArmDriverError> {
+                    self.writes.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+                fn write_estop_hold_bounded(
+                    &mut self,
+                    _targets: &[JointTarget],
+                ) -> Result<crate::driver::TxBatchOutcome, ArmDriverError> {
+                    self.hold_writes.fetch_add(1, Ordering::SeqCst);
+                    Ok(crate::driver::TxBatchOutcome::Complete)
+                }
+                fn set_torque(&mut self, _enable: bool) -> Result<(), ArmDriverError> { Ok(()) }
+                fn is_feedback_valid(&self) -> bool { true }
+                fn is_enabled(&self) -> bool { true }
+                fn enable_state(&self) -> EnableState {
+                    if !self.inject_in_setter {
+                        self.estop_state.request_and_latch();
+                    }
+                    EnableState::Enabled
+                }
+                fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::from_millis(1)); self.dof] }
+                fn feedback_instants(&self) -> Vec<Option<Instant>> { vec![Some(Instant::now()); self.dof] }
+                fn feedback_seqs(&self) -> Vec<u64> { vec![1; self.dof] }
+            }
+
+            let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());
+            inner.lease_enabled = true;
+            let gen = inner.acquire_lease("c1").unwrap();
+            inner.is_torqued = true;
+            inner.torque_intent = TorqueIntent::On;
+            inner.safety.set_torque(true).unwrap();
+            let writes = Arc::new(AtomicUsize::new(0));
+            let hold_writes = Arc::new(AtomicUsize::new(0));
+            let last_lease_gen = Arc::new(AtomicU64::new(999));
+            let drv = EstopInjectDriver {
+                dof: 7,
+                inject_in_setter,
+                estop_state: Arc::clone(&inner.estop_state),
+                writes: Arc::clone(&writes),
+                hold_writes: Arc::clone(&hold_writes),
+                last_lease_gen: Arc::clone(&last_lease_gen),
+            };
+            inner.driver = Some(DriverSlot::exclusive(Box::new(drv)));
+            inner.gravity_comp = Some(make_run(GravityCompPhase::Active, Some(gen)));
+
+            if immediate {
+                let out = inner.write_gravity_comp_immediate_inner(None, false, false);
+                assert!(
+                    matches!(out, TickOutput::Complete { is_hold: true, .. }),
+                    "immediate write must switch to hold on live E-stop (inject_in_setter={inject_in_setter}): {out:?}"
+                );
+                assert_eq!(writes.load(Ordering::SeqCst), 0);
+                assert_eq!(hold_writes.load(Ordering::SeqCst), 1);
+                assert_eq!(last_lease_gen.load(Ordering::SeqCst), 0);
+                assert!(matches!(
+                    inner.j7_intent.map(|i| i.kind),
+                    Some(crate::driver::PosForceIntentKind::Stop)
+                ));
+            } else {
+                let _ = inner.tick_control(0.02);
+                assert_eq!(writes.load(Ordering::SeqCst), 0);
+                assert!(hold_writes.load(Ordering::SeqCst) >= 1);
+                assert_eq!(last_lease_gen.load(Ordering::SeqCst), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn drv_lock_budgeted_clear_fault_clock_expiry_under_guard_refuses_without_tx() {
+        use crate::driver::{ArmDriver, ArmDriverError, DriverCapabilities, EnableState, JointTarget};
+        use crate::model::JointState;
+        use crate::safety::{ClearFaultError, ClearRefusal, FaultCode, FaultReason};
+        use crate::supervisor_lock::DriverSlot;
+        use crate::transport::MockClock;
+
+        struct ExpiryProbeDriver {
+            dof: usize,
+            clock: MockClock,
+            hw_fault: bool,
+            tx_probe_pending: bool,
+            deadlines_staged: Arc<AtomicUsize>,
+            tx_calls: Arc<AtomicUsize>,
+        }
+        impl ArmDriver for ExpiryProbeDriver {
+            fn capabilities(&self) -> DriverCapabilities { DriverCapabilities::default() }
+            fn clock_now(&self) -> Instant { self.clock.now() }
+            fn set_tx_release_deadline(&mut self, deadline: Option<Instant>) {
+                if deadline.is_some() {
+                    self.deadlines_staged.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+                Ok(vec![JointState { position: 0.0, velocity: 0.0, torque: 0.0, temperature: 30.0 }; self.dof])
+            }
+            fn write_joint_targets(&mut self, _targets: &[JointTarget]) -> Result<(), ArmDriverError> { Ok(()) }
+            fn set_torque(&mut self, _enable: bool) -> Result<(), ArmDriverError> { Ok(()) }
+            fn probe_tx_ready_budgeted(&mut self, _deadline: Instant) -> Result<bool, ArmDriverError> {
+                self.tx_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(true)
+            }
+            fn clear_fault_budgeted(&mut self, _deadline: Instant) -> Result<(), ArmDriverError> {
+                self.tx_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn has_hardware_fault(&self) -> bool { self.hw_fault }
+            fn tx_probe_pending(&self) -> bool { false }
+            fn tx_probe_confirmed(&self) -> bool { !self.tx_probe_pending }
+            fn is_feedback_valid(&self) -> bool { true }
+            fn is_enabled(&self) -> bool { false }
+            fn enable_state(&self) -> EnableState { EnableState::Disabled }
+            fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::from_millis(1)); self.dof] }
+            fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
+                out.clear();
+                out.resize(self.dof, Some(Duration::from_millis(1)));
+            }
+            fn feedback_instants(&self) -> Vec<Option<Instant>> { vec![Some(self.clock.now()); self.dof] }
+            fn feedback_seqs(&self) -> Vec<u64> { vec![1; self.dof] }
+        }
+
+        // Test BOTH budgeted TX probe and budgeted hardware reset when owner clock reaches
+        // `tx_deadline` right after `drv.clock_now()` under the guard: must return `BudgetExpired`
+        // with 0 staged deadlines, 0 TX calls, and preserved `scratch.ages` capacity.
+        for (test_reset, overshoot_ms) in [(false, 0u64), (false, 5u64), (true, 0u64), (true, 5u64)] {
+            let clock = MockClock::new();
+            let staged = Arc::new(AtomicUsize::new(0));
+            let tx_calls = Arc::new(AtomicUsize::new(0));
+            let drv = ExpiryProbeDriver {
+                dof: 7,
+                clock: clock.clone(),
+                hw_fault: test_reset,
+                tx_probe_pending: !test_reset,
+                deadlines_staged: Arc::clone(&staged),
+                tx_calls: Arc::clone(&tx_calls),
+            };
+            let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());
+            inner.lease_enabled = false;
+            inner.driver = Some(DriverSlot::exclusive(Box::new(drv)));
+            inner.scratch.ages = Vec::with_capacity(16);
+            let orig_cap = inner.scratch.ages.capacity();
+            if test_reset {
+                let _ = inner
+                    .safety
+                    .trigger_fault_coded(FaultCode::Other, FaultReason::Other("hw fault".into()));
+            } else {
+                let _ = inner
+                    .safety
+                    .trigger_fault_coded(FaultCode::CanTxStalled, FaultReason::CanTxStalled);
+            }
+
+            let t0 = Instant::now();
+            let release_deadline = t0 + Duration::from_millis(20);
+            let tx_deadline = release_deadline - inner.tx_release_publish_margin();
+            // First `now_fn()` call (pre-guard) is before `tx_deadline`; second `now_fn()` call
+            // (inside guard after `drv.clock_now()`) is AT or PAST `tx_deadline`!
+            let mut calls = 0usize;
+            let mut live_now = || {
+                calls += 1;
+                if calls == 1 {
+                    t0
+                } else {
+                    tx_deadline + Duration::from_millis(overshoot_ms)
+                }
+            };
+            let res = inner.clear_fault_executor_bounded_for_release_with_clock(
+                t0,
+                release_deadline,
+                None,
+                &mut live_now,
+            );
+            assert!(
+                matches!(res, Err(ClearFaultError::Rejected(ClearRefusal::BudgetExpired))),
+                "expected BudgetExpired (test_reset={test_reset}, overshoot_ms={overshoot_ms}), got {res:?}"
+            );
+            assert_eq!(staged.load(Ordering::SeqCst), 0, "must not stage TX deadline after expiry");
+            assert_eq!(tx_calls.load(Ordering::SeqCst), 0, "must not transmit after expiry");
+            assert_eq!(inner.scratch.ages.capacity(), orig_cap, "scratch.ages must be restored on BudgetExpired");
+        }
+    }
+
+    #[test]
+    fn drv_lock_major8_park_disable_stop_gen_max_cancels_cleanly_on_estop_inhibited() {
+        use crate::driver::{ArmDriver, ArmDriverError, DriverCapabilities, EnableState, JointTarget, TorqueProgress};
+        use crate::model::JointState;
+        use crate::rt_core::urgent::StopRequests;
+        use crate::supervisor_lock::DriverSlot;
+
+        struct StopGenLeadParkDriver {
+            dof: usize,
+            owner_stop_gen: Arc<AtomicU64>,
+        }
+        impl ArmDriver for StopGenLeadParkDriver {
+            fn capabilities(&self) -> DriverCapabilities { DriverCapabilities::default() }
+            fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+                Ok(vec![JointState { position: 0.0, velocity: 0.0, torque: 0.0, temperature: 30.0 }; self.dof])
+            }
+            fn write_joint_targets(&mut self, _targets: &[JointTarget]) -> Result<(), ArmDriverError> { Ok(()) }
+            fn set_torque(&mut self, _enable: bool) -> Result<(), ArmDriverError> { Ok(()) }
+            fn begin_client_park_disable(
+                &mut self,
+                _max_rx_frames: Option<u16>,
+                _expected_stop_gen: Option<u64>,
+            ) -> Result<TorqueProgress, ArmDriverError> {
+                // Advance owner-local `stop_gen` ahead of `StopRequests::current()` and fail
+                // with `EstopInhibited` (modeling a local stop before any disable frame hit the wire).
+                self.owner_stop_gen.fetch_add(1, Ordering::SeqCst);
+                Err(ArmDriverError::EstopInhibited)
+            }
+            fn is_feedback_valid(&self) -> bool { true }
+            fn is_enabled(&self) -> bool { true }
+            fn enable_state(&self) -> EnableState { EnableState::Enabled }
+            fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::from_millis(1)); self.dof] }
+            fn feedback_instants(&self) -> Vec<Option<Instant>> { vec![Some(Instant::now()); self.dof] }
+            fn feedback_seqs(&self) -> Vec<u64> { vec![1; self.dof] }
+        }
+
+        let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());
+        inner.lease_enabled = false;
+        inner.is_torqued = true;
+        inner.safety.set_torque(true).unwrap();
+        inner.commanded_velocities.fill(0.0);
+        inner.attach_stop_requests(StopRequests::new());
+        let drv = StopGenLeadParkDriver {
+            dof: 7,
+            owner_stop_gen: Arc::clone(&inner.stop_gen),
+        };
+        inner.driver = Some(DriverSlot::exclusive(Box::new(drv)));
+
+        inner.begin_park_disable_transition(false, None);
+        assert!(
+            inner.torque_transition.is_none(),
+            "client park stopped via owner-local stop_gen must cancel cleanly without torque_transition"
+        );
+        assert!(
+            !inner.safety.state().is_stopped(),
+            "clean park stop-gate cancellation must not latch E-stop/stopped fault"
+        );
     }
 }

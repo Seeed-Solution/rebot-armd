@@ -7,7 +7,7 @@
 //! the injection lives only in the tests.
 mod common;
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use armd::api::rest::ApiError;
 use armd::collision::{CollisionPolicy, Sensitivity};
@@ -33,7 +33,7 @@ fn rig(policy: Option<CollisionPolicy>) -> (SupervisorInner, TestArm) {
     let arm = TestArm::new();
     let mut inner = SupervisorInner::new(profile(policy));
     inner.lease_enabled = false;
-    inner.driver = Some(Mutex::new(Box::new(arm.clone())));
+    inner.driver = Some(armd::supervisor_lock::DriverSlot::legacy(Box::new(arm.clone())));
     inner.commanded_positions = INSPECT.to_vec();
     inner.measured_positions = INSPECT.to_vec();
     inner.target_positions = INSPECT.to_vec();

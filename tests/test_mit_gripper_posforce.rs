@@ -1357,7 +1357,7 @@ fn estop_holds_measured_position_only_when_feedback_is_fresh_else_commanded() {
     // Establish a fresh empty-queue boundary on the driver and decode fresh -2.2 feedback
     // directly into the driver cache without running inner.tick().
     {
-        let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+        let mut drv = inner.driver.as_mut().unwrap().write().unwrap();
         drv.read_joint_states().unwrap();
         bus.with(|s| {
             s.motors[J7].q = -2.2;
@@ -1424,7 +1424,7 @@ fn estop_never_blocks_when_driver_mutex_held_by_another_thread() {
     for floating_gc in [false, true] {
         let mut inner = setup_with_fresh_feedback(floating_gc);
         let pre_cmd = inner.commanded_positions.clone();
-        let shared_driver = Arc::new(inner.driver.take().unwrap());
+        let shared_driver = Arc::new(inner.driver.take().unwrap().into_legacy_mutex().unwrap());
         let holder_driver = Arc::clone(&shared_driver);
         let estop_driver = Arc::clone(&shared_driver);
         let (locked_tx, locked_rx) = mpsc::channel();
@@ -1476,7 +1476,7 @@ fn estop_never_blocks_when_driver_mutex_held_by_another_thread() {
     let mut inner = setup_with_fresh_feedback(true);
     let pre_cmd = inner.commanded_positions.clone();
     let _ = std::thread::scope(|s| {
-        let drv = inner.driver.as_ref().unwrap();
+        let drv = inner.driver.as_ref().unwrap().as_legacy_lock().unwrap();
         s.spawn(move || {
             let _guard = drv.lock().unwrap();
             panic!("intentional poison");

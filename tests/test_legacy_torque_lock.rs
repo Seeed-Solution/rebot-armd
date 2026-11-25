@@ -1143,7 +1143,7 @@ async fn legacy_ws_stalled_ticker_real_deadline_cleans_up_enable_and_detaches_di
             .driver
             .as_ref()
             .unwrap()
-            .lock()
+            .read()
             .unwrap()
             .torque_transition_pending();
         assert!(
@@ -1353,7 +1353,7 @@ async fn legacy_ws_contended_stop_drains_cancelling_phase_and_allows_measured_ho
             .driver
             .as_ref()
             .unwrap()
-            .lock()
+            .read()
             .unwrap()
             .torque_transition_pending(),
         "Damiao torque_hs must be cleared so subsequent measured holds are never rejected"
@@ -1453,7 +1453,7 @@ async fn legacy_ws_real_socket_deadline_cleans_up_enable_and_detaches_dispatched
                 .driver
                 .as_ref()
                 .unwrap()
-                .lock()
+                .read()
                 .unwrap()
                 .torque_transition_pending(),
             "Damiao driver torque_hs must be cancelled on real WS deadline"
@@ -1878,7 +1878,7 @@ async fn legacy_ws_contended_estop_and_lease_revocation_never_stall_and_drain_ca
         assert_eq!(bus.enable_tx_count(), tx_at_estop);
         let inner = sup.inner().read().await;
         assert!(!inner.torque_transition_pending());
-        assert!(!inner.driver.as_ref().unwrap().lock().unwrap().torque_transition_pending());
+        assert!(!inner.driver.as_ref().unwrap().read().unwrap().torque_transition_pending());
     }
 
     // Subcase 2 (R3 M2): Lease revocation while driver mutex is contended during pending enable
@@ -1927,7 +1927,7 @@ async fn legacy_ws_contended_estop_and_lease_revocation_never_stall_and_drain_ca
         assert_eq!(bus.enable_tx_count(), tx_at_revoke);
         let inner = sup.inner().read().await;
         assert!(!inner.torque_transition_pending());
-        assert!(!inner.driver.as_ref().unwrap().lock().unwrap().torque_transition_pending());
+        assert!(!inner.driver.as_ref().unwrap().read().unwrap().torque_transition_pending());
     }
 }
 

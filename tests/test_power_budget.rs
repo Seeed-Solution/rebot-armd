@@ -88,7 +88,7 @@ fn rig_at(config: ArmConfig, q: [f32; 7]) -> (SupervisorInner, SimArm) {
     let arm = SimArm::new(q);
     let mut inner = SupervisorInner::new(ArmConfig { lease_timeout_ms: 600_000, ..config });
     inner.lease_enabled = false;
-    inner.driver = Some(Mutex::new(Box::new(arm.clone())));
+    inner.driver = Some(armd::supervisor_lock::DriverSlot::legacy(Box::new(arm.clone())));
     inner.commanded_positions = q.to_vec();
     inner.measured_positions = q.to_vec();
     inner.target_positions = q.to_vec();

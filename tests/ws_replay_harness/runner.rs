@@ -52,6 +52,7 @@ struct RuntimeVars {
     recording_id: Option<String>,
     episode_id: Option<String>,
     actions: HashMap<String, u64>,
+    action_expected_s: HashMap<u64, f64>,
     last_action_id: Option<u64>,
 }
 
@@ -67,6 +68,11 @@ impl RuntimeVars {
         }
         if let Some(aid) = frame.get("action_id").and_then(Value::as_u64) {
             self.last_action_id = Some(aid);
+            if let Some(exp) = frame.get("expected_duration_s").and_then(Value::as_f64) {
+                if exp.is_finite() && exp >= 0.0 {
+                    self.action_expected_s.insert(aid, exp);
+                }
+            }
             if let Some(alias) = capture_action {
                 self.actions.insert(alias.to_string(), aid);
             }
@@ -247,7 +253,14 @@ async fn wait_for_action_terminal(
     if client.recorded_terminals.contains(&target_action_id) {
         return;
     }
-    tokio::time::timeout(Duration::from_secs(10), async {
+    let timeout = vars
+        .action_expected_s
+        .get(&target_action_id)
+        .copied()
+        .map_or(Duration::from_secs(10), |exp| {
+            Duration::from_secs_f64((exp * 2.0 + 5.0).max(10.0))
+        });
+    tokio::time::timeout(timeout, async {
         loop {
             let msg = client
                 .ws
@@ -286,7 +299,9 @@ async fn wait_for_action_terminal(
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("timed out waiting for terminal of action {target_action_id}"));
+    .unwrap_or_else(|_| {
+        panic!("timed out after {timeout:?} waiting for terminal of action {target_action_id}")
+    });
 }
 
 /// Quantize a joint-position array from a telemetry frame to integer milliradians (`1e-3 rad`).

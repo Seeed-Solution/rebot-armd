@@ -4094,3 +4094,210 @@ async fn executor_amend_ring_retains_32_paused_releases_and_accounts_saturation(
     assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO);
     handle.stop_and_join();
 }
+
+#[test]
+fn analyze_py_renders_phases_us_max_wait_and_sched_trace_and_sched_trace_sh_works() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let analyze_py = manifest.join("scripts/rt_qual/analyze.py");
+    let sched_trace_sh = manifest.join("scripts/rt_qual/sched_trace.sh");
+
+    // 1. analyze.py renders phases_us + mid_nvcsw/mid_nivcsw for max_release and holder/command/handoff for max_wait.
+    let mut t0 = base_tick_json(20_100, 1_500);
+    t0["instance_id"] = serde_json::json!("armd-pm-1");
+    t0["boot_id"] = serde_json::json!("boot-uuid-pm-1");
+    t0["process_start_unix_ns"] = serde_json::json!(1_700_000_000_000_000_000u64);
+    t0["owner_mode"] = serde_json::json!("legacy");
+    t0["loop_active"] = serde_json::json!(true);
+    t0["stats_snapshot_lapped"] = serde_json::json!(false);
+    t0["stats_writer_drops"] = serde_json::json!(0);
+    t0["in_flight_release_us"] = serde_json::json!(0);
+    t0["release_us"] = serde_json::json!({ "p50": 800, "p99": 2_000, "max": 24_500 });
+    t0["releases_started"] = serde_json::json!(100);
+    t0["releases_total"] = serde_json::json!(100);
+    t0["release_us_max_ever"] = serde_json::json!(24_500);
+    t0["releases_over_10ms"] = serde_json::json!(1);
+    t0["releases_over_15ms"] = serde_json::json!(1);
+    t0["releases_over_20ms"] = serde_json::json!(1);
+    t0["wake_late_max_ever"] = serde_json::json!(400);
+    t0["skipped_releases"] = serde_json::json!(0);
+    t0["diag_dropped"] = serde_json::json!(0);
+    t0["wake_lateness_us"] = serde_json::json!({ "p50": 50, "p99": 200, "max": 400 });
+    t0["wait_us"] = serde_json::json!({ "p50": 0, "p99": 100, "max": 6_400 });
+    t0["max_release"] = serde_json::json!({
+        "tick_us": 24_300,
+        "release_us": 24_500,
+        "wait_us": 50,
+        "lock_us": 1_800,
+        "post_us": 75,
+        "period_us": 20_100,
+        "pre_us": 30, "rx_us": 300, "control_us": 400, "tx_us": 500,
+        "finish_us": 40, "obs_us": 100, "publish_us": 30,
+        "phases_us": {
+            "alloc_read": 4,
+            "ack_flush": 11,
+            "terminal": 17_500,
+            "guard_drop": 38,
+            "post": 75,
+            "publish": 120
+        },
+        "lock_cpu_us": 1_200, "lock_vcsw": 1, "lock_ivcsw": 3,
+        "mid_nvcsw": 1, "mid_nivcsw": 3,
+        "lock_majflt": 0, "lock_minflt": 0, "lock_alloc_calls": 0,
+        "waited_for": null, "longest_hold": null,
+        "ticks_ago": 5
+    });
+    t0["max_wait"] = serde_json::json!({
+        "tick_us": 7_800,
+        "release_us": 7_900,
+        "wait_us": 6_400,
+        "lock_us": 1_100,
+        "post_us": 40,
+        "period_us": 20_050,
+        "pre_us": 20, "rx_us": 200, "control_us": 300, "tx_us": 300,
+        "finish_us": 30, "obs_us": 80, "publish_us": 20,
+        "phases_us": {
+            "alloc_read": 2, "ack_flush": 3, "terminal": 4,
+            "guard_drop": 5, "post": 40, "publish": 20
+        },
+        "lock_cpu_us": 900, "lock_vcsw": 0, "lock_ivcsw": 0,
+        "mid_nvcsw": 0, "mid_nivcsw": 0,
+        "lock_majflt": 0, "lock_minflt": 0, "lock_alloc_calls": 0,
+        "waited_for": {
+            "kind": "write",
+            "location": "src/supervisor.rs:1234",
+            "command": "/api/v1/motion/jog",
+            "action_id": 99,
+            "hold_us": 6_100,
+            "acquire_us": 5,
+            "acquired_before_wait_us": 200,
+            "released_before_lock_us": 280
+        },
+        "handoff_us": 280,
+        "longest_hold": null,
+        "ticks_ago": 12
+    });
+    let mut t1 = t0.clone();
+    t1["since_boot_ticks"] = serde_json::json!(200);
+    t1["releases_started"] = serde_json::json!(200);
+    t1["releases_total"] = serde_json::json!(200);
+    let load_path = dir.path().join("pm_load.jsonl");
+    let lines = format!(
+        "{}\n{}\n{}\n{}\n",
+        serde_json::json!({ "type": "meta", "run_id": "pm-test", "enabled_loads": { "obs_poll": true } }),
+        serde_json::json!({ "type": "sample", "run_id": "pm-test", "phase": "baseline", "elapsed_s": 0.0, "tick": t0, "counters": { "obs_ok": 1 } }),
+        serde_json::json!({ "type": "sample", "run_id": "pm-test", "phase": "final", "elapsed_s": 2.0, "tick": t1, "counters": { "obs_ok": 10 }, "safety_state": "Idle" }),
+        serde_json::json!({ "type": "summary", "run_id": "pm-test", "stop_reason": "completed", "fault": null, "safety_state": "Idle", "terminal_safety_verified": true, "counters": { "obs_ok": 10 } }),
+    );
+    std::fs::write(&load_path, lines).unwrap();
+
+    // 2. Synthetic ftrace sched_switch trace (both SG2002 5.10 no-TGID and 6.x TGID formats).
+    let trace_path = dir.path().join("sched_trace.txt");
+    std::fs::write(
+        &trace_path,
+        concat!(
+            "# tracer: nop\n",
+            "#\n",
+            "    armd-control-4200  [000] d...  100.001000: sched_switch: prev_comm=armd-control prev_pid=4200 prev_prio=20 prev_state=R ==> next_comm=irq/42-spi0 next_pid=115 next_prio=49\n",
+            "     irq/42-spi0-115   [000] d...  100.005250: sched_switch: prev_comm=irq/42-spi0 prev_pid=115 prev_prio=49 prev_state=S ==> next_comm=armd-control next_pid=4200 next_prio=20\n",
+            "    armd-control-4200  [000] d...  100.010000: sched_switch: prev_comm=armd-control prev_pid=4200 prev_prio=20 prev_state=S ==> next_comm=swapper/0 next_pid=0 next_prio=120\n",
+            "       swapper/0-0     [000] d...  100.011500: sched_switch: prev_comm=swapper/0 prev_pid=0 prev_prio=120 prev_state=R ==> next_comm=armd-control next_pid=4200 next_prio=20\n",
+            "    armd-control-4200  ( 4100) [000] d..1. 100.020000: sched_switch: prev_comm=armd-control prev_pid=4200 prev_prio=20 prev_state=S ==> next_comm=kworker/0:1H next_pid=88 next_prio=100\n",
+            "    kworker/0:1H-88    (   88) [000] d...  100.025000: sched_wakeup: comm=armd-control pid=4200 prio=20 target_cpu=000\n",
+            "    kworker/0:1H-88    (   88) [000] d..1. 100.032750: sched_switch: prev_comm=kworker/0:1H prev_pid=88 prev_prio=100 prev_state=I ==> next_comm=armd-control next_pid=4200 next_prio=20\n",
+        ),
+    )
+    .unwrap();
+
+    // Combined mode: --load + --sched-trace + --control-tid.
+    let combined = Command::new("python3")
+        .arg(&analyze_py)
+        .arg("--load")
+        .arg(&load_path)
+        .arg("--sched-trace")
+        .arg(&trace_path)
+        .arg("--control-tid")
+        .arg("4200")
+        .output()
+        .expect("run analyze.py combined");
+    assert!(
+        combined.status.success(),
+        "analyze.py combined failed: {}",
+        String::from_utf8_lossy(&combined.stderr)
+    );
+    let rep = String::from_utf8(combined.stdout).unwrap();
+    assert!(rep.contains("### Release Phase Marks (`max_release`)"), "{rep}");
+    assert!(rep.contains("| 4 | 11 | 17500 | 38 | 75 | 120 | 1/3 |"), "{rep}");
+    assert!(rep.contains("### Worst Lock Wait Breakdown (`max_wait`)"), "{rep}");
+    assert!(rep.contains("`write@src/supervisor.rs:1234` | `/api/v1/motion/jog` | 6.10 | 280 |"), "{rep}");
+    assert!(rep.contains("## 7. Scheduler Switch-Outs (`sched_trace`)"), "{rep}");
+    assert!(rep.contains("**Over threshold**: `2`"), "{rep}");
+    assert!(rep.contains("| 1 | `100.020000` | `100.032750` | **12.750** | `S` | `kworker/0:1H` | 88 | 100 |"), "{rep}");
+    assert!(rep.contains("| 2 | `100.001000` | `100.005250` | **4.250** | `R` | `irq/42-spi0` | 115 | 49 |"), "{rep}");
+    assert!(!rep.contains("swapper/0"), "1.5 ms switch-out must be filtered out:\n{rep}");
+
+    // Standalone mode: --sched-trace without --load.
+    let standalone = Command::new("python3")
+        .arg(&analyze_py)
+        .arg("--sched-trace")
+        .arg(&trace_path)
+        .arg("--control-tid")
+        .arg("4200")
+        .output()
+        .expect("run analyze.py standalone");
+    assert!(standalone.status.success());
+    let srep = String::from_utf8(standalone.stdout).unwrap();
+    assert!(srep.contains("kworker/0:1H"), "{srep}");
+    assert!(srep.contains("irq/42-spi0"), "{srep}");
+    assert!(!srep.contains("swapper/0"), "{srep}");
+
+    // 3. sched_trace.sh absent ftrace -> exits 2 with clear message.
+    let absent = Command::new("sh")
+        .arg(&sched_trace_sh)
+        .arg("--trace-dir")
+        .arg(dir.path().join("no_such_tracefs"))
+        .arg("--duration")
+        .arg("1")
+        .arg("--output")
+        .arg(dir.path().join("unused.txt"))
+        .output()
+        .expect("run sched_trace.sh absent");
+    assert_eq!(absent.status.code(), Some(2), "expected exit 2 when ftrace absent");
+    let absent_err = String::from_utf8_lossy(&absent.stderr);
+    assert!(absent_err.contains("ftrace unavailable"), "{absent_err}");
+
+    // 4. sched_trace.sh against a fake tracefs directory restores tracing_on=0 & event enables on exit.
+    let fake_trace = dir.path().join("fake_tracefs");
+    std::fs::create_dir_all(fake_trace.join("events/sched/sched_switch")).unwrap();
+    std::fs::create_dir_all(fake_trace.join("events/sched/sched_wakeup")).unwrap();
+    std::fs::write(fake_trace.join("tracing_on"), "0\n").unwrap();
+    std::fs::write(fake_trace.join("current_tracer"), "function\n").unwrap();
+    std::fs::write(fake_trace.join("buffer_size_kb"), "1408\n").unwrap();
+    std::fs::write(fake_trace.join("trace"), "# tracer: nop\n").unwrap();
+    std::fs::write(fake_trace.join("events/sched/sched_switch/enable"), "0\n").unwrap();
+    std::fs::write(fake_trace.join("events/sched/sched_wakeup/enable"), "0\n").unwrap();
+    let cap_out = dir.path().join("captured.txt");
+    let ok = Command::new("sh")
+        .arg(&sched_trace_sh)
+        .arg("--trace-dir")
+        .arg(&fake_trace)
+        .arg("--duration")
+        .arg("1")
+        .arg("--buffer-size-kb")
+        .arg("2048")
+        .arg("--output")
+        .arg(&cap_out)
+        .output()
+        .expect("run sched_trace.sh fake tracefs");
+    assert!(
+        ok.status.success(),
+        "sched_trace.sh failed: {}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(fake_trace.join("tracing_on")).unwrap().trim(), "0");
+    assert_eq!(std::fs::read_to_string(fake_trace.join("current_tracer")).unwrap().trim(), "nop");
+    assert_eq!(std::fs::read_to_string(fake_trace.join("buffer_size_kb")).unwrap().trim(), "2048");
+    assert_eq!(std::fs::read_to_string(fake_trace.join("events/sched/sched_switch/enable")).unwrap().trim(), "0");
+    assert_eq!(std::fs::read_to_string(fake_trace.join("events/sched/sched_wakeup/enable")).unwrap().trim(), "0");
+    assert!(cap_out.exists());
+}

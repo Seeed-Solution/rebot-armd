@@ -1777,59 +1777,47 @@ async fn assert_executor_refuses_op_cleanly(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn executor_refuses_calibration_apply_without_side_effects() {
-    let valid_q = armd::kinematics::r_to_quat(
-        &armd::chain::ArmModel::REBOT_DEV_ARM.cam_mount(false, 0.0, -25.0),
-    );
-    let body = json!({
-        "dry_run": false,
-        "camera_mount": { "offset_m": [0.01, -0.02, 0.05], "q_end_cam": valid_q },
-        "intrinsics": {
-            "fx": 831.5, "fy": 830.0, "cx": 321.0, "cy": 179.0,
-            "k1": 0.0, "k2": 0.0, "p1": 0.0, "p2": 0.0, "k3": 0.0,
-            "width": 640, "height": 360
-        },
-        "table_z_m": 0.012
-    });
-    let req: ApplyRequest = armd::calibration::parse_apply(&body).unwrap();
-    assert_executor_refuses_op_cleanly("/api/v1/calibration/apply", body, move |sup, deps| {
-        Box::pin(async move {
-            let check: armd::calibration::LeaseCheck = Box::new(|_| Ok(()));
-            Some(armd::calibration::apply(sup, deps, req, &check).await)
-        })
-    })
-    .await;
-}
+async fn executor_routes_in_scope_calibration_paths_through_lease_gate() {
+    // In-scope C-F1 part 1 calibration paths are no longer refused with EXECUTOR_UNSUPPORTED
+    // on mock Executor: without a lease on this WS connection they fail closed 409 LEASE_LOST,
+    // while leaving disk, live state, and RT allocator strictly untouched.
+    let rig = Rig::new(RtOwner::Executor, |_| {}).await;
+    let (base, server_jh) = spawn_http_router(&rig, None, OperatorAuth::disabled()).await;
+    let ws_url = format!("{}/api/v1/ws", base.replace("http://", "ws://"));
+    let _detached_guard = rig.sup.inner().write().await;
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn executor_refuses_calibration_restore_without_side_effects() {
-    let body = json!({ "backup": "2026-01-01T00-00-00Z" });
-    let body_c = body.clone();
-    assert_executor_refuses_op_cleanly("/api/v1/calibration/restore", body, move |sup, deps| {
-        Box::pin(async move {
-            let check: armd::calibration::LeaseCheck = Box::new(|_| Ok(()));
-            Some(armd::calibration::restore(sup, deps, &body_c, &check).await)
-        })
-    })
-    .await;
-}
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
+    let cases = [
+        ("/api/v1/calibration/apply", json!({ "dry_run": true })),
+        ("/api/v1/calibration/restore", json!({ "backup": "2026-01-01T00-00-00Z" })),
+        (
+            motor_zero::PATH,
+            json!({ "joints": [1, 2], "method": "software", "force": true, "dry_run": false }),
+        ),
+        (motor_zero::RESTORE_PATH, json!({ "backup": "2026-01-01T00-00-00Z" })),
+    ];
+    for (idx, (path, body)) in cases.iter().enumerate() {
+        let rej = ws_send_recv(
+            &mut ws,
+            json!({
+                "type": "command",
+                "request_id": (idx as u64) + 1,
+                "generation": rig.lease_gen,
+                "epoch_id": rig.epoch,
+                "path": path,
+                "body": body,
+            }),
+        )
+        .await;
+        assert_eq!(rej["type"], "command_reject", "{path}: {rej}");
+        assert_eq!(rej["status"], 409, "{path}: {rej}");
+        assert_eq!(rej["code"], "LEASE_LOST", "{path}: {rej}");
+    }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn executor_refuses_software_joint_zero_without_side_effects() {
-    let body = json!({ "joints": [1, 2], "method": "software", "force": true, "dry_run": false });
-    let req = MotorZeroRequest {
-        joints: vec![0, 1],
-        dry_run: false,
-        force: true,
-        method: Some("software".into()),
-    };
-    assert_executor_refuses_op_cleanly(motor_zero::PATH, body, move |sup, deps| {
-        Box::pin(async move {
-            let check: armd::calibration::LeaseCheck = Box::new(|_| Ok(()));
-            Some(motor_zero::run(sup, deps, req, &check).await)
-        })
-    })
-    .await;
+    rig.assert_executor_zero_alloc("in-scope calibration WS lease gate");
+    drop(_detached_guard);
+    server_jh.abort();
+    rig.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1851,15 +1839,80 @@ async fn executor_refuses_hardware_motor_zero_without_side_effects() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn executor_refuses_joint_zero_restore_without_side_effects() {
-    let body = json!({ "backup": "2026-01-01T00-00-00Z" });
-    assert_executor_refuses_op_cleanly(motor_zero::RESTORE_PATH, body, move |sup, deps| {
-        Box::pin(async move {
-            let check: armd::calibration::LeaseCheck = Box::new(|_| Ok(()));
-            Some(motor_zero::restore(sup, deps, "2026-01-01T00-00-00Z".into(), &check).await)
-        })
-    })
-    .await;
+async fn executor_refuses_driver_backed_software_zero_and_restore_without_side_effects() {
+    let sup = Arc::new(
+        ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(MinimalHwDriver::new(7))),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let calib_path = dir.path().join("calibration.json");
+    let setup_path = dir.path().join("grasp_setup.json");
+    let mut ecfg = ExecutorConfig::for_tests(Duration::from_millis(2));
+    ecfg.alloc_timing = true;
+    let handle = sup.start_executor(ecfg).await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while sup.hub().latest().is_none() {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let _detached = sup.inner().write().await;
+
+    let det_up = armd::api::proxy::DetectorUpstream::parse("http://127.0.0.1:9").unwrap();
+    let grasp_deps = GraspDeps::http(det_up.clone(), Some(setup_path.clone()));
+    let calib_path_chk = calib_path.clone();
+    let cal_deps = CalibrationDeps::new(calib_path, Some(setup_path), det_up.clone());
+    let router = armd::api::create_router_calibration(
+        sup.clone(),
+        det_up,
+        grasp_deps,
+        armd::diagnostics::DiagnosticsState::global(),
+        cal_deps,
+        OperatorAuth::disabled(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_jh = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    let ws_url = format!("ws://{addr}/api/v1/ws");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
+
+    for (idx, (path, body)) in [
+        (motor_zero::PATH, json!({ "joints": [1], "method": "software", "dry_run": false })),
+        (motor_zero::RESTORE_PATH, json!({ "backup": "2026-01-01T00-00-00Z" })),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let rej = ws_send_recv(
+            &mut ws,
+            json!({
+                "type": "command",
+                "request_id": (idx as u64) + 1,
+                "generation": 1,
+                "epoch_id": 1,
+                "path": path,
+                "body": body,
+            }),
+        )
+        .await;
+        assert_eq!(rej["type"], "command_reject", "{path}: {rej}");
+        assert_eq!(rej["status"], 409, "{path}: {rej}");
+        assert_eq!(rej["code"], "EXECUTOR_UNSUPPORTED", "{path}: {rej}");
+    }
+
+    assert!(!calib_path_chk.exists(), "refused driver-backed zero must not touch disk");
+    assert_eq!(
+        sup.published_config().await.unwrap().joint_zero_offsets,
+        vec![0.0; 7],
+        "refused driver-backed zero must not mutate live joint_zero_offsets"
+    );
+    assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO);
+    assert_eq!(sup.inner().control_thread_attempts(), 0);
+    drop(_detached);
+    server_jh.abort();
+    tokio::task::spawn_blocking(move || handle.stop_and_join())
+        .await
+        .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3827,4 +3880,1774 @@ async fn reconciling_transient_dir_sync_recovers_and_persistent_failure_latches_
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reconciling_transient_dir_sync_recovers_and_persistent_failure_latches_fault_executor() {
     run_reconciling_bounded_retry_and_fault_test(RtOwner::Executor).await;
+}
+
+// ============================================================================
+// 17. C-F1 Part 1: Calibration apply/restore & software joint-zero/restore
+//     on the executor config worker (WS replay parity, boundary 1 & 2 FS faults,
+//     stop/lease/operator revocation, motion block until reconcile, 0 RT allocs)
+// ============================================================================
+
+fn normalize_calib_reply_for_parity(mut v: Value) -> Value {
+    fn walk(val: &mut Value) {
+        match val {
+            Value::Object(map) => {
+                for (k, v) in map.iter_mut() {
+                    if matches!(
+                        k.as_str(),
+                        "backup" | "log" | "restored" | "at" | "set_at"
+                    ) && v.is_string()
+                    {
+                        *v = json!(format!("<{k}>"));
+                        continue;
+                    }
+                    walk(v);
+                }
+            }
+            Value::Array(arr) => {
+                for x in arr.iter_mut() {
+                    walk(x);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(&mut v);
+    v
+}
+
+fn sample_apply_body(dry_run: bool, with_kinematics: bool) -> Value {
+    let valid_q = armd::kinematics::r_to_quat(
+        &armd::chain::ArmModel::REBOT_DEV_ARM.cam_mount(false, 0.0, -25.0),
+    );
+    let mut body = json!({
+        "dry_run": dry_run,
+        "solved_at": "2026-11-25T00:00:00Z",
+        "camera_mount": {
+            "offset_m": [0.01, -0.02, 0.05],
+            "q_end_cam": valid_q
+        },
+        "intrinsics": {
+            "fx": 831.5, "fy": 830.0, "cx": 321.0, "cy": 179.0,
+            "k1": 0.0, "k2": 0.0, "p1": 0.0, "p2": 0.0, "k3": 0.0,
+            "width": 640, "height": 360
+        },
+        "table_z_m": 0.012
+    });
+    if with_kinematics {
+        body["kinematics"] = json!({
+            "joints": [
+                {"offset_rad": 0.0, "scale": 0.0},
+                {"offset_rad": 0.01, "scale": 0.0},
+                {"offset_rad": -0.01, "scale": 0.0},
+                {"offset_rad": 0.0, "scale": 0.0},
+                {"offset_rad": 0.0, "scale": 0.0},
+                {"offset_rad": 0.0, "scale": 0.0}
+            ]
+        });
+    }
+    body
+}
+
+async fn run_ws_calibration_parity_transcript(owner: RtOwner) -> Vec<Value> {
+    let (vision_addr, _vision_state, vision_jh) = spawn_mock_vision().await;
+    let rig = Rig::new(owner, |_| {}).await;
+    // Seed one pose so software zero stale-marking & kinematics TCP refresh are exercised on both owners.
+    {
+        let pub0 = rig.sup.published_config().await.unwrap();
+        let mut list = pub0.poses.list.clone();
+        list.poses.push(NamedPose {
+            id: "01KPARITYPOSE0000000000001".into(),
+            name: "p1".into(),
+            positions: INSPECT.to_vec(),
+            tcp: pub0.pose_tcp(&INSPECT),
+            saved_at_ms: 1700000000000,
+            profile_id: pub0.config.profile_id.clone(),
+            arm_dof: Some(pub0.config.arm_dof()),
+            gripper_joint: pub0.config.gripper_index(),
+            joint_names: Some(pub0.joint_names()),
+            tool_id: None,
+            tool_config_digest: None,
+            stale: None,
+        });
+        let adm = capture_config_admission(&rig.sup, 99, rig.lease_gen, Some(rig.epoch));
+        let prop = build_config_proposal(
+            &rig.sup,
+            ConfigDomain::Poses,
+            pub0.poses.revision,
+            adm,
+            rig.lease_gen,
+            pub0.workspace_revision,
+        );
+        let list_pub = list.clone();
+        let write = ConfigWriteOp::from(Some(PendingWrite::new(
+            rig.poses_path.clone(),
+            serde_json::to_string_pretty(&list).unwrap(),
+        )));
+        run_config_commit(
+            &rig.sup,
+            ConfigCommitPlan {
+                proposal: prop,
+                auth: ConfigAuthContext {
+                    admission: adm,
+                    lease_holder: Some((HolderLabel::new(&rig.lease_conn), rig.lease_gen)),
+                },
+                precheck: ReservePrecheck::PosesSave,
+                candidate: ConfigCandidate::Poses { next_list: list },
+                write,
+                expected_workspace_revision: None,
+                expected_poses_revision: None,
+            },
+            || Ok(()),
+            move |cfg, act| {
+                cfg.poses.list = list_pub;
+                cfg.poses.revision = act.revision;
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let (base, server_jh) = spawn_http_router(&rig, Some(vision_addr), OperatorAuth::disabled()).await;
+    let ws_url = format!("{}/api/v1/ws", base.replace("http://", "ws://"));
+    let _detached = if owner == RtOwner::Executor {
+        Some(rig.sup.inner().write().await)
+    } else {
+        None
+    };
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
+    // Force-preempt the initial rig lease so this WS owns the active lease cleanly.
+    ws.send(Message::Text(
+        json!({ "type": "acquire_lease", "client_id": "parity_ws", "force": true, "seq": 1 })
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    let gen = loop {
+        let Message::Text(t) = tokio::time::timeout(Duration::from_secs(3), ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+        else {
+            continue;
+        };
+        let v: Value = serde_json::from_str(&t).unwrap();
+        if v.get("type").and_then(Value::as_str) == Some("lease_granted") {
+            break v["generation"].as_u64().unwrap();
+        }
+    };
+    let epoch = rig.epoch;
+
+    let mut replies = Vec::new();
+    let mut next_req = 0u64;
+    macro_rules! send_cmd {
+        ($ws:expr, $path:expr, $body:expr $(,)?) => {{
+            next_req += 1;
+            let id = next_req;
+            let frame = json!({
+                "type": "command",
+                "request_id": id,
+                "generation": gen,
+                "epoch_id": epoch,
+                "path": $path,
+                "body": $body,
+            });
+            ws_send_recv($ws, frame)
+        }};
+    }
+
+    // 1. Immediate validation rejects (no epoch_id/is_torqued/safety_state).
+    replies.push(send_cmd!(&mut ws, "/api/v1/calibration/apply", json!({ "bogus": 1 })).await);
+    replies.push(send_cmd!(&mut ws, "/api/v1/calibration/restore", json!(123)).await);
+    replies.push(
+        send_cmd!(
+            &mut ws,
+            motor_zero::PATH,
+            json!({ "joints": [1], "method": "bogus" }),
+        )
+        .await,
+    );
+    replies.push(
+        send_cmd!(
+            &mut ws,
+            motor_zero::RESTORE_PATH,
+            json!({ "backup": "bad.json" }),
+        )
+        .await,
+    );
+
+    // 2. Deferred missing-backup reject (with epoch_id/is_torqued/safety_state).
+    replies.push(
+        send_cmd!(
+            &mut ws,
+            "/api/v1/calibration/restore",
+            json!({ "backup": "missing_backup" }),
+        )
+        .await,
+    );
+
+    // 3. Apply dry_run (deferred ack).
+    replies.push(
+        send_cmd!(
+            &mut ws,
+            "/api/v1/calibration/apply",
+            sample_apply_body(true, true),
+        )
+        .await,
+    );
+
+    // 4. Real apply with kinematics (deferred ack).
+    let applied = send_cmd!(
+        &mut ws,
+        "/api/v1/calibration/apply",
+        sample_apply_body(false, true),
+    )
+    .await;
+    assert_eq!(applied["type"], "command_ack", "apply failed on {owner:?}: {applied}");
+    let apply_backup = Path::new(applied["backup"].as_str().unwrap())
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    replies.push(applied);
+
+    // 5. Real restore back to absent calibration.json (deferred ack).
+    let restored = send_cmd!(
+        &mut ws,
+        "/api/v1/calibration/restore",
+        json!({ "backup": apply_backup }),
+    )
+    .await;
+    assert_eq!(restored["type"], "command_ack", "restore failed on {owner:?}: {restored}");
+    assert!(!rig.calib_path.exists(), "restoring pre-calib backup must remove calibration.json");
+    replies.push(restored);
+
+    // 6. Software zero dry_run (immediate ack).
+    let sw_dry = send_cmd!(
+        &mut ws,
+        motor_zero::PATH,
+        json!({ "joints": [2], "method": "software", "dry_run": true }),
+    )
+    .await;
+    assert_eq!(sw_dry["type"], "command_ack", "sw dry_run failed on {owner:?}: {sw_dry}");
+    assert!(sw_dry.get("epoch_id").is_none(), "motor_zero dry_run must be immediate");
+    replies.push(sw_dry);
+
+    // 7. Real software zero of J2 (reads 0.3 rad -> moves > 0.5 deg -> marks pose stale!).
+    let sw_ok = send_cmd!(
+        &mut ws,
+        motor_zero::PATH,
+        json!({ "joints": [2], "method": "software", "dry_run": false }),
+    )
+    .await;
+    assert_eq!(sw_ok["type"], "command_ack", "sw zero failed on {owner:?}: {sw_ok}");
+    let sw_backup = sw_ok["restore"]["backup"].as_str().unwrap().to_string();
+    assert_eq!(sw_ok["invalidated"]["poses_stale"], json!(["p1"]));
+    replies.push(sw_ok);
+
+    // 8. Joint-zero restore (deferred ack, restores offsets back to 0).
+    let jz_rest = send_cmd!(
+        &mut ws,
+        motor_zero::RESTORE_PATH,
+        json!({ "backup": sw_backup }),
+    )
+    .await;
+    assert_eq!(jz_rest["type"], "command_ack", "jz restore failed on {owner:?}: {jz_rest}");
+    assert_eq!(jz_rest["offsets_after"], json!([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]));
+    replies.push(jz_rest);
+
+    rig.assert_executor_zero_alloc("WS calibration/zero replay parity");
+    drop(_detached);
+    server_jh.abort();
+    vision_jh.abort();
+    rig.shutdown().await;
+    replies
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cf1_ws_replay_parity_legacy_vs_executor() {
+    let legacy = run_ws_calibration_parity_transcript(RtOwner::Legacy).await;
+    let exec = run_ws_calibration_parity_transcript(RtOwner::Executor).await;
+    assert_eq!(legacy.len(), exec.len());
+    for (i, (l, e)) in legacy.into_iter().zip(exec).enumerate() {
+        let ln = normalize_calib_reply_for_parity(l);
+        let en = normalize_calib_reply_for_parity(e);
+        assert_eq!(
+            serde_json::to_string(&ln).unwrap(),
+            serde_json::to_string(&en).unwrap(),
+            "WS reply parity diff at step {i}:\n  legacy: {ln}\n  exec:   {en}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cf1_fs_fault_injection_both_boundaries_and_partial_batch_restart_recovery() {
+    use std::sync::atomic::AtomicUsize;
+
+    // 1. Pre-rename failure (boundary 1) on calibration/apply -> Unattempted, vision reverted,
+    //    staged temp files discarded, live state untouched, motion NOT inhibited.
+    let (vision_addr, vision_state, vision_jh) = spawn_mock_vision().await;
+    let rig = Rig::new(RtOwner::Executor, |_| {}).await;
+    let det_up = armd::api::proxy::DetectorUpstream::parse(&format!("http://{vision_addr}")).unwrap();
+    let cal_deps = CalibrationDeps::new(rig.calib_path.clone(), Some(rig.setup_path.clone()), det_up);
+    let _detached = rig.sup.inner().write().await;
+
+    let pub_before = rig.sup.published_config().await.unwrap();
+    rig.sup.set_config_commit_test_hooks(ConfigCommitTestHooks {
+        fail_rename_once: Some(Arc::new(AtomicBool::new(true))),
+        ..Default::default()
+    });
+    let auth = armd::calibration::ExecutorCalibAuth {
+        admission: capture_config_admission(&rig.sup, 10, rig.lease_gen, Some(rig.epoch)),
+        lease_holder: Some((HolderLabel::new(&rig.lease_conn), rig.lease_gen)),
+        operator_grant: armd::auth::OperatorGrant::unenforced(),
+        auth_check: Arc::new(|| Ok(())),
+        txn_id: None,
+    };
+    let req = armd::calibration::parse_apply(&sample_apply_body(false, false)).unwrap();
+    let err = armd::calibration::apply_executor(&rig.sup, &cal_deps, req, auth)
+        .await
+        .expect_err("boundary-1 rename failure must fail");
+    rig.sup.set_config_commit_test_hooks(ConfigCommitTestHooks::default());
+
+    assert_eq!(err.code, "PERSIST_FAILED");
+    assert_eq!(err.extra.get("reverted"), Some(&json!(true)));
+    assert!(!rig.calib_path.exists(), "calibration.json must not exist after pre-rename failure");
+    assert!(
+        !dir_entries(rig._dir.path()).iter().any(|n| n.contains(".tmp-") || n.contains(".pending")),
+        "no staged temp or pending marker files may remain: {:?}",
+        dir_entries(rig._dir.path())
+    );
+    assert!(!rig.is_config_inhibited().await, "pre-rename failure must release Cleared");
+    let pub_after_b1 = rig.sup.published_config().await.unwrap();
+    assert_eq!(pub_after_b1.calibration_revision, pub_before.calibration_revision);
+    assert!(!pub_after_b1.camera_calibrated());
+    assert!(
+        (vision_state.lock().unwrap().1["fx"].as_f64().unwrap() - 824.0).abs() < 1e-6,
+        "remote vision must be reverted on pre-rename failure"
+    );
+
+    // 2. Post-rename dir-fsync failure (boundary 2) on calibration/apply -> Uncertain + Reconciling,
+    //    motion blocked until bounded reconciliation succeeds, then activates & lifts inhibit!
+    let sync_calls = Arc::new(AtomicUsize::new(0));
+    let sync_calls_hook = Arc::clone(&sync_calls);
+    rig.sup.set_config_commit_test_hooks(ConfigCommitTestHooks {
+        dir_sync_override: Some(Arc::new(move |_| {
+            let n = sync_calls_hook.fetch_add(1, Ordering::AcqRel);
+            if n < 2 {
+                Err(std::io::Error::other("transient dir fsync EIO"))
+            } else {
+                Ok(())
+            }
+        })),
+        reconcile_retry_interval: Some(Duration::from_millis(20)),
+        reconcile_max_attempts: Some(10),
+        ..Default::default()
+    });
+    let auth2 = armd::calibration::ExecutorCalibAuth {
+        admission: capture_config_admission(&rig.sup, 10, rig.lease_gen, Some(rig.epoch)),
+        lease_holder: Some((HolderLabel::new(&rig.lease_conn), rig.lease_gen)),
+        operator_grant: armd::auth::OperatorGrant::unenforced(),
+        auth_check: Arc::new(|| Ok(())),
+        txn_id: None,
+    };
+    let req2 = armd::calibration::parse_apply(&sample_apply_body(false, false)).unwrap();
+    let err2 = armd::calibration::apply_executor(&rig.sup, &cal_deps, req2, auth2)
+        .await
+        .expect_err("boundary-2 dir-sync failure must withhold activation");
+    assert_eq!(err2.code, "PERSIST_FAILED");
+    assert_eq!(err2.extra.get("reconciling"), Some(&json!(true)));
+    assert_eq!(err2.extra.get("outcome"), Some(&json!("uncertain")));
+    assert!(rig.calib_path.exists(), "calibration.json was renamed on disk");
+    assert!(rig.is_config_inhibited().await, "motion must be blocked while Reconciling");
+    assert_eq!(
+        rig.hold_state(ConfigDomain::Calibration).await,
+        Some(HoldState::Reconciling)
+    );
+    // Live state stays at old revision until reconciliation completes.
+    assert!(!rig.sup.published_config().await.unwrap().camera_calibrated());
+    // Concurrent config write / motion admission sees CONFIG_BUSY while Reconciling.
+    let pub_rec = rig.sup.published_config().await.unwrap();
+    let (busy_plan, ..) = keepout_plan(&rig, &pub_rec, vec![make_box("blocked", 0.3)], pub_rec.keepout.revision, 10, rig.lease_gen, false);
+    let busy_err = run_config_commit(&rig.sup, busy_plan, || Ok(()), |_, _| {})
+        .await
+        .unwrap_err();
+    assert!(matches!(busy_err, ArmError::Rejected { status: 409, code, .. } if code == "CONFIG_BUSY"));
+
+    // Wait for bounded reconciliation AND marker-cleanup transaction exclusion to finish.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while rig.is_config_inhibited().await || rig.sup.published_config().await.unwrap().calibration_busy {
+        assert!(Instant::now() < deadline, "timed out waiting for calibration reconciliation");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    rig.sup.set_config_commit_test_hooks(ConfigCommitTestHooks::default());
+    let pub_recovered = rig.sup.published_config().await.unwrap();
+    assert!(pub_recovered.camera_calibrated(), "calibration must activate after reconciliation");
+    assert_eq!(pub_recovered.calibration_revision, pub_before.calibration_revision + 1);
+    assert!(
+        !rig._dir.path().join(armd::rt_core::requests::config::CALIBRATION_PENDING_MARKER_NAME).exists(),
+        "pending commit marker must be removed after reconciliation succeeds"
+    );
+
+    // 3. Partial multi-file batch failure (file index 1 fails AFTER calibration.json renamed) ->
+    //    latches non-recoverable fault, does NOT retry dir-fsync, keeps Reconciling + pending
+    //    marker, and restart quarantines uncertain files without installing them!
+    let partial_sync_calls = Arc::new(AtomicUsize::new(0));
+    let partial_sync_hook = Arc::clone(&partial_sync_calls);
+    rig.sup.set_config_commit_test_hooks(ConfigCommitTestHooks {
+        fail_rename_at_index: Some(Arc::new(AtomicUsize::new(1))),
+        dir_sync_override: Some(Arc::new(move |_| {
+            partial_sync_hook.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        })),
+        reconcile_retry_interval: Some(Duration::from_millis(15)),
+        reconcile_max_attempts: Some(3),
+        ..Default::default()
+    });
+    let auth3 = armd::calibration::ExecutorCalibAuth {
+        admission: capture_config_admission(&rig.sup, 10, rig.lease_gen, Some(rig.epoch)),
+        lease_holder: Some((HolderLabel::new(&rig.lease_conn), rig.lease_gen)),
+        operator_grant: armd::auth::OperatorGrant::unenforced(),
+        auth_check: Arc::new(|| Ok(())),
+        txn_id: None,
+    };
+    let mut body3 = sample_apply_body(false, false);
+    body3["table_z_m"] = json!(0.045);
+    let req3 = armd::calibration::parse_apply(&body3).unwrap();
+    let err3 = armd::calibration::apply_executor(&rig.sup, &cal_deps, req3, auth3)
+        .await
+        .expect_err("partial batch rename failure at index 1 must fail");
+    rig.sup.set_config_commit_test_hooks(ConfigCommitTestHooks::default());
+    assert_eq!(err3.code, "PERSIST_FAILED");
+    assert_eq!(err3.extra.get("reconciling"), Some(&json!(true)));
+    assert!(rig.is_config_inhibited().await);
+    // Wait past the configured retry window to prove no background dir-fsync retry was scheduled.
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    assert_eq!(
+        partial_sync_calls.load(Ordering::Acquire),
+        0,
+        "partial batch rename failure must NOT spawn dir-fsync reconciliation retries"
+    );
+    let snap_partial = rig.sup.hub().latest().unwrap();
+    assert!(
+        matches!(snap_partial.obs.safety_state, armd::safety::SafetyState::Fault(_)),
+        "partial batch failure must latch non-recoverable Fault, got: {:?}",
+        snap_partial.obs.safety_state
+    );
+    let calib_disk: Value =
+        serde_json::from_str(&std::fs::read_to_string(&rig.calib_path).unwrap()).unwrap();
+    assert!((calib_disk["table_z_m"].as_f64().unwrap() - 0.045).abs() < 1e-6);
+    let setup_disk: Value =
+        serde_json::from_str(&std::fs::read_to_string(&rig.setup_path).unwrap()).unwrap();
+    assert!(
+        (setup_disk["table_z_m"].as_f64().unwrap() - 0.012).abs() < 1e-6,
+        "grasp_setup.json must still hold old table_z_m after partial batch failure"
+    );
+    assert!(
+        rig._dir
+            .path()
+            .join(armd::rt_core::requests::config::CALIBRATION_PENDING_MARKER_NAME)
+            .exists(),
+        "pending marker must stay on disk after partial batch failure"
+    );
+
+    // Simulate process restart against the same directory: startup MUST quarantine uncertain
+    // files (not install calibration.json or rewrite grasp_setup.json) and enter Reconciling.
+    let restart_sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    armd::calibration::load_into(&restart_sup, &rig.calib_path, Some(&rig.setup_path))
+        .await
+        .unwrap();
+    {
+        let inner = restart_sup.inner().read().await;
+        assert!(
+            inner.core.motion_inhibited_by_config(),
+            "restart with leftover pending commit marker must inhibit motion"
+        );
+        assert_eq!(
+            inner.core.config_held(ConfigDomain::Calibration).map(|h| h.state),
+            Some(HoldState::Reconciling)
+        );
+        assert!(
+            inner.calibration.is_none(),
+            "quarantined restart must NOT install uncertain calibration.json into live state"
+        );
+        assert_eq!(
+            inner.joint_zero_offsets,
+            vec![0.0; 7],
+            "quarantined restart must NOT install uncertain joint_zero offsets"
+        );
+        assert!(inner.calibration_load_error.is_some());
+    }
+
+    rig.assert_executor_zero_alloc("C-F1 boundary 1/2 FS fault injection & partial batch");
+    drop(_detached);
+    vision_jh.abort();
+    rig.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cf1_stop_and_lease_loss_between_stage_and_activate_and_motion_blocked_until_reconcile() {
+    // Part A: STOP between stage and rename (boundary 1) on software joint zero -> Unattempted,
+    //         hold Cleared, disk & live offsets untouched.
+    let rig = Rig::new(RtOwner::Executor, |_| {}).await;
+    let det_up = armd::api::proxy::DetectorUpstream::parse("http://127.0.0.1:9").unwrap();
+    let cal_deps = CalibrationDeps::new(rig.calib_path.clone(), Some(rig.setup_path.clone()), det_up);
+    let _detached = rig.sup.inner().write().await;
+
+    // Part A0: Queued calibration command whose ingress stop_gen predates an arrived Stop MUST
+    //          be rejected with STOPPED and never overtaken (Blocker 1 regression test).
+    let stale_stop_adm = capture_config_admission(&rig.sup, 9, rig.lease_gen, Some(rig.epoch));
+    let _ = rig.sup.executor_handle().unwrap().stop_requests().request();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let auth_stale_stop = armd::calibration::ExecutorCalibAuth {
+        admission: stale_stop_adm,
+        lease_holder: Some((HolderLabel::new(&rig.lease_conn), rig.lease_gen)),
+        operator_grant: armd::auth::OperatorGrant::unenforced(),
+        auth_check: Arc::new(|| Ok(())),
+        txn_id: None,
+    };
+    let sw_req = MotorZeroRequest {
+        joints: vec![1],
+        dry_run: false,
+        force: false,
+        method: Some("software".into()),
+    };
+    let err_stale_stop =
+        motor_zero::run_software_executor(&rig.sup, &cal_deps, sw_req.clone(), auth_stale_stop)
+            .await
+            .expect_err("queued calibration overtaken by Stop must be rejected");
+    assert_eq!(err_stale_stop.code, "STOPPED");
+    assert!(!rig.calib_path.exists());
+    assert_eq!(rig.sup.published_config().await.unwrap().joint_zero_offsets, vec![0.0; 7]);
+
+    let sup_stop = Arc::clone(&rig.sup);
+    rig.sup.set_config_commit_test_hooks(ConfigCommitTestHooks {
+        after_reserve_before_rename: Some(Arc::new(move || {
+            let _ = sup_stop.executor_handle().unwrap().stop_requests().request();
+        })),
+        ..Default::default()
+    });
+    let auth_a = armd::calibration::ExecutorCalibAuth {
+        admission: capture_config_admission(&rig.sup, 10, rig.lease_gen, Some(rig.epoch)),
+        lease_holder: Some((HolderLabel::new(&rig.lease_conn), rig.lease_gen)),
+        operator_grant: armd::auth::OperatorGrant::unenforced(),
+        auth_check: Arc::new(|| Ok(())),
+        txn_id: None,
+    };
+    let err_a = motor_zero::run_software_executor(&rig.sup, &cal_deps, sw_req.clone(), auth_a)
+        .await
+        .expect_err("pre-rename STOP must abort software zero");
+    rig.sup.set_config_commit_test_hooks(ConfigCommitTestHooks::default());
+    assert_eq!(err_a.code, "STOPPED");
+    assert_eq!(err_a.extra.get("reconciling"), None);
+    assert!(!rig.calib_path.exists(), "calibration.json must not be renamed after pre-rename STOP");
+    assert!(!rig.is_config_inhibited().await, "pre-rename STOP must clear hold");
+    assert_eq!(rig.sup.published_config().await.unwrap().joint_zero_offsets, vec![0.0; 7]);
+
+    // Part B: Lease / operator revocation AFTER rename and BEFORE activate (boundary 2) ->
+    //         Uncertain + Reconciling, disk updated, live offsets stay at 0, WS motion blocked!
+    let (base, server_jh) = spawn_http_router(&rig, None, OperatorAuth::disabled()).await;
+    let ws_url = format!("{}/api/v1/ws", base.replace("http://", "ws://"));
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
+    ws.send(Message::Text(
+        json!({ "type": "acquire_lease", "client_id": "motion_probe", "force": true, "seq": 1 })
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    let ws_gen = loop {
+        let Message::Text(t) = tokio::time::timeout(Duration::from_secs(3), ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+        else {
+            continue;
+        };
+        let v: Value = serde_json::from_str(&t).unwrap();
+        if v.get("type").and_then(Value::as_str) == Some("lease_granted") {
+            break v["generation"].as_u64().unwrap();
+        }
+    };
+
+    // Wait a tick for hub to observe the new WS lease owner handle.
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let ws_owner_label = rig
+        .sup
+        .hub()
+        .latest()
+        .unwrap()
+        .owner
+        .lease_owner
+        .expect("ws lease owner");
+
+    // Inject REAL owner-side lease loss after rename and before activate via a second WS client
+    // preempting the lease on the RT executor thread!
+    let (mut ws_thief, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
+    let trigger_steal = Arc::new(tokio::sync::Notify::new());
+    let trigger_steal_w = Arc::clone(&trigger_steal);
+    let (stolen_tx, stolen_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let thief_jh = tokio::spawn(async move {
+        trigger_steal_w.notified().await;
+        ws_thief
+            .send(Message::Text(
+                json!({ "type": "acquire_lease", "client_id": "thief_ws", "force": true, "seq": 1 })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        loop {
+            let Message::Text(t) = tokio::time::timeout(Duration::from_secs(3), ws_thief.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+            else {
+                continue;
+            };
+            let v: Value = serde_json::from_str(&t).unwrap();
+            if v.get("type").and_then(Value::as_str) == Some("lease_granted") {
+                let thief_gen = v["generation"].as_u64().unwrap();
+                let _ = stolen_tx.send(());
+                break (ws_thief, thief_gen);
+            }
+        }
+    });
+    let stolen_rx = std::sync::Mutex::new(stolen_rx);
+    rig.sup.set_config_commit_test_hooks(ConfigCommitTestHooks {
+        after_rename_before_activate: Some(Arc::new(move || {
+            trigger_steal.notify_one();
+            let _ = stolen_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(3));
+        })),
+        ..Default::default()
+    });
+    let auth_b = armd::calibration::ExecutorCalibAuth {
+        admission: capture_config_admission(&rig.sup, 11, ws_gen, Some(rig.epoch)),
+        lease_holder: Some((ws_owner_label, ws_gen)),
+        operator_grant: armd::auth::OperatorGrant::unenforced(),
+        auth_check: Arc::new(|| Ok(())),
+        txn_id: None,
+    };
+    let err_b = motor_zero::run_software_executor(&rig.sup, &cal_deps, sw_req, auth_b)
+        .await
+        .expect_err("post-rename owner lease loss must enter Reconciling");
+    let (mut ws_active, active_gen) = thief_jh.await.unwrap();
+    rig.sup.set_config_commit_test_hooks(ConfigCommitTestHooks::default());
+    assert_eq!(err_b.code, "LEASE_LOST");
+    assert_eq!(err_b.extra.get("reconciling"), Some(&json!(true)));
+    assert_eq!(err_b.extra.get("outcome"), Some(&json!("uncertain")));
+    assert!(rig.calib_path.exists(), "calibration.json was renamed on disk");
+    assert!(
+        rig._dir
+            .path()
+            .join(armd::rt_core::requests::config::CALIBRATION_PENDING_MARKER_NAME)
+            .exists(),
+        "single-file software zero post-rename failure must leave pending commit marker on disk"
+    );
+    assert_eq!(
+        rig.sup.published_config().await.unwrap().joint_zero_offsets,
+        vec![0.0; 7],
+        "old zero offsets must remain active until reconciled"
+    );
+    assert!(rig.is_config_inhibited().await, "motion must be blocked after rename until reconcile");
+    assert_eq!(
+        rig.hold_state(ConfigDomain::Calibration).await,
+        Some(HoldState::Reconciling)
+    );
+
+    // Real WS torque-on + servo/motion/config attempt on the active lease holder is refused while Reconciling!
+    let torque_reply = ws_send_recv(
+        &mut ws_active,
+        json!({
+            "type": "command",
+            "request_id": 1,
+            "generation": active_gen,
+            "epoch_id": rig.epoch,
+            "path": "/api/v1/torque",
+            "body": { "enable": true }
+        }),
+    )
+    .await;
+    assert!(
+        torque_reply["type"] == "command_reject" || torque_reply["type"] == "command_ack",
+        "unexpected torque reply while Reconciling: {torque_reply}"
+    );
+    ws_active
+        .send(Message::Text(
+            json!({
+                "type": "servo_target",
+                "generation": active_gen,
+                "epoch_id": rig.epoch,
+                "sequence_id": 1,
+                "positions": INSPECT
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let servo_rej = loop {
+        let Message::Text(t) = tokio::time::timeout(Duration::from_secs(3), ws_active.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+        else {
+            continue;
+        };
+        let v: Value = serde_json::from_str(&t).unwrap();
+        if v.get("type").and_then(Value::as_str) == Some("servo_reject") {
+            break v;
+        }
+    };
+    assert_eq!(
+        servo_rej["code"], "CONFIG_BUSY",
+        "servo motion must be blocked while Calibration is Reconciling: {servo_rej}"
+    );
+
+    rig.assert_executor_zero_alloc("C-F1 stop/lease loss & motion block");
+    drop(_detached);
+    server_jh.abort();
+    rig.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cf1_vision_ambiguous_outcomes_and_operator_grant_enforcement() {
+    use std::sync::atomic::AtomicUsize;
+
+    // Custom mock Vision server supporting deterministic 500-after-mutating and malformed-2xx
+    // responses while counting exact PUT attempts.
+    let put_mode = Arc::new(AtomicUsize::new(0)); // 0 = 500 after mutating, 1 = malformed 2xx (no revision)
+    let put_count = Arc::new(AtomicUsize::new(0));
+    let vision_rev = Arc::new(AtomicUsize::new(1));
+    let put_mode_h = Arc::clone(&put_mode);
+    let put_count_h = Arc::clone(&put_count);
+    let vision_rev_g = Arc::clone(&vision_rev);
+    let vision_rev_p = Arc::clone(&vision_rev);
+    let app = axum::Router::new().route(
+        "/api/calibration/intrinsics",
+        axum::routing::get(move || {
+            let rev = vision_rev_g.load(Ordering::Acquire);
+            async move {
+                axum::Json(json!({
+                    "fx": 824.0, "fy": 824.0, "cx": 320.0, "cy": 180.0,
+                    "k1": 0.0, "k2": 0.0, "p1": 0.0, "p2": 0.0, "k3": 0.0,
+                    "width": 640, "height": 360, "marker_size": 0.05,
+                    "revision": rev, "api_version": 2
+                }))
+            }
+        })
+        .put(move || {
+            let mode = put_mode_h.load(Ordering::Acquire);
+            let n = put_count_h.fetch_add(1, Ordering::AcqRel);
+            let _ = n;
+            vision_rev_p.fetch_add(1, Ordering::AcqRel);
+            async move {
+                use axum::response::IntoResponse;
+                if mode == 0 {
+                    (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        axum::Json(json!({"error": "VISION_INTERNAL"})),
+                    )
+                        .into_response()
+                } else {
+                    // Malformed 2xx: omits `revision`.
+                    (axum::http::StatusCode::OK, axum::Json(json!({"ok": true}))).into_response()
+                }
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let v_addr = listener.local_addr().unwrap();
+    let vision_jh = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    // 1. Vision 500 after mutation -> MUST NOT issue speculative rollback PUT (put_count == 1),
+    //    MUST keep pending marker, latch Fault + Reconciling, return CALIBRATION_INCONSISTENT,
+    //    and leave local calibration.json and live revision untouched.
+    {
+        let rig = Rig::new(RtOwner::Executor, |_| {}).await;
+        let det_up = armd::api::proxy::DetectorUpstream::parse(&format!("http://{v_addr}")).unwrap();
+        let cal_deps = CalibrationDeps::new(rig.calib_path.clone(), Some(rig.setup_path.clone()), det_up);
+        let _detached = rig.sup.inner().write().await;
+        let pub_before = rig.sup.published_config().await.unwrap();
+
+        put_mode.store(0, Ordering::Release);
+        put_count.store(0, Ordering::Release);
+        let auth = armd::calibration::ExecutorCalibAuth {
+            admission: capture_config_admission(&rig.sup, 10, rig.lease_gen, Some(rig.epoch)),
+            lease_holder: Some((HolderLabel::new(&rig.lease_conn), rig.lease_gen)),
+            operator_grant: armd::auth::OperatorGrant::unenforced(),
+            auth_check: Arc::new(|| Ok(())),
+            txn_id: None,
+        };
+        let req = armd::calibration::parse_apply(&sample_apply_body(false, false)).unwrap();
+        let err = armd::calibration::apply_executor(&rig.sup, &cal_deps, req, auth)
+            .await
+            .expect_err("ambiguous 500 Vision PUT must fail closed");
+        assert_eq!(err.code, "CALIBRATION_INCONSISTENT");
+        assert_eq!(err.extra.get("reconciling"), Some(&json!(true)));
+        assert_eq!(err.extra.get("outcome"), Some(&json!("uncertain")));
+        assert_eq!(
+            put_count.load(Ordering::Acquire),
+            1,
+            "executor must NOT issue a speculative rollback PUT on ambiguous Vision 500"
+        );
+        assert!(
+            rig._dir
+                .path()
+                .join(armd::rt_core::requests::config::CALIBRATION_PENDING_MARKER_NAME)
+                .exists(),
+            "pending commit marker must stay on disk after ambiguous Vision PUT"
+        );
+        assert!(!rig.calib_path.exists());
+        assert!(rig.is_config_inhibited().await);
+        assert_eq!(rig.hold_state(ConfigDomain::Calibration).await, Some(HoldState::Reconciling));
+        assert_eq!(
+            rig.sup.published_config().await.unwrap().calibration_revision,
+            pub_before.calibration_revision
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(matches!(
+            rig.sup.hub().latest().unwrap().obs.safety_state,
+            armd::safety::SafetyState::Fault(_)
+        ));
+        rig.assert_executor_zero_alloc("ambiguous Vision 500 fail-closed");
+        drop(_detached);
+        rig.shutdown().await;
+    }
+
+    // 2. Malformed 2xx Vision PUT (missing revision) -> same fail-closed behavior (put_count == 1).
+    {
+        let rig = Rig::new(RtOwner::Executor, |_| {}).await;
+        let det_up = armd::api::proxy::DetectorUpstream::parse(&format!("http://{v_addr}")).unwrap();
+        let cal_deps = CalibrationDeps::new(rig.calib_path.clone(), Some(rig.setup_path.clone()), det_up);
+        let _detached = rig.sup.inner().write().await;
+
+        put_mode.store(1, Ordering::Release);
+        put_count.store(0, Ordering::Release);
+        let auth = armd::calibration::ExecutorCalibAuth {
+            admission: capture_config_admission(&rig.sup, 10, rig.lease_gen, Some(rig.epoch)),
+            lease_holder: Some((HolderLabel::new(&rig.lease_conn), rig.lease_gen)),
+            operator_grant: armd::auth::OperatorGrant::unenforced(),
+            auth_check: Arc::new(|| Ok(())),
+            txn_id: None,
+        };
+        let req = armd::calibration::parse_apply(&sample_apply_body(false, false)).unwrap();
+        let err = armd::calibration::apply_executor(&rig.sup, &cal_deps, req, auth)
+            .await
+            .expect_err("malformed 2xx Vision PUT must fail closed");
+        assert_eq!(err.code, "CALIBRATION_INCONSISTENT");
+        assert_eq!(put_count.load(Ordering::Acquire), 1);
+        assert!(rig.is_config_inhibited().await);
+        assert!(
+            rig._dir
+                .path()
+                .join(armd::rt_core::requests::config::CALIBRATION_PENDING_MARKER_NAME)
+                .exists()
+        );
+        rig.assert_executor_zero_alloc("malformed 2xx Vision fail-closed");
+        drop(_detached);
+        rig.shutdown().await;
+    }
+
+    // 3. Denied/revoked OperatorGrant is rejected live on RT with 403 OPERATOR_REQUIRED when
+    //    operator_auth_enforced is enabled, without touching disk or Vision.
+    {
+        let rig = Rig::new(RtOwner::Executor, |_| {}).await;
+        let det_up = armd::api::proxy::DetectorUpstream::parse(&format!("http://{v_addr}")).unwrap();
+        let cal_deps = CalibrationDeps::new(rig.calib_path.clone(), Some(rig.setup_path.clone()), det_up);
+        rig.sup.set_operator_auth_enforced(true).await;
+        let _detached = rig.sup.inner().write().await;
+
+        put_count.store(0, Ordering::Release);
+        let auth_denied = armd::calibration::ExecutorCalibAuth {
+            admission: capture_config_admission(&rig.sup, 10, rig.lease_gen, Some(rig.epoch)),
+            lease_holder: Some((HolderLabel::new(&rig.lease_conn), rig.lease_gen)),
+            operator_grant: armd::auth::OperatorGrant::DENIED,
+            auth_check: Arc::new(|| Ok(())),
+            txn_id: None,
+        };
+        let sw_req = MotorZeroRequest {
+            joints: vec![1],
+            dry_run: false,
+            force: false,
+            method: Some("software".into()),
+        };
+        let err = motor_zero::run_software_executor(&rig.sup, &cal_deps, sw_req, auth_denied)
+            .await
+            .expect_err("DENIED OperatorGrant must be rejected on RT");
+        assert_eq!(err.status, 403);
+        assert_eq!(err.code, "OPERATOR_REQUIRED");
+        assert!(!rig.calib_path.exists());
+        assert!(!rig.is_config_inhibited().await);
+        rig.assert_executor_zero_alloc("revoked OperatorGrant rejected on RT");
+        drop(_detached);
+        rig.shutdown().await;
+    }
+
+    vision_jh.abort();
+}
+
+#[tokio::test]
+async fn cf1_r4_verify_authority_lease_precedence_and_watchdog_park_inhibit() {
+    use armd::auth::OperatorAuth;
+    use armd::rt_core::config_iface::ConfigDomain;
+    use armd::rt_core::requests::config::{
+        build_config_proposal, capture_config_admission, next_calibration_txn_id,
+        CalibrationTxnKind, ConfigAuthContext, ConfigReply, ConfigRequest, ReleaseConfig,
+        ReserveConfig, ReservePrecheck, VerifyDomainChecks,
+    };
+
+    // 1. VerifyAuthority fails closed on Calibration when operator_grant is None and when
+    //    proposal.domain mismatches the held domain.
+    {
+        let rig = Rig::new(RtOwner::Executor, |_| {}).await;
+        let _detached = rig.sup.inner().write().await;
+        let pub_cfg = rig.sup.published_config().await.unwrap();
+        let adm = capture_config_admission(&rig.sup, 10, rig.lease_gen, Some(rig.epoch));
+        let auth = ConfigAuthContext {
+            admission: adm,
+            lease_holder: Some((HolderLabel::new(&rig.lease_conn), rig.lease_gen)),
+        };
+        let prop = build_config_proposal(
+            &rig.sup,
+            ConfigDomain::Calibration,
+            pub_cfg.calibration_revision,
+            adm,
+            rig.lease_gen,
+            pub_cfg.workspace_revision,
+        );
+        let reservation = match rig
+            .sup
+            .dispatch_config_request(ConfigRequest::Reserve(ReserveConfig {
+                proposal: prop,
+                auth,
+                precheck: ReservePrecheck::Calibration {
+                    allow_during_calibration_busy: false,
+                    expected_txn_id: None,
+                    operator_grant: armd::auth::OperatorGrant::unenforced(),
+                    require_kinematics_disarmed: false,
+                    expected_grasp_setup_revision: Some(pub_cfg.grasp_setup_revision),
+                },
+                expected_workspace_revision: Some(pub_cfg.workspace_revision),
+                expected_poses_revision: None,
+            }))
+            .await
+            .unwrap()
+        {
+            ConfigReply::Reserved(Ok(r)) => r,
+            other => panic!("expected Reserved(Ok), got {}", std::any::type_name_of_val(&other)),
+        };
+
+        // Omitting operator_grant on Calibration must fail closed with OPERATOR_REQUIRED.
+        let reply = rig
+            .sup
+            .dispatch_config_request(ConfigRequest::VerifyAuthority {
+                domain: ConfigDomain::Calibration,
+                grant: reservation.grant(),
+                proposal: prop,
+                auth,
+                expected_workspace_revision: Some(pub_cfg.workspace_revision),
+                expected_poses_revision: None,
+                domain_checks: VerifyDomainChecks {
+                    operator_grant: None,
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        match reply {
+            ConfigReply::AuthorityVerified(Err(
+                armd::rt_core::requests::config::ConfigError::CalibPrecondition {
+                    status: 403,
+                    code: "OPERATOR_REQUIRED",
+                    ..
+                },
+            )) => {}
+            _ => panic!("VerifyAuthority without operator_grant must fail closed with OPERATOR_REQUIRED"),
+        }
+
+        // Mismatched proposal.domain must fail closed with WrongTarget.
+        let mut wrong_prop = prop;
+        wrong_prop.domain = ConfigDomain::Poses;
+        let reply2 = rig
+            .sup
+            .dispatch_config_request(ConfigRequest::VerifyAuthority {
+                domain: ConfigDomain::Calibration,
+                grant: reservation.grant(),
+                proposal: wrong_prop,
+                auth,
+                expected_workspace_revision: Some(pub_cfg.workspace_revision),
+                expected_poses_revision: None,
+                domain_checks: VerifyDomainChecks {
+                    operator_grant: Some(armd::auth::OperatorGrant::unenforced()),
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            reply2,
+            ConfigReply::AuthorityVerified(Err(
+                armd::rt_core::requests::config::ConfigError::WrongTarget
+            ))
+        ));
+
+        let _ = rig
+            .sup
+            .dispatch_config_request(ConfigRequest::Release(ReleaseConfig { reservation }))
+            .await
+            .unwrap();
+        rig.assert_executor_zero_alloc("VerifyAuthority fail-closed checks");
+        drop(_detached);
+        rig.shutdown().await;
+    }
+
+    // 2. While a calibration transaction is busy (before PR C Reserve), an expired lease whose
+    //    connection-local `recv_generation` still matches must get 409 LEASE_LOST (with epoch_id),
+    //    NOT CONFIG_BUSY; and the active lease holder gets CONFIG_BUSY before body parsing.
+    {
+        let rig = Rig::new(RtOwner::Executor, |cfg| {
+            cfg.lease_timeout_ms = 600;
+        })
+        .await;
+        let (base, server_jh) = spawn_http_router(&rig, None, OperatorAuth::disabled()).await;
+        let ws_url = format!("{}/api/v1/ws", base.replace("http://", "ws://"));
+        let _detached = rig.sup.inner().write().await;
+
+        let wait_lease_expired = |sup: &Arc<ArmSupervisor>, label: &'static str| {
+            let sup = Arc::clone(sup);
+            async move {
+                let deadline = Instant::now() + Duration::from_secs(3);
+                loop {
+                    if sup
+                        .hub()
+                        .latest()
+                        .is_some_and(|s| !s.owner.is_lease_active_at(Instant::now()))
+                    {
+                        return;
+                    }
+                    assert!(Instant::now() < deadline, "timed out waiting for {label} lease to expire");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        };
+
+        // Wait deterministically for the initial Rig lease to expire naturally (avoids preemption cooldown).
+        wait_lease_expired(&rig.sup, "initial rig").await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
+        ws.send(Message::Text(
+            json!({ "type": "acquire_lease", "client_id": "stale_ws", "force": false, "seq": 1 })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        let gen = loop {
+            let Message::Text(t) = tokio::time::timeout(Duration::from_secs(3), ws.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+            else {
+                continue;
+            };
+            let v: Value = serde_json::from_str(&t).unwrap();
+            if v.get("type").and_then(Value::as_str) == Some("lease_granted") {
+                break v["generation"].as_u64().unwrap();
+            }
+            if v.get("type").and_then(Value::as_str) == Some("lease_denied") {
+                panic!("ws1 acquire_lease unexpectedly denied: {v}");
+            }
+        };
+
+        // Let ws1's lease expire on RT while ws1's connection-local `recv_generation` stays `gen`.
+        wait_lease_expired(&rig.sup, "ws1").await;
+
+        // Second WS connection acquires the lease without preemption and opens a calibration txn
+        // (sets `calibration_busy = true` on RT without PR C Reserve/ConfigHold yet).
+        let (mut ws2, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
+        ws2.send(Message::Text(
+            json!({ "type": "acquire_lease", "client_id": "owner_ws", "force": false, "seq": 2 })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        let gen2 = loop {
+            let Message::Text(t) = tokio::time::timeout(Duration::from_secs(3), ws2.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+            else {
+                continue;
+            };
+            let v: Value = serde_json::from_str(&t).unwrap();
+            if v.get("type").and_then(Value::as_str) == Some("lease_granted") {
+                break v["generation"].as_u64().unwrap();
+            }
+            if v.get("type").and_then(Value::as_str) == Some("lease_denied") {
+                panic!("ws2 acquire_lease unexpectedly denied: {v}");
+            }
+        };
+        let owner_conn = {
+            let mut found = None;
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                if let Some(s) = rig.sup.hub().latest() {
+                    if s.owner.lease_generation == gen2 {
+                        found = s.owner.lease_owner;
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            found.expect("hub should publish ws2 lease_owner")
+        };
+        // Keep ws2's lease fresh under heavy parallel test load.
+        ws2.send(Message::Text(
+            json!({ "type": "heartbeat", "generation": gen2, "epoch_id": rig.epoch })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        let txn_id = next_calibration_txn_id();
+        let adm2 = capture_config_admission(&rig.sup, 22, gen2, Some(rig.epoch));
+        let began = rig
+            .sup
+            .dispatch_config_request(ConfigRequest::BeginCalibrationTxn {
+                txn_id,
+                auth: ConfigAuthContext {
+                    admission: adm2,
+                    lease_holder: Some((owner_conn, gen2)),
+                },
+                operator_grant: armd::auth::OperatorGrant::unenforced(),
+                expected_epoch: rig.epoch,
+                expected_stop_gen: adm2.stop_gen,
+                kind: CalibrationTxnKind::CameraApply {
+                    require_kinematics_disarmed: false,
+                    dry_run: false,
+                },
+            })
+            .await
+            .unwrap();
+        assert!(matches!(began, ConfigReply::CalibrationTxnBegan(Ok(_))));
+
+        // ws1 sends motor_zero with its expired generation while calibration_busy == true -> MUST be LEASE_LOST.
+        let reply_zero = ws_send_recv(
+            &mut ws,
+            json!({
+                "type": "command",
+                "request_id": 701,
+                "generation": gen,
+                "epoch_id": rig.epoch,
+                "path": motor_zero::PATH,
+                "body": { "joints": [1], "method": "software" },
+            }),
+        )
+        .await;
+        assert_eq!(reply_zero["type"], "command_reject");
+        assert_eq!(reply_zero["code"], "LEASE_LOST", "stale lease must return LEASE_LOST before CONFIG_BUSY: {reply_zero}");
+        assert_eq!(reply_zero["epoch_id"], rig.epoch);
+
+        // ws2 (the active lease holder) sends bogus bodies for all 4 in-scope commands while
+        // calibration_busy == true -> MUST match legacy ws.rs:2902 rejection() envelope
+        // (CONFIG_BUSY + epoch_id + safety_state) BEFORE body parsing.
+        for (req_id, path, body) in [
+            (702u64, motor_zero::PATH, json!({ "method": "software", "bogus": true })),
+            (703u64, motor_zero::RESTORE_PATH, json!({ "bogus": true })),
+            (704u64, "/api/v1/calibration/apply", json!({ "bogus": true })),
+            (705u64, "/api/v1/calibration/restore", json!(123)),
+        ] {
+            ws2.send(Message::Text(
+                json!({ "type": "heartbeat", "generation": gen2, "epoch_id": rig.epoch })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+            let reply_busy = ws_send_recv(
+                &mut ws2,
+                json!({
+                    "type": "command",
+                    "request_id": req_id,
+                    "generation": gen2,
+                    "epoch_id": rig.epoch,
+                    "path": path,
+                    "body": body,
+                }),
+            )
+            .await;
+            assert_eq!(reply_busy["type"], "command_reject");
+            assert_eq!(reply_busy["status"], 409);
+            assert_eq!(reply_busy["code"], "CONFIG_BUSY", "active owner {path} while busy must get CONFIG_BUSY before parse: {reply_busy}");
+            assert_eq!(reply_busy["error"], "CONFIG_BUSY");
+            assert_eq!(reply_busy["epoch_id"], rig.epoch, "concurrent busy reply must include epoch_id: {reply_busy}");
+            assert!(reply_busy.get("safety_state").is_some(), "concurrent busy reply must include safety_state key: {reply_busy}");
+        }
+
+        let _ = rig
+            .sup
+            .dispatch_config_request(ConfigRequest::EndCalibrationTxn {
+                txn_id,
+                force_reconcile: false,
+            })
+            .await
+            .unwrap();
+        server_jh.abort();
+        rig.assert_executor_zero_alloc("lease precedence during calibration_busy");
+        drop(_detached);
+        rig.shutdown().await;
+    }
+}
+
+// ============================================================================
+// 18. Active sequence pins on both Legacy and Executor owners (no stale 409)
+// ============================================================================
+
+async fn ws_acquire_lease(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> u64 {
+    ws.send(Message::Text(
+        json!({"type": "acquire_lease", "client_id": "seq_pins_ctrl", "seq": 1})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let rem = deadline.saturating_duration_since(Instant::now());
+        assert!(!rem.is_zero(), "timed out waiting for lease_granted");
+        let msg = tokio::time::timeout(rem, ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if let Message::Text(t) = msg {
+            let v: Value = serde_json::from_str(&t).unwrap();
+            if v.get("type").and_then(Value::as_str) == Some("lease_granted") {
+                return v["generation"].as_u64().unwrap();
+            }
+        }
+    }
+}
+
+async fn wait_executor_prep_env_synced(
+    rx: &mut tokio::sync::broadcast::Receiver<armd::ArmObservation>,
+    sup: &Arc<ArmSupervisor>,
+) {
+    let synced = || {
+        match (sup.hub().latest(), sup.hub().prep_env()) {
+            (Some(snap), Some(env)) => env.matches_owner_meta(&snap.rt.owner),
+            _ => false,
+        }
+    };
+    if synced() {
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Ok(_)) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
+                if synced() {
+                    return;
+                }
+            }
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                panic!("telemetry channel closed waiting for prep_env sync");
+            }
+            Err(_) => {
+                panic!("timed out waiting for executor StateHub revisions to match prep_env");
+            }
+        }
+    }
+}
+
+async fn wait_telemetry_action_terminal(
+    rx: &mut tokio::sync::broadcast::Receiver<armd::ArmObservation>,
+    sup: &Arc<ArmSupervisor>,
+    action_id: u64,
+    expected_state: &str,
+) {
+    let is_terminal_in = |obs: &armd::ArmObservation| -> bool {
+        obs.action
+            .iter()
+            .chain(obs.previous_action.iter())
+            .any(|a| a.id == action_id && !a.is_running() && a.state == expected_state)
+    };
+    if sup.hub().latest().is_some_and(|s| is_terminal_in(&s.obs)) {
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Ok(obs)) if is_terminal_in(&obs) => return,
+            Ok(Ok(_)) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
+                if sup.hub().latest().is_some_and(|s| is_terminal_in(&s.obs)) {
+                    return;
+                }
+            }
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                panic!("telemetry channel closed waiting for action {action_id} terminal");
+            }
+            Err(_) => {
+                panic!("timed out waiting for action {action_id} terminal ({expected_state})");
+            }
+        }
+    }
+}
+
+async fn run_sequence_pins_lifecycle_test(owner: RtOwner) {
+    struct CleanupPauseReset;
+    impl Drop for CleanupPauseReset {
+        fn drop(&mut self) {
+            armd::sequences::clear_test_cleanup_pause();
+        }
+    }
+    let _reset = CleanupPauseReset;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = ArmConfig::rebot_dm();
+    cfg.lease_timeout_ms = 600_000;
+    let sup = Arc::new(ArmSupervisor::new(cfg));
+    armd::poses::load_into(&sup, &dir.path().join("poses.json")).await;
+    armd::sequences::load_into(&sup, &dir.path().join("sequences.json")).await;
+    {
+        let mut inner = sup.inner().write().await;
+        inner.measured_positions = INSPECT.to_vec();
+        inner.commanded_positions = INSPECT.to_vec();
+        inner.target_positions = INSPECT.to_vec();
+    }
+
+    let mut telemetry_rx = sup.subscribe_telemetry().expect("telemetry subscriber");
+
+    if owner == RtOwner::Executor {
+        let mut ecfg = ExecutorConfig::for_tests(Duration::from_millis(2));
+        ecfg.alloc_timing = true;
+        let handle = sup.start_executor(ecfg).await.expect("start RT executor");
+        handle.attach_external_reply_sink(Arc::new(|_, _| {
+            armd::rt_core::broker::DeliveryDecision::Delivered
+        }));
+        let init_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while sup.hub().latest().is_none() {
+            let _ = tokio::time::timeout_at(init_deadline, telemetry_rx.recv())
+                .await
+                .expect("timed out waiting for initial executor snapshot");
+        }
+        assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO);
+    }
+
+    let _detached = if owner == RtOwner::Executor {
+        Some(sup.inner().write().await)
+    } else {
+        None
+    };
+
+    let router = armd::create_router(sup.clone(), OperatorAuth::disabled());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_jh = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/api/v1/ws"))
+        .await
+        .unwrap();
+    let lease_gen = ws_acquire_lease(&mut ws).await;
+    let mut req_id = 10u64;
+    let mut next_req = || {
+        req_id += 1;
+        req_id
+    };
+
+    let current_epoch = || -> u64 {
+        sup.hub()
+            .latest()
+            .map_or_else(|| sup.estop_epoch(), |s| s.obs.epoch_id)
+    };
+
+    // Enable torque via WS (works on both Legacy and Executor owners).
+    let epoch = if owner == RtOwner::Legacy {
+        sup.get_observation().await.epoch_id
+    } else {
+        current_epoch()
+    };
+    let torque_ack = ws_send_recv(
+        &mut ws,
+        json!({
+            "type": "command",
+            "request_id": next_req(),
+            "generation": lease_gen,
+            "epoch_id": epoch,
+            "path": "/api/v1/torque",
+            "body": { "enable": true }
+        }),
+    )
+    .await;
+    assert_eq!(torque_ack["type"], "command_ack", "{torque_ack}");
+
+    // Save pose P via WS.
+    let pose_ack = ws_send_recv(
+        &mut ws,
+        json!({
+            "type": "command",
+            "request_id": next_req(),
+            "generation": lease_gen,
+            "epoch_id": epoch,
+            "path": "/api/v1/poses/save",
+            "body": { "name": "pin_pose", "positions": INSPECT }
+        }),
+    )
+    .await;
+    assert_eq!(pose_ack["type"], "command_ack", "{pose_ack}");
+    let pose_id = pose_ack["pose"]["id"].as_str().unwrap().to_string();
+
+    // ------------------------------------------------------------------------
+    // Part A: While a sequence is running, deleting it is refused SEQUENCE_RUNNING
+    // and poses pinned only by the running sequence are protected (IN_USE / PosesDelete).
+    // ------------------------------------------------------------------------
+    let seq_run_ack = ws_send_recv(
+        &mut ws,
+        json!({
+            "type": "command",
+            "request_id": next_req(),
+            "generation": lease_gen,
+            "epoch_id": epoch,
+            "path": "/api/v1/sequences/save",
+            "body": {
+                "name": "seq_running_pins",
+                "steps": [
+                    { "type": "wait", "s": 10.0 },
+                    { "type": "pose", "pose_id": pose_id }
+                ]
+            }
+        }),
+    )
+    .await;
+    assert_eq!(seq_run_ack["type"], "command_ack", "{seq_run_ack}");
+    let seq_run_id = seq_run_ack["sequence"]["id"].as_str().unwrap().to_string();
+
+    let (run_cleanup_entered_rx, run_cleanup_release_tx) =
+        armd::sequences::arm_test_cleanup_pause(seq_run_id.clone());
+
+    let run_action_id = if owner == RtOwner::Legacy {
+        let ack = ws_send_recv(
+            &mut ws,
+            json!({
+                "type": "command",
+                "request_id": next_req(),
+                "generation": lease_gen,
+                "epoch_id": epoch,
+                "path": "/api/v1/action/run_sequence",
+                "body": { "id": seq_run_id }
+            }),
+        )
+        .await;
+        assert_eq!(ack["type"], "command_ack", "{ack}");
+        ack["action_id"].as_u64().unwrap()
+    } else {
+        wait_executor_prep_env_synced(&mut telemetry_rx, &sup).await;
+        let mut adm = sup.capture_admission_stamp();
+        adm.connection_id = 1;
+        adm.lease_gen = lease_gen;
+        adm.estop_epoch = epoch;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let snap = armd::rt_core::requests::actions::ActionSnapshot::capture(&sup, adm, deadline)
+            .await
+            .expect("capture ActionSnapshot for running sequence");
+        let plan = armd::sequences::prepare_run_from_snapshot(
+            &snap,
+            &json!({ "id": seq_run_id }),
+            epoch,
+            true,
+        )
+        .expect("prepare_run_from_snapshot");
+        let (aid, _) = armd::sequences::begin_executor(&sup, adm, plan)
+            .await
+            .expect("begin_executor");
+        aid
+    };
+
+    // 1. Delete while running MUST be refused with 409 SEQUENCE_RUNNING.
+    let del_running = ws_send_recv(
+        &mut ws,
+        json!({
+            "type": "command",
+            "request_id": next_req(),
+            "generation": lease_gen,
+            "epoch_id": epoch,
+            "path": "/api/v1/sequences/delete",
+            "body": { "id": seq_run_id }
+        }),
+    )
+    .await;
+    assert_eq!(del_running["type"], "command_reject", "{del_running}");
+    assert_eq!(del_running["status"], 409, "{del_running}");
+    assert_eq!(del_running["code"], "SEQUENCE_RUNNING", "{del_running}");
+
+    // 2. Edit the saved sequence to drop pose P while the running run still pins P in `RunPins`:
+    //    `poses/delete` MUST STILL fail with 409 IN_USE (proving `RunPins::pose_ids` protects P
+    //    in both `prepare_config_write_off_thread` and `ReservePrecheck::PosesDelete`).
+    let edit_ack = ws_send_recv(
+        &mut ws,
+        json!({
+            "type": "command",
+            "request_id": next_req(),
+            "generation": lease_gen,
+            "epoch_id": epoch,
+            "path": "/api/v1/sequences/save",
+            "body": {
+                "id": seq_run_id,
+                "name": "seq_running_pins",
+                "steps": [{ "type": "wait", "s": 10.0 }]
+            }
+        }),
+    )
+    .await;
+    assert_eq!(edit_ack["type"], "command_ack", "{edit_ack}");
+
+    let del_pose_running = ws_send_recv(
+        &mut ws,
+        json!({
+            "type": "command",
+            "request_id": next_req(),
+            "generation": lease_gen,
+            "epoch_id": epoch,
+            "path": "/api/v1/poses/delete",
+            "body": { "name": "pin_pose" }
+        }),
+    )
+    .await;
+    assert_eq!(del_pose_running["type"], "command_reject", "{del_pose_running}");
+    assert_eq!(del_pose_running["status"], 409, "{del_pose_running}");
+    assert_eq!(del_pose_running["code"], "IN_USE", "{del_pose_running}");
+
+    // Cancel the running sequence so it reaches terminal (`cancelled`) and pauses in `cleanup()`.
+    if owner == RtOwner::Legacy {
+        let stop_ack = ws_send_recv(
+            &mut ws,
+            json!({
+                "type": "command",
+                "request_id": next_req(),
+                "generation": lease_gen,
+                "epoch_id": epoch,
+                "path": "/api/v1/motion/stop",
+                "body": {}
+            }),
+        )
+        .await;
+        assert_eq!(stop_ack["type"], "command_ack", "{stop_ack}");
+    } else {
+        let handle = sup.executor_handle().expect("executor handle");
+        let _ = handle.stop_requests().request();
+    }
+
+    tokio::task::spawn_blocking(move || {
+        run_cleanup_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("running sequence must enter cleanup() after stop")
+    })
+    .await
+    .unwrap();
+
+    if owner == RtOwner::Executor {
+        wait_telemetry_action_terminal(&mut telemetry_rx, &sup, run_action_id, "cancelled").await;
+    }
+
+    // While `cleanup()` is STILL paused with stale `RunPins` intact:
+    // pose P (no longer referenced by saved sequences) and `seq_run_id` MUST both delete cleanly.
+    let del_pose_after = ws_send_recv(
+        &mut ws,
+        json!({
+            "type": "command",
+            "request_id": next_req(),
+            "generation": lease_gen,
+            "epoch_id": epoch,
+            "path": "/api/v1/poses/delete",
+            "body": { "name": "pin_pose" }
+        }),
+    )
+    .await;
+    assert_eq!(del_pose_after["type"], "command_ack", "{del_pose_after}");
+
+    let del_run_after = ws_send_recv(
+        &mut ws,
+        json!({
+            "type": "command",
+            "request_id": next_req(),
+            "generation": lease_gen,
+            "epoch_id": epoch,
+            "path": "/api/v1/sequences/delete",
+            "body": { "id": seq_run_id }
+        }),
+    )
+    .await;
+    assert_eq!(del_run_after["type"], "command_ack", "{del_run_after}");
+
+    let _ = run_cleanup_release_tx.send(());
+
+    // ------------------------------------------------------------------------
+    // Part B: Natural `done` terminal (`Step::Wait { s: 0.0 }`) with `cleanup()` held paused —
+    // exact reproduction of the session 13 post-terminal delete race on BOTH owners.
+    // ------------------------------------------------------------------------
+    let seq_done_ack = ws_send_recv(
+        &mut ws,
+        json!({
+            "type": "command",
+            "request_id": next_req(),
+            "generation": lease_gen,
+            "epoch_id": epoch,
+            "path": "/api/v1/sequences/save",
+            "body": {
+                "name": "seq_done_cleanup_pause",
+                "steps": [{ "type": "wait", "s": 0.0 }]
+            }
+        }),
+    )
+    .await;
+    assert_eq!(seq_done_ack["type"], "command_ack", "{seq_done_ack}");
+    let seq_done_id = seq_done_ack["sequence"]["id"].as_str().unwrap().to_string();
+
+    let (done_cleanup_entered_rx, done_cleanup_release_tx) =
+        armd::sequences::arm_test_cleanup_pause(seq_done_id.clone());
+
+    let done_action_id = if owner == RtOwner::Legacy {
+        let ack = ws_send_recv(
+            &mut ws,
+            json!({
+                "type": "command",
+                "request_id": next_req(),
+                "generation": lease_gen,
+                "epoch_id": epoch,
+                "path": "/api/v1/action/run_sequence",
+                "body": { "id": seq_done_id }
+            }),
+        )
+        .await;
+        assert_eq!(ack["type"], "command_ack", "{ack}");
+        ack["action_id"].as_u64().unwrap()
+    } else {
+        wait_executor_prep_env_synced(&mut telemetry_rx, &sup).await;
+        let mut adm = sup.capture_admission_stamp();
+        adm.connection_id = 1;
+        adm.lease_gen = lease_gen;
+        adm.estop_epoch = epoch;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let snap = armd::rt_core::requests::actions::ActionSnapshot::capture(&sup, adm, deadline)
+            .await
+            .expect("capture ActionSnapshot for done sequence");
+        let plan = armd::sequences::prepare_run_from_snapshot(
+            &snap,
+            &json!({ "id": seq_done_id }),
+            epoch,
+            true,
+        )
+        .expect("prepare_run_from_snapshot");
+        let (aid, _) = armd::sequences::begin_executor(&sup, adm, plan)
+            .await
+            .expect("begin_executor");
+        aid
+    };
+
+    tokio::task::spawn_blocking(move || {
+        done_cleanup_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("done sequence must enter cleanup() after terminal")
+    })
+    .await
+    .unwrap();
+
+    if owner == RtOwner::Executor {
+        wait_telemetry_action_terminal(&mut telemetry_rx, &sup, done_action_id, "done").await;
+        // Raw hub still holds uncleared pins while `cleanup()` is paused, but `published_config()`
+        // filters them out via active-pins rule.
+        assert!(
+            sup.published_config_hub()
+                .latest()
+                .unwrap()
+                .sequences
+                .pins
+                .as_ref()
+                .is_some_and(|p| p.action_id == done_action_id),
+            "expected raw pins to remain uncleared while cleanup() is paused on Executor"
+        );
+        assert!(
+            sup.published_config().await.unwrap().sequences.pins.is_none(),
+            "published_config() must filter stale pins after terminal on Executor"
+        );
+    } else {
+        let inner = sup.inner().read().await;
+        assert!(
+            inner
+                .sequences
+                .pins
+                .as_ref()
+                .is_some_and(|p| p.action_id == done_action_id),
+            "expected raw pins to remain uncleared while cleanup() is paused on Legacy"
+        );
+        assert!(inner.active_sequence_pins().is_none());
+        drop(inner);
+        assert!(
+            sup.published_config().await.unwrap().sequences.pins.is_none(),
+            "published_config() must filter stale pins after terminal on Legacy"
+        );
+    }
+
+    // Delete via WS while `cleanup()` is STILL paused MUST succeed with `command_ack`!
+    let del_done = ws_send_recv(
+        &mut ws,
+        json!({
+            "type": "command",
+            "request_id": next_req(),
+            "generation": lease_gen,
+            "epoch_id": epoch,
+            "path": "/api/v1/sequences/delete",
+            "body": { "id": seq_done_id }
+        }),
+    )
+    .await;
+    assert_eq!(del_done["type"], "command_ack", "{del_done}");
+
+    let _ = done_cleanup_release_tx.send(());
+
+    if let Some(handle) = sup.executor_handle() {
+        assert_eq!(
+            handle.stats().total_allocs(),
+            AllocCounts::ZERO,
+            "armd-control must remain zero-alloc across sequence pin install/clear/delete"
+        );
+        assert_eq!(sup.inner().control_thread_attempts(), 0);
+    }
+
+    drop(_detached);
+    server_jh.abort();
+    if let Some(handle) = sup.executor_handle() {
+        handle.stop_and_join();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sequence_pins_enforced_while_running_and_released_before_cleanup_legacy() {
+    run_sequence_pins_lifecycle_test(RtOwner::Legacy).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sequence_pins_enforced_while_running_and_released_before_cleanup_executor() {
+    run_sequence_pins_lifecycle_test(RtOwner::Executor).await;
 }

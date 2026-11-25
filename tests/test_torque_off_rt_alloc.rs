@@ -757,7 +757,13 @@ fn r1_hold_capture_uses_owner_snapshot_without_driver_mutex_zero_alloc() {
 
     // Poison `inner.driver` so any attempt to lock `self.driver` during hold capture would fail.
     let _ = std::thread::scope(|s| {
-        let drv = fx.core.driver.as_ref().expect("driver attached");
+        let drv = fx
+            .core
+            .driver
+            .as_ref()
+            .expect("driver attached")
+            .as_legacy_lock()
+            .expect("legacy driver");
         s.spawn(move || {
             let _guard = drv.lock().unwrap();
             panic!("intentional poison to prove hold capture never locks driver mutex");
@@ -765,7 +771,13 @@ fn r1_hold_capture_uses_owner_snapshot_without_driver_mutex_zero_alloc() {
         .join()
     });
     assert!(
-        fx.core.driver.as_ref().unwrap().is_poisoned(),
+        fx.core
+            .driver
+            .as_ref()
+            .unwrap()
+            .as_legacy_lock()
+            .unwrap()
+            .is_poisoned(),
         "driver mutex must be poisoned before testing lock-free hold capture"
     );
 

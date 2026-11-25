@@ -191,16 +191,17 @@ impl SupervisorInner {
         Ok(())
     }
 
-    /// Non-blocking stopped torque-off evaluation for `armd-control` (M4): uses `driver.try_lock()`,
-    /// returning `Err(())` on mutex contention (`TryLockError::WouldBlock`) instead of blocking.
+    /// Non-blocking stopped torque-off evaluation for `armd-control` (M4): zero-lock direct
+    /// borrow in `DriverSlot::Exclusive`, non-blocking `try_lock` in `DriverSlot::Legacy`
+    /// returning `Err(())` on mutex contention (`DriverTryError::WouldBlock`) instead of blocking.
     pub(crate) fn may_disable_torque_while_stopped_nonblocking(
         &self,
     ) -> Result<Result<(), StoppedTorqueOffRefusal>, ()> {
         if let Some(d) = self.driver.as_ref() {
-            return match d.try_lock() {
-                Ok(drv) => Ok(Self::check_stopped_torque_off_with_driver(&self.config, drv.as_ref())),
-                Err(std::sync::TryLockError::WouldBlock) => Err(()),
-                Err(std::sync::TryLockError::Poisoned(_)) => {
+            return match d.try_with_ref(|drv| Self::check_stopped_torque_off_with_driver(&self.config, drv)) {
+                Ok(res) => Ok(res),
+                Err(crate::supervisor_lock::DriverTryError::WouldBlock) => Err(()),
+                Err(crate::supervisor_lock::DriverTryError::Poisoned) => {
                     Ok(Err(StoppedTorqueOffRefusal::StaleOrMissingFeedback))
                 }
             };
@@ -211,14 +212,14 @@ impl SupervisorInner {
     pub fn may_disable_torque_while_stopped(&self) -> Result<(), StoppedTorqueOffRefusal> {
         if let Some(d) = self.driver.as_ref() {
             if self.rt_executor_owned {
-                return match d.try_lock() {
-                    Ok(drv) => Self::check_stopped_torque_off_with_driver(&self.config, drv.as_ref()),
+                return match d.try_with_ref(|drv| Self::check_stopped_torque_off_with_driver(&self.config, drv)) {
+                    Ok(res) => res,
                     Err(_) => Err(StoppedTorqueOffRefusal::StaleOrMissingFeedback),
                 };
             }
-            return match d.lock() {
-                Ok(drv) => Self::check_stopped_torque_off_with_driver(&self.config, drv.as_ref()),
-                Err(_) => Err(StoppedTorqueOffRefusal::StaleOrMissingFeedback),
+            return match d.with_ref(|drv| Self::check_stopped_torque_off_with_driver(&self.config, drv)) {
+                Some(res) => res,
+                None => Err(StoppedTorqueOffRefusal::StaleOrMissingFeedback),
             };
         }
         self.may_disable_torque_while_stopped_driverless()
