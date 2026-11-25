@@ -357,7 +357,7 @@ pub const TERMINAL_CODES: &[&str] = &[
     "PLACE_TIMEOUT", "TARGET_TIMEOUT", "SEQUENCE_TIMEOUT", "HOVER_TIMEOUT", "MEASURE_TIMEOUT", "MAX_SECONDS", "NOT_HOLDING", "TARGET_LOST", "TARGET_DISPLACED",
     "DROPPED", "OBJECT_HELD", "OBJECT_TOO_TALL", "TOO_WIDE", "CENTRING_FAILED", "DETECTION_UNAVAILABLE", "TASK_UNSUPPORTED",
     "OBSERVATION_UNAVAILABLE", "PERSIST_FAILED", "POLICY_NOT_ACTIVE", "POWER_LIMIT",
-    "VISION_STALE", "INFERENCE_ERROR", "POLICY_REVOKED", "POLICY_FAILED", "MODEL_CHANGED",
+    "VISION_STALE", "INFERENCE_ERROR", "POLICY_REVOKED", "POLICY_FAILED", "MODEL_CHANGED", "HANDSHAKE_EXPIRED",
 ];
 
 /// The static form of an action's code (None: it named none or an unlisted one).
@@ -814,6 +814,119 @@ static STOP_DIAG: StopDiagSlot = StopDiagSlot::new();
 /// Preallocated diagnostic slot written by [`SupervisorInner::authorized_stop`] until step 1
 /// moves it onto `ArmCore` / `ExecutorStats`.
 pub fn stop_diag() -> &'static StopDiagSlot { &STOP_DIAG }
+
+/// Lock-free fixed-size diagnostic slot for RT gripper force-cap warnings (0 allocs, 0 tracing
+/// calls on `armd-control`; drained and emitted off-thread in `StateHub::refresh`).
+pub struct GripperForceDiagSlot {
+    unavail_count: AtomicU64,
+    unavail_drained: AtomicU64,
+    unavail_bus_fresh: std::sync::atomic::AtomicBool,
+    unavail_has_torque: std::sync::atomic::AtomicBool,
+    cap_trip_count: AtomicU64,
+    cap_trip_drained: AtomicU64,
+    cap_tau_milli_nm: AtomicU32,
+    cap_limit_milli_nm: AtomicU32,
+    cap_pos_milli_rad: std::sync::atomic::AtomicI32,
+    cap_trips: AtomicU32,
+    stream_stop_count: AtomicU64,
+    stream_stop_drained: AtomicU64,
+    stream_stop_max_trips: AtomicU32,
+}
+
+impl GripperForceDiagSlot {
+    pub const fn new() -> Self {
+        Self {
+            unavail_count: AtomicU64::new(0),
+            unavail_drained: AtomicU64::new(0),
+            unavail_bus_fresh: std::sync::atomic::AtomicBool::new(false),
+            unavail_has_torque: std::sync::atomic::AtomicBool::new(false),
+            cap_trip_count: AtomicU64::new(0),
+            cap_trip_drained: AtomicU64::new(0),
+            cap_tau_milli_nm: AtomicU32::new(0),
+            cap_limit_milli_nm: AtomicU32::new(0),
+            cap_pos_milli_rad: std::sync::atomic::AtomicI32::new(0),
+            cap_trips: AtomicU32::new(0),
+            stream_stop_count: AtomicU64::new(0),
+            stream_stop_drained: AtomicU64::new(0),
+            stream_stop_max_trips: AtomicU32::new(0),
+        }
+    }
+
+    pub fn record_feedback_unavailable(&self, bus_fresh: bool, has_torque: bool) {
+        self.unavail_bus_fresh.store(bus_fresh, Ordering::Relaxed);
+        self.unavail_has_torque.store(has_torque, Ordering::Relaxed);
+        self.unavail_count.fetch_add(1, Ordering::Release);
+    }
+
+    pub fn record_cap_trip(&self, tau_abs: f32, limit_nm: f32, pos_rad: f32, trips: u32) {
+        let to_u32 = |v: f32| if v.is_finite() && v >= 0.0 { (v * 1000.0).min(u32::MAX as f32) as u32 } else { 0 };
+        let to_i32 = |v: f32| if v.is_finite() { (v * 1000.0).clamp(i32::MIN as f32, i32::MAX as f32) as i32 } else { 0 };
+        self.cap_tau_milli_nm.store(to_u32(tau_abs), Ordering::Relaxed);
+        self.cap_limit_milli_nm.store(to_u32(limit_nm), Ordering::Relaxed);
+        self.cap_pos_milli_rad.store(to_i32(pos_rad), Ordering::Relaxed);
+        self.cap_trips.store(trips, Ordering::Relaxed);
+        self.cap_trip_count.fetch_add(1, Ordering::Release);
+    }
+
+    pub fn record_stream_stopped(&self, max_trips: u32) {
+        self.stream_stop_max_trips.store(max_trips, Ordering::Relaxed);
+        self.stream_stop_count.fetch_add(1, Ordering::Release);
+    }
+
+    pub fn drain_and_log_once(&self) {
+        loop {
+            let prev = self.unavail_drained.load(Ordering::Acquire);
+            let now = self.unavail_count.load(Ordering::Acquire);
+            if now == prev { break; }
+            if self.unavail_drained.compare_exchange(prev, now, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                tracing::warn!(
+                    "Gripper close stopped ({} event(s)): feedback_fresh={} torque_feedback={} while max_close_torque_nm is active; holding",
+                    now.wrapping_sub(prev),
+                    self.unavail_bus_fresh.load(Ordering::Relaxed),
+                    self.unavail_has_torque.load(Ordering::Relaxed),
+                );
+                break;
+            }
+        }
+        loop {
+            let prev = self.cap_trip_drained.load(Ordering::Acquire);
+            let now = self.cap_trip_count.load(Ordering::Acquire);
+            if now == prev { break; }
+            if self.cap_trip_drained.compare_exchange(prev, now, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                tracing::warn!(
+                    "Gripper torque cap ({} event(s)): |tau| {:.2} N·m above {:.2} N·m at {:.3} rad (trip {} on this contact); holding",
+                    now.wrapping_sub(prev),
+                    self.cap_tau_milli_nm.load(Ordering::Relaxed) as f32 / 1000.0,
+                    self.cap_limit_milli_nm.load(Ordering::Relaxed) as f32 / 1000.0,
+                    self.cap_pos_milli_rad.load(Ordering::Relaxed) as f32 / 1000.0,
+                    self.cap_trips.load(Ordering::Relaxed),
+                );
+                break;
+            }
+        }
+        loop {
+            let prev = self.stream_stop_drained.load(Ordering::Acquire);
+            let now = self.stream_stop_count.load(Ordering::Acquire);
+            if now == prev { break; }
+            if self.stream_stop_drained.compare_exchange(prev, now, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                tracing::warn!(
+                    "Gripper torque cap tripped {} times on one contact under a stream ({} event(s)); stopping the stream",
+                    self.stream_stop_max_trips.load(Ordering::Relaxed),
+                    now.wrapping_sub(prev),
+                );
+                break;
+            }
+        }
+    }
+}
+
+impl Default for GripperForceDiagSlot {
+    fn default() -> Self { Self::new() }
+}
+
+static GRIPPER_FORCE_DIAG: GripperForceDiagSlot = GripperForceDiagSlot::new();
+
+pub(crate) fn gripper_force_diag() -> &'static GripperForceDiagSlot { &GRIPPER_FORCE_DIAG }
 
 /// The protocol code of a delegated error, as a static string without allocating
 /// (unknown codes: `REJECTED`).

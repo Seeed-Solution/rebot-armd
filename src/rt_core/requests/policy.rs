@@ -601,7 +601,7 @@ fn install_begin_policy_body(
             return Err("RELEASE_GATE_INVALID");
         }
         if !inner.feedback_numeric_valid
-            || !inner.driver_feedback_confirmed()
+            || !inner.rt_driver_feedback_confirmed()
             || !inner.has_policy_input_age_range()
         {
             return Err("FEEDBACK_UNCONFIRMED");

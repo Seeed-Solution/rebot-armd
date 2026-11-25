@@ -730,6 +730,7 @@ impl StateHub {
     fn refresh(&self, st: &mut HubState) -> Option<Arc<Snapshot>> {
         self.retire.free_all();
         super::ops::stop_diag().drain_and_log_once();
+        super::ops::gripper_force_diag().drain_and_log_once();
         // Acquire-check `has_fresh()` BEFORE inspecting `prewarm_template`: in executor mode
         // `try_prewarm_observations` sets `prewarm_template` (Release) before any release
         // calls `Producer::publish` (AcqRel), so observing `FRESH == 1` guarantees

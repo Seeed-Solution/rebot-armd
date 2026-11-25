@@ -2102,7 +2102,7 @@ impl SupervisorInner {
                 return Err(Refusal::code("RELEASE_GATE_REQUIRED"));
             }
             if !self.feedback_numeric_valid
-                || !self.driver_feedback_confirmed()
+                || !self.rt_driver_feedback_confirmed()
                 || !self.has_policy_input_age_range()
             {
                 self.terminate_policy_run_static(
@@ -2302,8 +2302,31 @@ impl SupervisorInner {
         self.release_servo_target();
         self.servo_settled_ticks.fill(0);
         self.clear_servo_ws_min_depths_rt();
+        self.gripper_stream_target = None;
+        self.gripper_stream_contact = None;
+        self.gripper_stream_contact_detector.reset();
+        self.gripper_stream_lease = None;
         self.j7_admitted_stamp = None;
         copy_into(&mut self.target_positions, &self.commanded_positions);
+    }
+
+    /// Zero-allocation Step-5 output-boundary revocation recheck: if `PolicyAuthorization`
+    /// changed after the currently installed live target was accepted, immediately drop both
+    /// `servo_target` and policy-owned `gripper_stream_*` state before any J1-J7 output advances.
+    #[inline]
+    pub(crate) fn recheck_live_policy_authorization_rt(&mut self) {
+        if let Some(aid) = self
+            .policy_run
+            .as_ref()
+            .filter(|r| {
+                r.mode == crate::policy_runtime::PolicyMode::Live
+                    && r.live_target_auth_gen
+                        .is_some_and(|g| r.authorization.current() != g)
+            })
+            .map(|r| r.action_id)
+        {
+            self.brake_live_policy_in_place(aid);
+        }
     }
 
     /// Vision hold of a live run: drop its servo target so the control loop brakes now
@@ -2460,6 +2483,10 @@ impl SupervisorInner {
             self.release_servo_target();
             self.servo_settled_ticks.fill(0);
             self.clear_servo_ws_min_depths_rt();
+            self.gripper_stream_target = None;
+            self.gripper_stream_contact = None;
+            self.gripper_stream_contact_detector.reset();
+            self.gripper_stream_lease = None;
             if reset_hold_target {
                 self.j7_admitted_stamp = None;
                 copy_into(&mut self.target_positions, &self.commanded_positions);

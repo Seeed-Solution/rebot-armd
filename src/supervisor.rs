@@ -909,6 +909,8 @@ pub struct SupervisorInner {
     /// True while a policy pack is being loaded/prepared outside the supervisor lock.
     #[cfg(feature = "policy-runtime")]
     pub policy_loading: bool,
+    /// Non-blocking Step-2 cache of `driver.is_feedback_valid()` (0 driver locks in Step 3/4).
+    pub(crate) driver_feedback_confirmed_cached: bool,
     /// Inline owner-side reservation held during off-thread policy pack load/warmup on executor.
     #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
     pub(crate) policy_load_reservation: Option<crate::rt_core::requests::policy::PolicyLoadReservation>,
@@ -2073,6 +2075,7 @@ impl SupervisorInner {
             policy_run: None,
             #[cfg(feature = "policy-runtime")]
             policy_loading: false,
+            driver_feedback_confirmed_cached: false,
             #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
             policy_load_reservation: None,
             #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
@@ -5368,7 +5371,15 @@ impl SupervisorInner {
         driver.set_estop_gate(self.estop_gate());
         driver.set_external_pos_force_emitter(true);
         self.driver_clock = driver.driver_clock();
+        self.driver_feedback_confirmed_cached = driver.is_feedback_valid();
         self.driver = Some(std::sync::Mutex::new(driver));
+    }
+
+    /// Lock-free Step-2 cached hardware feedback confirmation (`false` when driverless, lock failed,
+    /// or last Step-2 poll failed — fail-closed without taking the driver mutex in Step 3/4).
+    #[inline]
+    pub(crate) fn rt_driver_feedback_confirmed(&self) -> bool {
+        self.driver_feedback_confirmed_cached
     }
 
     /// Lock-free read of the driver clock for RT off-thread forwarding timestamps, falling back
@@ -6782,6 +6793,7 @@ impl SupervisorInner {
                                 out.recovery_ages = true;
                             }
                             let driver_valid = driver.is_feedback_valid();
+                            self.driver_feedback_confirmed_cached = driver_valid;
                             let all_fresh_age = sc.ages.len() == self.config.dof
                                 && sc.ages.iter().all(|a| a.is_some_and(|age| age <= Duration::from_millis(250)));
                             if self.feedback_numeric_valid && sc.ages.len() == self.config.dof && driver_valid {
@@ -6833,6 +6845,7 @@ impl SupervisorInner {
                             }
                         }
                         Err(_) => {
+                            self.driver_feedback_confirmed_cached = false;
                             self.last_can_feedback_instant = None;
                             self.thermal_cooldown.reset();
                             out.reset_stillness_on_read_err = true;
@@ -6872,6 +6885,7 @@ impl SupervisorInner {
                     }
                 }
                 Err(_) => {
+                    self.driver_feedback_confirmed_cached = false;
                     self.last_can_feedback_instant = None;
                     self.thermal_cooldown.reset();
                     out.reset_stillness_on_read_err = true;
@@ -6879,6 +6893,7 @@ impl SupervisorInner {
             }
         } else {
             // Driverless simulation mode: each control tick produces a fresh joint sample.
+            self.driver_feedback_confirmed_cached = false;
             self.core.simulate_feedback(self.config.dof, Instant::now());
             self.joint_feedback_queue_bounds.clear();
             out.bus_feedback_fresh = true;
@@ -6958,8 +6973,27 @@ impl SupervisorInner {
         let drv_action_cutoff = if self.safety.state().is_stopped() {
             None
         } else {
-            self.active_action_deadline()
-                .map(|dl| drv_now + dl.saturating_duration_since(owner_now))
+            let mut owner_dl = self.active_action_deadline();
+            #[cfg(feature = "policy-runtime")]
+            if self.watchdog_park.is_none() && !self.pending_normal_unload {
+                if let Some(run) = self
+                    .policy_run
+                    .as_ref()
+                    .filter(|r| r.mode == crate::policy_runtime::PolicyMode::Live)
+                {
+                    if self.lease_enabled {
+                        // Include absolute lease expiry (fail-closed to `owner_now` if lease is
+                        // missing or mismatched) so a policy target can never transmit after expiry.
+                        let lease_exp = self
+                            .active_lease
+                            .as_ref()
+                            .filter(|l| l.generation == run.lease_generation)
+                            .map_or(owner_now, |l| l.acquired_at + self.lease_timeout);
+                        owner_dl = Some(owner_dl.map_or(lease_exp, |cur| cur.min(lease_exp)));
+                    }
+                }
+            }
+            owner_dl.map(|dl| drv_now + dl.saturating_duration_since(owner_now))
         };
         let drv_effective = drv_action_cutoff.map_or(drv_release_cap, |ac| drv_release_cap.min(ac));
         drv.set_tx_release_deadline(Some(drv_effective));
@@ -7179,6 +7213,11 @@ impl SupervisorInner {
         // lease-expiry fence BEFORE gripper, motion, or bus output runs.
         self.sync_nonblocking_disconnect_fence(now_fn());
 
+        // 0.0b Output-boundary policy authorization recheck BEFORE the gripper force/contact
+        // block reads `gripper_stream_target` (so a revoked policy never advances J7 via CapRamp).
+        #[cfg(feature = "policy-runtime")]
+        self.recheck_live_policy_authorization_rt();
+
         // 0.1 Gripper stall protection state machine
         if self.active_trajectory.is_some() || self.macro_run.is_some() || self.pending_normal_unload
             || self.gravity_comp.is_some() || self.last_motion_frame.elapsed() > self.motion_frame_timeout {
@@ -7382,9 +7421,14 @@ impl SupervisorInner {
 
             if force_cap.is_some() && closing && self.is_torqued && (!is_bus_fresh || !has_torque_feedback) {
                 if !(self.gripper_stalled && self.gripper_force_capped) {
-                    tracing::warn!(
-                        "Gripper close stopped: feedback_fresh={is_bus_fresh} torque_feedback={has_torque_feedback} while max_close_torque_nm is active; holding"
-                    );
+                    if self.rt_executor_owned {
+                        crate::rt_core::ops::gripper_force_diag()
+                            .record_feedback_unavailable(is_bus_fresh, has_torque_feedback);
+                    } else {
+                        tracing::warn!(
+                            "Gripper close stopped: feedback_fresh={is_bus_fresh} torque_feedback={has_torque_feedback} while max_close_torque_nm is active; holding"
+                        );
+                    }
                 }
                 self.gripper_stalled = true;
                 self.gripper_force_capped = true;
@@ -7428,8 +7472,17 @@ impl SupervisorInner {
                         None => self.gripper_cap_ramp = Some(crate::motion::CapRamp::from_trip(tau_g.abs(), lead)),
                     }
                     let trips = self.gripper_cap_ramp.map_or(1, |r| r.trips);
-                    tracing::warn!("Gripper torque cap: |tau| {:.2} N·m above {:.2} N·m at {p_meas:.3} rad (trip {trips} on this contact); holding",
-                        tau_g.abs(), force_cap.unwrap_or(0.0));
+                    if self.rt_executor_owned {
+                        crate::rt_core::ops::gripper_force_diag().record_cap_trip(
+                            tau_g.abs(),
+                            force_cap.unwrap_or(0.0),
+                            p_meas,
+                            trips,
+                        );
+                    } else {
+                        tracing::warn!("Gripper torque cap: |tau| {:.2} N·m above {:.2} N·m at {p_meas:.3} rad (trip {trips} on this contact); holding",
+                            tau_g.abs(), force_cap.unwrap_or(0.0));
+                    }
                 }
                 self.gripper_stalled = true;
                 self.gripper_force_capped = true;
@@ -7452,7 +7505,12 @@ impl SupervisorInner {
                 // a stream that keeps tripping the cap on one contact is stopped
                 if new_over_cap && self.gripper_stream_target.is_some()
                     && self.gripper_cap_ramp.is_some_and(|r| r.exhausted()) {
-                    tracing::warn!("Gripper torque cap tripped {} times on one contact under a stream; stopping the stream", crate::motion::CAP_RAMP_MAX_TRIPS);
+                    if self.rt_executor_owned {
+                        crate::rt_core::ops::gripper_force_diag()
+                            .record_stream_stopped(crate::motion::CAP_RAMP_MAX_TRIPS);
+                    } else {
+                        tracing::warn!("Gripper torque cap tripped {} times on one contact under a stream; stopping the stream", crate::motion::CAP_RAMP_MAX_TRIPS);
+                    }
                     self.stop_motion();
                 }
             } else if !self.gripper_stalled && gripper_hw_overload && should_latch_hw_overload {
@@ -8099,21 +8157,10 @@ impl SupervisorInner {
         }
 
         // Step-5 owner output-boundary revocation recheck (Linearization 2): if `PolicyAuthorization`
-        // was bumped after Step 4 consumption or on a subsequent tick with no new mailbox frame,
-        // brake immediately before reading `servo_target` so zero policy-derived motion is emitted.
+        // was bumped after Step 4 consumption or mid-tick before servo stepping, brake immediately
+        // so zero policy-derived motion is emitted.
         #[cfg(feature = "policy-runtime")]
-        if let Some(aid) = self
-            .policy_run
-            .as_ref()
-            .filter(|r| {
-                r.mode == crate::policy_runtime::PolicyMode::Live
-                    && r.live_target_auth_gen
-                        .is_some_and(|g| r.authorization.current() != g)
-            })
-            .map(|r| r.action_id)
-        {
-            self.brake_live_policy_in_place(aid);
-        }
+        self.recheck_live_policy_authorization_rt();
 
         // 3.1 Servo streaming (park release / unload settle runs AFTER output acceptance below
         //     so park never advances or cuts torque on a deferred or rejected release).
