@@ -2288,11 +2288,17 @@ impl ShadowRuntime {
                     );
                     return;
                 }
+                // Evaluate the reducer's predicted hold mask at the checkpoint itself (after
+                // Step-2 transition service and RX intake have already applied to `self.state_ref`)
+                // so comparison aligns with live measured-hold selection within the same release.
+                let pred_hold =
+                    crate::torque::reducer::predict_group_hold_mask(self.state_ref(), 0, now_us);
                 let mut rt_actions = ActionSummary {
-                    hold_mask: self.last_release_hold_mask,
+                    hold_mask: pred_hold,
                     ..ActionSummary::default()
                 };
                 self.apply_fault_injection(&mut rt_actions);
+                self.last_release_hold_mask = rt_actions.hold_mask;
                 let gen = self.state_ref().groups[0].stop_generation;
                 self.emit_record(
                     seq,

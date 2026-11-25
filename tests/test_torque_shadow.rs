@@ -2293,3 +2293,330 @@ async fn r1_review_regressions_comparator_remount_unknown_queue_and_disabled_all
         assert_eq!(staging.allocated_capacity(), 0);
     }
 }
+
+/// Regression for real-arm dev18 FailedHold shadow comparison timing:
+/// On release N, `Release` runs before `service_torque_transition` and `poll_hardware_rx`;
+/// when an enable fails into `FailedHold` and per-joint feedback ramps in across releases
+/// (`0x3c -> 0x7c -> 0x7f`), `LiveHoldCheckpoint` must compare against the reducer's
+/// post-transition/post-RX hold prediction rather than the pre-transition `Release` snapshot.
+#[test]
+fn failed_hold_ramp_shadow_comparison_has_zero_divergences() {
+    // 1. Both owners: exact dev18 ramp sequence (`0x0 -> 0x3c -> 0x7c -> 0x7f`) through ShadowRuntime.
+    for owner in [ShadowOwner::Legacy, ShadowOwner::Executor] {
+        let clock = Arc::new(MockClock::new());
+        let tc = TorqueConfig::rebot_dm_default();
+        let (mut rt, hub) = ShadowRuntime::from_torque_config(
+            tc,
+            true,
+            VendorKind::Damiao,
+            Some(clock.clone() as Arc<dyn DriverClock>),
+        );
+        rt.set_owner(owner);
+
+        let mut sample_id = 0u64;
+        let mut push_samples = |rt: &mut ShadowRuntime, now: Instant, channels: &[u8]| {
+            for &ch in channels {
+                sample_id += 1;
+                rt.enqueue_at(
+                    now,
+                    ShadowInputKind::DriverObs(ShadowDriverObs::CausalSample {
+                        channel: ch,
+                        sample_id,
+                        stamp: RxStampKind::Valid {
+                            rx_at: now,
+                            drift_ns: 0,
+                            live_post_settle: true,
+                        },
+                        decode_now: now,
+                        position_rad: 0.0,
+                        velocity_rad_s: Some(0.0),
+                        temperature_c: Some(30.0),
+                        reported_enabled: Some(false),
+                        correlated_after_write_done: None,
+                        poll_issued: None,
+                        provenance: EvidenceProvenance::HardwareCausal,
+                    }),
+                );
+            }
+        };
+
+        // Enable starts cleanly.
+        let op = rt.alloc_live_op_id();
+        rt.enqueue_at(
+            clock.now(),
+            ShadowInputKind::EnableStart {
+                live_op_id: op,
+                live_refusal: None,
+                live_intent: TorqueIntent::On,
+                live_is_torqued: false,
+                live_stopped: false,
+            },
+        );
+
+        // Release 1 (dev18 release 12418): Release runs BEFORE transition failure + J3..J6 RX,
+        // then HandshakeResult::Failed enters FailedHold, then LiveHoldCheckpoint sees 0x3c.
+        clock.advance(Duration::from_millis(20));
+        let t1 = clock.now();
+        rt.enqueue_at(
+            t1,
+            ShadowInputKind::Release {
+                release_seq: 1,
+                live_intent: TorqueIntent::On,
+                live_is_torqued: false,
+                live_stopped: false,
+            },
+        );
+        push_samples(&mut rt, t1, &[2, 3, 4, 5]); // J3..J6 => 0x3c
+        rt.enqueue_at(
+            t1,
+            ShadowInputKind::HandshakeResult {
+                live_op_id: op,
+                confirmed_mask: ChannelMask::EMPTY,
+                outcome: HandshakeOutcome::Failed,
+                live_intent: TorqueIntent::On,
+                live_is_torqued: true,
+                live_stopped: true,
+            },
+        );
+        rt.enqueue_at(
+            t1,
+            ShadowInputKind::LiveHoldCheckpoint {
+                hold_mask: ChannelMask(0x3c),
+                contended: false,
+                escalated: false,
+                live_intent: TorqueIntent::On,
+                live_is_torqued: true,
+                live_stopped: true,
+            },
+        );
+
+        // Release 2 (dev18 release 12419): J7 arrives -> hold mask ramps 0x3c -> 0x7c.
+        clock.advance(Duration::from_millis(20));
+        let t2 = clock.now();
+        rt.enqueue_at(
+            t2,
+            ShadowInputKind::Release {
+                release_seq: 2,
+                live_intent: TorqueIntent::On,
+                live_is_torqued: true,
+                live_stopped: true,
+            },
+        );
+        push_samples(&mut rt, t2, &[2, 3, 4, 5, 6]); // J3..J7 => 0x7c
+        rt.enqueue_at(
+            t2,
+            ShadowInputKind::LiveHoldCheckpoint {
+                hold_mask: ChannelMask(0x7c),
+                contended: false,
+                escalated: false,
+                live_intent: TorqueIntent::On,
+                live_is_torqued: true,
+                live_stopped: true,
+            },
+        );
+
+        // Release 3 (dev18 release 12420): J1, J2 arrive -> hold mask ramps 0x7c -> 0x7f.
+        clock.advance(Duration::from_millis(20));
+        let t3 = clock.now();
+        rt.enqueue_at(
+            t3,
+            ShadowInputKind::Release {
+                release_seq: 3,
+                live_intent: TorqueIntent::On,
+                live_is_torqued: true,
+                live_stopped: true,
+            },
+        );
+        push_samples(&mut rt, t3, &[0, 1, 2, 3, 4, 5, 6]); // J1..J7 => 0x7f
+        rt.enqueue_at(
+            t3,
+            ShadowInputKind::LiveHoldCheckpoint {
+                hold_mask: ChannelMask(0x7f),
+                contended: false,
+                escalated: false,
+                live_intent: TorqueIntent::On,
+                live_is_torqued: true,
+                live_stopped: true,
+            },
+        );
+
+        // Release 4: steady 0x7f.
+        clock.advance(Duration::from_millis(20));
+        let t4 = clock.now();
+        rt.enqueue_at(
+            t4,
+            ShadowInputKind::Release {
+                release_seq: 4,
+                live_intent: TorqueIntent::On,
+                live_is_torqued: true,
+                live_stopped: true,
+            },
+        );
+        push_samples(&mut rt, t4, &[0, 1, 2, 3, 4, 5, 6]);
+        rt.enqueue_at(
+            t4,
+            ShadowInputKind::LiveHoldCheckpoint {
+                hold_mask: ChannelMask(0x7f),
+                contended: false,
+                escalated: false,
+                live_intent: TorqueIntent::On,
+                live_is_torqued: true,
+                live_stopped: true,
+            },
+        );
+
+        rt.flush_and_drain_sync();
+        let snap = hub.snapshot();
+        assert_eq!(snap.last_state.drive_state, DriveState::FailedHold);
+        assert_eq!(
+            snap.taxonomy.missing_action, 0,
+            "owner={owner:?}: FailedHold ramp must produce 0 missing_action divergences: {snap:?}"
+        );
+        assert_eq!(
+            snap.unexplained_divergences_total, 0,
+            "owner={owner:?}: FailedHold ramp must produce 0 unexplained divergences: {snap:?}"
+        );
+        assert_eq!(
+            snap.taxonomy.invariant_violation, 0,
+            "owner={owner:?}: FailedHold ramp must produce 0 invariant violations: {snap:?}"
+        );
+        assert!(
+            snap.comparisons_total >= 4,
+            "owner={owner:?}: expected >= 4 comparisons across FailedHold ramp: {snap:?}"
+        );
+
+        // Negative guard: a genuine live hold mismatch after FailedHold must STILL be flagged.
+        clock.advance(Duration::from_millis(20));
+        let t5 = clock.now();
+        rt.enqueue_at(
+            t5,
+            ShadowInputKind::Release {
+                release_seq: 5,
+                live_intent: TorqueIntent::On,
+                live_is_torqued: true,
+                live_stopped: true,
+            },
+        );
+        push_samples(&mut rt, t5, &[0, 1, 2, 3, 4, 5, 6]);
+        rt.enqueue_at(
+            t5,
+            ShadowInputKind::LiveHoldCheckpoint {
+                hold_mask: ChannelMask(0x7e), // live dropped J1 while reducer predicts 0x7f
+                contended: false,
+                escalated: false,
+                live_intent: TorqueIntent::On,
+                live_is_torqued: true,
+                live_stopped: true,
+            },
+        );
+        rt.flush_and_drain_sync();
+        let snap_neg = hub.snapshot();
+        assert_eq!(
+            snap_neg.taxonomy.extra_action, 1,
+            "owner={owner:?}: genuine missing live hold bit must still be caught as ExtraAction: {snap_neg:?}"
+        );
+    }
+
+    // 2. Live SupervisorInner + FakeCan FailedHold ramp (`0x3c -> 0x7c -> 0x7f`) via RT executor:
+    //    enable fails while only J3..J6 have fresh feedback, then J7 and J1..J2 arrive on the
+    //    following releases. Shadow diagnostics must report 0 divergences.
+    {
+        let clock = Arc::new(MockClock::new());
+        let bus = FakeCan::new(clock.clone());
+        let cfg = build_dm_config(true);
+        let drv = build_dm_driver(bus.clone(), &cfg);
+        let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
+        inner.lease_enabled = false;
+        inner.register_live_connection(1).unwrap();
+        let (mut fx, mut broker, _tw, _stop) = ReleaseFixture::new(
+            inner,
+            BootId(2),
+            Capacities { commands: 8, plans: 1, replies: 16 },
+        );
+
+        // Let initial startup feedback expire so only J3..J6 are fresh when enable fails.
+        // Suppress automatic 0xCC replies in FakeCan so J7 and J1..J2 only arrive when explicitly
+        // injected on the following releases (reproducing the dev18 0x3c -> 0x7c -> 0x7f ramp).
+        clock.advance(Duration::from_millis(300));
+        bus.with(|s| {
+            s.silent_disable = true;
+            s.fail_enable_mask = 0x7f; // Force enable failure into FailedHold.
+            let rx_t = Some(CanRxTime::Monotonic(s.clock.now()));
+            for idx in [2usize, 3, 4, 5] {
+                s.rx.push_back((s.motors[idx].feedback_frame(), rx_t));
+            }
+        });
+        let _ = fx.step();
+
+        let ep = fx.core.safety.epoch_id();
+        let _ = broker
+            .submit(
+                ClientId(1),
+                1,
+                Authority {
+                    lease_generation: 0,
+                    epoch: ep,
+                    stop_generation: 0,
+                    config_revision: 0,
+                    parent_generation: 0,
+                },
+                fx.now() + Duration::from_secs(5),
+                Submit::Transition(TransitionOp::TorqueOn),
+            )
+            .unwrap();
+
+        // Step until enable fails into FailedHold (keeping only J3..J6 fresh: 0x3c).
+        let mut failed = false;
+        for _ in 0..15 {
+            clock.advance(Duration::from_millis(20));
+            bus.with(|s| {
+                let rx_t = Some(CanRxTime::Monotonic(s.clock.now()));
+                for idx in [2usize, 3, 4, 5] {
+                    s.rx.push_back((s.motors[idx].feedback_frame(), rx_t));
+                }
+            });
+            let rep = fx.step();
+            if let Some((_, Outcome::Failed(_))) = rep.transition_ended {
+                failed = true;
+                break;
+            }
+        }
+        assert!(failed, "expected TorqueOn to fail into FailedHold");
+        assert_eq!(fx.core.owner_hold_mask(), 0x3c, "expected initial FailedHold mask 0x3c");
+
+        // Next release: J7 feedback arrives -> hold mask ramps 0x3c -> 0x7c.
+        clock.advance(Duration::from_millis(20));
+        bus.with(|s| {
+            let rx_t = Some(CanRxTime::Monotonic(s.clock.now()));
+            for idx in [2usize, 3, 4, 5, 6] {
+                s.rx.push_back((s.motors[idx].feedback_frame(), rx_t));
+            }
+        });
+        let _ = fx.step();
+        assert_eq!(fx.core.owner_hold_mask(), 0x7c, "expected ramped FailedHold mask 0x7c");
+
+        // Next release: J1 & J2 feedback arrive -> hold mask ramps 0x7c -> 0x7f.
+        clock.advance(Duration::from_millis(20));
+        bus.with(|s| {
+            s.push_all_feedback();
+        });
+        let _ = fx.step();
+        assert_eq!(fx.core.owner_hold_mask(), 0x7f, "expected full FailedHold mask 0x7f");
+
+        fx.core.test_flush_and_drain_torque_shadow();
+        let snap = fx.core.torque_shadow_diagnostics();
+        assert_eq!(snap.last_state.drive_state, DriveState::FailedHold);
+        assert_eq!(
+            snap.taxonomy.missing_action, 0,
+            "live FailedHold ramp must report 0 missing_action divergences: {snap:?}"
+        );
+        assert_eq!(
+            snap.unexplained_divergences_total, 0,
+            "live FailedHold ramp must report 0 unexplained divergences: {snap:?}"
+        );
+        assert_eq!(
+            snap.taxonomy.invariant_violation, 0,
+            "live FailedHold ramp must report 0 invariant violations: {snap:?}"
+        );
+    }
+}
