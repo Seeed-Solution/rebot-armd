@@ -1034,6 +1034,42 @@ fn emit_group_holds(state: &mut TorqueState, g: u8, now_us: u64, actions: &mut A
     }
 }
 
+/// Pure read-only projection of the hold channel mask that [`emit_group_holds`] produces for
+/// `group` in the reducer's current state at `now_us`.
+///
+/// Used by shadow `LiveHoldCheckpoint` after Step-2 transition service and RX intake so hold-mask
+/// comparison aligns with the live measured-hold selection point within the same release (rather
+/// than comparing against the pre-transition/pre-RX `Release` snapshot from earlier in the tick).
+pub fn predict_group_hold_mask(state: &TorqueState, group: u8, now_us: u64) -> ChannelMask {
+    let gi = group as usize;
+    if gi >= usize::from(state.config.group_count) || !group_requires_holds(&state.groups[gi]) {
+        return ChannelMask::EMPTY;
+    }
+    let mut mask = ChannelMask::EMPTY;
+    let active = group_active_channels(state, group);
+    for c in active.iter() {
+        let ch_cfg = state.config.channels[c as usize];
+        let rt = &state.joints[c as usize];
+        let uses_cap = rt.captured_position_rad.is_some()
+            && rt.captured_at_us.is_some()
+            && rt.last_sample_us.is_some();
+        let held = match ch_cfg.role {
+            JointRole::PassiveSensor => false,
+            JointRole::ActiveTool(ActiveToolSafeOutput::StopOutput) => true,
+            JointRole::ActiveTool(ActiveToolSafeOutput::BoundedRetention { max_retention_us }) => {
+                let started = rt.retention_started_us.unwrap_or(now_us);
+                let elapsed = now_us.saturating_sub(started);
+                elapsed >= max_retention_us || uses_cap
+            }
+            JointRole::LoadBearing | JointRole::Gripper(_) => uses_cap,
+        };
+        if held {
+            mask.insert(c);
+        }
+    }
+    mask
+}
+
 // =========================================================================
 // Event::CausalSample & Sliding-Window Rest Gate
 // =========================================================================
