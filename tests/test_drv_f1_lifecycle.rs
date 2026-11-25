@@ -1765,11 +1765,45 @@ async fn drv_f1_blocker1_process_exit_requires_causal_disarm_proof_and_retains_d
         );
     }
 
-    // Part B2: Ordinary Damiao budgeted disable with withheld feedback must return `Unconfirmed`
-    // (never `Confirmed` from TX repeat count), `commit_shutdown()` must reject unconfirmed
-    // hardware, and Legacy `ProcessExit` returning `Unconfirmed` must STILL retain the driver
-    // across `ArmSupervisor::drop` (never dropping an energized driver).
+    // Part B2: Damiao protective budgeted disable (`Thermal`) with withheld feedback must return
+    // `Unconfirmed` (never `Confirmed` from TX repeat count), `commit_shutdown()` must reject
+    // unconfirmed hardware even after ordinary disable software-state updates, and Legacy
+    // `ProcessExit` returning `Unconfirmed` must STILL retain the driver across
+    // `ArmSupervisor::drop` (never dropping an energized driver).
     {
+        let clock_th = MockClock::new();
+        let bus_th = FakeBus::new(&dm_limits(), [0.0; 7], Some(clock_th.clone()));
+        bus_th.with(|s| s.push_all_feedback());
+        let mut drv_th = DamiaoArmDriver::new(bus_th.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(dm_limits())
+            .unwrap();
+        let _ = drv_th.read_joint_states().unwrap();
+        drv_th.set_torque(true).unwrap();
+        bus_th.with(|s| s.withhold_disable_feedback = true);
+        let mut prog = drv_th
+            .begin_disable_torque_budgeted(
+                armd::driver::DisableKind::DisableProtective {
+                    reason: armd::driver::DisableProtectiveReason::Thermal,
+                },
+                0,
+            )
+            .unwrap();
+        let mut steps = 0;
+        while let TorqueProgress::Pending { wake } = prog {
+            let now = clock_th.now();
+            clock_th.advance(wake.saturating_duration_since(now) + Duration::from_millis(1));
+            prog = drv_th
+                .poll_torque_budgeted(clock_th.now() + Duration::from_millis(5), 64)
+                .unwrap();
+            steps += 1;
+            assert!(steps <= 16);
+        }
+        assert_eq!(
+            prog,
+            TorqueProgress::Done(armd::driver::TorqueOutcome::Unconfirmed),
+            "Damiao thermal protective disable must return Unconfirmed when disabled feedback is withheld"
+        );
+
         let (sup, bus, dropped) = make_watched_sup();
         sup.set_lease_enabled(false).await;
         sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();

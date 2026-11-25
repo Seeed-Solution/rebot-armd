@@ -14711,12 +14711,23 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 self.mit_fence = None;
             }
             self.disable_dispatched_mask = 0;
-            // Blocker 1: NEVER report `TorqueOutcome::Confirmed` solely from accepted TX repeats
-            // when any axis has not provided fresh post-enable causal `state == 0` confirmation.
-            let outcome = if self.is_hardware_disarmed_confirmed() {
-                TorqueOutcome::Confirmed
-            } else {
-                TorqueOutcome::Unconfirmed
+            // Blocker 1: Protective disables (`Thermal` / `ProcessExit`) NEVER report
+            // `TorqueOutcome::Confirmed` solely from accepted TX repeats without fresh
+            // post-enable causal `state == 0` confirmation on every axis. Ordinary rest-gated
+            // disables retain Damiao's bounded 3-repeat protocol completion while ownership
+            // release (`commit_shutdown` / `core_is_confirmed_disarmed`) independently requires
+            // `is_hardware_disarmed_confirmed()`.
+            let outcome = match kind {
+                DisableKind::DisableProtective { .. } => {
+                    if self.is_hardware_disarmed_confirmed() {
+                        TorqueOutcome::Confirmed
+                    } else {
+                        TorqueOutcome::Unconfirmed
+                    }
+                }
+                DisableKind::DisableRequested { .. } => {
+                    TorqueOutcome::Confirmed
+                }
             };
             return Ok(TorqueProgress::Done(outcome));
         }
@@ -14850,12 +14861,23 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 self.mit_fence = None;
             }
             self.disable_dispatched_mask = 0;
-            // Blocker 1: NEVER report `TorqueOutcome::Confirmed` solely from accepted TX repeats
-            // when any axis has not provided fresh post-enable causal `state == 0` confirmation.
-            let outcome = if self.is_hardware_disarmed_confirmed() {
-                TorqueOutcome::Confirmed
-            } else {
-                TorqueOutcome::Unconfirmed
+            // Blocker 1: Protective disables (`Thermal` / `ProcessExit`) NEVER report
+            // `TorqueOutcome::Confirmed` solely from accepted TX repeats without fresh
+            // post-enable causal `state == 0` confirmation on every axis. Ordinary rest-gated
+            // disables retain Damiao's bounded 3-repeat protocol completion while ownership
+            // release (`commit_shutdown` / `core_is_confirmed_disarmed`) independently requires
+            // `is_hardware_disarmed_confirmed()`.
+            let outcome = match kind {
+                DisableKind::DisableProtective { .. } => {
+                    if self.is_hardware_disarmed_confirmed() {
+                        TorqueOutcome::Confirmed
+                    } else {
+                        TorqueOutcome::Unconfirmed
+                    }
+                }
+                DisableKind::DisableRequested { .. } => {
+                    TorqueOutcome::Confirmed
+                }
             };
             return Ok(TorqueProgress::Done(outcome));
         }

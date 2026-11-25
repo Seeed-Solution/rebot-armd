@@ -8497,7 +8497,10 @@ fn finalize_process_exit_or_retain_safe_hold(
     lifecycle.safe_hold.mark_exited();
     if disarmed {
         lifecycle.set_owner_state(LC_OWNER_PROCESS_EXIT_DONE);
-        drop(core_slot.take());
+        if let Some(mut c) = core_slot.take() {
+            c.shutdown_committed = true;
+            drop(c);
+        }
         mark_control_exited(exited, control_exited_cv, hub);
         return;
     }
@@ -9083,7 +9086,10 @@ fn control_thread_main_inner(
             if core_is_confirmed_disarmed(core_ref) {
                 core_ref.flush_torque_shadow();
                 lifecycle.set_owner_state(LC_OWNER_DISARMED_EXITED);
-                drop(core_slot.take());
+                if let Some(mut c) = core_slot.take() {
+                    c.shutdown_committed = true;
+                    drop(c);
+                }
                 mark_control_exited(&exited, &control_exited_cv, &hub);
             } else {
                 let safe_hold_bufs = safe_hold_bufs_slot.as_mut().expect("safe_hold_bufs initialized");
@@ -9151,7 +9157,10 @@ fn control_thread_main_inner(
                 let _ = startup_gate.try_settle_failed(SpawnExecutorError::Fatal(msg));
                 *startup_settled = true;
                 lifecycle.set_owner_state(LC_OWNER_DISARMED_EXITED);
-                drop(core_slot.take());
+                if let Some(mut c) = core_slot.take() {
+                    c.shutdown_committed = true;
+                    drop(c);
+                }
                 mark_control_exited(&exited, &control_exited_cv, &hub);
             } else {
                 let _ = startup_gate.try_settle_failed(
@@ -9181,7 +9190,10 @@ fn control_thread_main_inner(
                 ));
                 *startup_settled = true;
                 lifecycle.set_owner_state(LC_OWNER_DISARMED_EXITED);
-                drop(core_slot.take());
+                if let Some(mut c) = core_slot.take() {
+                    c.shutdown_committed = true;
+                    drop(c);
+                }
                 mark_control_exited(&exited, &control_exited_cv, &hub);
                 if matches!(cfg.panic_policy, PanicPolicy::AbortProcess) {
                     crate::diagnostics::logwriter::flush_all(Duration::from_millis(500));
@@ -9910,7 +9922,10 @@ fn control_thread_main_inner(
             return;
         }
         lifecycle.set_owner_state(LC_OWNER_DISARMED_EXITED);
-        drop(core_slot.take());
+        if let Some(mut c) = core_slot.take() {
+            c.shutdown_committed = true;
+            drop(c);
+        }
         mark_control_exited(&exited, &control_exited_cv, &hub);
         if matches!(cfg.panic_policy, PanicPolicy::AbortProcess) {
             crate::diagnostics::logwriter::flush_all(Duration::from_millis(500));
@@ -10058,7 +10073,10 @@ fn control_thread_main_inner(
             );
         } else if core_is_confirmed_disarmed(core_slot.as_deref().expect("core owned")) {
             lifecycle.set_owner_state(LC_OWNER_DISARMED_EXITED);
-            drop(core_slot.take());
+            if let Some(mut c) = core_slot.take() {
+                c.shutdown_committed = true;
+                drop(c);
+            }
             mark_control_exited(&exited, &control_exited_cv, &hub);
         } else {
             run_executor_safe_hold(
@@ -10082,7 +10100,10 @@ fn control_thread_main_inner(
 
     if core_is_confirmed_disarmed(core_slot.as_deref().expect("core owned")) {
         lifecycle.set_owner_state(LC_OWNER_DISARMED_EXITED);
-        drop(core_slot.take());
+        if let Some(mut c) = core_slot.take() {
+            c.shutdown_committed = true;
+            drop(c);
+        }
         mark_control_exited(&exited, &control_exited_cv, &hub);
     } else {
         run_executor_safe_hold(
