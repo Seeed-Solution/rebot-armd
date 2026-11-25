@@ -4918,15 +4918,33 @@ async fn cf1_r4_verify_authority_lease_precedence_and_watchdog_park_inhibit() {
     //    NOT CONFIG_BUSY; and the active lease holder gets CONFIG_BUSY before body parsing.
     {
         let rig = Rig::new(RtOwner::Executor, |cfg| {
-            cfg.lease_timeout_ms = 250;
+            cfg.lease_timeout_ms = 600;
         })
         .await;
         let (base, server_jh) = spawn_http_router(&rig, None, OperatorAuth::disabled()).await;
         let ws_url = format!("{}/api/v1/ws", base.replace("http://", "ws://"));
         let _detached = rig.sup.inner().write().await;
 
-        // Wait for the initial Rig lease to expire naturally (avoids preemption cooldown).
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        let wait_lease_expired = |sup: &Arc<ArmSupervisor>, label: &'static str| {
+            let sup = Arc::clone(sup);
+            async move {
+                let deadline = Instant::now() + Duration::from_secs(3);
+                loop {
+                    if sup
+                        .hub()
+                        .latest()
+                        .is_some_and(|s| !s.owner.is_lease_active_at(Instant::now()))
+                    {
+                        return;
+                    }
+                    assert!(Instant::now() < deadline, "timed out waiting for {label} lease to expire");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        };
+
+        // Wait deterministically for the initial Rig lease to expire naturally (avoids preemption cooldown).
+        wait_lease_expired(&rig.sup, "initial rig").await;
 
         let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
         ws.send(Message::Text(
@@ -4955,7 +4973,7 @@ async fn cf1_r4_verify_authority_lease_precedence_and_watchdog_park_inhibit() {
         };
 
         // Let ws1's lease expire on RT while ws1's connection-local `recv_generation` stays `gen`.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        wait_lease_expired(&rig.sup, "ws1").await;
 
         // Second WS connection acquires the lease without preemption and opens a calibration txn
         // (sets `calibration_busy = true` on RT without PR C Reserve/ConfigHold yet).
@@ -4986,7 +5004,8 @@ async fn cf1_r4_verify_authority_lease_precedence_and_watchdog_park_inhibit() {
         };
         let owner_conn = {
             let mut found = None;
-            for _ in 0..50 {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
                 if let Some(s) = rig.sup.hub().latest() {
                     if s.owner.lease_generation == gen2 {
                         found = s.owner.lease_owner;
@@ -4997,6 +5016,14 @@ async fn cf1_r4_verify_authority_lease_precedence_and_watchdog_park_inhibit() {
             }
             found.expect("hub should publish ws2 lease_owner")
         };
+        // Keep ws2's lease fresh under heavy parallel test load.
+        ws2.send(Message::Text(
+            json!({ "type": "heartbeat", "generation": gen2, "epoch_id": rig.epoch })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
         let txn_id = next_calibration_txn_id();
         let adm2 = capture_config_admission(&rig.sup, 22, gen2, Some(rig.epoch));
         let began = rig
@@ -5045,6 +5072,13 @@ async fn cf1_r4_verify_authority_lease_precedence_and_watchdog_park_inhibit() {
             (704u64, "/api/v1/calibration/apply", json!({ "bogus": true })),
             (705u64, "/api/v1/calibration/restore", json!(123)),
         ] {
+            ws2.send(Message::Text(
+                json!({ "type": "heartbeat", "generation": gen2, "epoch_id": rig.epoch })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
             let reply_busy = ws_send_recv(
                 &mut ws2,
                 json!({
