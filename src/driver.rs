@@ -17217,6 +17217,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     }
 
     fn begin_control_release(&mut self, release_seq: u64) {
+        if self.control_release_id != release_seq {
+            self.tick_tx = None;
+        }
         self.control_release_managed = true;
         self.control_release_id = release_seq;
     }

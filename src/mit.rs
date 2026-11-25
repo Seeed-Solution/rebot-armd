@@ -2632,6 +2632,14 @@ impl CommissioningMachine {
         self.state != CommissioningOpState::Idle
     }
 
+    pub(crate) fn is_running(&self) -> bool {
+        self.state == CommissioningOpState::Running
+    }
+
+    pub(crate) fn is_running_op(&self, op_id: u64) -> bool {
+        self.state == CommissioningOpState::Running && self.active_op_id == op_id
+    }
+
     pub fn active_op_id(&self) -> Option<u64> {
         (self.state != CommissioningOpState::Idle).then_some(self.active_op_id)
     }
@@ -3498,12 +3506,25 @@ impl crate::supervisor::SupervisorInner {
         // right before `can.transmit` (closing B2 with zero allocation). Wrap in `catch_unwind`
         // so ANY panic in `drv.clock_now()` or CAN I/O unconditionally restores `self.driver`
         // before unwinding (never dropping the sole driver or leaving `self.driver == None`).
+        // Supports both `DriverSlot::Exclusive` (RT executor) and `DriverSlot::Legacy`
+        // (non-blocking `try_lock`, yielding on contention so write-guard hold stays <= 2 ms).
+        enum DriverCommStep {
+            Ran(
+                Result<
+                    (),
+                    (
+                        u16,
+                        &'static str,
+                        crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>,
+                    ),
+                >,
+            ),
+            Contended,
+            Unavailable,
+        }
         let mut taken = self.driver.take();
         let step_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            if let Some(drv) = taken
-                .as_mut()
-                .and_then(crate::supervisor_lock::DriverSlot::as_exclusive_mut)
-            {
+            let mut run_with_drv = |drv: &mut dyn crate::driver::ArmDriver| {
                 let drv_now = drv.clock_now();
                 let span = owner_cutoff.saturating_duration_since(owner_now_fn());
                 let drv_cutoff = drv_now + span;
@@ -3527,9 +3548,23 @@ impl crate::supervisor::SupervisorInner {
                 drv.set_tx_release_deadline(None);
                 #[cfg(not(target_arch = "wasm32"))]
                 self.torque_shadow.drain_from_driver(drv);
-                Some(res)
-            } else {
-                None
+                res
+            };
+            match taken.as_mut() {
+                Some(slot) => {
+                    if let Some(drv) = slot.as_exclusive_mut() {
+                        DriverCommStep::Ran(run_with_drv(drv))
+                    } else if let Some(lock) = slot.as_legacy_lock() {
+                        match lock.try_lock() {
+                            Ok(mut guard) => DriverCommStep::Ran(run_with_drv(&mut **guard)),
+                            Err(std::sync::TryLockError::WouldBlock) => DriverCommStep::Contended,
+                            Err(std::sync::TryLockError::Poisoned(_)) => DriverCommStep::Unavailable,
+                        }
+                    } else {
+                        DriverCommStep::Unavailable
+                    }
+                }
+                None => DriverCommStep::Unavailable,
             }
         }));
         self.driver = taken;
@@ -3537,14 +3572,15 @@ impl crate::supervisor::SupervisorInner {
             Ok(r) => r,
             Err(payload) => std::panic::resume_unwind(payload),
         };
-        let Some(step_result) = step_result else {
-            self.abort_running_commissioning(500, "DRIVER", "exclusive driver unavailable");
-            return;
-        };
-
         let _ = ctx;
-        if let Err((status, code, msg_buf)) = step_result {
-            self.abort_running_commissioning_bounded(status, code, msg_buf);
+        match step_result {
+            DriverCommStep::Ran(Ok(())) | DriverCommStep::Contended => {}
+            DriverCommStep::Ran(Err((status, code, msg_buf))) => {
+                self.abort_running_commissioning_bounded(status, code, msg_buf);
+            }
+            DriverCommStep::Unavailable => {
+                self.abort_running_commissioning(500, "DRIVER", "driver unavailable");
+            }
         }
     }
 
@@ -4893,6 +4929,22 @@ pub(crate) async fn run_rt_commissioning_op(
     };
     let op_guard = CommissioningOpGuard::new(std::sync::Arc::clone(sup), op_id);
 
+    // Legacy headless fallback tracking (matches TQ-LOCK pattern):
+    // When a live 50 Hz legacy control loop is ticking, `tick_control_inner` drives
+    // `service_commissioning_release` with a <= 1 ms step budget and zero headless interference.
+    // When no background ticker is running (e.g. headless tests), step every 5 ms after 25 ms
+    // of idle detection while keeping every SupervisorLock write hold <= 1 ms.
+    const FALLBACK_IDLE_DETECT: std::time::Duration = std::time::Duration::from_millis(25);
+    const FALLBACK_HEADLESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
+    let legacy_tick_counter = if sup.owner_mode() == crate::supervisor::OWNER_LEGACY {
+        sup.legacy_tick_seq_counter().await
+    } else {
+        None
+    };
+    let mut last_tick_seq = legacy_tick_counter.as_ref().map_or(0, |(_, s)| *s);
+    let mut last_fallback_step = std::time::Instant::now();
+    let mut headless_active = false;
+
     let snap = loop {
         if let Err((code, _)) = (auth_check)() {
             let reason = match code {
@@ -4960,6 +5012,28 @@ pub(crate) async fn run_rt_commissioning_op(
                 )));
             }
         }
+        if let Some((ref counter, _)) = legacy_tick_counter {
+            if sup.owner_mode() == crate::supervisor::OWNER_LEGACY {
+                let cur_seq = counter.load(std::sync::atomic::Ordering::Acquire);
+                let step_interval = if headless_active {
+                    FALLBACK_HEADLESS_INTERVAL
+                } else {
+                    FALLBACK_IDLE_DETECT
+                };
+                if cur_seq != last_tick_seq {
+                    last_tick_seq = cur_seq;
+                    last_fallback_step = std::time::Instant::now();
+                    headless_active = false;
+                } else if last_fallback_step.elapsed() >= step_interval {
+                    last_fallback_step = std::time::Instant::now();
+                    let (obs_seq, stepped) = sup
+                        .step_legacy_commissioning_headless(op_id, last_tick_seq)
+                        .await;
+                    headless_active = stepped;
+                    last_tick_seq = obs_seq;
+                }
+            }
+        }
         tokio::time::sleep(COMMISSIONING_POLL_INTERVAL).await;
     };
 
@@ -4977,6 +5051,68 @@ fn timeout_unit_json() -> Value {
         "unit_verified": false,
         "note": "50 us per count is documented by Damiao and not verified on this firmware; RAM only (0x55), lost at power-off",
     })
+}
+
+/// Synchronous under-lock preflight for legacy WS `/api/v1/calibration/mit_timeout`.
+/// Performs zero CAN or disk I/O: validates the request body, checks driver/torque-off/busy
+/// preconditions, and reserves a `calibration_txn_id` for non-dry-run RAM writes so the actual
+/// register I/O runs off `SupervisorLock` through the ticked C-F1 commissioning engine.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn check_mit_timeout_legacy_preflight(
+    inner: &mut crate::supervisor::SupervisorInner,
+    body: &Value,
+) -> Result<(TimeoutCommand, Option<u64>), CalibError> {
+    let cmd = parse_timeout_command(&inner.config, body)?;
+    if inner.driver.is_none() {
+        return Err(CalibError::new(400, "UNSUPPORTED", "no motor driver"));
+    }
+    if inner.commissioning.is_occupied() {
+        return Err(CalibError::new(
+            409,
+            "CONFIG_BUSY",
+            "a hardware commissioning operation is already running",
+        ));
+    }
+    if cmd.dry_run {
+        return Ok((cmd, None));
+    }
+    if inner.calibration_busy || inner.core.config().held().is_some() {
+        return Err(CalibError::new(
+            409,
+            "CONFIG_BUSY",
+            "a calibration apply, restore or motor zero is running",
+        ));
+    }
+    if inner.estop_pending() || inner.safety.state().is_stopped() {
+        return Err(CalibError::new(
+            409,
+            "MIT_TIMEOUT_ARMED",
+            "the arm is stopped or faulted; clear the fault first",
+        ));
+    }
+    if inner.is_torqued
+        || inner.disable_pending
+        || inner.torque_transition.is_some()
+        || inner.handover_settling_since.is_some()
+    {
+        return Err(CalibError::new(
+            409,
+            "MIT_TIMEOUT_ARMED",
+            "torque must be off (load mechanically supported) for the TIMEOUT commissioning",
+        ));
+    }
+    if inner.active_trajectory.is_some()
+        || inner.servo_target.is_some()
+        || inner.gravity_comp.is_some()
+        || inner.last_action.as_ref().is_some_and(|a| a.is_running())
+        || inner.macro_run.is_some()
+    {
+        return Err(CalibError::new(409, "MIT_TIMEOUT_ARMED", "a motion is running"));
+    }
+    let txn_id = crate::rt_core::requests::config::next_calibration_txn_id();
+    inner.calibration_busy = true;
+    inner.calibration_txn_id = Some(txn_id);
+    Ok((cmd, Some(txn_id)))
 }
 
 /// Synchronous preflight for executor-mode WS `/api/v1/calibration/mit_timeout`.

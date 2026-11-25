@@ -3463,6 +3463,8 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         generation,
                         epoch,
                         busy,
+                        stamp,
+                        recv_conn_id,
                         &recv_supervisor,
                         &recv_calib,
                         &recv_connection,

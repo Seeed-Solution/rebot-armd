@@ -49,7 +49,7 @@ pub(super) const ENTRIES: &[DispatchEntry] = &[
         admission: AdmissionClass::Ordinary,
         lease: LeaseRequirement::Required,
         auth: AuthRequirement::Operator(None),
-        reply: ReplyPolicy::CommandImmediate,
+        reply: ReplyPolicy::CommandDeferred,
     },
     DispatchEntry {
         key: DispatchKey::command(crate::mit::QUALIFICATION_PATH),
@@ -597,8 +597,17 @@ fn dispatch_calibration_entry(ctx: &mut OwnerDispatchCtx<'_>) -> Option<OwnerRep
 }
 
 /// A calibration command checked under the lock.
-pub(super) enum CalibJob { Apply(Box<crate::calibration::ApplyRequest>), Restore(Value), MotorZero(crate::motor_zero::MotorZeroRequest), JointZeroRestore(String),
-    MitQualification(Box<crate::calibration::CalibrationFile>) }
+pub(super) enum CalibJob {
+    Apply(Box<crate::calibration::ApplyRequest>),
+    Restore(Value),
+    MotorZero(crate::motor_zero::MotorZeroRequest),
+    JointZeroRestore(String),
+    MitTimeout {
+        cmd: crate::mit::TimeoutCommand,
+        txn_id: Option<u64>,
+    },
+    MitQualification(Box<crate::calibration::CalibrationFile>),
+}
 
 /// What a checked calibration command does: a task (job, busy flag set) or a reply under the
 /// lock (motor zero dry run).
@@ -627,8 +636,9 @@ pub(super) fn calibration_job(inner: &mut SupervisorInner, path: &str, body: &Va
         return Ok(CalibStart::Job(CalibJob::MotorZero(req), true));
     }
     if path == crate::mit::TIMEOUT_PATH {
-        // register reads / RAM write of a few motors with torque off, under the lock
-        return inner.mit_timeout_command(body).map(CalibStart::Reply);
+        // Off-lock C-F1 ticked commissioning transaction: zero CAN/disk I/O under SupervisorLock.
+        let (cmd, txn_id) = crate::mit::check_mit_timeout_legacy_preflight(inner, body)?;
+        return Ok(CalibStart::Job(CalibJob::MitTimeout { cmd, txn_id }, false));
     }
     if path == crate::mit::QUALIFICATION_PATH {
         let file = inner.mit_qualification_check(body)?;
@@ -689,6 +699,8 @@ pub(super) fn spawn_calibration_job(
     generation: u64,
     epoch: u64,
     busy: bool,
+    mut stamp: crate::supervisor::AdmissionStamp,
+    conn_id: u64,
     recv_supervisor: &Arc<ArmSupervisor>,
     recv_calib: &crate::calibration::CalibrationDeps,
     recv_connection: &str,
@@ -697,6 +709,65 @@ pub(super) fn spawn_calibration_job(
     ws_auth: &WsAuth,
     worker_tasks: &ConnectionTasks,
 ) {
+    if let CalibJob::MitTimeout { cmd, txn_id } = job {
+        stamp.connection_id = conn_id;
+        stamp.lease_gen = generation;
+        stamp.estop_epoch = epoch;
+        let ws_auth_c = ws_auth.clone();
+        let gen_now_c = recv_generation.clone();
+        let auth_check: Arc<
+            dyn Fn() -> Result<(), (&'static str, crate::supervisor::ArmError)> + Send + Sync,
+        > = Arc::new(move || {
+            if !ws_auth_c.is_operator() {
+                return Err((
+                    "OPERATOR_REQUIRED",
+                    crate::supervisor::ArmError::Rejected {
+                        status: 403,
+                        code: "OPERATOR_REQUIRED".into(),
+                        message: "Operator session expired or locked during calibration".into(),
+                    },
+                ));
+            }
+            if gen_now_c.load(Ordering::SeqCst) != generation {
+                return Err((
+                    "LEASE_LOST",
+                    crate::supervisor::ArmError::Rejected {
+                        status: 409,
+                        code: "LEASE_LOST".into(),
+                        message: "This connection lost the lease during the calibration".into(),
+                    },
+                ));
+            }
+            Ok(())
+        });
+        let pre_guard =
+            txn_id.map(|id| crate::calibration::ExecutorTxnGuard::new(recv_supervisor.clone(), id));
+        let auth = crate::calibration::ExecutorCalibAuth {
+            admission: stamp,
+            lease_holder: Some((crate::model::HolderLabel::new(recv_connection), generation)),
+            operator_grant: ws_auth.operator_grant(),
+            auth_check,
+            txn_id,
+        };
+        let (sup, calib, tx) = (recv_supervisor.clone(), recv_calib.clone(), ack_tx.clone());
+        let req_id_job = request_id.clone();
+        let handle = tokio::spawn(async move {
+            match crate::mit::run_mit_timeout_executor_with_guard(
+                &sup,
+                &calib,
+                cmd,
+                auth,
+                pre_guard,
+            )
+            .await
+            {
+                Ok(v) => fields_ack(&req_id_job, v),
+                Err(e) => calibration_reject(&req_id_job, &e),
+            }
+        });
+        forward_deferred_calib_job(worker_tasks, handle, request_id, tx);
+        return;
+    }
     let (sup, calib, conn, gen_now, tx) = (
         recv_supervisor.clone(),
         recv_calib.clone(),
@@ -744,6 +815,7 @@ pub(super) fn spawn_calibration_job(
                 CalibJob::MotorZero(req) => crate::motor_zero::run(&job_sup, &calib, req, &check).await,
                 CalibJob::JointZeroRestore(name) => crate::motor_zero::restore(&job_sup, &calib, name, &check).await,
                 CalibJob::MitQualification(file) => crate::mit::store_qualification(&job_sup, &calib, *file, &check).await,
+                CalibJob::MitTimeout { .. } => unreachable!("handled above"),
             };
             let _ = job_tx.send(res);
         });

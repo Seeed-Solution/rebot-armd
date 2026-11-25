@@ -9424,6 +9424,35 @@ impl SupervisorInner {
             }
         };
         let invalid_feedback = rx.invalid_feedback;
+        // Legacy ticked hardware commissioning (Step 2b equivalent): advance at most ONE
+        // <= 1 ms bounded step while disarmed so `/api/v1/calibration/mit_timeout` register I/O
+        // runs strictly off the WS handler lock with max write-guard hold <= 2 ms and 0 skipped releases.
+        #[cfg(not(target_arch = "wasm32"))]
+        if !self.pending_rx_poll.active
+            && !self.shutdown_committed
+            && !self.is_torqued
+            && !self.disable_pending
+            && self.torque_transition.is_none()
+            && self.commissioning.is_running()
+            && self
+                .driver
+                .as_ref()
+                .is_some_and(|d| d.as_legacy_lock().is_some())
+        {
+            const LEGACY_COMMISSIONING_STEP_BUDGET: Duration = Duration::from_millis(1);
+            let comm_now = Instant::now();
+            let comm_ctx = crate::rt_core::ops::CommitCtx {
+                arm: self.core.id(),
+                boot: crate::rt_core::broker::BootId::process(),
+                now: comm_now,
+                stop_generation: self.current_stop_gen(),
+            };
+            self.service_commissioning_release(
+                &comm_ctx,
+                comm_now + LEGACY_COMMISSIONING_STEP_BUDGET,
+                &Instant::now,
+            );
+        }
         let driver_torque_lost = rx.driver_torque_lost;
         let driver_enable_confirmed_ok = rx.driver_enable_confirmed_ok;
         let driver_torque_loss_sample_seq = rx.driver_torque_loss_sample_seq;
@@ -14595,6 +14624,64 @@ impl ArmSupervisor {
             }
             _ => Err(crate::rt_core::requests::config::config_unavailable()),
         }
+    }
+
+    /// Returns a lock-free handle to `SupervisorInner::control_release_seq_atomic` plus its current
+    /// sequence value so off-lock legacy commissioning waiters can detect whether a live 50 Hz
+    /// control ticker is actively servicing `service_commissioning_release`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) async fn legacy_tick_seq_counter(&self) -> Option<(Arc<AtomicU64>, u64)> {
+        if self.owner_mode() != OWNER_LEGACY {
+            return None;
+        }
+        let inner = self.inner.read().await;
+        if inner.detached {
+            return None;
+        }
+        let counter = Arc::clone(&inner.control_release_seq_atomic);
+        let cur = counter.load(Ordering::Acquire);
+        Some((counter, cur))
+    }
+
+    /// Headless fallback stepper for legacy ticked commissioning when no background 50 Hz control
+    /// loop is running (mirrors TQ-LOCK headless fallback). Re-verifies under `SupervisorLock::write`
+    /// that `control_release_seq == expected_seq`, then runs at most ONE `<= 1 ms` bounded step.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) async fn step_legacy_commissioning_headless(
+        &self,
+        op_id: u64,
+        expected_seq: u64,
+    ) -> (u64, bool) {
+        const LEGACY_HEADLESS_COMM_BUDGET: Duration = Duration::from_millis(1);
+        let mut inner = self.inner.write().await;
+        inner.set_command(crate::mit::TIMEOUT_PATH);
+        if inner.detached
+            || inner.control_release_seq != expected_seq
+            || !inner.commissioning.is_running_op(op_id)
+        {
+            return (inner.control_release_seq, false);
+        }
+        inner.control_release_seq = inner.control_release_seq.wrapping_add(1).max(1);
+        inner
+            .control_release_seq_atomic
+            .store(inner.control_release_seq, Ordering::Release);
+        let seq = inner.control_release_seq;
+        if let Some(ref mut slot) = inner.driver {
+            let _ = slot.try_with_mut(|drv| drv.begin_control_release(seq));
+        }
+        let step_now = Instant::now();
+        let ctx = crate::rt_core::ops::CommitCtx {
+            arm: inner.core.id(),
+            boot: crate::rt_core::broker::BootId::process(),
+            now: step_now,
+            stop_generation: inner.current_stop_gen(),
+        };
+        inner.service_commissioning_release(
+            &ctx,
+            step_now + LEGACY_HEADLESS_COMM_BUDGET,
+            &Instant::now,
+        );
+        (seq, true)
     }
 
     /// Routes one [`ConfigRequest`] through the active single owner (`Legacy` write lock or
