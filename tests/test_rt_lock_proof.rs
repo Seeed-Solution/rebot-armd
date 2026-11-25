@@ -1383,3 +1383,308 @@ fn production_executor_mock_positive_control_counts_and_catches_try_read_on_armd
         });
     });
 }
+
+#[test]
+fn terminal_capture_lock_proof_action_completion_dwell_saturation_and_positive_controls() {
+    use armd::driver::{ArmDriverError, DriverCapabilities, EnableState, JointTarget};
+    use armd::model::JointState;
+    use std::sync::atomic::AtomicUsize;
+
+    struct CaptureAuditDriver {
+        dof: usize,
+        positions: Vec<f32>,
+        in_capture: Arc<AtomicBool>,
+        driver_calls_during_capture: Arc<AtomicUsize>,
+    }
+
+    impl CaptureAuditDriver {
+        fn note_call(&self) {
+            if self.in_capture.load(Ordering::Acquire) {
+                self.driver_calls_during_capture.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+    }
+
+    impl armd::driver::ArmDriver for CaptureAuditDriver {
+        fn capabilities(&self) -> DriverCapabilities {
+            self.note_call();
+            DriverCapabilities {
+                velocity_feedback: true,
+                torque_feedback: true,
+                temperature_feedback: true,
+                torque_feedforward: false,
+                enable_feedback: true,
+                load_feedback: false,
+            }
+        }
+        fn enable_state(&self) -> EnableState {
+            self.note_call();
+            EnableState::Enabled
+        }
+        fn is_feedback_valid(&self) -> bool {
+            self.note_call();
+            true
+        }
+        fn feedback_ages(&self) -> Vec<Option<Duration>> {
+            self.note_call();
+            vec![Some(Duration::from_millis(5)); self.dof]
+        }
+        fn feedback_instants(&self) -> Vec<Option<Instant>> {
+            self.note_call();
+            vec![Some(Instant::now()); self.dof]
+        }
+        fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool {
+            self.note_call();
+            dof == self.dof && max_age >= Duration::from_millis(5)
+        }
+        fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+            self.note_call();
+            Ok(self
+                .positions
+                .iter()
+                .map(|&p| JointState {
+                    position: p,
+                    velocity: 0.0,
+                    torque: 0.0,
+                    temperature: 30.0,
+                })
+                .collect())
+        }
+        fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
+            self.note_call();
+            for (dst, t) in self.positions.iter_mut().zip(targets.iter()) {
+                *dst = t.position;
+            }
+            Ok(())
+        }
+        fn set_torque(&mut self, _enable: bool) -> Result<(), ArmDriverError> {
+            self.note_call();
+            Ok(())
+        }
+    }
+
+    run_bounded_fixture(Duration::from_secs(15), "terminal-capture-lock-proof", |deadline| {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let in_capture = Arc::new(AtomicBool::new(false));
+            let driver_calls_during_capture = Arc::new(AtomicUsize::new(0));
+            let drv = CaptureAuditDriver {
+                dof: 7,
+                positions: vec![0.0; 7],
+                in_capture: Arc::clone(&in_capture),
+                driver_calls_during_capture: Arc::clone(&driver_calls_during_capture),
+            };
+            let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
+            sup.set_lease_enabled(false).await;
+            sup.test_set_terminal_capture_drain_paused(true);
+            sup.test_set_terminal_capture_push_cap(3);
+
+            // 1) Hold `TerminalBroadcaster`'s internal mutex on another OS thread throughout
+            //    action completion, 30 dwell ticks, and ring saturation (6 actions > cap 3).
+            //    If `tick_shared`, `finish_action` (with defer), or `capture_edge_terminals`
+            //    ever locked `TerminalBroadcaster`, this would deadlock / trip timeout.
+            let (held_tx, held_rx) = mpsc::channel();
+            let (rel_tx, rel_rx) = mpsc::channel();
+            let sup_h = Arc::clone(&sup);
+            let tb_holder = thread::spawn(move || {
+                let _guard = sup_h.test_lock_terminal_broadcaster();
+                let _ = held_tx.send(());
+                let _ = rel_rx.recv();
+            });
+            held_rx.recv_timeout(Duration::from_secs(2)).expect("broadcaster lock held");
+
+            // Track driver calls strictly during `capture_edge_terminals`.
+            let in_cap_enter = Arc::clone(&in_capture);
+            sup.inner().write().await.terminal_capture_test_hook = Some(Arc::new(move |_| {
+                in_cap_enter.store(true, Ordering::Release);
+            }));
+
+            // Real in-tick trajectory completions + 30 dwell ticks + saturation (6 total actions
+            // into push_cap=3). `terminal_capture_test_hook` arms `in_capture` BEFORE
+            // `TerminalCaptureRecord::capture_from` AND SPSC push so any driver mutex call in
+            // record construction or ring flush is caught.
+            for i in 0..6 {
+                let delta = if i % 2 == 0 { 0.02 } else { -0.02 };
+                sup.inner().write().await.test_start_zero_heap_jog_rt(delta, 0.04);
+                let target_total = (i + 1) as u64;
+                for _ in 0..40 {
+                    in_capture.store(false, Ordering::Release);
+                    sup.control_tick(0.02).await;
+                    in_capture.store(false, Ordering::Release);
+                    let st = sup.test_terminal_capture_stats();
+                    if st.captured + st.saturated >= target_total {
+                        break;
+                    }
+                }
+                if i == 0 {
+                    // 30 dwell ticks after first completion: 0 extra captures, 0 broadcaster locks.
+                    for _ in 0..30 {
+                        in_capture.store(false, Ordering::Release);
+                        sup.control_tick(0.02).await;
+                        in_capture.store(false, Ordering::Release);
+                    }
+                    assert_eq!(sup.test_terminal_capture_stats().captured, 1);
+                }
+            }
+            let stats = sup.test_terminal_capture_stats();
+            assert_eq!(stats.captured, 3, "push_cap=3: {stats:?}");
+            assert_eq!(stats.saturated, 3, "3 actions must saturate: {stats:?}");
+            assert!(stats.ever_saturated);
+            assert_eq!(
+                driver_calls_during_capture.load(Ordering::Acquire),
+                0,
+                "capture_edge_terminals must acquire ZERO driver mutexes"
+            );
+
+            // 2) Positive controls inside `capture_edge_terminals`:
+            //    (a) Injected broadcaster mutex try_lock fails (`WouldBlock`) while held;
+            //    (b) Injected driver mutex call (`hardware_feedback_fresh`) increments driver counter 0 -> 1.
+            let sup_probe = Arc::clone(&sup);
+            let tb_try_locked = Arc::new(AtomicBool::new(true));
+            let tb_try_locked_c = Arc::clone(&tb_try_locked);
+            let in_cap_pos = Arc::clone(&in_capture);
+            sup.inner().write().await.terminal_capture_test_hook = Some(Arc::new(move |inner| {
+                tb_try_locked_c.store(sup_probe.test_try_lock_terminal_broadcaster(), Ordering::Release);
+                in_cap_pos.store(true, Ordering::Release);
+                let _ = inner.hardware_feedback_fresh(Duration::from_millis(250));
+                in_cap_pos.store(false, Ordering::Release);
+            }));
+            sup.control_tick(0.02).await;
+            sup.inner().write().await.terminal_capture_test_hook = None;
+
+            assert!(
+                !tb_try_locked.load(Ordering::Acquire),
+                "positive control: injected broadcaster lock inside capture MUST fail contention check"
+            );
+            assert!(
+                driver_calls_during_capture.load(Ordering::Acquire) >= 1,
+                "positive control: injected driver mutex call inside capture MUST be detected"
+            );
+
+            let _ = rel_tx.send(());
+            tb_holder.join().unwrap();
+
+            // 3) Positive control on `armd-control` RT executor: `SupervisorLock::try_read` inside
+            //    `terminal_capture_test_hook` panics and bumps `control_thread_attempts()` 0 -> 1,
+            //    whereas clean capture under `DetachedLegacyWriterHold` keeps attempts == 0.
+            let sup_rt = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+            sup_rt.set_lease_enabled(false).await;
+            sup_rt.register_ws_connection(1).await.unwrap();
+            sup_rt
+                .enable_torque(sup_rt.capture_admission_stamp())
+                .await
+                .unwrap();
+            let inner_lock = Arc::clone(sup_rt.inner());
+            let probe_armed = Arc::new(AtomicBool::new(false));
+            let probe_caught = Arc::new(AtomicBool::new(false));
+            let armed_c = Arc::clone(&probe_armed);
+            let caught_c = Arc::clone(&probe_caught);
+            sup_rt.inner().write().await.terminal_capture_test_hook = Some(Arc::new(move |_| {
+                if !armed_c.swap(false, Ordering::AcqRel) {
+                    return;
+                }
+                assert!(on_rt_control_thread());
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _ = inner_lock.try_read();
+                }));
+                assert!(res.is_err(), "injected SupervisorLock::try_read in capture must panic");
+                caught_c.store(true, Ordering::Release);
+            }));
+
+            let cfg_snap = Arc::new(
+                armd::rt_core::requests::motion::MotionConfigSnapshot::from_supervisor(
+                    &*sup_rt.inner().read().await,
+                ),
+            );
+            let handle = sup_rt
+                .start_executor_with_hooks(
+                    ExecutorConfig::for_tests(Duration::from_millis(5)),
+                    PersistTestHooks::default(),
+                )
+                .await
+                .unwrap();
+            let writer_hold = DetachedLegacyWriterHold::acquire(Arc::clone(&sup_rt), deadline);
+            // Drive an actual RT jog completion + dwell under `DetachedLegacyWriterHold`.
+            wait_until_deadline(deadline, "initial RT publication", || {
+                sup_rt.hub().published_seq() >= 2
+            });
+            let snap = sup_rt.hub().latest().unwrap();
+            let from = snap.rt.commanded_positions.clone();
+            let mut to = from.clone();
+            to[0] += 0.02;
+            let msnap = armd::rt_core::requests::motion::MotionPlanSnapshot {
+                config: cfg_snap,
+                commanded_positions: from.clone(),
+                commanded_velocities: vec![0.0; from.len()],
+                measured_positions: from,
+                torque_hold: None,
+                power_hold: None,
+                holding_after_clear: false,
+                mit_active: false,
+                authority: armd::rt_core::requests::motion::PlanAuthority {
+                    boot: snap.rt.boot_id,
+                    epoch: snap.obs.epoch_id,
+                    lease_generation: 0,
+                    stop_generation: snap.rt.stop_generation,
+                    deadline: Instant::now() + Duration::from_secs(5),
+                },
+                workspace_revision: snap.rt.workspace_revision,
+                motion_config_revision: snap.rt.motion_config_revision,
+            };
+            let jog_slot = armd::rt_core::requests::motion::prepare_motion(
+                &msnap,
+                &armd::rt_core::requests::motion::MotionRequest::jog(to, Some(0.05), None),
+            )
+            .unwrap()
+            .slot;
+            let auth = armd::rt_core::broker::Authority {
+                lease_generation: 0,
+                epoch: snap.obs.epoch_id,
+                stop_generation: snap.rt.stop_generation,
+                config_revision: 0,
+                parent_generation: 0,
+            };
+            let _ = handle
+                .broker()
+                .lock()
+                .unwrap()
+                .submit(
+                    armd::rt_core::broker::ClientId(1),
+                    1,
+                    auth,
+                    Instant::now() + Duration::from_secs(5),
+                    armd::rt_core::broker::Submit::Install(&move |s: &mut armd::rt_core::ops::PlanSlot| {
+                        armd::rt_core::requests::motion::stage_jog(s, &jog_slot);
+                    }),
+                )
+                .unwrap();
+            wait_until_deadline(deadline, "RT jog completion captured under detached writer hold", || {
+                sup_rt.test_terminal_capture_stats().captured >= 1
+            });
+            let cap_after_jog = sup_rt.test_terminal_capture_stats().captured;
+            let seq0 = sup_rt.hub().published_seq();
+            wait_until_deadline(deadline, "RT dwell releases under detached writer hold", || {
+                sup_rt.hub().published_seq() >= seq0 + 5
+            });
+            assert_eq!(
+                sup_rt.test_terminal_capture_stats().captured,
+                cap_after_jog,
+                "RT dwell must not re-capture completed jog"
+            );
+            assert_eq!(sup_rt.inner().control_thread_attempts(), 0);
+
+            probe_armed.store(true, Ordering::Release);
+            wait_until_deadline(deadline, "capture hook SupervisorLock positive control", || {
+                probe_caught.load(Ordering::Acquire)
+            });
+            assert_eq!(sup_rt.inner().control_thread_attempts(), 1);
+
+            writer_hold.release();
+            handle.stop_and_join();
+        });
+    });
+}
