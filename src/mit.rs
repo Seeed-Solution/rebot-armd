@@ -892,10 +892,19 @@ impl crate::supervisor::SupervisorInner {
         if self.urgent_stop_unapplied() || self.disconnect_fence_blocks_output() {
             return TickOutput::None;
         }
+        let is_hold = self.safety.state().is_stopped();
+        // Capture the client lease generation BEFORE `post_stop_check_hook` and BEFORE locking
+        // the driver so even a disconnect arriving in that exact window is caught at the driver's
+        // single TX choke point (`DamiaoArmDriver::send`). Autonomous safety motions
+        // (`watchdog_park`, `pending_normal_unload`) and stopped holds carry `0` (lease-exempt).
+        let output_lease_gen = if !is_hold && self.watchdog_park.is_none() && !self.pending_normal_unload {
+            self.current_active_lease_gen()
+        } else {
+            0
+        };
         if let Some(ref hook) = self.post_stop_check_hook {
             hook();
         }
-        let is_hold = self.safety.state().is_stopped();
         // Every J7 `Target` carries the `(stop_gen, estop_epoch)` from the A1 `AdmissionStamp` of
         // the command that produced it (`self.j7_admitted_stamp`). It is NEVER re-stamped later
         // and NEVER stamped with `max(local, requested)`, so any STOP accepted after admission —
@@ -1007,7 +1016,7 @@ impl crate::supervisor::SupervisorInner {
                 let j7_hold_hint = is_hold
                     || computed_j7_intent.is_some_and(|intent| {
                         !matches!(intent.kind, crate::driver::PosForceIntentKind::Target { .. })
-                            || intent.stamp != non_target_stamp
+                            || intent.stamp.is_stale_against(non_target_stamp)
                     });
                 drv.set_pending_pos_force_hold_hint(j7_hold_hint);
                 // Single TX cutoff choke point under the driver lock:
@@ -1034,9 +1043,13 @@ impl crate::supervisor::SupervisorInner {
                     }
                 }
                 let write_res = if is_hold {
+                    drv.set_output_lease_gen(0);
                     drv.write_estop_hold_bounded(targets)
                 } else {
-                    drv.write_joint_targets_bounded(targets)
+                    drv.set_output_lease_gen(output_lease_gen);
+                    let r = drv.write_joint_targets_bounded(targets);
+                    drv.set_output_lease_gen(0);
+                    r
                 };
                 let now = drv.clock_now();
                 if !is_hold
@@ -1075,6 +1088,9 @@ impl crate::supervisor::SupervisorInner {
                         format_args!("MIT batch write failed: {}", crate::driver::ESTOP_INHIBITED),
                     );
                     self.mit_lose_bounded(reason, crate::safety::FaultCode::BusLoss);
+                }
+                TickOutput::LeaseFenced => {
+                    self.j7_intent = Some(PosForceIntent::hold(self.current_j7_intent_stamp()));
                 }
                 TickOutput::Error { message, .. } => {
                     self.j7_intent = Some(PosForceIntent::stop(self.current_j7_intent_stamp()));

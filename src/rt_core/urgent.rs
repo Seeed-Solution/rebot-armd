@@ -225,20 +225,71 @@ impl EstopRequestedSource {
 /// Requested vs applied E-stop generations of one arm, and optionally its authorized-stop
 /// generations ([`Self::with_stops`]): the output gate.
 #[derive(Debug, Clone)]
+/// Lock-free view of the arm's live lease generation and fence-first disconnect atomics,
+/// carried on [`EstopGate`] so the driver's single TX choke point (`DamiaoArmDriver::send`)
+/// and the single J7 emitter drop stale client-lease motion frames immediately after a
+/// disconnect, release, preemption, or expiry without acquiring any lock.
+pub struct LeaseGate {
+    current_gen: Arc<AtomicU64>,
+    fenced_gen: Arc<AtomicU64>,
+    pending_disconnect_hold: Arc<AtomicU64>,
+}
+
+impl LeaseGate {
+    pub fn new(
+        current_gen: Arc<AtomicU64>,
+        fenced_gen: Arc<AtomicU64>,
+        pending_disconnect_hold: Arc<AtomicU64>,
+    ) -> Self {
+        Self { current_gen, fenced_gen, pending_disconnect_hold }
+    }
+
+    /// Current unfenced live lease generation (`0` when no lease, fenced, or disconnect pending).
+    #[inline]
+    pub fn current_lease_gen(&self) -> u64 {
+        if self.pending_disconnect_hold.load(Ordering::SeqCst) > 0 {
+            return 0;
+        }
+        let cur = self.current_gen.load(Ordering::SeqCst);
+        let fenced = self.fenced_gen.load(Ordering::SeqCst);
+        if cur > 0 && cur > fenced { cur } else { 0 }
+    }
+
+    /// True when a motion frame produced under `entry_lease_gen` (`> 0`) has been fenced by
+    /// disconnect, release, preemption, or expiry. `entry_lease_gen == 0` (stop/hold, autonomous
+    /// watchdog park/unload, or lease-disabled) is never fenced.
+    #[inline]
+    pub fn is_fenced(&self, entry_lease_gen: u64) -> bool {
+        if entry_lease_gen == 0 {
+            return false;
+        }
+        if self.pending_disconnect_hold.load(Ordering::SeqCst) > 0 {
+            return true;
+        }
+        let fenced = self.fenced_gen.load(Ordering::SeqCst);
+        if entry_lease_gen <= fenced {
+            return true;
+        }
+        self.current_gen.load(Ordering::SeqCst) != entry_lease_gen
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct EstopGate {
     requested: EstopRequestedSource,
     applied: Arc<AtomicU64>,
     stops: Option<StopRequests>,
+    lease: Option<LeaseGate>,
 }
 
 impl EstopGate {
     pub fn new(requested: Arc<AtomicU64>, applied: Arc<AtomicU64>) -> Self {
-        Self { requested: EstopRequestedSource::Raw(requested), applied, stops: None }
+        Self { requested: EstopRequestedSource::Raw(requested), applied, stops: None, lease: None }
     }
 
     /// Builds a gate reading directly from the arm's single packed [`EstopState`].
     pub fn from_state(state: Arc<EstopState>, applied: Arc<AtomicU64>) -> Self {
-        Self { requested: EstopRequestedSource::Packed(state), applied, stops: None }
+        Self { requested: EstopRequestedSource::Packed(state), applied, stops: None, lease: None }
     }
 
     /// The gate also holds output while an authorized stop is requested and not applied
@@ -246,6 +297,13 @@ impl EstopGate {
     /// still stops the remaining frames.
     pub fn with_stops(mut self, stops: StopRequests) -> Self {
         self.stops = Some(stops);
+        self
+    }
+
+    /// Attaches the arm's lock-free lease fence atomics so the driver TX choke point drops
+    /// stale client-lease motion frames immediately after disconnect, release, preemption, or expiry.
+    pub fn with_lease_gate(mut self, lease: LeaseGate) -> Self {
+        self.lease = Some(lease);
         self
     }
 
@@ -272,6 +330,19 @@ impl EstopGate {
             self.requested.generation(),
             self.stops.as_ref().map_or(0, StopRequests::current),
         )
+    }
+
+    /// Current live unfenced lease generation (`0` when no lease gate is attached, no active
+    /// lease exists, or a disconnect fence is active).
+    #[inline]
+    pub fn current_lease_gen(&self) -> u64 {
+        self.lease.as_ref().map_or(0, LeaseGate::current_lease_gen)
+    }
+
+    /// True when a motion frame produced under `entry_lease_gen` (`> 0`) has been fenced.
+    #[inline]
+    pub fn is_lease_fenced(&self, entry_lease_gen: u64) -> bool {
+        self.lease.as_ref().is_some_and(|l| l.is_fenced(entry_lease_gen))
     }
 }
 

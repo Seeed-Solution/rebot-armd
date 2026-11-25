@@ -189,6 +189,9 @@ pub enum ArmDriverError {
     #[error("{ESTOP_INHIBITED}")]
     EstopInhibited,
 
+    #[error("motion target dropped: lease generation fenced")]
+    LeaseFenced,
+
     #[error("MIT deadline fence tripped: {0}")]
     MitFenceTripped(MitFenceTripReason),
 
@@ -446,6 +449,21 @@ pub struct PosForceIntentStamp {
     pub stop_gen: u64,
     /// Safety / E-stop epoch (`SupervisorInner::safety.epoch_id()` / `EstopGate::estop_gen`).
     pub estop_epoch: u64,
+    /// Lease generation under which a `Target` intent was produced (`0` when hold/stop-class
+    /// or not bound to a client lease).
+    pub lease_gen: u64,
+}
+
+impl PosForceIntentStamp {
+    /// True when a `Target` intent stamped with `self` is stale relative to `current`:
+    /// stop generation or safety epoch changed, or a client-lease target (`self.lease_gen != 0`)
+    /// no longer matches `current.lease_gen`.
+    #[inline]
+    pub const fn is_stale_against(self, current: Self) -> bool {
+        self.stop_gen != current.stop_gen
+            || self.estop_epoch != current.estop_epoch
+            || (self.lease_gen != 0 && self.lease_gen != current.lease_gen)
+    }
 }
 
 /// Desired position-force J7 gripper action before stop-generation / epoch resolution.
@@ -972,6 +990,10 @@ pub trait ArmDriver: Send {
     /// [`ESTOP_INHIBITED`]). Default: the driver does not check (the tick checks before its
     /// output).
     fn set_estop_gate(&mut self, _gate: crate::rt_core::urgent::EstopGate) {}
+
+    /// Sets the client lease generation (`0` for hold/autonomous/lease-disabled output) stamped on
+    /// motion target entries queued by the immediately following [`Self::write_joint_targets_bounded`].
+    fn set_output_lease_gen(&mut self, _lease_gen: u64) {}
 
     /// Set the gripper joint index if the arm model defines a gripper
     fn set_gripper_index(&mut self, _index: Option<usize>) {}
@@ -3127,6 +3149,8 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     can: C,
     /// Checked before each frame of a target batch (`ArmDriver::set_estop_gate`).
     estop_gate: Option<crate::rt_core::urgent::EstopGate>,
+    /// Client lease generation stamped onto queued motion target frames (`0` for hold/autonomous).
+    output_lease_gen: u64,
     /// Atomic E-stop latch (`ArmDriver::set_abort_flag`), checked before enable transmissions.
     abort_flag: Option<Arc<AtomicBool>>,
     /// Authoritative packed E-stop state (`ArmDriver::set_estop_state`).
@@ -3417,6 +3441,8 @@ enum TxRefusal {
     BuildRefused,
     /// Step 5: stop/E-stop generation stamp changed since admission or operation start.
     StopStampChanged,
+    /// Step 3/5: motion frame's client lease generation was fenced (disconnect/release/preempt/expiry).
+    LeaseFenced,
     /// Step 6: underlying CAN transport returned an error (backpressure already marked on pass).
     Transport(TransportError),
 }
@@ -3452,6 +3478,8 @@ struct PendingTxFrame {
     cmd: PendingTargetCmd,
     queued_at: Instant,
     stop_stamp: StopStamp,
+    /// Client lease generation under which this motion target was produced (`0` for hold/autonomous).
+    lease_gen: u64,
     /// Counted once in `tx_deferred` per command instance; reset on in-place target replacement.
     was_deferred: bool,
 }
@@ -3609,6 +3637,27 @@ impl PendingTxQueue {
             .any(|slot| slot.is_some_and(|e| e.stop_stamp != current))
     }
 
+    /// Drop entries whose client lease generation has been fenced, compacting in place.
+    fn drop_fenced_lease(&mut self, mut is_fenced: impl FnMut(u64) -> bool) -> usize {
+        let mut write = 0usize;
+        let mut dropped = 0usize;
+        for read in 0..self.len {
+            if let Some(entry) = self.buf[read] {
+                if is_fenced(entry.lease_gen) {
+                    dropped += 1;
+                } else {
+                    self.buf[write] = Some(entry);
+                    write += 1;
+                }
+            }
+        }
+        for slot in &mut self.buf[write..self.len] {
+            *slot = None;
+        }
+        self.len = write;
+        dropped
+    }
+
     /// Remove every queued entry targeting `joint`, compacting in place (zero allocation).
     fn remove_joint(&mut self, joint: usize) {
         let mut write = 0usize;
@@ -3639,15 +3688,20 @@ impl PendingTxQueue {
         cmd: PendingTargetCmd,
         queued_at: Instant,
         stop_stamp: StopStamp,
+        lease_gen: u64,
     ) -> bool {
         if let Some(idx) = self.find_key(joint, frame_id) {
-            if let Some(prev) = self.buf[idx].filter(|prev| prev.stop_stamp == stop_stamp) {
+            if let Some(prev) = self
+                .buf[idx]
+                .filter(|prev| prev.stop_stamp == stop_stamp && prev.lease_gen == lease_gen)
+            {
                 self.buf[idx] = Some(PendingTxFrame {
                     joint,
                     frame_id,
                     cmd,
                     queued_at: prev.queued_at,
                     stop_stamp,
+                    lease_gen,
                     was_deferred: false,
                 });
                 return true;
@@ -3667,6 +3721,7 @@ impl PendingTxQueue {
             cmd,
             queued_at,
             stop_stamp,
+            lease_gen,
             was_deferred: false,
         });
         self.len += 1;
@@ -3838,6 +3893,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             mit_fence: None,
             mit_fence_last_cmd: vec![None; dof],
             estop_gate: None,
+            output_lease_gen: 0,
             abort_flag: None,
             estop_state: None,
             rt_no_sleep: false,
@@ -3925,7 +3981,21 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         StopStamp { estop_gen, stop_gen }
     }
 
-    /// Current driver-gate `(stop_gen, estop_epoch)` stamp for direct-driver callers of
+    #[inline]
+    fn current_lease_gen(&self) -> u64 {
+        self.estop_gate
+            .as_ref()
+            .map_or(0, crate::rt_core::urgent::EstopGate::current_lease_gen)
+    }
+
+    #[inline]
+    fn is_lease_fenced(&self, entry_lease_gen: u64) -> bool {
+        self.estop_gate
+            .as_ref()
+            .is_some_and(|g| g.is_lease_fenced(entry_lease_gen))
+    }
+
+    /// Current driver-gate `(stop_gen, estop_epoch, lease_gen)` stamp for direct-driver callers of
     /// [`ArmDriver::emit_pos_force_j7`].
     #[inline]
     pub fn current_j7_intent_stamp(&self) -> PosForceIntentStamp {
@@ -3933,6 +4003,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         PosForceIntentStamp {
             stop_gen: s.stop_gen,
             estop_epoch: s.estop_gen,
+            lease_gen: self.current_lease_gen(),
         }
     }
 
@@ -4311,6 +4382,18 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         fenced: bool,
         build: impl FnOnce(&Self) -> Option<CanFrame>,
     ) -> Result<CanFrame, TxRefusal> {
+        self.send_with_lease(kind, expected_stamp, 0, deadline, fenced, build)
+    }
+
+    fn send_with_lease(
+        &mut self,
+        kind: impl DamiaoTxKind,
+        expected_stamp: Option<StopStamp>,
+        expected_lease_gen: u64,
+        deadline: Option<Deadline>,
+        fenced: bool,
+        build: impl FnOnce(&Self) -> Option<CanFrame>,
+    ) -> Result<CanFrame, TxRefusal> {
         let has_pos_force_token = kind.pos_force_token().is_some();
         let kind = kind.tx_kind();
         // 1. Deadline check (inclusive: now >= deadline.at).
@@ -4327,8 +4410,11 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             }
         }
 
-        // 3. Stop gate by TxKind.
+        // 3. Stop gate and lease fence by TxKind (stop/hold-class and Disable are lease-exempt).
         let latched_before = self.stop_gate_for_kind(kind)?;
+        if matches!(kind, TxKind::Target) && self.is_lease_fenced(expected_lease_gen) {
+            return Err(TxRefusal::LeaseFenced);
+        }
 
         // 4. MIT deadline fence (when fenced) + build frame fresh at send time.
         if fenced {
@@ -4355,9 +4441,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             return Err(TxRefusal::BuildRefused);
         };
 
-        // 5. Re-read physical stop latch, pending gate, stop-generation stamp, MIT fence,
-        //    position-force submission freshness, deadline, and tick TX cutoff AFTER `build`,
-        //    immediately before `can.transmit` (host submission boundary).
+        // 5. Re-read physical stop latch, pending gate, stop-generation stamp, lease fence,
+        //    MIT fence, position-force submission freshness, deadline, and tick TX cutoff AFTER
+        //    `build`, immediately before `can.transmit` (host submission boundary).
         let latched_after = self.stop_gate_for_kind(kind)?;
         if matches!(kind, TxKind::RollbackHold(_)) && !latched_before && latched_after {
             return Err(TxRefusal::StopInhibited);
@@ -4366,6 +4452,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             && expected_stamp.is_some_and(|stamp| self.current_stop_stamp() != stamp)
         {
             return Err(TxRefusal::StopStampChanged);
+        }
+        if matches!(kind, TxKind::Target) && self.is_lease_fenced(expected_lease_gen) {
+            return Err(TxRefusal::LeaseFenced);
         }
         if fenced {
             if let Err(ArmDriverError::MitFenceTripped(reason)) = self.fence_check() {
@@ -5189,6 +5278,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             TxRefusal::DeadlinePassed => ArmDriverError::Transport(TransportError::Timeout),
             TxRefusal::Deferred => ArmDriverError::Transport(TransportError::WouldBlock),
             TxRefusal::StopInhibited | TxRefusal::StopStampChanged => ArmDriverError::EstopInhibited,
+            TxRefusal::LeaseFenced => ArmDriverError::LeaseFenced,
             TxRefusal::MitFenceTripped(reason) => ArmDriverError::MitFenceTripped(reason),
             TxRefusal::PosForceFeedbackExpired(joint) => {
                 ArmDriverError::PosForceFeedbackStaleBeforeTransmit { joint }
@@ -5900,6 +5990,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     fn drain_pending_pass(
         &mut self,
         pass_stop_stamp: StopStamp,
+        pass_lease_gen: u64,
         pre_dropped_stale: usize,
         pre_oldest_expired: Option<Duration>,
         stop_on_expiry: bool,
@@ -5929,9 +6020,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 }
             }
             let entry_deadline = Deadline::after(entry.queued_at, self.tx_budget.frame_max_age);
-            match self.send(
+            match self.send_with_lease(
                 TxKind::Target,
                 Some(entry.stop_stamp),
+                entry.lease_gen,
                 Some(entry_deadline),
                 false,
                 |d| d.build_pending_target_frame(&entry),
@@ -5977,6 +6069,17 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     self.discard_pending_tx_stopped();
                     return Err(ArmDriverError::EstopInhibited);
                 }
+                Err(TxRefusal::LeaseFenced) => {
+                    let gate = self.estop_gate.as_ref();
+                    let dropped = self
+                        .pending_tx
+                        .drop_fenced_lease(|g| gate.is_some_and(|gt| gt.is_lease_fenced(g)));
+                    if dropped > 0 {
+                        crate::diagnostics::tick::record_tx_dropped_stopped(dropped as u32);
+                    }
+                    crate::diagnostics::tick::record_tx_deferred(0, self.total_pending_tx_len());
+                    return Err(ArmDriverError::LeaseFenced);
+                }
                 Err(TxRefusal::BuildRefused) => {
                     self.discard_pending_tx_stopped();
                     return Err(ArmDriverError::PosForceTargetUnavailable { joint: entry.joint });
@@ -5999,10 +6102,21 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 }
             }
         }
-        // Pre-flush stop check: a stop/E-stop arriving during the final frame transmit skips flush.
+        // Pre-flush stop and lease-fence check: a stop/E-stop or disconnect arriving during the
+        // final frame transmit skips flush and drops any remaining fenced entries.
         if let Err(e) = self.strict_stop_check(Some(pass_stop_stamp)) {
             self.discard_pending_tx_stopped();
             return Err(e);
+        }
+        if self.is_lease_fenced(pass_lease_gen) {
+            let gate = self.estop_gate.as_ref();
+            let dropped = self
+                .pending_tx
+                .drop_fenced_lease(|g| gate.is_some_and(|gt| gt.is_lease_fenced(g)));
+            if dropped > 0 {
+                crate::diagnostics::tick::record_tx_dropped_stopped(dropped as u32);
+            }
+            return Err(ArmDriverError::LeaseFenced);
         }
         if sent_any {
             if self.flush_cutoff_exceeded() {
@@ -6018,10 +6132,20 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 return Err(e.into());
             }
         }
-        // Post-flush stop check: catches pending, latched, or already-applied stops raised during flush.
+        // Post-flush stop & lease-fence check.
         if let Err(e) = self.strict_stop_check(Some(pass_stop_stamp)) {
             self.discard_pending_tx_stopped();
             return Err(e);
+        }
+        if self.is_lease_fenced(pass_lease_gen) {
+            let gate = self.estop_gate.as_ref();
+            let dropped = self
+                .pending_tx
+                .drop_fenced_lease(|g| gate.is_some_and(|gt| gt.is_lease_fenced(g)));
+            if dropped > 0 {
+                crate::diagnostics::tick::record_tx_dropped_stopped(dropped as u32);
+            }
+            return Err(ArmDriverError::LeaseFenced);
         }
         for &joint in &sent_order[..sent_order_len] {
             self.record_flushed_joint_tx(joint, 0, true);
@@ -6093,12 +6217,20 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             self.discard_pending_tx_stopped();
             return Err(ArmDriverError::EstopInhibited);
         }
+        let fenced_dropped = {
+            let gate = self.estop_gate.as_ref();
+            self.pending_tx
+                .drop_fenced_lease(|g| gate.is_some_and(|gt| gt.is_lease_fenced(g)))
+        };
+        if fenced_dropped > 0 {
+            crate::diagnostics::tick::record_tx_dropped_stopped(fenced_dropped as u32);
+        }
         let cleanup_now = self.now();
         let (stale, pre_oldest) = self.pending_tx.drop_stale(cleanup_now, self.tx_budget.frame_max_age);
         if stale > 0 {
             crate::diagnostics::tick::record_tx_dropped_stale(stale as u32);
         }
-        let arm_out = self.drain_pending_pass(current_stamp, stale, pre_oldest, false)?;
+        let arm_out = self.drain_pending_pass(current_stamp, 0, stale, pre_oldest, false)?;
         if self.external_pos_force_emitter || !self.pf_deferred_motion {
             return Ok(arm_out);
         }
@@ -7435,6 +7567,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     self.enable_failed();
                     return Err(ArmDriverError::MitFenceTripped(reason));
                 }
+                Err(TxRefusal::LeaseFenced) => {
+                    unreachable!("TxKind::Handshake is exempt from lease fence");
+                }
             }
         }
         if sent_any {
@@ -8763,6 +8898,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                                 self.trip_fence(reason);
                                 return Err(ArmDriverError::MitFenceTripped(reason));
                             }
+                            Err(TxRefusal::LeaseFenced) => {
+                                unreachable!("TxKind::RollbackHold is exempt from lease fence");
+                            }
                         }
                     }
                 }
@@ -8894,7 +9032,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         torque: target.torque,
                         slot: slot as u8,
                     };
-                    let ok = self.pending_hold_tx.upsert(i, frame_id, cmd, batch_ts, start_stamp);
+                    let ok = self.pending_hold_tx.upsert(i, frame_id, cmd, batch_ts, start_stamp, 0);
                     debug_assert!(ok, "preflight checked pending_hold_tx capacity");
                 }
             }
@@ -9032,6 +9170,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                             self.last_hold_tx_due_mask = due_mask;
                             self.last_hold_tx_sent_mask = if self.can.flush_is_noop() { sent_slot_mask } else { 0 };
                             return Err(e.into());
+                        }
+                        Err(TxRefusal::LeaseFenced) => {
+                            unreachable!("TxKind::RollbackHold is exempt from lease fence");
                         }
                     }
                 }
@@ -9254,6 +9395,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     }
 
     fn write_joint_targets_bounded(&mut self, targets: &[JointTarget]) -> Result<TxBatchOutcome, ArmDriverError> {
+        let batch_lease_gen = self.output_lease_gen;
+        self.output_lease_gen = 0;
         self.last_target_tx_sent_mask = 0;
         self.last_tx_pf_status = PosForceTxStatus::Unobserved;
         self.last_output_was_hold = false;
@@ -9301,6 +9444,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             if let Err(e) = self.strict_stop_check(None) {
                 self.trip_fence(MitFenceTripReason::EstopBeforeBatch { total_joints });
                 return Err(e);
+            }
+            if self.is_lease_fenced(batch_lease_gen) {
+                return Err(ArmDriverError::LeaseFenced);
             }
             let pre_arm_intent_stamp = self.current_j7_intent_stamp();
             let arm_res: Result<TxBatchOutcome, ArmDriverError> = (|| {
@@ -9380,9 +9526,14 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         if started[i].is_none() {
                             started[i] = Some(self.now());
                         }
-                        match self.send(TxKind::Target, Some(start_stamp), None, true, |d| {
-                            d.target_frames_checked(i, target).ok()?.0.get(slot).copied().flatten()
-                        }) {
+                        match self.send_with_lease(
+                            TxKind::Target,
+                            Some(start_stamp),
+                            batch_lease_gen,
+                            None,
+                            true,
+                            |d| d.target_frames_checked(i, target).ok()?.0.get(slot).copied().flatten(),
+                        ) {
                             Ok(sent_frame) => {
                                 let mit_params = self.resolved_mit_params(target);
                                 self.record_sent_target(i, sent_frame, Some(mit_params));
@@ -9404,6 +9555,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                                     total_joints,
                                 });
                                 return Err(ArmDriverError::EstopInhibited);
+                            }
+                            Err(TxRefusal::LeaseFenced) => {
+                                return Err(ArmDriverError::LeaseFenced);
                             }
                             Err(TxRefusal::PosForceFeedbackExpired(joint)) => {
                                 self.trip_fence(MitFenceTripReason::TargetUnavailable {
@@ -9451,6 +9605,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     self.trip_fence(MitFenceTripReason::EstopBeforeFlush { total_joints });
                     return Err(ArmDriverError::EstopInhibited);
                 }
+                if self.is_lease_fenced(batch_lease_gen) {
+                    return Err(ArmDriverError::LeaseFenced);
+                }
                 if self.flush_cutoff_exceeded() {
                     self.mark_tx_pass_backpressured();
                     self.trip_fence(MitFenceTripReason::FlushFailed {
@@ -9472,6 +9629,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 if self.strict_stop_check(Some(start_stamp)).is_err() {
                     self.trip_fence(MitFenceTripReason::EstopAfterFlush { total_joints });
                     return Err(ArmDriverError::EstopInhibited);
+                }
+                if self.is_lease_fenced(batch_lease_gen) {
+                    return Err(ArmDriverError::LeaseFenced);
                 }
                 self.fence_check()?;
                 let mut sent_mask: u64 = 0;
@@ -9561,6 +9721,17 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             self.discard_pending_tx_stopped();
             return Err(e);
         }
+        let fenced_carry = {
+            let gate = self.estop_gate.as_ref();
+            self.pending_tx
+                .drop_fenced_lease(|g| gate.is_some_and(|gt| gt.is_lease_fenced(g)))
+        };
+        if fenced_carry > 0 {
+            crate::diagnostics::tick::record_tx_dropped_stopped(fenced_carry as u32);
+        }
+        if self.is_lease_fenced(batch_lease_gen) {
+            return Err(ArmDriverError::LeaseFenced);
+        }
         self.output_ran_since_rx = true;
         let batch_stamp = self.current_stop_stamp();
         let stopped_carry = self.pending_tx.drop_stopped(batch_stamp);
@@ -9616,12 +9787,14 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 }
             };
             for (frame_id, cmd) in cmds.into_iter().flatten() {
-                let ok = self.pending_tx.upsert(i, frame_id, cmd, batch_ts, batch_stamp);
+                let ok = self
+                    .pending_tx
+                    .upsert(i, frame_id, cmd, batch_ts, batch_stamp, batch_lease_gen);
                 debug_assert!(ok, "preflight checked pending queue capacity");
             }
         }
         let pre_arm_intent_stamp = self.current_j7_intent_stamp();
-        let arm_out = self.drain_pending_pass(batch_stamp, 0, None, true)?;
+        let arm_out = self.drain_pending_pass(batch_stamp, batch_lease_gen, 0, None, true)?;
         if self.external_pos_force_emitter {
             return Ok(arm_out);
         }
@@ -9791,6 +9964,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     fn set_abort_flag(&mut self, flag: Arc<AtomicBool>) { self.abort_flag = Some(flag); }
     fn set_estop_state(&mut self, state: Arc<crate::rt_core::urgent::EstopState>) { self.estop_state = Some(state); }
     fn set_estop_gate(&mut self, gate: crate::rt_core::urgent::EstopGate) { self.estop_gate = Some(gate); }
+    fn set_output_lease_gen(&mut self, lease_gen: u64) { self.output_lease_gen = lease_gen; }
 }
 
 impl<C: CanTransport> DamiaoArmDriver<C> {
@@ -10401,6 +10575,7 @@ mod pos_force_emitter {
         driver: &mut DamiaoArmDriver<C>,
         kind: TxKind,
         expected_stamp: Option<StopStamp>,
+        expected_lease_gen: u64,
         intent: PosForceIntentKind,
         allow_freeze: bool,
         retry: bool,
@@ -10457,7 +10632,14 @@ mod pos_force_emitter {
         if retry {
             driver.send_with_retry_inner(kind, expected_stamp, None, fenced, Some(&token), build)
         } else {
-            driver.send(authorize_kind(&token, kind), expected_stamp, None, fenced, build)
+            driver.send_with_lease(
+                authorize_kind(&token, kind),
+                expected_stamp,
+                expected_lease_gen,
+                None,
+                fenced,
+                build,
+            )
         }
     }
 
@@ -10474,6 +10656,7 @@ mod pos_force_emitter {
             driver,
             TxKind::Handshake,
             expected_stamp,
+            0,
             PosForceIntentKind::Hold,
             false,
             false,
@@ -10493,7 +10676,7 @@ mod pos_force_emitter {
         fenced: bool,
     ) -> Result<CanFrame, TxRefusal> {
         let kind = if is_rollback { TxKind::RollbackHold(joint) } else { TxKind::Hold };
-        send_frame(driver, kind, expected_stamp, intent, false, true, fenced)
+        send_frame(driver, kind, expected_stamp, 0, intent, false, true, fenced)
     }
 
     /// Narrow standalone-driver recovery API: called ONLY from `DamiaoArmDriver::receive_feedback`
@@ -10512,6 +10695,7 @@ mod pos_force_emitter {
             driver,
             TxKind::Recovery,
             expected_stamp,
+            0,
             PosForceIntentKind::Target {
                 position: hold_pos,
                 velocity: Some(speed),
@@ -10531,9 +10715,9 @@ mod pos_force_emitter {
     /// Always runs unfenced (`fenced = false`) with `allow_freeze = true` so a tripped MIT fence
     /// suppresses ONLY MIT arm joints and J7 (`TIMEOUT=0`) always receives its resolved frame.
     ///
-    /// Single stop-generation / E-stop epoch enforcement rule: any `Target` intent whose
-    /// `(stop_gen, estop_epoch)` stamp differs from `current` is degraded to `Hold` and is NEVER
-    /// re-stamped with the newer generation.
+    /// Single stop-generation / E-stop epoch / lease-generation enforcement rule: any `Target`
+    /// intent whose `(stop_gen, estop_epoch, lease_gen)` stamp is stale or lease-fenced is
+    /// degraded to `Hold` and is NEVER re-stamped with a newer generation.
     pub(super) fn emit_tick<C: CanTransport>(
         driver: &mut DamiaoArmDriver<C>,
         intent: PosForceIntent,
@@ -10545,8 +10729,8 @@ mod pos_force_emitter {
         if !driver.is_enabled || driver.torque_hs.is_some() {
             return Ok(PosForceEmitOutcome::NotApplicable);
         }
-        let stamp_stale = intent.stamp.stop_gen != current.stop_gen
-            || intent.stamp.estop_epoch != current.estop_epoch;
+        let stamp_stale = intent.stamp.is_stale_against(current)
+            || driver.is_lease_fenced(intent.stamp.lease_gen);
         let effective_kind = match intent.kind {
             PosForceIntentKind::Target { .. }
                 if stamp_stale || driver.pf_hold_on_first_fresh =>
@@ -10555,7 +10739,7 @@ mod pos_force_emitter {
             }
             other => other,
         };
-        let is_target_intent = matches!(effective_kind, PosForceIntentKind::Target { .. });
+        let mut is_target_intent = matches!(effective_kind, PosForceIntentKind::Target { .. });
         if is_target_intent {
             driver.strict_stop_check(None)?;
         } else {
@@ -10625,12 +10809,30 @@ mod pos_force_emitter {
         let mut active_kind = effective_kind;
         let mut retried = false;
         let sent_frame = loop {
-            let kind = match active_kind {
-                PosForceIntentKind::Target { .. } => TxKind::Target,
-                PosForceIntentKind::Hold | PosForceIntentKind::Stop => TxKind::RollbackHold(pf_j),
+            let (kind, target_lease_gen) = match active_kind {
+                PosForceIntentKind::Target { .. } => (TxKind::Target, intent.stamp.lease_gen),
+                PosForceIntentKind::Hold | PosForceIntentKind::Stop => (TxKind::RollbackHold(pf_j), 0),
             };
-            match send_frame(driver, kind, Some(start_stamp), active_kind, true, false, false) {
+            match send_frame(
+                driver,
+                kind,
+                Some(start_stamp),
+                target_lease_gen,
+                active_kind,
+                true,
+                false,
+                false,
+            ) {
                 Ok(frame) => break Some(frame),
+                Err(TxRefusal::LeaseFenced) => {
+                    if !retried && matches!(active_kind, PosForceIntentKind::Target { .. }) {
+                        retried = true;
+                        active_kind = PosForceIntentKind::Hold;
+                        is_target_intent = false;
+                        continue;
+                    }
+                    break None;
+                }
                 Err(TxRefusal::PosForceFeedbackExpired(_)) => {
                     let _ = driver.check_pos_force_freshness_for_tx();
                     if !retried {

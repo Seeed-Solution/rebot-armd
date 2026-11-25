@@ -2631,6 +2631,30 @@ impl ServoTargetDispatcher {
         g.prune_closed_stream_owners_locked();
     }
 
+    /// Non-blocking variant of [`Self::close_servo`] for disconnect teardown: attempts `try_lock`
+    /// and returns `false` without blocking if the dispatcher mutex is contended (the caller's
+    /// lock-free `atomic_fenced_lease_gen` update already fences the generation at every boundary
+    /// and `armd-dispatch` drains the close asynchronously).
+    pub(crate) fn try_close_servo(&self, lease_generation: u64) -> bool {
+        if lease_generation == 0 {
+            return true;
+        }
+        match self.inner.try_lock() {
+            Ok(mut g) => {
+                g.port.close_servo(lease_generation);
+                g.prune_closed_stream_owners_locked();
+                true
+            }
+            Err(std::sync::TryLockError::Poisoned(p)) => {
+                let mut g = p.into_inner();
+                g.port.close_servo(lease_generation);
+                g.prune_closed_stream_owners_locked();
+                true
+            }
+            Err(std::sync::TryLockError::WouldBlock) => false,
+        }
+    }
+
     pub(crate) fn sync_fenced_generation(&self, fenced_gen: u64) {
         if fenced_gen == 0 {
             return;
@@ -2685,6 +2709,27 @@ impl ServoTargetDispatcher {
         }
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.stream_owners.retain(|_, owner| owner.conn_id != conn_id);
+    }
+
+    /// Non-blocking variant of [`Self::unregister_connection`] for disconnect teardown (returns
+    /// immediately if the dispatcher mutex is contended; `prune_closed_stream_owners_locked`
+    /// reaps closed generations once the mutex is free).
+    pub(crate) fn try_unregister_connection(&self, conn_id: u64) -> bool {
+        if conn_id == 0 {
+            return true;
+        }
+        match self.inner.try_lock() {
+            Ok(mut g) => {
+                g.stream_owners.retain(|_, owner| owner.conn_id != conn_id);
+                true
+            }
+            Err(std::sync::TryLockError::Poisoned(p)) => {
+                let mut g = p.into_inner();
+                g.stream_owners.retain(|_, owner| owner.conn_id != conn_id);
+                true
+            }
+            Err(std::sync::TryLockError::WouldBlock) => false,
+        }
     }
 
     fn cancel_command_waiter(&self, key: (super::mailbox::StreamId, u64)) {
@@ -3239,6 +3284,11 @@ impl RtExecutorHandle {
         self.shared.servo_dispatcher.close_servo(lease_generation);
     }
 
+    /// Non-blocking `try_lock` variant of [`Self::close_servo`] for disconnect teardown.
+    pub fn try_close_servo(&self, lease_generation: u64) -> bool {
+        self.shared.servo_dispatcher.try_close_servo(lease_generation)
+    }
+
     /// True when `lease_generation` (non-zero) has been closed via `close_servo`.
     pub fn is_servo_closed(&self, lease_generation: u64) -> bool {
         self.shared.servo_dispatcher.is_servo_closed(lease_generation)
@@ -3267,6 +3317,11 @@ impl RtExecutorHandle {
     /// Unregisters streaming outcome delivery state for a closing WS connection.
     pub fn unregister_servo_connection(&self, conn_id: u64) {
         self.shared.servo_dispatcher.unregister_connection(conn_id);
+    }
+
+    /// Non-blocking `try_lock` variant of [`Self::unregister_servo_connection`] for disconnect teardown.
+    pub fn try_unregister_servo_connection(&self, conn_id: u64) -> bool {
+        self.shared.servo_dispatcher.try_unregister_connection(conn_id)
     }
 
     /// Routes one WS streaming servo frame (`servo`, `cartesian_joint_stream`, or implicit

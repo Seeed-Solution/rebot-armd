@@ -6,6 +6,11 @@
 #[allow(unused_imports)]
 use super::*;
 
+#[inline]
+fn buf_len_ok(v: &[f64], n: usize) -> bool {
+    v.len() >= n
+}
+
 /// Copies `src` into `dst`, reusing its memory when it holds a vector.
 fn set_vec(dst: &mut Option<Vec<f32>>, src: &[f32]) {
     match dst {
@@ -124,6 +129,42 @@ impl SupervisorInner {
         }
     }
 
+    /// Zero-allocation RT workspace refusal hold for `armd-control`: static codes & preallocated
+    /// `WorkspaceViolationDetail` text (zero heap allocations, zero frees).
+    pub(super) fn enter_servo_keepout_hold_rt(&mut self, f: crate::chain::WorkspaceFailureRt) {
+        #[cfg(feature = "policy-runtime")]
+        if self.policy_run.is_some() {
+            let msg = if self.rt_executor_owned {
+                None
+            } else {
+                Some("Policy step violated workspace".to_string())
+            };
+            self.terminate_policy_run("WORKSPACE_HOLD", "cancelled", Some("WORKSPACE_HOLD"), msg);
+        }
+        self.servo_hold(MotionLimitReason::Workspace, None);
+        if self.motion_limit.as_ref().is_some_and(|m| m.reason == MotionLimitReason::Workspace) {
+            let mut bufs = std::mem::take(&mut self.ws_eval_bufs);
+            let mut detail = self
+                .workspace_violation
+                .take()
+                .or_else(|| self.workspace_violation_spare.take())
+                .unwrap_or_else(crate::kinematics::WorkspaceViolationDetail::preallocated_rt);
+            if let Some((ws, cam)) = self.workspace_policy() {
+                let eval = crate::chain::WorkspaceEvaluator::new_with_tcp_in(
+                    &self.config.arm_model,
+                    ws,
+                    cam,
+                    self.config.tcp_offset,
+                    &mut bufs,
+                );
+                eval.write_failure_detail_rt(&f, &mut detail);
+                eval.recycle(&mut bufs);
+            }
+            self.ws_eval_bufs = bufs;
+            self.workspace_violation = Some(detail);
+        }
+    }
+
     /// Joint-space step from the commanded position to `next` (linear in joint space)
     /// against the full workspace (floor, outer box, reach, keep-out boxes, link capsules),
     /// using the persistent per-constraint monotonic escape rule and up to [`MAX_KEEPOUT_EVALS_PER_TICK`]
@@ -136,16 +177,7 @@ impl SupervisorInner {
     /// Pre-warms `ws_eval_bufs` and `scratch` joint-limit name buffers before `armd-control`
     /// enters `SCHED_FIFO` so the very first servo or braking tick performs zero heap allocations.
     pub fn prewarm_rt_buffers(&mut self) {
-        let mut bufs = std::mem::take(&mut self.ws_eval_bufs);
-        if let Some((ws, cam)) = self.workspace_policy() {
-            bufs.prepare_for(
-                &self.config.arm_model,
-                ws,
-                cam,
-                self.config.tcp_offset,
-            );
-        }
-        self.ws_eval_bufs = bufs;
+        self.prepare_workspace_eval_bufs();
         // Populate `JointLimit::name` String buffers once off-RT so `copy_limits` on the first
         // servo or fallback braking tick reuses them in place via `clone_from` (0 heap allocs).
         crate::rt_core::scratch::copy_limits(&mut self.scratch.step_limits, &self.config.limits);
@@ -160,6 +192,118 @@ impl SupervisorInner {
         let cand_min_d = result?;
         if let Some(min_d) = cand_min_d { self.servo_ws_min_depths = Some((self.workspace_revision, min_d)); }
         Ok(())
+    }
+
+    /// Zero-allocation RT workspace sweep for servo streaming and braking ticks on `armd-control`:
+    /// uses pre-sized clearance slices and sweep slab from `self.ws_eval_bufs` (zero heap ops
+    /// for any legal workspace size, including 32 end points + multiple keep-out boxes and
+    /// refusal / budget-exceeded paths).
+    pub(super) fn servo_step_workspace_rt(
+        &mut self,
+        next: &[f32],
+        phase: &'static str,
+    ) -> Result<(), crate::chain::WorkspaceFailureRt> {
+        let mut bufs = std::mem::take(&mut self.ws_eval_bufs);
+        let mut updated_len = 0usize;
+        let result = (|| {
+            let Some((ws, cam)) = self.workspace_policy() else {
+                return Ok(false);
+            };
+            let eval = crate::chain::WorkspaceEvaluator::new_with_tcp_in(
+                &self.config.arm_model,
+                ws,
+                cam,
+                self.config.tcp_offset,
+                &mut bufs,
+            );
+            let n = eval.total_slots;
+            let checked = (|| {
+                eval.eval_into_slice_rt(
+                    &self.commanded_positions,
+                    &mut bufs.scratch_c0,
+                    &mut bufs.world_caps,
+                    phase,
+                )?;
+                if buf_len_ok(&bufs.scratch_cand_min_d, n) {
+                    match &self.servo_ws_min_depths {
+                        Some((rev, min_d))
+                            if *rev == self.workspace_revision && min_d.as_slice().len() == n =>
+                        {
+                            bufs.scratch_cand_min_d[..n].copy_from_slice(min_d.as_slice());
+                        }
+                        _ => eval.init_min_depths_slice(&bufs.scratch_c0, &mut bufs.scratch_cand_min_d),
+                    }
+                } else {
+                    return Err(crate::chain::WorkspaceFailureRt {
+                        kind: crate::chain::WorkspaceFailureKindRt::Invalid("workspace scratch undersized"),
+                        phase,
+                    });
+                }
+                let mut budget = MAX_KEEPOUT_EVALS_PER_TICK;
+                eval.sweep_linear_step_rt(
+                    &self.commanded_positions,
+                    next,
+                    &bufs.scratch_c0,
+                    &mut bufs.scratch_cand_min_d,
+                    &mut budget,
+                    MAX_KEEPOUT_EVALS_PER_TICK,
+                    phase,
+                    phase,
+                    &mut bufs.scratch_c1,
+                    &mut bufs.scratch_cm,
+                    &mut bufs.sweep_slab,
+                    &mut bufs.sweep_stack,
+                    &mut bufs.sweep_free,
+                    &mut bufs.geom_bounds,
+                    &mut bufs.world_caps,
+                )?;
+                updated_len = n;
+                Ok(true)
+            })();
+            eval.recycle(&mut bufs);
+            checked
+        })();
+        let rev = self.workspace_revision;
+        if result.as_ref().is_ok_and(|&updated| updated) {
+            // Update `servo_ws_min_depths` in place (or from `bufs.min_depths_spare`) with 0 heap ops.
+            let src = &bufs.scratch_cand_min_d[..updated_len];
+            let updated_in_place = match self.servo_ws_min_depths.as_mut() {
+                Some((cur_rev, dst)) if dst.as_slice().len() == updated_len => {
+                    *cur_rev = rev;
+                    dst.as_mut_slice().copy_from_slice(src);
+                    true
+                }
+                _ => false,
+            };
+            if !updated_in_place {
+                if let Some((_, old)) = self.servo_ws_min_depths.take() {
+                    if old.is_heap() {
+                        if bufs.min_depths_spare.is_none() {
+                            bufs.min_depths_spare = Some(old);
+                        } else {
+                            self.push_retired_stop(crate::rt_core::urgent::RetiredStopPayloads {
+                                servo_ws_min_depths: Some((0, old)),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                }
+                if let Some(mut spare) = bufs
+                    .min_depths_spare
+                    .take()
+                    .filter(|s| s.as_slice().len() == updated_len)
+                {
+                    spare.as_mut_slice().copy_from_slice(src);
+                    self.servo_ws_min_depths = Some((rev, spare));
+                } else {
+                    let mut b = crate::kinematics::SlotBuf::zeros(updated_len);
+                    b.as_mut_slice().copy_from_slice(src);
+                    self.servo_ws_min_depths = Some((rev, b));
+                }
+            }
+        }
+        self.ws_eval_bufs = bufs;
+        result.map(|_| ())
     }
 
     /// `check_workspace_path(commanded, [target])` with the evaluator's reused vectors (no
@@ -185,17 +329,14 @@ impl SupervisorInner {
         result
     }
 
-    /// Zero-allocation RT variant of [`Self::servo_target_workspace`] (never builds allocating
+    /// Zero-allocation RT variant of [`Self::servo_target_workspace`]: uses pre-sized clearance
+    /// scratch slices from `self.ws_eval_bufs` (zero heap allocations for any legal workspace
+    /// size, including 32 end points + multiple keep-out boxes, and never builds allocating
     /// [`crate::chain::WorkspaceFailure`] strings on refusal).
     fn servo_target_workspace_rt(&mut self, target: &[f32]) -> Result<(), &'static str> {
         let mut bufs = std::mem::take(&mut self.ws_eval_bufs);
         let result = (|| {
             let Some((ws, cam)) = self.workspace_policy() else { return Ok(()); };
-            if self.config.arm_model.frames_f32(&self.commanded_positions).is_none()
-                || self.config.arm_model.frames_f32(target).is_none()
-            {
-                return Err("WORKSPACE_VIOLATION");
-            }
             let eval = crate::chain::WorkspaceEvaluator::new_with_tcp_in(
                 &self.config.arm_model,
                 ws,
@@ -204,22 +345,37 @@ impl SupervisorInner {
                 &mut bufs,
             )
             .with_escape_tol(crate::kinematics::WORKSPACE_EPS);
-            let checked = if !eval.capsules_valid() {
+            let n = eval.total_slots;
+            let checked = if !eval.capsules_valid()
+                || !buf_len_ok(&bufs.scratch_c0, n)
+                || !buf_len_ok(&bufs.scratch_c1, n)
+                || !buf_len_ok(&bufs.scratch_min_d, n)
+                || eval
+                    .eval_into_slice_rt(
+                        &self.commanded_positions,
+                        &mut bufs.scratch_c0,
+                        &mut bufs.world_caps,
+                        "plan",
+                    )
+                    .is_err()
+            {
                 Err("WORKSPACE_VIOLATION")
             } else {
-                let mut c0 = eval.alloc_buf();
-                let mut clr = eval.alloc_buf();
-                if eval.eval_into(&self.commanded_positions, &mut c0, "plan").is_err() {
+                eval.init_min_depths_slice(&bufs.scratch_c0, &mut bufs.scratch_min_d);
+                if eval
+                    .eval_into_slice_rt(target, &mut bufs.scratch_c1, &mut bufs.world_caps, "plan")
+                    .is_err()
+                    || eval
+                        .check_and_advance_slice_rt(
+                            &bufs.scratch_c1,
+                            &mut bufs.scratch_min_d,
+                            "servo_target",
+                        )
+                        .is_err()
+                {
                     Err("WORKSPACE_VIOLATION")
                 } else {
-                    let mut min_depths = eval.init_min_depths(&c0);
-                    if eval.eval_into(target, &mut clr, "plan").is_err()
-                        || !eval.check_and_advance_rt(&clr, &mut min_depths)
-                    {
-                        Err("WORKSPACE_VIOLATION")
-                    } else {
-                        Ok(())
-                    }
+                    Ok(())
                 }
             };
             eval.recycle(&mut bufs);
@@ -569,6 +725,7 @@ impl SupervisorInner {
             self.j7_admitted_stamp = Some(crate::driver::PosForceIntentStamp {
                 stop_gen: stamp.stop_gen,
                 estop_epoch: stamp.estop_epoch,
+                lease_gen: stamp.lease_gen,
             });
         }
 
@@ -637,6 +794,7 @@ impl SupervisorInner {
             this.j7_admitted_stamp = Some(crate::driver::PosForceIntentStamp {
                 stop_gen: stamp.stop_gen,
                 estop_epoch: stamp.estop_epoch,
+                lease_gen: stamp.lease_gen,
             });
         }
         let _ = this.safety.mark_motion_started();
@@ -829,6 +987,7 @@ impl SupervisorInner {
                     TickOutput::Expired { .. }
                     | TickOutput::Error { .. }
                     | TickOutput::EstopInhibited { .. }
+                    | TickOutput::LeaseFenced
                     | TickOutput::ActionDeadlineRefused { .. }
                     | TickOutput::None => {
                         self.tracking.invalidate();
@@ -886,9 +1045,9 @@ impl SupervisorInner {
                 ),
             );
         });
-        self.servo_target = None;
+        self.release_servo_target();
         self.servo_settled_ticks.fill(0);
-        self.servo_ws_min_depths = None;
+        self.clear_servo_ws_min_depths_rt();
         self.servo_stream_active = false;
         self.tracking.invalidate();
         self.active_trajectory = None;
@@ -1725,7 +1884,7 @@ impl SupervisorInner {
         if run.mode == crate::policy_runtime::PolicyMode::Live {
             self.release_servo_target();
             self.servo_settled_ticks.fill(0);
-            self.servo_ws_min_depths = None;
+            self.clear_servo_ws_min_depths_rt();
             copy_into(&mut self.target_positions, &self.commanded_positions);
         }
         if let Some(obs) = self.last_policy_obs.as_mut() {
@@ -1886,15 +2045,19 @@ pub mod targets {
 
     /// The WS reply to a servo target the RT refused (None: no reply).
     ///
-    /// As the legacy loop answers the same conditions: an unauthorized frame (lease lost,
-    /// stream not authorized, no lease) with `lease_lost` (with the loss reason when known),
-    /// a stale epoch with `epoch_sync`, a calibration with `servo_reject`
+    /// As the legacy loop answers the same conditions: a stop-preempted frame with `servo_reject`
+    /// (`code: "STOPPED"`, `reason: "stopped"` matching `api/ws/servo.rs`), an unauthorized frame
+    /// (lease lost, stream not authorized, no lease) with `lease_lost` (with the loss reason when
+    /// known), a stale epoch with `epoch_sync`, a calibration with `servo_reject`
     /// `reason: calibration_busy`, other refusals with `servo_reject` (and `current_revision`
-    /// when known). A frame refused because a stop overtook it gets no reply (legacy applied
-    /// it before the stop, which has its own reply). Messages are generic.
+    /// when known). Messages match the legacy path.
     pub fn servo_outcome_reply(refusal: &Refusal, ctx: &ReplyCtx) -> Option<Value> {
         Some(match refusal.code {
-            "STOPPED" => return None,
+            "STOPPED" => {
+                let mut v = servo_reject("STOPPED", "Stopped before motion began", ctx.epoch_id);
+                v["reason"] = json!("stopped");
+                v
+            }
             "LEASE_LOST" | "NO_LEASE" | "STREAM_NOT_AUTHORIZED" => {
                 let mut v = json!({"type":"lease_lost", "generation":ctx.lease_generation});
                 if let (RefusalDetail::LeaseLoss { reason }, true) = (refusal.detail, ctx.lease_generation != 0) { v["reason"] = json!(reason); }

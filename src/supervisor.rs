@@ -300,6 +300,7 @@ impl<'g> Admitted<'g> {
         inner.j7_admitted_stamp = Some(crate::driver::PosForceIntentStamp {
             stop_gen: stamp.stop_gen,
             estop_epoch: stamp.estop_epoch,
+            lease_gen: stamp.lease_gen,
         });
         Ok((inner, AdmittedProof { stamp }))
     }
@@ -744,6 +745,9 @@ pub(crate) enum TickOutput {
     /// Driver refused target/hold because an E-stop or authorized stop is pending/latched.
     /// Zero-allocation typed refusal (avoids formatting or matching `ESTOP_INHIBITED`).
     EstopInhibited { is_hold: bool },
+    /// Driver TX choke point dropped stale client-lease motion frames because the lease
+    /// generation was fenced by disconnect, release, preemption, or expiry (not a bus fault).
+    LeaseFenced,
     /// Driver TX choke point refused target writes because the active action/macro deadline
     /// elapsed before transmit (zero frames placed on the wire after the deadline; never counted
     /// as a CAN bus stall).
@@ -872,6 +876,9 @@ pub struct SupervisorInner {
     pub motion_limit: Option<MotionLimit>,
     /// Structured details of the active `MotionLimitReason::Workspace` hold/rejection.
     pub workspace_violation: Option<crate::kinematics::WorkspaceViolationDetail>,
+    /// Reusable preallocated [`crate::kinematics::WorkspaceViolationDetail`] moved into/out of
+    /// `workspace_violation` on RT so workspace refusals and clears perform 0 heap ops.
+    pub(crate) workspace_violation_spare: Option<crate::kinematics::WorkspaceViolationDetail>,
     /// Observation-clock time (s) `motion_limit` last applied.
     pub motion_limit_seen_s: f64,
     /// Holding after a blocked servo stream (keeps `motion_limit` = blocked).
@@ -2018,6 +2025,7 @@ impl SupervisorInner {
             motor_errors: Vec::new(),
             motion_limit: None,
             workspace_violation: None,
+            workspace_violation_spare: Some(crate::kinematics::WorkspaceViolationDetail::preallocated_rt()),
             motion_limit_seen_s: 0.0,
             servo_blocked_hold: false,
             servo_ws_min_depths: None,
@@ -2249,6 +2257,33 @@ impl SupervisorInner {
         inner
     }
 
+    /// Clears `self.workspace_violation`, recycling its preallocated detail into
+    /// `self.workspace_violation_spare` (0 alloc / 0 free on `armd-control`).
+    pub fn clear_workspace_violation_rt(&mut self) {
+        if let Some(old) = self.workspace_violation.take() {
+            if self.workspace_violation_spare.is_none() {
+                self.workspace_violation_spare = Some(old);
+            }
+        }
+    }
+
+    /// Clears `self.servo_ws_min_depths`, recycling any heap `SlotBuf` back into
+    /// `self.ws_eval_bufs.min_depths_spare` so `armd-control` never frees it.
+    pub(crate) fn clear_servo_ws_min_depths_rt(&mut self) {
+        if let Some((_, old)) = self.servo_ws_min_depths.take() {
+            if old.is_heap() {
+                if self.ws_eval_bufs.min_depths_spare.is_none() {
+                    self.ws_eval_bufs.min_depths_spare = Some(old);
+                } else {
+                    self.push_retired_stop(crate::rt_core::urgent::RetiredStopPayloads {
+                        servo_ws_min_depths: Some((0, old)),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+    }
+
     /// Pre-sizes `ws_eval_bufs` (including overflow slot and capsule buffers for workspaces
     /// exceeding 256 slots) off the RT thread so RT checks allocate zero heap memory.
     pub fn prepare_workspace_eval_bufs(&mut self) {
@@ -2257,6 +2292,10 @@ impl SupervisorInner {
             bufs.prepare_for(&self.config.arm_model, ws, cam, self.config.tcp_offset);
         }
         self.ws_eval_bufs = bufs;
+        if self.workspace_violation.is_none() && self.workspace_violation_spare.is_none() {
+            self.workspace_violation_spare =
+                Some(crate::kinematics::WorkspaceViolationDetail::preallocated_rt());
+        }
     }
 
     /// Minimal empty shell left inside `ArmSupervisor::inner` once ownership transfers to
@@ -2940,13 +2979,19 @@ impl SupervisorInner {
         schema
     }
 
-    /// The E-stop gate of this arm's bus driver: a request not yet applied by the tick
-    /// (plus authorized-stop generations when attached to an RT executor).
+    /// The E-stop and lease-fence gate of this arm's bus driver: a request not yet applied by the
+    /// tick (plus authorized-stop generations when attached to an RT executor, and the lock-free
+    /// fence-first disconnect lease atomics).
     pub fn estop_gate(&self) -> crate::rt_core::urgent::EstopGate {
         let gate = crate::rt_core::urgent::EstopGate::from_state(
             self.estop_state.clone(),
             self.estop_applied.clone(),
-        );
+        )
+        .with_lease_gate(crate::rt_core::urgent::LeaseGate::new(
+            self.lease_gen_mirror.clone(),
+            self.atomic_fenced_lease_gen.clone(),
+            self.pending_disconnect_hold.clone(),
+        ));
         match self.stop_requests.as_ref() {
             Some(stops) => gate.with_stops(stops.clone()),
             None => gate,
@@ -3122,8 +3167,22 @@ impl SupervisorInner {
         self.stop_motion();
         self.servo_stream_active = false;
         self.tracking.invalidate();
-        self.commanded_positions = self.measured_hold_pose();
-        self.target_positions = self.commanded_positions.clone();
+        let gripper_idx = self.config.gripper_index();
+        if self.measured_positions.iter().all(|q| q.is_finite()) {
+            for (i, (c, m)) in self
+                .commanded_positions
+                .iter_mut()
+                .zip(&self.measured_positions)
+                .enumerate()
+            {
+                if Some(i) == gripper_idx {
+                    continue;
+                }
+                let l = &self.config.limits[i];
+                *c = m.clamp(l.min_position, l.max_position);
+            }
+        }
+        copy_into(&mut self.target_positions, &self.commanded_positions);
         self.commanded_velocities.fill(0.0);
         self.commanded_accelerations.fill(0.0);
         self.following_error_since = None;
@@ -3658,6 +3717,9 @@ impl SupervisorInner {
         let holder = self.lease_holder_str();
         if out.lease_holder.as_deref() != holder { out.lease_holder = holder.map(crate::model::HolderLabel::new); }
         out.motion_limit.clone_from(&self.motion_limit);
+        #[cfg(not(target_arch = "wasm32"))]
+        out.set_workspace_violation_rt(self.workspace_violation.as_ref());
+        #[cfg(target_arch = "wasm32")]
         set_opt_eq(&mut out.workspace_violation, self.workspace_violation.as_ref());
         if out.motor_errors != self.motor_errors { out.motor_errors.clone_from(&self.motor_errors); }
         out.residual_torques = self.residual_torques;
@@ -4551,6 +4613,7 @@ impl SupervisorInner {
             self.j7_admitted_stamp = Some(crate::driver::PosForceIntentStamp {
                 stop_gen: self.stop_gen.load(Ordering::SeqCst),
                 estop_epoch: self.safety.epoch_id(),
+                lease_gen: 0,
             });
         }
         self.active_trajectory = Some(ActiveTrajectory::new(None, Reference::Gripper(Box::new(motion))));
@@ -5122,6 +5185,7 @@ impl SupervisorInner {
     /// Attach a driver, bind tick-epilogue ownership of the single J7 `PosForce` emitter, and
     /// cache its lock-free clock handle (if provided).
     pub(crate) fn install_driver(&mut self, mut driver: Box<dyn ArmDriver>) {
+        driver.set_estop_gate(self.estop_gate());
         driver.set_external_pos_force_emitter(true);
         self.driver_clock = driver.driver_clock();
         self.driver = Some(std::sync::Mutex::new(driver));
@@ -5545,14 +5609,22 @@ impl SupervisorInner {
         }
     }
 
-    /// Current owner `(stop_gen, estop_epoch)` stamp read in the tick epilogue (and used for
-    /// non-target `Hold`/`Stop` intents). NEVER used to stamp a `PosForceIntent::Target`: every
-    /// `Target` carries the A1 [`AdmissionStamp`] captured in `self.j7_admitted_stamp`.
+    /// Current owner `(stop_gen, estop_epoch, lease_gen)` stamp read in the tick epilogue (and
+    /// used for non-target `Hold`/`Stop` intents). NEVER used to stamp a `PosForceIntent::Target`:
+    /// every `Target` carries the A1 [`AdmissionStamp`] captured in `self.j7_admitted_stamp`.
     #[inline]
     pub(crate) fn current_j7_intent_stamp(&self) -> crate::driver::PosForceIntentStamp {
+        let lease_gen = if self.pending_disconnect_hold.load(Ordering::SeqCst) > 0 {
+            0
+        } else {
+            let cur = self.lease_gen_mirror.load(Ordering::SeqCst);
+            let fenced = self.atomic_fenced_lease_gen.load(Ordering::SeqCst);
+            if cur > 0 && cur > fenced { cur } else { 0 }
+        };
         crate::driver::PosForceIntentStamp {
             stop_gen: self.current_stop_gen(),
             estop_epoch: self.safety.epoch_id(),
+            lease_gen,
         }
     }
 
@@ -5585,7 +5657,7 @@ impl SupervisorInner {
         //   deadline ends motion and NEVER suppresses a stop, hold, or freeze.
         let j7_effective_hold_or_freeze = j7_is_hold
             || !matches!(intent.kind, crate::driver::PosForceIntentKind::Target { .. })
-            || intent.stamp != current_stamp
+            || intent.stamp.is_stale_against(current_stamp)
             || !drv.pos_force_feedback_fresh();
         let action_cap = cutoff.and_then(|c| c.drv_action_cutoff);
         if j7_effective_hold_or_freeze {
@@ -5655,7 +5727,7 @@ impl SupervisorInner {
                     | TickOutput::Error { pf_status: dst_pf, .. } => {
                         *dst_pf = pf_status;
                     }
-                    TickOutput::EstopInhibited { .. } => {}
+                    TickOutput::EstopInhibited { .. } | TickOutput::LeaseFenced => {}
                 }
             }
             Ok(PosForceEmitOutcome::Sent { joint, pf_status, .. }) => {
@@ -5710,7 +5782,7 @@ impl SupervisorInner {
                         }
                         *dst_pf = pf_status;
                     }
-                    TickOutput::EstopInhibited { .. } => {}
+                    TickOutput::EstopInhibited { .. } | TickOutput::LeaseFenced => {}
                 }
             }
             Ok(PosForceEmitOutcome::Deferred { joint, pf_status }) => {
@@ -5816,11 +5888,19 @@ impl SupervisorInner {
                     TickOutput::EstopInhibited { is_hold } => {
                         *tick_output = TickOutput::EstopInhibited { is_hold };
                     }
+                    TickOutput::LeaseFenced => {
+                        *tick_output = TickOutput::LeaseFenced;
+                    }
                 }
             }
             Err(ArmDriverError::EstopInhibited) => {
                 if matches!(tick_output, TickOutput::None) {
                     *tick_output = TickOutput::EstopInhibited { is_hold: j7_is_hold };
+                }
+            }
+            Err(ArmDriverError::LeaseFenced) => {
+                if matches!(tick_output, TickOutput::None) {
+                    *tick_output = TickOutput::LeaseFenced;
                 }
             }
             Err(e) => {
@@ -5873,7 +5953,7 @@ impl SupervisorInner {
                             pf_status,
                         };
                     }
-                    TickOutput::EstopInhibited { .. } => {}
+                    TickOutput::EstopInhibited { .. } | TickOutput::LeaseFenced => {}
                 }
             }
         }
@@ -5956,6 +6036,7 @@ impl SupervisorInner {
             Err(crate::driver::ArmDriverError::EstopInhibited) => {
                 TickOutput::EstopInhibited { is_hold }
             }
+            Err(crate::driver::ArmDriverError::LeaseFenced) => TickOutput::LeaseFenced,
             Err(e) => {
                 let mut buf = crate::mit::OutputErrorText::empty();
                 e.write_bounded(&mut buf);
@@ -5983,7 +6064,7 @@ impl SupervisorInner {
         self.mit.deferred_park_action = None;
         self.release_servo_target();
         self.servo_settled_ticks.fill(0);
-        self.servo_ws_min_depths = None;
+        self.clear_servo_ws_min_depths_rt();
         self.servo_stream_active = false;
         if let Some(old_traj) = self.active_trajectory.take() {
             self.retire_active_trajectory(old_traj);
@@ -6077,7 +6158,7 @@ impl SupervisorInner {
         has_pending_motion: bool,
     ) -> bool {
         match output {
-            TickOutput::None => {
+            TickOutput::None | TickOutput::LeaseFenced => {
                 self.reset_hold_tx_joint_progress();
                 if !self.is_torqued || self.disable_pending || self.shutdown_committed {
                     self.reset_tx_joint_progress();
@@ -7431,7 +7512,16 @@ impl SupervisorInner {
                             if v.capacity() >= self.servo_target_spare.capacity() { self.servo_target_spare = v; }
                         }
                         self.servo_settled_ticks.fill(0);
-                        self.servo_ws_min_depths = None;
+                        if let Some((_, old)) = self.servo_ws_min_depths.take() {
+                            if old.is_heap() && self.ws_eval_bufs.min_depths_spare.is_none() {
+                                self.ws_eval_bufs.min_depths_spare = Some(old);
+                            } else if old.is_heap() && self.rt_executor_owned && self.pending_retired_stops.len() < self.pending_retired_stops.capacity() {
+                                self.pending_retired_stops.push_back(crate::rt_core::urgent::RetiredStopPayloads {
+                                    servo_ws_min_depths: Some((0, old)),
+                                    ..Default::default()
+                                });
+                            }
+                        }
                         self.tracking.invalidate();
                         copy_into(&mut self.target_positions, &self.commanded_positions);
                         self.commanded_velocities.fill(0.0);
@@ -7995,8 +8085,8 @@ impl SupervisorInner {
                         self.latch_servo_fault(i);
                     } else if let Some(i) = blocked {
                         self.enter_servo_blocked_hold(i, "no progress at the lead cap");
-                    } else if let Err(e) = self.servo_step_workspace(&next_positions, "servo_step") {
-                        self.enter_servo_keepout_hold(&e);
+                    } else if let Err(f) = self.servo_step_workspace_rt(&next_positions, "servo_step") {
+                        self.enter_servo_keepout_hold_rt(f);
                     } else {
                         // swap: the previous command's memory goes back to the scratch
                         std::mem::swap(&mut self.commanded_positions, &mut next_positions);
@@ -8017,7 +8107,7 @@ impl SupervisorInner {
                             self.release_servo_target();
                             self.safety.mark_motion_finished();
                             if self.commanded_velocities.iter().all(|&v| v == 0.0) {
-                                self.servo_ws_min_depths = None;
+                                self.clear_servo_ws_min_depths_rt();
                                 let keep_stream = self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled)
                                     && self.tracking.has_residual_lead(
                                         &self.commanded_positions,
@@ -8076,8 +8166,8 @@ impl SupervisorInner {
             let braking = self.commanded_velocities.iter().any(|&v| v != 0.0);
             if let Some(i) = infeasible {
                 self.latch_servo_fault(i);
-            } else if let Some(e) = braking.then(|| self.servo_step_workspace(&next_positions, "braking").err()).flatten() {
-                self.enter_servo_keepout_hold(&e);
+            } else if let Some(f) = braking.then(|| self.servo_step_workspace_rt(&next_positions, "braking").err()).flatten() {
+                self.enter_servo_keepout_hold_rt(f);
             } else {
                 // swap: the previous command's memory goes back to the scratch
                 std::mem::swap(&mut self.commanded_positions, &mut next_positions);
@@ -8085,7 +8175,7 @@ impl SupervisorInner {
                 copy_into(&mut self.target_positions, &self.commanded_positions);
                 if self.commanded_velocities.iter().all(|&v| v == 0.0) {
                     self.safety.mark_motion_finished();
-                    self.servo_ws_min_depths = None;
+                    self.clear_servo_ws_min_depths_rt();
                     let keep_stream = self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled)
                         && (braking
                             || self.tracking.has_residual_lead(
@@ -8207,10 +8297,19 @@ impl SupervisorInner {
                         if driver.enable_state() != EnableState::Disabled {
                             let is_hold = self.safety.state().is_stopped();
                             if is_hold || !self.disconnect_fence_blocks_output() {
+                                let output_lease_gen = if is_hold || gravity_exiting_or_failed {
+                                    0
+                                } else {
+                                    self.current_active_lease_gen()
+                                };
                                 let write_res = if is_hold {
+                                    driver.set_output_lease_gen(0);
                                     driver.write_estop_hold_bounded(&targets)
                                 } else {
-                                    driver.write_joint_targets_bounded(&targets)
+                                    driver.set_output_lease_gen(output_lease_gen);
+                                    let r = driver.write_joint_targets_bounded(&targets);
+                                    driver.set_output_lease_gen(0);
+                                    r
                                 };
                                 tick_output = Self::tick_output_from_driver_write(&mut **driver, is_hold, write_res);
                                 if matches!(tick_output, TickOutput::Complete { is_hold: false, .. }) {
@@ -8355,6 +8454,7 @@ impl SupervisorInner {
                                 | TickOutput::Expired { .. }
                                 | TickOutput::Error { .. }
                                 | TickOutput::EstopInhibited { .. }
+                                | TickOutput::LeaseFenced
                                 | TickOutput::ActionDeadlineRefused { .. }
                                 | TickOutput::None => {
                                     self.tracking.invalidate();
@@ -8476,7 +8576,9 @@ impl SupervisorInner {
                 }
             }
             match &tick_output {
-                TickOutput::EstopInhibited { .. } | TickOutput::ActionDeadlineRefused { .. } => {
+                TickOutput::EstopInhibited { .. }
+                | TickOutput::LeaseFenced
+                | TickOutput::ActionDeadlineRefused { .. } => {
                     tick_output = TickOutput::None;
                 }
                 TickOutput::Complete { is_hold: false, .. }
@@ -8485,6 +8587,26 @@ impl SupervisorInner {
                     tick_output = TickOutput::None;
                 }
                 _ => {}
+            }
+        }
+        // A disconnect / lease fence arriving between `mit.rs` output check and the TX / J7
+        // epilogue: apply the non-blocking disconnect fence now (stopping client motion and
+        // revoking target authority) and degrade any pending J7 `Target` intent to stationary
+        // `Hold` so the arm holds cleanly with ZERO old-generation motion on CAN.
+        let mut disconnect_fenced_mid_tick = false;
+        if self.disconnect_fence_blocks_output() || matches!(tick_output, TickOutput::LeaseFenced) {
+            disconnect_fenced_mid_tick = true;
+            allow_output_accepted = false;
+            driverless_accepted = false;
+            self.sync_nonblocking_disconnect_fence(now_fn());
+            if matches!(
+                tick_output,
+                TickOutput::LeaseFenced
+                    | TickOutput::Complete { is_hold: false, .. }
+                    | TickOutput::Deferred { is_hold: false, .. }
+                    | TickOutput::Expired { is_hold: false, .. }
+            ) {
+                tick_output = TickOutput::None;
             }
         }
         // Tick epilogue (BOTH Legacy and RT Executor owners): invoke the ONE J7 PosForce emitter
@@ -8505,7 +8627,10 @@ impl SupervisorInner {
                 || self.e_stop_latched.load(Ordering::SeqCst);
             let j7_intent = if j7_is_hold {
                 crate::driver::PosForceIntent::stop(current_stamp)
-            } else if matches!(tick_output, TickOutput::Error { .. } | TickOutput::Expired { .. }) {
+            } else if disconnect_fenced_mid_tick
+                || self.disconnect_fence_blocks_output()
+                || matches!(tick_output, TickOutput::Error { .. } | TickOutput::Expired { .. })
+            {
                 crate::driver::PosForceIntent::hold(current_stamp)
             } else {
                 self.j7_intent
@@ -11163,7 +11288,10 @@ impl ArmSupervisor {
             OWNER_EXECUTOR => {
                 if let Some(handle) = self.executor_handle() {
                     if local_gen > 0 {
-                        handle.close_servo(local_gen);
+                        // Non-blocking: `atomic_fenced_lease_gen` is already set above, so if
+                        // `servo_dispatcher`'s mutex is currently held, never block teardown; the
+                        // owner and dispatcher sync the authoritative fence asynchronously.
+                        let _ = handle.try_close_servo(local_gen);
                     }
                     handle.enqueue_disconnect_detached(conn);
                 } else {

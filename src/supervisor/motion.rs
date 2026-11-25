@@ -22,7 +22,7 @@ impl SupervisorInner {
             }
         }
         if reason != MotionLimitReason::Workspace {
-            self.workspace_violation = None;
+            self.clear_workspace_violation_rt();
         }
         self.motion_limit = Some(MotionLimit { reason, joint, since_ms: (now * 1000.0) as u64 });
         self.motion_limit_seen_s = now;
@@ -58,24 +58,18 @@ impl SupervisorInner {
         }
         if self.motion_limit.is_some() && self.now_s() - self.motion_limit_seen_s > MOTION_LIMIT_CLEAR_S {
             self.motion_limit = None;
-            self.workspace_violation = None;
+            self.clear_workspace_violation_rt();
         }
     }
 
     pub(crate) fn retire_servo_ws_min_depths(&mut self) {
-        if let Some(depths) = self.servo_ws_min_depths.take() {
-            if depths.1.is_heap() {
-                self.push_retired_stop(crate::rt_core::urgent::RetiredStopPayloads {
-                    servo_ws_min_depths: Some(depths),
-                    ..Default::default()
-                });
-            }
-        }
+        self.clear_servo_ws_min_depths_rt();
     }
 
     pub(crate) fn retire_motion_payloads(&mut self) {
         self.release_servo_target();
-        let servo_ws_min_depths = self.servo_ws_min_depths.take().filter(|d| d.1.is_heap());
+        self.clear_servo_ws_min_depths_rt();
+        let servo_ws_min_depths = None;
         let trajectory = match self.active_trajectory.take() {
             Some(traj) => {
                 if self.rt_executor_owned

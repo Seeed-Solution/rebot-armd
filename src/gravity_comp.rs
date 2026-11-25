@@ -525,10 +525,22 @@ impl SupervisorInner {
         let is_hold = use_estop_hold
             || self.safety.state().is_stopped()
             || self.e_stop_latched.load(std::sync::atomic::Ordering::SeqCst);
+        let is_exiting = self.gravity_comp.as_ref().is_some_and(|r| {
+            matches!(
+                r.phase,
+                crate::gravity_comp::GravityCompPhase::Exiting { .. }
+                    | crate::gravity_comp::GravityCompPhase::ExitFailed { .. }
+            )
+        });
+        let output_lease_gen = if is_hold || is_exiting { 0 } else { self.current_active_lease_gen() };
         let write_res = if is_hold {
+            drv.set_output_lease_gen(0);
             drv.write_estop_hold_bounded(&targets)
         } else {
-            drv.write_joint_targets_bounded(&targets)
+            drv.set_output_lease_gen(output_lease_gen);
+            let r = drv.write_joint_targets_bounded(&targets);
+            drv.set_output_lease_gen(0);
+            r
         };
         let out = crate::supervisor::SupervisorInner::tick_output_from_driver_write(&mut **drv, is_hold, write_res);
         // Never write a 0x307 frame outside the tick epilogue's ONE J7 emitter: record intent

@@ -3101,7 +3101,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     worker_task.abort();
     let _ = worker_task.await;
     if let Some(handle) = supervisor.executor_handle() {
-        handle.unregister_servo_connection(conn_id);
+        let _ = handle.try_unregister_servo_connection(conn_id);
     }
     heartbeat_task.abort();
     let _ = heartbeat_task.await;

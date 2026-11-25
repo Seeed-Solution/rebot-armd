@@ -185,7 +185,7 @@ fn a_disconnect_with_a_buffered_target_commands_nothing() {
     assert_eq!((r.target0(), &r.fx.core.target_positions), (None, &before));
     assert_eq!(reply, Some(json!({"type":"lease_lost", "generation":r.gen, "reason":"expired"})));
 
-    // the same with the stop the close requests: refused as stopped, no reply
+    // the same with the stop the close requests: refused as stopped, matching legacy servo_reject
     let mut r = rig();
     assert_eq!(r.servo(Some(1), 0.004), None);
     r.fx.core.release_lease(CONN, r.gen);
@@ -194,7 +194,13 @@ fn a_disconnect_with_a_buffered_target_commands_nothing() {
     assert!(rep.stopped);
     assert_eq!(rep.target, Some((1, Err("STOPPED"))));
     assert_eq!(r.target0(), None);
-    assert_eq!(servo_outcome_reply(&rep.target_refusal.unwrap(), &r.reply_ctx()), None);
+    let stop_reply = servo_outcome_reply(&rep.target_refusal.unwrap(), &r.reply_ctx())
+        .expect("STOPPED streaming frame must emit servo_reject with reason=stopped");
+    assert_eq!(stop_reply["type"], "servo_reject");
+    assert_eq!(stop_reply["status"], 409);
+    assert_eq!(stop_reply["code"], "STOPPED");
+    assert_eq!(stop_reply["error"], "STOPPED");
+    assert_eq!(stop_reply["reason"], "stopped");
     let mut outs = Vec::new();
     r.port.outcomes(|o: TargetOutcome| outs.push(o));
     assert_eq!(outs.len(), 1, "the stream hears the refusal");
@@ -827,6 +833,7 @@ fn servo_j7_admitted_stamp_updates_only_when_frame_moves_j7() {
         Some(crate::driver::PosForceIntentStamp {
             stop_gen: 0,
             estop_epoch: ep,
+            lease_gen: g1,
         }),
         "servo frame moving J7 must stamp j7_admitted_stamp from its admission"
     );
