@@ -517,18 +517,36 @@ fn stale_and_missing_feedback_refused_as_not_at_rest_on_both_owners() {
         FaultCode::BusLoss,
         FaultReason::BusLoss,
     );
-    // Advance driver clock beyond 100 ms without new feedback.
+    // Silence motors and advance driver clock beyond 100 ms: M3 defers and probes within the 1 s
+    // lifetime, then expires with TORQUE_OFF_WOULD_DROP and 0 CMD_DISABLE frames when motors stay silent.
+    bus.with(|s| {
+        s.rx.clear();
+        s.pending.clear();
+        for m in &mut s.motors {
+            m.silent = true;
+        }
+    });
     clock.advance(Duration::from_millis(101));
     assert_eq!(
         inner.may_disable_torque_while_stopped(),
         Err(StoppedTorqueOffRefusal::StaleOrMissingFeedback)
     );
+    bus.clear_log();
     let err = inner.disable_torque().unwrap_err();
     assert!(matches!(err, SafetyError::TorqueOffWouldDrop { joint: None, .. }), "{err:?}");
+    assert_eq!(
+        bus.tx_log().iter().filter(|f| f.data == damiao::CMD_DISABLE).count(),
+        0
+    );
     assert!(inner.is_torqued);
 
-    // Once K=3 fresh causal samples arrive after an observed-empty queue boundary (<= 100 ms,
-    // spanning >= 20 ms per S2), disable succeeds and keeps Fault latch.
+    // Once motors reply again and K=3 fresh causal samples arrive after an observed-empty queue
+    // boundary (<= 100 ms, spanning >= 20 ms per S2), disable succeeds and keeps Fault latch.
+    bus.with(|s| {
+        for m in &mut s.motors {
+            m.silent = false;
+        }
+    });
     inner.tick(0.02); // observe empty RX queue at current time
     for step in 0..3 {
         if step > 0 {
@@ -540,7 +558,8 @@ fn stale_and_missing_feedback_refused_as_not_at_rest_on_both_owners() {
     assert!(matches!(inner.disable_torque(), Ok(SafetyState::Fault(_))));
     assert!(!inner.is_torqued);
 
-    // 2. Executor owner with stale feedback (> 100 ms)
+    // 2. Executor owner with stale/silent feedback (> 100 ms): M3 defers into AwaitRestGate probe
+    //    loop and expires at 1 s with Outcome::Failed("TORQUE_OFF_WOULD_DROP") and 0 CMD_DISABLE frames.
     let mut r = ExecRig::new();
     r.arm_now();
     r.fx.core.safety.trigger_fault_coded(FaultCode::BusLoss, FaultReason::BusLoss);
@@ -554,10 +573,29 @@ fn stale_and_missing_feedback_refused_as_not_at_rest_on_both_owners() {
     });
     // Advance > 100 ms with no replies.
     r.clock.advance(Duration::from_millis(120));
+    r.bus.clear_log();
     r.submit_transition(TransitionOp::TorqueOff);
     let rep = r.step();
     assert!(!r.fx.core.hardware_feedback_fresh(Duration::from_millis(100)));
-    assert_eq!(rep.command.unwrap().1, Err("TORQUE_OFF_WOULD_DROP"));
+    assert!(
+        matches!(rep.command, Some((_, Ok(_)))),
+        "M3: drained stale bus must defer into probe loop, got {:?}",
+        rep.command
+    );
+    let mut expired = false;
+    for _ in 0..60 {
+        let rep_step = r.step();
+        if let Some((_, outcome)) = rep_step.transition_ended {
+            assert_eq!(outcome, Outcome::Failed("TORQUE_OFF_WOULD_DROP"));
+            expired = true;
+            break;
+        }
+    }
+    assert!(expired, "M3: silent bus must expire at 1 s lifetime");
+    assert_eq!(
+        r.bus.tx_log().iter().filter(|f| f.data == damiao::CMD_DISABLE).count(),
+        0
+    );
     assert_eq!(
         r.fx.core.last_stopped_torque_off_refusal(),
         Some(StoppedTorqueOffRefusal::StaleOrMissingFeedback)
@@ -622,13 +660,23 @@ fn estop_same_rules_and_disable_exempt_from_stop_gate_on_both_owners() {
     assert_eq!(inner.safety.fault(), fault_before, "failed disable must not mutate fault detail");
     assert!(inner.disable_pending, "sticky disable_pending must stay set on failure");
 
-    // At rest -> stale feedback -> refused without mutating EStop latch, fault record, or epoch.
-    bus.with(|s| s.tx_error = false);
+    // At rest -> stale + silent bus -> probe loop expires at 1 s without mutating EStop latch, fault record, or epoch.
+    bus.with(|s| {
+        s.tx_error = false;
+        for m in &mut s.motors {
+            m.silent = true;
+        }
+    });
     clock.advance(Duration::from_millis(150));
     assert!(matches!(
         inner.disable_torque(),
         Err(SafetyError::TorqueOffWouldDrop { joint: None, .. })
     ));
+    bus.with(|s| {
+        for m in &mut s.motors {
+            m.silent = false;
+        }
+    });
     assert_eq!(*inner.safety.state(), SafetyState::EStop);
     assert_eq!(inner.safety.epoch_id(), epoch_before);
     assert_eq!(inner.safety.latched_fault_kinds(), kinds_before);
@@ -2035,14 +2083,40 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
                 assert!(poll_res.is_ok(), "legacy handshake resend at rest failed: {poll_res:?}");
                 assert!(disables > 0, "legacy handshake resend at rest must transmit retry disable");
             }
-            PoseCase::Raised | PoseCase::Stale => {
+            PoseCase::Raised => {
                 assert!(
                     matches!(poll_res, Err(armd::driver::ArmDriverError::TorqueOffWouldDrop)),
-                    "legacy handshake resend ({pose:?}) must refuse with TorqueOffWouldDrop, got {poll_res:?}"
+                    "legacy handshake resend (Raised) must refuse immediately with TorqueOffWouldDrop, got {poll_res:?}"
                 );
                 assert_eq!(
                     disables, 0,
-                    "legacy handshake resend ({pose:?}) must transmit ZERO disable frames"
+                    "legacy handshake resend (Raised) must transmit ZERO disable frames"
+                );
+            }
+            PoseCase::Stale => {
+                // M3: Stale evidence defers within 1 s with ZERO disable frames and refuses on 1 s expiry.
+                assert!(
+                    matches!(poll_res, Ok(armd::driver::TorqueProgress::Pending { .. })),
+                    "legacy handshake resend (Stale) must defer within 1 s lifetime, got {poll_res:?}"
+                );
+                assert_eq!(
+                    disables, 0,
+                    "legacy handshake resend (Stale) must transmit ZERO disable frames"
+                );
+                clock.advance(Duration::from_secs(1));
+                let exp_res = {
+                    let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+                    let dl = drv.clock_now() + Duration::from_millis(5);
+                    drv.poll_torque(dl)
+                };
+                assert!(
+                    matches!(exp_res, Err(armd::driver::ArmDriverError::DisableRequestExpired)),
+                    "legacy handshake resend (Stale) must refuse on 1 s expiry, got {exp_res:?}"
+                );
+                assert_eq!(
+                    count_damiao_disables(&bus),
+                    0,
+                    "legacy handshake resend (Stale) past 1 s expiry must transmit ZERO disable frames"
                 );
             }
         }
@@ -2157,16 +2231,40 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
             PoseCase::AtRest => {
                 assert!(disables > 0, "RT poll retry at rest must transmit disable retry frame");
             }
-            PoseCase::Raised | PoseCase::Stale => {
+            PoseCase::Raised => {
                 assert_eq!(
                     rep.transition_ended.map(|(_, o)| o),
                     Some(Outcome::Failed("TORQUE_OFF_WOULD_DROP")),
-                    "RT poll retry ({pose:?}) must fail with TORQUE_OFF_WOULD_DROP"
+                    "RT poll retry (Raised) must fail immediately with TORQUE_OFF_WOULD_DROP"
                 );
                 assert!(!r.fx.core.disable_pending);
                 assert_eq!(
                     disables, 0,
-                    "RT poll retry ({pose:?}) must transmit ZERO disable frames"
+                    "RT poll retry (Raised) must transmit ZERO disable frames"
+                );
+            }
+            PoseCase::Stale => {
+                // M3: Stale evidence defers within 1 s with ZERO disable frames and expires at 1 s.
+                assert_eq!(
+                    rep.transition_ended, None,
+                    "RT poll retry (Stale) must defer within 1 s lifetime"
+                );
+                assert_eq!(
+                    disables, 0,
+                    "RT poll retry (Stale) must transmit ZERO disable frames"
+                );
+                r.clock.advance(Duration::from_secs(1));
+                let rep_exp = r.step();
+                assert_eq!(
+                    rep_exp.transition_ended.map(|(_, o)| o),
+                    Some(Outcome::Failed("TORQUE_OFF_WOULD_DROP")),
+                    "RT poll retry (Stale) must fail at 1 s expiry with TORQUE_OFF_WOULD_DROP"
+                );
+                assert!(!r.fx.core.disable_pending);
+                assert_eq!(
+                    count_damiao_disables(&r.bus),
+                    0,
+                    "RT poll retry (Stale) past 1 s expiry must transmit ZERO disable frames"
                 );
             }
         }
@@ -2245,6 +2343,11 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
                     });
                 }
                 PoseCase::Stale => {
+                    bus.with(|s| {
+                        for m in &mut s.motors {
+                            m.silent = true;
+                        }
+                    });
                     clock.advance(Duration::from_millis(110));
                 }
             }
@@ -2469,12 +2572,19 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
                 assert!(req_res.is_ok(), "Feetech DisableRequested at rest failed: {req_res:?}");
                 assert_eq!(req_disables, 6);
             }
-            PoseCase::Raised | PoseCase::Stale => {
+            PoseCase::Raised => {
                 assert!(
                     matches!(req_res, Err(armd::driver::ArmDriverError::TorqueOffWouldDrop)),
-                    "Feetech DisableRequested ({pose:?}) must refuse, got {req_res:?}"
+                    "Feetech DisableRequested (Raised) must refuse immediately, got {req_res:?}"
                 );
-                assert_eq!(req_disables, 0, "Feetech DisableRequested ({pose:?}) must send 0 packets");
+                assert_eq!(req_disables, 0, "Feetech DisableRequested (Raised) must send 0 packets");
+            }
+            PoseCase::Stale => {
+                assert!(
+                    matches!(req_res, Err(armd::driver::ArmDriverError::DisableRequestExpired)),
+                    "Feetech DisableRequested (Stale) must defer/probe and expire at 1 s, got {req_res:?}"
+                );
+                assert_eq!(req_disables, 0, "Feetech DisableRequested (Stale) must send 0 packets");
             }
         }
 
@@ -4742,13 +4852,13 @@ fn e2_rest_pose_disable_gate_refuses_queued_raised_pose_behind_exhausted_drain()
         );
 
         // Next tick finishes draining the backlog (`mark_rx_empty` clears untrusted backlog
-        // timestamps -> still refused as StaleOrMissingFeedback, 0 CMD_DISABLE frames). Then fresh
-        // post-boundary feedback at the raised pose (0.45 rad) refuses as JointOutsideRest!
+        // timestamps -> M3 defers in AwaitRestGate with 0 CMD_DISABLE frames). Then fresh
+        // post-boundary feedback at the raised pose (0.45 rad) refuses immediately as TorqueOffWouldDrop!
         {
             let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
             let _ = drv.read_joint_states().unwrap();
             let started = drv.clock_now();
-            let err = drv
+            let p = drv
                 .begin_disable_torque_budgeted(
                     DisableKind::DisableRequested {
                         started_at: started,
@@ -4756,8 +4866,8 @@ fn e2_rest_pose_disable_gate_refuses_queued_raised_pose_behind_exhausted_drain()
                     },
                     0,
                 )
-                .unwrap_err();
-            assert!(matches!(err, ArmDriverError::TorqueOffWouldDrop));
+                .expect("M3: drained stale/missing backlog must defer into AwaitRestGate");
+            assert!(matches!(p, TorqueProgress::Pending { .. }));
         }
         assert_eq!(
             bus.tx_log().iter().filter(|f| f.data == damiao::CMD_DISABLE).count(),
@@ -4771,7 +4881,15 @@ fn e2_rest_pose_disable_gate_refuses_queued_raised_pose_behind_exhausted_drain()
             s.motors[0].q = 0.45;
             s.push_all_feedback();
         });
-        inner.tick(0.02);
+        {
+            let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+            let dl = drv.clock_now() + Duration::from_millis(5);
+            let err = drv.poll_torque_budgeted(dl, 64).unwrap_err();
+            assert!(
+                matches!(err, ArmDriverError::TorqueOffWouldDrop),
+                "M3: fresh raised pose arriving during AwaitRestGate must refuse immediately, got {err:?}"
+            );
+        }
         assert!(matches!(
             inner.may_disable_torque_while_stopped(),
             Err(StoppedTorqueOffRefusal::JointOutsideRest { joint_index: 0, .. })
@@ -8647,50 +8765,47 @@ fn r11_m2_damiao_rest_gate_covers_every_cmd_disable_motor_including_j7() {
         r.step();
     }
 
-    // With J7 stale, Damiao rest gate MUST NOT be Confirmed and MUST emit 0 CMD_DISABLE frames!
+    // With J7 stale, Damiao rest gate MUST NOT be Confirmed: M3 defers into AwaitRestGate with
+    // 0 CMD_DISABLE frames while probing J7 across releases!
     r.bus.clear_log();
     r.submit_transition(TransitionOp::TorqueOff);
-    let _rep = r.step();
+    let rep0 = r.step();
+    assert!(
+        matches!(rep0.command, Some((_, Ok(_)))),
+        "M2+M3: TorqueOff with silent J7 defers in AwaitRestGate, got {:?}",
+        rep0.command
+    );
+    assert!(rep0.transition_ended.is_none());
+    for _ in 0..3 {
+        let rep = r.step();
+        assert!(
+            rep.transition_ended.is_none(),
+            "M2: TorqueOff must remain pending while J7 is silent"
+        );
+    }
     assert_eq!(
         r.bus.tx_log().iter().filter(|f| f.data == damiao::CMD_DISABLE).count(),
         0,
         "M2: silent J7 must prevent CMD_DISABLE transmission even when J1..J6 are confirmed at rest"
     );
+    assert!(
+        r.bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data[0] == 7 && f.data[2] == 0xCC),
+        "M2: poll_await_rest_gate must emit 0xCC probe for J7 (motor 7)"
+    );
     assert!(r.fx.core.is_torqued);
     assert_eq!(r.fx.core.torque_intent, armd::TorqueIntent::On);
 
     // Unmute J7 at an arbitrary non-zero jaw position (-2.5 rad, far outside arm rest tolerance):
-    // 1 and 2 samples are NOT enough; 3rd sample across 3 releases confirms J7 and allows disable!
+    // 1st J7 sample is NOT enough (gate stays PendingDrainOrWindow, 0 CMD_DISABLE); once probes
+    // collect K=3 fresh J7 samples across 3 releases, the SAME pending TorqueOff completes!
     r.bus.with(|s| {
         s.motors[6].silent = false;
         s.motors[6].q = -2.5;
     });
-    // Feed 1st J7 sample (still < K=3): gate is PendingDrainOrWindow, not yet Confirmed.
-    r.clock.advance(Duration::from_millis(10));
-    r.bus.with(|s| s.push_all_feedback());
-    r.step();
-    {
-        let drv = r.fx.core.driver.as_ref().unwrap().lock().unwrap();
-        assert_eq!(
-            drv.rest_pose_gate_status(),
-            armd::driver::RestPoseGateStatus::PendingDrainOrWindow,
-            "M2: single J7 sample must leave Damiao rest gate PendingDrainOrWindow"
-        );
-    }
-
-    // Submit TorqueOff while J7 has only 1 sample: must stay Pending (0 CMD_DISABLE) and probe J7 (0xCC)!
-    r.bus.clear_log();
-    r.submit_transition(TransitionOp::TorqueOff);
-    let rep_pending = r.step();
+    let rep1 = r.step();
     assert!(
-        matches!(rep_pending.command, Some((_, Ok(_)))),
-        "M2: TorqueOff with 1 J7 sample must defer cleanly into AwaitRestGate, got {:?}",
-        rep_pending.command
-    );
-    assert!(
-        rep_pending.transition_ended.is_none(),
-        "M2: TorqueOff must stay pending while waiting for J7 K=3 window, got {:?}",
-        rep_pending.transition_ended
+        rep1.transition_ended.is_none(),
+        "M2: single J7 sample must not satisfy K=3 rest gate yet"
     );
     assert_eq!(
         r.bus.tx_log().iter().filter(|f| f.data == damiao::CMD_DISABLE).count(),
@@ -8698,8 +8813,6 @@ fn r11_m2_damiao_rest_gate_covers_every_cmd_disable_motor_including_j7() {
         "M2: 0 CMD_DISABLE frames before J7 reaches K=3"
     );
 
-    // Step across subsequent releases so J7 reaches K=3 fresh samples (via probes/feedback)
-    // and completes the disable even though J7 jaw is at -2.5 rad!
     let mut completed = false;
     for _ in 0..10 {
         let rep = r.step();
@@ -8715,13 +8828,139 @@ fn r11_m2_damiao_rest_gate_covers_every_cmd_disable_motor_including_j7() {
     }
     assert!(completed, "M2: TorqueOff must complete after J7 probes collect K=3 samples");
     assert!(
-        r.bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data[0] == 7 && f.data[2] == 0xCC),
-        "M2: poll_await_rest_gate must emit 0xCC probe for J7 (motor 7)"
-    );
-    assert!(
         r.bus.tx_log().iter().filter(|f| f.data == damiao::CMD_DISABLE).count() >= 7,
         "M2: all 7 motors receive CMD_DISABLE once J7 reaches K=3"
     );
     assert!(!r.fx.core.is_torqued);
     assert_eq!(r.fx.core.torque_intent, armd::TorqueIntent::Off);
+}
+
+#[test]
+fn r11_m3_drained_bus_stale_or_missing_defers_and_probes_within_1s_lifetime() {
+    // Part A: Drained bus with stale (> 100 ms) feedback while stopped & motors alive at rest ->
+    // TorqueOff MUST defer (Pending, 0 CMD_DISABLE), run 0xCC probe loop, and succeed within 1 s!
+    let mut r = ExecRig::new();
+    r.arm_now();
+    r.fx.core.safety.trigger_fault_coded(FaultCode::BusLoss, FaultReason::BusLoss);
+    r.bus.with(|s| {
+        s.follow_commands = false;
+        s.rx.clear();
+        s.pending.clear();
+        s.delayed.clear();
+    });
+    // Advance > 100 ms without pushing new feedback (bus is drained and stale).
+    r.clock.advance(Duration::from_millis(150));
+    {
+        let drv = r.fx.core.driver.as_ref().unwrap().lock().unwrap();
+        assert_eq!(
+            drv.rest_pose_gate_status(),
+            armd::driver::RestPoseGateStatus::StaleOrMissing,
+            "precondition: drained bus with >100ms feedback must report StaleOrMissing"
+        );
+    }
+
+    r.bus.clear_log();
+    r.submit_transition(TransitionOp::TorqueOff);
+    let rep0 = r.step();
+    assert!(
+        matches!(rep0.command, Some((_, Ok(_)))),
+        "M3: drained stale bus must defer TorqueOff instead of refusing immediately, got {:?}",
+        rep0.command
+    );
+    assert!(rep0.transition_ended.is_none(), "M3: must wait in AwaitRestGate probe loop");
+    assert_eq!(
+        r.bus.tx_log().iter().filter(|f| f.data == damiao::CMD_DISABLE).count(),
+        0,
+        "M3: 0 CMD_DISABLE frames before probe loop gathers K=3 fresh rest samples"
+    );
+
+    // Subsequent releases run the 0xCC probe loop, collect K=3 fresh rest replies, and disable!
+    let mut done = false;
+    for _ in 0..10 {
+        let rep = r.step();
+        if let Some((_, outcome)) = rep.transition_ended {
+            assert_eq!(outcome, Outcome::Completed, "M3: probe loop must confirm rest and disable: {outcome:?}");
+            done = true;
+            break;
+        }
+    }
+    assert!(done, "M3: deferred stale-bus disable must complete via probe loop within 1 s");
+    assert!(
+        r.bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data[2] == 0xCC),
+        "M3: must transmit read-only 0xCC status probes while awaiting stale/missing evidence"
+    );
+    assert!(!r.fx.core.is_torqued);
+    assert_eq!(r.fx.core.torque_intent, armd::TorqueIntent::Off);
+
+    // Part B: Drained bus with silent motors -> defers and probes, then expires at 1 s with
+    // TORQUE_OFF_WOULD_DROP and 0 CMD_DISABLE frames.
+    let mut r_silent = ExecRig::new();
+    r_silent.arm_now();
+    r_silent.fx.core.safety.trigger_fault_coded(FaultCode::BusLoss, FaultReason::BusLoss);
+    r_silent.bus.with(|s| {
+        s.follow_commands = false;
+        s.rx.clear();
+        s.pending.clear();
+        s.delayed.clear();
+        for m in &mut s.motors {
+            m.silent = true;
+        }
+    });
+    r_silent.clock.advance(Duration::from_millis(150));
+    r_silent.bus.clear_log();
+    r_silent.submit_transition(TransitionOp::TorqueOff);
+    let rep_s0 = r_silent.step();
+    assert!(matches!(rep_s0.command, Some((_, Ok(_)))), "M3: silent bus must defer first");
+    assert!(rep_s0.transition_ended.is_none());
+
+    // Advance through probes until the 1 s lifetime expires (50 Hz = 50 releases = 1.0 s).
+    let mut expired = false;
+    for _ in 0..60 {
+        let rep = r_silent.step();
+        if let Some((_, outcome)) = rep.transition_ended {
+            assert!(
+                matches!(outcome, Outcome::Failed("TORQUE_OFF_WOULD_DROP")),
+                "M3: silent bus must expire at 1 s with TORQUE_OFF_WOULD_DROP, got {outcome:?}"
+            );
+            expired = true;
+            break;
+        }
+    }
+    assert!(expired, "M3: silent bus disable must expire at 1 s lifetime");
+    assert!(
+        r_silent.bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data[2] == 0xCC),
+        "M3: silent bus must still have run 0xCC probes before expiry"
+    );
+    assert_eq!(
+        r_silent.bus.tx_log().iter().filter(|f| f.data == damiao::CMD_DISABLE).count(),
+        0,
+        "M3: silent bus expiry must emit 0 CMD_DISABLE frames"
+    );
+    assert!(r_silent.fx.core.is_torqued);
+    assert_eq!(r_silent.fx.core.torque_intent, armd::TorqueIntent::On);
+
+    // Part C: Real non-rest pose refuses IMMEDIATELY (no 1 s wait, 0 CMD_DISABLE frames).
+    let mut r_raised = ExecRig::new();
+    r_raised.arm_now();
+    r_raised.bus.with(|s| {
+        s.follow_commands = false;
+        s.rx.clear();
+        s.pending.clear();
+        s.motors[1].q = 0.45;
+        s.push_all_feedback();
+    });
+    r_raised.step();
+    r_raised.fx.core.safety.trigger_fault_coded(FaultCode::BusLoss, FaultReason::BusLoss);
+    r_raised.bus.clear_log();
+    r_raised.submit_transition(TransitionOp::TorqueOff);
+    let rep_r = r_raised.step();
+    assert_eq!(
+        rep_r.command.map(|(_, r)| r),
+        Some(Err("TORQUE_OFF_WOULD_DROP")),
+        "M3: real non-rest pose must still refuse IMMEDIATELY without deferring"
+    );
+    assert_eq!(
+        r_raised.bus.tx_log().iter().filter(|f| f.data == damiao::CMD_DISABLE).count(),
+        0
+    );
 }

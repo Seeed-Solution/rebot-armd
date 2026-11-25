@@ -4137,12 +4137,15 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                 }
                 match self.evaluate_rest_pose_gate() {
                     RestPoseGateStatus::Confirmed => {}
-                    RestPoseGateStatus::PendingDrainOrWindow => {
+                    // M3: Defer both incomplete drains/windows and stale/missing evidence into the
+                    // 1 s probe loop; refuse immediately only on a real non-rest pose or 1 s expiry.
+                    RestPoseGateStatus::PendingDrainOrWindow
+                    | RestPoseGateStatus::StaleOrMissing => {
                         self.pending_disable = Some(kind);
                         let wake = (self.clock_now() + EVIDENCE_PROBE_INTERVAL).min(exp);
                         return Ok(TorqueProgress::Pending { wake });
                     }
-                    RestPoseGateStatus::StaleOrMissing | RestPoseGateStatus::RefusedNonRest => {
+                    RestPoseGateStatus::RefusedNonRest => {
                         return Err(ArmDriverError::TorqueOffWouldDrop);
                     }
                 }
@@ -6492,10 +6495,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
         match self.evaluate_rest_pose_gate() {
             RestPoseGateStatus::Confirmed => Ok(()),
-            RestPoseGateStatus::PendingDrainOrWindow => Err(TxRefusal::DisableWaitEvidence),
-            RestPoseGateStatus::StaleOrMissing | RestPoseGateStatus::RefusedNonRest => {
-                Err(TxRefusal::TorqueOffWouldDrop)
+            // M3: A drained bus with stale or missing evidence defers into `AwaitRestGate` and
+            // runs the probe loop within the 1 s lifetime; only a real non-rest pose (or 1 s
+            // expiry checked above) refuses immediately.
+            RestPoseGateStatus::PendingDrainOrWindow | RestPoseGateStatus::StaleOrMissing => {
+                Err(TxRefusal::DisableWaitEvidence)
             }
+            RestPoseGateStatus::RefusedNonRest => Err(TxRefusal::TorqueOffWouldDrop),
         }
     }
 
@@ -15568,7 +15574,7 @@ mod tx_chokepoint_tests {
             TxKind::DisableRequested { .. }
             | TxKind::DisableProtective { .. }
             | TxKind::DisableProbe => Expected::Sent,
-            TxKind::Refresh | TxKind::RollbackHold(_) | TxKind::ClearFault => match stop {
+            TxKind::Refresh | TxKind::RollbackHold(_) | TxKind::MeasuredHold(_) | TxKind::ClearFault => match stop {
                 StopCase::Pending => Expected::RefusedStop,
                 StopCase::NoStop | StopCase::Latched => Expected::Sent,
             },
@@ -16025,14 +16031,14 @@ mod tx_chokepoint_tests {
             .is_ok());
         assert_eq!(bus.tx_len(), 1);
 
-        // 3. Stale feedback (> 100 ms) -> refused with TorqueOffWouldDrop, 0 TX.
+        // 3. Stale feedback (> 100 ms) within 1 s lifetime -> defers with DisableWaitEvidence (M3), 0 TX.
         clock.advance(Duration::from_millis(101));
         bus.clear_tx();
         assert!(matches!(
             drv.send(TxKind::DisableRequested { started_at: t0, rollback: false }, None, None, false, |d| {
                 Some(damiao::build_disable_frame(d.motor_ids[0]))
             }),
-            Err(TxRefusal::TorqueOffWouldDrop)
+            Err(TxRefusal::DisableWaitEvidence)
         ));
         assert_eq!(bus.tx_len(), 0);
 

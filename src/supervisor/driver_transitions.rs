@@ -3378,13 +3378,17 @@ impl SupervisorInner {
     }
 
     /// True when the driver can keep a stopped disable pending inside its 1 s lifetime while an
-    /// exhausted RX drain or incomplete K=3 rest-pose window completes (L1). Zero heap allocations.
+    /// exhausted RX drain, incomplete K=3 rest-pose window, or stale/missing evidence on a drained
+    /// bus runs the probe loop (L1/M3). Zero heap allocations.
     fn can_defer_stopped_disable_to_driver(&self) -> bool {
         self.driver.as_ref().is_some_and(|d| {
             d.lock().is_ok_and(|drv| {
                 drv.supports_budgeted_disable_await()
-                    && drv.rest_pose_gate_status()
-                        == crate::driver::RestPoseGateStatus::PendingDrainOrWindow
+                    && matches!(
+                        drv.rest_pose_gate_status(),
+                        crate::driver::RestPoseGateStatus::PendingDrainOrWindow
+                            | crate::driver::RestPoseGateStatus::StaleOrMissing
+                    )
             })
         })
     }
