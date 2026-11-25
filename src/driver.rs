@@ -1479,6 +1479,16 @@ pub trait ArmDriver: Send {
         self.begin_torque(enabled)
     }
 
+    /// Budgeted [`Self::begin_torque`] that also allows a bounded, ticked retry of an unverified
+    /// startup mapping-range check (legacy WS path; RT executor keeps [`Self::begin_torque_budgeted`]).
+    fn begin_torque_budgeted_with_range_retry(
+        &mut self,
+        enabled: bool,
+        max_rx_frames: u16,
+    ) -> Result<TorqueProgress, ArmDriverError> {
+        self.begin_torque_budgeted(enabled, max_rx_frames)
+    }
+
     /// Budgeted non-blocking hardware torque disable with an explicit [`DisableKind`].
     fn begin_disable_torque_budgeted(
         &mut self,
@@ -1525,7 +1535,7 @@ pub trait ArmDriver: Send {
     /// driver's own frame / time bound), at most one retransmit per joint, no sleep. Err when the
     /// transition failed (or none is pending).
     fn poll_torque(&mut self, _deadline: Instant) -> Result<TorqueProgress, ArmDriverError> {
-        Err(ArmDriverError::Protocol("no torque transition pending".into()))
+        Err(ArmDriverError::ProtocolStatic("no torque transition pending"))
     }
 
     /// Budgeted [`Self::poll_torque`] capping bus RX to `max_rx_frames` and `deadline`.
@@ -1560,6 +1570,14 @@ pub trait ArmDriver: Send {
     /// Aborts any pending enable handshake without transmitting further enable frames
     /// (called when E-stop or a fault intervenes mid-enable).
     fn abort_enable(&mut self) {}
+
+    /// Aborts a pending non-protective disable handshake ONLY if no disable frame has been
+    /// transmitted yet (`!disable_frames_dispatched()`). Returns `true` when aborted or idle,
+    /// and `false` when disable frames have already been dispatched or the disable is protective
+    /// (so hardware completion must continue).
+    fn abort_pending_disable(&mut self) -> bool {
+        !self.disable_frames_dispatched()
+    }
 
     /// One panic-disable retry step for multi-motor drivers: transmits disable to every motor
     /// not yet confirmed disabled without aborting remaining motors on a single-motor TX error,
@@ -4995,6 +5013,20 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         self.disable_dispatched_mask
     }
 
+    fn abort_pending_disable(&mut self) -> bool {
+        match self.pending_disable {
+            None => true,
+            Some(ref p)
+                if matches!(p.kind, DisableKind::DisableRequested { .. })
+                    && self.disable_dispatched_mask == 0 =>
+            {
+                self.pending_disable = None;
+                true
+            }
+            Some(_) => false,
+        }
+    }
+
     fn motor_status(&self) -> Option<Vec<u8>> {
         Some(self.motor_status.clone())
     }
@@ -7310,6 +7342,9 @@ impl PendingTxQueue {
 /// Phase of a pending Damiao torque transition.
 #[derive(Debug)]
 enum DamiaoTorque {
+    /// Budgeted legacy enable retrying mapping-range readback for joints still `Unverified` at
+    /// startup before draining/restoring/enabling (zero heap allocations on the control release).
+    RangeCheck(RangeCheckPhase),
     /// Budgeted enable waiting for an empty RX queue boundary before mode restore / enable TX.
     DrainBeforeEnable(Deadline),
     /// Enable, pre-restore refresh: waiting for a fresh J7 0xCC feedback reply before writing CTRL_MODE.
@@ -7347,6 +7382,20 @@ enum DamiaoTorque {
         mit_fenced: bool,
     },
 }
+
+/// Inline zero-allocation state for ticked mapping-range verification of joints that were
+/// `RangeCheckStatus::Unverified` at daemon startup (legacy budgeted enable path).
+#[derive(Debug)]
+struct RangeCheckPhase {
+    pending_mask: u32,
+    active_joint: Option<u8>,
+    boundary: Option<u64>,
+    sent_rids: u8,
+    deadline: Deadline,
+}
+
+/// Time allowed for register replies during ticked range-check recovery (safe at 50 Hz ticks).
+const TICKED_RANGE_CHECK_REPLY_TIMEOUT: Duration = Duration::from_millis(60);
 
 /// Bounded 0xCC feedback refresh for the position-force gripper during enable: `boundary` is the
 /// transmit-time RX sequence barrier established after draining RX right before sending 0xCC
@@ -10591,12 +10640,20 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     /// Enable, first step: fast path, range check, receive boundary, then either the base-mode
     /// restore (`Restore`) or the enable frames (`Enable`).
     fn begin_enable(&mut self) -> Result<TorqueProgress, ArmDriverError> {
-        self.begin_enable_budgeted(None)
+        self.begin_enable_budgeted_inner(None, false)
     }
 
     fn begin_enable_budgeted(&mut self, max_rx_frames: Option<u16>) -> Result<TorqueProgress, ArmDriverError> {
+        self.begin_enable_budgeted_inner(max_rx_frames, false)
+    }
+
+    fn begin_enable_budgeted_inner(
+        &mut self,
+        max_rx_frames: Option<u16>,
+        allow_ticked_range_retry: bool,
+    ) -> Result<TorqueProgress, ArmDriverError> {
         if self.torque_hs.is_some() {
-            return Err(ArmDriverError::Protocol("a torque transition is pending".into()));
+            return Err(ArmDriverError::ProtocolStatic("a torque transition is pending"));
         }
         self.discard_all_pending_tx();
         if max_rx_frames.is_none() {
@@ -10628,15 +10685,44 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
 
         // A motor that did not answer the startup range read gets another (read-only)
-        // try before each enable in the legacy path; budgeted zero-RX commits fail closed
-        // instead of blocking for register readback.
+        // try before each enable in the legacy path; budgeted RT commits fail closed
+        // (`RangeCheckUnverified`), while budgeted legacy WS commits run a bounded ticked
+        // `DamiaoTorque::RangeCheck` phase without blocking under the supervisor write guard.
         if self.range_check.as_ref().is_some_and(|c| c.status == RangeCheckStatus::Unverified) {
             if max_rx_frames == Some(0) {
-                self.is_enabled = false;
-                self.pending_rearm = true;
-                return Err(ArmDriverError::RangeCheckUnverified);
+                if allow_ticked_range_retry {
+                    let mut pending_mask = 0u32;
+                    if let Some(ref rc) = self.range_check {
+                        let dof = self.motor_ids.len().min(handshake::MAX_MASK_JOINTS);
+                        for (i, j) in rc.joints.iter().enumerate().take(dof) {
+                            if j.status == RangeCheckStatus::Unverified {
+                                pending_mask |= 1u32 << i;
+                            }
+                        }
+                    }
+                    if pending_mask != 0 {
+                        self.enable_stop_stamp = Some(self.current_stop_stamp());
+                        self.is_enabling = true;
+                        self.last_command_was_disable = false;
+                        self.disable_dispatched_mask = 0;
+                        let now = self.now();
+                        self.torque_hs = Some(DamiaoTorque::RangeCheck(RangeCheckPhase {
+                            pending_mask,
+                            active_joint: None,
+                            boundary: None,
+                            sent_rids: 0,
+                            deadline: Deadline::after(now, DAMIAO_RX_PASS),
+                        }));
+                        return Ok(TorqueProgress::Pending { wake: now });
+                    }
+                } else {
+                    self.is_enabled = false;
+                    self.pending_rearm = true;
+                    return Err(ArmDriverError::RangeCheckUnverified);
+                }
+            } else {
+                self.check_mapping_ranges();
             }
-            self.check_mapping_ranges();
         }
         if self.range_check.as_ref().is_some_and(|c| c.status == RangeCheckStatus::Mismatch) {
             self.is_enabled = false;
@@ -10767,6 +10853,192 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             return Ok(TorqueProgress::Pending { wake });
         }
         self.readback_or_enable()
+    }
+
+    /// Budgeted legacy mapping-range retry for joints that were `RangeCheckStatus::Unverified` at
+    /// startup: sends read-only CTRL_MODE / PMAX / VMAX / TMAX requests after an observed-empty
+    /// RX boundary, validates causal replies, updates `self.range_check` in place (zero heap
+    /// allocation), refuses with `RangeCheckMismatch` on any mismatch, and proceeds into enable
+    /// once every unverified joint has been checked.
+    fn poll_range_check(&mut self, mut rc: RangeCheckPhase) -> Result<TorqueProgress, ArmDriverError> {
+        const RIDS: [u8; 4] = [
+            damiao::RID_CTRL_MODE,
+            damiao::RID_PMAX,
+            damiao::RID_VMAX,
+            damiao::RID_TMAX,
+        ];
+        self.enable_estop_inhibited()?;
+        let _ = self.receive_feedback();
+        self.enable_estop_inhibited()?;
+
+        let j = match rc.active_joint {
+            Some(j) => usize::from(j),
+            None => {
+                let Some(next) = handshake::mask_joints(rc.pending_mask).next() else {
+                    return self.continue_enable_after_drain(self.last_read_drained);
+                };
+                rc.active_joint = Some(next as u8);
+                rc.boundary = None;
+                rc.sent_rids = 0;
+                rc.deadline = Deadline::after(self.now(), DAMIAO_RX_PASS);
+                next
+            }
+        };
+
+        if rc.boundary.is_none() {
+            if self.last_read_drained {
+                rc.boundary = Some(self.rx_empty_seq);
+                self.register_reply_log.clear();
+                rc.deadline = Deadline::after(self.now(), TICKED_RANGE_CHECK_REPLY_TIMEOUT);
+            } else if rc.deadline.passed(self.now()) {
+                self.awaiting_rx_boundary = true;
+                self.enable_failed();
+                return Err(ArmDriverError::RxDrainTimeout);
+            } else {
+                let wake = rc.deadline.at;
+                self.torque_hs = Some(DamiaoTorque::RangeCheck(rc));
+                return Ok(TorqueProgress::Pending { wake });
+            }
+        }
+
+        let boundary = rc.boundary.expect("set above");
+        let id = self.motor_ids[j];
+        let base_mode = self.base_mode(j);
+        let base = Self::mode_value(base_mode);
+        let expected_id = self.expected_reply_id(j);
+
+        if rc.sent_rids != 0x0F && !rc.deadline.passed(self.now()) {
+            let mut sent_any = false;
+            for (k, &rid) in RIDS.iter().enumerate() {
+                if (rc.sent_rids & (1u8 << k)) != 0 {
+                    continue;
+                }
+                match self.send(TxKind::Handshake, self.enable_stop_stamp, Some(rc.deadline), false, |_| {
+                    Some(damiao::build_read_register_frame(id, rid))
+                }) {
+                    Ok(_) => {
+                        rc.sent_rids |= 1u8 << k;
+                        sent_any = true;
+                    }
+                    Err(TxRefusal::DeadlinePassed | TxRefusal::Deferred) => break,
+                    Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged) => {
+                        self.abort_enable_for_estop();
+                        return Err(ArmDriverError::EstopInhibited);
+                    }
+                    Err(TxRefusal::Transport(e)) if e.is_tx_backpressure() => break,
+                    Err(TxRefusal::Transport(e)) => {
+                        self.enable_failed();
+                        return Err(ArmDriverError::Transport(e));
+                    }
+                    Err(r_err) => {
+                        self.enable_failed();
+                        return Err(Self::refusal_to_driver_err(r_err));
+                    }
+                }
+            }
+            if sent_any {
+                self.enable_estop_inhibited()?;
+                if let Err(e) = self.can.flush() {
+                    self.enable_failed();
+                    return Err(ArmDriverError::Transport(e));
+                }
+                if self.remaining_rx_frame_limit() > 0 {
+                    let _ = self.receive_feedback();
+                    self.enable_estop_inhibited()?;
+                }
+            }
+        }
+
+        let find_reply = |rid: u8, require_expected_id: bool| {
+            self.register_reply_log
+                .iter()
+                .rev()
+                .find(|(r, fid, _, seq, _)| {
+                    r.motor_id == id
+                        && !r.write
+                        && r.rid == rid
+                        && *seq > boundary
+                        && (!require_expected_id || *fid == expected_id)
+                })
+                .map(|(r, ..)| *r)
+        };
+        let r_mode = find_reply(damiao::RID_CTRL_MODE, base_mode == DamiaoControlMode::PosForce);
+        let r_mode_any = find_reply(damiao::RID_CTRL_MODE, false);
+        let r_p = find_reply(damiao::RID_PMAX, false);
+        let r_v = find_reply(damiao::RID_VMAX, false);
+        let r_t = find_reply(damiao::RID_TMAX, false);
+
+        let all_replied = r_mode_any.is_some() && r_p.is_some() && r_v.is_some() && r_t.is_some();
+        if !all_replied && !rc.deadline.passed(self.now()) {
+            let wake = if rc.sent_rids != 0x0F { self.now() } else { rc.deadline.at };
+            self.torque_hs = Some(DamiaoTorque::RangeCheck(rc));
+            return Ok(TorqueProgress::Pending { wake });
+        }
+
+        let l = self.limits[j];
+        let configured = [l.p_max, l.v_max, l.t_max];
+        let ctrl_mode = r_mode_any.map(|r| r.as_u32());
+        let reported = match (r_p, r_v, r_t) {
+            (Some(p), Some(v), Some(t)) => Some([p.as_f32(), v.as_f32(), t.as_f32()]),
+            _ => None,
+        };
+        let status = match reported {
+            None => RangeCheckStatus::Unverified,
+            Some(r) if Self::ranges_match(&r, &configured) => RangeCheckStatus::Passed,
+            Some(_) => RangeCheckStatus::Mismatch,
+        };
+        self.mit_limits_verified[j] = status == RangeCheckStatus::Passed;
+        let verified_ctrl = r_mode.map(|r| r.as_u32());
+        let verified_mode = verified_ctrl.and_then(Self::mode_from_u32);
+        if verified_ctrl == Some(base) && verified_mode == Some(base_mode) {
+            if base_mode == DamiaoControlMode::PosForce {
+                self.joint_modes[j] = Some(DamiaoControlMode::PosForce);
+            }
+            self.verified_modes[j] = Some(base_mode);
+        } else if verified_ctrl.or(ctrl_mode).is_some() {
+            self.joint_modes[j] = None;
+            self.verified_modes[j] = None;
+        } else {
+            self.verified_modes[j] = None;
+        }
+        if let Some(ref mut check) = self.range_check {
+            if let Some(entry) = check.joints.get_mut(j) {
+                entry.status = status;
+                entry.ctrl_mode = ctrl_mode;
+                entry.reported = reported;
+            }
+        }
+
+        rc.pending_mask &= !(1u32 << j);
+        rc.active_joint = None;
+        rc.boundary = None;
+        rc.sent_rids = 0;
+
+        if rc.pending_mask != 0 {
+            let now = self.now();
+            rc.deadline = Deadline::after(now, DAMIAO_RX_PASS);
+            self.torque_hs = Some(DamiaoTorque::RangeCheck(rc));
+            return Ok(TorqueProgress::Pending { wake: now });
+        }
+
+        let final_status = if let Some(ref mut check) = self.range_check {
+            let st = if check.joints.iter().any(|jj| jj.status == RangeCheckStatus::Mismatch) {
+                RangeCheckStatus::Mismatch
+            } else if check.joints.iter().any(|jj| jj.status == RangeCheckStatus::Unverified) {
+                RangeCheckStatus::Unverified
+            } else {
+                RangeCheckStatus::Passed
+            };
+            check.status = st;
+            st
+        } else {
+            RangeCheckStatus::Passed
+        };
+        if final_status == RangeCheckStatus::Mismatch {
+            self.enable_failed();
+            return Err(ArmDriverError::RangeCheckMismatch);
+        }
+        self.continue_enable_after_drain(self.last_read_drained)
     }
 
     /// Budgeted enable pre-drain: waits under `poll_torque_budgeted`'s budget until a receive
@@ -12368,7 +12640,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.rx_deadline = Some(deadline);
         self.rx_frame_limit = Some(max_rx_frames.min(64));
         let r = match self.torque_hs.take() {
-            None => Err(ArmDriverError::Protocol("no torque transition pending".into())),
+            None => Err(ArmDriverError::ProtocolStatic("no torque transition pending")),
+            Some(DamiaoTorque::RangeCheck(rc)) => self.poll_range_check(rc),
             Some(DamiaoTorque::DrainBeforeEnable(d)) => self.poll_drain_before_enable(d),
             Some(DamiaoTorque::RefreshBeforeRestore { refresh, stray, stray_len }) => {
                 self.poll_refresh_before_restore(refresh, stray, stray_len)
@@ -13090,12 +13363,33 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
     fn begin_torque_budgeted(&mut self, enabled: bool, max_rx_frames: u16) -> Result<TorqueProgress, ArmDriverError> {
         if !self.can.supports_nonblocking_rt() {
-            return Err(ArmDriverError::Protocol(
-                "UNSUPPORTED: CAN transport does not support non-blocking RT I/O".into(),
+            return Err(ArmDriverError::ProtocolStatic(
+                "UNSUPPORTED: CAN transport does not support non-blocking RT I/O",
             ));
         }
         if enabled {
             self.begin_enable_budgeted(Some(max_rx_frames))
+        } else {
+            let started_at = self.now();
+            self.begin_disable_budgeted(
+                DisableKind::DisableRequested { started_at },
+                Some(max_rx_frames),
+            )
+        }
+    }
+
+    fn begin_torque_budgeted_with_range_retry(
+        &mut self,
+        enabled: bool,
+        max_rx_frames: u16,
+    ) -> Result<TorqueProgress, ArmDriverError> {
+        if !self.can.supports_nonblocking_rt() {
+            return Err(ArmDriverError::ProtocolStatic(
+                "UNSUPPORTED: CAN transport does not support non-blocking RT I/O",
+            ));
+        }
+        if enabled {
+            self.begin_enable_budgeted_inner(Some(max_rx_frames), true)
         } else {
             let started_at = self.now();
             self.begin_disable_budgeted(
@@ -13353,6 +13647,21 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
     fn disable_dispatched_mask(&self) -> u64 {
         self.disable_dispatched_mask
+    }
+
+    fn abort_pending_disable(&mut self) -> bool {
+        match self.torque_hs {
+            None => true,
+            Some(DamiaoTorque::AwaitRestGate {
+                kind: DisableKind::DisableRequested { .. },
+                ..
+            }) if self.disable_dispatched_mask == 0 => {
+                self.torque_hs = None;
+                true
+            }
+            Some(DamiaoTorque::AwaitRestGate { .. } | DamiaoTorque::Disable { .. }) => false,
+            Some(_) => true,
+        }
     }
 
     fn finish_dispatched_disable(&mut self) -> Result<(), ArmDriverError> {

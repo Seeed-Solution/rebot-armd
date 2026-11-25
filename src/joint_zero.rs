@@ -373,6 +373,9 @@ impl ArmDriver for ZeroOffsetDriver {
     fn begin_torque_budgeted(&mut self, enabled: bool, max_rx_frames: u16) -> Result<crate::driver::TorqueProgress, ArmDriverError> {
         self.inner.begin_torque_budgeted(enabled, max_rx_frames)
     }
+    fn begin_torque_budgeted_with_range_retry(&mut self, enabled: bool, max_rx_frames: u16) -> Result<crate::driver::TorqueProgress, ArmDriverError> {
+        self.inner.begin_torque_budgeted_with_range_retry(enabled, max_rx_frames)
+    }
     fn begin_disable_torque_budgeted(&mut self, kind: DisableKind, max_rx_frames: u16) -> Result<crate::driver::TorqueProgress, ArmDriverError> {
         self.inner.begin_disable_torque_budgeted(kind, max_rx_frames)
     }
@@ -402,6 +405,7 @@ impl ArmDriver for ZeroOffsetDriver {
     fn disable_dispatched_mask(&self) -> u64 { self.inner.disable_dispatched_mask() }
     fn finish_dispatched_disable(&mut self) -> Result<(), ArmDriverError> { self.inner.finish_dispatched_disable() }
     fn abort_enable(&mut self) { self.inner.abort_enable() }
+    fn abort_pending_disable(&mut self) -> bool { self.inner.abort_pending_disable() }
     fn panic_disable_step(&mut self, first: bool, deadline: Instant) -> Option<Result<Vec<usize>, ArmDriverError>> {
         self.inner.panic_disable_step(first, deadline)
     }
