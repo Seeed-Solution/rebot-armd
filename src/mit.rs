@@ -1732,6 +1732,12 @@ impl crate::supervisor::SupervisorInner {
     /// Torque goes off: MIT owns nothing; the motors keep CTRL_MODE MIT in RAM until the next
     /// enable restores the base mode. A cancelled group stays cancelled until cleared.
     pub(crate) fn mit_torque_off(&mut self) {
+        self.mit_torque_off_inner(true);
+    }
+
+    /// Same as [`Self::mit_torque_off`], optionally deferring shadow emission (zero shadow clock
+    /// sampling inside timed panic-disable closures before the live outcome is sealed).
+    pub(crate) fn mit_torque_off_inner(&mut self, emit_shadow: bool) {
         self.mit.armed_ok = false;
         if self.mit.owner == MitOwner::Active {
             // The driver fence stays armed through the disable (no recovery replay, no invented
@@ -1744,13 +1750,17 @@ impl crate::supervisor::SupervisorInner {
                         mask.insert(j as u8);
                     }
                 }
-                self.torque_shadow.enqueue(
-                    crate::torque::shadow::ShadowInputKind::MitOwnershipChange {
-                        channels: mask,
-                        target_mode: crate::motor_mode::ControlMode::PositionVelocity,
-                        device_wide: false,
-                    },
-                );
+                if emit_shadow {
+                    self.torque_shadow.enqueue(
+                        crate::torque::shadow::ShadowInputKind::MitOwnershipChange {
+                            channels: mask,
+                            target_mode: crate::motor_mode::ControlMode::PositionVelocity,
+                            device_wide: false,
+                        },
+                    );
+                } else {
+                    self.torque_shadow.note_deferred_mit_off(mask);
+                }
             }
             self.mit.owner = MitOwner::Off;
             self.mit.joints.clear();

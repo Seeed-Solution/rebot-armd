@@ -2209,7 +2209,7 @@ async fn r1_review_regressions_comparator_remount_unknown_queue_and_disabled_all
     //     clock is identical with shadow ON vs OFF BELOW (19 ms), AT (20 ms), and ABOVE (21 ms)
     //     using the actual K=3 stopped rest-gate disable decision!
     {
-        fn probe_rest_gate(shadow: bool, dt_ms: u64) -> bool {
+        fn probe_rest_gate(shadow: bool, settle_ms: u64) -> bool {
             let clock = Arc::new(MockClock::new());
             let bus = FakeCan::new(clock.clone());
             bus.with(|s| {
@@ -2220,38 +2220,71 @@ async fn r1_review_regressions_comparator_remount_unknown_queue_and_disabled_all
             let cfg = build_dm_config(shadow);
             let mut drv = build_dm_driver(bus.clone(), &cfg);
             drv.set_shadow_enabled(shadow);
-            let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
-            // Seed initial feedback, arm, write a motion target, and latch E-stop.
+            let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+            for (i, slot) in arm_joints.iter_mut().enumerate().take(6) {
+                *slot = i;
+            }
+            drv.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+                safety_stopped: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                has_resting_pose: true,
+                arm_joints,
+                arm_joints_len: 6,
+                rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+                rest_pose_tolerance_rad: 0.05,
+            });
+            // Warm up, enable, and issue a real motion write to anchor `last_motion_write_at`.
             bus.with(|s| s.push_all_feedback());
-            inner.tick_control(0.02);
-            let st = inner.current_admission_stamp();
-            let adm = inner.check_admission(st).unwrap();
-            SupervisorInner::enable_torque(adm).unwrap();
-            inner.apply_stop_policy(armd::safety::StopPolicy::EStopLatch);
-            // Feed K=3 rest samples separated by `dt_ms` across 3 releases and check disable_torque!
-            for k in 1..=3u64 {
-                clock.advance(Duration::from_millis(dt_ms));
-                let rt_ns = 10_000_000_000 + (k * dt_ms) * 1_000_000;
+            let _ = drv.read_joint_states();
+            let _ = drv.set_torque(true);
+            let targets = vec![
+                armd::driver::JointTarget {
+                    position: 0.0,
+                    velocity: Some(0.0),
+                    torque: None,
+                    kp: None,
+                    kd: None,
+                };
+                7
+            ];
+            let _ = drv.write_joint_targets(&targets);
+            let _ = drv.read_joint_states();
+            // Advance so the 3 fresh rest samples sit at (settle_ms-2, settle_ms-1, settle_ms)
+            // after the motion write. The Damiao > 20 ms settle rule rejects samples at <= 20 ms
+            // and accepts once all K=3 samples arrive strictly > 20 ms after the motion write.
+            let mut rt_ns = 10_000_000_000i128;
+            for (rel_idx, step_ms) in [settle_ms.saturating_sub(2), 1, 1].into_iter().enumerate() {
+                clock.advance(Duration::from_millis(step_ms));
+                rt_ns += (step_ms as i128) * 1_000_000;
+                drv.begin_control_release((rel_idx + 2) as u64);
                 bus.with(|s| {
-                    s.kernel_realtime_ns = Some(rt_ns as i128);
+                    s.kernel_realtime_ns = Some(rt_ns);
                     s.set_pose(&[0.0; 7]);
                     for m in &s.motors {
                         let f = m.feedback_frame();
-                        s.rx.push_back((f, Some(CanRxTime::KernelRealtimeNs(rt_ns as i128))));
+                        s.rx.push_back((f, Some(CanRxTime::KernelRealtimeNs(rt_ns))));
                     }
                 });
-                inner.tick_control(0.02);
+                let _ = drv.read_joint_states();
             }
-            inner.disable_torque().is_ok()
+            let res = drv.disable_torque(armd::driver::DisableKind::DisableRequested {
+                started_at: clock.now(),
+            });
+            res.is_ok()
         }
-        for dt_ms in [19u64, 20, 21] {
-            assert_eq!(
-                probe_rest_gate(false, dt_ms),
-                probe_rest_gate(true, dt_ms),
-                "Damiao rest-gate disable decision at {dt_ms} ms must match identically with shadow ON vs OFF"
-            );
-        }
-        assert!(probe_rest_gate(true, 21));
+        let r19_off = probe_rest_gate(false, 19);
+        let r19_on = probe_rest_gate(true, 19);
+        assert_eq!(r19_off, r19_on, "19 ms rest-gate must match shadow ON vs OFF");
+        assert!(!r19_on, "19 ms post-motion must NOT satisfy >20 ms K=3 rest-settle gate");
+
+        let r20_off = probe_rest_gate(false, 20);
+        let r20_on = probe_rest_gate(true, 20);
+        assert_eq!(r20_off, r20_on, "20 ms rest-gate must match shadow ON vs OFF");
+        assert!(!r20_on, "20 ms post-motion must NOT satisfy >20 ms K=3 rest-settle gate");
+
+        let r23_off = probe_rest_gate(false, 23);
+        let r23_on = probe_rest_gate(true, 23);
+        assert_eq!(r23_off, r23_on, "23 ms rest-gate must match shadow ON vs OFF");
+        assert!(r23_on, "21/22/23 ms post-motion samples MUST pass >20 ms K=3 rest-settle gate");
     }
 
     // (g) R2-m2: Disabled ShadowDriverStaging allocates 0 slots.

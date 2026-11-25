@@ -1136,6 +1136,8 @@ pub struct ShadowRuntime {
     /// Retained handle to the paired off-thread hub (used by direct `SupervisorInner` tests and
     /// cloned into `ArmSupervisor` at startup; never locked on RT!).
     hub: Option<Arc<TorqueShadowHub>>,
+    /// MIT ownership mask cleared during a timed panic disable; emitted strictly after outcome seal.
+    deferred_mit_off_mask: ChannelMask,
     #[doc(hidden)]
     injected_fault: ShadowFaultInjection,
 }
@@ -1168,6 +1170,7 @@ impl ShadowRuntime {
             inner: None,
             overflow: Arc::new(ShadowOverflowAtomics::new()),
             hub: None,
+            deferred_mit_off_mask: ChannelMask::EMPTY,
             injected_fault: ShadowFaultInjection::None,
         }
     }
@@ -1199,6 +1202,7 @@ impl ShadowRuntime {
                 inner: None,
                 overflow,
                 hub: Some(Arc::clone(&hub)),
+                deferred_mit_off_mask: ChannelMask::EMPTY,
                 injected_fault: ShadowFaultInjection::None,
             };
             return (rt, hub);
@@ -1232,6 +1236,7 @@ impl ShadowRuntime {
                 inner: None,
                 overflow,
                 hub: Some(Arc::clone(&hub)),
+                deferred_mit_off_mask: ChannelMask::EMPTY,
                 injected_fault: ShadowFaultInjection::None,
             };
             return (rt, hub);
@@ -1272,9 +1277,25 @@ impl ShadowRuntime {
             inner: Some(inner),
             overflow,
             hub: Some(Arc::clone(&hub)),
+            deferred_mit_off_mask: ChannelMask::EMPTY,
             injected_fault: ShadowFaultInjection::None,
         };
         (rt, hub)
+    }
+
+    /// Record MIT channels cleared inside a timed panic disable without sampling the clock or
+    /// enqueueing until after the live panic deadline observer seals the outcome.
+    #[inline]
+    pub fn note_deferred_mit_off(&mut self, mask: ChannelMask) {
+        self.deferred_mit_off_mask = ChannelMask(self.deferred_mit_off_mask.raw() | mask.raw());
+    }
+
+    /// Consume and clear any deferred MIT-off mask recorded during a timed panic disable.
+    #[inline]
+    pub fn take_deferred_mit_off(&mut self) -> ChannelMask {
+        let m = self.deferred_mit_off_mask;
+        self.deferred_mit_off_mask = ChannelMask::EMPTY;
+        m
     }
 
     /// Re-initialize inline `TorqueState`, clock, and consumer mirror when a driver is mounted.
@@ -3756,7 +3777,7 @@ impl TorqueShadowConsumer {
                     .state
                     .as_ref()
                     .is_some_and(|st| st.devices[0].contention_escalated);
-            if live.live_contention_escalated && !pred_escalated {
+            if live.live_contention_escalated != pred_escalated {
                 self.push_divergence(
                     ShadowDivergenceEntry {
                         seq: rec.seq,
@@ -4008,6 +4029,30 @@ impl ShadowHubCore {
         *self.published.lock().unwrap_or_else(|e| e.into_inner()) = snap;
         n
     }
+
+    /// Non-blocking drain variant for bounded shutdown paths: if a detached timed-out worker
+    /// still holds `consumer`, returns immediately rather than blocking past the shutdown deadline.
+    fn try_drain_and_publish(&self) -> usize {
+        self.reclaim_retired();
+        if !self.enabled {
+            return 0;
+        }
+        let Ok(mut c) = self.consumer.try_lock() else {
+            return 0;
+        };
+        let owner = self.active_owner();
+        let n = c.drain(&self.overflow, owner);
+        let snap = c.snapshot(
+            &self.overflow,
+            owner,
+            self.bb_written.load(Ordering::Relaxed),
+            self.bb_dropped.load(Ordering::Relaxed),
+        );
+        if let Ok(mut pub_snap) = self.published.try_lock() {
+            *pub_snap = snap;
+        }
+        n
+    }
 }
 
 impl Drop for ShadowHubCore {
@@ -4024,6 +4069,9 @@ impl Drop for ShadowHubCore {
 pub struct TorqueShadowHub {
     core: Arc<ShadowHubCore>,
     worker: Mutex<Option<(JoinHandle<()>, Arc<(Mutex<bool>, Condvar)>)>>,
+    /// Latched when `stop_and_flush_bounded` times out waiting for a worker so subsequent
+    /// shutdown/Drop calls never mistake the empty worker slot for a completed worker.
+    worker_timed_out: AtomicBool,
 }
 
 impl TorqueShadowHub {
@@ -4044,6 +4092,7 @@ impl TorqueShadowHub {
                 retired_reclaimed: AtomicU64::new(0),
             }),
             worker: Mutex::new(None),
+            worker_timed_out: AtomicBool::new(false),
         }
     }
 
@@ -4071,6 +4120,7 @@ impl TorqueShadowHub {
                 retired_reclaimed: AtomicU64::new(0),
             }),
             worker: Mutex::new(None),
+            worker_timed_out: AtomicBool::new(false),
         }
     }
 
@@ -4216,6 +4266,7 @@ impl TorqueShadowHub {
                 done_bg.1.notify_all();
             })?;
         *slot = Some((jh, done));
+        self.worker_timed_out.store(false, Ordering::Release);
         Ok(())
     }
 
@@ -4317,10 +4368,12 @@ impl TorqueShadowHub {
             drop(g);
             if worker_finished {
                 let _ = jh.join();
+            } else {
+                self.worker_timed_out.store(true, Ordering::Release);
             }
         }
-        if worker_finished {
-            self.core.drain_and_publish();
+        if worker_finished && !self.worker_timed_out.load(Ordering::Acquire) {
+            self.core.try_drain_and_publish();
         }
         let done_opt = if let Ok(mut c) = self.core.consumer.try_lock() {
             c.bb_queue.take().map(|q| q.done)

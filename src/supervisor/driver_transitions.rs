@@ -2051,7 +2051,11 @@ impl SupervisorInner {
     /// State once an explicit disable (passing the rest-pose gate) or protective disable has been
     /// accepted and transmitted: records `torque_intent = Off` by decision and stops holding.
     pub(crate) fn disable_accepted(&mut self) {
-        self.mit_torque_off();
+        self.disable_accepted_inner(true);
+    }
+
+    pub(crate) fn disable_accepted_inner(&mut self, emit_mit_shadow: bool) {
+        self.mit_torque_off_inner(emit_mit_shadow);
         self.torque_intent = TorqueIntent::Off;
         self.is_torqued = false;
         self.pending_rearm = false;
@@ -7750,6 +7754,18 @@ impl SupervisorInner {
         if !self.torque_shadow.is_enabled() {
             return;
         }
+        // Emit any MIT ownership release deferred during `attempt_panic_disable_until` strictly
+        // AFTER the live panic deadline observer has sealed `outcome`.
+        let deferred_mit = self.torque_shadow.take_deferred_mit_off();
+        if !deferred_mit.is_empty() {
+            self.torque_shadow.enqueue(
+                crate::torque::shadow::ShadowInputKind::MitOwnershipChange {
+                    channels: deferred_mit,
+                    target_mode: crate::motor_mode::ControlMode::PositionVelocity,
+                    device_wide: false,
+                },
+            );
+        }
         if is_caught_panic {
             self.torque_shadow
                 .enqueue(crate::torque::shadow::ShadowInputKind::Panic {
@@ -7771,7 +7787,11 @@ impl SupervisorInner {
             | PanicDisableOutcome::Unconfirmed
             | PanicDisableOutcome::NoDriver => {
                 if let Some(ref d) = self.driver {
-                    if let Ok(mut drv) = d.try_lock() {
+                    // Hard-RT invariant: NEVER attempt a driver mutex lock from `armd-control`
+                    // (even `try_lock`) on emergency teardown; latch unverifiable loss lock-free.
+                    if crate::rt_core::executor::on_rt_control_thread() {
+                        self.torque_shadow.record_external_staging_loss(1);
+                    } else if let Ok(mut drv) = d.try_lock() {
                         self.torque_shadow.drain_from_driver(&mut **drv);
                     } else {
                         self.torque_shadow.record_external_staging_loss(1);
@@ -7793,7 +7813,7 @@ impl SupervisorInner {
     ) -> PanicDisableOutcome {
         self.mark_panic_disable_requested();
         let Some(ref d) = self.driver else {
-            self.disable_accepted();
+            self.disable_accepted_inner(false);
             return PanicDisableOutcome::NoDriver;
         };
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -7817,7 +7837,7 @@ impl SupervisorInner {
         }))
         .unwrap_or_else(|_| PanicDisableOutcome::Failed("panic during driver panic-disable".into()));
         if outcome == PanicDisableOutcome::Confirmed {
-            self.disable_accepted();
+            self.disable_accepted_inner(false);
         }
         outcome
     }

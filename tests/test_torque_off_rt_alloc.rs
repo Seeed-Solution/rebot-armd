@@ -1991,8 +1991,8 @@ fn rt_torque_off_shadow_on_ring_saturation_and_staging_overflow_zero_allocs() {
     );
 
     // 4. Hard-RT teardown proof: dropping BOTH `ShadowDriverStaging` and `ShadowRuntime` on
-    //    `armd-control` (`ControlThreadGuard`) MUST perform strictly (0, 0) heap ops (both
-    //    boxes retire lock-free off-thread and are reclaimed by the comparator worker).
+    //    `armd-control` (`ControlThreadGuard`) AND running `record_post_panic_disable_shadow`
+    //    on `armd-control` MUST perform strictly (0, 0) heap ops and NEVER touch the driver mutex!
     let (td_rt, td_hub) = armd::torque::shadow::ShadowRuntime::new_with_hub(
         &ArmConfig::rebot_dm(),
         true,

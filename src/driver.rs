@@ -1977,6 +1977,8 @@ pub struct FeetechArmDriver<T: Transport> {
     warned_missed_echoes: bool,
     #[cfg(not(target_arch = "wasm32"))]
     shadow_staging: crate::torque::shadow::ShadowDriverStaging,
+    #[cfg(not(target_arch = "wasm32"))]
+    last_disable_flush_ok: bool,
 }
 
 impl<T: Transport> FeetechArmDriver<T> {
@@ -2049,6 +2051,8 @@ impl<T: Transport> FeetechArmDriver<T> {
             warned_missed_echoes: false,
             #[cfg(not(target_arch = "wasm32"))]
             shadow_staging: crate::torque::shadow::ShadowDriverStaging::new(false),
+            #[cfg(not(target_arch = "wasm32"))]
+            last_disable_flush_ok: true,
         }
     }
 
@@ -2832,43 +2836,6 @@ impl<T: Transport> FeetechArmDriver<T> {
                 }
                 self.torque_enable_commanded = prev_commanded;
             }
-            #[cfg(not(target_arch = "wasm32"))]
-            if let Some(idx) = servo_idx {
-                if self.shadow_staging.is_enabled() && idx < crate::torque::MAX_CHANNELS {
-                    let now = self.clock_now();
-                    let mut outcomes = [crate::torque::MotorWriteOutcome::NotTargeted;
-                        crate::torque::MAX_CHANNELS];
-                    outcomes[idx] = if matches!(
-                        e,
-                        TransportError::WouldBlock | TransportError::NoBufferSpace
-                    ) || matches!(
-                        &e,
-                        TransportError::Io(io) if io.kind() == std::io::ErrorKind::WouldBlock
-                    ) {
-                        crate::torque::MotorWriteOutcome::Deferred
-                    } else {
-                        crate::torque::MotorWriteOutcome::Failed
-                    };
-                    let wk = match kind {
-                        DisableKind::DisableRequested { .. } => {
-                            crate::torque::WriteKind::DisableRequested
-                        }
-                        DisableKind::DisableProtective { .. } => {
-                            crate::torque::WriteKind::DisableProtective
-                        }
-                    };
-                    self.shadow_staging
-                        .push(crate::torque::shadow::ShadowDriverObs::WriteResult {
-                            device: 0,
-                            kind: wk,
-                            write_done: now,
-                            now,
-                            target_mask: crate::torque::ChannelMask::bit(idx as u8),
-                            outcomes,
-                            ambiguous_gap: false,
-                        });
-                }
-            }
             return Err(e.into());
         }
         let flush_res = self.transport.flush();
@@ -2877,40 +2844,43 @@ impl<T: Transport> FeetechArmDriver<T> {
         if *rx_budget > 0 && deadline.is_none_or(|dl| self.clock_now() < dl) {
             let _ = self.drain_tx_echo_until(&pkt, deadline);
         }
-        // Shadow staging runs strictly AFTER live deadline check and echo drain so shadow-on
-        // can never push the live clock past `deadline` and suppress `drain_tx_echo_until`.
+        // Record pure stack-only flush ambiguity flag; shadow clock sampling and staging are
+        // deferred strictly until AFTER the entire disable batch + readback deadline check.
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(idx) = servo_idx {
-            if self.shadow_staging.is_enabled() && idx < crate::torque::MAX_CHANNELS {
-                let now = self.clock_now();
-                let mut outcomes = [crate::torque::MotorWriteOutcome::NotTargeted;
-                    crate::torque::MAX_CHANNELS];
-                outcomes[idx] = if flush_ok {
-                    crate::torque::MotorWriteOutcome::Sent
-                } else {
-                    crate::torque::MotorWriteOutcome::Ambiguous
-                };
-                let wk = match kind {
-                    DisableKind::DisableRequested { .. } => {
-                        crate::torque::WriteKind::DisableRequested
-                    }
-                    DisableKind::DisableProtective { .. } => {
-                        crate::torque::WriteKind::DisableProtective
-                    }
-                };
-                self.shadow_staging
-                    .push(crate::torque::shadow::ShadowDriverObs::WriteResult {
-                        device: 0,
-                        kind: wk,
-                        write_done: now,
-                        now,
-                        target_mask: crate::torque::ChannelMask::bit(idx as u8),
-                        outcomes,
-                        ambiguous_gap: !flush_ok,
-                    });
-            }
+        {
+            self.last_disable_flush_ok = flush_ok;
         }
         Ok(true)
+    }
+
+    /// Stage one combined Feetech disable `WriteResult` strictly AFTER all live per-servo writes,
+    /// echo drains, and readback deadline checks have completed (zero deadline distortion).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn stage_feetech_disable_batch(
+        &mut self,
+        kind: DisableKind,
+        target_mask: crate::torque::ChannelMask,
+        outcomes: [crate::torque::MotorWriteOutcome; crate::torque::MAX_CHANNELS],
+        ambiguous_gap: bool,
+    ) {
+        if !self.shadow_staging.is_enabled() || target_mask.is_empty() {
+            return;
+        }
+        let now = self.clock_now();
+        let wk = match kind {
+            DisableKind::DisableRequested { .. } => crate::torque::WriteKind::DisableRequested,
+            DisableKind::DisableProtective { .. } => crate::torque::WriteKind::DisableProtective,
+        };
+        self.shadow_staging
+            .push(crate::torque::shadow::ShadowDriverObs::WriteResult {
+                device: 0,
+                kind: wk,
+                write_done: now,
+                now,
+                target_mask,
+                outcomes,
+                ambiguous_gap,
+            });
     }
 
     /// Direct non-deferred wrapper around [`Self::write_torque_off_checked_budgeted`] (used by `clear_fault`).
@@ -2920,7 +2890,46 @@ impl<T: Transport> FeetechArmDriver<T> {
         kind: DisableKind,
     ) -> Result<(), ArmDriverError> {
         let mut rx_budget = u16::MAX;
-        if self.write_torque_off_checked_budgeted(servo_id, kind, None, None, &mut rx_budget)? {
+        let res = self.write_torque_off_checked_budgeted(servo_id, kind, None, None, &mut rx_budget);
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.shadow_staging.is_enabled() {
+            if let Some(idx) = self.servo_ids.iter().position(|&id| id == servo_id) {
+                if idx < crate::torque::MAX_CHANNELS {
+                    let mut outcomes = [crate::torque::MotorWriteOutcome::NotTargeted;
+                        crate::torque::MAX_CHANNELS];
+                    let (outcome, ambiguous_gap) = match &res {
+                        Ok(true) => {
+                            if self.last_disable_flush_ok {
+                                (crate::torque::MotorWriteOutcome::Sent, false)
+                            } else {
+                                (crate::torque::MotorWriteOutcome::Ambiguous, true)
+                            }
+                        }
+                        Ok(false) => (crate::torque::MotorWriteOutcome::Deferred, false),
+                        Err(ArmDriverError::Transport(
+                            TransportError::WouldBlock | TransportError::NoBufferSpace,
+                        )) => (crate::torque::MotorWriteOutcome::Deferred, false),
+                        Err(ArmDriverError::Transport(TransportError::Io(io)))
+                            if io.kind() == std::io::ErrorKind::WouldBlock =>
+                        {
+                            (crate::torque::MotorWriteOutcome::Deferred, false)
+                        }
+                        Err(ArmDriverError::TorqueOffWouldDrop | ArmDriverError::DisableRequestExpired) => {
+                            (crate::torque::MotorWriteOutcome::RejectedStale, false)
+                        }
+                        Err(_) => (crate::torque::MotorWriteOutcome::Failed, false),
+                    };
+                    outcomes[idx] = outcome;
+                    self.stage_feetech_disable_batch(
+                        kind,
+                        crate::torque::ChannelMask::bit(idx as u8),
+                        outcomes,
+                        ambiguous_gap,
+                    );
+                }
+            }
+        }
+        if res? {
             Ok(())
         } else {
             Err(ArmDriverError::TorqueOffWouldDrop)
@@ -4119,6 +4128,13 @@ impl<T: Transport> FeetechArmDriver<T> {
         let mut deferred = false;
         let mut refused_err = None;
         let mut write_err = None;
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut shadow_target_mask = crate::torque::ChannelMask::EMPTY;
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut shadow_outcomes =
+            [crate::torque::MotorWriteOutcome::NotTargeted; crate::torque::MAX_CHANNELS];
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut shadow_ambiguous_gap = false;
         for (idx, &id) in ids[..n].iter().enumerate() {
             if skip_dispatched && idx < 64 && (self.disable_dispatched_mask & (1u64 << idx)) != 0 {
                 continue;
@@ -4140,6 +4156,16 @@ impl<T: Transport> FeetechArmDriver<T> {
                     if idx < 64 {
                         self.disable_dispatched_mask |= 1u64 << idx;
                     }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if idx < crate::torque::MAX_CHANNELS {
+                        shadow_target_mask.insert(idx as u8);
+                        if self.last_disable_flush_ok {
+                            shadow_outcomes[idx] = crate::torque::MotorWriteOutcome::Sent;
+                        } else {
+                            shadow_outcomes[idx] = crate::torque::MotorWriteOutcome::Ambiguous;
+                            shadow_ambiguous_gap = true;
+                        }
+                    }
                 }
                 Ok(false) => {
                     deferred = true;
@@ -4160,6 +4186,21 @@ impl<T: Transport> FeetechArmDriver<T> {
                     }
                 }
                 Err(e) => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if idx < crate::torque::MAX_CHANNELS {
+                        shadow_target_mask.insert(idx as u8);
+                        shadow_outcomes[idx] = match &e {
+                            ArmDriverError::Transport(
+                                TransportError::WouldBlock | TransportError::NoBufferSpace,
+                            ) => crate::torque::MotorWriteOutcome::Deferred,
+                            ArmDriverError::Transport(TransportError::Io(io))
+                                if io.kind() == std::io::ErrorKind::WouldBlock =>
+                            {
+                                crate::torque::MotorWriteOutcome::Deferred
+                            }
+                            _ => crate::torque::MotorWriteOutcome::Failed,
+                        };
+                    }
                     write_err = Some(e);
                 }
             }
@@ -4174,10 +4215,24 @@ impl<T: Transport> FeetechArmDriver<T> {
                 }
             }
             self.pending_disable = Some(PendingFeetechDisable { kind, client_park });
+            #[cfg(not(target_arch = "wasm32"))]
+            self.stage_feetech_disable_batch(
+                kind,
+                shadow_target_mask,
+                shadow_outcomes,
+                shadow_ambiguous_gap,
+            );
             return Ok((false, rx_start.saturating_sub(rx_remaining), budget_exhausted));
         }
         if !wrote_any && self.disable_dispatched_mask == 0 {
             if let Some(e) = refused_err.take().or_else(|| write_err.take()) {
+                #[cfg(not(target_arch = "wasm32"))]
+                self.stage_feetech_disable_batch(
+                    kind,
+                    shadow_target_mask,
+                    shadow_outcomes,
+                    shadow_ambiguous_gap,
+                );
                 return Err(e);
             }
         }
@@ -4189,6 +4244,13 @@ impl<T: Transport> FeetechArmDriver<T> {
                 budget_exhausted |= rb_ex;
             }
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        self.stage_feetech_disable_batch(
+            kind,
+            shadow_target_mask,
+            shadow_outcomes,
+            shadow_ambiguous_gap,
+        );
         if let Some(e) = refused_err.or(write_err) {
             return Err(e);
         }
