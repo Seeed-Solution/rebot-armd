@@ -332,6 +332,59 @@ def http_get_json(url: str, timeout: float) -> Any:
     return json.loads(raw.decode("utf-8"))
 
 
+def http_post_json(
+    url: str,
+    payload: dict[str, Any] | None,
+    timeout: float,
+    headers: dict[str, str] | None = None,
+) -> tuple[int, Any]:
+    body = b"" if payload is None else json.dumps(payload).encode("utf-8")
+    req_headers = {"Content-Type": "application/json"}
+    if headers:
+        req_headers.update(headers)
+    req = urllib.request.Request(url, data=body, headers=req_headers, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+        data = json.loads(raw.decode("utf-8")) if raw else None
+        return int(resp.status), data
+
+
+def request_tick_baseline_marker(
+    http_base: str,
+    operator_pin: str | None,
+    operator_token: str | None,
+    timeout: float = 2.0,
+) -> dict[str, Any]:
+    """Call POST /api/v1/diagnostics/tick/mark and wait briefly for since_marker.status == 'active'."""
+    headers: dict[str, str] = {"Origin": http_base}
+    token = operator_token
+    if not token and operator_pin:
+        _, unlock = http_post_json(
+            f"{http_base}/api/v1/operator/unlock",
+            {"pin": operator_pin},
+            timeout=timeout,
+            headers=headers,
+        )
+        if isinstance(unlock, dict) and isinstance(unlock.get("token"), str):
+            token = unlock["token"]
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    _, resp = http_post_json(f"{http_base}/api/v1/diagnostics/tick/mark", None, timeout=timeout, headers=headers)
+    marker_id = resp.get("marker_id") if isinstance(resp, dict) else None
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        tick = http_get_json(f"{http_base}/api/v1/diagnostics/tick", timeout=timeout)
+        sm = tick.get("since_marker") if isinstance(tick, dict) else None
+        if (
+            isinstance(sm, dict)
+            and sm.get("status") == "active"
+            and (marker_id is None or sm.get("marker_id") == marker_id)
+        ):
+            return {"ok": True, "marker_id": sm.get("marker_id"), "status": "active"}
+        time.sleep(0.025)
+    return {"ok": False, "marker_id": marker_id, "status": "pending_timeout"}
+
+
 def err_tag(exc: BaseException) -> str:
     if isinstance(exc, urllib.error.HTTPError):
         return f"HTTP_{exc.code}"
@@ -760,6 +813,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Allow sending operator PIN/token over plain http:// to non-loopback host",
     )
     p.add_argument("--force-lease", action="store_true", default=False, help="Force-take arm lease if another client holds it")
+    p.add_argument(
+        "--expect-owner",
+        choices=("legacy", "executor"),
+        default=None,
+        help="Verify baseline GET /api/v1/diagnostics/tick owner_mode matches this owner (fail closed on mismatch)",
+    )
+    p.add_argument(
+        "--mark-baseline",
+        action="store_true",
+        default=False,
+        help="Issue POST /api/v1/diagnostics/tick/mark before baseline capture for run-scoped since_marker peaks",
+    )
     args = p.parse_args(argv)
 
     if not (0.0 < args.speed_scale <= MAX_SPEED_SCALE):
@@ -873,6 +938,13 @@ def main(argv: list[str] | None = None) -> int:
                 "armd": boot_meta,
                 "blackbox_log_note": BLACKBOX_LOG_NOTE,
             }
+            # Optional baseline marker before baseline capture so since_marker aligns with samples[0].
+            if args.mark_baseline:
+                try:
+                    mark_res = request_tick_baseline_marker(http_base, operator_pin, operator_token)
+                    meta_record["baseline_marker"] = mark_res
+                except Exception as exc:
+                    meta_record["baseline_marker"] = {"ok": False, "error": f"{err_tag(exc)}: {exc}"}
             writer.write_terminal(meta_record)
 
             # Capture a synchronous baseline sample BEFORE starting any load workers (even when
@@ -885,6 +957,13 @@ def main(argv: list[str] | None = None) -> int:
             idle_wait_s = max(MIN_IDLE_TAIL_S, IDLE_TAIL_PERIOD_MULTIPLIER * nominal_period_s)
             if not baseline_ok:
                 state.set_stop_reason("error", f"baseline_poll_failed:{baseline_sample.get('tick_error') or 'no_tick'}")
+                state.workers_stop.set()
+            elif (
+                args.expect_owner is not None
+                and baseline_sample["tick"].get("owner_mode") != args.expect_owner
+            ):
+                got_owner = baseline_sample["tick"].get("owner_mode")
+                state.set_stop_reason("error", f"unexpected_owner_mode:{got_owner}!={args.expect_owner}")
                 state.workers_stop.set()
             else:
                 state.set_phase("baseline" if args.baseline_s > 0 else "full_load")

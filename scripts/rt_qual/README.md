@@ -9,6 +9,7 @@ Harness for the Stage 3 §6 qualification gate on the SG2002 reCamera arm (`armd
 | `devstat.sh` | reCamera (SG2002) | busybox `sh`, `/proc`, `ip` | `/userdata/rt-qual/<run-id>/devstat.txt` |
 | `load.py` | Office Raspberry Pi | Python 3.11+ stdlib + `rebot` SDK (`rebot-companion`) | `load.jsonl` |
 | `analyze.py` | Spark workstation | Python 3.11+ stdlib only | Markdown qualification report |
+| `executor_qual.sh` | reCamera (device) or Spark (mock) | `bash`, Python 3.11+, `rebot` SDK | `/userdata/rt-qual/<run-id>/` (`cold_starts.json`, `idle/`, `motion/`, `estop_check.json`, `summary.md`) |
 
 ## Gate Criteria (Stage 3 §6)
 
@@ -130,13 +131,28 @@ python3 scripts/rt_qual/analyze.py --load /path/to/tickload.json
 
 ```sh
 cargo build --bin armd
-./target/debug/armd --follower mock --port 18877 &
+./target/debug/armd --follower mock --owner executor --port 18877 &
 python3 scripts/rt_qual/load.py \
   --host 127.0.0.1 --port 18877 \
   --duration 30 --cycles 2 --motion-mode joint-j1 \
+  --expect-owner executor --mark-baseline \
   --bulk-path / --output /tmp/mock_load.jsonl
 python3 scripts/rt_qual/analyze.py --load /tmp/mock_load.jsonl
 ```
+
+### Automated §6 Executor Qualification Sequence (`executor_qual.sh`)
+
+Opt into the executor owner on the device by setting `"arm": {"armd_owner": "executor"}` (or top-level `"armd_owner": "executor"`) in `/userdata/local/apps/rebot-teleop.config.json` (default: `"legacy"`), then run:
+
+```sh
+# On device (smoke 45 s motion; pass --full for 180 s):
+bash scripts/rt_qual/executor_qual.sh --mode device --smoke --cold-starts 3 --idle-s 60
+
+# Local mock sim gate before any real run:
+bash scripts/rt_qual/executor_qual.sh --mode mock --smoke --cold-starts 3 --idle-s 10
+```
+
+`executor_qual.sh` executes N cold starts (`owner_mode == executor`, `safety_state == Idle`, thread priorities), an idle soak, a `load.py` J1 motion pass (`speed_scale=0.3`), `analyze.py` reports, and stop/E-stop checks at confirmed disarmed Idle. Panic and teardown tests that alter hold targets remain mock/`FakeBus`-only and are listed in the report as **covered in sim**.
 
 ## Output Formats
 

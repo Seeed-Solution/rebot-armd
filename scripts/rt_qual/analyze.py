@@ -2087,8 +2087,10 @@ def analyze(
                 "(gap: SupervisorLock::control_thread_attempts not exposed; confirm via B1 cargo test)"
             )
 
-    alloc_timing_confirmed = False
-    if devstat is not None:
+    alloc_timing_confirmed = (
+        bool(samples) and all(s.tick.get("alloc_timing_enabled") is True for s in samples)
+    )
+    if not alloc_timing_confirmed and devstat is not None:
         alloc_timing_confirmed = any("ARMD_ALLOC_TIMING=1" in l for l in devstat.armd_version)
     alloc_ops_delta = alloc_ops_series.verified_in_run_delta
     has_authoritative_alloc = (
@@ -2294,6 +2296,39 @@ def analyze(
         )
     if owner_mode is not None:
         out.append(f"- **Owner mode**: `{owner_mode}`")
+    executor_wakes_series = analyze_counter_series(samples, "executor_wakes")
+    if executor_wakes_series.present_any:
+        out.append(
+            f"- **Executor sub-release wakes (`executor_wakes`)**: delta=`{fmt_int(executor_wakes_series.verified_in_run_delta)}` "
+            f"(start={fmt_int(executor_wakes_series.start)}, end={fmt_int(executor_wakes_series.end)})"
+        )
+    if has_lock_attempts or alloc_ops_series.present_any:
+        exec_parts: list[str] = []
+        if has_lock_attempts:
+            exec_parts.append(f"`control_thread_lock_attempts`={fmt_int(lock_attempts_max)}")
+        if alloc_ops_series.present_any:
+            exec_parts.append(
+                f"`control_thread_alloc_ops` Δ={fmt_int(alloc_ops_delta)} "
+                f"(ARMD_ALLOC_TIMING=1 confirmed={alloc_timing_confirmed})"
+            )
+        out.append("- **Executor lock/alloc telemetry**: " + ", ".join(exec_parts))
+    if samples:
+        last_tick = samples[-1].tick
+        obs_cache = last_tick.get("observation_cache")
+        term_cap = last_tick.get("terminal_capture")
+        extra_exec_parts: list[str] = []
+        if isinstance(obs_cache, dict) and get_nonneg_int(obs_cache, "tick_frees") is not None:
+            extra_exec_parts.append(f"`observation_cache.tick_frees`={obs_cache['tick_frees']}")
+        if isinstance(term_cap, dict) and get_nonneg_int(term_cap, "captured") is not None:
+            extra_exec_parts.append(
+                f"`terminal_capture` captured={term_cap.get('captured')}, dropped={term_cap.get('dropped_full', 0)}"
+            )
+        if get_nonneg_int(last_tick, "safety_log_dropped") is not None:
+            extra_exec_parts.append(f"`safety_log_dropped`={last_tick['safety_log_dropped']}")
+        if get_nonneg_int(last_tick, "log_writer_dropped") is not None:
+            extra_exec_parts.append(f"`log_writer_dropped`={last_tick['log_writer_dropped']}")
+        if extra_exec_parts:
+            out.append("- **Off-thread sink & cache counters**: " + ", ".join(extra_exec_parts))
     if has_release_us or release_max_ever_series.present_any:
         out.append(
             f"- **Full release duration (`release_us`)**: p50 med=`{fmt_ms(us_to_ms(release_us_p50_med_us))} ms`, "
@@ -2790,10 +2825,11 @@ def analyze(
             "`control_thread_lock_attempts`: `SupervisorLock::control_thread_attempts` is not exposed in "
             "`GET /api/v1/diagnostics/tick` (verified via B1 tests; `wait_us`/`waited_for` are proxies)."
         )
-    gaps.append(
-        "`lock_alloc_calls`: populated only when `armd` runs with `ARMD_ALLOC_TIMING=1`, and serialized only on "
-        "`max_tick`/`max_lock` (not cumulative/window-wide); `ExecutorStats::wake_alloc_calls` is internal."
-    )
+    if not has_authoritative_alloc:
+        gaps.append(
+            "`lock_alloc_calls`: populated only when `armd` runs with `ARMD_ALLOC_TIMING=1`, and serialized only on "
+            "`max_tick`/`max_lock` (not cumulative/window-wide); run-scoped `control_thread_alloc_ops` requires executor mode with `ARMD_ALLOC_TIMING=1`."
+        )
     gaps.append(
         "`irq_runtime_ns`: `/proc/interrupts` exposes counts only; `/proc/<irq-tid>/sched` gives coarse threaded-IRQ "
         "CPU totals per sample interval, not hard-IRQ duration or per-tick overlapping timestamps."
@@ -2809,6 +2845,25 @@ def analyze(
     for g in gaps:
         out.append(f"- {g}")
     out.append("")
+
+    if owner_mode == "executor":
+        out.append("## 7. Simulation-Only Qualification Coverage (Covered in Sim)")
+        out.append("")
+        out.append(
+            "Fault-injection panic and teardown tests that alter hold targets or require mechanical support "
+            "run on mock / Damiao `FakeBus` rather than unattended hardware:"
+        )
+        out.append("")
+        out.append("| Qualification Item | Status | Evidence Suite |")
+        out.append("|---|---|---|")
+        out.append("| Control-thread panic -> preallocated zero-alloc SAFE-HOLD on measured positions | covered in sim | `test_drv_f1_lifecycle`, `test_drv_f1_alloc`, `test_rt_executor_hardening` |")
+        out.append("| Non-control panic -> stop, hold, park-to-rest, disable at confirmed rest | covered in sim | `test_drv_f1_lifecycle` |")
+        out.append("| Energized handback (`executor` -> `legacy`) and startup-failure legacy fallback | covered in sim | `test_drv_f1_lifecycle`, `test_g_real_follower` |")
+        out.append("| Stalled teardown / startup-timeout SAFE-HOLD & deliberate ProcessExit fallback | covered in sim | `test_drv_f1_lifecycle`, `test_rt_executor_hardening` |")
+        out.append("| Thermal trip protective disable path | covered in sim | `test_drv_f1_lifecycle`, `test_rt_executor_hardening` |")
+        out.append("| Whole-release / sub-release-wake 0-alloc & 0-supervisor-lock proofs | covered in sim | `test_rt_whole_release_alloc`, `test_drv_f1_alloc`, `test_rt_lock_proof` |")
+        out.append("| Damiao `FakeBus` executor E2E (enable, J1 motion, rest-pose torque-off) | covered in sim | `test_g_real_follower` |")
+        out.append("")
 
     if sched_trace is not None:
         out.extend(render_sched_trace_section(sched_trace))
