@@ -52,7 +52,10 @@ enum TxRule {
 
 struct VirtualBusState {
     motors: Vec<(u16, DamiaoLimits, f32, bool, u32)>, // (id, limits, q, enabled, ctrl_mode)
-    motor_faults: Vec<u8>, // non-zero overrides feedback state nibble (e.g. 0x0A overcurrent)
+    motor_faults: Vec<u8>, // non-zero overrides feedback state nibble (e.g. 0x0A overcurrent, 0x0D watchdog timeout)
+    motor_timeouts: Vec<u32>, // RID_TIMEOUT register (counts; 50 us / count; 0 disables watchdog)
+    motor_last_ctrl_at: Vec<Option<Instant>>, // timestamp of last CMD_ENABLE or control frame (0xCC does NOT refresh)
+    motor_watchdog_expiries: Vec<usize>, // cumulative Damiao TIMEOUT expiries per motor
     rx: VecDeque<(CanFrame, Option<Instant>)>,
     tx_log: Vec<CanFrame>,
     tx_accepted: Vec<CanFrame>,
@@ -82,9 +85,15 @@ impl VirtualBusState {
             .map(|(i, l)| (i as u16 + 1, *l, 0.0, false, damiao::CTRL_MODE_POS_VEL))
             .collect();
         let motor_faults = vec![0u8; limits.len()];
+        let motor_timeouts = vec![0u32; limits.len()];
+        let motor_last_ctrl_at = vec![None; limits.len()];
+        let motor_watchdog_expiries = vec![0usize; limits.len()];
         Self {
             motors,
             motor_faults,
+            motor_timeouts,
+            motor_last_ctrl_at,
+            motor_watchdog_expiries,
             rx: VecDeque::new(),
             tx_log: Vec::new(),
             tx_accepted: Vec::new(),
@@ -137,7 +146,32 @@ impl VirtualBusState {
         }
     }
 
+    /// Advance Damiao hardware TIMEOUT watchdogs up to `self.clock.now()`.
+    /// An enabled motor with `TIMEOUT > 0` that receives no control frame (`POS_VEL` / `MIT` /
+    /// `POS_FORCE`) for `>= counts * 50 us` disables itself and latches state `0xD` (CAN Loss).
+    /// Read-only `0xCC` status polls do NOT refresh the watchdog.
+    fn run_watchdogs(&mut self) {
+        let now = self.clock.now();
+        for k in 0..self.motors.len() {
+            let counts = self.motor_timeouts[k];
+            if counts == 0 || !self.motors[k].3 {
+                continue;
+            }
+            if let Some(last) = self.motor_last_ctrl_at[k] {
+                let limit = Duration::from_micros(u64::from(counts) * u64::from(damiao::TIMEOUT_UNIT_US_DOCUMENTED));
+                if now.saturating_duration_since(last) >= limit {
+                    self.motors[k].3 = false;
+                    self.motor_faults[k] = 0xD;
+                    self.motor_last_ctrl_at[k] = None;
+                    self.motor_watchdog_expiries[k] += 1;
+                }
+            }
+        }
+    }
+
     fn handle_frame(&mut self, frame: &CanFrame) {
+        self.run_watchdogs();
+        let now = self.clock.now();
         let id = frame.id as u16;
         if id == 0x7FF {
             let mid = u16::from_le_bytes([frame.data[0], frame.data[1]]);
@@ -152,6 +186,7 @@ impl VirtualBusState {
                             damiao::RID_PMAX => l.p_max.to_le_bytes(),
                             damiao::RID_VMAX => l.v_max.to_le_bytes(),
                             damiao::RID_TMAX => l.t_max.to_le_bytes(),
+                            damiao::RID_TIMEOUT => self.motor_timeouts[k].to_le_bytes(),
                             _ => 0u32.to_le_bytes(),
                         };
                         let [lo, hi] = mid.to_le_bytes();
@@ -160,12 +195,14 @@ impl VirtualBusState {
                             &[lo, hi, damiao::REG_READ, rid, val[0], val[1], val[2], val[3]],
                         )
                         .unwrap();
-                        self.rx.push_back((reply, Some(self.clock.now())));
+                        self.rx.push_back((reply, Some(now)));
                     }
                     damiao::REG_WRITE => {
                         let val = [frame.data[4], frame.data[5], frame.data[6], frame.data[7]];
                         if rid == damiao::RID_CTRL_MODE {
                             self.motors[k].4 = u32::from_le_bytes(val);
+                        } else if rid == damiao::RID_TIMEOUT {
+                            self.motor_timeouts[k] = u32::from_le_bytes(val);
                         }
                         let [lo, hi] = mid.to_le_bytes();
                         let reply = CanFrame::new_standard(
@@ -173,7 +210,7 @@ impl VirtualBusState {
                             &[lo, hi, damiao::REG_WRITE, rid, val[0], val[1], val[2], val[3]],
                         )
                         .unwrap();
-                        self.rx.push_back((reply, Some(self.clock.now())));
+                        self.rx.push_back((reply, Some(now)));
                     }
                     _ => {}
                 }
@@ -183,10 +220,14 @@ impl VirtualBusState {
         if let Some(k) = self.motors.iter().position(|m| m.0 == id) {
             if frame.data == damiao::CMD_ENABLE {
                 self.motors[k].3 = true;
+                self.motor_last_ctrl_at[k] = Some(now);
             } else if frame.data == damiao::CMD_DISABLE {
                 self.motors[k].3 = false;
+                self.motor_last_ctrl_at[k] = None;
             } else if frame.data == damiao::CMD_CLEAR_FAULTS {
                 self.motor_faults[k] = 0;
+            } else if self.motors[k].3 && self.motors[k].4 == damiao::CTRL_MODE_MIT {
+                self.motor_last_ctrl_at[k] = Some(now);
             }
             self.push_feedback(k);
         } else if let Some(k) = self
@@ -194,8 +235,11 @@ impl VirtualBusState {
             .iter()
             .position(|m| m.0 == id.wrapping_sub(0x100) || m.0 == id.wrapping_sub(0x300))
         {
-            self.motors[k].2 =
-                f32::from_le_bytes([frame.data[0], frame.data[1], frame.data[2], frame.data[3]]);
+            if self.motors[k].3 {
+                self.motors[k].2 =
+                    f32::from_le_bytes([frame.data[0], frame.data[1], frame.data[2], frame.data[3]]);
+                self.motor_last_ctrl_at[k] = Some(now);
+            }
             self.push_feedback(k);
         }
     }
@@ -285,10 +329,9 @@ impl CanTransport for VirtualBus {
     }
 
     fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<Instant>), TransportError> {
-        self.0
-            .lock()
-            .unwrap()
-            .rx
+        let mut s = self.0.lock().unwrap();
+        s.run_watchdogs();
+        s.rx
             .pop_front()
             .ok_or(TransportError::WouldBlock)
     }

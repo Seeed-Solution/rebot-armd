@@ -63,6 +63,8 @@ pub struct FakeMotor {
     pub last_cmd_at: Option<Instant>,
     /// The motor's own watchdog fired.
     pub watchdog_expired_at: Option<Instant>,
+    /// Cumulative number of Damiao TIMEOUT watchdog expiries on this motor.
+    pub watchdog_expiry_count: usize,
     /// Number of command frames received.
     pub commands: usize,
     /// The next `n` enable / disable frames are lost on the way to this motor (no state change,
@@ -103,7 +105,7 @@ impl FakeMotor {
         regs.insert(damiao::RID_TIMEOUT, 0u32.to_le_bytes());
         Self { id, q: 0.0, v: 0.0, tau: 0.0, enabled: false, state_override: None, limits, regs, reply_id: 0x10 + id,
             silent: false, ignore_reg_writes: false, ack_value_override: None, no_write_ack: false, ack_value_override_once: None, silent_after_mode_ack: false,
-            mute_feedback_after_mode_ack: false, mute_feedback: false, no_feedback: false, last_cmd: None, last_cmd_at: None, watchdog_expired_at: None, commands: 0,
+            mute_feedback_after_mode_ack: false, mute_feedback: false, no_feedback: false, last_cmd: None, last_cmd_at: None, watchdog_expired_at: None, watchdog_expiry_count: 0, commands: 0,
             drop_torque_frames: 0, torque_reply_delay: Duration::ZERO, torque_ready_at: None,
             stop_at: None, nm_per_raw: 0.0007, stop_stiffness: 250.0, last_pos_force: None, temperature_c: 30,
             ignore_set_zero: false, set_zero_count: 0 }
@@ -265,8 +267,10 @@ impl FakeBusState {
         for m in &mut self.motors {
             if let Some(deadline) = m.watchdog_deadline().filter(|d| now >= *d) {
                 m.enabled = false;
+                m.last_cmd_at = None;
                 m.state_override = Some(0xD);
                 m.watchdog_expired_at = Some(deadline);
+                m.watchdog_expiry_count += 1;
             }
         }
     }
@@ -358,6 +362,7 @@ impl FakeBusState {
                 self.command(k, None);
             } else if cmd == damiao::CMD_DISABLE {
                 self.motors[k].enabled = false;
+                self.motors[k].last_cmd_at = None;
             } else if cmd == damiao::CMD_CLEAR_FAULTS {
                 self.motors[k].state_override = None;
             } else if cmd == damiao::CMD_SET_ZERO {
@@ -420,7 +425,12 @@ impl FakeBusState {
                 let v = f32::from_le_bytes([cmd[4], cmd[5], cmd[6], cmd[7]]);
                 self.command(k, Some(MotorCmd::PosVel { p, v }));
             }
-            self.push_feedback(k);
+            let suppressed = self.now().is_some_and(|t| {
+                self.motors[k].torque_ready_at.is_some_and(|ready| t < ready)
+            });
+            if !suppressed {
+                self.push_feedback(k);
+            }
         }
     }
 }
