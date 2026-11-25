@@ -489,3 +489,399 @@ fn large_legal_workspace_servo_intake_step_refusal_and_publish_do_not_allocate()
         "stop + clear workspace_violation + follow-up servo step must not touch the allocator"
     );
 }
+
+/// PR Y zero-alloc & zero-free proof across the FULL RT policy lifecycle on `SupervisorInner`:
+/// ReserveLoad + cancel pruning, failed BeginPolicy, successful BeginPolicy + first `None -> Some`
+/// `PolicyObservation` publication, steady live steps, revocation hold, populated live-policy
+/// supersession (preserving replacement endpoint & J7 stamp with `servo_ws_min_depths` +
+/// `servo_target` populated), lease-loss termination, fault/E-stop termination, and post-end publish.
+#[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+#[test]
+fn rt_policy_lifecycle_reserve_begin_step_hold_supersede_and_terminate_zero_alloc_zero_free() {
+    use armd::model::HolderLabel;
+    use armd::policy_runtime::PolicyMode;
+    use armd::rt_core::broker::{
+        Capacities, ClientId, CommandKind, Descriptor, RequestId, Stamp, Submit,
+    };
+    use armd::rt_core::ops::{PlanSlot, Primitive, ReleaseEngine};
+    use armd::rt_core::requests::actions::{
+        ActionSubmit, PreparedActionKind, StagedAction,
+    };
+    use armd::rt_core::requests::lease::ConnectionHandle;
+    use armd::rt_core::requests::policy::{
+        commit_policy, BeginPolicySpec, EndPolicySpec, PolicyCommand, ReservePolicyLoadSpec,
+    };
+
+    let (mut inner, _) = supervisor();
+    let rt_auth = inner.init_rt_policy_spare_for_test(BOOT);
+    let conn = ConnectionHandle::try_new(1, CONN).unwrap();
+    let now = Instant::now();
+    let _ = inner.handle_conn_lifecycle(
+        armd::rt_core::requests::lease::LifecycleCmd::Open { seq: 1, conn_id: 1 },
+        now,
+    );
+    let lease_req = armd::rt_core::requests::lease::LeaseRequest::Preempt(
+        armd::rt_core::requests::lease::LeasePreempt {
+            connection: conn,
+            label: HolderLabel::new(CONN),
+            operator: armd::auth::OperatorGrant::unenforced(),
+        },
+    );
+    let lease_desc = Descriptor {
+        stamp: Stamp {
+            arm: ArmId::LOCAL,
+            boot: BOOT,
+            client: ClientId(1),
+            client_seq: 1,
+            request: RequestId(100),
+            authority: Authority::default(),
+            deadline: now + Duration::from_secs(10),
+        },
+        kind: CommandKind::Lease(lease_req),
+    };
+    let gen = match inner
+        .commit_lease(&lease_desc, lease_req, &ctx(now))
+        .expect("acquire ws lease for conn 1")
+    {
+        armd::rt_core::requests::lease::LeaseOutcome::Granted { generation, .. } => generation,
+        other => panic!("expected Granted, got {other:?}"),
+    };
+    let base = inner.commanded_positions.clone();
+    // Warm up all three triple-buffer slots (`back`, `middle`, `front`) + spares before measurement.
+    drop(inner.publish_at(0.02, 1, false));
+    drop(inner.core.hub().latest());
+    drop(inner.publish_at(0.04, 2, false));
+    drop(inner.core.hub().latest());
+    drop(inner.publish_at(0.06, 3, false));
+    drop(inner.core.hub().latest());
+
+    let make_desc_for = |client: ClientId, req_id: u64, auth: Authority, cmd: PolicyCommand| Descriptor {
+        stamp: Stamp {
+            arm: ArmId::LOCAL,
+            boot: BOOT,
+            client,
+            client_seq: req_id,
+            request: RequestId(req_id),
+            authority: auth,
+            deadline: now + Duration::from_secs(10),
+        },
+        kind: CommandKind::Policy(cmd),
+    };
+    let make_desc = |req_id: u64, auth: Authority, cmd: PolicyCommand| {
+        make_desc_for(ClientId(1), req_id, auth, cmd)
+    };
+    let ep = inner.safety.epoch_id();
+    let auth = Authority {
+        lease_generation: gen,
+        epoch: ep,
+        stop_generation: inner.current_stop_gen(),
+        config_revision: inner.workspace_revision,
+        parent_generation: 0,
+    };
+
+    // Pre-build frames and specs off-measurement so we measure ONLY RT owner execution.
+    let reserve_ok = ReservePolicyLoadSpec {
+        load_token: 1,
+        cancel_slot: 0,
+        admission_request_id: 1001,
+        prepared_boot: BOOT,
+        connection: conn,
+        mode: PolicyMode::Live,
+        sim_only: false,
+        i_am_at_the_arm: true,
+        operator: armd::auth::OperatorGrant::unenforced(),
+        reservation_expires_at: now + Duration::from_secs(10),
+    };
+    let begin_fail = BeginPolicySpec {
+        load_token: 1,
+        cancel_slot: 0,
+        admission_request_id: 1001,
+        prepared_boot: BOOT,
+        connection: conn,
+        operator: armd::auth::OperatorGrant::unenforced(),
+        calibration_revision: inner.calibration_revision,
+        policy_id: HolderLabel::new("p1"),
+        artifact_digest: HolderLabel::new("dig1"),
+        backend: HolderLabel::new("mlp"),
+        mode: PolicyMode::Live,
+        sim_only: false,
+        i_am_at_the_arm: true,
+        max_first_step_rad: 0.25,
+        max_step_rad: Some(0.10),
+        max_input_age_ms: 200,
+        max_vision_age_ms: None,
+        vision_stale_hold: false,
+        period_us: 50_000,
+        has_verified_release_gate: false,
+        gate_policy_sha256: HolderLabel::new(""),
+        gate_calibration_digest: HolderLabel::new(""),
+        gate_max_speed_scale: 1.0,
+        gate_is_production_release: false,
+        production_qualified_verified: false,
+    };
+    let bad_epoch_auth = Authority {
+        epoch: ep + 99,
+        ..auth
+    };
+    let reserve_2 = ReservePolicyLoadSpec {
+        load_token: 2,
+        admission_request_id: 1002,
+        ..reserve_ok
+    };
+    let begin_2 = BeginPolicySpec {
+        load_token: 2,
+        admission_request_id: 1002,
+        ..begin_fail
+    };
+
+    // Pre-stage a prepared joint move in a `ReleaseEngine` off-measurement so supersession
+    // exercises the real RT `ReleaseEngine::step` -> `commit_action(InstallPrepared)` path under
+    // WS conn 1 with 0 allocs / 0 frees.
+    let (mut jog_eng, mut jog_broker, _jog_tw, _jog_stops) = ReleaseEngine::new(
+        BOOT,
+        Capacities { commands: 4, replies: 8, plans: 2 },
+    );
+    let mut jog_start = [0.0f32; MAX_DOF];
+    let mut jog_goal = [0.0f32; MAX_DOF];
+    let mut jog_vmax = [1.0f32; MAX_DOF];
+    jog_start[..base.len()].copy_from_slice(&base);
+    jog_goal[..base.len()].copy_from_slice(&base);
+    jog_goal[0] += 0.12;
+    for (i, j) in inner.config.limits.iter().enumerate() {
+        jog_vmax[i] = j.max_velocity;
+    }
+    let dof_u8 = base.len() as u8;
+    let write_jog = |slot: &mut PlanSlot| {
+        slot.set(Primitive::Action(StagedAction::Joint {
+            child: None,
+            kind: PreparedActionKind::MoveToJoint,
+            dof: dof_u8,
+            start: jog_start,
+            target: jog_goal,
+            duration_s: 0.5,
+            max_velocity: jog_vmax,
+            power_scale: None,
+            settle: false,
+            approach_then: None,
+        }));
+    };
+    jog_broker
+        .submit(
+            ClientId(1),
+            50,
+            auth,
+            now + Duration::from_secs(10),
+            Submit::Action(ActionSubmit::InstallPrepared {
+                write: &write_jog,
+                kind: PreparedActionKind::MoveToJoint,
+                prepared_boot: BOOT,
+                admission_request_id: 1050,
+                check_workspace_revision: false,
+                poses_revision: None,
+                calibration_revision: None,
+                gripper_calib_revision: None,
+                power_budget_revision: None,
+            }),
+        )
+        .expect("stage jog action");
+
+    let (aid_committed, allocs, frees) = counted(|| {
+        // 1. ReserveLoad -> failed BeginPolicy (wrong epoch) -> reservation cleanly released.
+        let c1 = PolicyCommand::ReserveLoad(reserve_ok);
+        commit_policy(&mut inner, &make_desc(1, auth, c1), c1, &ctx(now)).expect("reserve 1");
+        let c2 = PolicyCommand::BeginPolicy(begin_fail);
+        assert!(commit_policy(&mut inner, &make_desc(2, bad_epoch_auth, c2), c2, &ctx(now)).is_err());
+
+        // 2. ReserveLoad -> BeginPolicy -> first `None -> Some(PolicyObservation)` publish!
+        let c3 = PolicyCommand::ReserveLoad(reserve_2);
+        commit_policy(&mut inner, &make_desc(3, auth, c3), c3, &ctx(now)).expect("reserve 2");
+        let c4 = PolicyCommand::BeginPolicy(begin_2);
+        let committed =
+            commit_policy(&mut inner, &make_desc(4, auth, c4), c4, &ctx(now)).expect("begin 2");
+        let aid = committed.action().unwrap().0;
+        drop(inner.publish_at(0.08, 4, false));
+
+        // 3. Steady live steps + tick + publish
+        let pgen = rt_auth.current();
+        let stream = StreamId(aid);
+        for seq in 1..=5u64 {
+            let f = frame(&inner, stream, auth, pgen, &base, 0.0001 * seq as f32, seq, now);
+            inner.consume_target(&f, &ctx(now)).expect("live policy step");
+            inner.tick_control(0.02);
+            drop(inner.publish_at(0.08 + 0.02 * seq as f64, 4 + seq, false));
+        }
+
+        // 4. Revocation hold + Step-5 hold + EndPolicy::Hold
+        let f_rev = frame(&inner, stream, auth, pgen.wrapping_add(5), &base, 0.0006, 6, now);
+        assert_eq!(inner.consume_target(&f_rev, &ctx(now)).unwrap_err().code, "POLICY_REVOKED");
+        let c_hold = PolicyCommand::EndPolicy(EndPolicySpec::Hold {
+            action_id: aid,
+            load_token: 2,
+            lease_generation: gen,
+        });
+        commit_policy(&mut inner, &make_desc(5, auth, c_hold), c_hold, &ctx(now)).expect("hold");
+        inner.tick_control(0.02);
+        drop(inner.publish_at(0.20, 10, false));
+
+        // 5. Re-apply live target so `servo_target` + `servo_ws_min_depths` are populated:
+        //    (a) `InstallPrepared::Joint` via `ReleaseEngine::step` is refused `MOTION_BUSY`
+        //        while the policy is active (0 allocs / 0 frees, policy stays live).
+        let pgen2 = rt_auth.current();
+        let f_live = frame(&inner, stream, auth, pgen2, &base, 0.0006, 7, now);
+        inner.consume_target(&f_live, &ctx(now)).expect("re-enter live");
+        inner.tick_control(0.02);
+        let rep = jog_eng.step(&mut inner, || now, 0.02, now + Duration::from_secs(10), 11);
+        assert!(rep.command.is_some(), "expected jog install refusal in release report");
+        assert!(inner.policy_run.is_some(), "InstallPrepared must refuse MOTION_BUSY while policy is active");
+
+        // 6. Terminate live run 2 via lease release + publish.
+        let _ = inner.release_lease(CONN, gen);
+        assert!(inner.policy_run.is_none());
+        drop(inner.publish_at(0.24, 12, false));
+        aid
+    });
+
+    assert!(aid_committed > 0);
+    assert_eq!(
+        (allocs, frees),
+        (0, 0),
+        "RT policy lifecycle (reserve/fail/begin/publish/step/revoke/hold/busy-refusal/lease-loss) touched allocator"
+    );
+    {
+        let after_lease_snap = inner.core.hub().latest().expect("published after lease loss");
+        assert_eq!(
+            after_lease_snap
+                .obs
+                .policy
+                .as_ref()
+                .and_then(|p| p.stop_reason.as_deref()),
+            Some("LEASE_LOST")
+        );
+    }
+
+    // 7. Re-acquire lease off-measurement, then verify `commit_primitive` is refused `MOTION_BUSY`
+    //    while a populated live policy is active, followed by `EndPolicy::Finish` and `EndPolicy::Stop`
+    //    + `EndPolicy::Fail` — all with 0 allocs / 0 frees.
+    let gen3 = inner.acquire_lease(CONN).expect("re-acquire lease");
+    inner.lease_enabled = false;
+    let auth3 = Authority {
+        lease_generation: gen3,
+        stop_generation: inner.current_stop_gen(),
+        ..auth
+    };
+    let reserve_3 = ReservePolicyLoadSpec {
+        load_token: 3,
+        admission_request_id: 1003,
+        ..reserve_ok
+    };
+    let begin_3 = BeginPolicySpec {
+        load_token: 3,
+        admission_request_id: 1003,
+        ..begin_fail
+    };
+    let reserve_4 = ReservePolicyLoadSpec {
+        load_token: 4,
+        admission_request_id: 1004,
+        ..reserve_ok
+    };
+    let begin_4 = BeginPolicySpec {
+        load_token: 4,
+        admission_request_id: 1004,
+        ..begin_fail
+    };
+    let ((), allocs2, frees2) = counted(|| {
+        let c5 = PolicyCommand::ReserveLoad(reserve_3);
+        commit_policy(&mut inner, &make_desc_for(ClientId(1), 6, auth3, c5), c5, &ctx(now))
+            .expect("reserve 3");
+        let c6 = PolicyCommand::BeginPolicy(begin_3);
+        let committed3 =
+            commit_policy(&mut inner, &make_desc_for(ClientId(1), 7, auth3, c6), c6, &ctx(now))
+                .expect("begin 3");
+        let aid3 = committed3.action().unwrap().0;
+        let pgen3 = rt_auth.current();
+        let f3 = frame(&inner, StreamId(aid3), auth3, pgen3, &base, 0.0006, 8, now);
+        inner.consume_target(&f3, &ctx(now)).expect("populate run 3 live target");
+        inner.tick_control(0.02);
+
+        // Concurrent motion primitive refused `MOTION_BUSY` with 0 allocs / 0 frees.
+        let mut cur_cmd = [0.0f32; MAX_DOF];
+        let mut sup_goal = [0.0f32; MAX_DOF];
+        cur_cmd[..base.len()].copy_from_slice(&inner.commanded_positions);
+        sup_goal[..base.len()].copy_from_slice(&inner.commanded_positions);
+        sup_goal[0] += 0.12;
+        let jog_prim = Primitive::joint_quintic(&cur_cmd[..base.len()], &sup_goal[..base.len()], 0.5)
+            .expect("jog prim");
+        let sup_desc = Descriptor {
+            stamp: Stamp {
+                arm: ArmId::LOCAL,
+                boot: BOOT,
+                client: ClientId(1),
+                client_seq: 51,
+                request: RequestId(51),
+                authority: Authority {
+                    stop_generation: inner.current_stop_gen(),
+                    ..auth3
+                },
+                deadline: now + Duration::from_secs(10),
+            },
+            kind: CommandKind::Immediate(armd::rt_core::broker::ImmediateOp::Heartbeat),
+        };
+        assert_eq!(
+            inner.commit_primitive(&sup_desc, &jog_prim, &ctx(now)).unwrap_err(),
+            "MOTION_BUSY"
+        );
+        assert!(inner.policy_run.is_some());
+
+        // Clean `EndPolicy::Finish` + publish.
+        let c_fin = PolicyCommand::EndPolicy(EndPolicySpec::Finish {
+            action_id: aid3,
+            load_token: 3,
+            lease_generation: gen3,
+            reason: HolderLabel::new("MAX_SECONDS"),
+            final_steps: 1,
+            final_stats: Default::default(),
+        });
+        commit_policy(&mut inner, &make_desc_for(ClientId(1), 8, auth3, c_fin), c_fin, &ctx(now))
+            .expect("finish run 3");
+        assert!(inner.policy_run.is_none());
+        drop(inner.publish_at(0.26, 13, false));
+
+        // Let braking settle to 0 velocity, then start run 4 and terminate via `EndPolicy::Stop`.
+        for k in 0..8 {
+            inner.tick_control(0.02);
+            drop(inner.publish_at(0.28 + 0.02 * k as f64, 14 + k, false));
+        }
+        let auth4 = Authority {
+            stop_generation: inner.current_stop_gen(),
+            ..auth3
+        };
+        let c7 = PolicyCommand::ReserveLoad(reserve_4);
+        commit_policy(&mut inner, &make_desc_for(ClientId(1), 9, auth4, c7), c7, &ctx(now))
+            .expect("reserve 4");
+        let c8 = PolicyCommand::BeginPolicy(begin_4);
+        commit_policy(&mut inner, &make_desc_for(ClientId(1), 10, auth4, c8), c8, &ctx(now))
+            .expect("begin 4");
+        let c_stop = PolicyCommand::EndPolicy(EndPolicySpec::Stop {
+            connection: conn,
+            lease_generation: gen3,
+        });
+        commit_policy(&mut inner, &make_desc_for(ClientId(1), 11, auth4, c_stop), c_stop, &ctx(now))
+            .expect("stop run 4");
+        assert!(inner.policy_run.is_none());
+        drop(inner.publish_at(0.50, 25, false));
+    });
+    assert_eq!(
+        (allocs2, frees2),
+        (0, 0),
+        "live policy busy-refusal, finish, and stop touched allocator"
+    );
+    let final_snap = inner.core.hub().latest().expect("published");
+    assert_eq!(
+        final_snap
+            .obs
+            .policy
+            .as_ref()
+            .and_then(|p| p.stop_reason.as_deref()),
+        Some("STOPPED")
+    );
+}

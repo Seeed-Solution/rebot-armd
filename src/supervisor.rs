@@ -5182,6 +5182,24 @@ impl SupervisorInner {
         max_id
     }
 
+    /// Test-only helper: initializes RT executor mode, preallocated `PolicyRun` spare, and
+    /// triple-buffer observation prewarm on a standalone `SupervisorInner` for counting-allocator
+    /// tests (`tests/test_target_consume_alloc.rs`).
+    #[doc(hidden)]
+    #[cfg(feature = "policy-runtime")]
+    pub fn init_rt_policy_spare_for_test(
+        &mut self,
+        boot: crate::rt_core::broker::BootId,
+    ) -> crate::policy_runtime::PolicyAuthorization {
+        self.rt_executor_owned = true;
+        self.boot_id = boot;
+        self.policy_run_spare = Some(crate::policy_runtime::PolicyRun::preallocated_rt_spare(
+            self.rt_policy_auth.clone(),
+        ));
+        self.prewarm_rt_buffers();
+        self.rt_policy_auth.clone()
+    }
+
     /// Queue a finished `PolicyRun` for off-thread drop when owned by the RT executor
     /// (prevents dropping heap strings/vectors on `armd-control`).
     #[cfg(feature = "policy-runtime")]

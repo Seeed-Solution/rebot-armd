@@ -39,7 +39,8 @@ fn rig() -> Rig {
     let st = inner.current_admission_stamp();
     let adm = inner.check_admission(st).unwrap();
     SupervisorInner::authorize_servo_stream(adm, gen).expect("authorize servo stream");
-    let (fx, broker, tw, stop) = ReleaseFixture::new(inner, BOOT, Capacities::default());
+    let (mut fx, broker, tw, stop) = ReleaseFixture::new(inner, BOOT, Capacities::default());
+    fx.core.attach_stop_requests(stop.clone());
     let mut stream = ServoStream::new();
     stream.lease_granted(gen);
     Rig { fx, _broker: broker, port: TargetPort::new(tw, ArmId::LOCAL, BOOT), stop, stream, gen }
@@ -837,4 +838,664 @@ fn servo_j7_admitted_stamp_updates_only_when_frame_moves_j7() {
         }),
         "servo frame moving J7 must stamp j7_admitted_stamp from its admission"
     );
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+mod pr_y_policy_unit_tests {
+    use super::*;
+    use crate::model::HolderLabel;
+    use crate::motion::PolicyStats;
+    use crate::policy_runtime::PolicyMode;
+    use crate::rt_core::broker::{ClientId, Reply, Submit};
+    use crate::rt_core::ops::Checkpoint;
+    use crate::rt_core::requests::lease::ConnectionHandle;
+    use crate::rt_core::requests::policy::{
+        BeginPolicySpec, EndPolicySpec, PolicyCancelSlots, PolicyCommand, ReservePolicyLoadSpec,
+        POLICY_CANCEL_SLOTS,
+    };
+
+    fn begin_rt_policy_via_broker(
+        r: &mut Rig,
+        conn_id: u64,
+        token: u64,
+        cancel_slot: u8,
+        mode: PolicyMode,
+        max_first_step_rad: f32,
+        max_step_rad: Option<f32>,
+        max_input_age_ms: u64,
+        max_vision_age_ms: Option<u64>,
+        vision_stale_hold: bool,
+        gate_max_speed_scale: Option<f64>,
+    ) -> u64 {
+        r.fx.core.rt_executor_owned = true;
+        r.fx.core.policy_run_spare = Some(crate::policy_runtime::PolicyRun::preallocated_rt_spare(
+            r.fx.core.rt_policy_auth.clone(),
+        ));
+        let conn = ConnectionHandle::try_new(conn_id, CONN).unwrap();
+        let auth = r.authority();
+        let now = r.fx.now();
+        let reserve = ReservePolicyLoadSpec {
+            load_token: token,
+            cancel_slot,
+            admission_request_id: token * 100 + 1,
+            prepared_boot: BOOT,
+            connection: conn,
+            mode,
+            sim_only: false,
+            i_am_at_the_arm: true,
+            operator: crate::auth::OperatorGrant::unenforced(),
+            reservation_expires_at: now + Duration::from_secs(10),
+        };
+        r._broker
+            .submit(
+                ClientId(conn_id),
+                token * 10 + 1,
+                auth,
+                now + Duration::from_secs(5),
+                Submit::Policy(PolicyCommand::ReserveLoad(reserve)),
+            )
+            .expect("admit reserve");
+        r.fx.step();
+        let mut replies = Vec::new();
+        r._broker.poll(|_, rep| {
+            replies.push(rep);
+            true
+        });
+        assert!(
+            replies.iter().any(|rep| matches!(rep, Reply::Ack { .. })),
+            "ReserveLoad must ACK: {replies:?}"
+        );
+
+        let now2 = r.fx.now();
+        let begin = BeginPolicySpec {
+            load_token: token,
+            cancel_slot,
+            admission_request_id: token * 100 + 1,
+            prepared_boot: BOOT,
+            connection: conn,
+            operator: crate::auth::OperatorGrant::unenforced(),
+            calibration_revision: r.fx.core.calibration_revision,
+            policy_id: HolderLabel::new("test_p"),
+            artifact_digest: HolderLabel::new("digest_a"),
+            backend: HolderLabel::new("mlp"),
+            mode,
+            sim_only: false,
+            i_am_at_the_arm: true,
+            max_first_step_rad,
+            max_step_rad,
+            max_input_age_ms,
+            max_vision_age_ms,
+            vision_stale_hold,
+            period_us: 50_000,
+            has_verified_release_gate: gate_max_speed_scale.is_some(),
+            gate_policy_sha256: HolderLabel::new("digest_a"),
+            gate_calibration_digest: HolderLabel::new(r.fx.core.active_calibration_digest_str()),
+            gate_max_speed_scale: gate_max_speed_scale.unwrap_or(1.0),
+            gate_is_production_release: false,
+            production_qualified_verified: false,
+        };
+        r._broker
+            .submit(
+                ClientId(conn_id),
+                token * 10 + 2,
+                auth,
+                now2 + Duration::from_secs(5),
+                Submit::Policy(PolicyCommand::BeginPolicy(begin)),
+            )
+            .expect("admit begin");
+        r.fx.step();
+        replies.clear();
+        r._broker.poll(|_, rep| {
+            replies.push(rep);
+            true
+        });
+        match replies.last() {
+            Some(Reply::Ack {
+                action: Some(aid), ..
+            }) => aid.0,
+            other => panic!("BeginPolicy must ACK with action_id: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn policy_target_refusal_precedence_and_outcome_state_consistency() {
+        let mut r = rig();
+        let aid = begin_rt_policy_via_broker(
+            &mut r,
+            1,
+            1,
+            0,
+            PolicyMode::Live,
+            0.25,
+            Some(0.10),
+            100,
+            Some(120),
+            true,
+            None,
+        );
+        let stream = policy_stream(aid);
+        let auth = r.authority();
+        let gen_ok = r.fx.core.policy_run.as_ref().unwrap().authorization.current();
+        let now = r.fx.now();
+
+        // 1. Invalid DOF precedes everything and does NOT terminate run.
+        let mut bad_dof = r.raw_frame(stream, auth, 0.01);
+        bad_dof.dof = 0;
+        bad_dof.policy_generation = gen_ok;
+        bad_dof.replaceable = false;
+        assert_eq!(r.consume(&bad_dof), Err("INVALID_COMMAND"));
+        assert!(r.fx.core.policy_run.is_some());
+
+        // 2. Wrong boot precedes authority/stream and does NOT terminate run.
+        let mut wrong_boot = r.raw_frame(stream, auth, 0.01);
+        wrong_boot.boot = BootId(999);
+        wrong_boot.policy_generation = gen_ok;
+        wrong_boot.replaceable = false;
+        assert_eq!(r.consume(&wrong_boot), Err("WRONG_TARGET"));
+        assert!(r.fx.core.policy_run.is_some());
+
+        // 3. Stream mismatch does NOT terminate run.
+        let mut wrong_stream = r.raw_frame(policy_stream(aid + 99), auth, 0.01);
+        wrong_stream.policy_generation = gen_ok;
+        wrong_stream.replaceable = false;
+        assert_eq!(r.consume(&wrong_stream), Err("STREAM_NOT_AUTHORIZED"));
+        assert!(r.fx.core.policy_run.is_some());
+
+        // 4. Revoked policy_generation precedes input staleness & deadline, brakes in place, keeps run alive.
+        let mut revoked_and_stale = r.raw_frame(stream, auth, 0.01);
+        revoked_and_stale.policy_generation = gen_ok + 7;
+        revoked_and_stale.input_at = now - Duration::from_millis(500);
+        revoked_and_stale.deadline = now - Duration::from_millis(100);
+        revoked_and_stale.replaceable = false;
+        assert_eq!(r.consume(&revoked_and_stale), Err("POLICY_REVOKED"));
+        assert!(r.fx.core.policy_run.is_some(), "revocation holds rather than terminates");
+        assert!(r.fx.core.servo_target.is_none());
+
+        // 5. Missing vision_at when vision required -> VISION_STALE (hold mode keeps run alive).
+        let gen_ok = r.fx.core.rt_policy_auth.current();
+        let mut missing_vis = r.raw_frame(stream, auth, 0.01);
+        missing_vis.policy_generation = gen_ok;
+        missing_vis.vision_at = None;
+        missing_vis.replaceable = false;
+        assert_eq!(r.consume(&missing_vis), Err("VISION_STALE"));
+        assert!(r.fx.core.policy_run.is_some());
+
+        // 6. Future vision_at (> now + 50 ms) -> VISION_STALE (hold mode).
+        let gen_ok = r.fx.core.rt_policy_auth.current();
+        let mut future_vis = r.raw_frame(stream, auth, 0.01);
+        future_vis.policy_generation = gen_ok;
+        future_vis.vision_at = Some(now + Duration::from_millis(100));
+        future_vis.replaceable = false;
+        assert_eq!(r.consume(&future_vis), Err("VISION_STALE"));
+        assert!(r.fx.core.policy_run.is_some());
+
+        // 7. Stale input_at (> 100 ms) ALSO past deadline (> 200 ms) -> INPUT_STALE precedes deadline
+        //    and terminates the run with matching `stop_reason == "STALE_INPUT"`.
+        let gen_ok = r.fx.core.rt_policy_auth.current();
+        let mut stale_and_past_dl = r.raw_frame(stream, auth, 0.01);
+        stale_and_past_dl.policy_generation = gen_ok;
+        stale_and_past_dl.input_at = now - Duration::from_millis(250);
+        stale_and_past_dl.vision_at = Some(now);
+        stale_and_past_dl.deadline = now - Duration::from_millis(50);
+        stale_and_past_dl.replaceable = false;
+        assert_eq!(r.consume(&stale_and_past_dl), Err("INPUT_STALE"));
+        assert!(r.fx.core.policy_run.is_none(), "INPUT_STALE must terminate run");
+        assert_eq!(
+            r.fx.core
+                .last_policy_obs
+                .as_ref()
+                .and_then(|o| o.stop_reason.as_deref()),
+            Some("STALE_INPUT")
+        );
+
+        // 8. Future input_at (> now + 50 ms) on a fresh run -> INPUT_STALE & terminates as STALE_INPUT.
+        let aid2 = begin_rt_policy_via_broker(
+            &mut r,
+            1,
+            2,
+            1,
+            PolicyMode::Live,
+            0.25,
+            Some(0.10),
+            100,
+            None,
+            false,
+            None,
+        );
+        let gen2 = r.fx.core.policy_run.as_ref().unwrap().authorization.current();
+        let now2 = r.fx.now();
+        let mut future_in = r.raw_frame(policy_stream(aid2), r.authority(), 0.01);
+        future_in.policy_generation = gen2;
+        future_in.input_at = now2 + Duration::from_millis(100);
+        future_in.replaceable = false;
+        assert_eq!(r.consume(&future_in), Err("INPUT_STALE"));
+        assert!(r.fx.core.policy_run.is_none());
+        assert_eq!(
+            r.fx.core
+                .last_policy_obs
+                .as_ref()
+                .and_then(|o| o.stop_reason.as_deref()),
+            Some("STALE_INPUT")
+        );
+    }
+
+    #[test]
+    fn policy_step5_revocation_without_new_frame_and_between_step4_step5_brakes_immediately() {
+        let mut r = rig();
+        let aid = begin_rt_policy_via_broker(
+            &mut r,
+            1,
+            1,
+            0,
+            PolicyMode::Live,
+            0.25,
+            Some(0.25),
+            200,
+            None,
+            false,
+            None,
+        );
+        let q0 = r.fx.core.commanded_positions[0];
+        let auth_handle = r.fx.core.rt_policy_auth.clone();
+        let gen0 = auth_handle.current();
+        let tgt = r.pose(0.05);
+
+        // Case A: Revoke strictly BETWEEN Step 4 (accepted frame) and Step 5 (`BeforeOutput`):
+        // Step 5 must catch `live_target_auth_gen != current()`, brake immediately, and move 0 rad.
+        let auth_hook = auth_handle.clone();
+        let triggered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let trig_c = triggered.clone();
+        r.fx.on_checkpoint(move |cp| {
+            if cp == Checkpoint::BeforeOutput
+                && !trig_c.swap(true, std::sync::atomic::Ordering::AcqRel)
+            {
+                auth_hook.revoke();
+            }
+        });
+        assert_eq!(
+            r.port.submit_policy(&PolicyTarget {
+                action_id: aid,
+                stamp: PolicyStamp {
+                    authority: r.authority(),
+                    authorization: gen0,
+                    max_input_age: Duration::from_millis(200),
+                },
+                targets: &tgt,
+                input_at: r.fx.now(),
+                vision_at: None,
+                vision_frame_id: None,
+            }),
+            crate::rt_core::mailbox::Submitted::Accepted
+        );
+        let rep = r.fx.step();
+        assert_eq!(rep.target, Some((1, Ok(()))));
+        assert!(r.fx.core.policy_run.is_some(), "revocation holds run active");
+        assert!(r.fx.core.servo_target.is_none(), "Step 5 must brake in place");
+        assert!(
+            (r.fx.core.commanded_positions[0] - q0).abs() < 1e-6,
+            "zero policy-driven movement after revocation between Step 4 and Step 5"
+        );
+
+        // Case B: Accept a fresh live target at the new generation, let 1 tick move, then revoke
+        // across a release with NO new target frame -> next release brakes immediately at Step 5.
+        let gen1 = auth_handle.current();
+        assert_eq!(
+            r.port.submit_policy(&PolicyTarget {
+                action_id: aid,
+                stamp: PolicyStamp {
+                    authority: r.authority(),
+                    authorization: gen1,
+                    max_input_age: Duration::from_millis(200),
+                },
+                targets: &tgt,
+                input_at: r.fx.now(),
+                vision_at: None,
+                vision_frame_id: None,
+            }),
+            crate::rt_core::mailbox::Submitted::Accepted
+        );
+        let rep2 = r.fx.step();
+        assert_eq!(rep2.target, Some((2, Ok(()))));
+        assert!(r.fx.core.servo_target.is_some());
+        let q_after_step = r.fx.core.commanded_positions[0];
+        assert!(q_after_step > q0, "fresh target must move arm");
+
+        // Revoke with NO new frame submitted:
+        auth_handle.revoke();
+        let rep3 = r.fx.step();
+        assert!(rep3.target.is_none());
+        assert!(
+            r.fx.core.servo_target.is_none(),
+            "Step 5 must clear active policy servo_target even with no new mailbox frame"
+        );
+        assert!(r.fx.core.policy_run.is_some());
+    }
+
+    #[test]
+    fn policy_first_step_jump_limit_subsequent_step_limit_and_release_gate_speed_scale() {
+        // 1. First-step JUMP_LIMIT
+        let mut r = rig();
+        let mut unscaled_lims = Vec::new();
+        r.fx.core.servo_limits_into(&mut unscaled_lims);
+        let base_servo_v0 = unscaled_lims[0].max_velocity;
+        let aid = begin_rt_policy_via_broker(
+            &mut r,
+            1,
+            1,
+            0,
+            PolicyMode::Live,
+            0.08,
+            Some(0.04),
+            200,
+            None,
+            false,
+            Some(0.25),
+        );
+        let mut lims = Vec::new();
+        r.fx.core.servo_limits_into(&mut lims);
+        assert!(
+            (lims[0].max_velocity - base_servo_v0 * 0.25).abs() < 1e-5,
+            "RtGateBinding max_speed_scale=0.25 must scale RT servo velocity limits (got {} vs {})",
+            lims[0].max_velocity,
+            base_servo_v0 * 0.25
+        );
+
+        let gen = r.fx.core.rt_policy_auth.current();
+        let q_jump = r.pose(0.15); // > 0.08 first-step limit
+        let mut f_jump = r.raw_frame(policy_stream(aid), r.authority(), 0.15);
+        f_jump.policy_generation = gen;
+        f_jump.replaceable = false;
+        f_jump.q[..q_jump.len()].copy_from_slice(&q_jump);
+        assert_eq!(r.consume(&f_jump), Err("JUMP_LIMIT"));
+        assert!(r.fx.core.policy_run.is_none());
+        assert_eq!(
+            r.fx.core
+                .last_policy_obs
+                .as_ref()
+                .and_then(|o| o.stop_reason.as_deref()),
+            Some("JUMP_LIMIT")
+        );
+
+        // 2. Subsequent-step STEP_LIMIT
+        let aid2 = begin_rt_policy_via_broker(
+            &mut r,
+            1,
+            2,
+            1,
+            PolicyMode::Live,
+            0.08,
+            Some(0.03),
+            200,
+            None,
+            false,
+            None,
+        );
+        let gen2 = r.fx.core.rt_policy_auth.current();
+        let mut f_ok = r.raw_frame(policy_stream(aid2), r.authority(), 0.05);
+        f_ok.policy_generation = gen2;
+        f_ok.replaceable = false;
+        assert_eq!(r.consume(&f_ok), Ok(()));
+        assert_eq!(r.fx.core.policy_run.as_ref().unwrap().steps, 1);
+
+        let mut f_step_big = r.raw_frame(policy_stream(aid2), r.authority(), 0.12); // +0.07 from 0.05 > 0.03
+        f_step_big.policy_generation = gen2;
+        f_step_big.seq = 2;
+        f_step_big.replaceable = false;
+        assert_eq!(r.consume(&f_step_big), Err("STEP_LIMIT"));
+        assert!(r.fx.core.policy_run.is_none());
+        assert_eq!(
+            r.fx.core
+                .last_policy_obs
+                .as_ref()
+                .and_then(|o| o.stop_reason.as_deref()),
+            Some("STEP_LIMIT")
+        );
+    }
+
+    #[test]
+    fn policy_cancel_slots_exclusive_lifetime_refusal_isolation_and_stop_ordering() {
+        // Part A: Exclusive-lifetime reclamation invariant on 64 slots
+        let slots = std::sync::Arc::new(PolicyCancelSlots::new());
+        let mut guards = Vec::new();
+        for _ in 0..POLICY_CANCEL_SLOTS {
+            guards.push(slots.claim_slot().expect("claim within 64"));
+        }
+        assert_eq!(slots.claim_slot().err(), Some("MOTION_BUSY"));
+
+        // Retire slot 0 with an in-flight admitted request (req_id = 42) and active run token.
+        let mut g0 = guards.remove(0);
+        let tok0 = g0.token();
+        let slot0 = g0.slot();
+        g0.record_admitted_req(42);
+        slots.set_active_run_token(tok0);
+        g0.disarm();
+        drop(g0);
+
+        // Still blocked because `last_completed_policy_req_id < 42`.
+        assert_eq!(slots.claim_slot().err(), Some("MOTION_BUSY"));
+
+        // Advance completed watermark to 42, STILL blocked because `active_run_token == tok0`.
+        slots.mark_policy_req_completed(42);
+        assert_eq!(slots.claim_slot().err(), Some("MOTION_BUSY"));
+
+        // Clear active_run_token -> now slot 0 reclaims cleanly!
+        slots.set_active_run_token(0);
+        let g_new = slots.claim_slot().expect("slot 0 reclaimed cleanly");
+        assert_eq!(g_new.slot(), slot0);
+        assert_ne!(g_new.token(), tok0);
+        drop(g_new);
+        drop(guards);
+
+        // Part B: Refused higher-token ReserveLoad does NOT cancel active lower-token run;
+        // delayed EndPolicy::{Hold,Finish,Fail} from old run A rejected after new run B starts.
+        let mut r = rig();
+        let aid_a = begin_rt_policy_via_broker(
+            &mut r,
+            1,
+            10,
+            0,
+            PolicyMode::Live,
+            0.25,
+            Some(0.10),
+            200,
+            None,
+            false,
+            None,
+        );
+        let conn = ConnectionHandle::try_new(1, CONN).unwrap();
+        let now = r.fx.now();
+        r._broker
+            .submit(
+                ClientId(1),
+                901,
+                r.authority(),
+                now + Duration::from_secs(5),
+                Submit::Policy(PolicyCommand::ReserveLoad(ReservePolicyLoadSpec {
+                    load_token: 99,
+                    cancel_slot: 1,
+                    admission_request_id: 9901,
+                    prepared_boot: BOOT,
+                    connection: conn,
+                    mode: PolicyMode::Live,
+                    sim_only: false,
+                    i_am_at_the_arm: true,
+                    operator: crate::auth::OperatorGrant::unenforced(),
+                    reservation_expires_at: now + Duration::from_secs(5),
+                })),
+            )
+            .expect("submit overlapping reserve");
+        r.fx.step();
+        let mut reps = Vec::new();
+        r._broker.poll(|_, rep| {
+            reps.push(rep);
+            true
+        });
+        assert!(matches!(reps.last(), Some(Reply::Refused { code: "MOTION_BUSY", .. })));
+        assert_eq!(
+            r.fx.core.policy_run.as_ref().map(|p| (p.action_id, p.load_token)),
+            Some((aid_a, 10)),
+            "refused higher-token reserve must not cancel active lower-token run"
+        );
+
+        // Stop run A and start run B on same lease.
+        r._broker
+            .submit(
+                ClientId(1),
+                902,
+                r.authority(),
+                r.fx.now() + Duration::from_secs(5),
+                Submit::Policy(PolicyCommand::EndPolicy(EndPolicySpec::Stop {
+                    connection: conn,
+                    lease_generation: r.gen,
+                })),
+            )
+            .expect("stop A");
+        r.fx.step();
+        reps.clear();
+        r._broker.poll(|_, rep| {
+            reps.push(rep);
+            true
+        });
+        assert!(r.fx.core.policy_run.is_none());
+
+        let aid_b = begin_rt_policy_via_broker(
+            &mut r,
+            1,
+            20,
+            2,
+            PolicyMode::Live,
+            0.25,
+            Some(0.10),
+            200,
+            None,
+            false,
+            None,
+        );
+        assert_ne!(aid_a, aid_b);
+
+        // Delayed Hold / Finish / Fail for old run A must ALL be refused `POLICY_NOT_ACTIVE`.
+        for (i, spec) in [
+            EndPolicySpec::Hold {
+                action_id: aid_a,
+                load_token: 10,
+                lease_generation: r.gen,
+            },
+            EndPolicySpec::Finish {
+                action_id: aid_a,
+                load_token: 10,
+                lease_generation: r.gen,
+                reason: HolderLabel::new("MAX_SECONDS"),
+                final_steps: 5,
+                final_stats: PolicyStats::default(),
+            },
+            EndPolicySpec::Fail {
+                action_id: aid_a,
+                load_token: 10,
+                lease_generation: r.gen,
+                reason: HolderLabel::new("INFERENCE_ERROR"),
+                message: HolderLabel::new("stale"),
+                final_steps: 5,
+                final_stats: PolicyStats::default(),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            r._broker
+                .submit(
+                    ClientId(1),
+                    910 + i as u64,
+                    r.authority(),
+                    r.fx.now() + Duration::from_secs(5),
+                    Submit::Policy(PolicyCommand::EndPolicy(spec)),
+                )
+                .expect("submit delayed end");
+            r.fx.step();
+            reps.clear();
+            r._broker.poll(|_, rep| {
+            reps.push(rep);
+            true
+        });
+            assert!(
+                matches!(
+                    reps.last(),
+                    Some(Reply::Refused {
+                        code: "POLICY_NOT_ACTIVE",
+                        ..
+                    })
+                ),
+                "delayed EndPolicy for run A must be refused POLICY_NOT_ACTIVE: {reps:?}"
+            );
+            assert_eq!(
+                r.fx.core.policy_run.as_ref().map(|p| p.action_id),
+                Some(aid_b),
+                "run B must remain active"
+            );
+        }
+
+        // Part C: `EndPolicy::Stop` interleaved with concurrent general Stop on unrelated active trajectory.
+        // First end run B, start a plain trajectory, then race StopRequests::request() right before commit!
+        r._broker
+            .submit(
+                ClientId(1),
+                950,
+                r.authority(),
+                r.fx.now() + Duration::from_secs(5),
+                Submit::Policy(PolicyCommand::EndPolicy(EndPolicySpec::Stop {
+                    connection: conn,
+                    lease_generation: r.gen,
+                })),
+            )
+            .expect("stop B");
+        r.fx.step();
+        r._broker.poll(|_, _| true);
+        assert!(r.fx.core.policy_run.is_none());
+
+        let jog_goal = r.pose(0.2);
+        let ep = r.epoch();
+        let stamp = r.fx.core.current_admission_stamp();
+        let adm = r.fx.core.check_admission(stamp).unwrap();
+        let _ = SupervisorInner::jog_action_slice(adm, &jog_goal, Some(1.0), Some(ep), "jog")
+            .expect("start active jog");
+        assert!(r.fx.core.active_trajectory.is_some());
+
+        // Attach shared `StopRequests` mirror and trigger an unapplied concurrent general Stop
+        // right before `commit_policy(EndPolicy::Stop)` directly to exercise the exact race window!
+        let stops = r.stop.clone();
+        r.fx.core.stop_requests = Some(stops.clone());
+        let auth_now = r.authority();
+        let _gen_before = stops.request(); // unapplied general stop (`prev != stops.applied()`)
+        let fake_desc = crate::rt_core::broker::Descriptor {
+            stamp: crate::rt_core::broker::Stamp {
+                arm: ArmId::LOCAL,
+                boot: BOOT,
+                client: ClientId(1),
+                client_seq: 999,
+                request: crate::rt_core::broker::RequestId(999),
+                authority: auth_now,
+                deadline: r.fx.now() + Duration::from_secs(2),
+            },
+            kind: crate::rt_core::broker::CommandKind::Policy(PolicyCommand::EndPolicy(
+                EndPolicySpec::Stop {
+                    connection: conn,
+                    lease_generation: r.gen,
+                },
+            )),
+        };
+        let commit_ctx = r.fx.ctx(r.fx.now());
+        let res = crate::rt_core::requests::policy::commit_policy(
+            &mut r.fx.core,
+            &fake_desc,
+            PolicyCommand::EndPolicy(EndPolicySpec::Stop {
+                connection: conn,
+                lease_generation: r.gen,
+            }),
+            &commit_ctx,
+        );
+        assert!(res.is_ok(), "EndPolicy::Stop must commit: {res:?}");
+        assert!(
+            r.fx.core.active_trajectory.is_none(),
+            "concurrent general Stop interleaved before EndPolicy::Stop must stop unrelated active trajectory"
+        );
+    }
 }
