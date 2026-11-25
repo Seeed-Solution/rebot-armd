@@ -7516,7 +7516,7 @@ impl SupervisorInner {
             crate::safety::BoundedText::<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>::empty();
         e.write_bounded(&mut err_detail);
         if !self.e_stop_latched.load(Ordering::SeqCst)
-            && !matches!(self.safety.state(), crate::safety::SafetyState::EStop { .. })
+            && !matches!(self.safety.state(), crate::safety::SafetyState::EStop)
         {
             let detail =
                 crate::safety::FaultDetail::formatted(FaultCode::DriverWriteFailed, |buf| {
