@@ -1246,7 +1246,7 @@ async function main() {
 
         // 5(e): Pure real browser pointer drag & held ArrowRight repeat on #grip-range (marked before confirm)
         log('--- Scenario 5(e): Real pointer drag & ArrowRight repeat on #grip-range ---');
-        await page.click('#ui-seg button[data-ui="expert"]');
+        if (await page.evaluate(() => S.ui !== 'expert')) await page.click('#btn-ui');
         await page.click('#mode-seg button[data-mode="cart"]');
         const gripBox = await (await page.waitForSelector('#grip-range', { state: 'visible', timeout: 3000 })).boundingBox();
         await page.evaluate(() => { S.ws.close(); });
