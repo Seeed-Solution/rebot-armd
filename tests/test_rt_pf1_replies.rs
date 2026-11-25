@@ -499,15 +499,15 @@ async fn pf1_mock_ws_replay_success_reject_cancel_stop_and_handover() {
     req_id += 1;
     assert_ne!(rec_rej["code"].as_str(), Some("EXECUTOR_ROUTING_PENDING"), "{rec_rej}");
 
-    // Unmigrated gravity_comp stays at 503 EXECUTOR_ROUTING_PENDING.
-    let gc_rej = ws_reply(
+    // Unmigrated record/start stays at 503 EXECUTOR_ROUTING_PENDING.
+    let unmig_rej = ws_reply(
         &mut ws_ctrl,
-        json!({"type": "command", "request_id": req_id, "generation": gen_ctrl, "epoch_id": ep, "path": "/api/v1/mode/gravity_comp", "body": {"enable": true}}),
+        json!({"type": "command", "request_id": req_id, "generation": gen_ctrl, "epoch_id": ep, "path": "/api/v1/record/start", "body": {"dataset": "d"}}),
         &["command_reject"],
     )
     .await;
     req_id += 1;
-    assert_eq!((gc_rej["status"].as_u64(), gc_rej["code"].as_str()), (Some(503), Some("EXECUTOR_ROUTING_PENDING")), "{gc_rej}");
+    assert_eq!((unmig_rej["status"].as_u64(), unmig_rej["code"].as_str()), (Some(503), Some("EXECUTOR_ROUTING_PENDING")), "{unmig_rej}");
 
     // (d) Cancel/Stop mid-action: slow move_to -> ACK -> urgent Stop -> cancelled terminal!
     let slow_ack = ws_reply(

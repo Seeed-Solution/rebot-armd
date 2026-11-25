@@ -2379,8 +2379,10 @@ async fn cli_startup_gate_allows_mock_and_rejects_non_mock_and_invalid_env() {
         format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
     };
 
-    assert!(run_fail("executor", "sim").contains("gated to '--follower mock'"));
-    assert!(run_fail("executor", "rebot-dm").contains("gated to '--follower mock'"));
+    let sim_err = run_fail("executor", "sim");
+    assert!(sim_err.contains("only qualified for '--follower rebot-dm' and '--follower mock'"), "{sim_err}");
+    let so101_err = run_fail("executor", "so-arm101");
+    assert!(so101_err.contains("only qualified for '--follower rebot-dm' and '--follower mock'"), "{so101_err}");
     assert!(run_fail("invalid_owner", "mock").contains("ARMD_RT_OWNER"));
 
     // Positive smoke: `ARMD_RT_OWNER=executor --follower mock` starts on an ephemeral port,
