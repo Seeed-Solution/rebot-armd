@@ -554,6 +554,22 @@ pub struct ReleasePhasesUs {
     pub publish: u32,
 }
 
+/// Overrun-only (`release >= 15 ms`) monotonic phase durations (µs) across
+/// `step return → ring publication → completion seal` (zero heap allocation).
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+pub struct PostOverrunPhasesUs {
+    /// Step return → start of ring publication (executor: `hub.wake`, `flush_torque_shadow`,
+    /// guard drop, Window 2 wakes, pre-push tail; legacy: guard teardown, pre-publish tail).
+    pub step_to_ring_us: u32,
+    /// Ring publication (`diag_tx.push` + `hub.wake` in executor;
+    /// `LockFreeTickStats::record_staged_with_publish` in legacy).
+    pub ring_publish_us: u32,
+    /// After ring publication → start of completion seal (tail allocs, amendment, pre-seal work).
+    pub ring_to_seal_us: u32,
+    /// Completion seal (`ExecutorStats::commit_release_outcome_with_clock`).
+    pub seal_us: u32,
+}
+
 /// What the control thread did while it waited and while it held the lock, from
 /// `getrusage(RUSAGE_THREAD)` and `CLOCK_THREAD_CPUTIME_ID` around the phases (Linux; zero
 /// elsewhere). Valid for the control thread, which polls the tick on one OS thread.
@@ -702,6 +718,14 @@ pub struct TickSample {
     pub phases: LockPhases,
     /// Monotonic sub-phase deltas (µs) across `lock_end → release completion`.
     pub phases_us: ReleasePhasesUs,
+    /// Overrun-only (`release >= 15 ms`) monotonic phase breakdown (µs) across
+    /// `step return → ring publication → completion seal` (`None` on non-overrun releases).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub post_phases_us: Option<PostOverrunPhasesUs>,
+    /// Overrun-only thread CPU time (`CLOCK_THREAD_CPUTIME_ID`, µs) across the same post-step
+    /// span (`None` on non-overrun releases).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub post_cpu_us: Option<u32>,
     #[serde(flatten)]
     pub usage: ThreadUsage,
     /// The guard the tick waited for; None when no other guard was released since the
@@ -1096,6 +1120,12 @@ impl UsageMark {
         #[cfg(not(target_os = "linux"))]
         UsageMark { tx, ..UsageMark::default() }
     }
+
+    /// Thread CPU time (`CLOCK_THREAD_CPUTIME_ID`, ns) captured by this mark (0 outside Linux).
+    #[inline]
+    pub fn cpu_ns(&self) -> u64 {
+        self.cpu_ns
+    }
 }
 
 /// Lightweight thread context-switch mark from `getrusage(RUSAGE_THREAD)` (Linux; zero elsewhere).
@@ -1453,6 +1483,13 @@ struct AtomicTickSlot {
     phase_guard_drop: AtomicU32,
     phase_post: AtomicU32,
     phase_publish: AtomicU32,
+    // Overrun-only PostOverrunPhasesUs (`post_phases_us`) + `post_cpu_us`
+    has_post_overrun: AtomicBool,
+    post_step_to_ring_us: AtomicU32,
+    post_ring_publish_us: AtomicU32,
+    post_ring_to_seal_us: AtomicU32,
+    post_seal_us: AtomicU32,
+    post_cpu_us: AtomicU32,
     // ThreadUsage
     wait_cpu_us: AtomicU32,
     lock_cpu_us: AtomicU32,
@@ -1513,6 +1550,8 @@ struct RawTickSlot {
     stats_wait_us: u32,
     phases: LockPhases,
     phases_us: ReleasePhasesUs,
+    post_phases_us: Option<PostOverrunPhasesUs>,
+    post_cpu_us: Option<u32>,
     usage: ThreadUsage,
     waited_for: RawHolder,
     longest_hold: RawHolder,
@@ -1559,6 +1598,32 @@ impl AtomicTickSlot {
         self.phase_guard_drop.store(s.phases_us.guard_drop, Ordering::Relaxed);
         self.phase_post.store(s.phases_us.post, Ordering::Relaxed);
         self.phase_publish.store(s.phases_us.publish, Ordering::Relaxed);
+        match (s.post_phases_us, s.post_cpu_us) {
+            (Some(pp), Some(cpu)) => {
+                self.has_post_overrun.store(true, Ordering::Relaxed);
+                self.post_step_to_ring_us.store(pp.step_to_ring_us, Ordering::Relaxed);
+                self.post_ring_publish_us.store(pp.ring_publish_us, Ordering::Relaxed);
+                self.post_ring_to_seal_us.store(pp.ring_to_seal_us, Ordering::Relaxed);
+                self.post_seal_us.store(pp.seal_us, Ordering::Relaxed);
+                self.post_cpu_us.store(cpu, Ordering::Relaxed);
+            }
+            (Some(pp), None) => {
+                self.has_post_overrun.store(true, Ordering::Relaxed);
+                self.post_step_to_ring_us.store(pp.step_to_ring_us, Ordering::Relaxed);
+                self.post_ring_publish_us.store(pp.ring_publish_us, Ordering::Relaxed);
+                self.post_ring_to_seal_us.store(pp.ring_to_seal_us, Ordering::Relaxed);
+                self.post_seal_us.store(pp.seal_us, Ordering::Relaxed);
+                self.post_cpu_us.store(0, Ordering::Relaxed);
+            }
+            (None, _) => {
+                self.has_post_overrun.store(false, Ordering::Relaxed);
+                self.post_step_to_ring_us.store(0, Ordering::Relaxed);
+                self.post_ring_publish_us.store(0, Ordering::Relaxed);
+                self.post_ring_to_seal_us.store(0, Ordering::Relaxed);
+                self.post_seal_us.store(0, Ordering::Relaxed);
+                self.post_cpu_us.store(0, Ordering::Relaxed);
+            }
+        }
         self.wait_cpu_us.store(s.usage.wait_cpu_us, Ordering::Relaxed);
         self.lock_cpu_us.store(s.usage.lock_cpu_us, Ordering::Relaxed);
         self.wait_vcsw.store(s.usage.wait_vcsw, Ordering::Relaxed);
@@ -1647,6 +1712,16 @@ impl AtomicTickSlot {
                 post: self.phase_post.load(Ordering::Relaxed),
                 publish: self.phase_publish.load(Ordering::Relaxed),
             },
+            post_phases_us: self.has_post_overrun.load(Ordering::Relaxed).then(|| PostOverrunPhasesUs {
+                step_to_ring_us: self.post_step_to_ring_us.load(Ordering::Relaxed),
+                ring_publish_us: self.post_ring_publish_us.load(Ordering::Relaxed),
+                ring_to_seal_us: self.post_ring_to_seal_us.load(Ordering::Relaxed),
+                seal_us: self.post_seal_us.load(Ordering::Relaxed),
+            }),
+            post_cpu_us: self
+                .has_post_overrun
+                .load(Ordering::Relaxed)
+                .then(|| self.post_cpu_us.load(Ordering::Relaxed)),
             usage: ThreadUsage {
                 wait_cpu_us: self.wait_cpu_us.load(Ordering::Relaxed),
                 lock_cpu_us: self.lock_cpu_us.load(Ordering::Relaxed),
@@ -1714,6 +1789,8 @@ impl RawTickSlot {
                 stats_wait_us: self.stats_wait_us,
                 phases: self.phases,
                 phases_us: self.phases_us,
+                post_phases_us: self.post_phases_us,
+                post_cpu_us: self.post_cpu_us,
                 usage: self.usage,
                 // SAFETY: seqlock read validated by caller.
                 waited_for: unsafe { self.waited_for.into_holder_validated() },
@@ -1950,11 +2027,74 @@ impl LockFreeTickStats {
         }
     }
 
+    /// Wait-free single-writer overrun-only amendment of `release_us`, `phases_us.publish`,
+    /// `post_phases_us`, and `post_cpu_us` for a specific `sample_seq` (legacy owner).
+    pub fn amend_slot_post_overrun(
+        &self,
+        sample_seq: u64,
+        release_us: u32,
+        publish_us: u32,
+        post_phases: PostOverrunPhasesUs,
+        post_cpu_us: u32,
+    ) {
+        if sample_seq == 0 {
+            return;
+        }
+        if self
+            .writer_busy
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            self.writer_contention_drops.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        struct BusyGuard<'a>(&'a AtomicBool);
+        impl Drop for BusyGuard<'_> {
+            #[inline]
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _busy = BusyGuard(&self.writer_busy);
+
+        let slot_idx = ((sample_seq.wrapping_sub(1)) as usize) & (LOCK_FREE_RING_CAPACITY - 1);
+        let slot = &self.slots[slot_idx];
+        if slot.sample_seq.load(Ordering::Relaxed) == sample_seq {
+            let s0 = slot.seq.load(Ordering::Relaxed);
+            slot.seq.store(s0.wrapping_add(1), Ordering::Relaxed);
+            fence(Ordering::Release);
+            if slot.release_us.load(Ordering::Relaxed) < release_us {
+                slot.release_us.store(release_us, Ordering::Relaxed);
+            }
+            if slot.phase_publish.load(Ordering::Relaxed) < publish_us {
+                slot.phase_publish.store(publish_us, Ordering::Relaxed);
+            }
+            slot.has_post_overrun.store(true, Ordering::Relaxed);
+            slot.post_step_to_ring_us.store(post_phases.step_to_ring_us, Ordering::Relaxed);
+            slot.post_ring_publish_us.store(post_phases.ring_publish_us, Ordering::Relaxed);
+            slot.post_ring_to_seal_us.store(post_phases.ring_to_seal_us, Ordering::Relaxed);
+            slot.post_seal_us.store(post_phases.seal_us, Ordering::Relaxed);
+            slot.post_cpu_us.store(post_cpu_us, Ordering::Relaxed);
+            slot.seq.store(s0.wrapping_add(2), Ordering::Release);
+        }
+    }
+
     /// Wait-free single-writer tail amendment by executor `release_seq` (called only by off-thread
     /// `drain_diag` under the `diag_rx` consumer mutex so `LockFreeTickStats` stays single-writer).
     /// Scans up to [`TICK_WINDOW`] recent slots (`1000 > DIAG_RING_CAPACITY`) and returns `true`
     /// if the target sample was found in the ring, or `false` if evicted or contended.
     pub fn amend_release_us_by_release_seq(&self, release_seq: u64, release_us: u32) -> bool {
+        self.amend_by_release_seq(release_seq, release_us, None)
+    }
+
+    /// Wait-free single-writer tail amendment by executor `release_seq` updating `release_us`
+    /// monotonically and optionally attaching overrun-only `post_phases_us` and `post_cpu_us`.
+    pub fn amend_by_release_seq(
+        &self,
+        release_seq: u64,
+        release_us: u32,
+        post_overrun: Option<(PostOverrunPhasesUs, u32)>,
+    ) -> bool {
         if release_seq == 0 {
             return false;
         }
@@ -1983,11 +2123,22 @@ impl LockFreeTickStats {
             if slot.sample_seq.load(Ordering::Relaxed) == seq
                 && slot.release_seq.load(Ordering::Relaxed) == release_seq
             {
-                if slot.release_us.load(Ordering::Relaxed) < release_us {
+                let raise_rel = slot.release_us.load(Ordering::Relaxed) < release_us;
+                if raise_rel || post_overrun.is_some() {
                     let s0 = slot.seq.load(Ordering::Relaxed);
                     slot.seq.store(s0.wrapping_add(1), Ordering::Relaxed);
                     fence(Ordering::Release);
-                    slot.release_us.store(release_us, Ordering::Relaxed);
+                    if raise_rel {
+                        slot.release_us.store(release_us, Ordering::Relaxed);
+                    }
+                    if let Some((pp, cpu_us)) = post_overrun {
+                        slot.has_post_overrun.store(true, Ordering::Relaxed);
+                        slot.post_step_to_ring_us.store(pp.step_to_ring_us, Ordering::Relaxed);
+                        slot.post_ring_publish_us.store(pp.ring_publish_us, Ordering::Relaxed);
+                        slot.post_ring_to_seal_us.store(pp.ring_to_seal_us, Ordering::Relaxed);
+                        slot.post_seal_us.store(pp.seal_us, Ordering::Relaxed);
+                        slot.post_cpu_us.store(cpu_us, Ordering::Relaxed);
+                    }
                     slot.seq.store(s0.wrapping_add(2), Ordering::Release);
                 }
                 return true;
@@ -2509,6 +2660,8 @@ mod tests {
                     post: 15,
                     publish: 6 + (i % 13),
                 },
+                post_phases_us: None,
+                post_cpu_us: None,
                 usage: ThreadUsage {
                     mid_nvcsw: u32::from(i % 17 == 0),
                     mid_nivcsw: u32::from(i % 19 == 0),
@@ -2725,6 +2878,8 @@ mod tests {
                     post: ku % 53,
                     publish: ku % 29,
                 },
+                post_phases_us: None,
+                post_cpu_us: None,
                 usage: ThreadUsage {
                     lock_cpu_us: ku % 500,
                     mid_nvcsw: ku % 3,

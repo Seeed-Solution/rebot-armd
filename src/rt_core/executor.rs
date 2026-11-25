@@ -31,9 +31,10 @@ use super::urgent::{
     UrgentStopError, UrgentStopOutcome, URGENT_STOP_CAPACITY,
 };
 use crate::diagnostics::tick::{
-    LockPhases, ReleasePhasesUs, ThreadUsage, TickSample, UsageMark, RELEASE_FLAG_CLEAR_OK,
-    RELEASE_FLAG_CLEAR_REFUSED, RELEASE_FLAG_ESTOP_APPLIED, RELEASE_FLAG_INJECT_ALLOC,
-    RELEASE_FLAG_SAFETY_LATCH, RELEASE_FLAG_THERMAL_TRIP, RELEASE_FLAG_WATCHDOG_LATCH,
+    LockPhases, PostOverrunPhasesUs, ReleasePhasesUs, ThreadUsage, TickSample, UsageMark,
+    RELEASE_FLAG_CLEAR_OK, RELEASE_FLAG_CLEAR_REFUSED, RELEASE_FLAG_ESTOP_APPLIED,
+    RELEASE_FLAG_INJECT_ALLOC, RELEASE_FLAG_SAFETY_LATCH, RELEASE_FLAG_THERMAL_TRIP,
+    RELEASE_FLAG_WATCHDOG_LATCH,
 };
 use crate::model::{ArmObservation, GripperPolicy, JawOpening};
 use crate::safety::{
@@ -566,7 +567,7 @@ impl ExecutorStats {
         diag_dropped_delta: u64,
         releases: &mut Releases,
         now_ns: impl FnOnce() -> u64,
-    ) {
+    ) -> (u64, u64) {
         let s0 = self.stats_seq.load(Ordering::Relaxed);
         self.stats_seq.store(s0.wrapping_add(1), Ordering::Relaxed);
         std::sync::atomic::fence(Ordering::Release);
@@ -638,6 +639,7 @@ impl ExecutorStats {
 
         self.releases_total.store(rel_total, Ordering::Relaxed);
         self.stats_seq.store(s0.wrapping_add(2), Ordering::Release);
+        (end_ns, release_ns)
     }
 
     /// Reads one atomically coherent snapshot of all monotonic counters and `since_marker`
@@ -2787,11 +2789,20 @@ impl BrokerDispatcher {
     }
 }
 
+/// Preallocated SPSC tail amendment pushed by `armd-control` after `diag_tx.push` when tail work,
+/// preemption, or a `>= 15 ms` overrun adds updated `release_us` or overrun-only post-step marks.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DiagAmend {
+    pub release_seq: u64,
+    pub release_us: u32,
+    pub post_overrun: Option<(PostOverrunPhasesUs, u32)>,
+}
+
 /// Off-thread consumer sinks drained by `armd-dispatch`, `tick_stats()`, and `shutdown_and_join()`.
 pub(crate) struct OffThreadSinks {
     /// Pair of preallocated SPSC diagnostic consumers (`diag_rx`, `diag_amend_rx`) under one
     /// mutex so `drain_diag` is the sole off-thread writer to `LockFreeTickStats`.
-    diag_rx: Mutex<(Consumer<TickSample>, Consumer<(u64, u32)>)>,
+    diag_rx: Mutex<(Consumer<TickSample>, Consumer<DiagAmend>)>,
     estop_reg: Arc<Mutex<EstopRegistry>>,
     reclaim_state_rx: Mutex<Consumer<Arc<SafetyState>>>,
     reclaim_stop_rx: Mutex<Consumer<RetiredStopPayloads>>,
@@ -2838,11 +2849,11 @@ impl OffThreadSinks {
         }
         let mut amends = Vec::new();
         let mut max_amend_seq: u64 = 0;
-        while let Ok((seq, us)) = amend_rx.pop() {
-            max_amend_seq = max_amend_seq.max(seq);
-            amends.push((seq, us));
+        while let Ok(amend) = amend_rx.pop() {
+            max_amend_seq = max_amend_seq.max(amend.release_seq);
+            amends.push(amend);
         }
-        // Control thread pushes `sample(seq)` to `diag_tx` strictly before pushing `(seq, us)`
+        // Control thread pushes `sample(seq)` to `diag_tx` strictly before pushing `DiagAmend`
         // to `diag_amend_tx` (and skips `diag_amend_tx` whenever `diag_tx` was full). Catch up
         // `diag_rx` if a release pushed both between the two pops so its amendment merges in place.
         while max_popped_seq < max_amend_seq {
@@ -2855,20 +2866,28 @@ impl OffThreadSinks {
             }
         }
         let mut unmatched_amends = Vec::new();
-        for (seq, us) in amends {
-            if let Some(sample) = samples.iter_mut().find(|s| s.release_seq == seq) {
-                if sample.release_us < us {
-                    sample.release_us = us;
+        for amend in amends {
+            if let Some(sample) = samples.iter_mut().find(|s| s.release_seq == amend.release_seq) {
+                if sample.release_us < amend.release_us {
+                    sample.release_us = amend.release_us;
+                }
+                if let Some((phases, cpu_us)) = amend.post_overrun {
+                    sample.post_phases_us = Some(phases);
+                    sample.post_cpu_us = Some(cpu_us);
                 }
             } else {
-                unmatched_amends.push((seq, us));
+                unmatched_amends.push(amend);
             }
         }
         for sample in &samples {
             let _ = tick_stats.record(sample);
         }
-        for (seq, us) in unmatched_amends {
-            if !tick_stats.amend_release_us_by_release_seq(seq, us) {
+        for amend in unmatched_amends {
+            if !tick_stats.amend_by_release_seq(
+                amend.release_seq,
+                amend.release_us,
+                amend.post_overrun,
+            ) {
                 self.stats.amend_missed.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -5783,7 +5802,7 @@ pub(crate) fn spawn_executor(
     // transitions cleanly to `OWNER_FAILED` instead of unwinding past the moved core on the caller.
 
     let (diag_tx, diag_rx) = RingBuffer::<TickSample>::new(DIAG_RING_CAPACITY);
-    let (diag_amend_tx, diag_amend_rx) = RingBuffer::<(u64, u32)>::new(DIAG_RING_CAPACITY);
+    let (diag_amend_tx, diag_amend_rx) = RingBuffer::<DiagAmend>::new(DIAG_RING_CAPACITY);
     let (maint_req_tx, maint_req_rx) = RingBuffer::<MaintRequest>::new(MAINT_QUEUE_CAPACITY);
     let (maint_rep_tx, maint_rep_rx) = RingBuffer::<MaintReply>::new(MAINT_QUEUE_CAPACITY);
     let (estop_ack_tx, estop_ack_rx) = RingBuffer::<EstopAck>::new(ESTOP_ACK_CAPACITY);
@@ -8875,7 +8894,7 @@ fn control_thread_main(
     control_sched: Arc<Mutex<Option<crate::diagnostics::tick::ControlThreadSched>>>,
     control_period_us: Arc<AtomicU64>,
     diag_tx: Producer<TickSample>,
-    diag_amend_tx: Producer<(u64, u32)>,
+    diag_amend_tx: Producer<DiagAmend>,
     maint_req_rx: Consumer<MaintRequest>,
     maint_rep_tx: Producer<MaintReply>,
     estop_ack_tx: Producer<EstopAck>,
@@ -9082,7 +9101,7 @@ fn control_thread_main_inner(
     _control_sched: Arc<Mutex<Option<crate::diagnostics::tick::ControlThreadSched>>>,
     control_period_us: Arc<AtomicU64>,
     mut diag_tx: Producer<TickSample>,
-    mut diag_amend_tx: Producer<(u64, u32)>,
+    mut diag_amend_tx: Producer<DiagAmend>,
     maint_req_rx: Consumer<MaintRequest>,
     maint_rep_tx: Producer<MaintReply>,
     estop_ack_tx: Producer<EstopAck>,
@@ -9584,7 +9603,13 @@ fn control_thread_main_inner(
             publish_gen += 1;
 
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                || -> Option<(TickSample, Instant, Option<(super::ops::ReleaseReport, Instant, u64)>)> {
+                || -> Option<(
+                    TickSample,
+                    Instant,
+                    u64,
+                    u64,
+                    Option<(super::ops::ReleaseReport, Instant, u64)>,
+                )> {
                     let _guard = ReleaseGuard::enter();
                     assert!(
                         tokio::runtime::Handle::try_current().is_err(),
@@ -9805,6 +9830,8 @@ fn control_thread_main_inner(
                             terminal: core.take_phase_terminal_us(),
                             ..ReleasePhasesUs::default()
                         },
+                        post_phases_us: None,
+                        post_cpu_us: None,
                         usage: ThreadUsage {
                             mid_nvcsw,
                             mid_nivcsw,
@@ -9823,6 +9850,8 @@ fn control_thread_main_inner(
                         release_flags,
                     };
                     let post_t0 = now_inst();
+                    let step_return_ns = now_ns_fn();
+                    let post_cpu_start_ns = usage_done.cpu_ns();
                     // Wake dispatcher immediately after Window 1 publication/drain work (preserving
                     // pre-Window-2 service latency for observations, acks, and safety logs).
                     hub.wake();
@@ -9830,7 +9859,13 @@ fn control_thread_main_inner(
 
                     let next_wake = report.poll.wake_before(release_deadline);
                     drop(_guard);
-                    Some((sample, post_t0, next_wake.map(|_| (report, release_deadline, next_release_ns))))
+                    Some((
+                        sample,
+                        post_t0,
+                        step_return_ns,
+                        post_cpu_start_ns,
+                        next_wake.map(|_| (report, release_deadline, next_release_ns)),
+                    ))
                 },
             ))
         };
@@ -9838,17 +9873,23 @@ fn control_thread_main_inner(
         // ---- Window 2: Disjoint sub-release transition wakes before `next_release_ns` ----
         let mut step_sample: Option<TickSample> = None;
         let mut step_post_t0: Option<Instant> = None;
+        let mut step_return_ns: Option<u64> = None;
+        let mut step_post_cpu_start_ns: Option<u64> = None;
         let step_res: Result<(), Box<dyn Any + Send>> = match release_res {
             Err(err) => Err(err),
             Ok(None) => Ok(()),
-            Ok(Some((sample, post_t0, None))) => {
+            Ok(Some((sample, post_t0, ret_ns, cpu_ns, None))) => {
                 step_sample = Some(sample);
                 step_post_t0 = Some(post_t0);
+                step_return_ns = Some(ret_ns);
+                step_post_cpu_start_ns = Some(cpu_ns);
                 Ok(())
             }
-            Ok(Some((sample, post_t0, Some((mut report, release_deadline, next_release_ns))))) => {
+            Ok(Some((sample, post_t0, ret_ns, cpu_ns, Some((mut report, release_deadline, next_release_ns))))) => {
                 step_sample = Some(sample);
                 step_post_t0 = Some(post_t0);
+                step_return_ns = Some(ret_ns);
+                step_post_cpu_start_ns = Some(cpu_ns);
                 let mut wakes = 0u32;
                 let mut next_wake = report.poll.wake_before(release_deadline);
                 let mut wake_err: Option<Box<dyn Any + Send>> = None;
@@ -9939,6 +9980,9 @@ fn control_thread_main_inner(
             sleep_dur(delay);
         }
         let pre_diag_end_ns = now_ns_fn();
+        let t1_pre_ring_ns = pre_diag_end_ns;
+        let t0_step_return_ns = step_return_ns.unwrap_or(t1_pre_ring_ns);
+        let post_cpu_start_ns = step_post_cpu_start_ns.unwrap_or(0);
         let pre_diag_release_ns = pre_diag_end_ns.saturating_sub(actual_ns);
         let stamped_release_us = crate::diagnostics::tick::ns_to_us_u32(pre_diag_release_ns);
         let mut diag_dropped_delta: u64 = 0;
@@ -9968,6 +10012,7 @@ fn control_thread_main_inner(
             let _ = engine.take_servo_closes_flushed();
             hub.wake();
         }
+        let t2_post_ring_ns = now_ns_fn();
         // Positive-control tail probe (strictly AFTER `diag_tx.push` and `hub.wake()`);
         // `_tail_local` drops BEFORE tail allocations are recorded and completion is published.
         {
@@ -9987,7 +10032,14 @@ fn control_thread_main_inner(
         let probe_release_us =
             crate::diagnostics::tick::ns_to_us_u32(now_ns_fn().saturating_sub(actual_ns));
         if pushed_sample && diag_dropped_delta == 0 && probe_release_us > stamped_release_us {
-            if diag_amend_tx.push((step_num, probe_release_us)).is_err() {
+            if diag_amend_tx
+                .push(DiagAmend {
+                    release_seq: step_num,
+                    release_us: probe_release_us,
+                    post_overrun: None,
+                })
+                .is_err()
+            {
                 diag_dropped_delta = diag_dropped_delta.saturating_add(1);
             }
             hub.wake();
@@ -10017,13 +10069,58 @@ fn control_thread_main_inner(
             sleep_dur(Duration::from_nanos(pre_seal_delay_ns));
         }
 
+        // Overrun-only (> 15 ms) post-step breakdown (allocation-free): attach per-phase monotonic
+        // marks + thread CPU time before the completion seal so readers waking on `releases_total`
+        // observe it immediately, and update `seal_us` after the seal if nonzero or newly > 15 ms.
+        let t3_pre_seal_ns = now_ns_fn();
+        let pre_seal_release_ns = t3_pre_seal_ns.saturating_sub(actual_ns);
+        let step_to_ring_us =
+            crate::diagnostics::tick::ns_to_us_u32(t1_pre_ring_ns.saturating_sub(t0_step_return_ns));
+        let ring_publish_us =
+            crate::diagnostics::tick::ns_to_us_u32(t2_post_ring_ns.saturating_sub(t1_pre_ring_ns));
+        let ring_to_seal_us =
+            crate::diagnostics::tick::ns_to_us_u32(t3_pre_seal_ns.saturating_sub(t2_post_ring_ns));
+        let mut pre_seal_overrun_cpu: Option<u32> = None;
+        if pushed_sample
+            && diag_dropped_delta == 0
+            && pre_seal_release_ns >= crate::diagnostics::tick::RELEASE_15MS_NS
+        {
+            let cpu_us = if step_post_cpu_start_ns.is_some() {
+                crate::diagnostics::tick::ns_to_us_u32(
+                    crate::diagnostics::tick::thread_cpu_ns().saturating_sub(post_cpu_start_ns),
+                )
+            } else {
+                0
+            };
+            let pre_seal_rel_us = crate::diagnostics::tick::ns_to_us_u32(pre_seal_release_ns);
+            let phases = PostOverrunPhasesUs {
+                step_to_ring_us,
+                ring_publish_us,
+                ring_to_seal_us,
+                seal_us: 0,
+            };
+            if diag_amend_tx
+                .push(DiagAmend {
+                    release_seq: step_num,
+                    release_us: pre_seal_rel_us,
+                    post_overrun: Some((phases, cpu_us)),
+                })
+                .is_err()
+            {
+                diag_dropped_delta = diag_dropped_delta.saturating_add(1);
+            } else {
+                pre_seal_overrun_cpu = Some(cpu_us);
+            }
+            hub.wake();
+        }
+
         // PUBLISH COMPLETION STRICTLY LAST: single `stats_seq` Release seal atomically clears
         // `in_flight_start_mono_ns = 0`, samples the final release end timestamp STRICTLY AFTER
         // all release work and clearing the in-flight marker, computes overrun skips from that
         // exact timestamp, updates all breach/peak/skip/drop/marker counters, and publishes
         // `releases_total` + `stats_seq` last; `completed_releases` follows with Release ordering
         // for direct B2 alloc readers.
-        stats.commit_release_outcome_with_clock(
+        let (_seal_end_ns, release_ns) = stats.commit_release_outcome_with_clock(
             actual_ns,
             wake_lateness_ns,
             wake_skipped,
@@ -10031,6 +10128,42 @@ fn control_thread_main_inner(
             &mut releases,
             now_ns_fn,
         );
+        if pushed_sample
+            && diag_dropped_delta == 0
+            && release_ns >= crate::diagnostics::tick::RELEASE_15MS_NS
+        {
+            let t4_post_seal_ns = now_ns_fn();
+            let seal_us = crate::diagnostics::tick::ns_to_us_u32(
+                t4_post_seal_ns.saturating_sub(t3_pre_seal_ns),
+            );
+            let cpu_us = if step_post_cpu_start_ns.is_some() {
+                crate::diagnostics::tick::ns_to_us_u32(
+                    crate::diagnostics::tick::thread_cpu_ns().saturating_sub(post_cpu_start_ns),
+                )
+            } else {
+                0
+            };
+            if pre_seal_overrun_cpu.is_none()
+                || seal_us > 0
+                || pre_seal_overrun_cpu != Some(cpu_us)
+            {
+                let final_rel_us = crate::diagnostics::tick::ns_to_us_u32(
+                    t4_post_seal_ns.saturating_sub(actual_ns),
+                );
+                let phases = PostOverrunPhasesUs {
+                    step_to_ring_us,
+                    ring_publish_us,
+                    ring_to_seal_us,
+                    seal_us,
+                };
+                let _ = diag_amend_tx.push(DiagAmend {
+                    release_seq: step_num,
+                    release_us: final_rel_us,
+                    post_overrun: Some((phases, cpu_us)),
+                });
+                hub.wake();
+            }
+        }
         stats.completed_releases.fetch_add(1, Ordering::Release);
 
         if let Err(err) = step_res {
@@ -10788,9 +10921,10 @@ pub fn run_periodic_with_deadline_and_clock(
             let _unwind_grid = PeriodicUnwindGridGuard { stats, clock };
             step(elapsed.as_secs_f64(), release_deadline);
             let step_end_ns = now_ns();
+            let post_cpu_start_ns = crate::diagnostics::tick::thread_cpu_ns();
             let _ = ACTIVE_PERIODIC_RELEASE.try_with(|c| c.take());
             let sample = crate::diagnostics::tick::take_periodic_sample_with_post_end()
-                .map(|(s, post_end)| (s, post_end, step_end_ns));
+                .map(|(s, post_end)| (s, post_end, step_end_ns, post_cpu_start_ns));
             drop(_unwind_grid);
             sample
             // `_lateness_guard` drops here, strictly BEFORE final timing & ring publication.
@@ -10807,10 +10941,11 @@ pub fn run_periodic_with_deadline_and_clock(
         // `phases_us.publish`, and publishes `slot.seq` + `meta_seq`.
         let mut stamped_us: u32 = 0;
         let mut stamped_pub_us: u32 = 0;
-        let mut stashed_marks: Option<(Instant, u64)> = None;
+        let mut stashed_marks: Option<(Instant, u64, u64)> = None;
+        let t1_pre_ring_ns = now_ns();
         let recorded_seq = match (stashed_sample, stats.legacy_tick_ring.get()) {
-            (Some((sample, post_end, step_end_ns)), Some(ring)) => {
-                stashed_marks = Some((post_end, step_end_ns));
+            (Some((sample, post_end, step_end_ns, post_cpu_start_ns)), Some(ring)) => {
+                stashed_marks = Some((post_end, step_end_ns, post_cpu_start_ns));
                 ring.record_staged_with_publish(&sample, || {
                     let t = now_ns();
                     stamped_us = crate::diagnostics::tick::ns_to_us_u32(t.saturating_sub(actual_ns));
@@ -10825,20 +10960,20 @@ pub fn run_periodic_with_deadline_and_clock(
             }
             _ => None,
         };
+        let t2_post_ring_ns = now_ns();
 
         // If OS preemption crossed `record_staged_with_publish`, amend the slot monotonically
         // BEFORE the completion seal.
-        if let (Some(seq), Some((post_end, step_end_ns)), Some(ring)) =
+        if let (Some(seq), Some((post_end, step_end_ns, _)), Some(ring)) =
             (recorded_seq, stashed_marks, stats.legacy_tick_ring.get())
         {
-            let t2 = now_ns();
             let probe_release_us =
-                crate::diagnostics::tick::ns_to_us_u32(t2.saturating_sub(actual_ns));
+                crate::diagnostics::tick::ns_to_us_u32(t2_post_ring_ns.saturating_sub(actual_ns));
             let probe_pub_us = crate::diagnostics::tick::us(
                 Instant::now().saturating_duration_since(post_end),
             )
             .max(crate::diagnostics::tick::ns_to_us_u32(
-                t2.saturating_sub(step_end_ns),
+                t2_post_ring_ns.saturating_sub(step_end_ns),
             ));
             if probe_release_us > stamped_us || probe_pub_us > stamped_pub_us {
                 ring.amend_slot_release_and_publish_us(seq, probe_release_us, probe_pub_us);
@@ -10852,11 +10987,46 @@ pub fn run_periodic_with_deadline_and_clock(
             sleep_dur(Duration::from_nanos(pre_seal_delay_ns));
         }
 
+        // Overrun-only (> 15 ms) post-step breakdown (allocation-free): record per-phase monotonic
+        // marks + thread CPU time before the completion seal so readers waking on `releases_total`
+        // observe it immediately, then update `seal_us` after the seal if overrun.
+        let t3_pre_seal_ns = now_ns();
+        let pre_seal_release_ns = t3_pre_seal_ns.saturating_sub(actual_ns);
+        if let (Some(seq), Some((post_end, step_end_ns, post_cpu_start_ns)), Some(ring)) =
+            (recorded_seq, stashed_marks, stats.legacy_tick_ring.get())
+        {
+            if pre_seal_release_ns >= crate::diagnostics::tick::RELEASE_15MS_NS {
+                let phases = PostOverrunPhasesUs {
+                    step_to_ring_us: crate::diagnostics::tick::ns_to_us_u32(
+                        t1_pre_ring_ns.saturating_sub(step_end_ns),
+                    ),
+                    ring_publish_us: crate::diagnostics::tick::ns_to_us_u32(
+                        t2_post_ring_ns.saturating_sub(t1_pre_ring_ns),
+                    ),
+                    ring_to_seal_us: crate::diagnostics::tick::ns_to_us_u32(
+                        t3_pre_seal_ns.saturating_sub(t2_post_ring_ns),
+                    ),
+                    seal_us: 0,
+                };
+                let cpu_us = crate::diagnostics::tick::ns_to_us_u32(
+                    crate::diagnostics::tick::thread_cpu_ns().saturating_sub(post_cpu_start_ns),
+                );
+                let pre_rel_us = crate::diagnostics::tick::ns_to_us_u32(pre_seal_release_ns);
+                let pre_pub_us = crate::diagnostics::tick::us(
+                    Instant::now().saturating_duration_since(post_end),
+                )
+                .max(crate::diagnostics::tick::ns_to_us_u32(
+                    t3_pre_seal_ns.saturating_sub(step_end_ns),
+                ));
+                ring.amend_slot_post_overrun(seq, pre_rel_us, pre_pub_us, phases, cpu_us);
+            }
+        }
+
         // PUBLISH COMPLETION STRICTLY LAST: atomically clears `in_flight_start_mono_ns = 0`,
         // samples the final release end timestamp strictly AFTER all release work and clearing
         // the in-flight marker, computes overrun skips from that timestamp, and publishes all
         // breach, peak, skip, marker, and `releases_total` counters under one `stats_seq` Release.
-        stats.commit_release_outcome_with_clock(
+        let (_seal_end_ns, release_ns) = stats.commit_release_outcome_with_clock(
             actual_ns,
             wake_lateness_ns,
             wake_skipped,
@@ -10864,6 +11034,40 @@ pub fn run_periodic_with_deadline_and_clock(
             &mut releases,
             now_ns,
         );
+        if release_ns >= crate::diagnostics::tick::RELEASE_15MS_NS {
+            if let (Some(seq), Some((post_end, step_end_ns, post_cpu_start_ns)), Some(ring)) =
+                (recorded_seq, stashed_marks, stats.legacy_tick_ring.get())
+            {
+                let t4_post_seal_ns = now_ns();
+                let phases = PostOverrunPhasesUs {
+                    step_to_ring_us: crate::diagnostics::tick::ns_to_us_u32(
+                        t1_pre_ring_ns.saturating_sub(step_end_ns),
+                    ),
+                    ring_publish_us: crate::diagnostics::tick::ns_to_us_u32(
+                        t2_post_ring_ns.saturating_sub(t1_pre_ring_ns),
+                    ),
+                    ring_to_seal_us: crate::diagnostics::tick::ns_to_us_u32(
+                        t3_pre_seal_ns.saturating_sub(t2_post_ring_ns),
+                    ),
+                    seal_us: crate::diagnostics::tick::ns_to_us_u32(
+                        t4_post_seal_ns.saturating_sub(t3_pre_seal_ns),
+                    ),
+                };
+                let cpu_us = crate::diagnostics::tick::ns_to_us_u32(
+                    crate::diagnostics::tick::thread_cpu_ns().saturating_sub(post_cpu_start_ns),
+                );
+                let final_rel_us = crate::diagnostics::tick::ns_to_us_u32(
+                    t4_post_seal_ns.saturating_sub(actual_ns),
+                );
+                let final_pub_us = crate::diagnostics::tick::us(
+                    Instant::now().saturating_duration_since(post_end),
+                )
+                .max(crate::diagnostics::tick::ns_to_us_u32(
+                    t4_post_seal_ns.saturating_sub(step_end_ns),
+                ));
+                ring.amend_slot_post_overrun(seq, final_rel_us, final_pub_us, phases, cpu_us);
+            }
+        }
     };
 
     // Loop-exit final accounting pass (normal shutdown): if the loop exited after a release

@@ -1471,6 +1471,18 @@ fn phase_marks_csw_mark_and_staged_publish_zero_alloc() {
                 })
                 .expect("record_staged_with_publish");
             lf.amend_slot_release_and_publish_us(seq, 1, 1);
+            lf.amend_slot_post_overrun(
+                seq,
+                16_000,
+                200,
+                armd::diagnostics::tick::PostOverrunPhasesUs {
+                    step_to_ring_us: 100,
+                    ring_publish_us: 50,
+                    ring_to_seal_us: 30,
+                    seal_us: 20,
+                },
+                40,
+            );
         }
         let delta = alloc::snapshot_counts().delta_since(before);
         (delta, lf.snapshot())

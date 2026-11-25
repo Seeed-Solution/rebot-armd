@@ -4301,3 +4301,144 @@ fn analyze_py_renders_phases_us_max_wait_and_sched_trace_and_sched_trace_sh_work
     assert_eq!(std::fs::read_to_string(fake_trace.join("events/sched/sched_wakeup/enable")).unwrap().trim(), "0");
     assert!(cap_out.exists());
 }
+
+/// Fix 2 (PUB-STALL): verify overrun-only (> 15 ms) `post_phases_us` and `post_cpu_us` across
+/// step return → ring publication → completion seal on BOTH control owners (`legacy` and `executor`),
+/// with zero breakdown emitted on normal (< 15 ms) releases and zero RT heap allocations.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pub_stall_overrun_only_post_phases_and_cpu_both_owners() {
+    for use_executor in [false, true] {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        let clock = LatenessClock::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut exec_handle = None;
+        let mut legacy_jh = None;
+
+        let stats_ref: Arc<ExecutorStats> = if use_executor {
+            let mut cfg = ExecutorConfig::for_tests(Duration::from_millis(50));
+            cfg.alloc_timing = true;
+            let h = sup
+                .start_executor_with_hooks(
+                    cfg,
+                    PersistTestHooks {
+                        clock: Some(clock.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let s = Arc::clone(h.stats());
+            exec_handle = Some(h);
+            s
+        } else {
+            let loop_stats = Arc::new(ExecutorStats::default());
+            sup.attach_legacy_loop_stats(Arc::clone(&loop_stats));
+            let sup_t = Arc::clone(&sup);
+            let clock_t = clock.clone();
+            let stop_t = Arc::clone(&stop);
+            let stats_t = Arc::clone(&loop_stats);
+            let rt = tokio::runtime::Handle::current();
+            legacy_jh = Some(thread::spawn(move || {
+                run_periodic_with_clock(
+                    Duration::from_millis(50),
+                    &stop_t,
+                    &stats_t,
+                    Some(clock_t.as_ref()),
+                    |dt| {
+                        rt.block_on(sup_t.control_tick(dt));
+                    },
+                );
+            }));
+            loop_stats
+        };
+
+        // 1. Normal (< 15 ms) release: `post_phases_us` and `post_cpu_us` MUST be None / omitted.
+        clock.run_schedule(&[0]);
+        let normal = sup.tick_stats();
+        assert_eq!(normal.releases_total, 1, "exec={use_executor}");
+        let mr_norm = normal.max_release.expect("normal max_release");
+        assert!(
+            mr_norm.sample.post_phases_us.is_none(),
+            "non-overrun release must omit post_phases_us (exec={use_executor}): {mr_norm:?}"
+        );
+        assert!(
+            mr_norm.sample.post_cpu_us.is_none(),
+            "non-overrun release must omit post_cpu_us (exec={use_executor}): {mr_norm:?}"
+        );
+        let norm_json = serde_json::to_value(&normal).unwrap();
+        assert!(
+            norm_json["max_release"].get("post_phases_us").is_none(),
+            "non-overrun JSON must omit post_phases_us: {norm_json}"
+        );
+        assert!(
+            norm_json["max_release"].get("post_cpu_us").is_none(),
+            "non-overrun JSON must omit post_cpu_us: {norm_json}"
+        );
+
+        // 2. Synthetic overrun (> 15 ms): inject a 12 ms post-stats stall + 6 ms pre-seal stall
+        // (total >= 18 ms > 15 ms) so both step_to_ring/ring_to_seal spans are exercised on both owners.
+        stats_ref
+            .post_stats_delay_once_ns
+            .store(12_000_000, Ordering::Release);
+        stats_ref
+            .pre_seal_delay_once_ns
+            .store(6_000_000, Ordering::Release);
+        clock.run_schedule(&[0]);
+
+        let overrun = sup.tick_stats();
+        assert_eq!(overrun.releases_total, 2, "exec={use_executor}");
+        assert!(
+            overrun.releases_over_15ms >= 1,
+            "synthetic overrun must cross 15 ms threshold (exec={use_executor}): {overrun:?}"
+        );
+        let mr = overrun.max_release.expect("overrun max_release");
+        let pp = mr.sample.post_phases_us.expect("overrun must populate post_phases_us");
+        let cpu = mr.sample.post_cpu_us.expect("overrun must populate post_cpu_us");
+
+        if use_executor {
+            // In executor, both post_stats_delay_once_ns (12 ms) and pre_seal_delay_once_ns (6 ms)
+            // fall between diag_tx.push+hub.wake and commit_release_outcome_with_clock (`ring_to_seal_us`).
+            assert!(
+                pp.ring_to_seal_us >= 17_000,
+                "executor overrun must attribute 12+6 ms stall to ring_to_seal_us: {pp:?}"
+            );
+        } else {
+            // In legacy, post_stats_delay_once_ns (12 ms) falls in `step_to_ring_us` and
+            // pre_seal_delay_once_ns (6 ms) falls in `ring_to_seal_us`.
+            assert!(
+                pp.step_to_ring_us >= 11_000,
+                "legacy overrun must attribute 12 ms pre-publish stall to step_to_ring_us: {pp:?}"
+            );
+            assert!(
+                pp.ring_to_seal_us >= 5_000,
+                "legacy overrun must attribute 6 ms pre-seal stall to ring_to_seal_us: {pp:?}"
+            );
+        }
+        // Virtual-clock sleep burns almost no CPU; post_cpu_us must remain bounded and present.
+        assert!(
+            cpu < 5_000,
+            "synthetic sleep overrun should report low thread CPU time (exec={use_executor}): cpu={cpu}"
+        );
+
+        let ov_json = serde_json::to_value(&overrun).unwrap();
+        let pp_json = &ov_json["max_release"]["post_phases_us"];
+        assert!(pp_json["step_to_ring_us"].is_u64(), "{ov_json}");
+        assert!(pp_json["ring_publish_us"].is_u64(), "{ov_json}");
+        assert!(pp_json["ring_to_seal_us"].is_u64(), "{ov_json}");
+        assert!(pp_json["seal_us"].is_u64(), "{ov_json}");
+        assert!(ov_json["max_release"]["post_cpu_us"].is_u64(), "{ov_json}");
+
+        if let Some(h) = exec_handle {
+            assert_eq!(
+                h.stats().total_allocs(),
+                AllocCounts::ZERO,
+                "executor PUB-STALL overrun diagnostics must remain strictly 0-alloc"
+            );
+            h.stop_and_join();
+        } else {
+            stop.store(true, Ordering::Release);
+            clock.wake();
+            legacy_jh.unwrap().join().unwrap();
+        }
+    }
+}

@@ -18354,6 +18354,8 @@ impl ArmSupervisor {
                 post: post_us,
                 publish: 0,
             },
+            post_phases_us: None,
+            post_cpu_us: None,
             usage: crate::diagnostics::tick::ThreadUsage {
                 mid_nvcsw,
                 mid_nivcsw,
