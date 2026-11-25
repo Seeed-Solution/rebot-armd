@@ -1440,6 +1440,17 @@ fn preflight_candidate_from_start(
 
     // 8. Unified parent deadline budget check (transition + vision + open + insert + close + loaded/recovery + settle)
     let vis = visible(s, t, &pre);
+    if !vis && pregrasp_path.duration + pre_open_s + 2.5 > st.phase_timeout_s {
+        return Err(Rejection::new(
+            "transition",
+            "GRASP_TIMEOUT",
+            format!(
+                "obscured pregrasp+pre_open duration {:.2} s exceeds revalidation freshness bound {:.2} s",
+                pregrasp_path.duration + pre_open_s + 2.5,
+                st.phase_timeout_s
+            ),
+        ));
+    }
     let vision_step_s = adaptive_vision_budget_s(st);
     let start_vision_s = vision_step_s;
     let pregrasp_vision_s = if vis { vision_step_s } else { 0.0 };
