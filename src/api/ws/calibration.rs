@@ -617,7 +617,7 @@ pub(super) enum CalibStart { Job(CalibJob, bool), Reply(Value) }
 /// writes (CONFIG_BUSY). Stop, torque, clear_fault and everything else go through.
 pub(super) fn calibration_busy_code(inner: &SupervisorInner, path: &str) -> Option<&'static str> {
     if !inner.calibration_busy || path == "/api/v1/motion/stop" { return None; }
-    if inner.motor_zero_busy && matches!(path, "/api/v1/torque" | "/api/v1/arm" | "/api/v1/safety/clear_fault") { return Some("MOTION_BUSY"); }
+    if (inner.motor_zero_busy || inner.commissioning.is_occupied()) && matches!(path, "/api/v1/torque" | "/api/v1/arm" | "/api/v1/safety/clear_fault") { return Some("MOTION_BUSY"); }
     if path.starts_with("/api/v1/action/") || path.starts_with("/api/v1/motion/") || path.starts_with("/api/v1/mode/") { return Some("MOTION_BUSY"); }
     if path.starts_with("/api/v1/calibration/") || matches!(path, "/api/v1/grasp/setup" | "/api/v1/poses/save" | "/api/v1/poses/rename" | "/api/v1/poses/delete"
         | "/api/v1/sequences/save" | "/api/v1/sequences/delete"
