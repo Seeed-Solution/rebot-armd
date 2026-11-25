@@ -723,12 +723,30 @@ impl ChunkSource {
         self.joint_base_age_ms.unwrap_or(0).saturating_add(elapsed)
     }
 
+    /// Exact monotonic deadline at which this source's joint observation exceeds `limit_ms`
+    /// (`now > deadline` is stale). Preserves sub-millisecond precision without floor loss.
+    pub fn joint_deadline(&self, limit_ms: u64) -> Option<Instant> {
+        let base = self.joint_base_age_ms.unwrap_or(0);
+        if base > limit_ms {
+            return None;
+        }
+        self.joint_captured_at
+            .checked_add(Duration::from_millis(limit_ms - base))
+    }
+
     pub fn vision_age_ms(&self, now: Instant) -> Option<u64> {
         self.vision_captured_at.map(|t| {
             now.saturating_duration_since(t)
                 .as_millis()
                 .min(u64::MAX as u128) as u64
         })
+    }
+
+    /// Exact monotonic deadline at which this source's detector frame exceeds `limit_ms`
+    /// (`now > deadline` is stale). Preserves sub-millisecond precision without floor loss.
+    pub fn vision_deadline(&self, limit_ms: u64) -> Option<Instant> {
+        self.vision_captured_at
+            .and_then(|t| t.checked_add(Duration::from_millis(limit_ms)))
     }
 }
 
@@ -973,11 +991,18 @@ impl ChunkRing {
             for read_idx in 0..count {
                 let src_id = self.source_ids[self.pred_slot(phys, read_idx)];
                 let fresh = self.sources[src_id].is_some_and(|src| {
-                    if src.joint_age_ms(limits.now) > limits.max_source_joint_age_ms {
+                    if src
+                        .joint_deadline(limits.max_source_joint_age_ms)
+                        .is_none_or(|dl| limits.now > dl)
+                    {
                         return false;
                     }
                     if let Some(max_v) = limits.max_source_vision_age_ms {
-                        if src.vision_age_ms(limits.now).is_some_and(|age| age > max_v) {
+                        if src.vision_captured_at.is_some()
+                            && src
+                                .vision_deadline(max_v)
+                                .is_none_or(|dl| limits.now > dl)
+                        {
                             return false;
                         }
                     }
@@ -1800,7 +1825,9 @@ impl PreparedPolicy {
                 }
             }
             if let Some(max_v) = params.max_fresh_vision_age_ms {
-                if src.vision_age_ms(now).is_some_and(|age| age > max_v) {
+                if src.vision_captured_at.is_some()
+                    && src.vision_deadline(max_v).is_none_or(|dl| now > dl)
+                {
                     self.clear_chunk_buffer();
                     return Ok(CommitGateDecision::Skip { commit_period });
                 }
@@ -1886,32 +1913,31 @@ impl PreparedPolicy {
             } else {
                 params.max_cached_joint_age_ms
             };
-            let joint_age_ms = src.joint_age_ms(now);
-            if joint_age_ms > joint_limit {
+            let Some(joint_dl) = src.joint_deadline(joint_limit) else {
+                self.clear_chunk_buffer();
+                return Ok(CommitGateDecision::Skip { commit_period });
+            };
+            if now > joint_dl {
                 self.clear_chunk_buffer();
                 return Ok(CommitGateDecision::Skip { commit_period });
             }
-            tighten(
-                &mut slot_exp,
-                now.checked_add(Duration::from_millis(
-                    joint_limit.saturating_sub(joint_age_ms),
-                )),
-            );
+            tighten(&mut slot_exp, Some(joint_dl));
             let vision_limit = if is_fresh {
                 params.max_fresh_vision_age_ms
             } else {
                 params.max_cached_vision_age_ms
             };
             if let Some(max_v) = vision_limit {
-                if let Some(age) = src.vision_age_ms(now) {
-                    if age > max_v {
+                if src.vision_captured_at.is_some() {
+                    let Some(vision_dl) = src.vision_deadline(max_v) else {
+                        self.clear_chunk_buffer();
+                        return Ok(CommitGateDecision::Skip { commit_period });
+                    };
+                    if now > vision_dl {
                         self.clear_chunk_buffer();
                         return Ok(CommitGateDecision::Skip { commit_period });
                     }
-                    tighten(
-                        &mut slot_exp,
-                        now.checked_add(Duration::from_millis(max_v.saturating_sub(age))),
-                    );
+                    tighten(&mut slot_exp, Some(vision_dl));
                 }
             }
             if let (Some(ticket), Some(live_ctx)) =
@@ -2288,14 +2314,17 @@ fn evaluate_final_commit_gate(
     }
 
     // 1. Single coherent detector snapshot check: timestamp presence, latest-frame and
-    //    pre-inference staleness, model_generation, and target-lost disposition.
+    //    pre-inference staleness (exact Instant deadlines), model_generation, and target-lost disposition.
     let commit_vision_target = if video_embedding_spec.is_none() {
         if let (Some(spec), Some(vis_cap)) = (vision_spec, vision_captured_at) {
-            let age_ms = gate_now
-                .saturating_duration_since(vis_cap)
-                .as_millis()
-                .min(u64::MAX as u128) as u64;
-            if age_ms > spec.max_staleness_ms {
+            if vis_cap
+                .checked_add(Duration::from_millis(spec.max_staleness_ms))
+                .is_none_or(|dl| gate_now > dl)
+            {
+                let age_ms = gate_now
+                    .saturating_duration_since(vis_cap)
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64;
                 prepared.clear_chunk_buffer();
                 return match spec.on_stale {
                     VisionStalePolicy::Stop => FinalCommitGateOutcome::Fail {
@@ -2323,11 +2352,14 @@ fn evaluate_final_commit_gate(
                     VisionStalePolicy::Hold => FinalCommitGateOutcome::Hold,
                 };
             };
-            let latest_age_ms = gate_now
-                .saturating_duration_since(frame_cap)
-                .as_millis()
-                .min(u64::MAX as u128) as u64;
-            if latest_age_ms > spec.max_staleness_ms {
+            if frame_cap
+                .checked_add(Duration::from_millis(spec.max_staleness_ms))
+                .is_none_or(|dl| gate_now > dl)
+            {
+                let latest_age_ms = gate_now
+                    .saturating_duration_since(frame_cap)
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64;
                 prepared.clear_chunk_buffer();
                 return match spec.on_stale {
                     VisionStalePolicy::Stop => FinalCommitGateOutcome::Fail {
@@ -2399,7 +2431,7 @@ fn evaluate_final_commit_gate(
     let embedding_clock_override_ms = hub_guard.and_then(HubCommitGuard::test_now_ms);
     let eval_now_ms = embedding_clock_override_ms.unwrap_or_else(|| monotonic_ms_at(gate_now));
     let commit_ticket_ctx = hub_guard.map(|guard| {
-        let live_hub = guard.live_ticket_state();
+        let live_hub = guard.live_ticket_state_at(eval_now_ms);
         TicketVerificationContext {
             policy_instance_id: live_hub.policy_instance_id,
             lease_generation: live_lease,
@@ -2699,7 +2731,7 @@ pub fn spawn_policy_runner(
                 }
             }
 
-            let (measured, prop_age_range_ms, captured_at, snap_lease_gen, run_ctx) = {
+            let (measured, prop_age_range_ms, oldest_input_at, captured_at, snap_lease_gen, run_ctx) = {
                 let inner = supervisor.inner().read().await;
                 let Some(run) = inner.policy_run.as_ref().filter(|r| r.action_id == action_id) else {
                     prepared.clear_chunk_buffer();
@@ -2718,10 +2750,16 @@ pub fn spawn_policy_runner(
                     lease_generation: lease_gen,
                     active_ok,
                 };
+                let now_sample = Instant::now();
+                let (age_range, oldest) = match inner.policy_input_age_and_oldest_at(now_sample) {
+                    Some((range, oldest)) => (Some(range), oldest),
+                    None => (None, now_sample),
+                };
                 (
                     inner.measured_positions.clone(),
-                    inner.policy_input_age_range_ms(),
-                    Instant::now(),
+                    age_range,
+                    oldest,
+                    now_sample,
                     lease_gen,
                     ctx,
                 )
@@ -2850,8 +2888,8 @@ pub fn spawn_policy_runner(
                 }
             });
             let chunk_source = ChunkSource {
-                joint_captured_at: captured_at,
-                joint_base_age_ms: base_input_age_ms,
+                joint_captured_at: oldest_input_at,
+                joint_base_age_ms: None,
                 vision_captured_at,
                 vision_generation: locked_generation,
                 vision_target,
@@ -3162,7 +3200,9 @@ async fn executor_commit_gate(
     verified_release_gate: Option<&VerifiedReleaseGate>,
     sandbox: Option<&Arc<crate::api::sandbox::SandboxState>>,
     snap_authority: crate::rt_core::broker::Authority,
+    authorization: &PolicyAuthorization,
     snap_auth_gen: u64,
+    last_seen_refusal_gen: &mut u64,
     oldest_input_at: Instant,
     base_input_age_ms: Option<u64>,
     captured_at: Instant,
@@ -3321,7 +3361,12 @@ async fn executor_commit_gate(
             prepared.clear_chunk_buffer();
             return ExecutorCommitOutcome::RtEnded;
         }
-        if has_pending_refusal {
+        let cur_refusal_gen = handle.policy_refusal_gen();
+        if has_pending_refusal
+            || cur_refusal_gen != *last_seen_refusal_gen
+            || authorization.current() != snap_auth_gen
+        {
+            *last_seen_refusal_gen = cur_refusal_gen;
             prepared.clear_chunk_buffer();
             step_stats.record(infer_us, step_us);
             return ExecutorCommitOutcome::Skip;
@@ -3358,6 +3403,16 @@ async fn executor_commit_gate(
                 post_vision_age_ms,
                 ..
             } => {
+                // Re-check lock-free RT refusal/revocation counters right before swapping into
+                // the triple buffer; if RT refused a prior slot while `evaluate_final_commit_gate`
+                // ran, clear the chunk ring now and do not publish.
+                let post_refusal_gen = handle.policy_refusal_gen();
+                if post_refusal_gen != cur_refusal_gen || authorization.current() != snap_auth_gen {
+                    *last_seen_refusal_gen = post_refusal_gen;
+                    prepared.clear_chunk_buffer();
+                    step_stats.record(infer_us, step_us);
+                    return ExecutorCommitOutcome::Skip;
+                }
                 let vision_at = if let Some(age_ms) =
                     post_vision_age_ms.filter(|_| video_embedding_spec.is_some())
                 {
@@ -3391,6 +3446,8 @@ async fn executor_commit_gate(
                     handshake_expires_at,
                     chunk_slot_expires_at: prepared.last_commit_slot_expires_at(),
                     chunk_period_end: prepared.last_commit_period_end(),
+                    expected_refusal_gen: (prepared.contract().chunking.chunk_size > 1)
+                        .then_some(cur_refusal_gen),
                 };
                 let policy_target = PolicyTarget {
                     action_id,
@@ -3681,6 +3738,7 @@ pub fn spawn_executor_policy_runner(params: ExecutorPolicyRunParams) -> tokio::t
         let period_ns = period.as_nanos().max(1);
         let mut last_committed_period: Option<u64> = None;
         let mut last_auth_gen: Option<u64> = None;
+        let mut last_seen_refusal_gen = handle.policy_refusal_gen();
         let stop_requests = handle.stop_requests().clone();
         let initial_stop_gen = supervisor.current_stop_gen();
 
@@ -3749,7 +3807,9 @@ pub fn spawn_executor_policy_runner(params: ExecutorPolicyRunParams) -> tokio::t
             }
 
             let outcomes = handle.drain_policy_outcomes(action_id);
-            if outcomes.iter().any(|o| o.result.is_err()) {
+            let cur_refusal_gen = handle.policy_refusal_gen();
+            if outcomes.iter().any(|o| o.result.is_err()) || cur_refusal_gen != last_seen_refusal_gen {
+                last_seen_refusal_gen = cur_refusal_gen;
                 prepared.clear_chunk_buffer();
             }
             if handle.is_policy_closed(action_id) {
@@ -4079,8 +4139,8 @@ pub fn spawn_executor_policy_runner(params: ExecutorPolicyRunParams) -> tokio::t
                 }
             });
             let chunk_source = ChunkSource {
-                joint_captured_at: captured_at,
-                joint_base_age_ms: base_input_age_ms,
+                joint_captured_at: oldest_input_at,
+                joint_base_age_ms: None,
                 vision_captured_at,
                 vision_generation: locked_generation,
                 vision_target,
@@ -4266,7 +4326,9 @@ pub fn spawn_executor_policy_runner(params: ExecutorPolicyRunParams) -> tokio::t
                 verified_release_gate.as_ref(),
                 sandbox.as_ref(),
                 snap_authority,
+                &authorization,
                 snap_auth_gen,
+                &mut last_seen_refusal_gen,
                 oldest_input_at,
                 base_input_age_ms,
                 captured_at,
@@ -6506,6 +6568,7 @@ mod chunking_tests {
             handshake_expires_at: Some(hs_exp),
             chunk_slot_expires_at: Some(slot_exp),
             chunk_period_end: Some(period_end),
+            expected_refusal_gen: None,
         };
         assert_eq!(
             frame.check_policy_with_validity(ArmId(1), BootId(1), slot_exp, &auth, &ta, validity),
@@ -6527,6 +6590,7 @@ mod chunking_tests {
             handshake_expires_at: None,
             chunk_slot_expires_at: None,
             chunk_period_end: Some(period_end),
+            expected_refusal_gen: None,
         };
         assert_eq!(
             frame.check_policy_with_validity(
@@ -6568,5 +6632,830 @@ mod chunking_tests {
                 .is_err(),
             "NaN temporal_ensemble_k must be rejected by PreparedPolicy::from_backend"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn chunking_r3_fractional_ms_contributor_deadline_and_detector_frame_mutation_at_gate() {
+        use super::super::manifest::{VisionFeatureSpec, VisionLayout, VisionSourceKind};
+        use super::super::vision::PolicyVisionFrame;
+        use crate::rt_core::broker::{Authority, BootId};
+        use crate::rt_core::ids::ArmId;
+        use crate::rt_core::mailbox::{
+            PolicyValidityBounds, StreamId, TargetAuthority, TargetFrame, MAX_DOF,
+        };
+        use std::sync::Mutex;
+
+        // 1. Fractional-ms contributor deadline: cached detector/joint contributor captured at
+        //    `origin` with a 100 ms limit; commit_gate runs at `origin + 99.8 ms` with a fresh
+        //    current frame. `slot_exp` MUST be exact `origin + 100.0 ms`, so RT at `origin + 100.4 ms`
+        //    refuses `DEADLINE_EXPIRED` (no +0.8 ms integer-ms floor extension).
+        let (snap, contract, cfg) = make_chunk_snapshot_and_contract(4, 2, None);
+        let state_dim = contract.action_dim;
+        let (backend, _) =
+            CountingChunkBackend::new(state_dim, 4 * state_dim, vec![vec![0.05; 4 * state_dim]]);
+        let mut prep =
+            PreparedPolicy::from_backend(snap, contract, Box::new(backend), &cfg).unwrap();
+        let origin = Instant::now();
+        let period_ns = Duration::from_millis(50).as_nanos();
+        let state = vec![0.0f32; state_dim];
+
+        let mut src0 = ChunkSource::from_joint(origin, None);
+        src0.vision_captured_at = Some(origin);
+        prep.plan_chunk_step(&state, None, 0, src0, None).unwrap();
+
+        let gate_p0 = CommitGateParams {
+            max_fresh_joint_age_ms: 100,
+            max_cached_joint_age_ms: 100,
+            max_fresh_vision_age_ms: Some(100),
+            max_cached_vision_age_ms: Some(100),
+            horizon_ms: 100,
+            vision_generation: None,
+            vision_target: None,
+            live_ticket_ctx: None,
+            embedding_clock_override_ms: None,
+        };
+        assert!(matches!(
+            prep.commit_gate(origin + Duration::from_millis(10), origin, period_ns, None, &gate_p0)
+                .unwrap(),
+            CommitGateDecision::Submit { commit_period: 0, .. }
+        ));
+
+        // Period 1 at origin + 99.8 ms: cached contributor is 99.8 ms old (<= 100.0 ms), so gate
+        // submits slot 1 with exact slot_exp == origin + 100.0 ms (only 0.2 ms remaining).
+        let t_gate = origin + Duration::from_micros(99_800);
+        assert!(matches!(
+            prep.commit_gate(t_gate, origin, period_ns, Some(0), &gate_p0)
+                .unwrap(),
+            CommitGateDecision::Submit { commit_period: 1, .. }
+        ));
+        let slot_exp = prep.last_commit_slot_expires_at().unwrap();
+        assert_eq!(
+            slot_exp,
+            origin + Duration::from_millis(100),
+            "slot_exp must equal exact contributor deadline (no integer-ms floor slip)"
+        );
+
+        let mut q = [0.0f32; MAX_DOF];
+        q[0] = 0.05;
+        let auth = Authority {
+            lease_generation: 1,
+            epoch: 1,
+            stop_generation: 0,
+            config_revision: 0,
+            parent_generation: 0,
+        };
+        let frame = TargetFrame {
+            arm: ArmId(1),
+            boot: BootId(1),
+            stream: StreamId(1),
+            seq: 2,
+            authority: auth,
+            policy_generation: 1,
+            input_at: t_gate,
+            vision_at: Some(t_gate), // fresh current frame
+            vision_frame_id: Some(2),
+            deadline: origin + Duration::from_millis(200),
+            dof: state_dim as u8,
+            q,
+            replaceable: false,
+        };
+        let ta = TargetAuthority {
+            stream: Some(StreamId(1)),
+            policy_generation: 1,
+            max_input_age: Some(Duration::from_millis(100)),
+            max_vision_age: Some(Duration::from_millis(100)),
+        };
+        let validity = PolicyValidityBounds {
+            vision_window_expires_at: None,
+            handshake_expires_at: None,
+            chunk_slot_expires_at: Some(slot_exp),
+            chunk_period_end: prep.last_commit_period_end(),
+            expected_refusal_gen: Some(0),
+        };
+        // At origin + 100.4 ms, current frame is only 0.6 ms old, but contributor exceeded 100.0 ms!
+        assert_eq!(
+            frame.check_policy_with_validity(
+                ArmId(1),
+                BootId(1),
+                origin + Duration::from_micros(100_400),
+                &auth,
+                &ta,
+                validity,
+            ),
+            Some("DEADLINE_EXPIRED")
+        );
+
+        // 2. Detector frame mutation between sampling and `evaluate_final_commit_gate`:
+        //    missing timestamp, stale frame, model_generation change, and target loss
+        //    (Hold / Stop / ZeroFeatures) each apply their configured disposition and clear ring.
+        struct SwappableVisionSource {
+            next: Arc<Mutex<PolicyVisionFrame>>,
+        }
+        impl PolicyVisionSource for SwappableVisionSource {
+            fn next_frame<'a>(
+                &'a self,
+                _after_frame_id: u64,
+                _wait_ms: u64,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<Option<PolicyVisionFrame>, String>>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                let frame = self.next.lock().unwrap().clone();
+                Box::pin(async move {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                    Ok(Some(frame))
+                })
+            }
+        }
+        let make_det = |label: &str| crate::grasp::Detection {
+            label: label.to_string(),
+            score: 0.95,
+            raw_score_valid: true,
+            box_norm: [0.4, 0.4, 0.6, 0.6],
+            angle_deg: None,
+            angle_conf: None,
+            grasp_width_px: None,
+            mask_focus: false,
+            disp_fg: None,
+            disp_bg: None,
+            depth_conf: None,
+            length_px: None,
+            jaw_clear: None,
+            depth_angle_deg: None,
+            depth_angle_conf: None,
+            depth_width_px: None,
+            contour_norm: None,
+        };
+        let fresh_now = Instant::now();
+        let shared_frame = Arc::new(Mutex::new(PolicyVisionFrame {
+            frame_id: 1,
+            detections: vec![make_det("cube")],
+            captured_at: Some(fresh_now),
+            model_generation: Some(7),
+        }));
+        let collector = VisionFeatureCollector::start(
+            Arc::new(SwappableVisionSource {
+                next: Arc::clone(&shared_frame),
+            }),
+            5,
+        );
+        // Wait for initial frame to land in collector.
+        let wait_dl = Instant::now() + Duration::from_millis(500);
+        while collector.latest().is_none() && Instant::now() < wait_dl {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(collector.latest().is_some());
+
+        let base_vision_spec = VisionFeatureSpec {
+            source: VisionSourceKind::Detector,
+            layout: VisionLayout::Top1BoxNormV1,
+            target_label: Some("cube".to_string()),
+            min_score: 0.5,
+            max_staleness_ms: 100,
+            max_sync_skew_ms: 100,
+            on_stale: VisionStalePolicy::Stop,
+            on_target_lost: VisionTargetLostPolicy::Stop,
+            require_model_generation: true,
+        };
+        let target_id = DetectorTargetIdentity::from_detection(None, "cube", [0.4, 0.4, 0.6, 0.6]);
+        let stage_chunk = |prep: &mut PreparedPolicy, now: Instant| {
+            let mut src = ChunkSource::from_joint(now, None);
+            src.vision_captured_at = Some(now);
+            src.vision_generation = Some(7);
+            src.vision_target = Some(target_id);
+            prep.plan_chunk_step(&state, None, 0, src, None).unwrap();
+            assert!(!prep.chunk_ring.is_empty());
+        };
+        let push_and_wait = |frame: PolicyVisionFrame| {
+            let want_id = frame.frame_id;
+            *shared_frame.lock().unwrap() = frame;
+            let collector_ref = &collector;
+            async move {
+                let dl = Instant::now() + Duration::from_millis(500);
+                while collector_ref.latest().map(|f| f.frame_id) != Some(want_id)
+                    && Instant::now() < dl
+                {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+                assert_eq!(collector_ref.latest().map(|f| f.frame_id), Some(want_id));
+            }
+        };
+
+        // (a) Missing timestamp with on_stale=Stop -> Fail("VISION_TIMESTAMP_MISSING") + clear ring.
+        let now_a = Instant::now();
+        stage_chunk(&mut prep, now_a);
+        push_and_wait(PolicyVisionFrame {
+            frame_id: 2,
+            detections: vec![make_det("cube")],
+            captured_at: None,
+            model_generation: Some(7),
+        })
+        .await;
+        let out_a = evaluate_final_commit_gate(
+            &mut prep,
+            None,
+            now_a,
+            period_ns,
+            None,
+            100,
+            200,
+            Some(100),
+            Some(200),
+            100,
+            None,
+            Some(&base_vision_spec),
+            None,
+            Some(1),
+            Some(&collector),
+            Some(7),
+            None,
+            now_a,
+            Some(now_a),
+            Some(target_id),
+            None,
+            None,
+        );
+        assert!(matches!(
+            out_a,
+            FinalCommitGateOutcome::Fail {
+                reason: "VISION_TIMESTAMP_MISSING",
+                ..
+            }
+        ));
+        assert!(prep.chunk_ring.is_empty());
+
+        // (b) Stale latest frame with on_stale=Hold -> Hold + clear ring.
+        let now_b = Instant::now();
+        stage_chunk(&mut prep, now_b);
+        push_and_wait(PolicyVisionFrame {
+            frame_id: 3,
+            detections: vec![make_det("cube")],
+            captured_at: now_b.checked_sub(Duration::from_millis(250)),
+            model_generation: Some(7),
+        })
+        .await;
+        let mut hold_stale_spec = base_vision_spec.clone();
+        hold_stale_spec.on_stale = VisionStalePolicy::Hold;
+        let out_b = evaluate_final_commit_gate(
+            &mut prep,
+            None,
+            now_b,
+            period_ns,
+            None,
+            100,
+            200,
+            Some(100),
+            Some(200),
+            100,
+            None,
+            Some(&hold_stale_spec),
+            None,
+            Some(1),
+            Some(&collector),
+            Some(7),
+            None,
+            now_b,
+            Some(now_b),
+            Some(target_id),
+            None,
+            None,
+        );
+        assert!(matches!(out_b, FinalCommitGateOutcome::Hold));
+        assert!(prep.chunk_ring.is_empty());
+
+        // (c) Model generation changed -> Fail("MODEL_CHANGED") + clear ring.
+        let now_c = Instant::now();
+        stage_chunk(&mut prep, now_c);
+        push_and_wait(PolicyVisionFrame {
+            frame_id: 4,
+            detections: vec![make_det("cube")],
+            captured_at: Some(now_c),
+            model_generation: Some(8),
+        })
+        .await;
+        let out_c = evaluate_final_commit_gate(
+            &mut prep,
+            None,
+            now_c,
+            period_ns,
+            None,
+            100,
+            200,
+            Some(100),
+            Some(200),
+            100,
+            None,
+            Some(&base_vision_spec),
+            None,
+            Some(1),
+            Some(&collector),
+            Some(7),
+            None,
+            now_c,
+            Some(now_c),
+            Some(target_id),
+            None,
+            None,
+        );
+        assert!(matches!(
+            out_c,
+            FinalCommitGateOutcome::Fail {
+                reason: "VISION_GENERATION_CHANGED",
+                ..
+            }
+        ));
+        assert!(prep.chunk_ring.is_empty());
+
+        // (d) Target lost: Stop -> Fail("TARGET_LOST"), Hold -> Hold, ZeroFeatures -> Skip + clear ring.
+        let now_d = Instant::now();
+        push_and_wait(PolicyVisionFrame {
+            frame_id: 5,
+            detections: vec![],
+            captured_at: Some(now_d),
+            model_generation: Some(7),
+        })
+        .await;
+        stage_chunk(&mut prep, now_d);
+        let out_d_stop = evaluate_final_commit_gate(
+            &mut prep,
+            None,
+            now_d,
+            period_ns,
+            None,
+            100,
+            200,
+            Some(100),
+            Some(200),
+            100,
+            None,
+            Some(&base_vision_spec),
+            None,
+            Some(1),
+            Some(&collector),
+            Some(7),
+            None,
+            now_d,
+            Some(now_d),
+            Some(target_id),
+            None,
+            None,
+        );
+        assert!(matches!(
+            out_d_stop,
+            FinalCommitGateOutcome::Fail {
+                reason: "TARGET_LOST",
+                ..
+            }
+        ));
+        assert!(prep.chunk_ring.is_empty());
+
+        let mut lost_hold_spec = base_vision_spec.clone();
+        lost_hold_spec.on_target_lost = VisionTargetLostPolicy::Hold;
+        stage_chunk(&mut prep, now_d);
+        let out_d_hold = evaluate_final_commit_gate(
+            &mut prep,
+            None,
+            now_d,
+            period_ns,
+            None,
+            100,
+            200,
+            Some(100),
+            Some(200),
+            100,
+            None,
+            Some(&lost_hold_spec),
+            None,
+            Some(1),
+            Some(&collector),
+            Some(7),
+            None,
+            now_d,
+            Some(now_d),
+            Some(target_id),
+            None,
+            None,
+        );
+        assert!(matches!(out_d_hold, FinalCommitGateOutcome::Hold));
+        assert!(prep.chunk_ring.is_empty());
+
+        let mut lost_zero_spec = base_vision_spec;
+        lost_zero_spec.on_target_lost = VisionTargetLostPolicy::ZeroFeatures;
+        stage_chunk(&mut prep, now_d);
+        let out_d_zero = evaluate_final_commit_gate(
+            &mut prep,
+            None,
+            now_d,
+            period_ns,
+            None,
+            100,
+            200,
+            Some(100),
+            Some(200),
+            100,
+            None,
+            Some(&lost_zero_spec),
+            None,
+            Some(1),
+            Some(&collector),
+            Some(7),
+            None,
+            now_d,
+            Some(now_d),
+            Some(target_id),
+            None,
+            None,
+        );
+        assert!(matches!(out_d_zero, FinalCommitGateOutcome::Skip));
+        assert!(prep.chunk_ring.is_empty());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn chunking_r3_rt_refusal_generation_handoff_prevents_stale_slot_survival() {
+        use crate::model::HolderLabel;
+        use crate::rt_core::broker::{ActionId, Authority, ClientId, Reply, TransitionOp};
+        use crate::rt_core::executor::ExecutorConfig;
+        use crate::rt_core::mailbox::{PolicyValidityBounds, Submitted};
+        use crate::rt_core::requests::lease::{
+            ConnectionHandle, LeaseAcquire, LeaseOutcome, LeaseRequest,
+        };
+        use crate::rt_core::requests::policy::{
+            BeginPolicySpec, PolicyCommand, ReservePolicyLoadSpec,
+        };
+        use crate::supervisor::targets::{PolicyStamp, PolicyTarget};
+
+        let (snap, contract, mut cfg) = make_chunk_snapshot_and_contract(4, 2, None);
+        cfg.lease_timeout_ms = 10_000;
+        let dim = cfg.dof;
+        let (backend, _) =
+            CountingChunkBackend::new(dim, 4 * dim, vec![vec![0.02; 4 * dim]]);
+        let mut prep =
+            PreparedPolicy::from_backend(snap, contract, Box::new(backend), &cfg).unwrap();
+
+        let sup = Arc::new(ArmSupervisor::new(cfg));
+        let handle = sup
+            .start_executor(ExecutorConfig::for_tests(Duration::from_millis(5)))
+            .await
+            .unwrap();
+        let dl_boot = Instant::now() + Duration::from_secs(2);
+        while sup.hub().latest().is_none() && Instant::now() < dl_boot {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let client_id = 909u64;
+        let conn = ConnectionHandle::try_new(client_id, "chunk-r3-refusal").unwrap();
+        let _ = handle.open_connection_async(client_id).await.unwrap();
+        let epoch_id = sup.hub().latest().unwrap().obs.epoch_id;
+        let lease_reply = handle
+            .submit_lease_async(
+                ClientId(client_id),
+                1,
+                Authority {
+                    lease_generation: 0,
+                    epoch: epoch_id,
+                    stop_generation: sup.current_stop_gen(),
+                    config_revision: 0,
+                    parent_generation: 0,
+                },
+                Instant::now() + Duration::from_secs(2),
+                LeaseRequest::Acquire(LeaseAcquire {
+                    connection: conn,
+                    label: HolderLabel::new("chunk-r3-refusal"),
+                    has_label: true,
+                }),
+            )
+            .await
+            .unwrap();
+        let lease_gen = match lease_reply {
+            Reply::Lease {
+                outcome: LeaseOutcome::Granted { generation, .. },
+                ..
+            } => generation,
+            other => panic!("LeaseAcquire failed: {other:?}"),
+        };
+        assert!(lease_gen > 0);
+        let epoch_id = sup.hub().latest().unwrap().obs.epoch_id;
+        // Torque on the sim supervisor via executor transition so Live policy is admitted.
+        let arm_ack = handle
+            .submit_transition_async(
+                ClientId(client_id),
+                2,
+                Authority {
+                    lease_generation: lease_gen,
+                    epoch: epoch_id,
+                    stop_generation: sup.current_stop_gen(),
+                    config_revision: 0,
+                    parent_generation: 0,
+                },
+                Instant::now() + Duration::from_secs(2),
+                TransitionOp::TorqueOn,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(arm_ack, Reply::Terminal { .. }), "TorqueOn failed: {arm_ack:?}");
+
+        let boot = handle.boot();
+        let epoch_id = sup.hub().latest().unwrap().obs.epoch_id;
+        let authority = Authority {
+            lease_generation: lease_gen,
+            epoch: epoch_id,
+            stop_generation: sup.current_stop_gen(),
+            config_revision: 0,
+            parent_generation: 0,
+        };
+        let mut token_guard = sup.policy_cancel_slots().claim_slot().unwrap();
+        let res_r = handle
+            .submit_policy_command_async(
+                ClientId(client_id),
+                3,
+                authority,
+                Instant::now() + Duration::from_secs(2),
+                PolicyCommand::ReserveLoad(ReservePolicyLoadSpec {
+                    load_token: token_guard.token(),
+                    cancel_slot: token_guard.slot(),
+                    admission_request_id: 3,
+                    prepared_boot: boot,
+                    connection: conn,
+                    mode: PolicyMode::Live,
+                    sim_only: true,
+                    i_am_at_the_arm: true,
+                    operator: crate::auth::OperatorGrant::unenforced(),
+                    reservation_expires_at: Instant::now() + Duration::from_secs(10),
+                }),
+                |req_id| token_guard.record_admitted_req(req_id.0),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(res_r, Reply::Ack { .. }), "ReserveLoad failed: {res_r:?}");
+
+        let begin_r = handle
+            .submit_policy_command_async(
+                ClientId(client_id),
+                4,
+                authority,
+                Instant::now() + Duration::from_secs(2),
+                PolicyCommand::BeginPolicy(BeginPolicySpec {
+                    load_token: token_guard.token(),
+                    cancel_slot: token_guard.slot(),
+                    admission_request_id: 3,
+                    prepared_boot: boot,
+                    connection: conn,
+                    operator: crate::auth::OperatorGrant::unenforced(),
+                    calibration_revision: 0,
+                    policy_id: HolderLabel::new("exec_chunk_r3"),
+                    artifact_digest: HolderLabel::new(prep.artifact_digest()),
+                    backend: HolderLabel::new(prep.backend_name()),
+                    mode: PolicyMode::Live,
+                    sim_only: true,
+                    i_am_at_the_arm: true,
+                    max_first_step_rad: DEFAULT_MAX_FIRST_STEP_RAD,
+                    max_step_rad: None,
+                    max_input_age_ms: 200,
+                    max_vision_age_ms: None,
+                    vision_stale_hold: false,
+                    period_us: 50_000,
+                    deadline: Some(Instant::now() + Duration::from_secs(5)),
+                    has_verified_release_gate: false,
+                    gate_policy_sha256: HolderLabel::new(""),
+                    gate_calibration_digest: HolderLabel::new(""),
+                    gate_max_speed_scale: 1.0,
+                    gate_is_production_release: false,
+                    production_qualified_verified: false,
+                }),
+                |req_id| token_guard.record_admitted_req(req_id.0),
+            )
+            .await
+            .unwrap();
+        let action_id = match begin_r {
+            Reply::Ack {
+                action: Some(ActionId(id)),
+                ..
+            } => id,
+            other => panic!("BeginPolicy failed: {other:?}"),
+        };
+        let dl_act = Instant::now() + Duration::from_secs(2);
+        while !sup
+            .hub()
+            .latest()
+            .and_then(|s| s.obs.policy.clone())
+            .is_some_and(|p| p.active && p.action_id == action_id)
+            && Instant::now() < dl_act
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let authorization = sup.rt_policy_authorization();
+
+        let g0 = handle.policy_refusal_gen();
+        let snap_now = sup.hub().latest().unwrap();
+        let snap_authority = snap_now.rt.owner.authority;
+
+        // 1. Submit slot 0 with already-past `chunk_period_end` -> RT refuses `DEADLINE_EXPIRED`
+        //    and immediately bumps `policy_refusal_gen` (`g0 -> g0 + 1`).
+        let mut q0 = vec![0.0f32; dim];
+        q0[0] = 0.02;
+        let sub0 = handle.submit_policy_with_validity(
+            &PolicyTarget {
+                action_id,
+                stamp: PolicyStamp {
+                    authority: snap_authority,
+                    authorization: authorization.current(),
+                    max_input_age: Duration::from_millis(200),
+                },
+                targets: &q0,
+                input_at: Instant::now(),
+                vision_at: None,
+                vision_frame_id: None,
+            },
+            PolicyValidityBounds {
+                vision_window_expires_at: None,
+                handshake_expires_at: None,
+                chunk_slot_expires_at: None,
+                chunk_period_end: Instant::now().checked_sub(Duration::from_millis(1)),
+                expected_refusal_gen: Some(g0),
+            },
+        );
+        assert!(matches!(sub0, Submitted::Accepted));
+
+        let dl_r0 = Instant::now() + Duration::from_secs(2);
+        let mut outcomes0 = Vec::new();
+        while outcomes0.is_empty() && Instant::now() < dl_r0 {
+            outcomes0 = handle.drain_policy_outcomes(action_id);
+            if outcomes0.is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        assert_eq!(
+            outcomes0[0].result.unwrap_err().code,
+            "DEADLINE_EXPIRED",
+            "slot 0 must be refused DEADLINE_EXPIRED"
+        );
+        assert_eq!(
+            handle.policy_refusal_gen(),
+            g0 + 1,
+            "primary RT refusal must bump policy_refusal_gen immediately"
+        );
+
+        // 2. Submit slot 1 carrying STALE `expected_refusal_gen = Some(g0)` (even with current
+        //    authorization generation) -> RT MUST refuse it with `POLICY_REVOKED` and NOT
+        //    double-bump `policy_refusal_gen`.
+        let mut q1 = vec![0.0f32; dim];
+        q1[0] = 0.04;
+        let sub1 = handle.submit_policy_with_validity(
+            &PolicyTarget {
+                action_id,
+                stamp: PolicyStamp {
+                    authority: snap_authority,
+                    authorization: authorization.current(),
+                    max_input_age: Duration::from_millis(200),
+                },
+                targets: &q1,
+                input_at: Instant::now(),
+                vision_at: None,
+                vision_frame_id: None,
+            },
+            PolicyValidityBounds {
+                vision_window_expires_at: None,
+                handshake_expires_at: None,
+                chunk_slot_expires_at: None,
+                chunk_period_end: Some(Instant::now() + Duration::from_secs(1)),
+                expected_refusal_gen: Some(g0),
+            },
+        );
+        assert!(matches!(sub1, Submitted::Accepted));
+
+        let dl_r1 = Instant::now() + Duration::from_secs(2);
+        let mut outcomes1 = Vec::new();
+        while outcomes1.is_empty() && Instant::now() < dl_r1 {
+            outcomes1 = handle.drain_policy_outcomes(action_id);
+            if outcomes1.is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        assert_eq!(
+            outcomes1[0].result.unwrap_err().code,
+            "POLICY_REVOKED",
+            "stale expected_refusal_gen slot must be refused POLICY_REVOKED"
+        );
+        assert_eq!(
+            handle.policy_refusal_gen(),
+            g0 + 1,
+            "cascaded expected_refusal_gen refusal must NOT double-bump policy_refusal_gen"
+        );
+
+        // 3. `executor_commit_gate` with stale `last_seen_refusal_gen = g0` MUST clear the
+        //    chunk ring and return `Skip` without submitting even when outcome queue is empty.
+        let now_gate = Instant::now();
+        prep.plan_chunk_step(
+            &vec![0.0f32; dim],
+            None,
+            0,
+            ChunkSource::from_joint(now_gate, None),
+            None,
+        )
+        .unwrap();
+        assert!(!prep.chunk_ring.is_empty());
+        let mut last_seen = g0;
+        let mut shadow_steps = 0u64;
+        let mut step_stats = PolicyStepStats::default();
+        step_stats.set_period_us(50_000);
+        let submitted_before = handle.policy_submitted_count();
+        let gate_out = executor_commit_gate(
+            &sup,
+            &handle,
+            &mut prep,
+            action_id,
+            lease_gen,
+            PolicyMode::Live,
+            None,
+            Duration::from_millis(200),
+            now_gate,
+            Duration::from_millis(50).as_nanos(),
+            None,
+            200,
+            400,
+            None,
+            None,
+            100,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            snap_authority,
+            &authorization,
+            authorization.current(),
+            &mut last_seen,
+            now_gate,
+            None,
+            now_gate,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0,
+            0,
+            &mut shadow_steps,
+            &mut step_stats,
+        )
+        .await;
+        assert!(matches!(gate_out, ExecutorCommitOutcome::Skip));
+        assert!(
+            prep.chunk_ring.is_empty(),
+            "stale last_seen_refusal_gen must clear whole chunk ring"
+        );
+        assert_eq!(last_seen, g0 + 1);
+        assert_eq!(
+            handle.policy_submitted_count(),
+            submitted_before,
+            "no target may be published when refusal generation advanced"
+        );
+
+        // 4. Fresh slot carrying refreshed `expected_refusal_gen = Some(g0 + 1)` is accepted.
+        let mut q2 = vec![0.0f32; dim];
+        q2[0] = 0.02;
+        let sub2 = handle.submit_policy_with_validity(
+            &PolicyTarget {
+                action_id,
+                stamp: PolicyStamp {
+                    authority: snap_authority,
+                    authorization: authorization.current(),
+                    max_input_age: Duration::from_millis(200),
+                },
+                targets: &q2,
+                input_at: Instant::now(),
+                vision_at: None,
+                vision_frame_id: None,
+            },
+            PolicyValidityBounds {
+                vision_window_expires_at: None,
+                handshake_expires_at: None,
+                chunk_slot_expires_at: None,
+                chunk_period_end: Some(Instant::now() + Duration::from_secs(1)),
+                expected_refusal_gen: Some(g0 + 1),
+            },
+        );
+        assert!(matches!(sub2, Submitted::Accepted));
+        let dl_r2 = Instant::now() + Duration::from_secs(2);
+        let mut outcomes2 = Vec::new();
+        while outcomes2.is_empty() && Instant::now() < dl_r2 {
+            outcomes2 = handle.drain_policy_outcomes(action_id);
+            if outcomes2.is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        assert!(
+            outcomes2[0].result.is_ok(),
+            "fresh slot with matching expected_refusal_gen must be accepted: {:?}",
+            outcomes2[0].result
+        );
+
+        token_guard.disarm();
+        handle.stop_and_join();
     }
 }

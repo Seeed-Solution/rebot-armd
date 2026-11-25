@@ -609,6 +609,9 @@ pub trait CoreOps {
     ) -> Result<(), Refusal> {
         self.consume_target(frame, ctx)
     }
+    /// Brakes a live policy run in place when a queued chunked slot is refused because RT
+    /// already refused an earlier slot (`expected_refusal_gen` mismatch; zero alloc).
+    fn on_policy_refusal_cascade(&mut self, _frame: &TargetFrame) {}
     /// Applies any pending urgent E-stop request; returns true when an E-stop was applied.
     fn apply_estop(&mut self) -> bool { false }
     /// Synchronizes any non-blocking socket-close lease fence (lock-free, zero allocations)
@@ -1403,6 +1406,10 @@ impl CoreOps for SupervisorInner {
         ctx: &CommitCtx,
     ) -> Result<(), Refusal> {
         self.consume_target_frame_with_validity(frame, validity, ctx)
+    }
+
+    fn on_policy_refusal_cascade(&mut self, frame: &TargetFrame) {
+        self.policy_target_refused("POLICY_REVOKED", frame);
     }
 
     fn apply_estop(&mut self) -> bool { self.consume_pending_estop() }
@@ -2412,7 +2419,21 @@ impl ReleaseEngine {
         let ctx = self.checkpoint(core, Checkpoint::BeforeTarget, &mut now_fn, &mut report);
         let mut deferred_target_outcome: Option<TargetOutcome> = None;
         if let Some((f, validity)) = self.targets.take_with_validity() {
-            let result = core.consume_target_with_validity(&f, validity, &ctx);
+            let cur_refusal_gen = self.targets.policy_refusal_gen();
+            let cascaded = f.policy_generation != 0
+                && validity
+                    .expected_refusal_gen
+                    .is_some_and(|exp| exp != cur_refusal_gen);
+            let result = if cascaded {
+                core.on_policy_refusal_cascade(&f);
+                Err(Refusal::code("POLICY_REVOKED"))
+            } else {
+                let res = core.consume_target_with_validity(&f, validity, &ctx);
+                if f.policy_generation != 0 && res.is_err() {
+                    self.targets.note_policy_refusal();
+                }
+                res
+            };
             deferred_target_outcome = Some(TargetOutcome { stream: f.stream, seq: f.seq, result });
             report.target_refusal = result.err();
             report.target = Some((f.seq, result.map_err(|r| r.code)));

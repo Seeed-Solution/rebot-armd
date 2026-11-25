@@ -2638,6 +2638,8 @@ pub(crate) struct ServoTargetDispatcher {
     atomic_fenced_lease_gen: Arc<AtomicU64>,
     #[cfg(feature = "policy-runtime")]
     atomic_closed_policy_action_id: Arc<AtomicU64>,
+    #[cfg(feature = "policy-runtime")]
+    policy_refusal_gen: Arc<AtomicU64>,
 }
 
 impl ServoTargetDispatcher {
@@ -2650,6 +2652,8 @@ impl ServoTargetDispatcher {
         #[cfg(feature = "policy-runtime")]
         atomic_closed_policy_action_id: Arc<AtomicU64>,
     ) -> Self {
+        #[cfg(feature = "policy-runtime")]
+        let policy_refusal_gen = writer.policy_refusal_gen_arc();
         Self {
             inner: Mutex::new(ServoTargetDispatcherInner {
                 port: crate::supervisor::targets::TargetPort::new(writer, arm, boot),
@@ -2673,7 +2677,14 @@ impl ServoTargetDispatcher {
             atomic_fenced_lease_gen,
             #[cfg(feature = "policy-runtime")]
             atomic_closed_policy_action_id,
+            #[cfg(feature = "policy-runtime")]
+            policy_refusal_gen,
         }
+    }
+
+    #[cfg(feature = "policy-runtime")]
+    pub(crate) fn policy_refusal_gen(&self) -> u64 {
+        self.policy_refusal_gen.load(Ordering::Acquire)
     }
 
     fn sync_authoritative_fence_locked(&self, g: &mut ServoTargetDispatcherInner) {
@@ -3749,6 +3760,13 @@ impl RtExecutorHandle {
     #[cfg(feature = "policy-runtime")]
     pub fn policy_busy_count(&self) -> u64 {
         self.shared.servo_dispatcher.policy_busy_count()
+    }
+
+    /// Lock-free monotonic RT policy-refusal generation counter (bumped immediately on Step 4
+    /// whenever RT refuses a policy target frame, before Step 7 outcome delivery).
+    #[cfg(feature = "policy-runtime")]
+    pub fn policy_refusal_gen(&self) -> u64 {
+        self.shared.servo_dispatcher.policy_refusal_gen()
     }
 
     /// Drains RT target outcomes belonging to policy run `action_id`.

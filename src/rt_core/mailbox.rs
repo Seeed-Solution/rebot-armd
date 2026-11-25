@@ -26,6 +26,8 @@
 //! A closing stream still calls [`TargetWriter::close_stream`] and the core
 //! `revoke_stream`; an explicit stop goes through `StopRequests` as for any stop.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::broker::{Authority, BootId};
@@ -56,6 +58,11 @@ pub struct PolicyValidityBounds {
     /// Exclusive end of the selected chunked control period (`now >= end` refuses with
     /// `DEADLINE_EXPIRED`, matching `commit_gate`'s half-open `[t_N, t_{N+1})` slot boundary).
     pub chunk_period_end: Option<Instant>,
+    /// Expected RT policy refusal generation when a chunked slot was published. If RT refused
+    /// a prior slot in the meantime (bumping the mailbox's refusal generation), this queued
+    /// slot is refused cleanly with `POLICY_REVOKED` (zero alloc) rather than surviving the
+    /// refusal across threads. `None` for single-step policies.
+    pub expected_refusal_gen: Option<u64>,
 }
 
 /// One target.
@@ -253,6 +260,7 @@ pub struct TargetWriter {
     streams: [Option<(StreamId, u64)>; MAX_STREAMS],
     last: Option<TargetFrame>,
     coalesced: u64,
+    policy_refusal_gen: Arc<AtomicU64>,
 }
 
 /// The RT's side. Not `Clone`, not `Sync`: one consumer.
@@ -265,13 +273,30 @@ pub struct TargetReader {
     consumer: Consumer<Slot>,
     outcomes: rtrb::Producer<TargetOutcome>,
     outcomes_dropped: u64,
+    policy_refusal_gen: Arc<AtomicU64>,
 }
 
 pub fn target_mailbox() -> (TargetWriter, TargetReader) {
     let empty = Slot { frame: None, validity: PolicyValidityBounds::default() };
     let (producer, consumer) = triple_buffer(empty, empty, empty);
     let (otx, orx) = rtrb::RingBuffer::new(OUTCOME_CAPACITY);
-    (TargetWriter { producer, outcomes: orx, streams: [None; MAX_STREAMS], last: None, coalesced: 0 }, TargetReader { consumer, outcomes: otx, outcomes_dropped: 0 })
+    let policy_refusal_gen = Arc::new(AtomicU64::new(0));
+    (
+        TargetWriter {
+            producer,
+            outcomes: orx,
+            streams: [None; MAX_STREAMS],
+            last: None,
+            coalesced: 0,
+            policy_refusal_gen: Arc::clone(&policy_refusal_gen),
+        },
+        TargetReader {
+            consumer,
+            outcomes: otx,
+            outcomes_dropped: 0,
+            policy_refusal_gen,
+        },
+    )
 }
 
 impl TargetWriter {
@@ -322,9 +347,29 @@ impl TargetWriter {
         while let Ok(o) = self.outcomes.pop() { each(o); n += 1; }
         n
     }
+
+    /// Lock-free handle to the RT's monotonic policy-refusal generation counter.
+    pub fn policy_refusal_gen_arc(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.policy_refusal_gen)
+    }
+
+    /// Current RT policy-refusal generation (Acquire).
+    pub fn policy_refusal_gen(&self) -> u64 {
+        self.policy_refusal_gen.load(Ordering::Acquire)
+    }
 }
 
 impl TargetReader {
+    /// Current RT policy-refusal generation (Acquire).
+    pub fn policy_refusal_gen(&self) -> u64 {
+        self.policy_refusal_gen.load(Ordering::Acquire)
+    }
+
+    /// Records a primary RT policy target refusal immediately on Step 4 (zero alloc, lock-free)
+    /// so off-thread chunked runners and queued slots observe it before Step 7 outcome delivery.
+    pub fn note_policy_refusal(&self) -> u64 {
+        self.policy_refusal_gen.fetch_add(1, Ordering::Release).wrapping_add(1)
+    }
     /// The newest unconsumed frame (None when nothing new).
     pub fn take(&mut self) -> Option<TargetFrame> {
         self.take_with_validity().map(|(f, _)| f)

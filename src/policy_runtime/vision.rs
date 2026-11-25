@@ -785,7 +785,10 @@ impl EmbeddingHubInner {
     }
 
     fn live_ticket_state(&self) -> LiveEmbeddingTicketState {
-        let now_armd_ms = self.now_ms();
+        self.live_ticket_state_at(self.now_ms())
+    }
+
+    fn live_ticket_state_at(&self, now_armd_ms: u64) -> LiveEmbeddingTicketState {
         let (clock_handshake_generation, clock_handshake_expires_at_ms) = match &self.handshake {
             Some(hs) => (hs.handshake_generation, hs.handshake_expires_at_ms),
             None => (0, 0),
@@ -813,6 +816,10 @@ pub struct HubCommitGuard<'a> {
 impl<'a> HubCommitGuard<'a> {
     pub fn live_ticket_state(&self) -> LiveEmbeddingTicketState {
         self.inner.live_ticket_state()
+    }
+
+    pub fn live_ticket_state_at(&self, now_armd_ms: u64) -> LiveEmbeddingTicketState {
+        self.inner.live_ticket_state_at(now_armd_ms)
     }
 
     pub fn is_unbroken_active_renewal(&self, ticket_hs_gen: u64) -> bool {

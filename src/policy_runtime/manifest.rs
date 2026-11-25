@@ -632,30 +632,19 @@ fn parse_chunking_section(val: Option<&Value>, action_dim: usize) -> Result<Chun
         None | Some(Value::Null) => 1usize,
         Some(v) => v
             .as_u64()
-            .filter(|&n| n >= 1 && (n as usize) <= MAX_CHUNK_SIZE)
-            .map(|n| n as usize)
+            .and_then(|n| usize::try_from(n).ok())
             .ok_or_else(|| {
                 PolicyError::InvalidManifest(format!(
                     "chunking.chunk_size must be an integer in 1..={MAX_CHUNK_SIZE}, got {v}"
                 ))
             })?,
     };
-    let total_out = chunk_size
-        .checked_mul(action_dim)
-        .ok_or_else(|| PolicyError::InvalidManifest("chunk_size * action_dim overflow".into()))?;
-    if total_out > super::mlp::MAX_DIM {
-        return Err(PolicyError::InvalidManifest(format!(
-            "chunking output width ({chunk_size} * {action_dim} = {total_out}) exceeds budget ({})",
-            super::mlp::MAX_DIM
-        )));
-    }
 
     let replan_every = match obj.get("replan_every") {
         None | Some(Value::Null) => chunk_size,
         Some(v) => v
             .as_u64()
-            .filter(|&n| n >= 1 && (n as usize) <= chunk_size)
-            .map(|n| n as usize)
+            .and_then(|n| usize::try_from(n).ok())
             .ok_or_else(|| {
                 PolicyError::InvalidManifest(format!(
                     "chunking.replan_every must be an integer in 1..={chunk_size}, got {v}"
@@ -671,25 +660,24 @@ fn parse_chunking_section(val: Option<&Value>, action_dim: usize) -> Result<Chun
                     "chunking.temporal_ensemble_k must be a finite number in 0..={MAX_TEMPORAL_ENSEMBLE_K}, got {v}"
                 ))
             })?;
-            let k32 = k64 as f32;
-            if !k64.is_finite()
-                || !k32.is_finite()
-                || !(0.0..=MAX_TEMPORAL_ENSEMBLE_K as f64).contains(&k64)
-                || !(0.0..=MAX_TEMPORAL_ENSEMBLE_K).contains(&k32)
-            {
+            // Reject out-of-range f64 values before narrowing to f32 so values that would
+            // round into range as f32 are still refused.
+            if !k64.is_finite() || !(0.0..=MAX_TEMPORAL_ENSEMBLE_K as f64).contains(&k64) {
                 return Err(PolicyError::InvalidManifest(format!(
                     "chunking.temporal_ensemble_k must be a finite f32 in 0..={MAX_TEMPORAL_ENSEMBLE_K}, got {v}"
                 )));
             }
-            Some(k32)
+            Some(k64 as f32)
         }
     };
 
-    Ok(ChunkingSpec {
+    let spec = ChunkingSpec {
         chunk_size,
         replan_every,
         temporal_ensemble_k,
-    })
+    };
+    validate_chunking_spec(spec, action_dim)?;
+    Ok(spec)
 }
 
 fn parse_vision_section(
