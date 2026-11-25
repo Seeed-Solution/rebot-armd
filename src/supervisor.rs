@@ -1355,8 +1355,11 @@ pub struct SupervisorInner {
     last_publish_only_us: u32,
     /// Context-switch baseline sampled right before the FIRST terminal capture of the release
     /// (whether early supersession/materialization or `capture_edge_terminals`), consumed by
-    /// `publish_at` so `mid_nvcsw` attributes stalls in every capture path.
+    /// `publish_at` / RT Executor so `mid_nvcsw` attributes stalls in every capture path.
     first_terminal_csw_mark: Option<crate::diagnostics::tick::CswMark>,
+    /// Preserved `mid_csw_start` from the latest `publish_at` so RT Executor (`CoreOps::publish`
+    /// drops `TickPublished`) can still compute `mid_nvcsw`/`mid_nivcsw` across capture+publish.
+    last_mid_csw_start: Option<crate::diagnostics::tick::CswMark>,
     /// Dedicated per-tick cached driver state read exclusively by terminal capture (isolated
     /// from hardware park/torque-off interlock fields `last_poll_*`).
     pub(crate) capture_driver_cache: terminal_capture::CaptureDriverCache,
@@ -2389,6 +2392,7 @@ impl SupervisorInner {
             last_phase_terminal_us: 0,
             last_publish_only_us: 0,
             first_terminal_csw_mark: None,
+            last_mid_csw_start: None,
             capture_driver_cache: terminal_capture::CaptureDriverCache::default(),
             template_obs_for_drain: None,
             terminal_capture_test_hook: None,
@@ -3548,6 +3552,15 @@ impl SupervisorInner {
         std::mem::replace(&mut self.last_phase_terminal_us, 0)
     }
 
+    /// Consumes the capture-window `CswMark` recorded at the first terminal capture or `publish_at`
+    /// of the current release (used by RT Executor to attribute `mid_nvcsw`/`mid_nivcsw`).
+    #[inline]
+    pub(crate) fn take_mid_csw_start(&mut self) -> Option<crate::diagnostics::tick::CswMark> {
+        self.last_mid_csw_start
+            .take()
+            .or_else(|| self.first_terminal_csw_mark.take())
+    }
+
     /// Consumes and resets the disjoint `StatePublisher::publish_with_rt_meta` duration (µs) for
     /// the current release (excludes `phases_us.terminal`).
     #[inline]
@@ -4241,11 +4254,12 @@ impl SupervisorInner {
         };
         let owner = self.published_owner_meta();
         let next_pub_seq = self.core.next_publish_seq();
-        let mid_csw_start = Some(
-            self.first_terminal_csw_mark
-                .take()
-                .unwrap_or_else(crate::diagnostics::tick::CswMark::now),
-        );
+        let mid_csw = self
+            .first_terminal_csw_mark
+            .take()
+            .unwrap_or_else(crate::diagnostics::tick::CswMark::now);
+        self.last_mid_csw_start = Some(mid_csw);
+        let mid_csw_start = Some(mid_csw);
         let (phase_terminal_us, captured_any) =
             self.capture_edge_terminals(timestamp, Some(next_pub_seq));
         let publish_start = Instant::now();

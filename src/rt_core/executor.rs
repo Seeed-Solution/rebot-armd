@@ -6996,8 +6996,16 @@ fn control_thread_main(
                     state.drain_retired_states(&mut core, now_inst());
                     let control_hz = core.config.control_frequency_hz;
                     let done = now_inst();
+                    let alloc_t0 = now_inst();
                     let allocs = crate::diagnostics::alloc::take();
+                    let phase_alloc_read = crate::diagnostics::tick::us(
+                        now_inst().saturating_duration_since(alloc_t0),
+                    );
                     let usage_done = UsageMark::now();
+                    let (mid_nvcsw, mid_nivcsw) = match core.take_mid_csw_start() {
+                        Some(m) => crate::diagnostics::tick::mid_csw_delta(&m, &usage_done),
+                        None => (0, 0),
+                    };
                     control_period_us.store((1e6 / f64::from(control_hz.max(1))) as u64, Ordering::Relaxed);
 
                     let sample = TickSample {
@@ -7027,10 +7035,13 @@ fn control_thread_main(
                             publish_us: core.take_publish_only_us(),
                         },
                         phases_us: ReleasePhasesUs {
+                            alloc_read: phase_alloc_read,
                             terminal: core.take_phase_terminal_us(),
                             ..ReleasePhasesUs::default()
                         },
                         usage: ThreadUsage {
+                            mid_nvcsw,
+                            mid_nivcsw,
                             lock_alloc_calls: allocs.calls.min(u64::from(u32::MAX)) as u32,
                             lock_alloc_us: (allocs.total_ns / 1000).min(u64::from(u32::MAX)) as u32,
                             lock_alloc_max_us: (allocs.max_ns / 1000).min(u64::from(u32::MAX)) as u32,

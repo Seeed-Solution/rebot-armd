@@ -248,6 +248,10 @@ pub(crate) struct TerminalCaptureRecord {
     pub(crate) commanded_positions: [f32; CAPTURE_MAX_DOF],
     pub(crate) tcp: Option<CapturedTcpState>,
     pub(crate) gripper: Option<CapturedGripperObs>,
+    /// Inline `(state, j7, offset_rad)` snapshot matching `gripper_zero_observation_into` so
+    /// synthesized observations keep `positions[joint]`, `gripper.rad`, and `gripper_zero.j7`
+    /// consistent from the same sample.
+    pub(crate) gripper_zero: Option<(HolderLabel, f32, Option<f32>)>,
     pub(crate) gravity_compensated: bool,
     pub(crate) gravity_torques_len: u8,
     pub(crate) gravity_torques: [f32; CAPTURE_MAX_DOF],
@@ -407,6 +411,29 @@ impl TerminalCaptureRecord {
         } else {
             None
         };
+        let gripper_zero = if let (Some(idx), Some(policy)) = (
+            inner.config.gripper_index(),
+            inner.config.gripper_policy.as_ref(),
+        ) {
+            let j7 = inner.measured_positions.get(idx).copied().unwrap_or(0.0);
+            let offset_rad = inner.gripper_calib_offset.or(inner.last_zero_check_offset);
+            let gz_state = if inner.gripper_calib_invalid {
+                "calib_invalid"
+            } else if inner.gripper_zero_checked {
+                "checked"
+            } else {
+                let min_j7 = policy.closed_rad.min(policy.open_rad) - 0.3;
+                let max_j7 = policy.closed_rad.max(policy.open_rad) + 0.3;
+                if j7 < min_j7 || j7 > max_j7 {
+                    "out_of_range"
+                } else {
+                    "ok"
+                }
+            };
+            Some((HolderLabel::new(gz_state), j7, offset_rad))
+        } else {
+            None
+        };
         let now_clock = inner.cached_driver_clock_now();
         let (feedback_age_ms, feedback_valid) = compute_cached_feedback_state(
             inner.feedback_numeric_valid,
@@ -521,6 +548,7 @@ impl TerminalCaptureRecord {
             commanded_positions,
             tcp,
             gripper,
+            gripper_zero,
             gravity_compensated,
             gravity_torques_len,
             gravity_torques,
@@ -711,6 +739,13 @@ impl TerminalCaptureRecord {
             .extend_from_slice(&self.commanded_positions[..dof]);
         obs.tcp = self.tcp.map(CapturedTcpState::to_tcp_state);
         obs.gripper = self.gripper.map(CapturedGripperObs::to_gripper_obs);
+        obs.gripper_zero = self.gripper_zero.map(|(state, j7, offset_rad)| {
+            crate::model::GripperZeroObservation {
+                state: state.as_str().to_owned(),
+                j7,
+                offset_rad,
+            }
+        });
         obs.gravity_compensated = self.gravity_compensated;
         let gt_len = usize::from(self.gravity_torques_len).min(CAPTURE_MAX_DOF);
         obs.gravity_torques.clear();
@@ -939,12 +974,12 @@ pub(crate) struct TerminalCaptureChannel {
     /// (bounded to `TERMINAL_FIFO_CAPACITY`) so delayed dispatch past the 2 s window never drops
     /// or truncates any field without touching `SupervisorLock`. Never accessed on `armd-control`.
     rich_action_cache: Mutex<VecDeque<CachedRichEntry>>,
-    /// Bounded off-RT history of action IDs emitted via synthetic (`obs_override`) terminals across
-    /// ALL consumers (`dispatch_loop`, `drain_and_activate_subscriber`, off-tick drains) so
-    /// `dispatch_loop` suppresses any stale `running` telemetry (including after diagnostic-only
-    /// snapshot reloads or multi-synthetic batches). Leaf mutex; fast-path gated by atomic flag.
-    synthetic_terminal_ids: Mutex<VecDeque<u64>>,
-    has_synthetic_ids: AtomicBool,
+    /// Monotonic high-water mark of action IDs emitted via synthetic (`obs_override`) terminals
+    /// across ALL drain consumers. Because action IDs are strictly monotonic and single-active-slot
+    /// (`begin_action` always terminates any earlier running action before assigning a higher ID),
+    /// any `running` snapshot with `action.id <= max_synthetic_action_id` is guaranteed stale
+    /// without ring eviction or mutex overhead.
+    max_synthetic_action_id: AtomicU64,
     control_thread_lock_attempts: AtomicU64,
     next_terminal_seq: AtomicU64,
     captured: AtomicU64,
@@ -962,8 +997,7 @@ impl TerminalCaptureChannel {
         let channel = Arc::new(Self {
             rx: Mutex::new(consumer),
             rich_action_cache: Mutex::new(VecDeque::with_capacity(TERMINAL_FIFO_CAPACITY)),
-            synthetic_terminal_ids: Mutex::new(VecDeque::with_capacity(TERMINAL_FIFO_CAPACITY)),
-            has_synthetic_ids: AtomicBool::new(false),
+            max_synthetic_action_id: AtomicU64::new(0),
             control_thread_lock_attempts: AtomicU64::new(0),
             next_terminal_seq: AtomicU64::new(0),
             captured: AtomicU64::new(0),
@@ -981,34 +1015,20 @@ impl TerminalCaptureChannel {
         (tx, channel)
     }
 
+    #[inline]
     fn record_synthetic_terminal_id(&self, action_id: u64) {
-        if action_id == 0 {
-            return;
+        if action_id != 0 {
+            self.max_synthetic_action_id
+                .fetch_max(action_id, Ordering::AcqRel);
         }
-        let mut ids = self
-            .synthetic_terminal_ids
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if !ids.contains(&action_id) {
-            while ids.len() >= TERMINAL_FIFO_CAPACITY.max(128) {
-                ids.pop_front();
-            }
-            ids.push_back(action_id);
-        }
-        self.has_synthetic_ids.store(true, Ordering::Release);
     }
 
-    /// True if `action_id` has been emitted via a synthetic (`obs_override`) terminal by ANY
-    /// drain consumer. O(1) atomic fast path when no synthetic terminal has ever been emitted.
+    /// True if `action_id` (a `running` snapshot candidate) is at or below the highest action ID
+    /// already emitted via a synthetic (`obs_override`) terminal by ANY drain consumer.
+    /// Lock-free, O(1), and immune to eviction across arbitrary burst sizes.
     #[inline]
     pub(crate) fn was_synthetically_terminated(&self, action_id: u64) -> bool {
-        if action_id == 0 || !self.has_synthetic_ids.load(Ordering::Acquire) {
-            return false;
-        }
-        self.synthetic_terminal_ids
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains(&action_id)
+        action_id != 0 && action_id <= self.max_synthetic_action_id.load(Ordering::Acquire)
     }
 
     #[inline]
@@ -1312,44 +1332,74 @@ fn resolve_full_action(
     latest_obs: Option<&ArmObservation>,
     channel: &TerminalCaptureChannel,
 ) -> Option<ActionStatus> {
+    let entry = channel.take_rich_entry(rec.action_id);
+    let mut base: Option<ActionStatus> = None;
     for slot in live_slots.iter().flatten() {
         if match_action(slot, rec) {
-            let _ = channel.take_rich_entry(rec.action_id);
-            return Some((*slot).clone());
+            base = Some((*slot).clone());
+            break;
         }
     }
-    if let Some(obs) = latest_obs {
-        for slot in [obs.previous_action.as_ref(), obs.action.as_ref()]
-            .into_iter()
-            .flatten()
-        {
-            if match_action(slot, rec) {
-                let _ = channel.take_rich_entry(rec.action_id);
-                return Some(slot.clone());
+    if base.is_none() {
+        if let Some(obs) = latest_obs {
+            for slot in [obs.previous_action.as_ref(), obs.action.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                if match_action(slot, rec) {
+                    base = Some(slot.clone());
+                    break;
+                }
             }
         }
     }
-    if let Some(entry) = channel.take_rich_entry(rec.action_id) {
-        let mut out = match entry.status {
-            Some(mut cached) => {
-                rec.apply_terminal_overlay(&mut cached);
-                cached
+    let mut out = match (base, entry) {
+        (Some(mut matched), sidecar) => {
+            // Re-apply captured terminal fields even when a live slot or later snapshot matched
+            // `(id, state, code)`, so subsequent in-place reconciliation (e.g., clearing a
+            // dir-sync durability warning) cannot alter the captured terminal payload depending
+            // on drain timing.
+            rec.apply_terminal_overlay(&mut matched);
+            if let Some(sc) = sidecar {
+                if rec.has_message && rec.message.is_truncated() {
+                    if let Some(full_msg) = sc.message {
+                        matched.message = Some(full_msg);
+                    }
+                }
+                if rec.has_durability_warning && rec.durability_warning.is_truncated() {
+                    if let Some(full_warn) = sc.durability_warning {
+                        matched.durability_warning = Some(full_warn);
+                    }
+                }
             }
-            None => rec.build_action_status(),
-        };
-        if rec.has_message && rec.message.is_truncated() {
-            if let Some(full_msg) = entry.message {
-                out.message = Some(full_msg);
-            }
+            matched
         }
-        if rec.has_durability_warning && rec.durability_warning.is_truncated() {
-            if let Some(full_warn) = entry.durability_warning {
-                out.durability_warning = Some(full_warn);
+        (None, Some(sc)) => {
+            let mut out = match sc.status {
+                Some(mut cached) => {
+                    rec.apply_terminal_overlay(&mut cached);
+                    cached
+                }
+                None => rec.build_action_status(),
+            };
+            if rec.has_message && rec.message.is_truncated() {
+                if let Some(full_msg) = sc.message {
+                    out.message = Some(full_msg);
+                }
             }
+            if rec.has_durability_warning && rec.durability_warning.is_truncated() {
+                if let Some(full_warn) = sc.durability_warning {
+                    out.durability_warning = Some(full_warn);
+                }
+            }
+            out
         }
-        return Some(out);
+        (None, None) => return None,
+    };
+    if !rec.has_durability_warning {
+        out.durability_warning = None;
     }
-    None
+    Some(out)
 }
 
 /// Single authoritative per-joint feedback age & freshness computation shared by
@@ -2099,12 +2149,18 @@ mod tests {
             );
             let grip = got[0].gripper.as_ref().expect("synthesized obs must include gripper");
             assert_eq!(grip.joint, gripper_idx);
+            let gz = got[0]
+                .gripper_zero
+                .as_ref()
+                .expect("synthesized obs must include gripper_zero");
             assert!(
                 (got[0].positions[gripper_idx] - moved_gripper_rad).abs() < 1e-6
-                    && (grip.rad - moved_gripper_rad).abs() < 1e-6,
-                "synthesized positions[gripper.joint] ({}) and gripper.rad ({}) must agree",
+                    && (grip.rad - moved_gripper_rad).abs() < 1e-6
+                    && (gz.j7 - moved_gripper_rad).abs() < 1e-6,
+                "synthesized positions[gripper.joint] ({}), gripper.rad ({}), and gripper_zero.j7 ({}) must all agree",
                 got[0].positions[gripper_idx],
-                grip.rad
+                grip.rad,
+                gz.j7
             );
             assert!(
                 got[0].tcp.is_some(),
