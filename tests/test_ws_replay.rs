@@ -973,9 +973,11 @@ async fn replay_corpus_matches_baseline_zero_diff() {
     let policy_disabled_file = manifest["policy_disabled_session"]
         .as_str()
         .expect("manifest.policy_disabled_session string");
-    assert!(
-        files.len() >= 30,
-        "corpus must have at least 30 sessions, found {}",
+    const EXPECTED_SESSION_COUNT: usize = 35;
+    assert_eq!(
+        files.len(),
+        EXPECTED_SESSION_COUNT,
+        "corpus must have exactly {EXPECTED_SESSION_COUNT} sessions, found {}",
         files.len()
     );
 
@@ -1019,11 +1021,18 @@ async fn replay_corpus_matches_baseline_zero_diff() {
             (expected.id, filename, frames, diffs)
         }));
     }
+    assert_eq!(
+        handles.len(),
+        EXPECTED_SESSION_COUNT,
+        "expected {EXPECTED_SESSION_COUNT} spawned replay sessions"
+    );
 
+    let mut completed_sessions = 0usize;
     let mut total_frames = 0usize;
     let mut total_diffs = 0usize;
     for handle in handles {
         let (id, filename, frames, diffs) = handle.await.expect("session task panicked");
+        completed_sessions += 1;
         total_frames += frames;
         if !diffs.is_empty() {
             total_diffs += diffs.len();
@@ -1039,9 +1048,14 @@ async fn replay_corpus_matches_baseline_zero_diff() {
     eprintln!(
         "REPLAY_SUMMARY: binary={} sessions={} frames={} diffs={}",
         bin.display(),
-        files.len(),
+        completed_sessions,
         total_frames,
         total_diffs
+    );
+    assert_eq!(
+        completed_sessions,
+        EXPECTED_SESSION_COUNT,
+        "all {EXPECTED_SESSION_COUNT} corpus sessions must complete and be compared"
     );
     assert_eq!(total_diffs, 0, "WS replay corpus had {total_diffs} diff(s)");
 }

@@ -6,6 +6,8 @@
 //! frames during waits or teardown).
 
 use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader};
+use std::net::SocketAddr;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -20,7 +22,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
 use super::comparator::{CloseOutcome, RecordedEvent, ScriptStep, SessionSetup, SessionTranscript};
-use super::seed::{materialize_seed, reserve_mock_port};
+use super::seed::{materialize_seed, FORBIDDEN_PORTS};
 
 type WsConn = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -300,6 +302,18 @@ pub fn quantize_positions_mrad(v: &Value) -> Vec<i32> {
         .unwrap_or_default()
 }
 
+/// Extract `127.0.0.1:<port>` from armd's startup log line (`armd API server listening on http://...`).
+fn parse_listening_addr(line: &str) -> Option<SocketAddr> {
+    let marker = "armd API server listening on http://";
+    let rest = line.split(marker).nth(1)?;
+    // Strip any trailing ANSI escape sequence or whitespace.
+    let token: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || matches!(c, '.' | ':' | '[' | ']'))
+        .collect();
+    token.parse::<SocketAddr>().ok()
+}
+
 /// Run a replay session script against an `armd` binary spawned with `--follower mock` and
 /// seeded state, returning the newly recorded [`SessionTranscript`].
 pub async fn execute_binary_session(
@@ -311,10 +325,9 @@ pub async fn execute_binary_session(
     steps: &[ScriptStep],
 ) -> SessionTranscript {
     let seed = materialize_seed(setup).await;
-    let port = reserve_mock_port();
-    let base_url = format!("http://127.0.0.1:{port}");
-    let ws_base = format!("ws://127.0.0.1:{port}/api/v1/ws");
 
+    // Let the kernel assign an ephemeral port (`--port 0`) directly inside `armd` so concurrent
+    // sessions and test processes never race on bind-drop-rebind probe sockets.
     let mut cmd = Command::new(binary);
     cmd.args([
         "--follower",
@@ -322,7 +335,7 @@ pub async fn execute_binary_session(
         "--config",
         seed.profile_path.to_str().unwrap(),
         "--port",
-        &port.to_string(),
+        "0",
         "--episodes-dir",
         seed.episodes_dir.to_str().unwrap(),
         "--log-dir",
@@ -335,15 +348,45 @@ pub async fn execute_binary_session(
     }
     cmd.env("ARMD_BIND_HOST", "127.0.0.1");
     cmd.env_remove("PORT");
+    cmd.env_remove("RUST_LOG");
     cmd.env_remove("ARMD_OPERATOR_PIN");
     cmd.env_remove("ARMD_TOOL");
     for (k, v) in &seed.env {
         cmd.env(k, v);
     }
-    cmd.stdout(Stdio::null()).stderr(Stdio::null());
-    let child = ChildGuard(cmd.spawn().unwrap_or_else(|e| {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::null());
+    let mut spawned = cmd.spawn().unwrap_or_else(|e| {
         panic!("failed to spawn {} for session {id}: {e}", binary.display())
-    }));
+    });
+    let stdout = spawned.stdout.take().expect("piped stdout from armd");
+    let child = ChildGuard(spawned);
+
+    let (addr_tx, addr_rx) = tokio::sync::oneshot::channel::<SocketAddr>();
+    let drain_handle = std::thread::spawn(move || {
+        let mut tx = Some(addr_tx);
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some(sender) = tx.as_ref() {
+                if let Some(addr) = parse_listening_addr(&line) {
+                    let _ = sender;
+                    if let Some(sender) = tx.take() {
+                        let _ = sender.send(addr);
+                    }
+                }
+            }
+        }
+    });
+
+    let bound_addr = tokio::time::timeout(Duration::from_secs(6), addr_rx)
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for armd --port 0 listening addr in session {id}"))
+        .unwrap_or_else(|_| panic!("armd exited before reporting listening addr in session {id}"));
+    assert!(
+        !FORBIDDEN_PORTS.contains(&bound_addr.port()),
+        "armd bound forbidden port {} in session {id}",
+        bound_addr.port()
+    );
+    let base_url = format!("http://{bound_addr}");
+    let ws_base = format!("ws://{bound_addr}/api/v1/ws");
 
     let http = reqwest::Client::new();
     let deadline = Instant::now() + Duration::from_secs(6);
@@ -355,13 +398,14 @@ pub async fn execute_binary_session(
         }
         assert!(
             Instant::now() < deadline,
-            "armd mock server failed to start on port {port} for session {id}"
+            "armd mock server failed to start on {bound_addr} for session {id}"
         );
-        tokio::time::sleep(Duration::from_millis(15)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
     let events = run_steps_against(&http, &base_url, &ws_base, steps).await;
     drop(child);
+    let _ = drain_handle.join();
 
     SessionTranscript {
         id: id.to_string(),

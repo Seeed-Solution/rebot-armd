@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU16, Ordering};
 
 use axum::{routing::get, Json, Router};
 use serde_json::json;
@@ -18,27 +17,23 @@ pub const SEEDED_POSE_ID: &str = "01J00000000000000000000002";
 /// Fixed seeded policy pack ID for shadow policy sessions.
 pub const SEEDED_POLICY_ID: &str = "shadow_demo";
 
-/// Safe port range for mock daemons (>= 18877, explicitly excluding forbidden 18765/18001/18990).
-const PORT_BASE: u16 = 18877;
-const FORBIDDEN_PORTS: &[u16] = &[18765, 18001, 18990];
+/// Ports that replay tests must never bind (explicitly excluding 18765/18001/18990).
+pub const FORBIDDEN_PORTS: &[u16] = &[18765, 18001, 18990];
 
-static NEXT_PORT_OFFSET: AtomicU16 = AtomicU16::new(0);
-
-/// Reserve an ephemeral-free local TCP port at or above 18877 (never touching forbidden ports).
-pub fn reserve_mock_port() -> u16 {
-    let pid_stride = ((std::process::id() as u16) % 400) * 16;
-    for _ in 0..2000 {
-        let off = NEXT_PORT_OFFSET.fetch_add(1, Ordering::Relaxed);
-        let candidate = PORT_BASE.wrapping_add((pid_stride + off) % 9000);
-        if candidate < PORT_BASE || FORBIDDEN_PORTS.contains(&candidate) {
-            continue;
+/// Bind an OS-assigned ephemeral loopback listener (`127.0.0.1:0`) without bind-drop-rebind races.
+async fn bind_ephemeral_listener() -> tokio::net::TcpListener {
+    let mut held = Vec::new();
+    for _ in 0..16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral loopback port");
+        let port = listener.local_addr().unwrap().port();
+        if !FORBIDDEN_PORTS.contains(&port) {
+            return listener;
         }
-        if let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", candidate)) {
-            drop(listener);
-            return candidate;
-        }
+        held.push(listener);
     }
-    panic!("Unable to reserve a free mock port >= {PORT_BASE}");
+    panic!("Unable to bind non-forbidden ephemeral loopback port");
 }
 
 pub struct MaterializedSeed {
@@ -58,8 +53,8 @@ impl Drop for MaterializedSeed {
 }
 
 async fn spawn_mock_detector() -> (SocketAddr, tokio::task::JoinHandle<()>) {
-    let port = reserve_mock_port();
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let listener = bind_ephemeral_listener().await;
+    let addr = listener.local_addr().unwrap();
     let app = Router::new()
         .route(
             "/api/mode",
@@ -98,7 +93,6 @@ async fn spawn_mock_detector() -> (SocketAddr, tokio::task::JoinHandle<()>) {
                 }))
             }),
         );
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     let handle = tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
@@ -297,9 +291,8 @@ pub async fn materialize_seed(setup: &SessionSetup) -> MaterializedSeed {
         env.insert("ARMD_DETECTOR_URL".into(), format!("http://{addr}"));
         Some(handle)
     } else {
-        // Point to an unused local port so detector probes fail fast without external network.
-        let dead_port = reserve_mock_port();
-        env.insert("ARMD_DETECTOR_URL".into(), format!("http://127.0.0.1:{dead_port}"));
+        // RFC 863 discard port on loopback fails fast with ECONNREFUSED without probing/racing ports.
+        env.insert("ARMD_DETECTOR_URL".into(), "http://127.0.0.1:9".into());
         None
     };
 
