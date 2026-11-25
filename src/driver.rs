@@ -1390,6 +1390,11 @@ pub trait ArmDriver: Send {
     /// from transient deferral ([`TxBatchOutcome::Deferred`]) without faulting or authorizing
     /// motion completion on deferral. Drivers and wrappers that support pending-queue carry-over
     /// override this method; the default forwards to fail-closed [`Self::write_joint_targets`].
+    /// Stages unfenced motion targets into the driver's carry-over TX queue with zero bus TX when
+    /// the release TX cutoff already expired before output started (avoids staging an already-expired
+    /// driver deadline while preserving carry-over parity).
+    fn defer_motion_targets_past_cutoff(&mut self, _targets: &[JointTarget]) {}
+
     fn write_joint_targets_bounded(&mut self, targets: &[JointTarget]) -> Result<TxBatchOutcome, ArmDriverError> {
         self.write_joint_targets(targets).map(|()| TxBatchOutcome::Complete)
     }
@@ -14820,6 +14825,35 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     fn pos_force_last_fresh_position(&self) -> Option<f32> {
         let _ = self.pos_force.as_ref()?;
         self.pf_last_fresh_position
+    }
+
+    fn defer_motion_targets_past_cutoff(&mut self, targets: &[JointTarget]) {
+        let batch_lease_gen = self.output_lease_gen;
+        self.output_lease_gen = 0;
+        if targets.len() != self.motor_ids.len()
+            || self.torque_hs.is_some()
+            || self.mit_fence.is_some()
+            || self.mit_fence_trip.is_some()
+            || self.target_frames_refused(None, true).is_some()
+            || self.strict_stop_check(None).is_err()
+            || self.is_lease_fenced(batch_lease_gen)
+        {
+            return;
+        }
+        let batch_stamp = self.current_stop_stamp();
+        let batch_ts = self.now();
+        for (i, target) in targets.iter().enumerate() {
+            if self.joint_modes.get(i).copied().flatten() == Some(DamiaoControlMode::PosForce) {
+                continue;
+            }
+            if let Ok(cmds) = self.pending_target_cmds_checked(i, target) {
+                for (frame_id, cmd) in cmds.into_iter().flatten() {
+                    let _ = self
+                        .pending_tx
+                        .upsert(i, frame_id, cmd, batch_ts, batch_stamp, batch_lease_gen);
+                }
+            }
+        }
     }
 
     fn write_joint_targets_bounded(&mut self, targets: &[JointTarget]) -> Result<TxBatchOutcome, ArmDriverError> {

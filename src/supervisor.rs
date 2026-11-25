@@ -7646,25 +7646,10 @@ impl SupervisorInner {
         let mut park_wake = None;
         let mut park_state_changed = false;
         let (rx_frames, rx_exhausted) = if release_cap_expired {
-            // Release TX cutoff already expired: skip budgeted Step-2 TX transitions, stage an
-            // already-expired driver TX cap (`Some(drv_now)`) so RX recovery emits 0 TX frames,
-            // and still read RX feedback (or cached states) so `bus_feedback_fresh` stays accurate.
-            let staged_expired = self
-                .driver
-                .as_mut()
-                .and_then(|d| {
-                    d.try_with_mut(|drv| {
-                        let drv_now = drv.clock_now();
-                        drv.set_tx_release_deadline(Some(drv_now));
-                        true
-                    })
-                    .ok()
-                })
-                .unwrap_or(false);
+            // Release TX cutoff already expired: skip budgeted Step-2 TX transitions without
+            // staging an expired driver deadline, and still read RX feedback so `bus_feedback_fresh`
+            // remains accurate.
             let mut rx = self.poll_hardware_rx_with_clock(Some(budget), None, None, now_fn);
-            if staged_expired {
-                self.clear_driver_tx_release_cap();
-            }
             rx.budget_exhausted = true;
             let rx_frames = rx.rx_frames;
             self.pending_rx_poll = rx;
@@ -7842,17 +7827,10 @@ impl SupervisorInner {
                                         driver.set_tx_release_deadline(Some(cap));
                                         true
                                     }
-                                    Err((drv_now, _)) => {
-                                        driver.set_tx_release_deadline(Some(drv_now));
-                                        true
-                                    }
+                                    Err(_) => false,
                                 }
                             }
-                            None => {
-                                let drv_now = driver.clock_now();
-                                driver.set_tx_release_deadline(Some(drv_now));
-                                true
-                            }
+                            None => false,
                         }
                     } else {
                         false
@@ -8218,19 +8196,15 @@ impl SupervisorInner {
             // Sample driver clock FIRST, then live owner clock inside the driver boundary, and
             // refuse expired release cutoffs BEFORE staging any driver deadline.
             let (drv_now, owner_now, drv_release_cap) = match release_deadline {
-                Some(rd) => match rd.checked_sub(margin) {
-                    Some(owner_cap) => {
-                        match translate_driver_cutoff_conservative(drv, owner_cap, now_fn) {
-                            Ok(translated) => translated,
-                            Err((drv_now, owner_now)) => (drv_now, owner_now, drv_now),
-                        }
+                Some(rd) => {
+                    let Some(owner_cap) = rd.checked_sub(margin) else {
+                        return (DriverTxCapOutcome::Expired, None);
+                    };
+                    match translate_driver_cutoff_conservative(drv, owner_cap, now_fn) {
+                        Ok(translated) => translated,
+                        Err(_) => return (DriverTxCapOutcome::Expired, None),
                     }
-                    None => {
-                        let drv_now = drv.clock_now();
-                        let owner_now = now_fn();
-                        (drv_now, owner_now, drv_now)
-                    }
-                },
+                }
                 None => {
                     let drv_now = drv.clock_now();
                     let owner_now = now_fn();
@@ -8296,18 +8270,10 @@ impl SupervisorInner {
                                     drv.set_tx_release_deadline(Some(cap));
                                     (true, false)
                                 }
-                                Err((drv_now, _)) => {
-                                    drv.set_tx_release_deadline(Some(drv_now));
-                                    (true, true)
-                                }
+                                Err(_) => (false, true),
                             }
                         }
-                        None => {
-                            let drv_now = drv.clock_now();
-                            let _ = now_fn();
-                            drv.set_tx_release_deadline(Some(drv_now));
-                            (true, true)
-                        }
+                        None => (false, true),
                     },
                     None => {
                         let drv_now = drv.clock_now();
@@ -10095,6 +10061,40 @@ impl SupervisorInner {
                         }
                     }
                 }
+            }
+        } else if !self.shutdown_committed && !enable_transition_owns_bus && output_tx_cap_expired {
+            // Release TX cutoff already expired before output started: transmit 0 frames and
+            // enqueue unfenced motion targets into the driver's carry-over queue without staging
+            // an already-expired driver deadline.
+            let is_stopped_or_failed_hold = self.safety.state().is_stopped()
+                || self.enable_lifecycle == driver_transitions::EnableLifecycle::FailedHold;
+            let send_to_bus = !self.disable_pending
+                && !transition_owns_bus
+                && self.is_torqued
+                && self.torque_intent == TorqueIntent::On
+                && feedback_fresh
+                && self.hardware_feedback_fresh(BUS_LOSS_TIMEOUT);
+            if send_to_bus && !is_stopped_or_failed_hold {
+                let mut sc = std::mem::take(&mut self.scratch);
+                sc.targets.clear();
+                let dof = self.config.dof;
+                for i in 0..dof {
+                    let pos = self.commanded_positions.get(i).copied().unwrap_or(0.0);
+                    let vel = self.commanded_velocities.get(i).copied();
+                    sc.targets.push(JointTarget {
+                        position: pos,
+                        velocity: vel,
+                        kp: None,
+                        kd: None,
+                        torque: None,
+                    });
+                }
+                let lease_gen = self.current_active_lease_gen();
+                if let Some(mut drv) = self.write_driver_for_tick() {
+                    drv.set_output_lease_gen(lease_gen);
+                    drv.defer_motion_targets_past_cutoff(&sc.targets);
+                }
+                self.scratch = sc;
             }
         } else if !self.shutdown_committed && !enable_transition_owns_bus && !output_tx_cap_expired {
             let tracking_active = self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled);

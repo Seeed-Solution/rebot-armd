@@ -189,6 +189,14 @@ impl ArmDriver for ZeroOffsetDriver {
         }
         Ok(rx)
     }
+    fn read_joint_states_safe_hold(&mut self, out: &mut Vec<JointState>, deadline: Instant, max_rx_frames: u16) -> Result<(u16, bool), ArmDriverError> {
+        let rx = self.inner.read_joint_states_safe_hold(out, deadline, max_rx_frames)?;
+        for (i, s) in out.iter_mut().enumerate() {
+            let o = self.off(i);
+            if o != 0.0 { s.position -= o; }
+        }
+        Ok(rx)
+    }
     fn read_cached_joint_states_into(&self, out: &mut Vec<JointState>) -> Option<()> {
         self.inner.read_cached_joint_states_into(out)?;
         for (i, s) in out.iter_mut().enumerate() {
@@ -224,6 +232,22 @@ impl ArmDriver for ZeroOffsetDriver {
         let r = self.inner.write_joint_targets_bounded(&m);
         self.motor_targets = m;
         r
+    }
+    fn defer_motion_targets_past_cutoff(&mut self, targets: &[JointTarget]) {
+        if self.offsets.iter().all(|o| *o == 0.0) {
+            self.inner.defer_motion_targets_past_cutoff(targets);
+            return;
+        }
+        let mut m = std::mem::take(&mut self.motor_targets);
+        m.clear();
+        m.extend(targets.iter().enumerate().map(|(i, t)| {
+            let o = self.off(i);
+            let mut t = t.clone();
+            if o != 0.0 { t.position += o; }
+            t
+        }));
+        self.inner.defer_motion_targets_past_cutoff(&m);
+        self.motor_targets = m;
     }
     fn discard_pending_tx(&mut self) { self.inner.discard_pending_tx(); }
     fn set_tx_release_deadline(&mut self, deadline: Option<Instant>) { self.inner.set_tx_release_deadline(deadline); }
@@ -402,6 +426,7 @@ impl ArmDriver for ZeroOffsetDriver {
     fn disable_dispatched_mask(&self) -> u64 { self.inner.disable_dispatched_mask() }
     fn finish_dispatched_disable(&mut self) -> Result<(), ArmDriverError> { self.inner.finish_dispatched_disable() }
     fn abort_enable(&mut self) { self.inner.abort_enable() }
+    fn prepare_safe_hold(&mut self) { self.inner.prepare_safe_hold() }
     fn panic_disable_step(&mut self, first: bool, deadline: Instant) -> Option<Result<Vec<usize>, ArmDriverError>> {
         self.inner.panic_disable_step(first, deadline)
     }
