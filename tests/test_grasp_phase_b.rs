@@ -2435,7 +2435,7 @@ async fn phase_b_pos_force_j7_intent_only_and_approach_lock_refusal_both_owners(
                         || matches!(res, Err(ArmError::Motion(armd::motion::MotionError::InvalidCommand(_)))),
                     "Legacy must refuse lock_j7_hold=true with approach_leg=Some: {res:?}"
                 );
-                let _ = inner.finish_macro(pid, "cancelled", None, None, None, None);
+                inner.finish_macro(pid, "cancelled", None, None, None, None);
             }
             Owner::Executor => {
                 let h = rig.handle.as_ref().unwrap();

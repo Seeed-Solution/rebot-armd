@@ -405,6 +405,7 @@ fn off_lock_grasp_ack(
 ///   auth off-lock, captures `ActionSnapshot::capture_executor` with the original connection
 ///   `AdmissionStamp`, plans/preflights off-thread via the shared `MacroCheck` pipeline, and
 ///   commits via `grasp::begin_executor`.
+///
 /// Returns `None` for any other path/strategy so unmigrated routes stay fail-closed.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_executor_ws_grasp(

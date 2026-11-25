@@ -3806,10 +3806,10 @@ pub(crate) fn install_begin_macro_with_proof(
     legacy_tag: Option<String>,
     legacy_task: Option<String>,
 ) -> Result<u64, ArmError> {
-    if spec.j7_intent_only {
-        if check_adaptive_begin_fence(spec).is_err() || expected_workspace_revision.is_none() {
-            return Err(ActionRefusal::new("INVALID_COMMAND").into_arm_error(this));
-        }
+    if spec.j7_intent_only
+        && (check_adaptive_begin_fence(spec).is_err() || expected_workspace_revision.is_none())
+    {
+        return Err(ActionRefusal::new("INVALID_COMMAND").into_arm_error(this));
     }
     let now = Instant::now();
     if let Some(ws_rev) = expected_workspace_revision.filter(|_| spec.check_workspace_revision) {

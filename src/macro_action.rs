@@ -690,7 +690,7 @@ impl MacroCtx {
                         .iter()
                         .copied()
                         .find(|&k| k == c.as_str())
-                        .unwrap_or_else(|| match c.as_str() {
+                        .unwrap_or(match c.as_str() {
                             "CONFIG_BUSY" => "CONFIG_BUSY",
                             "FEEDBACK_STALE" => "FEEDBACK_STALE",
                             "MOTION_BUSY" => "MOTION_BUSY",
