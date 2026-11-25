@@ -1462,3 +1462,153 @@ fn l3_stopped_hold_never_blocks_on_driver_mutex_and_empty_mask_takes_no_lock() {
         });
     });
 }
+
+/// M4 lock-proof: under `ControlThreadGuard` + `ReleaseGuard`, RT disable dispatch and disable
+/// polling use non-blocking `try_lock` (never block when the driver mutex is held on another OS
+/// thread, count skips in `TxDiagnostics::disable_lock_contended`, and escalate at N=25 skips).
+#[test]
+fn r11_m4_rt_disable_dispatch_and_polling_never_block_on_driver_mutex() {
+    use armd::diagnostics::tick::{
+        disable_contention_escalations_count, disable_lock_contended_count,
+        reset_disable_contention_escalations, reset_disable_lock_contended, TickStats,
+    };
+    use armd::rt_core::broker::{BootId, CommandKind, Descriptor, Stamp};
+    use armd::rt_core::ids::ArmId;
+    use armd::rt_core::ops::{CommitCtx, CoreOps, ServiceBudget, TorqueProgress};
+    use armd::safety::StopPolicy;
+    use armd::transport::MockClock;
+    use armd::SupervisorInner;
+
+    run_bounded_fixture(Duration::from_secs(5), "r11_m4_disable_lock_proof", |_deadline| {
+        let clock = MockClock::new();
+        let bus = FakeBus::with_clock(&dm_limits(), clock.clone());
+        bus.with(|s| {
+            s.immediate_replies = true;
+            s.push_all_feedback();
+        });
+        let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(dm_limits())
+            .unwrap();
+        drv.read_joint_states().unwrap();
+        drv.check_mapping_ranges();
+        let mut inner = SupervisorInner::new(ArmConfig {
+            lease_timeout_ms: 600_000,
+            ..ArmConfig::rebot_dm()
+        })
+        .with_driver(Box::new(drv));
+        inner.rt_executor_owned = true;
+        inner.lease_enabled = false;
+        inner.register_live_connection(1).unwrap();
+        inner.tick(0.02);
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).unwrap();
+        SupervisorInner::enable_torque(admitted).unwrap();
+        inner.apply_stop_policy(StopPolicy::EStopLatch);
+
+        // Clear 20 ms settle and collect K=3 rest samples.
+        clock.advance(Duration::from_millis(25));
+        for step in 0..3 {
+            if step > 0 {
+                clock.advance(Duration::from_millis(10));
+            }
+            bus.with(|s| s.push_all_feedback());
+            inner.tick(0.02);
+        }
+
+        // 1. Contended RT disable DISPATCH under ControlThreadGuard + ReleaseGuard: never blocks,
+        //    returns DRIVER_BUSY, increments TxDiagnostics::disable_lock_contended.
+        reset_disable_lock_contended();
+        reset_disable_contention_escalations();
+        inner.with_contended_driver_for_test(|core| {
+            let _rt_thread = ControlThreadGuard::enter();
+            let _release = ReleaseGuard::enter();
+            let now = clock.now();
+            let cctx = CommitCtx {
+                arm: ArmId(1),
+                boot: BootId(1),
+                now,
+                stop_generation: 0,
+            };
+            let desc = Descriptor {
+                stamp: Stamp {
+                    arm: ArmId(1),
+                    boot: BootId(1),
+                    request: RequestId(1),
+                    client: ClientId(1),
+                    client_seq: 1,
+                    authority: Authority {
+                        lease_generation: 0,
+                        epoch: core.safety.epoch_id(),
+                        stop_generation: 0,
+                        config_revision: 0,
+                        parent_generation: 0,
+                    },
+                    deadline: now + Duration::from_secs(5),
+                },
+                kind: CommandKind::Transition(TransitionOp::TorqueOff),
+            };
+            let t0 = Instant::now();
+            let res = core.commit_transition(&desc, TransitionOp::TorqueOff, &cctx);
+            assert_eq!(res, Err("DRIVER_BUSY"));
+            assert!(
+                t0.elapsed() < Duration::from_millis(20),
+                "M4: contended RT disable dispatch must never block"
+            );
+            assert_eq!(disable_lock_contended_count(), 1);
+            assert_eq!(TickStats::default().snapshot().tx.disable_lock_contended, 1);
+        });
+
+        // 2. Uncontended dispatch starts Pending disable repeats; then contended RT disable POLLING
+        //    never blocks and escalates at N=25 consecutive skips.
+        let now = clock.now();
+        let cctx = CommitCtx {
+            arm: ArmId(1),
+            boot: BootId(1),
+            now,
+            stop_generation: 0,
+        };
+        let desc = Descriptor {
+            stamp: Stamp {
+                arm: ArmId(1),
+                boot: BootId(1),
+                request: RequestId(2),
+                client: ClientId(1),
+                client_seq: 2,
+                authority: Authority {
+                    lease_generation: 0,
+                    epoch: inner.safety.epoch_id(),
+                    stop_generation: 0,
+                    config_revision: 0,
+                    parent_generation: 0,
+                },
+                deadline: now + Duration::from_secs(5),
+            },
+            kind: CommandKind::Transition(TransitionOp::TorqueOff),
+        };
+        assert!(inner.commit_transition(&desc, TransitionOp::TorqueOff, &cctx).is_ok());
+        assert!(inner.torque_transition_pending());
+
+        reset_disable_lock_contended();
+        reset_disable_contention_escalations();
+        inner.with_contended_driver_for_test(|core| {
+            let _rt_thread = ControlThreadGuard::enter();
+            let _release = ReleaseGuard::enter();
+            let budget = ServiceBudget::for_release(clock.now(), clock.now() + Duration::from_millis(20));
+            for skip in 1..=armd::STOPPED_HOLD_CONTENTION_ESCALATE_SKIPS {
+                let t0 = Instant::now();
+                let poll = core.poll_hardware(&budget);
+                assert!(
+                    t0.elapsed() < Duration::from_millis(20),
+                    "M4: contended RT disable poll #{skip} must never block"
+                );
+                assert!(matches!(poll.torque, Some(Ok(TorqueProgress::Pending { .. }))));
+                assert_eq!(disable_lock_contended_count(), u64::from(skip));
+            }
+            assert_eq!(disable_contention_escalations_count(), 1);
+            let snap = TickStats::default().snapshot();
+            assert_eq!(snap.tx.disable_lock_contended, u64::from(armd::STOPPED_HOLD_CONTENTION_ESCALATE_SKIPS));
+            assert_eq!(snap.tx.disable_contention_escalations, 1);
+            assert!(core.safety.has_latched_fault_code(armd::FaultCode::HardwareFault));
+        });
+    });
+}

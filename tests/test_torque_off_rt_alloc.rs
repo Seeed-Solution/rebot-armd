@@ -1168,3 +1168,166 @@ fn l3_stopped_hold_try_lock_contention_and_empty_mask_zero_alloc() {
         u64::from(armd::STOPPED_HOLD_CONTENTION_ESCALATE_SKIPS)
     );
 }
+
+/// M4: `armd-control` RT off-rest refusal (operational & stopped) allocates strictly (0, 0)
+/// without cloning positions or allocating the expected-pose Vec, and RT disable dispatch &
+/// polling use non-blocking `try_lock` with counted escalation at N=25 and (0, 0) allocs.
+#[test]
+fn r11_m4_rt_off_rest_refusal_and_disable_try_lock_escalation_zero_alloc() {
+    use armd::diagnostics::tick::{
+        disable_contention_escalations_count, disable_lock_contended_count,
+        reset_disable_contention_escalations, reset_disable_lock_contended,
+    };
+    use armd::rt_core::ids::ArmId;
+    use std::time::Instant;
+
+    // 1. Operational off-rest TorqueOff refusal (`ARM_NOT_AT_RESTING_POSE`): (0, 0) allocs/frees!
+    let (mut fx, mut b, bus, clock) = build_armed_fixture(0.35);
+    // Warm up triple-buffer slots so steady-state publish buffers are settled.
+    for _ in 0..5 {
+        bus.with(|s| s.push_all_feedback());
+        fx.step();
+        clock.advance(RELEASE);
+    }
+    assert!(fx.core.is_torqued);
+    assert!(fx.core.safety.state().is_operational());
+
+    let auth = fx.core.authority(&fx.ctx(fx.now()));
+    b.submit(
+        ClientId(1),
+        2,
+        auth,
+        fx.now() + Duration::from_secs(5),
+        Submit::Transition(TransitionOp::TorqueOff),
+    )
+    .unwrap();
+    bus.with(|s| s.push_all_feedback());
+    let (rep_refuse, a_ref, f_ref) = counted(|| fx.step());
+    assert_eq!(
+        rep_refuse.command.map(|(_, r)| r),
+        Some(Err("ARM_NOT_AT_RESTING_POSE")),
+        "M4: operational off-rest TorqueOff must refuse with ARM_NOT_AT_RESTING_POSE"
+    );
+    assert_eq!(
+        (a_ref, f_ref),
+        (0, 0),
+        "M4: operational off-rest TorqueOff refusal must allocate 0 and free 0"
+    );
+
+    // 2. Contended RT disable DISPATCH: try_lock returns DRIVER_BUSY without blocking,
+    //    escalates at N=25 consecutive skips, and allocates (0, 0) on every tick including escalation!
+    reset_disable_lock_contended();
+    reset_disable_contention_escalations();
+    fx.core.with_contended_driver_for_test(|core| {
+        let now = clock.now();
+        let cctx = armd::rt_core::ops::CommitCtx {
+            arm: ArmId(1),
+            boot: BOOT,
+            now,
+            stop_generation: 0,
+        };
+        let ep = core.safety.epoch_id();
+        for skip in 1..=armd::STOPPED_HOLD_CONTENTION_ESCALATE_SKIPS {
+            let desc = armd::rt_core::broker::Descriptor {
+                stamp: armd::rt_core::broker::Stamp {
+                    arm: ArmId(1),
+                    boot: BOOT,
+                    request: armd::rt_core::broker::RequestId(100 + u64::from(skip)),
+                    client: ClientId(1),
+                    client_seq: 100 + u64::from(skip),
+                    authority: Authority {
+                        lease_generation: 0,
+                        epoch: ep,
+                        stop_generation: 0,
+                        config_revision: 0,
+                        parent_generation: 0,
+                    },
+                    deadline: now + Duration::from_secs(5),
+                },
+                kind: armd::rt_core::broker::CommandKind::Transition(TransitionOp::TorqueOff),
+            };
+            let t0 = Instant::now();
+            let (res, a1, f1) =
+                counted(|| core.commit_transition(&desc, TransitionOp::TorqueOff, &cctx));
+            assert!(
+                t0.elapsed() < Duration::from_millis(20),
+                "M4: dispatch must never block"
+            );
+            assert_eq!(res, Err("DRIVER_BUSY"), "M4: contended dispatch skip #{skip}");
+            assert_eq!(
+                (a1, f1),
+                (0, 0),
+                "M4: contended dispatch skip #{skip} must allocate (0, 0)"
+            );
+            assert_eq!(disable_lock_contended_count(), u64::from(skip));
+            if skip < armd::STOPPED_HOLD_CONTENTION_ESCALATE_SKIPS {
+                assert_eq!(disable_contention_escalations_count(), 0);
+            } else {
+                assert_eq!(disable_contention_escalations_count(), 1);
+                assert!(core.safety.has_latched_fault_code(FaultCode::HardwareFault));
+            }
+        }
+    });
+
+    // 3. Contended RT disable POLLING: start a real TorqueOff at rest (Pending in repeat window),
+    //    then hold driver mutex across N=25 poll ticks -> never blocks, stays Pending, escalates at N=25, (0, 0) allocs!
+    let (mut fx_poll, mut b_poll, bus_poll, clock_poll) = build_armed_estopped_fixture(0.0);
+    // Clear 20 ms post-motion settle and accumulate K=3 fresh rest samples so TorqueOff enters Pending Disable repeats.
+    clock_poll.advance(Duration::from_millis(25));
+    for _ in 0..3 {
+        bus_poll.with(|s| s.push_all_feedback());
+        let _ = fx_poll.step();
+        clock_poll.advance(RELEASE);
+    }
+    let a_p = fx_poll.core.authority(&fx_poll.ctx(fx_poll.now()));
+    b_poll
+        .submit(
+            ClientId(1),
+            10,
+            a_p,
+            fx_poll.now() + Duration::from_secs(5),
+            Submit::Transition(TransitionOp::TorqueOff),
+        )
+        .unwrap();
+    bus_poll.with(|s| s.push_all_feedback());
+    let rep_start = fx_poll.step();
+    assert!(matches!(rep_start.command, Some((_, Ok(_)))));
+    assert!(
+        fx_poll.core.torque_transition_pending(),
+        "precondition: disable repeats must be pending"
+    );
+
+    reset_disable_lock_contended();
+    reset_disable_contention_escalations();
+    fx_poll.core.with_contended_driver_for_test(|core| {
+        let budget = armd::rt_core::ops::ServiceBudget::for_release(
+            clock_poll.now(),
+            clock_poll.now() + RELEASE,
+        );
+        for skip in 1..=armd::STOPPED_HOLD_CONTENTION_ESCALATE_SKIPS {
+            let t0 = Instant::now();
+            let (poll, a2, f2) = counted(|| core.poll_hardware(&budget));
+            assert!(
+                t0.elapsed() < Duration::from_millis(20),
+                "M4: disable poll must never block"
+            );
+            assert!(
+                matches!(poll.torque, Some(Ok(armd::rt_core::ops::TorqueProgress::Pending { .. }))),
+                "M4: contended disable poll skip #{skip} must keep transition Pending, got {:?}",
+                poll.torque
+            );
+            assert_eq!(
+                (a2, f2),
+                (0, 0),
+                "M4: contended disable poll skip #{skip} must allocate (0, 0)"
+            );
+            assert_eq!(disable_lock_contended_count(), u64::from(skip));
+            if skip < armd::STOPPED_HOLD_CONTENTION_ESCALATE_SKIPS {
+                assert_eq!(disable_contention_escalations_count(), 0);
+            } else {
+                assert_eq!(disable_contention_escalations_count(), 1);
+                assert!(core.safety.has_latched_fault_code(FaultCode::HardwareFault));
+            }
+        }
+    });
+}

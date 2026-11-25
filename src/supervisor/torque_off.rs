@@ -191,13 +191,40 @@ impl SupervisorInner {
         Ok(())
     }
 
+    /// Non-blocking stopped torque-off evaluation for `armd-control` (M4): uses `driver.try_lock()`,
+    /// returning `Err(())` on mutex contention (`TryLockError::WouldBlock`) instead of blocking.
+    pub(crate) fn may_disable_torque_while_stopped_nonblocking(
+        &self,
+    ) -> Result<Result<(), StoppedTorqueOffRefusal>, ()> {
+        if let Some(d) = self.driver.as_ref() {
+            return match d.try_lock() {
+                Ok(drv) => Ok(Self::check_stopped_torque_off_with_driver(&self.config, drv.as_ref())),
+                Err(std::sync::TryLockError::WouldBlock) => Err(()),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    Ok(Err(StoppedTorqueOffRefusal::StaleOrMissingFeedback))
+                }
+            };
+        }
+        Ok(self.may_disable_torque_while_stopped_driverless())
+    }
+
     pub fn may_disable_torque_while_stopped(&self) -> Result<(), StoppedTorqueOffRefusal> {
         if let Some(d) = self.driver.as_ref() {
+            if self.rt_executor_owned {
+                return match d.try_lock() {
+                    Ok(drv) => Self::check_stopped_torque_off_with_driver(&self.config, drv.as_ref()),
+                    Err(_) => Err(StoppedTorqueOffRefusal::StaleOrMissingFeedback),
+                };
+            }
             return match d.lock() {
                 Ok(drv) => Self::check_stopped_torque_off_with_driver(&self.config, drv.as_ref()),
                 Err(_) => Err(StoppedTorqueOffRefusal::StaleOrMissingFeedback),
             };
         }
+        self.may_disable_torque_while_stopped_driverless()
+    }
+
+    fn may_disable_torque_while_stopped_driverless(&self) -> Result<(), StoppedTorqueOffRefusal> {
         let tol = self.config.rest_pose_tolerance_rad;
         if !tol.is_finite() || tol <= 0.0 {
             return Err(StoppedTorqueOffRefusal::StaleOrMissingFeedback);

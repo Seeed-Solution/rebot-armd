@@ -3206,11 +3206,13 @@ impl<T: Transport> FeetechArmDriver<T> {
     fn execute_disable_writes(&mut self, kind: DisableKind) -> Result<(), ArmDriverError> {
         self.assert_clock_matches_transport();
         self.invalidate_partial_pos_rx();
-        let ids = self.servo_ids.clone();
+        let n = self.servo_ids.len().min(crate::rt_core::mailbox::MAX_DOF);
+        let mut ids = [0u8; crate::rt_core::mailbox::MAX_DOF];
+        ids[..n].copy_from_slice(&self.servo_ids[..n]);
         let mut wrote_any = false;
         let mut refused_err = None;
         let mut write_err = None;
-        for &id in &ids {
+        for &id in &ids[..n] {
             match self.write_torque_off(id, kind) {
                 Ok(()) => wrote_any = true,
                 Err(e @ (ArmDriverError::TorqueOffWouldDrop | ArmDriverError::DisableRequestExpired)) => {
@@ -3228,7 +3230,7 @@ impl<T: Transport> FeetechArmDriver<T> {
                 return Err(e);
             }
         }
-        let _ = self.read_torque_enable_states(&ids);
+        let _ = self.read_torque_enable_states(&ids[..n]);
         if let Some(e) = refused_err.or(write_err) {
             Err(e)
         } else {

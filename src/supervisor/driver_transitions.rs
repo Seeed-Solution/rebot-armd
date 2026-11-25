@@ -1464,24 +1464,63 @@ impl SupervisorInner {
         }
         self.active_disable_kind = Some(kind);
         self.disable_requested();
-        if let Some(ref d) = self.driver {
-            let mut drv = match d.lock() {
-                Ok(g) => g,
-                Err(_) => {
-                    if pending_disable {
-                        self.torque_transition = None;
-                        self.core.begin_transition(Err("FEEDBACK_UNAVAILABLE"));
-                    }
-                    return Err(RequestDisableError {
-                        code: "FEEDBACK_UNAVAILABLE",
-                        message: crate::safety::BoundedText::new("Feedback unavailable"),
-                        refused_by_chokepoint: false,
-                    });
-                }
-            };
+        if self.driver.is_some() {
             if self.rt_executor_owned {
-                let drv_now = drv.clock_now();
-                let res = match drv.begin_disable_torque_budgeted(kind, 0) {
+                let outcome = {
+                    let d = self.driver.as_ref().expect("checked is_some");
+                    match d.try_lock() {
+                        Ok(mut drv) => {
+                            let drv_now = drv.clock_now();
+                            let res = drv.begin_disable_torque_budgeted(kind, 0);
+                            let post_now = drv.clock_now();
+                            let frames_dispatched = drv.disable_frames_dispatched();
+                            let mut ages_buf = std::mem::take(&mut self.scratch.ages);
+                            let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
+                            let snap = OwnerDriverSnapshot::capture_from_driver(
+                                drv.as_ref(),
+                                self.config.dof,
+                                self.feedback_numeric_valid,
+                                &self.measured_positions,
+                                &mut ages_buf,
+                                &mut bounds_buf,
+                            );
+                            self.scratch.ages = ages_buf;
+                            self.scratch.fb.bounds = bounds_buf;
+                            Ok((res, drv_now, post_now, frames_dispatched, snap))
+                        }
+                        Err(std::sync::TryLockError::WouldBlock) => Err(true),
+                        Err(std::sync::TryLockError::Poisoned(_)) => Err(false),
+                    }
+                };
+                let (res, drv_now, post_now, frames_dispatched, snap) = match outcome {
+                    Ok(v) => {
+                        self.reset_disable_lock_contention();
+                        v
+                    }
+                    Err(true) => {
+                        self.record_disable_lock_contention();
+                        if pending_disable {
+                            self.torque_transition = Some(TorqueTransition::Disable { kind });
+                        }
+                        return Err(RequestDisableError {
+                            code: "DRIVER_BUSY",
+                            message: crate::safety::BoundedText::new("Driver mutex contended on RT disable"),
+                            refused_by_chokepoint: false,
+                        });
+                    }
+                    Err(false) => {
+                        if pending_disable {
+                            self.torque_transition = None;
+                            self.core.begin_transition(Err("FEEDBACK_UNAVAILABLE"));
+                        }
+                        return Err(RequestDisableError {
+                            code: "FEEDBACK_UNAVAILABLE",
+                            message: crate::safety::BoundedText::new("Feedback unavailable"),
+                            refused_by_chokepoint: false,
+                        });
+                    }
+                };
+                let res = match res {
                     Ok(p) => p,
                     Err(e) => {
                         let refused = matches!(
@@ -1492,8 +1531,6 @@ impl SupervisorInner {
                         let mut message = crate::safety::BoundedText::empty();
                         message.push_str("Torque disable transmission failed: ");
                         e.write_bounded(&mut message);
-                        let post_now = drv.clock_now();
-                        drop(drv);
                         let code = if pending_disable {
                             self.torque_transition = None;
                             if !refused {
@@ -1522,21 +1559,8 @@ impl SupervisorInner {
                         });
                     }
                 };
+                self.owner_driver_snapshot = snap;
                 let done_now = matches!(res, crate::driver::TorqueProgress::Done(_));
-                let frames_dispatched = drv.disable_frames_dispatched();
-                let mut ages_buf = std::mem::take(&mut self.scratch.ages);
-                let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
-                self.owner_driver_snapshot = OwnerDriverSnapshot::capture_from_driver(
-                    drv.as_ref(),
-                    self.config.dof,
-                    self.feedback_numeric_valid,
-                    &self.measured_positions,
-                    &mut ages_buf,
-                    &mut bounds_buf,
-                );
-                self.scratch.ages = ages_buf;
-                self.scratch.fb.bounds = bounds_buf;
-                drop(drv);
                 if done_now {
                     self.disable_accepted();
                     if pending_disable {
@@ -1556,6 +1580,21 @@ impl SupervisorInner {
                 }
                 return Ok(());
             }
+            let d = self.driver.as_ref().expect("checked is_some");
+            let mut drv = match d.lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    if pending_disable {
+                        self.torque_transition = None;
+                        self.core.begin_transition(Err("FEEDBACK_UNAVAILABLE"));
+                    }
+                    return Err(RequestDisableError {
+                        code: "FEEDBACK_UNAVAILABLE",
+                        message: crate::safety::BoundedText::new("Feedback unavailable"),
+                        refused_by_chokepoint: false,
+                    });
+                }
+            };
             if let Err(e) = drv.disable_torque(kind) {
                 let refused = matches!(
                     e,
@@ -3377,10 +3416,131 @@ impl SupervisorInner {
         self.torque_off_finish_in_place()
     }
 
+    /// Record one contended `driver.try_lock()` skip on an RT disable dispatch or poll path (M4).
+    /// Escalates at `STOPPED_HOLD_CONTENTION_ESCALATE_SKIPS` (25 consecutive skips, 0.5 s at 50 Hz)
+    /// with a counted diagnostic escalation and a non-recoverable `HardwareFault` (zero allocation).
+    pub(crate) fn record_disable_lock_contention(&mut self) {
+        crate::diagnostics::tick::record_disable_lock_contended();
+        self.disable_lock_contended_skips = self.disable_lock_contended_skips.saturating_add(1);
+        if self.disable_lock_contended_skips >= STOPPED_HOLD_CONTENTION_ESCALATE_SKIPS
+            && !self.disable_lock_contended_escalated
+        {
+            self.disable_lock_contended_escalated = true;
+            crate::diagnostics::tick::record_disable_contention_escalation();
+            let skips = self.disable_lock_contended_skips;
+            let detail = crate::safety::FaultDetail::formatted(FaultCode::HardwareFault, |buf| {
+                let _ = core::fmt::write(
+                    buf,
+                    format_args!(
+                        "RT torque-disable path skipped {} consecutive ticks due to driver mutex contention",
+                        skips
+                    ),
+                );
+            });
+            self.safety.latch(crate::safety::FaultKind::Other, detail);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn reset_disable_lock_contention(&mut self) {
+        self.disable_lock_contended_skips = 0;
+        self.disable_lock_contended_escalated = false;
+    }
+
+    /// Zero-allocation, non-blocking RT post-park-settle (`NormalUnload`) torque-off (B3/M4):
+    /// enforces both the K=3 rest-pose gate and static resting-pose check without cloning positions,
+    /// allocating expected-pose vectors, or taking blocking mutexes.
+    pub(super) fn torque_off_after_unload_settle_rt(&mut self) -> Result<(), &'static str> {
+        match self.may_disable_torque_while_stopped_nonblocking() {
+            Err(()) => {
+                self.record_disable_lock_contention();
+                return Err("DRIVER_BUSY");
+            }
+            Ok(Ok(())) => {
+                self.last_stopped_torque_off_refusal = None;
+            }
+            Ok(Err(crate::supervisor::StoppedTorqueOffRefusal::StaleOrMissingFeedback)) => {
+                match self.can_defer_stopped_disable_to_driver_nonblocking() {
+                    Err(()) => {
+                        self.record_disable_lock_contention();
+                        return Err("DRIVER_BUSY");
+                    }
+                    Ok(true) => {
+                        self.last_stopped_torque_off_refusal = None;
+                    }
+                    Ok(false) => {
+                        self.last_stopped_torque_off_refusal =
+                            Some(crate::supervisor::StoppedTorqueOffRefusal::StaleOrMissingFeedback);
+                        return Err("TORQUE_OFF_WOULD_DROP");
+                    }
+                }
+            }
+            Ok(Err(r)) => {
+                self.last_stopped_torque_off_refusal = Some(r);
+                return Err("TORQUE_OFF_WOULD_DROP");
+            }
+        }
+        match self.check_resting_pose_rt(true) {
+            super::RtRestingCheck::AtRest => {}
+            super::RtRestingCheck::OffRest => return Err("ARM_NOT_AT_RESTING_POSE"),
+            super::RtRestingCheck::LockContended => {
+                self.record_disable_lock_contention();
+                return Err("DRIVER_BUSY");
+            }
+        }
+        let started_at = self.driver_clock_now_or(Instant::now());
+        let disable_kind = crate::driver::DisableKind::DisableRequested {
+            started_at,
+            rollback: true,
+        };
+        self.stop_motion();
+        self.commanded_velocities.fill(0.0);
+        if let Err(err) = self.request_disable_bounded(disable_kind) {
+            if !err.refused_by_chokepoint
+                && err.code != "DRIVER_BUSY"
+                && !self.torque_off_stopped()
+            {
+                self.safety.latch(
+                    crate::safety::FaultKind::Other,
+                    crate::safety::FaultDetail::formatted(FaultCode::DriverWriteFailed, |buf| {
+                        buf.push_str(err.message.as_str());
+                    }),
+                );
+            }
+            return Err(err.code);
+        }
+        if !self.disable_pending {
+            self.torque_off_finish_rt()?;
+        }
+        Ok(())
+    }
+
+    /// True when the driver can keep a stopped disable pending inside its 1 s lifetime while an
+    /// exhausted RX drain, incomplete K=3 rest-pose window, or stale/missing evidence on a drained
+    /// bus runs the probe loop (L1/M3). Non-blocking variant for `armd-control` (M4).
+    fn can_defer_stopped_disable_to_driver_nonblocking(&self) -> Result<bool, ()> {
+        let Some(d) = self.driver.as_ref() else {
+            return Ok(false);
+        };
+        match d.try_lock() {
+            Ok(drv) => Ok(drv.supports_budgeted_disable_await()
+                && matches!(
+                    drv.rest_pose_gate_status(),
+                    crate::driver::RestPoseGateStatus::PendingDrainOrWindow
+                        | crate::driver::RestPoseGateStatus::StaleOrMissing
+                )),
+            Err(std::sync::TryLockError::WouldBlock) => Err(()),
+            Err(std::sync::TryLockError::Poisoned(_)) => Ok(false),
+        }
+    }
+
     /// True when the driver can keep a stopped disable pending inside its 1 s lifetime while an
     /// exhausted RX drain, incomplete K=3 rest-pose window, or stale/missing evidence on a drained
     /// bus runs the probe loop (L1/M3). Zero heap allocations.
     fn can_defer_stopped_disable_to_driver(&self) -> bool {
+        if self.rt_executor_owned {
+            return self.can_defer_stopped_disable_to_driver_nonblocking().unwrap_or(false);
+        }
         self.driver.as_ref().is_some_and(|d| {
             d.lock().is_ok_and(|drv| {
                 drv.supports_budgeted_disable_await()
@@ -3416,10 +3576,10 @@ impl SupervisorInner {
         Ok(())
     }
 
-    /// Zero-allocation stopped torque-off gate for RT budgeted transitions (L1): defers to the
-    /// driver's `AwaitRestGate` when the ONLY blocker is an incomplete RX drain or incomplete K=3
-    /// rest-pose window; immediately refuses non-rest poses, missing rest-pose policies, or
-    /// stale/silent buses.
+    /// Zero-allocation, non-blocking stopped torque-off gate for RT budgeted transitions (L1/M3/M4):
+    /// uses `driver.try_lock()` with counted escalation on contention, defers incomplete drains /
+    /// windows / stale-or-missing evidence to `AwaitRestGate`, and refuses off-rest poses with zero
+    /// position clones or expected-pose Vec allocations.
     fn torque_off_check_rt_transition(&mut self) -> Result<(), &'static str> {
         if self.calibration_busy && self.motor_zero_busy {
             return Err("MOTION_BUSY");
@@ -3431,21 +3591,46 @@ impl SupervisorInner {
             return Err("MOTION_BUSY");
         }
         if self.torque_off_stopped() {
-            match self.eval_stopped_torque_off() {
-                Ok(()) => return Ok(()),
-                Err(crate::supervisor::StoppedTorqueOffRefusal::StaleOrMissingFeedback)
-                    if self.can_defer_stopped_disable_to_driver() =>
-                {
+            match self.may_disable_torque_while_stopped_nonblocking() {
+                Err(()) => {
+                    self.record_disable_lock_contention();
+                    return Err("DRIVER_BUSY");
+                }
+                Ok(Ok(())) => {
                     self.last_stopped_torque_off_refusal = None;
                     return Ok(());
                 }
-                Err(_) => return Err("TORQUE_OFF_WOULD_DROP"),
+                Ok(Err(crate::supervisor::StoppedTorqueOffRefusal::StaleOrMissingFeedback)) => {
+                    match self.can_defer_stopped_disable_to_driver_nonblocking() {
+                        Err(()) => {
+                            self.record_disable_lock_contention();
+                            return Err("DRIVER_BUSY");
+                        }
+                        Ok(true) => {
+                            self.last_stopped_torque_off_refusal = None;
+                            return Ok(());
+                        }
+                        Ok(false) => {
+                            self.last_stopped_torque_off_refusal =
+                                Some(crate::supervisor::StoppedTorqueOffRefusal::StaleOrMissingFeedback);
+                            return Err("TORQUE_OFF_WOULD_DROP");
+                        }
+                    }
+                }
+                Ok(Err(r)) => {
+                    self.last_stopped_torque_off_refusal = Some(r);
+                    return Err("TORQUE_OFF_WOULD_DROP");
+                }
             }
         }
-        if self.has_resting_pose_violation_rt(false) {
-            return Err("ARM_NOT_AT_RESTING_POSE");
+        match self.check_resting_pose_rt(false) {
+            super::RtRestingCheck::AtRest => Ok(()),
+            super::RtRestingCheck::OffRest => Err("ARM_NOT_AT_RESTING_POSE"),
+            super::RtRestingCheck::LockContended => {
+                self.record_disable_lock_contention();
+                Err("DRIVER_BUSY")
+            }
         }
-        Ok(())
     }
 
     /// The refusals of a torque off: E-stop / fault (rest-pose gated), not at the resting pose.
@@ -3664,41 +3849,60 @@ impl SupervisorInner {
     ) -> Result<Result<crate::rt_core::ops::TorqueProgress, &'static str>, &'static str> {
         use crate::rt_core::ops::TorqueProgress as Rt;
         self.torque_off_check_rt_transition()?;
-        self.stop_motion();
-        self.commanded_velocities.fill(0.0);
-        self.background_disable_retry = None;
-        let started = match self.driver.as_ref() {
-            None => {
-                self.disable_requested();
-                None
-            }
-            Some(d) => {
-                let (res, requested_at, post_now, disable_kind, frames_dispatched) = {
-                    let mut drv = d.lock().map_err(|_| "FEEDBACK_UNAVAILABLE")?;
-                    let requested_at = drv.clock_now();
-                    let disable_kind = crate::driver::DisableKind::DisableRequested {
-                        started_at: requested_at,
-                        rollback: false,
-                    };
-                    let res = drv.begin_disable_torque_budgeted(disable_kind, 0);
-                    let frames_dispatched = drv.disable_frames_dispatched();
-                    let post_now = drv.clock_now();
-                    let mut ages_buf = std::mem::take(&mut self.scratch.ages);
-                    let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
-                    self.owner_driver_snapshot = OwnerDriverSnapshot::capture_from_driver(
-                        drv.as_ref(),
-                        self.config.dof,
-                        self.feedback_numeric_valid,
-                        &self.measured_positions,
-                        &mut ages_buf,
-                        &mut bounds_buf,
-                    );
-                    self.scratch.ages = ages_buf;
-                    self.scratch.fb.bounds = bounds_buf;
-                    (res, requested_at, post_now, disable_kind, frames_dispatched)
-                };
-                self.disable_requested_at(requested_at);
-                Some((res, post_now, disable_kind, frames_dispatched))
+        let started = if self.driver.is_none() {
+            self.stop_motion();
+            self.commanded_velocities.fill(0.0);
+            self.background_disable_retry = None;
+            self.disable_requested();
+            None
+        } else {
+            let locked = {
+                let d = self.driver.as_ref().expect("checked is_some");
+                match d.try_lock() {
+                    Ok(mut drv) => {
+                        let requested_at = drv.clock_now();
+                        let disable_kind = crate::driver::DisableKind::DisableRequested {
+                            started_at: requested_at,
+                            rollback: false,
+                        };
+                        let res = drv.begin_disable_torque_budgeted(disable_kind, 0);
+                        let frames_dispatched = drv.disable_frames_dispatched();
+                        let post_now = drv.clock_now();
+                        let mut ages_buf = std::mem::take(&mut self.scratch.ages);
+                        let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
+                        let snap = OwnerDriverSnapshot::capture_from_driver(
+                            drv.as_ref(),
+                            self.config.dof,
+                            self.feedback_numeric_valid,
+                            &self.measured_positions,
+                            &mut ages_buf,
+                            &mut bounds_buf,
+                        );
+                        self.scratch.ages = ages_buf;
+                        self.scratch.fb.bounds = bounds_buf;
+                        Ok((res, requested_at, post_now, disable_kind, frames_dispatched, snap))
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => Err(true),
+                    Err(std::sync::TryLockError::Poisoned(_)) => Err(false),
+                }
+            };
+            match locked {
+                Ok((res, requested_at, post_now, disable_kind, frames_dispatched, snap)) => {
+                    self.reset_disable_lock_contention();
+                    self.owner_driver_snapshot = snap;
+                    self.stop_motion();
+                    self.commanded_velocities.fill(0.0);
+                    self.background_disable_retry = None;
+                    self.disable_requested_at(requested_at);
+                    Some((res, post_now, disable_kind, frames_dispatched))
+                }
+                Err(true) => {
+                    self.record_disable_lock_contention();
+                    return Err("DRIVER_BUSY");
+                }
+                Err(false) => {
+                    return Err("FEEDBACK_UNAVAILABLE");
+                }
             }
         };
         if let Some((_, _, disable_kind, _)) = started {
@@ -3785,127 +3989,183 @@ impl SupervisorInner {
         if !self.disable_pending || self.torque_transition.is_some() {
             return None;
         }
-        let d = self.driver.as_ref()?;
-        let mut drv = d.lock().ok()?;
-        if self.control_release_seq > 0 {
-            drv.begin_control_release(self.control_release_seq);
+        if self.driver.is_none() {
+            return None;
         }
         if matches!(
             self.background_disable_retry,
             Some(BackgroundDisableRetry::Exhausted)
         ) {
-            drop(drv);
             return None;
         }
-        let drv_now = drv.clock_now();
         let span = budget.deadline.saturating_duration_since(budget.now);
-
-        if drv.torque_transition_pending() {
-            let poll_res = drv.poll_torque_budgeted(drv_now + span, budget.max_rx_frames);
-            let rx = drv.take_last_poll_rx();
-            let post_now = drv.clock_now();
-            let mut ages_buf = std::mem::take(&mut self.scratch.ages);
-            let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
-            self.owner_driver_snapshot = OwnerDriverSnapshot::capture_from_driver(
-                drv.as_ref(),
-                self.config.dof,
-                self.feedback_numeric_valid,
-                &self.measured_positions,
-                &mut ages_buf,
-                &mut bounds_buf,
-            );
-            self.scratch.ages = ages_buf;
-            self.scratch.fb.bounds = bounds_buf;
-            let still_pending = drv.torque_transition_pending();
-            let frames_dispatched = drv.disable_frames_dispatched();
-            drop(drv);
-            match poll_res {
-                Ok(crate::driver::TorqueProgress::Done(_)) => {
-                    self.disable_accepted();
-                    let _ = self.torque_off_finish_rt();
-                }
-                Err(
-                    crate::driver::ArmDriverError::TorqueOffWouldDrop
-                    | crate::driver::ArmDriverError::DisableRequestExpired,
-                ) => {
-                    self.disable_pending = false;
-                    self.active_disable_kind = None;
-                    self.last_disable_attempt = None;
-                    self.background_disable_retry = None;
-                }
-                Ok(crate::driver::TorqueProgress::Pending { .. }) => {
-                    if frames_dispatched {
-                        self.disable_first_frame_accepted();
+        let control_release_seq = self.control_release_seq;
+        // Probe / poll phase under non-blocking try_lock (M4).
+        enum BgPollStep {
+            Contended,
+            Poisoned,
+            Polled {
+                poll_res: Result<crate::driver::TorqueProgress, crate::driver::ArmDriverError>,
+                rx: Option<(u16, bool)>,
+                post_now: Instant,
+                still_pending: bool,
+                frames_dispatched: bool,
+                snap: OwnerDriverSnapshot,
+            },
+            Idle {
+                drv_now: Instant,
+            },
+        }
+        let step = {
+            let d = self.driver.as_ref().expect("checked is_some");
+            match d.try_lock() {
+                Err(std::sync::TryLockError::WouldBlock) => BgPollStep::Contended,
+                Err(std::sync::TryLockError::Poisoned(_)) => BgPollStep::Poisoned,
+                Ok(mut drv) => {
+                    if control_release_seq > 0 {
+                        drv.begin_control_release(control_release_seq);
                     }
-                    if let Some(BackgroundDisableRetry::Active {
-                        kind,
-                        started_at,
-                        ..
-                    }) = self.background_disable_retry
-                    {
-                        let window = self.background_disable_window_for(kind);
-                        if post_now.saturating_duration_since(started_at) >= window {
-                            if matches!(kind, crate::driver::DisableKind::DisableRequested { .. })
-                                && self.torque_off_stopped()
-                            {
-                                self.disable_pending = false;
-                                self.active_disable_kind = None;
-                                self.last_disable_attempt = None;
-                                self.background_disable_retry = None;
-                            } else {
-                                self.exhaust_background_disable_retry();
-                            }
+                    let drv_now = drv.clock_now();
+                    if drv.torque_transition_pending() {
+                        let poll_res = drv.poll_torque_budgeted(drv_now + span, budget.max_rx_frames);
+                        let rx = drv.take_last_poll_rx();
+                        let post_now = drv.clock_now();
+                        let mut ages_buf = std::mem::take(&mut self.scratch.ages);
+                        let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
+                        let snap = OwnerDriverSnapshot::capture_from_driver(
+                            drv.as_ref(),
+                            self.config.dof,
+                            self.feedback_numeric_valid,
+                            &self.measured_positions,
+                            &mut ages_buf,
+                            &mut bounds_buf,
+                        );
+                        self.scratch.ages = ages_buf;
+                        self.scratch.fb.bounds = bounds_buf;
+                        let still_pending = drv.torque_transition_pending();
+                        let frames_dispatched = drv.disable_frames_dispatched();
+                        BgPollStep::Polled {
+                            poll_res,
+                            rx,
+                            post_now,
+                            still_pending,
+                            frames_dispatched,
+                            snap,
                         }
-                    }
-                }
-                Err(_) => {
-                    match self.background_disable_retry {
-                        Some(BackgroundDisableRetry::Active {
-                            attempts,
-                            kind,
-                            started_at,
-                            ..
-                        }) => {
-                            let window = self.background_disable_window_for(kind);
-                            let window_expired =
-                                post_now.saturating_duration_since(started_at) >= window;
-                            if window_expired
-                                && matches!(kind, crate::driver::DisableKind::DisableRequested { .. })
-                                && self.torque_off_stopped()
-                            {
-                                self.disable_pending = false;
-                                self.active_disable_kind = None;
-                                self.last_disable_attempt = None;
-                                self.background_disable_retry = None;
-                            } else if window_expired
-                                || (!still_pending && attempts >= BACKGROUND_DISABLE_MAX_RETRIES)
-                            {
-                                self.exhaust_background_disable_retry();
-                            } else if !still_pending {
-                                self.background_disable_retry =
-                                    Some(BackgroundDisableRetry::Active {
-                                        attempts,
-                                        kind,
-                                        started_at,
-                                        next_retry_at: post_now + BACKGROUND_DISABLE_RETRY_INTERVAL,
-                                    });
-                            }
-                        }
-                        Some(BackgroundDisableRetry::Exhausted) => {}
-                        None => {
-                            let kind = self.active_disable_kind.unwrap_or(
-                                crate::driver::DisableKind::DisableRequested {
-                                    started_at: post_now,
-                                    rollback: false,
-                                },
-                            );
-                            let _ = self.arm_background_disable_retry_with_kind(kind, post_now);
-                        }
+                    } else {
+                        BgPollStep::Idle { drv_now }
                     }
                 }
             }
-            return rx;
-        }
+        };
+        let drv_now = match step {
+            BgPollStep::Contended => {
+                self.record_disable_lock_contention();
+                return None;
+            }
+            BgPollStep::Poisoned => return None,
+            BgPollStep::Polled {
+                poll_res,
+                rx,
+                post_now,
+                still_pending,
+                frames_dispatched,
+                snap,
+            } => {
+                self.reset_disable_lock_contention();
+                self.owner_driver_snapshot = snap;
+                match poll_res {
+                    Ok(crate::driver::TorqueProgress::Done(_)) => {
+                        self.disable_accepted();
+                        let _ = self.torque_off_finish_rt();
+                    }
+                    Err(
+                        crate::driver::ArmDriverError::TorqueOffWouldDrop
+                        | crate::driver::ArmDriverError::DisableRequestExpired,
+                    ) => {
+                        self.disable_pending = false;
+                        self.active_disable_kind = None;
+                        self.last_disable_attempt = None;
+                        self.background_disable_retry = None;
+                    }
+                    Ok(crate::driver::TorqueProgress::Pending { .. }) => {
+                        if frames_dispatched {
+                            self.disable_first_frame_accepted();
+                        }
+                        if let Some(BackgroundDisableRetry::Active {
+                            kind,
+                            started_at,
+                            ..
+                        }) = self.background_disable_retry
+                        {
+                            let window = self.background_disable_window_for(kind);
+                            if post_now.saturating_duration_since(started_at) >= window {
+                                if matches!(kind, crate::driver::DisableKind::DisableRequested { .. })
+                                    && self.torque_off_stopped()
+                                {
+                                    self.disable_pending = false;
+                                    self.active_disable_kind = None;
+                                    self.last_disable_attempt = None;
+                                    self.background_disable_retry = None;
+                                } else {
+                                    self.exhaust_background_disable_retry();
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        match self.background_disable_retry {
+                            Some(BackgroundDisableRetry::Active {
+                                attempts,
+                                kind,
+                                started_at,
+                                ..
+                            }) => {
+                                let window = self.background_disable_window_for(kind);
+                                let window_expired =
+                                    post_now.saturating_duration_since(started_at) >= window;
+                                if window_expired
+                                    && matches!(kind, crate::driver::DisableKind::DisableRequested { .. })
+                                    && self.torque_off_stopped()
+                                {
+                                    self.disable_pending = false;
+                                    self.active_disable_kind = None;
+                                    self.last_disable_attempt = None;
+                                    self.background_disable_retry = None;
+                                } else if window_expired
+                                    || (!still_pending && attempts >= BACKGROUND_DISABLE_MAX_RETRIES)
+                                {
+                                    self.exhaust_background_disable_retry();
+                                } else if !still_pending {
+                                    self.background_disable_retry =
+                                        Some(BackgroundDisableRetry::Active {
+                                            attempts,
+                                            kind,
+                                            started_at,
+                                            next_retry_at: post_now + BACKGROUND_DISABLE_RETRY_INTERVAL,
+                                        });
+                                }
+                            }
+                            Some(BackgroundDisableRetry::Exhausted) => {}
+                            None => {
+                                let kind = self.active_disable_kind.unwrap_or(
+                                    crate::driver::DisableKind::DisableRequested {
+                                        started_at: post_now,
+                                        rollback: false,
+                                    },
+                                );
+                                let _ = self.arm_background_disable_retry_with_kind(kind, post_now);
+                            }
+                        }
+                    }
+                }
+                return rx;
+            }
+            BgPollStep::Idle { drv_now } => {
+                self.reset_disable_lock_contention();
+                drv_now
+            }
+        };
 
         let Some(BackgroundDisableRetry::Active {
             attempts,
@@ -3914,7 +4174,6 @@ impl SupervisorInner {
             next_retry_at,
         }) = self.background_disable_retry
         else {
-            drop(drv);
             return None;
         };
         let window = self.background_disable_window_for(kind);
@@ -3923,7 +4182,6 @@ impl SupervisorInner {
             && matches!(kind, crate::driver::DisableKind::DisableRequested { .. })
             && self.torque_off_stopped()
         {
-            drop(drv);
             self.disable_pending = false;
             self.active_disable_kind = None;
             self.last_disable_attempt = None;
@@ -3931,32 +4189,51 @@ impl SupervisorInner {
             return None;
         }
         if attempts >= BACKGROUND_DISABLE_MAX_RETRIES || window_expired {
-            drop(drv);
             self.exhaust_background_disable_retry();
             return None;
         }
         if drv_now < next_retry_at {
-            drop(drv);
             return None;
         }
 
-        let res = drv.begin_disable_torque_budgeted(kind, 0);
-        let handshake_pending = drv.torque_transition_pending();
-        let frames_dispatched = drv.disable_frames_dispatched();
-        let post_now = drv.clock_now();
-        let mut ages_buf = std::mem::take(&mut self.scratch.ages);
-        let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
-        self.owner_driver_snapshot = OwnerDriverSnapshot::capture_from_driver(
-            drv.as_ref(),
-            self.config.dof,
-            self.feedback_numeric_valid,
-            &self.measured_positions,
-            &mut ages_buf,
-            &mut bounds_buf,
-        );
-        self.scratch.ages = ages_buf;
-        self.scratch.fb.bounds = bounds_buf;
-        drop(drv);
+        let retry_out = {
+            let d = self.driver.as_ref().expect("checked is_some");
+            match d.try_lock() {
+                Err(std::sync::TryLockError::WouldBlock) => Err(true),
+                Err(std::sync::TryLockError::Poisoned(_)) => Err(false),
+                Ok(mut drv) => {
+                    let res = drv.begin_disable_torque_budgeted(kind, 0);
+                    let handshake_pending = drv.torque_transition_pending();
+                    let frames_dispatched = drv.disable_frames_dispatched();
+                    let post_now = drv.clock_now();
+                    let mut ages_buf = std::mem::take(&mut self.scratch.ages);
+                    let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
+                    let snap = OwnerDriverSnapshot::capture_from_driver(
+                        drv.as_ref(),
+                        self.config.dof,
+                        self.feedback_numeric_valid,
+                        &self.measured_positions,
+                        &mut ages_buf,
+                        &mut bounds_buf,
+                    );
+                    self.scratch.ages = ages_buf;
+                    self.scratch.fb.bounds = bounds_buf;
+                    Ok((res, handshake_pending, frames_dispatched, post_now, snap))
+                }
+            }
+        };
+        let (res, handshake_pending, frames_dispatched, post_now, snap) = match retry_out {
+            Ok(v) => {
+                self.reset_disable_lock_contention();
+                v
+            }
+            Err(true) => {
+                self.record_disable_lock_contention();
+                return None;
+            }
+            Err(false) => return None,
+        };
+        self.owner_driver_snapshot = snap;
 
         match res {
             Ok(crate::driver::TorqueProgress::Done(_)) => {
@@ -4027,35 +4304,60 @@ impl SupervisorInner {
                 Some(TransitionPoll { progress, rx })
             }
             TorqueTransition::Disable { kind } => {
-                let Some(d) = self.driver.as_ref() else {
+                if self.driver.is_none() {
                     return Some(TransitionPoll { progress: Err("INTERNAL"), rx: None });
-                };
-                let Ok(mut drv) = d.lock() else {
-                    return Some(TransitionPoll { progress: Err("FEEDBACK_UNAVAILABLE"), rx: None });
-                };
-                if self.control_release_seq > 0 {
-                    drv.begin_control_release(self.control_release_seq);
                 }
-                let drv_now = drv.clock_now();
                 let span = budget.deadline.saturating_duration_since(budget.now);
+                let control_release_seq = self.control_release_seq;
+                let poll_out = {
+                    let d = self.driver.as_ref().expect("checked is_some");
+                    match d.try_lock() {
+                        Err(std::sync::TryLockError::WouldBlock) => Err(true),
+                        Err(std::sync::TryLockError::Poisoned(_)) => Err(false),
+                        Ok(mut drv) => {
+                            if control_release_seq > 0 {
+                                drv.begin_control_release(control_release_seq);
+                            }
+                            let drv_now = drv.clock_now();
+                            let r = drv.poll_torque_budgeted(drv_now + span, budget.max_rx_frames);
+                            let frames_dispatched = drv.disable_frames_dispatched();
+                            let rx = drv.take_last_poll_rx();
+                            let post_now = drv.clock_now();
+                            let mut ages_buf = std::mem::take(&mut self.scratch.ages);
+                            let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
+                            let snap = OwnerDriverSnapshot::capture_from_driver(
+                                drv.as_ref(),
+                                self.config.dof,
+                                self.feedback_numeric_valid,
+                                &self.measured_positions,
+                                &mut ages_buf,
+                                &mut bounds_buf,
+                            );
+                            self.scratch.ages = ages_buf;
+                            self.scratch.fb.bounds = bounds_buf;
+                            Ok((drv_now, r, frames_dispatched, rx, post_now, snap))
+                        }
+                    }
+                };
+                let (drv_now, r, frames_dispatched, rx, post_now, snap) = match poll_out {
+                    Ok(v) => {
+                        self.reset_disable_lock_contention();
+                        v
+                    }
+                    Err(true) => {
+                        self.torque_transition = Some(TorqueTransition::Disable { kind });
+                        self.record_disable_lock_contention();
+                        return Some(TransitionPoll {
+                            progress: Ok(Rt::Pending { wake: budget.now }),
+                            rx: None,
+                        });
+                    }
+                    Err(false) => {
+                        return Some(TransitionPoll { progress: Err("FEEDBACK_UNAVAILABLE"), rx: None });
+                    }
+                };
+                self.owner_driver_snapshot = snap;
                 let to_exec = |wake: Instant| budget.now + wake.saturating_duration_since(drv_now);
-                let r = drv.poll_torque_budgeted(drv_now + span, budget.max_rx_frames);
-                let frames_dispatched = drv.disable_frames_dispatched();
-                let rx = drv.take_last_poll_rx();
-                let post_now = drv.clock_now();
-                let mut ages_buf = std::mem::take(&mut self.scratch.ages);
-                let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
-                self.owner_driver_snapshot = OwnerDriverSnapshot::capture_from_driver(
-                    drv.as_ref(),
-                    self.config.dof,
-                    self.feedback_numeric_valid,
-                    &self.measured_positions,
-                    &mut ages_buf,
-                    &mut bounds_buf,
-                );
-                self.scratch.ages = ages_buf;
-                self.scratch.fb.bounds = bounds_buf;
-                drop(drv);
                 match r {
                     Ok(Drv::Pending { wake }) => {
                         if frames_dispatched {
