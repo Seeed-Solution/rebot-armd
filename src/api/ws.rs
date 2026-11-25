@@ -2028,6 +2028,12 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         if sink_tracker.is_abandoned(action.0) {
                             return DeliveryDecision::Abandoned;
                         }
+                        // Preserve exact chronological order on this socket: flush any queued
+                        // observer terminals with `id < action.0` onto `ordinary_out_tx` BEFORE
+                        // enqueuing this owner-routed terminal.
+                        if !sink_sup.flush_observer_terminals_before(action.0) {
+                            return DeliveryDecision::Backpressured;
+                        }
                         let mut obs = match sink_sup.hub().latest() {
                             Some(s) => s.obs.clone(),
                             None => return DeliveryDecision::Backpressured,
@@ -2358,6 +2364,11 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             continue;
                         }
                         let is_control_msg = val.get("type").is_some();
+                        let acked_action_id = if val.get("type").and_then(Value::as_str) == Some("command_ack") {
+                            val.get("action_id").and_then(Value::as_u64)
+                        } else {
+                            None
+                        };
                         let granted_gen = if val.get("type").and_then(Value::as_str) == Some("lease_granted") {
                             val.get("generation").and_then(Value::as_u64)
                         } else {
@@ -2377,6 +2388,10 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                 ).await;
                             }
                             break;
+                        }
+                        if let Some(aid) = acked_action_id {
+                            // Wire ACK write has succeeded: release telemetry/lag-resync visibility for `aid`.
+                            writer_ack_tracker.mark_wire_ack_written(aid);
                         }
                         if let Some(g) = granted_gen {
                             max_granted_gen = max_granted_gen.max(g);
@@ -2733,6 +2748,9 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         &worker_ack_tracker,
                     ).await else { break; };
                     if reply.get("type").and_then(Value::as_str) == Some("command_ack") {
+                        if let Some(aid) = reply.get("action_id").and_then(Value::as_u64) {
+                            worker_ack_tracker.mark_ack_queued_for_wire(aid);
+                        }
                         let delay_ms = TEST_DEFERRED_ACK_DELAY_MS.load(Ordering::Relaxed);
                         if delay_ms > 0 {
                             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -2950,12 +2968,15 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                 gate,
                                 ack_guard,
                             } => {
-                                if gate.is_some()
-                                    && reply.get("type").and_then(Value::as_str) == Some("command_ack")
-                                {
-                                    let delay_ms = TEST_DEFERRED_ACK_DELAY_MS.load(Ordering::Relaxed);
-                                    if delay_ms > 0 {
-                                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                if reply.get("type").and_then(Value::as_str) == Some("command_ack") {
+                                    if let Some(aid) = reply.get("action_id").and_then(Value::as_u64) {
+                                        worker_ack_tracker.mark_ack_queued_for_wire(aid);
+                                    }
+                                    if gate.is_some() {
+                                        let delay_ms = TEST_DEFERRED_ACK_DELAY_MS.load(Ordering::Relaxed);
+                                        if delay_ms > 0 {
+                                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                        }
                                     }
                                 }
                                 let sent = worker_writer.send_ordinary_control(reply).await;

@@ -276,7 +276,7 @@ async fn pf1_mock_ws_replay_success_reject_cancel_stop_and_handover() {
         gen_ctrl,
         ep,
         "/api/v1/action/move_relative",
-        json!({"delta": [-0.02, 0.0, 0.0], "speed_scale": 1.0}),
+        json!({"delta": [-0.02, 0.0, 0.0], "frame": "base", "speed_scale": 1.0}),
     )
     .await;
     req_id += 1;
@@ -364,6 +364,14 @@ async fn pf1_mock_ws_replay_success_reject_cancel_stop_and_handover() {
 
     // Also prove grasp (both dry_run AND live admission!) + calib_hover + measure_multiview over WS
     // route through executor admission (never 503 EXECUTOR_ROUTING_PENDING) with exact error codes.
+    let grasp_body = json!({
+        "label": "cube",
+        "box_norm": [0.46, 0.86, 0.54, 0.94],
+        "strategy": "legacy",
+        "retreat": false
+    });
+    let mut grasp_dry_body = grasp_body.clone();
+    grasp_dry_body["dry_run"] = json!(true);
     let grasp_dry = ws_reply(
         &mut ws_ctrl,
         json!({
@@ -372,27 +380,23 @@ async fn pf1_mock_ws_replay_success_reject_cancel_stop_and_handover() {
             "generation": gen_ctrl,
             "epoch_id": ep,
             "path": "/api/v1/action/grasp",
-            "body": {"position": [tcp0[0], tcp0[1], tcp0[2]], "dry_run": true}
+            "body": grasp_dry_body
         }),
         &["command_ack"],
     )
     .await;
     req_id += 1;
-    assert_eq!(grasp_dry["status"], "dry_run", "{grasp_dry}");
-    assert!(grasp_dry.get("reachable").is_some(), "{grasp_dry}");
+    assert_eq!(grasp_dry["status"], "accepted", "{grasp_dry}");
+    assert_eq!(grasp_dry["reachable"], json!(true), "{grasp_dry}");
 
-    // Live (non-dry-run) WS grasp reaching executor admission -> ACK strictly before terminal!
+    // Live (non-dry-run) WS adaptive grasp reaching executor admission -> ACK strictly before terminal!
     let (ack_grasp, term_grasp) = send_cmd_and_expect_ack_before_terminal(
         &mut ws_ctrl,
         req_id,
         gen_ctrl,
         ep,
         "/api/v1/action/grasp",
-        json!({
-            "position": [tcp0[0] + 0.02, tcp0[1], tcp0[2]],
-            "approach_height_m": 0.02,
-            "retreat": false
-        }),
+        grasp_body,
     )
     .await;
     req_id += 1;
@@ -1170,6 +1174,21 @@ async fn pf1_races_concurrent_pump_order_mapping_reentry_and_malformed_recovery(
     tracker.redact_obs(&mut obs);
     assert!(obs.action.is_none(), "resolved abandoned id 53 stays redacted");
     assert!(obs.previous_action.is_some(), "unrelated id 54 becomes visible once resolved");
+
+    // Queued wire ACK (`unwritten_wire_acks`) keeps hiding terminal even AFTER `leave_ack_barrier()`
+    // until `writer_task` itself finishes writing `command_ack` to the wire (R2-B1)!
+    tracker.enter_ack_barrier(60);
+    tracker.mark_ack_queued_for_wire(61);
+    tracker.leave_ack_barrier();
+    obs.action = Some(mk_term(61));
+    obs.previous_action = Some(mk_term(61));
+    tracker.redact_obs(&mut obs);
+    assert!(obs.action.is_none(), "queued unwritten ACK must redact obs.action even after barrier drop");
+    assert!(obs.previous_action.is_none(), "queued unwritten ACK must redact obs.previous_action");
+    tracker.mark_wire_ack_written(61);
+    obs.action = Some(mk_term(61));
+    tracker.redact_obs(&mut obs);
+    assert!(obs.action.is_some(), "after writer writes ACK, terminal becomes visible");
 
     // Verify Broker::try_poll recovers reservations on early Terminal & malformed Ack{action:None}.
     {
@@ -2008,6 +2027,12 @@ async fn pf1_reentry_shutdown_emergency_teardown_and_open_rollback() {
         );
         release.store(true, Ordering::Release);
         pump_thr.join().unwrap();
+        // Wait boundedly for whichever thread (`pump_thr` or `armd-dispatch`) owned the callback
+        // to complete `reconcile_in_flight` and release the in-flight reservation credit.
+        let rec_dl = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < rec_dl && handle.reply_router_stats().global_reserved != 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         assert_eq!(handle.reply_router_stats().global_reserved, 0);
     }
 
@@ -2117,16 +2142,21 @@ async fn pf1_reentry_shutdown_emergency_teardown_and_open_rollback() {
         wait_pub_ready(&sup).await;
 
         sup.register_ws_connection(901).await.unwrap();
-        let cb_invoked = Arc::new(AtomicBool::new(false));
-        let invoked = Arc::clone(&cb_invoked);
+        let caller_tid = std::thread::current().id();
+        let in_emergency = Arc::new(AtomicBool::new(false));
+        let cb_invoked_on_emergency_caller = Arc::new(AtomicBool::new(false));
+        let em_flag = Arc::clone(&in_emergency);
+        let invoked = Arc::clone(&cb_invoked_on_emergency_caller);
         handle
             .register_connection_reply_sink(
                 ClientId(901),
                 Arc::new(move |_, _| {
-                    invoked.store(true, Ordering::Release);
-                    // Would stall forever if emergency teardown entered this callback!
-                    std::thread::sleep(Duration::from_secs(30));
-                    DeliveryDecision::Delivered
+                    if em_flag.load(Ordering::Acquire) && std::thread::current().id() == caller_tid {
+                        invoked.store(true, Ordering::Release);
+                        std::thread::sleep(Duration::from_secs(5));
+                    }
+                    // Keep terminal queued in `slot.pending` while releasing `SerialDrainGate`!
+                    DeliveryDecision::Backpressured
                 }),
                 Some(4),
             )
@@ -2169,9 +2199,17 @@ async fn pf1_reentry_shutdown_emergency_teardown_and_open_rollback() {
                 ActionSubmit::FinishMacro(FinishMacroSpec::done(aid, handle.boot())),
             )
             .unwrap();
-        // Wait briefly so RT emits the Terminal into the broker ring while drain gate is IDLE.
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        // Wait until the Terminal is queued in `slot.pending` and `SerialDrainGate` is IDLE!
+        let q_dl = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < q_dl
+            && handle.reply_router_stats().pending_external_deliveries == 0
+        {
+            handle.pump_broker_replies();
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(handle.reply_router_stats().pending_external_deliveries, 1);
 
+        in_emergency.store(true, Ordering::Release);
         let t0 = Instant::now();
         let _ = handle.emergency_disable_and_join();
         let elapsed = t0.elapsed();
@@ -2180,9 +2218,13 @@ async fn pf1_reentry_shutdown_emergency_teardown_and_open_rollback() {
             "emergency teardown with idle gate must stay bounded, took {elapsed:?}"
         );
         assert!(
-            !cb_invoked.load(Ordering::Acquire),
-            "emergency teardown MUST NOT invoke sink callbacks"
+            !cb_invoked_on_emergency_caller.load(Ordering::Acquire),
+            "emergency teardown MUST NOT invoke sink callbacks on the emergency caller"
         );
+        let rec_dl = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < rec_dl && handle.reply_router_stats().global_reserved != 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         assert_eq!(handle.reply_router_stats().global_reserved, 0);
     }
 
@@ -2285,11 +2327,15 @@ async fn pf1_reentry_shutdown_emergency_teardown_and_open_rollback() {
 
         // Major 1: panicking sink callback releases SerialDrainGate and recovers credits!
         sup.register_ws_connection(952).await.unwrap();
+        let panic_caller_tid = std::thread::current().id();
         handle
             .register_connection_reply_sink(
                 ClientId(952),
-                Arc::new(|_, r| {
+                Arc::new(move |_, r| {
                     if matches!(r, Reply::Terminal { .. }) {
+                        if std::thread::current().id() != panic_caller_tid {
+                            return DeliveryDecision::Backpressured;
+                        }
                         panic!("simulated sink callback panic");
                     }
                     DeliveryDecision::Delivered
@@ -2350,6 +2396,116 @@ async fn pf1_reentry_shutdown_emergency_teardown_and_open_rollback() {
         // Gate MUST NOT be wedged and reservation credits MUST have been recovered!
         let _ = handle.pump_broker_replies();
         assert_eq!(handle.reply_router_stats().global_reserved, 0);
+        handle.stop_and_join();
+    }
+
+    // Part G (R2-B2): Sink calls stop_and_join() re-entrantly, returns Backpressured, then panics
+    // when deferred normal shutdown retries the callback -> SerialDrainGuard unwinds cleanly,
+    // completes callback-free deferred retirement, releases the gate, and does not wedge!
+    {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig {
+            collision: None,
+            lease_timeout_ms: 600_000,
+            ..ArmConfig::rebot_dm()
+        }));
+        sup.set_lease_enabled(false).await;
+        {
+            let mut inner = sup.inner().write().await;
+            inner.commanded_positions = INSPECT.to_vec();
+            inner.measured_positions = INSPECT.to_vec();
+            inner.target_positions = INSPECT.to_vec();
+            let s = inner.current_admission_stamp();
+            let a = inner.check_admission(s).unwrap();
+            SupervisorInner::enable_torque(a).unwrap();
+            inner.tick(0.02);
+        }
+        let handle = sup
+            .start_executor(ExecutorConfig::for_tests(Duration::from_millis(5)))
+            .await
+            .unwrap();
+        wait_pub_ready(&sup).await;
+
+        sup.register_ws_connection(961).await.unwrap();
+        let g_caller_tid = std::thread::current().id();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_cb = Arc::clone(&calls);
+        let h_cb = handle.clone();
+        handle
+            .register_connection_reply_sink(
+                ClientId(961),
+                Arc::new(move |_, r| {
+                    if matches!(r, Reply::Terminal { .. }) {
+                        if std::thread::current().id() != g_caller_tid {
+                            return DeliveryDecision::Backpressured;
+                        }
+                        let n = calls_cb.fetch_add(1, Ordering::SeqCst);
+                        if n == 0 {
+                            h_cb.stop_and_join();
+                            return DeliveryDecision::Backpressured;
+                        }
+                        panic!("simulated panic during deferred normal shutdown retry");
+                    }
+                    DeliveryDecision::Delivered
+                }),
+                Some(4),
+            )
+            .unwrap();
+
+        let mut adm = sup.capture_admission_stamp();
+        adm.connection_id = 961;
+        let snap = ActionSnapshot::capture(&sup, adm, Instant::now() + DEFAULT_ACTION_DEADLINE)
+            .await
+            .unwrap();
+        let mut spec = BeginMacroSpec::new(MacroKind::Place, handle.boot());
+        spec.admission_request_id = adm.request_id;
+        let (_, mut rx, _g) = handle
+            .submit_external_action(
+                ClientId(961),
+                1,
+                snap.owner.authority,
+                Instant::now() + DEFAULT_ACTION_DEADLINE,
+                ActionSubmit::BeginMacro(spec),
+                ExternalDestinationPolicy::ConnectionOnly,
+                false,
+                None,
+            )
+            .unwrap();
+        let aid = loop {
+            handle.pump_broker_replies();
+            if let Ok(Ok(Reply::Ack { action: Some(id), .. })) = rx.try_recv() {
+                break id;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        };
+        let mut fa = snap.owner.authority;
+        fa.parent_generation = aid.0;
+        let _ = handle
+            .submit_internal_action(
+                ClientId(961),
+                2,
+                fa,
+                Instant::now() + DEFAULT_FINISH_DEADLINE,
+                ActionSubmit::FinishMacro(FinishMacroSpec::done(aid, handle.boot())),
+            )
+            .unwrap();
+
+        let mut panicked = false;
+        let dl = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < dl && !panicked {
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handle.pump_broker_replies();
+            }));
+            if res.is_err() {
+                panicked = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(panicked, "expected deferred-shutdown retry callback panic");
+        assert!(calls.load(Ordering::SeqCst) >= 2);
+        // Gate MUST NOT be wedged and credits MUST be 0!
+        assert_eq!(handle.reply_router_stats().global_reserved, 0);
+        let _ = handle.pump_broker_replies();
         handle.stop_and_join();
     }
 }

@@ -3053,9 +3053,11 @@ impl SupervisorInner {
     pub(crate) fn check_terminal_fifo_for_new_action(&self) -> Result<(), SafetyError> {
         let has_running = self.last_action.as_ref().is_some_and(|a| a.is_running());
         let needed = if has_running { 2 } else { 1 };
+        let mut in_ring = 0usize;
         #[cfg(not(target_arch = "wasm32"))]
         if self.rt_executor_owned {
             if let Some(tx) = self.rt_terminal_tx.as_ref() {
+                in_ring = tx.pending_slots();
                 if tx.free_slots() < needed {
                     return Err(SafetyError::TerminalsBusy);
                 }
@@ -3064,7 +3066,7 @@ impl SupervisorInner {
         let Some(terminals) = self.terminals.as_ref() else {
             return Ok(());
         };
-        if !terminals.can_start_action(has_running, self.rt_executor_owned) {
+        if !terminals.can_start_action_with_inflight(has_running, self.rt_executor_owned, in_ring) {
             return Err(SafetyError::TerminalsBusy);
         }
         Ok(())
@@ -9955,13 +9957,24 @@ impl TerminalBroadcaster {
         self.recompute_atomics(&g);
     }
 
+    #[cfg(test)]
     pub(crate) fn can_start_action(&self, has_running_action: bool, lock_free: bool) -> bool {
+        self.can_start_action_with_inflight(has_running_action, lock_free, 0)
+    }
+
+    pub(crate) fn can_start_action_with_inflight(
+        &self,
+        has_running_action: bool,
+        lock_free: bool,
+        in_ring: usize,
+    ) -> bool {
         if self.subscriber_count.load(Ordering::Acquire) == 0 {
             return true;
         }
         // Reserve 1 slot for the new action's eventual terminal, plus 1 immediate slot if a
-        // currently running action will be superseded right now.
-        let needed = if has_running_action { 2 } else { 1 };
+        // currently running action will be superseded right now, plus any terminals already
+        // queued in the RT SPSC ring awaiting off-RT drain into subscriber FIFOs.
+        let needed = (if has_running_action { 2usize } else { 1usize }).saturating_add(in_ring);
         if lock_free {
             let cap = self.capacity_atomic.load(Ordering::Acquire);
             let max_len = self.max_fifo_len.load(Ordering::Acquire);
@@ -10079,6 +10092,41 @@ impl TerminalBroadcaster {
             }
         }
         self.recompute_atomics(&g);
+    }
+
+    /// Drains queued observer terminals with `action.id < max_exclusive_id` so an owner-routed
+    /// terminal for `max_exclusive_id` never overtakes an earlier observer terminal on the same
+    /// socket. Returns `true` when no earlier observer terminal remains blocked behind backpressure.
+    pub(crate) fn drain_before_action_id(
+        &self,
+        base_obs: &ArmObservation,
+        max_exclusive_id: u64,
+    ) -> bool {
+        if self.dispatch_paused.load(Ordering::Acquire)
+            || self.pending_total.load(Ordering::Acquire) == 0
+        {
+            return true;
+        }
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut all_earlier_flushed = true;
+        for q in &mut g.sinks {
+            while let Some(finished) = q.fifo.front() {
+                if finished.id >= max_exclusive_id {
+                    break;
+                }
+                let mut obs = base_obs.clone();
+                obs.action = Some(finished.clone());
+                obs.previous_action = None;
+                if (q.sink)(&obs) {
+                    q.fifo.pop_front();
+                } else {
+                    all_earlier_flushed = false;
+                    break;
+                }
+            }
+        }
+        self.recompute_atomics(&g);
+        all_earlier_flushed
     }
 
     pub(crate) fn set_capacity(&self, capacity: usize) {
@@ -11385,6 +11433,21 @@ impl ArmSupervisor {
     /// off-RT terminal cache populated by `OffThreadSinks::drain_rt_terminals`.
     pub(crate) fn lookup_finished_action(&self, action_id: u64) -> Option<ActionStatus> {
         self.terminals.lookup_finished(action_id)
+    }
+
+    /// Flushes any queued observer terminals strictly earlier than `max_exclusive_id` onto
+    /// subscribed WS ordinary queues before an owner-routed terminal for `max_exclusive_id` is
+    /// enqueued, preserving exact chronological order across both sources on the same socket.
+    pub(crate) fn flush_observer_terminals_before(&self, max_exclusive_id: u64) -> bool {
+        if !self.terminals.has_pending() {
+            return true;
+        }
+        let base = self
+            .hub
+            .latest()
+            .map(|s| s.obs.clone())
+            .unwrap_or_else(|| self.template_obs.clone());
+        self.terminals.drain_before_action_id(&base, max_exclusive_id)
     }
 
     /// Starts the dispatcher thread (armd does at startup, before the control loop): it

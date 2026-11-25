@@ -267,7 +267,9 @@ impl SupervisorInner {
         let mut retired_ctx: Option<Box<ZeroCheckPersistContext>> = None;
         let mut incoming_message = message;
         let mut displaced_message: Option<String> = None;
+        let mut transitioned = false;
         if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id && a.is_running()) {
+            transitioned = true;
             a.state = state.into();
             a.code = code.map(Into::into);
             displaced_message = std::mem::replace(&mut a.message, incoming_message.take());
@@ -385,7 +387,9 @@ impl SupervisorInner {
                 self.retire_macro_run(run);
             }
         }
-        self.record_finished_action_by_id(id);
+        if transitioned || !self.rt_executor_owned {
+            self.record_finished_action_by_id(id);
+        }
     }
 
     /// Start a park (NormalUnload) and record it as a `park` action. Returns its id when

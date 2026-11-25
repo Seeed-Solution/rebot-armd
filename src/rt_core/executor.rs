@@ -2190,6 +2190,9 @@ impl BrokerDispatcher {
 
     fn disconnect_client_only(&self, client: super::broker::ClientId) {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(handle) = super::requests::lease::ConnectionHandle::from_ws_id(client.0) {
+            self.conn_lifecycle.enqueue_disconnect_detached(handle);
+        }
         Self::disconnect_broker_client_locked(&mut st, &self.broker, &self.reply_router, client.0);
     }
 
@@ -2836,7 +2839,8 @@ impl OffThreadSinks {
                 } else {
                     None
                 };
-                let status = rec.into_action_status(measurement, policy_stats);
+                let durability_warning = self.hub.action_durability_warning(rec.id);
+                let status = rec.into_action_status(measurement, policy_stats, durability_warning);
                 terminals.record_finished(&status);
             }
         }
@@ -3674,17 +3678,29 @@ struct SerialDrainGuard<'a> {
 
 impl SerialDrainGuard<'_> {
     fn finish(mut self) {
-        self.released = true;
+        // Keep `self.released == false` until `run_deferred_and_release_gate()` completes so a
+        // panic inside a deferred-shutdown callback still triggers unwind recovery in `Drop`.
         self.dispatcher.run_deferred_and_release_gate();
+        self.released = true;
     }
 }
 
 impl Drop for SerialDrainGuard<'_> {
     fn drop(&mut self) {
         if !self.released {
-            // Unwinding after a callback panic: release the gate unconditionally so no future
-            // drainer or shutdown caller can deadlock permanently.
-            self.dispatcher.drain_gate.release_on_unwind();
+            // Unwinding after a callback panic (possibly inside deferred normal shutdown):
+            // finish any remaining deferred retirement strictly WITHOUT invoking callbacks,
+            // then guarantee the gate is released so no future drainer or teardown can wedge.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                while let Some((rt_joined, _)) =
+                    self.dispatcher.drain_gate.try_release_or_take_deferred()
+                {
+                    self.dispatcher.finalize_stopped_under_gate(rt_joined, false);
+                }
+            }));
+            if self.dispatcher.drain_gate.is_owned_by_current_thread() {
+                self.dispatcher.drain_gate.release_on_unwind();
+            }
         }
     }
 }
@@ -6824,6 +6840,10 @@ impl super::requests::config::CommonCommitWorker for ExecutorPersistBackend<'_> 
             } else {
                 (self.new_policy.take(), self.new_jaw.take())
             };
+            // Record the full worker-owned warning off-RT on `StateHub` BEFORE pushing to RT so
+            // the very first terminal frame preserves untruncated warnings (>160 UTF-8 bytes).
+            self.hub
+                .record_action_durability_warning(self.job.action_id, warn.clone());
             let _ = self.push_cmd(PersistCmd::DirSyncFailed {
                 action_id: self.job.action_id,
                 reservation,

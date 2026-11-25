@@ -116,6 +116,10 @@ const OWNED_ROUTER_ACTION_HISTORY_CAP: usize = 128;
 struct WsWireAckState {
     abandoned_ids: VecDeque<u64>,
     owned_router_ids: VecDeque<u64>,
+    /// Action IDs whose `command_ack` has been queued on `ordinary_out_tx` by `worker_task`
+    /// but not yet written to the TCP socket by `writer_task`. Redacted from telemetry/lag
+    /// resync until `mark_wire_ack_written(aid)` runs right after `write_ws_frame_bounded` succeeds.
+    unwritten_wire_acks: VecDeque<u64>,
     ack_barrier_active: bool,
     ack_barrier_floor: u64,
     unknown_abandoned_count: usize,
@@ -199,6 +203,34 @@ impl WsWireAckTracker {
         g.owned_router_ids.contains(&action_id)
     }
 
+    /// Marks `action_id`'s `command_ack` as queued onto `ordinary_out_tx` awaiting actual wire
+    /// write by `writer_task`. Call BEFORE `send_ordinary_control` and BEFORE dropping
+    /// `CommandReplyGateGuard` so telemetry cannot overtake the queued ACK after barrier release.
+    pub fn mark_ack_queued_for_wire(&self, action_id: u64) {
+        if action_id == 0 {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if !g.unwritten_wire_acks.contains(&action_id) {
+            if g.unwritten_wire_acks.len() >= OWNED_ROUTER_ACTION_HISTORY_CAP {
+                g.unwritten_wire_acks.pop_front();
+            }
+            g.unwritten_wire_acks.push_back(action_id);
+        }
+    }
+
+    /// Marks `action_id`'s `command_ack` as actually written to the WebSocket wire by `writer_task`,
+    /// releasing telemetry/lag-resync visibility for `action_id`.
+    pub fn mark_wire_ack_written(&self, action_id: u64) {
+        if action_id == 0 {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pos) = g.unwritten_wire_acks.iter().position(|&id| id == action_id) {
+            g.unwritten_wire_acks.remove(pos);
+        }
+    }
+
     /// Marks `action_id` as abandoned before wire `command_ack` enqueue on this socket.
     pub fn mark_abandoned(&self, action_id: u64) {
         if action_id == 0 {
@@ -236,7 +268,10 @@ impl WsWireAckTracker {
     }
 
     fn should_hide_terminal(g: &WsWireAckState, action_id: u64) -> bool {
-        if g.socket_closed || g.abandoned_ids.contains(&action_id) {
+        if g.socket_closed
+            || g.abandoned_ids.contains(&action_id)
+            || g.unwritten_wire_acks.contains(&action_id)
+        {
             return true;
         }
         if g.ack_barrier_active && action_id > g.ack_barrier_floor {
@@ -250,11 +285,12 @@ impl WsWireAckTracker {
 
     /// Single per-socket visibility gate applied to telemetry and lag-resync `ArmObservation`
     /// frames before serialization: redacts any terminal (`!is_running()`) in BOTH `obs.action`
-    /// and `obs.previous_action` that is abandoned, pending an unknown-ID abandonment, or
-    /// belongs to an in-flight ACK barrier whose `command_ack` has not yet been enqueued.
+    /// and `obs.previous_action` that is abandoned, pending an unknown-ID abandonment, queued
+    /// awaiting wire ACK write, or belongs to an in-flight ACK barrier.
     pub fn redact_obs(&self, obs: &mut crate::model::ArmObservation) {
         let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if g.abandoned_ids.is_empty()
+            && g.unwritten_wire_acks.is_empty()
             && !g.socket_closed
             && !g.ack_barrier_active
             && g.unknown_abandoned_count == 0
@@ -376,12 +412,13 @@ impl RtTerminalStatus {
     }
 
     /// Reconstructs an off-RT [`ActionStatus`] for `TerminalBroadcaster` and WS owner delivery,
-    /// attaching any sidecar measurement payload and off-RT `PolicyStats` overlay associated with
-    /// `self.id`.
+    /// attaching any sidecar measurement payload, off-RT `PolicyStats` overlay, and full
+    /// untruncated worker-owned durability warning associated with `self.id`.
     pub fn into_action_status(
         self,
         measurement: Option<serde_json::Value>,
         policy_stats_overlay: Option<crate::motion::PolicyStats>,
+        durability_warning_overlay: Option<String>,
     ) -> ActionStatus {
         let mut status = ActionStatus::blank();
         status.id = self.id;
@@ -418,9 +455,10 @@ impl RtTerminalStatus {
         status.offset_rad = self.offset_rad;
         status.pass = self.pass;
         status.durability_confirmed = self.durability_confirmed;
-        status.durability_warning = self
-            .has_durability_warning
-            .then(|| self.durability_warning.as_str().to_owned());
+        status.durability_warning = durability_warning_overlay.or_else(|| {
+            self.has_durability_warning
+                .then(|| self.durability_warning.as_str().to_owned())
+        });
         status.policy_stats = self.policy_stats.or(policy_stats_overlay);
         status.measurement = measurement;
         status
@@ -430,7 +468,8 @@ impl RtTerminalStatus {
 /// Single-producer `Sync`-safe lock-free SPSC sender for [`RtTerminalStatus`].
 ///
 /// Mirrors `PolicyTerminalTx`: all access to the inner `rtrb::Producer` requires `&mut self`,
-/// while `free_slots(&self)` reads only atomic `pushed`/`popped` counters (zero locks, zero allocs).
+/// while `free_slots(&self)` and `pending_slots(&self)` read only atomic `pushed`/`popped`
+/// counters (zero locks, zero allocs).
 pub struct RtTerminalTx {
     tx: rtrb::Producer<RtTerminalStatus>,
     cap: usize,
@@ -452,13 +491,18 @@ impl RtTerminalTx {
         }
     }
 
+    /// Number of terminal records currently buffered in the SPSC ring awaiting off-RT drain.
+    #[inline]
+    pub fn pending_slots(&self) -> usize {
+        let pushed = self.pushed.load(Ordering::Acquire);
+        let popped = self.popped.load(Ordering::Acquire);
+        pushed.saturating_sub(popped) as usize
+    }
+
     /// Approximate free slots available in the ring (lower bound safe for admission checks).
     #[inline]
     pub fn free_slots(&self) -> usize {
-        let pushed = self.pushed.load(Ordering::Acquire);
-        let popped = self.popped.load(Ordering::Acquire);
-        let used = pushed.saturating_sub(popped) as usize;
-        self.cap.saturating_sub(used)
+        self.cap.saturating_sub(self.pending_slots())
     }
 
     /// Pushes one `Copy` terminal record without allocation. Returns `true` on success, `false`
@@ -790,24 +834,40 @@ impl SerialDrainGate {
 /// Compact bounded durable tracker of closed `ClientId`s.
 ///
 /// Server-assigned WS connection IDs are strictly monotonic (`1, 2, 3, ...`), so contiguous
-/// closed prefixes fold into `watermark` in O(1) space. Non-monotonic synthetic IDs are tracked
-/// in `above` up to `MAX_CLOSED_ABOVE`, compacting below the minimum active/pending client ID
-/// when exceeded so long-running connection churn stays strictly O(1) memory.
+/// closed prefixes fold into `watermark` in O(1) space. When non-contiguous IDs exceed
+/// `MAX_CLOSED_ABOVE`, `watermark` advances to the highest closed ID while recording the
+/// bounded (`<= MAX_LIVE_CONNECTIONS`) currently live IDs `<= watermark` in `exempt_live`.
+/// Thus NO closed tombstone is ever erased, even while an early client (`1`) remains live
+/// across unbounded churn of higher IDs, and memory stays strictly O(1).
 const MAX_CLOSED_ABOVE: usize = 1024;
 
 #[derive(Debug, Default)]
 struct ClosedClients {
     watermark: u64,
+    /// Currently live client IDs `<= watermark` exempted from the closed-below-watermark range.
+    /// Bounded strictly by the active connection count (`<= MAX_LIVE_CONNECTIONS`).
+    exempt_live: BTreeSet<u64>,
     above: BTreeSet<u64>,
 }
 
 impl ClosedClients {
     fn contains(&self, client: ClientId) -> bool {
-        client.0 != 0 && (client.0 <= self.watermark || self.above.contains(&client.0))
+        if client.0 == 0 {
+            return false;
+        }
+        if client.0 <= self.watermark {
+            !self.exempt_live.contains(&client.0)
+        } else {
+            self.above.contains(&client.0)
+        }
     }
 
-    fn insert(&mut self, client: ClientId, min_live_client: Option<u64>) {
-        if client.0 == 0 || client.0 <= self.watermark {
+    fn insert(&mut self, client: ClientId, live_clients: impl IntoIterator<Item = u64>) {
+        if client.0 == 0 {
+            return;
+        }
+        self.exempt_live.remove(&client.0);
+        if client.0 <= self.watermark {
             return;
         }
         self.above.insert(client.0);
@@ -816,20 +876,18 @@ impl ClosedClients {
             self.above.pop_first();
             self.watermark = self.watermark.saturating_add(1);
         }
-        // Bound sparse synthetic IDs: advance watermark up to any closed ID below all live clients.
+        // Bound non-contiguous closed sets WITHOUT ever erasing a closed tombstone: advance
+        // `watermark` to the highest closed ID and preserve only the <= 64 live IDs below it.
         if self.above.len() > MAX_CLOSED_ABOVE {
-            let ceiling = min_live_client.unwrap_or(u64::MAX);
-            while let Some(&first) = self.above.first() {
-                if first < ceiling && self.above.len() > MAX_CLOSED_ABOVE / 2 {
-                    self.above.pop_first();
-                    self.watermark = self.watermark.max(first);
-                } else {
-                    break;
+            if let Some(max_closed) = self.above.pop_last() {
+                self.watermark = self.watermark.max(max_closed);
+                self.above.clear();
+                self.exempt_live.clear();
+                for live in live_clients {
+                    if live != 0 && live != client.0 && live <= self.watermark {
+                        self.exempt_live.insert(live);
+                    }
                 }
-            }
-            // Hard fallback if live client ID is smaller than all sparse entries: evict oldest.
-            while self.above.len() > MAX_CLOSED_ABOVE {
-                self.above.pop_first();
             }
         }
     }
@@ -935,23 +993,24 @@ impl ActionReplyRouter {
         }
     }
 
-    fn min_active_client_id(&self) -> Option<u64> {
-        let mut min_id: Option<u64> = None;
-        let mut consider = |c: ClientId| {
-            if c.0 != 0 {
-                min_id = Some(min_id.map_or(c.0, |m| m.min(c.0)));
-            }
-        };
+    fn live_client_ids(&self) -> Vec<u64> {
+        let mut live = Vec::with_capacity(self.client_to_slot.len() + 4);
         for &c in self.client_to_slot.keys() {
-            consider(c);
+            if c.0 != 0 {
+                live.push(c.0);
+            }
         }
         for r in self.external_routes.values() {
-            consider(r.client);
+            if r.client.0 != 0 {
+                live.push(r.client.0);
+            }
         }
         for (c, _) in self.internal_waiters.values() {
-            consider(*c);
+            if c.0 != 0 {
+                live.push(c.0);
+            }
         }
-        min_id
+        live
     }
 
     pub(crate) fn stats(&self) -> ReplyRouterStats {
@@ -977,9 +1036,11 @@ impl ActionReplyRouter {
     }
 
     pub(crate) fn has_external_consumers(&self) -> bool {
+        // Only poll the broker ring for router-managed traffic when an internal waiter, an active
+        // external action route, or an explicit global sink consumer is present. Idle per-connection
+        // WS slots with zero active routes must NOT steal raw `broker.submit` test fixture replies.
         !self.internal_waiters.is_empty()
             || !self.external_routes.is_empty()
-            || !self.client_to_slot.is_empty()
             || self.global_sink.is_some()
     }
 
@@ -1205,9 +1266,9 @@ impl ActionReplyRouter {
             }
         }
 
-        // 4. Record durable closure after retiring `client`'s entries so compaction sees the new min live client.
-        let min_live = self.min_active_client_id();
-        self.closed_clients.insert(client, min_live);
+        // 4. Record durable closure after retiring `client`'s entries so compaction preserves all remaining live IDs.
+        let live = self.live_client_ids();
+        self.closed_clients.insert(client, live);
     }
 
     /// Removes a newly-registered `ConnSlot` during rollback of a rejected/cancelled `Open`
@@ -2374,6 +2435,31 @@ mod tests {
         assert!(router.closed_clients.contains(ClientId(5_000)));
         assert!(!router.closed_clients.contains(ClientId(5_001)));
 
+        // 1b. Client 5001 stays live while 5002 + 2,000 higher IDs close: compaction MUST NOT
+        //     erase client 5002's tombstone while keeping client 5001 live in O(1) memory!
+        router
+            .register_connection(
+                ClientId(5_001),
+                Arc::new(|_, _| DeliveryDecision::Delivered),
+                Some(2),
+            )
+            .unwrap();
+        router.close_connection(ClientId(5_002));
+        for id in 5_003..=7_100u64 {
+            router.close_connection(ClientId(id));
+        }
+        assert!(router.closed_clients.above_len() <= MAX_CLOSED_ABOVE);
+        assert!(
+            !router.closed_clients.contains(ClientId(5_001)),
+            "live client 5001 must remain exempt"
+        );
+        assert!(
+            router.closed_clients.contains(ClientId(5_002)),
+            "closed client 5002 tombstone MUST NOT be erased under churn"
+        );
+        router.close_connection(ClientId(5_001));
+        assert!(router.closed_clients.contains(ClientId(5_001)));
+
         // 2. Cancelled internal waiter leaves tombstone that consumes late ACK; close cleans up.
         let (tx1, _rx1) = oneshot::channel();
         router.register_internal_waiter(RequestId(10), ClientId(6000), tx1);
@@ -2475,7 +2561,7 @@ mod tests {
         });
 
         let rec = RtTerminalStatus::from_action_status(&a);
-        let restored = rec.into_action_status(None, None);
+        let restored = rec.into_action_status(None, None, None);
         assert_eq!(restored.stop_rad, Some(0.12));
         assert_eq!(restored.offset_rad, Some(-0.01));
         assert_eq!(restored.pass, Some(true));
@@ -2483,8 +2569,11 @@ mod tests {
         assert_eq!(restored.durability_warning.as_deref(), Some("fsync deferred"));
         assert_eq!(restored.policy_stats, a.policy_stats);
 
-        // Also verify off-RT overlay attaches policy_stats when RT left it None.
+        // Also verify off-RT overlay attaches policy_stats AND untruncated >160B durability_warning.
         a.policy_stats = None;
+        let long_warning = "dir-sync failed: ".to_string() + &"x".repeat(220);
+        assert!(long_warning.len() > 200);
+        a.durability_warning = Some(long_warning.clone());
         let overlay = crate::motion::PolicyStats {
             steps: 99,
             overruns: 0,
@@ -2493,7 +2582,8 @@ mod tests {
             period_us: 20_000,
         };
         let rec2 = RtTerminalStatus::from_action_status(&a);
-        let restored2 = rec2.into_action_status(None, Some(overlay));
+        let restored2 = rec2.into_action_status(None, Some(overlay), Some(long_warning.clone()));
         assert_eq!(restored2.policy_stats, Some(overlay));
+        assert_eq!(restored2.durability_warning.as_deref(), Some(long_warning.as_str()));
     }
 }
