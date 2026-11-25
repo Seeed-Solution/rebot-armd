@@ -9936,19 +9936,30 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                                     | crate::torque::WriteKind::DisableProtective
                             )
                         {
-                            let mut outcomes = [crate::torque::MotorWriteOutcome::NotTargeted;
-                                crate::torque::MAX_CHANNELS];
-                            outcomes[idx] = outcome;
-                            PendingDisableShadowBatch::merge_batch(
-                                &mut self.pending_disable_shadow,
-                                PendingDisableShadowBatch {
-                                    kind: wk,
-                                    target_mask: crate::torque::ChannelMask::bit(idx as u8),
-                                    outcomes,
-                                    ambiguous_gap: false,
-                                    write_done: Some(write_done),
-                                },
-                            );
+                            // When a multi-tick requested disable already dispatched >= 1 motor in
+                            // this tick and hits TX backpressure on the next motor, keep the paused
+                            // motor unresolved in `pending_disable_dispatch.remaining_recipients`
+                            // (matching budget-pause) so the next tick's Sent write reconciles it.
+                            let paused_mid_multitick = matches!(
+                                wk,
+                                crate::torque::WriteKind::DisableRequested
+                            ) && outcome == crate::torque::MotorWriteOutcome::Deferred
+                                && self.pending_disable_shadow.is_some();
+                            if !paused_mid_multitick {
+                                let mut outcomes = [crate::torque::MotorWriteOutcome::NotTargeted;
+                                    crate::torque::MAX_CHANNELS];
+                                outcomes[idx] = outcome;
+                                PendingDisableShadowBatch::merge_batch(
+                                    &mut self.pending_disable_shadow,
+                                    PendingDisableShadowBatch {
+                                        kind: wk,
+                                        target_mask: crate::torque::ChannelMask::bit(idx as u8),
+                                        outcomes,
+                                        ambiguous_gap: false,
+                                        write_done: Some(write_done),
+                                    },
+                                );
+                            }
                         } else {
                             let mut outcomes = [crate::torque::MotorWriteOutcome::NotTargeted;
                                 crate::torque::MAX_CHANNELS];
@@ -14711,10 +14722,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         self.refresh_scheduler.reset_sweep();
                         self.awaiting_rx_boundary = new_awaiting_rx_boundary;
                     }
-                    if skip_dispatched {
-                        let _ = self.ensure_tx_pass();
-                        self.record_tx_pass_attempt();
-                    }
                     sent_any = true;
                     if idx < 64 {
                         self.disable_dispatched_mask |= 1u64 << idx;
@@ -14775,7 +14782,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         && e.is_tx_backpressure()
                         && (sent_any || self.disable_dispatched_mask != 0) =>
                 {
-                    self.mark_tx_pass_backpressured();
                     budget_paused = true;
                     break;
                 }
@@ -15433,8 +15439,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     Some(damiao::build_disable_frame(d.motor_ids[idx]))
                 }) {
                     Ok(_) => {
-                        let _ = self.ensure_tx_pass();
-                        self.record_tx_pass_attempt();
                         sent_any = true;
                         if idx < 64 {
                             self.disable_dispatched_mask |= 1u64 << idx;
@@ -15443,7 +15447,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     }
                     Err(TxRefusal::DeadlinePassed | TxRefusal::Deferred) => break,
                     Err(TxRefusal::Transport(e)) if e.is_tx_backpressure() => {
-                        self.mark_tx_pass_backpressured();
                         break;
                     }
                     Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged) => {
@@ -15668,10 +15671,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 Some(damiao::build_disable_frame(d.motor_ids[idx]))
             }) {
                 Ok(_) => {
-                    if is_requested {
-                        let _ = self.ensure_tx_pass();
-                        self.record_tx_pass_attempt();
-                    }
                     sent_any = true;
                     if idx < 64 {
                         repeat_pass_mask |= 1u64 << idx;
@@ -20191,12 +20190,19 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             && self.is_enabled
             && !self.is_enabling
             && !self.is_stopped_for_disable()
+            && !matches!(
+                self.torque_hs,
+                Some(DamiaoTorque::AwaitRestGate { .. } | DamiaoTorque::Disable { .. })
+            )
             && self.recovery_tx_allowed()
             && self.is_feedback_valid()
             && !(self.output_ran_since_rx && self.has_class1_transition_pending())
         {
             let n = self.motor_ids.len();
             for i in 0..n {
+                if i < 64 && (self.disable_dispatched_mask & (1u64 << i)) != 0 {
+                    continue;
+                }
                 if self.strict_stop_check(Some(rx_stop_stamp)).is_err() {
                     self.discard_pending_tx_stopped();
                     break;

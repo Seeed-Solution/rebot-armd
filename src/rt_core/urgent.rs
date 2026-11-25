@@ -279,17 +279,30 @@ pub struct EstopGate {
     requested: EstopRequestedSource,
     applied: Arc<AtomicU64>,
     stops: Option<StopRequests>,
+    owner_stop_gen: Option<Arc<AtomicU64>>,
     lease: Option<LeaseGate>,
 }
 
 impl EstopGate {
     pub fn new(requested: Arc<AtomicU64>, applied: Arc<AtomicU64>) -> Self {
-        Self { requested: EstopRequestedSource::Raw(requested), applied, stops: None, lease: None }
+        Self {
+            requested: EstopRequestedSource::Raw(requested),
+            applied,
+            stops: None,
+            owner_stop_gen: None,
+            lease: None,
+        }
     }
 
     /// Builds a gate reading directly from the arm's single packed [`EstopState`].
     pub fn from_state(state: Arc<EstopState>, applied: Arc<AtomicU64>) -> Self {
-        Self { requested: EstopRequestedSource::Packed(state), applied, stops: None, lease: None }
+        Self {
+            requested: EstopRequestedSource::Packed(state),
+            applied,
+            stops: None,
+            owner_stop_gen: None,
+            lease: None,
+        }
     }
 
     /// The gate also holds output while an authorized stop is requested and not applied
@@ -297,6 +310,13 @@ impl EstopGate {
     /// still stops the remaining frames.
     pub fn with_stops(mut self, stops: StopRequests) -> Self {
         self.stops = Some(stops);
+        self
+    }
+
+    /// Attaches the owner's monotonic `stop_gen` atomic so legacy/non-executor Stop requests
+    /// are visible through [`Self::generations`] even when [`StopRequests`] is not attached.
+    pub fn with_owner_stop_gen(mut self, stop_gen: Arc<AtomicU64>) -> Self {
+        self.owner_stop_gen = Some(stop_gen);
         self
     }
 
@@ -326,10 +346,12 @@ impl EstopGate {
     /// (`requested == applied`), so deferred frames stamped at admission are invalidated.
     #[inline]
     pub fn generations(&self) -> (u64, u64) {
-        (
-            self.requested.generation(),
-            self.stops.as_ref().map_or(0, StopRequests::current),
-        )
+        let req_stop = self.stops.as_ref().map_or(0, StopRequests::current);
+        let own_stop = self
+            .owner_stop_gen
+            .as_ref()
+            .map_or(0, |a| a.load(Ordering::SeqCst));
+        (self.requested.generation(), req_stop.max(own_stop))
     }
 
     /// Current live unfenced lease generation (`0` when no lease gate is attached, no active

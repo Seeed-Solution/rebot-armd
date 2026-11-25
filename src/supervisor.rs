@@ -4035,6 +4035,7 @@ impl SupervisorInner {
             self.estop_state.clone(),
             self.estop_applied.clone(),
         )
+        .with_owner_stop_gen(self.stop_gen.clone())
         .with_lease_gate(crate::rt_core::urgent::LeaseGate::new(
             self.lease_gen_mirror.clone(),
             self.atomic_fenced_lease_gen.clone(),
