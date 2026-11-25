@@ -962,7 +962,7 @@ impl SupervisorInner {
                 for (i, l) in limits.iter_mut().enumerate().take(usize::from(dof)) {
                     if max_velocity[i] > 0.0 { l.max_velocity = l.max_velocity.min(max_velocity[i]); }
                 }
-                this.install_macro_quintic_inner(&proof, id, q[..usize::from(dof)].to_vec(), &limits).map(drop)
+                this.install_macro_quintic_inner(&proof, id, q[..usize::from(dof)].to_vec(), &limits, None).map(drop)
             }
             Primitive::Gripper { fraction, speed, grasp, .. } => {
                 let command = if grasp && fraction <= 0.0 { GripperCommand::Close } else if !grasp && fraction >= 1.0 { GripperCommand::Open } else { GripperCommand::Move };
@@ -1344,10 +1344,30 @@ impl SupervisorInner {
     /// Returns its planned duration.
     pub fn install_macro_quintic(admitted: Admitted<'_>, id: u64, target: Vec<f32>, limits: &[crate::model::JointLimit]) -> Result<f64, ArmError> {
         let (this, proof) = admitted.consume()?;
-        this.install_macro_quintic_inner(&proof, id, target, limits)
+        this.install_macro_quintic_inner(&proof, id, target, limits, None)
     }
 
-    pub(crate) fn install_macro_quintic_inner(&mut self, _proof: &crate::supervisor::AdmittedProof, id: u64, target: Vec<f32>, limits: &[crate::model::JointLimit]) -> Result<f64, ArmError> {
+    /// [`Self::install_macro_quintic`] reusing an off-lock [`crate::supervisor::PreparedQuintic`]
+    /// when start, target, limits, workspace revision, tool offset and power budget still match.
+    pub(crate) fn install_macro_quintic_prepared(
+        admitted: Admitted<'_>,
+        id: u64,
+        target: Vec<f32>,
+        limits: &[crate::model::JointLimit],
+        prepared: Option<crate::supervisor::PreparedQuintic>,
+    ) -> Result<f64, ArmError> {
+        let (this, proof) = admitted.consume()?;
+        this.install_macro_quintic_inner(&proof, id, target, limits, prepared)
+    }
+
+    pub(crate) fn install_macro_quintic_inner(
+        &mut self,
+        _proof: &crate::supervisor::AdmittedProof,
+        id: u64,
+        target: Vec<f32>,
+        limits: &[crate::model::JointLimit],
+        prepared: Option<crate::supervisor::PreparedQuintic>,
+    ) -> Result<f64, ArmError> {
         let epoch = self.macro_sub_ready(id)?;
         if epoch != self.safety.epoch_id() { return Err(MotionError::PlanStale("epoch changed during the action".into()).into()); }
         self.action_preconditions()?;
@@ -1360,11 +1380,27 @@ impl SupervisorInner {
         }
         self.torque_hold_filter(&mut target);
         self.power_hold_filter(&mut target);
-        let traj = TrajectoryPlanner::plan(&self.commanded_positions, &self.commanded_velocities, &target,
-            &vec![0.0; self.config.dof], None, limits)?;
-        let (traj, power_scale) = self.power_fit_quintic(traj, &self.commanded_positions, &self.commanded_velocities, &target, limits, true)?;
-        let samples = self.workspace_samples(&traj)?;
-        self.check_workspace_path(&self.commanded_positions, samples.iter().map(Vec::as_slice))?;
+        let reuse = prepared.filter(|p| {
+            p.start == self.commanded_positions
+                && p.v0 == self.commanded_velocities
+                && p.target == target
+                && p.limits.as_slice() == limits
+                && p.workspace_revision == self.workspace_revision
+                && p.tcp_offset == self.config.tcp_offset
+                && p.power.as_ref() == self.power_budget()
+                && p.checked_workspace == self.workspace_policy().is_some()
+        });
+        let (traj, power_scale) = if let Some(p) = reuse {
+            self.prepared_quintics_used += 1;
+            (p.traj, p.power_scale)
+        } else {
+            let traj = TrajectoryPlanner::plan(&self.commanded_positions, &self.commanded_velocities, &target,
+                &vec![0.0; self.config.dof], None, limits)?;
+            let (traj, power_scale) = self.power_fit_quintic(traj, &self.commanded_positions, &self.commanded_velocities, &target, limits, true)?;
+            let samples = self.workspace_samples(&traj)?;
+            self.check_workspace_path(&self.commanded_positions, samples.iter().map(Vec::as_slice))?;
+            (traj, power_scale)
+        };
         if moves_gripper {
             self.gripper_hold_vel_ceiling = None;
         }
