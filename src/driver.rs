@@ -13085,21 +13085,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     && self
                         .last_feedback_instant[j]
                         .is_some_and(|rx_at| rx_at >= tx_at && !f.deadline.passed(rx_at));
-                if causal {
-                    let st = self.motor_status[j];
-                    if damiao_fault_name(st).is_some() {
-                        let motor_id = self.motor_ids[j];
-                        self.refresh_capture = None;
-                        self.enable_failed();
-                        return Err(ArmDriverError::MotorHardwareFault {
-                            joint: j,
-                            motor_id,
-                            status: st,
-                        });
-                    }
-                    if self.fresh_measured_position(j, ENABLE_FRESHEN_EXIT_ARM_MAX_AGE).is_some() {
-                        f.confirmed_mask |= 1u32 << j;
-                    }
+                if causal
+                    && self.fresh_measured_position(j, ENABLE_FRESHEN_EXIT_ARM_MAX_AGE).is_some()
+                {
+                    // Arm-joint hardware fault bits (e.g. 0xD LostCommunication left after an
+                    // idle/MIT watchdog timeout) are checked after Restore + CMD_ENABLE in
+                    // `poll_enable`, not before mode restore.
+                    f.confirmed_mask |= 1u32 << j;
                 }
             }
 

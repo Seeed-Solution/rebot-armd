@@ -2535,10 +2535,12 @@ fn failed_hold_ramp_shadow_comparison_has_zero_divergences() {
             Capacities { commands: 8, plans: 1, replies: 16 },
         );
 
-        // Let initial startup feedback expire so only J3..J6 are fresh when enable fails.
+        // Let initial startup feedback expire (> 250 ms Damiao capture validity) while staying
+        // under BUS_LOSS_TIMEOUT (500 ms) through the 180 ms pre-enable FRESHEN window so only
+        // J3..J6 are fresh when enable fails without crossing BusLoss on the J7 ramp release.
         // Suppress automatic 0xCC replies in FakeCan so J7 and J1..J2 only arrive when explicitly
         // injected on the following releases (reproducing the dev18 0x3c -> 0x7c -> 0x7f ramp).
-        clock.advance(Duration::from_millis(300));
+        clock.advance(Duration::from_millis(260));
         bus.with(|s| {
             s.silent_disable = true;
             s.fail_enable_mask = 0x7f; // Force enable failure into FailedHold.
