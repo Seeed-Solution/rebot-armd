@@ -5197,6 +5197,14 @@ function parseDetections(rawData, refRes) {
       obbCorners = item.obb_corners.map(([u, v]) => (isPixelUnit ? [Number(u) / refW, Number(v) / refH] : [Number(u), Number(v)]));
     }
 
+    // segment models: exterior outline of the mask, same unit as the box (rebot-vision HTTP results)
+    let contour = null;
+    if (Array.isArray(item.contour) && item.contour.length >= 3) {
+      contour = item.contour.filter((c) => Array.isArray(c) && c.length >= 2).map(([u, v]) => (isPixelUnit ? [Number(u) / refW, Number(v) / refH] : [Number(u), Number(v)]))
+        .filter(([u, v]) => Number.isFinite(u) && Number.isFinite(v));
+      if (contour.length < 3) contour = null;
+    }
+
     results.push({
       x0, y0, x1, y1,
       cx, cy, w, h,
@@ -5204,7 +5212,8 @@ function parseDetections(rawData, refRes) {
       score,
       track_id: track_id != null ? track_id : null,
       aruco,
-      obbCorners
+      obbCorners,
+      contour
     });
   }
   return results;
@@ -11112,6 +11121,16 @@ function drawOverlay() {
       g.strokeRect(bx, by, bw, bh);
       g.restore();
     }
+    // segment models: the mask outline (dashed and dimmer while another object is selected)
+    if (d.contour && showOpt('contour')) {
+      const other = !!GR.sel && !(GR.sel.label === d.label && graspIou(GR.sel.box, [d.x0, d.y0, d.x1, d.y1]) > 0.5);
+      g.save();
+      contourPath(g, rect, d.contour);
+      g.fillStyle = 'rgba(255,255,255,0.10)'; if (!other) g.fill();
+      g.setLineDash(other ? [6, 5] : []); g.lineJoin = 'round'; g.lineWidth = 2; g.strokeStyle = other ? 'rgba(255,255,255,0.6)' : 'rgba(255,255,255,0.9)';
+      g.stroke();
+      g.restore();
+    }
     if (S.ui === 'simple' && !showOpt('label')) { g.restore(); continue; }
 
     // 2. 目标中心微型十字准星 (半径 4px，带白色中心点与半透明外圈)
@@ -11837,11 +11856,26 @@ function graspDraw(g, rect, fresh) {
   if (s) {
     const stale = performance.now() - s.seenAt > 800;
     const x = rect.x + s.box[0] * rect.w, y = rect.y + s.box[1] * rect.h, w = (s.box[2] - s.box[0]) * rect.w, h = (s.box[3] - s.box[1]) * rect.h;
+    // the outline when one was read (selContour); then the box is only a faint dashed frame
+    const sc = showOpt('contour') ? (selContour(s) || (() => {
+      const d = (S.detections || []).find((q) => q.contour && q.label === s.label && graspIou(s.box, [q.x0, q.y0, q.x1, q.y1]) > 0.5);
+      return d ? { pts: d.contour, shift: null } : null;
+    })()) : null;
     g.save();
     g.setLineDash(stale ? [6, 5] : []);
-    g.lineWidth = 5; g.strokeStyle = 'rgba(255,255,255,0.95)'; g.strokeRect(x - 2, y - 2, w + 4, h + 4);
-    g.lineWidth = 3; g.strokeStyle = '#8CC020'; g.strokeRect(x - 2, y - 2, w + 4, h + 4);
+    if (sc) {
+      contourPath(g, rect, sc.pts, sc.shift);
+      g.fillStyle = 'rgba(140,192,32,0.16)'; g.fill();
+      g.lineJoin = 'round';
+      g.lineWidth = 5; g.strokeStyle = 'rgba(255,255,255,0.9)'; g.stroke();
+      g.lineWidth = 3; g.strokeStyle = '#8CC020'; g.stroke();
+      g.setLineDash([5, 4]); g.lineWidth = 1; g.strokeStyle = 'rgba(255,255,255,0.6)'; g.strokeRect(x, y, w, h);
+    } else {
+      g.lineWidth = 5; g.strokeStyle = 'rgba(255,255,255,0.95)'; g.strokeRect(x - 2, y - 2, w + 4, h + 4);
+      g.lineWidth = 3; g.strokeStyle = '#8CC020'; g.strokeRect(x - 2, y - 2, w + 4, h + 4);
+    }
     g.restore();
+    graspContourPoll();
   }
   placeObjCard(rect);
   // grip point marker while selecting, grasping or picking it
@@ -11890,7 +11924,7 @@ function renderGrasp() {
   if (GR.sel) {
     setText($('grasp-label'), GR.sel.label);
     setText($('grasp-score'), Math.round(GR.sel.score * 100) + '%');
-    setText($('grasp-src'), t('oc.src.box'));
+    setText($('grasp-src'), VM.kind === 'segment' && selContour(GR.sel) ? t('oc.src.seg') : VM.kind === 'segment' ? '' : t('oc.src.box'));
   }
   // simple: measuring note under the measure button, the grasp task row (Settings opens the grasp settings)
   const measOk = !!(S.caps && S.caps.measure_multiview);
@@ -12270,6 +12304,39 @@ function initSVis() {
   $('grasp-task').addEventListener('click', () => gsetOpen(true));
   i18nHooks.push(renderSVis);
   renderSVis();
+}
+
+/* Outline of the selected object. The detection WebSocket (rebot-vision's /results stream) carries boxes only; the
+   HTTP result (GET /api/v1/detection/latest) carries `contour` for segment models. With the segment kind the page
+   reads it for the selected object only, at most every 500 ms, and draws it shifted with the tracked box. */
+const CT = { busy: false, at: 0 };
+async function graspContourPoll() {
+  const s = GR.sel;
+  if (!s || CT.busy || !graspDetOn() || VM.kind !== 'segment' || performance.now() - CT.at < 500) return;
+  if ((S.detections || []).some((d) => d.contour)) return; // the stream carries outlines itself
+  CT.busy = true; CT.at = performance.now();
+  try {
+    const dets = parseDetections(await detLatest(''), videoSrcRes()).filter((d) => d.contour && d.label === s.label);
+    let best = null, bi = 0.3;
+    for (const d of dets) { const i = graspIou([d.x0, d.y0, d.x1, d.y1], s.box); if (i > bi) { bi = i; best = d; } }
+    if (GR.sel === s) {
+      if (best) { s.contour = best.contour; s.contourBox = [best.x0, best.y0, best.x1, best.y1]; s.contourAt = performance.now(); }
+      else if (performance.now() - (s.contourAt || 0) > 2000) s.contour = null;
+    }
+  } catch (_) {} finally { CT.busy = false; }
+}
+// outline in canvas pixels; shifted by how far the tracked box moved since the outline was read
+function contourPath(g, rect, pts, shift) {
+  const [dx, dy] = shift || [0, 0];
+  g.beginPath();
+  pts.forEach(([u, v], i) => { const x = rect.x + (u + dx) * rect.w, y = rect.y + (v + dy) * rect.h; if (i) g.lineTo(x, y); else g.moveTo(x, y); });
+  g.closePath();
+}
+function selContour(s) {
+  if (!s || !s.contour || performance.now() - (s.contourAt || 0) > 3000) return null;
+  const c = (b) => [(b[0] + b[2]) / 2, (b[1] + b[3]) / 2];
+  const a = c(s.contourBox), b = c(s.box);
+  return { pts: s.contour, shift: [b[0] - a[0], b[1] - a[1]] };
 }
 
 /* Object card placement (simple, landscape): beside the selected object (right, else left, below, above), clear of the
