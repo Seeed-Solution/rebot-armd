@@ -77,6 +77,7 @@ struct FakeBusInner {
     rx: VecDeque<CanFrame>,
     tx_log: Vec<CanFrame>,
     immediate_replies: bool,
+    withhold_disable_feedback: bool,
     follow_targets: bool,
     clock: Option<MockClock>,
 }
@@ -116,6 +117,7 @@ impl FakeBus {
             rx: VecDeque::new(),
             tx_log: Vec::new(),
             immediate_replies: true,
+            withhold_disable_feedback: false,
             follow_targets: false,
             clock,
         })))
@@ -195,12 +197,16 @@ impl CanTransport for FakeBus {
         let is_pos_vel = (0x101..=0x107).contains(&id);
         let is_pos_force = (0x301..=0x307).contains(&id);
         let immediate = s.immediate_replies;
+        let withhold_disable = s.withhold_disable_feedback;
         let follow = s.follow_targets;
         if let Some(m) = s.motors.iter_mut().find(|m| m.id == base_id) {
+            let is_disable = frame.data == damiao::CMD_DISABLE;
             if frame.data == damiao::CMD_ENABLE {
                 m.enabled = true;
-            } else if frame.data == damiao::CMD_DISABLE {
-                m.enabled = false;
+            } else if is_disable {
+                if !withhold_disable {
+                    m.enabled = false;
+                }
             } else if (is_pos_vel || is_pos_force) && follow && frame.data.len() >= 4 {
                 let target_q = f32::from_le_bytes([
                     frame.data[0],
@@ -212,7 +218,7 @@ impl CanTransport for FakeBus {
                     m.q = target_q;
                 }
             }
-            if immediate && !m.silent {
+            if immediate && !m.silent && !(is_disable && withhold_disable) {
                 let fb = m.feedback_frame();
                 s.rx.push_back(fb);
             }
@@ -1466,5 +1472,282 @@ async fn review_blockers_b3_b7_b8_b10_enforced() {
         bufs.step_driver(&mut drv, &ctrl, Instant::now() + Duration::from_millis(20), &mut now);
         assert_eq!(calls.load(Ordering::Acquire), 2, "SAFE-HOLD must retry unconfirmed thermal disable");
         assert!(ctrl.thermal_disable_confirmed());
+    }
+}
+
+/// Blocker 1 regression:
+/// 1. Ordinary `is_hardware_disarmed_confirmed()` on Damiao must NOT accept cached pre-enable
+///    `motor_status == 0`; it requires causal per-axis disabled feedback after the last `CMD_ENABLE`.
+/// 2. `ProcessExit` on Damiao must require causal post-disable `state == 0` feedback per axis;
+///    when `FakeBus` accepts `CMD_DISABLE` TX but withholds disabled feedback, `ProcessExit`
+///    returns `Unconfirmed` and retains the energized driver in SAFE-HOLD (NEVER drops it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drv_f1_blocker1_process_exit_requires_causal_disarm_proof_and_retains_driver() {
+    // Part A: Ordinary disarm predicate rejects cached pre-enable status == 0 after CMD_ENABLE TX.
+    {
+        let clock = MockClock::new();
+        let limits = dm_limits();
+        let bus = FakeBus::new(&limits, [0.0; 7], Some(clock.clone()));
+        let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits)
+            .unwrap();
+        bus.with(|s| s.push_all_feedback());
+        let _ = drv.read_joint_states().unwrap();
+        assert!(
+            drv.is_hardware_disarmed_confirmed(),
+            "fresh cold-boot state==0 on all axes should confirm disarmed"
+        );
+
+        // Stop immediate replies, dispatch CMD_ENABLE on the wire, then abort enable so
+        // `is_enabled == false`, `torque_transition_pending() == false`, and cached
+        // `motor_status` is STILL `[0; 7]` and fresh (< 500 ms).
+        bus.with(|s| s.immediate_replies = false);
+        let _ = drv.begin_torque_budgeted(true, 64).unwrap();
+        for _ in 0..8 {
+            clock.advance(Duration::from_millis(2));
+            let _ = drv.poll_torque_budgeted(clock.now() + Duration::from_millis(5), 64);
+        }
+        let enable_tx = bus.with(|s| {
+            s.tx_log
+                .iter()
+                .filter(|f| f.data == damiao::CMD_ENABLE)
+                .count()
+        });
+        assert!(enable_tx > 0, "expected at least one CMD_ENABLE frame on the wire");
+        drv.abort_enable();
+        assert_eq!(drv.enable_state(), EnableState::Disabled);
+        assert!(drv.is_feedback_valid());
+        assert!(!drv.torque_transition_pending());
+        assert!(
+            !drv.is_hardware_disarmed_confirmed(),
+            "cached pre-enable state==0 must NOT confirm disarmed after CMD_ENABLE TX"
+        );
+
+        // Fresh post-enable state==0 feedback on all 7 axes restores causal disarm proof.
+        clock.advance(Duration::from_millis(5));
+        bus.with(|s| {
+            for m in &mut s.motors {
+                m.enabled = false;
+            }
+            s.push_all_feedback();
+        });
+        let _ = drv.read_joint_states().unwrap();
+        assert!(
+            drv.is_hardware_disarmed_confirmed(),
+            "fresh post-enable state==0 on all axes should confirm disarmed"
+        );
+    }
+
+    // Helper wrapper tracking physical driver Drop while forwarding the full ArmDriver surface.
+    struct DropWatchDamiao {
+        inner: DamiaoArmDriver<FakeBus>,
+        dropped: Arc<AtomicBool>,
+    }
+    impl Drop for DropWatchDamiao {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+    impl ArmDriver for DropWatchDamiao {
+        fn capabilities(&self) -> DriverCapabilities { self.inner.capabilities() }
+        fn enable_state(&self) -> EnableState { self.inner.enable_state() }
+        fn is_hardware_disarmed_confirmed(&self) -> bool { self.inner.is_hardware_disarmed_confirmed() }
+        fn has_driver_fresh_position_api(&self) -> bool { self.inner.has_driver_fresh_position_api() }
+        fn fresh_measured_position_for(&self, joint: usize, max_age: Duration) -> Option<f32> {
+            self.inner.fresh_measured_position_for(joint, max_age)
+        }
+        fn fresh_measured_sample_for(&self, joint: usize, max_age: Duration) -> Option<(f32, u64)> {
+            self.inner.fresh_measured_sample_for(joint, max_age)
+        }
+        fn joint_hold_mode_verified(&self, joint: usize) -> bool {
+            self.inner.joint_hold_mode_verified(joint)
+        }
+        fn is_feedback_valid(&self) -> bool { self.inner.is_feedback_valid() }
+        fn is_enabled(&self) -> bool { self.inner.is_enabled() }
+        fn has_any_joint_enabled(&self) -> bool { self.inner.has_any_joint_enabled() }
+        fn has_known_partial_enable(&self) -> bool { self.inner.has_known_partial_enable() }
+        fn torque_transition_pending(&self) -> bool { self.inner.torque_transition_pending() }
+        fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) { self.inner.feedback_ages_into(out) }
+        fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool {
+            self.inner.feedback_all_within(dof, max_age)
+        }
+        fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+            self.inner.read_joint_states()
+        }
+        fn read_joint_states_budgeted(
+            &mut self,
+            out: &mut Vec<JointState>,
+            deadline: Instant,
+            max_rx_frames: u16,
+        ) -> Result<(u16, bool), ArmDriverError> {
+            self.inner.read_joint_states_budgeted(out, deadline, max_rx_frames)
+        }
+        fn read_joint_states_safe_hold(
+            &mut self,
+            out: &mut Vec<JointState>,
+            deadline: Instant,
+            max_rx_frames: u16,
+        ) -> Result<(u16, bool), ArmDriverError> {
+            self.inner.read_joint_states_safe_hold(out, deadline, max_rx_frames)
+        }
+        fn read_cached_joint_states_into(&self, out: &mut Vec<JointState>) -> Option<()> {
+            self.inner.read_cached_joint_states_into(out)
+        }
+        fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
+            self.inner.write_joint_targets(targets)
+        }
+        fn write_joint_targets_bounded(
+            &mut self,
+            targets: &[JointTarget],
+        ) -> Result<armd::driver::TxBatchOutcome, ArmDriverError> {
+            self.inner.write_joint_targets_bounded(targets)
+        }
+        fn write_measured_hold_masked(
+            &mut self,
+            hold_mask: u64,
+            targets: &[JointTarget],
+        ) -> Result<HoldPassReport, ArmDriverError> {
+            self.inner.write_measured_hold_masked(hold_mask, targets)
+        }
+        fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> {
+            self.inner.set_torque(enabled)
+        }
+        fn begin_torque(&mut self, enabled: bool) -> Result<TorqueProgress, ArmDriverError> {
+            self.inner.begin_torque(enabled)
+        }
+        fn poll_torque(&mut self, deadline: Instant) -> Result<TorqueProgress, ArmDriverError> {
+            self.inner.poll_torque(deadline)
+        }
+        fn begin_torque_budgeted(
+            &mut self,
+            enabled: bool,
+            max_rx_frames: u16,
+        ) -> Result<TorqueProgress, ArmDriverError> {
+            self.inner.begin_torque_budgeted(enabled, max_rx_frames)
+        }
+        fn poll_torque_budgeted(
+            &mut self,
+            deadline: Instant,
+            max_rx_frames: u16,
+        ) -> Result<TorqueProgress, ArmDriverError> {
+            self.inner.poll_torque_budgeted(deadline, max_rx_frames)
+        }
+        fn panic_disable_step(
+            &mut self,
+            first: bool,
+            deadline: Instant,
+        ) -> Option<Result<Vec<usize>, ArmDriverError>> {
+            self.inner.panic_disable_step(first, deadline)
+        }
+        fn unconfirmed_disable_joints(&self) -> Vec<usize> {
+            self.inner.unconfirmed_disable_joints()
+        }
+        fn supports_rt_executor(&self) -> Result<(), &'static str> {
+            self.inner.supports_rt_executor()
+        }
+        fn set_rt_mode(&mut self, rt: bool) { self.inner.set_rt_mode(rt) }
+        fn set_tx_release_deadline(&mut self, deadline: Option<Instant>) {
+            self.inner.set_tx_release_deadline(deadline)
+        }
+        fn set_estop_state(&mut self, state: Arc<armd::rt_core::urgent::EstopState>) {
+            self.inner.set_estop_state(state)
+        }
+        fn set_estop_gate(&mut self, gate: armd::rt_core::urgent::EstopGate) {
+            self.inner.set_estop_gate(gate)
+        }
+        fn prepare_safe_hold(&mut self) { self.inner.prepare_safe_hold() }
+        fn clock_now(&self) -> Instant { self.inner.clock_now() }
+        fn clock_pause(&self, d: Duration) { self.inner.clock_pause(d) }
+        fn position_limits(&self, joint: usize) -> Option<(f32, f32)> {
+            self.inner.position_limits(joint)
+        }
+    }
+
+    let make_watched_sup = || {
+        let limits = dm_limits();
+        let bus = FakeBus::new(&limits, [0.4, -0.3, 0.2, 0.1, -0.2, 0.3, 0.0], None);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits)
+            .unwrap();
+        bus.with(|s| s.push_all_feedback());
+        let _ = drv.read_joint_states().unwrap();
+        bus.with(|s| s.push_all_feedback());
+        let _ = drv.read_joint_states().unwrap();
+        drv.check_mapping_ranges();
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(
+            DropWatchDamiao {
+                inner: drv,
+                dropped: Arc::clone(&dropped),
+            },
+        )));
+        (sup, bus, dropped)
+    };
+
+    // Part B: FakeBus accepts CMD_DISABLE TX but withholds disabled feedback -> ProcessExit
+    // returns Unconfirmed and retains the energized driver in post-exit SAFE-HOLD (never dropped).
+    {
+        let (sup, bus, dropped) = make_watched_sup();
+        sup.set_lease_enabled(false).await;
+        sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
+        assert!(bus.with(|s| s.motors.iter().all(|m| m.enabled)));
+
+        let mut cfg = ExecutorConfig::for_tests(Duration::from_millis(10));
+        cfg.panic_policy = PanicPolicy::StopExecutor;
+        let _handle = sup.start_executor(cfg).await.expect("start_executor");
+
+        // Accept CMD_DISABLE on the wire, but withhold disabled feedback replies.
+        bus.with(|s| {
+            s.tx_log.clear();
+            s.withhold_disable_feedback = true;
+        });
+
+        let outcome = sup
+            .emergency_process_exit_disable_until(Instant::now() + Duration::from_millis(250))
+            .await;
+        assert_eq!(
+            outcome,
+            PanicDisableOutcome::Unconfirmed,
+            "ProcessExit must NOT return Confirmed when disabled feedback is withheld"
+        );
+        let disable_tx = bus.with(|s| {
+            s.tx_log
+                .iter()
+                .filter(|f| f.data == damiao::CMD_DISABLE)
+                .count()
+        });
+        assert!(disable_tx >= 7, "expected CMD_DISABLE frames on bus, got {disable_tx}");
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(
+            !dropped.load(Ordering::Acquire),
+            "energized driver with unconfirmed ProcessExit disable MUST stay retained in SAFE-HOLD and NEVER drop"
+        );
+    }
+
+    // Part C: Positive control — when FakeBus replies with fresh post-disable state==0 on all
+    // 7 axes, ProcessExit returns Confirmed and drops the disarmed core cleanly.
+    {
+        let (sup, bus, dropped) = make_watched_sup();
+        sup.set_lease_enabled(false).await;
+        sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
+        assert!(bus.with(|s| s.motors.iter().all(|m| m.enabled)));
+
+        let mut cfg = ExecutorConfig::for_tests(Duration::from_millis(10));
+        cfg.panic_policy = PanicPolicy::StopExecutor;
+        let _handle = sup.start_executor(cfg).await.expect("start_executor");
+
+        let outcome = sup
+            .emergency_process_exit_disable_until(Instant::now() + Duration::from_millis(500))
+            .await;
+        assert_eq!(
+            outcome,
+            PanicDisableOutcome::Confirmed,
+            "fresh causal post-disable state==0 feedback on all axes should confirm ProcessExit"
+        );
+        wait_until_async(Duration::from_secs(2), "confirmed-disarmed core dropped", || {
+            dropped.load(Ordering::Acquire)
+        })
+        .await;
     }
 }

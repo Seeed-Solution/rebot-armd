@@ -7533,14 +7533,27 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     rest_pose_window: Vec<CausalWindow>,
     /// `rx_seq` snapshot when `CMD_ENABLE` was transmitted for motor `i`.
     motor_enable_seq: Vec<u64>,
+    /// Per-axis `(rx_seq, tx_started)` boundary captured at the most recent `CMD_ENABLE`
+    /// submission so ordinary disarm confirmation requires a fresh post-enable `state == 0` reply.
+    motor_last_enable_tx: Vec<Option<(u64, Instant)>>,
+    /// True once motor `i` has produced a causal `state == 0` feedback frame after its latest
+    /// `CMD_ENABLE` submission (cleared on any `CMD_ENABLE` or non-zero `state_or_error`).
+    motor_disarmed_after_enable: Vec<bool>,
     /// True once motor `i` has received feedback strictly after its latest `CMD_ENABLE`
     /// transmit (any state, including fault states, so `poll_enable` detects faults causally).
     motor_post_enable_feedback: Vec<bool>,
     /// Monotonic counter bumped strictly when a post-enable motor feedback frame carries
     /// `state_or_error != 1` (R12 M2).
     reported_torque_loss_sample_seq: u64,
-    /// Per-joint transmit completion flags for the active panic-disable sequence.
-    panic_disable_tx_ok: Vec<bool>,
+    /// True while a `ProcessExit` panic-disable sequence is active and awaiting causal per-axis
+    /// `state == 0` feedback replies after `CMD_DISABLE` transmission.
+    panic_disable_active: bool,
+    /// Per-axis `(rx_seq, tx_started)` boundary captured when a flushed `CMD_DISABLE` was sent
+    /// after an empty RX boundary during `panic_disable_step`.
+    panic_disable_tx_boundary: Vec<Option<(u64, Instant)>>,
+    /// Per-axis causal confirmation that a fresh `state == 0` reply arrived after the axis's
+    /// flushed `panic_disable_step` `CMD_DISABLE` transmission.
+    panic_disable_confirmed: Vec<bool>,
     /// MIT tracking deadline fence (`set_mit_deadline_fence`); None = off (unchanged behaviour).
     mit_fence: Option<Duration>,
     /// Per joint: when its last confirmed command started out (the earliest frame of it, never
@@ -8635,9 +8648,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             control_release_managed: false,
             rest_pose_window: vec![CausalWindow::default(); dof],
             motor_enable_seq: vec![0; dof],
+            motor_last_enable_tx: vec![None; dof],
+            motor_disarmed_after_enable: vec![false; dof],
             motor_post_enable_feedback: vec![false; dof],
             reported_torque_loss_sample_seq: 0,
-            panic_disable_tx_ok: vec![false; dof],
+            panic_disable_active: false,
+            panic_disable_tx_boundary: vec![None; dof],
+            panic_disable_confirmed: vec![false; dof],
             rx_empty_seq: 0,
             last_read_drained: false,
             mit_fence: None,
@@ -9597,9 +9614,26 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 if let Some(idx) = enable_motor_idx {
                     self.motor_post_enable_feedback[idx] = false;
                     self.motor_enable_seq[idx] = self.rx_seq;
+                    self.motor_last_enable_tx[idx] = Some((tx_seq_mark, tx_started_mark));
+                    self.motor_disarmed_after_enable[idx] = false;
+                    self.panic_disable_active = false;
+                    self.panic_disable_tx_boundary[idx] = None;
+                    self.panic_disable_confirmed[idx] = false;
                     self.mode_readback_boundary[idx] = None;
                 } else if let Some(idx) = disable_motor_idx {
                     self.motor_post_enable_feedback[idx] = false;
+                }
+            } else if let Err(ref e) = res {
+                // Non-backpressure transport error on CMD_ENABLE has ambiguous wire delivery:
+                // invalidate any cached disarm proof on that axis fail-closed.
+                if !e.is_tx_backpressure() {
+                    if let Some(idx) = enable_motor_idx {
+                        self.motor_last_enable_tx[idx] = Some((tx_seq_mark, tx_started_mark));
+                        self.motor_disarmed_after_enable[idx] = false;
+                        self.panic_disable_active = false;
+                        self.panic_disable_tx_boundary[idx] = None;
+                        self.panic_disable_confirmed[idx] = false;
+                    }
                 }
             }
             let write_done = self.now();
@@ -14924,6 +14958,49 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
     }
 
+    /// Physical disarm proof for Damiao motors: requires fresh `state == 0` feedback on EVERY axis
+    /// with causal per-axis evidence received AFTER the axis's latest `CMD_ENABLE` submission (and
+    /// after its flushed `CMD_DISABLE` submission whenever `panic_disable_step` is active). Never
+    /// trusts stale pre-enable cached `motor_status == 0`.
+    fn is_hardware_disarmed_confirmed(&self) -> bool {
+        !self.motor_ids.is_empty()
+            && !self.is_enabled
+            && !self.is_enabling
+            && !self.torque_transition_pending()
+            && self.disable_dispatched_mask == 0
+            && !self.awaiting_rx_boundary
+            && self.is_feedback_valid()
+            && self.enable_state() == EnableState::Disabled
+            && !self.has_any_joint_enabled()
+            && !self.has_known_partial_enable()
+            && (0..self.motor_ids.len()).all(|i| {
+                let causal_after_enable = self
+                    .motor_disarmed_after_enable
+                    .get(i)
+                    .copied()
+                    .unwrap_or(false)
+                    && match self.motor_last_enable_tx.get(i).copied().flatten() {
+                        Some((en_seq, en_at)) => {
+                            self.last_feedback_seq.get(i).copied().unwrap_or(0) > en_seq
+                                && self
+                                    .last_feedback_instant
+                                    .get(i)
+                                    .copied()
+                                    .flatten()
+                                    .is_some_and(|t| t >= en_at)
+                        }
+                        None => true,
+                    };
+                let causal_after_panic_disable = !self.panic_disable_active
+                    || self
+                        .panic_disable_confirmed
+                        .get(i)
+                        .copied()
+                        .unwrap_or(false);
+                causal_after_enable && causal_after_panic_disable
+            })
+    }
+
     fn reported_torque_loss_sample_seq(&self) -> Option<u64> {
         Some(self.reported_torque_loss_sample_seq)
     }
@@ -16249,19 +16326,41 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             self.refresh_scheduler.reset_sweep();
             self.pos_force_verified = false;
             self.clear_cached_targets();
-            self.awaiting_rx_boundary = !self.last_read_drained;
-            let cmd_start = self.now();
-            self.last_enable_command = Some(cmd_start);
-            self.last_enable_command_rx_seq = Some(self.rx_seq);
             self.last_command_was_disable = true;
             self.is_enabled = false;
             self.pending_rearm = true;
+            self.panic_disable_active = true;
+            self.panic_disable_tx_boundary.fill(None);
+            self.panic_disable_confirmed.fill(false);
+
+            // Drain any pre-disable RX frames before sending CMD_DISABLE so buffered stale
+            // `state == 0` frames are consumed prior to capturing each axis's causal TX boundary.
+            self.last_poll_rx = None;
+            self.rx_deadline = Some(deadline);
+            self.rx_frame_limit = Some(64);
+            let _ = self.receive_feedback();
+            self.rx_deadline = None;
+            self.rx_frame_limit = None;
+            self.awaiting_rx_boundary = !self.last_read_drained;
+
+            let cmd_start = self.now();
+            self.last_enable_command = Some(cmd_start);
+            self.last_enable_command_rx_seq = Some(self.rx_seq);
             self.last_query_instant = Some(cmd_start);
-            self.panic_disable_tx_ok.fill(false);
+        } else {
+            // Drain any replies that arrived since the previous step before resending.
+            self.last_poll_rx = None;
+            self.rx_deadline = Some(deadline);
+            self.rx_frame_limit = Some(64);
+            let _ = self.receive_feedback();
+            self.rx_deadline = None;
+            self.rx_frame_limit = None;
         }
 
         let pending_before = self.unconfirmed_disable_joints();
         if pending_before.is_empty() {
+            self.panic_disable_active = false;
+            self.disable_dispatched_mask = 0;
             self.mit_fence = None;
             return Some(Ok(Vec::new()));
         }
@@ -16271,18 +16370,30 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             reason: DisableProtectiveReason::ProcessExit,
         };
         let mut sent_any = false;
+        let mut newly_armed: Vec<usize> = Vec::new();
+        let clean_rx_boundary = !self.awaiting_rx_boundary;
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.defer_disable_shadow = true;
         }
         for i in pending_before {
             let Some(&id) = self.motor_ids.get(i) else { continue };
-            match self.send_plain(protective, None, Some(tx_deadline), false, |_| {
-                Some(damiao::build_disable_frame(id))
-            }) {
-                Ok(_) => {
+            let mut revoked: Option<&'static str> = None;
+            match self.send(
+                protective,
+                None,
+                Some(tx_deadline),
+                false,
+                None,
+                &mut revoked,
+                |_| Some(damiao::build_disable_frame(id)),
+            ) {
+                Ok((_, tx_seq_mark, tx_started_mark, _)) => {
                     sent_any = true;
-                    self.panic_disable_tx_ok[i] = true;
+                    if clean_rx_boundary && self.panic_disable_tx_boundary[i].is_none() {
+                        self.panic_disable_tx_boundary[i] = Some((tx_seq_mark, tx_started_mark));
+                        newly_armed.push(i);
+                    }
                 }
                 Err(TxRefusal::DeadlinePassed) => {
                     tracing::warn!(
@@ -16309,7 +16420,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         if sent_any {
             if let Err(e) = self.can.flush() {
                 tracing::warn!("Panic disable CAN flush failed: {e}");
-                self.panic_disable_tx_ok.fill(false);
+                for i in newly_armed {
+                    self.panic_disable_tx_boundary[i] = None;
+                }
             }
         }
 
@@ -16322,6 +16435,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
         let remaining = self.unconfirmed_disable_joints();
         if remaining.is_empty() {
+            self.panic_disable_active = false;
+            self.disable_dispatched_mask = 0;
             self.mit_fence = None;
         }
         Some(Ok(remaining))
@@ -16329,7 +16444,18 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
     fn unconfirmed_disable_joints(&self) -> Vec<usize> {
         (0..self.motor_ids.len())
-            .filter(|&i| !self.panic_disable_tx_ok.get(i).copied().unwrap_or(false))
+            .filter(|&i| {
+                let confirmed = !self.awaiting_rx_boundary
+                    && self.panic_disable_confirmed.get(i).copied().unwrap_or(false)
+                    && self.motor_status.get(i).copied() == Some(0)
+                    && self
+                        .last_feedback_instant
+                        .get(i)
+                        .copied()
+                        .flatten()
+                        .is_some_and(|t| self.since(t) <= DAMIAO_FEEDBACK_VALID_WINDOW);
+                !confirmed
+            })
             .collect()
     }
 
@@ -18823,6 +18949,25 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     if feedback.state_or_error != 1 {
                         self.reported_torque_loss_sample_seq =
                             self.reported_torque_loss_sample_seq.wrapping_add(1).max(1);
+                    }
+                }
+                if !self.awaiting_rx_boundary {
+                    if feedback.state_or_error == 0 {
+                        let after_enable = match self.motor_last_enable_tx[idx] {
+                            Some((en_seq, en_at)) => seq > en_seq && rx_at >= en_at,
+                            None => true,
+                        };
+                        if after_enable {
+                            self.motor_disarmed_after_enable[idx] = true;
+                        }
+                        if let Some((pd_seq, pd_at)) = self.panic_disable_tx_boundary[idx] {
+                            if seq > pd_seq && rx_at >= pd_at {
+                                self.panic_disable_confirmed[idx] = true;
+                            }
+                        }
+                    } else {
+                        self.motor_disarmed_after_enable[idx] = false;
+                        self.panic_disable_confirmed[idx] = false;
                     }
                 }
                 let mut window_offset_drifted = false;
