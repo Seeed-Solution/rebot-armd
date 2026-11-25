@@ -6002,3 +6002,194 @@ fn j7_enable_refresh_review_blocker_regressions() {
         assert!(!d.torque_transition_pending() && !d.is_enabled());
     }
 }
+
+#[test]
+fn addendum_refresh_scheduler_idle_torqued_stopped_no_output_until_fresh_and_guards() {
+    let limits = b601_limits();
+    let make_pf = || armd::driver::GripperPosForce {
+        joint: 6,
+        current_raw: 220,
+        close_speed_rad_s: 0.30,
+        closed_rad: 0.0,
+        open_rad: -5.7,
+        calibrated: false,
+        ceiling_torque_nm: None,
+        torque_reference: None,
+    };
+
+    // 1. Idle-torqued (enabled, no output pass) with J7 under NoOutputUntilFresh + J1..J6 stale:
+    //    reserves at most 1 0xCC slot per tick BEFORE ordinary TX and covers J1..J7 in 7 ticks.
+    {
+        let (bus, clock) = VirtualBus::new(&limits);
+        bus.with(|s| {
+            s.motors[6].2 = -1.0;
+            s.motors[6].4 = damiao::CTRL_MODE_POS_FORCE;
+        });
+        let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits.clone())
+            .unwrap()
+            .with_gripper_pos_force(make_pf())
+            .unwrap();
+        d.read_joint_states().unwrap();
+        bus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+        d.check_mapping_ranges();
+        d.set_torque(true).unwrap();
+        // Reset J7 to boot state (`NoOutputUntilFresh`, pf_last_fresh_position == None) and age
+        // J1..J6 past 100 ms while staying Idle-torqued (no output pass).
+        d.reset_pos_force_boot_state();
+        clock.advance(ms(120));
+        let mut polled_ids = Vec::new();
+        for tick in 1..=7 {
+            bus.with(|s| {
+                s.rx.clear();
+                s.tx_log.clear();
+                s.tx_accepted.clear();
+            });
+            d.read_joint_states().unwrap();
+            let cc: Vec<u16> = bus.with(|s| {
+                s.tx_accepted
+                    .iter()
+                    .filter(|f| f.id == 0x7FF && f.data[2] == 0xCC)
+                    .map(|f| u16::from_le_bytes([f.data[0], f.data[1]]))
+                    .collect()
+            });
+            assert_eq!(cc.len(), 1, "Idle-torqued tick {tick}: expected 1 0xCC, got {cc:?}");
+            polled_ids.push(cc[0]);
+            // Even if emit_pos_force_j7 runs in the same tick, at most 1 0xCC total is allowed!
+            let stamp = d.current_j7_intent_stamp();
+            let _ = d
+                .emit_pos_force_j7(
+                    armd::driver::PosForceIntent {
+                        kind: armd::driver::PosForceIntentKind::Hold,
+                        stamp,
+                    },
+                    stamp,
+                )
+                .unwrap();
+            let total_cc = bus.with(|s| {
+                s.tx_accepted
+                    .iter()
+                    .filter(|f| f.id == 0x7FF && f.data[2] == 0xCC)
+                    .count()
+            });
+            assert_eq!(
+                total_cc, 1,
+                "Idle-torqued tick {tick}: emit_pos_force_j7 must never send a 2nd 0xCC"
+            );
+            clock.advance(ms(20));
+        }
+        let unique: std::collections::BTreeSet<u16> = polled_ids.iter().copied().collect();
+        assert_eq!(
+            unique,
+            (1u16..=7).collect(),
+            "Idle-torqued 7 ticks must serve all 7 joints including J7 under NoOutputUntilFresh: {polled_ids:?}"
+        );
+    }
+
+    // 2. Stopped (latched E-stop) with J7 under NoOutputUntilFresh + J1..J6 stale:
+    //    serves J1..J7 round-robin (1 0xCC per tick), and pending stop inhibits 0xCC (0 frames).
+    {
+        let (bus, clock) = VirtualBus::new(&limits);
+        bus.with(|s| {
+            s.motors[6].2 = -1.0;
+            s.motors[6].4 = damiao::CTRL_MODE_POS_FORCE;
+        });
+        let estop_req = Arc::new(AtomicU64::new(0));
+        let estop_app = Arc::new(AtomicU64::new(0));
+        let gate = EstopGate::new(estop_req.clone(), estop_app.clone());
+        let estop_state = Arc::new(armd::rt_core::urgent::EstopState::new());
+        let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits.clone())
+            .unwrap()
+            .with_gripper_pos_force(make_pf())
+            .unwrap();
+        d.set_estop_gate(gate);
+        d.set_estop_state(estop_state.clone());
+        d.read_joint_states().unwrap();
+        bus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+        d.reset_pos_force_boot_state();
+        estop_state.latch();
+        clock.advance(ms(120));
+
+        // Latched (no pending stop): 1 0xCC per tick covering J1..J7 in 7 ticks.
+        let mut polled = Vec::new();
+        for _ in 0..7 {
+            bus.with(|s| {
+                s.rx.clear();
+                s.tx_log.clear();
+                s.tx_accepted.clear();
+            });
+            d.read_joint_states().unwrap();
+            let cc: Vec<u16> = bus.with(|s| {
+                s.tx_accepted
+                    .iter()
+                    .filter(|f| f.id == 0x7FF && f.data[2] == 0xCC)
+                    .map(|f| u16::from_le_bytes([f.data[0], f.data[1]]))
+                    .collect()
+            });
+            assert_eq!(cc.len(), 1, "stopped tick must send 1 0xCC: {cc:?}");
+            polled.push(cc[0]);
+            clock.advance(ms(20));
+        }
+        assert_eq!(
+            polled.iter().copied().collect::<std::collections::BTreeSet<_>>(),
+            (1u16..=7).collect(),
+            "stopped state must cover all 7 joints including J7 under NoOutputUntilFresh: {polled:?}"
+        );
+
+        // Pending urgent stop (requested > applied): MUST emit 0 0xCC frames.
+        clock.advance(ms(120));
+        estop_req.store(1, Ordering::SeqCst);
+        bus.with(|s| {
+            s.rx.clear();
+            s.tx_log.clear();
+            s.tx_accepted.clear();
+        });
+        d.read_joint_states().unwrap();
+        assert!(
+            bus.with(|s| s.tx_log.is_empty()),
+            "pending stop must inhibit RefreshScheduler 0xCC"
+        );
+        estop_app.store(1, Ordering::SeqCst);
+
+        // MIT fence armed/tripped: MUST emit 0 0xCC frames.
+        d.set_mit_deadline_fence(Some(ms(45)), ms(300));
+        clock.advance(ms(120));
+        bus.with(|s| {
+            s.rx.clear();
+            s.tx_log.clear();
+            s.tx_accepted.clear();
+        });
+        d.read_joint_states().unwrap();
+        assert!(
+            bus.with(|s| s.tx_log.is_empty()),
+            "MIT fence must inhibit RefreshScheduler 0xCC"
+        );
+    }
+
+    // 3. Undrained RX backlog (`!last_read_drained`): MUST emit 0 0xCC frames.
+    {
+        let (bus, clock) = VirtualBus::new(&limits);
+        let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits)
+            .unwrap();
+        d.read_joint_states().unwrap();
+        clock.advance(ms(120));
+        bus.with(|s| {
+            s.rx.clear();
+            s.tx_log.clear();
+            s.tx_accepted.clear();
+            // Flood RX with 70 frames (> 64 frame RX limit) so receive_feedback does not drain.
+            for _ in 0..70 {
+                s.push_feedback(0);
+            }
+        });
+        d.read_joint_states().unwrap();
+        assert!(
+            bus.with(|s| s.tx_log.is_empty()),
+            "undrained RX must inhibit RefreshScheduler 0xCC"
+        );
+    }
+}

@@ -10914,3 +10914,454 @@ fn review_fix_damiao_repeat_pass_probes_aged_out_k3_window_and_refuses_non_rest(
     build(false);
     build(true);
 }
+
+fn make_pos_force_exec_rig(j7_silent_from_boot: bool) -> ExecRig {
+    let clock = MockClock::new();
+    let bus = FakeBus::with_clock(&limits(), clock.clone());
+    let pf = armd::driver::GripperPosForce {
+        joint: 6,
+        current_raw: 220,
+        close_speed_rad_s: 0.30,
+        closed_rad: 0.0,
+        open_rad: -5.7,
+        calibrated: false,
+        ceiling_torque_nm: None,
+        torque_reference: None,
+    };
+    bus.with(|s| {
+        s.immediate_replies = true;
+        s.follow_commands = false;
+        s.motors[6].q = -1.2;
+        s.motors[6].silent = j7_silent_from_boot;
+        s.motors[6].regs.insert(
+            damiao::RID_CTRL_MODE,
+            damiao::CTRL_MODE_POS_FORCE.to_le_bytes(),
+        );
+    });
+    let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(limits())
+        .unwrap()
+        .with_gripper_pos_force(pf)
+        .unwrap();
+    // Establish initial empty-queue boundary for J1..J6 only; leave J7 with NO fresh feedback
+    // since boot so J7 starts under `PosForceBootFallback::NoOutputUntilFresh`.
+    d.read_joint_states().unwrap();
+    bus.with(|s| {
+        for j in 0..6 {
+            s.push_feedback(j);
+        }
+    });
+    d.read_joint_states().unwrap();
+    d.check_mapping_ranges();
+    if j7_silent_from_boot {
+        d.reset_pos_force_boot_state();
+    }
+    let mut inner = SupervisorInner::new(ArmConfig {
+        lease_timeout_ms: 600_000,
+        ..ArmConfig::rebot_dm()
+    })
+    .with_driver(Box::new(d));
+    inner.lease_enabled = false;
+    inner.register_live_connection(1).unwrap();
+    let (fx, b, _tw, _stop) = ReleaseFixture::new(
+        inner,
+        BOOT,
+        Capacities {
+            commands: 8,
+            plans: 1,
+            replies: 16,
+        },
+    );
+    ExecRig {
+        fx,
+        b,
+        bus,
+        clock,
+        seq: 0,
+    }
+}
+
+#[test]
+fn addendum_failed_hold_at_rest_refreshes_all_7_joints_within_7_ticks_and_disables_at_rest() {
+    // Part A: After ENABLE_FAILED in FailedHold at rest, with NO other traffic (all 7 joints
+    // starting stale, including J7 under NoOutputUntilFresh), the unified RefreshScheduler
+    // reserves at most 1 0xCC slot per tick, brings EVERY joint J1..J7 to fresh feedback within
+    // 7 ticks of recovery, and torque(false) succeeds at rest.
+    {
+        let mut r = make_pos_force_exec_rig(true);
+        // Mute all 7 motors during enable so enable fails into FailedHold with all 7 joints stale
+        // (and J7 under NoOutputUntilFresh with zero prior fresh samples).
+        r.bus.with(|s| {
+            for m in &mut s.motors {
+                m.silent = true;
+            }
+            s.rx.clear();
+            s.pending.clear();
+            s.delayed.clear();
+        });
+        r.clock.advance(Duration::from_millis(120));
+        r.submit_transition(TransitionOp::TorqueOn);
+        let mut failed_tick = None;
+        for step in 1..=20 {
+            let rep = r.step();
+            if let Some((_, outcome)) = rep.transition_ended {
+                assert!(
+                    matches!(outcome, Outcome::Failed(_)),
+                    "muted enable must fail into FailedHold, got {outcome:?}"
+                );
+                failed_tick = Some(step);
+                break;
+            }
+        }
+        assert!(failed_tick.is_some(), "enable must fail into FailedHold");
+        assert_eq!(
+            r.fx.core.enable_lifecycle(),
+            armd::supervisor::EnableLifecycle::FailedHold
+        );
+        assert!(
+            r.fx.core.safety.has_latched_fault_code(FaultCode::EnableFailed),
+            "ENABLE_FAILED fault must be latched: {:?}",
+            r.fx.core.safety.fault()
+        );
+        assert!(r.fx.core.is_torqued);
+
+        // Now all 7 motors are alive at rest (J1..J6 at 0.0 rad, J7 at -1.2 rad), with ZERO
+        // external/manual feedback pushes and NO other traffic.
+        r.bus.with(|s| {
+            s.rx.clear();
+            s.pending.clear();
+            s.delayed.clear();
+            for j in 0..6 {
+                s.motors[j].silent = false;
+                s.motors[j].q = 0.0;
+            }
+            s.motors[6].silent = false;
+            s.motors[6].q = -1.2;
+        });
+        let mut all_fresh_at_tick: Option<usize> = None;
+        let mut total_cc_ids: Vec<u16> = Vec::new();
+        for tick in 1..=8 {
+            r.bus.clear_log();
+            let _ = r.step();
+            let cc_ids: Vec<u16> = r
+                .bus
+                .tx_log()
+                .iter()
+                .filter(|f| f.id == 0x7FF && f.data[2] == 0xCC)
+                .map(|f| u16::from_le_bytes([f.data[0], f.data[1]]))
+                .collect();
+            assert!(
+                cc_ids.len() <= 1,
+                "tick {tick}: at most 1 0xCC per tick, got {cc_ids:?}"
+            );
+            total_cc_ids.extend_from_slice(&cc_ids);
+            let obs = r.fx.core.current_observation();
+            let ages = obs.feedback_age_ms;
+            let all_fresh = ages.len() == 7
+                && ages.iter().all(|a| a.is_some_and(|ms| ms <= 100));
+            println!(
+                "[FakeBus][all-muted-then-recovered] tick={tick} cc_ids={cc_ids:?} ages_ms={ages:?} all_fresh={all_fresh}"
+            );
+            if all_fresh && all_fresh_at_tick.is_none() {
+                all_fresh_at_tick = Some(tick);
+            }
+        }
+        assert!(
+            all_fresh_at_tick.is_some(),
+            "all 7 joints (including J7 under NoOutputUntilFresh) must become fresh via RefreshScheduler"
+        );
+        let unique_cc: std::collections::BTreeSet<u16> = total_cc_ids.iter().copied().collect();
+        assert_eq!(
+            unique_cc,
+            (1u16..=7).collect(),
+            "RefreshScheduler must cover every joint J1..J7: {total_cc_ids:?}"
+        );
+    }
+
+    // Part B: Exact real-world ENABLE_FAILED -> FailedHold at rest (J7 starts with NO fresh
+    // feedback under NoOutputUntilFresh and fails enable; J1..J6 also age stale during the failed
+    // enable window; NO other traffic once in FailedHold): EVERY joint J1..J7 gets fresh feedback
+    // within <= 7 ticks, and torque(false) succeeds at rest!
+    {
+        let mut r = make_pos_force_exec_rig(true);
+        // Keep J7 silent during enable so enable fails into FailedHold; J1..J6 stay at rest (0.0)
+        // and drop_torque_frames = 10 on J1..J6 makes enable time out after 150 ms so J1..J6 are
+        // ALSO stale (> 100 ms) at the moment ENABLE_FAILED fires!
+        r.bus.with(|s| {
+            s.motors[6].silent = true;
+            for j in 0..6 {
+                s.motors[j].q = 0.0;
+                s.motors[j].drop_torque_frames = 10;
+            }
+        });
+        r.clock.advance(Duration::from_millis(120));
+        r.submit_transition(TransitionOp::TorqueOn);
+        let mut failed = false;
+        for _ in 0..20 {
+            let rep = r.step();
+            if let Some((_, outcome)) = rep.transition_ended {
+                assert!(
+                    matches!(outcome, Outcome::Failed(_)),
+                    "expected ENABLE_FAILED, got {outcome:?}"
+                );
+                failed = true;
+                break;
+            }
+        }
+        assert!(failed, "enable must fail into FailedHold");
+        assert_eq!(
+            r.fx.core.enable_lifecycle(),
+            armd::supervisor::EnableLifecycle::FailedHold
+        );
+        assert!(
+            r.fx.core.safety.has_latched_fault_code(FaultCode::EnableFailed),
+            "ENABLE_FAILED fault must be latched: {:?}",
+            r.fx.core.safety.fault()
+        );
+        let entry_ages = r.fx.core.current_observation().feedback_age_ms;
+        assert!(
+            entry_ages[6].is_none(),
+            "J7 must start FailedHold under NoOutputUntilFresh (age=None), got {entry_ages:?}"
+        );
+        assert!(
+            entry_ages[..6].iter().all(|a| a.is_none_or(|ms| ms >= 100)),
+            "J1..J6 must also start FailedHold stale (>= 100 ms), got {entry_ages:?}"
+        );
+        // Unmute J7 at rest jaw position (-1.2 rad); NO manual feedback pushes, NO other traffic.
+        r.bus.with(|s| {
+            s.motors[6].silent = false;
+            s.motors[6].q = -1.2;
+            for j in 0..6 {
+                s.motors[j].drop_torque_frames = 0;
+            }
+        });
+        println!("[FakeBus][FailedHold] entry_ages_ms={entry_ages:?}");
+
+        let mut all_fresh_at_tick: Option<usize> = None;
+        for tick in 1..=7 {
+            r.bus.clear_log();
+            let _ = r.step();
+            let cc_ids: Vec<u16> = r
+                .bus
+                .tx_log()
+                .iter()
+                .filter(|f| f.id == 0x7FF && f.data[2] == 0xCC)
+                .map(|f| u16::from_le_bytes([f.data[0], f.data[1]]))
+                .collect();
+            assert!(
+                cc_ids.len() <= 1,
+                "FailedHold tick {tick}: at most 1 0xCC per tick, got {cc_ids:?}"
+            );
+            let obs = r.fx.core.current_observation();
+            let ages = obs.feedback_age_ms;
+            let all_fresh = ages.len() == 7
+                && ages.iter().all(|a| a.is_some_and(|ms| ms <= 100));
+            println!(
+                "[FakeBus][FailedHold] tick={tick} cc_ids={cc_ids:?} ages_ms={ages:?} all_fresh={all_fresh}"
+            );
+            if all_fresh && all_fresh_at_tick.is_none() {
+                all_fresh_at_tick = Some(tick);
+            }
+        }
+        let fresh_tick = all_fresh_at_tick.expect(
+            "after ENABLE_FAILED in FailedHold at rest, every joint J1..J7 must be fresh within 7 ticks",
+        );
+        assert!(
+            fresh_tick <= 7,
+            "all 7 joints must be fresh within 7 ticks, took {fresh_tick}"
+        );
+
+        // Now request torque(false) at rest -> MUST succeed!
+        r.bus.clear_log();
+        r.submit_transition(TransitionOp::TorqueOff);
+        let mut torque_off_outcome = None;
+        for _ in 0..15 {
+            let rep = r.step();
+            if let Some((_, o)) = rep.transition_ended {
+                torque_off_outcome = Some(o);
+                break;
+            }
+        }
+        assert_eq!(
+            torque_off_outcome,
+            Some(Outcome::Completed),
+            "torque(false) at rest in FailedHold must succeed after refresh"
+        );
+        assert!(!r.fx.core.is_torqued);
+        assert_eq!(r.fx.core.torque_intent, armd::TorqueIntent::Off);
+        let disable_frames = r
+            .bus
+            .tx_log()
+            .iter()
+            .filter(|f| f.data == damiao::CMD_DISABLE)
+            .count();
+        assert!(
+            disable_frames >= 7,
+            "all 7 motors must receive CMD_DISABLE on rest-pose disable (sent {disable_frames})"
+        );
+        println!(
+            "[FakeBus][FailedHold] all_fresh_at_tick={fresh_tick} torque_off=Completed cmd_disable_frames={disable_frames}"
+        );
+    }
+
+    // Part C: Stale J7 alone (never answered, age=None under NoOutputUntilFresh) does NOT block
+    // rest-pose disable after ENABLE_FAILED in FailedHold!
+    {
+        let mut r = make_pos_force_exec_rig(true);
+        r.bus.with(|s| {
+            s.motors[6].silent = true;
+            for j in 0..6 {
+                s.motors[j].q = 0.0;
+                s.motors[j].drop_torque_frames = 10;
+            }
+        });
+        r.clock.advance(Duration::from_millis(120));
+        r.submit_transition(TransitionOp::TorqueOn);
+        for _ in 0..20 {
+            if r.step().transition_ended.is_some() {
+                break;
+            }
+        }
+        assert_eq!(
+            r.fx.core.enable_lifecycle(),
+            armd::supervisor::EnableLifecycle::FailedHold
+        );
+        // Keep J7 permanently silent/stale (`age = None`) while J1..J6 refresh and accumulate K=3
+        // fresh rest samples via RefreshScheduler + measured holds!
+        r.bus.with(|s| {
+            for j in 0..6 {
+                s.motors[j].drop_torque_frames = 0;
+            }
+        });
+        for _ in 0..15 {
+            let _ = r.step();
+        }
+        let obs_before = r.fx.core.current_observation();
+        assert!(
+            obs_before.feedback_age_ms[6].is_none(),
+            "J7 must still have no fresh feedback: {:?}",
+            obs_before.feedback_age_ms
+        );
+        assert!(
+            obs_before.feedback_age_ms[..6]
+                .iter()
+                .all(|a| a.is_some_and(|ms| ms <= 100)),
+            "J1..J6 must be fresh at rest: {:?}",
+            obs_before.feedback_age_ms
+        );
+
+        r.bus.clear_log();
+        r.submit_transition(TransitionOp::TorqueOff);
+        let rep0 = r.step();
+        assert!(
+            matches!(rep0.command, Some((_, Ok(_)))),
+            "stale J7 alone must NOT refuse rest-pose disable: {:?}",
+            rep0.command
+        );
+        let cmd_disable_count = r
+            .bus
+            .tx_log()
+            .iter()
+            .filter(|f| f.data == damiao::CMD_DISABLE)
+            .count();
+        assert!(
+            cmd_disable_count >= 7,
+            "stale J7 alone must NOT block CMD_DISABLE dispatch (sent {cmd_disable_count})"
+        );
+        // Allow J7 to ack disable so TorqueOff confirms completion.
+        r.bus.with(|s| s.motors[6].silent = false);
+        let mut done = None;
+        for _ in 0..10 {
+            let rep = r.step();
+            if let Some((_, o)) = rep.transition_ended {
+                done = Some(o);
+                break;
+            }
+        }
+        assert_eq!(done, Some(Outcome::Completed), "stale-J7 rest-pose disable must complete");
+        assert!(!r.fx.core.is_torqued);
+        println!(
+            "[FakeBus][stale-J7-disable] j7_age_before={:?} j1_j6_ages_before={:?} cmd_disable_dispatched={cmd_disable_count} outcome=Completed",
+            obs_before.feedback_age_ms[6],
+            &obs_before.feedback_age_ms[..6]
+        );
+    }
+}
+
+#[test]
+fn addendum_stale_arm_joint_j1_to_j6_still_blocks_rest_pose_disable() {
+    // Verify for every arm joint J1..J6 (indices 0..6): when that single arm joint is silent/stale
+    // while all other 6 joints (including J7) have fresh K=3 rest feedback, rest-pose disable is
+    // BLOCKED with 0 CMD_DISABLE frames transmitted and refuses with TorqueOffWouldDrop / expiry.
+    for stale_arm_joint in 0..6usize {
+        let mut r = ExecRig::new();
+        r.arm_now();
+        r.fx.core
+            .safety
+            .trigger_fault_coded(FaultCode::BusLoss, FaultReason::BusLoss);
+        r.bus.with(|s| {
+            s.follow_commands = false;
+            s.rx.clear();
+            s.pending.clear();
+            s.delayed.clear();
+            for m in &mut s.motors {
+                m.q = 0.0;
+            }
+            s.motors[stale_arm_joint].silent = true;
+        });
+        r.clock.advance(Duration::from_millis(120));
+        r.step(); // observe empty RX queue boundary
+        for _ in 0..3 {
+            r.clock.advance(Duration::from_millis(10));
+            r.bus.with(|s| {
+                for j in 0..7 {
+                    if j != stale_arm_joint {
+                        s.push_feedback(j);
+                    }
+                }
+            });
+            r.step();
+        }
+
+        // Direct supervisor check must refuse with StaleOrMissingFeedback.
+        assert_eq!(
+            r.fx.core.may_disable_torque_while_stopped(),
+            Err(StoppedTorqueOffRefusal::StaleOrMissingFeedback),
+            "stale J{} must be refused by supervisor rest gate",
+            stale_arm_joint + 1
+        );
+
+        // TransitionOp::TorqueOff must transmit ZERO CMD_DISABLE frames while J{stale_arm_joint+1}
+        // stays silent and must fail after the 1 s AwaitRestGate lifetime.
+        r.bus.clear_log();
+        r.submit_transition(TransitionOp::TorqueOff);
+        let mut outcome = None;
+        for _ in 0..60 {
+            let rep = r.step();
+            if let Some((_, o)) = rep.transition_ended {
+                outcome = Some(o);
+                break;
+            }
+        }
+        assert!(
+            matches!(outcome, Some(Outcome::Failed(_))),
+            "stale J{} must fail rest-pose TorqueOff, got {outcome:?}",
+            stale_arm_joint + 1
+        );
+        assert_eq!(
+            r.bus
+                .tx_log()
+                .iter()
+                .filter(|f| f.data == damiao::CMD_DISABLE)
+                .count(),
+            0,
+            "stale J{} must transmit ZERO CMD_DISABLE frames",
+            stale_arm_joint + 1
+        );
+        assert!(
+            r.fx.core.is_torqued,
+            "stale J{} must keep torque on",
+            stale_arm_joint + 1
+        );
+    }
+}
