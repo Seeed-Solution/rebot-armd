@@ -6763,6 +6763,10 @@ impl SupervisorInner {
                     {
                         out.driver_torque_lost = true;
                     }
+                    // R1/B2: Sync MIT ownership loss before capturing hold-mode verification so
+                    // MIT-configured joints in verified `PosVel` fall back to position-mode holds
+                    // while joints still in `Mit` mode enter L2's 200 ms readback -> fault bound.
+                    driver.set_mit_ownership_lost(self.mit.owner == crate::mit::MitOwner::Lost);
                     // R1: Refresh the owner-held driver snapshot while already holding the driver
                     // lock so stopped-hold capture and MIT stopped-hold preparation never lock
                     // `self.driver` or allocate.

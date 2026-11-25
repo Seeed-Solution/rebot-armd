@@ -2115,15 +2115,6 @@ impl SupervisorInner {
         }
         let dof = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
         let (mut hold_mask, invalidated_mask) = self.snapshot_measured_hold_with_invalidated();
-        // B2: When MIT ownership is Lost, do NOT return early — exclude ONLY MIT-owned joints so
-        // every other position joint continues receiving its stationary hold.
-        let mit_lost_mask = if self.mit.owner == crate::mit::MitOwner::Lost {
-            let mask = crate::mit::mit_joint_mask(&self.config);
-            hold_mask &= !mask;
-            mask
-        } else {
-            0
-        };
 
         let mut targets = std::mem::take(&mut self.scratch.targets);
         targets.clear();
@@ -2198,6 +2189,7 @@ impl SupervisorInner {
         let write_result = match self.driver.as_ref() {
             Some(d) => match d.try_lock() {
                 Ok(mut drv) => {
+                    drv.set_mit_ownership_lost(self.mit.owner == crate::mit::MitOwner::Lost);
                     drv.drop_pending_holds_outside_mask(keep_queued_mask);
                     drv.set_pending_pos_force_hold_hint(true);
                     let r = drv.write_measured_hold_masked(hold_mask, &targets);
@@ -2287,10 +2279,8 @@ impl SupervisorInner {
                         next_pending_mask |= 1u64 << j;
                     }
                     // B2: Preserve captured hold targets while torque_intent == On; only clear
-                    // when explicitly SkippedOff (and not merely masked out for MIT loss).
-                    if report.joint_status[j] == JointHoldStatus::SkippedOff
-                        && (mit_lost_mask & (1u64 << j)) == 0
-                    {
+                    // when explicitly SkippedOff (UnheldNoVerifiedMode preserves captured_positions).
+                    if report.joint_status[j] == JointHoldStatus::SkippedOff {
                         self.measured_hold.captured_positions[j] = None;
                         self.measured_hold.captured_continuity_epoch[j] = None;
                         self.measured_hold.last_seen_fresh_at[j] = None;

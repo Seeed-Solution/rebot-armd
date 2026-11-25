@@ -8290,8 +8290,9 @@ fn r11_b2_holds_never_dropped_on_stale_feedback_or_mit_owner_lost() {
         }
     }
 
-    // Part 2: MIT ownership Lost (with J4 configured as MIT and driver MIT fence tripped) ->
-    // MIT joint J4 receives 0 frames while ALL non-MIT position joints (J1–J3, J5–J7) stay held!
+    // Part 2: MIT ownership Lost while J4 is configured as MIT with verified `PosVel` mode ->
+    // R12 B2: MIT Lost MUST NOT mask out J4; J4 falls back to verified `PosVel` hold (`0x104`)
+    // with ZERO MIT frames (`0x004`), and all other position joints stay held.
     {
         let clock = MockClock::new();
         let bus = FakeBus::with_clock(&limits(), clock.clone());
@@ -8330,7 +8331,7 @@ fn r11_b2_holds_never_dropped_on_stale_feedback_or_mit_owner_lost() {
         enable_torque_admitted(&mut inner).unwrap();
         inner.config.joint_tracking.as_mut().unwrap().enabled = true;
 
-        // Simulate MIT ownership loss + tripped driver MIT fence while stopped.
+        // Simulate MIT ownership loss + armed driver MIT fence while stopped; J4 is verified `PosVel`.
         inner.mit.owner = MitOwner::Lost;
         inner.apply_stop_policy(StopPolicy::EStopLatch);
         {
@@ -8344,22 +8345,22 @@ fn r11_b2_holds_never_dropped_on_stale_feedback_or_mit_owner_lost() {
         inner.tick(0.02);
 
         let tx = bus.tx_log();
-        // J4 (MIT joint, index 3 -> 0x004 / 0x104) MUST NOT be commanded.
+        // J4 MUST NOT receive any MIT frame (`0x004`), and MUST fall back to verified `PosVel` (`0x104`).
         assert!(
-            tx.iter().all(|f| f.id != 0x004 && f.id != 0x104),
-            "B2: MIT-lost joint J4 must not be commanded: {tx:?}"
+            tx.iter().all(|f| f.id != 0x004),
+            "R12 B2: MIT-lost joint J4 must not receive MIT frames (0x004): {tx:?}"
         );
-        // Every non-MIT position joint (J1, J2, J3, J5, J6, J7 -> 0x101..0x103, 0x105..0x107) MUST be held!
-        for j in [0usize, 1, 2, 4, 5, 6] {
+        // Every joint including J4 (0x101..=0x107) MUST be held in verified `PosVel` mode!
+        for j in 0..7usize {
             let can_id = 0x101u32 + j as u32;
             let f = tx
                 .iter()
                 .find(|f| f.id == can_id)
-                .unwrap_or_else(|| panic!("B2: non-MIT joint J{} (0x{can_id:03X}) must still be held under MitOwner::Lost: {tx:?}", j + 1));
+                .unwrap_or_else(|| panic!("R12 B2: joint J{} (0x{can_id:03X}) must be held in PosVel under MitOwner::Lost: {tx:?}", j + 1));
             let sent_q = decode_damiao_pos_vel_pos(f);
             assert!(
                 (sent_q - hold_pose[j]).abs() < 2e-3,
-                "B2: non-MIT J{} must hold {}, got {sent_q}",
+                "R12 B2: J{} must hold {}, got {sent_q}",
                 j + 1,
                 hold_pose[j]
             );
@@ -9303,4 +9304,190 @@ fn r12_b1_feetech_legacy_pending_disable_continues_holds_without_starvation() {
         parse_feetech_sync_write_goal_steps(&tx_r4).is_empty(),
         "B1: Feetech holds must stop after accepted disable"
     );
+}
+
+/// R12 B2: `MitOwner::Lost` must NEVER mask out held joints:
+/// 1. When J4 (configured as MIT) has verified `PosVel` mode, it falls back to `0x104`
+///    `PosVel` hold at its captured position (0 `0x004` MIT frames).
+/// 2. When J4 is still in `Mit` mode (no verified non-MIT hold mode), it stays unheld ONLY
+///    under L2's 200 ms `RID_CTRL_MODE` readback bound and latches a non-recoverable
+///    `HardwareFault` at 200 ms while all other joints stay held.
+/// 3. If J4 reports `PosVel` (`CTRL_MODE = 2`) on L2's `RID_CTRL_MODE` readback before 200 ms,
+///    it immediately resumes verified `0x104` `PosVel` holds at its preserved captured target
+///    without faulting.
+#[test]
+fn r12_b2_mit_lost_falls_back_to_verified_posvel_hold_or_faults_under_l2_bound() {
+    use armd::driver::{JointHoldStatus, JointMode, JointTarget};
+    use armd::mit::MitOwner;
+
+    let make_rig = |j4_in_mit_mode: bool| {
+        let clock = MockClock::new();
+        let bus = FakeBus::with_clock(&limits(), clock.clone());
+        let mut cfg = ArmConfig {
+            lease_timeout_ms: 600_000,
+            ..ArmConfig::rebot_dm()
+        };
+        let mut jt = armd::tracking::JointTrackingConfig::rebot_dm();
+        jt.enabled = false;
+        jt.joints[3].strategy = armd::tracking::TrackingStrategy::Mit;
+        jt.joints[3].kp = 10.0;
+        jt.joints[3].kd = 0.5;
+        jt.joints[3].effort_limit_nm = 3.0;
+        jt.joints[3].gravity_scale = 0.0;
+        jt.joints[3].hold_kp = Some(10.0);
+        jt.joints[3].hold_kd = Some(0.5);
+        cfg.joint_tracking = Some(jt);
+
+        let mut dm = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits())
+            .unwrap();
+        let hold_pose = [0.10_f32, 0.20, -0.15, 0.30, -0.20, 0.05, 0.0];
+        bus.with(|s| {
+            s.follow_commands = false;
+            s.immediate_replies = true;
+            for (i, m) in s.motors.iter_mut().enumerate() {
+                m.q = hold_pose[i];
+            }
+            s.push_all_feedback();
+        });
+        dm.read_joint_states().unwrap();
+        dm.check_mapping_ranges();
+        let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(dm));
+        inner.lease_enabled = false;
+        inner.tick(0.02);
+        enable_torque_admitted(&mut inner).unwrap();
+        if j4_in_mit_mode {
+            // Switch J4 into MIT mode with verified mode evidence.
+            let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+            let modes = [
+                JointMode::Position,
+                JointMode::Position,
+                JointMode::Position,
+                JointMode::Mit,
+                JointMode::Position,
+                JointMode::Position,
+                JointMode::Position,
+            ];
+            let targets: Vec<JointTarget> = hold_pose
+                .iter()
+                .map(|&p| JointTarget {
+                    position: p,
+                    velocity: Some(0.0),
+                    kp: Some(10.0),
+                    kd: Some(0.5),
+                    torque: Some(0.0),
+                })
+                .collect();
+            drv.set_joint_modes(&modes, &targets).unwrap();
+        }
+        // Capture initial stopped hold targets before MIT loss so J4 has a captured target.
+        inner.apply_stop_policy(StopPolicy::EStopLatch);
+        clock.advance(Duration::from_millis(20));
+        bus.with(|s| s.push_all_feedback());
+        inner.tick(0.02);
+        (inner, bus, clock, hold_pose)
+    };
+
+    // Case 1: J4 verified in `PosVel` + `MitOwner::Lost` -> falls back directly to `0x104`.
+    {
+        let (mut inner, bus, clock, hold_pose) = make_rig(false);
+        inner.mit.owner = MitOwner::Lost;
+        clock.advance(Duration::from_millis(20));
+        bus.with(|s| s.push_all_feedback());
+        bus.clear_log();
+        inner.tick(0.02);
+        let tx = bus.tx_log();
+        assert!(tx.iter().all(|f| f.id != 0x004), "Case 1: zero MIT frames on J4: {tx:?}");
+        let j4_frame = tx
+            .iter()
+            .find(|f| f.id == 0x104)
+            .expect("Case 1: J4 must hold in verified PosVel (0x104) under MitOwner::Lost");
+        assert!((decode_damiao_pos_vel_pos(j4_frame) - hold_pose[3]).abs() < 2e-3);
+        assert_eq!(inner.joint_hold_status()[3], JointHoldStatus::Held);
+    }
+
+    // Case 2: J4 still in `Mit` mode + `MitOwner::Lost` -> unheld under L2 200 ms bound -> HardwareFault.
+    {
+        let (mut inner, bus, clock, hold_pose) = make_rig(true);
+        inner.mit.owner = MitOwner::Lost;
+        // Tick 1 under MIT loss: J4 stays unheld (0x004 & 0x104 absent), L2 probes RID_CTRL_MODE.
+        clock.advance(Duration::from_millis(20));
+        bus.with(|s| s.push_all_feedback());
+        bus.clear_log();
+        inner.tick(0.02);
+        let tx1 = bus.tx_log();
+        assert!(
+            tx1.iter().all(|f| f.id != 0x004 && f.id != 0x104),
+            "Case 2: J4 in Mit mode under MitOwner::Lost must stay unheld until non-MIT mode verified: {tx1:?}"
+        );
+        assert!(
+            tx1.iter().any(|f| f.id == 0x7FF && f.data[..4] == [4, 0, 0x33, 10]),
+            "Case 2: L2 must probe RID_CTRL_MODE for unverified J4: {tx1:?}"
+        );
+        assert_eq!(inner.joint_hold_status()[3], JointHoldStatus::UnheldNoVerifiedMode);
+        assert!(
+            !inner.safety.has_latched_fault_code(FaultCode::HardwareFault),
+            "Case 2: L2 must not fault before 200 ms bound"
+        );
+        // Advance past 200 ms with J4 still reporting CTRL_MODE=1 (Mit): L2 latches non-recoverable HardwareFault.
+        for _ in 0..10 {
+            clock.advance(Duration::from_millis(25));
+            bus.with(|s| s.push_all_feedback());
+            bus.clear_log();
+            inner.tick(0.02);
+            let tx = bus.tx_log();
+            assert!(tx.iter().all(|f| f.id != 0x004 && f.id != 0x104));
+            for j in [0usize, 1, 2, 4, 5, 6] {
+                let id = 0x101u32 + j as u32;
+                let f = tx.iter().find(|f| f.id == id).expect("other joints remain held");
+                assert!((decode_damiao_pos_vel_pos(f) - hold_pose[j]).abs() < 2e-3);
+            }
+        }
+        assert!(
+            inner.safety.has_latched_fault_code(FaultCode::HardwareFault),
+            "Case 2: L2 must raise HardwareFault at 200 ms when J4 has no verified non-MIT hold mode"
+        );
+        let fault = inner.safety.fault().expect("fault latched");
+        assert!(!fault.recoverable, "Case 2: L2 unverified-mode fault must be non-recoverable");
+    }
+
+    // Case 3: J4 in `Mit` mode + `MitOwner::Lost`, then J4 reports `CTRL_MODE=2 (PosVel)` before 200 ms ->
+    // falls back immediately to verified `0x104` hold at its preserved captured target without L2 fault!
+    {
+        let (mut inner, bus, clock, hold_pose) = make_rig(true);
+        inner.mit.owner = MitOwner::Lost;
+        clock.advance(Duration::from_millis(20));
+        bus.with(|s| s.push_all_feedback());
+        inner.tick(0.02);
+        assert_eq!(inner.joint_hold_status()[3], JointHoldStatus::UnheldNoVerifiedMode);
+
+        // Motor switches to PosVel (CTRL_MODE=2); next L2 RID_CTRL_MODE readback verifies it.
+        bus.with(|s| {
+            s.motors[3].set_reg_u32(damiao::RID_CTRL_MODE, damiao::CTRL_MODE_POS_VEL);
+            s.push_all_feedback();
+        });
+        clock.advance(Duration::from_millis(20));
+        inner.tick(0.02); // sends RID_CTRL_MODE readback & queues reply (or receives it next tick)
+        clock.advance(Duration::from_millis(20));
+        bus.with(|s| s.push_all_feedback());
+        bus.clear_log();
+        inner.tick(0.02);
+
+        let tx = bus.tx_log();
+        assert!(tx.iter().all(|f| f.id != 0x004), "Case 3: zero MIT frames on J4: {tx:?}");
+        let j4_frame = tx
+            .iter()
+            .find(|f| f.id == 0x104)
+            .expect("Case 3: once PosVel is verified via L2 readback, J4 must resume 0x104 hold");
+        assert!(
+            (decode_damiao_pos_vel_pos(j4_frame) - hold_pose[3]).abs() < 2e-3,
+            "Case 3: J4 must hold its preserved captured target {}",
+            hold_pose[3]
+        );
+        assert_eq!(inner.joint_hold_status()[3], JointHoldStatus::Held);
+        assert!(
+            !inner.safety.has_latched_fault_code(FaultCode::HardwareFault),
+            "Case 3: no L2 fault when PosVel verifies within 200 ms"
+        );
+    }
 }

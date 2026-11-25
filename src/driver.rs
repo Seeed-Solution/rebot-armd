@@ -1648,6 +1648,11 @@ pub trait ArmDriver: Send {
     /// next confirmed enable; no autonomous frame is sent for `holdoff`.
     fn set_mit_deadline_fence(&mut self, _deadline: Option<Duration>, _holdoff: Duration) {}
 
+    /// Records whether supervisor MIT ownership is currently `Lost` so `verified_hold_mode`
+    /// rejects MIT frames while allowing verified position-mode (`PosVel` / `PosForce`) holds
+    /// to continue without masking out MIT-configured joints (R12 B2).
+    fn set_mit_ownership_lost(&mut self, _lost: bool) {}
+
     /// Operator recovery after an MIT loss in which a motor disabled itself (its command TIMEOUT
     /// expired, error 0xD) while others stay enabled: clear-error to every motor in an error
     /// state, then disable every motor and require fresh per-motor confirmation (state 0). Sends
@@ -5128,6 +5133,9 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     mit_fence_holdoff: Duration,
     /// The operator cleared the trip (`acknowledge_mit_fence_trip`): polls may resume.
     mit_fence_acked: bool,
+    /// True while supervisor MIT ownership is `Lost`: `verified_hold_mode` rejects MIT frames
+    /// so MIT-configured joints fall back to verified `PosVel` holds or stay unheld under L2.
+    mit_ownership_lost: bool,
     /// RX sequence boundary captured at the start of the most recent [`ArmDriver::mit_expiry_recover`]
     /// request; final MIT clear requires every joint's `last_feedback_seq` to exceed this boundary.
     last_mit_recovery_rx_seq: Option<u64>,
@@ -5953,6 +5961,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             mit_fence_trip: None,
             mit_fence_holdoff: Duration::ZERO,
             mit_fence_acked: false,
+            mit_ownership_lost: false,
             last_mit_recovery_rx_seq: None,
             mit_tracking_used: false,
             torque_hs: None,
@@ -9928,6 +9937,11 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if verified != active {
             return None;
         }
+        if verified == DamiaoControlMode::Mit
+            && (self.mit_ownership_lost || self.mit_fence_trip.is_some())
+        {
+            return None;
+        }
         Some(verified)
     }
 
@@ -9963,6 +9977,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.mit_fence = None;
         self.mit_fence_trip = None;
         self.mit_fence_acked = false;
+        self.mit_ownership_lost = false;
         self.last_mit_recovery_rx_seq = None;
         self.mit_tracking_used = false;
         self.mit_fence_last_cmd.fill(None);
@@ -10753,6 +10768,10 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         self.mit_fence_holdoff = holdoff;
         let now = self.now();
         self.mit_fence_last_cmd.fill(deadline.map(|_| now));
+    }
+
+    fn set_mit_ownership_lost(&mut self, lost: bool) {
+        self.mit_ownership_lost = lost;
     }
 
     fn mit_fence_trip(&self) -> Option<String> { self.mit_fence_trip.as_ref().map(|(r, _)| r.to_string()) }

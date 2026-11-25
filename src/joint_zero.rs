@@ -456,6 +456,7 @@ impl ArmDriver for ZeroOffsetDriver {
         }
     }
     fn set_mit_deadline_fence(&mut self, deadline: Option<Duration>, holdoff: Duration) { self.inner.set_mit_deadline_fence(deadline, holdoff) }
+    fn set_mit_ownership_lost(&mut self, lost: bool) { self.inner.set_mit_ownership_lost(lost) }
     fn mit_fence_trip(&self) -> Option<String> { self.inner.mit_fence_trip() }
     fn mit_fence_trip_bounded(
         &self,
