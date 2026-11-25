@@ -1325,6 +1325,13 @@ pub struct SupervisorInner {
     /// Shared per-connection bounded action-terminal FIFO broadcaster (wired by `ArmSupervisor::new`;
     /// `None` on standalone `SupervisorInner::new`, never locked on `armd-control`).
     terminals: Option<Arc<TerminalBroadcaster>>,
+    /// Preallocated lock-free SPSC ring carrying `Copy` [`RtTerminalStatus`] records from
+    /// `armd-control` to `armd-dispatch` with zero RT heap allocations and zero RT locks.
+    #[cfg(not(target_arch = "wasm32"))]
+    rt_terminal_tx: Option<crate::rt_core::reply_router::RtTerminalTx>,
+    /// Monotonic overflow counter for `rt_terminal_tx` (zero under normal bounded admission).
+    #[cfg(not(target_arch = "wasm32"))]
+    rt_terminal_overflow: Option<Arc<AtomicU64>>,
     /// Monotonic count of deferred safety log events dropped at the RT->off-thread SPSC ring.
     pub(crate) safety_log_ring_dropped: u64,
     /// Deterministic test hook invoked inside `publish_at` strictly before `core.publish(...)`.
@@ -2340,6 +2347,10 @@ impl SupervisorInner {
             consumed_stamps: ConsumedStamps::new(),
             consumed_broker_stamps: ConsumedStamps::new(),
             terminals: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            rt_terminal_tx: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            rt_terminal_overflow: None,
             safety_log_ring_dropped: 0,
             before_publish_hook: None,
             tx_joint_no_progress_ticks: vec![0; dof],
@@ -3022,12 +3033,37 @@ impl SupervisorInner {
     }
 
     /// Ensures every subscribed connection's bounded terminal FIFO has room for any action
+    pub(crate) fn terminals_handle(&self) -> Option<Arc<TerminalBroadcaster>> {
+        self.terminals.clone()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn attach_rt_terminal_tx(
+        &mut self,
+        tx: crate::rt_core::reply_router::RtTerminalTx,
+        overflow: Arc<AtomicU64>,
+    ) {
+        self.rt_terminal_tx = Some(tx);
+        self.rt_terminal_overflow = Some(overflow);
+    }
+
+    /// Checks whether every subscribed connection's bounded terminal FIFO (and on RT Executor,
+    /// the lock-free `rt_terminal_tx` SPSC ring) has capacity for any running action that may be
     /// superseded by this start plus the new action's eventual terminal (never drops a terminal).
     pub(crate) fn check_terminal_fifo_for_new_action(&self) -> Result<(), SafetyError> {
+        let has_running = self.last_action.as_ref().is_some_and(|a| a.is_running());
+        let needed = if has_running { 2 } else { 1 };
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.rt_executor_owned {
+            if let Some(tx) = self.rt_terminal_tx.as_ref() {
+                if tx.free_slots() < needed {
+                    return Err(SafetyError::TerminalsBusy);
+                }
+            }
+        }
         let Some(terminals) = self.terminals.as_ref() else {
             return Ok(());
         };
-        let has_running = self.last_action.as_ref().is_some_and(|a| a.is_running());
         if !terminals.can_start_action(has_running, self.rt_executor_owned) {
             return Err(SafetyError::TerminalsBusy);
         }
@@ -3035,10 +3071,23 @@ impl SupervisorInner {
     }
 
     /// Records a finished action (`!is_running()`) into every subscribed connection's bounded
-    /// terminal FIFO (deduped by action ID) and wakes `armd-dispatch` immediately. Skipped on
-    /// `armd-control` (`rt_executor_owned == true`) so RT ticks stay lock-free/zero-alloc.
-    pub(crate) fn record_finished_action(&self, action: &ActionStatus) {
-        if self.rt_executor_owned || action.is_running() {
+    /// terminal FIFO (deduped by action ID) and wakes `armd-dispatch` immediately. On
+    /// `armd-control` (`rt_executor_owned == true`), pushes a zero-alloc `Copy`
+    /// [`RtTerminalStatus`] into the lock-free SPSC `rt_terminal_tx` ring (0 allocs, 0 locks).
+    pub(crate) fn record_finished_action(&mut self, action: &ActionStatus) {
+        if action.is_running() {
+            return;
+        }
+        if self.rt_executor_owned {
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(tx) = self.rt_terminal_tx.as_mut() {
+                let rec = crate::rt_core::reply_router::RtTerminalStatus::from_action_status(action);
+                if tx.push(rec).is_err() {
+                    if let Some(ov) = self.rt_terminal_overflow.as_ref() {
+                        ov.fetch_add(1, Ordering::Release);
+                    }
+                }
+            }
             return;
         }
         if let Some(terminals) = self.terminals.as_ref() {
@@ -3049,12 +3098,27 @@ impl SupervisorInner {
     }
 
     /// Convenience helper: if `self.last_action` matches `id` and is terminal, record it.
-    pub(crate) fn record_finished_action_by_id(&self, id: u64) {
+    pub(crate) fn record_finished_action_by_id(&mut self, id: u64) {
         if self.rt_executor_owned {
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(a) = self.last_action.as_ref().filter(|a| a.id == id && !a.is_running()) {
+                let rec = crate::rt_core::reply_router::RtTerminalStatus::from_action_status(a);
+                if let Some(tx) = self.rt_terminal_tx.as_mut() {
+                    if tx.push(rec).is_err() {
+                        if let Some(ov) = self.rt_terminal_overflow.as_ref() {
+                            ov.fetch_add(1, Ordering::Release);
+                        }
+                    }
+                }
+            }
             return;
         }
         if let Some(a) = self.last_action.as_ref().filter(|a| a.id == id && !a.is_running()) {
-            self.record_finished_action(a);
+            if let Some(terminals) = self.terminals.as_ref() {
+                if terminals.record_finished(a) {
+                    self.core.hub().wake();
+                }
+            }
         }
     }
 
@@ -10113,10 +10177,11 @@ enum WsSlotPhase {
     Closing,
 }
 
-#[derive(Debug, Clone, Copy)]
 struct WsSlotEntry {
     phase: WsSlotPhase,
     opening: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    reply_sink: Option<Arc<crate::rt_core::reply_router::ConnectionReplySink>>,
 }
 
 struct WsConnectionSlotPool {
@@ -10151,9 +10216,62 @@ impl WsConnectionSlotPool {
             WsSlotEntry {
                 phase: WsSlotPhase::Admitted,
                 opening: false,
+                #[cfg(not(target_arch = "wasm32"))]
+                reply_sink: None,
             },
         );
         Ok(handle)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn attach_reply_sink(
+        &self,
+        conn_id: u64,
+        sink: Arc<crate::rt_core::reply_router::ConnectionReplySink>,
+    ) -> bool {
+        let mut g = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(entry) = g.get_mut(&conn_id) else {
+            return false;
+        };
+        if entry.phase == WsSlotPhase::Closing {
+            return false;
+        }
+        entry.reply_sink = Some(sink);
+        true
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn reply_sink(
+        &self,
+        conn_id: u64,
+    ) -> Option<Arc<crate::rt_core::reply_router::ConnectionReplySink>> {
+        let g = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = g.get(&conn_id)?;
+        if entry.phase == WsSlotPhase::Closing {
+            return None;
+        }
+        entry.reply_sink.clone()
+    }
+
+    /// Joins transferred `live_ids` against non-closing `WsSlotEntry` reply sinks for atomic
+    /// executor handover seeding (omits unregistered claimed slots and already-closing slots).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn sinks_for_live_ids(
+        &self,
+        live_ids: &[u64],
+    ) -> Vec<(u64, Arc<crate::rt_core::reply_router::ConnectionReplySink>)> {
+        let g = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::with_capacity(live_ids.len());
+        for &id in live_ids {
+            if let Some(entry) = g.get(&id) {
+                if entry.phase != WsSlotPhase::Closing {
+                    if let Some(sink) = entry.reply_sink.as_ref() {
+                        out.push((id, Arc::clone(sink)));
+                    }
+                }
+            }
+        }
+        out
     }
 
     fn begin_open(&self, conn_id: u64) -> bool {
@@ -10917,6 +11035,8 @@ impl ArmSupervisor {
             self.pending_disconnect_hold.clone(),
         );
         let real = std::mem::replace(&mut *guard, shell);
+        let live_ids: Vec<u64> = real.live_connection_ids().collect();
+        let seeded_ws_sinks = self.ws_slots.sinks_for_live_ids(&live_ids);
 
         match crate::rt_core::executor::spawn_executor(
             real,
@@ -10931,6 +11051,7 @@ impl ArmSupervisor {
             hooks,
         ) {
             Ok((handle, sinks)) => {
+                handle.seed_connection_reply_sinks(seeded_ws_sinks);
                 *self.sinks.lock().unwrap_or_else(|e| e.into_inner()) = Some(sinks);
                 self.executor_base_gen.store(initial_gen, Ordering::Release);
                 {
@@ -11787,6 +11908,18 @@ impl ArmSupervisor {
         self.ws_slots.try_claim()
     }
 
+    /// Attaches a per-connection reply sink to an already-claimed WS slot BEFORE owner
+    /// registration begins, so both live executor registration and Legacy->Executor handover
+    /// seed the exact same sink boundary.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn attach_ws_reply_sink(
+        &self,
+        conn_id: u64,
+        sink: Arc<crate::rt_core::reply_router::ConnectionReplySink>,
+    ) -> bool {
+        self.ws_slots.attach_reply_sink(conn_id, sink)
+    }
+
     /// Number of currently admitted WS connection slots (including closing slots awaiting owner
     /// disconnect confirmation).
     pub fn live_ws_slot_count(&self) -> usize {
@@ -11891,7 +12024,12 @@ impl ArmSupervisor {
                     drop(inner);
                     if self.owner_mode() == OWNER_EXECUTOR {
                         if let Some(handle) = self.executor_handle() {
-                            return match handle.open_connection_async(conn_id).await {
+                            let open_res = if let Some(sink) = self.ws_slots.reply_sink(conn_id) {
+                                handle.open_connection_with_reply_sink_async(conn_id, sink).await
+                            } else {
+                                handle.open_connection_async(conn_id).await
+                            };
+                            return match open_res {
                                 Ok(Ok(())) => Ok(()),
                                 Ok(Err(code)) => {
                                     let status = if code == "TOO_MANY_CONNECTIONS" { 503 } else { 409 };
@@ -11932,7 +12070,12 @@ impl ArmSupervisor {
                 let Some(handle) = self.executor_handle() else {
                     return Err(executor_unavailable());
                 };
-                match handle.open_connection_async(conn_id).await {
+                let open_res = if let Some(sink) = self.ws_slots.reply_sink(conn_id) {
+                    handle.open_connection_with_reply_sink_async(conn_id, sink).await
+                } else {
+                    handle.open_connection_async(conn_id).await
+                };
+                match open_res {
                     Ok(Ok(())) => Ok(()),
                     Ok(Err(code)) => {
                         let status = if code == "TOO_MANY_CONNECTIONS" { 503 } else { 409 };
@@ -14121,23 +14264,32 @@ fn dispatch_loop(
             libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_OTHER, &param);
         }
     }
-    let drain_sinks = || {
+    let drain_sinks = || -> (bool, u64) {
         let s = sinks.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some(s) = s {
             s.drain_all(tick_stats);
+            (true, s.rt_terminal_overflow())
+        } else {
+            (false, 0)
         }
     };
     let mut last = 0u64;
     let mut last_diag = 0u64;
     while !hub.is_closed() {
-        drain_sinks();
+        let (has_sinks, rt_term_overflow) = drain_sinks();
         if let Some(ring) = hub.record_ring() { ring.drain(); }
         let mut new_obs: Option<ArmObservation> = None;
         if hub.published_seq() != last {
             if let Some(s) = hub.latest().filter(|s| s.meta.seq > last) {
                 last = s.meta.seq;
                 last_diag = last_diag.max(s.policy_diag_seq);
-                terminals.record_from_observation(&s.obs);
+                // In executor mode, `rt_terminal_rx` (drained in `drain_sinks()` above) is the
+                // authoritative FIFO source of finished actions so a newer snapshot can never jump
+                // ahead of an earlier terminal still in the ring; only fall back to snapshot
+                // sampling in legacy mode or if the RT terminal ring overflowed.
+                if !has_sinks || rt_term_overflow > 0 {
+                    terminals.record_from_observation(&s.obs);
+                }
                 new_obs = Some(s.obs.clone());
             }
         } else if hub.policy_diag_seq() != last_diag {
@@ -14145,7 +14297,9 @@ fn dispatch_loop(
                 if s.meta.seq > last {
                     last = s.meta.seq;
                     last_diag = last_diag.max(s.policy_diag_seq);
-                    terminals.record_from_observation(&s.obs);
+                    if !has_sinks || rt_term_overflow > 0 {
+                        terminals.record_from_observation(&s.obs);
+                    }
                     new_obs = Some(s.obs.clone());
                 } else if s.policy_diag_seq > last_diag {
                     last_diag = s.policy_diag_seq;
