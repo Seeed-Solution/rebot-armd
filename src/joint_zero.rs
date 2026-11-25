@@ -197,6 +197,9 @@ impl ArmDriver for ZeroOffsetDriver {
         }
         Some(())
     }
+    fn service_pending_refresh(&mut self) -> Result<(), ArmDriverError> {
+        self.inner.service_pending_refresh()
+    }
     fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
         if self.offsets.iter().all(|o| *o == 0.0) { return self.inner.write_joint_targets(targets); }
         let mut m = std::mem::take(&mut self.motor_targets);

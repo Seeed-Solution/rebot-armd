@@ -891,7 +891,9 @@ fn budget_exhaustion_carries_fresh_coalesces_opposite_targets_and_separates_coun
 
 #[test]
 fn shared_tick_budget_refresh_and_early_recovery_backpressure_close_pass() {
-    // Part A: 0xCC refreshes in receive_feedback() share max_frames with write_joint_targets_bounded().
+    // Part A: 0xCC refresh scheduler reserves at most 1 slot per tick BEFORE ordinary TX,
+    // sharing max_frames with write_joint_targets_bounded() and covering all 4 stale motors
+    // round-robin across 4 ticks.
     let (mut d, bus, clock) = enabled_driver();
     d.set_torque(false).unwrap(); // disabled -> stale >= 100 ms sends 0xCC refreshes (no recovery holds)
     bus.clear();
@@ -905,15 +907,46 @@ fn shared_tick_budget_refresh_and_early_recovery_backpressure_close_pass() {
     });
     reset_tx_metrics();
     d.read_joint_states().unwrap();
-    let refresh_count = bus.with(|s| s.tx_accepted.iter().filter(|f| f.id == 0x7FF).count());
-    assert_eq!(refresh_count, 4, "4 stale motors refreshed in receive_feedback");
+    let first_refresh_ids: Vec<u16> = bus.with(|s| {
+        s.tx_accepted
+            .iter()
+            .filter(|f| f.id == 0x7FF && f.data[2] == 0xCC)
+            .map(|f| u16::from_le_bytes([f.data[0], f.data[1]]))
+            .collect()
+    });
+    assert_eq!(first_refresh_ids, vec![4], "at most 1 0xCC slot reserved per tick (J4 first)");
 
-    // In the same tick, only 2 of the 6 attempts remain for target writes.
+    // In the same tick, 5 of the 6 attempts remain for target writes.
     let out = d.write_joint_targets_bounded(&targets_const(0.1)).unwrap();
-    assert_eq!(out, TxBatchOutcome::Deferred { pending: 5 });
+    assert_eq!(out, TxBatchOutcome::Deferred { pending: 2 });
     let m = take_tx_metrics();
-    assert_eq!(m.frames, 6, "combined refresh (4) + target (2) bounded by max_frames = 6");
-    assert_eq!(m.pending, 5);
+    assert_eq!(m.frames, 6, "combined refresh (1) + target (5) bounded by max_frames = 6");
+    assert_eq!(m.pending, 2);
+
+    // Subsequent 3 ticks cover remaining stale motors J5, J6, J7 (1 per tick, round-robin).
+    let mut swept = first_refresh_ids;
+    for _ in 0..3 {
+        clock.advance(ms(20));
+        bus.with(|s| {
+            s.rx.clear();
+            s.tx_log.clear();
+            s.tx_accepted.clear();
+            for j in 0..3 {
+                s.push_feedback(j);
+            }
+        });
+        d.read_joint_states().unwrap();
+        let ids: Vec<u16> = bus.with(|s| {
+            s.tx_accepted
+                .iter()
+                .filter(|f| f.id == 0x7FF && f.data[2] == 0xCC)
+                .map(|f| u16::from_le_bytes([f.data[0], f.data[1]]))
+                .collect()
+        });
+        assert_eq!(ids.len(), 1, "each tick reserves exactly 1 0xCC slot: {ids:?}");
+        swept.extend(ids);
+    }
+    assert_eq!(swept, vec![4, 5, 6, 7], "4 ticks cover all 4 stale motors J4..J7 round-robin");
 
     // Part B: early recovery ENOBUFS closes the ENTIRE shared pass (zero subsequent recovery,
     // refresh, or target transmit attempts even with spare attempts and time).
@@ -3801,7 +3834,7 @@ fn production_damiao_operations_under_latched_estop_table() {
                 (res.is_ok(), bus.with(|s| s.tx_accepted.clone()))
             },
             |tx| {
-                assert_eq!(tx.len(), 7, "expected 7 refresh frames: {tx:?}");
+                assert_eq!(tx.len(), 1, "expected at most 1 refresh frame per tick: {tx:?}");
                 assert!(
                     tx.iter().all(|f| f.id == 0x7FF && f.data[2] == 0xCC),
                     "expected read-only 0xCC refresh frames only: {tx:?}"

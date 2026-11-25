@@ -8347,7 +8347,16 @@ impl SupervisorInner {
                 let read_res = match (budget, transition_rx) {
                     (Some(b), Some((frames, exhausted))) => {
                         if driver.read_cached_joint_states_into(&mut sc.states).is_some() {
-                            Ok((frames, exhausted))
+                            if !exhausted
+                                && self.enable_lifecycle
+                                    == driver_transitions::EnableLifecycle::FailedHold
+                            {
+                                driver
+                                    .service_pending_refresh()
+                                    .map(|()| (frames, exhausted))
+                            } else {
+                                Ok((frames, exhausted))
+                            }
                         } else {
                             let remaining = b.max_rx_frames.saturating_sub(frames);
                             if remaining == 0 {

@@ -1183,6 +1183,11 @@ pub trait ArmDriver: Send {
     fn read_cached_joint_states_into(&self, _out: &mut Vec<JointState>) -> Option<()> {
         None
     }
+    /// Service at most one pending owner-local `0xCC` refresh slot if this tick reused a
+    /// transition RX pass without running `read_joint_states` (zero locks, zero allocations).
+    fn service_pending_refresh(&mut self) -> Result<(), ArmDriverError> {
+        Ok(())
+    }
     /// [`Self::feedback_ages`] into `out`.
     fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) { out.clear(); out.extend_from_slice(&self.feedback_ages()); }
     /// [`Self::feedback_instants`] into `out`.
@@ -7279,7 +7284,6 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     awaiting_rx_boundary: bool,
     is_enabling: bool,
     last_warn_sec: AtomicU64,
-    last_refresh_instant: Option<Instant>,
     /// Confirmed control mode per joint; None = unconfirmed after a failed switch.
     joint_modes: Vec<Option<DamiaoControlMode>>,
     /// Per-joint control mode verified from a causal `RID_CTRL_MODE` readback (or confirmed
@@ -7396,10 +7400,9 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     last_expired_oldest_age: Option<Duration>,
     /// Shared TX pass state across `receive_feedback()`, J7 handshakes, and `write_joint_targets*()` in one tick.
     tick_tx: Option<TickTxPass>,
-    /// Round-robin start index for budget-constrained 0xCC refresh sweeps.
-    refresh_cursor: usize,
-    /// Bitmask of stale joints not yet polled in the current 0xCC refresh sweep.
-    refresh_unfinished: u64,
+    /// Unified owner-local `0xCC` refresh scheduler (fixed `u64` bitmask + round-robin cursor,
+    /// at most one `0xCC` slot per tick across enable, FailedHold, Idle-torqued, and stopped).
+    refresh_scheduler: RefreshScheduler,
     /// Stop/E-stop generation stamp captured when an enable handshake starts so an applied stop
     /// (`requested == applied`) mid-handshake also inhibits subsequent enable frames.
     enable_stop_stamp: Option<StopStamp>,
@@ -7437,8 +7440,6 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     /// Consecutive ticks in which a needed J7 `0xCC` refresh was deferred by TX budget/backpressure;
     /// when `>= 1`, the next tick prioritizes J7's `0xCC` ahead of competing frames so refresh never starves.
     pf_refresh_deferred_ticks: u8,
-    /// True once a J7 `0xCC` refresh has been attempted during the active tick (`begin_tx_tick()`).
-    pf_refresh_attempted_this_tick: bool,
     /// True when an output pass ran since the previous `receive_feedback()` pass.
     output_ran_since_rx: bool,
     /// True when the most recent bounded output pass was a stopped hold (`write_estop_hold_bounded`),
@@ -8079,6 +8080,135 @@ impl PendingTxQueue {
     }
 }
 
+/// Unified owner-local `0xCC` read-only status refresh scheduler for [`DamiaoArmDriver`].
+///
+/// Zero locks, zero heap allocations. Uses a fixed `u64` bitmask (`unfinished_mask` / `swept_mask`)
+/// and round-robin `cursor` to serve every joint lacking recent replies (including J7 under
+/// `NoOutputUntilFresh`) across enable transitions, `FailedHold`, `Idle`-torqued, and stopped
+/// states, enforcing at most ONE `0xCC` slot per tick (`slot_used_this_tick`).
+#[derive(Debug, Default)]
+struct RefreshScheduler {
+    unfinished_mask: u64,
+    swept_mask: u64,
+    cursor: usize,
+    last_sweep_completed: Option<Instant>,
+    slot_used_this_tick: bool,
+}
+
+impl RefreshScheduler {
+    #[inline]
+    fn begin_tick(&mut self) {
+        self.slot_used_this_tick = false;
+    }
+
+    #[inline]
+    fn reset_sweep(&mut self) {
+        self.unfinished_mask = 0;
+        self.swept_mask = 0;
+        self.cursor = 0;
+    }
+
+    #[inline]
+    fn clear_joint(&mut self, joint: usize) {
+        if joint < 64 {
+            let bit = 1u64 << joint;
+            self.unfinished_mask &= !bit;
+            self.swept_mask &= !bit;
+        }
+    }
+
+    #[inline]
+    fn slot_available(&self) -> bool {
+        !self.slot_used_this_tick
+    }
+
+    /// Select the next stale joint to receive this tick's single `0xCC` slot, or `None` if no
+    /// slot is available, no joint is stale, or every stale joint was already polled within
+    /// `cooldown`. Newly stale joints (not in `swept_mask`) are served immediately without
+    /// waiting for an unrelated sweep cooldown.
+    fn pick_next(
+        &mut self,
+        stale_mask: u64,
+        n: usize,
+        now: Instant,
+        cooldown: Duration,
+    ) -> Option<usize> {
+        let valid_mask = if n == 0 {
+            0
+        } else if n >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << n) - 1
+        };
+        let stale = stale_mask & valid_mask;
+        // Any joint that received fresh feedback leaves both masks immediately.
+        self.swept_mask &= stale;
+        self.unfinished_mask &= stale;
+        if stale == 0 || !self.slot_available() {
+            return None;
+        }
+        let cooldown_ready = self
+            .last_sweep_completed
+            .is_none_or(|t| now.saturating_duration_since(t) >= cooldown);
+        let candidates = if self.unfinished_mask != 0 {
+            self.unfinished_mask
+        } else if cooldown_ready {
+            self.swept_mask = 0;
+            stale
+        } else {
+            let new_stale = stale & !self.swept_mask;
+            if new_stale != 0 {
+                new_stale
+            } else {
+                return None;
+            }
+        };
+        let start = self.cursor % n;
+        for offset in 0..n {
+            let i = (start + offset) % n;
+            if (candidates & (1u64 << i)) != 0 {
+                self.unfinished_mask = candidates;
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Record that `joint`'s `0xCC` frame transmitted and flushed in this tick.
+    #[inline]
+    fn commit_sent(&mut self, joint: usize, n: usize, now: Instant) {
+        self.slot_used_this_tick = true;
+        if joint < 64 {
+            let bit = 1u64 << joint;
+            self.unfinished_mask &= !bit;
+            self.swept_mask |= bit;
+        }
+        if n > 0 {
+            self.cursor = (joint + 1) % n;
+        }
+        if self.unfinished_mask == 0 {
+            self.last_sweep_completed = Some(now);
+        }
+    }
+
+    /// Consume this tick's `0xCC` slot without advancing `cursor` or clearing `unfinished_mask`
+    /// when TX budget/backpressure deferred transmission, so the next tick retries the same joint.
+    #[inline]
+    fn record_deferred(&mut self) {
+        self.slot_used_this_tick = true;
+    }
+
+    /// Advance past a joint that failed with a non-retryable transmit error so other stale joints
+    /// are not starved on subsequent ticks.
+    #[inline]
+    fn skip_non_retryable(&mut self, joint: usize, n: usize, now: Instant) {
+        self.commit_sent(joint, n, now);
+    }
+}
+
+/// Read-only `0xCC` status refresh cadence / staleness threshold for joints lacking recent replies.
+const DAMIAO_REFRESH_AFTER: Duration = Duration::from_millis(100);
+
 /// Phase of a pending Damiao torque transition.
 #[derive(Debug)]
 enum DamiaoTorque {
@@ -8271,7 +8401,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             awaiting_rx_boundary: false,
             is_enabling: false,
             last_warn_sec: AtomicU64::new(0),
-            last_refresh_instant: None,
             joint_modes: vec![Some(DamiaoControlMode::PosVel); dof],
             verified_modes: vec![None; dof],
             mode_readback_boundary: vec![None; dof],
@@ -8328,8 +8457,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             last_target_tx_sent_mask: 0,
             last_expired_oldest_age: None,
             tick_tx: None,
-            refresh_cursor: 0,
-            refresh_unfinished: 0,
+            refresh_scheduler: RefreshScheduler::default(),
             enable_stop_stamp: None,
             pf_last_fresh_feedback: None,
             pf_last_fresh_position: None,
@@ -8342,7 +8470,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             pf_fresh_gen: 0,
             pf_refresh_pending: false,
             pf_refresh_deferred_ticks: 0,
-            pf_refresh_attempted_this_tick: false,
             output_ran_since_rx: false,
             last_output_was_hold: false,
             last_hold_tx_due_mask: 0,
@@ -8387,7 +8514,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     /// independently of `read_joint_states()`.
     pub fn begin_tx_tick(&mut self) {
         self.tick_tx = None;
-        self.pf_refresh_attempted_this_tick = false;
+        self.refresh_scheduler.begin_tick();
     }
 
     #[inline]
@@ -9837,9 +9964,169 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.check_pos_force_freshness_for_tx_at(now)
     }
 
-    /// Single refresh sender for a stale active `PosForce` joint (`0xCC` read-only status poll).
-    /// Sends at most ONE `0xCC` per tick (`begin_tx_tick()`) via `send(TxKind::Refresh, ...)`.
-    /// Callers own flushing when this returns `Ok(true)`.
+    /// Compute the fixed `u64` bitmask of joints lacking recent feedback at `now` (zero alloc).
+    ///
+    /// Covers every joint J1–J7 (including J7 under `NoOutputUntilFresh`). When
+    /// `defer_active_pf_freeze` is true and an enabled, verified `PosForce` joint is already
+    /// emitting `0x307` freeze frames during an output pass (`pf_last_fresh_position.is_some()`),
+    /// its `0xCC` slot is left for `emit_pos_force_j7_impl` after `0x307` freeze so tight
+    /// stopped-hold budgets keep Class 1/3 arm holds + J7 freeze prioritized. Under
+    /// `NoOutputUntilFresh` (`pf_last_fresh_position.is_none()`), `FailedHold`, `Idle`-torqued,
+    /// stopped, or any stale arm joint J1–J6, the joint is served directly here before ordinary TX.
+    fn compute_stale_refresh_mask(&self, now: Instant, defer_active_pf_freeze: bool) -> u64 {
+        let n = self.motor_ids.len().min(self.last_feedback_instant.len()).min(64);
+        let active_pf = self.active_pos_force_joint();
+        let pf_configured = self.pos_force.as_ref().map(|pf| pf.joint);
+        let mut stale = 0u64;
+        for i in 0..n {
+            let is_stale = if pf_configured == Some(i) {
+                if defer_active_pf_freeze
+                    && self.is_enabled
+                    && active_pf == Some(i)
+                    && self.pf_last_fresh_position.is_some()
+                    && (self.output_ran_since_rx || self.tx_budget.max_frames <= self.motor_ids.len())
+                {
+                    false
+                } else {
+                    !self.pos_force_feedback_valid(i, now)
+                }
+            } else {
+                self.last_feedback_instant[i]
+                    .is_none_or(|t| now.saturating_duration_since(t) >= DAMIAO_REFRESH_AFTER)
+                    || self.feedback_queue_bound.get(i).copied().flatten().is_none()
+            };
+            if is_stale {
+                stale |= 1u64 << i;
+            }
+        }
+        stale
+    }
+
+    /// Service the unified owner-local `0xCC` refresh scheduler: transmits and flushes at most
+    /// ONE `0xCC` read-only status refresh frame per tick, reserved before ordinary TX.
+    ///
+    /// Preserves all stop, MIT fence (`poll_tx_allowed`), deadline, authority (when enabling),
+    /// and RX-provenance (`last_read_drained && !awaiting_rx_boundary`) checks with zero locks
+    /// and zero heap allocations.
+    fn service_refresh_scheduler(
+        &mut self,
+        expected_stamp: StopStamp,
+        deadline: Option<Deadline>,
+        defer_active_pf_freeze: bool,
+        allowed_mask: u64,
+    ) -> Result<bool, ArmDriverError> {
+        if !self.refresh_scheduler.slot_available() {
+            return Ok(false);
+        }
+        if !self.last_read_drained || self.awaiting_rx_boundary || !self.poll_tx_allowed() {
+            return Ok(false);
+        }
+        if self.is_enabling {
+            self.enable_estop_inhibited()?;
+            self.check_enable_tx_authority()?;
+        } else if self.pending_stop_check(Some(expected_stamp)).is_err() {
+            return Ok(false);
+        }
+        let now = self.now();
+        if deadline.is_some_and(|d| d.passed(now)) {
+            return Ok(false);
+        }
+        let stale_mask = self.compute_stale_refresh_mask(now, defer_active_pf_freeze) & allowed_mask;
+        let n = self.motor_ids.len().min(self.last_feedback_instant.len()).min(64);
+        let Some(joint) =
+            self.refresh_scheduler
+                .pick_next(stale_mask, n, now, DAMIAO_REFRESH_AFTER)
+        else {
+            return Ok(false);
+        };
+        let _ = self.ensure_tx_pass();
+        let kind = if self.is_enabling {
+            TxKind::Handshake
+        } else {
+            TxKind::Refresh
+        };
+        let stamp = if self.is_enabling {
+            self.enable_stop_stamp
+        } else {
+            Some(expected_stamp)
+        };
+        match self.send(kind, stamp, deadline, false, |d| {
+            Some(damiao::build_refresh_frame(d.motor_ids[joint]))
+        }) {
+            Ok(_) => {
+                if self.is_enabling {
+                    self.enable_estop_inhibited()?;
+                    self.check_enable_tx_authority()?;
+                } else if self.pending_stop_check(Some(expected_stamp)).is_err() {
+                    self.discard_all_pending_tx();
+                    self.refresh_scheduler.record_deferred();
+                    return Err(ArmDriverError::EstopInhibited);
+                }
+                if self.flush_cutoff_exceeded() {
+                    self.mark_tx_pass_backpressured();
+                    self.discard_all_pending_tx();
+                    self.refresh_scheduler.record_deferred();
+                    return Err(TransportError::Timeout.into());
+                }
+                if let Err(e) = self.can.flush() {
+                    self.mark_tx_pass_backpressured();
+                    self.discard_all_pending_tx();
+                    self.refresh_scheduler.record_deferred();
+                    return Err(e.into());
+                }
+                self.refresh_scheduler.commit_sent(joint, n, self.now());
+                if self.active_pos_force_joint() == Some(joint) {
+                    self.pf_refresh_pending = false;
+                    self.pf_refresh_deferred_ticks = 0;
+                }
+                Ok(true)
+            }
+            Err(TxRefusal::Deferred | TxRefusal::DeadlinePassed) => {
+                self.refresh_scheduler.record_deferred();
+                if self.active_pos_force_joint() == Some(joint) {
+                    self.pf_refresh_deferred_ticks =
+                        self.pf_refresh_deferred_ticks.saturating_add(1);
+                }
+                Ok(false)
+            }
+            Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged) => {
+                if self.is_enabling {
+                    self.abort_enable_for_estop();
+                } else {
+                    self.discard_all_pending_tx();
+                }
+                Err(ArmDriverError::EstopInhibited)
+            }
+            Err(r @ (TxRefusal::LeaseFenced | TxRefusal::EnableAuthorityExpired)) => {
+                self.torque_hs = None;
+                self.enable_failed();
+                Err(Self::refusal_to_driver_err(r))
+            }
+            Err(TxRefusal::Transport(e)) if e.is_tx_backpressure() => {
+                if self.is_enabling {
+                    self.enable_estop_inhibited()?;
+                    self.check_enable_tx_authority()?;
+                } else if self.pending_stop_check(Some(expected_stamp)).is_err() {
+                    self.discard_all_pending_tx();
+                    return Err(ArmDriverError::EstopInhibited);
+                }
+                self.refresh_scheduler.record_deferred();
+                if self.active_pos_force_joint() == Some(joint) {
+                    self.pf_refresh_deferred_ticks =
+                        self.pf_refresh_deferred_ticks.saturating_add(1);
+                }
+                Ok(false)
+            }
+            Err(_) => {
+                self.refresh_scheduler.skip_non_retryable(joint, n, self.now());
+                Ok(false)
+            }
+        }
+    }
+
+    /// Post-freeze `0xCC` refresh slot for a stale active `PosForce` joint, sharing the single
+    /// [`RefreshScheduler`] per-tick 1-slot cap (`slot_available()`). Callers own flushing when
+    /// this returns `Ok(true)`.
     fn try_send_pf_refresh(&mut self, expected_stamp: StopStamp) -> Result<bool, ArmDriverError> {
         let Some(pf_joint) = self.active_pos_force_joint() else {
             self.pf_refresh_pending = false;
@@ -9847,21 +10134,23 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             return Ok(false);
         };
         if !self.pf_refresh_pending
-            || self.pf_refresh_attempted_this_tick
+            || !self.refresh_scheduler.slot_available()
             || !self.poll_tx_allowed()
         {
             return Ok(false);
         }
-        self.pf_refresh_attempted_this_tick = true;
+        let n = self.motor_ids.len().min(self.last_feedback_instant.len()).min(64);
         match self.send(TxKind::Refresh, Some(expected_stamp), None, false, |d| {
             Some(damiao::build_refresh_frame(d.motor_ids[pf_joint]))
         }) {
             Ok(_) => {
+                self.refresh_scheduler.commit_sent(pf_joint, n, self.now());
                 self.pf_refresh_pending = false;
                 self.pf_refresh_deferred_ticks = 0;
                 Ok(true)
             }
             Err(TxRefusal::Deferred) => {
+                self.refresh_scheduler.record_deferred();
                 self.pf_refresh_pending = true;
                 self.pf_refresh_deferred_ticks = self.pf_refresh_deferred_ticks.saturating_add(1);
                 Ok(false)
@@ -9875,11 +10164,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     self.discard_all_pending_tx();
                     return Err(ArmDriverError::EstopInhibited);
                 }
+                self.refresh_scheduler.record_deferred();
                 self.pf_refresh_pending = true;
                 self.pf_refresh_deferred_ticks = self.pf_refresh_deferred_ticks.saturating_add(1);
                 Ok(false)
             }
             Err(_) => {
+                self.refresh_scheduler.record_deferred();
                 self.pf_refresh_pending = true;
                 self.pf_refresh_deferred_ticks = self.pf_refresh_deferred_ticks.saturating_add(1);
                 Ok(false)
@@ -10873,7 +11164,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
         // nothing cached or queued may be replayed: the group's outputs are uncertain
         self.clear_cached_targets();
-        self.refresh_unfinished = 0;
+        self.refresh_scheduler.reset_sweep();
         self.discard_all_pending_tx();
     }
 
@@ -11754,7 +12045,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if max_rx_frames.is_none() {
             self.begin_tx_tick();
         }
-        self.refresh_unfinished = 0;
+        self.refresh_scheduler.reset_sweep();
         self.enable_stop_stamp = None;
         self.enable_frames_sent_any = false;
         self.enable_estop_inhibited()?;
@@ -12217,6 +12508,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     ) -> Result<Option<u64>, ArmDriverError> {
         self.enable_estop_inhibited()?;
         self.check_enable_tx_authority()?;
+        if !self.refresh_scheduler.slot_available() {
+            return Ok(None);
+        }
         if !self.drain_rx_for_boundary(deadline) {
             self.enable_estop_inhibited()?;
             self.check_enable_tx_authority()?;
@@ -12236,7 +12530,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             Some(damiao::build_refresh_frame(id))
         }) {
             Ok(_) => {}
-            Err(TxRefusal::DeadlinePassed | TxRefusal::Deferred) => return Ok(None),
+            Err(TxRefusal::DeadlinePassed | TxRefusal::Deferred) => {
+                self.refresh_scheduler.record_deferred();
+                return Ok(None);
+            }
             Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged) => {
                 self.abort_enable_for_estop();
                 return Err(ArmDriverError::EstopInhibited);
@@ -12246,12 +12543,17 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 self.enable_failed();
                 return Err(Self::refusal_to_driver_err(r));
             }
-            Err(TxRefusal::Transport(e)) if e.is_tx_backpressure() => return Ok(None),
+            Err(TxRefusal::Transport(e)) if e.is_tx_backpressure() => {
+                self.refresh_scheduler.record_deferred();
+                return Ok(None);
+            }
             Err(r) => return Err(Self::refusal_to_driver_err(r)),
         }
         self.enable_estop_inhibited()?;
         self.check_enable_tx_authority()?;
         self.can.flush()?;
+        let n = self.motor_ids.len().min(self.last_feedback_instant.len()).min(64);
+        self.refresh_scheduler.commit_sent(joint, n, self.now());
         self.refresh_capture = Some(RefreshCapture {
             joint,
             boundary,
@@ -13627,7 +13929,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             }
             self.discard_all_pending_tx();
             self.begin_tx_tick();
-            self.refresh_unfinished = 0;
+            self.refresh_scheduler.reset_sweep();
         }
         let prev_awaiting_rx_boundary = self.awaiting_rx_boundary;
         // E2/L1: Drain RX before checking Rule A′ in `send` so the send-time check sees the
@@ -13691,7 +13993,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             }
             self.discard_all_pending_tx();
             self.begin_tx_tick();
-            self.refresh_unfinished = 0;
+            self.refresh_scheduler.reset_sweep();
             self.awaiting_rx_boundary = new_awaiting_rx_boundary;
         }
         let skip_dispatched = matches!(kind, DisableKind::DisableRequested { .. });
@@ -13738,7 +14040,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         }
                         self.discard_all_pending_tx();
                         self.begin_tx_tick();
-                        self.refresh_unfinished = 0;
+                        self.refresh_scheduler.reset_sweep();
                         self.awaiting_rx_boundary = new_awaiting_rx_boundary;
                     }
                     sent_any = true;
@@ -15206,7 +15508,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             }
             self.enable_stop_stamp = None;
             self.discard_all_pending_tx();
-            self.refresh_unfinished = 0;
+            self.refresh_scheduler.reset_sweep();
             self.pos_force_verified = false;
             self.clear_cached_targets();
             self.awaiting_rx_boundary = !self.last_read_drained;
@@ -17307,6 +17609,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             self.pf_last_fresh_position = None;
             self.pf_hold_on_first_fresh = false;
             self.pf_refresh_pending = false;
+            self.refresh_scheduler.clear_joint(j);
             self.pf_deferred_ticks = 0;
             self.pf_deferred_motion = false;
             self.pf_deferred_since = None;
@@ -17391,6 +17694,17 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         out.clear();
         out.extend_from_slice(&self.cached_states);
         Some(())
+    }
+
+    fn service_pending_refresh(&mut self) -> Result<(), ArmDriverError> {
+        if self.is_enabling {
+            return Ok(());
+        }
+        let stop_stamp = self.current_stop_stamp();
+        match self.service_refresh_scheduler(stop_stamp, None, true, u64::MAX) {
+            Ok(_) | Err(ArmDriverError::EstopInhibited) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
@@ -17940,34 +18254,26 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         } else {
             let _ = self.drop_stopped_hold_tx(rx_stop_stamp);
         }
-        // Class 4 (`0xCC` refresh) when enabled: ONLY emit during RX when no output pass ran since
-        // the previous RX (e.g. `send_to_bus == false` during bus loss) and no Class-1/2/3 frames
-        // are pending. Whenever output runs, `emit_pos_force_j7_impl` emits `0xCC` strictly AFTER
-        // all Class-1, Class-2, and Class-3 arm and J7 frames if spare TX budget remains.
-        let mut rx_pf_refresh_sent = false;
+        // Unified owner-local `0xCC` refresh scheduler: reserves at most ONE `0xCC` slot per tick
+        // BEFORE autonomous recovery and ordinary TX across `FailedHold`, `Idle`-torqued, and
+        // stopped states — serving every joint lacking recent replies, including J7 under
+        // `NoOutputUntilFresh`. (During enable transitions `is_enabling == true`, `poll_enable`
+        // and causal `RefreshCapture` handshakes drive the same `RefreshScheduler`.)
         let enabled_pf_joint = if self.is_enabled { self.active_pos_force_joint() } else { None };
         if let Some(pf_j) = enabled_pf_joint {
-            if rx_drained
-                && !self.awaiting_rx_boundary
-                && !self.is_enabling
-                && self.poll_tx_allowed()
-                && self.pending_stop_check(Some(rx_stop_stamp)).is_ok()
-            {
+            if rx_drained && !self.awaiting_rx_boundary && !self.is_enabling {
                 if self.pos_force_feedback_valid(pf_j, self.now()) {
                     self.pf_refresh_pending = false;
                     self.pf_refresh_deferred_ticks = 0;
-                } else if self.pf_refresh_pending
-                    && !self.output_ran_since_rx
-                    && self.pending_hold_tx.len() == 0
-                    && self.pending_tx.len() == 0
-                    && self.tx_budget.max_frames > self.motor_ids.len()
-                {
-                    if let Ok(true) = self.try_send_pf_refresh(rx_stop_stamp) {
-                        rx_pf_refresh_sent = true;
-                    }
                 } else {
                     self.pf_refresh_pending = true;
                 }
+            }
+        }
+        if !self.is_enabling {
+            match self.service_refresh_scheduler(rx_stop_stamp, None, true, u64::MAX) {
+                Ok(_) | Err(ArmDriverError::EstopInhibited) => {}
+                Err(e) => return Err(e),
             }
         }
         if rx_drained
@@ -18096,126 +18402,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     self.discard_pending_tx_stopped();
                     break;
                 }
-            }
-        }
-        // Damiao motors only transmit in reply to a frame. When feedback goes stale
-        // (idle, bus glitch, motor power dip) nothing would ever refresh it, so a
-        // fault could never be cleared. Poll stale motors with the read-only 0xCC
-        // refresh (`TxKind::Refresh`: allowed while latched, refused while pending).
-        const REFRESH_AFTER: Duration = Duration::from_millis(100);
-        if rx_drained
-            && !self.awaiting_rx_boundary
-            && !self.is_enabling
-            && self.poll_tx_allowed()
-            && self.pending_stop_check(Some(rx_stop_stamp)).is_ok()
-            && !(self.is_enabled
-                && self.output_ran_since_rx
-                && (self.pending_hold_tx.len() > 0
-                    || self.pending_tx.len() > 0
-                    || self.has_class1_transition_pending()))
-        {
-            let cooldown_ready = self.last_refresh_instant.is_none_or(|t| self.since(t) >= REFRESH_AFTER);
-            if cooldown_ready || self.refresh_unfinished != 0 {
-                // the stale motors as a bit set taken before the first transmit (no allocation)
-                let n = self.motor_ids.len().min(self.last_feedback_instant.len()).min(64);
-                let rx_now = self.now();
-                let stale = (0..n)
-                    .filter(|&i| {
-                        // When enabled, the single J7 refresh scheduler owns the active PosForce
-                        // joint so RX does not double-poll or steal J1–J6 budget on tick 1.
-                        if enabled_pf_joint == Some(i) {
-                            return false;
-                        }
-                        if self.active_pos_force_joint() == Some(i) {
-                            return !self.pos_force_feedback_valid(i, rx_now);
-                        }
-                        self.last_feedback_instant[i].is_none_or(|t| self.since(t) >= REFRESH_AFTER)
-                    })
-                    .fold(0u64, |m, i| m | (1 << i));
-                let mut remaining = if self.refresh_unfinished != 0 {
-                    let cont = stale & self.refresh_unfinished;
-                    if cont != 0 {
-                        cont
-                    } else if cooldown_ready {
-                        stale
-                    } else {
-                        0
-                    }
-                } else {
-                    stale
-                };
-                if remaining != 0 && n > 0 {
-                    let _ = self.ensure_tx_pass();
-                    let start = self.refresh_cursor % n;
-                    let mut refresh_sent = false;
-                    let mut stopped_during_refresh = false;
-                    for offset in 0..n {
-                        let i = (start + offset) % n;
-                        if remaining & (1 << i) == 0 {
-                            continue;
-                        }
-                        match self.send(TxKind::Refresh, Some(rx_stop_stamp), None, false, |d| {
-                            Some(damiao::build_refresh_frame(d.motor_ids[i]))
-                        }) {
-                            Ok(_) => {
-                                refresh_sent = true;
-                                remaining &= !(1 << i);
-                                self.refresh_cursor = (i + 1) % n;
-                            }
-                            Err(TxRefusal::Deferred) => break,
-                            Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged) => {
-                                self.discard_all_pending_tx();
-                                stopped_during_refresh = true;
-                                break;
-                            }
-                            Err(TxRefusal::Transport(e)) if e.is_tx_backpressure() => {
-                                if self.pending_stop_check(Some(rx_stop_stamp)).is_err() {
-                                    self.discard_all_pending_tx();
-                                    stopped_during_refresh = true;
-                                }
-                                break;
-                            }
-                            Err(_) => {
-                                remaining &= !(1 << i);
-                                self.refresh_cursor = (i + 1) % n;
-                            }
-                        }
-                    }
-                    if (refresh_sent || rx_pf_refresh_sent)
-                        && !stopped_during_refresh
-                        && self.pending_stop_check(Some(rx_stop_stamp)).is_ok()
-                    {
-                        if self.flush_cutoff_exceeded() {
-                            self.mark_tx_pass_backpressured();
-                            self.discard_all_pending_tx();
-                            return Err(TransportError::Timeout.into());
-                        }
-                        if let Err(e) = self.can.flush() {
-                            self.mark_tx_pass_backpressured();
-                            self.discard_all_pending_tx();
-                            return Err(e.into());
-                        }
-                        rx_pf_refresh_sent = false;
-                    }
-                    self.refresh_unfinished = remaining;
-                    if remaining == 0 && refresh_sent {
-                        self.last_refresh_instant = Some(self.now());
-                    }
-                } else {
-                    self.refresh_unfinished = 0;
-                }
-            }
-        }
-        if rx_pf_refresh_sent && self.pending_stop_check(Some(rx_stop_stamp)).is_ok() {
-            if self.flush_cutoff_exceeded() {
-                self.mark_tx_pass_backpressured();
-                self.discard_all_pending_tx();
-                return Err(TransportError::Timeout.into());
-            }
-            if let Err(e) = self.can.flush() {
-                self.mark_tx_pass_backpressured();
-                self.discard_all_pending_tx();
-                return Err(e.into());
             }
         }
         self.output_ran_since_rx = false;
@@ -18535,7 +18721,7 @@ mod pos_force_emitter {
                     if driver.pending_hold_tx.len() == 0
                         && driver.pending_tx.len() == 0
                         && driver.pf_refresh_pending
-                        && !driver.pf_refresh_attempted_this_tick
+                        && driver.refresh_scheduler.slot_available()
                         && driver.poll_tx_allowed()
                         && driver.can_start_tick_tx()
                         && driver.try_send_pf_refresh(start_stamp)?
@@ -18657,7 +18843,7 @@ mod pos_force_emitter {
 
         let Some(sent_frame) = sent_frame else {
             if driver.pf_refresh_pending
-                && !driver.pf_refresh_attempted_this_tick
+                && driver.refresh_scheduler.slot_available()
                 && driver.poll_tx_allowed()
             {
                 driver.pf_refresh_deferred_ticks =
@@ -18684,7 +18870,7 @@ mod pos_force_emitter {
         if driver.pending_hold_tx.len() == 0
             && driver.pending_tx.len() == 0
             && driver.pf_refresh_pending
-            && !driver.pf_refresh_attempted_this_tick
+            && driver.refresh_scheduler.slot_available()
             && driver.poll_tx_allowed()
             && driver.can_start_tick_tx()
         {
