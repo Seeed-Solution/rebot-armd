@@ -284,6 +284,8 @@ fn reply(snap: &Snapshot, req: &MeasureRequest, frame: &DetectionFrame) -> Value
 /// the commanded positions changed meanwhile, then fit and measure. No lease, no motion.
 pub async fn measure(supervisor: &Arc<ArmSupervisor>, source: &dyn DetectionSource, body: &Value) -> Result<Value, ArmError> {
     let req = parse_request(body)?;
+    // the detector stays as it is until the measurement is done (`POST /api/v1/vision/detector`)
+    let _in_flight = crate::vision_detector::measure_in_flight();
     let snap = snapshot(&*supervisor.inner().read().await)?;
     match source.per_request_pipelines().await {
         Ok(true) => {}
