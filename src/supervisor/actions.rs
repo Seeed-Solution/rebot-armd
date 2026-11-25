@@ -147,6 +147,13 @@ impl SupervisorInner {
             if was_running {
                 self.record_terminal_transition_for(&old);
             }
+            if let Some((evicting_prev, _)) = self.previous_action.as_ref() {
+                if !evicting_prev.is_running() && self.staged_terminals.has_deferred(evicting_prev.id)
+                {
+                    let evicting_id = evicting_prev.id;
+                    self.materialize_deferred_staged_by_id(evicting_id, now);
+                }
+            }
             if let Some((mut prev, _)) = self.previous_action.replace((old, now + 2.0)) {
                 if let Some(msg) = prev.message.take() {
                     self.recycle_action_msg_spare(msg);

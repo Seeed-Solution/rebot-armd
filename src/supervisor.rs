@@ -3225,6 +3225,29 @@ impl SupervisorInner {
         }
     }
 
+    /// Materializes a `StagedTerminal::Deferred` entry in-place into `StagedTerminal::Captured`
+    /// right before `action_id`'s live slot (`previous_action` / `last_action`) is overwritten so
+    /// no deferred terminal can ever be silently skipped at `capture_edge_terminals`.
+    pub(crate) fn materialize_deferred_staged_by_id(&mut self, action_id: u64, obs_timestamp: f64) {
+        let t0 = Instant::now();
+        let Some(seq) = self.staged_terminals.deferred_seq_for(action_id) else {
+            return;
+        };
+        let Some(action) = self.find_terminal_slot(action_id) else {
+            return;
+        };
+        let rec = terminal_capture::TerminalCaptureRecord::capture_from(
+            self,
+            action,
+            seq,
+            obs_timestamp,
+        );
+        self.staged_terminals.replace_deferred_with_captured(action_id, rec);
+        self.last_phase_terminal_us = self
+            .last_phase_terminal_us
+            .saturating_add(crate::diagnostics::tick::us(t0.elapsed()));
+    }
+
     /// Authoritative `running -> !running` transition handler for a superseded `ActionStatus`
     /// (called from `begin_action_inner` when `old` is moving into `previous_action`).
     /// - Off-tick Legacy (`!rt_executor_owned && !defer_terminal_capture`): drains any earlier SPSC
@@ -3265,7 +3288,7 @@ impl SupervisorInner {
             return;
         }
         if let Some(terminals) = self.terminals.as_ref() {
-            if terminals.record_finished_with_seq(seq, action.clone(), None) {
+            if terminals.record_finished_with_seq(seq, action.clone(), None, None) {
                 self.core.hub().wake();
             }
         }
@@ -3304,7 +3327,7 @@ impl SupervisorInner {
             }
             if let Some(a) = self.last_action.as_ref().filter(|a| a.id == id && !a.is_running()) {
                 if let Some(terminals) = self.terminals.as_ref() {
-                    if terminals.record_finished_with_seq(seq, a.clone(), None) {
+                    if terminals.record_finished_with_seq(seq, a.clone(), None, None) {
                         self.core.hub().wake();
                     }
                 }
@@ -6070,14 +6093,6 @@ impl SupervisorInner {
             None
         };
         self.last_poll_feedback_at = all_ages.then_some(poll_before);
-        if self.feedback_numeric_valid && driver_valid {
-            self.core.poll_feedback(
-                &mut self.joint_feedback_queue_bounds,
-                self.config.dof,
-                driver.as_ref(),
-                &mut self.scratch.fb,
-            );
-        }
         self.driver = Some(std::sync::Mutex::new(driver));
     }
 
@@ -10242,6 +10257,7 @@ type TerminalSinkFn = Box<dyn Fn(&ArmObservation) -> bool + Send + Sync>;
 struct QueuedTerminal {
     action: ActionStatus,
     obs_override: Option<ArmObservation>,
+    required_publish_seq: Option<u64>,
 }
 
 struct ConnectionTerminalQueue {
@@ -10398,17 +10414,20 @@ impl TerminalBroadcaster {
 
     #[cfg(test)]
     pub(crate) fn record_finished(&self, action: &ActionStatus) -> bool {
-        self.record_finished_with_seq(0, action.clone(), None)
+        self.record_finished_with_seq(0, action.clone(), None, None)
     }
 
     /// Enqueues a terminal action with authoritative `terminal_seq` (0 when unassigned in direct
     /// unit tests) into every subscriber whose `min_terminal_seq < terminal_seq` (or 0) and that
-    /// has not already seen `action.id`. Updates `max_fifo_len` and `pending_total` with `Release`.
+    /// has not already seen `action.id`. Carries `required_publish_seq` through to delivery so
+    /// `drain_all` never pairs a terminal with a snapshot older than its required publication.
+    /// Updates `max_fifo_len` and `pending_total` with `Release`.
     pub(crate) fn record_finished_with_seq(
         &self,
         terminal_seq: u64,
         action: ActionStatus,
         obs_override: Option<ArmObservation>,
+        required_publish_seq: Option<u64>,
     ) -> bool {
         if action.is_running() || self.subscriber_count.load(Ordering::Acquire) == 0 {
             return false;
@@ -10437,6 +10456,7 @@ impl TerminalBroadcaster {
             q.fifo.push_back(QueuedTerminal {
                 action: action.clone(),
                 obs_override: obs_override.clone(),
+                required_publish_seq,
             });
             enqueued = true;
         }
@@ -10468,18 +10488,28 @@ impl TerminalBroadcaster {
             && self.pending_total.load(Ordering::Acquire) > 0
     }
 
-    pub(crate) fn drain_all(&self, base_obs: &ArmObservation) {
+    /// Drains ready queued terminals onto subscriber sinks, enforcing `required_publish_seq <= base_seq`
+    /// whenever an entry relies on `base_obs`. Returns `true` if any subscriber FIFO stopped at a
+    /// head entry waiting for a newer snapshot (`base_seq < required_publish_seq`).
+    pub(crate) fn drain_all(&self, base_obs: &ArmObservation, base_seq: u64) -> bool {
         if self.dispatch_paused.load(Ordering::Acquire)
             || self.pending_total.load(Ordering::Acquire) == 0
         {
-            return;
+            return false;
         }
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut blocked_on_seq = false;
         // Pop a terminal ONLY after its sink confirms a successful enqueue. On failure
-        // (e.g., outbound queue full -> fatal close triggered), keep the terminal at the
-        // head of the FIFO and keep the subscriber until connection teardown unsubscribes it.
+        // (e.g., outbound queue full -> fatal close triggered) or when `base_seq < required_publish_seq`,
+        // keep the terminal at the head of the FIFO to preserve strict FIFO order and snapshot parity.
         for q in &mut g.sinks {
             while let Some(entry) = q.fifo.front() {
+                if let Some(req_seq) = entry.required_publish_seq {
+                    if entry.obs_override.is_none() && base_seq < req_seq {
+                        blocked_on_seq = true;
+                        break;
+                    }
+                }
                 let mut obs = match entry.obs_override.as_ref() {
                     Some(captured) => captured.clone(),
                     None => base_obs.clone(),
@@ -10494,6 +10524,7 @@ impl TerminalBroadcaster {
             }
         }
         self.recompute_atomics(&g);
+        blocked_on_seq
     }
 
     pub(crate) fn set_capacity(&self, capacity: usize) {
@@ -11853,7 +11884,8 @@ impl ArmSupervisor {
                 .as_ref()
                 .map(|s| &s.obs)
                 .unwrap_or(&self.template_obs);
-            self.terminals.drain_all(base);
+            let base_seq = latest.as_ref().map_or(0, |s| s.meta.seq);
+            let _ = self.terminals.drain_all(base, base_seq);
         }
         drained
     }
@@ -11862,6 +11894,37 @@ impl ArmSupervisor {
     #[doc(hidden)]
     pub fn test_terminal_capture_stats(&self) -> crate::diagnostics::tick::TerminalCaptureStats {
         self.terminal_capture_channel.stats()
+    }
+
+    /// Test-only accessor for forbidden `TerminalCaptureChannel` (`rx` / `rich_action_cache`)
+    /// lock attempts detected on the marked RT control thread.
+    #[doc(hidden)]
+    pub fn test_terminal_capture_control_lock_attempts(&self) -> u64 {
+        self.terminal_capture_channel.control_thread_lock_attempts()
+    }
+
+    /// Test-only hook: hold `TerminalCaptureChannel::rx` mutex (for executor lock proofs).
+    #[doc(hidden)]
+    pub fn test_lock_terminal_capture_rx(&self) -> impl Drop + '_ {
+        self.terminal_capture_channel.lock_rx_for_test()
+    }
+
+    /// Test-only hook: hold `TerminalCaptureChannel::rich_action_cache` mutex (for executor lock proofs).
+    #[doc(hidden)]
+    pub fn test_lock_terminal_capture_rich_cache(&self) -> impl Drop + '_ {
+        self.terminal_capture_channel.lock_rich_cache_for_test()
+    }
+
+    /// Test-only positive control: attempt `TerminalCaptureChannel::rx` lock on the current thread.
+    #[doc(hidden)]
+    pub fn test_touch_terminal_capture_rx_lock(&self) {
+        self.terminal_capture_channel.touch_rx_lock_for_test();
+    }
+
+    /// Test-only positive control: attempt `TerminalCaptureChannel::rich_action_cache` lock on the current thread.
+    #[doc(hidden)]
+    pub fn test_touch_terminal_capture_rich_cache_lock(&self) {
+        self.terminal_capture_channel.touch_rich_cache_lock_for_test();
     }
 
     /// Test-only hook: hold `TerminalBroadcaster`'s internal mutex (for deterministic lock proofs).
@@ -14401,7 +14464,6 @@ impl ArmSupervisor {
             usage_locked,
             pre,
             publish,
-            allocs,
             mid_csw_start,
             phase_alloc_read,
             phase_ack_flush,
@@ -14456,9 +14518,6 @@ impl ArmSupervisor {
             let after_publish = Instant::now();
             Self::flush_legacy_estop_acks_into(&self.estop_reg, &mut inner);
             let after_ack_flush = Instant::now();
-            // Sample allocator totals at the end of the guarded interval so the alloc proof covers
-            // disconnect drain, tick control, edge-triggered terminal capture, publish, and ACK flush.
-            let allocs = crate::diagnostics::alloc::take();
             let lock_end = Instant::now();
             (
                 kept,
@@ -14474,7 +14533,6 @@ impl ArmSupervisor {
                 usage_locked,
                 body_start.saturating_duration_since(locked),
                 after_publish.saturating_duration_since(body_end),
-                allocs,
                 mid_csw_start,
                 us(lock_end.saturating_duration_since(after_ack_flush)),
                 us(after_ack_flush.saturating_duration_since(after_publish)),
@@ -14483,6 +14541,10 @@ impl ArmSupervisor {
             )
         };
         let released = Instant::now();
+        // Sample allocator totals immediately after write-guard drop so the alloc proof covers
+        // disconnect drain, tick control, edge-triggered terminal capture, publish, ACK flush,
+        // and write-guard teardown.
+        let allocs = crate::diagnostics::alloc::take();
         let phase_guard_drop = us(released.saturating_duration_since(lock_end));
         let usage_released = UsageMark::now();
         let (mid_nvcsw, mid_nivcsw) = mid_csw_delta(&mid_csw_start, &usage_released);
@@ -14870,12 +14932,32 @@ fn dispatch_loop(
         // BEFORE forwarding telemetry so a newer telemetry snapshot can never overtake earlier
         // terminals on the wire.
         if terminals.has_pending() {
-            let base = latest_snap
-                .as_ref()
-                .map(|s| s.obs.clone())
-                .or_else(|| pending_telemetry.clone())
-                .or_else(|| hub.latest().map(|s| s.obs.clone()));
-            terminals.drain_all(base.as_ref().unwrap_or(template_obs));
+            let (base, base_seq) = match latest_snap.as_ref() {
+                Some(s) => (&s.obs, s.meta.seq),
+                None => (pending_telemetry.as_ref().unwrap_or(template_obs), 0),
+            };
+            if terminals.drain_all(base, base_seq) {
+                // At least one terminal is gated on `required_publish_seq > base_seq` (e.g., an
+                // off-tick Legacy drain moved a terminal into the broadcaster while `latest_snap`
+                // was still at N). Refresh `latest_snap` once so it pairs with the matching snapshot.
+                if let Some(s) = hub.latest().filter(|s| s.meta.seq > last) {
+                    last = s.meta.seq;
+                    last_diag = last_diag.max(s.policy_diag_seq);
+                    pending_telemetry = Some(s.obs.clone());
+                    latest_snap = Some(s);
+                    terminal_capture.drain_into(
+                        terminals,
+                        hub,
+                        latest_snap.as_deref(),
+                        &[],
+                        template_obs,
+                        true,
+                    );
+                    if let Some(s_ref) = latest_snap.as_ref() {
+                        let _ = terminals.drain_all(&s_ref.obs, s_ref.meta.seq);
+                    }
+                }
+            }
         }
         // Telemetry forwarding gate: read `terminal_capture.inflight()` (Acquire) FIRST, then
         // `terminals.pending_total()` (Acquire) SECOND — the exact inverse of `drain_into`'s
@@ -14909,7 +14991,7 @@ fn dispatch_loop(
         false,
     );
     if terminals.has_pending() {
-        terminals.drain_all(final_snap.as_ref().map_or(template_obs, |s| &s.obs));
+        let _ = terminals.drain_all(final_snap.as_ref().map_or(template_obs, |s| &s.obs), u64::MAX);
     }
 }
 
@@ -15316,13 +15398,13 @@ mod observation_snapshot_tests {
         // Sink rejects (outbound queue full): drain_all MUST NOT pop action 1 and MUST NOT remove
         // the subscriber.
         let base_obs = factory.current_observation();
-        tb.drain_all(&base_obs);
+        let _ = tb.drain_all(&base_obs, 0);
         assert_eq!(tb.pending_total(), 3, "failed enqueue must not pop terminal or drop subscriber");
         assert!(delivered.lock().unwrap().is_empty());
 
         // Once sink accepts again, all 3 terminals pop and deliver in exact FIFO order.
         accept.store(true, Ordering::SeqCst);
-        tb.drain_all(&base_obs);
+        let _ = tb.drain_all(&base_obs, 0);
         assert_eq!(tb.pending_total(), 0);
         assert_eq!(*delivered.lock().unwrap(), vec![a1.id, a2.id, a3.id]);
         assert!(tb.can_start_action(false, false));

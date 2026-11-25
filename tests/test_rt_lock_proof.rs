@@ -1461,6 +1461,9 @@ fn terminal_capture_lock_proof_action_completion_dwell_saturation_and_positive_c
             self.note_call();
             Ok(())
         }
+        fn supports_rt_executor(&self) -> Result<(), &'static str> {
+            Ok(())
+        }
     }
 
     run_bounded_fixture(Duration::from_secs(15), "terminal-capture-lock-proof", |deadline| {
@@ -1568,10 +1571,25 @@ fn terminal_capture_lock_proof_action_completion_dwell_saturation_and_positive_c
             let _ = rel_tx.send(());
             tb_holder.join().unwrap();
 
-            // 3) Positive control on `armd-control` RT executor: `SupervisorLock::try_read` inside
-            //    `terminal_capture_test_hook` panics and bumps `control_thread_attempts()` 0 -> 1,
-            //    whereas clean capture under `DetachedLegacyWriterHold` keeps attempts == 0.
-            let sup_rt = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+            // 3) RT Executor lock proof + positive controls on `armd-control`:
+            //    Attach `CaptureAuditDriver`, hold `TerminalCaptureChannel::rx`,
+            //    `TerminalCaptureChannel::rich_action_cache`, `TerminalBroadcaster`, AND
+            //    `DetachedLegacyWriterHold` simultaneously while completing a real RT jog + dwell.
+            //    Verify 0 `SupervisorLock`, 0 `TerminalCaptureChannel` (`rx` / `rich_action_cache`),
+            //    and 0 driver mutex calls during capture; then verify positive controls catch
+            //    injected `SupervisorLock::try_read`, uncontended `channel.rx.lock()`, and
+            //    uncontended `rich_action_cache.lock()` on `armd-control`.
+            let rt_in_capture = Arc::new(AtomicBool::new(false));
+            let rt_driver_calls = Arc::new(AtomicUsize::new(0));
+            let rt_drv = CaptureAuditDriver {
+                dof: 7,
+                in_capture: Arc::clone(&rt_in_capture),
+                driver_calls_during_capture: Arc::clone(&rt_driver_calls),
+                positions: vec![0.0; 7],
+            };
+            let sup_rt = Arc::new(
+                ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(rt_drv)),
+            );
             sup_rt.set_lease_enabled(false).await;
             sup_rt.register_ws_connection(1).await.unwrap();
             sup_rt
@@ -1579,19 +1597,41 @@ fn terminal_capture_lock_proof_action_completion_dwell_saturation_and_positive_c
                 .await
                 .unwrap();
             let inner_lock = Arc::clone(sup_rt.inner());
+            let sup_rt_for_hook = Arc::clone(&sup_rt);
+            let rt_in_capture_hook = Arc::clone(&rt_in_capture);
             let probe_armed = Arc::new(AtomicBool::new(false));
             let probe_caught = Arc::new(AtomicBool::new(false));
             let armed_c = Arc::clone(&probe_armed);
             let caught_c = Arc::clone(&probe_caught);
             sup_rt.inner().write().await.terminal_capture_test_hook = Some(Arc::new(move |_| {
+                rt_in_capture_hook.store(true, Ordering::Release);
                 if !armed_c.swap(false, Ordering::AcqRel) {
+                    rt_in_capture_hook.store(false, Ordering::Release);
                     return;
                 }
                 assert!(on_rt_control_thread());
-                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let res_sup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let _ = inner_lock.try_read();
                 }));
-                assert!(res.is_err(), "injected SupervisorLock::try_read in capture must panic");
+                assert!(
+                    res_sup.is_err(),
+                    "injected SupervisorLock::try_read in capture must panic"
+                );
+                let res_rx = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    sup_rt_for_hook.test_touch_terminal_capture_rx_lock();
+                }));
+                assert!(
+                    res_rx.is_err(),
+                    "injected uncontended TerminalCaptureChannel::rx.lock() in capture must panic"
+                );
+                let res_cache = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    sup_rt_for_hook.test_touch_terminal_capture_rich_cache_lock();
+                }));
+                assert!(
+                    res_cache.is_err(),
+                    "injected uncontended TerminalCaptureChannel::rich_action_cache.lock() in capture must panic"
+                );
+                rt_in_capture_hook.store(false, Ordering::Release);
                 caught_c.store(true, Ordering::Release);
             }));
 
@@ -1608,7 +1648,12 @@ fn terminal_capture_lock_proof_action_completion_dwell_saturation_and_positive_c
                 .await
                 .unwrap();
             let writer_hold = DetachedLegacyWriterHold::acquire(Arc::clone(&sup_rt), deadline);
-            // Drive an actual RT jog completion + dwell under `DetachedLegacyWriterHold`.
+            // Hold ALL three capture/broadcaster mutexes simultaneously while `armd-control`
+            // runs jog completion + dwell: any lock attempt would deadlock/fail before deadline.
+            let _hold_rx = sup_rt.test_lock_terminal_capture_rx();
+            let _hold_rich = sup_rt.test_lock_terminal_capture_rich_cache();
+            let _hold_tb = sup_rt.test_lock_terminal_broadcaster();
+            // Drive an actual RT jog completion + dwell under all four held locks.
             wait_until_deadline(deadline, "initial RT publication", || {
                 sup_rt.hub().published_seq() >= 2
             });
@@ -1662,12 +1707,12 @@ fn terminal_capture_lock_proof_action_completion_dwell_saturation_and_positive_c
                     }),
                 )
                 .unwrap();
-            wait_until_deadline(deadline, "RT jog completion captured under detached writer hold", || {
+            wait_until_deadline(deadline, "RT jog completion captured under all held locks", || {
                 sup_rt.test_terminal_capture_stats().captured >= 1
             });
             let cap_after_jog = sup_rt.test_terminal_capture_stats().captured;
             let seq0 = sup_rt.hub().published_seq();
-            wait_until_deadline(deadline, "RT dwell releases under detached writer hold", || {
+            wait_until_deadline(deadline, "RT dwell releases under all held locks", || {
                 sup_rt.hub().published_seq() >= seq0 + 5
             });
             assert_eq!(
@@ -1676,12 +1721,33 @@ fn terminal_capture_lock_proof_action_completion_dwell_saturation_and_positive_c
                 "RT dwell must not re-capture completed jog"
             );
             assert_eq!(sup_rt.inner().control_thread_attempts(), 0);
+            assert_eq!(
+                sup_rt.test_terminal_capture_control_lock_attempts(),
+                0,
+                "armd-control must perform 0 TerminalCaptureChannel rx/rich_cache lock attempts"
+            );
+            assert_eq!(
+                rt_driver_calls.load(Ordering::Acquire),
+                0,
+                "armd-control capture must perform 0 driver mutex calls"
+            );
+
+            // Release the test mutex holds so the positive controls exercise UNCONTENDED
+            // channel.rx.lock() and rich_action_cache.lock() on `armd-control`.
+            drop(_hold_tb);
+            drop(_hold_rich);
+            drop(_hold_rx);
 
             probe_armed.store(true, Ordering::Release);
-            wait_until_deadline(deadline, "capture hook SupervisorLock positive control", || {
+            wait_until_deadline(deadline, "capture hook lock positive controls", || {
                 probe_caught.load(Ordering::Acquire)
             });
             assert_eq!(sup_rt.inner().control_thread_attempts(), 1);
+            assert_eq!(
+                sup_rt.test_terminal_capture_control_lock_attempts(),
+                2,
+                "positive controls must catch BOTH uncontended rx.lock() and rich_action_cache.lock() on armd-control"
+            );
 
             writer_hold.release();
             handle.stop_and_join();

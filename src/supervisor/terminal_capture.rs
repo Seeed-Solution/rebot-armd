@@ -96,55 +96,6 @@ impl CapturedSafetyState {
     }
 }
 
-/// Returns true if `action` carries rich off-RT macro/diagnostic fields that exceed the inline
-/// `TerminalCaptureRecord` representation.
-#[inline]
-pub(crate) fn action_has_rich_fields(action: &ActionStatus) -> bool {
-    !action.episodes.is_empty()
-        || !action.height_estimates.is_empty()
-        || !action.yaw_estimates.is_empty()
-        || !action.width_estimates.is_empty()
-        || !action.motions.is_empty()
-        || action.measurement.is_some()
-        || action.align.is_some()
-        || action.orientation.is_some()
-        || action.height_source.is_some()
-        || action.height_reason.is_some()
-        || action.depth_anchor.is_some()
-        || action.border.is_some()
-        || action.probe_mode.is_some()
-        || action.recentre.is_some()
-        || action.post_lift.is_some()
-        || action.pre_open.is_some()
-        || action.approach.is_some()
-        || action.approach_reason.is_some()
-        || action.approach_signs.is_some()
-        || action.approach_flipped.is_some()
-        || action.iteration.is_some()
-        || action.error_px.is_some()
-        || action.final_offset_px.is_some()
-        || action.acquire_height_m.is_some()
-        || action.descend_contact.is_some()
-        || action.phase_ms.len() > 12
-        || action.message.as_ref().is_some_and(|m| m.len() > 256)
-        || action
-            .durability_warning
-            .as_ref()
-            .is_some_and(|w| w.len() > 256)
-        || action
-            .tag
-            .as_ref()
-            .is_some_and(|s| s.len() > HolderLabel::CAPACITY)
-        || action
-            .task
-            .as_ref()
-            .is_some_and(|s| s.len() > HolderLabel::CAPACITY)
-        || action
-            .sequence_id
-            .as_ref()
-            .is_some_and(|s| s.len() > HolderLabel::CAPACITY)
-}
-
 /// Fixed-size `Copy` terminal record captured on `armd-control` with zero heap ops and zero locks.
 #[derive(Clone, Copy)]
 pub(crate) struct TerminalCaptureRecord {
@@ -188,7 +139,6 @@ pub(crate) struct TerminalCaptureRecord {
     pub(crate) policy_stats: Option<PolicyStats>,
     pub(crate) phase_ms_len: u8,
     pub(crate) phase_ms: [(BoundedText<24>, u32); 12],
-    pub(crate) has_rich_fields: bool,
     pub(crate) dof: u8,
     pub(crate) positions: [f32; MAX_DOF],
     pub(crate) velocities: [f32; MAX_DOF],
@@ -216,11 +166,8 @@ fn copy_f32_slice(src: &[f32]) -> [f32; MAX_DOF] {
 }
 
 #[inline]
-fn opt_label(s: Option<&String>) -> (Option<HolderLabel>, bool) {
-    match s {
-        Some(v) => (Some(HolderLabel::new(v)), v.len() > HolderLabel::CAPACITY),
-        None => (None, false),
-    }
+fn opt_label(s: Option<&String>) -> Option<HolderLabel> {
+    s.map(|v| HolderLabel::new(v))
 }
 
 impl TerminalCaptureRecord {
@@ -232,53 +179,32 @@ impl TerminalCaptureRecord {
         terminal_seq: u64,
         obs_timestamp: f64,
     ) -> Self {
-        let mut rich = action_has_rich_fields(action);
-
         let (has_message, message) = match action.message.as_deref() {
-            Some(m) => {
-                let bt = BoundedText::<256>::new(m);
-                if bt.is_truncated() {
-                    rich = true;
-                }
-                (true, bt)
-            }
+            Some(m) => (true, BoundedText::<256>::new(m)),
             None => (false, BoundedText::empty()),
         };
         let (has_durability_warning, durability_warning) = match action.durability_warning.as_deref()
         {
-            Some(w) => {
-                let bt = BoundedText::<256>::new(w);
-                if bt.is_truncated() {
-                    rich = true;
-                }
-                (true, bt)
-            }
+            Some(w) => (true, BoundedText::<256>::new(w)),
             None => (false, BoundedText::empty()),
         };
-        let (tag, t1) = opt_label(action.tag.as_ref());
-        let (task, t2) = opt_label(action.task.as_ref());
-        let (sequence_id, t3) = opt_label(action.sequence_id.as_ref());
-        let (step_type, t4) = opt_label(action.step_type.as_ref());
-        let (constraint_id, t5) = opt_label(action.constraint_id.as_ref());
-        let (geometry_id, t6) = opt_label(action.geometry_id.as_ref());
-        let (violation_phase, t7) = opt_label(action.violation_phase.as_ref());
-        let (reason, t8) = opt_label(action.reason.as_ref());
-        if t1 || t2 || t3 || t4 || t5 || t6 || t7 || t8 {
-            rich = true;
-        }
+        let tag = opt_label(action.tag.as_ref());
+        let task = opt_label(action.task.as_ref());
+        let sequence_id = opt_label(action.sequence_id.as_ref());
+        let step_type = opt_label(action.step_type.as_ref());
+        let constraint_id = opt_label(action.constraint_id.as_ref());
+        let geometry_id = opt_label(action.geometry_id.as_ref());
+        let violation_phase = opt_label(action.violation_phase.as_ref());
+        let reason = opt_label(action.reason.as_ref());
 
         let mut phase_ms = [(BoundedText::<24>::empty(), 0u32); 12];
         let mut phase_ms_len = 0u8;
         for (k, &v) in &action.phase_ms {
             if usize::from(phase_ms_len) < phase_ms.len() {
-                let bt = BoundedText::<24>::new(k);
-                if bt.is_truncated() {
-                    rich = true;
-                }
-                phase_ms[usize::from(phase_ms_len)] = (bt, v);
+                phase_ms[usize::from(phase_ms_len)] = (BoundedText::<24>::new(k), v);
                 phase_ms_len += 1;
             } else {
-                rich = true;
+                break;
             }
         }
 
@@ -331,7 +257,6 @@ impl TerminalCaptureRecord {
             policy_stats: action.policy_stats,
             phase_ms_len,
             phase_ms,
-            has_rich_fields: rich,
             dof,
             positions: copy_f32_slice(&inner.measured_positions),
             velocities: copy_f32_slice(&inner.measured_velocities),
@@ -405,7 +330,8 @@ impl TerminalCaptureRecord {
     }
 
     /// Applies terminal transition fields captured on-tick onto a rich cached off-RT `ActionStatus`
-    /// (preserving `episodes`, `motions`, `height_estimates`, `measurement`, and full strings).
+    /// (preserving `episodes`, `motions`, `height_estimates`, `measurement`, grasp diagnostics, and
+    /// full untruncated strings while updating terminal state, phase, and timing fields).
     pub(crate) fn apply_terminal_overlay(&self, dst: &mut ActionStatus) {
         dst.state = self.state;
         dst.code = self.code;
@@ -419,6 +345,7 @@ impl TerminalCaptureRecord {
         }
         dst.progress = self.progress;
         dst.finished_at = self.finished_at;
+        dst.phase = self.phase;
         if self.holding.is_some() {
             dst.holding = self.holding;
         }
@@ -427,6 +354,21 @@ impl TerminalCaptureRecord {
         }
         if self.settled.is_some() {
             dst.settled = self.settled;
+        }
+        if self.t_s.is_some() {
+            dst.t_s = self.t_s;
+        }
+        if self.power_scale.is_some() {
+            dst.power_scale = self.power_scale;
+        }
+        if self.step_index.is_some() {
+            dst.step_index = self.step_index;
+        }
+        if self.repeat_index.is_some() {
+            dst.repeat_index = self.repeat_index;
+        }
+        if self.repeats.is_some() {
+            dst.repeats = self.repeats;
         }
         if self.failed_step.is_some() {
             dst.failed_step = self.failed_step;
@@ -439,6 +381,26 @@ impl TerminalCaptureRecord {
         }
         if self.pass.is_some() {
             dst.pass = self.pass;
+        }
+        if let Some(v) = self.constraint_id {
+            if dst.constraint_id.is_none() {
+                dst.constraint_id = Some(v.as_str().to_owned());
+            }
+        }
+        if let Some(v) = self.geometry_id {
+            if dst.geometry_id.is_none() {
+                dst.geometry_id = Some(v.as_str().to_owned());
+            }
+        }
+        if let Some(v) = self.violation_phase {
+            if dst.violation_phase.is_none() {
+                dst.violation_phase = Some(v.as_str().to_owned());
+            }
+        }
+        if let Some(v) = self.reason {
+            if dst.reason.is_none() {
+                dst.reason = Some(v.as_str().to_owned());
+            }
         }
         if self.durability_confirmed.is_some() {
             dst.durability_confirmed = self.durability_confirmed;
@@ -522,6 +484,44 @@ impl StagedTerminalBuf {
     #[inline]
     pub(crate) fn len(&self) -> usize {
         self.len
+    }
+
+    #[inline]
+    pub(crate) fn has_deferred(&self, action_id: u64) -> bool {
+        self.deferred_seq_for(action_id).is_some()
+    }
+
+    #[inline]
+    pub(crate) fn deferred_seq_for(&self, action_id: u64) -> Option<u64> {
+        for slot in &self.slots[..self.len] {
+            if let Some(StagedTerminal::Deferred {
+                action_id: id,
+                terminal_seq,
+            }) = slot
+            {
+                if *id == action_id {
+                    return Some(*terminal_seq);
+                }
+            }
+        }
+        None
+    }
+
+    #[inline]
+    pub(crate) fn replace_deferred_with_captured(
+        &mut self,
+        action_id: u64,
+        rec: TerminalCaptureRecord,
+    ) -> bool {
+        for slot in &mut self.slots[..self.len] {
+            if let Some(StagedTerminal::Deferred { action_id: id, .. }) = slot {
+                if *id == action_id {
+                    *slot = Some(StagedTerminal::Captured(rec));
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Stages a terminal entry inline; if all 4 slots are already occupied, evicts and returns
@@ -636,10 +636,11 @@ impl TerminalCaptureTx {
 /// `channel.rx -> terminals.inner` (and `rich_action_cache` is a leaf mutex).
 pub(crate) struct TerminalCaptureChannel {
     rx: Mutex<rtrb::Consumer<TerminalCaptureRecord>>,
-    /// Off-RT mirror of rich macro `ActionStatus` payloads (bounded to `TERMINAL_FIFO_CAPACITY`)
-    /// so delayed dispatch past the 2 s window never drops `episodes`, `motions`, `height_estimates`,
-    /// or long strings without touching `SupervisorLock`. Never accessed on `armd-control`.
+    /// Off-RT mirror of off-RT mutated `ActionStatus` payloads (bounded to `TERMINAL_FIFO_CAPACITY`)
+    /// so delayed dispatch past the 2 s window never drops any rich/diagnostic field without
+    /// touching `SupervisorLock`. Never accessed on `armd-control`.
     rich_action_cache: Mutex<VecDeque<ActionStatus>>,
+    control_thread_lock_attempts: AtomicU64,
     next_terminal_seq: AtomicU64,
     captured: AtomicU64,
     saturated: AtomicU64,
@@ -656,6 +657,7 @@ impl TerminalCaptureChannel {
         let channel = Arc::new(Self {
             rx: Mutex::new(consumer),
             rich_action_cache: Mutex::new(VecDeque::with_capacity(TERMINAL_FIFO_CAPACITY)),
+            control_thread_lock_attempts: AtomicU64::new(0),
             next_terminal_seq: AtomicU64::new(0),
             captured: AtomicU64::new(0),
             saturated: AtomicU64::new(0),
@@ -672,15 +674,61 @@ impl TerminalCaptureChannel {
         (tx, channel)
     }
 
-    /// Off-RT mirror for rich macro `ActionStatus` payloads (never called on `armd-control`).
-    pub(crate) fn mirror_rich_action(&self, action: &ActionStatus) {
-        if !action_has_rich_fields(action) {
-            return;
+    #[inline]
+    fn lock_rx(&self) -> std::sync::MutexGuard<'_, rtrb::Consumer<TerminalCaptureRecord>> {
+        if crate::rt_core::executor::on_rt_control_thread() {
+            self.control_thread_lock_attempts
+                .fetch_add(1, Ordering::SeqCst);
+            crate::rt_core::executor::assert_not_on_rt_control_thread(
+                "TerminalCaptureChannel::rx.lock",
+            );
         }
-        let mut cache = self
-            .rich_action_cache
+        crate::rt_core::executor::assert_not_in_rt_release("TerminalCaptureChannel::rx.lock");
+        self.rx.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[inline]
+    fn lock_rich_cache(&self) -> std::sync::MutexGuard<'_, VecDeque<ActionStatus>> {
+        if crate::rt_core::executor::on_rt_control_thread() {
+            self.control_thread_lock_attempts
+                .fetch_add(1, Ordering::SeqCst);
+            crate::rt_core::executor::assert_not_on_rt_control_thread(
+                "TerminalCaptureChannel::rich_action_cache.lock",
+            );
+        }
+        crate::rt_core::executor::assert_not_in_rt_release(
+            "TerminalCaptureChannel::rich_action_cache.lock",
+        );
+        self.rich_action_cache
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(crate) fn control_thread_lock_attempts(&self) -> u64 {
+        self.control_thread_lock_attempts.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn lock_rx_for_test(&self) -> impl Drop + '_ {
+        self.rx.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(crate) fn lock_rich_cache_for_test(&self) -> impl Drop + '_ {
+        self.rich_action_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(crate) fn touch_rx_lock_for_test(&self) {
+        let _g = self.lock_rx();
+    }
+
+    pub(crate) fn touch_rich_cache_lock_for_test(&self) {
+        let _g = self.lock_rich_cache();
+    }
+
+    /// Unconditional off-RT mirror for `ActionStatus` payloads (never called on `armd-control`).
+    pub(crate) fn mirror_rich_action(&self, action: &ActionStatus) {
+        let mut cache = self.lock_rich_cache();
         if let Some(existing) = cache.iter_mut().find(|a| a.id == action.id) {
             existing.clone_from(action);
             return;
@@ -692,10 +740,7 @@ impl TerminalCaptureChannel {
     }
 
     fn take_rich_action(&self, action_id: u64) -> Option<ActionStatus> {
-        let mut cache = self
-            .rich_action_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut cache = self.lock_rich_cache();
         let pos = cache.iter().position(|a| a.id == action_id)?;
         let item = cache.remove(pos);
         // Prune older consumed entries boundedly.
@@ -797,8 +842,15 @@ impl TerminalCaptureChannel {
             };
 
             // Enqueue into `TerminalBroadcaster` (updating `max_fifo_len` & `pending_total` with
-            // `Release`) STRICTLY BEFORE decrementing `self.inflight` (`Release`).
-            let _ = terminals.record_finished_with_seq(rec.terminal_seq, action, obs_override);
+            // `Release`) STRICTLY BEFORE decrementing `self.inflight` (`Release`). Carry
+            // `rec.publish_seq` through to delivery so a stale dispatcher snapshot can never pair
+            // with this terminal.
+            let _ = terminals.record_finished_with_seq(
+                rec.terminal_seq,
+                action,
+                obs_override,
+                rec.publish_seq,
+            );
             self.inflight.fetch_sub(1, Ordering::Release);
             drained += 1;
         }
@@ -818,7 +870,7 @@ impl TerminalCaptureChannel {
         if self.drain_paused.load(Ordering::Acquire) {
             return 0;
         }
-        let mut rx = self.rx.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rx = self.lock_rx();
         self.drain_locked(
             &mut rx,
             terminals,
@@ -841,7 +893,7 @@ impl TerminalCaptureChannel {
         latest_snap: Option<&Snapshot>,
         template_obs: &ArmObservation,
     ) {
-        let mut rx = self.rx.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rx = self.lock_rx();
         let _ = self.drain_locked(
             &mut rx,
             terminals,
@@ -885,11 +937,9 @@ fn resolve_full_action(
             }
         }
     }
-    if rec.has_rich_fields {
-        if let Some(mut cached) = channel.take_rich_action(rec.action_id) {
-            rec.apply_terminal_overlay(&mut cached);
-            return Some(cached);
-        }
+    if let Some(mut cached) = channel.take_rich_action(rec.action_id) {
+        rec.apply_terminal_overlay(&mut cached);
+        return Some(cached);
     }
     None
 }
@@ -1145,11 +1195,13 @@ mod tests {
             true
         });
 
-        // Create a rich macro off-tick with `episodes`, `motions`, `height_estimates`, and `phase_ms`
-        // (via `update_action`), then finish it in-tick + park + expire 2 s window.
-        let (id_macro, id_park) = {
+        // Create a rich macro off-tick with `episodes`, `motions`, `height_estimates`, `phase_ms`,
+        // AND grasp diagnostic fields (`held_width_m`, `close_height_m`), then update `phase` to
+        // `"done"` under guarded deferral, finish it in-tick + start park + expire 2 s window.
+        let (id_macro, id_park, expected_action) = {
             let mut inner = sup.inner().write().await;
             let id1 = inner.begin_action("place", Some("tag-1".into()));
+            inner.set_action_phase(id1, "close", 0.75, Some(2), Some(3.5));
             inner.update_action(id1, |a| {
                 a.episodes.push("ep-001".into());
                 a.motions.push(MacroMotionDiag {
@@ -1168,13 +1220,18 @@ mod tests {
                     record_only: false,
                     reason: None,
                 });
+                a.held_width_m = Some(0.032);
+                a.close_height_m = Some(0.041);
                 a.phase_ms.insert("descend".into(), 145);
             });
             inner.defer_terminal_capture = true;
+            // Simulate a guarded Legacy completion updating `phase` while mirroring is disabled.
+            inner.set_action_phase(id1, "done", 1.0, None, None);
             if let Some(a) = inner.last_action.as_mut() {
                 a.phase_ms.insert("close".into(), 80);
             }
             inner.finish_action(id1, "done", None, None, Some(true), None, None);
+            let expected = inner.last_action.clone().expect("finished macro slot");
             // Staged terminal (1) + starting park (1) == 2 (allowed).
             assert!(inner.check_terminal_fifo_for_new_action().is_ok());
             let id2 = inner.begin_action_rt("park");
@@ -1189,7 +1246,7 @@ mod tests {
                 *until = 0.0;
             }
             inner.defer_terminal_capture = false;
-            (id1, id2)
+            (id1, id2, expected)
         };
 
         sup.control_tick(0.02).await;
@@ -1201,16 +1258,210 @@ mod tests {
 
         let got = delivered.lock().unwrap().clone();
         assert_eq!(got.len(), 1);
+        assert_eq!(
+            got[0], expected_action,
+            "delayed rich terminal ActionStatus must match full terminal payload field-for-field"
+        );
         assert_eq!(got[0].id, id_macro);
-        assert_eq!(got[0].tag.as_deref(), Some("tag-1"));
-        assert_eq!(got[0].episodes, vec!["ep-001".to_string()]);
-        assert_eq!(got[0].motions.len(), 1);
-        assert_eq!(got[0].motions[0].phase, "descend");
-        assert_eq!(got[0].height_estimates.len(), 1);
-        assert_eq!(got[0].height_estimates[0].source, "depth:metric_table");
-        assert_eq!(got[0].phase_ms.get("descend"), Some(&145));
-        assert_eq!(got[0].phase_ms.get("close"), Some(&80));
+        assert_eq!(got[0].phase.as_deref(), Some("done"));
+        assert_eq!(got[0].held_width_m, Some(0.032));
+        assert_eq!(got[0].close_height_m, Some(0.041));
         assert_ne!(id_macro, id_park);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deferred_staging_materializes_before_slot_overwrite_preserving_all_ids_in_order() {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        sup.set_lease_enabled(false).await;
+        let delivered = Arc::new(Mutex::new(Vec::<ActionStatus>::new()));
+        let delivered_c = Arc::clone(&delivered);
+        let _sub = sup.test_subscribe_action_terminals(move |obs| {
+            if let Some(a) = obs.action.as_ref() {
+                delivered_c.lock().unwrap().push(a.clone());
+            }
+            true
+        });
+
+        // Finish A under deferral, start B (A -> previous_action), then start C (B supersedes and
+        // overwrites A in previous_action) BEFORE `capture_edge_terminals` runs.
+        let (id_a, id_b, id_c) = {
+            let mut inner = sup.inner().write().await;
+            inner.defer_terminal_capture = true;
+            let a = inner.begin_action_rt("jog");
+            inner.finish_action(a, "done", None, None, None, None, None);
+            let b = inner.begin_action_rt("jog");
+            let c = inner.begin_action_rt("park");
+            inner.pending_normal_unload = true;
+            inner.defer_terminal_capture = false;
+            (a, b, c)
+        };
+
+        sup.control_tick(0.02).await;
+        let _ = sup.test_drain_terminal_captures();
+
+        let got = delivered.lock().unwrap().clone();
+        let ids: Vec<u64> = got.iter().map(|a| a.id).collect();
+        assert_eq!(
+            ids,
+            vec![id_a, id_b],
+            "materialized deferred A and superseded B must both be delivered in strict FIFO order (C={id_c} still running)"
+        );
+        assert_eq!(got[0].state.as_str(), "done");
+        assert_eq!(got[1].state.as_str(), "cancelled");
+        assert_eq!(got[1].code.as_deref(), Some("SUPERSEDED"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn publish_seq_barrier_carried_through_broadcaster_prevents_stale_snapshot_pairing() {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        sup.set_lease_enabled(false).await;
+        let delivered = Arc::new(Mutex::new(Vec::<(u64, f64)>::new()));
+        let delivered_c = Arc::clone(&delivered);
+        let _sub = sup.test_subscribe_action_terminals(move |obs| {
+            if let Some(a) = obs.action.as_ref() {
+                delivered_c.lock().unwrap().push((a.id, obs.timestamp));
+            }
+            true
+        });
+
+        // Snapshot N published before terminal A.
+        sup.control_tick(0.02).await;
+        let snap_n = sup.hub().latest().expect("snapshot N");
+
+        // Legacy tick publishes terminal A at snapshot N+1 while dispatcher is paused on N.
+        let id_a = {
+            let mut inner = sup.inner().write().await;
+            inner.test_stage_completed_action_rt("jog")
+        };
+        sup.control_tick(0.02).await;
+        let snap_n1 = sup.hub().latest().expect("snapshot N+1");
+        assert!(snap_n1.meta.seq > snap_n.meta.seq);
+
+        // Off-tick Legacy action start drains A from the SPSC ring into `TerminalBroadcaster`
+        // (bypassing the ring barrier with `respect_publish_barrier = false`).
+        let _id_b = {
+            let mut inner = sup.inner().write().await;
+            inner.begin_action("jog", None)
+        };
+        assert_eq!(sup.test_terminal_capture_stats().queued, 0);
+
+        // Attempting to flush `TerminalBroadcaster` with stale snapshot N MUST NOT emit A!
+        let blocked = sup.terminals.drain_all(&snap_n.obs, snap_n.meta.seq);
+        assert!(
+            blocked,
+            "drain_all against stale snapshot N must hold terminal A gated on required_publish_seq"
+        );
+        assert!(
+            delivered.lock().unwrap().is_empty(),
+            "terminal A must not be paired with stale snapshot N"
+        );
+
+        // Once snapshot N+1 is used, terminal A flushes paired with snapshot N+1.
+        let blocked_after = sup.terminals.drain_all(&snap_n1.obs, snap_n1.meta.seq);
+        assert!(!blocked_after);
+        let got = delivered.lock().unwrap().clone();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, id_a);
+        assert_eq!(got[0].1, snap_n1.obs.timestamp);
+    }
+
+    #[test]
+    fn install_driver_does_not_advance_feedback_history_before_first_poll() {
+        use std::sync::atomic::{AtomicBool, Ordering as AOrd};
+
+        struct InstantPollDriver {
+            dof: usize,
+            valid: Arc<AtomicBool>,
+            read_ok: Arc<AtomicBool>,
+            instant: Instant,
+        }
+
+        impl crate::driver::ArmDriver for InstantPollDriver {
+            fn read_joint_states(
+                &mut self,
+            ) -> Result<Vec<crate::model::JointState>, crate::driver::ArmDriverError> {
+                if !self.read_ok.load(AOrd::Acquire) {
+                    return Err(crate::driver::ArmDriverError::Protocol(
+                        "injected poll fail".into(),
+                    ));
+                }
+                Ok(vec![crate::model::JointState::default(); self.dof])
+            }
+            fn write_joint_targets(
+                &mut self,
+                _targets: &[crate::JointTarget],
+            ) -> Result<(), crate::driver::ArmDriverError> {
+                Ok(())
+            }
+            fn set_torque(&mut self, _enabled: bool) -> Result<(), crate::driver::ArmDriverError> {
+                Ok(())
+            }
+            fn is_feedback_valid(&self) -> bool {
+                self.valid.load(AOrd::Acquire)
+            }
+            fn feedback_instants_into(&self, out: &mut Vec<Option<Instant>>) {
+                out.clear();
+                out.resize(self.dof, Some(self.instant));
+            }
+            fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
+                out.clear();
+                out.resize(self.dof, Some(Duration::from_millis(5)));
+            }
+        }
+
+        let cfg = ArmConfig::rebot_dm();
+        let dof = cfg.dof;
+        let mut inner = SupervisorInner::new(cfg);
+        let valid = Arc::new(AtomicBool::new(true));
+        let read_ok = Arc::new(AtomicBool::new(false));
+        let drv = InstantPollDriver {
+            dof,
+            valid: Arc::clone(&valid),
+            read_ok: Arc::clone(&read_ok),
+            instant: Instant::now(),
+        };
+
+        let seqs_before = inner.core.feedback().seqs().to_vec();
+        inner.install_driver(Box::new(drv));
+        assert_eq!(
+            inner.core.feedback().seqs(),
+            seqs_before.as_slice(),
+            "install_driver must not advance ArmCore feedback sequences before the first control poll"
+        );
+        assert!(
+            inner.cached_hardware_feedback_fresh(Duration::from_millis(250)),
+            "seeded poll-age fallback keeps freshness valid immediately after attachment"
+        );
+
+        // First poll fails -> cached freshness fails closed and sequences stay unchanged.
+        inner.poll_hardware_rx(None, None, None);
+        assert!(
+            !inner.cached_hardware_feedback_fresh(Duration::from_millis(250)),
+            "failed poll must make cached freshness fail closed"
+        );
+        assert_eq!(inner.core.feedback().seqs(), seqs_before.as_slice());
+
+        // Subsequent valid poll -> freshness becomes true and sequences advance by exactly 1.
+        read_ok.store(true, AOrd::Release);
+        inner.poll_hardware_rx(None, None, None);
+        assert!(
+            inner.cached_hardware_feedback_fresh(Duration::from_millis(250)),
+            "successful poll must restore cached freshness"
+        );
+        for (i, (&after, &before)) in inner
+            .core
+            .feedback()
+            .seqs()
+            .iter()
+            .zip(seqs_before.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                after,
+                before + 1,
+                "joint {i} feedback sequence must advance exactly once on first valid poll"
+            );
+        }
     }
 
     #[test]
