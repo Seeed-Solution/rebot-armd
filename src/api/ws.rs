@@ -679,6 +679,19 @@ impl WsWriterHandle {
         }
     }
 
+    /// Non-blocking ordinary control send distinguishing channel saturation (`Full`) from a closed
+    /// or fatal socket (`Closed`), used by the per-connection `ActionReplyRouter` WS sink so
+    /// router reply credits remain held across backpressure and release on enqueue or close.
+    fn try_send_ordinary_control_result(&self, reply: Value) -> Result<(), mpsc::error::TrySendError<()>> {
+        if self.is_fatal() {
+            return Err(mpsc::error::TrySendError::Closed(()));
+        }
+        self.ordinary_tx.try_send(reply).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => mpsc::error::TrySendError::Full(()),
+            mpsc::error::TrySendError::Closed(_) => mpsc::error::TrySendError::Closed(()),
+        })
+    }
+
     /// Ordinary control reply send from async worker / cancellation tasks. Tries non-blocking
     /// first; yields once if the writer task simply hasn't been polled yet in a tight burst,
     /// then closes the connection with an explicit error frame if still full. Never drops.
@@ -739,6 +752,7 @@ impl WsWriterHandle {
 pub(super) struct CommandReplyGateGuard {
     active: Arc<AtomicBool>,
     hub: Arc<crate::rt_core::publish::StateHub>,
+    ack_tracker: Option<Arc<crate::rt_core::reply_router::WsWireAckTracker>>,
 }
 
 impl CommandReplyGateGuard {
@@ -747,6 +761,32 @@ impl CommandReplyGateGuard {
         Self {
             active: Arc::clone(active),
             hub: Arc::clone(hub),
+            ack_tracker: None,
+        }
+    }
+
+    /// Enters both `command_reply_pending` and the per-socket `WsWireAckTracker` ACK barrier so
+    /// neither the router sink nor telemetry/lag-resync frames can emit a newly-started action's
+    /// terminal before `command_ack` is enqueued onto `ordinary_out_tx`.
+    pub(super) fn enter_with_tracker(
+        active: &Arc<AtomicBool>,
+        hub: &Arc<crate::rt_core::publish::StateHub>,
+        tracker: &Arc<crate::rt_core::reply_router::WsWireAckTracker>,
+    ) -> Self {
+        let floor_id = hub
+            .latest()
+            .map(|s| {
+                let a = s.obs.action.as_ref().map_or(0, |a| a.id);
+                let p = s.obs.previous_action.as_ref().map_or(0, |a| a.id);
+                a.max(p)
+            })
+            .unwrap_or(0);
+        tracker.enter_ack_barrier(floor_id);
+        active.store(true, Ordering::Release);
+        Self {
+            active: Arc::clone(active),
+            hub: Arc::clone(hub),
+            ack_tracker: Some(Arc::clone(tracker)),
         }
     }
 }
@@ -754,6 +794,9 @@ impl CommandReplyGateGuard {
 impl Drop for CommandReplyGateGuard {
     fn drop(&mut self) {
         self.active.store(false, Ordering::Release);
+        if let Some(t) = self.ack_tracker.as_ref() {
+            t.leave_ack_barrier();
+        }
         self.hub.wake();
     }
 }
@@ -1956,23 +1999,103 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
         disarmed: false,
     };
 
-    // Per-socket wire-ACK abandonment tracker (shared across worker, terminal subscription, and
-    // writer telemetry/lag resync) + per-connection broker reply sink attached BEFORE owner
-    // registration so both live executor open and Legacy->Executor handover bind identically.
+    // Per-socket wire-ACK visibility & routing tracker (shared across worker, broker reply sink,
+    // observer terminal subscription, and writer telemetry/lag resync) + per-connection broker
+    // reply sink attached BEFORE owner registration so both live executor open and
+    // Legacy->Executor handover bind identically.
+    let command_reply_pending = Arc::new(AtomicBool::new(false));
     let wire_ack_tracker = Arc::new(crate::rt_core::reply_router::WsWireAckTracker::new());
     {
-        let sink_hub = supervisor.hub().clone();
+        let sink_sup = supervisor.clone();
+        let sink_writer = writer.clone();
+        let sink_pending = Arc::clone(&command_reply_pending);
         let sink_tracker = Arc::clone(&wire_ack_tracker);
         let _ = supervisor.attach_ws_reply_sink(
             conn_id,
-            Arc::new(move |_client, _reply| {
-                if sink_tracker.is_socket_closed() {
-                    return crate::rt_core::broker::DeliveryDecision::Abandoned;
+            Arc::new(move |client: crate::rt_core::broker::ClientId, reply: crate::rt_core::broker::Reply| {
+                use crate::rt_core::broker::{DeliveryDecision, Outcome, Reply};
+                if client.0 != conn_id || sink_tracker.is_socket_closed() {
+                    return DeliveryDecision::Abandoned;
                 }
-                // Wake `armd-dispatch` so the matching lossless `ArmObservation` terminal flushes
-                // immediately without emitting a duplicate JSON frame on `ordinary_out_tx`.
-                sink_hub.wake();
-                crate::rt_core::broker::DeliveryDecision::Delivered
+                if sink_pending.load(Ordering::Acquire) || sink_tracker.is_ack_barrier_active() {
+                    // Hold router credit until `command_ack` is enqueued and `CommandReplyGateGuard` drops.
+                    return DeliveryDecision::Backpressured;
+                }
+                match reply {
+                    Reply::Terminal {
+                        action, outcome, ..
+                    } => {
+                        if sink_tracker.is_abandoned(action.0) {
+                            return DeliveryDecision::Abandoned;
+                        }
+                        let mut obs = match sink_sup.hub().latest() {
+                            Some(s) => s.obs.clone(),
+                            None => return DeliveryDecision::Backpressured,
+                        };
+                        let status = sink_sup
+                            .lookup_finished_action(action.0)
+                            .or_else(|| {
+                                obs.action
+                                    .as_ref()
+                                    .filter(|a| a.id == action.0 && !a.is_running())
+                                    .cloned()
+                            })
+                            .or_else(|| {
+                                obs.previous_action
+                                    .as_ref()
+                                    .filter(|a| a.id == action.0 && !a.is_running())
+                                    .cloned()
+                            })
+                            .unwrap_or_else(|| {
+                                let mut s = crate::motion::ActionStatus::blank();
+                                s.id = action.0;
+                                s.state = crate::model::HolderLabel::new(match outcome {
+                                    Outcome::Completed => "done",
+                                    Outcome::Cancelled(_) | Outcome::Superseded | Outcome::Stopped => {
+                                        "cancelled"
+                                    }
+                                    Outcome::Failed(_) => "failed",
+                                });
+                                s.code = match outcome {
+                                    Outcome::Completed => None,
+                                    Outcome::Cancelled(code) | Outcome::Failed(code) => {
+                                        Some(crate::model::HolderLabel::new(code))
+                                    }
+                                    Outcome::Superseded => {
+                                        Some(crate::model::HolderLabel::new("SUPERSEDED"))
+                                    }
+                                    Outcome::Stopped => {
+                                        Some(crate::model::HolderLabel::new("STOPPED"))
+                                    }
+                                };
+                                s.progress = if matches!(outcome, Outcome::Completed) {
+                                    1.0
+                                } else {
+                                    0.0
+                                };
+                                s.finished_at = Some(obs.timestamp);
+                                s
+                            });
+                        obs.action = Some(status);
+                        obs.previous_action = None;
+                        let Ok(val) = serde_json::to_value(&obs) else {
+                            return DeliveryDecision::Abandoned;
+                        };
+                        match sink_writer.try_send_ordinary_control_result(val) {
+                            Ok(()) => DeliveryDecision::Delivered,
+                            Err(mpsc::error::TrySendError::Full(())) => {
+                                DeliveryDecision::Backpressured
+                            }
+                            Err(mpsc::error::TrySendError::Closed(())) => {
+                                sink_tracker.mark_socket_closed();
+                                DeliveryDecision::Abandoned
+                            }
+                        }
+                    }
+                    Reply::Refused { .. } | Reply::Ack { .. } | Reply::Lease { .. } => {
+                        DeliveryDecision::Delivered
+                    }
+                }
             }),
         );
     }
@@ -2035,12 +2158,11 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     }
     let _conn_guard = ConnectionGuard(connection.clone());
 
-    // Route unseen action terminals into this connection's lossless ordinary control queue
-    // (never dropped by telemetry broadcast lag; overflow closes the connection with an error).
-    // Returning `false` while `command_reply_pending` is set keeps terminals at the head of
-    // `TerminalBroadcaster`'s bounded FIFO (and gates telemetry broadcast) until the in-flight
-    // command's own reply is enqueued on `ordinary_tx`.
-    let command_reply_pending = Arc::new(AtomicBool::new(false));
+    // Route unseen observer/legacy action terminals into this connection's lossless ordinary
+    // control queue (never dropped by telemetry broadcast lag; overflow closes the connection with
+    // an error). Actions submitted by THIS socket over `OWNER_EXECUTOR` are marked router-owned in
+    // `wire_ack_tracker` and delivered exclusively by `ActionReplyRouter -> ws_reply_sink` so they
+    // are skipped here without duplicate frames.
     let term_writer = writer.clone();
     let term_pending = Arc::clone(&command_reply_pending);
     let term_ack_tracker = Arc::clone(&wire_ack_tracker);
@@ -2048,11 +2170,11 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
         if term_ack_tracker.is_socket_closed() {
             return true;
         }
-        if obs
-            .action
-            .as_ref()
-            .is_some_and(|a| !a.is_running() && term_ack_tracker.is_abandoned(a.id))
-        {
+        if obs.action.as_ref().is_some_and(|a| {
+            !a.is_running()
+                && (term_ack_tracker.is_abandoned(a.id)
+                    || term_ack_tracker.is_owned_by_router(a.id))
+        }) {
             return true;
         }
         if term_pending.load(Ordering::Acquire) {
@@ -2294,7 +2416,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             if !rate.due(last_sent, obs.timestamp) { continue; }
                             last_sent = Some(obs.timestamp);
                         }
-                        writer_ack_tracker.redact_abandoned_obs(&mut obs);
+                        writer_ack_tracker.redact_obs(&mut obs);
                         if let Ok(text) = serde_json::to_string(&obs) {
                             if let Err(e) = write_ws_frame_bounded(&writer_connection, &mut sender, Message::Text(text.into()), ws_write_timeout(&writer_connection), &writer_fatal_triggered, &writer_fatal_notify).await {
                                 if e == WriteErr::Timeout {

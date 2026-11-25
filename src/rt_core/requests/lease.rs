@@ -1872,6 +1872,9 @@ pub enum ConnLifecycleError {
     AlreadyClosed,
     InvalidConnection,
     Stopped,
+    /// Caller invoked a synchronous lifecycle wait from inside the active `SerialDrainGate`
+    /// callback thread (would deadlock waiting for itself to drain the lifecycle reply).
+    ReentrantCallback,
 }
 
 /// Applies one [`LifecycleCmd`] on the single owner (0 alloc / 0 free on RT).

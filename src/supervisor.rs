@@ -3082,7 +3082,7 @@ impl SupervisorInner {
             #[cfg(not(target_arch = "wasm32"))]
             if let Some(tx) = self.rt_terminal_tx.as_mut() {
                 let rec = crate::rt_core::reply_router::RtTerminalStatus::from_action_status(action);
-                if tx.push(rec).is_err() {
+                if !tx.push(rec) {
                     if let Some(ov) = self.rt_terminal_overflow.as_ref() {
                         ov.fetch_add(1, Ordering::Release);
                     }
@@ -3104,7 +3104,7 @@ impl SupervisorInner {
             if let Some(a) = self.last_action.as_ref().filter(|a| a.id == id && !a.is_running()) {
                 let rec = crate::rt_core::reply_router::RtTerminalStatus::from_action_status(a);
                 if let Some(tx) = self.rt_terminal_tx.as_mut() {
-                    if tx.push(rec).is_err() {
+                    if !tx.push(rec) {
                         if let Some(ov) = self.rt_terminal_overflow.as_ref() {
                             ov.fetch_add(1, Ordering::Release);
                         }
@@ -9879,6 +9879,10 @@ struct TerminalBroadcasterInner {
     next_id: u64,
     capacity: usize,
     sinks: Vec<ConnectionTerminalQueue>,
+    /// Bounded cache of recently finished `ActionStatus` records so per-connection WS broker
+    /// reply sinks can retrieve the exact enriched `ActionStatus` for their bound `ActionId`
+    /// even when a subsequent action has already overwritten `hub.latest().obs.action`.
+    recent_finished: std::collections::VecDeque<ActionStatus>,
 }
 
 /// Lossless off-RT per-connection bounded FIFO of finished actions: every terminal action
@@ -9907,6 +9911,7 @@ impl Default for TerminalBroadcaster {
                 next_id: 1,
                 capacity: TERMINAL_FIFO_CAPACITY,
                 sinks: Vec::new(),
+                recent_finished: std::collections::VecDeque::with_capacity(64),
             }),
         }
     }
@@ -9972,10 +9977,18 @@ impl TerminalBroadcaster {
     }
 
     pub(crate) fn record_finished(&self, action: &ActionStatus) -> bool {
-        if action.is_running() || self.subscriber_count.load(Ordering::Acquire) == 0 {
+        if action.is_running() {
             return false;
         }
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = g.recent_finished.iter_mut().find(|a| a.id == action.id) {
+            *existing = action.clone();
+        } else {
+            if g.recent_finished.len() >= 64 {
+                g.recent_finished.pop_front();
+            }
+            g.recent_finished.push_back(action.clone());
+        }
         if g.sinks.is_empty() {
             return false;
         }
@@ -10000,6 +10013,15 @@ impl TerminalBroadcaster {
             self.recompute_atomics(&g);
         }
         enqueued
+    }
+
+    pub(crate) fn lookup_finished(&self, action_id: u64) -> Option<ActionStatus> {
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.recent_finished
+            .iter()
+            .rev()
+            .find(|a| a.id == action_id)
+            .cloned()
     }
 
     pub(crate) fn record_from_observation(&self, obs: &ArmObservation) {
@@ -11359,6 +11381,12 @@ impl ArmSupervisor {
         }
     }
 
+    /// Looks up the enriched finished [`ActionStatus`] for `action_id` from the bounded
+    /// off-RT terminal cache populated by `OffThreadSinks::drain_rt_terminals`.
+    pub(crate) fn lookup_finished_action(&self, action_id: u64) -> Option<ActionStatus> {
+        self.terminals.lookup_finished(action_id)
+    }
+
     /// Starts the dispatcher thread (armd does at startup, before the control loop): it
     /// frees the observations the tick retired, forwards telemetry and drains the
     /// recording ring. Idempotent.
@@ -12051,7 +12079,9 @@ impl ArmSupervisor {
                                         message: "Connection identity is closed or invalid".into(),
                                     })
                                 }
-                                Err(ConnLifecycleError::Stopped) => Err(executor_unavailable()),
+                                Err(ConnLifecycleError::Stopped | ConnLifecycleError::ReentrantCallback) => {
+                                    Err(executor_unavailable())
+                                }
                             };
                         }
                     }
@@ -12097,7 +12127,9 @@ impl ArmSupervisor {
                             message: "Connection identity is closed or invalid".into(),
                         })
                     }
-                    Err(ConnLifecycleError::Stopped) => Err(executor_unavailable()),
+                    Err(ConnLifecycleError::Stopped | ConnLifecycleError::ReentrantCallback) => {
+                        Err(executor_unavailable())
+                    }
                 }
             }
             _ => Err(executor_unavailable()),

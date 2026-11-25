@@ -29,7 +29,7 @@
 //!    completion records cross to `armd-dispatch` through a preallocated lock-free SPSC
 //!    ring of `Copy` [`RtTerminalStatus`] records.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -89,29 +89,114 @@ pub enum ExternalSubmitError {
     Stopped,
 }
 
-/// Per-socket wire-ACK abandonment tracker shared between WS `worker_task`,
-/// `subscribe_action_terminals`, and `writer_task` (telemetry + lag resync).
+/// Per-socket wire-ACK visibility & routing tracker shared between WS `worker_task`,
+/// `ws_reply_sink`, `subscribe_action_terminals`, and `writer_task` (telemetry + lag resync).
 ///
-/// Guarantees that if a submitting WS socket fails, times out, or cancels before its
-/// `command_ack` is enqueued onto `ordinary_out_tx`, no terminal `ArmObservation` for that
-/// abandoned action (via `TerminalBroadcaster`, telemetry broadcast, or `hub.latest()` lag
-/// resync) can leak to that submitting socket.
+/// Enforces a single per-socket visibility decision across ALL terminal-bearing outputs:
+/// 1. While a command ACK barrier is active (`enter_ack_barrier`..`leave_ack_barrier`), any
+///    newly-finished action (`id > ack_barrier_floor`) is redacted from telemetry/lag resync
+///    in BOTH `obs.action` and `obs.previous_action` and held back by `ws_reply_sink` until
+///    `command_ack` has been enqueued onto `ordinary_out_tx`.
+/// 2. If a submitting WS socket fails, times out, or cancels before its `command_ack` is
+///    enqueued (including while `action_id` is still unknown), no terminal `ArmObservation`
+///    for that abandoned action can leak via `TerminalBroadcaster`, telemetry, or lag resync.
+/// 3. Actions admitted on THIS socket over `OWNER_EXECUTOR` are marked router-owned so their
+///    owner terminal is delivered strictly through `ActionReplyRouter -> ws_reply_sink` (holding
+///    its router reservation credit through enqueue or abandonment) without duplicate delivery
+///    from `TerminalBroadcaster`.
 #[derive(Debug, Default)]
 pub struct WsWireAckTracker {
     inner: Mutex<WsWireAckState>,
 }
 
 const ABANDONED_ACTION_HISTORY_CAP: usize = 64;
+const OWNED_ROUTER_ACTION_HISTORY_CAP: usize = 128;
 
 #[derive(Debug, Default)]
 struct WsWireAckState {
     abandoned_ids: VecDeque<u64>,
+    owned_router_ids: VecDeque<u64>,
+    ack_barrier_active: bool,
+    ack_barrier_floor: u64,
+    unknown_abandoned_count: usize,
+    unknown_abandoned_floor: u64,
     socket_closed: bool,
 }
 
 impl WsWireAckTracker {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Enters the per-socket ACK enqueue barrier for a new external command, capturing the
+    /// highest action ID already visible on the wire before this command can reach RT.
+    pub fn enter_ack_barrier(&self, floor_action_id: u64) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.ack_barrier_active = true;
+        g.ack_barrier_floor = floor_action_id;
+    }
+
+    /// Leaves the per-socket ACK enqueue barrier after `command_ack` is enqueued (or abandoned).
+    pub fn leave_ack_barrier(&self) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.ack_barrier_active = false;
+    }
+
+    /// True while an external command on this socket has not yet enqueued its wire reply.
+    pub fn is_ack_barrier_active(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .ack_barrier_active
+    }
+
+    /// Records that an action admitted on this socket was abandoned while still `AwaitingAck`
+    /// (its `action_id` is not yet known). Any terminal with `id > floor` is hidden until the
+    /// late broker reply resolves the exact `action_id` (or shutdown clears it).
+    pub fn begin_unknown_abandoned(&self) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if g.unknown_abandoned_count == 0 {
+            g.unknown_abandoned_floor = g.ack_barrier_floor;
+        } else {
+            g.unknown_abandoned_floor = g.unknown_abandoned_floor.min(g.ack_barrier_floor);
+        }
+        g.unknown_abandoned_count = g.unknown_abandoned_count.saturating_add(1);
+    }
+
+    /// Resolves one previously unknown abandoned route once its late broker reply arrives (or
+    /// on router shutdown), recording the concrete `action_id` if known.
+    pub fn resolve_unknown_abandoned(&self, action_id: Option<u64>) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(id) = action_id {
+            if id != 0 && !g.abandoned_ids.contains(&id) {
+                if g.abandoned_ids.len() >= ABANDONED_ACTION_HISTORY_CAP {
+                    g.abandoned_ids.pop_front();
+                }
+                g.abandoned_ids.push_back(id);
+            }
+        }
+        g.unknown_abandoned_count = g.unknown_abandoned_count.saturating_sub(1);
+    }
+
+    /// Marks `action_id` as owned by this socket's `ActionReplyRouter` sink so observer
+    /// `TerminalBroadcaster` skips it on this socket (preventing duplicate owner terminals).
+    pub fn mark_owned_by_router(&self, action_id: u64) {
+        if action_id == 0 {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if !g.owned_router_ids.contains(&action_id) {
+            if g.owned_router_ids.len() >= OWNED_ROUTER_ACTION_HISTORY_CAP {
+                g.owned_router_ids.pop_front();
+            }
+            g.owned_router_ids.push_back(action_id);
+        }
+    }
+
+    /// True if `action_id` belongs to an external executor action admitted on this socket.
+    pub fn is_owned_by_router(&self, action_id: u64) -> bool {
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.owned_router_ids.contains(&action_id)
     }
 
     /// Marks `action_id` as abandoned before wire `command_ack` enqueue on this socket.
@@ -150,23 +235,47 @@ impl WsWireAckTracker {
             .socket_closed
     }
 
-    /// Redacts any finished (`!is_running()`) abandoned action from `obs.action` and
-    /// `obs.previous_action` before telemetry/lag-resync serialization on the submitting socket.
-    pub fn redact_abandoned_obs(&self, obs: &mut crate::model::ArmObservation) {
+    fn should_hide_terminal(g: &WsWireAckState, action_id: u64) -> bool {
+        if g.socket_closed || g.abandoned_ids.contains(&action_id) {
+            return true;
+        }
+        if g.ack_barrier_active && action_id > g.ack_barrier_floor {
+            return true;
+        }
+        if g.unknown_abandoned_count > 0 && action_id > g.unknown_abandoned_floor {
+            return true;
+        }
+        false
+    }
+
+    /// Single per-socket visibility gate applied to telemetry and lag-resync `ArmObservation`
+    /// frames before serialization: redacts any terminal (`!is_running()`) in BOTH `obs.action`
+    /// and `obs.previous_action` that is abandoned, pending an unknown-ID abandonment, or
+    /// belongs to an in-flight ACK barrier whose `command_ack` has not yet been enqueued.
+    pub fn redact_obs(&self, obs: &mut crate::model::ArmObservation) {
         let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if g.abandoned_ids.is_empty() && !g.socket_closed {
+        if g.abandoned_ids.is_empty()
+            && !g.socket_closed
+            && !g.ack_barrier_active
+            && g.unknown_abandoned_count == 0
+        {
             return;
         }
         if let Some(a) = obs.action.as_ref() {
-            if !a.is_running() && (g.socket_closed || g.abandoned_ids.contains(&a.id)) {
+            if !a.is_running() && Self::should_hide_terminal(&g, a.id) {
                 obs.action = None;
             }
         }
         if let Some(prev) = obs.previous_action.as_ref() {
-            if !prev.is_running() && (g.socket_closed || g.abandoned_ids.contains(&prev.id)) {
+            if !prev.is_running() && Self::should_hide_terminal(&g, prev.id) {
                 obs.previous_action = None;
             }
         }
+    }
+
+    /// Backwards-compatible alias for [`Self::redact_obs`].
+    pub fn redact_abandoned_obs(&self, obs: &mut crate::model::ArmObservation) {
+        self.redact_obs(obs);
     }
 }
 
@@ -206,6 +315,13 @@ pub struct RtTerminalStatus {
     pub grasp_width_m: Option<f32>,
     pub object_height_m: Option<f32>,
     pub close_height_m: Option<f32>,
+    pub stop_rad: Option<f32>,
+    pub offset_rad: Option<f32>,
+    pub pass: Option<bool>,
+    pub durability_confirmed: Option<bool>,
+    pub durability_warning: BoundedText<160>,
+    pub has_durability_warning: bool,
+    pub policy_stats: Option<crate::motion::PolicyStats>,
 }
 
 impl RtTerminalStatus {
@@ -213,6 +329,10 @@ impl RtTerminalStatus {
     pub fn from_action_status(a: &ActionStatus) -> Self {
         let (has_message, message) = match a.message.as_deref() {
             Some(m) => (true, BoundedText::new(m)),
+            None => (false, BoundedText::default()),
+        };
+        let (has_durability_warning, durability_warning) = match a.durability_warning.as_deref() {
+            Some(w) => (true, BoundedText::new(w)),
             None => (false, BoundedText::default()),
         };
         Self {
@@ -245,12 +365,24 @@ impl RtTerminalStatus {
             grasp_width_m: a.grasp_width_m,
             object_height_m: a.object_height_m,
             close_height_m: a.close_height_m,
+            stop_rad: a.stop_rad,
+            offset_rad: a.offset_rad,
+            pass: a.pass,
+            durability_confirmed: a.durability_confirmed,
+            durability_warning,
+            has_durability_warning,
+            policy_stats: a.policy_stats,
         }
     }
 
-    /// Reconstructs an off-RT [`ActionStatus`] for `TerminalBroadcaster`, attaching any sidecar
-    /// measurement payload associated with `self.id`.
-    pub fn into_action_status(self, measurement: Option<serde_json::Value>) -> ActionStatus {
+    /// Reconstructs an off-RT [`ActionStatus`] for `TerminalBroadcaster` and WS owner delivery,
+    /// attaching any sidecar measurement payload and off-RT `PolicyStats` overlay associated with
+    /// `self.id`.
+    pub fn into_action_status(
+        self,
+        measurement: Option<serde_json::Value>,
+        policy_stats_overlay: Option<crate::motion::PolicyStats>,
+    ) -> ActionStatus {
         let mut status = ActionStatus::blank();
         status.id = self.id;
         status.kind = self.kind;
@@ -282,6 +414,14 @@ impl RtTerminalStatus {
         status.grasp_width_m = self.grasp_width_m;
         status.object_height_m = self.object_height_m;
         status.close_height_m = self.close_height_m;
+        status.stop_rad = self.stop_rad;
+        status.offset_rad = self.offset_rad;
+        status.pass = self.pass;
+        status.durability_confirmed = self.durability_confirmed;
+        status.durability_warning = self
+            .has_durability_warning
+            .then(|| self.durability_warning.as_str().to_owned());
+        status.policy_stats = self.policy_stats.or(policy_stats_overlay);
         status.measurement = measurement;
         status
     }
@@ -321,11 +461,16 @@ impl RtTerminalTx {
         self.cap.saturating_sub(used)
     }
 
+    /// Pushes one `Copy` terminal record without allocation. Returns `true` on success, `false`
+    /// when the ring is full.
     #[inline]
-    pub fn push(&mut self, rec: RtTerminalStatus) -> Result<(), rtrb::PushError<RtTerminalStatus>> {
-        self.tx.push(rec)?;
-        self.pushed.fetch_add(1, Ordering::Release);
-        Ok(())
+    pub fn push(&mut self, rec: RtTerminalStatus) -> bool {
+        if self.tx.push(rec).is_ok() {
+            self.pushed.fetch_add(1, Ordering::Release);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -396,6 +541,9 @@ enum ExternalRouteState {
         #[allow(dead_code)]
         action_id: Option<ActionId>,
         wire_tracker: Option<Arc<WsWireAckTracker>>,
+        /// True when `wire_tracker.begin_unknown_abandoned()` was called and still needs a
+        /// matching `resolve_unknown_abandoned(...)` on late reply or shutdown.
+        unknown_tracker_armed: bool,
     },
 }
 
@@ -509,9 +657,10 @@ pub(crate) struct SerialDrainGate {
 
 struct SerialDrainState {
     active: bool,
-    /// Deferred `finish_stopped(rt_joined)` requested while another thread (emergency timeout)
-    /// or the same thread (re-entrant sink callback calling `stop_and_join`) held the gate.
-    deferred_finish_stopped: Option<bool>,
+    /// Deferred `finish_stopped(rt_joined, allow_callbacks)` requested while another thread
+    /// (emergency timeout) or the same thread (re-entrant sink callback calling `stop_and_join`)
+    /// held the gate.
+    deferred_finish_stopped: Option<(bool, bool)>,
 }
 
 static NEXT_DRAIN_TID: AtomicU64 = AtomicU64::new(1);
@@ -541,6 +690,12 @@ impl SerialDrainGate {
         }
     }
 
+    /// True if the calling thread currently holds this serial drain gate (e.g. inside a sink
+    /// callback invoked by `deliver_ready_under_gate`).
+    pub(crate) fn is_owned_by_current_thread(&self) -> bool {
+        self.owner_tid.load(Ordering::Acquire) == current_drain_tid()
+    }
+
     /// Acquires the serial drain gate, blocking if another thread holds it, or returning
     /// `DrainEnter::SameThreadReentrant` if the calling thread already holds the gate (callback
     /// re-entry).
@@ -559,20 +714,23 @@ impl SerialDrainGate {
     }
 
     /// Acquires the serial drain gate up to `timeout`; if same-thread re-entry or timeout occurs,
-    /// atomically records `deferred_finish_stopped = Some(rt_joined)` under the gate mutex so the
-    /// active owner executes finalization before releasing the gate.
+    /// atomically records `deferred_finish_stopped = Some((rt_joined, allow_callbacks))` under
+    /// the gate mutex so the active owner executes finalization before releasing the gate.
     pub(crate) fn enter_for_shutdown(
         &self,
         emergency_bound: Option<Duration>,
         rt_joined: bool,
     ) -> DrainEnter {
         let tid = current_drain_tid();
+        let allow_callbacks = emergency_bound.is_none();
+        let merge = |prev: Option<(bool, bool)>| {
+            Some(prev.map_or((rt_joined, allow_callbacks), |(pj, pc)| {
+                (pj || rt_joined, pc && allow_callbacks)
+            }))
+        };
         let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if g.active && self.owner_tid.load(Ordering::Acquire) == tid {
-            g.deferred_finish_stopped = Some(
-                g.deferred_finish_stopped
-                    .map_or(rt_joined, |prev| prev || rt_joined),
-            );
+            g.deferred_finish_stopped = merge(g.deferred_finish_stopped);
             return DrainEnter::SameThreadReentrant;
         }
         if let Some(bound) = emergency_bound {
@@ -580,10 +738,7 @@ impl SerialDrainGate {
             while g.active {
                 let rem = deadline.saturating_duration_since(Instant::now());
                 if rem.is_zero() {
-                    g.deferred_finish_stopped = Some(
-                        g.deferred_finish_stopped
-                            .map_or(rt_joined, |prev| prev || rt_joined),
-                    );
+                    g.deferred_finish_stopped = merge(g.deferred_finish_stopped);
                     return DrainEnter::TimedOut;
                 }
                 let (next, res) = self
@@ -592,10 +747,7 @@ impl SerialDrainGate {
                     .unwrap_or_else(|e| e.into_inner());
                 g = next;
                 if res.timed_out() && g.active {
-                    g.deferred_finish_stopped = Some(
-                        g.deferred_finish_stopped
-                            .map_or(rt_joined, |prev| prev || rt_joined),
-                    );
+                    g.deferred_finish_stopped = merge(g.deferred_finish_stopped);
                     return DrainEnter::TimedOut;
                 }
             }
@@ -610,25 +762,90 @@ impl SerialDrainGate {
     }
 
     /// Atomically checks for deferred shutdown finalization under the gate mutex; releases the
-    /// gate ONLY when no deferred work remains. If `Some(rt_joined)` is returned, the caller
-    /// still owns the gate, must run `finalize_stopped_locked(rt_joined)`, and then call
+    /// gate ONLY when no deferred work remains. If `Some((rt_joined, allow_callbacks))` is
+    /// returned, the caller still owns the gate, must run
+    /// `finalize_stopped_under_gate(rt_joined, allow_callbacks)`, and then call
     /// `try_release_or_take_deferred()` again until it returns `None`.
-    pub(crate) fn try_release_or_take_deferred(&self) -> Option<bool> {
+    pub(crate) fn try_release_or_take_deferred(&self) -> Option<(bool, bool)> {
         let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(rt_joined) = g.deferred_finish_stopped.take() {
-            return Some(rt_joined);
+        if let Some(deferred) = g.deferred_finish_stopped.take() {
+            return Some(deferred);
         }
         self.owner_tid.store(0, Ordering::Release);
         g.active = false;
         self.cv.notify_all();
         None
     }
+
+    /// Unconditionally releases the gate during stack unwinding after a callback panic so no
+    /// future drainer or shutdown caller can deadlock permanently.
+    pub(crate) fn release_on_unwind(&self) {
+        let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        self.owner_tid.store(0, Ordering::Release);
+        g.active = false;
+        self.cv.notify_all();
+    }
+}
+
+/// Compact bounded durable tracker of closed `ClientId`s.
+///
+/// Server-assigned WS connection IDs are strictly monotonic (`1, 2, 3, ...`), so contiguous
+/// closed prefixes fold into `watermark` in O(1) space. Non-monotonic synthetic IDs are tracked
+/// in `above` up to `MAX_CLOSED_ABOVE`, compacting below the minimum active/pending client ID
+/// when exceeded so long-running connection churn stays strictly O(1) memory.
+const MAX_CLOSED_ABOVE: usize = 1024;
+
+#[derive(Debug, Default)]
+struct ClosedClients {
+    watermark: u64,
+    above: BTreeSet<u64>,
+}
+
+impl ClosedClients {
+    fn contains(&self, client: ClientId) -> bool {
+        client.0 != 0 && (client.0 <= self.watermark || self.above.contains(&client.0))
+    }
+
+    fn insert(&mut self, client: ClientId, min_live_client: Option<u64>) {
+        if client.0 == 0 || client.0 <= self.watermark {
+            return;
+        }
+        self.above.insert(client.0);
+        // Fold contiguous closed prefix immediately (O(1) memory for monotonic WS IDs).
+        while self.above.first().copied() == Some(self.watermark.saturating_add(1)) {
+            self.above.pop_first();
+            self.watermark = self.watermark.saturating_add(1);
+        }
+        // Bound sparse synthetic IDs: advance watermark up to any closed ID below all live clients.
+        if self.above.len() > MAX_CLOSED_ABOVE {
+            let ceiling = min_live_client.unwrap_or(u64::MAX);
+            while let Some(&first) = self.above.first() {
+                if first < ceiling && self.above.len() > MAX_CLOSED_ABOVE / 2 {
+                    self.above.pop_first();
+                    self.watermark = self.watermark.max(first);
+                } else {
+                    break;
+                }
+            }
+            // Hard fallback if live client ID is smaller than all sparse entries: evict oldest.
+            while self.above.len() > MAX_CLOSED_ABOVE {
+                self.above.pop_first();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn above_len(&self) -> usize {
+        self.above.len()
+    }
 }
 
 /// Unified off-RT action reply router (replaces PR P's stopgap global-only router).
 pub(crate) struct ActionReplyRouter {
-    /// Separate internal ACK waiters for non-action macro RPCs (`InstallChild`, `FinishMacro`).
-    pub(crate) internal_waiters: HashMap<RequestId, oneshot::Sender<Reply>>,
+    /// Separate internal ACK waiters for non-action macro RPCs (`InstallChild`, `FinishMacro`),
+    /// keyed by `RequestId` with owning `ClientId` (for close cleanup) and `Option<Sender>`
+    /// (`None` = cancelled tombstone that still consumes & discards a late ACK cleanly).
+    internal_waiters: HashMap<RequestId, (ClientId, Option<oneshot::Sender<Reply>>)>,
     /// Active external action routes (`BeginMacro`, `InstallPrepared`) bound to a destination.
     external_routes: HashMap<RequestId, ExternalActionRoute>,
     /// Fixed-size per-connection reply slots (`<= MAX_LIVE_CONNECTIONS`).
@@ -639,9 +856,9 @@ pub(crate) struct ActionReplyRouter {
     next_slot_gen: u64,
     /// Round-robin cursor across `slots` so no single backpressured connection starves others.
     rr_cursor: usize,
-    /// Durable set of closed `ClientId`s (never cleared on last reply; prevents re-admission
-    /// via `ConnectionOrGlobal` after `disconnect_client_only`).
-    closed_clients: HashSet<ClientId>,
+    /// Bounded compact durable set of closed `ClientId`s (prevents re-admission via
+    /// `ConnectionOrGlobal` after `disconnect_client_only` in O(1) memory).
+    closed_clients: ClosedClients,
     /// Fallback global sink for non-WS direct API / integration tests.
     global_sink: Option<Arc<ConnectionReplySink>>,
     global_sink_gen: u64,
@@ -650,9 +867,12 @@ pub(crate) struct ActionReplyRouter {
     next_global_seq: u64,
     /// Queued terminals targeting `global_sink` (bounded by pre-reserved credits).
     global_pending: VecDeque<(u64, ClientId, u64, Reply)>,
-    /// Unrouted replies from low-level raw `broker.submit` fixtures (no bound route).
+    /// Unrouted non-terminal replies from low-level raw `broker.submit` fixtures (no bound route).
     unrouted_external: VecDeque<(u64, ClientId, Reply)>,
-    /// Global bounded capacity (tracks `global_reserved + unrouted_external.len() <= global_cap`).
+    /// Count of popped `unrouted_external` items currently in-flight inside a delivery callback
+    /// so `global_used` never undercounts and backpressure re-insertion cannot exceed `global_cap`.
+    in_flight_unrouted: usize,
+    /// Global bounded capacity (tracks `global_reserved + unrouted_external.len() + in_flight_unrouted <= global_cap`).
     global_cap: usize,
     /// Default per-connection bounded reply capacity.
     default_per_conn_cap: usize,
@@ -680,12 +900,13 @@ impl ActionReplyRouter {
             client_to_slot: HashMap::with_capacity(MAX_LIVE_CONNECTIONS),
             next_slot_gen: 0,
             rr_cursor: 0,
-            closed_clients: HashSet::new(),
+            closed_clients: ClosedClients::default(),
             global_sink: None,
             global_sink_gen: 0,
             next_global_seq: 0,
             global_pending: VecDeque::with_capacity(cap),
             unrouted_external: VecDeque::with_capacity(cap),
+            in_flight_unrouted: 0,
             global_cap: cap,
             default_per_conn_cap,
             global_reserved: 0,
@@ -694,6 +915,43 @@ impl ActionReplyRouter {
             mapping_mismatches: 0,
             protocol_anomalies: 0,
         }
+    }
+
+    pub(crate) fn register_internal_waiter(
+        &mut self,
+        req_id: RequestId,
+        client: ClientId,
+        tx: oneshot::Sender<Reply>,
+    ) {
+        self.internal_waiters.insert(req_id, (client, Some(tx)));
+    }
+
+    /// Cancels an internal waiter while retaining a tombstone `(client, None)` until either the
+    /// late ACK arrives (and is cleanly abandoned instead of leaking into `unrouted_external`)
+    /// or `client` disconnects / executor stops.
+    pub(crate) fn cancel_internal_waiter(&mut self, req_id: RequestId) {
+        if let Some((_, slot)) = self.internal_waiters.get_mut(&req_id) {
+            *slot = None;
+        }
+    }
+
+    fn min_active_client_id(&self) -> Option<u64> {
+        let mut min_id: Option<u64> = None;
+        let mut consider = |c: ClientId| {
+            if c.0 != 0 {
+                min_id = Some(min_id.map_or(c.0, |m| m.min(c.0)));
+            }
+        };
+        for &c in self.client_to_slot.keys() {
+            consider(c);
+        }
+        for r in self.external_routes.values() {
+            consider(r.client);
+        }
+        for (c, _) in self.internal_waiters.values() {
+            consider(*c);
+        }
+        min_id
     }
 
     pub(crate) fn stats(&self) -> ReplyRouterStats {
@@ -755,7 +1013,7 @@ impl ActionReplyRouter {
         sink: Arc<ConnectionReplySink>,
         per_conn_cap: Option<usize>,
     ) -> Result<ConnectionSlotToken, AdmitError> {
-        if client.0 == 0 || self.closed_clients.contains(&client) {
+        if client.0 == 0 || self.closed_clients.contains(client) {
             return Err(AdmitError::Disconnected);
         }
         if let Some(&idx) = self.client_to_slot.get(&client) {
@@ -852,6 +1110,7 @@ impl ActionReplyRouter {
                         route.state = ExternalRouteState::Abandoned {
                             action_id: Some(aid),
                             wire_tracker: wt,
+                            unknown_tracker_armed: false,
                         };
                     }
                     ExternalRouteState::AckCommitted { action_id } => {
@@ -859,6 +1118,7 @@ impl ActionReplyRouter {
                         route.state = ExternalRouteState::Abandoned {
                             action_id: Some(aid),
                             wire_tracker: None,
+                            unknown_tracker_armed: false,
                         };
                     }
                     ExternalRouteState::Abandoned { .. } => {}
@@ -868,9 +1128,9 @@ impl ActionReplyRouter {
     }
 
     /// Closes a connection immediately: records durable closure, blocks future admissions,
-    /// retires all routes and queued replies for `client` across both its `ConnSlot` and
-    /// `global_pending`/`unrouted_external`, and frees `slot_idx` so future connections reuse it
-    /// only with a strictly larger `slot_gen`.
+    /// retires all routes, internal waiters, and queued replies for `client` across both its
+    /// `ConnSlot` and `global_pending`/`unrouted_external`, and frees `slot_idx` so future
+    /// connections reuse it only with a strictly larger `slot_gen`.
     ///
     /// Does NOT touch any popped `InFlightDelivery` credit (that credit stays owned by the
     /// active drain until [`Self::reconcile_in_flight`] runs).
@@ -878,7 +1138,9 @@ impl ActionReplyRouter {
         if client.0 == 0 {
             return;
         }
-        self.closed_clients.insert(client);
+
+        // 0. Retire all internal waiters (both live and cancelled tombstones) owned by `client`.
+        self.internal_waiters.retain(|_, (c, _)| *c != client);
 
         // 1. Close & free per-connection slot (if registered).
         if let Some(slot_idx) = self.client_to_slot.remove(&client) {
@@ -927,11 +1189,25 @@ impl ActionReplyRouter {
                             self.terminals_abandoned += 1;
                         }
                     }
-                    ExternalRouteState::AckCommitted { .. }
-                    | ExternalRouteState::Abandoned { .. } => {}
+                    ExternalRouteState::Abandoned {
+                        wire_tracker,
+                        unknown_tracker_armed,
+                        ..
+                    } => {
+                        if unknown_tracker_armed {
+                            if let Some(wt) = wire_tracker {
+                                wt.resolve_unknown_abandoned(None);
+                            }
+                        }
+                    }
+                    ExternalRouteState::AckCommitted { .. } => {}
                 }
             }
         }
+
+        // 4. Record durable closure after retiring `client`'s entries so compaction sees the new min live client.
+        let min_live = self.min_active_client_id();
+        self.closed_clients.insert(client, min_live);
     }
 
     /// Removes a newly-registered `ConnSlot` during rollback of a rejected/cancelled `Open`
@@ -960,14 +1236,16 @@ impl ActionReplyRouter {
         client: ClientId,
         policy: ExternalDestinationPolicy,
     ) -> Result<ReplyTarget, ExternalSubmitError> {
-        if client.0 != 0 && self.closed_clients.contains(&client) {
+        if client.0 != 0 && self.closed_clients.contains(client) {
             return Err(ExternalSubmitError::Admit(AdmitError::Disconnected));
         }
         if client.0 == 0 && policy == ExternalDestinationPolicy::ConnectionOnly {
             return Err(ExternalSubmitError::Admit(AdmitError::Disconnected));
         }
-        // Global capacity accounts for both reserved routes/pending and any buffered unrouted replies.
-        let global_used = self.global_reserved + self.unrouted_external.len();
+        // Global capacity accounts for reserved routes/pending, buffered unrouted replies, AND
+        // any popped unrouted replies currently in-flight inside a delivery callback.
+        let global_used =
+            self.global_reserved + self.unrouted_external.len() + self.in_flight_unrouted;
         if global_used + 1 > self.global_cap {
             return Err(ExternalSubmitError::Admit(AdmitError::RepliesFull));
         }
@@ -1109,9 +1387,16 @@ impl ActionReplyRouter {
             } => {
                 ack_tx.take();
                 let wt = tracker.or_else(|| wire_tracker.take());
+                let armed = if let Some(t) = wt.as_ref() {
+                    t.begin_unknown_abandoned();
+                    true
+                } else {
+                    false
+                };
                 route.state = ExternalRouteState::Abandoned {
                     action_id: None,
                     wire_tracker: wt,
+                    unknown_tracker_armed: armed,
                 };
             }
             ExternalRouteState::AwaitingAckCommit {
@@ -1129,6 +1414,7 @@ impl ActionReplyRouter {
                     route.state = ExternalRouteState::Abandoned {
                         action_id: Some(aid),
                         wire_tracker: wt,
+                        unknown_tracker_armed: false,
                     };
                 }
             }
@@ -1142,6 +1428,7 @@ impl ActionReplyRouter {
             ExternalRouteState::Abandoned {
                 action_id,
                 wire_tracker,
+                ..
             } => {
                 known_action = *action_id;
                 if wire_tracker.is_none() {
@@ -1166,10 +1453,18 @@ impl ActionReplyRouter {
     ) -> DeliveryDecision {
         let req = reply.request();
 
-        // 1. Separate internal ACK waiters (`InstallChild`, `FinishMacro`).
-        if let Some(tx) = self.internal_waiters.remove(&req) {
-            let _ = tx.send(reply);
-            return DeliveryDecision::Delivered;
+        // 1. Separate internal ACK waiters (`InstallChild`, `FinishMacro`) including cancelled tombstones.
+        if let Some((_, tx_opt)) = self.internal_waiters.remove(&req) {
+            return match tx_opt {
+                Some(tx) => {
+                    if tx.send(reply).is_ok() {
+                        DeliveryDecision::Delivered
+                    } else {
+                        DeliveryDecision::Abandoned
+                    }
+                }
+                None => DeliveryDecision::Abandoned,
+            };
         }
 
         // 2. Managed external action routes (`BeginMacro`, `InstallPrepared`).
@@ -1178,11 +1473,20 @@ impl ActionReplyRouter {
         }
 
         // 3. Unrouted replies from low-level raw `broker.submit` fixtures.
-        if client.0 != 0 && self.closed_clients.contains(&client) {
+        //    Never offer an unrouted `Reply::Terminal` (a `starts_action()` command that bypassed
+        //    routed destination binding) to a later-attached global sink.
+        if matches!(reply, Reply::Terminal { .. }) {
+            self.protocol_anomalies += 1;
             self.terminals_abandoned += 1;
             return DeliveryDecision::Abandoned;
         }
-        if self.global_reserved + self.unrouted_external.len() < self.global_cap {
+        if client.0 != 0 && self.closed_clients.contains(client) {
+            self.terminals_abandoned += 1;
+            return DeliveryDecision::Abandoned;
+        }
+        let global_used =
+            self.global_reserved + self.unrouted_external.len() + self.in_flight_unrouted;
+        if global_used < self.global_cap {
             self.next_global_seq += 1;
             let seq = self.next_global_seq;
             self.unrouted_external.push_back((seq, client, reply));
@@ -1213,6 +1517,11 @@ impl ActionReplyRouter {
                     action: Some(action_id),
                     ..
                 } => {
+                    // Mark router ownership on the submitting socket BEFORE releasing ACK so
+                    // observer `TerminalBroadcaster` never double-delivers this action's terminal.
+                    if let Some(wt) = wire_tracker.as_ref() {
+                        wt.mark_owned_by_router(action_id.0);
+                    }
                     let delivered_ack = ack_tx
                         .take()
                         .is_some_and(|tx| tx.send(Ok(reply)).is_ok());
@@ -1221,6 +1530,9 @@ impl ActionReplyRouter {
                         if !target_still_live {
                             // Destination closed/detached while ACK was in flight: release credit now
                             // and abandon future Terminal cleanly.
+                            if let Some(wt) = wire_tracker.as_ref() {
+                                wt.mark_abandoned(action_id.0);
+                            }
                             if route.reserved_held {
                                 route.reserved_held = false;
                                 self.release_target_credit(route.target);
@@ -1228,6 +1540,7 @@ impl ActionReplyRouter {
                             route.state = ExternalRouteState::Abandoned {
                                 action_id: Some(action_id),
                                 wire_tracker,
+                                unknown_tracker_armed: false,
                             };
                         } else if require_ack_commit {
                             route.state = ExternalRouteState::AwaitingAckCommit {
@@ -1253,6 +1566,7 @@ impl ActionReplyRouter {
                         route.state = ExternalRouteState::Abandoned {
                             action_id: Some(action_id),
                             wire_tracker,
+                            unknown_tracker_armed: false,
                         };
                         self.external_routes.insert(req, route);
                         DeliveryDecision::Abandoned
@@ -1366,23 +1680,33 @@ impl ActionReplyRouter {
             ExternalRouteState::Abandoned {
                 action_id: _,
                 wire_tracker,
+                unknown_tracker_armed,
             } => match reply {
                 Reply::Ack {
                     action: Some(aid), ..
                 } => {
                     if let Some(wt) = wire_tracker.as_ref() {
-                        wt.mark_abandoned(aid.0);
+                        if unknown_tracker_armed {
+                            wt.resolve_unknown_abandoned(Some(aid.0));
+                        } else {
+                            wt.mark_abandoned(aid.0);
+                        }
                     }
                     route.state = ExternalRouteState::Abandoned {
                         action_id: Some(aid),
                         wire_tracker,
+                        unknown_tracker_armed: false,
                     };
                     self.external_routes.insert(req, route);
                     DeliveryDecision::Abandoned
                 }
                 Reply::Terminal { action, .. } => {
                     if let Some(wt) = wire_tracker.as_ref() {
-                        wt.mark_abandoned(action.0);
+                        if unknown_tracker_armed {
+                            wt.resolve_unknown_abandoned(Some(action.0));
+                        } else {
+                            wt.mark_abandoned(action.0);
+                        }
                     }
                     self.terminals_abandoned += 1;
                     if route.reserved_held {
@@ -1391,6 +1715,11 @@ impl ActionReplyRouter {
                     DeliveryDecision::Abandoned
                 }
                 Reply::Refused { .. } | Reply::Ack { action: None, .. } | Reply::Lease { .. } => {
+                    if unknown_tracker_armed {
+                        if let Some(wt) = wire_tracker.as_ref() {
+                            wt.resolve_unknown_abandoned(None);
+                        }
+                    }
                     if route.reserved_held {
                         self.release_target_credit(route.target);
                     }
@@ -1412,7 +1741,7 @@ impl ActionReplyRouter {
             ReplyTarget::GlobalSink { client, sink_gen } => {
                 self.global_sink.is_some()
                     && self.global_sink_gen == sink_gen
-                    && !self.closed_clients.contains(&client)
+                    && !self.closed_clients.contains(client)
             }
         }
     }
@@ -1445,7 +1774,7 @@ impl ActionReplyRouter {
             ReplyTarget::GlobalSink { client, sink_gen } => {
                 if self.global_sink.is_some()
                     && self.global_sink_gen == sink_gen
-                    && !(client.0 != 0 && self.closed_clients.contains(&client))
+                    && !(client.0 != 0 && self.closed_clients.contains(client))
                     && route.reserved_held
                 {
                     self.next_global_seq += 1;
@@ -1519,7 +1848,7 @@ impl ActionReplyRouter {
                         let (_, client, sink_gen, reply) =
                             self.global_pending.pop_front().expect("checked front");
                         if sink_gen != self.global_sink_gen
-                            || (client.0 != 0 && self.closed_clients.contains(&client))
+                            || (client.0 != 0 && self.closed_clients.contains(client))
                         {
                             self.global_reserved = self.global_reserved.saturating_sub(1);
                             self.terminals_abandoned += 1;
@@ -1536,10 +1865,11 @@ impl ActionReplyRouter {
                     } else {
                         let (_, client, reply) =
                             self.unrouted_external.pop_front().expect("checked front");
-                        if client.0 != 0 && self.closed_clients.contains(&client) {
+                        if client.0 != 0 && self.closed_clients.contains(client) {
                             self.terminals_abandoned += 1;
                             continue;
                         }
+                        self.in_flight_unrouted += 1;
                         return Some(InFlightDelivery {
                             target: ReplyTarget::GlobalSink {
                                 client,
@@ -1616,9 +1946,12 @@ impl ActionReplyRouter {
                 }
             }
             ReplyTarget::GlobalSink { client, sink_gen } => {
+                if !item.owns_reservation {
+                    self.in_flight_unrouted = self.in_flight_unrouted.saturating_sub(1);
+                }
                 let live_global = self.global_sink.is_some()
                     && self.global_sink_gen == sink_gen
-                    && !self.closed_clients.contains(&client);
+                    && !self.closed_clients.contains(client);
                 match (decision, live_global) {
                     (DeliveryDecision::Backpressured, true) => {
                         if item.owns_reservation {
@@ -1651,24 +1984,43 @@ impl ActionReplyRouter {
         }
     }
 
-    /// Pops one unrouted reply (from raw `broker.submit` fixtures) for `poll_external_replies`.
+    /// Pops one unrouted reply (from raw `broker.submit` fixtures) for `poll_external_replies`,
+    /// holding an `in_flight_unrouted` credit until [`Self::finish_unrouted_in_flight`] runs.
     /// Never steals replies bound to a per-connection `ConnSlot` or `GlobalSink`.
     pub(crate) fn pop_unrouted(&mut self) -> Option<(ClientId, Reply)> {
         while let Some((_, client, reply)) = self.unrouted_external.pop_front() {
-            if client.0 != 0 && self.closed_clients.contains(&client) {
+            if client.0 != 0 && self.closed_clients.contains(client) {
                 self.terminals_abandoned += 1;
                 continue;
             }
+            self.in_flight_unrouted += 1;
             return Some((client, reply));
         }
         None
     }
 
-    pub(crate) fn push_front_unrouted(&mut self, client: ClientId, reply: Reply) {
-        if !(client.0 != 0 && self.closed_clients.contains(&client)) {
-            self.unrouted_external.push_front((0, client, reply));
-        } else {
-            self.terminals_abandoned += 1;
+    /// Reconciles one popped raw unrouted reply from [`Self::pop_unrouted`].
+    pub(crate) fn finish_unrouted_in_flight(
+        &mut self,
+        client: ClientId,
+        reply: Reply,
+        decision: DeliveryDecision,
+    ) {
+        self.in_flight_unrouted = self.in_flight_unrouted.saturating_sub(1);
+        match decision {
+            DeliveryDecision::Backpressured => {
+                if !(client.0 != 0 && self.closed_clients.contains(client)) {
+                    self.unrouted_external.push_front((0, client, reply));
+                } else {
+                    self.terminals_abandoned += 1;
+                }
+            }
+            DeliveryDecision::Delivered => {
+                self.terminals_delivered += 1;
+            }
+            DeliveryDecision::Abandoned => {
+                self.terminals_abandoned += 1;
+            }
         }
     }
 
@@ -1699,12 +2051,21 @@ impl ActionReplyRouter {
                 route.reserved_held = false;
                 self.global_reserved = self.global_reserved.saturating_sub(1);
             }
-            if let ExternalRouteState::AwaitingAckCommit {
-                held_terminal: Some(_),
-                ..
-            } = route.state
-            {
-                self.terminals_abandoned += 1;
+            match route.state {
+                ExternalRouteState::AwaitingAckCommit {
+                    held_terminal: Some(_),
+                    ..
+                } => {
+                    self.terminals_abandoned += 1;
+                }
+                ExternalRouteState::Abandoned {
+                    wire_tracker: Some(wt),
+                    unknown_tracker_armed: true,
+                    ..
+                } => {
+                    wt.resolve_unknown_abandoned(None);
+                }
+                _ => {}
             }
         }
         for slot in self.slots.iter_mut() {
@@ -1987,7 +2348,152 @@ mod tests {
             DrainEnter::SameThreadReentrant
         ));
         // Outer owner atomically picks up deferred finalization before releasing gate.
-        assert_eq!(gate.try_release_or_take_deferred(), Some(true));
+        assert_eq!(gate.try_release_or_take_deferred(), Some((true, true)));
         assert_eq!(gate.try_release_or_take_deferred(), None);
+
+        // Emergency shutdown records allow_callbacks = false so callback-free retirement runs.
+        assert!(matches!(gate.enter(), DrainEnter::Entered));
+        assert!(matches!(
+            gate.enter_for_shutdown(Some(Duration::from_millis(5)), false),
+            DrainEnter::SameThreadReentrant
+        ));
+        assert_eq!(gate.try_release_or_take_deferred(), Some((false, false)));
+        assert_eq!(gate.try_release_or_take_deferred(), None);
+    }
+
+    #[test]
+    fn closed_clients_bounded_memory_internal_waiter_cleanup_and_in_flight_unrouted_cap() {
+        let mut router = ActionReplyRouter::new(2);
+
+        // 1. 5,000 sequential connection closes fold into watermark in O(1) space.
+        for id in 1..=5_000u64 {
+            router.close_connection(ClientId(id));
+        }
+        assert_eq!(router.closed_clients.above_len(), 0);
+        assert!(router.closed_clients.contains(ClientId(1)));
+        assert!(router.closed_clients.contains(ClientId(5_000)));
+        assert!(!router.closed_clients.contains(ClientId(5_001)));
+
+        // 2. Cancelled internal waiter leaves tombstone that consumes late ACK; close cleans up.
+        let (tx1, _rx1) = oneshot::channel();
+        router.register_internal_waiter(RequestId(10), ClientId(6000), tx1);
+        router.cancel_internal_waiter(RequestId(10));
+        assert_eq!(
+            router.route_broker_reply(
+                ClientId(6000),
+                Reply::Ack {
+                    request: RequestId(10),
+                    commit_seq: 1,
+                    action: None,
+                }
+            ),
+            DeliveryDecision::Abandoned
+        );
+        assert_eq!(router.stats().active_internal_waiters, 0);
+        assert_eq!(router.stats().pending_unrouted, 0);
+
+        let (tx2, mut rx2) = oneshot::channel();
+        router.register_internal_waiter(RequestId(11), ClientId(6001), tx2);
+        router.close_connection(ClientId(6001));
+        assert_eq!(router.stats().active_internal_waiters, 0);
+        assert!(rx2.try_recv().is_err());
+
+        // 3. Unrouted Reply::Terminal is abandoned (never offered to global sink).
+        router.attach_global_sink(Arc::new(|_, _| DeliveryDecision::Delivered));
+        assert_eq!(
+            router.route_broker_reply(
+                ClientId(6002),
+                Reply::Terminal {
+                    request: RequestId(12),
+                    action: ActionId(7),
+                    outcome: Outcome::Completed,
+                    children: 0,
+                }
+            ),
+            DeliveryDecision::Abandoned
+        );
+        assert_eq!(router.stats().pending_unrouted, 0);
+        assert_eq!(router.stats().protocol_anomalies, 1);
+
+        // 4. In-flight unrouted reply holds global_cap so backpressure re-insert never overcommits.
+        assert_eq!(
+            router.route_broker_reply(
+                ClientId(6002),
+                Reply::Refused {
+                    request: RequestId(13),
+                    code: "WRONG_TARGET",
+                }
+            ),
+            DeliveryDecision::Delivered
+        );
+        assert_eq!(
+            router.route_broker_reply(
+                ClientId(6002),
+                Reply::Refused {
+                    request: RequestId(14),
+                    code: "WRONG_TARGET",
+                }
+            ),
+            DeliveryDecision::Delivered
+        );
+        let mut bp = [false; MAX_LIVE_CONNECTIONS];
+        let in_flight = router.pop_next_delivery(&mut bp, false).unwrap();
+        // Even with 1 item popped in-flight, global_used == 2 == global_cap -> admission refused!
+        assert!(matches!(
+            router.check_external_admission(
+                ClientId(6002),
+                ExternalDestinationPolicy::ConnectionOrGlobal
+            ),
+            Err(ExternalSubmitError::Admit(AdmitError::RepliesFull))
+        ));
+        router.reconcile_in_flight(in_flight, DeliveryDecision::Backpressured);
+        assert_eq!(router.stats().pending_unrouted, 2);
+    }
+
+    #[test]
+    fn rt_terminal_status_preserves_policy_stats_and_durability_fields() {
+        let mut a = ActionStatus::blank();
+        a.id = 77;
+        a.kind = HolderLabel::new("gripper_zero_check");
+        a.state = HolderLabel::new("done");
+        a.finished_at = Some(2.5);
+        a.stop_rad = Some(0.12);
+        a.offset_rad = Some(-0.01);
+        a.pass = Some(true);
+        a.durability_confirmed = Some(false);
+        a.durability_warning = Some("fsync deferred".into());
+        a.policy_stats = Some(crate::motion::PolicyStats {
+            steps: 42,
+            overruns: 1,
+            skipped: 2,
+            infer_us: crate::motion::PolicyInferUs {
+                p50: 1200,
+                p99: 2400,
+                max: 3100,
+            },
+            period_us: 20_000,
+        });
+
+        let rec = RtTerminalStatus::from_action_status(&a);
+        let restored = rec.into_action_status(None, None);
+        assert_eq!(restored.stop_rad, Some(0.12));
+        assert_eq!(restored.offset_rad, Some(-0.01));
+        assert_eq!(restored.pass, Some(true));
+        assert_eq!(restored.durability_confirmed, Some(false));
+        assert_eq!(restored.durability_warning.as_deref(), Some("fsync deferred"));
+        assert_eq!(restored.policy_stats, a.policy_stats);
+
+        // Also verify off-RT overlay attaches policy_stats when RT left it None.
+        a.policy_stats = None;
+        let overlay = crate::motion::PolicyStats {
+            steps: 99,
+            overruns: 0,
+            skipped: 0,
+            infer_us: crate::motion::PolicyInferUs { p50: 500, p99: 900, max: 1100 },
+            period_us: 20_000,
+        };
+        let rec2 = RtTerminalStatus::from_action_status(&a);
+        let restored2 = rec2.into_action_status(None, Some(overlay));
+        assert_eq!(restored2.policy_stats, Some(overlay));
     }
 }

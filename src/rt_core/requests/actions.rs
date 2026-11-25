@@ -3742,6 +3742,9 @@ pub fn install_begin_macro(
             return Err(ActionRefusal::new("MOTION_BUSY"));
         }
         inner
+            .check_terminal_fifo_for_new_action()
+            .map_err(|e| ActionRefusal::new(static_code(e.into())))?;
+        inner
             .check_prepared_fresh_static(stamp.admission.estop_epoch)
             .map_err(ActionRefusal::new)?;
     } else {

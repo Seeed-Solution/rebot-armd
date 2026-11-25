@@ -784,14 +784,16 @@ pub(super) async fn handle_executor_ws_action(
                 ));
             }
         }
-        AuthRequirement::Conditional(_) if path == "/api/v1/action/run_sequence" => {
-            if !ws_auth.is_operator() && body.get("record").is_some_and(|r| !r.is_null()) {
-                return immediate(off_lock_action_reject(
-                    &request_id_val,
-                    epoch,
-                    ApiError::operator_required("run_sequence (record)"),
-                ));
-            }
+        AuthRequirement::Conditional(_)
+            if path == "/api/v1/action/run_sequence"
+                && !ws_auth.is_operator()
+                && body.get("record").is_some_and(|r| !r.is_null()) =>
+        {
+            return immediate(off_lock_action_reject(
+                &request_id_val,
+                epoch,
+                ApiError::operator_required("run_sequence (record)"),
+            ));
         }
         _ => {}
     }
@@ -934,7 +936,11 @@ pub(super) async fn handle_executor_ws_action(
             }));
         }
 
-        let gate = CommandReplyGateGuard::enter(command_reply_pending, recv_supervisor.hub());
+        let gate = CommandReplyGateGuard::enter_with_tracker(
+            command_reply_pending,
+            recv_supervisor.hub(),
+            wire_ack_tracker,
+        );
         match submit_prepared_executor_ws(
             recv_supervisor,
             recv_conn_id,
@@ -1004,7 +1010,11 @@ pub(super) async fn handle_executor_ws_action(
                 Ok(p) => p,
                 Err(e) => return immediate(off_lock_action_reject(&request_id_val, epoch, e.into())),
             };
-            let gate = CommandReplyGateGuard::enter(command_reply_pending, recv_supervisor.hub());
+            let gate = CommandReplyGateGuard::enter_with_tracker(
+                command_reply_pending,
+                recv_supervisor.hub(),
+                wire_ack_tracker,
+            );
             match crate::sequences::begin_executor_ws(
                 recv_supervisor,
                 ws_stamp,
@@ -1034,7 +1044,11 @@ pub(super) async fn handle_executor_ws_action(
                 Ok(p) => p,
                 Err(e) => return immediate(off_lock_action_reject(&request_id_val, epoch, e.into())),
             };
-            let gate = CommandReplyGateGuard::enter(command_reply_pending, recv_supervisor.hub());
+            let gate = CommandReplyGateGuard::enter_with_tracker(
+                command_reply_pending,
+                recv_supervisor.hub(),
+                wire_ack_tracker,
+            );
             match crate::calib_hover::begin_executor_ws(
                 recv_supervisor,
                 ws_stamp,
@@ -1071,7 +1085,11 @@ pub(super) async fn handle_executor_ws_action(
                 Ok(p) => p,
                 Err(e) => return immediate(off_lock_action_reject(&request_id_val, epoch, e.into())),
             };
-            let gate = CommandReplyGateGuard::enter(command_reply_pending, recv_supervisor.hub());
+            let gate = CommandReplyGateGuard::enter_with_tracker(
+                command_reply_pending,
+                recv_supervisor.hub(),
+                wire_ack_tracker,
+            );
             match crate::measure_multiview::begin_executor_ws(
                 recv_supervisor,
                 ws_stamp,
@@ -1405,7 +1423,11 @@ pub(super) async fn complete_macro_check(
             }
             Ok(Ok(p)) => p,
         };
-        let gate = CommandReplyGateGuard::enter(command_reply_pending, recv_supervisor.hub());
+        let gate = CommandReplyGateGuard::enter_with_tracker(
+            command_reply_pending,
+            recv_supervisor.hub(),
+            wire_ack_tracker,
+        );
         let begin_res = match planned {
             PlannedMacro::Grasp(g) => {
                 crate::grasp::begin_executor_ws(

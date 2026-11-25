@@ -1133,6 +1133,19 @@ impl StateHub {
             .cloned()
     }
 
+    /// Returns the latest recorded `PolicyStats` for `action_id`, if any (used by off-RT
+    /// `OffThreadSinks::drain_rt_terminals` so the first terminal frame preserves `policy_stats`).
+    #[cfg(feature = "policy-runtime")]
+    pub fn action_policy_stats(&self, id: u64) -> Option<crate::motion::PolicyStats> {
+        let g = self.policy_diag.lock().unwrap_or_else(|e| e.into_inner());
+        g.iter().find(|e| e.action_id == id).map(|e| e.stats)
+    }
+
+    #[cfg(not(feature = "policy-runtime"))]
+    pub fn action_policy_stats(&self, _id: u64) -> Option<crate::motion::PolicyStats> {
+        None
+    }
+
     /// Populates `obs.action.measurement` and `obs.previous_action.measurement` from the off-RT
     /// sidecar store when missing.
     pub fn attach_action_measurement(&self, obs: &mut ArmObservation) {

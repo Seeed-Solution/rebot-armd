@@ -130,15 +130,18 @@ impl SupervisorInner {
             }
         }
         if let Some(mut old) = self.last_action.take() {
-            if old.is_running() {
+            let was_running = old.is_running();
+            if was_running {
                 old.state = "cancelled".into();
                 old.code = Some("SUPERSEDED".into());
                 if format_superseded_msg {
                     old.message = Some(format!("Replaced by a new {kind} action"));
                 }
                 old.finished_at = Some(now);
+                self.record_finished_action(&old);
+            } else if !self.rt_executor_owned {
+                self.record_finished_action(&old);
             }
-            self.record_finished_action(&old);
             if let Some((mut prev, _)) = self.previous_action.replace((old, now + 2.0)) {
                 if let Some(msg) = prev.message.take() {
                     self.recycle_action_msg_spare(msg);

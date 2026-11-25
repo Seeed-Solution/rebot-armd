@@ -1679,6 +1679,7 @@ pub(crate) struct BrokerDispatcher {
     broker: Arc<Mutex<Broker<PlanSlot>>>,
     conn_lifecycle: Arc<super::requests::lease::ConnLifecycleClient>,
     reply_router: Arc<Mutex<ActionReplyRouter>>,
+    broker_discarded: AtomicBool,
     state: Mutex<BrokerDispatcherState>,
 }
 
@@ -1723,6 +1724,7 @@ impl BrokerDispatcher {
             broker,
             conn_lifecycle,
             reply_router,
+            broker_discarded: AtomicBool::new(false),
             state: Mutex::new(BrokerDispatcherState {
                 managed: HashMap::with_capacity(super::broker::REPLY_CAPACITY),
                 draining_disconnected: false,
@@ -1918,8 +1920,7 @@ impl BrokerDispatcher {
         self.reply_router
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .internal_waiters
-            .insert(req_id, tx);
+            .register_internal_waiter(req_id, client, tx);
         Ok((req_id, rx))
     }
 
@@ -1927,8 +1928,7 @@ impl BrokerDispatcher {
         self.reply_router
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .internal_waiters
-            .remove(&req_id);
+            .cancel_internal_waiter(req_id);
     }
 
     fn register_connection_reply_sink(
@@ -2145,6 +2145,13 @@ impl BrokerDispatcher {
         connection: super::requests::lease::ConnectionHandle,
     ) -> Result<super::requests::lease::LeaseOutcome, super::requests::lease::ConnLifecycleError>
     {
+        if self.drain_gate.is_owned_by_current_thread() {
+            // Calling a synchronous lifecycle wait from inside a sink callback on the drain
+            // thread would deadlock waiting for itself to drain the lifecycle reply. Enqueue
+            // the disconnect detached + retire router/broker state immediately and fail fast.
+            self.enqueue_disconnect_detached(connection);
+            return Err(super::requests::lease::ConnLifecycleError::ReentrantCallback);
+        }
         let rx = {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let (tx, rx) = mpsc::sync_channel(1);
@@ -2279,8 +2286,25 @@ impl BrokerDispatcher {
     /// Executes one full serialized delivery pass (called ONLY while holding `self.drain_gate`).
     fn deliver_ready_under_gate(&self, force_poll: bool) -> usize {
         use super::broker::DeliveryDecision;
-        use super::reply_router::ReplyTarget;
+        use super::reply_router::{InFlightDelivery, ReplyTarget};
         use crate::supervisor::MAX_LIVE_CONNECTIONS;
+
+        // Unwind-safe reconciliation guard: if a user sink callback panics while an
+        // `InFlightDelivery` is popped, Drop reconciles it as `Abandoned` so credits never leak.
+        struct InFlightGuard<'a> {
+            router: &'a Mutex<ActionReplyRouter>,
+            item: Option<InFlightDelivery>,
+        }
+        impl Drop for InFlightGuard<'_> {
+            fn drop(&mut self) {
+                if let Some(item) = self.item.take() {
+                    self.router
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .reconcile_in_flight(item, DeliveryDecision::Abandoned);
+                }
+            }
+        }
 
         let mut total = 0usize;
         let mut backpressured_slots = [false; MAX_LIVE_CONNECTIONS];
@@ -2303,15 +2327,23 @@ impl BrokerDispatcher {
                 let Some(item) = next else {
                     break;
                 };
-                let decision = if item
-                    .closed
-                    .as_ref()
-                    .is_some_and(|c| c.load(Ordering::Acquire))
-                {
-                    DeliveryDecision::Abandoned
-                } else {
-                    item.sink.deliver(item.client, item.reply)
+                let mut guard = InFlightGuard {
+                    router: &self.reply_router,
+                    item: Some(item),
                 };
+                let decision = {
+                    let it = guard.item.as_ref().expect("set above");
+                    if it
+                        .closed
+                        .as_ref()
+                        .is_some_and(|c| c.load(Ordering::Acquire))
+                    {
+                        DeliveryDecision::Abandoned
+                    } else {
+                        it.sink.deliver(it.client, it.reply)
+                    }
+                };
+                let item = guard.item.take().expect("set above");
                 match (decision, item.target) {
                     (
                         DeliveryDecision::Backpressured,
@@ -2340,30 +2372,42 @@ impl BrokerDispatcher {
     }
 
     fn run_deferred_and_release_gate(&self) {
-        while let Some(rt_joined) = self.drain_gate.try_release_or_take_deferred() {
-            self.finalize_stopped_under_gate(rt_joined);
+        while let Some((rt_joined, allow_callbacks)) =
+            self.drain_gate.try_release_or_take_deferred()
+        {
+            self.finalize_stopped_under_gate(rt_joined, allow_callbacks);
+        }
+    }
+
+    /// Unwind-safe RAII owner of `SerialDrainGate`: runs any deferred shutdown finalization on
+    /// normal exit and guarantees gate release even if a sink callback panics/unwinds.
+    fn enter_drain_guard(&self) -> Option<SerialDrainGuard<'_>> {
+        if matches!(
+            self.drain_gate.enter(),
+            super::reply_router::DrainEnter::Entered
+        ) {
+            Some(SerialDrainGuard {
+                dispatcher: self,
+                released: false,
+            })
+        } else {
+            None
         }
     }
 
     fn pump_replies(&self, force_poll: bool) -> usize {
-        if !matches!(
-            self.drain_gate.enter(),
-            super::reply_router::DrainEnter::Entered
-        ) {
+        let Some(guard) = self.enter_drain_guard() else {
             return 0;
-        }
+        };
         let n = self.deliver_ready_under_gate(force_poll);
-        self.run_deferred_and_release_gate();
+        guard.finish();
         n
     }
 
     fn drain_replies(&self) {
-        if !matches!(
-            self.drain_gate.enter(),
-            super::reply_router::DrainEnter::Entered
-        ) {
+        let Some(guard) = self.enter_drain_guard() else {
             return;
-        }
+        };
         let _ = self.deliver_ready_under_gate(false);
         let exited = {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -2383,7 +2427,7 @@ impl BrokerDispatcher {
                 .unwrap_or_else(|e| e.into_inner())
                 .fail_pending_waiters_on_stop();
         }
-        self.run_deferred_and_release_gate();
+        guard.finish();
     }
 
     /// Drains ONLY unrouted raw-broker replies (never steals replies bound to a per-connection
@@ -2393,12 +2437,24 @@ impl BrokerDispatcher {
         F: FnMut(ClientId, super::broker::Reply) -> super::broker::DeliveryDecision,
     {
         use super::broker::DeliveryDecision;
-        if !matches!(
-            self.drain_gate.enter(),
-            super::reply_router::DrainEnter::Entered
-        ) {
-            return 0;
+        struct UnroutedGuard<'a> {
+            router: &'a Mutex<ActionReplyRouter>,
+            item: Option<(ClientId, super::broker::Reply)>,
         }
+        impl Drop for UnroutedGuard<'_> {
+            fn drop(&mut self) {
+                if let Some((client, reply)) = self.item.take() {
+                    self.router
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .finish_unrouted_in_flight(client, reply, DeliveryDecision::Abandoned);
+                }
+            }
+        }
+
+        let Some(gate_guard) = self.enter_drain_guard() else {
+            return 0;
+        };
         let _ = self.deliver_ready_under_gate(true);
         let mut delivered = 0usize;
         loop {
@@ -2410,15 +2466,21 @@ impl BrokerDispatcher {
             let Some((client, reply)) = next else {
                 break;
             };
-            match deliver(client, reply) {
+            let mut uguard = UnroutedGuard {
+                router: &self.reply_router,
+                item: Some((client, reply)),
+            };
+            let decision = deliver(client, reply);
+            let (c, r) = uguard.item.take().expect("set above");
+            self.reply_router
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .finish_unrouted_in_flight(c, r, decision);
+            match decision {
                 DeliveryDecision::Delivered | DeliveryDecision::Abandoned => {
                     delivered += 1;
                 }
                 DeliveryDecision::Backpressured => {
-                    self.reply_router
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .push_front_unrouted(client, reply);
                     break;
                 }
             }
@@ -2426,21 +2488,25 @@ impl BrokerDispatcher {
         if delivered > 0 {
             let _ = self.deliver_ready_under_gate(true);
         }
-        self.run_deferred_and_release_gate();
+        gate_guard.finish();
         delivered
     }
 
-    fn finalize_stopped_under_gate(&self, rt_joined: bool) {
-        // 1. Final delivery attempt for any replies RT already emitted before exiting.
-        let _ = self.deliver_ready_under_gate(true);
-        // 2. Finalize all remaining off-RT state and recover reservations.
+    fn finalize_stopped_under_gate(&self, rt_joined: bool, allow_callbacks: bool) {
+        // 1. On normal shutdown (`allow_callbacks == true`), give already-emitted replies one
+        //    final delivery pass. On emergency shutdown (`allow_callbacks == false`), NEVER invoke
+        //    sink callbacks so a slow or stalled sink cannot defeat the emergency deadline.
+        if allow_callbacks {
+            let _ = self.deliver_ready_under_gate(true);
+        }
+        // 2. Finalize all remaining off-RT state and recover reservations (lock-only).
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         Self::fail_remaining(&mut st.managed, OwnerError::Stopped);
         st.draining_disconnected = false;
         let mut broker = self.broker.lock().unwrap_or_else(|e| e.into_inner());
         let mut router = self.reply_router.lock().unwrap_or_else(|e| e.into_inner());
         router.finalize_stopped(false);
-        if rt_joined {
+        if rt_joined && !self.broker_discarded.swap(true, Ordering::AcqRel) {
             broker.discard_stopped_after_rt_exit();
         } else {
             broker.reclaim_plans();
@@ -2465,8 +2531,12 @@ impl BrokerDispatcher {
             .enter_for_shutdown(emergency_bound, rt_joined)
         {
             super::reply_router::DrainEnter::Entered => {
-                self.finalize_stopped_under_gate(rt_joined);
-                self.run_deferred_and_release_gate();
+                let guard = SerialDrainGuard {
+                    dispatcher: self,
+                    released: false,
+                };
+                self.finalize_stopped_under_gate(rt_joined, emergency_bound.is_none());
+                guard.finish();
             }
             super::reply_router::DrainEnter::SameThreadReentrant => {
                 // Deferred finalization is recorded atomically under `drain_gate` and will run
@@ -2761,7 +2831,12 @@ impl OffThreadSinks {
             self.rt_terminal_popped.fetch_add(1, Ordering::Release);
             if let Some(terminals) = self.terminals.as_ref() {
                 let measurement = self.hub.action_measurement(rec.id);
-                let status = rec.into_action_status(measurement);
+                let policy_stats = if rec.policy_stats.is_none() && rec.kind.as_str() == "policy" {
+                    self.hub.action_policy_stats(rec.id)
+                } else {
+                    None
+                };
+                let status = rec.into_action_status(measurement, policy_stats);
                 terminals.record_finished(&status);
             }
         }
@@ -3586,6 +3661,34 @@ impl TargetWriterGuard<'_> {
     }
 }
 
+/// Explicit RT thread join-lifetime state (distinguishes running vs joined vs detached so a
+/// detached control thread is NEVER mistaken for a completed join on subsequent teardown).
+const RT_STATE_RUNNING: u8 = 0;
+const RT_STATE_JOINED: u8 = 1;
+const RT_STATE_DETACHED: u8 = 2;
+
+struct SerialDrainGuard<'a> {
+    dispatcher: &'a BrokerDispatcher,
+    released: bool,
+}
+
+impl SerialDrainGuard<'_> {
+    fn finish(mut self) {
+        self.released = true;
+        self.dispatcher.run_deferred_and_release_gate();
+    }
+}
+
+impl Drop for SerialDrainGuard<'_> {
+    fn drop(&mut self) {
+        if !self.released {
+            // Unwinding after a callback panic: release the gate unconditionally so no future
+            // drainer or shutdown caller can deadlock permanently.
+            self.dispatcher.drain_gate.release_on_unwind();
+        }
+    }
+}
+
 struct RtExecutorShared {
     boot: BootId,
     broker: Arc<Mutex<Broker<PlanSlot>>>,
@@ -3605,6 +3708,7 @@ struct RtExecutorShared {
     control_stop: Arc<AtomicBool>,
     persist_stop: Arc<AtomicBool>,
     exited: Arc<AtomicBool>,
+    control_rt_state: std::sync::atomic::AtomicU8,
     control_exited_cv: Arc<(Mutex<bool>, Condvar)>,
     persist_worker_exited: Arc<AtomicBool>,
     persist_exited_cv: Arc<(Mutex<bool>, Condvar)>,
@@ -3652,7 +3756,6 @@ impl RtExecutorShared {
             clock.wake();
         }
 
-        let mut rt_joined = false;
         if let Some(bound) = emergency_bound {
             // Wait up to `bound` for `armd-control` to finish its bounded disable and exit;
             // if a driver syscall stalls past the bound, take and detach the join handle so no
@@ -3663,8 +3766,9 @@ impl RtExecutorShared {
             if let Some(jh) = self.control_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
                 if finished {
                     let _ = jh.join();
-                    rt_joined = true;
+                    self.control_rt_state.store(RT_STATE_JOINED, Ordering::Release);
                 } else {
+                    self.control_rt_state.store(RT_STATE_DETACHED, Ordering::Release);
                     self.exited.store(true, Ordering::Release);
                     tracing::error!(
                         "Emergency teardown: detaching stalled RT executor thread (`armd-control`) after {:?} timeout so later teardown/Drop cannot block indefinitely",
@@ -3672,8 +3776,6 @@ impl RtExecutorShared {
                     );
                     drop(jh);
                 }
-            } else {
-                rt_joined = !self.teardown_disable.timed_out.load(Ordering::Acquire);
             }
         } else if self.teardown_disable.timed_out.load(Ordering::Acquire) {
             // A prior panic or emergency deadline observer already recorded `TimedOut`:
@@ -3682,8 +3784,9 @@ impl RtExecutorShared {
             if let Some(jh) = self.control_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
                 if finished {
                     let _ = jh.join();
-                    rt_joined = true;
+                    self.control_rt_state.store(RT_STATE_JOINED, Ordering::Release);
                 } else {
+                    self.control_rt_state.store(RT_STATE_DETACHED, Ordering::Release);
                     self.exited.store(true, Ordering::Release);
                     tracing::error!(
                         "Teardown: detaching stalled RT executor thread (`armd-control`) after panic/emergency timeout so Drop cannot block indefinitely"
@@ -3693,10 +3796,9 @@ impl RtExecutorShared {
             }
         } else if let Some(jh) = self.control_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let _ = jh.join();
-            rt_joined = true;
-        } else {
-            rt_joined = !self.teardown_disable.timed_out.load(Ordering::Acquire);
+            self.control_rt_state.store(RT_STATE_JOINED, Ordering::Release);
         }
+        let rt_joined = self.control_rt_state.load(Ordering::Acquire) == RT_STATE_JOINED;
 
         if let Some(jh) = self.monitor_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
             jh.thread().unpark();
@@ -4164,6 +4266,9 @@ impl RtExecutorHandle {
         &self,
         conn_id: u64,
     ) -> Result<Result<(), &'static str>, super::requests::lease::ConnLifecycleError> {
+        if self.shared.broker_dispatcher.drain_gate.is_owned_by_current_thread() {
+            return Err(super::requests::lease::ConnLifecycleError::ReentrantCallback);
+        }
         self.shared.conn_lifecycle_client.open_sync(conn_id)
     }
 
@@ -4903,6 +5008,7 @@ pub(crate) fn spawn_executor(
         control_stop,
         persist_stop,
         exited,
+        control_rt_state: std::sync::atomic::AtomicU8::new(RT_STATE_RUNNING),
         control_exited_cv,
         persist_worker_exited,
         persist_exited_cv,
