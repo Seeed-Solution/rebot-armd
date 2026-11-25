@@ -2870,7 +2870,7 @@ impl SupervisorInner {
     pub fn schema(&self) -> ObservationSchema {
         let mut schema = ObservationSchema::from_config(&self.config);
         schema.capabilities.gravity_comp = self.gravity_comp_support().is_ok();
-        let torque_feedback = self.driver.as_ref().is_some_and(|d| d.lock().is_ok_and(|drv| drv.capabilities().torque_feedback));
+        let torque_feedback = self.lock_driver_for_tick().is_some_and(|drv| drv.capabilities().torque_feedback);
         schema.capabilities.collision_guard &= torque_feedback;
         schema.capabilities.torque_guard &= torque_feedback;
         schema.capabilities.power_budget &= torque_feedback;
@@ -3232,8 +3232,10 @@ impl SupervisorInner {
             && self.config.dynamics_qualified
             && self.config.gravity_model.is_some()
             && self.config.dof >= self.config.arm_dof()
-            && self.driver.as_ref().is_none_or(|d|
-                d.lock().is_ok_and(|drv| drv.capabilities().torque_feedforward))
+            && (self.driver.is_none()
+                || self
+                    .lock_driver_for_tick()
+                    .is_some_and(|drv| drv.capabilities().torque_feedforward))
     }
 
     /// Adds the time since the previous mark to phase `i` of the running tick (no-op
@@ -3607,7 +3609,7 @@ impl SupervisorInner {
         } else {
             None
         };
-        let driver_capabilities = self.driver.as_ref().and_then(|d| d.lock().ok().map(|drv| drv.capabilities())).unwrap_or_default();
+        let driver_capabilities = self.lock_driver_for_tick().map(|drv| drv.capabilities()).unwrap_or_default();
         out.timestamp = timestamp;
         out.positions.clone_from(&self.measured_positions);
         out.velocities.clone_from(&self.measured_velocities);
@@ -3632,10 +3634,14 @@ impl SupervisorInner {
         out.gravity_compensated = self.gravity_output_enabled();
         out.gravity_torques.clone_from(&self.gravity_torques);
         out.driver_capabilities = driver_capabilities;
-        out.enable_state = self.driver.as_ref().map_or(if self.is_torqued { EnableState::Enabled } else { EnableState::Disabled }, |d| d.lock().map_or(EnableState::Unknown, |drv| drv.enable_state()));
-        match self.driver.as_ref().map(|d| d.lock()) {
-            Some(Ok(drv)) => drv.feedback_age_ms_into(&mut out.feedback_age_ms),
-            _ => fill_n(&mut out.feedback_age_ms, Some(0), self.config.dof),
+        out.enable_state = if self.driver.is_none() {
+            if self.is_torqued { EnableState::Enabled } else { EnableState::Disabled }
+        } else {
+            self.lock_driver_for_tick().map_or(EnableState::Unknown, |drv| drv.enable_state())
+        };
+        match self.lock_driver_for_tick() {
+            Some(drv) => drv.feedback_age_ms_into(&mut out.feedback_age_ms),
+            None => fill_n(&mut out.feedback_age_ms, Some(0), self.config.dof),
         }
         out.disable_pending = self.disable_pending;
         out.feedback_valid = self.hardware_feedback_fresh(Duration::from_millis(250));
@@ -3653,9 +3659,9 @@ impl SupervisorInner {
         sync_action_obs(&mut out.previous_action, prev_src, prev_action_spare);
         out.control_mode = if self.gravity_comp.is_some() { crate::model::ControlMode::GravityComp } else { crate::model::ControlMode::Position };
         self.gravity_comp_observation_into(&mut out.gravity_comp);
-        match self.driver.as_ref().map(|d| d.lock()) {
-            Some(Ok(drv)) => drv.with_range_check(&mut |rc| set_opt_eq(&mut out.driver_range_check, rc)),
-            _ => out.driver_range_check = None,
+        match self.lock_driver_for_tick() {
+            Some(drv) => drv.with_range_check(&mut |rc| set_opt_eq(&mut out.driver_range_check, rc)),
+            None => out.driver_range_check = None,
         }
         // inline label: setting or clearing it never allocates or frees on the tick
         let holder = self.lease_holder_str();
@@ -4093,15 +4099,16 @@ impl SupervisorInner {
     /// velocity, supporting torque and enable state. This is a capability check,
     /// not a claim that the arm is currently resting or ready to disable.
     pub fn supports_automatic_unload(&self) -> bool {
-        self.driver.as_ref().is_none_or(|driver| {
-            self.config.resting_pose.as_ref().is_some_and(|policy| {
-                driver.lock().is_ok_and(|driver| {
-                    let capabilities = driver.capabilities();
-                    capabilities.velocity_feedback
-                        && capabilities.enable_feedback
-                        && (capabilities.torque_feedback || policy.support_torque_limits.is_empty())
-                        && (capabilities.load_feedback || policy.support_load_limits.is_empty())
-                })
+        if self.driver.is_none() {
+            return true;
+        }
+        self.config.resting_pose.as_ref().is_some_and(|policy| {
+            self.lock_driver_for_tick().is_some_and(|driver| {
+                let capabilities = driver.capabilities();
+                capabilities.velocity_feedback
+                    && capabilities.enable_feedback
+                    && (capabilities.torque_feedback || policy.support_torque_limits.is_empty())
+                    && (capabilities.load_feedback || policy.support_load_limits.is_empty())
             })
         })
     }
@@ -4338,13 +4345,27 @@ impl SupervisorInner {
         // the arm dropping).
         if (self.thermal_protection_active() || was_active)
             && temperature_available
-            && !self.safety.has_latched_fault_kind(crate::safety::FaultKind::ThermalTrip)
             && self
                 .temperatures
                 .iter()
                 .any(|t| t.is_finite() && *t > self.config.max_temperature)
         {
-            self.apply_stop_policy(StopPolicy::ThermalTrip);
+            let thermal_already_latched =
+                self.safety.has_latched_fault_kind(crate::safety::FaultKind::ThermalTrip);
+            // R12 B4: The thermal latch must NOT suppress its own redispatch if torque is still
+            // on / intent is still On and no protective disable retry is already armed or exhausted.
+            let needs_thermal_redispatch = thermal_already_latched
+                && (self.is_torqued || self.torque_intent == TorqueIntent::On)
+                && !matches!(
+                    self.background_disable_retry,
+                    Some(driver_transitions::BackgroundDisableRetry::Active {
+                        kind: crate::driver::DisableKind::DisableProtective { .. },
+                        ..
+                    }) | Some(driver_transitions::BackgroundDisableRetry::Exhausted)
+                );
+            if !thermal_already_latched || needs_thermal_redispatch {
+                self.apply_stop_policy(StopPolicy::ThermalTrip);
+            }
         }
     }
 
@@ -4447,9 +4468,11 @@ impl SupervisorInner {
             return true;
         }
 
-        let (has_velocity_capability, is_valid) = match &self.driver {
-            None => (true, true),
-            Some(driver) => driver.lock().map_or((false, false), |drv| (drv.capabilities().velocity_feedback, drv.is_feedback_valid())),
+        let (has_velocity_capability, is_valid) = if self.driver.is_none() {
+            (true, true)
+        } else {
+            self.lock_driver_for_tick()
+                .map_or((false, false), |drv| (drv.capabilities().velocity_feedback, drv.is_feedback_valid()))
         };
 
         if !is_valid {
@@ -6858,6 +6881,19 @@ impl SupervisorInner {
         self.tick_control_inner(dt, None, now_fn)
     }
 
+    /// Non-blocking `try_lock` on `armd-control` (`rt_executor_owned == true`); blocking `lock` on legacy.
+    #[inline]
+    pub(crate) fn lock_driver_for_tick(
+        &self,
+    ) -> Option<std::sync::MutexGuard<'_, Box<dyn ArmDriver>>> {
+        let d = self.driver.as_ref()?;
+        if self.rt_executor_owned {
+            d.try_lock().ok()
+        } else {
+            d.lock().ok()
+        }
+    }
+
     /// Computes the single per-tick TX cutoff ONCE in the owner:
     ///   `effective_cutoff = min(control-release deadline, active action/macro parent & child deadlines)`
     /// translated into the driver clock domain, and installs it as THE deadline on `self.driver`
@@ -6867,10 +6903,7 @@ impl SupervisorInner {
         release_deadline: Option<Instant>,
         now_fn: &mut dyn FnMut() -> Instant,
     ) -> (bool, Option<EffectiveTxCutoff>) {
-        let Some(ref d) = self.driver else {
-            return (false, None);
-        };
-        let Ok(mut drv) = d.lock() else {
+        let Some(mut drv) = self.lock_driver_for_tick() else {
             return (false, None);
         };
         let owner_now = now_fn();
@@ -6912,21 +6945,17 @@ impl SupervisorInner {
         // Legacy callers without a preceding Step-2 `poll_hardware_for_release` run `poll_hardware_rx`
         // below; bound any stale-joint recovery TX during RX intake to the control-release cap.
         let applied_rx_tx_cap = if !self.pending_rx_poll.active {
-            if let Some(ref d) = self.driver {
-                if let Ok(mut drv) = d.lock() {
-                    let drv_now = drv.clock_now();
-                    let cap = match release_deadline {
-                        Some(rd) => self.driver_tx_release_cap(drv_now, now_fn(), rd),
-                        None => {
-                            let period = Duration::from_secs_f64(1.0 / f64::from(self.config.control_frequency_hz.max(1)));
-                            drv_now + period.saturating_sub(self.tx_release_publish_margin())
-                        }
-                    };
-                    drv.set_tx_release_deadline(Some(cap));
-                    true
-                } else {
-                    false
-                }
+            if let Some(mut drv) = self.lock_driver_for_tick() {
+                let drv_now = drv.clock_now();
+                let cap = match release_deadline {
+                    Some(rd) => self.driver_tx_release_cap(drv_now, now_fn(), rd),
+                    None => {
+                        let period = Duration::from_secs_f64(1.0 / f64::from(self.config.control_frequency_hz.max(1)));
+                        drv_now + period.saturating_sub(self.tx_release_publish_margin())
+                    }
+                };
+                drv.set_tx_release_deadline(Some(cap));
+                true
             } else {
                 false
             }
@@ -7176,8 +7205,8 @@ impl SupervisorInner {
             self.end_gripper_stream();
         }
         if let Some(g_idx) = self.config.gripper_index() {
-            let (is_bus_fresh, has_torque_feedback, has_load_feedback, pos_force_info) = if let Some(ref d) = self.driver {
-                if let Ok(driver) = d.lock() {
+            let (is_bus_fresh, has_torque_feedback, has_load_feedback, pos_force_info) = if self.driver.is_some() {
+                if let Some(driver) = self.lock_driver_for_tick() {
                     let fresh = self.feedback_numeric_valid
                         && self.last_can_feedback_instant.is_some_and(|t| t.elapsed() < Duration::from_millis(50))
                         && driver.is_feedback_valid();
@@ -7614,7 +7643,7 @@ impl SupervisorInner {
             Some(tau) => { self.gravity_torques.clear(); self.gravity_torques.extend_from_slice(&tau[..arm_dof]); }
             None => self.gravity_torques.clear(),
         }
-        let torque_feedback = self.driver.as_ref().is_some_and(|d| d.lock().is_ok_and(|drv| drv.capabilities().torque_feedback));
+        let torque_feedback = self.lock_driver_for_tick().is_some_and(|drv| drv.capabilities().torque_feedback);
         self.collision.torque_feedback = torque_feedback;
         // Residuals and the collision guard are per joint of a 6-joint arm.
         self.residual_torques = model_gravity.filter(|_| arm_dof == 6 && torque_feedback && self.feedback_numeric_valid && self.torques.len() >= 6)
@@ -7656,7 +7685,12 @@ impl SupervisorInner {
         // Check hardware motor faults / error flags from feedback (0 heap allocs on RT).
         if self.is_torqued {
             if let Some(ref d) = self.driver {
-                if let Ok(driver) = d.lock() {
+                let guard = if self.rt_executor_owned {
+                    d.try_lock().ok()
+                } else {
+                    d.lock().ok()
+                };
+                if let Some(driver) = guard {
                     if driver.has_hardware_fault() {
                         let hw_err = if !self.safety.has_latched_fault_code(FaultCode::HardwareFault)
                             || !self.safety.has_latched_fault_kind(crate::safety::FaultKind::Other)
@@ -7863,8 +7897,8 @@ impl SupervisorInner {
         // the scratch's step output: Path / Gripper / Replay steps write into its vectors
         let mut step_buf = std::mem::take(&mut self.scratch.step_out);
         let time_scale = self.motion_time_scale();
-        let (torque_feedback, load_feedback) = if let Some(ref d) = self.driver {
-            if let Ok(driver) = d.lock() {
+        let (torque_feedback, load_feedback) = if self.driver.is_some() {
+            if let Some(driver) = self.lock_driver_for_tick() {
                 let caps = driver.capabilities();
                 (caps.torque_feedback, caps.load_feedback)
             } else {
@@ -8477,7 +8511,12 @@ impl SupervisorInner {
                     driverless_accepted = true;
                     gravity_driverless_ok = true;
                 } else if let (Some(targets), Some(d)) = (self.gravity_comp_targets_array(), self.driver.as_ref()) {
-                    if let Ok(mut driver) = d.lock() {
+                    let guard = if self.rt_executor_owned {
+                        d.try_lock().ok()
+                    } else {
+                        d.lock().ok()
+                    };
+                    if let Some(mut driver) = guard {
                         if self.torque_intent == TorqueIntent::On {
                             let is_hold = self.safety.state().is_stopped();
                             if is_hold || !self.disconnect_fence_blocks_output() {
@@ -8835,9 +8874,9 @@ impl SupervisorInner {
         };
         let has_pending_motion = matches!(tick_output, TickOutput::None)
             && self.max_tx_joint_no_progress_ticks() > 0
-            && self.driver.as_ref().is_some_and(|d| {
-                d.lock().is_ok_and(|drv| drv.pending_motion_tx_len() > 0)
-            });
+            && self
+                .lock_driver_for_tick()
+                .is_some_and(|drv| drv.pending_motion_tx_len() > 0);
         let j7_stale = tick_output.j7_stale();
         let batch_completed = self.classify_tick_output(tick_output, true, has_pending_motion);
 
@@ -9116,10 +9155,8 @@ impl SupervisorInner {
 
         self.active_tx_cutoff = None;
         if applied_rx_tx_cap || applied_output_tx_cap {
-            if let Some(ref d) = self.driver {
-                if let Ok(mut drv) = d.lock() {
-                    drv.set_tx_release_deadline(None);
-                }
+            if let Some(mut drv) = self.lock_driver_for_tick() {
+                drv.set_tx_release_deadline(None);
             }
         }
 

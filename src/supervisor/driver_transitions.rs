@@ -1382,7 +1382,11 @@ impl SupervisorInner {
         if !self.feedback_numeric_valid { return false; }
         // Ages alone decide: drivers' is_feedback_valid() hard-codes 250 ms,
         // which would silently cap callers asking for a longer bound.
-        self.driver.as_ref().is_none_or(|d| d.lock().is_ok_and(|drv| drv.feedback_all_within(self.config.dof, max_age)))
+        if self.driver.is_none() {
+            return true;
+        }
+        self.lock_driver_for_tick()
+            .is_some_and(|drv| drv.feedback_all_within(self.config.dof, max_age))
     }
 
     /// True when every arm joint (excluding a `PosForce` Damiao gripper) has valid numeric
@@ -1395,7 +1399,11 @@ impl SupervisorInner {
             return self.hardware_feedback_fresh(max_age);
         }
         let arm = self.config.arm_joints();
-        self.driver.as_ref().is_none_or(|d| d.lock().is_ok_and(|drv| drv.feedback_joints_within(&arm, max_age)))
+        if self.driver.is_none() {
+            return true;
+        }
+        self.lock_driver_for_tick()
+            .is_some_and(|drv| drv.feedback_joints_within(&arm, max_age))
     }
 
     /// Per arm joint, an instant before which its last sample cannot have been enqueued: the
@@ -1502,6 +1510,16 @@ impl SupervisorInner {
                         self.record_disable_lock_contention();
                         if pending_disable {
                             self.torque_transition = Some(TorqueTransition::Disable { kind });
+                        } else if is_protective {
+                            // R12 B4: A contended first protective (thermal / exit) cut MUST arm
+                            // a bounded per-release retry (`next_retry_at: now`) on the driver's
+                            // lock-free clock so `service_background_disable` retries every
+                            // release until dispatched.
+                            let retry_now = self.driver_clock_now_or(Instant::now());
+                            let _ = self.arm_background_disable_retry_immediate_with_kind(
+                                kind,
+                                retry_now,
+                            );
                         }
                         return Err(RequestDisableError {
                             code: "DRIVER_BUSY",
@@ -1543,6 +1561,8 @@ impl SupervisorInner {
                             self.torque_transition = None;
                             if let Some(rk) = partial_retry {
                                 let _ = self.arm_background_disable_retry_immediate_with_kind(rk, post_now);
+                            } else if is_protective {
+                                let _ = self.arm_background_disable_retry_immediate_with_kind(kind, post_now);
                             } else if !refused {
                                 let _ = self.arm_background_disable_retry_with_kind(kind, post_now);
                             }
@@ -1552,6 +1572,8 @@ impl SupervisorInner {
                         } else {
                             if let Some(rk) = partial_retry {
                                 let _ = self.arm_background_disable_retry_immediate_with_kind(rk, post_now);
+                            } else if is_protective {
+                                let _ = self.arm_background_disable_retry_immediate_with_kind(kind, post_now);
                             } else if refused {
                                 self.disable_pending = false;
                                 self.active_disable_kind = None;
@@ -4527,12 +4549,16 @@ impl SupervisorInner {
                                 {
                                     self.exhaust_background_disable_retry();
                                 } else if !still_pending {
+                                    let is_protective = matches!(
+                                        kind,
+                                        crate::driver::DisableKind::DisableProtective { .. }
+                                    );
                                     self.background_disable_retry =
                                         Some(BackgroundDisableRetry::Active {
                                             attempts,
                                             kind,
                                             started_at,
-                                            next_retry_at: if partial_remaining {
+                                            next_retry_at: if partial_remaining || is_protective {
                                                 post_now
                                             } else {
                                                 post_now + BACKGROUND_DISABLE_RETRY_INTERVAL
@@ -4547,6 +4573,10 @@ impl SupervisorInner {
                                         started_at: post_now,
                                     },
                                 );
+                                let is_protective = matches!(
+                                    kind,
+                                    crate::driver::DisableKind::DisableProtective { .. }
+                                );
                                 if let Some(rk) = self.commit_partial_disable_retry_kind(
                                     kind,
                                     post_now,
@@ -4554,6 +4584,8 @@ impl SupervisorInner {
                                     partial_remaining,
                                 ) {
                                     let _ = self.arm_background_disable_retry_immediate_with_kind(rk, post_now);
+                                } else if is_protective {
+                                    let _ = self.arm_background_disable_retry_immediate_with_kind(kind, post_now);
                                 } else {
                                     let _ = self.arm_background_disable_retry_with_kind(kind, post_now);
                                 }
@@ -4688,11 +4720,15 @@ impl SupervisorInner {
         {
             self.exhaust_background_disable_retry();
         } else {
+            let is_protective = matches!(
+                kind,
+                crate::driver::DisableKind::DisableProtective { .. }
+            );
             self.background_disable_retry = Some(BackgroundDisableRetry::Active {
                 attempts: next_attempts,
                 kind,
                 started_at,
-                next_retry_at: if partial_remaining {
+                next_retry_at: if partial_remaining || is_protective {
                     post_now
                 } else {
                     post_now + BACKGROUND_DISABLE_RETRY_INTERVAL
@@ -6396,10 +6432,8 @@ impl SupervisorInner {
     }
 
     pub fn driver_feedback_confirmed(&self) -> bool {
-        match &self.driver {
-            None => false,
-            Some(d) => d.lock().is_ok_and(|drv| drv.is_feedback_valid()),
-        }
+        self.lock_driver_for_tick()
+            .is_some_and(|drv| drv.is_feedback_valid())
     }
 }
 

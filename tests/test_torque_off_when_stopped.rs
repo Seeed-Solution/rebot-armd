@@ -9695,3 +9695,188 @@ fn r12_b3_partial_disable_commits_intent_off_retries_remaining_and_skips_holds_o
         assert_eq!(drv.disable_dispatched_mask(), 0);
     }
 }
+
+/// R12 B4: Thermal retry on the RT owner under driver mutex contention:
+/// 1. First thermal trip fires while `self.driver` is contended (`WouldBlock`):
+///    latches `ThermalTrip`, arms bounded per-release `DisableProtective { Thermal }` retry,
+///    and sends 0 `CMD_DISABLE` frames on the contended attempt.
+/// 2. On the VERY NEXT uncontended release (even within < 25 ms, EVERY release), the protective
+///    thermal cut retries and dispatches `CMD_DISABLE` to all 7 motors even at a raised pose
+///    (and the existing `ThermalTrip` latch does NOT suppress redispatch or bump epoch again).
+/// 3. Even if `ThermalTrip` was already latched while `is_torqued == true` with no retry armed,
+///    `check_thermal_protection` redispatches `DisableProtective { Thermal }` on the next release.
+#[test]
+fn r12_b4_rt_thermal_cut_retries_every_release_after_first_contention() {
+    use armd::safety::FaultKind;
+    use armd::TorqueIntent;
+
+    // Part 1: Contended first RT thermal cut arms bounded retry and dispatches on the very next
+    // uncontended release (at raised pose, with < 25 ms spacing).
+    {
+        let mut r = ExecRig::new();
+        r.fx.core.rt_executor_owned = true;
+        r.arm_now();
+        // Move arm to raised pose (away from rest) and set J2 over max_temperature.
+        let overtemp = r.fx.core.config.max_temperature + 10.0;
+        let overtemp_u8 = overtemp.ceil() as u8;
+        r.bus.with(|s| {
+            s.follow_commands = false;
+            for m in s.motors.iter_mut() {
+                m.q = 0.60;
+            }
+            s.motors[1].temperature_c = 35;
+            s.push_all_feedback();
+        });
+        r.step();
+        assert!(!r.fx.core.safety.has_latched_fault_kind(FaultKind::ThermalTrip));
+
+        // Now raise temperature above limit and contend the driver mutex during the first thermal cut!
+        r.fx.core.temperatures[1] = overtemp;
+        r.bus.clear_log();
+        r.fx.core.with_contended_driver_for_test(|core| {
+            core.apply_stop_policy(StopPolicy::ThermalTrip);
+        });
+        assert!(
+            r.fx.core.safety.has_latched_fault_kind(FaultKind::ThermalTrip),
+            "B4: ThermalTrip must latch on the first overtemp attempt"
+        );
+        let epoch_after_first = r.fx.core.safety.epoch_id();
+        assert!(
+            r.fx.core.disable_pending,
+            "B4: disable_pending must stay true after contended thermal cut"
+        );
+        assert_eq!(
+            r.bus
+                .tx_log()
+                .iter()
+                .filter(|f| f.data == damiao::CMD_DISABLE)
+                .count(),
+            0,
+            "B4: contended attempt cannot transmit CMD_DISABLE yet"
+        );
+
+        // Next release is only 10 ms later (< 25 ms normal retry interval) and STILL contended:
+        // must keep retry armed without blocking or losing retry state.
+        r.clock.advance(Duration::from_millis(10));
+        r.bus.with(|s| {
+            s.motors[1].temperature_c = overtemp_u8;
+            s.push_all_feedback();
+        });
+        r.bus.clear_log();
+        let t_wall = Instant::now();
+        {
+            let driver_ref = r.fx.core.driver.as_ref().unwrap();
+            let addr =
+                (driver_ref as *const std::sync::Mutex<Box<dyn ArmDriver>>) as usize;
+            let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel::<()>(1);
+            let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+            let holder = std::thread::spawn(move || {
+                let mutex =
+                    unsafe { &*(addr as *const std::sync::Mutex<Box<dyn ArmDriver>>) };
+                let _guard = mutex.lock().unwrap();
+                let _ = locked_tx.send(());
+                let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            });
+            locked_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let _ = r.fx.step();
+            let _ = release_tx.send(());
+            let _ = holder.join();
+        }
+        assert!(
+            t_wall.elapsed() < Duration::from_millis(500),
+            "B4: contended RT step must be strictly non-blocking (elapsed={:?})",
+            t_wall.elapsed()
+        );
+        assert_eq!(
+            r.bus
+                .tx_log()
+                .iter()
+                .filter(|f| f.data == damiao::CMD_DISABLE)
+                .count(),
+            0
+        );
+
+        // Next release is uncontended (only 10 ms later, proving EVERY-release retry):
+        // protective thermal cut MUST dispatch CMD_DISABLE to ALL 7 motors at raised pose!
+        r.bus.with(|s| {
+            s.motors[1].temperature_c = overtemp_u8;
+            s.push_all_feedback();
+        });
+        r.bus.clear_log();
+        let _ = r.fx.step();
+        let tx_uncontended = r.bus.tx_log();
+        for id in 1u32..=7 {
+            assert!(
+                tx_uncontended.iter().any(|f| f.id == id && f.data == damiao::CMD_DISABLE),
+                "B4: uncontended release immediately after contention must dispatch CMD_DISABLE to J{id}: {tx_uncontended:?}"
+            );
+        }
+        assert_eq!(
+            r.fx.core.torque_intent,
+            TorqueIntent::Off,
+            "B4: protective thermal dispatch commits torque_intent=Off"
+        );
+        assert!(
+            r.fx.core.safety.has_latched_fault_kind(FaultKind::ThermalTrip),
+            "B4: ThermalTrip remains latched after protective dispatch"
+        );
+        let _ = epoch_after_first;
+
+        // Complete Damiao repeat passes to full confirmation.
+        for _ in 0..8 {
+            r.step_with_feedback();
+            if !r.fx.core.disable_pending && !r.fx.core.is_torqued {
+                break;
+            }
+        }
+        assert!(!r.fx.core.is_torqued && !r.fx.core.disable_pending);
+    }
+
+    // Part 2: An existing `ThermalTrip` latch MUST NOT suppress thermal redispatch when
+    // torque is still on and no protective retry is armed (supervisor.rs:4341).
+    {
+        let mut r = ExecRig::new();
+        r.fx.core.rt_executor_owned = true;
+        r.arm_now();
+        let overtemp = r.fx.core.config.max_temperature + 12.0;
+        let overtemp_u8 = overtemp.ceil() as u8;
+        r.bus.with(|s| {
+            s.follow_commands = false;
+            for m in s.motors.iter_mut() {
+                m.q = 0.55;
+            }
+            s.motors[1].temperature_c = 35;
+            s.push_all_feedback();
+        });
+        r.step();
+
+        // Pre-latch ThermalTrip WITHOUT having dispatched the protective disable yet.
+        r.fx.core.safety.latch(
+            FaultKind::ThermalTrip,
+            armd::safety::FaultDetail::ThermalTrip {
+                joint_idx: 1,
+                temperature: overtemp,
+                limit: r.fx.core.config.max_temperature,
+            },
+        );
+        assert!(r.fx.core.is_torqued);
+        assert_eq!(r.fx.core.torque_intent, TorqueIntent::On);
+
+        // Feed overtemp sample and run one RT release: existing ThermalTrip latch MUST NOT
+        // suppress redispatch of DisableProtective { Thermal }!
+        r.bus.with(|s| {
+            s.motors[1].temperature_c = overtemp_u8;
+            s.push_all_feedback();
+        });
+        r.bus.clear_log();
+        r.step();
+        let tx = r.bus.tx_log();
+        for id in 1u32..=7 {
+            assert!(
+                tx.iter().any(|f| f.id == id && f.data == damiao::CMD_DISABLE),
+                "B4 Part 2: existing ThermalTrip latch must not suppress redispatch to J{id}: {tx:?}"
+            );
+        }
+        assert_eq!(r.fx.core.torque_intent, TorqueIntent::Off);
+    }
+}

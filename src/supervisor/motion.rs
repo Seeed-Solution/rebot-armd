@@ -517,14 +517,16 @@ impl SupervisorInner {
                 self.thermal_cooldown.reset();
                 let (joint_idx, temperature) = self.temperatures.iter().copied().enumerate()
                     .filter(|(_, t)| t.is_finite()).max_by(|a,b| a.1.total_cmp(&b.1)).unwrap_or((0, 0.0));
-                self.safety.latch(
-                    crate::safety::FaultKind::ThermalTrip,
-                    crate::safety::FaultDetail::ThermalTrip {
-                        joint_idx,
-                        temperature,
-                        limit: self.config.max_temperature,
-                    },
-                );
+                if !self.safety.has_latched_fault_kind(crate::safety::FaultKind::ThermalTrip) {
+                    self.safety.latch(
+                        crate::safety::FaultKind::ThermalTrip,
+                        crate::safety::FaultDetail::ThermalTrip {
+                            joint_idx,
+                            temperature,
+                            limit: self.config.max_temperature,
+                        },
+                    );
+                }
                 // Cancel any in-flight enable through the reducer before protective thermal cut
                 // takes over, preserving the thermal latch (highest severity) and protective cut.
                 self.interrupt_enable_for_thermal();
@@ -536,11 +538,19 @@ impl SupervisorInner {
                     reason: crate::driver::DisableProtectiveReason::Thermal,
                 };
                 self.active_disable_kind = Some(thermal_disable);
-                // T2: Upgrading from a user `DisableRequested` to `DisableProtective { Thermal }`
-                // MUST bypass the 250 ms retry throttle (and any non-protective retry state) so
-                // the driver immediately switches to protective disable on both legacy and RT.
+                let rt_needs_redispatch = self.rt_executor_owned
+                    && self.background_disable_retry.is_none()
+                    && (self.is_torqued || self.torque_intent == TorqueIntent::On)
+                    && !self
+                        .driver
+                        .as_ref()
+                        .is_some_and(|d| d.try_lock().is_ok_and(|drv| drv.torque_transition_pending()));
+                // T2 / R12 B4: Upgrading from a user `DisableRequested` to `DisableProtective { Thermal }`
+                // (or redispatching after a thermal cut whose retry is not yet armed) MUST bypass
+                // the 250 ms throttle so the driver immediately dispatches/arms protective disable.
                 if !self.disable_pending
                     || !already_protective
+                    || rt_needs_redispatch
                     || (!self.rt_executor_owned
                         && self.last_disable_attempt.is_none_or(|t| t.elapsed() >= Duration::from_millis(250)))
                 {
@@ -1731,7 +1741,11 @@ impl SupervisorInner {
 
     /// Feedback a commit may plan from: numerically valid, and fresh per the driver (no driver: simulated).
     pub fn commit_feedback_valid(&self) -> bool {
-        self.feedback_numeric_valid && self.driver.as_ref().is_none_or(|d| d.lock().is_ok_and(|drv| drv.is_feedback_valid()))
+        self.feedback_numeric_valid
+            && (self.driver.is_none()
+                || self
+                    .lock_driver_for_tick()
+                    .is_some_and(|drv| drv.is_feedback_valid()))
     }
 
     /// The refusal code when a primitive admitted under `admitted` may not be installed,
