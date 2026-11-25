@@ -46,6 +46,7 @@ pub mod safety;
 #[cfg(not(target_arch = "wasm32"))] pub mod supervisor;
 #[cfg(not(target_arch = "wasm32"))] pub mod supervisor_lock;
 #[cfg(not(target_arch = "wasm32"))] pub mod teach;
+pub mod torque;
 pub mod torque_guard;
 pub mod tracking;
 pub mod tool;
