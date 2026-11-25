@@ -680,6 +680,10 @@ impl SupervisorInner {
                     });
             }
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        if !self.rt_executor_owned {
+            self.flush_torque_shadow();
+        }
     }
 
     pub fn preempt_lease(&mut self, conn: &str, label: &str) -> Result<(u64, Option<(String, u64)>), PreemptError> {

@@ -4652,7 +4652,45 @@ impl SupervisorInner {
         &mut self,
     ) -> Result<Result<crate::rt_core::ops::TorqueProgress, &'static str>, &'static str> {
         use crate::rt_core::ops::TorqueProgress as Rt;
-        self.torque_off_check_rt_transition()?;
+        if let Err(code) = self.torque_off_check_rt_transition() {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let live_op_id = self.torque_shadow.alloc_live_op_id();
+                let live_refusal = match code {
+                    "TORQUE_OFF_WOULD_DROP" | "ARM_NOT_AT_RESTING_POSE" => {
+                        crate::torque::shadow::LiveRefusalKind::TorqueOffWouldDrop
+                    }
+                    "DRIVER_BUSY" => crate::torque::shadow::LiveRefusalKind::DriverBusy,
+                    "MOTION_BUSY" | "TRANSITION_BUSY" => {
+                        crate::torque::shadow::LiveRefusalKind::BusyOrTransition
+                    }
+                    _ => crate::torque::shadow::LiveRefusalKind::Other,
+                };
+                self.torque_shadow
+                    .enqueue(crate::torque::shadow::ShadowInputKind::DisableRequest {
+                        live_op_id,
+                        explicit_release_authorized: false,
+                        live_refusal: Some(live_refusal),
+                        live_intent: self.shadow_live_intent(),
+                        live_is_torqued: self.is_torqued,
+                        live_stopped: self.safety.state().is_stopped(),
+                    });
+            }
+            return Err(code);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let live_op_id = self.torque_shadow.alloc_live_op_id();
+            self.torque_shadow
+                .enqueue(crate::torque::shadow::ShadowInputKind::DisableRequest {
+                    live_op_id,
+                    explicit_release_authorized: false,
+                    live_refusal: None,
+                    live_intent: self.shadow_live_intent(),
+                    live_is_torqued: self.is_torqued,
+                    live_stopped: self.safety.state().is_stopped(),
+                });
+        }
         let started = if self.driver.is_none() {
             self.stop_motion();
             self.commanded_velocities.fill(0.0);
@@ -4714,19 +4752,6 @@ impl SupervisorInner {
         if let Some((_, _, disable_kind, _, _)) = started {
             self.active_disable_kind = Some(disable_kind);
             self.active_disable_client_park = None;
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let live_op_id = self.torque_shadow.alloc_live_op_id();
-            self.torque_shadow
-                .enqueue(crate::torque::shadow::ShadowInputKind::DisableRequest {
-                    live_op_id,
-                    explicit_release_authorized: false,
-                    live_refusal: None,
-                    live_intent: self.shadow_live_intent(),
-                    live_is_torqued: self.is_torqued,
-                    live_stopped: self.safety.state().is_stopped(),
-                });
         }
         Ok(match started {
             None => {
@@ -7542,18 +7567,15 @@ impl SupervisorInner {
         hard_deadline: Instant,
         coop_budget: Duration,
     ) -> PanicDisableOutcome {
-        let panic_edge = Instant::now();
         self.mark_panic_disable_requested();
         #[cfg(not(target_arch = "wasm32"))]
-        self.torque_shadow.enqueue_at(
-            panic_edge,
-            crate::torque::shadow::ShadowInputKind::Panic {
+        self.torque_shadow
+            .enqueue(crate::torque::shadow::ShadowInputKind::Panic {
                 tier: crate::torque::PanicTier::CaughtControlPanic,
                 live_intent: self.shadow_live_intent(),
                 live_is_torqued: self.is_torqued,
                 live_stopped: true,
-            },
-        );
+            });
         let Some(ref d) = self.driver else {
             self.disable_accepted();
             #[cfg(not(target_arch = "wasm32"))]
