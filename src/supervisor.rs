@@ -13378,18 +13378,38 @@ impl ArmSupervisor {
         if self.owner_mode() != OWNER_LEGACY {
             return None;
         }
-        use crate::diagnostics::tick::{us, UsageMark};
+        use crate::diagnostics::tick::{mid_csw_delta, us, CswMark, ReleasePhasesUs, UsageMark};
         let started = Instant::now();
         let usage_start = UsageMark::now();
-        let (mut obs, terminal_obs, wait, lock_held, control_hz, pending_zc, pending_wd, phases, log, locked, usage_locked, pre, publish, allocs) = {
+        let (
+            mut obs,
+            terminal_obs,
+            wait,
+            lock_held,
+            control_hz,
+            pending_zc,
+            pending_wd,
+            phases,
+            log,
+            locked,
+            usage_locked,
+            pre,
+            publish,
+            allocs,
+            mid_csw_start,
+            phase_alloc_read,
+            phase_ack_flush,
+            phase_terminal,
+            after_terminal,
+        ) = {
             let (mut inner, generation) = self.inner.write_tick().await;
             if inner.detached || self.owner_mode() != OWNER_LEGACY {
                 return None;
             }
+            let locked = Instant::now();
             if self.pending_disconnect_hold.load(Ordering::Acquire) > 0 {
                 let _ = self.drain_pending_disconnects_under_guard(&mut inner, None);
             }
-            let locked = Instant::now();
             let usage_locked = UsageMark::now();
             let _ = crate::diagnostics::alloc::take();
             // No other guard exists now: the log is complete up to the guard waited for.
@@ -13416,9 +13436,12 @@ impl ArmSupervisor {
             let pending_zc = inner.pending_zero_check_persist.take();
             let pending_wd = inner.watchdog_park_pending.filter(|p| !p.waiting_mit_handback);
             let control_hz = inner.config.control_frequency_hz;
+            let mid_csw_start = CswMark::now();
             let lock_end = Instant::now();
             let allocs = crate::diagnostics::alloc::take();
+            let after_alloc_read = Instant::now();
             Self::flush_legacy_estop_acks_into(&self.estop_reg, &mut inner);
+            let after_ack_flush = Instant::now();
             // Capture any terminal action observation WITHOUT touching `self.hub.latest()` so a
             // preempted reader holding `StateHub`'s reader lock can never delay `tick_shared`.
             let terminal_obs = if inner.last_action.as_ref().is_some_and(|a| !a.is_running())
@@ -13428,11 +13451,33 @@ impl ArmSupervisor {
             } else {
                 None
             };
-            (kept, terminal_obs, locked - started, lock_end - locked, control_hz, pending_zc, pending_wd, phases, log, locked, usage_locked,
-                body_start - locked, lock_end - body_end, allocs)
+            let after_terminal = Instant::now();
+            (
+                kept,
+                terminal_obs,
+                locked.saturating_duration_since(started),
+                lock_end.saturating_duration_since(locked),
+                control_hz,
+                pending_zc,
+                pending_wd,
+                phases,
+                log,
+                locked,
+                usage_locked,
+                body_start.saturating_duration_since(locked),
+                lock_end.saturating_duration_since(body_end),
+                allocs,
+                mid_csw_start,
+                us(after_alloc_read.saturating_duration_since(lock_end)),
+                us(after_ack_flush.saturating_duration_since(after_alloc_read)),
+                us(after_terminal.saturating_duration_since(after_ack_flush)),
+                after_terminal,
+            )
         };
         let released = Instant::now();
+        let phase_guard_drop = us(released.saturating_duration_since(after_terminal));
         let usage_released = UsageMark::now();
+        let (mid_nvcsw, mid_nivcsw) = mid_csw_delta(&mid_csw_start, &usage_released);
         if let Some(ref tobs) = terminal_obs {
             self.terminals.record_from_observation(tobs);
             if self.terminals.has_pending() {
@@ -13472,6 +13517,7 @@ impl ArmSupervisor {
         }
         let late = !dt.is_finite() || dt > 2.0 / f64::from(control_hz.max(1));
         let done = Instant::now();
+        let post_us = us(done.saturating_duration_since(released));
         let log = log.unwrap_or_default();
         let holder = |r: crate::supervisor_lock::HoldRecord| {
             let signed = |a: Instant, b: Instant| if a >= b { us(a - b) as i64 } else { -(us(b - a) as i64) };
@@ -13486,12 +13532,12 @@ impl ArmSupervisor {
                 released_before_lock_us: signed(locked, r.released),
             }
         };
-        let mut sample = crate::diagnostics::tick::TickSample {
-            tick_us: us(done - started),
+        let sample = crate::diagnostics::tick::TickSample {
+            tick_us: us(done.saturating_duration_since(started)),
             release_us: 0,
             wait_us: us(wait),
             lock_us: us(lock_held),
-            post_us: us(done - released),
+            post_us,
             period_us: if dt.is_finite() && dt >= 0.0 { us(Duration::from_secs_f64(dt.min(4.0e3))) } else { 0 },
             wake_lateness_us,
             reader_hold_us: us(log.reader_hold),
@@ -13504,7 +13550,17 @@ impl ArmSupervisor {
                 rx_us: phases[0], control_us: phases[1], tx_us: phases[2], finish_us: phases[3], obs_us: phases[4],
                 publish_us: us(publish),
             },
+            phases_us: ReleasePhasesUs {
+                alloc_read: phase_alloc_read,
+                ack_flush: phase_ack_flush,
+                terminal: phase_terminal,
+                guard_drop: phase_guard_drop,
+                post: post_us,
+                publish: 0,
+            },
             usage: crate::diagnostics::tick::ThreadUsage {
+                mid_nvcsw,
+                mid_nivcsw,
                 lock_alloc_calls: allocs.calls.min(u64::from(u32::MAX)) as u32,
                 lock_alloc_us: (allocs.total_ns / 1000).min(u64::from(u32::MAX)) as u32,
                 lock_alloc_max_us: (allocs.max_ns / 1000).min(u64::from(u32::MAX)) as u32,
@@ -13520,11 +13576,17 @@ impl ArmSupervisor {
         };
         if crate::diagnostics::tick::periodic_defers_sample_publish() {
             // Single-completion point in `run_periodic_with_clock` will stamp full `release_us`
-            // (covering wake through `block_on` return and stats publication) and record once.
-            crate::diagnostics::tick::stash_periodic_sample(sample);
+            // and `phases_us.publish` (covering wake through `block_on` return and stats
+            // publication) and record once.
+            crate::diagnostics::tick::stash_periodic_sample_with_post_end(sample, done);
         } else {
-            sample.release_us = us(started.elapsed());
-            let _ = self.tick_stats.record(&sample);
+            let _ = self.tick_stats.record_staged_with_publish(&sample, || {
+                let now = Instant::now();
+                (
+                    us(now.saturating_duration_since(started)),
+                    us(now.saturating_duration_since(done)),
+                )
+            });
         }
         obs
     }
