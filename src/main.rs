@@ -401,7 +401,11 @@ fn spawn_legacy_control_loop(
             None,
         );
     })?;
-    executor_stats.spawn_monitor(control_stop.clone())?;
+    if let Err(e) = executor_stats.spawn_monitor(control_stop.clone()) {
+        warn!(
+            "Failed to spawn legacy control stats monitor ({e}); continuing with running Legacy control loop"
+        );
+    }
     Ok(control_stop)
 }
 

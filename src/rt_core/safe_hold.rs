@@ -549,11 +549,13 @@ impl SafeHoldBuffers {
                 };
                 if !self.thermal_disable_started {
                     match drv.begin_disable_torque_budgeted(kind, 0) {
-                        Ok(TorqueProgress::Done(crate::driver::TorqueOutcome::Confirmed)) => {
+                        Ok(TorqueProgress::Done(crate::driver::TorqueOutcome::Confirmed))
+                            if drv.is_hardware_disarmed_confirmed() =>
+                        {
                             self.thermal_disable_started = true;
                             ctrl.thermal_disable_confirmed.store(true, Ordering::Release);
                         }
-                        Ok(TorqueProgress::Done(crate::driver::TorqueOutcome::Unconfirmed)) => {
+                        Ok(TorqueProgress::Done(_)) => {
                             // Never falsely mark unconfirmed thermal disable as confirmed; retry.
                             self.thermal_disable_started = false;
                         }
@@ -569,10 +571,12 @@ impl SafeHoldBuffers {
                     && !ctrl.thermal_disable_confirmed.load(Ordering::Acquire)
                 {
                     match drv.poll_torque_budgeted(drv_cap, RX_FRAME_BUDGET) {
-                        Ok(TorqueProgress::Done(crate::driver::TorqueOutcome::Confirmed)) => {
+                        Ok(TorqueProgress::Done(crate::driver::TorqueOutcome::Confirmed))
+                            if drv.is_hardware_disarmed_confirmed() =>
+                        {
                             ctrl.thermal_disable_confirmed.store(true, Ordering::Release);
                         }
-                        Ok(TorqueProgress::Done(crate::driver::TorqueOutcome::Unconfirmed)) => {
+                        Ok(TorqueProgress::Done(_)) => {
                             self.thermal_disable_started = false;
                         }
                         Ok(TorqueProgress::Pending { .. }) => {}

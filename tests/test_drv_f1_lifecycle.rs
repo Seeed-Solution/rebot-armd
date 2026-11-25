@@ -1765,6 +1765,43 @@ async fn drv_f1_blocker1_process_exit_requires_causal_disarm_proof_and_retains_d
         );
     }
 
+    // Part B2: Ordinary Damiao budgeted disable with withheld feedback must return `Unconfirmed`
+    // (never `Confirmed` from TX repeat count), `commit_shutdown()` must reject unconfirmed
+    // hardware, and Legacy `ProcessExit` returning `Unconfirmed` must STILL retain the driver
+    // across `ArmSupervisor::drop` (never dropping an energized driver).
+    {
+        let (sup, bus, dropped) = make_watched_sup();
+        sup.set_lease_enabled(false).await;
+        sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
+        assert!(bus.with(|s| s.motors.iter().all(|m| m.enabled)));
+
+        // Withhold disabled feedback and run Legacy ProcessExit -> Unconfirmed.
+        bus.with(|s| s.withhold_disable_feedback = true);
+        let outcome = sup
+            .emergency_process_exit_disable_until(Instant::now() + Duration::from_millis(200))
+            .await;
+        assert_eq!(
+            outcome,
+            PanicDisableOutcome::Unconfirmed,
+            "Legacy ProcessExit must return Unconfirmed when disabled feedback is withheld"
+        );
+        {
+            let mut inner = sup.inner().write().await;
+            assert!(
+                !inner.commit_shutdown(),
+                "commit_shutdown() MUST reject when hardware disarm is unconfirmed"
+            );
+        }
+        // Drop the last ArmSupervisor reference: even though `process_exit_requested == true`,
+        // unconfirmed Legacy hardware MUST be retained in SAFE-HOLD and NEVER dropped.
+        drop(sup);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(
+            !dropped.load(Ordering::Acquire),
+            "Legacy ArmSupervisor::drop after Unconfirmed ProcessExit MUST NOT drop energized driver"
+        );
+    }
+
     // Part C: Positive control — when FakeBus replies with fresh post-disable state==0 on all
     // 7 axes, ProcessExit returns Confirmed and drops the disarmed core cleanly.
     {

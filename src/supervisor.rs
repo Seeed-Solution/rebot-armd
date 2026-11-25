@@ -6060,7 +6060,8 @@ impl SupervisorInner {
             || (self.shutdown_ready()
                 && !self.is_torqued
                 && !self.disable_pending
-                && !self.torque_transition_pending());
+                && !self.torque_transition_pending()
+                && crate::rt_core::executor::core_is_confirmed_disarmed(self));
         if !ready {
             return false;
         }
@@ -12367,7 +12368,7 @@ pub struct ArmSupervisor {
     /// Single-owner slot (`Legacy` -> `Transferring` -> `Executor` | `Failed`).
     /// Lock order: always `self.inner` before `self.owner`.
     owner: std::sync::Mutex<OwnerSlot>,
-    owner_mode: AtomicU8,
+    owner_mode: Arc<AtomicU8>,
     /// `self.inner.generation()` captured at the moment ownership transfers to the RT executor.
     /// In `OWNER_EXECUTOR` mode `fresh()` requires `s.meta.generation >= executor_base_gen + 1`
     /// so rejected legacy lock attempts on the detached shell cannot skew observation freshness.
@@ -12671,9 +12672,32 @@ enum Fresh<'a> {
     Locked(crate::supervisor_lock::SupReadGuard<'a, SupervisorInner>),
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for SupervisorInner {
+    fn drop(&mut self) {
+        // Last-resort safety barrier (Blocker 3): even if a caller held a cloned
+        // `Arc<SupervisorLock<SupervisorInner>>` across `ArmSupervisor::drop` so `try_write()`
+        // could not extract the driver into SAFE-HOLD, NEVER drop an energized/unconfirmed driver
+        // when the final `Arc` releases.
+        if !self.detached
+            && !self.shutdown_committed
+            && self.driver.is_some()
+            && !crate::rt_core::executor::core_is_confirmed_disarmed(self)
+        {
+            if let Some(slot) = self.driver.take() {
+                tracing::error!(
+                    "SupervisorInner::drop reached with energized/unconfirmed driver still attached; leaking driver slot rather than dropping energized hardware"
+                );
+                std::mem::forget(slot);
+            }
+        }
+    }
+}
+
 impl Drop for ArmSupervisor {
     fn drop(&mut self) {
-        // DRV-F1 B2: NEVER destroy an energized or unconfirmed Legacy driver on Drop.
+        // DRV-F1 B2: NEVER destroy an energized or unconfirmed Legacy driver on Drop — even after
+        // an unconfirmed/timed-out Legacy `ProcessExit` (`process_exit_requested == true`).
         // If this Legacy shell still holds a non-disarmed driver, extract it and hand it to a
         // detached SAFE-HOLD writer thread; if spawning fails, retain sole ownership and run
         // SAFE-HOLD inline (NEVER dropping an energized driver inside a failed spawn closure).
@@ -12684,9 +12708,7 @@ impl Drop for ArmSupervisor {
             crate::torque::shadow::ShadowRuntime,
         )> = None;
         #[cfg(not(target_arch = "wasm32"))]
-        if self.owner_mode.load(Ordering::Acquire) == OWNER_LEGACY
-            && !self.process_exit_requested.load(Ordering::Acquire)
-        {
+        if self.owner_mode.load(Ordering::Acquire) == OWNER_LEGACY {
             if let Ok(mut guard) = self.inner.try_write() {
                 if !guard.detached
                     && !guard.shutdown_committed
@@ -13015,7 +13037,7 @@ impl ArmSupervisor {
             ),
             sequences_revision: Arc::new(AtomicU64::new(0)),
             owner: std::sync::Mutex::new(OwnerSlot::Legacy),
-            owner_mode: AtomicU8::new(OWNER_LEGACY),
+            owner_mode: Arc::new(AtomicU8::new(OWNER_LEGACY)),
             executor_base_gen: AtomicU64::new(0),
             estop_reg: Arc::new(std::sync::Mutex::new(crate::rt_core::executor::EstopRegistry::default())),
             sinks: Arc::new(std::sync::Mutex::new(None)),
@@ -13200,13 +13222,13 @@ impl ArmSupervisor {
         );
 
         // Unified Legacy loop exit disposition (DRV-F1 B1/B2/B5):
-        // - Confirmed disarm, completed ownership transfer (`guard.detached`), committed shutdown,
-        //   or explicit ProcessExit authorization exits cleanly without abandoning an energized arm.
-        // - Control panic OR ordinary stop while energized/unconfirmed atomically detaches the
-        //   shell (`guard.detached = true`), publishes `OwnerSlot::Failed` + `DetachedSafeHold`,
-        //   and retains exclusive ownership in SAFE-HOLD until thermal trip or deliberate ProcessExit.
-        let need_safe_hold_check = panicked || !self.process_exit_requested.load(Ordering::Acquire);
-        if need_safe_hold_check {
+        // - Confirmed disarm, completed ownership transfer (`guard.detached`), or committed shutdown
+        //   exits cleanly without abandoning an energized arm.
+        // - Control panic, ordinary stop, OR unconfirmed/timed-out Legacy `ProcessExit` while
+        //   energized/unconfirmed atomically detaches the shell (`guard.detached = true`),
+        //   publishes `OwnerSlot::Failed` + `DetachedSafeHold`, and retains exclusive ownership in
+        //   SAFE-HOLD until thermal trip or confirmed `ProcessExit` disarm.
+        {
             let reason = if panicked {
                 crate::rt_core::safe_hold::SafeHoldReason::ControlPanic
             } else {
@@ -13246,9 +13268,7 @@ impl ArmSupervisor {
                                 guard.flush_torque_shadow();
                             }
                         }));
-                        if !crate::rt_core::executor::core_is_confirmed_disarmed(&guard)
-                            && !self.process_exit_requested.load(Ordering::Acquire)
-                        {
+                        if !crate::rt_core::executor::core_is_confirmed_disarmed(&guard) {
                             self.estop_state.latch();
                             self.internal_fault_lane.latch_control_safe_hold_fence();
                             safe_hold_ctrl.mark_active(reason);
@@ -13317,10 +13337,14 @@ impl ArmSupervisor {
                     let outcome = self.attempt_legacy_panic_disable(rem);
                     safe_hold_ctrl.record_process_exit_outcome_lockfree(&outcome);
                     safe_hold_ctrl.mark_exited();
-                    return;
-                }
-                if !panicked && self.process_exit_requested.load(Ordering::Acquire) {
-                    return;
+                    if matches!(
+                        outcome,
+                        PanicDisableOutcome::Confirmed | PanicDisableOutcome::NoDriver
+                    ) {
+                        return;
+                    }
+                    // Unconfirmed/TimedOut/Failed: continue looping to acquire the shell lock and
+                    // retain the energized driver in SAFE-HOLD rather than returning to drop it.
                 }
                 std::thread::sleep(Duration::from_millis(1));
             }
@@ -13767,13 +13791,14 @@ impl ArmSupervisor {
                 });
             }
             *slot = OwnerSlot::Transferring;
-            self.owner_mode.store(OWNER_TRANSFERRING, Ordering::Release);
             let mut w = self.active_writer.lock().unwrap_or_else(|e| e.into_inner());
             let prev_stop = match &*w {
                 WriterEndpoint::Legacy { control_stop, .. } => control_stop.clone(),
                 _ => None,
             };
             *w = WriterEndpoint::Transferring;
+            drop(w);
+            self.owner_mode.store(OWNER_TRANSFERRING, Ordering::Release);
             prev_stop
         };
         let mut rollback = TransferGuard {
@@ -17339,14 +17364,22 @@ impl ArmSupervisor {
                 "legacy protective disable requires explicit ProcessExit authorization".into(),
             ));
         }
+        if self.owner_mode.load(Ordering::Acquire) == OWNER_TRANSFERRING {
+            return LegacyPanicDisableStep::Detached;
+        }
         self.estop_state.request_and_latch();
+        let owner_mode = Arc::clone(&self.owner_mode);
         let run_inline = |inner: Arc<SupervisorLock<SupervisorInner>>,
+                          owner_mode: Arc<AtomicU8>,
                           coop_deadline: Instant,
                           hard_deadline: Instant,
                           coop_budget: Duration|
          -> LegacyPanicDisableStep {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut guard = loop {
+                    if owner_mode.load(Ordering::Acquire) == OWNER_TRANSFERRING {
+                        return LegacyPanicDisableStep::Detached;
+                    }
                     if let Ok(g) = inner.try_write() {
                         break g;
                     }
@@ -17356,9 +17389,9 @@ impl ArmSupervisor {
                     }
                     std::thread::sleep(rem.min(Duration::from_millis(2)));
                 };
-                if guard.detached {
-                    // Ownership moved out of the Legacy shell (to Executor or DetachedSafeHold);
-                    // NEVER falsely report `NoDriver` from the detached shell.
+                if guard.detached || owner_mode.load(Ordering::Acquire) == OWNER_TRANSFERRING {
+                    // Ownership moved or is actively transferring out of the Legacy shell;
+                    // NEVER dispatch Legacy disable or falsely report `NoDriver`.
                     return LegacyPanicDisableStep::Detached;
                 }
                 if Instant::now() >= hard_deadline {
@@ -17383,12 +17416,19 @@ impl ArmSupervisor {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let inner = Arc::clone(&self.inner);
+            let owner_mode_thread = Arc::clone(&owner_mode);
             let (tx, rx) = std::sync::mpsc::sync_channel(1);
             match std::thread::Builder::new()
                 .name("armd-panic-disable".into())
                 .spawn(move || {
                     let (step, done_at) = {
-                        let res = run_inline(inner.clone(), coop_deadline, hard_deadline, coop_budget);
+                        let res = run_inline(
+                            inner.clone(),
+                            owner_mode_thread,
+                            coop_deadline,
+                            hard_deadline,
+                            coop_budget,
+                        );
                         (res, Instant::now())
                     };
                     // Seal and deliver the live outcome FIRST before touching shadow recording.
@@ -17418,8 +17458,13 @@ impl ArmSupervisor {
                 Err(e) => {
                     // Never fall back to an unbounded inline driver call when the bounded
                     // helper thread cannot be spawned; only confirm NoDriver when NOT detached.
+                    if self.owner_mode.load(Ordering::Acquire) == OWNER_TRANSFERRING {
+                        return LegacyPanicDisableStep::Detached;
+                    }
                     if let Ok(guard) = self.inner.try_write() {
-                        if guard.detached {
+                        if guard.detached
+                            || self.owner_mode.load(Ordering::Acquire) == OWNER_TRANSFERRING
+                        {
                             return LegacyPanicDisableStep::Detached;
                         }
                         if guard.driver.is_none() {
@@ -17434,7 +17479,13 @@ impl ArmSupervisor {
         }
         #[cfg(target_arch = "wasm32")]
         {
-            run_inline(Arc::clone(&self.inner), coop_deadline, hard_deadline, coop_budget)
+            run_inline(
+                Arc::clone(&self.inner),
+                owner_mode,
+                coop_deadline,
+                hard_deadline,
+                coop_budget,
+            )
         }
     }
 

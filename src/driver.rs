@@ -14711,7 +14711,14 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 self.mit_fence = None;
             }
             self.disable_dispatched_mask = 0;
-            return Ok(TorqueProgress::Done(TorqueOutcome::Confirmed));
+            // Blocker 1: NEVER report `TorqueOutcome::Confirmed` solely from accepted TX repeats
+            // when any axis has not provided fresh post-enable causal `state == 0` confirmation.
+            let outcome = if self.is_hardware_disarmed_confirmed() {
+                TorqueOutcome::Confirmed
+            } else {
+                TorqueOutcome::Unconfirmed
+            };
+            return Ok(TorqueProgress::Done(outcome));
         }
         let now = self.now();
         if now < next_repeat_at {
@@ -14843,7 +14850,14 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 self.mit_fence = None;
             }
             self.disable_dispatched_mask = 0;
-            return Ok(TorqueProgress::Done(TorqueOutcome::Confirmed));
+            // Blocker 1: NEVER report `TorqueOutcome::Confirmed` solely from accepted TX repeats
+            // when any axis has not provided fresh post-enable causal `state == 0` confirmation.
+            let outcome = if self.is_hardware_disarmed_confirmed() {
+                TorqueOutcome::Confirmed
+            } else {
+                TorqueOutcome::Unconfirmed
+            };
+            return Ok(TorqueProgress::Done(outcome));
         }
         next_repeat_at = self.now() + DAMIAO_DISABLE_REPEAT_INTERVAL;
         let wake = expiry.map_or(next_repeat_at, |exp| next_repeat_at.min(exp));

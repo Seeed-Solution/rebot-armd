@@ -3386,40 +3386,48 @@ impl crate::supervisor::SupervisorInner {
         }
 
         // Temporarily take driver out so the live submission gate closure can borrow `&*self`
-        // right before `can.transmit` (closing B2 with zero allocation).
+        // right before `can.transmit` (closing B2 with zero allocation). Wrap in `catch_unwind`
+        // so ANY panic in `drv.clock_now()` or CAN I/O unconditionally restores `self.driver`
+        // before unwinding (never dropping the sole driver or leaving `self.driver == None`).
         let mut taken = self.driver.take();
-        let step_result = if let Some(drv) = taken
-            .as_mut()
-            .and_then(crate::supervisor_lock::DriverSlot::as_exclusive_mut)
-        {
-            let drv_now = drv.clock_now();
-            let span = owner_cutoff.saturating_duration_since(owner_now_fn());
-            let drv_cutoff = drv_now + span;
-            drv.set_tx_release_deadline(Some(drv_cutoff));
+        let step_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if let Some(drv) = taken
+                .as_mut()
+                .and_then(crate::supervisor_lock::DriverSlot::as_exclusive_mut)
+            {
+                let drv_now = drv.clock_now();
+                let span = owner_cutoff.saturating_duration_since(owner_now_fn());
+                let drv_cutoff = drv_now + span;
+                drv.set_tx_release_deadline(Some(drv_cutoff));
 
-            let res = match kind {
-                CommissioningOpKind::ReadIdentity => {
-                    self.step_read_identity_with_drv(drv, &auth, drv_cutoff, remaining_rx, owner_now_fn)
-                }
-                CommissioningOpKind::WriteTimeout => {
-                    self.step_write_timeout_with_drv(drv, &auth, drv_cutoff, remaining_rx, owner_now_fn)
-                }
-                CommissioningOpKind::MotorZeroDisable => {
-                    self.step_motor_zero_disable_with_drv(drv, &auth, drv_cutoff, remaining_rx, owner_now_fn)
-                }
-                CommissioningOpKind::MotorZeroWriteVerify => {
-                    self.step_motor_zero_write_verify_with_drv(drv, &auth, drv_cutoff, remaining_rx, owner_now_fn)
-                }
-            };
+                let res = match kind {
+                    CommissioningOpKind::ReadIdentity => {
+                        self.step_read_identity_with_drv(drv, &auth, drv_cutoff, remaining_rx, owner_now_fn)
+                    }
+                    CommissioningOpKind::WriteTimeout => {
+                        self.step_write_timeout_with_drv(drv, &auth, drv_cutoff, remaining_rx, owner_now_fn)
+                    }
+                    CommissioningOpKind::MotorZeroDisable => {
+                        self.step_motor_zero_disable_with_drv(drv, &auth, drv_cutoff, remaining_rx, owner_now_fn)
+                    }
+                    CommissioningOpKind::MotorZeroWriteVerify => {
+                        self.step_motor_zero_write_verify_with_drv(drv, &auth, drv_cutoff, remaining_rx, owner_now_fn)
+                    }
+                };
 
-            drv.set_tx_release_deadline(None);
-            #[cfg(not(target_arch = "wasm32"))]
-            self.torque_shadow.drain_from_driver(drv);
-            Some(res)
-        } else {
-            None
-        };
+                drv.set_tx_release_deadline(None);
+                #[cfg(not(target_arch = "wasm32"))]
+                self.torque_shadow.drain_from_driver(drv);
+                Some(res)
+            } else {
+                None
+            }
+        }));
         self.driver = taken;
+        let step_result = match step_outcome {
+            Ok(r) => r,
+            Err(payload) => std::panic::resume_unwind(payload),
+        };
         let Some(step_result) = step_result else {
             self.abort_running_commissioning(500, "DRIVER", "exclusive driver unavailable");
             return;
