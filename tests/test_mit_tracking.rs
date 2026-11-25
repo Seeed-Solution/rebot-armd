@@ -612,10 +612,6 @@ fn mit_bus_loss_cancels_the_group() {
     );
 }
 
-fn command_frames(log: &[armd::transport::CanFrame]) -> Vec<armd::transport::CanFrame> {
-    log.iter().filter(|f| (1..=7).contains(&f.id) || (0x101..=0x107).contains(&f.id)).copied().collect()
-}
-
 #[test]
 fn mit_partial_send_reconnect_through_the_supervisor() {
     let (mut inner, bus, clock) = active_rig_clocked(mit_config_j4(), 0.0);
