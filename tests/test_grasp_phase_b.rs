@@ -28,23 +28,28 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use armd::driver::{
-    ArmDriver, ArmDriverError, DriverCapabilities, EnableState, JointTarget, TorqueOutcome,
-    TorqueProgress, TxBatchOutcome,
+    ArmDriver, ArmDriverError, DriverCapabilities, EnableState, JointTarget, MotorCurrentCap,
+    PosForceEmitOutcome, PosForceIntent, PosForceIntentKind, PosForceIntentStamp, PosForceTxStatus,
+    TorqueOutcome, TorqueProgress, TxBatchOutcome,
 };
 use armd::grasp::{
-    self, BoxFuture, CamModel, Detection, DetectionFrame, DetectionSource, GraspSetup, ModeInfo,
-    ProviderModels, ResidentModels,
+    self, BoxFuture, CamModel, Detection, DetectionFrame, DetectionSource, GraspDeps, GraspSetup,
+    ModeInfo, ProviderModels, ResidentModels,
 };
-use armd::grasp_select::PregraspMode;
+use armd::grasp_select::{self, PregraspMode, Strategy};
 use armd::kinematics::{self, Pose, Vec3};
-use armd::macro_action::ActionId;
+use armd::macro_action::{ActionId, ChildSpec, ChildTicket};
 use armd::model::{CameraMount, JointState, KeepoutBox};
 use armd::place;
 use armd::rt_core::broker::{ClientId, DeliveryDecision, Outcome, Reply, Submit};
 use armd::rt_core::config_iface::{ConfigDomain, ConfigProposal};
 use armd::rt_core::executor::{ExecutorConfig, RtExecutorHandle};
+use armd::rt_core::ops::{PlanSlot, Primitive};
 use armd::rt_core::requests::actions::{
-    ActionSnapshot, FinishMacroSpec, FinishState, HeldUpdate, DEFAULT_ACTION_DEADLINE,
+    install_begin_macro_admitted, install_macro_child, prepare_child_cartesian_slot_with_options,
+    ActionSnapshot, ActionStamp, ActionSubmit, FinishMacroSpec, FinishState, HeldUpdate,
+    MacroChildPayload, OwnerCheckCtx, PreparedApproachLeg, ResolvedCartesianLegs, StagedAction,
+    StagedQuinticLeg, DEFAULT_ACTION_DEADLINE,
 };
 use armd::rt_core::requests::config::{
     run_config_commit, ConfigAuthContext, ConfigCandidate, ConfigCommitPlan, ConfigWriteOp,
@@ -100,6 +105,14 @@ struct DriverSim {
     contact: Option<ContactInject>,
     /// When true, `read_joint_state` returns a driver fault.
     inject_fault: bool,
+    /// Realistic per-read feedback sequence and timestamp.
+    fb_seq: u64,
+    fb_instant: Instant,
+    /// When true, expose active `PosForce` J7 mode and move J7 ONLY via `emit_pos_force_j7`.
+    pos_force_active: bool,
+    external_pf: bool,
+    /// Every emitted J7 PosForce intent: `(timestamp, kind, is_stale, measured_pos_before_step)`.
+    pf_intent_log: Vec<(Instant, PosForceIntentKind, bool, [f32; 7])>,
     /// Every TX write `(timestamp, enabled, is_estop_hold, target_positions)`.
     tx_log: Vec<(Instant, bool, bool, [f32; 7])>,
     /// Counts distinct close transitions (from open-side toward closed-side) to prove no regrip.
@@ -115,7 +128,12 @@ struct PhaseBDriver {
 }
 
 impl PhaseBDriver {
-    fn new(cfg: &ArmConfig, q0: &[f32; 7], object_j7: Option<f32>) -> (Self, Arc<Mutex<DriverSim>>) {
+    fn new(
+        cfg: &ArmConfig,
+        q0: &[f32; 7],
+        object_j7: Option<f32>,
+        pos_force_active: bool,
+    ) -> (Self, Arc<Mutex<DriverSim>>) {
         let gp = cfg.gripper_policy.as_ref().expect("gripper policy");
         let sim = Arc::new(Mutex::new(DriverSim {
             enabled: false,
@@ -129,6 +147,11 @@ impl PhaseBDriver {
             dropped: false,
             contact: None,
             inject_fault: false,
+            fb_seq: 1,
+            fb_instant: Instant::now(),
+            pos_force_active,
+            external_pf: false,
+            pf_intent_log: Vec::new(),
             tx_log: Vec::new(),
             close_transitions: 0,
             last_j7_cmd: q0[6],
@@ -137,6 +160,44 @@ impl PhaseBDriver {
             tcp_offset: cfg.active_tool.tcp_offset_m,
         }));
         (Self { sim: Arc::clone(&sim) }, sim)
+    }
+
+    fn apply_j7_target(s: &mut DriverSim, desired_j7: f32, max_step: Option<f32>) {
+        let close_dir = if s.closed_rad >= s.open_rad { 1.0f32 } else { -1.0f32 };
+        let next_cmd = match max_step {
+            Some(step) if step.is_finite() && step > 0.0 => {
+                let d = desired_j7 - s.pos[6];
+                if d.abs() <= step {
+                    desired_j7
+                } else {
+                    s.pos[6] + step.copysign(d)
+                }
+            }
+            _ => desired_j7,
+        };
+        let dj7 = (next_cmd - s.last_j7_cmd) * close_dir;
+        if dj7 > 0.005 {
+            if !s.in_close_stroke {
+                s.close_transitions += 1;
+                s.in_close_stroke = true;
+            }
+        } else if dj7 < -0.005 {
+            s.in_close_stroke = false;
+        }
+        s.last_j7_cmd = next_cmd;
+        let eff_obj = if s.dropped { None } else { s.object_j7 };
+        if let Some(obj_j7) = eff_obj {
+            let past_obj = (next_cmd - obj_j7) * close_dir >= 0.0;
+            if past_obj {
+                s.pos[6] = obj_j7;
+                s.vel[6] = 0.0;
+                s.tau[6] = 1.5 * close_dir;
+                return;
+            }
+        }
+        s.vel[6] = (next_cmd - s.pos[6]) / 0.02;
+        s.pos[6] = next_cmd;
+        s.tau[6] = 0.0;
     }
 }
 
@@ -154,41 +215,111 @@ impl ArmDriver for PhaseBDriver {
         !self.sim.lock().unwrap().inject_fault
     }
     fn feedback_ages(&self) -> Vec<Option<Duration>> {
-        vec![Some(Duration::ZERO); 7]
+        let now = Instant::now();
+        let ts = self.sim.lock().unwrap().fb_instant;
+        vec![Some(now.saturating_duration_since(ts)); 7]
     }
     fn feedback_instants(&self) -> Vec<Option<Instant>> {
-        vec![Some(Instant::now()); 7]
+        vec![Some(self.sim.lock().unwrap().fb_instant); 7]
     }
     fn feedback_seqs(&self) -> Vec<u64> {
-        vec![1; 7]
+        vec![self.sim.lock().unwrap().fb_seq; 7]
     }
     fn feedback_receive_instants(&self) -> Vec<Option<Instant>> {
-        vec![Some(Instant::now()); 7]
+        vec![Some(self.sim.lock().unwrap().fb_instant); 7]
     }
     fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
+        let now = Instant::now();
+        let ts = self.sim.lock().unwrap().fb_instant;
+        let age = now.saturating_duration_since(ts);
         out.clear();
-        out.extend(std::iter::repeat_n(Some(Duration::ZERO), 7));
+        out.extend(std::iter::repeat_n(Some(age), 7));
     }
     fn feedback_all_within(&self, dof: usize, _max_age: Duration) -> bool {
         dof == 7 && !self.sim.lock().unwrap().inject_fault
     }
     fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) {
+        let now = Instant::now();
+        let ts = self.sim.lock().unwrap().fb_instant;
+        let ms = now.saturating_duration_since(ts).as_millis() as u64;
         out.clear();
-        out.extend(std::iter::repeat_n(Some(0), 7));
+        out.extend(std::iter::repeat_n(Some(ms), 7));
     }
     fn feedback_instants_into(&self, out: &mut Vec<Option<Instant>>) {
-        let now = Instant::now();
+        let ts = self.sim.lock().unwrap().fb_instant;
         out.clear();
-        out.extend(std::iter::repeat_n(Some(now), 7));
+        out.extend(std::iter::repeat_n(Some(ts), 7));
     }
     fn feedback_seqs_into(&self, out: &mut Vec<u64>) {
+        let seq = self.sim.lock().unwrap().fb_seq;
         out.clear();
-        out.extend(std::iter::repeat_n(1, 7));
+        out.extend(std::iter::repeat_n(seq, 7));
     }
     fn feedback_receive_instants_into(&self, out: &mut Vec<Option<Instant>>) {
-        let now = Instant::now();
+        let ts = self.sim.lock().unwrap().fb_instant;
         out.clear();
-        out.extend(std::iter::repeat_n(Some(now), 7));
+        out.extend(std::iter::repeat_n(Some(ts), 7));
+    }
+    fn motor_current_cap(&self) -> Option<MotorCurrentCap> {
+        let s = self.sim.lock().unwrap();
+        s.pos_force_active.then_some(MotorCurrentCap {
+            joint: 6,
+            mode: "pos_force",
+            current_raw: Some(2500),
+            active: true,
+            calibrated: true,
+            ceiling_torque_nm: Some(1.5),
+            torque_reference: None,
+            close_speed_rad_s: Some(2.0),
+            note: "phase_b_sim_pos_force",
+        })
+    }
+    fn set_external_pos_force_emitter(&mut self, enabled: bool) {
+        self.sim.lock().unwrap().external_pf = enabled;
+    }
+    fn pos_force_feedback_fresh(&self) -> bool {
+        !self.sim.lock().unwrap().inject_fault
+    }
+    fn pos_force_last_fresh_position(&self) -> Option<f32> {
+        Some(self.sim.lock().unwrap().pos[6])
+    }
+    fn emit_pos_force_j7(
+        &mut self,
+        intent: PosForceIntent,
+        current: PosForceIntentStamp,
+    ) -> Result<PosForceEmitOutcome, ArmDriverError> {
+        let mut s = self.sim.lock().unwrap();
+        if !s.pos_force_active {
+            return Ok(PosForceEmitOutcome::NotApplicable);
+        }
+        let stale = intent.stamp.is_stale_against(current);
+        let snap_pos = s.pos;
+        s.pf_intent_log.push((Instant::now(), intent.kind, stale, snap_pos));
+        if s.enabled && !s.inject_fault {
+            if let PosForceIntentKind::Target { position, velocity, .. } = intent.kind {
+                if !stale {
+                    let step = velocity.filter(|v| v.is_finite() && *v > 0.0).map(|v| v * 0.02);
+                    Self::apply_j7_target(&mut s, position, step);
+                }
+            } else {
+                // Hold / Stop keeps current measured J7 stationary (maintaining stall torque if holding).
+                s.vel[6] = 0.0;
+                let close_dir = if s.closed_rad >= s.open_rad { 1.0f32 } else { -1.0f32 };
+                let eff_obj = if s.dropped { None } else { s.object_j7 };
+                if let Some(obj_j7) = eff_obj {
+                    if (s.pos[6] - obj_j7).abs() < 0.05 {
+                        s.tau[6] = 1.5 * close_dir;
+                    }
+                } else {
+                    s.tau[6] = 0.0;
+                }
+            }
+        }
+        Ok(PosForceEmitOutcome::Sent {
+            joint: 6,
+            freeze: false,
+            pf_status: PosForceTxStatus::Fresh,
+        })
     }
     fn enable_state(&self) -> EnableState {
         if self.sim.lock().unwrap().enabled {
@@ -203,10 +334,12 @@ impl ArmDriver for PhaseBDriver {
         Ok(out)
     }
     fn read_joint_states_into(&mut self, out: &mut Vec<JointState>) -> Result<(), ArmDriverError> {
-        let s = self.sim.lock().unwrap();
+        let mut s = self.sim.lock().unwrap();
         if s.inject_fault {
             return Err(ArmDriverError::HardwareFault("injected Phase B driver fault".into()));
         }
+        s.fb_seq = s.fb_seq.saturating_add(1);
+        s.fb_instant = Instant::now();
         out.clear();
         for i in 0..7 {
             out.push(JointState {
@@ -243,18 +376,21 @@ impl ArmDriver for PhaseBDriver {
             return Ok(());
         }
 
-        // Track close strokes (moving in closing direction by > 0.02 rad).
-        let close_dir = if s.closed_rad >= s.open_rad { 1.0f32 } else { -1.0f32 };
-        let dj7 = (cmd[6] - s.last_j7_cmd) * close_dir;
-        if dj7 > 0.005 {
-            if !s.in_close_stroke {
-                s.close_transitions += 1;
-                s.in_close_stroke = true;
+        // When PosForce is active with external emitter, J7 moves ONLY via `emit_pos_force_j7`!
+        let pos_force_external = s.pos_force_active && s.external_pf;
+        if !pos_force_external {
+            let close_dir = if s.closed_rad >= s.open_rad { 1.0f32 } else { -1.0f32 };
+            let dj7 = (cmd[6] - s.last_j7_cmd) * close_dir;
+            if dj7 > 0.005 {
+                if !s.in_close_stroke {
+                    s.close_transitions += 1;
+                    s.in_close_stroke = true;
+                }
+            } else if dj7 < -0.005 {
+                s.in_close_stroke = false;
             }
-        } else if dj7 < -0.005 {
-            s.in_close_stroke = false;
+            s.last_j7_cmd = cmd[6];
         }
-        s.last_j7_cmd = cmd[6];
 
         // Arm joints 0..6: check optional early contact obstruction (only armed AFTER arriving
         // at pregrasp with open jaws, so pregrasp transition itself is never obstructed!).
@@ -314,23 +450,26 @@ impl ArmDriver for PhaseBDriver {
             }
         }
 
-        // Gripper joint 6: stall on object when closing unless dropped.
-        let eff_obj = if s.dropped { None } else { s.object_j7 };
-        if let Some(obj_j7) = eff_obj {
-            let past_obj = (cmd[6] - obj_j7) * close_dir >= 0.0;
-            if past_obj {
-                s.pos[6] = obj_j7;
-                s.vel[6] = 0.0;
-                s.tau[6] = 1.5 * close_dir;
+        // Gripper joint 6: stall on object when closing unless dropped (only when non-PosForce).
+        if !pos_force_external {
+            let close_dir = if s.closed_rad >= s.open_rad { 1.0f32 } else { -1.0f32 };
+            let eff_obj = if s.dropped { None } else { s.object_j7 };
+            if let Some(obj_j7) = eff_obj {
+                let past_obj = (cmd[6] - obj_j7) * close_dir >= 0.0;
+                if past_obj {
+                    s.pos[6] = obj_j7;
+                    s.vel[6] = 0.0;
+                    s.tau[6] = 1.5 * close_dir;
+                } else {
+                    s.vel[6] = (cmd[6] - s.pos[6]) / 0.02;
+                    s.pos[6] = cmd[6];
+                    s.tau[6] = 0.0;
+                }
             } else {
                 s.vel[6] = (cmd[6] - s.pos[6]) / 0.02;
                 s.pos[6] = cmd[6];
                 s.tau[6] = 0.0;
             }
-        } else {
-            s.vel[6] = (cmd[6] - s.pos[6]) / 0.02;
-            s.pos[6] = cmd[6];
-            s.tau[6] = 0.0;
         }
         Ok(())
     }
@@ -402,6 +541,7 @@ struct VisionState {
     per_request: bool,
     mode_generation: Option<u64>,
     frame_generation: Option<u64>,
+    preflight_delay: Option<Duration>,
     on_frame_hook: Option<Arc<dyn Fn(u64) + Send + Sync>>,
 }
 
@@ -442,6 +582,7 @@ impl PhaseBVision {
                 per_request: true,
                 mode_generation: Some(1),
                 frame_generation: Some(1),
+                preflight_delay: None,
                 on_frame_hook: None,
             }),
         })
@@ -591,10 +732,13 @@ impl DetectionSource for PhaseBVision {
     }
     fn mode_info(&self) -> BoxFuture<'_, Result<ModeInfo, String>> {
         Box::pin(async move {
-            let (per_req, gen) = {
+            let (per_req, gen, delay) = {
                 let st = self.state.lock().unwrap();
-                (st.per_request, st.mode_generation)
+                (st.per_request, st.mode_generation, st.preflight_delay)
             };
+            if let Some(d) = delay {
+                tokio::time::sleep(d).await;
+            }
             Ok(ModeInfo {
                 reported: true,
                 per_request_pipelines: per_req,
@@ -768,10 +912,24 @@ impl Rig {
         object_j7: Option<f32>,
         lease_enabled: bool,
     ) -> Self {
+        Self::start_with_pos_force(owner, config, setup, q_arm, poly, height_m, object_j7, lease_enabled, false).await
+    }
+
+    async fn start_with_pos_force(
+        owner: Owner,
+        config: ArmConfig,
+        setup: GraspSetup,
+        q_arm: [f64; 6],
+        poly: Vec<[f64; 2]>,
+        height_m: f64,
+        object_j7: Option<f32>,
+        lease_enabled: bool,
+        pos_force_active: bool,
+    ) -> Self {
         let gp = config.gripper_policy.as_ref().expect("gripper policy");
         let start_j7 = gp.closed_rad;
         let q7: [f32; 7] = std::array::from_fn(|i| if i < 6 { q_arm[i] as f32 } else { start_j7 });
-        let (drv, sim) = PhaseBDriver::new(&config, &q7, object_j7);
+        let (drv, sim) = PhaseBDriver::new(&config, &q7, object_j7, pos_force_active);
         let cam = CamModel::assumed(&config.arm_model, &setup, &config.camera_mount);
         let start_end = config.arm_model.fk(&q_arm);
         let arm_model = config.arm_model.clone();
@@ -829,6 +987,7 @@ impl Rig {
         let ticker_stop = Arc::new(AtomicBool::new(false));
         let handle = match owner {
             Owner::Legacy => {
+                sup.start_dispatcher().unwrap();
                 let sup_t = sup.clone();
                 let stop_t = ticker_stop.clone();
                 tokio::spawn(async move {
@@ -920,14 +1079,17 @@ impl Rig {
         s
     }
 
-    async fn plan_adaptive(&self, body: &Value) -> Result<grasp::PlannedGrasp, ArmError> {
+    async fn plan_and_stamp_adaptive(
+        &self,
+        body: &Value,
+    ) -> Result<(grasp::PlannedGrasp, armd::supervisor::AdmissionStamp), ArmError> {
+        let adm = self.admission_stamp().await;
         let pending = match self.owner {
             Owner::Legacy => {
                 let inner = self.sup.inner().read().await;
                 grasp::prepare(&inner, body, inner.safety.epoch_id())?
             }
             Owner::Executor => {
-                let adm = self.admission_stamp().await;
                 let snap = ActionSnapshot::capture(
                     &self.sup,
                     adm,
@@ -941,11 +1103,18 @@ impl Rig {
             .await
             .unwrap()?;
         grasp::preflight(self.vision.as_ref(), &mut planned).await?;
-        Ok(planned)
+        Ok((planned, adm))
     }
 
-    async fn start_adaptive(&self, planned: grasp::PlannedGrasp) -> Result<(u64, f64), ArmError> {
-        let adm = self.admission_stamp().await;
+    async fn plan_adaptive(&self, body: &Value) -> Result<grasp::PlannedGrasp, ArmError> {
+        Ok(self.plan_and_stamp_adaptive(body).await?.0)
+    }
+
+    async fn start_adaptive_with_stamp(
+        &self,
+        planned: grasp::PlannedGrasp,
+        adm: armd::supervisor::AdmissionStamp,
+    ) -> Result<(u64, f64), ArmError> {
         match self.owner {
             Owner::Legacy => {
                 let mut inner = self.sup.inner().write().await;
@@ -961,6 +1130,11 @@ impl Rig {
                 grasp::begin_executor(&self.sup, adm, self.vision.clone(), planned).await
             }
         }
+    }
+
+    async fn start_adaptive(&self, planned: grasp::PlannedGrasp) -> Result<(u64, f64), ArmError> {
+        let adm = self.admission_stamp().await;
+        self.start_adaptive_with_stamp(planned, adm).await
     }
 
     async fn wait_action_end(&self, action_id: u64, timeout: Duration) -> (String, Option<String>, Option<bool>) {
@@ -1812,29 +1986,85 @@ async fn phase_b_boundary_stop_estop_fault_lease_timeout_matrix_both_owners() {
             let poly = banana([0.30, 0.0], 0.12, 30.0, 0.034, 90.0);
             let need_lease = matches!(ev, BoundaryEvent::LeaseLoss | BoundaryEvent::Stop);
 
-            let rig = Rig::start(owner, cfg.clone(), setup.clone(), q0, poly.clone(), 0.035, Some(obj_j7), need_lease).await;
+            let rig = Rig::start_with_pos_force(
+                owner,
+                cfg.clone(),
+                setup.clone(),
+                q0,
+                poly.clone(),
+                0.035,
+                Some(obj_j7),
+                need_lease,
+                true,
+            )
+            .await;
             let req = adaptive_request(&rig.cam, &rig.start_end, setup.table_z_m, &poly, 0.035);
-            let planned = rig.plan_adaptive(&req).await.unwrap();
+            let (planned, adm) = rig.plan_and_stamp_adaptive(&req).await.unwrap();
 
-            // Wait until the first arm child (`pregrasp`) has actually moved joints > 0.01 rad!
+            // Subscribe to lossless Legacy action terminals BEFORE BeginMacro so we assert exact
+            // terminal count == 1 on BOTH Legacy and Executor (not merely liveness).
+            let legacy_terminals = Arc::new(Mutex::new(Vec::<u64>::new()));
+            let _term_sub = if owner == Owner::Legacy {
+                let log_t = Arc::clone(&legacy_terminals);
+                Some(rig.sup.test_subscribe_action_terminals(move |obs| {
+                    if let Some(a) = obs.action.as_ref() {
+                        if a.state != "running" {
+                            log_t.lock().unwrap().push(a.id);
+                        }
+                    }
+                    true
+                }))
+            } else {
+                None
+            };
+
             let id = match ev {
                 BoundaryEvent::Timeout => {
-                    // Use a short parent deadline (350 ms) directly on spawn so timeout fires mid-child.
-                    let adm = rig.admission_stamp().await;
-                    let short_dl = Instant::now() + Duration::from_millis(350);
+                    // Use production `BeginMacroSpec` + short deadline on BOTH Legacy and Executor
+                    // (900 ms lets `pregrasp` begin moving well past 0.005 rad while firing
+                    // `GRASP_TIMEOUT` mid-child on the 0.04 m/s transition).
+                    let short_dl = Instant::now() + Duration::from_millis(900);
                     match owner {
                         Owner::Legacy => {
                             let mut inner = rig.sup.inner().write().await;
+                            let ws_rev = planned.adaptive.as_ref().unwrap().revisions.workspace_revision;
+                            let boot = OwnerCheckCtx::for_legacy(&inner).boot;
+                            let mut spec =
+                                grasp::begin_macro_spec(&planned, boot, 7, Some(6), short_dl)
+                                    .unwrap();
+                            spec.admission_request_id = adm.request_id;
                             let admitted = inner.check_admission(adm).unwrap();
-                            let aid = SupervisorInner::begin_macro(admitted, "grasp", &planned.input, None).unwrap();
+                            let aid = install_begin_macro_admitted(
+                                admitted,
+                                &spec,
+                                Some(ws_rev),
+                                None,
+                                None,
+                            )
+                            .unwrap();
                             drop(inner);
-                            grasp::spawn_with_deadline(rig.sup.clone(), rig.vision.clone(), aid, planned, adm, short_dl);
+                            grasp::spawn_with_deadline(
+                                rig.sup.clone(),
+                                rig.vision.clone(),
+                                aid,
+                                planned,
+                                adm,
+                                short_dl,
+                            );
                             aid
                         }
                         Owner::Executor => {
                             let h = rig.handle.as_ref().unwrap();
-                            let snap = ActionSnapshot::capture(&rig.sup, adm, Instant::now() + DEFAULT_ACTION_DEADLINE).await.unwrap();
-                            let mut spec = grasp::begin_macro_spec(&planned, h.boot(), 7, Some(6), short_dl).unwrap();
+                            let snap = ActionSnapshot::capture(
+                                &rig.sup,
+                                adm,
+                                Instant::now() + DEFAULT_ACTION_DEADLINE,
+                            )
+                            .await
+                            .unwrap();
+                            let mut spec =
+                                grasp::begin_macro_spec(&planned, h.boot(), 7, Some(6), short_dl)
+                                    .unwrap();
                             spec.admission_request_id = adm.request_id;
                             let rev = planned.adaptive.as_ref().unwrap().revisions;
                             let mut stamp = snap.stamp;
@@ -1842,25 +2072,46 @@ async fn phase_b_boundary_stop_estop_fault_lease_timeout_matrix_both_owners() {
                             stamp.gripper_calib_revision = Some(rev.gripper_calib_revision);
                             stamp.calibration_revision = Some(rev.calibration_revision);
                             stamp.power_budget_revision = Some(rev.power_budget_revision);
-                            let (aid, _) = armd::macro_action::begin_macro_executor(&rig.sup, &stamp, spec, Instant::now() + DEFAULT_ACTION_DEADLINE).await.unwrap();
-                            grasp::spawn_with_deadline(rig.sup.clone(), rig.vision.clone(), aid, planned, adm, short_dl);
+                            let (aid, _) = armd::macro_action::begin_macro_executor(
+                                &rig.sup,
+                                &stamp,
+                                spec,
+                                Instant::now() + DEFAULT_ACTION_DEADLINE,
+                            )
+                            .await
+                            .unwrap();
+                            grasp::spawn_with_deadline(
+                                rig.sup.clone(),
+                                rig.vision.clone(),
+                                aid,
+                                planned,
+                                adm,
+                                short_dl,
+                            );
                             aid
                         }
                     }
                 }
-                _ => rig.start_adaptive(planned).await.unwrap().0,
+                _ => rig.start_adaptive_with_stamp(planned, adm).await.unwrap().0,
             };
 
-            // Wait until arm begins moving (up to 2 s).
+            // Wait deterministically until the first arm child (`pregrasp`) has actually moved!
             let move_dl = Instant::now() + Duration::from_secs(2);
+            let mut moved = 0.0f32;
             while Instant::now() < move_dl {
                 let q = rig.measured_positions().await;
-                let moved = (0..6).map(|i| (q[i] - q0[i] as f32).abs()).fold(0.0f32, f32::max);
+                moved = (0..6)
+                    .map(|i| (q[i] - q0[i] as f32).abs())
+                    .fold(0.0f32, f32::max);
                 if moved > 0.005 {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
+            assert!(
+                moved > 0.005,
+                "{owner:?} / {ev:?}: arm child never began moving before boundary injection (moved={moved})"
+            );
 
             // Inject boundary event.
             match ev {
@@ -1932,19 +2183,36 @@ async fn phase_b_boundary_stop_estop_fault_lease_timeout_matrix_both_owners() {
             let (state, code, _) = rig.wait_action_end(id, Duration::from_secs(10)).await;
             assert_ne!(state, "done", "{owner:?} / {ev:?}: must not complete normally");
             if matches!(ev, BoundaryEvent::Timeout) {
-                assert_eq!(code.as_deref(), Some("GRASP_TIMEOUT"), "{owner:?}: expected GRASP_TIMEOUT, got ({state}, {code:?})");
+                assert_eq!(
+                    code.as_deref(),
+                    Some("GRASP_TIMEOUT"),
+                    "{owner:?}: expected GRASP_TIMEOUT, got ({state}, {code:?})"
+                );
             }
             assert_eq!(rig.held_label().await, None, "{owner:?} / {ev:?}: held must stay None");
 
-            // Effective TX cutoff: after 25 ms settle post-terminal, observe 80 ms more and verify
-            // ZERO motion steps on TX (and zero enabled TX after E-stop/Fault) + STILL strictly 1 terminal!
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            let cutoff_idx = rig.sim.lock().unwrap().tx_log.len();
+            // Record cutoff IMMEDIATELY at terminal observation (NO 25 ms skip!) and observe 80 ms
+            // to assert ZERO motion steps AND ZERO PosForce Target intents after cutoff.
+            let (cutoff_idx, pf_cutoff_idx) = {
+                let s = rig.sim.lock().unwrap();
+                (s.tx_log.len(), s.pf_intent_log.len())
+            };
             tokio::time::sleep(Duration::from_millis(80)).await;
-            let post_tx = rig.sim.lock().unwrap().tx_log[cutoff_idx..].to_vec();
+            let (post_tx, post_pf) = {
+                let s = rig.sim.lock().unwrap();
+                (
+                    s.tx_log[cutoff_idx..].to_vec(),
+                    s.pf_intent_log[pf_cutoff_idx..].to_vec(),
+                )
+            };
+            assert!(
+                post_pf
+                    .iter()
+                    .all(|(_, k, stale, _)| !matches!(k, PosForceIntentKind::Target { .. }) || *stale),
+                "{owner:?} / {ev:?}: active PosForce Target emitted after cutoff! {post_pf:?}"
+            );
             match ev {
                 BoundaryEvent::EStop => {
-                    // After E-stop cutoff: ZERO non-hold motion TX writes, and zero joint motion!
                     assert!(
                         post_tx.iter().all(|(_, en, is_hold, _)| !*en || *is_hold),
                         "{owner:?} / {ev:?}: non-hold motion TX continued after E-stop cutoff ({} entries)",
@@ -1986,12 +2254,571 @@ async fn phase_b_boundary_stop_estop_fault_lease_timeout_matrix_both_owners() {
                     "{owner:?} / {ev:?}: parent macro MUST end exactly once"
                 );
             } else {
-                let alive = rig.sup.inner().read().await.macro_alive(id);
-                assert!(!alive, "legacy macro must not stay alive after {ev:?}");
+                let count = legacy_terminals
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|&&aid| aid == id)
+                    .count();
+                assert_eq!(
+                    count, 1,
+                    "Legacy / {ev:?}: parent macro MUST publish exactly one lossless terminal (got {count})"
+                );
+                assert!(
+                    !rig.sup.inner().read().await.macro_alive(id),
+                    "legacy macro must not stay alive after {ev:?}"
+                );
             }
-            // Confirm no double-trigger by checking an independent counter after waiting.
             let _ = AtomicUsize::new(0);
             rig.shutdown();
         }
     }
+}
+
+// ============================================================================
+// 8. PosForce Active J7 Intent-Only Ownership + `lock_j7_hold` + Approach Refusal
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn phase_b_pos_force_j7_intent_only_and_approach_lock_refusal_both_owners() {
+    for owner in Owner::BOTH {
+        let (cfg, setup) = fast_mounted_config();
+        let gp = cfg.gripper_policy.clone().unwrap();
+        let obj_j7 = gp.closed_rad + 0.35 * (gp.open_rad - gp.closed_rad);
+        let q0 = solve_camera_down(&cfg, &setup, [0.42, 0.0, 0.26]);
+        let poly = banana([0.42, 0.0], 0.12, 30.0, 0.034, 90.0);
+
+        let rig = Rig::start_with_pos_force(
+            owner,
+            cfg.clone(),
+            setup.clone(),
+            q0,
+            poly.clone(),
+            0.035,
+            Some(obj_j7),
+            false,
+            true,
+        )
+        .await;
+        let req = adaptive_request(&rig.cam, &rig.start_end, setup.table_z_m, &poly, 0.035);
+        let (planned, adm) = rig.plan_and_stamp_adaptive(&req).await.expect("adaptive plan");
+
+        let (tx_start, pf_start) = {
+            let s = rig.sim.lock().unwrap();
+            (s.tx_log.len(), s.pf_intent_log.len())
+        };
+        let (id, _) = rig.start_adaptive_with_stamp(planned, adm).await.expect("begin adaptive");
+        let (state, code, holding) = rig.wait_action_end(id, Duration::from_secs(20)).await;
+        assert_eq!(
+            (state.as_str(), code.as_deref(), holding),
+            ("done", None, Some(true)),
+            "{owner:?}: PosForce adaptive grasp must succeed with holding=true"
+        );
+        assert_eq!(rig.held_label().await.as_deref(), Some("banana"), "{owner:?}");
+
+        let pf_log = rig.sim.lock().unwrap().pf_intent_log[pf_start..].to_vec();
+        let tx_log = rig.sim.lock().unwrap().tx_log[tx_start..].to_vec();
+        let target_count = pf_log
+            .iter()
+            .filter(|(_, k, stale, _)| !*stale && matches!(k, PosForceIntentKind::Target { .. }))
+            .count();
+        let hold_count = pf_log
+            .iter()
+            .filter(|(_, k, _, _)| matches!(k, PosForceIntentKind::Hold | PosForceIntentKind::Stop))
+            .count();
+        assert!(
+            target_count >= 5 && hold_count >= 10,
+            "{owner:?}: expected both Target ({target_count}) and Hold ({hold_count}) PosForce intents"
+        );
+        // On EVERY tick where the arm joints stepped (> 5e-4 rad), the PosForce J7 emitter MUST
+        // have emitted Hold/Stop (NEVER an active Target!), proving J7 moves ONLY inside GripperMotion!
+        for w in pf_log.windows(2) {
+            let arm_d = (0..6)
+                .map(|i| (w[1].3[i] - w[0].3[i]).abs())
+                .fold(0.0f32, f32::max);
+            if arm_d > 5e-4 {
+                assert!(
+                    !matches!(w[1].1, PosForceIntentKind::Target { .. }) || w[1].2,
+                    "{owner:?}: PosForce emitted active Target while arm moved (arm_d={arm_d})!"
+                );
+            }
+        }
+        let _ = tx_log;
+
+        // Also assert `lock_j7_hold: true` + `approach_leg` / `approach_then` is refused with
+        // `INVALID_COMMAND` on BOTH owners!
+        let q_cur = rig.measured_positions().await;
+        let q_cur6 = [
+            f64::from(q_cur[0]),
+            f64::from(q_cur[1]),
+            f64::from(q_cur[2]),
+            f64::from(q_cur[3]),
+            f64::from(q_cur[4]),
+            f64::from(q_cur[5]),
+        ];
+        let mut q_goal6 = q_cur6;
+        q_goal6[0] += 0.04;
+        let mut q_goal7 = q_cur;
+        q_goal7[0] = q_goal6[0] as f32;
+
+        match owner {
+            Owner::Legacy => {
+                let inp = {
+                    let inner = rig.sup.inner().read().await;
+                    inner.plan_input_in(armd::motion::GoalFrame::Tcp).unwrap()
+                };
+                let swept = armd::grasp_select::feasibility::plan_swept_joint_path(
+                    &inp,
+                    q_goal6,
+                    &[[0.0, 0.0, 0.0]],
+                    -1.0,
+                )
+                .unwrap();
+                let mut inner = rig.sup.inner().write().await;
+                let stamp_l = inner.current_admission_stamp();
+                let admitted = inner.check_admission(stamp_l).unwrap();
+                let pid = SupervisorInner::begin_macro(admitted, "grasp", &inp, None).unwrap();
+                let owner_ctx = OwnerCheckCtx::for_legacy(&inner);
+                let req_stamp = ActionStamp {
+                    arm: owner_ctx.arm,
+                    boot: owner_ctx.boot,
+                    admission: stamp_l.for_macro_child(),
+                    config_revision: inner.workspace_revision,
+                    calibration_revision: None,
+                    poses_revision: None,
+                    sequences_revision: None,
+                    grasp_setup_revision: None,
+                    gripper_calib_revision: None,
+                    power_budget_revision: None,
+                    parent_generation: pid,
+                    deadline: Instant::now() + DEFAULT_ACTION_DEADLINE,
+                };
+                let dummy_seg = armd::trajectory::MultiJointQuinticTrajectory::new(
+                    &q_cur,
+                    &q_goal7,
+                    &[0.0; 7],
+                    &[0.0; 7],
+                    0.5,
+                )
+                .unwrap();
+                let mut target8 = [0.0f32; 8];
+                target8[..7].copy_from_slice(&q_goal7);
+                let payload = MacroChildPayload::LegacyCartesian {
+                    spec: ChildSpec {
+                        ticket: ChildTicket { parent: ActionId(pid), child_seq: 1 },
+                        timeout_s: 10.0,
+                        timeout_code: "GRASP_TIMEOUT",
+                        contact: None,
+                    },
+                    start: q_cur.to_vec(),
+                    input: inp,
+                    resolved: ResolvedCartesianLegs {
+                        path: swept,
+                        approach_leg: Some(PreparedApproachLeg {
+                            seg: dummy_seg,
+                            target: q_goal7.to_vec(),
+                            power_scale: None,
+                            staged: StagedQuinticLeg {
+                                target: target8,
+                                duration_s: 0.5,
+                                power_scale: None,
+                            },
+                        }),
+                        outcome: None,
+                        expected_duration_s: 1.0,
+                    },
+                    lock_j7_hold: true,
+                };
+                let res = install_macro_child(&mut inner, &req_stamp, &owner_ctx, false, payload);
+                assert!(
+                    matches!(res, Err(ArmError::Rejected { ref code, .. }) if code == "INVALID_COMMAND")
+                        || matches!(res, Err(ArmError::Motion(armd::motion::MotionError::InvalidCommand(_)))),
+                    "Legacy must refuse lock_j7_hold=true with approach_leg=Some: {res:?}"
+                );
+                let _ = inner.finish_macro(pid, "cancelled", None, None, None, None);
+            }
+            Owner::Executor => {
+                let h = rig.handle.as_ref().unwrap();
+                let boot = h.boot();
+                let adm_e = rig.admission_stamp().await;
+                let snap = ActionSnapshot::capture(
+                    &rig.sup,
+                    adm_e,
+                    Instant::now() + DEFAULT_ACTION_DEADLINE,
+                )
+                .await
+                .unwrap();
+                let inp = snap.plan_input_in(armd::motion::GoalFrame::Tcp).unwrap();
+                let swept = armd::grasp_select::feasibility::plan_swept_joint_path(
+                    &inp,
+                    q_goal6,
+                    &[[0.0, 0.0, 0.0]],
+                    -1.0,
+                )
+                .unwrap();
+                let begin = armd::rt_core::requests::actions::BeginMacroSpec::new(
+                    armd::rt_core::requests::actions::MacroKind::Grasp,
+                    boot,
+                );
+                let (pid, _) = armd::macro_action::begin_macro_executor(
+                    &rig.sup,
+                    &snap.stamp,
+                    begin,
+                    Instant::now() + DEFAULT_ACTION_DEADLINE,
+                )
+                .await
+                .unwrap();
+                let snap2 = ActionSnapshot::capture(
+                    &rig.sup,
+                    adm_e,
+                    Instant::now() + DEFAULT_ACTION_DEADLINE,
+                )
+                .await
+                .unwrap();
+                let mut slot = prepare_child_cartesian_slot_with_options(
+                    &snap2.commanded_positions,
+                    &swept,
+                    None,
+                    None,
+                    true,
+                    ChildSpec {
+                        ticket: ChildTicket { parent: ActionId(pid), child_seq: 1 },
+                        timeout_s: 10.0,
+                        timeout_code: "GRASP_TIMEOUT",
+                        contact: None,
+                    },
+                )
+                .unwrap();
+                // Inject a forbidden `approach_then` into the `lock_j7_hold: true` slot and submit!
+                if let Primitive::Action(StagedAction::Cartesian {
+                    ref mut approach_then, ..
+                }) = slot.primitive
+                {
+                    let mut target = [0.0f32; 8];
+                    target[..7].copy_from_slice(&q_goal7);
+                    *approach_then = Some(StagedQuinticLeg {
+                        target,
+                        duration_s: 0.5,
+                        power_scale: None,
+                    });
+                }
+                let mut auth = snap2.owner.authority;
+                auth.parent_generation = pid;
+                let w = |dst: &mut PlanSlot| *dst = slot.clone();
+                let req_id = h
+                    .broker()
+                    .lock()
+                    .unwrap()
+                    .submit(
+                        ClientId(rig.conn_id),
+                        777,
+                        auth,
+                        Instant::now() + DEFAULT_ACTION_DEADLINE,
+                        Submit::Action(ActionSubmit::InstallChild {
+                            write: &w,
+                            prepared_boot: boot,
+                            check_workspace_revision: false,
+                            calibration_revision: None,
+                            grasp_setup_revision: None,
+                            gripper_calib_revision: None,
+                            power_budget_revision: None,
+                        }),
+                    )
+                    .unwrap();
+                let dl = Instant::now() + Duration::from_secs(2);
+                let mut refused_code: Option<&'static str> = None;
+                while Instant::now() < dl {
+                    h.pump_broker_replies();
+                    if let Some(c) = rig.sink_replies.lock().unwrap().iter().find_map(|(_, r)| match r {
+                        Reply::Refused { request, code } if *request == req_id => Some(*code),
+                        _ => None,
+                    }) {
+                        refused_code = Some(c);
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                assert_eq!(
+                    refused_code,
+                    Some("INVALID_COMMAND"),
+                    "Executor must refuse lock_j7_hold=true with approach_then=Some"
+                );
+            }
+        }
+        rig.shutdown();
+    }
+}
+
+// ============================================================================
+// 9. Production Axum HTTP + WebSocket E2E on `OWNER_EXECUTOR`
+//    (No Pre-Attached Reply Sink, Lease-Free Dry-Run, Live Adaptive WS, Lease-Loss During Plan)
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn phase_b_executor_ws_end_to_end_live_dry_run_and_lease_loss() {
+    use futures_util::StreamExt;
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::connect_async;
+
+    let (cfg, setup) = fast_mounted_config();
+    let gp = cfg.gripper_policy.clone().unwrap();
+    let obj_j7 = gp.closed_rad + 0.35 * (gp.open_rad - gp.closed_rad);
+    let q0 = solve_camera_down(&cfg, &setup, [0.42, 0.0, 0.26]);
+    let poly = banana([0.42, 0.0], 0.12, 30.0, 0.034, 90.0);
+    let q7: [f32; 7] = std::array::from_fn(|i| if i < 6 { q0[i] as f32 } else { gp.closed_rad });
+    let (drv, _sim) = PhaseBDriver::new(&cfg, &q7, Some(obj_j7), true);
+    let cam = CamModel::assumed(&cfg.arm_model, &setup, &cfg.camera_mount);
+    let start_end = cfg.arm_model.fk(&q0);
+    let arm_model = cfg.arm_model.clone();
+
+    let sup = Arc::new(ArmSupervisor::new(cfg).with_driver(Box::new(drv)));
+    sup.set_lease_enabled(true).await;
+    {
+        let mut inner = sup.inner().write().await;
+        inner.set_grasp_setup(setup.clone());
+        inner.commanded_positions = q7.to_vec();
+        inner.measured_positions = q7.to_vec();
+        inner.target_positions = q7.to_vec();
+        let saved = inner.lease_enabled;
+        inner.lease_enabled = false;
+        let s = inner.current_admission_stamp();
+        let a = inner.check_admission(s).unwrap();
+        SupervisorInner::enable_torque(a).unwrap();
+        inner.lease_enabled = saved;
+        for _ in 0..3 {
+            inner.tick(0.02);
+        }
+    }
+    // Start RT Executor WITHOUT attaching any external reply sink: production WS routing MUST
+    // attach the WS broker reply sink on demand!
+    let handle = sup
+        .start_executor(ExecutorConfig::for_tests(Duration::from_millis(5)))
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        if sup.hub().latest().is_some_and(|s| !s.rt.owner.boot.is_zero()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(sup.owner_mode(), OWNER_EXECUTOR);
+
+    let vision = PhaseBVision::new(sup.clone(), cam.clone(), arm_model, poly.clone(), 0.035, setup.table_z_m);
+    let grasp_deps = GraspDeps {
+        source: vision.clone(),
+        setup_path: None,
+    };
+    let detector = armd::api::proxy::DetectorUpstream::from_env();
+    let diagnostics = armd::diagnostics::DiagnosticsState::global();
+    let calibration = armd::calibration::CalibrationDeps::from_env(None, detector.clone());
+    let router = armd::api::create_router_calibration_with_auth(
+        sup.clone(),
+        detector,
+        grasp_deps,
+        diagnostics,
+        calibration,
+        armd::OperatorAuth::disabled(),
+    );
+    // Ephemeral OS port (127.0.0.1:0 — never 18765/18001/18990).
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let http = reqwest::Client::new();
+    let req_body = adaptive_request(&cam, &start_end, setup.table_z_m, &poly, 0.035);
+
+    // 9a) Schema advertises both `grasp_select` and `grasp_select_exec` on 6-DOF Executor!
+    let schema: Value = http
+        .get(format!("http://{addr}/api/v1/observation/schema"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(schema["capabilities"]["grasp_select"], json!(true), "{schema}");
+    assert_eq!(schema["capabilities"]["grasp_select_exec"], json!(true), "{schema}");
+
+    // 9b) Lease-free REST dry_run succeeds with 200 OK while NO client holds the lease!
+    let mut dry_body = req_body.clone();
+    dry_body["dry_run"] = json!(true);
+    let rest_dry = http
+        .post(format!("http://{addr}/api/v1/action/grasp"))
+        .json(&dry_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rest_dry.status(), reqwest::StatusCode::OK);
+    let rest_dry_json: Value = rest_dry.json().await.unwrap();
+    assert_eq!(rest_dry_json["reachable"], json!(true), "{rest_dry_json}");
+    assert_eq!(rest_dry_json["strategy"], json!("adaptive"));
+    assert_eq!(rest_dry_json["outcome"], json!("selected"));
+
+    // 9c) REST live grasp (without dry_run: true) refuses with 409 LEASE_REQUIRED.
+    let rest_live = http
+        .post(format!("http://{addr}/api/v1/action/grasp"))
+        .json(&req_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rest_live.status(), reqwest::StatusCode::CONFLICT);
+    let rest_live_json: Value = rest_live.json().await.unwrap();
+    assert_eq!(rest_live_json["code"], json!("LEASE_REQUIRED"), "{rest_live_json}");
+
+    // 9d) Open WS: lease-free WS dry_run succeeds BEFORE acquiring a lease!
+    let (mut ws, _) = connect_async(format!("ws://{addr}/api/v1/ws")).await.unwrap();
+    let epoch0 = sup.hub().latest().unwrap().obs.epoch_id;
+    let ws_dry = common::ws_reply(
+        &mut ws,
+        json!({
+            "type": "command",
+            "request_id": 1,
+            "generation": 0,
+            "epoch_id": epoch0,
+            "path": "/api/v1/action/grasp",
+            "body": dry_body
+        }),
+        &["command_ack", "command_reject"],
+    )
+    .await;
+    assert_eq!(ws_dry["type"], json!("command_ack"), "WS lease-free dry_run failed: {ws_dry}");
+    assert_eq!(ws_dry["reachable"], json!(true), "{ws_dry}");
+    assert_eq!(ws_dry["strategy"], json!("adaptive"));
+
+    // 9e) Acquire WS lease -> test lease loss during planning FIRST (while arm is still at `q0`):
+    //     delay preflight 180 ms, release lease mid-flight -> MUST reject with `LEASE_LOST` and
+    //     NOT start a macro!
+    let granted = common::ws_reply(
+        &mut ws,
+        json!({"type": "acquire_lease", "client_id": "phase_b_ws_e2e"}),
+        &["lease_granted", "lease_rejected"],
+    )
+    .await;
+    assert_eq!(granted["type"], json!("lease_granted"), "{granted}");
+    let gen0 = granted["generation"].as_u64().unwrap();
+    let epoch = sup.hub().latest().unwrap().obs.epoch_id;
+
+    vision.state.lock().unwrap().preflight_delay = Some(Duration::from_millis(180));
+    common::send(
+        &mut ws,
+        json!({
+            "type": "command",
+            "request_id": 2,
+            "generation": gen0,
+            "epoch_id": epoch,
+            "path": "/api/v1/action/grasp",
+            "body": req_body
+        }),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    common::send(&mut ws, json!({"type": "release_lease", "generation": gen0})).await;
+    let reject = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let text = ws.next().await.unwrap().unwrap().into_text().unwrap();
+            let v: Value = serde_json::from_str(&text).unwrap();
+            if matches!(v["type"].as_str(), Some("command_ack" | "command_reject"))
+                && v["request_id"].as_u64() == Some(2)
+            {
+                return v;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for lease-loss rejection");
+    assert_eq!(reject["type"], json!("command_reject"), "{reject}");
+    assert_eq!(reject["code"], json!("LEASE_LOST"), "{reject}");
+    assert!(
+        !sup.hub().latest().unwrap().rt.owner.macro_state.alive,
+        "lease loss during planning must NOT start a macro"
+    );
+
+    // 9f) Re-acquire WS lease -> live adaptive grasp over WS -> command_ack -> lossless terminal!
+    vision.state.lock().unwrap().preflight_delay = None;
+    let granted2 = common::ws_reply(
+        &mut ws,
+        json!({"type": "acquire_lease", "client_id": "phase_b_ws_e2e"}),
+        &["lease_granted", "lease_rejected"],
+    )
+    .await;
+    assert_eq!(granted2["type"], json!("lease_granted"), "{granted2}");
+    let gen = granted2["generation"].as_u64().unwrap();
+    let epoch2 = sup.hub().latest().unwrap().obs.epoch_id;
+
+    let live_ack = common::ws_reply(
+        &mut ws,
+        json!({
+            "type": "command",
+            "request_id": 3,
+            "generation": gen,
+            "epoch_id": epoch2,
+            "path": "/api/v1/action/grasp",
+            "body": req_body
+        }),
+        &["command_ack", "command_reject"],
+    )
+    .await;
+    assert_eq!(
+        live_ack["type"],
+        json!("command_ack"),
+        "Executor WS live adaptive grasp must be accepted (not 503 EXECUTOR_ROUTING_PENDING): {live_ack}"
+    );
+    let action_id = live_ack["action_id"].as_u64().expect("action_id on ack");
+    assert!(live_ack["expected_duration_s"].as_f64().unwrap_or(0.0) > 0.0);
+
+    // Wait for lossless terminal observation on the WebSocket stream with holding == true!
+    let terminal = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let text = ws.next().await.unwrap().unwrap().into_text().unwrap();
+            let v: Value = serde_json::from_str(&text).unwrap();
+            if v.get("type").is_none() {
+                if let Some(a) = v.get("action").filter(|a| !a.is_null()) {
+                    if a["id"].as_u64() == Some(action_id) && a["state"] != "running" {
+                        return a.clone();
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for lossless WS adaptive grasp terminal");
+    assert_eq!(terminal["state"], json!("done"), "{terminal}");
+    assert_eq!(terminal["holding"], json!(true), "{terminal}");
+    assert_eq!(
+        sup.hub().latest().unwrap().rt.owner.held.map(|h| h.label.as_str().to_string()),
+        Some("banana".to_string())
+    );
+
+    srv.abort();
+    handle.stop_and_join();
+}
+
+// ============================================================================
+// 10. Verify Companion SDK Doc Request Example Through Actual `armd` Parsers
+// ============================================================================
+
+#[test]
+fn phase_b_sdk_doc_request_example_parses_cleanly() {
+    let doc = include_str!("../docs/grasp_phase_b_sdk.md");
+    let start = doc.find("```json\n").expect("docs/grasp_phase_b_sdk.md must contain a ```json example");
+    let rest = &doc[start + "```json\n".len()..];
+    let end = rest.find("\n```").expect("closing ``` fence");
+    let raw_json = &rest[..end];
+    let body: Value = serde_json::from_str(raw_json).expect("valid JSON request example");
+
+    let req = grasp::parse_grasp(&body, &GraspSetup::default()).expect("parse_grasp must accept doc example");
+    assert_eq!(req.label, "banana");
+    assert_eq!(req.frame_id, Some(7));
+    assert_eq!(grasp_select::parse_strategy(&body).unwrap(), Strategy::Adaptive);
+    let ev = grasp_select::snapshot::parse_evidence(&body).expect("parse_evidence must accept doc example");
+    assert_eq!(ev.contour_norm.as_ref().map(Vec::len), Some(4));
+    assert_eq!(ev.height_m, Some([0.032, 0.038]));
+    assert_eq!(ev.payload_kg, Some(0.15));
+    let prefs = grasp_select::snapshot::parse_preferences(&body).expect("parse_preferences must accept doc example");
+    assert_eq!(prefs.approach_side, grasp_select::snapshot::Side::Any);
+    assert_eq!(prefs.preferred_max_tilt_deg, Some(45.0));
+    assert_eq!(prefs.hard_max_tilt_deg, Some(70.0));
+    assert_eq!(grasp_select::snapshot::parse_budget(&body).unwrap(), 500);
 }

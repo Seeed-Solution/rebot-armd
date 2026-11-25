@@ -11,7 +11,7 @@
 
 mod common;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -138,6 +138,8 @@ struct ZeroAllocDriver {
     reject_writes: Arc<AtomicBool>,
     has_torque_feedback: bool,
     pos_force_close_speed: Option<f32>,
+    pf_target_count: Arc<AtomicUsize>,
+    pf_hold_count: Arc<AtomicUsize>,
 }
 
 impl ZeroAllocDriver {
@@ -154,6 +156,8 @@ impl ZeroAllocDriver {
             reject_writes: Arc::new(AtomicBool::new(false)),
             has_torque_feedback: true,
             pos_force_close_speed: None,
+            pf_target_count: Arc::new(AtomicUsize::new(0)),
+            pf_hold_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -237,7 +241,35 @@ impl ArmDriver for ZeroAllocDriver {
             joint: 6,
             active: true,
             close_speed_rad_s: s,
-            ceiling_torque_estimate_nm: None,
+            ceiling_torque_estimate_nm: Some(1.5),
+        })
+    }
+    fn pos_force_feedback_fresh(&self) -> bool { true }
+    fn pos_force_last_fresh_position(&self) -> Option<f32> { self.q.get(6).copied() }
+    fn emit_pos_force_j7(
+        &mut self,
+        intent: armd::driver::PosForceIntent,
+        current: armd::driver::PosForceIntentStamp,
+    ) -> Result<armd::driver::PosForceEmitOutcome, ArmDriverError> {
+        if self.pos_force_close_speed.is_none() {
+            return Ok(armd::driver::PosForceEmitOutcome::NotApplicable);
+        }
+        let stale = intent.stamp.is_stale_against(current);
+        match intent.kind {
+            armd::driver::PosForceIntentKind::Target { position, .. } if !stale => {
+                self.pf_target_count.fetch_add(1, Ordering::Relaxed);
+                if self.q.len() > 6 {
+                    self.q[6] = position;
+                }
+            }
+            _ => {
+                self.pf_hold_count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Ok(armd::driver::PosForceEmitOutcome::Sent {
+            joint: 6,
+            freeze: false,
+            pf_status: armd::driver::PosForceTxStatus::Fresh,
         })
     }
     fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
@@ -1583,7 +1615,10 @@ fn b2_r2_m5_1000_refused_rt_gripper_installs_preserve_learning_pool_and_are_zero
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn phase_b_adaptive_macro_fenced_and_j7_locked_is_zero_alloc_on_rt() {
     let clock = ScriptedClock::new();
-    let drv = ZeroAllocDriver::new(&INSPECT, clock.clone());
+    let mut drv = ZeroAllocDriver::new(&INSPECT, clock.clone());
+    drv.pos_force_close_speed = Some(2.0);
+    let pf_targets = Arc::clone(&drv.pf_target_count);
+    let pf_holds = Arc::clone(&drv.pf_hold_count);
     let sup = Arc::new(
         ArmSupervisor::new(ArmConfig {
             collision: None,
@@ -1629,9 +1664,14 @@ async fn phase_b_adaptive_macro_fenced_and_j7_locked_is_zero_alloc_on_rt() {
     let rev_gc = snap.env.gripper_calib_revision;
     let rev_pb = snap.env.power_budget_revision;
     let j7_locked_val = snap.commanded_positions[6];
+    pf_targets.store(0, Ordering::Relaxed);
+    pf_holds.store(0, Ordering::Relaxed);
 
-    // 1) BeginMacro with all 5 revisions fenced
-    let mut begin = BeginMacroSpec::new(MacroKind::Grasp, boot);
+    // 1) Adaptive BeginMacro with `j7_intent_only = true`, start fence, and all 5 revisions
+    let mut begin = BeginMacroSpec::new(MacroKind::Grasp, boot)
+        .with_start(&snap.commanded_positions)
+        .unwrap();
+    begin.j7_intent_only = true;
     begin.check_workspace_revision = true;
     begin.calibration_revision = Some(rev_cal);
     begin.grasp_setup_revision = Some(rev_gs);
@@ -1651,7 +1691,7 @@ async fn phase_b_adaptive_macro_fenced_and_j7_locked_is_zero_alloc_on_rt() {
             Submit::Action(ActionSubmit::BeginMacro(begin)),
         )
         .unwrap();
-    clock.run_steps(period_ns, 2);
+    clock.run_steps(period_ns, 4);
     let reps = drain(&handle);
     let parent = reps
         .iter()
@@ -1660,6 +1700,8 @@ async fn phase_b_adaptive_macro_fenced_and_j7_locked_is_zero_alloc_on_rt() {
             _ => None,
         })
         .expect("fenced BeginMacro ACK");
+    assert_eq!(pf_targets.load(Ordering::Relaxed), 0, "BeginMacro(j7_intent_only) must emit 0 PosForce Target");
+    assert!(pf_holds.load(Ordering::Relaxed) >= 4, "BeginMacro(j7_intent_only) must emit PosForce Hold");
     assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO, "fenced BeginMacro must be 0-alloc");
 
     // 2) Swept-joint verbatim JointPath child with `lock_j7_hold: true` + all 5 revisions
@@ -1726,9 +1768,10 @@ async fn phase_b_adaptive_macro_fenced_and_j7_locked_is_zero_alloc_on_rt() {
     }
     let reps = drain(&handle);
     assert!(reps.iter().any(|r| matches!(r, Reply::Ack { request, .. } if *request == r_c1)), "{reps:?}");
+    assert_eq!(pf_targets.load(Ordering::Relaxed), 0, "arm-only child & inter-child gap must emit 0 PosForce Target");
     assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO, "lock_j7_hold swept-joint child must be 0-alloc");
 
-    // 3) Fenced J7 gripper child with all 5 revisions
+    // 3) Fenced J7 gripper child with all 5 revisions (ONLY here may PosForce Target fire!)
     let snap = latest_snap(&sup, clock.now() + DEFAULT_ACTION_DEADLINE);
     let c2_spec = ChildSpec {
         ticket: ChildTicket { parent, child_seq: 2 },
@@ -1775,6 +1818,7 @@ async fn phase_b_adaptive_macro_fenced_and_j7_locked_is_zero_alloc_on_rt() {
     clock.run_steps(period_ns, 200);
     let reps = drain(&handle);
     assert!(reps.iter().any(|r| matches!(r, Reply::Ack { request, .. } if *request == r_c2)), "{reps:?}");
+    assert!(pf_targets.load(Ordering::Relaxed) >= 1, "GripperMotion child must emit PosForce Target");
     assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO, "fenced gripper child must be 0-alloc");
 
     // 4a) FinishMacro(Done, HeldUpdate::Set) with STALE grasp_setup_revision -> refused PLAN_STALE,
