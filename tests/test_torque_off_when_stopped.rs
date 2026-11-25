@@ -10718,3 +10718,152 @@ fn review_fix_damiao_failed_repeat_passes_never_confirm_and_retry_wouldblock() {
         );
     }
 }
+
+/// Regression: when the oldest K=3 rest-pose sample ages out (> 100 ms) between Damiao repeat
+/// pass 1 and pass 2 on an otherwise-silent bus, `poll_disable` probes with read-only `0x7FF 0xCC`
+/// (`TxKind::DisableProbe`) and completes all `DAMIAO_DISABLE_REPEATS` passes at rest, while
+/// refusing immediately with `TorqueOffWouldDrop` if the probe reports a non-rest pose.
+#[test]
+fn review_fix_damiao_repeat_pass_probes_aged_out_k3_window_and_refuses_non_rest() {
+    use std::sync::atomic::AtomicBool;
+    use armd::driver::{
+        ArmDriver, ArmDriverError, DamiaoArmDriver, DisableKind, RestPoseGateStatus,
+        StoppedDisableGate, DAMIAO_DISABLE_REPEATS,
+    };
+    use armd::protocol::damiao;
+    use armd::transport::{CanFrame, CanTransport, DriverClock, MockClock, TransportError};
+
+    #[derive(Clone)]
+    struct ProbeRepeatCan {
+        clock: MockClock,
+        rx: Arc<std::sync::Mutex<std::collections::VecDeque<(CanFrame, Instant)>>>,
+        motor_pos: Arc<std::sync::Mutex<f32>>,
+        disable_tx: Arc<std::sync::atomic::AtomicUsize>,
+        probe_tx: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl ProbeRepeatCan {
+        fn make_fb(&self, id: u8) -> CanFrame {
+            let pos = *self.motor_pos.lock().unwrap();
+            let mut data = [0u8; 8];
+            data[0] = (1 << 4) | (id & 0x0F);
+            let p_raw = damiao::float_to_uint(pos, -12.5, 12.5, 16);
+            let v_raw = damiao::float_to_uint(0.0, -45.0, 45.0, 12);
+            let t_raw = damiao::float_to_uint(0.0, -18.0, 18.0, 12);
+            data[1] = (p_raw >> 8) as u8;
+            data[2] = (p_raw & 0xFF) as u8;
+            data[3] = (v_raw >> 4) as u8;
+            data[4] = (((v_raw & 0x0F) << 4) | ((t_raw >> 8) & 0x0F)) as u8;
+            data[5] = (t_raw & 0xFF) as u8;
+            data[6] = 30;
+            data[7] = 30;
+            CanFrame::new_standard(0x10 + u16::from(id), &data).unwrap()
+        }
+        fn push_all(&self) {
+            let now = self.clock.now();
+            let mut q = self.rx.lock().unwrap();
+            for id in [1u8, 2u8] {
+                q.push_back((self.make_fb(id), now));
+            }
+        }
+    }
+    impl CanTransport for ProbeRepeatCan {
+        fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
+            if frame.data == damiao::CMD_DISABLE {
+                self.disable_tx.fetch_add(1, Ordering::SeqCst);
+                let id = frame.id as u8;
+                self.rx.lock().unwrap().push_back((self.make_fb(id), self.clock.now()));
+            } else if frame.id == 0x7FF && frame.data[2] == 0xCC {
+                self.probe_tx.fetch_add(1, Ordering::SeqCst);
+                let id = u16::from_le_bytes([frame.data[0], frame.data[1]]) as u8;
+                self.rx.lock().unwrap().push_back((self.make_fb(id), self.clock.now()));
+            }
+            Ok(())
+        }
+        fn receive(&mut self) -> Result<CanFrame, TransportError> {
+            self.rx
+                .lock()
+                .unwrap()
+                .pop_front()
+                .map(|(f, _)| f)
+                .ok_or(TransportError::WouldBlock)
+        }
+        fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<Instant>), TransportError> {
+            self.rx
+                .lock()
+                .unwrap()
+                .pop_front()
+                .map(|(f, t)| (f, Some(t)))
+                .ok_or(TransportError::WouldBlock)
+        }
+        fn flush(&mut self) -> Result<(), TransportError> { Ok(()) }
+        fn clock(&self) -> Option<Arc<dyn DriverClock>> { Some(Arc::new(self.clock.clone())) }
+        fn supports_nonblocking_rt(&self) -> bool { true }
+    }
+
+    let build = |move_to_non_rest_after_pass1: bool| {
+        let clock = MockClock::new();
+        let motor_pos = Arc::new(std::sync::Mutex::new(0.0f32));
+        let disable_tx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe_tx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let can = ProbeRepeatCan {
+            clock: clock.clone(),
+            rx: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            motor_pos: motor_pos.clone(),
+            disable_tx: disable_tx.clone(),
+            probe_tx: probe_tx.clone(),
+        };
+        let mut drv = DamiaoArmDriver::new(can.clone(), vec![1, 2]);
+        let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+        arm_joints[0] = 0;
+        arm_joints[1] = 1;
+        drv.set_stopped_disable_gate(StoppedDisableGate {
+            safety_stopped: Arc::new(AtomicBool::new(true)),
+            has_resting_pose: true,
+            arm_joints,
+            arm_joints_len: 2,
+            rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+            rest_pose_tolerance_rad: 0.05,
+        });
+        drv.read_joint_states().unwrap();
+        // Samples at t = 0, 40, 82 ms: confirmed at t = 82 ms, but oldest sample ages out at t = 102 ms
+        // right when repeat pass 2 fires (82 + 20 = 102 ms)!
+        for (rel, dt_ms) in [(1u64, 0u64), (2, 40), (3, 42)] {
+            if dt_ms > 0 {
+                clock.advance(Duration::from_millis(dt_ms));
+            }
+            drv.begin_control_release(rel);
+            can.push_all();
+            drv.read_joint_states().unwrap();
+        }
+        assert_eq!(drv.rest_pose_gate_status(), RestPoseGateStatus::Confirmed);
+        if move_to_non_rest_after_pass1 {
+            // Switch position to raised after Pass 1 completes and its replies are drained at rel 3;
+            // at t = 102 ms (rel 4), oldest sample (0 ms) ages out -> Pass 2 probes and sees raised!
+            let _ = drv.begin_disable_torque(DisableKind::DisableRequested { started_at: clock.now() }).unwrap();
+            let _ = drv.poll_torque(clock.now() + Duration::from_millis(5)).unwrap();
+            assert_eq!(disable_tx.load(Ordering::SeqCst), 2);
+            *motor_pos.lock().unwrap() = 0.50;
+            clock.advance(Duration::from_millis(20)); // t = 102 ms -> oldest sample aged out
+            drv.begin_control_release(4);
+            let err = drv.poll_torque(clock.now() + Duration::from_millis(5)).unwrap_err();
+            assert!(
+                matches!(err, ArmDriverError::TorqueOffWouldDrop),
+                "probe seeing non-rest pose on repeat pass 2 must refuse immediately: {err:?}"
+            );
+            assert!(probe_tx.load(Ordering::SeqCst) > 0, "expected DisableProbe on aged-out pass 2");
+            assert_eq!(disable_tx.load(Ordering::SeqCst), 2, "zero pass-2 disable frames after non-rest probe");
+        } else {
+            drv.disable_torque(DisableKind::DisableRequested { started_at: clock.now() })
+                .expect("blocking disable must probe aged-out K=3 window on pass 2 and complete");
+            assert!(probe_tx.load(Ordering::SeqCst) > 0, "expected DisableProbe when oldest sample aged out");
+            assert_eq!(
+                disable_tx.load(Ordering::SeqCst),
+                2 * usize::from(DAMIAO_DISABLE_REPEATS),
+                "all DAMIAO_DISABLE_REPEATS passes must transmit after probe refreshes K=3 window"
+            );
+        }
+    };
+
+    build(false);
+    build(true);
+}
