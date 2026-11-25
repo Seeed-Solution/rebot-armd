@@ -175,6 +175,13 @@ fn start_blackbox(supervisor: &ArmSupervisor, cli_dir: Option<&str>, system: &ar
         .and_then(|rec| diagnostics::blackbox::open(&dir, rec.boot, started).map(|bb| (rec, bb)));
     match result {
         Ok((rec, bb)) => {
+            #[cfg(not(target_arch = "wasm32"))]
+            let bb = {
+                if let Err(e) = supervisor.torque_shadow_hub().attach_blackbox_dir(&dir, rec.boot, started) {
+                    warn!("Torque shadow blackbox {} unavailable ({e})", dir.display());
+                }
+                bb.with_shadow_atomics(supervisor.torque_shadow_overflow_atomics())
+            };
             info!("Previous start: {}", diagnostics::boot::summary(&rec));
             info!("Black box recording to {} (boot {})", dir.display(), rec.boot);
             if let Err(e) = diagnostics::blackbox::spawn_recorder(supervisor, bb) {
@@ -463,7 +470,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rt_owner = armd::rt_core::executor::RtOwner::from_env()?;
     armd::rt_core::executor::validate_startup_owner(rt_owner, follower)?;
     let config = resolve_follower_config(follower, cli.config.as_deref())?;
-    let config = apply_cli_tool(config, cli.tool.as_deref())?;
+    let mut config = apply_cli_tool(config, cli.tool.as_deref())?;
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let shadow_env = std::env::var(armd::torque::shadow::ENV_TORQUE_SHADOW).ok();
+        config.torque_shadow_enabled = armd::torque::shadow::resolve_shadow_enabled(
+            config.torque_shadow_enabled,
+            shadow_env.as_deref(),
+        )?;
+    }
     config.validate_step1_driver_parity(follower)?;
     if follower == "mock" && cli.follower_port.is_some() {
         return Err("--follower-port requires a hardware follower".into());

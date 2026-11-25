@@ -1192,6 +1192,8 @@ impl crate::supervisor::SupervisorInner {
         });
         let mut computed_j7_intent: Option<PosForceIntent> = None;
         let cutoff = self.active_tx_cutoff;
+        #[cfg(not(target_arch = "wasm32"))]
+        let shadow_rt = &mut self.torque_shadow;
         let res = self.driver.as_ref().and_then(|d| d.lock().ok())
             .map(|mut drv| {
                 // Resolve the J7 PosForce intent (never writing a 0x307 frame here: the tick
@@ -1281,6 +1283,8 @@ impl crate::supervisor::SupervisorInner {
                     r
                 };
                 let now = drv.clock_now();
+                #[cfg(not(target_arch = "wasm32"))]
+                shadow_rt.drain_from_driver(&mut **drv);
                 if !is_hold
                     && matches!(
                         write_res,

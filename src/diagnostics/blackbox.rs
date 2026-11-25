@@ -108,11 +108,68 @@ struct Record<'a> {
     /// Last command source: the latest action as `kind:state`.
     action: Option<String>,
     dropped: u64,
+    /// Compact torque-shadow summary; omitted when clean so baseline `bb.jsonl` lines stay identical.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    torque_shadow: Option<crate::torque::shadow::ShadowBbCompact>,
 }
 
 /// One black-box line (with the trailing newline). `boot` is armd's persisted start
 /// counter, `t_ms` the monotonic time since armd started.
 pub fn record_line(boot: u64, t_ms: u64, dropped: u64, obs: &ArmObservation) -> String {
+    record_line_with_shadow(boot, t_ms, dropped, obs, None)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn record_line_with_shadow(
+    boot: u64,
+    t_ms: u64,
+    dropped: u64,
+    obs: &ArmObservation,
+    torque_shadow: Option<crate::torque::shadow::ShadowBbCompact>,
+) -> String {
+    let record = Record {
+        boot,
+        t_ms,
+        safety_state: &obs.safety_state,
+        is_torqued: obs.is_torqued,
+        enable_state: &obs.enable_state,
+        lease_holder: &obs.lease_holder,
+        control_mode: &obs.control_mode,
+        positions: R3(&obs.positions),
+        commanded_positions: R3(&obs.commanded_positions),
+        velocities: R3(&obs.velocities),
+        torques: R3(&obs.torques),
+        temperatures: R3(&obs.temperatures),
+        residual_torques: obs.residual_torques.as_ref().map(|r| R3(r)),
+        collision: obs.collision.as_ref(),
+        feedback_valid: obs.feedback_valid,
+        feedback_age_ms: &obs.feedback_age_ms,
+        motor_errors: &obs.motor_errors,
+        motion_limit: &obs.motion_limit,
+        power: obs.power.as_ref().filter(|p| p.valid).map(|p| PowerRec {
+            a: (p.bus_a * 100.0).round() / 100.0,
+            pk: (p.peak_a * 100.0).round() / 100.0,
+            s: (p.scale * 100.0).round() / 100.0,
+            hold: p.hold,
+        }),
+        action: obs.action.as_ref().map(|a| format!("{}:{}", a.kind, a.state)),
+        dropped,
+        torque_shadow,
+    };
+    let mut line = serde_json::to_string(&record).unwrap_or_else(|_| format!("{{\"boot\":{boot},\"t_ms\":{t_ms}}}"));
+    line.push('\n');
+    line
+}
+
+#[cfg(target_arch = "wasm32")]
+fn record_line_with_shadow(
+    boot: u64,
+    t_ms: u64,
+    dropped: u64,
+    obs: &ArmObservation,
+    _torque_shadow: Option<()>,
+) -> String {
     let record = Record {
         boot,
         t_ms,
@@ -180,6 +237,8 @@ pub struct BlackBox {
     start: Instant,
     dropped: Arc<AtomicU64>,
     written: Arc<AtomicU64>,
+    #[cfg(not(target_arch = "wasm32"))]
+    shadow_atomics: Option<Arc<crate::torque::shadow::ShadowOverflowAtomics>>,
 }
 
 impl BlackBox {
@@ -204,7 +263,27 @@ impl BlackBox {
                 }
             }
         })?;
-        Ok(Self { tx, sampler: Sampler::default(), boot, start, dropped: Arc::default(), written })
+        Ok(Self {
+            tx,
+            sampler: Sampler::default(),
+            boot,
+            start,
+            dropped: Arc::default(),
+            written,
+            #[cfg(not(target_arch = "wasm32"))]
+            shadow_atomics: None,
+        })
+    }
+
+    /// Attach lock-free torque-shadow atomics so non-clean shadow state piggybacks a compact
+    /// summary onto existing `bb.jsonl` lines without displacing any primary sample.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn with_shadow_atomics(
+        mut self,
+        atomics: Arc<crate::torque::shadow::ShadowOverflowAtomics>,
+    ) -> Self {
+        self.shadow_atomics = Some(atomics);
+        self
     }
 
     /// Takes a sample of `obs` when one is due. Never blocks.
@@ -213,7 +292,17 @@ impl BlackBox {
             return Offer::Skipped;
         }
         let t_ms = now.saturating_duration_since(self.start).as_millis() as u64;
-        let line = record_line(self.boot, t_ms, self.dropped.load(Ordering::Relaxed), obs);
+        #[cfg(not(target_arch = "wasm32"))]
+        let shadow_compact = self.shadow_atomics.as_ref().and_then(|a| a.blackbox_compact());
+        #[cfg(target_arch = "wasm32")]
+        let shadow_compact = None;
+        let line = record_line_with_shadow(
+            self.boot,
+            t_ms,
+            self.dropped.load(Ordering::Relaxed),
+            obs,
+            shadow_compact,
+        );
         match self.tx.try_send((line, obs.is_torqued)) {
             Ok(()) => Offer::Queued,
             Err(_) => {

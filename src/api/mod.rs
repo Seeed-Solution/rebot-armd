@@ -286,6 +286,7 @@ pub fn create_router_full_with_sandbox(
         .route("/api/v1/sequences", get(rest::get_sequences))
         .route("/api/v1/sequences/{id}", get(rest::get_sequence))
         .route("/api/v1/action/run_sequence", post(rest::action_requires_lease))
+        .route("/api/v1/diagnostics", get(diagnostics::get_diagnostics))
         .route("/api/v1/diagnostics/boots", get(diagnostics::get_boots))
         .route("/api/v1/diagnostics/blackbox", get(diagnostics::get_blackbox))
         .route("/api/v1/diagnostics/tick", get(diagnostics::get_tick))
@@ -372,6 +373,7 @@ async fn gate_executor_owner(
                             "/api/v1/observation"
                                 | "/api/v1/observation/schema"
                                 | "/api/v1/auth/status"
+                                | "/api/v1/diagnostics"
                                 | "/api/v1/diagnostics/tick"
                                 | "/api/v1/diagnostics/boots"
                                 | "/api/v1/diagnostics/blackbox"

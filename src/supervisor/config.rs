@@ -87,10 +87,13 @@ impl SupervisorInner {
             return Err(format!("joint zero needs {} finite offsets", self.config.dof));
         }
         let old = std::mem::replace(&mut self.joint_zero_offsets, offsets.to_vec());
+        let changed = old != offsets;
         self.tracking.invalidate();
-        if old != offsets { self.calibration_revision += 1; self.refresh_effective_floor(); }
+        if changed { self.calibration_revision += 1; self.refresh_effective_floor(); }
         if let Some(d) = self.driver.as_ref() {
             let mut drv = d.lock().map_err(|_| "driver unavailable".to_string())?;
+            #[cfg(not(target_arch = "wasm32"))]
+            self.torque_shadow.drain_from_driver(&mut **drv);
             drv.set_joint_zero_offsets(offsets);
             let pos: Vec<_> = (0..self.config.dof).map(|i| drv.position_limits(i)).collect();
             drop(drv);
@@ -111,6 +114,14 @@ impl SupervisorInner {
             self.zero_convention = Default::default();
         }
         self.zero_check_pending = true;
+        #[cfg(not(target_arch = "wasm32"))]
+        if changed {
+            self.torque_shadow
+                .enqueue(crate::torque::shadow::ShadowInputKind::JointZeroRecalibrated);
+            if !self.rt_executor_owned {
+                self.flush_torque_shadow();
+            }
+        }
         Ok(())
     }
 

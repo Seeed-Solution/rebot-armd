@@ -392,13 +392,14 @@ pub enum ShadowDriverObs {
     },
 }
 
-/// Bounded inline staging ring embedded in each driver struct (zero heap allocation, zero locks).
+/// Bounded preallocated staging ring embedded in each driver struct (0 RT allocs, 0 locks).
 pub struct ShadowDriverStaging {
     enabled: bool,
     len: usize,
     dropped: u64,
     sample_seq: u64,
-    buf: [Option<ShadowDriverObs>; DRIVER_SHADOW_STAGING_CAP],
+    /// Preallocated fixed-capacity heap slice when enabled (0 bytes inline on driver stack frames).
+    buf: Box<[Option<ShadowDriverObs>]>,
 }
 
 impl Default for ShadowDriverStaging {
@@ -409,19 +410,28 @@ impl Default for ShadowDriverStaging {
 
 impl ShadowDriverStaging {
     pub fn new(enabled: bool) -> Self {
+        let buf = if enabled {
+            vec![None; DRIVER_SHADOW_STAGING_CAP].into_boxed_slice()
+        } else {
+            Vec::new().into_boxed_slice()
+        };
         Self {
             enabled,
             len: 0,
             dropped: 0,
             sample_seq: 0,
-            buf: [None; DRIVER_SHADOW_STAGING_CAP],
+            buf,
         }
     }
 
-    #[inline]
+    /// Enable or disable staging (called off-RT at driver install). Preallocates fixed buffer once.
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
-        if !enabled {
+        if enabled {
+            if self.buf.len() != DRIVER_SHADOW_STAGING_CAP {
+                self.buf = vec![None; DRIVER_SHADOW_STAGING_CAP].into_boxed_slice();
+            }
+        } else {
             self.len = 0;
             self.dropped = 0;
         }
@@ -443,7 +453,7 @@ impl ShadowDriverStaging {
         if !self.enabled {
             return;
         }
-        if self.len < DRIVER_SHADOW_STAGING_CAP {
+        if self.len < self.buf.len() {
             self.buf[self.len] = Some(obs);
             self.len += 1;
         } else {
@@ -455,13 +465,13 @@ impl ShadowDriverStaging {
     /// Resets the staging buffer cleanly with zero heap allocation.
     #[inline]
     pub fn drain_into(&mut self, out: &mut [Option<ShadowDriverObs>]) -> (usize, u64) {
-        let count = self.len.min(out.len());
+        let count = self.len.min(out.len()).min(self.buf.len());
         let overflow_from_small_out = self.len.saturating_sub(count) as u64;
-        for i in 0..count {
-            out[i] = self.buf[i].take();
+        for (dst, src) in out.iter_mut().zip(self.buf.iter_mut()).take(count) {
+            *dst = src.take();
         }
-        for i in count..self.len {
-            self.buf[i] = None;
+        for slot in self.buf.iter_mut().take(self.len).skip(count) {
+            *slot = None;
         }
         let dropped = self.dropped.saturating_add(overflow_from_small_out);
         self.len = 0;
@@ -938,6 +948,29 @@ struct ParkBinding {
     generation: u64,
 }
 
+/// Zero-cost wrapper making `rtrb::Producer<T>` `Sync` by exposing ONLY `&mut self` access.
+///
+/// SAFETY: `Producer<T>` is `Send` (for `T: Send`) and is never accessed through `&self`
+/// (shared references cannot call any method or touch the inner `Cell`), so sharing
+/// `&ExclusiveProducer<T>` across threads cannot introduce data races.
+struct ExclusiveProducer<T>(Producer<T>);
+
+// SAFETY: `ExclusiveProducer<T>` provides no `&self` access to the inner `Producer<T>`,
+// and all mutation requires `&mut self` (exclusive ownership).
+unsafe impl<T: Send> Sync for ExclusiveProducer<T> {}
+
+impl<T> ExclusiveProducer<T> {
+    #[inline]
+    fn new(tx: Producer<T>) -> Self {
+        Self(tx)
+    }
+
+    #[inline]
+    fn push(&mut self, value: T) -> Result<(), PushError<T>> {
+        self.0.push(value)
+    }
+}
+
 /// Inline shadow runtime owned by `SupervisorInner` (one per active owner).
 ///
 /// Zero heap allocations and zero locks after initialization.
@@ -945,7 +978,7 @@ pub struct ShadowRuntime {
     enabled: bool,
     owner: ShadowOwner,
     vendor: VendorKind,
-    state: TorqueState,
+    state: Box<TorqueState>,
     clock: ShadowClock,
     next_input_seq: u64,
     next_live_op_id: u64,
@@ -954,9 +987,9 @@ pub struct ShadowRuntime {
     disable_binding: DisableBinding,
     park_binding: ParkBinding,
     pending_len: usize,
-    pending_inputs: [Option<ShadowInput>; OWNER_PENDING_INPUTS_CAP],
-    driver_scratch: [Option<ShadowDriverObs>; DRIVER_SHADOW_STAGING_CAP],
-    ring_tx: Option<Producer<ShadowRecord>>,
+    pending_inputs: Box<[Option<ShadowInput>]>,
+    driver_scratch: Box<[Option<ShadowDriverObs>]>,
+    ring_tx: Option<ExclusiveProducer<ShadowRecord>>,
     overflow: Arc<ShadowOverflowAtomics>,
     /// Retained handle to the paired off-thread hub (used by direct `SupervisorInner` tests and
     /// cloned into `ArmSupervisor` at startup; never locked on RT!).
@@ -966,10 +999,10 @@ pub struct ShadowRuntime {
 }
 
 impl ShadowRuntime {
-    /// Disabled runtime with zero ring allocation (`torque_shadow_enabled = false` or `detached_shell`).
+    /// Disabled runtime with zero ring/buffer allocation (`torque_shadow_enabled = false` or `detached_shell`).
     pub fn disabled(cfg: &ArmConfig) -> Self {
         let tc = torque_config_from_arm_config(cfg, VendorKind::Damiao, false);
-        let state = TorqueState::new(tc).expect("valid derived TorqueConfig");
+        let state = Box::new(TorqueState::new(tc).expect("valid derived TorqueConfig"));
         Self {
             enabled: false,
             owner: ShadowOwner::Legacy,
@@ -983,8 +1016,8 @@ impl ShadowRuntime {
             disable_binding: DisableBinding::default(),
             park_binding: ParkBinding::default(),
             pending_len: 0,
-            pending_inputs: [None; OWNER_PENDING_INPUTS_CAP],
-            driver_scratch: [None; DRIVER_SHADOW_STAGING_CAP],
+            pending_inputs: Vec::new().into_boxed_slice(),
+            driver_scratch: Vec::new().into_boxed_slice(),
             ring_tx: None,
             overflow: Arc::new(ShadowOverflowAtomics::new()),
             hub: None,
@@ -993,7 +1026,7 @@ impl ShadowRuntime {
     }
 
     /// Construct a new inline `ShadowRuntime` and its paired [`TorqueShadowHub`].
-    /// When `enabled == false`, skips `rtrb::RingBuffer` allocation completely.
+    /// When `enabled == false`, skips `rtrb::RingBuffer` and FIFO buffer allocation completely.
     pub fn new_with_hub(
         cfg: &ArmConfig,
         enabled: bool,
@@ -1012,7 +1045,7 @@ impl ShadowRuntime {
         vendor: VendorKind,
         driver_clock: Option<Arc<dyn DriverClock>>,
     ) -> (Self, Arc<TorqueShadowHub>) {
-        let state = TorqueState::new(tc).expect("valid TorqueConfig");
+        let state = Box::new(TorqueState::new(tc).expect("valid TorqueConfig"));
         let overflow = Arc::new(ShadowOverflowAtomics::new());
         if !enabled {
             let hub = Arc::new(TorqueShadowHub::disabled(Arc::clone(&overflow)));
@@ -1029,8 +1062,8 @@ impl ShadowRuntime {
                 disable_binding: DisableBinding::default(),
                 park_binding: ParkBinding::default(),
                 pending_len: 0,
-                pending_inputs: [None; OWNER_PENDING_INPUTS_CAP],
-                driver_scratch: [None; DRIVER_SHADOW_STAGING_CAP],
+                pending_inputs: Vec::new().into_boxed_slice(),
+                driver_scratch: Vec::new().into_boxed_slice(),
                 ring_tx: None,
                 overflow,
                 hub: Some(Arc::clone(&hub)),
@@ -1041,7 +1074,7 @@ impl ShadowRuntime {
         }
 
         let (tx, rx) = RingBuffer::<ShadowRecord>::new(SHADOW_RING_CAPACITY);
-        let mut consumer_state = state;
+        let mut consumer_state = state.clone();
         let has_mode_rb = has_causal_mode_readback(vendor);
         if !has_mode_rb {
             seed_state_native_modes(&mut consumer_state);
@@ -1065,9 +1098,9 @@ impl ShadowRuntime {
             disable_binding: DisableBinding::default(),
             park_binding: ParkBinding::default(),
             pending_len: 0,
-            pending_inputs: [None; OWNER_PENDING_INPUTS_CAP],
-            driver_scratch: [None; DRIVER_SHADOW_STAGING_CAP],
-            ring_tx: Some(tx),
+            pending_inputs: vec![None; OWNER_PENDING_INPUTS_CAP].into_boxed_slice(),
+            driver_scratch: vec![None; DRIVER_SHADOW_STAGING_CAP].into_boxed_slice(),
+            ring_tx: Some(ExclusiveProducer::new(tx)),
             overflow,
             hub: Some(Arc::clone(&hub)),
             injected_fault: ShadowFaultInjection::None,
@@ -1093,14 +1126,14 @@ impl ShadowRuntime {
         self.vendor = vendor;
         self.clock = ShadowClock::new(driver_clock);
         let tc = torque_config_from_arm_config(cfg, vendor, true);
-        let mut new_state = TorqueState::new(tc).expect("valid derived TorqueConfig");
+        let mut new_state = Box::new(TorqueState::new(tc).expect("valid derived TorqueConfig"));
         let has_mode_rb = has_causal_mode_readback(vendor);
         if !has_mode_rb {
             seed_state_native_modes(&mut new_state);
         }
-        self.state = new_state;
+        *self.state = *new_state;
         self.pending_len = 0;
-        for slot in &mut self.pending_inputs {
+        for slot in self.pending_inputs.iter_mut() {
             *slot = None;
         }
         self.next_input_seq = 1;
@@ -1142,7 +1175,7 @@ impl ShadowRuntime {
             .store(false, Ordering::Release);
 
         let (tx, rx) = RingBuffer::<ShadowRecord>::new(SHADOW_RING_CAPACITY);
-        self.ring_tx = Some(tx);
+        self.ring_tx = Some(ExclusiveProducer::new(tx));
         if let Some(ref hub) = self.hub {
             hub.reinit_consumer(rx, new_state, self.owner);
         }
@@ -1219,7 +1252,7 @@ impl ShadowRuntime {
             return;
         }
         let seq = self.alloc_seq();
-        if self.pending_len < OWNER_PENDING_INPUTS_CAP {
+        if self.pending_len < self.pending_inputs.len() {
             self.pending_inputs[self.pending_len] = Some(ShadowInput {
                 seq,
                 edge_instant,
@@ -1256,6 +1289,15 @@ impl ShadowRuntime {
                 .saturating_add(driver_dropped.saturating_sub(1));
             self.overflow.record_staging_loss(first_lost, driver_dropped);
         }
+    }
+
+    /// Convenience wrapper draining staged observations directly from a locked `ArmDriver`.
+    #[inline]
+    pub fn drain_from_driver(&mut self, drv: &mut dyn crate::driver::ArmDriver) {
+        if !self.enabled {
+            return;
+        }
+        self.drain_driver_staging_into_fifo(|buf| drv.drain_shadow_observations(buf));
     }
 
     /// Outer post-write boundary flush: drains `pending_inputs` in exact causal FIFO order,
@@ -2761,8 +2803,8 @@ struct TorqueShadowConsumer {
     enabled: bool,
     owner: ShadowOwner,
     rx: Option<Consumer<ShadowRecord>>,
-    state: TorqueState,
-    prev_state: TorqueState,
+    state: Box<TorqueState>,
+    prev_state: Box<TorqueState>,
     expected_seq: u64,
     first_unverifiable_seq: Option<u64>,
     overflow_logged_bb: bool,
@@ -2780,13 +2822,14 @@ struct TorqueShadowConsumer {
 impl TorqueShadowConsumer {
     fn new_disabled() -> Self {
         let tc = TorqueConfig::rebot_dm_default();
-        let state = TorqueState::new(tc).expect("valid default");
+        let state = Box::new(TorqueState::new(tc).expect("valid default"));
+        let prev_state = state.clone();
         Self {
             enabled: false,
             owner: ShadowOwner::Legacy,
             rx: None,
             state,
-            prev_state: state,
+            prev_state,
             expected_seq: 1,
             first_unverifiable_seq: None,
             overflow_logged_bb: false,
@@ -2802,13 +2845,14 @@ impl TorqueShadowConsumer {
         }
     }
 
-    fn new_enabled(rx: Consumer<ShadowRecord>, state: TorqueState, owner: ShadowOwner) -> Self {
+    fn new_enabled(rx: Consumer<ShadowRecord>, state: Box<TorqueState>, owner: ShadowOwner) -> Self {
+        let prev_state = state.clone();
         Self {
             enabled: true,
             owner,
             rx: Some(rx),
             state,
-            prev_state: state,
+            prev_state,
             expected_seq: 1,
             first_unverifiable_seq: None,
             overflow_logged_bb: false,
@@ -3003,7 +3047,7 @@ impl TorqueShadowConsumer {
             }
             ShadowRecordKind::Step => {
                 if let Some(ev) = rec.event {
-                    self.prev_state = self.state;
+                    *self.prev_state = *self.state;
                     let off_actions = step(&mut self.state, ev);
                     if let Err(v) =
                         check_invariants(&self.state, &self.prev_state, &ev, &off_actions)
@@ -3319,7 +3363,7 @@ impl TorqueShadowHub {
 
     fn enabled(
         rx: Consumer<ShadowRecord>,
-        state: TorqueState,
+        state: Box<TorqueState>,
         overflow: Arc<ShadowOverflowAtomics>,
         owner: ShadowOwner,
     ) -> Self {
@@ -3351,7 +3395,7 @@ impl TorqueShadowHub {
     pub fn reinit_consumer(
         &self,
         rx: Consumer<ShadowRecord>,
-        state: TorqueState,
+        state: Box<TorqueState>,
         owner: ShadowOwner,
     ) {
         if !self.enabled {

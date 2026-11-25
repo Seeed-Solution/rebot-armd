@@ -6873,6 +6873,7 @@ fn control_thread_main(
                         state.flush_pending_maint_reply(&core);
                         state.emit_estop_ack_if_advanced(&mut core);
                         state.drain_retired_states(&mut core, now_inst());
+                        core.flush_torque_shadow();
                         if engine.take_urgent_replies_flushed()
                             || engine.take_lifecycle_replies_flushed()
                             || engine.take_servo_closes_flushed()
@@ -6996,6 +6997,7 @@ fn control_thread_main(
                     // Wake dispatcher immediately after Window 1 publication/drain work (preserving
                     // pre-Window-2 service latency for observations, acks, and safety logs).
                     hub.wake();
+                    core.flush_torque_shadow();
 
                     let next_wake = report.poll.wake_before(release_deadline);
                     drop(_guard);
@@ -7073,6 +7075,7 @@ fn control_thread_main(
                             }
                             state.emit_estop_ack_if_advanced(&mut core);
                             state.drain_retired_states(&mut core, now_inst());
+                            core.flush_torque_shadow();
                             let _wake_tail_local =
                                 state.run_tail_alloc_probe(&state.hooks.inject_wake_tail_once);
                             report.poll.wake_before(release_deadline)

@@ -902,6 +902,9 @@ pub struct SupervisorInner {
     /// Monotonic control-release sequence counter pushed to the driver once per release so
     /// rest-pose K=3 ticks count control releases, never individual RX receive passes.
     pub(crate) control_release_seq: u64,
+    /// Inline observation-only `TorqueController` shadow runtime (zero alloc, zero lock on RT).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) torque_shadow: crate::torque::shadow::ShadowRuntime,
     /// Inline per-joint measured-position hold state (zero alloc on RT).
     pub(crate) measured_hold: driver_transitions::MeasuredHoldTracker,
     /// Inline owner-held driver snapshot refreshed whenever the owner already holds the driver
@@ -2086,7 +2089,11 @@ impl ConsumedStamps {
 }
 
 impl SupervisorInner {
-    pub fn new(mut config: ArmConfig) -> Self {
+    pub fn new(config: ArmConfig) -> Self {
+        Self::new_inner(config, true)
+    }
+
+    fn new_inner(mut config: ArmConfig, allow_shadow: bool) -> Self {
         config.validate().expect("Invalid ArmConfig: invariant violation");
         let dof = config.dof;
         let collision_policy = config.collision.unwrap_or_default();
@@ -2142,6 +2149,19 @@ impl SupervisorInner {
         let estop_state = Arc::new(crate::rt_core::urgent::EstopState::new());
         let e_stop_latched = crate::rt_core::urgent::EstopLatchView::new(estop_state.clone());
         let requested_estop_count = crate::rt_core::urgent::EstopCounterView::new(estop_state.clone());
+        #[cfg(not(target_arch = "wasm32"))]
+        let torque_shadow = if allow_shadow {
+            crate::torque::shadow::ShadowRuntime::new_with_hub(
+                &config,
+                config.torque_shadow_enabled,
+                crate::torque::VendorKind::Damiao,
+                false,
+                None,
+            )
+            .0
+        } else {
+            crate::torque::shadow::ShadowRuntime::disabled(&config)
+        };
 
         let mut inner = Self {
             config,
@@ -2160,6 +2180,8 @@ impl SupervisorInner {
             enable_lifecycle: driver_transitions::EnableLifecycle::Disarmed,
             torque_intent: driver_transitions::TorqueIntent::Off,
             control_release_seq: 0,
+            #[cfg(not(target_arch = "wasm32"))]
+            torque_shadow,
             measured_hold: driver_transitions::MeasuredHoldTracker::new(dof),
             owner_driver_snapshot: driver_transitions::OwnerDriverSnapshot::new(dof),
             background_disable_retry: None,
@@ -2532,7 +2554,7 @@ impl SupervisorInner {
         atomic_fenced_lease_gen: Arc<AtomicU64>,
         pending_disconnect_hold: Arc<AtomicU64>,
     ) -> Self {
-        let mut shell = Self::new(config.clone());
+        let mut shell = Self::new_inner(config.clone(), false);
         shell.e_stop_latched = crate::rt_core::urgent::EstopLatchView::new(estop_state.clone());
         shell.requested_estop_count = crate::rt_core::urgent::EstopCounterView::new(estop_state.clone());
         shell.estop_state = estop_state;
@@ -5011,6 +5033,18 @@ impl SupervisorInner {
         self.shutdown_committed = true;
         self.estop_state.latch();
         self.stop_motion();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.torque_shadow
+                .enqueue(crate::torque::shadow::ShadowInputKind::ProcessExit {
+                    live_intent: self.shadow_live_intent(),
+                    live_is_torqued: self.is_torqued,
+                    live_stopped: self.safety.state().is_stopped(),
+                });
+            if !self.rt_executor_owned {
+                self.flush_torque_shadow();
+            }
+        }
         true
     }
 
@@ -5911,7 +5945,57 @@ impl SupervisorInner {
         self.driver_feedback_confirmed_cached = driver.is_feedback_valid();
         self.refresh_owner_driver_snapshot_from_ref(driver.as_ref());
         self.torque_intent = crate::supervisor::TorqueIntent::On;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            driver.set_shadow_enabled(self.torque_shadow.is_enabled());
+            self.torque_shadow.reinit_for_driver(
+                &self.config,
+                driver.shadow_vendor_kind(),
+                driver.driver_clock(),
+            );
+            self.torque_shadow.drain_from_driver(&mut *driver);
+            self.torque_shadow.flush_deferred_steps();
+        }
         self.driver = Some(std::sync::Mutex::new(driver));
+    }
+
+    /// Flush all pending shadow reducer steps and emit compact SPSC records (outer post-write boundary only).
+    #[inline]
+    pub(crate) fn flush_torque_shadow(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.torque_shadow.flush_deferred_steps();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[inline]
+    pub(crate) fn shadow_live_intent(&self) -> crate::torque::TorqueIntent {
+        match self.torque_intent {
+            crate::supervisor::TorqueIntent::On => crate::torque::TorqueIntent::On,
+            crate::supervisor::TorqueIntent::Off => crate::torque::TorqueIntent::Off,
+        }
+    }
+
+    /// Test-only shadow fault injection setter on `SupervisorInner` (never exposed via HTTP/WS/CLI/env/JSON).
+    #[cfg(not(target_arch = "wasm32"))]
+    #[doc(hidden)]
+    pub fn test_set_torque_shadow_fault(&mut self, fault: crate::torque::shadow::ShadowFaultInjection) {
+        self.torque_shadow.set_injected_fault(fault);
+    }
+
+    /// Test-only synchronous flush + drain on `SupervisorInner`.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[doc(hidden)]
+    pub fn test_flush_and_drain_torque_shadow(&mut self) {
+        self.torque_shadow.flush_and_drain_sync();
+    }
+
+    /// Read current torque shadow diagnostics from `SupervisorInner`'s paired hub.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn torque_shadow_diagnostics(&self) -> crate::torque::shadow::TorqueShadowDiagnostics {
+        self.torque_shadow.hub().map_or_else(
+            || crate::torque::shadow::TorqueShadowDiagnostics::disabled(self.torque_shadow.owner()),
+            |h| h.snapshot(),
+        )
     }
 
     /// Lock-free Step-2 cached hardware feedback confirmation (`false` when driverless, lock failed,
@@ -6745,7 +6829,7 @@ impl SupervisorInner {
                 Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
                 Err(std::sync::TryLockError::WouldBlock) => return,
             };
-            Self::emit_and_merge_pos_force_j7(
+            let out = Self::emit_and_merge_pos_force_j7(
                 &mut **drv,
                 j7_is_hold,
                 intent,
@@ -6753,7 +6837,10 @@ impl SupervisorInner {
                 cutoff,
                 tick_output,
                 allow_output_accepted,
-            )
+            );
+            #[cfg(not(target_arch = "wasm32"))]
+            self.torque_shadow.drain_from_driver(&mut **drv);
+            out
         };
         if j7_is_hold {
             if let Some((joint, status)) = hold_update {
@@ -7230,6 +7317,14 @@ impl SupervisorInner {
         release_deadline: Option<Instant>,
     ) -> crate::rt_core::ops::HardwarePoll {
         self.control_release_seq = self.control_release_seq.wrapping_add(1).max(1);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.torque_shadow
+            .enqueue(crate::torque::shadow::ShadowInputKind::Release {
+                release_seq: self.control_release_seq,
+                live_intent: self.shadow_live_intent(),
+                live_is_torqued: self.is_torqued,
+                live_stopped: self.safety.state().is_stopped(),
+            });
         let was_thermal_active = self.thermal_protection_active();
         // Install the release publish-margin TX cap BEFORE enable-transition polling, background
         // disable polling, and RX feedback intake so every TX in Step 2 obeys the same cutoff.
@@ -7617,6 +7712,8 @@ impl SupervisorInner {
                         self.config.dof,
                         &mut **driver,
                     );
+                    #[cfg(not(target_arch = "wasm32"))]
+                    self.torque_shadow.drain_from_driver(&mut **driver);
                 }
                 Some(Err(())) => {
                     self.feedback_numeric_valid = false;
@@ -7630,7 +7727,39 @@ impl SupervisorInner {
         } else {
             // Driverless simulation mode: each control tick produces a fresh joint sample.
             self.driver_feedback_confirmed_cached = false;
-            self.core.simulate_feedback(self.config.dof, Instant::now());
+            let sim_now = Instant::now();
+            self.core.simulate_feedback(self.config.dof, sim_now);
+            #[cfg(not(target_arch = "wasm32"))]
+            if self.torque_shadow.is_enabled() {
+                let n = self.config.dof.min(crate::torque::MAX_CHANNELS);
+                for ch in 0..n {
+                    let pos = self.measured_positions.get(ch).copied().unwrap_or(0.0);
+                    let vel = self.measured_velocities.get(ch).copied();
+                    let temp = self.temperatures.get(ch).copied();
+                    self.torque_shadow.enqueue_at(
+                        sim_now,
+                        crate::torque::shadow::ShadowInputKind::DriverObs(
+                            crate::torque::shadow::ShadowDriverObs::CausalSample {
+                                channel: ch as u8,
+                                sample_id: self.control_release_seq.saturating_mul(64).saturating_add(ch as u64 + 1),
+                                stamp: crate::torque::shadow::RxStampKind::Valid {
+                                    rx_at: sim_now,
+                                    drift_ns: 0,
+                                    live_post_settle: true,
+                                },
+                                decode_now: sim_now,
+                                position_rad: pos,
+                                velocity_rad_s: vel,
+                                temperature_c: temp,
+                                reported_enabled: Some(self.is_torqued),
+                                correlated_after_write_done: None,
+                                poll_issued: None,
+                                provenance: crate::torque::shadow::EvidenceProvenance::MockSynthetic,
+                            },
+                        ),
+                    );
+                }
+            }
             self.joint_feedback_queue_bounds.clear();
             out.bus_feedback_fresh = true;
         }
@@ -7805,6 +7934,14 @@ impl SupervisorInner {
             std::mem::take(&mut self.pending_rx_poll)
         } else {
             self.control_release_seq = self.control_release_seq.wrapping_add(1).max(1);
+            #[cfg(not(target_arch = "wasm32"))]
+            self.torque_shadow
+                .enqueue(crate::torque::shadow::ShadowInputKind::Release {
+                    release_seq: self.control_release_seq,
+                    live_intent: self.shadow_live_intent(),
+                    live_is_torqued: self.is_torqued,
+                    live_stopped: self.safety.state().is_stopped(),
+                });
             if self.has_non_broker_torque_transition() {
                 let now = Instant::now();
                 let budget = crate::rt_core::ops::ServiceBudget {
@@ -9542,6 +9679,8 @@ impl SupervisorInner {
                                     r
                                 };
                                 tick_output = Self::tick_output_from_driver_write(&mut **driver, is_hold, write_res);
+                                #[cfg(not(target_arch = "wasm32"))]
+                                self.torque_shadow.drain_from_driver(&mut **driver);
                                 if matches!(tick_output, TickOutput::Complete { is_hold: false, .. }) {
                                     allow_output_accepted = true;
                                 }
@@ -10203,6 +10342,10 @@ impl SupervisorInner {
                 drv.set_tx_release_deadline(None);
             }
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        if !self.rt_executor_owned {
+            self.flush_torque_shadow();
+        }
 
         timestamp
     }
@@ -10657,6 +10800,9 @@ pub struct ArmSupervisor {
     /// Off-thread bounded WS connection slot pool (`MAX_LIVE_CONNECTIONS = 64`), enforcing the
     /// fail-closed cap before allocating a monotonic connection ID and before touching any owner.
     ws_slots: Arc<WsConnectionSlotPool>,
+    /// Off-thread `TorqueController` shadow comparator/diagnostics hub (never locked on RT).
+    #[cfg(not(target_arch = "wasm32"))]
+    torque_shadow: Arc<crate::torque::shadow::TorqueShadowHub>,
     /// Unique identifier for this daemon/supervisor instance (changes across restarts).
     instance_id: String,
     /// Guards off-lock legacy watchdog park planning against concurrent duplicate spawns.
@@ -10938,6 +11084,12 @@ impl ArmSupervisor {
         let policy_backend_permits = Arc::new(tokio::sync::Semaphore::new(2));
         let terminals = Arc::new(TerminalBroadcaster::default());
         let mut inner = SupervisorInner::new(config);
+        #[cfg(not(target_arch = "wasm32"))]
+        let torque_shadow = inner
+            .torque_shadow
+            .hub()
+            .cloned()
+            .expect("SupervisorInner::new always pairs a TorqueShadowHub");
         inner.estop_state = estop_state.clone();
         inner.e_stop_latched = e_stop_latched.clone();
         inner.requested_estop_count = requested_estop_count.clone();
@@ -11025,6 +11177,8 @@ impl ArmSupervisor {
             template_obs,
             legacy_loop_stats: std::sync::Mutex::new(None),
             ws_slots: Arc::new(WsConnectionSlotPool::new()),
+            #[cfg(not(target_arch = "wasm32"))]
+            torque_shadow,
             instance_id,
             watchdog_park_planning: Arc::new(AtomicBool::new(false)),
             executor_hover_jobs: std::sync::Mutex::new(Vec::new()),
@@ -11478,7 +11632,15 @@ impl ArmSupervisor {
             self.atomic_fenced_lease_gen.clone(),
             self.pending_disconnect_hold.clone(),
         );
-        let real = std::mem::replace(&mut *guard, shell);
+        let mut real = std::mem::replace(&mut *guard, shell);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            real.torque_shadow
+                .set_owner(crate::torque::shadow::ShadowOwner::Executor);
+            if let Err(e) = self.torque_shadow.start_worker() {
+                tracing::warn!("Failed to start torque shadow worker thread on executor handoff: {e}");
+            }
+        }
 
         match crate::rt_core::executor::spawn_executor(
             real,
@@ -11510,6 +11672,10 @@ impl ArmSupervisor {
             }
             Err((Some(real), msg)) => {
                 *guard = *real;
+                #[cfg(not(target_arch = "wasm32"))]
+                guard
+                    .torque_shadow
+                    .set_owner(crate::torque::shadow::ShadowOwner::Legacy);
                 let _ = self.drain_pending_disconnects_under_guard(&mut guard, None);
                 guard.purge_closed_live_connections();
                 restore_legacy(&mut rollback);
@@ -11850,7 +12016,31 @@ impl ArmSupervisor {
             .spawn(move || dispatch_loop(&hub, &tx, &terminals, &sinks, &tick_stats, &template_obs))
             .map_err(|e| ArmError::Internal(format!("cannot start the observation dispatcher thread: {e}")))?;
         self.hub.set_dispatcher(handle.thread().clone());
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Err(e) = self.torque_shadow.start_worker() {
+            tracing::warn!("Failed to start torque shadow worker thread: {e}");
+        }
         Ok(())
+    }
+
+    /// Snapshot of shadow `TorqueController` diagnostics (lock-free / off-RT; never touches RT owner).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn torque_shadow_diagnostics(&self) -> crate::torque::shadow::TorqueShadowDiagnostics {
+        self.torque_shadow.snapshot()
+    }
+
+    /// Shared handle to the off-thread shadow comparator/diagnostics hub.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn torque_shadow_hub(&self) -> &Arc<crate::torque::shadow::TorqueShadowHub> {
+        &self.torque_shadow
+    }
+
+    /// Lock-free atomic overflow/summary handle for primary `bb.jsonl` piggyback summaries.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn torque_shadow_overflow_atomics(
+        &self,
+    ) -> Arc<crate::torque::shadow::ShadowOverflowAtomics> {
+        self.torque_shadow.overflow_atomics().clone()
     }
 
     /// Test-only hook: configure per-connection bounded terminal FIFO capacity.
