@@ -2462,11 +2462,11 @@ mod tests {
 
         // 2. Cancelled internal waiter leaves tombstone that consumes late ACK; close cleans up.
         let (tx1, _rx1) = oneshot::channel();
-        router.register_internal_waiter(RequestId(10), ClientId(6000), tx1);
+        router.register_internal_waiter(RequestId(10), ClientId(8000), tx1);
         router.cancel_internal_waiter(RequestId(10));
         assert_eq!(
             router.route_broker_reply(
-                ClientId(6000),
+                ClientId(8000),
                 Reply::Ack {
                     request: RequestId(10),
                     commit_seq: 1,
@@ -2479,8 +2479,8 @@ mod tests {
         assert_eq!(router.stats().pending_unrouted, 0);
 
         let (tx2, mut rx2) = oneshot::channel();
-        router.register_internal_waiter(RequestId(11), ClientId(6001), tx2);
-        router.close_connection(ClientId(6001));
+        router.register_internal_waiter(RequestId(11), ClientId(8001), tx2);
+        router.close_connection(ClientId(8001));
         assert_eq!(router.stats().active_internal_waiters, 0);
         assert!(rx2.try_recv().is_err());
 
@@ -2488,7 +2488,7 @@ mod tests {
         router.attach_global_sink(Arc::new(|_, _| DeliveryDecision::Delivered));
         assert_eq!(
             router.route_broker_reply(
-                ClientId(6002),
+                ClientId(8002),
                 Reply::Terminal {
                     request: RequestId(12),
                     action: ActionId(7),
@@ -2504,7 +2504,7 @@ mod tests {
         // 4. In-flight unrouted reply holds global_cap so backpressure re-insert never overcommits.
         assert_eq!(
             router.route_broker_reply(
-                ClientId(6002),
+                ClientId(8002),
                 Reply::Refused {
                     request: RequestId(13),
                     code: "WRONG_TARGET",
@@ -2514,7 +2514,7 @@ mod tests {
         );
         assert_eq!(
             router.route_broker_reply(
-                ClientId(6002),
+                ClientId(8002),
                 Reply::Refused {
                     request: RequestId(14),
                     code: "WRONG_TARGET",
@@ -2527,7 +2527,7 @@ mod tests {
         // Even with 1 item popped in-flight, global_used == 2 == global_cap -> admission refused!
         assert!(matches!(
             router.check_external_admission(
-                ClientId(6002),
+                ClientId(8002),
                 ExternalDestinationPolicy::ConnectionOrGlobal
             ),
             Err(ExternalSubmitError::Admit(AdmitError::RepliesFull))
