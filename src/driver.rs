@@ -370,6 +370,21 @@ impl StoppedDisableGate {
         position.is_finite() && rest.is_finite() && (position - rest).abs() <= self.rest_pose_tolerance_rad
     }
 
+    /// True when `position` satisfies the rest-pose predicate for motor `joint` (M2):
+    /// - Arm joints (`is_arm_joint(joint)`): finite position within `rest_pose_tolerance_rad`
+    ///   of `rest_positions[joint]`.
+    /// - Non-arm motors that still receive `CMD_DISABLE` (e.g., J7 gripper): rest is defined
+    ///   as the jaw being in any finite position — K=3 fresh valid samples are still required
+    ///   by the Damiao rest-pose gate, with no pose tolerance.
+    #[inline]
+    pub fn motor_at_rest(&self, joint: usize, position: f32) -> bool {
+        if self.is_arm_joint(joint) {
+            self.joint_at_rest(joint, position)
+        } else {
+            self.has_resting_pose && position.is_finite()
+        }
+    }
+
     /// Evaluates Rule A′ pose check against fresh arm-joint positions matching `arm_joint_indices()`.
     #[inline]
     pub fn check_positions(&self, positions: &[f32]) -> bool {
@@ -6396,7 +6411,14 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             || self.is_stop_pending()
     }
 
-    /// Zero-allocation evaluation of the Damiao K=3 rest-pose evidence gate (S2/L1).
+    /// Zero-allocation evaluation of the Damiao K=3 rest-pose evidence gate (S2/L1/M2).
+    ///
+    /// Covers EVERY motor in `self.motor_ids` that receives `CMD_DISABLE`, J7 included:
+    /// - Arm joints (`gate.is_arm_joint(i)`): K=3 fresh (`<= 100 ms`) valid samples across 3
+    ///   distinct control releases within `rest_pose_tolerance_rad` of `rest_positions[i]`.
+    /// - Non-arm motors (e.g. J7 gripper, `!gate.is_arm_joint(i)`): rest is any finite jaw
+    ///   position (`gate.motor_at_rest(i, pos)`), requiring K=3 fresh (`<= 100 ms`) valid
+    ///   samples across 3 distinct control releases with no pose tolerance.
     fn evaluate_rest_pose_gate(&self) -> RestPoseGateStatus {
         let Some(ref gate) = self.stopped_disable_gate else {
             return RestPoseGateStatus::RefusedNonRest;
@@ -6404,8 +6426,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if !gate.has_resting_pose {
             return RestPoseGateStatus::RefusedNonRest;
         }
-        let arm_joints = gate.arm_joint_indices();
-        if arm_joints.is_empty() {
+        if gate.arm_joint_indices().is_empty() || self.motor_ids.is_empty() {
             return RestPoseGateStatus::RefusedNonRest;
         }
         let now = self.now();
@@ -6413,7 +6434,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let drain_incomplete = self.awaiting_rx_boundary || !self.last_read_drained;
         let mut missing_fresh = false;
         let mut window_incomplete = false;
-        for &i in arm_joints {
+        for i in 0..self.motor_ids.len() {
             let Some(s) = self.cached_states.get(i) else {
                 return RestPoseGateStatus::RefusedNonRest;
             };
@@ -6430,7 +6451,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     .flatten()
                     .is_some_and(|b| now.saturating_duration_since(b) <= STOPPED_DISABLE_FEEDBACK_MAX_AGE);
             if fresh_pose {
-                if !joint_state_valid(s, caps) || !gate.joint_at_rest(i, s.position) {
+                if !joint_state_valid(s, caps) || !gate.motor_at_rest(i, s.position) {
                     return RestPoseGateStatus::RefusedNonRest;
                 }
             } else {
@@ -10252,19 +10273,19 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if now.saturating_duration_since(started_at) >= STOPPED_DISABLE_REQUEST_LIFETIME {
             return Err(ArmDriverError::DisableRequestExpired);
         }
-        // Once RX is drained, emit spaced read-only `0x7FF 0xCC` probes for arm joints whose
-        // K=3 rest-pose window is not yet confirmed (ensuring remaining RX budget can absorb the
-        // replies without re-exhausting the drain on this tick).
+        // Once RX is drained, emit spaced read-only `0x7FF 0xCC` probes for EVERY motor that
+        // receives `CMD_DISABLE` (arm joints + J7, M2) whose K=3 rest-pose window is not yet
+        // confirmed (ensuring remaining RX budget can absorb the replies without re-exhausting
+        // the drain on this tick).
         if self.last_read_drained && !self.awaiting_rx_boundary && now >= next_probe_at {
             let mut probe_mask = 0u32;
             let mut probe_count = 0usize;
-            if let Some(ref gate) = self.stopped_disable_gate {
-                for &i in gate.arm_joint_indices() {
-                    if i < handshake::MAX_MASK_JOINTS
-                        && !self
-                            .rest_pose_window
-                            .get(i)
-                            .is_some_and(|w| w.is_confirmed(now, STOPPED_DISABLE_FEEDBACK_MAX_AGE))
+            if self.stopped_disable_gate.is_some() {
+                for i in 0..self.motor_ids.len().min(handshake::MAX_MASK_JOINTS) {
+                    if !self
+                        .rest_pose_window
+                        .get(i)
+                        .is_some_and(|w| w.is_confirmed(now, STOPPED_DISABLE_FEEDBACK_MAX_AGE))
                     {
                         probe_mask |= 1u32 << i;
                         probe_count += 1;
@@ -13614,30 +13635,31 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     RestBoundaryCheck::Satisfied => {
                         self.pose_feedback_instant[idx] = Some(rx_at);
                         if let Some(ref gate) = self.stopped_disable_gate {
-                            if gate.is_arm_joint(idx) {
-                                if !self.awaiting_rx_boundary
-                                    && queue_bound.is_some()
-                                    && joint_state_valid(&self.cached_states[idx], self.capabilities())
-                                    && gate.joint_at_rest(idx, feedback.position)
+                            // M2: Every motor that receives `CMD_DISABLE` (arm joints + J7)
+                            // accumulates K=3 fresh valid samples; arm joints enforce
+                            // `rest_pose_tolerance_rad` while J7 accepts any finite jaw position.
+                            if !self.awaiting_rx_boundary
+                                && queue_bound.is_some()
+                                && joint_state_valid(&self.cached_states[idx], self.capabilities())
+                                && gate.motor_at_rest(idx, feedback.position)
+                            {
+                                let release_id = self.control_release_id;
+                                if self.rest_pose_window[idx].record_agree(
+                                    rx_at,
+                                    release_id,
+                                    STOPPED_DISABLE_FEEDBACK_MAX_AGE,
+                                    decode_offset_ns,
+                                ) == WindowRecord::OffsetDrifted
                                 {
-                                    let release_id = self.control_release_id;
-                                    if self.rest_pose_window[idx].record_agree(
-                                        rx_at,
-                                        release_id,
-                                        STOPPED_DISABLE_FEEDBACK_MAX_AGE,
-                                        decode_offset_ns,
-                                    ) == WindowRecord::OffsetDrifted
-                                    {
-                                        let (cur_rx, cur_off) = self.capture_rx_clock_sample(decode_now);
-                                        self.rest_pose_boundary[idx] = Some(RestPoseBoundary {
-                                            write_done: decode_now,
-                                            write_done_rx_clock: Some(cur_rx),
-                                            write_done_offset_ns: cur_off,
-                                        });
-                                    }
-                                } else {
-                                    self.rest_pose_window[idx].record_disagree();
+                                    let (cur_rx, cur_off) = self.capture_rx_clock_sample(decode_now);
+                                    self.rest_pose_boundary[idx] = Some(RestPoseBoundary {
+                                        write_done: decode_now,
+                                        write_done_rx_clock: Some(cur_rx),
+                                        write_done_offset_ns: cur_off,
+                                    });
                                 }
+                            } else {
+                                self.rest_pose_window[idx].record_disagree();
                             }
                         }
                     }
