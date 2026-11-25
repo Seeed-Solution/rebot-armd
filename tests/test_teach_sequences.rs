@@ -104,16 +104,46 @@ struct Rig {
     _tmp: tempfile::TempDir,
     a: String,
     b: String,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for Rig {
+    fn drop(&mut self) {
+        for t in self.tasks.drain(..) { t.abort(); }
+    }
 }
 
 impl Rig {
     async fn new() -> Self {
+        Self::new_paced(Duration::from_millis(1)).await
+    }
+
+    async fn new_paced(tick_period: Duration) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let supervisor = Arc::new(ArmSupervisor::new(profile()));
         supervisor.set_episodes_dir(Some(tmp.path().join("episodes"))).await;
         armd::sequences::load_into(&supervisor, &tmp.path().join("sequences.json")).await;
-        let (ws, generation, epoch, sup, addr) = common::torqued_rig(supervisor, &INSPECT).await;
-        let mut rig = Rig { ws, generation, epoch, sup, addr, _tmp: tmp, a: String::new(), b: String::new() };
+        let router = armd::create_router(supervisor.clone(), armd::OperatorAuth::disabled());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+        let ticker = supervisor.clone();
+        let tick_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tick_period);
+            loop { interval.tick().await; ticker.tick(0.02).await; }
+        });
+        let (mut ws, generation) = common::controller(addr).await;
+        let epoch = supervisor.get_observation().await.epoch_id;
+        let ack = common::rpc(&mut ws, generation, epoch, "/api/v1/torque", json!({"enable": true})).await;
+        assert_eq!(ack["type"], "command_ack", "{ack}");
+        {
+            let mut inner = supervisor.inner().write().await;
+            inner.commanded_positions = INSPECT.to_vec();
+            inner.measured_positions = INSPECT.to_vec();
+            inner.target_positions = INSPECT.to_vec();
+        }
+        let epoch = supervisor.get_observation().await.epoch_id;
+        let mut rig = Rig { ws, generation, epoch, sup: supervisor, addr, _tmp: tmp, a: String::new(), b: String::new(), tasks: vec![srv, tick_task] };
         rig.a = rig.rpc("/api/v1/poses/save", json!({"name": "A", "positions": A})).await["pose"]["id"].as_str().unwrap().to_string();
         rig.b = rig.rpc("/api/v1/poses/save", json!({"name": "B", "positions": B})).await["pose"]["id"].as_str().unwrap().to_string();
         rig
@@ -136,19 +166,38 @@ impl Rig {
     }
 
     /// Polls the action until it ends; returns it and the (repeat, step) pairs seen in order.
+    /// Fails immediately if the action record is missing or mismatched.
     async fn wait(&mut self, id: u64, max_s: f64, mut each: impl FnMut(&armd::motion::ActionStatus)) -> (armd::motion::ActionStatus, Vec<(u32, usize)>) {
         let until = Instant::now() + Duration::from_secs_f64(max_s);
         let mut seen: Vec<(u32, usize)> = Vec::new();
+        let mut rx = self.sup.subscribe_telemetry().expect("telemetry subscriber");
+        let first = self.sup.get_observation().await;
+        let first_ts = first.timestamp;
+        let a = first.action.into_iter().chain(first.previous_action).find(|a| a.id == id).expect("the action");
+        if let (Some(r), Some(k)) = (a.repeat_index, a.step_index) {
+            if seen.last() != Some(&(r, k)) { seen.push((r, k)); }
+        }
+        each(&a);
+        if !a.is_running() { return (a, seen); }
+        let mut last_drain = Instant::now();
         loop {
             assert!(Instant::now() < until, "action {id} did not end in {max_s} s");
-            common::drain(&mut self.ws, 2).await;
-            let a = self.sup.inner().read().await.last_action.clone().filter(|a| a.id == id).expect("the action");
+            if last_drain.elapsed() > Duration::from_millis(100) {
+                common::drain(&mut self.ws, 1).await;
+                last_drain = Instant::now();
+            }
+            let obs = match tokio::time::timeout(Duration::from_millis(20), rx.recv()).await {
+                Ok(Ok(obs)) if obs.timestamp <= first_ts => continue,
+                Ok(Ok(obs)) => obs,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) | Err(_) => self.sup.get_observation().await,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => panic!("telemetry channel closed while waiting for action {id}"),
+            };
+            let a = obs.action.into_iter().chain(obs.previous_action).find(|a| a.id == id).expect("the action");
             if let (Some(r), Some(k)) = (a.repeat_index, a.step_index) {
                 if seen.last() != Some(&(r, k)) { seen.push((r, k)); }
             }
             each(&a);
             if !a.is_running() { return (a, seen); }
-            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
 
@@ -220,19 +269,18 @@ async fn save_validates_and_steps_run_in_order() {
     let one: Value = reqwest::get(format!("http://{}/api/v1/sequences/{sid}", rig.addr)).await.unwrap().json().await.unwrap();
     assert_eq!(one["name"], "取放 1");
 
-    let t0 = Instant::now();
     let (id, expected) = rig.run(json!({"id": sid, "tag": "t1"})).await;
+    assert!(expected > 0.0, "expected duration bound must be positive: {expected}");
     let mut kinds = Vec::new();
     let (a_done, seen) = rig.wait(id, 30.0, |a| {
         if let Some(t) = &a.step_type { if kinds.last() != Some(t) { kinds.push(t.clone()); } }
     }).await;
-    let took = t0.elapsed().as_secs_f64();
-    println!("sequence: {took:.2} s, expected bound {expected:.2} s, steps {seen:?}");
+    // Accelerated rig pacing: wall-time `took <= expected` is checked at real-time 20 ms pacing
+    // in `sequence_wall_duration_stays_within_expected_bound_at_realtime_pacing`.
     assert_eq!((a_done.state.as_str(), a_done.kind.as_str(), a_done.tag.as_deref(), a_done.failed_step), ("done", "sequence", Some("t1"), None), "{a_done:?}");
     assert_eq!(a_done.sequence_id.as_deref(), Some(sid.as_str()));
     assert_eq!(seen, vec![(0, 0), (0, 1), (0, 2), (0, 3), (0, 4)]);
     assert_eq!(kinds, vec!["pose", "gripper", "wait", "pose", "gripper"]);
-    assert!(took <= expected, "{took} > {expected}");
     let q = rig.commanded().await;
     assert!(close(&q, &B, 6), "{q:?}");
     // single step / from_step
@@ -336,18 +384,19 @@ async fn run_pins_pose_revisions_and_refuses_stale_data() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn record_saves_one_episode_per_repeat_and_discards_an_aborted_repeat() {
-    let mut rig = Rig::new().await;
+    // Episode timestamps use wall clock, so pace at 4 ms (~5x real time): each ~5.6 s repeat
+    // records > 0.5 s wall duration and > 20 frames while finishing 5x faster.
+    let mut rig = Rig::new_paced(Duration::from_millis(4)).await;
     let (a, b) = (rig.a.clone(), rig.b.clone());
     let ep = rig.episode(0.15, 0.6).await;
     let sid = rig.save("rec", json!([{"type": "pose", "pose_id": a}, {"type": "replay", "episode_id": ep, "speed": 1.0, "gripper": false},
                                      {"type": "pose", "pose_id": b}])).await;
     let before = rig.sup.episode_store().await.list_episodes(None, None, None, &[]).len();
-    let t0 = Instant::now();
     let (id, expected) = rig.run(json!({"id": sid, "repeat": 2, "record": {"dataset": "default", "task": "pick"}})).await;
+    assert!(expected > 0.0, "expected duration bound must be positive: {expected}");
     let (done, seen) = rig.wait(id, 60.0, |_| {}).await;
-    let took = t0.elapsed().as_secs_f64();
-    println!("recorded run: {took:.2} s, expected bound {expected:.1} s, seen {seen:?}");
-    assert!(took <= expected, "{took} > {expected}");
+    // Accelerated rig pacing (4 ms/tick): wall-time `took <= expected` is checked at real-time
+    // 20 ms pacing in `sequence_wall_duration_stays_within_expected_bound_at_realtime_pacing`.
     assert_eq!(done.state, "done", "{done:?}");
     assert_eq!(seen, vec![(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)]);
     assert_eq!(done.episodes.len(), 2);
@@ -369,7 +418,7 @@ async fn record_saves_one_episode_per_repeat_and_discards_an_aborted_repeat() {
     rig.sup.discard_recording().await.unwrap();
 
     // stop during the second repeat: its episode is discarded, the first is kept
-    let sid2 = rig.save("rec wait", json!([{"type": "pose", "pose_id": a}, {"type": "wait", "s": 1.0}])).await;
+    let sid2 = rig.save("rec wait", json!([{"type": "pose", "pose_id": a}, {"type": "wait", "s": 0.5}])).await;
     let (id, _) = rig.run(json!({"id": sid2, "repeat": 3, "record": {"dataset": "default"}})).await;
     let mut stopped = false;
     let until = Instant::now() + Duration::from_secs(20);
@@ -393,4 +442,32 @@ async fn record_saves_one_episode_per_repeat_and_discards_an_aborted_repeat() {
     assert_eq!(of_run[0].sidecar.repeat_index, Some(0));
     assert!(rig.sup.inner().read().await.recording.is_none(), "the aborted repeat's recording is gone");
     assert_eq!(rig.sup.get_recording_state().await.0, armd::EpisodeState::Discarded);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sequence_wall_duration_stays_within_expected_bound_at_realtime_pacing() {
+    // True 50 Hz (20 ms) real-time pacing so `took <= expected` verifies the planned wall-time
+    // duration bound across pose, gripper, wait, and replay steps without time-scale distortion.
+    let mut rig = Rig::new_paced(Duration::from_millis(20)).await;
+    let a = rig.a.clone();
+    let ep = rig.episode(0.15, 0.6).await;
+    let steps = json!([
+        {"type": "pose", "pose_id": a, "speed_scale": 1.0},
+        {"type": "gripper", "action": "move", "fraction": 0.5},
+        {"type": "wait", "s": 0.2},
+        {"type": "replay", "episode_id": ep, "speed": 1.0, "gripper": false},
+    ]);
+    let sid = rig.save("rt_bound", steps).await;
+    let t0 = Instant::now();
+    let (id, expected) = rig.run(json!({"id": sid, "tag": "rt"})).await;
+    let mut kinds = Vec::new();
+    let (done, seen) = rig.wait(id, expected + 10.0, |a| {
+        if let Some(t) = &a.step_type { if kinds.last() != Some(t) { kinds.push(t.clone()); } }
+    }).await;
+    let took = t0.elapsed().as_secs_f64();
+    println!("realtime sequence: {took:.2} s, expected bound {expected:.2} s, steps {seen:?}");
+    assert_eq!((done.state.as_str(), done.kind.as_str(), done.tag.as_deref(), done.failed_step), ("done", "sequence", Some("rt"), None), "{done:?}");
+    assert_eq!(seen, vec![(0, 0), (0, 1), (0, 2), (0, 3)]);
+    assert_eq!(kinds, vec!["pose", "gripper", "wait", "replay"]);
+    assert!(took <= expected, "{took} > {expected}");
 }

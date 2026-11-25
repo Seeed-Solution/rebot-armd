@@ -13,6 +13,50 @@ use common::INSPECT;
 
 const READY: [f32; 7] = [0.3, -0.9, -1.3, 1.2, 0.1, 1.2, -1.0];
 
+struct RigTasks(Vec<tokio::task::JoinHandle<()>>);
+
+impl Drop for RigTasks {
+    fn drop(&mut self) {
+        for t in self.0.drain(..) { t.abort(); }
+    }
+}
+
+async fn fast_torqued_rig(
+    supervisor: Arc<ArmSupervisor>,
+    q: &[f32],
+) -> (common::TestSocket, u64, u64, Arc<ArmSupervisor>, std::net::SocketAddr, RigTasks) {
+    let router = armd::create_router(supervisor.clone(), armd::OperatorAuth::disabled());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+    let ticker = supervisor.clone();
+    // Advance 50 Hz simulated trajectories at 20x wall clock while moving (keeps ~165 ms window for MOTION_BUSY).
+    let tick_task = tokio::spawn(async move {
+        loop {
+            let moving = ticker.inner().read().await.active_trajectory.is_some();
+            if moving {
+                ticker.tick(0.02).await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            } else {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                ticker.tick(0.02).await;
+            }
+        }
+    });
+    let (mut ws, generation) = common::controller(addr).await;
+    let epoch = supervisor.get_observation().await.epoch_id;
+    let ack = common::rpc(&mut ws, generation, epoch, "/api/v1/torque", json!({"enable": true})).await;
+    assert_eq!(ack["type"], "command_ack", "{ack}");
+    {
+        let mut inner = supervisor.inner().write().await;
+        inner.commanded_positions = q.to_vec();
+        inner.measured_positions = q.to_vec();
+        inner.target_positions = q.to_vec();
+    }
+    let epoch = supervisor.get_observation().await.epoch_id;
+    (ws, generation, epoch, supervisor, addr, RigTasks(vec![srv, tick_task]))
+}
+
 async fn wait_action(ws: &mut common::TestSocket, supervisor: &ArmSupervisor, generation: u64, epoch: u64, id: u64) -> armd::motion::ActionStatus {
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut last_hb = Instant::now();
@@ -20,11 +64,11 @@ async fn wait_action(ws: &mut common::TestSocket, supervisor: &ArmSupervisor, ge
         assert!(Instant::now() < deadline, "action {id} not finished");
         if last_hb.elapsed() > Duration::from_millis(200) {
             common::send(ws, json!({"type":"heartbeat", "generation":generation, "epoch_id":epoch})).await;
+            common::drain(ws, 5).await;
             last_hb = Instant::now();
         }
-        common::drain(ws, 5).await;
         if let Some(a) = supervisor.get_observation().await.action.filter(|a| a.id == id && !a.is_running()) { return a; }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
 }
 
@@ -91,7 +135,7 @@ async fn ws_save_list_move_to_pose_and_delete() {
     let path = dir.path().join("poses.json");
     let supervisor = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
     armd::poses::load_into(&supervisor, &path).await;
-    let (mut ws, generation, epoch, supervisor, addr) = common::torqued_rig(supervisor, &INSPECT).await;
+    let (mut ws, generation, epoch, supervisor, addr, _tasks) = fast_torqued_rig(supervisor, &INSPECT).await;
     let rpc = |path: &'static str, body: serde_json::Value| (path, body);
 
     // Save the measured pose (default) and an explicit one.
@@ -244,7 +288,7 @@ async fn move_to_pose_include_gripper_enforces_tool_provenance() {
     cfg_b.active_tool.commissioning_required = false;
     let sup_b = Arc::new(ArmSupervisor::new(cfg_b));
     armd::poses::load_into(&sup_b, &poses_path).await;
-    let (mut ws, generation, epoch, sup_b, _addr) = common::torqued_rig(sup_b, &INSPECT).await;
+    let (mut ws, generation, epoch, sup_b, _addr, _tasks) = fast_torqued_rig(sup_b, &INSPECT).await;
 
     // 3. move_to_pose with include_gripper: true MUST be rejected with TOOL_MISMATCH.
     let rej = common::rpc(

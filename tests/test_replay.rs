@@ -500,6 +500,17 @@ async fn wait_done(sup: &ArmSupervisor, id: u64, max_ticks: usize, mut each: imp
     done.expect("action did not finish")
 }
 
+async fn wait_done_fixed_step(sup: &ArmSupervisor, id: u64, max_ticks: usize, mut each: impl FnMut(&armd::ArmObservation)) -> armd::motion::ActionStatus {
+    let mut done = None;
+    for _ in 0..max_ticks {
+        let o = sup.tick(DT).await;
+        each(&o);
+        let a = o.action.clone().unwrap();
+        if a.id == id && !a.is_running() { done = Some(a); break; }
+    }
+    done.expect("action did not finish")
+}
+
 /// Smallest max-joint distance (J1-J6) from `q` to the polyline through `path`.
 fn path_distance(q: &[f32], path: &[Vec<f32>]) -> f32 {
     let mut best = f32::INFINITY;
@@ -527,20 +538,20 @@ async fn record_jog_save_and_replay_matches_the_recording() {
         i.target_positions = INSPECT.to_vec();
     }
     sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
-    realtime(&sup, 10, |_| {}).await;
+    realtime(&sup, 5, |_| {}).await;
 
-    // record two joint moves (peak commanded speed 1.875 * 0.4 / 2.5 = 0.30 rad/s)
+    // record two joint moves with real wall-clock timestamps (peak commanded speed 1.875 * 0.16 / 1.0 = 0.30 rad/s)
     sup.start_recording(Some("jog".into()), None).await.unwrap();
-    realtime(&sup, 10, |_| {}).await;
+    realtime(&sup, 5, |_| {}).await;
     let mut out = INSPECT.to_vec();
-    out[0] += 0.4; out[1] -= 0.2; out[4] += 0.3; out[6] = -1.0;
-    let back = { let mut b = INSPECT.to_vec(); b[0] += 0.1; b };
-    for (target, secs) in [(out, 2.5), (back, 2.0)] {
+    out[0] += 0.16; out[1] -= 0.08; out[4] += 0.12; out[6] = -0.6;
+    let back = { let mut b = INSPECT.to_vec(); b[0] += 0.04; b };
+    for (target, secs) in [(out, 1.0), (back, 0.8)] {
         let epoch = sup.get_observation().await.epoch_id;
         let (_, id, _) = { let mut i = sup.inner().write().await; let a = i.check_admission(sup.capture_admission_stamp()).unwrap(); armd::SupervisorInner::jog_action(a, target, Some(secs), Some(epoch), "joint_move") }.unwrap();
         wait_done(&sup, id, 400, |_| {}).await;
     }
-    realtime(&sup, 10, |_| {}).await;
+    realtime(&sup, 5, |_| {}).await;
     let saved = sup.save_recording().await.unwrap();
     assert_eq!(saved, tmp.path().join("jog.parquet"));
     let frames = armd::read_frames_from_parquet(&saved).unwrap();
@@ -550,13 +561,17 @@ async fn record_jog_save_and_replay_matches_the_recording() {
     assert_eq!((listed.episodes[0].id.as_str(), listed.episodes[0].frames), ("jog", frames.len()));
     println!("SIM recorded {} frames, {rec_dur:.2} s", frames.len());
 
+    // Replay advances purely by tick dt; drive LagArm with fixed DT = 20 ms (identical TAU = 50 ms physics)
+    // instead of sleeping 20 ms real time per tick.
+    arm.0.lock().unwrap().last_read = None;
+
     for speed in [0.5, 1.0] {
         let epoch = sup.get_observation().await.epoch_id;
         let (id, expected) = { let mut i = sup.inner().write().await; let a = i.check_admission(sup.capture_admission_stamp()).unwrap(); armd::SupervisorInner::start_replay(a, req("jog", speed, true), epoch) }.unwrap();
         let mut phases: Vec<String> = Vec::new();
         let (mut cmd_err, mut path_err, mut aligned_err) = (0.0f32, 0.0f32, 0.0f32);
         let mut approach_end: Option<Vec<f32>> = None;
-        let a = wait_done(&sup, id, ((expected + 3.0) / DT) as usize, |o| {
+        let a = wait_done_fixed_step(&sup, id, ((expected + 3.0) / DT) as usize, |o| {
             let a = o.action.as_ref().unwrap();
             let phase = a.phase.as_deref().unwrap_or_default().to_string();
             if phases.last() != Some(&phase) {
