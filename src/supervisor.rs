@@ -4377,8 +4377,11 @@ impl SupervisorInner {
                         ..
                     }) | Some(driver_transitions::BackgroundDisableRetry::Exhausted)
                 );
-            if !thermal_already_latched || needs_thermal_redispatch {
+            if !thermal_already_latched {
                 self.apply_stop_policy(StopPolicy::ThermalTrip);
+            } else if needs_thermal_redispatch {
+                self.thermal_cooldown.reset();
+                self.redispatch_thermal_protective_disable();
             }
         }
     }

@@ -3594,8 +3594,11 @@ fn mit_recovery_no_fence_ack_or_state_change_before_clear_check_passes() {
         );
         let temps_before = inner.temperatures.clone();
         let pos_before = inner.measured_positions.clone();
+        // Keep temperature above the reset threshold (75 - 5 = 70 C) so clear_check refuses
+        // while staying <= max_temperature (75 C) so subsequent energized ticks do not fire a
+        // new active R12 B4 thermal protective disable cut.
         bus.with(|s| {
-            s.motors[0].temperature_c = 85;
+            s.motors[0].temperature_c = 73;
             s.motors[0].q = 0.25;
         });
         bus.clear_log();

@@ -176,6 +176,44 @@ impl SupervisorInner {
         self.apply_stop_policy_in_tick(policy, true);
     }
 
+    /// Dispatches or arms `DisableProtective { Thermal }` without re-latching `ThermalTrip` or
+    /// churning `epoch_id` (R12 B4: a thermal latch must never suppress its own protective cut).
+    pub(crate) fn redispatch_thermal_protective_disable(&mut self) {
+        // Cancel any in-flight enable through the reducer before protective thermal cut
+        // takes over, preserving the thermal latch (highest severity) and protective cut.
+        self.interrupt_enable_for_thermal();
+        let already_protective = matches!(
+            self.active_disable_kind,
+            Some(crate::driver::DisableKind::DisableProtective { .. })
+        );
+        let thermal_disable = crate::driver::DisableKind::DisableProtective {
+            reason: crate::driver::DisableProtectiveReason::Thermal,
+        };
+        self.active_disable_kind = Some(thermal_disable);
+        let rt_needs_redispatch = self.rt_executor_owned
+            && self.background_disable_retry.is_none()
+            && (self.is_torqued || self.torque_intent == TorqueIntent::On)
+            && !self
+                .driver
+                .as_ref()
+                .is_some_and(|d| d.try_lock().is_ok_and(|drv| drv.torque_transition_pending()));
+        // T2 / R12 B4: Upgrading from a user `DisableRequested` to `DisableProtective { Thermal }`
+        // (or redispatching after a thermal cut whose retry is not yet armed) MUST bypass
+        // the 250 ms throttle so the driver immediately dispatches/arms protective disable.
+        if !self.disable_pending
+            || !already_protective
+            || rt_needs_redispatch
+            || (!self.rt_executor_owned
+                && self.last_disable_attempt.is_none_or(|t| t.elapsed() >= Duration::from_millis(250)))
+        {
+            if let Err(e) = self.request_disable_bounded(thermal_disable) {
+                if !self.safety.deferred_logging() {
+                    tracing::error!("Thermal shutdown not confirmed: {}", e.message.as_str());
+                }
+            }
+        }
+    }
+
     /// Execute the `StopPolicy::EStopLatch` transition without ever blocking on `driver`.
     /// Separated from `self.driver` so tests can verify real multi-thread mutex contention
     /// against the exact production latch path in safe Rust.
@@ -517,49 +555,15 @@ impl SupervisorInner {
                 self.thermal_cooldown.reset();
                 let (joint_idx, temperature) = self.temperatures.iter().copied().enumerate()
                     .filter(|(_, t)| t.is_finite()).max_by(|a,b| a.1.total_cmp(&b.1)).unwrap_or((0, 0.0));
-                if !self.safety.has_latched_fault_kind(crate::safety::FaultKind::ThermalTrip) {
-                    self.safety.latch(
-                        crate::safety::FaultKind::ThermalTrip,
-                        crate::safety::FaultDetail::ThermalTrip {
-                            joint_idx,
-                            temperature,
-                            limit: self.config.max_temperature,
-                        },
-                    );
-                }
-                // Cancel any in-flight enable through the reducer before protective thermal cut
-                // takes over, preserving the thermal latch (highest severity) and protective cut.
-                self.interrupt_enable_for_thermal();
-                let already_protective = matches!(
-                    self.active_disable_kind,
-                    Some(crate::driver::DisableKind::DisableProtective { .. })
+                self.safety.latch(
+                    crate::safety::FaultKind::ThermalTrip,
+                    crate::safety::FaultDetail::ThermalTrip {
+                        joint_idx,
+                        temperature,
+                        limit: self.config.max_temperature,
+                    },
                 );
-                let thermal_disable = crate::driver::DisableKind::DisableProtective {
-                    reason: crate::driver::DisableProtectiveReason::Thermal,
-                };
-                self.active_disable_kind = Some(thermal_disable);
-                let rt_needs_redispatch = self.rt_executor_owned
-                    && self.background_disable_retry.is_none()
-                    && (self.is_torqued || self.torque_intent == TorqueIntent::On)
-                    && !self
-                        .driver
-                        .as_ref()
-                        .is_some_and(|d| d.try_lock().is_ok_and(|drv| drv.torque_transition_pending()));
-                // T2 / R12 B4: Upgrading from a user `DisableRequested` to `DisableProtective { Thermal }`
-                // (or redispatching after a thermal cut whose retry is not yet armed) MUST bypass
-                // the 250 ms throttle so the driver immediately dispatches/arms protective disable.
-                if !self.disable_pending
-                    || !already_protective
-                    || rt_needs_redispatch
-                    || (!self.rt_executor_owned
-                        && self.last_disable_attempt.is_none_or(|t| t.elapsed() >= Duration::from_millis(250)))
-                {
-                    if let Err(e) = self.request_disable_bounded(thermal_disable) {
-                        if !self.safety.deferred_logging() {
-                            tracing::error!("Thermal shutdown not confirmed: {}", e.message.as_str());
-                        }
-                    }
-                }
+                self.redispatch_thermal_protective_disable();
             }
             StopPolicy::BusLossFallback => {
                 self.exit_gravity_comp_inner("BUS_LOSS", "CAN feedback lost", !in_tick);

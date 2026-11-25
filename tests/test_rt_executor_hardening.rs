@@ -1800,7 +1800,13 @@ async fn damiao_unified_fresh_boundary_and_stale_shutdown_gate_virtual_clock() {
         !sup.shutdown_ready().await,
         "unsolicited startup 0x0 without accepted disable must refuse shutdown_ready"
     );
-    // Explicit accepted disable via the supervisor records `torque_intent = Off` -> `shutdown_ready`.
+    // Explicit accepted disable via the supervisor goes through the K=3 rest-pose gate (R12 B5)
+    // and records `torque_intent = Off` -> `shutdown_ready`.
+    for _ in 0..3 {
+        clock2.advance(Duration::from_millis(15));
+        bus2.with(|s| s.push_all_feedback());
+        sup.tick(0.02).await;
+    }
     sup.disable_torque().await.unwrap();
     assert!(sup.shutdown_ready().await);
     assert!(sup.request_shutdown().await.unwrap());
@@ -2234,9 +2240,15 @@ async fn mit_fence_trip_confirmed_disable_stays_shutdown_ready_and_repeated_unkn
     assert!(drv.mit_fence_trip().is_some(), "MIT deadline fence must be tripped");
 
     // Disable torque via supervisor while leaving the MIT fence trip UNACKNOWLEDGED
-    // (`poll_tx_allowed()` stays false), recording `torque_intent = Off`.
+    // (`poll_tx_allowed()` stays false): satisfy K=3 rest-pose gate (R12 B5) with arriving
+    // feedback across 3 releases, then disable records `torque_intent = Off`.
     let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
     sup.set_lease_enabled(false).await;
+    for _ in 0..3 {
+        clock.advance(Duration::from_millis(15));
+        bus.with(|s| s.push_all_feedback());
+        sup.tick(0.02).await;
+    }
     sup.disable_torque().await.unwrap();
     assert!(sup.shutdown_ready().await);
 
