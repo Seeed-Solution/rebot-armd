@@ -576,6 +576,10 @@ pub trait CoreOps {
     /// Drains displaced lease generations queued since the last drain (zero allocs) so the
     /// release engine can dispatch off-thread `close_servo(old_generation)` strictly after publish.
     fn drain_servo_closes(&mut self, _each: &mut dyn FnMut(u64)) {}
+    /// True when terminated policy action IDs await post-publication atomic close watermark flush.
+    fn has_pending_policy_close(&self) -> bool { false }
+    /// Advances the durable post-publication policy close watermark (zero allocs, lossless).
+    fn flush_policy_close_watermark(&mut self) -> u64 { 0 }
     /// An authorized stop was requested: stop active motion.
     fn apply_stop(&mut self);
     /// Applies an authorized stop at `generation` and synchronizes the owner's stop counter.
@@ -1215,6 +1219,28 @@ impl CoreOps for SupervisorInner {
 
     fn drain_servo_closes(&mut self, each: &mut dyn FnMut(u64)) {
         self.drain_pending_servo_closes(each);
+    }
+
+    fn has_pending_policy_close(&self) -> bool {
+        #[cfg(feature = "policy-runtime")]
+        {
+            self.has_pending_policy_close()
+        }
+        #[cfg(not(feature = "policy-runtime"))]
+        {
+            false
+        }
+    }
+
+    fn flush_policy_close_watermark(&mut self) -> u64 {
+        #[cfg(feature = "policy-runtime")]
+        {
+            self.flush_pending_policy_close_watermark()
+        }
+        #[cfg(not(feature = "policy-runtime"))]
+        {
+            0
+        }
     }
 
     // ends client motion; a running watchdog park belongs to the lease watchdog and continues
@@ -1898,6 +1924,9 @@ impl ReleaseEngine {
                 self.lifecycle_replies_flushed = true;
             }
             let _ = self.flush_servo_closes(core);
+        if core.flush_policy_close_watermark() != 0 {
+            self.servo_closes_flushed = true;
+        }
             return report;
         }
         // 3. Urgent recheck + at most one ordinary command (replies deferred until strictly AFTER Step 6 publish)
@@ -2147,6 +2176,9 @@ impl ReleaseEngine {
             }
         }
         let _ = self.flush_servo_closes(core);
+        if core.flush_policy_close_watermark() != 0 {
+            self.servo_closes_flushed = true;
+        }
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(ActiveSlot::Macro { parent, child_plan }) = self.active.as_mut() {
             if child_plan.is_some() && !core.macro_child_running(parent.action()) {
@@ -2190,7 +2222,12 @@ impl ReleaseEngine {
         let finished = self
             .take_finished_transition(report)
             .or_else(|| self.take_aborted_transition(core, report));
-        if urgent_applied || lifecycle_pending || core.has_pending_servo_closes() || finished.is_some() {
+        if urgent_applied
+            || lifecycle_pending
+            || core.has_pending_servo_closes()
+            || core.has_pending_policy_close()
+            || finished.is_some()
+        {
             let ts = core.now_timestamp();
             core.publish(ts, publish_generation);
             if let Some((t, outcome)) = finished {
@@ -2203,6 +2240,9 @@ impl ReleaseEngine {
                 self.lifecycle_replies_flushed = true;
             }
             let _ = self.flush_servo_closes(core);
+            if core.flush_policy_close_watermark() != 0 {
+                self.servo_closes_flushed = true;
+            }
             return true;
         }
         if self.has_pending_urgent_stop_replies() && self.flush_urgent_stop_replies() {

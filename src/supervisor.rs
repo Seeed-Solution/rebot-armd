@@ -912,6 +912,31 @@ pub struct SupervisorInner {
     /// Most recent policy observation telemetry (retained after policy run ends).
     #[cfg(feature = "policy-runtime")]
     pub last_policy_obs: Option<crate::model::PolicyObservation>,
+    /// Preallocated `PolicyObservation` and target-vector spares recycled on `armd-control`
+    /// so starting, stepping, holding, superseding, and ending policy runs allocate and free 0 bytes.
+    #[cfg(feature = "policy-runtime")]
+    pub(crate) rt_policy_auth: crate::policy_runtime::PolicyAuthorization,
+    #[cfg(feature = "policy-runtime")]
+    pub(crate) policy_run_spare: Option<crate::policy_runtime::PolicyRun>,
+    #[cfg(feature = "policy-runtime")]
+    pub(crate) policy_live_vec_spare: Vec<f32>,
+    #[cfg(feature = "policy-runtime")]
+    pub(crate) policy_shadow_vec_spare: Vec<f32>,
+    #[cfg(feature = "policy-runtime")]
+    pub(crate) last_policy_obs_spare: Option<crate::model::PolicyObservation>,
+    #[cfg(feature = "policy-runtime")]
+    pub(crate) last_policy_obs_vec_spare: Vec<f32>,
+    /// Highest terminated policy action ID awaiting post-publication atomic close watermark flush.
+    #[cfg(feature = "policy-runtime")]
+    pub(crate) pending_policy_close_max: u64,
+    /// Monotonic watermark advanced strictly BEFORE Step 6 publish on policy termination so
+    /// off-thread `StateHub` seals diagnostics before the first terminal publication.
+    #[cfg(feature = "policy-runtime")]
+    pub(crate) atomic_diag_sealed_policy_action_id: Arc<AtomicU64>,
+    /// Monotonic watermark advanced strictly AFTER Step 6 publish (Step 7 / wake) so
+    /// `ServoTargetDispatcher` closes terminated policy streams losslessly.
+    #[cfg(feature = "policy-runtime")]
+    pub(crate) atomic_closed_policy_action_id: Arc<AtomicU64>,
     /// Device qualification ledger (`src/policy_runtime/qualification.rs`); None = no records
     /// are written and production releases are refused.
     #[cfg(feature = "policy-runtime")]
@@ -2045,6 +2070,24 @@ impl SupervisorInner {
             #[cfg(feature = "policy-runtime")]
             last_policy_obs: None,
             #[cfg(feature = "policy-runtime")]
+            rt_policy_auth: crate::policy_runtime::PolicyAuthorization::default(),
+            #[cfg(feature = "policy-runtime")]
+            policy_run_spare: None,
+            #[cfg(feature = "policy-runtime")]
+            policy_live_vec_spare: Vec::with_capacity(crate::rt_core::mailbox::MAX_DOF),
+            #[cfg(feature = "policy-runtime")]
+            policy_shadow_vec_spare: Vec::with_capacity(crate::rt_core::mailbox::MAX_DOF),
+            #[cfg(feature = "policy-runtime")]
+            last_policy_obs_spare: Some(crate::model::PolicyObservation::preallocated_rt()),
+            #[cfg(feature = "policy-runtime")]
+            last_policy_obs_vec_spare: Vec::with_capacity(crate::rt_core::mailbox::MAX_DOF),
+            #[cfg(feature = "policy-runtime")]
+            pending_policy_close_max: 0,
+            #[cfg(feature = "policy-runtime")]
+            atomic_diag_sealed_policy_action_id: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "policy-runtime")]
+            atomic_closed_policy_action_id: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "policy-runtime")]
             policy_ledger_path: crate::policy_runtime::qualification::ledger_path_from_env(),
             quintic_settle: None,
             before_install_hook: None,
@@ -2252,6 +2295,12 @@ impl SupervisorInner {
             power_budget_revision: 1,
             rt_closed_connections: None,
         };
+        #[cfg(feature = "policy-runtime")]
+        {
+            inner.policy_run_spare = Some(crate::policy_runtime::PolicyRun::preallocated_rt_spare(
+                inner.rt_policy_auth.clone(),
+            ));
+        }
         inner.prepare_workspace_eval_bufs();
         inner.refresh_schema_cache();
         inner
@@ -2292,6 +2341,13 @@ impl SupervisorInner {
             bufs.prepare_for(&self.config.arm_model, ws, cam, self.config.tcp_offset);
         }
         self.ws_eval_bufs = bufs;
+        // Single-buffer workspace spare invariant: at most one heap `SlotBuf` exists across
+        // `(self.servo_ws_min_depths, self.ws_eval_bufs.min_depths_spare)`, so
+        // `clear_servo_ws_min_depths_rt` always recycles directly into `min_depths_spare` with
+        // 0 frees even when retirement queues are full.
+        if self.servo_ws_min_depths.as_ref().is_some_and(|(_, b)| b.is_heap()) {
+            self.ws_eval_bufs.min_depths_spare = None;
+        }
         if self.workspace_violation.is_none() && self.workspace_violation_spare.is_none() {
             self.workspace_violation_spare =
                 Some(crate::kinematics::WorkspaceViolationDetail::preallocated_rt());
@@ -2784,6 +2840,19 @@ impl SupervisorInner {
             self.pending_deferred_done = None;
         }
         self.sync_lease_gen_mirror();
+        #[cfg(feature = "policy-runtime")]
+        if self
+            .policy_run
+            .as_ref()
+            .is_some_and(|r| r.lease_generation <= displaced_gen)
+        {
+            self.terminate_policy_run_static(
+                "LEASE_LOST",
+                "cancelled",
+                Some("LEASE_LOST"),
+                Some("Control lease lost or expired"),
+            );
+        }
         if stop_active_motion {
             self.stop_motion();
         }
@@ -3633,7 +3702,7 @@ impl SupervisorInner {
         &self,
         timestamp: f64,
         out: &mut ArmObservation,
-        spares: Option<&mut crate::rt_core::publish::ObservationSpares>,
+        mut spares: Option<&mut crate::rt_core::publish::ObservationSpares>,
     ) {
         use crate::rt_core::scratch::{fill_n, set_opt, set_opt_eq};
         let tcp = if self.config.kinematics.is_some() {
@@ -3696,7 +3765,7 @@ impl SupervisorInner {
         out.disable_pending = self.disable_pending;
         out.feedback_valid = self.hardware_feedback_fresh(Duration::from_millis(250));
         out.commanded_positions.clone_from(&self.commanded_positions);
-        let (action_spare, prev_action_spare) = match spares {
+        let (action_spare, prev_action_spare) = match spares.as_deref_mut() {
             Some(s) => (Some(&mut s.action_msg), Some(&mut s.prev_action_msg)),
             None => (None, None),
         };
@@ -3734,7 +3803,7 @@ impl SupervisorInner {
             out.loads = None;
         }
         #[cfg(feature = "policy-runtime")]
-        self.policy_observation_into(&mut out.policy);
+        self.policy_observation_into_with_spares(&mut out.policy, spares);
         #[cfg(not(feature = "policy-runtime"))]
         { out.policy = None; }
         out.watchdog_park_blocked_reason = self.watchdog_park_blocked_reason;
@@ -5011,13 +5080,40 @@ impl SupervisorInner {
         self.retired_macro_runs.pop_front()
     }
 
-    /// True when the supervisor has guaranteed off-thread retirement capacity for a new
-    /// `PolicyRun` so ending it on `armd-control` never frees heap fields on the RT thread.
+    /// True when the supervisor has guaranteed off-thread retirement capacity (or unconditional
+    /// RT spare recycling) for a new `PolicyRun` so ending it on `armd-control` never frees heap
+    /// fields on the RT thread.
     #[cfg(feature = "policy-runtime")]
     pub fn can_admit_policy_run(&self) -> bool {
-        !self.rt_executor_owned
-            || self.retired_policy_runs.len() + usize::from(self.policy_run.is_some())
-                < self.retired_policy_runs.capacity()
+        if self.rt_executor_owned {
+            self.policy_run.is_none() && self.policy_run_spare.is_some()
+        } else {
+            true
+        }
+    }
+
+    #[cfg(feature = "policy-runtime")]
+    pub(crate) fn record_pending_policy_close(&mut self, action_id: u64) {
+        if action_id > self.pending_policy_close_max {
+            self.pending_policy_close_max = action_id;
+        }
+    }
+
+    #[cfg(feature = "policy-runtime")]
+    pub(crate) fn has_pending_policy_close(&self) -> bool {
+        self.pending_policy_close_max != 0
+    }
+
+    /// Flushes any pending post-publication policy stream close into the durable atomic watermark
+    /// (zero allocations, zero drop risk). Returns the flushed high-water mark (0 if none).
+    #[cfg(feature = "policy-runtime")]
+    pub(crate) fn flush_pending_policy_close_watermark(&mut self) -> u64 {
+        let max_id = std::mem::replace(&mut self.pending_policy_close_max, 0);
+        if max_id != 0 {
+            self.atomic_closed_policy_action_id
+                .fetch_max(max_id, Ordering::Release);
+        }
+        max_id
     }
 
     /// Queue a finished `PolicyRun` for off-thread drop when owned by the RT executor
@@ -7918,6 +8014,23 @@ impl SupervisorInner {
             }
         }
 
+        // Step-5 owner output-boundary revocation recheck (Linearization 2): if `PolicyAuthorization`
+        // was bumped after Step 4 consumption or on a subsequent tick with no new mailbox frame,
+        // brake immediately before reading `servo_target` so zero policy-derived motion is emitted.
+        #[cfg(feature = "policy-runtime")]
+        if let Some(aid) = self
+            .policy_run
+            .as_ref()
+            .filter(|r| {
+                r.mode == crate::policy_runtime::PolicyMode::Live
+                    && r.live_target_auth_gen
+                        .is_some_and(|g| r.authorization.current() != g)
+            })
+            .map(|r| r.action_id)
+        {
+            self.brake_live_policy_in_place(aid);
+        }
+
         // 3.1 Servo streaming (park release / unload settle runs AFTER output acceptance below
         //     so park never advances or cuts torque on a deferred or rejected release).
         if !(self.pending_normal_unload && self.active_trajectory.is_none()) && self.servo_target.is_some() {
@@ -7943,8 +8056,15 @@ impl SupervisorInner {
             if self.last_motion_frame.elapsed() > self.motion_frame_timeout {
                 self.release_servo_target();
                 self.servo_settled_ticks.fill(0);
-                self.fail_live_policy_from_control("TARGET_TIMEOUT",
-                    format!("No policy target for {} ms; the control loop dropped the target", self.motion_frame_timeout.as_millis()));
+                if self.rt_executor_owned {
+                    self.fail_live_policy_from_control_static(
+                        "TARGET_TIMEOUT",
+                        "No policy target within motion frame timeout; the control loop dropped the target",
+                    );
+                } else {
+                    self.fail_live_policy_from_control("TARGET_TIMEOUT",
+                        format!("No policy target for {} ms; the control loop dropped the target", self.motion_frame_timeout.as_millis()));
+                }
             } else {
                 // Check if any target joint has instantaneous jump > 0.35 rad relative to commanded_positions
                 // The 7-DOF gripper is exempt: its far targets are expected (POS_VEL needs a
@@ -7963,13 +8083,22 @@ impl SupervisorInner {
                 });
 
                 if has_dirty_jump {
-                    tracing::warn!(
-                        "Discarding dirty servo target frame: instantaneous jump exceeds 0.35 rad relative to commanded_positions"
-                    );
+                    if !self.rt_executor_owned {
+                        tracing::warn!(
+                            "Discarding dirty servo target frame: instantaneous jump exceeds 0.35 rad relative to commanded_positions"
+                        );
+                    }
                     self.release_servo_target();
                     self.servo_settled_ticks.fill(0);
-                    self.fail_live_policy_from_control("SERVO_TARGET_DISCARDED",
-                        "The control loop discarded the policy target: it leads the commanded position by more than 0.35 rad".into());
+                    if self.rt_executor_owned {
+                        self.fail_live_policy_from_control_static(
+                            "SERVO_TARGET_DISCARDED",
+                            "The control loop discarded the policy target: it leads the commanded position by more than 0.35 rad",
+                        );
+                    } else {
+                        self.fail_live_policy_from_control("SERVO_TARGET_DISCARDED",
+                            "The control loop discarded the policy target: it leads the commanded position by more than 0.35 rad".into());
+                    }
                 } else {
                     reference_stepped = true;
                     if let Some(g) = gripper_idx {
@@ -9336,6 +9465,15 @@ pub struct ArmSupervisor {
     closed_bitset: Arc<crate::rt_core::requests::actions::ClosedBitset>,
     atomic_fenced_lease_gen: Arc<AtomicU64>,
     pending_disconnect_hold: Arc<AtomicU64>,
+    /// Shared persistent `PolicyAuthorization` for executor-owned policy runs (0 RT alloc/free).
+    #[cfg(feature = "policy-runtime")]
+    rt_policy_auth: crate::policy_runtime::PolicyAuthorization,
+    /// Pre-publication policy diagnostic seal watermark shared with `StateHub`.
+    #[cfg(feature = "policy-runtime")]
+    atomic_diag_sealed_policy_action_id: Arc<AtomicU64>,
+    /// Post-publication policy stream close watermark shared with `ServoTargetDispatcher`.
+    #[cfg(feature = "policy-runtime")]
+    atomic_closed_policy_action_id: Arc<AtomicU64>,
     /// Leaf queue of socket-close disconnects deferred when the owner write lock is contended
     /// or ownership is transitioning (`OWNER_TRANSFERRING`); NEVER locked on `armd-control`.
     pending_disconnects: std::sync::Mutex<std::collections::VecDeque<crate::rt_core::requests::lease::ConnectionHandle>>,
@@ -9645,6 +9783,12 @@ impl ArmSupervisor {
         let closed_bitset = Arc::new(crate::rt_core::requests::actions::ClosedBitset::new());
         let atomic_fenced_lease_gen = Arc::new(AtomicU64::new(0));
         let pending_disconnect_hold = Arc::new(AtomicU64::new(0));
+        #[cfg(feature = "policy-runtime")]
+        let rt_policy_auth = crate::policy_runtime::PolicyAuthorization::default();
+        #[cfg(feature = "policy-runtime")]
+        let atomic_diag_sealed_policy_action_id = Arc::new(AtomicU64::new(0));
+        #[cfg(feature = "policy-runtime")]
+        let atomic_closed_policy_action_id = Arc::new(AtomicU64::new(0));
         let terminals = Arc::new(TerminalBroadcaster::default());
         let mut inner = SupervisorInner::new(config);
         inner.estop_state = estop_state.clone();
@@ -9655,6 +9799,15 @@ impl ArmSupervisor {
         inner.shared_closed_bitset = closed_bitset.clone();
         inner.atomic_fenced_lease_gen = atomic_fenced_lease_gen.clone();
         inner.pending_disconnect_hold = pending_disconnect_hold.clone();
+        #[cfg(feature = "policy-runtime")]
+        {
+            inner.rt_policy_auth = rt_policy_auth.clone();
+            inner.policy_run_spare = Some(crate::policy_runtime::PolicyRun::preallocated_rt_spare(
+                rt_policy_auth.clone(),
+            ));
+            inner.atomic_diag_sealed_policy_action_id = atomic_diag_sealed_policy_action_id.clone();
+            inner.atomic_closed_policy_action_id = atomic_closed_policy_action_id.clone();
+        }
         inner.terminals = Some(Arc::clone(&terminals));
         let template_obs = inner.current_observation();
         let initial_pub_cfg = crate::rt_core::requests::config::PublishedConfig::from_inner(&inner);
@@ -9682,6 +9835,12 @@ impl ArmSupervisor {
             closed_bitset,
             atomic_fenced_lease_gen,
             pending_disconnect_hold,
+            #[cfg(feature = "policy-runtime")]
+            rt_policy_auth,
+            #[cfg(feature = "policy-runtime")]
+            atomic_diag_sealed_policy_action_id,
+            #[cfg(feature = "policy-runtime")]
+            atomic_closed_policy_action_id,
             pending_disconnects: std::sync::Mutex::new(std::collections::VecDeque::new()),
             tick_stats: Arc::new(crate::diagnostics::tick::LockFreeTickStats::new()),
             control_sched: Arc::new(std::sync::Mutex::new(None)),
@@ -10536,6 +10695,24 @@ impl ArmSupervisor {
     #[doc(hidden)]
     pub fn hub(&self) -> &Arc<crate::rt_core::publish::StateHub> {
         &self.hub
+    }
+
+    /// Persistent lock-free [`PolicyAuthorization`] shared with `SupervisorInner` on `OWNER_EXECUTOR`.
+    #[cfg(feature = "policy-runtime")]
+    pub fn rt_policy_authorization(&self) -> crate::policy_runtime::PolicyAuthorization {
+        self.rt_policy_auth.clone()
+    }
+
+    /// Pre-publication policy diagnostic seal watermark (`AtomicU64`).
+    #[cfg(feature = "policy-runtime")]
+    pub(crate) fn diag_sealed_policy_watermark(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.atomic_diag_sealed_policy_action_id)
+    }
+
+    /// Post-publication policy stream close watermark (`AtomicU64`).
+    #[cfg(feature = "policy-runtime")]
+    pub(crate) fn closed_policy_watermark(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.atomic_closed_policy_action_id)
     }
 
     /// The current observation, without the supervisor lock while the control loop runs

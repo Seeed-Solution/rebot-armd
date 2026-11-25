@@ -72,6 +72,17 @@ impl PolicyMode {
     }
 }
 
+/// Copyable RT release-gate binding carried by executor-owned [`PolicyRun`] instances so
+/// `armd-control` enforces real-arm artifact, calibration, and velocity-scale invariants with
+/// zero heap ownership and zero frees on termination.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RtGateBinding {
+    pub policy_sha256: crate::model::HolderLabel,
+    pub calibration_digest: crate::model::HolderLabel,
+    pub max_speed_scale: f64,
+    pub production_release: bool,
+}
+
 /// Active policy run tracked by `SupervisorInner`.
 #[derive(Debug, Clone)]
 pub struct PolicyRun {
@@ -93,6 +104,16 @@ pub struct PolicyRun {
     pub max_step_rad: Option<f32>,
     pub i_am_at_the_arm: bool,
     pub verified_release_gate: Option<VerifiedReleaseGate>,
+    /// Copyable RT binding used on `OWNER_EXECUTOR` when `verified_release_gate` is `None`.
+    pub(crate) rt_gate_binding: Option<RtGateBinding>,
+    /// Authorization generation accepted with the currently installed live `servo_target`.
+    pub(crate) live_target_auth_gen: Option<u64>,
+    /// True for executor-owned runs recycled unconditionally into `SupervisorInner::policy_run_spare`.
+    pub(crate) rt_owned: bool,
+    /// Client-chosen monotonic attempt token owning this run (for cancellation isolation & runner ownership).
+    pub(crate) load_token: u64,
+    /// Preallocated slot index in `PolicyCancelSlots` for `load_token`.
+    pub(crate) cancel_slot: u8,
     pub stop_reason: Option<String>,
     /// [`max_policy_input_age_ms`] for the run's rate (set by the runner; until then the
     /// bound for [`MIN_LIVE_POLICY_FPS`]).
@@ -133,6 +154,101 @@ impl PolicyAuthorization {
 }
 
 impl PolicyRun {
+    /// Preallocated empty `PolicyRun` recycled in place by `OWNER_EXECUTOR` (0 RT alloc/free).
+    pub(crate) fn preallocated_rt_spare(authorization: PolicyAuthorization) -> Self {
+        Self {
+            action_id: 0,
+            epoch_id: 0,
+            connection_id: String::with_capacity(crate::model::HolderLabel::CAPACITY),
+            lease_generation: 0,
+            policy_id: String::with_capacity(crate::model::HolderLabel::CAPACITY),
+            artifact_digest: String::with_capacity(crate::model::HolderLabel::CAPACITY),
+            backend: String::with_capacity(64),
+            mode: PolicyMode::Shadow,
+            steps: 0,
+            last_input_age_ms: None,
+            last_vision_age_ms: None,
+            vision_frame_id: None,
+            last_shadow_target: None,
+            last_live_target: None,
+            max_first_step_rad: DEFAULT_MAX_FIRST_STEP_RAD,
+            max_step_rad: None,
+            i_am_at_the_arm: false,
+            verified_release_gate: None,
+            rt_gate_binding: None,
+            live_target_auth_gen: None,
+            rt_owned: true,
+            load_token: 0,
+            cancel_slot: 0,
+            stop_reason: None,
+            max_input_age_ms: max_policy_input_age_ms(MIN_LIVE_POLICY_FPS),
+            step_stats: PolicyStepStats::default(),
+            authorization,
+            max_vision_age_ms: None,
+            vision_stale_hold: false,
+        }
+    }
+
+    pub(crate) fn release_gate_max_speed_scale(&self) -> Option<f64> {
+        self.verified_release_gate
+            .as_ref()
+            .map(VerifiedReleaseGate::max_speed_scale)
+            .or_else(|| self.rt_gate_binding.as_ref().map(|g| g.max_speed_scale))
+    }
+
+    pub(crate) fn gate_calibration_digest(&self) -> Option<&str> {
+        self.verified_release_gate
+            .as_ref()
+            .map(VerifiedReleaseGate::calibration_digest)
+            .or_else(|| self.rt_gate_binding.as_ref().map(|g| g.calibration_digest.as_str()))
+    }
+
+    pub(crate) fn gate_policy_sha256(&self) -> Option<&str> {
+        self.verified_release_gate
+            .as_ref()
+            .map(VerifiedReleaseGate::policy_sha256)
+            .or_else(|| self.rt_gate_binding.as_ref().map(|g| g.policy_sha256.as_str()))
+    }
+
+    /// [`Self::to_observation`] into `out`, reusing `vec_spare` for `last_shadow_target`
+    /// transitions so `None <-> Some(Vec<f32>)` never allocates or frees on `armd-control`.
+    pub fn to_observation_into_with_vec_spare(
+        &self,
+        active: bool,
+        out: &mut PolicyObservation,
+        vec_spare: &mut Vec<f32>,
+    ) {
+        use crate::rt_core::scratch::{copy_into, set_str};
+        out.active = active;
+        out.action_id = self.action_id;
+        set_str(&mut out.policy_id, &self.policy_id);
+        set_str(&mut out.artifact_digest, &self.artifact_digest);
+        set_str(&mut out.backend, &self.backend);
+        set_str(&mut out.mode, self.mode.as_str());
+        out.steps = self.steps;
+        out.last_input_age_ms = self.last_input_age_ms;
+        out.last_vision_age_ms = self.last_vision_age_ms;
+        out.vision_frame_id = self.vision_frame_id;
+        match self.last_shadow_target.as_deref() {
+            Some(src) => match out.last_shadow_target.as_mut() {
+                Some(dst) => copy_into(dst, src),
+                None => {
+                    let mut v = std::mem::take(vec_spare);
+                    copy_into(&mut v, src);
+                    out.last_shadow_target = Some(v);
+                }
+            },
+            None => {
+                if let Some(old) = out.last_shadow_target.take() {
+                    if old.capacity() >= vec_spare.capacity() {
+                        *vec_spare = old;
+                    }
+                }
+            }
+        }
+        out.stop_reason = self.stop_reason.as_deref().map(crate::model::HolderLabel::new);
+    }
+
     /// [`Self::to_observation`] into `out`, reusing its memory.
     pub fn to_observation_into(&self, active: bool, out: &mut PolicyObservation) {
         use crate::rt_core::scratch::{set_opt, set_str};
@@ -267,6 +383,11 @@ impl PolicyStepStats {
             self.overruns += 1;
             self.skipped += step_us / self.period_us;
         }
+    }
+
+    /// Record one target skipped due to mailbox backpressure (`Submitted::Busy`).
+    pub fn record_skipped(&mut self) {
+        self.skipped = self.skipped.saturating_add(1);
     }
 
     pub fn report(&self) -> crate::motion::PolicyStats {

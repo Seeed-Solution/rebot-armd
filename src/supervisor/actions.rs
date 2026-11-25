@@ -104,13 +104,20 @@ impl SupervisorInner {
         self.drop_macro_run("cancelled", Some("SUPERSEDED"));
         #[cfg(feature = "policy-runtime")]
         if let Some(mut run) = self.policy_run.take() {
-            run.stop_reason = Some("SUPERSEDED".to_string());
-            if run.mode == crate::policy_runtime::PolicyMode::Live {
-                self.servo_target = None;
-                self.servo_settled_ticks.fill(0);
-                self.servo_ws_min_depths = None;
+            if self.rt_executor_owned {
+                // Executor supersession: revoke authorization, seal/close stream, recycle spares
+                // in place with 0 allocs/frees, and preserve replacement `target_positions` and
+                // `j7_admitted_stamp` (`reset_hold_target = false`).
+                self.teardown_rt_policy_run(run, "SUPERSEDED", false, Instant::now());
+            } else {
+                run.stop_reason = Some("SUPERSEDED".to_string());
+                if run.mode == crate::policy_runtime::PolicyMode::Live {
+                    self.servo_target = None;
+                    self.servo_settled_ticks.fill(0);
+                    self.servo_ws_min_depths = None;
+                }
+                self.last_policy_obs = Some(run.to_observation(false));
             }
-            self.last_policy_obs = Some(run.to_observation(false));
         }
         if let Some(mut old) = self.last_action.take() {
             if old.is_running() {
@@ -1326,7 +1333,7 @@ impl SupervisorInner {
         self.gripper_hold_vel_ceiling = Some(motion.wire_velocity_ceiling());
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
-        self.servo_ws_min_depths = None;
+        self.clear_servo_ws_min_depths_rt();
         let mut target = self.commanded_positions.clone();
         target[gripper_idx] = motion.target;
         self.target_positions = target;
@@ -1571,7 +1578,7 @@ impl SupervisorInner {
         let motion = motion.with_baseline(self.gripper_baseline_for_motion(), learn);
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
-        self.servo_ws_min_depths = None;
+        self.clear_servo_ws_min_depths_rt();
         let mut target = self.commanded_positions.clone();
         target[gripper_idx] = motion.target;
         self.target_positions = target;
@@ -1643,7 +1650,7 @@ impl SupervisorInner {
         self.gripper_hold_vel_ceiling = Some(motion.wire_velocity_ceiling());
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
-        self.servo_ws_min_depths = None;
+        self.clear_servo_ws_min_depths_rt();
         let mut target = self.commanded_positions.clone();
         target[gripper_idx] = motion.target;
         self.target_positions = target;

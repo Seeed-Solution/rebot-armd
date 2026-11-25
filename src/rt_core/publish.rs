@@ -331,12 +331,16 @@ fn copy_into<T: Copy>(dst: &mut Vec<T>, src: &[T]) {
     dst.extend_from_slice(src);
 }
 
-/// Preallocated per-slot string spare reused across `None <-> Some(String)` action message
-/// transitions so RT publication never allocates or drops heap strings.
+/// Preallocated per-slot spares reused across `None <-> Some(...)` action message and policy
+/// observation transitions so RT publication never allocates or drops heap storage.
 #[derive(Debug, Default)]
 pub struct ObservationSpares {
     pub action_msg: String,
     pub prev_action_msg: String,
+    #[cfg(feature = "policy-runtime")]
+    pub policy_obs: Option<crate::model::PolicyObservation>,
+    #[cfg(feature = "policy-runtime")]
+    pub policy_shadow_vec: Vec<f32>,
 }
 
 impl ObservationSpares {
@@ -344,6 +348,10 @@ impl ObservationSpares {
         Self {
             action_msg: String::with_capacity(256),
             prev_action_msg: String::with_capacity(256),
+            #[cfg(feature = "policy-runtime")]
+            policy_obs: Some(crate::model::PolicyObservation::preallocated_rt()),
+            #[cfg(feature = "policy-runtime")]
+            policy_shadow_vec: Vec::with_capacity(super::mailbox::MAX_DOF),
         }
     }
 }
@@ -537,13 +545,22 @@ impl StatePublisher {
     }
 
     /// Returns the string spares to the back slot before publishing (0 alloc, 0 drop).
-    pub fn restore_back_spares(&mut self, spares: ObservationSpares) {
+    pub fn restore_back_spares(&mut self, mut spares: ObservationSpares) {
         let slot = self.producer.back_mut();
         if spares.action_msg.capacity() > slot.spares.action_msg.capacity() {
-            slot.spares.action_msg = spares.action_msg;
+            slot.spares.action_msg = std::mem::take(&mut spares.action_msg);
         }
         if spares.prev_action_msg.capacity() > slot.spares.prev_action_msg.capacity() {
-            slot.spares.prev_action_msg = spares.prev_action_msg;
+            slot.spares.prev_action_msg = std::mem::take(&mut spares.prev_action_msg);
+        }
+        #[cfg(feature = "policy-runtime")]
+        {
+            if spares.policy_obs.is_some() && slot.spares.policy_obs.is_none() {
+                slot.spares.policy_obs = spares.policy_obs.take();
+            }
+            if spares.policy_shadow_vec.capacity() > slot.spares.policy_shadow_vec.capacity() {
+                slot.spares.policy_shadow_vec = std::mem::take(&mut spares.policy_shadow_vec);
+            }
         }
     }
 

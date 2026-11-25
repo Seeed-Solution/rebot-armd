@@ -141,6 +141,38 @@ impl TargetFrame {
         }
         None
     }
+
+    /// Single effective refusal code for a policy target frame (`policy_generation != 0`).
+    /// Precedence: `INVALID_COMMAND` -> `WRONG_TARGET` -> authority (`STOPPED`/`LEASE_LOST`/
+    /// `EPOCH_MISMATCH`/`PLAN_STALE`/`PARENT_REPLACED`) -> `STREAM_NOT_AUTHORIZED` ->
+    /// `POLICY_REVOKED` -> `INPUT_STALE` (aged or future) -> `VISION_STALE` (missing, aged,
+    /// or future when `max_vision_age` is set) -> `DEADLINE_EXPIRED`.
+    pub fn check_policy(
+        &self,
+        arm: ArmId,
+        boot: BootId,
+        now: Instant,
+        current: &Authority,
+        targets: &TargetAuthority,
+    ) -> Option<&'static str> {
+        if self.dof == 0 || usize::from(self.dof) > MAX_DOF { return Some("INVALID_COMMAND"); }
+        if self.arm != arm || self.boot != boot || self.boot.is_zero() { return Some("WRONG_TARGET"); }
+        if let Some(code) = self.authority.admits(current) { return Some(code); }
+        if targets.stream != Some(self.stream) { return Some("STREAM_NOT_AUTHORIZED"); }
+        if self.policy_generation != targets.policy_generation { return Some("POLICY_REVOKED"); }
+        if let Some(m) = targets.max_input_age {
+            if now.checked_duration_since(self.input_at).is_none_or(|age| age > m) {
+                return Some("INPUT_STALE");
+            }
+        }
+        if let Some(m) = targets.max_vision_age {
+            if self.vision_at.and_then(|at| now.checked_duration_since(at)).is_none_or(|age| age > m) {
+                return Some("VISION_STALE");
+            }
+        }
+        if now > self.deadline { return Some("DEADLINE_EXPIRED"); }
+        None
+    }
 }
 
 /// Result of [`TargetWriter::submit`].
