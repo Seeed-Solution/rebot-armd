@@ -1956,6 +1956,27 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
         disarmed: false,
     };
 
+    // Per-socket wire-ACK abandonment tracker (shared across worker, terminal subscription, and
+    // writer telemetry/lag resync) + per-connection broker reply sink attached BEFORE owner
+    // registration so both live executor open and Legacy->Executor handover bind identically.
+    let wire_ack_tracker = Arc::new(crate::rt_core::reply_router::WsWireAckTracker::new());
+    {
+        let sink_hub = supervisor.hub().clone();
+        let sink_tracker = Arc::clone(&wire_ack_tracker);
+        let _ = supervisor.attach_ws_reply_sink(
+            conn_id,
+            Arc::new(move |_client, _reply| {
+                if sink_tracker.is_socket_closed() {
+                    return crate::rt_core::broker::DeliveryDecision::Abandoned;
+                }
+                // Wake `armd-dispatch` so the matching lossless `ArmObservation` terminal flushes
+                // immediately without emitting a duplicate JSON frame on `ordinary_out_tx`.
+                sink_hub.wake();
+                crate::rt_core::broker::DeliveryDecision::Delivered
+            }),
+        );
+    }
+
     // Register this admitted slot with the active owner concurrently so `reader_task` is live
     // immediately for urgent E-stop while `worker_task` and `heartbeat_task` gate ordinary/lease
     // traffic until owner registration settles (`Some(true)` registered, `Some(false)` stopped/degraded).
@@ -2022,7 +2043,18 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     let command_reply_pending = Arc::new(AtomicBool::new(false));
     let term_writer = writer.clone();
     let term_pending = Arc::clone(&command_reply_pending);
+    let term_ack_tracker = Arc::clone(&wire_ack_tracker);
     let _terminal_sub = supervisor.subscribe_action_terminals(move |obs| {
+        if term_ack_tracker.is_socket_closed() {
+            return true;
+        }
+        if obs
+            .action
+            .as_ref()
+            .is_some_and(|a| !a.is_running() && term_ack_tracker.is_abandoned(a.id))
+        {
+            return true;
+        }
         if term_pending.load(Ordering::Acquire) {
             return false;
         }
@@ -2043,6 +2075,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     let writer_in_flight_estops = in_flight_estops.clone();
     let writer_in_flight_stops = in_flight_stops.clone();
     let writer_urgent_notify = urgent_done_notify.clone();
+    let writer_ack_tracker = Arc::clone(&wire_ack_tracker);
     let mut writer_task = tokio::spawn(async move {
         let mut last_sent: Option<f64> = None;
         let mut last_wire_epoch: Option<(u64, Option<Value>)> = None;
@@ -2256,11 +2289,12 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     None => { ord_closed = true; }
                 },
                 _ = std::future::ready(()), if pending_latest_telemetry.is_some() => {
-                    if let Some(obs) = pending_latest_telemetry.take() {
+                    if let Some(mut obs) = pending_latest_telemetry.take() {
                         if let Some(rate) = obs_rate {
                             if !rate.due(last_sent, obs.timestamp) { continue; }
                             last_sent = Some(obs.timestamp);
                         }
+                        writer_ack_tracker.redact_abandoned_obs(&mut obs);
                         if let Ok(text) = serde_json::to_string(&obs) {
                             if let Err(e) = write_ws_frame_bounded(&writer_connection, &mut sender, Message::Text(text.into()), ws_write_timeout(&writer_connection), &writer_fatal_triggered, &writer_fatal_notify).await {
                                 if e == WriteErr::Timeout {
@@ -2494,6 +2528,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     let worker_ordinary_queue = ordinary_queue.clone();
     let worker_writer = writer.clone();
     let worker_command_reply_pending = Arc::clone(&command_reply_pending);
+    let worker_ack_tracker = Arc::clone(&wire_ack_tracker);
     let worker_tasks = tasks.clone();
     let worker_closing = connection_closing.clone();
     let recv_deps = deps;
@@ -2560,7 +2595,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 }
                 joined = async { (&mut macro_check.as_mut().expect("guarded by the precondition").rx).await }, if macro_active => {
                     let MacroCheck { request_id, command_path, generation, stamp, executor, .. } = macro_check.take().expect("checked above");
-                    let Some((reply, macro_gate)) = actions::complete_macro_check(
+                    let Some((reply, macro_gate, macro_ack_guard)) = actions::complete_macro_check(
                         request_id,
                         command_path,
                         generation,
@@ -2573,6 +2608,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         &recv_deps,
                         &worker_closing,
                         &worker_command_reply_pending,
+                        &worker_ack_tracker,
                     ).await else { break; };
                     if reply.get("type").and_then(Value::as_str) == Some("command_ack") {
                         let delay_ms = TEST_DEFERRED_ACK_DELAY_MS.load(Ordering::Relaxed);
@@ -2581,8 +2617,24 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         }
                     }
                     let sent = worker_writer.send_ordinary_control(reply).await;
-                    drop(macro_gate);
-                    if !sent { break; }
+                    if sent {
+                        if let Some(ag) = macro_ack_guard {
+                            if ag.confirm_enqueued() {
+                                if let Some(h) = recv_supervisor.executor_handle() {
+                                    h.pump_broker_replies();
+                                }
+                            }
+                        }
+                        drop(macro_gate);
+                    } else {
+                        if let Some(ag) = macro_ack_guard {
+                            ag.abandon_closed();
+                        } else {
+                            worker_ack_tracker.mark_socket_closed();
+                        }
+                        drop(macro_gate);
+                        break;
+                    }
                     continue;
                 }
                 item = worker_ordinary_queue.pop(macro_active) => match item {
@@ -2749,7 +2801,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         }
                         continue;
                     }
-                    if let Some(grasp_disp) = actions::handle_executor_ws_grasp(
+                    if let Some(action_disp) = actions::handle_executor_ws_action(
                         frame_kind,
                         entry,
                         &value,
@@ -2762,19 +2814,53 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         &ws_auth,
                         &recv_supervisor,
                         &recv_deps,
+                        &recv_calib,
                         &worker_closing,
+                        &worker_command_reply_pending,
+                        &worker_ack_tracker,
                         &worker_tasks,
                     )
                     .await
                     {
-                        match grasp_disp {
-                            actions::ExecutorGraspDispatch::Reply(reply) => {
-                                if !worker_writer.send_ordinary_control(reply).await {
+                        match action_disp {
+                            actions::ExecutorActionDispatch::Reply {
+                                reply,
+                                gate,
+                                ack_guard,
+                            } => {
+                                if gate.is_some()
+                                    && reply.get("type").and_then(Value::as_str) == Some("command_ack")
+                                {
+                                    let delay_ms = TEST_DEFERRED_ACK_DELAY_MS.load(Ordering::Relaxed);
+                                    if delay_ms > 0 {
+                                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                    }
+                                }
+                                let sent = worker_writer.send_ordinary_control(reply).await;
+                                if sent {
+                                    if let Some(ag) = ack_guard {
+                                        if ag.confirm_enqueued() {
+                                            if let Some(h) = recv_supervisor.executor_handle() {
+                                                h.pump_broker_replies();
+                                            }
+                                        }
+                                    }
+                                    drop(gate);
+                                } else {
+                                    if let Some(ag) = ack_guard {
+                                        ag.abandon_closed();
+                                    } else {
+                                        worker_ack_tracker.mark_socket_closed();
+                                    }
+                                    drop(gate);
                                     break;
                                 }
                             }
-                            actions::ExecutorGraspDispatch::Macro(check) => {
+                            actions::ExecutorActionDispatch::Macro(check) => {
                                 macro_check = Some(check);
+                            }
+                            actions::ExecutorActionDispatch::Closed => {
+                                break;
                             }
                         }
                         continue;
@@ -3250,6 +3336,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     supervisor.fence_ws_connection_immediate(conn_handle, closing_gen);
 
     connection_closing.store(true, Ordering::SeqCst);
+    wire_ack_tracker.mark_socket_closed();
     #[cfg(feature = "policy-runtime")]
     ws_closed.store(true, Ordering::SeqCst);
     ordinary_queue.close();
