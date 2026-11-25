@@ -7630,9 +7630,6 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     rest_pose_window: Vec<CausalWindow>,
     /// `rx_seq` snapshot when `CMD_ENABLE` was transmitted for motor `i`.
     motor_enable_seq: Vec<u64>,
-    /// `rx_seq` snapshot when the initial `CMD_DISABLE` was transmitted for motor `i` in the
-    /// active disable sequence (used to confirm fresh post-disable `motor_status == 0` replies).
-    motor_disable_seq: Vec<u64>,
     /// True once motor `i` has received feedback strictly after its latest `CMD_ENABLE`
     /// transmit (any state, including fault states, so `poll_enable` detects faults causally).
     motor_post_enable_feedback: Vec<bool>,
@@ -8588,7 +8585,6 @@ enum DamiaoTorque {
         started_in_estop: bool,
         client_park: bool,
         rest_established: bool,
-        confirm_polls_sent: u8,
     },
 }
 
@@ -8752,7 +8748,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             control_release_managed: false,
             rest_pose_window: vec![CausalWindow::default(); dof],
             motor_enable_seq: vec![0; dof],
-            motor_disable_seq: vec![0; dof],
             motor_post_enable_feedback: vec![false; dof],
             reported_torque_loss_sample_seq: 0,
             panic_disable_tx_ok: vec![false; dof],
@@ -9382,15 +9377,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             && (0..self.motor_ids.len()).all(|i| self.motor_status[i] == 0)
     }
 
-    /// True when the bus has produced at least one `motor_status == 0` disable reply (ruling out
-    /// silent/static mocks that never flip status) yet one or more motors still have not confirmed
-    /// `motor_status == 0`.
-    fn needs_disable_status_confirm(&self) -> bool {
-        !self.motor_ids.is_empty()
-            && !self.all_motors_confirmed_disabled()
-            && self.motor_status.iter().any(|&s| s == 0)
-    }
-
     /// True when every configured arm joint (or all motors when no arm subset is configured) has
     /// already confirmed `motor_status == 0` (disabled).
     fn all_arm_joints_confirmed_disabled(&self) -> bool {
@@ -9833,9 +9819,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     self.mode_readback_boundary[idx] = None;
                 } else if let Some(idx) = disable_motor_idx {
                     self.motor_post_enable_feedback[idx] = false;
-                    if idx < self.motor_disable_seq.len() && self.motor_disable_seq[idx] == 0 {
-                        self.motor_disable_seq[idx] = tx_seq_mark;
-                    }
                 }
             }
             let write_done = self.now();
@@ -12591,7 +12574,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         self.disable_rest_established = false;
                         self.disable_tx_deadline = None;
                         self.disable_lease_gen = None;
-                        self.motor_disable_seq.fill(0);
                         let now = self.now();
                         self.torque_hs = Some(DamiaoTorque::RangeCheck(RangeCheckPhase {
                             pending_mask,
@@ -12624,7 +12606,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.disable_rest_established = false;
         self.disable_tx_deadline = None;
         self.disable_lease_gen = None;
-        self.motor_disable_seq.fill(0);
 
         let budget_armed = match max_rx_frames {
             Some(limit) => {
@@ -14075,7 +14056,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.disable_rest_established = false;
         self.disable_tx_deadline = None;
         self.disable_lease_gen = None;
-        self.motor_disable_seq.fill(0);
         self.enable_stop_stamp = None;
         self.enable_tx_deadline = None;
         self.enable_lease_gen = None;
@@ -14440,7 +14420,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
         if self.disable_dispatched_mask == 0 {
             self.disable_rest_established = false;
-            self.motor_disable_seq.fill(0);
         }
         let prev_awaiting_rx_boundary = self.awaiting_rx_boundary;
         // E2/L1: Drain RX before checking Rule A′ in `send` so the send-time check sees the
@@ -14559,7 +14538,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let all_mask = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
         if (self.disable_dispatched_mask & all_mask) == all_mask {
             self.disable_dispatched_mask = 0;
-            self.motor_disable_seq.fill(0);
         }
         if client_park && self.motor_ids.is_empty() {
             self.strict_stop_check(expected_stamp)?;
@@ -14675,17 +14653,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 continue;
             }
             if skip_dispatched {
-                let estop_now =
-                    self.is_stop_pending() || (!started_in_estop && self.is_stop_latched());
-                let stop_changed = self.current_stop_stamp() != start_stop_stamp;
-                if estop_now || stop_changed {
-                    abort_reason = Some(if estop_now {
-                        PartialDisableReason::Estop
-                    } else {
-                        PartialDisableReason::Stopped
-                    });
-                    break;
-                }
                 if self.disable_lease_gen.is_some_and(|g| self.is_lease_fenced(g)) {
                     abort_reason = Some(PartialDisableReason::LeaseLost);
                     break;
@@ -14909,7 +14876,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         started_in_estop,
                         client_park,
                         rest_established: true,
-                        confirm_polls_sent: 0,
                     });
                     return Ok(TorqueProgress::Pending { wake: self.now() });
                 }
@@ -14968,7 +14934,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 started_in_estop,
                 client_park,
                 rest_established: self.disable_rest_established,
-                confirm_polls_sent: 0,
             });
             return Ok(TorqueProgress::Pending { wake: self.now() });
         }
@@ -15013,67 +14978,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             started_in_estop,
             client_park,
             rest_established: self.disable_rest_established,
-            confirm_polls_sent: 0,
         });
         Ok(TorqueProgress::Pending { wake })
-    }
-
-    /// Emits read-only `0x7FF 0xCC` (`TxKind::DisableProbe`) status polls for motors that have not
-    /// yet replied `motor_status == 0` strictly after their disable TX.
-    fn probe_unconfirmed_disable_joints(
-        &mut self,
-        expiry: Option<Instant>,
-        next_probe_at: &mut Instant,
-    ) -> bool {
-        let now = self.now();
-        if !self.last_read_drained || self.awaiting_rx_boundary || now < *next_probe_at {
-            return false;
-        }
-        let mut probe_mask = 0u32;
-        let mut probe_count = 0usize;
-        let dof = self.motor_ids.len().min(handshake::MAX_MASK_JOINTS);
-        for i in 0..dof {
-            let confirmed = self.motor_status.get(i).copied() == Some(0)
-                && self.last_feedback_seq.get(i).copied().unwrap_or(0)
-                    > self.motor_disable_seq.get(i).copied().unwrap_or(0)
-                && self
-                    .last_feedback_instant
-                    .get(i)
-                    .copied()
-                    .flatten()
-                    .is_some_and(|t| now.saturating_duration_since(t) <= DAMIAO_FEEDBACK_VALID_WINDOW);
-            if !confirmed {
-                probe_mask |= 1u32 << i;
-                probe_count += 1;
-            }
-        }
-        if probe_count == 0 || self.remaining_rx_frame_limit() <= probe_count {
-            return false;
-        }
-        let dl = self.disable_step_deadline(expiry);
-        let mut probed_any = false;
-        for i in handshake::mask_joints(probe_mask) {
-            if !self.can_start_tick_tx() || dl.is_some_and(|d| d.passed(self.now())) {
-                break;
-            }
-            let Some(&id) = self.motor_ids.get(i) else { continue };
-            match self.send_plain(TxKind::DisableProbe, None, dl, false, |_| {
-                Some(damiao::build_refresh_frame(id))
-            }) {
-                Ok(_) => {
-                    let _ = self.ensure_tx_pass();
-                    self.record_tx_pass_attempt();
-                    probed_any = true;
-                }
-                Err(_) => break,
-            }
-        }
-        if probed_any {
-            *next_probe_at = self.now() + EVIDENCE_PROBE_INTERVAL;
-            let _ = self.can.flush();
-            let _ = self.receive_feedback();
-        }
-        probed_any
     }
 
     /// Emits spaced read-only `0x7FF 0xCC` (`TxKind::DisableProbe`) status probes for every motor
@@ -15265,7 +15171,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         started_in_estop: bool,
         client_park: bool,
         rest_established: bool,
-        mut confirm_polls_sent: u8,
     ) -> Result<TorqueProgress, ArmDriverError> {
         self.disable_rest_established = rest_established;
         let is_requested = matches!(kind, DisableKind::DisableRequested { .. });
@@ -15305,8 +15210,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
 
         // Phase A: Multi-tick initial dispatch (`repeats_sent == 0`, some motors still enabled).
         if repeats_sent == 0 && is_requested {
-            let estop_now = self.is_stop_pending() || (!started_in_estop && self.is_stop_latched());
-            let stop_changed = self.current_stop_stamp() != start_stop_stamp;
+            let cur_stamp = self.current_stop_stamp();
+            let estop_now = (!started_in_estop && self.is_stop_latched())
+                || cur_stamp.estop_gen != start_stop_stamp.estop_gen;
+            let stop_changed = cur_stamp.stop_gen != start_stop_stamp.stop_gen;
             if estop_now || stop_changed {
                 let reason = if estop_now {
                     PartialDisableReason::Estop
@@ -15383,7 +15290,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                             started_in_estop,
                             client_park,
                             rest_established,
-                            confirm_polls_sent,
                         });
                         let _ = after;
                         return Ok(TorqueProgress::Pending { wake });
@@ -15412,9 +15318,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 if idx < 64 && (self.disable_dispatched_mask & (1u64 << idx)) != 0 {
                     continue;
                 }
-                let estop_now =
-                    self.is_stop_pending() || (!started_in_estop && self.is_stop_latched());
-                let stop_changed = self.current_stop_stamp() != start_stop_stamp;
+                let cur_stamp = self.current_stop_stamp();
+                let estop_now = (!started_in_estop && self.is_stop_latched())
+                    || cur_stamp.estop_gen != start_stop_stamp.estop_gen;
+                let stop_changed = cur_stamp.stop_gen != start_stop_stamp.stop_gen;
                 if estop_now || stop_changed {
                     abort_reason = Some(if estop_now {
                         PartialDisableReason::Estop
@@ -15569,7 +15476,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     started_in_estop,
                     client_park,
                     rest_established,
-                    confirm_polls_sent: 0,
                 });
                 return Ok(TorqueProgress::Pending { wake });
             }
@@ -15587,52 +15493,20 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 started_in_estop,
                 client_park,
                 rest_established,
-                confirm_polls_sent,
             });
             return Ok(TorqueProgress::Pending { wake });
         }
 
-        // Phase B: All repeats dispatched -> confirm by status replies (0xCC poll if still unconfirmed).
+        // Phase B: All repeats dispatched -> complete cleanly.
         if repeats_sent >= DAMIAO_DISABLE_REPEATS {
-            if !is_requested || !self.needs_disable_status_confirm() || confirm_polls_sent >= 2 {
-                if mit_fenced {
-                    self.mit_fence = None;
-                }
-                self.disable_dispatched_mask = 0;
-                self.disable_rest_established = false;
-                self.disable_tx_deadline = None;
-                self.disable_lease_gen = None;
-                return Ok(TorqueProgress::Done(TorqueOutcome::Confirmed));
+            if mit_fenced {
+                self.mit_fence = None;
             }
-            let _ = self.probe_unconfirmed_disable_joints(expiry, &mut next_probe_at);
-            if !self.needs_disable_status_confirm() {
-                if mit_fenced {
-                    self.mit_fence = None;
-                }
-                self.disable_dispatched_mask = 0;
-                self.disable_rest_established = false;
-                self.disable_tx_deadline = None;
-                self.disable_lease_gen = None;
-                return Ok(TorqueProgress::Done(TorqueOutcome::Confirmed));
-            }
-            confirm_polls_sent = confirm_polls_sent.saturating_add(1);
-            let after = self.now();
-            let target_wake = next_probe_at.max(after + EVIDENCE_PROBE_INTERVAL);
-            let wake = expiry.map_or(target_wake, |exp| target_wake.min(exp));
-            self.torque_hs = Some(DamiaoTorque::Disable {
-                kind,
-                repeats_sent,
-                repeat_pass_mask,
-                next_repeat_at,
-                next_probe_at,
-                mit_fenced,
-                start_stop_stamp,
-                started_in_estop,
-                client_park,
-                rest_established,
-                confirm_polls_sent,
-            });
-            return Ok(TorqueProgress::Pending { wake });
+            self.disable_dispatched_mask = 0;
+            self.disable_rest_established = false;
+            self.disable_tx_deadline = None;
+            self.disable_lease_gen = None;
+            return Ok(TorqueProgress::Done(TorqueOutcome::Confirmed));
         }
 
         // Phase C: Bounded repeat passes (`1 <= repeats_sent < DAMIAO_DISABLE_REPEATS`).
@@ -15649,7 +15523,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 started_in_estop,
                 client_park,
                 rest_established,
-                confirm_polls_sent,
             });
             return Ok(TorqueProgress::Pending { wake });
         }
@@ -15742,7 +15615,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     started_in_estop,
                     client_park,
                     rest_established,
-                    confirm_polls_sent,
                 });
                 return Ok(TorqueProgress::Pending { wake });
             }
@@ -15764,7 +15636,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     started_in_estop,
                     client_park,
                     rest_established,
-                    confirm_polls_sent,
                 });
                 return Ok(TorqueProgress::Pending { wake });
             }
@@ -15801,7 +15672,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     started_in_estop,
                     client_park,
                     rest_established,
-                    confirm_polls_sent,
                 });
                 return Ok(TorqueProgress::Pending { wake });
             }
@@ -15813,45 +15683,14 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         repeats_sent = repeats_sent.saturating_add(1);
         repeat_pass_mask = 0;
         if repeats_sent >= DAMIAO_DISABLE_REPEATS {
-            if !is_requested || !self.needs_disable_status_confirm() {
-                if mit_fenced {
-                    self.mit_fence = None;
-                }
-                self.disable_dispatched_mask = 0;
-                self.disable_rest_established = false;
-                self.disable_tx_deadline = None;
-                self.disable_lease_gen = None;
-                return Ok(TorqueProgress::Done(TorqueOutcome::Confirmed));
+            if mit_fenced {
+                self.mit_fence = None;
             }
-            let _ = self.probe_unconfirmed_disable_joints(expiry, &mut next_probe_at);
-            if !self.needs_disable_status_confirm() {
-                if mit_fenced {
-                    self.mit_fence = None;
-                }
-                self.disable_dispatched_mask = 0;
-                self.disable_rest_established = false;
-                self.disable_tx_deadline = None;
-                self.disable_lease_gen = None;
-                return Ok(TorqueProgress::Done(TorqueOutcome::Confirmed));
-            }
-            confirm_polls_sent = confirm_polls_sent.saturating_add(1);
-            let after = self.now();
-            let target_wake = next_probe_at.max(after + EVIDENCE_PROBE_INTERVAL);
-            let wake = expiry.map_or(target_wake, |exp| target_wake.min(exp));
-            self.torque_hs = Some(DamiaoTorque::Disable {
-                kind,
-                repeats_sent,
-                repeat_pass_mask,
-                next_repeat_at,
-                next_probe_at,
-                mit_fenced,
-                start_stop_stamp,
-                started_in_estop,
-                client_park,
-                rest_established,
-                confirm_polls_sent,
-            });
-            return Ok(TorqueProgress::Pending { wake });
+            self.disable_dispatched_mask = 0;
+            self.disable_rest_established = false;
+            self.disable_tx_deadline = None;
+            self.disable_lease_gen = None;
+            return Ok(TorqueProgress::Done(TorqueOutcome::Confirmed));
         }
         next_repeat_at = self.now() + DAMIAO_DISABLE_REPEAT_INTERVAL;
         let wake = expiry.map_or(next_repeat_at, |exp| next_repeat_at.min(exp));
@@ -15866,7 +15705,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             started_in_estop,
             client_park,
             rest_established,
-            confirm_polls_sent,
         });
         Ok(TorqueProgress::Pending { wake })
     }
@@ -15984,7 +15822,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 started_in_estop,
                 client_park,
                 rest_established,
-                confirm_polls_sent,
             }) => self.poll_disable(
                 kind,
                 repeats_sent,
@@ -15996,7 +15833,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 started_in_estop,
                 client_park,
                 rest_established,
-                confirm_polls_sent,
             ),
         };
         self.rx_deadline = None;
