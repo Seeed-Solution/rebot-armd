@@ -1348,3 +1348,106 @@ fn a8_blocked_zero_check_store_offset_serialization_zero_alloc() {
         .unwrap();
     }
 }
+
+#[test]
+fn phase_marks_csw_mark_and_staged_publish_zero_alloc() {
+    use armd::diagnostics::tick::{
+        mid_csw_delta, stash_periodic_sample_with_post_end, take_periodic_sample_with_post_end,
+        us, CswMark, Holder, LockFreeTickStats, ReleasePhasesUs, ThreadUsage, TickSample,
+        UsageMark, WakeLatenessGuard,
+    };
+
+    let (delta, snap) = thread::spawn(|| {
+        let lf = LockFreeTickStats::new();
+        let loc = std::panic::Location::caller();
+        alloc::time_this_thread();
+
+        // Warm up TLS slots once before measuring.
+        {
+            let _g = WakeLatenessGuard::enter_periodic(100, true);
+            stash_periodic_sample_with_post_end(TickSample::default(), Instant::now());
+            let _ = take_periodic_sample_with_post_end();
+        }
+        let _ = CswMark::now();
+        let _ = UsageMark::now();
+        let _ = alloc::take();
+
+        let before = alloc::snapshot_counts();
+        for i in 0..200u32 {
+            let _g = WakeLatenessGuard::enter_periodic(u64::from(i) * 1_000, true);
+            let started = Instant::now();
+            let usage_start = UsageMark::now();
+            let locked = Instant::now();
+            let usage_locked = UsageMark::now();
+            let mid_csw_start = CswMark::now();
+            let lock_end = Instant::now();
+            let _allocs = alloc::take();
+            let after_alloc_read = Instant::now();
+            let after_ack_flush = Instant::now();
+            let after_terminal = Instant::now();
+            let released = Instant::now();
+            let usage_released = UsageMark::now();
+            let (mid_nvcsw, mid_nivcsw) = mid_csw_delta(&mid_csw_start, &usage_released);
+            let done = Instant::now();
+            let holder = Holder {
+                kind: "write",
+                location: loc,
+                command: Some("/api/v1/motion/jog"),
+                action_id: Some(u64::from(i)),
+                hold_us: 50,
+                acquire_us: 2,
+                acquired_before_wait_us: 10,
+                released_before_lock_us: 5,
+            };
+            let sample = TickSample {
+                tick_us: us(done.saturating_duration_since(started)),
+                release_us: 0,
+                wait_us: i,
+                lock_us: us(lock_end.saturating_duration_since(locked)),
+                post_us: us(done.saturating_duration_since(released)),
+                phases_us: ReleasePhasesUs {
+                    alloc_read: us(after_alloc_read.saturating_duration_since(lock_end)),
+                    ack_flush: us(after_ack_flush.saturating_duration_since(after_alloc_read)),
+                    terminal: us(after_terminal.saturating_duration_since(after_ack_flush)),
+                    guard_drop: us(released.saturating_duration_since(after_terminal)),
+                    post: us(done.saturating_duration_since(released)),
+                    publish: 0,
+                },
+                usage: ThreadUsage {
+                    mid_nvcsw,
+                    mid_nivcsw,
+                    ..armd::diagnostics::tick::thread_usage(&usage_start, &usage_locked, &usage_released)
+                },
+                waited_for: Some(holder),
+                longest_hold: Some(holder),
+                ..Default::default()
+            };
+            stash_periodic_sample_with_post_end(sample, done);
+            let (stashed, post_end) = take_periodic_sample_with_post_end().expect("stashed sample");
+            let seq = lf
+                .record_staged_with_publish(&stashed, || {
+                    let now = Instant::now();
+                    (
+                        us(now.saturating_duration_since(started)),
+                        us(now.saturating_duration_since(post_end)),
+                    )
+                })
+                .expect("record_staged_with_publish");
+            lf.amend_slot_release_and_publish_us(seq, 1, 1);
+        }
+        let delta = alloc::snapshot_counts().delta_since(before);
+        (delta, lf.snapshot())
+    })
+    .join()
+    .unwrap();
+
+    assert_eq!(
+        delta,
+        AllocCounts::ZERO,
+        "phase marks + CswMark + record_staged_with_publish must allocate 0 bytes: {delta:?}"
+    );
+    let mw = snap.max_wait.expect("max_wait");
+    assert_eq!(mw.sample.wait_us, 199);
+    assert_eq!(mw.handoff_us, Some(5));
+    assert!(snap.max_release.unwrap().sample.phases_us.publish >= 1);
+}

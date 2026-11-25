@@ -31,7 +31,7 @@ use super::urgent::{
     UrgentStopError, UrgentStopOutcome, URGENT_STOP_CAPACITY,
 };
 use crate::diagnostics::tick::{
-    LockPhases, ThreadUsage, TickSample, UsageMark, RELEASE_FLAG_CLEAR_OK,
+    LockPhases, ReleasePhasesUs, ThreadUsage, TickSample, UsageMark, RELEASE_FLAG_CLEAR_OK,
     RELEASE_FLAG_CLEAR_REFUSED, RELEASE_FLAG_ESTOP_APPLIED, RELEASE_FLAG_INJECT_ALLOC,
     RELEASE_FLAG_SAFETY_LATCH, RELEASE_FLAG_THERMAL_TRIP, RELEASE_FLAG_WATCHDOG_LATCH,
 };
@@ -6979,6 +6979,7 @@ fn control_thread_main(
                             obs_us: phases[4],
                             publish_us: crate::diagnostics::tick::us(done.saturating_duration_since(body_end)),
                         },
+                        phases_us: ReleasePhasesUs::default(),
                         usage: ThreadUsage {
                             lock_alloc_calls: allocs.calls.min(u64::from(u32::MAX)) as u32,
                             lock_alloc_us: (allocs.total_ns / 1000).min(u64::from(u32::MAX)) as u32,
@@ -7719,11 +7720,19 @@ pub fn run_periodic_with_deadline_and_clock(
                         ACTIVE_PERIODIC_RELEASE.try_with(|c| c.take()).ok().flatten()
                     {
                         if std::thread::panicking() {
-                            let sample = crate::diagnostics::tick::take_periodic_sample();
-                            if let (Some(sample), Some(ring)) = (sample, self.stats.legacy_tick_ring.get()) {
-                                let _ = ring.record_staged(&sample, || {
+                            let stashed = crate::diagnostics::tick::take_periodic_sample_with_post_end();
+                            if let (Some((sample, post_end)), Some(ring)) =
+                                (stashed, self.stats.legacy_tick_ring.get())
+                            {
+                                let _ = ring.record_staged_with_publish(&sample, || {
                                     let t = self.clock.map_or_else(mono_now_ns, ExecutorClock::now_ns);
-                                    crate::diagnostics::tick::ns_to_us_u32(t.saturating_sub(actual_ns))
+                                    let rel = crate::diagnostics::tick::ns_to_us_u32(
+                                        t.saturating_sub(actual_ns),
+                                    );
+                                    let pub_us = crate::diagnostics::tick::us(
+                                        Instant::now().saturating_duration_since(post_end),
+                                    );
+                                    (rel, pub_us)
                                 });
                             }
                             let mut exit_releases = Releases { period_ns, next_ns };
@@ -7741,8 +7750,10 @@ pub fn run_periodic_with_deadline_and_clock(
             }
             let _unwind_grid = PeriodicUnwindGridGuard { stats, clock };
             step(elapsed.as_secs_f64(), release_deadline);
+            let step_end_ns = now_ns();
             let _ = ACTIVE_PERIODIC_RELEASE.try_with(|c| c.take());
-            let sample = crate::diagnostics::tick::take_periodic_sample();
+            let sample = crate::diagnostics::tick::take_periodic_sample_with_post_end()
+                .map(|(s, post_end)| (s, post_end, step_end_ns));
             drop(_unwind_grid);
             sample
             // `_lateness_guard` drops here, strictly BEFORE final timing & ring publication.
@@ -7754,26 +7765,46 @@ pub fn run_periodic_with_deadline_and_clock(
             sleep_dur(Duration::from_nanos(post_stats_delay_ns));
         }
 
-        // Publish rolling sample FIRST (before completion seal). `record_staged` stages all
-        // payload fields into the unpublished slot, stamps `release_us` from `now_ns()`, and
-        // publishes `slot.seq` + `meta_seq`.
+        // Publish rolling sample FIRST (before completion seal). `record_staged_with_publish`
+        // stages all payload fields into the unpublished slot, stamps `release_us` and
+        // `phases_us.publish`, and publishes `slot.seq` + `meta_seq`.
         let mut stamped_us: u32 = 0;
+        let mut stamped_pub_us: u32 = 0;
+        let mut stashed_marks: Option<(Instant, u64)> = None;
         let recorded_seq = match (stashed_sample, stats.legacy_tick_ring.get()) {
-            (Some(sample), Some(ring)) => ring.record_staged(&sample, || {
-                let t = now_ns();
-                stamped_us = crate::diagnostics::tick::ns_to_us_u32(t.saturating_sub(actual_ns));
-                stamped_us
-            }),
+            (Some((sample, post_end, step_end_ns)), Some(ring)) => {
+                stashed_marks = Some((post_end, step_end_ns));
+                ring.record_staged_with_publish(&sample, || {
+                    let t = now_ns();
+                    stamped_us = crate::diagnostics::tick::ns_to_us_u32(t.saturating_sub(actual_ns));
+                    let wall_pub = crate::diagnostics::tick::us(
+                        Instant::now().saturating_duration_since(post_end),
+                    );
+                    let clock_pub =
+                        crate::diagnostics::tick::ns_to_us_u32(t.saturating_sub(step_end_ns));
+                    stamped_pub_us = wall_pub.max(clock_pub);
+                    (stamped_us, stamped_pub_us)
+                })
+            }
             _ => None,
         };
 
-        // If OS preemption crossed `record_staged`, amend the slot monotonically BEFORE the
-        // completion seal.
-        let probe_release_us =
-            crate::diagnostics::tick::ns_to_us_u32(now_ns().saturating_sub(actual_ns));
-        if let (Some(seq), Some(ring)) = (recorded_seq, stats.legacy_tick_ring.get()) {
-            if probe_release_us > stamped_us {
-                ring.amend_slot_release_us(seq, probe_release_us);
+        // If OS preemption crossed `record_staged_with_publish`, amend the slot monotonically
+        // BEFORE the completion seal.
+        if let (Some(seq), Some((post_end, step_end_ns)), Some(ring)) =
+            (recorded_seq, stashed_marks, stats.legacy_tick_ring.get())
+        {
+            let t2 = now_ns();
+            let probe_release_us =
+                crate::diagnostics::tick::ns_to_us_u32(t2.saturating_sub(actual_ns));
+            let probe_pub_us = crate::diagnostics::tick::us(
+                Instant::now().saturating_duration_since(post_end),
+            )
+            .max(crate::diagnostics::tick::ns_to_us_u32(
+                t2.saturating_sub(step_end_ns),
+            ));
+            if probe_release_us > stamped_us || probe_pub_us > stamped_pub_us {
+                ring.amend_slot_release_and_publish_us(seq, probe_release_us, probe_pub_us);
             }
         }
 
