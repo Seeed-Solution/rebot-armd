@@ -2181,13 +2181,10 @@ impl SupervisorInner {
                 let mut next_pending_mask = 0u64;
                 for j in 0..n {
                     self.measured_hold.joint_status[j] = report.joint_status[j];
-                    if matches!(
-                        report.joint_status[j],
-                        JointHoldStatus::Queued | JointHoldStatus::HeldStaleTarget
-                    ) && has_pending_holds
+                    if report.joint_status[j] == JointHoldStatus::Queued
+                        || (report.joint_status[j] == JointHoldStatus::HeldStaleTarget
+                            && has_pending_holds)
                     {
-                        next_pending_mask |= 1u64 << j;
-                    } else if report.joint_status[j] == JointHoldStatus::Queued {
                         next_pending_mask |= 1u64 << j;
                     }
                     // B2: Preserve captured hold targets while torque_intent == On; only clear
@@ -3989,9 +3986,7 @@ impl SupervisorInner {
         if !self.disable_pending || self.torque_transition.is_some() {
             return None;
         }
-        if self.driver.is_none() {
-            return None;
-        }
+        self.driver.as_ref()?;
         if matches!(
             self.background_disable_retry,
             Some(BackgroundDisableRetry::Exhausted)
@@ -4010,7 +4005,6 @@ impl SupervisorInner {
                 post_now: Instant,
                 still_pending: bool,
                 frames_dispatched: bool,
-                snap: OwnerDriverSnapshot,
             },
             Idle {
                 drv_now: Instant,
@@ -4032,7 +4026,7 @@ impl SupervisorInner {
                         let post_now = drv.clock_now();
                         let mut ages_buf = std::mem::take(&mut self.scratch.ages);
                         let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
-                        let snap = OwnerDriverSnapshot::capture_from_driver(
+                        self.owner_driver_snapshot = OwnerDriverSnapshot::capture_from_driver(
                             drv.as_ref(),
                             self.config.dof,
                             self.feedback_numeric_valid,
@@ -4050,7 +4044,6 @@ impl SupervisorInner {
                             post_now,
                             still_pending,
                             frames_dispatched,
-                            snap,
                         }
                     } else {
                         BgPollStep::Idle { drv_now }
@@ -4070,10 +4063,8 @@ impl SupervisorInner {
                 post_now,
                 still_pending,
                 frames_dispatched,
-                snap,
             } => {
                 self.reset_disable_lock_contention();
-                self.owner_driver_snapshot = snap;
                 match poll_res {
                     Ok(crate::driver::TorqueProgress::Done(_)) => {
                         self.disable_accepted();
