@@ -1575,10 +1575,8 @@ fn r12_m3_feetech_rt_disable_path_zero_alloc_and_honours_rx_budget_and_deadline(
     assert_eq!((a, f), (0, 0), "M3: read_joint_states_budgeted unsupported must allocate (0, 0)");
 
     let (r_bt, a, f) = counted(|| drv.begin_torque_budgeted(true, 6));
-    assert!(matches!(r_bt, Ok(armd::driver::TorqueProgress::Pending { .. })));
-    assert_eq!((a, f), (0, 0), "M3: Feetech begin_torque_budgeted(true) must allocate (0, 0)");
-    let (_, a_ab, f_ab) = counted(|| drv.abort_enable());
-    assert_eq!((a_ab, f_ab), (0, 0), "M3: Feetech abort_enable must allocate (0, 0)");
+    assert!(matches!(r_bt, Err(ArmDriverError::ProtocolStatic(_))));
+    assert_eq!((a, f), (0, 0), "M3: begin_torque_budgeted unsupported must allocate (0, 0)");
 
     let (r_pb, a, f) = counted(|| drv.poll_torque_budgeted(dl0, 6));
     assert!(matches!(r_pb, Err(ArmDriverError::ProtocolStatic(_))));

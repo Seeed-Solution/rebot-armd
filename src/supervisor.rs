@@ -902,11 +902,14 @@ pub struct SupervisorInner {
     /// never lock `self.driver` or mistake mutex contention for missing capability.
     pub(crate) driver_has_load_feedback: bool,
     pub(crate) driver_supports_rt_executor: bool,
-    pub(crate) driver_supports_budgeted_enable_await: bool,
     pub(crate) driver_supports_budgeted_disable_await: bool,
     /// True for the duration of a legacy control release servicing an in-flight non-broker torque
     /// transition so every driver lock acquisition (`lock_driver_for_tick`) stays non-blocking.
     pub(crate) nonblocking_driver_release: bool,
+    /// Set to `true` when a legacy WS torque completion slot publishes a terminal outcome under
+    /// the write guard; `ArmSupervisor` reads & clears it before dropping the guard and calls
+    /// `legacy_torque_notify.notify_waiters()` strictly OFF-LOCK (zero mutexes on control release).
+    pub(crate) legacy_torque_settled_this_tick: bool,
     /// Static torque direction (`"on"` / `"off"`) set by [`Self::service_torque_transition`] ONLY
     /// on ticks that serviced a legacy WS torque handshake step (not Park / BrokerTransition),
     /// consumed by `tick_shared` for `/api/v1/torque` diagnostics attribution.
@@ -2181,9 +2184,9 @@ impl SupervisorInner {
             legacy_torque_slots: std::array::from_fn(|_| Arc::new(driver_transitions::LegacyTorqueSlot::new())),
             driver_has_load_feedback: false,
             driver_supports_rt_executor: false,
-            driver_supports_budgeted_enable_await: false,
             driver_supports_budgeted_disable_await: false,
             nonblocking_driver_release: false,
+            legacy_torque_settled_this_tick: false,
             last_tick_torque_ws_direction: None,
             enable_lifecycle: driver_transitions::EnableLifecycle::Disarmed,
             torque_intent: driver_transitions::TorqueIntent::Off,
@@ -4698,14 +4701,28 @@ impl SupervisorInner {
             let first_gen = self.applied_estop_count + 1;
             self.reset_hold_tx_joint_progress();
             self.estop_state.latch();
-            if matches!(self.torque_transition, Some(driver_transitions::TorqueTransition::Enable(_))) {
+            // Non-blocking driver abort on E-stop (never stall behind a contended driver mutex
+            // before latching EStop and publishing `estop_applied`); retain `DetachedCancel` on
+            // `WouldBlock` so the next release drains `drv.abort_enable()` with zero enable TX.
+            let mut estop_cancel_was_torqued: Option<bool> = None;
+            if let Some(driver_transitions::TorqueTransition::Enable(ref reducer)) =
+                self.torque_transition
+            {
+                let was_t = reducer.was_torqued;
                 if let Some(ref d) = self.driver {
-                    if let Ok(mut drv) = d.lock() {
-                        drv.abort_enable();
+                    match d.try_lock() {
+                        Ok(mut drv) => drv.abort_enable(),
+                        Err(std::sync::TryLockError::WouldBlock) => {
+                            estop_cancel_was_torqued = Some(was_t);
+                        }
+                        Err(std::sync::TryLockError::Poisoned(_)) => {}
                     }
                 }
             }
             self.apply_stop_policy(StopPolicy::EStopLatch);
+            if let Some(was_t) = estop_cancel_was_torqued {
+                self.retain_detached_enable_cancel_if_clear(was_t);
+            }
             self.applied_estop_count = req;
             self.estop_applied.store(req, Ordering::SeqCst);
             if self.pending_estop_acks.len() < crate::rt_core::executor::ESTOP_ACK_CAPACITY {
@@ -4722,6 +4739,12 @@ impl SupervisorInner {
         } else {
             false
         }
+    }
+
+    #[doc(hidden)]
+    pub fn request_and_consume_estop_for_test(&mut self) -> bool {
+        let _ = self.estop_state.request_and_latch();
+        self.consume_pending_estop()
     }
 
     /// Pure, allocation-free evaluation of the next [`ThermalCooldown`] state from fresh driver
@@ -5928,7 +5951,6 @@ impl SupervisorInner {
         self.driver_has_torque_feedback = caps.torque_feedback;
         self.driver_has_load_feedback = caps.load_feedback;
         self.driver_supports_rt_executor = driver.supports_rt_executor().is_ok();
-        self.driver_supports_budgeted_enable_await = driver.supports_budgeted_enable_await();
         self.driver_supports_budgeted_disable_await = driver.supports_budgeted_disable_await();
         if let Some(pf) = self
             .config
@@ -8801,6 +8823,8 @@ impl SupervisorInner {
         // Retries pass the original `DisableKind` (`started_at`) back into the driver transmit
         // choke point, which enforces Rule A′ and the single 1 s total request lifetime at send time.
         if !self.rt_executor_owned
+            && !(self.last_tick_torque_ws_direction.is_some()
+                && !self.is_protective_disable_active())
             && !self.service_legacy_pending_disable()
             && !self.confirm_background_disable_if_ready()
             && self
@@ -10735,6 +10759,12 @@ pub struct ArmSupervisor {
     executor_hover_jobs: std::sync::Mutex<Vec<crate::calib_hover::HoverJob>>,
     /// Test-only override for legacy WS `/api/v1/torque` request deadline in ms (0 = default).
     legacy_torque_deadline_override_ms: AtomicU64,
+    /// Off-lock wakeup broadcast for legacy WS `/api/v1/torque` waiters, notified strictly AFTER
+    /// releasing `SupervisorLock::write` so control releases never touch Tokio's Notify mutex.
+    legacy_torque_notify: Arc<tokio::sync::Notify>,
+    /// Guards the single bounded headless cleanup task that drains a contended `DetachedCancel` or
+    /// expired `Detached` disable when no live control loop is ticking.
+    headless_detached_drain_active: Arc<AtomicBool>,
 }
 
 static NEXT_WS_CONN_ID: AtomicU64 = AtomicU64::new(1);
@@ -11100,7 +11130,67 @@ impl ArmSupervisor {
             watchdog_park_planning: Arc::new(AtomicBool::new(false)),
             executor_hover_jobs: std::sync::Mutex::new(Vec::new()),
             legacy_torque_deadline_override_ms: AtomicU64::new(0),
+            legacy_torque_notify: Arc::new(tokio::sync::Notify::new()),
+            headless_detached_drain_active: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Spawns at most one bounded off-lock cleanup task in headless mode (when no live control
+    /// loop is ticking) so a contended `DetachedCancel` or expired `Detached` disable left behind
+    /// after waiter timeout still drains once the driver mutex frees. Exits immediately if a live
+    /// control tick advances `control_release_seq` or ownership transfers.
+    fn spawn_headless_detached_drain_if_needed(&self, observed_seq: u64) {
+        if self
+            .headless_detached_drain_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let inner_lock = Arc::clone(&self.inner);
+        let active_flag = Arc::clone(&self.headless_detached_drain_active);
+        let notify = Arc::clone(&self.legacy_torque_notify);
+        tokio::spawn(async move {
+            struct ClearFlag(Arc<AtomicBool>);
+            impl Drop for ClearFlag {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
+            let _guard = ClearFlag(active_flag);
+            const DRAIN_INTERVAL: Duration = Duration::from_millis(25);
+            const DRAIN_BUDGET: Duration = Duration::from_micros(500);
+            let hard_deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < hard_deadline {
+                tokio::time::sleep(DRAIN_INTERVAL).await;
+                let (keep_going, settled_any) = {
+                    let mut inner = inner_lock.write().await;
+                    if inner.detached
+                        || inner.control_release_seq != observed_seq
+                        || !inner.has_detached_torque_transition()
+                    {
+                        (false, false)
+                    } else {
+                        let now = Instant::now();
+                        let budget = crate::rt_core::ops::ServiceBudget {
+                            now,
+                            deadline: now + DRAIN_BUDGET,
+                            max_rx_frames: crate::rt_core::ops::RX_FRAME_BUDGET,
+                        };
+                        let _ = inner.service_torque_transition(&budget);
+                        let settled =
+                            std::mem::replace(&mut inner.legacy_torque_settled_this_tick, false);
+                        (inner.has_detached_torque_transition(), settled)
+                    }
+                };
+                if settled_any {
+                    notify.notify_waiters();
+                }
+                if !keep_going {
+                    break;
+                }
+            }
+        });
     }
 
     /// Test-only override for legacy WS `/api/v1/torque` request deadline (0 / `None` = default 5 s).
@@ -11578,11 +11668,21 @@ impl ArmSupervisor {
                 guard.torque_transition = Some(driver_transitions::TorqueTransition::Enable(reducer));
             }
             Some(driver_transitions::TorqueTransition::Disable {
-                origin: driver_transitions::DisableOrigin::LegacyWs { .. },
+                origin: driver_transitions::DisableOrigin::LegacyWs { deadline, .. },
                 kind,
             }) => {
+                // Preserve `Some(deadline)` across owner handoff so an undispatched disable still
+                // expires cleanly on the new owner without transmitting past its deadline; once
+                // dispatched (or protective), the new owner clears the deadline and completes it.
+                let handoff_dl = if matches!(kind, crate::driver::DisableKind::DisableProtective { .. })
+                    || guard.torque_intent == driver_transitions::TorqueIntent::Off
+                {
+                    None
+                } else {
+                    Some(deadline)
+                };
                 guard.torque_transition = Some(driver_transitions::TorqueTransition::Disable {
-                    origin: driver_transitions::DisableOrigin::Detached,
+                    origin: driver_transitions::DisableOrigin::Detached { deadline: handoff_dl },
                     kind,
                 });
             }
@@ -11603,8 +11703,9 @@ impl ArmSupervisor {
             hooks,
         ) {
             Ok((handle, sinks)) => {
+                let mut any_settled = false;
                 for slot in &handoff_slots {
-                    slot.settle_owner_transferred();
+                    any_settled |= slot.settle_owner_transferred();
                 }
                 *self.sinks.lock().unwrap_or_else(|e| e.into_inner()) = Some(sinks);
                 self.executor_base_gen.store(initial_gen, Ordering::Release);
@@ -11615,6 +11716,9 @@ impl ArmSupervisor {
                 }
                 rollback.armed = false;
                 drop(guard);
+                if any_settled {
+                    self.legacy_torque_notify.notify_waiters();
+                }
                 // Forward any socket-close disconnects queued in the tiny window between draining
                 // `guard` and publishing `OWNER_EXECUTOR` directly to the new RT owner.
                 self.forward_pending_disconnects_to_executor(&handle);
@@ -11632,8 +11736,9 @@ impl ArmSupervisor {
                 Err(ArmError::Internal(msg))
             }
             Err((None, msg)) => {
+                let mut any_settled = false;
                 for slot in &handoff_slots {
-                    slot.settle_owner_transferred();
+                    any_settled |= slot.settle_owner_transferred();
                 }
                 self.published_config.set_available(false);
                 {
@@ -11643,6 +11748,9 @@ impl ArmSupervisor {
                 }
                 rollback.armed = false;
                 drop(guard);
+                if any_settled {
+                    self.legacy_torque_notify.notify_waiters();
+                }
                 Err(ArmError::Internal(msg))
             }
         }
@@ -13641,12 +13749,18 @@ impl ArmSupervisor {
                     consumed: false,
                 };
 
-                // Bounded fallback poll interval when no live control loop is ticking (e.g.
-                // headless tests or pre-executor setup). When a live 50 Hz control loop is
-                // running, `control_release_seq_atomic` advances every 20 ms so the waiter never
-                // re-acquires the write lock.
+                // Bounded off-lock waiter polling + headless fallback:
+                // - Normal live control loop (50 Hz): `tick_shared` publishes wait-free to the
+                //   atomic slot and calls `self.legacy_torque_notify.notify_waiters()` strictly
+                //   OFF-LOCK after dropping `SupWriteGuard`; the 5 ms poll cap catches any
+                //   non-tick settlement (Stop / E-stop / lease fence / handoff race) cleanly.
+                // - Headless mode (no ticking control loop): fallback is throttled to >= 25 ms AND
+                //   re-verifies `inner.control_release_seq == last_tick_seq` under the write guard
+                //   so a live control tick that ran while queued keeps single progress ownership.
+                const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(5);
                 const FALLBACK_STEP_INTERVAL: Duration = Duration::from_millis(25);
                 const FALLBACK_STEP_BUDGET: Duration = Duration::from_micros(500);
+                let mut last_fallback_step = Instant::now();
 
                 let outcome = loop {
                     if let Some(done) = slot.take_settled(token) {
@@ -13655,7 +13769,7 @@ impl ArmSupervisor {
                     }
                     let now_wait = Instant::now();
                     if now_wait >= deadline {
-                        let done = {
+                        let (done, needs_headless_drain, settled_any, cur_seq) = {
                             let mut inner = self.inner.write().await;
                             let io_scope = crate::diagnostics::tick::HoldIoScope::enter();
                             inner.set_command("/api/v1/torque");
@@ -13666,65 +13780,94 @@ impl ArmSupervisor {
                             } else {
                                 inner.timeout_legacy_torque_transition(token, slot_idx, enabled)
                             };
+                            let needs_drain =
+                                !inner.detached && inner.has_detached_torque_transition();
+                            let settled_any =
+                                std::mem::replace(&mut inner.legacy_torque_settled_this_tick, false);
+                            let seq = inner.control_release_seq;
                             inner.set_io_timing(io_scope.finish());
-                            out
+                            (out, needs_drain, settled_any, seq)
                         };
+                        if settled_any {
+                            self.legacy_torque_notify.notify_waiters();
+                        }
+                        if needs_headless_drain {
+                            self.spawn_headless_detached_drain_if_needed(cur_seq);
+                        }
                         slot_guard.consumed = true;
                         break done;
                     }
-                    let notified = slot.notified();
+                    let notified = self.legacy_torque_notify.notified();
                     if let Some(done) = slot.take_settled(token) {
                         slot_guard.consumed = true;
                         break done;
                     }
                     let rem = deadline.saturating_duration_since(now_wait);
-                    let wait_for = rem.min(FALLBACK_STEP_INTERVAL);
-                    if tokio::time::timeout(wait_for, notified).await.is_err() {
-                        if let Some(done) = slot.take_settled(token) {
+                    let wait_for = rem.min(WAIT_POLL_INTERVAL);
+                    let _ = tokio::time::timeout(wait_for, notified).await;
+                    if let Some(done) = slot.take_settled(token) {
+                        slot_guard.consumed = true;
+                        break done;
+                    }
+                    let cur_tick_seq = tick_seq_counter.load(Ordering::Acquire);
+                    if cur_tick_seq != last_tick_seq {
+                        last_tick_seq = cur_tick_seq;
+                        last_fallback_step = Instant::now();
+                    } else if last_fallback_step.elapsed() >= FALLBACK_STEP_INTERVAL
+                        && Instant::now() < deadline
+                    {
+                        last_fallback_step = Instant::now();
+                        let (expired_out, needs_headless_drain, settled_any, observed_seq) = {
+                            let mut inner = self.inner.write().await;
+                            let io_scope = crate::diagnostics::tick::HoldIoScope::enter();
+                            inner.set_command("/api/v1/torque");
+                            inner.set_direction(if enabled { "on" } else { "off" });
+                            let step_now = Instant::now();
+                            let out = if step_now >= deadline {
+                                Some(if inner.detached {
+                                    slot.take_settled(token)
+                                        .unwrap_or(LegacyTorqueOutcome::OwnerTransferred)
+                                } else {
+                                    inner.timeout_legacy_torque_transition(
+                                        token, slot_idx, enabled,
+                                    )
+                                })
+                            } else {
+                                // Re-verify under the write guard that no live control tick ran
+                                // while we waited to acquire `SupervisorLock::write`.
+                                if !inner.detached
+                                    && inner.control_release_seq == last_tick_seq
+                                    && inner.has_legacy_torque_transition_token(token)
+                                {
+                                    let budget = crate::rt_core::ops::ServiceBudget {
+                                        now: step_now,
+                                        deadline: step_now + FALLBACK_STEP_BUDGET,
+                                        max_rx_frames: crate::rt_core::ops::RX_FRAME_BUDGET,
+                                    };
+                                    let _ = inner.service_torque_transition(&budget);
+                                }
+                                None
+                            };
+                            let needs_drain = out.is_some()
+                                && !inner.detached
+                                && inner.has_detached_torque_transition();
+                            let settled_any =
+                                std::mem::replace(&mut inner.legacy_torque_settled_this_tick, false);
+                            let seq = inner.control_release_seq;
+                            inner.set_io_timing(io_scope.finish());
+                            (out, needs_drain, settled_any, seq)
+                        };
+                        if settled_any {
+                            self.legacy_torque_notify.notify_waiters();
+                        }
+                        if needs_headless_drain {
+                            self.spawn_headless_detached_drain_if_needed(observed_seq);
+                        }
+                        if let Some(done) = expired_out {
                             slot_guard.consumed = true;
                             break done;
                         }
-                        let cur_tick_seq = tick_seq_counter.load(Ordering::Acquire);
-                        if cur_tick_seq != last_tick_seq {
-                            last_tick_seq = cur_tick_seq;
-                        } else if Instant::now() < deadline {
-                            let expired_out = {
-                                let mut inner = self.inner.write().await;
-                                let io_scope = crate::diagnostics::tick::HoldIoScope::enter();
-                                inner.set_command("/api/v1/torque");
-                                inner.set_direction(if enabled { "on" } else { "off" });
-                                let step_now = Instant::now();
-                                let out = if step_now >= deadline {
-                                    Some(if inner.detached {
-                                        slot.take_settled(token)
-                                            .unwrap_or(LegacyTorqueOutcome::OwnerTransferred)
-                                    } else {
-                                        inner.timeout_legacy_torque_transition(
-                                            token, slot_idx, enabled,
-                                        )
-                                    })
-                                } else {
-                                    if !inner.detached
-                                        && inner.has_legacy_torque_transition_token(token)
-                                    {
-                                        let budget = crate::rt_core::ops::ServiceBudget {
-                                            now: step_now,
-                                            deadline: step_now + FALLBACK_STEP_BUDGET,
-                                            max_rx_frames: crate::rt_core::ops::RX_FRAME_BUDGET,
-                                        };
-                                        let _ = inner.service_torque_transition(&budget);
-                                    }
-                                    None
-                                };
-                                inner.set_io_timing(io_scope.finish());
-                                out
-                            };
-                            if let Some(done) = expired_out {
-                                slot_guard.consumed = true;
-                                break done;
-                            }
-                            last_tick_seq = tick_seq_counter.load(Ordering::Acquire);
-                        }
+                        last_tick_seq = observed_seq;
                     }
                 };
 
@@ -14735,16 +14878,16 @@ impl ArmSupervisor {
         use crate::diagnostics::tick::{us, UsageMark};
         let started = Instant::now();
         let usage_start = UsageMark::now();
-        let (mut obs, terminal_obs, wait, lock_held, control_hz, pending_zc, pending_wd, phases, log, locked, usage_locked, pre, publish, allocs, tick_tq_dir, tick_io) = {
+        let (mut obs, terminal_obs, wait, control_hz, pending_zc, pending_wd, phases, log, locked, usage_locked, pre, publish, allocs, tick_tq_dir, tick_io, settled_legacy) = {
             let (mut inner, generation) = self.inner.write_tick().await;
+            let locked = Instant::now();
+            let usage_locked = UsageMark::now();
             if inner.detached || self.owner_mode() != OWNER_LEGACY {
                 return None;
             }
             if self.pending_disconnect_hold.load(Ordering::Acquire) > 0 {
                 let _ = self.drain_pending_disconnects_under_guard(&mut inner, None);
             }
-            let locked = Instant::now();
-            let usage_locked = UsageMark::now();
             let _ = crate::diagnostics::alloc::take();
             // No other guard exists now: the log is complete up to the guard waited for.
             let log = self.inner.take_log();
@@ -14786,11 +14929,17 @@ impl ArmSupervisor {
             } else {
                 None
             };
-            (kept, terminal_obs, locked - started, lock_end - locked, control_hz, pending_zc, pending_wd, phases, log, locked, usage_locked,
-                body_start - locked, lock_end - body_end, allocs, tick_tq_dir, tick_io)
+            let settled_legacy =
+                std::mem::replace(&mut inner.legacy_torque_settled_this_tick, false);
+            (kept, terminal_obs, locked - started, control_hz, pending_zc, pending_wd, phases, log, locked, usage_locked,
+                body_start - locked, lock_end - body_end, allocs, tick_tq_dir, tick_io, settled_legacy)
         };
         let released = Instant::now();
         let usage_released = UsageMark::now();
+        let lock_held = released.saturating_duration_since(locked);
+        if settled_legacy {
+            self.legacy_torque_notify.notify_waiters();
+        }
         // Record EVERY control-tick guard into opt-in test history (single Relaxed load when
         // disabled) so slow non-torque ticks are never hidden from lock-proof assertions.
         self.inner.record_tick_hold_for_history(

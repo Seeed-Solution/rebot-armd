@@ -703,9 +703,10 @@ pub enum DisableOrigin {
         slot: u8,
         deadline: Instant,
     },
-    /// Legacy WS disable whose waiter timed out after disable frames were dispatched or after
-    /// upgrading to a protective disable; the control tick completes the hardware disable cleanly.
-    Detached,
+    /// Legacy WS disable whose waiter timed out or was detached on owner handoff.
+    /// Carries `deadline: Some(dl)` while undispatched so an expired undispatched request aborts
+    /// cleanly under a single driver lock; `deadline: None` once frames are dispatched or protective.
+    Detached { deadline: Option<Instant> },
 }
 
 /// Number of preallocated legacy WS torque completion slots on [`SupervisorInner`].
@@ -765,13 +766,14 @@ const fn pack_slot(token: u64, state: u64) -> u64 {
     (token << 2) | (state & SLOT_STATE_MASK)
 }
 
-/// Preallocated, lock-free per-request completion slot shared between a legacy WS waiter and the
-/// control tick. Packs `(token << 2) | state` into a single `AtomicU64` so token and state always
-/// transition atomically (zero skew/ABA, 0 mutexes, 0 heap allocs/frees on control release).
+/// Preallocated, strictly wait-free per-request completion slot shared between a legacy WS waiter
+/// and the control tick. Packs `(token << 2) | state` into a single `AtomicU64` with zero mutexes,
+/// zero `Notify` waiter locks, and zero heap allocs/frees on the control release.
+/// Off-lock waiter wakeup is performed by `ArmSupervisor::legacy_torque_notify` AFTER dropping
+/// `SupervisorLock::write`.
 pub(crate) struct LegacyTorqueSlot {
     packed: std::sync::atomic::AtomicU64,
     outcome: std::cell::UnsafeCell<Option<LegacyTorqueOutcome>>,
-    notify: tokio::sync::Notify,
 }
 
 // SAFETY: Access to `outcome` is strictly serialized by the single-word atomic state machine:
@@ -788,7 +790,6 @@ impl LegacyTorqueSlot {
         Self {
             packed: std::sync::atomic::AtomicU64::new(SLOT_IDLE),
             outcome: std::cell::UnsafeCell::new(None),
-            notify: tokio::sync::Notify::new(),
         }
     }
 
@@ -823,9 +824,10 @@ impl LegacyTorqueSlot {
             });
     }
 
-    /// Wait-free settlement on the control release (never blocks on a preempted waiter, 0 allocs).
+    /// Wait-free settlement on the control release (zero mutexes, zero allocs).
+    /// Returns `true` iff an outcome was published for a live waiter (`SLOT_IN_FLIGHT -> SLOT_SETTLED`).
     /// When the waiter already abandoned the slot, skips invoking `make` and returns the slot to `Idle`.
-    pub(crate) fn settle_with(&self, token: u64, make: impl FnOnce() -> LegacyTorqueOutcome) {
+    pub(crate) fn settle_with(&self, token: u64, make: impl FnOnce() -> LegacyTorqueOutcome) -> bool {
         let in_flight = pack_slot(token, SLOT_IN_FLIGHT);
         let settled = pack_slot(token, SLOT_SETTLED);
         let abandoned = pack_slot(token, SLOT_ABANDONED);
@@ -834,10 +836,10 @@ impl LegacyTorqueSlot {
             let _ = self
                 .packed
                 .compare_exchange(abandoned, SLOT_IDLE, Ordering::AcqRel, Ordering::Acquire);
-            return;
+            return false;
         }
         if cur != in_flight {
-            return;
+            return false;
         }
         // SAFETY: owner has exclusive write access to `outcome` while in `SLOT_IN_FLIGHT`.
         unsafe { *self.outcome.get() = Some(make()) };
@@ -845,18 +847,20 @@ impl LegacyTorqueSlot {
             .packed
             .compare_exchange(in_flight, settled, Ordering::Release, Ordering::Acquire)
         {
-            Ok(_) => self.notify.notify_one(),
+            Ok(_) => true,
             Err(v) if v == abandoned => {
                 // Waiter abandoned concurrently; waiter will not read `outcome`.
                 // SAFETY: exclusive ownership stays with owner until `SLOT_IDLE`.
                 unsafe { *self.outcome.get() = None };
                 self.packed.store(SLOT_IDLE, Ordering::Release);
+                false
             }
-            Err(_) => {}
+            Err(_) => false,
         }
     }
 
-    pub(crate) fn settle_owner_transferred(&self) {
+    /// Returns `true` iff an `OwnerTransferred` outcome was published for a live waiter.
+    pub(crate) fn settle_owner_transferred(&self) -> bool {
         let cur = self.packed.load(Ordering::Acquire);
         let st = cur & SLOT_STATE_MASK;
         let tok_bits = cur & !SLOT_STATE_MASK;
@@ -865,6 +869,7 @@ impl LegacyTorqueSlot {
                 let _ = self
                     .packed
                     .compare_exchange(cur, SLOT_IDLE, Ordering::AcqRel, Ordering::Acquire);
+                false
             }
             SLOT_IN_FLIGHT => {
                 // SAFETY: owner has exclusive write access to `outcome` while in `SLOT_IN_FLIGHT`.
@@ -875,16 +880,17 @@ impl LegacyTorqueSlot {
                     Ordering::Release,
                     Ordering::Acquire,
                 ) {
-                    Ok(_) => self.notify.notify_one(),
+                    Ok(_) => true,
                     Err(v) if v == (tok_bits | SLOT_ABANDONED) => {
                         // SAFETY: waiter abandoned concurrently and will not read `outcome`.
                         unsafe { *self.outcome.get() = None };
                         self.packed.store(SLOT_IDLE, Ordering::Release);
+                        false
                     }
-                    Err(_) => {}
+                    Err(_) => false,
                 }
             }
-            _ => {}
+            _ => false,
         }
     }
 
@@ -917,10 +923,6 @@ impl LegacyTorqueSlot {
             }
             Err(_) => {}
         }
-    }
-
-    pub(crate) fn notified(&self) -> tokio::sync::futures::Notified<'_> {
-        self.notify.notified()
     }
 }
 
@@ -1059,7 +1061,7 @@ fn enable_driver_err_code(e: &crate::driver::ArmDriverError) -> &'static str {
     } else {
         match e {
             E::TorqueOffWouldDrop | E::DisableRequestExpired => "TORQUE_OFF_WOULD_DROP",
-            E::EnableAuthorityExpired => "LEASE_LOST",
+            E::LeaseFenced | E::EnableAuthorityExpired => "LEASE_LOST",
             E::Transport(_) => "DRIVER_WRITE_FAILED",
             _ => "ENABLE_FAILED",
         }
@@ -1885,7 +1887,7 @@ impl SupervisorInner {
                                         LegacyTorqueFailure::FeedbackUnavailable,
                                     );
                                 }
-                                DisableOrigin::Detached => {}
+                                DisableOrigin::Detached { .. } => {}
                             }
                         }
                         return Err(RequestDisableError {
@@ -1943,7 +1945,7 @@ impl SupervisorInner {
                                         Some(message),
                                     );
                                 }
-                                DisableOrigin::Detached => {}
+                                DisableOrigin::Detached { .. } => {}
                             }
                             code
                         } else {
@@ -1992,7 +1994,7 @@ impl SupervisorInner {
                                     }
                                 }
                             }
-                            DisableOrigin::Detached => {
+                            DisableOrigin::Detached { .. } => {
                                 let _ = self.torque_off_finish_rt();
                             }
                         }
@@ -2031,7 +2033,7 @@ impl SupervisorInner {
                                 LegacyTorqueFailure::FeedbackUnavailable,
                             );
                         }
-                        DisableOrigin::Detached => {}
+                        DisableOrigin::Detached { .. } => {}
                     }
                 }
                 return Err(RequestDisableError {
@@ -2126,7 +2128,7 @@ impl SupervisorInner {
                                             Some(message),
                                         );
                                     }
-                                    DisableOrigin::Detached => {}
+                                    DisableOrigin::Detached { .. } => {}
                                 }
                                 code
                             } else {
@@ -2190,7 +2192,7 @@ impl SupervisorInner {
                                         Some(message),
                                     );
                                 }
-                                DisableOrigin::Detached => {}
+                                DisableOrigin::Detached { .. } => {}
                             }
                             code
                         } else {
@@ -2254,7 +2256,7 @@ impl SupervisorInner {
                                 Some(message),
                             );
                         }
-                        DisableOrigin::Detached => {}
+                        DisableOrigin::Detached { .. } => {}
                     }
                     code
                 } else {
@@ -2310,7 +2312,7 @@ impl SupervisorInner {
                         }
                     }
                 }
-                DisableOrigin::Detached => {
+                DisableOrigin::Detached { .. } => {
                     let _ = self.torque_off_finish_rt();
                 }
             }
@@ -3489,6 +3491,9 @@ impl SupervisorInner {
         // 2 & 3. Cancel queued enable work (NEVER send automatic rollback disable frames),
         // refresh owner-held driver snapshot in the SAME single lock, capture per-joint holds from
         // owner data (no extra driver lock), and drop queued driver holds outside `hold_mask`.
+        // On mutex contention (`WouldBlock`), retain `DetachedCancel` so a subsequent control tick
+        // drains `drv.abort_enable()` with zero enable TX and unblocks measured-hold writes.
+        let mut cancel_contended = false;
         if let Some(d) = self.driver.take() {
             match d.try_lock() {
                 Ok(mut drv) => {
@@ -3497,7 +3502,12 @@ impl SupervisorInner {
                     let (hold_mask, _) = self.capture_measured_hold_from_owner();
                     drv.drop_pending_holds_outside_mask(hold_mask);
                 }
-                Err(_) => {
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    cancel_contended = true;
+                    self.owner_driver_snapshot.invalidate();
+                    let _ = self.capture_measured_hold_from_owner();
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
                     self.owner_driver_snapshot.invalidate();
                     let _ = self.capture_measured_hold_from_owner();
                 }
@@ -3505,6 +3515,9 @@ impl SupervisorInner {
             self.driver = Some(d);
         } else {
             let _ = self.snapshot_measured_hold();
+        }
+        if cancel_contended {
+            self.retain_detached_enable_cancel_if_clear(_was_torqued);
         }
         // 4. Record captured measured positions and enter FailedHold (no cached-command fallback).
         let dof = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
@@ -3783,7 +3796,9 @@ impl SupervisorInner {
                     authority,
                     req_dl,
                 );
-                drv.set_enable_tx_deadline(tx_dl);
+                let expected_lease_gen = authority
+                    .and_then(|a| (a.lease_generation != 0).then_some(a.lease_generation));
+                drv.set_enable_authority(tx_dl, expected_lease_gen);
                 let started = if budgeted && retry_unverified_ranges {
                     drv.begin_torque_budgeted_with_range_retry(true, 0)
                 } else if budgeted {
@@ -3934,15 +3949,84 @@ impl SupervisorInner {
         }
     }
 
-    /// Cancels an in-flight `EnableOrigin::ParkRearm` cleanly on client Stop without latching
-    /// `EnableFailed`, preserving holding torque on any energized joints.
-    fn cancel_park_rearm_on_stop(&mut self, action_id: u64, was_torqued: bool) {
-        if let Some(ref d) = self.driver {
-            if let Ok(mut drv) = d.lock() {
-                drv.abort_enable();
-            }
+    /// True when a protective (thermal or process-exit) hardware disable is currently pending.
+    #[inline]
+    pub(crate) fn is_protective_disable_active(&self) -> bool {
+        self.disable_pending
+            && matches!(
+                self.active_disable_kind,
+                Some(crate::driver::DisableKind::DisableProtective { .. })
+            )
+    }
+
+    /// Retains `EnableOrigin::DetachedCancel` (`Cancelling` phase) when a driver mutex was
+    /// contended during an enable abort, provided no newer transition or protective disable owns
+    /// the slot. A later release drains `drv.abort_enable()` with zero enable TX.
+    pub(crate) fn retain_detached_enable_cancel_if_clear(&mut self, was_torqued: bool) {
+        if self.torque_transition.is_none() && !self.is_protective_disable_active() {
+            self.torque_transition = Some(TorqueTransition::Enable(EnableReducer {
+                origin: EnableOrigin::DetachedCancel,
+                phase: EnableReducerPhase::Cancelling,
+                was_torqued,
+                prev_gripper_cmd: None,
+                authority: None,
+                budgeted: true,
+            }));
         }
-        self.is_torqued = was_torqued || self.driver_any_enabled();
+    }
+
+    /// Single non-blocking enable-abort helper shared across Stop, ParkRearm abort, timeout, and
+    /// E-stop paths. Returns `(drv_any_enabled, contended)`. When `retain_on_contention` is true
+    /// and `driver.try_lock()` returns `WouldBlock`, installs `DetachedCancel` so a later release
+    /// drains `drv.abort_enable()` with zero enable TX.
+    pub(crate) fn abort_enable_driver_nonblocking(
+        &mut self,
+        was_torqued: bool,
+        retain_on_contention: bool,
+    ) -> (bool, bool) {
+        let mut drv_any_enabled = false;
+        let mut contended = false;
+        if let Some(d) = self.driver.take() {
+            match d.try_lock() {
+                Ok(mut drv) => {
+                    let enable_dispatched = drv.enable_frames_dispatched();
+                    drv.abort_enable();
+                    self.refresh_owner_driver_snapshot_from_ref(drv.as_ref());
+                    drv_any_enabled = enable_dispatched
+                        || drv.enable_state() != EnableState::Disabled
+                        || drv.has_any_joint_enabled()
+                        || drv.has_known_partial_enable();
+                    if was_torqued || drv_any_enabled {
+                        let (hold_mask, _) = self.capture_measured_hold_from_owner();
+                        drv.drop_pending_holds_outside_mask(hold_mask);
+                    }
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    contended = true;
+                    drv_any_enabled = true;
+                    self.owner_driver_snapshot.invalidate();
+                    let _ = self.capture_measured_hold_from_owner();
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    drv_any_enabled = true;
+                    self.owner_driver_snapshot.invalidate();
+                    let _ = self.capture_measured_hold_from_owner();
+                }
+            }
+            self.driver = Some(d);
+        }
+        if contended && retain_on_contention {
+            self.retain_detached_enable_cancel_if_clear(was_torqued);
+        }
+        (drv_any_enabled, contended)
+    }
+
+    /// Cancels an in-flight `EnableOrigin::ParkRearm` cleanly on client Stop without latching
+    /// `EnableFailed`, preserving holding torque on any energized joints (non-blocking `try_lock`,
+    /// retaining `DetachedCancel` on contention).
+    fn cancel_park_rearm_on_stop(&mut self, action_id: u64, was_torqued: bool) {
+        let (drv_any_enabled, _) = self.abort_enable_driver_nonblocking(was_torqued, true);
+        self.is_torqued = was_torqued || drv_any_enabled;
         self.pending_rearm = true;
         if self.park_continuation.is_some_and(|c| c.action_id == action_id) {
             self.park_continuation = None;
@@ -4117,7 +4201,10 @@ impl SupervisorInner {
                                 reducer.authority,
                                 req_dl,
                             );
-                            drv.set_enable_tx_deadline(tx_dl);
+                            let expected_lease_gen = reducer
+                                .authority
+                                .and_then(|a| (a.lease_generation != 0).then_some(a.lease_generation));
+                            drv.set_enable_authority(tx_dl, expected_lease_gen);
                             let (r, rx) = if let Some(b) = budget {
                                 let span = b.deadline.saturating_duration_since(b.now);
                                 let r = if reducer.budgeted {
@@ -4234,6 +4321,48 @@ impl SupervisorInner {
                         )
                     }
                     Err(e) => {
+                        // Major 1: If the driver stopped an enable poll due to a stop-stamp change
+                        // (`EstopInhibited`) on `EnableOrigin::LegacyWs`, resolve live E-stop vs
+                        // ordinary client Stop so an ordinary Stop aborts cleanly without latching
+                        // `EnableFailed` or falsely reporting `ESTOP_ACTIVE`.
+                        if crate::driver::is_estop_inhibited(&e) {
+                            if let EnableOrigin::LegacyWs {
+                                token,
+                                slot,
+                                stop_gen,
+                                prev_torque_intent,
+                                ..
+                            } = reducer.origin
+                            {
+                                let is_estop = self.estop_pending()
+                                    || self.e_stop_latched.load(Ordering::SeqCst)
+                                    || matches!(self.safety.state(), SafetyState::EStop);
+                                if !is_estop
+                                    && (self.urgent_stop_unapplied()
+                                        || self.current_stop_gen() != stop_gen)
+                                {
+                                    let estop = self.cancel_legacy_enable_on_stop(
+                                        token,
+                                        slot,
+                                        reducer.was_torqued,
+                                        prev_torque_intent,
+                                    );
+                                    return (
+                                        EnableStepOutcome::Failed {
+                                            rt_code: if estop { "ESTOP_ACTIVE" } else { "STOPPED" },
+                                            message: crate::safety::BoundedText::new(if estop {
+                                                "interrupted by E-stop"
+                                            } else {
+                                                "enable cancelled by stop"
+                                            }),
+                                            feedback_unavailable: false,
+                                            estop_interrupted: estop,
+                                        },
+                                        rx,
+                                    );
+                                }
+                            }
+                        }
                         let mut rt_code = enable_driver_err_code(&e);
                         if matches!(e, crate::driver::ArmDriverError::EnableAuthorityExpired) {
                             if let EnableOrigin::LegacyWs { deadline, .. } = reducer.origin {
@@ -5080,7 +5209,23 @@ impl SupervisorInner {
                     | TorqueTransition::Disable {
                         origin: DisableOrigin::Park { .. }
                             | DisableOrigin::LegacyWs { .. }
-                            | DisableOrigin::Detached,
+                            | DisableOrigin::Detached { .. },
+                        ..
+                    }
+            )
+        )
+    }
+
+    pub(crate) fn has_detached_torque_transition(&self) -> bool {
+        matches!(
+            self.torque_transition,
+            Some(
+                TorqueTransition::Enable(EnableReducer {
+                    origin: EnableOrigin::DetachedCancel,
+                    ..
+                })
+                    | TorqueTransition::Disable {
+                        origin: DisableOrigin::Detached { .. },
                         ..
                     }
             )
@@ -5101,22 +5246,6 @@ impl SupervisorInner {
                     }
             ) if t == token
         )
-    }
-
-    fn driver_any_enabled(&self) -> bool {
-        let Some(ref d) = self.driver else {
-            return false;
-        };
-        match d.try_lock() {
-            Ok(drv) => {
-                drv.enable_state() != EnableState::Disabled
-                    || drv.has_any_joint_enabled()
-                    || drv.has_known_partial_enable()
-            }
-            Err(_) => {
-                self.last_poll_enable_state != EnableState::Disabled || self.last_poll_partial_enable
-            }
-        }
     }
 
     /// Starts a torque-enable transition without waiting for its confirmation (the RT's
@@ -5268,7 +5397,8 @@ impl SupervisorInner {
         }
     }
 
-    /// Aborts a pending `ParkRearm` enable transition safely (preserving holding torque).
+    /// Aborts a pending `ParkRearm` enable transition safely (non-blocking `try_lock`, preserving
+    /// holding torque and retaining `DetachedCancel` on driver mutex contention).
     pub(crate) fn abort_park_rearm_transition(&mut self) {
         let Some(TorqueTransition::Enable(EnableReducer {
             origin: EnableOrigin::ParkRearm { .. },
@@ -5279,8 +5409,8 @@ impl SupervisorInner {
             return;
         };
         self.torque_transition = None;
-        if let Some(ref d) = self.driver { if let Ok(mut drv) = d.lock() { drv.abort_enable(); } }
-        self.is_torqued = was_torqued || self.driver_any_enabled();
+        let (drv_any_enabled, _) = self.abort_enable_driver_nonblocking(was_torqued, true);
+        self.is_torqued = was_torqued || drv_any_enabled;
         self.pending_rearm = true;
     }
 
@@ -5409,24 +5539,34 @@ impl SupervisorInner {
         None
     }
 
-    fn settle_legacy_ws_accepted(&self, token: u64, slot: u8) {
+    fn settle_legacy_ws_accepted(&mut self, token: u64, slot: u8) {
+        let epoch_id = self.safety.epoch_id();
+        let safety_state = self.safety.state_arc();
+        let is_torqued = self.is_torqued;
+        let control_mode_gravity_comp = self.gravity_comp_active();
         if let Some(s) = self.legacy_torque_slots.get(usize::from(slot)) {
-            s.settle_with(token, || LegacyTorqueOutcome::Accepted {
-                epoch_id: self.safety.epoch_id(),
-                safety_state: self.safety.state_arc(),
-                is_torqued: self.is_torqued,
-                control_mode_gravity_comp: self.gravity_comp_active(),
-            });
+            if s.settle_with(token, || LegacyTorqueOutcome::Accepted {
+                epoch_id,
+                safety_state,
+                is_torqued,
+                control_mode_gravity_comp,
+            }) {
+                self.legacy_torque_settled_this_tick = true;
+            }
         }
     }
 
-    fn settle_legacy_ws_failed(&self, token: u64, slot: u8, failure: LegacyTorqueFailure) {
+    fn settle_legacy_ws_failed(&mut self, token: u64, slot: u8, failure: LegacyTorqueFailure) {
+        let epoch_id = self.safety.epoch_id();
+        let safety_state = self.safety.state_arc();
         if let Some(s) = self.legacy_torque_slots.get(usize::from(slot)) {
-            s.settle_with(token, || LegacyTorqueOutcome::Failed {
+            if s.settle_with(token, || LegacyTorqueOutcome::Failed {
                 failure,
-                epoch_id: self.safety.epoch_id(),
-                safety_state: self.safety.state_arc(),
-            });
+                epoch_id,
+                safety_state,
+            }) {
+                self.legacy_torque_settled_this_tick = true;
+            }
         }
     }
 
@@ -5511,48 +5651,7 @@ impl SupervisorInner {
             self.settle_legacy_ws_failed(token, slot, LegacyTorqueFailure::EStopActive);
             return true;
         }
-        let mut drv_any_enabled = false;
-        let mut cancel_pending_contention = false;
-        if let Some(d) = self.driver.take() {
-            match d.try_lock() {
-                Ok(mut drv) => {
-                    let enable_dispatched = drv.enable_frames_dispatched();
-                    drv.abort_enable();
-                    self.refresh_owner_driver_snapshot_from_ref(drv.as_ref());
-                    drv_any_enabled = enable_dispatched
-                        || drv.enable_state() != EnableState::Disabled
-                        || drv.has_any_joint_enabled()
-                        || drv.has_known_partial_enable();
-                    if was_torqued || drv_any_enabled {
-                        let (hold_mask, _) = self.capture_measured_hold_from_owner();
-                        drv.drop_pending_holds_outside_mask(hold_mask);
-                    }
-                }
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    // Retain explicit Cancelling phase so control ticks retry `drv.abort_enable()`
-                    // with zero enable TX until the driver's `torque_hs` is cleared and measured
-                    // hold writes are unblocked.
-                    cancel_pending_contention = true;
-                    drv_any_enabled = true;
-                    let _ = self.capture_measured_hold_from_owner();
-                }
-                Err(std::sync::TryLockError::Poisoned(_)) => {
-                    drv_any_enabled = true;
-                    let _ = self.capture_measured_hold_from_owner();
-                }
-            }
-            self.driver = Some(d);
-        }
-        if cancel_pending_contention {
-            self.torque_transition = Some(TorqueTransition::Enable(EnableReducer {
-                origin: EnableOrigin::DetachedCancel,
-                phase: EnableReducerPhase::Cancelling,
-                was_torqued,
-                prev_gripper_cmd: None,
-                authority: None,
-                budgeted: true,
-            }));
-        }
+        let (drv_any_enabled, _) = self.abort_enable_driver_nonblocking(was_torqued, true);
         let any_energized = was_torqued || drv_any_enabled;
         if !any_energized {
             self.enable_lifecycle = EnableLifecycle::Disarmed;
@@ -5649,9 +5748,7 @@ impl SupervisorInner {
             admitted_epoch: s.estop_epoch,
         };
         let prev_torque_intent = this.torque_intent;
-        let budgeted = this.driver.is_none()
-            || this.driver_supports_rt_executor
-            || this.driver_supports_budgeted_enable_await;
+        let budgeted = this.driver.is_none() || this.driver_supports_rt_executor;
         let origin = EnableOrigin::LegacyWs {
             token,
             slot: slot_idx,
@@ -5920,6 +6017,7 @@ impl SupervisorInner {
                 slot.release_unstarted(token);
                 let mut err_detail =
                     crate::safety::BoundedText::<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>::empty();
+                err_detail.push_str("Torque disable transmission failed: ");
                 e.write_bounded(&mut err_detail);
                 let refused = matches!(
                     e,
@@ -5964,6 +6062,74 @@ impl SupervisorInner {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DisableExpiryDecision {
+    Aborted,
+    KeepDetachedDispatched,
+    ContendedRetry,
+}
+
+impl SupervisorInner {
+    /// Single locked decision for an expired non-protective disable (`LegacyWs` or `Detached`):
+    /// - Protective disable -> never aborted (`KeepDetachedDispatched`).
+    /// - Missing driver or poisoned lock -> clears transition + retry state (`Aborted`).
+    /// - Contended `try_lock()` -> keeps `Detached { deadline: Some(dl) }` pending without clearing
+    ///   retry state (`ContendedRetry`).
+    /// - Acquired single driver guard -> inspects `disable_frames_dispatched()` and, when
+    ///   undispatched, calls `abort_pending_disable()` under the SAME guard; clears retry state
+    ///   (including `active_disable_client_park`) ONLY on confirmed abort.
+    fn try_abort_expired_undispatched_disable(
+        &mut self,
+        kind: crate::driver::DisableKind,
+        deadline: Option<Instant>,
+    ) -> DisableExpiryDecision {
+        let is_protective =
+            matches!(kind, crate::driver::DisableKind::DisableProtective { .. });
+        if is_protective {
+            self.torque_transition = Some(TorqueTransition::Disable {
+                origin: DisableOrigin::Detached { deadline: None },
+                kind,
+            });
+            return DisableExpiryDecision::KeepDetachedDispatched;
+        }
+        let Some(ref d) = self.driver else {
+            self.clear_active_disable_retry_state();
+            return DisableExpiryDecision::Aborted;
+        };
+        let decision = match d.try_lock() {
+            Err(std::sync::TryLockError::WouldBlock) => DisableExpiryDecision::ContendedRetry,
+            Err(std::sync::TryLockError::Poisoned(_)) => DisableExpiryDecision::Aborted,
+            Ok(mut drv) => {
+                if self.torque_intent == TorqueIntent::Off || drv.disable_frames_dispatched() {
+                    DisableExpiryDecision::KeepDetachedDispatched
+                } else if drv.abort_pending_disable() {
+                    DisableExpiryDecision::Aborted
+                } else {
+                    // Driver refused abort (e.g., driver-internal protective state); keep active
+                    // without clearing retry state and without misclassifying as aborted.
+                    DisableExpiryDecision::KeepDetachedDispatched
+                }
+            }
+        };
+        match decision {
+            DisableExpiryDecision::Aborted => self.clear_active_disable_retry_state(),
+            DisableExpiryDecision::ContendedRetry => {
+                self.torque_transition = Some(TorqueTransition::Disable {
+                    origin: DisableOrigin::Detached { deadline },
+                    kind,
+                });
+            }
+            DisableExpiryDecision::KeepDetachedDispatched => {
+                self.torque_transition = Some(TorqueTransition::Disable {
+                    origin: DisableOrigin::Detached { deadline: None },
+                    kind,
+                });
+            }
+        }
+        decision
+    }
 
     /// Resolves an expired legacy WS torque transition under the owner write guard.
     /// - When `settle_slot` is `false` (waiter-driven timeout): checks for an already-settled
@@ -6004,27 +6170,8 @@ impl SupervisorInner {
                         EnableOrigin::LegacyWs { prev_torque_intent, .. } => prev_torque_intent,
                         _ => TorqueIntent::Off,
                     };
-                    let mut drv_any_enabled = false;
-                    let mut cancel_pending_contention = false;
-                    if let Some(ref d) = self.driver {
-                        match d.try_lock() {
-                            Ok(mut drv) => {
-                                let enable_dispatched = drv.enable_frames_dispatched();
-                                drv.abort_enable();
-                                drv_any_enabled = enable_dispatched
-                                    || drv.enable_state() != EnableState::Disabled
-                                    || drv.has_any_joint_enabled()
-                                    || drv.has_known_partial_enable();
-                            }
-                            Err(std::sync::TryLockError::WouldBlock) => {
-                                cancel_pending_contention = true;
-                                drv_any_enabled = true;
-                            }
-                            Err(std::sync::TryLockError::Poisoned(_)) => {
-                                drv_any_enabled = true;
-                            }
-                        }
-                    }
+                    let (drv_any_enabled, contended) =
+                        self.abort_enable_driver_nonblocking(reducer.was_torqued, false);
                     if !reducer.was_torqued && !drv_any_enabled {
                         self.enable_lifecycle = EnableLifecycle::Disarmed;
                         self.is_torqued = false;
@@ -6036,15 +6183,8 @@ impl SupervisorInner {
                             buf.push_str("enable transition timed out");
                         });
                     }
-                    if cancel_pending_contention {
-                        self.torque_transition = Some(TorqueTransition::Enable(EnableReducer {
-                            origin: EnableOrigin::DetachedCancel,
-                            phase: EnableReducerPhase::Cancelling,
-                            was_torqued: reducer.was_torqued,
-                            prev_gripper_cmd: None,
-                            authority: None,
-                            budgeted: true,
-                        }));
+                    if contended {
+                        self.retain_detached_enable_cancel_if_clear(reducer.was_torqued);
                     }
                 }
             }
@@ -6067,39 +6207,16 @@ impl SupervisorInner {
             );
             let mut aborted_before_dispatch = false;
             if matches_ours {
-                if let Some(TorqueTransition::Disable { kind, .. }) = self.torque_transition.take()
+                if let Some(TorqueTransition::Disable {
+                    origin: DisableOrigin::LegacyWs { deadline, .. },
+                    kind,
+                }) = self.torque_transition.take()
                 {
-                    let is_protective =
-                        matches!(kind, crate::driver::DisableKind::DisableProtective { .. });
-                    let already_dispatched = self.torque_intent == TorqueIntent::Off
-                        || self.driver.as_ref().is_some_and(|d| {
-                            d.try_lock()
-                                .map_or(true, |drv| drv.disable_frames_dispatched())
-                        });
-                    if is_protective || already_dispatched {
-                        // Never cancel protective or already-dispatched hardware disables;
-                        // detach the waiter so control ticks finish the disable cleanly.
-                        self.torque_transition = Some(TorqueTransition::Disable {
-                            origin: DisableOrigin::Detached,
-                            kind,
-                        });
-                    } else {
-                        let aborted = self.driver.as_ref().is_none_or(|d| {
-                            d.try_lock()
-                                .is_ok_and(|mut drv| drv.abort_pending_disable())
-                        });
-                        if aborted {
-                            self.disable_pending = false;
-                            self.active_disable_kind = None;
-                            self.last_disable_attempt = None;
-                            self.background_disable_retry = None;
-                            aborted_before_dispatch = true;
-                        } else {
-                            self.torque_transition = Some(TorqueTransition::Disable {
-                                origin: DisableOrigin::Detached,
-                                kind,
-                            });
-                        }
+                    if matches!(
+                        self.try_abort_expired_undispatched_disable(kind, Some(deadline)),
+                        DisableExpiryDecision::Aborted
+                    ) {
+                        aborted_before_dispatch = true;
                     }
                 }
             }
@@ -7077,7 +7194,6 @@ impl SupervisorInner {
         &mut self,
         budget: &crate::rt_core::ops::ServiceBudget,
     ) -> Option<TransitionPoll> {
-        use crate::driver::TorqueProgress as Drv;
         use crate::rt_core::ops::TorqueProgress as Rt;
         let t = self.torque_transition.take()?;
         let ws_origin_dir = match t {
@@ -7086,13 +7202,13 @@ impl SupervisorInner {
                 ..
             }) => Some("on"),
             TorqueTransition::Disable {
-                origin: DisableOrigin::LegacyWs { .. } | DisableOrigin::Detached,
+                origin: DisableOrigin::LegacyWs { .. } | DisableOrigin::Detached { .. },
                 ..
             } => Some("off"),
             _ => None,
         };
         self.last_tick_torque_ws_direction = ws_origin_dir;
-        // Enforce authoritative request deadline BEFORE dispatch, retry, or arming (Major 1).
+        // Enforce authoritative request deadline BEFORE dispatch, retry, or arming (Major 1 / B4).
         match t {
             TorqueTransition::Enable(EnableReducer {
                 origin: EnableOrigin::LegacyWs { token, slot, deadline, .. },
@@ -7118,8 +7234,45 @@ impl SupervisorInner {
                     broker_owned: false,
                 });
             }
+            TorqueTransition::Disable {
+                origin: DisableOrigin::Detached { deadline: Some(dl) },
+                kind,
+            } if Instant::now() >= dl => {
+                match self.try_abort_expired_undispatched_disable(kind, Some(dl)) {
+                    DisableExpiryDecision::Aborted => {
+                        return Some(TransitionPoll {
+                            progress: Err("DEADLINE_EXPIRED"),
+                            rx: None,
+                            broker_owned: false,
+                        });
+                    }
+                    DisableExpiryDecision::ContendedRetry => {
+                        return Some(TransitionPoll {
+                            progress: Ok(Rt::Pending { wake: budget.now }),
+                            rx: None,
+                            broker_owned: false,
+                        });
+                    }
+                    DisableExpiryDecision::KeepDetachedDispatched => {
+                        // Already dispatched (or protective): let the next line poll to completion
+                        // with `deadline: None`.
+                        let next = self.torque_transition.take()?;
+                        return self.service_torque_transition_post_deadline(next, budget);
+                    }
+                }
+            }
             _ => {}
         }
+        self.service_torque_transition_post_deadline(t, budget)
+    }
+
+    fn service_torque_transition_post_deadline(
+        &mut self,
+        t: TorqueTransition,
+        budget: &crate::rt_core::ops::ServiceBudget,
+    ) -> Option<TransitionPoll> {
+        use crate::driver::TorqueProgress as Drv;
+        use crate::rt_core::ops::TorqueProgress as Rt;
         let broker_owned = matches!(
             t,
             TorqueTransition::Enable(EnableReducer { origin: EnableOrigin::BrokerTransition, .. })
@@ -7196,7 +7349,7 @@ impl SupervisorInner {
                                 LegacyTorqueFailure::StaticCode("INTERNAL"),
                             );
                         }
-                        DisableOrigin::BrokerTransition | DisableOrigin::Detached => {}
+                        DisableOrigin::BrokerTransition | DisableOrigin::Detached { .. } => {}
                     }
                     return Some(TransitionPoll { progress: Err("INTERNAL"), rx: None, broker_owned });
                 }
@@ -7204,7 +7357,7 @@ impl SupervisorInner {
                 let control_release_seq = self.control_release_seq;
                 let nonblocking_lock = self.rt_executor_owned
                     || broker_owned
-                    || matches!(origin, DisableOrigin::LegacyWs { .. } | DisableOrigin::Detached);
+                    || matches!(origin, DisableOrigin::LegacyWs { .. } | DisableOrigin::Detached { .. });
                 let poll_out = {
                     let d = self.driver.as_ref().expect("checked is_some");
                     let guard = if nonblocking_lock {
@@ -7284,7 +7437,7 @@ impl SupervisorInner {
                                     LegacyTorqueFailure::FeedbackUnavailable,
                                 );
                             }
-                            DisableOrigin::BrokerTransition | DisableOrigin::Detached => {}
+                            DisableOrigin::BrokerTransition | DisableOrigin::Detached { .. } => {}
                         }
                         return Some(TransitionPoll {
                             progress: Err("FEEDBACK_UNAVAILABLE"),
@@ -7331,7 +7484,7 @@ impl SupervisorInner {
                             };
                             Some(TransitionPoll { progress, rx, broker_owned })
                         }
-                        DisableOrigin::Detached => {
+                        DisableOrigin::Detached { .. } => {
                             self.disable_accepted();
                             let progress = self.torque_off_finish_rt().map(|()| Rt::Done);
                             Some(TransitionPoll { progress, rx, broker_owned })
@@ -7376,7 +7529,7 @@ impl SupervisorInner {
                                         LegacyTorqueFailure::EStopActive,
                                     );
                                 }
-                                DisableOrigin::BrokerTransition | DisableOrigin::Detached => {}
+                                DisableOrigin::BrokerTransition | DisableOrigin::Detached { .. } => {}
                             }
                             return Some(TransitionPoll {
                                 progress: Err("ESTOP_ACTIVE"),
@@ -7399,6 +7552,7 @@ impl SupervisorInner {
                         );
                         let mut err_detail =
                             crate::safety::BoundedText::<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>::empty();
+                        err_detail.push_str("Torque disable transmission failed: ");
                         e.write_bounded(&mut err_detail);
                         let (code, text) = if client_park_stopped {
                             self.clear_active_disable_retry_state();
@@ -7445,7 +7599,7 @@ impl SupervisorInner {
                                     Some(err_detail),
                                 );
                             }
-                            DisableOrigin::BrokerTransition | DisableOrigin::Detached => {}
+                            DisableOrigin::BrokerTransition | DisableOrigin::Detached { .. } => {}
                         }
                         Some(TransitionPoll {
                             progress: Err(code),
@@ -9781,7 +9935,7 @@ mod panic_disable_tests {
                 matches!(
                     inner.torque_transition,
                     Some(TorqueTransition::Disable {
-                        origin: DisableOrigin::Detached,
+                        origin: DisableOrigin::Detached { .. },
                         ..
                     })
                 ),

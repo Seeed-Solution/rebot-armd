@@ -336,11 +336,8 @@ impl ArmDriver for ZeroOffsetDriver {
     fn supports_budgeted_disable_await(&self) -> bool {
         self.inner.supports_budgeted_disable_await()
     }
-    fn supports_budgeted_enable_await(&self) -> bool {
-        self.inner.supports_budgeted_enable_await()
-    }
-    fn set_enable_tx_deadline(&mut self, deadline: Option<Instant>) {
-        self.inner.set_enable_tx_deadline(deadline)
+    fn set_enable_authority(&mut self, deadline: Option<Instant>, expected_lease_gen: Option<u64>) {
+        self.inner.set_enable_authority(deadline, expected_lease_gen)
     }
     fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool { self.inner.feedback_all_within(dof, max_age) }
     fn feedback_joints_within(&self, joints: &[usize], max_age: Duration) -> bool { self.inner.feedback_joints_within(joints, max_age) }
