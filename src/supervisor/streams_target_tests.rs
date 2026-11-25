@@ -671,3 +671,163 @@ fn lease_commit_authorizes_servo_stream_expiry_revokes_before_target_and_clear_f
         "clear_fault must authorize the committed lease's servo stream"
     );
 }
+
+#[test]
+fn expired_lease_during_pending_torque_enable_preserves_step2_timing_and_revokes_target() {
+    use crate::rt_core::broker::ClientId;
+    use crate::rt_core::requests::lease::{
+        install_lease_acquire, ConnectionHandle, LeaseAcquire, LeaseInstallCtx, LeaseOutcome,
+    };
+    use crate::supervisor::driver_transitions::{EnableAuthority, TorqueTransition};
+
+    let mut inner = SupervisorInner::new(ArmConfig {
+        lease_timeout_ms: 200,
+        ..ArmConfig::rebot_dm()
+    });
+    inner.tick(0.02);
+    inner.register_live_connection(1).unwrap();
+    let (mut fx, _broker, tw, stop) = ReleaseFixture::new(inner, BOOT, Capacities::default());
+    let mut port = TargetPort::new(tw, ArmId::LOCAL, BOOT);
+
+    let conn1 = ConnectionHandle::try_new(1, "connection:1").unwrap();
+    let ctx1 = LeaseInstallCtx {
+        expected_arm: ArmId::LOCAL,
+        expected_boot: BOOT,
+        stamp_arm: ArmId::LOCAL,
+        stamp_boot: BOOT,
+        now: fx.now(),
+        request_id: crate::supervisor::next_admission_request_id(),
+        client: ClientId(1),
+        deadline: fx.now() + Duration::from_secs(1),
+        enforce_single_use: true,
+    };
+    let g1 = match install_lease_acquire(
+        &mut fx.core,
+        &LeaseAcquire {
+            connection: conn1,
+            label: crate::model::HolderLabel::new("c1"),
+            has_label: true,
+        },
+        &ctx1,
+    )
+    .unwrap()
+    {
+        LeaseOutcome::Granted { generation, .. } => generation,
+        other => panic!("expected Granted, got {other:?}"),
+    };
+    assert_eq!(fx.core.core.target_authority().stream, Some(servo_stream(g1)));
+
+    // Simulate an in-flight TorqueTransition::Enable owned by g1.
+    fx.core.torque_transition = Some(TorqueTransition::Enable {
+        was_torqued: false,
+        prev_gripper_cmd: None,
+        authority: EnableAuthority {
+            lease_generation: g1,
+            owner_conn_id: 1,
+            admitted_epoch: fx.core.safety.epoch_id(),
+        },
+    });
+
+    // Submit a target while the lease is live, then advance past lease_timeout (200 ms).
+    let mut q = fx.core.commanded_positions.clone();
+    let q0 = q[0];
+    q[0] += 0.25;
+    let mut s1 = ServoStream::new();
+    s1.lease_granted(g1);
+    let auth1 = Authority {
+        lease_generation: g1,
+        epoch: fx.core.safety.epoch_id(),
+        stop_generation: stop.current(),
+        ..Authority::default()
+    };
+    fx.clock().advance(Duration::from_millis(100));
+    assert_eq!(
+        port.submit_servo(
+            &mut s1,
+            &ServoMessage {
+                sequence_id: Some(1),
+                positions: &q,
+                authority: auth1,
+                received_at: fx.now(),
+                calibration_busy: false,
+            }
+        ),
+        None
+    );
+    fx.clock().advance(Duration::from_millis(110));
+
+    // Step 1 sync must revoke target authority and queue close_servo(g1) WITHOUT prematurely
+    // aborting the in-flight TorqueTransition::Enable before Step 2 `service_torque_transition`.
+    assert!(fx.core.sync_nonblocking_disconnect_fence(fx.now()));
+    assert_eq!(
+        fx.core.core.target_authority().stream,
+        None,
+        "Step 1 expiry fence must revoke servo stream before target intake"
+    );
+    assert!(
+        matches!(fx.core.torque_transition, Some(TorqueTransition::Enable { .. })),
+        "Step 1 expiry fence must not prematurely abort TorqueTransition::Enable before Step 2"
+    );
+
+    // Running the full release lets Step 2 abort TorqueTransition::Enable cleanly and Step 4
+    // refuse the buffered target with LEASE_LOST (zero motion output).
+    let rep = fx.step();
+    assert!(
+        fx.core.torque_transition.is_none(),
+        "Step 2 service_torque_transition must abort the expired Enable transition"
+    );
+    assert_eq!(rep.target.map(|(_, r)| r), Some(Err("LEASE_LOST")));
+    assert_eq!(fx.core.servo_target, None);
+    assert!((fx.core.commanded_positions[0] - q0).abs() < 1e-6);
+}
+
+#[test]
+fn servo_j7_admitted_stamp_updates_only_when_frame_moves_j7() {
+    let mut inner = SupervisorInner::new(ArmConfig {
+        lease_timeout_ms: 600_000,
+        ..ArmConfig::rebot_dm()
+    });
+    inner.tick(0.02);
+    let s0 = inner.current_admission_stamp();
+    let a0 = inner.check_admission(s0).unwrap();
+    SupervisorInner::enable_torque(a0).expect("arm");
+    let g1 = inner.acquire_lease("conn-j7").expect("lease");
+    let ep = inner.safety.epoch_id();
+
+    // Clear stamp after arming so we can observe exact stamping behavior on servo frames.
+    inner.j7_admitted_stamp = None;
+    let base = inner.commanded_positions.clone();
+
+    // Frame moving only J1 (J7 unchanged) must NOT stamp `j7_admitted_stamp`.
+    let mut q_j1_only = base.clone();
+    q_j1_only[0] += 0.05;
+    let st1 = crate::supervisor::AdmissionStamp::for_rt_internal(0, ep, g1);
+    let ad1 = inner.check_admission(st1).unwrap();
+    SupervisorInner::servo_slice_rt(ad1, &q_j1_only, ep).expect("j1-only frame accepted");
+    assert_eq!(
+        inner.j7_admitted_stamp, None,
+        "servo frame that does not move J7 must not advance j7_admitted_stamp"
+    );
+
+    // Frame moving J7 must stamp `j7_admitted_stamp` from its admission.
+    let mut q_j7 = q_j1_only.clone();
+    let g_idx = inner.config.gripper_index().expect("gripper joint");
+    let g_lim = &inner.config.limits[g_idx];
+    let mid = 0.5 * (g_lim.min_position + g_lim.max_position);
+    q_j7[g_idx] = if (mid - q_j7[g_idx]).abs() > 1e-2 {
+        mid
+    } else {
+        g_lim.min_position + 0.25 * (g_lim.max_position - g_lim.min_position)
+    };
+    let st2 = crate::supervisor::AdmissionStamp::for_rt_internal(0, ep, g1);
+    let ad2 = inner.check_admission(st2).unwrap();
+    SupervisorInner::servo_slice_rt(ad2, &q_j7, ep).expect("j7-moving frame accepted");
+    assert_eq!(
+        inner.j7_admitted_stamp,
+        Some(crate::driver::PosForceIntentStamp {
+            stop_gen: 0,
+            estop_epoch: ep,
+        }),
+        "servo frame moving J7 must stamp j7_admitted_stamp from its admission"
+    );
+}

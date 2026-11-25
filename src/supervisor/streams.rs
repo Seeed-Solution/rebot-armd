@@ -185,6 +185,50 @@ impl SupervisorInner {
         result
     }
 
+    /// Zero-allocation RT variant of [`Self::servo_target_workspace`] (never builds allocating
+    /// [`crate::chain::WorkspaceFailure`] strings on refusal).
+    fn servo_target_workspace_rt(&mut self, target: &[f32]) -> Result<(), &'static str> {
+        let mut bufs = std::mem::take(&mut self.ws_eval_bufs);
+        let result = (|| {
+            let Some((ws, cam)) = self.workspace_policy() else { return Ok(()); };
+            if self.config.arm_model.frames_f32(&self.commanded_positions).is_none()
+                || self.config.arm_model.frames_f32(target).is_none()
+            {
+                return Err("WORKSPACE_VIOLATION");
+            }
+            let eval = crate::chain::WorkspaceEvaluator::new_with_tcp_in(
+                &self.config.arm_model,
+                ws,
+                cam,
+                self.config.tcp_offset,
+                &mut bufs,
+            )
+            .with_escape_tol(crate::kinematics::WORKSPACE_EPS);
+            let checked = if !eval.capsules_valid() {
+                Err("WORKSPACE_VIOLATION")
+            } else {
+                let mut c0 = eval.alloc_buf();
+                let mut clr = eval.alloc_buf();
+                if eval.eval_into(&self.commanded_positions, &mut c0, "plan").is_err() {
+                    Err("WORKSPACE_VIOLATION")
+                } else {
+                    let mut min_depths = eval.init_min_depths(&c0);
+                    if eval.eval_into(target, &mut clr, "plan").is_err()
+                        || !eval.check_and_advance_rt(&clr, &mut min_depths)
+                    {
+                        Err("WORKSPACE_VIOLATION")
+                    } else {
+                        Ok(())
+                    }
+                }
+            };
+            eval.recycle(&mut bufs);
+            checked
+        })();
+        self.ws_eval_bufs = bufs;
+        result
+    }
+
     /// [`Self::servo_step_workspace`]'s check; the new minimum depths (None: no workspace).
     pub(super) fn servo_step_workspace_in(&self, next: &[f32], phase: &str, bufs: &mut crate::chain::EvalBufs)
         -> Result<Option<crate::kinematics::SlotBuf>, SafetyError> {
@@ -288,10 +332,34 @@ impl SupervisorInner {
         }
     }
 
+    fn clamp_j7_if_stale(&self, targets: &mut [f32], j7_gate: crate::supervisor::J7PosForceGate) {
+        if j7_gate.stale {
+            if let Some(g) = self.config.gripper_index() {
+                if targets.len() > g {
+                    if let Some(freeze_pos) = j7_gate.freeze_pos {
+                        targets[g] = freeze_pos;
+                    } else if g < self.commanded_positions.len() {
+                        targets[g] = self.commanded_positions[g];
+                    }
+                }
+            }
+        }
+    }
+
     pub(super) fn validate_and_filter_servo_targets(
         &mut self,
         targets: &mut [f32],
         epoch_id: u64,
+    ) -> Result<(), SafetyError> {
+        let j7_gate = self.sample_pos_force_j7_gate();
+        self.validate_and_filter_servo_targets_with_gate(targets, epoch_id, j7_gate)
+    }
+
+    fn validate_and_filter_servo_targets_with_gate(
+        &mut self,
+        targets: &mut [f32],
+        epoch_id: u64,
+        j7_gate: crate::supervisor::J7PosForceGate,
     ) -> Result<(), SafetyError> {
         if self.config.active_tool.commissioning_required {
             return Err(SafetyError::CommissioningRequired("servo".into()));
@@ -338,17 +406,64 @@ impl SupervisorInner {
         }
         self.torque_hold_filter(targets);
         self.power_hold_filter(targets);
-        if self.check_pos_force_gripper_fresh_static().is_err() {
-            if let Some(g) = self.config.gripper_index() {
-                if targets.len() > g {
-                    if let Some(freeze_pos) = self.pos_force_j7_freeze_position() {
-                        targets[g] = freeze_pos;
-                    } else if g < self.commanded_positions.len() {
-                        targets[g] = self.commanded_positions[g];
-                    }
-                }
-            }
+        self.clamp_j7_if_stale(targets, j7_gate);
+        Ok(())
+    }
+
+    /// Zero-allocation RT validation & filtering for mailbox servo targets (`armd-control`).
+    fn validate_and_filter_servo_targets_rt(
+        &mut self,
+        targets: &mut [f32],
+        epoch_id: u64,
+        j7_gate: crate::supervisor::J7PosForceGate,
+    ) -> Result<(), crate::rt_core::mailbox::Refusal> {
+        use crate::rt_core::mailbox::{Refusal, RefusalDetail};
+        if self.config.active_tool.commissioning_required {
+            return Err(Refusal::code("COMMISSIONING_REQUIRED"));
         }
+        if self.gravity_comp.is_some() {
+            return Err(Refusal::code("MOTION_BUSY"));
+        }
+        if self.collision.hold.is_some() {
+            return Err(Refusal::code("COLLISION_HOLD"));
+        }
+        if self.handover_settling_since.is_some() {
+            return Err(Refusal::code("HANDOVER_SETTLING"));
+        }
+        if self.shutdown_committed || self.estop_pending() {
+            return Err(Refusal::code("ESTOP_ACTIVE"));
+        }
+        if epoch_id != self.safety.epoch_id() {
+            return Err(Refusal::code("EPOCH_MISMATCH"));
+        }
+        if self.pending_rearm || self.pending_normal_unload {
+            return Err(Refusal::code("NOT_ARMED"));
+        }
+        if self.active_trajectory.is_some() || self.macro_run.is_some() {
+            return Err(Refusal::code("MOTION_BUSY"));
+        }
+        if let Err((code, idx)) =
+            self.safety
+                .validate_motion_command_rt(Some(epoch_id), targets, &self.config.limits)
+        {
+            if code == "SOFT_LIMIT_EXCEEDED" {
+                self.note_motion_limit(MotionLimitReason::JointLimit, idx);
+                return Err(Refusal {
+                    code,
+                    detail: RefusalDetail::Limit {
+                        joint: idx.map(|i| i as u8),
+                    },
+                });
+            }
+            return Err(Refusal::code(code));
+        }
+        if let Err(code) = self.servo_target_workspace_rt(targets) {
+            self.note_motion_limit(MotionLimitReason::Workspace, None);
+            return Err(Refusal::code(code));
+        }
+        self.torque_hold_filter(targets);
+        self.power_hold_filter(targets);
+        self.clamp_j7_if_stale(targets, j7_gate);
         Ok(())
     }
 
@@ -356,7 +471,16 @@ impl SupervisorInner {
     /// releases the stall latch on a target away from the stall. A torque-cap latch needs the
     /// target [`GRIPPER_FORCE_RELEASE_MARGIN_RAD`] more open than the hold.
     pub(super) fn release_gripper_stall_on_reverse(&mut self, targets: &[f32]) {
-        if self.check_pos_force_gripper_fresh_static().is_err() {
+        let j7_gate = self.sample_pos_force_j7_gate();
+        self.release_gripper_stall_on_reverse_with_gate(targets, j7_gate);
+    }
+
+    fn release_gripper_stall_on_reverse_with_gate(
+        &mut self,
+        targets: &[f32],
+        j7_gate: crate::supervisor::J7PosForceGate,
+    ) {
+        if j7_gate.stale {
             self.gripper_stream_target = None;
             return;
         }
@@ -381,6 +505,13 @@ impl SupervisorInner {
         }
     }
 
+    fn frame_moves_j7(&self, targets: &[f32], prev_cmd_j7: f32, prev_tgt_j7: f32) -> bool {
+        self.config.gripper_index().is_some_and(|g| {
+            g < targets.len()
+                && ((targets[g] - prev_cmd_j7).abs() > 1e-6 || (targets[g] - prev_tgt_j7).abs() > 1e-6)
+        })
+    }
+
     pub fn servo(admitted: Admitted<'_>, targets: Vec<f32>, epoch_id: u64) -> Result<(), SafetyError> {
         Self::servo_slice(admitted, &targets, epoch_id)
     }
@@ -389,19 +520,20 @@ impl SupervisorInner {
     /// (the latest-target path consumes through it).
     pub fn servo_slice(admitted: Admitted<'_>, targets_in: &[f32], epoch_id: u64) -> Result<(), SafetyError> {
         let prev_j7_stamp = admitted.inner.j7_admitted_stamp;
-        let (this, _proof) = admitted.consume()?;
-        // If J7 PosForce feedback is stale, `validate_and_filter_servo_targets` clamps J7 to the
-        // last fresh freeze position while letting J1–J6 continue; never advance `j7_admitted_stamp`
-        // on a refused frame or while J7 is gated stale by `check_pos_force_gripper_fresh_static`.
-        let j7_stale = this.check_pos_force_gripper_fresh_static().is_err();
-        let res = this.servo_slice_inner(targets_in, epoch_id);
-        if res.is_err() || j7_stale {
-            this.j7_admitted_stamp = prev_j7_stamp;
-        }
-        res
+        let (this, proof) = admitted.consume()?;
+        // Restore prior J7 stamp until validation succeeds AND the frame moves J7 while J7 is fresh.
+        this.j7_admitted_stamp = prev_j7_stamp;
+        let j7_gate = this.sample_pos_force_j7_gate();
+        this.servo_slice_inner(targets_in, epoch_id, j7_gate, proof.stamp())
     }
 
-    fn servo_slice_inner(&mut self, targets_in: &[f32], epoch_id: u64) -> Result<(), SafetyError> {
+    fn servo_slice_inner(
+        &mut self,
+        targets_in: &[f32],
+        epoch_id: u64,
+        j7_gate: crate::supervisor::J7PosForceGate,
+        stamp: crate::supervisor::AdmissionStamp,
+    ) -> Result<(), SafetyError> {
         if targets_in.len() > crate::rt_core::mailbox::MAX_DOF { return self.servo_slice_oversized(targets_in.to_vec(), epoch_id); }
         let mut buf = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
         let targets = &mut buf[..targets_in.len()];
@@ -411,7 +543,17 @@ impl SupervisorInner {
             return Err(SafetyError::MotionBusy);
         }
         if self.mit_motion_blocked() { return Err(SafetyError::MotionBusy); }
-        self.validate_and_filter_servo_targets(targets, epoch_id)?;
+        let (prev_cmd_j7, prev_tgt_j7) = self
+            .config
+            .gripper_index()
+            .map(|g| {
+                (
+                    self.commanded_positions.get(g).copied().unwrap_or(0.0),
+                    self.target_positions.get(g).copied().unwrap_or(0.0),
+                )
+            })
+            .unwrap_or((0.0, 0.0));
+        self.validate_and_filter_servo_targets_with_gate(targets, epoch_id, j7_gate)?;
         if self.servo_blocked_hold { self.clear_blocked_hold(); }
 
         // Only renew lease and motion frame timestamp AFTER command validation succeeds
@@ -421,8 +563,14 @@ impl SupervisorInner {
             l.last_valid_motion_instant = Some(Instant::now());
         }
 
-        // Gripper stall release check on reverse command
-        self.release_gripper_stall_on_reverse(targets);
+        // Gripper stall release check on reverse command (reusing the same single J7 freshness sample)
+        self.release_gripper_stall_on_reverse_with_gate(targets, j7_gate);
+        if !j7_gate.stale && self.frame_moves_j7(targets, prev_cmd_j7, prev_tgt_j7) {
+            self.j7_admitted_stamp = Some(crate::driver::PosForceIntentStamp {
+                stop_gen: stamp.stop_gen,
+                estop_epoch: stamp.estop_epoch,
+            });
+        }
 
         let _ = self.safety.mark_motion_started();
 
@@ -432,6 +580,70 @@ impl SupervisorInner {
         self.servo_stream_active = true;
         self.servo_settled_ticks.fill(0);
 
+        Ok(())
+    }
+
+    /// Zero-allocation RT servo target intake (used by [`Self::consume_target_frame`]).
+    /// Never allocates on either acceptance or refusal, samples J7 freshness at most once from
+    /// Step 2's snapshot, and updates `j7_admitted_stamp` only when a fresh accepted frame moves J7.
+    pub(crate) fn servo_slice_rt(
+        admitted: Admitted<'_>,
+        targets_in: &[f32],
+        epoch_id: u64,
+    ) -> Result<(), crate::rt_core::mailbox::Refusal> {
+        use crate::rt_core::mailbox::Refusal;
+        let prev_j7_stamp = admitted.inner.j7_admitted_stamp;
+        let (this, proof) = admitted
+            .consume()
+            .map_err(|e| Refusal::code(targets::safety_code(&e)))?;
+        this.j7_admitted_stamp = prev_j7_stamp;
+        if targets_in.len() > crate::rt_core::mailbox::MAX_DOF {
+            return Err(Refusal::code("SAFETY_ERROR"));
+        }
+        let mut buf = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
+        let targets = &mut buf[..targets_in.len()];
+        targets.copy_from_slice(targets_in);
+        #[cfg(feature = "policy-runtime")]
+        if this.policy_run.is_some() || this.policy_loading {
+            return Err(Refusal::code("MOTION_BUSY"));
+        }
+        if this.mit_motion_blocked() {
+            return Err(Refusal::code("MOTION_BUSY"));
+        }
+        let (prev_cmd_j7, prev_tgt_j7) = this
+            .config
+            .gripper_index()
+            .map(|g| {
+                (
+                    this.commanded_positions.get(g).copied().unwrap_or(0.0),
+                    this.target_positions.get(g).copied().unwrap_or(0.0),
+                )
+            })
+            .unwrap_or((0.0, 0.0));
+        let j7_gate = this.sample_pos_force_j7_gate();
+        this.validate_and_filter_servo_targets_rt(targets, epoch_id, j7_gate)?;
+        if this.servo_blocked_hold {
+            this.clear_blocked_hold();
+        }
+        let now = Instant::now();
+        this.last_heartbeat = now;
+        this.last_motion_frame = now;
+        if let Some(ref mut l) = this.active_lease {
+            l.last_valid_motion_instant = Some(now);
+        }
+        this.release_gripper_stall_on_reverse_with_gate(targets, j7_gate);
+        if !j7_gate.stale && this.frame_moves_j7(targets, prev_cmd_j7, prev_tgt_j7) {
+            let stamp = proof.stamp();
+            this.j7_admitted_stamp = Some(crate::driver::PosForceIntentStamp {
+                stop_gen: stamp.stop_gen,
+                estop_epoch: stamp.estop_epoch,
+            });
+        }
+        let _ = this.safety.mark_motion_started();
+        copy_into(&mut this.target_positions, targets);
+        this.set_servo_target(targets);
+        this.servo_stream_active = true;
+        this.servo_settled_ticks.fill(0);
         Ok(())
     }
 
@@ -2031,14 +2243,7 @@ pub mod targets {
                 frame.authority.lease_generation,
             );
             let admitted = self.check_admission(stamp).map_err(|e| Refusal::code(safety_code(&e)))?;
-            Self::servo_slice(admitted, frame.positions(), frame.authority.epoch).map_err(|e| {
-                let joint = match &e {
-                    SafetyError::SoftLimitExceeded { joint, .. } => self.config.limits.iter().position(|l| &l.name == joint).map(|i| i as u8),
-                    _ => None,
-                };
-                let code = safety_code(&e);
-                Refusal { code, detail: if joint.is_some() { RefusalDetail::Limit { joint } } else { RefusalDetail::None } }
-            })
+            Self::servo_slice_rt(admitted, frame.positions(), frame.authority.epoch)
         }
 
         #[cfg(not(feature = "policy-runtime"))]

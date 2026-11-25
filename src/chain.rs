@@ -1570,6 +1570,26 @@ impl<'a> WorkspaceEvaluator<'a> {
         Ok(())
     }
 
+    /// True when every configured link capsule resolves to a known frame (zero-alloc RT precheck).
+    pub fn capsules_valid(&self) -> bool {
+        self.capsules.iter().all(|(fr_opt, _, _, _)| fr_opt.is_some())
+    }
+
+    /// Zero-allocation variant of [`Self::check_and_advance`]: returns `false` if any workspace
+    /// constraint is rejected, otherwise advances `min_depths` and returns `true`.
+    pub fn check_and_advance_rt(
+        &self,
+        clr: &k::SlotBuf,
+        min_depths: &mut k::SlotBuf,
+    ) -> bool {
+        let cs = clr.as_slice();
+        if k::first_workspace_rejection_with_tol(cs, min_depths.as_slice(), self.escape_tol).is_some() {
+            return false;
+        }
+        k::advance_min_depths(cs, min_depths.as_mut_slice());
+        true
+    }
+
     /// Check `clr` against `min_depths` without mutating `min_depths`.
     pub fn check_readonly(
         &self,

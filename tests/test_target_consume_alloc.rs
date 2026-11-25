@@ -109,6 +109,47 @@ fn refusing_a_servo_target_for_its_authority_does_not_allocate() {
     assert_eq!((allocs, frees), (0, 0));
 }
 
+#[test]
+fn refusing_a_servo_target_for_soft_limit_or_commissioning_does_not_allocate() {
+    let (mut inner, gen) = supervisor();
+    {
+        let s = inner.current_admission_stamp();
+        let a = inner.check_admission(s).unwrap();
+        armd::SupervisorInner::authorize_servo_stream(a, gen).unwrap();
+    }
+    let stream = inner.core.target_authority().stream.expect("authorized");
+    let base = inner.commanded_positions.clone();
+    let now = Instant::now();
+    let authority = Authority {
+        lease_generation: gen,
+        epoch: inner.safety.epoch_id(),
+        config_revision: inner.workspace_revision,
+        ..Authority::default()
+    };
+    let oob = frame(&inner, stream, authority, 0, &base, 50.0, 1, now);
+    let (oob_err, oob_allocs, oob_frees) = counted(|| inner.consume_target(&oob, &ctx(now)).unwrap_err());
+    assert_eq!(oob_err.code, "SOFT_LIMIT_EXCEEDED");
+    assert_eq!(
+        oob_err.detail,
+        armd::rt_core::mailbox::RefusalDetail::Limit { joint: Some(0) }
+    );
+    assert_eq!(
+        (oob_allocs, oob_frees),
+        (0, 0),
+        "soft-limit refusal on RT servo intake must not allocate"
+    );
+
+    inner.config.active_tool.commissioning_required = true;
+    let valid = frame(&inner, stream, authority, 0, &base, 0.001, 2, now);
+    let (comm_err, comm_allocs, comm_frees) = counted(|| inner.consume_target(&valid, &ctx(now)).unwrap_err());
+    assert_eq!(comm_err.code, "COMMISSIONING_REQUIRED");
+    assert_eq!(
+        (comm_allocs, comm_frees),
+        (0, 0),
+        "commissioning refusal on RT servo intake must not allocate"
+    );
+}
+
 #[cfg(feature = "policy-runtime")]
 #[test]
 fn consuming_live_policy_targets_does_not_allocate_in_steady_streaming() {

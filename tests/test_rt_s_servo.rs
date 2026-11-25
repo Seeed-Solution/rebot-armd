@@ -77,7 +77,7 @@ async fn wait_until(timeout: Duration, mut pred: impl FnMut() -> bool) {
         if pred() {
             return;
         }
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
     assert!(pred(), "condition not satisfied within {timeout:?}");
 }
@@ -186,6 +186,11 @@ fn make_fakebus_supervisor(cfg: ArmConfig, pos_force_j7: bool) -> (Arc<ArmSuperv
 async fn buffered_target_across_disconnect_and_preemption_then_replacement_owner_zero_old_gen_output() {
     let cfg = ArmConfig {
         lease_timeout_ms: 5_000,
+        // Keep snapshot `valid_until` (2 / control_frequency_hz = 100 ms) wider than the
+        // one-shot 60 ms release pause so ws3's `preempt_lease_ws` hits the fresh snapshot
+        // immediately and queues `LeasePreempt` into the EXACT same paused release as ws2's
+        // buffered servo frame.
+        control_frequency_hz: 20,
         ..ArmConfig::rebot_dm()
     };
     let (sup, bus) = make_fakebus_supervisor(cfg, false);
@@ -194,7 +199,7 @@ async fn buffered_target_across_disconnect_and_preemption_then_replacement_owner
     let delay: Arc<Mutex<Option<Duration>>> = Arc::new(Mutex::new(None));
     let handle = sup
         .start_executor_with_hooks(
-            ExecutorConfig::for_tests(Duration::from_millis(5)),
+            ExecutorConfig::for_tests(Duration::from_millis(10)),
             PersistTestHooks {
                 release_delay_once: Some(delay.clone()),
                 ..Default::default()
@@ -222,6 +227,7 @@ async fn buffered_target_across_disconnect_and_preemption_then_replacement_owner
 
     let mut q_old1 = vec![0.0f32; 7];
     q_old1[0] = q0 + 0.55;
+    let sub_before_disc = handle.servo_submitted_count();
     send(
         &mut ws1,
         json!({
@@ -233,8 +239,11 @@ async fn buffered_target_across_disconnect_and_preemption_then_replacement_owner
         }),
     )
     .await;
-    // Give ws1's worker a brief moment to push the target into the triple buffer while RT is paused.
-    tokio::time::sleep(Duration::from_millis(12)).await;
+    // Deterministically prove ws1's target entered the triple-buffer mailbox while RT is paused.
+    wait_until(Duration::from_secs(1), || {
+        handle.servo_submitted_count() > sub_before_disc
+    })
+    .await;
     // Disconnect ws1 BEFORE the paused release unblocks.
     drop(ws1);
 
@@ -246,6 +255,10 @@ async fn buffered_target_across_disconnect_and_preemption_then_replacement_owner
     let seq_after_disc = sup.hub().published_seq() + 5;
     wait_until(Duration::from_secs(1), || sup.hub().published_seq() >= seq_after_disc).await;
 
+    assert!(
+        handle.servo_lease_refused_count(gen1) >= 1,
+        "expected owner-side lease refusal for buffered gen1 target across disconnect"
+    );
     let snap_after_disc = sup.fresh_snapshot(None).await.unwrap();
     assert!(
         (snap_after_disc.obs.commanded_positions[0] - q0).abs() < 1e-3,
@@ -253,7 +266,12 @@ async fn buffered_target_across_disconnect_and_preemption_then_replacement_owner
         snap_after_disc.obs.commanded_positions[0]
     );
     let tx_disc = bus.tx_log();
-    for f in tx_disc.iter().filter(|f| f.id == 0x101) {
+    let j1_tx_disc: Vec<_> = tx_disc.iter().filter(|f| f.id == 0x101).collect();
+    assert!(
+        !j1_tx_disc.is_empty(),
+        "expected nonempty J1 hold CAN TX frames after disconnect"
+    );
+    for f in j1_tx_disc {
         let p = decode_pos_f32(f);
         assert!(
             (p - q0).abs() < 1e-3,
@@ -267,15 +285,23 @@ async fn buffered_target_across_disconnect_and_preemption_then_replacement_owner
     assert!(gen2 > gen1);
     let ep2 = sup.fresh_snapshot(None).await.unwrap().obs.epoch_id;
     let mut ws3 = connect_ws(addr).await;
+    // Wait until ws3 has completed server-side `register_ws_connection` and entered its read loop
+    // (proven by receiving its first server message) BEFORE pausing armd-control!
+    let _ = tokio::time::timeout(Duration::from_secs(2), ws3.next())
+        .await
+        .expect("ws3 initial server message")
+        .expect("ws3 stream open")
+        .expect("ws3 frame ok");
 
     // Pause one release so ws2's servo target and ws3's force preemption meet in the same release
     // (Step 3 LeasePreempt MUST revoke gen2 BEFORE Step 4 consumes ws2's buffered target!).
-    *delay.lock().unwrap() = Some(Duration::from_millis(70));
+    *delay.lock().unwrap() = Some(Duration::from_millis(60));
     wait_until(Duration::from_secs(1), || delay.lock().unwrap().is_none()).await;
     bus.clear_log();
 
     let mut q_old2 = vec![0.0f32; 7];
     q_old2[0] = q0 - 0.55;
+    let sub_before_preempt = handle.servo_submitted_count();
     send(
         &mut ws2,
         json!({
@@ -287,7 +313,10 @@ async fn buffered_target_across_disconnect_and_preemption_then_replacement_owner
         }),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    wait_until(Duration::from_secs(1), || {
+        handle.servo_submitted_count() > sub_before_preempt
+    })
+    .await;
 
     // Replacement owner preempts while the paused release is still in flight.
     send(
@@ -308,6 +337,10 @@ async fn buffered_target_across_disconnect_and_preemption_then_replacement_owner
     let seq_after_preempt = sup.hub().published_seq() + 5;
     wait_until(Duration::from_secs(1), || sup.hub().published_seq() >= seq_after_preempt).await;
 
+    assert!(
+        handle.servo_lease_refused_count(gen2) >= 1,
+        "expected owner-side lease refusal for buffered gen2 target across preemption"
+    );
     let snap_after_preempt = sup.fresh_snapshot(None).await.unwrap();
     assert!(
         (snap_after_preempt.obs.commanded_positions[0] - q0).abs() < 1e-3,
@@ -315,7 +348,12 @@ async fn buffered_target_across_disconnect_and_preemption_then_replacement_owner
         snap_after_preempt.obs.commanded_positions[0]
     );
     let tx_preempt = bus.tx_log();
-    for f in tx_preempt.iter().filter(|f| f.id == 0x101) {
+    let j1_tx_preempt: Vec<_> = tx_preempt.iter().filter(|f| f.id == 0x101).collect();
+    assert!(
+        !j1_tx_preempt.is_empty(),
+        "expected nonempty J1 hold CAN TX frames after preemption"
+    );
+    for f in j1_tx_preempt {
         let p = decode_pos_f32(f);
         assert!(
             (p - q0).abs() < 1e-3,
@@ -1014,6 +1052,23 @@ async fn executor_servo_zero_alloc_and_zero_supervisor_lock_proof() {
     )
     .await;
     assert_eq!(next_of(&mut ws1, "command_ack").await["request_id"], 2);
+    // Out-of-soft-limit refusal on the RT path must also allocate zero heap memory.
+    send(
+        &mut ws1,
+        json!({
+            "type": "command",
+            "path": "/api/v1/motion/servo",
+            "body": {"targets": [99.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]},
+            "generation": gen1,
+            "epoch_id": ep1,
+            "request_id": 3,
+        }),
+    )
+    .await;
+    let oob_rej = next_of(&mut ws1, "command_reject").await;
+    assert_eq!(oob_rej["request_id"], 3);
+    assert_eq!(oob_rej["status"], 400);
+    assert_eq!(oob_rej["code"], "SOFT_LIMIT_EXCEEDED");
     drop(ws1);
     wait_until(Duration::from_secs(2), || handle.is_servo_closed(gen1)).await;
 

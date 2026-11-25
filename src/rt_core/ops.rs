@@ -2085,10 +2085,13 @@ impl ReleaseEngine {
             self.intake.retire_plan(cp);
         }
         // 4. Unconditional urgent recheck + consume at most one latest target
+        //    Defer reporting `TargetOutcome` until Step 7 (strictly AFTER Step 6 `core.publish`)
+        //    so off-thread command waiters always observe the post-motion published snapshot.
         let ctx = self.checkpoint(core, Checkpoint::BeforeTarget, &mut now_fn, &mut report);
+        let mut deferred_target_outcome: Option<TargetOutcome> = None;
         if let Some(f) = self.targets.take() {
             let result = core.consume_target(&f, &ctx);
-            self.targets.report(TargetOutcome { stream: f.stream, seq: f.seq, result });
+            deferred_target_outcome = Some(TargetOutcome { stream: f.stream, seq: f.seq, result });
             report.target_refusal = result.err();
             report.target = Some((f.seq, result.map_err(|r| r.code)));
         }
@@ -2109,7 +2112,7 @@ impl ReleaseEngine {
         // 6. Publish
         core.publish(timestamp, publish_generation);
         // 7. Deliver aborted/finished transition terminals, urgent stop replies, lifecycle replies,
-        //    Step 3 replies, and active-action terminals strictly AFTER publish.
+        //    Step 3 replies, target outcomes, and active-action terminals strictly AFTER publish.
         if transition_installed_this_release {
             if let Some((t, outcome)) = aborted_transition {
                 if let Some(ack_reply) = deferred_step3_reply.take() {
@@ -2134,6 +2137,9 @@ impl ReleaseEngine {
         }
         if let Some(reply) = deferred_step3_reply {
             self.intake.emit_reply(reply);
+        }
+        if let Some(outcome) = deferred_target_outcome {
+            self.targets.report(outcome);
         }
         if let Some(eviction) = deferred_eviction {
             if let Some(tx) = self.eviction_tx.as_mut() {

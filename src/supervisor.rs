@@ -43,12 +43,16 @@ static NEXT_ADMISSION_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 /// per-broker monotonic IDs never collide with global [`next_admission_request_id`] IDs.
 const BROKER_REQUEST_ID_BIT: u64 = 1u64 << 63;
 
+/// High bit reserving an isolated single-use namespace for RT-internal latest-target and
+/// servo-stream authorization stamps so they never collide with caller or `LeaseInstallCtx` IDs.
+const RT_INTERNAL_REQUEST_ID_BIT: u64 = 1u64 << 62;
+
 /// Allocates a fresh non-zero, single-use admission request ID (lock-free, zero-alloc).
 #[inline]
 pub fn next_admission_request_id() -> u64 {
     let id = NEXT_ADMISSION_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
     assert!(
-        id != 0 && (id & BROKER_REQUEST_ID_BIT) == 0,
+        id != 0 && (id & (BROKER_REQUEST_ID_BIT | RT_INTERNAL_REQUEST_ID_BIT)) == 0,
         "admission request_id overflow"
     );
     id
@@ -125,14 +129,14 @@ impl AdmissionStamp {
     }
 
     /// Constructs a fresh single-use [`AdmissionStamp`] for an RT-internal latest-target or
-    /// stream-handback step (zero-alloc atomic counter).
+    /// stream-handback step (zero-alloc atomic counter in an isolated namespace).
     pub(crate) fn for_rt_internal(stop_gen: u64, estop_epoch: u64, lease_gen: u64) -> Self {
         Self {
             stop_gen,
             estop_epoch,
             lease_gen,
             connection_id: 0,
-            request_id: next_admission_request_id(),
+            request_id: next_admission_request_id() | RT_INTERNAL_REQUEST_ID_BIT,
         }
     }
 }
@@ -1306,6 +1310,10 @@ pub struct SupervisorInner {
     /// the command that produced the active J7 target. Never re-stamped at output time and never
     /// stamped with `max(local, requested)`; cleared on stop, E-stop, and torque-off.
     pub(crate) j7_admitted_stamp: Option<crate::driver::PosForceIntentStamp>,
+    /// Single-sample Step 2 snapshot of J7 PosForce freshness and freeze position for the current
+    /// RT release (`Some` from Step 2 `poll_hardware_with_release_deadline` until Step 5
+    /// `tick_control_inner` exit), eliminating TOCTOU and extra driver locks during Step 4 intake.
+    pub(crate) rt_j7_pf_gate: Option<J7PosForceGate>,
     /// Optional deterministic test seam invoked right after `mit.rs` checks
     /// `urgent_stop_unapplied()` and before J7 intent stamping (`None` in production, 0 alloc).
     #[doc(hidden)]
@@ -1325,6 +1333,13 @@ pub struct SupervisorInner {
     pub power_budget_revision: u64,
     /// Lock-free exact closed-connection bitset shared with the RT `Broker` (checked on RT commits).
     rt_closed_connections: Option<Arc<crate::rt_core::requests::actions::ClosedBitset>>,
+}
+
+/// Single-sample snapshot of active J7 `PosForce` freshness and freeze position.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct J7PosForceGate {
+    pub(crate) stale: bool,
+    pub(crate) freeze_pos: Option<f32>,
 }
 
 /// Copy `src` into `dst` (for `ArmObservation::{action, previous_action}`), routing
@@ -2218,6 +2233,7 @@ impl SupervisorInner {
             unload_settle_spare: Some(UnloadSettle::with_capacity(unload_settle_cap)),
             j7_intent: None,
             j7_admitted_stamp: None,
+            rt_j7_pf_gate: None,
             post_stop_check_hook: None,
             gripper_motion_spare: None,
             move_samples_spares: Vec::new(),
@@ -2353,9 +2369,29 @@ impl SupervisorInner {
             })
             .map(|a| a.generation)
         {
-            let stop_client_motion =
-                self.watchdog_park.is_none() && !self.pending_normal_unload;
-            self.fence_displaced_lease_generation(expired_gen, stop_client_motion);
+            let enable_owned_by_expired = matches!(
+                self.torque_transition,
+                Some(driver_transitions::TorqueTransition::Enable { authority, .. })
+                    if authority.lease_generation == expired_gen
+            );
+            if enable_owned_by_expired {
+                // Preserve Step 2 `service_torque_transition` timing for an in-flight enable
+                // transition owned by the expiring lease (do not take `driver.lock()` or start
+                // rollback disable prematurely in Step 1). Still revoke target stream authority
+                // and queue off-thread `close_servo(expired_gen)` before Step 4 target intake.
+                self.core.revoke_stream();
+                self.record_pending_servo_close(expired_gen);
+                if self.gripper_stream_lease == Some(expired_gen) {
+                    self.end_gripper_stream();
+                }
+                if self.watchdog_park.is_none() && !self.pending_normal_unload {
+                    self.stop_motion();
+                }
+            } else {
+                let stop_client_motion =
+                    self.watchdog_park.is_none() && !self.pending_normal_unload;
+                self.fence_displaced_lease_generation(expired_gen, stop_client_motion);
+            }
             fenced_any = true;
         }
         if self.pending_disconnect_hold.load(Ordering::SeqCst) > 0 {
@@ -5231,10 +5267,29 @@ impl SupervisorInner {
     /// feedback is stale (`> 100 ms`). Single source of truth wrapped by
     /// [`Self::check_pos_force_gripper_fresh`].
     pub(crate) fn check_pos_force_gripper_fresh_static(&self) -> Result<(), &'static str> {
+        if let Some(gate) = self.rt_j7_pf_gate {
+            return if gate.stale { Err("J7_FEEDBACK_STALE") } else { Ok(()) };
+        }
         if self.is_pos_force_j7_stale() {
             return Err("J7_FEEDBACK_STALE");
         }
         Ok(())
+    }
+
+    /// Captures a single consistent `(stale, freeze_pos)` snapshot for J7 `PosForce` gating.
+    /// Reuses Step 2's cached [`Self::rt_j7_pf_gate`] during an RT release (zero driver lock
+    /// attempts on Step 4); outside an RT release, reads both fields under a single `try_lock()`.
+    pub(crate) fn sample_pos_force_j7_gate(&self) -> J7PosForceGate {
+        if let Some(gate) = self.rt_j7_pf_gate {
+            return gate;
+        }
+        if self.check_pos_force_gripper_fresh_static().is_ok() {
+            return J7PosForceGate::default();
+        }
+        J7PosForceGate {
+            stale: true,
+            freeze_pos: self.pos_force_j7_freeze_position(),
+        }
     }
 
     /// Refuse new gripper targets while active `PosForce` J7 feedback is stale (`> 100 ms`).
@@ -6342,6 +6397,7 @@ impl SupervisorInner {
         let _ = self.confirm_background_disable_if_ready();
         let budget_exhausted = budget.now > budget.deadline || rx_exhausted;
         let Some(driver) = self.driver.as_ref() else {
+            self.rt_j7_pf_gate = None;
             return crate::rt_core::ops::HardwarePoll {
                 driverless: true,
                 rx_frames,
@@ -6350,18 +6406,46 @@ impl SupervisorInner {
                 ..crate::rt_core::ops::HardwarePoll::default()
             };
         };
-        let d = driver.lock().unwrap_or_else(|e| e.into_inner());
-        d.feedback_ages_into(&mut self.scratch.ages);
-        let oldest = self.scratch.ages.iter().copied().try_fold(Duration::ZERO, |m, a| a.map(|a| m.max(a)));
-        crate::rt_core::ops::HardwarePoll {
-            driverless: false,
-            feedback_valid: d.is_feedback_valid(),
-            enable_state: Some(d.enable_state()),
-            oldest_feedback_age: oldest,
-            rx_frames,
-            budget_exhausted,
-            torque: self.core.poll_transition(),
-        }
+        let is_pf = self
+            .config
+            .damiao_gripper
+            .as_ref()
+            .is_some_and(|g| g.mode == crate::model::DamiaoGripperMode::PosForce);
+        let (poll, pf_gate) = {
+            let d = driver.lock().unwrap_or_else(|e| e.into_inner());
+            d.feedback_ages_into(&mut self.scratch.ages);
+            let oldest = self.scratch.ages.iter().copied().try_fold(Duration::ZERO, |m, a| a.map(|a| m.max(a)));
+            let gate = if is_pf {
+                let stale = !d.pos_force_feedback_fresh();
+                let freeze_pos = self.config.gripper_index().and_then(|g| {
+                    let raw = d
+                        .pos_force_last_fresh_position()
+                        .or_else(|| self.measured_positions.get(g).copied().filter(|p| p.is_finite()))
+                        .or_else(|| self.commanded_positions.get(g).copied().filter(|p| p.is_finite()))?;
+                    Some(
+                        self.config
+                            .limits
+                            .get(g)
+                            .map_or(raw, |l| raw.clamp(l.min_position, l.max_position)),
+                    )
+                });
+                J7PosForceGate { stale, freeze_pos }
+            } else {
+                J7PosForceGate::default()
+            };
+            let poll = crate::rt_core::ops::HardwarePoll {
+                driverless: false,
+                feedback_valid: d.is_feedback_valid(),
+                enable_state: Some(d.enable_state()),
+                oldest_feedback_age: oldest,
+                rx_frames,
+                budget_exhausted,
+                torque: self.core.poll_transition(),
+            };
+            (poll, gate)
+        };
+        self.rt_j7_pf_gate = Some(pf_gate);
+        poll
     }
 
     /// Single-pass hardware receive + feedback intake.
@@ -6832,7 +6916,7 @@ impl SupervisorInner {
 
         // 0.0 Apply any non-blocking socket-close lease fence, pending disconnect hold, and
         // lease-expiry fence BEFORE gripper, motion, or bus output runs.
-        self.sync_nonblocking_disconnect_fence(Instant::now());
+        self.sync_nonblocking_disconnect_fence(now_fn());
 
         // 0.1 Gripper stall protection state machine
         if self.active_trajectory.is_some() || self.macro_run.is_some() || self.pending_normal_unload
@@ -8722,6 +8806,7 @@ impl SupervisorInner {
         }
 
         self.active_tx_cutoff = None;
+        self.rt_j7_pf_gate = None;
         if applied_rx_tx_cap || applied_output_tx_cap {
             if let Some(ref d) = self.driver {
                 if let Ok(mut drv) = d.lock() {

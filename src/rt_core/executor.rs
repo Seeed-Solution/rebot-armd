@@ -2401,6 +2401,8 @@ struct ServoTargetDispatcherInner {
     >,
     stream_owners: std::collections::HashMap<super::mailbox::StreamId, ServoStreamOwner>,
     unclaimed_outcomes: VecDeque<super::mailbox::TargetOutcome>,
+    submitted_count: u64,
+    lease_refused_by_gen: std::collections::HashMap<u64, u64>,
     closed: bool,
 }
 
@@ -2410,6 +2412,18 @@ type DrainedServoDeliveries = (
 );
 
 impl ServoTargetDispatcherInner {
+    fn prune_closed_stream_owners_locked(&mut self) {
+        let closed = self.port.closed_servo_generation();
+        if closed == 0 {
+            return;
+        }
+        self.stream_owners.retain(|_, owner| {
+            !(owner.lease_generation != 0
+                && owner.lease_generation <= closed
+                && owner.pending_seqs.is_empty())
+        });
+    }
+
     fn pop_outcomes_locked(
         &mut self,
         hub: &StateHub,
@@ -2420,6 +2434,14 @@ impl ServoTargetDispatcherInner {
         self.port.outcomes(|o| popped.push(o));
         let closed_gen = self.port.closed_servo_generation();
         for o in popped {
+            if (o.stream.0 & crate::supervisor::targets::SERVO_STREAM_BIT) != 0 {
+                if let Err(ref r) = o.result {
+                    if matches!(r.code, "LEASE_LOST" | "NO_LEASE" | "STREAM_NOT_AUTHORIZED") {
+                        let gen = o.stream.0 & !crate::supervisor::targets::SERVO_STREAM_BIT;
+                        *self.lease_refused_by_gen.entry(gen).or_insert(0) += 1;
+                    }
+                }
+            }
             if let Some(tx) = self.command_waiters.remove(&(o.stream, o.seq)) {
                 resolved_cmds.push((
                     tx,
@@ -2487,6 +2509,28 @@ impl ServoTargetDispatcherInner {
             };
             resolved_cmds.push((tx, outcome));
         }
+        // Retire the overwritten streaming seq from its owner too so a closed stream whose
+        // buffered frame was coalesced by a replacement generation cannot pin its owner forever.
+        let closed_gen = self.port.closed_servo_generation();
+        let mut drop_closed_owner = false;
+        if let Some(owner) = self.stream_owners.get_mut(&old_key.0) {
+            while let Some(&front) = owner.pending_seqs.front() {
+                if front <= old_key.1 {
+                    owner.pending_seqs.pop_front();
+                } else {
+                    break;
+                }
+            }
+            if owner.lease_generation != 0
+                && owner.lease_generation <= closed_gen
+                && owner.pending_seqs.is_empty()
+            {
+                drop_closed_owner = true;
+            }
+        }
+        if drop_closed_owner {
+            self.stream_owners.remove(&old_key.0);
+        }
     }
 }
 
@@ -2495,10 +2539,17 @@ impl ServoTargetDispatcherInner {
 pub(crate) struct ServoTargetDispatcher {
     inner: Mutex<ServoTargetDispatcherInner>,
     exited: Arc<AtomicBool>,
+    atomic_fenced_lease_gen: Arc<AtomicU64>,
 }
 
 impl ServoTargetDispatcher {
-    fn new(writer: TargetWriter, arm: ArmId, boot: BootId, exited: Arc<AtomicBool>) -> Self {
+    fn new(
+        writer: TargetWriter,
+        arm: ArmId,
+        boot: BootId,
+        exited: Arc<AtomicBool>,
+        atomic_fenced_lease_gen: Arc<AtomicU64>,
+    ) -> Self {
         Self {
             inner: Mutex::new(ServoTargetDispatcherInner {
                 port: crate::supervisor::targets::TargetPort::new(writer, arm, boot),
@@ -2506,9 +2557,20 @@ impl ServoTargetDispatcher {
                 command_waiters: std::collections::HashMap::new(),
                 stream_owners: std::collections::HashMap::new(),
                 unclaimed_outcomes: VecDeque::with_capacity(UNCLAIMED_TARGET_OUTCOMES_CAP),
+                submitted_count: 0,
+                lease_refused_by_gen: std::collections::HashMap::new(),
                 closed: false,
             }),
             exited,
+            atomic_fenced_lease_gen,
+        }
+    }
+
+    fn sync_authoritative_fence_locked(&self, g: &mut ServoTargetDispatcherInner) {
+        let fenced_gen = self.atomic_fenced_lease_gen.load(Ordering::Acquire);
+        if fenced_gen > g.port.closed_servo_generation() {
+            g.port.close_servo(fenced_gen);
+            g.prune_closed_stream_owners_locked();
         }
     }
 
@@ -2548,6 +2610,7 @@ impl ServoTargetDispatcher {
         let mut stream_refusals = Vec::new();
         {
             let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            self.sync_authoritative_fence_locked(&mut g);
             g.pop_outcomes_locked(hub, &mut resolved_cmds, &mut stream_refusals);
             if self.exited.load(Ordering::Acquire) {
                 g.pop_outcomes_locked(hub, &mut resolved_cmds, &mut stream_refusals);
@@ -2565,12 +2628,7 @@ impl ServoTargetDispatcher {
         }
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.port.close_servo(lease_generation);
-        let closed = g.port.closed_servo_generation();
-        g.stream_owners.retain(|_, owner| {
-            !(owner.lease_generation != 0
-                && owner.lease_generation <= closed
-                && owner.pending_seqs.is_empty())
-        });
+        g.prune_closed_stream_owners_locked();
     }
 
     pub(crate) fn sync_fenced_generation(&self, fenced_gen: u64) {
@@ -2580,29 +2638,20 @@ impl ServoTargetDispatcher {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if fenced_gen > g.port.closed_servo_generation() {
             g.port.close_servo(fenced_gen);
-            let closed = g.port.closed_servo_generation();
-            g.stream_owners.retain(|_, owner| {
-                !(owner.lease_generation != 0
-                    && owner.lease_generation <= closed
-                    && owner.pending_seqs.is_empty())
-            });
+            g.prune_closed_stream_owners_locked();
         }
     }
 
     pub(crate) fn is_servo_closed(&self, lease_generation: u64) -> bool {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .port
-            .is_servo_closed(lease_generation)
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        self.sync_authoritative_fence_locked(&mut g);
+        g.port.is_servo_closed(lease_generation)
     }
 
     pub(crate) fn closed_servo_generation(&self) -> u64 {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .port
-            .closed_servo_generation()
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        self.sync_authoritative_fence_locked(&mut g);
+        g.port.closed_servo_generation()
     }
 
     pub(crate) fn coalesced(&self) -> u64 {
@@ -2611,6 +2660,23 @@ impl ServoTargetDispatcher {
             .unwrap_or_else(|e| e.into_inner())
             .port
             .coalesced()
+    }
+
+    pub(crate) fn submitted_count(&self) -> u64 {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .submitted_count
+    }
+
+    pub(crate) fn lease_refused_count(&self, lease_generation: u64) -> u64 {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .lease_refused_by_gen
+            .get(&lease_generation)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub(crate) fn unregister_connection(&self, conn_id: u64) {
@@ -2658,6 +2724,7 @@ impl ServoTargetDispatcher {
         let mut stream_refusals = Vec::new();
         let res = {
             let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            self.sync_authoritative_fence_locked(&mut g);
             g.pop_outcomes_locked(hub, &mut resolved_cmds, &mut stream_refusals);
             if g.closed || self.exited.load(Ordering::Acquire) {
                 Err(())
@@ -2667,6 +2734,7 @@ impl ServoTargetDispatcher {
                 let seq_before = g.port.last_seq();
                 let immediate = g.port.submit_servo(stream, msg);
                 if immediate.is_none() && g.port.last_seq() > seq_before {
+                    g.submitted_count = g.submitted_count.saturating_add(1);
                     let assigned_seq = g.port.last_seq();
                     let sid = crate::supervisor::targets::servo_stream(msg.authority.lease_generation);
                     g.last_inflight_key = Some((sid, assigned_seq));
@@ -2709,6 +2777,7 @@ impl ServoTargetDispatcher {
         let mut stream_refusals = Vec::new();
         let res = {
             let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            self.sync_authoritative_fence_locked(&mut g);
             g.pop_outcomes_locked(hub, &mut resolved_cmds, &mut stream_refusals);
             if g.closed || self.exited.load(Ordering::Acquire) {
                 Err(ServoCommandSubmitError::Unavailable)
@@ -2719,6 +2788,7 @@ impl ServoTargetDispatcher {
                 match g.port.submit_servo(stream, msg) {
                     Some(reply) => Err(ServoCommandSubmitError::Immediate(reply)),
                     None if g.port.last_seq() > seq_before => {
+                        g.submitted_count = g.submitted_count.saturating_add(1);
                         let assigned_seq = g.port.last_seq();
                         let sid = crate::supervisor::targets::servo_stream(msg.authority.lease_generation);
                         g.last_inflight_key = Some((sid, assigned_seq));
@@ -3182,6 +3252,16 @@ impl RtExecutorHandle {
     /// Total servo target frames coalesced before RT consumption.
     pub fn servo_coalesced(&self) -> u64 {
         self.shared.servo_dispatcher.coalesced()
+    }
+
+    /// Total servo target frames accepted into the triple-buffer mailbox by `TargetPort::submit_servo`.
+    pub fn servo_submitted_count(&self) -> u64 {
+        self.shared.servo_dispatcher.submitted_count()
+    }
+
+    /// Total RT owner-side lease/stream refusals observed for `servo_stream(lease_generation)`.
+    pub fn servo_lease_refused_count(&self, lease_generation: u64) -> u64 {
+        self.shared.servo_dispatcher.lease_refused_count(lease_generation)
     }
 
     /// Unregisters streaming outcome delivery state for a closing WS connection.
@@ -3804,6 +3884,7 @@ pub(crate) fn spawn_executor(
         core.core.id(),
         cfg.boot,
         exited.clone(),
+        Arc::clone(&atomic_fenced_lease_gen),
     ));
     let target_writer_handle = TargetWriterHandle {
         dispatcher: Arc::clone(&servo_dispatcher),
