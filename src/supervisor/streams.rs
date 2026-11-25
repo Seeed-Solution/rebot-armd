@@ -133,21 +133,23 @@ impl SupervisorInner {
     }
 
     /// Full workspace sweep check for a servo streaming or braking tick.
-    /// Pre-warms `ws_eval_bufs` before `armd-control` enters `SCHED_FIFO` so the first
-    /// braking tick after an RT urgent stop performs zero heap allocations.
+    /// Pre-warms `ws_eval_bufs` and `scratch` joint-limit name buffers before `armd-control`
+    /// enters `SCHED_FIFO` so the very first servo or braking tick performs zero heap allocations.
     pub fn prewarm_rt_buffers(&mut self) {
         let mut bufs = std::mem::take(&mut self.ws_eval_bufs);
         if let Some((ws, cam)) = self.workspace_policy() {
-            let eval = crate::chain::WorkspaceEvaluator::new_with_tcp_in(
+            bufs.prepare_for(
                 &self.config.arm_model,
                 ws,
                 cam,
                 self.config.tcp_offset,
-                &mut bufs,
             );
-            eval.recycle(&mut bufs);
         }
         self.ws_eval_bufs = bufs;
+        // Populate `JointLimit::name` String buffers once off-RT so `copy_limits` on the first
+        // servo or fallback braking tick reuses them in place via `clone_from` (0 heap allocs).
+        crate::rt_core::scratch::copy_limits(&mut self.scratch.step_limits, &self.config.limits);
+        crate::rt_core::scratch::copy_limits(&mut self.scratch.fallback_limits, &self.config.limits);
     }
 
     pub fn servo_step_workspace(&mut self, next: &[f32], phase: &str) -> Result<(), SafetyError> {
