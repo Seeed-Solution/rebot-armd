@@ -3,12 +3,13 @@
 
 mod common;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
+use armd::driver::{ArmDriver, ArmDriverError, DriverCapabilities, EnableState, JointMode, JointTarget};
 use armd::kinematics::{self, Vec3};
-use armd::model::KeepoutBox;
+use armd::model::{JointState, KeepoutBox};
 use armd::motion::ActionStatus;
 use armd::{ArmConfig, ArmSupervisor};
 
@@ -26,6 +27,62 @@ fn tcp(q: &[f32]) -> Vec3 { kinematics::fk(&kinematics::q6(q)).p }
 
 fn dist(a: &Vec3, b: &Vec3) -> f64 { kinematics::norm(&kinematics::sub(a, b)) }
 
+struct RecordingState {
+    q: [f32; 7],
+    torqued: bool,
+    tx_j7: Vec<f32>,
+}
+
+/// Ideal position servo that losslessly records every J7 position written by the control loop.
+#[derive(Clone)]
+struct RecordingArm(Arc<Mutex<RecordingState>>);
+
+impl RecordingArm {
+    fn new(q: [f32; 7]) -> Self {
+        Self(Arc::new(Mutex::new(RecordingState { q, torqued: false, tx_j7: Vec::new() })))
+    }
+    fn clear_tx(&self) { self.0.lock().unwrap().tx_j7.clear(); }
+    fn tx_j7(&self) -> Vec<f32> { self.0.lock().unwrap().tx_j7.clone() }
+}
+
+impl ArmDriver for RecordingArm {
+    fn capabilities(&self) -> DriverCapabilities {
+        DriverCapabilities { velocity_feedback: true, torque_feedback: true, temperature_feedback: true, torque_feedforward: false, enable_feedback: true, load_feedback: false }
+    }
+    fn enable_state(&self) -> EnableState {
+        if self.0.lock().unwrap().torqued { EnableState::Enabled } else { EnableState::Disabled }
+    }
+    fn is_feedback_valid(&self) -> bool { true }
+    fn is_enabled(&self) -> bool { self.0.lock().unwrap().torqued }
+    fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::ZERO); 7] }
+    fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+        let s = self.0.lock().unwrap();
+        let mut q6 = [0.0; 6];
+        q6.copy_from_slice(&s.q[..6]);
+        let g = armd::compute_gravity_torques(&q6).unwrap();
+        Ok((0..7).map(|i| JointState {
+            position: s.q[i], velocity: 0.0, temperature: 30.0,
+            torque: if i < 6 { g[i] } else { 0.0 },
+        }).collect())
+    }
+    fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
+        let mut s = self.0.lock().unwrap();
+        if let Some(j7) = targets.get(6) {
+            s.tx_j7.push(j7.position);
+        }
+        for (i, t) in targets.iter().enumerate().take(7) { s.q[i] = t.position; }
+        Ok(())
+    }
+    fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> {
+        self.0.lock().unwrap().torqued = enabled;
+        Ok(())
+    }
+    fn supports_mit_mode_switch(&self) -> bool { true }
+    fn set_joint_modes(&mut self, _modes: &[JointMode], _hold: &[JointTarget]) -> Result<(), ArmDriverError> {
+        Ok(())
+    }
+}
+
 struct Rig {
     ws: common::TestSocket,
     generation: u64,
@@ -41,9 +98,16 @@ impl Drop for Rig {
 }
 
 async fn rig(boxes: Vec<KeepoutBox>) -> Rig {
+    rig_with_driver(boxes, None).await
+}
+
+async fn rig_with_driver(boxes: Vec<KeepoutBox>, driver: Option<Box<dyn ArmDriver>>) -> Rig {
     let mut config = profile();
     config.workspace.as_mut().unwrap().keepout_boxes = boxes;
-    let sup = Arc::new(ArmSupervisor::new(config));
+    let sup = match driver {
+        Some(d) => Arc::new(ArmSupervisor::new(config).with_driver(d)),
+        None => Arc::new(ArmSupervisor::new(config)),
+    };
     let router = armd::create_router(sup.clone(), armd::OperatorAuth::disabled());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -92,29 +156,28 @@ impl Rig {
     }
 
     /// Wait for the end of action `id`, heartbeating; `each` sees every observed record and
-    /// the commanded positions.
+    /// the commanded positions. Fails immediately if the action record is missing or mismatched.
     async fn wait(&mut self, id: u64, mut each: impl FnMut(&ActionStatus, &[f32])) -> ActionStatus {
         let deadline = Instant::now() + Duration::from_secs(60);
         let mut last_hb = Instant::now();
-        let mut rx = self.sup.subscribe_telemetry().ok();
+        let mut rx = self.sup.subscribe_telemetry().expect("telemetry subscriber");
+        let first = self.sup.get_observation().await;
+        let first_ts = first.timestamp;
+        let a = first.action.into_iter().chain(first.previous_action).find(|a| a.id == id).expect("action record");
+        each(&a, &first.commanded_positions);
+        if !a.is_running() { return a; }
         loop {
             assert!(Instant::now() < deadline, "place {id} not finished");
             if last_hb.elapsed() > Duration::from_millis(200) { self.heartbeat().await; last_hb = Instant::now(); }
-            let obs = match rx.as_mut() {
-                Some(rx) => match tokio::time::timeout(Duration::from_millis(20), rx.recv()).await {
-                    Ok(Ok(obs)) => obs,
-                    _ => self.sup.get_observation().await,
-                },
-                None => {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                    self.sup.get_observation().await
-                }
+            let obs = match tokio::time::timeout(Duration::from_millis(20), rx.recv()).await {
+                Ok(Ok(obs)) if obs.timestamp <= first_ts => continue,
+                Ok(Ok(obs)) => obs,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) | Err(_) => self.sup.get_observation().await,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => panic!("telemetry channel closed while waiting for place {id}"),
             };
-            let q = obs.commanded_positions.clone();
-            if let Some(a) = obs.action.into_iter().chain(obs.previous_action).find(|a| a.id == id) {
-                each(&a, &q);
-                if !a.is_running() { return a; }
-            }
+            let a = obs.action.into_iter().chain(obs.previous_action).find(|a| a.id == id).expect("action record");
+            each(&a, &obs.commanded_positions);
+            if !a.is_running() { return a; }
         }
     }
 
@@ -187,14 +250,19 @@ async fn place_at_a_position_without_retreat() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn release_false_keeps_the_gripper_closed() {
-    let mut r = rig(vec![]).await;
+    let arm = RecordingArm::new(START);
+    let mut r = rig_with_driver(vec![], Some(Box::new(arm.clone()))).await;
+    arm.clear_tx();
     let p0 = tcp(&START);
     let target = [p0[0] + 0.03, p0[1], p0[2] - 0.06];
     let id = r.place(json!({"position": target, "release": false})).await;
-    let mut j7_moved = 0.0f32;
-    let a = r.wait(id, |_, q| j7_moved = j7_moved.max((q[6] - START[6]).abs())).await;
+    let a = r.wait(id, |_, _| {}).await;
     assert_eq!((a.state.as_str(), a.phase.as_deref(), a.holding), ("done", Some("done"), None), "{a:?}");
-    assert!(j7_moved < 1e-6, "J7 never commanded: {j7_moved}");
+    // Lossless proof from every driver TX write during the action (never relying on lossy telemetry).
+    let tx_j7 = arm.tx_j7();
+    assert!(!tx_j7.is_empty(), "driver must receive joint targets during place");
+    let j7_moved = tx_j7.iter().map(|&v| (v - START[6]).abs()).fold(0.0f32, f32::max);
+    assert!(j7_moved < 1e-6, "J7 never commanded across {} driver TX writes: max delta {j7_moved}", tx_j7.len());
     assert!(dist(&tcp(&r.q().await), &[target[0], target[1], target[2] + 0.08]) < 2e-3, "retreated");
 }
 

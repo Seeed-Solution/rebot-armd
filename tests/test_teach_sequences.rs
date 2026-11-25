@@ -166,10 +166,19 @@ impl Rig {
     }
 
     /// Polls the action until it ends; returns it and the (repeat, step) pairs seen in order.
+    /// Fails immediately if the action record is missing or mismatched.
     async fn wait(&mut self, id: u64, max_s: f64, mut each: impl FnMut(&armd::motion::ActionStatus)) -> (armd::motion::ActionStatus, Vec<(u32, usize)>) {
         let until = Instant::now() + Duration::from_secs_f64(max_s);
         let mut seen: Vec<(u32, usize)> = Vec::new();
-        let mut rx = self.sup.subscribe_telemetry().ok();
+        let mut rx = self.sup.subscribe_telemetry().expect("telemetry subscriber");
+        let first = self.sup.get_observation().await;
+        let first_ts = first.timestamp;
+        let a = first.action.into_iter().chain(first.previous_action).find(|a| a.id == id).expect("the action");
+        if let (Some(r), Some(k)) = (a.repeat_index, a.step_index) {
+            if seen.last() != Some(&(r, k)) { seen.push((r, k)); }
+        }
+        each(&a);
+        if !a.is_running() { return (a, seen); }
         let mut last_drain = Instant::now();
         loop {
             assert!(Instant::now() < until, "action {id} did not end in {max_s} s");
@@ -177,23 +186,18 @@ impl Rig {
                 common::drain(&mut self.ws, 1).await;
                 last_drain = Instant::now();
             }
-            let obs = match rx.as_mut() {
-                Some(rx) => match tokio::time::timeout(Duration::from_millis(20), rx.recv()).await {
-                    Ok(Ok(obs)) => obs,
-                    _ => self.sup.get_observation().await,
-                },
-                None => {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                    self.sup.get_observation().await
-                }
+            let obs = match tokio::time::timeout(Duration::from_millis(20), rx.recv()).await {
+                Ok(Ok(obs)) if obs.timestamp <= first_ts => continue,
+                Ok(Ok(obs)) => obs,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) | Err(_) => self.sup.get_observation().await,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => panic!("telemetry channel closed while waiting for action {id}"),
             };
-            if let Some(a) = obs.action.into_iter().chain(obs.previous_action).find(|a| a.id == id) {
-                if let (Some(r), Some(k)) = (a.repeat_index, a.step_index) {
-                    if seen.last() != Some(&(r, k)) { seen.push((r, k)); }
-                }
-                each(&a);
-                if !a.is_running() { return (a, seen); }
+            let a = obs.action.into_iter().chain(obs.previous_action).find(|a| a.id == id).expect("the action");
+            if let (Some(r), Some(k)) = (a.repeat_index, a.step_index) {
+                if seen.last() != Some(&(r, k)) { seen.push((r, k)); }
             }
+            each(&a);
+            if !a.is_running() { return (a, seen); }
         }
     }
 
