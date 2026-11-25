@@ -731,6 +731,7 @@ pub(crate) enum LegacyTorqueFailure {
 /// Lossless terminal outcome of a legacy WS `/api/v1/torque` transition captured atomically at
 /// completion time inside the owner (zero heap allocation on the control release).
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)] // inline bounded failure keeps control-release settling zero-alloc
 pub(crate) enum LegacyTorqueOutcome {
     Accepted {
         epoch_id: u64,
@@ -747,6 +748,7 @@ pub(crate) enum LegacyTorqueOutcome {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // preallocated inline slot avoids heap alloc on control release
 enum LegacyTorqueSlotState {
     Idle,
     InFlight { token: u64, abandoned: bool },
@@ -859,6 +861,7 @@ impl LegacyTorqueSlot {
 }
 
 /// Immediate start result of a legacy WS `/api/v1/torque` command under the short write guard.
+#[allow(clippy::large_enum_variant)] // inline bounded failure returned under short write guard
 pub(crate) enum LegacyTorqueStart {
     ImmediateAccepted {
         epoch_id: u64,
