@@ -104,13 +104,30 @@ impl SupervisorInner {
         self.drop_macro_run("cancelled", Some("SUPERSEDED"));
         #[cfg(feature = "policy-runtime")]
         if let Some(mut run) = self.policy_run.take() {
-            run.stop_reason = Some("SUPERSEDED".to_string());
-            if run.mode == crate::policy_runtime::PolicyMode::Live {
-                self.servo_target = None;
-                self.servo_settled_ticks.fill(0);
-                self.servo_ws_min_depths = None;
+            if self.rt_executor_owned {
+                // Executor supersession: revoke authorization, seal/close stream, recycle spares
+                // in place with 0 allocs/frees, emit immutable terminal outcome, and preserve
+                // replacement `target_positions` and `j7_admitted_stamp` (`reset_hold_target = false`).
+                let sup_aid = run.action_id;
+                let sup_steps = run.steps;
+                self.teardown_rt_policy_run(run, "SUPERSEDED", false, Instant::now());
+                #[cfg(not(target_arch = "wasm32"))]
+                self.push_rt_policy_terminal(
+                    sup_aid,
+                    sup_steps,
+                    "SUPERSEDED",
+                    "cancelled",
+                    crate::motion::PolicyStats::default(),
+                );
+            } else {
+                run.stop_reason = Some("SUPERSEDED".to_string());
+                if run.mode == crate::policy_runtime::PolicyMode::Live {
+                    self.servo_target = None;
+                    self.servo_settled_ticks.fill(0);
+                    self.servo_ws_min_depths = None;
+                }
+                self.last_policy_obs = Some(run.to_observation(false));
             }
-            self.last_policy_obs = Some(run.to_observation(false));
         }
         if let Some(mut old) = self.last_action.take() {
             if old.is_running() {
@@ -1090,12 +1107,17 @@ impl SupervisorInner {
     }
 
     pub(crate) fn install_macro_path_inner(&mut self, proof: &crate::supervisor::AdmittedProof, id: u64, input: &PlanInput, path: JointPath) -> Result<f64, ArmError> {
+        self.install_macro_path_inner_with_j7_lock(proof, id, input, path, false)
+    }
+
+    pub(crate) fn install_macro_path_inner_with_j7_lock(&mut self, proof: &crate::supervisor::AdmittedProof, id: u64, input: &PlanInput, path: JointPath, lock_j7_hold: bool) -> Result<f64, ArmError> {
         let epoch = self.macro_sub_ready(id)?;
         if input.epoch != epoch { return Err(MotionError::PlanStale("epoch changed during the action".into()).into()); }
         self.check_plan_fresh(input)?;
         let duration = self.start_path_motion_at_inner(proof, input.epoch, &path)?;
         if input.power.is_some() { self.note_action_power_scale(id, path.power_scale); }
-        self.active_trajectory = Some(ActiveTrajectory::new(Some(id), Reference::Path(PathTrajectory::new(path))));
+        let hold_j7 = if lock_j7_hold { self.config.gripper_index() } else { None };
+        self.active_trajectory = Some(ActiveTrajectory::new(Some(id), Reference::Path(PathTrajectory::new(path).with_hold_j7(hold_j7))));
         self.set_macro_sub_running(id);
         Ok(duration + 0.5)
     }
@@ -1329,7 +1351,7 @@ impl SupervisorInner {
         self.gripper_hold_vel_ceiling = Some(motion.wire_velocity_ceiling());
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
-        self.servo_ws_min_depths = None;
+        self.clear_servo_ws_min_depths_rt();
         let mut target = self.commanded_positions.clone();
         target[gripper_idx] = motion.target;
         self.target_positions = target;
@@ -1610,7 +1632,7 @@ impl SupervisorInner {
         let motion = motion.with_baseline(self.gripper_baseline_for_motion(), learn);
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
-        self.servo_ws_min_depths = None;
+        self.clear_servo_ws_min_depths_rt();
         let mut target = self.commanded_positions.clone();
         target[gripper_idx] = motion.target;
         self.target_positions = target;
@@ -1682,7 +1704,7 @@ impl SupervisorInner {
         self.gripper_hold_vel_ceiling = Some(motion.wire_velocity_ceiling());
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
-        self.servo_ws_min_depths = None;
+        self.clear_servo_ws_min_depths_rt();
         let mut target = self.commanded_positions.clone();
         target[gripper_idx] = motion.target;
         self.target_positions = target;

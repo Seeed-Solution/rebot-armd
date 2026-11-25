@@ -3961,6 +3961,26 @@ pub struct PolicyObservation {
 
 crate::fieldwise_clone!(PolicyObservation { active, action_id, policy_id, artifact_digest, backend, mode, steps, last_input_age_ms, last_vision_age_ms, vision_frame_id, last_shadow_target, stop_reason });
 
+impl PolicyObservation {
+    /// Preallocated empty `PolicyObservation` reused by `armd-control` spares (0 RT alloc/free).
+    pub fn preallocated_rt() -> Self {
+        Self {
+            active: false,
+            action_id: 0,
+            policy_id: String::with_capacity(HolderLabel::CAPACITY),
+            artifact_digest: String::with_capacity(HolderLabel::CAPACITY),
+            backend: String::with_capacity(64),
+            mode: String::with_capacity(16),
+            steps: 0,
+            last_input_age_ms: None,
+            last_vision_age_ms: None,
+            vision_frame_id: None,
+            last_shadow_target: None,
+            stop_reason: None,
+        }
+    }
+}
+
 /// Gripper zero state published in `observation.gripper_zero`.
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct GripperZeroObservation {
@@ -4216,6 +4236,10 @@ pub struct Capabilities {
     /// (false) from older armd.
     #[serde(default)]
     pub grasp_select: bool,
+    /// Live grasp execution with `strategy: "adaptive"` (`grasp_select` phase B): `grasp` on a
+    /// 6-DOF arm. Absent (false) from older armd (phase A was dry-run only).
+    #[serde(default)]
+    pub grasp_select_exec: bool,
     /// Action `/api/v1/action/measure_multiview` (lease, operator session): motion-stereo object
     /// measurement from views around the object (`ActionStatus.measurement`); same value as `grasp`.
     /// Absent (false) from older armd.
@@ -4546,6 +4570,7 @@ impl Capabilities {
             move_path_joint: arm_with_gripper && kin,
             grasp_measure: grasp,
             grasp_select: grasp && config.arm_dof() == 6,
+            grasp_select_exec: grasp && config.arm_dof() == 6,
             measure_multiview: grasp,
             calibration_apply: grasp,
             calibration_kinematics: grasp && config.arm_model.chain().is_none(),

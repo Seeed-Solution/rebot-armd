@@ -25,12 +25,15 @@ use std::time::Instant;
 
 use serde_json::{json, Value};
 
-pub use snapshot::{capture, Snapshot};
+pub use snapshot::{capture, capture_from_env, Snapshot};
 use candidates::{Chord, DirClass, Hypothesis, Rejection};
-use feasibility::{Checked, Work};
+pub use feasibility::{
+    CarriedObjectBox, Checked, Margins, Work, BRANCH_CONSISTENCY_TOL_RAD, CONTACT_LATERAL_TOL_M,
+    CONTACT_ROT_TOL_RAD, CONTACT_WINDOW_M,
+};
 use score::{Robustness, Scores};
 use crate::kinematics::{self, Pose};
-use crate::motion::MotionError;
+use crate::motion::{self, GripperCommand, MotionError};
 
 /// Grasp request `strategy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -43,15 +46,6 @@ pub fn parse_strategy(body: &Value) -> Result<Strategy, MotionError> {
         Some(Value::String(s)) if s == "legacy" => Ok(Strategy::Legacy),
         Some(Value::String(s)) if s == "adaptive" => Ok(Strategy::Adaptive),
         Some(_) => Err(MotionError::InvalidCommand("strategy must be \"legacy\", \"adaptive\" or null".into())),
-    }
-}
-
-/// Refusal of an executed (not dry-run) grasp with `strategy: "adaptive"`: execution with a
-/// selected candidate is not available yet.
-pub fn refuse_execution(body: &Value) -> Result<(), MotionError> {
-    match parse_strategy(body)? {
-        Strategy::Legacy => Ok(()),
-        Strategy::Adaptive => Err(MotionError::Unsupported("strategy \"adaptive\" is available for dry_run only; execution uses the legacy strategy".into())),
     }
 }
 
@@ -105,12 +99,294 @@ pub struct ExecutionPlan {
     pub q_lift: [f64; 6],
 }
 
+/// Snapshot of all five owner configuration revisions captured at adaptive grasp admission and
+/// fenced on `BeginMacro`, every `InstallChild`, post-lift holding observation, and final
+/// `FinishMacro(Done, HeldUpdate::Set)` commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdaptiveRevisions {
+    pub workspace_revision: u64,
+    pub calibration_revision: u64,
+    pub grasp_setup_revision: u64,
+    pub gripper_calib_revision: u64,
+    pub power_budget_revision: u64,
+}
+
+/// How the adaptive route transitions from actual start `q0` to `pregrasp`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PregraspMode {
+    /// Straight Cartesian TCP path from `q0` to `pregrasp` staying on the selected IK branch.
+    Cartesian,
+    /// Swept joint-space quintic `JointPath` from `q0` to `q_pregrasp` (used when a straight
+    /// Cartesian move would flip the IK branch or fail IK), J7 strictly locked.
+    SweptJoint,
+}
+
+impl PregraspMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Cartesian => "cartesian",
+            Self::SweptJoint => "swept_joint",
+        }
+    }
+}
+
+/// Scheduled time budget (s) derived from the exact checked legs and shared gripper estimator.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RouteBudget {
+    pub pregrasp_s: f64,
+    pub start_vision_s: f64,
+    pub pre_open_s: f64,
+    pub pregrasp_vision_s: f64,
+    pub insert_s: f64,
+    pub close_s: f64,
+    pub close_timeout_s: f64,
+    pub is_pos_force_close: bool,
+    pub separation_s: f64,
+    pub lift_s: f64,
+    pub withdrawal_s: f64,
+    pub post_lift_settle_s: f64,
+    pub nominal_total_s: f64,
+    pub recovery_total_s: f64,
+}
+
+/// Shared gripper duration / timeout estimator using the EXACT same
+/// [`motion::GripperMotion::try_with_close_speed_limit`] calculation installed by the owner.
+/// Returns `(expected_duration_s, motion_timeout_s, is_pos_force_close)`.
+pub fn estimate_gripper_duration_s(
+    policy: &crate::model::GripperPolicy,
+    limit: &crate::model::JointLimit,
+    start_j7: f32,
+    close_speed_limit: Option<f32>,
+    command: GripperCommand,
+    fraction: Option<f64>,
+    grasp: bool,
+) -> Result<(f64, f64, bool), MotionError> {
+    let closes = match command {
+        GripperCommand::Close | GripperCommand::Seek => true,
+        GripperCommand::Open => false,
+        GripperCommand::Move => {
+            let target =
+                policy.closed_rad + fraction.unwrap_or(0.0) as f32 * (policy.open_rad - policy.closed_rad);
+            let dir = if policy.closed_rad >= policy.open_rad { 1.0 } else { -1.0 };
+            (target - start_j7) * dir > 1e-3
+        }
+    };
+    let (speed, timeout_s) = if closes {
+        (policy.close_speed(), None)
+    } else {
+        (1.0, Some(8.0))
+    };
+    let req = motion::GripperRequest {
+        command,
+        fraction,
+        grasp,
+        speed,
+        timeout_s,
+        tag: None,
+    };
+    let mut mot = motion::GripperMotion::try_with_close_speed_limit(
+        req,
+        policy.clone(),
+        limit.clone(),
+        start_j7,
+        0,
+        close_speed_limit,
+    )?;
+    let is_pf = close_speed_limit.is_some() && mot.is_closing();
+    if is_pf && mot.request.timeout_s.is_some() {
+        mot.use_default_timeout();
+    }
+    Ok((mot.expected_duration(), mot.timeout_s, is_pf))
+}
+
+/// Maximum wait window (s) allowed for a single adaptive vision revalidation step (shared by
+/// whole-route preflight budgeting AND live `fresh_match_adaptive` timeouts).
+pub const ADAPTIVE_VISION_WINDOW_CAP_S: f64 = 2.5;
+
+/// Unified per-step vision revalidation budget (s): settle delay + bounded observation wait.
+/// Shared by both `preflight_candidate_from_start` and live `Orchestrator::fresh_match_adaptive`.
+pub fn adaptive_vision_budget_s(st: &crate::grasp::GraspSetup) -> f64 {
+    st.settle_delay_s.max(0.0) + st.lost_timeout_s.min(ADAPTIVE_VISION_WINDOW_CAP_S)
+}
+
+/// Single authoritative executable route for Phase B adaptive grasp: drives adaptive dry-run
+/// reporting, pre-`BeginMacro` whole-route preflight & budget admission, [`SelectedGraspMacro`]
+/// construction, and runtime `Orchestrator::run_adaptive` execution.
+#[derive(Debug, Clone)]
+pub struct AdaptiveRoute {
+    pub candidate_id: String,
+    pub approach_class: &'static str,
+    pub tilt_deg: f64,
+    pub plan: ExecutionPlan,
+    pub pregrasp_mode: PregraspMode,
+    /// Nominal TCP-frame carried-object box at `plan.grasp` (low/high projection hull +
+    /// `hard_error_m` + `TABLE_ERROR_M`); live execution transforms this by the exact SE(3)
+    /// relative contact pose `actual_contact_tcp^{-1} * plan.grasp`.
+    pub obj_box_nominal_tcp: CarriedObjectBox,
+    /// Conservative preflight TCP-frame object volume (expanded over the full accepted contact
+    /// translation + rotation envelope).
+    pub obj_box_tcp: CarriedObjectBox,
+    pub payload_kg: Option<f64>,
+    pub torque_limits: Option<Vec<f64>>,
+    pub has_gravity_model: bool,
+    pub target_centroid: [f64; 2],
+    pub target_table_z: f64,
+    pub target_height: [f64; 2],
+    pub target_poly: Vec<[f64; 2]>,
+    pub target_axis: [f64; 2],
+    pub target_axis_ambiguous: bool,
+    pub target_hard_error_m: f64,
+    pub opening_reserve_m: f64,
+    pub contact_window_m: f64,
+    pub visible_at_pregrasp: bool,
+    pub pre_open_command: GripperCommand,
+    pub pre_open_fraction: Option<f64>,
+    pub budget: RouteBudget,
+    pub contact_guard: crate::rt_core::ops::ContactGuard,
+    pub contact_stop_armed: bool,
+    pub checked_phases: Vec<&'static str>,
+    pub margins: Margins,
+    pub robustness: Robustness,
+    pub scores: Scores,
+    pub approach_mps: f64,
+    pub insert_mps: f64,
+    pub loaded_mps: f64,
+    pub has_oriented_evidence: bool,
+}
+
+impl AdaptiveRoute {
+    /// Builds P's [`SelectedGraspMacro`] directly from this authoritative route, binding all
+    /// five captured revisions and exact `expected_duration_s`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn into_selected_macro(
+        &self,
+        prepared_boot: crate::rt_core::broker::BootId,
+        start: &[f32],
+        deadline: Instant,
+        tag: Option<&str>,
+        task: Option<&str>,
+        revisions: AdaptiveRevisions,
+        admission_request_id: u64,
+    ) -> Result<SelectedGraspMacro, &'static str> {
+        use crate::rt_core::requests::actions::{BeginMacroSpec, MacroKind};
+
+        let mut begin = BeginMacroSpec::new(MacroKind::Grasp, prepared_boot).with_start(start)?;
+        begin.admission_request_id = admission_request_id;
+        begin.check_workspace_revision = true;
+        begin.calibration_revision = Some(revisions.calibration_revision);
+        begin.grasp_setup_revision = Some(revisions.grasp_setup_revision);
+        begin.gripper_calib_revision = Some(revisions.gripper_calib_revision);
+        begin.power_budget_revision = Some(revisions.power_budget_revision);
+        begin.macro_deadline = Some(deadline);
+        begin.timeout_code = crate::safety::BoundedText::new("GRASP_TIMEOUT");
+        begin.j7_intent_only = true;
+        if let Some(tag) = tag {
+            begin.tag = crate::model::HolderLabel::new(tag);
+        }
+        if let Some(task) = task {
+            begin.task = crate::model::HolderLabel::new(task);
+        }
+        let steps = vec![
+            SelectedMacroStep::MoveTcp {
+                phase: "pregrasp",
+                goal: self.plan.pregrasp,
+                linear_mps: self.approach_mps,
+                contact: None,
+            },
+            SelectedMacroStep::Gripper {
+                phase: "pre_open",
+                command: self.pre_open_command,
+                fraction: self.pre_open_fraction,
+                grasp: false,
+            },
+            SelectedMacroStep::MoveTcp {
+                phase: "insert",
+                goal: self.plan.grasp,
+                linear_mps: self.insert_mps,
+                contact: Some(self.contact_guard),
+            },
+            SelectedMacroStep::Gripper {
+                phase: "close",
+                command: GripperCommand::Close,
+                fraction: None,
+                grasp: true,
+            },
+            SelectedMacroStep::MoveTcp {
+                phase: "separation",
+                goal: self.plan.separation,
+                linear_mps: self.loaded_mps,
+                contact: None,
+            },
+            SelectedMacroStep::MoveTcp {
+                phase: "lift",
+                goal: self.plan.lift,
+                linear_mps: self.loaded_mps,
+                contact: None,
+            },
+        ];
+        Ok(SelectedGraspMacro {
+            begin,
+            steps,
+            expected_duration_s: self.budget.nominal_total_s,
+        })
+    }
+}
+
+/// Result of Phase B actual-start selection + whole-route preflight ([`select_adaptive_route`]).
+#[derive(Debug, Clone)]
+pub struct AdaptiveSelection {
+    pub selection: Selection,
+    pub route: Option<AdaptiveRoute>,
+    pub failing_phase: Option<&'static str>,
+    /// Checked-alternative hint populated ONLY when an actually checked alternative exists
+    /// (e.g. an `InsufficientEvidence` candidate with a verified payload capacity bound).
+    pub checked_hint: Option<String>,
+}
+
+impl AdaptiveSelection {
+    pub fn reachable(&self) -> bool {
+        self.selection.outcome == Outcome::Selected && self.route.is_some()
+    }
+
+    /// Adaptive dry-run reply JSON (parity with Phase A fields plus authoritative Phase B
+    /// route summary, `failing_phase`, and checked-alternative `hint` only when verified).
+    pub fn to_json(
+        &self,
+        s: &Snapshot,
+        legacy_verdict: Option<(bool, Option<&str>, Option<&str>)>,
+    ) -> Value {
+        let mut v = self.selection.to_json(s);
+        if let Some(route) = &self.route {
+            v["expected_duration_s"] = json!(route.budget.nominal_total_s);
+            v["pregrasp_mode"] = json!(route.pregrasp_mode.name());
+            v["checked_phases"] = json!(route.checked_phases);
+            if let Some(sc) = v.get_mut("selected_candidate").and_then(Value::as_object_mut) {
+                sc.insert("checked_phases".into(), json!(route.checked_phases));
+                sc.insert("pregrasp_mode".into(), json!(route.pregrasp_mode.name()));
+                sc.insert("expected_duration_s".into(), json!(route.budget.nominal_total_s));
+            }
+        }
+        v["failing_phase"] = json!(self.failing_phase);
+        let hint = self.checked_hint.clone().or_else(|| {
+            if !self.reachable() {
+                if let Some((true, _, _)) = legacy_verdict {
+                    return Some("legacy strategy passed dry_run for this target".to_string());
+                }
+            }
+            None
+        });
+        if let Some(h) = hint {
+            v["hint"] = json!(h);
+        }
+        v
+    }
+}
+
 /// Ordered macro child step produced from a selected [`ExecutionPlan`] for Phase B execution.
 ///
-/// Phase A keeps live `strategy: "adaptive"` refused via [`refuse_execution`] and serves
-/// dry-run selection only. Phase B installs [`SelectedGraspMacro::begin`] as an A7 macro parent
-/// and feeds each [`SelectedMacroStep`] through `MacroCtx` / `InstallChild` without changing
-/// the A7 broker or owner contract.
+/// Phase B installs [`SelectedGraspMacro::begin`] as an A7 macro parent and feeds each
+/// [`SelectedMacroStep`] through `MacroCtx` / `InstallChild` without changing the A7 broker or
+/// owner contract.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SelectedMacroStep {
     /// Linear TCP sub-motion with optional contact guard (for insertion).
@@ -283,7 +559,7 @@ impl Selection {
 }
 
 /// Order of the phases, for the deepest failure.
-const PHASE_ORDER: [&str; 12] = ["evidence", "geometry", "table", "pre_open", "insertion", "closure", "endpoint_ik", "acquisition", "transition", "separation", "lift", "withdrawal"];
+const PHASE_ORDER: [&str; 13] = ["evidence", "geometry", "table", "pre_open", "insertion", "closure", "endpoint_ik", "acquisition", "transition", "separation", "lift", "withdrawal", "budget"];
 
 fn phase_rank(p: &str, path: bool) -> usize {
     // an insertion failure of the path check is deeper than one of the cheap stage
@@ -360,11 +636,996 @@ fn prescore(s: &Snapshot, t: &snapshot::Target, ch: &Chord, hy: &Hypothesis, q_g
     score::contact_quality(s, t, ch, hy) - score::preference_penalty(&s.prefs, hy) + 0.2 * feasibility::joint_margin(&s.input, q_g)
 }
 
-fn visible(s: &Snapshot, t: &snapshot::Target, tcp: &Pose) -> bool {
-    let end = crate::motion::tcp_to_end(tcp, &s.input.tcp_offset);
-    let z = t.table_z + (t.height[0] + t.height[1]) / 4.0;
+/// Whether the target is meaningfully visible in the camera image when the TCP is at `tcp`:
+/// centroid projects inside the 4 px inset AND at least half of footprint vertices project
+/// inside the image frame (so a single slightly clipped corner cannot silently skip pre-grasp
+/// vision revalidation).
+pub fn visible_at_pose(
+    cam: &crate::grasp::CamModel,
+    tcp_offset: &[f64; 3],
+    poly: &[[f64; 2]],
+    z_mid: f64,
+    tcp: &Pose,
+) -> bool {
+    if poly.is_empty() {
+        return false;
+    }
+    let end = crate::motion::tcp_to_end(tcp, tcp_offset);
     let m = 4.0;
-    t.poly.iter().all(|v| s.cam.project(&end, &[v[0], v[1], z]).is_some_and(|p| p[0] >= m && p[1] >= m && p[0] <= s.cam.size[0] - m && p[1] <= s.cam.size[1] - m))
+    let centroid = geometry::centroid(poly);
+    let Some(cp) = cam.project(&end, &[centroid[0], centroid[1], z_mid]) else {
+        return false;
+    };
+    if !(cp[0] >= m && cp[1] >= m && cp[0] <= cam.size[0] - m && cp[1] <= cam.size[1] - m) {
+        return false;
+    }
+    let in_frame = poly
+        .iter()
+        .filter(|v| {
+            cam.project(&end, &[v[0], v[1], z_mid]).is_some_and(|p| {
+                p[0] >= 0.0 && p[1] >= 0.0 && p[0] <= cam.size[0] && p[1] <= cam.size[1]
+            })
+        })
+        .count();
+    in_frame * 2 >= poly.len()
+}
+
+fn visible(s: &Snapshot, t: &snapshot::Target, tcp: &Pose) -> bool {
+    let z = t.table_z + (t.height[0] + t.height[1]) / 4.0;
+    visible_at_pose(&s.cam, &s.input.tcp_offset, &t.poly, z, tcp)
+}
+
+/// Phase B actual-start selection + whole-route preflight (shared single authority for live
+/// adaptive `grasp` AND adaptive `grasp_dry_run`).
+///
+/// Shares candidate generation and scoring with Phase A [`select`], while evaluating actual-start
+/// feasibility directly from `s.input.q0` (direct Cartesian or swept-joint `pregrasp`, calibrated
+/// `pre_open`, straight-line TCP `insert`, capped `close`, nominal + contact-window `separation`
+/// & `lift` with conservative swept OBB SAT + 8-corner payload torque, closed & open `withdrawal`,
+/// and unified per-child + parent deadline admission) under ONE absolute `budget_ms` deadline.
+pub fn select_adaptive_route(
+    s: &Snapshot,
+    gripper_policy: &crate::model::GripperPolicy,
+    gripper_limit: &crate::model::JointLimit,
+    close_speed_limit: Option<f32>,
+    has_gravity_model: bool,
+) -> AdaptiveSelection {
+    let mut se = Search {
+        s,
+        start: Instant::now(),
+        stats: Stats::default(),
+        rejected: Vec::new(),
+        by_phase: BTreeMap::new(),
+        by_code: BTreeMap::new(),
+    };
+    let t = match snapshot::target(s) {
+        Ok(t) => t,
+        Err(m) => {
+            *se.by_phase.entry("evidence").or_default() += 1;
+            let ev = evidence_json(s, None);
+            let sel = se.finish(
+                Outcome::Infeasible,
+                Some("INVALID_COMMAND".into()),
+                Some(format!("evidence: {m}")),
+                Vec::new(),
+                ev,
+            );
+            return AdaptiveSelection {
+                selection: sel,
+                route: None,
+                failing_phase: Some("evidence"),
+                checked_hint: None,
+            };
+        }
+    };
+    let ev = evidence_json(s, Some(&t));
+    let (chords, chord_rej) = candidates::chords(&t, &s.tool);
+    se.stats.chords = chords.len();
+    for r in chord_rej {
+        *se.by_phase.entry(r.phase).or_default() += 1;
+        *se.by_code.entry(format!("{}:{}", r.phase, r.code)).or_default() += 1;
+    }
+    let mut cheap = candidates::CheapStats::default();
+    let (hyps, hyp_rej) = candidates::hypotheses(s, &t, &chords, &mut cheap);
+    se.stats.generated = cheap.generated;
+    se.stats.geometric_survivors = hyps.len();
+    for (hy, r) in hyp_rej {
+        se.reject(&hy, r, false);
+    }
+    if se.out_of_budget() {
+        se.stats.lattice_tests = cheap.lattice_tests;
+        return AdaptiveSelection {
+            selection: se.exhausted(0, ev),
+            route: None,
+            failing_phase: Some("budget"),
+            checked_hint: None,
+        };
+    }
+
+    // Check acquisition as a reference seed / diagnostic only — NEVER hard-blocking direct-from-q0
+    // candidates when acquisition itself is blocked (e.g. overhead keep-out box above target).
+    let mut work = Work::default();
+    let acq_res = feasibility::acquisition(s, &mut work);
+    let acq_seed = acq_res.as_ref().ok().map(|a| a.q_end);
+
+    // Seed endpoint IK from cache, actual start q0, optional acq_seed, and a canonical
+    // target-facing front-branch seed (clamped to joint limits) so starting on an alternate IK
+    // branch does not trap endpoint IK in a local minimum and can cleanly fall back to a
+    // swept-joint pregrasp transition.
+    let az = t.centroid[1].atan2(t.centroid[0]);
+    let raw_canonical = [az, -1.167, -1.565, 1.435, 0.0, 0.0];
+    let canonical_seed: [f64; 6] = std::array::from_fn(|j| {
+        let lim = &s.input.limits[j];
+        raw_canonical[j].clamp(f64::from(lim.min_position) + 0.05, f64::from(lim.max_position) - 0.05)
+    });
+    let mut seed_cache: BTreeMap<(DirClass, bool), [f64; 6]> = BTreeMap::new();
+    let mut screened: Vec<(Hypothesis, [f64; 6], [f64; 6], f64)> = Vec::new();
+    for hy in hyps {
+        if se.out_of_budget() {
+            se.stats.work = work;
+            se.stats.lattice_tests = cheap.lattice_tests;
+            return AdaptiveSelection {
+                selection: se.exhausted(0, ev),
+                route: None,
+                failing_phase: Some("budget"),
+                checked_hint: None,
+            };
+        }
+        let mut seeds = Vec::with_capacity(4);
+        if let Some(q) = seed_cache.get(&(hy.class, hy.half_turn)) {
+            seeds.push(*q);
+        }
+        seeds.push(s.input.q0);
+        if let Some(qa) = acq_seed {
+            seeds.push(qa);
+        }
+        seeds.push(canonical_seed);
+        let q_g = match feasibility::endpoint_ik(&s.input, &hy.grasp_pose(), &seeds, &mut work) {
+            Ok(q) => q,
+            Err((ep, er)) => {
+                se.reject(
+                    &hy,
+                    Rejection::new(
+                        "endpoint_ik",
+                        "IK_UNREACHABLE",
+                        format!("contact pose: best IK error {:.4} m / {:.2} deg", ep, er.to_degrees()),
+                    )
+                    .with(ep, kinematics::PAR.tol_pos),
+                    false,
+                );
+                continue;
+            }
+        };
+        let mut pre_seeds = vec![q_g, s.input.q0];
+        if let Some(qa) = acq_seed {
+            pre_seeds.push(qa);
+        }
+        pre_seeds.push(canonical_seed);
+        let q_pre_seed = match feasibility::endpoint_ik(&s.input, &hy.pregrasp_pose(), &pre_seeds, &mut work) {
+            Ok(q) => q,
+            Err((ep, er)) => {
+                se.reject(
+                    &hy,
+                    Rejection::new(
+                        "endpoint_ik",
+                        "IK_UNREACHABLE",
+                        format!("pre-grasp pose: best IK error {:.4} m / {:.2} deg", ep, er.to_degrees()),
+                    )
+                    .with(ep, kinematics::PAR.tol_pos),
+                    false,
+                );
+                continue;
+            }
+        };
+        seed_cache.insert((hy.class, hy.half_turn), q_g);
+        let p = prescore(s, &t, &chords[hy.chord], &hy, &q_g);
+        screened.push((hy, q_g, q_pre_seed, p));
+    }
+    se.stats.ik_survivors = screened.len();
+
+    // If acquisition failed AND no candidate even passed endpoint IK (wholly unreachable target,
+    // e.g. table 0.30 m below base), preserve the exact acquisition failure diagnostics.
+    if screened.is_empty() {
+        if let Err(r) = acq_res {
+            se.stats.work = work;
+            se.stats.lattice_tests = cheap.lattice_tests;
+            *se.by_phase.entry("acquisition").or_default() += 1;
+            let m = format!(
+                "acquisition: {} (a different contact pose cannot fix the observation pose)",
+                r.message
+            );
+            let sel = se.finish(Outcome::Infeasible, Some(r.code), Some(m), Vec::new(), ev);
+            return AdaptiveSelection {
+                selection: sel,
+                route: None,
+                failing_phase: Some("acquisition"),
+                checked_hint: None,
+            };
+        }
+    }
+
+    screened.sort_by(|a, b| b.3.total_cmp(&a.3).then(a.0.index.cmp(&b.0.index)));
+    let mut short: Vec<usize> = screened
+        .iter()
+        .enumerate()
+        .filter(|(_, x)| x.0.class.is_radial_oblique())
+        .map(|(i, _)| i)
+        .take(RESERVED_RADIAL_OBLIQUE)
+        .collect();
+    for (i, x) in screened.iter().enumerate() {
+        if short.len() >= SHORTLIST {
+            break;
+        }
+        if short.contains(&i) {
+            continue;
+        }
+        let n_class = short
+            .iter()
+            .filter(|&&j| screened[j].0.class == x.0.class)
+            .count();
+        if n_class < MAX_PER_CLASS {
+            short.push(i);
+        }
+    }
+    short.sort_unstable();
+    se.stats.shortlisted = short.len();
+
+    let acq_ok = acq_res.is_ok();
+    let mut entries: Vec<(Candidate, AdaptiveRoute)> = Vec::new();
+    let mut deepest: Option<(usize, Rejection)> = None;
+
+    let evaluate = |se: &mut Search,
+                        hy: &Hypothesis,
+                        q_pre_seed: [f64; 6],
+                        work: &mut Work,
+                        entries: &mut Vec<(Candidate, AdaptiveRoute)>,
+                        deepest: &mut Option<(usize, Rejection)>| {
+        let budget_check = || se.out_of_budget();
+        match preflight_candidate_from_start(
+            s,
+            &t,
+            hy,
+            q_pre_seed,
+            acq_ok,
+            gripper_policy,
+            gripper_limit,
+            close_speed_limit,
+            has_gravity_model,
+            work,
+            &budget_check,
+        ) {
+            Ok((checked, mut route)) => {
+                let rob = score::robustness(s, &t, hy, &checked, work);
+                let ch = chords[hy.chord].clone();
+                let scores = score::score(s, &t, &ch, hy, &checked, &rob);
+                let vis = visible(s, &t, &hy.pregrasp_pose());
+                let cid = se.id(hy);
+                route.candidate_id = cid.clone();
+                route.robustness = rob;
+                route.scores = scores;
+                route.visible_at_pregrasp = vis;
+                let cand = Candidate {
+                    id: cid,
+                    hy: hy.clone(),
+                    chord: ch,
+                    checked,
+                    robustness: rob,
+                    scores,
+                    visible_at_pregrasp: vis,
+                };
+                entries.push((cand, route));
+            }
+            Err(r) => {
+                let rank = phase_rank(r.phase, true);
+                if deepest.as_ref().is_none_or(|(d, _)| rank > *d) {
+                    *deepest = Some((rank, r.clone()));
+                }
+                se.reject(hy, r, true);
+            }
+        }
+    };
+
+    for &i in &short {
+        if se.out_of_budget() {
+            let n = entries.len();
+            se.stats.work = work;
+            se.stats.lattice_tests = cheap.lattice_tests;
+            return AdaptiveSelection {
+                selection: se.exhausted(n, ev),
+                route: None,
+                failing_phase: Some("budget"),
+                checked_hint: None,
+            };
+        }
+        let (hy, _, q_pre_seed, _) = &screened[i];
+        evaluate(&mut se, hy, *q_pre_seed, &mut work, &mut entries, &mut deepest);
+    }
+
+    // Refinement around best feasible oblique (same schedule as Phase A).
+    let best_oblique = entries
+        .iter()
+        .filter(|(c, _)| c.hy.tilt_deg > 0.0)
+        .max_by(|a, b| {
+            a.0.scores
+                .total
+                .total_cmp(&b.0.scores.total)
+                .then(b.0.hy.index.cmp(&a.0.hy.index))
+        })
+        .map(|(c, _)| (c.hy.clone(), c.checked.q_grasp, c.checked.q_pre));
+    if let Some((b, b_qg, b_qp)) = best_oblique {
+        let ch = &chords[b.chord];
+        let h0 = geometry::unit2([b.a[0], b.a[1]]);
+        let rot = |h: geometry::V2, deg: f64| {
+            let (sn, cs) = deg.to_radians().sin_cos();
+            [h[0] * cs - h[1] * sn, h[0] * sn + h[1] * cs]
+        };
+        let variants = [
+            (b.tilt_deg + 10.0, h0),
+            ((b.tilt_deg - 10.0).max(10.0), h0),
+            (b.tilt_deg, rot(h0, 20.0)),
+            (b.tilt_deg, rot(h0, -20.0)),
+        ];
+        let mut next = 10_000 + b.index * 10;
+        for (tilt, h) in variants.into_iter().take(REFINE) {
+            if se.out_of_budget() {
+                let n = entries.len();
+                se.stats.work = work;
+                se.stats.lattice_tests = cheap.lattice_tests;
+                return AdaptiveSelection {
+                    selection: se.exhausted(n, ev),
+                    route: None,
+                    failing_phase: Some("budget"),
+                    checked_hint: None,
+                };
+            }
+            next += 1;
+            se.stats.refined += 1;
+            match candidates::make(
+                s,
+                &t,
+                ch,
+                b.chord,
+                (b.class, tilt.min(80.0), h),
+                b.half_turn,
+                b.deep,
+                next,
+                &mut cheap,
+            ) {
+                Ok(hy) => {
+                    let seeds = [b_qg, s.input.q0];
+                    match feasibility::endpoint_ik(&s.input, &hy.grasp_pose(), &seeds, &mut work) {
+                        Ok(q_g) => {
+                            let pre_seeds = [b_qp, q_g, s.input.q0];
+                            match feasibility::endpoint_ik(
+                                &s.input,
+                                &hy.pregrasp_pose(),
+                                &pre_seeds,
+                                &mut work,
+                            ) {
+                                Ok(q_pre_seed) => evaluate(
+                                    &mut se,
+                                    &hy,
+                                    q_pre_seed,
+                                    &mut work,
+                                    &mut entries,
+                                    &mut deepest,
+                                ),
+                                Err((ep, _)) => se.reject(
+                                    &hy,
+                                    Rejection::new(
+                                        "endpoint_ik",
+                                        "IK_UNREACHABLE",
+                                        format!("refined pre-grasp pose: IK error {ep:.4} m"),
+                                    )
+                                    .with(ep, kinematics::PAR.tol_pos),
+                                    true,
+                                ),
+                            }
+                        }
+                        Err((ep, _)) => se.reject(
+                            &hy,
+                            Rejection::new(
+                                "endpoint_ik",
+                                "IK_UNREACHABLE",
+                                format!("refined contact pose: IK error {ep:.4} m"),
+                            )
+                            .with(ep, kinematics::PAR.tol_pos),
+                            true,
+                        ),
+                    }
+                }
+                Err(b) => {
+                    let (hy, r) = *b;
+                    se.reject(&hy, r, true);
+                }
+            }
+        }
+    }
+
+    se.stats.work = work;
+    se.stats.lattice_tests = cheap.lattice_tests;
+    se.stats.fully_checked = entries.len();
+    // Enforce absolute search budget right before publishing a route so the last evaluation
+    // cannot exceed `budget_ms` and still return `Outcome::Selected`.
+    if se.out_of_budget() {
+        let n = entries.len();
+        return AdaptiveSelection {
+            selection: se.exhausted(n, ev),
+            route: None,
+            failing_phase: Some("budget"),
+            checked_hint: None,
+        };
+    }
+    entries.sort_by(|a, b| {
+        let ia = a.0.checked.insufficient_evidence.is_some();
+        let ib = b.0.checked.insufficient_evidence.is_some();
+        ia.cmp(&ib)
+            .then(b.0.scores.total.total_cmp(&a.0.scores.total))
+            .then(a.0.hy.index.cmp(&b.0.hy.index))
+    });
+    let ranked: Vec<Candidate> = entries.iter().map(|(c, _)| c.clone()).collect();
+    match entries.first() {
+        Some((c, route)) if c.checked.insufficient_evidence.is_none() => {
+            let route = route.clone();
+            let sel = se.finish(Outcome::Selected, None, None, ranked, ev);
+            AdaptiveSelection {
+                selection: sel,
+                route: Some(route),
+                failing_phase: None,
+                checked_hint: None,
+            }
+        }
+        Some((c, _)) => {
+            let m = format!(
+                "insufficient evidence: {}",
+                c.checked.insufficient_evidence.clone().unwrap_or_default()
+            );
+            let hint = c.checked.margins.payload_capacity_kg.filter(|cap| *cap >= 0.0).map(|cap| {
+                format!(
+                    "checked candidate {} supports payload up to {:.3} kg; pass evidence.payload_kg <= {:.3}",
+                    c.id, cap, cap
+                )
+            });
+            let sel = se.finish(
+                Outcome::InsufficientEvidence,
+                Some("INSUFFICIENT_EVIDENCE".into()),
+                Some(m),
+                ranked,
+                ev,
+            );
+            AdaptiveSelection {
+                selection: sel,
+                route: None,
+                failing_phase: Some("lift"),
+                checked_hint: hint,
+            }
+        }
+        None => {
+            let (phase, code, m) = match deepest {
+                Some((_, r)) => (
+                    r.phase,
+                    r.code.clone(),
+                    format!("no candidate passed; deepest failure in {}: {}", r.phase, r.message),
+                ),
+                None => {
+                    let top = se.rejected.iter().max_by(|a, b| {
+                        phase_rank(a.rejection.phase, false)
+                            .cmp(&phase_rank(b.rejection.phase, false))
+                            .then(b.hy.index.cmp(&a.hy.index))
+                    });
+                    match top {
+                        Some(r) => (
+                            r.rejection.phase,
+                            r.rejection.code.clone(),
+                            format!(
+                                "no candidate passed; deepest failure in {}: {}",
+                                r.rejection.phase, r.rejection.message
+                            ),
+                        ),
+                        None => (
+                            "geometry",
+                            "NO_CANDIDATE".into(),
+                            "no contact chord on the footprint".into(),
+                        ),
+                    }
+                }
+            };
+            let sel = se.finish(Outcome::Infeasible, Some(code), Some(m), ranked, ev);
+            AdaptiveSelection {
+                selection: sel,
+                route: None,
+                failing_phase: Some(phase),
+                checked_hint: None,
+            }
+        }
+    }
+}
+
+/// Whole-route actual-start preflight of one hypothesis `hy` directly from `s.input.q0`.
+/// Uses the single converged [`feasibility::validate_loaded_leg`] validator for nominal AND
+/// guarded-contact `separation` / `lift` legs and enforces the shared absolute search budget.
+#[allow(clippy::too_many_arguments)]
+fn preflight_candidate_from_start(
+    s: &Snapshot,
+    t: &snapshot::Target,
+    hy: &Hypothesis,
+    q_pre_seed: [f64; 6],
+    acq_ok: bool,
+    gripper_policy: &crate::model::GripperPolicy,
+    gripper_limit: &crate::model::JointLimit,
+    close_speed_limit: Option<f32>,
+    has_gravity_model: bool,
+    work: &mut Work,
+    out_of_budget: &dyn Fn() -> bool,
+) -> Result<(Checked, AdaptiveRoute), Rejection> {
+    let check_budget = || -> Result<(), Rejection> {
+        if out_of_budget() {
+            return Err(Rejection::new("budget", "BUDGET_EXHAUSTED", "selection budget exceeded"));
+        }
+        Ok(())
+    };
+    check_budget()?;
+    let st = &s.setup;
+    let pre = hy.pregrasp_pose();
+    let grasp_pose = hy.grasp_pose();
+    let table_bound_z = st.table_z_m + crate::grasp::TABLE_CLEARANCE_M;
+    let q6_of = |q: &[f32; 7]| std::array::from_fn::<f64, 6, _>(|i| f64::from(q[i]));
+
+    // 1. Pregrasp from actual start q0 (J7 locked at s.input.j7): direct Cartesian if branch-
+    //    consistent, else swept joint-space quintic JointPath to q_pre_seed.
+    let (pregrasp_path, pregrasp_mode) = match feasibility::phase(
+        s,
+        "transition",
+        s.input.q0,
+        s.input.j7,
+        pre,
+        st.approach_speed_mps,
+        work,
+    ) {
+        Ok(p) => {
+            let q_end = q6_of(&p.last());
+            // Verify insertion from this Cartesian end succeeds without branch flip; otherwise try swept joint.
+            if feasibility::phase(s, "insertion", q_end, s.open_rad, grasp_pose, st.descend_speed_mps, work).is_ok() {
+                (p, PregraspMode::Cartesian)
+            } else {
+                let inp = feasibility::input_at(&s.input, s.input.q0, s.input.j7);
+                work.path_checks += 1;
+                let jp = feasibility::plan_swept_joint_path(&inp, q_pre_seed, &s.envelope, table_bound_z)
+                    .map_err(|e| feasibility::motion_rejection("transition", &e))?;
+                work.path_samples += jp.q.len();
+                (jp, PregraspMode::SweptJoint)
+            }
+        }
+        Err(cart_rej) => {
+            let inp = feasibility::input_at(&s.input, s.input.q0, s.input.j7);
+            work.path_checks += 1;
+            match feasibility::plan_swept_joint_path(&inp, q_pre_seed, &s.envelope, table_bound_z) {
+                Ok(jp) => {
+                    work.path_samples += jp.q.len();
+                    (jp, PregraspMode::SweptJoint)
+                }
+                Err(_) => return Err(cart_rej),
+            }
+        }
+    };
+    if pregrasp_path.duration + 0.5 > st.phase_timeout_s {
+        return Err(Rejection::new(
+            "transition",
+            "GRASP_TIMEOUT",
+            format!(
+                "pregrasp duration {:.2} s + settle exceeds phase_timeout_s {:.2} s",
+                pregrasp_path.duration, st.phase_timeout_s
+            ),
+        ));
+    }
+    let q_pre = q6_of(&pregrasp_path.last());
+    check_budget()?;
+
+    // 2. Pre-open budget (shared GripperMotion estimator)
+    let (pre_open_cmd, pre_open_frac) = (GripperCommand::Open, None);
+    let (pre_open_s, _, _) = estimate_gripper_duration_s(
+        gripper_policy,
+        gripper_limit,
+        s.input.j7,
+        close_speed_limit,
+        pre_open_cmd,
+        pre_open_frac,
+        false,
+    )
+    .map_err(|e| feasibility::motion_rejection("pre_open", &e))?;
+    if pre_open_s > st.phase_timeout_s {
+        return Err(Rejection::new(
+            "pre_open",
+            "GRASP_TIMEOUT",
+            format!("pre-open duration {:.2} s exceeds phase_timeout_s {:.2} s", pre_open_s, st.phase_timeout_s),
+        ));
+    }
+
+    // 3. Insertion: straight TCP line along hy.a at fixed orientation, reduced speed
+    let insertion = feasibility::phase(
+        s,
+        "insertion",
+        q_pre,
+        s.open_rad,
+        grasp_pose,
+        st.descend_speed_mps,
+        work,
+    )?;
+    if insertion.duration + 0.5 > st.phase_timeout_s {
+        return Err(Rejection::new(
+            "insertion",
+            "GRASP_TIMEOUT",
+            format!(
+                "insertion duration {:.2} s + settle exceeds phase_timeout_s {:.2} s",
+                insertion.duration, st.phase_timeout_s
+            ),
+        ));
+    }
+    let q_grasp = q6_of(&insertion.last());
+    check_budget()?;
+
+    // 4. Close: shared GripperMotion capped pos-force estimator
+    let (close_s, close_timeout_s, is_pos_force_close) = estimate_gripper_duration_s(
+        gripper_policy,
+        gripper_limit,
+        s.open_rad,
+        close_speed_limit,
+        GripperCommand::Close,
+        None,
+        true,
+    )
+    .map_err(|e| feasibility::motion_rejection("closure", &e))?;
+    if !is_pos_force_close && close_s > st.phase_timeout_s {
+        return Err(Rejection::new(
+            "closure",
+            "GRASP_TIMEOUT",
+            format!("close duration {:.2} s exceeds phase_timeout_s {:.2} s", close_s, st.phase_timeout_s),
+        ));
+    }
+
+    // Contact window + conservative carried-object TCP box (full projection hull + SE(3) envelope)
+    let contact_stop_armed = st.descend_contact_stop_nm.is_some();
+    let contact_window_m = CONTACT_WINDOW_M.min(hy.insertion_m * 0.5);
+    let obj_box_nom = CarriedObjectBox::from_target_grasp(t, &grasp_pose);
+    let obj_box = obj_box_nom.expanded_by_contact_envelope(
+        if contact_stop_armed { contact_window_m } else { 0.0 },
+        CONTACT_LATERAL_TOL_M,
+        CONTACT_ROT_TOL_RAD,
+    );
+    let torque_limits_slice = s.torque_limits.as_ref().map(|(l, _)| l.as_slice());
+    let loaded_params = feasibility::LoadedLegParams {
+        arm: &s.input.arm,
+        tcp_offset: &s.input.tcp_offset,
+        ws: s.input.ws.as_ref(),
+        envelope: &s.envelope,
+        table_z_m: st.table_z_m,
+        phase_timeout_s: st.phase_timeout_s,
+        obj_box: &obj_box,
+        payload_kg: s.evidence.payload_kg,
+        torque_limits: torque_limits_slice,
+        has_gravity_model,
+        fail_on_insufficient_evidence: false,
+    };
+    let mut worst_capacity: Option<(f64, usize)> = None;
+    let mut insufficient: Option<String> = None;
+    let mut merge_verdict = |v: feasibility::LoadedLegVerdict| {
+        if let Some((c, j)) = v.payload_capacity {
+            if worst_capacity.is_none_or(|(wc, _)| c < wc) {
+                worst_capacity = Some((c, j));
+            }
+        }
+        if insufficient.is_none() {
+            insufficient = v.insufficient_evidence;
+        }
+    };
+
+    // 5. Separation + Lift (nominal pose) via single converged `validate_loaded_leg`
+    let sep = Pose::new(hy.r, kinematics::add(&hy.g, &[0.0, 0.0, feasibility::SEPARATION_M]));
+    let separation = feasibility::phase(
+        s,
+        "separation",
+        q_grasp,
+        s.closed_rad,
+        sep,
+        st.descend_speed_mps,
+        work,
+    )?;
+    merge_verdict(feasibility::validate_loaded_leg(&loaded_params, &separation, "separation")?);
+    let q_sep = q6_of(&separation.last());
+    let lift_z = (st.table_z_m + st.lift_height_m).max(sep.p[2]);
+    let lift = Pose::new(hy.r, [hy.g[0], hy.g[1], lift_z]);
+    let (lift_path, q_lift) = if lift_z > sep.p[2] + 1e-4 {
+        let lp = feasibility::phase(
+            s,
+            "lift",
+            q_sep,
+            s.closed_rad,
+            lift,
+            st.descend_speed_mps,
+            work,
+        )?;
+        merge_verdict(feasibility::validate_loaded_leg(&loaded_params, &lp, "lift")?);
+        let q = q6_of(&lp.last());
+        (Some(lp), q)
+    } else {
+        (None, q_sep)
+    };
+    check_budget()?;
+
+    // 6. Closed-jaw withdrawal (empty-grasp NOT_HOLDING recovery: jaws stay closed, straight back along -a)
+    let withdrawal = feasibility::phase(
+        s,
+        "withdrawal",
+        q_grasp,
+        s.closed_rad,
+        pre,
+        st.descend_speed_mps,
+        work,
+    )?;
+    if withdrawal.duration + 0.5 > st.phase_timeout_s {
+        return Err(Rejection::new(
+            "withdrawal",
+            "GRASP_TIMEOUT",
+            format!(
+                "withdrawal duration {:.2} s + settle exceeds phase_timeout_s {:.2} s",
+                withdrawal.duration, st.phase_timeout_s
+            ),
+        ));
+    }
+
+    // 7. When contact guard is armed, preflight contact-window stations along -a through the
+    //    EXACT same `validate_loaded_leg` (timeout + table clear + OBB SAT + 8-corner torque)
+    //    plus closed & open withdrawal timeout/path checks.
+    let mut worst_sep_s = separation.duration;
+    let mut worst_lift_s = lift_path.as_ref().map_or(0.0, |p| p.duration);
+    let mut worst_withdraw_s = withdrawal.duration;
+    if contact_stop_armed {
+        let open_withdraw = feasibility::phase(
+            s,
+            "withdrawal",
+            q_grasp,
+            s.open_rad,
+            pre,
+            st.descend_speed_mps,
+            work,
+        )?;
+        if open_withdraw.duration + 0.5 > st.phase_timeout_s {
+            return Err(Rejection::new(
+                "withdrawal",
+                "GRASP_TIMEOUT",
+                format!(
+                    "open-jaw withdrawal duration {:.2} s + settle exceeds phase_timeout_s {:.2} s",
+                    open_withdraw.duration, st.phase_timeout_s
+                ),
+            ));
+        }
+        worst_withdraw_s = worst_withdraw_s.max(open_withdraw.duration);
+        for d in [0.005_f64, 0.010, contact_window_m] {
+            check_budget()?;
+            if d > contact_window_m + 1e-9 || d <= 1e-4 {
+                continue;
+            }
+            let frac = (1.0 - d / hy.insertion_m.max(1e-6)).clamp(0.0, 1.0);
+            let idx = ((frac * (insertion.q.len().saturating_sub(1)) as f64).round() as usize)
+                .min(insertion.q.len().saturating_sub(1));
+            let q_cw = q6_of(&insertion.q[idx]);
+            let p_cw = motion::end_to_tcp(&s.input.arm.fk(&q_cw), &s.input.tcp_offset).p;
+            let sep_cw = Pose::new(hy.r, [p_cw[0], p_cw[1], (p_cw[2] + feasibility::SEPARATION_M).max(sep.p[2])]);
+            let sp = feasibility::phase(s, "separation", q_cw, s.closed_rad, sep_cw, st.descend_speed_mps, work)?;
+            merge_verdict(feasibility::validate_loaded_leg(&loaded_params, &sp, "separation")?);
+            worst_sep_s = worst_sep_s.max(sp.duration);
+            let q_sp = q6_of(&sp.last());
+            let lift_cw_z = (st.table_z_m + st.lift_height_m).max(sep_cw.p[2]);
+            if lift_cw_z > sep_cw.p[2] + 1e-4 {
+                let lift_cw = Pose::new(hy.r, [p_cw[0], p_cw[1], lift_cw_z]);
+                let lp = feasibility::phase(s, "lift", q_sp, s.closed_rad, lift_cw, st.descend_speed_mps, work)?;
+                merge_verdict(feasibility::validate_loaded_leg(&loaded_params, &lp, "lift")?);
+                worst_lift_s = worst_lift_s.max(lp.duration);
+            }
+            let wd = feasibility::phase(s, "withdrawal", q_cw, s.closed_rad, pre, st.descend_speed_mps, work)?;
+            if wd.duration + 0.5 > st.phase_timeout_s {
+                return Err(Rejection::new(
+                    "withdrawal",
+                    "GRASP_TIMEOUT",
+                    format!(
+                        "contact-window withdrawal duration {:.2} s + settle exceeds phase_timeout_s {:.2} s",
+                        wd.duration, st.phase_timeout_s
+                    ),
+                ));
+            }
+            worst_withdraw_s = worst_withdraw_s.max(wd.duration);
+        }
+    }
+    let payload_assumed = worst_capacity.is_some() && s.evidence.payload_kg.is_none();
+
+    // 8. Unified parent deadline budget check (transition + vision + open + insert + close + loaded/recovery + settle)
+    let vis = visible(s, t, &pre);
+    if !vis && pregrasp_path.duration + pre_open_s + 2.5 > st.phase_timeout_s {
+        return Err(Rejection::new(
+            "transition",
+            "GRASP_TIMEOUT",
+            format!(
+                "obscured pregrasp+pre_open duration {:.2} s exceeds revalidation freshness bound {:.2} s",
+                pregrasp_path.duration + pre_open_s + 2.5,
+                st.phase_timeout_s
+            ),
+        ));
+    }
+    let vision_step_s = adaptive_vision_budget_s(st);
+    let start_vision_s = vision_step_s;
+    let pregrasp_vision_s = if vis { vision_step_s } else { 0.0 };
+    let post_lift_settle_s = st.post_lift_settle_ms as f64 / 1000.0;
+    let arm_settle_nom = 0.5 * (3.0 + if lift_path.is_some() { 1.0 } else { 0.0 });
+    let arm_settle_rec = 0.5 * 3.0;
+    let nominal_total_s = pregrasp_path.duration
+        + start_vision_s
+        + pre_open_s
+        + pregrasp_vision_s
+        + insertion.duration
+        + close_s
+        + worst_sep_s
+        + worst_lift_s
+        + post_lift_settle_s
+        + arm_settle_nom;
+    let recovery_total_s = pregrasp_path.duration
+        + start_vision_s
+        + pre_open_s
+        + pregrasp_vision_s
+        + insertion.duration
+        + close_s
+        + worst_withdraw_s
+        + arm_settle_rec;
+    let required_s = nominal_total_s.max(recovery_total_s);
+    if required_s > st.timeout_s {
+        return Err(Rejection::new(
+            "budget",
+            "GRASP_TIMEOUT",
+            format!(
+                "scheduled route budget {:.1} s (nominal {:.1} s, recovery {:.1} s, close {:.1} s) exceeds timeout_s {:.1} s",
+                required_s, nominal_total_s, recovery_total_s, close_s, st.timeout_s
+            ),
+        )
+        .with(required_s, st.timeout_s));
+    }
+
+    // Margins & travel summary
+    let paths: Vec<&motion::JointPath> = [
+        Some(&pregrasp_path),
+        Some(&insertion),
+        Some(&separation),
+        lift_path.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let mut jm = 1.0f64;
+    let mut sig = f64::INFINITY;
+    for p in paths.iter().copied().chain(std::iter::once(&withdrawal)) {
+        for (k, q) in p.q.iter().enumerate() {
+            let q = q6_of(q);
+            jm = jm.min(feasibility::joint_margin(&s.input, &q));
+            if k % 3 == 0 || k + 1 == p.q.len() {
+                sig = sig.min(feasibility::sigma_min(&s.input, &q));
+            }
+        }
+    }
+    let duration_s = paths.iter().map(|p| p.duration).sum::<f64>();
+    let joint_travel_rad: f64 = paths
+        .iter()
+        .map(|p| {
+            p.q.windows(2)
+                .map(|w| (0..p.arm_dof).map(|i| f64::from((w[1][i] - w[0][i]).abs())).sum::<f64>())
+                .sum::<f64>()
+        })
+        .sum();
+    let mut phases = Vec::with_capacity(8);
+    if acq_ok {
+        phases.push("acquisition");
+    }
+    phases.extend([
+        "transition",
+        "pre_open",
+        "insertion",
+        "closure",
+        "separation",
+        "lift",
+        "withdrawal",
+    ]);
+    let margins = Margins {
+        joint_limit: jm,
+        sigma_min: sig,
+        table_clearance_m: hy.table_clearance_m,
+        payload_capacity_kg: worst_capacity.map(|c| c.0),
+    };
+    let checked = Checked {
+        q_pre,
+        q_grasp,
+        q_lift,
+        separation: sep,
+        lift,
+        duration_s,
+        joint_travel_rad,
+        margins,
+        phases: phases.clone(),
+        payload_assumed,
+        insufficient_evidence: insufficient,
+    };
+    let lim = st.descend_contact_stop_nm.map_or(0.0, |l| l as f32);
+    let mut max_residual_nm = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
+    max_residual_nm[1] = lim;
+    max_residual_nm[2] = lim;
+    let contact_guard = crate::rt_core::ops::ContactGuard {
+        max_residual_nm,
+        stop_code: None,
+    };
+    let plan = ExecutionPlan {
+        pregrasp: pre,
+        insertion_dir: hy.a,
+        insertion_m: hy.insertion_m,
+        grasp: grasp_pose,
+        separation: sep,
+        lift,
+        jaw_opening_m: s.tool.open_width_m,
+        chord_width_m: hy.width_m,
+        q_pregrasp: q_pre,
+        q_grasp,
+        q_lift,
+    };
+    let has_oriented_evidence = s.evidence.contour_norm.is_some()
+        || s.evidence.obb_corners_norm.is_some()
+        || (s.evidence.angle_deg.is_some()
+            && s.evidence.angle_conf.is_some_and(|c| c >= st.align_min_angle_conf));
+    let route = AdaptiveRoute {
+        candidate_id: String::new(),
+        approach_class: hy.class.name(),
+        tilt_deg: hy.tilt_deg,
+        plan,
+        pregrasp_mode,
+        obj_box_nominal_tcp: obj_box_nom,
+        obj_box_tcp: obj_box,
+        payload_kg: s.evidence.payload_kg,
+        torque_limits: s.torque_limits.as_ref().map(|(l, _)| l.clone()),
+        has_gravity_model,
+        target_centroid: t.centroid,
+        target_table_z: t.table_z,
+        target_height: t.height,
+        target_poly: t.poly.clone(),
+        target_axis: t.axis,
+        target_axis_ambiguous: t.axis_ambiguous,
+        target_hard_error_m: t.hard_error_m,
+        opening_reserve_m: hy.opening_reserve_m,
+        contact_window_m,
+        visible_at_pregrasp: vis,
+        pre_open_command: pre_open_cmd,
+        pre_open_fraction: pre_open_frac,
+        budget: RouteBudget {
+            pregrasp_s: pregrasp_path.duration,
+            start_vision_s,
+            pre_open_s,
+            pregrasp_vision_s,
+            insert_s: insertion.duration,
+            close_s,
+            close_timeout_s,
+            is_pos_force_close,
+            separation_s: worst_sep_s,
+            lift_s: worst_lift_s,
+            withdrawal_s: worst_withdraw_s,
+            post_lift_settle_s,
+            nominal_total_s,
+            recovery_total_s,
+        },
+        contact_guard,
+        contact_stop_armed,
+        checked_phases: phases,
+        margins,
+        robustness: Robustness::default(),
+        scores: Scores::default(),
+        approach_mps: st.approach_speed_mps,
+        insert_mps: st.descend_speed_mps,
+        loaded_mps: st.descend_speed_mps,
+        has_oriented_evidence,
+    };
+    Ok((checked, route))
 }
 
 /// Run the selection on a snapshot (outside the supervisor lock).

@@ -3872,10 +3872,12 @@ async fn m2_raw_broker_rejects_unregistered_client_ids_and_binds_client_to_lease
             poses_revision: None,
             sequences_revision: None,
             grasp_setup_revision: None,
+            gripper_calib_revision: None,
             power_budget_revision: None,
             macro_deadline: None,
             timeout_code: armd::safety::BoundedText::new("MACRO_TIMEOUT"),
             orientation_levelled: false,
+            j7_intent_only: false,
             task: armd::model::HolderLabel::new(""),
             tag: armd::model::HolderLabel::new(""),
         };

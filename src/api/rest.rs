@@ -569,7 +569,7 @@ pub async fn action_requires_lease(
             return Err(ApiError::operator_required(uri.path()));
         }
         #[cfg(feature = "policy-runtime")]
-        if uri.path() == "/api/v1/action/policy/start" && !supervisor.inner().read().await.policy_live_allowed() {
+        if uri.path() == "/api/v1/action/policy/start" && !supervisor.policy_live_allowed_off_lock().await {
             return Err(ApiError::operator_required("policy/start (real arm)"));
         }
         if uri.path() == "/api/v1/action/gripper_zero_check" {

@@ -8,3 +8,5 @@ pub mod actions;
 pub mod config;
 pub mod lease;
 pub mod motion;
+#[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+pub mod policy;

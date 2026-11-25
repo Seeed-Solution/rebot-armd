@@ -391,12 +391,16 @@ fn copy_into<T: Copy>(dst: &mut Vec<T>, src: &[T]) {
     dst.extend_from_slice(src);
 }
 
-/// Preallocated per-slot string spare reused across `None <-> Some(String)` action message
-/// transitions so RT publication never allocates or drops heap strings.
+/// Preallocated per-slot spares reused across `None <-> Some(...)` action message and policy
+/// observation transitions so RT publication never allocates or drops heap storage.
 #[derive(Debug, Default)]
 pub struct ObservationSpares {
     pub action_msg: String,
     pub prev_action_msg: String,
+    #[cfg(feature = "policy-runtime")]
+    pub policy_obs: Option<crate::model::PolicyObservation>,
+    #[cfg(feature = "policy-runtime")]
+    pub policy_shadow_vec: Vec<f32>,
 }
 
 impl ObservationSpares {
@@ -404,6 +408,10 @@ impl ObservationSpares {
         Self {
             action_msg: String::with_capacity(256),
             prev_action_msg: String::with_capacity(256),
+            #[cfg(feature = "policy-runtime")]
+            policy_obs: Some(crate::model::PolicyObservation::preallocated_rt()),
+            #[cfg(feature = "policy-runtime")]
+            policy_shadow_vec: Vec::with_capacity(super::mailbox::MAX_DOF),
         }
     }
 }
@@ -425,7 +433,41 @@ pub struct Snapshot {
     pub obs: ArmObservation,
     pub owner: OwnerStateSnapshot,
     pub rt: RtSample,
+    /// Off-RT policy diagnostic overlay revision reflected in `obs` (`0` before first update).
+    pub policy_diag_seq: u64,
 }
+
+/// Off-RT policy diagnostic overlay update emitted by the executor policy runner (never touched
+/// on `armd-control`). Carries Shadow step/target telemetry and Live/Shadow timing `PolicyStats`.
+#[cfg(feature = "policy-runtime")]
+#[derive(Debug, Clone)]
+pub struct PolicyDiagUpdate {
+    pub action_id: u64,
+    pub is_shadow: bool,
+    pub steps: u64,
+    pub stats: crate::motion::PolicyStats,
+    pub last_input_age_ms: Option<u64>,
+    pub last_vision_age_ms: Option<u64>,
+    pub vision_frame_id: Option<u64>,
+    pub last_shadow_target: Option<Vec<f32>>,
+}
+
+#[cfg(feature = "policy-runtime")]
+#[derive(Debug, Clone)]
+struct PolicyDiagEntry {
+    action_id: u64,
+    is_shadow: bool,
+    steps: u64,
+    stats: crate::motion::PolicyStats,
+    last_input_age_ms: Option<u64>,
+    last_vision_age_ms: Option<u64>,
+    vision_frame_id: Option<u64>,
+    last_shadow_target: Option<Vec<f32>>,
+    sealed: bool,
+}
+
+#[cfg(feature = "policy-runtime")]
+const POLICY_DIAG_CAPACITY: usize = 64;
 
 /// Capacity of the retire ring.
 pub const RETIRE_CAPACITY: usize = 8;
@@ -609,13 +651,22 @@ impl StatePublisher {
     }
 
     /// Returns the string spares to the back slot before publishing (0 alloc, 0 drop).
-    pub fn restore_back_spares(&mut self, spares: ObservationSpares) {
+    pub fn restore_back_spares(&mut self, mut spares: ObservationSpares) {
         let slot = self.producer.back_mut();
         if spares.action_msg.capacity() > slot.spares.action_msg.capacity() {
-            slot.spares.action_msg = spares.action_msg;
+            slot.spares.action_msg = std::mem::take(&mut spares.action_msg);
         }
         if spares.prev_action_msg.capacity() > slot.spares.prev_action_msg.capacity() {
-            slot.spares.prev_action_msg = spares.prev_action_msg;
+            slot.spares.prev_action_msg = std::mem::take(&mut spares.prev_action_msg);
+        }
+        #[cfg(feature = "policy-runtime")]
+        {
+            if spares.policy_obs.is_some() && slot.spares.policy_obs.is_none() {
+                slot.spares.policy_obs = spares.policy_obs.take();
+            }
+            if spares.policy_shadow_vec.capacity() > slot.spares.policy_shadow_vec.capacity() {
+                slot.spares.policy_shadow_vec = std::mem::take(&mut spares.policy_shadow_vec);
+            }
         }
     }
 
@@ -635,6 +686,7 @@ impl StatePublisher {
 struct HubState {
     consumer: Consumer<Slot>,
     latest: Option<Arc<Snapshot>>,
+    last_policy_diag_seq: u64,
 }
 
 /// Result of [`StateHub::try_latest`].
@@ -671,6 +723,17 @@ pub struct StateHub {
     /// ID (never touched on `armd-control`; bounded to 16 entries). Attached in [`Self::refresh`]
     /// to `obs.action` and `obs.previous_action` before any snapshot or terminal is delivered.
     action_measurements: Mutex<std::collections::HashMap<u64, serde_json::Value>>,
+    /// Pre-publication policy diagnostic seal watermark shared with `SupervisorInner` (never
+    /// locked on `armd-control`).
+    #[cfg(feature = "policy-runtime")]
+    policy_diag_sealed: OnceLock<Arc<AtomicU64>>,
+    /// Bounded off-RT sidecar store of runner-emitted Shadow diagnostics and `PolicyStats` keyed
+    /// by `action_id` (cap 64; never touched on `armd-control`). Lock order: `state -> policy_diag`.
+    #[cfg(feature = "policy-runtime")]
+    policy_diag: Mutex<std::collections::VecDeque<PolicyDiagEntry>>,
+    /// Monotonic revision bumped on every accepted [`Self::update_policy_diag`] call.
+    #[cfg(feature = "policy-runtime")]
+    policy_diag_seq: AtomicU64,
     /// Number of off-RT readers currently waiting to acquire `self.state` inside `latest()`.
     latest_waiters: AtomicUsize,
 }
@@ -686,7 +749,7 @@ pub fn state_channel(dof: usize) -> (StatePublisher, Arc<StateHub>) {
     };
     let (producer, consumer) = triple_buffer(slot(), slot(), slot());
     let hub = Arc::new(StateHub {
-        state: Mutex::new(HubState { consumer, latest: None }),
+        state: Mutex::new(HubState { consumer, latest: None, last_policy_diag_seq: 0 }),
         published: AtomicU64::new(0),
         dispatcher: OnceLock::new(),
         closed: AtomicBool::new(false),
@@ -698,6 +761,12 @@ pub fn state_channel(dof: usize) -> (StatePublisher, Arc<StateHub>) {
         schema_cache: Mutex::new(None),
         prep_env: Mutex::new(None),
         action_measurements: Mutex::new(std::collections::HashMap::new()),
+        #[cfg(feature = "policy-runtime")]
+        policy_diag_sealed: OnceLock::new(),
+        #[cfg(feature = "policy-runtime")]
+        policy_diag: Mutex::new(std::collections::VecDeque::with_capacity(POLICY_DIAG_CAPACITY)),
+        #[cfg(feature = "policy-runtime")]
+        policy_diag_seq: AtomicU64::new(0),
         latest_waiters: AtomicUsize::new(0),
     });
     (StatePublisher { producer, seq: 0, retire_head: 0, hub: hub.clone() }, hub)
@@ -736,12 +805,17 @@ impl StateHub {
     fn refresh(&self, st: &mut HubState) -> Option<Arc<Snapshot>> {
         self.retire.free_all();
         super::ops::stop_diag().drain_and_log_once();
+        super::ops::gripper_force_diag().drain_and_log_once();
         // Acquire-check `has_fresh()` BEFORE inspecting `prewarm_template`: in executor mode
         // `try_prewarm_observations` sets `prewarm_template` (Release) before any release
         // calls `Producer::publish` (AcqRel), so observing `FRESH == 1` guarantees
         // `prewarm_template` is visible and prevents rotating an empty `front` slot into
         // `middle` for the RT producer.
-        if st.consumer.has_fresh() {
+        let has_fresh = st.consumer.has_fresh();
+        let diag_seq = self.policy_diag_seq();
+        let diag_changed = diag_seq != st.last_policy_diag_seq;
+        let mut refreshed = false;
+        if has_fresh {
             if st.consumer.front().obs.is_none() {
                 if let Some(tmpl) = self.prewarm_template.get() {
                     let mut obs = (**tmpl).clone();
@@ -752,16 +826,25 @@ impl StateHub {
                     st.consumer.front_mut().obs = Some(obs);
                 }
             }
-            if st.consumer.refresh() {
-                let slot = st.consumer.front_mut();
-                // copied, not moved: the slot keeps its memory for the tick to fill again (the
-                // tick neither allocates nor frees observations)
-                if let (Some(meta), Some(obs)) = (slot.meta, slot.obs.as_ref()) {
-                    let mut obs = obs.clone();
-                    self.attach_action_measurement(&mut obs);
-                    let snap = Snapshot { meta, obs, owner: slot.owner, rt: slot.rt.clone() };
-                    st.latest = Some(Arc::new(snap));
-                }
+            refreshed = st.consumer.refresh();
+        }
+        if refreshed || (diag_changed && st.consumer.front().obs.is_some()) {
+            let slot = st.consumer.front_mut();
+            // copied, not moved: the slot keeps its memory for the tick to fill again (the
+            // tick neither allocates nor frees observations)
+            if let (Some(meta), Some(obs)) = (slot.meta, slot.obs.as_ref()) {
+                let mut obs = obs.clone();
+                self.attach_action_measurement(&mut obs);
+                self.attach_policy_diag(&mut obs);
+                st.last_policy_diag_seq = diag_seq;
+                let snap = Snapshot {
+                    meta,
+                    obs,
+                    owner: slot.owner,
+                    rt: slot.rt.clone(),
+                    policy_diag_seq: diag_seq,
+                };
+                st.latest = Some(Arc::new(snap));
             }
         }
         st.latest.clone()
@@ -782,6 +865,141 @@ impl StateHub {
 
     /// `seq` of the newest publication, without the hub mutex (0: none yet).
     pub fn published_seq(&self) -> u64 { self.published.load(Ordering::Acquire) }
+
+    /// Monotonic sequence of off-RT policy diagnostic overlay updates (`0` before first update).
+    pub fn policy_diag_seq(&self) -> u64 {
+        #[cfg(feature = "policy-runtime")]
+        {
+            self.policy_diag_seq.load(Ordering::Acquire)
+        }
+        #[cfg(not(feature = "policy-runtime"))]
+        {
+            0
+        }
+    }
+
+    /// Binds the RT pre-publication policy diagnostic seal watermark (`AtomicU64`).
+    #[cfg(feature = "policy-runtime")]
+    pub fn attach_policy_diag_seal(&self, seal: Arc<AtomicU64>) {
+        let _ = self.policy_diag_sealed.set(seal);
+    }
+
+    /// Updates the off-RT policy diagnostic overlay for `update.action_id` and wakes `armd-dispatch`.
+    /// Returns `false` (no-op) once RT seals `action_id` or a terminal snapshot freezes the entry.
+    #[cfg(feature = "policy-runtime")]
+    pub fn update_policy_diag(&self, update: PolicyDiagUpdate) -> bool {
+        if update.action_id == 0 {
+            return false;
+        }
+        {
+            let mut entries = self.policy_diag.lock().unwrap_or_else(|e| e.into_inner());
+            let sealed = self
+                .policy_diag_sealed
+                .get()
+                .map_or(0, |a| a.load(Ordering::Acquire));
+            if update.action_id <= sealed {
+                return false;
+            }
+            if let Some(existing) = entries.iter_mut().find(|e| e.action_id == update.action_id) {
+                if existing.sealed {
+                    return false;
+                }
+                existing.is_shadow = update.is_shadow;
+                existing.steps = existing.steps.max(update.steps);
+                existing.stats = update.stats;
+                existing.last_input_age_ms = update.last_input_age_ms;
+                existing.last_vision_age_ms = update.last_vision_age_ms;
+                existing.vision_frame_id = update.vision_frame_id;
+                existing.last_shadow_target = update.last_shadow_target;
+            } else {
+                if entries.len() >= POLICY_DIAG_CAPACITY {
+                    entries.pop_front();
+                }
+                entries.push_back(PolicyDiagEntry {
+                    action_id: update.action_id,
+                    is_shadow: update.is_shadow,
+                    steps: update.steps,
+                    stats: update.stats,
+                    last_input_age_ms: update.last_input_age_ms,
+                    last_vision_age_ms: update.last_vision_age_ms,
+                    vision_frame_id: update.vision_frame_id,
+                    last_shadow_target: update.last_shadow_target,
+                    sealed: false,
+                });
+            }
+            self.policy_diag_seq.fetch_add(1, Ordering::Release);
+        }
+        self.wake();
+        true
+    }
+
+    /// Freezes sealed/inactive policy diagnostic entries and enriches `obs` in place (called in
+    /// [`Self::refresh`] and in `MaintClientInner::pop_all_replies` before delivering `Observation`).
+    #[cfg(feature = "policy-runtime")]
+    pub fn attach_policy_diag(&self, obs: &mut ArmObservation) {
+        let mut entries = self.policy_diag.lock().unwrap_or_else(|e| e.into_inner());
+        let sealed = self
+            .policy_diag_sealed
+            .get()
+            .map_or(0, |a| a.load(Ordering::Acquire));
+        if sealed > 0 {
+            for e in entries.iter_mut() {
+                if e.action_id <= sealed {
+                    e.sealed = true;
+                }
+            }
+        }
+        if let Some(ref p) = obs.policy {
+            if !p.active {
+                if let Some(e) = entries.iter_mut().find(|e| e.action_id == p.action_id) {
+                    e.sealed = true;
+                }
+            }
+        }
+        if entries.is_empty() {
+            return;
+        }
+        if let Some(a) = obs
+            .action
+            .as_mut()
+            .filter(|a| a.kind.as_str() == "policy" && a.policy_stats.is_none())
+        {
+            if let Some(e) = entries.iter().find(|e| e.action_id == a.id) {
+                a.policy_stats = Some(e.stats);
+            }
+        }
+        if let Some(a) = obs
+            .previous_action
+            .as_mut()
+            .filter(|a| a.kind.as_str() == "policy" && a.policy_stats.is_none())
+        {
+            if let Some(e) = entries.iter().find(|e| e.action_id == a.id) {
+                a.policy_stats = Some(e.stats);
+            }
+        }
+        if let Some(p) = obs.policy.as_mut() {
+            if let Some(e) = entries.iter().find(|e| e.action_id == p.action_id) {
+                if e.is_shadow || p.mode == "shadow" {
+                    p.steps = p.steps.max(e.steps);
+                    if e.last_input_age_ms.is_some() {
+                        p.last_input_age_ms = e.last_input_age_ms;
+                    }
+                    if e.last_vision_age_ms.is_some() {
+                        p.last_vision_age_ms = e.last_vision_age_ms;
+                    }
+                    if e.vision_frame_id.is_some() {
+                        p.vision_frame_id = e.vision_frame_id;
+                    }
+                    if e.last_shadow_target.is_some() {
+                        p.last_shadow_target = e.last_shadow_target.clone();
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(not(feature = "policy-runtime"))]
+    pub fn attach_policy_diag(&self, _obs: &mut ArmObservation) {}
 
     /// Registers the dispatcher thread woken by every publication. Only the first call counts.
     pub fn set_dispatcher(&self, thread: std::thread::Thread) -> bool { self.dispatcher.set(thread).is_ok() }

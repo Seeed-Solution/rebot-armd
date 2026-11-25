@@ -11,7 +11,7 @@
 
 mod common;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -32,10 +32,10 @@ use armd::rt_core::executor::{
 use armd::rt_core::mailbox::MAX_DOF;
 use armd::rt_core::ops::{EpisodeRef, PlanSlot, Primitive};
 use armd::rt_core::requests::actions::{
-    prepare_child_cartesian_slot, prepare_child_gripper_slot, prepare_child_joint_slot,
-    prepare_gripper, prepare_move_to, ActionSnapshot, ActionSubmit, BeginMacroSpec,
-    FinishMacroSpec, HeldUpdate, MacroKind, PreparedActionKind, StagedAction,
-    DEFAULT_ACTION_DEADLINE, DEFAULT_FINISH_DEADLINE,
+    prepare_child_cartesian_slot, prepare_child_cartesian_slot_with_options,
+    prepare_child_gripper_slot, prepare_child_joint_slot, prepare_gripper, prepare_move_to,
+    ActionSnapshot, ActionSubmit, BeginMacroSpec, FinishMacroSpec, HeldUpdate, MacroKind,
+    PreparedActionKind, StagedAction, DEFAULT_ACTION_DEADLINE, DEFAULT_FINISH_DEADLINE,
 };
 use armd::supervisor::GripperBaselineCmd;
 use armd::{ArmConfig, ArmSupervisor, SupervisorInner};
@@ -138,6 +138,8 @@ struct ZeroAllocDriver {
     reject_writes: Arc<AtomicBool>,
     has_torque_feedback: bool,
     pos_force_close_speed: Option<f32>,
+    pf_target_count: Arc<AtomicUsize>,
+    pf_hold_count: Arc<AtomicUsize>,
 }
 
 impl ZeroAllocDriver {
@@ -154,6 +156,8 @@ impl ZeroAllocDriver {
             reject_writes: Arc::new(AtomicBool::new(false)),
             has_torque_feedback: true,
             pos_force_close_speed: None,
+            pf_target_count: Arc::new(AtomicUsize::new(0)),
+            pf_hold_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -237,7 +241,35 @@ impl ArmDriver for ZeroAllocDriver {
             joint: 6,
             active: true,
             close_speed_rad_s: s,
-            ceiling_torque_estimate_nm: None,
+            ceiling_torque_estimate_nm: Some(1.5),
+        })
+    }
+    fn pos_force_feedback_fresh(&self) -> bool { true }
+    fn pos_force_last_fresh_position(&self) -> Option<f32> { self.q.get(6).copied() }
+    fn emit_pos_force_j7(
+        &mut self,
+        intent: armd::driver::PosForceIntent,
+        current: armd::driver::PosForceIntentStamp,
+    ) -> Result<armd::driver::PosForceEmitOutcome, ArmDriverError> {
+        if self.pos_force_close_speed.is_none() {
+            return Ok(armd::driver::PosForceEmitOutcome::NotApplicable);
+        }
+        let stale = intent.stamp.is_stale_against(current);
+        match intent.kind {
+            armd::driver::PosForceIntentKind::Target { position, .. } if !stale => {
+                self.pf_target_count.fetch_add(1, Ordering::Relaxed);
+                if self.q.len() > 6 {
+                    self.q[6] = position;
+                }
+            }
+            _ => {
+                self.pf_hold_count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Ok(armd::driver::PosForceEmitOutcome::Sent {
+            joint: 6,
+            freeze: false,
+            pf_status: armd::driver::PosForceTxStatus::Fresh,
         })
     }
     fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
@@ -460,7 +492,7 @@ async fn b2_pr_p_prepared_actions_and_macro_lifecycle_are_zero_alloc_on_rt() {
     {
         let write = |dst: &mut PlanSlot| *dst = c1_slot.clone();
         handle.broker().lock().unwrap().submit(ClientId(1), 6, snap.owner.authority, clock.now() + DEFAULT_ACTION_DEADLINE,
-            Submit::Action(ActionSubmit::InstallChild { write: &write, prepared_boot: boot, check_workspace_revision: true, calibration_revision: None, gripper_calib_revision: None, power_budget_revision: None })).unwrap();
+            Submit::Action(ActionSubmit::InstallChild { write: &write, prepared_boot: boot, check_workspace_revision: true, calibration_revision: None, grasp_setup_revision: None, gripper_calib_revision: None, power_budget_revision: None })).unwrap();
     }
     clock.run_steps(period_ns, 60);
     let _ = drain(&handle);
@@ -477,7 +509,7 @@ async fn b2_pr_p_prepared_actions_and_macro_lifecycle_are_zero_alloc_on_rt() {
     {
         let write = |dst: &mut PlanSlot| *dst = c2_slot.clone();
         handle.broker().lock().unwrap().submit(ClientId(1), 7, snap.owner.authority, clock.now() + DEFAULT_ACTION_DEADLINE,
-            Submit::Action(ActionSubmit::InstallChild { write: &write, prepared_boot: boot, check_workspace_revision: true, calibration_revision: None, gripper_calib_revision: None, power_budget_revision: None })).unwrap();
+            Submit::Action(ActionSubmit::InstallChild { write: &write, prepared_boot: boot, check_workspace_revision: true, calibration_revision: None, grasp_setup_revision: None, gripper_calib_revision: None, power_budget_revision: None })).unwrap();
     }
     clock.run_steps(period_ns, 60);
     let _ = drain(&handle);
@@ -491,7 +523,7 @@ async fn b2_pr_p_prepared_actions_and_macro_lifecycle_are_zero_alloc_on_rt() {
     {
         let write = |dst: &mut PlanSlot| *dst = c3_slot.clone();
         handle.broker().lock().unwrap().submit(ClientId(1), 8, snap.owner.authority, clock.now() + DEFAULT_ACTION_DEADLINE,
-            Submit::Action(ActionSubmit::InstallChild { write: &write, prepared_boot: boot, check_workspace_revision: false, calibration_revision: None, gripper_calib_revision: None, power_budget_revision: None })).unwrap();
+            Submit::Action(ActionSubmit::InstallChild { write: &write, prepared_boot: boot, check_workspace_revision: false, calibration_revision: None, grasp_setup_revision: None, gripper_calib_revision: None, power_budget_revision: None })).unwrap();
     }
     clock.run_steps(period_ns, 250);
     let _ = drain(&handle);
@@ -535,7 +567,7 @@ async fn b2_pr_p_prepared_actions_and_macro_lifecycle_are_zero_alloc_on_rt() {
     {
         let write = |dst: &mut PlanSlot| *dst = cg_slot.clone();
         handle.broker().lock().unwrap().submit(ClientId(1), 11, snap.owner.authority, clock.now() + DEFAULT_ACTION_DEADLINE,
-            Submit::Action(ActionSubmit::InstallChild { write: &write, prepared_boot: boot, check_workspace_revision: false, calibration_revision: None, gripper_calib_revision: None, power_budget_revision: None })).unwrap();
+            Submit::Action(ActionSubmit::InstallChild { write: &write, prepared_boot: boot, check_workspace_revision: false, calibration_revision: None, grasp_setup_revision: None, gripper_calib_revision: None, power_budget_revision: None })).unwrap();
     }
     clock.run_steps(period_ns, 3);
     // Reject bus writes for 3 ticks while forced FinishMacro + duplicate FinishMacro arrive!
@@ -1209,6 +1241,7 @@ async fn b2_r2_m4_prepared_replay_approach_planned_off_thread_is_zero_alloc_on_r
                 prepared_boot: boot,
                 check_workspace_revision: true,
                 calibration_revision: None,
+                grasp_setup_revision: None,
                 gripper_calib_revision: None,
                 power_budget_revision: None,
             }),
@@ -1472,6 +1505,7 @@ fn b2_r2_m5_1000_refused_rt_gripper_installs_preserve_learning_pool_and_are_zero
                         prepared_boot: boot,
                         check_workspace_revision: false,
                         calibration_revision: None,
+                        grasp_setup_revision: None,
                         gripper_calib_revision: None,
                         power_budget_revision: None,
                     }),
@@ -1499,6 +1533,7 @@ fn b2_r2_m5_1000_refused_rt_gripper_installs_preserve_learning_pool_and_are_zero
                         prepared_boot: boot,
                         check_workspace_revision: false,
                         calibration_revision: None,
+                        grasp_setup_revision: None,
                         gripper_calib_revision: None,
                         power_budget_revision: None,
                     }),
@@ -1538,6 +1573,7 @@ fn b2_r2_m5_1000_refused_rt_gripper_installs_preserve_learning_pool_and_are_zero
                     prepared_boot: boot,
                     check_workspace_revision: false,
                     calibration_revision: None,
+                    grasp_setup_revision: None,
                     gripper_calib_revision: None,
                     power_budget_revision: None,
                 }),
@@ -1566,4 +1602,286 @@ fn b2_r2_m5_1000_refused_rt_gripper_installs_preserve_learning_pool_and_are_zero
     })
     .join()
     .unwrap();
+}
+
+/// Phase B adaptive grasp RT zero-alloc proof:
+/// - `BeginMacro` carrying all 5 captured revisions (`workspace`, `calibration`, `grasp_setup`,
+///   `gripper_calib`, `power_budget`)
+/// - `InstallChild` for a verbatim swept-joint `JointPath` with `lock_j7_hold: true` + 5 revisions
+///   (verifies J7 stays identically locked across every tick AND 0 allocs)
+/// - `InstallChild` for a fenced J7 gripper move + 5 revisions
+/// - `FinishMacro(Done, HeldUpdate::Set)` with stale revision refusal (`PLAN_STALE`, `held` NOT set,
+///   0 allocs) followed by matching revision commit (`Done`, `held` set, 0 allocs)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn phase_b_adaptive_macro_fenced_and_j7_locked_is_zero_alloc_on_rt() {
+    let clock = ScriptedClock::new();
+    let mut drv = ZeroAllocDriver::new(&INSPECT, clock.clone());
+    drv.pos_force_close_speed = Some(2.0);
+    let pf_targets = Arc::clone(&drv.pf_target_count);
+    let pf_holds = Arc::clone(&drv.pf_hold_count);
+    let sup = Arc::new(
+        ArmSupervisor::new(ArmConfig {
+            collision: None,
+            lease_timeout_ms: 600_000,
+            ..ArmConfig::rebot_dm()
+        })
+        .with_driver(Box::new(drv)),
+    );
+    sup.set_lease_enabled(false).await;
+    {
+        let mut inner = sup.inner().write().await;
+        inner.commanded_positions = INSPECT.to_vec();
+        inner.measured_positions = INSPECT.to_vec();
+        inner.target_positions = INSPECT.to_vec();
+        let s = inner.current_admission_stamp();
+        let a = inner.check_admission(s).unwrap();
+        SupervisorInner::enable_torque(a).unwrap();
+        inner.register_live_connection(1).unwrap();
+        inner.tick(0.02);
+    }
+
+    let period_ns = 20_000_000u64;
+    let mut cfg = ExecutorConfig::for_tests(Duration::from_nanos(period_ns));
+    cfg.alloc_timing = true;
+    let handle = sup
+        .start_executor_with_hooks(
+            cfg,
+            PersistTestHooks {
+                clock: Some(clock.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let boot = handle.boot();
+    clock.run_steps(period_ns, 3);
+    assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO);
+
+    let snap = latest_snap(&sup, clock.now() + DEFAULT_ACTION_DEADLINE);
+    let rev_ws = snap.env.workspace_revision;
+    let rev_cal = snap.env.calibration_revision;
+    let rev_gs = snap.env.grasp_setup_revision;
+    let rev_gc = snap.env.gripper_calib_revision;
+    let rev_pb = snap.env.power_budget_revision;
+    let j7_locked_val = snap.commanded_positions[6];
+    pf_targets.store(0, Ordering::Relaxed);
+    pf_holds.store(0, Ordering::Relaxed);
+
+    // 1) Adaptive BeginMacro with `j7_intent_only = true`, start fence, and all 5 revisions
+    let mut begin = BeginMacroSpec::new(MacroKind::Grasp, boot)
+        .with_start(&snap.commanded_positions)
+        .unwrap();
+    begin.j7_intent_only = true;
+    begin.check_workspace_revision = true;
+    begin.calibration_revision = Some(rev_cal);
+    begin.grasp_setup_revision = Some(rev_gs);
+    begin.gripper_calib_revision = Some(rev_gc);
+    begin.power_budget_revision = Some(rev_pb);
+    let mut auth = snap.owner.authority;
+    auth.config_revision = rev_ws;
+    let r_begin = handle
+        .broker()
+        .lock()
+        .unwrap()
+        .submit(
+            ClientId(1),
+            1,
+            auth,
+            clock.now() + DEFAULT_ACTION_DEADLINE,
+            Submit::Action(ActionSubmit::BeginMacro(begin)),
+        )
+        .unwrap();
+    clock.run_steps(period_ns, 4);
+    let reps = drain(&handle);
+    let parent = reps
+        .iter()
+        .find_map(|r| match r {
+            Reply::Ack { request, action: Some(a), .. } if *request == r_begin => Some(*a),
+            _ => None,
+        })
+        .expect("fenced BeginMacro ACK");
+    assert_eq!(pf_targets.load(Ordering::Relaxed), 0, "BeginMacro(j7_intent_only) must emit 0 PosForce Target");
+    assert!(pf_holds.load(Ordering::Relaxed) >= 4, "BeginMacro(j7_intent_only) must emit PosForce Hold");
+    assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO, "fenced BeginMacro must be 0-alloc");
+
+    // 2) Swept-joint verbatim JointPath child with `lock_j7_hold: true` + all 5 revisions
+    let snap = latest_snap(&sup, clock.now() + DEFAULT_ACTION_DEADLINE);
+    let mut q_goal = [0.0f64; 6];
+    for i in 0..6 {
+        q_goal[i] = f64::from(snap.commanded_positions[i]);
+    }
+    q_goal[0] += 0.06;
+    let inp = snap.plan_input_in(GoalFrame::Tcp).unwrap();
+    let swept = armd::grasp_select::feasibility::plan_swept_joint_path(
+        &inp,
+        q_goal,
+        &[[0.0, 0.0, 0.0]],
+        -1.0,
+    )
+    .expect("swept joint path");
+    let c1_spec = ChildSpec {
+        ticket: ChildTicket { parent, child_seq: 1 },
+        timeout_s: 10.0,
+        timeout_code: "GRASP_TIMEOUT",
+        contact: None,
+    };
+    let c1_slot = prepare_child_cartesian_slot_with_options(
+        &snap.commanded_positions,
+        &swept,
+        None,
+        None,
+        true,
+        c1_spec,
+    )
+    .expect("stage lock_j7_hold slot");
+    let mut c1_auth = snap.owner.authority;
+    c1_auth.config_revision = rev_ws;
+    c1_auth.parent_generation = parent.0;
+    let w1 = |dst: &mut PlanSlot| *dst = c1_slot.clone();
+    let r_c1 = handle
+        .broker()
+        .lock()
+        .unwrap()
+        .submit(
+            ClientId(1),
+            2,
+            c1_auth,
+            clock.now() + DEFAULT_ACTION_DEADLINE,
+            Submit::Action(ActionSubmit::InstallChild {
+                write: &w1,
+                prepared_boot: boot,
+                check_workspace_revision: true,
+                calibration_revision: Some(rev_cal),
+                grasp_setup_revision: Some(rev_gs),
+                gripper_calib_revision: Some(rev_gc),
+                power_budget_revision: Some(rev_pb),
+            }),
+        )
+        .unwrap();
+    for _ in 0..80 {
+        clock.run_steps(period_ns, 1);
+        let cur = sup.hub().latest().unwrap().rt.commanded_positions[6];
+        assert!(
+            (cur - j7_locked_val).abs() < 1e-6,
+            "J7 must stay identically locked during lock_j7_hold path: cur={cur} expected={j7_locked_val}"
+        );
+    }
+    let reps = drain(&handle);
+    assert!(reps.iter().any(|r| matches!(r, Reply::Ack { request, .. } if *request == r_c1)), "{reps:?}");
+    assert_eq!(pf_targets.load(Ordering::Relaxed), 0, "arm-only child & inter-child gap must emit 0 PosForce Target");
+    assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO, "lock_j7_hold swept-joint child must be 0-alloc");
+
+    // 3) Fenced J7 gripper child with all 5 revisions (ONLY here may PosForce Target fire!)
+    let snap = latest_snap(&sup, clock.now() + DEFAULT_ACTION_DEADLINE);
+    let c2_spec = ChildSpec {
+        ticket: ChildTicket { parent, child_seq: 2 },
+        timeout_s: 10.0,
+        timeout_code: "GRASP_TIMEOUT",
+        contact: None,
+    };
+    let c2_slot = prepare_child_gripper_slot(
+        &snap.commanded_positions,
+        GripperCommand::Move,
+        Some(0.4),
+        false,
+        1.0,
+        Some(8.0),
+        Some(20.0),
+        true,
+        c2_spec,
+    )
+    .expect("stage fenced gripper slot");
+    let mut c2_auth = snap.owner.authority;
+    c2_auth.config_revision = rev_ws;
+    c2_auth.parent_generation = parent.0;
+    let w2 = |dst: &mut PlanSlot| *dst = c2_slot.clone();
+    let r_c2 = handle
+        .broker()
+        .lock()
+        .unwrap()
+        .submit(
+            ClientId(1),
+            3,
+            c2_auth,
+            clock.now() + DEFAULT_ACTION_DEADLINE,
+            Submit::Action(ActionSubmit::InstallChild {
+                write: &w2,
+                prepared_boot: boot,
+                check_workspace_revision: true,
+                calibration_revision: Some(rev_cal),
+                grasp_setup_revision: Some(rev_gs),
+                gripper_calib_revision: Some(rev_gc),
+                power_budget_revision: Some(rev_pb),
+            }),
+        )
+        .unwrap();
+    clock.run_steps(period_ns, 200);
+    let reps = drain(&handle);
+    assert!(reps.iter().any(|r| matches!(r, Reply::Ack { request, .. } if *request == r_c2)), "{reps:?}");
+    assert!(pf_targets.load(Ordering::Relaxed) >= 1, "GripperMotion child must emit PosForce Target");
+    assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO, "fenced gripper child must be 0-alloc");
+
+    // 4a) FinishMacro(Done, HeldUpdate::Set) with STALE grasp_setup_revision -> refused PLAN_STALE,
+    //     held NOT set, and strictly 0 allocs!
+    let snap = latest_snap(&sup, clock.now() + DEFAULT_ACTION_DEADLINE);
+    let mut stale_fin = FinishMacroSpec::done(parent, boot);
+    stale_fin.holding = Some(true);
+    stale_fin.held = HeldUpdate::Set {
+        label: HolderLabel::new("banana"),
+        spill_safe: false,
+    };
+    stale_fin.check_workspace_revision = true;
+    stale_fin.calibration_revision = Some(rev_cal);
+    stale_fin.grasp_setup_revision = Some(rev_gs + 99);
+    stale_fin.gripper_calib_revision = Some(rev_gc);
+    stale_fin.power_budget_revision = Some(rev_pb);
+    let mut fin_auth = snap.owner.authority;
+    fin_auth.config_revision = rev_ws;
+    fin_auth.parent_generation = parent.0;
+    let r_stale = handle
+        .broker()
+        .lock()
+        .unwrap()
+        .submit(
+            ClientId(1),
+            4,
+            fin_auth,
+            clock.now() + DEFAULT_ACTION_DEADLINE,
+            Submit::Action(ActionSubmit::FinishMacro(stale_fin)),
+        )
+        .unwrap();
+    clock.run_steps(period_ns, 2);
+    let reps = drain(&handle);
+    assert!(
+        reps.iter().any(|r| matches!(r, Reply::Refused { request, code: "PLAN_STALE" } if *request == r_stale)),
+        "stale FinishMacro(Done) must refuse PLAN_STALE: {reps:?}"
+    );
+    assert!(sup.hub().latest().unwrap().rt.owner.held.is_none(), "refused FinishMacro must NOT set held");
+    assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO, "stale FinishMacro refusal must be 0-alloc");
+
+    // 4b) Matching 5-revision FinishMacro(Done, HeldUpdate::Set) -> commits held, 0 allocs!
+    let mut ok_fin = stale_fin;
+    ok_fin.grasp_setup_revision = Some(rev_gs);
+    let r_ok = handle
+        .broker()
+        .lock()
+        .unwrap()
+        .submit(
+            ClientId(1),
+            5,
+            fin_auth,
+            clock.now() + DEFAULT_ACTION_DEADLINE,
+            Submit::Action(ActionSubmit::FinishMacro(ok_fin)),
+        )
+        .unwrap();
+    clock.run_steps(period_ns, 2);
+    let reps = drain(&handle);
+    assert!(reps.iter().any(|r| matches!(r, Reply::Ack { request, .. } if *request == r_ok)), "{reps:?}");
+    assert_eq!(
+        sup.hub().latest().unwrap().rt.owner.held.map(|h| h.label.as_str().to_string()),
+        Some("banana".to_string())
+    );
+    assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO, "fenced FinishMacro commit must be 0-alloc");
+
+    handle.stop_and_join();
 }

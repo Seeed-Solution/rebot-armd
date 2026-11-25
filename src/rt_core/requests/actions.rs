@@ -273,6 +273,9 @@ pub enum StagedAction {
         duration_s: f64,
         power_scale: Option<f64>,
         approach_then: Option<StagedQuinticLeg>,
+        /// Adaptive arm-only path: enforces quiescent start, no hold filter, exact J7 invariance
+        /// across all samples, and owner-side `PathTrajectory::with_hold_j7` lock.
+        lock_j7_hold: bool,
     },
     /// Prepared joint-space quintic (`move_to`/`move_relative` `path: "joint"`,
     /// `move_to_pose`, or macro `JointQuinticLimited` child).
@@ -357,10 +360,15 @@ pub struct BeginMacroSpec {
     pub poses_revision: Option<u64>,
     pub sequences_revision: Option<u64>,
     pub grasp_setup_revision: Option<u64>,
+    pub gripper_calib_revision: Option<u64>,
     pub power_budget_revision: Option<u64>,
     pub macro_deadline: Option<Instant>,
     pub timeout_code: BoundedText<48>,
     pub orientation_levelled: bool,
+    /// Adaptive grasp owner-side invariant: requires all 5 revision checks + start freshness at
+    /// `BeginMacro` commit, and restricts J7 `PosForceIntent::Target` permission strictly to
+    /// active `GripperMotion` children.
+    pub j7_intent_only: bool,
     pub task: HolderLabel,
     pub tag: HolderLabel,
 }
@@ -379,10 +387,12 @@ impl BeginMacroSpec {
             poses_revision: None,
             sequences_revision: None,
             grasp_setup_revision: None,
+            gripper_calib_revision: None,
             power_budget_revision: None,
             macro_deadline: None,
             timeout_code: BoundedText::empty(),
             orientation_levelled: false,
+            j7_intent_only: false,
             task: HolderLabel::default(),
             tag: HolderLabel::default(),
         }
@@ -412,6 +422,12 @@ pub struct FinishMacroSpec {
     pub holding: Option<bool>,
     pub gripper_gap_rad: Option<f32>,
     pub held: HeldUpdate,
+    /// Optional revision fences checked atomically on `FinishState::Done` before committing `held`.
+    pub check_workspace_revision: bool,
+    pub calibration_revision: Option<u64>,
+    pub grasp_setup_revision: Option<u64>,
+    pub gripper_calib_revision: Option<u64>,
+    pub power_budget_revision: Option<u64>,
 }
 
 impl FinishMacroSpec {
@@ -425,6 +441,11 @@ impl FinishMacroSpec {
             holding: None,
             gripper_gap_rad: None,
             held: HeldUpdate::Unchanged,
+            check_workspace_revision: false,
+            calibration_revision: None,
+            grasp_setup_revision: None,
+            gripper_calib_revision: None,
+            power_budget_revision: None,
         }
     }
 
@@ -438,6 +459,11 @@ impl FinishMacroSpec {
             holding: None,
             gripper_gap_rad: None,
             held: HeldUpdate::Unchanged,
+            check_workspace_revision: false,
+            calibration_revision: None,
+            grasp_setup_revision: None,
+            gripper_calib_revision: None,
+            power_budget_revision: None,
         }
     }
 
@@ -451,6 +477,11 @@ impl FinishMacroSpec {
             holding: None,
             gripper_gap_rad: None,
             held: HeldUpdate::Unchanged,
+            check_workspace_revision: false,
+            calibration_revision: None,
+            grasp_setup_revision: None,
+            gripper_calib_revision: None,
+            power_budget_revision: None,
         }
     }
 }
@@ -479,6 +510,7 @@ pub enum ActionCommand {
         prepared_boot: BootId,
         check_workspace_revision: bool,
         calibration_revision: Option<u64>,
+        grasp_setup_revision: Option<u64>,
         gripper_calib_revision: Option<u64>,
         power_budget_revision: Option<u64>,
     },
@@ -526,6 +558,7 @@ pub enum ActionSubmit<'a, P> {
         prepared_boot: BootId,
         check_workspace_revision: bool,
         calibration_revision: Option<u64>,
+        grasp_setup_revision: Option<u64>,
         gripper_calib_revision: Option<u64>,
         power_budget_revision: Option<u64>,
     },
@@ -771,6 +804,24 @@ pub fn check_action_authority(
     check_workspace_rev: bool,
     require_single_use_admission: bool,
 ) -> Result<(), ActionRefusal> {
+    check_action_authority_ex(
+        inner,
+        stamp,
+        ctx,
+        check_workspace_rev,
+        require_single_use_admission,
+        false,
+    )
+}
+
+fn check_action_authority_ex(
+    inner: &SupervisorInner,
+    stamp: &ActionStamp,
+    ctx: &OwnerCheckCtx,
+    check_workspace_rev: bool,
+    require_single_use_admission: bool,
+    is_stop_finish: bool,
+) -> Result<(), ActionRefusal> {
     let current = Authority {
         lease_generation: inner.lease_valid_at(ctx.now).map_or(0, |l| l.generation),
         epoch: inner.safety.epoch_id(),
@@ -853,10 +904,10 @@ pub fn check_action_authority(
             return Err(ActionRefusal::new("PLAN_STALE"));
         }
     }
-    if inner.core.motion_inhibited_by_config() {
+    if !is_stop_finish && inner.core.motion_inhibited_by_config() {
         return Err(ActionRefusal::new("CONFIG_BUSY"));
     }
-    if ctx.require_rt_feedback && !inner.commit_feedback_valid() {
+    if !is_stop_finish && ctx.require_rt_feedback && !inner.commit_feedback_valid() {
         return Err(ActionRefusal::new("FEEDBACK_STALE"));
     }
     if require_single_use_admission {
@@ -1184,6 +1235,156 @@ impl ActionSnapshot {
             Ok(Self::from_inner(&inner, admission, deadline))
         }
     }
+}
+
+/// Type-safe, lease-free read-only planning snapshot (NO [`ActionStamp`] or [`AdmissionStamp`]).
+///
+/// Used by lease-free dry-run endpoints (e.g. `POST /api/v1/action/grasp` with `dry_run: true`)
+/// on BOTH Legacy and RT Executor owners with zero `SupervisorLock` on `OWNER_EXECUTOR`.
+/// Because it carries no admission authority, it can never be passed into an owner commit gate.
+#[derive(Debug, Clone)]
+pub struct ReadOnlySnapshot {
+    pub env: Arc<ActionPrepEnv>,
+    pub owner: PublishedOwnerMeta,
+    pub safety_state: SafetyState,
+    pub commanded_positions: Vec<f32>,
+    pub commanded_velocities: Vec<f32>,
+    pub measured_positions: Vec<f32>,
+}
+
+impl ReadOnlySnapshot {
+    /// Captures a coherent read-only planning snapshot from `sup`:
+    /// - `OWNER_EXECUTOR`: reads ONLY `StateHub::latest()` + `StateHub::prep_env()` (0 lock).
+    /// - `OWNER_LEGACY`: takes a brief `read()` lock.
+    pub async fn capture(sup: &ArmSupervisor) -> Result<Self, ArmError> {
+        if sup.owner_mode() == OWNER_EXECUTOR {
+            let snap = sup.hub().latest().ok_or_else(|| ArmError::Rejected {
+                status: 503,
+                code: "OBSERVATION_UNAVAILABLE".into(),
+                message: "No published snapshot available yet".into(),
+            })?;
+            let env = sup.hub().prep_env().ok_or_else(|| ArmError::Rejected {
+                status: 503,
+                code: "OBSERVATION_UNAVAILABLE".into(),
+                message: "No published planning environment available yet".into(),
+            })?;
+            let owner = snap.rt.owner;
+            if owner.boot.is_zero() {
+                return Err(ArmError::Rejected {
+                    status: 503,
+                    code: "OBSERVATION_UNAVAILABLE".into(),
+                    message: "No live owner metadata published yet".into(),
+                });
+            }
+            if !env.matches_owner_meta(&owner) {
+                return Err(ArmError::Motion(MotionError::PlanStale(
+                    "published planning environment revision lags owner revision".into(),
+                )));
+            }
+            Ok(Self {
+                env,
+                owner,
+                safety_state: snap.obs.safety_state.clone(),
+                commanded_positions: snap.rt.commanded_positions.clone(),
+                commanded_velocities: snap.rt.commanded_velocities.clone(),
+                measured_positions: snap.rt.positions.clone(),
+            })
+        } else {
+            let inner = sup.inner().read().await;
+            if inner.detached {
+                return Err(ArmError::Rejected {
+                    status: 503,
+                    code: "OWNER_TRANSFERRED".into(),
+                    message: "Ownership transferred to RT executor".into(),
+                });
+            }
+            Ok(Self {
+                env: Arc::new(ActionPrepEnv::from_inner(&inner)),
+                owner: inner.published_owner_meta(),
+                safety_state: inner.safety.state().clone(),
+                commanded_positions: inner.commanded_positions.clone(),
+                commanded_velocities: inner.commanded_velocities.clone(),
+                measured_positions: inner.measured_positions.clone(),
+            })
+        }
+    }
+
+    /// Checks operational preconditions against this read-only snapshot (mirrors `ActionSnapshot`).
+    pub fn check_preconditions(&self) -> Result<(), ArmError> {
+        if self.owner.handover_settling {
+            return Err(SafetyError::HandoverSettling.into());
+        }
+        match &self.safety_state {
+            SafetyState::EStop => return Err(SafetyError::EStopActive.into()),
+            SafetyState::Fault(r) => return Err(SafetyError::FaultActive(r.clone()).into()),
+            s if !s.is_operational() => return Err(SafetyError::NotArmed(s.clone()).into()),
+            _ => {}
+        }
+        if self.owner.pending_rearm || self.owner.pending_normal_unload {
+            return Err(SafetyError::NotArmed(self.safety_state.clone()).into());
+        }
+        if self.owner.collision_hold {
+            return Err(SafetyError::CollisionHold("collision hold active".into()).into());
+        }
+        if self.owner.config_inhibited {
+            return Err(ArmError::Rejected {
+                status: 409,
+                code: "CONFIG_BUSY".into(),
+                message: "Configuration change is in progress".into(),
+            });
+        }
+        if self.owner.calibration_busy {
+            return Err(MotionError::MotionBusy("a calibration apply is running".into()).into());
+        }
+        if self.owner.zero_check_persisting {
+            return Err(MotionError::MotionBusy("gripper calibration is being persisted".into()).into());
+        }
+        if self.owner.policy_busy {
+            return Err(MotionError::MotionBusy("a policy run is active".into()).into());
+        }
+        if self.owner.motion_active {
+            return Err(MotionError::MotionBusy("a trajectory is running".into()).into());
+        }
+        if self.commanded_velocities.iter().any(|v| v.abs() >= 1e-3) {
+            return Err(MotionError::MotionBusy("the arm is still moving".into()).into());
+        }
+        if self.owner.gravity_comp_active {
+            return Err(MotionError::MotionBusy("gravity compensation is active".into()).into());
+        }
+        Ok(())
+    }
+
+    /// Builds a [`PlanInput`] in `goal_frame` strictly from this read-only snapshot (0 lock).
+    pub fn plan_input_in(&self, goal_frame: GoalFrame) -> Result<PlanInput, ArmError> {
+        if self.env.config.kinematics.is_none() || !self.env.config.has_cartesian_with_gripper() {
+            return Err(MotionError::Unsupported(
+                "Cartesian actions need a kinematics model and an arm with gripper".into(),
+            )
+            .into());
+        }
+        self.check_preconditions()?;
+        let arm_dof = self.env.config.arm_dof();
+        let gripper_idx = self.env.config.gripper_index().unwrap_or(arm_dof);
+        Ok(PlanInput {
+            q0: crate::kinematics::q6(
+                &self.commanded_positions[..arm_dof.min(self.commanded_positions.len())],
+            ),
+            j7: self.commanded_positions.get(gripper_idx).copied().unwrap_or(0.0),
+            limits: self.env.planning_limits(None),
+            speed_cap: self.env.config.speed_cap,
+            ws: self.env.workspace_policy.clone(),
+            cam: self.env.config.camera_mount.clone(),
+            arm: self.env.config.arm_model.clone(),
+            epoch: self.owner.authority.epoch,
+            workspace_revision: self.env.workspace_revision,
+            power: self.env.power_budget.clone(),
+            tcp_offset: self.env.config.tcp_offset,
+            goal_frame,
+        })
+    }
+}
+
+impl ActionSnapshot {
 
     /// Checks operational preconditions against the published snapshot (mirrors
     /// `SupervisorInner::action_preconditions` + `gravity_comp_motion_busy`).
@@ -1616,6 +1817,7 @@ impl PreparedCartesianAction {
             duration_s: path.duration,
             power_scale: self.input.power.as_ref().map(|_| path.power_scale),
             approach_then,
+            lock_j7_hold: false,
         });
         Ok(slot)
     }
@@ -2421,6 +2623,19 @@ pub fn prepare_child_cartesian_slot_with_approach(
     approach_then: Option<StagedQuinticLeg>,
     child: ChildSpec,
 ) -> Result<PlanSlot, &'static str> {
+    prepare_child_cartesian_slot_with_options(start, path, power_scale, approach_then, false, child)
+}
+
+/// Off-thread helper: stage a prepared Cartesian / swept-joint [`JointPath`] macro child into a
+/// [`PlanSlot`], optionally enforcing owner-side J7 hold lock and exact start/quiescence gates.
+pub fn prepare_child_cartesian_slot_with_options(
+    start: &[f32],
+    path: &JointPath,
+    power_scale: Option<f64>,
+    approach_then: Option<StagedQuinticLeg>,
+    lock_j7_hold: bool,
+    child: ChildSpec,
+) -> Result<PlanSlot, &'static str> {
     if start.len() != path.dof || start.len() > MAX_DOF {
         return Err("INVALID_COMMAND");
     }
@@ -2438,6 +2653,7 @@ pub fn prepare_child_cartesian_slot_with_approach(
         duration_s: path.duration,
         power_scale,
         approach_then,
+        lock_j7_hold,
     });
     Ok(slot)
 }
@@ -3154,7 +3370,7 @@ fn install_move_joint_rt(
     }
     this.release_servo_target();
     this.servo_settled_ticks.fill(0);
-    this.servo_ws_min_depths = None;
+    this.clear_servo_ws_min_depths_rt();
     crate::rt_core::scratch::copy_into(&mut this.target_positions, &tgt[..dof]);
     this.safety
         .mark_motion_started()
@@ -3355,7 +3571,7 @@ fn install_gripper_rt(
     this.gripper_hold_vel_ceiling = Some(wire_vel_ceiling);
     this.release_servo_target();
     this.servo_settled_ticks.fill(0);
-    this.servo_ws_min_depths = None;
+    this.clear_servo_ws_min_depths_rt();
     crate::rt_core::scratch::copy_into(&mut this.target_positions, &this.commanded_positions);
     if gripper_idx < this.target_positions.len() {
         this.target_positions[gripper_idx] = target_g;
@@ -3481,6 +3697,20 @@ fn install_replay_slot_rt(
     SupervisorInner::install_prepared_replay(admitted, prepared).map_err(static_code)
 }
 
+fn check_adaptive_begin_fence(spec: &BeginMacroSpec) -> Result<(), ActionRefusal> {
+    if spec.j7_intent_only
+        && (!spec.check_start
+            || !spec.check_workspace_revision
+            || spec.calibration_revision.is_none()
+            || spec.grasp_setup_revision.is_none()
+            || spec.gripper_calib_revision.is_none()
+            || spec.power_budget_revision.is_none())
+    {
+        return Err(ActionRefusal::new("INVALID_COMMAND"));
+    }
+    Ok(())
+}
+
 /// **5. ONE owner-side install for `BeginMacro` (A7)**: validates authority, optional start
 /// freshness, domain revisions, consumes A1 `Admitted<'g>`, detaches/quiesces any replaced
 /// active macro, allocates parent `ActionId`, and records [`MacroRun`] with optional
@@ -3493,6 +3723,7 @@ pub fn install_begin_macro(
     legacy_tag: Option<String>,
     legacy_task: Option<String>,
 ) -> Result<u64, ActionRefusal> {
+    check_adaptive_begin_fence(spec)?;
     check_action_authority(inner, stamp, ctx, spec.check_workspace_revision, true)?;
     if spec.check_start {
         let dof = usize::from(spec.dof);
@@ -3575,6 +3806,11 @@ pub(crate) fn install_begin_macro_with_proof(
     legacy_tag: Option<String>,
     legacy_task: Option<String>,
 ) -> Result<u64, ArmError> {
+    if spec.j7_intent_only
+        && (check_adaptive_begin_fence(spec).is_err() || expected_workspace_revision.is_none())
+    {
+        return Err(ActionRefusal::new("INVALID_COMMAND").into_arm_error(this));
+    }
     let now = Instant::now();
     if let Some(ws_rev) = expected_workspace_revision.filter(|_| spec.check_workspace_revision) {
         if this.workspace_revision != ws_rev {
@@ -3584,6 +3820,21 @@ pub(crate) fn install_begin_macro_with_proof(
     if let Some(cal_rev) = spec.calibration_revision {
         if this.calibration_revision != cal_rev {
             return Err(ActionRefusal::new("CALIBRATION_CHANGED").into_arm_error(this));
+        }
+    }
+    if let Some(gs_rev) = spec.grasp_setup_revision {
+        if this.grasp_setup_revision != gs_rev {
+            return Err(ActionRefusal::new("PLAN_STALE").into_arm_error(this));
+        }
+    }
+    if let Some(gc_rev) = spec.gripper_calib_revision {
+        if this.gripper_calib_revision != gc_rev {
+            return Err(ActionRefusal::new("PLAN_STALE").into_arm_error(this));
+        }
+    }
+    if let Some(pb_rev) = spec.power_budget_revision {
+        if this.power_budget_revision != pb_rev {
+            return Err(ActionRefusal::new("PLAN_STALE").into_arm_error(this));
         }
     }
     if spec.check_start {
@@ -3632,6 +3883,12 @@ fn install_begin_macro_committed(
         this.begin_action(spec.kind.action_kind_str(), tag)
     };
     let mut run = MacroRun::new(id, proof.stamp().estop_epoch, proof.stamp());
+    run.j7_intent_only = spec.j7_intent_only;
+    if spec.j7_intent_only {
+        // Adaptive macros restrict J7 PosForce Target permission strictly to active GripperMotion
+        // children; BeginMacro never grants J7 Target permission.
+        this.j7_admitted_stamp = None;
+    }
     if let Some(d) = spec.macro_deadline {
         let tc = if spec.timeout_code.is_empty() {
             "TIMEOUT"
@@ -3667,6 +3924,7 @@ pub enum MacroChildPayload {
         start: Vec<f32>,
         input: PlanInput,
         resolved: ResolvedCartesianLegs,
+        lock_j7_hold: bool,
     },
     /// Legacy prepared joint-quintic child (`sequence` pose step / `measure_multiview`).
     LegacyJoint {
@@ -3736,9 +3994,37 @@ pub fn install_macro_child(
             start,
             input,
             resolved,
+            lock_j7_hold,
         } => {
             let parent_id = precheck_macro_child(inner, stamp, ctx, &spec, &start)
                 .map_err(|r| r.into_arm_error(inner))?;
+            if lock_j7_hold {
+                if resolved.approach_leg.is_some() {
+                    return Err(ActionRefusal::new("INVALID_COMMAND").into_arm_error(inner));
+                }
+                if inner.torque_guard.hold.is_some() || inner.power.gov.hold.is_some() {
+                    return Err(ActionRefusal::new("PLAN_STALE").into_arm_error(inner));
+                }
+                if inner.commanded_velocities.iter().any(|v| v.abs() >= 1e-3) {
+                    return Err(ActionRefusal::new("PLAN_STALE").into_arm_error(inner));
+                }
+                if let Some(first) = resolved.path.q.first() {
+                    let dof = resolved.path.dof.min(inner.commanded_positions.len());
+                    if check_start_fresh(&inner.commanded_positions[..dof], &first[..dof]).is_err() {
+                        return Err(ActionRefusal::new("PLAN_STALE").into_arm_error(inner));
+                    }
+                    if let Some(g) = inner.config.gripper_index().filter(|&g| g < dof) {
+                        let live_g = inner.commanded_positions[g];
+                        if (first[g] - live_g).abs() > 1e-6
+                            || resolved.path.q.iter().any(|s| (s[g] - live_g).abs() > 1e-6)
+                        {
+                            return Err(ActionRefusal::new("PLAN_STALE").into_arm_error(inner));
+                        }
+                    }
+                } else {
+                    return Err(ActionRefusal::new("INVALID_COMMAND").into_arm_error(inner));
+                }
+            }
             inner.guard_next_macro_child(parent_id, spec.contact);
             let admitted = match consume_action_admission(inner, stamp, ctx.stop_generation) {
                 Ok(a) => a,
@@ -3757,6 +4043,7 @@ pub fn install_macro_child(
                 resolved.path,
                 approach_seg,
                 resolved.outcome.as_ref(),
+                lock_j7_hold,
             ) {
                 Ok(d) => d,
                 Err(e) => {
@@ -3764,6 +4051,9 @@ pub fn install_macro_child(
                     return Err(e);
                 }
             };
+            if lock_j7_hold || inner.macro_run.as_ref().is_some_and(|m| m.j7_intent_only) {
+                inner.j7_admitted_stamp = None;
+            }
             let ticket = arm_child_deadline_clamped(inner, parent_id, &spec, ctx.now, Some((dur * 2.0 + 5.0).min(spec.timeout_s)))
                 .ok_or_else(|| ActionRefusal::new("PARENT_REPLACED").into_arm_error(inner))?;
             Ok(InstalledMacroChild {
@@ -4015,10 +4305,34 @@ fn install_macro_child_slot_rt(
             duration_s,
             power_scale,
             approach_then,
+            lock_j7_hold,
             ..
         } => {
             inner.validate_prepared_joint_path(dof, &slot.path, duration_s)?;
             inner.check_prepared_fresh_static(stamp.admission.estop_epoch)?;
+            if lock_j7_hold {
+                if approach_then.is_some() {
+                    return Err("INVALID_COMMAND");
+                }
+                if inner.torque_guard.hold.is_some() || inner.power.gov.hold.is_some() {
+                    return Err("PLAN_STALE");
+                }
+                if inner.commanded_velocities[..dof].iter().any(|v| v.abs() >= 1e-3) {
+                    return Err("PLAN_STALE");
+                }
+                let first = &slot.path.samples()[0][..dof];
+                if check_start_fresh(&inner.commanded_positions[..dof], first).is_err() {
+                    return Err("PLAN_STALE");
+                }
+                if let Some(g) = inner.config.gripper_index().filter(|&g| g < dof) {
+                    let live_g = inner.commanded_positions[g];
+                    if (first[g] - live_g).abs() > 1e-6
+                        || slot.path.samples().iter().any(|s| (s[g] - live_g).abs() > 1e-6)
+                    {
+                        return Err("PLAN_STALE");
+                    }
+                }
+            }
             let last_slice = &slot.path.samples()[slot.path.len() - 1][..dof];
             let mut last_buf = [0.0f32; MAX_DOF];
             last_buf[..dof].copy_from_slice(last_slice);
@@ -4041,6 +4355,9 @@ fn install_macro_child_slot_rt(
                 }
             };
             let (this, proof) = admitted.consume().map_err(|e| static_code(e.into()))?;
+            if lock_j7_hold || this.macro_run.as_ref().is_some_and(|m| m.j7_intent_only) {
+                this.j7_admitted_stamp = None;
+            }
             let duration = match this.start_path_motion_slice_inner(
                 &proof,
                 stamp.admission.estop_epoch,
@@ -4057,8 +4374,11 @@ fn install_macro_child_slot_rt(
                 this.note_action_power_scale(parent_id, s);
             }
             let arm_dof = this.config.arm_dof();
-            let base_ref =
-                Reference::Path(motion::PathTrajectory::from_plan_slot(slot, dof, arm_dof, duration_s));
+            let hold_j7 = if lock_j7_hold { this.config.gripper_index() } else { None };
+            let base_ref = Reference::Path(
+                motion::PathTrajectory::from_plan_slot(slot, dof, arm_dof, duration_s)
+                    .with_hold_j7(hold_j7),
+            );
             let total_dur = if let Some((seg, leg)) = then_traj {
                 let d2 = seg.duration;
                 if let Some(s) = leg.power_scale {
@@ -4279,7 +4599,7 @@ fn install_macro_child_slot_rt(
             this.gripper_hold_vel_ceiling = Some(wire_vel);
             this.release_servo_target();
             this.servo_settled_ticks.fill(0);
-            this.servo_ws_min_depths = None;
+            this.clear_servo_ws_min_depths_rt();
             crate::rt_core::scratch::copy_into(&mut this.target_positions, &this.commanded_positions);
             if gripper_idx < this.target_positions.len() {
                 this.target_positions[gripper_idx] = target_g;
@@ -4390,7 +4710,15 @@ pub fn install_finish_macro(
     spec: &FinishMacroSpec,
     legacy_message: Option<String>,
 ) -> Result<ActionId, ActionRefusal> {
-    check_action_authority(inner, stamp, ctx, false, false)?;
+    let is_stop_finish = spec.state != FinishState::Done;
+    check_action_authority_ex(
+        inner,
+        stamp,
+        ctx,
+        spec.check_workspace_revision && !is_stop_finish,
+        false,
+        is_stop_finish,
+    )?;
     let id = spec.parent.0;
     let Some(run) = inner
         .macro_run
@@ -4599,7 +4927,7 @@ pub fn commit_action(
                 spec.poses_revision,
                 spec.sequences_revision,
                 spec.grasp_setup_revision,
-                None,
+                spec.gripper_calib_revision,
                 spec.power_budget_revision,
             );
             let id = install_begin_macro(inner, &stamp, &owner_ctx, &spec, None, None)
@@ -4610,6 +4938,7 @@ pub fn commit_action(
             prepared_boot,
             check_workspace_revision,
             calibration_revision,
+            grasp_setup_revision,
             gripper_calib_revision,
             power_budget_revision,
             ..
@@ -4622,7 +4951,7 @@ pub fn commit_action(
                 calibration_revision,
                 None,
                 None,
-                None,
+                grasp_setup_revision,
                 gripper_calib_revision,
                 power_budget_revision,
             );
@@ -4636,12 +4965,12 @@ pub fn commit_action(
                 d,
                 spec.prepared_boot,
                 0,
+                spec.calibration_revision,
                 None,
                 None,
-                None,
-                None,
-                None,
-                None,
+                spec.grasp_setup_revision,
+                spec.gripper_calib_revision,
+                spec.power_budget_revision,
             );
             let parent = install_finish_macro(inner, &stamp, &owner_ctx, &spec, None)
                 .map_err(|r| r.code)?;

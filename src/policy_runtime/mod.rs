@@ -36,6 +36,8 @@ pub use runner::{
     MIN_LIVE_POLICY_FPS, MIN_POLICY_FPS, period_us_for_fps, PolicyStepStats, SpeedGateReport, WarmupInferUs,
     POLICY_STATS_RING, SPEED_GATE_PERIOD_FRACTION, WARMUP_INFERENCES, WARMUP_MAX_TOTAL,
 };
+#[cfg(not(target_arch = "wasm32"))]
+pub use runner::{spawn_executor_policy_runner, ExecutorPolicyRunParams};
 #[cfg(feature = "policy-tract")]
 pub use tract_backend::TractBackend;
 pub use units::{

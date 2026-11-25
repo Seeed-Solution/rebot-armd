@@ -240,6 +240,9 @@ pub enum CommandKind {
     /// Action-family prepared commands and macro lifecycle (A6 + A7).
     #[cfg(not(target_arch = "wasm32"))]
     Action(super::requests::actions::ActionCommand),
+    /// Policy runtime lifecycle commands (`ReserveLoad`, `BeginPolicy`, `EndPolicy`) (Stage 3 C2).
+    #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+    Policy(super::requests::policy::PolicyCommand),
 }
 
 impl CommandKind {
@@ -247,7 +250,7 @@ impl CommandKind {
     pub fn is_install(&self) -> bool {
         matches!(self, Self::Install { .. } | Self::InstallHome { .. } | Self::InstallPark { .. })
     }
-    /// A terminal reply follows the ACK (an install, transition, prepared action, or `BeginMacro`).
+    /// A terminal reply follows the ACK (an install, transition, prepared action, `BeginMacro`, or `BeginPolicy`).
     pub fn starts_action(&self) -> bool {
         match self {
             Self::Install { .. }
@@ -256,6 +259,8 @@ impl CommandKind {
             | Self::Transition(_) => true,
             #[cfg(not(target_arch = "wasm32"))]
             Self::Action(a) => a.starts_action(),
+            #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+            Self::Policy(p) => p.starts_action(),
             Self::ContinuePark { .. } | Self::Immediate(_) | Self::Lease(_) => false,
         }
     }
@@ -267,6 +272,8 @@ impl CommandKind {
             | Self::ContinuePark { plan } => Some(*plan),
             #[cfg(not(target_arch = "wasm32"))]
             Self::Action(a) => a.plan(),
+            #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+            Self::Policy(_) => None,
             Self::Immediate(_) | Self::Transition(_) | Self::Lease(_) => None,
         }
     }
@@ -666,6 +673,8 @@ pub enum Submit<'a, P> {
     Lease(super::requests::lease::LeaseRequest),
     #[cfg(not(target_arch = "wasm32"))]
     Action(super::requests::actions::ActionSubmit<'a, P>),
+    #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+    Policy(super::requests::policy::PolicyCommand),
 }
 
 /// Capacities of one broker (tests use tiny ones).
@@ -812,6 +821,20 @@ impl<P> Broker<P> {
 
     /// Admits one command: reserves its replies, stages its plan, queues its descriptor.
     pub fn submit(&mut self, client: ClientId, client_seq: u64, authority: Authority, deadline: Instant, what: Submit<'_, P>) -> Result<RequestId, AdmitError> {
+        self.submit_with_pre_push(client, client_seq, authority, deadline, what, |_| {})
+    }
+
+    /// Admits one command, invoking `on_admitted(request)` strictly AFTER capacity checks pass
+    /// and strictly BEFORE pushing the descriptor into the command ring (never called on error).
+    pub fn submit_with_pre_push(
+        &mut self,
+        client: ClientId,
+        client_seq: u64,
+        authority: Authority,
+        deadline: Instant,
+        what: Submit<'_, P>,
+        on_admitted: impl FnOnce(RequestId),
+    ) -> Result<RequestId, AdmitError> {
         if self.disconnected.contains(&client) {
             self.stats.refused_admission += 1;
             return Err(AdmitError::Disconnected);
@@ -823,6 +846,8 @@ impl<P> Broker<P> {
             | Submit::Transition(_) => true,
             #[cfg(not(target_arch = "wasm32"))]
             Submit::Action(a) => a.starts_action(),
+            #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+            Submit::Policy(p) => p.starts_action(),
             Submit::ContinuePark(_) | Submit::Immediate(_) | Submit::Lease(_) => false,
         };
         let need = 1 + usize::from(terminal);
@@ -865,6 +890,8 @@ impl<P> Broker<P> {
             Submit::Immediate(op) => CommandKind::Immediate(op),
             Submit::Transition(op) => CommandKind::Transition(op),
             Submit::Lease(req) => CommandKind::Lease(req),
+            #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+            Submit::Policy(cmd) => CommandKind::Policy(cmd),
             #[cfg(not(target_arch = "wasm32"))]
             Submit::Action(a) => {
                 use super::requests::actions::{ActionCommand, ActionSubmit};
@@ -902,6 +929,7 @@ impl<P> Broker<P> {
                         prepared_boot,
                         check_workspace_revision,
                         calibration_revision,
+                        grasp_setup_revision,
                         gripper_calib_revision,
                         power_budget_revision,
                     } => match self.plans.stage(write) {
@@ -910,6 +938,7 @@ impl<P> Broker<P> {
                             prepared_boot,
                             check_workspace_revision,
                             calibration_revision,
+                            grasp_setup_revision,
                             gripper_calib_revision,
                             power_budget_revision,
                         }),
@@ -924,6 +953,7 @@ impl<P> Broker<P> {
         };
         self.next_request += 1;
         let request = RequestId(self.next_request);
+        on_admitted(request);
         let d = Descriptor { stamp: Stamp { arm: self.arm, boot: self.boot, request, client, client_seq, authority, deadline }, kind };
         if self.commands.push(d).is_err() {
             // single producer and slots() > 0 above: unreachable; keep it side-effect free

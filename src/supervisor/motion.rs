@@ -203,9 +203,15 @@ impl SupervisorInner {
             }
         }
         // (the message is built only when a run ends: a stop without one does not allocate)
+        #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+        if self.policy_load_reservation.take().is_some() {
+            self.policy_loading = false;
+            self.policy_cancel_slots.set_active_load_token(0);
+            self.reconcile_target_stream_authority(Instant::now());
+        }
         #[cfg(feature = "policy-runtime")]
         if self.policy_run.is_some() {
-            self.terminate_policy_run("STOPPED", "cancelled", Some("STOPPED"), Some("Motion stopped".into()));
+            self.terminate_policy_run_static("STOPPED", "cancelled", Some("STOPPED"), Some("Motion stopped"));
         }
         if self.gripper_reference_active() { self.hold_gripper_at_measured(); }
         self.servo_settled_ticks.fill(0);
@@ -390,20 +396,25 @@ impl SupervisorInner {
     }
 
     pub(crate) fn apply_stop_policy_in_tick(&mut self, policy: StopPolicy, in_tick: bool) {
+        #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+        if self.policy_load_reservation.take().is_some() {
+            self.policy_loading = false;
+            self.policy_cancel_slots.set_active_load_token(0);
+        }
         #[cfg(feature = "policy-runtime")]
         if self.policy_run.is_some() {
             match policy {
                 StopPolicy::NormalUnload => {
-                    self.terminate_policy_run("STOPPED", "cancelled", Some("STOPPED"), Some("Arm unloading".into()));
+                    self.terminate_policy_run_static("STOPPED", "cancelled", Some("STOPPED"), Some("Arm unloading"));
                 }
                 StopPolicy::EStopLatch => {
-                    self.terminate_policy_run("ESTOP", "failed", Some("ESTOP_ACTIVE"), Some("E-stop latched".into()));
+                    self.terminate_policy_run_static("ESTOP", "failed", Some("ESTOP_ACTIVE"), Some("E-stop latched"));
                 }
                 StopPolicy::ThermalTrip => {
-                    self.terminate_policy_run("THERMAL_TRIP", "failed", Some("THERMAL_TRIP"), Some("Thermal trip".into()));
+                    self.terminate_policy_run_static("THERMAL_TRIP", "failed", Some("THERMAL_TRIP"), Some("Thermal trip"));
                 }
                 StopPolicy::BusLossFallback => {
-                    self.terminate_policy_run("BUS_LOSS", "failed", Some("BUS_LOSS"), Some("CAN feedback lost".into()));
+                    self.terminate_policy_run_static("BUS_LOSS", "failed", Some("BUS_LOSS"), Some("CAN feedback lost"));
                 }
             }
         }
@@ -674,7 +685,7 @@ impl SupervisorInner {
 
         #[cfg(feature = "policy-runtime")]
         if self.policy_run.is_some() {
-            self.terminate_policy_run("LEASE_LOST", "cancelled", Some("LEASE_LOST"), Some("Control lease preempted".into()));
+            self.terminate_policy_run_static("LEASE_LOST", "cancelled", Some("LEASE_LOST"), Some("Control lease preempted"));
         }
 
         // Decision-based hardware disabled check (never inferred from feedback telemetry).
@@ -738,7 +749,7 @@ impl SupervisorInner {
         self.cancel_watchdog_park_for_new_lease(client_id);
         #[cfg(feature = "policy-runtime")]
         if self.policy_run.is_some() {
-            self.terminate_policy_run("LEASE_LOST", "cancelled", Some("LEASE_LOST"), Some("Control lease acquired by new controller".into()));
+            self.terminate_policy_run_static("LEASE_LOST", "cancelled", Some("LEASE_LOST"), Some("Control lease acquired by new controller"));
         }
         if let Some(old_gen) = self.active_lease.as_ref().map(|a| a.generation) {
             self.fence_displaced_lease_generation(old_gen, true);
@@ -939,7 +950,7 @@ impl SupervisorInner {
     pub(crate) fn latch_watchdog_fault(&mut self) {
         #[cfg(feature = "policy-runtime")]
         if self.policy_run.is_some() {
-            self.terminate_policy_run("WATCHDOG_TIMEOUT", "failed", Some("WATCHDOG_TIMEOUT"), Some("Lease watchdog expired".into()));
+            self.terminate_policy_run_static("WATCHDOG_TIMEOUT", "failed", Some("WATCHDOG_TIMEOUT"), Some("Lease watchdog expired"));
         }
         if !self.safety.state().is_stopped() {
             // Preserve a torque-guard backed-off command before updating commanded_positions in place.
@@ -966,7 +977,7 @@ impl SupervisorInner {
             self.gripper_stream_contact_detector.reset();
             self.gripper_stream_lease = None;
             self.servo_settled_ticks.fill(0);
-            self.servo_ws_min_depths = None;
+            self.clear_servo_ws_min_depths_rt();
             self.servo_stream_active = false;
             self.tracking.invalidate();
             crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
@@ -995,7 +1006,7 @@ impl SupervisorInner {
                 self.fence_displaced_lease_generation(displaced, false);
                 #[cfg(feature = "policy-runtime")]
                 if self.policy_run.is_some() {
-                    self.terminate_policy_run("LEASE_LOST", "cancelled", Some("LEASE_LOST"), Some("Control lease released".into()));
+                    self.terminate_policy_run_static("LEASE_LOST", "cancelled", Some("LEASE_LOST"), Some("Control lease released"));
                 }
                 return valid;
             }
@@ -1383,7 +1394,7 @@ impl SupervisorInner {
             self.gripper_hold_vel_ceiling = None;
         }
         self.release_servo_target();
-        self.servo_ws_min_depths = None;
+        self.clear_servo_ws_min_depths_rt();
         crate::rt_core::scratch::copy_into(&mut self.target_positions, &target_positions);
         self.safety.mark_motion_started()?;
         let duration = traj.duration;
@@ -1805,7 +1816,7 @@ impl SupervisorInner {
         self.safety.validate_motion_command(Some(epoch), last, &self.config.limits)?;
         self.release_servo_target();
         self.servo_settled_ticks.fill(0);
-        self.servo_ws_min_depths = None;
+        self.clear_servo_ws_min_depths_rt();
         crate::rt_core::scratch::copy_into(&mut self.target_positions, last);
         self.safety.mark_motion_started()?;
         self.last_heartbeat = Instant::now();

@@ -396,8 +396,13 @@ async fn gate_executor_owner(
                         | "/api/v1/auth/lock"
                         | "/api/v1/heartbeat"
                         | "/api/v1/motion/servo"
+                        | "/api/v1/action/policy/start"
+                        | "/api/v1/action/policy/stop"
+                        | "/api/v1/vision/clock-handshake"
+                        | "/api/v1/vision/embedding"
                         | "/api/v1/diagnostics/tick/mark"
                         | "/api/v1/tool/commissioning/confirm"
+                        | "/api/v1/action/grasp"
                 ),
                 _ => false,
             };

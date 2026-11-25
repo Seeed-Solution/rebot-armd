@@ -144,7 +144,7 @@ impl PreparedOffThreadConfig {
     }
 }
 
-fn off_lock_command_reject(request_id: &Value, epoch: u64, error: ApiError) -> Value {
+pub(super) fn off_lock_command_reject(request_id: &Value, epoch: u64, error: ApiError) -> Value {
     let mut reply = rejection(error, "command_reject", epoch);
     reply["request_id"] = request_id.clone();
     reply
@@ -1426,7 +1426,7 @@ async fn commit_prepared_config(
     }
 }
 
-fn current_epoch_off_lock(sup: &ArmSupervisor, fallback: u64) -> u64 {
+pub(super) fn current_epoch_off_lock(sup: &ArmSupervisor, fallback: u64) -> u64 {
     let hub_ep = sup.hub().latest().map_or(fallback, |s| s.obs.epoch_id);
     hub_ep.max(sup.estop_epoch())
 }
