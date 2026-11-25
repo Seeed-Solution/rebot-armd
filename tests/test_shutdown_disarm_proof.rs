@@ -939,10 +939,97 @@ fn disarm_probe_rejects_pre_poll_stale_rx_and_mixed_state_burst() {
             !ok,
             "enabled reply followed by disabled reply in the same RX batch must NOT confirm disarm"
         );
+        assert!(
+            !drv.is_hardware_disarmed_confirmed(),
+            "rejected mixed-state burst must invalidate passive disarm proof so teardown cannot reuse it"
+        );
         let logs = take_logs();
         assert!(
             logs.contains("J3") && logs.contains("enabled"),
             "expected log naming J3 enabled in mixed-state burst, got: {logs:?}"
+        );
+    }
+
+    // (c) R2 Blocker 1 regression: an enabled reply sitting at frame 65+ (beyond one 64-frame RX
+    // batch) after 64 state==0 frames must still be drained and reject disarm proof.
+    {
+        let clock = MockClock::new();
+        let bus = FakeBus::with_clock(&dm_limits(), clock.clone());
+        let injected = Arc::new(AtomicBool::new(false));
+        let injected_c = Arc::clone(&injected);
+        bus.with(|s| {
+            s.immediate_replies = true;
+        });
+        #[derive(Clone)]
+        struct Over64Bus {
+            inner: FakeBus,
+            injected: Arc<AtomicBool>,
+        }
+        impl armd::transport::CanTransport for Over64Bus {
+            fn transmit(&mut self, frame: &CanFrame) -> Result<(), armd::transport::TransportError> {
+                let res = self.inner.transmit(frame);
+                if frame.id == 0x7FF
+                    && frame.data[2] == 0xCC
+                    && frame.data[0] == 7
+                    && !self.injected.swap(true, Ordering::AcqRel)
+                {
+                    self.inner.with(|s| {
+                        // Pad 60 extra state==0 frames for J1 so total > 64 frames, then append an
+                        // enabled (`state == 1`) frame for J6 past frame 64.
+                        let f1 = s.motors[0].feedback_frame();
+                        for _ in 0..60 {
+                            s.rx.push_back(f1);
+                        }
+                        let prev = s.motors[5].enabled;
+                        s.motors[5].enabled = true;
+                        let f6 = s.motors[5].feedback_frame();
+                        s.motors[5].enabled = prev;
+                        s.rx.push_back(f6);
+                    });
+                }
+                res
+            }
+            fn receive(&mut self) -> Result<CanFrame, armd::transport::TransportError> {
+                self.inner.receive()
+            }
+            fn receive_timestamped(
+                &mut self,
+            ) -> Result<(CanFrame, Option<Instant>), armd::transport::TransportError> {
+                self.inner.receive_timestamped()
+            }
+            fn flush(&mut self) -> Result<(), armd::transport::TransportError> {
+                self.inner.flush()
+            }
+            fn supports_nonblocking_rt(&self) -> bool {
+                self.inner.supports_nonblocking_rt()
+            }
+            fn supports_bounded_flush(&self) -> bool {
+                self.inner.supports_bounded_flush()
+            }
+            fn clock(&self) -> Option<Arc<dyn armd::transport::DriverClock>> {
+                self.inner.clock()
+            }
+        }
+
+        let over64_bus = Over64Bus {
+            inner: bus.clone(),
+            injected: injected_c,
+        };
+        let mut drv = DamiaoArmDriver::new(over64_bus, vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(dm_limits())
+            .unwrap();
+        let _ = take_logs();
+        let ok = drv.probe_hardware_disarmed_until(Instant::now() + Duration::from_millis(80));
+        assert!(injected.load(Ordering::Acquire));
+        assert!(
+            !ok,
+            "enabled reply queued past frame 64 must be drained and reject disarm proof"
+        );
+        assert!(!drv.is_hardware_disarmed_confirmed());
+        let logs = take_logs();
+        assert!(
+            logs.contains("J6") && logs.contains("enabled"),
+            "expected log naming J6 enabled past frame 64, got: {logs:?}"
         );
     }
 }
