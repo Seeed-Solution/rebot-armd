@@ -18207,7 +18207,7 @@ mod tx_chokepoint_tests {
 
                         let stamp = drv.current_stop_stamp();
                         let mut build_called = false;
-                        let res = drv.send(kind, Some(stamp), deadline, false, |d| {
+                        let res = drv.send_plain(kind, Some(stamp), deadline, false, |d| {
                             build_called = true;
                             Some(damiao::build_pos_vel_frame(0x100, d.motor_ids[0], 0.25, 1.0))
                         });
@@ -18272,7 +18272,7 @@ mod tx_chokepoint_tests {
         clock.advance(Duration::from_millis(101));
         bus.clear_tx();
         let mut called = false;
-        let stale_res = drv.send(TxKind::RollbackHold(0), None, None, false, |d| {
+        let stale_res = drv.send_plain(TxKind::RollbackHold(0), None, None, false, |d| {
             called = true;
             Some(damiao::build_pos_vel_frame(0x100, d.motor_ids[0], 0.35, 1.0))
         });
@@ -18286,7 +18286,7 @@ mod tx_chokepoint_tests {
         drv.read_joint_states().unwrap();
         bus.clear_tx();
         assert!(drv
-            .send(TxKind::RollbackHold(0), None, None, false, |d| {
+            .send_plain(TxKind::RollbackHold(0), None, None, false, |d| {
                 let pos = d.fresh_measured_position(0, POS_FORCE_FEEDBACK_MAX_AGE)?;
                 Some(d.pos_vel_frame(0, pos))
             })
@@ -18303,13 +18303,13 @@ mod tx_chokepoint_tests {
         drv.set_abort_flag(Arc::new(AtomicBool::new(false)));
         bus.clear_tx();
         assert!(matches!(
-            drv.send(TxKind::Target, None, None, false, |_| None),
+            drv.send_plain(TxKind::Target, None, None, false, |_| None),
             Err(TxRefusal::BuildRefused)
         ));
         assert_eq!(bus.tx_len(), 0);
         // Budget slot was NOT consumed by BuildRefused, so the next valid frame succeeds.
         assert!(drv
-            .send(TxKind::Target, None, None, false, |d| Some(d.pos_vel_frame(0, 0.0)))
+            .send_plain(TxKind::Target, None, None, false, |d| Some(d.pos_vel_frame(0, 0.0)))
             .is_ok());
         assert_eq!(bus.tx_len(), 1);
 
@@ -18351,7 +18351,7 @@ mod tx_chokepoint_tests {
             let g = stops.request();
             stops.mark_applied(g);
             bus.clear_tx();
-            let res = drv.send(kind, Some(old_stamp), None, false, |d| {
+            let res = drv.send_plain(kind, Some(old_stamp), None, false, |d| {
                 Some(damiao::build_disable_frame(d.motor_ids[0]))
             });
             if matches!(
@@ -18439,7 +18439,7 @@ mod tx_chokepoint_tests {
 
             let stamp = drv.current_stop_stamp();
             let mut build_ran = false;
-            let res = drv.send(kind, Some(stamp), None, false, |d| {
+            let res = drv.send_plain(kind, Some(stamp), None, false, |d| {
                 build_ran = true;
                 // Flip latch mid-build; generation (`req`/`app`) deliberately unchanged!
                 latched.store(true, Ordering::SeqCst);
@@ -18474,7 +18474,7 @@ mod tx_chokepoint_tests {
             drv.set_estop_gate(EstopGate::new(req.clone(), app));
             drv.set_abort_flag(latched);
 
-            let res = drv.send(kind, None, None, false, |d| {
+            let res = drv.send_plain(kind, None, None, false, |d| {
                 req.fetch_add(1, Ordering::SeqCst);
                 Some(damiao::build_refresh_frame(d.motor_ids[0]))
             });
@@ -18493,7 +18493,7 @@ mod tx_chokepoint_tests {
         let latched = Arc::new(AtomicBool::new(false));
         drv.set_estop_gate(EstopGate::new(req.clone(), app));
         drv.set_abort_flag(latched.clone());
-        let res = drv.send(
+        let res = drv.send_plain(
             TxKind::DisableProtective { reason: DisableProtectiveReason::ProcessExit },
             None,
             None,
@@ -18525,7 +18525,7 @@ mod tx_chokepoint_tests {
             rest_pose_tolerance_rad: 0.05,
         });
         let started_at = clock.now();
-        let res = drv.send(
+        let res = drv.send_plain(
             TxKind::DisableRequested { started_at },
             None,
             None,
@@ -18564,7 +18564,7 @@ mod tx_chokepoint_tests {
         bus.clear_tx();
         let t0 = clock.now();
         assert!(matches!(
-            drv.send(TxKind::DisableRequested { started_at: t0 }, None, None, false, |d| {
+            drv.send_plain(TxKind::DisableRequested { started_at: t0 }, None, None, false, |d| {
                 Some(damiao::build_disable_frame(d.motor_ids[0]))
             }),
             Err(TxRefusal::TorqueOffWouldDrop)
@@ -18582,7 +18582,7 @@ mod tx_chokepoint_tests {
         }
         bus.clear_tx();
         assert!(drv
-            .send(TxKind::DisableRequested { started_at: t0 }, None, None, false, |d| {
+            .send_plain(TxKind::DisableRequested { started_at: t0 }, None, None, false, |d| {
                 Some(damiao::build_disable_frame(d.motor_ids[0]))
             })
             .is_ok());
@@ -18592,7 +18592,7 @@ mod tx_chokepoint_tests {
         clock.advance(Duration::from_millis(101));
         bus.clear_tx();
         assert!(matches!(
-            drv.send(TxKind::DisableRequested { started_at: t0 }, None, None, false, |d| {
+            drv.send_plain(TxKind::DisableRequested { started_at: t0 }, None, None, false, |d| {
                 Some(damiao::build_disable_frame(d.motor_ids[0]))
             }),
             Err(TxRefusal::DisableWaitEvidence)
@@ -18611,7 +18611,7 @@ mod tx_chokepoint_tests {
         }
         bus.clear_tx();
         assert!(matches!(
-            drv.send(TxKind::DisableRequested { started_at: t0 }, None, None, false, |d| {
+            drv.send_plain(TxKind::DisableRequested { started_at: t0 }, None, None, false, |d| {
                 Some(damiao::build_disable_frame(d.motor_ids[0]))
             }),
             Err(TxRefusal::DisableRequestExpired)
@@ -18645,7 +18645,7 @@ mod tx_chokepoint_tests {
         let t2 = clock2.now();
         for joint in 0..4 {
             assert!(matches!(
-                drv2.send(TxKind::DisableRequested { started_at: t2 }, None, None, false, |d| {
+                drv2.send_plain(TxKind::DisableRequested { started_at: t2 }, None, None, false, |d| {
                     Some(damiao::build_disable_frame(d.motor_ids[joint]))
                 }),
                 Err(TxRefusal::TorqueOffWouldDrop)
@@ -18662,7 +18662,7 @@ mod tx_chokepoint_tests {
         let t_op = clock.now();
         bus.clear_tx();
         assert!(matches!(
-            drv.send(TxKind::DisableRequested { started_at: t_op }, None, None, false, |d| {
+            drv.send_plain(TxKind::DisableRequested { started_at: t_op }, None, None, false, |d| {
                 Some(damiao::build_disable_frame(d.motor_ids[0]))
             }),
             Err(TxRefusal::TorqueOffWouldDrop)
@@ -18671,7 +18671,7 @@ mod tx_chokepoint_tests {
         clock.advance(Duration::from_millis(500));
         bus.clear_tx();
         assert!(matches!(
-            drv.send(TxKind::DisableRequested { started_at: t0 }, None, None, false, |d| {
+            drv.send_plain(TxKind::DisableRequested { started_at: t0 }, None, None, false, |d| {
                 Some(damiao::build_disable_frame(d.motor_ids[0]))
             }),
             Err(TxRefusal::DisableRequestExpired)
@@ -19239,7 +19239,7 @@ mod tx_chokepoint_tests {
             &damiao::encode_pos_force_payload(-1.0, 0, 460),
         )
         .unwrap();
-        let res = drv.send(TxKind::Target, None, None, false, |_| Some(forged));
+        let res = drv.send_plain(TxKind::Target, None, None, false, |_| Some(forged));
         assert!(
             matches!(res, Err(TxRefusal::BuildRefused)),
             "forged 0x307 through send() without PosForceSendToken must fail with BuildRefused, got {res:?}"
