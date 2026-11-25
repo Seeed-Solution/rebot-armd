@@ -285,6 +285,18 @@ pub(super) enum PendingPlanKind {
     Replay,
 }
 
+impl PendingPlanKind {
+    pub(super) const fn command_path(self) -> &'static str {
+        match self {
+            Self::MoveTo => "/api/v1/action/move_to",
+            Self::MoveRelative => "/api/v1/action/move_relative",
+            Self::MoveToPose => "/api/v1/action/move_to_pose",
+            Self::Gripper => "/api/v1/action/gripper",
+            Self::Replay => "/api/v1/action/replay",
+        }
+    }
+}
+
 /// A prepared action waiting for off-lock planning from a captured [`ActionSnapshot`].
 pub(super) struct PendingPlan {
     pub(super) request_id: Value,
@@ -306,6 +318,13 @@ pub(super) enum PlannedMacro {
 }
 
 impl PendingMacro {
+    pub(super) const fn command_path(&self) -> &'static str {
+        match self {
+            Self::Grasp(_) => "/api/v1/action/grasp",
+            Self::Place(_) => "/api/v1/action/place",
+        }
+    }
+
     pub(super) fn plan(self) -> Result<PlannedMacro, ArmError> {
         match self {
             Self::Grasp(g) => crate::grasp::plan(g).map(PlannedMacro::Grasp),
@@ -345,6 +364,7 @@ impl Drop for AbortOnDrop {
 /// tracked connection task, aborted automatically on drop so preflight never outlives the socket.
 pub(super) struct MacroCheck {
     pub(super) request_id: Value,
+    pub(super) command_path: &'static str,
     pub(super) generation: u64,
     pub(super) stamp: crate::supervisor::AdmissionStamp,
     pub(super) abort: AbortOnDrop,
@@ -583,6 +603,7 @@ pub(super) fn dispatch_action_command(
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn complete_macro_check(
     request_id: Value,
+    command_path: &'static str,
     generation: u64,
     stamp: crate::supervisor::AdmissionStamp,
     joined: Result<Result<PlannedMacro, ArmError>, tokio::sync::oneshot::error::RecvError>,
@@ -616,6 +637,7 @@ pub(super) async fn complete_macro_check(
     let gate = CommandReplyGateGuard::enter(command_reply_pending, recv_supervisor.hub());
     let outcome = {
         let mut inner = recv_supervisor.inner().write().await;
+        inner.set_command(command_path);
         if worker_closing.load(Ordering::SeqCst) {
             MacroFinishOutcome::Closed
         } else if inner.detached {
@@ -644,10 +666,13 @@ pub(super) async fn complete_macro_check(
                         }
                     } else {
                         match planned.start(&mut inner, stamp, recv_supervisor, recv_deps) {
-                            Ok(started) => MacroFinishOutcome::Ack {
-                                snap: AckSnapshot::from_inner(&inner),
-                                started: Some(started),
-                            },
+                            Ok(started) => {
+                                inner.set_action_id(started.0);
+                                MacroFinishOutcome::Ack {
+                                    snap: AckSnapshot::from_inner(&inner),
+                                    started: Some(started),
+                                }
+                            }
                             Err(error) => MacroFinishOutcome::Reject {
                                 epoch: inner.safety.epoch_id(),
                                 error: error.into(),
@@ -765,6 +790,7 @@ pub(super) async fn complete_pending_plan(
     let gate = CommandReplyGateGuard::enter(command_reply_pending, recv_supervisor.hub());
     let outcome = {
         let mut inner = recv_supervisor.inner().write().await;
+        inner.set_command(kind.command_path());
         if worker_closing.load(Ordering::SeqCst) {
             PlanInstallOutcome::Closed
         } else if inner.detached {
@@ -850,10 +876,13 @@ pub(super) async fn complete_pending_plan(
                                 }
                             };
                             match res {
-                                Ok(started) => PlanInstallOutcome::Ack {
-                                    snap: AckSnapshot::from_inner(&inner),
-                                    started: Some(started),
-                                },
+                                Ok(started) => {
+                                    inner.set_action_id(started.0);
+                                    PlanInstallOutcome::Ack {
+                                        snap: AckSnapshot::from_inner(&inner),
+                                        started: Some(started),
+                                    }
+                                }
                                 Err(error) => PlanInstallOutcome::Reject {
                                     epoch: inner.safety.epoch_id(),
                                     error: error.into(),
@@ -915,6 +944,7 @@ pub(super) fn spawn_macro_check(
     recv_connection: &str,
     worker_tasks: &ConnectionTasks,
 ) -> MacroCheck {
+    let command_path = pending.command_path();
     let source = recv_deps.source.clone();
     let cancel = worker_closing.clone();
     let plan_conn = recv_connection.to_string();
@@ -954,6 +984,7 @@ pub(super) fn spawn_macro_check(
     });
     MacroCheck {
         request_id,
+        command_path,
         generation,
         stamp,
         abort: AbortOnDrop(abort),
@@ -1003,6 +1034,7 @@ pub(super) async fn complete_pending_replay(
     let gate = CommandReplyGateGuard::enter(command_reply_pending, recv_supervisor.hub());
     let outcome = {
         let mut inner = recv_supervisor.inner().write().await;
+        inner.set_command("/api/v1/action/replay");
         if worker_closing.load(Ordering::SeqCst) {
             ReplayInstallOutcome::Closed
         } else if inner.detached {
@@ -1036,10 +1068,13 @@ pub(super) async fn complete_pending_replay(
                             .map_err(ArmError::from)
                             .and_then(|admitted| SupervisorInner::install_replay(admitted, plan))
                         {
-                            Ok(started) => ReplayInstallOutcome::Ack {
-                                snap: AckSnapshot::from_inner(&inner),
-                                started: Some(started),
-                            },
+                            Ok(started) => {
+                                inner.set_action_id(started.0);
+                                ReplayInstallOutcome::Ack {
+                                    snap: AckSnapshot::from_inner(&inner),
+                                    started: Some(started),
+                                }
+                            }
                             Err(error) => ReplayInstallOutcome::Reject {
                                 epoch: inner.safety.epoch_id(),
                                 error: error.into(),

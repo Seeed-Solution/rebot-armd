@@ -44,6 +44,10 @@ pub struct HoldRecord {
     pub kind: HoldKind,
     /// Where `read()` / `write()` was called.
     pub location: &'static Location<'static>,
+    /// Static WS/command path attributed to this hold (zero allocation on hot path).
+    pub command: Option<&'static str>,
+    /// Action id created or installed under this hold, if any.
+    pub action_id: Option<u64>,
     /// `read()` / `write()` called.
     pub called: Instant,
     /// Guard handed to the caller.
@@ -95,8 +99,16 @@ struct Holds {
 }
 
 impl Holds {
-    fn record(&self, kind: HoldKind, location: &'static Location<'static>, called: Instant, acquired: Instant) {
-        let r = HoldRecord { kind, location, called, acquired, released: Instant::now() };
+    fn record(
+        &self,
+        kind: HoldKind,
+        location: &'static Location<'static>,
+        command: Option<&'static str>,
+        action_id: Option<u64>,
+        called: Instant,
+        acquired: Instant,
+    ) {
+        let r = HoldRecord { kind, location, command, action_id, called, acquired, released: Instant::now() };
         self.log.lock().unwrap_or_else(|e| e.into_inner()).add(r);
     }
 
@@ -171,7 +183,7 @@ impl<T> SupervisorLock<T> {
             site: "SupervisorLock::read",
             inner: async move {
                 let guard = self.lock.read().await;
-                SupReadGuard { guard: ManuallyDrop::new(guard), t: Timing { location, called, acquired: Instant::now() }, holds: &self.holds }
+                SupReadGuard { guard: ManuallyDrop::new(guard), t: Timing::new(location, called), holds: &self.holds }
             },
         }
     }
@@ -181,7 +193,7 @@ impl<T> SupervisorLock<T> {
         let (location, called) = (Location::caller(), Instant::now());
         self.holds.check_not_on_control_thread("SupervisorLock::try_read");
         let guard = self.lock.try_read()?;
-        Ok(SupReadGuard { guard: ManuallyDrop::new(guard), t: Timing { location, called, acquired: Instant::now() }, holds: &self.holds })
+        Ok(SupReadGuard { guard: ManuallyDrop::new(guard), t: Timing::new(location, called), holds: &self.holds })
     }
 
     #[track_caller]
@@ -194,7 +206,7 @@ impl<T> SupervisorLock<T> {
             inner: async move {
                 let guard = self.lock.write().await;
                 self.bump();
-                SupWriteGuard { guard: ManuallyDrop::new(guard), t: Timing { location, called, acquired: Instant::now() }, holds: &self.holds }
+                SupWriteGuard { guard: ManuallyDrop::new(guard), t: Timing::new(location, called), holds: &self.holds }
             },
         }
     }
@@ -205,7 +217,7 @@ impl<T> SupervisorLock<T> {
         self.holds.check_not_on_control_thread("SupervisorLock::try_write");
         let guard = self.lock.try_write()?;
         self.bump();
-        Ok(SupWriteGuard { guard: ManuallyDrop::new(guard), t: Timing { location, called, acquired: Instant::now() }, holds: &self.holds })
+        Ok(SupWriteGuard { guard: ManuallyDrop::new(guard), t: Timing::new(location, called), holds: &self.holds })
     }
 
     #[track_caller]
@@ -214,7 +226,7 @@ impl<T> SupervisorLock<T> {
         self.holds.check_not_on_control_thread("SupervisorLock::blocking_write");
         let guard = self.lock.blocking_write();
         self.bump();
-        SupWriteGuard { guard: ManuallyDrop::new(guard), t: Timing { location, called, acquired: Instant::now() }, holds: &self.holds }
+        SupWriteGuard { guard: ManuallyDrop::new(guard), t: Timing::new(location, called), holds: &self.holds }
     }
 
     #[track_caller]
@@ -228,7 +240,7 @@ impl<T> SupervisorLock<T> {
             inner: async move {
                 let guard = self.lock.clone().write_owned().await;
                 self.bump();
-                SupOwnedWriteGuard { guard: ManuallyDrop::new(guard), t: Timing { location, called, acquired: Instant::now() }, holds: self.holds.clone() }
+                SupOwnedWriteGuard { guard: ManuallyDrop::new(guard), t: Timing::new(location, called), holds: self.holds.clone() }
             },
         }
     }
@@ -262,8 +274,17 @@ impl<T> SupervisorLock<T> {
 #[derive(Clone, Copy)]
 struct Timing {
     location: &'static Location<'static>,
+    command: Option<&'static str>,
+    action_id: Option<u64>,
     called: Instant,
     acquired: Instant,
+}
+
+impl Timing {
+    #[inline]
+    fn new(location: &'static Location<'static>, called: Instant) -> Self {
+        Self { location, command: None, action_id: None, called, acquired: Instant::now() }
+    }
 }
 
 pub struct SupReadGuard<'a, T> {
@@ -274,7 +295,7 @@ pub struct SupReadGuard<'a, T> {
 
 impl<T> Drop for SupReadGuard<'_, T> {
     fn drop(&mut self) {
-        self.holds.record(HoldKind::Read, self.t.location, self.t.called, self.t.acquired);
+        self.holds.record(HoldKind::Read, self.t.location, self.t.command, self.t.action_id, self.t.called, self.t.acquired);
         // SAFETY: dropped once, here; the field is not used afterwards.
         unsafe { ManuallyDrop::drop(&mut self.guard) };
     }
@@ -291,9 +312,23 @@ pub struct SupWriteGuard<'a, T> {
     holds: &'a Holds,
 }
 
+impl<T> SupWriteGuard<'_, T> {
+    /// Attribute this write-lock hold to a static command path (zero allocation).
+    #[inline]
+    pub fn set_command(&mut self, command: &'static str) {
+        self.t.command = Some(command);
+    }
+
+    /// Attribute this write-lock hold to the action id created or installed under it (zero allocation).
+    #[inline]
+    pub fn set_action_id(&mut self, action_id: u64) {
+        self.t.action_id = Some(action_id);
+    }
+}
+
 impl<T> Drop for SupWriteGuard<'_, T> {
     fn drop(&mut self) {
-        self.holds.record(HoldKind::Write, self.t.location, self.t.called, self.t.acquired);
+        self.holds.record(HoldKind::Write, self.t.location, self.t.command, self.t.action_id, self.t.called, self.t.acquired);
         // SAFETY: dropped once, here; the field is not used afterwards.
         unsafe { ManuallyDrop::drop(&mut self.guard) };
     }
@@ -314,9 +349,23 @@ pub struct SupOwnedWriteGuard<T> {
     holds: Arc<Holds>,
 }
 
+impl<T> SupOwnedWriteGuard<T> {
+    /// Attribute this write-lock hold to a static command path (zero allocation).
+    #[inline]
+    pub fn set_command(&mut self, command: &'static str) {
+        self.t.command = Some(command);
+    }
+
+    /// Attribute this write-lock hold to the action id created or installed under it (zero allocation).
+    #[inline]
+    pub fn set_action_id(&mut self, action_id: u64) {
+        self.t.action_id = Some(action_id);
+    }
+}
+
 impl<T> Drop for SupOwnedWriteGuard<T> {
     fn drop(&mut self) {
-        self.holds.record(HoldKind::Write, self.t.location, self.t.called, self.t.acquired);
+        self.holds.record(HoldKind::Write, self.t.location, self.t.command, self.t.action_id, self.t.called, self.t.acquired);
         // SAFETY: dropped once, here; the field is not used afterwards.
         unsafe { ManuallyDrop::drop(&mut self.guard) };
     }
@@ -407,5 +456,31 @@ mod tests {
         let log = lock.take_log().unwrap();
         assert!(log.writer_acquire >= Duration::from_millis(5), "{log:?}");
         assert_eq!(log.slowest_acquire.unwrap().kind, HoldKind::Write);
+    }
+
+    #[tokio::test]
+    async fn write_guard_records_static_command_and_action_id() {
+        let lock = Arc::new(SupervisorLock::new(0u32));
+        {
+            let mut g = lock.write().await;
+            g.set_command("/api/v1/motion/jog");
+            g.set_action_id(77);
+            *g += 1;
+        }
+        let log = lock.take_log().unwrap();
+        let last = log.last_release.unwrap();
+        assert_eq!(last.kind, HoldKind::Write);
+        assert_eq!(last.command, Some("/api/v1/motion/jog"));
+        assert_eq!(last.action_id, Some(77));
+        {
+            let mut g = lock.clone().write_owned().await;
+            g.set_command("/api/v1/motion/home");
+            g.set_action_id(88);
+            *g += 1;
+        }
+        let log2 = lock.take_log().unwrap();
+        let last2 = log2.longest.unwrap();
+        assert_eq!(last2.command, Some("/api/v1/motion/home"));
+        assert_eq!(last2.action_id, Some(88));
     }
 }

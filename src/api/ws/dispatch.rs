@@ -46,6 +46,23 @@ pub(super) enum FrameKind {
     Unknown,
 }
 
+impl FrameKind {
+    pub(super) const fn as_static_str(self) -> &'static str {
+        match self {
+            Self::EStop => "estop",
+            Self::Auth => "auth",
+            Self::Heartbeat => "heartbeat",
+            Self::AcquireLease => "acquire_lease",
+            Self::ReleaseLease => "release_lease",
+            Self::Command => "command",
+            Self::Preset => "preset",
+            Self::Servo => "servo",
+            Self::ImplicitServo => "implicit_servo",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// Primary lookup key in the unified WS dispatch table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct DispatchKey {

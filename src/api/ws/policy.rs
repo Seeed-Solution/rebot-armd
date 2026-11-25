@@ -126,6 +126,7 @@ impl Drop for PolicyLoadingGuard {
             return;
         };
         if let Ok(mut inner) = sup.inner().try_write() {
+            inner.set_command("/api/v1/action/policy/start");
             if !inner.detached {
                 inner.policy_loading = false;
             }
@@ -135,6 +136,7 @@ impl Drop for PolicyLoadingGuard {
             Ok(h) => {
                 h.spawn(async move {
                     let mut inner = sup.inner().write().await;
+                    inner.set_command("/api/v1/action/policy/start");
                     if !inner.detached {
                         inner.policy_loading = false;
                     }
@@ -142,6 +144,7 @@ impl Drop for PolicyLoadingGuard {
             }
             Err(_) => {
                 let mut inner = sup.inner().blocking_write();
+                inner.set_command("/api/v1/action/policy/start");
                 if !inner.detached {
                     inner.policy_loading = false;
                 }
@@ -327,6 +330,7 @@ pub(super) fn spawn_policy_start(
 
         if ws_closed_c.load(Ordering::SeqCst) {
             let mut inner = sup.inner().write().await;
+            inner.set_command("/api/v1/action/policy/start");
             loading_guard.clear(&mut inner);
             return;
         }
@@ -355,6 +359,7 @@ pub(super) fn spawn_policy_start(
             Err(e) => {
                 let epoch = {
                     let mut inner = sup.inner().write().await;
+                    inner.set_command("/api/v1/action/policy/start");
                     loading_guard.clear(&mut inner);
                     inner.safety.epoch_id()
                 };
@@ -366,6 +371,7 @@ pub(super) fn spawn_policy_start(
             Ok(Err(error)) => {
                 let epoch = {
                     let mut inner = sup.inner().write().await;
+                    inner.set_command("/api/v1/action/policy/start");
                     loading_guard.clear(&mut inner);
                     inner.safety.epoch_id()
                 };
@@ -389,6 +395,7 @@ pub(super) fn spawn_policy_start(
                 maybe_pause_worker_before_lock(&conn).await;
 
                 let mut inner = sup.inner().write().await;
+                inner.set_command("/api/v1/action/policy/start");
                 loading_guard.clear(&mut inner);
                 if ws_closed_c.load(Ordering::SeqCst) || inner.is_connection_closed(recv_conn_id) {
                     PolicyStartOutcome::Closed
@@ -461,14 +468,17 @@ pub(super) fn spawn_policy_start(
                                     .and_then(|admitted| {
                                         SupervisorInner::begin_policy_run(admitted, start_req)
                                     }) {
-                                    Ok(action_id) => PolicyStartOutcome::Started {
-                                        snap: AckSnapshot::from_inner(&inner),
-                                        action_id,
-                                        prepared_policy,
-                                        fps,
-                                        deadline,
-                                        speed,
-                                    },
+                                    Ok(action_id) => {
+                                        inner.set_action_id(action_id);
+                                        PolicyStartOutcome::Started {
+                                            snap: AckSnapshot::from_inner(&inner),
+                                            action_id,
+                                            prepared_policy,
+                                            fps,
+                                            deadline,
+                                            speed,
+                                        }
+                                    }
                                     Err(error) => PolicyStartOutcome::Reject {
                                         epoch: inner.safety.epoch_id(),
                                         error: error.into(),

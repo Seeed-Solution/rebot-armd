@@ -10701,8 +10701,10 @@ impl ArmSupervisor {
                 })
             }
             OWNER_LEGACY => {
+                let cmd_label = req.command_label();
                 let mut ex = ConfigExchange::new(req);
                 let mut inner = self.inner.write().await;
+                inner.set_command(cmd_label);
                 if inner.detached {
                     drop(inner);
                     let req = ex.req.take().expect("request still present");
@@ -10797,8 +10799,10 @@ impl ArmSupervisor {
                     }
                 }
                 OWNER_LEGACY => {
+                    let cmd_label = req.command_label();
                     let mut ex = ConfigExchange::new(req);
                     let mut inner = self.inner.write().await;
+                    inner.set_command(cmd_label);
                     if inner.detached {
                         drop(inner);
                         req = ex.req.take().expect("request still present");
@@ -11941,6 +11945,7 @@ impl ArmSupervisor {
         match self.owner_mode() {
             OWNER_LEGACY => {
                 let mut inner = self.inner.write().await;
+                inner.set_command("acquire_lease");
                 self.check_legacy_under_guard(&inner)?;
                 let ctx = LeaseInstallCtx {
                     expected_arm: inner.core.id(),
@@ -12017,6 +12022,7 @@ impl ArmSupervisor {
         match self.owner_mode() {
             OWNER_LEGACY => {
                 let mut inner = self.inner.write().await;
+                inner.set_command("acquire_lease");
                 self.check_legacy_under_guard(&inner)?;
                 let ctx = LeaseInstallCtx {
                     expected_arm: inner.core.id(),
@@ -12089,6 +12095,7 @@ impl ArmSupervisor {
         match self.owner_mode() {
             OWNER_LEGACY => {
                 let mut inner = self.inner.write().await;
+                inner.set_command("release_lease");
                 self.check_legacy_under_guard(&inner)?;
                 let ctx = LeaseInstallCtx {
                     expected_arm: inner.core.id(),
@@ -12198,6 +12205,7 @@ impl ArmSupervisor {
             } => match self.owner_mode() {
                 OWNER_LEGACY => {
                     let mut inner = self.inner.write().await;
+                    inner.set_command("heartbeat");
                     self.check_legacy_under_guard(&inner)?;
                     install_legacy_heartbeat(
                         &mut inner,
@@ -12356,6 +12364,7 @@ impl ArmSupervisor {
         match self.owner_mode() {
             OWNER_LEGACY => {
                 let mut inner = self.inner.write().await;
+                inner.set_command("/api/v1/torque");
                 self.check_legacy_under_guard(&inner)?;
                 if let Err(err) = check_torque_owner_preflight(
                     &mut inner,
@@ -12561,6 +12570,7 @@ impl ArmSupervisor {
         match self.owner_mode() {
             OWNER_LEGACY => {
                 let mut inner = self.inner.write().await;
+                inner.set_command("/api/v1/safety/clear_fault");
                 self.check_legacy_under_guard(&inner)?;
                 let res = install_lease_clear_fault_legacy(
                     &mut inner,
@@ -12767,6 +12777,11 @@ impl ArmSupervisor {
                 .await
                 .map_err(|e| ArmError::Internal(format!("motion planner failed: {e}")))?;
             let mut inner = self.inner.write().await;
+            inner.set_command(match request.kind {
+                req::MotionKind::Jog => "/api/v1/motion/jog",
+                req::MotionKind::Home => "/api/v1/motion/home",
+                req::MotionKind::Park => "/api/v1/motion/unload",
+            });
             self.check_legacy_under_guard(&inner)?;
             if let Some(hook) = inner.before_install_hook.take() { hook(&mut inner); }
             let plan = prepared?;
@@ -12776,7 +12791,14 @@ impl ArmSupervisor {
                 req::MotionKind::Park => req::install_park(&mut inner, stamp, &plan.slot, plan.heap_traj, epoch_id, false),
             };
             match res {
-                Ok(installed) => return Ok(installed.epoch()),
+                Ok(installed) => {
+                    let aid = match installed {
+                        req::MotionInstalled::Started { action_id, .. }
+                        | req::MotionInstalled::DeferredContinuation { action_id, .. } => action_id,
+                    };
+                    inner.set_action_id(aid);
+                    return Ok(installed.epoch());
+                }
                 Err(req::MotionInstallError::StartDrifted) if attempt + 1 < MAX_RETRIES => {
                     if Instant::now() > snapshot.authority.deadline {
                         return Err(req::MotionInstallError::DeadlineExpired.into_arm_error(&inner, request.action_kind, epoch_id));
@@ -13456,6 +13478,8 @@ impl ArmSupervisor {
             crate::diagnostics::tick::Holder {
                 kind: r.kind.as_str(),
                 location: r.location,
+                command: r.command,
+                action_id: r.action_id,
                 hold_us: us(r.hold()),
                 acquire_us: us(r.acquire()),
                 acquired_before_wait_us: signed(started, r.acquired),

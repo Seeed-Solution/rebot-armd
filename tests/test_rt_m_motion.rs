@@ -2559,3 +2559,137 @@ async fn r3_deferred_park_enforces_original_deadline_on_both_owners() {
         drop(handle);
     }
 }
+
+// ============================================================================
+// 11. Per-Command Lock Attribution in /api/v1/diagnostics/tick (Zero-Alloc Hot Path)
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_lock_attribution_records_static_command_and_action_id_in_tick_diagnostics_zero_alloc() {
+    use armd::diagnostics::alloc::{snapshot_counts, time_this_thread};
+    use armd::diagnostics::tick::{Holder, LockFreeTickStats, TickSample};
+    use armd::supervisor_lock::SupervisorLock;
+
+    // 11a. Strictly zero heap allocations/frees on the lock-attribution hot path:
+    //      set_command + set_action_id + guard drop -> HoldLog -> take_log -> LockFreeTickStats::record.
+    {
+        let (counts, longest) = std::thread::spawn(|| {
+            let lock = SupervisorLock::new(0u64);
+            let lf = LockFreeTickStats::new();
+            let loc = std::panic::Location::caller();
+            time_this_thread();
+            let before = snapshot_counts();
+            {
+                let mut w = lock.try_write().expect("uncontended try_write");
+                w.set_command("/api/v1/motion/jog");
+                w.set_action_id(123);
+                *w += 1;
+            }
+            let log = lock.take_log().expect("take_log");
+            let r = log.last_release.expect("recorded hold");
+            let h = Holder {
+                kind: r.kind.as_str(),
+                location: loc,
+                command: r.command,
+                action_id: r.action_id,
+                hold_us: 10,
+                acquire_us: 1,
+                acquired_before_wait_us: 0,
+                released_before_lock_us: 0,
+            };
+            let ok = lf.record(&TickSample {
+                tick_us: 50,
+                lock_us: 20,
+                waited_for: Some(h),
+                longest_hold: Some(h),
+                ..Default::default()
+            });
+            let delta = snapshot_counts().delta_since(before);
+            assert!(ok);
+            let snap = lf.snapshot();
+            (delta, snap.max_tick.unwrap().sample.longest_hold.unwrap())
+        })
+        .join()
+        .unwrap();
+        assert_eq!(counts, AllocCounts::ZERO, "lock attribution hot path must allocate 0 bytes");
+        assert_eq!(longest.command, Some("/api/v1/motion/jog"));
+        assert_eq!(longest.action_id, Some(123));
+    }
+
+    // 11b. Real WS + HTTP GET /api/v1/diagnostics/tick: verify lock breakdowns name the WS
+    //      command path and action_id when the tick observes/waits on a WS write hold.
+    {
+        let cfg = dm_config_with_planning_load();
+        let mut q0 = cfg.home_positions.clone();
+        q0[0] += 0.20;
+        let sup = Arc::new(ArmSupervisor::new(cfg));
+        let (mut ws, gen, _, sup, addr) = common::torqued_rig(sup, &q0).await;
+        // Inject a 25 ms hold (> 20 ms tick period) inside Lock #2 of `/api/v1/motion/jog` so
+        // the 50 Hz control tick deterministically blocks on this write guard, guaranteeing that
+        // `max_tick` in `GET /api/v1/diagnostics/tick` names `/api/v1/motion/jog` and its action_id
+        // in both `waited_for` and `longest_hold`.
+        {
+            let mut inner = sup.inner().write().await;
+            inner.before_install_hook = Some(Box::new(|_| {
+                std::thread::sleep(Duration::from_millis(25));
+            }));
+        }
+        let ep = sup.get_observation().await.epoch_id;
+        let mut jog_t = q0.clone();
+        jog_t[0] -= 0.08;
+        let ack = common::rpc(
+            &mut ws,
+            gen,
+            ep,
+            "/api/v1/motion/jog",
+            json!({"target_positions": jog_t, "duration_secs": 0.4}),
+        )
+        .await;
+        assert_eq!(ack["type"], "command_ack", "{ack}");
+        let action_id = ack["action_id"].as_u64().expect("jog action_id");
+        // Wait for at least two 50 Hz ticks so the hold log is drained into `LockFreeTickStats`.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let resp = reqwest::get(format!("http://{addr}/api/v1/diagnostics/tick"))
+            .await
+            .expect("GET /api/v1/diagnostics/tick");
+        assert!(resp.status().is_success());
+        let body: serde_json::Value = resp.json().await.expect("tick diagnostics JSON");
+
+        // Verify raw tick samples captured BOTH command path and action_id on the jog Lock #2 hold.
+        let samples = sup.tick_samples();
+        let jog_holder = samples
+            .iter()
+            .flat_map(|s| s.longest_hold.into_iter().chain(s.waited_for))
+            .find(|h| h.command == Some("/api/v1/motion/jog") && h.action_id == Some(action_id));
+        assert!(
+            jog_holder.is_some(),
+            "expected tick_samples to attribute /api/v1/motion/jog action_id={action_id}; samples={:?}",
+            samples
+                .iter()
+                .filter_map(|s| s.longest_hold.map(|h| (h.command, h.action_id, h.hold_us)))
+                .collect::<Vec<_>>()
+        );
+
+        // Verify the HTTP JSON lock breakdowns (`max_tick` / `max_release`) expose `command` and `action_id`.
+        let mt = &body["max_tick"];
+        let breakdown_holder = mt
+            .get("longest_hold")
+            .filter(|h| h.get("command").and_then(|c| c.as_str()) == Some("/api/v1/motion/jog"))
+            .or_else(|| {
+                mt.get("waited_for")
+                    .filter(|h| h.get("command").and_then(|c| c.as_str()) == Some("/api/v1/motion/jog"))
+            })
+            .or_else(|| {
+                body["max_release"]
+                    .get("longest_hold")
+                    .filter(|h| h.get("command").and_then(|c| c.as_str()) == Some("/api/v1/motion/jog"))
+            });
+        let h_json = breakdown_holder.unwrap_or_else(|| {
+            panic!("expected /api/v1/diagnostics/tick lock breakdown to name /api/v1/motion/jog; body={body}")
+        });
+        assert_eq!(h_json["command"], "/api/v1/motion/jog", "{h_json}");
+        assert_eq!(h_json["action_id"], action_id, "{h_json}");
+        assert_eq!(h_json["kind"], "write", "{h_json}");
+    }
+}

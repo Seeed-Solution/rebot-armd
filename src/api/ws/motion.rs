@@ -63,6 +63,7 @@ pub(super) enum MotionReplyKind {
 }
 
 pub(super) struct PendingMotion {
+    command_path: &'static str,
     reply_kind: MotionReplyKind,
     request: req::MotionRequest,
     snapshot: req::MotionPlanSnapshot,
@@ -147,7 +148,7 @@ fn dispatch_preset(ctx: &mut OwnerDispatchCtx<'_>) -> Option<OwnerReply> {
     match req::preflight_motion_request_at(ctx.inner, ctx.stamp, &request, Some(ctx.epoch), ctx.received_at) {
         Ok(snapshot) => {
             let reply_kind = MotionReplyKind::Preset { name };
-            *ctx.pending_motion = Some(PendingMotion { reply_kind, request, snapshot, epoch: ctx.epoch, generation: ctx.local_generation });
+            *ctx.pending_motion = Some(PendingMotion { command_path: "preset", reply_kind, request, snapshot, epoch: ctx.epoch, generation: ctx.local_generation });
             None
         }
         Err(e) => Some(OwnerReply::PresetReject {
@@ -193,10 +194,16 @@ fn dispatch_motion_command(ctx: &mut OwnerDispatchCtx<'_>) -> Option<OwnerReply>
             });
         }
     };
+    let command_path: &'static str = match ctx.path {
+        "/api/v1/motion/jog" => "/api/v1/motion/jog",
+        "/api/v1/motion/home" => "/api/v1/motion/home",
+        "/api/v1/motion/unload" => "/api/v1/motion/unload",
+        _ => "command",
+    };
     match req::preflight_motion_request_at(ctx.inner, ctx.stamp, &request, Some(ctx.epoch), ctx.received_at) {
         Ok(snapshot) => {
             let reply_kind = MotionReplyKind::Command { request_id: ctx.value["request_id"].clone() };
-            *ctx.pending_motion = Some(PendingMotion { reply_kind, request, snapshot, epoch: ctx.epoch, generation: ctx.local_generation });
+            *ctx.pending_motion = Some(PendingMotion { command_path, reply_kind, request, snapshot, epoch: ctx.epoch, generation: ctx.local_generation });
             None
         }
         Err(e) => Some(OwnerReply::CommandReject {
@@ -237,7 +244,7 @@ pub(super) async fn complete_pending_motion(
         RetryDrift(req::MotionPlanSnapshot),
     }
 
-    let PendingMotion { reply_kind, request, mut snapshot, epoch, generation } = pending;
+    let PendingMotion { command_path, reply_kind, request, mut snapshot, epoch, generation } = pending;
     for attempt in 0..MAX_START_DRIFT_RETRIES {
         let snap_for_plan = snapshot.clone();
         let req_for_plan = request.clone();
@@ -267,6 +274,7 @@ pub(super) async fn complete_pending_motion(
         let gate = CommandReplyGateGuard::enter(command_reply_pending, recv_supervisor.hub());
         let step = {
             let mut inner = recv_supervisor.inner().write().await;
+            inner.set_command(command_path);
             if worker_closing.load(Ordering::SeqCst) {
                 InstallStep::Closed
             } else if inner.detached {
@@ -296,12 +304,14 @@ pub(super) async fn complete_pending_motion(
                             };
                             match installed {
                                 Ok(req::MotionInstalled::Started { action_id, expected_duration_s, .. }) => {
+                                    inner.set_action_id(action_id);
                                     InstallStep::Ack {
                                         snap: AckSnapshot::from_inner(&inner),
                                         started: Some((action_id, expected_duration_s)),
                                     }
                                 }
                                 Ok(req::MotionInstalled::DeferredContinuation { action_id, expected_duration_s, .. }) => {
+                                    inner.set_action_id(action_id);
                                     let notify = Arc::clone(&inner.park_continuation_notify);
                                     let deadline = inner.park_continuation.map_or(snapshot.authority.deadline, |c| c.deadline);
                                     InstallStep::DeferredParkAck {
@@ -400,6 +410,8 @@ fn spawn_park_continuation(
             let expired = Instant::now() > deadline;
             if disconnected || expired {
                 let mut inner = supervisor.inner().write().await;
+                inner.set_command("/api/v1/motion/unload");
+                inner.set_action_id(action_id);
                 if !inner.detached {
                     let (code, text) = if expired {
                         ("DEADLINE_EXPIRED", "Park continuation exceeded original request deadline")
@@ -439,6 +451,8 @@ fn spawn_park_continuation(
                 Some(req::prepare_motion(&snap, &req::MotionRequest::park()))
             }).await;
             let mut inner = supervisor.inner().write().await;
+            inner.set_command("/api/v1/motion/unload");
+            inner.set_action_id(action_id);
             if inner.detached { return; }
             if inner.current_stop_gen() != request_stop_gen
                 || !inner.park_continuation.is_some_and(|c| c.action_id == action_id)

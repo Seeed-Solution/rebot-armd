@@ -2559,9 +2559,10 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     continue;
                 }
                 joined = async { (&mut macro_check.as_mut().expect("guarded by the precondition").rx).await }, if macro_active => {
-                    let MacroCheck { request_id, generation, stamp, .. } = macro_check.take().expect("checked above");
+                    let MacroCheck { request_id, command_path, generation, stamp, .. } = macro_check.take().expect("checked above");
                     let Some((reply, macro_gate)) = actions::complete_macro_check(
                         request_id,
+                        command_path,
                         generation,
                         stamp,
                         joined,
@@ -2809,9 +2810,13 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             let mut pending_config_write: Option<config::PendingConfigJob> = None;
             let mut pending_calibration: Option<(Value, CalibJob, u64, u64, bool)> = None;
             maybe_pause_worker_before_lock(&recv_connection).await;
+            let command_label: &'static str = entry
+                .and_then(|e| e.key.path)
+                .unwrap_or_else(|| frame_kind.as_static_str());
             let mut reply_gate_guard;
             let lock1_reply: Option<dispatch::OwnerReply> = {
                 let mut inner = recv_supervisor.inner().write().await;
+                inner.set_command(command_label);
                 if inner.detached {
                     drop(inner);
                     if let Some(reply) = executor_routing_reject(&value, recv_supervisor.owner_mode()) {
@@ -2819,6 +2824,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     }
                     continue;
                 }
+                let prev_action_id = inner.last_action.as_ref().map(|a| a.id);
                 reply_gate_guard = Some(CommandReplyGateGuard::enter(
                     &worker_command_reply_pending,
                     recv_supervisor.hub(),
@@ -2859,7 +2865,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 let missing_gen = (entry.is_some_and(|e| e.lease == LeaseRequirement::RequiredExplicitGeneration)
                     && value.get("generation").and_then(Value::as_u64).is_none())
                     || servo::is_missing_generation(raw_kind, &value);
-                if missing_gen {
+                let out = if missing_gen {
                     Some(dispatch::OwnerReply::ServoRejectReason("missing_generation"))
                 } else if !authorized && !is_dry_run {
                     let reason = if raw_kind != "command" && raw_kind != "release_lease" && local_generation != 0 {
@@ -2930,7 +2936,28 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     } else {
                         None
                     }
+                };
+                let started_action_id = match &out {
+                    Some(
+                        dispatch::OwnerReply::CommandAck {
+                            started: Some((aid, _)),
+                            ..
+                        }
+                        | dispatch::OwnerReply::CommandAckJob {
+                            started: Some((aid, _)),
+                            ..
+                        },
+                    ) => Some(*aid),
+                    _ => inner
+                        .last_action
+                        .as_ref()
+                        .map(|a| a.id)
+                        .filter(|&id| Some(id) != prev_action_id),
+                };
+                if let Some(aid) = started_action_id {
+                    inner.set_action_id(aid);
                 }
+                out
             };
             // Write guard is now released; format every immediate WS reply strictly off-lock and
             // enqueue it onto `ordinary_tx` while `reply_gate_guard` stays active so any terminal
