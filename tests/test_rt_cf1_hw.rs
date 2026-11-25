@@ -2269,4 +2269,45 @@ async fn mit_timeout_disarmed_idle_silent_axis_rejected_zero_writes() {
     assert_eq!(rig.hold_state().await, None);
     rig.assert_zero_alloc("disarmed idle silent axis");
     rig.shutdown().await;
+
+    // Subcase B (Blocker regression): J4 stops replying right before WriteTimeout while its
+    // pre-existing K=3 rest window is STILL fresh (< 100 ms). GatherRestEvidence MUST require a
+    // causal post-probe reply from every arm axis and refuse with 0 writes instead of reusing
+    // pre-gather cached samples.
+    let rig2 = HwRig::new(RtOwner::Executor, true, None, |_| {}).await;
+    // Stop the artificial feeder and immediately silence J4 while its K=3 window is fresh (< 40 ms).
+    rig2.feeder_stop.store(true, Ordering::Release);
+    tokio::time::sleep(Duration::from_millis(12)).await;
+    rig2.bus.with(|s| {
+        s.motors[3].silent = true;
+    });
+    let mut ws2 = rig2.connect_ws().await;
+    let (gen2, epoch2) = ws_acquire_lease(&mut ws2, "c-silent-fresh-cache").await;
+    rig2.bus.clear_log();
+    let err2 = ws_cmd(
+        &mut ws2,
+        1,
+        gen2,
+        epoch2,
+        mit::TIMEOUT_PATH,
+        json!({ "joints": [1], "timeout_counts": 2000, "dry_run": false }),
+    )
+    .await;
+    assert_eq!(
+        err2["type"], "command_reject",
+        "newly silent J4 with still-fresh cached K=3 window MUST be rejected: {err2}"
+    );
+    let log2 = rig2.bus.tx_log();
+    assert_no_flash_write(&log2);
+    assert!(
+        !log2
+            .iter()
+            .any(|f| f.id == 0x7FF && f.data[2] == damiao::REG_WRITE),
+        "newly silent axis must emit 0 REG_WRITE frames"
+    );
+    assert_eq!(rig2.bus.with(|s| s.motors[0].reg_u32(damiao::RID_TIMEOUT)), 0);
+    assert!(!pending_commit_marker_path(&rig2.calib_path).exists());
+    assert_eq!(rig2.hold_state().await, None);
+    rig2.assert_zero_alloc("newly silent axis cached-window regression");
+    rig2.shutdown().await;
 }
