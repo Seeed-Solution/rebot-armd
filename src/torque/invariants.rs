@@ -1218,9 +1218,7 @@ fn check_thermal_and_panic_invariants(
                 }
                 if !matches!(
                     dcmd.origin,
-                    DisableOrigin::ProtectiveThermal
-                        | DisableOrigin::ProtectivePanicBusLoss
-                        | DisableOrigin::ProtectiveProcessExit
+                    DisableOrigin::ProtectiveThermal | DisableOrigin::ProtectiveProcessExit
                 ) {
                     return Err(Violation::new(
                         ViolationKind::SafeHoldEmittedDisallowedDisable,

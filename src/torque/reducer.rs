@@ -588,20 +588,17 @@ fn handle_release(state: &mut TorqueState, now_us: u64, actions: &mut ActionSet)
             continue;
         }
 
-        // 2. Tier-2 SafeHold bus-loss trip (per-device timer crossed limit, B11).
+        // 2. Tier-2 SafeHold bus-loss trip (per-device timer crossed limit, B11):
+        // DRV-F1 governing rule: protective disable is ONLY for Thermal and ProcessExit.
+        // Bus loss alone latches a non-recoverable BusLoss fault and leaves holding unconfirmed
+        // (SafeHold continues emitting holds / HeldStaleTarget; zero protective disable).
         if tripped_safe_hold_groups.contains(g)
             && state.groups[gi].drive_state == DriveState::SafeHold
             && state.groups[gi].torque_intent == TorqueIntent::On
             && state.groups[gi].disable_tx.is_none()
+            && !state.groups[gi].faults.contains(TorqueFaultKind::BusLoss)
         {
-            trigger_protective_disable(
-                state,
-                g,
-                DisableOrigin::ProtectivePanicBusLoss,
-                now_us,
-                actions,
-            );
-            continue;
+            latch_non_protective_fault(state, g, TorqueFaultKind::BusLoss, now_us, actions);
         }
 
         // 3. Enable deadline expiry.

@@ -725,6 +725,41 @@ pub(crate) struct DeferredActionDone {
     pub(crate) is_gripper: bool,
 }
 
+/// Result of staging a per-release driver TX deadline cap using conservative driver-clock-first,
+/// live-owner-clock-second translation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DriverTxCapOutcome {
+    /// A strictly live deadline (`owner_now < owner_cutoff`) was staged on the driver.
+    Installed,
+    /// No driver attached (or non-blocking try_lock contended); no deadline staged.
+    NotInstalled,
+    /// Owner cutoff already expired (`owner_now >= owner_cutoff`) before staging; zero deadline
+    /// staged and callers must skip budgeted TX.
+    Expired,
+}
+
+/// Conservative driver-clock-first, live-owner-clock-second cutoff translation shared by
+/// periodic TX, RX recovery, release caps, torque transitions, and budgeted `clear_fault`.
+///
+/// Samples `drv.clock_now()` FIRST and `now_fn()` SECOND so driver-lock wait or clock latency can
+/// never add time back to the cutoff. Returns `Err((drv_now, owner_now))` when already expired
+/// (`owner_now >= owner_cutoff`) so callers reject expired cutoffs before staging any driver
+/// deadline.
+#[inline]
+pub(crate) fn translate_driver_cutoff_conservative(
+    drv: &dyn ArmDriver,
+    owner_cutoff: Instant,
+    now_fn: &mut dyn FnMut() -> Instant,
+) -> Result<(Instant, Instant, Instant), (Instant, Instant)> {
+    let drv_now = drv.clock_now();
+    let owner_now = now_fn();
+    if owner_now >= owner_cutoff {
+        return Err((drv_now, owner_now));
+    }
+    let remaining = owner_cutoff.saturating_duration_since(owner_now);
+    Ok((drv_now, owner_now, drv_now + remaining))
+}
+
 /// Single per-tick TX cutoff computed ONCE in the owner:
 /// `drv_effective = min(control-release deadline, active action/macro parent & child deadlines)`
 /// translated into the driver clock domain and installed at the driver TX choke point.
@@ -7338,26 +7373,30 @@ impl SupervisorInner {
         crate::driver::DAMIAO_TX_RELEASE_PUBLISH_MARGIN.min(period / 2)
     }
 
-    /// Installs `driver.set_tx_release_deadline(Some(cap))` for `(now, release_deadline)` and
-    /// returns `true` when a driver cap was installed.
-    pub(crate) fn install_driver_tx_release_cap(
+    /// Installs `driver.set_tx_release_deadline(Some(cap))` using conservative driver-clock-first,
+    /// live-owner-clock-second translation, refusing expired cutoffs BEFORE staging any deadline.
+    pub(crate) fn install_driver_tx_release_cap_with_clock(
         &mut self,
-        now: Instant,
         release_deadline: Instant,
-    ) -> bool {
+        now_fn: &mut dyn FnMut() -> Instant,
+    ) -> DriverTxCapOutcome {
         let margin = self.tx_release_publish_margin();
-        let remaining = release_deadline
-            .saturating_duration_since(now)
-            .saturating_sub(margin);
+        let Some(owner_cap) = release_deadline.checked_sub(margin) else {
+            return DriverTxCapOutcome::Expired;
+        };
         let Some(d) = self.driver.as_mut() else {
-            return false;
+            return DriverTxCapOutcome::NotInstalled;
         };
         d.try_with_mut(|driver| {
-            let cap = driver.clock_now() + remaining;
-            driver.set_tx_release_deadline(Some(cap));
-            true
+            match translate_driver_cutoff_conservative(driver, owner_cap, now_fn) {
+                Ok((_, _, cap)) => {
+                    driver.set_tx_release_deadline(Some(cap));
+                    DriverTxCapOutcome::Installed
+                }
+                Err(_) => DriverTxCapOutcome::Expired,
+            }
         })
-        .unwrap_or(false)
+        .unwrap_or(DriverTxCapOutcome::NotInstalled)
     }
 
     /// Clears any active per-release TX deadline cap on the attached driver.
@@ -7397,42 +7436,69 @@ impl SupervisorInner {
         budget: &crate::rt_core::ops::ServiceBudget,
         release_deadline: Option<Instant>,
     ) -> crate::rt_core::ops::HardwarePoll {
+        let entry_wall = Instant::now();
+        let mut live_now = || budget.now + Instant::now().saturating_duration_since(entry_wall);
+        self.poll_hardware_with_release_deadline_with_clock(budget, release_deadline, &mut live_now)
+    }
+
+    pub(crate) fn poll_hardware_with_release_deadline_with_clock(
+        &mut self,
+        budget: &crate::rt_core::ops::ServiceBudget,
+        release_deadline: Option<Instant>,
+        now_fn: &mut dyn FnMut() -> Instant,
+    ) -> crate::rt_core::ops::HardwarePoll {
         self.control_release_seq = self.control_release_seq.wrapping_add(1).max(1);
         let was_thermal_active = self.thermal_protection_active();
         // Install the release publish-margin TX cap BEFORE enable-transition polling, background
         // disable polling, and RX feedback intake so every TX in Step 2 obeys the same cutoff.
-        let applied_step2_tx_cap = release_deadline
-            .is_some_and(|rd| self.install_driver_tx_release_cap(budget.now, rd));
-        let trans = self.service_torque_transition(budget);
+        // If the release cutoff has already expired, stage ZERO driver deadline and skip budgeted
+        // Step-2 TX/poll work cleanly (`budget_exhausted = true`).
+        let cap_outcome = match release_deadline {
+            Some(rd) => self.install_driver_tx_release_cap_with_clock(rd, now_fn),
+            None => DriverTxCapOutcome::NotInstalled,
+        };
+        let applied_step2_tx_cap = cap_outcome == DriverTxCapOutcome::Installed;
+        let release_cap_expired = cap_outcome == DriverTxCapOutcome::Expired;
         let mut park_wake = None;
         let mut park_state_changed = false;
-        let transition_rx = if let Some(tp) = trans {
-            if tp.broker_owned {
-                self.core.begin_transition(tp.progress);
-            } else {
-                match tp.progress {
-                    Ok(crate::rt_core::ops::TorqueProgress::Pending { wake }) => park_wake = Some(wake),
-                    Ok(crate::rt_core::ops::TorqueProgress::Done) | Err(_) => park_state_changed = true,
-                }
-            }
-            tp.rx
+        let (rx_frames, rx_exhausted) = if release_cap_expired {
+            self.pending_rx_poll = PendingRxPoll {
+                active: true,
+                budget_exhausted: true,
+                ..PendingRxPoll::default()
+            };
+            (0, true)
         } else {
-            self.service_background_disable(budget)
+            let trans = self.service_torque_transition_with_clock(budget, now_fn);
+            let transition_rx = if let Some(tp) = trans {
+                if tp.broker_owned {
+                    self.core.begin_transition(tp.progress);
+                } else {
+                    match tp.progress {
+                        Ok(crate::rt_core::ops::TorqueProgress::Pending { wake }) => park_wake = Some(wake),
+                        Ok(crate::rt_core::ops::TorqueProgress::Done) | Err(_) => park_state_changed = true,
+                    }
+                }
+                tp.rx
+            } else {
+                self.service_background_disable_with_clock(budget, now_fn)
+            };
+            let rx = self.poll_hardware_rx_with_clock(Some(budget), transition_rx, None, now_fn);
+            if applied_step2_tx_cap {
+                self.clear_driver_tx_release_cap();
+            }
+            let rx_frames = rx.rx_frames;
+            let rx_exhausted = rx.budget_exhausted;
+            self.pending_rx_poll = rx;
+            (rx_frames, rx_exhausted)
         };
-        let rx = self.poll_hardware_rx(Some(budget), transition_rx, None);
-        if applied_step2_tx_cap {
-            self.clear_driver_tx_release_cap();
-        }
-        let rx_frames = rx.rx_frames;
-        let rx_exhausted = rx.budget_exhausted;
-        self.pending_rx_poll = rx;
         // Run thermal protection BEFORE consuming background disable confirmation and before
         // Step 2b maintenance (`ClearFault`/`RequestShutdown`) or Step 3 command admission so an
         // over-temperature sample arriving on the same poll as confirmed disable or enabling
         // cannot suppress `ThermalTrip`.
         self.check_thermal_protection_inner(was_thermal_active, true);
         let _ = self.confirm_background_disable_if_ready();
-        let budget_exhausted = budget.now > budget.deadline || rx_exhausted;
+        let budget_exhausted = release_cap_expired || budget.now > budget.deadline || rx_exhausted;
         let Some(driver) = self.driver.as_ref() else {
             self.rt_j7_pf_gate = None;
             return crate::rt_core::ops::HardwarePoll {
@@ -7533,11 +7599,25 @@ impl SupervisorInner {
     /// and Step 4 targets see fresh feedback and Step 5 `tick_control` does not re-read the bus.
     /// Legacy callers invoking `tick_control` directly without a prior `poll_hardware` call this
     /// with `budget: None`.
+    #[cfg(test)]
     pub(crate) fn poll_hardware_rx(
         &mut self,
         budget: Option<&crate::rt_core::ops::ServiceBudget>,
         transition_rx: Option<(u16, bool)>,
         release_deadline: Option<Instant>,
+    ) -> PendingRxPoll {
+        let entry_wall = Instant::now();
+        let base = budget.map_or(entry_wall, |b| b.now);
+        let mut live_now = || base + Instant::now().saturating_duration_since(entry_wall);
+        self.poll_hardware_rx_with_clock(budget, transition_rx, release_deadline, &mut live_now)
+    }
+
+    pub(crate) fn poll_hardware_rx_with_clock(
+        &mut self,
+        budget: Option<&crate::rt_core::ops::ServiceBudget>,
+        transition_rx: Option<(u16, bool)>,
+        release_deadline: Option<Instant>,
+        now_fn: &mut dyn FnMut() -> Instant,
     ) -> PendingRxPoll {
         let mut out = PendingRxPoll { active: true, ..PendingRxPoll::default() };
         let mut new_motor_errors = None;
@@ -7551,37 +7631,54 @@ impl SupervisorInner {
                 if self.control_release_seq > 0 {
                     driver.begin_control_release(self.control_release_seq);
                 }
-                let applied_step2_tx_cap = if let (Some(b), Some(rd)) = (budget, release_deadline) {
-                    let drv_now = driver.clock_now();
-                    let remaining = rd.saturating_duration_since(b.now).saturating_sub(margin);
-                    driver.set_tx_release_deadline(Some(drv_now + remaining));
-                    true
+                let (applied_step2_tx_cap, release_cap_expired) =
+                    if let (Some(_), Some(rd)) = (budget, release_deadline) {
+                        match rd.checked_sub(margin) {
+                            Some(owner_cap) => {
+                                match translate_driver_cutoff_conservative(driver, owner_cap, now_fn) {
+                                    Ok((_, _, cap)) => {
+                                        driver.set_tx_release_deadline(Some(cap));
+                                        (true, false)
+                                    }
+                                    Err(_) => (false, true),
+                                }
+                            }
+                            None => (false, true),
+                        }
+                    } else {
+                        (false, false)
+                    };
+                let read_res = if release_cap_expired {
+                    Ok((transition_rx.map_or(0, |(f, _)| f), true))
                 } else {
-                    false
-                };
-                let read_res = match (budget, transition_rx) {
-                    (Some(b), Some((frames, exhausted))) => {
-                        if driver.read_cached_joint_states_into(&mut sc.states).is_some() {
-                            Ok((frames, exhausted))
-                        } else {
-                            let remaining = b.max_rx_frames.saturating_sub(frames);
-                            if remaining == 0 {
-                                Ok((frames, true))
+                    match (budget, transition_rx) {
+                        (Some(b), Some((frames, exhausted))) => {
+                            if driver.read_cached_joint_states_into(&mut sc.states).is_some() {
+                                Ok((frames, exhausted))
                             } else {
-                                let drv_now = driver.clock_now();
-                                let span = b.deadline.saturating_duration_since(b.now);
-                                driver
-                                    .read_joint_states_budgeted(&mut sc.states, drv_now + span, remaining)
-                                    .map(|(f2, ex2)| (frames.saturating_add(f2), exhausted || ex2))
+                                let remaining = b.max_rx_frames.saturating_sub(frames);
+                                if remaining == 0 {
+                                    Ok((frames, true))
+                                } else {
+                                    match translate_driver_cutoff_conservative(driver, b.deadline, now_fn) {
+                                        Ok((_, _, drv_deadline)) => driver
+                                            .read_joint_states_budgeted(&mut sc.states, drv_deadline, remaining)
+                                            .map(|(f2, ex2)| (frames.saturating_add(f2), exhausted || ex2)),
+                                        Err(_) => Ok((frames, true)),
+                                    }
+                                }
                             }
                         }
+                        (Some(b), None) => {
+                            match translate_driver_cutoff_conservative(driver, b.deadline, now_fn) {
+                                Ok((_, _, drv_deadline)) => {
+                                    driver.read_joint_states_budgeted(&mut sc.states, drv_deadline, b.max_rx_frames)
+                                }
+                                Err(_) => Ok((0, true)),
+                            }
+                        }
+                        (None, _) => driver.read_joint_states_into(&mut sc.states).map(|()| (0, false)),
                     }
-                    (Some(b), None) => {
-                        let drv_now = driver.clock_now();
-                        let span = b.deadline.saturating_duration_since(b.now);
-                        driver.read_joint_states_budgeted(&mut sc.states, drv_now + span, b.max_rx_frames)
-                    }
-                    (None, _) => driver.read_joint_states_into(&mut sc.states).map(|()| (0, false)),
                 };
                 if applied_step2_tx_cap {
                     driver.set_tx_release_deadline(None);
@@ -7851,15 +7948,16 @@ impl SupervisorInner {
 
     /// Computes the single per-tick TX cutoff ONCE in the owner:
     ///   `effective_cutoff = min(control-release deadline, active action/macro parent & child deadlines)`
-    /// translated into the driver clock domain, and installs it as THE deadline on `self.driver`
-    /// via `set_tx_release_deadline`. Safety/stopped holds are never clipped by an action deadline.
+    /// translated into the driver clock domain using conservative driver-clock-first,
+    /// live-owner-clock-second sampling. Rejects expired release cutoffs BEFORE staging any driver
+    /// deadline. Safety/stopped holds are never clipped by an action deadline.
     fn install_effective_tx_cutoff(
         &mut self,
         release_deadline: Option<Instant>,
         now_fn: &mut dyn FnMut() -> Instant,
-    ) -> (bool, Option<EffectiveTxCutoff>) {
+    ) -> (DriverTxCapOutcome, Option<EffectiveTxCutoff>) {
         if self.driver.is_none() {
-            return (false, None);
+            return (DriverTxCapOutcome::NotInstalled, None);
         }
         let margin = self.tx_release_publish_margin();
         let period = Duration::from_secs_f64(1.0 / f64::from(self.config.control_frequency_hz.max(1)));
@@ -7902,29 +8000,44 @@ impl SupervisorInner {
         };
         let rt_owned = self.rt_executor_owned;
         let Some(d) = self.driver.as_mut() else {
-            return (false, None);
+            return (DriverTxCapOutcome::NotInstalled, None);
         };
         let apply = |drv: &mut dyn ArmDriver| {
-            // Sample owner clock and driver clock together inside the driver boundary so mutex
-            // contention or thread preemption before acquiring the driver cannot extend TX cutoffs.
-            let owner_now = now_fn();
-            let drv_now = drv.clock_now();
-            let drv_release_cap = match release_deadline {
+            // Sample driver clock FIRST, then live owner clock inside the driver boundary, and
+            // refuse expired release cutoffs BEFORE staging any driver deadline.
+            let (drv_now, owner_now, drv_release_cap) = match release_deadline {
                 Some(rd) => {
-                    let remaining = rd.saturating_duration_since(owner_now).saturating_sub(margin);
-                    drv_now + remaining
+                    let Some(owner_cap) = rd.checked_sub(margin) else {
+                        return (DriverTxCapOutcome::Expired, None);
+                    };
+                    match translate_driver_cutoff_conservative(drv, owner_cap, now_fn) {
+                        Ok(translated) => translated,
+                        Err(_) => return (DriverTxCapOutcome::Expired, None),
+                    }
                 }
-                None => drv_now + period.saturating_sub(margin),
+                None => {
+                    let drv_now = drv.clock_now();
+                    let owner_now = now_fn();
+                    let span = period.saturating_sub(margin);
+                    (drv_now, owner_now, drv_now + span)
+                }
             };
             let drv_action_cutoff = if fail_closed_action_dl {
                 Some(drv_now)
             } else {
                 owner_dl.map(|dl| drv_now + dl.saturating_duration_since(owner_now))
             };
-            let drv_effective = drv_action_cutoff.map_or(drv_release_cap, |ac| drv_release_cap.min(ac));
+            // When the action cutoff is already expired (`drv_action_cutoff == Some(drv_now)`),
+            // stage ONLY the live `drv_release_cap` on the driver (preserving the hold/J7-freeze
+            // exception without staging an expired deadline), while motion output checks
+            // `drv_action_cutoff <= drv_anchor` and returns `ActionDeadlineRefused` with 0 TX.
+            let drv_effective = match drv_action_cutoff {
+                Some(ac) if ac > drv_now => drv_release_cap.min(ac),
+                _ => drv_release_cap,
+            };
             drv.set_tx_release_deadline(Some(drv_effective));
             (
-                true,
+                DriverTxCapOutcome::Installed,
                 Some(EffectiveTxCutoff {
                     drv_release_cap,
                     drv_action_cutoff,
@@ -7934,9 +8047,11 @@ impl SupervisorInner {
             )
         };
         if rt_owned {
-            d.try_with_mut(apply).unwrap_or((false, None))
+            d.try_with_mut(apply)
+                .unwrap_or((DriverTxCapOutcome::NotInstalled, None))
         } else {
-            d.with_mut(apply).unwrap_or((false, None))
+            d.with_mut(apply)
+                .unwrap_or((DriverTxCapOutcome::NotInstalled, None))
         }
     }
 
@@ -7950,27 +8065,40 @@ impl SupervisorInner {
             self.last_clock_now = Some(now_fn());
         }
         // Legacy callers without a preceding Step-2 `poll_hardware_for_release` run `poll_hardware_rx`
-        // below; bound any stale-joint recovery TX during RX intake to the control-release cap.
-        let applied_rx_tx_cap = if !self.pending_rx_poll.active && self.driver.is_some() {
+        // below; bound any stale-joint recovery TX during RX intake to the control-release cap
+        // using conservative driver-first, live-owner-second translation.
+        let rx_tx_cap_outcome = if !self.pending_rx_poll.active && self.driver.is_some() {
             let margin = self.tx_release_publish_margin();
             let period = Duration::from_secs_f64(1.0 / f64::from(self.config.control_frequency_hz.max(1)));
             if let Some(mut drv) = self.write_driver_for_tick() {
-                let cap = match release_deadline {
-                    Some(rd) => {
-                        let owner_now = now_fn();
+                match release_deadline {
+                    Some(rd) => match rd.checked_sub(margin) {
+                        Some(owner_cap) => {
+                            match translate_driver_cutoff_conservative(drv.as_ref(), owner_cap, now_fn) {
+                                Ok((_, _, cap)) => {
+                                    drv.set_tx_release_deadline(Some(cap));
+                                    DriverTxCapOutcome::Installed
+                                }
+                                Err(_) => DriverTxCapOutcome::Expired,
+                            }
+                        }
+                        None => DriverTxCapOutcome::Expired,
+                    },
+                    None => {
                         let drv_now = drv.clock_now();
-                        drv_now + rd.saturating_duration_since(owner_now).saturating_sub(margin)
+                        let _ = now_fn();
+                        drv.set_tx_release_deadline(Some(drv_now + period.saturating_sub(margin)));
+                        DriverTxCapOutcome::Installed
                     }
-                    None => drv.clock_now() + period.saturating_sub(margin),
-                };
-                drv.set_tx_release_deadline(Some(cap));
-                true
+                }
             } else {
-                false
+                DriverTxCapOutcome::NotInstalled
             }
         } else {
-            false
+            DriverTxCapOutcome::NotInstalled
         };
+        let applied_rx_tx_cap = rx_tx_cap_outcome == DriverTxCapOutcome::Installed;
+        let rx_tx_cap_expired = rx_tx_cap_outcome == DriverTxCapOutcome::Expired;
         self.consume_pending_estop();
         // Immediate atomic e-stop latch check before any processing (only latches once when not yet recorded;
         // every new E-stop request arrives via `consume_pending_estop` above and advances the epoch).
@@ -7985,18 +8113,25 @@ impl SupervisorInner {
         let was_step2_poll = self.pending_rx_poll.active;
         let rx = if was_step2_poll {
             std::mem::take(&mut self.pending_rx_poll)
+        } else if rx_tx_cap_expired {
+            self.control_release_seq = self.control_release_seq.wrapping_add(1).max(1);
+            PendingRxPoll {
+                active: true,
+                budget_exhausted: true,
+                ..PendingRxPoll::default()
+            }
         } else {
             self.control_release_seq = self.control_release_seq.wrapping_add(1).max(1);
             if self.has_non_broker_torque_transition() {
-                let now = Instant::now();
+                let now = now_fn();
                 let budget = crate::rt_core::ops::ServiceBudget {
                     now,
                     deadline: now + crate::rt_core::ops::RX_TIME_BUDGET,
                     max_rx_frames: crate::rt_core::ops::RX_FRAME_BUDGET,
                 };
-                let _ = self.service_torque_transition(&budget);
+                let _ = self.service_torque_transition_with_clock(&budget, now_fn);
             }
-            self.poll_hardware_rx(None, None, None)
+            self.poll_hardware_rx_with_clock(None, None, None, now_fn)
         };
         let invalid_feedback = rx.invalid_feedback;
         let driver_torque_lost = rx.driver_torque_lost;
@@ -8997,7 +9132,9 @@ impl SupervisorInner {
         // child deadlines) ONCE for this tick and pass it as THE deadline to the driver TX choke
         // point. If a deadline elapses anywhere during Step 3, tracking, or the driver lock/TX
         // critical section, the TX choke point refuses writes past the cutoff and the next tick holds.
-        let (applied_output_tx_cap, tx_cutoff) = self.install_effective_tx_cutoff(release_deadline, now_fn);
+        let (output_tx_cap_outcome, tx_cutoff) = self.install_effective_tx_cutoff(release_deadline, now_fn);
+        let applied_output_tx_cap = output_tx_cap_outcome == DriverTxCapOutcome::Installed;
+        let output_tx_cap_expired = output_tx_cap_outcome == DriverTxCapOutcome::Expired;
         self.active_tx_cutoff = tx_cutoff;
         let mut reference_stepped = false;
 
@@ -9742,7 +9879,7 @@ impl SupervisorInner {
                     }
                 }
             }
-        } else if !self.shutdown_committed && !enable_transition_owns_bus {
+        } else if !self.shutdown_committed && !enable_transition_owns_bus && !output_tx_cap_expired {
             let tracking_active = self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled);
             let is_stopped_or_failed_hold = self.safety.state().is_stopped()
                 || self.enable_lifecycle == driver_transitions::EnableLifecycle::FailedHold;
@@ -9770,6 +9907,15 @@ impl SupervisorInner {
                 } else {
                     self.measured_hold.clear();
                 }
+            } else if send_to_bus
+                && tx_cutoff.is_some_and(|c| c.drv_action_cutoff.is_some_and(|ac| ac <= c.drv_anchor))
+            {
+                let c = tx_cutoff.expect("checked above");
+                self.tracking.invalidate();
+                tick_output = TickOutput::ActionDeadlineRefused {
+                    drv_now: c.drv_anchor,
+                    pf_status: crate::driver::PosForceTxStatus::Unobserved,
+                };
             } else if send_to_bus {
                 if !is_stopped_or_failed_hold {
                     self.measured_hold.clear();
@@ -10075,6 +10221,7 @@ impl SupervisorInner {
                 || ((is_stopped_or_failed_hold_epilogue || pending_disable_hold_epilogue)
                     && self.stopped_hold_eligible()));
         if !self.shutdown_committed
+            && !output_tx_cap_expired
             && j7_eligible
             && !enable_transition_owns_bus
             && !self.urgent_stop_unapplied()
@@ -15675,19 +15822,30 @@ mod observation_snapshot_tests {
         };
         let _ = inner.tick_control_inner(0.02, Some(rd), &mut now_fn);
         let captured = deadlines.lock().unwrap().clone();
-        // First non-None deadline is the RX-recovery cap installed inside `d.with_mut`:
-        // since call #2 (`owner_now`) is already past `rd`, remaining must be ZERO (`clock.now()`).
-        let first_some = captured.iter().copied().flatten().next().expect("RX cap installed");
-        assert_eq!(first_some, clock.now(), "expired RX recovery cap must not extend past driver now");
+        // DRV-F1 conservative driver-first cutoff translation: since call #2 (`owner_now`) is
+        // already past `rd - margin`, expired cutoffs are rejected BEFORE staging any driver
+        // deadline (zero `Some(_)` deadlines staged).
+        assert!(
+            captured.iter().all(Option::is_none),
+            "expired RX/output cutoffs must reject before staging any driver deadline, got {captured:?}"
+        );
 
-        // Also verify `install_effective_tx_cutoff` directly when `owner_now` is past `rd`.
+        // Also verify `install_effective_tx_cutoff` directly when `owner_now` is past `rd`:
+        // must return `DriverTxCapOutcome::Expired` with zero staged deadlines.
         deadlines.lock().unwrap().clear();
         let mut expired_now = || rd + Duration::from_millis(10);
-        let (installed, cutoff) = inner.install_effective_tx_cutoff(Some(rd), &mut expired_now);
-        assert!(installed);
-        let cutoff = cutoff.expect("cutoff returned");
-        assert_eq!(cutoff.drv_release_cap, clock.now());
-        assert_eq!(cutoff.owner_anchor, rd + Duration::from_millis(10));
+        let (outcome, cutoff) = inner.install_effective_tx_cutoff(Some(rd), &mut expired_now);
+        assert_eq!(outcome, DriverTxCapOutcome::Expired);
+        assert!(cutoff.is_none());
+        assert!(deadlines.lock().unwrap().is_empty());
+
+        // When `owner_now` is still strictly before `rd - margin`, a live deadline IS staged.
+        let mut live_now = || t0;
+        let (live_outcome, live_cutoff) = inner.install_effective_tx_cutoff(Some(rd), &mut live_now);
+        assert_eq!(live_outcome, DriverTxCapOutcome::Installed);
+        let live_cutoff = live_cutoff.expect("live cutoff returned");
+        assert!(live_cutoff.drv_release_cap > clock.now());
+        assert_eq!(live_cutoff.owner_anchor, t0);
     }
 
     #[test]
