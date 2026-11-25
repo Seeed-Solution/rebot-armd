@@ -8193,12 +8193,12 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     ) -> Result<CanFrame, TxRefusal> {
         let prev = self.send_lease_gen;
         self.send_lease_gen = expected_lease_gen;
-        let res = self.send(kind, expected_stamp, deadline, fenced, build);
+        let res = self.send_plain(kind, expected_stamp, deadline, fenced, build);
         self.send_lease_gen = prev;
         res
     }
 
-    fn send(
+    fn send_plain(
         &mut self,
         kind: impl DamiaoTxKind,
         expected_stamp: Option<StopStamp>,
@@ -8207,7 +8207,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         build: impl FnOnce(&Self) -> Option<CanFrame>,
     ) -> Result<CanFrame, TxRefusal> {
         let mut revoked: Option<&'static str> = None;
-        self.send_inner(kind, expected_stamp, deadline, fenced, None, &mut revoked, build)
+        self.send(kind, expected_stamp, deadline, fenced, None, &mut revoked, build)
             .map(|(f, _, _, _)| f)
     }
 
@@ -8220,7 +8220,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         build: impl FnOnce(&Self) -> Option<CanFrame>,
     ) -> Result<(CanFrame, u64, Instant, Option<i128>), Result<&'static str, TxRefusal>> {
         let mut revoked: Option<&'static str> = None;
-        match self.send_inner(kind, expected_stamp, deadline, false, Some(pre_tx_gate), &mut revoked, build) {
+        match self.send(kind, expected_stamp, deadline, false, Some(pre_tx_gate), &mut revoked, build) {
             Ok(ok) => Ok(ok),
             Err(r) => {
                 if let Some(code) = revoked {
@@ -8233,7 +8233,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn send_inner(
+    fn send(
         &mut self,
         kind: impl DamiaoTxKind,
         expected_stamp: Option<StopStamp>,
@@ -8452,14 +8452,14 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let mut retries = 0u8;
         loop {
             let res = match pos_force_token {
-                Some(tok) => self.send(
+                Some(tok) => self.send_plain(
                     pos_force_emitter::authorize_kind(tok, kind),
                     expected_stamp,
                     deadline,
                     fenced,
                     |d| build(d),
                 ),
-                None => self.send(kind, expected_stamp, deadline, fenced, |d| build(d)),
+                None => self.send_plain(kind, expected_stamp, deadline, fenced, |d| build(d)),
             };
             match res {
                 Ok(frame) => return Ok(frame),
@@ -8888,7 +8888,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             return Ok(false);
         }
         self.pf_refresh_attempted_this_tick = true;
-        match self.send(TxKind::Refresh, Some(expected_stamp), None, false, |d| {
+        match self.send_plain(TxKind::Refresh, Some(expected_stamp), None, false, |d| {
             Some(damiao::build_refresh_frame(d.motor_ids[pf_joint]))
         }) {
             Ok(_) => {
@@ -9775,7 +9775,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         // as every other TX in the release.
         self.begin_tx_tick();
         let probe_joint = 0usize;
-        match self.send(TxKind::Refresh, Some(start_stamp), deadline, false, |d| {
+        match self.send_plain(TxKind::Refresh, Some(start_stamp), deadline, false, |d| {
             Some(damiao::build_refresh_frame(d.motor_ids[probe_joint]))
         }) {
             Ok(_) => {}
@@ -10964,7 +10964,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let boundary = self.rx_seq;
         let tx_at = self.now();
         let id = self.motor_ids[joint];
-        match self.send(TxKind::Handshake, self.enable_stop_stamp, Some(deadline), false, |_| {
+        match self.send_plain(TxKind::Handshake, self.enable_stop_stamp, Some(deadline), false, |_| {
             Some(damiao::build_refresh_frame(id))
         }) {
             Ok(_) => {}
@@ -11311,7 +11311,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             let mut first_sent_joint = None;
             for j in handshake::mask_joints(unsent) {
                 let id = self.motor_ids[j];
-                match self.send(TxKind::Handshake, self.enable_stop_stamp, Some(r.deadline), false, |_| {
+                match self.send_plain(TxKind::Handshake, self.enable_stop_stamp, Some(r.deadline), false, |_| {
                     Some(damiao::build_read_register_frame(id, damiao::RID_CTRL_MODE))
                 }) {
                     Ok(_) => {
@@ -11568,7 +11568,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 mask &= !(1 << i);
                 continue;
             };
-            match self.send(TxKind::Handshake, self.enable_stop_stamp, deadline, false, |d| {
+            match self.send_plain(TxKind::Handshake, self.enable_stop_stamp, deadline, false, |d| {
                 // L2: Never transmit `CMD_ENABLE` unless `verified_modes[i]` causally matches
                 // `base_mode(i)` after this daemon started.
                 if d.verified_modes.get(i).copied().flatten() != Some(d.base_mode(i))
@@ -11970,7 +11970,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             if skip_dispatched && idx < 64 && (self.disable_dispatched_mask & (1u64 << idx)) != 0 {
                 continue;
             }
-            match self.send(tx_kind, expected_stamp, None, false, |d| {
+            match self.send_plain(tx_kind, expected_stamp, None, false, |d| {
                 Some(damiao::build_disable_frame(d.motor_ids[idx]))
             }) {
                 Ok(_) => {
@@ -12143,7 +12143,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let mut probed_any = false;
         for i in handshake::mask_joints(probe_mask) {
             let Some(&id) = self.motor_ids.get(i) else { continue };
-            match self.send(TxKind::DisableProbe, None, dl, false, |_| {
+            match self.send_plain(TxKind::DisableProbe, None, dl, false, |_| {
                 Some(damiao::build_refresh_frame(id))
             }) {
                 Ok(_) => probed_any = true,
@@ -12296,7 +12296,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             if idx < 64 && (repeat_pass_mask & (1u64 << idx)) != 0 {
                 continue;
             }
-            match self.send(tx_kind, None, None, false, |d| {
+            match self.send_plain(tx_kind, None, None, false, |d| {
                 Some(damiao::build_disable_frame(d.motor_ids[idx]))
             }) {
                 Ok(_) => {
@@ -12592,7 +12592,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             }
             let id = self.motor_ids[i];
             let seq_before = self.rx_seq;
-            match self.send(TxKind::Refresh, None, None, false, |_| {
+            match self.send_plain(TxKind::Refresh, None, None, false, |_| {
                 Some(damiao::build_read_register_frame(id, damiao::RID_CTRL_MODE))
             }) {
                 Ok(_) => {
@@ -12809,7 +12809,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         let pre = self.rx_boundary().map_err(|e| e.to_string())?;
         self.pending_stop_check(Some(start_stamp)).map_err(|e| format!("status poll not sent: {e}"))?;
         for idx in 0..self.motor_ids.len() {
-            match self.send(TxKind::Refresh, Some(start_stamp), None, false, |d| {
+            match self.send_plain(TxKind::Refresh, Some(start_stamp), None, false, |d| {
                 Some(damiao::build_refresh_frame(d.motor_ids[idx]))
             }) {
                 Ok(_) => {}
@@ -12851,7 +12851,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         // 1. clear-error (FF..FB on the motor's ID) to every motor reporting an error state
         let faulted: Vec<usize> = (0..self.motor_ids.len()).filter(|&i| self.motor_status[i] >= 8).collect();
         for &i in &faulted {
-            match self.send(TxKind::ClearFault, Some(start_stamp), None, false, |d| {
+            match self.send_plain(TxKind::ClearFault, Some(start_stamp), None, false, |d| {
                 Some(damiao::build_clear_faults_frame(d.motor_ids[i]))
             }) {
                 Ok(_) => {}
@@ -13438,7 +13438,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         let mut err: Option<ArmDriverError> = None;
         let mut sent_any = false;
         for idx in 0..self.motor_ids.len() {
-            match self.send(TxKind::ClearFault, Some(start_stamp), None, false, |d| {
+            match self.send_plain(TxKind::ClearFault, Some(start_stamp), None, false, |d| {
                 Some(damiao::build_clear_faults_frame(d.motor_ids[idx]))
             }) {
                 Ok(_) => sent_any = true,
@@ -13486,7 +13486,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         let mut err: Option<ArmDriverError> = None;
         let mut sent_any = false;
         for idx in 0..self.motor_ids.len() {
-            match self.send(TxKind::ClearFault, Some(start_stamp), Some(dl), false, |d| {
+            match self.send_plain(TxKind::ClearFault, Some(start_stamp), Some(dl), false, |d| {
                 Some(damiao::build_clear_faults_frame(d.motor_ids[idx]))
             }) {
                 Ok(_) => sent_any = true,
@@ -13704,7 +13704,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         let mut sent_any = false;
         for i in pending_before {
             let Some(&id) = self.motor_ids.get(i) else { continue };
-            match self.send(protective, None, Some(tx_deadline), false, |_| {
+            match self.send_plain(protective, None, Some(tx_deadline), false, |_| {
                 Some(damiao::build_disable_frame(id))
             }) {
                 Ok(_) => {
@@ -13982,7 +13982,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         if started[i].is_none() {
                             started[i] = Some(self.now());
                         }
-                        match self.send(TxKind::RollbackHold(i), Some(start_stamp), None, true, |d| {
+                        match self.send_plain(TxKind::RollbackHold(i), Some(start_stamp), None, true, |d| {
                             let fresh_pos = d.fresh_measured_position(i, POS_FORCE_FEEDBACK_MAX_AGE)?;
                             let hold_target = JointTarget {
                                 position: fresh_pos,
@@ -14243,7 +14243,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         let _ = self.pending_hold_tx.remove_at(idx);
                         continue;
                     };
-                    match self.send(
+                    match self.send_plain(
                         TxKind::RollbackHold(i),
                         Some(entry.stop_stamp),
                         Some(entry_deadline),
@@ -14729,7 +14729,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     if started[i].is_none() {
                         started[i] = Some(self.now());
                     }
-                    match self.send(TxKind::MeasuredHold(i), Some(start_stamp), None, true, |d| {
+                    match self.send_plain(TxKind::MeasuredHold(i), Some(start_stamp), None, true, |d| {
                         if !captured_pos.is_finite() {
                             return None;
                         }
@@ -14969,7 +14969,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         let _ = self.pending_hold_tx.remove_at(idx);
                         continue;
                     };
-                    match self.send(
+                    match self.send_plain(
                         TxKind::MeasuredHold(i),
                         Some(entry.stop_stamp),
                         Some(entry_deadline),
@@ -16353,7 +16353,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         recovery_vel,
                     )
                 } else {
-                    self.send(TxKind::Recovery, Some(rx_stop_stamp), None, false, |d| {
+                    self.send_plain(TxKind::Recovery, Some(rx_stop_stamp), None, false, |d| {
                         let id = d.motor_ids[i];
                         let p = d.cached_states.get(i).map_or(0.0, |s| s.position);
                         match resolved_mode {
@@ -16480,7 +16480,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         if remaining & (1 << i) == 0 {
                             continue;
                         }
-                        match self.send(TxKind::Refresh, Some(rx_stop_stamp), None, false, |d| {
+                        match self.send_plain(TxKind::Refresh, Some(rx_stop_stamp), None, false, |d| {
                             Some(damiao::build_refresh_frame(d.motor_ids[i]))
                         }) {
                             Ok(_) => {
