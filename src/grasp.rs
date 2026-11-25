@@ -3207,14 +3207,28 @@ pub fn plan(pending: PendingGrasp) -> Result<PlannedGrasp, ArmError> {
         let code = sel.selection.code.unwrap_or_else(|| "NO_CANDIDATE".into());
         let phase = sel.failing_phase.unwrap_or("selection");
         let base_msg = sel.selection.message.unwrap_or_else(|| "adaptive grasp infeasible".into());
-        let message = match &sel.checked_hint {
+        // Preserve dry-run/live parity for checked-only hints: only emit the legacy hint when
+        // the legacy route actually passes on this exact snapshot.
+        let checked_hint = sel.checked_hint.or_else(|| {
+            let legacy_pending = PendingGrasp {
+                input,
+                request,
+                open_rad,
+                physical_contact_end_m,
+                adaptive: None,
+            };
+            plan(legacy_pending)
+                .ok()
+                .map(|_| "legacy strategy passed dry_run for this target".to_string())
+        });
+        let message = match &checked_hint {
             Some(hint) => format!("[{phase}] {base_msg}; hint: {hint}"),
             None => format!("[{phase}] {base_msg}"),
         };
         let mut details = serde_json::Map::new();
         details.insert("failing_phase".into(), serde_json::json!(phase));
         details.insert("outcome".into(), serde_json::json!(sel.selection.outcome.name()));
-        if let Some(hint) = sel.checked_hint {
+        if let Some(hint) = checked_hint {
             details.insert("hint".into(), serde_json::json!(hint));
         }
         return Err(ArmError::Detailed {

@@ -357,7 +357,9 @@ impl AdaptiveSelection {
             }
             None
         });
-        v["hint"] = json!(hint);
+        if let Some(h) = hint {
+            v["hint"] = json!(h);
+        }
         v
     }
 }
@@ -712,7 +714,16 @@ pub fn select_adaptive_route(
     let acq_res = feasibility::acquisition(s, &mut work);
     let acq_seed = acq_res.as_ref().ok().map(|a| a.q_end);
 
-    // Seed endpoint IK from cache, actual start q0, and optional acq_seed.
+    // Seed endpoint IK from cache, actual start q0, optional acq_seed, and a canonical
+    // target-facing front-branch seed (clamped to joint limits) so starting on an alternate IK
+    // branch does not trap endpoint IK in a local minimum and can cleanly fall back to a
+    // swept-joint pregrasp transition.
+    let az = t.centroid[1].atan2(t.centroid[0]);
+    let raw_canonical = [az, -1.167, -1.565, 1.435, 0.0, 0.0];
+    let canonical_seed: [f64; 6] = std::array::from_fn(|j| {
+        let lim = &s.input.limits[j];
+        raw_canonical[j].clamp(f64::from(lim.min_position) + 0.05, f64::from(lim.max_position) - 0.05)
+    });
     let mut seed_cache: BTreeMap<(DirClass, bool), [f64; 6]> = BTreeMap::new();
     let mut screened: Vec<(Hypothesis, [f64; 6], [f64; 6], f64)> = Vec::new();
     for hy in hyps {
@@ -726,7 +737,7 @@ pub fn select_adaptive_route(
                 checked_hint: None,
             };
         }
-        let mut seeds = Vec::with_capacity(3);
+        let mut seeds = Vec::with_capacity(4);
         if let Some(q) = seed_cache.get(&(hy.class, hy.half_turn)) {
             seeds.push(*q);
         }
@@ -734,6 +745,7 @@ pub fn select_adaptive_route(
         if let Some(qa) = acq_seed {
             seeds.push(qa);
         }
+        seeds.push(canonical_seed);
         let q_g = match feasibility::endpoint_ik(&s.input, &hy.grasp_pose(), &seeds, &mut work) {
             Ok(q) => q,
             Err((ep, er)) => {
@@ -754,6 +766,7 @@ pub fn select_adaptive_route(
         if let Some(qa) = acq_seed {
             pre_seeds.push(qa);
         }
+        pre_seeds.push(canonical_seed);
         let q_pre_seed = match feasibility::endpoint_ik(&s.input, &hy.pregrasp_pose(), &pre_seeds, &mut work) {
             Ok(q) => q,
             Err((ep, er)) => {
