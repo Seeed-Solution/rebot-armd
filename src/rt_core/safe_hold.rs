@@ -20,6 +20,7 @@ use crate::driver::{
 use crate::model::{ArmConfig, DamiaoGripperMode, JointState};
 use crate::rt_core::mailbox::MAX_DOF;
 use crate::rt_core::ops::RX_FRAME_BUDGET;
+use crate::rt_core::urgent::{EstopState, StopRequests};
 use crate::supervisor::{
     bounded_panic_disable_driver_until, panic_disable_deadlines,
     translate_driver_cutoff_conservative, PanicDisableOutcome, SupervisorInner, BUS_LOSS_TIMEOUT,
@@ -277,6 +278,9 @@ pub struct SafeHoldBuffers {
     pos_buf: [f32; 1],
     thermal_disable_started: bool,
     j7_stamp: PosForceIntentStamp,
+    estop_state: Option<std::sync::Arc<EstopState>>,
+    estop_applied: Option<std::sync::Arc<AtomicU64>>,
+    stop_requests: Option<StopRequests>,
 }
 
 impl SafeHoldBuffers {
@@ -310,6 +314,36 @@ impl SafeHoldBuffers {
                 estop_epoch: 0,
                 lease_gen: 0,
             },
+            estop_state: None,
+            estop_applied: None,
+            stop_requests: None,
+        }
+    }
+
+    /// Attaches the owner's lock-free E-stop/stop mirrors once at control-thread startup (off RT)
+    /// so SAFE-HOLD acknowledges any pending external E-stop/stop generations without allocating
+    /// or locking — preventing `EstopGate::pending()` from starving `write_measured_hold_masked`
+    /// while keeping `EstopState::LATCH_BIT` permanently latched.
+    pub fn attach_stop_mirrors(
+        &mut self,
+        estop_state: std::sync::Arc<EstopState>,
+        estop_applied: std::sync::Arc<AtomicU64>,
+        stop_requests: Option<StopRequests>,
+    ) {
+        self.estop_state = Some(estop_state);
+        self.estop_applied = Some(estop_applied);
+        self.stop_requests = stop_requests;
+    }
+
+    #[inline]
+    fn acknowledge_stops_for_safe_hold(&self) {
+        if let (Some(es), Some(applied)) = (self.estop_state.as_ref(), self.estop_applied.as_ref())
+        {
+            es.latch();
+            applied.fetch_max(es.requested_count(), Ordering::SeqCst);
+        }
+        if let Some(stops) = self.stop_requests.as_ref() {
+            stops.mark_applied(stops.current());
         }
     }
 
@@ -522,6 +556,9 @@ impl SafeHoldBuffers {
             }
         }
         if hold_mask != 0 || self.gripper_is_pos_force {
+            // Acknowledge any pending external E-stop/stop generations while keeping LATCH_BIT set
+            // so `EstopGate::pending()` never suppresses SAFE-HOLD measured-position hold frames.
+            self.acknowledge_stops_for_safe_hold();
             drv.set_pending_pos_force_hold_hint(true);
             if let Ok(report) = drv.write_measured_hold_masked(hold_mask, &self.hold_targets[..dof])
             {

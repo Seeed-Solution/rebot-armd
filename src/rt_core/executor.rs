@@ -7688,7 +7688,7 @@ fn run_executor_safe_hold(
     control_stop: &Arc<AtomicBool>,
     reason: super::safe_hold::SafeHoldReason,
 ) {
-    estop_state.request_and_latch();
+    estop_state.latch();
     internal_fault_lane.latch_control_safe_hold_fence();
     safe_hold_bufs.seed_on_entry(&core);
     lifecycle.set_owner_state(LC_OWNER_SAFE_HOLD);
@@ -7799,6 +7799,11 @@ fn control_thread_main(
     // Preallocate SAFE-HOLD working buffers BEFORE any unwind boundary so control-thread panics
     // or energized teardown/startup timeouts transition to SAFE-HOLD with zero heap allocations.
     let mut safe_hold_bufs = super::safe_hold::SafeHoldBuffers::from_config(&core.config, cfg.period);
+    safe_hold_bufs.attach_stop_mirrors(
+        Arc::clone(&estop_state),
+        Arc::clone(&core.estop_applied),
+        Some(stop_requests_init.clone()),
+    );
     safe_hold_bufs.mirror_from_core(&core);
     let clock_hook_top = hooks.clock.clone();
 

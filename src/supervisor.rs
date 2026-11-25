@@ -11685,6 +11685,14 @@ impl ArmSupervisor {
         let cfg = runtime.block_on(async { self.inner().read().await.config.clone() });
         let mut safe_hold_bufs =
             crate::rt_core::safe_hold::SafeHoldBuffers::from_config(&cfg, period);
+        {
+            let guard = runtime.block_on(self.inner.read());
+            safe_hold_bufs.attach_stop_mirrors(
+                Arc::clone(&self.estop_state),
+                Arc::clone(&guard.estop_applied),
+                guard.stop_requests.clone(),
+            );
+        }
         let safe_hold_ctrl = Arc::clone(&self.legacy_safe_hold);
         let mut step_counter: u64 = 0;
         let mut panicked = false;
@@ -11717,7 +11725,7 @@ impl ArmSupervisor {
                         crate::rt_core::executor::account_periodic_overrun_on_panic_exit(
                             &loop_stats,
                         );
-                        self.estop_state.request_and_latch();
+                        self.estop_state.latch();
                         self.internal_fault_lane.latch_control_safe_hold_fence();
                         tracing::error!(
                             "Legacy control thread panicked during tick {step_counter}; transitioning to SAFE-HOLD"
