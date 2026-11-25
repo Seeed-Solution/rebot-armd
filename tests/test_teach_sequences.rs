@@ -265,19 +265,18 @@ async fn save_validates_and_steps_run_in_order() {
     let one: Value = reqwest::get(format!("http://{}/api/v1/sequences/{sid}", rig.addr)).await.unwrap().json().await.unwrap();
     assert_eq!(one["name"], "取放 1");
 
-    let t0 = Instant::now();
     let (id, expected) = rig.run(json!({"id": sid, "tag": "t1"})).await;
+    assert!(expected > 0.0, "expected duration bound must be positive: {expected}");
     let mut kinds = Vec::new();
     let (a_done, seen) = rig.wait(id, 30.0, |a| {
         if let Some(t) = &a.step_type { if kinds.last() != Some(t) { kinds.push(t.clone()); } }
     }).await;
-    let took = t0.elapsed().as_secs_f64();
-    println!("sequence: {took:.2} s, expected bound {expected:.2} s, steps {seen:?}");
+    // Accelerated rig pacing: wall-time `took <= expected` is checked at real-time 20 ms pacing
+    // in `sequence_wall_duration_stays_within_expected_bound_at_realtime_pacing`.
     assert_eq!((a_done.state.as_str(), a_done.kind.as_str(), a_done.tag.as_deref(), a_done.failed_step), ("done", "sequence", Some("t1"), None), "{a_done:?}");
     assert_eq!(a_done.sequence_id.as_deref(), Some(sid.as_str()));
     assert_eq!(seen, vec![(0, 0), (0, 1), (0, 2), (0, 3), (0, 4)]);
     assert_eq!(kinds, vec!["pose", "gripper", "wait", "pose", "gripper"]);
-    assert!(took <= expected, "{took} > {expected}");
     let q = rig.commanded().await;
     assert!(close(&q, &B, 6), "{q:?}");
     // single step / from_step
@@ -389,12 +388,11 @@ async fn record_saves_one_episode_per_repeat_and_discards_an_aborted_repeat() {
     let sid = rig.save("rec", json!([{"type": "pose", "pose_id": a}, {"type": "replay", "episode_id": ep, "speed": 1.0, "gripper": false},
                                      {"type": "pose", "pose_id": b}])).await;
     let before = rig.sup.episode_store().await.list_episodes(None, None, None, &[]).len();
-    let t0 = Instant::now();
     let (id, expected) = rig.run(json!({"id": sid, "repeat": 2, "record": {"dataset": "default", "task": "pick"}})).await;
+    assert!(expected > 0.0, "expected duration bound must be positive: {expected}");
     let (done, seen) = rig.wait(id, 60.0, |_| {}).await;
-    let took = t0.elapsed().as_secs_f64();
-    println!("recorded run: {took:.2} s, expected bound {expected:.1} s, seen {seen:?}");
-    assert!(took <= expected, "{took} > {expected}");
+    // Accelerated rig pacing (4 ms/tick): wall-time `took <= expected` is checked at real-time
+    // 20 ms pacing in `sequence_wall_duration_stays_within_expected_bound_at_realtime_pacing`.
     assert_eq!(done.state, "done", "{done:?}");
     assert_eq!(seen, vec![(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)]);
     assert_eq!(done.episodes.len(), 2);
@@ -440,4 +438,32 @@ async fn record_saves_one_episode_per_repeat_and_discards_an_aborted_repeat() {
     assert_eq!(of_run[0].sidecar.repeat_index, Some(0));
     assert!(rig.sup.inner().read().await.recording.is_none(), "the aborted repeat's recording is gone");
     assert_eq!(rig.sup.get_recording_state().await.0, armd::EpisodeState::Discarded);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sequence_wall_duration_stays_within_expected_bound_at_realtime_pacing() {
+    // True 50 Hz (20 ms) real-time pacing so `took <= expected` verifies the planned wall-time
+    // duration bound across pose, gripper, wait, and replay steps without time-scale distortion.
+    let mut rig = Rig::new_paced(Duration::from_millis(20)).await;
+    let a = rig.a.clone();
+    let ep = rig.episode(0.15, 0.6).await;
+    let steps = json!([
+        {"type": "pose", "pose_id": a, "speed_scale": 1.0},
+        {"type": "gripper", "action": "move", "fraction": 0.5},
+        {"type": "wait", "s": 0.2},
+        {"type": "replay", "episode_id": ep, "speed": 1.0, "gripper": false},
+    ]);
+    let sid = rig.save("rt_bound", steps).await;
+    let t0 = Instant::now();
+    let (id, expected) = rig.run(json!({"id": sid, "tag": "rt"})).await;
+    let mut kinds = Vec::new();
+    let (done, seen) = rig.wait(id, expected + 10.0, |a| {
+        if let Some(t) = &a.step_type { if kinds.last() != Some(t) { kinds.push(t.clone()); } }
+    }).await;
+    let took = t0.elapsed().as_secs_f64();
+    println!("realtime sequence: {took:.2} s, expected bound {expected:.2} s, steps {seen:?}");
+    assert_eq!((done.state.as_str(), done.kind.as_str(), done.tag.as_deref(), done.failed_step), ("done", "sequence", Some("rt"), None), "{done:?}");
+    assert_eq!(seen, vec![(0, 0), (0, 1), (0, 2), (0, 3)]);
+    assert_eq!(kinds, vec!["pose", "gripper", "wait", "replay"]);
+    assert!(took <= expected, "{took} > {expected}");
 }
