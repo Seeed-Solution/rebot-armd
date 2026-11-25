@@ -5444,6 +5444,7 @@ impl ControlState {
                 }
             }
             a.finished_at = Some(now);
+            core.record_terminal_transition_by_id(id);
         }
     }
 
@@ -6865,6 +6866,7 @@ fn control_thread_main(
                         },
                     );
                     if control_stop.load(Ordering::Acquire) {
+                        let (_, captured_any) = core.capture_edge_terminals(core.now_s(), None);
                         if let Some(p) = injected_job_probe.take() {
                             if state.offload_reclaim_tx.push(OffloadReclaim::Probe(p)).is_ok() {
                                 core.core.hub().wake();
@@ -6873,7 +6875,8 @@ fn control_thread_main(
                         state.flush_pending_maint_reply(&core);
                         state.emit_estop_ack_if_advanced(&mut core);
                         state.drain_retired_states(&mut core, now_inst());
-                        if engine.take_urgent_replies_flushed()
+                        if captured_any
+                            || engine.take_urgent_replies_flushed()
                             || engine.take_lifecycle_replies_flushed()
                             || engine.take_servo_closes_flushed()
                         {
@@ -6906,6 +6909,10 @@ fn control_thread_main(
                             }
                             Err(rtrb::PushError::Full(job)) => {
                                 state.reject_saturated_persist_job(&mut core, job, injected_job_probe.take());
+                                let (_, captured_any) = core.capture_edge_terminals(core.now_s(), None);
+                                if captured_any {
+                                    hub.wake();
+                                }
                             }
                         }
                     }
@@ -6979,7 +6986,10 @@ fn control_thread_main(
                             obs_us: phases[4],
                             publish_us: crate::diagnostics::tick::us(done.saturating_duration_since(body_end)),
                         },
-                        phases_us: ReleasePhasesUs::default(),
+                        phases_us: ReleasePhasesUs {
+                            terminal: core.take_phase_terminal_us(),
+                            ..ReleasePhasesUs::default()
+                        },
                         usage: ThreadUsage {
                             lock_alloc_calls: allocs.calls.min(u64::from(u32::MAX)) as u32,
                             lock_alloc_us: (allocs.total_ns / 1000).min(u64::from(u32::MAX)) as u32,

@@ -129,8 +129,14 @@ impl SupervisorInner {
                 self.last_policy_obs = Some(run.to_observation(false));
             }
         }
+        // Off-tick Legacy start: drain any queued in-tick terminal captures while `previous_action`
+        // and `last_action` are still live so no rich macro payload can be evicted before capture.
+        if !self.rt_executor_owned && !self.defer_terminal_capture {
+            self.drain_terminal_captures_with_live_slots();
+        }
         if let Some(mut old) = self.last_action.take() {
-            if old.is_running() {
+            let was_running = old.is_running();
+            if was_running {
                 old.state = "cancelled".into();
                 old.code = Some("SUPERSEDED".into());
                 if format_superseded_msg {
@@ -138,7 +144,9 @@ impl SupervisorInner {
                 }
                 old.finished_at = Some(now);
             }
-            self.record_finished_action(&old);
+            if was_running {
+                self.record_terminal_transition_for(&old);
+            }
             if let Some((mut prev, _)) = self.previous_action.replace((old, now + 2.0)) {
                 if let Some(msg) = prev.message.take() {
                     self.recycle_action_msg_spare(msg);
@@ -264,7 +272,9 @@ impl SupervisorInner {
         let mut retired_ctx: Option<Box<ZeroCheckPersistContext>> = None;
         let mut incoming_message = message;
         let mut displaced_message: Option<String> = None;
+        let mut transitioned_terminal = false;
         if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id && a.is_running()) {
+            transitioned_terminal = true;
             a.state = state.into();
             a.code = code.map(Into::into);
             displaced_message = std::mem::replace(&mut a.message, incoming_message.take());
@@ -340,6 +350,7 @@ impl SupervisorInner {
                     self.retire_zero_check_ctx(ctx);
                 } else {
                     // Hold action as running until atomic persist-before-commit completes off-thread.
+                    transitioned_terminal = false;
                     if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
                         a.state = crate::model::HolderLabel::new("running");
                         a.finished_at = None;
@@ -365,6 +376,8 @@ impl SupervisorInner {
                 // the EXACT same common commit state machine (`reserve -> serialize + stage + fsync
                 // -> fresh authority recheck -> rename -> parent-dir fsync -> authority recheck
                 // -> activate`, with dir-sync failure entering `Reconciling`).
+                // `commit_zero_check_sync` owns the authoritative terminal transition emission.
+                transitioned_terminal = false;
                 crate::rt_core::requests::config::commit_zero_check_sync(self, id, offset_rad, ctx);
             }
         }
@@ -382,7 +395,9 @@ impl SupervisorInner {
                 self.retire_macro_run(run);
             }
         }
-        self.record_finished_action_by_id(id);
+        if transitioned_terminal {
+            self.record_terminal_transition_by_id(id);
+        }
     }
 
     /// Start a park (NormalUnload) and record it as a `park` action. Returns its id when
@@ -554,12 +569,22 @@ impl SupervisorInner {
             if iteration.is_some() { a.iteration = iteration; }
             if error_px.is_some() { a.error_px = error_px; }
         }
+        if !self.rt_executor_owned && !self.defer_terminal_capture {
+            if let Some(a) = self.last_action.as_ref().filter(|a| a.id == id) {
+                self.mirror_rich_action_off_rt(a);
+            }
+        }
     }
 
     /// Grasp camera-down re-check result ([`ActionStatus::final_offset_px`]).
     pub fn set_action_final_offset(&mut self, id: u64, offset_px: [f32; 2]) {
         if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id && a.is_running()) {
             a.final_offset_px = Some(offset_px);
+        }
+        if !self.rt_executor_owned && !self.defer_terminal_capture {
+            if let Some(a) = self.last_action.as_ref().filter(|a| a.id == id) {
+                self.mirror_rich_action_off_rt(a);
+            }
         }
     }
 
@@ -568,11 +593,21 @@ impl SupervisorInner {
         if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id && a.is_running()) {
             a.acquire_height_m = Some(height_m);
         }
+        if !self.rt_executor_owned && !self.defer_terminal_capture {
+            if let Some(a) = self.last_action.as_ref().filter(|a| a.id == id) {
+                self.mirror_rich_action_off_rt(a);
+            }
+        }
     }
 
     /// Change diagnostic fields of the running action `id` (grasp status fields).
     pub fn update_action(&mut self, id: u64, f: impl FnOnce(&mut ActionStatus)) {
         if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id && a.is_running()) { f(a); }
+        if !self.rt_executor_owned && !self.defer_terminal_capture {
+            if let Some(a) = self.last_action.as_ref().filter(|a| a.id == id) {
+                self.mirror_rich_action_off_rt(a);
+            }
+        }
     }
 
     /// Record structured workspace violation details on running action `id`.
@@ -582,6 +617,11 @@ impl SupervisorInner {
             a.geometry_id = detail.geometry_id;
             a.violation_phase = detail.violation_phase;
             a.reason = detail.reason;
+        }
+        if !self.rt_executor_owned && !self.defer_terminal_capture {
+            if let Some(a) = self.last_action.as_ref().filter(|a| a.id == id) {
+                self.mirror_rich_action_off_rt(a);
+            }
         }
     }
 

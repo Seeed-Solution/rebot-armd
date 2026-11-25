@@ -534,7 +534,7 @@ impl SupervisorInner {
                 }
             };
             a.finished_at = Some(now);
-            self.record_finished_action_by_id(action_id);
+            self.record_terminal_transition_by_id(action_id);
             return (code_buf, old_msg);
         }
         (code_buf, msg_buf)
@@ -555,7 +555,7 @@ impl SupervisorInner {
             a.code = Some(crate::model::HolderLabel::new(&code));
             let old_msg = a.message.replace(message);
             a.finished_at = Some(now);
-            self.record_finished_action_by_id(action_id);
+            self.record_terminal_transition_by_id(action_id);
             return (Some(code), old_msg);
         }
         (Some(code), Some(message))
@@ -568,11 +568,13 @@ impl SupervisorInner {
         warning: Option<String>,
     ) -> Option<String> {
         let now = self.now_s();
+        let mut transitioned_terminal = false;
         let ret = if let Some(a) = self.last_action.as_mut().filter(|a| a.id == action_id) {
             if a.is_running() {
                 a.state = crate::model::HolderLabel::new("done");
                 a.progress = 1.0;
                 a.finished_at = Some(now);
+                transitioned_terminal = true;
             }
             match durability {
                 crate::rt_core::config_iface::Durability::Durable => {
@@ -595,7 +597,9 @@ impl SupervisorInner {
         } else {
             return warning;
         };
-        self.record_finished_action_by_id(action_id);
+        if transitioned_terminal {
+            self.record_terminal_transition_by_id(action_id);
+        }
         ret
     }
 
@@ -610,11 +614,13 @@ impl SupervisorInner {
         mut msg_buf: Option<String>,
     ) -> (Option<String>, Option<String>) {
         let now = self.now_s();
+        let mut transitioned_terminal = false;
         if let Some(a) = self.last_action.as_mut().filter(|a| a.id == action_id) {
             if a.is_running() {
                 a.state = crate::model::HolderLabel::new("failed");
                 a.code = Some(crate::model::HolderLabel::new("PERSIST_FAILED"));
                 a.finished_at = Some(now);
+                transitioned_terminal = true;
             }
             a.durability_confirmed = Some(false);
             let old_warn = a.durability_warning.replace(warning);
@@ -631,7 +637,9 @@ impl SupervisorInner {
                 }
                 None => None,
             };
-            self.record_finished_action_by_id(action_id);
+            if transitioned_terminal {
+                self.record_terminal_transition_by_id(action_id);
+            }
             return (old_msg, old_warn);
         }
         (msg_buf, Some(warning))

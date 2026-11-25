@@ -25,6 +25,7 @@ pub(crate) mod config;
 mod motion;
 pub(crate) mod streams;
 mod actions;
+pub(crate) mod terminal_capture;
 
 /// Broker side of the servo, teleop and policy latest-target path (track D); the WS loop
 /// and the policy runner submit through it once they route through the mailbox.
@@ -819,6 +820,10 @@ pub struct TickPublished {
     pub kept: Option<ArmObservation>,
     /// End of the tick body (the tick phase mark), None without phase timing.
     pub body_end: Option<Instant>,
+    /// Wall duration (µs) spent in edge-triggered terminal-action capture before publish.
+    pub phase_terminal_us: u32,
+    /// True if at least one newly terminal action record was pushed during this publish.
+    pub captured_any: bool,
 }
 
 /// Phase of an off-owner deferred park continuation (MIT moving-park handback or bounded
@@ -1325,6 +1330,29 @@ pub struct SupervisorInner {
     /// Shared per-connection bounded action-terminal FIFO broadcaster (wired by `ArmSupervisor::new`;
     /// `None` on standalone `SupervisorInner::new`, never locked on `armd-control`).
     terminals: Option<Arc<TerminalBroadcaster>>,
+    /// When true (inside `ArmSupervisor::tick_shared` write guard), terminal action transitions
+    /// stage into `staged_terminals` and flush via the lock-free SPSC ring instead of touching
+    /// `TerminalBroadcaster`'s mutex under the tick guard.
+    pub(crate) defer_terminal_capture: bool,
+    /// Lock-free SPSC producer for edge-triggered fixed-size terminal records (`&mut self` only).
+    terminal_capture_tx: Option<terminal_capture::TerminalCaptureTx>,
+    /// Shared off-thread consumer + atomic accounting for terminal captures (`rx` never locked on RT).
+    terminal_capture_channel: Option<Arc<terminal_capture::TerminalCaptureChannel>>,
+    /// Inline fixed-size staging buffer for terminal transitions within one release before publish.
+    staged_terminals: terminal_capture::StagedTerminalBuf,
+    /// Fixed-size dedupe tracker keyed by `(action_id, terminal_seq)` preventing dwell re-capture.
+    terminal_edge_tracker: terminal_capture::TerminalEdgeTracker,
+    /// Accumulated wall time (µs) spent in `capture_edge_terminals` during the latest release.
+    last_phase_terminal_us: u32,
+    /// Driver-clock instant sampled strictly BEFORE `driver.feedback_ages_into` on the last poll
+    /// (fail-closed fallback reference for drivers without per-joint `feedback_instants`).
+    pub(crate) last_poll_feedback_at: Option<Instant>,
+    /// Prebuilt template observation used only by off-tick terminal drain when `hub` has not published.
+    template_obs_for_drain: Option<Arc<ArmObservation>>,
+    /// Doc-hidden deterministic test seam invoked strictly inside `capture_edge_terminals`
+    /// (`None` in production, 0 alloc).
+    #[doc(hidden)]
+    pub terminal_capture_test_hook: Option<Arc<dyn Fn(&SupervisorInner) + Send + Sync>>,
     /// Monotonic count of deferred safety log events dropped at the RT->off-thread SPSC ring.
     pub(crate) safety_log_ring_dropped: u64,
     /// Deterministic test hook invoked inside `publish_at` strictly before `core.publish(...)`.
@@ -2340,6 +2368,15 @@ impl SupervisorInner {
             consumed_stamps: ConsumedStamps::new(),
             consumed_broker_stamps: ConsumedStamps::new(),
             terminals: None,
+            defer_terminal_capture: false,
+            terminal_capture_tx: None,
+            terminal_capture_channel: None,
+            staged_terminals: terminal_capture::StagedTerminalBuf::default(),
+            terminal_edge_tracker: terminal_capture::TerminalEdgeTracker::default(),
+            last_phase_terminal_us: 0,
+            last_poll_feedback_at: None,
+            template_obs_for_drain: None,
+            terminal_capture_test_hook: None,
             safety_log_ring_dropped: 0,
             before_publish_hook: None,
             tx_joint_no_progress_ticks: vec![0; dof],
@@ -3021,48 +3058,401 @@ impl SupervisorInner {
         self.abort_enable_transition_for_fenced_lease_impl(displaced_gen);
     }
 
-    /// Ensures every subscribed connection's bounded terminal FIFO has room for any action
-    /// superseded by this start plus the new action's eventual terminal (never drops a terminal).
+    /// Ensures every subscribed connection's bounded terminal FIFO (plus staged and in-flight
+    /// SPSC captures) has room for any action superseded by this start plus the new action's
+    /// eventual terminal (never drops a terminal).
     pub(crate) fn check_terminal_fifo_for_new_action(&self) -> Result<(), SafetyError> {
         let Some(terminals) = self.terminals.as_ref() else {
             return Ok(());
         };
         let has_running = self.last_action.as_ref().is_some_and(|a| a.is_running());
-        if !terminals.can_start_action(has_running, self.rt_executor_owned) {
+        let staged = self.staged_terminals.len();
+        let (inflight, ring_admission_cap) = match self.terminal_capture_channel.as_ref() {
+            Some(ch) => (ch.inflight(), ch.admission_cap()),
+            None => (0, TERMINAL_FIFO_CAPACITY),
+        };
+        if !terminals.can_start_action_with_inflight(
+            has_running,
+            self.rt_executor_owned || self.defer_terminal_capture,
+            staged,
+            inflight,
+            ring_admission_cap,
+        ) {
             return Err(SafetyError::TerminalsBusy);
         }
         Ok(())
     }
 
-    /// Records a finished action (`!is_running()`) into every subscribed connection's bounded
-    /// terminal FIFO (deduped by action ID) and wakes `armd-dispatch` immediately. Skipped on
-    /// `armd-control` (`rt_executor_owned == true`) so RT ticks stay lock-free/zero-alloc.
-    pub(crate) fn record_finished_action(&self, action: &ActionStatus) {
-        if self.rt_executor_owned || action.is_running() {
+    /// Lock-free read of the attached driver's clock without ever acquiring `self.driver.lock()`.
+    #[inline]
+    pub(crate) fn cached_driver_clock_now(&self) -> Instant {
+        self.driver_clock.as_ref().map_or_else(Instant::now, |c| c.now())
+    }
+
+    /// Per-tick cached hardware enable state (zero driver mutex acquisitions).
+    #[inline]
+    pub(crate) fn cached_enable_state(&self) -> EnableState {
+        if self.driver.is_some() {
+            self.last_poll_enable_state
+        } else if self.is_torqued {
+            EnableState::Enabled
+        } else {
+            EnableState::Disabled
+        }
+    }
+
+    /// Per-tick cached hardware feedback freshness within `max_age` (zero driver mutex acquisitions).
+    /// Always checks `feedback_numeric_valid` and `last_poll_feedback_valid` first; evaluates
+    /// per-joint receive instants from `ArmCore::feedback()` against `cached_driver_clock_now()`,
+    /// with a fail-closed fallback to `(last_poll_oldest_age, last_poll_feedback_at)` for drivers
+    /// without per-joint instants. Never mutates `ArmCore::feedback().instants()`.
+    #[inline]
+    pub(crate) fn cached_hardware_feedback_fresh(&self, max_age: Duration) -> bool {
+        terminal_capture::evaluate_cached_feedback_fresh(
+            self.feedback_numeric_valid,
+            self.last_poll_feedback_valid,
+            self.driver.is_some(),
+            self.config.dof,
+            self.core.feedback().instants(),
+            self.last_poll_oldest_age,
+            self.last_poll_feedback_at,
+            self.cached_driver_clock_now(),
+            max_age,
+        )
+    }
+
+    /// Off-RT helper mirroring a rich macro `ActionStatus` into `TerminalCaptureChannel`'s
+    /// bounded sidecar cache so delayed dispatch past the 2 s window preserves every field.
+    /// Never called on `armd-control` (`rt_executor_owned || defer_terminal_capture`).
+    pub(crate) fn mirror_rich_action_off_rt(&self, action: &ActionStatus) {
+        if self.rt_executor_owned || self.defer_terminal_capture {
+            return;
+        }
+        if let Some(ch) = self.terminal_capture_channel.as_ref() {
+            ch.mirror_rich_action(action);
+        }
+    }
+
+    /// Off-tick Legacy helper: drains any queued SPSC terminal captures into `TerminalBroadcaster`
+    /// while `previous_action` and `last_action` are still live so no rich macro payload can be
+    /// evicted before preservation. Early-returns without touching `hub` or `rx` when empty.
+    pub(crate) fn drain_terminal_captures_with_live_slots(&self) {
+        if self.rt_executor_owned || self.defer_terminal_capture {
+            return;
+        }
+        let (Some(ch), Some(terminals)) = (self.terminal_capture_channel.as_ref(), self.terminals.as_ref()) else {
+            return;
+        };
+        if ch.inflight() == 0 {
+            return;
+        }
+        let latest = self.core.hub().latest();
+        let live_slots = [
+            self.previous_action.as_ref().map(|(a, _)| a),
+            self.last_action.as_ref(),
+        ];
+        if let Some(tmpl) = self.template_obs_for_drain.as_ref() {
+            ch.drain_into(
+                terminals,
+                self.core.hub(),
+                latest.as_deref(),
+                &live_slots,
+                tmpl,
+                false,
+            );
+        } else {
+            let fallback = ArmObservation::blank();
+            ch.drain_into(
+                terminals,
+                self.core.hub(),
+                latest.as_deref(),
+                &live_slots,
+                &fallback,
+                false,
+            );
+        }
+    }
+
+    /// Allocates the next monotonic `terminal_seq` from the shared channel (or returns 0 on
+    /// standalone `SupervisorInner::new` without an `ArmSupervisor`).
+    #[inline]
+    fn alloc_terminal_seq(&self) -> u64 {
+        self.terminal_capture_channel
+            .as_ref()
+            .map_or(0, |ch| ch.alloc_terminal_seq())
+    }
+
+    #[inline]
+    fn find_terminal_slot(&self, action_id: u64) -> Option<&ActionStatus> {
+        if let Some(a) = self.last_action.as_ref().filter(|a| a.id == action_id && !a.is_running()) {
+            return Some(a);
+        }
+        self.previous_action
+            .as_ref()
+            .map(|(a, _)| a)
+            .filter(|a| a.id == action_id && !a.is_running())
+    }
+
+    #[inline]
+    fn flush_evicted_staged(
+        &mut self,
+        evicted: terminal_capture::StagedTerminal,
+        obs_timestamp: f64,
+        publish_seq: Option<u64>,
+    ) {
+        let rec = match evicted {
+            terminal_capture::StagedTerminal::Captured(mut r) => {
+                r.publish_seq = publish_seq;
+                r.obs_timestamp = obs_timestamp;
+                Some(r)
+            }
+            terminal_capture::StagedTerminal::Deferred {
+                action_id,
+                terminal_seq,
+            } => self.find_terminal_slot(action_id).map(|a| {
+                let mut r = terminal_capture::TerminalCaptureRecord::capture_from(
+                    self,
+                    a,
+                    terminal_seq,
+                    obs_timestamp,
+                );
+                r.publish_seq = publish_seq;
+                r
+            }),
+        };
+        if let (Some(r), Some(tx)) = (rec, self.terminal_capture_tx.as_mut()) {
+            let _ = tx.try_push(r);
+        }
+    }
+
+    /// Authoritative `running -> !running` transition handler for a superseded `ActionStatus`
+    /// (called from `begin_action_inner` when `old` is moving into `previous_action`).
+    /// - Off-tick Legacy (`!rt_executor_owned && !defer_terminal_capture`): drains any earlier SPSC
+    ///   captures first (preserving strict `terminal_seq` order) and inserts the full `ActionStatus`
+    ///   directly into `TerminalBroadcaster`.
+    /// - In-tick Legacy or RT Executor (`defer_terminal_capture || rt_executor_owned`): captures a
+    ///   fixed-size `Copy` `TerminalCaptureRecord` into inline `staged_terminals` (0 alloc, 0 lock)
+    ///   and accounts its construction time in `last_phase_terminal_us`.
+    pub(crate) fn record_terminal_transition_for(&mut self, action: &ActionStatus) {
+        if action.is_running() || action.id == 0 {
+            return;
+        }
+        if self.terminal_edge_tracker.has_seen_action(action.id) {
+            return;
+        }
+        if self.rt_executor_owned || self.defer_terminal_capture {
+            let t0 = Instant::now();
+            let seq = self.alloc_terminal_seq();
+            if !self.terminal_edge_tracker.record_edge(action.id, seq) {
+                return;
+            }
+            let ts = self.now_s();
+            let rec = terminal_capture::TerminalCaptureRecord::capture_from(self, action, seq, ts);
+            if let Some(oldest) = self
+                .staged_terminals
+                .push_evicting_oldest(terminal_capture::StagedTerminal::Captured(rec))
+            {
+                self.flush_evicted_staged(oldest, ts, None);
+            }
+            self.last_phase_terminal_us = self
+                .last_phase_terminal_us
+                .saturating_add(crate::diagnostics::tick::us(t0.elapsed()));
+            return;
+        }
+        self.drain_terminal_captures_with_live_slots();
+        let seq = self.alloc_terminal_seq();
+        if !self.terminal_edge_tracker.record_edge(action.id, seq) {
             return;
         }
         if let Some(terminals) = self.terminals.as_ref() {
-            if terminals.record_finished(action) {
+            if terminals.record_finished_with_seq(seq, action.clone(), None) {
                 self.core.hub().wake();
             }
         }
     }
 
-    /// Convenience helper: if `self.last_action` matches `id` and is terminal, record it.
-    pub(crate) fn record_finished_action_by_id(&self, id: u64) {
-        if self.rt_executor_owned {
-            return;
-        }
+    /// Convenience wrapper: emits the authoritative terminal transition when `self.last_action`
+    /// matches `id` and is terminal (`!is_running()`).
+    /// On RT/guarded ticks, stages a lightweight `Deferred { action_id, terminal_seq }` edge so
+    /// `TerminalCaptureRecord::capture_from` runs inside `capture_edge_terminals` (covered by
+    /// `phases_us.terminal`, `terminal_capture_test_hook`, and capture alloc/lock proofs).
+    pub(crate) fn record_terminal_transition_by_id(&mut self, id: u64) {
         if let Some(a) = self.last_action.as_ref().filter(|a| a.id == id && !a.is_running()) {
-            self.record_finished_action(a);
+            if self.terminal_edge_tracker.has_seen_action(a.id) {
+                return;
+            }
+            if self.rt_executor_owned || self.defer_terminal_capture {
+                let action_id = a.id;
+                let seq = self.alloc_terminal_seq();
+                let _ = self.terminal_edge_tracker.record_edge(action_id, seq);
+                let ts = self.now_s();
+                if let Some(oldest) = self.staged_terminals.push_evicting_oldest(
+                    terminal_capture::StagedTerminal::Deferred {
+                        action_id,
+                        terminal_seq: seq,
+                    },
+                ) {
+                    self.flush_evicted_staged(oldest, ts, None);
+                }
+                return;
+            }
+            // Off-tick Legacy: drain ring with live slots first, then enqueue full ActionStatus.
+            self.drain_terminal_captures_with_live_slots();
+            let seq = self.alloc_terminal_seq();
+            if !self.terminal_edge_tracker.record_edge(id, seq) {
+                return;
+            }
+            if let Some(a) = self.last_action.as_ref().filter(|a| a.id == id && !a.is_running()) {
+                if let Some(terminals) = self.terminals.as_ref() {
+                    if terminals.record_finished_with_seq(seq, a.clone(), None) {
+                        self.core.hub().wake();
+                    }
+                }
+            }
         }
     }
 
+    /// Edge-triggered, allocation-free, lock-free capture and flush of staged terminal transitions
+    /// (plus once-per-id fallback for direct test struct mutations to `previous_action`/`last_action`)
+    /// into the preallocated SPSC ring strictly before `StatePublisher::publish_with_owner`.
+    ///
+    /// Returns `(total_terminal_phase_us, captured_any)` covering both record construction and
+    /// SPSC push.
+    pub(crate) fn capture_edge_terminals(
+        &mut self,
+        obs_timestamp: f64,
+        publish_seq: Option<u64>,
+    ) -> (u32, bool) {
+        let t0 = Instant::now();
+        if let Some(hook) = self.terminal_capture_test_hook.as_ref() {
+            hook(self);
+        }
+        // Fallback edge check for direct test mutations that bypassed `finish_action` /
+        // `begin_action_inner`. Respects the 2 s `previous_action` window and checks
+        // `previous_action` before `last_action` for chronological FIFO order.
+        if let Some((prev, until)) = self.previous_action.as_ref() {
+            if !prev.is_running()
+                && obs_timestamp < *until
+                && prev.id != 0
+                && !self.terminal_edge_tracker.has_seen_edge(prev.id, 0)
+            {
+                let prev_id = prev.id;
+                let seq = self.alloc_terminal_seq();
+                let _ = self.terminal_edge_tracker.record_edge(prev_id, seq);
+                if let Some(oldest) = self.staged_terminals.push_evicting_oldest(
+                    terminal_capture::StagedTerminal::Deferred {
+                        action_id: prev_id,
+                        terminal_seq: seq,
+                    },
+                ) {
+                    self.flush_evicted_staged(oldest, obs_timestamp, publish_seq);
+                }
+            }
+        }
+        if let Some(cur) = self.last_action.as_ref() {
+            if !cur.is_running()
+                && cur.id != 0
+                && !self.terminal_edge_tracker.has_seen_edge(cur.id, 0)
+            {
+                let cur_id = cur.id;
+                let seq = self.alloc_terminal_seq();
+                let _ = self.terminal_edge_tracker.record_edge(cur_id, seq);
+                if let Some(oldest) = self.staged_terminals.push_evicting_oldest(
+                    terminal_capture::StagedTerminal::Deferred {
+                        action_id: cur_id,
+                        terminal_seq: seq,
+                    },
+                ) {
+                    self.flush_evicted_staged(oldest, obs_timestamp, publish_seq);
+                }
+            }
+        }
+
+        let mut captured_any = false;
+        while let Some(staged) = self.staged_terminals.pop_front() {
+            let rec = match staged {
+                terminal_capture::StagedTerminal::Captured(mut r) => {
+                    r.publish_seq = publish_seq;
+                    r.obs_timestamp = obs_timestamp;
+                    Some(r)
+                }
+                terminal_capture::StagedTerminal::Deferred {
+                    action_id,
+                    terminal_seq,
+                } => self.find_terminal_slot(action_id).map(|a| {
+                    let mut r = terminal_capture::TerminalCaptureRecord::capture_from(
+                        self,
+                        a,
+                        terminal_seq,
+                        obs_timestamp,
+                    );
+                    r.publish_seq = publish_seq;
+                    r
+                }),
+            };
+            if let (Some(r), Some(tx)) = (rec, self.terminal_capture_tx.as_mut()) {
+                if tx.try_push(r) {
+                    captured_any = true;
+                }
+            }
+        }
+        let elapsed_us = crate::diagnostics::tick::us(t0.elapsed());
+        let total_us = self.last_phase_terminal_us.saturating_add(elapsed_us);
+        self.last_phase_terminal_us = total_us;
+        (total_us, captured_any)
+    }
+
+    /// Test-only helper: begins and immediately finishes a zero-alloc RT action inside the
+    /// deferred terminal-capture staging buffer so unit/integration tests can stage an edge.
+    #[doc(hidden)]
+    pub fn test_stage_completed_action_rt(&mut self, kind: &str) -> u64 {
+        let prev = self.defer_terminal_capture;
+        self.defer_terminal_capture = true;
+        let id = self.begin_action_rt(kind);
+        self.finish_action(id, "done", None, None, Some(true), None, None);
+        self.defer_terminal_capture = prev;
+        id
+    }
+
+    /// Test-only helper: installs a short zero-heap inline `ActiveTrajectory::quintic` (no
+    /// `motion_limits` heap Vec) so Legacy `control_tick` runs the real in-tick trajectory
+    /// completion -> `finish_action` -> `capture_from` -> SPSC push path with zero unrelated
+    /// trajectory deallocations.
+    #[doc(hidden)]
+    pub fn test_start_zero_heap_jog_rt(&mut self, delta_j0: f32, duration_s: f64) -> u64 {
+        let prev = self.defer_terminal_capture;
+        self.defer_terminal_capture = true;
+        let id = self.begin_action_rt("jog");
+        let start = self.commanded_positions.clone();
+        let mut target = start.clone();
+        if let Some(q0) = target.first_mut() {
+            *q0 += delta_j0;
+        }
+        let zeros = vec![0.0f32; start.len()];
+        let traj = MultiJointQuinticTrajectory::new(&start, &zeros, &target, &zeros, duration_s)
+            .expect("zero-heap quintic trajectory");
+        self.active_trajectory = Some(ActiveTrajectory::quintic(traj, Some(id)));
+        self.target_positions = target;
+        let _ = self.safety.set_torque_rt(true);
+        let _ = self.safety.mark_motion_started();
+        self.is_torqued = true;
+        self.defer_terminal_capture = prev;
+        id
+    }
+
+    /// Consumes and resets the accumulated `phases_us.terminal` duration (µs) for the current release.
+    #[inline]
+    pub(crate) fn take_phase_terminal_us(&mut self) -> u32 {
+        std::mem::replace(&mut self.last_phase_terminal_us, 0)
+    }
+
     /// Patches `failed_step` on a queued terminal action if still awaiting dispatcher drain.
+    /// Drains any pending SPSC captures first so an in-tick capture is never missed.
     pub(crate) fn update_recorded_terminal_failed_step(&self, id: u64, step: Option<usize>) {
         if self.rt_executor_owned {
             return;
         }
+        self.drain_terminal_captures_with_live_slots();
         if let Some(terminals) = self.terminals.as_ref() {
             terminals.update_failed_step(id, step);
         }
@@ -3741,6 +4131,9 @@ impl SupervisorInner {
             watchdog_park_pending_attempt: wd_attempt,
         };
         let owner = self.published_owner_meta();
+        let next_pub_seq = self.core.next_publish_seq();
+        let (phase_terminal_us, captured_any) =
+            self.capture_edge_terminals(timestamp, Some(next_pub_seq));
         let SupervisorInner {
             core,
             measured_positions,
@@ -3764,7 +4157,12 @@ impl SupervisorInner {
             owner,
             meta,
         );
-        TickPublished { kept, body_end }
+        TickPublished {
+            kept,
+            body_end,
+            phase_terminal_us,
+            captured_any,
+        }
     }
 
     /// The control loop's tick under the write guard of lock generation `generation`:
@@ -3797,7 +4195,8 @@ impl SupervisorInner {
     /// Pre-warms RT-owned scratch/history buffers, static fallback policies, and empty
     /// triple-buffer observation slots for the RT executor before the first release runs
     /// (nonblocking under reader contention; leaves `published_seq` unchanged).
-    pub(crate) fn prewarm_observation_slots(&mut self) {
+    #[doc(hidden)]
+    pub fn prewarm_observation_slots(&mut self) {
         let _ = Self::default_rebot_dm_resting_pose();
         let dof = self.config.dof;
         let arm_dof = self.config.arm_dof();
@@ -5650,12 +6049,35 @@ impl SupervisorInner {
     }
 
     /// Attach a driver, bind tick-epilogue ownership of the single J7 `PosForce` emitter, and
-    /// cache its lock-free clock handle (if provided).
+    /// cache its lock-free clock handle and initial driver state snapshot.
     pub(crate) fn install_driver(&mut self, mut driver: Box<dyn ArmDriver>) {
         driver.set_estop_gate(self.estop_gate());
         driver.set_external_pos_force_emitter(true);
         self.driver_clock = driver.driver_clock();
-        self.driver_feedback_confirmed_cached = driver.is_feedback_valid();
+        self.driver_caps = driver.capabilities();
+        self.last_poll_enable_state = driver.enable_state();
+        self.last_poll_partial_enable = driver.has_known_partial_enable();
+        let driver_valid = driver.is_feedback_valid();
+        self.driver_feedback_confirmed_cached = driver_valid;
+        self.last_poll_feedback_valid = driver_valid;
+        let poll_before = self.cached_driver_clock_now();
+        let mut ages = Vec::with_capacity(self.config.dof);
+        driver.feedback_ages_into(&mut ages);
+        let all_ages = ages.len() == self.config.dof && ages.iter().all(Option::is_some);
+        self.last_poll_oldest_age = if all_ages {
+            ages.iter().flatten().copied().max()
+        } else {
+            None
+        };
+        self.last_poll_feedback_at = all_ages.then_some(poll_before);
+        if self.feedback_numeric_valid && driver_valid {
+            self.core.poll_feedback(
+                &mut self.joint_feedback_queue_bounds,
+                self.config.dof,
+                driver.as_ref(),
+                &mut self.scratch.fb,
+            );
+        }
         self.driver = Some(std::sync::Mutex::new(driver));
     }
 
@@ -7109,6 +7531,7 @@ impl SupervisorInner {
                                 has_loads.then_some(sc.loads.as_slice()),
                             );
                             out.invalid_feedback = !self.feedback_numeric_valid;
+                            let poll_before = self.cached_driver_clock_now();
                             driver.feedback_ages_into(&mut sc.ages);
                             if !sc.recovered.is_empty() || self.tracking.recovery_suspended {
                                 out.recovery_ages = true;
@@ -7119,12 +7542,18 @@ impl SupervisorInner {
                             self.driver_caps = driver.capabilities();
                             self.last_poll_enable_state = driver.enable_state();
                             self.last_poll_partial_enable = driver.has_known_partial_enable();
-                            self.last_poll_feedback_valid = driver_valid;
-                            self.last_poll_oldest_age = if all_ages {
-                                sc.ages.iter().flatten().copied().max()
+                            self.last_poll_feedback_valid = driver_valid && self.feedback_numeric_valid;
+                            if self.feedback_numeric_valid {
+                                self.last_poll_oldest_age = if all_ages {
+                                    sc.ages.iter().flatten().copied().max()
+                                } else {
+                                    None
+                                };
+                                self.last_poll_feedback_at = all_ages.then_some(poll_before);
                             } else {
-                                None
-                            };
+                                self.last_poll_oldest_age = None;
+                                self.last_poll_feedback_at = None;
+                            }
                             let all_fresh_age = sc.ages.len() == self.config.dof
                                 && sc.ages.iter().all(|a| a.is_some_and(|age| age <= Duration::from_millis(250)));
                             if self.feedback_numeric_valid && sc.ages.len() == self.config.dof && driver_valid {
@@ -7180,6 +7609,8 @@ impl SupervisorInner {
                             self.last_can_feedback_instant = None;
                             self.last_poll_feedback_valid = false;
                             self.last_poll_oldest_age = None;
+                            self.last_poll_feedback_at = None;
+                            self.last_poll_enable_state = driver.enable_state();
                             self.thermal_cooldown.reset();
                             out.reset_stillness_on_read_err = true;
                         }
@@ -7220,6 +7651,10 @@ impl SupervisorInner {
                 Err(_) => {
                     self.driver_feedback_confirmed_cached = false;
                     self.last_can_feedback_instant = None;
+                    self.last_poll_feedback_valid = false;
+                    self.last_poll_oldest_age = None;
+                    self.last_poll_feedback_at = None;
+                    self.last_poll_enable_state = EnableState::Unknown;
                     self.thermal_cooldown.reset();
                     out.reset_stillness_on_read_err = true;
                 }
@@ -9804,9 +10239,15 @@ pub const TERMINAL_FIFO_CAPACITY: usize = 64;
 
 type TerminalSinkFn = Box<dyn Fn(&ArmObservation) -> bool + Send + Sync>;
 
+struct QueuedTerminal {
+    action: ActionStatus,
+    obs_override: Option<ArmObservation>,
+}
+
 struct ConnectionTerminalQueue {
     sub_id: u64,
-    fifo: std::collections::VecDeque<ActionStatus>,
+    min_terminal_seq: u64,
+    fifo: std::collections::VecDeque<QueuedTerminal>,
     seen: std::collections::VecDeque<u64>,
     sink: TerminalSinkFn,
 }
@@ -9818,10 +10259,10 @@ struct TerminalBroadcasterInner {
 }
 
 /// Lossless off-RT per-connection bounded FIFO of finished actions: every terminal action
-/// (`!is_running()`) is appended in exact order to each subscribed connection's bounded FIFO,
-/// from which `armd-dispatch` drains every terminal in order onto that connection's lossless
-/// ordinary control queue. Never drops a terminal; if full, new action starts are refused with
-/// [`SafetyError::TerminalsBusy`] until drained. Never locks on `armd-control`.
+/// (`!is_running()`) is appended in exact `terminal_seq` order to each subscribed connection's
+/// bounded FIFO, from which `armd-dispatch` drains every terminal in order onto that connection's
+/// lossless ordinary control queue. Never drops a terminal; if full, new action starts are refused
+/// with [`SafetyError::TerminalsBusy`] until drained. Never locks on `armd-control`.
 pub(crate) struct TerminalBroadcaster {
     subscriber_count: AtomicUsize,
     pending_total: AtomicUsize,
@@ -9865,13 +10306,19 @@ impl TerminalBroadcaster {
         self.capacity_atomic.store(g.capacity, Ordering::Release);
     }
 
+    #[cfg(test)]
     pub(crate) fn subscribe(&self, sink: TerminalSinkFn) -> u64 {
+        self.subscribe_with_cutoff(sink, 0)
+    }
+
+    pub(crate) fn subscribe_with_cutoff(&self, sink: TerminalSinkFn, min_terminal_seq: u64) -> u64 {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let id = g.next_id;
         g.next_id += 1;
         let cap = g.capacity;
         g.sinks.push(ConnectionTerminalQueue {
             sub_id: id,
+            min_terminal_seq,
             fifo: std::collections::VecDeque::with_capacity(cap.min(TERMINAL_FIFO_CAPACITY)),
             seen: std::collections::VecDeque::with_capacity(cap.max(128)),
             sink,
@@ -9880,23 +10327,65 @@ impl TerminalBroadcaster {
         id
     }
 
+    /// Atomically reads `read_cutoff()` and installs `min_terminal_seq` under `self.inner.lock()`
+    /// so no concurrent enqueue can observe the temporary `u64::MAX` filter after the cutoff is read.
+    pub(crate) fn activate_subscriber_cutoff(
+        &self,
+        sub_id: u64,
+        read_cutoff: impl FnOnce() -> u64,
+    ) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let cutoff = read_cutoff();
+        if let Some(q) = g.sinks.iter_mut().find(|q| q.sub_id == sub_id) {
+            q.min_terminal_seq = cutoff;
+        }
+    }
+
     pub(crate) fn unsubscribe(&self, id: u64) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.sinks.retain(|q| q.sub_id != id);
         self.recompute_atomics(&g);
     }
 
+    #[cfg(test)]
     pub(crate) fn can_start_action(&self, has_running_action: bool, lock_free: bool) -> bool {
+        self.can_start_action_with_inflight(
+            has_running_action,
+            lock_free,
+            0,
+            0,
+            TERMINAL_FIFO_CAPACITY,
+        )
+    }
+
+    /// End-to-end admission check charging `staged + inflight + fifo + needed` against both the
+    /// per-connection FIFO capacity and the capture ring's admission cap.
+    ///
+    /// Caller reads `inflight` with `Acquire` strictly BEFORE this method reads `max_fifo_len`
+    /// with `Acquire`, matching the inverse write order in `TerminalCaptureChannel::drain_into`
+    /// (`max_fifo_len` Release -> `inflight` Release) so handoffs never under-count.
+    pub(crate) fn can_start_action_with_inflight(
+        &self,
+        has_running_action: bool,
+        lock_free: bool,
+        staged: usize,
+        inflight: usize,
+        ring_admission_cap: usize,
+    ) -> bool {
         if self.subscriber_count.load(Ordering::Acquire) == 0 {
             return true;
         }
         // Reserve 1 slot for the new action's eventual terminal, plus 1 immediate slot if a
         // currently running action will be superseded right now.
         let needed = if has_running_action { 2 } else { 1 };
+        let in_pipeline = staged.saturating_add(inflight);
+        if in_pipeline.saturating_add(needed) > ring_admission_cap {
+            return false;
+        }
         if lock_free {
             let cap = self.capacity_atomic.load(Ordering::Acquire);
             let max_len = self.max_fifo_len.load(Ordering::Acquire);
-            return max_len.saturating_add(needed) <= cap;
+            return max_len.saturating_add(in_pipeline).saturating_add(needed) <= cap;
         }
         let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if g.sinks.is_empty() {
@@ -9904,10 +10393,23 @@ impl TerminalBroadcaster {
         }
         g.sinks
             .iter()
-            .all(|q| q.fifo.len().saturating_add(needed) <= g.capacity)
+            .all(|q| q.fifo.len().saturating_add(in_pipeline).saturating_add(needed) <= g.capacity)
     }
 
+    #[cfg(test)]
     pub(crate) fn record_finished(&self, action: &ActionStatus) -> bool {
+        self.record_finished_with_seq(0, action.clone(), None)
+    }
+
+    /// Enqueues a terminal action with authoritative `terminal_seq` (0 when unassigned in direct
+    /// unit tests) into every subscriber whose `min_terminal_seq < terminal_seq` (or 0) and that
+    /// has not already seen `action.id`. Updates `max_fifo_len` and `pending_total` with `Release`.
+    pub(crate) fn record_finished_with_seq(
+        &self,
+        terminal_seq: u64,
+        action: ActionStatus,
+        obs_override: Option<ArmObservation>,
+    ) -> bool {
         if action.is_running() || self.subscriber_count.load(Ordering::Acquire) == 0 {
             return false;
         }
@@ -9918,18 +10420,24 @@ impl TerminalBroadcaster {
         let cap = g.capacity;
         let mut enqueued = false;
         for q in &mut g.sinks {
+            if terminal_seq != 0 && terminal_seq <= q.min_terminal_seq {
+                continue;
+            }
             if q.seen.contains(&action.id) {
                 continue;
             }
             // Never drop or skip a finished action's terminal even if `q.fifo.len() >= cap`:
-            // `can_start_action` refuses NEW starts with `TERMINALS_BUSY` once `len >= cap`,
-            // while any already-running action's terminal is preserved in strict FIFO order.
+            // `can_start_action_with_inflight` refuses NEW starts with `TERMINALS_BUSY` once
+            // `len >= cap`, while any already-running action's terminal is preserved in strict FIFO order.
             let seen_cap = cap.max(128).max(q.fifo.len() + 1);
             if q.seen.len() >= seen_cap {
                 q.seen.pop_front();
             }
             q.seen.push_back(action.id);
-            q.fifo.push_back(action.clone());
+            q.fifo.push_back(QueuedTerminal {
+                action: action.clone(),
+                obs_override: obs_override.clone(),
+            });
             enqueued = true;
         }
         if enqueued {
@@ -9938,29 +10446,19 @@ impl TerminalBroadcaster {
         enqueued
     }
 
-    pub(crate) fn record_from_observation(&self, obs: &ArmObservation) {
-        if self.subscriber_count.load(Ordering::Acquire) == 0 {
-            return;
-        }
-        // Check `previous_action` before `action` to preserve chronological FIFO order.
-        for act in [obs.previous_action.as_ref(), obs.action.as_ref()]
-            .into_iter()
-            .flatten()
-        {
-            if !act.is_running() {
-                self.record_finished(act);
-            }
-        }
-    }
-
     pub(crate) fn update_failed_step(&self, action_id: u64, step: Option<usize>) {
         if self.subscriber_count.load(Ordering::Acquire) == 0 {
             return;
         }
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         for q in &mut g.sinks {
-            if let Some(a) = q.fifo.iter_mut().find(|a| a.id == action_id) {
-                a.failed_step = step;
+            if let Some(entry) = q.fifo.iter_mut().find(|e| e.action.id == action_id) {
+                entry.action.failed_step = step;
+                if let Some(obs) = entry.obs_override.as_mut() {
+                    if let Some(a) = obs.action.as_mut().filter(|a| a.id == action_id) {
+                        a.failed_step = step;
+                    }
+                }
             }
         }
     }
@@ -9981,9 +10479,12 @@ impl TerminalBroadcaster {
         // (e.g., outbound queue full -> fatal close triggered), keep the terminal at the
         // head of the FIFO and keep the subscriber until connection teardown unsubscribes it.
         for q in &mut g.sinks {
-            while let Some(finished) = q.fifo.front() {
-                let mut obs = base_obs.clone();
-                obs.action = Some(finished.clone());
+            while let Some(entry) = q.fifo.front() {
+                let mut obs = match entry.obs_override.as_ref() {
+                    Some(captured) => captured.clone(),
+                    None => base_obs.clone(),
+                };
+                obs.action = Some(entry.action.clone());
                 obs.previous_action = None;
                 if (q.sink)(&obs) {
                     q.fifo.pop_front();
@@ -10008,6 +10509,14 @@ impl TerminalBroadcaster {
     pub(crate) fn pending_total(&self) -> usize {
         self.pending_total.load(Ordering::Acquire)
     }
+
+    pub(crate) fn lock_for_test(&self) -> impl Drop + '_ {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(crate) fn try_lock_for_test(&self) -> bool {
+        self.inner.try_lock().is_ok()
+    }
 }
 
 /// RAII subscription unregistering a WS connection from [`TerminalBroadcaster`] on teardown.
@@ -10028,6 +10537,7 @@ pub struct ArmSupervisor {
     inner: Arc<SupervisorLock<SupervisorInner>>,
     telemetry_tx: broadcast::Sender<ArmObservation>,
     terminals: Arc<TerminalBroadcaster>,
+    terminal_capture_channel: Arc<terminal_capture::TerminalCaptureChannel>,
     /// Single authoritative atomic state packing `(generation << 1) | latched` for E-stop.
     pub estop_state: Arc<crate::rt_core::urgent::EstopState>,
     pub e_stop_latched: crate::rt_core::urgent::EstopLatchView,
@@ -10375,6 +10885,8 @@ impl ArmSupervisor {
         #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
         let policy_backend_permits = Arc::new(tokio::sync::Semaphore::new(2));
         let terminals = Arc::new(TerminalBroadcaster::default());
+        let (terminal_capture_tx, terminal_capture_channel) =
+            terminal_capture::TerminalCaptureChannel::new();
         let mut inner = SupervisorInner::new(config);
         inner.estop_state = estop_state.clone();
         inner.e_stop_latched = e_stop_latched.clone();
@@ -10399,7 +10911,10 @@ impl ArmSupervisor {
             inner.policy_terminal_tx = Some(policy_terminal_tx);
         }
         inner.terminals = Some(Arc::clone(&terminals));
+        inner.terminal_capture_tx = Some(terminal_capture_tx);
+        inner.terminal_capture_channel = Some(Arc::clone(&terminal_capture_channel));
         let template_obs = inner.current_observation();
+        inner.template_obs_for_drain = Some(Arc::new(template_obs.clone()));
         let initial_pub_cfg = crate::rt_core::requests::config::PublishedConfig::from_inner(&inner);
         let estop_epoch = inner.safety.epoch_mirror();
         let hub = inner.core.hub().clone();
@@ -10418,6 +10933,7 @@ impl ArmSupervisor {
             inner: Arc::new(SupervisorLock::new(inner)),
             telemetry_tx: tx,
             terminals,
+            terminal_capture_channel,
             estop_state,
             e_stop_latched,
             requested_estop_count,
@@ -11227,11 +11743,29 @@ impl ArmSupervisor {
 
     /// Subscribes a WS connection's lossless ordinary control queue to unseen action-terminal
     /// observations so terminals are never lost to telemetry broadcast lag.
+    ///
+    /// Uses a race-free 0->1 / N->N+1 registration protocol under `(channel.rx -> terminals.inner)`:
+    /// 1. Register the queue with `min_terminal_seq = u64::MAX` (activates admission backpressure
+    ///    immediately while ignoring pre-existing records).
+    /// 2. Under `channel.rx`, drain ready pre-subscription captures (enforcing the publish barrier
+    ///    so unpublished RT captures are never exposed early), then atomically read
+    ///    `latest_terminal_seq()` and set `min_terminal_seq` inside `terminals.inner`.
     pub(crate) fn subscribe_action_terminals(
         &self,
         sink: impl Fn(&ArmObservation) -> bool + Send + Sync + 'static,
     ) -> TerminalSubscription {
-        let id = self.terminals.subscribe(Box::new(sink));
+        let id = self
+            .terminals
+            .subscribe_with_cutoff(Box::new(sink), u64::MAX);
+        let latest = self.hub.latest();
+        self.terminal_capture_channel
+            .drain_and_activate_subscriber(
+                id,
+                &self.terminals,
+                &self.hub,
+                latest.as_deref(),
+                &self.template_obs,
+            );
         TerminalSubscription {
             broadcaster: Arc::clone(&self.terminals),
             id,
@@ -11250,26 +11784,97 @@ impl ArmSupervisor {
         if self.hub.has_dispatcher() { return Ok(()); }
         let _start = self.dispatcher_start.lock().unwrap_or_else(|e| e.into_inner());
         if self.hub.has_dispatcher() { return Ok(()); }
-        let (hub, tx, terminals, sinks, tick_stats, template_obs) = (
+        let (hub, tx, terminals, terminal_capture, sinks, tick_stats, template_obs) = (
             Arc::clone(&self.hub),
             self.telemetry_tx.clone(),
             Arc::clone(&self.terminals),
+            Arc::clone(&self.terminal_capture_channel),
             Arc::clone(&self.sinks),
             Arc::clone(&self.tick_stats),
             self.template_obs.clone(),
         );
         let handle = std::thread::Builder::new()
             .name("armd-dispatch".into())
-            .spawn(move || dispatch_loop(&hub, &tx, &terminals, &sinks, &tick_stats, &template_obs))
+            .spawn(move || {
+                dispatch_loop(
+                    &hub,
+                    &tx,
+                    &terminals,
+                    &terminal_capture,
+                    &sinks,
+                    &tick_stats,
+                    &template_obs,
+                )
+            })
             .map_err(|e| ArmError::Internal(format!("cannot start the observation dispatcher thread: {e}")))?;
         self.hub.set_dispatcher(handle.thread().clone());
         Ok(())
     }
 
-    /// Test-only hook: configure per-connection bounded terminal FIFO capacity.
+    /// Test-only hook: configure per-connection bounded terminal FIFO and capture admission capacity.
     #[doc(hidden)]
     pub fn test_set_terminal_fifo_capacity(&self, capacity: usize) {
         self.terminals.set_capacity(capacity);
+        self.terminal_capture_channel.set_admission_cap(capacity);
+    }
+
+    /// Test-only hook: pause or resume draining of the SPSC terminal capture ring.
+    #[doc(hidden)]
+    pub fn test_set_terminal_capture_drain_paused(&self, paused: bool) {
+        self.terminal_capture_channel.set_drain_paused(paused);
+        if !paused {
+            self.hub.wake();
+        }
+    }
+
+    /// Test-only hook: configure effective push capacity of the SPSC terminal capture ring
+    /// (for deterministic ring-saturation tests).
+    #[doc(hidden)]
+    pub fn test_set_terminal_capture_push_cap(&self, cap: usize) {
+        self.terminal_capture_channel.set_test_push_cap(cap);
+    }
+
+    /// Test-only hook: synchronously drain ready SPSC terminal capture records into
+    /// `TerminalBroadcaster` and flush subscriber queues (for deterministic tests without waiting
+    /// on dispatcher wake jitter).
+    #[doc(hidden)]
+    pub fn test_drain_terminal_captures(&self) -> usize {
+        let latest = self.hub.latest();
+        let drained = self.terminal_capture_channel.drain_into(
+            &self.terminals,
+            &self.hub,
+            latest.as_deref(),
+            &[],
+            &self.template_obs,
+            true,
+        );
+        if self.terminals.has_pending() {
+            let base = latest
+                .as_ref()
+                .map(|s| &s.obs)
+                .unwrap_or(&self.template_obs);
+            self.terminals.drain_all(base);
+        }
+        drained
+    }
+
+    /// Test-only accessor for lock-free terminal capture statistics.
+    #[doc(hidden)]
+    pub fn test_terminal_capture_stats(&self) -> crate::diagnostics::tick::TerminalCaptureStats {
+        self.terminal_capture_channel.stats()
+    }
+
+    /// Test-only hook: hold `TerminalBroadcaster`'s internal mutex (for deterministic lock proofs).
+    #[doc(hidden)]
+    pub fn test_lock_terminal_broadcaster(&self) -> impl Drop + '_ {
+        self.terminals.lock_for_test()
+    }
+
+    /// Test-only hook: non-blocking `try_lock` on `TerminalBroadcaster`'s internal mutex
+    /// (positive control for lock proofs).
+    #[doc(hidden)]
+    pub fn test_try_lock_terminal_broadcaster(&self) -> bool {
+        self.terminals.try_lock_for_test()
     }
 
     /// Test-only hook: pause or resume draining of per-connection terminal FIFOs in `armd-dispatch`.
@@ -11282,8 +11887,20 @@ impl ArmSupervisor {
     }
 
     /// Test-only accessor for total pending finished actions across subscribed terminal FIFOs.
+    /// Drains any ready SPSC terminal captures into `TerminalBroadcaster` first (respecting
+    /// `drain_paused`, without flushing subscriber sinks) so immediate post-tick checks observe
+    /// deterministic FIFO occupancy.
     #[doc(hidden)]
     pub fn test_pending_terminal_count(&self) -> usize {
+        let latest = self.hub.latest();
+        let _ = self.terminal_capture_channel.drain_into(
+            &self.terminals,
+            &self.hub,
+            latest.as_deref(),
+            &[],
+            &self.template_obs,
+            true,
+        );
         self.terminals.pending_total()
     }
 
@@ -13772,7 +14389,7 @@ impl ArmSupervisor {
         let usage_start = UsageMark::now();
         let (
             mut obs,
-            terminal_obs,
+            captured_any,
             wait,
             lock_held,
             control_hz,
@@ -13789,22 +14406,25 @@ impl ArmSupervisor {
             phase_alloc_read,
             phase_ack_flush,
             phase_terminal,
-            after_terminal,
+            lock_end,
         ) = {
             let (mut inner, generation) = self.inner.write_tick().await;
             if inner.detached || self.owner_mode() != OWNER_LEGACY {
                 return None;
             }
             let locked = Instant::now();
+            let usage_locked = UsageMark::now();
+            // Reset allocator counters and enable deferral BEFORE draining pending disconnects so
+            // any terminal or allocation inside the entire guarded interval is covered.
+            let _ = crate::diagnostics::alloc::take();
+            inner.defer_terminal_capture = true;
+            inner.defer_zero_check_persist = true;
+            inner.defer_watchdog_park_plan = true;
             if self.pending_disconnect_hold.load(Ordering::Acquire) > 0 {
                 let _ = self.drain_pending_disconnects_under_guard(&mut inner, None);
             }
-            let usage_locked = UsageMark::now();
-            let _ = crate::diagnostics::alloc::take();
             // No other guard exists now: the log is complete up to the guard waited for.
             let log = self.inner.take_log();
-            inner.defer_zero_check_persist = true;
-            inner.defer_watchdog_park_plan = true;
             inner.tick_phases_us = [0; 5];
             let body_start = Instant::now();
             inner.tick_phase_mark = Some(body_start);
@@ -13812,7 +14432,12 @@ impl ArmSupervisor {
                 let period = Duration::from_secs_f64(1.0 / f64::from(inner.config.control_frequency_hz.max(1)));
                 started + period
             });
-            let TickPublished { kept, body_end } = inner.tick_publish_with_deadline(
+            let TickPublished {
+                kept,
+                body_end,
+                phase_terminal_us,
+                captured_any,
+            } = inner.tick_publish_with_deadline(
                 dt,
                 generation,
                 keep,
@@ -13820,30 +14445,24 @@ impl ArmSupervisor {
             );
             let body_end = body_end.unwrap_or(body_start);
             let phases = inner.tick_phases_us;
+            let _ = inner.take_phase_terminal_us();
+            inner.defer_terminal_capture = false;
             inner.defer_zero_check_persist = false;
             inner.defer_watchdog_park_plan = false;
             let pending_zc = inner.pending_zero_check_persist.take();
             let pending_wd = inner.watchdog_park_pending.filter(|p| !p.waiting_mit_handback);
             let control_hz = inner.config.control_frequency_hz;
             let mid_csw_start = CswMark::now();
-            let lock_end = Instant::now();
-            let allocs = crate::diagnostics::alloc::take();
-            let after_alloc_read = Instant::now();
+            let after_publish = Instant::now();
             Self::flush_legacy_estop_acks_into(&self.estop_reg, &mut inner);
             let after_ack_flush = Instant::now();
-            // Capture any terminal action observation WITHOUT touching `self.hub.latest()` so a
-            // preempted reader holding `StateHub`'s reader lock can never delay `tick_shared`.
-            let terminal_obs = if inner.last_action.as_ref().is_some_and(|a| !a.is_running())
-                || inner.previous_action.as_ref().is_some_and(|(a, _)| !a.is_running())
-            {
-                kept.clone().or_else(|| Some(inner.current_observation()))
-            } else {
-                None
-            };
-            let after_terminal = Instant::now();
+            // Sample allocator totals at the end of the guarded interval so the alloc proof covers
+            // disconnect drain, tick control, edge-triggered terminal capture, publish, and ACK flush.
+            let allocs = crate::diagnostics::alloc::take();
+            let lock_end = Instant::now();
             (
                 kept,
-                terminal_obs,
+                captured_any,
                 locked.saturating_duration_since(started),
                 lock_end.saturating_duration_since(locked),
                 control_hz,
@@ -13854,24 +14473,21 @@ impl ArmSupervisor {
                 locked,
                 usage_locked,
                 body_start.saturating_duration_since(locked),
-                lock_end.saturating_duration_since(body_end),
+                after_publish.saturating_duration_since(body_end),
                 allocs,
                 mid_csw_start,
-                us(after_alloc_read.saturating_duration_since(lock_end)),
-                us(after_ack_flush.saturating_duration_since(after_alloc_read)),
-                us(after_terminal.saturating_duration_since(after_ack_flush)),
-                after_terminal,
+                us(lock_end.saturating_duration_since(after_ack_flush)),
+                us(after_ack_flush.saturating_duration_since(after_publish)),
+                phase_terminal_us,
+                lock_end,
             )
         };
         let released = Instant::now();
-        let phase_guard_drop = us(released.saturating_duration_since(after_terminal));
+        let phase_guard_drop = us(released.saturating_duration_since(lock_end));
         let usage_released = UsageMark::now();
         let (mid_nvcsw, mid_nivcsw) = mid_csw_delta(&mid_csw_start, &usage_released);
-        if let Some(ref tobs) = terminal_obs {
-            self.terminals.record_from_observation(tobs);
-            if self.terminals.has_pending() {
-                self.hub.wake();
-            }
+        if captured_any {
+            self.hub.wake();
         }
         self.control_period_us.store((1e6 / f64::from(control_hz.max(1))) as u64, Ordering::Relaxed);
         if let Some(wd) = pending_wd {
@@ -14127,6 +14743,7 @@ impl ArmSupervisor {
             published: self.hub.published_seq(),
             tick_frees: self.hub.tick_frees(),
         };
+        snap.terminal_capture = self.terminal_capture_channel.stats();
         snap.safety_log_dropped = self
             .sinks
             .lock()
@@ -14168,6 +14785,7 @@ fn dispatch_loop(
     hub: &crate::rt_core::publish::StateHub,
     tx: &broadcast::Sender<ArmObservation>,
     terminals: &TerminalBroadcaster,
+    terminal_capture: &terminal_capture::TerminalCaptureChannel,
     sinks: &std::sync::Mutex<Option<Arc<crate::rt_core::executor::OffThreadSinks>>>,
     tick_stats: &crate::diagnostics::tick::LockFreeTickStats,
     template_obs: &ArmObservation,
@@ -14191,44 +14809,85 @@ fn dispatch_loop(
     };
     let mut last = 0u64;
     let mut last_diag = 0u64;
+    let mut latest_snap: Option<Arc<crate::rt_core::publish::Snapshot>> = None;
+    let mut pending_telemetry: Option<ArmObservation> = None;
     while !hub.is_closed() {
         drain_sinks();
         if let Some(ring) = hub.record_ring() { ring.drain(); }
-        let mut new_obs: Option<ArmObservation> = None;
         if hub.published_seq() != last {
             if let Some(s) = hub.latest().filter(|s| s.meta.seq > last) {
                 last = s.meta.seq;
                 last_diag = last_diag.max(s.policy_diag_seq);
-                terminals.record_from_observation(&s.obs);
-                new_obs = Some(s.obs.clone());
+                pending_telemetry = Some(s.obs.clone());
+                latest_snap = Some(s);
             }
         } else if hub.policy_diag_seq() != last_diag {
             if let Some(s) = hub.latest() {
                 if s.meta.seq > last {
                     last = s.meta.seq;
                     last_diag = last_diag.max(s.policy_diag_seq);
-                    terminals.record_from_observation(&s.obs);
-                    new_obs = Some(s.obs.clone());
+                    pending_telemetry = Some(s.obs.clone());
+                    latest_snap = Some(s);
                 } else if s.policy_diag_seq > last_diag {
                     last_diag = s.policy_diag_seq;
                     // Diagnostic-only overlay update (Shadow steps / timing stats): forward
                     // telemetry without re-enqueuing action terminals.
-                    new_obs = Some(s.obs.clone());
+                    pending_telemetry = Some(s.obs.clone());
+                    latest_snap = Some(s);
                 }
+            }
+        }
+        // Single authoritative terminal ingestion path: drain ready SPSC capture records into
+        // `TerminalBroadcaster` in strict `terminal_seq` order, binding publish-barrier eligibility
+        // strictly to `latest_snap.meta.seq`.
+        terminal_capture.drain_into(
+            terminals,
+            hub,
+            latest_snap.as_deref(),
+            &[],
+            template_obs,
+            true,
+        );
+        // If a new publication landed concurrently while draining, refresh `latest_snap` once so a
+        // waiting `publish_seq`-gated capture consumes against the matching snapshot immediately.
+        if hub.published_seq() != last {
+            if let Some(s) = hub.latest().filter(|s| s.meta.seq > last) {
+                last = s.meta.seq;
+                last_diag = last_diag.max(s.policy_diag_seq);
+                pending_telemetry = Some(s.obs.clone());
+                latest_snap = Some(s);
+                terminal_capture.drain_into(
+                    terminals,
+                    hub,
+                    latest_snap.as_deref(),
+                    &[],
+                    template_obs,
+                    true,
+                );
             }
         }
         // Drain every connection's bounded terminal FIFO into its higher-priority `ordinary_out_tx`
         // BEFORE forwarding telemetry so a newer telemetry snapshot can never overtake earlier
         // terminals on the wire.
         if terminals.has_pending() {
-            let base = new_obs
-                .clone()
+            let base = latest_snap
+                .as_ref()
+                .map(|s| s.obs.clone())
+                .or_else(|| pending_telemetry.clone())
                 .or_else(|| hub.latest().map(|s| s.obs.clone()));
             terminals.drain_all(base.as_ref().unwrap_or(template_obs));
         }
-        if let Some(obs) = new_obs {
-            if terminals.pending_total() == 0 && tx.receiver_count() > 0 {
-                let _ = tx.send(obs);
+        // Telemetry forwarding gate: read `terminal_capture.inflight()` (Acquire) FIRST, then
+        // `terminals.pending_total()` (Acquire) SECOND — the exact inverse of `drain_into`'s
+        // write order (`pending_total` Release -> `inflight` Release) so `(0, 0)` cannot be
+        // observed while a terminal is moving into the FIFO. Keep `pending_telemetry` across
+        // iterations so a gated snapshot is still forwarded once terminals clear without requiring
+        // another publication.
+        if terminal_capture.inflight() == 0 && terminals.pending_total() == 0 {
+            if let Some(obs) = pending_telemetry.take() {
+                if tx.receiver_count() > 0 {
+                    let _ = tx.send(obs);
+                }
             }
         }
         std::thread::park_timeout(Duration::from_millis(50));
@@ -14240,12 +14899,17 @@ fn dispatch_loop(
         s.flush_and_report_shutdown(tick_stats);
     }
     if let Some(ring) = hub.record_ring() { ring.drain(); }
-    let latest_obs = hub.latest().map(|s| s.obs.clone());
-    if let Some(obs) = latest_obs.as_ref() {
-        terminals.record_from_observation(obs);
-    }
+    let final_snap = hub.latest().or(latest_snap);
+    terminal_capture.drain_into(
+        terminals,
+        hub,
+        final_snap.as_deref(),
+        &[],
+        template_obs,
+        false,
+    );
     if terminals.has_pending() {
-        terminals.drain_all(latest_obs.as_ref().unwrap_or(template_obs));
+        terminals.drain_all(final_snap.as_ref().map_or(template_obs, |s| &s.obs));
     }
 }
 

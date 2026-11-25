@@ -599,6 +599,19 @@ pub struct ObservationCacheStats {
     pub published: u64,
 }
 
+/// Edge-triggered terminal-observation capture counters (`armd-control` -> off-thread drain).
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+pub struct TerminalCaptureStats {
+    /// Edge-triggered terminal records captured on the control release path since boot.
+    pub captured: u64,
+    /// Terminal records dropped because the preallocated SPSC capture ring was saturated.
+    pub saturated: u64,
+    /// Latched indicator set true if capture ring saturation has ever occurred since boot.
+    pub ever_saturated: bool,
+    /// Captured records currently queued in flight awaiting off-thread drain.
+    pub queued: u64,
+}
+
 /// Percentiles of the tick's lock phases.
 #[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
 pub struct LockPhasePercentiles {
@@ -763,6 +776,9 @@ pub struct TickSnapshot {
     /// Control thread scheduling; None until the control thread reported it (tests).
     pub control_thread: Option<ControlThreadSched>,
     pub observation_cache: ObservationCacheStats,
+    /// Edge-triggered terminal-observation capture counters (`armd-control` -> off-thread drain).
+    #[serde(default)]
+    pub terminal_capture: TerminalCaptureStats,
     /// Monotonic count of deferred safety log events dropped on overflow (never reset).
     #[serde(default)]
     pub safety_log_dropped: u64,
@@ -1841,6 +1857,7 @@ impl TickWindow {
             },
             control_thread: None,
             observation_cache: ObservationCacheStats::default(),
+            terminal_capture: TerminalCaptureStats::default(),
             safety_log_dropped: 0,
             log_writer_dropped: 0,
             stats_snapshot_lapped: self.snapshot_lapped,

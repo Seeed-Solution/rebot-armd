@@ -525,6 +525,9 @@ mod runtime {
 
         fn record_approach(&mut self, id: u64, outcome: &Outcome) {
             if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) { outcome.apply(a); }
+            if let Some(a) = self.last_action.as_ref().filter(|a| a.id == id) {
+                self.mirror_rich_action_off_rt(a);
+            }
         }
 
         fn outcome_of(plan: &Plan, signs: &[i8], flipped: &[usize]) -> Outcome {
