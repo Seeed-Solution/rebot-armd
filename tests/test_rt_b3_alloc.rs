@@ -3503,8 +3503,23 @@ fn mit_recovery_no_fence_ack_or_state_change_before_clear_check_passes() {
         (inner, bus, clock)
     };
 
+    let assert_mit_fence_unacked = |log: &[armd::transport::CanFrame], ctx: &str| {
+        assert!(
+            !log.iter().any(|f| f.id == 0x7FF && f.data[2] == 0xCC),
+            "{ctx}: autonomous 0xCC CAN refresh must stay blocked while MIT fence is unacked: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|f| f.id == 4 || f.id == 0x104),
+            "{ctx}: fenced MIT joint J4 must receive 0 frames while MIT fence is unacked: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|f| f.data == damiao::CMD_DISABLE),
+            "{ctx}: 0 CMD_DISABLE frames allowed while recovery is refused: {log:?}"
+        );
+    };
+
     // (a) Quiet-period refusal MUST NOT ack the fence: after holdoff elapses, background ticks
-    //     must still emit 0 autonomous 0xCC CAN refresh frames.
+    //     must still emit 0 autonomous 0xCC CAN refresh frames and 0 J4 MIT frames.
     {
         let (mut inner, bus, clock) = setup_mit_lost(false);
         bus.clear_log();
@@ -3516,15 +3531,12 @@ fn mit_recovery_no_fence_ack_or_state_change_before_clear_check_passes() {
             clock.advance(Duration::from_millis(120));
             inner.tick(DT);
         }
-        assert!(
-            bus.tx_log().is_empty(),
-            "failed quiet-period clear must NOT ack fence or unlock autonomous CAN refresh: {:?}",
-            bus.tx_log()
-        );
+        assert_mit_fence_unacked(&bus.tx_log(), "failed quiet-period clear");
     }
 
     // (b) WatchdogTimeout with active lease + stale heartbeat MUST refuse in pre_ctx BEFORE
-    //     even polling 0xCC, leaving fence unacked and state unchanged.
+    //     even polling 0xCC, leaving fence unacked and state unchanged (B2: non-MIT position
+    //     joints still keep their stationary holds, while J4 MIT & 0xCC refresh stay blocked).
     {
         let (mut inner, bus, clock) = setup_mit_lost(true);
         inner.lease_enabled = true;
@@ -3540,7 +3552,7 @@ fn mit_recovery_no_fence_ack_or_state_change_before_clear_check_passes() {
             clock.advance(Duration::from_millis(120));
             inner.tick(DT);
         }
-        assert!(bus.tx_log().is_empty(), "fence must stay unacked after heartbeat refusal: {:?}", bus.tx_log());
+        assert_mit_fence_unacked(&bus.tx_log(), "heartbeat refusal");
     }
 
     // (c) Hot ThermalTrip during MIT recovery MUST refuse in full clear_check with ZERO fence ack
@@ -3568,17 +3580,13 @@ fn mit_recovery_no_fence_ack_or_state_change_before_clear_check_passes() {
             "no recovery commands allowed when clear_check refuses: {:?}",
             bus.tx_log()
         );
-        // Subsequent ticks MUST send 0 autonomous CAN refresh frames (fence was NOT acked!).
+        // Subsequent ticks MUST send 0 autonomous CAN refresh frames & 0 J4 frames (fence NOT acked!).
         bus.clear_log();
         for _ in 0..4 {
             clock.advance(Duration::from_millis(120));
             inner.tick(DT);
         }
-        assert!(
-            bus.tx_log().is_empty(),
-            "autonomous CAN refresh must stay blocked after ThermalTrip refused MIT clear: {:?}",
-            bus.tx_log()
-        );
+        assert_mit_fence_unacked(&bus.tx_log(), "ThermalTrip refused MIT clear");
 
         // (d) Cool motor 0 to 35 C and nudge J0 to 0.03 rad (within the 0.05 rad rest tolerance
         //     so Rule A' allows recovery, while distinct from 0.0 to detect state mutation), feed K=3
@@ -3610,11 +3618,7 @@ fn mit_recovery_no_fence_ack_or_state_change_before_clear_check_passes() {
             clock.advance(Duration::from_millis(120));
             inner.tick(DT);
         }
-        assert!(
-            bus.tx_log().is_empty(),
-            "autonomous CAN refresh must stay blocked when recovery confirmation is missing: {:?}",
-            bus.tx_log()
-        );
+        assert_mit_fence_unacked(&bus.tx_log(), "unconfirmed MIT clear");
 
         // (e) Now full clear_check passes + confirmed -> recovery succeeds, clears to Idle,
         //     mit.owner becomes Off, and fence is now acknowledged so read-only polls may resume.
