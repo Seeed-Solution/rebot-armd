@@ -917,6 +917,10 @@ pub struct SupervisorInner {
     /// Shared exclusive-lifetime lock-free cancellation slots for executor policy start/run.
     #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
     pub(crate) policy_cancel_slots: Arc<crate::rt_core::requests::policy::PolicyCancelSlots>,
+    /// Lock-free single-producer ring publishing immutable RT policy terminal records off-thread
+    /// (0 allocs, 0 frees, 0 locks on `armd-control`).
+    #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+    pub(crate) policy_terminal_tx: Option<crate::rt_core::requests::policy::PolicyTerminalTx>,
     /// Most recent policy observation telemetry (retained after policy run ends).
     #[cfg(feature = "policy-runtime")]
     pub last_policy_obs: Option<crate::model::PolicyObservation>,
@@ -2080,6 +2084,8 @@ impl SupervisorInner {
             policy_load_reservation: None,
             #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
             policy_cancel_slots: Arc::new(crate::rt_core::requests::policy::PolicyCancelSlots::new()),
+            #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+            policy_terminal_tx: None,
             #[cfg(feature = "policy-runtime")]
             last_policy_obs: None,
             #[cfg(feature = "policy-runtime")]
@@ -5377,9 +5383,33 @@ impl SupervisorInner {
 
     /// Lock-free Step-2 cached hardware feedback confirmation (`false` when driverless, lock failed,
     /// or last Step-2 poll failed — fail-closed without taking the driver mutex in Step 3/4).
+    #[cfg(feature = "policy-runtime")]
     #[inline]
     pub(crate) fn rt_driver_feedback_confirmed(&self) -> bool {
         self.driver_feedback_confirmed_cached
+    }
+
+    /// Pushes an immutable owner terminal outcome for an executor-owned policy run into the
+    /// lock-free `rtrb` ring consumed off-thread by `PolicyQualificationCoordinator` (0 RT allocs).
+    #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+    #[inline]
+    pub(crate) fn push_rt_policy_terminal(
+        &mut self,
+        action_id: u64,
+        steps: u64,
+        stop_reason: &str,
+        action_state: &str,
+        stats: crate::motion::PolicyStats,
+    ) {
+        if let Some(tx) = self.policy_terminal_tx.as_mut() {
+            tx.push(crate::rt_core::requests::policy::PolicyTerminalOutcome {
+                action_id,
+                steps,
+                stop_reason: crate::model::HolderLabel::new(stop_reason),
+                action_state: crate::model::HolderLabel::new(action_state),
+                stats,
+            });
+        }
     }
 
     /// Lock-free read of the driver clock for RT off-thread forwarding timestamps, falling back
@@ -6973,6 +7003,7 @@ impl SupervisorInner {
         let drv_action_cutoff = if self.safety.state().is_stopped() {
             None
         } else {
+            #[allow(unused_mut)]
             let mut owner_dl = self.active_action_deadline();
             #[cfg(feature = "policy-runtime")]
             if self.watchdog_park.is_none() && !self.pending_normal_unload {
@@ -6981,6 +7012,9 @@ impl SupervisorInner {
                     .as_ref()
                     .filter(|r| r.mode == crate::policy_runtime::PolicyMode::Live)
                 {
+                    if let Some(dl) = run.deadline {
+                        owner_dl = Some(owner_dl.map_or(dl, |cur| cur.min(dl)));
+                    }
                     if self.lease_enabled {
                         // Include absolute lease expiry (fail-closed to `owner_now` if lease is
                         // missing or mismatched) so a policy target can never transmit after expiry.
@@ -7213,10 +7247,11 @@ impl SupervisorInner {
         // lease-expiry fence BEFORE gripper, motion, or bus output runs.
         self.sync_nonblocking_disconnect_fence(now_fn());
 
-        // 0.0b Output-boundary policy authorization recheck BEFORE the gripper force/contact
-        // block reads `gripper_stream_target` (so a revoked policy never advances J7 via CapRamp).
+        // 0.0b Output-boundary policy deadline & authorization recheck BEFORE the gripper
+        // force/contact block reads `gripper_stream_target` (so an expired or revoked policy never
+        // advances J7 via CapRamp or emits post-deadline motion).
         #[cfg(feature = "policy-runtime")]
-        self.recheck_live_policy_authorization_rt();
+        self.enforce_policy_deadline_and_auth_rt(now_fn());
 
         // 0.1 Gripper stall protection state machine
         if self.active_trajectory.is_some() || self.macro_run.is_some() || self.pending_normal_unload
@@ -9602,6 +9637,12 @@ pub struct ArmSupervisor {
     /// Shared exclusive-lifetime lock-free policy cancellation slots.
     #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
     policy_cancel_slots: Arc<crate::rt_core::requests::policy::PolicyCancelSlots>,
+    /// Off-thread coordinator for immutable RT policy terminal records and qualification ledger fences.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+    policy_qualification: Arc<crate::rt_core::requests::policy::PolicyQualificationCoordinator>,
+    /// Bounded permit pool capping concurrent blocking policy loads/warmups and inferences.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+    policy_backend_permits: Arc<tokio::sync::Semaphore>,
     /// Leaf queue of socket-close disconnects deferred when the owner write lock is contended
     /// or ownership is transitioning (`OWNER_TRANSFERRING`); NEVER locked on `armd-control`.
     pending_disconnects: std::sync::Mutex<std::collections::VecDeque<crate::rt_core::requests::lease::ConnectionHandle>>,
@@ -9919,6 +9960,11 @@ impl ArmSupervisor {
         let atomic_closed_policy_action_id = Arc::new(AtomicU64::new(0));
         #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
         let policy_cancel_slots = Arc::new(crate::rt_core::requests::policy::PolicyCancelSlots::new());
+        #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+        let (policy_terminal_tx, policy_qualification) =
+            crate::rt_core::requests::policy::PolicyQualificationCoordinator::channel();
+        #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+        let policy_backend_permits = Arc::new(tokio::sync::Semaphore::new(2));
         let terminals = Arc::new(TerminalBroadcaster::default());
         let mut inner = SupervisorInner::new(config);
         inner.estop_state = estop_state.clone();
@@ -9941,6 +9987,7 @@ impl ArmSupervisor {
         #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
         {
             inner.policy_cancel_slots = Arc::clone(&policy_cancel_slots);
+            inner.policy_terminal_tx = Some(policy_terminal_tx);
         }
         inner.terminals = Some(Arc::clone(&terminals));
         let template_obs = inner.current_observation();
@@ -9975,6 +10022,10 @@ impl ArmSupervisor {
             rt_policy_auth,
             #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
             policy_cancel_slots,
+            #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+            policy_qualification,
+            #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+            policy_backend_permits,
             pending_disconnects: std::sync::Mutex::new(std::collections::VecDeque::new()),
             tick_stats: Arc::new(crate::diagnostics::tick::LockFreeTickStats::new()),
             control_sched: Arc::new(std::sync::Mutex::new(None)),
@@ -10841,6 +10892,20 @@ impl ArmSupervisor {
     #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
     pub fn policy_cancel_slots(&self) -> &Arc<crate::rt_core::requests::policy::PolicyCancelSlots> {
         &self.policy_cancel_slots
+    }
+
+    /// Off-thread coordinator for immutable RT policy terminal records and qualification fences.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+    pub fn policy_qualification(
+        &self,
+    ) -> &Arc<crate::rt_core::requests::policy::PolicyQualificationCoordinator> {
+        &self.policy_qualification
+    }
+
+    /// Bounded permit pool capping concurrent blocking policy loads/warmups and inferences.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+    pub fn policy_backend_permits(&self) -> &Arc<tokio::sync::Semaphore> {
+        &self.policy_backend_permits
     }
 
     /// Lock-free `policy_live_allowed` query on `OWNER_EXECUTOR` (reads `PublishedConfig`),

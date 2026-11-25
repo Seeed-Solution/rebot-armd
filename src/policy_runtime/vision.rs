@@ -564,6 +564,8 @@ struct EmbeddingHubInner {
     pending_challenges: VecDeque<PendingClockChallenge>,
     next_challenge_seq: u64,
     bound: Option<BoundEmbeddingPolicy>,
+    /// Monotonic high-water policy instance ID that has bound this hub (fences late old runners).
+    last_bound_policy_id: u64,
     invalidation_generation: u64,
     producer_epoch: Option<u64>,
     last_frame_id: Option<u64>,
@@ -592,6 +594,7 @@ impl Default for EmbeddingHubInner {
             pending_challenges: VecDeque::new(),
             next_challenge_seq: 0,
             bound: None,
+            last_bound_policy_id: 0,
             invalidation_generation: 0,
             producer_epoch: None,
             last_frame_id: None,
@@ -608,9 +611,22 @@ impl Default for EmbeddingHubInner {
 }
 
 impl EmbeddingHubInner {
-    /// Refuses the bound run's targets that wait in the latest-target mailbox.
+    /// Refuses the bound run's targets that wait in the latest-target mailbox, scoped to the
+    /// currently bound policy instance when using an executor-scoped authorization.
     fn revoke_targets(&self) {
-        if let Some(a) = self.target_authorization.as_ref() { a.revoke(); }
+        let Some(a) = self.target_authorization.as_ref() else {
+            return;
+        };
+        if let Some(ref b) = self.bound {
+            if a.revoke_for_action(b.policy_instance_id) {
+                return;
+            }
+            if (a.current() >> 32) == 0 {
+                a.revoke();
+            }
+        } else if (a.current() >> 32) == 0 {
+            a.revoke();
+        }
     }
 
     fn now_ms(&self) -> u64 {
@@ -823,6 +839,37 @@ impl VideoEmbeddingHub {
 
     pub fn bind_policy(&self, policy_instance_id: u64, spec: VideoEmbeddingSpec, runner_fps: f64) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        Self::bind_policy_locked(&mut inner, policy_instance_id, spec, runner_fps, None);
+    }
+
+    /// Monotonically fenced policy binding for `OWNER_EXECUTOR`: refuses stale older runners
+    /// (`policy_instance_id <= last_bound_policy_id`) under the hub lock without disturbing the
+    /// newer active run's frames, binding, or authorization.
+    pub fn bind_policy_fenced(
+        &self,
+        policy_instance_id: u64,
+        spec: VideoEmbeddingSpec,
+        runner_fps: f64,
+        authorization: Option<super::runner::PolicyAuthorization>,
+    ) -> bool {
+        if policy_instance_id == 0 {
+            return false;
+        }
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if policy_instance_id <= inner.last_bound_policy_id {
+            return false;
+        }
+        Self::bind_policy_locked(&mut inner, policy_instance_id, spec, runner_fps, authorization);
+        true
+    }
+
+    fn bind_policy_locked(
+        inner: &mut EmbeddingHubInner,
+        policy_instance_id: u64,
+        spec: VideoEmbeddingSpec,
+        runner_fps: f64,
+        authorization: Option<super::runner::PolicyAuthorization>,
+    ) {
         let now_ms = inner.now_ms();
         let effective_staleness_ms = spec.effective_staleness_ms_for_fps(runner_fps);
         let compatible = inner.frames.iter().all(|f| {
@@ -853,11 +900,15 @@ impl VideoEmbeddingHub {
                 inner.frames.pop_front();
             }
         }
+        inner.last_bound_policy_id = inner.last_bound_policy_id.max(policy_instance_id);
         inner.bound = Some(BoundEmbeddingPolicy {
             policy_instance_id,
             spec,
             effective_staleness_ms,
         });
+        if let Some(auth) = authorization {
+            inner.target_authorization = Some(auth);
+        }
         inner.refill_started_at_ms = None;
         inner.continuous_renewal_floor_gen = inner.handshake_generation;
         inner.server_model_epoch = inner.server_model_epoch.wrapping_add(1);
@@ -873,11 +924,11 @@ impl VideoEmbeddingHub {
             .as_ref()
             .is_some_and(|b| b.policy_instance_id == policy_instance_id)
         {
-            inner.bound = None;
             inner.continuous_renewal_floor_gen = inner.handshake_generation;
             inner.server_model_epoch = inner.server_model_epoch.wrapping_add(1);
             inner.invalidation_generation = inner.invalidation_generation.wrapping_add(1);
             inner.revoke_targets();
+            inner.bound = None;
             inner.target_authorization = None;
         }
     }

@@ -612,6 +612,7 @@ fn rt_policy_lifecycle_reserve_begin_step_hold_supersede_and_terminate_zero_allo
         max_vision_age_ms: None,
         vision_stale_hold: false,
         period_us: 50_000,
+        deadline: None,
         has_verified_release_gate: false,
         gate_policy_sha256: HolderLabel::new(""),
         gate_calibration_digest: HolderLabel::new(""),

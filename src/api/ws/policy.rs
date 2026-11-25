@@ -880,15 +880,47 @@ pub(super) async fn handle_executor_ws_policy(
 
         let sandbox_load = sandbox_c.clone();
         let cancel_policy = ws_closed_c.clone();
+        let cancel_slots_load = sup.policy_cancel_slots().clone();
+        let cancel_slot_idx = token_guard.slot();
+        let cancel_token_val = token_guard.token();
+        let stop_requests_load = handle.stop_requests().clone();
+        let initial_stop_gen = reserve_authority.stop_generation;
+        let qual_coord_load = sup.policy_qualification().clone();
         let plan_conn = conn.clone();
         let policy_id_load = policy_id.clone();
+        let backend_permit = match sup.policy_backend_permits().clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                let cur_ep = config::current_epoch_off_lock(&sup, epoch);
+                let _ = tx
+                    .send(config::off_lock_command_reject(
+                        &request_id_val,
+                        cur_ep,
+                        policy_code_to_api_error("MOTION_BUSY", cur_ep),
+                    ))
+                    .await;
+                return;
+            }
+        };
         let prepared = tokio::task::spawn_blocking(move || {
+            let _backend_permit = backend_permit;
+            let is_cancelled = || {
+                cancel_policy.load(Ordering::Acquire)
+                    || cancel_slots_load.is_cancelled(cancel_slot_idx, cancel_token_val)
+                    || stop_requests_load.current() != initial_stop_gen
+            };
             maybe_pause_blocking_plan(&plan_conn);
             let delay_ms = sandbox_load.policy_load_delay_ms();
-            if delay_ms > 0 && !sleep_cancellable_ms(delay_ms, &cancel_policy) {
-                return Err(ArmError::Safety(SafetyError::Stopped));
+            if delay_ms > 0 {
+                let until = Instant::now() + std::time::Duration::from_millis(delay_ms);
+                while Instant::now() < until {
+                    if is_cancelled() {
+                        return Err(ArmError::Safety(SafetyError::Stopped));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
             }
-            if cancel_policy.load(Ordering::Acquire) {
+            if is_cancelled() {
                 return Err(ArmError::Safety(SafetyError::Stopped));
             }
             let dir = sandbox_load.policy_dir(&policy_id_load).ok_or_else(|| {
@@ -900,7 +932,7 @@ pub(super) async fn handle_executor_ws_policy(
             })?;
             let mut prepared_policy = crate::policy_runtime::prepare_policy(&dir, &config_snap)
                 .map_err(ArmError::from)?;
-            if cancel_policy.load(Ordering::Acquire) {
+            if is_cancelled() {
                 return Err(ArmError::Safety(SafetyError::Stopped));
             }
             let infer_delay_ms = sandbox_load.policy_infer_delay_ms();
@@ -959,23 +991,12 @@ pub(super) async fn handle_executor_ws_policy(
                             message: "production_release requires a device qualification ledger ($ARMD_POLICY_LEDGER or /userdata/rebot-teleop/policy_qualification.jsonl)".into(),
                         });
                     };
-                    let records = crate::policy_runtime::qualification::load_records(path)
-                        .map_err(|e| ArmError::Rejected {
-                            status: 403,
-                            code: "QUALIFICATION_REQUIRED".into(),
-                            message: e.to_string(),
-                        })?;
-                    crate::policy_runtime::qualification::check_production_qualified(&records, gate)
-                        .map_err(|e| ArmError::Rejected {
-                            status: 403,
-                            code: "QUALIFICATION_REQUIRED".into(),
-                            message: e.to_string(),
-                        })?;
+                    qual_coord_load.check_production_qualified_locked(path, gate)?;
                     production_qualified_verified = true;
                 }
             }
 
-            if cancel_policy.load(Ordering::Acquire) {
+            if is_cancelled() {
                 return Err(ArmError::Safety(SafetyError::Stopped));
             }
             let warmup = prepared_policy
@@ -984,7 +1005,7 @@ pub(super) async fn handle_executor_ws_policy(
                     crate::policy_runtime::WARMUP_MAX_TOTAL,
                 )
                 .map_err(ArmError::from)?;
-            if cancel_policy.load(Ordering::Acquire) {
+            if is_cancelled() {
                 return Err(ArmError::Safety(SafetyError::Stopped));
             }
             let speed = crate::policy_runtime::SpeedGateReport::new(warmup, effective_fps);
@@ -1174,6 +1195,7 @@ pub(super) async fn handle_executor_ws_policy(
                                     max_vision_age_ms,
                                     vision_stale_hold,
                                     period_us: crate::policy_runtime::period_us_for_fps(fps),
+                                    deadline,
                                     has_verified_release_gate,
                                     gate_policy_sha256,
                                     gate_calibration_digest,
@@ -1215,8 +1237,28 @@ pub(super) async fn handle_executor_ws_policy(
                                                         dyn crate::policy_runtime::PolicyVisionSource,
                                                     >
                                             });
-                                        // Hand ownership of `token_guard` directly into the runner
-                                        // BEFORE sending the WS ACK so drop/cancellation cannot orphan it.
+                                        // Register pending qualification fence BEFORE spawning runner
+                                        // or sending WS ACK so no subsequent `production_release`
+                                        // start can slip in before this supervised run's ledger write.
+                                        let pending_qual_guard = if request_mode
+                                            == crate::policy_runtime::PolicyMode::Live
+                                            && !pub_cfg2.policy_live_allowed
+                                        {
+                                            verified_release_gate
+                                                .as_ref()
+                                                .filter(|g| {
+                                                    g.authorization_tier()
+                                                        == crate::policy_runtime::AuthorizationTier::SupervisedFirstRun
+                                                })
+                                                .map(|g| {
+                                                    sup.policy_qualification()
+                                                        .register_pending(action_id, g)
+                                                })
+                                        } else {
+                                            None
+                                        };
+                                        // Hand ownership of `token_guard` and `pending_qual_guard`
+                                        // directly into the runner BEFORE sending the WS ACK.
                                         crate::policy_runtime::spawn_executor_policy_runner(
                                             crate::policy_runtime::ExecutorPolicyRunParams {
                                                 supervisor: sup.clone(),
@@ -1235,6 +1277,7 @@ pub(super) async fn handle_executor_ws_policy(
                                                 policy_live_allowed: pub_cfg2.policy_live_allowed,
                                                 has_driver,
                                                 token_guard,
+                                                pending_qual_guard,
                                             },
                                         );
                                         let mut ack = off_lock_policy_ack(

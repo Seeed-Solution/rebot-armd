@@ -42,6 +42,16 @@ pub const MAX_STREAMS: usize = 8;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StreamId(pub u64);
 
+/// Absolute validity deadlines carried atomically in the triple-buffer slot alongside a
+/// policy [`TargetFrame`] (zero allocations, `Copy`, `None` for non-policy / detector frames).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PolicyValidityBounds {
+    /// Earliest expiry across the embedding window (`min(window_newest, window_oldest)`).
+    pub vision_window_expires_at: Option<Instant>,
+    /// Absolute clock-handshake expiry (`clock_handshake_expires_at_ms` anchored at submit).
+    pub handshake_expires_at: Option<Instant>,
+}
+
 /// One target.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TargetFrame {
@@ -155,6 +165,28 @@ impl TargetFrame {
         current: &Authority,
         targets: &TargetAuthority,
     ) -> Option<&'static str> {
+        self.check_policy_with_validity(
+            arm,
+            boot,
+            now,
+            current,
+            targets,
+            PolicyValidityBounds::default(),
+        )
+    }
+
+    /// Single effective refusal code for a policy target frame together with its atomic
+    /// [`PolicyValidityBounds`]. Enforces `HANDSHAKE_EXPIRED` and embedding window expiry
+    /// independently of `vision_at` / `vision_frame_id`.
+    pub fn check_policy_with_validity(
+        &self,
+        arm: ArmId,
+        boot: BootId,
+        now: Instant,
+        current: &Authority,
+        targets: &TargetAuthority,
+        validity: PolicyValidityBounds,
+    ) -> Option<&'static str> {
         if self.dof == 0 || usize::from(self.dof) > MAX_DOF { return Some("INVALID_COMMAND"); }
         if self.arm != arm || self.boot != boot || self.boot.is_zero() { return Some("WRONG_TARGET"); }
         if let Some(code) = self.authority.admits(current) { return Some(code); }
@@ -164,6 +196,12 @@ impl TargetFrame {
             if now.checked_duration_since(self.input_at).is_none_or(|age| age > m) {
                 return Some("INPUT_STALE");
             }
+        }
+        if validity.handshake_expires_at.is_some_and(|exp| now > exp) {
+            return Some("HANDSHAKE_EXPIRED");
+        }
+        if validity.vision_window_expires_at.is_some_and(|exp| now > exp) {
+            return Some("VISION_STALE");
         }
         if let Some(m) = targets.max_vision_age {
             if self.vision_at.and_then(|at| now.checked_duration_since(at)).is_none_or(|age| age > m) {
@@ -192,6 +230,7 @@ pub enum Submitted {
 #[derive(Clone, Copy)]
 struct Slot {
     frame: Option<TargetFrame>,
+    validity: PolicyValidityBounds,
 }
 
 /// The broker's side.
@@ -217,7 +256,7 @@ pub struct TargetReader {
 }
 
 pub fn target_mailbox() -> (TargetWriter, TargetReader) {
-    let empty = Slot { frame: None };
+    let empty = Slot { frame: None, validity: PolicyValidityBounds::default() };
     let (producer, consumer) = triple_buffer(empty, empty, empty);
     let (otx, orx) = rtrb::RingBuffer::new(OUTCOME_CAPACITY);
     (TargetWriter { producer, outcomes: orx, streams: [None; MAX_STREAMS], last: None, coalesced: 0 }, TargetReader { consumer, outcomes: otx, outcomes_dropped: 0 })
@@ -225,6 +264,14 @@ pub fn target_mailbox() -> (TargetWriter, TargetReader) {
 
 impl TargetWriter {
     pub fn submit(&mut self, frame: TargetFrame) -> Submitted {
+        self.submit_with_validity(frame, PolicyValidityBounds::default())
+    }
+
+    pub fn submit_with_validity(
+        &mut self,
+        frame: TargetFrame,
+        validity: PolicyValidityBounds,
+    ) -> Submitted {
         let entry = match self.streams.iter().position(|e| e.is_some_and(|(s, _)| s == frame.stream)) {
             Some(i) => {
                 if self.streams[i].is_some_and(|(_, last)| frame.seq <= last) { return Submitted::OutOfOrder; }
@@ -237,7 +284,9 @@ impl TargetWriter {
         };
         // conservative: the reader may take the unconsumed frame right after this check
         if self.producer.unconsumed() && self.last.is_some_and(|l| !l.replaceable) { return Submitted::Busy; }
-        self.producer.back_mut().frame = Some(frame);
+        let slot = self.producer.back_mut();
+        slot.frame = Some(frame);
+        slot.validity = validity;
         let overwrote = self.producer.publish();
         self.streams[entry] = Some((frame.stream, frame.seq));
         let replaced = self.last.replace(frame).filter(|_| overwrote);
@@ -266,8 +315,14 @@ impl TargetWriter {
 impl TargetReader {
     /// The newest unconsumed frame (None when nothing new).
     pub fn take(&mut self) -> Option<TargetFrame> {
+        self.take_with_validity().map(|(f, _)| f)
+    }
+
+    /// The newest unconsumed frame together with its atomic [`PolicyValidityBounds`].
+    pub fn take_with_validity(&mut self) -> Option<(TargetFrame, PolicyValidityBounds)> {
         if !self.consumer.refresh() { return None; }
-        self.consumer.front().frame
+        let slot = self.consumer.front();
+        slot.frame.map(|f| (f, slot.validity))
     }
 
     /// Reports how a consumed frame was applied (never waits: counted when the ring is full).

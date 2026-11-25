@@ -927,6 +927,7 @@ mod pr_y_policy_unit_tests {
             max_vision_age_ms,
             vision_stale_hold,
             period_us: 50_000,
+            deadline: None,
             has_verified_release_gate: gate_max_speed_scale.is_some(),
             gate_policy_sha256: HolderLabel::new("digest_a"),
             gate_calibration_digest: HolderLabel::new(r.fx.core.active_calibration_digest_str()),

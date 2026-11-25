@@ -114,6 +114,8 @@ pub struct PolicyRun {
     pub(crate) load_token: u64,
     /// Preallocated slot index in `PolicyCancelSlots` for `load_token`.
     pub(crate) cancel_slot: u8,
+    /// Optional absolute `max_seconds` run deadline enforced directly on `armd-control`.
+    pub(crate) deadline: Option<Instant>,
     pub stop_reason: Option<String>,
     /// [`max_policy_input_age_ms`] for the run's rate (set by the runner; until then the
     /// bound for [`MIN_LIVE_POLICY_FPS`]).
@@ -144,12 +146,73 @@ impl Default for PolicyAuthorization {
 }
 
 impl PolicyAuthorization {
+    const GEN_MASK: u64 = 0xFFFF_FFFF;
+
+    #[inline]
+    fn action_tag(action_id: u64) -> u64 {
+        let t = action_id & Self::GEN_MASK;
+        if t == 0 { 1 } else { t }
+    }
+
+    #[inline]
+    fn next_gen(cur: u64) -> u64 {
+        let g = (cur & Self::GEN_MASK).wrapping_add(1) & Self::GEN_MASK;
+        if g == 0 { 1 } else { g }
+    }
+
     pub fn current(&self) -> u64 { self.0.load(Ordering::Acquire) }
 
-    /// Revokes every target stamped so far; returns the new generation.
+    /// Binds this shared RT authorization to `action_id` and advances the generation (0 allocs).
+    pub(crate) fn bind_action(&self, action_id: u64) -> u64 {
+        let tag = Self::action_tag(action_id);
+        let mut cur = self.0.load(Ordering::Acquire);
+        loop {
+            let next = (tag << 32) | Self::next_gen(cur);
+            match self.0.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return next,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    /// Unbinds `action_id` and advances the generation (CAS-scoped so a replacement run is untouched).
+    pub(crate) fn unbind_action(&self, action_id: u64) {
+        let tag = Self::action_tag(action_id);
+        let mut cur = self.0.load(Ordering::Acquire);
+        while (cur >> 32) == tag {
+            let next = Self::next_gen(cur);
+            match self.0.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    /// Revokes targets ONLY while `action_id` still owns this authorization (returns `false`
+    /// without mutating a replacement run's generation if the owner already changed).
+    pub(crate) fn revoke_for_action(&self, action_id: u64) -> bool {
+        let tag = Self::action_tag(action_id);
+        let mut cur = self.0.load(Ordering::Acquire);
+        while (cur >> 32) == tag {
+            let next = (tag << 32) | Self::next_gen(cur);
+            match self.0.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return true,
+                Err(actual) => cur = actual,
+            }
+        }
+        false
+    }
+
+    /// Revokes every target stamped so far (preserving any active action tag); returns the new generation.
     pub fn revoke(&self) -> u64 {
-        let next = self.0.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
-        if next == 0 { self.0.fetch_add(1, Ordering::AcqRel).wrapping_add(1) } else { next }
+        let mut cur = self.0.load(Ordering::Acquire);
+        loop {
+            let next = (cur & !Self::GEN_MASK) | Self::next_gen(cur);
+            match self.0.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return next,
+                Err(actual) => cur = actual,
+            }
+        }
     }
 }
 
@@ -180,6 +243,7 @@ impl PolicyRun {
             rt_owned: true,
             load_token: 0,
             cancel_slot: 0,
+            deadline: None,
             stop_reason: None,
             max_input_age_ms: max_policy_input_age_ms(MIN_LIVE_POLICY_FPS),
             step_stats: PolicyStepStats::default(),
@@ -1631,6 +1695,7 @@ pub struct ExecutorPolicyRunParams {
     pub policy_live_allowed: bool,
     pub has_driver: bool,
     pub token_guard: crate::rt_core::requests::policy::PolicyTokenGuard,
+    pub pending_qual_guard: Option<crate::rt_core::requests::policy::PendingQualGuard>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1943,6 +2008,23 @@ async fn executor_commit_gate(
     } else {
         vision_captured_at
     };
+    let validity = if let (Some(ticket), Some(ref guard)) = (emb_ticket, &hub_guard) {
+        let live_now_ms = guard.live_ticket_state().now_armd_ms;
+        let anchor = Instant::now();
+        let win_dl_ms = ticket
+            .window_oldest_deadline_ms()
+            .min(ticket.window_newest_deadline_ms());
+        let win_rem = win_dl_ms.saturating_sub(live_now_ms);
+        let hs_rem = ticket
+            .clock_handshake_expires_at_ms()
+            .saturating_sub(live_now_ms);
+        crate::rt_core::mailbox::PolicyValidityBounds {
+            vision_window_expires_at: Some(anchor + Duration::from_millis(win_rem)),
+            handshake_expires_at: Some(anchor + Duration::from_millis(hs_rem)),
+        }
+    } else {
+        crate::rt_core::mailbox::PolicyValidityBounds::default()
+    };
     let policy_target = PolicyTarget {
         action_id,
         stamp: PolicyStamp {
@@ -1955,7 +2037,7 @@ async fn executor_commit_gate(
         vision_at,
         vision_frame_id,
     };
-    let sub = handle.submit_policy(&policy_target);
+    let sub = handle.submit_policy_with_validity(&policy_target, validity);
     drop(hub_guard);
 
     match sub {
@@ -2030,6 +2112,7 @@ pub fn spawn_executor_policy_runner(params: ExecutorPolicyRunParams) -> tokio::t
         policy_live_allowed,
         has_driver,
         mut token_guard,
+        mut pending_qual_guard,
     } = params;
 
     let clamped_fps = if fps.is_finite() && fps > 0.0 {
@@ -2134,17 +2217,26 @@ pub fn spawn_executor_policy_runner(params: ExecutorPolicyRunParams) -> tokio::t
         let embedding_hub = video_embedding_spec
             .as_ref()
             .map(|_| embedding_hub_for_supervisor(&supervisor));
-        let _unbind_guard = embedding_hub
-            .as_ref()
-            .zip(video_embedding_spec.as_ref())
-            .map(|(hub, spec)| {
-                hub.bind_policy(action_id, spec.clone(), clamped_fps);
-                hub.bind_target_authorization(action_id, authorization.clone());
-                UnbindGuard {
-                    hub: hub.clone(),
+        let mut _unbind_guard: Option<UnbindGuard> = None;
+        if let (Some(hub), Some(spec)) = (embedding_hub.as_ref(), video_embedding_spec.as_ref()) {
+            // Fence hub binding by monotonic action_id and live stream status so a delayed old
+            // runner A can never overwrite or unbind a newer active runner B.
+            if handle.is_policy_closed(action_id)
+                || !hub.bind_policy_fenced(
                     action_id,
-                }
+                    spec.clone(),
+                    clamped_fps,
+                    Some(authorization.clone()),
+                )
+            {
+                token_guard.disarm();
+                return;
+            }
+            _unbind_guard = Some(UnbindGuard {
+                hub: hub.clone(),
+                action_id,
             });
+        }
         let emb_run_started_ms = embedding_hub.as_ref().map_or(0, |h| h.now_armd_ms());
 
         let collector = if video_embedding_spec.is_none() {
@@ -2164,16 +2256,12 @@ pub fn spawn_executor_policy_runner(params: ExecutorPolicyRunParams) -> tokio::t
         let mut interval = tokio::time::interval(period);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        let mut fallback_stop_reason = "STOPPED";
-        let mut fallback_action_state = "cancelled";
 
         loop {
             if let Some(dl) = tokio_dl {
                 tokio::select! {
                     biased;
                     _ = tokio::time::sleep_until(dl) => {
-                        fallback_stop_reason = "MAX_SECONDS";
-                        fallback_action_state = "done";
                         if send_executor_end_policy(
                             &handle, &supervisor, client, &mut client_seq,
                             lease_generation, epoch_id, &token_guard,
@@ -2198,8 +2286,6 @@ pub fn spawn_executor_policy_runner(params: ExecutorPolicyRunParams) -> tokio::t
             let step_started_at = Instant::now();
             if let Some(dl) = deadline {
                 if Instant::now() >= dl {
-                    fallback_stop_reason = "MAX_SECONDS";
-                    fallback_action_state = "done";
                     if send_executor_end_policy(
                         &handle,
                         &supervisor,
@@ -2276,8 +2362,6 @@ pub fn spawn_executor_policy_runner(params: ExecutorPolicyRunParams) -> tokio::t
                         .min(u64::MAX as u128) as u64;
                     (oldest, Some((min_ms, max_ms)))
                 } else if mode == PolicyMode::Live && !policy_live_allowed {
-                    fallback_stop_reason = "STALE_INPUT";
-                    fallback_action_state = "failed";
                     if send_executor_end_policy(
                         &handle,
                         &supervisor,
@@ -2323,8 +2407,6 @@ pub fn spawn_executor_policy_runner(params: ExecutorPolicyRunParams) -> tokio::t
                 emb_mapped_and_unc_ms,
             ) = if let (Some(emb_spec), Some(hub)) = (&video_embedding_spec, &embedding_hub) {
                 let Some(lease_gen) = snap_lease_gen else {
-                    fallback_stop_reason = "LEASE_LOST";
-                    fallback_action_state = "failed";
                     if send_executor_end_policy(
                         &handle,
                         &supervisor,
@@ -2378,7 +2460,7 @@ pub fn spawn_executor_policy_runner(params: ExecutorPolicyRunParams) -> tokio::t
                         )
                     }
                     EmbeddingSampleDecision::Hold => {
-                        authorization.revoke();
+                        let _ = authorization.revoke_for_action(action_id);
                         let _ = send_executor_end_policy(
                             &handle,
                             &supervisor,
@@ -2397,8 +2479,6 @@ pub fn spawn_executor_policy_runner(params: ExecutorPolicyRunParams) -> tokio::t
                         continue;
                     }
                     EmbeddingSampleDecision::Stop { reason, message } => {
-                        fallback_stop_reason = reason;
-                        fallback_action_state = "failed";
                         if send_executor_end_policy(
                             &handle,
                             &supervisor,
@@ -2457,7 +2537,7 @@ pub fn spawn_executor_policy_runner(params: ExecutorPolicyRunParams) -> tokio::t
                         None,
                     ),
                     VisionStepDecision::Hold => {
-                        authorization.revoke();
+                        let _ = authorization.revoke_for_action(action_id);
                         let _ = send_executor_end_policy(
                             &handle,
                             &supervisor,
@@ -2476,8 +2556,6 @@ pub fn spawn_executor_policy_runner(params: ExecutorPolicyRunParams) -> tokio::t
                         continue;
                     }
                     VisionStepDecision::Stop { reason, message } => {
-                        fallback_stop_reason = reason;
-                        fallback_action_state = "failed";
                         if send_executor_end_policy(
                             &handle,
                             &supervisor,
@@ -2507,7 +2585,42 @@ pub fn spawn_executor_policy_runner(params: ExecutorPolicyRunParams) -> tokio::t
                 (None, None, None, None, None)
             };
 
+            let infer_permit = {
+                let perm_fut = supervisor.policy_backend_permits().clone().acquire_owned();
+                if let Some(dl) = tokio_dl {
+                    tokio::select! {
+                        biased;
+                        _ = tokio::time::sleep_until(dl) => {
+                            if send_executor_end_policy(
+                                &handle, &supervisor, client, &mut client_seq,
+                                lease_generation, epoch_id, &token_guard,
+                                EndPolicySpec::Finish {
+                                    action_id,
+                                    load_token,
+                                    lease_generation,
+                                    reason: HolderLabel::new("MAX_SECONDS"),
+                                    final_steps: shadow_steps,
+                                    final_stats: step_stats.report(),
+                                },
+                            ).await {
+                                token_guard.disarm();
+                            }
+                            break;
+                        }
+                        res = perm_fut => match res {
+                            Ok(p) => p,
+                            Err(_) => break,
+                        },
+                    }
+                } else {
+                    match perm_fut.await {
+                        Ok(p) => p,
+                        Err(_) => break,
+                    }
+                }
+            };
             let infer_handle = tokio::task::spawn_blocking(move || {
+                let _infer_permit = infer_permit;
                 let t0 = Instant::now();
                 let res =
                     prepared.step_infer_with_vision(&measured, vision_features.as_deref());
@@ -2518,8 +2631,6 @@ pub fn spawn_executor_policy_runner(params: ExecutorPolicyRunParams) -> tokio::t
                 tokio::select! {
                     biased;
                     _ = tokio::time::sleep_until(dl) => {
-                        fallback_stop_reason = "MAX_SECONDS";
-                        fallback_action_state = "done";
                         if send_executor_end_policy(
                             &handle, &supervisor, client, &mut client_seq,
                             lease_generation, epoch_id, &token_guard,
@@ -2545,8 +2656,6 @@ pub fn spawn_executor_policy_runner(params: ExecutorPolicyRunParams) -> tokio::t
             let (target, infer_us) = match infer_result {
                 Err(e) => {
                     tracing::warn!("Policy inference task failed for action {action_id}: {e}");
-                    fallback_stop_reason = "INFERENCE_ERROR";
-                    fallback_action_state = "failed";
                     if send_executor_end_policy(
                         &handle,
                         &supervisor,
@@ -2581,8 +2690,6 @@ pub fn spawn_executor_policy_runner(params: ExecutorPolicyRunParams) -> tokio::t
                                 PolicyError::NonFinite(_) => "NON_FINITE",
                                 _ => "INFERENCE_ERROR",
                             };
-                            fallback_stop_reason = reason;
-                            fallback_action_state = "failed";
                             if send_executor_end_policy(
                                 &handle,
                                 &supervisor,
@@ -2649,7 +2756,7 @@ pub fn spawn_executor_policy_runner(params: ExecutorPolicyRunParams) -> tokio::t
             {
                 ExecutorCommitOutcome::Continue => {}
                 ExecutorCommitOutcome::Hold => {
-                    authorization.revoke();
+                    let _ = authorization.revoke_for_action(action_id);
                     let _ = send_executor_end_policy(
                         &handle,
                         &supervisor,
@@ -2671,8 +2778,6 @@ pub fn spawn_executor_policy_runner(params: ExecutorPolicyRunParams) -> tokio::t
                     break;
                 }
                 ExecutorCommitOutcome::Finish(reason) => {
-                    fallback_stop_reason = reason;
-                    fallback_action_state = "done";
                     if send_executor_end_policy(
                         &handle,
                         &supervisor,
@@ -2697,8 +2802,6 @@ pub fn spawn_executor_policy_runner(params: ExecutorPolicyRunParams) -> tokio::t
                     break;
                 }
                 ExecutorCommitOutcome::Fail { reason, message } => {
-                    fallback_stop_reason = reason;
-                    fallback_action_state = "failed";
                     if send_executor_end_policy(
                         &handle,
                         &supervisor,
@@ -2727,66 +2830,45 @@ pub fn spawn_executor_policy_runner(params: ExecutorPolicyRunParams) -> tokio::t
         }
 
         // Off-thread device qualification ledger append for supervised first runs on real arms.
+        // Uses ONLY the immutable action-keyed owner terminal outcome (`PolicyTerminalOutcome`):
+        // never falls back to optimistic runner intent (`MAX_SECONDS/done`) when the owner's
+        // terminal record is missing or displaced. Releases `pending_qual_guard` atomically under
+        // `ledger_io` ONLY AFTER fsync completes so concurrent `production_release` starts cannot
+        // approve using stale ledger state.
         if mode == PolicyMode::Live && !policy_live_allowed {
             if let Some(ref gate) = verified_release_gate {
                 if gate.authorization_tier() == super::release_gate::AuthorizationTier::SupervisedFirstRun
                 {
+                    let qual_coord = supervisor.policy_qualification().clone();
+                    let mut owner_outcome = qual_coord.take_terminal_outcome(action_id);
+                    if owner_outcome.is_none() {
+                        let poll_until = Instant::now() + Duration::from_millis(200);
+                        while Instant::now() < poll_until {
+                            tokio::time::sleep(Duration::from_millis(2)).await;
+                            owner_outcome = qual_coord.take_terminal_outcome(action_id);
+                            if owner_outcome.is_some() {
+                                break;
+                            }
+                        }
+                    }
                     if let Some(ledger_path) = supervisor
                         .published_config_hub()
                         .latest()
                         .and_then(|c| c.policy_ledger_path.clone())
                     {
-                        let snap = supervisor.hub().latest();
-                        let (final_steps, final_reason, final_state) = snap.as_ref().map_or_else(
-                            || {
-                                (
-                                    step_stats.report().steps,
-                                    fallback_stop_reason.to_string(),
-                                    fallback_action_state.to_string(),
-                                )
-                            },
-                            |s| {
-                                let (steps, reason) = s
-                                    .obs
-                                    .policy
-                                    .as_ref()
-                                    .filter(|p| p.action_id == action_id)
-                                    .map_or_else(
-                                        || {
-                                            (
-                                                step_stats.report().steps,
-                                                fallback_stop_reason.to_string(),
-                                            )
-                                        },
-                                        |p| {
-                                            (
-                                                p.steps,
-                                                p.stop_reason
-                                                    .as_ref()
-                                                    .map(|r| r.as_str().to_string())
-                                                    .unwrap_or_else(|| {
-                                                        fallback_stop_reason.to_string()
-                                                    }),
-                                            )
-                                        },
-                                    );
-                                let state = s
-                                    .obs
-                                    .action
-                                    .as_ref()
-                                    .filter(|a| a.id == action_id)
-                                    .or_else(|| {
-                                        s.obs
-                                            .previous_action
-                                            .as_ref()
-                                            .filter(|a| a.id == action_id)
-                                    })
-                                    .map(|a| a.state.as_str().to_string())
-                                    .unwrap_or_else(|| fallback_action_state.to_string());
-                                (steps, reason, state)
-                            },
-                        );
-                        let passed = final_reason == "MAX_SECONDS" && final_state == "done";
+                        let (final_steps, final_reason, passed) = match owner_outcome {
+                            Some(out) => {
+                                let reason = out.stop_reason.as_str().to_string();
+                                let ok = reason == "MAX_SECONDS"
+                                    && out.action_state.as_str() == "done";
+                                (out.steps, reason, ok)
+                            }
+                            None => (
+                                step_stats.report().steps,
+                                "INTERRUPTED".to_string(),
+                                false,
+                            ),
+                        };
                         let record = super::qualification::QualificationRecord::for_run(
                             gate,
                             action_id,
@@ -2795,8 +2877,14 @@ pub fn spawn_executor_policy_runner(params: ExecutorPolicyRunParams) -> tokio::t
                             passed,
                         )
                         .with_policy_stats(step_stats.report());
+                        let guard_owned = pending_qual_guard.take();
                         let _ = tokio::task::spawn_blocking(move || {
-                            if let Err(e) = super::qualification::append_record(&ledger_path, &record) {
+                            let mut guard_owned = guard_owned;
+                            if let Err(e) = qual_coord.append_and_release_pending(
+                                &ledger_path,
+                                &record,
+                                guard_owned.as_mut(),
+                            ) {
                                 tracing::warn!(
                                     "Failed to append policy qualification record to {}: {e}",
                                     ledger_path.display()
@@ -2804,9 +2892,12 @@ pub fn spawn_executor_policy_runner(params: ExecutorPolicyRunParams) -> tokio::t
                             }
                         })
                         .await;
+                    } else if let Some(mut g) = pending_qual_guard.take() {
+                        g.release_now();
                     }
                 }
             }
         }
+        drop(pending_qual_guard);
     })
 }

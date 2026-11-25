@@ -2979,6 +2979,7 @@ impl ServoTargetDispatcher {
         &self,
         hub: &StateHub,
         target: &crate::supervisor::targets::PolicyTarget<'_>,
+        validity: super::mailbox::PolicyValidityBounds,
     ) -> super::mailbox::Submitted {
         let mut resolved_cmds = Vec::new();
         let mut stream_refusals = Vec::new();
@@ -2991,9 +2992,10 @@ impl ServoTargetDispatcher {
             } else {
                 let coalesced_before = g.port.coalesced();
                 let prev_key = g.last_inflight_key;
-                let sub = g.port.submit_policy(target);
+                let sub = g.port.submit_policy_with_validity(target, validity);
                 match sub {
-                    super::mailbox::Submitted::Accepted => {
+                    super::mailbox::Submitted::Accepted
+                    | super::mailbox::Submitted::Coalesced { .. } => {
                         g.policy_submitted_count = g.policy_submitted_count.saturating_add(1);
                         if target.action_id != 0
                             && !g.tracked_policy_streams.contains(&target.action_id)
@@ -3006,7 +3008,9 @@ impl ServoTargetDispatcher {
                         let assigned_seq = g.port.last_seq();
                         let sid = crate::supervisor::targets::policy_stream(target.action_id);
                         g.last_inflight_key = Some((sid, assigned_seq));
-                        if g.port.coalesced() > coalesced_before {
+                        if matches!(sub, super::mailbox::Submitted::Coalesced { .. })
+                            || g.port.coalesced() > coalesced_before
+                        {
                             g.note_coalesced_locked(prev_key, &mut resolved_cmds);
                         }
                     }
@@ -3596,9 +3600,20 @@ impl RtExecutorHandle {
         &self,
         target: &crate::supervisor::targets::PolicyTarget<'_>,
     ) -> super::mailbox::Submitted {
+        self.submit_policy_with_validity(target, super::mailbox::PolicyValidityBounds::default())
+    }
+
+    /// Submits one live policy target frame together with its atomic absolute validity bounds
+    /// (`vision_window_expires_at`, `handshake_expires_at`) synchronously under `HubCommitGuard`.
+    #[cfg(feature = "policy-runtime")]
+    pub fn submit_policy_with_validity(
+        &self,
+        target: &crate::supervisor::targets::PolicyTarget<'_>,
+        validity: super::mailbox::PolicyValidityBounds,
+    ) -> super::mailbox::Submitted {
         self.shared
             .servo_dispatcher
-            .submit_policy(&self.shared.hub, target)
+            .submit_policy(&self.shared.hub, target, validity)
     }
 
     /// Closes policy stream `action_id` off-thread (idempotent; frees stream slot in `TargetWriter`).

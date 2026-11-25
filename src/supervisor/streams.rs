@@ -1560,6 +1560,7 @@ impl SupervisorInner {
             rt_owned: false,
             load_token: 0,
             cancel_slot: 0,
+            deadline: None,
             stop_reason: None,
             max_input_age_ms: crate::policy_runtime::max_policy_input_age_ms(crate::policy_runtime::MIN_LIVE_POLICY_FPS),
             step_stats: crate::policy_runtime::PolicyStepStats::default(),
@@ -2310,9 +2311,24 @@ impl SupervisorInner {
         copy_into(&mut self.target_positions, &self.commanded_positions);
     }
 
-    /// Zero-allocation Step-5 output-boundary revocation recheck: if `PolicyAuthorization`
-    /// changed after the currently installed live target was accepted, immediately drop both
-    /// `servo_target` and policy-owned `gripper_stream_*` state before any J1-J7 output advances.
+    /// Zero-allocation Step-5 output-boundary deadline and revocation recheck: if `run.deadline`
+    /// (`max_seconds`) elapsed, terminates cleanly as `MAX_SECONDS` (`done`); otherwise if
+    /// `PolicyAuthorization` changed after the installed live target was accepted, immediately
+    /// drops both `servo_target` and policy-owned `gripper_stream_*` state before any J1-J7
+    /// output advances.
+    #[inline]
+    pub(crate) fn enforce_policy_deadline_and_auth_rt(&mut self, now: Instant) {
+        if self
+            .policy_run
+            .as_ref()
+            .is_some_and(|r| r.rt_owned && r.deadline.is_some_and(|dl| now >= dl))
+        {
+            self.terminate_policy_run_static("MAX_SECONDS", "done", None, None);
+            return;
+        }
+        self.recheck_live_policy_authorization_rt();
+    }
+
     #[inline]
     pub(crate) fn recheck_live_policy_authorization_rt(&mut self) {
         if let Some(aid) = self
@@ -2475,7 +2491,11 @@ impl SupervisorInner {
         reset_hold_target: bool,
         now: Instant,
     ) {
-        run.authorization.revoke();
+        if run.rt_owned {
+            run.authorization.unbind_action(run.action_id);
+        } else {
+            run.authorization.revoke();
+        }
         self.atomic_diag_sealed_policy_action_id
             .fetch_max(run.action_id, Ordering::Release);
         self.record_pending_policy_close(run.action_id);
@@ -2505,6 +2525,7 @@ impl SupervisorInner {
         run.rt_gate_binding = None;
         run.load_token = 0;
         run.cancel_slot = 0;
+        run.deadline = None;
         #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
         self.policy_cancel_slots.set_active_run_token(0);
         if run.rt_owned && self.policy_run_spare.is_none() {
@@ -2542,6 +2563,7 @@ impl SupervisorInner {
         };
         let action_id = run.action_id;
         if self.rt_executor_owned {
+            let final_steps = run.steps;
             // Only write `policy_stats` when explicitly supplied (e.g. `EndPolicy::{Finish, Fail}`);
             // leave `None` on RT-initiated termination so `StateHub` attaches the frozen runner stats.
             if let Some(stats) = final_stats {
@@ -2556,6 +2578,14 @@ impl SupervisorInner {
                 None,
                 None,
                 None,
+            );
+            #[cfg(not(target_arch = "wasm32"))]
+            self.push_rt_policy_terminal(
+                action_id,
+                final_steps,
+                stop_reason,
+                action_state,
+                final_stats.unwrap_or_default(),
             );
             return;
         }
@@ -2974,6 +3004,20 @@ pub mod targets {
         /// input age bound). `Busy`: the previous target was not consumed yet; the runner counts the
         /// step as skipped. Rejects late submissions for closed action IDs immediately off-thread.
         pub fn submit_policy(&mut self, t: &PolicyTarget<'_>) -> Submitted {
+            self.submit_policy_with_validity(
+                t,
+                crate::rt_core::mailbox::PolicyValidityBounds::default(),
+            )
+        }
+
+        /// Submits one policy target together with atomic [`PolicyValidityBounds`] (tracking both
+        /// `Accepted` and `Coalesced` publications so policy streams that overwrite an unconsumed
+        /// replaceable servo frame are never left untracked).
+        pub fn submit_policy_with_validity(
+            &mut self,
+            t: &PolicyTarget<'_>,
+            validity: crate::rt_core::mailbox::PolicyValidityBounds,
+        ) -> Submitted {
             if self.is_policy_closed(t.action_id) {
                 return Submitted::OutOfOrder;
             }
@@ -2982,8 +3026,8 @@ pub mod targets {
             match self.frame(policy_stream(t.action_id), t.stamp.authority, t.stamp.authorization.max(1), t.targets, t.input_at,
                 t.vision_at, t.vision_frame_id, deadline, false) {
                 Some(frame) => {
-                    let sub = self.writer.submit(frame);
-                    if matches!(sub, Submitted::Accepted)
+                    let sub = self.writer.submit_with_validity(frame, validity);
+                    if matches!(sub, Submitted::Accepted | Submitted::Coalesced { .. })
                         && t.action_id != 0
                         && !self.open_policy_actions.contains(&t.action_id)
                     {
@@ -3157,13 +3201,34 @@ pub mod targets {
         /// Applies one target from the latest-target mailbox after rechecking it (see the
         /// module doc) at the release `ctx` (its urgent-stop generation and clock).
         pub fn consume_target_frame(&mut self, frame: &TargetFrame, ctx: &CommitCtx) -> Result<(), Refusal> {
+            self.consume_target_frame_with_validity(
+                frame,
+                crate::rt_core::mailbox::PolicyValidityBounds::default(),
+                ctx,
+            )
+        }
+
+        /// Applies one target together with its atomic [`PolicyValidityBounds`] at `ctx`.
+        pub fn consume_target_frame_with_validity(
+            &mut self,
+            frame: &TargetFrame,
+            validity: crate::rt_core::mailbox::PolicyValidityBounds,
+            ctx: &CommitCtx,
+        ) -> Result<(), Refusal> {
             #[cfg(feature = "policy-runtime")]
             self.sync_policy_target_authority();
             // a target is checked against the active workspace when applied; it carries no plan revision
             let current = Authority { config_revision: frame.authority.config_revision, ..CoreOps::authority(self, ctx) };
             let policy = frame.policy_generation != 0;
             let check_res = if policy {
-                frame.check_policy(ctx.arm, ctx.boot, ctx.now, &current, &self.core.target_authority())
+                frame.check_policy_with_validity(
+                    ctx.arm,
+                    ctx.boot,
+                    ctx.now,
+                    &current,
+                    &self.core.target_authority(),
+                    validity,
+                )
             } else {
                 frame.check(ctx.arm, ctx.boot, ctx.now, &current, &self.core.target_authority())
             };
@@ -3204,6 +3269,12 @@ pub mod targets {
                 // without double-revoking the newer generation.
                 "POLICY_REVOKED" => self.brake_live_policy_in_place(action_id),
                 "DEADLINE_EXPIRED" => self.hold_policy_run(action_id),
+                "HANDSHAKE_EXPIRED" => self.terminate_policy_run_static(
+                    "HANDSHAKE_EXPIRED",
+                    "failed",
+                    Some("HANDSHAKE_EXPIRED"),
+                    Some("Vision clock handshake expired before the target was applied"),
+                ),
                 "VISION_STALE" if hold_on_stale => self.hold_policy_run(action_id),
                 "VISION_STALE" => self.terminate_policy_run_static(
                     "VISION_STALE",
@@ -3245,9 +3316,18 @@ pub mod targets {
         #[cfg(feature = "policy-runtime")]
         fn consume_policy_target(&mut self, frame: &TargetFrame, now: Instant) -> Result<(), Refusal> {
             let ms = |t: Instant| now.saturating_duration_since(t).as_millis().min(u128::from(u64::MAX)) as u64;
-            let Some(action_id) = self.policy_run.as_ref().map(|r| r.action_id).filter(|id| frame.stream == policy_stream(*id)) else {
+            let Some((action_id, deadline)) = self
+                .policy_run
+                .as_ref()
+                .filter(|r| frame.stream == policy_stream(r.action_id))
+                .map(|r| (r.action_id, r.deadline))
+            else {
                 return Err(Refusal::code("POLICY_NOT_ACTIVE"));
             };
+            if deadline.is_some_and(|dl| now >= dl) {
+                self.terminate_policy_run_static("MAX_SECONDS", "done", None, None);
+                return Err(Refusal::code("POLICY_NOT_ACTIVE"));
+            }
             let input_age_ms = self.has_policy_input_age_range().then(|| ms(frame.input_at));
             self.policy_step_slice_rt(action_id, frame, input_age_ms, frame.vision_at.map(ms), frame.vision_frame_id, now)
         }

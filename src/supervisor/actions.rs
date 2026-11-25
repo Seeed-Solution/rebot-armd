@@ -106,9 +106,19 @@ impl SupervisorInner {
         if let Some(mut run) = self.policy_run.take() {
             if self.rt_executor_owned {
                 // Executor supersession: revoke authorization, seal/close stream, recycle spares
-                // in place with 0 allocs/frees, and preserve replacement `target_positions` and
-                // `j7_admitted_stamp` (`reset_hold_target = false`).
+                // in place with 0 allocs/frees, emit immutable terminal outcome, and preserve
+                // replacement `target_positions` and `j7_admitted_stamp` (`reset_hold_target = false`).
+                let sup_aid = run.action_id;
+                let sup_steps = run.steps;
                 self.teardown_rt_policy_run(run, "SUPERSEDED", false, Instant::now());
+                #[cfg(not(target_arch = "wasm32"))]
+                self.push_rt_policy_terminal(
+                    sup_aid,
+                    sup_steps,
+                    "SUPERSEDED",
+                    "cancelled",
+                    crate::motion::PolicyStats::default(),
+                );
             } else {
                 run.stop_reason = Some("SUPERSEDED".to_string());
                 if run.mode == crate::policy_runtime::PolicyMode::Live {

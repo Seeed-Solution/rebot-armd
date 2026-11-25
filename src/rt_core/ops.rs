@@ -567,6 +567,15 @@ pub trait CoreOps {
     /// `frame.positions()` (a slice of the frame) into the core's preallocated target state.
     /// (The foundation adapter still delegates to `servo(Vec)`, which allocates: track D.)
     fn consume_target(&mut self, frame: &TargetFrame, ctx: &CommitCtx) -> Result<(), Refusal>;
+    /// Applies one target together with its atomic [`super::mailbox::PolicyValidityBounds`].
+    fn consume_target_with_validity(
+        &mut self,
+        frame: &TargetFrame,
+        _validity: super::mailbox::PolicyValidityBounds,
+        ctx: &CommitCtx,
+    ) -> Result<(), Refusal> {
+        self.consume_target(frame, ctx)
+    }
     /// Applies any pending urgent E-stop request; returns true when an E-stop was applied.
     fn apply_estop(&mut self) -> bool { false }
     /// Synchronizes any non-blocking socket-close lease fence (lock-free, zero allocations)
@@ -1333,6 +1342,15 @@ impl CoreOps for SupervisorInner {
         // track D: identity, deadline, authority, stream, policy generation, input / camera
         // ages, config hold, then the servo / policy step checks (supervisor::streams::targets)
         self.consume_target_frame(frame, ctx)
+    }
+
+    fn consume_target_with_validity(
+        &mut self,
+        frame: &TargetFrame,
+        validity: super::mailbox::PolicyValidityBounds,
+        ctx: &CommitCtx,
+    ) -> Result<(), Refusal> {
+        self.consume_target_frame_with_validity(frame, validity, ctx)
     }
 
     fn apply_estop(&mut self) -> bool { self.consume_pending_estop() }
@@ -2271,8 +2289,8 @@ impl ReleaseEngine {
         //    so off-thread command waiters always observe the post-motion published snapshot.
         let ctx = self.checkpoint(core, Checkpoint::BeforeTarget, &mut now_fn, &mut report);
         let mut deferred_target_outcome: Option<TargetOutcome> = None;
-        if let Some(f) = self.targets.take() {
-            let result = core.consume_target(&f, &ctx);
+        if let Some((f, validity)) = self.targets.take_with_validity() {
+            let result = core.consume_target_with_validity(&f, validity, &ctx);
             deferred_target_outcome = Some(TargetOutcome { stream: f.stream, seq: f.seq, result });
             report.target_refusal = result.err();
             report.target = Some((f.seq, result.map_err(|r| r.code)));

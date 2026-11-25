@@ -5,6 +5,8 @@
 //! heap allocations, zero heap frees, zero file I/O, and zero `SupervisorLock` reads while
 //! preserving all real-arm safety, operator, lease, release-gate, and stop-ordering invariants.
 
+use std::collections::VecDeque;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -12,6 +14,8 @@ use std::time::Instant;
 use crate::auth::OperatorGrant;
 use crate::model::HolderLabel;
 use crate::motion::PolicyStats;
+use crate::policy_runtime::qualification::{self, QualificationRecord};
+use crate::policy_runtime::release_gate::VerifiedReleaseGate;
 use crate::policy_runtime::runner::RtGateBinding;
 use crate::policy_runtime::{PolicyMode, DEFAULT_MAX_FIRST_STEP_RAD};
 use crate::rt_core::broker::{ActionId, BootId, Descriptor};
@@ -20,11 +24,207 @@ use crate::rt_core::requests::lease::ConnectionHandle;
 use crate::rt_core::scratch::set_str;
 use crate::safety::{FaultReason, SafetyError, SafetyState};
 use crate::supervisor::streams::push_str_bounded;
-use crate::supervisor::{AdmissionStamp, SupervisorInner};
+use crate::supervisor::{AdmissionStamp, ArmError, SupervisorInner};
 
 /// Fixed count of exclusive-lifetime per-attempt cancellation slots (strictly greater than
 /// `Broker` command ring capacity 32).
 pub const POLICY_CANCEL_SLOTS: usize = 64;
+
+/// Immutable action-keyed terminal outcome emitted once by `armd-control` into a lock-free
+/// bounded ring (`rtrb`, cap 64, 0 RT allocs/frees/locks) so off-thread qualification ledger
+/// writers never rely on mutable `StateHub` snapshots or optimistic runner fallbacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PolicyTerminalOutcome {
+    pub action_id: u64,
+    pub steps: u64,
+    pub stop_reason: HolderLabel,
+    pub action_state: HolderLabel,
+    pub stats: PolicyStats,
+}
+
+#[derive(Debug, Clone)]
+struct PendingQualEntry {
+    action_id: u64,
+    policy_sha256: String,
+    scene_id: String,
+    tool_id: String,
+    profile_id: String,
+    calibration_digest: String,
+}
+
+impl PendingQualEntry {
+    fn matches_gate(&self, gate: &VerifiedReleaseGate) -> bool {
+        self.policy_sha256.eq_ignore_ascii_case(gate.policy_sha256())
+            && self.scene_id == gate.scene_id()
+            && self.tool_id == gate.tool_id()
+            && self.profile_id == gate.canonical_profile_id()
+            && self.calibration_digest.eq_ignore_ascii_case(gate.calibration_digest())
+    }
+}
+
+struct PolicyQualState {
+    consumer: rtrb::Consumer<PolicyTerminalOutcome>,
+    outcomes: VecDeque<PolicyTerminalOutcome>,
+    pending: Vec<PendingQualEntry>,
+}
+
+/// Exclusive-access (`&mut self` only) wrapper around `rtrb::Producer<PolicyTerminalOutcome>`
+/// so `SupervisorInner` remains `Sync` while `armd-control` pushes lock-free with 0 allocs.
+pub struct PolicyTerminalTx(rtrb::Producer<PolicyTerminalOutcome>);
+
+// SAFETY: `PolicyTerminalTx` exposes no `&self` access to its inner `rtrb::Producer`; all
+// operations require `&mut self`, ensuring single-thread exclusive access (like `std::sync::Exclusive`).
+unsafe impl Sync for PolicyTerminalTx {}
+
+impl PolicyTerminalTx {
+    #[inline]
+    pub fn push(&mut self, outcome: PolicyTerminalOutcome) {
+        let _ = self.0.push(outcome);
+    }
+}
+
+/// Off-thread coordinator for immutable RT policy terminal records and qualification-ledger
+/// persistence fences (0 RT locks, 0 RT allocs; `armd-control` only holds the [`PolicyTerminalTx`]).
+pub struct PolicyQualificationCoordinator {
+    state: Mutex<PolicyQualState>,
+    /// Serializes `append_record` against `has_pending_for` + `load_records` so a concurrent
+    /// `production_release` start can never approve before a finished supervised run is fsynced.
+    ledger_io: Mutex<()>,
+}
+
+impl PolicyQualificationCoordinator {
+    pub fn channel() -> (PolicyTerminalTx, Arc<Self>) {
+        let (tx, rx) = rtrb::RingBuffer::new(64);
+        let coord = Arc::new(Self {
+            state: Mutex::new(PolicyQualState {
+                consumer: rx,
+                outcomes: VecDeque::with_capacity(128),
+                pending: Vec::new(),
+            }),
+            ledger_io: Mutex::new(()),
+        });
+        (PolicyTerminalTx(tx), coord)
+    }
+
+    fn drain_locked(st: &mut PolicyQualState) {
+        while let Ok(out) = st.consumer.pop() {
+            if st.outcomes.len() >= 128 {
+                st.outcomes.pop_front();
+            }
+            st.outcomes.push_back(out);
+        }
+    }
+
+    /// Registers a `SupervisedFirstRun` live run as pending qualification persistence strictly
+    /// BEFORE WS ACK / runner spawn so any subsequent `production_release` start is fenced until
+    /// this run's authoritative record is fsynced to the ledger.
+    pub fn register_pending(
+        self: &Arc<Self>,
+        action_id: u64,
+        gate: &VerifiedReleaseGate,
+    ) -> PendingQualGuard {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.pending.push(PendingQualEntry {
+            action_id,
+            policy_sha256: gate.policy_sha256().to_string(),
+            scene_id: gate.scene_id().to_string(),
+            tool_id: gate.tool_id().to_string(),
+            profile_id: gate.canonical_profile_id().to_string(),
+            calibration_digest: gate.calibration_digest().to_string(),
+        });
+        PendingQualGuard {
+            coord: Arc::clone(self),
+            action_id,
+            released: false,
+        }
+    }
+
+    pub fn has_pending_for(&self, gate: &VerifiedReleaseGate) -> bool {
+        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.pending.iter().any(|p| p.matches_gate(gate))
+    }
+
+    /// Takes the immutable owner terminal outcome for `action_id`, draining the lock-free RT ring.
+    pub fn take_terminal_outcome(&self, action_id: u64) -> Option<PolicyTerminalOutcome> {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Self::drain_locked(&mut st);
+        st.outcomes
+            .iter()
+            .position(|o| o.action_id == action_id)
+            .and_then(|idx| st.outcomes.remove(idx))
+    }
+
+    /// Serialized off-thread production-release qualification check: refuses fail-closed while ANY
+    /// matching supervised run is still running or pending ledger persistence, then validates the
+    /// persisted ledger records under the same `ledger_io` mutex.
+    pub fn check_production_qualified_locked(
+        &self,
+        path: &Path,
+        gate: &VerifiedReleaseGate,
+    ) -> Result<(), ArmError> {
+        let _io = self.ledger_io.lock().unwrap_or_else(|e| e.into_inner());
+        if self.has_pending_for(gate) {
+            return Err(ArmError::Rejected {
+                status: 403,
+                code: "QUALIFICATION_REQUIRED".into(),
+                message: "A supervised run qualification record for this artifact and deployment is still pending persistence".into(),
+            });
+        }
+        let records = qualification::load_records(path).map_err(|e| ArmError::Rejected {
+            status: 403,
+            code: "QUALIFICATION_REQUIRED".into(),
+            message: e.to_string(),
+        })?;
+        qualification::check_production_qualified(&records, gate).map_err(|e| ArmError::Rejected {
+            status: 403,
+            code: "QUALIFICATION_REQUIRED".into(),
+            message: e.to_string(),
+        })
+    }
+
+    /// Appends and fsyncs one qualification record and releases the matching pending entry
+    /// atomically under `ledger_io` so no `production_release` reader can observe a gap.
+    pub fn append_and_release_pending(
+        &self,
+        path: &Path,
+        record: &QualificationRecord,
+        guard: Option<&mut PendingQualGuard>,
+    ) -> std::io::Result<()> {
+        let _io = self.ledger_io.lock().unwrap_or_else(|e| e.into_inner());
+        let res = qualification::append_record(path, record);
+        if let Some(g) = guard {
+            g.release_now();
+        }
+        res
+    }
+
+    fn release_pending(&self, action_id: u64) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.pending.retain(|p| p.action_id != action_id);
+    }
+}
+
+/// Drop-safe pending qualification fence owned by an executor `SupervisedFirstRun` runner.
+pub struct PendingQualGuard {
+    coord: Arc<PolicyQualificationCoordinator>,
+    action_id: u64,
+    released: bool,
+}
+
+impl PendingQualGuard {
+    pub fn release_now(&mut self) {
+        if !self.released {
+            self.released = true;
+            self.coord.release_pending(self.action_id);
+        }
+    }
+}
+
+impl Drop for PendingQualGuard {
+    fn drop(&mut self) {
+        self.release_now();
+    }
+}
 
 #[derive(Default)]
 struct CancelSlot {
@@ -279,6 +479,7 @@ pub struct BeginPolicySpec {
     pub max_vision_age_ms: Option<u64>,
     pub vision_stale_hold: bool,
     pub period_us: u64,
+    pub deadline: Option<Instant>,
     pub has_verified_release_gate: bool,
     pub gate_policy_sha256: HolderLabel,
     pub gate_calibration_digest: HolderLabel,
@@ -616,6 +817,9 @@ fn install_begin_policy_body(
     if !inner.can_admit_policy_run() {
         return Err("MOTION_BUSY");
     }
+    if spec.deadline.is_some_and(|dl| ctx.now >= dl) {
+        return Err("DEADLINE_EXPIRED");
+    }
 
     inner.sync_stop_generation(ctx.stop_generation);
     let stamp = policy_admission_stamp(d, spec.admission_request_id);
@@ -671,7 +875,8 @@ fn install_begin_policy_body(
     run.max_input_age_ms = spec.max_input_age_ms;
     run.step_stats = crate::policy_runtime::PolicyStepStats::default();
     run.step_stats.set_period_us(spec.period_us);
-    run.authorization.revoke();
+    run.deadline = spec.deadline;
+    run.authorization.bind_action(action_id);
     run.max_vision_age_ms = spec.max_vision_age_ms;
     run.vision_stale_hold = spec.vision_stale_hold;
 
