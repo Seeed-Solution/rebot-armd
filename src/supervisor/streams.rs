@@ -1120,6 +1120,7 @@ impl SupervisorInner {
                         };
                         self.tracking.record_issued_with_ws_depths(fb.positions, fb.velocities, full, park);
                         self.tracking.fallback_ramp = (!done).then_some(ramp);
+                        self.tracking.holding_fallback_pose = done;
                     }
                     TickOutput::Deferred { .. } => {
                         // Keep the in-progress braking ramp intact across transient deferral
@@ -1158,6 +1159,7 @@ impl SupervisorInner {
                 self.commanded_velocities.fill(0.0);
                 self.commanded_accelerations.fill(0.0);
                 self.tracking.invalidate();
+                self.tracking.holding_fallback_pose = true;
                 self.safety.latch(
                     crate::safety::FaultKind::Other,
                     crate::safety::FaultDetail::formatted(FaultCode::ServoNoBrake, |buf| {
@@ -1315,20 +1317,16 @@ impl SupervisorInner {
         }
         match &self.driver {
             None => true,
-            Some(d) => match d.try_lock() {
-                Ok(drv) => drv.feedback_all_within(self.config.dof, Duration::MAX),
-                Err(std::sync::TryLockError::Poisoned(p)) => {
-                    p.into_inner().feedback_all_within(self.config.dof, Duration::MAX)
-                }
-                Err(std::sync::TryLockError::WouldBlock) => false,
-            },
+            Some(d) => d
+                .try_with_ref_recover(|drv| drv.feedback_all_within(self.config.dof, Duration::MAX))
+                .unwrap_or(false),
         }
     }
 
     pub fn policy_input_age_range_ms(&self) -> Option<(u64, u64)> {
         match &self.driver {
             None => Some((0, 0)),
-            Some(d) => d.lock().ok().and_then(|drv| {
+            Some(d) => d.with_ref(|drv| {
                 let ages = drv.feedback_ages();
                 if ages.len() != self.config.dof {
                     return None;
@@ -1345,7 +1343,41 @@ impl SupervisorInner {
                     return None;
                 }
                 Some((min_ms, max_ms))
-            }),
+            })?,
+        }
+    }
+
+    /// Exact oldest joint-feedback instant (no millisecond floor loss) together with the
+    /// integer-millisecond `(min, max)` telemetry age range at `now`.
+    pub fn policy_input_age_and_oldest_at(
+        &self,
+        now: std::time::Instant,
+    ) -> Option<((u64, u64), std::time::Instant)> {
+        match &self.driver {
+            None => Some(((0, 0), now)),
+            Some(d) => d.with_ref(|drv| {
+                let ages = drv.feedback_ages();
+                if ages.len() != self.config.dof {
+                    return None;
+                }
+                let durs = ages.into_iter().collect::<Option<Vec<_>>>()?;
+                let mut min_ms = u64::MAX;
+                let mut max_ms = 0u64;
+                let mut max_dur = std::time::Duration::ZERO;
+                for dur in durs {
+                    if dur > max_dur {
+                        max_dur = dur;
+                    }
+                    let ms = dur.as_millis().min(u64::MAX as u128) as u64;
+                    min_ms = min_ms.min(ms);
+                    max_ms = max_ms.max(ms);
+                }
+                if min_ms > max_ms {
+                    return None;
+                }
+                let oldest = now.checked_sub(max_dur).unwrap_or(now);
+                Some(((min_ms, max_ms), oldest))
+            })?,
         }
     }
 
@@ -2704,6 +2736,7 @@ pub mod targets {
             SafetyError::HandoverSettling => "HANDOVER_SETTLING",
             SafetyError::ArmNotAtRestingPose { .. } => "ARM_NOT_AT_RESTING_POSE",
             SafetyError::MotionForbiddenInFaultState(_) => "MOTION_FORBIDDEN_IN_FAULT_STATE",
+            SafetyError::TorqueOffWouldDrop { .. } => "TORQUE_OFF_WOULD_DROP",
             SafetyError::ClearFaultRejected(_) => "CLEAR_FAULT_REJECTED",
             SafetyError::EStopActive => "ESTOP_ACTIVE",
             SafetyError::CollisionHold(_) => "COLLISION_HOLD",
@@ -2741,6 +2774,7 @@ pub mod targets {
             "FAULT_ACTIVE" => (409, code, Some("Fault")),
             "ARM_NOT_AT_RESTING_POSE" => (409, "ArmNotAtRestingPose", Some("Armed")),
             "MOTION_FORBIDDEN_IN_FAULT_STATE" => (409, "MotionForbiddenInFaultState", Some("Fault")),
+            "TORQUE_OFF_WOULD_DROP" => (409, code, None),
             "CLEAR_FAULT_REJECTED" => (409, "ClearFaultRejected", Some("Fault")),
             "WORKSPACE_VIOLATION" | "JUMP_LIMIT" | "STEP_LIMIT" => (422, code, None),
             "SOFT_LIMIT_EXCEEDED" | "SAFETY_ERROR" | "INVALID_COMMAND" => (400, code, None),
@@ -3256,12 +3290,12 @@ pub mod targets {
         }
 
         #[cfg(not(feature = "policy-runtime"))]
-        fn policy_target_refused(&mut self, _code: &str, _frame: &TargetFrame) {}
+        pub(crate) fn policy_target_refused(&mut self, _code: &str, _frame: &TargetFrame) {}
 
         /// A target of the active run was refused by the consumption check: hold or end the
         /// run where the legacy commit holds or ends it (zero heap allocations / frees on RT).
         #[cfg(feature = "policy-runtime")]
-        fn policy_target_refused(&mut self, code: &str, frame: &TargetFrame) {
+        pub(crate) fn policy_target_refused(&mut self, code: &str, frame: &TargetFrame) {
             let Some(run) = self.policy_run.as_ref().filter(|r| frame.stream == policy_stream(r.action_id)) else { return; };
             let (action_id, hold_on_stale) = (run.action_id, run.vision_stale_hold);
             match code {

@@ -2467,7 +2467,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             // (never re-sampled downstream).
             let received_at = Instant::now();
             let stamp = crate::supervisor::AdmissionStamp {
-                stop_gen: reader_supervisor.stop_generation(),
+                stop_gen: reader_supervisor.current_stop_gen(),
                 estop_epoch: value
                     .get("epoch_id")
                     .and_then(Value::as_u64)

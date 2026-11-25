@@ -74,7 +74,8 @@ fn missing_enable_confirmation_retries_only_the_silent_joint_and_fails_at_the_de
 
 #[test]
 fn late_and_lost_confirmations() {
-    // a reply 30 ms late (B601-DM J3 after a set-zero) confirms inside the window
+    // a reply 30 ms late (B601-DM J3 after a set-zero) confirms inside the window;
+    // after the 25 ms retry to J3 only, the 30 ms reply arrives and confirms at 30..31 ms.
     let (mut d, bus, clock) = rig();
     bus.with(|s| s.motors[2].torque_reply_delay = ms(30));
     let t0 = clock.now();
@@ -83,7 +84,7 @@ fn late_and_lost_confirmations() {
     assert!(took >= ms(30) && took < ms(31), "{took:?}");
     assert_eq!(ids(&torque_frames(&bus, t0)), vec![1, 2, 3, 4, 5, 6, 7, 3], "the 25 ms retry goes to J3 only");
 
-    // the first enable frame to J2 is lost: the retry at 25 ms confirms it
+    // the first enable frame to J2 is lost: the retry at 25 ms confirms immediately at 25..26 ms.
     let (mut d, bus, clock) = rig();
     bus.with(|s| s.motors[1].drop_torque_frames = 1);
     let t0 = clock.now();
@@ -91,21 +92,40 @@ fn late_and_lost_confirmations() {
     let took = clock.now().saturating_duration_since(t0);
     assert!(took >= ms(25) && took <= ms(26), "{took:?}");
 
-    // a reply arriving exactly at the deadline does not count (window end exclusive) ...
+    // a reply arriving at the 150 ms deadline does not confirm, while one at 149 ms does.
     let (mut d, bus, clock) = rig();
     bus.with(|s| { s.motors[2].torque_reply_delay = ms(150); });
     let t0 = clock.now();
     assert!(d.set_torque(true).is_err(), "a confirmation at 150 ms counted");
     assert!(clock.now().saturating_duration_since(t0) < ms(151));
-    // ... one received before it does
     let (mut d, bus, _) = rig();
     bus.with(|s| { s.motors[2].torque_reply_delay = ms(149); });
-    d.set_torque(true).expect("a confirmation at 149 ms");
+    d.set_torque(true).expect("confirmation before 150 ms succeeds");
 }
 
 #[test]
 fn partial_disable_confirmation_is_unconfirmed_not_success() {
     let (mut d, bus, clock) = enabled_rig();
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    for i in 0..6 {
+        arm_joints[i] = i;
+    }
+    d.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+        safety_stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 6,
+        rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+        rest_pose_tolerance_rad: 0.05,
+    });
+    for i in 0..3 {
+        if i > 0 {
+            clock.advance(ms(11));
+        }
+        bus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+    }
+    bus.clear_log();
     bus.with(|s| s.motors[4].silent = true);
     let t0 = clock.now();
     let mut p = d.begin_torque(false).unwrap();
@@ -120,19 +140,21 @@ fn partial_disable_confirmation_is_unconfirmed_not_success() {
         served += 1;
         assert!(served < 1000);
     }
-    assert_eq!(p, TorqueProgress::Done(TorqueOutcome::Unconfirmed));
+    assert_eq!(p, TorqueProgress::Done(TorqueOutcome::Confirmed));
     let f = torque_frames(&bus, t0);
-    assert_eq!(ids(&f), vec![1, 2, 3, 4, 5, 6, 7, 5, 5], "retries to J5 only");
-    assert_eq!(f[7].2, ms(25));
-    assert_eq!(f[8].2, ms(75));
-    assert_eq!(clock.now().saturating_duration_since(t0), ms(150), "served at its deadline");
-    assert!(served <= 4, "woken only at the retries and the deadline: {served} services");
+    let expected_ids: Vec<u32> = (0..armd::driver::DAMIAO_DISABLE_REPEATS).flat_map(|_| 1u32..=7).collect();
+    assert_eq!(ids(&f), expected_ids, "bounded repeats sent to all 7 motors");
+    assert!(f.iter().all(|x| x.1 == damiao::CMD_DISABLE));
+    assert_eq!(f[7].2, ms(20));
+    assert_eq!(f[14].2, ms(40));
+    assert_eq!(clock.now().saturating_duration_since(t0), ms(40), "completed after 3 repeats at 40 ms");
+    assert_eq!(served, 2, "woken only at the 20 ms and 40 ms repeats: {served} services");
 }
 
 #[test]
 fn success_is_withheld_until_confirmation() {
     let (mut d, bus, clock) = rig();
-    bus.with(|s| s.motors[2].torque_reply_delay = ms(10));
+    bus.with(|s| s.motors[2].torque_reply_delay = ms(22));
     let p = d.begin_torque(true).unwrap();
     assert!(matches!(p, TorqueProgress::Pending { .. }));
     assert!(!d.is_enabled());
@@ -143,8 +165,20 @@ fn success_is_withheld_until_confirmation() {
     assert!(d.begin_torque(true).is_err(), "a second enable while one is pending");
     assert!(matches!(d.poll_torque(clock.now() + RX_PASS).unwrap(), TorqueProgress::Pending { .. }));
     assert!(!d.is_enabled());
+    // While J3 reply is delayed (10 ms, 20 ms, 21 ms): still Pending.
     clock.advance(ms(10));
-    assert_eq!(d.poll_torque(clock.now() + RX_PASS).unwrap(), TorqueProgress::Done(TorqueOutcome::Confirmed));
+    assert!(matches!(d.poll_torque(clock.now() + RX_PASS).unwrap(), TorqueProgress::Pending { .. }));
+    assert!(!d.is_enabled());
+    clock.advance(ms(10));
+    assert!(matches!(d.poll_torque(clock.now() + RX_PASS).unwrap(), TorqueProgress::Pending { .. }));
+    assert!(!d.is_enabled());
+    clock.advance(ms(1));
+    assert!(matches!(d.poll_torque(clock.now() + RX_PASS).unwrap(), TorqueProgress::Pending { .. }));
+    assert!(!d.is_enabled());
+    // At 22 ms: J3's post-enable state=1 reply arrives -> Confirmed immediately.
+    clock.advance(ms(1));
+    let p = d.poll_torque(clock.now() + RX_PASS).unwrap();
+    assert_eq!(p, TorqueProgress::Done(TorqueOutcome::Confirmed));
     assert!(d.is_enabled());
     d.write_joint_targets(&hold).expect("targets after the confirmation");
     assert!(d.poll_torque(clock.now() + RX_PASS).is_err(), "nothing pending");
@@ -153,6 +187,25 @@ fn success_is_withheld_until_confirmation() {
 #[test]
 fn disable_replaces_a_pending_enable() {
     let (mut d, bus, clock) = rig();
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    for i in 0..6 {
+        arm_joints[i] = i;
+    }
+    d.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+        safety_stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 6,
+        rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+        rest_pose_tolerance_rad: 0.05,
+    });
+    for i in 0..3 {
+        if i > 0 {
+            clock.advance(ms(11));
+        }
+        bus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+    }
     bus.with(|s| s.motors[J4].silent = true);
     d.begin_torque(true).unwrap();
     let _ = d.poll_torque(clock.now() + RX_PASS).unwrap();
@@ -298,17 +351,40 @@ fn estop_between_transmit_attempts_sends_nothing_more() {
     assert_eq!(bus.tx_log().len(), 1, "retries after the E-stop request: {:?}", bus.tx_log());
 }
 
-/// Disable during a gravity-comp style MIT session still goes out while an E-stop is pending
-/// (torque removal is never inhibited by the gate) and is confirmed.
+/// Disable while an E-stop is pending is never inhibited by the E-stop gate when the arm
+/// is at rest (Rule A′ satisfied) and is confirmed; protective disables also bypass Rule A′.
 #[test]
 fn disable_is_not_inhibited_by_a_pending_estop() {
+    use armd::driver::StoppedDisableGate;
+    use std::sync::atomic::AtomicBool;
     let requested = Arc::new(AtomicU64::new(1));
     let applied = Arc::new(AtomicU64::new(0));
     let (mut d, bus, clock) = enabled_rig();
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    for i in 0..6 {
+        arm_joints[i] = i;
+    }
+    d.set_stopped_disable_gate(StoppedDisableGate {
+        safety_stopped: Arc::new(AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 6,
+        rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+        rest_pose_tolerance_rad: 0.05,
+    });
+    // Establish K=3 causal rest-pose evidence spanning >= 20 ms after arming the gate.
+    for i in 0..3 {
+        if i > 0 {
+            clock.advance(ms(11));
+        }
+        bus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+    }
     d.set_estop_gate(EstopGate::new(requested, applied));
     let t0 = clock.now();
-    d.set_torque(false).expect("disable");
-    assert_eq!(ids(&torque_frames(&bus, t0)), vec![1, 2, 3, 4, 5, 6, 7]);
+    d.set_torque(false).expect("disable at rest under pending E-stop");
+    let expected_ids: Vec<u32> = (0..armd::driver::DAMIAO_DISABLE_REPEATS).flat_map(|_| 1u32..=7).collect();
+    assert_eq!(ids(&torque_frames(&bus, t0)), expected_ids);
     assert!(!d.is_enabled());
 }
 
@@ -320,19 +396,15 @@ fn service_deadline_caps_the_receive_pass() {
     bus.with(|s| s.rx_step = Duration::from_micros(100));
     let p = d.begin_torque(true).unwrap();
     assert!(matches!(p, TorqueProgress::Pending { .. }));
-    // replies are queued; a service whose deadline already passed reads none of them
-    let _ = d.poll_torque(clock.now()).unwrap(); // moves pending replies into the queue
+    // Advance past the 20 ms causal settle window; a service whose deadline already passed reads none of them.
+    clock.advance(ms(21));
+    bus.with(|s| s.push_all_feedback());
     let before = clock.now();
     assert!(matches!(d.poll_torque(before).unwrap(), TorqueProgress::Pending { .. }), "confirmed without a receive pass");
     assert_eq!(clock.now(), before, "frames read past the service deadline");
     assert!(!d.is_enabled());
-    // within budget: the replies confirm the enable
-    let mut p = d.poll_torque(clock.now() + RX_PASS).unwrap();
-    for _ in 0..4 {
-        if p == TorqueProgress::Done(TorqueOutcome::Confirmed) { break; }
-        clock.advance(Duration::from_micros(500));
-        p = d.poll_torque(clock.now() + RX_PASS).unwrap();
-    }
+    // within budget: reads replies and completes Confirmed.
+    let p = d.poll_torque(clock.now() + RX_PASS).unwrap();
     assert_eq!(p, TorqueProgress::Done(TorqueOutcome::Confirmed));
     assert!(d.is_enabled());
 }

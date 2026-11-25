@@ -1190,7 +1190,7 @@ impl SupervisorInner {
             || (target - cur) * close_dir > 1e-4;
         if is_closing {
             if let Some(ref d) = self.driver {
-                let has_torque_fb = d.lock().is_ok_and(|drv| drv.capabilities().torque_feedback);
+                let has_torque_fb = d.with_ref(|drv| drv.capabilities().torque_feedback).unwrap_or(false);
                 if !has_torque_fb {
                     return Err(MotionError::Unsupported(
                         "Gripper close requires torque_feedback when max_close_torque_nm is configured".into(),
@@ -1209,8 +1209,7 @@ impl SupervisorInner {
         }
         let gripper_idx = self.config.gripper_index()?;
         self.driver.as_ref()
-            .and_then(|d| d.lock().ok())
-            .and_then(|drv| drv.gripper_pos_force_info())
+            .and_then(|d| d.with_ref(|drv| drv.gripper_pos_force_info()).flatten())
             .filter(|info| info.joint == gripper_idx)
             .map(|info| info.close_speed_rad_s)
             .filter(|v| v.is_finite() && *v > 0.0)
@@ -1225,8 +1224,7 @@ impl SupervisorInner {
         }
         let gripper_idx = self.config.gripper_index()?;
         self.driver.as_ref()
-            .and_then(|d| d.lock().ok())
-            .and_then(|drv| drv.gripper_pos_force_info())
+            .and_then(|d| d.with_ref(|drv| drv.gripper_pos_force_info()).flatten())
             .filter(|info| info.joint == gripper_idx)
             .and_then(|info| info.ceiling_torque_estimate_nm)
             .filter(|v| v.is_finite() && *v > 0.0)

@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use rtrb::{Consumer, Producer, RingBuffer};
 
 use crate::auth::OperatorGrant;
-use crate::model::{EnableState, HolderLabel};
+use crate::model::HolderLabel;
 use crate::rt_core::broker::{Authority, BootId, ClientId, Descriptor};
 use crate::rt_core::ids::ArmId;
 use crate::rt_core::ops::CommitCtx;
@@ -1107,6 +1107,39 @@ pub fn install_lease_clear_fault_rt(
     now: Instant,
     release_deadline: Instant,
 ) -> LeaseClearFaultOutcome {
+    let mut live_now = || now.max(Instant::now());
+    install_lease_clear_fault_rt_with_clock(
+        inner,
+        connection,
+        lease_generation,
+        supplied_epoch,
+        request_id_valid,
+        body_error,
+        auth_policy,
+        operator,
+        now,
+        release_deadline,
+        &mut live_now,
+    )
+}
+
+/// Like [`install_lease_clear_fault_rt`], threading the owner's live clock (`now_fn`) into
+/// under-guard authority rechecks and TX deadline translation so wait time or driver-clock
+/// sampling can never extend TX beyond `release_deadline`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn install_lease_clear_fault_rt_with_clock(
+    inner: &mut SupervisorInner,
+    connection: ConnectionHandle,
+    lease_generation: u64,
+    supplied_epoch: Option<u64>,
+    request_id_valid: bool,
+    body_error: Option<&'static str>,
+    auth_policy: OwnerAuthPolicy,
+    operator: OperatorGrant,
+    now: Instant,
+    release_deadline: Instant,
+    now_fn: &mut dyn FnMut() -> Instant,
+) -> LeaseClearFaultOutcome {
     let auth = match check_lease_clear_fault_owner_preflight(
         inner,
         connection,
@@ -1121,10 +1154,11 @@ pub fn install_lease_clear_fault_rt(
         Ok(a) => a,
         Err(out) => return out,
     };
-    match inner.clear_fault_executor_bounded_for_release_with_authority(
+    match inner.clear_fault_executor_bounded_for_release_with_authority_clock(
         now,
         release_deadline,
         auth,
+        now_fn,
     ) {
         Ok(safety_state) => LeaseClearFaultOutcome::Cleared {
             safety_state,
@@ -1426,25 +1460,12 @@ pub fn install_lease_preempt(
         }
     }
 
-    let confirmed_hardware_disabled = match &inner.driver {
-        None => {
-            !inner.is_torqued
-                && !inner.disable_pending
-                && inner.safety.state() == &SafetyState::Idle
-        }
-        Some(driver) => {
-            !inner.is_torqued
-                && !inner.disable_pending
-                && inner.safety.state() == &SafetyState::Idle
-                && driver.lock().is_ok_and(|drv| {
-                    if !drv.capabilities().enable_feedback {
-                        true
-                    } else {
-                        drv.enable_state() == EnableState::Disabled
-                    }
-                })
-        }
-    };
+    // M1: Hardware-disabled readiness is owned strictly by decision state (`torque_intent == Off`),
+    // never inferred from feedback-reported `enable_state()`.
+    let confirmed_hardware_disabled = !inner.is_torqued
+        && inner.torque_intent == crate::supervisor::TorqueIntent::Off
+        && !inner.disable_pending
+        && inner.safety.state() == &SafetyState::Idle;
 
     let evicted = inner
         .active_lease

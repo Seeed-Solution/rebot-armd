@@ -14,6 +14,12 @@ fn feedback_frame(id: u8, state: u8, position: f32) -> CanFrame {
     CanFrame::new_standard(0x10 + id as u16, &data).unwrap()
 }
 
+fn ctrl_mode_reply(id: u16, mode: u32) -> CanFrame {
+    let [lo, hi] = id.to_le_bytes();
+    let [m0, m1, m2, m3] = mode.to_le_bytes();
+    CanFrame::new_standard(0x10 + id, &[lo, hi, damiao::REG_READ, damiao::RID_CTRL_MODE, m0, m1, m2, m3]).unwrap()
+}
+
 #[test]
 fn set_zero_needs_a_confirmed_disabled_motor_and_sends_the_fe_frame() {
     let ids = [1u16, 2, 3];
@@ -23,8 +29,38 @@ fn set_zero_needs_a_confirmed_disabled_motor_and_sends_the_fe_frame() {
     assert!(!d.motor_zero_support().persist_verified);
     // no feedback yet: not confirmed disabled
     assert!(d.set_zero_position(1).is_err());
-    // disable: every motor answers state 0
-    for &id in &ids { d.can_mut().respond_to_transmit(damiao::build_disable_frame(id), feedback_frame(id as u8, 0, 0.4)); }
+    // disable: every motor answers state 0 (post-settle 0xCC refresh confirms)
+    for &id in &ids {
+        let fb = feedback_frame(id as u8, 0, 0.4);
+        d.can_mut().respond_to_transmit(damiao::build_disable_frame(id), fb);
+        d.can_mut().respond_to_transmit(damiao::build_refresh_frame(id), fb);
+    }
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    for i in 0..ids.len() {
+        arm_joints[i] = i;
+    }
+    let mut rest_positions = [0.0f32; armd::rt_core::mailbox::MAX_DOF];
+    for slot in &mut rest_positions[..ids.len()] {
+        *slot = 0.4;
+    }
+    d.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+        safety_stopped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: ids.len(),
+        rest_positions,
+        rest_pose_tolerance_rad: 0.05,
+    });
+    d.read_joint_states().unwrap();
+    for step in 0..3 {
+        if step > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(11));
+        }
+        for &id in &ids {
+            d.can_mut().provide_rx_frame(feedback_frame(id as u8, 0, 0.4));
+        }
+        d.read_joint_states().unwrap();
+    }
     d.set_torque(false).unwrap();
     d.can_mut().take_tx_frames();
     d.set_zero_position(1).unwrap();
@@ -38,7 +74,12 @@ fn set_zero_needs_a_confirmed_disabled_motor_and_sends_the_fe_frame() {
 fn set_zero_is_refused_while_enabled_or_when_a_motor_reports_enabled() {
     let ids = [1u16, 2];
     let mut d = DamiaoArmDriver::new(MockCanTransport::new(), ids.to_vec());
-    for &id in &ids { d.can_mut().respond_to_transmit(damiao::build_enable_frame(id), feedback_frame(id as u8, 1, 0.2)); }
+    for &id in &ids {
+        let fb = feedback_frame(id as u8, 1, 0.2);
+        d.can_mut().respond_to_transmit(damiao::build_read_register_frame(id, damiao::RID_CTRL_MODE), ctrl_mode_reply(id, damiao::CTRL_MODE_POS_VEL));
+        d.can_mut().respond_to_transmit(damiao::build_enable_frame(id), fb);
+        d.can_mut().respond_to_transmit(damiao::build_refresh_frame(id), fb);
+    }
     d.set_torque(true).unwrap();
     d.can_mut().take_tx_frames();
     assert!(d.set_zero_position(0).unwrap_err().to_string().contains("torque off"));
@@ -51,26 +92,59 @@ fn set_zero_is_refused_while_enabled_or_when_a_motor_reports_enabled() {
     assert!(!d.can_mut().take_tx_frames().iter().any(|f| f.data == damiao::CMD_SET_ZERO));
 }
 
-/// The disable confirmation waits its full window by time (not a check count) and resends the
-/// disable frame to a motor that has not confirmed (seen on the real arm: a disable right after
-/// an enable was not confirmed in time, DRIVER_WRITE_FAILED).
+/// Accepted disable transmits `DAMIAO_DISABLE_REPEATS` bounded disable frames per motor spaced by
+/// `DAMIAO_DISABLE_REPEAT_INTERVAL`, independent of motor feedback (no 150 ms confirmation wait).
 #[test]
 fn disable_confirmation_is_time_bounded_and_resends_to_unconfirmed_motors() {
     let ids = [1u16, 2, 3];
     let mut d = DamiaoArmDriver::new(MockCanTransport::new(), ids.to_vec());
-    for &id in &ids[..2] { d.can_mut().respond_to_transmit(damiao::build_disable_frame(id), feedback_frame(id as u8, 0, 0.1)); }
+    for &id in &ids[..2] {
+        let fb = feedback_frame(id as u8, 0, 0.1);
+        d.can_mut().respond_to_transmit(damiao::build_disable_frame(id), fb);
+        d.can_mut().respond_to_transmit(damiao::build_refresh_frame(id), fb);
+    }
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    for i in 0..ids.len() {
+        arm_joints[i] = i;
+    }
+    let mut rest_positions = [0.0f32; armd::rt_core::mailbox::MAX_DOF];
+    for slot in &mut rest_positions[..ids.len()] {
+        *slot = 0.1;
+    }
+    d.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+        safety_stopped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: ids.len(),
+        rest_positions,
+        rest_pose_tolerance_rad: 0.05,
+    });
+    d.read_joint_states().unwrap();
+    for step in 0..3 {
+        if step > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(11));
+        }
+        for &id in &ids {
+            d.can_mut().provide_rx_frame(feedback_frame(id as u8, 0, 0.1));
+        }
+        d.read_joint_states().unwrap();
+    }
+    let _ = d.can_mut().take_tx_frames();
     let t0 = std::time::Instant::now();
     d.set_torque(false).unwrap();
     let waited = t0.elapsed();
     let tx = d.can_mut().take_tx_frames();
     let sent = |id: u16| tx.iter().filter(|f| **f == damiao::build_disable_frame(id)).count();
-    assert!(waited >= armd::driver::DAMIAO_DISABLE_CONFIRM, "waited {waited:?}");
-    assert_eq!((sent(1), sent(2), sent(3)), (1, 1, 3), "resent twice only to the silent motor");
-    // all motors answer: confirmed on the first frame, no resend, no full wait
-    let mut d = DamiaoArmDriver::new(MockCanTransport::new(), ids.to_vec());
-    for &id in &ids { d.can_mut().respond_to_transmit(damiao::build_disable_frame(id), feedback_frame(id as u8, 0, 0.1)); }
-    let t0 = std::time::Instant::now();
-    d.set_torque(false).unwrap();
-    assert!(t0.elapsed() < std::time::Duration::from_millis(25));
-    assert_eq!(d.can_mut().take_tx_frames().len(), 3);
+    let expected_min = armd::driver::DAMIAO_DISABLE_REPEAT_INTERVAL
+        * u32::from(armd::driver::DAMIAO_DISABLE_REPEATS - 1);
+    assert!(
+        waited >= expected_min && waited < std::time::Duration::from_millis(120),
+        "expected bounded repeats without 150 ms confirmation wait, waited {waited:?}"
+    );
+    let r = usize::from(armd::driver::DAMIAO_DISABLE_REPEATS);
+    assert_eq!(
+        (sent(1), sent(2), sent(3)),
+        (r, r, r),
+        "every motor receives exactly DAMIAO_DISABLE_REPEATS disable frames"
+    );
 }

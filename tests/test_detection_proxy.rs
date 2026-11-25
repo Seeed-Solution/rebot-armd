@@ -358,6 +358,11 @@ async fn vision_mode_get_and_post_pass_through() {
     assert_eq!(r.headers()["cache-control"], "no-store");
     let v: serde_json::Value = r.json().await.unwrap();
     assert_eq!((v["mode"].as_str(), v["api_version"].as_u64()), (Some("yolo"), Some(2)));
+    let mc = v["model_config"].as_object().expect("model_config object must be present");
+    assert!(mc["optimal"].is_boolean());
+    assert!(mc["missing"].is_array());
+    assert!(mc["mismatched"].is_array());
+    assert!(matches!(mc["source"].as_str(), Some("bundled" | "cdn" | "user")));
 
     let r = c.post(&url).json(&serde_json::json!({"mode": "both", "enabled": true})).send().await.unwrap();
     assert_eq!(r.status(), 200);

@@ -995,6 +995,7 @@ pub fn install_watchdog_park(
     }
     if !inner.is_torqued || inner.pending_rearm || inner.disable_pending || inner.torque_transition.is_some()
         || inner.mit_active() || inner.handover_settling_since.is_some() || inner.collision.hold.is_some()
+        || inner.core.motion_inhibited_by_config() || inner.calibration_busy
     {
         return Err(MotionInstallError::MotionBusy);
     }

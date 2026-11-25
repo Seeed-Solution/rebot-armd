@@ -136,6 +136,27 @@ impl ArmDriver for TrackingTestDriver {
         let s = self.0.lock().unwrap();
         vec![Some(s.feedback_age); s.dof]
     }
+    fn fresh_joint_positions_into(
+        &self,
+        joints: &[usize],
+        max_age: Duration,
+        out: &mut [f32],
+    ) -> bool {
+        let s = self.0.lock().unwrap();
+        if s.feedback_age > max_age || out.len() < joints.len() {
+            return false;
+        }
+        for (slot, &j) in out.iter_mut().zip(joints.iter()) {
+            let Some(&p) = s.q.get(j) else {
+                return false;
+            };
+            if !p.is_finite() {
+                return false;
+            }
+            *slot = p;
+        }
+        true
+    }
     fn feedback_instants(&self) -> Vec<Option<std::time::Instant>> {
         if let Some(instants) = self.0.lock().unwrap().feedback_instants.clone() {
             return instants.into_iter().map(Some).collect();
@@ -1699,11 +1720,29 @@ fn tracking_damiao_recovery_suspends_compensated_writes() {
                     let i = (id - 1) as usize;
                     if !s.drop_rx[i] { s.push_feedback(i); }
                 }
+            } else if frame.id == 0x7FF && frame.data[2] == damiao::REG_READ && frame.data[3] == damiao::RID_CTRL_MODE {
+                let id = u16::from_le_bytes([frame.data[0], frame.data[1]]);
+                if (1..=7).contains(&id) {
+                    let b = damiao::CTRL_MODE_POS_VEL.to_le_bytes();
+                    let [lo, hi] = id.to_le_bytes();
+                    s.rx_queue.push_back(
+                        CanFrame::new_standard(0x10 + id, &[lo, hi, damiao::REG_READ, damiao::RID_CTRL_MODE, b[0], b[1], b[2], b[3]]).unwrap()
+                    );
+                }
             }
             Ok(())
         }
         fn receive(&mut self) -> Result<CanFrame, TransportError> {
             self.0.lock().unwrap().rx_queue.pop_front().ok_or(TransportError::WouldBlock)
+        }
+        fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<std::time::Instant>), TransportError> {
+            self.0
+                .lock()
+                .unwrap()
+                .rx_queue
+                .pop_front()
+                .map(|f| (f, Some(std::time::Instant::now())))
+                .ok_or(TransportError::WouldBlock)
         }
         fn flush(&mut self) -> Result<(), TransportError> { Ok(()) }
     }
@@ -2026,6 +2065,9 @@ fn tracking_gravity_comp_handback_and_mode_switch_hold_loss() {
         fn receive(&mut self) -> Result<CanFrame, TransportError> {
             self.inner.receive()
         }
+        fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<std::time::Instant>), TransportError> {
+            self.inner.receive_timestamped()
+        }
         fn flush(&mut self) -> Result<(), TransportError> {
             if self.fail_flush_after_mode_write && self.mode_write_seen {
                 return Err(TransportError::Io(std::io::Error::other("simulated bus flush failure")));
@@ -2040,9 +2082,14 @@ fn tracking_gravity_comp_handback_and_mode_switch_hold_loss() {
         let p = damiao::float_to_uint(0.2, limits.p_min, limits.p_max, 16);
         let fb = CanFrame::new_standard(0x11, &[0x11, (p >> 8) as u8, p as u8, 0, 0, 0, 30, 30]).unwrap();
         mock.respond_to_transmit(damiao::build_enable_frame(1), fb);
+        mock.respond_to_transmit(damiao::build_refresh_frame(1), fb);
         let mk_reply = |op: u8, rid: u8, bytes: [u8; 4]| {
             CanFrame::new_standard(0, &[1, 0, op, rid, bytes[0], bytes[1], bytes[2], bytes[3]]).unwrap()
         };
+        mock.respond_to_transmit(
+            damiao::build_read_register_frame(1, damiao::RID_CTRL_MODE),
+            mk_reply(damiao::REG_READ, damiao::RID_CTRL_MODE, damiao::CTRL_MODE_POS_VEL.to_le_bytes()),
+        );
         for (rid, val) in [(damiao::RID_PMAX, 12.5_f32), (damiao::RID_VMAX, 30.0), (damiao::RID_TMAX, 18.0)] {
             mock.respond_to_transmit(damiao::build_read_register_frame(1, rid), mk_reply(damiao::REG_READ, rid, val.to_le_bytes()));
         }
@@ -2876,10 +2923,15 @@ fn damiao_write_modes_preserves_cold_arm_gravity_comp_and_interrupted_rearm() {
         let enabled_fb = CanFrame::new_standard(0x11, &[0x11, (p >> 8) as u8, p as u8, 0, 0, 0, 30, 30]).unwrap();
         let disabled_fb = CanFrame::new_standard(0x11, &[0x01, (p >> 8) as u8, p as u8, 0, 0, 0, 30, 30]).unwrap();
         mock.respond_to_transmit(damiao::build_enable_frame(1), enabled_fb);
+        mock.respond_to_transmit(damiao::build_refresh_frame(1), enabled_fb);
         mock.respond_to_transmit(damiao::build_disable_frame(1), disabled_fb);
         let mk_reply = |op: u8, rid: u8, bytes: [u8; 4]| {
             CanFrame::new_standard(0, &[1, 0, op, rid, bytes[0], bytes[1], bytes[2], bytes[3]]).unwrap()
         };
+        mock.respond_to_transmit(
+            damiao::build_read_register_frame(1, damiao::RID_CTRL_MODE),
+            mk_reply(damiao::REG_READ, damiao::RID_CTRL_MODE, damiao::CTRL_MODE_POS_VEL.to_le_bytes()),
+        );
         for (rid, val) in [(damiao::RID_PMAX, 12.5_f32), (damiao::RID_VMAX, 30.0), (damiao::RID_TMAX, 18.0)] {
             mock.respond_to_transmit(
                 damiao::build_read_register_frame(1, rid),
@@ -2912,9 +2964,38 @@ fn damiao_write_modes_preserves_cold_arm_gravity_comp_and_interrupted_rearm() {
     // 3. Re-arm after interrupted MIT session (motor left in MIT when torque disabled -> restored on set_torque(true))
     drv.set_joint_modes(&[JointMode::Mit], &[JointTarget::mit(0.15, 0.0, 30.0, 1.0, 0.0)])
         .expect("enter MIT before simulated interruption");
+    let limits_rearm = DamiaoLimits::default();
+    let p_rearm = damiao::float_to_uint(0.15, limits_rearm.p_min, limits_rearm.p_max, 16);
+    let disabled_fb_rearm =
+        CanFrame::new_standard(0x11, &[0x01, (p_rearm >> 8) as u8, p_rearm as u8, 0, 0, 0, 30, 30]).unwrap();
+    let enabled_fb_rearm =
+        CanFrame::new_standard(0x11, &[0x11, (p_rearm >> 8) as u8, p_rearm as u8, 0, 0, 0, 30, 30]).unwrap();
+    drv.can_mut().replace_transmit_response(damiao::build_refresh_frame(1), disabled_fb_rearm);
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    arm_joints[0] = 0;
+    let mut rest_positions = [0.0f32; armd::rt_core::mailbox::MAX_DOF];
+    rest_positions[0] = 0.15;
+    drv.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+        safety_stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 1,
+        rest_positions,
+        rest_pose_tolerance_rad: 0.05,
+    });
+    // Wait past TORQUE_CAUSAL_SETTLE_WINDOW (20 ms) after set_joint_modes, then establish K=3 rest samples.
+    std::thread::sleep(Duration::from_millis(22));
+    for step in 0..3 {
+        if step > 0 {
+            std::thread::sleep(Duration::from_millis(11));
+        }
+        drv.can_mut().provide_rx_frame(enabled_fb_rearm);
+        drv.read_joint_states().unwrap();
+    }
     drv.set_torque(false).expect("disable while in MIT");
     assert!(!drv.is_enabled());
     let _ = drv.can_mut().take_tx_frames();
+    drv.can_mut().replace_transmit_response(damiao::build_refresh_frame(1), enabled_fb_rearm);
     drv.set_torque(true)
         .expect("re-arm after interrupted MIT session must restore POS_VEL with dual-hold and succeed");
     assert!(drv.is_enabled());
@@ -2958,6 +3039,9 @@ fn damiao_recovery_tx_failure_not_recorded_as_sent() {
         fn receive(&mut self) -> Result<CanFrame, TransportError> {
             self.inner.receive()
         }
+        fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<std::time::Instant>), TransportError> {
+            self.inner.receive_timestamped()
+        }
         fn flush(&mut self) -> Result<(), TransportError> {
             self.inner.flush()
         }
@@ -2967,7 +3051,14 @@ fn damiao_recovery_tx_failure_not_recorded_as_sent() {
     let limits = DamiaoLimits::default();
     let p = damiao::float_to_uint(0.1, limits.p_min, limits.p_max, 16);
     let fb = CanFrame::new_standard(0x11, &[0x11, (p >> 8) as u8, p as u8, 0, 0, 0, 30, 30]).unwrap();
+    let ctrl_mode_reply = CanFrame::new_standard(
+        0x11,
+        &[1, 0, damiao::REG_READ, damiao::RID_CTRL_MODE, 2, 0, 0, 0],
+    )
+    .unwrap();
+    mock.respond_to_transmit(damiao::build_read_register_frame(1, damiao::RID_CTRL_MODE), ctrl_mode_reply);
     mock.respond_to_transmit(damiao::build_enable_frame(1), fb);
+    mock.respond_to_transmit(damiao::build_refresh_frame(1), fb);
     let mut drv = DamiaoArmDriver::new(FailRecoveryTxCan { inner: mock, fail_pos_vel: false }, vec![1]);
     drv.set_torque(true).unwrap();
 
@@ -3043,6 +3134,20 @@ fn tracking_damiao_recovery_preserves_unaffected_moving_joint() {
             s.tx_log.push(*frame);
             if frame.data == [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFC] && (1..=7).contains(&frame.id) {
                 s.push_feedback((frame.id - 1) as usize);
+            } else if frame.id == 0x7FF && frame.data[2] == 0xCC {
+                let id = u16::from_le_bytes([frame.data[0], frame.data[1]]);
+                if (1..=7).contains(&id) {
+                    s.push_feedback((id - 1) as usize);
+                }
+            } else if frame.id == 0x7FF && frame.data[2] == damiao::REG_READ && frame.data[3] == damiao::RID_CTRL_MODE {
+                let id = u16::from_le_bytes([frame.data[0], frame.data[1]]);
+                if (1..=7).contains(&id) {
+                    let b = damiao::CTRL_MODE_POS_VEL.to_le_bytes();
+                    let [lo, hi] = id.to_le_bytes();
+                    s.rx.push_back(
+                        CanFrame::new_standard(0x10 + id, &[lo, hi, damiao::REG_READ, damiao::RID_CTRL_MODE, b[0], b[1], b[2], b[3]]).unwrap()
+                    );
+                }
             } else if (0x101..=0x107).contains(&frame.id) {
                 let idx = (frame.id - 0x101) as usize;
                 if !s.drop_rx[idx] {
@@ -3053,6 +3158,15 @@ fn tracking_damiao_recovery_preserves_unaffected_moving_joint() {
         }
         fn receive(&mut self) -> Result<CanFrame, TransportError> {
             self.0.lock().unwrap().rx.pop_front().ok_or(TransportError::WouldBlock)
+        }
+        fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<std::time::Instant>), TransportError> {
+            self.0
+                .lock()
+                .unwrap()
+                .rx
+                .pop_front()
+                .map(|f| (f, Some(std::time::Instant::now())))
+                .ok_or(TransportError::WouldBlock)
         }
         fn flush(&mut self) -> Result<(), TransportError> {
             Ok(())

@@ -174,12 +174,66 @@ class Motors:
                 return None
         return out
 
+    @classmethod
+    def parse_hold_targets(cls, targets, dof: int | None = None) -> list[tuple | None] | None:
+        """Validated sparse hold targets (tuple or None per joint), or None when malformed."""
+        target_dof = DOF if dof is None else dof
+        if not isinstance(targets, list) or len(targets) != target_dof:
+            return None
+        out: list[tuple | None] = []
+        any_present = False
+        for t in targets:
+            if t is None:
+                out.append(None)
+                continue
+            if not isinstance(t, dict):
+                return None
+            mode = t.get("mode")
+            if mode == "pos_vel":
+                q, vlim = _finite(t.get("q")), _finite(t.get("vlim", 2.0))
+                if q is None or vlim is None:
+                    return None
+                out.append((mode, q, abs(vlim)))
+                any_present = True
+            elif mode == "mit":
+                vals = [_finite(t.get("q"))] + [
+                    _finite(t.get(k, 0.0)) for k in ("dq", "kp", "kd", "tau")
+                ]
+                if any(v is None for v in vals):
+                    return None
+                out.append((mode, *vals))
+                any_present = True
+            else:
+                return None
+        return out if any_present else None
+
     def set_targets(self, targets) -> bool:
         """Apply all targets, or none of them when one is malformed."""
         parsed = self.parse_targets(targets, self.dof)
         if parsed is None:
             return False
         for i, t in enumerate(parsed):
+            if t[0] == "pos_vel":
+                self.mode[i], self.q_t[i], self.vlim[i] = t
+            else:
+                (
+                    self.mode[i],
+                    self.q_t[i],
+                    self.dq_t[i],
+                    self.kp[i],
+                    self.kd[i],
+                    self.tau_ff[i],
+                ) = t
+        return True
+
+    def set_hold_targets(self, targets) -> bool:
+        """Apply sparse hold targets, leaving None entries untouched."""
+        parsed = self.parse_hold_targets(targets, self.dof)
+        if parsed is None:
+            return False
+        for i, t in enumerate(parsed):
+            if t is None:
+                continue
             if t[0] == "pos_vel":
                 self.mode[i], self.q_t[i], self.vlim[i] = t
             else:
@@ -434,15 +488,21 @@ class Simulator:
         if msg["type"] == "poll":
             self.peer = addr
             return
-        enable, seq, targets = (
+        enable, seq, targets, hold_targets = (
             msg.get("enable"),
             msg.get("seq", 0),
             msg.get("targets"),
+            msg.get("hold_targets"),
         )
         parsed = (
             None
             if targets is None
             else self.motors.parse_targets(targets, self.motors.dof)
+        )
+        parsed_hold = (
+            None
+            if hold_targets is None
+            else self.motors.parse_hold_targets(hold_targets, self.motors.dof)
         )
         if (
             (enable is not None and not isinstance(enable, bool))
@@ -450,7 +510,9 @@ class Simulator:
             or not isinstance(seq, int)
             or seq < 0
             or (targets is not None and parsed is None)
-            or (enable is None and targets is None)
+            or (hold_targets is not None and parsed_hold is None)
+            or (targets is not None and hold_targets is not None)
+            or (enable is None and targets is None and hold_targets is None)
         ):
             self.rejected += 1
             return
@@ -459,6 +521,8 @@ class Simulator:
             self.motors.set_enabled(enable)
         if targets is not None:
             self.motors.set_targets(targets)
+        if hold_targets is not None:
+            self.motors.set_hold_targets(hold_targets)
         self.ack = seq
         if self.steps_since_cmd:
             self.cmd_period = min(self.steps_since_cmd, self.tau_hist.maxlen)

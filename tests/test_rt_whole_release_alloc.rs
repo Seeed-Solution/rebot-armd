@@ -206,6 +206,41 @@ impl ArmDriver for WakeDriver {
         true
     }
 
+    fn has_driver_fresh_position_api(&self) -> bool {
+        true
+    }
+
+    fn fresh_joint_positions_into(
+        &self,
+        joints: &[usize],
+        max_age: Duration,
+        out: &mut [f32],
+    ) -> bool {
+        if joints.is_empty() || out.len() < joints.len() {
+            return false;
+        }
+        let now = self.now();
+        for (slot, &i) in out.iter_mut().zip(joints.iter()) {
+            let fresh = self
+                .rx_at
+                .get(i)
+                .copied()
+                .flatten()
+                .is_some_and(|t| now.saturating_duration_since(t) <= max_age);
+            if !fresh {
+                return false;
+            }
+            let Some(&p) = self.q.get(i) else {
+                return false;
+            };
+            if !p.is_finite() {
+                return false;
+            }
+            *slot = p;
+        }
+        true
+    }
+
     fn feedback_ages(&self) -> Vec<Option<Duration>> {
         let now = self.now();
         self.rx_at.iter().map(|t| t.map(|t| now.saturating_duration_since(t))).collect()
@@ -1759,4 +1794,126 @@ fn terminal_capture_action_completion_dwell_saturation_and_positive_control_zero
 
         handle.stop_and_join();
     });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cf1_calibration_and_software_zero_executor_zero_rt_alloc() {
+    use armd::calibration::{CalibrationDeps, ExecutorCalibAuth};
+    use armd::model::HolderLabel;
+    use armd::motor_zero::{self, MotorZeroRequest};
+    use armd::rt_core::requests::config::capture_config_admission;
+
+    let dir = tempfile::tempdir().unwrap();
+    let calib_path = dir.path().join("calibration.json");
+    let setup_path = dir.path().join("grasp_setup.json");
+
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    let lease_conn = "alloc-cf1-conn".to_string();
+    let (lease_gen, epoch) = {
+        let mut inner = sup.inner().write().await;
+        inner.measured_positions = vec![0.0, 0.25, -0.25, 0.0, 0.0, 0.0, 0.0];
+        inner.commanded_positions = inner.measured_positions.clone();
+        inner.target_positions = inner.measured_positions.clone();
+        // Seed populated tracking history WITH occupied spares so executor handoff
+        // (`normalize_spares_off_thread`) normalizes colliding spares while preserving active
+        // history, and the first RT tick + software-zero activation execute 0 allocs / 0 frees.
+        inner.tracking.record_issued(vec![0.1; 7], vec![0.01; 7]);
+        inner.tracking.invalidate(); // moves vectors into spare_issued_*
+        inner.tracking.record_issued(vec![0.2; 7], vec![0.02; 7]);
+        inner.tracking.last_nominal = Some((vec![0.2; 7], vec![0.0; 7]));
+        let g = inner.acquire_lease(&lease_conn).unwrap();
+        (g, inner.safety.epoch_id())
+    };
+    let handle = sup
+        .start_executor(alloc_cfg(Duration::from_millis(2)))
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while sup.hub().latest().is_none() {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO);
+
+    let det_up = armd::api::proxy::DetectorUpstream::parse("http://127.0.0.1:9").unwrap();
+    let cal_deps = CalibrationDeps::new(calib_path, Some(setup_path), det_up);
+
+    // Software joint zero + joint-zero restore on Executor MUST perform 0 RT allocs/frees.
+    let auth_zero = ExecutorCalibAuth {
+        admission: capture_config_admission(&sup, 1, lease_gen, Some(epoch)),
+        lease_holder: Some((HolderLabel::new(&lease_conn), lease_gen)),
+        operator_grant: armd::auth::OperatorGrant::unenforced(),
+        auth_check: Arc::new(|| Ok(())),
+        txn_id: None,
+    };
+    let sw_req = MotorZeroRequest {
+        joints: vec![1, 2],
+        dry_run: false,
+        force: false,
+        method: Some("software".into()),
+    };
+    let sw_out = motor_zero::run_software_executor(&sup, &cal_deps, sw_req, auth_zero)
+        .await
+        .expect("software zero on executor");
+    let backup = sw_out["restore"]["backup"].as_str().unwrap().to_string();
+
+    let auth_restore = ExecutorCalibAuth {
+        admission: capture_config_admission(&sup, 1, lease_gen, Some(epoch)),
+        lease_holder: Some((HolderLabel::new(&lease_conn), lease_gen)),
+        operator_grant: armd::auth::OperatorGrant::unenforced(),
+        auth_check: Arc::new(|| Ok(())),
+        txn_id: None,
+    };
+    let _restored = motor_zero::restore_executor(&sup, &cal_deps, backup, auth_restore)
+        .await
+        .expect("joint-zero restore on executor");
+
+    let counts = handle.stats().total_allocs();
+    let lock_attempts = sup.inner().control_thread_attempts();
+    tokio::task::spawn_blocking(move || handle.stop_and_join())
+        .await
+        .unwrap();
+    assert_eq!(
+        counts,
+        AllocCounts::ZERO,
+        "C-F1 software zero + restore allocated on RT: {counts:?}"
+    );
+    assert_eq!(lock_attempts, 0, "C-F1 attempted SupervisorLock on RT");
+
+    // Directly verify zero RT alloc/free when TrackingRuntime holds occupied active history,
+    // occupied spares, heap-backed SlotBuf depths (len > 16), AND a populated FallbackRamp
+    // simultaneously at the moment of software-zero invalidation.
+    let mut inner = armd::supervisor::SupervisorInner::new(ArmConfig::rebot_dm());
+    inner.tracking.record_issued(vec![0.1; 7], vec![0.01; 7]);
+    inner.tracking.invalidate(); // fills spares
+    inner.tracking.record_issued_with_ws_depths(
+        vec![0.2; 7],
+        vec![0.02; 7],
+        Some((1, armd::kinematics::SlotBuf::zeros(32))),
+        Some((1, armd::kinematics::SlotBuf::zeros(32))),
+    );
+    inner.tracking.last_nominal = Some((vec![0.2; 7], vec![0.0; 7]));
+    inner.tracking.fallback_ramp = Some(armd::tracking::FallbackRamp {
+        hold: vec![0.0; 7],
+        keepout_only: false,
+        limits: Vec::with_capacity(7),
+    });
+    alloc::time_this_thread();
+    let before = alloc::snapshot_counts();
+    let retired = inner.tracking.invalidate_retiring_for_test();
+    let delta = alloc::snapshot_counts().delta_since(before);
+    assert_eq!(
+        delta,
+        AllocCounts::ZERO,
+        "invalidate_retiring allocated/freed on RT with occupied spares + heap depths + fallback_ramp: {delta:?}"
+    );
+    // Dropping `retired` off-RT frees the displaced buffers (positive control: dealloc > 0).
+    let before_drop = alloc::snapshot_counts();
+    drop(retired);
+    let drop_delta = alloc::snapshot_counts().delta_since(before_drop);
+    assert!(
+        drop_delta.dealloc >= 6,
+        "retired tracking payload must actually own displaced heap buffers for off-RT drop: {drop_delta:?}"
+    );
+    drop(inner);
 }

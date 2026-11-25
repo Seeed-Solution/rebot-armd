@@ -410,7 +410,7 @@ async fn rig_driven(setup: GraspSetup, truth: Truth, mount_rot_deg: f32, start: 
         inner.lease_enabled = lease;
         if let Some(arm) = &arm {
             arm.0.lock().unwrap().q = q;
-            inner.driver = Some(std::sync::Mutex::new(Box::new(arm.clone())));
+            inner.driver = Some(armd::supervisor_lock::DriverSlot::legacy(Box::new(arm.clone())));
         }
         { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
         inner.commanded_positions = q.to_vec();

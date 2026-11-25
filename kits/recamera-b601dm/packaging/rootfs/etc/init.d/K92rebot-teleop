@@ -28,6 +28,7 @@ PROFILE=/usr/share/$NAME/profile/rebot-b601dm.json
 # Camera process, kept running by a respawn loop whose pid is in VISION_PIDFILE
 VISION_DAEMON=/usr/bin/rebot-vision
 VISION_RUNNER=/usr/share/$NAME/rebot-vision-run
+MODELS_CHECK=/usr/share/$NAME/rebot-models-check
 VISION_PIDFILE=/var/run/rebot-vision.pid
 VISION_CONF=/userdata/rebot-teleop/vision.json
 VISION_CONF_DEFAULT=/usr/share/$NAME/vision.json.default
@@ -722,6 +723,9 @@ start_vision() {
     done
     if [ ! -f "$VISION_CONF" ] && [ -f "$VISION_CONF_DEFAULT" ]; then
         mkdir -p "$(dirname "$VISION_CONF")" && cp -f "$VISION_CONF_DEFAULT" "$VISION_CONF" 2>/dev/null || true
+    fi
+    if [ -x "$MODELS_CHECK" ]; then
+        "$MODELS_CHECK" || true
     fi
     REBOT_VISION_CONF="$VISION_CONF" start-stop-daemon -S -b -m -p "$VISION_PIDFILE" -a /bin/sh -- "$VISION_RUNNER"
     sleep 0.5

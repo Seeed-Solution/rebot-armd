@@ -14,7 +14,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use armd::api::{create_router_full, proxy::DetectorUpstream};
 use armd::diagnostics::tick::{reset_tx_metrics, take_tx_metrics};
@@ -53,7 +53,7 @@ enum TxRule {
 struct VirtualBusState {
     motors: Vec<(u16, DamiaoLimits, f32, bool, u32)>, // (id, limits, q, enabled, ctrl_mode)
     motor_faults: Vec<u8>, // non-zero overrides feedback state nibble (e.g. 0x0A overcurrent)
-    rx: VecDeque<CanFrame>,
+    rx: VecDeque<(CanFrame, Option<Instant>)>,
     tx_log: Vec<CanFrame>,
     tx_accepted: Vec<CanFrame>,
     tx_script: VecDeque<(TxRule, Duration)>,
@@ -124,12 +124,16 @@ impl VirtualBusState {
             30,
             30,
         ];
-        self.rx.push_back(CanFrame::new_standard(0x10 + id, &data).unwrap());
+        self.rx.push_back((CanFrame::new_standard(0x10 + id, &data).unwrap(), Some(self.clock.now())));
+    }
+
+    fn push_unsolicited_feedback(&mut self, i: usize) {
+        self.push_feedback(i);
     }
 
     fn push_all_feedback(&mut self) {
         for i in 0..self.motors.len() {
-            self.push_feedback(i);
+            self.push_unsolicited_feedback(i);
         }
     }
 
@@ -156,7 +160,7 @@ impl VirtualBusState {
                             &[lo, hi, damiao::REG_READ, rid, val[0], val[1], val[2], val[3]],
                         )
                         .unwrap();
-                        self.rx.push_back(reply);
+                        self.rx.push_back((reply, Some(self.clock.now())));
                     }
                     damiao::REG_WRITE => {
                         let val = [frame.data[4], frame.data[5], frame.data[6], frame.data[7]];
@@ -169,7 +173,7 @@ impl VirtualBusState {
                             &[lo, hi, damiao::REG_WRITE, rid, val[0], val[1], val[2], val[3]],
                         )
                         .unwrap();
-                        self.rx.push_back(reply);
+                        self.rx.push_back((reply, Some(self.clock.now())));
                     }
                     _ => {}
                 }
@@ -277,6 +281,10 @@ impl CanTransport for VirtualBus {
     }
 
     fn receive(&mut self) -> Result<CanFrame, TransportError> {
+        self.receive_timestamped().map(|(f, _)| f)
+    }
+
+    fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<Instant>), TransportError> {
         self.0
             .lock()
             .unwrap()
@@ -313,6 +321,18 @@ fn enabled_driver() -> (DamiaoArmDriver<VirtualBus>, VirtualBus, MockClock) {
     let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
         .with_joint_limits(limits)
         .unwrap();
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    for i in 0..6 {
+        arm_joints[i] = i;
+    }
+    d.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+        safety_stopped: Arc::new(AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 6,
+        rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+        rest_pose_tolerance_rad: 0.05,
+    });
     bus.with(|s| s.push_all_feedback());
     d.read_joint_states().unwrap();
     d.set_torque(true).expect("enable");
@@ -1437,9 +1457,16 @@ fn receive_recovery_obeys_stop_gate_and_refresh_flush_failure_propagates() {
         let (mut d, bus, clock) = enabled_driver();
         d.set_tx_budget(TxBudget { max_frames: 4, max_duration: ms(5), frame_max_age: ms(45) });
         assert_eq!(
-            d.write_joint_targets_bounded(&targets_const(0.1)).unwrap(),
+            d.write_joint_targets_bounded(&targets_const(0.02)).unwrap(),
             TxBatchOutcome::Deferred { pending: 3 }
         );
+        for step in 0..3 {
+            if step > 0 {
+                clock.advance(ms(10));
+            }
+            bus.with(|s| s.push_all_feedback());
+            d.read_joint_states().unwrap();
+        }
         d.set_torque(false).unwrap(); // disabled -> stale >= 100 ms sends 0xCC refreshes only
         // Re-queue pending motion frames isn't needed while disabled, verify pass closure + Err propagation.
         clock.advance(ms(120));
@@ -1845,7 +1872,7 @@ fn j7_pos_force_autonomous_recovery_obeys_estop_and_handshake_obeys_tx_budget() 
     // reads back, sends 0x307 pre-enable hold, and confirms enable.
     d.set_tx_budget(TxBudget::default());
     let mut confirmed = false;
-    for _ in 0..20 {
+    for _ in 0..50 {
         clock.advance(ms(2));
         match d.poll_torque(clock.now() + ms(5)).expect("poll_torque with restored budget") {
             armd::driver::TorqueProgress::Done(armd::driver::TorqueOutcome::Confirmed) => {
@@ -1964,15 +1991,17 @@ fn enable_and_retry_frames_obey_tx_budget_across_polls() {
 
     let mut confirmed = false;
     let mut total_enables = 0usize;
-    for step in 0..30 {
+    for step in 0..120 {
         bus.clear();
         clock.advance(ms(1));
         match d.poll_torque(clock.now() + ms(5)).expect("poll_torque under max_frames=1") {
             armd::driver::TorqueProgress::Done(armd::driver::TorqueOutcome::Confirmed) => {
+                let sent = bus.with(|s| s.tx_log.clone());
                 assert!(
-                    bus.with(|s| s.tx_log.len()) <= 1,
+                    sent.len() <= 1,
                     "step {step} exceeded max_frames=1"
                 );
+                total_enables += sent.iter().filter(|f| f.data == damiao::CMD_ENABLE).count();
                 confirmed = true;
                 break;
             }
@@ -2320,8 +2349,10 @@ fn gravity_comp_recovery_rebuilds_mit_frame_fresh_and_refuses_stale() {
     assert!((wire_kd - 0.8).abs() < 0.05, "expected preserved kd ~0.8, got {wire_kd}");
     assert!((wire_t - 1.5).abs() < 0.05, "expected preserved torque ~1.5, got {wire_t}");
 
-    // Advance another 60 ms (feedback age = 110 ms > 100 ms freshness limit) with silent motors:
+    // Advance another 60 ms (feedback age = 110 ms > 100 ms freshness limit) with silent motors
+    // (drop the synchronous mock reply to the t = 50 ms recovery frame so the motor truly stayed silent):
     // recovery MUST fail closed and send ZERO MIT frames for J4.
+    bus.with(|s| s.rx.clear());
     clock.advance(ms(60));
     bus.clear();
     d.read_joint_states().unwrap();
@@ -2345,7 +2376,25 @@ fn motor_fault_plus_latched_estop_clears_via_operator_clear_fault_and_refuses_pe
         let mut driver = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
             .with_joint_limits(limits)
             .unwrap();
+        let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+        for (i, slot) in arm_joints.iter_mut().enumerate().take(6) {
+            *slot = i;
+        }
+        driver.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+            safety_stopped: Arc::new(AtomicBool::new(false)),
+            has_resting_pose: true,
+            arm_joints,
+            arm_joints_len: 6,
+            rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+            rest_pose_tolerance_rad: 0.05,
+        });
         driver.read_joint_states().unwrap();
+        for _ in 0..2 {
+            clock.advance(ms(10));
+            bus.with(|s| s.push_all_feedback());
+            driver.read_joint_states().unwrap();
+        }
+        driver.set_torque(false).unwrap();
         let cfg = ArmConfig { lease_timeout_ms: 600_000, ..ArmConfig::rebot_dm() };
         let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(driver));
         inner.lease_enabled = false;
@@ -2369,7 +2418,7 @@ fn motor_fault_plus_latched_estop_clears_via_operator_clear_fault_and_refuses_pe
     };
 
     // Case A: Legacy `SupervisorInner::clear_fault()` resets motor fault while latched, then clears latch.
-    let (mut inner, bus, _clock) = make_faulted_estop_supervisor();
+    let (mut inner, bus, clock) = make_faulted_estop_supervisor();
     // Negative check: while a NEW stop is PENDING (requested > applied), clear_fault MUST refuse
     // and emit 0 CMD_CLEAR_FAULTS frames.
     bus.clear();
@@ -2416,8 +2465,14 @@ fn motor_fault_plus_latched_estop_clears_via_operator_clear_fault_and_refuses_pe
         "latch must remain set until fresh fault-free feedback is verified on retry"
     );
 
-    // Next supervisor tick ingests the fault-free feedback replies from the reset while E-stop remains latched.
-    inner.tick(0.02);
+    // Next supervisor ticks ingest K=3 fault-free feedback replies across >= 20 ms while E-stop remains latched.
+    for step in 0..3 {
+        if step > 0 {
+            clock.advance(ms(10));
+            bus.with(|s| s.push_all_feedback());
+        }
+        inner.tick(0.02);
+    }
     assert_eq!(*inner.safety.state(), SafetyState::EStop);
     assert!(inner.e_stop_latched.load(Ordering::SeqCst));
 
@@ -2432,7 +2487,7 @@ fn motor_fault_plus_latched_estop_clears_via_operator_clear_fault_and_refuses_pe
 
     // Case B: RT Executor `SupervisorInner::clear_fault_executor(deadline)` resets motor fault while
     // latched via `clear_fault_budgeted`, then clears the latch on the next call after Step 2 feedback.
-    let (mut inner_rt, bus_rt, _clock_rt) = make_faulted_estop_supervisor();
+    let (mut inner_rt, bus_rt, clock_rt) = make_faulted_estop_supervisor();
     bus_rt.clear();
     let step1_rt = inner_rt
         .clear_fault_executor(std::time::Instant::now() + ms(50))
@@ -2454,8 +2509,14 @@ fn motor_fault_plus_latched_estop_clears_via_operator_clear_fault_and_refuses_pe
         "clear_fault_executor while latched must transmit CMD_CLEAR_FAULTS to all 7 motors: {clear_frames_rt:?}"
     );
     assert!(inner_rt.e_stop_latched.load(Ordering::SeqCst));
-    // Step 2 tick ingests fresh fault-free feedback from all 7 motors.
-    inner_rt.tick(0.02);
+    // Step 2 ticks ingest K=3 fresh fault-free feedback from all 7 motors across >= 20 ms.
+    for step in 0..3 {
+        if step > 0 {
+            clock_rt.advance(ms(10));
+            bus_rt.with(|s| s.push_all_feedback());
+        }
+        inner_rt.tick(0.02);
+    }
     let final_rt = inner_rt
         .clear_fault_executor(std::time::Instant::now() + ms(50))
         .expect("second clear_fault_executor after fresh feedback must clear E-stop latch");
@@ -2502,6 +2563,7 @@ fn confirmed_handover_and_mit_fresh_status_obey_per_send_stop_gate_and_tx_budget
             r
         }
         fn receive(&mut self) -> Result<CanFrame, TransportError> { self.inner.receive() }
+        fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<Instant>), TransportError> { self.inner.receive_timestamped() }
         fn flush(&mut self) -> Result<(), TransportError> { self.inner.flush() }
     }
 
@@ -2638,6 +2700,18 @@ fn budget_1_completes_multi_joint_restore_readback_and_enable_within_deadline() 
             torque_reference: None,
         })
         .unwrap();
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    for (i, slot) in arm_joints.iter_mut().enumerate().take(6) {
+        *slot = i;
+    }
+    d.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+        safety_stopped: Arc::new(AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 6,
+        rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+        rest_pose_tolerance_rad: 0.05,
+    });
     // Establish fresh feedback, enable once, switch J4 to MIT, then disable so J4 is stray (MIT)
     // and needs CTRL_MODE=POS_VEL + dual holds on the next enable alongside J7 PosForce!
     d.read_joint_states().unwrap();
@@ -2650,6 +2724,13 @@ fn budget_1_completes_multi_joint_restore_readback_and_enable_within_deadline() 
     let mut mit_j4 = [JointMode::Position; 7];
     mit_j4[3] = JointMode::Mit;
     d.set_joint_modes(&mit_j4, &targets_const(0.0)).expect("switch J4 to MIT");
+    for step in 0..3 {
+        if step > 0 {
+            clock.advance(ms(10));
+        }
+        bus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+    }
     d.set_torque(false).expect("disable while J4 is in MIT");
     // Refresh feedback (torque off, state 0, fresh <= 100 ms).
     d.read_joint_states().unwrap();
@@ -2671,7 +2752,7 @@ fn budget_1_completes_multi_joint_restore_readback_and_enable_within_deadline() 
     let mut saw_j4_ctrl_mode = false;
     let mut saw_j4_hold = false;
     let mut total_enables = 0usize;
-    for step in 0..40 {
+    for step in 0..120 {
         let sent_prev = bus.with(|s| s.tx_log.clone());
         saw_j4_ctrl_mode |= sent_prev.iter().any(|f| {
             f.id == 0x7FF && f.data[0] == 4 && f.data[2] == damiao::REG_WRITE && f.data[3] == damiao::RID_CTRL_MODE
@@ -2786,6 +2867,7 @@ fn carried_and_retried_j7_enable_fails_closed_when_j7_feedback_goes_stale() {
             r
         }
         fn receive(&mut self) -> Result<CanFrame, TransportError> { self.inner.receive() }
+        fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<Instant>), TransportError> { self.inner.receive_timestamped() }
         fn flush(&mut self) -> Result<(), TransportError> { self.inner.flush() }
     }
 
@@ -2829,7 +2911,7 @@ fn carried_and_retried_j7_enable_fails_closed_when_j7_feedback_goes_stale() {
     }
     assert!(saw_enable_batch, "expected initial J7 CMD_ENABLE while J7 feedback is still fresh");
     // Drop the 0x307 feedback reply too if still sitting in RX so J7 stays aged from t=0.
-    vbus.with(|s| s.rx.retain(|f| f.id != 0x17));
+    vbus.with(|s| s.rx.retain(|(f, _)| f.id != 0x17));
     // Advance +76 ms (past the 75 ms retry point and past 100 ms J7 feedback age, still < 150 ms enable confirm).
     clock2.advance(ms(76));
     vbus.clear();
@@ -3517,12 +3599,16 @@ fn production_damiao_operations_under_latched_estop_table() {
                 );
                 assert_eq!(
                     tx.iter().filter(|f| f.data == damiao::CMD_DISABLE).count(),
-                    7,
-                    "expected 7 CMD_DISABLE frames: {tx:?}"
+                    7 * usize::from(armd::driver::DAMIAO_DISABLE_REPEATS),
+                    "expected 21 CMD_DISABLE frames: {tx:?}"
                 );
                 assert!(
-                    tx.iter().all(|f| f.data == damiao::CMD_CLEAR_FAULTS || f.data == damiao::CMD_DISABLE),
-                    "mit_expiry_recover must only transmit CMD_CLEAR_FAULTS and CMD_DISABLE: {tx:?}"
+                    tx.iter().all(|f| {
+                        f.data == damiao::CMD_CLEAR_FAULTS
+                            || f.data == damiao::CMD_DISABLE
+                            || (f.id == 0x7FF && f.data[2] == 0xCC)
+                    }),
+                    "mit_expiry_recover must only transmit CMD_CLEAR_FAULTS, CMD_DISABLE, and read-only 0xCC status probes: {tx:?}"
                 );
             },
         ),
@@ -3530,7 +3616,14 @@ fn production_damiao_operations_under_latched_estop_table() {
             "begin_torque(false)",
             Outcome::AllowedTx,
             |latch, _| {
-                let (mut d, bus, _) = enabled_driver();
+                let (mut d, bus, clock) = enabled_driver();
+                for i in 0..3 {
+                    if i > 0 {
+                        clock.advance(ms(11));
+                    }
+                    bus.with(|s| s.push_all_feedback());
+                    d.read_joint_states().unwrap();
+                }
                 latch(&mut d);
                 bus.clear();
                 let res = d.begin_torque(false);
@@ -3546,7 +3639,14 @@ fn production_damiao_operations_under_latched_estop_table() {
             "begin_torque_budgeted(false, 16)",
             Outcome::AllowedTx,
             |latch, _| {
-                let (mut d, bus, _) = enabled_driver();
+                let (mut d, bus, clock) = enabled_driver();
+                for i in 0..3 {
+                    if i > 0 {
+                        clock.advance(ms(11));
+                    }
+                    bus.with(|s| s.push_all_feedback());
+                    d.read_joint_states().unwrap();
+                }
                 latch(&mut d);
                 bus.clear();
                 let res = d.begin_torque_budgeted(false, 16);
@@ -3633,6 +3733,7 @@ fn cutoff_elapsing_during_send_build_refuses_submission_without_transmitting() {
         fn clock(&self) -> Option<Arc<dyn DriverClock>> { Some(Arc::clone(&self.clock)) }
         fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> { self.inner.transmit(frame) }
         fn receive(&mut self) -> Result<CanFrame, TransportError> { self.inner.receive() }
+        fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<Instant>), TransportError> { self.inner.receive_timestamped() }
         fn flush(&mut self) -> Result<(), TransportError> { self.inner.flush() }
         fn supports_bounded_flush(&self) -> bool { true }
         fn flush_is_noop(&self) -> bool { true }

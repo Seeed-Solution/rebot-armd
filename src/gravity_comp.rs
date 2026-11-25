@@ -19,7 +19,7 @@
 
 use std::time::Duration;
 
-use crate::driver::{EnableState, JointMode, JointTarget, RangeCheckStatus};
+use crate::driver::{JointMode, JointTarget, RangeCheckStatus};
 use crate::model::{GravityCompExit, GravityCompObservation, GravityCompPolicy, ModeReason};
 use crate::motion::MotionError;
 use crate::safety::{FaultReason, SafetyError, SafetyState};
@@ -123,8 +123,10 @@ impl SupervisorInner {
         if !self.config.dynamics_qualified {
             return Err(reason("UNSUPPORTED", "Gravity compensation is disabled: active tool dynamics are unqualified"));
         }
-        if let Some(d) = &self.driver {
-            let Ok(drv) = d.lock() else { return Err(reason("UNSUPPORTED", "driver lock poisoned")); };
+        if self.driver.is_some() {
+            let Some(drv) = self.read_driver_for_tick() else {
+                return Err(reason("UNSUPPORTED", "driver lock unavailable"));
+            };
             if !drv.supports_mit_mode_switch() {
                 return Err(reason("UNSUPPORTED", "The driver cannot switch joints to MIT mode"));
             }
@@ -176,7 +178,7 @@ impl SupervisorInner {
         // MIT torque commands are only as right as the mapping ranges: require the
         // startup range check to have passed when the driver ran one.
         let mut blocked = None;
-        if let Some(Ok(drv)) = self.driver.as_ref().map(|d| d.lock()) {
+        if let Some(drv) = self.read_driver_for_tick() {
             drv.with_range_check(&mut |c| match c.map(|c| (c.status, c)) {
                 Some((RangeCheckStatus::Mismatch, c)) => blocked = Some(reason("DRIVER_RANGE_MISMATCH", &c.message)),
                 Some((RangeCheckStatus::Unverified, c)) => blocked = Some(reason("DRIVER_RANGE_UNVERIFIED", &c.message)),
@@ -399,16 +401,19 @@ impl SupervisorInner {
             *t = if t.is_finite() { t.clamp(-lim, lim) } else { model[i] };
         }
         let gripper = self.commanded_positions[ARM];
-        if let Some(d) = &self.driver {
-            let mut drv = d.lock().map_err(|_| ArmError::Internal("driver lock poisoned".into()))?;
+        if let Some(d) = self.driver.as_mut() {
             let mut modes = vec![JointMode::Mit; ARM];
             modes.push(JointMode::Position);
             let mut hold: Vec<JointTarget> = (0..ARM)
                 .map(|i| JointTarget::mit(pose[i], 0.0, policy.hold_kp[i], policy.hold_kd[i], entry_torque[i])).collect();
             hold.push(JointTarget::position(gripper));
-            if let Err(e) = drv.set_joint_modes(&modes, &hold) {
-                let uncertain = drv.joint_modes_uncertain();
-                drop(drv);
+            let switch_res = d
+                .with_mut(|drv| match drv.set_joint_modes(&modes, &hold) {
+                    Ok(()) => Ok(()),
+                    Err(e) => Err((e, drv.joint_modes_uncertain())),
+                })
+                .ok_or_else(|| ArmError::Internal("driver lock poisoned".into()))?;
+            if let Err((e, uncertain)) = switch_res {
                 // Mode switch (and any rollback dual-hold) already wrote hold frames to the bus;
                 // never keep a stale pre-entry `last_issued_positions` as tracking baseline.
                 self.tracking.invalidate();
@@ -498,30 +503,30 @@ impl SupervisorInner {
     /// routing the bounded result through the owner's output classifier without counting
     /// off-tick calls against periodic release streaks.
     fn gravity_comp_write_now(&mut self) {
-        let driver = self.driver.take();
-        let out = self.write_gravity_comp_immediate_with_driver(driver.as_ref(), false, false);
-        self.driver = driver;
+        let out = self.write_gravity_comp_immediate_inner(None, false, false);
         let _ = self.classify_tick_output(out, false, false);
     }
 
     /// Shared immediate gravity-comp write using stack-allocated targets (0 alloc).
     /// Callers pass `use_estop_hold` explicitly when the physical E-stop latch is already set
     /// before `SafetyState::EStop` is installed, and `nonblocking = true` to preserve `try_lock`.
-    pub(crate) fn write_gravity_comp_immediate_with_driver(
+    /// When `ext_driver` is `None`, operates directly on `self.driver` in place (zero mutex in
+    /// `DriverSlot::Exclusive`, guarded lock in `DriverSlot::Legacy`); when `Some`, uses the
+    /// externally shared mutex (for legacy two-thread contention tests).
+    pub(crate) fn write_gravity_comp_immediate_inner(
         &mut self,
-        driver: Option<&std::sync::Mutex<Box<dyn crate::driver::ArmDriver>>>,
+        ext_driver: Option<&std::sync::Mutex<Box<dyn crate::driver::ArmDriver>>>,
         use_estop_hold: bool,
         nonblocking: bool,
     ) -> crate::supervisor::TickOutput {
         use crate::supervisor::TickOutput;
-        if !self.is_torqued || self.disable_pending { return TickOutput::None; }
-        let Some(targets) = self.gravity_comp_targets_array() else { return TickOutput::None; };
-        let Some(d) = driver else { return TickOutput::None; };
-        let guard = if nonblocking { d.try_lock().ok() } else { d.lock().ok() };
-        let Some(mut drv) = guard else { return TickOutput::None; };
-        if drv.enable_state() == EnableState::Disabled {
+        if !self.is_torqued
+            || self.disable_pending
+            || self.torque_intent != crate::supervisor::TorqueIntent::On
+        {
             return TickOutput::None;
         }
+        let Some(targets) = self.gravity_comp_targets_array() else { return TickOutput::None; };
         let is_hold = use_estop_hold
             || self.safety.state().is_stopped()
             || self.e_stop_latched.load(std::sync::atomic::Ordering::SeqCst);
@@ -533,21 +538,61 @@ impl SupervisorInner {
             )
         });
         let output_lease_gen = if is_hold || is_exiting { 0 } else { self.current_active_lease_gen() };
-        let write_res = if is_hold {
-            drv.set_output_lease_gen(0);
-            drv.write_estop_hold_bounded(&targets)
+        let maybe_out = if let Some(raw) = ext_driver {
+            let fence = self.live_disconnect_fence_view();
+            let guard = if nonblocking { raw.try_lock().ok() } else { raw.lock().ok() };
+            guard.and_then(|mut g| {
+                crate::supervisor::SupervisorInner::write_gravity_comp_targets_checked(
+                    &mut **g,
+                    &targets,
+                    is_hold,
+                    output_lease_gen,
+                    &fence,
+                )
+            })
         } else {
-            drv.set_output_lease_gen(output_lease_gen);
-            let r = drv.write_joint_targets_bounded(&targets);
-            drv.set_output_lease_gen(0);
-            r
+            let e_stop_latched = &self.e_stop_latched;
+            let pending_disconnect_hold = &self.pending_disconnect_hold;
+            let atomic_fenced_lease_gen = &self.atomic_fenced_lease_gen;
+            let fenced_lease_generation = self.fenced_lease_generation;
+            let active_lease_conn_id = self.active_lease_conn_id;
+            let active_lease_gen = self.active_lease.as_ref().map(|a| a.generation);
+            let closed_connections = &self.closed_connections;
+            let rt_closed_connections = self.rt_closed_connections.as_deref();
+            let shared_closed_bitset = &self.shared_closed_bitset;
+            let fence = crate::supervisor::LiveDisconnectFenceView::new(
+                e_stop_latched,
+                pending_disconnect_hold,
+                atomic_fenced_lease_gen,
+                fenced_lease_generation,
+                active_lease_conn_id,
+                active_lease_gen,
+                closed_connections,
+                rt_closed_connections,
+                shared_closed_bitset,
+            );
+            let Some(slot) = self.driver.as_mut() else { return TickOutput::None; };
+            let run_write = |drv: &mut dyn crate::driver::ArmDriver| {
+                crate::supervisor::SupervisorInner::write_gravity_comp_targets_checked(
+                    drv,
+                    &targets,
+                    is_hold,
+                    output_lease_gen,
+                    &fence,
+                )
+            };
+            if nonblocking {
+                slot.try_with_mut(run_write).ok().flatten()
+            } else {
+                slot.with_mut(run_write).flatten()
+            }
         };
-        let out = crate::supervisor::SupervisorInner::tick_output_from_driver_write(&mut **drv, is_hold, write_res);
+        let Some((out, effective_hold)) = maybe_out else { return TickOutput::None; };
         // Never write a 0x307 frame outside the tick epilogue's ONE J7 emitter: record intent
         // only so an in-tick urgent E-stop emits J7 strictly once in the epilogue and an off-tick
         // exit hands J7 off to the next control tick.
         let intent_stamp = self.current_j7_intent_stamp();
-        self.j7_intent = Some(if is_hold {
+        self.j7_intent = Some(if effective_hold {
             crate::driver::PosForceIntent::stop(intent_stamp)
         } else {
             crate::driver::PosForceIntent::hold(intent_stamp)
@@ -601,14 +646,11 @@ impl SupervisorInner {
             }
             _ => {}
         }
-        if !self.is_torqued || self.disable_pending {
+        if !self.is_torqued
+            || self.disable_pending
+            || self.torque_intent != crate::supervisor::TorqueIntent::On
+        {
             return Some(("TORQUE_LOST", HolderLabel::new("Torque is off")));
-        }
-        if let Some(d) = &self.driver {
-            let enabled = d.lock().is_ok_and(|drv| !drv.capabilities().enable_feedback || drv.enable_state() == EnableState::Enabled);
-            if !enabled {
-                return Some(("TORQUE_LOST", HolderLabel::new("Motors no longer report enabled")));
-            }
         }
         if self.lease_enabled {
             if self.last_heartbeat.elapsed() > self.lease_timeout {
@@ -853,7 +895,7 @@ impl SupervisorInner {
         let has_vel = self
             .driver
             .as_ref()
-            .is_none_or(|d| d.lock().is_ok_and(|drv| drv.capabilities().velocity_feedback));
+            .is_none_or(|d| d.with_ref(|drv| drv.capabilities().velocity_feedback).unwrap_or(false));
         if !has_vel {
             return true;
         }
@@ -881,10 +923,10 @@ impl SupervisorInner {
         } else if !stationary {
             Err(format!("arm not stationary (limit {max_vel} rad/s) before switching back to POS_VEL"))
         } else {
-            match &self.driver {
+            match self.driver.as_mut() {
                 None => Ok(()),
-                Some(d) => match d.lock() {
-                    Ok(mut drv) => {
+                Some(d) => d
+                    .with_mut(|drv| {
                         let hold_targets: [JointTarget; ARM + 1] = std::array::from_fn(|i| {
                             if i < ARM {
                                 JointTarget::position(hold[i])
@@ -893,9 +935,8 @@ impl SupervisorInner {
                             }
                         });
                         drv.set_joint_modes_in_tick(&[JointMode::Position; ARM + 1], &hold_targets).map_err(|e| e.to_string())
-                    }
-                    Err(_) => Err("driver lock poisoned".into()),
-                },
+                    })
+                    .unwrap_or_else(|| Err("driver lock poisoned".into())),
             }
         };
         match result {
