@@ -3151,6 +3151,8 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     estop_gate: Option<crate::rt_core::urgent::EstopGate>,
     /// Client lease generation stamped onto queued motion target frames (`0` for hold/autonomous).
     output_lease_gen: u64,
+    /// Per-call client lease generation checked inside [`Self::send`] (set by `send_with_lease`).
+    send_lease_gen: u64,
     /// Atomic E-stop latch (`ArmDriver::set_abort_flag`), checked before enable transmissions.
     abort_flag: Option<Arc<AtomicBool>>,
     /// Authoritative packed E-stop state (`ArmDriver::set_estop_state`).
@@ -3894,6 +3896,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             mit_fence_last_cmd: vec![None; dof],
             estop_gate: None,
             output_lease_gen: 0,
+            send_lease_gen: 0,
             abort_flag: None,
             estop_state: None,
             rt_no_sleep: false,
@@ -4374,17 +4377,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     /// 5. Post-build re-read of stop latch, pending gate, stop stamp, MIT fence, type-system
     ///    `PosForceSendToken` capability for `0x307` frames, submission freshness, deadline, and cutoff.
     /// 6. Account budget attempt, transmit, and record per-frame wall/CPU diagnostics.
-    fn send(
-        &mut self,
-        kind: impl DamiaoTxKind,
-        expected_stamp: Option<StopStamp>,
-        deadline: Option<Deadline>,
-        fenced: bool,
-        build: impl FnOnce(&Self) -> Option<CanFrame>,
-    ) -> Result<CanFrame, TxRefusal> {
-        self.send_with_lease(kind, expected_stamp, 0, deadline, fenced, build)
-    }
-
     fn send_with_lease(
         &mut self,
         kind: impl DamiaoTxKind,
@@ -4394,6 +4386,22 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         fenced: bool,
         build: impl FnOnce(&Self) -> Option<CanFrame>,
     ) -> Result<CanFrame, TxRefusal> {
+        let prev = self.send_lease_gen;
+        self.send_lease_gen = expected_lease_gen;
+        let res = self.send(kind, expected_stamp, deadline, fenced, build);
+        self.send_lease_gen = prev;
+        res
+    }
+
+    fn send(
+        &mut self,
+        kind: impl DamiaoTxKind,
+        expected_stamp: Option<StopStamp>,
+        deadline: Option<Deadline>,
+        fenced: bool,
+        build: impl FnOnce(&Self) -> Option<CanFrame>,
+    ) -> Result<CanFrame, TxRefusal> {
+        let expected_lease_gen = self.send_lease_gen;
         let has_pos_force_token = kind.pos_force_token().is_some();
         let kind = kind.tx_kind();
         // 1. Deadline check (inclusive: now >= deadline.at).

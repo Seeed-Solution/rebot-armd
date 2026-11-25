@@ -209,14 +209,35 @@ impl SupervisorInner {
             let Some((ws, cam)) = self.workspace_policy() else {
                 return Ok(false);
             };
-            let eval = crate::chain::WorkspaceEvaluator::new_with_tcp_in(
+            let mut eval = crate::chain::WorkspaceEvaluator::new_with_tcp_in(
                 &self.config.arm_model,
                 ws,
                 cam,
                 self.config.tcp_offset,
                 &mut bufs,
             );
-            let n = eval.total_slots;
+            let mut n = eval.total_slots;
+            if !buf_len_ok(&bufs.scratch_c0, n)
+                || !buf_len_ok(&bufs.scratch_c1, n)
+                || !buf_len_ok(&bufs.scratch_cm, n)
+                || !buf_len_ok(&bufs.scratch_cand_min_d, n)
+                || !buf_len_ok(&bufs.geom_bounds, eval.num_geoms)
+                || bufs.sweep_slab.len() < 2 * n
+            {
+                // Fallback only if a non-RT caller/test mutated `config.workspace` directly
+                // without calling `prepare_workspace_eval_bufs()`; on `armd-control`, every
+                // workspace load and config commit pre-sizes `ws_eval_bufs` off-thread.
+                eval.recycle(&mut bufs);
+                bufs.prepare_for(&self.config.arm_model, ws, cam, self.config.tcp_offset);
+                eval = crate::chain::WorkspaceEvaluator::new_with_tcp_in(
+                    &self.config.arm_model,
+                    ws,
+                    cam,
+                    self.config.tcp_offset,
+                    &mut bufs,
+                );
+                n = eval.total_slots;
+            }
             let checked = (|| {
                 eval.eval_into_slice_rt(
                     &self.commanded_positions,
@@ -337,7 +358,7 @@ impl SupervisorInner {
         let mut bufs = std::mem::take(&mut self.ws_eval_bufs);
         let result = (|| {
             let Some((ws, cam)) = self.workspace_policy() else { return Ok(()); };
-            let eval = crate::chain::WorkspaceEvaluator::new_with_tcp_in(
+            let mut eval = crate::chain::WorkspaceEvaluator::new_with_tcp_in(
                 &self.config.arm_model,
                 ws,
                 cam,
@@ -345,7 +366,23 @@ impl SupervisorInner {
                 &mut bufs,
             )
             .with_escape_tol(crate::kinematics::WORKSPACE_EPS);
-            let n = eval.total_slots;
+            let mut n = eval.total_slots;
+            if !buf_len_ok(&bufs.scratch_c0, n)
+                || !buf_len_ok(&bufs.scratch_c1, n)
+                || !buf_len_ok(&bufs.scratch_min_d, n)
+            {
+                eval.recycle(&mut bufs);
+                bufs.prepare_for(&self.config.arm_model, ws, cam, self.config.tcp_offset);
+                eval = crate::chain::WorkspaceEvaluator::new_with_tcp_in(
+                    &self.config.arm_model,
+                    ws,
+                    cam,
+                    self.config.tcp_offset,
+                    &mut bufs,
+                )
+                .with_escape_tol(crate::kinematics::WORKSPACE_EPS);
+                n = eval.total_slots;
+            }
             let checked = if !eval.capsules_valid()
                 || !buf_len_ok(&bufs.scratch_c0, n)
                 || !buf_len_ok(&bufs.scratch_c1, n)
