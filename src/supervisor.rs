@@ -7766,7 +7766,6 @@ impl SupervisorInner {
             let kind = self.active_disable_kind.unwrap_or_else(|| {
                 crate::driver::DisableKind::DisableRequested {
                     started_at: self.driver_clock_now(),
-                    rollback: false,
                 }
             });
             if let Err(e) = self.request_disable_bounded(kind) {

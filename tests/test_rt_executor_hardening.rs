@@ -524,6 +524,21 @@ impl ArmDriver for DelayedWakeDriver {
     fn supports_rt_executor(&self) -> Result<(), &'static str> { Ok(()) }
     fn is_feedback_valid(&self) -> bool { true }
     fn is_enabled(&self) -> bool { self.enabled }
+    fn fresh_joint_positions_into(&self, joints: &[usize], max_age: Duration, out: &mut [f32]) -> bool {
+        if joints.is_empty() || out.len() < joints.len() || Duration::from_millis(1) > max_age {
+            return false;
+        }
+        for (dst, &j) in out.iter_mut().zip(joints.iter()) {
+            let Some(s) = self.states.get(j) else {
+                return false;
+            };
+            if !s.position.is_finite() {
+                return false;
+            }
+            *dst = s.position;
+        }
+        true
+    }
     fn feedback_all_within(&self, dof: usize, _: Duration) -> bool { dof == self.dof }
     fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) { out.clear(); out.resize(self.dof, Some(Duration::from_millis(1))); }
     fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) { out.clear(); out.resize(self.dof, Some(1)); }
@@ -828,6 +843,25 @@ async fn damiao_fresh_unknown_shutdown_gate_and_panic_disable_paths() {
         EnableState::Disabled,
         "fresh state-0 feedback from all motors reports Disabled telemetry"
     );
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    for (i, slot) in arm_joints.iter_mut().enumerate().take(6) {
+        *slot = i;
+    }
+    frozen_drv.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+        safety_stopped: Arc::new(AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 6,
+        rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+        rest_pose_tolerance_rad: 0.05,
+    });
+    for step in 0..3 {
+        if step > 0 {
+            frozen_clock.advance(Duration::from_millis(10));
+        }
+        frozen_bus.with(|s| s.push_all_feedback());
+        frozen_drv.read_joint_states().unwrap();
+    }
     let prog = frozen_drv.begin_torque(false).unwrap();
     assert!(matches!(prog, TorqueProgress::Pending { .. }));
     assert!(frozen_drv.torque_transition_pending());
@@ -1676,6 +1710,18 @@ async fn damiao_unified_fresh_boundary_and_stale_shutdown_gate_virtual_clock() {
     let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
         .with_joint_limits(dm_limits())
         .unwrap();
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    for (i, slot) in arm_joints.iter_mut().enumerate().take(6) {
+        *slot = i;
+    }
+    drv.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+        safety_stopped: Arc::new(AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 6,
+        rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+        rest_pose_tolerance_rad: 0.05,
+    });
     drv.read_joint_states().unwrap();
     drv.set_torque(true).unwrap();
     assert_eq!(drv.enable_state(), EnableState::Enabled);
@@ -1691,6 +1737,11 @@ async fn damiao_unified_fresh_boundary_and_stale_shutdown_gate_virtual_clock() {
         s.push_all_feedback();
     });
     drv.read_joint_states().unwrap();
+    for _ in 0..2 {
+        clock.advance(Duration::from_millis(10));
+        bus.with(|s| s.push_all_feedback());
+        drv.read_joint_states().unwrap();
+    }
     assert_eq!(drv.enable_state(), EnableState::Disabled);
 
     let p0 = drv.begin_torque(false).unwrap();

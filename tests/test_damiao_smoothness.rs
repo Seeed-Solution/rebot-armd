@@ -313,6 +313,16 @@ fn all_motors_reporting_disabled_override_cached_enable_flag() {
     // (e.g., power dip), telemetry reflects EnableState::Disabled immediately while a subsequent
     // disable transaction also leaves telemetry at Disabled.
     let mut driver = DamiaoArmDriver::new(MockCanTransport::new(), vec![1]);
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    arm_joints[0] = 0;
+    driver.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+        safety_stopped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 1,
+        rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+        rest_pose_tolerance_rad: 0.05,
+    });
     let fb_on = feedback_frame(1, 1, 0.0);
     let fb_off = feedback_frame(1, 0, 0.0);
     mock_ctrl_mode_readback(&mut driver, 1, damiao::CTRL_MODE_POS_VEL);
@@ -326,6 +336,11 @@ fn all_motors_reporting_disabled_override_cached_enable_flag() {
     driver.read_joint_states().unwrap();
     assert_eq!(driver.enable_state(), EnableState::Disabled);
 
+    for _ in 0..2 {
+        thread::sleep(Duration::from_millis(11));
+        driver.can_mut().provide_rx_frame(fb_off);
+        driver.read_joint_states().unwrap();
+    }
     driver.can_mut().respond_to_transmit(damiao::build_disable_frame(1), fb_off);
     driver.can_mut().replace_transmit_response(damiao::build_refresh_frame(1), fb_off);
     driver.set_torque(false).unwrap();

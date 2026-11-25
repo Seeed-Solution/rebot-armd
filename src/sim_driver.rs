@@ -162,9 +162,9 @@ enum SendGate {
     Target,
     /// Enable command: inhibited whenever E-stop is latched or pending.
     Enable,
-    /// Requested disable command: subject to the stopped rest-pose rule and 1 s request lifetime
-    /// while stopped, OR unconditionally in every safety state when `rollback` is true.
-    DisableRequested { started_at: Instant, rollback: bool },
+    /// Requested disable command: unconditionally subject to the rest-pose gate and 1 s request
+    /// lifetime in every safety state (operational and stopped alike).
+    DisableRequested { started_at: Instant },
     /// Protective disable command (`Thermal`, `ProcessExit`): never refused.
     DisableProtective { reason: crate::driver::DisableProtectiveReason },
 }
@@ -386,24 +386,10 @@ impl SimArmDriver {
         Ok(())
     }
 
-    /// Enforces Rule A′ and the single 1 s request lifetime at send time for `DisableRequested`
-    /// while safety state is stopped (Fault or E-stop) OR unconditionally when `rollback` is
-    /// true, reading timestamp & positions from the same coherent simulator feedback packet.
-    /// Zero heap allocations.
-    fn check_stopped_disable_requested(
-        &self,
-        started_at: Instant,
-        rollback: bool,
-    ) -> Result<(), ArmDriverError> {
-        let stopped = self
-            .stopped_disable_gate
-            .as_ref()
-            .is_some_and(crate::driver::StoppedDisableGate::is_safety_stopped)
-            || self.abort_flag.as_ref().is_some_and(|f| f.load(Ordering::SeqCst))
-            || self.estop_gate.as_ref().is_some_and(|g| g.pending());
-        if !rollback && !stopped {
-            return Ok(());
-        }
+    /// Enforces the rest-pose gate and single 1 s request lifetime at send time for EVERY
+    /// `DisableRequested` in every safety state (operational and stopped alike), reading
+    /// timestamp & positions from the same coherent simulator feedback packet. Zero heap allocations.
+    fn check_stopped_disable_requested(&self, started_at: Instant) -> Result<(), ArmDriverError> {
         if Instant::now().saturating_duration_since(started_at)
             >= crate::driver::STOPPED_DISABLE_REQUEST_LIFETIME
         {
@@ -477,8 +463,8 @@ impl SimArmDriver {
                     return Err(ArmDriverError::EstopInhibited);
                 }
             }
-            SendGate::DisableRequested { started_at, rollback } => {
-                self.check_stopped_disable_requested(started_at, rollback)?;
+            SendGate::DisableRequested { started_at } => {
+                self.check_stopped_disable_requested(started_at)?;
             }
             SendGate::DisableProtective { .. } => {}
         }
@@ -1040,7 +1026,6 @@ impl ArmDriver for SimArmDriver {
         } else {
             self.disable_torque(crate::driver::DisableKind::DisableRequested {
                 started_at: Instant::now(),
-                rollback: false,
             })
         }
     }
@@ -1078,15 +1063,14 @@ impl ArmDriver for SimArmDriver {
         } else {
             self.begin_disable_torque(crate::driver::DisableKind::DisableRequested {
                 started_at: Instant::now(),
-                rollback: false,
             })
         }
     }
 
     fn begin_disable_torque(&mut self, kind: crate::driver::DisableKind) -> Result<TorqueProgress, ArmDriverError> {
         let gate = match kind {
-            crate::driver::DisableKind::DisableRequested { started_at, rollback } => {
-                SendGate::DisableRequested { started_at, rollback }
+            crate::driver::DisableKind::DisableRequested { started_at } => {
+                SendGate::DisableRequested { started_at }
             }
             crate::driver::DisableKind::DisableProtective { reason } => {
                 SendGate::DisableProtective { reason }
@@ -1483,7 +1467,6 @@ mod tests {
 
         let res_raised = drv.begin_disable_torque(crate::driver::DisableKind::DisableRequested {
             started_at: Instant::now(),
-            rollback: false,
         });
         assert!(
             matches!(res_raised, Err(ArmDriverError::TorqueOffWouldDrop)),
@@ -1505,7 +1488,6 @@ mod tests {
         let t0 = Instant::now();
         let res_contended = drv.begin_disable_torque(crate::driver::DisableKind::DisableRequested {
             started_at: Instant::now(),
-            rollback: false,
         });
         let elapsed = t0.elapsed();
         drop(_held);
@@ -1518,7 +1500,6 @@ mod tests {
         // 4. Uncontended at rest (packet 3) -> succeeds and transmits enable=false!
         drv.begin_disable_torque(crate::driver::DisableKind::DisableRequested {
             started_at: Instant::now(),
-            rollback: false,
         })
         .expect("uncontended fresh rest pose in RT mode must transmit disable");
         peer.socket.set_read_timeout(Some(Duration::from_millis(200))).unwrap();

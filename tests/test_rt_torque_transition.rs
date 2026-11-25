@@ -242,13 +242,13 @@ fn a_disable_waits_for_fresh_disabled_feedback_and_holds_no_output_meanwhile() {
     assert!(first.command.unwrap().1.is_ok(), "{first:?}");
     assert!(r.fx.core.disable_pending && r.fx.core.is_torqued, "pending until confirmed: {first:?} {} {} {}", r.fx.core.disable_pending, r.fx.core.is_torqued, r.fx.core.torque_transition_pending());
     r.bus.clear_log();
-    let (_, outcome, reports) = r.until_ended(20);
+    let (_, outcome, reports) = r.until_ended(30);
     assert_eq!(outcome, Outcome::Completed);
-    // no target frame while the transition owned the bus (only disable retries / polls)
+    // no target frame while the transition owned the bus (only 0xCC rest probes and disable repeats)
     let targets = r.bus.tx_log().iter().filter(|f| (1..=7).contains(&f.id) && f.data != damiao::CMD_DISABLE).count();
     assert_eq!(targets, 0, "{:?}", r.bus.tx_log());
     let disables = r.bus.tx_log().iter().filter(|f| f.data == damiao::CMD_DISABLE).count();
-    assert_eq!(disables, 14, "remaining 2 bounded disable repeats across 7 motors: {disables}");
+    assert_eq!(disables, 21, "all 3 bounded disable repeats across 7 motors after K=3 rest gate: {disables}");
     let inner = &r.fx.core;
     assert_eq!(inner.torque_intent(), armd::TorqueIntent::Off);
     assert!(!inner.is_torqued && !inner.disable_pending && !inner.pending_rearm && !inner.torque_transition_pending());

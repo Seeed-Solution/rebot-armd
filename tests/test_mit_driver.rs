@@ -483,8 +483,44 @@ fn mit_hand_back_past_the_deadline_fails_and_plain_switch_is_refused_after_a_tri
 /// complete, and then releases the fence even if a motor is silent.
 #[test]
 fn mit_unconfirmed_disable_fails_and_keeps_the_fence() {
-    let (mut d, bus, clock) = mit_rig(2000);
-    let hold = hold_at(&mut d);
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    for i in 0..6 {
+        arm_joints[i] = i;
+    }
+    let mut rest_positions = [0.0f32; armd::rt_core::mailbox::MAX_DOF];
+    for i in 0..7 {
+        rest_positions[i] = 0.1 * i as f32;
+    }
+    let gate = armd::driver::StoppedDisableGate {
+        safety_stopped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 6,
+        rest_positions,
+        rest_pose_tolerance_rad: 0.05,
+    };
+    let make_mit_rig_at_rest = || {
+        let (mut d, bus, clock) = rig(2000);
+        let hold = hold_at(&mut d);
+        d.set_joint_modes_confirmed(&modes_j4(JointMode::Mit), &hold).expect("confirmed handover");
+        assert_eq!(d.joint_control_modes()[J4], Some(DamiaoControlMode::Mit));
+        d.set_stopped_disable_gate(gate.clone());
+        // Wait past TORQUE_CAUSAL_SETTLE_WINDOW (20 ms) from the handover hold, collect K=3 rest
+        // samples, and only then arm the 45 ms MIT deadline fence so the pre-disable K=3 wait
+        // does not consume the fence's 45 ms output-gap budget.
+        clock.advance(Duration::from_millis(21));
+        for step in 0..3 {
+            if step > 0 {
+                clock.advance(Duration::from_millis(11));
+            }
+            bus.with(|s| s.push_all_feedback());
+            d.read_joint_states().unwrap();
+        }
+        d.set_mit_deadline_fence(Some(FENCE), HOLDOFF);
+        bus.clear_log();
+        (d, bus, clock, hold)
+    };
+    let (mut d, bus, clock, hold) = make_mit_rig_at_rest();
     bus.with(|s| s.motors[J4].silent = true);
     let t0 = clock.now();
     let mut p = d.begin_torque(false).expect("disable accepted");
@@ -519,7 +555,7 @@ fn mit_unconfirmed_disable_fails_and_keeps_the_fence() {
     let log = bus.tx_log();
     assert!(log.iter().any(|f| f.id == 0x7FF && f.data[2] == 0xCC), "status polls did not resume after fence release: {log:?}");
     // Blocking set_torque(false) also completes cleanly and releases the fence.
-    let (mut d, _bus, _) = mit_rig(2000);
+    let (mut d, _bus, _clock, _hold) = make_mit_rig_at_rest();
     d.set_torque(false).expect("bounded disable repeats complete");
     assert!(d.mit_fence_trip().is_none());
 }

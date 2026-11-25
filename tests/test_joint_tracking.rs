@@ -2971,6 +2971,27 @@ fn damiao_write_modes_preserves_cold_arm_gravity_comp_and_interrupted_rearm() {
     let enabled_fb_rearm =
         CanFrame::new_standard(0x11, &[0x11, (p_rearm >> 8) as u8, p_rearm as u8, 0, 0, 0, 30, 30]).unwrap();
     drv.can_mut().replace_transmit_response(damiao::build_refresh_frame(1), disabled_fb_rearm);
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    arm_joints[0] = 0;
+    let mut rest_positions = [0.0f32; armd::rt_core::mailbox::MAX_DOF];
+    rest_positions[0] = 0.15;
+    drv.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+        safety_stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 1,
+        rest_positions,
+        rest_pose_tolerance_rad: 0.05,
+    });
+    // Wait past TORQUE_CAUSAL_SETTLE_WINDOW (20 ms) after set_joint_modes, then establish K=3 rest samples.
+    std::thread::sleep(Duration::from_millis(22));
+    for step in 0..3 {
+        if step > 0 {
+            std::thread::sleep(Duration::from_millis(11));
+        }
+        drv.can_mut().provide_rx_frame(enabled_fb_rearm);
+        drv.read_joint_states().unwrap();
+    }
     drv.set_torque(false).expect("disable while in MIT");
     assert!(!drv.is_enabled());
     let _ = drv.can_mut().take_tx_frames();

@@ -229,6 +229,21 @@ impl ArmDriver for ThreadAuditDriver {
     fn supports_rt_executor(&self) -> Result<(), &'static str> { Ok(()) }
     fn is_feedback_valid(&self) -> bool { true }
     fn is_enabled(&self) -> bool { self.enabled }
+    fn fresh_joint_positions_into(&self, joints: &[usize], max_age: Duration, out: &mut [f32]) -> bool {
+        if joints.is_empty() || out.len() < joints.len() || Duration::from_millis(1) > max_age {
+            return false;
+        }
+        for (dst, &j) in out.iter_mut().zip(joints.iter()) {
+            let Some(&p) = self.positions.get(j) else {
+                return false;
+            };
+            if !p.is_finite() {
+                return false;
+            }
+            *dst = p;
+        }
+        true
+    }
     fn enable_state(&self) -> EnableState {
         if self.enabled { EnableState::Enabled } else { EnableState::Disabled }
     }
@@ -1234,6 +1249,26 @@ fn single_budgeted_rx_pass_and_zero_rx_torque_begin_and_unsupported_serial() {
     let mut drv2 = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
         .with_joint_limits(dm_limits())
         .unwrap();
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    for (i, slot) in arm_joints.iter_mut().enumerate().take(6) {
+        *slot = i;
+    }
+    drv2.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+        safety_stopped: Arc::new(AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 6,
+        rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+        rest_pose_tolerance_rad: 0.05,
+    });
+    drv2.read_joint_states().unwrap();
+    for step in 0..3 {
+        if step > 0 {
+            clock.advance(Duration::from_millis(10));
+        }
+        raw_bus.with(|s| s.push_all_feedback());
+        drv2.read_joint_states().unwrap();
+    }
     bus.rx_calls.store(0, Ordering::SeqCst);
     let _ = drv2.begin_torque_budgeted(false, 0).unwrap();
     assert_eq!(bus.rx_calls.load(Ordering::SeqCst), 0, "begin_torque_budgeted(false, 0) must do 0 RX");
@@ -2416,7 +2451,24 @@ fn estop_aborts_pending_damiao_enable_without_tx_and_preserves_torque_state() {
     let mut drv_a = DamiaoArmDriver::new(raw_bus_a.clone(), vec![1, 2, 3, 4, 5, 6, 7])
         .with_joint_limits(dm_limits())
         .unwrap();
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    for (i, slot) in arm_joints.iter_mut().enumerate().take(6) {
+        *slot = i;
+    }
+    drv_a.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+        safety_stopped: Arc::new(AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 6,
+        rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+        rest_pose_tolerance_rad: 0.05,
+    });
     drv_a.read_joint_states().unwrap();
+    for _ in 0..2 {
+        clock.advance(Duration::from_millis(10));
+        raw_bus_a.with(|s| s.push_all_feedback());
+        drv_a.read_joint_states().unwrap();
+    }
     drv_a.set_torque(false).unwrap();
     drv_a.check_mapping_ranges();
     let mut inner_a = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_a));
@@ -3323,10 +3375,29 @@ async fn rt_capability_gates_legacy_slcan_preservation_zero_offset_no_sleep_and_
     let mut drv_blk = DamiaoArmDriver::new(bus_blk.clone(), vec![1, 2, 3, 4, 5, 6, 7])
         .with_joint_limits(dm_limits())
         .unwrap();
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    for (i, slot) in arm_joints.iter_mut().enumerate().take(6) {
+        *slot = i;
+    }
+    drv_blk.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+        safety_stopped: Arc::new(AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 6,
+        rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+        rest_pose_tolerance_rad: 0.05,
+    });
     drv_blk.read_joint_states().unwrap();
     drv_blk.check_mapping_ranges();
     // Legacy blocking set_torque(true/false) works cleanly!
     drv_blk.set_torque(true).expect("legacy blocking-transport set_torque(true) must succeed");
+    for step in 0..3 {
+        if step > 0 {
+            clock.advance(Duration::from_millis(10));
+        }
+        raw_blk.with(|s| s.push_all_feedback());
+        drv_blk.read_joint_states().unwrap();
+    }
     drv_blk.set_torque(false).expect("legacy blocking-transport set_torque(false) must succeed");
     // Explicitly budgeted RT methods fail closed with UNSUPPORTED!
     let mut states_buf = Vec::new();

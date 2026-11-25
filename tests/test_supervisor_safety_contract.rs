@@ -25,6 +25,19 @@ impl ArmDriver for Driver {
     fn enable_state(&self) -> EnableState { self.hardware.lock().unwrap().enabled }
     fn is_feedback_valid(&self) -> bool { self.hardware.lock().unwrap().age.is_some_and(|a| a <= Duration::from_millis(250)) }
     fn feedback_ages(&self) -> Vec<Option<Duration>> { let h = self.hardware.lock().unwrap(); vec![h.age; h.states.len()] }
+    fn has_driver_fresh_position_api(&self) -> bool { true }
+    fn fresh_joint_positions_into(&self, joints: &[usize], max_age: Duration, out: &mut [f32]) -> bool {
+        let h = self.hardware.lock().unwrap();
+        if joints.is_empty() || out.len() < joints.len() || !h.age.is_some_and(|a| a <= max_age) {
+            return false;
+        }
+        for (slot, &i) in out.iter_mut().zip(joints.iter()) {
+            let Some(st) = h.states.get(i) else { return false; };
+            if !st.position.is_finite() { return false; }
+            *slot = st.position;
+        }
+        true
+    }
     fn max_command_velocity(&self, _: usize) -> Option<f32> { self.max_velocity }
     fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> { Ok(self.hardware.lock().unwrap().states.clone()) }
     fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {

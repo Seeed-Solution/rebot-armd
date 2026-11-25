@@ -35,6 +35,32 @@ fn set_zero_needs_a_confirmed_disabled_motor_and_sends_the_fe_frame() {
         d.can_mut().respond_to_transmit(damiao::build_disable_frame(id), fb);
         d.can_mut().respond_to_transmit(damiao::build_refresh_frame(id), fb);
     }
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    for i in 0..ids.len() {
+        arm_joints[i] = i;
+    }
+    let mut rest_positions = [0.0f32; armd::rt_core::mailbox::MAX_DOF];
+    for slot in &mut rest_positions[..ids.len()] {
+        *slot = 0.4;
+    }
+    d.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+        safety_stopped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: ids.len(),
+        rest_positions,
+        rest_pose_tolerance_rad: 0.05,
+    });
+    d.read_joint_states().unwrap();
+    for step in 0..3 {
+        if step > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(11));
+        }
+        for &id in &ids {
+            d.can_mut().provide_rx_frame(feedback_frame(id as u8, 0, 0.4));
+        }
+        d.read_joint_states().unwrap();
+    }
     d.set_torque(false).unwrap();
     d.can_mut().take_tx_frames();
     d.set_zero_position(1).unwrap();
@@ -77,6 +103,33 @@ fn disable_confirmation_is_time_bounded_and_resends_to_unconfirmed_motors() {
         d.can_mut().respond_to_transmit(damiao::build_disable_frame(id), fb);
         d.can_mut().respond_to_transmit(damiao::build_refresh_frame(id), fb);
     }
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    for i in 0..ids.len() {
+        arm_joints[i] = i;
+    }
+    let mut rest_positions = [0.0f32; armd::rt_core::mailbox::MAX_DOF];
+    for slot in &mut rest_positions[..ids.len()] {
+        *slot = 0.1;
+    }
+    d.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+        safety_stopped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: ids.len(),
+        rest_positions,
+        rest_pose_tolerance_rad: 0.05,
+    });
+    d.read_joint_states().unwrap();
+    for step in 0..3 {
+        if step > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(11));
+        }
+        for &id in &ids {
+            d.can_mut().provide_rx_frame(feedback_frame(id as u8, 0, 0.1));
+        }
+        d.read_joint_states().unwrap();
+    }
+    let _ = d.can_mut().take_tx_frames();
     let t0 = std::time::Instant::now();
     d.set_torque(false).unwrap();
     let waited = t0.elapsed();

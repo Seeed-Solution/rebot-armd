@@ -1497,6 +1497,17 @@ fn test_feetech_partial_fault_disables_only_faulted_and_detects_partial_enable()
     let mock = MockTransport::new_preserving();
     let servo_ids = vec![1, 2];
     let mut driver = FeetechArmDriver::new(mock, servo_ids);
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    arm_joints[0] = 0;
+    arm_joints[1] = 1;
+    driver.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+        safety_stopped: Arc::new(AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 2,
+        rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+        rest_pose_tolerance_rad: 0.05,
+    });
 
     let mut rx_fb = Vec::new();
     for &id in &[1u8, 2u8] {
@@ -1509,6 +1520,10 @@ fn test_feetech_partial_fault_disables_only_faulted_and_detects_partial_enable()
     }
     driver.transport_mut().provide_rx(&rx_fb);
     driver.read_joint_states().unwrap();
+    driver.transport_mut().advance_clock(Duration::from_millis(11));
+    driver.transport_mut().provide_rx(&rx_fb);
+    driver.read_joint_states().unwrap();
+    driver.transport_mut().advance_clock(Duration::from_millis(11));
     let _ = driver.transport_mut().take_tx();
 
     let mut rx_err = Vec::new();

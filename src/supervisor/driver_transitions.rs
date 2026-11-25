@@ -2307,10 +2307,10 @@ impl SupervisorInner {
     #[inline]
     fn background_disable_window_for(&self, kind: crate::driver::DisableKind) -> Duration {
         match kind {
-            crate::driver::DisableKind::DisableRequested { .. } if self.torque_off_stopped() => {
+            crate::driver::DisableKind::DisableRequested { .. } => {
                 crate::driver::STOPPED_DISABLE_REQUEST_LIFETIME
             }
-            _ => BACKGROUND_DISABLE_MAX_WINDOW,
+            crate::driver::DisableKind::DisableProtective { .. } => BACKGROUND_DISABLE_MAX_WINDOW,
         }
     }
 
@@ -3351,12 +3351,7 @@ impl SupervisorInner {
             });
         }
         let started_at = self.driver_clock_now();
-        let disable_kind = crate::driver::DisableKind::DisableRequested {
-            started_at,
-            // Enforce K=3 rest-pose gate & 1 s lifetime unconditionally in the driver choke point
-            // even though `safety.state()` is still Operational after a park settle (B3).
-            rollback: true,
-        };
+        let disable_kind = crate::driver::DisableKind::DisableRequested { started_at };
         self.stop_motion();
         self.commanded_velocities.fill(0.0);
         if let Err(error) = self.request_disable(disable_kind) {
@@ -3393,14 +3388,12 @@ impl SupervisorInner {
     fn torque_off_in_place(&mut self, stillness_verified: bool) -> Result<(), SafetyError> {
         self.torque_off_check(stillness_verified)?;
         let started_at = self.driver_clock_now();
-        let disable_kind = crate::driver::DisableKind::DisableRequested {
-            started_at,
-            rollback: false,
-        };
+        let disable_kind = crate::driver::DisableKind::DisableRequested { started_at };
         self.stop_motion();
         self.commanded_velocities.fill(0.0);
         if let Err(error) = self.request_disable(disable_kind) {
-            if !self.torque_off_stopped() {
+            let refused = matches!(error, SafetyError::TorqueOffWouldDrop { .. });
+            if !refused && !self.torque_off_stopped() {
                 self.safety.latch(
                     crate::safety::FaultKind::Other,
                     crate::safety::FaultDetail::formatted(FaultCode::DriverWriteFailed, |buf| {
@@ -3410,7 +3403,10 @@ impl SupervisorInner {
             }
             return Err(error);
         }
-        self.torque_off_finish_in_place()
+        if !self.disable_pending {
+            self.torque_off_finish_in_place()?;
+        }
+        Ok(())
     }
 
     /// Record one contended `driver.try_lock()` skip on an RT disable dispatch or poll path (M4).
@@ -3486,10 +3482,7 @@ impl SupervisorInner {
             }
         }
         let started_at = self.driver_clock_now_or(Instant::now());
-        let disable_kind = crate::driver::DisableKind::DisableRequested {
-            started_at,
-            rollback: true,
-        };
+        let disable_kind = crate::driver::DisableKind::DisableRequested { started_at };
         self.stop_motion();
         self.commanded_velocities.fill(0.0);
         if let Err(err) = self.request_disable_bounded(disable_kind) {
@@ -3550,8 +3543,9 @@ impl SupervisorInner {
         })
     }
 
-    /// Zero-allocation RT torque-off precheck (static protocol error codes): enforces Rule A′
-    /// (`eval_stopped_torque_off`) when stopped and zero-alloc resting-pose check otherwise.
+    /// Zero-allocation RT torque-off precheck (static protocol error codes): enforces the
+    /// unified rest-pose gate in EVERY safety state (operational and stopped alike), plus the
+    /// operational stillness/support-torque/workspace check when not stopped.
     fn torque_off_check_rt(&mut self, stillness_verified: bool) -> Result<(), &'static str> {
         if self.calibration_busy && self.motor_zero_busy {
             return Err("MOTION_BUSY");
@@ -3562,21 +3556,18 @@ impl SupervisorInner {
         if self.gravity_comp.is_some() {
             return Err("MOTION_BUSY");
         }
-        if self.torque_off_stopped() {
-            return self
-                .eval_stopped_torque_off()
-                .map_err(|_| "TORQUE_OFF_WOULD_DROP");
-        }
-        if self.has_resting_pose_violation_rt(stillness_verified) {
+        if !self.torque_off_stopped() && self.has_resting_pose_violation_rt(stillness_verified) {
             return Err("ARM_NOT_AT_RESTING_POSE");
         }
-        Ok(())
+        self.eval_stopped_torque_off()
+            .map_err(|_| "TORQUE_OFF_WOULD_DROP")
     }
 
-    /// Zero-allocation, non-blocking stopped torque-off gate for RT budgeted transitions (L1/M3/M4):
-    /// uses `driver.try_lock()` with counted escalation on contention, defers incomplete drains /
-    /// windows / stale-or-missing evidence to `AwaitRestGate`, and refuses off-rest poses with zero
-    /// position clones or expected-pose Vec allocations.
+    /// Zero-allocation, non-blocking rest-pose gate for ALL RT budgeted torque-off transitions
+    /// (operational and stopped alike): uses `driver.try_lock()` with counted escalation on
+    /// contention, checks operational stillness/support-torque/workspace when not stopped,
+    /// defers incomplete drains / K=3 windows / stale-or-missing evidence to `AwaitRestGate`,
+    /// and refuses off-rest poses with zero heap allocations.
     fn torque_off_check_rt_transition(&mut self) -> Result<(), &'static str> {
         if self.calibration_busy && self.motor_zero_busy {
             return Err("MOTION_BUSY");
@@ -3587,74 +3578,78 @@ impl SupervisorInner {
         if self.gravity_comp.is_some() {
             return Err("MOTION_BUSY");
         }
-        if self.torque_off_stopped() {
-            match self.may_disable_torque_while_stopped_nonblocking() {
-                Err(()) => {
+        if !self.torque_off_stopped() {
+            match self.check_resting_pose_rt(false) {
+                super::RtRestingCheck::AtRest => {}
+                super::RtRestingCheck::OffRest => return Err("ARM_NOT_AT_RESTING_POSE"),
+                super::RtRestingCheck::LockContended => {
                     self.record_disable_lock_contention();
                     return Err("DRIVER_BUSY");
                 }
-                Ok(Ok(())) => {
-                    self.last_stopped_torque_off_refusal = None;
-                    return Ok(());
-                }
-                Ok(Err(crate::supervisor::StoppedTorqueOffRefusal::StaleOrMissingFeedback)) => {
-                    match self.can_defer_stopped_disable_to_driver_nonblocking() {
-                        Err(()) => {
-                            self.record_disable_lock_contention();
-                            return Err("DRIVER_BUSY");
-                        }
-                        Ok(true) => {
-                            self.last_stopped_torque_off_refusal = None;
-                            return Ok(());
-                        }
-                        Ok(false) => {
-                            self.last_stopped_torque_off_refusal =
-                                Some(crate::supervisor::StoppedTorqueOffRefusal::StaleOrMissingFeedback);
-                            return Err("TORQUE_OFF_WOULD_DROP");
-                        }
-                    }
-                }
-                Ok(Err(r)) => {
-                    self.last_stopped_torque_off_refusal = Some(r);
-                    return Err("TORQUE_OFF_WOULD_DROP");
-                }
             }
         }
-        match self.check_resting_pose_rt(false) {
-            super::RtRestingCheck::AtRest => Ok(()),
-            super::RtRestingCheck::OffRest => Err("ARM_NOT_AT_RESTING_POSE"),
-            super::RtRestingCheck::LockContended => {
+        match self.may_disable_torque_while_stopped_nonblocking() {
+            Err(()) => {
                 self.record_disable_lock_contention();
                 Err("DRIVER_BUSY")
+            }
+            Ok(Ok(())) => {
+                self.last_stopped_torque_off_refusal = None;
+                Ok(())
+            }
+            Ok(Err(crate::supervisor::StoppedTorqueOffRefusal::StaleOrMissingFeedback)) => {
+                match self.can_defer_stopped_disable_to_driver_nonblocking() {
+                    Err(()) => {
+                        self.record_disable_lock_contention();
+                        Err("DRIVER_BUSY")
+                    }
+                    Ok(true) => {
+                        self.last_stopped_torque_off_refusal = None;
+                        Ok(())
+                    }
+                    Ok(false) => {
+                        self.last_stopped_torque_off_refusal =
+                            Some(crate::supervisor::StoppedTorqueOffRefusal::StaleOrMissingFeedback);
+                        Err("TORQUE_OFF_WOULD_DROP")
+                    }
+                }
+            }
+            Ok(Err(r)) => {
+                self.last_stopped_torque_off_refusal = Some(r);
+                Err("TORQUE_OFF_WOULD_DROP")
             }
         }
     }
 
-    /// The refusals of a torque off: E-stop / fault (rest-pose gated), not at the resting pose.
+    /// Unified torque-off refusals for operational and stopped states alike: when operational,
+    /// checks the resting-pose stillness/support-torque/workspace policy first, then ALWAYS
+    /// enforces the authoritative K=3 rest-pose gate (`eval_stopped_torque_off`).
     fn torque_off_check(&mut self, stillness_verified: bool) -> Result<(), SafetyError> {
-        if self.torque_off_stopped() {
-            match self.eval_stopped_torque_off() {
-                Ok(()) => return Ok(()),
-                Err(crate::supervisor::StoppedTorqueOffRefusal::StaleOrMissingFeedback)
-                    if self.can_defer_stopped_disable_to_driver() =>
-                {
-                    self.last_stopped_torque_off_refusal = None;
-                    return Ok(());
-                }
-                Err(r) => return Err(r.into_safety_error(&self.config.joint_names)),
+        if !self.torque_off_stopped() {
+            let violation = if stillness_verified {
+                self.resting_pose_static_violation()
+            } else {
+                self.resting_pose_violation()
+            };
+            if let Some(reason) = violation {
+                tracing::warn!("Torque off refused, not at resting pose: {reason}");
+                return Err(SafetyError::ArmNotAtRestingPose {
+                    current: self.measured_positions.clone(),
+                    expected: self.config.resting_positions().to_vec(),
+                    reason: Some(reason),
+                });
             }
         }
-
-        let violation = if stillness_verified { self.resting_pose_static_violation() } else { self.resting_pose_violation() };
-        if let Some(reason) = violation {
-            tracing::warn!("Torque off refused, not at resting pose: {reason}");
-            return Err(SafetyError::ArmNotAtRestingPose {
-                current: self.measured_positions.clone(),
-                expected: self.config.resting_positions().to_vec(),
-                reason: Some(reason),
-            });
+        match self.eval_stopped_torque_off() {
+            Ok(()) => Ok(()),
+            Err(crate::supervisor::StoppedTorqueOffRefusal::StaleOrMissingFeedback)
+                if self.can_defer_stopped_disable_to_driver() =>
+            {
+                self.last_stopped_torque_off_refusal = None;
+                Ok(())
+            }
+            Err(r) => Err(r.into_safety_error(&self.config.joint_names)),
         }
-        Ok(())
     }
 
     /// Torque off after the accepted disable without cloning `SafetyState` (zero-alloc on RT).
@@ -3860,7 +3855,6 @@ impl SupervisorInner {
                         let requested_at = drv.clock_now();
                         let disable_kind = crate::driver::DisableKind::DisableRequested {
                             started_at: requested_at,
-                            rollback: false,
                         };
                         let res = drv.begin_disable_torque_budgeted(disable_kind, 0);
                         let frames_dispatched = drv.disable_frames_dispatched();
@@ -4142,7 +4136,6 @@ impl SupervisorInner {
                                 let kind = self.active_disable_kind.unwrap_or(
                                     crate::driver::DisableKind::DisableRequested {
                                         started_at: post_now,
-                                        rollback: false,
                                     },
                                 );
                                 let _ = self.arm_background_disable_retry_with_kind(kind, post_now);

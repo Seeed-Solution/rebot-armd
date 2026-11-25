@@ -2038,7 +2038,6 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
             let p = drv
                 .begin_disable_torque(DisableKind::DisableRequested {
                     started_at: t0,
-                    rollback: false,
                 })
                 .expect("initial disable at rest must start");
             assert!(matches!(p, armd::driver::TorqueProgress::Pending { .. }));
@@ -2153,7 +2152,6 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
             let p = drv
                 .begin_disable_torque(DisableKind::DisableRequested {
                     started_at: t_req,
-                    rollback: false,
                 })
                 .expect("disable started within 1 s must start");
             assert!(matches!(p, armd::driver::TorqueProgress::Pending { .. }));
@@ -2296,6 +2294,23 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
             } else {
                 bus.with(|s| s.push_all_feedback());
                 inner.tick(0.02);
+                // Under B5, operational `disable_torque()` also requires K=3 post-motion rest
+                // samples before attempting `CMD_DISABLE`. Establish K=3 directly on the driver
+                // after the > 20 ms post-motion settle so the subsequent `tx_error` fails the
+                // `CMD_DISABLE` transmission itself (leaving `disable_pending == true`).
+                clock.advance(Duration::from_millis(25));
+                {
+                    let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+                    let _ = drv.read_joint_states();
+                    for step in 0..3 {
+                        if step > 0 {
+                            clock.advance(Duration::from_millis(12));
+                        }
+                        bus.with(|s| s.push_all_feedback());
+                        drv.begin_control_release(100 + step as u64);
+                        let _ = drv.read_joint_states();
+                    }
+                }
             }
             bus.with(|s| {
                 s.tx_error = true;
@@ -2419,11 +2434,10 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
             });
             {
                 let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+                drv.read_joint_states().unwrap();
                 if prior_all_off {
-                    drv.set_torque(false).unwrap();
                     assert_eq!(drv.enable_state(), EnableState::Disabled);
                 } else {
-                    drv.read_joint_states().unwrap();
                     assert_eq!(drv.enable_state(), EnableState::Unknown);
                 }
             }
@@ -2563,7 +2577,6 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
         }
         let req_res = drv.disable_torque(DisableKind::DisableRequested {
             started_at: drv.clock_now(),
-            rollback: false,
         });
         let req_tx = drv.transport_mut().take_tx();
         let req_disables = count_feetech_torque_off_writes(&req_tx);
@@ -2710,7 +2723,6 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
 
         let req_res = sim.begin_disable_torque(DisableKind::DisableRequested {
             started_at: Instant::now(),
-            rollback: false,
         });
         std::thread::sleep(Duration::from_millis(25));
         let req_count = disable_cmds.lock().unwrap().len();
@@ -4143,20 +4155,40 @@ fn spec_6_robstride_without_device_evidence_reports_unknown_not_confirmed() {
     assert_eq!(drv.enable_state(), EnableState::Unknown);
     assert!(!drv.is_enabled());
 
-    // Even after fresh motor feedback frames arrive, RobStride has no device enable telemetry.
-    for id in 1..=6u8 {
-        let ext_id = armd::protocol::robstride::build_feedback_extended_id(0, id, 0xFD);
-        drv.can_mut()
-            .provide_rx_frame(CanFrame::new_extended(ext_id, &[128, 0, 128, 0, 128, 0, 0, 250]).unwrap());
+    // Configure rest-pose gate + K=3 spaced rest samples so operational DisableRequested passes B5.
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    for i in 0..6 {
+        arm_joints[i] = i;
     }
+    drv.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+        safety_stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 6,
+        rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+        rest_pose_tolerance_rad: 0.05,
+    });
+    // Wait past post-motion settle (> 20 ms after enable) and drain an initial empty RX boundary
+    // before collecting K=3 spaced rest samples; RobStride still reports Unknown enable telemetry.
+    std::thread::sleep(Duration::from_millis(25));
     drv.read_joint_states().unwrap();
+    for step in 0..3 {
+        if step > 0 {
+            std::thread::sleep(Duration::from_millis(12));
+        }
+        for id in 1..=6u8 {
+            let ext_id = armd::protocol::robstride::build_feedback_extended_id(0, id, 0xFD);
+            drv.can_mut()
+                .provide_rx_frame(CanFrame::new_extended(ext_id, &[128, 0, 128, 0, 128, 0, 0, 250]).unwrap());
+        }
+        drv.read_joint_states().unwrap();
+    }
     assert_eq!(drv.enable_state(), EnableState::Unknown);
 
     // Disable send also reports Unconfirmed + Unknown, never Confirmed.
     let dis = drv
         .begin_disable_torque(DisableKind::DisableRequested {
             started_at: drv.clock_now(),
-            rollback: false,
         })
         .unwrap();
     assert_eq!(
@@ -4635,7 +4667,6 @@ fn review_m01_m06_m07_m08_m09_unverified_mode_thermal_late_reply_and_gap_recaptu
             .with_joint_limits(limits())
             .unwrap();
         drv.read_joint_states().unwrap();
-        drv.set_torque(false).unwrap();
         drv.check_mapping_ranges();
         let mut inner = SupervisorInner::new(ArmConfig {
             lease_timeout_ms: 600_000,
@@ -4804,7 +4835,6 @@ fn e2_rest_pose_disable_gate_refuses_queued_raised_pose_behind_exhausted_drain()
                 .begin_disable_torque_budgeted(
                     DisableKind::DisableRequested {
                         started_at: started,
-                        rollback: false,
                     },
                     0,
                 )
@@ -4835,7 +4865,6 @@ fn e2_rest_pose_disable_gate_refuses_queued_raised_pose_behind_exhausted_drain()
                 .begin_disable_torque_budgeted(
                     DisableKind::DisableRequested {
                         started_at: started,
-                        rollback: false,
                     },
                     4,
                 )
@@ -4862,7 +4891,6 @@ fn e2_rest_pose_disable_gate_refuses_queued_raised_pose_behind_exhausted_drain()
                 .begin_disable_torque_budgeted(
                     DisableKind::DisableRequested {
                         started_at: started,
-                        rollback: false,
                     },
                     0,
                 )
@@ -4920,7 +4948,6 @@ fn e2_rest_pose_disable_gate_refuses_queued_raised_pose_behind_exhausted_drain()
                 .begin_disable_torque_budgeted(
                     DisableKind::DisableRequested {
                         started_at: req_started,
-                        rollback: false,
                     },
                     4,
                 )
@@ -5011,7 +5038,6 @@ fn e2_rest_pose_disable_gate_refuses_queued_raised_pose_behind_exhausted_drain()
             .begin_disable_torque_budgeted(
                 DisableKind::DisableRequested {
                     started_at: clock.now(),
-                    rollback: false,
                 },
                 4,
             )
@@ -5449,7 +5475,6 @@ fn t1_thermal_checks_active_during_enabling_rt_and_legacy() {
             .with_joint_limits(limits())
             .unwrap();
         drv.read_joint_states().unwrap();
-        drv.set_torque(false).unwrap();
         drv.check_mapping_ranges();
         let mut inner = SupervisorInner::new(ArmConfig {
             lease_timeout_ms: 600_000,
@@ -5540,7 +5565,6 @@ fn t1_thermal_checks_active_during_enabling_rt_and_legacy() {
             .with_joint_limits(limits())
             .unwrap();
         drv.read_joint_states().unwrap();
-        drv.set_torque(false).unwrap();
         drv.check_mapping_ranges();
         let mut inner = SupervisorInner::new(ArmConfig {
             lease_timeout_ms: 600_000,
@@ -5626,7 +5650,6 @@ fn t1_thermal_checks_active_during_enabling_rt_and_legacy() {
             .with_joint_limits(limits())
             .unwrap();
         drv.read_joint_states().unwrap();
-        drv.set_torque(false).unwrap();
         drv.check_mapping_ranges();
         let mut inner = SupervisorInner::new(ArmConfig {
             lease_timeout_ms: 600_000,
@@ -5711,13 +5734,6 @@ fn t2_thermal_trip_upgrades_pending_disable_with_single_broker_terminal() {
         assert!(enable_torque_admitted(&mut inner).is_ok());
         assert!(inner.is_torqued);
 
-        // Hold disable pending on the bus initially so `TorqueTransition::Disable` stays in flight.
-        bus.with(|s| {
-            for m in &mut s.motors {
-                m.drop_torque_frames = 1;
-            }
-        });
-
         let (mut fx, mut broker, _tw, _stop) = ReleaseFixture::new_with_clock(
             inner,
             BootId(201),
@@ -5738,20 +5754,31 @@ fn t2_thermal_trip_upgrades_pending_disable_with_single_broker_terminal() {
         assert!(fx.core.torque_transition_pending(), "T2: Disable must be in flight");
         assert!(fx.transition().is_some(), "T2: ReleaseEngine must hold installed Disable");
 
-        // Immediately (< 250 ms after DisableRequested started): arm drifts to a raised pose
-        // AND J2 hits 94 °C (> 70 °C). Also let subsequent disable writes succeed on the bus so
-        // DisableProtective confirms once transmitted.
+        // Advance 1 step so `AwaitRestGate` is still collecting K=3 (pending); J2 hits 94 °C
+        // (> 70 °C) while `Disable` is pending, upgrading the pending broker transition to
+        // `DisableProtective { Thermal }`. Then the arm drifts to a raised pose (`0.50 rad`),
+        // proving `DisableProtective` completes at a raised pose and delivers exactly 1 terminal.
         bus.clear_log();
+        bus.with(|s| {
+            s.motors[1].temperature_c = 94;
+            s.push_all_feedback();
+        });
+        let _ = fx.step();
         bus.with(|s| {
             for m in &mut s.motors {
                 m.q = 0.50; // raised pose (rest-pose gate would refuse DisableRequested)
                 m.drop_torque_frames = 0;
             }
-            s.motors[1].temperature_c = 94;
             s.push_all_feedback();
         });
 
         let mut terminals = Vec::new();
+        broker.poll(|_, r| {
+            if let Reply::Terminal { request, outcome, .. } = r {
+                terminals.push((request, outcome));
+            }
+            true
+        });
         for _ in 0..8 {
             let _ = fx.step();
             broker.poll(|_, r| {
@@ -7116,7 +7143,7 @@ fn r10_feetech_defers_incomplete_rest_window_within_1s_lifetime() {
 
         let started_at = clock.now();
         let p0 = drv
-            .begin_disable_torque(DisableKind::DisableRequested { started_at, rollback: false })
+            .begin_disable_torque(DisableKind::DisableRequested { started_at })
             .expect("incomplete rest window must defer, not fail");
         assert!(matches!(p0, TorqueProgress::Pending { .. }));
         assert!(drv.torque_transition_pending());
@@ -7155,7 +7182,7 @@ fn r10_feetech_defers_incomplete_rest_window_within_1s_lifetime() {
 
         let started_at = clock.now();
         let p0 = drv
-            .begin_disable_torque(DisableKind::DisableRequested { started_at, rollback: false })
+            .begin_disable_torque(DisableKind::DisableRequested { started_at })
             .expect("poisoned line must defer within 1 s lifetime");
         assert!(matches!(p0, TorqueProgress::Pending { .. }));
 
@@ -7206,7 +7233,6 @@ fn r10_feetech_defers_incomplete_rest_window_within_1s_lifetime() {
         let err = drv
             .begin_disable_torque(DisableKind::DisableRequested {
                 started_at: clock.now(),
-                rollback: false,
             })
             .unwrap_err();
         assert!(matches!(err, ArmDriverError::TorqueOffWouldDrop), "raised pose must refuse immediately: {err:?}");
@@ -7222,7 +7248,7 @@ fn r10_feetech_defers_incomplete_rest_window_within_1s_lifetime() {
         drv.read_joint_states().unwrap();
         let started_at = clock.now();
         let p0 = drv
-            .begin_disable_torque(DisableKind::DisableRequested { started_at, rollback: false })
+            .begin_disable_torque(DisableKind::DisableRequested { started_at })
             .unwrap();
         assert!(matches!(p0, TorqueProgress::Pending { .. }));
         clock.advance(Duration::from_millis(1050));
@@ -8550,7 +8576,6 @@ fn r11_b4_feetech_disable_rechecks_stopped_state_and_rest_evidence_after_drain()
         let started_at = drv.clock_now();
         let res = drv.disable_torque(DisableKind::DisableRequested {
             started_at,
-            rollback: false,
         });
         assert!(
             matches!(res, Err(ArmDriverError::TorqueOffWouldDrop)),
@@ -8613,7 +8638,6 @@ fn r11_b4_feetech_disable_rechecks_stopped_state_and_rest_evidence_after_drain()
         let started_at = drv.clock_now();
         let res = drv.disable_torque(DisableKind::DisableRequested {
             started_at,
-            rollback: false,
         });
         assert!(
             matches!(res, Err(ArmDriverError::DisableRequestExpired)),
@@ -8963,4 +8987,117 @@ fn r11_m3_drained_bus_stale_or_missing_defers_and_probes_within_1s_lifetime() {
         r_raised.bus.tx_log().iter().filter(|f| f.data == damiao::CMD_DISABLE).count(),
         0
     );
+}
+
+/// Round 12 Decision / B5: ALL `DisableRequested` go through the single K=3 rest-pose gate in
+/// EVERY safety state (operational `Armed` / `Idle` as well as stopped `EStop` / `Fault`).
+/// The ONLY ungated disable is `DisableProtective` (`Thermal` / `ProcessExit`).
+#[test]
+fn r12_b5_operational_torque_off_enforces_rest_gate_on_both_owners_and_drivers() {
+    use armd::driver::{DisableKind, DisableProtectiveReason, TorqueProgress};
+    use armd::rt_core::broker::{Outcome, TransitionOp};
+
+    // 1. Operational RT owner at raised pose -> refused with 0 CMD_DISABLE frames.
+    let mut rt_raised = ExecRig::new();
+    rt_raised.arm_now();
+    rt_raised.bus.with(|s| {
+        s.follow_commands = false;
+        s.rx.clear();
+        s.pending.clear();
+        s.motors[1].q = 0.45;
+        s.push_all_feedback();
+    });
+    rt_raised.step();
+    assert!(rt_raised.fx.core.safety.state().is_operational());
+    rt_raised.bus.clear_log();
+    rt_raised.submit_transition(TransitionOp::TorqueOff);
+    let rep = rt_raised.step();
+    assert!(
+        matches!(rep.command, Some((_, Err("ARM_NOT_AT_RESTING_POSE" | "TORQUE_OFF_WOULD_DROP")))),
+        "B5: operational RT TorqueOff at raised pose must refuse, got {rep:?}"
+    );
+    assert_eq!(
+        rt_raised.bus.tx_log().iter().filter(|f| f.data == damiao::CMD_DISABLE).count(),
+        0,
+        "B5: operational RT TorqueOff at raised pose must transmit 0 CMD_DISABLE frames"
+    );
+    assert_eq!(rt_raised.fx.core.torque_intent, armd::TorqueIntent::On);
+
+    // 2. Operational RT owner at rest with < K=3 samples -> defers (0 CMD_DISABLE on submit),
+    //    then completes once K=3 rest samples arrive.
+    let mut rt_rest = ExecRig::new();
+    rt_rest.arm_now();
+    assert!(rt_rest.fx.core.safety.state().is_operational());
+    rt_rest.bus.clear_log();
+    rt_rest.submit_transition(TransitionOp::TorqueOff);
+    let rep0 = rt_rest.step();
+    assert!(
+        matches!(rep0.command, Some((_, Ok(_)))),
+        "B5: operational RT TorqueOff at rest with incomplete K=3 must defer, got {rep0:?}"
+    );
+    assert_eq!(
+        rt_rest.bus.tx_log().iter().filter(|f| f.data == damiao::CMD_DISABLE).count(),
+        0,
+        "B5: operational RT TorqueOff must emit 0 CMD_DISABLE frames before K=3 rest confirmation"
+    );
+    let mut completed = false;
+    for _ in 0..20 {
+        let rep = rt_rest.step();
+        if let Some((_, Outcome::Completed)) = rep.transition_ended {
+            completed = true;
+            break;
+        }
+    }
+    assert!(completed, "B5: operational RT TorqueOff at rest must complete after K=3");
+    assert_eq!(rt_rest.fx.core.torque_intent, armd::TorqueIntent::Off);
+    assert!(!rt_rest.fx.core.is_torqued);
+
+    // 3. Direct driver choke point while safety_stopped == false:
+    //    DisableRequested at raised pose -> TorqueOffWouldDrop (0 TX);
+    //    DisableProtective at raised pose -> succeeds (ungated).
+    let (mut inner_leg, bus_leg, clock_leg) = make_driver_rig();
+    enable_torque_admitted(&mut inner_leg).unwrap();
+    assert!(inner_leg.safety.state().is_operational());
+    bus_leg.with(|s| {
+        s.follow_commands = false;
+        s.motors[2].q = 0.50;
+        s.push_all_feedback();
+    });
+    clock_leg.advance(Duration::from_millis(20));
+    inner_leg.tick(0.02);
+    bus_leg.clear_log();
+    // Legacy operational disable_torque at raised pose refuses with 0 CMD_DISABLE.
+    assert!(inner_leg.disable_torque().is_err());
+    assert_eq!(
+        bus_leg.tx_log().iter().filter(|f| f.data == damiao::CMD_DISABLE).count(),
+        0,
+        "B5: legacy operational disable_torque at raised pose must send 0 CMD_DISABLE"
+    );
+    // Direct driver begin_disable_torque(DisableRequested) while operational + raised also refuses (0 TX).
+    {
+        let mut drv = inner_leg.driver.as_ref().unwrap().lock().unwrap();
+        let started_at = drv.clock_now();
+        let err = drv
+            .begin_disable_torque(DisableKind::DisableRequested { started_at })
+            .unwrap_err();
+        assert!(
+            matches!(err, armd::driver::ArmDriverError::TorqueOffWouldDrop),
+            "B5: direct operational DisableRequested at raised pose must refuse with TorqueOffWouldDrop, got {err:?}"
+        );
+        assert_eq!(
+            bus_leg.tx_log().iter().filter(|f| f.data == damiao::CMD_DISABLE).count(),
+            0
+        );
+        // DisableProtective remains ungated at raised pose.
+        let prog = drv
+            .begin_disable_torque(DisableKind::DisableProtective {
+                reason: DisableProtectiveReason::Thermal,
+            })
+            .expect("B5: DisableProtective must remain ungated at raised pose");
+        assert!(matches!(prog, TorqueProgress::Pending { .. } | TorqueProgress::Done(_)));
+        assert!(
+            bus_leg.tx_log().iter().filter(|f| f.data == damiao::CMD_DISABLE).count() >= 7,
+            "B5: DisableProtective must transmit CMD_DISABLE to all motors even at raised pose"
+        );
+    }
 }

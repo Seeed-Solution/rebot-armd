@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use armd::driver::{ArmDriver, DamiaoArmDriver};
+use armd::driver::{ArmDriver, DamiaoArmDriver, StoppedDisableGate};
 use armd::protocol::damiao::{self, DamiaoLimits};
 use armd::rt_core::broker::{
     Authority, BootId, Broker, Capacities, ClientId, Outcome, Submit, TransitionOp,
@@ -585,13 +585,33 @@ fn rt_enable_failure_with_motor_fault_and_failed_hold_ticks_zero_alloc() {
         let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
             .with_joint_limits(limits)
             .unwrap();
+        let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+        for i in 0..6 {
+            arm_joints[i] = i;
+        }
+        drv.set_stopped_disable_gate(StoppedDisableGate {
+            safety_stopped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            has_resting_pose: true,
+            arm_joints,
+            arm_joints_len: 6,
+            rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+            rest_pose_tolerance_rad: 0.05,
+        });
+        drv.read_joint_states().unwrap();
+        for step in 0..3 {
+            if step > 0 {
+                clock.advance(Duration::from_millis(12));
+            }
+            bus.with(|s| s.push_all_feedback());
+            drv.read_joint_states().unwrap();
+        }
+        drv.check_mapping_ranges();
+        drv.set_torque(false).unwrap();
         bus.with(|s| {
             s.motors[1].q = q_j2;
             s.push_all_feedback();
         });
         drv.read_joint_states().unwrap();
-        drv.check_mapping_ranges();
-        drv.set_torque(false).unwrap();
         let mut inner = SupervisorInner::new(ArmConfig {
             lease_timeout_ms: 600_000,
             ..ArmConfig::rebot_dm()

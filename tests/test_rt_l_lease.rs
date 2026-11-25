@@ -2770,6 +2770,26 @@ fn background_disable_retry_bounded_choke_point_recovery_and_fault_exhaustion() 
                 out.clear();
                 out.resize(self.dof, Some(Duration::from_millis(1)));
             }
+            fn has_driver_fresh_position_api(&self) -> bool {
+                true
+            }
+            fn fresh_joint_positions_into(
+                &self,
+                joints: &[usize],
+                max_age: Duration,
+                out: &mut [f32],
+            ) -> bool {
+                if joints.is_empty() || out.len() < joints.len() || Duration::from_millis(1) > max_age {
+                    return false;
+                }
+                for (dst, &j) in out.iter_mut().zip(joints.iter()) {
+                    let Some(&p) = self.positions.get(j) else {
+                        return false;
+                    };
+                    *dst = p;
+                }
+                true
+            }
             fn clock_now(&self) -> Instant { self.clock.now() }
         }
 
@@ -4507,6 +4527,26 @@ fn m4_disable_confirm_timeout_retries_in_background_preserving_original_timestam
             fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
                 out.clear();
                 out.resize(self.dof, Some(Duration::from_millis(1)));
+            }
+            fn has_driver_fresh_position_api(&self) -> bool {
+                true
+            }
+            fn fresh_joint_positions_into(
+                &self,
+                joints: &[usize],
+                max_age: Duration,
+                out: &mut [f32],
+            ) -> bool {
+                if joints.is_empty() || out.len() < joints.len() || Duration::from_millis(1) > max_age {
+                    return false;
+                }
+                for (dst, &j) in out.iter_mut().zip(joints.iter()) {
+                    let Some(&p) = self.positions.get(j) else {
+                        return false;
+                    };
+                    *dst = p;
+                }
+                true
             }
             fn clock_now(&self) -> Instant { self.clock.now() }
         }

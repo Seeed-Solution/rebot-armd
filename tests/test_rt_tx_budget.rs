@@ -1457,9 +1457,16 @@ fn receive_recovery_obeys_stop_gate_and_refresh_flush_failure_propagates() {
         let (mut d, bus, clock) = enabled_driver();
         d.set_tx_budget(TxBudget { max_frames: 4, max_duration: ms(5), frame_max_age: ms(45) });
         assert_eq!(
-            d.write_joint_targets_bounded(&targets_const(0.1)).unwrap(),
+            d.write_joint_targets_bounded(&targets_const(0.02)).unwrap(),
             TxBatchOutcome::Deferred { pending: 3 }
         );
+        for step in 0..3 {
+            if step > 0 {
+                clock.advance(ms(10));
+            }
+            bus.with(|s| s.push_all_feedback());
+            d.read_joint_states().unwrap();
+        }
         d.set_torque(false).unwrap(); // disabled -> stale >= 100 ms sends 0xCC refreshes only
         // Re-queue pending motion frames isn't needed while disabled, verify pass closure + Err propagation.
         clock.advance(ms(120));
@@ -2369,7 +2376,24 @@ fn motor_fault_plus_latched_estop_clears_via_operator_clear_fault_and_refuses_pe
         let mut driver = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
             .with_joint_limits(limits)
             .unwrap();
+        let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+        for (i, slot) in arm_joints.iter_mut().enumerate().take(6) {
+            *slot = i;
+        }
+        driver.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+            safety_stopped: Arc::new(AtomicBool::new(false)),
+            has_resting_pose: true,
+            arm_joints,
+            arm_joints_len: 6,
+            rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+            rest_pose_tolerance_rad: 0.05,
+        });
         driver.read_joint_states().unwrap();
+        for _ in 0..2 {
+            clock.advance(ms(10));
+            bus.with(|s| s.push_all_feedback());
+            driver.read_joint_states().unwrap();
+        }
         driver.set_torque(false).unwrap();
         let cfg = ArmConfig { lease_timeout_ms: 600_000, ..ArmConfig::rebot_dm() };
         let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(driver));
@@ -2676,6 +2700,18 @@ fn budget_1_completes_multi_joint_restore_readback_and_enable_within_deadline() 
             torque_reference: None,
         })
         .unwrap();
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    for (i, slot) in arm_joints.iter_mut().enumerate().take(6) {
+        *slot = i;
+    }
+    d.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+        safety_stopped: Arc::new(AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 6,
+        rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+        rest_pose_tolerance_rad: 0.05,
+    });
     // Establish fresh feedback, enable once, switch J4 to MIT, then disable so J4 is stray (MIT)
     // and needs CTRL_MODE=POS_VEL + dual holds on the next enable alongside J7 PosForce!
     d.read_joint_states().unwrap();
@@ -2688,6 +2724,13 @@ fn budget_1_completes_multi_joint_restore_readback_and_enable_within_deadline() 
     let mut mit_j4 = [JointMode::Position; 7];
     mit_j4[3] = JointMode::Mit;
     d.set_joint_modes(&mit_j4, &targets_const(0.0)).expect("switch J4 to MIT");
+    for step in 0..3 {
+        if step > 0 {
+            clock.advance(ms(10));
+        }
+        bus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+    }
     d.set_torque(false).expect("disable while J4 is in MIT");
     // Refresh feedback (torque off, state 0, fresh <= 100 ms).
     d.read_joint_states().unwrap();

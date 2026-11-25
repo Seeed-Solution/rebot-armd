@@ -760,6 +760,21 @@ mod shutdown_tests {
         fn is_feedback_valid(&self) -> bool {
             true
         }
+        fn has_driver_fresh_position_api(&self) -> bool {
+            true
+        }
+        fn fresh_joint_positions_into(
+            &self,
+            joints: &[usize],
+            _max_age: Duration,
+            out: &mut [f32],
+        ) -> bool {
+            if out.len() < joints.len() {
+                return false;
+            }
+            out[..joints.len()].fill(0.0);
+            true
+        }
         fn feedback_ages(&self) -> Vec<Option<Duration>> {
             vec![Some(Duration::ZERO); 6]
         }
@@ -869,6 +884,21 @@ mod shutdown_tests {
             *self.state.lock().unwrap() == EnableState::Enabled
         }
         fn is_feedback_valid(&self) -> bool {
+            true
+        }
+        fn has_driver_fresh_position_api(&self) -> bool {
+            true
+        }
+        fn fresh_joint_positions_into(
+            &self,
+            joints: &[usize],
+            _max_age: Duration,
+            out: &mut [f32],
+        ) -> bool {
+            if out.len() < joints.len() {
+                return false;
+            }
+            out[..joints.len()].fill(0.0);
             true
         }
         fn feedback_ages(&self) -> Vec<Option<Duration>> {

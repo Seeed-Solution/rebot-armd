@@ -605,6 +605,31 @@ fn test_damiao_driver_mock_loopback() {
     let _ = driver.read_joint_states().unwrap();
 
     // 5. Test best-effort disable: no motor confirms, the frame is resent at 25 and 75 ms
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    arm_joints[0] = 0;
+    arm_joints[1] = 1;
+    let mut rest_positions = [0.0f32; armd::rt_core::mailbox::MAX_DOF];
+    rest_positions[0] = 0.5;
+    rest_positions[1] = 0.5;
+    driver.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+        safety_stopped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 2,
+        rest_positions,
+        rest_pose_tolerance_rad: 0.05,
+    });
+    // Wait past TORQUE_CAUSAL_SETTLE_WINDOW (20 ms) after write_joint_targets, then establish K=3 rest samples.
+    std::thread::sleep(std::time::Duration::from_millis(22));
+    for step in 0..3 {
+        if step > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(11));
+        }
+        driver.can_mut().provide_rx_frame(CanFrame::new_standard(0x11, &d1_master).unwrap());
+        driver.can_mut().provide_rx_frame(CanFrame::new_standard(0x12, &d2_master).unwrap());
+        let _ = driver.read_joint_states().unwrap();
+    }
+    let _ = driver.can_mut().take_tx_frames();
     driver.set_torque(false).unwrap();
     let disable_tx = driver.can_mut().take_tx_frames();
     assert_eq!(disable_tx[0].data, CMD_DISABLE);

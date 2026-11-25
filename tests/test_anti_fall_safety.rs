@@ -81,6 +81,26 @@ impl ArmDriver for DummyDriver {
         self.feedback_valid.load(Ordering::SeqCst)
     }
 
+    fn has_driver_fresh_position_api(&self) -> bool {
+        true
+    }
+
+    fn fresh_joint_positions_into(&self, joints: &[usize], _max_age: Duration, out: &mut [f32]) -> bool {
+        if joints.is_empty() || out.len() < joints.len() || !self.feedback_valid.load(Ordering::SeqCst) {
+            return false;
+        }
+        for (slot, &i) in out.iter_mut().zip(joints.iter()) {
+            let Some(st) = self.states.get(i) else {
+                return false;
+            };
+            if !st.position.is_finite() {
+                return false;
+            }
+            *slot = st.position;
+        }
+        true
+    }
+
     fn is_enabled(&self) -> bool {
         self.is_enabled
     }

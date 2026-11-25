@@ -21,7 +21,7 @@ use armd::diagnostics::tick::{
     TickSample, RELEASE_FLAG_CLEAR_OK, RELEASE_FLAG_CLEAR_REFUSED, RELEASE_FLAG_ESTOP_APPLIED,
     RELEASE_FLAG_INJECT_ALLOC, RELEASE_FLAG_THERMAL_TRIP, RELEASE_FLAG_WATCHDOG_LATCH,
 };
-use armd::driver::{ArmDriver, ArmDriverError, DamiaoArmDriver, DriverCapabilities, EnableState, JointTarget};
+use armd::driver::{ArmDriver, ArmDriverError, DamiaoArmDriver, DriverCapabilities, EnableState, JointTarget, StoppedDisableGate};
 use armd::model::JointState;
 use armd::protocol::damiao::DamiaoLimits;
 use armd::rt_core::executor::{ExecutorConfig, PersistTestHooks};
@@ -96,6 +96,29 @@ fn take_global_logs(log: &GlobalLog) -> String {
 
 fn dm_limits() -> Vec<DamiaoLimits> {
     ArmConfig::rebot_dm().damiao_ranges.unwrap().iter().map(|r| r.limits()).collect()
+}
+
+fn seed_standalone_rest_gate(drv: &mut DamiaoArmDriver<FakeBus>, bus: &FakeBus, clock: &MockClock) {
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    for i in 0..6 {
+        arm_joints[i] = i;
+    }
+    drv.set_stopped_disable_gate(StoppedDisableGate {
+        safety_stopped: Arc::new(AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 6,
+        rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+        rest_pose_tolerance_rad: 0.05,
+    });
+    drv.read_joint_states().unwrap();
+    for step in 0..3 {
+        if step > 0 {
+            clock.advance(Duration::from_millis(12));
+        }
+        bus.with(|s| s.push_all_feedback());
+        drv.read_joint_states().unwrap();
+    }
 }
 
 fn assert_api_clear_fault_text(err: ClearFaultError, expected_msg: &str) {
@@ -476,7 +499,7 @@ async fn clear_fault_refusals_zero_alloc_unchanged_outcome_and_identical_api_tex
     let bus = FakeBus::with_clock(&dm_limits(), clock.clone());
     bus.with(|s| { s.immediate_replies = true; s.push_all_feedback(); });
     let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7]).with_joint_limits(dm_limits()).unwrap();
-    drv.read_joint_states().unwrap();
+    seed_standalone_rest_gate(&mut drv, &bus, &clock);
     drv.set_torque(false).unwrap();
     drv.check_mapping_ranges();
     let mut inner = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv));
@@ -1683,7 +1706,7 @@ fn mit_expiry_recovery_with_thermal_trip_recorded_is_refused_until_cooldown() {
     let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
         .with_joint_limits(limits.clone())
         .unwrap();
-    drv.read_joint_states().unwrap();
+    seed_standalone_rest_gate(&mut drv, &bus, &clock);
     drv.set_torque(false).unwrap();
     drv.check_mapping_ranges();
 
@@ -2338,7 +2361,7 @@ fn clear_check_runs_before_motor_reset_on_legacy_and_executor_paths() {
         let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
             .with_joint_limits(limits.clone())
             .unwrap();
-        drv.read_joint_states().unwrap();
+        seed_standalone_rest_gate(&mut drv, &bus, &clock);
         drv.set_torque(false).unwrap();
         drv.check_mapping_ranges();
         let mut cfg = ArmConfig::rebot_dm();
@@ -2490,7 +2513,7 @@ fn mit_expiry_recovery_final_check_uses_post_recovery_feedback() {
         let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
             .with_joint_limits(limits.clone())
             .unwrap();
-        drv.read_joint_states().unwrap();
+        seed_standalone_rest_gate(&mut drv, &bus, &clock);
         drv.set_torque(false).unwrap();
         drv.check_mapping_ranges();
 
@@ -2772,7 +2795,7 @@ fn clear_evidence_stale_temp_resets_cooldown_expired_lease_clears_and_joint_limi
     let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
         .with_joint_limits(limits.clone())
         .unwrap();
-    drv.read_joint_states().unwrap();
+    seed_standalone_rest_gate(&mut drv, &bus, &clock);
     drv.set_torque(false).unwrap();
     drv.check_mapping_ranges();
     let mut cfg = ArmConfig::rebot_dm();
@@ -3088,7 +3111,7 @@ fn thermal_cooldown_restarts_across_unobserved_stale_gap_without_tick() {
         let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
             .with_joint_limits(limits)
             .unwrap();
-        drv.read_joint_states().unwrap();
+        seed_standalone_rest_gate(&mut drv, &bus, &clock);
         drv.set_torque(false).unwrap();
         drv.check_mapping_ranges();
         let mut cfg = ArmConfig::rebot_dm();
@@ -3424,7 +3447,7 @@ fn mit_recovery_no_fence_ack_or_state_change_before_clear_check_passes() {
         let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
             .with_joint_limits(limits.clone())
             .unwrap();
-        drv.read_joint_states().unwrap();
+        seed_standalone_rest_gate(&mut drv, &bus, &clock);
         drv.set_torque(false).unwrap();
         drv.check_mapping_ranges();
 
@@ -3752,6 +3775,7 @@ fn mit_recovery_final_read_rejects_cached_feedback_without_post_recovery_rx_seq(
     dm.read_joint_states().unwrap();
     dm.check_mapping_ranges();
     dm.set_torque(true).unwrap();
+    seed_standalone_rest_gate(&mut dm, &bus, &clock);
     // Queue a pre-recovery state-0 frame for motor 0 BEFORE mit_expiry_recover() is requested,
     // and make motor 0 drop its disable command reply.
     let stale_state0_j1 = bus.with(|s| {

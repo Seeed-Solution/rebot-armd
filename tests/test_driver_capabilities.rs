@@ -2,11 +2,25 @@ use std::thread;
 use std::time::Duration;
 
 use armd::driver::{
-    ArmDriver, DamiaoArmDriver, DamiaoControlMode, DriverCapabilities, EnableState,
-    FashionStarArmDriver, FeetechArmDriver, RobStrideArmDriver,
+    ArmDriver, DamiaoArmDriver, DamiaoControlMode, DisableKind, DisableProtectiveReason,
+    DriverCapabilities, EnableState, FashionStarArmDriver, FeetechArmDriver, RobStrideArmDriver,
+    StoppedDisableGate,
 };
 use armd::protocol::damiao;
 use armd::transport::{CanFrame, CanTransport, MockCanTransport, MockTransport, Transport};
+
+fn rest_gate_1dof() -> StoppedDisableGate {
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    arm_joints[0] = 0;
+    StoppedDisableGate {
+        safety_stopped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 1,
+        rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+        rest_pose_tolerance_rad: 0.05,
+    }
+}
 
 fn feedback(state: u8, mos: u8, rotor: u8) -> CanFrame {
     // Midrange encoded position, velocity and torque; physical temperature bytes.
@@ -143,6 +157,14 @@ fn damiao_disable_needs_feedback_and_failure_does_not_fabricate_disabled_status(
         .can_mut()
         .respond_to_transmit(damiao::build_refresh_frame(1), feedback(1, 30, 32));
     driver.set_torque(true).unwrap();
+    driver.set_stopped_disable_gate(rest_gate_1dof());
+    for step in 0..3 {
+        if step > 0 {
+            thread::sleep(Duration::from_millis(11));
+        }
+        driver.can_mut().provide_rx_frame(feedback(1, 30, 32));
+        driver.read_joint_states().unwrap();
+    }
     driver
         .can_mut()
         .remove_transmit_response(&damiao::build_refresh_frame(1));
@@ -195,12 +217,19 @@ fn clear_fault_write_does_not_erase_observed_hardware_faults() {
     assert!(dm.check_hardware_status().is_ok());
 
     let mut rs = RobStrideArmDriver::new(MockCanTransport::new(), vec![1]);
+    rs.set_stopped_disable_gate(rest_gate_1dof());
+    rs.read_joint_states().unwrap();
     let fault_id = armd::protocol::robstride::build_feedback_extended_id(3, 1, 0xFD);
     let clear_id = armd::protocol::robstride::build_feedback_extended_id(0, 1, 0xFD);
     let data = [128, 0, 128, 0, 128, 0, 0, 250];
-    rs.can_mut()
-        .provide_rx_frame(CanFrame::new_extended(fault_id, &data).unwrap());
-    rs.read_joint_states().unwrap();
+    for step in 0..3 {
+        if step > 0 {
+            thread::sleep(Duration::from_millis(11));
+        }
+        rs.can_mut()
+            .provide_rx_frame(CanFrame::new_extended(fault_id, &data).unwrap());
+        rs.read_joint_states().unwrap();
+    }
     assert!(rs.check_hardware_status().is_err());
     rs.clear_fault().unwrap();
     assert!(rs.check_hardware_status().is_err());
@@ -213,6 +242,7 @@ fn clear_fault_write_does_not_erase_observed_hardware_faults() {
 #[test]
 fn queued_disabled_feedback_cannot_acknowledge_a_later_disable_command() {
     let mut driver = DamiaoArmDriver::new(MockCanTransport::new(), vec![1]);
+    driver.set_stopped_disable_gate(rest_gate_1dof());
     let ctrl_mode_reply = CanFrame::new_standard(
         0x11,
         &[1, 0, damiao::REG_READ, damiao::RID_CTRL_MODE, 2, 0, 0, 0],
@@ -228,6 +258,13 @@ fn queued_disabled_feedback_cannot_acknowledge_a_later_disable_command() {
         .can_mut()
         .respond_to_transmit(damiao::build_refresh_frame(1), feedback(1, 30, 32));
     driver.set_torque(true).unwrap();
+    for step in 0..3 {
+        if step > 0 {
+            thread::sleep(Duration::from_millis(11));
+        }
+        driver.can_mut().provide_rx_frame(feedback(1, 30, 32));
+        driver.read_joint_states().unwrap();
+    }
     driver
         .can_mut()
         .remove_transmit_response(&damiao::build_refresh_frame(1));
@@ -274,7 +311,14 @@ fn overloaded_rx_still_sends_disable_but_requires_a_new_feedback_boundary() {
     for _ in 0..205 {
         driver.can_mut().provide_rx_frame(feedback(0, 30, 32));
     }
-    driver.set_torque(false).unwrap();
+    // Under B5, DisableRequested waits for RX drain + K=3 post-boundary samples;
+    // DisableProtective still sends CMD_DISABLE immediately on an overloaded RX and requires
+    // a new feedback boundary before telemetry leaves Unknown.
+    driver
+        .disable_torque(DisableKind::DisableProtective {
+            reason: DisableProtectiveReason::Thermal,
+        })
+        .unwrap();
     assert_eq!(
         driver
             .can_mut()
@@ -300,6 +344,7 @@ fn overloaded_rx_still_sends_disable_but_requires_a_new_feedback_boundary() {
 #[test]
 fn genuine_response_to_disable_confirms_disabled_state() {
     let mut driver = DamiaoArmDriver::new(MockCanTransport::new(), vec![1]);
+    driver.set_stopped_disable_gate(rest_gate_1dof());
     let ctrl_mode_reply = CanFrame::new_standard(
         0x11,
         &[1, 0, damiao::REG_READ, damiao::RID_CTRL_MODE, 2, 0, 0, 0],
@@ -318,6 +363,13 @@ fn genuine_response_to_disable_confirms_disabled_state() {
         .can_mut()
         .respond_to_transmit(damiao::build_disable_frame(1), feedback(0, 30, 32));
     driver.set_torque(true).unwrap();
+    for step in 0..3 {
+        if step > 0 {
+            thread::sleep(Duration::from_millis(11));
+        }
+        driver.can_mut().provide_rx_frame(feedback(1, 30, 32));
+        driver.read_joint_states().unwrap();
+    }
     driver
         .can_mut()
         .replace_transmit_response(damiao::build_refresh_frame(1), feedback(0, 30, 32));

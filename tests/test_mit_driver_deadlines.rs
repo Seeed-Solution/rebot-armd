@@ -106,6 +106,26 @@ fn late_and_lost_confirmations() {
 #[test]
 fn partial_disable_confirmation_is_unconfirmed_not_success() {
     let (mut d, bus, clock) = enabled_rig();
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    for i in 0..6 {
+        arm_joints[i] = i;
+    }
+    d.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+        safety_stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 6,
+        rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+        rest_pose_tolerance_rad: 0.05,
+    });
+    for i in 0..3 {
+        if i > 0 {
+            clock.advance(ms(11));
+        }
+        bus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+    }
+    bus.clear_log();
     bus.with(|s| s.motors[4].silent = true);
     let t0 = clock.now();
     let mut p = d.begin_torque(false).unwrap();
@@ -167,6 +187,25 @@ fn success_is_withheld_until_confirmation() {
 #[test]
 fn disable_replaces_a_pending_enable() {
     let (mut d, bus, clock) = rig();
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    for i in 0..6 {
+        arm_joints[i] = i;
+    }
+    d.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+        safety_stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 6,
+        rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+        rest_pose_tolerance_rad: 0.05,
+    });
+    for i in 0..3 {
+        if i > 0 {
+            clock.advance(ms(11));
+        }
+        bus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+    }
     bus.with(|s| s.motors[J4].silent = true);
     d.begin_torque(true).unwrap();
     let _ = d.poll_torque(clock.now() + RX_PASS).unwrap();

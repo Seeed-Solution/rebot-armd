@@ -150,6 +150,28 @@ fn unconfirmed_mode_gets_both_frames_and_enable_restores_pos_vel() {
     assert_eq!(ids, vec![0x101, 1]);
 
     // A later enable handshake first restores POS_VEL (refused while unconfirmed).
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    arm_joints[0] = 0;
+    let mut rest_positions = [0.0f32; armd::rt_core::mailbox::MAX_DOF];
+    rest_positions[0] = 0.2;
+    driver.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+        safety_stopped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 1,
+        rest_positions,
+        rest_pose_tolerance_rad: 0.05,
+    });
+    // Wait past TORQUE_CAUSAL_SETTLE_WINDOW (20 ms) after write_joint_targets, then establish K=3 rest samples.
+    std::thread::sleep(std::time::Duration::from_millis(22));
+    for step in 0..3 {
+        if step > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(11));
+        }
+        driver.can_mut().provide_rx_frame(feedback_frame(1, 1, 0.2));
+        driver.read_joint_states().unwrap();
+    }
+    let _ = driver.can_mut().take_tx_frames();
     driver.set_torque(false).unwrap();
     driver.set_pending_rearm(true);
     assert!(driver.set_torque(true).is_err(), "enable must not proceed with an unconfirmed mode");
