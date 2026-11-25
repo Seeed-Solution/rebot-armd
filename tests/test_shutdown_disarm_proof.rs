@@ -893,12 +893,21 @@ fn disarm_probe_rejects_pre_poll_stale_rx_and_mixed_state_burst() {
                     && frame.data[0] == 3
                     && !self.injected.swap(true, Ordering::AcqRel)
                 {
+                    // Inject BOTH J3 enabled AND J4 enabled-then-disabled in the same drain so
+                    // per-axis adverse tracking must catch and invalidate BOTH axes.
                     self.inner.with(|s| {
-                        let prev = s.motors[2].enabled;
+                        let prev3 = s.motors[2].enabled;
                         s.motors[2].enabled = true;
-                        let fb = s.motors[2].feedback_frame();
-                        s.motors[2].enabled = prev;
-                        s.rx.push_back(fb);
+                        let f3 = s.motors[2].feedback_frame();
+                        s.motors[2].enabled = prev3;
+                        let prev4 = s.motors[3].enabled;
+                        s.motors[3].enabled = true;
+                        let f4_en = s.motors[3].feedback_frame();
+                        s.motors[3].enabled = prev4;
+                        let f4_dis = s.motors[3].feedback_frame();
+                        s.rx.push_back(f3);
+                        s.rx.push_back(f4_en);
+                        s.rx.push_back(f4_dis);
                     });
                 }
                 self.inner.transmit(frame)
@@ -945,8 +954,19 @@ fn disarm_probe_rejects_pre_poll_stale_rx_and_mixed_state_burst() {
         );
         let logs = take_logs();
         assert!(
-            logs.contains("J3") && logs.contains("enabled"),
-            "expected log naming J3 enabled in mixed-state burst, got: {logs:?}"
+            logs.contains("J3") && logs.contains("J4") && logs.contains("enabled"),
+            "expected log naming both J3 and J4 enabled in multi-axis burst, got: {logs:?}"
+        );
+        // Even if J3 later sends a single disabled frame, J4's rejected evidence must ALSO stay
+        // invalidated so passive disarm proof cannot become true from J4's earlier burst frame!
+        bus.with(|s| {
+            let f3 = s.motors[2].feedback_frame();
+            s.rx.push_back(f3);
+        });
+        let _ = drv.read_joint_states().unwrap();
+        assert!(
+            !drv.is_hardware_disarmed_confirmed(),
+            "J4 must remain invalidated after multi-axis adverse burst even if J3 later replies state==0"
         );
     }
 

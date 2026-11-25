@@ -7694,10 +7694,13 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     panic_disable_confirmed: Vec<bool>,
     /// True while `probe_hardware_disarmed_until` is actively polling read-only `0xCC` status.
     disarm_probe_active: bool,
-    /// First non-disabled (`state != 0`) post-boundary feedback observed during an active
-    /// `probe_hardware_disarmed_until` pass so a later `state == 0` frame in the same RX batch
-    /// cannot mask an enabled or faulted reply.
-    disarm_probe_adverse: Option<(usize, u8)>,
+    /// Per-axis bitmask of axes that produced a non-disabled (`state != 0`) post-boundary feedback
+    /// frame during an active `probe_hardware_disarmed_until` pass so a later `state == 0` frame
+    /// in the same drain can never mask or cache proof for any adverse axis.
+    disarm_probe_adverse_mask: u32,
+    /// First non-disabled (`state != 0`) state recorded per axis during an active
+    /// `probe_hardware_disarmed_until` pass.
+    disarm_probe_adverse_state: [u8; MAX_MODE_JOINTS],
     /// MIT tracking deadline fence (`set_mit_deadline_fence`); None = off (unchanged behaviour).
     mit_fence: Option<Duration>,
     /// Per joint: when its last confirmed command started out (the earliest frame of it, never
@@ -8882,7 +8885,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             panic_disable_tx_boundary: vec![None; dof],
             panic_disable_confirmed: vec![false; dof],
             disarm_probe_active: false,
-            disarm_probe_adverse: None,
+            disarm_probe_adverse_mask: 0,
+            disarm_probe_adverse_state: [0; MAX_MODE_JOINTS],
             rx_empty_seq: 0,
             last_read_drained: false,
             mit_fence: None,
@@ -16600,7 +16604,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
         self.awaiting_rx_boundary = false;
 
-        self.disarm_probe_adverse = None;
+        self.disarm_probe_adverse_mask = 0;
+        self.disarm_probe_adverse_state = [0; MAX_MODE_JOINTS];
         self.disarm_probe_active = true;
         let mut next_tx_at = self.now();
         let mut first_pass = true;
@@ -16688,29 +16693,36 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 self.rx_frame_limit = None;
             }
 
-            // Preserve any adverse (enabled/faulted) frame observed anywhere across the drained RX
-            // batches so a subsequent `state == 0` frame in the same drain can never mask it, AND
-            // invalidate that axis's cached disarm proof so passive checks cannot reuse it later.
-            if let Some((bad_idx, bad_st)) = self.disarm_probe_adverse {
-                self.motor_disarmed_after_enable[bad_idx] = false;
-                self.motor_status[bad_idx] = bad_st;
-                let id = self.motor_ids[bad_idx];
-                if bad_st == 1 {
-                    tracing::warn!(
-                        "Shutdown disarm proof refused: Damiao joint J{} (CAN ID 0x{:X}) replied enabled (state=1)",
-                        bad_idx + 1,
-                        id
-                    );
-                } else {
-                    tracing::warn!(
-                        "Shutdown disarm proof refused: Damiao joint J{} (CAN ID 0x{:X}) replied non-disabled (state=0x{:X})",
-                        bad_idx + 1,
-                        id,
-                        bad_st
-                    );
+            // Preserve EVERY adverse (enabled/faulted) axis observed across all drained RX batches
+            // so a subsequent `state == 0` frame in the same drain can never mask it, AND
+            // invalidate every adverse axis's cached disarm proof so passive checks cannot reuse it.
+            if self.disarm_probe_adverse_mask != 0 {
+                for i in 0..n {
+                    if (self.disarm_probe_adverse_mask & (1u32 << i)) == 0 {
+                        continue;
+                    }
+                    let bad_st = self.disarm_probe_adverse_state[i];
+                    self.motor_disarmed_after_enable[i] = false;
+                    self.motor_status[i] = bad_st;
+                    let id = self.motor_ids[i];
+                    if bad_st == 1 {
+                        tracing::warn!(
+                            "Shutdown disarm proof refused: Damiao joint J{} (CAN ID 0x{:X}) replied enabled (state=1)",
+                            i + 1,
+                            id
+                        );
+                    } else {
+                        tracing::warn!(
+                            "Shutdown disarm proof refused: Damiao joint J{} (CAN ID 0x{:X}) replied non-disabled (state=0x{:X})",
+                            i + 1,
+                            id,
+                            bad_st
+                        );
+                    }
                 }
                 self.disarm_probe_active = false;
-                self.disarm_probe_adverse = None;
+                self.disarm_probe_adverse_mask = 0;
+                self.disarm_probe_adverse_state = [0; MAX_MODE_JOINTS];
                 return false;
             }
 
@@ -16735,7 +16747,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         self.motor_ids[i]
                     );
                     self.disarm_probe_active = false;
-                    self.disarm_probe_adverse = None;
+                    self.disarm_probe_adverse_mask = 0;
+                    self.disarm_probe_adverse_state = [0; MAX_MODE_JOINTS];
                     return false;
                 }
                 if st != 0 {
@@ -16747,7 +16760,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         st
                     );
                     self.disarm_probe_active = false;
-                    self.disarm_probe_adverse = None;
+                    self.disarm_probe_adverse_mask = 0;
+                    self.disarm_probe_adverse_state = [0; MAX_MODE_JOINTS];
                     return false;
                 }
             }
@@ -16774,10 +16788,17 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
 
         self.disarm_probe_active = false;
-        self.disarm_probe_adverse = None;
+        self.disarm_probe_adverse_mask = 0;
+        self.disarm_probe_adverse_state = [0; MAX_MODE_JOINTS];
         if confirmed {
             return true;
         }
+        // Fail closed: an unconfirmed or incomplete-drain probe must never leave cached passive
+        // disarm proof behind for a subsequent teardown check.
+        if !self.last_read_drained {
+            self.awaiting_rx_boundary = true;
+        }
+        self.motor_disarmed_after_enable.fill(false);
         log_unconfirmed_axes(self, &probe_tx_boundary);
         false
     }
@@ -20788,9 +20809,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 if !self.awaiting_rx_boundary {
                     if feedback.state_or_error == 0 {
                         let adverse_this_axis = self.disarm_probe_active
-                            && self
-                                .disarm_probe_adverse
-                                .is_some_and(|(bad_idx, _)| bad_idx == idx);
+                            && idx < MAX_MODE_JOINTS
+                            && (self.disarm_probe_adverse_mask & (1u32 << idx)) != 0;
                         let after_enable = match self.motor_last_enable_tx[idx] {
                             Some((en_seq, en_at)) => seq > en_seq && rx_at >= en_at,
                             None => true,
@@ -20806,8 +20826,12 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     } else {
                         self.motor_disarmed_after_enable[idx] = false;
                         self.panic_disable_confirmed[idx] = false;
-                        if self.disarm_probe_active && self.disarm_probe_adverse.is_none() {
-                            self.disarm_probe_adverse = Some((idx, feedback.state_or_error));
+                        if self.disarm_probe_active
+                            && idx < MAX_MODE_JOINTS
+                            && (self.disarm_probe_adverse_mask & (1u32 << idx)) == 0
+                        {
+                            self.disarm_probe_adverse_mask |= 1u32 << idx;
+                            self.disarm_probe_adverse_state[idx] = feedback.state_or_error;
                         }
                     }
                 }
