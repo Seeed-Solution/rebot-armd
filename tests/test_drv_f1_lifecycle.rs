@@ -201,17 +201,7 @@ impl CanTransport for FakeBus {
                 m.enabled = true;
             } else if frame.data == damiao::CMD_DISABLE {
                 m.enabled = false;
-            } else if is_pos_vel && follow && frame.data.len() >= 4 {
-                let target_q = f32::from_le_bytes([
-                    frame.data[0],
-                    frame.data[1],
-                    frame.data[2],
-                    frame.data[3],
-                ]);
-                if target_q.is_finite() {
-                    m.q = target_q;
-                }
-            } else if is_pos_force && follow && frame.data.len() >= 4 {
+            } else if (is_pos_vel || is_pos_force) && follow && frame.data.len() >= 4 {
                 let target_q = f32::from_le_bytes([
                     frame.data[0],
                     frame.data[1],

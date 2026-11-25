@@ -7807,6 +7807,7 @@ fn control_thread_main(
     safe_hold_bufs.mirror_from_core(&core);
     let clock_hook_top = hooks.clock.clone();
 
+    #[allow(clippy::large_enum_variant)]
     enum StartupStepOutcome {
         Ready {
             payload: Box<StartupReadyPayload>,

@@ -5736,6 +5736,7 @@ impl SupervisorInner {
                 let measured_positions = &self.measured_positions;
                 let mut ages_buf = std::mem::take(&mut self.scratch.ages);
                 let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
+                #[allow(clippy::large_enum_variant)] // RT stack-only enum; avoids heap Box
                 enum DisablePollOutcome {
                     Ran(
                         Instant,
