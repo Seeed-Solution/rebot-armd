@@ -1500,11 +1500,12 @@ fn terminal_capture_lock_proof_action_completion_dwell_saturation_and_positive_c
             });
             held_rx.recv_timeout(Duration::from_secs(2)).expect("broadcaster lock held");
 
-            // Track driver calls strictly during `capture_edge_terminals`.
-            let in_cap_enter = Arc::clone(&in_capture);
-            sup.inner().write().await.terminal_capture_test_hook = Some(Arc::new(move |_| {
-                in_cap_enter.store(true, Ordering::Release);
-            }));
+            // Track driver calls strictly across the entire `capture_edge_terminals` body.
+            let in_cap_hook = Arc::clone(&in_capture);
+            sup.inner().write().await.terminal_capture_test_hook =
+                Some(Arc::new(move |_, entering| {
+                    in_cap_hook.store(entering, Ordering::Release);
+                }));
 
             // Real in-tick trajectory completions + 30 dwell ticks + saturation (6 total actions
             // into push_cap=3). `terminal_capture_test_hook` arms `in_capture` BEFORE
@@ -1550,12 +1551,17 @@ fn terminal_capture_lock_proof_action_completion_dwell_saturation_and_positive_c
             let tb_try_locked = Arc::new(AtomicBool::new(true));
             let tb_try_locked_c = Arc::clone(&tb_try_locked);
             let in_cap_pos = Arc::clone(&in_capture);
-            sup.inner().write().await.terminal_capture_test_hook = Some(Arc::new(move |inner| {
-                tb_try_locked_c.store(sup_probe.test_try_lock_terminal_broadcaster(), Ordering::Release);
-                in_cap_pos.store(true, Ordering::Release);
-                let _ = inner.hardware_feedback_fresh(Duration::from_millis(250));
-                in_cap_pos.store(false, Ordering::Release);
-            }));
+            sup.inner().write().await.terminal_capture_test_hook =
+                Some(Arc::new(move |inner, entering| {
+                    in_cap_pos.store(entering, Ordering::Release);
+                    if entering {
+                        tb_try_locked_c.store(
+                            sup_probe.test_try_lock_terminal_broadcaster(),
+                            Ordering::Release,
+                        );
+                        let _ = inner.hardware_feedback_fresh(Duration::from_millis(250));
+                    }
+                }));
             sup.control_tick(0.02).await;
             sup.inner().write().await.terminal_capture_test_hook = None;
 
@@ -1603,37 +1609,42 @@ fn terminal_capture_lock_proof_action_completion_dwell_saturation_and_positive_c
             let probe_caught = Arc::new(AtomicBool::new(false));
             let armed_c = Arc::clone(&probe_armed);
             let caught_c = Arc::clone(&probe_caught);
-            sup_rt.inner().write().await.terminal_capture_test_hook = Some(Arc::new(move |_| {
-                rt_in_capture_hook.store(true, Ordering::Release);
-                if !armed_c.swap(false, Ordering::AcqRel) {
-                    rt_in_capture_hook.store(false, Ordering::Release);
-                    return;
-                }
-                assert!(on_rt_control_thread());
-                let res_sup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let _ = inner_lock.try_read();
+            sup_rt.inner().write().await.terminal_capture_test_hook =
+                Some(Arc::new(move |inner, entering| {
+                    // Span the ENTIRE `capture_edge_terminals` body (`capture_from` + SPSC push):
+                    // `entering == true` arms the driver audit window BEFORE record construction,
+                    // `entering == false` clears it strictly AFTER the push loop completes.
+                    rt_in_capture_hook.store(entering, Ordering::Release);
+                    if !entering || !armed_c.swap(false, Ordering::AcqRel) {
+                        return;
+                    }
+                    assert!(on_rt_control_thread());
+                    let res_sup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let _ = inner_lock.try_read();
+                    }));
+                    assert!(
+                        res_sup.is_err(),
+                        "injected SupervisorLock::try_read in capture must panic"
+                    );
+                    let res_rx = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        sup_rt_for_hook.test_touch_terminal_capture_rx_lock();
+                    }));
+                    assert!(
+                        res_rx.is_err(),
+                        "injected uncontended TerminalCaptureChannel::rx.lock() in capture must panic"
+                    );
+                    let res_cache = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        sup_rt_for_hook.test_touch_terminal_capture_rich_cache_lock();
+                    }));
+                    assert!(
+                        res_cache.is_err(),
+                        "injected uncontended TerminalCaptureChannel::rich_action_cache.lock() in capture must panic"
+                    );
+                    // Positive control: injected driver mutex acquisition strictly inside the
+                    // capture window MUST be detected by `rt_driver_calls`.
+                    let _ = inner.hardware_feedback_fresh(Duration::from_millis(250));
+                    caught_c.store(true, Ordering::Release);
                 }));
-                assert!(
-                    res_sup.is_err(),
-                    "injected SupervisorLock::try_read in capture must panic"
-                );
-                let res_rx = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    sup_rt_for_hook.test_touch_terminal_capture_rx_lock();
-                }));
-                assert!(
-                    res_rx.is_err(),
-                    "injected uncontended TerminalCaptureChannel::rx.lock() in capture must panic"
-                );
-                let res_cache = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    sup_rt_for_hook.test_touch_terminal_capture_rich_cache_lock();
-                }));
-                assert!(
-                    res_cache.is_err(),
-                    "injected uncontended TerminalCaptureChannel::rich_action_cache.lock() in capture must panic"
-                );
-                rt_in_capture_hook.store(false, Ordering::Release);
-                caught_c.store(true, Ordering::Release);
-            }));
 
             let cfg_snap = Arc::new(
                 armd::rt_core::requests::motion::MotionConfigSnapshot::from_supervisor(
@@ -1747,6 +1758,10 @@ fn terminal_capture_lock_proof_action_completion_dwell_saturation_and_positive_c
                 sup_rt.test_terminal_capture_control_lock_attempts(),
                 2,
                 "positive controls must catch BOTH uncontended rx.lock() and rich_action_cache.lock() on armd-control"
+            );
+            assert!(
+                rt_driver_calls.load(Ordering::Acquire) >= 1,
+                "positive control: injected driver mutex call inside RT capture window MUST be detected"
             );
 
             writer_hold.release();

@@ -96,6 +96,30 @@ impl CapturedSafetyState {
     }
 }
 
+/// Dedicated per-tick cached driver state owned exclusively by terminal capture so seeding at
+/// `install_driver` or failing closed on mutex/read errors never mutates hardware park/torque-off
+/// interlock fields (`last_poll_enable_state`, `last_poll_partial_enable`, `last_poll_oldest_age`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CaptureDriverCache {
+    pub(crate) enable_state: EnableState,
+    pub(crate) driver_caps: DriverCapabilities,
+    pub(crate) feedback_valid: bool,
+    pub(crate) oldest_age: Option<Duration>,
+    pub(crate) feedback_at: Option<Instant>,
+}
+
+impl Default for CaptureDriverCache {
+    fn default() -> Self {
+        Self {
+            enable_state: EnableState::Unknown,
+            driver_caps: DriverCapabilities::default(),
+            feedback_valid: false,
+            oldest_age: None,
+            feedback_at: None,
+        }
+    }
+}
+
 /// Fixed-size `Copy` terminal record captured on `armd-control` with zero heap ops and zero locks.
 #[derive(Clone, Copy)]
 pub(crate) struct TerminalCaptureRecord {
@@ -168,6 +192,27 @@ fn copy_f32_slice(src: &[f32]) -> [f32; MAX_DOF] {
 #[inline]
 fn opt_label(s: Option<&String>) -> Option<HolderLabel> {
     s.map(|v| HolderLabel::new(v))
+}
+
+fn overlay_opt_label(dst: &mut Option<String>, src: Option<HolderLabel>) {
+    match src {
+        Some(v) => {
+            let s = v.as_str();
+            if v.len() == HolderLabel::CAPACITY
+                && dst
+                    .as_deref()
+                    .is_some_and(|existing| existing.starts_with(s))
+            {
+                return;
+            }
+            if dst.as_deref() != Some(s) {
+                *dst = Some(s.to_owned());
+            }
+        }
+        None => {
+            *dst = None;
+        }
+    }
 }
 
 impl TerminalCaptureRecord {
@@ -274,7 +319,7 @@ impl TerminalCaptureRecord {
             } else {
                 ControlMode::Position
             },
-            driver_caps: inner.driver_caps,
+            driver_caps: inner.cached_capture_driver_caps(),
             enable_state: inner.cached_enable_state(),
             lease_holder: inner.lease_holder_str().map(HolderLabel::new),
         }
@@ -382,26 +427,10 @@ impl TerminalCaptureRecord {
         if self.pass.is_some() {
             dst.pass = self.pass;
         }
-        if let Some(v) = self.constraint_id {
-            if dst.constraint_id.is_none() {
-                dst.constraint_id = Some(v.as_str().to_owned());
-            }
-        }
-        if let Some(v) = self.geometry_id {
-            if dst.geometry_id.is_none() {
-                dst.geometry_id = Some(v.as_str().to_owned());
-            }
-        }
-        if let Some(v) = self.violation_phase {
-            if dst.violation_phase.is_none() {
-                dst.violation_phase = Some(v.as_str().to_owned());
-            }
-        }
-        if let Some(v) = self.reason {
-            if dst.reason.is_none() {
-                dst.reason = Some(v.as_str().to_owned());
-            }
-        }
+        overlay_opt_label(&mut dst.constraint_id, self.constraint_id);
+        overlay_opt_label(&mut dst.geometry_id, self.geometry_id);
+        overlay_opt_label(&mut dst.violation_phase, self.violation_phase);
+        overlay_opt_label(&mut dst.reason, self.reason);
         if self.durability_confirmed.is_some() {
             dst.durability_confirmed = self.durability_confirmed;
         }
@@ -831,25 +860,34 @@ impl TerminalCaptureChannel {
                 .unwrap_or_else(|| rec.build_action_status());
             hub.attach_action_measurement_to_action(&mut action);
 
-            // Preserve HEAD's wire contract: when `hub` has published, `drain_all` clones the
-            // latest `base_obs` and injects `action`. Only when no published snapshot exists
-            // (`hub.published_seq() == 0 && latest_obs.is_none()`), synthesize a full
-            // `ArmObservation` off-thread from `rec` overlaid onto `template_obs`.
-            let obs_override = if latest_obs.is_none() && hub.published_seq() == 0 {
-                Some(rec.build_observation(template_obs, action.clone()))
+            // Preserve HEAD's wire contract when `rec.publish_seq` matches an already-published
+            // snapshot (`consumed_seq >= req_seq`): `drain_all` clones `base_obs` and injects
+            // `action`, carrying `required_publish_seq` through delivery.
+            // Whenever a record has NO matching published snapshot (`rec.publish_seq.is_none()`,
+            // e.g. post-publish persistence saturation / control_stop, or no snapshot published
+            // yet, or shutdown draining a record ahead of `consumed_seq`), synthesize a
+            // self-contained `ArmObservation` from `rec`'s captured state so a terminal is NEVER
+            // paired with a pre-terminal snapshot.
+            let needs_captured_obs = rec.publish_seq.is_none()
+                || (latest_obs.is_none() && hub.published_seq() == 0)
+                || (!respect_publish_barrier
+                    && rec.publish_seq.is_some_and(|req| consumed_seq < req));
+            let (obs_override, required_publish_seq) = if needs_captured_obs {
+                (
+                    Some(rec.build_observation(latest_obs.unwrap_or(template_obs), action.clone())),
+                    None,
+                )
             } else {
-                None
+                (None, rec.publish_seq)
             };
 
             // Enqueue into `TerminalBroadcaster` (updating `max_fifo_len` & `pending_total` with
-            // `Release`) STRICTLY BEFORE decrementing `self.inflight` (`Release`). Carry
-            // `rec.publish_seq` through to delivery so a stale dispatcher snapshot can never pair
-            // with this terminal.
+            // `Release`) STRICTLY BEFORE decrementing `self.inflight` (`Release`).
             let _ = terminals.record_finished_with_seq(
                 rec.terminal_seq,
                 action,
                 obs_override,
-                rec.publish_seq,
+                required_publish_seq,
             );
             self.inflight.fetch_sub(1, Ordering::Release);
             drained += 1;
@@ -1422,7 +1460,23 @@ mod tests {
         };
 
         let seqs_before = inner.core.feedback().seqs().to_vec();
+        let interlock_before = (
+            inner.last_poll_enable_state,
+            inner.last_poll_partial_enable,
+            inner.last_poll_feedback_valid,
+            inner.last_poll_oldest_age,
+        );
         inner.install_driver(Box::new(drv));
+        assert_eq!(
+            (
+                inner.last_poll_enable_state,
+                inner.last_poll_partial_enable,
+                inner.last_poll_feedback_valid,
+                inner.last_poll_oldest_age,
+            ),
+            interlock_before,
+            "install_driver must not mutate hardware park/torque-off interlock last_poll_* fields"
+        );
         assert_eq!(
             inner.core.feedback().seqs(),
             seqs_before.as_slice(),
@@ -1433,13 +1487,23 @@ mod tests {
             "seeded poll-age fallback keeps freshness valid immediately after attachment"
         );
 
-        // First poll fails -> cached freshness fails closed and sequences stay unchanged.
+        // First poll fails -> cached freshness fails closed while sequences and interlock stay unchanged.
         inner.poll_hardware_rx(None, None, None);
         assert!(
             !inner.cached_hardware_feedback_fresh(Duration::from_millis(250)),
             "failed poll must make cached freshness fail closed"
         );
         assert_eq!(inner.core.feedback().seqs(), seqs_before.as_slice());
+        assert_eq!(
+            (
+                inner.last_poll_enable_state,
+                inner.last_poll_partial_enable,
+                inner.last_poll_feedback_valid,
+                inner.last_poll_oldest_age,
+            ),
+            interlock_before,
+            "failed poll must not mutate hardware interlock last_poll_* fields"
+        );
 
         // Subsequent valid poll -> freshness becomes true and sequences advance by exactly 1.
         read_ok.store(true, AOrd::Release);
@@ -1462,6 +1526,150 @@ mod tests {
                 "joint {i} feedback sequence must advance exactly once on first valid poll"
             );
         }
+        // Subsequent read error after a valid poll matches baseline `last_poll_*` behavior
+        // (`feedback_valid=false, oldest_age=None`, enable state unchanged) while failing closed
+        // in `capture_driver_cache`.
+        let enable_after_valid = (inner.last_poll_enable_state, inner.last_poll_partial_enable);
+        read_ok.store(false, AOrd::Release);
+        inner.poll_hardware_rx(None, None, None);
+        assert!(
+            !inner.cached_hardware_feedback_fresh(Duration::from_millis(250)),
+            "read error after valid poll must fail closed in capture_driver_cache"
+        );
+        assert_eq!(
+            (inner.last_poll_enable_state, inner.last_poll_partial_enable),
+            enable_after_valid,
+            "read error must preserve baseline enable interlock fields"
+        );
+        assert!(!inner.last_poll_feedback_valid);
+        assert!(inner.last_poll_oldest_age.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delayed_cancellation_clears_mirrored_workspace_violation_diagnostics() {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        sup.set_lease_enabled(false).await;
+        let delivered = Arc::new(Mutex::new(Vec::<ActionStatus>::new()));
+        let delivered_c = Arc::clone(&delivered);
+        let _sub = sup.test_subscribe_action_terminals(move |obs| {
+            if let Some(a) = obs.action.as_ref() {
+                delivered_c.lock().unwrap().push(a.clone());
+            }
+            true
+        });
+
+        let (id_a, expected) = {
+            let mut inner = sup.inner().write().await;
+            let id = inner.begin_action("grasp", None);
+            inner.set_action_workspace_violation(
+                id,
+                crate::kinematics::WorkspaceViolationDetail {
+                    constraint_id: Some("table_plane".into()),
+                    geometry_id: Some("jaw_tip".into()),
+                    violation_phase: Some("descend".into()),
+                    reason: Some("z below table".into()),
+                },
+            );
+            // Guarded cancellation clears workspace violation fields (`finish_action`).
+            inner.defer_terminal_capture = true;
+            inner.finish_action(id, "cancelled", Some("STOPPED"), None, None, None, None);
+            let exp = inner.last_action.clone().expect("cancelled slot");
+            assert!(exp.constraint_id.is_none());
+            assert!(exp.geometry_id.is_none());
+            assert!(exp.violation_phase.is_none());
+            assert!(exp.reason.is_none());
+            let _id2 = inner.begin_action_rt("park");
+            inner.pending_normal_unload = true;
+            if let Some((_, until)) = inner.previous_action.as_mut() {
+                *until = 0.0;
+            }
+            inner.defer_terminal_capture = false;
+            (id, exp)
+        };
+
+        sup.control_tick(0.02).await;
+        let _write_hold = sup.inner().write().await;
+        let _ = sup.test_drain_terminal_captures();
+        drop(_write_hold);
+
+        let got = delivered.lock().unwrap().clone();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, id_a);
+        assert_eq!(
+            got[0], expected,
+            "delayed cancellation must clear previously mirrored workspace violation fields"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn post_publish_and_shutdown_captures_synthesize_self_contained_observation() {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        sup.set_lease_enabled(false).await;
+        let delivered = Arc::new(Mutex::new(Vec::<ArmObservation>::new()));
+        let delivered_c = Arc::clone(&delivered);
+        let _sub = sup.test_subscribe_action_terminals(move |obs| {
+            delivered_c.lock().unwrap().push(obs.clone());
+            true
+        });
+
+        // Publish baseline snapshot N with initial epoch and timestamp.
+        sup.control_tick(0.02).await;
+        let snap_n = sup.hub().latest().expect("snapshot N");
+
+        // Simulate post-publish capture with `publish_seq: None` (like persistence saturation or
+        // control_stop) after epoch / timestamp advance without another publish_at.
+        let id_sat = {
+            let mut inner = sup.inner().write().await;
+            inner.defer_terminal_capture = true;
+            let id = inner.begin_action_rt("gripper_zero_check");
+            inner.finish_action(id, "failed", Some("PERSIST_FAILED"), None, None, None, None);
+            let ts_after = snap_n.obs.timestamp + 1.25;
+            let _ = inner.capture_edge_terminals(ts_after, None);
+            inner.defer_terminal_capture = false;
+            id
+        };
+        let _ = sup.test_drain_terminal_captures();
+        {
+            let got = delivered.lock().unwrap();
+            assert_eq!(got.len(), 1);
+            assert_eq!(got[0].action.as_ref().map(|a| a.id), Some(id_sat));
+            assert!(
+                (got[0].timestamp - (snap_n.obs.timestamp + 1.25)).abs() < 1e-6,
+                "publish_seq: None capture must synthesize self-contained observation at capture timestamp, not stale snap_n"
+            );
+        }
+
+        // Simulate shutdown drain when a queued record has `publish_seq > final_snap.meta.seq`:
+        // drain with `respect_publish_barrier = false` synthesizes `obs_override`, and
+        // `drain_all(..., final_seq)` delivers it without ever passing `u64::MAX`.
+        let id_shut = {
+            let mut inner = sup.inner().write().await;
+            inner.defer_terminal_capture = true;
+            let id = inner.begin_action_rt("jog");
+            inner.finish_action(id, "done", None, None, None, None, None);
+            let ts_shut = snap_n.obs.timestamp + 2.50;
+            let future_seq = snap_n.meta.seq + 10;
+            let _ = inner.capture_edge_terminals(ts_shut, Some(future_seq));
+            inner.defer_terminal_capture = false;
+            id
+        };
+        let _ = sup.terminal_capture_channel.drain_into(
+            &sup.terminals,
+            &sup.hub,
+            Some(&snap_n),
+            &[],
+            &sup.template_obs,
+            false,
+        );
+        let blocked = sup.terminals.drain_all(&snap_n.obs, snap_n.meta.seq);
+        assert!(!blocked);
+        let got = delivered.lock().unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[1].action.as_ref().map(|a| a.id), Some(id_shut));
+        assert!(
+            (got[1].timestamp - (snap_n.obs.timestamp + 2.50)).abs() < 1e-6,
+            "shutdown drain ahead of final_snap.seq must emit captured observation, not stale snap_n"
+        );
     }
 
     #[test]

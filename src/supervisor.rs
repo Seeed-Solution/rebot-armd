@@ -1344,15 +1344,15 @@ pub struct SupervisorInner {
     terminal_edge_tracker: terminal_capture::TerminalEdgeTracker,
     /// Accumulated wall time (µs) spent in `capture_edge_terminals` during the latest release.
     last_phase_terminal_us: u32,
-    /// Driver-clock instant sampled strictly BEFORE `driver.feedback_ages_into` on the last poll
-    /// (fail-closed fallback reference for drivers without per-joint `feedback_instants`).
-    pub(crate) last_poll_feedback_at: Option<Instant>,
+    /// Dedicated per-tick cached driver state read exclusively by terminal capture (isolated
+    /// from hardware park/torque-off interlock fields `last_poll_*`).
+    pub(crate) capture_driver_cache: terminal_capture::CaptureDriverCache,
     /// Prebuilt template observation used only by off-tick terminal drain when `hub` has not published.
     template_obs_for_drain: Option<Arc<ArmObservation>>,
-    /// Doc-hidden deterministic test seam invoked strictly inside `capture_edge_terminals`
-    /// (`None` in production, 0 alloc).
+    /// Doc-hidden deterministic test seam invoked at entry (`true`) and exit (`false`) of
+    /// `capture_edge_terminals` (`None` in production, 0 alloc).
     #[doc(hidden)]
-    pub terminal_capture_test_hook: Option<Arc<dyn Fn(&SupervisorInner) + Send + Sync>>,
+    pub terminal_capture_test_hook: Option<Arc<dyn Fn(&SupervisorInner, bool) + Send + Sync>>,
     /// Monotonic count of deferred safety log events dropped at the RT->off-thread SPSC ring.
     pub(crate) safety_log_ring_dropped: u64,
     /// Deterministic test hook invoked inside `publish_at` strictly before `core.publish(...)`.
@@ -2374,7 +2374,7 @@ impl SupervisorInner {
             staged_terminals: terminal_capture::StagedTerminalBuf::default(),
             terminal_edge_tracker: terminal_capture::TerminalEdgeTracker::default(),
             last_phase_terminal_us: 0,
-            last_poll_feedback_at: None,
+            capture_driver_cache: terminal_capture::CaptureDriverCache::default(),
             template_obs_for_drain: None,
             terminal_capture_test_hook: None,
             safety_log_ring_dropped: 0,
@@ -3089,11 +3089,12 @@ impl SupervisorInner {
         self.driver_clock.as_ref().map_or_else(Instant::now, |c| c.now())
     }
 
-    /// Per-tick cached hardware enable state (zero driver mutex acquisitions).
+    /// Per-tick cached hardware enable state for terminal capture (zero driver mutex acquisitions,
+    /// isolated from hardware interlock `last_poll_enable_state`).
     #[inline]
     pub(crate) fn cached_enable_state(&self) -> EnableState {
         if self.driver.is_some() {
-            self.last_poll_enable_state
+            self.capture_driver_cache.enable_state
         } else if self.is_torqued {
             EnableState::Enabled
         } else {
@@ -3101,21 +3102,32 @@ impl SupervisorInner {
         }
     }
 
+    /// Per-tick cached driver capabilities for terminal capture (zero driver mutex acquisitions).
+    #[inline]
+    pub(crate) fn cached_capture_driver_caps(&self) -> DriverCapabilities {
+        if self.driver.is_some() {
+            self.capture_driver_cache.driver_caps
+        } else {
+            self.driver_caps
+        }
+    }
+
     /// Per-tick cached hardware feedback freshness within `max_age` (zero driver mutex acquisitions).
-    /// Always checks `feedback_numeric_valid` and `last_poll_feedback_valid` first; evaluates
-    /// per-joint receive instants from `ArmCore::feedback()` against `cached_driver_clock_now()`,
-    /// with a fail-closed fallback to `(last_poll_oldest_age, last_poll_feedback_at)` for drivers
-    /// without per-joint instants. Never mutates `ArmCore::feedback().instants()`.
+    /// Always checks `feedback_numeric_valid` and `capture_driver_cache.feedback_valid` first;
+    /// evaluates per-joint receive instants from `ArmCore::feedback()` against
+    /// `cached_driver_clock_now()`, with a fail-closed fallback to `capture_driver_cache`
+    /// `(oldest_age, feedback_at)` for drivers without per-joint instants. Never mutates
+    /// `ArmCore::feedback().instants()` or hardware park interlock fields.
     #[inline]
     pub(crate) fn cached_hardware_feedback_fresh(&self, max_age: Duration) -> bool {
         terminal_capture::evaluate_cached_feedback_fresh(
             self.feedback_numeric_valid,
-            self.last_poll_feedback_valid,
+            self.capture_driver_cache.feedback_valid,
             self.driver.is_some(),
             self.config.dof,
             self.core.feedback().instants(),
-            self.last_poll_oldest_age,
-            self.last_poll_feedback_at,
+            self.capture_driver_cache.oldest_age,
+            self.capture_driver_cache.feedback_at,
             self.cached_driver_clock_now(),
             max_age,
         )
@@ -3275,7 +3287,8 @@ impl SupervisorInner {
                 .staged_terminals
                 .push_evicting_oldest(terminal_capture::StagedTerminal::Captured(rec))
             {
-                self.flush_evicted_staged(oldest, ts, None);
+                let next_pub_seq = Some(self.core.next_publish_seq());
+                self.flush_evicted_staged(oldest, ts, next_pub_seq);
             }
             self.last_phase_terminal_us = self
                 .last_phase_terminal_us
@@ -3315,7 +3328,8 @@ impl SupervisorInner {
                         terminal_seq: seq,
                     },
                 ) {
-                    self.flush_evicted_staged(oldest, ts, None);
+                    let next_pub_seq = Some(self.core.next_publish_seq());
+                    self.flush_evicted_staged(oldest, ts, next_pub_seq);
                 }
                 return;
             }
@@ -3348,7 +3362,7 @@ impl SupervisorInner {
     ) -> (u32, bool) {
         let t0 = Instant::now();
         if let Some(hook) = self.terminal_capture_test_hook.as_ref() {
-            hook(self);
+            hook(self, true);
         }
         // Fallback edge check for direct test mutations that bypassed `finish_action` /
         // `begin_action_inner`. Respects the 2 s `previous_action` window and checks
@@ -3420,6 +3434,9 @@ impl SupervisorInner {
             }
         }
         let elapsed_us = crate::diagnostics::tick::us(t0.elapsed());
+        if let Some(hook) = self.terminal_capture_test_hook.as_ref() {
+            hook(self, false);
+        }
         let total_us = self.last_phase_terminal_us.saturating_add(elapsed_us);
         self.last_phase_terminal_us = total_us;
         (total_us, captured_any)
@@ -6072,27 +6089,29 @@ impl SupervisorInner {
     }
 
     /// Attach a driver, bind tick-epilogue ownership of the single J7 `PosForce` emitter, and
-    /// cache its lock-free clock handle and initial driver state snapshot.
+    /// cache its lock-free clock handle and terminal-capture-only initial snapshot (without
+    /// mutating hardware park/torque-off interlock `last_poll_*` fields before the first poll).
     pub(crate) fn install_driver(&mut self, mut driver: Box<dyn ArmDriver>) {
         driver.set_estop_gate(self.estop_gate());
         driver.set_external_pos_force_emitter(true);
         self.driver_clock = driver.driver_clock();
-        self.driver_caps = driver.capabilities();
-        self.last_poll_enable_state = driver.enable_state();
-        self.last_poll_partial_enable = driver.has_known_partial_enable();
         let driver_valid = driver.is_feedback_valid();
         self.driver_feedback_confirmed_cached = driver_valid;
-        self.last_poll_feedback_valid = driver_valid;
         let poll_before = self.cached_driver_clock_now();
         let mut ages = Vec::with_capacity(self.config.dof);
         driver.feedback_ages_into(&mut ages);
         let all_ages = ages.len() == self.config.dof && ages.iter().all(Option::is_some);
-        self.last_poll_oldest_age = if all_ages {
-            ages.iter().flatten().copied().max()
-        } else {
-            None
+        self.capture_driver_cache = terminal_capture::CaptureDriverCache {
+            enable_state: driver.enable_state(),
+            driver_caps: driver.capabilities(),
+            feedback_valid: driver_valid,
+            oldest_age: if all_ages {
+                ages.iter().flatten().copied().max()
+            } else {
+                None
+            },
+            feedback_at: all_ages.then_some(poll_before),
         };
-        self.last_poll_feedback_at = all_ages.then_some(poll_before);
         self.driver = Some(std::sync::Mutex::new(driver));
     }
 
@@ -7554,21 +7573,25 @@ impl SupervisorInner {
                             let driver_valid = driver.is_feedback_valid();
                             self.driver_feedback_confirmed_cached = driver_valid;
                             let all_ages = sc.ages.len() == self.config.dof && sc.ages.iter().all(Option::is_some);
-                            self.driver_caps = driver.capabilities();
-                            self.last_poll_enable_state = driver.enable_state();
-                            self.last_poll_partial_enable = driver.has_known_partial_enable();
-                            self.last_poll_feedback_valid = driver_valid && self.feedback_numeric_valid;
-                            if self.feedback_numeric_valid {
-                                self.last_poll_oldest_age = if all_ages {
-                                    sc.ages.iter().flatten().copied().max()
-                                } else {
-                                    None
-                                };
-                                self.last_poll_feedback_at = all_ages.then_some(poll_before);
+                            let oldest_age = if all_ages {
+                                sc.ages.iter().flatten().copied().max()
                             } else {
-                                self.last_poll_oldest_age = None;
-                                self.last_poll_feedback_at = None;
-                            }
+                                None
+                            };
+                            let caps = driver.capabilities();
+                            let enable_state = driver.enable_state();
+                            self.driver_caps = caps;
+                            self.last_poll_enable_state = enable_state;
+                            self.last_poll_partial_enable = driver.has_known_partial_enable();
+                            self.last_poll_feedback_valid = driver_valid;
+                            self.last_poll_oldest_age = oldest_age;
+                            self.capture_driver_cache = terminal_capture::CaptureDriverCache {
+                                enable_state,
+                                driver_caps: caps,
+                                feedback_valid: driver_valid && self.feedback_numeric_valid,
+                                oldest_age: if self.feedback_numeric_valid { oldest_age } else { None },
+                                feedback_at: (self.feedback_numeric_valid && all_ages).then_some(poll_before),
+                            };
                             let all_fresh_age = sc.ages.len() == self.config.dof
                                 && sc.ages.iter().all(|a| a.is_some_and(|age| age <= Duration::from_millis(250)));
                             if self.feedback_numeric_valid && sc.ages.len() == self.config.dof && driver_valid {
@@ -7624,8 +7647,10 @@ impl SupervisorInner {
                             self.last_can_feedback_instant = None;
                             self.last_poll_feedback_valid = false;
                             self.last_poll_oldest_age = None;
-                            self.last_poll_feedback_at = None;
-                            self.last_poll_enable_state = driver.enable_state();
+                            self.capture_driver_cache.enable_state = driver.enable_state();
+                            self.capture_driver_cache.feedback_valid = false;
+                            self.capture_driver_cache.oldest_age = None;
+                            self.capture_driver_cache.feedback_at = None;
                             self.thermal_cooldown.reset();
                             out.reset_stillness_on_read_err = true;
                         }
@@ -7666,10 +7691,10 @@ impl SupervisorInner {
                 Err(_) => {
                     self.driver_feedback_confirmed_cached = false;
                     self.last_can_feedback_instant = None;
-                    self.last_poll_feedback_valid = false;
-                    self.last_poll_oldest_age = None;
-                    self.last_poll_feedback_at = None;
-                    self.last_poll_enable_state = EnableState::Unknown;
+                    self.capture_driver_cache.enable_state = EnableState::Unknown;
+                    self.capture_driver_cache.feedback_valid = false;
+                    self.capture_driver_cache.oldest_age = None;
+                    self.capture_driver_cache.feedback_at = None;
                     self.thermal_cooldown.reset();
                     out.reset_stillness_on_read_err = true;
                 }
@@ -14991,7 +15016,8 @@ fn dispatch_loop(
         false,
     );
     if terminals.has_pending() {
-        let _ = terminals.drain_all(final_snap.as_ref().map_or(template_obs, |s| &s.obs), u64::MAX);
+        let final_seq = final_snap.as_ref().map_or(0, |s| s.meta.seq);
+        let _ = terminals.drain_all(final_snap.as_ref().map_or(template_obs, |s| &s.obs), final_seq);
     }
 }
 

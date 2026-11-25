@@ -1556,8 +1556,8 @@ fn terminal_capture_action_completion_dwell_saturation_and_positive_control_zero
                 //     and verify BOTH `lock_alloc_calls` (moved `alloc::take()`) AND monotonic counts fail.
                 let fired = Arc::new(AtomicUsize::new(0));
                 let fired_c = Arc::clone(&fired);
-                sup.inner().write().await.terminal_capture_test_hook = Some(Arc::new(move |_| {
-                    if fired_c.fetch_add(1, Ordering::AcqRel) == 0 {
+                sup.inner().write().await.terminal_capture_test_hook = Some(Arc::new(move |_, entering| {
+                    if entering && fired_c.fetch_add(1, Ordering::AcqRel) == 0 {
                         let b = Box::new([0xA5u8; 128]);
                         std::hint::black_box(&b);
                         drop(b);
@@ -1604,8 +1604,8 @@ fn terminal_capture_action_completion_dwell_saturation_and_positive_control_zero
 
         let hook_arm = Arc::new(AtomicBool::new(false));
         let hook_arm_c = Arc::clone(&hook_arm);
-        sup.inner().write().await.terminal_capture_test_hook = Some(Arc::new(move |_| {
-            if hook_arm_c.swap(false, Ordering::AcqRel) {
+        sup.inner().write().await.terminal_capture_test_hook = Some(Arc::new(move |_, entering| {
+            if entering && hook_arm_c.swap(false, Ordering::AcqRel) {
                 let b = Box::new(0x55AA_u64);
                 std::hint::black_box(&b);
                 drop(b);
