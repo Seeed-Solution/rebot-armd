@@ -451,6 +451,26 @@ pub fn commit_policy(
     }
 }
 
+fn policy_admission_stamp(d: &Descriptor, admission_request_id: u64) -> AdmissionStamp {
+    if admission_request_id != 0 {
+        AdmissionStamp {
+            stop_gen: d.stamp.authority.stop_generation,
+            estop_epoch: d.stamp.authority.epoch,
+            lease_gen: d.stamp.authority.lease_generation,
+            connection_id: d.stamp.client.0,
+            request_id: admission_request_id,
+        }
+    } else {
+        AdmissionStamp::from_broker_conn(
+            d.stamp.authority.stop_generation,
+            d.stamp.authority.epoch,
+            d.stamp.authority.lease_generation,
+            d.stamp.client.0,
+            d.stamp.request.0,
+        )
+    }
+}
+
 fn install_reserve_load(
     inner: &mut SupervisorInner,
     d: &Descriptor,
@@ -471,13 +491,7 @@ fn install_reserve_load(
         return Err("DEADLINE_EXPIRED");
     }
     inner.sync_stop_generation(ctx.stop_generation);
-    let stamp = AdmissionStamp::from_broker_conn(
-        d.stamp.authority.stop_generation,
-        d.stamp.authority.epoch,
-        d.stamp.authority.lease_generation,
-        d.stamp.client.0,
-        spec.admission_request_id,
-    );
+    let stamp = policy_admission_stamp(d, spec.admission_request_id);
     inner
         .preflight_admission(stamp)
         .map_err(|e| crate::supervisor::targets::safety_code(&e))?;
@@ -604,13 +618,7 @@ fn install_begin_policy_body(
     }
 
     inner.sync_stop_generation(ctx.stop_generation);
-    let stamp = AdmissionStamp::from_broker_conn(
-        d.stamp.authority.stop_generation,
-        d.stamp.authority.epoch,
-        d.stamp.authority.lease_generation,
-        d.stamp.client.0,
-        spec.admission_request_id,
-    );
+    let stamp = policy_admission_stamp(d, spec.admission_request_id);
     let prev_j7_stamp = inner.j7_admitted_stamp;
     let admitted = inner
         .check_admission(stamp)

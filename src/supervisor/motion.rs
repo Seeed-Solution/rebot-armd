@@ -1051,9 +1051,7 @@ impl SupervisorInner {
         if self.config.active_tool.commissioning_required { return Err("COMMISSIONING_REQUIRED"); }
         if self.core.motion_inhibited_by_config() { return Err("CONFIG_BUSY"); }
         if self.gravity_comp.is_some() { return Err("MOTION_BUSY"); }
-        // When MIT tracking is configured on a torqued arm, defer remaining checks to
-        // `jog_action_slice` so `mit_motion_blocker()` keeps its exact precedence.
-        if self.is_torqued && self.config.joint_tracking.is_some() { return Ok(()); }
+        if self.mit_motion_blocked() { return Err("MOTION_BUSY"); }
         #[cfg(feature = "policy-runtime")]
         if self.policy_loading || self.policy_run.is_some() { return Err("MOTION_BUSY"); }
         if self.collision.hold.is_some() { return Err("COLLISION_HOLD"); }
