@@ -1117,7 +1117,7 @@ fn verify_ticket_in_critical_section(
     Ok(live_hub.now_armd_ms)
 }
 
-fn verify_embedding_release_gate(
+pub(crate) fn verify_embedding_release_gate(
     gate: &VerifiedReleaseGate,
     emb: &VideoEmbeddingSpec,
 ) -> Result<(), String> {
@@ -1607,6 +1607,1209 @@ pub fn spawn_policy_runner(
             ) {
                 tracing::info!("Policy runner {action_id} exited on step: {e}");
                 break;
+            }
+        }
+    })
+}
+
+/// Parameters for the RT-executor off-thread policy runner (`OWNER_EXECUTOR`).
+#[cfg(not(target_arch = "wasm32"))]
+pub struct ExecutorPolicyRunParams {
+    pub supervisor: Arc<ArmSupervisor>,
+    pub handle: crate::rt_core::executor::RtExecutorHandle,
+    pub client: crate::rt_core::broker::ClientId,
+    pub action_id: u64,
+    pub lease_generation: u64,
+    pub epoch_id: u64,
+    pub mode: PolicyMode,
+    pub prepared: PreparedPolicy,
+    pub fps: f64,
+    pub deadline: Option<Instant>,
+    pub vision_source: Option<Arc<dyn PolicyVisionSource>>,
+    pub sandbox: Option<Arc<crate::api::sandbox::SandboxState>>,
+    pub verified_release_gate: Option<VerifiedReleaseGate>,
+    pub policy_live_allowed: bool,
+    pub has_driver: bool,
+    pub token_guard: crate::rt_core::requests::policy::PolicyTokenGuard,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+enum ExecutorCommitOutcome {
+    Continue,
+    Hold,
+    RtEnded,
+    Finish(&'static str),
+    Fail { reason: &'static str, message: String },
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::too_many_arguments)]
+async fn send_executor_end_policy(
+    handle: &crate::rt_core::executor::RtExecutorHandle,
+    supervisor: &ArmSupervisor,
+    client: crate::rt_core::broker::ClientId,
+    client_seq: &mut u64,
+    lease_generation: u64,
+    epoch_id: u64,
+    token_guard: &crate::rt_core::requests::policy::PolicyTokenGuard,
+    spec: crate::rt_core::requests::policy::EndPolicySpec,
+) -> bool {
+    use crate::rt_core::broker::{AdmitError, Authority, Reply};
+    use crate::rt_core::executor::BrokerDispatchError;
+    use crate::rt_core::requests::policy::PolicyCommand;
+
+    for attempt in 0..12u32 {
+        *client_seq = client_seq.wrapping_add(1);
+        let authority = Authority {
+            lease_generation,
+            epoch: epoch_id,
+            stop_generation: supervisor.current_stop_gen(),
+            config_revision: 0,
+            parent_generation: 0,
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        match handle
+            .submit_policy_command_async(
+                client,
+                *client_seq,
+                authority,
+                deadline,
+                PolicyCommand::EndPolicy(spec),
+                |req_id| token_guard.record_admitted_req(req_id.0),
+            )
+            .await
+        {
+            Ok(Reply::Ack { .. }) => return true,
+            Ok(Reply::Refused { code, .. })
+                if matches!(
+                    code,
+                    "POLICY_NOT_ACTIVE" | "LEASE_LOST" | "EPOCH_MISMATCH" | "STOPPED"
+                ) =>
+            {
+                return true;
+            }
+            Ok(Reply::Refused { .. } | Reply::Lease { .. } | Reply::Terminal { .. }) => {
+                return false;
+            }
+            Err(BrokerDispatchError::Admit(
+                AdmitError::CommandsFull | AdmitError::RepliesFull,
+            )) if attempt + 1 < 12 => {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Err(
+                BrokerDispatchError::Admit(AdmitError::Disconnected)
+                | BrokerDispatchError::Stopped,
+            ) => return true,
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+/// Single post-inference commit gate for the RT-executor policy runner: checks deadline,
+/// detector staleness & generation, deployment/release-gate binding, `InferenceTicket` under
+/// `HubCommitGuard`, and then either updates off-RT Shadow diagnostics (0 mailbox submissions)
+/// or submits one live frame synchronously via `TargetPort::submit_policy`.
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::too_many_arguments)]
+async fn executor_commit_gate(
+    supervisor: &ArmSupervisor,
+    handle: &crate::rt_core::executor::RtExecutorHandle,
+    action_id: u64,
+    lease_generation: u64,
+    mode: PolicyMode,
+    deadline: Option<Instant>,
+    max_input_age: Duration,
+    video_embedding_spec: Option<&VideoEmbeddingSpec>,
+    vision_spec: Option<&super::manifest::VisionFeatureSpec>,
+    embedding_hub: Option<&Arc<VideoEmbeddingHub>>,
+    collector: Option<&VisionFeatureCollector>,
+    locked_generation: Option<u64>,
+    verified_release_gate: Option<&VerifiedReleaseGate>,
+    sandbox: Option<&Arc<crate::api::sandbox::SandboxState>>,
+    snap_authority: crate::rt_core::broker::Authority,
+    snap_auth_gen: u64,
+    oldest_input_at: Instant,
+    base_input_age_ms: Option<u64>,
+    captured_at: Instant,
+    vision_captured_at: Option<Instant>,
+    vision_frame_id: Option<u64>,
+    emb_ticket: Option<&InferenceTicket>,
+    emb_mapped_and_unc_ms: Option<(u64, u64)>,
+    target: Vec<f32>,
+    infer_us: u64,
+    step_us: u64,
+    shadow_steps: &mut u64,
+    step_stats: &mut PolicyStepStats,
+) -> ExecutorCommitOutcome {
+    use crate::rt_core::mailbox::Submitted;
+    use crate::rt_core::publish::PolicyDiagUpdate;
+    use crate::supervisor::targets::{PolicyStamp, PolicyTarget};
+
+    if let Some(dl) = deadline {
+        if Instant::now() >= dl {
+            return ExecutorCommitOutcome::Finish("MAX_SECONDS");
+        }
+    }
+
+    let detector_post_vision_age_ms = if video_embedding_spec.is_none() {
+        let post_age = if let (Some(spec), Some(vis_cap)) = (vision_spec, vision_captured_at) {
+            let age_ms = Instant::now()
+                .saturating_duration_since(vis_cap)
+                .as_millis()
+                .min(u64::MAX as u128) as u64;
+            if age_ms > spec.max_staleness_ms {
+                return match spec.on_stale {
+                    VisionStalePolicy::Stop => ExecutorCommitOutcome::Fail {
+                        reason: "VISION_STALE",
+                        message: format!(
+                            "Vision frame became stale before step commit ({age_ms} ms > {} ms)",
+                            spec.max_staleness_ms
+                        ),
+                    },
+                    VisionStalePolicy::Hold => ExecutorCommitOutcome::Hold,
+                };
+            }
+            Some(age_ms)
+        } else {
+            None
+        };
+        if let (Some(spec), Some(col)) = (vision_spec, collector) {
+            if spec.require_model_generation {
+                if let Some(latest_frame) = col.latest() {
+                    if latest_frame.model_generation != locked_generation {
+                        let (reason, message) = match latest_frame.model_generation {
+                            None => (
+                                "VISION_GENERATION_MISSING",
+                                format!(
+                                    "Vision frame {} missing required model_generation before step commit",
+                                    latest_frame.frame_id
+                                ),
+                            ),
+                            Some(new_gen) => (
+                                "VISION_GENERATION_CHANGED",
+                                format!(
+                                    "Vision model generation changed from {} to {new_gen} before step commit",
+                                    locked_generation
+                                        .map_or_else(|| "none".to_string(), |g| g.to_string())
+                                ),
+                            ),
+                        };
+                        return ExecutorCommitOutcome::Fail { reason, message };
+                    }
+                }
+            }
+        }
+        post_age
+    } else {
+        None
+    };
+
+    if let Some(gate) = verified_release_gate {
+        if let Some(emb) = video_embedding_spec {
+            if let Err(msg) = verify_embedding_release_gate(gate, emb) {
+                return ExecutorCommitOutcome::Fail {
+                    reason: "RELEASE_GATE_INVALID",
+                    message: msg,
+                };
+            }
+        }
+        let (scene_id, tool_id) = match sandbox {
+            Some(s) => s.active_scene_and_tool().await,
+            None => (gate.scene_id().to_string(), gate.tool_id().to_string()),
+        };
+        let calibration_digest = supervisor
+            .published_config_hub()
+            .latest()
+            .map(|c| c.active_calibration_digest())
+            .unwrap_or_default();
+        let cur_ctx = super::release_gate::ActiveDeploymentContext {
+            scene_id,
+            tool_id,
+            calibration_digest,
+        };
+        if let Err(e) = gate.verify_deployment(&cur_ctx) {
+            return ExecutorCommitOutcome::Fail {
+                reason: "DEPLOYMENT_CHANGED",
+                message: e.to_string(),
+            };
+        }
+    }
+
+    // Synchronous critical section: hold `HubCommitGuard` across `InferenceTicket::verify`
+    // and immediate `TargetPort::submit_policy` (NO `.await` while held!).
+    let hub_guard = embedding_hub.map(|hub| hub.lock_for_commit());
+    let hold_on_stale =
+        video_embedding_spec.is_some_and(|s| s.on_stale == VisionStalePolicy::Hold);
+
+    let mirror_lease = supervisor.lease_generation();
+    let fenced_lease = supervisor.atomic_fenced_lease_gen();
+    let hub_active = supervisor.hub().latest().is_some_and(|s| {
+        s.obs
+            .policy
+            .as_ref()
+            .is_some_and(|p| p.active && p.action_id == action_id)
+    });
+    let live_lease = (hub_active
+        && mirror_lease == lease_generation
+        && fenced_lease < lease_generation)
+        .then_some(lease_generation);
+
+    let emb_commit_now_ms = if let (Some(ticket), Some(ref guard)) = (emb_ticket, &hub_guard) {
+        let live_hub = guard.live_ticket_state();
+        let ctx = TicketVerificationContext {
+            policy_instance_id: live_hub.policy_instance_id,
+            lease_generation: live_lease,
+            producer_epoch: live_hub.producer_epoch,
+            model_generation: live_hub.model_generation,
+            invalidation_generation: live_hub.invalidation_generation,
+            clock_handshake_generation: live_hub.clock_handshake_generation,
+            now_armd_ms: live_hub.now_armd_ms,
+        };
+        match ticket.verify(&ctx) {
+            Ok(()) => Some(live_hub.now_armd_ms),
+            Err(TicketViolation::ClockHandshakeGenerationMismatch { expected, actual }) => {
+                if actual != 0 && guard.is_unbroken_active_renewal(expected) {
+                    return ExecutorCommitOutcome::Hold;
+                }
+                let now_armd_ms = live_hub.now_armd_ms;
+                if now_armd_ms > ticket.clock_handshake_expires_at_ms() {
+                    let exp = TicketViolation::ClockHandshakeExpired {
+                        now_ms: now_armd_ms,
+                        expires_at_ms: ticket.clock_handshake_expires_at_ms(),
+                    };
+                    return ExecutorCommitOutcome::Fail {
+                        reason: exp.code(),
+                        message: exp.message(),
+                    };
+                }
+                let v = TicketViolation::ClockHandshakeGenerationMismatch { expected, actual };
+                return ExecutorCommitOutcome::Fail {
+                    reason: v.code(),
+                    message: v.message(),
+                };
+            }
+            Err(
+                TicketViolation::WindowNewestExpired { .. }
+                | TicketViolation::WindowOldestExpired { .. },
+            ) if hold_on_stale => {
+                return ExecutorCommitOutcome::Hold;
+            }
+            Err(violation) => {
+                return ExecutorCommitOutcome::Fail {
+                    reason: violation.code(),
+                    message: violation.message(),
+                };
+            }
+        }
+    } else {
+        None
+    };
+
+    let post_vision_age_ms = if let (Some(now_ms), Some((mapped_ms, unc_ms))) =
+        (emb_commit_now_ms, emb_mapped_and_unc_ms)
+    {
+        Some(now_ms.saturating_sub(mapped_ms).saturating_add(unc_ms))
+    } else {
+        detector_post_vision_age_ms
+    };
+    let input_age_ms = base_input_age_ms.map(|base| {
+        base.saturating_add(captured_at.elapsed().as_millis().min(u64::MAX as u128) as u64)
+    });
+
+    if mode == PolicyMode::Shadow {
+        drop(hub_guard);
+        if !hub_active || handle.is_policy_closed(action_id) {
+            return ExecutorCommitOutcome::RtEnded;
+        }
+        *shadow_steps = shadow_steps.saturating_add(1);
+        step_stats.record(infer_us, step_us);
+        supervisor.hub().update_policy_diag(PolicyDiagUpdate {
+            action_id,
+            is_shadow: true,
+            steps: *shadow_steps,
+            stats: step_stats.report(),
+            last_input_age_ms: input_age_ms,
+            last_vision_age_ms: post_vision_age_ms,
+            vision_frame_id,
+            last_shadow_target: Some(target),
+        });
+        return ExecutorCommitOutcome::Continue;
+    }
+
+    // Live mode: submit synchronously to `TargetPort::submit_policy` BEFORE dropping `hub_guard`.
+    if live_lease.is_none() || handle.is_policy_closed(action_id) {
+        drop(hub_guard);
+        return ExecutorCommitOutcome::RtEnded;
+    }
+    let vision_at = if let Some(age_ms) = post_vision_age_ms.filter(|_| video_embedding_spec.is_some()) {
+        Instant::now().checked_sub(Duration::from_millis(age_ms))
+    } else {
+        vision_captured_at
+    };
+    let policy_target = PolicyTarget {
+        action_id,
+        stamp: PolicyStamp {
+            authority: snap_authority,
+            authorization: snap_auth_gen,
+            max_input_age,
+        },
+        targets: &target,
+        input_at: oldest_input_at,
+        vision_at,
+        vision_frame_id,
+    };
+    let sub = handle.submit_policy(&policy_target);
+    drop(hub_guard);
+
+    match sub {
+        Submitted::Accepted | Submitted::Coalesced { .. } => {
+            step_stats.record(infer_us, step_us);
+            supervisor.hub().update_policy_diag(PolicyDiagUpdate {
+                action_id,
+                is_shadow: false,
+                steps: 0,
+                stats: step_stats.report(),
+                last_input_age_ms: None,
+                last_vision_age_ms: None,
+                vision_frame_id: None,
+                last_shadow_target: None,
+            });
+            ExecutorCommitOutcome::Continue
+        }
+        Submitted::Busy => {
+            step_stats.record_skipped();
+            supervisor.hub().update_policy_diag(PolicyDiagUpdate {
+                action_id,
+                is_shadow: false,
+                steps: 0,
+                stats: step_stats.report(),
+                last_input_age_ms: None,
+                last_vision_age_ms: None,
+                vision_frame_id: None,
+                last_shadow_target: None,
+            });
+            ExecutorCommitOutcome::Continue
+        }
+        Submitted::OutOfOrder => {
+            if handle.is_policy_closed(action_id) {
+                ExecutorCommitOutcome::RtEnded
+            } else {
+                ExecutorCommitOutcome::Fail {
+                    reason: "POLICY_FAILED",
+                    message: "Policy target stream closed or out of order".into(),
+                }
+            }
+        }
+        Submitted::StreamsFull => ExecutorCommitOutcome::Fail {
+            reason: "STREAMS_FULL",
+            message: "Target mailbox has too many open streams".into(),
+        },
+    }
+}
+
+/// Spawn the off-thread policy runner for `OWNER_EXECUTOR`: zero `SupervisorLock` reads,
+/// off-thread inference, `StateHub` input capture, synchronous `TargetPort::submit_policy`
+/// under `HubCommitGuard` for Live runs, off-RT `StateHub` diagnostics for Shadow runs (0
+/// mailbox submissions), and drop-safe `PolicyTokenGuard` ownership.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn spawn_executor_policy_runner(params: ExecutorPolicyRunParams) -> tokio::task::JoinHandle<()> {
+    use crate::model::HolderLabel;
+    use crate::rt_core::requests::policy::EndPolicySpec;
+
+    let ExecutorPolicyRunParams {
+        supervisor,
+        handle,
+        client,
+        action_id,
+        lease_generation,
+        epoch_id,
+        mode,
+        mut prepared,
+        fps,
+        deadline,
+        vision_source,
+        sandbox,
+        verified_release_gate,
+        policy_live_allowed,
+        has_driver,
+        mut token_guard,
+    } = params;
+
+    let clamped_fps = if fps.is_finite() && fps > 0.0 {
+        fps.clamp(MIN_POLICY_FPS, MAX_POLICY_FPS)
+    } else {
+        DEFAULT_POLICY_FPS
+    };
+    let period = Duration::from_secs_f64(1.0 / clamped_fps);
+    let max_input_age = Duration::from_millis(max_policy_input_age_ms(clamped_fps));
+    let tokio_dl = deadline.map(tokio::time::Instant::from_std);
+    let load_token = token_guard.token();
+
+    tokio::spawn(async move {
+        struct ClosePolicyGuard {
+            handle: crate::rt_core::executor::RtExecutorHandle,
+            action_id: u64,
+        }
+        impl Drop for ClosePolicyGuard {
+            fn drop(&mut self) {
+                self.handle.close_policy(self.action_id);
+            }
+        }
+        struct UnbindGuard {
+            hub: Arc<VideoEmbeddingHub>,
+            action_id: u64,
+        }
+        impl Drop for UnbindGuard {
+            fn drop(&mut self) {
+                self.hub.unbind_policy(self.action_id);
+            }
+        }
+
+        let _close_guard = ClosePolicyGuard {
+            handle: handle.clone(),
+            action_id,
+        };
+        let mut client_seq: u64 = 1u64 << 60;
+        let mut step_stats = PolicyStepStats::default();
+        step_stats.set_period_us(period_us_for_fps(clamped_fps));
+        let mut shadow_steps: u64 = 0;
+
+        let video_embedding_spec = prepared.contract().video_embedding.clone();
+        let vision_spec = prepared.contract().vision.clone();
+        let authorization = supervisor.rt_policy_authorization();
+
+        if video_embedding_spec.is_none() && vision_spec.is_some() && vision_source.is_none() {
+            if send_executor_end_policy(
+                &handle,
+                &supervisor,
+                client,
+                &mut client_seq,
+                lease_generation,
+                epoch_id,
+                &token_guard,
+                EndPolicySpec::Fail {
+                    action_id,
+                    load_token,
+                    lease_generation,
+                    reason: HolderLabel::new("VISION_UNAVAILABLE"),
+                    message: HolderLabel::new(
+                        "Policy requires vision input, but no vision source is available",
+                    ),
+                    final_steps: shadow_steps,
+                    final_stats: step_stats.report(),
+                },
+            )
+            .await
+            {
+                token_guard.disarm();
+            }
+            return;
+        }
+
+        if let (Some(ref emb), Some(ref gate)) = (&video_embedding_spec, &verified_release_gate) {
+            if let Err(msg) = verify_embedding_release_gate(gate, emb) {
+                if send_executor_end_policy(
+                    &handle,
+                    &supervisor,
+                    client,
+                    &mut client_seq,
+                    lease_generation,
+                    epoch_id,
+                    &token_guard,
+                    EndPolicySpec::Fail {
+                        action_id,
+                        load_token,
+                        lease_generation,
+                        reason: HolderLabel::new("RELEASE_GATE_INVALID"),
+                        message: HolderLabel::new(&msg),
+                        final_steps: shadow_steps,
+                        final_stats: step_stats.report(),
+                    },
+                )
+                .await
+                {
+                    token_guard.disarm();
+                }
+                return;
+            }
+        }
+
+        let embedding_hub = video_embedding_spec
+            .as_ref()
+            .map(|_| embedding_hub_for_supervisor(&supervisor));
+        let _unbind_guard = embedding_hub
+            .as_ref()
+            .zip(video_embedding_spec.as_ref())
+            .map(|(hub, spec)| {
+                hub.bind_policy(action_id, spec.clone(), clamped_fps);
+                hub.bind_target_authorization(action_id, authorization.clone());
+                UnbindGuard {
+                    hub: hub.clone(),
+                    action_id,
+                }
+            });
+        let emb_run_started_ms = embedding_hub.as_ref().map_or(0, |h| h.now_armd_ms());
+
+        let collector = if video_embedding_spec.is_none() {
+            vision_spec.as_ref().zip(vision_source).map(|(spec, src)| {
+                let wait_ms = (spec.max_staleness_ms / 4).clamp(10, 50);
+                VisionFeatureCollector::start(src, wait_ms)
+            })
+        } else {
+            None
+        };
+        let run_started_at = Instant::now();
+        let mut locked_generation: Option<u64> = None;
+        let mut locked_continuity_epoch: Option<u64> = embedding_hub
+            .as_ref()
+            .and_then(|h| h.active_continuity_epoch());
+
+        let mut interval = tokio::time::interval(period);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        let mut fallback_stop_reason = "STOPPED";
+        let mut fallback_action_state = "cancelled";
+
+        loop {
+            if let Some(dl) = tokio_dl {
+                tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep_until(dl) => {
+                        fallback_stop_reason = "MAX_SECONDS";
+                        fallback_action_state = "done";
+                        if send_executor_end_policy(
+                            &handle, &supervisor, client, &mut client_seq,
+                            lease_generation, epoch_id, &token_guard,
+                            EndPolicySpec::Finish {
+                                action_id,
+                                load_token,
+                                lease_generation,
+                                reason: HolderLabel::new("MAX_SECONDS"),
+                                final_steps: shadow_steps,
+                                final_stats: step_stats.report(),
+                            },
+                        ).await {
+                            token_guard.disarm();
+                        }
+                        break;
+                    }
+                    _ = interval.tick() => {}
+                }
+            } else {
+                interval.tick().await;
+            }
+            let step_started_at = Instant::now();
+            if let Some(dl) = deadline {
+                if Instant::now() >= dl {
+                    fallback_stop_reason = "MAX_SECONDS";
+                    fallback_action_state = "done";
+                    if send_executor_end_policy(
+                        &handle,
+                        &supervisor,
+                        client,
+                        &mut client_seq,
+                        lease_generation,
+                        epoch_id,
+                        &token_guard,
+                        EndPolicySpec::Finish {
+                            action_id,
+                            load_token,
+                            lease_generation,
+                            reason: HolderLabel::new("MAX_SECONDS"),
+                            final_steps: shadow_steps,
+                            final_stats: step_stats.report(),
+                        },
+                    )
+                    .await
+                    {
+                        token_guard.disarm();
+                    }
+                    break;
+                }
+            }
+
+            let _outcomes = handle.drain_policy_outcomes(action_id);
+            if handle.is_policy_closed(action_id) {
+                token_guard.disarm();
+                break;
+            }
+            let Some(snap) = supervisor.hub().latest() else {
+                continue;
+            };
+            let active_matches = snap
+                .obs
+                .policy
+                .as_ref()
+                .is_some_and(|p| p.active && p.action_id == action_id);
+            if !active_matches {
+                token_guard.disarm();
+                break;
+            }
+
+            let captured_at = Instant::now();
+            let measured = snap.rt.positions.clone();
+            let snap_authority = snap.rt.owner.authority;
+            let snap_auth_gen = authorization.current();
+            let dof = prepared.contract().action_dim;
+
+            let (oldest_input_at, prop_age_range_ms) = if has_driver {
+                let all_present = snap.rt.feedback_instants.len() == dof
+                    && snap.rt.feedback_instants.iter().all(Option::is_some);
+                if all_present {
+                    let mut oldest = captured_at;
+                    let mut newest: Option<Instant> = None;
+                    for t in snap.rt.feedback_instants.iter().flatten().copied() {
+                        if t < oldest {
+                            oldest = t;
+                        }
+                        newest = Some(match newest {
+                            Some(n) if n >= t => n,
+                            _ => t,
+                        });
+                    }
+                    let min_ms = newest.map_or(0, |n| {
+                        captured_at
+                            .saturating_duration_since(n)
+                            .as_millis()
+                            .min(u64::MAX as u128) as u64
+                    });
+                    let max_ms = captured_at
+                        .saturating_duration_since(oldest)
+                        .as_millis()
+                        .min(u64::MAX as u128) as u64;
+                    (oldest, Some((min_ms, max_ms)))
+                } else if mode == PolicyMode::Live && !policy_live_allowed {
+                    fallback_stop_reason = "STALE_INPUT";
+                    fallback_action_state = "failed";
+                    if send_executor_end_policy(
+                        &handle,
+                        &supervisor,
+                        client,
+                        &mut client_seq,
+                        lease_generation,
+                        epoch_id,
+                        &token_guard,
+                        EndPolicySpec::Fail {
+                            action_id,
+                            load_token,
+                            lease_generation,
+                            reason: HolderLabel::new("STALE_INPUT"),
+                            message: HolderLabel::new(
+                                "Real-arm joint feedback timestamp unavailable",
+                            ),
+                            final_steps: shadow_steps,
+                            final_stats: step_stats.report(),
+                        },
+                    )
+                    .await
+                    {
+                        token_guard.disarm();
+                    }
+                    break;
+                } else {
+                    (captured_at, None)
+                }
+            } else {
+                (captured_at, Some((0, 0)))
+            };
+            let base_input_age_ms = prop_age_range_ms.map(|(_, hi)| hi);
+            let snap_lease_gen = (snap_authority.lease_generation == lease_generation
+                && supervisor.lease_generation() == lease_generation
+                && supervisor.atomic_fenced_lease_gen() < lease_generation)
+                .then_some(lease_generation);
+
+            let (
+                vision_features,
+                vision_captured_at,
+                vision_frame_id,
+                emb_ticket,
+                emb_mapped_and_unc_ms,
+            ) = if let (Some(emb_spec), Some(hub)) = (&video_embedding_spec, &embedding_hub) {
+                let Some(lease_gen) = snap_lease_gen else {
+                    fallback_stop_reason = "LEASE_LOST";
+                    fallback_action_state = "failed";
+                    if send_executor_end_policy(
+                        &handle,
+                        &supervisor,
+                        client,
+                        &mut client_seq,
+                        lease_generation,
+                        epoch_id,
+                        &token_guard,
+                        EndPolicySpec::Fail {
+                            action_id,
+                            load_token,
+                            lease_generation,
+                            reason: HolderLabel::new("LEASE_LOST"),
+                            message: HolderLabel::new(
+                                "Control lease lost or expired before embedding step",
+                            ),
+                            final_steps: shadow_steps,
+                            final_stats: step_stats.report(),
+                        },
+                    )
+                    .await
+                    {
+                        token_guard.disarm();
+                    }
+                    break;
+                };
+                match hub.sample_window_with_continuity(
+                    emb_spec,
+                    emb_run_started_ms,
+                    locked_continuity_epoch,
+                ) {
+                    EmbeddingSampleDecision::Ready(win) => {
+                        locked_continuity_epoch.get_or_insert(win.handshake_continuity_epoch);
+                        let ticket = InferenceTicket::new(
+                            action_id,
+                            lease_gen,
+                            win.producer_epoch,
+                            win.model_generation,
+                            win.invalidation_generation,
+                            win.clock_handshake_generation,
+                            win.clock_handshake_expires_at_ms,
+                            win.window_newest_deadline_ms,
+                            win.window_oldest_deadline_ms,
+                        );
+                        (
+                            Some(win.features),
+                            None,
+                            Some(win.newest_frame_id),
+                            Some(ticket),
+                            Some((win.newest_oldest_mapped_at_ms, win.effective_uncertainty_ms)),
+                        )
+                    }
+                    EmbeddingSampleDecision::Hold => {
+                        authorization.revoke();
+                        let _ = send_executor_end_policy(
+                            &handle,
+                            &supervisor,
+                            client,
+                            &mut client_seq,
+                            lease_generation,
+                            epoch_id,
+                            &token_guard,
+                            EndPolicySpec::Hold {
+                                action_id,
+                                load_token,
+                                lease_generation,
+                            },
+                        )
+                        .await;
+                        continue;
+                    }
+                    EmbeddingSampleDecision::Stop { reason, message } => {
+                        fallback_stop_reason = reason;
+                        fallback_action_state = "failed";
+                        if send_executor_end_policy(
+                            &handle,
+                            &supervisor,
+                            client,
+                            &mut client_seq,
+                            lease_generation,
+                            epoch_id,
+                            &token_guard,
+                            EndPolicySpec::Fail {
+                                action_id,
+                                load_token,
+                                lease_generation,
+                                reason: HolderLabel::new(reason),
+                                message: HolderLabel::new(&message),
+                                final_steps: shadow_steps,
+                                final_stats: step_stats.report(),
+                            },
+                        )
+                        .await
+                        {
+                            token_guard.disarm();
+                        }
+                        break;
+                    }
+                }
+            } else if let (Some(spec), Some(col)) = (&vision_spec, &collector) {
+                let frame = col.latest();
+                let now = Instant::now();
+                let prop_elapsed_ms = now
+                    .saturating_duration_since(captured_at)
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64;
+                let synced_prop_age_range_ms = prop_age_range_ms.map(|(lo, hi)| {
+                    (
+                        lo.saturating_add(prop_elapsed_ms),
+                        hi.saturating_add(prop_elapsed_ms),
+                    )
+                });
+                match evaluate_vision_frame(
+                    frame.as_ref(),
+                    spec,
+                    run_started_at,
+                    now,
+                    synced_prop_age_range_ms,
+                    &mut locked_generation,
+                ) {
+                    VisionStepDecision::Ready {
+                        features,
+                        vision_age_ms: _,
+                        frame_id,
+                    } => (
+                        Some(features.to_vec()),
+                        frame.as_ref().and_then(|f| f.captured_at),
+                        Some(frame_id),
+                        None,
+                        None,
+                    ),
+                    VisionStepDecision::Hold => {
+                        authorization.revoke();
+                        let _ = send_executor_end_policy(
+                            &handle,
+                            &supervisor,
+                            client,
+                            &mut client_seq,
+                            lease_generation,
+                            epoch_id,
+                            &token_guard,
+                            EndPolicySpec::Hold {
+                                action_id,
+                                load_token,
+                                lease_generation,
+                            },
+                        )
+                        .await;
+                        continue;
+                    }
+                    VisionStepDecision::Stop { reason, message } => {
+                        fallback_stop_reason = reason;
+                        fallback_action_state = "failed";
+                        if send_executor_end_policy(
+                            &handle,
+                            &supervisor,
+                            client,
+                            &mut client_seq,
+                            lease_generation,
+                            epoch_id,
+                            &token_guard,
+                            EndPolicySpec::Fail {
+                                action_id,
+                                load_token,
+                                lease_generation,
+                                reason: HolderLabel::new(reason),
+                                message: HolderLabel::new(&message),
+                                final_steps: shadow_steps,
+                                final_stats: step_stats.report(),
+                            },
+                        )
+                        .await
+                        {
+                            token_guard.disarm();
+                        }
+                        break;
+                    }
+                }
+            } else {
+                (None, None, None, None, None)
+            };
+
+            let infer_handle = tokio::task::spawn_blocking(move || {
+                let t0 = Instant::now();
+                let res =
+                    prepared.step_infer_with_vision(&measured, vision_features.as_deref());
+                let infer_us = t0.elapsed().as_micros().min(u64::MAX as u128) as u64;
+                (prepared, res.map(|t| (t, infer_us)))
+            });
+            let infer_result = if let Some(dl) = tokio_dl {
+                tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep_until(dl) => {
+                        fallback_stop_reason = "MAX_SECONDS";
+                        fallback_action_state = "done";
+                        if send_executor_end_policy(
+                            &handle, &supervisor, client, &mut client_seq,
+                            lease_generation, epoch_id, &token_guard,
+                            EndPolicySpec::Finish {
+                                action_id,
+                                load_token,
+                                lease_generation,
+                                reason: HolderLabel::new("MAX_SECONDS"),
+                                final_steps: shadow_steps,
+                                final_stats: step_stats.report(),
+                            },
+                        ).await {
+                            token_guard.disarm();
+                        }
+                        break;
+                    }
+                    res = infer_handle => res,
+                }
+            } else {
+                infer_handle.await
+            };
+
+            let (target, infer_us) = match infer_result {
+                Err(e) => {
+                    tracing::warn!("Policy inference task failed for action {action_id}: {e}");
+                    fallback_stop_reason = "INFERENCE_ERROR";
+                    fallback_action_state = "failed";
+                    if send_executor_end_policy(
+                        &handle,
+                        &supervisor,
+                        client,
+                        &mut client_seq,
+                        lease_generation,
+                        epoch_id,
+                        &token_guard,
+                        EndPolicySpec::Fail {
+                            action_id,
+                            load_token,
+                            lease_generation,
+                            reason: HolderLabel::new("INFERENCE_ERROR"),
+                            message: HolderLabel::new(&format!("inference task failed: {e}")),
+                            final_steps: shadow_steps,
+                            final_stats: step_stats.report(),
+                        },
+                    )
+                    .await
+                    {
+                        token_guard.disarm();
+                    }
+                    break;
+                }
+                Ok((p, res)) => {
+                    prepared = p;
+                    match res {
+                        Ok(t) => t,
+                        Err(e) => {
+                            tracing::warn!("Policy inference failed for action {action_id}: {e}");
+                            let reason = match e {
+                                PolicyError::NonFinite(_) => "NON_FINITE",
+                                _ => "INFERENCE_ERROR",
+                            };
+                            fallback_stop_reason = reason;
+                            fallback_action_state = "failed";
+                            if send_executor_end_policy(
+                                &handle,
+                                &supervisor,
+                                client,
+                                &mut client_seq,
+                                lease_generation,
+                                epoch_id,
+                                &token_guard,
+                                EndPolicySpec::Fail {
+                                    action_id,
+                                    load_token,
+                                    lease_generation,
+                                    reason: HolderLabel::new(reason),
+                                    message: HolderLabel::new(&e.to_string()),
+                                    final_steps: shadow_steps,
+                                    final_stats: step_stats.report(),
+                                },
+                            )
+                            .await
+                            {
+                                token_guard.disarm();
+                            }
+                            break;
+                        }
+                    }
+                }
+            };
+
+            let step_us = step_started_at
+                .elapsed()
+                .as_micros()
+                .min(u64::MAX as u128) as u64;
+            match executor_commit_gate(
+                &supervisor,
+                &handle,
+                action_id,
+                lease_generation,
+                mode,
+                deadline,
+                max_input_age,
+                video_embedding_spec.as_ref(),
+                vision_spec.as_ref(),
+                embedding_hub.as_ref(),
+                collector.as_ref(),
+                locked_generation,
+                verified_release_gate.as_ref(),
+                sandbox.as_ref(),
+                snap_authority,
+                snap_auth_gen,
+                oldest_input_at,
+                base_input_age_ms,
+                captured_at,
+                vision_captured_at,
+                vision_frame_id,
+                emb_ticket.as_ref(),
+                emb_mapped_and_unc_ms,
+                target,
+                infer_us,
+                step_us,
+                &mut shadow_steps,
+                &mut step_stats,
+            )
+            .await
+            {
+                ExecutorCommitOutcome::Continue => {}
+                ExecutorCommitOutcome::Hold => {
+                    authorization.revoke();
+                    let _ = send_executor_end_policy(
+                        &handle,
+                        &supervisor,
+                        client,
+                        &mut client_seq,
+                        lease_generation,
+                        epoch_id,
+                        &token_guard,
+                        EndPolicySpec::Hold {
+                            action_id,
+                            load_token,
+                            lease_generation,
+                        },
+                    )
+                    .await;
+                }
+                ExecutorCommitOutcome::RtEnded => {
+                    token_guard.disarm();
+                    break;
+                }
+                ExecutorCommitOutcome::Finish(reason) => {
+                    fallback_stop_reason = reason;
+                    fallback_action_state = "done";
+                    if send_executor_end_policy(
+                        &handle,
+                        &supervisor,
+                        client,
+                        &mut client_seq,
+                        lease_generation,
+                        epoch_id,
+                        &token_guard,
+                        EndPolicySpec::Finish {
+                            action_id,
+                            load_token,
+                            lease_generation,
+                            reason: HolderLabel::new(reason),
+                            final_steps: shadow_steps,
+                            final_stats: step_stats.report(),
+                        },
+                    )
+                    .await
+                    {
+                        token_guard.disarm();
+                    }
+                    break;
+                }
+                ExecutorCommitOutcome::Fail { reason, message } => {
+                    fallback_stop_reason = reason;
+                    fallback_action_state = "failed";
+                    if send_executor_end_policy(
+                        &handle,
+                        &supervisor,
+                        client,
+                        &mut client_seq,
+                        lease_generation,
+                        epoch_id,
+                        &token_guard,
+                        EndPolicySpec::Fail {
+                            action_id,
+                            load_token,
+                            lease_generation,
+                            reason: HolderLabel::new(reason),
+                            message: HolderLabel::new(&message),
+                            final_steps: shadow_steps,
+                            final_stats: step_stats.report(),
+                        },
+                    )
+                    .await
+                    {
+                        token_guard.disarm();
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Off-thread device qualification ledger append for supervised first runs on real arms.
+        if mode == PolicyMode::Live && !policy_live_allowed {
+            if let Some(ref gate) = verified_release_gate {
+                if gate.authorization_tier() == super::release_gate::AuthorizationTier::SupervisedFirstRun
+                {
+                    if let Some(ledger_path) = supervisor
+                        .published_config_hub()
+                        .latest()
+                        .and_then(|c| c.policy_ledger_path.clone())
+                    {
+                        let snap = supervisor.hub().latest();
+                        let (final_steps, final_reason, final_state) = snap.as_ref().map_or_else(
+                            || {
+                                (
+                                    step_stats.report().steps,
+                                    fallback_stop_reason.to_string(),
+                                    fallback_action_state.to_string(),
+                                )
+                            },
+                            |s| {
+                                let (steps, reason) = s
+                                    .obs
+                                    .policy
+                                    .as_ref()
+                                    .filter(|p| p.action_id == action_id)
+                                    .map_or_else(
+                                        || {
+                                            (
+                                                step_stats.report().steps,
+                                                fallback_stop_reason.to_string(),
+                                            )
+                                        },
+                                        |p| {
+                                            (
+                                                p.steps,
+                                                p.stop_reason
+                                                    .as_ref()
+                                                    .map(|r| r.as_str().to_string())
+                                                    .unwrap_or_else(|| {
+                                                        fallback_stop_reason.to_string()
+                                                    }),
+                                            )
+                                        },
+                                    );
+                                let state = s
+                                    .obs
+                                    .action
+                                    .as_ref()
+                                    .filter(|a| a.id == action_id)
+                                    .or_else(|| {
+                                        s.obs
+                                            .previous_action
+                                            .as_ref()
+                                            .filter(|a| a.id == action_id)
+                                    })
+                                    .map(|a| a.state.as_str().to_string())
+                                    .unwrap_or_else(|| fallback_action_state.to_string());
+                                (steps, reason, state)
+                            },
+                        );
+                        let passed = final_reason == "MAX_SECONDS" && final_state == "done";
+                        let record = super::qualification::QualificationRecord::for_run(
+                            gate,
+                            action_id,
+                            final_steps,
+                            &final_reason,
+                            passed,
+                        )
+                        .with_policy_stats(step_stats.report());
+                        let _ = tokio::task::spawn_blocking(move || {
+                            if let Err(e) = super::qualification::append_record(&ledger_path, &record) {
+                                tracing::warn!(
+                                    "Failed to append policy qualification record to {}: {e}",
+                                    ledger_path.display()
+                                );
+                            }
+                        })
+                        .await;
+                    }
+                }
             }
         }
     })

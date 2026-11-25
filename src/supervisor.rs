@@ -10778,6 +10778,19 @@ impl ArmSupervisor {
         &self.policy_cancel_slots
     }
 
+    /// Lock-free `policy_live_allowed` query on `OWNER_EXECUTOR` (reads `PublishedConfig`),
+    /// preserving the legacy read-lock path on `OWNER_LEGACY`.
+    #[cfg(feature = "policy-runtime")]
+    pub async fn policy_live_allowed_off_lock(&self) -> bool {
+        if self.owner_mode() == OWNER_EXECUTOR {
+            self.published_config
+                .latest()
+                .is_some_and(|c| c.policy_live_allowed)
+        } else {
+            self.inner.read().await.policy_live_allowed()
+        }
+    }
+
     /// The current observation, without the supervisor lock while the control loop runs
     /// (`GET /api/v1/observation`).
     pub async fn observation(&self) -> Result<ArmObservation, ArmError> {

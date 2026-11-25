@@ -2722,6 +2722,35 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         }
                         continue;
                     }
+                    #[cfg(feature = "policy-runtime")]
+                    if let Some(opt_reply) = policy::handle_executor_ws_policy(
+                        frame_kind,
+                        entry,
+                        &value,
+                        stamp,
+                        recv_conn_id,
+                        &recv_connection,
+                        &recv_generation,
+                        &recv_client_label,
+                        &mut last_ordinary_request,
+                        &ws_auth,
+                        &recv_supervisor,
+                        &recv_sandbox,
+                        &recv_deps,
+                        &ack_tx,
+                        &worker_ws_closed,
+                        &pending_policy_loads,
+                        &worker_tasks,
+                    )
+                    .await
+                    {
+                        if let Some(reply) = opt_reply {
+                            if !worker_writer.send_ordinary_control(reply).await {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
                 }
                 if let Some(reply) = executor_routing_reject(&value, owner_mode) {
                     if !worker_writer.send_ordinary_control(reply).await { break; }
