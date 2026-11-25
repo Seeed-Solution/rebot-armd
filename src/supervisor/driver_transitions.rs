@@ -3297,6 +3297,59 @@ impl SupervisorInner {
         Ok(self.safety.state().clone())
     }
 
+    /// Post-park-settle (`NormalUnload`) torque-off (B3): treated as an ordinary stopped disable.
+    /// Must pass BOTH the resting-pose static check and the authoritative K=3 rest-pose gate
+    /// (`eval_stopped_torque_off` + driver choke point with `rollback: true`), recording
+    /// `torque_intent = Off` strictly by decision once accepted. If the gate refuses, holds
+    /// continue (`torque_intent == On`) and the refusal is returned to the caller.
+    pub(super) fn torque_off_after_unload_settle(&mut self) -> Result<SafetyState, SafetyError> {
+        match self.eval_stopped_torque_off() {
+            Ok(()) => {}
+            Err(crate::supervisor::StoppedTorqueOffRefusal::StaleOrMissingFeedback)
+                if self.can_defer_stopped_disable_to_driver() =>
+            {
+                self.last_stopped_torque_off_refusal = None;
+            }
+            Err(r) => return Err(r.into_safety_error(&self.config.joint_names)),
+        }
+        if let Some(reason) = self.resting_pose_static_violation() {
+            tracing::warn!("Unload settle torque off refused, not at resting pose: {reason}");
+            return Err(SafetyError::ArmNotAtRestingPose {
+                current: self.measured_positions.clone(),
+                expected: self.config.resting_positions().to_vec(),
+                reason: Some(reason),
+            });
+        }
+        let started_at = self.driver_clock_now();
+        let disable_kind = crate::driver::DisableKind::DisableRequested {
+            started_at,
+            // Enforce K=3 rest-pose gate & 1 s lifetime unconditionally in the driver choke point
+            // even though `safety.state()` is still Operational after a park settle (B3).
+            rollback: true,
+        };
+        self.stop_motion();
+        self.commanded_velocities.fill(0.0);
+        if let Err(error) = self.request_disable(disable_kind) {
+            let refused = matches!(error, SafetyError::TorqueOffWouldDrop { .. });
+            if !refused && !self.torque_off_stopped() {
+                self.safety.latch(
+                    crate::safety::FaultKind::Other,
+                    crate::safety::FaultDetail::formatted(FaultCode::DriverWriteFailed, |buf| {
+                        let _ = core::fmt::write(buf, format_args!("{error}"));
+                    }),
+                );
+            }
+            return Err(error);
+        }
+        // On RT executor, a deferred `AwaitRestGate` or in-flight repeat pass leaves
+        // `disable_pending == true`; finish transitioning `safety` to `Idle` only once
+        // `disable_accepted()` has cleared `disable_pending`.
+        if !self.disable_pending {
+            self.torque_off_finish_in_place()?;
+        }
+        Ok(self.safety.state().clone())
+    }
+
     /// True when E-stop, a Fault state, any latched fault kind bit, or a pending E-stop
     /// keeps the arm stopped: torque-off must apply Rule A′ and must never clear or mutate
     /// the fault record or epoch.
@@ -3771,6 +3824,7 @@ impl SupervisorInner {
             match poll_res {
                 Ok(crate::driver::TorqueProgress::Done(_)) => {
                     self.disable_accepted();
+                    let _ = self.torque_off_finish_rt();
                 }
                 Err(
                     crate::driver::ArmDriverError::TorqueOffWouldDrop
@@ -3909,6 +3963,7 @@ impl SupervisorInner {
         match res {
             Ok(crate::driver::TorqueProgress::Done(_)) => {
                 self.disable_accepted();
+                let _ = self.torque_off_finish_rt();
                 return None;
             }
             Err(

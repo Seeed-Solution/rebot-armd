@@ -8128,3 +8128,153 @@ fn r11_b2_holds_never_dropped_on_stale_feedback_or_mit_owner_lost() {
         }
     }
 }
+
+/// R11 B3: Watchdog `NormalUnload` must NOT bypass the K=3 rest-pose gate after a park settle:
+/// 1. If the park settles where the static policy allows it (e.g. wider policy tolerance) or the
+///    driver's rest-pose gate refuses (joint outside `rest_pose_tolerance_rad`, or K<3 / non-rest),
+///    the post-settle disable is REFUSED with 0 `CMD_DISABLE` frames, `torque_intent` stays `On`,
+///    holds continue, and `WatchdogTimeout` latches.
+/// 2. When the park genuinely reaches rest and completes K=3, the rest gate accepts the disable,
+///    transmits `CMD_DISABLE`, records `torque_intent = Off` by decision, and enters `Idle`.
+#[test]
+fn r11_b3_watchdog_normal_unload_enforces_rest_pose_gate_and_holds_on_refusal() {
+    use armd::TorqueIntent;
+
+    // Part 1: Rest gate refuses when park settles at 0.07 rad (inside wider 0.08 rad static
+    // `resting_pose.position_tolerances`, OUTSIDE strict 0.05 rad `rest_pose_tolerance_rad`!).
+    {
+        let clock = MockClock::new();
+        let bus = FakeBus::with_clock(&limits(), clock.clone());
+        let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits())
+            .unwrap();
+        bus.with(|s| {
+            s.follow_commands = false;
+            s.immediate_replies = true;
+            for m in &mut s.motors {
+                m.q = 0.0;
+                m.v = 0.0;
+            }
+            s.motors[0].q = 0.07; // > 0.05 rad rest_pose_tolerance_rad, < 0.10 rad static policy!
+            s.push_all_feedback();
+        });
+        d.read_joint_states().unwrap();
+        d.check_mapping_ranges();
+        let mut cfg = ArmConfig {
+            lease_timeout_ms: 50,
+            rest_pose_tolerance_rad: 0.05,
+            ..ArmConfig::rebot_dm()
+        };
+        if let Some(ref mut rp) = cfg.resting_pose {
+            rp.position_tolerances = vec![0.10; 7];
+            rp.max_total_deviation = 0.50;
+        }
+        let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(d));
+        inner.lease_enabled = false;
+        inner.register_live_connection(1).unwrap();
+        inner.tick(0.02);
+        enable_torque_admitted(&mut inner).unwrap();
+
+        // Trigger watchdog NormalUnload park.
+        inner.lease_enabled = true;
+        inner.last_heartbeat = Instant::now() - Duration::from_millis(200);
+        bus.clear_log();
+        // Tick through park trajectory + 800 ms unload settle (> 20 ms causal settle window so
+        // driver pose feedback stays provably fresh and evaluates the exact 0.07 rad pose).
+        for _ in 0..200 {
+            clock.advance(Duration::from_millis(21));
+            bus.with(|s| {
+                s.motors[0].q = 0.07;
+                s.motors[0].v = 0.0;
+                s.push_all_feedback();
+            });
+            inner.tick(0.02);
+            if matches!(inner.safety.state(), SafetyState::Fault(FaultReason::WatchdogTimeout)) {
+                break;
+            }
+        }
+        assert_eq!(
+            spec_count_damiao_disables(&bus),
+            0,
+            "B3: watchdog NormalUnload must NOT bypass rest-pose gate when J1 is at 0.07 > 0.05 rad"
+        );
+        assert_eq!(
+            inner.torque_intent,
+            TorqueIntent::On,
+            "B3: torque_intent must remain On when rest gate refuses post-settle unload"
+        );
+        assert!(inner.is_torqued, "B3: arm must remain torqued and holding");
+        assert!(
+            matches!(inner.safety.state(), SafetyState::Fault(FaultReason::WatchdogTimeout)),
+            "B3: refused watchdog unload must report failure by latching WatchdogTimeout, got {:?}",
+            inner.safety.state()
+        );
+        assert!(
+            matches!(
+                inner.last_stopped_torque_off_refusal(),
+                Some(StoppedTorqueOffRefusal::JointOutsideRest { joint_index: 0, .. })
+            ),
+            "B3: refusal reason must record JointOutsideRest for J1, got {:?}",
+            inner.last_stopped_torque_off_refusal()
+        );
+        // Subsequent tick keeps holding all 7 joints!
+        clock.advance(Duration::from_millis(20));
+        bus.with(|s| s.push_all_feedback());
+        bus.clear_log();
+        inner.tick(0.02);
+        assert_eq!(
+            bus.tx_log().iter().filter(|f| (0x101..=0x107).contains(&f.id)).count(),
+            7,
+            "B3: arm must keep holding after watchdog NormalUnload rest-gate refusal"
+        );
+    }
+
+    // Part 2: Park genuinely reaches rest (0.0 rad) and passes K=3 rest-pose gate -> accepted,
+    // CMD_DISABLE sent, `torque_intent = Off` recorded by decision, and enters Idle!
+    {
+        let clock = MockClock::new();
+        let bus = FakeBus::with_clock(&limits(), clock.clone());
+        let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits())
+            .unwrap();
+        bus.with(|s| {
+            s.follow_commands = true;
+            s.immediate_replies = true;
+            for m in &mut s.motors {
+                m.q = 0.0;
+                m.v = 0.0;
+            }
+            s.motors[0].q = 0.25;
+            s.push_all_feedback();
+        });
+        d.read_joint_states().unwrap();
+        d.check_mapping_ranges();
+        let cfg = ArmConfig {
+            lease_timeout_ms: 50,
+            ..ArmConfig::rebot_dm()
+        };
+        let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(d));
+        inner.lease_enabled = false;
+        inner.register_live_connection(1).unwrap();
+        inner.tick(0.02);
+        enable_torque_admitted(&mut inner).unwrap();
+        inner.lease_enabled = true;
+        inner.last_heartbeat = Instant::now() - Duration::from_millis(200);
+        bus.clear_log();
+        for _ in 0..200 {
+            clock.advance(Duration::from_millis(21));
+            bus.with(|s| s.push_all_feedback());
+            inner.tick(0.02);
+            if *inner.safety.state() == SafetyState::Idle && !inner.is_torqued {
+                break;
+            }
+        }
+        assert_eq!(*inner.safety.state(), SafetyState::Idle);
+        assert!(!inner.is_torqued);
+        assert_eq!(inner.torque_intent, TorqueIntent::Off);
+        assert!(
+            spec_count_damiao_disables(&bus) >= 7,
+            "B3: watchdog NormalUnload at rest must transmit CMD_DISABLE after passing K=3 gate"
+        );
+    }
+}

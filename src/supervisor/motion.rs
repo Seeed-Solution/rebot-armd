@@ -476,9 +476,10 @@ impl SupervisorInner {
                         return;
                     }
                 }
-                // If the arm is torqued, maintain holding torque if motion cannot be planned or arm is not operational!
-                // NEVER cut power under gravity when motion planning fails or arm is in stopped/idle state!
-                if self.is_torqued {
+                // If the arm is torqued or torque_intent is On, maintain holding torque if motion
+                // cannot be planned or arm is not operational! NEVER cut power or bypass the rest
+                // gate under gravity when motion planning fails or arm is not operational.
+                if self.is_torqued || self.torque_intent == crate::supervisor::TorqueIntent::On {
                     tracing::warn!("NormalUnload cannot plan motion or arm not operational; maintaining holding torque to prevent dropping arm");
                     self.pending_normal_unload = false;
                     self.unload_settle = None;
@@ -486,7 +487,8 @@ impl SupervisorInner {
                     self.servo_target = None;
                     return;
                 }
-                // If not torqued, ensure state is clean
+                // Already cleanly disarmed (`!is_torqued && torque_intent == Off`): clean up motion state
+                // without issuing an ungated hardware disable.
                 self.pending_normal_unload = false;
                 self.unload_settle = None;
                 self.is_torqued = false;
@@ -499,17 +501,6 @@ impl SupervisorInner {
                 }
                 let _ = self.safety.set_torque(false);
                 self.mit_torque_off();
-                if let Some(ref d) = self.driver {
-                    if let Ok(mut driver) = d.lock() {
-                        let started_at = driver.clock_now();
-                        let _ = driver.disable_torque(
-                            crate::driver::DisableKind::DisableRequested {
-                                started_at,
-                                rollback: false,
-                            },
-                        );
-                    }
-                }
             }
             StopPolicy::EStopLatch => {
                 let driver = self.driver.take();

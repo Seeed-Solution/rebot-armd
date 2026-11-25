@@ -5046,13 +5046,16 @@ impl SupervisorInner {
             tracing::info!("Arm settled cleanly at home position for {} ms after {:.2} s; safely cutting torque to Standby/Idle.",
                 UNLOAD_SETTLE_HOLD.as_millis(), settle.pending_s);
             let watchdog_park = self.watchdog_park.take().is_some();
-            match self.torque_off(true) {
+            match self.torque_off_after_unload_settle() {
                 Ok(_) if watchdog_park => tracing::info!("Watchdog park complete: torque off at resting pose"),
                 Ok(_) => {}
                 Err(e) => {
                     tracing::warn!("Failed to cut torque after normal unload settle: {}", e);
                     self.safety.mark_motion_finished();
-                    if watchdog_park && self.is_torqued && !self.safety.state().is_stopped() {
+                    if watchdog_park
+                        && (self.is_torqued || self.torque_intent == TorqueIntent::On)
+                        && !self.safety.state().is_stopped()
+                    {
                         tracing::warn!("Watchdog park failed at torque off; holding torque and latching WatchdogTimeout");
                         self.latch_watchdog_fault();
                     }
