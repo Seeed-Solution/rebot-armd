@@ -126,7 +126,7 @@ fn state_checks(inner: &SupervisorInner) -> Result<(), CalibError> {
 /// Current readings of all joints; fresh feedback required with a driver.
 fn readings(inner: &SupervisorInner) -> Result<Vec<f32>, CalibError> {
     if let Some(d) = inner.driver.as_ref() {
-        let fresh = d.lock().is_ok_and(|drv| drv.is_feedback_valid());
+        let fresh = d.with_ref(|drv| drv.is_feedback_valid()).unwrap_or(false);
         if !fresh { return Err(CalibError::new(409, "MOTOR_ZERO_NO_FEEDBACK", "the motor feedback is not fresh; check the bus and the motor power")); }
     }
     let q = inner.measured_positions.clone();
@@ -222,8 +222,7 @@ struct Feedback { ages: Vec<Option<Duration>>, status: Option<Vec<u8>> }
 
 fn feedback(inner: &SupervisorInner) -> Option<Feedback> {
     let d = inner.driver.as_ref()?;
-    let drv = d.lock().ok()?;
-    Some(Feedback { ages: drv.feedback_ages(), status: drv.motor_status() })
+    d.with_ref(|drv| Feedback { ages: drv.feedback_ages(), status: drv.motor_status() })
 }
 
 /// Sample newer than `since` for joint `j` (always true for the mock follower).
@@ -282,9 +281,10 @@ async fn run_motor(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, req: MotorZ
     // 1. readings, then disable every motor (official sequence), torque stays off
     let (before, r, t_disable) = locked_step(sup, check, grant, "disable", |inner| {
         let q = readings(inner)?;
-        if let Some(d) = inner.driver.as_ref() {
-            let mut drv = d.lock().map_err(|_| CalibError::new(500, "INTERNAL", "driver unavailable"))?;
-            drv.set_torque(false).map_err(|e| CalibError::new(500, "MOTOR_ZERO_NOT_DISABLED", format!("disable failed: {e}")))?;
+        if let Some(d) = inner.driver.as_mut() {
+            d.with_mut(|drv| drv.set_torque(false))
+                .ok_or_else(|| CalibError::new(500, "INTERNAL", "driver unavailable"))?
+                .map_err(|e| CalibError::new(500, "MOTOR_ZERO_NOT_DISABLED", format!("disable failed: {e}")))?;
         }
         Ok((q, reference(inner), Instant::now()))
     }).await?;

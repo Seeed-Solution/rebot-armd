@@ -108,7 +108,7 @@ fn rig_at(config: ArmConfig, q: [f32; 7]) -> (SupervisorInner, StopArm) {
     let arm = StopArm::new(q);
     let mut inner = SupervisorInner::new(config);
     inner.lease_enabled = false;
-    inner.driver = Some(Mutex::new(Box::new(arm.clone())));
+    inner.driver = Some(armd::supervisor_lock::DriverSlot::legacy(Box::new(arm.clone())));
     inner.commanded_positions = q.to_vec();
     inner.measured_positions = q.to_vec();
     inner.target_positions = q.to_vec();

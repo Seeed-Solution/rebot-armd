@@ -237,6 +237,10 @@ impl SupervisorInner {
     /// against the exact production latch path in safe Rust.
     #[doc(hidden)]
     pub fn apply_estop_latch_with_driver(&mut self, driver: Option<&std::sync::Mutex<Box<dyn ArmDriver>>>) {
+        self.apply_estop_latch_impl(driver);
+    }
+
+    fn apply_estop_latch_impl(&mut self, ext_driver: Option<&std::sync::Mutex<Box<dyn ArmDriver>>>) {
         self.estop_state.latch();
         // Immediate rigid lock at current position, latch E-Stop, advance epoch.
         // Maintain active restorative torque hold: do NOT cut power or set is_torqued=false.
@@ -252,36 +256,50 @@ impl SupervisorInner {
         // Lock onto measured_positions only when finite and the supervisor's own coherent
         // feedback snapshot (`core.feedback()` + `joint_feedback_queue_bounds`, captured
         // alongside `measured_positions`) is provably within the 250 ms freshness bound
-        // against the driver's clock. Use non-blocking `try_lock` so E-stop never waits on
-        // a contended driver mutex; if contended, poisoned, stale, or unbounded, hold
-        // `commanded_positions`.
+        // against the driver's clock. In `DriverSlot::Exclusive`, borrows directly with zero
+        // lock; in `DriverSlot::Legacy` / external test mutex, uses non-blocking `try_lock` so
+        // E-stop never waits on a contended mutex (holding `commanded_positions` if contended,
+        // poisoned, stale, or unbounded).
         const ESTOP_FEEDBACK_MAX_AGE: Duration = Duration::from_millis(250);
-        let (driver_contended, snapshot_fresh) = match driver {
-            None => (false, self.feedback_numeric_valid),
-            Some(d) => match d.try_lock() {
-                Err(_) => (true, false),
-                Ok(drv) => {
-                    let now = drv.clock_now();
-                    let dof = self.config.dof;
-                    let fb = self.core.feedback();
-                    let fresh = self.feedback_numeric_valid
-                        && (0..dof).all(|i| {
-                            fb.instant(i).is_some_and(|t| now.saturating_duration_since(t) <= ESTOP_FEEDBACK_MAX_AGE)
-                        })
-                        && {
-                            drv.feedback_queue_bounds_into(&mut self.scratch.fb.bounds);
-                            if self.scratch.fb.bounds.is_empty() {
-                                true
-                            } else {
-                                self.joint_feedback_queue_bounds.len() == dof
-                                    && self.joint_feedback_queue_bounds.iter().all(|b| {
-                                        b.is_some_and(|t| now.saturating_duration_since(t) <= ESTOP_FEEDBACK_MAX_AGE)
-                                    })
-                            }
-                        };
-                    (false, fresh)
+        let dof = self.config.dof;
+        let feedback_numeric_valid = self.feedback_numeric_valid;
+        let has_driver = ext_driver.is_some() || self.driver.is_some();
+        let (driver_contended, snapshot_fresh) = {
+            let mut fb_bounds = std::mem::take(&mut self.scratch.fb.bounds);
+            let check_drv = |drv: &dyn ArmDriver, bounds: &mut Vec<Option<Instant>>| -> bool {
+                let now = drv.clock_now();
+                let fb = self.core.feedback();
+                feedback_numeric_valid
+                    && (0..dof).all(|i| {
+                        fb.instant(i).is_some_and(|t| now.saturating_duration_since(t) <= ESTOP_FEEDBACK_MAX_AGE)
+                    })
+                    && {
+                        drv.feedback_queue_bounds_into(bounds);
+                        if bounds.is_empty() {
+                            true
+                        } else {
+                            self.joint_feedback_queue_bounds.len() == dof
+                                && self.joint_feedback_queue_bounds.iter().all(|b| {
+                                    b.is_some_and(|t| now.saturating_duration_since(t) <= ESTOP_FEEDBACK_MAX_AGE)
+                                })
+                        }
+                    }
+            };
+            let res = if let Some(raw) = ext_driver {
+                match raw.try_lock() {
+                    Err(_) => (true, false),
+                    Ok(drv) => (false, check_drv(drv.as_ref(), &mut fb_bounds)),
                 }
-            },
+            } else if let Some(slot) = self.driver.as_ref() {
+                match slot.try_with_ref(|drv| check_drv(drv, &mut fb_bounds)) {
+                    Err(_) => (true, false),
+                    Ok(fresh) => (false, fresh),
+                }
+            } else {
+                (false, feedback_numeric_valid)
+            };
+            self.scratch.fb.bounds = fb_bounds;
+            res
         };
         if self.measured_positions.iter().all(|p| p.is_finite())
             && self.measured_positions.len() == self.config.dof
@@ -322,12 +340,12 @@ impl SupervisorInner {
         }
 
         self.commanded_velocities.fill(0.0);
-        if driver.is_none() {
+        if !has_driver {
             self.measured_velocities.fill(0.0);
         }
         // Send the stiff MIT exit hold immediately when uncontended; never block on a held mutex.
         let hold_out = if exited_gravity_comp && !driver_contended && self.is_torqued && !self.disable_pending {
-            self.write_gravity_comp_immediate_with_driver(driver, true, true)
+            self.write_gravity_comp_immediate_inner(ext_driver, true, true)
         } else {
             crate::supervisor::TickOutput::None
         };
@@ -557,16 +575,12 @@ impl SupervisorInner {
                 }
                 let _ = self.safety.set_torque(false);
                 self.mit_torque_off();
-                if let Some(ref d) = self.driver {
-                    if let Ok(mut driver) = d.lock() {
-                        let _ = driver.set_torque(false);
-                    }
+                if let Some(d) = self.driver.as_mut() {
+                    let _ = d.with_mut(|driver| driver.set_torque(false));
                 }
             }
             StopPolicy::EStopLatch => {
-                let driver = self.driver.take();
-                self.apply_estop_latch_with_driver(driver.as_ref());
-                self.driver = driver;
+                self.apply_estop_latch_impl(None);
             }
             StopPolicy::ThermalTrip => {
                 self.stop_motion();
@@ -662,13 +676,13 @@ impl SupervisorInner {
             Some(driver) => !self.is_torqued
                 && !self.disable_pending
                 && self.safety.state() == &SafetyState::Idle
-                && driver.lock().is_ok_and(|drv| {
+                && driver.with_ref(|drv| {
                     if !drv.capabilities().enable_feedback {
                         true
                     } else {
                         drv.enable_state() == EnableState::Disabled
                     }
-                }),
+                }).unwrap_or(false),
         };
 
         let old_gen = self.active_lease.as_ref().map_or(0, |a| a.generation);
@@ -1233,7 +1247,7 @@ impl SupervisorInner {
                     let close_dir = if policy.closed_rad >= policy.open_rad { 1.0_f32 } else { -1.0_f32 };
                     if (target_g - cur_g) * close_dir > 1e-4 && policy.max_close_torque_nm.is_some() {
                         if let Some(ref d) = self.driver {
-                            let has_torque_fb = d.lock().is_ok_and(|drv| drv.capabilities().torque_feedback);
+                            let has_torque_fb = d.with_ref(|drv| drv.capabilities().torque_feedback).unwrap_or(false);
                             if !has_torque_fb {
                                 return Err(MotionError::Unsupported(
                                     "Gripper close during commissioning jog requires torque_feedback when max_close_torque_nm is configured".into(),
@@ -1712,7 +1726,7 @@ impl SupervisorInner {
         if self.rt_executor_owned {
             return self.last_poll_feedback_valid;
         }
-        self.driver.as_ref().is_none_or(|d| d.lock().is_ok_and(|drv| drv.is_feedback_valid()))
+        self.driver.as_ref().is_none_or(|d| d.with_ref(|drv| drv.is_feedback_valid()).unwrap_or(false))
     }
 
     /// The refusal code when a primitive admitted under `admitted` may not be installed,

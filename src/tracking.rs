@@ -614,7 +614,7 @@ impl crate::supervisor::SupervisorInner {
     /// Receive times of the oldest and newest joint feedback sample, when every joint has one
     /// (`ArmDriver::feedback_instants`: the driver's own receive instants, not now - age).
     fn feedback_instant_range(&self) -> Option<(std::time::Instant, std::time::Instant)> {
-        let instants = self.driver.as_ref()?.lock().ok()?.feedback_instants();
+        let instants = self.driver.as_ref()?.with_ref(|drv| drv.feedback_instants())?;
         if instants.len() != self.config.dof {
             return None;
         }
@@ -639,7 +639,7 @@ impl crate::supervisor::SupervisorInner {
         let velocity_feedback = self
             .driver
             .as_ref()
-            .is_some_and(|d| d.lock().is_ok_and(|drv| drv.capabilities().velocity_feedback));
+            .is_some_and(|d| d.with_ref(|drv| drv.capabilities().velocity_feedback).unwrap_or(false));
         if velocity_feedback {
             return arm.iter().all(|&j| {
                 self.measured_velocities

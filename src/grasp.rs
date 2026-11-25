@@ -5758,12 +5758,11 @@ impl Orchestrator {
                 let j7_seq = inner.core.feedback().seqs().get(g_idx).copied();
 
                 let (torque_fb, load_fb) = if let Some(ref d) = inner.driver {
-                    if let Ok(driver) = d.lock() {
+                    d.with_ref(|driver| {
                         let caps = driver.capabilities();
                         (caps.torque_feedback, caps.load_feedback)
-                    } else {
-                        (false, false)
-                    }
+                    })
+                    .unwrap_or((false, false))
                 } else {
                     (true, !inner.loads.is_empty())
                 };

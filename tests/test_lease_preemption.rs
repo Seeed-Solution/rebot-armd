@@ -355,7 +355,7 @@ async fn test_fail_closed_driver_lock_poison_protection() {
         Arc::try_unwrap(m).map_err(|_| "unwrap failed").unwrap()
     };
 
-    inner.driver = Some(poisoned_mutex);
+    inner.driver = Some(armd::supervisor_lock::DriverSlot::from_mutex(poisoned_mutex));
     inner.is_torqued = true;
 
     // 1. Preempt with poisoned driver: ZERO PANIC, Fail-Closed into Cat 4

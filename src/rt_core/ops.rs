@@ -1552,13 +1552,15 @@ impl CoreOps for SupervisorInner {
                 ..HardwarePoll::default()
             };
         };
-        let d = driver.lock().unwrap_or_else(|e| e.into_inner());
-        d.feedback_ages_into(&mut self.scratch.ages);
-        let oldest = self.scratch.ages.iter().copied().try_fold(Duration::ZERO, |m, a| a.map(|a| m.max(a)));
+        let (feedback_valid, enable_state, oldest) = driver.with_ref_recover(|d| {
+            d.feedback_ages_into(&mut self.scratch.ages);
+            let oldest = self.scratch.ages.iter().copied().try_fold(Duration::ZERO, |m, a| a.map(|a| m.max(a)));
+            (d.is_feedback_valid(), d.enable_state(), oldest)
+        });
         HardwarePoll {
             driverless: false,
-            feedback_valid: d.is_feedback_valid(),
-            enable_state: Some(d.enable_state()),
+            feedback_valid,
+            enable_state: Some(enable_state),
             oldest_feedback_age: oldest,
             rx_frames,
             budget_exhausted,

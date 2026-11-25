@@ -1742,8 +1742,8 @@ async fn damiao_unified_fresh_boundary_and_stale_shutdown_gate_virtual_clock() {
     // Fresh state-0 feedback restores Disabled and shutdown_ready!
     bus2.with(|s| s.push_all_feedback());
     {
-        let inner = sup.inner().read().await;
-        let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+        let mut inner = sup.inner().write().await;
+        let mut drv = inner.driver.as_mut().unwrap().write().unwrap();
         drv.read_joint_states().unwrap();
         assert_eq!(drv.enable_state(), EnableState::Disabled);
     }
@@ -2193,8 +2193,8 @@ async fn mit_fence_trip_confirmed_disable_stays_shutdown_ready_and_repeated_unkn
     });
     clock.advance(Duration::from_secs(1));
     {
-        let inner = sup.inner().read().await;
-        let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+        let mut inner = sup.inner().write().await;
+        let mut drv = inner.driver.as_mut().unwrap().write().unwrap();
         drv.read_joint_states().unwrap();
         assert!(!drv.is_feedback_valid(), "1 s without polls must make feedback ages stale (>250 ms)");
         assert!(drv.mit_fence_trip().is_some(), "MIT fence trip for output must stay active");
@@ -2223,9 +2223,9 @@ async fn mit_fence_trip_confirmed_disable_stays_shutdown_ready_and_repeated_unkn
 
     // Verify a later enable request clears sticky Disabled (so enable_state is no longer sticky).
     {
-        let inner = sup.inner().write().await;
+        let mut inner = sup.inner().write().await;
         inner.e_stop_latched.store(false, Ordering::SeqCst);
-        let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+        let mut drv = inner.driver.as_mut().unwrap().write().unwrap();
         let _ = drv.begin_torque(true);
         assert_ne!(
             drv.enable_state(),

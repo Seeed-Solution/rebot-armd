@@ -187,7 +187,7 @@ fn the_rt_enable_sends_the_j7_position_force_handshake_like_the_blocking_enable(
     assert_eq!(frames[write].1[4..8], damiao::CTRL_MODE_POS_FORCE.to_le_bytes());
     assert_eq!(r.bus.with(|s| s.motors[6].ctrl_mode()), damiao::CTRL_MODE_POS_FORCE);
     // the cap is visible through the supervisor's (joint-zero wrapped) driver
-    let cap = r.fx.core.driver.as_ref().unwrap().lock().unwrap().motor_current_cap().expect("current cap");
+    let cap = r.fx.core.driver.as_ref().unwrap().read().unwrap().motor_current_cap().expect("current cap");
     assert!(cap.active && cap.current_raw == Some(220), "{cap:?}");
     assert!(r.fx.core.is_torqued);
 }

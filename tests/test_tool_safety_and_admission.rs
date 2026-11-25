@@ -300,7 +300,7 @@ fn b3_close_torque_cap_refuses_missing_torque_feedback_and_stops_on_stale_feedba
     cfg.gripper_policy.as_mut().unwrap().max_close_torque_nm = Some(1.0);
     let drv = MockFbArm::new(INSPECT, false);
     let mut inner = SupervisorInner::new(cfg);
-    inner.driver = Some(Mutex::new(Box::new(drv)));
+    inner.driver = Some(armd::supervisor_lock::DriverSlot::legacy(Box::new(drv)));
     inner.lease_enabled = false;
     { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     inner.commanded_positions = vec![0.0, -1.167, -1.565, 1.435, 0.0, 0.0, -3.0];
@@ -346,7 +346,7 @@ fn b3_close_torque_cap_refuses_missing_torque_feedback_and_stops_on_stale_feedba
     let q0 = [0.0, -1.167, -1.565, 1.435, 0.0, 0.0, -3.0];
     let drv2 = MockFbArm::new(q0, true);
     let mut inner2 = SupervisorInner::new(cfg2);
-    inner2.driver = Some(Mutex::new(Box::new(drv2.clone())));
+    inner2.driver = Some(armd::supervisor_lock::DriverSlot::legacy(Box::new(drv2.clone())));
     inner2.lease_enabled = false;
     { let __s = inner2.current_admission_stamp(); inner2.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     inner2.commanded_positions = q0.to_vec();
@@ -710,7 +710,7 @@ fn b9_table_z_from_tcp_rejects_stale_or_moving_arm_without_changing_revision_or_
 
     let drv = MockFbArm::new(q_vert, true);
     let mut inner = SupervisorInner::new(cfg);
-    inner.driver = Some(Mutex::new(Box::new(drv.clone())));
+    inner.driver = Some(armd::supervisor_lock::DriverSlot::legacy(Box::new(drv.clone())));
     inner.lease_enabled = false;
     { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     inner.commanded_positions = q_vert.to_vec();
@@ -958,7 +958,7 @@ fn r2_b04_m01_clear_fault_and_torque_off_enforce_measured_workspace_envelope() {
         s.clear_disables = vec![0, 1, 2, 3, 4, 5];
     }
     let mut inner = SupervisorInner::new(cfg);
-    inner.driver = Some(Mutex::new(Box::new(drv.clone())));
+    inner.driver = Some(armd::supervisor_lock::DriverSlot::legacy(Box::new(drv.clone())));
     inner.lease_enabled = false;
     { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
 
@@ -993,7 +993,7 @@ fn r2_b06_table_z_from_tcp_rejects_cached_or_gapped_hw_timestamps() {
     drv.state.lock().unwrap().rx_instants = Some(vec![Some(fixed_rx); 7]);
 
     let mut inner = SupervisorInner::new(cfg);
-    inner.driver = Some(Mutex::new(Box::new(drv.clone())));
+    inner.driver = Some(armd::supervisor_lock::DriverSlot::legacy(Box::new(drv.clone())));
     inner.lease_enabled = false;
     { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     inner.commanded_positions = q_vert.to_vec();
@@ -1065,7 +1065,7 @@ fn r2_b07_commissioning_jog_scales_j7_velocity_and_requires_torque_feedback_on_c
     q_open[6] = -3.0;
     let drv_no_tq = MockFbArm::new(q_open, false);
     let mut inner = SupervisorInner::new(cfg.clone());
-    inner.driver = Some(Mutex::new(Box::new(drv_no_tq)));
+    inner.driver = Some(armd::supervisor_lock::DriverSlot::legacy(Box::new(drv_no_tq)));
     inner.lease_enabled = false;
     { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     inner.commanded_positions = q_open.to_vec();
@@ -1081,7 +1081,7 @@ fn r2_b07_commissioning_jog_scales_j7_velocity_and_requires_torque_feedback_on_c
     );
 
     let drv_tq = MockFbArm::new(q_open, true);
-    inner.driver = Some(Mutex::new(Box::new(drv_tq)));
+    inner.driver = Some(armd::supervisor_lock::DriverSlot::legacy(Box::new(drv_tq)));
     let max_j7_vel = cfg.limits[6].max_velocity * 0.2;
     let (_ep, _id, dur) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::jog_action_with_speed_scale(__a, q_close.to_vec(), None, Some(ep), "joint_move", Some(0.2))) } }.unwrap();
     let dq7 = (q_close[6] - q_open[6]).abs() as f64;
@@ -1211,7 +1211,7 @@ fn r2_b11_read_joint_states_error_clears_freshness_and_freezes_streaming_close()
     let q0 = [0.0, -1.167, -1.565, 1.435, 0.0, 0.0, -3.0];
     let drv = MockFbArm::new(q0, true);
     let mut inner = SupervisorInner::new(cfg);
-    inner.driver = Some(Mutex::new(Box::new(drv.clone())));
+    inner.driver = Some(armd::supervisor_lock::DriverSlot::legacy(Box::new(drv.clone())));
     inner.lease_enabled = false;
     { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     inner.commanded_positions = q0.to_vec();
@@ -1256,7 +1256,7 @@ fn r2_m05_m06_hover_resume_requires_fp_and_physical_jaw_curve_required() {
     no_curve_cfg.gripper_policy.as_mut().unwrap().jaw_opening = None;
     let drv = MockFbArm::new(INSPECT, true);
     let mut phys_inner = SupervisorInner::new(no_curve_cfg);
-    phys_inner.driver = Some(Mutex::new(Box::new(drv)));
+    phys_inner.driver = Some(armd::supervisor_lock::DriverSlot::legacy(Box::new(drv)));
     phys_inner.follower = Some("rebot-dm".into());
     assert!(phys_inner.requires_real_jaw_curve());
     assert!(grasp::prepare_setup_update(&phys_inner, &json!({"max_grasp_width_m": 0.12}), None, false).is_ok());

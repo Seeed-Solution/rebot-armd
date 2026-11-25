@@ -3071,9 +3071,9 @@ async fn zero_alloc_rt_l2_torque_and_clear_fault_with_tracing_enabled() {
         ctrl.allow_disable_confirm.store(true, Ordering::SeqCst);
         let _ = core
             .driver
-            .as_ref()
+            .as_mut()
             .unwrap()
-            .lock()
+            .write()
             .unwrap()
             .begin_torque_budgeted(false, 0);
         core.disable_pending = false;
