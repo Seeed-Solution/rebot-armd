@@ -1476,6 +1476,11 @@ pub struct ArmConfig {
     #[serde(default)]
     #[cfg(not(target_arch = "wasm32"))]
     pub grasp: Option<crate::grasp::GraspSetup>,
+    /// Default detector models of the detection kinds (`POST /api/v1/vision/detector`); None =
+    /// the built-in rebot-vision names ([`crate::vision_detector::DetectorDefaults::default`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg(not(target_arch = "wasm32"))]
+    pub vision_detectors: Option<crate::vision_detector::DetectorDefaults>,
     /// Gravity compensation (hand-guiding); None means unsupported.
     #[serde(default)]
     pub gravity_comp: Option<GravityCompPolicy>,
@@ -1648,6 +1653,7 @@ impl Default for ArmConfig {
             camera_mount: CameraMount::default(),
             gripper_policy: None,
             #[cfg(not(target_arch = "wasm32"))] grasp: None,
+            #[cfg(not(target_arch = "wasm32"))] vision_detectors: None,
             gravity_comp: None,
             joint_tracking: None,
             damiao_ranges: None,
@@ -2268,6 +2274,8 @@ impl ArmConfig {
         }
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(g) = &self.grasp { g.validate().map_err(|e| format!("Invalid grasp setup: {e}"))?; }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(d) = &self.vision_detectors { d.validate()?; }
         if let Some(policy) = &self.resting_pose {
             if policy.position_tolerances.len() < self.resting_arm_joints() {
                 return Err(format!("resting_pose.position_tolerances needs a value for each of the {} arm joints",
@@ -3430,6 +3438,7 @@ impl ArmConfig {
             camera_mount: CameraMount::default(),
             gripper_policy: Some(GripperPolicy::rebot_dm()),
             #[cfg(not(target_arch = "wasm32"))] grasp: Some(crate::grasp::GraspSetup::default()),
+            #[cfg(not(target_arch = "wasm32"))] vision_detectors: None,
             gravity_comp: Some(GravityCompPolicy::rebot_dm()),
             joint_tracking: Some(JointTrackingConfig::rebot_dm()),
             damiao_ranges: Some(vec![
@@ -4117,6 +4126,11 @@ pub struct VisionCapabilities {
     /// armd proxies a detector's API under `/api/v1/detection/*` (upstream
     /// `ARMD_DETECTOR_URL`). Whether a detector is reachable is not checked here.
     pub detection_proxy: bool,
+    /// `POST /api/v1/vision/detector` (operator): switch the detector between the default
+    /// `detect` and `segment` models (`vision_detectors` profile section). Whether the provider
+    /// can switch models shows in `GET /api/v1/vision/mode` `models`.
+    #[serde(default)]
+    pub detector_switch: bool,
     /// armd proxies the provider's mode API at this route (`GET`/`POST`). Present from
     /// capabilities version 2; whether the provider has it shows in `modes`.
     pub mode_endpoint: String,
@@ -4580,7 +4594,7 @@ impl Capabilities {
             teach: Some(TeachCapabilities { version: TEACH_VERSION, episodes: true, sequences: true }),
             #[cfg(target_arch = "wasm32")]
             teach: None,
-            vision: VisionCapabilities { detection_proxy: true, mode_endpoint: VISION_MODE_ENDPOINT.to_string(), ..Default::default() },
+            vision: VisionCapabilities { detection_proxy: true, detector_switch: cfg!(not(target_arch = "wasm32")), mode_endpoint: VISION_MODE_ENDPOINT.to_string(), ..Default::default() },
             policy_runtime,
         }
     }

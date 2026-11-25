@@ -3372,7 +3372,7 @@ fn task_unsupported(message: String) -> ArmError {
 }
 
 /// One model-changing preflight at a time (armd talks to one provider; its swap is one at a time).
-static MODEL_SWITCH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(crate) static MODEL_SWITCH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// How long a preflight waits for the provider's swap (`/api/mode` polled).
 const MODEL_SWITCH_TIMEOUT: Duration = Duration::from_secs(5);
 

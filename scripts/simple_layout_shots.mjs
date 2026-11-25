@@ -6,7 +6,7 @@
 // YOLO + ArUco, 7-DOF grasp settings), so every simple-mode chip is on screen. The arm is enabled (hold the
 // switch). For 932x430, 844x390, 667x375 landscape, 390x844 portrait and 1440x900: no two visible controls
 // overlap, every visible control (and its text) is inside the viewport, the E-stop is visible and on top.
-// The recognition popover is opened once per viewport, checked the same way, used (YOLO / Off), closed.
+// The recognition panel is opened once per viewport, checked the same way, used (switch on / off), closed.
 // Portrait scrolls: checked horizontally, plus the E-stop on screen after scrolling to the bottom.
 // Also writes expert-mode 1440x900 (EXPERT=1 only writes that one).
 // Writes PNGs to OUT (default .cache/simple-layout-shots/).
@@ -48,12 +48,12 @@ const collect = () => {
     return true;
   };
   const SEL = ['#safety', '.topbar', '#view-switch', '#pose-card', '#pad-sxy', '#pad-srot', '#pad-sz', '#pad-sgrip', '#s-grip-readout',
-    '.preset', '#btn-pose', '.hud > *', '#det-ctl > *', '#grasp-bar', '#gc-banner', '#s-hint', '.toast'];
+    '.preset', '#btn-pose', '.hud > *', '#s-vis', '#grasp-bar', '#s-objhint', '#gc-banner', '#s-hint', '.toast'];
   // intended: the view switch sits in the pose card's header row
   const ALLOW = [['#view-switch', '#pose-card']];
   const scrolls = document.scrollingElement.scrollHeight > innerHeight + 1;
   const els = [...new Set(SEL.flatMap((s) => [...document.querySelectorAll(s)]))].filter(vis);
-  // keep leaves: drop a block that contains another listed block (e.g. #det-ctl wrapper)
+  // keep leaves: drop a block that contains another listed block
   const leaves = els.filter((e) => !els.some((o) => o !== e && e.contains(o)));
   const name = (e) => e.id ? '#' + e.id : (e.className && typeof e.className === 'string' ? '.' + e.className.trim().split(/\s+/).join('.') : e.tagName) + (e.dataset.preset ? '[' + e.dataset.preset + ']' : '');
   const rects = leaves.map((e) => { const r = e.getBoundingClientRect(); return { n: name(e), e, x: r.left, y: r.top, r: r.right, b: r.bottom }; });
@@ -78,6 +78,8 @@ const collect = () => {
     const a = rects[i], b = rects[j];
     if (a.e.contains(b.e) || b.e.contains(a.e)) continue;
     if (ALLOW.some(([p, q]) => (a.n === p && b.n === q) || (a.n === q && b.n === p))) continue;
+    // stacked (portrait) layout: the recognition panel is a bottom sheet over the controls below the safety card
+    if (document.body.classList.contains('oc-slot') && (a.n === '#s-vis' || b.n === '#s-vis')) continue;
     const ix = Math.min(a.r, b.r) - Math.max(a.x, b.x), iy = Math.min(a.b, b.b) - Math.max(a.y, b.y);
     if (ix > 1 && iy > 1) issues.push(`overlap ${a.n} x ${b.n} (${ix|0}x${iy|0})`);
   }
@@ -111,13 +113,19 @@ async function open(view, scale, ui) {
     document.getElementById('video-stream').poster = poster.toDataURL();
     setInterval(() => { V.playing = true; V.fps = 14; V.lat = 195; document.getElementById('vhint')?.classList.add('hide'); }, 50);
   });
-  await page.click(`#ui-seg button[data-ui="${ui}"]`);
+  await page.evaluate((u) => setUi(u), ui);
   await page.waitForFunction(() => S.obs && S.dof > 0, null, { timeout: 15000 });
   // enable: hold the switch
   const en = await page.$('#btn-enable');
   if (await en.isVisible()) {
     const b = await en.boundingBox();
     await page.mouse.move(b.x + b.width / 2, b.y + b.height / 2); await page.mouse.down(); await page.waitForTimeout(900); await page.mouse.up();
+    // a page without control asks first (take-control dialog); then hold again
+    await page.waitForTimeout(300);
+    if (await page.isVisible('#take-confirm')) {
+      await page.click('#take-confirm'); await page.waitForTimeout(500);
+      await page.mouse.move(b.x + b.width / 2, b.y + b.height / 2); await page.mouse.down(); await page.waitForTimeout(900); await page.mouse.up();
+    }
   }
   await page.waitForTimeout(1500);
   return { ctx, page };
@@ -145,16 +153,19 @@ try {
       console.log(`${name} simple + recognition popover: ${r.n} controls, issues=${r.issues.length}`);
       for (const i of r.issues) console.log('    ' + i);
       ok(r.issues.length === 0, `${name}: popover open, no overlap / overflow`);
-      ok(await page.isVisible('#vmode'), `${name}: mode selector in popover`);
-      ok(await page.isVisible('#btn-trigger'), `${name}: single shot in popover`);
-      await page.click('#vmode button[data-vm="yolo"]'); await page.waitForTimeout(600);
+      ok(await page.isVisible('#sv-on'), `${name}: recognition switch in the panel`);
+      ok(await page.isVisible('#sv-show'), `${name}: display options in the panel`);
+      await page.click('#sv-on'); await page.waitForTimeout(600);
       const chipTxt = await page.textContent('#btn-vis');
-      ok(/开|On/.test(chipTxt), `${name}: choosing YOLO in the popover turns detection on (chip "${chipTxt}")`);
-      await page.click('#vmode button[data-vm="off"]'); await page.waitForTimeout(600);
+      ok(/开|物体|On|objects/.test(chipTxt), `${name}: the panel switch turns recognition on (chip "${chipTxt}")`);
+      await page.click('#sv-on'); await page.waitForTimeout(600);
       await page.click('#btn-vis'); await page.waitForTimeout(200);
-      ok(!(await page.evaluate(() => document.body.classList.contains('vis-open'))) && !(await page.isVisible('#det-ctl')), `${name}: the chip closes the popover`);
-      await page.click('#btn-vis'); await page.mouse.click(view.width / 2, 60); await page.waitForTimeout(200);
-      ok(!(await page.isVisible('#det-ctl')), `${name}: an outside tap closes the popover`);
+      ok(!(await page.evaluate(() => document.body.classList.contains('vis-open'))) && !(await page.isVisible('#s-vis')), `${name}: the chip closes the panel`);
+      await page.click('#btn-vis'); await page.waitForTimeout(200);
+      // tap the video just below the panel (on the phone sheet: just above it)
+      const pr = await page.evaluate(() => { const r = document.getElementById('s-vis').getBoundingClientRect(); return { x: r.left + r.width / 2, top: r.top, bottom: r.bottom }; });
+      await page.mouse.click(pr.x, pr.top > 120 ? pr.top - 12 : pr.bottom + 10); await page.waitForTimeout(200);
+      ok(!(await page.isVisible('#s-vis')), `${name}: an outside tap closes the panel`);
       ok(await page.evaluate(() => S.state !== 'EStop'), `${name}: popover use did not trigger the E-stop`);
     }
     if (r.scrolls) {
