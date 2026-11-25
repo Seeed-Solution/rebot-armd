@@ -9990,6 +9990,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let n = self.motor_ids.len().min(self.last_feedback_instant.len()).min(64);
         let active_pf = self.active_pos_force_joint();
         let pf_configured = self.pos_force.as_ref().map(|pf| pf.joint);
+        // During active operational output (enabled, output running every tick, not stopped),
+        // arm joints J1–J6 receive reply-producing motion frames in this very tick; reserve the
+        // single 0xCC slot for joints lacking reply-producing traffic (NoOutputUntilFresh J7,
+        // or post-freeze J7). In FailedHold, Idle-torqued (!output_ran_since_rx), and stopped
+        // states, every stale joint J1–J7 is served directly here.
+        let active_operational_output =
+            self.is_enabled && self.output_ran_since_rx && !self.is_stopped_for_disable();
         let mut stale = 0u64;
         for i in 0..n {
             let is_stale = if pf_configured == Some(i) {
@@ -10003,10 +10010,11 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 } else {
                     !self.pos_force_feedback_valid(i, now)
                 }
+            } else if active_operational_output {
+                false
             } else {
                 self.last_feedback_instant[i]
                     .is_none_or(|t| now.saturating_duration_since(t) >= DAMIAO_REFRESH_AFTER)
-                    || self.feedback_queue_bound.get(i).copied().flatten().is_none()
             };
             if is_stale {
                 stale |= 1u64 << i;
