@@ -5122,6 +5122,39 @@ impl SupervisorInner {
             Some(_) => !self.is_torqued && self.torque_intent == TorqueIntent::Off,
         }
     }
+    /// Quiesces active motion/targets, refreshes live measured-position hold provenance directly
+    /// from the attached driver at a release boundary (zero allocs, zero locks on `Exclusive`),
+    /// aligns `commanded_positions`/`target_positions` to fresh measured positions, and returns
+    /// `true` ONLY when every arm joint has verified finite hold coverage (DRV-F1 B2).
+    pub(crate) fn quiesce_motion_and_refresh_hold_for_handback(&mut self) -> bool {
+        self.active_trajectory = None;
+        self.release_servo_target();
+        self.servo_stream_active = false;
+        self.macro_run = None;
+        self.gravity_comp = None;
+        self.pending_normal_unload = false;
+        self.unload_settle = None;
+        self.commanded_velocities.fill(0.0);
+        self.commanded_accelerations.fill(0.0);
+        self.refresh_measured_hold_for_handback();
+        let dof = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
+        let arm_dof = self.config.arm_dof().min(dof);
+        let mut all_arm_covered = true;
+        for j in 0..dof {
+            if let Some(pos) = self.measured_hold.captured_positions[j].filter(|p| p.is_finite()) {
+                if j < self.commanded_positions.len() {
+                    self.commanded_positions[j] = pos;
+                }
+                if j < self.target_positions.len() {
+                    self.target_positions[j] = pos;
+                }
+            } else if j < arm_dof {
+                all_arm_covered = false;
+            }
+        }
+        all_arm_covered
+    }
+
     /// Refreshes live measured-position hold provenance directly from the attached driver at a
     /// release boundary (zero allocations, zero locks on `DriverSlot::Exclusive`) immediately
     /// before energized handback to Legacy ownership.
@@ -11196,6 +11229,9 @@ pub struct ArmSupervisor {
     /// Authoritative active bus-writer lifecycle endpoint (Legacy, Executor, or DetachedSafeHold)
     /// so daemon shutdown and deliberate process-exit always reach the actual writer (B4).
     active_writer: std::sync::Mutex<WriterEndpoint>,
+    /// Supervisor-wide sticky flag set when deliberate `ProcessExit` protective disable is
+    /// requested so concurrent ownership handback never strands the driver without disable (B3).
+    process_exit_requested: AtomicBool,
 }
 
 /// Authoritative endpoint for the single active hardware bus writer across startup, handback,
@@ -11587,6 +11623,7 @@ impl ArmSupervisor {
                 control_stop: None,
                 safe_hold: legacy_safe_hold,
             }),
+            process_exit_requested: AtomicBool::new(false),
         }
     }
 
@@ -11737,25 +11774,57 @@ impl ArmSupervisor {
         );
 
         if panicked {
-            // Fence all new commands/rearm and acquire exclusive ownership of the driver ONCE
-            // so SAFE-HOLD executes with zero mutexes, zero allocations, and zero planner calls.
-            let extract_deadline = Instant::now() + PANIC_DISABLE_TIMEOUT;
+            // Fence all new commands/rearm immediately and mark SAFE-HOLD active BEFORE acquiring
+            // the shell write guard. Never abandon an energized driver on transient lock contention
+            // (B7): keep retrying `try_write()` until the driver is extracted or confirmed disarmed
+            // (hardware-verified, B5), or deliberate ProcessExit wakes us.
+            safe_hold_ctrl.mark_active(crate::rt_core::safe_hold::SafeHoldReason::ControlPanic);
             let mut extracted_driver: Option<Box<dyn ArmDriver>> = None;
             loop {
                 if let Ok(mut guard) = self.inner.try_write() {
                     if !guard.detached {
-                        safe_hold_bufs.seed_on_entry(&guard);
-                        if !guard.shutdown_ready() {
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            safe_hold_bufs.seed_on_entry(&guard);
+                        }));
+                        if !crate::rt_core::executor::core_is_confirmed_disarmed(&guard) {
                             extracted_driver = guard
                                 .driver
                                 .take()
                                 .map(crate::supervisor_lock::DriverSlot::into_driver_recover_for_safe_hold);
+                            if extracted_driver.is_some() {
+                                // Publish exclusive SAFE-HOLD transition atomically under `guard`
+                                // so `try_set_driver()` and `start_executor()` can NEVER install a
+                                // second bus writer while SAFE-HOLD owns the hardware (B4).
+                                {
+                                    let mut slot =
+                                        self.owner.lock().unwrap_or_else(|e| e.into_inner());
+                                    *slot = OwnerSlot::Failed;
+                                    self.owner_mode.store(OWNER_FAILED, Ordering::Release);
+                                }
+                                {
+                                    let mut w = self
+                                        .active_writer
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner());
+                                    *w = WriterEndpoint::DetachedSafeHold {
+                                        safe_hold: Arc::clone(&safe_hold_ctrl),
+                                        control_stop: Arc::clone(&control_stop),
+                                    };
+                                }
+                            }
                         }
                     }
                     break;
                 }
-                if Instant::now() >= extract_deadline {
-                    break;
+                if safe_hold_ctrl.process_exit_requested() {
+                    // Process exit requested while shell write guard is still contended: run
+                    // bounded legacy panic disable once the lock frees within the exit deadline.
+                    let dl = safe_hold_ctrl.process_exit_deadline();
+                    let rem = dl.saturating_duration_since(Instant::now());
+                    let outcome = self.attempt_legacy_panic_disable(rem);
+                    safe_hold_ctrl.record_process_exit_outcome_lockfree(&outcome);
+                    safe_hold_ctrl.mark_exited();
+                    return;
                 }
                 std::thread::sleep(Duration::from_millis(1));
             }
@@ -11769,7 +11838,6 @@ impl ArmSupervisor {
                 );
                 drop(drv);
             } else {
-                safe_hold_ctrl.mark_active(crate::rt_core::safe_hold::SafeHoldReason::ControlPanic);
                 safe_hold_ctrl.mark_exited();
             }
         }
@@ -12379,18 +12447,22 @@ impl ArmSupervisor {
         }
     }
 
-    /// Hands ownership cleanly from `OWNER_EXECUTOR` back to a prepared `OWNER_LEGACY` owner
-    /// within one absolute `timeout` budget (DRV-F1 / R5 Blocker 1 / B1):
-    /// - Starts the single deadline at entry and uses a cancel-safe RAII guard so awaiting
-    ///   `self.inner.write()` can never strand `OWNER_TRANSFERRING`.
-    /// - Records the handback obligation BEFORE signaling `control_stop`, fences incoming
-    ///   commands/targets, transfers `Box<SupervisorInner>` + fresh measured hold state at a
-    ///   release boundary via lock-free SPSC (0 allocs on `armd-control`), converts the driver
-    ///   slot back to `Legacy` off-RT, and publishes `OWNER_LEGACY` ONLY when the legacy owner
-    ///   is ready to continue the hold.
-    /// - If handback stalls past the deadline while energized, `armd-control` keeps the
-    ///   exclusive driver in SAFE-HOLD and `OWNER_LEGACY` is NEVER published (single writer).
+    /// Hands ownership cleanly from `OWNER_EXECUTOR` back to `OWNER_LEGACY` when the driver is
+    /// already confirmed physically disarmed. Refuses energized handback without a prepared live
+    /// periodic legacy receiver — energized callers must use [`Self::handback_to_legacy_with_live_loop`]
+    /// so an energized arm is never left without a periodic writer (DRV-F1 B2).
     pub async fn handback_to_legacy(&self, timeout: Duration) -> Result<(), ArmError> {
+        self.handback_to_legacy_inner(timeout, None).await
+    }
+
+    async fn handback_to_legacy_inner(
+        &self,
+        timeout: Duration,
+        live_receiver: Option<(
+            &Arc<(std::sync::Mutex<Option<bool>>, std::sync::Condvar)>,
+            &Arc<AtomicBool>,
+        )>,
+    ) -> Result<(), ArmError> {
         let deadline = Instant::now() + timeout;
         let handle = {
             let mut slot = self.owner.lock().unwrap_or_else(|e| e.into_inner());
@@ -12451,6 +12523,15 @@ impl ArmSupervisor {
             }
         };
 
+        // Reject bare energized handback without a prepared live receiver BEFORE signaling stop (B2).
+        if live_receiver.is_none() && !handle.shutdown_ready().unwrap_or(false) {
+            return Err(ArmError::Rejected {
+                status: 409,
+                code: "HANDBACK_REQUIRES_LIVE_RECEIVER".into(),
+                message: "Energized handback requires a prepared live legacy receiver (use handback_to_legacy_with_live_loop)".into(),
+            });
+        }
+
         // Zero `.await` points below: commit handback request on `armd-control` within the SAME
         // deadline. Disarm the cancel guard only after we commit to either Legacy or Failed/SafeHold.
         match handle.take_handback_core_until(deadline) {
@@ -12473,12 +12554,21 @@ impl ArmSupervisor {
                 {
                     let mut w = self.active_writer.lock().unwrap_or_else(|e| e.into_inner());
                     *w = WriterEndpoint::Legacy {
-                        control_stop: None,
+                        control_stop: live_receiver.map(|(_, stop)| Arc::clone(stop)),
                         safe_hold: Arc::clone(&self.legacy_safe_hold),
                     };
                 }
                 hb_guard.handle = None;
                 drop(guard);
+                // Release the pre-spawned live legacy receiver IMMEDIATELY after dropping `guard`
+                // and BEFORE running bounded worker teardown so energized holds continue with
+                // minimal inter-frame gap (B2).
+                if let Some((ready, _)) = live_receiver {
+                    let (lock, cv) = &**ready;
+                    *lock.lock().unwrap_or_else(|e| e.into_inner()) = Some(true);
+                    cv.notify_all();
+                }
+                handle.finish_handback_cleanup_until(deadline);
                 self.try_drain_pending_disconnects_legacy();
                 Ok(())
             }
@@ -12523,10 +12613,10 @@ impl ArmSupervisor {
         }
     }
 
-    /// Starts a live legacy control loop parked on a ready gate, executes [`Self::handback_to_legacy`],
-    /// and immediately unparks the legacy loop once `OWNER_LEGACY` is published so energized holds
-    /// continue with bounded inter-frame gap (B1). On handback failure, cancels the parked thread
-    /// cleanly so no second writer ever runs.
+    /// Starts a live legacy control loop parked on a ready gate, executes energized handback,
+    /// and unparks the legacy loop immediately after restoring `self.inner` and publishing
+    /// `OWNER_LEGACY` (BEFORE worker cleanup finishes — B2). On handback failure, cancels the
+    /// parked thread cleanly so no second writer ever runs.
     pub async fn handback_to_legacy_with_live_loop(
         self: &Arc<Self>,
         timeout: Duration,
@@ -12559,16 +12649,11 @@ impl ArmSupervisor {
             })
             .map_err(|e| ArmError::Internal(format!("failed to prepare legacy receiver thread: {e}")))?;
 
-        match self.handback_to_legacy(timeout).await {
-            Ok(()) => {
-                self.register_legacy_control_stop(Arc::clone(&control_stop));
-                {
-                    let (lock, cv) = &*ready;
-                    *lock.lock().unwrap_or_else(|e| e.into_inner()) = Some(true);
-                    cv.notify_all();
-                }
-                Ok((control_stop, jh))
-            }
+        match self
+            .handback_to_legacy_inner(timeout, Some((&ready, &control_stop)))
+            .await
+        {
+            Ok(()) => Ok((control_stop, jh)),
             Err(e) => {
                 {
                     let (lock, cv) = &*ready;
@@ -14979,9 +15064,18 @@ impl ArmSupervisor {
                     Err(_) => return Err(crate::rt_core::executor::OwnerError::TimedOut.into()),
                 };
                 if self.check_legacy_under_guard(&inner).is_ok() {
-                    return tokio::task::spawn_blocking(move || inner.request_shutdown())
-                        .await
-                        .map_err(|e| ArmError::Internal(format!("request_shutdown blocking task failed: {e}")));
+                    let rem_after_lock = deadline.saturating_duration_since(Instant::now());
+                    if rem_after_lock.is_zero() {
+                        return Err(crate::rt_core::executor::OwnerError::TimedOut.into());
+                    }
+                    let task = tokio::task::spawn_blocking(move || inner.request_shutdown());
+                    return match tokio::time::timeout(rem_after_lock, task).await {
+                        Ok(Ok(ok)) => Ok(ok),
+                        Ok(Err(e)) => Err(ArmError::Internal(format!(
+                            "request_shutdown blocking task failed: {e}"
+                        ))),
+                        Err(_) => Err(crate::rt_core::executor::OwnerError::TimedOut.into()),
+                    };
                 }
                 drop(inner);
                 match self.executor_handle() {
@@ -15002,37 +15096,21 @@ impl ArmSupervisor {
     }
 
     /// Deliberate process-exit protective disable routed through the authoritative active writer
-    /// endpoint (`Executor`, `Legacy`, or `DetachedSafeHold`) under ONE absolute `deadline` (B4).
+    /// endpoint (`Executor`, `Legacy`, or `DetachedSafeHold`) under ONE absolute `deadline` (B3/B4/B11).
     pub async fn emergency_process_exit_disable_until(
         self: &Arc<Self>,
         deadline: Instant,
     ) -> PanicDisableOutcome {
-        self.estop_state.request_and_latch();
+        self.process_exit_requested.store(true, Ordering::Release);
+        self.estop_state.latch();
         self.internal_fault_lane.latch_control_safe_hold_fence();
-        match self.active_writer_endpoint() {
-            WriterEndpoint::DetachedSafeHold {
-                safe_hold,
-                control_stop,
-            } => {
-                control_stop.store(true, Ordering::Release);
-                safe_hold.request_process_exit_disable(deadline);
-                tokio::task::spawn_blocking(move || safe_hold.wait_process_exit_until(deadline))
-                    .await
-                    .unwrap_or_else(|je| PanicDisableOutcome::Failed(je.to_string()))
-            }
-            WriterEndpoint::Executor(handle) => {
-                tokio::task::spawn_blocking(move || handle.emergency_disable_and_join_until(deadline))
-                    .await
-                    .unwrap_or_else(|je| PanicDisableOutcome::Failed(je.to_string()))
-            }
-            WriterEndpoint::Legacy {
-                control_stop,
-                safe_hold,
-            } => {
-                if let Some(stop) = control_stop {
-                    self.signal_legacy_stop(&stop);
-                }
-                if safe_hold.is_active() {
+        for _attempt in 0..2 {
+            match self.active_writer_endpoint() {
+                WriterEndpoint::DetachedSafeHold {
+                    safe_hold,
+                    control_stop,
+                } => {
+                    control_stop.store(true, Ordering::Release);
                     safe_hold.request_process_exit_disable(deadline);
                     return tokio::task::spawn_blocking(move || {
                         safe_hold.wait_process_exit_until(deadline)
@@ -15040,13 +15118,47 @@ impl ArmSupervisor {
                     .await
                     .unwrap_or_else(|je| PanicDisableOutcome::Failed(je.to_string()));
                 }
-                let sup = Arc::clone(self);
-                let rem = deadline.saturating_duration_since(Instant::now());
-                tokio::task::spawn_blocking(move || sup.attempt_legacy_panic_disable(rem))
+                WriterEndpoint::Executor(handle) => {
+                    let h_em = handle.clone();
+                    let outcome = tokio::task::spawn_blocking(move || {
+                        h_em.emergency_disable_and_join_until(deadline)
+                    })
                     .await
-                    .unwrap_or_else(|je| PanicDisableOutcome::Failed(je.to_string()))
+                    .unwrap_or_else(|je| PanicDisableOutcome::Failed(je.to_string()));
+                    // If the executor completed a concurrent handback to Legacy right as ProcessExit
+                    // arrived, re-resolve the authoritative endpoint and disable via Legacy within
+                    // the SAME `deadline` (DRV-F1 B3).
+                    if handle.was_handed_back() {
+                        continue;
+                    }
+                    return outcome;
+                }
+                WriterEndpoint::Legacy {
+                    control_stop,
+                    safe_hold,
+                } => {
+                    if let Some(stop) = control_stop {
+                        self.signal_legacy_stop(&stop);
+                    }
+                    if safe_hold.is_active() {
+                        safe_hold.request_process_exit_disable(deadline);
+                        return tokio::task::spawn_blocking(move || {
+                            safe_hold.wait_process_exit_until(deadline)
+                        })
+                        .await
+                        .unwrap_or_else(|je| PanicDisableOutcome::Failed(je.to_string()));
+                    }
+                    let sup = Arc::clone(self);
+                    return tokio::task::spawn_blocking(move || {
+                        let rem = deadline.saturating_duration_since(Instant::now());
+                        sup.attempt_legacy_panic_disable(rem)
+                    })
+                    .await
+                    .unwrap_or_else(|je| PanicDisableOutcome::Failed(je.to_string()));
+                }
             }
         }
+        PanicDisableOutcome::TimedOut
     }
 
     pub async fn is_at_safe_resting_pose(&self) -> bool {

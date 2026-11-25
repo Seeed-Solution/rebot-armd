@@ -1078,7 +1078,7 @@ async fn stalled_handback_retains_exclusive_driver_in_safe_hold_never_publishes_
 
     let t0 = Instant::now();
     let res = sup
-        .handback_to_legacy(Duration::from_millis(60))
+        .handback_to_legacy_with_live_loop(Duration::from_millis(60), Duration::from_millis(5))
         .await;
     assert!(res.is_err(), "stalled handback must fail bounded");
     assert!(t0.elapsed() < Duration::from_millis(500));

@@ -417,8 +417,9 @@ impl SafeHoldBuffers {
     ///   stale, release-capped).
     #[inline]
     pub fn prepare_driver_on_entry(&self, drv: &mut dyn ArmDriver) {
-        drv.abort_enable();
-        drv.set_external_pos_force_emitter(false);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drv.prepare_safe_hold();
+        }));
     }
 
     /// Executes ONE zero-allocation, zero-lock SAFE-HOLD tick on an exclusively owned driver.
@@ -443,10 +444,10 @@ impl SafeHoldBuffers {
         };
         drv.set_tx_release_deadline(Some(drv_cap));
 
-        // 2. Zero-alloc RX intake (prefer budgeted RX; never calls allocating `read_joint_states`).
+        // 2. Zero-alloc live RX intake across all supported drivers (Damiao, RobStride, Feetech).
         let rx_deadline = drv_cap.min(drv_now + crate::rt_core::ops::RX_TIME_BUDGET);
         let rx_ok = drv
-            .read_joint_states_budgeted(&mut self.rx_states, rx_deadline, RX_FRAME_BUDGET)
+            .read_joint_states_safe_hold(&mut self.rx_states, rx_deadline, RX_FRAME_BUDGET)
             .is_ok()
             || drv.read_cached_joint_states_into(&mut self.rx_states).is_some();
 

@@ -210,6 +210,7 @@ impl InternalFaultLane {
 struct GlobalPanicState {
     lane_ptr: std::sync::atomic::AtomicPtr<InternalFaultLane>,
     coord_woken: AtomicBool,
+    control_panic_woken: AtomicBool,
     coord_thread: OnceLock<Thread>,
     hook_installed: AtomicBool,
     /// Keeps registered `Arc<InternalFaultLane>` alive so `lane_ptr` is always valid to deref
@@ -223,6 +224,7 @@ fn global_panic_state() -> &'static GlobalPanicState {
     GLOBAL_PANIC.get_or_init(|| GlobalPanicState {
         lane_ptr: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
         coord_woken: AtomicBool::new(false),
+        control_panic_woken: AtomicBool::new(false),
         coord_thread: OnceLock::new(),
         hook_installed: AtomicBool::new(false),
         owners: Mutex::new(Vec::new()),
@@ -241,6 +243,11 @@ pub fn install_process_panic_coordinator(lane: Arc<InternalFaultLane>) {
                 let st = global_panic_state();
                 loop {
                     thread::park();
+                    if st.control_panic_woken.swap(false, Ordering::AcqRel) {
+                        tracing::error!(
+                            "Control thread (armd-control) panicked; unwinding directly into preallocated SAFE-HOLD"
+                        );
+                    }
                     if st.coord_woken.swap(false, Ordering::AcqRel) {
                         let ptr = st.lane_ptr.load(Ordering::Acquire);
                         if !ptr.is_null() {
@@ -271,31 +278,38 @@ pub fn install_process_panic_coordinator(lane: Arc<InternalFaultLane>) {
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
-        let prev = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            // Tier 1: Control-thread panics unwind to `catch_unwind` -> SAFE-HOLD directly.
+        // Do NOT chain the previous hook: chaining stderr/diagnostic locks on the panic hook can
+        // block `armd-control` before its surrounding `catch_unwind` enters SAFE-HOLD (B12).
+        // All diagnostic logging runs asynchronously on the pre-spawned `armd-panic-coord` thread.
+        let _prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |_info| {
+            let Some(st) = GLOBAL_PANIC.get() else {
+                return;
+            };
+            if on_any_control_thread() {
+                // Tier 1: Control-thread panics notify off-thread coordinator lock-freely and
+                // return immediately so unwind reaches `catch_unwind` -> SAFE-HOLD without delay.
+                st.control_panic_woken.store(true, Ordering::Release);
+                if let Some(coord) = st.coord_thread.get() {
+                    coord.unpark();
+                }
+                return;
+            }
             // Tier 2: Non-control panics trigger the lock-free, allocation-free, non-logging,
             // non-waiting fence + owner-side park lane, and unpark `armd-panic-coord`.
-            if !on_any_control_thread() {
-                if let Some(st) = GLOBAL_PANIC.get() {
-                    let ptr = st.lane_ptr.load(Ordering::Acquire);
-                    if !ptr.is_null() {
-                        // SAFETY: `owners` retains the `Arc` for the lifetime of the process.
-                        let lane = unsafe { &*ptr };
-                        let cur = thread::current();
-                        let name = cur.name().unwrap_or("<unnamed>");
-                        if lane.trigger_non_control_panic(name) {
-                            st.coord_woken.store(true, Ordering::Release);
-                            if let Some(coord) = st.coord_thread.get() {
-                                coord.unpark();
-                            }
-                        }
+            let ptr = st.lane_ptr.load(Ordering::Acquire);
+            if !ptr.is_null() {
+                // SAFETY: `owners` retains the `Arc` for the lifetime of the process.
+                let lane = unsafe { &*ptr };
+                let cur = thread::current();
+                let name = cur.name().unwrap_or("<unnamed>");
+                if lane.trigger_non_control_panic(name) {
+                    st.coord_woken.store(true, Ordering::Release);
+                    if let Some(coord) = st.coord_thread.get() {
+                        coord.unpark();
                     }
                 }
             }
-            // Note: chaining `prev` preserves stderr backtrace in tests/diagnostics. For strict
-            // non-blocking panic hook behavior in production, `prev` writes directly to stderr.
-            prev(info);
         }));
     }
 }

@@ -348,7 +348,7 @@ where
 async fn finalize_shutdown_with_hook_until<F, Fut>(
     supervisor: &Arc<ArmSupervisor>,
     server_handle: &mut tokio::task::JoinHandle<std::io::Result<()>>,
-    executor_handle: Option<armd::rt_core::executor::RtExecutorHandle>,
+    _executor_handle: Option<armd::rt_core::executor::RtExecutorHandle>,
     legacy_control_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
     deadline: std::time::Instant,
     after_legacy_commit_before_abort: F,
@@ -357,8 +357,15 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    // Resolve authoritative active writer dynamically from `supervisor` (falling back to any
-    // handle passed by unit tests that construct `finalize_shutdown` directly).
+    // Reserve part of the ONE shared `deadline` for fallback emergency ProcessExit disable so
+    // initial commit attempts never exhaust the entire budget and fallback never mints a fresh
+    // timeout (DRV-F1 B11).
+    let now = std::time::Instant::now();
+    let total_rem = deadline.saturating_duration_since(now);
+    let commit_deadline = now + total_rem / 2;
+
+    // Resolve authoritative active writer dynamically from `supervisor` (never preferring a stale
+    // startup `executor_handle` once handback switched ownership to Legacy — DRV-F1 B3).
     let active = supervisor.active_writer_endpoint();
     match active {
         armd::supervisor::WriterEndpoint::DetachedSafeHold { .. } => {
@@ -375,9 +382,10 @@ where
         }
         armd::supervisor::WriterEndpoint::Executor(handle) => {
             let h_commit = handle.clone();
-            let commit_res =
-                tokio::task::spawn_blocking(move || h_commit.shutdown_and_join_until(deadline))
-                    .await;
+            let commit_res = tokio::task::spawn_blocking(move || {
+                h_commit.shutdown_and_join_until(commit_deadline)
+            })
+            .await;
             match commit_res {
                 Ok(Ok(())) => {
                     server_handle.abort();
@@ -387,11 +395,8 @@ where
                 Ok(Err(e)) => {
                     error!("Final shutdown commit refused/timed out by RT owner: {e}");
                     server_handle.abort();
-                    let emergency_dl = std::time::Instant::now()
-                        + armd::supervisor::PANIC_DISABLE_TIMEOUT
-                        + Duration::from_millis(100);
                     let outcome = supervisor
-                        .emergency_process_exit_disable_until(emergency_dl)
+                        .emergency_process_exit_disable_until(deadline)
                         .await;
                     outcome.log(
                         "Refused final shutdown torque-off",
@@ -404,11 +409,8 @@ where
                 Err(je) => {
                     error!("Final shutdown commit task failed: {je}");
                     server_handle.abort();
-                    let emergency_dl = std::time::Instant::now()
-                        + armd::supervisor::PANIC_DISABLE_TIMEOUT
-                        + Duration::from_millis(100);
                     let outcome = supervisor
-                        .emergency_process_exit_disable_until(emergency_dl)
+                        .emergency_process_exit_disable_until(deadline)
                         .await;
                     outcome.log(
                         "Failed final shutdown torque-off",
@@ -424,75 +426,20 @@ where
             control_stop: ep_stop,
             ..
         } => {
-            if let Some(handle) = executor_handle {
-                let h_commit = handle.clone();
-                let commit_res =
-                    tokio::task::spawn_blocking(move || h_commit.shutdown_and_join_until(deadline))
-                        .await;
-                match commit_res {
-                    Ok(Ok(())) => {
-                        server_handle.abort();
-                        info!("armd stopped after shutdown readiness confirmation");
-                        return Ok(());
-                    }
-                    Ok(Err(e)) => {
-                        error!("Final shutdown commit refused by RT owner: {e}");
-                        server_handle.abort();
-                        supervisor.estop_state.request_and_latch();
-                        let h_disable = handle.clone();
-                        let outcome = tokio::task::spawn_blocking(move || {
-                            h_disable.emergency_disable_and_join()
-                        })
-                        .await
-                        .unwrap_or_else(|je| {
-                            armd::supervisor::PanicDisableOutcome::Failed(je.to_string())
-                        });
-                        outcome.log(
-                            "Refused final shutdown torque-off",
-                            armd::supervisor::PANIC_DISABLE_TIMEOUT,
-                        );
-                        return Err(format!(
-                            "Final shutdown commit refused by RT owner: {e} (torque-off: {outcome:?})"
-                        ));
-                    }
-                    Err(je) => {
-                        error!("Final shutdown commit task failed: {je}");
-                        server_handle.abort();
-                        supervisor.estop_state.request_and_latch();
-                        let h_disable = handle.clone();
-                        let outcome = tokio::task::spawn_blocking(move || {
-                            h_disable.emergency_disable_and_join()
-                        })
-                        .await
-                        .unwrap_or_else(|e| {
-                            armd::supervisor::PanicDisableOutcome::Failed(e.to_string())
-                        });
-                        outcome.log(
-                            "Failed final shutdown torque-off",
-                            armd::supervisor::PANIC_DISABLE_TIMEOUT,
-                        );
-                        return Err(format!(
-                            "Final shutdown commit task failed: {je} (torque-off: {outcome:?})"
-                        ));
-                    }
-                }
-            }
-
             if let Some(control_stop) = ep_stop.or(legacy_control_stop) {
-                let confirmed = {
-                    let mut inner = supervisor.inner().write().await;
-                    inner.commit_shutdown()
+                let lock_rem = commit_deadline.saturating_duration_since(std::time::Instant::now());
+                let confirmed = match tokio::time::timeout(lock_rem, supervisor.inner().write()).await
+                {
+                    Ok(mut inner) => inner.commit_shutdown(),
+                    Err(_) => false,
                 };
                 if !confirmed {
-                    error!("Final legacy shutdown recheck refused: hardware disable is not confirmed");
+                    error!("Final legacy shutdown recheck refused or timed out: hardware disable is not confirmed");
                     server_handle.abort();
-                    supervisor.estop_state.request_and_latch();
+                    supervisor.estop_state.latch();
                     supervisor.signal_legacy_stop(&control_stop);
-                    let emergency_dl = std::time::Instant::now()
-                        + armd::supervisor::PANIC_DISABLE_TIMEOUT
-                        + Duration::from_millis(100);
                     let outcome = supervisor
-                        .emergency_process_exit_disable_until(emergency_dl)
+                        .emergency_process_exit_disable_until(deadline)
                         .await;
                     outcome.log(
                         "Refused legacy final shutdown torque-off",

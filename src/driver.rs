@@ -1166,6 +1166,17 @@ pub trait ArmDriver: Send {
         self.read_joint_states_into(out)?;
         Ok((0, false))
     }
+    /// Bounded live RX pass used by SAFE-HOLD so every supported legacy/RT driver (including
+    /// serial Feetech, RobStride, and Damiao) maintains live thermal/freshness monitoring without
+    /// heap allocation (DRV-F1 B9). Defaults to [`Self::read_joint_states_budgeted`].
+    fn read_joint_states_safe_hold(
+        &mut self,
+        out: &mut Vec<JointState>,
+        deadline: Instant,
+        max_rx_frames: u16,
+    ) -> Result<(u16, bool), ArmDriverError> {
+        self.read_joint_states_budgeted(out, deadline, max_rx_frames)
+    }
     /// Copy the driver's already-cached joint states into `out` without touching the bus.
     /// Returns `None` if the driver does not maintain an inspectable cache.
     fn read_cached_joint_states_into(&self, _out: &mut Vec<JointState>) -> Option<()> {
@@ -1560,6 +1571,14 @@ pub trait ArmDriver: Send {
     /// Aborts any pending enable handshake without transmitting further enable frames
     /// (called when E-stop or a fault intervenes mid-enable).
     fn abort_enable(&mut self) {}
+    /// Prepares an exclusively owned driver on SAFE-HOLD entry: aborts any interrupted enable
+    /// handshake AND reconciles any abandoned disable handshake while preserving
+    /// `disable_dispatched_mask` so remaining energized axes keep receiving measured-position holds
+    /// (DRV-F1 B10), and switches PosForce J7 into standalone emitter mode.
+    fn prepare_safe_hold(&mut self) {
+        self.abort_enable();
+        self.set_external_pos_force_emitter(false);
+    }
 
     /// One panic-disable retry step for multi-motor drivers: transmits disable to every motor
     /// not yet confirmed disabled without aborting remaining motors on a single-motor TX error,
@@ -4941,6 +4960,16 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         Err(ArmDriverError::ProtocolStatic("UNSUPPORTED: serial driver does not support budgeted RX"))
     }
 
+    fn read_joint_states_safe_hold(
+        &mut self,
+        out: &mut Vec<JointState>,
+        _deadline: Instant,
+        _max_rx_frames: u16,
+    ) -> Result<(u16, bool), ArmDriverError> {
+        self.read_joint_states_into(out)?;
+        Ok((out.len() as u16, false))
+    }
+
     fn read_cached_joint_states_into(&self, out: &mut Vec<JointState>) -> Option<()> {
         out.clear();
         out.extend_from_slice(&self.cached_states);
@@ -5848,6 +5877,19 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
 
     fn feedback_ages(&self) -> Vec<Option<Duration>> {
         self.last_feedback_instant.iter().map(|t| t.map(|t| self.since(t))).collect()
+    }
+
+    fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
+        out.clear();
+        out.extend(self.last_feedback_instant.iter().map(|t| t.map(|t| self.since(t))));
+    }
+
+    fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool {
+        self.last_feedback_instant.len() == dof
+            && self
+                .last_feedback_instant
+                .iter()
+                .all(|t| t.is_some_and(|t| self.since(t) <= max_age))
     }
 
     fn feedback_instants(&self) -> Vec<Option<Instant>> {
@@ -12496,6 +12538,19 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         self.last_feedback_instant.iter().map(|t| t.map(|t| self.since(t))).collect()
     }
 
+    fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
+        out.clear();
+        out.extend(self.last_feedback_instant.iter().map(|t| t.map(|t| self.since(t))));
+    }
+
+    fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool {
+        self.last_feedback_instant.len() == dof
+            && self
+                .last_feedback_instant
+                .iter()
+                .all(|t| t.is_some_and(|t| self.since(t) <= max_age))
+    }
+
     fn feedback_instants(&self) -> Vec<Option<Instant>> {
         self.last_feedback_instant.clone()
     }
@@ -13053,8 +13108,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
     fn begin_torque_budgeted(&mut self, enabled: bool, max_rx_frames: u16) -> Result<TorqueProgress, ArmDriverError> {
         if !self.can.supports_nonblocking_rt() {
-            return Err(ArmDriverError::Protocol(
-                "UNSUPPORTED: CAN transport does not support non-blocking RT I/O".into(),
+            return Err(ArmDriverError::ProtocolStatic(
+                "UNSUPPORTED: CAN transport does not support non-blocking RT I/O",
             ));
         }
         if enabled {
@@ -13074,8 +13129,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         max_rx_frames: u16,
     ) -> Result<TorqueProgress, ArmDriverError> {
         if !self.can.supports_nonblocking_rt() {
-            return Err(ArmDriverError::Protocol(
-                "UNSUPPORTED: CAN transport does not support non-blocking RT I/O".into(),
+            return Err(ArmDriverError::ProtocolStatic(
+                "UNSUPPORTED: CAN transport does not support non-blocking RT I/O",
             ));
         }
         self.begin_disable_budgeted(kind, Some(max_rx_frames))
@@ -13101,8 +13156,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
     fn poll_torque_budgeted(&mut self, deadline: Instant, max_rx_frames: u16) -> Result<TorqueProgress, ArmDriverError> {
         if !self.can.supports_nonblocking_rt() {
-            return Err(ArmDriverError::Protocol(
-                "UNSUPPORTED: CAN transport does not support non-blocking RT I/O".into(),
+            return Err(ArmDriverError::ProtocolStatic(
+                "UNSUPPORTED: CAN transport does not support non-blocking RT I/O",
             ));
         }
         self.poll_torque_inner(deadline, max_rx_frames)
@@ -13124,6 +13179,20 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             self.torque_hs = None;
             self.enable_failed();
         }
+    }
+
+    fn prepare_safe_hold(&mut self) {
+        self.abort_enable();
+        // Also clear any abandoned in-flight disable handshake while preserving
+        // `self.disable_dispatched_mask` so already-disabled axes remain `SkippedOff` while all
+        // remaining energized axes continue receiving measured-position holds (DRV-F1 B10).
+        if matches!(
+            self.torque_hs,
+            Some(DamiaoTorque::Disable { .. } | DamiaoTorque::AwaitRestGate { .. })
+        ) {
+            self.torque_hs = None;
+        }
+        self.set_external_pos_force_emitter(false);
     }
 
     fn panic_disable_step(
@@ -15276,8 +15345,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         max_rx_frames: u16,
     ) -> Result<(u16, bool), ArmDriverError> {
         if !self.can.supports_nonblocking_rt() {
-            return Err(ArmDriverError::Protocol(
-                "UNSUPPORTED: CAN transport does not support non-blocking RT I/O".into(),
+            return Err(ArmDriverError::ProtocolStatic(
+                "UNSUPPORTED: CAN transport does not support non-blocking RT I/O",
             ));
         }
         if !self.control_release_managed {
@@ -15301,13 +15370,6 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         Some(())
     }
 
-    fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
-        out.clear();
-        out.extend(self.last_feedback_instant.iter().map(|t| t.map(|t| self.since(t))));
-    }
-    fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool {
-        self.last_feedback_instant.len() == dof && self.last_feedback_instant.iter().all(|t| t.is_some_and(|t| self.since(t) <= max_age))
-    }
     fn feedback_joints_within(&self, joints: &[usize], max_age: Duration) -> bool {
         joints.iter().all(|&i| {
             self.last_feedback_instant
@@ -16979,6 +17041,19 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
 
     fn feedback_ages(&self) -> Vec<Option<Duration>> {
         self.last_feedback_instant.iter().map(|t| t.map(|t| self.since(t))).collect()
+    }
+
+    fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
+        out.clear();
+        out.extend(self.last_feedback_instant.iter().map(|t| t.map(|t| self.since(t))));
+    }
+
+    fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool {
+        self.last_feedback_instant.len() == dof
+            && self
+                .last_feedback_instant
+                .iter()
+                .all(|t| t.is_some_and(|t| self.since(t) <= max_age))
     }
 
     fn feedback_instants(&self) -> Vec<Option<Instant>> {

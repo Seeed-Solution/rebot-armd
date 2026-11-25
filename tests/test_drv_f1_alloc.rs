@@ -404,15 +404,18 @@ async fn executor_energized_handback_and_safe_hold_zero_rt_allocs() {
             armd::diagnostics::alloc::AllocCounts::ZERO,
             "RT releases before handback must perform 0 heap ops"
         );
-        sup.handback_to_legacy(Duration::from_secs(2))
+        let (legacy_stop, legacy_jh) = sup
+            .handback_to_legacy_with_live_loop(Duration::from_secs(2), Duration::from_millis(5))
             .await
-            .expect("handback succeeds");
+            .expect("energized handback succeeds");
         assert_eq!(sup.owner_mode(), OWNER_LEGACY);
         assert_eq!(sup.driver_lock_attempts(), 0);
         let outcome = sup
             .emergency_process_exit_disable_until(Instant::now() + Duration::from_secs(2))
             .await;
         assert_eq!(outcome, PanicDisableOutcome::Confirmed);
+        legacy_stop.store(true, Ordering::Release);
+        legacy_jh.join().unwrap();
     }
 
     // (b) Executor panic -> SAFE-HOLD ticks run cleanly with `alloc_timing` enabled and

@@ -2301,22 +2301,30 @@ impl OffThreadSinks {
             }
         }
         {
-            let mut log_g = self.safety_log_rx.lock().unwrap_or_else(|e| e.into_inner());
-            let total = self.stats.safety_log_dropped.load(Ordering::Relaxed);
-            let delta = total.saturating_sub(log_g.1);
-            if delta > 0 {
-                log_g.1 = total;
+            let mut deferred_events = Vec::new();
+            let mut drop_report = None;
+            {
+                let mut log_g = self.safety_log_rx.lock().unwrap_or_else(|e| e.into_inner());
+                let total = self.stats.safety_log_dropped.load(Ordering::Relaxed);
+                let delta = total.saturating_sub(log_g.1);
+                if delta > 0 {
+                    log_g.1 = total;
+                    drop_report = Some((delta, total));
+                }
+                while let Ok(ev) = log_g.0.pop() {
+                    deferred_events.push(ev);
+                }
+                if let Ok(mut sh) = self.shutdown_hold_error.try_lock() {
+                    if let Some(ev) = sh.take() {
+                        deferred_events.push(ev);
+                    }
+                }
+            }
+            // Emit logs strictly AFTER releasing `safety_log_rx` mutex (DRV-F1 B11).
+            if let Some((delta, total)) = drop_report {
                 crate::safety::emit_safety_log_dropped(delta, total);
             }
-            while let Ok(ev) = log_g.0.pop() {
-                ev.emit();
-            }
-            if let Some(ev) = self
-                .shutdown_hold_error
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take()
-            {
+            for ev in deferred_events {
                 ev.emit();
             }
         }
@@ -2484,7 +2492,24 @@ pub(crate) struct LifecycleControl {
     handback_token: AtomicU64,
     handback_deadline_ns: AtomicU64,
     handback_state: AtomicU8,
+    /// Single-slot lock-free ownership handoff pointer stored BEFORE `CAS(HB_PENDING -> HB_HANDED_BACK)`
+    /// so `HB_HANDED_BACK` guarantees immediate payload availability without post-deadline spins (B1).
+    handback_slot: std::sync::atomic::AtomicPtr<SupervisorInner>,
     pub(crate) safe_hold: Arc<super::safe_hold::SafeHoldControl>,
+}
+
+impl Drop for LifecycleControl {
+    fn drop(&mut self) {
+        let raw = self
+            .handback_slot
+            .swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if !raw.is_null() {
+            // SAFETY: `raw` came from `Box::into_raw` and was never claimed.
+            unsafe {
+                drop(Box::from_raw(raw));
+            }
+        }
+    }
 }
 
 impl LifecycleControl {
@@ -2500,6 +2525,7 @@ impl LifecycleControl {
             handback_token: AtomicU64::new(0),
             handback_deadline_ns: AtomicU64::new(0),
             handback_state: AtomicU8::new(HB_IDLE),
+            handback_slot: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
             safe_hold,
         }
     }
@@ -2636,15 +2662,24 @@ impl LifecycleControl {
         token
     }
 
-    /// Owner-side lock-free handback commit at a release boundary (0 allocs, 0 locks).
-    /// Transfers `core` into the preallocated SPSC ring ONLY if the caller has not timed out and
-    /// `Instant::now() < deadline`. On rejection, returns `Err(core)` so `armd-control` keeps
-    /// exclusive ownership and enters SAFE-HOLD.
+    /// Owner-side lock-free handback commit at a release boundary (0 allocs, 0 frees, 0 locks).
+    /// Stores `Box::into_raw(core)` into `handback_slot` BEFORE publishing `HB_HANDED_BACK` so
+    /// the receiver is guaranteed to claim the payload immediately on `HB_HANDED_BACK` (B1).
+    /// Rejects handback if `ProcessExit` was raised (B3) or deadline expired; on rejection,
+    /// atomically reclaims `core` without losing or dropping ownership.
     pub(crate) fn try_commit_handback(
         &self,
         core: Box<SupervisorInner>,
-        handback_tx: &mut Producer<Box<SupervisorInner>>,
     ) -> Result<(), Box<SupervisorInner>> {
+        if self.current_request() >= LC_REQ_PROCESS_EXIT {
+            let _ = self.handback_state.compare_exchange(
+                HB_PENDING,
+                HB_SAFE_HOLD,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            return Err(core);
+        }
         let dl_ns = self.handback_deadline_ns.load(Ordering::Acquire);
         if self.handback_state.load(Ordering::Acquire) != HB_PENDING || self.now_rel_ns() >= dl_ns {
             let _ = self.handback_state.compare_exchange(
@@ -2655,19 +2690,11 @@ impl LifecycleControl {
             );
             return Err(core);
         }
-        if handback_tx.is_abandoned() || handback_tx.is_full() {
-            let _ = self.handback_state.compare_exchange(
-                HB_PENDING,
-                HB_TIMED_OUT,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
-            return Err(core);
-        }
-        // Push into the SPSC ring FIRST, then atomically publish `HB_HANDED_BACK`. Because
-        // `handback_tx` has capacity 1 and is single-producer, if `CAS` fails we cannot pop back
-        // from a `Producer`, so arbitrate `CAS(Pending -> HandedBack)` ONLY when `now < dl_ns`
-        // and immediately push (guaranteed space since cap=1 and single handback).
+        // Publish raw pointer BEFORE CAS(Pending -> HandedBack). Only `armd-control` writes to
+        // `handback_slot` and the caller reads it ONLY after observing `HB_HANDED_BACK`.
+        let raw = Box::into_raw(core);
+        let prev = self.handback_slot.swap(raw, Ordering::Release);
+        debug_assert!(prev.is_null(), "handback_slot must be empty before commit");
         if self
             .handback_state
             .compare_exchange(
@@ -2676,19 +2703,40 @@ impl LifecycleControl {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .is_err()
+            .is_ok()
         {
-            return Err(core);
+            self.set_owner_state(LC_OWNER_HANDED_BACK);
+            Ok(())
+        } else {
+            let reclaimed = self
+                .handback_slot
+                .swap(std::ptr::null_mut(), Ordering::AcqRel);
+            // SAFETY: CAS failed so receiver never claims `handback_slot`.
+            Err(unsafe { Box::from_raw(reclaimed) })
         }
-        match handback_tx.push(core) {
-            Ok(()) => {
-                self.set_owner_state(LC_OWNER_HANDED_BACK);
-                Ok(())
-            }
-            Err(rtrb::PushError::Full(core)) => {
-                self.handback_state.store(HB_SAFE_HOLD, Ordering::Release);
-                Err(core)
-            }
+    }
+
+    /// Marks handback explicitly aborted into SAFE-HOLD on `armd-control` (e.g. unverified hold or
+    /// prep panic) so the caller stops waiting immediately without waiting for `deadline` (B2/B6).
+    pub(crate) fn abort_handback_to_safe_hold(&self) {
+        let _ = self.handback_state.compare_exchange(
+            HB_PENDING,
+            HB_SAFE_HOLD,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    /// Claims the handed-back `Box<SupervisorInner>` immediately after `HB_HANDED_BACK` (B1).
+    pub(crate) fn take_handed_back_core(&self) -> Option<Box<SupervisorInner>> {
+        let raw = self
+            .handback_slot
+            .swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if raw.is_null() {
+            None
+        } else {
+            // SAFETY: `raw` was stored by `try_commit_handback` before `HB_HANDED_BACK`.
+            Some(unsafe { Box::from_raw(raw) })
         }
     }
 
@@ -3535,10 +3583,7 @@ impl TargetWriterGuard<'_> {
 ///   checkpoint immediately before `drop(core)`.
 /// - `exited` becomes `true` strictly AFTER `drop(core)` completes on `armd-control`.
 #[derive(Clone, Copy, Default)]
-struct ControlExitState {
-    dropping: bool,
-    exited: bool,
-}
+struct ControlExitState;
 
 struct RtExecutorShared {
     boot: BootId,
@@ -3567,7 +3612,6 @@ struct RtExecutorShared {
     teardown_disable: Arc<TeardownDisable>,
     teardown_disable_timeout: Duration,
     lifecycle: Arc<LifecycleControl>,
-    handback_rx: Mutex<Consumer<Box<SupervisorInner>>>,
     internal_fault_lane: Arc<crate::panic_coord::InternalFaultLane>,
     persist_thread: Mutex<Option<JoinHandle<()>>>,
     control_thread: Mutex<Option<JoinHandle<()>>>,
@@ -3708,19 +3752,32 @@ impl RtExecutorShared {
             );
         }
 
-        // Final off-thread drain and reclamation.
-        self.maint_client.finish_stopped();
-        self.urgent_stop_client.finish_stopped();
-        self.conn_lifecycle_client.finish_stopped();
-        self.broker_dispatcher.finish_stopped();
-        self.sinks.flush_and_report_shutdown(&self.tick_stats);
-        self.servo_dispatcher.finish_stopped(&self.hub);
-        if let Some(ring) = self.hub.record_ring() {
-            ring.drain();
+        // Final off-thread drain and reclamation: strictly bounded by the shared `deadline` and
+        // non-blocking on contended locks (DRV-F1 B11).
+        if Instant::now() < deadline {
+            self.maint_client.finish_stopped();
+            self.urgent_stop_client.finish_stopped();
+            self.conn_lifecycle_client.finish_stopped();
+            self.broker_dispatcher.finish_stopped();
+            if Instant::now() < deadline {
+                self.sinks.flush_and_report_shutdown(&self.tick_stats);
+            }
+            if Instant::now() < deadline {
+                self.servo_dispatcher.finish_stopped(&self.hub);
+            }
+            if Instant::now() < deadline {
+                if let Some(ring) = self.hub.record_ring() {
+                    ring.drain();
+                }
+                let _ = self.hub.latest();
+            }
+            if let Ok(mut b) = self.broker.try_lock() {
+                b.poll(|_, _| true);
+            }
+            if let Ok(mut r) = self.reply_router.try_lock() {
+                r.waiters.clear();
+            }
         }
-        let _ = self.hub.latest();
-        self.broker.lock().unwrap_or_else(|e| e.into_inner()).poll(|_, _| true);
-        self.reply_router.lock().unwrap_or_else(|e| e.into_inner()).waiters.clear();
     }
 
     fn default_teardown_deadline(&self) -> Instant {
@@ -4715,10 +4772,13 @@ impl RtExecutorHandle {
     }
 
     /// Records a token-bound energized handback obligation BEFORE signaling `control_stop`,
-    /// fences incoming commands/targets, and waits up to `deadline` for `armd-control` to
-    /// transfer `Box<SupervisorInner>` + fresh measured hold state through the preallocated SPSC
-    /// channel. If handback stalls past `deadline`, `armd-control` retains exclusive driver
-    /// ownership in SAFE-HOLD and this returns `Err(HandbackFailure::TimedOutSafeHold)`.
+    /// fences incoming commands/targets, and waits up to `deadline` for `armd-control` to commit
+    /// `Box<SupervisorInner>` into the lock-free `AtomicPtr` slot (`HB_HANDED_BACK` guarantees
+    /// immediate payload availability with zero post-deadline spin, B1).
+    ///
+    /// Returns `Ok(core)` IMMEDIATELY without waiting for monitor/persist cleanup so the caller
+    /// can restore the legacy owner and unpark the live legacy receiver first (B2), then finish
+    /// worker cleanup via [`Self::finish_handback_cleanup_until`].
     pub(crate) fn take_handback_core_until(
         &self,
         deadline: Instant,
@@ -4754,43 +4814,12 @@ impl RtExecutorHandle {
         }
         let final_state = self.shared.lifecycle.finish_handback_timeout_check(token);
         if final_state == HB_HANDED_BACK {
-            let mut core_opt = self
-                .shared
-                .handback_rx
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .pop()
-                .ok();
-            // Briefly spin in case owner CASed `HB_HANDED_BACK` just before pushing to SPSC.
-            while core_opt.is_none() {
-                let rem = deadline.saturating_duration_since(Instant::now());
-                if rem.is_zero() && self.shared.exited.load(Ordering::Acquire) {
-                    break;
-                }
-                if let Ok(c) = self
-                    .shared
-                    .handback_rx
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .pop()
-                {
-                    core_opt = Some(c);
-                    break;
-                }
-                if self.shared.lifecycle.handback_state() == HB_SAFE_HOLD {
-                    break;
-                }
-                thread::yield_now();
-            }
-            self.shared
-                .teardown_and_join_until(deadline, LC_REQ_HANDBACK);
-            if let Some(core) = core_opt {
+            if let Some(core) = self.shared.lifecycle.take_handed_back_core() {
                 return Ok(core);
             }
-        } else {
-            self.shared
-                .teardown_and_join_until(deadline, LC_REQ_HANDBACK);
         }
+        self.shared
+            .teardown_and_join_until(deadline, LC_REQ_HANDBACK);
         if self.shared.lifecycle.owner_state() == LC_OWNER_SAFE_HOLD
             || self.shared.lifecycle.safe_hold.is_active()
             || !self.shared.exited.load(Ordering::Acquire)
@@ -4799,6 +4828,19 @@ impl RtExecutorHandle {
         } else {
             Err(HandbackFailure::ExecutorExited)
         }
+    }
+
+    /// Finishes bounded off-control worker cleanup (control/monitor/persist join or detach) after
+    /// the legacy owner has already resumed live periodic control (B2).
+    pub(crate) fn finish_handback_cleanup_until(&self, deadline: Instant) {
+        self.shared
+            .teardown_and_join_until(deadline, LC_REQ_HANDBACK);
+    }
+
+    /// True if `armd-control` already handed `core` back to Legacy (`LC_OWNER_HANDED_BACK`) (B3).
+    pub(crate) fn was_handed_back(&self) -> bool {
+        self.shared.lifecycle.owner_state() == LC_OWNER_HANDED_BACK
+            || self.shared.lifecycle.handback_state() == HB_HANDED_BACK
     }
 
     #[doc(hidden)]
@@ -4938,13 +4980,12 @@ pub(crate) fn spawn_executor(
         Arc::clone(&reply_router),
         exited.clone(),
     ));
-    let control_exited_cv = Arc::new((Mutex::new(ControlExitState::default()), Condvar::new()));
+    let control_exited_cv = Arc::new((Mutex::new(ControlExitState), Condvar::new()));
     let persist_worker_exited = Arc::new(AtomicBool::new(false));
     let persist_exited_cv = Arc::new((Mutex::new(false), Condvar::new()));
     let teardown_disable = Arc::new(TeardownDisable::default());
     let safe_hold_ctrl = Arc::new(super::safe_hold::SafeHoldControl::new());
     let lifecycle = Arc::new(LifecycleControl::new(Arc::clone(&safe_hold_ctrl)));
-    let (handback_tx, handback_rx) = RingBuffer::<Box<SupervisorInner>>::new(1);
     let stats = Arc::new(ExecutorStats::default());
 
     let shutdown_hold_error = Arc::new(Mutex::new(None));
@@ -5054,7 +5095,6 @@ pub(crate) fn spawn_executor(
                     control_exited_cv,
                     teardown_disable,
                     lifecycle_ctrl,
-                    handback_tx,
                     internal_fault_lane_ctrl,
                     stats,
                     control_sched,
@@ -5206,7 +5246,6 @@ pub(crate) fn spawn_executor(
         teardown_disable,
         teardown_disable_timeout: startup_bound,
         lifecycle,
-        handback_rx: Mutex::new(handback_rx),
         internal_fault_lane,
         persist_thread: Mutex::new(Some(persist_thread)),
         control_thread_handle: control_thread.thread().clone(),
@@ -5393,28 +5432,28 @@ impl ControlState {
         while let Some(ack) = core.pending_estop_acks.pop_front() {
             self.estop_overflow_gen.fetch_max(ack.last_gen, Ordering::Release);
             if let Err(rtrb::PushError::Full(state)) = self.reclaim_state_tx.push(ack.state) {
-                let _ = self.offload_reclaim_tx.push(OffloadReclaim::SafetyState(state));
+                push_offload_no_rt_free(&mut self.offload_reclaim_tx, OffloadReclaim::SafetyState(state));
             }
         }
         self.drain_retired_states(core, now);
         while let Some(arc) = core.safety.pop_retired_state_arc() {
             if let Err(rtrb::PushError::Full(state)) = self.reclaim_state_tx.push(arc) {
-                let _ = self.offload_reclaim_tx.push(OffloadReclaim::SafetyState(state));
+                push_offload_no_rt_free(&mut self.offload_reclaim_tx, OffloadReclaim::SafetyState(state));
             }
         }
         while let Some(retired) = core.pending_retired_stops.pop_front() {
             if let Err(rtrb::PushError::Full(retired)) = self.reclaim_stop_tx.push(retired) {
-                let _ = self.offload_reclaim_tx.push(OffloadReclaim::RetiredStop(retired));
+                push_offload_no_rt_free(&mut self.offload_reclaim_tx, OffloadReclaim::RetiredStop(retired));
             }
         }
         while let Some(traj) = core.pop_retired_trajectory() {
             if let Err(rtrb::PushError::Full(traj)) = self.reclaim_traj_tx.push(traj) {
-                let _ = self.offload_reclaim_tx.push(OffloadReclaim::ActiveTrajectory(traj));
+                push_offload_no_rt_free(&mut self.offload_reclaim_tx, OffloadReclaim::ActiveTrajectory(traj));
             }
         }
         while let Some(run) = core.pop_retired_macro_run() {
             if let Err(rtrb::PushError::Full(run)) = self.reclaim_macro_tx.push(run) {
-                let _ = self.offload_reclaim_tx.push(OffloadReclaim::MacroRun(run));
+                push_offload_no_rt_free(&mut self.offload_reclaim_tx, OffloadReclaim::MacroRun(run));
             }
         }
         #[cfg(feature = "policy-runtime")]
@@ -7498,38 +7537,41 @@ impl StartupGate {
     }
 }
 
+/// Lock-free offload helper for `armd-control`: pushes a heap-owning item into `offload_reclaim_tx`
+/// and never drops/frees it on `armd-control` if the ring is full (B8).
+#[inline]
+fn push_offload_no_rt_free(tx: &mut Producer<OffloadReclaim>, item: OffloadReclaim) {
+    if let Err(rtrb::PushError::Full(rejected)) = tx.push(item) {
+        std::mem::forget(rejected);
+    }
+}
+
 /// RAII fallback guard on `armd-control`: if startup exits or unwinds unexpectedly before
 /// settling `StartupGate`, latches shared E-stop BEFORE publishing terminal failure.
+/// Once `settled = true`, `Drop` is strictly lock-free and allocation-free (B8).
 struct StartupAbortGuard {
+    settled: bool,
     gate: StartupGate,
     estop_state: Arc<crate::rt_core::urgent::EstopState>,
-    control_exited_cv: Arc<(Mutex<ControlExitState>, Condvar)>,
     exited: Arc<AtomicBool>,
     hub: Arc<StateHub>,
 }
 
 impl Drop for StartupAbortGuard {
     fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
         let still_pending = matches!(
             *self.gate.0.slot.lock().unwrap_or_else(|e| e.into_inner()),
             StartupSlot::Pending
         );
         if still_pending {
-            self.estop_state.request_and_latch();
+            self.estop_state.latch();
             let _ = self.gate.try_settle_failed(SpawnExecutorError::Fatal(
                 "armd-control exited unexpectedly before signaling readiness".into(),
             ));
             self.exited.store(true, Ordering::Release);
-            {
-                let mut st = self
-                    .control_exited_cv
-                    .0
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                st.dropping = true;
-                st.exited = true;
-            }
-            self.control_exited_cv.1.notify_all();
             self.hub.wake();
         }
     }
@@ -7547,16 +7589,15 @@ fn stop_and_join_persist_bounded(
     let _ = join_or_detach_until(persist_thread, deadline, "armd-persist");
 }
 
-/// Returns `true` ONLY when `core` has no driver or is confirmed physically disarmed with zero
-/// pending torque/gravity-comp/disable work. Any energized, pending, `EnableState::Unknown`, or
-/// panicking `enable_state()` probe returns `false` (fail-closed -> retain driver in SAFE-HOLD).
-fn core_is_confirmed_disarmed(core: &SupervisorInner) -> bool {
-    if core.driver.is_none() {
+/// Returns `true` ONLY when `core` has no driver OR hardware explicitly confirms
+/// `EnableState::Disabled` with zero active torque/gravity-comp/disable transitions (DRV-F1 B5).
+/// Never treats software `shutdown_ready()` / `TorqueIntent::Off` alone as physical disarm:
+/// `EnableState::Enabled`, `EnableState::Unknown`, unconfirmed disable, or probe panic all return
+/// `false` (fail-closed -> retain sole ownership in SAFE-HOLD).
+pub(crate) fn core_is_confirmed_disarmed(core: &SupervisorInner) -> bool {
+    let Some(slot) = core.driver.as_ref() else {
         return true;
-    }
-    if core.shutdown_ready() {
-        return true;
-    }
+    };
     if core.is_torqued
         || core.disable_pending
         || core.gravity_comp.is_some()
@@ -7564,9 +7605,6 @@ fn core_is_confirmed_disarmed(core: &SupervisorInner) -> bool {
     {
         return false;
     }
-    let Some(slot) = core.driver.as_ref() else {
-        return true;
-    };
     matches!(
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             slot.try_with_ref(|drv| drv.enable_state())
@@ -7655,18 +7693,13 @@ fn run_bounded_teardown_disable(
     }
 }
 
+/// Lock-free, allocation-free exit publication on `armd-control` (DRV-F1 B8).
 fn mark_control_exited(
     exited: &AtomicBool,
-    control_exited_cv: &(Mutex<ControlExitState>, Condvar),
+    _control_exited_cv: &(Mutex<ControlExitState>, Condvar),
     hub: &StateHub,
 ) {
     exited.store(true, Ordering::Release);
-    {
-        let mut st = control_exited_cv.0.lock().unwrap_or_else(|e| e.into_inner());
-        st.dropping = true;
-        st.exited = true;
-    }
-    control_exited_cv.1.notify_all();
     hub.wake();
 }
 
@@ -7690,7 +7723,9 @@ fn run_executor_safe_hold(
 ) {
     estop_state.latch();
     internal_fault_lane.latch_control_safe_hold_fence();
-    safe_hold_bufs.seed_on_entry(&core);
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        safe_hold_bufs.seed_on_entry(&core);
+    }));
     lifecycle.set_owner_state(LC_OWNER_SAFE_HOLD);
     let has_drv = core
         .driver
@@ -7758,7 +7793,6 @@ fn control_thread_main(
     control_exited_cv: Arc<(Mutex<ControlExitState>, Condvar)>,
     teardown_disable: Arc<TeardownDisable>,
     lifecycle: Arc<LifecycleControl>,
-    mut handback_tx: Producer<Box<SupervisorInner>>,
     internal_fault_lane: Arc<crate::panic_coord::InternalFaultLane>,
     stats: Arc<ExecutorStats>,
     _control_sched: Arc<Mutex<Option<crate::diagnostics::tick::ControlThreadSched>>>,
@@ -7788,10 +7822,10 @@ fn control_thread_main(
     hub: Arc<StateHub>,
     hooks: PersistTestHooks,
 ) {
-    let _abort_guard = StartupAbortGuard {
+    let mut abort_guard = StartupAbortGuard {
+        settled: false,
         gate: startup_gate.clone(),
         estop_state: Arc::clone(&estop_state),
-        control_exited_cv: Arc::clone(&control_exited_cv),
         exited: Arc::clone(&exited),
         hub: Arc::clone(&hub),
     };
@@ -7996,8 +8030,9 @@ fn control_thread_main(
             return;
         }
         Ok(StartupStepOutcome::NonRecoverable { msg }) => {
-            if core.driver.is_none() || core.shutdown_ready() {
+            if core_is_confirmed_disarmed(&core) {
                 let _ = startup_gate.try_settle_failed(SpawnExecutorError::Fatal(msg));
+                abort_guard.settled = true;
                 lifecycle.set_owner_state(LC_OWNER_DISARMED_EXITED);
                 drop(core);
                 mark_control_exited(&exited, &control_exited_cv, &hub);
@@ -8009,19 +8044,21 @@ fn control_thread_main(
                         control_stop: Arc::clone(&control_stop),
                     },
                 );
+                abort_guard.settled = true;
                 teardown_timeout_loser(core, super::safe_hold::SafeHoldReason::StartupTimeoutLoser);
             }
             return;
         }
         Err(err) => {
-            let _ = offload_reclaim_tx.push(OffloadReclaim::Probe(err));
-            estop_state.request_and_latch();
+            push_offload_no_rt_free(&mut offload_reclaim_tx, OffloadReclaim::Probe(err));
+            estop_state.latch();
             internal_fault_lane.latch_control_safe_hold_fence();
             tracing::error!("RT executor thread panicked during startup initialization");
-            if core.driver.is_none() || core.shutdown_ready() {
+            if core_is_confirmed_disarmed(&core) {
                 let _ = startup_gate.try_settle_failed(SpawnExecutorError::Fatal(
                     "RT executor panicked during startup initialization".into(),
                 ));
+                abort_guard.settled = true;
                 lifecycle.set_owner_state(LC_OWNER_DISARMED_EXITED);
                 drop(core);
                 mark_control_exited(&exited, &control_exited_cv, &hub);
@@ -8037,6 +8074,7 @@ fn control_thread_main(
                         control_stop: Arc::clone(&control_stop),
                     },
                 );
+                abort_guard.settled = true;
                 teardown_timeout_loser(core, super::safe_hold::SafeHoldReason::ControlPanic);
             }
             return;
@@ -8044,22 +8082,24 @@ fn control_thread_main(
     };
 
     if startup_gate.try_settle_ready(ready_payload).is_err() || !startup_gate.wait_activation() {
+        abort_guard.settled = true;
         // Caller timed out or failed activation before `OWNER_EXECUTOR` was published:
-        // zero shared hub/readiness state was mutated; keep energized/unknown driver in SAFE-HOLD.
-        drop(back_obs);
-        drop(mid_obs);
+        // retire warmed observations off-thread (0 RT frees) and keep energized/unknown driver in SAFE-HOLD.
+        push_offload_no_rt_free(&mut offload_reclaim_tx, OffloadReclaim::Observation(back_obs));
+        push_offload_no_rt_free(&mut offload_reclaim_tx, OffloadReclaim::Observation(mid_obs));
         teardown_timeout_loser(core, super::safe_hold::SafeHoldReason::StartupTimeoutLoser);
         return;
     }
+    abort_guard.settled = true;
 
     // Activation succeeded: install private producer observation slots without allocating/freeing
     // on `armd-control` (retiring any already-warmed unused slots off-thread).
     let (unused_back, unused_mid) = core.core.install_prewarmed_producer_slots(back_obs, mid_obs);
     if let Some(obs) = unused_back {
-        let _ = offload_reclaim_tx.push(OffloadReclaim::Observation(obs));
+        push_offload_no_rt_free(&mut offload_reclaim_tx, OffloadReclaim::Observation(obs));
     }
     if let Some(obs) = unused_mid {
-        let _ = offload_reclaim_tx.push(OffloadReclaim::Observation(obs));
+        push_offload_no_rt_free(&mut offload_reclaim_tx, OffloadReclaim::Observation(obs));
     }
 
     let mut engine = engine;
@@ -8722,37 +8762,83 @@ fn control_thread_main(
     }
 
     if req_kind == LC_REQ_HANDBACK {
-        // Refresh live measured hold provenance directly from the exclusive driver at the release
-        // boundary (0 allocs, 0 locks), restore legacy driver mode, and hand `Box<SupervisorInner>`
-        // across the preallocated SPSC ring iff the handback deadline has not expired.
-        core.refresh_measured_hold_for_handback();
-        if let Some(drv) = core
-            .driver
-            .as_mut()
-            .and_then(crate::supervisor_lock::DriverSlot::as_exclusive_mut)
-        {
-            drv.set_rt_mode(false);
-        }
-        core.rt_executor_owned = false;
-        core.before_publish_hook = None;
-        core.safety.set_off_thread_reclaim(false);
-        match lifecycle.try_commit_handback(core, &mut handback_tx) {
+        // Quiesce any active motion, verify fresh hold coverage if energized, restore legacy
+        // driver mode — ALL inside `catch_unwind` while keeping `core` in outer ownership (B2/B6).
+        let prep_ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let disarmed = core_is_confirmed_disarmed(&core);
+            if !disarmed && !core.quiesce_motion_and_refresh_hold_for_handback() {
+                return false;
+            }
+            if let Some(drv) = core
+                .driver
+                .as_mut()
+                .and_then(crate::supervisor_lock::DriverSlot::as_exclusive_mut)
+            {
+                drv.set_rt_mode(false);
+            }
+            core.rt_executor_owned = false;
+            core.before_publish_hook = None;
+            core.safety.set_off_thread_reclaim(false);
+            true
+        }));
+        let commit_res = match prep_ok {
+            Ok(true) => lifecycle.try_commit_handback(core),
+            Ok(false) => {
+                lifecycle.abort_handback_to_safe_hold();
+                Err(core)
+            }
+            Err(err) => {
+                push_offload_no_rt_free(&mut state.offload_reclaim_tx, OffloadReclaim::Probe(err));
+                lifecycle.abort_handback_to_safe_hold();
+                Err(core)
+            }
+        };
+        match commit_res {
             Ok(()) => {
-                // Sole ownership transferred off-control without dropping or allocating!
+                // Sole ownership transferred off-control with 0 allocs, 0 frees, 0 locks (B1/B8)!
                 mark_control_exited(&exited, &control_exited_cv, &hub);
                 return;
             }
             Err(mut core) => {
-                // Handback timed out / stalled: keep energized/unknown driver exclusively in SAFE-HOLD.
-                if let Some(drv) = core
-                    .driver
-                    .as_mut()
-                    .and_then(crate::supervisor_lock::DriverSlot::as_exclusive_mut)
+                // Handback timed out / aborted / superseded by ProcessExit: restore RT mode inside
+                // `catch_unwind` and either execute ProcessExit disable or retain driver in SAFE-HOLD.
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if let Some(drv) = core
+                        .driver
+                        .as_mut()
+                        .and_then(crate::supervisor_lock::DriverSlot::as_exclusive_mut)
+                    {
+                        drv.set_rt_mode(true);
+                    }
+                    core.rt_executor_owned = true;
+                }));
+                if lifecycle.current_request() >= LC_REQ_PROCESS_EXIT
+                    || teardown_disable.requested.load(Ordering::Acquire)
                 {
-                    drv.set_rt_mode(true);
-                }
-                core.rt_executor_owned = true;
-                if core_is_confirmed_disarmed(&core) {
+                    let explicit_dl = lifecycle
+                        .safe_hold
+                        .process_exit_requested()
+                        .then(|| lifecycle.safe_hold.process_exit_deadline());
+                    let outcome = run_bounded_teardown_disable(
+                        &mut core,
+                        &teardown_disable,
+                        &exited,
+                        &control_exited_cv,
+                        &hub,
+                        &state.hooks,
+                        None,
+                        "RT executor process-exit disable after handback race",
+                        "panic during process-exit disable after handback race",
+                        None,
+                        explicit_dl,
+                    );
+                    lifecycle
+                        .safe_hold
+                        .record_process_exit_outcome_lockfree(&outcome);
+                    lifecycle.set_owner_state(LC_OWNER_PROCESS_EXIT_DONE);
+                    drop(core);
+                    mark_control_exited(&exited, &control_exited_cv, &hub);
+                } else if core_is_confirmed_disarmed(&core) {
                     lifecycle.set_owner_state(LC_OWNER_DISARMED_EXITED);
                     drop(core);
                     mark_control_exited(&exited, &control_exited_cv, &hub);
