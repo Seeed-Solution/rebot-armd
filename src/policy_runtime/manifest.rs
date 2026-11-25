@@ -24,6 +24,11 @@ pub const MAX_MODEL_BYTES: usize = 8 * 1024 * 1024 + 4096;
 pub const MAX_VISION_STALENESS_MS: u64 = 500;
 pub const MAX_VIDEO_WINDOW_SPAN_MS: u64 = 2000;
 pub const MAX_POLICY_INPUT_WIDTH: usize = 1024;
+pub const MAX_CHUNK_SIZE: usize = 128;
+/// Maximum accepted value of `chunking.temporal_ensemble_k` (`0.0..=100.0`, finite as `f32`).
+pub const MAX_TEMPORAL_ENSEMBLE_K: f32 = 100.0;
+/// Maximum open-loop action-chunk horizon `replan_every * (1000 / fps)` in milliseconds.
+pub const MAX_OPEN_LOOP_HORIZON_MS: f64 = 1000.0;
 pub const DEFAULT_VISION_MIN_SCORE: f32 = 0.3;
 const MAX_ONNX_PROTO_DEPTH: usize = 32;
 
@@ -181,6 +186,23 @@ pub struct NormalizationStats {
     pub action_std: Option<Vec<f32>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ChunkingSpec {
+    pub chunk_size: usize,
+    pub replan_every: usize,
+    pub temporal_ensemble_k: Option<f32>,
+}
+
+impl Default for ChunkingSpec {
+    fn default() -> Self {
+        Self {
+            chunk_size: 1,
+            replan_every: 1,
+            temporal_ensemble_k: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct StrictPolicyContract {
     pub format: String,
@@ -197,6 +219,7 @@ pub struct StrictPolicyContract {
     pub max_first_step_rad: Option<f32>,
     pub vision: Option<VisionFeatureSpec>,
     pub video_embedding: Option<VideoEmbeddingSpec>,
+    pub chunking: ChunkingSpec,
 }
 
 #[derive(Debug, Clone)]
@@ -491,17 +514,22 @@ impl StrictPolicyContract {
             )));
         }
 
+        let chunking = parse_chunking_section(obj.get("chunking"), action_dim)?;
+
         if let Some(inputs) = obj.get("inputs") {
             validate_inputs_shape(inputs, action_dim)?;
         }
         if let Some(outputs) = obj.get("outputs") {
-            validate_outputs_shape(outputs, action_dim)?;
+            validate_outputs_shape(outputs, action_dim, chunking.chunk_size)?;
         }
 
         let joint_names = parse_strict_joint_names(obj, action_dim)?;
         let normalization = parse_normalization(obj.get("normalization"), action_dim)?;
 
         let fps = parse_optional_positive_f64(obj.get("fps"), "fps")?;
+        if let Some(f) = fps {
+            validate_chunking_horizon(chunking, f)?;
+        }
         let max_step_rad = parse_optional_positive_f32(obj.get("max_step_rad"), "max_step_rad")?;
         let max_first_step_rad =
             parse_optional_positive_f32(obj.get("max_first_step_rad"), "max_first_step_rad")?;
@@ -522,8 +550,110 @@ impl StrictPolicyContract {
             max_first_step_rad,
             vision,
             video_embedding,
+            chunking,
         })
     }
+
+    /// Total flattened output dimension expected from the inference backend (`action_dim * chunk_size`).
+    pub fn expected_output_dim(&self) -> usize {
+        self.action_dim * self.chunking.chunk_size
+    }
+}
+
+/// Validate that the open-loop chunk horizon `replan_every * (1000 / fps)` does not exceed
+/// [`MAX_OPEN_LOOP_HORIZON_MS`] (1000 ms).
+pub fn validate_chunking_horizon(chunking: ChunkingSpec, fps: f64) -> Result<(), PolicyError> {
+    if chunking.chunk_size <= 1 {
+        return Ok(());
+    }
+    if !fps.is_finite() || fps <= 0.0 {
+        return Err(PolicyError::InvalidManifest(
+            "chunking.replan_every horizon requires positive finite fps".into(),
+        ));
+    }
+    if (chunking.replan_every as f64) * 1000.0 > MAX_OPEN_LOOP_HORIZON_MS * fps {
+        let horizon_ms = (chunking.replan_every as f64) * (1000.0 / fps);
+        return Err(PolicyError::InvalidManifest(format!(
+            "chunking.replan_every ({}) at fps ({fps}) yields open-loop horizon {horizon_ms:.1} ms exceeding maximum {MAX_OPEN_LOOP_HORIZON_MS:.0} ms",
+            chunking.replan_every
+        )));
+    }
+    Ok(())
+}
+
+fn parse_chunking_section(val: Option<&Value>, action_dim: usize) -> Result<ChunkingSpec, PolicyError> {
+    let Some(raw) = val else {
+        return Ok(ChunkingSpec::default());
+    };
+    if raw.is_null() {
+        return Ok(ChunkingSpec::default());
+    }
+    let obj = raw
+        .as_object()
+        .ok_or_else(|| PolicyError::InvalidManifest("chunking must be a JSON object".into()))?;
+
+    let chunk_size = match obj.get("chunk_size") {
+        None | Some(Value::Null) => 1usize,
+        Some(v) => v
+            .as_u64()
+            .filter(|&n| n >= 1 && (n as usize) <= MAX_CHUNK_SIZE)
+            .map(|n| n as usize)
+            .ok_or_else(|| {
+                PolicyError::InvalidManifest(format!(
+                    "chunking.chunk_size must be an integer in 1..={MAX_CHUNK_SIZE}, got {v}"
+                ))
+            })?,
+    };
+    let total_out = chunk_size
+        .checked_mul(action_dim)
+        .ok_or_else(|| PolicyError::InvalidManifest("chunk_size * action_dim overflow".into()))?;
+    if total_out > super::mlp::MAX_DIM {
+        return Err(PolicyError::InvalidManifest(format!(
+            "chunking output width ({chunk_size} * {action_dim} = {total_out}) exceeds budget ({})",
+            super::mlp::MAX_DIM
+        )));
+    }
+
+    let replan_every = match obj.get("replan_every") {
+        None | Some(Value::Null) => chunk_size,
+        Some(v) => v
+            .as_u64()
+            .filter(|&n| n >= 1 && (n as usize) <= chunk_size)
+            .map(|n| n as usize)
+            .ok_or_else(|| {
+                PolicyError::InvalidManifest(format!(
+                    "chunking.replan_every must be an integer in 1..={chunk_size}, got {v}"
+                ))
+            })?,
+    };
+
+    let temporal_ensemble_k = match obj.get("temporal_ensemble_k") {
+        None | Some(Value::Null) => None,
+        Some(v) => {
+            let k64 = v.as_f64().ok_or_else(|| {
+                PolicyError::InvalidManifest(format!(
+                    "chunking.temporal_ensemble_k must be a finite number in 0..={MAX_TEMPORAL_ENSEMBLE_K}, got {v}"
+                ))
+            })?;
+            let k32 = k64 as f32;
+            if !k64.is_finite()
+                || !k32.is_finite()
+                || !(0.0..=MAX_TEMPORAL_ENSEMBLE_K as f64).contains(&k64)
+                || !(0.0..=MAX_TEMPORAL_ENSEMBLE_K).contains(&k32)
+            {
+                return Err(PolicyError::InvalidManifest(format!(
+                    "chunking.temporal_ensemble_k must be a finite f32 in 0..={MAX_TEMPORAL_ENSEMBLE_K}, got {v}"
+                )));
+            }
+            Some(k32)
+        }
+    };
+
+    Ok(ChunkingSpec {
+        chunk_size,
+        replan_every,
+        temporal_ensemble_k,
+    })
 }
 
 fn parse_vision_section(
@@ -985,7 +1115,7 @@ fn validate_inputs_shape(inputs: &Value, action_dim: usize) -> Result<(), Policy
     Ok(())
 }
 
-fn validate_outputs_shape(outputs: &Value, action_dim: usize) -> Result<(), PolicyError> {
+fn validate_outputs_shape(outputs: &Value, action_dim: usize, chunk_size: usize) -> Result<(), PolicyError> {
     let outputs_obj = outputs
         .as_object()
         .ok_or_else(|| PolicyError::InvalidManifest("outputs must be an object".into()))?;
@@ -994,7 +1124,38 @@ fn validate_outputs_shape(outputs: &Value, action_dim: usize) -> Result<(), Poli
             .as_object()
             .ok_or_else(|| PolicyError::InvalidManifest("outputs.action must be an object".into()))?;
         if let Some(shape) = action_obj.get("shape") {
-            validate_vector_shape(shape, action_dim, "outputs.action.shape")?;
+            let expected_flat = action_dim * chunk_size;
+            let arr = shape
+                .as_array()
+                .ok_or_else(|| PolicyError::InvalidManifest("outputs.action.shape must be an array".into()))?;
+            let dims = arr
+                .iter()
+                .map(|v| v.as_u64().filter(|&d| d > 0).map(|d| d as usize))
+                .collect::<Option<Vec<usize>>>()
+                .ok_or_else(|| {
+                    PolicyError::InvalidManifest(format!(
+                        "outputs.action.shape elements must be positive integers, got {shape}"
+                    ))
+                })?;
+            match dims.as_slice() {
+                [d] | [1, d] if *d == expected_flat => {}
+                [1, k, d] | [k, d] if chunk_size > 1 && *k == chunk_size && *d == action_dim => {
+                    return Err(PolicyError::InvalidManifest(format!(
+                        "outputs.action.shape {shape} is not supported; export flattened [1, {expected_flat}] (chunk_size * action_dim)"
+                    )));
+                }
+                [d] | [1, d] => {
+                    return Err(PolicyError::DimensionMismatch {
+                        expected: expected_flat,
+                        actual: *d,
+                    });
+                }
+                _ => {
+                    return Err(PolicyError::InvalidManifest(format!(
+                        "outputs.action.shape {shape} is not supported; export flattened [1, {expected_flat}] (or [{expected_flat}])"
+                    )));
+                }
+            }
         }
     }
     Ok(())
