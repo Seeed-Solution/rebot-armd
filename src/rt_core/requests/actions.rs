@@ -365,6 +365,10 @@ pub struct BeginMacroSpec {
     pub macro_deadline: Option<Instant>,
     pub timeout_code: BoundedText<48>,
     pub orientation_levelled: bool,
+    /// Adaptive grasp owner-side invariant: requires all 5 revision checks + start freshness at
+    /// `BeginMacro` commit, and restricts J7 `PosForceIntent::Target` permission strictly to
+    /// active `GripperMotion` children.
+    pub j7_intent_only: bool,
     pub task: HolderLabel,
     pub tag: HolderLabel,
 }
@@ -388,6 +392,7 @@ impl BeginMacroSpec {
             macro_deadline: None,
             timeout_code: BoundedText::empty(),
             orientation_levelled: false,
+            j7_intent_only: false,
             task: HolderLabel::default(),
             tag: HolderLabel::default(),
         }
@@ -799,6 +804,24 @@ pub fn check_action_authority(
     check_workspace_rev: bool,
     require_single_use_admission: bool,
 ) -> Result<(), ActionRefusal> {
+    check_action_authority_ex(
+        inner,
+        stamp,
+        ctx,
+        check_workspace_rev,
+        require_single_use_admission,
+        false,
+    )
+}
+
+fn check_action_authority_ex(
+    inner: &SupervisorInner,
+    stamp: &ActionStamp,
+    ctx: &OwnerCheckCtx,
+    check_workspace_rev: bool,
+    require_single_use_admission: bool,
+    is_stop_finish: bool,
+) -> Result<(), ActionRefusal> {
     let current = Authority {
         lease_generation: inner.lease_valid_at(ctx.now).map_or(0, |l| l.generation),
         epoch: inner.safety.epoch_id(),
@@ -881,10 +904,10 @@ pub fn check_action_authority(
             return Err(ActionRefusal::new("PLAN_STALE"));
         }
     }
-    if inner.core.motion_inhibited_by_config() {
+    if !is_stop_finish && inner.core.motion_inhibited_by_config() {
         return Err(ActionRefusal::new("CONFIG_BUSY"));
     }
-    if ctx.require_rt_feedback && !inner.commit_feedback_valid() {
+    if !is_stop_finish && ctx.require_rt_feedback && !inner.commit_feedback_valid() {
         return Err(ActionRefusal::new("FEEDBACK_STALE"));
     }
     if require_single_use_admission {
@@ -3674,6 +3697,20 @@ fn install_replay_slot_rt(
     SupervisorInner::install_prepared_replay(admitted, prepared).map_err(static_code)
 }
 
+fn check_adaptive_begin_fence(spec: &BeginMacroSpec) -> Result<(), ActionRefusal> {
+    if spec.j7_intent_only
+        && (!spec.check_start
+            || !spec.check_workspace_revision
+            || spec.calibration_revision.is_none()
+            || spec.grasp_setup_revision.is_none()
+            || spec.gripper_calib_revision.is_none()
+            || spec.power_budget_revision.is_none())
+    {
+        return Err(ActionRefusal::new("INVALID_COMMAND"));
+    }
+    Ok(())
+}
+
 /// **5. ONE owner-side install for `BeginMacro` (A7)**: validates authority, optional start
 /// freshness, domain revisions, consumes A1 `Admitted<'g>`, detaches/quiesces any replaced
 /// active macro, allocates parent `ActionId`, and records [`MacroRun`] with optional
@@ -3686,6 +3723,7 @@ pub fn install_begin_macro(
     legacy_tag: Option<String>,
     legacy_task: Option<String>,
 ) -> Result<u64, ActionRefusal> {
+    check_adaptive_begin_fence(spec)?;
     check_action_authority(inner, stamp, ctx, spec.check_workspace_revision, true)?;
     if spec.check_start {
         let dof = usize::from(spec.dof);
@@ -3768,6 +3806,11 @@ pub(crate) fn install_begin_macro_with_proof(
     legacy_tag: Option<String>,
     legacy_task: Option<String>,
 ) -> Result<u64, ArmError> {
+    if spec.j7_intent_only {
+        if check_adaptive_begin_fence(spec).is_err() || expected_workspace_revision.is_none() {
+            return Err(ActionRefusal::new("INVALID_COMMAND").into_arm_error(this));
+        }
+    }
     let now = Instant::now();
     if let Some(ws_rev) = expected_workspace_revision.filter(|_| spec.check_workspace_revision) {
         if this.workspace_revision != ws_rev {
@@ -3840,6 +3883,12 @@ fn install_begin_macro_committed(
         this.begin_action(spec.kind.action_kind_str(), tag)
     };
     let mut run = MacroRun::new(id, proof.stamp().estop_epoch, proof.stamp());
+    run.j7_intent_only = spec.j7_intent_only;
+    if spec.j7_intent_only {
+        // Adaptive macros restrict J7 PosForce Target permission strictly to active GripperMotion
+        // children; BeginMacro never grants J7 Target permission.
+        this.j7_admitted_stamp = None;
+    }
     if let Some(d) = spec.macro_deadline {
         let tc = if spec.timeout_code.is_empty() {
             "TIMEOUT"
@@ -3949,6 +3998,9 @@ pub fn install_macro_child(
             let parent_id = precheck_macro_child(inner, stamp, ctx, &spec, &start)
                 .map_err(|r| r.into_arm_error(inner))?;
             if lock_j7_hold {
+                if resolved.approach_leg.is_some() {
+                    return Err(ActionRefusal::new("INVALID_COMMAND").into_arm_error(inner));
+                }
                 if inner.torque_guard.hold.is_some() || inner.power.gov.hold.is_some() {
                     return Err(ActionRefusal::new("PLAN_STALE").into_arm_error(inner));
                 }
@@ -3998,6 +4050,9 @@ pub fn install_macro_child(
                     return Err(e);
                 }
             };
+            if lock_j7_hold || inner.macro_run.as_ref().is_some_and(|m| m.j7_intent_only) {
+                inner.j7_admitted_stamp = None;
+            }
             let ticket = arm_child_deadline_clamped(inner, parent_id, &spec, ctx.now, Some((dur * 2.0 + 5.0).min(spec.timeout_s)))
                 .ok_or_else(|| ActionRefusal::new("PARENT_REPLACED").into_arm_error(inner))?;
             Ok(InstalledMacroChild {
@@ -4248,6 +4303,9 @@ fn install_macro_child_slot_rt(
             inner.validate_prepared_joint_path(dof, &slot.path, duration_s)?;
             inner.check_prepared_fresh_static(stamp.admission.estop_epoch)?;
             if lock_j7_hold {
+                if approach_then.is_some() {
+                    return Err("INVALID_COMMAND");
+                }
                 if inner.torque_guard.hold.is_some() || inner.power.gov.hold.is_some() {
                     return Err("PLAN_STALE");
                 }
@@ -4289,6 +4347,9 @@ fn install_macro_child_slot_rt(
                 }
             };
             let (this, proof) = admitted.consume().map_err(|e| static_code(e.into()))?;
+            if lock_j7_hold || this.macro_run.as_ref().is_some_and(|m| m.j7_intent_only) {
+                this.j7_admitted_stamp = None;
+            }
             let duration = match this.start_path_motion_slice_inner(
                 &proof,
                 stamp.admission.estop_epoch,
@@ -4641,7 +4702,15 @@ pub fn install_finish_macro(
     spec: &FinishMacroSpec,
     legacy_message: Option<String>,
 ) -> Result<ActionId, ActionRefusal> {
-    check_action_authority(inner, stamp, ctx, spec.check_workspace_revision, false)?;
+    let is_stop_finish = spec.state != FinishState::Done;
+    check_action_authority_ex(
+        inner,
+        stamp,
+        ctx,
+        spec.check_workspace_revision && !is_stop_finish,
+        false,
+        is_stop_finish,
+    )?;
     let id = spec.parent.0;
     let Some(run) = inner
         .macro_run

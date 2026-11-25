@@ -107,6 +107,10 @@ pub struct MacroRun {
     pub child: ChildRecord,
     /// Contact guard of the next installed child ([`ContactGuard`]).
     pub next_guard: Option<ContactGuard>,
+    /// Phase B adaptive macro invariant: J7 `PosForceIntent::Target` permission is strictly
+    /// restricted to active `GripperMotion` children; `BeginMacro`, arm-only children, and
+    /// inter-child gaps force `j7_admitted_stamp = None` (PosForce `Hold`).
+    pub j7_intent_only: bool,
 }
 
 impl MacroRun {
@@ -115,7 +119,8 @@ impl MacroRun {
         Self { id, epoch, stamp, sub: SubState::Idle, stop_requested: false, finishing: false,
             hold_pending_bus_accept: false, phase: None, phase_start: None,
             deadline: None, timeout_code: crate::safety::BoundedText::empty(),
-            children: 0, child: ChildRecord::default(), next_guard: None }
+            children: 0, child: ChildRecord::default(), next_guard: None,
+            j7_intent_only: false }
     }
 
     /// Sets an owner-enforced whole-macro deadline and timeout failure code.
@@ -679,8 +684,21 @@ impl MacroCtx {
                 .await
             {
                 Ok(_) => return Ok(()),
-                Err(Stop::Fail(c, _)) if fence.is_some() && matches!(c.as_str(), "PLAN_STALE" | "CALIBRATION_CHANGED") => {
-                    return Err(if c == "CALIBRATION_CHANGED" { "CALIBRATION_CHANGED" } else { "PLAN_STALE" });
+                Err(Stop::Cancelled) => return Ok(()),
+                Err(Stop::Fail(c, _)) if fence.is_some() => {
+                    let code: &'static str = crate::rt_core::ops::TERMINAL_CODES
+                        .iter()
+                        .copied()
+                        .find(|&k| k == c.as_str())
+                        .unwrap_or_else(|| match c.as_str() {
+                            "CONFIG_BUSY" => "CONFIG_BUSY",
+                            "FEEDBACK_STALE" => "FEEDBACK_STALE",
+                            "MOTION_BUSY" => "MOTION_BUSY",
+                            "DEADLINE_EXPIRED" => "DEADLINE_EXPIRED",
+                            "CALIBRATION_CHANGED" => "CALIBRATION_CHANGED",
+                            _ => "PLAN_STALE",
+                        });
+                    return Err(code);
                 }
                 Err(_) => return Ok(()),
             }
@@ -734,7 +752,8 @@ impl MacroCtx {
         }
         match install_finish_macro(&mut inner, &stamp, &ctx, &spec, message) {
             Ok(_) => Ok(()),
-            Err(r) if fence.is_some() && matches!(r.code, "PLAN_STALE" | "CALIBRATION_CHANGED") => Err(r.code),
+            Err(r) if matches!(r.code, "PARENT_REPLACED" | "STOPPED" | "LEASE_LOST" | "ESTOP_ACTIVE" | "EPOCH_MISMATCH") => Ok(()),
+            Err(r) if fence.is_some() => Err(r.code),
             Err(_) => Ok(()),
         }
     }
@@ -1052,7 +1071,7 @@ impl MacroCtx {
                 Some(revisions.calibration_revision),
             )
             .await
-            .map_err(before)?;
+            .map_err(|s| before(tag_phase_stop(phase, s)))?;
             child_spec.ticket
         } else {
             let mut inner = self.sup.inner().write().await;
@@ -1098,7 +1117,7 @@ impl MacroCtx {
                     if let Some(detail) = e.workspace_detail() {
                         inner.set_action_workspace_violation(self.id, detail);
                     }
-                    return Err(before(self.map_install_err(&mut inner, e)));
+                    return Err(before(tag_phase_stop(phase, self.map_install_err(&mut inner, e))));
                 }
             };
             installed.ticket
@@ -1132,7 +1151,9 @@ impl MacroCtx {
                 }
             }
         }
-        sub_res.map(|done| (done, watch)).map_err(|s| (s, true))
+        sub_res
+            .map(|done| (done, watch))
+            .map_err(|s| (tag_phase_stop(phase, s), true))
     }
 
     /// Install a joint-space quintic macro child through the single `install_macro_child` /
@@ -1705,7 +1726,8 @@ impl MacroCtx {
                 true,
                 Some(revisions.calibration_revision),
             )
-            .await?;
+            .await
+            .map_err(|s| tag_phase_stop(phase, s))?;
             child_spec.ticket
         } else {
             let mut inner = self.sup.inner().write().await;
@@ -1747,10 +1769,24 @@ impl MacroCtx {
                 {
                     return Err(fail(self.timeout_code, format!("[{phase}] {msg}")));
                 }
-                Err(other) => return Err(self.map_install_err(&mut inner, other)),
+                Err(other) => return Err(tag_phase_stop(phase, self.map_install_err(&mut inner, other))),
             }
         };
-        self.wait_child(ticket).await
+        self.wait_child(ticket).await.map_err(|s| tag_phase_stop(phase, s))
+    }
+}
+
+fn tag_phase_stop(phase: &str, stop: Stop) -> Stop {
+    match stop {
+        Stop::Fail(code, msg) => {
+            let prefix = format!("[{phase}]");
+            if msg.starts_with(&prefix) {
+                Stop::Fail(code, msg)
+            } else {
+                Stop::Fail(code, format!("{prefix} {msg}"))
+            }
+        }
+        other => other,
     }
 }
 

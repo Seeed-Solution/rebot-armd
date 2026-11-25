@@ -1711,7 +1711,7 @@ async fn phase_b_revalidation_and_revision_fencing_both_owners() {
                 Owner::Executor => {
                     let h = rig.handle.as_ref().unwrap();
                     let snap = ActionSnapshot::capture(&rig.sup, adm, dl).await.unwrap();
-                    let mut spec = grasp::begin_macro_spec(&planned, h.boot(), 7, Some(6), dl);
+                    let mut spec = grasp::begin_macro_spec(&planned, h.boot(), 7, Some(6), dl).unwrap();
                     spec.admission_request_id = adm.request_id;
                     let mut stamp = snap.stamp;
                     stamp.grasp_setup_revision = Some(rev.grasp_setup_revision);
@@ -1834,7 +1834,7 @@ async fn phase_b_boundary_stop_estop_fault_lease_timeout_matrix_both_owners() {
                         Owner::Executor => {
                             let h = rig.handle.as_ref().unwrap();
                             let snap = ActionSnapshot::capture(&rig.sup, adm, Instant::now() + DEFAULT_ACTION_DEADLINE).await.unwrap();
-                            let mut spec = grasp::begin_macro_spec(&planned, h.boot(), 7, Some(6), short_dl);
+                            let mut spec = grasp::begin_macro_spec(&planned, h.boot(), 7, Some(6), short_dl).unwrap();
                             spec.admission_request_id = adm.request_id;
                             let rev = planned.adaptive.as_ref().unwrap().revisions;
                             let mut stamp = snap.stamp;

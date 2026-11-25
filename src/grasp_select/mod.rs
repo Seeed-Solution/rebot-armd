@@ -262,6 +262,7 @@ impl AdaptiveRoute {
         begin.power_budget_revision = Some(revisions.power_budget_revision);
         begin.macro_deadline = Some(deadline);
         begin.timeout_code = crate::safety::BoundedText::new("GRASP_TIMEOUT");
+        begin.j7_intent_only = true;
         if let Some(tag) = tag {
             begin.tag = crate::model::HolderLabel::new(tag);
         }

@@ -3600,19 +3600,29 @@ pub fn begin_macro_spec(
     dof: usize,
     gripper_idx: Option<usize>,
     deadline: Instant,
-) -> crate::rt_core::requests::actions::BeginMacroSpec {
+) -> Result<crate::rt_core::requests::actions::BeginMacroSpec, ArmError> {
     if let Some(pa) = &planned.adaptive {
-        if let Ok(m) = pa.route.into_selected_macro(
-            prepared_boot,
-            &pa.start_positions,
-            deadline,
-            planned.request.tag.as_deref(),
-            planned.request.task.as_deref(),
-            pa.revisions,
-            0,
-        ) {
-            return m.begin;
-        }
+        let m = pa
+            .route
+            .into_selected_macro(
+                prepared_boot,
+                &pa.start_positions,
+                deadline,
+                planned.request.tag.as_deref(),
+                planned.request.task.as_deref(),
+                pa.revisions,
+                0,
+            )
+            .map_err(|code| ArmError::Detailed {
+                status: 400,
+                code: code.into(),
+                message: format!("[begin] failed to construct adaptive BeginMacroSpec: {code}"),
+                details: Box::new(serde_json::json!({
+                    "failing_phase": "begin",
+                    "outcome": "infeasible",
+                })),
+            })?;
+        return Ok(m.begin);
     }
     use crate::rt_core::requests::actions::{BeginMacroSpec, MacroKind};
     let mut start = vec![0.0f32; dof];
@@ -3636,7 +3646,7 @@ pub fn begin_macro_spec(
     if let Some(task) = planned.request.task.as_deref() {
         spec.task = crate::model::HolderLabel::new(task);
     }
-    spec
+    Ok(spec)
 }
 
 /// Begin a planned grasp under a short write lock through the single owner-side
@@ -3659,7 +3669,7 @@ pub fn begin_with_stamp(
         inner.config.dof,
         inner.config.gripper_index(),
         deadline,
-    );
+    )?;
     let adaptive_rev = planned.adaptive.as_ref().map(|pa| pa.revisions);
     let action_stamp = ActionStamp {
         arm: inner.core.id(),
@@ -3700,6 +3710,9 @@ pub fn begin_with_stamp(
 pub fn begin(admitted: crate::supervisor::Admitted<'_>, supervisor: &Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, planned: PlannedGrasp) -> Result<(u64, f64), ArmError> {
     let deadline = Instant::now() + Duration::from_secs_f64(planned.request.setup.timeout_s);
     let (inner, proof) = admitted.consume()?;
+    if planned.adaptive.is_some() {
+        inner.j7_admitted_stamp = None;
+    }
     let stamp = proof.stamp();
     let spec = begin_macro_spec(
         &planned,
@@ -3707,7 +3720,7 @@ pub fn begin(admitted: crate::supervisor::Admitted<'_>, supervisor: &Arc<ArmSupe
         inner.config.dof,
         inner.config.gripper_index(),
         deadline,
-    );
+    )?;
     let duration = if planned.adaptive.is_some() {
         expected_duration(&planned)
     } else {
@@ -3774,7 +3787,7 @@ pub async fn begin_executor(
         .map_or((planned.input.limits.len(), planned.input.limits.len().checked_sub(1)), |e| {
             (e.config.dof, e.config.gripper_index())
         });
-    let mut spec = begin_macro_spec(&planned, boot, dof, gripper_idx, deadline);
+    let mut spec = begin_macro_spec(&planned, boot, dof, gripper_idx, deadline)?;
     spec.admission_request_id = stamp.request_id;
     let adaptive_rev = planned.adaptive.as_ref().map(|pa| pa.revisions);
     let action_stamp = ActionStamp {
@@ -6615,7 +6628,7 @@ async fn run(
                 HeldUpdate::Unchanged
             };
             let adaptive_rev = planned.adaptive.as_ref().map(|pa| pa.revisions);
-            if let Err(stale_code) = orch
+            if let Err(refusal_code) = orch
                 .ctx
                 .finish_fenced(
                     FinishState::Done,
@@ -6628,18 +6641,25 @@ async fn run(
                 )
                 .await
             {
-                orch.ctx
-                    .finish(
-                        FinishState::Failed,
-                        Some(stale_code),
-                        Some(format!(
-                            "[lift_confirm] configuration changed before grasp completion ({stale_code})"
-                        )),
-                        Some(false),
-                        None,
-                        HeldUpdate::Clear,
-                    )
-                    .await;
+                let msg = format!(
+                    "[lift_confirm] finish refused on live parent before completion ({refusal_code})"
+                );
+                for _ in 0..5 {
+                    orch.ctx
+                        .finish(
+                            FinishState::Failed,
+                            Some(refusal_code),
+                            Some(msg.clone()),
+                            Some(false),
+                            None,
+                            HeldUpdate::Clear,
+                        )
+                        .await;
+                    if !orch.ctx.alive().await {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
             }
         }
         Err(Stop::Fail(code, message)) => {

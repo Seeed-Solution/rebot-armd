@@ -7715,6 +7715,9 @@ impl SupervisorInner {
         // one that reported done short of its command (stopped on something) and is not holding
         // an object: the same, so the leading command does not keep pressing
         let grip_active = self.gripper_reference_active();
+        if self.macro_run.as_ref().is_some_and(|m| m.j7_intent_only) && !grip_active {
+            self.j7_admitted_stamp = None;
+        }
         let lead = self.config.gripper_index()
             .and_then(|g| Some((self.commanded_positions.get(g)? - self.measured_positions.get(g)?).abs()))
             .filter(|l| l.is_finite()).unwrap_or(0.0);
@@ -7910,6 +7913,9 @@ impl SupervisorInner {
         }
 
         self.scratch.point = point_buf;
+        if self.macro_run.as_ref().is_some_and(|m| m.j7_intent_only) && !self.gripper_reference_active() {
+            self.j7_admitted_stamp = None;
+        }
         // not stepped (no Path / Gripper / Replay reference): the buffer goes back unused
         if self.scratch.step_out.positions.capacity() < step_buf.positions.capacity() { self.scratch.step_out = step_buf; }
         if let Some(caps) = caps_before_step {

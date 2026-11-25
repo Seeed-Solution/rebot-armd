@@ -3659,6 +3659,7 @@ async fn m2_raw_broker_rejects_unregistered_client_ids_and_binds_client_to_lease
             macro_deadline: None,
             timeout_code: armd::safety::BoundedText::new("MACRO_TIMEOUT"),
             orientation_levelled: false,
+            j7_intent_only: false,
             task: armd::model::HolderLabel::new(""),
             tag: armd::model::HolderLabel::new(""),
         };
