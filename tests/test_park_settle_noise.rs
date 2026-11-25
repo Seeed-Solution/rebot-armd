@@ -63,6 +63,49 @@ impl ArmDriver for Shared {
     fn read_joint_states_into(&mut self, out: &mut Vec<armd::model::JointState>) -> Result<(), ArmDriverError> { self.0.lock().unwrap().read_joint_states_into(out) }
     fn write_joint_targets(&mut self, t: &[JointTarget]) -> Result<(), ArmDriverError> { self.0.lock().unwrap().write_joint_targets(t) }
     fn set_torque(&mut self, e: bool) -> Result<(), ArmDriverError> { self.0.lock().unwrap().set_torque(e) }
+    fn disable_torque(&mut self, kind: armd::driver::DisableKind) -> Result<(), ArmDriverError> {
+        self.0.lock().unwrap().disable_torque(kind)
+    }
+    fn begin_disable_torque(
+        &mut self,
+        kind: armd::driver::DisableKind,
+    ) -> Result<armd::driver::TorqueProgress, ArmDriverError> {
+        self.0.lock().unwrap().begin_disable_torque(kind)
+    }
+    fn begin_disable_torque_budgeted(
+        &mut self,
+        kind: armd::driver::DisableKind,
+        max_rx_frames: u16,
+    ) -> Result<armd::driver::TorqueProgress, ArmDriverError> {
+        self.0.lock().unwrap().begin_disable_torque_budgeted(kind, max_rx_frames)
+    }
+    fn poll_torque(&mut self, deadline: Instant) -> Result<armd::driver::TorqueProgress, ArmDriverError> {
+        self.0.lock().unwrap().poll_torque(deadline)
+    }
+    fn poll_torque_budgeted(
+        &mut self,
+        deadline: Instant,
+        max_rx_frames: u16,
+    ) -> Result<armd::driver::TorqueProgress, ArmDriverError> {
+        self.0.lock().unwrap().poll_torque_budgeted(deadline, max_rx_frames)
+    }
+    fn torque_transition_pending(&self) -> bool { self.0.lock().unwrap().torque_transition_pending() }
+    fn disable_frames_dispatched(&self) -> bool { self.0.lock().unwrap().disable_frames_dispatched() }
+    fn fresh_joint_positions_into(&self, joints: &[usize], max_age: Duration, out: &mut [f32]) -> bool {
+        self.0.lock().unwrap().fresh_joint_positions_into(joints, max_age, out)
+    }
+    fn rest_pose_gate_status(&self) -> armd::driver::RestPoseGateStatus {
+        self.0.lock().unwrap().rest_pose_gate_status()
+    }
+    fn supports_budgeted_disable_await(&self) -> bool {
+        self.0.lock().unwrap().supports_budgeted_disable_await()
+    }
+    fn begin_control_release(&mut self, release_seq: u64) {
+        self.0.lock().unwrap().begin_control_release(release_seq);
+    }
+    fn set_stopped_disable_gate(&mut self, gate: armd::driver::StoppedDisableGate) {
+        self.0.lock().unwrap().set_stopped_disable_gate(gate);
+    }
     fn is_feedback_valid(&self) -> bool { self.0.lock().unwrap().is_feedback_valid() }
     fn check_hardware_status(&self) -> Result<(), ArmDriverError> { self.0.lock().unwrap().check_hardware_status() }
     fn is_enabled(&self) -> bool { self.0.lock().unwrap().is_enabled() }
@@ -111,7 +154,16 @@ impl Rig {
             let l = &lim[id as usize - 1];
             let p = damiao::float_to_uint(start[id as usize - 1], l.p_min, l.p_max, 16);
             let f = frame(id, 1, p, 2048, 2048);
+            let [lo, hi] = (id as u16).to_le_bytes();
+            let [m0, m1, m2, m3] = damiao::CTRL_MODE_POS_VEL.to_le_bytes();
+            let mode_reply = CanFrame::new_standard(
+                0x10 + id as u16,
+                &[lo, hi, damiao::REG_READ, damiao::RID_CTRL_MODE, m0, m1, m2, m3],
+            )
+            .unwrap();
+            driver.can_mut().respond_to_transmit(damiao::build_read_register_frame(id as u16, damiao::RID_CTRL_MODE), mode_reply);
             driver.can_mut().respond_to_transmit(damiao::build_enable_frame(id as u16), f);
+            driver.can_mut().respond_to_transmit(damiao::build_refresh_frame(id as u16), f);
             driver.can_mut().respond_to_transmit(damiao::build_disable_frame(id as u16), frame(id, 0, p, 2048, 2048));
             driver.can_mut().provide_rx_frame(f);
         }
@@ -125,6 +177,17 @@ impl Rig {
             inner.measured_positions = start.to_vec();
         }
         sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
+        {
+            let mut d = drv.lock().unwrap();
+            for id in 1..=7u8 {
+                let l = &lim[id as usize - 1];
+                let p = damiao::float_to_uint(start[id as usize - 1], l.p_min, l.p_max, 16);
+                d.can_mut().replace_transmit_response(
+                    damiao::build_refresh_frame(id as u16),
+                    frame(id, 0, p, 2048, 2048),
+                );
+            }
+        }
         Self { sup, drv, clock, lim, q: start.iter().map(|&p| p as f64).collect(), tau: 0.15, blocked: None,
             load: vec![0.0; 7], drift: vec![0.0; 7], noise, rng: Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1) }
     }

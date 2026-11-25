@@ -948,7 +948,12 @@ int main(int argc, char** argv) {
             r.height = frame.height;
             r.inference_ms = vr.inference_ms;
             r.set_boxes(boxes.data(), boxes.size());
-            extra = rv::debug_extra(vr.mode, display_markers);
+            std::string display_contours;
+            if (vr.ran_yolo && detector && detector->getKind() == yolo::Kind::Segment) {
+                const size_t budget = rv::ws_contours_budget(vr.mode, dets, display_markers);
+                display_contours = rv::contours_json(dets, content, frame.width, frame.height, budget);
+            }
+            extra = rv::debug_extra(vr.mode, display_markers, display_contours);
             r.debug_extra = extra;
 
             if (g_cfg.verbose) {

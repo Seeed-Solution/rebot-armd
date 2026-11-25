@@ -23,8 +23,8 @@
 // zero heap allocations and zero heap frees across every config request and error path.
 #![allow(clippy::result_large_err, clippy::large_enum_variant)]
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
@@ -61,6 +61,73 @@ use crate::supervisor::{
 use crate::supervisor::config::CONFIG_PROPOSAL_BUDGET;
 
 static NEXT_CONFIG_REQ_SEQ: AtomicU64 = AtomicU64::new(1);
+static NEXT_CALIB_TXN_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Allocates a unique non-zero calibration transaction ID for executor-mode busy ownership.
+pub fn next_calibration_txn_id() -> u64 {
+    NEXT_CALIB_TXN_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Three-valued persistence commit outcome preserved across calibration and config commits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitDisposition {
+    /// Disk rename + parent-dir fsync + post-rename authority recheck + live activation succeeded.
+    Applied,
+    /// Failure occurred at or after rename (or activation outcome is unknown); old live state
+    /// remains active and `HoldState::Reconciling` blocks motion until reconciled.
+    Uncertain,
+    /// Failure occurred strictly before any rename mutated disk; staged files were discarded
+    /// and the reservation was released (`Cleared`).
+    Unattempted,
+}
+
+/// Durable marker file written before multi-file calibration batch rename and removed only after
+/// live activation (or bounded reconciliation) succeeds. If present at startup, the process
+/// crashed mid-batch and startup enters `HoldState::Reconciling` to inhibit motion.
+pub const CALIBRATION_PENDING_MARKER_NAME: &str = ".calibration_commit.pending";
+
+pub(crate) fn pending_commit_marker_path(calib_path: &Path) -> PathBuf {
+    let dir = calib_path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    dir.join(CALIBRATION_PENDING_MARKER_NAME)
+}
+
+pub(crate) fn write_pending_commit_marker(path: &Path, text: &str) -> Result<(), String> {
+    let staged = StagedWrite::stage(path.to_path_buf(), text.to_string())?;
+    let ds = staged.rename_only()?;
+    match ds.sync_parent_dir() {
+        PublishOutcome::Published => Ok(()),
+        PublishOutcome::PublishedDurabilityUnconfirmed(w) => Err(format!(
+            "pending commit marker {} renamed but parent dir fsync failed: {w}",
+            path.display()
+        )),
+    }
+}
+
+pub(crate) fn remove_pending_commit_marker(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => match PendingDirSync::for_path(path).sync_parent_dir() {
+            PublishOutcome::Published => Ok(()),
+            PublishOutcome::PublishedDurabilityUnconfirmed(w) => {
+                tracing::warn!(
+                    "Removed calibration commit marker {} but parent dir fsync failed: {w}",
+                    path.display()
+                );
+                Err(format!(
+                    "removed pending commit marker {} but parent dir fsync failed: {w}",
+                    path.display()
+                ))
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => {
+            tracing::warn!("Could not remove calibration commit marker {}: {e}", path.display());
+            Err(format!("could not remove calibration commit marker {}: {e}", path.display()))
+        }
+    }
+}
 
 /// Default delay between bounded post-rename parent-directory fsync reconciliation retries.
 pub const DEFAULT_RECONCILE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
@@ -105,6 +172,8 @@ pub struct PublishedConfig {
     pub calibration: Option<CalibrationFile>,
     pub calibration_revision: u64,
     pub calibration_busy: bool,
+    pub calibration_txn_id: Option<u64>,
+    pub calibration_quarantined: bool,
     pub calibration_load_error: Option<String>,
     pub profile_camera_mount: CameraMount,
     pub profile_floor_z_m: Option<f32>,
@@ -146,6 +215,8 @@ impl PublishedConfig {
             .as_ref()
             .and_then(|d| d.with_ref(|drv| drv.motor_current_cap()).flatten())
             .and_then(|cap| serde_json::to_value(cap).ok());
+        let mut sequences = inner.sequences.clone();
+        sequences.pins = inner.active_sequence_pins().cloned();
         Self {
             config: inner.config.clone(),
             follower: inner.follower.clone(),
@@ -165,7 +236,7 @@ impl PublishedConfig {
             gripper_calib_stale: inner.gripper_calib_stale.clone(),
             gripper_calib_revision: inner.gripper_calib_revision,
             poses: inner.poses.clone(),
-            sequences: inner.sequences.clone(),
+            sequences,
             episodes: inner.episodes.clone(),
             grasp_setup_revision: inner.grasp_setup_revision,
             tool_commissioning_path: inner.tool_commissioning_path.clone(),
@@ -174,6 +245,8 @@ impl PublishedConfig {
             calibration: inner.calibration.clone(),
             calibration_revision: inner.calibration_revision,
             calibration_busy: inner.calibration_busy,
+            calibration_txn_id: inner.calibration_txn_id,
+            calibration_quarantined: inner.calibration_quarantined,
             calibration_load_error: inner.calibration_load_error.clone(),
             profile_camera_mount: inner.profile_camera_mount.clone(),
             profile_floor_z_m: inner.profile_floor_z_m,
@@ -426,6 +499,13 @@ impl PublishedConfig {
         Value::Object(obj)
     }
 
+    /// True when sequence `id` is actively running in this published snapshot.
+    /// `ArmSupervisor::published_config` guarantees `self.sequences.pins` holds only active pins.
+    pub fn is_sequence_running(&self, id: &str) -> bool {
+        self.sequences
+            .is_sequence_running_with_pins(id, self.sequences.pins.as_ref())
+    }
+
     pub fn sequence_view(&self, s: &Sequence) -> Value {
         let mut stale = Vec::new();
         let mut missing = Vec::new();
@@ -447,7 +527,7 @@ impl PublishedConfig {
         let mut v = serde_json::to_value(s).unwrap_or_default();
         v["stale_steps"] = json!(stale);
         v["missing_steps"] = json!(missing);
-        v["running"] = json!(self.sequences.pins.as_ref().is_some_and(|p| p.sequence_id == s.id));
+        v["running"] = json!(self.is_sequence_running(&s.id));
         v
     }
 
@@ -779,6 +859,11 @@ pub enum ConfigError {
         code: &'static str,
         message: &'static str,
     },
+    CalibPreconditionText {
+        status: u16,
+        code: &'static str,
+        message: BoundedText<256>,
+    },
     OwnerStopped,
     OwnerQueueFull,
 }
@@ -878,6 +963,11 @@ impl ConfigError {
                 code: (*code).into(),
                 message: (*message).into(),
             },
+            Self::CalibPreconditionText { status, code, message } => ArmError::Rejected {
+                status: *status,
+                code: (*code).into(),
+                message: message.as_str().into(),
+            },
             Self::OwnerStopped => ArmError::Rejected {
                 status: 503,
                 code: "EXECUTOR_STOPPED".into(),
@@ -965,6 +1055,8 @@ pub(crate) fn check_config_authority_inner(
         if gen == 0 || !core.validate_lease_at(conn.as_str(), gen, ctx.now) {
             return Err(ConfigError::LeaseLost);
         }
+    } else if proposal.domain == ConfigDomain::Calibration {
+        return Err(ConfigError::LeaseLost);
     }
     if enforce_unused_stamp && core.is_stamp_consumed(auth.admission.request_id) {
         return Err(ConfigError::StampConsumed);
@@ -997,6 +1089,63 @@ pub enum ReservePrecheck {
         tool_id: HolderLabel,
         tool_config_digest: HolderLabel,
     },
+    Calibration {
+        allow_during_calibration_busy: bool,
+        expected_txn_id: Option<u64>,
+        operator_grant: crate::auth::OperatorGrant,
+        require_kinematics_disarmed: bool,
+        expected_grasp_setup_revision: Option<u64>,
+    },
+    SoftwareJointZero {
+        allow_during_calibration_busy: bool,
+        expected_txn_id: Option<u64>,
+        operator_grant: crate::auth::OperatorGrant,
+        expected_gripper_calib_revision: Option<u64>,
+    },
+}
+
+/// Zero-allocation domain precondition bundle rechecked at pre-rename `VerifyAuthority`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VerifyDomainChecks {
+    pub expected_grasp_setup_revision: Option<u64>,
+    pub expected_gripper_calib_revision: Option<u64>,
+    pub require_workspace_unblocked: bool,
+    pub require_kinematics_disarmed: bool,
+    pub require_software_zero_idle: bool,
+    pub expected_txn_id: Option<u64>,
+    pub operator_grant: Option<crate::auth::OperatorGrant>,
+}
+
+/// Kind of executor-mode calibration transaction started via `ConfigRequest::BeginCalibrationTxn`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalibrationTxnKind {
+    /// Authoritative live-authority + `calibration_busy` check before body parsing for zero paths.
+    IngressBusyCheck,
+    /// Authoritative preflight (`begin_checks` + live lease/epoch/stop) before body parsing.
+    CameraPreflight,
+    CameraApply {
+        require_kinematics_disarmed: bool,
+        dry_run: bool,
+    },
+    CameraRestore,
+    SoftwareZero {
+        set_busy: bool,
+    },
+    JointZeroRestore,
+}
+
+/// Stack-only snapshot returned by `BeginCalibrationTxn` / `SampleCalibrationState` (0 alloc on RT).
+#[derive(Debug, Clone, Copy)]
+pub struct CalibrationStateSample {
+    pub positions: [f32; crate::rt_core::mailbox::MAX_DOF],
+    pub dof: usize,
+    pub has_driver: bool,
+    pub feedback_valid: bool,
+    pub feedback_instants: [Option<Instant>; crate::rt_core::mailbox::MAX_DOF],
+    pub is_torqued: bool,
+    pub safety_state: SafetyStateTag,
+    pub epoch_id: u64,
+    pub calibration_revision: u64,
 }
 
 /// Pre-built candidate payload swapped into `SupervisorInner` in-place during [`ActivateConfig`].
@@ -1031,6 +1180,39 @@ pub enum ConfigCandidate {
         tool_id: HolderLabel,
         tool_config_digest: HolderLabel,
         confirmed_at: String,
+    },
+    Calibration {
+        calibration: Option<CalibrationFile>,
+        #[cfg(feature = "policy-runtime")]
+        calibration_digest: String,
+        camera_mount: CameraMount,
+        arm_model: ArmModel,
+        kinematics_changed: bool,
+        next_pose_list: Option<PoseList>,
+        grasp_setup: Option<GraspSetup>,
+        expected_grasp_setup_revision: Option<u64>,
+        expected_txn_id: Option<u64>,
+        operator_grant: crate::auth::OperatorGrant,
+        effective_floor: Option<(f32, &'static str)>,
+        ws_eval_bufs: Option<EvalBufs>,
+    },
+    SoftwareJointZero {
+        new_offsets: [f32; crate::rt_core::mailbox::MAX_DOF],
+        dof: usize,
+        calibration: Option<CalibrationFile>,
+        #[cfg(feature = "policy-runtime")]
+        calibration_digest: String,
+        next_arm_model: Option<ArmModel>,
+        next_pose_list: Option<(PoseList, bool)>,
+        next_gripper_stale: Option<CalibrationStale>,
+        expected_gripper_calib_revision: Option<u64>,
+        expected_txn_id: Option<u64>,
+        operator_grant: crate::auth::OperatorGrant,
+        effective_floor: Option<(f32, &'static str)>,
+        ws_eval_bufs: Option<EvalBufs>,
+        reset_gripper_baseline: bool,
+        replacement_baseline: Option<crate::gripper_baseline::FreeTorqueBaseline>,
+        replacement_baseline_pending: Option<Vec<crate::gripper_baseline::MoveRecord>>,
     },
 }
 
@@ -1084,6 +1266,10 @@ pub struct FinishReconcileConfig {
     pub candidate: ConfigCandidate,
     pub expected_workspace_revision: Option<u64>,
     pub expected_poses_revision: Option<u64>,
+    /// When `Some(tid)`, atomically installs `calibration_busy = true; calibration_txn_id = Some(tid)`
+    /// as `HoldState::Reconciling` clears so no new calibration can start before this retry unlinks
+    /// its pending commit marker and calls `EndCalibrationTxn { txn_id: tid, force_reconcile: false }`.
+    pub cleanup_marker_txn_id: Option<u64>,
 }
 
 /// Owner-routed gravity compensation request (mock zero-alloc; hardware driver fails closed in Executor).
@@ -1156,10 +1342,13 @@ pub struct ConfigActivated {
     pub workspace_revision: u64,
     pub poses_revision: u64,
     pub gripper_calib_revision: u64,
+    pub grasp_setup_revision: u64,
+    pub calibration_revision: u64,
     pub epoch_id: u64,
     pub is_torqued: bool,
     pub safety_state: SafetyStateTag,
     pub gravity_comp_active: bool,
+    pub activated_at: Instant,
 }
 
 /// All owner-side configuration and companion maintenance requests routed via `MaintenanceOp::Config`.
@@ -1174,6 +1363,7 @@ pub enum ConfigRequest {
         auth: ConfigAuthContext,
         expected_workspace_revision: Option<u64>,
         expected_poses_revision: Option<u64>,
+        domain_checks: VerifyDomainChecks,
     },
     Persisted(PersistedConfig),
     Activate(ActivateConfig),
@@ -1188,8 +1378,40 @@ pub enum ConfigRequest {
     GravityComp(GravityCompOp),
     InspectHold(ConfigDomain),
     /// Zero-alloc check on live owner whether `episode_id` may be deleted (not referenced by
-    /// saved sequences, running sequence pins, or an active `Sequences` save reservation).
+    /// saved sequences, active running sequence pins, or an active `Sequences` save reservation).
     CheckEpisodeDeleteAllowed(HolderLabel),
+    /// Zero-alloc start/preflight of an executor calibration or software-zero transaction.
+    BeginCalibrationTxn {
+        txn_id: u64,
+        auth: ConfigAuthContext,
+        operator_grant: crate::auth::OperatorGrant,
+        expected_epoch: u64,
+        expected_stop_gen: u64,
+        kind: CalibrationTxnKind,
+    },
+    /// Zero-alloc transaction-bound cleanup of `calibration_busy` / `motor_zero_busy`.
+    /// When `force_reconcile` is true, atomically enters `HoldState::Reconciling` before clearing
+    /// busy flags so an abnormal drop after remote Vision mutation never lifts motion inhibit.
+    EndCalibrationTxn {
+        txn_id: u64,
+        force_reconcile: bool,
+    },
+    /// Zero-alloc live authority + zero state check + joint reading/freshness sample.
+    SampleCalibrationState {
+        auth: ConfigAuthContext,
+        operator_grant: crate::auth::OperatorGrant,
+        expected_epoch: u64,
+        expected_stop_gen: u64,
+        expected_txn_id: Option<u64>,
+        require_zero_state_checks: bool,
+        check_authority: bool,
+    },
+    /// Installs active `RunPins` on the live owner (`OWNER_EXECUTOR`) with zero alloc/free on
+    /// `armd-control`; any displaced or stale pins are retired off-thread via `ConfigRetiredPayloads`.
+    InstallSequenceRunPins(crate::sequences::RunPins),
+    /// Clears `RunPins` for `action_id` on the live owner (`OWNER_EXECUTOR`) with zero free on
+    /// `armd-control`.
+    ClearSequenceRunPins { action_id: u64 },
 }
 
 impl ConfigRequest {
@@ -1208,6 +1430,12 @@ impl ConfigRequest {
             Self::SampleTableCapture => "/api/v1/grasp/setup",
             Self::GravityComp(_) => "/api/v1/mode/gravity_comp",
             Self::CheckEpisodeDeleteAllowed(_) => "/api/v1/episodes/delete",
+            Self::BeginCalibrationTxn { .. }
+            | Self::EndCalibrationTxn { .. }
+            | Self::SampleCalibrationState { .. } => "/api/v1/calibration",
+            Self::InstallSequenceRunPins(_) | Self::ClearSequenceRunPins { .. } => {
+                "/api/v1/action/run_sequence"
+            }
         }
     }
 }
@@ -1228,6 +1456,10 @@ pub enum ConfigReply {
         state: Option<crate::rt_core::config_iface::HoldState>,
     },
     EpisodeDeleteAllowed(bool),
+    CalibrationTxnBegan(Result<CalibrationStateSample, ConfigError>),
+    CalibrationTxnEnded(bool),
+    CalibrationStateSampled(Result<CalibrationStateSample, ConfigError>),
+    SequenceRunPinsUpdated,
 }
 
 /// Displaced or unused heap payloads carried back inside the SAME `Box<ConfigExchange>`
@@ -1244,9 +1476,16 @@ pub struct ConfigRetiredPayloads {
     pub pose_list: Option<PoseList>,
     pub sequence_file: Option<SequenceFile>,
     pub reserved_sequence_pins: Option<crate::sequences::ReservedSequencePins>,
+    pub run_sequence_pins: Option<crate::sequences::RunPins>,
     pub steps: Option<Vec<Step>>,
     pub grasp_setup: Option<GraspSetup>,
     pub string_a: Option<String>,
+    pub string_b: Option<String>,
+    pub calibration_file: Option<CalibrationFile>,
+    pub arm_model: Option<ArmModel>,
+    pub gripper_baseline: Option<crate::gripper_baseline::FreeTorqueBaseline>,
+    pub gripper_baseline_pending: Option<Vec<crate::gripper_baseline::MoveRecord>>,
+    pub(crate) tracking: crate::tracking::TrackingRetiredBuffers,
     pub gravity_comp_policy: Option<crate::model::GravityCompPolicy>,
     pub unused_candidate: Option<ConfigCandidate>,
 }
@@ -1292,6 +1531,7 @@ pub(crate) fn handle_config_exchange(
             auth,
             expected_workspace_revision,
             expected_poses_revision,
+            domain_checks,
         } => ConfigReply::AuthorityVerified(install_verify_authority(
             core,
             ctx,
@@ -1301,6 +1541,7 @@ pub(crate) fn handle_config_exchange(
             &auth,
             expected_workspace_revision,
             expected_poses_revision,
+            domain_checks,
         )),
         ConfigRequest::Persisted(p) => ConfigReply::Persisted(install_persisted_config(core, p)),
         ConfigRequest::Activate(a) => ConfigReply::Activated(install_activate_config(core, ctx, a, &mut ex.retired)),
@@ -1333,14 +1574,73 @@ pub(crate) fn handle_config_exchange(
             state: core.core.config_held(domain).map(|h| h.state),
         },
         ConfigRequest::CheckEpisodeDeleteAllowed(episode_id) => {
-            ConfigReply::EpisodeDeleteAllowed(!core.sequences.is_episode_in_use(episode_id.as_str()))
+            ConfigReply::EpisodeDeleteAllowed(!core.is_episode_in_use(episode_id.as_str()))
         }
+        ConfigRequest::InstallSequenceRunPins(pins) => {
+            if core.running_action_id() == Some(pins.action_id) {
+                ex.retired.run_sequence_pins = core.sequences.pins.replace(pins);
+            } else {
+                ex.retired.run_sequence_pins = Some(pins);
+            }
+            ConfigReply::SequenceRunPinsUpdated
+        }
+        ConfigRequest::ClearSequenceRunPins { action_id } => {
+            if core.sequences.pins.as_ref().is_some_and(|p| p.action_id == action_id) {
+                ex.retired.run_sequence_pins = core.sequences.pins.take();
+            }
+            ConfigReply::SequenceRunPinsUpdated
+        }
+        ConfigRequest::BeginCalibrationTxn {
+            txn_id,
+            auth,
+            operator_grant,
+            expected_epoch,
+            expected_stop_gen,
+            kind,
+        } => ConfigReply::CalibrationTxnBegan(install_begin_calibration_txn(
+            core,
+            ctx,
+            txn_id,
+            &auth,
+            operator_grant,
+            expected_epoch,
+            expected_stop_gen,
+            kind,
+        )),
+        ConfigRequest::EndCalibrationTxn {
+            txn_id,
+            force_reconcile,
+        } => ConfigReply::CalibrationTxnEnded(install_end_calibration_txn(
+            core,
+            txn_id,
+            force_reconcile,
+        )),
+        ConfigRequest::SampleCalibrationState {
+            auth,
+            operator_grant,
+            expected_epoch,
+            expected_stop_gen,
+            expected_txn_id,
+            require_zero_state_checks,
+            check_authority,
+        } => ConfigReply::CalibrationStateSampled(install_sample_calibration_state(
+            core,
+            ctx,
+            &auth,
+            operator_grant,
+            expected_epoch,
+            expected_stop_gen,
+            expected_txn_id,
+            require_zero_state_checks,
+            check_authority,
+        )),
     };
     ex.reply = Some(reply);
 }
 
 fn run_reserve_precheck(
     core: &SupervisorInner,
+    now: Instant,
     precheck: ReservePrecheck,
     retired: &mut ConfigRetiredPayloads,
 ) -> Result<(), ConfigError> {
@@ -1402,7 +1702,7 @@ fn run_reserve_precheck(
             if core.calibration_busy {
                 return Err(ConfigError::Busy("a camera calibration apply or restore is running"));
             }
-            if !deleting_pose_id.is_empty() && core.sequences.is_pose_in_use(deleting_pose_id.as_str()) {
+            if !deleting_pose_id.is_empty() && core.is_pose_in_use(deleting_pose_id.as_str()) {
                 return Err(ConfigError::PoseInUse);
             }
             Ok(())
@@ -1426,11 +1726,7 @@ fn run_reserve_precheck(
                     }
                 }
                 if let Some(del_id) = deleting_sequence_id {
-                    if core
-                        .sequences
-                        .pins
-                        .as_ref()
-                        .is_some_and(|p| p.sequence_id == del_id.as_str())
+                    if core.is_sequence_running(del_id.as_str())
                         && core.sequences.get(del_id.as_str()).is_some()
                     {
                         return Err(ConfigError::SequenceRunning);
@@ -1473,7 +1769,454 @@ fn run_reserve_precheck(
             }
             Ok(())
         }
+        ReservePrecheck::Calibration {
+            allow_during_calibration_busy,
+            expected_txn_id,
+            operator_grant,
+            require_kinematics_disarmed,
+            expected_grasp_setup_revision,
+        } => {
+            if !operator_grant.is_valid_at(now, core.operator_auth_enforced) {
+                return Err(ConfigError::CalibPrecondition {
+                    status: 403,
+                    code: "OPERATOR_REQUIRED",
+                    message: "Operator session expired or locked during calibration",
+                });
+            }
+            if let Some(tid) = expected_txn_id {
+                if core.calibration_txn_id != Some(tid) {
+                    return Err(ConfigError::Busy("calibration transaction ownership was lost"));
+                }
+            } else if !allow_during_calibration_busy && core.calibration_busy {
+                return Err(ConfigError::Busy(
+                    "a calibration apply, restore, or configuration change is running",
+                ));
+            }
+            if let Some(reason) = core.workspace_change_blocker_for_calibration_static() {
+                return Err(ConfigError::MotionBusy {
+                    subject: "the camera calibration",
+                    reason,
+                });
+            }
+            if !has_grasp_setup_rt(core) {
+                return Err(ConfigError::CalibPrecondition {
+                    status: 400,
+                    code: "UNSUPPORTED",
+                    message: "This profile has no grasp setup",
+                });
+            }
+            if require_kinematics_disarmed {
+                check_kinematics_disarmed_rt(core)?;
+            }
+            if let Some(exp_gs) = expected_grasp_setup_revision {
+                if core.grasp_setup_revision != exp_gs {
+                    return Err(ConfigError::RevisionMismatch {
+                        expected: exp_gs,
+                        current: core.grasp_setup_revision,
+                    });
+                }
+            }
+            Ok(())
+        }
+        ReservePrecheck::SoftwareJointZero {
+            allow_during_calibration_busy,
+            expected_txn_id,
+            operator_grant,
+            expected_gripper_calib_revision,
+        } => {
+            if !operator_grant.is_valid_at(now, core.operator_auth_enforced) {
+                return Err(ConfigError::CalibPrecondition {
+                    status: 403,
+                    code: "OPERATOR_REQUIRED",
+                    message: "Operator session expired or locked during calibration",
+                });
+            }
+            if core.rt_executor_owned && core.driver.is_some() {
+                return Err(ConfigError::CalibPrecondition {
+                    status: 409,
+                    code: "EXECUTOR_UNSUPPORTED",
+                    message: "software joint zero with an attached hardware driver is not available while the RT executor owns the arm; use the legacy owner",
+                });
+            }
+            if let Some(tid) = expected_txn_id {
+                if core.calibration_txn_id != Some(tid) {
+                    return Err(ConfigError::Busy("calibration transaction ownership was lost"));
+                }
+            } else if !allow_during_calibration_busy && core.calibration_busy {
+                return Err(ConfigError::Busy(
+                    "a calibration apply, restore, zero, or configuration change is running",
+                ));
+            }
+            if core.config.zero_reference.is_none() {
+                return Err(ConfigError::CalibPrecondition {
+                    status: 400,
+                    code: "UNSUPPORTED",
+                    message: "the software zero needs a profile zero_reference",
+                });
+            }
+            check_software_zero_idle_rt(core)?;
+            if let Some(exp_gc) = expected_gripper_calib_revision {
+                if core.gripper_calib_revision != exp_gc {
+                    return Err(ConfigError::PlanStale(
+                        "gripper calibration changed while preparing software joint zero",
+                    ));
+                }
+            }
+            Ok(())
+        }
     }
+}
+
+fn has_grasp_setup_rt(core: &SupervisorInner) -> bool {
+    core.config.has_cartesian_with_gripper()
+        && core.config.kinematics.is_some()
+        && core.config.gripper_policy.is_some()
+        && core.config.grasp.is_some()
+}
+
+fn check_kinematics_disarmed_rt(core: &SupervisorInner) -> Result<(), ConfigError> {
+    let running = core.last_action.as_ref().is_some_and(|a| a.is_running()) || core.macro_run.is_some();
+    if core.is_torqued || running {
+        let message = if running {
+            "the kinematic correction can change only with torque off and no action running (an action is running); park or disable torque first"
+        } else {
+            "the kinematic correction can change only with torque off and no action running (torque is on); park or disable torque first"
+        };
+        return Err(ConfigError::CalibPrecondition {
+            status: 409,
+            code: "KINEMATICS_ARMED",
+            message,
+        });
+    }
+    Ok(())
+}
+
+fn check_software_zero_idle_rt(core: &SupervisorInner) -> Result<(), ConfigError> {
+    use crate::safety::SafetyState;
+    if core.safety.state().is_stopped() {
+        let mut message = BoundedText::<256>::empty();
+        let _ = core::fmt::write(
+            &mut message,
+            format_args!("the arm is in {:?}; clear the fault first", core.safety.state()),
+        );
+        return Err(ConfigError::CalibPreconditionText {
+            status: 409,
+            code: "MOTOR_ZERO_FAULT",
+            message,
+        });
+    }
+    let msg = if core.is_torqued || core.disable_pending {
+        Some("motor zero needs torque off and no action running (torque is on); park or disable torque first")
+    } else if core.last_action.as_ref().is_some_and(|a| a.is_running()) || core.macro_run.is_some() {
+        Some("motor zero needs torque off and no action running (an action is running); park or disable torque first")
+    } else if core.gravity_comp.is_some() {
+        Some("motor zero needs torque off and no action running (gravity compensation is on); park or disable torque first")
+    } else if core.active_trajectory.is_some() || core.servo_target.is_some() {
+        Some("motor zero needs torque off and no action running (a motion is running); park or disable torque first")
+    } else {
+        match core.safety.state() {
+            SafetyState::Idle => None,
+            SafetyState::Booting => Some("motor zero needs torque off and no action running (the arm is Booting); park or disable torque first"),
+            SafetyState::Armed => Some("motor zero needs torque off and no action running (the arm is Armed); park or disable torque first"),
+            SafetyState::Moving => Some("motor zero needs torque off and no action running (the arm is Moving); park or disable torque first"),
+            SafetyState::EStop | SafetyState::Fault(_) => None,
+        }
+    };
+    if let Some(message) = msg {
+        return Err(ConfigError::CalibPrecondition {
+            status: 409,
+            code: "MOTOR_ZERO_ARMED",
+            message,
+        });
+    }
+    Ok(())
+}
+
+fn snapshot_calibration_sample_rt(
+    core: &SupervisorInner,
+    require_readings: bool,
+) -> Result<CalibrationStateSample, ConfigError> {
+    let dof = core.config.dof;
+    let has_driver = core.driver.is_some();
+    let feedback_valid = if has_driver {
+        core.commit_feedback_valid()
+    } else {
+        true
+    };
+    if require_readings {
+        if has_driver && !feedback_valid {
+            return Err(ConfigError::CalibPrecondition {
+                status: 409,
+                code: "MOTOR_ZERO_NO_FEEDBACK",
+                message: "the motor feedback is not fresh; check the bus and the motor power",
+            });
+        }
+        if core.measured_positions.len() != dof
+            || dof > crate::rt_core::mailbox::MAX_DOF
+            || !core.measured_positions.iter().all(|v| v.is_finite())
+        {
+            return Err(ConfigError::CalibPrecondition {
+                status: 409,
+                code: "MOTOR_ZERO_NO_FEEDBACK",
+                message: "no valid joint readings",
+            });
+        }
+    }
+    let mut positions = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
+    let copy_len = core.measured_positions.len().min(crate::rt_core::mailbox::MAX_DOF);
+    positions[..copy_len].copy_from_slice(&core.measured_positions[..copy_len]);
+    let mut feedback_instants = [None; crate::rt_core::mailbox::MAX_DOF];
+    let fb = core.core.feedback().instants();
+    let fb_len = fb.len().min(crate::rt_core::mailbox::MAX_DOF);
+    feedback_instants[..fb_len].copy_from_slice(&fb[..fb_len]);
+    Ok(CalibrationStateSample {
+        positions,
+        dof,
+        has_driver,
+        feedback_valid,
+        feedback_instants,
+        is_torqued: core.is_torqued,
+        safety_state: SafetyStateTag::from_state(core.safety.state()),
+        epoch_id: core.safety.epoch_id(),
+        calibration_revision: core.calibration_revision,
+    })
+}
+
+fn check_calib_live_authority_rt(
+    core: &mut SupervisorInner,
+    ctx: &CommitCtx,
+    auth: &ConfigAuthContext,
+    expected_epoch: u64,
+    expected_stop_gen: u64,
+) -> Result<(), ConfigError> {
+    if auth.admission.connection_id != 0 && core.is_connection_closed(auth.admission.connection_id) {
+        return Err(ConfigError::ConnectionClosed);
+    }
+    if core.estop_request_unapplied() || core.safety.epoch_id() != expected_epoch {
+        return Err(ConfigError::EpochMismatch {
+            current_epoch: core.safety.epoch_id(),
+        });
+    }
+    if core.urgent_stop_unapplied() || ctx.stop_generation != expected_stop_gen {
+        return Err(ConfigError::Stopped);
+    }
+    if let Some((conn, gen)) = auth.lease_holder {
+        if gen == 0 || !core.validate_lease_at(conn.as_str(), gen, ctx.now) {
+            return Err(ConfigError::LeaseLost);
+        }
+    } else {
+        return Err(ConfigError::LeaseLost);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn install_begin_calibration_txn(
+    core: &mut SupervisorInner,
+    ctx: &CommitCtx,
+    txn_id: u64,
+    auth: &ConfigAuthContext,
+    operator_grant: crate::auth::OperatorGrant,
+    expected_epoch: u64,
+    expected_stop_gen: u64,
+    kind: CalibrationTxnKind,
+) -> Result<CalibrationStateSample, ConfigError> {
+    check_calib_live_authority_rt(core, ctx, auth, expected_epoch, expected_stop_gen)?;
+    if !operator_grant.is_valid_at(ctx.now, core.operator_auth_enforced) {
+        return Err(ConfigError::CalibPrecondition {
+            status: 403,
+            code: "OPERATOR_REQUIRED",
+            message: "Operator session expired or locked during calibration",
+        });
+    }
+    match kind {
+        CalibrationTxnKind::IngressBusyCheck => {
+            if core.calibration_busy {
+                return Err(ConfigError::Busy(
+                    "a calibration apply, restore or motor zero is running",
+                ));
+            }
+            snapshot_calibration_sample_rt(core, false)
+        }
+        CalibrationTxnKind::CameraPreflight => {
+            if core.calibration_busy {
+                return Err(ConfigError::Busy(
+                    "a calibration apply, restore or motor zero is running",
+                ));
+            }
+            if core.core.config().held().is_some() {
+                return Err(ConfigError::Busy(
+                    "a calibration apply, restore, or configuration change is running",
+                ));
+            }
+            if let Some(reason) = core.workspace_change_blocker_for_calibration_static() {
+                return Err(ConfigError::MotionBusy {
+                    subject: "the camera calibration",
+                    reason,
+                });
+            }
+            if !has_grasp_setup_rt(core) {
+                return Err(ConfigError::CalibPrecondition {
+                    status: 400,
+                    code: "UNSUPPORTED",
+                    message: "This profile has no grasp setup",
+                });
+            }
+            snapshot_calibration_sample_rt(core, false)
+        }
+        CalibrationTxnKind::CameraApply {
+            require_kinematics_disarmed,
+            dry_run,
+        } => {
+            if core.calibration_busy || core.core.config().held().is_some() {
+                return Err(ConfigError::Busy(
+                    "a calibration apply, restore, or configuration change is running",
+                ));
+            }
+            if let Some(reason) = core.workspace_change_blocker_for_calibration_static() {
+                return Err(ConfigError::MotionBusy {
+                    subject: "the camera calibration",
+                    reason,
+                });
+            }
+            if !has_grasp_setup_rt(core) {
+                return Err(ConfigError::CalibPrecondition {
+                    status: 400,
+                    code: "UNSUPPORTED",
+                    message: "This profile has no grasp setup",
+                });
+            }
+            if require_kinematics_disarmed {
+                check_kinematics_disarmed_rt(core)?;
+            }
+            let sample = snapshot_calibration_sample_rt(core, false)?;
+            if !dry_run {
+                core.calibration_busy = true;
+                core.calibration_txn_id = Some(txn_id);
+            }
+            Ok(sample)
+        }
+        CalibrationTxnKind::CameraRestore => {
+            if core.calibration_busy || core.core.config().held().is_some() {
+                return Err(ConfigError::Busy(
+                    "a calibration apply, restore, or configuration change is running",
+                ));
+            }
+            if let Some(reason) = core.workspace_change_blocker_for_calibration_static() {
+                return Err(ConfigError::MotionBusy {
+                    subject: "the camera calibration",
+                    reason,
+                });
+            }
+            if !has_grasp_setup_rt(core) {
+                return Err(ConfigError::CalibPrecondition {
+                    status: 400,
+                    code: "UNSUPPORTED",
+                    message: "This profile has no grasp setup",
+                });
+            }
+            let sample = snapshot_calibration_sample_rt(core, false)?;
+            core.calibration_busy = true;
+            core.calibration_txn_id = Some(txn_id);
+            Ok(sample)
+        }
+        CalibrationTxnKind::SoftwareZero { set_busy } => {
+            if core.rt_executor_owned && core.driver.is_some() {
+                return Err(ConfigError::CalibPrecondition {
+                    status: 409,
+                    code: "EXECUTOR_UNSUPPORTED",
+                    message: "/api/v1/calibration/motor_zero is not available while the RT executor owns the arm; use the legacy owner",
+                });
+            }
+            if core.calibration_busy || core.core.config().held().is_some() {
+                return Err(ConfigError::Busy(
+                    "a calibration apply, restore, motor zero, or configuration change is running",
+                ));
+            }
+            check_software_zero_idle_rt(core)?;
+            let sample = snapshot_calibration_sample_rt(core, true)?;
+            if set_busy {
+                core.calibration_busy = true;
+                core.motor_zero_busy = true;
+                core.calibration_txn_id = Some(txn_id);
+            }
+            Ok(sample)
+        }
+        CalibrationTxnKind::JointZeroRestore => {
+            if core.rt_executor_owned && core.driver.is_some() {
+                return Err(ConfigError::CalibPrecondition {
+                    status: 409,
+                    code: "EXECUTOR_UNSUPPORTED",
+                    message: "/api/v1/calibration/joint_zero/restore is not available while the RT executor owns the arm; use the legacy owner",
+                });
+            }
+            if core.calibration_busy || core.core.config().held().is_some() {
+                return Err(ConfigError::Busy(
+                    "a calibration apply, restore, zero, or configuration change is running",
+                ));
+            }
+            check_software_zero_idle_rt(core)?;
+            let sample = snapshot_calibration_sample_rt(core, false)?;
+            core.calibration_busy = true;
+            core.motor_zero_busy = true;
+            core.calibration_txn_id = Some(txn_id);
+            Ok(sample)
+        }
+    }
+}
+
+fn install_end_calibration_txn(
+    core: &mut SupervisorInner,
+    txn_id: u64,
+    force_reconcile: bool,
+) -> bool {
+    if core.calibration_txn_id == Some(txn_id) {
+        if force_reconcile {
+            let active_rev = ConfigAuthority::revision(core, ConfigDomain::Calibration);
+            core.core
+                .config_mut()
+                .force_reconcile(ConfigDomain::Calibration, active_rev);
+        }
+        core.calibration_busy = false;
+        core.motor_zero_busy = false;
+        core.calibration_txn_id = None;
+        true
+    } else {
+        false
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn install_sample_calibration_state(
+    core: &mut SupervisorInner,
+    ctx: &CommitCtx,
+    auth: &ConfigAuthContext,
+    operator_grant: crate::auth::OperatorGrant,
+    expected_epoch: u64,
+    expected_stop_gen: u64,
+    expected_txn_id: Option<u64>,
+    require_zero_state_checks: bool,
+    check_authority: bool,
+) -> Result<CalibrationStateSample, ConfigError> {
+    if let Some(tid) = expected_txn_id {
+        if core.calibration_txn_id != Some(tid) {
+            return Err(ConfigError::Busy("calibration transaction ownership was lost"));
+        }
+    }
+    if check_authority {
+        check_calib_live_authority_rt(core, ctx, auth, expected_epoch, expected_stop_gen)?;
+        if !operator_grant.is_valid_at(ctx.now, core.operator_auth_enforced) {
+            return Err(ConfigError::CalibPrecondition {
+                status: 403,
+                code: "OPERATOR_REQUIRED",
+                message: "Operator session expired or locked during calibration",
+            });
+        }
+    }
+    if require_zero_state_checks {
+        check_software_zero_idle_rt(core)?;
+    }
+    snapshot_calibration_sample_rt(core, require_zero_state_checks)
 }
 
 fn install_reserve_config(
@@ -1527,7 +2270,7 @@ fn install_reserve_config(
             ));
         }
     }
-    if let Err(err) = run_reserve_precheck(core, precheck, retired) {
+    if let Err(err) = run_reserve_precheck(core, ctx.now, precheck, retired) {
         retired.reserved_sequence_pins = seq_reserved_pins;
         return Err(err);
     }
@@ -1588,6 +2331,7 @@ fn install_verify_authority(
     auth: &ConfigAuthContext,
     expected_workspace_revision: Option<u64>,
     expected_poses_revision: Option<u64>,
+    domain_checks: VerifyDomainChecks,
 ) -> Result<(), ConfigError> {
     if core
         .core
@@ -1595,6 +2339,9 @@ fn install_verify_authority(
         .is_none_or(|h| h.grant != Some(grant))
     {
         return Err(ConfigError::NotHeld);
+    }
+    if proposal.domain != domain {
+        return Err(ConfigError::WrongTarget);
     }
     check_config_authority(core, ctx, proposal, auth, false)?;
     let current_rev = ConfigAuthority::revision(core, domain);
@@ -1617,6 +2364,71 @@ fn install_verify_authority(
                 "poses changed before calibration rename",
             ));
         }
+    }
+    if domain == ConfigDomain::Calibration {
+        let Some(op_grant) = domain_checks.operator_grant else {
+            return Err(ConfigError::CalibPrecondition {
+                status: 403,
+                code: "OPERATOR_REQUIRED",
+                message: "Operator session expired or locked during calibration",
+            });
+        };
+        if !op_grant.is_valid_at(ctx.now, core.operator_auth_enforced) {
+            return Err(ConfigError::CalibPrecondition {
+                status: 403,
+                code: "OPERATOR_REQUIRED",
+                message: "Operator session expired or locked during calibration",
+            });
+        }
+    } else if let Some(op_grant) = domain_checks.operator_grant {
+        if !op_grant.is_valid_at(ctx.now, core.operator_auth_enforced) {
+            return Err(ConfigError::CalibPrecondition {
+                status: 403,
+                code: "OPERATOR_REQUIRED",
+                message: "Operator session expired or locked during calibration",
+            });
+        }
+    }
+    if let Some(tid) = domain_checks.expected_txn_id {
+        if core.calibration_txn_id != Some(tid) {
+            return Err(ConfigError::Busy("calibration transaction ownership was lost"));
+        }
+    }
+    if let Some(exp_gs) = domain_checks.expected_grasp_setup_revision {
+        if core.grasp_setup_revision != exp_gs {
+            return Err(ConfigError::RevisionMismatch {
+                expected: exp_gs,
+                current: core.grasp_setup_revision,
+            });
+        }
+    }
+    if let Some(exp_gc) = domain_checks.expected_gripper_calib_revision {
+        if core.gripper_calib_revision != exp_gc {
+            return Err(ConfigError::PlanStale(
+                "gripper calibration changed before software joint zero rename",
+            ));
+        }
+    }
+    if domain_checks.require_workspace_unblocked {
+        if let Some(reason) = core.workspace_change_blocker_for_calibration_static() {
+            return Err(ConfigError::MotionBusy {
+                subject: "the camera calibration",
+                reason,
+            });
+        }
+    }
+    if domain_checks.require_kinematics_disarmed {
+        check_kinematics_disarmed_rt(core)?;
+    }
+    if domain_checks.require_software_zero_idle {
+        if core.rt_executor_owned && core.driver.is_some() {
+            return Err(ConfigError::CalibPrecondition {
+                status: 409,
+                code: "EXECUTOR_UNSUPPORTED",
+                message: "software joint zero with an attached hardware driver is not available while the RT executor owns the arm; use the legacy owner",
+            });
+        }
+        check_software_zero_idle_rt(core)?;
     }
     Ok(())
 }
@@ -1719,6 +2531,11 @@ fn install_activate_config(
     {
         retired.unused_candidate = Some(candidate);
         let _ = ConfigAuthority::release(core, reservation);
+        if durability != Durability::Volatile {
+            let active_rev = ConfigAuthority::revision(core, domain);
+            core.core.config_mut().force_reconcile(domain, active_rev);
+            return Err(ConfigError::Reconciling("NOT_HELD"));
+        }
         return Err(ConfigError::NotHeld);
     }
 
@@ -1762,7 +2579,7 @@ fn install_activate_config(
     }
 
     // Domain-specific post-rename invariant rechecks before swapping live state.
-    if let Err(code) = check_candidate_domain_invariants(core, &candidate) {
+    if let Err(code) = check_candidate_domain_invariants(core, ctx.now, &candidate, false) {
         return Err(fail_activation(core, reservation, code, candidate, retired));
     }
 
@@ -1780,10 +2597,13 @@ fn install_activate_config(
             workspace_revision: core.workspace_revision,
             poses_revision: core.poses.revision,
             gripper_calib_revision: core.gripper_calib_revision,
+            grasp_setup_revision: core.grasp_setup_revision,
+            calibration_revision: core.calibration_revision,
             epoch_id: core.safety.epoch_id(),
             is_torqued: core.is_torqued,
             safety_state: SafetyStateTag::from_state(core.safety.state()),
             gravity_comp_active: core.gravity_comp_active(),
+            activated_at: ctx.now,
         }),
         Activated::Refused { code, reservation } => {
             let _ = ConfigAuthority::release(core, reservation);
@@ -1795,7 +2615,9 @@ fn install_activate_config(
 
 fn check_candidate_domain_invariants(
     core: &SupervisorInner,
+    now: Instant,
     candidate: &ConfigCandidate,
+    for_reconcile: bool,
 ) -> Result<(), &'static str> {
     match candidate {
         ConfigCandidate::Keepout { .. } => {
@@ -1846,6 +2668,80 @@ fn check_candidate_domain_invariants(
             } else {
                 Ok(())
             }
+        }
+        ConfigCandidate::Calibration {
+            kinematics_changed,
+            expected_grasp_setup_revision,
+            expected_txn_id,
+            operator_grant,
+            ..
+        } => {
+            if !operator_grant.is_valid_at(now, core.operator_auth_enforced) {
+                return Err("OPERATOR_REQUIRED");
+            }
+            if for_reconcile {
+                if core.calibration_txn_id.is_some() && core.calibration_txn_id != *expected_txn_id {
+                    return Err("CONFIG_BUSY");
+                }
+            } else if let Some(tid) = expected_txn_id {
+                if core.calibration_txn_id != Some(*tid) {
+                    return Err("CONFIG_BUSY");
+                }
+            }
+            if !has_grasp_setup_rt(core) {
+                return Err("UNSUPPORTED");
+            }
+            if core.workspace_change_blocker_for_calibration_static().is_some() {
+                return Err("MOTION_BUSY");
+            }
+            if *kinematics_changed && check_kinematics_disarmed_rt(core).is_err() {
+                return Err("KINEMATICS_ARMED");
+            }
+            if let Some(exp_gs) = expected_grasp_setup_revision {
+                if core.grasp_setup_revision != *exp_gs {
+                    return Err("REVISION_MISMATCH");
+                }
+            }
+            Ok(())
+        }
+        ConfigCandidate::SoftwareJointZero {
+            dof,
+            expected_gripper_calib_revision,
+            expected_txn_id,
+            operator_grant,
+            ..
+        } => {
+            if !operator_grant.is_valid_at(now, core.operator_auth_enforced) {
+                return Err("OPERATOR_REQUIRED");
+            }
+            if for_reconcile {
+                if core.calibration_txn_id.is_some() && core.calibration_txn_id != *expected_txn_id {
+                    return Err("CONFIG_BUSY");
+                }
+            } else if let Some(tid) = expected_txn_id {
+                if core.calibration_txn_id != Some(*tid) {
+                    return Err("CONFIG_BUSY");
+                }
+            }
+            if core.rt_executor_owned && core.driver.is_some() {
+                return Err("EXECUTOR_UNSUPPORTED");
+            }
+            if core.config.zero_reference.is_none() || *dof != core.config.dof {
+                return Err("UNSUPPORTED");
+            }
+            if let Err(err) = check_software_zero_idle_rt(core) {
+                return Err(match err {
+                    ConfigError::CalibPrecondition { code, .. }
+                    | ConfigError::CalibPreconditionText { code, .. } => code,
+                    _ => "MOTOR_ZERO_ARMED",
+                });
+            }
+            if let Some(exp_gc) = expected_gripper_calib_revision {
+                if core.gripper_calib_revision != *exp_gc {
+                    return Err("PLAN_STALE");
+                }
+            }
+            Ok(())
         }
         ConfigCandidate::Poses { .. } | ConfigCandidate::Sequences { .. } => Ok(()),
     }
@@ -1938,6 +2834,178 @@ fn swap_config_candidate_in_place(
             retired.string_a = core.tool_commissioning_confirmed_at.replace(confirmed_at);
             core.tool_commissioning_revision += 1;
         }
+        ConfigCandidate::Calibration {
+            calibration,
+            #[cfg(feature = "policy-runtime")]
+            calibration_digest,
+            camera_mount,
+            arm_model,
+            kinematics_changed,
+            next_pose_list,
+            grasp_setup,
+            expected_grasp_setup_revision: _,
+            expected_txn_id: _,
+            operator_grant: _,
+            effective_floor,
+            ws_eval_bufs,
+        } => {
+            let mut ws_changed = kinematics_changed;
+            if core.config.camera_mount != camera_mount {
+                ws_changed = true;
+            }
+            core.config.camera_mount = camera_mount;
+            retired.arm_model = Some(std::mem::replace(&mut core.config.arm_model, arm_model));
+            retired.calibration_file = std::mem::replace(&mut core.calibration, calibration);
+            #[cfg(feature = "policy-runtime")]
+            {
+                retired.string_a = Some(std::mem::replace(
+                    &mut core.calibration_digest,
+                    calibration_digest,
+                ));
+            }
+            retired.string_b = core.calibration_load_error.take();
+            if let Some(next_poses) = next_pose_list {
+                retired.pose_list = Some(std::mem::replace(&mut core.poses.list, next_poses));
+            }
+            if let Some(setup) = grasp_setup {
+                let tilt = setup.camera_tilt_deg as f32;
+                if core.config.camera_mount.tilt_deg != tilt {
+                    ws_changed = true;
+                }
+                core.config.camera_mount.tilt_deg = tilt;
+                retired.grasp_setup = core.config.grasp.replace(setup);
+                core.grasp_setup_revision += 1;
+            } else if let Some(g) = core.config.grasp.as_mut() {
+                g.camera_tilt_deg = f64::from(core.config.camera_mount.tilt_deg);
+            }
+            if let Some((eff_floor, floor_src)) = effective_floor {
+                core.floor_source = floor_src;
+                if let Some(ws) = core.config.workspace.as_mut() {
+                    if ws.floor_z_m != eff_floor {
+                        ws.floor_z_m = eff_floor;
+                        ws_changed = true;
+                    }
+                }
+            }
+            if let Some(bufs) = ws_eval_bufs {
+                retired.eval_bufs = Some(std::mem::replace(&mut core.ws_eval_bufs, bufs));
+            }
+            if ws_changed {
+                core.workspace_revision += 1;
+                core.bump_motion_config_revision();
+                core.retire_servo_ws_min_depths();
+            }
+            core.calibration_revision += 1;
+            if !core.rt_executor_owned {
+                core.refresh_schema_cache();
+            }
+        }
+        ConfigCandidate::SoftwareJointZero {
+            new_offsets,
+            dof,
+            calibration,
+            #[cfg(feature = "policy-runtime")]
+            calibration_digest,
+            next_arm_model,
+            next_pose_list,
+            next_gripper_stale,
+            expected_gripper_calib_revision: _,
+            expected_txn_id: _,
+            operator_grant: _,
+            effective_floor,
+            ws_eval_bufs,
+            reset_gripper_baseline,
+            replacement_baseline,
+            replacement_baseline_pending,
+        } => {
+            let mut ws_changed = false;
+            let mut j6_changed = false;
+            let n = dof.min(core.joint_zero_offsets.len()).min(crate::rt_core::mailbox::MAX_DOF);
+            for i in 0..n {
+                let old = core.joint_zero_offsets[i];
+                let new_v = new_offsets[i];
+                let d = old - new_v;
+                core.joint_zero_offsets[i] = new_v;
+                if d != 0.0 {
+                    if i == 5 {
+                        j6_changed = true;
+                    }
+                    if let Some(p) = core.measured_positions.get_mut(i) {
+                        *p += d;
+                    }
+                    if let Some(p) = core.commanded_positions.get_mut(i) {
+                        *p += d;
+                    }
+                    if let Some(p) = core.target_positions.get_mut(i) {
+                        *p += d;
+                    }
+                }
+            }
+            retired.tracking = core.tracking.invalidate_retiring();
+            if j6_changed {
+                core.zero_convention = Default::default();
+            }
+            core.zero_check_pending = true;
+            if reset_gripper_baseline && core.gripper_baseline.is_some() {
+                retired.gripper_baseline =
+                    std::mem::replace(&mut core.gripper_baseline, replacement_baseline);
+                core.gripper_last_contact = None;
+                if let Some(fresh_pending) = replacement_baseline_pending {
+                    retired.gripper_baseline_pending = Some(std::mem::replace(
+                        &mut core.gripper_baseline_pending,
+                        fresh_pending,
+                    ));
+                }
+                core.gripper_baseline_generation += 1;
+                core.gripper_baseline_dirty = true;
+            } else {
+                retired.gripper_baseline = replacement_baseline;
+                retired.gripper_baseline_pending = replacement_baseline_pending;
+            }
+            if let Some(arm_model) = next_arm_model {
+                retired.arm_model = Some(std::mem::replace(&mut core.config.arm_model, arm_model));
+                ws_changed = true;
+            }
+            retired.calibration_file = std::mem::replace(&mut core.calibration, calibration);
+            #[cfg(feature = "policy-runtime")]
+            {
+                retired.string_a = Some(std::mem::replace(
+                    &mut core.calibration_digest,
+                    calibration_digest,
+                ));
+            }
+            if let Some((next_poses, bump_rev)) = next_pose_list {
+                retired.pose_list = Some(std::mem::replace(&mut core.poses.list, next_poses));
+                if bump_rev {
+                    core.poses.revision += 1;
+                }
+            }
+            if let Some(stale) = next_gripper_stale {
+                retired.gripper_stale = core.gripper_calib_stale.replace(stale);
+                core.gripper_calib_revision += 1;
+            }
+            if let Some((eff_floor, floor_src)) = effective_floor {
+                core.floor_source = floor_src;
+                if let Some(ws) = core.config.workspace.as_mut() {
+                    if ws.floor_z_m != eff_floor {
+                        ws.floor_z_m = eff_floor;
+                        ws_changed = true;
+                    }
+                }
+            }
+            if let Some(bufs) = ws_eval_bufs {
+                retired.eval_bufs = Some(std::mem::replace(&mut core.ws_eval_bufs, bufs));
+            }
+            if ws_changed {
+                core.workspace_revision += 1;
+                core.bump_motion_config_revision();
+                core.retire_servo_ws_min_depths();
+            }
+            core.calibration_revision += 1;
+            if !core.rt_executor_owned {
+                core.refresh_schema_cache();
+            }
+        }
     }
 }
 
@@ -1955,6 +3023,7 @@ fn install_finish_reconcile(
         candidate,
         expected_workspace_revision,
         expected_poses_revision,
+        cleanup_marker_txn_id,
     } = req;
     let is_reconciling = core
         .core
@@ -1992,7 +3061,7 @@ fn install_finish_reconcile(
             ));
         }
     }
-    if let Err(code) = check_candidate_domain_invariants(core, &candidate) {
+    if let Err(code) = check_candidate_domain_invariants(core, ctx.now, &candidate, true) {
         retired.unused_candidate = Some(candidate);
         return Err(match code {
             "MOTION_BUSY" => ConfigError::MotionBusy {
@@ -2007,16 +3076,25 @@ fn install_finish_reconcile(
     swap_config_candidate_in_place(core, candidate, retired);
     let cleared = ConfigAuthority::finish_reconcile(core, domain);
     debug_assert!(cleared);
+    if let Some(cleanup_tid) = cleanup_marker_txn_id {
+        // Retain calibration transaction exclusion atomically while the retry unlinks its
+        // pending commit marker so a new calibration cannot overwrite the shared marker path.
+        core.calibration_busy = true;
+        core.calibration_txn_id = Some(cleanup_tid);
+    }
     Ok(ConfigActivated {
         revision: ConfigAuthority::revision(core, domain),
         durability: Durability::Durable,
         workspace_revision: core.workspace_revision,
         poses_revision: core.poses.revision,
         gripper_calib_revision: core.gripper_calib_revision,
+        grasp_setup_revision: core.grasp_setup_revision,
+        calibration_revision: core.calibration_revision,
         epoch_id: core.safety.epoch_id(),
         is_torqued: core.is_torqued,
         safety_state: SafetyStateTag::from_state(core.safety.state()),
         gravity_comp_active: core.gravity_comp_active(),
+        activated_at: ctx.now,
     })
 }
 
@@ -2264,6 +3342,8 @@ pub struct ConfigCommitTestHooks {
     pub after_reserve_before_rename: Option<Arc<dyn Fn() + Send + Sync>>,
     pub after_rename_before_activate: Option<Arc<dyn Fn() + Send + Sync>>,
     pub fail_rename_once: Option<Arc<AtomicBool>>,
+    /// Optional 0-based file index at which a multi-file batch rename fails once (`usize::MAX` = disabled).
+    pub fail_rename_at_index: Option<Arc<AtomicUsize>>,
     pub fail_dir_sync_once: Option<Arc<AtomicBool>>,
     pub fail_persisted_once: Option<Arc<AtomicBool>>,
     /// Optional parent-directory fsync override invoked on both initial commit and reconciliation retries.
@@ -2419,6 +3499,7 @@ pub struct ReservationGuard {
     sup: Arc<ArmSupervisor>,
     reservation: Option<Reservation>,
     renamed: bool,
+    pub_phase: Option<Arc<AtomicU8>>,
 }
 
 impl ReservationGuard {
@@ -2427,6 +3508,20 @@ impl ReservationGuard {
             sup,
             reservation: Some(reservation),
             renamed: false,
+            pub_phase: None,
+        }
+    }
+
+    pub(crate) fn with_phase(
+        sup: Arc<ArmSupervisor>,
+        reservation: Reservation,
+        pub_phase: Arc<AtomicU8>,
+    ) -> Self {
+        Self {
+            sup,
+            reservation: Some(reservation),
+            renamed: false,
+            pub_phase: Some(pub_phase),
         }
     }
 
@@ -2448,8 +3543,13 @@ impl Drop for ReservationGuard {
         let Some(reservation) = self.reservation.take() else {
             return;
         };
+        let domain = reservation.domain();
         let sup = Arc::clone(&self.sup);
-        let renamed = self.renamed;
+        let renamed = self.renamed
+            || self
+                .pub_phase
+                .as_ref()
+                .is_some_and(|p| p.load(Ordering::SeqCst) >= PUB_PHASE_RENAMING);
         match tokio::runtime::Handle::try_current() {
             Ok(h) => {
                 h.spawn(async move {
@@ -2462,12 +3562,28 @@ impl Drop for ReservationGuard {
                                 },
                             ))
                             .await;
-                        if let Ok(ConfigReply::Persisted(Ok(r))) = res {
-                            let _ = sup
-                                .dispatch_config_request_owned_reliable(ConfigRequest::Release(
-                                    ReleaseConfig { reservation: r },
-                                ))
-                                .await;
+                        match res {
+                            Ok(ConfigReply::Persisted(Ok(r))) => {
+                                let rel = sup
+                                    .dispatch_config_request_owned_reliable(ConfigRequest::Release(
+                                        ReleaseConfig { reservation: r },
+                                    ))
+                                    .await;
+                                if !matches!(rel, Ok(ConfigReply::Released(Released::Reconciling))) {
+                                    let _ = sup
+                                        .dispatch_config_request_reliable(|| {
+                                            ConfigRequest::ForceReconcile(domain)
+                                        })
+                                        .await;
+                                }
+                            }
+                            _ => {
+                                let _ = sup
+                                    .dispatch_config_request_reliable(|| {
+                                        ConfigRequest::ForceReconcile(domain)
+                                    })
+                                    .await;
+                            }
                         }
                     } else {
                         let _ = sup
@@ -2492,6 +3608,8 @@ impl Drop for ReservationGuard {
                                 let _ = h.call_config(ConfigRequest::Release(ReleaseConfig {
                                     reservation: r,
                                 }));
+                            } else {
+                                let _ = h.call_config(ConfigRequest::ForceReconcile(domain));
                             }
                         } else {
                             let _ = h.call_config(ConfigRequest::Release(ReleaseConfig {
@@ -2519,6 +3637,9 @@ impl Drop for ReservationGuard {
                                     reservation: r,
                                 }));
                                 handle_config_exchange(&mut inner, &ctx, &mut rel);
+                            } else {
+                                let mut frc = ConfigExchange::new(ConfigRequest::ForceReconcile(domain));
+                                handle_config_exchange(&mut inner, &ctx, &mut frc);
                             }
                         } else {
                             let mut rel = ConfigExchange::new(ConfigRequest::Release(ReleaseConfig {
@@ -2533,6 +3654,24 @@ impl Drop for ReservationGuard {
     }
 }
 
+/// Single filesystem mutation inside a [`ConfigWriteOp::Batch`].
+#[derive(Debug, Clone)]
+pub enum FileWriteOp {
+    /// Stage and atomically rename `PendingWrite` over its target path.
+    Replace(PendingWrite),
+    /// Remove the file at `PathBuf` (`NotFound` is treated as a no-op that did not mutate disk).
+    Remove(PathBuf),
+}
+
+impl FileWriteOp {
+    pub fn target_path(&self) -> &Path {
+        match self {
+            Self::Replace(pw) => &pw.path,
+            Self::Remove(p) => p,
+        }
+    }
+}
+
 /// Filesystem operation performed during a unified [`run_config_commit_detailed`] transaction.
 ///
 /// Every persisted write runs its staging, file fsync, rename, and parent-directory fsync
@@ -2542,6 +3681,18 @@ pub enum ConfigWriteOp {
     Volatile,
     /// Stage `PendingWrite` off-thread after reservation, then rename + dir-sync before activation.
     StageAndReplace(PendingWrite),
+    /// Ordered batch of file replacements/removals (1..=3 files) with an optional durable
+    /// pending-commit marker file written before pre-rename verification (or an already-written
+    /// marker created before external vision PUT) and removed only after live activation or
+    /// bounded reconciliation succeeds.
+    Batch {
+        ops: Vec<FileWriteOp>,
+        pending_marker: Option<(PathBuf, String)>,
+        /// Pre-existing durable intent marker created before an external side effect (e.g.
+        /// rebot-vision PUT). Removed ONLY after live activation or reconciliation succeeds;
+        /// left for the outer transaction to clean up if pre-rename rollback succeeds.
+        existing_marker: Option<PathBuf>,
+    },
 }
 
 impl From<Option<PendingWrite>> for ConfigWriteOp {
@@ -2575,13 +3726,21 @@ pub struct ConfigCommitOutcome {
     pub durability_warning: Option<String>,
 }
 
+impl ConfigCommitOutcome {
+    pub fn disposition(&self) -> CommitDisposition {
+        CommitDisposition::Applied
+    }
+}
+
 /// Typed failure outcome from [`run_config_commit_detailed`] preserving whether disk publication
-/// happened and whether the owner entered `HoldState::Reconciling`.
+/// happened, whether the owner entered `HoldState::Reconciling`, and whether activation outcome
+/// is unknown (transport error / worker panic after publication).
 #[derive(Debug)]
 pub struct ConfigCommitError {
     pub error: ArmError,
     pub disk_published: bool,
     pub reconciling: bool,
+    pub outcome_unknown: bool,
 }
 
 impl ConfigCommitError {
@@ -2590,6 +3749,7 @@ impl ConfigCommitError {
             error,
             disk_published: false,
             reconciling: false,
+            outcome_unknown: false,
         }
     }
 
@@ -2598,9 +3758,31 @@ impl ConfigCommitError {
             error,
             disk_published: true,
             reconciling: true,
+            outcome_unknown: false,
+        }
+    }
+
+    fn post_publish_unknown(error: ArmError) -> Self {
+        Self {
+            error,
+            disk_published: true,
+            reconciling: true,
+            outcome_unknown: true,
+        }
+    }
+
+    pub fn disposition(&self) -> CommitDisposition {
+        if self.disk_published || self.reconciling || self.outcome_unknown {
+            CommitDisposition::Uncertain
+        } else {
+            CommitDisposition::Unattempted
         }
     }
 }
+
+const PUB_PHASE_PRE_RENAME: u8 = 0;
+const PUB_PHASE_RENAMING: u8 = 1;
+const PUB_PHASE_RENAMED: u8 = 2;
 
 /// Unified, cancellation-safe off-thread two-phase config commit orchestrator for BOTH
 /// `RtOwner::Legacy` and `RtOwner::Executor`.
@@ -2621,16 +3803,26 @@ where
     FPub: FnOnce(&mut PublishedConfig, ConfigActivated) + Send + 'static,
 {
     let sup_w = Arc::clone(sup);
+    let pub_phase = Arc::new(AtomicU8::new(PUB_PHASE_PRE_RENAME));
+    let pub_phase_w = Arc::clone(&pub_phase);
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        let res = run_config_commit_worker(sup_w, plan, auth_check, update_published).await;
+        let res = run_config_commit_worker(sup_w, plan, auth_check, update_published, pub_phase_w).await;
         let _ = done_tx.send(res);
     });
     match done_rx.await {
         Ok(res) => res,
-        Err(_) => Err(ConfigCommitError::pre_publish(ArmError::Internal(
-            "configuration commit worker aborted".into(),
-        ))),
+        Err(_) => {
+            if pub_phase.load(Ordering::Acquire) != PUB_PHASE_PRE_RENAME {
+                Err(ConfigCommitError::post_publish_unknown(ArmError::Internal(
+                    "configuration commit worker aborted after disk publication began; reconciliation required".into(),
+                )))
+            } else {
+                Err(ConfigCommitError::pre_publish(ArmError::Internal(
+                    "configuration commit worker aborted".into(),
+                )))
+            }
+        }
     }
 }
 
@@ -2669,6 +3861,9 @@ pub(crate) trait CommonCommitWorker: Send {
     fn should_fail_rename_once(&self) -> bool {
         false
     }
+    fn fail_rename_at_index(&self) -> Option<usize> {
+        None
+    }
     fn should_fail_dir_sync_once(&self) -> bool {
         false
     }
@@ -2682,6 +3877,13 @@ pub(crate) trait CommonCommitWorker: Send {
     fn prepare_write_after_reserve(
         &mut self,
     ) -> impl std::future::Future<Output = Result<Option<PendingWrite>, Self::Err>> + Send;
+    /// Step 1b (generalized): produce a [`ConfigWriteOp`] (single write, volatile, or multi-file batch).
+    /// Defaults to wrapping [`Self::prepare_write_after_reserve`].
+    fn prepare_write_op_after_reserve(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<ConfigWriteOp, Self::Err>> + Send {
+        async { self.prepare_write_after_reserve().await.map(ConfigWriteOp::from) }
+    }
     /// Optional pre-rename hook; returning `true` simulates worker disconnect (without Release).
     fn after_reserve_before_rename(&mut self) -> bool {
         false
@@ -2690,10 +3892,21 @@ pub(crate) trait CommonCommitWorker: Send {
     fn verify_authority_before_rename(
         &mut self,
     ) -> impl std::future::Future<Output = Result<(), Self::Err>> + Send;
-    /// Called immediately after `rename_only()` succeeds (before `mark_persisted`).
+    /// Called immediately before the blocking rename/remove step starts (marks publication phase).
+    fn on_rename_starting(&mut self) {}
+    /// Called immediately after at least one file rename/remove succeeded (before `mark_persisted`).
     fn on_renamed(&mut self) {}
     /// Step 4b: Record `Persisted(DurableUnconfirmed)` on the live owner immediately after rename.
     fn mark_persisted(&mut self) -> impl std::future::Future<Output = Result<(), Self::Err>> + Send;
+    /// Step 4 error (partial batch): a later rename/remove failed AFTER >=1 earlier file mutated disk.
+    /// Must enter `Reconciling` and latch a non-recoverable fault (never retry half-published batch).
+    fn reconcile_after_partial_rename(
+        &mut self,
+        _failed_path: PathBuf,
+        err: String,
+    ) -> impl std::future::Future<Output = Self::Err> + Send {
+        self.reconcile_rename_join_error(err)
+    }
     /// Step 5 error: Parent-directory fsync failed after rename -> enter `Reconciling`, NO Activate,
     /// and kick off bounded off-RT reconciliation retry for `target_path`.
     fn reconcile_after_dir_sync_failure(
@@ -2701,6 +3914,18 @@ pub(crate) trait CommonCommitWorker: Send {
         target_path: PathBuf,
         warn: String,
     ) -> impl std::future::Future<Output = Self::Err> + Send;
+    /// Step 5 error (multi-path): parent-directory fsync failed across one or more target paths.
+    fn reconcile_after_dir_sync_failure_paths(
+        &mut self,
+        target_paths: Vec<PathBuf>,
+        warn: String,
+    ) -> impl std::future::Future<Output = Self::Err> + Send {
+        let first = target_paths
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| PathBuf::from("state"));
+        self.reconcile_after_dir_sync_failure(first, warn)
+    }
     /// Optional post-dir-sync hook; returning `true` simulates worker disconnect (without Activate).
     fn after_rename_before_activate(&mut self) -> bool {
         false
@@ -2723,8 +3948,48 @@ pub(crate) trait CommonCommitWorker: Send {
         &mut self,
         err: String,
     ) -> impl std::future::Future<Output = Self::Err> + Send;
-    /// Returned when a test hook simulates worker disconnect before rename or before activate.
+    /// Called when an activated commit's pending-commit marker could not be removed cleanly.
+    fn note_marker_cleanup_warning(&mut self, _ok: &mut Self::Ok, _warn: String) {}
+    /// Called when a marker written by this worker could not be removed after pre-rename abort:
+    /// must enter `Reconciling` rather than silently releasing `Cleared` while a marker remains.
+    fn reconcile_after_marker_error(
+        &mut self,
+        err: String,
+    ) -> impl std::future::Future<Output = Self::Err> + Send {
+        self.reconcile_rename_join_error(err)
+    }
     fn worker_disconnected_err(&mut self) -> Self::Err;
+}
+
+enum StagedFileOp {
+    Replace(StagedWrite),
+    Remove(PathBuf),
+}
+
+fn abort_staged_ops(ops: Vec<StagedFileOp>) {
+    for op in ops {
+        if let StagedFileOp::Replace(staged) = op {
+            staged.abort();
+        }
+    }
+}
+
+fn unique_dir_syncs(dir_syncs: Vec<PendingDirSync>) -> Vec<PendingDirSync> {
+    let mut seen: Vec<PathBuf> = Vec::with_capacity(dir_syncs.len());
+    let mut out: Vec<PendingDirSync> = Vec::with_capacity(dir_syncs.len());
+    for ds in dir_syncs {
+        let parent = ds
+            .target()
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+            .to_path_buf();
+        if !seen.contains(&parent) {
+            seen.push(parent);
+            out.push(ds);
+        }
+    }
+    out
 }
 
 async fn run_fs_step<T: Send + 'static>(
@@ -2758,122 +4023,308 @@ pub(crate) async fn execute_common_commit<W: CommonCommitWorker>(
     // 1. Reserve domain on the single live owner strictly BEFORE serialization or staging.
     w.reserve().await?;
 
-    // 1b. Produce serialized write (and pin sequence replay episodes) under the granted reservation.
-    let pending_write = match w.prepare_write_after_reserve().await {
-        Ok(pw) => pw,
+    // 1b. Produce serialized write(s) (and pin sequence replay episodes) under the granted reservation.
+    let write_op = match w.prepare_write_op_after_reserve().await {
+        Ok(op) => op,
         Err(err) => {
             w.release_pre_rename().await;
             return Err(err);
         }
     };
 
+    let (file_ops, pending_marker, existing_marker): (
+        Vec<FileWriteOp>,
+        Option<(PathBuf, String)>,
+        Option<PathBuf>,
+    ) = match write_op {
+        ConfigWriteOp::Volatile => (Vec::new(), None, None),
+        ConfigWriteOp::StageAndReplace(pw) => (vec![FileWriteOp::Replace(pw)], None, None),
+        ConfigWriteOp::Batch {
+            ops,
+            pending_marker,
+            existing_marker,
+        } => (ops, pending_marker, existing_marker),
+    };
+
     // 2. Off-thread stage + file fsync (`StagedWrite::stage`) strictly AFTER reserve.
-    let staged_opt: Option<StagedWrite> = match pending_write {
-        None => None,
-        Some(pw) => {
-            let stage_res = run_fs_step(W::RUN_BLOCKING_ON_TOKIO, move || {
-                StagedWrite::stage(pw.path, pw.text)
+    let mut staged_ops: Vec<StagedFileOp> = Vec::with_capacity(file_ops.len());
+    for op in file_ops {
+        match op {
+            FileWriteOp::Replace(pw) => {
+                let stage_res = run_fs_step(W::RUN_BLOCKING_ON_TOKIO, move || {
+                    StagedWrite::stage(pw.path, pw.text)
+                })
+                .await
+                .map_err(|e| format!("stage task failed: {e}"))
+                .and_then(|r| r);
+                match stage_res {
+                    Ok(staged) => staged_ops.push(StagedFileOp::Replace(staged)),
+                    Err(e) => {
+                        abort_staged_ops(staged_ops);
+                        tracing::warn!("State file not staged: {e}");
+                        return Err(w.abort_pre_rename_fs("stage", e).await);
+                    }
+                }
+            }
+            FileWriteOp::Remove(path) => staged_ops.push(StagedFileOp::Remove(path)),
+        }
+    }
+
+    // 2b. Write & durably fsync any worker-owned pending-commit marker BEFORE boundary-1
+    //     authority verification so no blocking marker I/O runs between recheck and rename.
+    let mut worker_marker: Option<PathBuf> = None;
+    if !staged_ops.is_empty() {
+        if let Some((marker_path, marker_text)) = pending_marker {
+            let mp = marker_path.clone();
+            let marker_res = run_fs_step(W::RUN_BLOCKING_ON_TOKIO, move || {
+                let staged = StagedWrite::stage(mp.clone(), marker_text)
+                    .map_err(|e| (false, e))?;
+                let ds = staged.rename_only().map_err(|e| (false, e))?;
+                match ds.sync_parent_dir() {
+                    PublishOutcome::Published => Ok(()),
+                    PublishOutcome::PublishedDurabilityUnconfirmed(w) => Err((
+                        true,
+                        format!("marker {} renamed but dir fsync failed: {w}", mp.display()),
+                    )),
+                }
             })
             .await
-            .map_err(|e| format!("stage task failed: {e}"))
+            .map_err(|e| (true, format!("marker task failed: {e}")))
             .and_then(|r| r);
-            match stage_res {
-                Ok(staged) => Some(staged),
-                Err(e) => {
-                    tracing::warn!("State file not staged: {e}");
+            match marker_res {
+                Ok(()) => worker_marker = Some(marker_path),
+                Err((false, e)) => {
+                    abort_staged_ops(staged_ops);
+                    tracing::warn!("Pending commit marker not written: {e}");
+                    return Err(w.abort_pre_rename_fs("stage", e).await);
+                }
+                Err((true, e)) => {
+                    abort_staged_ops(staged_ops);
+                    let mp_clean = marker_path.clone();
+                    let rm_res = run_fs_step(W::RUN_BLOCKING_ON_TOKIO, move || {
+                        remove_pending_commit_marker(&mp_clean)
+                    })
+                    .await
+                    .map_err(|re| re.to_string())
+                    .and_then(|r| r);
+                    if let Err(rm_err) = rm_res {
+                        tracing::error!(
+                            "Pending commit marker left after failed dir fsync ({e}); cleanup failed ({rm_err})"
+                        );
+                        return Err(w.reconcile_after_marker_error(format!("{e}; cleanup: {rm_err}")).await);
+                    }
                     return Err(w.abort_pre_rename_fs("stage", e).await);
                 }
             }
         }
-    };
+    }
 
     if w.after_reserve_before_rename() {
-        if let Some(staged) = staged_opt {
-            staged.abort();
-        }
+        abort_staged_ops(staged_ops);
         return Err(w.worker_disconnected_err());
     }
 
-    // 3. Fresh pre-rename off-thread auth + live owner authority recheck.
+    // 3. Fresh pre-rename off-thread auth + live owner authority recheck (immediately before
+    //    blocking target renames; no blocking marker I/O runs after this check).
     if let Err(err) = w.verify_authority_before_rename().await {
-        if let Some(staged) = staged_opt {
-            staged.abort();
+        abort_staged_ops(staged_ops);
+        if let Some(mp) = worker_marker.take() {
+            let rm_res = run_fs_step(W::RUN_BLOCKING_ON_TOKIO, move || {
+                remove_pending_commit_marker(&mp)
+            })
+            .await
+            .map_err(|re| re.to_string())
+            .and_then(|r| r);
+            if let Err(rm_err) = rm_res {
+                tracing::error!(
+                    "Pre-rename verification failed and pending marker cleanup failed ({rm_err}); entering Reconciling"
+                );
+                return Err(w.reconcile_after_marker_error(rm_err).await);
+            }
         }
         w.release_pre_rename().await;
         return Err(err);
     }
 
-    // 4. Rename off-thread, mark Persisted(DurableUnconfirmed), then parent-directory fsync
+    // 4. Rename/remove off-thread, mark Persisted(DurableUnconfirmed), then parent-directory fsync
     //    strictly BEFORE activation.
     let mut disk_published = false;
-    if let Some(staged) = staged_opt {
+    let mut cleanup_marker_on_activate: Option<PathBuf> =
+        worker_marker.clone().or(existing_marker);
+
+    if !staged_ops.is_empty() {
         let sim_rename_fail = w.should_fail_rename_once();
+        let fail_idx = w.fail_rename_at_index();
+        w.on_rename_starting();
+
         let rename_outcome = run_fs_step(W::RUN_BLOCKING_ON_TOKIO, move || {
-            if sim_rename_fail {
-                staged.abort();
-                return Err("simulated rename failure".to_string());
+            let mut dir_syncs: Vec<PendingDirSync> = Vec::with_capacity(staged_ops.len());
+            let mut iter = staged_ops.into_iter().enumerate();
+            while let Some((idx, op)) = iter.next() {
+                if (sim_rename_fail && idx == 0) || fail_idx == Some(idx) {
+                    let failed_path = match op {
+                        StagedFileOp::Replace(s) => {
+                            let p = s.target_path().to_path_buf();
+                            s.abort();
+                            p
+                        }
+                        StagedFileOp::Remove(p) => p,
+                    };
+                    for (_, rem) in iter {
+                        if let StagedFileOp::Replace(s) = rem {
+                            s.abort();
+                        }
+                    }
+                    return Err((
+                        !dir_syncs.is_empty(),
+                        failed_path,
+                        format!("simulated rename failure at index {idx}"),
+                    ));
+                }
+                match op {
+                    StagedFileOp::Replace(staged) => {
+                        let target = staged.target_path().to_path_buf();
+                        match staged.rename_only() {
+                            Ok(ds) => dir_syncs.push(ds),
+                            Err(e) => {
+                                for (_, rem) in iter {
+                                    if let StagedFileOp::Replace(s) = rem {
+                                        s.abort();
+                                    }
+                                }
+                                return Err((!dir_syncs.is_empty(), target, e));
+                            }
+                        }
+                    }
+                    StagedFileOp::Remove(path) => match std::fs::remove_file(&path) {
+                        Ok(()) => dir_syncs.push(PendingDirSync::for_path(&path)),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => {
+                            for (_, rem) in iter {
+                                if let StagedFileOp::Replace(s) = rem {
+                                    s.abort();
+                                }
+                            }
+                            return Err((!dir_syncs.is_empty(), path, e.to_string()));
+                        }
+                    },
+                }
             }
-            staged.rename_only()
+            Ok(dir_syncs)
         })
         .await;
 
-        let dir_sync = match rename_outcome {
-            Ok(Ok(ds)) => {
-                w.on_renamed();
-                ds
-            }
-            Ok(Err(e)) => {
+        let dir_syncs = match rename_outcome {
+            Ok(Ok(ds)) => ds,
+            Ok(Err((false, _failed_path, e))) => {
+                if let Some(mp) = worker_marker.take() {
+                    let rm_res = run_fs_step(W::RUN_BLOCKING_ON_TOKIO, move || {
+                        remove_pending_commit_marker(&mp)
+                    })
+                    .await
+                    .map_err(|re| re.to_string())
+                    .and_then(|r| r);
+                    if let Err(rm_err) = rm_res {
+                        tracing::error!(
+                            "Pre-rename publish failed ({e}) and marker cleanup failed ({rm_err}); entering Reconciling"
+                        );
+                        return Err(w.reconcile_after_marker_error(format!("{e}; cleanup: {rm_err}")).await);
+                    }
+                }
                 tracing::warn!("State file not published: {e}");
                 return Err(w.abort_pre_rename_fs("rename", e).await);
             }
+            Ok(Err((true, failed_path, e))) => {
+                w.on_renamed();
+                tracing::error!(
+                    "Partial batch rename failure at {} ({e}); entering Reconciling and latching fault",
+                    failed_path.display()
+                );
+                return Err(w.reconcile_after_partial_rename(failed_path, e).await);
+            }
             Err(e) => {
+                w.on_renamed();
                 return Err(w.reconcile_rename_join_error(e).await);
             }
         };
-        let target_path = dir_sync.target().to_path_buf();
 
-        disk_published = true;
+        if !dir_syncs.is_empty() {
+            w.on_renamed();
+            disk_published = true;
 
-        // 4b. Mark Persisted(DurableUnconfirmed) immediately after rename.
-        w.mark_persisted().await?;
+            let target_paths: Vec<PathBuf> =
+                dir_syncs.iter().map(|ds| ds.target().to_path_buf()).collect();
+            let unique_syncs = unique_dir_syncs(dir_syncs);
 
-        // 5. Parent-directory fsync strictly AFTER rename and strictly BEFORE activation.
-        //    A failure here MUST NOT activate the new policy; it enters Reconciling and keeps
-        //    motion inhibited until bounded reconciliation succeeds (or latches a fault).
-        let dir_sync_res: Result<(), String> = if w.should_fail_dir_sync_once() {
-            Err("simulated parent dir fsync failure".into())
-        } else {
-            let override_fn = w.dir_sync_override();
-            run_fs_step(W::RUN_BLOCKING_ON_TOKIO, move || {
-                let outcome = match override_fn {
-                    Some(f) => dir_sync.sync_with(|dir| f(dir)),
-                    None => dir_sync.sync_parent_dir(),
-                };
-                match outcome {
-                    PublishOutcome::Published => Ok(()),
-                    PublishOutcome::PublishedDurabilityUnconfirmed(warn) => Err(warn),
-                }
-            })
-            .await
-            .map_err(|e| e.to_string())
-            .and_then(|r| r)
-        };
+            // 4b. Mark Persisted(DurableUnconfirmed) immediately after rename.
+            w.mark_persisted().await?;
 
-        if let Err(warn) = dir_sync_res {
-            tracing::error!(
-                "Parent directory fsync failed after rename for {} ({warn}); keeping old policy active and entering Reconciling",
-                target_path.display()
-            );
-            return Err(w.reconcile_after_dir_sync_failure(target_path, warn).await);
-        }
+            // 5. Parent-directory fsync strictly AFTER rename and strictly BEFORE activation.
+            //    A failure here MUST NOT activate the new policy; it enters Reconciling and keeps
+            //    motion inhibited until bounded reconciliation succeeds (or latches a fault).
+            let dir_sync_res: Result<(), String> = if w.should_fail_dir_sync_once() {
+                Err("simulated parent dir fsync failure".into())
+            } else {
+                let override_fn = w.dir_sync_override();
+                run_fs_step(W::RUN_BLOCKING_ON_TOKIO, move || {
+                    for ds in unique_syncs {
+                        let outcome = match override_fn.as_ref() {
+                            Some(f) => ds.sync_with(|dir| f(dir)),
+                            None => ds.sync_parent_dir(),
+                        };
+                        if let PublishOutcome::PublishedDurabilityUnconfirmed(warn) = outcome {
+                            return Err(warn);
+                        }
+                    }
+                    Ok(())
+                })
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|r| r)
+            };
 
-        if w.after_rename_before_activate() {
-            return Err(w.worker_disconnected_err());
+            if let Err(warn) = dir_sync_res {
+                tracing::error!(
+                    "Parent directory fsync failed after rename for {:?} ({warn}); keeping old policy active and entering Reconciling",
+                    target_paths
+                );
+                return Err(w.reconcile_after_dir_sync_failure_paths(target_paths, warn).await);
+            }
+
+            if w.after_rename_before_activate() {
+                return Err(w.worker_disconnected_err());
+            }
         }
     }
 
     // 6. Fresh post-dir-sync authority recheck + atomic activation + PublishedConfigHub update.
-    w.activate_and_publish(disk_published).await
+    let mut res = w.activate_and_publish(disk_published).await;
+    if let Ok(ref mut ok) = res {
+        if let Some(mp) = cleanup_marker_on_activate.take() {
+            let rm_res = run_fs_step(W::RUN_BLOCKING_ON_TOKIO, move || {
+                remove_pending_commit_marker(&mp)
+            })
+            .await
+            .map_err(|re| re.to_string())
+            .and_then(|r| r);
+            if let Err(rm_err) = rm_res {
+                w.note_marker_cleanup_warning(ok, rm_err);
+            }
+        }
+    } else if !disk_published {
+        if let Some(mp) = worker_marker.take() {
+            let rm_res = run_fs_step(W::RUN_BLOCKING_ON_TOKIO, move || {
+                remove_pending_commit_marker(&mp)
+            })
+            .await
+            .map_err(|re| re.to_string())
+            .and_then(|r| r);
+            if let Err(rm_err) = rm_res {
+                return Err(w.reconcile_after_marker_error(rm_err).await);
+            }
+        }
+    }
+    res
 }
 
 /// Synchronously drives [`execute_common_commit`] to completion for dedicated blocking workers
@@ -2895,8 +4346,10 @@ struct ConfigCommitBackend<FAuth, FPub> {
     proposal: ConfigProposal,
     auth: ConfigAuthContext,
     precheck: Option<ReservePrecheck>,
+    domain_checks: VerifyDomainChecks,
     candidate: Option<ConfigCandidate>,
-    pending_write: Option<PendingWrite>,
+    write_op: Option<ConfigWriteOp>,
+    pending_marker_path: Option<PathBuf>,
     expected_workspace_revision: Option<u64>,
     expected_poses_revision: Option<u64>,
     replay_episode_refs: Vec<(usize, String)>,
@@ -2906,6 +4359,7 @@ struct ConfigCommitBackend<FAuth, FPub> {
     grant: Option<GrantId>,
     domain: ConfigDomain,
     episode_pin_guard: Option<crate::recording::store::EpisodePinGuard>,
+    pub_phase: Arc<AtomicU8>,
 }
 
 impl<FAuth, FPub> CommonCommitWorker for ConfigCommitBackend<FAuth, FPub>
@@ -2928,6 +4382,13 @@ where
             .fail_rename_once
             .as_ref()
             .is_some_and(|f| f.swap(false, Ordering::AcqRel))
+    }
+
+    fn fail_rename_at_index(&self) -> Option<usize> {
+        self.hooks.fail_rename_at_index.as_ref().and_then(|f| {
+            let idx = f.swap(usize::MAX, Ordering::AcqRel);
+            (idx != usize::MAX).then_some(idx)
+        })
     }
 
     fn should_fail_dir_sync_once(&self) -> bool {
@@ -2972,11 +4433,19 @@ where
         };
         self.grant = Some(reservation.grant());
         self.domain = reservation.domain();
-        self.guard = Some(ReservationGuard::new(Arc::clone(&self.sup), reservation));
+        self.guard = Some(ReservationGuard::with_phase(
+            Arc::clone(&self.sup),
+            reservation,
+            Arc::clone(&self.pub_phase),
+        ));
         Ok(())
     }
 
     async fn prepare_write_after_reserve(&mut self) -> Result<Option<PendingWrite>, Self::Err> {
+        unreachable!("ConfigCommitBackend uses prepare_write_op_after_reserve")
+    }
+
+    async fn prepare_write_op_after_reserve(&mut self) -> Result<ConfigWriteOp, Self::Err> {
         // For `Sequences` saves referencing replay episodes, atomically verify existence and pin
         // them in `EpisodeStore` right under the granted `Sequences` reservation so concurrent
         // episode deletion is refused with 409 IN_USE and an already-deleted episode aborts
@@ -2995,7 +4464,7 @@ where
                 }
             }
         }
-        Ok(self.pending_write.take())
+        Ok(self.write_op.take().unwrap_or(ConfigWriteOp::Volatile))
     }
 
     fn after_reserve_before_rename(&mut self) -> bool {
@@ -3019,6 +4488,7 @@ where
                 auth: self.auth,
                 expected_workspace_revision: self.expected_workspace_revision,
                 expected_poses_revision: self.expected_poses_revision,
+                domain_checks: self.domain_checks,
             })
             .await
         {
@@ -3033,7 +4503,12 @@ where
         }
     }
 
+    fn on_rename_starting(&mut self) {
+        self.pub_phase.store(PUB_PHASE_RENAMING, Ordering::Release);
+    }
+
     fn on_renamed(&mut self) {
+        self.pub_phase.store(PUB_PHASE_RENAMED, Ordering::Release);
         if let Some(g) = self.guard.as_mut() {
             g.mark_renamed();
         }
@@ -3086,32 +4561,116 @@ where
                 if let Some(pg) = self.episode_pin_guard.take() {
                     pg.keep_pinned_for_reconcile();
                 }
+                let domain = self.domain;
+                let _ = self
+                    .sup
+                    .dispatch_config_request_reliable(|| ConfigRequest::ForceReconcile(domain))
+                    .await;
                 return Err(ConfigCommitError::post_publish_reconciling(e.to_arm_error()));
             }
             Err(e) => {
                 if let Some(pg) = self.episode_pin_guard.take() {
                     pg.keep_pinned_for_reconcile();
                 }
+                let domain = self.domain;
+                let _ = self
+                    .sup
+                    .dispatch_config_request_reliable(|| ConfigRequest::ForceReconcile(domain))
+                    .await;
                 return Err(ConfigCommitError::post_publish_reconciling(e.to_arm_error()));
             }
             _ => {
                 if let Some(pg) = self.episode_pin_guard.take() {
                     pg.keep_pinned_for_reconcile();
                 }
+                let domain = self.domain;
+                let _ = self
+                    .sup
+                    .dispatch_config_request_reliable(|| ConfigRequest::ForceReconcile(domain))
+                    .await;
                 return Err(ConfigCommitError::post_publish_reconciling(
                     ArmError::Internal("unexpected config persisted reply".into()),
                 ));
             }
         };
-        let mut g = ReservationGuard::new(Arc::clone(&self.sup), persisted_r);
+        let mut g = ReservationGuard::with_phase(
+            Arc::clone(&self.sup),
+            persisted_r,
+            Arc::clone(&self.pub_phase),
+        );
         g.mark_renamed();
         self.guard = Some(g);
         Ok(())
     }
 
+    async fn reconcile_after_partial_rename(
+        &mut self,
+        failed_path: PathBuf,
+        err: String,
+    ) -> Self::Err {
+        if let Some(pg) = self.episode_pin_guard.take() {
+            pg.keep_pinned_for_reconcile();
+        }
+        if let Some(g) = self.guard.as_mut() {
+            g.mark_renamed();
+            if let Some(r) = g.take() {
+                if let Ok(ConfigReply::Persisted(Ok(pr))) = self
+                    .sup
+                    .dispatch_config_request_owned_reliable(ConfigRequest::Persisted(
+                        PersistedConfig {
+                            reservation: r,
+                            durability: Durability::DurableUnconfirmed,
+                        },
+                    ))
+                    .await
+                {
+                    let _ = self
+                        .sup
+                        .dispatch_config_request_owned_reliable(ConfigRequest::Release(
+                            ReleaseConfig { reservation: pr },
+                        ))
+                        .await;
+                } else {
+                    let domain = self.domain;
+                    let _ = self
+                        .sup
+                        .dispatch_config_request_reliable(|| ConfigRequest::ForceReconcile(domain))
+                        .await;
+                }
+            }
+        }
+        let file_name = target_file_label(&failed_path);
+        let msg = format!(
+            "Configuration persistence failed mid-batch at {file_name} ({err}); disk state may be partial, reconciliation required"
+        );
+        let bounded = BoundedText::<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>::new(&msg);
+        let domain = self.domain;
+        let _ = self
+            .sup
+            .dispatch_config_request_reliable(|| ConfigRequest::LatchConfigReconcileFault {
+                domain,
+                message: bounded,
+            })
+            .await;
+        ConfigCommitError::post_publish_reconciling(ArmError::Rejected {
+            status: 500,
+            code: "PERSIST_FAILED".into(),
+            message: msg,
+        })
+    }
+
     async fn reconcile_after_dir_sync_failure(
         &mut self,
         target_path: PathBuf,
+        warn: String,
+    ) -> Self::Err {
+        self.reconcile_after_dir_sync_failure_paths(vec![target_path], warn)
+            .await
+    }
+
+    async fn reconcile_after_dir_sync_failure_paths(
+        &mut self,
+        target_paths: Vec<PathBuf>,
         warn: String,
     ) -> Self::Err {
         let mut expected_from = self.proposal.expected_revision;
@@ -3147,7 +4706,8 @@ where
             spawn_config_reconcile_retry(
                 Arc::clone(&self.sup),
                 self.domain,
-                target_path,
+                target_paths,
+                self.pending_marker_path.take(),
                 expected_from,
                 self.proposal,
                 self.auth,
@@ -3223,6 +4783,13 @@ where
                     }
                 }
                 if disk_published {
+                    if !matches!(e, ConfigError::Reconciling(_)) {
+                        let domain = self.domain;
+                        let _ = self
+                            .sup
+                            .dispatch_config_request_reliable(|| ConfigRequest::ForceReconcile(domain))
+                            .await;
+                    }
                     tracing::error!(
                         "Configuration written on disk but not activated: {:?}; reconciling",
                         e
@@ -3232,6 +4799,7 @@ where
                     error: e.to_arm_error(),
                     disk_published,
                     reconciling: is_reconciling,
+                    outcome_unknown: false,
                 });
             }
             Err(e) => {
@@ -3239,24 +4807,35 @@ where
                     if let Some(pg) = self.episode_pin_guard.take() {
                         pg.keep_pinned_for_reconcile();
                     }
+                    // Transport failed after disk publication: activation outcome and
+                    // PublishedConfigHub sync are unconfirmed, so unconditionally force
+                    // Reconciling to keep motion inhibited until reconciled.
+                    let domain = self.domain;
+                    let _ = self
+                        .sup
+                        .dispatch_config_request_reliable(|| ConfigRequest::ForceReconcile(domain))
+                        .await;
+                    return Err(ConfigCommitError::post_publish_unknown(e.to_arm_error()));
                 }
-                return Err(ConfigCommitError {
-                    error: e.to_arm_error(),
-                    disk_published,
-                    reconciling: disk_published,
-                });
+                return Err(ConfigCommitError::pre_publish(e.to_arm_error()));
             }
             _ => {
                 if disk_published {
                     if let Some(pg) = self.episode_pin_guard.take() {
                         pg.keep_pinned_for_reconcile();
                     }
+                    let domain = self.domain;
+                    let _ = self
+                        .sup
+                        .dispatch_config_request_reliable(|| ConfigRequest::ForceReconcile(domain))
+                        .await;
+                    return Err(ConfigCommitError::post_publish_unknown(ArmError::Internal(
+                        "unexpected config activate reply".into(),
+                    )));
                 }
-                return Err(ConfigCommitError {
-                    error: ArmError::Internal("unexpected config activate reply".into()),
-                    disk_published,
-                    reconciling: disk_published,
-                });
+                return Err(ConfigCommitError::pre_publish(ArmError::Internal(
+                    "unexpected config activate reply".into(),
+                )));
             }
         };
 
@@ -3274,6 +4853,7 @@ where
             cfg.workspace_revision = activated.workspace_revision;
             update_published(cfg, activated);
         });
+        sync_prep_env_from_published(&self.sup);
         drop(self.episode_pin_guard.take());
 
         Ok(ConfigCommitOutcome {
@@ -3344,8 +4924,26 @@ where
         })
     }
 
+    fn note_marker_cleanup_warning(&mut self, ok: &mut Self::Ok, warn: String) {
+        ok.durability_confirmed = false;
+        ok.durability_warning = Some(warn);
+    }
+
+    async fn reconcile_after_marker_error(&mut self, err: String) -> Self::Err {
+        self.reconcile_rename_join_error(format!("pending commit marker error: {err}"))
+            .await
+    }
+
     fn worker_disconnected_err(&mut self) -> Self::Err {
-        ConfigCommitError::pre_publish(ArmError::Internal("config commit worker disconnected".into()))
+        if self.pub_phase.load(Ordering::Acquire) != PUB_PHASE_PRE_RENAME {
+            ConfigCommitError::post_publish_unknown(ArmError::Internal(
+                "config commit worker disconnected after rename".into(),
+            ))
+        } else {
+            ConfigCommitError::pre_publish(ArmError::Internal(
+                "config commit worker disconnected".into(),
+            ))
+        }
     }
 }
 
@@ -3354,6 +4952,7 @@ async fn run_config_commit_worker<FAuth, FPub>(
     plan: ConfigCommitPlan,
     auth_check: FAuth,
     update_published: FPub,
+    pub_phase: Arc<AtomicU8>,
 ) -> Result<ConfigCommitOutcome, ConfigCommitError>
 where
     FAuth: Fn() -> Result<(), (&'static str, ArmError)> + Send + 'static,
@@ -3372,6 +4971,39 @@ where
         expected_workspace_revision,
         expected_poses_revision,
     } = plan;
+
+    let domain_checks = match &precheck {
+        ReservePrecheck::Calibration {
+            expected_txn_id,
+            operator_grant,
+            require_kinematics_disarmed,
+            expected_grasp_setup_revision,
+            ..
+        } => VerifyDomainChecks {
+            expected_grasp_setup_revision: *expected_grasp_setup_revision,
+            expected_gripper_calib_revision: None,
+            require_workspace_unblocked: true,
+            require_kinematics_disarmed: *require_kinematics_disarmed,
+            require_software_zero_idle: false,
+            expected_txn_id: *expected_txn_id,
+            operator_grant: Some(*operator_grant),
+        },
+        ReservePrecheck::SoftwareJointZero {
+            expected_txn_id,
+            operator_grant,
+            expected_gripper_calib_revision,
+            ..
+        } => VerifyDomainChecks {
+            expected_grasp_setup_revision: None,
+            expected_gripper_calib_revision: *expected_gripper_calib_revision,
+            require_workspace_unblocked: false,
+            require_kinematics_disarmed: false,
+            require_software_zero_idle: true,
+            expected_txn_id: *expected_txn_id,
+            operator_grant: Some(*operator_grant),
+        },
+        _ => VerifyDomainChecks::default(),
+    };
 
     // For `Sequences` saves, collect replay-step `(step_idx, episode_id)` references and ensure
     // `reserved_pins` covers BOTH pose and replay episode IDs across the reservation lifetime.
@@ -3404,9 +5036,16 @@ where
         }
     }
 
-    let pending_write = match write {
-        ConfigWriteOp::Volatile => None,
-        ConfigWriteOp::StageAndReplace(w) => Some(w),
+    let pending_marker_path = match &write {
+        ConfigWriteOp::Batch {
+            pending_marker,
+            existing_marker,
+            ..
+        } => pending_marker
+            .as_ref()
+            .map(|(p, _)| p.clone())
+            .or_else(|| existing_marker.clone()),
+        _ => None,
     };
     let domain = proposal.domain;
     let mut backend = ConfigCommitBackend {
@@ -3415,8 +5054,10 @@ where
         proposal,
         auth,
         precheck: Some(precheck),
+        domain_checks,
         candidate: Some(candidate),
-        pending_write,
+        write_op: Some(write),
+        pending_marker_path,
         expected_workspace_revision,
         expected_poses_revision,
         replay_episode_refs,
@@ -3426,8 +5067,30 @@ where
         grant: None,
         domain,
         episode_pin_guard: None,
+        pub_phase,
     };
     execute_common_commit(&mut backend).await
+}
+
+fn sync_prep_env_from_published(sup: &ArmSupervisor) {
+    let Some(pub_cfg) = sup.published_config_hub().latest() else {
+        return;
+    };
+    let Some(cur) = sup.hub().prep_env() else {
+        return;
+    };
+    let mut next = (*cur).clone();
+    next.config = pub_cfg.config.clone();
+    next.workspace_policy = pub_cfg.workspace_policy().map(|(ws, _)| ws.clone());
+    next.poses = pub_cfg.poses.list.clone();
+    next.sequences = pub_cfg.sequences.clone();
+    next.grasp_setup = pub_cfg.config.grasp.clone();
+    next.workspace_revision = pub_cfg.workspace_revision;
+    next.poses_revision = pub_cfg.poses.revision;
+    next.sequences_revision = pub_cfg.sequences.revision;
+    next.grasp_setup_revision = pub_cfg.grasp_setup_revision;
+    next.gripper_calib_revision = pub_cfg.gripper_calib_revision;
+    sup.hub().update_prep_env(Arc::new(next));
 }
 
 fn target_file_label(path: &std::path::Path) -> String {
@@ -3456,7 +5119,8 @@ async fn is_owner_stopped(sup: &ArmSupervisor) -> bool {
 fn spawn_config_reconcile_retry<FAuth, FPub>(
     sup: Arc<ArmSupervisor>,
     domain: ConfigDomain,
-    target_path: PathBuf,
+    target_paths: Vec<PathBuf>,
+    mut pending_marker_path: Option<PathBuf>,
     expected_from: u64,
     proposal: ConfigProposal,
     auth: ConfigAuthContext,
@@ -3475,7 +5139,10 @@ fn spawn_config_reconcile_retry<FAuth, FPub>(
     FPub: FnOnce(&mut PublishedConfig, ConfigActivated) + Send + 'static,
 {
     tokio::spawn(async move {
-        let file_name = target_file_label(&target_path);
+        let file_name = target_paths
+            .first()
+            .map(|p| target_file_label(p))
+            .unwrap_or_else(|| "state".to_string());
         let mut last_warn = initial_warn;
         let mut candidate_opt = Some(candidate);
         let mut update_pub_opt = Some(update_published);
@@ -3527,17 +5194,24 @@ fn spawn_config_reconcile_retry<FAuth, FPub>(
                 }
             }
 
-            let pds = PendingDirSync::for_path(&target_path);
+            let unique_syncs = unique_dir_syncs(
+                target_paths
+                    .iter()
+                    .map(|p| PendingDirSync::for_path(p))
+                    .collect(),
+            );
             let ov = dir_sync_override.clone();
             let sync_res = tokio::task::spawn_blocking(move || {
-                let outcome = match ov {
-                    Some(f) => pds.sync_with(|dir| f(dir)),
-                    None => pds.sync_parent_dir(),
-                };
-                match outcome {
-                    PublishOutcome::Published => Ok(()),
-                    PublishOutcome::PublishedDurabilityUnconfirmed(w) => Err(w),
+                for pds in unique_syncs {
+                    let outcome = match ov.as_ref() {
+                        Some(f) => pds.sync_with(|dir| f(dir)),
+                        None => pds.sync_parent_dir(),
+                    };
+                    if let PublishOutcome::PublishedDurabilityUnconfirmed(w) = outcome {
+                        return Err(w);
+                    }
                 }
+                Ok(())
             })
             .await
             .map_err(|e| e.to_string())
@@ -3564,6 +5238,9 @@ fn spawn_config_reconcile_retry<FAuth, FPub>(
             let Some(cand) = candidate_opt.take() else {
                 return;
             };
+            let cleanup_marker_txn_id = pending_marker_path
+                .is_some()
+                .then(next_calibration_txn_id);
             match sup
                 .dispatch_config_request_owned_reliable(ConfigRequest::FinishReconcile(
                     FinishReconcileConfig {
@@ -3574,11 +5251,19 @@ fn spawn_config_reconcile_retry<FAuth, FPub>(
                         candidate: cand,
                         expected_workspace_revision,
                         expected_poses_revision,
+                        cleanup_marker_txn_id,
                     },
                 ))
                 .await
             {
                 Ok(ConfigReply::Activated(Ok(activated))) => {
+                    let cleanup_guard = cleanup_marker_txn_id.map(|tid| {
+                        sup.published_config_hub().update(|cfg| {
+                            cfg.calibration_busy = true;
+                            cfg.calibration_txn_id = Some(tid);
+                        });
+                        crate::calibration::ExecutorTxnGuard::new(Arc::clone(&sup), tid)
+                    });
                     if domain == ConfigDomain::Sequences {
                         sup.set_sequences_revision(activated.revision);
                     }
@@ -3587,6 +5272,23 @@ fn spawn_config_reconcile_retry<FAuth, FPub>(
                             cfg.workspace_revision = activated.workspace_revision;
                             update_pub(cfg, activated);
                         });
+                        sync_prep_env_from_published(&sup);
+                    }
+                    if let Some(mp) = pending_marker_path.take() {
+                        let rm_res = tokio::task::spawn_blocking(move || {
+                            remove_pending_commit_marker(&mp)
+                        })
+                        .await
+                        .map_err(|e| e.to_string())
+                        .and_then(|r| r);
+                        if let Err(e) = rm_res {
+                            tracing::error!(
+                                "Config reconciliation activated {file_name} but failed to remove pending commit marker: {e}"
+                            );
+                        }
+                    }
+                    if let Some(g) = cleanup_guard {
+                        g.release().await;
                     }
                     drop(episode_pin_guard.take());
                     tracing::info!(

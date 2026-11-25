@@ -81,6 +81,18 @@ fn test_sim_so101_capabilities_6dof_vs_7dof() {
 fn test_sim_so101_handshake_enable_disable() {
     let mut sim = MockSim::new();
     let mut drv = SimArmDriver::connect(&sim.addr(), 6).unwrap().with_load_only_feedback(true);
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    for i in 0..6 {
+        arm_joints[i] = i;
+    }
+    drv.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+        safety_stopped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 6,
+        rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+        rest_pose_tolerance_rad: 0.05,
+    });
 
     let handle = std::thread::spawn(move || {
         let cmd = sim.recv_kind("cmd");

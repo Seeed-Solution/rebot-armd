@@ -1579,6 +1579,8 @@ async fn test_so101_feetech_driver_backed_arm_joint_0x20_overload_triggers_estop
     {
         let mut m = mock.lock().unwrap();
         m.clear_write_responses();
+        // Wait LINE_IDLE_QUIET (20 ms) after the stale-period SYNC_READ timeout poisoned the line.
+        m.advance_clock(Duration::from_millis(20));
         m.stage_reply(&sync_read_chunk0, &rx_c0_overload);
         m.stage_reply(&sync_read_chunk1, &rx_c1_normal);
         m.stage_reply(&sync_read_en, &rx_tq);

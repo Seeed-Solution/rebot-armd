@@ -172,6 +172,19 @@ impl ArmDriver for MotionTestDriver {
         let n = self.now(); out.clear();
         for t in &self.rx_at { out.push(t.map(|t| n.saturating_duration_since(t))); }
     }
+    fn fresh_joint_positions_into(&self, indices: &[usize], max_age: Duration, out: &mut [f32]) -> bool {
+        if out.len() < indices.len() { return false; }
+        let n = self.now();
+        let ov_q0 = f32::from_bits(self.knobs.override_q0_bits.load(Ordering::Relaxed));
+        for (slot, &i) in out.iter_mut().zip(indices.iter()) {
+            let fresh = self.rx_at.get(i).copied().flatten().is_some_and(|t| n.saturating_duration_since(t) <= max_age);
+            if !fresh { return false; }
+            let pos = if i == 0 && ov_q0.is_finite() { ov_q0 } else { *self.q.get(i).unwrap_or(&f32::NAN) };
+            if !pos.is_finite() { return false; }
+            *slot = pos;
+        }
+        true
+    }
     fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool {
         let n = self.now();
         self.rx_at.len() == dof && self.rx_at.iter().all(|t| t.is_some_and(|t| n.saturating_duration_since(t) <= max_age))
@@ -240,9 +253,10 @@ impl ArmDriver for MotionTestDriver {
         if self.knobs.estop_inhibit_disable.load(Ordering::Acquire) {
             return Err(ArmDriverError::EstopInhibited);
         }
-        if self.knobs.confirm_disable.load(Ordering::Acquire) {
-            self.enabled = false;
+        if !self.knobs.confirm_disable.load(Ordering::Acquire) {
+            return Err(ArmDriverError::TorqueOffWouldDrop);
         }
+        self.enabled = false;
         Ok(TorqueProgress::Done(TorqueOutcome::Confirmed))
     }
     fn abort_enable(&mut self) { if matches!(self.pending, Some((true, _))) { self.pending = None; } }
@@ -618,7 +632,7 @@ async fn park_disable_confirm_failure_stop_boundary_and_estop_inhibit() {
     let period = Duration::from_millis(5);
     let period_ns = period.as_nanos() as u64;
 
-    // (a) Missing disable confirmation -> FEEDBACK_UNCONFIRMED + StaticFault::DisableUnconfirmed + 0 alloc.
+    // (a) Rest-pose gate refusal during park disable -> TORQUE_OFF_WOULD_DROP, torque stays ON, 0 alloc.
     {
         let clock = ScriptedClock::new();
         let (drv, knobs) = MotionTestDriver::new(vec![0.0, 0.0], Duration::from_millis(2), Duration::from_millis(2), Some(clock.clone()));
@@ -642,10 +656,9 @@ async fn park_disable_confirm_failure_stop_boundary_and_estop_inhibit() {
             }
             if failed_code.is_some() { break; }
         }
-        assert_eq!(failed_code, Some("FEEDBACK_UNCONFIRMED"), "replies={all_rs:?} obs={:?}", sup.hub().latest().map(|s| (s.obs.safety_state.clone(), s.obs.is_torqued, s.obs.action.clone())));
+        assert_eq!(failed_code, Some("TORQUE_OFF_WOULD_DROP"), "replies={all_rs:?} obs={:?}", sup.hub().latest().map(|s| (s.obs.safety_state.clone(), s.obs.is_torqued, s.obs.action.clone())));
         let snap_end = sup.hub().latest().unwrap();
-        assert!(snap_end.obs.is_torqued, "torque must remain reported ON when disable unconfirmed");
-        assert!(matches!(&snap_end.obs.safety_state, SafetyState::Fault(armd::safety::FaultReason::Other(m)) if m.contains("not been confirmed")), "{:?}", snap_end.obs.safety_state);
+        assert!(snap_end.obs.is_torqued, "torque must remain reported ON when park disable is refused by rest-pose gate");
         assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO);
         drop(handle);
     }
@@ -1735,10 +1748,13 @@ fn m3_client_park_first_disable_frame_rechecks_stop_at_driver_tx_gate() {
             r
         }
         fn receive(&mut self) -> Result<CanFrame, TransportError> {
+            self.receive_timestamped().map(|(f, _)| f)
+        }
+        fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<Instant>), TransportError> {
             if self.fire_stop_on_receive.swap(false, Ordering::SeqCst) {
                 let _ = self.stops.request();
             }
-            self.inner.receive()
+            self.inner.receive_timestamped()
         }
         fn flush(&mut self) -> Result<(), TransportError> { self.inner.flush() }
         fn supports_bounded_flush(&self) -> bool { true }
@@ -1750,7 +1766,7 @@ fn m3_client_park_first_disable_frame_rechecks_stop_at_driver_tx_gate() {
     // 10a. Direct driver-boundary checks on `DamiaoArmDriver::begin_client_park_disable`.
     {
         let clock = armd::transport::MockClock::new();
-        let bus = FakeBus::with_clock(&limits, clock);
+        let bus = FakeBus::with_clock(&limits, clock.clone());
         let stops = StopRequests::default();
         let req_estop = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let app_estop = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1769,9 +1785,27 @@ fn m3_client_park_first_disable_frame_rechecks_stop_at_driver_tx_gate() {
         };
         let mut drv = DamiaoArmDriver::new(can, vec![1, 2]).with_joint_limits(limits.clone()).unwrap();
         drv.set_estop_gate(EstopGate::new(req_estop, app_estop).with_stops(stops.clone()));
+        let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+        arm_joints[0] = 0;
+        arm_joints[1] = 1;
+        drv.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+            safety_stopped: Arc::new(AtomicBool::new(false)),
+            has_resting_pose: true,
+            arm_joints,
+            arm_joints_len: 2,
+            rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+            rest_pose_tolerance_rad: 0.05,
+        });
         bus.with(|s| s.push_all_feedback());
         drv.read_joint_states().unwrap();
         drv.set_torque(true).unwrap();
+        // Accumulate K=3 causal rest samples so the rest-pose gate is confirmed before testing
+        // client-park Stop linearization at the driver TX choke point.
+        for _ in 0..3 {
+            clock.advance(Duration::from_millis(12));
+            bus.with(|s| s.push_all_feedback());
+            drv.read_joint_states().unwrap();
+        }
         assert_eq!(drv.enable_state(), EnableState::Enabled);
         assert_eq!(disable_tx.load(Ordering::SeqCst), 0);
 
@@ -1818,8 +1852,18 @@ fn m3_client_park_first_disable_frame_rechecks_stop_at_driver_tx_gate() {
         let sg2 = stops.current();
         assert!(sg2 > sg_wb && stops.pending());
         stops.mark_applied(sg2);
+        for _ in 0..3 {
+            clock.advance(Duration::from_millis(12));
+            bus.with(|s| s.push_all_feedback());
+            drv.read_joint_states().unwrap();
+        }
         drv.set_torque(false).unwrap();
         drv.set_torque(true).unwrap();
+        for _ in 0..3 {
+            clock.advance(Duration::from_millis(12));
+            bus.with(|s| s.push_all_feedback());
+            drv.read_joint_states().unwrap();
+        }
         let _ = stops.request();
         assert!(stops.pending());
         disable_tx.store(0, Ordering::SeqCst);
@@ -1832,7 +1876,7 @@ fn m3_client_park_first_disable_frame_rechecks_stop_at_driver_tx_gate() {
     //      transmitted, torque stays ON, !disable_pending, park cancelled STOPPED.
     {
         let clock = armd::transport::MockClock::new();
-        let bus = FakeBus::with_clock(&limits, clock);
+        let bus = FakeBus::with_clock(&limits, clock.clone());
         let stops = StopRequests::default();
         let fire_rx = Arc::new(AtomicBool::new(false));
         let fire_tx = Arc::new(AtomicBool::new(false));
@@ -1847,7 +1891,7 @@ fn m3_client_park_first_disable_frame_rechecks_stop_at_driver_tx_gate() {
             stops: stops.clone(),
             disable_tx_count: disable_tx.clone(),
         };
-        let drv = DamiaoArmDriver::new(can, vec![1, 2]).with_joint_limits(limits).unwrap();
+        let drv = DamiaoArmDriver::new(can, vec![1, 2]).with_joint_limits(limits.clone()).unwrap();
         let mut inner = SupervisorInner::new(parkable_2dof_config()).with_driver(Box::new(drv));
         inner.attach_stop_requests(stops.clone());
         bus.with(|s| s.push_all_feedback());
@@ -1863,13 +1907,14 @@ fn m3_client_park_first_disable_frame_rechecks_stop_at_driver_tx_gate() {
 
         let mut armed = false;
         for _ in 0..320 {
+            clock.advance(Duration::from_millis(10));
             bus.with(|s| s.push_all_feedback());
             inner.tick(0.01);
             if !armed && inner.unload_settle.as_ref().is_some_and(|u| u.held_s >= 0.70) {
                 armed = true;
                 wb_stop.store(true, Ordering::SeqCst);
             }
-            if !inner.pending_normal_unload {
+            if !inner.pending_normal_unload && !inner.torque_transition_pending() {
                 break;
             }
         }
@@ -1879,6 +1924,94 @@ fn m3_client_park_first_disable_frame_rechecks_stop_at_driver_tx_gate() {
         assert!(inner.is_torqued && !inner.disable_pending, "torque must remain held and disable_pending false");
         assert_eq!(inner.last_action.as_ref().and_then(|a| a.code.as_deref()), Some("STOPPED"));
         assert_ne!(inner.safety.fault_code(), Some(FaultCode::DriverWriteFailed));
+    }
+
+    // 10b2. Regression (client park Stop fence across partial retry):
+    //       motor 0 transmits disable, then client Stop arrives BEFORE motor 1's first write ->
+    //       owner must NEVER hand motor 1 to an unstamped background/periodic retry across
+    //       subsequent ticks (disable_tx stays == 1, torque_intent stays On, DriverWriteFailed latched).
+    for rt_owned in [false, true] {
+        let clock = armd::transport::MockClock::new();
+        let bus = FakeBus::with_clock(&limits, clock.clone());
+        let stops = StopRequests::default();
+        let fire_rx = Arc::new(AtomicBool::new(false));
+        let fire_tx = Arc::new(AtomicBool::new(false));
+        let wb_stop = Arc::new(AtomicBool::new(false));
+        let disable_tx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let can = RaceStopCan {
+            inner: bus.clone(),
+            nonblocking_rt: rt_owned,
+            fire_stop_on_receive: fire_rx,
+            fire_stop_on_first_disable_tx: fire_tx.clone(),
+            would_block_and_stop_on_first_disable_tx: wb_stop,
+            stops: stops.clone(),
+            disable_tx_count: disable_tx.clone(),
+        };
+        let drv = DamiaoArmDriver::new(can, vec![1, 2]).with_joint_limits(limits.clone()).unwrap();
+        let mut inner = SupervisorInner::new(parkable_2dof_config()).with_driver(Box::new(drv));
+        inner.attach_stop_requests(stops.clone());
+        bus.with(|s| s.push_all_feedback());
+        let stamp = inner.current_admission_stamp();
+        SupervisorInner::enable_torque(inner.check_admission(stamp).unwrap()).unwrap();
+        inner.tick(0.01);
+
+        let snap = MotionPlanSnapshot::from_supervisor(&inner);
+        let park = req::prepare_motion(&snap, &MotionRequest::park()).unwrap();
+        let stamp = inner.current_admission_stamp();
+        let ep = inner.safety.epoch_id();
+        req::install_park(&mut inner, stamp, &park.slot, None, Some(ep), false).unwrap();
+        if rt_owned {
+            inner.rt_executor_owned = true;
+        }
+
+        let mut armed = false;
+        for _ in 0..320 {
+            clock.advance(Duration::from_millis(10));
+            bus.with(|s| s.push_all_feedback());
+            if rt_owned {
+                let b = armd::rt_core::ops::ServiceBudget {
+                    now: clock.now(),
+                    deadline: clock.now() + Duration::from_millis(2),
+                    max_rx_frames: 32,
+                };
+                let _ = armd::rt_core::ops::CoreOps::poll_hardware(&mut inner, &b);
+            }
+            inner.tick(0.01);
+            if !armed && inner.unload_settle.as_ref().is_some_and(|u| u.held_s >= 0.70) {
+                armed = true;
+                fire_tx.store(true, Ordering::SeqCst);
+            }
+            if !inner.pending_normal_unload && !inner.torque_transition_pending() {
+                break;
+            }
+        }
+        assert!(armed, "rt_owned={rt_owned}: unload_settle must reach >= 0.70s");
+        assert!(!fire_tx.load(Ordering::SeqCst), "rt_owned={rt_owned}: Stop after motor 0 must have fired");
+        assert_eq!(disable_tx.load(Ordering::SeqCst), 1, "rt_owned={rt_owned}: only motor 0 disabled before Stop");
+        assert_eq!(inner.safety.fault_code(), Some(FaultCode::DriverWriteFailed));
+        assert_eq!(inner.torque_intent, armd::TorqueIntent::On);
+
+        // Advance > 600 ms (past both immediate RT retry and 250 ms legacy fallback) with fresh rest feedback:
+        // motor 1 must NEVER receive a first disable write from any background retry after Stop.
+        for _ in 0..35 {
+            clock.advance(Duration::from_millis(20));
+            bus.with(|s| s.push_all_feedback());
+            if rt_owned {
+                let b = armd::rt_core::ops::ServiceBudget {
+                    now: clock.now(),
+                    deadline: clock.now() + Duration::from_millis(2),
+                    max_rx_frames: 32,
+                };
+                let _ = armd::rt_core::ops::CoreOps::poll_hardware(&mut inner, &b);
+            }
+            inner.tick(0.02);
+        }
+        assert_eq!(
+            disable_tx.load(Ordering::SeqCst),
+            1,
+            "rt_owned={rt_owned}: motor 1 must NEVER receive its first disable from retry after Stop"
+        );
+        assert_eq!(inner.torque_intent, armd::TorqueIntent::On);
     }
 
     // 10c. SO-ARM101 / Feetech (`FeetechArmDriver`) per-servo Stop / stop_gen gate:
@@ -2002,8 +2135,23 @@ fn m3_client_park_first_disable_frame_rechecks_stop_at_driver_tx_gate() {
                 .with_calibrated(true)
                 .with_tx_echo(Some(false));
             drv.set_estop_gate(EstopGate::new(req_estop, app_estop).with_stops(stops.clone()));
+            let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+            arm_joints[0] = 0;
+            arm_joints[1] = 1;
+            drv.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+                safety_stopped: Arc::new(AtomicBool::new(false)),
+                has_resting_pose: true,
+                arm_joints,
+                arm_joints_len: 2,
+                rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+                rest_pose_tolerance_rad: 0.05,
+            });
             drv.read_joint_states().unwrap();
             drv.set_torque(true).unwrap();
+            for _ in 0..3 {
+                clock.advance(Duration::from_millis(12));
+                drv.read_joint_states().unwrap();
+            }
             assert_eq!(drv.enable_state(), EnableState::Enabled);
             assert_eq!(disable_writes.load(Ordering::SeqCst), 0);
 
@@ -2041,9 +2189,17 @@ fn m3_client_park_first_disable_frame_rechecks_stop_at_driver_tx_gate() {
             let sg3 = stops.current();
             assert!(sg3 > sg2 && stops.pending());
             stops.mark_applied(sg3);
+            for _ in 0..3 {
+                clock.advance(Duration::from_millis(12));
+                drv.read_joint_states().unwrap();
+            }
             drv.set_torque(false).unwrap();
             drv.read_joint_states().unwrap();
             drv.set_torque(true).unwrap();
+            for _ in 0..3 {
+                clock.advance(Duration::from_millis(12));
+                drv.read_joint_states().unwrap();
+            }
             let _ = stops.request();
             assert!(stops.pending());
             disable_writes.store(0, Ordering::SeqCst);
@@ -2098,7 +2254,7 @@ fn m3_client_park_first_disable_frame_rechecks_stop_at_driver_tx_gate() {
                     armed = true;
                     wb_stop.store(true, Ordering::SeqCst);
                 }
-                if !inner.pending_normal_unload {
+                if !inner.pending_normal_unload && !inner.torque_transition_pending() {
                     break;
                 }
             }

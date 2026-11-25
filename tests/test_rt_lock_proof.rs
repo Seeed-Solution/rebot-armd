@@ -1074,8 +1074,16 @@ impl CanTransport for TracingBus {
         self.inner.receive()
     }
 
+    fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<std::time::Instant>), TransportError> {
+        self.inner.receive_timestamped()
+    }
+
     fn flush(&mut self) -> Result<(), TransportError> {
         self.inner.flush()
+    }
+
+    fn flush_is_noop(&self) -> bool {
+        self.inner.flush_is_noop()
     }
 
     fn clock(&self) -> Option<Arc<dyn DriverClock>> {
@@ -1108,7 +1116,10 @@ fn production_executor_bus_trace_dynamic_output_inhibited_while_legacy_writer_he
             .build()
             .unwrap();
         rt.block_on(async move {
-            let fake_bus = FakeBus::new(&dm_limits());
+            // Use an injected driver clock and a 20 ms release period matching `ArmConfig::rebot_dm()`
+            // (50 Hz) so OS scheduling jitter under CPU load cannot spuriously trip wall-clock
+            // `DAMIAO_TX_FRAME_MAX_AGE` (45 ms), `resolved_tx_stall_ticks()` (4), or `BUS_LOSS_TIMEOUT`.
+            let fake_bus = FakeBus::with_clock(&dm_limits(), MockClock::new());
             fake_bus.with(|s| {
                 s.immediate_replies = true;
                 s.record_tx_log = false;
@@ -1126,7 +1137,7 @@ fn production_executor_bus_trace_dynamic_output_inhibited_while_legacy_writer_he
             sup.set_lease_enabled(false).await;
             sup.register_ws_connection(1).await.unwrap();
             let handle = sup
-                .start_executor(ExecutorConfig::for_tests(Duration::from_millis(5)))
+                .start_executor(ExecutorConfig::for_tests(Duration::from_millis(20)))
                 .await
                 .expect("start production executor with DamiaoArmDriver<TracingBus>");
             assert_eq!(sup.owner_mode(), OWNER_EXECUTOR);
@@ -1171,6 +1182,17 @@ fn production_executor_bus_trace_dynamic_output_inhibited_while_legacy_writer_he
             ));
 
             wait_until_deadline(deadline, "bus-triggered mid-batch urgent stop applied", || {
+                assert!(!handle.is_exited(), "executor exited unexpectedly before mid-batch stop");
+                if let Some(s) = sup.hub().latest() {
+                    assert!(
+                        !matches!(s.obs.safety_state, SafetyState::Fault(_)),
+                        "executor faulted before mid-batch stop: state={:?} j1_seen={} triggered_gen={} applied={}",
+                        s.obs.safety_state,
+                        bus.advancing_j1_seen.load(Ordering::Acquire),
+                        bus.triggered_gen.load(Ordering::Acquire),
+                        handle.stop_requests().applied(),
+                    );
+                }
                 let gen = bus.triggered_gen.load(Ordering::Acquire);
                 gen > 0 && handle.stop_requests().applied() == gen
             });
@@ -1693,8 +1715,20 @@ impl CanTransport for LockFreeScriptedBus {
         Err(TransportError::Timeout)
     }
 
+    fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<Instant>), TransportError> {
+        let now = self
+            .clock
+            .as_ref()
+            .map_or_else(Instant::now, DriverClock::now);
+        self.receive().map(|f| (f, Some(now)))
+    }
+
     fn flush(&mut self) -> Result<(), TransportError> {
         Ok(())
+    }
+
+    fn flush_is_noop(&self) -> bool {
+        true
     }
 
     fn clock(&self) -> Option<Arc<dyn DriverClock>> {
@@ -1858,15 +1892,19 @@ fn production_executor_driver_lock_positive_control_counts_and_catches_on_armd_c
         drv.set_torque(true).unwrap();
         drv.set_rt_mode(true);
         let counter = Arc::new(AtomicU64::new(0));
-        let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());
+        let mut inner = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv));
         inner.lease_enabled = false;
         inner.is_torqued = true;
         inner.safety.set_torque(true).unwrap();
-        inner.driver = Some(if exclusive {
-            DriverSlot::exclusive(Box::new(drv))
+        if exclusive {
+            inner.driver = Some(inner.driver.take().unwrap().into_exclusive().ok().unwrap());
         } else {
-            DriverSlot::legacy_with_counter(Box::new(drv), Arc::clone(&counter))
-        });
+            inner
+                .driver
+                .as_mut()
+                .unwrap()
+                .attach_counter(Arc::clone(&counter));
+        }
         (inner, tx_cons, counter)
     };
 
@@ -2105,23 +2143,24 @@ fn legacy_vs_executor_bus_trace_parity_mid_batch_stop_and_partial_tx_carryover()
         drv.check_mapping_ranges();
         drv.set_torque(true).unwrap();
 
-        let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());
+        let mut inner = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv));
         inner.lease_enabled = false;
         inner.is_torqued = true;
         inner.safety.set_torque(true).unwrap();
         let lock_counter = Arc::new(AtomicU64::new(0));
         match owner {
             OwnerKind::Legacy => {
-                inner.driver = Some(DriverSlot::legacy_with_counter(
-                    Box::new(drv),
-                    Arc::clone(&lock_counter),
-                ));
+                inner
+                    .driver
+                    .as_mut()
+                    .unwrap()
+                    .attach_counter(Arc::clone(&lock_counter));
             }
             OwnerKind::Executor => {
-                drv.set_rt_mode(true);
+                inner.driver.as_mut().unwrap().write().unwrap().set_rt_mode(true);
                 inner.rt_executor_owned = true;
                 inner.safety.set_off_thread_reclaim(true);
-                inner.driver = Some(DriverSlot::exclusive(Box::new(drv)));
+                inner.driver = Some(inner.driver.take().unwrap().into_exclusive().ok().unwrap());
             }
         }
 
@@ -2227,23 +2266,24 @@ fn legacy_vs_executor_bus_trace_parity_mid_batch_stop_and_partial_tx_carryover()
         drv.check_mapping_ranges();
         drv.set_torque(true).unwrap();
 
-        let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());
+        let mut inner = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv));
         inner.lease_enabled = false;
         inner.is_torqued = true;
         inner.safety.set_torque(true).unwrap();
         let lock_counter = Arc::new(AtomicU64::new(0));
         match owner {
             OwnerKind::Legacy => {
-                inner.driver = Some(DriverSlot::legacy_with_counter(
-                    Box::new(drv),
-                    Arc::clone(&lock_counter),
-                ));
+                inner
+                    .driver
+                    .as_mut()
+                    .unwrap()
+                    .attach_counter(Arc::clone(&lock_counter));
             }
             OwnerKind::Executor => {
-                drv.set_rt_mode(true);
+                inner.driver.as_mut().unwrap().write().unwrap().set_rt_mode(true);
                 inner.rt_executor_owned = true;
                 inner.safety.set_off_thread_reclaim(true);
-                inner.driver = Some(DriverSlot::exclusive(Box::new(drv)));
+                inner.driver = Some(inner.driver.take().unwrap().into_exclusive().ok().unwrap());
             }
         }
         inner.tick(0.02);
@@ -3414,5 +3454,310 @@ fn single_writer_ownership_across_start_failures_and_shutdown_paths() {
                 cvar.notify_all();
             }
         });
+    });
+}
+
+/// L3 lock-proof:
+/// 1. Under `DriverSlot::Exclusive` (production `armd-control`) with `ControlThreadGuard` +
+///    `ReleaseGuard`, stopped-hold TX and empty-mask stopped-hold never touch any mutex and
+///    complete with zero lock attempts.
+/// 2. Under `DriverSlot::Legacy` with a contended driver mutex on another OS thread, stopped-hold
+///    TX uses non-blocking `try_lock` (skips the tick and increments
+///    `TxDiagnostics::stopped_hold_lock_contended`), and an empty hold mask takes NO lock at all.
+#[test]
+fn l3_stopped_hold_never_blocks_on_driver_mutex_and_empty_mask_takes_no_lock() {
+    use armd::diagnostics::tick::{
+        reset_stopped_hold_lock_contended, stopped_hold_lock_contended_count, TickStats,
+    };
+    use armd::rt_core::ops::{CoreOps, ServiceBudget};
+    use armd::safety::StopPolicy;
+    use armd::transport::MockClock;
+    use armd::SupervisorInner;
+
+    run_bounded_fixture(Duration::from_secs(5), "l3_stopped_hold_lock_proof", |_deadline| {
+        let build_estopped = |exclusive: bool| {
+            let clock = MockClock::new();
+            let bus = FakeBus::with_clock(&dm_limits(), clock.clone());
+            bus.with(|s| {
+                s.immediate_replies = true;
+                for (i, m) in s.motors.iter_mut().enumerate() {
+                    m.q = if i < 6 { 0.25 } else { 0.0 };
+                }
+                s.push_all_feedback();
+            });
+            let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+                .with_joint_limits(dm_limits())
+                .unwrap();
+            drv.read_joint_states().unwrap();
+            drv.check_mapping_ranges();
+            let mut inner = SupervisorInner::new(ArmConfig {
+                lease_timeout_ms: 600_000,
+                ..ArmConfig::rebot_dm()
+            })
+            .with_driver(Box::new(drv));
+            if exclusive {
+                inner.driver = Some(inner.driver.take().unwrap().into_exclusive().ok().unwrap());
+                inner.rt_executor_owned = true;
+            }
+            inner.lease_enabled = false;
+            inner.tick(0.02);
+            let stamp = inner.current_admission_stamp();
+            let admitted = inner.check_admission(stamp).unwrap();
+            SupervisorInner::enable_torque(admitted).unwrap();
+            inner.apply_stop_policy(StopPolicy::EStopLatch);
+
+            bus.with(|s| s.push_all_feedback());
+            let now = Instant::now();
+            let budget = ServiceBudget::for_release(now, now + Duration::from_millis(20));
+            let _ = inner.poll_hardware(&budget);
+            (inner, bus)
+        };
+
+        // Part A: Exclusive RT owner under ControlThreadGuard + ReleaseGuard — zero mutexes.
+        {
+            let (mut inner, _bus) = build_estopped(true);
+            let _rt_thread = ControlThreadGuard::enter();
+            let _release = ReleaseGuard::enter();
+            assert!(inner.service_stopped_measured_hold_complete(0.02, false));
+            assert_ne!(inner.owner_hold_mask(), 0);
+            assert_eq!(inner.owner_pending_hold_mask(), 0);
+            inner.invalidate_owner_driver_snapshot_for_test();
+            assert!(!inner.service_stopped_measured_hold_complete(0.02, false));
+            assert_eq!(inner.owner_hold_mask(), 0);
+            assert!(inner.driver.as_ref().unwrap().is_exclusive());
+        }
+
+        // Part B: Legacy owner with contended mutex — non-blocking try_lock + empty-mask zero-lock.
+        {
+            let (mut inner, _bus) = build_estopped(false);
+            assert!(inner.service_stopped_measured_hold_complete(0.02, false));
+            assert_ne!(inner.owner_hold_mask(), 0);
+            assert_eq!(inner.owner_pending_hold_mask(), 0);
+
+            reset_stopped_hold_lock_contended();
+            inner.with_contended_driver_for_test(|core| {
+                // 1. Contended non-empty mask: try_lock returns immediately, skips send, counts contention.
+                let t0 = Instant::now();
+                let sent = core.service_stopped_measured_hold_complete(0.02, false);
+                assert!(!sent, "L3: contended stopped-hold must skip send");
+                assert!(
+                    t0.elapsed() < Duration::from_millis(20),
+                    "L3: contended stopped-hold must never block"
+                );
+                assert_eq!(stopped_hold_lock_contended_count(), 1);
+                let snap = TickStats::default().snapshot();
+                assert_eq!(snap.tx.stopped_hold_lock_contended, 1);
+
+                // 2. Empty mask while driver mutex is STILL held: takes NO lock at all (counter stays 1).
+                core.invalidate_owner_driver_snapshot_for_test();
+                let t1 = Instant::now();
+                let sent_empty = core.service_stopped_measured_hold_complete(0.02, false);
+                assert!(!sent_empty);
+                assert_eq!(core.owner_hold_mask(), 0);
+                assert!(t1.elapsed() < Duration::from_millis(20));
+                assert_eq!(
+                    stopped_hold_lock_contended_count(),
+                    1,
+                    "L3: empty mask must NOT attempt try_lock"
+                );
+            });
+        }
+    });
+}
+
+/// M4 lock-proof:
+/// 1. Under `DriverSlot::Exclusive` (production `armd-control`) with `ControlThreadGuard` +
+///    `ReleaseGuard`, RT disable dispatch and disable polling never touch any mutex (`0` attempts).
+/// 2. Under `DriverSlot::Legacy` with a contended driver mutex on another OS thread, RT disable
+///    dispatch and disable polling use non-blocking `try_lock`, count skips in
+///    `TxDiagnostics::disable_lock_contended`, and escalate at N=25 skips.
+#[test]
+fn r11_m4_rt_disable_dispatch_and_polling_never_block_on_driver_mutex() {
+    use armd::diagnostics::tick::{
+        disable_contention_escalations_count, disable_lock_contended_count,
+        reset_disable_contention_escalations, reset_disable_lock_contended, TickStats,
+    };
+    use armd::rt_core::broker::{BootId, CommandKind, Descriptor, Stamp};
+    use armd::rt_core::ids::ArmId;
+    use armd::rt_core::ops::{CommitCtx, CoreOps, ServiceBudget, TorqueProgress};
+    use armd::safety::StopPolicy;
+    use armd::transport::MockClock;
+    use armd::SupervisorInner;
+
+    run_bounded_fixture(Duration::from_secs(5), "r11_m4_disable_lock_proof", |_deadline| {
+        let build_ready_at_rest = |exclusive: bool| {
+            let clock = MockClock::new();
+            let bus = FakeBus::with_clock(&dm_limits(), clock.clone());
+            bus.with(|s| {
+                s.immediate_replies = true;
+                s.push_all_feedback();
+            });
+            let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+                .with_joint_limits(dm_limits())
+                .unwrap();
+            drv.read_joint_states().unwrap();
+            drv.check_mapping_ranges();
+            let mut inner = SupervisorInner::new(ArmConfig {
+                lease_timeout_ms: 600_000,
+                ..ArmConfig::rebot_dm()
+            })
+            .with_driver(Box::new(drv));
+            if exclusive {
+                inner.driver = Some(inner.driver.take().unwrap().into_exclusive().ok().unwrap());
+            }
+            inner.rt_executor_owned = true;
+            inner.lease_enabled = false;
+            inner.register_live_connection(1).unwrap();
+            inner.tick(0.02);
+            let stamp = inner.current_admission_stamp();
+            let admitted = inner.check_admission(stamp).unwrap();
+            SupervisorInner::enable_torque(admitted).unwrap();
+            inner.apply_stop_policy(StopPolicy::EStopLatch);
+
+            // Clear 20 ms settle and collect K=3 rest samples.
+            clock.advance(Duration::from_millis(25));
+            for step in 0..3 {
+                if step > 0 {
+                    clock.advance(Duration::from_millis(10));
+                }
+                bus.with(|s| s.push_all_feedback());
+                inner.tick(0.02);
+            }
+            (inner, clock)
+        };
+
+        // Part A: Exclusive RT owner under ControlThreadGuard + ReleaseGuard — zero mutexes.
+        {
+            let (mut inner, clock) = build_ready_at_rest(true);
+            let _rt_thread = ControlThreadGuard::enter();
+            let _release = ReleaseGuard::enter();
+            let now = clock.now();
+            let cctx = CommitCtx {
+                arm: ArmId(1),
+                boot: BootId(1),
+                now,
+                stop_generation: 0,
+            };
+            let desc = Descriptor {
+                stamp: Stamp {
+                    arm: ArmId(1),
+                    boot: BootId(1),
+                    request: RequestId(1),
+                    client: ClientId(1),
+                    client_seq: 1,
+                    authority: Authority {
+                        lease_generation: 0,
+                        epoch: inner.safety.epoch_id(),
+                        stop_generation: 0,
+                        config_revision: 0,
+                        parent_generation: 0,
+                    },
+                    deadline: now + Duration::from_secs(5),
+                },
+                kind: CommandKind::Transition(TransitionOp::TorqueOff),
+            };
+            assert!(inner.commit_transition(&desc, TransitionOp::TorqueOff, &cctx).is_ok());
+            assert!(inner.torque_transition_pending());
+            let budget = ServiceBudget::for_release(clock.now(), clock.now() + Duration::from_millis(20));
+            let poll = inner.poll_hardware(&budget);
+            assert!(matches!(poll.torque, Some(Ok(TorqueProgress::Pending { .. } | TorqueProgress::Done))));
+            assert!(inner.driver.as_ref().unwrap().is_exclusive());
+        }
+
+        // Part B: Legacy owner with contended mutex — non-blocking try_lock + N=25 escalation.
+        {
+            let (mut inner, clock) = build_ready_at_rest(false);
+
+            // 1. Contended RT disable DISPATCH: never blocks, returns DRIVER_BUSY, counts contention.
+            reset_disable_lock_contended();
+            reset_disable_contention_escalations();
+            inner.with_contended_driver_for_test(|core| {
+                let now = clock.now();
+                let cctx = CommitCtx {
+                    arm: ArmId(1),
+                    boot: BootId(1),
+                    now,
+                    stop_generation: 0,
+                };
+                let desc = Descriptor {
+                    stamp: Stamp {
+                        arm: ArmId(1),
+                        boot: BootId(1),
+                        request: RequestId(1),
+                        client: ClientId(1),
+                        client_seq: 1,
+                        authority: Authority {
+                            lease_generation: 0,
+                            epoch: core.safety.epoch_id(),
+                            stop_generation: 0,
+                            config_revision: 0,
+                            parent_generation: 0,
+                        },
+                        deadline: now + Duration::from_secs(5),
+                    },
+                    kind: CommandKind::Transition(TransitionOp::TorqueOff),
+                };
+                let t0 = Instant::now();
+                let res = core.commit_transition(&desc, TransitionOp::TorqueOff, &cctx);
+                assert_eq!(res, Err("DRIVER_BUSY"));
+                assert!(
+                    t0.elapsed() < Duration::from_millis(20),
+                    "M4: contended RT disable dispatch must never block"
+                );
+                assert_eq!(disable_lock_contended_count(), 1);
+                assert_eq!(TickStats::default().snapshot().tx.disable_lock_contended, 1);
+            });
+
+            // 2. Uncontended dispatch starts Pending disable repeats; then contended RT disable POLLING
+            //    never blocks and escalates at N=25 consecutive skips.
+            let now = clock.now();
+            let cctx = CommitCtx {
+                arm: ArmId(1),
+                boot: BootId(1),
+                now,
+                stop_generation: 0,
+            };
+            let desc = Descriptor {
+                stamp: Stamp {
+                    arm: ArmId(1),
+                    boot: BootId(1),
+                    request: RequestId(2),
+                    client: ClientId(1),
+                    client_seq: 2,
+                    authority: Authority {
+                        lease_generation: 0,
+                        epoch: inner.safety.epoch_id(),
+                        stop_generation: 0,
+                        config_revision: 0,
+                        parent_generation: 0,
+                    },
+                    deadline: now + Duration::from_secs(5),
+                },
+                kind: CommandKind::Transition(TransitionOp::TorqueOff),
+            };
+            assert!(inner.commit_transition(&desc, TransitionOp::TorqueOff, &cctx).is_ok());
+            assert!(inner.torque_transition_pending());
+
+            reset_disable_lock_contended();
+            reset_disable_contention_escalations();
+            inner.with_contended_driver_for_test(|core| {
+                let budget = ServiceBudget::for_release(clock.now(), clock.now() + Duration::from_millis(20));
+                for skip in 1..=armd::STOPPED_HOLD_CONTENTION_ESCALATE_SKIPS {
+                    let t0 = Instant::now();
+                    let poll = core.poll_hardware(&budget);
+                    assert!(
+                        t0.elapsed() < Duration::from_millis(20),
+                        "M4: contended RT disable poll #{skip} must never block"
+                    );
+                    assert!(matches!(poll.torque, Some(Ok(TorqueProgress::Pending { .. }))));
+                    assert_eq!(disable_lock_contended_count(), u64::from(skip));
+                }
+                assert_eq!(disable_contention_escalations_count(), 1);
+                let snap = TickStats::default().snapshot();
+                assert_eq!(snap.tx.disable_lock_contended, u64::from(armd::STOPPED_HOLD_CONTENTION_ESCALATE_SKIPS));
+                assert_eq!(snap.tx.disable_contention_escalations, 1);
+                assert!(core.safety.has_latched_fault_code(armd::FaultCode::HardwareFault));
+            });
+        }
     });
 }

@@ -94,6 +94,14 @@ impl ArmDriver for LagDriver {
     fn enable_state(&self) -> EnableState { self.0.lock().unwrap().enabled }
     fn is_feedback_valid(&self) -> bool { true }
     fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::ZERO); 7] }
+    fn fresh_joint_positions_into(&self, joints: &[usize], _max_age: Duration, out: &mut [f32]) -> bool {
+        let arm = self.0.lock().unwrap();
+        for (dst, &j) in out.iter_mut().zip(joints.iter()) {
+            let Some(&p) = arm.q.get(j) else { return false; };
+            *dst = p;
+        }
+        true
+    }
     fn max_command_velocity(&self, _: usize) -> Option<f32> { Some(2.0) }
     fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
         let arm = self.0.lock().unwrap();

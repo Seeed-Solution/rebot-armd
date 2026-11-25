@@ -1120,6 +1120,7 @@ impl SupervisorInner {
                         };
                         self.tracking.record_issued_with_ws_depths(fb.positions, fb.velocities, full, park);
                         self.tracking.fallback_ramp = (!done).then_some(ramp);
+                        self.tracking.holding_fallback_pose = done;
                     }
                     TickOutput::Deferred { .. } => {
                         // Keep the in-progress braking ramp intact across transient deferral
@@ -1158,6 +1159,7 @@ impl SupervisorInner {
                 self.commanded_velocities.fill(0.0);
                 self.commanded_accelerations.fill(0.0);
                 self.tracking.invalidate();
+                self.tracking.holding_fallback_pose = true;
                 self.safety.latch(
                     crate::safety::FaultKind::Other,
                     crate::safety::FaultDetail::formatted(FaultCode::ServoNoBrake, |buf| {
@@ -2700,6 +2702,7 @@ pub mod targets {
             SafetyError::HandoverSettling => "HANDOVER_SETTLING",
             SafetyError::ArmNotAtRestingPose { .. } => "ARM_NOT_AT_RESTING_POSE",
             SafetyError::MotionForbiddenInFaultState(_) => "MOTION_FORBIDDEN_IN_FAULT_STATE",
+            SafetyError::TorqueOffWouldDrop { .. } => "TORQUE_OFF_WOULD_DROP",
             SafetyError::ClearFaultRejected(_) => "CLEAR_FAULT_REJECTED",
             SafetyError::EStopActive => "ESTOP_ACTIVE",
             SafetyError::CollisionHold(_) => "COLLISION_HOLD",
@@ -2737,6 +2740,7 @@ pub mod targets {
             "FAULT_ACTIVE" => (409, code, Some("Fault")),
             "ARM_NOT_AT_RESTING_POSE" => (409, "ArmNotAtRestingPose", Some("Armed")),
             "MOTION_FORBIDDEN_IN_FAULT_STATE" => (409, "MotionForbiddenInFaultState", Some("Fault")),
+            "TORQUE_OFF_WOULD_DROP" => (409, code, None),
             "CLEAR_FAULT_REJECTED" => (409, "ClearFaultRejected", Some("Fault")),
             "WORKSPACE_VIOLATION" | "JUMP_LIMIT" | "STEP_LIMIT" => (422, code, None),
             "SOFT_LIMIT_EXCEEDED" | "SAFETY_ERROR" | "INVALID_COMMAND" => (400, code, None),

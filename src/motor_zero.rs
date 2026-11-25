@@ -282,7 +282,10 @@ async fn run_motor(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, req: MotorZ
     let (before, r, t_disable) = locked_step(sup, check, grant, "disable", |inner| {
         let q = readings(inner)?;
         if let Some(d) = inner.driver.as_mut() {
-            d.with_mut(|drv| drv.set_torque(false))
+            d.with_mut(|drv| {
+                let started_at = drv.clock_now();
+                drv.disable_torque(crate::driver::DisableKind::DisableRequested { started_at })
+            })
                 .ok_or_else(|| CalibError::new(500, "INTERNAL", "driver unavailable"))?
                 .map_err(|e| CalibError::new(500, "MOTOR_ZERO_NOT_DISABLED", format!("disable failed: {e}")))?;
         }
@@ -422,22 +425,60 @@ async fn run_software(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, req: Mot
     Ok(out)
 }
 
-/// A backup of `calibration.json` before a joint zero change: `<backup_dir>/<time>/` with
-/// `calibration.json` (when it exists) and `manifest.json` (`reason`, `joint_zero_offsets`).
-async fn write_zero_backup(deps: &CalibrationDeps, reason: &str, offsets: &[f32]) -> Result<std::path::PathBuf, String> {
+/// A backup of `calibration.json` (and companion `poses.json` / `gripper_calib.json` when
+/// present) before a joint zero change: `<backup_dir>/<time>/` with `manifest.json`
+/// (`reason`, `joint_zero_offsets`) and durably fsynced backup directory entries.
+async fn write_zero_backup_with_companions(
+    deps: &CalibrationDeps,
+    reason: &str,
+    offsets: &[f32],
+    poses_path: Option<std::path::PathBuf>,
+    gripper_calib_path: Option<std::path::PathBuf>,
+) -> Result<std::path::PathBuf, String> {
     let (root, calib) = (deps.backup_dir.clone(), deps.path.clone());
     let manifest = json!({"created_at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true), "reason": reason, "joint_zero_offsets": offsets});
     crate::calibration::blocking(move || {
-        std::fs::create_dir_all(&root)?;
+        let durable_root = calib.parent().filter(|p| p.is_dir());
+        crate::persist::create_dir_all_durable_under(&root, durable_root)?;
         let dir = root.join(crate::calibration::backup_name(&root));
         std::fs::create_dir(&dir)?;
         let mut files = vec!["manifest.json"];
-        if let Some(t) = crate::calibration::read_if_file(&calib)? { crate::persist::write_atomic(&dir.join("calibration.json"), &t)?; files.push("calibration.json"); }
+        if let Some(t) = crate::calibration::read_if_file(&calib)? {
+            crate::persist::write_atomic(&dir.join("calibration.json"), &t)?;
+            files.push("calibration.json");
+        }
+        if let Some(p) = poses_path.as_deref() {
+            if let Some(t) = crate::calibration::read_if_file(p)? {
+                crate::persist::write_atomic(&dir.join("poses.json"), &t)?;
+                files.push("poses.json");
+            }
+        }
+        if let Some(g) = gripper_calib_path.as_deref() {
+            if let Some(t) = crate::calibration::read_if_file(g)? {
+                crate::persist::write_atomic(&dir.join("gripper_calib.json"), &t)?;
+                files.push("gripper_calib.json");
+            }
+        }
         let mut manifest = manifest;
         manifest["files"] = json!(files);
-        crate::persist::write_atomic(&dir.join("manifest.json"), &serde_json::to_string_pretty(&manifest).unwrap_or_default())?;
+        let manifest_path = dir.join("manifest.json");
+        crate::persist::write_atomic(&manifest_path, &serde_json::to_string_pretty(&manifest).unwrap_or_default())?;
+        if let crate::persist::PublishOutcome::PublishedDurabilityUnconfirmed(w) =
+            crate::persist::PendingDirSync::for_path(&manifest_path).sync_parent_dir()
+        {
+            return Err(std::io::Error::other(format!("zero backup dir fsync failed: {w}")));
+        }
+        if let crate::persist::PublishOutcome::PublishedDurabilityUnconfirmed(w) =
+            crate::persist::PendingDirSync::for_path(&dir).sync_parent_dir()
+        {
+            return Err(std::io::Error::other(format!("zero backup root fsync failed: {w}")));
+        }
         Ok(dir)
     }).await
+}
+
+async fn write_zero_backup(deps: &CalibrationDeps, reason: &str, offsets: &[f32]) -> Result<std::path::PathBuf, String> {
+    write_zero_backup_with_companions(deps, reason, offsets, None, None).await
 }
 
 /// Under the lock: check a joint zero restore `{backup}` (torque off, no action, lease).
@@ -549,4 +590,1237 @@ async fn write_log(deps: &CalibrationDeps, started: &str, req: &MotorZeroRequest
         Ok(Err(e)) => { tracing::warn!("motor zero log {}: {e}", path.display()); json!({"error": e.to_string()}) }
         Err(e) => json!({"error": e.to_string()}),
     }
+}
+
+// ============================================================================
+// Executor-mode software joint zero & joint-zero restore (PR C-F1 part 1)
+// ============================================================================
+
+/// Outcome of synchronous executor-mode software-zero preflight (`check_software_executor`).
+pub(crate) enum ExecutorZeroStart {
+    DryRunReply(Value),
+    Run(MotorZeroRequest, crate::calibration::ExecutorTxnGuard),
+}
+
+fn reference_from_published(pub_cfg: &crate::rt_core::requests::config::PublishedConfig) -> Vec<f32> {
+    pub_cfg
+        .config
+        .zero_reference
+        .as_ref()
+        .map(|_| pub_cfg.config.home_positions.clone())
+        .unwrap_or_else(|| vec![0.0; pub_cfg.config.dof])
+}
+
+fn invalidates_from_published(
+    pub_cfg: &crate::rt_core::requests::config::PublishedConfig,
+    req: &MotorZeroRequest,
+    q: &[f32],
+    r: &[f32],
+) -> Value {
+    let moved: Vec<usize> = req
+        .joints
+        .iter()
+        .copied()
+        .filter(|&j| f64::from((q[j] - r[j]).abs()) > crate::joint_zero::STALE_THRESHOLD_RAD)
+        .collect();
+    let grip = pub_cfg.config.gripper_index();
+    json!({
+        "kinematics": pub_cfg.config.arm_model.correction().is_some(),
+        "camera": pub_cfg.camera_calibrated(),
+        "poses": if moved.is_empty() {
+            Vec::new()
+        } else {
+            pub_cfg.poses.list.poses.iter().map(|p| p.name.clone()).collect()
+        },
+        "gripper_calibration": grip.is_some_and(|g| moved.contains(&g))
+            && (pub_cfg.gripper_calib_offset.is_some() || pub_cfg.gripper_calib_jaw_opening.is_some()),
+    })
+}
+
+fn zero_entry_from_published(
+    pub_cfg: &crate::rt_core::requests::config::PublishedConfig,
+    new: &[f32],
+    method: &str,
+) -> Option<Option<crate::joint_zero::JointZero>> {
+    let name = pub_cfg
+        .config
+        .zero_reference
+        .as_ref()
+        .map_or("rest", |r| r.name.as_str())
+        .to_string();
+    let stored = pub_cfg
+        .calibration
+        .as_ref()
+        .and_then(|c| c.joint_zero.as_ref())
+        .is_some();
+    if new.iter().all(|o| *o == 0.0) {
+        return stored.then_some(None);
+    }
+    Some(Some(crate::joint_zero::JointZero::new(new, method, &name)))
+}
+
+/// Synchronous preflight for executor-mode software joint zero (`/api/v1/calibration/motor_zero`).
+/// Hardware `method == "motor"` and driver-backed software zero fail closed with `409 EXECUTOR_UNSUPPORTED`.
+pub(crate) async fn check_software_executor(
+    sup: &Arc<ArmSupervisor>,
+    body: &Value,
+    auth: &crate::calibration::ExecutorCalibAuth,
+) -> Result<ExecutorZeroStart, CalibError> {
+    let pub_cfg = sup.published_config().await.map_err(CalibError::from)?;
+    let mut req = parse(body)?;
+    let tool = pub_cfg.calibration_tools().motor_zero;
+    if !tool.support.supported {
+        return Err(CalibError::new(
+            400,
+            "UNSUPPORTED",
+            format!("motor zero is not supported: {}", tool.support.reason.unwrap_or_default()),
+        ));
+    }
+    let method = method_of(&req, &tool);
+    req.method = Some(method.into());
+    if method == "motor" {
+        return Err(CalibError::new(
+            409,
+            "EXECUTOR_UNSUPPORTED",
+            format!("{PATH} is not available while the RT executor owns the arm; use the legacy owner"),
+        ));
+    }
+    if pub_cfg.has_driver {
+        return Err(CalibError::new(
+            409,
+            "EXECUTOR_UNSUPPORTED",
+            format!("{PATH} is not available while the RT executor owns the arm; use the legacy owner"),
+        ));
+    }
+    if !tool.software {
+        return Err(CalibError::new(
+            400,
+            "UNSUPPORTED",
+            "the software zero needs a profile zero_reference",
+        ));
+    }
+    if let Some(j) = req.joints.iter().find(|j| !tool.joints.contains(&(*j + 1))) {
+        return Err(CalibError::new(
+            400,
+            "JOINT_UNSUPPORTED",
+            format!("joint {} is not in calibration_tools.motor_zero.joints {:?}", j + 1, tool.joints),
+        ));
+    }
+    if let Err((_, arm_err)) = (auth.auth_check)() {
+        return Err(CalibError::from(arm_err));
+    }
+    let txn_id = crate::rt_core::requests::config::next_calibration_txn_id();
+    let cfg_auth = crate::rt_core::requests::config::ConfigAuthContext {
+        admission: auth.admission,
+        lease_holder: auth.lease_holder,
+    };
+    let mut pre_guard = (!req.dry_run)
+        .then(|| crate::calibration::ExecutorTxnGuard::new(Arc::clone(sup), txn_id));
+    let sample = match sup
+        .dispatch_config_request(
+            crate::rt_core::requests::config::ConfigRequest::BeginCalibrationTxn {
+                txn_id,
+                auth: cfg_auth,
+                operator_grant: auth.operator_grant,
+                expected_epoch: auth.admission.estop_epoch,
+                expected_stop_gen: auth.admission.stop_gen,
+                kind: crate::rt_core::requests::config::CalibrationTxnKind::SoftwareZero {
+                    set_busy: !req.dry_run,
+                },
+            },
+        )
+        .await
+    {
+        Ok(crate::rt_core::requests::config::ConfigReply::CalibrationTxnBegan(Ok(s))) => s,
+        Ok(crate::rt_core::requests::config::ConfigReply::CalibrationTxnBegan(Err(e))) => {
+            if let Some(g) = pre_guard.take() {
+                let _ = g.disarm();
+            }
+            return Err(crate::calibration::calib_error_from_config(e));
+        }
+        Err(e) => {
+            if let Some(g) = pre_guard.take() {
+                g.release().await;
+            }
+            return Err(crate::calibration::calib_error_from_config(e));
+        }
+        _ => {
+            if let Some(g) = pre_guard.take() {
+                g.release().await;
+            }
+            return Err(CalibError::new(500, "INTERNAL", "unexpected begin calibration reply"));
+        }
+    };
+    let q = sample.positions[..sample.dof].to_vec();
+    let r = reference_from_published(&pub_cfg);
+    let rows = joint_rows(&req, &q, &r);
+    let persist = Some("calibration_file".to_string());
+    if req.dry_run {
+        let far_j: Vec<usize> = req
+            .joints
+            .iter()
+            .filter(|&&j| far(&q, &r, j))
+            .map(|j| j + 1)
+            .collect();
+        return Ok(ExecutorZeroStart::DryRunReply(json!({
+            "dry_run": true,
+            "joints": rows,
+            "needs_force": !far_j.is_empty(),
+            "far_joints": far_j,
+            "invalidates": invalidates_from_published(&pub_cfg, &req, &q, &r),
+            "zero_method": "software",
+            "method": tool.support.method,
+            "persist": persist,
+            "persist_verified": true,
+            "max_offset_deg": MOTOR_ZERO_MAX_OFFSET_DEG,
+        })));
+    }
+    let guard = pre_guard.expect("non-dry-run software zero holds txn guard");
+    let far_s: Vec<String> = req
+        .joints
+        .iter()
+        .filter(|&&j| far(&q, &r, j))
+        .map(|&j| {
+            format!(
+                "J{} reads {:.1} deg (reference {:.1} deg)",
+                j + 1,
+                f64::from(q[j]).to_degrees(),
+                f64::from(r[j]).to_degrees()
+            )
+        })
+        .collect();
+    if !far_s.is_empty() && !req.force {
+        guard.release().await;
+        let mut e = CalibError::new(
+            409,
+            "MOTOR_ZERO_FAR",
+            format!(
+                "{} (more than {MOTOR_ZERO_MAX_OFFSET_DEG} deg from the reference); \
+                check the arm is in the rest pose, or send force: true for a lost zero",
+                far_s.join(", ")
+            ),
+        );
+        e.extra.insert("joints".into(), json!(rows));
+        return Err(e);
+    }
+    sup.published_config_hub().update(|cfg| {
+        cfg.calibration_busy = true;
+        cfg.calibration_txn_id = Some(txn_id);
+    });
+    Ok(ExecutorZeroStart::Run(req, guard))
+}
+
+/// Synchronous preflight for executor-mode `/api/v1/calibration/joint_zero/restore`.
+pub(crate) async fn check_restore_executor(
+    sup: &Arc<ArmSupervisor>,
+    body: &Value,
+    auth: &crate::calibration::ExecutorCalibAuth,
+) -> Result<(String, crate::calibration::ExecutorTxnGuard), CalibError> {
+    let name = body
+        .get("backup")
+        .and_then(Value::as_str)
+        .filter(|n| {
+            !n.is_empty()
+                && n.len() <= 64
+                && n.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        })
+        .ok_or_else(|| {
+            invalid("backup must be the name of a software zero backup (GET /api/v1/calibration backups)")
+        })?
+        .to_string();
+    if body.as_object().is_some_and(|o| o.keys().any(|k| k != "backup")) {
+        return Err(invalid("only the field backup is allowed"));
+    }
+    let pub_cfg = sup.published_config().await.map_err(CalibError::from)?;
+    if pub_cfg.has_driver {
+        return Err(CalibError::new(
+            409,
+            "EXECUTOR_UNSUPPORTED",
+            format!("{RESTORE_PATH} is not available while the RT executor owns the arm; use the legacy owner"),
+        ));
+    }
+    if pub_cfg.config.zero_reference.is_none() {
+        return Err(CalibError::new(
+            400,
+            "UNSUPPORTED",
+            "the joint zero needs a profile zero_reference",
+        ));
+    }
+    if let Err((_, arm_err)) = (auth.auth_check)() {
+        return Err(CalibError::from(arm_err));
+    }
+    let txn_id = crate::rt_core::requests::config::next_calibration_txn_id();
+    let cfg_auth = crate::rt_core::requests::config::ConfigAuthContext {
+        admission: auth.admission,
+        lease_holder: auth.lease_holder,
+    };
+    let pre_guard = crate::calibration::ExecutorTxnGuard::new(Arc::clone(sup), txn_id);
+    match sup
+        .dispatch_config_request(
+            crate::rt_core::requests::config::ConfigRequest::BeginCalibrationTxn {
+                txn_id,
+                auth: cfg_auth,
+                operator_grant: auth.operator_grant,
+                expected_epoch: auth.admission.estop_epoch,
+                expected_stop_gen: auth.admission.stop_gen,
+                kind: crate::rt_core::requests::config::CalibrationTxnKind::JointZeroRestore,
+            },
+        )
+        .await
+    {
+        Ok(crate::rt_core::requests::config::ConfigReply::CalibrationTxnBegan(Ok(_))) => {
+            sup.published_config_hub().update(|cfg| {
+                cfg.calibration_busy = true;
+                cfg.calibration_txn_id = Some(txn_id);
+            });
+            Ok((name, pre_guard))
+        }
+        Ok(crate::rt_core::requests::config::ConfigReply::CalibrationTxnBegan(Err(e))) => {
+            let _ = pre_guard.disarm();
+            Err(crate::calibration::calib_error_from_config(e))
+        }
+        Err(e) => {
+            pre_guard.release().await;
+            Err(crate::calibration::calib_error_from_config(e))
+        }
+        _ => {
+            pre_guard.release().await;
+            Err(CalibError::new(500, "INTERNAL", "unexpected begin restore reply"))
+        }
+    }
+}
+
+async fn sample_zero_state_executor(
+    sup: &ArmSupervisor,
+    auth: &crate::calibration::ExecutorCalibAuth,
+    txn_id: Option<u64>,
+    step: &'static str,
+    require_zero_state_checks: bool,
+    check_authority: bool,
+) -> Result<crate::rt_core::requests::config::CalibrationStateSample, CalibError> {
+    if check_authority {
+        if let Err((_, arm_err)) = (auth.auth_check)() {
+            return Err(CalibError::from(arm_err).at(step));
+        }
+    }
+    let cfg_auth = crate::rt_core::requests::config::ConfigAuthContext {
+        admission: auth.admission,
+        lease_holder: auth.lease_holder,
+    };
+    match sup
+        .dispatch_config_request_reliable(|| {
+            crate::rt_core::requests::config::ConfigRequest::SampleCalibrationState {
+                auth: cfg_auth,
+                operator_grant: auth.operator_grant,
+                expected_epoch: auth.admission.estop_epoch,
+                expected_stop_gen: auth.admission.stop_gen,
+                expected_txn_id: txn_id,
+                require_zero_state_checks,
+                check_authority,
+            }
+        })
+        .await
+    {
+        Ok(crate::rt_core::requests::config::ConfigReply::CalibrationStateSampled(Ok(s))) => Ok(s),
+        Ok(crate::rt_core::requests::config::ConfigReply::CalibrationStateSampled(Err(e))) => {
+            Err(crate::calibration::calib_error_from_deferred_config(e).at(step))
+        }
+        Err(e) => Err(crate::calibration::calib_error_from_deferred_config(e).at(step)),
+        _ => Err(CalibError::new(500, "INTERNAL", "unexpected calibration sample reply").at(step)),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn commit_software_zero_via_worker(
+    sup: &Arc<ArmSupervisor>,
+    deps: &CalibrationDeps,
+    auth: &crate::calibration::ExecutorCalibAuth,
+    txn_id: u64,
+    new_offsets: &[f32],
+    joints_one_based: &[usize],
+    changes: &[f32],
+    method_label: &str,
+    new_zero: Option<Option<crate::joint_zero::JointZero>>,
+    backup_path: &std::path::Path,
+    reason_label: &str,
+) -> Result<(crate::rt_core::requests::config::ConfigCommitOutcome, Value), CalibError> {
+    use crate::calibration::{
+        effective_floor_for_with_legacy, file_fingerprints, legacy_file_fingerprint,
+        CalibrationFile, CalibrationStale,
+    };
+    use crate::rt_core::config_iface::ConfigDomain;
+    use crate::rt_core::requests::config::{
+        build_config_proposal_with_deadline, pending_commit_marker_path,
+        prepare_eval_bufs_off_thread, run_config_commit_detailed, ConfigAuthContext,
+        ConfigCandidate, ConfigCommitPlan, ConfigWriteOp, FileWriteOp, ReservePrecheck,
+    };
+
+    let pub_cfg = sup.published_config().await.map_err(CalibError::from)?;
+    let dof = pub_cfg.config.dof;
+    if new_offsets.len() != dof || dof > crate::rt_core::mailbox::MAX_DOF {
+        return Err(CalibError::new(
+            400,
+            "INVALID_COMMAND",
+            format!("joint zero needs {dof} finite offsets"),
+        ));
+    }
+    let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let moved: Vec<usize> = joints_one_based
+        .iter()
+        .zip(changes)
+        .filter(|(_, d)| f64::from(d.abs()) > crate::joint_zero::STALE_THRESHOLD_RAD)
+        .map(|(j, _)| *j)
+        .collect();
+
+    let mut file = pub_cfg.calibration.clone();
+    let removed = file.as_mut().and_then(|c| c.kinematics.take());
+    let had_live_kin = pub_cfg.config.arm_model.correction().is_some();
+    let camera_stale = file.as_ref().is_some_and(CalibrationFile::has_camera);
+    if let Some(c) = file.as_mut().filter(|c| c.has_camera()) {
+        c.stale = Some(CalibrationStale {
+            reason: format!(
+                "{method_label} zero of joints {joints_one_based:?}; the camera calibration was measured with the old zero"
+            ),
+            at: at.clone(),
+        });
+        if let Some(a) = c.acceptance.as_mut() {
+            a.invalidated = Some(CalibrationStale {
+                reason: format!(
+                    "{method_label} zero of joints {joints_one_based:?}; the acceptance was measured with the old zero"
+                ),
+                at: at.clone(),
+            });
+        }
+    }
+    let mut file_changes = removed.is_some() || camera_stale;
+    if let Some(c) = file.as_mut() {
+        if crate::mit::invalidate_record(
+            c,
+            joints_one_based,
+            &format!(
+                "{method_label} zero of joints {joints_one_based:?}; the MIT qualification was measured with the old zero"
+            ),
+            &at,
+        ) {
+            file_changes = true;
+        }
+    }
+    if let Some(z) = new_zero {
+        if file.as_ref().and_then(|c| c.joint_zero.as_ref()) != z.as_ref() {
+            file_changes = true;
+        }
+        match file.as_mut() {
+            Some(c) => c.joint_zero = z,
+            None if z.is_some() => {
+                file = Some(CalibrationFile {
+                    joint_zero: z,
+                    ..Default::default()
+                });
+            }
+            None => {}
+        }
+    }
+    if file.as_ref().is_some_and(|c| {
+        !c.has_camera()
+            && c.joint_zero.is_none()
+            && c.kinematics.is_none()
+            && c.mit_qualification.is_none()
+    }) {
+        file = None;
+    }
+
+    let next_arm_model = if had_live_kin {
+        Some(
+            pub_cfg
+                .config
+                .arm_model
+                .with_correction(None)
+                .map_err(|e| CalibError::new(500, "INTERNAL", e))?,
+        )
+    } else {
+        None
+    };
+    let effective_arm_model = next_arm_model.as_ref().unwrap_or(&pub_cfg.config.arm_model);
+
+    let stale_reason = format!("{method_label} zero of joints {moved:?}; taught with the old zero");
+    let mut poses_stale = Vec::new();
+    let mut next_pose_list: Option<(crate::poses::PoseList, bool)> = None;
+    if (!moved.is_empty() && !pub_cfg.poses.list.poses.is_empty()) || had_live_kin {
+        let mut list = pub_cfg.poses.list.clone();
+        if !moved.is_empty() {
+            for p in &mut list.poses {
+                p.stale = Some(CalibrationStale {
+                    reason: stale_reason.clone(),
+                    at: at.clone(),
+                });
+                poses_stale.push(p.name.clone());
+            }
+        }
+        if had_live_kin {
+            for p in &mut list.poses {
+                p.tcp = pub_cfg.recompute_pose_tcp_for(effective_arm_model, p);
+            }
+        }
+        next_pose_list = Some((list, !poses_stale.is_empty()));
+    }
+    let expected_poses_revision = next_pose_list.as_ref().map(|_| pub_cfg.poses.revision);
+
+    let grip_idx = pub_cfg.config.gripper_index();
+    let grip_one = grip_idx.map(|g| g + 1);
+    // Legacy resets an existing gripper torque baseline for ANY nonzero gripper offset change,
+    // independent of the 0.5 deg staleness threshold used for persisted gripper_calib.json.
+    let gripper_any_change = grip_idx.is_some_and(|gi| {
+        gi < new_offsets.len()
+            && gi < pub_cfg.joint_zero_offsets.len()
+            && (pub_cfg.joint_zero_offsets[gi] - new_offsets[gi]) != 0.0
+    });
+    let gripper_moved = grip_one.is_some_and(|g| moved.contains(&g));
+    let has_grip_calib =
+        pub_cfg.gripper_calib_offset.is_some() || pub_cfg.gripper_calib_jaw_opening.is_some();
+    let gripper_stale = gripper_moved && has_grip_calib;
+    let next_gripper_stale = gripper_stale.then(|| CalibrationStale {
+        reason: stale_reason.clone(),
+        at: at.clone(),
+    });
+    let expected_gripper_calib_revision =
+        gripper_stale.then_some(pub_cfg.gripper_calib_revision);
+
+    let effective_floor = pub_cfg.profile_floor_z_m.map(|profile| {
+        let (_, fp) = file_fingerprints(
+            file.as_ref(),
+            &pub_cfg.config.camera_mount,
+            new_offsets,
+            Some(&pub_cfg.config.active_tool.config_digest),
+        );
+        let legacy_fp =
+            legacy_file_fingerprint(file.as_ref(), &pub_cfg.config.camera_mount, new_offsets);
+        let (eff, src, _) = effective_floor_for_with_legacy(
+            profile,
+            file.as_ref(),
+            &fp,
+            Some(&legacy_fp),
+            &pub_cfg.config.active_tool,
+        );
+        (eff, src)
+    });
+
+    let ws_eval_bufs = pub_cfg.workspace_policy().map(|(ws, cam)| {
+        let mut next_ws = ws.clone();
+        if let Some((eff, _)) = effective_floor {
+            next_ws.floor_z_m = eff;
+        }
+        prepare_eval_bufs_off_thread(
+            effective_arm_model,
+            &next_ws,
+            cam,
+            pub_cfg.config.active_tool.tcp_offset_m,
+        )
+    });
+
+    // Pre-build replacement gripper baseline off-RT when gripper joint zero changes at all.
+    let (replacement_baseline, replacement_baseline_pending) = if gripper_any_change {
+        let rb = pub_cfg.config.gripper_policy.as_ref().map(|policy| {
+            crate::gripper_baseline::FreeTorqueBaseline::new(
+                policy.closed_rad,
+                policy.open_rad,
+                Some(pub_cfg.config.active_tool.id.clone()),
+                Some(pub_cfg.config.active_tool.config_digest.clone()),
+                pub_cfg.follower.clone(),
+            )
+        });
+        (rb, Some(Vec::with_capacity(crate::supervisor::GRIPPER_BASELINE_PENDING_MAX)))
+    } else {
+        (None, None)
+    };
+
+    let mut file_ops = Vec::with_capacity(3);
+    if file_changes {
+        match file.as_ref() {
+            Some(c) => {
+                let text = serde_json::to_string_pretty(c).unwrap_or_default();
+                file_ops.push(FileWriteOp::Replace(crate::persist::PendingWrite::new(
+                    deps.path.clone(),
+                    text,
+                )));
+            }
+            None => {
+                file_ops.push(FileWriteOp::Remove(deps.path.clone()));
+            }
+        }
+    }
+    if let (Some((ref list, true)), Some(ref poses_path)) = (&next_pose_list, &pub_cfg.poses.path) {
+        file_ops.push(FileWriteOp::Replace(crate::persist::PendingWrite::new(
+            poses_path.clone(),
+            serde_json::to_string_pretty(list).unwrap_or_default(),
+        )));
+    }
+    if let Some(ref stale) = next_gripper_stale {
+        let f = crate::gripper_calib::GripperCalibFile {
+            offset_rad: pub_cfg.gripper_calib_offset,
+            jaw_opening: pub_cfg.gripper_calib_jaw_opening.clone(),
+            ts: Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs()),
+            ),
+            stale: Some(stale.clone()),
+            tool_id: Some(pub_cfg.config.active_tool.id.clone()),
+            tool_config_digest: Some(pub_cfg.config.active_tool.config_digest.clone()),
+        };
+        let grip_path = pub_cfg
+            .gripper_calib_path
+            .clone()
+            .unwrap_or_else(crate::gripper_calib::path_from_env);
+        file_ops.push(FileWriteOp::Replace(crate::persist::PendingWrite::new(
+            grip_path,
+            serde_json::to_string_pretty(&f).unwrap_or_default(),
+        )));
+    }
+    // Journal EVERY effectful C-F1 commit (single-file or multi-file) so an authority loss or
+    // crash after rename is quarantined on restart rather than silently activating rejected offsets.
+    let pending_marker = if !file_ops.is_empty() {
+        let marker_path = pending_commit_marker_path(&deps.path);
+        let marker_text = json!({
+            "reason": reason_label,
+            "backup": backup_path.display().to_string(),
+            "files": file_ops.iter().map(|op| op.target_path().display().to_string()).collect::<Vec<_>>(),
+        })
+        .to_string();
+        Some((marker_path, marker_text))
+    } else {
+        None
+    };
+
+    let mut offsets_arr = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
+    offsets_arr[..dof].copy_from_slice(new_offsets);
+
+    let lease_gen = auth.lease_holder.map_or(0, |(_, g)| g);
+    let proposal = build_config_proposal_with_deadline(
+        sup,
+        ConfigDomain::Calibration,
+        pub_cfg.calibration_revision,
+        auth.admission,
+        lease_gen,
+        pub_cfg.workspace_revision,
+        Instant::now() + crate::supervisor::config::CONFIG_PROPOSAL_BUDGET,
+    );
+    let cfg_auth = ConfigAuthContext {
+        admission: auth.admission,
+        lease_holder: auth.lease_holder,
+    };
+
+    let pub_offsets = new_offsets.to_vec();
+    let pub_cal = file.clone();
+    let pub_arm = next_arm_model.clone();
+    let pub_poses = next_pose_list.clone();
+    let pub_grip_stale = next_gripper_stale.clone();
+    let pub_floor = effective_floor;
+
+    let plan = ConfigCommitPlan {
+        proposal,
+        auth: cfg_auth,
+        precheck: ReservePrecheck::SoftwareJointZero {
+            allow_during_calibration_busy: true,
+            expected_txn_id: Some(txn_id),
+            operator_grant: auth.operator_grant,
+            expected_gripper_calib_revision,
+        },
+        candidate: ConfigCandidate::SoftwareJointZero {
+            new_offsets: offsets_arr,
+            dof,
+            calibration: file,
+            #[cfg(feature = "policy-runtime")]
+            calibration_digest: SupervisorInner::calibration_digest_of(pub_cal.as_ref()),
+            next_arm_model,
+            next_pose_list,
+            next_gripper_stale,
+            expected_gripper_calib_revision,
+            expected_txn_id: Some(txn_id),
+            operator_grant: auth.operator_grant,
+            effective_floor,
+            ws_eval_bufs,
+            reset_gripper_baseline: gripper_any_change,
+            replacement_baseline,
+            replacement_baseline_pending,
+        },
+        write: if file_ops.is_empty() {
+            ConfigWriteOp::Volatile
+        } else {
+            ConfigWriteOp::Batch {
+                ops: file_ops,
+                pending_marker,
+                existing_marker: None,
+            }
+        },
+        expected_workspace_revision: Some(pub_cfg.workspace_revision),
+        expected_poses_revision,
+    };
+
+    let auth_cb = Arc::clone(&auth.auth_check);
+    let outcome = run_config_commit_detailed(
+        sup,
+        plan,
+        move || (auth_cb)(),
+        move |cfg, act| {
+            if cfg.joint_zero_offsets.len() > 5
+                && pub_offsets.len() > 5
+                && cfg.joint_zero_offsets[5] != pub_offsets[5]
+            {
+                cfg.zero_convention = Default::default();
+            }
+            cfg.joint_zero_offsets = pub_offsets;
+            cfg.calibration = pub_cal;
+            if let Some(m) = pub_arm {
+                cfg.config.arm_model = m;
+            }
+            if let Some((pl, bump)) = pub_poses {
+                cfg.poses.list = pl;
+                if bump {
+                    cfg.poses.revision = act.poses_revision;
+                }
+            }
+            if let Some(st) = pub_grip_stale {
+                cfg.gripper_calib_stale = Some(st);
+                cfg.gripper_calib_revision = act.gripper_calib_revision;
+            }
+            if let Some((eff, src)) = pub_floor {
+                cfg.floor_source = src;
+                if let Some(ws) = cfg.config.workspace.as_mut() {
+                    ws.floor_z_m = eff;
+                }
+            }
+            cfg.calibration_revision = act.calibration_revision;
+            cfg.workspace_revision = act.workspace_revision;
+        },
+    )
+    .await
+    .map_err(|e| crate::calibration::calib_error_from_commit(e, "apply", Some(backup_path)))?;
+
+    let inv = json!({
+        "kinematics_removed": removed.is_some() || had_live_kin,
+        "camera_stale": camera_stale,
+        "poses_stale": poses_stale,
+        "gripper_calibration_stale": gripper_stale,
+        "removed_kinematics": removed,
+        "at": at,
+        "error": Value::Null,
+    });
+    Ok((outcome, inv))
+}
+
+async fn verify_executor(
+    sup: &ArmSupervisor,
+    auth: &crate::calibration::ExecutorCalibAuth,
+    req: &MotorZeroRequest,
+    before: &[f32],
+    r: &[f32],
+    t_apply: Instant,
+) -> Vec<Value> {
+    let deadline = Instant::now() + VERIFY_TIMEOUT;
+    loop {
+        let sample = sample_zero_state_executor(sup, auth, None, "verify", false, false).await;
+        let (rows, all) = match sample {
+            Ok(s) => {
+                let mut all = true;
+                let rows: Vec<Value> = req
+                    .joints
+                    .iter()
+                    .map(|&j| {
+                        let after = if j < s.dof { s.positions[j] } else { f32::NAN };
+                        let fresh = !s.has_driver
+                            || s.feedback_instants
+                                .get(j)
+                                .copied()
+                                .flatten()
+                                .is_some_and(|t| t > t_apply);
+                        let ok = fresh && (after - r[j]).abs() < verify_rad();
+                        all &= ok;
+                        json!({
+                            "joint": j + 1,
+                            "before_rad": before[j],
+                            "after_rad": after,
+                            "reference_rad": r[j],
+                            "sent": true,
+                            "fresh": fresh,
+                            "verified": ok,
+                        })
+                    })
+                    .collect();
+                (rows, all)
+            }
+            Err(_) => {
+                let rows: Vec<Value> = req
+                    .joints
+                    .iter()
+                    .map(|&j| {
+                        json!({
+                            "joint": j + 1,
+                            "before_rad": before[j],
+                            "after_rad": Value::Null,
+                            "reference_rad": r[j],
+                            "sent": true,
+                            "fresh": false,
+                            "verified": false,
+                        })
+                    })
+                    .collect();
+                (rows, false)
+            }
+        };
+        if all || Instant::now() >= deadline {
+            return rows;
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// Executor-mode software joint zero through PR C's two-phase config worker.
+pub async fn run_software_executor(
+    sup: &Arc<ArmSupervisor>,
+    deps: &CalibrationDeps,
+    req: MotorZeroRequest,
+    auth: crate::calibration::ExecutorCalibAuth,
+) -> Result<Value, CalibError> {
+    run_software_executor_with_guard(sup, deps, req, auth, None).await
+}
+
+pub(crate) async fn run_software_executor_with_guard(
+    sup: &Arc<ArmSupervisor>,
+    deps: &CalibrationDeps,
+    req: MotorZeroRequest,
+    auth: crate::calibration::ExecutorCalibAuth,
+    existing_guard: Option<crate::calibration::ExecutorTxnGuard>,
+) -> Result<Value, CalibError> {
+    if req.method.as_deref() != Some("software") {
+        if let Some(g) = existing_guard {
+            g.release().await;
+        }
+        return Err(CalibError::new(
+            409,
+            "EXECUTOR_UNSUPPORTED",
+            format!("{PATH} is not available while the RT executor owns the arm; use the legacy owner"),
+        ));
+    }
+    let sup_w = Arc::clone(sup);
+    let deps_w = deps.clone();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let res = async move {
+            let guard = match existing_guard {
+                Some(g) => g,
+                None => match auth.txn_id {
+                    Some(id) => crate::calibration::ExecutorTxnGuard::new(Arc::clone(&sup_w), id),
+                    None => {
+                        if let Err((_, arm_err)) = (auth.auth_check)() {
+                            return Err(CalibError::from(arm_err));
+                        }
+                        let tid = crate::rt_core::requests::config::next_calibration_txn_id();
+                        let cfg_auth = crate::rt_core::requests::config::ConfigAuthContext {
+                            admission: auth.admission,
+                            lease_holder: auth.lease_holder,
+                        };
+                        let pre_g = crate::calibration::ExecutorTxnGuard::new(Arc::clone(&sup_w), tid);
+                        match sup_w
+                            .dispatch_config_request(
+                                crate::rt_core::requests::config::ConfigRequest::BeginCalibrationTxn {
+                                    txn_id: tid,
+                                    auth: cfg_auth,
+                                    operator_grant: auth.operator_grant,
+                                    expected_epoch: auth.admission.estop_epoch,
+                                    expected_stop_gen: auth.admission.stop_gen,
+                                    kind: crate::rt_core::requests::config::CalibrationTxnKind::SoftwareZero {
+                                        set_busy: true,
+                                    },
+                                },
+                            )
+                            .await
+                        {
+                            Ok(crate::rt_core::requests::config::ConfigReply::CalibrationTxnBegan(Ok(_))) => {
+                                sup_w.published_config_hub().update(|cfg| {
+                                    cfg.calibration_busy = true;
+                                    cfg.calibration_txn_id = Some(tid);
+                                });
+                                pre_g
+                            }
+                            Ok(crate::rt_core::requests::config::ConfigReply::CalibrationTxnBegan(Err(e))) => {
+                                let _ = pre_g.disarm();
+                                return Err(crate::calibration::calib_error_from_config(e));
+                            }
+                            Err(e) => {
+                                pre_g.release().await;
+                                return Err(crate::calibration::calib_error_from_config(e));
+                            }
+                            _ => {
+                                pre_g.release().await;
+                                return Err(CalibError::new(500, "INTERNAL", "unexpected begin zero reply"));
+                            }
+                        }
+                    }
+                },
+            };
+            let txn_id = guard.txn_id();
+            let run_res = async {
+                let started = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                let pub_cfg = sup_w.published_config().await.map_err(CalibError::from)?;
+                if pub_cfg.has_driver {
+                    return Err(CalibError::new(
+                        409,
+                        "EXECUTOR_UNSUPPORTED",
+                        format!("{PATH} is not available while the RT executor owns the arm; use the legacy owner"),
+                    ));
+                }
+                let r = reference_from_published(&pub_cfg);
+                let n = pub_cfg.config.dof;
+                // 1. Capture mean of fresh readings over SOFTWARE_CAPTURE while checking authority & state.
+                let _ = sample_zero_state_executor(&sup_w, &auth, Some(txn_id), "capture", true, true).await?;
+                let t0 = Instant::now();
+                let (mut sum, mut lo, mut hi, mut count) = (
+                    vec![0.0f64; n],
+                    vec![f32::INFINITY; n],
+                    vec![f32::NEG_INFINITY; n],
+                    0u32,
+                );
+                while t0.elapsed() < crate::joint_zero::SOFTWARE_CAPTURE || count == 0 {
+                    let s = sample_zero_state_executor(&sup_w, &auth, Some(txn_id), "capture", true, true).await?;
+                    for j in 0..n {
+                        let qj = s.positions[j];
+                        sum[j] += f64::from(qj);
+                        lo[j] = lo[j].min(qj);
+                        hi[j] = hi[j].max(qj);
+                    }
+                    count += 1;
+                    tokio::time::sleep(POLL).await;
+                }
+                let before: Vec<f32> = sum.iter().map(|v| (*v / f64::from(count)) as f32).collect();
+                let moving: Vec<String> = req
+                    .joints
+                    .iter()
+                    .filter(|&&j| hi[j] - lo[j] > CAPTURE_MAX_SPREAD_RAD)
+                    .map(|&j| format!("J{} moved {:.2} deg", j + 1, f64::from(hi[j] - lo[j]).to_degrees()))
+                    .collect();
+                if !moving.is_empty() {
+                    return Err(CalibError::new(
+                        409,
+                        "ZERO_MOVING",
+                        format!(
+                            "{} during the {} ms capture; hold the arm still in the rest pose and run again; nothing was changed",
+                            moving.join(", "),
+                            crate::joint_zero::SOFTWARE_CAPTURE.as_millis()
+                        ),
+                    ));
+                }
+                // 2. Compute new offsets.
+                let pub_now = sup_w.published_config().await.map_err(CalibError::from)?;
+                let old = pub_now.joint_zero_offsets.clone();
+                let mut new = old.clone();
+                for &j in &req.joints {
+                    new[j] = old[j] + (before[j] - r[j]);
+                }
+                if let Some(j) = req
+                    .joints
+                    .iter()
+                    .find(|&&j| f64::from(new[j].abs()) > crate::joint_zero::MAX_OFFSET_RAD)
+                {
+                    return Err(CalibError::new(
+                        409,
+                        "MOTOR_ZERO_FAR",
+                        format!(
+                            "J{} would need a joint zero offset of {:.1} deg; nothing was changed",
+                            j + 1,
+                            f64::from(new[*j]).to_degrees()
+                        ),
+                    ));
+                }
+                // 3. Backup (including companion poses & gripper_calib), then commit through PR C's two-phase worker.
+                let backup = write_zero_backup_with_companions(
+                    &deps_w,
+                    "software_zero",
+                    &old,
+                    pub_now.poses.path.clone(),
+                    pub_now.gripper_calib_path.clone(),
+                )
+                .await
+                .map_err(|e| {
+                    CalibError::new(
+                        500,
+                        "PERSIST_FAILED",
+                        format!("backup: {e}; nothing was changed"),
+                    )
+                })?;
+                let zeroed: Vec<usize> = req.joints.iter().map(|j| j + 1).collect();
+                let changes: Vec<f32> = req.joints.iter().map(|&j| r[j] - before[j]).collect();
+                let entry = zero_entry_from_published(&pub_now, &new, "software");
+                let (outcome, inv) = commit_software_zero_via_worker(
+                    &sup_w,
+                    &deps_w,
+                    &auth,
+                    txn_id,
+                    &new,
+                    &zeroed,
+                    &changes,
+                    "software",
+                    entry,
+                    &backup,
+                    "software_zero",
+                )
+                .await?;
+                // 4. Verify readings newer than activation + write audit log.
+                let rows = verify_executor(
+                    &sup_w,
+                    &auth,
+                    &req,
+                    &before,
+                    &r,
+                    outcome.activated.activated_at,
+                )
+                .await;
+                let verified = rows.iter().all(|r| r["verified"] == json!(true));
+                let log = write_log(
+                    &deps_w,
+                    &started,
+                    &req,
+                    &before,
+                    &rows,
+                    if verified { "verified" } else { "unverified" },
+                    &inv,
+                )
+                .await;
+                tracing::warn!(
+                    "Software zero of joints {zeroed:?} (executor): offsets {old:?} -> {new:?} rad (backup {})",
+                    backup.display()
+                );
+                let mut out = json!({
+                    "joints": rows,
+                    "invalidated": inv,
+                    "log": log,
+                    "zero_method": "software",
+                    "persist": "calibration_file",
+                    "persist_verified": true,
+                    "torque": "off",
+                    "backup": backup.display().to_string(),
+                    "offsets_before": old,
+                    "offsets_after": new,
+                });
+                if !verified {
+                    let mut e = CalibError::new(
+                        500,
+                        "MOTOR_ZERO_UNVERIFIED",
+                        format!(
+                            "the joint zero was installed but not every joint read within {MOTOR_ZERO_VERIFY_MRAD} mrad of its reference; \
+                            restore backup {} or run the tool again",
+                            backup
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_default()
+                        ),
+                    );
+                    if let Value::Object(m) = out.take() {
+                        e.extra = m;
+                    }
+                    return Err(e);
+                }
+                out["restore"] = json!({
+                    "path": RESTORE_PATH,
+                    "backup": backup.file_name().map(|n| n.to_string_lossy().into_owned()),
+                });
+                Ok(out)
+            }
+            .await;
+            guard.release().await;
+            run_res
+        }
+        .await;
+        let _ = done_tx.send(res);
+    });
+    done_rx.await.unwrap_or_else(|e| {
+        tracing::error!("software zero worker failed: {e}");
+        Err(CalibError::new(
+            500,
+            "INTERNAL",
+            "calibration task failed: channel closed; check GET /api/v1/calibration and the backups",
+        ))
+    })
+}
+
+/// Executor-mode `/api/v1/calibration/joint_zero/restore` through PR C's two-phase config worker.
+pub async fn restore_executor(
+    sup: &Arc<ArmSupervisor>,
+    deps: &CalibrationDeps,
+    name: String,
+    auth: crate::calibration::ExecutorCalibAuth,
+) -> Result<Value, CalibError> {
+    restore_executor_with_guard(sup, deps, name, auth, None).await
+}
+
+pub(crate) async fn restore_executor_with_guard(
+    sup: &Arc<ArmSupervisor>,
+    deps: &CalibrationDeps,
+    name: String,
+    auth: crate::calibration::ExecutorCalibAuth,
+    existing_guard: Option<crate::calibration::ExecutorTxnGuard>,
+) -> Result<Value, CalibError> {
+    let sup_w = Arc::clone(sup);
+    let deps_w = deps.clone();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let res = async move {
+            let guard = match existing_guard {
+                Some(g) => g,
+                None => match auth.txn_id {
+                    Some(id) => crate::calibration::ExecutorTxnGuard::new(Arc::clone(&sup_w), id),
+                    None => {
+                        if let Err((_, arm_err)) = (auth.auth_check)() {
+                            return Err(CalibError::from(arm_err));
+                        }
+                        let tid = crate::rt_core::requests::config::next_calibration_txn_id();
+                        let cfg_auth = crate::rt_core::requests::config::ConfigAuthContext {
+                            admission: auth.admission,
+                            lease_holder: auth.lease_holder,
+                        };
+                        let pre_g = crate::calibration::ExecutorTxnGuard::new(Arc::clone(&sup_w), tid);
+                        match sup_w
+                            .dispatch_config_request(
+                                crate::rt_core::requests::config::ConfigRequest::BeginCalibrationTxn {
+                                    txn_id: tid,
+                                    auth: cfg_auth,
+                                    operator_grant: auth.operator_grant,
+                                    expected_epoch: auth.admission.estop_epoch,
+                                    expected_stop_gen: auth.admission.stop_gen,
+                                    kind: crate::rt_core::requests::config::CalibrationTxnKind::JointZeroRestore,
+                                },
+                            )
+                            .await
+                        {
+                            Ok(crate::rt_core::requests::config::ConfigReply::CalibrationTxnBegan(Ok(_))) => {
+                                sup_w.published_config_hub().update(|cfg| {
+                                    cfg.calibration_busy = true;
+                                    cfg.calibration_txn_id = Some(tid);
+                                });
+                                pre_g
+                            }
+                            Ok(crate::rt_core::requests::config::ConfigReply::CalibrationTxnBegan(Err(e))) => {
+                                let _ = pre_g.disarm();
+                                return Err(crate::calibration::calib_error_from_config(e));
+                            }
+                            Err(e) => {
+                                pre_g.release().await;
+                                return Err(crate::calibration::calib_error_from_config(e));
+                            }
+                            _ => {
+                                pre_g.release().await;
+                                return Err(CalibError::new(500, "INTERNAL", "unexpected begin restore reply"));
+                            }
+                        }
+                    }
+                },
+            };
+            let txn_id = guard.txn_id();
+            let run_res = async {
+                let dir = deps_w.backup_dir.join(&name);
+                let name_c = name.clone();
+                let target: Option<crate::joint_zero::JointZero> = tokio::task::spawn_blocking(move || {
+                    let manifest: Value = std::fs::read_to_string(dir.join("manifest.json"))
+                        .ok()
+                        .and_then(|t| serde_json::from_str(&t).ok())
+                        .ok_or_else(|| {
+                            CalibError::new(
+                                404,
+                                "BACKUP_NOT_FOUND",
+                                format!("backup {name_c}: no manifest.json"),
+                            )
+                        })?;
+                    if manifest.get("reason").and_then(Value::as_str) != Some("software_zero") {
+                        return Err(invalid(format!("backup {name_c} is not a software zero backup")));
+                    }
+                    match crate::calibration::read_if_file(&dir.join("calibration.json")) {
+                        Ok(None) => Ok(None),
+                        Ok(Some(t)) => Ok(serde_json::from_str::<crate::calibration::CalibrationFile>(&t)
+                            .map_err(|e| invalid(format!("backup {name_c}: calibration.json: {e}")))?
+                            .joint_zero),
+                        Err(e) => Err(CalibError::new(
+                            500,
+                            "PERSIST_FAILED",
+                            format!("backup {name_c}: {e}"),
+                        )),
+                    }
+                })
+                .await
+                .map_err(|e| CalibError::new(500, "INTERNAL", format!("restore read task: {e}")))??;
+
+                let _ = sample_zero_state_executor(&sup_w, &auth, Some(txn_id), "restore", true, true).await?;
+                let pub_cfg = sup_w.published_config().await.map_err(CalibError::from)?;
+                if pub_cfg.has_driver {
+                    return Err(CalibError::new(
+                        409,
+                        "EXECUTOR_UNSUPPORTED",
+                        format!("{RESTORE_PATH} is not available while the RT executor owns the arm; use the legacy owner"),
+                    ));
+                }
+                let n = pub_cfg.config.dof;
+                let new = target.as_ref().map_or_else(|| vec![0.0; n], |z| z.offsets());
+                if let Some(z) = &target {
+                    z.validate(Some(n))
+                        .map_err(|e| invalid(format!("backup {name}: {e}")))?;
+                }
+                let old = pub_cfg.joint_zero_offsets.clone();
+                let backup = write_zero_backup_with_companions(
+                    &deps_w,
+                    "joint_zero_restore",
+                    &old,
+                    pub_cfg.poses.path.clone(),
+                    pub_cfg.gripper_calib_path.clone(),
+                )
+                .await
+                .map_err(|e| {
+                    CalibError::new(
+                        500,
+                        "PERSIST_FAILED",
+                        format!("backup: {e}; nothing was changed"),
+                    )
+                })?;
+                let joints: Vec<usize> = (0..new.len()).filter(|&j| old[j] != new[j]).collect();
+                let joints_one: Vec<usize> = joints.iter().map(|j| j + 1).collect();
+                let changes: Vec<f32> = joints.iter().map(|&j| old[j] - new[j]).collect();
+                let entry = Some(target.filter(|z| !z.is_zero()));
+                let (_outcome, inv) = commit_software_zero_via_worker(
+                    &sup_w,
+                    &deps_w,
+                    &auth,
+                    txn_id,
+                    &new,
+                    &joints_one,
+                    &changes,
+                    "restored",
+                    entry,
+                    &backup,
+                    "joint_zero_restore",
+                )
+                .await?;
+                tracing::warn!(
+                    "Joint zero restored from backup {name} (executor): offsets {old:?} -> {new:?} rad"
+                );
+                Ok(json!({
+                    "restored": name,
+                    "backup": backup.display().to_string(),
+                    "offsets_before": old,
+                    "offsets_after": new,
+                    "invalidated": inv,
+                }))
+            }
+            .await;
+            guard.release().await;
+            run_res
+        }
+        .await;
+        let _ = done_tx.send(res);
+    });
+    done_rx.await.unwrap_or_else(|e| {
+        tracing::error!("joint zero restore worker failed: {e}");
+        Err(CalibError::new(
+            500,
+            "INTERNAL",
+            "calibration task failed: channel closed; check GET /api/v1/calibration and the backups",
+        ))
+    })
 }

@@ -19,7 +19,7 @@
 
 use std::time::Duration;
 
-use crate::driver::{EnableState, JointMode, JointTarget, RangeCheckStatus};
+use crate::driver::{JointMode, JointTarget, RangeCheckStatus};
 use crate::model::{GravityCompExit, GravityCompObservation, GravityCompPolicy, ModeReason};
 use crate::motion::MotionError;
 use crate::safety::{FaultReason, SafetyError, SafetyState};
@@ -123,20 +123,17 @@ impl SupervisorInner {
         if !self.config.dynamics_qualified {
             return Err(reason("UNSUPPORTED", "Gravity compensation is disabled: active tool dynamics are unqualified"));
         }
-        if let Some(d) = &self.driver {
-            let support_res = d
-                .with_ref(|drv| {
-                    if !drv.supports_mit_mode_switch() {
-                        return Err(reason("UNSUPPORTED", "The driver cannot switch joints to MIT mode"));
-                    }
-                    let caps = drv.capabilities();
-                    if !caps.velocity_feedback || !caps.torque_feedback || !caps.enable_feedback {
-                        return Err(reason("UNSUPPORTED", "Gravity compensation needs velocity, torque and enable feedback"));
-                    }
-                    Ok(())
-                })
-                .unwrap_or_else(|| Err(reason("UNSUPPORTED", "driver lock poisoned")));
-            support_res?;
+        if self.driver.is_some() {
+            let Some(drv) = self.read_driver_for_tick() else {
+                return Err(reason("UNSUPPORTED", "driver lock unavailable"));
+            };
+            if !drv.supports_mit_mode_switch() {
+                return Err(reason("UNSUPPORTED", "The driver cannot switch joints to MIT mode"));
+            }
+            let caps = drv.capabilities();
+            if !caps.velocity_feedback || !caps.torque_feedback || !caps.enable_feedback {
+                return Err(reason("UNSUPPORTED", "Gravity compensation needs velocity, torque and enable feedback"));
+            }
         }
         Ok(())
     }
@@ -181,13 +178,11 @@ impl SupervisorInner {
         // MIT torque commands are only as right as the mapping ranges: require the
         // startup range check to have passed when the driver ran one.
         let mut blocked = None;
-        if let Some(d) = self.driver.as_ref() {
-            let _ = d.with_ref(|drv| {
-                drv.with_range_check(&mut |c| match c.map(|c| (c.status, c)) {
-                    Some((RangeCheckStatus::Mismatch, c)) => blocked = Some(reason("DRIVER_RANGE_MISMATCH", &c.message)),
-                    Some((RangeCheckStatus::Unverified, c)) => blocked = Some(reason("DRIVER_RANGE_UNVERIFIED", &c.message)),
-                    _ => {}
-                });
+        if let Some(drv) = self.read_driver_for_tick() {
+            drv.with_range_check(&mut |c| match c.map(|c| (c.status, c)) {
+                Some((RangeCheckStatus::Mismatch, c)) => blocked = Some(reason("DRIVER_RANGE_MISMATCH", &c.message)),
+                Some((RangeCheckStatus::Unverified, c)) => blocked = Some(reason("DRIVER_RANGE_UNVERIFIED", &c.message)),
+                _ => {}
             });
         }
         if blocked.is_some() { return blocked; }
@@ -525,7 +520,12 @@ impl SupervisorInner {
         nonblocking: bool,
     ) -> crate::supervisor::TickOutput {
         use crate::supervisor::TickOutput;
-        if !self.is_torqued || self.disable_pending { return TickOutput::None; }
+        if !self.is_torqued
+            || self.disable_pending
+            || self.torque_intent != crate::supervisor::TorqueIntent::On
+        {
+            return TickOutput::None;
+        }
         let Some(targets) = self.gravity_comp_targets_array() else { return TickOutput::None; };
         let is_hold = use_estop_hold
             || self.safety.state().is_stopped()
@@ -646,16 +646,11 @@ impl SupervisorInner {
             }
             _ => {}
         }
-        if !self.is_torqued || self.disable_pending {
+        if !self.is_torqued
+            || self.disable_pending
+            || self.torque_intent != crate::supervisor::TorqueIntent::On
+        {
             return Some(("TORQUE_LOST", HolderLabel::new("Torque is off")));
-        }
-        if let Some(d) = &self.driver {
-            let enabled = d
-                .with_ref(|drv| !drv.capabilities().enable_feedback || drv.enable_state() == EnableState::Enabled)
-                .unwrap_or(false);
-            if !enabled {
-                return Some(("TORQUE_LOST", HolderLabel::new("Motors no longer report enabled")));
-            }
         }
         if self.lease_enabled {
             if self.last_heartbeat.elapsed() > self.lease_timeout {

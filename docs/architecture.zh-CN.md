@@ -141,6 +141,7 @@ armd 不做推理，而是在自身端口下代理检测程序的 HTTP API，使
 | `torque_guard` | profile 开启 `torque_guard` 且有 `damiao_ranges`，驱动报告力矩：关节 |力矩| ≥ `ratio` × TMAX 持续 `persist_ms` 时停止运动（动作码 `TORQUE_LIMIT`，`motion_limit.reason` 为 `torque`）；策略见 `schema.torque_guard`（版本 8） |
 | `vision.detection_proxy` | 恒为 true：检测路由存在；不检查感知服务是否可达 |
 | `vision.mode_endpoint` | （字符串）恒为 `/api/v1/vision/mode` |
+| `vision.detector_switch` | 恒为 true：`POST /api/v1/vision/detector` 在默认 `detect` 与 `segment` 模型之间切换检测器（[检测接口](detection_api.md)） |
 | `vision.modes` | （列表）感知服务报告的模式；服务不可达或没有 `/api/mode` 时为空 |
 | `vision.mode` | （字符串或 null）当前基础模式 |
 | `vision.api_version` | （数字或 null）感知接口版本 |

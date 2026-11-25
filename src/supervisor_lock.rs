@@ -484,6 +484,12 @@ impl DriverLock {
     pub fn into_raw_mutex(self) -> std::sync::Mutex<Box<dyn crate::driver::ArmDriver>> {
         self.lock
     }
+
+    /// Borrows the underlying `std::sync::Mutex` (for legacy contention tests on a non-RT thread).
+    #[doc(hidden)]
+    pub fn raw_mutex(&self) -> &std::sync::Mutex<Box<dyn crate::driver::ArmDriver>> {
+        &self.lock
+    }
 }
 
 /// Single-thread-pinned wrapper for an exclusively owned `Box<dyn ArmDriver>`.
@@ -800,6 +806,16 @@ impl DriverSlot {
         }
     }
 
+    /// Non-blocking immutable guard: zero-lock reference in `Exclusive`,
+    /// guarded `DriverLock::try_lock()` in `Legacy` (`None` if contended or poisoned).
+    #[inline]
+    pub fn try_read(&self) -> Option<DriverReadGuard<'_>> {
+        match self {
+            Self::Exclusive(drv) => Some(DriverReadGuard::Exclusive(drv.get_ref())),
+            Self::Legacy(lock) => lock.try_lock().ok().map(DriverReadGuard::Legacy),
+        }
+    }
+
     /// Borrows the driver mutably as a guard: zero-lock mutable reference in `Exclusive`,
     /// guarded `DriverLock::lock()` in `Legacy` (`None` if poisoned).
     #[inline]
@@ -807,6 +823,16 @@ impl DriverSlot {
         match self {
             Self::Exclusive(drv) => Some(DriverWriteGuard::Exclusive(drv.get_mut())),
             Self::Legacy(lock) => lock.lock().ok().map(DriverWriteGuard::Legacy),
+        }
+    }
+
+    /// Non-blocking mutable guard: zero-lock mutable reference in `Exclusive`,
+    /// guarded `DriverLock::try_lock()` in `Legacy` (`None` if contended or poisoned).
+    #[inline]
+    pub fn try_write(&mut self) -> Option<DriverWriteGuard<'_>> {
+        match self {
+            Self::Exclusive(drv) => Some(DriverWriteGuard::Exclusive(drv.get_mut())),
+            Self::Legacy(lock) => lock.try_lock().ok().map(DriverWriteGuard::Legacy),
         }
     }
 }

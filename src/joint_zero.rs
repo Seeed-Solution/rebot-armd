@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::driver::{ArmDriver, ArmDriverError, JointMode, JointTarget};
+use crate::driver::{ArmDriver, ArmDriverError, DisableKind, JointMode, JointTarget, StoppedDisableGate};
 use crate::model::{DriverCapabilities, DriverRangeCheck, EnableState, JointState, MotorZeroSupport};
 
 /// Averaging window of the software zero.
@@ -94,11 +94,18 @@ pub struct ZeroOffsetDriver {
     offsets: Vec<f32>,
     /// Motor-side targets of the last write (reused: no allocation per write).
     motor_targets: Vec<JointTarget>,
+    /// Joint-space stopped-disable gate kept so offset updates re-shift `inner`'s motor-space rest pose.
+    stopped_disable_gate: Option<StoppedDisableGate>,
 }
 
 impl ZeroOffsetDriver {
     pub fn new(inner: Box<dyn ArmDriver>, offsets: &[f32]) -> Self {
-        Self { inner, offsets: offsets.to_vec(), motor_targets: Vec::with_capacity(offsets.len().max(8)) }
+        Self {
+            inner,
+            offsets: offsets.to_vec(),
+            motor_targets: Vec::with_capacity(offsets.len().max(8)),
+            stopped_disable_gate: None,
+        }
     }
 
     fn off(&self, i: usize) -> f32 { self.offsets.get(i).copied().unwrap_or(0.0) }
@@ -117,6 +124,37 @@ impl ZeroOffsetDriver {
 impl ArmDriver for ZeroOffsetDriver {
     fn capabilities(&self) -> DriverCapabilities { self.inner.capabilities() }
     fn enable_state(&self) -> EnableState { self.inner.enable_state() }
+    fn reported_torque_loss_sample_seq(&self) -> Option<u64> {
+        self.inner.reported_torque_loss_sample_seq()
+    }
+    fn has_driver_fresh_position_api(&self) -> bool {
+        self.inner.has_driver_fresh_position_api()
+    }
+    fn fresh_measured_position_for(&self, joint: usize, max_age: Duration) -> Option<f32> {
+        let mut pos = self.inner.fresh_measured_position_for(joint, max_age)?;
+        let o = self.off(joint);
+        if o != 0.0 {
+            pos -= o;
+        }
+        pos.is_finite().then_some(pos)
+    }
+    fn fresh_measured_sample_for(&self, joint: usize, max_age: Duration) -> Option<(f32, u64)> {
+        let (mut pos, epoch) = self.inner.fresh_measured_sample_for(joint, max_age)?;
+        let o = self.off(joint);
+        if o != 0.0 {
+            pos -= o;
+        }
+        pos.is_finite().then_some((pos, epoch))
+    }
+    fn joint_hold_mode_verified(&self, joint: usize) -> bool {
+        self.inner.joint_hold_mode_verified(joint)
+    }
+    fn request_mode_readback_budgeted(&mut self, unverified_mask: u64) -> bool {
+        self.inner.request_mode_readback_budgeted(unverified_mask)
+    }
+    fn drop_pending_holds_outside_mask(&mut self, hold_mask: u64) {
+        self.inner.drop_pending_holds_outside_mask(hold_mask);
+    }
     fn feedback_ages(&self) -> Vec<Option<Duration>> { self.inner.feedback_ages() }
     fn feedback_instants(&self) -> Vec<Option<Instant>> { self.inner.feedback_instants() }
     fn feedback_seqs(&self) -> Vec<u64> { self.inner.feedback_seqs() }
@@ -222,6 +260,26 @@ impl ArmDriver for ZeroOffsetDriver {
         self.motor_targets = m;
         r
     }
+    fn write_measured_hold_masked(
+        &mut self,
+        hold_mask: u64,
+        targets: &[JointTarget],
+    ) -> Result<crate::driver::HoldPassReport, ArmDriverError> {
+        if self.offsets.iter().all(|o| *o == 0.0) {
+            return self.inner.write_measured_hold_masked(hold_mask, targets);
+        }
+        let mut m = std::mem::take(&mut self.motor_targets);
+        m.clear();
+        m.extend(targets.iter().enumerate().map(|(i, t)| {
+            let o = self.off(i);
+            let mut t = t.clone(); // plain fields: no allocation
+            if o != 0.0 { t.position += o; }
+            t
+        }));
+        let r = self.inner.write_measured_hold_masked(hold_mask, &m);
+        self.motor_targets = m;
+        r
+    }
     fn set_external_pos_force_emitter(&mut self, enabled: bool) {
         self.inner.set_external_pos_force_emitter(enabled);
     }
@@ -272,9 +330,28 @@ impl ArmDriver for ZeroOffsetDriver {
         Some(pos - offset)
     }
     fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) { self.inner.feedback_ages_into(out) }
+    fn rest_pose_gate_status(&self) -> crate::driver::RestPoseGateStatus {
+        self.inner.rest_pose_gate_status()
+    }
+    fn supports_budgeted_disable_await(&self) -> bool {
+        self.inner.supports_budgeted_disable_await()
+    }
     fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool { self.inner.feedback_all_within(dof, max_age) }
-    fn feedback_joints_within(&self, joints: &[usize], max_age: Duration) -> bool {
-        self.inner.feedback_joints_within(joints, max_age)
+    fn feedback_joints_within(&self, joints: &[usize], max_age: Duration) -> bool { self.inner.feedback_joints_within(joints, max_age) }
+    fn fresh_joint_positions_into(&self, joints: &[usize], max_age: Duration, out: &mut [f32]) -> bool {
+        if !self.inner.fresh_joint_positions_into(joints, max_age, out) {
+            return false;
+        }
+        for (slot, &i) in out.iter_mut().zip(joints.iter()) {
+            let o = self.off(i);
+            if o != 0.0 {
+                *slot -= o;
+            }
+            if !slot.is_finite() {
+                return false;
+            }
+        }
+        true
     }
     fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) { self.inner.feedback_age_ms_into(out) }
     fn with_range_check(&self, f: &mut dyn FnMut(Option<&DriverRangeCheck>)) { self.inner.with_range_check(f) }
@@ -288,9 +365,16 @@ impl ArmDriver for ZeroOffsetDriver {
     fn clear_fault_disables_arm_joint(&self, arm_dof: usize) -> bool { self.inner.clear_fault_disables_arm_joint(arm_dof) }
     fn has_hardware_fault(&self) -> bool { self.inner.has_hardware_fault() }
     fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> { self.inner.set_torque(enabled) }
+    fn disable_torque(&mut self, kind: DisableKind) -> Result<(), ArmDriverError> { self.inner.disable_torque(kind) }
     fn begin_torque(&mut self, enabled: bool) -> Result<crate::driver::TorqueProgress, ArmDriverError> { self.inner.begin_torque(enabled) }
+    fn begin_disable_torque(&mut self, kind: DisableKind) -> Result<crate::driver::TorqueProgress, ArmDriverError> {
+        self.inner.begin_disable_torque(kind)
+    }
     fn begin_torque_budgeted(&mut self, enabled: bool, max_rx_frames: u16) -> Result<crate::driver::TorqueProgress, ArmDriverError> {
         self.inner.begin_torque_budgeted(enabled, max_rx_frames)
+    }
+    fn begin_disable_torque_budgeted(&mut self, kind: DisableKind, max_rx_frames: u16) -> Result<crate::driver::TorqueProgress, ArmDriverError> {
+        self.inner.begin_disable_torque_budgeted(kind, max_rx_frames)
     }
     fn begin_client_park_disable(
         &mut self,
@@ -299,12 +383,24 @@ impl ArmDriver for ZeroOffsetDriver {
     ) -> Result<crate::driver::TorqueProgress, ArmDriverError> {
         self.inner.begin_client_park_disable(max_rx_frames, expected_stop_gen)
     }
+    fn begin_client_park_disable_with_kind(
+        &mut self,
+        kind: DisableKind,
+        max_rx_frames: Option<u16>,
+        expected_stop_gen: Option<u64>,
+    ) -> Result<crate::driver::TorqueProgress, ArmDriverError> {
+        self.inner
+            .begin_client_park_disable_with_kind(kind, max_rx_frames, expected_stop_gen)
+    }
     fn poll_torque(&mut self, deadline: Instant) -> Result<crate::driver::TorqueProgress, ArmDriverError> { self.inner.poll_torque(deadline) }
     fn poll_torque_budgeted(&mut self, deadline: Instant, max_rx_frames: u16) -> Result<crate::driver::TorqueProgress, ArmDriverError> {
         self.inner.poll_torque_budgeted(deadline, max_rx_frames)
     }
     fn take_last_poll_rx(&mut self) -> Option<(u16, bool)> { self.inner.take_last_poll_rx() }
     fn torque_transition_pending(&self) -> bool { self.inner.torque_transition_pending() }
+    fn disable_frames_dispatched(&self) -> bool { self.inner.disable_frames_dispatched() }
+    fn disable_dispatched_mask(&self) -> u64 { self.inner.disable_dispatched_mask() }
+    fn finish_dispatched_disable(&mut self) -> Result<(), ArmDriverError> { self.inner.finish_dispatched_disable() }
     fn abort_enable(&mut self) { self.inner.abort_enable() }
     fn panic_disable_step(&mut self, first: bool, deadline: Instant) -> Option<Result<Vec<usize>, ArmDriverError>> {
         self.inner.panic_disable_step(first, deadline)
@@ -326,6 +422,11 @@ impl ArmDriver for ZeroOffsetDriver {
     fn set_abort_flag(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) { self.inner.set_abort_flag(flag) }
     fn set_estop_state(&mut self, state: std::sync::Arc<crate::rt_core::urgent::EstopState>) { self.inner.set_estop_state(state) }
     fn set_estop_gate(&mut self, gate: crate::rt_core::urgent::EstopGate) { self.inner.set_estop_gate(gate) }
+    fn set_stopped_disable_gate(&mut self, gate: StoppedDisableGate) {
+        let motor_gate = gate.with_motor_offsets(&self.offsets);
+        self.stopped_disable_gate = Some(gate);
+        self.inner.set_stopped_disable_gate(motor_gate);
+    }
     fn set_output_lease_gen(&mut self, lease_gen: u64) { self.inner.set_output_lease_gen(lease_gen) }
     fn set_gripper_index(&mut self, index: Option<usize>) { self.inner.set_gripper_index(index) }
     fn is_enabled(&self) -> bool { self.inner.is_enabled() }
@@ -360,7 +461,12 @@ impl ArmDriver for ZeroOffsetDriver {
     fn range_check(&self) -> Option<DriverRangeCheck> { self.inner.range_check() }
     fn motor_zero_support(&self) -> MotorZeroSupport { self.inner.motor_zero_support() }
     fn set_zero_position(&mut self, joint: usize) -> Result<(), ArmDriverError> { self.inner.set_zero_position(joint) }
-    fn set_joint_zero_offsets(&mut self, offsets: &[f32]) { self.offsets = offsets.to_vec(); }
+    fn set_joint_zero_offsets(&mut self, offsets: &[f32]) {
+        self.offsets = offsets.to_vec();
+        if let Some(ref gate) = self.stopped_disable_gate {
+            self.inner.set_stopped_disable_gate(gate.with_motor_offsets(&self.offsets));
+        }
+    }
     fn joint_zero_offsets(&self) -> Option<Vec<f32>> { Some(self.offsets.clone()) }
     fn take_recovery_writes(&mut self) -> Vec<usize> { self.inner.take_recovery_writes() }
     fn set_strict_mode_handover(&mut self, strict: bool) { self.inner.set_strict_mode_handover(strict) }
@@ -371,6 +477,7 @@ impl ArmDriver for ZeroOffsetDriver {
         }
     }
     fn set_mit_deadline_fence(&mut self, deadline: Option<Duration>, holdoff: Duration) { self.inner.set_mit_deadline_fence(deadline, holdoff) }
+    fn set_mit_ownership_lost(&mut self, lost: bool) { self.inner.set_mit_ownership_lost(lost) }
     fn mit_fence_trip(&self) -> Option<String> { self.inner.mit_fence_trip() }
     fn mit_fence_trip_bounded(
         &self,
@@ -378,6 +485,7 @@ impl ArmDriver for ZeroOffsetDriver {
         self.inner.mit_fence_trip_bounded()
     }
     fn clock_now(&self) -> std::time::Instant { self.inner.clock_now() }
+    fn begin_control_release(&mut self, release_seq: u64) { self.inner.begin_control_release(release_seq) }
     fn driver_clock(&self) -> Option<std::sync::Arc<dyn crate::transport::DriverClock>> {
         self.inner.driver_clock()
     }

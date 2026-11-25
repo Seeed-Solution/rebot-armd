@@ -98,6 +98,7 @@ pub fn parse_state(bytes: &[u8], dof: usize) -> Option<SimState> {
 struct Shared {
     latest: Option<SimState>,
     received_at: Option<Instant>,
+    continuity_epoch: u64,
 }
 
 /// Opaque test handle allowing another thread to hold `SimArmDriver`'s internal RX mutex
@@ -148,7 +149,10 @@ struct SimCommandRef<'a> {
     seq: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     enable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     targets: Option<&'a [SimTarget]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hold_targets: Option<&'a [Option<SimTarget>]>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -158,8 +162,11 @@ enum SendGate {
     Target,
     /// Enable command: inhibited whenever E-stop is latched or pending.
     Enable,
-    /// Disable command: never inhibited by E-stop.
-    Disable,
+    /// Requested disable command: unconditionally subject to the rest-pose gate and 1 s request
+    /// lifetime in every safety state (operational and stopped alike).
+    DisableRequested { started_at: Instant },
+    /// Protective disable command (`Thermal`, `ProcessExit`): never refused.
+    DisableProtective { reason: crate::driver::DisableProtectiveReason },
 }
 
 pub struct SimArmDriver {
@@ -187,9 +194,11 @@ pub struct SimArmDriver {
     cached_ack: u64,
     cached_enabled: bool,
     cached_received_at: Option<Instant>,
+    cached_continuity_epoch: u64,
     cached_has_state: bool,
-    /// Preallocated outbound target scratch, JSON serialization buffer, and RT poll keepalive (0 alloc).
+    /// Preallocated outbound target scratch, sparse hold scratch, JSON serialization buffer, and RT poll keepalive (0 alloc).
     cmd_targets: Vec<SimTarget>,
+    cmd_hold_targets: Vec<Option<SimTarget>>,
     tx_buf: Vec<u8>,
     keepalive_bytes: Vec<u8>,
     load_only_feedback: bool,
@@ -204,6 +213,10 @@ pub struct SimArmDriver {
     estop_state: Option<Arc<crate::rt_core::urgent::EstopState>>,
     /// Pending-E-stop gate checked immediately before target and enable sends.
     estop_gate: Option<crate::rt_core::urgent::EstopGate>,
+    /// Supervisor-injected stopped-disable gate enforced at send time for `DisableRequested`.
+    stopped_disable_gate: Option<crate::driver::StoppedDisableGate>,
+    /// Optional RT release cutoff deadline enforced right before UDP submission.
+    tx_release_deadline: Option<Instant>,
     /// Deterministic test hook invoked inside `send_ref` strictly after JSON serialization and
     /// immediately before the final E-stop send gate and socket transmit.
     before_send_hook: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -272,8 +285,10 @@ impl SimArmDriver {
             cached_ack: 0,
             cached_enabled: false,
             cached_received_at: None,
+            cached_continuity_epoch: 0,
             cached_has_state: false,
             cmd_targets: Vec::with_capacity(dof),
+            cmd_hold_targets: Vec::with_capacity(dof),
             tx_buf: Vec::with_capacity(1024),
             keepalive_bytes,
             load_only_feedback: false,
@@ -282,6 +297,8 @@ impl SimArmDriver {
             abort_flag: None,
             estop_state: None,
             estop_gate: None,
+            stopped_disable_gate: None,
+            tx_release_deadline: None,
             before_send_hook: None,
         })
     }
@@ -369,7 +386,48 @@ impl SimArmDriver {
         Ok(())
     }
 
-    fn send_ref(&mut self, with_targets: bool, enable: Option<bool>, gate: SendGate) -> Result<u64, ArmDriverError> {
+    /// Enforces the rest-pose gate and single 1 s request lifetime at send time for EVERY
+    /// `DisableRequested` in every safety state (operational and stopped alike), reading
+    /// timestamp & positions from the same coherent simulator feedback packet. Zero heap allocations.
+    fn check_stopped_disable_requested(&self, started_at: Instant) -> Result<(), ArmDriverError> {
+        if Instant::now().saturating_duration_since(started_at)
+            >= crate::driver::STOPPED_DISABLE_REQUEST_LIFETIME
+        {
+            return Err(ArmDriverError::DisableRequestExpired);
+        }
+        let Some(ref gate) = self.stopped_disable_gate else {
+            return Err(ArmDriverError::TorqueOffWouldDrop);
+        };
+        let arm_joints = gate.arm_joint_indices();
+        let mut arm_positions = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
+        if !self.fresh_joint_positions_into(
+            arm_joints,
+            crate::driver::STOPPED_DISABLE_FEEDBACK_MAX_AGE,
+            &mut arm_positions[..arm_joints.len()],
+        ) {
+            return Err(ArmDriverError::TorqueOffWouldDrop);
+        }
+        if !gate.check_positions(&arm_positions[..arm_joints.len()]) {
+            return Err(ArmDriverError::TorqueOffWouldDrop);
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn current_stop_stamp(&self) -> (u64, u64) {
+        self.estop_gate
+            .as_ref()
+            .map_or((0, 0), crate::rt_core::urgent::EstopGate::generations)
+    }
+
+    fn send_ref(
+        &mut self,
+        with_targets: bool,
+        with_hold_targets: bool,
+        enable: Option<bool>,
+        gate: SendGate,
+        expected_stamp: Option<(u64, u64)>,
+    ) -> Result<u64, ArmDriverError> {
         let next_seq = self.seq + 1;
         let cmd = SimCommandRef {
             v: PROTOCOL_VERSION,
@@ -377,19 +435,45 @@ impl SimArmDriver {
             seq: next_seq,
             enable,
             targets: with_targets.then_some(self.cmd_targets.as_slice()),
+            hold_targets: with_hold_targets.then_some(self.cmd_hold_targets.as_slice()),
         };
         self.tx_buf.clear();
         let serialized = serde_json::to_writer(&mut self.tx_buf, &cmd).is_ok();
         if let Some(hook) = self.before_send_hook.as_ref() {
             hook();
         }
-        // Final pending-E-stop gate right before the socket send.
+        // Final send-time release cutoff, stop-generation stamp, and Rule A′ gate right before
+        // the socket send.
         match gate {
-            SendGate::Target => self.estop_check()?,
-            SendGate::Enable => self.enable_estop_inhibited()?,
-            SendGate::Disable => {}
+            SendGate::Target => {
+                if self.tx_release_deadline.is_some_and(|dl| Instant::now() >= dl) {
+                    return Err(ArmDriverError::Transport(crate::transport::TransportError::Timeout));
+                }
+                self.estop_check()?;
+                if expected_stamp.is_some_and(|s| self.current_stop_stamp() != s) {
+                    return Err(ArmDriverError::EstopInhibited);
+                }
+            }
+            SendGate::Enable => {
+                if self.tx_release_deadline.is_some_and(|dl| Instant::now() >= dl) {
+                    return Err(ArmDriverError::Transport(crate::transport::TransportError::Timeout));
+                }
+                self.enable_estop_inhibited()?;
+                if expected_stamp.is_some_and(|s| self.current_stop_stamp() != s) {
+                    return Err(ArmDriverError::EstopInhibited);
+                }
+            }
+            SendGate::DisableRequested { started_at } => {
+                self.check_stopped_disable_requested(started_at)?;
+            }
+            SendGate::DisableProtective { .. } => {}
         }
         self.seq = next_seq;
+        // Invalidate torque evidence BEFORE any torque-changing write that could reach the
+        // simulator (deferred/refused writes exited above and left `enable_seq` intact).
+        if enable.is_some() {
+            self.enable_seq = next_seq;
+        }
         if serialized {
             // A lost datagram is equivalent to a lost CAN frame: the missing feedback,
             // not the write error, is what the supervisor acts on (BUS_LOSS).
@@ -426,6 +510,7 @@ impl SimArmDriver {
                 self.cached_ack = state.ack;
                 self.cached_enabled = state.enabled;
                 self.cached_received_at = s.received_at;
+                self.cached_continuity_epoch = s.continuity_epoch;
                 self.cached_has_state = true;
                 self.cached_torques.clear();
                 self.cached_torques.extend_from_slice(&state.tau);
@@ -540,8 +625,16 @@ fn receiver_loop(
                 // Same session: drop duplicates and reordered datagrams. A new session
                 // (simulator restart) starts a new sequence.
                 Some(state) if s.latest.as_ref().is_none_or(|l| l.session != state.session || state.seq > l.seq) => {
+                    let now = Instant::now();
+                    let gap_broken = s.latest.as_ref().is_some_and(|l| l.session != state.session)
+                        || s.received_at.is_none_or(|prev| {
+                            now.saturating_duration_since(prev) > crate::driver::STOPPED_DISABLE_FEEDBACK_MAX_AGE
+                        });
+                    if gap_broken {
+                        s.continuity_epoch = s.continuity_epoch.wrapping_add(1);
+                    }
                     let prev = s.latest.replace(state);
-                    s.received_at = Some(Instant::now());
+                    s.received_at = Some(now);
                     prev
                 }
                 _ => {
@@ -588,6 +681,24 @@ impl ArmDriver for SimArmDriver {
         }
     }
 
+    fn has_driver_fresh_position_api(&self) -> bool { true }
+
+    fn fresh_measured_position_for(&self, joint: usize, max_age: Duration) -> Option<f32> {
+        let mut pos = [0.0f32; 1];
+        self.fresh_joint_positions_into(&[joint], max_age, &mut pos)
+            .then_some(pos[0])
+    }
+
+    fn fresh_measured_sample_for(&self, joint: usize, max_age: Duration) -> Option<(f32, u64)> {
+        let pos = self.fresh_measured_position_for(joint, max_age)?;
+        let epoch = if self.rt_mode.load(Ordering::Relaxed) {
+            self.cached_continuity_epoch
+        } else {
+            self.shared.lock().map_or(self.cached_continuity_epoch, |s| s.continuity_epoch)
+        };
+        Some((pos, epoch))
+    }
+
     fn feedback_ages(&self) -> Vec<Option<Duration>> {
         let age = self.rx_metadata().1.map(|t| t.elapsed());
         vec![age; self.dof]
@@ -599,8 +710,72 @@ impl ArmDriver for SimArmDriver {
     }
 
     fn feedback_joints_within(&self, joints: &[usize], max_age: Duration) -> bool {
-        joints.iter().all(|&j| j < self.dof)
-            && self.rx_metadata().1.map(|t| t.elapsed()).is_some_and(|age| age <= max_age)
+        if joints.iter().any(|&i| i >= self.dof) { return false; }
+        self.rx_metadata().1.map(|t| t.elapsed()).is_some_and(|age| age <= max_age)
+    }
+
+    fn fresh_joint_positions_into(
+        &self,
+        joints: &[usize],
+        max_age: Duration,
+        out: &mut [f32],
+    ) -> bool {
+        if joints.is_empty() || out.len() < joints.len() || joints.iter().any(|&i| i >= self.dof) {
+            return false;
+        }
+        let caps = self.capabilities();
+        // Always read BOTH timestamp and joint states from the receiver's latest coherent packet
+        // so the send gate never acts on a superseded owner-local pose when `armd-sim-rx` already
+        // holds a newer (e.g. raised) pose. In RT mode use strictly non-blocking `try_lock()` and
+        // fail closed if contended (zero allocation, zero blocking).
+        let s = if self.rt_mode.load(Ordering::Relaxed) {
+            match self.shared.try_lock() {
+                Ok(g) => g,
+                Err(_) => return false,
+            }
+        } else {
+            match self.shared.lock() {
+                Ok(g) => g,
+                Err(_) => return false,
+            }
+        };
+        if !s.received_at.is_some_and(|t| t.elapsed() <= max_age) {
+            return false;
+        }
+        let Some(ref state) = s.latest else {
+            return false;
+        };
+        let off = self.zero_offsets.as_deref();
+        for (slot, &i) in out.iter_mut().zip(joints.iter()) {
+            let (Some(&raw_q), Some(&dq), Some(&tau), Some(&temp)) = (
+                state.q.get(i),
+                state.dq.get(i),
+                state.tau.get(i),
+                state.temp.get(i),
+            ) else {
+                return false;
+            };
+            let js = JointState {
+                position: off.map_or(raw_q, |o| raw_q - o[i]),
+                velocity: dq,
+                torque: if self.load_only_feedback { 0.0 } else { tau },
+                temperature: temp,
+            };
+            if !crate::driver::joint_state_valid(&js, caps) {
+                return false;
+            }
+            if caps.load_feedback {
+                let load_ok = match state.loads.as_ref() {
+                    Some(loads) if loads.len() == self.dof => loads.get(i).is_some_and(|l| l.is_finite()),
+                    _ => tau.is_finite(),
+                };
+                if !load_ok {
+                    return false;
+                }
+            }
+            *slot = js.position;
+        }
+        true
     }
 
     fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
@@ -713,6 +888,101 @@ impl ArmDriver for SimArmDriver {
         }
     }
 
+    fn write_estop_hold(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
+        let n = self.dof.min(64);
+        let mask = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+        self.write_measured_hold_masked(mask, targets).map(|_| ())
+    }
+
+    fn write_estop_hold_bounded(&mut self, targets: &[JointTarget]) -> Result<crate::driver::TxBatchOutcome, ArmDriverError> {
+        let n = self.dof.min(64);
+        let mask = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+        self.write_measured_hold_masked(mask, targets).map(|r| r.outcome)
+    }
+
+    fn write_measured_hold_masked(
+        &mut self,
+        hold_mask: u64,
+        targets: &[JointTarget],
+    ) -> Result<crate::driver::HoldPassReport, ArmDriverError> {
+        use crate::driver::{HoldPassReport, JointHoldStatus};
+        if self.torque_hs.is_some() {
+            return Err(ArmDriverError::Protocol("torque transition pending: no hold before its confirmation".into()));
+        }
+        if targets.len() != self.dof {
+            return Err(ArmDriverError::JointCountMismatch { expected: self.dof, actual: targets.len() });
+        }
+        let dof = self.dof.min(crate::rt_core::mailbox::MAX_DOF);
+        let mut report = HoldPassReport::empty(dof);
+        let mut held_mask = 0u64;
+        let mut stale_mask = 0u64;
+        let mut hold_pos = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
+        for (i, target) in targets.iter().enumerate().take(dof) {
+            let fresh = self.fresh_measured_position_for(i, crate::driver::STOPPED_DISABLE_FEEDBACK_MAX_AGE);
+            if (hold_mask & (1u64 << i)) == 0 {
+                report.joint_status[i] = if fresh.is_none() {
+                    JointHoldStatus::UnheldNoFreshFeedback
+                } else {
+                    JointHoldStatus::SkippedOff
+                };
+                continue;
+            }
+            if target.position.is_finite() {
+                hold_pos[i] = target.position;
+            } else if let Some(fresh_p) = fresh {
+                hold_pos[i] = fresh_p;
+            } else {
+                report.joint_status[i] = JointHoldStatus::UnheldNoFreshFeedback;
+                continue;
+            }
+            if fresh.is_none() {
+                stale_mask |= 1u64 << i;
+                report.joint_status[i] = JointHoldStatus::HeldStaleTarget;
+            } else {
+                report.joint_status[i] = JointHoldStatus::Queued;
+            }
+            held_mask |= 1u64 << i;
+        }
+        if held_mask == 0 {
+            return Ok(report);
+        }
+        let start_stamp = self.current_stop_stamp();
+        self.estop_check()?;
+        let off = self.zero_offsets.as_deref();
+        self.cmd_hold_targets.clear();
+        self.cmd_hold_targets.extend(targets.iter().zip(&self.modes).enumerate().map(|(i, (t, mode))| {
+            if i >= dof || (held_mask & (1u64 << i)) == 0 {
+                return None;
+            }
+            let q_joint = hold_pos[i];
+            let q = off.map_or(q_joint, |o| q_joint + o[i]);
+            Some(match mode {
+                JointMode::Position => SimTarget::PosVel { q, vlim: POS_VEL_VLIM },
+                JointMode::Mit => SimTarget::Mit {
+                    q,
+                    dq: 0.0,
+                    kp: t.kp.unwrap_or(0.0),
+                    kd: t.kd.unwrap_or(0.0),
+                    tau: t.torque.filter(|v| v.is_finite()).unwrap_or(0.0),
+                },
+            })
+        }));
+        // Sparse `hold_targets` with `enable: None` leaves excluded actuators untouched and
+        // guarantees zero enable or mode-switch side effect.
+        self.send_ref(false, true, None, SendGate::Target, Some(start_stamp))?;
+        for i in 0..dof {
+            if (held_mask & (1u64 << i)) != 0 {
+                report.joint_status[i] = if (stale_mask & (1u64 << i)) != 0 {
+                    JointHoldStatus::HeldStaleTarget
+                } else {
+                    JointHoldStatus::Held
+                };
+            }
+        }
+        report.sent_any = true;
+        Ok(report)
+    }
+
     fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
         if self.torque_hs.is_some() {
             return Err(ArmDriverError::Protocol("torque transition pending: no target before its confirmation".into()));
@@ -720,6 +990,7 @@ impl ArmDriver for SimArmDriver {
         if targets.len() != self.dof {
             return Err(ArmDriverError::JointCountMismatch { expected: self.dof, actual: targets.len() });
         }
+        let start_stamp = self.current_stop_stamp();
         self.estop_check()?;
         let off = self.zero_offsets.as_deref();
         self.cmd_targets.clear();
@@ -735,21 +1006,41 @@ impl ArmDriver for SimArmDriver {
         }));
         // Target packets omit `enable` so they preserve the peer's torque state; torque changes
         // go exclusively through explicit enable/disable commands (`begin_torque`).
-        self.send_ref(true, None, SendGate::Target)?;
+        self.send_ref(true, false, None, SendGate::Target, Some(start_stamp))?;
         Ok(())
     }
 
     /// Blocking: [`ArmDriver::begin_torque`], then served every 1 ms until it finishes. An
     /// unacknowledged disable returns Ok (the caller checks the enable state).
     fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> {
-        let mut progress = self.begin_torque(enabled)?;
+        if enabled {
+            let mut progress = self.begin_torque(true)?;
+            loop {
+                match progress {
+                    TorqueProgress::Done(_) => return Ok(()),
+                    TorqueProgress::Pending { .. } => {}
+                }
+                progress = self.poll_torque(Instant::now())?;
+                if matches!(progress, TorqueProgress::Pending { .. }) { std::thread::sleep(Duration::from_millis(1)); }
+            }
+        } else {
+            self.disable_torque(crate::driver::DisableKind::DisableRequested {
+                started_at: Instant::now(),
+            })
+        }
+    }
+
+    fn disable_torque(&mut self, kind: crate::driver::DisableKind) -> Result<(), ArmDriverError> {
+        let mut progress = self.begin_disable_torque(kind)?;
         loop {
             match progress {
                 TorqueProgress::Done(_) => return Ok(()),
                 TorqueProgress::Pending { .. } => {}
             }
             progress = self.poll_torque(Instant::now())?;
-            if matches!(progress, TorqueProgress::Pending { .. }) { std::thread::sleep(Duration::from_millis(1)); }
+            if matches!(progress, TorqueProgress::Pending { .. }) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
     }
 
@@ -757,20 +1048,48 @@ impl ArmDriver for SimArmDriver {
     /// with `ack >= seq` and the requested `enabled`) is awaited until the deadline. A disable
     /// replaces a pending enable.
     fn begin_torque(&mut self, enabled: bool) -> Result<TorqueProgress, ArmDriverError> {
-        if enabled && self.torque_hs.is_some() {
-            return Err(ArmDriverError::Protocol("a torque transition is pending".into()));
-        }
         if enabled {
+            if self.torque_hs.is_some() {
+                return Err(ArmDriverError::Protocol("a torque transition is pending".into()));
+            }
+            let start_stamp = self.current_stop_stamp();
             self.enable_estop_inhibited()?;
+            let seq = self.send_ref(false, false, Some(true), SendGate::Enable, Some(start_stamp))?;
+            self.enable_requested = true;
+            self.enable_seq = seq;
+            let now = Instant::now();
+            self.torque_hs = Some((true, Deadline::after(now, ENABLE_CONFIRM_TIMEOUT)));
+            Ok(TorqueProgress::Pending { wake: now })
+        } else {
+            self.begin_disable_torque(crate::driver::DisableKind::DisableRequested {
+                started_at: Instant::now(),
+            })
         }
-        let gate = if enabled { SendGate::Enable } else { SendGate::Disable };
-        let seq = self.send_ref(false, Some(enabled), gate)?;
-        self.enable_requested = enabled;
+    }
+
+    fn begin_disable_torque(&mut self, kind: crate::driver::DisableKind) -> Result<TorqueProgress, ArmDriverError> {
+        let gate = match kind {
+            crate::driver::DisableKind::DisableRequested { started_at } => {
+                SendGate::DisableRequested { started_at }
+            }
+            crate::driver::DisableKind::DisableProtective { reason } => {
+                SendGate::DisableProtective { reason }
+            }
+        };
+        let seq = self.send_ref(false, false, Some(false), gate, None)?;
+        self.enable_requested = false;
         self.enable_seq = seq;
-        let timeout = if enabled { ENABLE_CONFIRM_TIMEOUT } else { DISABLE_CONFIRM_TIMEOUT };
         let now = Instant::now();
-        self.torque_hs = Some((enabled, Deadline::after(now, timeout)));
+        self.torque_hs = Some((false, Deadline::after(now, DISABLE_CONFIRM_TIMEOUT)));
         Ok(TorqueProgress::Pending { wake: now })
+    }
+
+    fn begin_disable_torque_budgeted(
+        &mut self,
+        kind: crate::driver::DisableKind,
+        _max_rx_frames: u16,
+    ) -> Result<TorqueProgress, ArmDriverError> {
+        self.begin_disable_torque(kind)
     }
 
     /// No receive pass (the receiver thread fills the cache): `_deadline` bounds nothing.
@@ -804,6 +1123,7 @@ impl ArmDriver for SimArmDriver {
     }
 
     fn torque_transition_pending(&self) -> bool { self.torque_hs.is_some() }
+    fn disable_frames_dispatched(&self) -> bool { matches!(self.torque_hs, Some((false, _))) }
 
     fn abort_enable(&mut self) {
         if matches!(self.torque_hs, Some((true, _))) {
@@ -855,6 +1175,14 @@ impl ArmDriver for SimArmDriver {
     fn set_estop_state(&mut self, state: Arc<crate::rt_core::urgent::EstopState>) { self.estop_state = Some(state); }
 
     fn set_estop_gate(&mut self, gate: crate::rt_core::urgent::EstopGate) { self.estop_gate = Some(gate); }
+
+    fn set_stopped_disable_gate(&mut self, gate: crate::driver::StoppedDisableGate) {
+        self.stopped_disable_gate = Some(gate);
+    }
+
+    fn set_tx_release_deadline(&mut self, deadline: Option<Instant>) {
+        self.tx_release_deadline = deadline;
+    }
 
     fn supports_mit_mode_switch(&self) -> bool { true }
 
@@ -1058,5 +1386,124 @@ mod tests {
         let mut peer = Peer::new();
         let _drv = SimArmDriver::connect(&peer.addr(), 3).unwrap();
         assert_eq!(peer.recv().kind, "poll");
+    }
+
+    #[test]
+    fn fresh_joint_positions_reads_timestamp_and_positions_from_same_packet() {
+        let mut peer = Peer::new();
+        let mut drv = SimArmDriver::connect(&peer.addr(), 3).unwrap();
+        // Packet 1: rest pose (q0 = 0.0), synced into owner-local `self.cached`.
+        peer.send_state(1, 1, 0, true, 0.0);
+        settle();
+        assert_eq!(drv.read_joint_states().unwrap()[0].position, 0.0);
+
+        // Packet 2: raised pose (q0 = 0.45), received on the background thread WITHOUT calling
+        // `read_joint_states()` again so `self.cached` still holds 0.0.
+        peer.send_state(1, 2, 0, true, 0.45);
+        settle();
+        assert_eq!(drv.cached[0].position, 0.0, "owner cache must still hold packet 1");
+
+        // Legacy mode MUST read BOTH timestamp and position from packet 2 (0.45), never 0.0.
+        let mut out = [0.0f32; 2];
+        assert!(drv.fresh_joint_positions_into(&[0, 1], Duration::from_millis(200), &mut out));
+        assert!((out[0] - 0.45).abs() < 1e-5, "expected packet 2 position 0.45, got {}", out[0]);
+
+        // RT mode MUST also read BOTH timestamp and position from the receiver's latest packet
+        // (packet 2, 0.45), never the superseded owner cache (packet 1, 0.0).
+        drv.set_rt_mode(true);
+        let mut out_rt = [0.0f32; 2];
+        assert!(drv.fresh_joint_positions_into(&[0, 1], Duration::from_millis(200), &mut out_rt));
+        assert!(
+            (out_rt[0] - 0.45).abs() < 1e-5,
+            "RT mode must read receiver's latest packet 2 (0.45), not superseded cache (0.0); got {}",
+            out_rt[0]
+        );
+
+        // Stale receiver timestamp in RT mode is refused even if owner cache looks fresh.
+        drv.cached_received_at = Some(Instant::now());
+        drv.shared.lock().unwrap().received_at = Some(Instant::now() - Duration::from_millis(500));
+        assert!(
+            !drv.fresh_joint_positions_into(&[0, 1], Duration::from_millis(100), &mut out_rt),
+            "stale receiver packet timestamp in RT mode must be refused"
+        );
+    }
+
+    #[test]
+    fn rt_sim_send_gate_reads_latest_receiver_packet_and_fails_closed_when_contended() {
+        let mut peer = Peer::new();
+        let mut drv = SimArmDriver::connect(&peer.addr(), 3).unwrap();
+        let mut arm_joints = [0usize; crate::rt_core::mailbox::MAX_DOF];
+        arm_joints[0] = 0;
+        arm_joints[1] = 1;
+        arm_joints[2] = 2;
+        drv.set_stopped_disable_gate(crate::driver::StoppedDisableGate {
+            safety_stopped: Arc::new(AtomicBool::new(true)),
+            has_resting_pose: true,
+            arm_joints,
+            arm_joints_len: 3,
+            rest_positions: [0.0, 0.1, 0.2, 0.0, 0.0, 0.0, 0.0, 0.0],
+            rest_pose_tolerance_rad: 0.05,
+        });
+        // 1. Packet 1: at rest (`q = [0.0, 0.1, 0.2]`), let peer discover armd's UDP port via
+        //    initial poll, then switch into RT mode and sync into owner-local cache.
+        peer.send_state(1, 1, 0, true, 0.0);
+        settle();
+        drv.set_rt_mode(true);
+        let mut states = Vec::with_capacity(3);
+        drv.read_joint_states_budgeted(&mut states, Instant::now() + Duration::from_millis(5), 64)
+            .unwrap();
+        assert!((drv.cached[0].position - 0.0).abs() < 1e-5);
+
+        // Drain any initial keepalive polls from peer.
+        peer.socket.set_read_timeout(Some(Duration::from_millis(25))).unwrap();
+        let mut drain_buf = [0u8; 4096];
+        while peer.socket.recv(&mut drain_buf).is_ok() {}
+
+        // 2. Packet 2: newer RAISED pose (`q0 = 0.50`) arrives at receiver WITHOUT calling
+        //    `read_joint_states` so `self.cached` still holds the superseded rest pose (`0.0`)!
+        peer.send_state(1, 2, 0, true, 0.50);
+        settle();
+        assert!((drv.cached[0].position - 0.0).abs() < 1e-5, "owner cache still holds superseded rest pose");
+
+        let res_raised = drv.begin_disable_torque(crate::driver::DisableKind::DisableRequested {
+            started_at: Instant::now(),
+        });
+        assert!(
+            matches!(res_raised, Err(ArmDriverError::TorqueOffWouldDrop)),
+            "RT sim send gate must refuse using receiver's newer raised pose, got {res_raised:?}"
+        );
+        // Verify zero UDP `cmd` datagrams reached the simulator peer.
+        while let Ok(n) = peer.socket.recv(&mut drain_buf) {
+            if let Ok(cmd) = serde_json::from_slice::<SimCommand>(&drain_buf[..n]) {
+                assert_ne!(cmd.kind, "cmd", "unexpected cmd datagram transmitted on raised pose: {cmd:?}");
+            }
+        }
+
+        // 3. Packet 3 returns to rest (`q0 = 0.0`), but receiver mutex is contended -> RT send
+        //    gate must NOT block and must fail closed (`TorqueOffWouldDrop`, 0 cmd datagrams).
+        peer.send_state(1, 3, 0, true, 0.0);
+        settle();
+        let lock = drv.test_rx_lock_handle();
+        let _held = lock.lock();
+        let t0 = Instant::now();
+        let res_contended = drv.begin_disable_torque(crate::driver::DisableKind::DisableRequested {
+            started_at: Instant::now(),
+        });
+        let elapsed = t0.elapsed();
+        drop(_held);
+        assert!(
+            matches!(res_contended, Err(ArmDriverError::TorqueOffWouldDrop)),
+            "contended RT receiver lock must fail closed, got {res_contended:?}"
+        );
+        assert!(elapsed < Duration::from_millis(10), "contended RT send gate blocked: {elapsed:?}");
+
+        // 4. Uncontended at rest (packet 3) -> succeeds and transmits enable=false!
+        drv.begin_disable_torque(crate::driver::DisableKind::DisableRequested {
+            started_at: Instant::now(),
+        })
+        .expect("uncontended fresh rest pose in RT mode must transmit disable");
+        peer.socket.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        let cmd = peer.recv_kind("cmd");
+        assert_eq!(cmd.enable, Some(false));
     }
 }

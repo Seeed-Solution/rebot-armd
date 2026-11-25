@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -302,6 +302,19 @@ pub enum SafetyError {
 
     #[error("Motion forbidden in fault/estop state: {0}")]
     MotionForbiddenInFaultState(String),
+
+    #[error("{message}")]
+    TorqueOffWouldDrop {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        joint: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        position: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rest: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        message: String,
+    },
 
     #[error("Arm is coming to a safe stop from previous session; motion gate locked")]
     HandoverSettling,
@@ -1297,6 +1310,10 @@ pub struct ClearContext {
     pub lease_heartbeat_fresh: bool,
     pub joint_limit_violation: Option<JointLimitClearViolation>,
     pub enable_state_known: bool,
+    /// Explicit recovery admission for `FailedHold` (`ENABLE_FAILED`) on drivers with enable
+    /// feedback when per-motor evidence remains `Unknown` after a failed/interrupted enable:
+    /// keeps `enable_state_known` truthful for all other checks while allowing operator recovery.
+    pub failed_hold_recovery_allowed: bool,
     /// True when the driver reports a latched motor fault bit that requires a motor reset
     /// before it can clear. `clear_check` permits this reset ONLY after every OTHER recorded
     /// kind's condition has passed, returning [`ClearRefusal::HardwareResetRequired`].
@@ -1336,6 +1353,7 @@ impl ClearContext {
             lease_heartbeat_fresh: true,
             joint_limit_violation: None,
             enable_state_known: true,
+            failed_hold_recovery_allowed: false,
             hardware_reset_required: false,
             hardware_reset_sent: false,
             hardware_error: None,
@@ -1354,6 +1372,13 @@ pub enum ClearFaultError {
     EStopActive,
     EpochMismatch { expected: u64, received: u64 },
     FeedbackUnavailable,
+    TorqueOffWouldDrop {
+        joint_index: Option<usize>,
+        position: Option<f32>,
+        rest: Option<f32>,
+        tolerance: Option<f32>,
+        reason: &'static str,
+    },
     Rejected(ClearFaultRefusal),
 }
 
@@ -1364,6 +1389,12 @@ impl std::fmt::Display for ClearFaultError {
             Self::EpochMismatch { expected, received } =>
                 write!(f, "Epoch mismatch: expected {expected}, received {received}. Command invalidated by generation change"),
             Self::FeedbackUnavailable => f.write_str("Actuator feedback unavailable: physical angles not received from hardware"),
+            Self::TorqueOffWouldDrop { joint_index: Some(i), position: Some(p), rest: Some(r), tolerance: Some(t), .. } =>
+                write!(f, "Torque stays on: J{} is at {p:.3} rad (rest {r:.3} rad, tolerance {t:.3} rad); the arm would drop. Clear the fault and park, or cut power.", i + 1),
+            Self::TorqueOffWouldDrop { reason: "no_resting_pose", .. } =>
+                f.write_str("Torque stays on: profile has no calibrated resting_pose configured; the arm would drop. Clear the fault and park, or cut power."),
+            Self::TorqueOffWouldDrop { .. } =>
+                f.write_str("Torque stays on: feedback is missing or older than 100 ms, so the rest pose cannot be verified; the arm would drop. Wait for fresh feedback, clear the fault and park, or cut power."),
             Self::Rejected(r) => write!(f, "Cannot clear fault while hardware fault condition persists: {r}"),
         }
     }
@@ -1385,6 +1416,16 @@ impl From<ClearFaultError> for SafetyError {
             ClearFaultError::EStopActive => SafetyError::EStopActive,
             ClearFaultError::EpochMismatch { expected, received } => SafetyError::EpochMismatch { expected, received },
             ClearFaultError::FeedbackUnavailable => SafetyError::FeedbackUnavailable,
+            ClearFaultError::TorqueOffWouldDrop { joint_index, position, rest, reason, .. } => {
+                let message = e.to_string();
+                SafetyError::TorqueOffWouldDrop {
+                    joint: joint_index.map(|i| format!("joint_{}", i + 1)),
+                    position,
+                    rest,
+                    reason: Some(reason.to_string()),
+                    message,
+                }
+            }
             ClearFaultError::Rejected(r) => r.into_safety_error(),
         }
     }
@@ -1459,6 +1500,9 @@ pub struct SafetyManager {
     /// Fixed-size preallocated record of the representative detail per latched [`FaultKind`]
     /// (`FaultKind::COUNT` slots, allocated once at startup; zero RT heap ops).
     latched_fault_details: Box<[Option<LatchedFaultDetail>]>,
+    /// Atomic stopped-state signal (`state.is_stopped() || has_latched_fault()`) shared with
+    /// hardware drivers so their transmit choke point enforces Rule A′ without locks.
+    stopped_flag: Arc<AtomicBool>,
 }
 
 impl Clone for SafetyManager {
@@ -1512,6 +1556,9 @@ impl Clone for SafetyManager {
             latched_fault_codes: self.latched_fault_codes,
             has_non_recoverable: self.has_non_recoverable,
             latched_fault_details: self.latched_fault_details.clone(),
+            stopped_flag: Arc::new(AtomicBool::new(
+                self.state_arc.is_stopped() || self.latched_fault_kinds != 0,
+            )),
         }
     }
 }
@@ -1573,6 +1620,7 @@ impl Default for SafetyManager {
             latched_fault_codes: 0,
             has_non_recoverable: false,
             latched_fault_details: vec![None; FaultKind::COUNT].into_boxed_slice(),
+            stopped_flag: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -1580,6 +1628,20 @@ impl Default for SafetyManager {
 impl SafetyManager {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Shared atomic flag that is `true` whenever safety state is stopped (`EStop` or `Fault`)
+    /// or any fault kind bit is latched. Updated lock-free on every latch and clear.
+    pub fn stopped_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.stopped_flag)
+    }
+
+    #[inline]
+    fn sync_stopped_flag(&self) {
+        self.stopped_flag.store(
+            self.state_arc.is_stopped() || self.latched_fault_kinds != 0,
+            Ordering::SeqCst,
+        );
     }
 
     pub fn state(&self) -> &SafetyState {
@@ -1892,6 +1954,7 @@ impl SafetyManager {
     #[doc(hidden)]
     pub fn record_unknown_kind_bit_for_test(&mut self, bit: u16) {
         self.latched_fault_kinds |= bit;
+        self.sync_stopped_flag();
     }
 
     /// Empties every preallocated fault-slot pool for deterministic exhaustion tests.
@@ -2203,11 +2266,15 @@ impl SafetyManager {
         // 1. Always record kind, code, worst-of recoverability, and inline detail (0 heap ops).
         self.latched_fault_kinds |= kind.bit();
         self.latched_fault_codes |= code.bit();
+        self.sync_stopped_flag();
         if kind.always_non_recoverable() || !code.recoverable() {
             self.has_non_recoverable = true;
         }
         let keep_prev_other_detail = kind == FaultKind::Other
-            && prev_detail.is_some_and(|d| !d.code.recoverable() && code.recoverable());
+            && prev_detail.is_some_and(|d| {
+                (!d.code.recoverable() && code.recoverable())
+                    || (d.code == FaultCode::EnableFailed && code == FaultCode::HardwareFault)
+            });
         if !keep_prev_other_detail {
             self.latched_fault_details[kind as usize] = Some(LatchedFaultDetail {
                 code,
@@ -2423,7 +2490,7 @@ impl SafetyManager {
             if ctx.hardware_reset_required {
                 return Err(ClearRefusal::HardwareResetRequired);
             }
-            if ctx.has_driver && !ctx.enable_state_known {
+            if ctx.has_driver && !ctx.enable_state_known && !ctx.failed_hold_recovery_allowed {
                 return Err(ClearRefusal::EnableStateUnknown);
             }
         }
@@ -2449,6 +2516,7 @@ impl SafetyManager {
             self.latched_fault_codes = 0;
             self.has_non_recoverable = false;
             self.latched_fault_details.fill(None);
+            self.sync_stopped_flag();
             self.bump_epoch();
             Ok(SafetyState::Idle)
         } else {
@@ -2618,11 +2686,12 @@ impl SafetyManager {
 
     /// Set torque enabled/disabled
     pub fn set_torque(&mut self, enable: bool) -> Result<SafetyState, SafetyError> {
-        if self.state_arc.is_stopped() {
+        if self.state_arc.is_stopped() || self.has_latched_fault() {
             if !enable {
-                return Err(SafetyError::MotionForbiddenInFaultState(
-                    "Cannot disable torque in EStop or Fault. Call clear_fault first.".into(),
-                ));
+                // Disabling torque while stopped keeps the E-stop / Fault latch intact
+                // without mutating the fault record or epoch; rest-pose gating is enforced
+                // by the supervisor before reaching here.
+                return Ok((*self.state_arc).clone());
             }
             if let SafetyState::Fault(ref reason) = *self.state_arc {
                 return Err(SafetyError::FaultActive(reason.clone()));

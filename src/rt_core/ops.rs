@@ -356,7 +356,7 @@ pub const TERMINAL_CODES: &[&str] = &[
     "FOLLOWING_ERROR", "CONTROL_DEADLINE", "INVALID_TELEMETRY", "DRIVER_WRITE_FAILED", "CAN_TX_STALLED", "J7_FEEDBACK_STALE", "HARDWARE_FAULT", "ENABLE_FAILED",
     "SERVO_NO_BRAKE", "HANDOVER_UNSETTLED", "GRAVITY_COMP_FAILED", "COLLISION", "COLLISION_HOLD", "BLOCKED_HOLD", "WORKSPACE_HOLD",
     "TORQUE_LIMIT", "TRACKING_STALL", "SAFETY_ERROR", "SAFETY_REJECTED", "SOFT_LIMIT_EXCEEDED", "FEEDBACK_UNAVAILABLE",
-    "FEEDBACK_UNCONFIRMED", "FEEDBACK_STALE", "INVALID_FEEDBACK", "UNLOAD_FAILED",
+    "FEEDBACK_UNCONFIRMED", "FEEDBACK_STALE", "INVALID_FEEDBACK", "UNLOAD_FAILED", "TORQUE_OFF_WOULD_DROP", "ARM_NOT_AT_RESTING_POSE", "DRIVER_BUSY",
     // motion and action failures
     "IK_UNREACHABLE", "IK_BRANCH_FLIP", "WORKSPACE_VIOLATION", "INVALID_COMMAND", "INVALID_TARGET", "JUMP_LIMIT", "STEP_LIMIT",
     "SERVO_INFEASIBLE", "SERVO_TARGET_DISCARDED", "STALE_INPUT", "MOTION_TIMEOUT", "GRIPPER_TIMEOUT", "GRASP_TIMEOUT",
@@ -987,7 +987,7 @@ pub(crate) fn static_code(e: ArmError) -> &'static str {
         "MOTION_BUSY", "NOT_ARMED", "ESTOP_ACTIVE", "FAULT_ACTIVE", "EPOCH_MISMATCH", "INVALID_COMMAND", "IK_UNREACHABLE",
         "WORKSPACE_VIOLATION", "JOINT_LIMIT", "PLAN_STALE", "LEASE_LOST", "NO_LEASE", "DISCONNECTED", "COLLISION_HOLD", "COMMISSIONING_REQUIRED",
         "INVALID_VALUE", "UNSUPPORTED", "INTERNAL", "FEEDBACK_STALE", "J7_FEEDBACK_STALE", "FEEDBACK_UNAVAILABLE", "CONFIG_BUSY", "ARM_NOT_AT_RESTING_POSE", "TOOL_MISMATCH",
-        "MOTION_FORBIDDEN_IN_FAULT_STATE", "STOPPED", "TERMINALS_BUSY", "STAMP_REUSED", "HANDOVER_SETTLING", "DISABLE_PENDING", "TRANSITION_BUSY",
+        "MOTION_FORBIDDEN_IN_FAULT_STATE", "TORQUE_OFF_WOULD_DROP", "STOPPED", "TERMINALS_BUSY", "STAMP_REUSED", "HANDOVER_SETTLING", "DISABLE_PENDING", "TRANSITION_BUSY",
         "WRONG_TARGET", "DEADLINE_EXPIRED",
     ];
     match &e {
@@ -1005,6 +1005,7 @@ pub(crate) fn static_code(e: ArmError) -> &'static str {
             S::WorkspaceViolation { .. } => "WORKSPACE_VIOLATION",
             S::ArmNotAtRestingPose { .. } => "ARM_NOT_AT_RESTING_POSE",
             S::MotionForbiddenInFaultState(_) => "MOTION_FORBIDDEN_IN_FAULT_STATE",
+            S::TorqueOffWouldDrop { .. } => "TORQUE_OFF_WOULD_DROP",
             S::Stopped => "STOPPED",
             S::LeaseLost => "LEASE_LOST",
             S::TerminalsBusy => "TERMINALS_BUSY",
@@ -1552,11 +1553,20 @@ impl CoreOps for SupervisorInner {
                 ..HardwarePoll::default()
             };
         };
-        let (feedback_valid, enable_state, oldest) = driver.with_ref_recover(|d| {
-            d.feedback_ages_into(&mut self.scratch.ages);
-            let oldest = self.scratch.ages.iter().copied().try_fold(Duration::ZERO, |m, a| a.map(|a| m.max(a)));
+        let sample = |d: &dyn crate::driver::ArmDriver, ages: &mut Vec<Option<Duration>>| {
+            d.feedback_ages_into(ages);
+            let oldest = ages.iter().copied().try_fold(Duration::ZERO, |m, a| a.map(|a| m.max(a)));
             (d.is_feedback_valid(), d.enable_state(), oldest)
-        });
+        };
+        let (feedback_valid, enable_state, oldest) = match driver.try_with_ref(|d| sample(d, &mut self.scratch.ages)) {
+            Ok(v) => v,
+            Err(crate::supervisor_lock::DriverTryError::WouldBlock) => {
+                (false, crate::driver::EnableState::Unknown, None)
+            }
+            Err(crate::supervisor_lock::DriverTryError::Poisoned) => {
+                driver.with_ref_recover(|d| sample(d, &mut self.scratch.ages))
+            }
+        };
         HardwarePoll {
             driverless: false,
             feedback_valid,

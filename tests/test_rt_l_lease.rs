@@ -1800,6 +1800,24 @@ impl ArmDriver for L2MockDriver {
             out.push(1);
         }
     }
+
+    fn fresh_joint_positions_into(
+        &self,
+        joints: &[usize],
+        max_age: Duration,
+        out: &mut [f32],
+    ) -> bool {
+        if Duration::from_millis(1) > max_age {
+            return false;
+        }
+        for (dst, &j) in out.iter_mut().zip(joints.iter()) {
+            let Some(&p) = self.positions.get(j) else {
+                return false;
+            };
+            *dst = p;
+        }
+        true
+    }
 }
 
 // ============================================================================
@@ -2000,7 +2018,7 @@ async fn ws_torque_arm_and_delayed_hardware_confirmation_both_owners() {
         assert_eq!(ack_off["is_torqued"], false);
         assert_eq!(ack_off["safety_state"], "Idle");
 
-        // Failed enable poll -> command_reject (ENABLE_FAILED) + fault latched + disable cleanup.
+        // Failed enable poll -> command_reject (ENABLE_FAILED) + fault latched + FailedHold (no rollback disable).
         ctrl.allow_enable_confirm.store(false, Ordering::SeqCst);
         ctrl.fail_enable_poll.store(true, Ordering::SeqCst);
         let before_dis = ctrl.begin_disable_calls.load(Ordering::SeqCst);
@@ -2012,11 +2030,20 @@ async fn ws_torque_arm_and_delayed_hardware_confirmation_both_owners() {
         .await;
         assert_eq!(rej["type"], "command_reject", "{rej}");
         assert_eq!(rej["code"], "ENABLE_FAILED", "{rej}");
-        assert!(
-            ctrl.begin_disable_calls.load(Ordering::SeqCst) > before_dis,
-            "failed enable on previously un-torqued arm must invoke single disable choke point"
+        assert_eq!(
+            ctrl.begin_disable_calls.load(Ordering::SeqCst),
+            before_dis,
+            "failed enable must enter FailedHold without rollback disable"
         );
         assert_eq!(ctrl.set_torque_blocking_calls.load(Ordering::SeqCst), 0);
+        let obs = sup.observation().await.unwrap();
+        assert!(obs.is_torqued, "FailedHold must keep is_torqued=true: {obs:?}");
+        assert!(matches!(obs.safety_state, SafetyState::Fault(_)), "{obs:?}");
+        assert_eq!(
+            obs.fault.as_ref().map(|f| f.code),
+            Some(armd::FaultCode::EnableFailed),
+            "FailedHold must latch FaultCode::EnableFailed: {obs:?}"
+        );
 
         drop(ws);
         handle.stop_and_join();
@@ -2120,7 +2147,15 @@ fn in_flight_torque_enable_abort_on_preempt_disconnect_and_expiry() {
             Some(Outcome::Failed("LEASE_LOST"))
         );
         assert!(ctrl.abort_enable_calls.load(Ordering::SeqCst) >= 1);
-        assert!(ctrl.begin_disable_calls.load(Ordering::SeqCst) >= 1);
+        assert_eq!(
+            ctrl.begin_disable_calls.load(Ordering::SeqCst),
+            0,
+            "aborted enable on preempt must enter FailedHold with no rollback disable"
+        );
+        assert_eq!(fx.core.enable_lifecycle(), armd::supervisor::EnableLifecycle::FailedHold);
+        assert_eq!(fx.core.torque_intent(), armd::TorqueIntent::On);
+        assert!(fx.core.is_torqued);
+        assert!(fx.core.safety.has_latched_fault_code(armd::FaultCode::EnableFailed));
         assert_eq!(ctrl.set_torque_blocking_calls.load(Ordering::SeqCst), 0);
 
         // Exact Step 7 ordering: aborted enable Terminal MUST arrive BEFORE replacement Grant!
@@ -2232,7 +2267,16 @@ fn in_flight_torque_enable_abort_on_preempt_disconnect_and_expiry() {
         assert!(matches!(disc_res, LeaseOutcome::Disconnected { released: true, .. }));
         assert_eq!(ended_outcome, Some(Outcome::Failed("DISCONNECTED")));
         assert!(ctrl.abort_enable_calls.load(Ordering::SeqCst) >= 1);
-        assert!(ctrl.begin_disable_calls.load(Ordering::SeqCst) >= 1);
+        assert_eq!(
+            ctrl.begin_disable_calls.load(Ordering::SeqCst),
+            0,
+            "aborted enable on disconnect must enter FailedHold with no rollback disable"
+        );
+        assert_eq!(fx.core.enable_lifecycle(), armd::supervisor::EnableLifecycle::FailedHold);
+        assert_eq!(fx.core.torque_intent(), armd::TorqueIntent::On);
+        assert!(fx.core.is_torqued);
+        assert!(fx.core.safety.has_latched_fault_code(armd::FaultCode::EnableFailed));
+        assert_eq!(ctrl.set_torque_blocking_calls.load(Ordering::SeqCst), 0);
 
         let mut replies = Vec::new();
         b.poll(|_, r| {
@@ -2307,6 +2351,16 @@ fn in_flight_torque_enable_abort_on_preempt_disconnect_and_expiry() {
             "expired enable must abort BEFORE calling poll_torque_budgeted"
         );
         assert!(ctrl.abort_enable_calls.load(Ordering::SeqCst) >= 1);
+        assert_eq!(
+            ctrl.begin_disable_calls.load(Ordering::SeqCst),
+            0,
+            "expired enable must enter FailedHold with no rollback disable"
+        );
+        assert_eq!(fx.core.enable_lifecycle(), armd::supervisor::EnableLifecycle::FailedHold);
+        assert_eq!(fx.core.torque_intent(), armd::TorqueIntent::On);
+        assert!(fx.core.is_torqued);
+        assert!(fx.core.safety.has_latched_fault_code(armd::FaultCode::EnableFailed));
+        assert_eq!(ctrl.set_torque_blocking_calls.load(Ordering::SeqCst), 0);
         let mut replies = Vec::new();
         b.poll(|_, r| {
             replies.push(r);
@@ -2401,6 +2455,15 @@ fn in_flight_torque_enable_abort_on_preempt_disconnect_and_expiry() {
             Some(Outcome::Failed("DISCONNECTED")),
             "same-release Disconnect must abort and end the Step-3 TorqueOn before Step 6"
         );
+        assert!(ctrl.abort_enable_calls.load(Ordering::SeqCst) >= 1);
+        assert_eq!(
+            ctrl.begin_disable_calls.load(Ordering::SeqCst),
+            0,
+            "same-release disconnected enable must enter FailedHold with no rollback disable"
+        );
+        assert_eq!(fx.core.enable_lifecycle(), armd::supervisor::EnableLifecycle::FailedHold);
+        assert_eq!(fx.core.torque_intent(), armd::TorqueIntent::On);
+        assert_eq!(ctrl.set_torque_blocking_calls.load(Ordering::SeqCst), 0);
         let pub_snap = fx.core.core.hub().latest().unwrap();
         assert!(
             !pub_snap.owner.torque_transition_pending,
@@ -2436,7 +2499,7 @@ fn in_flight_torque_enable_abort_on_preempt_disconnect_and_expiry() {
 fn background_disable_retry_bounded_choke_point_recovery_and_fault_exhaustion() {
     ensure_tracing_subscriber();
 
-    // (a) Transient CAN TX failure on disable cleanup recovers on retry 4 via single choke point.
+    // (a) Transient CAN TX failure on explicit TorqueOff recovers on retry 4 via single choke point.
     {
         let cfg = ArmConfig {
             lease_timeout_ms: 5_000,
@@ -2444,9 +2507,7 @@ fn background_disable_retry_bounded_choke_point_recovery_and_fault_exhaustion() 
         };
         let mclock = MockClock::new();
         let ctrl = Arc::new(L2DriverControl::default());
-        ctrl.allow_enable_confirm.store(false, Ordering::SeqCst);
-        ctrl.fail_enable_poll.store(true, Ordering::SeqCst);
-        ctrl.partial_enable_unknown_until_disable.store(true, Ordering::SeqCst);
+        ctrl.allow_enable_confirm.store(true, Ordering::SeqCst);
         ctrl.fail_disable_begin_remaining.store(3, Ordering::SeqCst);
         ctrl.allow_disable_confirm.store(true, Ordering::SeqCst);
 
@@ -2472,13 +2533,30 @@ fn background_disable_retry_bounded_choke_point_recovery_and_fault_exhaustion() 
             Submit::Transition(TransitionOp::TorqueOn),
         )
         .unwrap();
-        let _ = fx.step(); // commits enable
-        let r_fail = fx.step(); // poll fails -> enable_step_failed -> initial disable fails (1/3) -> arms retry
-        assert_eq!(r_fail.transition_ended.map(|(_, o)| o), Some(Outcome::Failed("ENABLE_FAILED")));
+        assert!(fx.step().command.unwrap().1.is_ok());
+        assert_eq!(fx.step().transition_ended.map(|(_, o)| o), Some(Outcome::Completed));
+        assert!(fx.core.is_torqued);
+
+        // Explicit TorqueOff fails with transient transport error -> arms BackgroundDisableRetry.
+        let a1 = fx.core.authority(&fx.ctx(fx.now()));
+        b.submit(
+            ClientId(1),
+            2,
+            a1,
+            fx.now() + Duration::from_secs(5),
+            Submit::Transition(TransitionOp::TorqueOff),
+        )
+        .unwrap();
+        let r_fail = fx.step();
+        assert!(r_fail.command.unwrap().1.is_ok());
+        assert_eq!(
+            r_fail.transition_ended.map(|(_, o)| o),
+            Some(Outcome::Failed("DRIVER_WRITE_FAILED"))
+        );
         assert!(fx.core.disable_pending);
         assert_eq!(ctrl.begin_disable_calls.load(Ordering::SeqCst), 1);
 
-        // Step releases (20ms each): retries at >=25ms spacing until call 4 succeeds and confirms.
+        // Step releases (20ms each): retries at >=25ms spacing until call 4 succeeds.
         for _ in 0..12 {
             let _ = fx.step();
             if !fx.core.disable_pending {
@@ -2487,15 +2565,15 @@ fn background_disable_retry_bounded_choke_point_recovery_and_fault_exhaustion() 
         }
         assert!(!fx.core.disable_pending, "background disable must confirm once bus recovers");
         assert!(!fx.core.is_torqued);
+        assert_eq!(fx.core.torque_intent(), armd::TorqueIntent::Off);
         assert_eq!(ctrl.begin_disable_calls.load(Ordering::SeqCst), 4);
         assert_eq!(ctrl.set_torque_blocking_calls.load(Ordering::SeqCst), 0);
     }
 
-    // (b) Persistent disable failure from a clean non-faulted fenced-enable abort exhausts the
-    //     exact bounded retry cap (1 initial + 8 retries = 9), latches specifically
-    //     `StaticFault::DisableUnconfirmed` ("Torque disable has not been confirmed by fresh
-    //     hardware feedback"), and NEVER restarts even after advancing well past the legacy
-    //     250 ms fallback interval and invoking `request_shutdown`.
+    // (b) Persistent disable failure on explicit TorqueOff exhausts the exact bounded retry cap
+    //     (1 initial + 8 retries = 9), latches specifically `StaticFault::DisableUnconfirmed`
+    //     ("Torque disable has not been confirmed by fresh hardware feedback"), and NEVER restarts
+    //     across ticks or `request_shutdown`.
     {
         let cfg = ArmConfig {
             lease_timeout_ms: 5_000,
@@ -2503,16 +2581,15 @@ fn background_disable_retry_bounded_choke_point_recovery_and_fault_exhaustion() 
         };
         let mclock = MockClock::new();
         let ctrl = Arc::new(L2DriverControl::default());
-        ctrl.allow_enable_confirm.store(false, Ordering::SeqCst);
-        ctrl.partial_enable_unknown_until_disable.store(true, Ordering::SeqCst);
+        ctrl.allow_enable_confirm.store(true, Ordering::SeqCst);
         ctrl.fail_disable_begin_remaining.store(100, Ordering::SeqCst);
 
         let drv = L2MockDriver::new(&cfg, Some(mclock.clone()), ctrl.clone());
         let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
         inner.rt_executor_owned = true;
+        inner.lease_enabled = false;
         inner.prewarm_rt_buffers();
-        let c1 = ConnectionHandle::from_ws_id(1).unwrap();
-        inner.register_live_connection(c1.id()).unwrap();
+        inner.register_live_connection(1).unwrap();
 
         let (mut fx, mut b, _tw, _st) = ReleaseFixture::new_with_clock(
             inner,
@@ -2526,51 +2603,38 @@ fn background_disable_retry_bounded_choke_point_recovery_and_fault_exhaustion() 
             1,
             a0,
             fx.now() + Duration::from_secs(5),
-            Submit::Lease(LeaseRequest::Acquire(LeaseAcquire {
-                connection: c1,
-                label: armd::model::HolderLabel::new("exhaust_holder"),
-                has_label: true,
-            })),
+            Submit::Transition(TransitionOp::TorqueOn),
         )
         .unwrap();
         assert!(fx.step().command.unwrap().1.is_ok());
+        assert_eq!(fx.step().transition_ended.map(|(_, o)| o), Some(Outcome::Completed));
+        assert!(fx.core.is_torqued);
+
+        // Explicit TorqueOff fails on call #1 -> arms BackgroundDisableRetry.
         let a1 = fx.core.authority(&fx.ctx(fx.now()));
-        assert!(a1.lease_generation >= 1);
         b.submit(
             ClientId(1),
             2,
             a1,
             fx.now() + Duration::from_secs(5),
-            Submit::Transition(TransitionOp::TorqueOn),
-        )
-        .unwrap();
-        assert!(fx.step().command.unwrap().1.is_ok()); // commits pending TorqueOn (no fault latched)
-        assert_eq!(*fx.core.safety.state(), SafetyState::Idle);
-
-        // Release lease -> aborts in-flight enable cleanly (no prior EnableFailed fault!) and
-        // fires initial disable call #1 via single choke point, which fails and arms retry.
-        b.submit(
-            ClientId(1),
-            3,
-            a1,
-            fx.now() + Duration::from_secs(5),
-            Submit::Lease(LeaseRequest::Release(LeaseRelease {
-                connection: c1,
-                generation: a1.lease_generation,
-            })),
+            Submit::Transition(TransitionOp::TorqueOff),
         )
         .unwrap();
         assert!(fx.step().command.unwrap().1.is_ok());
         assert_eq!(ctrl.begin_disable_calls.load(Ordering::SeqCst), 1);
         assert!(fx.core.disable_pending);
-        assert_eq!(
-            *fx.core.safety.state(),
-            SafetyState::Idle,
-            "no fault may be latched before retries exhaust"
+        assert!(
+            !matches!(
+                fx.core.safety.state(),
+                SafetyState::Fault(armd::FaultReason::Other(r))
+                    if r == "Torque disable has not been confirmed by fresh hardware feedback"
+            ),
+            "DisableUnconfirmed must NOT be latched before retries exhaust: {:?}",
+            fx.core.safety.state()
         );
 
         // 20 ms release steps with 25 ms retry spacing => each retry fires every 40 ms
-        // (2 steps): 8 retries take 8 * 40 ms = 320 ms (16 steps) < 500 ms window.
+        // (2 steps): 8 retries take 8 * 40 ms = 320 ms (16 steps) < 1 s lifetime.
         for _ in 0..20 {
             let _ = fx.step();
         }
@@ -2580,25 +2644,23 @@ fn background_disable_retry_bounded_choke_point_recovery_and_fault_exhaustion() 
             "expected exact 1 initial + 8 bounded retries = 9 calls on 20 ms timeline"
         );
         assert!(fx.core.disable_pending, "disable_pending must remain true until confirmed");
-        assert!(
-            matches!(
-                fx.core.safety.state(),
-                SafetyState::Fault(armd::FaultReason::Other(r))
-                    if r == "Torque disable has not been confirmed by fresh hardware feedback"
-            ),
-            "exhaustion must latch exact StaticFault::DisableUnconfirmed, got: {:?}",
-            fx.core.safety.state()
+        let fault = fx.core.safety.fault().expect("exhaustion must latch fault");
+        assert_eq!(fault.code, armd::safety::FaultCode::DriverWriteFailed);
+        assert_eq!(
+            fault.message.as_str(),
+            "Torque disable has not been confirmed by fresh hardware feedback",
+            "exhaustion must latch exact StaticFault::DisableUnconfirmed, got: {fault:?}"
         );
+        assert!(matches!(fx.core.safety.state(), SafetyState::Fault(_)));
         assert!(fx.core.safety.has_latched_fault_code(armd::safety::FaultCode::DriverWriteFailed));
         assert_eq!(ctrl.set_torque_blocking_calls.load(Ordering::SeqCst), 0);
 
         // Advance well past both the 250 ms legacy fallback interval (wall + virtual) and the
-        // 500 ms retry window, and trigger repeated `request_shutdown`: call count MUST stay 9.
+        // 1 s retry window, and trigger `request_shutdown`: call count MUST stay 9.
         std::thread::sleep(Duration::from_millis(260));
-        for _ in 0..25 {
+        for _ in 0..55 {
             let _ = fx.step();
         }
-        assert!(!fx.core.request_shutdown());
         assert!(!fx.core.request_shutdown());
         for _ in 0..10 {
             let _ = fx.step();
@@ -2606,29 +2668,150 @@ fn background_disable_retry_bounded_choke_point_recovery_and_fault_exhaustion() 
         assert_eq!(
             ctrl.begin_disable_calls.load(Ordering::SeqCst),
             9,
-            "exhausted BackgroundDisableRetry must NEVER restart across ticks or shutdown"
+            "exhausted BackgroundDisableRetry must NEVER restart across ticks or request_shutdown"
         );
     }
 
-    // (c) Pending driver disable handshake that never confirms MUST STILL exhaust at
-    //     BACKGROUND_DISABLE_MAX_WINDOW (500 ms) rather than bypassing the deadline forever.
+    // (c) Pending driver disable handshake that stays pending across the retry window
+    //     (`STOPPED_DISABLE_REQUEST_LIFETIME` = 1 s when stopped) MUST STILL exhaust and latch
+    //     `StaticFault::DisableUnconfirmed` rather than bypassing the deadline forever.
     {
+        struct StuckPendingDisableDriver {
+            dof: usize,
+            positions: Vec<f32>,
+            enabled: bool,
+            clock: MockClock,
+            pending_disable: bool,
+            disable_calls: Arc<AtomicUsize>,
+        }
+
+        impl ArmDriver for StuckPendingDisableDriver {
+            fn capabilities(&self) -> DriverCapabilities {
+                DriverCapabilities {
+                    enable_feedback: true,
+                    velocity_feedback: true,
+                    torque_feedback: true,
+                    temperature_feedback: true,
+                    ..DriverCapabilities::default()
+                }
+            }
+            fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+                Ok(self
+                    .positions
+                    .iter()
+                    .map(|&p| JointState { position: p, velocity: 0.0, torque: 0.0, temperature: 30.0 })
+                    .collect())
+            }
+            fn read_joint_states_budgeted(
+                &mut self,
+                out: &mut Vec<JointState>,
+                _deadline: Instant,
+                _max_rx_frames: u16,
+            ) -> Result<(u16, bool), ArmDriverError> {
+                out.clear();
+                for &p in &self.positions {
+                    out.push(JointState { position: p, velocity: 0.0, torque: 0.0, temperature: 30.0 });
+                }
+                Ok((self.dof as u16, false))
+            }
+            fn read_cached_joint_states_into(&self, out: &mut Vec<JointState>) -> Option<()> {
+                out.clear();
+                for &p in &self.positions {
+                    out.push(JointState { position: p, velocity: 0.0, torque: 0.0, temperature: 30.0 });
+                }
+                Some(())
+            }
+            fn write_joint_targets(&mut self, _: &[JointTarget]) -> Result<(), ArmDriverError> { Ok(()) }
+            fn set_torque(&mut self, enable: bool) -> Result<(), ArmDriverError> {
+                self.enabled = enable;
+                Ok(())
+            }
+            fn begin_disable_torque_budgeted(
+                &mut self,
+                kind: armd::driver::DisableKind,
+                _: u16,
+            ) -> Result<DrvTorqueProgress, ArmDriverError> {
+                let call = self.disable_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if call == 1 {
+                    return Err(ArmDriverError::Transport(TransportError::WouldBlock));
+                }
+                let _ = kind;
+                self.pending_disable = true;
+                Ok(DrvTorqueProgress::Pending {
+                    wake: self.clock.now() + Duration::from_millis(20),
+                })
+            }
+            fn begin_torque_budgeted(&mut self, enable: bool, _: u16) -> Result<DrvTorqueProgress, ArmDriverError> {
+                if enable {
+                    self.enabled = true;
+                    return Ok(DrvTorqueProgress::Done(TorqueOutcome::Confirmed));
+                }
+                unreachable!("disable routes through begin_disable_torque_budgeted")
+            }
+            fn poll_torque_budgeted(&mut self, _: Instant, _: u16) -> Result<DrvTorqueProgress, ArmDriverError> {
+                if self.pending_disable {
+                    // Driver handshake genuinely stays Pending forever; `service_background_disable`
+                    // must still terminate on `window_expired` even while `still_pending == true`
+                    // and `attempts < BACKGROUND_DISABLE_MAX_RETRIES`.
+                    return Ok(DrvTorqueProgress::Pending {
+                        wake: self.clock.now() + Duration::from_millis(20),
+                    });
+                }
+                Ok(DrvTorqueProgress::Done(TorqueOutcome::Confirmed))
+            }
+            fn torque_transition_pending(&self) -> bool { self.pending_disable }
+            fn is_enabled(&self) -> bool { self.enabled }
+            fn enable_state(&self) -> EnableState {
+                if self.enabled { EnableState::Enabled } else { EnableState::Disabled }
+            }
+            fn is_feedback_valid(&self) -> bool { true }
+            fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::from_millis(1)); self.dof] }
+            fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
+                out.clear();
+                out.resize(self.dof, Some(Duration::from_millis(1)));
+            }
+            fn has_driver_fresh_position_api(&self) -> bool {
+                true
+            }
+            fn fresh_joint_positions_into(
+                &self,
+                joints: &[usize],
+                max_age: Duration,
+                out: &mut [f32],
+            ) -> bool {
+                if joints.is_empty() || out.len() < joints.len() || Duration::from_millis(1) > max_age {
+                    return false;
+                }
+                for (dst, &j) in out.iter_mut().zip(joints.iter()) {
+                    let Some(&p) = self.positions.get(j) else {
+                        return false;
+                    };
+                    *dst = p;
+                }
+                true
+            }
+            fn clock_now(&self) -> Instant { self.clock.now() }
+        }
+
         let cfg = ArmConfig {
             lease_timeout_ms: 5_000,
             ..ArmConfig::rebot_dm()
         };
         let mclock = MockClock::new();
-        let ctrl = Arc::new(L2DriverControl::default());
-        ctrl.allow_enable_confirm.store(false, Ordering::SeqCst);
-        ctrl.partial_enable_unknown_until_disable.store(true, Ordering::SeqCst);
-        ctrl.allow_disable_confirm.store(false, Ordering::SeqCst);
-
-        let drv = L2MockDriver::new(&cfg, Some(mclock.clone()), ctrl.clone());
+        let disable_calls = Arc::new(AtomicUsize::new(0));
+        let drv = StuckPendingDisableDriver {
+            dof: cfg.dof,
+            positions: cfg.resting_positions().to_vec(),
+            enabled: false,
+            clock: mclock.clone(),
+            pending_disable: false,
+            disable_calls: Arc::clone(&disable_calls),
+        };
         let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
         inner.rt_executor_owned = true;
+        inner.lease_enabled = false;
         inner.prewarm_rt_buffers();
-        let c1 = ConnectionHandle::from_ws_id(2).unwrap();
-        inner.register_live_connection(c1.id()).unwrap();
+        inner.register_live_connection(2).unwrap();
 
         let (mut fx, mut b, _tw, _st) = ReleaseFixture::new_with_clock(
             inner,
@@ -2642,54 +2825,46 @@ fn background_disable_retry_bounded_choke_point_recovery_and_fault_exhaustion() 
             1,
             a0,
             fx.now() + Duration::from_secs(5),
-            Submit::Lease(LeaseRequest::Acquire(LeaseAcquire {
-                connection: c1,
-                label: armd::model::HolderLabel::new("stuck_disable_holder"),
-                has_label: true,
-            })),
+            Submit::Transition(TransitionOp::TorqueOn),
         )
         .unwrap();
         assert!(fx.step().command.unwrap().1.is_ok());
+        assert!(fx.core.is_torqued);
+
         let a1 = fx.core.authority(&fx.ctx(fx.now()));
-        assert!(a1.lease_generation >= 1);
         b.submit(
             ClientId(2),
             2,
             a1,
             fx.now() + Duration::from_secs(5),
-            Submit::Transition(TransitionOp::TorqueOn),
+            Submit::Transition(TransitionOp::TorqueOff),
         )
         .unwrap();
         assert!(fx.step().command.unwrap().1.is_ok());
-        b.submit(
-            ClientId(2),
-            3,
-            a1,
-            fx.now() + Duration::from_secs(5),
-            Submit::Lease(LeaseRequest::Release(LeaseRelease {
-                connection: c1,
-                generation: a1.lease_generation,
-            })),
-        )
-        .unwrap();
-        assert!(fx.step().command.unwrap().1.is_ok());
-        assert_eq!(ctrl.begin_disable_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(*fx.core.safety.state(), SafetyState::Idle);
+        assert_eq!(disable_calls.load(Ordering::SeqCst), 1);
 
-        // Advance 30 * 20 ms = 600 ms > 500 ms window while handshake stays Pending.
-        for _ in 0..30 {
+        // Advance 60 * 20 ms = 1200 ms > STOPPED_DISABLE_REQUEST_LIFETIME (1 s) while handshake stays Pending:
+        // `service_background_disable` must terminate the stopped `DisableRequested` on `window_expired`
+        // even while `still_pending == true` and `attempts < BACKGROUND_DISABLE_MAX_RETRIES`.
+        for _ in 0..60 {
             let _ = fx.step();
         }
+        assert_eq!(disable_calls.load(Ordering::SeqCst), 2);
         assert!(
-            matches!(
-                fx.core.safety.state(),
-                SafetyState::Fault(armd::FaultReason::Other(r))
-                    if r == "Torque disable has not been confirmed by fresh hardware feedback"
-            ),
-            "stuck pending disable handshake must exhaust at 500 ms window, got: {:?}",
-            fx.core.safety.state()
+            !fx.core.disable_pending,
+            "expired stopped DisableRequested must clear disable_pending instead of retrying forever"
         );
-        assert_eq!(ctrl.begin_disable_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fx.core.torque_intent(), armd::TorqueIntent::On);
+        assert!(matches!(fx.core.safety.state(), SafetyState::Fault(_)));
+        assert!(fx.core.safety.has_latched_fault_code(armd::safety::FaultCode::DriverWriteFailed));
+        for _ in 0..10 {
+            let _ = fx.step();
+        }
+        assert_eq!(
+            disable_calls.load(Ordering::SeqCst),
+            2,
+            "terminated pending disable must never restart after window expiry"
+        );
     }
 }
 
@@ -2979,13 +3154,16 @@ async fn zero_alloc_rt_l2_torque_and_clear_fault_with_tracing_enabled() {
 
         let _ = armd::diagnostics::alloc::take();
 
-        // 1. TorqueOff refused ARM_NOT_AT_RESTING_POSE (enable state Disabled / not at rest) -> 0 alloc.
+        // 1. TorqueOff refused ARM_NOT_AT_RESTING_POSE (arm raised off rest pose) -> 0 alloc.
         let ep1 = core.safety.epoch_id();
+        let saved_j1 = core.measured_positions[1];
+        core.measured_positions[1] = saved_j1 + 0.5;
         let d_off_refuse = mk_tr(10, TransitionOp::TorqueOff, ep1);
         assert_eq!(
             core.commit_transition(&d_off_refuse, TransitionOp::TorqueOff, &cctx),
             Err("ARM_NOT_AT_RESTING_POSE")
         );
+        core.measured_positions[1] = saved_j1;
 
         // 2. TorqueOn start -> poll confirmed -> TorqueOff start -> poll confirmed -> 0 alloc.
         ctrl.allow_enable_confirm.store(true, Ordering::SeqCst);
@@ -3002,21 +3180,62 @@ async fn zero_alloc_rt_l2_torque_and_clear_fault_with_tracing_enabled() {
         let p2 = core.poll_hardware(&b1);
         assert!(matches!(p2.torque, Some(Ok(armd::rt_core::ops::TorqueProgress::Pending { .. }))));
         ctrl.allow_disable_confirm.store(true, Ordering::SeqCst);
-        let p2b = core.poll_hardware(&b1);
-        assert!(matches!(p2b.torque, Some(Ok(armd::rt_core::ops::TorqueProgress::Pending { .. }))));
         let p3 = core.poll_hardware(&b1);
         assert_eq!(p3.torque, Some(Ok(armd::rt_core::ops::TorqueProgress::Done)));
         assert!(!core.is_torqued);
+        assert_eq!(core.torque_intent(), armd::TorqueIntent::Off);
 
-        // 3. TorqueOn failure (enable_step_failed) + BackgroundDisableRetry attempts + exhaustion -> 0 alloc.
+        // 3a. TorqueOn failure enters FailedHold with no rollback disable -> TorqueOff -> LeaseClearFault -> 0 alloc.
         ctrl.allow_enable_confirm.store(false, Ordering::SeqCst);
         ctrl.fail_enable_poll.store(true, Ordering::SeqCst);
-        ctrl.partial_enable_unknown_until_disable.store(true, Ordering::SeqCst);
-        ctrl.fail_disable_begin_remaining.store(20, Ordering::SeqCst);
+        let before_dis = ctrl.begin_disable_calls.load(Ordering::SeqCst);
         let d_on_fail = mk_tr(13, TransitionOp::TorqueOn, ep1);
         assert!(core.commit_transition(&d_on_fail, TransitionOp::TorqueOn, &cctx).is_ok());
         let p_fail = core.poll_hardware(&b1);
         assert_eq!(p_fail.torque, Some(Err("ENABLE_FAILED")));
+        assert_eq!(core.enable_lifecycle(), armd::supervisor::EnableLifecycle::FailedHold);
+        assert_eq!(core.torque_intent(), armd::TorqueIntent::On);
+        assert_eq!(ctrl.begin_disable_calls.load(Ordering::SeqCst), before_dis);
+
+        let ep_fh = core.safety.epoch_id();
+        let d_off_fh = mk_tr(14, TransitionOp::TorqueOff, ep_fh);
+        assert!(core.commit_transition(&d_off_fh, TransitionOp::TorqueOff, &cctx).is_ok());
+        assert_eq!(
+            core.poll_hardware(&b1).torque,
+            Some(Ok(armd::rt_core::ops::TorqueProgress::Done))
+        );
+        let cleared_fh = install_lease_clear_fault_rt(
+            &mut core,
+            c1,
+            g1,
+            Some(ep_fh),
+            true,
+            None,
+            OwnerAuthPolicy::ClearFault,
+            grant_ok,
+            mclock.now(),
+            mclock.now() + Duration::from_millis(20),
+        );
+        assert!(matches!(
+            cleared_fh,
+            LeaseClearFaultOutcome::Cleared { safety_state: SafetyState::Idle, .. }
+        ), "{cleared_fh:?}");
+
+        // 3b. Re-arm and test BackgroundDisableRetry exhaustion on transport-failed TorqueOff -> 0 alloc.
+        ctrl.fail_enable_poll.store(false, Ordering::SeqCst);
+        ctrl.allow_enable_confirm.store(true, Ordering::SeqCst);
+        let ep_rearm = core.safety.epoch_id();
+        let d_on_ok = mk_tr(15, TransitionOp::TorqueOn, ep_rearm);
+        assert!(core.commit_transition(&d_on_ok, TransitionOp::TorqueOn, &cctx).is_ok());
+        assert_eq!(
+            core.poll_hardware(&b1).torque,
+            Some(Ok(armd::rt_core::ops::TorqueProgress::Done))
+        );
+
+        ctrl.fail_disable_begin_remaining.store(20, Ordering::SeqCst);
+        let d_off_fail = mk_tr(16, TransitionOp::TorqueOff, ep_rearm);
+        assert!(core.commit_transition(&d_off_fail, TransitionOp::TorqueOff, &cctx).is_ok());
+        assert!(core.disable_pending);
         for _ in 0..10 {
             mclock.advance(Duration::from_millis(30));
             let bn = ServiceBudget::for_release(mclock.now(), mclock.now() + Duration::from_millis(20));
@@ -3066,18 +3285,16 @@ async fn zero_alloc_rt_l2_torque_and_clear_fault_with_tracing_enabled() {
             Err(TorquePreflightError::OperatorRequired { .. })
         ));
 
-        // Confirm background disable via driver, then LeaseClearFault succeeds -> 0 alloc!
+        // Confirm disable via TorqueOff, then LeaseClearFault succeeds -> 0 alloc!
         ctrl.fail_disable_begin_remaining.store(0, Ordering::SeqCst);
         ctrl.allow_disable_confirm.store(true, Ordering::SeqCst);
-        let _ = core
-            .driver
-            .as_mut()
-            .unwrap()
-            .write()
-            .unwrap()
-            .begin_torque_budgeted(false, 0);
-        core.disable_pending = false;
-        core.is_torqued = false;
+        let d_off_ok = mk_tr(17, TransitionOp::TorqueOff, ep_fault);
+        assert!(core.commit_transition(&d_off_ok, TransitionOp::TorqueOff, &cctx).is_ok());
+        let p_off_done = core.poll_hardware(&b1);
+        assert_eq!(p_off_done.torque, Some(Ok(armd::rt_core::ops::TorqueProgress::Done)));
+        assert!(!core.disable_pending);
+        assert!(!core.is_torqued);
+        assert_eq!(core.torque_intent(), armd::TorqueIntent::Off);
         let cleared = install_lease_clear_fault_rt(
             &mut core,
             c1,
@@ -3093,10 +3310,11 @@ async fn zero_alloc_rt_l2_torque_and_clear_fault_with_tracing_enabled() {
         assert!(matches!(cleared, LeaseClearFaultOutcome::Cleared { safety_state: SafetyState::Idle, .. }), "{cleared:?}");
 
         // Refusal on TorqueOn while pending / after fault -> 0 alloc!
+        ctrl.allow_enable_confirm.store(false, Ordering::SeqCst);
         ctrl.fail_enable_poll.store(false, Ordering::SeqCst);
         let ep_clean = core.safety.epoch_id();
         let cctx_clean = CommitCtx { arm, boot, now: now_f, stop_generation: 0 };
-        let d_on2 = mk_tr(14, TransitionOp::TorqueOn, ep_clean);
+        let d_on2 = mk_tr(18, TransitionOp::TorqueOn, ep_clean);
         assert!(core.commit_transition(&d_on2, TransitionOp::TorqueOn, &cctx_clean).is_ok());
         // Fence displaced lease via disconnect while TorqueOn is pending -> abort_enable_transition_for_fenced_lease -> 0 alloc!
         ctrl.fail_disable_begin_remaining.store(0, Ordering::SeqCst);
@@ -4099,9 +4317,9 @@ async fn m3_clear_fault_rechecks_authority_before_hardware_reset_and_final_clear
 fn m4_disable_confirm_timeout_retries_in_background_preserving_original_timestamp() {
     ensure_tracing_subscriber();
 
-    // (a) When disable sends succeed (`Ok(Done(Unconfirmed))`) and `DisableConfirm` times out,
-    //     `BackgroundDisableRetry` arms before latching `DisableUnconfirmed` so background service
-    //     keeps retrying and confirms once hardware feedback reports Disabled.
+    // (a) Decision-based disable: `Ok(Done(Unconfirmed))` completes `TorqueOff` immediately with
+    //     no `DisableConfirm` phase, while a transport-failed `TorqueOff` arms
+    //     `BackgroundDisableRetry` and recovers once the bus clears.
     {
         let cfg = ArmConfig {
             lease_timeout_ms: 60_000,
@@ -4140,7 +4358,7 @@ fn m4_disable_confirm_timeout_retries_in_background_preserving_original_timestam
         assert_eq!(fx.step().transition_ended.map(|(_, o)| o), Some(Outcome::Completed));
         assert!(fx.core.is_torqued);
 
-        // Start TorqueOff: send succeeds (`Done(Unconfirmed)`), confirmation times out after 25 ms.
+        // `Done(Unconfirmed)` completes immediately (`torque_intent == Off`, no `DisableConfirm`).
         let a1 = fx.core.authority(&fx.ctx(fx.now()));
         b.submit(
             ClientId(1),
@@ -4150,47 +4368,65 @@ fn m4_disable_confirm_timeout_retries_in_background_preserving_original_timestam
             Submit::Transition(TransitionOp::TorqueOff),
         )
         .unwrap();
-        assert!(fx.step().command.unwrap().1.is_ok());
+        let r_unconf = fx.step();
+        assert!(r_unconf.command.unwrap().1.is_ok());
+        assert_eq!(fx.step().transition_ended.map(|(_, o)| o), Some(Outcome::Completed));
         assert_eq!(ctrl.begin_disable_calls.load(Ordering::SeqCst), 1);
+        assert!(!fx.core.disable_pending);
+        assert!(!fx.core.is_torqued);
+        assert_eq!(fx.core.torque_intent(), armd::TorqueIntent::Off);
 
-        let mut timed_out = false;
-        for _ in 0..6 {
-            let r = fx.step();
-            if r.transition_ended.map(|(_, o)| o) == Some(Outcome::Failed("FEEDBACK_UNCONFIRMED")) {
-                timed_out = true;
-                break;
-            }
-        }
-        assert!(timed_out, "disable confirmation must time out with FEEDBACK_UNCONFIRMED");
-        assert!(fx.core.disable_pending);
-        assert!(matches!(fx.core.safety.state(), SafetyState::Fault(_)));
+        // Re-arm and trigger `BackgroundDisableRetry` via transient transport errors on `TorqueOff`.
+        let a2 = fx.core.authority(&fx.ctx(fx.now()));
+        b.submit(
+            ClientId(1),
+            3,
+            a2,
+            fx.now() + Duration::from_secs(5),
+            Submit::Transition(TransitionOp::TorqueOn),
+        )
+        .unwrap();
+        assert!(fx.step().command.unwrap().1.is_ok());
+        assert_eq!(fx.step().transition_ended.map(|(_, o)| o), Some(Outcome::Completed));
+        assert!(fx.core.is_torqued);
 
-        // Advance releases: background disable service MUST keep retrying (`begin_disable_calls > 1`).
-        for _ in 0..5 {
-            let _ = fx.step();
-        }
-        let retries_after_timeout = ctrl.begin_disable_calls.load(Ordering::SeqCst);
-        assert!(
-            retries_after_timeout >= 3,
-            "background service must keep retrying after DisableConfirm timeout, got {retries_after_timeout} calls"
-        );
-
-        // Hardware now confirms disabled on the next background retry -> clears `disable_pending`.
         ctrl.disable_always_unconfirmed.store(false, Ordering::SeqCst);
         ctrl.allow_disable_confirm.store(true, Ordering::SeqCst);
-        for _ in 0..6 {
+        ctrl.fail_disable_begin_remaining.store(3, Ordering::SeqCst);
+        let a3 = fx.core.authority(&fx.ctx(fx.now()));
+        b.submit(
+            ClientId(1),
+            4,
+            a3,
+            fx.now() + Duration::from_secs(5),
+            Submit::Transition(TransitionOp::TorqueOff),
+        )
+        .unwrap();
+        let r_err = fx.step();
+        assert!(r_err.command.unwrap().1.is_ok());
+        assert_eq!(
+            r_err.transition_ended.map(|(_, o)| o),
+            Some(Outcome::Failed("DRIVER_WRITE_FAILED"))
+        );
+        assert!(fx.core.disable_pending);
+        assert_eq!(ctrl.begin_disable_calls.load(Ordering::SeqCst), 2);
+
+        for _ in 0..12 {
             let _ = fx.step();
             if !fx.core.disable_pending {
                 break;
             }
         }
-        assert!(!fx.core.disable_pending, "background retry must confirm disable once hardware reports Disabled");
+        assert!(!fx.core.disable_pending, "background retry must complete once transport recovers");
         assert!(!fx.core.is_torqued);
+        assert_eq!(fx.core.torque_intent(), armd::TorqueIntent::Off);
+        assert_eq!(ctrl.begin_disable_calls.load(Ordering::SeqCst), 5);
     }
 
-    // (b) Original `DisableRequested` timestamp preservation: when the initial disable handshake
-    //     consumes 400 ms before `DisableConfirm` times out at 425 ms, background retries MUST
-    //     expire at `requested_at + 500 ms` (only 75 ms left -> at most 2 retries, NOT a fresh 500 ms window!).
+    // (b) Original `DisableRequested { started_at }` timestamp preservation: when the initial
+    //     pending disable consumes 400 ms before failing and retry #1 consumes another 450 ms,
+    //     EVERY retry receives the original `t0` timestamp and the retry window expires at
+    //     `t0 + STOPPED_DISABLE_REQUEST_LIFETIME` (1 s) — NOT a fresh window!
     {
         struct SlowPendingDisableDriver {
             dof: usize,
@@ -4199,6 +4435,7 @@ fn m4_disable_confirm_timeout_retries_in_background_preserving_original_timestam
             clock: MockClock,
             handshake_end: Option<Instant>,
             disable_calls: Arc<AtomicUsize>,
+            seen_started_at: Arc<Mutex<Vec<Instant>>>,
         }
 
         impl ArmDriver for SlowPendingDisableDriver {
@@ -4242,19 +4479,35 @@ fn m4_disable_confirm_timeout_retries_in_background_preserving_original_timestam
                 self.enabled = enable;
                 Ok(())
             }
-            fn begin_torque_budgeted(&mut self, enable: bool, _: u16) -> Result<DrvTorqueProgress, ArmDriverError> {
-                if enable {
-                    self.enabled = true;
-                    return Ok(DrvTorqueProgress::Done(TorqueOutcome::Confirmed));
+            fn begin_disable_torque_budgeted(
+                &mut self,
+                kind: armd::driver::DisableKind,
+                _: u16,
+            ) -> Result<DrvTorqueProgress, ArmDriverError> {
+                if let armd::driver::DisableKind::DisableRequested { started_at, .. } = kind {
+                    self.seen_started_at.lock().unwrap().push(started_at);
+                } else {
+                    panic!("expected DisableRequested, got {kind:?}");
                 }
                 let call = self.disable_calls.fetch_add(1, Ordering::SeqCst) + 1;
                 if call == 1 {
                     let end = self.clock.now() + Duration::from_millis(400);
                     self.handshake_end = Some(end);
                     Ok(DrvTorqueProgress::Pending { wake: self.clock.now() + Duration::from_millis(20) })
+                } else if call == 2 {
+                    let end = self.clock.now() + Duration::from_millis(450);
+                    self.handshake_end = Some(end);
+                    Ok(DrvTorqueProgress::Pending { wake: self.clock.now() + Duration::from_millis(20) })
                 } else {
-                    Ok(DrvTorqueProgress::Done(TorqueOutcome::Unconfirmed))
+                    Err(ArmDriverError::Transport(TransportError::WouldBlock))
                 }
+            }
+            fn begin_torque_budgeted(&mut self, enable: bool, _: u16) -> Result<DrvTorqueProgress, ArmDriverError> {
+                if enable {
+                    self.enabled = true;
+                    return Ok(DrvTorqueProgress::Done(TorqueOutcome::Confirmed));
+                }
+                unreachable!("disable must route through begin_disable_torque_budgeted")
             }
             fn poll_torque_budgeted(&mut self, _: Instant, _: u16) -> Result<DrvTorqueProgress, ArmDriverError> {
                 if let Some(end) = self.handshake_end {
@@ -4262,9 +4515,9 @@ fn m4_disable_confirm_timeout_retries_in_background_preserving_original_timestam
                         return Ok(DrvTorqueProgress::Pending { wake: self.clock.now() + Duration::from_millis(20) });
                     }
                     self.handshake_end = None;
-                    return Ok(DrvTorqueProgress::Done(TorqueOutcome::Unconfirmed));
+                    return Err(ArmDriverError::Transport(TransportError::WouldBlock));
                 }
-                Ok(DrvTorqueProgress::Done(TorqueOutcome::Unconfirmed))
+                Err(ArmDriverError::Transport(TransportError::WouldBlock))
             }
             fn torque_transition_pending(&self) -> bool { self.handshake_end.is_some() }
             fn is_enabled(&self) -> bool { self.enabled }
@@ -4277,6 +4530,26 @@ fn m4_disable_confirm_timeout_retries_in_background_preserving_original_timestam
                 out.clear();
                 out.resize(self.dof, Some(Duration::from_millis(1)));
             }
+            fn has_driver_fresh_position_api(&self) -> bool {
+                true
+            }
+            fn fresh_joint_positions_into(
+                &self,
+                joints: &[usize],
+                max_age: Duration,
+                out: &mut [f32],
+            ) -> bool {
+                if joints.is_empty() || out.len() < joints.len() || Duration::from_millis(1) > max_age {
+                    return false;
+                }
+                for (dst, &j) in out.iter_mut().zip(joints.iter()) {
+                    let Some(&p) = self.positions.get(j) else {
+                        return false;
+                    };
+                    *dst = p;
+                }
+                true
+            }
             fn clock_now(&self) -> Instant { self.clock.now() }
         }
 
@@ -4286,6 +4559,7 @@ fn m4_disable_confirm_timeout_retries_in_background_preserving_original_timestam
         };
         let mclock = MockClock::new();
         let disable_calls = Arc::new(AtomicUsize::new(0));
+        let seen_started_at = Arc::new(Mutex::new(Vec::new()));
         let drv = SlowPendingDisableDriver {
             dof: cfg.dof,
             positions: cfg.resting_positions().to_vec(),
@@ -4293,6 +4567,7 @@ fn m4_disable_confirm_timeout_retries_in_background_preserving_original_timestam
             clock: mclock.clone(),
             handshake_end: None,
             disable_calls: Arc::clone(&disable_calls),
+            seen_started_at: Arc::clone(&seen_started_at),
         };
         let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
         inner.rt_executor_owned = true;
@@ -4312,39 +4587,53 @@ fn m4_disable_confirm_timeout_retries_in_background_preserving_original_timestam
         assert!(fx.step().command.unwrap().1.is_ok());
         assert!(fx.core.is_torqued);
 
-        // Start slow disable at t0: handshake runs 400 ms, then DisableConfirm runs 25 ms -> times out at t0+425ms.
+        // Start slow disable at t0: initial handshake runs 400 ms before failing (`< 500 ms`
+        // `BACKGROUND_DISABLE_MAX_WINDOW`), arming `BackgroundDisableRetry` with `started_at == t0`.
         let t0 = mclock.now();
         let a1 = fx.core.authority(&fx.ctx(fx.now()));
         b.submit(ClientId(1), 2, a1, fx.now() + Duration::from_secs(5), Submit::Transition(TransitionOp::TorqueOff)).unwrap();
         assert!(fx.step().command.unwrap().1.is_ok());
         assert_eq!(disable_calls.load(Ordering::SeqCst), 1);
 
-        let mut timed_out_at = None;
+        let mut failed_at = None;
         for _ in 0..40 {
             let r = fx.step();
-            if r.transition_ended.map(|(_, o)| o) == Some(Outcome::Failed("FEEDBACK_UNCONFIRMED")) {
-                timed_out_at = Some(mclock.now());
+            if r.transition_ended.map(|(_, o)| o) == Some(Outcome::Failed("DRIVER_WRITE_FAILED")) {
+                failed_at = Some(mclock.now());
                 break;
             }
         }
-        let timed_out_at = timed_out_at.expect("slow disable confirm must time out");
-        let elapsed_at_timeout = timed_out_at.saturating_duration_since(t0);
+        let failed_at = failed_at.expect("slow disable must fail after 400 ms");
+        let elapsed_at_fail = failed_at.saturating_duration_since(t0);
         assert!(
-            elapsed_at_timeout >= Duration::from_millis(420) && elapsed_at_timeout < Duration::from_millis(480),
-            "expected timeout around 425ms from t0, got {elapsed_at_timeout:?}"
+            elapsed_at_fail >= Duration::from_millis(400) && elapsed_at_fail < Duration::from_millis(460),
+            "expected failure around 400ms from t0, got {elapsed_at_fail:?}"
         );
 
-        // Step well past t0 + 1000 ms: because retries keep the original `t0` timestamp (500 ms
-        // window), only retries inside `[t0+425ms, t0+500ms)` can run (<= 3 total calls including
-        // the initial disable, NEVER 9 calls from a reset 500 ms window!).
+        // Step well past `t0 + STOPPED_DISABLE_REQUEST_LIFETIME` (1 s): call #2 consumes 450 ms
+        // (`t0+440ms -> t0+890ms`), leaving only ~100 ms before `t0 + 1 s` -> only 1..=2 extra
+        // retries can run (3..=4 total calls, NEVER 9 calls from a reset window!).
         for _ in 0..40 {
             let _ = fx.step();
         }
         let total_calls = disable_calls.load(Ordering::SeqCst);
         assert!(
-            (2..=3).contains(&total_calls),
-            "retries must honor original DisableRequested timestamp (500ms window from t0 => 1 initial + 1..=2 retries), got {total_calls} total calls"
+            (3..=5).contains(&total_calls),
+            "retries must honor original DisableRequested timestamp (1s window from t0 => 1 initial + slow retry + <=3 fast retries), got {total_calls} total calls"
         );
+        let stamps = seen_started_at.lock().unwrap().clone();
+        assert_eq!(stamps.len(), total_calls);
+        assert!(
+            stamps.iter().all(|&ts| ts == stamps[0]),
+            "every retry must preserve original DisableRequested {{ started_at }}: {stamps:?}"
+        );
+        assert!(
+            !fx.core.disable_pending,
+            "stopped DisableRequested must terminate when t0 + STOPPED_DISABLE_REQUEST_LIFETIME expires"
+        );
+        assert_eq!(fx.core.torque_intent(), armd::TorqueIntent::On);
+        assert!(matches!(fx.core.safety.state(), SafetyState::Fault(_)));
+        assert!(fx.core.safety.has_latched_fault_code(armd::safety::FaultCode::DriverWriteFailed));
         // Advancing even further must produce zero extra calls (exhausted permanently).
         for _ in 0..20 {
             let _ = fx.step();

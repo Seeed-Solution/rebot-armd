@@ -725,16 +725,20 @@ fn expired_lease_during_pending_torque_enable_preserves_step2_timing_and_revokes
     assert_eq!(fx.core.core.target_authority().stream, Some(servo_stream(g1)));
 
     // Simulate an in-flight TorqueTransition::Enable owned by g1.
-    fx.core.torque_transition = Some(TorqueTransition::Enable {
-        origin: crate::supervisor::driver_transitions::EnableOrigin::BrokerTransition,
-        was_torqued: false,
-        prev_gripper_cmd: None,
-        authority: EnableAuthority {
-            lease_generation: g1,
-            owner_conn_id: 1,
-            admitted_epoch: fx.core.safety.epoch_id(),
+    fx.core.torque_transition = Some(TorqueTransition::Enable(
+        crate::supervisor::driver_transitions::EnableReducer {
+            origin: crate::supervisor::driver_transitions::EnableOrigin::BrokerTransition,
+            phase: crate::supervisor::driver_transitions::EnableReducerPhase::Enable,
+            was_torqued: false,
+            prev_gripper_cmd: None,
+            authority: Some(EnableAuthority {
+                lease_generation: g1,
+                owner_conn_id: 1,
+                admitted_epoch: fx.core.safety.epoch_id(),
+            }),
+            budgeted: true,
         },
-    });
+    ));
 
     // Submit a target while the lease is live, then advance past lease_timeout (200 ms).
     let mut q = fx.core.commanded_positions.clone();
@@ -777,14 +781,19 @@ fn expired_lease_during_pending_torque_enable_preserves_step2_timing_and_revokes
         "Step 1 expiry fence must not prematurely abort TorqueTransition::Enable before Step 2"
     );
 
-    // Running the full release lets Step 2 abort TorqueTransition::Enable cleanly and Step 4
-    // refuse the buffered target with LEASE_LOST (zero motion output).
+    // Running the full release lets Step 2 abort TorqueTransition::Enable cleanly into FailedHold
+    // (latching ENABLE_FAILED and advancing epoch) and Step 4 refuse the buffered target with
+    // zero motion output (`EPOCH_MISMATCH` or `LEASE_LOST`).
     let rep = fx.step();
     assert!(
         fx.core.torque_transition.is_none(),
         "Step 2 service_torque_transition must abort the expired Enable transition"
     );
-    assert_eq!(rep.target.map(|(_, r)| r), Some(Err("LEASE_LOST")));
+    assert!(
+        matches!(rep.target.map(|(_, r)| r), Some(Err("LEASE_LOST" | "EPOCH_MISMATCH"))),
+        "Step 4 must refuse buffered target after Step 2 abort: {:?}",
+        rep.target
+    );
     assert_eq!(fx.core.servo_target, None);
     assert!((fx.core.commanded_positions[0] - q0).abs() < 1e-6);
 }

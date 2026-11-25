@@ -7,7 +7,7 @@ mod mit_support;
 static ALLOC: armd::diagnostics::alloc::TimedAlloc = armd::diagnostics::alloc::TimedAlloc;
 
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -21,7 +21,7 @@ use armd::diagnostics::tick::{
     TickSample, RELEASE_FLAG_CLEAR_OK, RELEASE_FLAG_CLEAR_REFUSED, RELEASE_FLAG_ESTOP_APPLIED,
     RELEASE_FLAG_INJECT_ALLOC, RELEASE_FLAG_THERMAL_TRIP, RELEASE_FLAG_WATCHDOG_LATCH,
 };
-use armd::driver::{ArmDriver, ArmDriverError, DamiaoArmDriver, DriverCapabilities, EnableState, JointTarget};
+use armd::driver::{ArmDriver, ArmDriverError, DamiaoArmDriver, DriverCapabilities, EnableState, JointTarget, StoppedDisableGate};
 use armd::model::JointState;
 use armd::protocol::damiao::DamiaoLimits;
 use armd::rt_core::executor::{ExecutorConfig, PersistTestHooks};
@@ -98,6 +98,29 @@ fn dm_limits() -> Vec<DamiaoLimits> {
     ArmConfig::rebot_dm().damiao_ranges.unwrap().iter().map(|r| r.limits()).collect()
 }
 
+fn seed_standalone_rest_gate(drv: &mut DamiaoArmDriver<FakeBus>, bus: &FakeBus, clock: &MockClock) {
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    for i in 0..6 {
+        arm_joints[i] = i;
+    }
+    drv.set_stopped_disable_gate(StoppedDisableGate {
+        safety_stopped: Arc::new(AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 6,
+        rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+        rest_pose_tolerance_rad: 0.05,
+    });
+    drv.read_joint_states().unwrap();
+    for step in 0..3 {
+        if step > 0 {
+            clock.advance(Duration::from_millis(12));
+        }
+        bus.with(|s| s.push_all_feedback());
+        drv.read_joint_states().unwrap();
+    }
+}
+
 fn assert_api_clear_fault_text(err: ClearFaultError, expected_msg: &str) {
     let safety_err = SafetyError::from(err);
     assert_eq!(safety_err, SafetyError::ClearFaultRejected(expected_msg.to_string()));
@@ -163,6 +186,17 @@ impl ArmDriver for RestingSupportDriver {
     }
     fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool {
         self.dof == dof && self.age.is_some_and(|a| a <= max_age)
+    }
+    fn fresh_joint_positions_into(&self, joints: &[usize], max_age: Duration, out: &mut [f32]) -> bool {
+        if joints.is_empty() || out.len() < joints.len() || !self.age.is_some_and(|a| a <= max_age) {
+            return false;
+        }
+        for (slot, &i) in out.iter_mut().zip(joints.iter()) {
+            let Some(&p) = self.positions.get(i) else { return false; };
+            if !p.is_finite() { return false; }
+            *slot = p;
+        }
+        true
     }
     fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) {
         out.clear(); let ms = self.age.map(|a| a.as_millis() as u64); for _ in 0..self.dof { out.push(ms); }
@@ -465,7 +499,8 @@ async fn clear_fault_refusals_zero_alloc_unchanged_outcome_and_identical_api_tex
     let bus = FakeBus::with_clock(&dm_limits(), clock.clone());
     bus.with(|s| { s.immediate_replies = true; s.push_all_feedback(); });
     let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7]).with_joint_limits(dm_limits()).unwrap();
-    drv.read_joint_states().unwrap();
+    seed_standalone_rest_gate(&mut drv, &bus, &clock);
+    drv.set_torque(false).unwrap();
     drv.check_mapping_ranges();
     let mut inner = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv));
     inner.lease_enabled = false;
@@ -1517,7 +1552,12 @@ fn paired_fault_kinds_refuse_clear_until_both_conditions_hold_and_report_most_se
             Ok((0..self.dof).map(|_| JointState { temperature: t, ..JointState::default() }).collect())
         }
         fn write_joint_targets(&mut self, _: &[JointTarget]) -> Result<(), ArmDriverError> { Ok(()) }
-        fn set_torque(&mut self, _: bool) -> Result<(), ArmDriverError> { Ok(()) }
+        fn set_torque(&mut self, enable: bool) -> Result<(), ArmDriverError> {
+            if !enable {
+                return Err(ArmDriverError::HardwareFault("bus busy".into()));
+            }
+            Ok(())
+        }
     }
     let mut sup_inner = SupervisorInner::new(cfg.clone()).with_driver(Box::new(AgeTempDriver {
         dof: cfg.dof,
@@ -1666,7 +1706,8 @@ fn mit_expiry_recovery_with_thermal_trip_recorded_is_refused_until_cooldown() {
     let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
         .with_joint_limits(limits.clone())
         .unwrap();
-    drv.read_joint_states().unwrap();
+    seed_standalone_rest_gate(&mut drv, &bus, &clock);
+    drv.set_torque(false).unwrap();
     drv.check_mapping_ranges();
 
     let mut jt = JointTrackingConfig::rebot_dm();
@@ -1770,14 +1811,22 @@ fn mit_expiry_recovery_with_thermal_trip_recorded_is_refused_until_cooldown() {
     assert!(inner.safety.has_latched_fault_kind(FaultKind::ThermalTrip));
     assert!(inner.safety.has_latched_fault_kind(FaultKind::BusLoss));
 
-    // Cool motor 0 below reset threshold -> confirmed MIT recovery now passes clear_check and clears all at once!
+    // Cool motor 0 below reset threshold and accumulate K=3 rest-pose samples across >= 20 ms ->
+    // confirmed MIT recovery now passes clear_check and clears all at once!
     bus.with(|s| s.motors[0].temperature_c = 35);
+    for i in 0..3 {
+        if i > 0 {
+            clock.advance(Duration::from_millis(12));
+        }
+        bus.with(|s| s.push_all_feedback());
+        inner.tick(DT);
+    }
     let mut cleared = false;
     for _ in 0..6 {
         match inner.clear_fault_confirmed(true) {
             Ok(SafetyState::Idle) => { cleared = true; break; }
             Ok(other) => panic!("unexpected state after MIT recovery: {other:?}"),
-            Err(_) => { clock.advance(Duration::from_millis(120)); inner.tick(DT); }
+            Err(_) => { clock.advance(Duration::from_millis(20)); inner.tick(DT); }
         }
     }
     assert!(cleared, "MIT recovery must succeed once ThermalTrip cooled down: {:?}", inner.clear_fault_confirmed(true));
@@ -2020,6 +2069,9 @@ fn arm_driver_error_write_bounded_and_clear_fault_error_cover_all_variants_zero_
         match e {
             ArmDriverError::Transport(_) => "Transport",
             ArmDriverError::Protocol(_) => "Protocol",
+            ArmDriverError::ProtocolStatic(_) => "ProtocolStatic",
+            ArmDriverError::AmbiguousDuplicateReply(_) => "AmbiguousDuplicateReply",
+            ArmDriverError::FeetechReadbackFailed { .. } => "FeetechReadbackFailed",
             ArmDriverError::JointCountMismatch { .. } => "JointCountMismatch",
             ArmDriverError::HardwareFault(_) => "HardwareFault",
             ArmDriverError::Timeout(_) => "Timeout",
@@ -2038,6 +2090,14 @@ fn arm_driver_error_write_bounded_and_clear_fault_error_cover_all_variants_zero_
             ArmDriverError::PosForcePreEnableHoldBudgetExhausted { .. } => "PosForcePreEnableHoldBudgetExhausted",
             ArmDriverError::PosForcePreEnableHoldTxFailed { .. } => "PosForcePreEnableHoldTxFailed",
             ArmDriverError::TxQueueFull { .. } => "TxQueueFull",
+            ArmDriverError::TorqueOffWouldDrop => "TorqueOffWouldDrop",
+            ArmDriverError::DisableRequestExpired => "DisableRequestExpired",
+            ArmDriverError::RangeCheckUnverified => "RangeCheckUnverified",
+            ArmDriverError::RangeCheckMismatch => "RangeCheckMismatch",
+            ArmDriverError::RxDrainTimeout => "RxDrainTimeout",
+            ArmDriverError::EnableTimeout { .. } => "EnableTimeout",
+            ArmDriverError::MotorHardwareFault { .. } => "MotorHardwareFault",
+            ArmDriverError::DisableMitFenceUnconfirmed => "DisableMitFenceUnconfirmed",
             ArmDriverError::LeaseFenced => "LeaseFenced",
         }
     }
@@ -2057,6 +2117,9 @@ fn arm_driver_error_write_bounded_and_clear_fault_error_cover_all_variants_zero_
             kind: std::io::ErrorKind::BrokenPipe,
         }),
         ArmDriverError::Protocol("bad register reply".into()),
+        ArmDriverError::ProtocolStatic("FEETECH_LINE_BUSY"),
+        ArmDriverError::AmbiguousDuplicateReply(2),
+        ArmDriverError::FeetechReadbackFailed { servo_id: 2, error_code: "FEETECH_READ_TIMEOUT" },
         ArmDriverError::JointCountMismatch { expected: 7, actual: 6 },
         ArmDriverError::HardwareFault("motor 2 overvoltage".into()),
         ArmDriverError::Timeout(4),
@@ -2090,6 +2153,18 @@ fn arm_driver_error_write_bounded_and_clear_fault_error_cover_all_variants_zero_
         ArmDriverError::PosForcePreEnableHoldBudgetExhausted { joint: 6 },
         ArmDriverError::PosForcePreEnableHoldTxFailed { joint: 6, kind: TxFailKind::Enobufs },
         ArmDriverError::TxQueueFull { queued: 30, new: 7, capacity: 32 },
+        ArmDriverError::TorqueOffWouldDrop,
+        ArmDriverError::DisableRequestExpired,
+        ArmDriverError::RangeCheckUnverified,
+        ArmDriverError::RangeCheckMismatch,
+        ArmDriverError::RxDrainTimeout,
+        ArmDriverError::EnableTimeout {
+            feedback_valid: true,
+            statuses: [1, 1, 0, 1, 1, 1, 1, 0],
+            dof: 7,
+        },
+        ArmDriverError::MotorHardwareFault { joint: 2, motor_id: 3, status: 0x08 },
+        ArmDriverError::DisableMitFenceUnconfirmed,
         ArmDriverError::LeaseFenced,
     ];
     #[cfg(unix)]
@@ -2294,7 +2369,8 @@ fn clear_check_runs_before_motor_reset_on_legacy_and_executor_paths() {
         let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
             .with_joint_limits(limits.clone())
             .unwrap();
-        drv.read_joint_states().unwrap();
+        seed_standalone_rest_gate(&mut drv, &bus, &clock);
+        drv.set_torque(false).unwrap();
         drv.check_mapping_ranges();
         let mut cfg = ArmConfig::rebot_dm();
         cfg.max_temperature = 75.0;
@@ -2398,12 +2474,18 @@ fn clear_check_runs_before_motor_reset_on_legacy_and_executor_paths() {
         }
         assert!(count_resets() >= 1, "use_executor={use_executor}: permitted reset must transmit CMD_CLEAR_FAULTS");
 
-        // 5. Motor clears fault bit & sends fresh fault-free feedback -> subsequent clear passes full clear_check!
+        // 5. Motor clears fault bit & sends K=3 fresh fault-free feedback samples across >= 20 ms ->
+        // subsequent clear passes full clear_check!
         bus.with(|s| {
             s.motors[0].state_override = None;
-            s.push_all_feedback();
         });
-        let _ = inner.poll_hardware(&ServiceBudget::for_release(clock.now(), clock.now() + Duration::from_millis(20)));
+        for i in 0..3 {
+            if i > 0 {
+                clock.advance(Duration::from_millis(12));
+            }
+            bus.with(|s| s.push_all_feedback());
+            let _ = inner.poll_hardware(&ServiceBudget::for_release(clock.now(), clock.now() + Duration::from_millis(20)));
+        }
         // Two-stage clear because step 3 consumed pending E-stop into `e_stop_latched`.
         if use_executor {
             let s1 = inner.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)).unwrap();
@@ -2439,7 +2521,8 @@ fn mit_expiry_recovery_final_check_uses_post_recovery_feedback() {
         let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
             .with_joint_limits(limits.clone())
             .unwrap();
-        drv.read_joint_states().unwrap();
+        seed_standalone_rest_gate(&mut drv, &bus, &clock);
+        drv.set_torque(false).unwrap();
         drv.check_mapping_ranges();
 
         let mut jt = JointTrackingConfig::rebot_dm();
@@ -2513,13 +2596,13 @@ fn mit_expiry_recovery_final_check_uses_post_recovery_feedback() {
             inner.tick(DT);
         }
         assert!(bus.with(|s| s.motors[3].state_override == Some(0xD) && !s.motors[3].enabled));
-        (inner, bus, cfg)
+        (inner, bus, clock, cfg)
     };
 
     // (a) Motor 0 is cool (35 C) BEFORE recovery, then jumps to 85 C DURING `mit_expiry_recover()` ->
     // final check MUST inspect post-recovery temperatures and refuse to clear!
     {
-        let (mut inner, bus, _cfg) = setup_expired_mit();
+        let (mut inner, bus, clock, _cfg) = setup_expired_mit();
         inner.safety.latch(
             FaultKind::ThermalTrip,
             FaultDetail::ThermalTrip { joint_idx: 0, temperature: 80.0, limit: 75.0 },
@@ -2531,6 +2614,13 @@ fn mit_expiry_recovery_final_check_uses_post_recovery_feedback() {
                 st.motors[0].temperature_c = 85;
             }));
         });
+        for i in 0..3 {
+            if i > 0 {
+                clock.advance(Duration::from_millis(12));
+            }
+            bus.with(|s| s.push_all_feedback());
+            inner.tick(DT);
+        }
         let err = inner.clear_fault_confirmed(true).unwrap_err();
         assert!(
             err.to_string().contains("Temperature must be confirmed below the reset threshold"),
@@ -2543,18 +2633,32 @@ fn mit_expiry_recovery_final_check_uses_post_recovery_feedback() {
     // (b) Joint 0 is at home BEFORE recovery, then moves beyond soft limit DURING `mit_expiry_recover()` ->
     // final check MUST inspect post-recovery joint positions and refuse to clear!
     {
-        let (mut inner, bus, cfg) = setup_expired_mit();
+        let (mut inner, bus, clock, cfg) = setup_expired_mit();
         inner.safety.latch(
             FaultKind::JointLimit,
             FaultDetail::formatted(FaultCode::JointLimit, |b| b.push_str("joint 1 out of limits")),
         );
         let over_limit = cfg.limits[0].max_position + 0.3;
+        let disable_frames = Arc::new(AtomicUsize::new(0));
+        let disable_frames_cb = Arc::clone(&disable_frames);
         bus.with(|s| {
             s.motors[0].q = cfg.home_positions[0];
             s.on_disable_state = Some(Arc::new(move |st| {
-                st.motors[0].q = over_limit;
+                // R10 disable sends 3 repeats x 7 motors = 21 CMD_DISABLE frames.
+                // Move J0 over limit on the 15th frame (J0 on the 3rd/final pass) so
+                // passes 1-2 pass Rule A' at rest and post-recovery feedback reports over_limit.
+                if disable_frames_cb.fetch_add(1, Ordering::Relaxed) + 1 >= 15 {
+                    st.motors[0].q = over_limit;
+                }
             }));
         });
+        for i in 0..3 {
+            if i > 0 {
+                clock.advance(Duration::from_millis(12));
+            }
+            bus.with(|s| s.push_all_feedback());
+            inner.tick(DT);
+        }
         let err = inner.clear_fault_confirmed(true).unwrap_err();
         assert!(
             err.to_string().contains("within limits"),
@@ -2661,11 +2765,12 @@ fn mit_expiry_recovery_final_check_uses_post_recovery_feedback() {
         inner.safety.latch(FaultKind::J7FeedbackStale, FaultDetail::J7FeedbackStale(None));
 
         // During `mit_expiry_recover()`, move motor 0 to a distinct position AND mute J7 after
-        // advancing > 100 ms so post-recovery J7 freshness fails!
+        // advancing > 100 ms so post-recovery J7 freshness fails! Keep motor 0 at rest before
+        // `clear_fault_confirmed(true)` so R10's Rule A′ rest-pose gate passes and exercises
+        // the post-recovery stale-J7 check.
         let prev_measured_j0 = inner.measured_positions[0];
         let clock_cb = clock.clone();
         bus.with(|s| {
-            s.motors[0].q = prev_measured_j0 + 0.25;
             s.on_disable_state = Some(Arc::new(move |st| {
                 st.motors[0].q = prev_measured_j0 + 0.35;
                 st.motors[6].mute_feedback = true;
@@ -2698,7 +2803,8 @@ fn clear_evidence_stale_temp_resets_cooldown_expired_lease_clears_and_joint_limi
     let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
         .with_joint_limits(limits.clone())
         .unwrap();
-    drv.read_joint_states().unwrap();
+    seed_standalone_rest_gate(&mut drv, &bus, &clock);
+    drv.set_torque(false).unwrap();
     drv.check_mapping_ranges();
     let mut cfg = ArmConfig::rebot_dm();
     cfg.max_temperature = 75.0;
@@ -3013,7 +3119,8 @@ fn thermal_cooldown_restarts_across_unobserved_stale_gap_without_tick() {
         let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
             .with_joint_limits(limits)
             .unwrap();
-        drv.read_joint_states().unwrap();
+        seed_standalone_rest_gate(&mut drv, &bus, &clock);
+        drv.set_torque(false).unwrap();
         drv.check_mapping_ranges();
         let mut cfg = ArmConfig::rebot_dm();
         cfg.max_temperature = 75.0;
@@ -3348,7 +3455,8 @@ fn mit_recovery_no_fence_ack_or_state_change_before_clear_check_passes() {
         let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
             .with_joint_limits(limits.clone())
             .unwrap();
-        drv.read_joint_states().unwrap();
+        seed_standalone_rest_gate(&mut drv, &bus, &clock);
+        drv.set_torque(false).unwrap();
         drv.check_mapping_ranges();
 
         let mut jt = JointTrackingConfig::rebot_dm();
@@ -3426,8 +3534,23 @@ fn mit_recovery_no_fence_ack_or_state_change_before_clear_check_passes() {
         (inner, bus, clock)
     };
 
+    let assert_mit_fence_unacked = |log: &[armd::transport::CanFrame], ctx: &str| {
+        assert!(
+            !log.iter().any(|f| f.id == 0x7FF && f.data[2] == 0xCC),
+            "{ctx}: autonomous 0xCC CAN refresh must stay blocked while MIT fence is unacked: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|f| f.id == 4 || f.id == 0x104),
+            "{ctx}: fenced MIT joint J4 must receive 0 frames while MIT fence is unacked: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|f| f.data == damiao::CMD_DISABLE),
+            "{ctx}: 0 CMD_DISABLE frames allowed while recovery is refused: {log:?}"
+        );
+    };
+
     // (a) Quiet-period refusal MUST NOT ack the fence: after holdoff elapses, background ticks
-    //     must still emit 0 autonomous 0xCC CAN refresh frames.
+    //     must still emit 0 autonomous 0xCC CAN refresh frames and 0 J4 MIT frames.
     {
         let (mut inner, bus, clock) = setup_mit_lost(false);
         bus.clear_log();
@@ -3439,15 +3562,12 @@ fn mit_recovery_no_fence_ack_or_state_change_before_clear_check_passes() {
             clock.advance(Duration::from_millis(120));
             inner.tick(DT);
         }
-        assert!(
-            bus.tx_log().is_empty(),
-            "failed quiet-period clear must NOT ack fence or unlock autonomous CAN refresh: {:?}",
-            bus.tx_log()
-        );
+        assert_mit_fence_unacked(&bus.tx_log(), "failed quiet-period clear");
     }
 
     // (b) WatchdogTimeout with active lease + stale heartbeat MUST refuse in pre_ctx BEFORE
-    //     even polling 0xCC, leaving fence unacked and state unchanged.
+    //     even polling 0xCC, leaving fence unacked and state unchanged (B2: non-MIT position
+    //     joints still keep their stationary holds, while J4 MIT & 0xCC refresh stay blocked).
     {
         let (mut inner, bus, clock) = setup_mit_lost(true);
         inner.lease_enabled = true;
@@ -3463,7 +3583,7 @@ fn mit_recovery_no_fence_ack_or_state_change_before_clear_check_passes() {
             clock.advance(Duration::from_millis(120));
             inner.tick(DT);
         }
-        assert!(bus.tx_log().is_empty(), "fence must stay unacked after heartbeat refusal: {:?}", bus.tx_log());
+        assert_mit_fence_unacked(&bus.tx_log(), "heartbeat refusal");
     }
 
     // (c) Hot ThermalTrip during MIT recovery MUST refuse in full clear_check with ZERO fence ack
@@ -3476,8 +3596,11 @@ fn mit_recovery_no_fence_ack_or_state_change_before_clear_check_passes() {
         );
         let temps_before = inner.temperatures.clone();
         let pos_before = inner.measured_positions.clone();
+        // Keep temperature above the reset threshold (75 - 5 = 70 C) so clear_check refuses
+        // while staying <= max_temperature (75 C) so subsequent energized ticks do not fire a
+        // new active R12 B4 thermal protective disable cut.
         bus.with(|s| {
-            s.motors[0].temperature_c = 85;
+            s.motors[0].temperature_c = 73;
             s.motors[0].q = 0.25;
         });
         bus.clear_log();
@@ -3491,26 +3614,34 @@ fn mit_recovery_no_fence_ack_or_state_change_before_clear_check_passes() {
             "no recovery commands allowed when clear_check refuses: {:?}",
             bus.tx_log()
         );
-        // Subsequent ticks MUST send 0 autonomous CAN refresh frames (fence was NOT acked!).
+        // Subsequent ticks MUST send 0 autonomous CAN refresh frames & 0 J4 frames (fence NOT acked!).
         bus.clear_log();
         for _ in 0..4 {
             clock.advance(Duration::from_millis(120));
             inner.tick(DT);
         }
-        assert!(
-            bus.tx_log().is_empty(),
-            "autonomous CAN refresh must stay blocked after ThermalTrip refused MIT clear: {:?}",
-            bus.tx_log()
-        );
+        assert_mit_fence_unacked(&bus.tx_log(), "ThermalTrip refused MIT clear");
 
-        // (d) Cool motor 0 to 35 C and move J0 to 0.40 rad, but omit confirmation -> refused with
-        //     RECOVERY_CONFIRM_CODE, still ZERO fence ack and ZERO state mutation!
+        // (d) Cool motor 0 to 35 C and nudge J0 to 0.03 rad (within the 0.05 rad rest tolerance
+        //     so Rule A' allows recovery, while distinct from 0.0 to detect state mutation), feed K=3
+        //     causal rest samples to the driver without mutating supervisor state, and omit
+        //     confirmation -> refused with RECOVERY_CONFIRM_CODE, still ZERO fence ack and
+        //     ZERO state mutation!
         let pos_before_unconf = inner.measured_positions.clone();
         let temps_before_unconf = inner.temperatures.clone();
         bus.with(|s| {
             s.motors[0].temperature_c = 35;
-            s.motors[0].q = 0.40;
+            s.motors[0].q = 0.03;
         });
+        for i in 0..3 {
+            if i > 0 {
+                clock.advance(Duration::from_millis(12));
+            }
+            bus.with(|s| s.push_all_feedback());
+            let mut drv = inner.driver.as_mut().unwrap().write().unwrap();
+            drv.begin_control_release(100 + i as u64);
+            drv.read_joint_states().unwrap();
+        }
         let err_unconf = inner.clear_fault_confirmed(false).unwrap_err();
         assert!(matches!(err_unconf, ArmError::Rejected { ref code, .. } if code == mit::RECOVERY_CONFIRM_CODE), "{err_unconf}");
         assert_eq!(inner.mit.owner, mit::MitOwner::Lost);
@@ -3521,14 +3652,17 @@ fn mit_recovery_no_fence_ack_or_state_change_before_clear_check_passes() {
             clock.advance(Duration::from_millis(120));
             inner.tick(DT);
         }
-        assert!(
-            bus.tx_log().is_empty(),
-            "autonomous CAN refresh must stay blocked when recovery confirmation is missing: {:?}",
-            bus.tx_log()
-        );
+        assert_mit_fence_unacked(&bus.tx_log(), "unconfirmed MIT clear");
 
         // (e) Now full clear_check passes + confirmed -> recovery succeeds, clears to Idle,
         //     mit.owner becomes Off, and fence is now acknowledged so read-only polls may resume.
+        for i in 0..3 {
+            if i > 0 {
+                clock.advance(Duration::from_millis(12));
+            }
+            bus.with(|s| s.push_all_feedback());
+            inner.tick(DT);
+        }
         let cleared = inner.clear_fault_confirmed(true).unwrap();
         assert_eq!(cleared, SafetyState::Idle);
         assert_eq!(inner.mit.owner, mit::MitOwner::Off);
@@ -3570,6 +3704,16 @@ fn mit_recovery_final_read_rejects_cached_feedback_without_post_recovery_rx_seq(
         fn enable_state(&self) -> EnableState { EnableState::Disabled }
         fn is_feedback_valid(&self) -> bool { true }
         fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::from_millis(5)); self.dof] }
+        fn fresh_joint_positions_into(&self, joints: &[usize], max_age: Duration, out: &mut [f32]) -> bool {
+            if max_age < Duration::from_millis(5) || out.len() < joints.len() {
+                return false;
+            }
+            for (slot, &i) in out.iter_mut().zip(joints.iter()) {
+                let Some(s) = self.states.get(i) else { return false; };
+                *slot = s.position;
+            }
+            true
+        }
         fn feedback_seqs(&self) -> Vec<u64> { self.seqs.clone() }
         fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
             // Returns pre-recovery cached states without advancing `seqs`.
@@ -3591,7 +3735,6 @@ fn mit_recovery_final_read_rejects_cached_feedback_without_post_recovery_rx_seq(
     }
 
     let cfg = ArmConfig {
-        resting_pose: None,
         workspace: None,
         ..ArmConfig::rebot_dm()
     };
@@ -3643,6 +3786,7 @@ fn mit_recovery_final_read_rejects_cached_feedback_without_post_recovery_rx_seq(
     dm.read_joint_states().unwrap();
     dm.check_mapping_ranges();
     dm.set_torque(true).unwrap();
+    seed_standalone_rest_gate(&mut dm, &bus, &clock);
     // Queue a pre-recovery state-0 frame for motor 0 BEFORE mit_expiry_recover() is requested,
     // and make motor 0 drop its disable command reply.
     let stale_state0_j1 = bus.with(|s| {

@@ -200,6 +200,92 @@ thread_local! {
     static TX_TICK: Cell<TxTickMetrics> = const { Cell::new(TxTickMetrics::ZERO) };
 }
 
+/// Monotonic counter of stopped-hold TX ticks skipped because `driver.try_lock()` was contended
+/// (L3: stopped-hold TX never blocks on the driver mutex).
+static STOPPED_HOLD_LOCK_CONTENDED: AtomicU64 = AtomicU64::new(0);
+/// Monotonic counter of stopped-hold `try_lock` contention escalations triggered after
+/// `STOPPED_HOLD_CONTENTION_ESCALATE_SKIPS` (25) consecutive contended ticks (0.5 s at 50 Hz).
+static STOPPED_HOLD_CONTENTION_ESCALATIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Record one stopped-hold TX tick skipped due to driver mutex contention (zero allocation).
+#[inline]
+pub fn record_stopped_hold_lock_contended() {
+    STOPPED_HOLD_LOCK_CONTENDED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Total stopped-hold TX ticks skipped due to driver mutex contention since boot.
+#[inline]
+pub fn stopped_hold_lock_contended_count() -> u64 {
+    STOPPED_HOLD_LOCK_CONTENDED.load(Ordering::Relaxed)
+}
+
+/// Reset the stopped-hold driver lock contention counter (tests).
+#[inline]
+pub fn reset_stopped_hold_lock_contended() {
+    STOPPED_HOLD_LOCK_CONTENDED.store(0, Ordering::Relaxed);
+}
+
+/// Record one stopped-hold `try_lock` contention escalation warning/fault (zero allocation).
+#[inline]
+pub fn record_stopped_hold_contention_escalation() {
+    STOPPED_HOLD_CONTENTION_ESCALATIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Total stopped-hold `try_lock` contention escalations since boot.
+#[inline]
+pub fn stopped_hold_contention_escalations_count() -> u64 {
+    STOPPED_HOLD_CONTENTION_ESCALATIONS.load(Ordering::Relaxed)
+}
+
+/// Reset the stopped-hold `try_lock` contention escalation counter (tests).
+#[inline]
+pub fn reset_stopped_hold_contention_escalations() {
+    STOPPED_HOLD_CONTENTION_ESCALATIONS.store(0, Ordering::Relaxed);
+}
+
+/// Monotonic counter of RT disable dispatch/poll ticks skipped because `driver.try_lock()` was
+/// contended (M4: `armd-control` disable paths never block on the driver mutex).
+static DISABLE_LOCK_CONTENDED: AtomicU64 = AtomicU64::new(0);
+/// Monotonic counter of RT disable `try_lock` contention escalations triggered after
+/// `STOPPED_HOLD_CONTENTION_ESCALATE_SKIPS` (25) consecutive contended ticks (0.5 s at 50 Hz).
+static DISABLE_CONTENTION_ESCALATIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Record one RT disable dispatch/poll tick skipped due to driver mutex contention (zero allocation).
+#[inline]
+pub fn record_disable_lock_contended() {
+    DISABLE_LOCK_CONTENDED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Total RT disable dispatch/poll ticks skipped due to driver mutex contention since boot.
+#[inline]
+pub fn disable_lock_contended_count() -> u64 {
+    DISABLE_LOCK_CONTENDED.load(Ordering::Relaxed)
+}
+
+/// Reset the RT disable driver lock contention counter (tests).
+#[inline]
+pub fn reset_disable_lock_contended() {
+    DISABLE_LOCK_CONTENDED.store(0, Ordering::Relaxed);
+}
+
+/// Record one RT disable `try_lock` contention escalation warning/fault (zero allocation).
+#[inline]
+pub fn record_disable_contention_escalation() {
+    DISABLE_CONTENTION_ESCALATIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Total RT disable `try_lock` contention escalations since boot.
+#[inline]
+pub fn disable_contention_escalations_count() -> u64 {
+    DISABLE_CONTENTION_ESCALATIONS.load(Ordering::Relaxed)
+}
+
+/// Reset the RT disable `try_lock` contention escalation counter (tests).
+#[inline]
+pub fn reset_disable_contention_escalations() {
+    DISABLE_CONTENTION_ESCALATIONS.store(0, Ordering::Relaxed);
+}
+
 /// Calling thread's CPU time in nanoseconds from `CLOCK_THREAD_CPUTIME_ID` (Linux; 0 elsewhere).
 #[inline]
 pub fn thread_cpu_ns() -> u64 {
@@ -587,6 +673,18 @@ pub struct TxDiagnostics {
     pub since_boot_deferred: u64,
     pub since_boot_dropped_stale: u64,
     pub since_boot_dropped_stopped: u64,
+    /// Stopped-hold TX ticks skipped because `driver.try_lock()` was contended (L3).
+    #[serde(default)]
+    pub stopped_hold_lock_contended: u64,
+    /// Stopped-hold `try_lock` contention escalations triggered after 25 consecutive skips (0.5 s).
+    #[serde(default)]
+    pub stopped_hold_contention_escalations: u64,
+    /// RT disable dispatch/poll ticks skipped because `driver.try_lock()` was contended (M4).
+    #[serde(default)]
+    pub disable_lock_contended: u64,
+    /// RT disable `try_lock` contention escalations triggered after 25 consecutive skips (0.5 s).
+    #[serde(default)]
+    pub disable_contention_escalations: u64,
 }
 
 /// Coherent per-run baseline deltas and peaks since the latest operator
@@ -1686,6 +1784,10 @@ impl TickWindow {
                 since_boot_deferred: self.tx_totals.deferred,
                 since_boot_dropped_stale: self.tx_totals.dropped_stale,
                 since_boot_dropped_stopped: self.tx_totals.dropped_stopped,
+                stopped_hold_lock_contended: stopped_hold_lock_contended_count(),
+                stopped_hold_contention_escalations: stopped_hold_contention_escalations_count(),
+                disable_lock_contended: disable_lock_contended_count(),
+                disable_contention_escalations: disable_contention_escalations_count(),
             },
             control_thread: None,
             observation_cache: ObservationCacheStats::default(),
