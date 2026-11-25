@@ -1002,9 +1002,9 @@ fn hardware_without_calibrated_resting_pose_refuses_stopped_torque_off_on_both_o
 
 #[test]
 fn silent_gripper_does_not_block_arm_joint_rest_admission_and_driverless_missing_feedback_refuses() {
-    // 1. M2: Damiao rest gate covers EVERY motor that receives CMD_DISABLE, J7 included.
-    //    Silent J7 (> 150 ms) MUST block Damiao rest-pose admission until J7 provides K=3
-    //    fresh valid samples, at which point ANY finite jaw position (no pose tolerance) passes.
+    // 1. Rest pose is judged from K=3 fresh causal feedback on J1..J6 ONLY.
+    //    Silent/stale J7 (> 150 ms) MUST NOT block Damiao rest-pose admission when J1..J6 have
+    //    K=3 fresh rest samples.
     let (mut inner, bus, clock) = make_driver_rig();
     enable_torque_admitted(&mut inner).unwrap();
     inner.safety.trigger_fault_coded(FaultCode::BusLoss, FaultReason::BusLoss);
@@ -1029,12 +1029,12 @@ fn silent_gripper_does_not_block_arm_joint_rest_admission_and_driverless_missing
     }
     assert_eq!(
         inner.may_disable_torque_while_stopped(),
-        Err(StoppedTorqueOffRefusal::StaleOrMissingFeedback),
-        "M2: silent J7 (receives CMD_DISABLE) must block Damiao rest-pose gate until K=3 fresh J7 samples arrive"
+        Ok(()),
+        "silent J7 must NOT block Damiao rest-pose gate when J1..J6 have K=3 fresh rest samples"
     );
 
     // Unmute J7 at an arbitrary non-zero jaw position (1.75 rad, well outside arm tolerance):
-    // K=3 fresh J7 samples must confirm the gate because J7 rest is any finite jaw position.
+    // still passes because J7 is excluded from the rest-pose gate.
     bus.with(|s| {
         s.motors[6].silent = false;
         s.motors[6].q = 1.75;
@@ -1047,7 +1047,7 @@ fn silent_gripper_does_not_block_arm_joint_rest_admission_and_driverless_missing
     assert_eq!(
         inner.may_disable_torque_while_stopped(),
         Ok(()),
-        "M2: J7 at any finite jaw position with K=3 fresh samples must pass Damiao rest-pose gate"
+        "J7 at any jaw position must not block Damiao rest-pose gate"
     );
 
     // If an arm joint (J3) goes stale (> 100 ms), admission MUST refuse.
@@ -1279,7 +1279,8 @@ fn fresh_driver_timestamps_never_vouch_for_stale_measured_positions_and_zero_off
     assert!(inner.is_torqued);
 
     // Move J2 back to rest with K=3 fresh J1..J6 feedback samples while J7 is STILL silent:
-    // M2 requires K=3 fresh samples on every motor receiving CMD_DISABLE (J7 included).
+    // Rest pose is judged from J1..J6 ONLY, so admission succeeds from fresh driver samples
+    // even while `inner.feedback_numeric_valid` is false and J7 is silent.
     inner.feedback_numeric_valid = false;
     bus.with(|s| {
         s.motors[1].q = 0.0;
@@ -1299,11 +1300,11 @@ fn fresh_driver_timestamps_never_vouch_for_stale_measured_positions_and_zero_off
     }
     assert_eq!(
         inner.may_disable_torque_while_stopped(),
-        Err(StoppedTorqueOffRefusal::StaleOrMissingFeedback),
-        "M2: silent J7 must keep Damiao rest gate unconfirmed"
+        Ok(()),
+        "silent J7 must not block Damiao rest gate once J1..J6 have K=3 fresh rest samples"
     );
     // Unmute J7 at arbitrary jaw angle (-2.0 rad) with K=3 fresh samples while
-    // `inner.feedback_numeric_valid` remains false -> admission succeeds from fresh driver samples.
+    // `inner.feedback_numeric_valid` remains false -> admission still succeeds.
     bus.with(|s| {
         s.motors[6].silent = false;
         s.motors[6].q = -2.0;
@@ -8856,40 +8857,87 @@ fn r11_m1_reported_enable_state_is_telemetry_when_holding_and_keeps_holds_on_mot
 }
 
 #[test]
-fn r11_m2_damiao_rest_gate_covers_every_cmd_disable_motor_including_j7() {
+fn r11_m2_damiao_rest_gate_checks_arm_joints_only_and_probes_silent_arm_joint() {
+    // Part A: A silent/stale J7 gripper alone MUST NOT block rest-pose disable when J1..J6
+    // have K=3 fresh causal rest samples.
+    {
+        let mut r = ExecRig::new();
+        r.arm_now();
+        r.fx.core.safety.trigger_fault_coded(FaultCode::BusLoss, FaultReason::BusLoss);
+
+        r.bus.with(|s| {
+            s.follow_commands = false;
+            s.rx.clear();
+            s.pending.clear();
+            s.delayed.clear();
+            s.motors[6].silent = true;
+        });
+        r.clock.advance(Duration::from_millis(120));
+        r.step(); // observe empty RX queue boundary
+        for _ in 0..3 {
+            r.clock.advance(Duration::from_millis(10));
+            r.bus.with(|s| {
+                for j in 0..6 {
+                    s.push_feedback(j);
+                }
+            });
+            r.step();
+        }
+
+        r.bus.clear_log();
+        r.submit_transition(TransitionOp::TorqueOff);
+        let rep0 = r.step();
+        assert!(
+            matches!(rep0.command, Some((_, Ok(_)))),
+            "silent J7 with K=3 fresh rest J1..J6 must admit TorqueOff, got {:?}",
+            rep0.command
+        );
+        // Let motors reply to CMD_DISABLE (J7 stays silent, so unmute J7 only for disable-ack
+        // or check CMD_DISABLE was already dispatched immediately on J1..J6 rest confirmation).
+        let disable_count = r
+            .bus
+            .tx_log()
+            .iter()
+            .filter(|f| f.data == damiao::CMD_DISABLE)
+            .count();
+        assert!(
+            disable_count >= 7,
+            "silent J7 must NOT block CMD_DISABLE dispatch when J1..J6 are confirmed at rest (sent {disable_count})"
+        );
+    }
+
+    // Part B: A silent/stale arm joint (J6, index 5) MUST still block rest-pose disable,
+    // defer into AwaitRestGate with 0 CMD_DISABLE frames, emit 0xCC probes for J6, and
+    // complete only once J6 reaches K=3 fresh causal rest samples across 3 distinct releases.
     let mut r = ExecRig::new();
     r.arm_now();
     r.fx.core.safety.trigger_fault_coded(FaultCode::BusLoss, FaultReason::BusLoss);
 
-    // Silence J7 while J1..J6 accumulate K=3 fresh rest samples across 3 distinct releases.
     r.bus.with(|s| {
         s.follow_commands = false;
         s.rx.clear();
         s.pending.clear();
         s.delayed.clear();
-        s.motors[6].silent = true;
+        s.motors[5].silent = true;
     });
-    // Wait > 100 ms so J7's prior feedback expires.
     r.clock.advance(Duration::from_millis(120));
     r.step(); // observe empty RX queue boundary
     for _ in 0..3 {
         r.clock.advance(Duration::from_millis(10));
         r.bus.with(|s| {
-            for j in 0..6 {
+            for j in [0usize, 1, 2, 3, 4, 6] {
                 s.push_feedback(j);
             }
         });
         r.step();
     }
 
-    // With J7 stale, Damiao rest gate MUST NOT be Confirmed: M3 defers into AwaitRestGate with
-    // 0 CMD_DISABLE frames while probing J7 across releases!
     r.bus.clear_log();
     r.submit_transition(TransitionOp::TorqueOff);
     let rep0 = r.step();
     assert!(
         matches!(rep0.command, Some((_, Ok(_)))),
-        "M2+M3: TorqueOff with silent J7 defers in AwaitRestGate, got {:?}",
+        "M3: TorqueOff with silent J6 defers in AwaitRestGate, got {:?}",
         rep0.command
     );
     assert!(rep0.transition_ended.is_none());
@@ -8897,37 +8945,36 @@ fn r11_m2_damiao_rest_gate_covers_every_cmd_disable_motor_including_j7() {
         let rep = r.step();
         assert!(
             rep.transition_ended.is_none(),
-            "M2: TorqueOff must remain pending while J7 is silent"
+            "TorqueOff must remain pending while arm joint J6 is silent"
         );
     }
     assert_eq!(
         r.bus.tx_log().iter().filter(|f| f.data == damiao::CMD_DISABLE).count(),
         0,
-        "M2: silent J7 must prevent CMD_DISABLE transmission even when J1..J6 are confirmed at rest"
+        "silent J6 must prevent CMD_DISABLE transmission"
     );
     assert!(
-        r.bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data[0] == 7 && f.data[2] == 0xCC),
-        "M2: poll_await_rest_gate must emit 0xCC probe for J7 (motor 7)"
+        r.bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data[0] == 6 && f.data[2] == 0xCC),
+        "poll_await_rest_gate must emit 0xCC probe for silent arm joint J6 (motor 6)"
     );
     assert!(r.fx.core.is_torqued);
     assert_eq!(r.fx.core.torque_intent, armd::TorqueIntent::On);
 
-    // Unmute J7 at an arbitrary non-zero jaw position (-2.5 rad, far outside arm rest tolerance):
-    // 1st J7 sample is NOT enough (gate stays PendingDrainOrWindow, 0 CMD_DISABLE); once probes
-    // collect K=3 fresh J7 samples across 3 releases, the SAME pending TorqueOff completes!
+    // Unmute J6 at rest (0.0 rad): 1st sample is NOT enough (K=3 causal window required);
+    // once probes collect K=3 fresh J6 samples across 3 releases, TorqueOff completes!
     r.bus.with(|s| {
-        s.motors[6].silent = false;
-        s.motors[6].q = -2.5;
+        s.motors[5].silent = false;
+        s.motors[5].q = 0.0;
     });
     let rep1 = r.step();
     assert!(
         rep1.transition_ended.is_none(),
-        "M2: single J7 sample must not satisfy K=3 rest gate yet"
+        "single J6 sample must not satisfy K=3 rest gate yet"
     );
     assert_eq!(
         r.bus.tx_log().iter().filter(|f| f.data == damiao::CMD_DISABLE).count(),
         0,
-        "M2: 0 CMD_DISABLE frames before J7 reaches K=3"
+        "0 CMD_DISABLE frames before J6 reaches K=3"
     );
 
     let mut completed = false;
@@ -8937,16 +8984,16 @@ fn r11_m2_damiao_rest_gate_covers_every_cmd_disable_motor_including_j7() {
             assert_eq!(
                 outcome,
                 Outcome::Completed,
-                "M2: TorqueOff must complete once J7 reaches K=3 at -2.5 rad: {outcome:?}"
+                "TorqueOff must complete once J6 reaches K=3 at rest: {outcome:?}"
             );
             completed = true;
             break;
         }
     }
-    assert!(completed, "M2: TorqueOff must complete after J7 probes collect K=3 samples");
+    assert!(completed, "TorqueOff must complete after J6 probes collect K=3 samples");
     assert!(
         r.bus.tx_log().iter().filter(|f| f.data == damiao::CMD_DISABLE).count() >= 7,
-        "M2: all 7 motors receive CMD_DISABLE once J7 reaches K=3"
+        "all 7 motors receive CMD_DISABLE once J1..J6 reach K=3"
     );
     assert!(!r.fx.core.is_torqued);
     assert_eq!(r.fx.core.torque_intent, armd::TorqueIntent::Off);
