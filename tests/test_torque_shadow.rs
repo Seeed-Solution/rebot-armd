@@ -2203,33 +2203,58 @@ async fn r1_review_regressions_comparator_remount_unknown_queue_and_disabled_all
         handle.stop_and_join();
     }
 
-    // (f) B2: Damiao live rest-settle boundary with independently sampled realtime clock is
-    //     identical with shadow ON vs OFF (staging runs strictly AFTER capture_rx_clock_sample).
+    // (f) B2 + R2-M19: Damiao live 20 ms rest-settle boundary with independently sampled realtime
+    //     clock is identical with shadow ON vs OFF BELOW (19 ms), AT (20 ms), and ABOVE (21 ms)
+    //     using the actual K=3 stopped rest-gate disable decision!
     {
-        fn probe_settle(shadow: bool) -> bool {
+        fn probe_rest_gate(shadow: bool, dt_ms: u64) -> bool {
             let clock = Arc::new(MockClock::new());
             let bus = FakeCan::new(clock.clone());
             bus.with(|s| {
                 s.kernel_realtime_ns = Some(10_000_000_000);
                 s.realtime_minus_mono_ns = Some(10_000_000_000);
+                s.set_pose(&[0.0; 7]);
             });
             let cfg = build_dm_config(shadow);
             let mut drv = build_dm_driver(bus.clone(), &cfg);
             drv.set_shadow_enabled(shadow);
-            let targets = vec![armd::driver::JointTarget::position(0.0); 7];
-            let _ = drv.write_joint_targets(&targets);
-            // Advance exactly 21 ms (> 20 ms settle) and feed a kernel-stamped feedback frame.
-            clock.advance(Duration::from_millis(21));
-            bus.with(|s| {
-                s.kernel_realtime_ns = Some(10_021_000_000);
-                s.set_pose(&[0.0; 7]);
-                let f = s.motors[0].feedback_frame();
-                s.rx.push_back((f, Some(CanRxTime::KernelRealtimeNs(10_021_000_000))));
-            });
-            let _ = drv.read_joint_states();
-            drv.feedback_instants()[0].is_some()
+            let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
+            // Seed initial feedback, arm, write a motion target, and latch E-stop.
+            bus.with(|s| s.push_all_feedback());
+            inner.tick_control(0.02);
+            let st = inner.current_admission_stamp();
+            let adm = inner.check_admission(st).unwrap();
+            SupervisorInner::enable_torque(adm).unwrap();
+            inner.apply_stop_policy(armd::safety::StopPolicy::EStopLatch);
+            // Feed K=3 rest samples separated by `dt_ms` across 3 releases and check disable_torque!
+            for k in 1..=3u64 {
+                clock.advance(Duration::from_millis(dt_ms));
+                let rt_ns = 10_000_000_000 + (k * dt_ms) * 1_000_000;
+                bus.with(|s| {
+                    s.kernel_realtime_ns = Some(rt_ns as i128);
+                    s.set_pose(&[0.0; 7]);
+                    for m in &s.motors {
+                        let f = m.feedback_frame();
+                        s.rx.push_back((f, Some(CanRxTime::KernelRealtimeNs(rt_ns as i128))));
+                    }
+                });
+                inner.tick_control(0.02);
+            }
+            inner.disable_torque().is_ok()
         }
-        assert_eq!(probe_settle(false), probe_settle(true));
-        assert!(probe_settle(true));
+        for dt_ms in [19u64, 20, 21] {
+            assert_eq!(
+                probe_rest_gate(false, dt_ms),
+                probe_rest_gate(true, dt_ms),
+                "Damiao rest-gate disable decision at {dt_ms} ms must match identically with shadow ON vs OFF"
+            );
+        }
+        assert!(probe_rest_gate(true, 21));
+    }
+
+    // (g) R2-m2: Disabled ShadowDriverStaging allocates 0 slots.
+    {
+        let staging = armd::torque::shadow::ShadowDriverStaging::new(false);
+        assert_eq!(staging.allocated_capacity(), 0);
     }
 }

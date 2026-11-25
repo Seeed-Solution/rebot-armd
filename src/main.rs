@@ -176,17 +176,18 @@ fn start_blackbox(supervisor: &ArmSupervisor, cli_dir: Option<&str>, system: &ar
     match result {
         Ok((rec, bb)) => {
             #[cfg(not(target_arch = "wasm32"))]
-            let bb = {
-                if let Err(e) = supervisor.torque_shadow_hub().attach_blackbox_dir(&dir, rec.boot, started) {
-                    warn!("Torque shadow blackbox {} unavailable ({e})", dir.display());
-                }
-                bb.with_shadow_atomics(supervisor.torque_shadow_overflow_atomics())
-            };
+            let bb = bb.with_shadow_atomics(supervisor.torque_shadow_overflow_atomics());
             info!("Previous start: {}", diagnostics::boot::summary(&rec));
             info!("Black box recording to {} (boot {})", dir.display(), rec.boot);
             if let Err(e) = diagnostics::blackbox::spawn_recorder(supervisor, bb) {
                 warn!("Black box off: {e}");
                 return;
+            }
+            // Start decoupled shadow blackbox AFTER primary recorder is live; file open happens
+            // inside the `"armd-shadow-bb"` thread so shadow disk I/O never gates primary startup.
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Err(e) = supervisor.torque_shadow_hub().attach_blackbox_dir(&dir, rec.boot, started) {
+                warn!("Torque shadow blackbox {} unavailable ({e})", dir.display());
             }
             DiagnosticsState::set_global(DiagnosticsState { blackbox_dir: Some(dir), boot: rec.boot });
         }
@@ -339,6 +340,10 @@ where
             Ok(Ok(())) => {
                 // A confirmed-safe exit must not wait indefinitely on connected WebSockets.
                 server_handle.abort();
+                #[cfg(not(target_arch = "wasm32"))]
+                supervisor
+                    .torque_shadow_hub()
+                    .stop_and_flush_bounded(Duration::from_millis(100));
                 info!("armd stopped after shutdown readiness confirmation");
                 return Ok(());
             }
@@ -670,10 +675,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let outcome = control_supervisor
                             .attempt_legacy_panic_disable(armd::supervisor::PANIC_DISABLE_TIMEOUT);
                         outcome.log("Legacy control thread panic", armd::supervisor::PANIC_DISABLE_TIMEOUT);
+                        // Non-blocking wake on fatal control panic (never block or join worker on fatal exit).
                         #[cfg(not(target_arch = "wasm32"))]
-                        control_supervisor
-                            .torque_shadow_hub()
-                            .stop_and_flush_bounded(Duration::from_millis(100));
+                        control_supervisor.torque_shadow_hub().wake();
                         armd::diagnostics::logwriter::flush_all(Duration::from_millis(500));
                         std::process::exit(1);
                     }

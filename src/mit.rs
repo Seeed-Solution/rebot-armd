@@ -1382,6 +1382,22 @@ impl crate::supervisor::SupervisorInner {
         code: crate::safety::FaultCode,
     ) {
         self.safety.log_mit_tracking_cancelled(reason);
+        #[cfg(not(target_arch = "wasm32"))]
+        if !self.mit.joints.is_empty() {
+            let mut mask = crate::torque::ChannelMask::EMPTY;
+            for &j in &self.mit.joints {
+                if j < crate::torque::MAX_CHANNELS {
+                    mask.insert(j as u8);
+                }
+            }
+            self.torque_shadow.enqueue(
+                crate::torque::shadow::ShadowInputKind::MitOwnershipChange {
+                    channels: mask,
+                    target_mode: crate::motor_mode::ControlMode::PositionVelocity,
+                    device_wide: true,
+                },
+            );
+        }
         self.mit.owner = MitOwner::Lost;
         self.mit.lost_reason = Some(reason);
         self.mit.last_output = None;
@@ -1720,6 +1736,22 @@ impl crate::supervisor::SupervisorInner {
         if self.mit.owner == MitOwner::Active {
             // The driver fence stays armed through the disable (no recovery replay, no invented
             // hold even when the disable fails); a confirmed disable or enable disarms it.
+            #[cfg(not(target_arch = "wasm32"))]
+            if !self.mit.joints.is_empty() {
+                let mut mask = crate::torque::ChannelMask::EMPTY;
+                for &j in &self.mit.joints {
+                    if j < crate::torque::MAX_CHANNELS {
+                        mask.insert(j as u8);
+                    }
+                }
+                self.torque_shadow.enqueue(
+                    crate::torque::shadow::ShadowInputKind::MitOwnershipChange {
+                        channels: mask,
+                        target_mode: crate::motor_mode::ControlMode::PositionVelocity,
+                        device_wide: false,
+                    },
+                );
+            }
             self.mit.owner = MitOwner::Off;
             self.mit.joints.clear();
             self.mit.last_output = None;

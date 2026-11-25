@@ -14103,8 +14103,17 @@ impl ArmSupervisor {
             match std::thread::Builder::new()
                 .name("armd-panic-disable".into())
                 .spawn(move || {
-                    let outcome = run_inline(inner, coop_deadline, hard_deadline, coop_budget);
-                    let _ = tx.send((outcome, Instant::now()));
+                    let (outcome, done_at) = {
+                        let res = run_inline(inner.clone(), coop_deadline, hard_deadline, coop_budget);
+                        (res, Instant::now())
+                    };
+                    // Seal and deliver the live outcome FIRST before touching shadow recording.
+                    let _ = tx.send((outcome.clone(), done_at));
+                    if let Ok(mut g) = inner.try_write() {
+                        if !g.detached {
+                            g.record_post_panic_disable_shadow(true, &outcome);
+                        }
+                    }
                 }) {
                 Ok(_) => {
                     let wait = hard_deadline.saturating_duration_since(Instant::now());

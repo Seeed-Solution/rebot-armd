@@ -398,7 +398,50 @@ pub enum ShadowDriverObs {
     },
 }
 
-/// Bounded preallocated staging ring embedded in each driver struct (0 RT allocs, 0 locks).
+/// Heap-backed driver staging buffer with intrusive Treiber stack link so if an `ArmDriver` is
+/// dropped on `armd-control` (executor exit/unwind), its staging allocation is retired lock-free
+/// and freed off-thread (0 allocs, 0 frees, 0 locks on RT teardown).
+struct DriverStagingBuf {
+    buf: Box<[Option<ShadowDriverObs>]>,
+    next_retired: *mut DriverStagingBuf,
+}
+
+// SAFETY: uniquely owned inside `ShadowDriverStaging` until retired via atomic Treiber stack.
+unsafe impl Send for DriverStagingBuf {}
+unsafe impl Sync for DriverStagingBuf {}
+
+static RETIRED_DRIVER_STAGING_HEAD: AtomicPtr<DriverStagingBuf> =
+    AtomicPtr::new(std::ptr::null_mut());
+
+#[inline]
+fn retire_driver_staging_buf(boxed: Box<DriverStagingBuf>) {
+    let raw = Box::into_raw(boxed);
+    loop {
+        let head = RETIRED_DRIVER_STAGING_HEAD.load(Ordering::Acquire);
+        // SAFETY: `raw` is uniquely owned before atomic publication.
+        unsafe {
+            (*raw).next_retired = head;
+        }
+        if RETIRED_DRIVER_STAGING_HEAD
+            .compare_exchange_weak(head, raw, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            break;
+        }
+    }
+}
+
+fn reclaim_retired_driver_staging() {
+    let mut cur = RETIRED_DRIVER_STAGING_HEAD.swap(std::ptr::null_mut(), Ordering::AcqRel);
+    while !cur.is_null() {
+        // SAFETY: exclusively reclaimed from the Treiber stack; created by `Box::into_raw`.
+        let node = unsafe { Box::from_raw(cur) };
+        cur = node.next_retired;
+        drop(node);
+    }
+}
+
+/// Bounded preallocated staging ring embedded in each driver struct (0 RT allocs, 0 locks, 0 RT frees).
 pub struct ShadowDriverStaging {
     enabled: bool,
     len: usize,
@@ -406,8 +449,18 @@ pub struct ShadowDriverStaging {
     sample_seq: u64,
     /// Deduplicates identical pre-transport refusal spins within a single driver guard call.
     last_refusal: Option<(WriteKind, ChannelMask, MotorWriteOutcome)>,
-    /// Preallocated fixed-capacity heap slice when enabled (0 bytes inline on driver stack frames).
-    buf: Box<[Option<ShadowDriverObs>]>,
+    /// Preallocated fixed-capacity heap slice when enabled (`None` when disabled -> 0 bytes allocated).
+    buf: Option<Box<DriverStagingBuf>>,
+}
+
+impl Drop for ShadowDriverStaging {
+    fn drop(&mut self) {
+        if let Some(boxed) = self.buf.take() {
+            if crate::rt_core::executor::on_rt_control_thread() {
+                retire_driver_staging_buf(boxed);
+            }
+        }
+    }
 }
 
 impl Default for ShadowDriverStaging {
@@ -419,9 +472,12 @@ impl Default for ShadowDriverStaging {
 impl ShadowDriverStaging {
     pub fn new(enabled: bool) -> Self {
         let buf = if enabled {
-            vec![None; DRIVER_SHADOW_STAGING_CAP].into_boxed_slice()
+            Some(Box::new(DriverStagingBuf {
+                buf: vec![None; DRIVER_SHADOW_STAGING_CAP].into_boxed_slice(),
+                next_retired: std::ptr::null_mut(),
+            }))
         } else {
-            Vec::new().into_boxed_slice()
+            None
         };
         Self {
             enabled,
@@ -433,13 +489,22 @@ impl ShadowDriverStaging {
         }
     }
 
+    /// Allocated staging slot count (`0` when disabled).
+    #[inline]
+    pub fn allocated_capacity(&self) -> usize {
+        self.buf.as_ref().map_or(0, |b| b.buf.len())
+    }
+
     /// Enable or disable staging (called off-RT at driver install). Preallocates fixed buffer once.
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
         self.last_refusal = None;
         if enabled {
-            if self.buf.len() != DRIVER_SHADOW_STAGING_CAP {
-                self.buf = vec![None; DRIVER_SHADOW_STAGING_CAP].into_boxed_slice();
+            if self.buf.as_ref().is_none_or(|b| b.buf.len() != DRIVER_SHADOW_STAGING_CAP) {
+                self.buf = Some(Box::new(DriverStagingBuf {
+                    buf: vec![None; DRIVER_SHADOW_STAGING_CAP].into_boxed_slice(),
+                    next_retired: std::ptr::null_mut(),
+                }));
             }
         } else {
             self.len = 0;
@@ -466,8 +531,12 @@ impl ShadowDriverStaging {
         if matches!(obs, ShadowDriverObs::WriteResult { .. }) {
             self.last_refusal = None;
         }
-        if self.len < self.buf.len() {
-            self.buf[self.len] = Some(obs);
+        let Some(ref mut inner) = self.buf else {
+            self.dropped = self.dropped.saturating_add(1);
+            return;
+        };
+        if self.len < inner.buf.len() {
+            inner.buf[self.len] = Some(obs);
             self.len += 1;
         } else {
             self.dropped = self.dropped.saturating_add(1);
@@ -493,8 +562,12 @@ impl ShadowDriverStaging {
             return;
         }
         self.last_refusal = Some(key);
-        if self.len < self.buf.len() {
-            self.buf[self.len] = Some(obs);
+        let Some(ref mut inner) = self.buf else {
+            self.dropped = self.dropped.saturating_add(1);
+            return;
+        };
+        if self.len < inner.buf.len() {
+            inner.buf[self.len] = Some(obs);
             self.len += 1;
         } else {
             self.dropped = self.dropped.saturating_add(1);
@@ -505,12 +578,19 @@ impl ShadowDriverStaging {
     /// Resets the staging buffer cleanly with zero heap allocation.
     #[inline]
     pub fn drain_into(&mut self, out: &mut [Option<ShadowDriverObs>]) -> (usize, u64) {
-        let count = self.len.min(out.len()).min(self.buf.len());
+        let Some(ref mut inner) = self.buf else {
+            let dropped = self.dropped;
+            self.len = 0;
+            self.dropped = 0;
+            self.last_refusal = None;
+            return (0, dropped);
+        };
+        let count = self.len.min(out.len()).min(inner.buf.len());
         let overflow_from_small_out = self.len.saturating_sub(count) as u64;
-        for (dst, src) in out.iter_mut().zip(self.buf.iter_mut()).take(count) {
+        for (dst, src) in out.iter_mut().zip(inner.buf.iter_mut()).take(count) {
             *dst = src.take();
         }
-        for slot in self.buf.iter_mut().take(self.len).skip(count) {
+        for slot in inner.buf.iter_mut().take(self.len).skip(count) {
             *slot = None;
         }
         let dropped = self.dropped.saturating_add(overflow_from_small_out);
@@ -2893,13 +2973,13 @@ impl ShadowBbQueue {
         start: Instant,
         written: Arc<AtomicU64>,
         dropped: Arc<AtomicU64>,
-    ) -> Self {
+    ) -> io::Result<Self> {
         let (tx, rx) = mpsc::sync_channel::<String>(SHADOW_BB_QUEUE_CAP);
         let w = written;
         let d = Arc::clone(&dropped);
         let done = Arc::new((Mutex::new(false), Condvar::new()));
         let done_bg = Arc::clone(&done);
-        let _ = thread::Builder::new()
+        thread::Builder::new()
             .name("armd-shadow-bb".into())
             .spawn(move || {
                 while let Ok(line) = rx.recv() {
@@ -2915,20 +2995,68 @@ impl ShadowBbQueue {
                 let mut g = done_bg.0.lock().unwrap_or_else(|e| e.into_inner());
                 *g = true;
                 done_bg.1.notify_all();
-            });
-        Self {
+            })?;
+        Ok(Self {
             tx,
             boot,
             start,
             dropped,
             done,
-        }
+        })
+    }
+
+    /// Spawn the decoupled `"armd-shadow-bb"` writer thread and open `bb_shadow.jsonl` INSIDE the
+    /// writer thread so startup/primary `bb.jsonl` never blocks on shadow disk open or rotation.
+    fn spawn_dir(
+        path: std::path::PathBuf,
+        boot: u64,
+        start: Instant,
+        written: Arc<AtomicU64>,
+        dropped: Arc<AtomicU64>,
+    ) -> io::Result<Self> {
+        let (tx, rx) = mpsc::sync_channel::<String>(SHADOW_BB_QUEUE_CAP);
+        let w = written;
+        let d = Arc::clone(&dropped);
+        let done = Arc::new((Mutex::new(false), Condvar::new()));
+        let done_bg = Arc::clone(&done);
+        thread::Builder::new()
+            .name("armd-shadow-bb".into())
+            .spawn(move || {
+                let mut sink_opt = RotatingFile::open(&path, SHADOW_BB_MAX_BYTES, SHADOW_BB_KEEP).ok();
+                while let Ok(line) = rx.recv() {
+                    if let Some(ref mut sink) = sink_opt {
+                        match sink.write_shadow_line(line.as_bytes()) {
+                            Ok(()) => {
+                                w.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(_) => {
+                                d.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    } else {
+                        d.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                let mut g = done_bg.0.lock().unwrap_or_else(|e| e.into_inner());
+                *g = true;
+                done_bg.1.notify_all();
+            })?;
+        Ok(Self {
+            tx,
+            boot,
+            start,
+            dropped,
+            done,
+        })
     }
 
     #[inline]
-    fn try_send(&self, line: String) {
+    fn try_send(&self, line: String) -> bool {
         if self.tx.try_send(line).is_err() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
+            false
+        } else {
+            true
         }
     }
 }
@@ -3025,9 +3153,10 @@ impl TorqueShadowConsumer {
             atomics
                 .interval_unverifiable_mirror
                 .store(true, Ordering::Release);
-            if !self.overflow_logged_bb {
+            if !self.overflow_logged_bb
+                && self.write_bb_overflow(c, atomics, active_owner)
+            {
                 self.overflow_logged_bb = true;
-                self.write_bb_overflow(c, atomics, active_owner);
             }
         }
     }
@@ -3037,9 +3166,9 @@ impl TorqueShadowConsumer {
         cutoff_seq: u64,
         atomics: &ShadowOverflowAtomics,
         active_owner: ShadowOwner,
-    ) {
+    ) -> bool {
         let Some(ref q) = self.bb_queue else {
-            return;
+            return false;
         };
         let t_ms = q.start.elapsed().as_millis() as u64;
         let line = format!(
@@ -3051,7 +3180,7 @@ impl TorqueShadowConsumer {
             atomics.ring_dropped_records.load(Ordering::Relaxed),
             atomics.staging_dropped_records.load(Ordering::Relaxed),
         );
-        q.try_send(line);
+        q.try_send(line)
     }
 
     fn write_bb_divergence(&self, entry: &ShadowDivergenceEntry) {
@@ -3612,7 +3741,10 @@ impl TorqueShadowConsumer {
             }
         }
 
-        // 5g. Stopped-hold contention escalation parity.
+        // 5g. Stopped-hold contention escalation parity: the reducer evaluates streak escalation
+        //     on the next `Release` boundary (`reducer.rs:483`) rather than on the individual
+        //     `WriteResult(Hold)` receipt, so compare escalation against the reducer's device
+        //     `contention_escalated` latch state rather than only the single-step `ActionSummary`.
         if matches!(
             rec.event,
             Some(Event::WriteResult(WriteResult {
@@ -3620,8 +3752,12 @@ impl TorqueShadowConsumer {
                 ..
             }))
         ) {
-            let pred_escalated = !pred.contention_escalated.is_empty();
-            if pred_escalated != live.live_contention_escalated {
+            let pred_escalated = !pred.contention_escalated.is_empty()
+                || self
+                    .state
+                    .as_ref()
+                    .is_some_and(|st| st.devices[0].contention_escalated);
+            if live.live_contention_escalated && !pred_escalated {
                 self.push_divergence(
                     ShadowDivergenceEntry {
                         seq: rec.seq,
@@ -3840,6 +3976,7 @@ impl ShadowHubCore {
     }
 
     fn reclaim_retired(&self) {
+        reclaim_retired_driver_staging();
         let mut cur = self
             .retired_head
             .swap(std::ptr::null_mut(), Ordering::AcqRel);
@@ -3887,7 +4024,7 @@ impl Drop for ShadowHubCore {
 /// and owns the decoupled `"armd-shadow-bb"` rotating writer channel.
 pub struct TorqueShadowHub {
     core: Arc<ShadowHubCore>,
-    worker: Mutex<Option<JoinHandle<()>>>,
+    worker: Mutex<Option<(JoinHandle<()>, Arc<(Mutex<bool>, Condvar)>)>>,
 }
 
 impl TorqueShadowHub {
@@ -3955,7 +4092,8 @@ impl TorqueShadowHub {
                 break;
             }
         }
-        self.wake();
+        // Strictly lock-free: do NOT call `wake()` (which attempts `wake_mu.try_lock()`) from
+        // `Drop` on `armd-control`. The off-thread worker reclaims on its next poll or shutdown.
     }
 
     /// Test-only counter of retired `ShadowRuntimeInner` allocations reclaimed off-thread.
@@ -4010,17 +4148,21 @@ impl TorqueShadowHub {
             .store(owner_to_u8(owner), Ordering::Release);
     }
 
-    /// Attach a dedicated `bb_shadow.jsonl` file inside `dir` (off-thread, never touches `bb.jsonl`).
+    /// Attach a dedicated `bb_shadow.jsonl` file inside `dir` (opens the file inside the
+    /// decoupled `"armd-shadow-bb"` thread so startup/primary `bb.jsonl` never waits on shadow disk I/O).
     pub fn attach_blackbox_dir(&self, dir: &Path, boot: u64, start: Instant) -> io::Result<()> {
         if !self.core.enabled {
             return Ok(());
         }
-        let file = RotatingFile::open(
+        let q = ShadowBbQueue::spawn_dir(
             dir.join(SHADOW_BB_FILE),
-            SHADOW_BB_MAX_BYTES,
-            SHADOW_BB_KEEP,
+            boot,
+            start,
+            Arc::clone(&self.core.bb_written),
+            Arc::clone(&self.core.bb_dropped),
         )?;
-        self.attach_blackbox_sink(Box::new(file), boot, start);
+        let mut c = self.core.consumer.lock().unwrap_or_else(|e| e.into_inner());
+        c.bb_queue = Some(q);
         Ok(())
     }
 
@@ -4034,15 +4176,16 @@ impl TorqueShadowHub {
         if !self.core.enabled {
             return;
         }
-        let q = ShadowBbQueue::spawn(
+        if let Ok(q) = ShadowBbQueue::spawn(
             sink,
             boot,
             start,
             Arc::clone(&self.core.bb_written),
             Arc::clone(&self.core.bb_dropped),
-        );
-        let mut c = self.core.consumer.lock().unwrap_or_else(|e| e.into_inner());
-        c.bb_queue = Some(q);
+        ) {
+            let mut c = self.core.consumer.lock().unwrap_or_else(|e| e.into_inner());
+            c.bb_queue = Some(q);
+        }
     }
 
     /// Spawn the dedicated `"armd-torque-shadow"` off-thread consumer (idempotent; no-op when disabled).
@@ -4056,6 +4199,8 @@ impl TorqueShadowHub {
             return Ok(());
         }
         let core = Arc::clone(&self.core);
+        let done = Arc::new((Mutex::new(false), Condvar::new()));
+        let done_bg = Arc::clone(&done);
         let jh = thread::Builder::new()
             .name("armd-torque-shadow".into())
             .spawn(move || {
@@ -4067,8 +4212,11 @@ impl TorqueShadowHub {
                     }
                 }
                 core.drain_and_publish();
+                let mut g = done_bg.0.lock().unwrap_or_else(|e| e.into_inner());
+                *g = true;
+                done_bg.1.notify_all();
             })?;
-        *slot = Some(jh);
+        *slot = Some((jh, done));
         Ok(())
     }
 
@@ -4133,42 +4281,67 @@ impl TorqueShadowHub {
         snap
     }
 
-    /// Stop the consumer worker cleanly, drain any remaining SPSC records, and wait up to
-    /// `timeout` for `"armd-shadow-bb"` to flush queued shadow blackbox lines.
+    /// Stop the consumer worker and flush queued shadow records + `bb_shadow.jsonl` under ONE
+    /// single overall wall-clock deadline (`timeout`). Never blocks beyond `timeout` even if a
+    /// comparator or disk sink is delayed.
     pub fn stop_and_flush_bounded(&self, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
         self.core.stop.store(true, Ordering::Release);
         {
             let mut flag = self.core.wake_mu.lock().unwrap_or_else(|e| e.into_inner());
             *flag = true;
             self.core.wake_cv.notify_all();
         }
-        if let Some(jh) = self
+        let worker_entry = self
             .worker
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .take()
-        {
-            let _ = jh.join();
+            .take();
+        let mut worker_finished = true;
+        if let Some((jh, worker_done)) = worker_entry {
+            let mut g = worker_done.0.lock().unwrap_or_else(|e| e.into_inner());
+            while !*g {
+                let rem = deadline.saturating_duration_since(Instant::now());
+                if rem.is_zero() {
+                    break;
+                }
+                let (next, res) = worker_done
+                    .1
+                    .wait_timeout(g, rem)
+                    .unwrap_or_else(|e| e.into_inner());
+                g = next;
+                if res.timed_out() {
+                    break;
+                }
+            }
+            worker_finished = *g;
+            drop(g);
+            if worker_finished {
+                let _ = jh.join();
+            }
         }
-        self.core.drain_and_publish();
-        let done_opt = {
-            let mut c = self.core.consumer.lock().unwrap_or_else(|e| e.into_inner());
+        if worker_finished {
+            self.core.drain_and_publish();
+        }
+        let done_opt = if let Ok(mut c) = self.core.consumer.try_lock() {
             c.bb_queue.take().map(|q| q.done)
+        } else {
+            None
         };
         if let Some(done) = done_opt {
-            if !timeout.is_zero() {
-                let deadline = Instant::now() + timeout;
-                let mut g = done.0.lock().unwrap_or_else(|e| e.into_inner());
-                while !*g {
-                    let rem = deadline.saturating_duration_since(Instant::now());
-                    if rem.is_zero() {
-                        break;
-                    }
-                    let (next, res) = done.1.wait_timeout(g, rem).unwrap_or_else(|e| e.into_inner());
-                    g = next;
-                    if res.timed_out() {
-                        break;
-                    }
+            let mut g = done.0.lock().unwrap_or_else(|e| e.into_inner());
+            while !*g {
+                let rem = deadline.saturating_duration_since(Instant::now());
+                if rem.is_zero() {
+                    break;
+                }
+                let (next, res) = done
+                    .1
+                    .wait_timeout(g, rem)
+                    .unwrap_or_else(|e| e.into_inner());
+                g = next;
+                if res.timed_out() {
+                    break;
                 }
             }
         }

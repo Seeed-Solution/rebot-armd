@@ -2862,13 +2862,20 @@ impl<T: Transport> FeetechArmDriver<T> {
             return Err(e.into());
         }
         let flush_res = self.transport.flush();
+        let flush_ok = flush_res.is_ok();
+        let _ = flush_res;
+        if *rx_budget > 0 && deadline.is_none_or(|dl| self.clock_now() < dl) {
+            let _ = self.drain_tx_echo_until(&pkt, deadline);
+        }
+        // Shadow staging runs strictly AFTER live deadline check and echo drain so shadow-on
+        // can never push the live clock past `deadline` and suppress `drain_tx_echo_until`.
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(idx) = servo_idx {
             if self.shadow_staging.is_enabled() && idx < crate::torque::MAX_CHANNELS {
                 let now = self.clock_now();
                 let mut outcomes = [crate::torque::MotorWriteOutcome::NotTargeted;
                     crate::torque::MAX_CHANNELS];
-                outcomes[idx] = if flush_res.is_ok() {
+                outcomes[idx] = if flush_ok {
                     crate::torque::MotorWriteOutcome::Sent
                 } else {
                     crate::torque::MotorWriteOutcome::Ambiguous
@@ -2889,13 +2896,9 @@ impl<T: Transport> FeetechArmDriver<T> {
                         now,
                         target_mask: crate::torque::ChannelMask::bit(idx as u8),
                         outcomes,
-                        ambiguous_gap: flush_res.is_err(),
+                        ambiguous_gap: !flush_ok,
                     });
             }
-        }
-        let _ = flush_res;
-        if *rx_budget > 0 && deadline.is_none_or(|dl| self.clock_now() < dl) {
-            let _ = self.drain_tx_echo_until(&pkt, deadline);
         }
         Ok(true)
     }
@@ -3982,7 +3985,7 @@ impl<T: Transport> FeetechArmDriver<T> {
                                         && window.is_some_and(|(req_at, _)| req_at >= w)
                                 });
                                 #[cfg(not(target_arch = "wasm32"))]
-                                {
+                                if self.shadow_staging.is_enabled() {
                                     let decode_now = self.clock_now();
                                     let req_at = window.map(|(r, _)| r);
                                     self.stage_feetech_causal_sample(

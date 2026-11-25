@@ -1538,17 +1538,19 @@ impl SupervisorInner {
         self.active_disable_kind = Some(kind);
         self.disable_requested();
         #[cfg(not(target_arch = "wasm32"))]
-        if matches!(kind, crate::driver::DisableKind::DisableRequested { .. }) {
+        if let crate::driver::DisableKind::DisableRequested { started_at } = kind {
             let live_op_id = self.torque_shadow.alloc_live_op_id();
-            self.torque_shadow
-                .enqueue(crate::torque::shadow::ShadowInputKind::DisableRequest {
+            self.torque_shadow.enqueue_at(
+                started_at,
+                crate::torque::shadow::ShadowInputKind::DisableRequest {
                     live_op_id,
                     explicit_release_authorized: false,
                     live_refusal: None,
                     live_intent: self.shadow_live_intent(),
                     live_is_torqued: self.is_torqued,
                     live_stopped: self.safety.state().is_stopped(),
-                });
+                },
+            );
         }
         if self.driver.is_some() {
             if self.rt_executor_owned {
@@ -7674,9 +7676,43 @@ impl SupervisorInner {
         self.attempt_bounded_teardown_disable(timeout, true)
     }
 
-    /// Bounded protective disable on repeated shutdown (attributed as `ProcessExit`, not caught panic).
+    /// Bounded protective disable on repeated shutdown (drains driver observations without
+    /// emitting a premature `ProcessExit` before `commit_shutdown`).
     pub(crate) fn attempt_shutdown_protective_disable(&mut self, timeout: Duration) -> PanicDisableOutcome {
-        self.attempt_bounded_teardown_disable(timeout, false)
+        self.mark_panic_disable_requested();
+        let origin = Instant::now();
+        let (coop_deadline, hard_deadline) = panic_disable_deadlines(origin, timeout);
+        let coop_budget = coop_deadline.saturating_duration_since(origin);
+        let outcome = run_with_panic_deadline_observer_until(
+            hard_deadline,
+            || self.attempt_panic_disable_until(coop_deadline, hard_deadline, coop_budget),
+            |_| true,
+            move || {
+                PanicDisableOutcome::TimedOut.log("Bounded panic disable", timeout);
+            },
+        )
+        .unwrap_or(PanicDisableOutcome::TimedOut);
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.torque_shadow.is_enabled() {
+            match &outcome {
+                PanicDisableOutcome::Confirmed
+                | PanicDisableOutcome::Unconfirmed
+                | PanicDisableOutcome::NoDriver => {
+                    if let Some(ref d) = self.driver {
+                        if let Ok(mut drv) = d.try_lock() {
+                            self.torque_shadow.drain_from_driver(&mut **drv);
+                        } else {
+                            self.torque_shadow.record_external_staging_loss(1);
+                        }
+                    }
+                }
+                PanicDisableOutcome::TimedOut | PanicDisableOutcome::Failed(_) => {
+                    self.torque_shadow.record_external_staging_loss(1);
+                }
+            }
+            self.flush_torque_shadow();
+        }
+        outcome
     }
 
     fn attempt_bounded_teardown_disable(
@@ -7704,13 +7740,16 @@ impl SupervisorInner {
 
     /// Record panic or forced-teardown shadow state AFTER the live deadline observer has sealed
     /// the live `PanicDisableOutcome`. Signals incomplete staging loss if the driver timed out
-    /// or panicked so `interval_unverifiable` latches cleanly.
+    /// or panicked so `interval_unverifiable` latches cleanly. No-op (zero locks) when disabled.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn record_post_panic_disable_shadow(
         &mut self,
         is_caught_panic: bool,
         outcome: &PanicDisableOutcome,
     ) {
+        if !self.torque_shadow.is_enabled() {
+            return;
+        }
         if is_caught_panic {
             self.torque_shadow
                 .enqueue(crate::torque::shadow::ShadowInputKind::Panic {
