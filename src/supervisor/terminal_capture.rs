@@ -18,7 +18,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::model::{ArmObservation, ControlMode, DriverCapabilities, EnableState, HolderLabel};
+use crate::model::{
+    ArmObservation, ControlMode, DriverCapabilities, EnableState, GripperBaselineObs, GripperObs,
+    HolderLabel,
+};
 use crate::motion::{ActionStatus, PolicyStats};
 use crate::rt_core::mailbox::MAX_DOF;
 use crate::rt_core::publish::{Snapshot, StateHub};
@@ -120,6 +123,36 @@ impl Default for CaptureDriverCache {
     }
 }
 
+/// `Copy` inline mirror of [`GripperObs`] so `TerminalCaptureRecord` stays `Copy` without
+/// modifying `GripperObs`'s public trait impls.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CapturedGripperObs {
+    pub(crate) joint: usize,
+    pub(crate) rad: f32,
+    pub(crate) fraction: f32,
+    pub(crate) opening_m: Option<f32>,
+    pub(crate) stalled: bool,
+    pub(crate) force_limited: bool,
+    pub(crate) force_limit_trips: u64,
+    pub(crate) baseline: Option<GripperBaselineObs>,
+}
+
+impl CapturedGripperObs {
+    #[inline]
+    fn to_gripper_obs(self) -> GripperObs {
+        GripperObs {
+            joint: self.joint,
+            rad: self.rad,
+            fraction: self.fraction,
+            opening_m: self.opening_m,
+            stalled: self.stalled,
+            force_limited: self.force_limited,
+            force_limit_trips: self.force_limit_trips,
+            baseline: self.baseline,
+        }
+    }
+}
+
 /// Fixed-size `Copy` terminal record captured on `armd-control` with zero heap ops and zero locks.
 #[derive(Clone, Copy)]
 pub(crate) struct TerminalCaptureRecord {
@@ -141,6 +174,9 @@ pub(crate) struct TerminalCaptureRecord {
     pub(crate) geometry_id: Option<HolderLabel>,
     pub(crate) violation_phase: Option<HolderLabel>,
     pub(crate) reason: Option<HolderLabel>,
+    /// Bitmask of truncated workspace labels (bit 0: constraint_id, 1: geometry_id,
+    /// 2: violation_phase, 3: reason) so UTF-8 boundary truncation is exact.
+    pub(crate) label_truncated_mask: u8,
     pub(crate) durability_confirmed: Option<bool>,
     pub(crate) has_durability_warning: bool,
     pub(crate) durability_warning: BoundedText<256>,
@@ -169,6 +205,10 @@ pub(crate) struct TerminalCaptureRecord {
     pub(crate) torques: [f32; MAX_DOF],
     pub(crate) temperatures: [f32; MAX_DOF],
     pub(crate) commanded_positions: [f32; MAX_DOF],
+    pub(crate) gripper: Option<CapturedGripperObs>,
+    pub(crate) gravity_compensated: bool,
+    pub(crate) gravity_torques: [f32; MAX_DOF],
+    pub(crate) feedback_age_ms: [Option<u64>; MAX_DOF],
     pub(crate) is_torqued: bool,
     pub(crate) disable_pending: bool,
     pub(crate) feedback_valid: bool,
@@ -194,11 +234,19 @@ fn opt_label(s: Option<&String>) -> Option<HolderLabel> {
     s.map(|v| HolderLabel::new(v))
 }
 
-fn overlay_opt_label(dst: &mut Option<String>, src: Option<HolderLabel>) {
+#[inline]
+fn opt_label_tracked(s: Option<&String>) -> (Option<HolderLabel>, bool) {
+    match s {
+        Some(v) => (Some(HolderLabel::new(v)), v.len() > HolderLabel::CAPACITY),
+        None => (None, false),
+    }
+}
+
+fn overlay_opt_label(dst: &mut Option<String>, src: Option<HolderLabel>, truncated: bool) {
     match src {
         Some(v) => {
             let s = v.as_str();
-            if v.len() == HolderLabel::CAPACITY
+            if truncated
                 && dst
                     .as_deref()
                     .is_some_and(|existing| existing.starts_with(s))
@@ -237,10 +285,12 @@ impl TerminalCaptureRecord {
         let task = opt_label(action.task.as_ref());
         let sequence_id = opt_label(action.sequence_id.as_ref());
         let step_type = opt_label(action.step_type.as_ref());
-        let constraint_id = opt_label(action.constraint_id.as_ref());
-        let geometry_id = opt_label(action.geometry_id.as_ref());
-        let violation_phase = opt_label(action.violation_phase.as_ref());
-        let reason = opt_label(action.reason.as_ref());
+        let (constraint_id, t_c) = opt_label_tracked(action.constraint_id.as_ref());
+        let (geometry_id, t_g) = opt_label_tracked(action.geometry_id.as_ref());
+        let (violation_phase, t_v) = opt_label_tracked(action.violation_phase.as_ref());
+        let (reason, t_r) = opt_label_tracked(action.reason.as_ref());
+        let label_truncated_mask =
+            u8::from(t_c) | (u8::from(t_g) << 1) | (u8::from(t_v) << 2) | (u8::from(t_r) << 3);
 
         let mut phase_ms = [(BoundedText::<24>::empty(), 0u32); 12];
         let mut phase_ms_len = 0u8;
@@ -260,6 +310,70 @@ impl TerminalCaptureRecord {
             None
         };
         let dof = inner.config.dof.min(MAX_DOF) as u8;
+        let gripper = if let (Some(idx), Some(policy)) = (
+            inner.config.gripper_index(),
+            inner.config.gripper_policy.as_ref(),
+        ) {
+            inner.measured_positions.get(idx).map(|&rad| {
+                let span = policy.open_rad - policy.closed_rad;
+                let fraction = if span.abs() < 1e-6 {
+                    0.0
+                } else {
+                    ((rad - policy.closed_rad) / span).clamp(0.0, 1.0)
+                };
+                let opening_m = policy.jaw_opening.as_ref().map(|jo| jo.opening_m(rad));
+                CapturedGripperObs {
+                    joint: idx,
+                    rad,
+                    fraction,
+                    opening_m,
+                    stalled: inner.gripper_stalled,
+                    force_limited: inner.gripper_stalled && inner.gripper_force_capped,
+                    force_limit_trips: inner.gripper_force_trips,
+                    baseline: Some(inner.gripper_baseline_observation()),
+                }
+            })
+        } else {
+            None
+        };
+        let mut feedback_age_ms = [None; MAX_DOF];
+        let now_clock = inner.cached_driver_clock_now();
+        let dof_usize = usize::from(dof);
+        if inner.driver.is_none() {
+            for slot in &mut feedback_age_ms[..dof_usize] {
+                *slot = Some(0);
+            }
+        } else {
+            let instants = inner.core.feedback().instants();
+            if instants.len() >= dof_usize && instants[..dof_usize].iter().any(Option::is_some) {
+                for (dst, &inst) in feedback_age_ms[..dof_usize].iter_mut().zip(&instants[..dof_usize]) {
+                    *dst = inst.map(|t| {
+                        now_clock
+                            .saturating_duration_since(t)
+                            .as_millis()
+                            .min(u128::from(u64::MAX)) as u64
+                    });
+                }
+            } else if let (Some(oldest), Some(polled_at)) = (
+                inner.capture_driver_cache.oldest_age,
+                inner.capture_driver_cache.feedback_at,
+            ) {
+                let total_ms = oldest
+                    .saturating_add(now_clock.saturating_duration_since(polled_at))
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64;
+                for slot in &mut feedback_age_ms[..dof_usize] {
+                    *slot = Some(total_ms);
+                }
+            }
+        }
+
+        let driver_caps = inner.cached_capture_driver_caps();
+        let gravity_compensated = inner.gravity_compensated
+            && inner.config.dynamics_qualified
+            && inner.config.gravity_model.is_some()
+            && inner.config.dof >= inner.config.arm_dof()
+            && (inner.driver.is_none() || driver_caps.torque_feedforward);
 
         Self {
             terminal_seq,
@@ -280,6 +394,7 @@ impl TerminalCaptureRecord {
             geometry_id,
             violation_phase,
             reason,
+            label_truncated_mask,
             durability_confirmed: action.durability_confirmed,
             has_durability_warning,
             durability_warning,
@@ -308,6 +423,10 @@ impl TerminalCaptureRecord {
             torques: copy_f32_slice(&inner.torques),
             temperatures: copy_f32_slice(&inner.temperatures),
             commanded_positions: copy_f32_slice(&inner.commanded_positions),
+            gripper,
+            gravity_compensated,
+            gravity_torques: copy_f32_slice(&inner.gravity_torques),
+            feedback_age_ms,
             is_torqued: inner.is_torqued,
             disable_pending: inner.disable_pending,
             feedback_valid: inner.cached_hardware_feedback_fresh(Duration::from_millis(250)),
@@ -319,7 +438,7 @@ impl TerminalCaptureRecord {
             } else {
                 ControlMode::Position
             },
-            driver_caps: inner.cached_capture_driver_caps(),
+            driver_caps,
             enable_state: inner.cached_enable_state(),
             lease_holder: inner.lease_holder_str().map(HolderLabel::new),
         }
@@ -427,10 +546,26 @@ impl TerminalCaptureRecord {
         if self.pass.is_some() {
             dst.pass = self.pass;
         }
-        overlay_opt_label(&mut dst.constraint_id, self.constraint_id);
-        overlay_opt_label(&mut dst.geometry_id, self.geometry_id);
-        overlay_opt_label(&mut dst.violation_phase, self.violation_phase);
-        overlay_opt_label(&mut dst.reason, self.reason);
+        overlay_opt_label(
+            &mut dst.constraint_id,
+            self.constraint_id,
+            (self.label_truncated_mask & 1) != 0,
+        );
+        overlay_opt_label(
+            &mut dst.geometry_id,
+            self.geometry_id,
+            (self.label_truncated_mask & 2) != 0,
+        );
+        overlay_opt_label(
+            &mut dst.violation_phase,
+            self.violation_phase,
+            (self.label_truncated_mask & 4) != 0,
+        );
+        overlay_opt_label(
+            &mut dst.reason,
+            self.reason,
+            (self.label_truncated_mask & 8) != 0,
+        );
         if self.durability_confirmed.is_some() {
             dst.durability_confirmed = self.durability_confirmed;
         }
@@ -469,6 +604,14 @@ impl TerminalCaptureRecord {
         obs.commanded_positions.clear();
         obs.commanded_positions
             .extend_from_slice(&self.commanded_positions[..dof]);
+        obs.gripper = self.gripper.map(CapturedGripperObs::to_gripper_obs);
+        obs.gravity_compensated = self.gravity_compensated;
+        obs.gravity_torques.clear();
+        obs.gravity_torques
+            .extend_from_slice(&self.gravity_torques[..dof]);
+        obs.feedback_age_ms.clear();
+        obs.feedback_age_ms
+            .extend_from_slice(&self.feedback_age_ms[..dof]);
         obs.is_torqued = self.is_torqued;
         obs.disable_pending = self.disable_pending;
         obs.feedback_valid = self.feedback_valid;
@@ -476,6 +619,9 @@ impl TerminalCaptureRecord {
         obs.safety_state = self.safety_state.to_safety_state();
         obs.fault = self.fault;
         obs.control_mode = self.control_mode;
+        if self.control_mode != ControlMode::GravityComp {
+            obs.gravity_comp.phase = None;
+        }
         obs.driver_capabilities = self.driver_caps;
         obs.enable_state = self.enable_state;
         obs.lease_holder = self.lease_holder;
@@ -660,15 +806,31 @@ impl TerminalCaptureTx {
     }
 }
 
+/// Outcome of draining ready terminal records from the SPSC ring into `TerminalBroadcaster`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DrainOutcome {
+    pub(crate) drained: usize,
+    /// Action ID of the latest synthetic (`obs_override.is_some()`) terminal drained, so
+    /// `dispatch_loop` can suppress any older `running` `pending_telemetry` for the same action.
+    pub(crate) last_synthetic_action_id: Option<u64>,
+}
+
+struct CachedRichEntry {
+    id: u64,
+    status: Option<ActionStatus>,
+    message: Option<String>,
+    durability_warning: Option<String>,
+}
+
 /// Shared off-thread consumer and lock-free atomic accounting for terminal capture.
 /// `rx` and `rich_action_cache` are NEVER locked on `armd-control`; lock order is strictly
 /// `channel.rx -> terminals.inner` (and `rich_action_cache` is a leaf mutex).
 pub(crate) struct TerminalCaptureChannel {
     rx: Mutex<rtrb::Consumer<TerminalCaptureRecord>>,
-    /// Off-RT mirror of off-RT mutated `ActionStatus` payloads (bounded to `TERMINAL_FIFO_CAPACITY`)
-    /// so delayed dispatch past the 2 s window never drops any rich/diagnostic field without
-    /// touching `SupervisorLock`. Never accessed on `armd-control`.
-    rich_action_cache: Mutex<VecDeque<ActionStatus>>,
+    /// Off-RT mirror of off-RT mutated `ActionStatus` payloads and >256-byte worker strings
+    /// (bounded to `TERMINAL_FIFO_CAPACITY`) so delayed dispatch past the 2 s window never drops
+    /// or truncates any field without touching `SupervisorLock`. Never accessed on `armd-control`.
+    rich_action_cache: Mutex<VecDeque<CachedRichEntry>>,
     control_thread_lock_attempts: AtomicU64,
     next_terminal_seq: AtomicU64,
     captured: AtomicU64,
@@ -717,7 +879,7 @@ impl TerminalCaptureChannel {
     }
 
     #[inline]
-    fn lock_rich_cache(&self) -> std::sync::MutexGuard<'_, VecDeque<ActionStatus>> {
+    fn lock_rich_cache(&self) -> std::sync::MutexGuard<'_, VecDeque<CachedRichEntry>> {
         if crate::rt_core::executor::on_rt_control_thread() {
             self.control_thread_lock_attempts
                 .fetch_add(1, Ordering::SeqCst);
@@ -758,22 +920,75 @@ impl TerminalCaptureChannel {
     /// Unconditional off-RT mirror for `ActionStatus` payloads (never called on `armd-control`).
     pub(crate) fn mirror_rich_action(&self, action: &ActionStatus) {
         let mut cache = self.lock_rich_cache();
-        if let Some(existing) = cache.iter_mut().find(|a| a.id == action.id) {
-            existing.clone_from(action);
+        if let Some(existing) = cache.iter_mut().find(|e| e.id == action.id) {
+            match existing.status.as_mut() {
+                Some(s) => s.clone_from(action),
+                None => existing.status = Some(action.clone()),
+            }
             return;
         }
         while cache.len() >= TERMINAL_FIFO_CAPACITY {
             cache.pop_front();
         }
-        cache.push_back(action.clone());
+        cache.push_back(CachedRichEntry {
+            id: action.id,
+            status: Some(action.clone()),
+            message: None,
+            durability_warning: None,
+        });
     }
 
-    fn take_rich_action(&self, action_id: u64) -> Option<ActionStatus> {
+    /// Off-RT mirror for >256-byte persistence worker error messages so delayed recovery past
+    /// the 2 s window never truncates `ActionStatus::message`.
+    pub(crate) fn mirror_action_message(&self, action_id: u64, message: &str) {
+        if action_id == 0 || message.len() <= 256 {
+            return;
+        }
         let mut cache = self.lock_rich_cache();
-        let pos = cache.iter().position(|a| a.id == action_id)?;
+        if let Some(existing) = cache.iter_mut().find(|e| e.id == action_id) {
+            existing.message = Some(message.to_owned());
+            return;
+        }
+        while cache.len() >= TERMINAL_FIFO_CAPACITY {
+            cache.pop_front();
+        }
+        cache.push_back(CachedRichEntry {
+            id: action_id,
+            status: None,
+            message: Some(message.to_owned()),
+            durability_warning: None,
+        });
+    }
+
+    /// Off-RT mirror for >256-byte persistence worker durability warnings.
+    pub(crate) fn mirror_action_durability_warning(&self, action_id: u64, warning: &str) {
+        if action_id == 0 || warning.len() <= 256 {
+            return;
+        }
+        let mut cache = self.lock_rich_cache();
+        if let Some(existing) = cache.iter_mut().find(|e| e.id == action_id) {
+            existing.durability_warning = Some(warning.to_owned());
+            return;
+        }
+        while cache.len() >= TERMINAL_FIFO_CAPACITY {
+            cache.pop_front();
+        }
+        cache.push_back(CachedRichEntry {
+            id: action_id,
+            status: None,
+            message: None,
+            durability_warning: Some(warning.to_owned()),
+        });
+    }
+
+    fn take_rich_entry(&self, action_id: u64) -> Option<CachedRichEntry> {
+        let mut cache = self.lock_rich_cache();
+        let pos = cache.iter().position(|e| e.id == action_id)?;
         let item = cache.remove(pos);
         // Prune older consumed entries boundedly.
-        while cache.front().is_some_and(|a| a.id < action_id) && cache.len() > TERMINAL_FIFO_CAPACITY / 2 {
+        while cache.front().is_some_and(|e| e.id < action_id)
+            && cache.len() > TERMINAL_FIFO_CAPACITY / 2
+        {
             cache.pop_front();
         }
         item
@@ -834,19 +1049,20 @@ impl TerminalCaptureChannel {
         live_slots: &[Option<&ActionStatus>],
         template_obs: &ArmObservation,
         respect_publish_barrier: bool,
-    ) -> usize {
+    ) -> DrainOutcome {
         if self.drain_paused.load(Ordering::Acquire) {
-            return 0;
+            return DrainOutcome::default();
         }
-        let mut drained = 0usize;
+        let mut outcome = DrainOutcome::default();
         let hub_closed = hub.is_closed();
+        // Single authoritative barrier policy governing BOTH ring eligibility AND synthesis:
+        // when the hub is closed or barrier is disabled, an unmet `publish_seq` synthesizes a
+        // self-contained captured observation instead of carrying an unmet sequence into the FIFO.
+        let enforce_barrier = respect_publish_barrier && !hub_closed;
         let consumed_seq = latest_snap.map_or(0, |s| s.meta.seq);
         let latest_obs = latest_snap.map(|s| &s.obs);
         while let Ok(head) = rx.peek() {
-            // Bind eligibility strictly to `consumed_seq` (the `meta.seq` of the observation
-            // actually being consumed) so a concurrent publish cannot open the barrier against
-            // a stale snapshot.
-            if respect_publish_barrier && !hub_closed {
+            if enforce_barrier {
                 if let Some(req_seq) = head.publish_seq {
                     if consumed_seq < req_seq {
                         break;
@@ -860,19 +1076,11 @@ impl TerminalCaptureChannel {
                 .unwrap_or_else(|| rec.build_action_status());
             hub.attach_action_measurement_to_action(&mut action);
 
-            // Preserve HEAD's wire contract when `rec.publish_seq` matches an already-published
-            // snapshot (`consumed_seq >= req_seq`): `drain_all` clones `base_obs` and injects
-            // `action`, carrying `required_publish_seq` through delivery.
-            // Whenever a record has NO matching published snapshot (`rec.publish_seq.is_none()`,
-            // e.g. post-publish persistence saturation / control_stop, or no snapshot published
-            // yet, or shutdown draining a record ahead of `consumed_seq`), synthesize a
-            // self-contained `ArmObservation` from `rec`'s captured state so a terminal is NEVER
-            // paired with a pre-terminal snapshot.
             let needs_captured_obs = rec.publish_seq.is_none()
                 || (latest_obs.is_none() && hub.published_seq() == 0)
-                || (!respect_publish_barrier
-                    && rec.publish_seq.is_some_and(|req| consumed_seq < req));
+                || (!enforce_barrier && rec.publish_seq.is_some_and(|req| consumed_seq < req));
             let (obs_override, required_publish_seq) = if needs_captured_obs {
+                outcome.last_synthetic_action_id = Some(rec.action_id);
                 (
                     Some(rec.build_observation(latest_obs.unwrap_or(template_obs), action.clone())),
                     None,
@@ -890,9 +1098,9 @@ impl TerminalCaptureChannel {
                 required_publish_seq,
             );
             self.inflight.fetch_sub(1, Ordering::Release);
-            drained += 1;
+            outcome.drained += 1;
         }
-        drained
+        outcome
     }
 
     /// Drains ready records from the SPSC ring into `terminals` in strict `terminal_seq` order.
@@ -904,9 +1112,9 @@ impl TerminalCaptureChannel {
         live_slots: &[Option<&ActionStatus>],
         template_obs: &ArmObservation,
         respect_publish_barrier: bool,
-    ) -> usize {
+    ) -> DrainOutcome {
         if self.drain_paused.load(Ordering::Acquire) {
-            return 0;
+            return DrainOutcome::default();
         }
         let mut rx = self.lock_rx();
         self.drain_locked(
@@ -960,7 +1168,7 @@ fn resolve_full_action(
 ) -> Option<ActionStatus> {
     for slot in live_slots.iter().flatten() {
         if match_action(slot, rec) {
-            let _ = channel.take_rich_action(rec.action_id);
+            let _ = channel.take_rich_entry(rec.action_id);
             return Some((*slot).clone());
         }
     }
@@ -970,14 +1178,30 @@ fn resolve_full_action(
             .flatten()
         {
             if match_action(slot, rec) {
-                let _ = channel.take_rich_action(rec.action_id);
+                let _ = channel.take_rich_entry(rec.action_id);
                 return Some(slot.clone());
             }
         }
     }
-    if let Some(mut cached) = channel.take_rich_action(rec.action_id) {
-        rec.apply_terminal_overlay(&mut cached);
-        return Some(cached);
+    if let Some(entry) = channel.take_rich_entry(rec.action_id) {
+        let mut out = match entry.status {
+            Some(mut cached) => {
+                rec.apply_terminal_overlay(&mut cached);
+                cached
+            }
+            None => rec.build_action_status(),
+        };
+        if rec.has_message && rec.message.is_truncated() {
+            if let Some(full_msg) = entry.message {
+                out.message = Some(full_msg);
+            }
+        }
+        if rec.has_durability_warning && rec.durability_warning.is_truncated() {
+            if let Some(full_warn) = entry.durability_warning {
+                out.durability_warning = Some(full_warn);
+            }
+        }
+        return Some(out);
     }
     None
 }
@@ -1355,12 +1579,14 @@ mod tests {
         sup.set_lease_enabled(false).await;
         let delivered = Arc::new(Mutex::new(Vec::<(u64, f64)>::new()));
         let delivered_c = Arc::clone(&delivered);
-        let _sub = sup.test_subscribe_action_terminals(move |obs| {
+        // Subscribe directly on `TerminalBroadcaster` without spawning `armd-dispatch` so the
+        // manual drains below are 100% deterministic and cannot race with a background thread.
+        let sub_id = sup.terminals.subscribe(Box::new(move |obs| {
             if let Some(a) = obs.action.as_ref() {
                 delivered_c.lock().unwrap().push((a.id, obs.timestamp));
             }
             true
-        });
+        }));
 
         // Snapshot N published before terminal A.
         sup.control_tick(0.02).await;
@@ -1401,6 +1627,7 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].0, id_a);
         assert_eq!(got[0].1, snap_n1.obs.timestamp);
+        sup.terminals.unsubscribe(sub_id);
     }
 
     #[test]
@@ -1607,41 +1834,76 @@ mod tests {
         sup.set_lease_enabled(false).await;
         let delivered = Arc::new(Mutex::new(Vec::<ArmObservation>::new()));
         let delivered_c = Arc::clone(&delivered);
-        let _sub = sup.test_subscribe_action_terminals(move |obs| {
+        // Subscribe directly on `TerminalBroadcaster` (no background dispatcher) for deterministic
+        // manual drain verification.
+        let sub_id = sup.terminals.subscribe(Box::new(move |obs| {
             delivered_c.lock().unwrap().push(obs.clone());
             true
-        });
+        }));
 
         // Publish baseline snapshot N with initial epoch and timestamp.
         sup.control_tick(0.02).await;
         let snap_n = sup.hub().latest().expect("snapshot N");
 
         // Simulate post-publish capture with `publish_seq: None` (like persistence saturation or
-        // control_stop) after epoch / timestamp advance without another publish_at.
+        // control_stop) after moving the gripper joint and advancing timestamp without another
+        // publish_at. Verify self-contained field consistency (`positions[gripper.joint] == gripper.rad`,
+        // `feedback_age_ms`) AND `DrainOutcome.last_synthetic_action_id`.
+        let gripper_idx = {
+            let inner = sup.inner().read().await;
+            inner.config.gripper_index().expect("rebot_dm has gripper")
+        };
+        let moved_gripper_rad = 0.42f32;
         let id_sat = {
             let mut inner = sup.inner().write().await;
             inner.defer_terminal_capture = true;
             let id = inner.begin_action_rt("gripper_zero_check");
+            inner.measured_positions[gripper_idx] = moved_gripper_rad;
             inner.finish_action(id, "failed", Some("PERSIST_FAILED"), None, None, None, None);
             let ts_after = snap_n.obs.timestamp + 1.25;
             let _ = inner.capture_edge_terminals(ts_after, None);
             inner.defer_terminal_capture = false;
             id
         };
-        let _ = sup.test_drain_terminal_captures();
+        let out_sat = sup.terminal_capture_channel.drain_into(
+            &sup.terminals,
+            &sup.hub,
+            Some(&snap_n),
+            &[],
+            &sup.template_obs,
+            true,
+        );
+        assert_eq!(out_sat.drained, 1);
+        assert_eq!(
+            out_sat.last_synthetic_action_id,
+            Some(id_sat),
+            "synthetic post-publish drain must report action_id so stale running pending_telemetry is suppressed"
+        );
+        assert!(!sup.terminals.drain_all(&snap_n.obs, snap_n.meta.seq));
         {
             let got = delivered.lock().unwrap();
             assert_eq!(got.len(), 1);
             assert_eq!(got[0].action.as_ref().map(|a| a.id), Some(id_sat));
             assert!(
                 (got[0].timestamp - (snap_n.obs.timestamp + 1.25)).abs() < 1e-6,
-                "publish_seq: None capture must synthesize self-contained observation at capture timestamp, not stale snap_n"
+                "publish_seq: None capture must synthesize self-contained observation at capture timestamp"
             );
+            let grip = got[0].gripper.as_ref().expect("synthesized obs must include gripper");
+            assert_eq!(grip.joint, gripper_idx);
+            assert!(
+                (got[0].positions[gripper_idx] - moved_gripper_rad).abs() < 1e-6
+                    && (grip.rad - moved_gripper_rad).abs() < 1e-6,
+                "synthesized positions[gripper.joint] ({}) and gripper.rad ({}) must agree",
+                got[0].positions[gripper_idx],
+                grip.rad
+            );
+            assert_eq!(got[0].feedback_age_ms.len(), got[0].positions.len());
         }
 
-        // Simulate shutdown drain when a queued record has `publish_seq > final_snap.meta.seq`:
-        // drain with `respect_publish_barrier = false` synthesizes `obs_override`, and
-        // `drain_all(..., final_seq)` delivers it without ever passing `u64::MAX`.
+        // Simulate hub closing between loop check and normal `drain_into(..., respect_publish_barrier = true)`
+        // when a queued record has `publish_seq > final_snap.meta.seq`: unified `enforce_barrier`
+        // MUST synthesize `obs_override` (NOT carry an unmet `required_publish_seq`), so `drain_all`
+        // delivers it against `snap_n.meta.seq` without stranding.
         let id_shut = {
             let mut inner = sup.inner().write().await;
             inner.defer_terminal_capture = true;
@@ -1653,23 +1915,128 @@ mod tests {
             inner.defer_terminal_capture = false;
             id
         };
-        let _ = sup.terminal_capture_channel.drain_into(
+        sup.hub().close();
+        let out_shut = sup.terminal_capture_channel.drain_into(
             &sup.terminals,
             &sup.hub,
             Some(&snap_n),
             &[],
             &sup.template_obs,
-            false,
+            true,
         );
+        assert_eq!(out_shut.drained, 1);
+        assert_eq!(out_shut.last_synthetic_action_id, Some(id_shut));
         let blocked = sup.terminals.drain_all(&snap_n.obs, snap_n.meta.seq);
-        assert!(!blocked);
+        assert!(
+            !blocked,
+            "hub_closed drain must synthesize self-contained obs so drain_all does not strand"
+        );
         let got = delivered.lock().unwrap();
         assert_eq!(got.len(), 2);
         assert_eq!(got[1].action.as_ref().map(|a| a.id), Some(id_shut));
         assert!(
             (got[1].timestamp - (snap_n.obs.timestamp + 2.50)).abs() < 1e-6,
-            "shutdown drain ahead of final_snap.seq must emit captured observation, not stale snap_n"
+            "hub_closed drain ahead of final_snap.seq must emit captured observation"
         );
+        sup.terminals.unsubscribe(sub_id);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delayed_recovery_preserves_long_error_message_and_utf8_boundary_label() {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        sup.set_lease_enabled(false).await;
+        let delivered = Arc::new(Mutex::new(Vec::<ActionStatus>::new()));
+        let delivered_c = Arc::clone(&delivered);
+        let sub_id = sup.terminals.subscribe(Box::new(move |obs| {
+            if let Some(a) = obs.action.as_ref() {
+                delivered_c.lock().unwrap().push(a.clone());
+            }
+            true
+        }));
+
+        // 1) 127-byte ASCII prefix + multibyte UTF-8 char (`'é'`, 2 bytes -> total 129 bytes)
+        //    produces a 127-byte `HolderLabel` that MUST NOT overwrite the original cached string.
+        let utf8_reason = format!("{}é-suffix", "a".repeat(127));
+        assert!(utf8_reason.len() > HolderLabel::CAPACITY);
+        assert_eq!(HolderLabel::new(&utf8_reason).len(), 127);
+
+        let (id_utf8, expected_utf8) = {
+            let mut inner = sup.inner().write().await;
+            let id = inner.begin_action("grasp", None);
+            inner.set_action_workspace_violation(
+                id,
+                crate::kinematics::WorkspaceViolationDetail {
+                    constraint_id: Some("c1".into()),
+                    geometry_id: Some("g1".into()),
+                    violation_phase: Some("descend".into()),
+                    reason: Some(utf8_reason.clone()),
+                },
+            );
+            inner.defer_terminal_capture = true;
+            inner.finish_action(
+                id,
+                "failed",
+                Some("WORKSPACE_VIOLATION"),
+                None,
+                None,
+                None,
+                None,
+            );
+            let exp = inner.last_action.clone().expect("workspace violation slot");
+            let _id2 = inner.begin_action_rt("park");
+            inner.pending_normal_unload = true;
+            if let Some((_, until)) = inner.previous_action.as_mut() {
+                *until = 0.0;
+            }
+            inner.defer_terminal_capture = false;
+            (id, exp)
+        };
+        sup.control_tick(0.02).await;
+        let _ = sup.test_drain_terminal_captures();
+
+        // 2) >256-byte persistence worker error message mirrored via `mirror_action_message`
+        //    must survive 2 s expiry without 256-byte truncation.
+        let long_msg = format!("Failed to sync gripper calibration: {}", "x".repeat(360));
+        assert!(long_msg.len() > 256);
+        let id_long = {
+            let mut inner = sup.inner().write().await;
+            inner.defer_terminal_capture = true;
+            let id = inner.begin_action_rt("gripper_zero_check");
+            sup.terminal_capture_channel
+                .mirror_action_message(id, &long_msg);
+            inner.finish_action(
+                id,
+                "failed",
+                Some("PERSIST_FAILED"),
+                Some(long_msg.clone()),
+                None,
+                None,
+                None,
+            );
+            let _id2 = inner.begin_action_rt("park");
+            inner.pending_normal_unload = true;
+            if let Some((_, until)) = inner.previous_action.as_mut() {
+                *until = 0.0;
+            }
+            inner.defer_terminal_capture = false;
+            id
+        };
+        sup.control_tick(0.02).await;
+        let _ = sup.test_drain_terminal_captures();
+
+        let got = delivered.lock().unwrap().clone();
+        assert_eq!(got.len(), 3, "expected [id_utf8, superseded park, id_long]");
+        assert_eq!(got[0].id, id_utf8);
+        assert_eq!(got[0], expected_utf8, "UTF-8 boundary truncated label must preserve full cached reason");
+        assert_eq!(got[0].reason.as_deref(), Some(utf8_reason.as_str()));
+        assert_eq!(got[1].code.as_deref(), Some("SUPERSEDED"));
+        assert_eq!(got[2].id, id_long);
+        assert_eq!(
+            got[2].message.as_deref(),
+            Some(long_msg.as_str()),
+            "delayed >256-byte persistence error message must be recovered losslessly"
+        );
+        sup.terminals.unsubscribe(sub_id);
     }
 
     #[test]

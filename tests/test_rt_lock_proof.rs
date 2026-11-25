@@ -1507,36 +1507,52 @@ fn terminal_capture_lock_proof_action_completion_dwell_saturation_and_positive_c
                     in_cap_hook.store(entering, Ordering::Release);
                 }));
 
+            // Also exercise an in-tick supersession (early `capture_from` via
+            // `record_terminal_transition_for`) so that path is audited for 0 driver locks too.
+            {
+                let mut inner = sup.inner().write().await;
+                let _superseded = inner.test_start_zero_heap_jog_rt(0.02, 0.20);
+                let _replacement = inner.test_start_zero_heap_jog_rt(-0.02, 0.04);
+            }
+            for _ in 0..40 {
+                sup.control_tick(0.02).await;
+                let st = sup.test_terminal_capture_stats();
+                if st.captured + st.saturated >= 2 {
+                    break;
+                }
+            }
+
             // Real in-tick trajectory completions + 30 dwell ticks + saturation (6 total actions
-            // into push_cap=3). `terminal_capture_test_hook` arms `in_capture` BEFORE
-            // `TerminalCaptureRecord::capture_from` AND SPSC push so any driver mutex call in
-            // record construction or ring flush is caught.
+            // into push_cap=3). `terminal_capture_test_hook` spans `capture_edge_terminals` AND
+            // early `capture_from` paths so any driver mutex call in record construction or ring
+            // flush is caught.
+            let baseline_total = {
+                let st = sup.test_terminal_capture_stats();
+                st.captured + st.saturated
+            };
             for i in 0..6 {
                 let delta = if i % 2 == 0 { 0.02 } else { -0.02 };
                 sup.inner().write().await.test_start_zero_heap_jog_rt(delta, 0.04);
-                let target_total = (i + 1) as u64;
+                let target_total = baseline_total + (i + 1) as u64;
                 for _ in 0..40 {
-                    in_capture.store(false, Ordering::Release);
                     sup.control_tick(0.02).await;
-                    in_capture.store(false, Ordering::Release);
                     let st = sup.test_terminal_capture_stats();
                     if st.captured + st.saturated >= target_total {
                         break;
                     }
                 }
                 if i == 0 {
+                    let cap_after_first = sup.test_terminal_capture_stats().captured;
                     // 30 dwell ticks after first completion: 0 extra captures, 0 broadcaster locks.
                     for _ in 0..30 {
-                        in_capture.store(false, Ordering::Release);
                         sup.control_tick(0.02).await;
-                        in_capture.store(false, Ordering::Release);
                     }
-                    assert_eq!(sup.test_terminal_capture_stats().captured, 1);
+                    assert_eq!(sup.test_terminal_capture_stats().captured, cap_after_first);
                 }
             }
             let stats = sup.test_terminal_capture_stats();
             assert_eq!(stats.captured, 3, "push_cap=3: {stats:?}");
-            assert_eq!(stats.saturated, 3, "3 actions must saturate: {stats:?}");
+            assert!(stats.saturated >= 3, "actions past push_cap=3 must saturate: {stats:?}");
             assert!(stats.ever_saturated);
             assert_eq!(
                 driver_calls_during_capture.load(Ordering::Acquire),

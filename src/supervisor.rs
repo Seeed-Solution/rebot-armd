@@ -824,6 +824,9 @@ pub struct TickPublished {
     pub phase_terminal_us: u32,
     /// True if at least one newly terminal action record was pushed during this publish.
     pub captured_any: bool,
+    /// Context-switch baseline sampled strictly before `capture_edge_terminals` so `mid_nvcsw`
+    /// attributes any voluntary switch during terminal capture, publish, ACK flush, or guard drop.
+    pub mid_csw_start: Option<crate::diagnostics::tick::CswMark>,
 }
 
 /// Phase of an off-owner deferred park continuation (MIT moving-park handback or bounded
@@ -3133,6 +3136,44 @@ impl SupervisorInner {
         )
     }
 
+    /// Returns a cloned handle to the shared off-thread `TerminalCaptureChannel` (wired by
+    /// `ArmSupervisor::new`, `None` on standalone `SupervisorInner::new`).
+    pub(crate) fn terminal_capture_channel(
+        &self,
+    ) -> Option<Arc<terminal_capture::TerminalCaptureChannel>> {
+        self.terminal_capture_channel.clone()
+    }
+
+    /// Shared record-construction entry point wrapping `TerminalCaptureRecord::capture_from` so
+    /// early capture paths (immediate supersession, pre-overwrite materialization, staged
+    /// eviction) are audited by `terminal_capture_test_hook` identically to `capture_edge_terminals`.
+    #[inline]
+    fn capture_terminal_record(
+        &self,
+        action: &ActionStatus,
+        terminal_seq: u64,
+        obs_timestamp: f64,
+        invoke_hook: bool,
+    ) -> terminal_capture::TerminalCaptureRecord {
+        if invoke_hook {
+            if let Some(hook) = self.terminal_capture_test_hook.as_ref() {
+                hook(self, true);
+            }
+        }
+        let rec = terminal_capture::TerminalCaptureRecord::capture_from(
+            self,
+            action,
+            terminal_seq,
+            obs_timestamp,
+        );
+        if invoke_hook {
+            if let Some(hook) = self.terminal_capture_test_hook.as_ref() {
+                hook(self, false);
+            }
+        }
+        rec
+    }
+
     /// Off-RT helper mirroring a rich macro `ActionStatus` into `TerminalCaptureChannel`'s
     /// bounded sidecar cache so delayed dispatch past the 2 s window preserves every field.
     /// Never called on `armd-control` (`rt_executor_owned || defer_terminal_capture`).
@@ -3222,12 +3263,8 @@ impl SupervisorInner {
                 action_id,
                 terminal_seq,
             } => self.find_terminal_slot(action_id).map(|a| {
-                let mut r = terminal_capture::TerminalCaptureRecord::capture_from(
-                    self,
-                    a,
-                    terminal_seq,
-                    obs_timestamp,
-                );
+                let mut r =
+                    self.capture_terminal_record(a, terminal_seq, obs_timestamp, true);
                 r.publish_seq = publish_seq;
                 r
             }),
@@ -3248,12 +3285,7 @@ impl SupervisorInner {
         let Some(action) = self.find_terminal_slot(action_id) else {
             return;
         };
-        let rec = terminal_capture::TerminalCaptureRecord::capture_from(
-            self,
-            action,
-            seq,
-            obs_timestamp,
-        );
+        let rec = self.capture_terminal_record(action, seq, obs_timestamp, true);
         self.staged_terminals.replace_deferred_with_captured(action_id, rec);
         self.last_phase_terminal_us = self
             .last_phase_terminal_us
@@ -3282,7 +3314,7 @@ impl SupervisorInner {
                 return;
             }
             let ts = self.now_s();
-            let rec = terminal_capture::TerminalCaptureRecord::capture_from(self, action, seq, ts);
+            let rec = self.capture_terminal_record(action, seq, ts, true);
             if let Some(oldest) = self
                 .staged_terminals
                 .push_evicting_oldest(terminal_capture::StagedTerminal::Captured(rec))
@@ -4172,6 +4204,7 @@ impl SupervisorInner {
         };
         let owner = self.published_owner_meta();
         let next_pub_seq = self.core.next_publish_seq();
+        let mid_csw_start = Some(crate::diagnostics::tick::CswMark::now());
         let (phase_terminal_us, captured_any) =
             self.capture_edge_terminals(timestamp, Some(next_pub_seq));
         let SupervisorInner {
@@ -4202,6 +4235,7 @@ impl SupervisorInner {
             body_end,
             phase_terminal_us,
             captured_any,
+            mid_csw_start,
         }
     }
 
@@ -11896,7 +11930,7 @@ impl ArmSupervisor {
     #[doc(hidden)]
     pub fn test_drain_terminal_captures(&self) -> usize {
         let latest = self.hub.latest();
-        let drained = self.terminal_capture_channel.drain_into(
+        let outcome = self.terminal_capture_channel.drain_into(
             &self.terminals,
             &self.hub,
             latest.as_deref(),
@@ -11912,7 +11946,7 @@ impl ArmSupervisor {
             let base_seq = latest.as_ref().map_or(0, |s| s.meta.seq);
             let _ = self.terminals.drain_all(base, base_seq);
         }
-        drained
+        outcome.drained
     }
 
     /// Test-only accessor for lock-free terminal capture statistics.
@@ -14490,7 +14524,6 @@ impl ArmSupervisor {
             pre,
             publish,
             mid_csw_start,
-            phase_alloc_read,
             phase_ack_flush,
             phase_terminal,
             lock_end,
@@ -14524,6 +14557,7 @@ impl ArmSupervisor {
                 body_end,
                 phase_terminal_us,
                 captured_any,
+                mid_csw_start,
             } = inner.tick_publish_with_deadline(
                 dt,
                 generation,
@@ -14539,7 +14573,7 @@ impl ArmSupervisor {
             let pending_zc = inner.pending_zero_check_persist.take();
             let pending_wd = inner.watchdog_park_pending.filter(|p| !p.waiting_mit_handback);
             let control_hz = inner.config.control_frequency_hz;
-            let mid_csw_start = CswMark::now();
+            let mid_csw_start = mid_csw_start.unwrap_or_else(CswMark::now);
             let after_publish = Instant::now();
             Self::flush_legacy_estop_acks_into(&self.estop_reg, &mut inner);
             let after_ack_flush = Instant::now();
@@ -14559,7 +14593,6 @@ impl ArmSupervisor {
                 body_start.saturating_duration_since(locked),
                 after_publish.saturating_duration_since(body_end),
                 mid_csw_start,
-                us(lock_end.saturating_duration_since(after_ack_flush)),
                 us(after_ack_flush.saturating_duration_since(after_publish)),
                 phase_terminal_us,
                 lock_end,
@@ -14568,8 +14601,10 @@ impl ArmSupervisor {
         let released = Instant::now();
         // Sample allocator totals immediately after write-guard drop so the alloc proof covers
         // disconnect drain, tick control, edge-triggered terminal capture, publish, ACK flush,
-        // and write-guard teardown.
+        // and write-guard teardown, and `phases_us.alloc_read` measures the actual `alloc::take()`.
+        let alloc_read_start = Instant::now();
         let allocs = crate::diagnostics::alloc::take();
+        let phase_alloc_read = us(alloc_read_start.elapsed());
         let phase_guard_drop = us(released.saturating_duration_since(lock_end));
         let usage_released = UsageMark::now();
         let (mid_nvcsw, mid_nivcsw) = mid_csw_delta(&mid_csw_start, &usage_released);
@@ -14640,7 +14675,7 @@ impl ArmSupervisor {
             phases: crate::diagnostics::tick::LockPhases {
                 pre_us: us(pre),
                 rx_us: phases[0], control_us: phases[1], tx_us: phases[2], finish_us: phases[3], obs_us: phases[4],
-                publish_us: us(publish),
+                publish_us: us(publish).saturating_sub(phase_terminal),
             },
             phases_us: ReleasePhasesUs {
                 alloc_read: phase_alloc_read,
@@ -14926,8 +14961,21 @@ fn dispatch_loop(
         }
         // Single authoritative terminal ingestion path: drain ready SPSC capture records into
         // `TerminalBroadcaster` in strict `terminal_seq` order, binding publish-barrier eligibility
-        // strictly to `latest_snap.meta.seq`.
-        terminal_capture.drain_into(
+        // strictly to `latest_snap.meta.seq`. If a synthetic post-publish terminal (`obs_override`)
+        // drained for the same action currently marked `running` in `pending_telemetry`, suppress
+        // that stale `running` telemetry so wire order never reverses (`failed` -> `running`).
+        let suppress_stale_running = |pending: &mut Option<ArmObservation>, syn_id: Option<u64>| {
+            if let Some(id) = syn_id {
+                if pending
+                    .as_ref()
+                    .and_then(|o| o.action.as_ref())
+                    .is_some_and(|a| a.id == id && a.is_running())
+                {
+                    *pending = None;
+                }
+            }
+        };
+        let drain_out = terminal_capture.drain_into(
             terminals,
             hub,
             latest_snap.as_deref(),
@@ -14935,6 +14983,7 @@ fn dispatch_loop(
             template_obs,
             true,
         );
+        suppress_stale_running(&mut pending_telemetry, drain_out.last_synthetic_action_id);
         // If a new publication landed concurrently while draining, refresh `latest_snap` once so a
         // waiting `publish_seq`-gated capture consumes against the matching snapshot immediately.
         if hub.published_seq() != last {
@@ -14943,7 +14992,7 @@ fn dispatch_loop(
                 last_diag = last_diag.max(s.policy_diag_seq);
                 pending_telemetry = Some(s.obs.clone());
                 latest_snap = Some(s);
-                terminal_capture.drain_into(
+                let drain_out2 = terminal_capture.drain_into(
                     terminals,
                     hub,
                     latest_snap.as_deref(),
@@ -14951,6 +15000,7 @@ fn dispatch_loop(
                     template_obs,
                     true,
                 );
+                suppress_stale_running(&mut pending_telemetry, drain_out2.last_synthetic_action_id);
             }
         }
         // Drain every connection's bounded terminal FIFO into its higher-priority `ordinary_out_tx`
@@ -14970,7 +15020,7 @@ fn dispatch_loop(
                     last_diag = last_diag.max(s.policy_diag_seq);
                     pending_telemetry = Some(s.obs.clone());
                     latest_snap = Some(s);
-                    terminal_capture.drain_into(
+                    let drain_out3 = terminal_capture.drain_into(
                         terminals,
                         hub,
                         latest_snap.as_deref(),
@@ -14978,6 +15028,7 @@ fn dispatch_loop(
                         template_obs,
                         true,
                     );
+                    suppress_stale_running(&mut pending_telemetry, drain_out3.last_synthetic_action_id);
                     if let Some(s_ref) = latest_snap.as_ref() {
                         let _ = terminals.drain_all(&s_ref.obs, s_ref.meta.seq);
                     }

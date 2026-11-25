@@ -4323,6 +4323,7 @@ pub(crate) fn spawn_executor(
     });
 
     // Spawn dedicated persistence worker first so its thread handle can be woken on job push.
+    let persist_terminal_capture = core.terminal_capture_channel();
     let persist_thread = match spawn_persist_worker(
         persist_job_rx,
         persist_cmd_tx,
@@ -4335,6 +4336,7 @@ pub(crate) fn spawn_executor(
         persist_worker_exited.clone(),
         persist_exited_cv.clone(),
         hub.clone(),
+        persist_terminal_capture,
         hooks.clone(),
     ) {
         Ok(jh) => jh,
@@ -5860,8 +5862,30 @@ fn spawn_persist_worker(
     persist_worker_exited: Arc<AtomicBool>,
     persist_exited_cv: Arc<(Mutex<bool>, Condvar)>,
     hub: Arc<StateHub>,
+    terminal_capture: Option<Arc<crate::supervisor::terminal_capture::TerminalCaptureChannel>>,
     hooks: PersistTestHooks,
 ) -> std::io::Result<JoinHandle<()>> {
+    fn mirror_persist_cmd_text(
+        ch: Option<&crate::supervisor::terminal_capture::TerminalCaptureChannel>,
+        cmd: &PersistCmd,
+    ) {
+        let Some(ch) = ch else {
+            return;
+        };
+        match cmd {
+            PersistCmd::Fail { action_id, message, .. }
+            | PersistCmd::Abort { action_id, message, .. } => {
+                ch.mirror_action_message(*action_id, message);
+            }
+            PersistCmd::DirSyncFailed {
+                action_id, warning, ..
+            } => {
+                ch.mirror_action_durability_warning(*action_id, warning);
+            }
+            _ => {}
+        }
+    }
+
     struct ExitFlag(Arc<AtomicBool>, Arc<(Mutex<bool>, Condvar)>, Arc<StateHub>);
     impl Drop for ExitFlag {
         fn drop(&mut self) {
@@ -5878,6 +5902,7 @@ fn spawn_persist_worker(
         let _exit_guard = ExitFlag(persist_worker_exited, persist_exited_cv, hub);
         let mut last_sent_watchdog_park: Option<(u64, u8)> = None;
         let push_cmd = |tx: &mut Producer<PersistCmd>, cmd: PersistCmd, stop: &AtomicBool, dead: &AtomicBool| -> bool {
+            mirror_persist_cmd_text(terminal_capture.as_deref(), &cmd);
             let mut pending = Some(cmd);
             while let Some(c) = pending.take() {
                 if stop.load(Ordering::Acquire) || dead.load(Ordering::Acquire) || tx.is_abandoned() {
@@ -6008,6 +6033,7 @@ fn spawn_persist_worker(
                 cw_guard: Some(_cw),
                 published_config: &published_config,
                 hub: &hub_for_refresh,
+                terminal_capture: terminal_capture.as_deref(),
                 persist_stop: &persist_stop,
                 control_exited: &control_exited,
                 hooks: &hooks,
@@ -6036,6 +6062,7 @@ struct ExecutorPersistBackend<'a> {
     cw_guard: Option<tokio::sync::MutexGuard<'a, ()>>,
     published_config: &'a Arc<super::requests::config::PublishedConfigHub>,
     hub: &'a Arc<StateHub>,
+    terminal_capture: Option<&'a crate::supervisor::terminal_capture::TerminalCaptureChannel>,
     persist_stop: &'a Arc<AtomicBool>,
     control_exited: &'a Arc<AtomicBool>,
     hooks: &'a PersistTestHooks,
@@ -6050,6 +6077,20 @@ struct ExecutorPersistBackend<'a> {
 
 impl ExecutorPersistBackend<'_> {
     fn push_cmd(&mut self, cmd: PersistCmd) -> bool {
+        if let Some(ch) = self.terminal_capture {
+            match &cmd {
+                PersistCmd::Fail { action_id, message, .. }
+                | PersistCmd::Abort { action_id, message, .. } => {
+                    ch.mirror_action_message(*action_id, message);
+                }
+                PersistCmd::DirSyncFailed {
+                    action_id, warning, ..
+                } => {
+                    ch.mirror_action_durability_warning(*action_id, warning);
+                }
+                _ => {}
+            }
+        }
         let mut pending = Some(cmd);
         while let Some(c) = pending.take() {
             if self.persist_stop.load(Ordering::Acquire)
