@@ -349,15 +349,26 @@ def http_post_json(
         return int(resp.status), data
 
 
+def _is_loopback_host(http_base: str) -> bool:
+    parsed = urllib.parse.urlsplit(http_base)
+    host = (parsed.hostname or "").strip().lower()
+    return host in ("127.0.0.1", "localhost", "::1")
+
+
 def request_tick_baseline_marker(
     http_base: str,
     operator_pin: str | None,
     operator_token: str | None,
+    allow_insecure_auth: bool = False,
     timeout: float = 2.0,
 ) -> dict[str, Any]:
     """Call POST /api/v1/diagnostics/tick/mark and wait briefly for since_marker.status == 'active'."""
     headers: dict[str, str] = {"Origin": http_base}
     token = operator_token
+    if (token or operator_pin) and http_base.startswith("http://") and not _is_loopback_host(http_base) and not allow_insecure_auth:
+        raise RuntimeError(
+            "Refusing to send operator credentials over plain http:// to non-loopback host without --allow-insecure-auth"
+        )
     if not token and operator_pin:
         _, unlock = http_post_json(
             f"{http_base}/api/v1/operator/unlock",
@@ -941,7 +952,12 @@ def main(argv: list[str] | None = None) -> int:
             # Optional baseline marker before baseline capture so since_marker aligns with samples[0].
             if args.mark_baseline:
                 try:
-                    mark_res = request_tick_baseline_marker(http_base, operator_pin, operator_token)
+                    mark_res = request_tick_baseline_marker(
+                        http_base,
+                        operator_pin,
+                        operator_token,
+                        allow_insecure_auth=args.allow_insecure_auth,
+                    )
                     meta_record["baseline_marker"] = mark_res
                 except Exception as exc:
                     meta_record["baseline_marker"] = {"ok": False, "error": f"{err_tag(exc)}: {exc}"}

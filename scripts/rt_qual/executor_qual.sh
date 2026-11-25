@@ -454,14 +454,19 @@ echo "      motion report: ${MOTION_VERDICT}"
 # Step 4: Stop / E-Stop Checks (confirmed Idle & disarmed before triggering E-stop)
 # ------------------------------------------------------------------------------
 echo "[4/4] Running stop & E-stop checks..."
-python3 - "$BASE_URL" "$CLEAR_ESTOP_AFTER_CHECK" "${RUN_DIR}/estop_check.json" <<'PY'
-import json, os, sys, time, urllib.error, urllib.request
+python3 - "$BASE_URL" "$CLEAR_ESTOP_AFTER_CHECK" "${RUN_DIR}/estop_check.json" "$ALLOW_INSECURE_AUTH" <<'PY'
+import json, os, sys, time, urllib.error, urllib.parse, urllib.request
 from rebot import _ws as rebot_ws
 
 base_url = sys.argv[1]
 clear_after = sys.argv[2] == "1"
 out_path = sys.argv[3]
+allow_insecure_auth = sys.argv[4] == "1"
 ws_url = base_url.replace("http://", "ws://").replace("https://", "wss://") + "/api/v1/ws"
+
+def is_loopback(url):
+    host = (urllib.parse.urlsplit(url).hostname or "").strip().lower()
+    return host in ("127.0.0.1", "localhost", "::1")
 
 def get_json(path):
     with urllib.request.urlopen(f"{base_url}{path}", timeout=3.0) as r:
@@ -498,7 +503,21 @@ if s_before != "Idle" or obs_before.get("is_torqued"):
     raise RuntimeError(f"Pre-check requires Idle & disarmed, got safety={s_before}, is_torqued={obs_before.get('is_torqued')}")
 epoch_before = obs_before.get("epoch_id")
 
-# 2. Acquire WS lease and exercise /api/v1/motion/stop on executor owner.
+# Resolve optional operator token respecting the same insecure-auth transport opt-in as load.py.
+pin = os.environ.get("REBOT_OPERATOR_PIN")
+op_token = os.environ.get("REBOT_OPERATOR_TOKEN")
+if (pin or op_token) and base_url.startswith("http://") and not is_loopback(base_url) and not allow_insecure_auth:
+    raise RuntimeError(
+        "Refusing to send operator credentials over plain http:// to non-loopback host without --allow-insecure-auth"
+    )
+if not op_token and pin:
+    ul_status, ul = post_json("/api/v1/operator/unlock", {"pin": pin})
+    if ul_status != 200 or not isinstance(ul, dict) or not isinstance(ul.get("token"), str):
+        raise RuntimeError(f"operator unlock failed: {ul_status} {ul}")
+    op_token = ul["token"]
+
+# 2. Authenticate WS session (when operator credentials supplied), acquire lease without forced
+#    preemption, and exercise /api/v1/motion/stop on executor owner.
 ws = rebot_ws.connect(ws_url, timeout=3.0, origin=True)
 req_counter = 0
 try:
@@ -511,13 +530,19 @@ try:
                 return msg
         raise TimeoutError(f"timeout waiting for {wanted}")
 
-    ws.send(json.dumps({"type": "acquire_lease", "seq": 1, "client_id": "executor-qual-estop", "force": True}))
+    if op_token:
+        ws.send(json.dumps({"type": "auth", "seq": 1, "token": op_token}))
+        auth_ack = recv_types({"auth_ack"})
+        if auth_ack.get("role") != "operator":
+            raise RuntimeError(f"WS operator auth failed: {auth_ack}")
+
+    ws.send(json.dumps({"type": "acquire_lease", "seq": 2, "client_id": "executor-qual-estop", "force": False}))
     lease = recv_types({"lease_granted", "lease_rejected"})
     if lease.get("type") != "lease_granted":
         raise RuntimeError(f"lease acquire failed: {lease}")
     gen = lease["generation"]
 
-    def ws_cmd(path, body, epoch_id, operator_token=None):
+    def ws_cmd(path, body, epoch_id):
         global req_counter
         req_counter += 1
         payload = {
@@ -528,8 +553,6 @@ try:
             "path": path,
             "body": body,
         }
-        if operator_token:
-            payload["operator_token"] = operator_token
         ws.send(json.dumps(payload))
         return recv_types({"command_ack", "command_reject"})
 
@@ -557,13 +580,7 @@ try:
 
     cleared = False
     if clear_after:
-        pin = os.environ.get("REBOT_OPERATOR_PIN")
-        tok = os.environ.get("REBOT_OPERATOR_TOKEN")
-        if not tok and pin:
-            _, ul = post_json("/api/v1/operator/unlock", {"pin": pin})
-            if isinstance(ul, dict):
-                tok = ul.get("token")
-        clr_reply = ws_cmd("/api/v1/safety/clear_fault", {}, epoch_estop, operator_token=tok)
+        clr_reply = ws_cmd("/api/v1/safety/clear_fault", {}, epoch_estop)
         if clr_reply.get("type") != "command_ack":
             raise RuntimeError(f"WS clear_fault failed after E-stop check: {clr_reply}")
         obs_after = get_json("/api/v1/observation")
@@ -644,12 +661,23 @@ lines = [
 print("\n".join(lines[:10]))
 PY
 
-# Fail non-zero if either report hit FAIL or INVALID.
+# Fail closed unless every report has an explicit recognized PASS verdict (or observable-PASS
+# with only the unexposed enqueue_to_wire_us gap, and zero authoritative alloc/lock/drop gaps).
 for rep in "${RUN_DIR}/idle/report.md" "${RUN_DIR}/motion/report.md"; do
-    if grep -Eq '^\*\*Overall Verdict: (FAIL|INVALID)' "$rep"; then
-        echo "Qualification FAILED: $(grep -m1 '^\*\*Overall Verdict:' "$rep") in $rep" >&2
-        exit 1
+    verdict="$(grep -m1 '^\*\*Overall Verdict:' "$rep" || true)"
+    if [ "$verdict" = "**Overall Verdict: PASS**" ]; then
+        continue
     fi
+    if [ "$verdict" = "**Overall Verdict: INCOMPLETE (all observable criteria PASS; diagnostic gaps remain)**" ] \
+        && grep -Fq '| Lock gate (zero supervisor-lock attempts) | `0` |' "$rep" \
+        && grep -Fq '| PASS |' "$rep" \
+        && ! grep -Fq 'PASS (proxy)' "$rep" \
+        && ! grep -Fq 'INCOMPLETE (missing/malformed allocation evidence)' "$rep" \
+        && ! grep -Fq 'INCOMPLETE (diag_dropped' "$rep"; then
+        continue
+    fi
+    echo "Qualification FAILED: unacceptable verdict '${verdict:-<missing>}' in $rep" >&2
+    exit 1
 done
 
 echo "====================================================================="
