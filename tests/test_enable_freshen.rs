@@ -887,7 +887,7 @@ async fn dev20_soak_cycle_30x_enable_j1_motion_stop_park_rest_torque_off_idle_ze
             (inner.safety.epoch_id(), inner.current_admission_stamp())
         };
         let sup_ws = sup.clone();
-        let c_en = conn.clone();
+        let c_en = conn;
         let en_task = tokio::spawn(async move {
             sup_ws
                 .torque_ws_with_deadline(
@@ -1048,7 +1048,7 @@ async fn dev20_soak_cycle_30x_enable_j1_motion_stop_park_rest_torque_off_idle_ze
             (inner.safety.epoch_id(), inner.current_admission_stamp())
         };
         let sup_ws = sup.clone();
-        let c_dis = conn.clone();
+        let c_dis = conn;
         let dis_task = tokio::spawn(async move {
             sup_ws
                 .torque_ws_with_deadline(

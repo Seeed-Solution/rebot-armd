@@ -8649,10 +8649,34 @@ struct EnableFreshen {
     target_mask: u32,
     sent_mask: u32,
     confirmed_mask: u32,
-    tx_boundary: [u64; MAX_MODE_JOINTS],
-    tx_at: [Option<Instant>; MAX_MODE_JOINTS],
+    started: Instant,
+    base_rx_seq: u64,
+    tx_boundary_delta: [u32; MAX_MODE_JOINTS],
+    tx_offset_ns: [u32; MAX_MODE_JOINTS],
     next_retry_at: Option<Instant>,
     deadline: Deadline,
+}
+
+impl EnableFreshen {
+    const UNSET_NS: u32 = u32::MAX;
+
+    fn tx_boundary(&self, j: usize) -> u64 {
+        self.base_rx_seq.saturating_add(u64::from(self.tx_boundary_delta[j]))
+    }
+
+    fn tx_at(&self, j: usize) -> Option<Instant> {
+        let ns = self.tx_offset_ns[j];
+        (ns != Self::UNSET_NS).then(|| self.started + Duration::from_nanos(u64::from(ns)))
+    }
+
+    fn record_tx(&mut self, j: usize, boundary: u64, tx_at: Instant) {
+        self.sent_mask |= 1u32 << j;
+        self.tx_boundary_delta[j] =
+            u32::try_from(boundary.saturating_sub(self.base_rx_seq)).unwrap_or(u32::MAX);
+        let ns = u32::try_from(tx_at.saturating_duration_since(self.started).as_nanos())
+            .unwrap_or(Self::UNSET_NS - 1);
+        self.tx_offset_ns[j] = ns.min(Self::UNSET_NS - 1);
+    }
 }
 
 /// Time allowed for register replies during ticked range-check recovery (safe at 50 Hz ticks).
@@ -12844,8 +12868,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             target_mask,
             sent_mask: 0,
             confirmed_mask: 0,
-            tx_boundary: [0; MAX_MODE_JOINTS],
-            tx_at: [None; MAX_MODE_JOINTS],
+            started: start,
+            base_rx_seq: self.rx_seq,
+            tx_boundary_delta: [0; MAX_MODE_JOINTS],
+            tx_offset_ns: [EnableFreshen::UNSET_NS; MAX_MODE_JOINTS],
             next_retry_at: None,
             deadline,
         };
@@ -12910,9 +12936,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             ) {
                 Ok(_) => {
                     if (f.sent_mask & (1u32 << j)) == 0 {
-                        f.sent_mask |= 1u32 << j;
-                        f.tx_boundary[j] = boundary;
-                        f.tx_at[j] = Some(tx_at);
+                        f.record_tx(j, boundary, tx_at);
                     }
                     sent_any = true;
                 }
@@ -12941,10 +12965,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     && (f.sent_mask & (1u32 << pf_j)) != 0
                     && self.refresh_capture.is_none()
                 {
-                    if let Some(tx_at) = f.tx_at[pf_j] {
+                    if let Some(tx_at) = f.tx_at(pf_j) {
                         self.refresh_capture = Some(RefreshCapture {
                             joint: pf_j,
-                            boundary: f.tx_boundary[pf_j],
+                            boundary: f.tx_boundary(pf_j),
                             tx_at,
                             deadline: f.deadline,
                             allow_enabled_state: false,
@@ -12999,17 +13023,18 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
 
         if self.last_read_drained {
             for j in handshake::mask_joints(f.target_mask & f.sent_mask) {
-                let Some(tx_at) = f.tx_at[j] else {
+                let Some(tx_at) = f.tx_at(j) else {
                     continue;
                 };
+                let tx_boundary = f.tx_boundary(j);
                 if pf_joint == Some(j) {
                     let cap_first = self
                         .refresh_capture
                         .as_ref()
-                        .filter(|c| c.joint == j && c.boundary == f.tx_boundary[j])
+                        .filter(|c| c.joint == j && c.boundary == tx_boundary)
                         .and_then(|c| c.first);
                     if let Some(sample) = cap_first {
-                        let timely = sample.seq > f.tx_boundary[j]
+                        let timely = sample.seq > tx_boundary
                             && sample.rx_at >= tx_at
                             && !f.deadline.passed(sample.rx_at)
                             && sample.position.is_finite()
@@ -13050,7 +13075,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     }
                     continue;
                 }
-                let causal = self.last_feedback_seq[j] > f.tx_boundary[j]
+                let causal = self.last_feedback_seq[j] > tx_boundary
                     && self
                         .last_feedback_instant[j]
                         .is_some_and(|rx_at| rx_at >= tx_at && !f.deadline.passed(rx_at));
@@ -13090,6 +13115,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 }
                 f.confirmed_mask &= !re_stale;
                 f.sent_mask &= !re_stale;
+                for j in handshake::mask_joints(re_stale) {
+                    f.tx_offset_ns[j] = EnableFreshen::UNSET_NS;
+                }
                 if pf_joint.is_some_and(|pf_j| (re_stale & (1u32 << pf_j)) != 0) {
                     self.refresh_capture = None;
                 }
