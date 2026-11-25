@@ -3138,7 +3138,7 @@ fn carried_and_retried_j7_enable_fails_closed_when_j7_feedback_goes_stale() {
         let en_t = j7_enable_sent_at.expect("expected J7 CMD_ENABLE after fresh reply");
         // Verify J7 CMD_ENABLE went out on the EXACT release that accepted the delayed reply
         // (first 20 ms tick >= cc_t + reply_delay_ms).
-        let expected_accept_offset = ((reply_delay_ms + 19) / 20) * 20;
+        let expected_accept_offset = reply_delay_ms.div_ceil(20) * 20;
         assert_eq!(
             en_t.saturating_duration_since(cc_t),
             ms(expected_accept_offset),
