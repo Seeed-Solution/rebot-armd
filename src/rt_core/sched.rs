@@ -258,15 +258,28 @@ impl RtReadiness {
     }
 }
 
-static READINESS: std::sync::OnceLock<RtReadiness> = std::sync::OnceLock::new();
+static READINESS: std::sync::RwLock<Option<RtReadiness>> = std::sync::RwLock::new(None);
 
-/// Records the executor's readiness (the armd binary, once the executor thread runs). Only
-/// the first call counts.
-pub fn set_readiness(r: RtReadiness) { let _ = READINESS.set(r); }
+/// Records the active control owner's scheduling readiness (updated atomically at executor
+/// startup activation so a newly activated RT executor never retains stale legacy readiness).
+pub fn set_readiness(r: RtReadiness) {
+    *READINESS.write().unwrap_or_else(|e| e.into_inner()) = Some(r);
+}
+
+/// Returns a snapshot of the current recorded scheduling readiness, if any.
+pub fn current_readiness() -> Option<RtReadiness> {
+    READINESS.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
 
 /// Why MIT tracking is refused by the RT gate: None when the executor is ready, or when no
 /// executor recorded its readiness (library use and tests drive the tick themselves).
-pub fn mit_refusal() -> Option<String> { READINESS.get().and_then(RtReadiness::refusal) }
+pub fn mit_refusal() -> Option<String> {
+    READINESS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(RtReadiness::refusal)
+}
 
 #[cfg(test)]
 mod tests {

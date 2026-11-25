@@ -2465,7 +2465,11 @@ impl ArmDriver for OwnershipAuditDriver {
         _deadline: Instant,
         _max_rx_frames: u16,
     ) -> Result<(u16, bool), ArmDriverError> {
-        let count = self.release_reads.fetch_add(1, Ordering::SeqCst) + 1;
+        let count = if in_rt_release() {
+            self.release_reads.fetch_add(1, Ordering::SeqCst) + 1
+        } else {
+            0
+        };
         if count >= 2 {
             if let Some((entered, gate)) = &self.block_release_read_gate {
                 entered.store(true, Ordering::Release);
@@ -2720,11 +2724,10 @@ fn single_writer_ownership_across_start_failures_and_shutdown_paths() {
             }
 
             // 4a. Non-recoverable init failure (`fail_init: Some(false)`) when torqued:
-            //     runs bounded disable on `armd-control`, drops driver on `armd-control`,
-            //     transitions to OWNER_FAILED, detached shell has `driver.is_none()`.
+            //     under DRV-F1, NEVER disables away from rest; retains exclusive driver in SAFE-HOLD
+            //     until explicit ProcessExit disable, transitions to OWNER_FAILED, detached shell has `driver.is_none()`.
             // 4b. Non-recoverable init failure when `is_torqued == false` and `disable_pending == None`
-            //     but hardware driver reports `EnableState::Enabled` (partial/unconfirmed energization):
-            //     still runs bounded disable fail-closed!
+            //     but hardware driver reports `EnableState::Enabled`: same SAFE-HOLD until ProcessExit.
             for supervisor_torqued in [true, false] {
                 let enabled = Arc::new(AtomicBool::new(true));
                 let disables = Arc::new(AtomicUsize::new(0));
@@ -2747,11 +2750,28 @@ fn single_writer_ownership_across_start_failures_and_shutdown_paths() {
                     .is_err());
                 assert_eq!(sup.owner_mode(), OWNER_FAILED);
                 assert!(sup.inner().read().await.driver.is_none(), "detached shell must not retain driver");
-                assert!(
-                    disables.load(Ordering::SeqCst) >= 1,
-                    "non-recoverable init fail with enabled driver must attempt disable (supervisor_torqued={supervisor_torqued})"
+                wait_until_deadline(
+                    deadline,
+                    "non-recoverable init fail entered SAFE-HOLD",
+                    || sup.is_detached_safe_hold_active(),
                 );
+                assert_eq!(
+                    disables.load(Ordering::SeqCst),
+                    0,
+                    "DRV-F1: startup failure away from rest must NEVER disable torque (supervisor_torqued={supervisor_torqued})"
+                );
+                assert!(enabled.load(Ordering::SeqCst));
+                assert!(drop_t.lock().unwrap().is_none(), "SAFE-HOLD must keep driver alive until ProcessExit");
+                // Deliberate ProcessExit protective disable reaches the detached SAFE-HOLD writer.
+                let outcome = sup
+                    .emergency_process_exit_disable_until(Instant::now() + Duration::from_secs(2))
+                    .await;
+                assert_eq!(outcome, PanicDisableOutcome::Confirmed);
+                assert!(disables.load(Ordering::SeqCst) >= 1);
                 assert!(!enabled.load(Ordering::SeqCst));
+                wait_until_deadline(deadline, "detached SAFE-HOLD dropped driver on ProcessExit", || {
+                    drop_t.lock().unwrap().is_some()
+                });
                 let (dtid, on_ctrl) = drop_t.lock().unwrap().expect("driver dropped on control thread");
                 assert_ne!(dtid, main_tid);
                 assert!(on_ctrl);
@@ -2760,8 +2780,9 @@ fn single_writer_ownership_across_start_failures_and_shutdown_paths() {
 
             // 4c. Non-recoverable init failure (`fail_init: Some(false)`) with owner torque flags
             //     clear and a driver that PANICS inside `enable_state()`:
-            //     probe panic is caught as unknown enable state, bounded disable still runs,
-            //     startup returns Err, OWNER_FAILED, SupervisorLock released, Legacy never gets driver.
+            //     probe panic is caught as unknown enable state -> retains driver in SAFE-HOLD
+            //     (0 disables away from rest), OWNER_FAILED, SupervisorLock released, Legacy never gets driver;
+            //     deliberate ProcessExit disables and drops on `armd-control`.
             {
                 let enabled = Arc::new(AtomicBool::new(true));
                 let disables = Arc::new(AtomicUsize::new(0));
@@ -2787,8 +2808,20 @@ fn single_writer_ownership_across_start_failures_and_shutdown_paths() {
                 assert_eq!(sup.owner_mode(), OWNER_FAILED);
                 assert!(sup.inner().try_write().is_ok(), "SupervisorLock must be released");
                 assert!(sup.inner().read().await.driver.is_none(), "Legacy must never receive driver");
-                assert!(disables.load(Ordering::SeqCst) >= 1, "panicking enable_state probe must trigger bounded disable");
+                wait_until_deadline(deadline, "panicking enable_state probe entered SAFE-HOLD", || {
+                    sup.is_detached_safe_hold_active()
+                });
+                assert_eq!(disables.load(Ordering::SeqCst), 0, "unknown enable state must not disable away from rest");
+                assert!(enabled.load(Ordering::SeqCst));
+                let outcome = sup
+                    .emergency_process_exit_disable_until(Instant::now() + Duration::from_secs(2))
+                    .await;
+                assert_eq!(outcome, PanicDisableOutcome::Confirmed);
+                assert!(disables.load(Ordering::SeqCst) >= 1);
                 assert!(!enabled.load(Ordering::SeqCst));
+                wait_until_deadline(deadline, "4c SAFE-HOLD dropped driver on ProcessExit", || {
+                    drop_t.lock().unwrap().is_some()
+                });
                 let (dtid, on_ctrl) = drop_t.lock().unwrap().expect("driver dropped on control thread");
                 assert_ne!(dtid, main_tid);
                 assert!(on_ctrl);
@@ -2921,18 +2954,28 @@ fn single_writer_ownership_across_start_failures_and_shutdown_paths() {
                     *lock.lock().unwrap() = true;
                     cvar.notify_all();
                 }
-                wait_until_deadline(deadline, "late startup worker tore down after unblock", || {
-                    drop_t.lock().unwrap().is_some()
+                wait_until_deadline(deadline, "late startup worker entered SAFE-HOLD after unblock", || {
+                    sup.is_detached_safe_hold_active()
                 });
                 assert_eq!(
                     release_reads.load(Ordering::SeqCst),
                     0,
                     "late startup worker must NEVER enter release loop after timeout"
                 );
-                assert!(
-                    disables.load(Ordering::SeqCst) >= 1,
-                    "late startup worker must run bounded disable before dropping driver"
+                assert_eq!(
+                    disables.load(Ordering::SeqCst),
+                    0,
+                    "DRV-F1: late startup timeout-loser must hold in SAFE-HOLD without disabling away from rest"
                 );
+                assert!(drop_t.lock().unwrap().is_none());
+                let outcome = sup
+                    .emergency_process_exit_disable_until(Instant::now() + Duration::from_secs(2))
+                    .await;
+                assert_eq!(outcome, PanicDisableOutcome::Confirmed);
+                wait_until_deadline(deadline, "late startup worker dropped driver on ProcessExit", || {
+                    drop_t.lock().unwrap().is_some()
+                });
+                assert!(disables.load(Ordering::SeqCst) >= 1);
                 let (dtid, on_ctrl) = drop_t.lock().unwrap().unwrap();
                 assert_ne!(dtid, main_tid);
                 assert!(on_ctrl);
@@ -3024,23 +3067,33 @@ fn single_writer_ownership_across_start_failures_and_shutdown_paths() {
                     *lock.lock().unwrap() = true;
                     cvar.notify_all();
                 }
-                wait_until_deadline(deadline, "late preflight worker disabled and dropped driver", || {
-                    drop_t.lock().unwrap().is_some()
+                wait_until_deadline(deadline, "late preflight worker entered SAFE-HOLD", || {
+                    sup.is_detached_safe_hold_active()
                 });
                 assert_eq!(release_reads.load(Ordering::SeqCst), 0);
-                assert!(
-                    disables.load(Ordering::SeqCst) >= 1,
-                    "late preflight worker must run bounded disable even on late Err (stall_in_supports={stall_in_supports})"
+                assert_eq!(
+                    disables.load(Ordering::SeqCst),
+                    0,
+                    "DRV-F1: late preflight worker must retain energized driver in SAFE-HOLD (stall_in_supports={stall_in_supports})"
                 );
+                assert!(enabled.load(Ordering::SeqCst));
+                let outcome = sup
+                    .emergency_process_exit_disable_until(Instant::now() + Duration::from_secs(2))
+                    .await;
+                assert_eq!(outcome, PanicDisableOutcome::Confirmed);
+                wait_until_deadline(deadline, "late preflight worker disabled and dropped driver on ProcessExit", || {
+                    drop_t.lock().unwrap().is_some()
+                });
+                assert!(disables.load(Ordering::SeqCst) >= 1);
                 assert!(!enabled.load(Ordering::SeqCst));
                 let (dtid, on_ctrl) = drop_t.lock().unwrap().unwrap();
                 assert_ne!(dtid, main_tid);
                 assert!(on_ctrl);
                 assert_eq!(sup.driver_lock_attempts(), 0);
             }
-            // 5b. Startup panic inside `set_estop_gate(...)` (on `armd-control`, never caller thread):
-            //     caught cleanly, runs bounded panic-disable on `armd-control`, drops driver on
-            //     `armd-control`, transitions to OWNER_FAILED (NEVER OWNER_LEGACY), 0 DriverLock attempts.
+            // 5b. Startup panic inside `set_estop_gate(...)` / `set_rt_mode(...)` (on `armd-control`):
+            //     caught cleanly, enters SAFE-HOLD without disabling away from rest, transitions to
+            //     OWNER_FAILED (NEVER OWNER_LEGACY); deliberate ProcessExit disables and drops on `armd-control`.
             for panic_in_gate in [false, true] {
                 let enabled = Arc::new(AtomicBool::new(true));
                 let disables = Arc::new(AtomicUsize::new(0));
@@ -3069,24 +3122,36 @@ fn single_writer_ownership_across_start_failures_and_shutdown_paths() {
                 assert!(sup.start_executor(cfg).await.is_err());
                 assert_eq!(sup.owner_mode(), OWNER_FAILED);
                 assert!(sup.inner().read().await.driver.is_none());
-                assert!(
-                    disables.load(Ordering::SeqCst) >= 1,
-                    "startup panic must run bounded panic-disable (panic_in_gate={panic_in_gate})"
+                wait_until_deadline(deadline, "startup panic entered SAFE-HOLD", || {
+                    sup.is_detached_safe_hold_active()
+                });
+                assert_eq!(
+                    disables.load(Ordering::SeqCst),
+                    0,
+                    "DRV-F1: startup panic while torqued must hold in SAFE-HOLD without disabling (panic_in_gate={panic_in_gate})"
                 );
+                assert!(enabled.load(Ordering::SeqCst));
+                let outcome = sup
+                    .emergency_process_exit_disable_until(Instant::now() + Duration::from_secs(2))
+                    .await;
+                assert_eq!(outcome, PanicDisableOutcome::Confirmed);
+                assert!(disables.load(Ordering::SeqCst) >= 1);
                 assert!(!enabled.load(Ordering::SeqCst));
+                wait_until_deadline(deadline, "startup panic SAFE-HOLD dropped driver on ProcessExit", || {
+                    drop_t.lock().unwrap().is_some()
+                });
                 let (dtid, on_ctrl) = drop_t
                     .lock()
                     .unwrap()
-                    .expect("driver dropped on control thread after startup panic");
+                    .expect("driver dropped on control thread after ProcessExit");
                 assert_ne!(dtid, main_tid);
                 assert!(on_ctrl);
                 assert_eq!(sup.driver_lock_attempts(), 0);
             }
 
-            // 5c. Startup disable hang (`fail_init: Some(false)` with `begin_torque_budgeted(false, 0)`
-            //     blocking past `panic_disable_timeout`): `start_executor` must return `Err` within
-            //     the bounded timeout, transition to OWNER_FAILED, release SupervisorLock, and leave
-            //     sole driver ownership on the stalled control thread until it unblocks.
+            // 5c. Startup failure while torqued enters SAFE-HOLD, then deliberate ProcessExit disable
+            //     stalls past bound: returns TimedOut within bound while `armd-control` retains sole
+            //     ownership until unblocked.
             {
                 let enabled = Arc::new(AtomicBool::new(true));
                 let disables = Arc::new(AtomicUsize::new(0));
@@ -3112,20 +3177,29 @@ fn single_writer_ownership_across_start_failures_and_shutdown_paths() {
                     panic_disable_timeout: Some(Duration::from_millis(40)),
                     ..Default::default()
                 };
-                let t0 = Instant::now();
                 let res = sup.start_executor_with_hooks(cfg, hooks).await;
-                let elapsed = t0.elapsed();
-                assert!(res.is_err(), "stalled startup teardown must return Err");
-                assert!(
-                    elapsed < Duration::from_millis(500),
-                    "stalled startup teardown must return within bounded timeout, took {elapsed:?}"
-                );
+                assert!(res.is_err(), "fail_init must return Err");
                 assert_eq!(sup.owner_mode(), OWNER_FAILED);
                 assert!(
                     sup.inner().try_write().is_ok(),
                     "SupervisorLock must be released (not stuck in OWNER_TRANSFERRING)"
                 );
                 assert!(sup.inner().read().await.driver.is_none());
+                wait_until_deadline(deadline, "startup panic entered SAFE-HOLD", || {
+                    sup.is_detached_safe_hold_active()
+                });
+                assert_eq!(disables.load(Ordering::SeqCst), 0);
+
+                let t0 = Instant::now();
+                let outcome = sup
+                    .emergency_process_exit_disable_until(Instant::now() + Duration::from_millis(60))
+                    .await;
+                let elapsed = t0.elapsed();
+                assert_eq!(outcome, PanicDisableOutcome::TimedOut);
+                assert!(
+                    elapsed < Duration::from_millis(500),
+                    "stalled ProcessExit disable must return within bounded timeout, took {elapsed:?}"
+                );
                 assert!(
                     drop_t.lock().unwrap().is_none(),
                     "stalled control thread must retain sole ownership until unblocked"
@@ -3180,8 +3254,21 @@ fn single_writer_ownership_across_start_failures_and_shutdown_paths() {
                     assert!(disables.load(Ordering::SeqCst) >= 1);
                     assert!(!enabled.load(Ordering::SeqCst));
                 } else {
+                    // DRV-F1: ordinary stop_and_join while energized retains driver in SAFE-HOLD
+                    // without disabling away from rest; deliberate ProcessExit then disables and drops.
                     handle.stop_and_join();
+                    assert!(handle.is_in_safe_hold());
+                    assert_eq!(disables.load(Ordering::SeqCst), 0);
+                    assert!(enabled.load(Ordering::SeqCst));
+                    assert!(drop_t.lock().unwrap().is_none());
+                    let outcome = handle.emergency_disable_and_join();
+                    assert_eq!(outcome, PanicDisableOutcome::Confirmed);
+                    assert!(disables.load(Ordering::SeqCst) >= 1);
+                    assert!(!enabled.load(Ordering::SeqCst));
                 }
+                wait_until_deadline(deadline, "driver dropped on armd-control", || {
+                    drop_t.lock().unwrap().is_some()
+                });
                 let (dtid, on_ctrl) = drop_t.lock().unwrap().expect("driver dropped on armd-control");
                 assert_eq!(dtid, exec_tid);
                 assert!(on_ctrl);
@@ -3286,28 +3373,35 @@ fn single_writer_ownership_across_start_failures_and_shutdown_paths() {
                     .await
                     .expect("start executor for ordinary teardown racing release panic");
                 let exec_tid = handle.executor_thread_id();
-                wait_until_deadline(deadline, "release panic entered stalled disable", || {
-                    disable_entered.load(Ordering::Acquire)
+                wait_until_deadline(deadline, "release panic entered SAFE-HOLD", || {
+                    handle.is_in_safe_hold()
                 });
-                // Call ordinary `stop_and_join()` immediately while disable is stalled and BEFORE
-                // the 80 ms timeout observer has recorded `TimedOut`.
+                assert_eq!(disables.load(Ordering::SeqCst), 0, "release panic must hold without disabling");
+                // Ordinary stop_and_join detaches cleanly while SAFE-HOLD remains active.
                 let t0 = Instant::now();
                 handle.stop_and_join();
                 let elapsed = t0.elapsed();
                 assert!(
                     elapsed < Duration::from_millis(500),
-                    "ordinary stop_and_join racing stalled release panic must detach cleanly, took {elapsed:?}"
+                    "ordinary stop_and_join during SAFE-HOLD must detach cleanly, took {elapsed:?}"
                 );
+                assert!(drop_t.lock().unwrap().is_none());
+                // Deliberate ProcessExit then enters stalled disable and returns TimedOut within bound.
+                let t1 = Instant::now();
+                let outcome = handle.emergency_disable_and_join();
+                assert_eq!(outcome, PanicDisableOutcome::TimedOut);
+                assert!(t1.elapsed() < Duration::from_millis(500));
+                assert!(disable_entered.load(Ordering::Acquire));
                 assert!(
                     drop_t.lock().unwrap().is_none(),
-                    "stalled panic-disable thread must retain sole ownership until unblocked"
+                    "stalled ProcessExit disable thread must retain sole ownership until unblocked"
                 );
                 {
                     let (lock, cvar) = &*disable_gate;
                     *lock.lock().unwrap() = true;
                     cvar.notify_all();
                 }
-                wait_until_deadline(deadline, "stalled release-panic disable finished after unblock", || {
+                wait_until_deadline(deadline, "stalled ProcessExit disable finished after unblock", || {
                     drop_t.lock().unwrap().is_some()
                 });
                 let (dtid, on_ctrl) = drop_t.lock().unwrap().unwrap();
@@ -3318,7 +3412,7 @@ fn single_writer_ownership_across_start_failures_and_shutdown_paths() {
 
             // 7c. Forced ordinary teardown (`stop_and_join`) detaching a stalled, still-torqued
             //     release: must latch shared E-stop BEFORE detaching, and once unblocked the late
-            //     worker must run bounded disable before destroying `core`.
+            //     worker must enter SAFE-HOLD (0 disables away from rest) until ProcessExit.
             {
                 let enabled = Arc::new(AtomicBool::new(true));
                 let disables = Arc::new(AtomicUsize::new(0));
@@ -3367,13 +3461,21 @@ fn single_writer_ownership_across_start_failures_and_shutdown_paths() {
                     *lock.lock().unwrap() = true;
                     cvar.notify_all();
                 }
-                wait_until_deadline(deadline, "resumed worker ran disable and dropped driver", || {
+                wait_until_deadline(deadline, "resumed worker entered SAFE-HOLD without disabling", || {
+                    handle.is_in_safe_hold()
+                });
+                assert_eq!(
+                    disables.load(Ordering::SeqCst),
+                    0,
+                    "DRV-F1: resumed detached torqued worker must hold in SAFE-HOLD, not disable away from rest"
+                );
+                assert!(enabled.load(Ordering::SeqCst));
+                let outcome = handle.emergency_disable_and_join();
+                assert_eq!(outcome, PanicDisableOutcome::Confirmed);
+                wait_until_deadline(deadline, "ProcessExit disabled and dropped driver", || {
                     drop_t.lock().unwrap().is_some()
                 });
-                assert!(
-                    disables.load(Ordering::SeqCst) >= 1,
-                    "resumed detached torqued worker must run bounded disable before drop"
-                );
+                assert!(disables.load(Ordering::SeqCst) >= 1);
                 assert!(!enabled.load(Ordering::SeqCst));
                 let (dtid, on_ctrl) = drop_t.lock().unwrap().unwrap();
                 assert_eq!(dtid, exec_tid);

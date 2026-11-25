@@ -175,6 +175,16 @@ impl ArmCore {
         self.publisher.try_prewarm_observations(make);
     }
 
+    /// Installs privately staged pre-warmed producer observation slots without locking `hub`.
+    pub fn install_prewarmed_producer_slots(
+        &mut self,
+        back_obs: ArmObservation,
+        mid_obs: ArmObservation,
+    ) -> (Option<ArmObservation>, Option<ArmObservation>) {
+        self.publisher
+            .install_prewarmed_producer_slots(back_obs, mid_obs)
+    }
+
     /// The observation of the publication slot the next [`Self::publish`] writes, moved
     /// out to be filled in place (`SupervisorInner::fill_observation`) and handed back by
     /// `publish`: the tick reuses its memory instead of building a new observation (a blank

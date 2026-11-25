@@ -2997,7 +2997,7 @@ impl SupervisorInner {
     }
 
     fn enable_prepare_inner(&mut self, allow_bus_read: bool, allow_sync_mit: bool) -> Result<(bool, Option<f32>), SafetyError> {
-        if self.shutdown_committed {
+        if self.internal_fault_lane.is_fenced() || self.shutdown_committed {
             return Err(SafetyError::EStopActive);
         }
         if let Some(ref err) = self.driver_config_error {
@@ -3267,6 +3267,9 @@ impl SupervisorInner {
         }
         if self.gravity_comp.is_some() {
             return Err("MOTION_BUSY");
+        }
+        if self.internal_fault_lane.is_fenced() {
+            return Err("INTERNAL_FAULT");
         }
         if self.shutdown_committed {
             return Err("ESTOP_ACTIVE");
@@ -6752,7 +6755,7 @@ impl SupervisorInner {
     ) -> Result<SafetyState, ClearFaultWithAuthError> {
         use crate::rt_core::requests::lease::recheck_clear_fault_authority_readonly;
         use crate::safety::{ClearFaultError, ClearRefusal, FaultKind};
-        if self.shutdown_committed {
+        if self.internal_fault_lane.is_fenced() || self.shutdown_committed {
             return Err(ClearFaultWithAuthError::Clear(ClearFaultError::Rejected(ClearRefusal::ShutdownCommitted)));
         }
         // Build live pre-commit ClearContext right before committing so any concurrent E-stop,

@@ -3311,6 +3311,7 @@ fn only_thermal_and_process_exit_construct_disable_protective_and_no_already_off
 
     let mut expected: Vec<(String, &'static str)> = vec![
         ("src/driver.rs".to_string(), "ProcessExit"),
+        ("src/rt_core/safe_hold.rs".to_string(), "Thermal"),
         ("src/supervisor.rs".to_string(), "ProcessExit"),
         ("src/supervisor/driver_transitions.rs".to_string(), "ProcessExit"),
         ("src/supervisor/driver_transitions.rs".to_string(), "ProcessExit"),

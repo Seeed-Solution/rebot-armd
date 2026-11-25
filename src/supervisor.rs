@@ -39,7 +39,10 @@ pub(crate) use driver_transitions::{
     ClearFaultCommit, ClearFaultLegacyInnerError, ClearFaultLegacyWithAuthError,
     ClearFaultWithAuthError, ParkRearmStart,
 };
-pub(crate) use driver_transitions::{panic_disable_deadlines, run_with_panic_deadline_observer_until};
+pub(crate) use driver_transitions::{
+    bounded_panic_disable_driver_until, panic_disable_deadlines,
+    run_with_panic_deadline_observer_until,
+};
 pub use torque_off::{StoppedTorqueOffRefusal, STOPPED_TORQUE_OFF_FEEDBACK_MAX_AGE};
 
 /// Global monotonic allocator for single-use [`AdmissionStamp::request_id`] values.
@@ -1393,6 +1396,11 @@ pub struct SupervisorInner {
     /// True after a shutdown request was refused because hardware `enable_state()` was `Unknown`,
     /// so a repeated shutdown signal issues a bounded disable request instead of only re-checking.
     pub(crate) shutdown_refused_unknown: bool,
+    /// Lock-free owner-side internal-fault lane shared with the process panic hook and API/WS
+    /// ingress (DRV-F1 / FU-PANIC).
+    pub internal_fault_lane: Arc<crate::panic_coord::InternalFaultLane>,
+    /// True while a non-control-panic stop-direction park-to-rest is actively progressing on this owner.
+    pub(crate) internal_fault_park_active: bool,
     /// Preallocated bounded journal of immutable E-stop acknowledgements recorded at the exact
     /// moment [`Self::consume_pending_estop`] applies each urgent request (cap 64; never grows).
     pub(crate) pending_estop_acks: std::collections::VecDeque<crate::rt_core::executor::EstopAck>,
@@ -2501,6 +2509,8 @@ impl SupervisorInner {
             rt_executor_owned: false,
             shutdown_committed: false,
             shutdown_refused_unknown: false,
+            internal_fault_lane: Arc::new(crate::panic_coord::InternalFaultLane::new()),
+            internal_fault_park_active: false,
             pending_estop_acks: std::collections::VecDeque::with_capacity(
                 crate::rt_core::executor::ESTOP_ACK_CAPACITY,
             ),
@@ -3296,6 +3306,9 @@ impl SupervisorInner {
                 received: stamp.estop_epoch,
             });
         }
+        if self.internal_fault_lane.is_fenced() {
+            return Err(SafetyError::EStopActive);
+        }
         if self.e_stop_latched.load(Ordering::SeqCst)
             || matches!(self.safety.state(), SafetyState::EStop)
         {
@@ -4024,10 +4037,17 @@ impl SupervisorInner {
         obs
     }
 
-    /// Pre-warms RT-owned scratch/history buffers, static fallback policies, and empty
-    /// triple-buffer observation slots for the RT executor before the first release runs
-    /// (nonblocking under reader contention; leaves `published_seq` unchanged).
-    pub(crate) fn prewarm_observation_slots(&mut self) {
+    /// Pre-warms ONLY private `core`-owned RT scratch/history/spare buffers and constructs
+    /// privately staged pre-sized observation slots `(template, front, back, mid)` WITHOUT
+    /// touching shared `hub` state (so a timed-out startup loser never mutates `hub`).
+    pub(crate) fn prewarm_rt_observation_spares(
+        &mut self,
+    ) -> (
+        Box<ArmObservation>,
+        ArmObservation,
+        ArmObservation,
+        ArmObservation,
+    ) {
         let _ = Self::default_rebot_dm_resting_pose();
         let dof = self.config.dof;
         let arm_dof = self.config.arm_dof();
@@ -4040,9 +4060,6 @@ impl SupervisorInner {
         self.gravity_torques.reserve(arm_dof);
         self.mit.last_ff.reserve(dof.max(crate::rt_core::mailbox::MAX_DOF));
         self.closed_connections.reserve_rt();
-        // Exclusive buffer ownership invariant (0 alloc / 0 free on RT):
-        // either the live field holds the preallocated buffer and its spare is 0-capacity `String::new()`,
-        // or the live field is `None` and the spare holds the preallocated buffer.
         if let Some(ref mut a) = self.active_lease {
             if a.client_id.capacity() < 64 {
                 a.client_id.reserve(64 - a.client_id.len());
@@ -4092,9 +4109,6 @@ impl SupervisorInner {
             .as_ref()
             .and_then(|info| info.ceiling_torque_estimate_nm)
             .filter(|v| v.is_finite() && *v > 0.0);
-        // Maintain the strict single-buffer invariant on RT: EXACTLY ONE 128-byte heap String
-        // exists across `(self.held, self.held_label_spare)`, so transitions between `Some` and
-        // `None` never drop or allocate on `armd-control` even if an object was held at handover.
         if let Some(h) = self.held.as_mut() {
             h.label.reserve(128);
             self.held_label_spare = String::new();
@@ -4103,13 +4117,24 @@ impl SupervisorInner {
         }
         self.prewarm_rt_gripper_spares();
         let tmpl = self.current_observation();
-        self.core.try_prewarm_observations(|| {
+        let make_one = || {
             let mut obs = tmpl.clone();
             obs.ensure_rt_safety_text_spare();
             obs.gravity_torques.reserve(arm_dof);
             obs.motor_errors.reserve(dof);
             obs
-        });
+        };
+        (Box::new(make_one()), make_one(), make_one(), make_one())
+    }
+
+    /// Pre-warms RT-owned scratch/history buffers, static fallback policies, and empty
+    /// triple-buffer observation slots for the RT executor before the first release runs
+    /// (nonblocking under reader contention; leaves `published_seq` unchanged).
+    #[allow(dead_code)]
+    pub(crate) fn prewarm_observation_slots(&mut self) {
+        let (tmpl, front, back, mid) = self.prewarm_rt_observation_spares();
+        self.core.hub().install_prewarm_template_and_front(tmpl, front);
+        let _ = self.core.install_prewarmed_producer_slots(back, mid);
     }
 
     /// [`Self::current_observation`] at `timestamp` written into `out`, reusing its memory: the
@@ -5097,6 +5122,132 @@ impl SupervisorInner {
             Some(_) => !self.is_torqued && self.torque_intent == TorqueIntent::Off,
         }
     }
+    /// Refreshes live measured-position hold provenance directly from the attached driver at a
+    /// release boundary (zero allocations, zero locks on `DriverSlot::Exclusive`) immediately
+    /// before energized handback to Legacy ownership.
+    pub(crate) fn refresh_measured_hold_for_handback(&mut self) {
+        let dof = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
+        if let Some(d) = self.driver.as_ref() {
+            let mut ages = std::mem::take(&mut self.scratch.ages);
+            let mut bounds = std::mem::take(&mut self.scratch.fb.bounds);
+            let feedback_numeric_valid = self.feedback_numeric_valid;
+            let measured = &self.measured_positions;
+            if let Some(snap) = d.with_ref(|drv| {
+                driver_transitions::OwnerDriverSnapshot::capture_from_driver(
+                    drv,
+                    dof,
+                    feedback_numeric_valid,
+                    measured,
+                    &mut ages,
+                    &mut bounds,
+                )
+            }) {
+                self.owner_driver_snapshot = snap;
+            }
+            self.scratch.ages = ages;
+            self.scratch.fb.bounds = bounds;
+        }
+        let _ = self.capture_measured_hold_from_owner();
+    }
+
+    /// Latches a non-recoverable fault naming the panicking non-control thread (DRV-F1 / FU-PANIC).
+    fn latch_internal_fault_non_recoverable(&mut self) {
+        let mut name_buf = [0u8; 64];
+        let thread_name = self.internal_fault_lane.copy_thread_name(&mut name_buf);
+        self.safety.latch(
+            crate::safety::FaultKind::Other,
+            crate::safety::FaultDetail::formatted(crate::safety::FaultCode::Other, |buf| {
+                let _ = core::fmt::write(
+                    buf,
+                    format_args!("non-control thread panic ({thread_name}); commands fenced"),
+                );
+            }),
+        );
+        self.internal_fault_lane.mark_fault_latched();
+    }
+
+    /// Owner-side lock-free service of [`crate::panic_coord::InternalFaultLane`] invoked on EVERY
+    /// control tick/release across BOTH Legacy and RT Executor owners (zero queue dependency).
+    ///
+    /// On a non-control thread panic while `armd-control` is healthy:
+    /// 1. Revokes prior motion, servo targets, macro/policy runs, and any pending enable transition.
+    /// 2. Attempts normal stop-direction park to the resting pose (`StopPolicy::NormalUnload`).
+    /// 3. At confirmed rest, normal rest-gated disable (`Rule A'`) removes torque and latches a
+    ///    non-recoverable fault naming the panicking thread.
+    /// 4. If park cannot start or fails/aborts mid-way, keeps holding and latches the
+    ///    non-recoverable fault (never disables torque away from rest).
+    #[inline(never)]
+    pub(crate) fn service_internal_fault_lane(&mut self) {
+        use crate::panic_coord::InternalFaultParkOutcome;
+        if !self.internal_fault_lane.is_fenced() {
+            return;
+        }
+        if self.internal_fault_lane.take_park_request() {
+            // Revoke all prior client motion, servo targets, macro/policy runs, and any in-flight
+            // enable transition without setting E-stop (so `NormalUnload` remains eligible).
+            if let Some(driver_transitions::TorqueTransition::Enable(_)) =
+                self.torque_transition.take()
+            {
+                if let Some(d) = self.driver.as_mut() {
+                    let _ = d.try_with_mut(|drv| drv.abort_enable());
+                }
+                self.enable_lifecycle = driver_transitions::EnableLifecycle::FailedHold;
+                self.pending_rearm = true;
+            }
+            self.stop_motion();
+            self.servo_target = None;
+            self.servo_stream_active = false;
+            self.drop_macro_run("failed", Some("INTERNAL_FAULT"));
+            #[cfg(feature = "policy-runtime")]
+            if self.policy_run.is_some() {
+                self.policy_run = None;
+            }
+            if !self.is_torqued && self.torque_intent == TorqueIntent::Off {
+                self.latch_internal_fault_non_recoverable();
+                self.internal_fault_lane
+                    .set_outcome(InternalFaultParkOutcome::ParkedAndDisabled);
+                return;
+            }
+            self.apply_stop_policy(StopPolicy::NormalUnload);
+            if self.pending_normal_unload {
+                self.internal_fault_park_active = true;
+                self.internal_fault_lane
+                    .set_outcome(InternalFaultParkOutcome::Parking);
+            } else {
+                // Park could not start (workspace violation, blocked, no rest pose, already
+                // stopped, or failed hold): keep holding and latch non-recoverable fault.
+                self.latch_internal_fault_non_recoverable();
+                self.internal_fault_lane
+                    .set_outcome(InternalFaultParkOutcome::HoldingFallback);
+            }
+            return;
+        }
+
+        if self.internal_fault_park_active {
+            if !self.is_torqued
+                && self.torque_intent == TorqueIntent::Off
+                && !self.disable_pending
+                && !self.torque_transition_pending()
+            {
+                self.internal_fault_park_active = false;
+                self.latch_internal_fault_non_recoverable();
+                self.internal_fault_lane
+                    .set_outcome(InternalFaultParkOutcome::ParkedAndDisabled);
+            } else if !self.pending_normal_unload
+                && !self.disable_pending
+                && !self.torque_transition_pending()
+                && self.active_trajectory.is_none()
+            {
+                // Park ended without disabling (e.g. rest-gate refused or trajectory aborted):
+                // retain holding torque and latch non-recoverable fault.
+                self.internal_fault_park_active = false;
+                self.latch_internal_fault_non_recoverable();
+                self.internal_fault_lane
+                    .set_outcome(InternalFaultParkOutcome::HoldingFallback);
+            }
+        }
+    }
+
     /// Authoritative shutdown gate shared by legacy lock and RT executor ownership paths.
     /// Returns `true` when safe to stop the control loop and exit; returns `false` after
     /// latching stop when no accepted disable has recorded `torque_intent = Off` yet. When
@@ -7462,12 +7613,29 @@ impl SupervisorInner {
         let mut park_wake = None;
         let mut park_state_changed = false;
         let (rx_frames, rx_exhausted) = if release_cap_expired {
-            self.pending_rx_poll = PendingRxPoll {
-                active: true,
-                budget_exhausted: true,
-                ..PendingRxPoll::default()
-            };
-            (0, true)
+            // Release TX cutoff already expired: skip budgeted Step-2 TX transitions, stage an
+            // already-expired driver TX cap (`Some(drv_now)`) so RX recovery emits 0 TX frames,
+            // and still read RX feedback (or cached states) so `bus_feedback_fresh` stays accurate.
+            let staged_expired = self
+                .driver
+                .as_mut()
+                .and_then(|d| {
+                    d.try_with_mut(|drv| {
+                        let drv_now = drv.clock_now();
+                        drv.set_tx_release_deadline(Some(drv_now));
+                        true
+                    })
+                    .ok()
+                })
+                .unwrap_or(false);
+            let mut rx = self.poll_hardware_rx_with_clock(Some(budget), None, None, now_fn);
+            if staged_expired {
+                self.clear_driver_tx_release_cap();
+            }
+            rx.budget_exhausted = true;
+            let rx_frames = rx.rx_frames;
+            self.pending_rx_poll = rx;
+            (rx_frames, true)
         } else {
             let trans = self.service_torque_transition_with_clock(budget, now_fn);
             let transition_rx = if let Some(tp) = trans {
@@ -7612,6 +7780,7 @@ impl SupervisorInner {
         self.poll_hardware_rx_with_clock(budget, transition_rx, release_deadline, &mut live_now)
     }
 
+    #[inline(never)]
     pub(crate) fn poll_hardware_rx_with_clock(
         &mut self,
         budget: Option<&crate::rt_core::ops::ServiceBudget>,
@@ -7631,54 +7800,63 @@ impl SupervisorInner {
                 if self.control_release_seq > 0 {
                     driver.begin_control_release(self.control_release_seq);
                 }
-                let (applied_step2_tx_cap, release_cap_expired) =
+                let applied_step2_tx_cap =
                     if let (Some(_), Some(rd)) = (budget, release_deadline) {
                         match rd.checked_sub(margin) {
                             Some(owner_cap) => {
                                 match translate_driver_cutoff_conservative(driver, owner_cap, now_fn) {
                                     Ok((_, _, cap)) => {
                                         driver.set_tx_release_deadline(Some(cap));
-                                        (true, false)
+                                        true
                                     }
-                                    Err(_) => (false, true),
+                                    Err((drv_now, _)) => {
+                                        driver.set_tx_release_deadline(Some(drv_now));
+                                        true
+                                    }
                                 }
                             }
-                            None => (false, true),
+                            None => {
+                                let drv_now = driver.clock_now();
+                                driver.set_tx_release_deadline(Some(drv_now));
+                                true
+                            }
                         }
                     } else {
-                        (false, false)
+                        false
                     };
-                let read_res = if release_cap_expired {
-                    Ok((transition_rx.map_or(0, |(f, _)| f), true))
-                } else {
-                    match (budget, transition_rx) {
-                        (Some(b), Some((frames, exhausted))) => {
-                            if driver.read_cached_joint_states_into(&mut sc.states).is_some() {
-                                Ok((frames, exhausted))
+                let read_res = match (budget, transition_rx) {
+                    (Some(b), Some((frames, exhausted))) => {
+                        if driver.read_cached_joint_states_into(&mut sc.states).is_some() {
+                            Ok((frames, exhausted))
+                        } else {
+                            let remaining = b.max_rx_frames.saturating_sub(frames);
+                            if remaining == 0 {
+                                Ok((frames, true))
                             } else {
-                                let remaining = b.max_rx_frames.saturating_sub(frames);
-                                if remaining == 0 {
-                                    Ok((frames, true))
-                                } else {
-                                    match translate_driver_cutoff_conservative(driver, b.deadline, now_fn) {
-                                        Ok((_, _, drv_deadline)) => driver
-                                            .read_joint_states_budgeted(&mut sc.states, drv_deadline, remaining)
-                                            .map(|(f2, ex2)| (frames.saturating_add(f2), exhausted || ex2)),
-                                        Err(_) => Ok((frames, true)),
+                                match translate_driver_cutoff_conservative(driver, b.deadline, now_fn) {
+                                    Ok((_, _, drv_deadline)) => driver
+                                        .read_joint_states_budgeted(&mut sc.states, drv_deadline, remaining)
+                                        .map(|(f2, ex2)| (frames.saturating_add(f2), exhausted || ex2)),
+                                    Err(_) => {
+                                        let _ = driver.read_cached_joint_states_into(&mut sc.states);
+                                        Ok((frames, true))
                                     }
                                 }
                             }
                         }
-                        (Some(b), None) => {
-                            match translate_driver_cutoff_conservative(driver, b.deadline, now_fn) {
-                                Ok((_, _, drv_deadline)) => {
-                                    driver.read_joint_states_budgeted(&mut sc.states, drv_deadline, b.max_rx_frames)
-                                }
-                                Err(_) => Ok((0, true)),
+                    }
+                    (Some(b), None) => {
+                        match translate_driver_cutoff_conservative(driver, b.deadline, now_fn) {
+                            Ok((_, _, drv_deadline)) => {
+                                driver.read_joint_states_budgeted(&mut sc.states, drv_deadline, b.max_rx_frames)
+                            }
+                            Err(_) => {
+                                let _ = driver.read_cached_joint_states_into(&mut sc.states);
+                                Ok((0, true))
                             }
                         }
-                        (None, _) => driver.read_joint_states_into(&mut sc.states).map(|()| (0, false)),
                     }
+                    (None, _) => driver.read_joint_states_into(&mut sc.states).map(|()| (0, false)),
                 };
                 if applied_step2_tx_cap {
                     driver.set_tx_release_deadline(None);
@@ -7951,6 +8129,7 @@ impl SupervisorInner {
     /// translated into the driver clock domain using conservative driver-clock-first,
     /// live-owner-clock-second sampling. Rejects expired release cutoffs BEFORE staging any driver
     /// deadline. Safety/stopped holds are never clipped by an action deadline.
+    #[inline(never)]
     fn install_effective_tx_cutoff(
         &mut self,
         release_deadline: Option<Instant>,
@@ -8006,15 +8185,19 @@ impl SupervisorInner {
             // Sample driver clock FIRST, then live owner clock inside the driver boundary, and
             // refuse expired release cutoffs BEFORE staging any driver deadline.
             let (drv_now, owner_now, drv_release_cap) = match release_deadline {
-                Some(rd) => {
-                    let Some(owner_cap) = rd.checked_sub(margin) else {
-                        return (DriverTxCapOutcome::Expired, None);
-                    };
-                    match translate_driver_cutoff_conservative(drv, owner_cap, now_fn) {
-                        Ok(translated) => translated,
-                        Err(_) => return (DriverTxCapOutcome::Expired, None),
+                Some(rd) => match rd.checked_sub(margin) {
+                    Some(owner_cap) => {
+                        match translate_driver_cutoff_conservative(drv, owner_cap, now_fn) {
+                            Ok(translated) => translated,
+                            Err((drv_now, owner_now)) => (drv_now, owner_now, drv_now),
+                        }
                     }
-                }
+                    None => {
+                        let drv_now = drv.clock_now();
+                        let owner_now = now_fn();
+                        (drv_now, owner_now, drv_now)
+                    }
+                },
                 None => {
                     let drv_now = drv.clock_now();
                     let owner_now = now_fn();
@@ -8055,6 +8238,7 @@ impl SupervisorInner {
         }
     }
 
+    #[inline(never)]
     fn tick_control_inner(
         &mut self,
         dt: f64,
@@ -8067,7 +8251,7 @@ impl SupervisorInner {
         // Legacy callers without a preceding Step-2 `poll_hardware_for_release` run `poll_hardware_rx`
         // below; bound any stale-joint recovery TX during RX intake to the control-release cap
         // using conservative driver-first, live-owner-second translation.
-        let rx_tx_cap_outcome = if !self.pending_rx_poll.active && self.driver.is_some() {
+        let (applied_rx_tx_cap, rx_tx_cap_expired) = if !self.pending_rx_poll.active && self.driver.is_some() {
             let margin = self.tx_release_publish_margin();
             let period = Duration::from_secs_f64(1.0 / f64::from(self.config.control_frequency_hz.max(1)));
             if let Some(mut drv) = self.write_driver_for_tick() {
@@ -8077,29 +8261,36 @@ impl SupervisorInner {
                             match translate_driver_cutoff_conservative(drv.as_ref(), owner_cap, now_fn) {
                                 Ok((_, _, cap)) => {
                                     drv.set_tx_release_deadline(Some(cap));
-                                    DriverTxCapOutcome::Installed
+                                    (true, false)
                                 }
-                                Err(_) => DriverTxCapOutcome::Expired,
+                                Err((drv_now, _)) => {
+                                    drv.set_tx_release_deadline(Some(drv_now));
+                                    (true, true)
+                                }
                             }
                         }
-                        None => DriverTxCapOutcome::Expired,
+                        None => {
+                            let drv_now = drv.clock_now();
+                            let _ = now_fn();
+                            drv.set_tx_release_deadline(Some(drv_now));
+                            (true, true)
+                        }
                     },
                     None => {
                         let drv_now = drv.clock_now();
                         let _ = now_fn();
                         drv.set_tx_release_deadline(Some(drv_now + period.saturating_sub(margin)));
-                        DriverTxCapOutcome::Installed
+                        (true, false)
                     }
                 }
             } else {
-                DriverTxCapOutcome::NotInstalled
+                (false, false)
             }
         } else {
-            DriverTxCapOutcome::NotInstalled
+            (false, false)
         };
-        let applied_rx_tx_cap = rx_tx_cap_outcome == DriverTxCapOutcome::Installed;
-        let rx_tx_cap_expired = rx_tx_cap_outcome == DriverTxCapOutcome::Expired;
         self.consume_pending_estop();
+        self.service_internal_fault_lane();
         // Immediate atomic e-stop latch check before any processing (only latches once when not yet recorded;
         // every new E-stop request arrives via `consume_pending_estop` above and advances the epoch).
         if self.e_stop_latched.load(Ordering::SeqCst)
@@ -8113,16 +8304,9 @@ impl SupervisorInner {
         let was_step2_poll = self.pending_rx_poll.active;
         let rx = if was_step2_poll {
             std::mem::take(&mut self.pending_rx_poll)
-        } else if rx_tx_cap_expired {
-            self.control_release_seq = self.control_release_seq.wrapping_add(1).max(1);
-            PendingRxPoll {
-                active: true,
-                budget_exhausted: true,
-                ..PendingRxPoll::default()
-            }
         } else {
             self.control_release_seq = self.control_release_seq.wrapping_add(1).max(1);
-            if self.has_non_broker_torque_transition() {
+            if !rx_tx_cap_expired && self.has_non_broker_torque_transition() {
                 let now = now_fn();
                 let budget = crate::rt_core::ops::ServiceBudget {
                     now,
@@ -10990,7 +11174,7 @@ pub struct ArmSupervisor {
     sinks: Arc<std::sync::Mutex<Option<Arc<crate::rt_core::executor::OffThreadSinks>>>>,
     /// Template observation used by `armd-dispatch` to carry drained action terminals if no
     /// control tick has published to `hub` yet.
-    template_obs: ArmObservation,
+    template_obs: Box<ArmObservation>,
     /// Shared periodic-loop timing stats attached in Legacy mode (`run_periodic`).
     legacy_loop_stats: std::sync::Mutex<Option<Arc<crate::rt_core::executor::ExecutorStats>>>,
     /// Off-thread bounded WS connection slot pool (`MAX_LIVE_CONNECTIONS = 64`), enforcing the
@@ -11005,6 +11189,28 @@ pub struct ArmSupervisor {
     executor_hover_jobs: std::sync::Mutex<Vec<crate::calib_hover::HoverJob>>,
     /// Shared counter of forbidden `DriverLock` attempts on `armd-control`.
     driver_lock_attempts: Arc<AtomicU64>,
+    /// Process-wide / supervisor-wide lock-free internal-fault lane (DRV-F1 / FU-PANIC).
+    internal_fault_lane: Arc<crate::panic_coord::InternalFaultLane>,
+    /// Shared SAFE-HOLD control block for the legacy control loop.
+    legacy_safe_hold: Arc<crate::rt_core::safe_hold::SafeHoldControl>,
+    /// Authoritative active bus-writer lifecycle endpoint (Legacy, Executor, or DetachedSafeHold)
+    /// so daemon shutdown and deliberate process-exit always reach the actual writer (B4).
+    active_writer: std::sync::Mutex<WriterEndpoint>,
+}
+
+/// Authoritative endpoint for the single active hardware bus writer across startup, handback,
+/// detached SAFE-HOLD, and daemon process exit (B4).
+#[derive(Clone)]
+pub enum WriterEndpoint {
+    Legacy {
+        control_stop: Option<Arc<AtomicBool>>,
+        safe_hold: Arc<crate::rt_core::safe_hold::SafeHoldControl>,
+    },
+    Executor(crate::rt_core::executor::RtExecutorHandle),
+    DetachedSafeHold {
+        safe_hold: Arc<crate::rt_core::safe_hold::SafeHoldControl>,
+        control_stop: Arc<AtomicBool>,
+    },
 }
 
 static NEXT_WS_CONN_ID: AtomicU64 = AtomicU64::new(1);
@@ -11253,6 +11459,7 @@ pub fn init_process_identity() -> &'static ProcessIdentity {
 }
 
 impl ArmSupervisor {
+    #[inline(never)]
     pub fn new(config: ArmConfig) -> Self {
         let _ = init_process_identity();
         let (tx, _) = broadcast::channel(128);
@@ -11278,7 +11485,10 @@ impl ArmSupervisor {
         #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
         let policy_backend_permits = Arc::new(tokio::sync::Semaphore::new(2));
         let terminals = Arc::new(TerminalBroadcaster::default());
+        let internal_fault_lane = Arc::new(crate::panic_coord::InternalFaultLane::new());
+        let legacy_safe_hold = Arc::new(crate::rt_core::safe_hold::SafeHoldControl::new());
         let mut inner = SupervisorInner::new(config);
+        inner.internal_fault_lane = Arc::clone(&internal_fault_lane);
         inner.estop_state = estop_state.clone();
         inner.e_stop_latched = e_stop_latched.clone();
         inner.requested_estop_count = requested_estop_count.clone();
@@ -11303,7 +11513,7 @@ impl ArmSupervisor {
         }
         inner.terminals = Some(Arc::clone(&terminals));
         let driver_lock_attempts = Arc::clone(&inner.driver_lock_attempts);
-        let template_obs = inner.current_observation();
+        let template_obs = Box::new(inner.current_observation());
         let initial_pub_cfg = crate::rt_core::requests::config::PublishedConfig::from_inner(&inner);
         let estop_epoch = inner.safety.epoch_mirror();
         let hub = inner.core.hub().clone();
@@ -11371,6 +11581,189 @@ impl ArmSupervisor {
             watchdog_park_planning: Arc::new(AtomicBool::new(false)),
             executor_hover_jobs: std::sync::Mutex::new(Vec::new()),
             driver_lock_attempts,
+            internal_fault_lane,
+            legacy_safe_hold: Arc::clone(&legacy_safe_hold),
+            active_writer: std::sync::Mutex::new(WriterEndpoint::Legacy {
+                control_stop: None,
+                safe_hold: legacy_safe_hold,
+            }),
+        }
+    }
+
+    pub fn internal_fault_lane(&self) -> &Arc<crate::panic_coord::InternalFaultLane> {
+        &self.internal_fault_lane
+    }
+
+    #[inline]
+    pub fn internal_fault_fenced(&self) -> bool {
+        self.internal_fault_lane.is_fenced()
+    }
+
+    pub fn legacy_safe_hold_control(&self) -> Arc<crate::rt_core::safe_hold::SafeHoldControl> {
+        Arc::clone(&self.legacy_safe_hold)
+    }
+
+    /// Registers the active legacy control loop's stop flag on the authoritative writer endpoint.
+    pub fn register_legacy_control_stop(&self, stop: Arc<AtomicBool>) {
+        let mut w = self.active_writer.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(*w, WriterEndpoint::Legacy { .. }) {
+            *w = WriterEndpoint::Legacy {
+                control_stop: Some(stop),
+                safe_hold: Arc::clone(&self.legacy_safe_hold),
+            };
+        }
+    }
+
+    /// Returns a snapshot of the authoritative active bus-writer endpoint (B4).
+    pub fn active_writer_endpoint(&self) -> WriterEndpoint {
+        self.active_writer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// True if a detached `armd-control` thread currently holds an energized/unknown-state driver
+    /// in SAFE-HOLD (e.g. after a startup timeout or stalled handback).
+    pub fn has_detached_safe_hold(&self) -> bool {
+        match self.active_writer_endpoint() {
+            WriterEndpoint::DetachedSafeHold { safe_hold, .. } => !safe_hold.is_exited(),
+            WriterEndpoint::Executor(h) => {
+                let sh = h.safe_hold_control();
+                sh.is_active() && !sh.is_exited()
+            }
+            WriterEndpoint::Legacy { safe_hold, .. } => {
+                safe_hold.is_active() && !safe_hold.is_exited()
+            }
+        }
+    }
+
+    /// True ONLY once the active writer's `armd-control` thread has actually entered the
+    /// SAFE-HOLD loop (`safe_hold.is_active() && !safe_hold.is_exited()`).
+    pub fn is_detached_safe_hold_active(&self) -> bool {
+        match self.active_writer_endpoint() {
+            WriterEndpoint::DetachedSafeHold { safe_hold, .. } => {
+                safe_hold.is_active() && !safe_hold.is_exited()
+            }
+            WriterEndpoint::Executor(h) => {
+                let sh = h.safe_hold_control();
+                sh.is_active() && !sh.is_exited()
+            }
+            WriterEndpoint::Legacy { safe_hold, .. } => {
+                safe_hold.is_active() && !safe_hold.is_exited()
+            }
+        }
+    }
+
+    /// Returns the active writer's [`SafeHoldControl`] handle for observability and testing.
+    pub fn active_safe_hold_control(&self) -> Arc<crate::rt_core::safe_hold::SafeHoldControl> {
+        match self.active_writer_endpoint() {
+            WriterEndpoint::DetachedSafeHold { safe_hold, .. } => safe_hold,
+            WriterEndpoint::Executor(h) => h.safe_hold_control(),
+            WriterEndpoint::Legacy { safe_hold, .. } => safe_hold,
+        }
+    }
+
+    /// Shared Legacy `armd-control` loop body with tiered panic recovery (FU-PANIC / DRV-F1):
+    /// - Enters [`crate::panic_coord::ControlPanicScope`] so the process panic hook routes
+    ///   control-thread panics to local `catch_unwind` -> SAFE-HOLD.
+    /// - Preallocates [`crate::rt_core::safe_hold::SafeHoldBuffers`] before the loop and mirrors
+    ///   last fresh measured positions after every clean tick.
+    /// - On an unwind panic inside a legacy control tick while a hardware driver is attached and
+    ///   not confirmed disarmed: fences all commands/rearm, extracts the `Box<dyn ArmDriver>`
+    ///   exclusively ONCE (recovering poison if needed), and transitions into the zero-alloc,
+    ///   zero-lock SAFE-HOLD loop until thermal trip or deliberate `ProcessExit` protective disable.
+    pub fn run_legacy_control_loop_blocking(
+        self: &Arc<Self>,
+        period: Duration,
+        control_stop: Arc<AtomicBool>,
+        loop_stats: Arc<crate::rt_core::executor::ExecutorStats>,
+        runtime: tokio::runtime::Handle,
+        panic_hook_step: Option<Arc<AtomicU64>>,
+    ) {
+        let _panic_scope = crate::panic_coord::ControlPanicScope::enter();
+        self.register_legacy_control_stop(Arc::clone(&control_stop));
+        let cfg = runtime.block_on(async { self.inner().read().await.config.clone() });
+        let mut safe_hold_bufs =
+            crate::rt_core::safe_hold::SafeHoldBuffers::from_config(&cfg, period);
+        let safe_hold_ctrl = Arc::clone(&self.legacy_safe_hold);
+        let mut step_counter: u64 = 0;
+        let mut panicked = false;
+
+        crate::rt_core::executor::run_periodic_with_deadline(
+            period,
+            &control_stop,
+            &loop_stats,
+            |dt, release_deadline| {
+                step_counter = step_counter.saturating_add(1);
+                let tick_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if panic_hook_step
+                        .as_ref()
+                        .is_some_and(|target| target.load(Ordering::Acquire) == step_counter)
+                    {
+                        panic!("simulated legacy control thread panic at tick {step_counter}");
+                    }
+                    runtime.block_on(self.control_tick_with_deadline(dt, release_deadline));
+                }));
+                match tick_res {
+                    Ok(()) => {
+                        if let Ok(guard) = self.inner.try_read() {
+                            if !guard.detached {
+                                safe_hold_bufs.mirror_from_core(&guard);
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        panicked = true;
+                        crate::rt_core::executor::account_periodic_overrun_on_panic_exit(
+                            &loop_stats,
+                        );
+                        self.estop_state.request_and_latch();
+                        self.internal_fault_lane.latch_control_safe_hold_fence();
+                        tracing::error!(
+                            "Legacy control thread panicked during tick {step_counter}; transitioning to SAFE-HOLD"
+                        );
+                        control_stop.store(true, Ordering::Release);
+                    }
+                }
+            },
+        );
+
+        if panicked {
+            // Fence all new commands/rearm and acquire exclusive ownership of the driver ONCE
+            // so SAFE-HOLD executes with zero mutexes, zero allocations, and zero planner calls.
+            let extract_deadline = Instant::now() + PANIC_DISABLE_TIMEOUT;
+            let mut extracted_driver: Option<Box<dyn ArmDriver>> = None;
+            loop {
+                if let Ok(mut guard) = self.inner.try_write() {
+                    if !guard.detached {
+                        safe_hold_bufs.seed_on_entry(&guard);
+                        if !guard.shutdown_ready() {
+                            extracted_driver = guard
+                                .driver
+                                .take()
+                                .map(crate::supervisor_lock::DriverSlot::into_driver_recover_for_safe_hold);
+                        }
+                    }
+                    break;
+                }
+                if Instant::now() >= extract_deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            if let Some(mut drv) = extracted_driver {
+                let _ = safe_hold_bufs.run_loop(
+                    drv.as_mut(),
+                    &safe_hold_ctrl,
+                    crate::rt_core::safe_hold::SafeHoldReason::ControlPanic,
+                    Instant::now,
+                    std::thread::sleep,
+                );
+                drop(drv);
+            } else {
+                safe_hold_ctrl.mark_active(crate::rt_core::safe_hold::SafeHoldReason::ControlPanic);
+                safe_hold_ctrl.mark_exited();
+            }
         }
     }
 
@@ -11834,9 +12227,48 @@ impl ArmSupervisor {
             Arc::clone(&self.tick_stats),
             Arc::clone(&self.control_sched),
             Arc::clone(&self.control_period_us),
+            Arc::clone(&self.internal_fault_lane),
             hooks,
         ) {
-            Ok((handle, sinks)) => {
+            Ok((handle, sinks, ready_payload, startup_gate)) => {
+                // Single startup activation barrier (R5 Major 2 / M2):
+                // Commit staged hub snapshots, observation prewarm, scheduler readiness,
+                // published_config, sinks, and `OWNER_EXECUTOR` atomically strictly OUTSIDE the
+                // StartupGate mutex and strictly BEFORE releasing `armd-control` to Release #1.
+                if Instant::now() >= startup_gate.deadline() {
+                    startup_gate.mark_aborted();
+                    self.published_config.set_available(false);
+                    {
+                        let mut slot = self.owner.lock().unwrap_or_else(|e| e.into_inner());
+                        *slot = OwnerSlot::Failed;
+                        self.owner_mode.store(OWNER_FAILED, Ordering::Release);
+                    }
+                    {
+                        let mut w = self.active_writer.lock().unwrap_or_else(|e| e.into_inner());
+                        *w = WriterEndpoint::DetachedSafeHold {
+                            safe_hold: handle.safe_hold_control(),
+                            control_stop: Arc::new(AtomicBool::new(true)),
+                        };
+                    }
+                    rollback.armed = false;
+                    drop(guard);
+                    return Err(ArmError::Internal(
+                        "RT executor startup timed out before activation barrier".into(),
+                    ));
+                }
+                self.hub.set_motion_config(ready_payload.staged_motion_cfg);
+                self.hub.update_prep_env(ready_payload.staged_prep_env);
+                self.hub.install_prewarm_template_and_front(
+                    ready_payload.staged_obs_template,
+                    ready_payload.staged_front_obs,
+                );
+                *self
+                    .control_sched
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(ready_payload.staged_sched);
+                if let Some(readiness) = ready_payload.staged_readiness {
+                    crate::rt_core::sched::set_readiness(readiness);
+                }
                 self.published_config.publish(candidate_pub_cfg, initial_gen);
                 *self.sinks.lock().unwrap_or_else(|e| e.into_inner()) = Some(sinks);
                 self.executor_base_gen.store(initial_gen, Ordering::Release);
@@ -11844,6 +12276,32 @@ impl ArmSupervisor {
                     let mut slot = self.owner.lock().unwrap_or_else(|e| e.into_inner());
                     *slot = OwnerSlot::Executor(handle.clone());
                     self.owner_mode.store(OWNER_EXECUTOR, Ordering::Release);
+                }
+                {
+                    let mut w = self.active_writer.lock().unwrap_or_else(|e| e.into_inner());
+                    *w = WriterEndpoint::Executor(handle.clone());
+                }
+                if !startup_gate.mark_activated() {
+                    // `armd-control` already timed out waiting for activation: roll owner to
+                    // `Failed` and record detached SAFE-HOLD endpoint.
+                    self.published_config.set_available(false);
+                    {
+                        let mut slot = self.owner.lock().unwrap_or_else(|e| e.into_inner());
+                        *slot = OwnerSlot::Failed;
+                        self.owner_mode.store(OWNER_FAILED, Ordering::Release);
+                    }
+                    {
+                        let mut w = self.active_writer.lock().unwrap_or_else(|e| e.into_inner());
+                        *w = WriterEndpoint::DetachedSafeHold {
+                            safe_hold: handle.safe_hold_control(),
+                            control_stop: Arc::new(AtomicBool::new(true)),
+                        };
+                    }
+                    rollback.armed = false;
+                    drop(guard);
+                    return Err(ArmError::Internal(
+                        "RT executor startup activation expired".into(),
+                    ));
                 }
                 rollback.armed = false;
                 drop(guard);
@@ -11887,6 +12345,230 @@ impl ArmSupervisor {
                 rollback.armed = false;
                 drop(guard);
                 Err(ArmError::Internal(msg))
+            }
+            Err(crate::rt_core::executor::SpawnExecutorError::FatalDetachedSafeHold {
+                msg,
+                safe_hold,
+                control_stop,
+            }) => {
+                self.published_config.set_available(false);
+                {
+                    let mut slot = self.owner.lock().unwrap_or_else(|e| e.into_inner());
+                    *slot = OwnerSlot::Failed;
+                    self.owner_mode.store(OWNER_FAILED, Ordering::Release);
+                }
+                {
+                    let mut w = self.active_writer.lock().unwrap_or_else(|e| e.into_inner());
+                    *w = WriterEndpoint::DetachedSafeHold {
+                        safe_hold,
+                        control_stop,
+                    };
+                }
+                rollback.armed = false;
+                drop(guard);
+                Err(ArmError::Internal(msg))
+            }
+        }
+    }
+
+    /// Hands ownership cleanly from `OWNER_EXECUTOR` back to a prepared `OWNER_LEGACY` owner
+    /// within one absolute `timeout` budget (DRV-F1 / R5 Blocker 1 / B1):
+    /// - Starts the single deadline at entry and uses a cancel-safe RAII guard so awaiting
+    ///   `self.inner.write()` can never strand `OWNER_TRANSFERRING`.
+    /// - Records the handback obligation BEFORE signaling `control_stop`, fences incoming
+    ///   commands/targets, transfers `Box<SupervisorInner>` + fresh measured hold state at a
+    ///   release boundary via lock-free SPSC (0 allocs on `armd-control`), converts the driver
+    ///   slot back to `Legacy` off-RT, and publishes `OWNER_LEGACY` ONLY when the legacy owner
+    ///   is ready to continue the hold.
+    /// - If handback stalls past the deadline while energized, `armd-control` keeps the
+    ///   exclusive driver in SAFE-HOLD and `OWNER_LEGACY` is NEVER published (single writer).
+    pub async fn handback_to_legacy(&self, timeout: Duration) -> Result<(), ArmError> {
+        let deadline = Instant::now() + timeout;
+        let handle = {
+            let mut slot = self.owner.lock().unwrap_or_else(|e| e.into_inner());
+            match std::mem::replace(&mut *slot, OwnerSlot::Transferring) {
+                OwnerSlot::Executor(h) => {
+                    self.owner_mode.store(OWNER_TRANSFERRING, Ordering::Release);
+                    h
+                }
+                other => {
+                    *slot = other;
+                    return Err(ArmError::Rejected {
+                        status: 409,
+                        code: "OWNER_NOT_EXECUTOR".into(),
+                        message: "Handback requires active RT executor ownership".into(),
+                    });
+                }
+            }
+        };
+
+        struct HandbackGuard<'a> {
+            sup: &'a ArmSupervisor,
+            handle: Option<crate::rt_core::executor::RtExecutorHandle>,
+        }
+        impl Drop for HandbackGuard<'_> {
+            fn drop(&mut self) {
+                if let Some(h) = self.handle.take() {
+                    let mut slot = self.sup.owner.lock().unwrap_or_else(|e| e.into_inner());
+                    if matches!(*slot, OwnerSlot::Transferring) {
+                        *slot = OwnerSlot::Executor(h);
+                        self.sup.owner_mode.store(OWNER_EXECUTOR, Ordering::Release);
+                    }
+                }
+            }
+        }
+        let mut hb_guard = HandbackGuard {
+            sup: self,
+            handle: Some(handle.clone()),
+        };
+
+        // Acquire the legacy shell write lock BEFORE signaling `armd-control` to stop.
+        // If cancelled or timed out here, `HandbackGuard` restores `OWNER_EXECUTOR` cleanly.
+        let rem = deadline.saturating_duration_since(Instant::now());
+        if rem.is_zero() {
+            return Err(ArmError::Rejected {
+                status: 503,
+                code: "HANDBACK_TIMED_OUT".into(),
+                message: "Handback deadline expired before acquiring legacy shell".into(),
+            });
+        }
+        let mut guard = match tokio::time::timeout(rem, self.inner.write()).await {
+            Ok(g) => g,
+            Err(_) => {
+                return Err(ArmError::Rejected {
+                    status: 503,
+                    code: "HANDBACK_TIMED_OUT".into(),
+                    message: "Handback timed out waiting for legacy shell lock".into(),
+                });
+            }
+        };
+
+        // Zero `.await` points below: commit handback request on `armd-control` within the SAME
+        // deadline. Disarm the cancel guard only after we commit to either Legacy or Failed/SafeHold.
+        match handle.take_handback_core_until(deadline) {
+            Ok(mut core) => {
+                if let Some(slot) = core.driver.take() {
+                    core.driver = Some(slot.into_legacy(Arc::clone(&self.driver_lock_attempts)));
+                }
+                core.detached = false;
+                core.rt_executor_owned = false;
+                core.internal_fault_lane = Arc::clone(&self.internal_fault_lane);
+                *guard = *core;
+                let _ = self.drain_pending_disconnects_under_guard(&mut guard, None);
+                guard.purge_closed_live_connections();
+                *self.sinks.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                {
+                    let mut slot = self.owner.lock().unwrap_or_else(|e| e.into_inner());
+                    *slot = OwnerSlot::Legacy;
+                    self.owner_mode.store(OWNER_LEGACY, Ordering::Release);
+                }
+                {
+                    let mut w = self.active_writer.lock().unwrap_or_else(|e| e.into_inner());
+                    *w = WriterEndpoint::Legacy {
+                        control_stop: None,
+                        safe_hold: Arc::clone(&self.legacy_safe_hold),
+                    };
+                }
+                hb_guard.handle = None;
+                drop(guard);
+                self.try_drain_pending_disconnects_legacy();
+                Ok(())
+            }
+            Err(crate::rt_core::executor::HandbackFailure::TimedOutSafeHold) => {
+                self.published_config.set_available(false);
+                {
+                    let mut slot = self.owner.lock().unwrap_or_else(|e| e.into_inner());
+                    *slot = OwnerSlot::Failed;
+                    self.owner_mode.store(OWNER_FAILED, Ordering::Release);
+                }
+                {
+                    let mut w = self.active_writer.lock().unwrap_or_else(|e| e.into_inner());
+                    *w = WriterEndpoint::DetachedSafeHold {
+                        safe_hold: handle.safe_hold_control(),
+                        control_stop: Arc::new(AtomicBool::new(true)),
+                    };
+                }
+                hb_guard.handle = None;
+                drop(guard);
+                Err(ArmError::Rejected {
+                    status: 503,
+                    code: "HANDBACK_STALLED_SAFE_HOLD".into(),
+                    message: "Energized handback timed out; exclusive driver retained in SAFE-HOLD"
+                        .into(),
+                })
+            }
+            Err(crate::rt_core::executor::HandbackFailure::ExecutorExited) => {
+                self.published_config.set_available(false);
+                {
+                    let mut slot = self.owner.lock().unwrap_or_else(|e| e.into_inner());
+                    *slot = OwnerSlot::Failed;
+                    self.owner_mode.store(OWNER_FAILED, Ordering::Release);
+                }
+                hb_guard.handle = None;
+                drop(guard);
+                Err(ArmError::Rejected {
+                    status: 503,
+                    code: "EXECUTOR_STOPPED".into(),
+                    message: "RT executor exited before handback completed".into(),
+                })
+            }
+        }
+    }
+
+    /// Starts a live legacy control loop parked on a ready gate, executes [`Self::handback_to_legacy`],
+    /// and immediately unparks the legacy loop once `OWNER_LEGACY` is published so energized holds
+    /// continue with bounded inter-frame gap (B1). On handback failure, cancels the parked thread
+    /// cleanly so no second writer ever runs.
+    pub async fn handback_to_legacy_with_live_loop(
+        self: &Arc<Self>,
+        timeout: Duration,
+        period: Duration,
+    ) -> Result<(Arc<AtomicBool>, std::thread::JoinHandle<()>), ArmError> {
+        let ready = Arc::new((std::sync::Mutex::new(Option::<bool>::None), std::sync::Condvar::new()));
+        let control_stop = Arc::new(AtomicBool::new(false));
+        let stats = Arc::new(crate::rt_core::executor::ExecutorStats::default());
+        let sup_bg = Arc::clone(self);
+        let ready_bg = Arc::clone(&ready);
+        let stop_bg = Arc::clone(&control_stop);
+        let stats_bg = Arc::clone(&stats);
+        let runtime = tokio::runtime::Handle::current();
+        let jh = std::thread::Builder::new()
+            .name("armd-control-legacy".into())
+            .spawn(move || {
+                let (lock, cv) = &*ready_bg;
+                let proceed = {
+                    let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    while g.is_none() {
+                        g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
+                    }
+                    g.unwrap_or(false)
+                };
+                if !proceed {
+                    return;
+                }
+                sup_bg.attach_legacy_loop_stats(stats_bg.clone());
+                sup_bg.run_legacy_control_loop_blocking(period, stop_bg, stats_bg, runtime, None);
+            })
+            .map_err(|e| ArmError::Internal(format!("failed to prepare legacy receiver thread: {e}")))?;
+
+        match self.handback_to_legacy(timeout).await {
+            Ok(()) => {
+                self.register_legacy_control_stop(Arc::clone(&control_stop));
+                {
+                    let (lock, cv) = &*ready;
+                    *lock.lock().unwrap_or_else(|e| e.into_inner()) = Some(true);
+                    cv.notify_all();
+                }
+                Ok((control_stop, jh))
+            }
+            Err(e) => {
+                {
+                    let (lock, cv) = &*ready;
+                    *lock.lock().unwrap_or_else(|e| e.into_inner()) = Some(false);
+                    cv.notify_all();
+                }
+                let _ = jh.join();
+                Err(e)
             }
         }
     }
@@ -14268,13 +14950,26 @@ impl ArmSupervisor {
     }
 
     pub async fn request_shutdown(&self) -> Result<bool, ArmError> {
+        let deadline = Instant::now() + PANIC_DISABLE_TIMEOUT + Duration::from_millis(100);
+        self.request_shutdown_until(deadline).await
+    }
+
+    /// Bounded shutdown admission carrying ONE absolute `deadline` from daemon entry (B3).
+    pub async fn request_shutdown_until(&self, deadline: Instant) -> Result<bool, ArmError> {
         match self.owner_mode() {
             OWNER_EXECUTOR => match self.executor_handle() {
-                Some(h) => h.request_shutdown_async().await.map_err(Into::into),
+                Some(h) => h.request_shutdown_until(deadline).await.map_err(Into::into),
                 None => Err(executor_unavailable()),
             },
             OWNER_LEGACY => {
-                let mut inner = self.inner.clone().write_owned().await;
+                let rem = deadline.saturating_duration_since(Instant::now());
+                if rem.is_zero() {
+                    return Err(crate::rt_core::executor::OwnerError::TimedOut.into());
+                }
+                let mut inner = match tokio::time::timeout(rem, self.inner.clone().write_owned()).await {
+                    Ok(g) => g,
+                    Err(_) => return Err(crate::rt_core::executor::OwnerError::TimedOut.into()),
+                };
                 if self.check_legacy_under_guard(&inner).is_ok() {
                     return tokio::task::spawn_blocking(move || inner.request_shutdown())
                         .await
@@ -14282,11 +14977,67 @@ impl ArmSupervisor {
                 }
                 drop(inner);
                 match self.executor_handle() {
-                    Some(h) => h.request_shutdown_async().await.map_err(Into::into),
+                    Some(h) => h.request_shutdown_until(deadline).await.map_err(Into::into),
                     None => Err(executor_unavailable()),
                 }
             }
-            _ => Err(executor_unavailable()),
+            _ => {
+                if self.has_detached_safe_hold() {
+                    // A detached SAFE-HOLD writer holds an energized/unknown driver; ordinary
+                    // shutdown admission is false until deliberate process exit disables it.
+                    Ok(false)
+                } else {
+                    Err(executor_unavailable())
+                }
+            }
+        }
+    }
+
+    /// Deliberate process-exit protective disable routed through the authoritative active writer
+    /// endpoint (`Executor`, `Legacy`, or `DetachedSafeHold`) under ONE absolute `deadline` (B4).
+    pub async fn emergency_process_exit_disable_until(
+        self: &Arc<Self>,
+        deadline: Instant,
+    ) -> PanicDisableOutcome {
+        self.estop_state.request_and_latch();
+        self.internal_fault_lane.latch_control_safe_hold_fence();
+        match self.active_writer_endpoint() {
+            WriterEndpoint::DetachedSafeHold {
+                safe_hold,
+                control_stop,
+            } => {
+                control_stop.store(true, Ordering::Release);
+                safe_hold.request_process_exit_disable(deadline);
+                tokio::task::spawn_blocking(move || safe_hold.wait_process_exit_until(deadline))
+                    .await
+                    .unwrap_or_else(|je| PanicDisableOutcome::Failed(je.to_string()))
+            }
+            WriterEndpoint::Executor(handle) => {
+                tokio::task::spawn_blocking(move || handle.emergency_disable_and_join_until(deadline))
+                    .await
+                    .unwrap_or_else(|je| PanicDisableOutcome::Failed(je.to_string()))
+            }
+            WriterEndpoint::Legacy {
+                control_stop,
+                safe_hold,
+            } => {
+                if let Some(stop) = control_stop {
+                    self.signal_legacy_stop(&stop);
+                }
+                if safe_hold.is_active() {
+                    safe_hold.request_process_exit_disable(deadline);
+                    return tokio::task::spawn_blocking(move || {
+                        safe_hold.wait_process_exit_until(deadline)
+                    })
+                    .await
+                    .unwrap_or_else(|je| PanicDisableOutcome::Failed(je.to_string()));
+                }
+                let sup = Arc::clone(self);
+                let rem = deadline.saturating_duration_since(Instant::now());
+                tokio::task::spawn_blocking(move || sup.attempt_legacy_panic_disable(rem))
+                    .await
+                    .unwrap_or_else(|je| PanicDisableOutcome::Failed(je.to_string()))
+            }
         }
     }
 

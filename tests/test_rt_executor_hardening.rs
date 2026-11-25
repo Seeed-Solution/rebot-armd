@@ -942,8 +942,20 @@ async fn damiao_fresh_unknown_shutdown_gate_and_panic_disable_paths() {
     cfg_panic.panic_policy = PanicPolicy::StopExecutor;
     let hooks_panic = PersistTestHooks { panic_on_release: Some(2), ..Default::default() };
     let h_panic = sup_panic.start_executor_with_hooks(cfg_panic, hooks_panic).await.unwrap();
-    wait_until_async(Duration::from_secs(2), || h_panic.is_exited()).await;
+    wait_until_async(Duration::from_secs(2), || h_panic.is_in_safe_hold()).await;
     assert!(sup_panic.e_stop_latched.load(Ordering::SeqCst));
+    assert!(
+        bus_panic.with(|s| {
+            s.motors.iter().all(|m| m.enabled)
+                && !s.tx_log.iter().any(|f| f.data == armd::protocol::damiao::CMD_DISABLE)
+        }),
+        "DRV-F1: executor panic while energized must enter SAFE-HOLD without disabling torque"
+    );
+    let h_panic_em = h_panic.clone();
+    let outcome_panic = tokio::task::spawn_blocking(move || h_panic_em.emergency_disable_and_join())
+        .await
+        .unwrap();
+    assert_eq!(outcome_panic, PanicDisableOutcome::Confirmed);
     let (all_disabled, disable_ids) = bus_panic.with(|s| {
         let ids: Vec<u32> = s
             .tx_log
@@ -953,16 +965,17 @@ async fn damiao_fresh_unknown_shutdown_gate_and_panic_disable_paths() {
             .collect();
         (s.motors.iter().all(|m| !m.enabled), ids)
     });
-    assert!(all_disabled, "all 7 virtual motors must be disabled by executor panic path");
+    assert!(all_disabled, "all 7 virtual motors must be disabled by ProcessExit from SAFE-HOLD");
     for motor_id in 1u32..=7 {
         assert!(
             disable_ids.contains(&motor_id),
-            "missing CMD_DISABLE frame for motor {motor_id} in executor panic tx_log: {disable_ids:?}"
+            "missing CMD_DISABLE frame for motor {motor_id} in ProcessExit tx_log: {disable_ids:?}"
         );
     }
     h_panic.stop_and_join();
 
-    // (d) Executor panic with completely silent motors stays bounded within timeout (never hangs).
+    // (d) Executor panic with completely silent motors enters SAFE-HOLD (0 disables on bus loss),
+    // and deliberate ProcessExit disable stays bounded within timeout (never hangs).
     let bus_silent = FakeBus::new(&dm_limits());
     bus_silent.with(|s| {
         s.immediate_replies = true;
@@ -984,16 +997,24 @@ async fn damiao_fresh_unknown_shutdown_gate_and_panic_disable_paths() {
     });
     let mut cfg_silent = ExecutorConfig::for_tests(Duration::from_millis(5));
     cfg_silent.panic_policy = PanicPolicy::StopExecutor;
-    let t_silent = Instant::now();
     let h_silent = sup_silent
         .start_executor_with_hooks(cfg_silent, PersistTestHooks { panic_on_release: Some(2), ..Default::default() })
         .await
         .unwrap();
-    wait_until_async(Duration::from_secs(2), || h_silent.is_exited()).await;
-    assert!(t_silent.elapsed() < Duration::from_millis(1200), "silent panic disable took {:?}", t_silent.elapsed());
+    wait_until_async(Duration::from_secs(2), || h_silent.is_in_safe_hold()).await;
+    assert!(
+        bus_silent.with(|s| !s.tx_log.iter().any(|f| f.data == armd::protocol::damiao::CMD_DISABLE)),
+        "DRV-F1: bus loss in SAFE-HOLD must not issue CMD_DISABLE"
+    );
+    let t_silent = Instant::now();
+    let h_silent_em = h_silent.clone();
+    let _ = tokio::task::spawn_blocking(move || h_silent_em.emergency_disable_and_join())
+        .await
+        .unwrap();
+    assert!(t_silent.elapsed() < Duration::from_millis(1200), "silent ProcessExit disable took {:?}", t_silent.elapsed());
     assert!(
         bus_silent.with(|s| s.tx_log.iter().any(|f| f.data == armd::protocol::damiao::CMD_DISABLE)),
-        "silent executor panic path must still issue CMD_DISABLE frames"
+        "silent ProcessExit disable path must still issue CMD_DISABLE frames"
     );
     h_silent.stop_and_join();
 
@@ -1583,14 +1604,21 @@ async fn panic_disable_deadline_observer_fires_on_blocking_driver_and_preserves_
         })),
         ..Default::default()
     };
-    let t_start = Instant::now();
     let handle = sup.start_executor_with_hooks(cfg, hooks).await.unwrap();
     let exec_tid = handle.executor_thread_id();
+    wait_until_async(Duration::from_secs(2), || handle.is_in_safe_hold()).await;
+    assert!(
+        entered_rx.try_recv().is_err(),
+        "DRV-F1: panic must enter SAFE-HOLD without calling set_torque(false)"
+    );
+    let t_start = Instant::now();
+    let h_em = handle.clone();
+    let em_task = tokio::task::spawn_blocking(move || h_em.emergency_disable_and_join());
 
     tokio::task::spawn_blocking(move || {
         entered_rx
             .recv_timeout(Duration::from_secs(2))
-            .expect("owner must enter blocking set_torque(false)");
+            .expect("owner must enter blocking set_torque(false) on ProcessExit");
     })
     .await
     .unwrap();
@@ -1611,6 +1639,8 @@ async fn panic_disable_deadline_observer_fires_on_blocking_driver_and_preserves_
     );
     assert_ne!(observer_tid, exec_tid, "deadline observer must be an independent thread");
     assert!(handle.is_exited(), "deadline observer must mark executor exited on timeout");
+    let outcome = em_task.await.unwrap();
+    assert_eq!(outcome, PanicDisableOutcome::TimedOut);
     {
         let tids = driver_tids.lock().unwrap();
         assert!(!tids.is_empty());
@@ -2104,7 +2134,13 @@ async fn panic_disable_retries_transient_j3_send_failure_and_disables_all_motors
         .start_executor_with_hooks(cfg, PersistTestHooks { panic_on_release: Some(2), ..Default::default() })
         .await
         .unwrap();
-    wait_until_async(Duration::from_secs(2), || handle.is_exited()).await;
+    wait_until_async(Duration::from_secs(2), || handle.is_in_safe_hold()).await;
+    assert_eq!(bus.j3_failures.load(Ordering::SeqCst), 0, "panic alone must hold without disabling");
+    let h_em = handle.clone();
+    let outcome = tokio::task::spawn_blocking(move || h_em.emergency_disable_and_join())
+        .await
+        .unwrap();
+    assert_eq!(outcome, PanicDisableOutcome::Confirmed);
 
     assert_eq!(bus.j3_failures.load(Ordering::SeqCst), 1, "first J3 disable send must have failed");
     assert!(bus.j3_successes.load(Ordering::SeqCst) >= 1, "J3 disable must be retried and succeed");
@@ -2525,12 +2561,16 @@ async fn emergency_timeout_detaches_stalled_control_thread_so_drop_is_bounded() 
         ..Default::default()
     };
     let handle2 = sup2.start_executor_with_hooks(cfg2, hooks2).await.unwrap();
+    wait_until_async(Duration::from_secs(2), || handle2.is_in_safe_hold()).await;
+    let h2_em = handle2.clone();
+    let em2_task = tokio::task::spawn_blocking(move || h2_em.emergency_disable_and_join());
     tokio::task::spawn_blocking(move || {
         entered_rx2.recv_timeout(Duration::from_secs(2)).expect("entered blocked disable");
         obs_rx2.recv_timeout(Duration::from_millis(600)).expect("observer fired TimedOut");
     })
     .await
     .unwrap();
+    assert_eq!(em2_task.await.unwrap(), PanicDisableOutcome::TimedOut);
 
     // Drop the LAST handle and supervisor while `release_tx2` is STILL HELD!
     let t_drop2 = Instant::now();
@@ -2937,7 +2977,13 @@ async fn panic_disable_rt_persistent_j3_unconfirmed_and_damiao_stale_refresh_and
         )
         .await
         .unwrap();
-    wait_until_async(Duration::from_secs(2), || handle.is_exited()).await;
+    wait_until_async(Duration::from_secs(2), || handle.is_in_safe_hold()).await;
+    assert_eq!(bus_rt.j3_failures.load(Ordering::SeqCst), 0, "panic alone must hold without disabling");
+    let h_em = handle.clone();
+    let outcome = tokio::task::spawn_blocking(move || h_em.emergency_disable_and_join())
+        .await
+        .unwrap();
+    assert_eq!(outcome, PanicDisableOutcome::Unconfirmed);
 
     assert!(
         !timeout_fired.load(Ordering::SeqCst),

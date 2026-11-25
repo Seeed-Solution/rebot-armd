@@ -613,7 +613,14 @@ impl StatePublisher {
     ///   stores a template in `hub.prewarm_template` so `StateHub::refresh` warms `front`
     ///   off-thread before rotating it back to the producer.
     pub fn try_prewarm_observations(&mut self, mut make: impl FnMut() -> ArmObservation) {
-        let _ = self.hub.prewarm_template.set(Box::new(make()));
+        {
+            let mut g = self
+                .hub
+                .prewarm_template
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            *g = Some(Box::new(make()));
+        }
         match self.hub.state.try_lock() {
             Ok(mut st) => {
                 self.producer.for_each_slot_mut(&mut st.consumer, |slot| {
@@ -643,6 +650,37 @@ impl StatePublisher {
                 }
             }
         }
+    }
+
+    /// Installs privately staged pre-warmed `back` and `middle` observation buffers into the
+    /// producer's own slots without locking `hub.state` or allocating on `armd-control`.
+    /// Returns any unused buffers so the caller can retire them off-RT (zero RT frees).
+    pub fn install_prewarmed_producer_slots(
+        &mut self,
+        back_obs: ArmObservation,
+        mid_obs: ArmObservation,
+    ) -> (Option<ArmObservation>, Option<ArmObservation>) {
+        let unused_back = {
+            let back = self.producer.back_mut();
+            if back.obs.is_none() {
+                back.obs = Some(back_obs);
+                None
+            } else {
+                Some(back_obs)
+            }
+        };
+        let unused_mid = if self.producer.swap_unfresh() {
+            let other = self.producer.back_mut();
+            if other.obs.is_none() {
+                other.obs = Some(mid_obs);
+                None
+            } else {
+                Some(mid_obs)
+            }
+        } else {
+            Some(mid_obs)
+        };
+        (unused_back, unused_mid)
     }
 
     /// Moves the preallocated string spares out of the back slot (0 alloc).
@@ -708,9 +746,9 @@ pub struct StateHub {
     retire: RetireRing,
     /// Displaced observations the tick had to free itself (retire ring full).
     tick_frees: AtomicU64,
-    /// Pre-sized observation template recorded at executor startup so a contended reader warms
-    /// its own `front` slot off-thread before handing it back to the RT producer.
-    prewarm_template: OnceLock<Box<ArmObservation>>,
+    /// Pre-sized observation template recorded atomically at executor startup activation so a
+    /// reader warms its own `front` slot off-thread before handing it back to the RT producer.
+    prewarm_template: std::sync::RwLock<Option<Box<ArmObservation>>>,
     /// Immutable motion planning config snapshot updated off-tick for zero-lock workers.
     motion_config: std::sync::RwLock<Option<Arc<super::requests::motion::MotionConfigSnapshot>>>,
     /// Off-thread schema cache paired with [`OwnerStateSnapshot::schema_revision`]. Never locked
@@ -756,7 +794,7 @@ pub fn state_channel(dof: usize) -> (StatePublisher, Arc<StateHub>) {
         record: OnceLock::new(),
         retire: RetireRing::new(),
         tick_frees: AtomicU64::new(0),
-        prewarm_template: OnceLock::new(),
+        prewarm_template: std::sync::RwLock::new(None),
         motion_config: std::sync::RwLock::new(None),
         schema_cache: Mutex::new(None),
         prep_env: Mutex::new(None),
@@ -817,7 +855,11 @@ impl StateHub {
         let mut refreshed = false;
         if has_fresh {
             if st.consumer.front().obs.is_none() {
-                if let Some(tmpl) = self.prewarm_template.get() {
+                let tmpl_guard = self
+                    .prewarm_template
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner());
+                if let Some(tmpl) = tmpl_guard.as_ref() {
                     let mut obs = (**tmpl).clone();
                     obs.ensure_rt_safety_text_spare();
                     let dof = obs.positions.len();
@@ -1023,6 +1065,36 @@ impl StateHub {
     }
 
     pub fn is_closed(&self) -> bool { self.closed.load(Ordering::Acquire) }
+
+    /// Atomically installs the pre-warmed observation template and warms the hub's `front` slot
+    /// during startup activation off `armd-control` (never called before startup commit wins).
+    pub fn install_prewarm_template_and_front(
+        &self,
+        tmpl: Box<ArmObservation>,
+        front_obs: ArmObservation,
+    ) {
+        {
+            let mut g = self
+                .prewarm_template
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            *g = Some(tmpl);
+        }
+        if let Ok(mut st) = self.state.try_lock() {
+            if st.consumer.front().obs.is_none() {
+                st.consumer.front_mut().obs = Some(front_obs);
+            }
+        }
+    }
+
+    /// Returns true if a pre-warmed observation template has been installed on the hub.
+    #[doc(hidden)]
+    pub fn has_prewarm_template(&self) -> bool {
+        self.prewarm_template
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
 
     /// Publishes an immutable motion planning config snapshot off the RT tick.
     pub fn set_motion_config(&self, cfg: Arc<super::requests::motion::MotionConfigSnapshot>) {
@@ -1264,7 +1336,7 @@ mod tests {
         let reader = std::thread::spawn(move || {
             let mut st = hub_r.state.lock().unwrap();
             assert!(st.consumer.front().obs.is_none());
-            assert!(hub_r.prewarm_template.get().is_none());
+            assert!(!hub_r.has_prewarm_template());
             entered_tx.send(()).unwrap();
             // Pause while producer runs `try_prewarm_observations` (hits WouldBlock) + publishes!
             resume_rx.recv().unwrap();
@@ -1276,7 +1348,7 @@ mod tests {
         entered_rx.recv().unwrap();
         // Contended startup prewarm warms back & middle without blocking and records template.
         publisher.try_prewarm_observations(|| obs(0.0));
-        assert!(hub.prewarm_template.get().is_some());
+        assert!(hub.has_prewarm_template());
         // Publish twice while reader still holds `hub.state`.
         for seq in 1..=2u64 {
             let mut o = publisher.take_back_observation().expect("back slot prewarmed");

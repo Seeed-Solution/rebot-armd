@@ -357,6 +357,23 @@ async fn gate_executor_owner(
     request: Request<Body>,
     next: Next,
 ) -> Response {
+    if supervisor.internal_fault_fenced() {
+        let method = request.method();
+        let path = request.uri().path();
+        let allowed_under_internal_fault = *method == axum::http::Method::GET
+            || *method == axum::http::Method::HEAD
+            || matches!(
+                path,
+                "/api/v1/safety/e_stop" | "/api/v1/auth/unlock" | "/api/v1/auth/lock"
+            );
+        if !allowed_under_internal_fault {
+            return axum::response::IntoResponse::into_response(rest::ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Internal fault or SAFE-HOLD active; commands and rearm are fenced".into(),
+                "INTERNAL_FAULT".into(),
+            ));
+        }
+    }
     match supervisor.owner_mode() {
         crate::supervisor::OWNER_LEGACY => next.run(request).await,
         crate::supervisor::OWNER_EXECUTOR => {

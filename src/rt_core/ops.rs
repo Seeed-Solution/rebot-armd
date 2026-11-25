@@ -1447,6 +1447,9 @@ impl CoreOps for SupervisorInner {
     }
 
     fn consume_target(&mut self, frame: &TargetFrame, ctx: &CommitCtx) -> Result<(), Refusal> {
+        if self.internal_fault_lane.is_fenced() {
+            return Err(Refusal::code("INTERNAL_FAULT"));
+        }
         // track D: identity, deadline, authority, stream, policy generation, input / camera
         // ages, config hold, then the servo / policy step checks (supervisor::streams::targets)
         self.consume_target_frame(frame, ctx)
@@ -1458,6 +1461,9 @@ impl CoreOps for SupervisorInner {
         validity: super::mailbox::PolicyValidityBounds,
         ctx: &CommitCtx,
     ) -> Result<(), Refusal> {
+        if self.internal_fault_lane.is_fenced() {
+            return Err(Refusal::code("INTERNAL_FAULT"));
+        }
         self.consume_target_frame_with_validity(frame, validity, ctx)
     }
 
