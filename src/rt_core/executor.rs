@@ -933,6 +933,7 @@ struct MaintClientInner {
     closed: bool,
     waiters: HashMap<u64, MaintWaiter>,
     exited: Arc<AtomicBool>,
+    hub: Arc<StateHub>,
 }
 
 impl MaintClientInner {
@@ -950,6 +951,10 @@ impl MaintClientInner {
                 let res = match reply.result {
                     MaintenanceResult::Stopped | MaintenanceResult::StoppedWithConfig(_) => {
                         Err(OwnerError::Stopped)
+                    }
+                    MaintenanceResult::Observation(mut obs) => {
+                        self.hub.attach_policy_diag(&mut obs);
+                        Ok(MaintenanceResult::Observation(obs))
                     }
                     other => Ok(other),
                 };
@@ -988,7 +993,12 @@ pub(crate) struct MaintClient {
 }
 
 impl MaintClient {
-    fn new(req_tx: Producer<MaintRequest>, rep_rx: Consumer<MaintReply>, exited: Arc<AtomicBool>) -> Self {
+    fn new(
+        req_tx: Producer<MaintRequest>,
+        rep_rx: Consumer<MaintReply>,
+        exited: Arc<AtomicBool>,
+        hub: Arc<StateHub>,
+    ) -> Self {
         Self {
             inner: Mutex::new(MaintClientInner {
                 req_tx,
@@ -998,6 +1008,7 @@ impl MaintClient {
                 closed: false,
                 waiters: HashMap::new(),
                 exited,
+                hub,
             }),
         }
     }
@@ -1795,6 +1806,72 @@ impl BrokerDispatcher {
         Ok((ack_rx, term_rx))
     }
 
+    #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+    fn submit_policy_command(
+        &self,
+        client: super::broker::ClientId,
+        client_seq: u64,
+        authority: super::broker::Authority,
+        deadline: Instant,
+        cmd: super::requests::policy::PolicyCommand,
+        on_admitted: impl FnOnce(super::broker::RequestId),
+    ) -> Result<
+        (
+            tokio::sync::oneshot::Receiver<Result<super::broker::Reply, OwnerError>>,
+            Option<tokio::sync::oneshot::Receiver<Result<super::broker::Reply, OwnerError>>>,
+        ),
+        BrokerDispatchError,
+    > {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.exited.load(Ordering::Acquire) {
+            return Err(BrokerDispatchError::Stopped);
+        }
+        if client.0 == 0 || !self.conn_lifecycle.is_slot_open(client.0) {
+            return Err(BrokerDispatchError::Admit(
+                super::broker::AdmitError::Disconnected,
+            ));
+        }
+        let starts_action = cmd.starts_action();
+        let req = self
+            .broker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .submit_with_pre_push(
+                client,
+                client_seq,
+                authority,
+                deadline,
+                super::broker::Submit::Policy(cmd),
+                on_admitted,
+            )
+            .map_err(BrokerDispatchError::Admit)?;
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        if starts_action {
+            let (term_tx, term_rx) = tokio::sync::oneshot::channel();
+            st.managed.insert(
+                req,
+                ManagedEntry {
+                    client,
+                    waiter: ManagedWaiter::Action {
+                        ack: Some(ack_tx),
+                        terminal: Some(term_tx),
+                        acked: false,
+                    },
+                },
+            );
+            Ok((ack_rx, Some(term_rx)))
+        } else {
+            st.managed.insert(
+                req,
+                ManagedEntry {
+                    client,
+                    waiter: ManagedWaiter::OneShot(Some(ack_tx)),
+                },
+            );
+            Ok((ack_rx, None))
+        }
+    }
+
     /// Linearizes connection teardown off-thread: prevents any subsequent `BrokerDispatcher`
     /// submission for `connection.id()`, marks the broker client disconnected (retiring its
     /// managed waiters immediately while continuing broker reclamation), and pushes a
@@ -2401,7 +2478,15 @@ struct ServoTargetDispatcherInner {
     >,
     stream_owners: std::collections::HashMap<super::mailbox::StreamId, ServoStreamOwner>,
     unclaimed_outcomes: VecDeque<super::mailbox::TargetOutcome>,
+    #[cfg(feature = "policy-runtime")]
+    policy_outcomes: VecDeque<(u64, super::mailbox::TargetOutcome)>,
+    #[cfg(feature = "policy-runtime")]
+    tracked_policy_streams: VecDeque<u64>,
     submitted_count: u64,
+    #[cfg(feature = "policy-runtime")]
+    policy_submitted_count: u64,
+    #[cfg(feature = "policy-runtime")]
+    policy_busy_count: u64,
     lease_refused_by_gen: std::collections::HashMap<u64, u64>,
     closed: bool,
 }
@@ -2434,6 +2519,17 @@ impl ServoTargetDispatcherInner {
         self.port.outcomes(|o| popped.push(o));
         let closed_gen = self.port.closed_servo_generation();
         for o in popped {
+            #[cfg(feature = "policy-runtime")]
+            if (o.stream.0 & crate::supervisor::targets::SERVO_STREAM_BIT) == 0
+                && o.stream.0 != 0
+                && self.tracked_policy_streams.contains(&o.stream.0)
+            {
+                if self.policy_outcomes.len() >= UNCLAIMED_TARGET_OUTCOMES_CAP {
+                    self.policy_outcomes.pop_front();
+                }
+                self.policy_outcomes.push_back((o.stream.0, o));
+                continue;
+            }
             if (o.stream.0 & crate::supervisor::targets::SERVO_STREAM_BIT) != 0 {
                 if let Err(ref r) = o.result {
                     if matches!(r.code, "LEASE_LOST" | "NO_LEASE" | "STREAM_NOT_AUTHORIZED") {
@@ -2540,6 +2636,8 @@ pub(crate) struct ServoTargetDispatcher {
     inner: Mutex<ServoTargetDispatcherInner>,
     exited: Arc<AtomicBool>,
     atomic_fenced_lease_gen: Arc<AtomicU64>,
+    #[cfg(feature = "policy-runtime")]
+    atomic_closed_policy_action_id: Arc<AtomicU64>,
 }
 
 impl ServoTargetDispatcher {
@@ -2549,6 +2647,8 @@ impl ServoTargetDispatcher {
         boot: BootId,
         exited: Arc<AtomicBool>,
         atomic_fenced_lease_gen: Arc<AtomicU64>,
+        #[cfg(feature = "policy-runtime")]
+        atomic_closed_policy_action_id: Arc<AtomicU64>,
     ) -> Self {
         Self {
             inner: Mutex::new(ServoTargetDispatcherInner {
@@ -2557,12 +2657,22 @@ impl ServoTargetDispatcher {
                 command_waiters: std::collections::HashMap::new(),
                 stream_owners: std::collections::HashMap::new(),
                 unclaimed_outcomes: VecDeque::with_capacity(UNCLAIMED_TARGET_OUTCOMES_CAP),
+                #[cfg(feature = "policy-runtime")]
+                policy_outcomes: VecDeque::with_capacity(UNCLAIMED_TARGET_OUTCOMES_CAP),
+                #[cfg(feature = "policy-runtime")]
+                tracked_policy_streams: VecDeque::with_capacity(64),
                 submitted_count: 0,
+                #[cfg(feature = "policy-runtime")]
+                policy_submitted_count: 0,
+                #[cfg(feature = "policy-runtime")]
+                policy_busy_count: 0,
                 lease_refused_by_gen: std::collections::HashMap::new(),
                 closed: false,
             }),
             exited,
             atomic_fenced_lease_gen,
+            #[cfg(feature = "policy-runtime")]
+            atomic_closed_policy_action_id,
         }
     }
 
@@ -2571,6 +2681,13 @@ impl ServoTargetDispatcher {
         if fenced_gen > g.port.closed_servo_generation() {
             g.port.close_servo(fenced_gen);
             g.prune_closed_stream_owners_locked();
+        }
+        #[cfg(feature = "policy-runtime")]
+        {
+            let closed_policy = self.atomic_closed_policy_action_id.load(Ordering::Acquire);
+            if closed_policy > g.port.closed_policy_action_id() {
+                g.port.close_policy(closed_policy);
+            }
         }
     }
 
@@ -2855,6 +2972,125 @@ impl ServoTargetDispatcher {
         };
         Self::deliver_drained(hub, (resolved_cmds, stream_refusals));
         res
+    }
+
+    #[cfg(feature = "policy-runtime")]
+    pub(crate) fn submit_policy(
+        &self,
+        hub: &StateHub,
+        target: &crate::supervisor::targets::PolicyTarget<'_>,
+        validity: super::mailbox::PolicyValidityBounds,
+    ) -> super::mailbox::Submitted {
+        let mut resolved_cmds = Vec::new();
+        let mut stream_refusals = Vec::new();
+        let sub = {
+            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            self.sync_authoritative_fence_locked(&mut g);
+            g.pop_outcomes_locked(hub, &mut resolved_cmds, &mut stream_refusals);
+            if g.closed || self.exited.load(Ordering::Acquire) {
+                super::mailbox::Submitted::OutOfOrder
+            } else {
+                let coalesced_before = g.port.coalesced();
+                let prev_key = g.last_inflight_key;
+                let sub = g.port.submit_policy_with_validity(target, validity);
+                match sub {
+                    super::mailbox::Submitted::Accepted
+                    | super::mailbox::Submitted::Coalesced { .. } => {
+                        g.policy_submitted_count = g.policy_submitted_count.saturating_add(1);
+                        if target.action_id != 0
+                            && !g.tracked_policy_streams.contains(&target.action_id)
+                        {
+                            if g.tracked_policy_streams.len() >= 64 {
+                                g.tracked_policy_streams.pop_front();
+                            }
+                            g.tracked_policy_streams.push_back(target.action_id);
+                        }
+                        let assigned_seq = g.port.last_seq();
+                        let sid = crate::supervisor::targets::policy_stream(target.action_id);
+                        g.last_inflight_key = Some((sid, assigned_seq));
+                        if matches!(sub, super::mailbox::Submitted::Coalesced { .. })
+                            || g.port.coalesced() > coalesced_before
+                        {
+                            g.note_coalesced_locked(prev_key, &mut resolved_cmds);
+                        }
+                    }
+                    super::mailbox::Submitted::Busy => {
+                        g.policy_busy_count = g.policy_busy_count.saturating_add(1);
+                    }
+                    _ => {}
+                }
+                sub
+            }
+        };
+        Self::deliver_drained(hub, (resolved_cmds, stream_refusals));
+        sub
+    }
+
+    #[cfg(feature = "policy-runtime")]
+    pub(crate) fn close_policy(&self, action_id: u64) {
+        if action_id == 0 {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.port.close_policy(action_id);
+    }
+
+    #[cfg(feature = "policy-runtime")]
+    pub(crate) fn is_policy_closed(&self, action_id: u64) -> bool {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        self.sync_authoritative_fence_locked(&mut g);
+        g.port.is_policy_closed(action_id)
+    }
+
+    #[cfg(feature = "policy-runtime")]
+    pub(crate) fn closed_policy_action_id(&self) -> u64 {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        self.sync_authoritative_fence_locked(&mut g);
+        g.port.closed_policy_action_id()
+    }
+
+    #[cfg(feature = "policy-runtime")]
+    pub(crate) fn policy_submitted_count(&self) -> u64 {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .policy_submitted_count
+    }
+
+    #[cfg(feature = "policy-runtime")]
+    pub(crate) fn policy_busy_count(&self) -> u64 {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .policy_busy_count
+    }
+
+    #[cfg(feature = "policy-runtime")]
+    pub(crate) fn drain_policy_outcomes(
+        &self,
+        hub: &StateHub,
+        action_id: u64,
+    ) -> Vec<super::mailbox::TargetOutcome> {
+        let mut resolved_cmds = Vec::new();
+        let mut stream_refusals = Vec::new();
+        let mut matching = Vec::new();
+        {
+            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            self.sync_authoritative_fence_locked(&mut g);
+            g.pop_outcomes_locked(hub, &mut resolved_cmds, &mut stream_refusals);
+            let closed_id = g.port.closed_policy_action_id();
+            let mut remaining = VecDeque::with_capacity(g.policy_outcomes.len());
+            while let Some((id, outcome)) = g.policy_outcomes.pop_front() {
+                if id == action_id {
+                    matching.push(outcome);
+                } else if id > closed_id {
+                    remaining.push_back((id, outcome));
+                }
+            }
+            g.policy_outcomes = remaining;
+        }
+        Self::deliver_drained(hub, (resolved_cmds, stream_refusals));
+        matching
     }
 }
 
@@ -3355,6 +3591,93 @@ impl RtExecutorHandle {
         self.shared
             .servo_dispatcher
             .submit_servo_command(&self.shared.hub, stream, msg)
+    }
+
+    /// Submits one live policy target frame synchronously through `TargetPort::submit_policy`
+    /// (called off-thread under `HubCommitGuard`, never called in Shadow mode).
+    #[cfg(feature = "policy-runtime")]
+    pub fn submit_policy(
+        &self,
+        target: &crate::supervisor::targets::PolicyTarget<'_>,
+    ) -> super::mailbox::Submitted {
+        self.submit_policy_with_validity(target, super::mailbox::PolicyValidityBounds::default())
+    }
+
+    /// Submits one live policy target frame together with its atomic absolute validity bounds
+    /// (`vision_window_expires_at`, `handshake_expires_at`) synchronously under `HubCommitGuard`.
+    #[cfg(feature = "policy-runtime")]
+    pub fn submit_policy_with_validity(
+        &self,
+        target: &crate::supervisor::targets::PolicyTarget<'_>,
+        validity: super::mailbox::PolicyValidityBounds,
+    ) -> super::mailbox::Submitted {
+        self.shared
+            .servo_dispatcher
+            .submit_policy(&self.shared.hub, target, validity)
+    }
+
+    /// Closes policy stream `action_id` off-thread (idempotent; frees stream slot in `TargetWriter`).
+    #[cfg(feature = "policy-runtime")]
+    pub fn close_policy(&self, action_id: u64) {
+        self.shared.servo_dispatcher.close_policy(action_id);
+    }
+
+    /// True once `action_id` has been closed via `close_policy` or the RT close watermark.
+    #[cfg(feature = "policy-runtime")]
+    pub fn is_policy_closed(&self, action_id: u64) -> bool {
+        self.shared.servo_dispatcher.is_policy_closed(action_id)
+    }
+
+    /// Highest closed policy action ID on this executor's `TargetPort`.
+    #[cfg(feature = "policy-runtime")]
+    pub fn closed_policy_action_id(&self) -> u64 {
+        self.shared.servo_dispatcher.closed_policy_action_id()
+    }
+
+    /// Total policy target frames accepted into the triple-buffer mailbox (must stay 0 in Shadow mode).
+    #[cfg(feature = "policy-runtime")]
+    pub fn policy_submitted_count(&self) -> u64 {
+        self.shared.servo_dispatcher.policy_submitted_count()
+    }
+
+    /// Total policy target submissions refused `Submitted::Busy` (previous target unconsumed).
+    #[cfg(feature = "policy-runtime")]
+    pub fn policy_busy_count(&self) -> u64 {
+        self.shared.servo_dispatcher.policy_busy_count()
+    }
+
+    /// Drains RT target outcomes belonging to policy run `action_id`.
+    #[cfg(feature = "policy-runtime")]
+    pub fn drain_policy_outcomes(&self, action_id: u64) -> Vec<super::mailbox::TargetOutcome> {
+        self.shared
+            .servo_dispatcher
+            .drain_policy_outcomes(&self.shared.hub, action_id)
+    }
+
+    /// Submits one `Copy` policy lifecycle command (`ReserveLoad`, `BeginPolicy`, `EndPolicy`),
+    /// invoking `on_admitted` strictly BEFORE ring publication on admitted descriptors.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+    pub async fn submit_policy_command_async(
+        &self,
+        client: super::broker::ClientId,
+        client_seq: u64,
+        authority: super::broker::Authority,
+        deadline: Instant,
+        cmd: super::requests::policy::PolicyCommand,
+        on_admitted: impl FnOnce(super::broker::RequestId),
+    ) -> Result<super::broker::Reply, BrokerDispatchError> {
+        let (ack_rx, _term_rx) = self.shared.broker_dispatcher.submit_policy_command(
+            client,
+            client_seq,
+            authority,
+            deadline,
+            cmd,
+            on_admitted,
+        )?;
+        match ack_rx.await {
+            Ok(Ok(reply)) => Ok(reply),
+            _ => Err(BrokerDispatchError::Stopped),
+        }
     }
     pub fn stop_requests(&self) -> &StopRequests { &self.shared.stop_requests }
     pub fn stats(&self) -> &Arc<ExecutorStats> { &self.shared.stats }
@@ -3888,10 +4211,9 @@ pub(crate) fn spawn_executor(
         path: core.gripper_baseline_path.clone(),
     };
     let (mut engine, broker, target_writer, stop_requests) = ReleaseEngine::new(cfg.boot, cfg.capacities);
-    core.boot_id = cfg.boot;
+    core.set_boot_id(cfg.boot);
     core.attach_stop_requests(stop_requests.clone());
     core.attach_closed_bitset(broker.closed_bitset());
-    core.boot_id = cfg.boot;
     hub.update_prep_env(Arc::new(super::requests::actions::ActionPrepEnv::from_inner(&core)));
 
     let (diag_tx, diag_rx) = RingBuffer::<TickSample>::new(DIAG_RING_CAPACITY);
@@ -3913,6 +4235,7 @@ pub(crate) fn spawn_executor(
     let (persist_job_tx, persist_job_rx) = RingBuffer::<PendingZeroCheckPersist>::new(4);
     let (persist_cmd_tx, persist_cmd_rx) = RingBuffer::<PersistCmd>::new(2);
     let (persist_rep_tx, persist_rep_rx) = RingBuffer::<PersistReply>::new(PERSIST_REP_CAPACITY);
+    let (watchdog_plan_tx, watchdog_plan_rx) = RingBuffer::<WatchdogParkPlan>::new(2);
     let (offload_reclaim_tx, offload_reclaim_rx) =
         RingBuffer::<OffloadReclaim>::new(OFFLOAD_RECLAIM_CAPACITY);
 
@@ -3934,12 +4257,16 @@ pub(crate) fn spawn_executor(
     let (servo_close_tx, servo_close_rx) = RingBuffer::<u64>::new(64);
     engine.attach_servo_close_tx(servo_close_tx);
     let atomic_fenced_lease_gen = core.atomic_fenced_lease_gen.clone();
+    #[cfg(feature = "policy-runtime")]
+    let atomic_closed_policy_action_id = core.atomic_closed_policy_action_id.clone();
     let servo_dispatcher = Arc::new(ServoTargetDispatcher::new(
         target_writer,
         core.core.id(),
         cfg.boot,
         exited.clone(),
         Arc::clone(&atomic_fenced_lease_gen),
+        #[cfg(feature = "policy-runtime")]
+        atomic_closed_policy_action_id,
     ));
     let target_writer_handle = TargetWriterHandle {
         dispatcher: Arc::clone(&servo_dispatcher),
@@ -3962,7 +4289,12 @@ pub(crate) fn spawn_executor(
 
     let shutdown_hold_error = Arc::new(Mutex::new(None));
     let persist_rep_rx = Arc::new(Mutex::new(persist_rep_rx));
-    let maint_client = Arc::new(MaintClient::new(maint_req_tx, maint_rep_rx, exited.clone()));
+    let maint_client = Arc::new(MaintClient::new(
+        maint_req_tx,
+        maint_rep_rx,
+        exited.clone(),
+        Arc::clone(&hub),
+    ));
     let sinks = Arc::new(OffThreadSinks {
         diag_rx: Mutex::new((diag_rx, diag_amend_rx)),
         estop_reg: estop_reg.clone(),
@@ -3995,6 +4327,7 @@ pub(crate) fn spawn_executor(
         persist_job_rx,
         persist_cmd_tx,
         persist_rep_rx.clone(),
+        watchdog_plan_tx,
         config_write_mutex,
         Arc::clone(&published_config),
         persist_stop.clone(),
@@ -4054,6 +4387,7 @@ pub(crate) fn spawn_executor(
                 persist_job_tx,
                 persist_cmd_rx,
                 persist_rep_tx,
+                watchdog_plan_rx,
                 offload_reclaim_tx,
                 persist_wake,
                 estop_state,
@@ -4132,6 +4466,15 @@ pub(crate) fn spawn_executor(
         baseline_identity,
     });
     Ok((RtExecutorHandle { shared }, sinks))
+}
+
+/// Copy-only off-RT watchdog park preparation result pushed by `armd-persist` and installed on
+/// `armd-control` with zero heap allocations and zero frees.
+#[derive(Clone, Copy)]
+struct WatchdogParkPlan {
+    generation: u64,
+    attempt: u8,
+    plan: Result<super::requests::motion::PreparedMotionSlot, crate::safety::BoundedText<160>>,
 }
 
 /// Single production forwarding path from `core.safety`'s inline log ring into the bounded
@@ -4224,6 +4567,9 @@ struct ControlState {
     persist_job_tx: Producer<PendingZeroCheckPersist>,
     persist_cmd_rx: Consumer<PersistCmd>,
     persist_rep_tx: Producer<PersistReply>,
+    /// Precomputed off-RT watchdog park plans (Copy-only, 0 alloc / 0 free on `armd-control`).
+    watchdog_plan_rx: Consumer<WatchdogParkPlan>,
+    last_woken_watchdog_park: Option<(u64, u8)>,
     /// Retained persistence reply if `persist_rep_tx` was temporarily full (flushed before popping).
     pending_persist_reply: Option<PersistReply>,
     /// Retained rejected persistence job if `persist_job_tx` and `offload_reclaim_tx` were both saturated.
@@ -4467,6 +4813,37 @@ impl ControlState {
         core.estop_ack_overflow_gen = 0;
         if drained {
             core.core.hub().wake();
+        }
+    }
+
+    fn service_watchdog_park_plan(&mut self, core: &mut SupervisorInner) {
+        use super::requests::motion as req;
+        const MAX_DRIFT_RETRIES: u8 = 5;
+        let Ok(wp) = self.watchdog_plan_rx.pop() else { return; };
+        if !core.watchdog_park_pending.is_some_and(|p| p.generation == wp.generation && p.attempt == wp.attempt) {
+            return;
+        }
+        match wp.plan {
+            Ok(slot) => match req::install_watchdog_park(core, wp.generation, &slot, None) {
+                Ok(_) | Err(req::MotionInstallError::ContinuationMismatch) => {}
+                Err(req::MotionInstallError::StartDrifted) => {
+                    if let Some(p) = core.watchdog_park_pending.as_mut().filter(|p| p.generation == wp.generation) {
+                        if p.attempt.saturating_add(1) < MAX_DRIFT_RETRIES {
+                            p.attempt = p.attempt.saturating_add(1);
+                            return;
+                        }
+                    }
+                    req::fail_watchdog_park_plan(
+                        core,
+                        wp.generation,
+                        crate::safety::BoundedText::new("watchdog park drifted repeatedly"),
+                    );
+                }
+                Err(e) => {
+                    req::fail_watchdog_park_plan(core, wp.generation, crate::safety::BoundedText::new(e.code()));
+                }
+            },
+            Err(reason) => req::fail_watchdog_park_plan(core, wp.generation, reason),
         }
     }
 
@@ -5474,6 +5851,7 @@ fn spawn_persist_worker(
     mut job_rx: Consumer<PendingZeroCheckPersist>,
     mut cmd_tx: Producer<PersistCmd>,
     rep_rx: Arc<Mutex<Consumer<PersistReply>>>,
+    mut watchdog_plan_tx: Producer<WatchdogParkPlan>,
     config_write_mutex: Arc<tokio::sync::Mutex<()>>,
     published_config: Arc<super::requests::config::PublishedConfigHub>,
     persist_stop: Arc<AtomicBool>,
@@ -5494,8 +5872,10 @@ fn spawn_persist_worker(
     }
 
     thread::Builder::new().name("armd-persist".into()).spawn(move || {
+        let hub_watch = Arc::clone(&hub);
         let hub_for_refresh = Arc::clone(&hub);
         let _exit_guard = ExitFlag(persist_worker_exited, persist_exited_cv, hub);
+        let mut last_sent_watchdog_park: Option<(u64, u8)> = None;
         let push_cmd = |tx: &mut Producer<PersistCmd>, cmd: PersistCmd, stop: &AtomicBool, dead: &AtomicBool| -> bool {
             let mut pending = Some(cmd);
             while let Some(c) = pending.take() {
@@ -5525,6 +5905,33 @@ fn spawn_persist_worker(
         };
 
         while !persist_stop.load(Ordering::Acquire) && !control_exited.load(Ordering::Acquire) {
+            if let Some(snap) = hub_watch.latest() {
+                let wd_gen = snap.rt.watchdog_park_pending_gen;
+                if wd_gen != 0 {
+                    let key = (wd_gen, snap.rt.watchdog_park_pending_attempt);
+                    if last_sent_watchdog_park != Some(key) {
+                        let plan = match hub_watch.motion_config().and_then(|cfg| {
+                            super::requests::motion::MotionPlanSnapshot::from_published(&snap, cfg)
+                        }) {
+                            Some(plan_snap) => match super::requests::motion::prepare_motion(
+                                &plan_snap,
+                                &super::requests::motion::MotionRequest::park(),
+                            ) {
+                                Ok(p) => Ok(p.slot),
+                                Err(e) => {
+                                    let mut msg = crate::safety::BoundedText::<160>::empty();
+                                    let _ = core::fmt::write(&mut msg, format_args!("watchdog park could not be planned: {e}"));
+                                    Err(msg)
+                                }
+                            },
+                            None => Err(crate::safety::BoundedText::new("watchdog park snapshot or motion config unavailable")),
+                        };
+                        if watchdog_plan_tx.push(WatchdogParkPlan { generation: key.0, attempt: key.1, plan }).is_ok() {
+                            last_sent_watchdog_park = Some(key);
+                        }
+                    }
+                }
+            }
             if hooks.pause_persist_worker.as_ref().is_some_and(|p| p.load(Ordering::Acquire)) {
                 thread::park_timeout(Duration::from_millis(2));
                 continue;
@@ -6165,6 +6572,7 @@ fn control_thread_main(
     persist_job_tx: Producer<PendingZeroCheckPersist>,
     persist_cmd_rx: Consumer<PersistCmd>,
     persist_rep_tx: Producer<PersistReply>,
+    watchdog_plan_rx: Consumer<WatchdogParkPlan>,
     offload_reclaim_tx: Producer<OffloadReclaim>,
     persist_wake: Thread,
     estop_state: Arc<crate::rt_core::urgent::EstopState>,
@@ -6254,6 +6662,8 @@ fn control_thread_main(
         persist_job_tx,
         persist_cmd_rx,
         persist_rep_tx,
+        watchdog_plan_rx,
+        last_woken_watchdog_park: None,
         pending_persist_reply: None,
         retained_persist_job: None,
         offload_reclaim_tx,
@@ -6442,6 +6852,7 @@ fn control_thread_main(
                             // in `core.pending_estop_acks` (keeping their `Arc<SafetyState>` alive) and
                             // deliver them ONLY after Step 6 publishes the corresponding snapshot.
                             state.service_persistence(core, ctx);
+                            state.service_watchdog_park_plan(core);
                             state.service_one_maintenance(
                                 core,
                                 ctx,
@@ -6473,6 +6884,15 @@ fn control_thread_main(
                     let (phases, body_end) = core.take_tick_phases();
                     let body_end = body_end.unwrap_or_else(now_inst);
                     core.defer_zero_check_persist = false;
+                    if let Some(p) = core.watchdog_park_pending.filter(|p| !p.waiting_mit_handback) {
+                        let key = (p.generation, p.attempt);
+                        if state.last_woken_watchdog_park != Some(key) {
+                            state.last_woken_watchdog_park = Some(key);
+                            state.persist_wake.unpark();
+                        }
+                    } else {
+                        state.last_woken_watchdog_park = None;
+                    }
                     if let Some(mut job) = core.pending_zero_check_persist.take() {
                         job.stop_gen = state.stop_requests.current();
                         match state.persist_job_tx.push(job) {
@@ -7596,6 +8016,7 @@ mod tests {
             closed: false,
             waiters: HashMap::new(),
             exited: exited.clone(),
+            hub: crate::rt_core::publish::state_channel(7).1,
         };
         let (tx, rx) = mpsc::sync_channel(1);
         inner.waiters.insert(1, MaintWaiter::Sync(tx));
@@ -7802,6 +8223,8 @@ mod tests {
             persist_job_tx,
             persist_cmd_rx,
             persist_rep_tx,
+            watchdog_plan_rx: RingBuffer::<WatchdogParkPlan>::new(2).1,
+            last_woken_watchdog_park: None,
             pending_persist_reply: None,
             retained_persist_job: None,
             offload_reclaim_tx,
@@ -7877,6 +8300,7 @@ mod tests {
         let (persist_job_tx, _) = RingBuffer::<PendingZeroCheckPersist>::new(2);
         let (_, persist_cmd_rx) = RingBuffer::<PersistCmd>::new(2);
         let (persist_rep_tx, _) = RingBuffer::<PersistReply>::new(2);
+        let (_, watchdog_plan_rx) = RingBuffer::<WatchdogParkPlan>::new(4);
         let (offload_reclaim_tx, _) = RingBuffer::<OffloadReclaim>::new(OFFLOAD_RECLAIM_CAPACITY);
 
         // Pre-fill downstream `safety_log_tx` (cap 2) with 2 unrelated events.
@@ -7908,6 +8332,8 @@ mod tests {
             persist_rep_tx,
             pending_persist_reply: None,
             retained_persist_job: None,
+            watchdog_plan_rx,
+            last_woken_watchdog_park: None,
             offload_reclaim_tx,
             persist_wake: thread::current(),
             persist_granted: None,
@@ -8159,6 +8585,8 @@ mod tests {
             persist_job_tx,
             persist_cmd_rx,
             persist_rep_tx,
+            watchdog_plan_rx: RingBuffer::<WatchdogParkPlan>::new(2).1,
+            last_woken_watchdog_park: None,
             pending_persist_reply: None,
             retained_persist_job: None,
             offload_reclaim_tx,
@@ -8330,6 +8758,8 @@ mod tests {
             persist_job_tx,
             persist_cmd_rx,
             persist_rep_tx,
+            watchdog_plan_rx: RingBuffer::<WatchdogParkPlan>::new(2).1,
+            last_woken_watchdog_park: None,
             pending_persist_reply: None,
             retained_persist_job: None,
             offload_reclaim_tx,

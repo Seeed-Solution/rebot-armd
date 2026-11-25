@@ -3273,26 +3273,46 @@ pub async fn delete_policy(
     // Holding activate_lock across the check + rename ensures concurrent activate() calls
     // (including mode="sim" upstream round-trips) cannot select a policy being deleted.
     let _act_guard = state.activate_lock.lock().await;
-    let inner = supervisor.inner().read().await;
-    #[cfg(feature = "policy-runtime")]
-    {
-        if let Some(run) = inner.policy_run.as_ref().filter(|r| r.policy_id == id) {
-            return Err(policy_delete_error(
-                StatusCode::CONFLICT,
-                "POLICY_IN_USE",
-                format!("Policy pack '{id}' is used by the running policy action {}", run.action_id),
-            ));
+    let legacy_guard = if supervisor.owner_mode() == crate::supervisor::OWNER_LEGACY {
+        let inner = supervisor.inner().read().await;
+        #[cfg(feature = "policy-runtime")]
+        {
+            if let Some(run) = inner.policy_run.as_ref().filter(|r| r.policy_id == id) {
+                return Err(policy_delete_error(
+                    StatusCode::CONFLICT,
+                    "POLICY_IN_USE",
+                    format!("Policy pack '{id}' is used by the running policy action {}", run.action_id),
+                ));
+            }
+            if inner.policy_loading {
+                return Err(policy_delete_error(
+                    StatusCode::CONFLICT,
+                    "POLICY_IN_USE",
+                    "A policy pack is being loaded for a run; delete it after the start finishes".into(),
+                ));
+            }
         }
-        if inner.policy_loading {
-            return Err(policy_delete_error(
-                StatusCode::CONFLICT,
-                "POLICY_IN_USE",
-                "A policy pack is being loaded for a run; delete it after the start finishes".into(),
-            ));
+        Some(inner)
+    } else {
+        #[cfg(feature = "policy-runtime")]
+        if let Some(snap) = supervisor.hub().latest() {
+            if let Some(p) = snap.obs.policy.as_ref().filter(|p| p.active && p.policy_id == id) {
+                return Err(policy_delete_error(
+                    StatusCode::CONFLICT,
+                    "POLICY_IN_USE",
+                    format!("Policy pack '{id}' is used by the running policy action {}", p.action_id),
+                ));
+            }
+            if snap.rt.owner.policy_busy {
+                return Err(policy_delete_error(
+                    StatusCode::CONFLICT,
+                    "POLICY_IN_USE",
+                    "A policy pack is being loaded or running; delete it after the run finishes".into(),
+                ));
+            }
         }
-    }
-    #[cfg(not(feature = "policy-runtime"))]
-    let _ = &inner;
+        None
+    };
     let active = state.active.read().await;
     if active.active_policy.as_deref() == Some(id.as_str()) {
         return Err(policy_delete_error(
@@ -3308,7 +3328,7 @@ pub async fn delete_policy(
         policy_delete_error(StatusCode::INTERNAL_SERVER_ERROR, "DELETE_FAILED", format!("Cannot delete policy pack '{id}': {e}"))
     })?;
     drop(active);
-    drop(inner);
+    drop(legacy_guard);
     state.invalidate_bundle_cache_for_policy(&id).await;
     Ok(Json(serde_json::json!({"id": id, "deleted": true})))
 }

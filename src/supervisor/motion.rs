@@ -83,7 +83,13 @@ impl SupervisorInner {
                                     self.recycle_move_samples_rt(samples);
                                 }
                             }
-                            if !b.has_inner_heap_storage() && self.gripper_motion_spare.is_none() {
+                            if traj.action_id.is_none()
+                                && b.is_park_release_clean()
+                                && self.park_release_spare.is_none()
+                            {
+                                self.park_release_spare = Some(b);
+                                None
+                            } else if !b.has_inner_heap_storage() && self.gripper_motion_spare.is_none() {
                                 self.gripper_motion_spare = Some(b);
                                 None
                             } else {
@@ -93,6 +99,7 @@ impl SupervisorInner {
                                     then: None,
                                     span: traj.span,
                                     motion_limits: None,
+                                    motion_vel_caps: traj.motion_vel_caps,
                                     motion_max_velocity: traj.motion_max_velocity,
                                 };
                                 rebuilt.has_heap_storage().then_some(rebuilt)
@@ -105,13 +112,14 @@ impl SupervisorInner {
                                 then: None,
                                 span: traj.span,
                                 motion_limits: None,
+                                motion_vel_caps: traj.motion_vel_caps,
                                 motion_max_velocity: traj.motion_max_velocity,
                             };
                             rebuilt.has_heap_storage().then_some(rebuilt)
                         }
                     }
                 } else {
-                    traj.has_heap_storage().then_some(traj)
+                    self.recycle_or_keep_heap_trajectory(traj)
                 }
             }
             None => None,
@@ -137,19 +145,73 @@ impl SupervisorInner {
         }
     }
 
+    /// Pure read-only preview of torque-guard and power-governor hold clamping without
+    /// mutating `self.motion_limit`. Returns `(torque_clamped_joint, power_clamped_joint)`.
+    pub(crate) fn preview_hold_filters(&self, targets: &mut [f32]) -> (Option<usize>, Option<usize>) {
+        let mut torque_clamped = None;
+        if let Some(h) = self.torque_guard.hold {
+            if let Some(t) = targets.get_mut(h.joint) {
+                if (*t - h.hold_q) * h.sign > 0.0 {
+                    *t = h.hold_q;
+                    torque_clamped = Some(h.joint);
+                }
+            }
+        }
+        let mut power_clamped = None;
+        if let Some(h) = self.power.gov.hold {
+            for (j, t) in targets.iter_mut().enumerate().take(crate::power::MAX_JOINTS) {
+                if h.push[j] != 0.0 && (*t - h.hold_q[j]) * h.push[j] > 0.0 {
+                    *t = h.hold_q[j];
+                    power_clamped.get_or_insert(j);
+                }
+            }
+        }
+        (torque_clamped, power_clamped)
+    }
+
+    pub(crate) fn commit_hold_filter_notes(&mut self, torque_clamped: Option<usize>, power_clamped: Option<usize>) {
+        if let Some(j) = torque_clamped {
+            self.note_motion_limit(MotionLimitReason::Torque, Some(j));
+        }
+        if let Some(j) = power_clamped {
+            self.note_motion_limit(MotionLimitReason::Power, Some(j));
+        }
+    }
+
     /// Explicit user release uses the same bounded deceleration as a stream timeout.
     /// In RT executor mode, heap-owning motion payloads are retired off-thread (zero RT frees).
     pub fn stop_motion(&mut self) {
+        // a STOP cancels a deferred park continuation and any in-flight ParkRearm before disable
+        let cancelled_continuation = self.park_continuation.take();
+        if let Some(cont) = cancelled_continuation {
+            self.abort_park_rearm_transition();
+            self.notify_park_continuation();
+            if !self.park_disable_in_flight()
+                && self.last_action.as_ref().is_some_and(|a| a.id == cont.action_id && a.is_running())
+            {
+                self.finish_action(cont.action_id, "cancelled", Some("STOPPED"), None, None, None, None);
+            }
+        }
         // a STOP cancels a park deferred behind the MIT hand back
+        self.mit.deferred_park_off_owner = false;
         if std::mem::take(&mut self.mit.park_after_hand_back) {
             if let Some(id) = self.mit.deferred_park_action.take() {
-                self.finish_action(id, "cancelled", Some("STOPPED"), Some("Motion stopped".into()), None, None, None);
+                let mut msg = self.take_action_msg_buf(id, 32);
+                msg.clear();
+                msg.push_str("Motion stopped");
+                self.finish_action(id, "cancelled", Some("STOPPED"), Some(msg), None, None, None);
             }
         }
         // (the message is built only when a run ends: a stop without one does not allocate)
+        #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+        if self.policy_load_reservation.take().is_some() {
+            self.policy_loading = false;
+            self.policy_cancel_slots.set_active_load_token(0);
+            self.reconcile_target_stream_authority(Instant::now());
+        }
         #[cfg(feature = "policy-runtime")]
         if self.policy_run.is_some() {
-            self.terminate_policy_run("STOPPED", "cancelled", Some("STOPPED"), Some("Motion stopped".into()));
+            self.terminate_policy_run_static("STOPPED", "cancelled", Some("STOPPED"), Some("Motion stopped"));
         }
         if self.gripper_reference_active() { self.hold_gripper_at_measured(); }
         self.servo_settled_ticks.fill(0);
@@ -179,6 +241,7 @@ impl SupervisorInner {
         // Immediate rigid lock at current position, latch E-Stop, advance epoch.
         // Maintain active restorative torque hold: do NOT cut power or set is_torqued=false.
         self.pending_normal_unload = false;
+        self.watchdog_park_pending = None;
         self.retire_motion_payloads();
         self.pending_deferred_done = None;
         self.gripper_stream_target = None;
@@ -291,20 +354,25 @@ impl SupervisorInner {
     }
 
     pub(crate) fn apply_stop_policy_in_tick(&mut self, policy: StopPolicy, in_tick: bool) {
+        #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+        if self.policy_load_reservation.take().is_some() {
+            self.policy_loading = false;
+            self.policy_cancel_slots.set_active_load_token(0);
+        }
         #[cfg(feature = "policy-runtime")]
         if self.policy_run.is_some() {
             match policy {
                 StopPolicy::NormalUnload => {
-                    self.terminate_policy_run("STOPPED", "cancelled", Some("STOPPED"), Some("Arm unloading".into()));
+                    self.terminate_policy_run_static("STOPPED", "cancelled", Some("STOPPED"), Some("Arm unloading"));
                 }
                 StopPolicy::EStopLatch => {
-                    self.terminate_policy_run("ESTOP", "failed", Some("ESTOP_ACTIVE"), Some("E-stop latched".into()));
+                    self.terminate_policy_run_static("ESTOP", "failed", Some("ESTOP_ACTIVE"), Some("E-stop latched"));
                 }
                 StopPolicy::ThermalTrip => {
-                    self.terminate_policy_run("THERMAL_TRIP", "failed", Some("THERMAL_TRIP"), Some("Thermal trip".into()));
+                    self.terminate_policy_run_static("THERMAL_TRIP", "failed", Some("THERMAL_TRIP"), Some("Thermal trip"));
                 }
                 StopPolicy::BusLossFallback => {
-                    self.terminate_policy_run("BUS_LOSS", "failed", Some("BUS_LOSS"), Some("CAN feedback lost".into()));
+                    self.terminate_policy_run_static("BUS_LOSS", "failed", Some("BUS_LOSS"), Some("CAN feedback lost"));
                 }
             }
         }
@@ -342,7 +410,7 @@ impl SupervisorInner {
                     if self.is_torqued {
                         self.pending_normal_unload = false;
                         self.unload_settle = None;
-                        self.active_trajectory = None;
+                        self.replace_active_trajectory(None);
                         self.servo_target = None;
                     }
                     return;
@@ -354,7 +422,7 @@ impl SupervisorInner {
                 if self.mit_active() && self.mit_hand_back("park").is_err() {
                     if self.mit_active() && !self.safety.state().is_stopped() {
                         tracing::warn!("Park requested while MIT tracking moves the arm: braking to rest and handing back first");
-                        self.active_trajectory = None;
+                        self.replace_active_trajectory(None);
                         self.mit.park_after_hand_back = true;
                     }
                     return;
@@ -426,7 +494,7 @@ impl SupervisorInner {
                                 self.park_rejection = Some(e);
                                 self.pending_normal_unload = false;
                                 self.unload_settle = None;
-                                self.active_trajectory = None;
+                                self.replace_active_trajectory(None);
                                 return;
                             }
                         }
@@ -438,7 +506,7 @@ impl SupervisorInner {
                                 self.park_rejection = Some(e);
                                 self.pending_normal_unload = false;
                                 self.unload_settle = None;
-                                self.active_trajectory = None;
+                                self.replace_active_trajectory(None);
                                 return;
                             }
                         };
@@ -448,7 +516,7 @@ impl SupervisorInner {
                             self.park_rejection = Some(e);
                             self.pending_normal_unload = false;
                             self.unload_settle = None;
-                            self.active_trajectory = None;
+                            self.replace_active_trajectory(None);
                             return;
                         }
                         let _ = self.safety.set_torque(true);
@@ -472,7 +540,7 @@ impl SupervisorInner {
                     tracing::warn!("NormalUnload cannot plan motion or arm not operational; maintaining holding torque to prevent dropping arm");
                     self.pending_normal_unload = false;
                     self.unload_settle = None;
-                    self.active_trajectory = None;
+                    self.replace_active_trajectory(None);
                     self.servo_target = None;
                     return;
                 }
@@ -585,7 +653,7 @@ impl SupervisorInner {
 
         #[cfg(feature = "policy-runtime")]
         if self.policy_run.is_some() {
-            self.terminate_policy_run("LEASE_LOST", "cancelled", Some("LEASE_LOST"), Some("Control lease preempted".into()));
+            self.terminate_policy_run_static("LEASE_LOST", "cancelled", Some("LEASE_LOST"), Some("Control lease preempted"));
         }
 
         // Four-category state categorization (strictly fail-closed, no unwrap/panic, driver lock poison returns false)
@@ -658,7 +726,7 @@ impl SupervisorInner {
         self.cancel_watchdog_park_for_new_lease(client_id);
         #[cfg(feature = "policy-runtime")]
         if self.policy_run.is_some() {
-            self.terminate_policy_run("LEASE_LOST", "cancelled", Some("LEASE_LOST"), Some("Control lease acquired by new controller".into()));
+            self.terminate_policy_run_static("LEASE_LOST", "cancelled", Some("LEASE_LOST"), Some("Control lease acquired by new controller"));
         }
         if let Some(old_gen) = self.active_lease.as_ref().map(|a| a.generation) {
             self.fence_displaced_lease_generation(old_gen, true);
@@ -673,7 +741,8 @@ impl SupervisorInner {
     /// A new lease owner takes over from a running watchdog park: the park's
     /// motion is cancelled like any other queued motion and the arm brakes to a hold.
     pub(crate) fn cancel_watchdog_park_for_new_lease(&mut self, client_id: &str) {
-        if self.watchdog_park.take().is_some() && self.pending_normal_unload {
+        let had_pending = self.watchdog_park_pending.take().is_some();
+        if self.watchdog_park.take().is_some() && (self.pending_normal_unload || had_pending) {
             if !self.rt_executor_owned {
                 tracing::info!("Watchdog park cancelled: new lease acquired by {client_id}; holding position");
             }
@@ -685,11 +754,19 @@ impl SupervisorInner {
     /// from its measured velocity (max over joints of |v| / planning acceleration), the
     /// planned park duration (which already starts from the commanded velocity), the
     /// settle hold and [`WATCHDOG_PARK_MARGIN`]; never less than [`WATCHDOG_PARK_TIMEOUT`].
+    /// Zero heap allocations (uses inline planning limits when within inline DOF bound).
     pub fn watchdog_park_timeout(&self) -> Duration {
-        let decel = self.measured_velocities.iter().zip(self.planning_limits())
-            .filter(|(v, l)| v.is_finite() && l.max_acceleration > 1e-6)
-            .map(|(v, l)| f64::from(v.abs() / l.max_acceleration))
-            .fold(0.0, f64::max);
+        let decel = if let Some((limits, n)) = self.planning_limits_inline(None) {
+            self.measured_velocities.iter().zip(&limits[..n])
+                .filter(|(v, l)| v.is_finite() && l.max_acceleration > 1e-6)
+                .map(|(v, l)| f64::from(v.abs() / l.max_acceleration))
+                .fold(0.0, f64::max)
+        } else {
+            self.measured_velocities.iter().zip(&self.config.limits)
+                .filter(|(v, l)| v.is_finite() && l.max_acceleration > 1e-6)
+                .map(|(v, l)| f64::from(v.abs() / l.max_acceleration))
+                .fold(0.0, f64::max)
+        };
         let planned = self.unload_planned_duration
             .filter(|d| d.is_finite() && *d >= 0.0)
             .map_or(Duration::ZERO, |d| Duration::from_secs_f64((decel + d).min(3600.0)) + UNLOAD_SETTLE_HOLD + WATCHDOG_PARK_MARGIN);
@@ -708,6 +785,7 @@ impl SupervisorInner {
                 "configuration hold active"
             };
             let reason = crate::safety::BoundedText::new(msg);
+            self.watchdog_park_pending = None;
             self.watchdog_park_blocked_reason = Some(crate::model::HolderLabel::new(msg));
             self.safety.log_watchdog_park_blocked(reason);
             self.stop_motion();
@@ -716,17 +794,48 @@ impl SupervisorInner {
             }
             return;
         }
-        if !self.pending_normal_unload {
-            tracing::warn!("Watchdog park interrupted (safety state {:?})", self.safety.state());
+        if !self.pending_normal_unload && self.watchdog_park_pending.is_none() {
+            if !self.rt_executor_owned {
+                tracing::warn!("Watchdog park interrupted (safety state {:?})", self.safety.state());
+            }
             if self.is_torqued {
                 self.latch_watchdog_fault();
             }
+            return;
+        }
+        if self.watchdog_park_pending.is_some()
+            && (!self.is_torqued || self.safety.state().is_stopped() || self.e_stop_latched.load(Ordering::SeqCst))
+        {
+            self.watchdog_park_pending = None;
             return;
         }
         // budget in reference time: the power governor may slow the park
         if dt.is_finite() && dt > 0.0 { park.elapsed_s += dt * self.motion_time_scale(); }
         if park.elapsed_s < park.budget_s {
             self.watchdog_park = Some(park);
+            return;
+        }
+        if self.watchdog_park_pending.take().is_some() {
+            self.mit.park_after_hand_back = false;
+            self.mit.deferred_park_off_owner = false;
+            if !self.rt_executor_owned {
+                tracing::warn!("Watchdog park off-thread plan timed out after {:.2} s; holding torque and latching WatchdogTimeout", park.budget_s);
+            }
+            self.safety.log_watchdog_park_blocked(crate::safety::BoundedText::new("watchdog park plan timed out"));
+            self.latch_watchdog_fault();
+            return;
+        }
+        if self.rt_executor_owned {
+            let at_pose = self.active_trajectory.is_none() && self.is_resting_pose_static_ok();
+            if at_pose && !park.grace_granted {
+                park.budget_s += WATCHDOG_PARK_SETTLE_GRACE.as_secs_f64();
+                park.grace_granted = true;
+                self.watchdog_park = Some(park);
+                return;
+            }
+            let reason = self.unload_settle_blocker_static();
+            self.safety.log_watchdog_park_blocked(crate::safety::BoundedText::new(reason));
+            self.latch_watchdog_fault();
             return;
         }
         let blocker = self.unload_settle_blocker().unwrap_or_else(|| "settle pending".into());
@@ -741,6 +850,17 @@ impl SupervisorInner {
         }
         tracing::warn!("Watchdog park did not finish within {:.2} s ({blocker}); holding torque and latching WatchdogTimeout", park.budget_s);
         self.latch_watchdog_fault();
+    }
+
+    /// Allocation-free static reason code for a pending unload settle on `armd-control`.
+    fn unload_settle_blocker_static(&mut self) -> &'static str {
+        if self.active_trajectory.is_some() {
+            "park trajectory still running"
+        } else if !self.is_resting_pose_static_ok() {
+            "resting pose static check failed"
+        } else {
+            "settle stationary check pending"
+        }
     }
 
     /// Zero-allocation bounded check of conditions for parking automatically when the lease
@@ -807,7 +927,7 @@ impl SupervisorInner {
     pub(crate) fn latch_watchdog_fault(&mut self) {
         #[cfg(feature = "policy-runtime")]
         if self.policy_run.is_some() {
-            self.terminate_policy_run("WATCHDOG_TIMEOUT", "failed", Some("WATCHDOG_TIMEOUT"), Some("Lease watchdog expired".into()));
+            self.terminate_policy_run_static("WATCHDOG_TIMEOUT", "failed", Some("WATCHDOG_TIMEOUT"), Some("Lease watchdog expired"));
         }
         if !self.safety.state().is_stopped() {
             // Preserve a torque-guard backed-off command before updating commanded_positions in place.
@@ -825,6 +945,7 @@ impl SupervisorInner {
                 }
             }
             self.watchdog_park = None;
+            self.watchdog_park_pending = None;
             self.pending_normal_unload = false;
             self.retire_motion_payloads();
             self.pending_deferred_done = None;
@@ -833,7 +954,7 @@ impl SupervisorInner {
             self.gripper_stream_contact_detector.reset();
             self.gripper_stream_lease = None;
             self.servo_settled_ticks.fill(0);
-            self.servo_ws_min_depths = None;
+            self.clear_servo_ws_min_depths_rt();
             self.servo_stream_active = false;
             self.tracking.invalidate();
             crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
@@ -862,7 +983,7 @@ impl SupervisorInner {
                 self.fence_displaced_lease_generation(displaced, false);
                 #[cfg(feature = "policy-runtime")]
                 if self.policy_run.is_some() {
-                    self.terminate_policy_run("LEASE_LOST", "cancelled", Some("LEASE_LOST"), Some("Control lease released".into()));
+                    self.terminate_policy_run_static("LEASE_LOST", "cancelled", Some("LEASE_LOST"), Some("Control lease released"));
                 }
                 return valid;
             }
@@ -996,14 +1117,14 @@ impl SupervisorInner {
     }
 
     /// Planned-motion limits in fixed stack storage (no `Vec` or joint-name `String`
-    /// allocations). Returns `None` if `config.limits.len() > MAX_DOF`.
-    pub(crate) fn planning_limits_inline(&self, speed_scale: Option<f64>) -> Option<([crate::model::JointLimit; crate::rt_core::mailbox::MAX_DOF], usize)> {
+    /// allocations). Returns `None` if `config.limits.len() > MAX_MOTION_DOF`.
+    pub(crate) fn planning_limits_inline(&self, speed_scale: Option<f64>) -> Option<([crate::model::JointLimit; crate::model::MAX_MOTION_DOF], usize)> {
         let dof = self.config.limits.len();
-        if dof > crate::rt_core::mailbox::MAX_DOF { return None; }
+        if dof > crate::model::MAX_MOTION_DOF { return None; }
         let scale = self.config.speed_cap.and_then(|c| c.joint_velocity_scale).unwrap_or(1.0);
         let gripper_idx = self.config.gripper_index();
         let commissioning = self.config.active_tool.commissioning_required;
-        let mut out: [crate::model::JointLimit; crate::rt_core::mailbox::MAX_DOF] = std::array::from_fn(|_| crate::model::JointLimit {
+        let mut out: [crate::model::JointLimit; crate::model::MAX_MOTION_DOF] = std::array::from_fn(|_| crate::model::JointLimit {
             name: String::new(),
             min_position: 0.0,
             max_position: 0.0,
@@ -1032,24 +1153,6 @@ impl SupervisorInner {
             };
         }
         Some((out, dof))
-    }
-
-    /// Zero-allocation static refusal checks for RT jog commits (`commit_primitive` /
-    /// `Primitive::JointQuintic`), preserving the exact refusal precedence of `jog_action_slice`.
-    pub(crate) fn jog_precheck_static(&self) -> Result<(), &'static str> {
-        if self.config.active_tool.commissioning_required { return Err("COMMISSIONING_REQUIRED"); }
-        if self.core.motion_inhibited_by_config() { return Err("CONFIG_BUSY"); }
-        if self.gravity_comp.is_some() { return Err("MOTION_BUSY"); }
-        // When MIT tracking is configured on a torqued arm, defer remaining checks to
-        // `jog_action_slice` so `mit_motion_blocker()` keeps its exact precedence.
-        if self.is_torqued && self.config.joint_tracking.is_some() { return Ok(()); }
-        #[cfg(feature = "policy-runtime")]
-        if self.policy_loading || self.policy_run.is_some() { return Err("MOTION_BUSY"); }
-        if self.collision.hold.is_some() { return Err("COLLISION_HOLD"); }
-        if self.handover_settling_since.is_some() { return Err("REJECTED"); }
-        if self.e_stop_latched.load(Ordering::SeqCst) { return Err("ESTOP_ACTIVE"); }
-        if self.pending_rearm || self.pending_normal_unload { return Err("NOT_ARMED"); }
-        Ok(())
     }
 
     /// Zero-allocation workspace sweep check of a joint-space quintic trajectory using
@@ -1085,136 +1188,6 @@ impl SupervisorInner {
         })();
         self.ws_eval_bufs = bufs;
         result
-    }
-
-    /// Jog from a fixed slice (RT commit path: no `to_vec()`, no `planning_limits()`
-    /// allocation, no `workspace_samples` `Vec`, no `target_positions` replacement free).
-    pub(crate) fn jog_action_slice(admitted: Admitted<'_>, target_positions: &[f32], duration_secs: Option<f64>, epoch_id: Option<u64>, kind: &str) -> Result<(u64, u64, f64), ArmError> {
-        let (this, proof) = admitted.consume()?;
-        this.jog_action_slice_inner(&proof, target_positions, duration_secs, epoch_id, kind)
-    }
-
-    fn jog_action_slice_inner(&mut self, proof: &crate::supervisor::AdmittedProof, target_positions: &[f32], duration_secs: Option<f64>, epoch_id: Option<u64>, kind: &str) -> Result<(u64, u64, f64), ArmError> {
-        use crate::rt_core::mailbox::MAX_DOF;
-        if self.config.active_tool.commissioning_required {
-            return Err(SafetyError::CommissioningRequired(format!("{kind} (requires speed_scale <= 0.2)")).into());
-        }
-        let n = target_positions.len();
-        if n > MAX_DOF {
-            return self.jog_action_with_speed_scale_inner(proof, target_positions.to_vec(), duration_secs, epoch_id, kind, None);
-        }
-        let Some((limits_buf, lim_n)) = self.planning_limits_inline(None) else {
-            return self.jog_action_with_speed_scale_inner(proof, target_positions.to_vec(), duration_secs, epoch_id, kind, None);
-        };
-        self.check_terminal_fifo_for_new_action()?;
-        let limits = &limits_buf[..lim_n];
-        let mut target = [0.0f32; MAX_DOF];
-        target[..n].copy_from_slice(target_positions);
-        let target = &mut target[..n];
-
-        self.config_motion_check()?;
-        self.gravity_comp_motion_busy()?;
-        if self.mit_motion_blocked() {
-            if let Some(reason) = self.mit_motion_blocker() { return Err(MotionError::MotionBusy(reason).into()); }
-        }
-        #[cfg(feature = "policy-runtime")]
-        if self.policy_loading {
-            return Err(MotionError::MotionBusy("a policy is loading".into()).into());
-        }
-        #[cfg(feature = "policy-runtime")]
-        if self.policy_run.is_some() {
-            return Err(MotionError::MotionBusy("a policy run is active".into()).into());
-        }
-        self.collision_hold_check()?;
-        if self.handover_settling_since.is_some() {
-            return Err(ArmError::Safety(SafetyError::HandoverSettling));
-        }
-        if self.e_stop_latched.load(Ordering::SeqCst) {
-            return Err(ArmError::Safety(SafetyError::EStopActive));
-        }
-        if self.pending_rearm || self.pending_normal_unload {
-            return Err(ArmError::Safety(SafetyError::NotArmed(self.safety.state().clone())));
-        }
-        if self.macro_run.as_ref().is_some_and(|m| m.finishing) {
-            return Err(MotionError::MotionBusy("macro finishing hold pending bus acceptance".into()).into());
-        }
-        self.pending_normal_unload = false;
-
-        self.safety.validate_motion_command(epoch_id, target, &self.config.limits)?;
-        if self.config.gripper_index().is_some_and(|g| {
-            target.len() > g
-                && self.commanded_positions.len() > g
-                && (target[g] - self.commanded_positions[g]).abs() > 1e-4
-        }) {
-            self.check_pos_force_gripper_fresh()?;
-        }
-        self.torque_hold_filter(target);
-        self.power_hold_filter(target);
-
-        if let Some(g_idx) = self.config.gripper_index() {
-            if self.gripper_stalled && target.len() > g_idx && self.commanded_positions.len() > g_idx {
-                let delta = target[g_idx] - self.commanded_positions[g_idx];
-                let tau_g = self.torques.get(g_idx).copied().unwrap_or(0.0);
-                if (delta * tau_g < -1e-4) || (delta * self.gripper_stall_sign < -1e-4) {
-                    self.gripper_stalled = false;
-                    self.gripper_high_torque_ticks = 0;
-                    self.gripper_low_torque_ticks = 0;
-                    self.gripper_stall_window.reset();
-                }
-            }
-        }
-
-        let zeros = [0.0f32; MAX_DOF];
-        let mut start_pos = [0.0f32; MAX_DOF];
-        let (start_dof, quiesce_macro_gripper) = self.post_quiesce_commanded_positions(&mut start_pos);
-        let mut start_vel = [0.0f32; MAX_DOF];
-        let vel_dof = self.commanded_velocities.len().min(MAX_DOF);
-        start_vel[..vel_dof].copy_from_slice(&self.commanded_velocities[..vel_dof]);
-        if quiesce_macro_gripper {
-            if let Some(g) = self.config.gripper_index().filter(|&g| g < vel_dof) {
-                start_vel[g] = 0.0;
-            }
-        }
-        let traj = TrajectoryPlanner::plan(
-            &start_pos[..start_dof],
-            &start_vel[..vel_dof],
-            target,
-            &zeros[..self.config.dof],
-            duration_secs,
-            limits,
-        )?;
-        let (traj, power_scale) = self.power_fit_quintic(
-            traj,
-            &start_pos[..start_dof],
-            &start_vel[..vel_dof],
-            target,
-            limits,
-            true,
-        )?;
-        self.check_workspace_quintic_inline(&traj)?;
-
-        // Commit old-macro gripper quiesce strictly AFTER all validation succeeded and BEFORE
-        // mutating new motion state (target_positions / safety / active_trajectory).
-        if quiesce_macro_gripper {
-            self.hold_gripper_at_measured();
-            self.releasing = false;
-        }
-        self.last_heartbeat = Instant::now();
-        if self.config.gripper_index().is_some_and(|g| target.len() > g && (target[g] - self.commanded_positions[g]).abs() > 1e-4) {
-            self.gripper_hold_vel_ceiling = None;
-        }
-        self.release_servo_target();
-        self.servo_settled_ticks.fill(0);
-        self.servo_ws_min_depths = None;
-        crate::rt_core::scratch::copy_into(&mut self.target_positions, target);
-        self.safety.mark_motion_started()?;
-        let duration = traj.duration;
-        let id = self.begin_action_rt(kind);
-        if let Some(s) = power_scale { self.note_action_power_scale(id, s); }
-        // No `speed_scale` here, so `active_tracking_limits` already uses `planning_limits()`
-        // when `motion_limits` is None (avoids cloning `Vec<JointLimit>` and joint name strings).
-        self.replace_active_trajectory(Some(ActiveTrajectory::quintic(traj, Some(id))));
-        Ok((self.safety.epoch_id(), id, duration))
     }
 
     pub fn jog(admitted: Admitted<'_>, target_positions: Vec<f32>, duration_secs: Option<f64>, epoch_id: Option<u64>) -> Result<u64, ArmError> {
@@ -1313,6 +1286,9 @@ impl SupervisorInner {
         if self.pending_rearm || self.pending_normal_unload {
             return Err(ArmError::Safety(SafetyError::NotArmed(self.safety.state().clone())));
         }
+        if self.disable_pending || self.torque_transition.is_some() || self.park_continuation.is_some() {
+            return Err(MotionError::MotionBusy("a torque transition or park is pending".into()).into());
+        }
         if self.macro_run.as_ref().is_some_and(|m| m.finishing) {
             return Err(MotionError::MotionBusy("macro finishing hold pending bus acceptance".into()).into());
         }
@@ -1364,7 +1340,7 @@ impl SupervisorInner {
             (p.traj, p.power_scale)
         } else {
             // 2. Plan quintic polynomial trajectory from commanded state to target
-            let zero_buf = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
+            let zero_buf = [0.0f32; crate::model::MAX_MOTION_DOF];
             let zero_vec;
             let zeros: &[f32] = if self.config.dof <= zero_buf.len() {
                 &zero_buf[..self.config.dof]
@@ -1395,7 +1371,7 @@ impl SupervisorInner {
             self.gripper_hold_vel_ceiling = None;
         }
         self.release_servo_target();
-        self.servo_ws_min_depths = None;
+        self.clear_servo_ws_min_depths_rt();
         crate::rt_core::scratch::copy_into(&mut self.target_positions, &target_positions);
         self.safety.mark_motion_started()?;
         let duration = traj.duration;
@@ -1410,7 +1386,9 @@ impl SupervisorInner {
     /// running (each was checked against the current rule). Zero-allocation static variant.
     pub(crate) fn workspace_change_blocker_static(&self) -> Option<&'static str> {
         if self.macro_run.is_some() { return Some("a macro action is running"); }
-        if self.pending_normal_unload { return Some("a park is running"); }
+        if self.pending_normal_unload || self.park_continuation.is_some() || self.park_disable_in_flight() {
+            return Some("a park is running");
+        }
         self.busy_reason_static()
     }
 
@@ -1723,8 +1701,18 @@ impl SupervisorInner {
     // -- RT commit (armd 1.6 RT core, track C) ------------------------------------------
 
     /// Feedback a commit may plan from: numerically valid, and fresh per the driver (no driver: simulated).
+    /// On RT executor ownership, uses the Step-2 cached poll state with zero extra driver locks.
     pub fn commit_feedback_valid(&self) -> bool {
-        self.feedback_numeric_valid && self.driver.as_ref().is_none_or(|d| d.lock().is_ok_and(|drv| drv.is_feedback_valid()))
+        if !self.feedback_numeric_valid {
+            return false;
+        }
+        if self.driver.is_none() {
+            return true;
+        }
+        if self.rt_executor_owned {
+            return self.last_poll_feedback_valid;
+        }
+        self.driver.as_ref().is_none_or(|d| d.lock().is_ok_and(|drv| drv.is_feedback_valid()))
     }
 
     /// The refusal code when a primitive admitted under `admitted` may not be installed,
@@ -1759,14 +1747,31 @@ impl SupervisorInner {
     /// RT-safe: when keeping a watchdog park, records fields into [`crate::rt_core::ops::stop_diag`]
     /// without tracing or allocating; a normal-priority thread formats off-thread.
     pub fn authorized_stop(&mut self) -> bool {
-        if let Some(park) = self.watchdog_park.as_ref().filter(|_| self.pending_normal_unload) {
+        if let Some(park) = self.watchdog_park.as_ref().filter(|_| self.pending_normal_unload || self.watchdog_park_pending.is_some()) {
             crate::rt_core::ops::stop_diag().record_park_ignored(self.core.id(), park.elapsed_s, park.budget_s);
+            return false;
+        }
+        if self.is_watchdog_park_disable_in_flight() {
+            crate::rt_core::ops::stop_diag().record_park_ignored(self.core.id(), 0.0, 0.0);
             return false;
         }
         if self.gravity_comp.is_some() {
             self.exit_gravity_comp("STOPPED", "Stop command");
         }
+        let disable_in_flight = self.park_disable_in_flight();
+        let running_park_id = self
+            .last_action
+            .as_ref()
+            .filter(|a| a.is_running() && a.kind == "park")
+            .map(|a| a.id);
         self.stop_motion();
+        if !disable_in_flight {
+            if let Some(id) = running_park_id {
+                if self.last_action.as_ref().is_some_and(|a| a.id == id && a.is_running()) {
+                    self.finish_action(id, "cancelled", Some("STOPPED"), None, None, None, None);
+                }
+            }
+        }
         if self.macro_run.is_some() {
             self.request_macro_stop();
         }
@@ -1787,7 +1792,7 @@ impl SupervisorInner {
         self.safety.validate_motion_command(Some(epoch), last, &self.config.limits)?;
         self.release_servo_target();
         self.servo_settled_ticks.fill(0);
-        self.servo_ws_min_depths = None;
+        self.clear_servo_ws_min_depths_rt();
         crate::rt_core::scratch::copy_into(&mut self.target_positions, last);
         self.safety.mark_motion_started()?;
         self.last_heartbeat = Instant::now();

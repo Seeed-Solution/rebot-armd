@@ -104,13 +104,30 @@ impl SupervisorInner {
         self.drop_macro_run("cancelled", Some("SUPERSEDED"));
         #[cfg(feature = "policy-runtime")]
         if let Some(mut run) = self.policy_run.take() {
-            run.stop_reason = Some("SUPERSEDED".to_string());
-            if run.mode == crate::policy_runtime::PolicyMode::Live {
-                self.servo_target = None;
-                self.servo_settled_ticks.fill(0);
-                self.servo_ws_min_depths = None;
+            if self.rt_executor_owned {
+                // Executor supersession: revoke authorization, seal/close stream, recycle spares
+                // in place with 0 allocs/frees, emit immutable terminal outcome, and preserve
+                // replacement `target_positions` and `j7_admitted_stamp` (`reset_hold_target = false`).
+                let sup_aid = run.action_id;
+                let sup_steps = run.steps;
+                self.teardown_rt_policy_run(run, "SUPERSEDED", false, Instant::now());
+                #[cfg(not(target_arch = "wasm32"))]
+                self.push_rt_policy_terminal(
+                    sup_aid,
+                    sup_steps,
+                    "SUPERSEDED",
+                    "cancelled",
+                    crate::motion::PolicyStats::default(),
+                );
+            } else {
+                run.stop_reason = Some("SUPERSEDED".to_string());
+                if run.mode == crate::policy_runtime::PolicyMode::Live {
+                    self.servo_target = None;
+                    self.servo_settled_ticks.fill(0);
+                    self.servo_ws_min_depths = None;
+                }
+                self.last_policy_obs = Some(run.to_observation(false));
             }
-            self.last_policy_obs = Some(run.to_observation(false));
         }
         if let Some(mut old) = self.last_action.take() {
             if old.is_running() {
@@ -435,6 +452,9 @@ impl SupervisorInner {
         }
         if self.pending_rearm || self.pending_normal_unload {
             return Err(SafetyError::NotArmed(self.safety.state().clone()).into());
+        }
+        if self.disable_pending || self.torque_transition.is_some() || self.park_continuation.is_some() {
+            return Err(MotionError::MotionBusy("a torque transition or park is pending".into()).into());
         }
         self.collision_hold_check()?;
         self.config_motion_check()?;
@@ -959,7 +979,7 @@ impl SupervisorInner {
                 for (i, l) in limits.iter_mut().enumerate().take(usize::from(dof)) {
                     if max_velocity[i] > 0.0 { l.max_velocity = l.max_velocity.min(max_velocity[i]); }
                 }
-                this.install_macro_quintic_inner(&proof, id, q[..usize::from(dof)].to_vec(), &limits).map(drop)
+                this.install_macro_quintic_inner(&proof, id, q[..usize::from(dof)].to_vec(), &limits, None).map(drop)
             }
             Primitive::Gripper { fraction, speed, grasp, .. } => {
                 let command = if grasp && fraction <= 0.0 { GripperCommand::Close } else if !grasp && fraction >= 1.0 { GripperCommand::Open } else { GripperCommand::Move };
@@ -1331,7 +1351,7 @@ impl SupervisorInner {
         self.gripper_hold_vel_ceiling = Some(motion.wire_velocity_ceiling());
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
-        self.servo_ws_min_depths = None;
+        self.clear_servo_ws_min_depths_rt();
         let mut target = self.commanded_positions.clone();
         target[gripper_idx] = motion.target;
         self.target_positions = target;
@@ -1346,10 +1366,30 @@ impl SupervisorInner {
     /// Returns its planned duration.
     pub fn install_macro_quintic(admitted: Admitted<'_>, id: u64, target: Vec<f32>, limits: &[crate::model::JointLimit]) -> Result<f64, ArmError> {
         let (this, proof) = admitted.consume()?;
-        this.install_macro_quintic_inner(&proof, id, target, limits)
+        this.install_macro_quintic_inner(&proof, id, target, limits, None)
     }
 
-    pub(crate) fn install_macro_quintic_inner(&mut self, _proof: &crate::supervisor::AdmittedProof, id: u64, target: Vec<f32>, limits: &[crate::model::JointLimit]) -> Result<f64, ArmError> {
+    /// [`Self::install_macro_quintic`] reusing an off-lock [`crate::supervisor::PreparedQuintic`]
+    /// when start, target, limits, workspace revision, tool offset and power budget still match.
+    pub(crate) fn install_macro_quintic_prepared(
+        admitted: Admitted<'_>,
+        id: u64,
+        target: Vec<f32>,
+        limits: &[crate::model::JointLimit],
+        prepared: Option<crate::supervisor::PreparedQuintic>,
+    ) -> Result<f64, ArmError> {
+        let (this, proof) = admitted.consume()?;
+        this.install_macro_quintic_inner(&proof, id, target, limits, prepared)
+    }
+
+    pub(crate) fn install_macro_quintic_inner(
+        &mut self,
+        _proof: &crate::supervisor::AdmittedProof,
+        id: u64,
+        target: Vec<f32>,
+        limits: &[crate::model::JointLimit],
+        prepared: Option<crate::supervisor::PreparedQuintic>,
+    ) -> Result<f64, ArmError> {
         let epoch = self.macro_sub_ready(id)?;
         if epoch != self.safety.epoch_id() { return Err(MotionError::PlanStale("epoch changed during the action".into()).into()); }
         self.action_preconditions()?;
@@ -1362,11 +1402,27 @@ impl SupervisorInner {
         }
         self.torque_hold_filter(&mut target);
         self.power_hold_filter(&mut target);
-        let traj = TrajectoryPlanner::plan(&self.commanded_positions, &self.commanded_velocities, &target,
-            &vec![0.0; self.config.dof], None, limits)?;
-        let (traj, power_scale) = self.power_fit_quintic(traj, &self.commanded_positions, &self.commanded_velocities, &target, limits, true)?;
-        let samples = self.workspace_samples(&traj)?;
-        self.check_workspace_path(&self.commanded_positions, samples.iter().map(Vec::as_slice))?;
+        let reuse = prepared.filter(|p| {
+            p.start == self.commanded_positions
+                && p.v0 == self.commanded_velocities
+                && p.target == target
+                && p.limits.as_slice() == limits
+                && p.workspace_revision == self.workspace_revision
+                && p.tcp_offset == self.config.tcp_offset
+                && p.power.as_ref() == self.power_budget()
+                && p.checked_workspace == self.workspace_policy().is_some()
+        });
+        let (traj, power_scale) = if let Some(p) = reuse {
+            self.prepared_quintics_used += 1;
+            (p.traj, p.power_scale)
+        } else {
+            let traj = TrajectoryPlanner::plan(&self.commanded_positions, &self.commanded_velocities, &target,
+                &vec![0.0; self.config.dof], None, limits)?;
+            let (traj, power_scale) = self.power_fit_quintic(traj, &self.commanded_positions, &self.commanded_velocities, &target, limits, true)?;
+            let samples = self.workspace_samples(&traj)?;
+            self.check_workspace_path(&self.commanded_positions, samples.iter().map(Vec::as_slice))?;
+            (traj, power_scale)
+        };
         if moves_gripper {
             self.gripper_hold_vel_ceiling = None;
         }
@@ -1576,7 +1632,7 @@ impl SupervisorInner {
         let motion = motion.with_baseline(self.gripper_baseline_for_motion(), learn);
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
-        self.servo_ws_min_depths = None;
+        self.clear_servo_ws_min_depths_rt();
         let mut target = self.commanded_positions.clone();
         target[gripper_idx] = motion.target;
         self.target_positions = target;
@@ -1648,7 +1704,7 @@ impl SupervisorInner {
         self.gripper_hold_vel_ceiling = Some(motion.wire_velocity_ceiling());
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
-        self.servo_ws_min_depths = None;
+        self.clear_servo_ws_min_depths_rt();
         let mut target = self.commanded_positions.clone();
         target[gripper_idx] = motion.target;
         self.target_positions = target;
@@ -1760,6 +1816,13 @@ impl SupervisorInner {
             };
             // a macro sub-motion or a replay must not outlive its action
             if (is_macro || is_replay) && carried { self.stop_motion(); }
+            if is_park && self.park_continuation.is_some_and(|c| c.action_id == id) {
+                self.park_continuation = None;
+                self.mit.park_after_hand_back = false;
+                self.mit.deferred_park_off_owner = false;
+                self.abort_park_rearm_transition();
+                self.notify_park_continuation();
+            }
             self.pending_deferred_done = None;
             if self.zero_check_persisting == Some(id) { self.zero_check_persisting = None; }
             let mut message = self.take_action_msg_buf(id, 256);
@@ -1853,17 +1916,29 @@ impl SupervisorInner {
         }
         let superseded = (self.active_trajectory.is_some() && !carried) || self.servo_target.is_some();
         if is_park {
-            if self.mit.deferred_park_action == Some(id) { return; }
+            if self.mit.deferred_park_action == Some(id)
+                || self.park_continuation.is_some_and(|c| c.action_id == id)
+                || self.park_disable_in_flight_for(id)
+            {
+                return;
+            }
             if self.pending_normal_unload {
                 let progress = self.active_trajectory.as_ref().and_then(|a| a.as_quintic()).map_or(1.0, |t| (t.elapsed / t.duration).min(1.0) as f32);
                 if let Some(a) = self.last_action.as_mut() { a.progress = progress; }
-            } else if !self.is_torqued && matches!(self.safety.state(), SafetyState::Idle) {
+            } else if !self.is_torqued
+                && matches!(self.safety.state(), SafetyState::Idle)
+                && !self.disable_pending
+                && !self.park_disable_in_flight()
+            {
                 self.finish_action(id, "done", None, None, None, None, None);
             } else if superseded {
                 self.pending_deferred_done = None;
                 self.finish_action(id, "cancelled", Some("SUPERSEDED"), None, None, None, None);
             } else {
-                self.finish_action(id, "failed", Some("UNLOAD_FAILED"), Some("Park ended with torque still on".into()), None, None, None);
+                let mut msg = self.take_action_msg_buf(id, 64);
+                msg.clear();
+                msg.push_str("Park ended with torque still on");
+                self.finish_action(id, "failed", Some("UNLOAD_FAILED"), Some(msg), None, None, None);
             }
             return;
         }

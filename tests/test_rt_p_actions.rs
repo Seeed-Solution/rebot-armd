@@ -2475,15 +2475,28 @@ fn review_m8_m9_mixed_legacy_child_refused_and_gripper_to_jog_replacement_order(
     jog_start[6] = meas_jaw; // post-quiesce jaw position!
     let mut jog_target = jog_start;
     jog_target[0] += 0.12;
-    let jog_prim = Primitive::JointQuintic {
-        dof: INSPECT.len() as u8,
-        start: jog_start,
-        q: jog_target,
-        duration_s: 0.4,
-    };
     let mut jog_auth = auth(&fx);
     jog_auth.parent_generation = 0;
-    let w_jog = |dst: &mut PlanSlot| dst.set(jog_prim);
+    let mut jog_snap = armd::rt_core::requests::motion::MotionPlanSnapshot::from_supervisor(&fx.core);
+    jog_snap.commanded_positions = jog_start[..INSPECT.len()].to_vec();
+    jog_snap.commanded_velocities[6] = 0.0;
+    jog_snap.authority = armd::rt_core::requests::motion::PlanAuthority {
+        boot: BOOT,
+        epoch: jog_auth.epoch,
+        lease_generation: jog_auth.lease_generation,
+        stop_generation: jog_auth.stop_generation,
+        deadline: dl,
+    };
+    let jog_plan = armd::rt_core::requests::motion::prepare_motion(
+        &jog_snap,
+        &armd::rt_core::requests::motion::MotionRequest::jog(
+            jog_target[..INSPECT.len()].to_vec(),
+            Some(0.4),
+            None,
+        ),
+    )
+    .unwrap();
+    let w_jog = |dst: &mut PlanSlot| armd::rt_core::requests::motion::stage_jog(dst, &jog_plan.slot);
     let r_jog = b
         .submit(ClientId(1), 4, jog_auth, dl, Submit::Install(&w_jog))
         .unwrap();

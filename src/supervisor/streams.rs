@@ -41,6 +41,59 @@ impl SupervisorInner {
     }
 }
 
+/// Copies `src` into `dst`, reusing `vec_spare` for `last_shadow_target` (0 RT alloc/free).
+#[cfg(feature = "policy-runtime")]
+fn copy_policy_obs_with_vec_spare(
+    dst: &mut crate::model::PolicyObservation,
+    src: &crate::model::PolicyObservation,
+    vec_spare: &mut Vec<f32>,
+) {
+    use crate::rt_core::scratch::{copy_into, set_str};
+    dst.active = src.active;
+    dst.action_id = src.action_id;
+    set_str(&mut dst.policy_id, &src.policy_id);
+    set_str(&mut dst.artifact_digest, &src.artifact_digest);
+    set_str(&mut dst.backend, &src.backend);
+    set_str(&mut dst.mode, &src.mode);
+    dst.steps = src.steps;
+    dst.last_input_age_ms = src.last_input_age_ms;
+    dst.last_vision_age_ms = src.last_vision_age_ms;
+    dst.vision_frame_id = src.vision_frame_id;
+    match src.last_shadow_target.as_deref() {
+        Some(v) => match dst.last_shadow_target.as_mut() {
+            Some(d) => copy_into(d, v),
+            None => {
+                let mut buf = std::mem::take(vec_spare);
+                copy_into(&mut buf, v);
+                dst.last_shadow_target = Some(buf);
+            }
+        },
+        None => {
+            if let Some(old) = dst.last_shadow_target.take() {
+                if old.capacity() >= vec_spare.capacity() {
+                    *vec_spare = old;
+                }
+            }
+        }
+    }
+    dst.stop_reason = src.stop_reason;
+}
+
+/// Bounded copy into a preallocated `String` without ever reallocating past `buf.capacity()`.
+#[cfg(feature = "policy-runtime")]
+pub(crate) fn push_str_bounded(buf: &mut String, text: &str) {
+    buf.clear();
+    let cap = buf.capacity();
+    if cap == 0 || text.is_empty() {
+        return;
+    }
+    let mut n = text.len().min(cap);
+    while n > 0 && !text.is_char_boundary(n) {
+        n -= 1;
+    }
+    buf.push_str(&text[..n]);
+}
+
 /// The run's observation into `dst`, reusing its memory.
 #[cfg(feature = "policy-runtime")]
 fn set_policy_obs(dst: &mut Option<crate::model::PolicyObservation>, run: &crate::policy_runtime::PolicyRun) {
@@ -67,8 +120,8 @@ impl SupervisorInner {
         #[cfg(feature = "policy-runtime")]
         if let Some(ref run) = self.policy_run {
             if run.mode == crate::policy_runtime::PolicyMode::Live {
-                if let Some(ref gate) = run.verified_release_gate {
-                    let scale = (gate.max_speed_scale() as f32).clamp(0.1, 1.0);
+                if let Some(scale) = run.release_gate_max_speed_scale() {
+                    let scale = (scale as f32).clamp(0.1, 1.0);
                     for limit in limits.iter_mut() {
                         limit.max_velocity *= scale;
                     }
@@ -83,8 +136,19 @@ impl SupervisorInner {
     pub(super) fn fail_live_policy_from_control(&mut self, reason: &str, message: String) {
         #[cfg(feature = "policy-runtime")]
         if self.policy_run.as_ref().is_some_and(|r| r.mode == crate::policy_runtime::PolicyMode::Live) {
-            tracing::warn!("Policy run ended by the control loop: {reason}: {message}");
+            if !self.rt_executor_owned {
+                tracing::warn!("Policy run ended by the control loop: {reason}: {message}");
+            }
             self.terminate_policy_run(reason, "failed", Some(reason), Some(message));
+        }
+    }
+
+    /// Zero-allocation RT equivalent of [`Self::fail_live_policy_from_control`].
+    #[allow(unused_variables)]
+    pub(super) fn fail_live_policy_from_control_static(&mut self, reason: &'static str, message: &'static str) {
+        #[cfg(feature = "policy-runtime")]
+        if self.policy_run.as_ref().is_some_and(|r| r.mode == crate::policy_runtime::PolicyMode::Live) {
+            self.terminate_policy_run_static(reason, "failed", Some(reason), Some(message));
         }
     }
 
@@ -100,16 +164,29 @@ impl SupervisorInner {
     /// object is not released. A tracking error that persists in this hold latches the
     /// usual tracking Fault (the stream is no longer active).
     pub(super) fn enter_servo_blocked_hold(&mut self, joint: usize, why: &str) {
-        tracing::warn!(
-            "Joint {} blocked during servo streaming ({why}; cmd {:.3} meas {:.3} rad): stream stopped, holding position",
-            joint + 1, self.commanded_positions[joint], self.measured_positions[joint]);
+        if !self.rt_executor_owned {
+            tracing::warn!(
+                "Joint {} blocked during servo streaming ({why}; cmd {:.3} meas {:.3} rad): stream stopped, holding position",
+                joint + 1, self.commanded_positions[joint], self.measured_positions[joint]);
+        }
         #[cfg(feature = "policy-runtime")]
-        self.terminate_policy_run(
-            "BLOCKED_HOLD",
-            "cancelled",
-            Some("BLOCKED_HOLD"),
-            Some(format!("Joint {} blocked during policy streaming: {why}", joint + 1)),
-        );
+        if self.policy_run.is_some() {
+            if self.rt_executor_owned {
+                self.terminate_policy_run_static(
+                    "BLOCKED_HOLD",
+                    "cancelled",
+                    Some("BLOCKED_HOLD"),
+                    Some("Joint blocked during policy streaming"),
+                );
+            } else {
+                self.terminate_policy_run(
+                    "BLOCKED_HOLD",
+                    "cancelled",
+                    Some("BLOCKED_HOLD"),
+                    Some(format!("Joint {} blocked during policy streaming: {why}", joint + 1)),
+                );
+            }
+        }
         self.servo_hold(MotionLimitReason::Blocked, Some(joint));
     }
 
@@ -134,12 +211,21 @@ impl SupervisorInner {
     pub(super) fn enter_servo_keepout_hold_rt(&mut self, f: crate::chain::WorkspaceFailureRt) {
         #[cfg(feature = "policy-runtime")]
         if self.policy_run.is_some() {
-            let msg = if self.rt_executor_owned {
-                None
+            if self.rt_executor_owned {
+                self.terminate_policy_run_static(
+                    "WORKSPACE_HOLD",
+                    "cancelled",
+                    Some("WORKSPACE_HOLD"),
+                    Some("Policy step violated workspace"),
+                );
             } else {
-                Some("Policy step violated workspace".to_string())
-            };
-            self.terminate_policy_run("WORKSPACE_HOLD", "cancelled", Some("WORKSPACE_HOLD"), msg);
+                self.terminate_policy_run(
+                    "WORKSPACE_HOLD",
+                    "cancelled",
+                    Some("WORKSPACE_HOLD"),
+                    Some("Policy step violated workspace".to_string()),
+                );
+            }
         }
         self.servo_hold(MotionLimitReason::Workspace, None);
         if self.motion_limit.as_ref().is_some_and(|m| m.reason == MotionLimitReason::Workspace) {
@@ -513,12 +599,31 @@ impl SupervisorInner {
     /// [`Self::validate_servo_lease`] for the connection of policy run `action_id`, without
     /// copying its connection id.
     #[cfg(feature = "policy-runtime")]
+    #[cfg(feature = "policy-runtime")]
     fn validate_policy_lease(&mut self, action_id: u64, generation: u64) -> bool {
+        self.validate_policy_lease_at(action_id, generation, Instant::now())
+    }
+
+    #[cfg(feature = "policy-runtime")]
+    fn validate_policy_lease_at(&mut self, action_id: u64, generation: u64, now: Instant) -> bool {
         let timeout = self.lease_timeout;
+        let fenced = self.effective_fenced_lease_generation();
+        if self.pending_disconnect_hold.load(Ordering::SeqCst) > 0 {
+            return false;
+        }
+        if self.active_lease_conn_id != 0 && self.is_connection_closed(self.active_lease_conn_id) {
+            return false;
+        }
         let Some(conn) = self.policy_run.as_ref().filter(|r| r.action_id == action_id).map(|r| r.connection_id.as_str()) else { return false; };
         match self.active_lease.as_mut() {
-            Some(active) if active.acquired_at.elapsed() < timeout && active.generation == generation && !conn.is_empty() && active.client_id == conn => {
-                active.last_valid_motion_instant = Some(Instant::now());
+            Some(active)
+                if active.generation > fenced
+                    && now.saturating_duration_since(active.acquired_at) < timeout
+                    && active.generation == generation
+                    && !conn.is_empty()
+                    && active.client_id == conn =>
+            {
+                active.last_valid_motion_instant = Some(now);
                 true
             }
             _ => false,
@@ -727,8 +832,8 @@ impl SupervisorInner {
         j7_gate: crate::supervisor::J7PosForceGate,
         stamp: crate::supervisor::AdmissionStamp,
     ) -> Result<(), SafetyError> {
-        if targets_in.len() > crate::rt_core::mailbox::MAX_DOF { return self.servo_slice_oversized(targets_in.to_vec(), epoch_id); }
-        let mut buf = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
+        if targets_in.len() > crate::model::MAX_MOTION_DOF { return self.servo_slice_oversized(targets_in.to_vec(), epoch_id); }
+        let mut buf = [0.0f32; crate::model::MAX_MOTION_DOF];
         let targets = &mut buf[..targets_in.len()];
         targets.copy_from_slice(targets_in);
         #[cfg(feature = "policy-runtime")]
@@ -1068,8 +1173,15 @@ impl SupervisorInner {
     /// limits. Latch a fault and retain holding torque; normal smoothing does
     /// not apply to this exceptional safety interruption.
     pub(super) fn latch_servo_fault(&mut self, joint_idx: usize) {
-        self.fail_live_policy_from_control("SERVO_INFEASIBLE",
-            format!("Joint {} has an infeasible servo braking state", joint_idx + 1));
+        if self.rt_executor_owned {
+            self.fail_live_policy_from_control_static(
+                "SERVO_INFEASIBLE",
+                "Joint has an infeasible servo braking state",
+            );
+        } else {
+            self.fail_live_policy_from_control("SERVO_INFEASIBLE",
+                format!("Joint {} has an infeasible servo braking state", joint_idx + 1));
+        }
         let limit = &self.config.limits[joint_idx];
         let q = self.commanded_positions[joint_idx];
         let v = self.commanded_velocities[joint_idx];
@@ -1128,9 +1240,58 @@ impl SupervisorInner {
 
     /// [`Self::policy_observation`] into `out`, reusing its memory.
     pub fn policy_observation_into(&self, out: &mut Option<crate::model::PolicyObservation>) {
+        self.policy_observation_into_with_spares(out, None);
+    }
+
+    /// Zero-allocation RT policy observation sync using per-slot [`ObservationSpares`] so
+    /// `None <-> Some(PolicyObservation)` and `last_shadow_target` transitions perform 0 allocs/frees.
+    pub(crate) fn policy_observation_into_with_spares(
+        &self,
+        out: &mut Option<crate::model::PolicyObservation>,
+        spares: Option<&mut crate::rt_core::publish::ObservationSpares>,
+    ) {
+        let (obs_spare, vec_spare) = match spares {
+            Some(s) => (Some(&mut s.policy_obs), Some(&mut s.policy_shadow_vec)),
+            None => (None, None),
+        };
         match &self.policy_run {
-            Some(run) => run.to_observation_into(true, out.get_or_insert_with(Default::default)),
-            None => crate::rt_core::scratch::set_opt(out, self.last_policy_obs.as_ref()),
+            Some(run) => {
+                if out.is_none() {
+                    if let Some(slot) = obs_spare.and_then(Option::take) {
+                        *out = Some(slot);
+                    }
+                }
+                let dst = out.get_or_insert_with(crate::model::PolicyObservation::preallocated_rt);
+                if let Some(vs) = vec_spare {
+                    run.to_observation_into_with_vec_spare(true, dst, vs);
+                } else {
+                    run.to_observation_into(true, dst);
+                }
+            }
+            None => match self.last_policy_obs.as_ref() {
+                Some(src) => {
+                    if out.is_none() {
+                        if let Some(slot) = obs_spare.and_then(Option::take) {
+                            *out = Some(slot);
+                        }
+                    }
+                    let dst = out.get_or_insert_with(crate::model::PolicyObservation::preallocated_rt);
+                    if let Some(vs) = vec_spare {
+                        copy_policy_obs_with_vec_spare(dst, src, vs);
+                    } else {
+                        dst.clone_from(src);
+                    }
+                }
+                None => {
+                    if let Some(old) = out.take() {
+                        if let Some(slot) = obs_spare {
+                            if slot.is_none() {
+                                *slot = Some(old);
+                            }
+                        }
+                    }
+                }
+            },
         }
     }
 
@@ -1148,7 +1309,7 @@ impl SupervisorInner {
 
     /// Zero-allocation, non-blocking equivalent of `self.policy_input_age_range_ms().is_some()`
     /// safe to call on `armd-control`.
-    pub(super) fn has_policy_input_age_range(&self) -> bool {
+    pub(crate) fn has_policy_input_age_range(&self) -> bool {
         if self.config.dof == 0 {
             return false;
         }
@@ -1394,6 +1555,12 @@ impl SupervisorInner {
             max_step_rad: req.max_step_rad,
             i_am_at_the_arm: req.i_am_at_the_arm,
             verified_release_gate: req.verified_release_gate,
+            rt_gate_binding: None,
+            live_target_auth_gen: None,
+            rt_owned: false,
+            load_token: 0,
+            cancel_slot: 0,
+            deadline: None,
             stop_reason: None,
             max_input_age_ms: crate::policy_runtime::max_policy_input_age_ms(crate::policy_runtime::MIN_LIVE_POLICY_FPS),
             step_stats: crate::policy_runtime::PolicyStepStats::default(),
@@ -1454,8 +1621,8 @@ impl SupervisorInner {
     ) -> Result<(), ArmError> {
         use crate::policy_runtime::PolicyMode;
 
-        let mut buf = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
-        let n = targets_in.len().min(crate::rt_core::mailbox::MAX_DOF);
+        let mut buf = [0.0f32; crate::model::MAX_MOTION_DOF];
+        let n = targets_in.len().min(crate::model::MAX_MOTION_DOF);
         buf[..n].copy_from_slice(&targets_in[..n]);
         let targets = &mut buf[..n];
 
@@ -1761,18 +1928,431 @@ impl SupervisorInner {
         Ok(())
     }
 
+    /// Zero-allocation RT policy step intake called from [`Self::consume_policy_target`].
+    /// Enforces full parity with [`Self::policy_step_slice`] (first-step `JUMP_LIMIT`,
+    /// subsequent-step `STEP_LIMIT`, real-arm gate binding, single-sample J7 PosForce gate,
+    /// shared servo validation) with 0 heap allocations and 0 frees.
+    ///
+    /// Two-transition J7 contract:
+    /// - A rejected candidate never installs a new `j7_admitted_stamp`.
+    /// - Terminating or braking the live run clears `j7_admitted_stamp = None` so the single
+    ///   J7 emitter degrades subsequent ticks to `Hold`.
+    /// - An accepted frame stamps `j7_admitted_stamp` ONLY after all checks pass and targets
+    ///   are installed, and ONLY when `!j7_gate.stale && frame_moves_j7(...)`.
+    pub(crate) fn policy_step_slice_rt(
+        &mut self,
+        action_id: u64,
+        frame: &crate::rt_core::mailbox::TargetFrame,
+        input_age_ms: Option<u64>,
+        vision_age_ms: Option<u64>,
+        vision_frame_id: Option<u64>,
+        now: Instant,
+    ) -> Result<(), crate::rt_core::mailbox::Refusal> {
+        use crate::policy_runtime::PolicyMode;
+        use crate::rt_core::mailbox::Refusal;
+
+        let targets_in = frame.positions();
+        let mut buf = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
+        let n = targets_in.len().min(crate::rt_core::mailbox::MAX_DOF);
+        buf[..n].copy_from_slice(&targets_in[..n]);
+        let targets = &mut buf[..n];
+
+        let (epoch_id, lease_gen, mode, max_first, max_step, has_prev_live, max_input_age_ms) = {
+            let Some(active) = self.policy_run.as_ref() else {
+                return Err(Refusal::code("POLICY_NOT_ACTIVE"));
+            };
+            if active.action_id != action_id {
+                return Err(Refusal::code("POLICY_NOT_ACTIVE"));
+            }
+            (
+                active.epoch_id,
+                active.lease_generation,
+                active.mode,
+                active.max_first_step_rad,
+                active.max_step_rad,
+                active.last_live_target.is_some(),
+                active.max_input_age_ms,
+            )
+        };
+
+        if self.estop_pending() || matches!(self.safety.state(), SafetyState::EStop) {
+            self.terminate_policy_run_static("ESTOP", "failed", Some("ESTOP_ACTIVE"), Some("E-stop latched"));
+            return Err(Refusal::code("ESTOP_ACTIVE"));
+        }
+        if epoch_id != self.safety.epoch_id() {
+            self.terminate_policy_run_static(
+                "STOPPED",
+                "cancelled",
+                Some("EPOCH_MISMATCH"),
+                Some("Epoch changed during policy run"),
+            );
+            return Err(Refusal::code("EPOCH_MISMATCH"));
+        }
+        if let SafetyState::Fault(ref r) = self.safety.state() {
+            let reason = if matches!(r, FaultReason::WatchdogTimeout) {
+                "WATCHDOG_TIMEOUT"
+            } else {
+                "FAULT"
+            };
+            self.terminate_policy_run_static(reason, "failed", Some(reason), Some("Fault active during policy run"));
+            return Err(Refusal::code("FAULT_ACTIVE"));
+        }
+        if !self.validate_policy_lease_at(action_id, lease_gen, now) {
+            self.terminate_policy_run_static(
+                "LEASE_LOST",
+                "cancelled",
+                Some("LEASE_LOST"),
+                Some("Control lease lost or expired"),
+            );
+            return Err(Refusal::code("LEASE_LOST"));
+        }
+        if self.servo_blocked_hold {
+            self.terminate_policy_run_static(
+                "BLOCKED_HOLD",
+                "cancelled",
+                Some("BLOCKED_HOLD"),
+                Some("Servo blocked hold active"),
+            );
+            return Err(Refusal::code("BLOCKED_HOLD"));
+        }
+        if targets_in.len() != self.config.dof || targets.iter().any(|v| !v.is_finite()) {
+            self.terminate_policy_run_static(
+                "INVALID_TARGET",
+                "failed",
+                Some("INVALID_TARGET"),
+                Some("Policy produced non-finite or wrong-dimension target"),
+            );
+            return Err(Refusal::code("SAFETY_ERROR"));
+        }
+
+        if mode == PolicyMode::Shadow {
+            let mut shadow_spare = std::mem::take(&mut self.policy_shadow_vec_spare);
+            let mut obs_spare = self.last_policy_obs_spare.take();
+            let mut obs_vec_spare = std::mem::take(&mut self.last_policy_obs_vec_spare);
+            if let Some(run) = self.policy_run.as_mut().filter(|r| r.action_id == action_id) {
+                run.steps += 1;
+                run.last_input_age_ms = input_age_ms;
+                run.last_vision_age_ms = vision_age_ms;
+                run.vision_frame_id = vision_frame_id;
+                match run.last_shadow_target.as_mut() {
+                    Some(v) => copy_into(v, targets),
+                    None => {
+                        copy_into(&mut shadow_spare, targets);
+                        run.last_shadow_target = Some(std::mem::take(&mut shadow_spare));
+                    }
+                }
+                if self.last_policy_obs.is_none() {
+                    self.last_policy_obs = obs_spare.take();
+                }
+                let dst = self.last_policy_obs.get_or_insert_with(crate::model::PolicyObservation::preallocated_rt);
+                run.to_observation_into_with_vec_spare(true, dst, &mut obs_vec_spare);
+            }
+            if shadow_spare.capacity() > self.policy_shadow_vec_spare.capacity() {
+                self.policy_shadow_vec_spare = shadow_spare;
+            }
+            if obs_spare.is_some() && self.last_policy_obs_spare.is_none() {
+                self.last_policy_obs_spare = obs_spare;
+            }
+            self.last_policy_obs_vec_spare = obs_vec_spare;
+            return Ok(());
+        }
+
+        // Live mode checks: release-gate calibration binding, real-arm gate, stale joint input,
+        // first-step and per-step jump limits, single-sample J7 gate, and shared servo validation.
+        let gate_calib_mismatch = self
+            .policy_run
+            .as_ref()
+            .filter(|r| r.action_id == action_id)
+            .and_then(|r| r.gate_calibration_digest())
+            .is_some_and(|d| !d.eq_ignore_ascii_case(self.active_calibration_digest_str()));
+        if gate_calib_mismatch {
+            self.terminate_policy_run_static(
+                "DEPLOYMENT_CHANGED",
+                "failed",
+                Some("DEPLOYMENT_CHANGED"),
+                Some("Active calibration digest changed during live policy run"),
+            );
+            return Err(Refusal::code("DEPLOYMENT_CHANGED"));
+        }
+        if !self.policy_live_allowed() {
+            let (has_confirm, has_gate) = self.policy_run.as_ref().map_or((false, false), |run| {
+                (
+                    run.i_am_at_the_arm,
+                    !run.artifact_digest.is_empty()
+                        && run
+                            .gate_policy_sha256()
+                            .is_some_and(|sha| sha.eq_ignore_ascii_case(&run.artifact_digest)),
+                )
+            });
+            if !has_confirm {
+                self.terminate_policy_run_static(
+                    "OPERATOR_CONFIRMATION_REQUIRED",
+                    "failed",
+                    Some("OPERATOR_CONFIRMATION_REQUIRED"),
+                    Some("Real-arm live policy execution requires operator confirmation"),
+                );
+                return Err(Refusal::code("OPERATOR_CONFIRMATION_REQUIRED"));
+            }
+            if !has_gate {
+                self.terminate_policy_run_static(
+                    "RELEASE_GATE_REQUIRED",
+                    "failed",
+                    Some("RELEASE_GATE_REQUIRED"),
+                    Some("Real-arm live policy execution requires a verified release gate"),
+                );
+                return Err(Refusal::code("RELEASE_GATE_REQUIRED"));
+            }
+            if !self.feedback_numeric_valid
+                || !self.rt_driver_feedback_confirmed()
+                || !self.has_policy_input_age_range()
+            {
+                self.terminate_policy_run_static(
+                    "FEEDBACK_UNCONFIRMED",
+                    "failed",
+                    Some("FEEDBACK_UNCONFIRMED"),
+                    Some("Hardware feedback is unconfirmed during live policy step"),
+                );
+                return Err(Refusal::code("FEEDBACK_UNCONFIRMED"));
+            }
+        }
+
+        let input_stale = match input_age_ms {
+            Some(age) => age > max_input_age_ms,
+            None => !self.policy_live_allowed(),
+        };
+        if input_stale {
+            self.terminate_policy_run_static(
+                "STALE_INPUT",
+                "failed",
+                Some("STALE_INPUT"),
+                Some("Live policy target computed from stale joint positions"),
+            );
+            return Err(Refusal::code("STALE_INPUT"));
+        }
+
+        if !has_prev_live {
+            if self.measured_positions.len() != self.config.dof
+                || self.measured_positions.iter().any(|m| !m.is_finite())
+            {
+                self.terminate_policy_run_static(
+                    "INVALID_FEEDBACK",
+                    "failed",
+                    Some("INVALID_FEEDBACK"),
+                    Some("Measured joint positions are invalid on first live policy step"),
+                );
+                return Err(Refusal::code("SAFETY_ERROR"));
+            }
+            for i in 0..self.config.dof {
+                if (targets[i] - self.measured_positions[i]).abs() > max_first {
+                    self.terminate_policy_run_static(
+                        "JUMP_LIMIT",
+                        "failed",
+                        Some("JUMP_LIMIT"),
+                        Some("First live policy step exceeds max_first_step_rad"),
+                    );
+                    return Err(Refusal::code("JUMP_LIMIT"));
+                }
+            }
+        } else if let Some(step_cap) = max_step {
+            let dof = self.config.dof;
+            let violated = self
+                .policy_run
+                .as_ref()
+                .and_then(|r| r.last_live_target.as_deref())
+                .is_some_and(|prev| {
+                    (0..dof).any(|i| (targets[i] - prev[i]).abs() > step_cap)
+                });
+            if violated {
+                self.terminate_policy_run_static(
+                    "STEP_LIMIT",
+                    "failed",
+                    Some("STEP_LIMIT"),
+                    Some("Live policy step exceeds max_step_rad"),
+                );
+                return Err(Refusal::code("STEP_LIMIT"));
+            }
+        }
+
+        let (prev_cmd_j7, prev_tgt_j7) = self
+            .config
+            .gripper_index()
+            .map(|g| {
+                (
+                    self.commanded_positions.get(g).copied().unwrap_or(0.0),
+                    self.target_positions.get(g).copied().unwrap_or(0.0),
+                )
+            })
+            .unwrap_or((0.0, 0.0));
+        let j7_gate = self.sample_pos_force_j7_gate();
+        if self.config.gripper_index().is_some() && j7_gate.stale {
+            self.terminate_policy_run_static(
+                "J7_FEEDBACK_STALE",
+                "failed",
+                Some("J7_FEEDBACK_STALE"),
+                Some("Gripper (J7) position-force feedback is stale (> 100 ms)"),
+            );
+            return Err(Refusal::code("J7_FEEDBACK_STALE"));
+        }
+
+        if let Err(refusal) = self.validate_and_filter_servo_targets_rt(targets, epoch_id, j7_gate) {
+            let (reason, state, code, msg) = match refusal.code {
+                "ESTOP_ACTIVE" => ("ESTOP", "failed", "ESTOP_ACTIVE", "E-stop latched"),
+                "FAULT_ACTIVE" => ("FAULT", "failed", "FAULT_ACTIVE", "Fault active during policy step"),
+                "COLLISION_HOLD" => ("COLLISION_HOLD", "cancelled", "COLLISION_HOLD", "Collision hold active"),
+                "SOFT_LIMIT_EXCEEDED" => ("SOFT_LIMIT_EXCEEDED", "failed", "SOFT_LIMIT_EXCEEDED", "Policy target exceeded joint soft limits"),
+                "WORKSPACE_VIOLATION" => ("WORKSPACE_VIOLATION", "failed", "WORKSPACE_VIOLATION", "Policy target violated workspace bounds"),
+                "NOT_ARMED" => ("NOT_ARMED", "failed", "NOT_ARMED", "Arm is not armed"),
+                "COMMISSIONING_REQUIRED" => ("COMMISSIONING_REQUIRED", "failed", "COMMISSIONING_REQUIRED", "Tool commissioning required"),
+                _ => ("SAFETY_REJECTED", "failed", "SAFETY_ERROR", "Policy target rejected by safety filter"),
+            };
+            self.terminate_policy_run_static(reason, state, Some(code), Some(msg));
+            return Err(refusal);
+        }
+
+        // All checks passed: install live target, update run state using preallocated spares,
+        // and stamp `j7_admitted_stamp` ONLY when this accepted fresh frame moves J7.
+        self.last_motion_frame = now;
+        self.release_gripper_stall_on_reverse_with_gate(targets, j7_gate);
+        let _ = self.safety.mark_motion_started();
+
+        copy_into(&mut self.target_positions, targets);
+        self.set_servo_target(targets);
+        self.servo_stream_active = true;
+        self.servo_settled_ticks.fill(0);
+
+        let mut live_spare = std::mem::take(&mut self.policy_live_vec_spare);
+        let mut shadow_spare = std::mem::take(&mut self.policy_shadow_vec_spare);
+        let mut obs_spare = self.last_policy_obs_spare.take();
+        let mut obs_vec_spare = std::mem::take(&mut self.last_policy_obs_vec_spare);
+        if let Some(run) = self.policy_run.as_mut().filter(|r| r.action_id == action_id) {
+            run.steps += 1;
+            run.last_input_age_ms = input_age_ms;
+            run.last_vision_age_ms = vision_age_ms;
+            run.vision_frame_id = vision_frame_id;
+            run.live_target_auth_gen = Some(frame.policy_generation);
+            match run.last_live_target.as_mut() {
+                Some(v) => copy_into(v, targets),
+                None => {
+                    copy_into(&mut live_spare, targets);
+                    run.last_live_target = Some(std::mem::take(&mut live_spare));
+                }
+            }
+            match run.last_shadow_target.as_mut() {
+                Some(v) => copy_into(v, targets),
+                None => {
+                    copy_into(&mut shadow_spare, targets);
+                    run.last_shadow_target = Some(std::mem::take(&mut shadow_spare));
+                }
+            }
+            if self.last_policy_obs.is_none() {
+                self.last_policy_obs = obs_spare.take();
+            }
+            let dst = self.last_policy_obs.get_or_insert_with(crate::model::PolicyObservation::preallocated_rt);
+            run.to_observation_into_with_vec_spare(true, dst, &mut obs_vec_spare);
+        }
+        if live_spare.capacity() > self.policy_live_vec_spare.capacity() {
+            self.policy_live_vec_spare = live_spare;
+        }
+        if shadow_spare.capacity() > self.policy_shadow_vec_spare.capacity() {
+            self.policy_shadow_vec_spare = shadow_spare;
+        }
+        if obs_spare.is_some() && self.last_policy_obs_spare.is_none() {
+            self.last_policy_obs_spare = obs_spare;
+        }
+        self.last_policy_obs_vec_spare = obs_vec_spare;
+
+        if !j7_gate.stale && self.frame_moves_j7(targets, prev_cmd_j7, prev_tgt_j7) {
+            self.j7_admitted_stamp = Some(crate::driver::PosForceIntentStamp {
+                stop_gen: frame.authority.stop_generation,
+                estop_epoch: frame.authority.epoch,
+                lease_gen: frame.authority.lease_generation,
+            });
+        }
+        Ok(())
+    }
+
+    /// Drops the live policy's `servo_target`, recycles target buffers, clears
+    /// `live_target_auth_gen` and `j7_admitted_stamp`, and snaps `target_positions` to
+    /// `commanded_positions` with 0 allocs and 0 frees, WITHOUT bumping `run.authorization`
+    /// (used at Step 4 `POLICY_REVOKED` and Step 5 output-boundary recheck so a newer already-
+    /// bumped generation `G + 1` is not spuriously double-revoked).
+    pub(crate) fn brake_live_policy_in_place(&mut self, action_id: u64) {
+        let Some(run) = self
+            .policy_run
+            .as_mut()
+            .filter(|r| r.action_id == action_id && r.mode == crate::policy_runtime::PolicyMode::Live)
+        else {
+            return;
+        };
+        let reclaimed_live = run.last_live_target.take();
+        run.live_target_auth_gen = None;
+        if let Some(mut v) = reclaimed_live {
+            if v.capacity() > 0 {
+                v.clear();
+                if self.policy_live_vec_spare.capacity() == 0 {
+                    self.policy_live_vec_spare = v;
+                } else if let Some(spare) = self
+                    .policy_run_spare
+                    .as_mut()
+                    .filter(|s| s.last_live_target.is_none())
+                {
+                    spare.last_live_target = Some(v);
+                }
+            }
+        }
+        self.release_servo_target();
+        self.servo_settled_ticks.fill(0);
+        self.clear_servo_ws_min_depths_rt();
+        self.gripper_stream_target = None;
+        self.gripper_stream_contact = None;
+        self.gripper_stream_contact_detector.reset();
+        self.gripper_stream_lease = None;
+        self.j7_admitted_stamp = None;
+        copy_into(&mut self.target_positions, &self.commanded_positions);
+    }
+
+    /// Zero-allocation Step-5 output-boundary deadline and revocation recheck: if `run.deadline`
+    /// (`max_seconds`) elapsed, terminates cleanly as `MAX_SECONDS` (`done`); otherwise if
+    /// `PolicyAuthorization` changed after the installed live target was accepted, immediately
+    /// drops both `servo_target` and policy-owned `gripper_stream_*` state before any J1-J7
+    /// output advances.
+    #[inline]
+    pub(crate) fn enforce_policy_deadline_and_auth_rt(&mut self, now: Instant) {
+        if self
+            .policy_run
+            .as_ref()
+            .is_some_and(|r| r.rt_owned && r.deadline.is_some_and(|dl| now >= dl))
+        {
+            self.terminate_policy_run_static("MAX_SECONDS", "done", None, None);
+            return;
+        }
+        self.recheck_live_policy_authorization_rt();
+    }
+
+    #[inline]
+    pub(crate) fn recheck_live_policy_authorization_rt(&mut self) {
+        if let Some(aid) = self
+            .policy_run
+            .as_ref()
+            .filter(|r| {
+                r.mode == crate::policy_runtime::PolicyMode::Live
+                    && r.live_target_auth_gen
+                        .is_some_and(|g| r.authorization.current() != g)
+            })
+            .map(|r| r.action_id)
+        {
+            self.brake_live_policy_in_place(aid);
+        }
+    }
+
     /// Vision hold of a live run: drop its servo target so the control loop brakes now
     /// (instead of tracking the last target until the motion-frame timeout). The next target
     /// is checked against the measured pose with the first-step limit.
     pub fn hold_policy_run(&mut self, action_id: u64) {
-        let Some(run) = self.policy_run.as_mut().filter(|r| r.action_id == action_id && r.mode == crate::policy_runtime::PolicyMode::Live) else { return; };
+        let Some(run) = self.policy_run.as_ref().filter(|r| r.action_id == action_id && r.mode == crate::policy_runtime::PolicyMode::Live) else { return; };
         // a target computed before the hold and still waiting in the mailbox is not applied
         run.authorization.revoke();
-        run.last_live_target = None;
-        self.servo_target = None;
-        self.servo_settled_ticks.fill(0);
-        self.servo_ws_min_depths = None;
-        self.target_positions = self.commanded_positions.clone();
+        self.brake_live_policy_in_place(action_id);
     }
 
     /// Set the run's [`crate::policy_runtime::max_policy_input_age_ms`] bound.
@@ -1882,7 +2462,7 @@ impl SupervisorInner {
     }
 
     /// Zero-allocation termination helper for static messages on `armd-control`: fills a
-    /// preallocated `action_msg_spares` buffer and terminates without heap allocation or free.
+    /// preallocated `action_msg_spares` buffer (bounded, 0 reallocs) and terminates with 0 alloc/free.
     pub(crate) fn terminate_policy_run_static(
         &mut self,
         stop_reason: &'static str,
@@ -1895,33 +2475,131 @@ impl SupervisorInner {
         };
         let msg = action_message.map(|text| {
             let mut buf = self.take_action_msg_buf(action_id, 256);
-            buf.clear();
-            buf.push_str(text);
+            push_str_bounded(&mut buf, text);
             buf
         });
-        self.terminate_policy_run(stop_reason, action_state, action_code, msg);
+        self.terminate_policy_run_with_stats(stop_reason, action_state, action_code, msg, None);
     }
 
-    pub(crate) fn terminate_policy_run(
+    /// Executor-only zero-alloc teardown shared by termination (`reset_hold_target = true`) and
+    /// supersession (`reset_hold_target = false`). Never allocates, never frees, seals diagnostics
+    /// BEFORE Step 6 publish, and queues post-publication stream close.
+    pub(crate) fn teardown_rt_policy_run(
+        &mut self,
+        mut run: crate::policy_runtime::PolicyRun,
+        stop_reason: &str,
+        reset_hold_target: bool,
+        now: Instant,
+    ) {
+        if run.rt_owned {
+            run.authorization.unbind_action(run.action_id);
+        } else {
+            run.authorization.revoke();
+        }
+        self.atomic_diag_sealed_policy_action_id
+            .fetch_max(run.action_id, Ordering::Release);
+        self.record_pending_policy_close(run.action_id);
+        if run.mode == crate::policy_runtime::PolicyMode::Live {
+            self.release_servo_target();
+            self.servo_settled_ticks.fill(0);
+            self.clear_servo_ws_min_depths_rt();
+            self.gripper_stream_target = None;
+            self.gripper_stream_contact = None;
+            self.gripper_stream_contact_detector.reset();
+            self.gripper_stream_lease = None;
+            if reset_hold_target {
+                self.j7_admitted_stamp = None;
+                copy_into(&mut self.target_positions, &self.commanded_positions);
+            }
+        }
+        if self.last_policy_obs.is_none() {
+            self.last_policy_obs = self.last_policy_obs_spare.take();
+        }
+        let dst = self
+            .last_policy_obs
+            .get_or_insert_with(crate::model::PolicyObservation::preallocated_rt);
+        run.to_observation_into_with_vec_spare(false, dst, &mut self.last_policy_obs_vec_spare);
+        dst.stop_reason = Some(crate::model::HolderLabel::new(stop_reason));
+
+        run.live_target_auth_gen = None;
+        run.rt_gate_binding = None;
+        run.load_token = 0;
+        run.cancel_slot = 0;
+        run.deadline = None;
+        #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+        self.policy_cancel_slots.set_active_run_token(0);
+        if run.rt_owned && self.policy_run_spare.is_none() {
+            if self.policy_live_vec_spare.capacity() == 0 {
+                if let Some(mut v) = run.last_live_target.take() {
+                    v.clear();
+                    self.policy_live_vec_spare = v;
+                }
+            }
+            if self.policy_shadow_vec_spare.capacity() == 0 {
+                if let Some(mut v) = run.last_shadow_target.take() {
+                    v.clear();
+                    self.policy_shadow_vec_spare = v;
+                }
+            }
+            self.policy_run_spare = Some(run);
+        } else {
+            // Leave heap target buffers attached to `run` so `retire_policy_run` frees them
+            // off-thread with 0 frees on `armd-control`.
+            self.retire_policy_run(run);
+        }
+        self.reconcile_target_stream_authority(now);
+    }
+
+    pub(crate) fn terminate_policy_run_with_stats(
         &mut self,
         stop_reason: &str,
         action_state: &str,
         action_code: Option<&str>,
         action_message: Option<String>,
+        final_stats: Option<crate::motion::PolicyStats>,
     ) {
         let Some(mut run) = self.policy_run.take() else {
             return;
         };
-        self.end_policy_stream(run.action_id);
-        self.set_action_policy_stats(run.action_id, run.step_stats.report());
-        if !self.rt_executor_owned {
-            run.stop_reason = Some(stop_reason.to_string());
-            self.record_policy_qualification(&run, stop_reason, action_state);
+        let action_id = run.action_id;
+        if self.rt_executor_owned {
+            let final_steps = run.steps;
+            // Only write `policy_stats` when explicitly supplied (e.g. `EndPolicy::{Finish, Fail}`);
+            // leave `None` on RT-initiated termination so `StateHub` attaches the frozen runner stats.
+            if let Some(stats) = final_stats {
+                self.set_action_policy_stats(action_id, stats);
+            }
+            self.teardown_rt_policy_run(run, stop_reason, true, Instant::now());
+            self.finish_action(
+                action_id,
+                action_state,
+                action_code,
+                action_message,
+                None,
+                None,
+                None,
+            );
+            #[cfg(not(target_arch = "wasm32"))]
+            self.push_rt_policy_terminal(
+                action_id,
+                final_steps,
+                stop_reason,
+                action_state,
+                final_stats.unwrap_or_default(),
+            );
+            return;
         }
+        run.authorization.revoke();
+        self.record_pending_policy_close(action_id);
+        self.end_policy_stream(action_id);
+        self.set_action_policy_stats(action_id, final_stats.unwrap_or_else(|| run.step_stats.report()));
+        run.stop_reason = Some(stop_reason.to_string());
+        self.record_policy_qualification(&run, stop_reason, action_state);
         if run.mode == crate::policy_runtime::PolicyMode::Live {
             self.release_servo_target();
             self.servo_settled_ticks.fill(0);
             self.clear_servo_ws_min_depths_rt();
+            self.j7_admitted_stamp = None;
             copy_into(&mut self.target_positions, &self.commanded_positions);
         }
         if let Some(obs) = self.last_policy_obs.as_mut() {
@@ -1932,7 +2610,6 @@ impl SupervisorInner {
             obs.stop_reason = Some(crate::model::HolderLabel::new(stop_reason));
             self.last_policy_obs = Some(obs);
         }
-        let action_id = run.action_id;
         self.finish_action(
             action_id,
             action_state,
@@ -1943,6 +2620,16 @@ impl SupervisorInner {
             None,
         );
         self.retire_policy_run(run);
+    }
+
+    pub(crate) fn terminate_policy_run(
+        &mut self,
+        stop_reason: &str,
+        action_state: &str,
+        action_code: Option<&str>,
+        action_message: Option<String>,
+    ) {
+        self.terminate_policy_run_with_stats(stop_reason, action_state, action_code, action_message, None);
     }
 }
 
@@ -2176,6 +2863,10 @@ pub mod targets {
         closed_servo_gen: u64,
         /// Non-zero servo lease generations currently open in `writer` (bounded by `MAX_STREAMS`).
         open_servo_gens: Vec<u64>,
+        /// Monotonic high-water mark of closed policy action IDs: durable late-submission fence.
+        closed_policy_action_id: u64,
+        /// Non-zero policy action IDs currently open in `writer` (bounded by `MAX_STREAMS`).
+        open_policy_actions: Vec<u64>,
     }
 
     impl TargetPort {
@@ -2187,6 +2878,8 @@ pub mod targets {
                 seq: 0,
                 closed_servo_gen: 0,
                 open_servo_gens: Vec::with_capacity(crate::rt_core::mailbox::MAX_STREAMS),
+                closed_policy_action_id: 0,
+                open_policy_actions: Vec::with_capacity(crate::rt_core::mailbox::MAX_STREAMS),
             }
         }
 
@@ -2202,6 +2895,14 @@ pub mod targets {
         /// True when `lease_generation` (non-zero) has been closed via [`Self::close_servo`].
         pub fn is_servo_closed(&self, lease_generation: u64) -> bool {
             lease_generation != 0 && lease_generation <= self.closed_servo_gen
+        }
+
+        /// Highest policy action ID permanently closed on this port (0 if none closed yet).
+        pub fn closed_policy_action_id(&self) -> u64 { self.closed_policy_action_id }
+
+        /// True when `action_id` (non-zero) has been closed via [`Self::close_policy`].
+        pub fn is_policy_closed(&self, action_id: u64) -> bool {
+            action_id != 0 && action_id <= self.closed_policy_action_id
         }
 
         /// Underlying target writer (for low-level mailbox access / tests).
@@ -2234,8 +2935,25 @@ pub mod targets {
             });
         }
 
-        /// Policy run `action_id` ended: forget its stream.
-        pub fn close_policy(&mut self, action_id: u64) { self.writer.close_stream(policy_stream(action_id)); }
+        /// Policy run `action_id` ended: forget its stream (and any older open policy streams)
+        /// and fence late submissions for `<= action_id`.
+        pub fn close_policy(&mut self, action_id: u64) {
+            if action_id == 0 {
+                return;
+            }
+            self.closed_policy_action_id = self.closed_policy_action_id.max(action_id);
+            self.writer.close_stream(policy_stream(action_id));
+            let closed = self.closed_policy_action_id;
+            let writer = &mut self.writer;
+            self.open_policy_actions.retain(|&id| {
+                if id <= closed {
+                    writer.close_stream(policy_stream(id));
+                    false
+                } else {
+                    true
+                }
+            });
+        }
 
         #[allow(clippy::too_many_arguments)]
         fn frame(&mut self, stream: StreamId, authority: Authority, policy_generation: u64, q: &[f32], input_at: Instant,
@@ -2284,13 +3002,39 @@ pub mod targets {
 
         /// Submits one policy target (not replaceable; deadline: input time + twice the run's
         /// input age bound). `Busy`: the previous target was not consumed yet; the runner counts the
-        /// step as skipped.
+        /// step as skipped. Rejects late submissions for closed action IDs immediately off-thread.
         pub fn submit_policy(&mut self, t: &PolicyTarget<'_>) -> Submitted {
+            self.submit_policy_with_validity(
+                t,
+                crate::rt_core::mailbox::PolicyValidityBounds::default(),
+            )
+        }
+
+        /// Submits one policy target together with atomic [`PolicyValidityBounds`] (tracking both
+        /// `Accepted` and `Coalesced` publications so policy streams that overwrite an unconsumed
+        /// replaceable servo frame are never left untracked).
+        pub fn submit_policy_with_validity(
+            &mut self,
+            t: &PolicyTarget<'_>,
+            validity: crate::rt_core::mailbox::PolicyValidityBounds,
+        ) -> Submitted {
+            if self.is_policy_closed(t.action_id) {
+                return Submitted::OutOfOrder;
+            }
             // after the input age bound, so an aged input ends the run as `STALE_INPUT`
             let deadline = t.input_at + 2 * t.stamp.max_input_age;
             match self.frame(policy_stream(t.action_id), t.stamp.authority, t.stamp.authorization.max(1), t.targets, t.input_at,
                 t.vision_at, t.vision_frame_id, deadline, false) {
-                Some(frame) => self.writer.submit(frame),
+                Some(frame) => {
+                    let sub = self.writer.submit_with_validity(frame, validity);
+                    if matches!(sub, Submitted::Accepted | Submitted::Coalesced { .. })
+                        && t.action_id != 0
+                        && !self.open_policy_actions.contains(&t.action_id)
+                    {
+                        self.open_policy_actions.push(t.action_id);
+                    }
+                    sub
+                }
                 None => Submitted::Busy,
             }
         }
@@ -2321,20 +3065,70 @@ pub mod targets {
             Ok(())
         }
 
+        /// Single centralized owner target-stream authority selector (Live policy stream, Shadow /
+        /// loading revoked stream, or valid current-lease-only servo stream). Fails closed
+        /// whenever no valid unfenced open lease exists or admission refuses.
+        pub(crate) fn reconcile_target_stream_authority(&mut self, now: Instant) {
+            #[cfg(feature = "policy-runtime")]
+            if let Some(run) = self.policy_run.as_ref() {
+                if run.mode == crate::policy_runtime::PolicyMode::Live || !run.rt_owned {
+                    let input_known = self.has_policy_input_age_range();
+                    let run = self.policy_run.as_ref().expect("checked");
+                    self.core.authorize_stream(TargetAuthority {
+                        stream: Some(policy_stream(run.action_id)),
+                        policy_generation: run.authorization.current(),
+                        max_input_age: input_known.then(|| Duration::from_millis(run.max_input_age_ms)),
+                        max_vision_age: run.max_vision_age_ms.map(Duration::from_millis),
+                    });
+                } else {
+                    // Executor Shadow run: zero mailbox authority; servo frames still get MOTION_BUSY.
+                    self.core.revoke_stream();
+                }
+                return;
+            }
+            #[cfg(feature = "policy-runtime")]
+            if self.policy_loading {
+                self.core.revoke_stream();
+                return;
+            }
+            let g = if self.pending_disconnect_hold.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                0
+            } else {
+                self.active_lease_gen_at(now)
+            };
+            if g == 0 {
+                self.core.revoke_stream();
+                return;
+            }
+            let stamp = crate::supervisor::AdmissionStamp::for_rt_internal(
+                self.current_stop_gen(),
+                self.safety.epoch_id(),
+                g,
+            );
+            match self.check_admission(stamp) {
+                Ok(admitted) => {
+                    if Self::authorize_servo_stream(admitted, g).is_err() {
+                        self.core.revoke_stream();
+                    }
+                }
+                Err(_) => {
+                    self.core.revoke_stream();
+                }
+            }
+        }
+
         /// Authorizes the committed lease generation's servo stream through
         /// [`Self::authorize_servo_stream`] (zero allocations, zero locks), preserving any active
-        /// policy stream. Fails closed (revokes the stream) if admission cannot currently pass
-        /// (for example while E-stop is latched; restored automatically on `clear_fault`).
+        /// policy run (Live or Shadow) or active load reservation. Fails closed (revokes the
+        /// stream) if admission cannot currently pass.
         pub(crate) fn authorize_servo_stream_for_committed_lease(&mut self, lease_generation: u64) {
             if lease_generation == 0 {
                 self.core.revoke_stream();
                 return;
             }
             #[cfg(feature = "policy-runtime")]
-            if let Some(run) = self.policy_run.as_ref() {
-                if self.core.target_authority().stream == Some(policy_stream(run.action_id)) {
-                    return;
-                }
+            if self.policy_run.is_some() || self.policy_loading {
+                return;
             }
             let stamp = crate::supervisor::AdmissionStamp::for_rt_internal(
                 self.current_stop_gen(),
@@ -2353,26 +3147,15 @@ pub mod targets {
             }
         }
 
-        /// After a policy run of `action_id`: hand the targets back to the lease holder's
-        /// servo stream (none without a lease or under E-stop) when the run's stream was authorized.
+        /// After a policy run of `action_id`: restore the valid current lease holder's servo
+        /// stream (revoking when lease was lost, expired, fenced, or disconnected, or under E-stop).
         #[cfg(feature = "policy-runtime")]
         pub(in crate::supervisor) fn end_policy_stream(&mut self, action_id: u64) {
-            if self.core.target_authority().stream != Some(policy_stream(action_id)) { return; }
-            match self.active_lease.as_ref().map(|l| l.generation) {
-                Some(g) => {
-                    let stamp = crate::supervisor::AdmissionStamp::for_rt_internal(
-                        self.current_stop_gen(),
-                        self.safety.epoch_id(),
-                        g,
-                    );
-                    if let Ok(admitted) = self.check_admission(stamp) {
-                        let _ = Self::authorize_servo_stream(admitted, g);
-                    } else {
-                        self.core.revoke_stream();
-                    }
-                }
-                None => self.core.revoke_stream(),
+            let was_authorized = self.core.target_authority().stream == Some(policy_stream(action_id));
+            if !was_authorized && self.core.target_authority().stream.is_some() {
+                return;
             }
+            self.reconcile_target_stream_authority(Instant::now());
         }
 
         /// The stamp of run `action_id`'s next target (None: no such run).
@@ -2418,12 +3201,38 @@ pub mod targets {
         /// Applies one target from the latest-target mailbox after rechecking it (see the
         /// module doc) at the release `ctx` (its urgent-stop generation and clock).
         pub fn consume_target_frame(&mut self, frame: &TargetFrame, ctx: &CommitCtx) -> Result<(), Refusal> {
+            self.consume_target_frame_with_validity(
+                frame,
+                crate::rt_core::mailbox::PolicyValidityBounds::default(),
+                ctx,
+            )
+        }
+
+        /// Applies one target together with its atomic [`PolicyValidityBounds`] at `ctx`.
+        pub fn consume_target_frame_with_validity(
+            &mut self,
+            frame: &TargetFrame,
+            validity: crate::rt_core::mailbox::PolicyValidityBounds,
+            ctx: &CommitCtx,
+        ) -> Result<(), Refusal> {
             #[cfg(feature = "policy-runtime")]
             self.sync_policy_target_authority();
             // a target is checked against the active workspace when applied; it carries no plan revision
             let current = Authority { config_revision: frame.authority.config_revision, ..CoreOps::authority(self, ctx) };
             let policy = frame.policy_generation != 0;
-            if let Some(code) = frame.check(ctx.arm, ctx.boot, ctx.now, &current, &self.core.target_authority()) {
+            let check_res = if policy {
+                frame.check_policy_with_validity(
+                    ctx.arm,
+                    ctx.boot,
+                    ctx.now,
+                    &current,
+                    &self.core.target_authority(),
+                    validity,
+                )
+            } else {
+                frame.check(ctx.arm, ctx.boot, ctx.now, &current, &self.core.target_authority())
+            };
+            if let Some(code) = check_res {
                 if policy { self.policy_target_refused(code, frame); }
                 // a servo frame while a policy run owns the targets: the legacy MOTION_BUSY
                 #[cfg(feature = "policy-runtime")]
@@ -2450,27 +3259,49 @@ pub mod targets {
         fn policy_target_refused(&mut self, _code: &str, _frame: &TargetFrame) {}
 
         /// A target of the active run was refused by the consumption check: hold or end the
-        /// run where the legacy commit holds or ends it.
+        /// run where the legacy commit holds or ends it (zero heap allocations / frees on RT).
         #[cfg(feature = "policy-runtime")]
         fn policy_target_refused(&mut self, code: &str, frame: &TargetFrame) {
             let Some(run) = self.policy_run.as_ref().filter(|r| frame.stream == policy_stream(r.action_id)) else { return; };
             let (action_id, hold_on_stale) = (run.action_id, run.vision_stale_hold);
             match code {
-                // revoked after the target was computed (vision hold or invalidation) or too late: brake now
-                "POLICY_REVOKED" | "DEADLINE_EXPIRED" => self.hold_policy_run(action_id),
+                // revoked after the target was computed (vision hold or invalidation): brake now
+                // without double-revoking the newer generation.
+                "POLICY_REVOKED" => self.brake_live_policy_in_place(action_id),
+                "DEADLINE_EXPIRED" => self.hold_policy_run(action_id),
+                "HANDSHAKE_EXPIRED" => self.terminate_policy_run_static(
+                    "HANDSHAKE_EXPIRED",
+                    "failed",
+                    Some("HANDSHAKE_EXPIRED"),
+                    Some("Vision clock handshake expired before the target was applied"),
+                ),
                 "VISION_STALE" if hold_on_stale => self.hold_policy_run(action_id),
-                "VISION_STALE" => { self.fail_policy_run(action_id, "VISION_STALE", "Vision sample became stale before the target was applied"); }
-                "INPUT_STALE" => self.terminate_policy_run("STALE_INPUT", "failed", Some("STALE_INPUT"),
-                    Some("Live policy target computed from stale joint positions (aged while buffered)".into())),
-                "LEASE_LOST" => self.terminate_policy_run("LEASE_LOST", "cancelled", Some("LEASE_LOST"), Some("Control lease lost or expired".into())),
+                "VISION_STALE" => self.terminate_policy_run_static(
+                    "VISION_STALE",
+                    "failed",
+                    Some("VISION_STALE"),
+                    Some("Vision sample became stale before the target was applied"),
+                ),
+                "INPUT_STALE" => self.terminate_policy_run_static(
+                    "STALE_INPUT",
+                    "failed",
+                    Some("STALE_INPUT"),
+                    Some("Live policy target computed from stale joint positions (aged while buffered)"),
+                ),
+                "LEASE_LOST" => self.terminate_policy_run_static(
+                    "LEASE_LOST",
+                    "cancelled",
+                    Some("LEASE_LOST"),
+                    Some("Control lease lost or expired"),
+                ),
                 "EPOCH_MISMATCH" => {
                     if self.estop_pending() || matches!(self.safety.state(), SafetyState::EStop) {
-                        self.terminate_policy_run("ESTOP", "failed", Some("ESTOP_ACTIVE"), Some("E-stop latched".into()));
-                    } else if let SafetyState::Fault(r) = self.safety.state().clone() {
+                        self.terminate_policy_run_static("ESTOP", "failed", Some("ESTOP_ACTIVE"), Some("E-stop latched"));
+                    } else if let SafetyState::Fault(ref r) = self.safety.state() {
                         let reason = if matches!(r, crate::safety::FaultReason::WatchdogTimeout) { "WATCHDOG_TIMEOUT" } else { "FAULT" };
-                        self.terminate_policy_run(reason, "failed", Some(reason), Some(format!("Fault active: {r:?}")));
+                        self.terminate_policy_run_static(reason, "failed", Some(reason), Some("Fault active during policy run"));
                     } else {
-                        self.terminate_policy_run("STOPPED", "cancelled", Some("EPOCH_MISMATCH"), Some("Epoch changed during policy run".into()));
+                        self.terminate_policy_run_static("STOPPED", "cancelled", Some("EPOCH_MISMATCH"), Some("Epoch changed during policy run"));
                     }
                 }
                 _ => {}
@@ -2480,17 +3311,25 @@ pub mod targets {
         #[cfg(not(feature = "policy-runtime"))]
         fn consume_policy_target(&mut self, _frame: &TargetFrame, _now: Instant) -> Result<(), Refusal> { Err(Refusal::code("POLICY_NOT_ACTIVE")) }
 
-        /// A policy frame that passed the consumption check: `policy_step_slice` (holds, gates,
-        /// input age, jump caps, servo checks; it ends the run where the legacy commit ends it).
+        /// A policy frame that passed the consumption check: zero-alloc `policy_step_slice_rt`
+        /// (holds, gates, input age, jump/step caps, single-sample J7 gate, servo checks).
         #[cfg(feature = "policy-runtime")]
         fn consume_policy_target(&mut self, frame: &TargetFrame, now: Instant) -> Result<(), Refusal> {
             let ms = |t: Instant| now.saturating_duration_since(t).as_millis().min(u128::from(u64::MAX)) as u64;
-            let Some(action_id) = self.policy_run.as_ref().map(|r| r.action_id).filter(|id| frame.stream == policy_stream(*id)) else {
+            let Some((action_id, deadline)) = self
+                .policy_run
+                .as_ref()
+                .filter(|r| frame.stream == policy_stream(r.action_id))
+                .map(|r| (r.action_id, r.deadline))
+            else {
                 return Err(Refusal::code("POLICY_NOT_ACTIVE"));
             };
+            if deadline.is_some_and(|dl| now >= dl) {
+                self.terminate_policy_run_static("MAX_SECONDS", "done", None, None);
+                return Err(Refusal::code("POLICY_NOT_ACTIVE"));
+            }
             let input_age_ms = self.has_policy_input_age_range().then(|| ms(frame.input_at));
-            self.policy_step_slice(action_id, frame.positions(), input_age_ms, frame.vision_at.map(ms), frame.vision_frame_id)
-                .map_err(|e| Refusal::code(policy_code(&e)))
+            self.policy_step_slice_rt(action_id, frame, input_age_ms, frame.vision_at.map(ms), frame.vision_frame_id, now)
         }
     }
 }

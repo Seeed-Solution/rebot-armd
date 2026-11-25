@@ -33,15 +33,43 @@ fn later() -> Instant { Instant::now() + Duration::from_secs(10) }
 
 fn auth(fx: &ReleaseFixture<SupervisorInner>) -> Authority { fx.core.authority(&fx.ctx(fx.now())) }
 
-fn quintic(fx: &ReleaseFixture<SupervisorInner>, d0: f32, duration_s: f64) -> Primitive {
+use armd::rt_core::requests::motion::{self as req_motion, MotionPlanSnapshot, MotionRequest, PlanAuthority, PreparedMotionSlot};
+
+enum InstallArg {
+    Prim(Box<Primitive>),
+    Jog(Box<PreparedMotionSlot>),
+}
+impl From<Primitive> for InstallArg { fn from(p: Primitive) -> Self { Self::Prim(Box::new(p)) } }
+impl From<PreparedMotionSlot> for InstallArg { fn from(s: PreparedMotionSlot) -> Self { Self::Jog(Box::new(s)) } }
+
+fn prepare_jog_from(fx: &ReleaseFixture<SupervisorInner>, start: &[f32], q: &[f32], duration_s: f64) -> PreparedMotionSlot {
+    let mut snap = MotionPlanSnapshot::from_supervisor(&fx.core);
+    snap.commanded_positions = start.to_vec();
+    let a = fx.core.authority(&fx.ctx(fx.now()));
+    snap.authority = PlanAuthority {
+        boot: fx.boot(),
+        epoch: a.epoch,
+        lease_generation: a.lease_generation,
+        stop_generation: a.stop_generation,
+        deadline: fx.now().max(Instant::now()) + Duration::from_secs(600),
+    };
+    req_motion::prepare_motion(&snap, &MotionRequest::jog(q.to_vec(), Some(duration_s), None))
+        .expect("prepare_motion")
+        .slot
+}
+
+fn quintic(fx: &ReleaseFixture<SupervisorInner>, d0: f32, duration_s: f64) -> PreparedMotionSlot {
     let start = fx.core.commanded_positions.clone();
     let mut q = start.clone();
     q[0] += d0;
-    Primitive::joint_quintic(&start, &q, duration_s).unwrap()
+    prepare_jog_from(fx, &start, &q, duration_s)
 }
 
-fn submit_install(b: &mut Broker<PlanSlot>, seq: u64, a: Authority, deadline: Instant, p: Primitive) -> Result<RequestId, AdmitError> {
-    b.submit(ClientId(1), seq, a, deadline, Submit::Install(&move |slot: &mut PlanSlot| slot.set(p)))
+fn submit_install(b: &mut Broker<PlanSlot>, seq: u64, a: Authority, deadline: Instant, arg: impl Into<InstallArg>) -> Result<RequestId, AdmitError> {
+    match arg.into() {
+        InstallArg::Prim(p) => b.submit(ClientId(1), seq, a, deadline, Submit::Install(&move |slot: &mut PlanSlot| slot.set(*p))),
+        InstallArg::Jog(j) => b.submit(ClientId(1), seq, a, deadline, Submit::Install(&move |slot: &mut PlanSlot| req_motion::stage_jog(slot, &j))),
+    }
 }
 
 fn replies(b: &mut Broker<PlanSlot>) -> Vec<Reply> {
@@ -336,14 +364,14 @@ fn a_child_commits_only_while_its_parent_is_the_running_action() {
     let start = fx.core.commanded_positions.clone();
     let mut q = start.clone();
     q[0] -= 0.05;
-    submit_install(&mut b, 2, stale, later(), Primitive::joint_quintic(&start, &q, 1.0).unwrap()).unwrap();
+    submit_install(&mut b, 2, stale, later(), prepare_jog_from(&fx, &start, &q, 1.0)).unwrap();
     assert_eq!(fx.step().command.unwrap().1, Err("PARENT_REPLACED"));
     assert_eq!(fx.active(), Some(parent));
     // a child of the running parent, prepared from the current commanded position
     let start = fx.core.commanded_positions.clone();
     let mut q = start.clone();
     q[0] -= 0.05;
-    submit_install(&mut b, 3, a, later(), Primitive::joint_quintic(&start, &q, 1.0).unwrap()).unwrap();
+    submit_install(&mut b, 3, a, later(), prepare_jog_from(&fx, &start, &q, 1.0)).unwrap();
     assert!(fx.step().command.unwrap().1.is_ok());
 }
 
@@ -358,13 +386,13 @@ fn a_primitive_prepared_from_another_start_is_refused_including_the_gripper() {
     // the gripper moved by 2e-4 since the plan: stale
     let mut moved = start.clone();
     moved[gripper] += 2e-4;
-    submit_install(&mut b, 1, a, later(), Primitive::joint_quintic(&moved, &q, 0.5).unwrap()).unwrap();
+    submit_install(&mut b, 1, a, later(), prepare_jog_from(&fx, &moved, &q, 0.5)).unwrap();
     assert_eq!(fx.step().command.unwrap().1, Err("PLAN_STALE"));
     assert!(fx.active().is_none() && fx.core.active_trajectory.is_none());
     // below the 1e-4 threshold it is the same start
     let mut close = start.clone();
     close[gripper] += 5e-5;
-    submit_install(&mut b, 2, a, later(), Primitive::joint_quintic(&close, &q, 0.5).unwrap()).unwrap();
+    submit_install(&mut b, 2, a, later(), prepare_jog_from(&fx, &close, &q, 0.5)).unwrap();
     assert!(fx.step().command.unwrap().1.is_ok());
 }
 
@@ -618,8 +646,9 @@ fn expire(fx: &mut ReleaseFixture<SupervisorInner>) {
     fx.core.last_heartbeat = Instant::now() - past;
 }
 
-fn to(fx: &ReleaseFixture<SupervisorInner>, q: [f32; 2], duration_s: f64) -> Primitive {
-    Primitive::joint_quintic(&fx.core.commanded_positions.clone(), &q, duration_s).unwrap()
+fn to(fx: &ReleaseFixture<SupervisorInner>, q: [f32; 2], duration_s: f64) -> PreparedMotionSlot {
+    let start = fx.core.commanded_positions.clone();
+    prepare_jog_from(fx, &start, &q, duration_s)
 }
 
 /// Runs the active action to its end, renewing the lease.
@@ -740,7 +769,7 @@ fn a_motion_between_prepare_and_install_refuses_the_install_and_keeps_the_runnin
     // prepared from the snapshot, queued now: r1 moved the commanded joints since
     let mut q2 = snap.commanded.clone();
     q2[1] += 0.1;
-    let r2 = submit_install(&mut b, 2, a, later(), Primitive::joint_quintic(&snap.commanded, &q2, 1.0).unwrap()).unwrap();
+    let r2 = submit_install(&mut b, 2, a, later(), prepare_jog_from(&fx, &snap.commanded, &q2, 1.0)).unwrap();
     let before = (target_of(&fx), fx.core.target_positions.clone());
     let rep = fx.step();
     assert_eq!(rep.command, Some((r2, Err("PLAN_STALE"))));
@@ -781,8 +810,9 @@ fn a_worker_refuses_a_joint_move_at_admission_while_a_config_hold_inhibits_motio
     let mut q = snap.commanded.clone();
     q[0] += 0.05;
     // free: prepared from the snapshot's commanded joints, admitted and committed
-    let p = armd::motion::prepare_joint_move(&snap, &q, 0.5).unwrap();
-    submit_install(&mut b, 1, snap.authority, later(), p).unwrap();
+    assert!(armd::motion::prepare_joint_move(&snap, &q, 0.5).is_ok());
+    let slot = prepare_jog_from(&fx, &snap.commanded, &q, 0.5);
+    submit_install(&mut b, 1, snap.authority, later(), slot).unwrap();
     assert!(fx.step().command.unwrap().1.is_ok());
     assert_eq!(armd::motion::prepare_joint_move(&snap, &q[..2], 0.5), Err("INVALID_COMMAND"));
     // a configuration worker holds a motion domain: the next move is refused before admission

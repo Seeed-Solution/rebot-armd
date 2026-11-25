@@ -7,7 +7,7 @@
 use super::*;
 use super::dispatch::{
     AdmissionClass, AuthRequirement, DispatchEntry, DispatchHandler, DispatchKey,
-    LeaseRequirement, OwnerDispatchCtx, ReplyPolicy,
+    LeaseRequirement, OwnerDispatchCtx, OwnerReply, ReplyPolicy,
 };
 
 pub(super) const ENTRIES: &[DispatchEntry] = &[
@@ -80,7 +80,7 @@ pub(super) fn dispatch_executor_calibration_command(path: &str, value: &Value, e
     })
 }
 
-fn dispatch_calibration_entry(ctx: &mut OwnerDispatchCtx<'_>) -> Option<Value> {
+fn dispatch_calibration_entry(ctx: &mut OwnerDispatchCtx<'_>) -> Option<OwnerReply> {
     dispatch_calibration_command(
         ctx.inner,
         ctx.path,
@@ -165,14 +165,14 @@ pub(super) fn dispatch_calibration_command(
     local_generation: u64,
     epoch: u64,
     pending_calibration: &mut Option<(Value, CalibJob, u64, u64, bool)>,
-) -> Option<Value> {
+) -> Option<OwnerReply> {
     match calibration_job(inner, path, &value["body"]) {
         Ok(CalibStart::Job(job, busy)) => {
             *pending_calibration = Some((value["request_id"].clone(), job, local_generation, epoch, busy));
             None
         }
-        Ok(CalibStart::Reply(reply)) => Some(fields_ack(&value["request_id"], reply)),
-        Err(e) => Some(calibration_reject(&value["request_id"], &e)),
+        Ok(CalibStart::Reply(reply)) => Some(OwnerReply::FieldsAck(reply)),
+        Err(e) => Some(OwnerReply::CalibReject(e)),
     }
 }
 

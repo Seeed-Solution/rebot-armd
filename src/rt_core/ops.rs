@@ -54,7 +54,7 @@ pub struct Committed {
 }
 
 impl Committed {
-    fn authorized(d: &Descriptor, action: Option<ActionId>) -> Self { Self { request: d.stamp.request, action } }
+    pub(super) fn authorized(d: &Descriptor, action: Option<ActionId>) -> Self { Self { request: d.stamp.request, action } }
 
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn for_action(d: &Descriptor, action: Option<ActionId>) -> Self {
@@ -207,12 +207,14 @@ impl PreparedPath {
     }
 }
 
-/// One plan slot: the primitive, the prepared path a [`Primitive::Prepared`] reads, and (for
-/// prepared replays) the exact off-thread fitted & workspace-swept approach quintic.
+/// One plan slot: the primitive, the prepared path a [`Primitive::Prepared`] reads, optional
+/// `Copy` prepared motion plan (`PlanSlot::motion`), and (for prepared replays) the exact
+/// off-thread fitted & workspace-swept approach quintic.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlanSlot {
     pub primitive: Primitive,
     pub path: PreparedPath,
+    pub motion: Option<super::requests::motion::PreparedMotionSlot>,
     #[cfg(not(target_arch = "wasm32"))]
     pub replay_approach: Option<crate::replay::PreparedReplayApproach>,
 }
@@ -227,6 +229,7 @@ impl PlanSlot {
         Self {
             primitive: Primitive::None,
             path: PreparedPath::with_capacity(n),
+            motion: None,
             #[cfg(not(target_arch = "wasm32"))]
             replay_approach: None,
         }
@@ -235,10 +238,11 @@ impl PlanSlot {
     /// Payload bytes reserved by this slot's [`PreparedPath`] buffers.
     pub fn payload_bytes(&self) -> usize { self.path.payload_bytes() }
 
-    /// Stages a primitive that reads no path (the path and replay approach are cleared).
+    /// Stages a primitive that reads no path (the path, prepared motion slot, and replay approach are cleared).
     pub fn set(&mut self, p: Primitive) {
         self.primitive = p;
         self.path.clear();
+        self.motion = None;
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.replay_approach = None;
@@ -248,12 +252,14 @@ impl PlanSlot {
     /// Stages a slot the worker prepared (`PLAN_TOO_LARGE`: nothing staged; the slot is empty).
     pub fn copy_from(&mut self, other: &PlanSlot) -> Result<(), &'static str> {
         self.primitive = Primitive::None;
+        self.motion = None;
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.replay_approach = None;
         }
         self.path.copy_from(&other.path)?;
         self.primitive = other.primitive;
+        self.motion = other.motion;
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.replay_approach = other.replay_approach;
@@ -358,6 +364,7 @@ pub const TERMINAL_CODES: &[&str] = &[
     "DROPPED", "OBJECT_HELD", "OBJECT_TOO_TALL", "TOO_WIDE", "CENTRING_FAILED", "DETECTION_UNAVAILABLE", "TASK_UNSUPPORTED",
     "OBSERVATION_UNAVAILABLE", "PERSIST_FAILED", "POLICY_NOT_ACTIVE", "POWER_LIMIT",
     "LIFT_TORQUE", "INSUFFICIENT_EVIDENCE", "BUDGET_EXHAUSTED",
+    "VISION_STALE", "INFERENCE_ERROR", "POLICY_REVOKED", "POLICY_FAILED", "MODEL_CHANGED", "HANDSHAKE_EXPIRED",
 ];
 
 /// The static form of an action's code (None: it named none or an unlisted one).
@@ -472,12 +479,22 @@ pub struct HardwarePoll {
     /// The driver transition in flight (None: none): progress, or its failure code (the
     /// transition's terminal is `Failed(code)`).
     pub torque: Option<Result<TorqueProgress, &'static str>>,
+    /// Sub-release wake for an internal park transition (`ParkRearm` or `Park` disable);
+    /// separate from `torque` so broker `ReleaseEngine::transition` stays isolated.
+    pub park_wake: Option<Instant>,
+    /// True when a park `ParkRearm` or `Park` disable transition finished on this poll,
+    /// requiring a Step-6 / sub-release publication.
+    pub park_state_changed: bool,
 }
 
 impl HardwarePoll {
-    /// When the bus owner wants to be serviced before the next release (a pending transition).
+    /// When the bus owner wants to be serviced before the next release (a pending broker or park transition).
     pub fn wake(&self) -> Option<Instant> {
-        match self.torque { Some(Ok(TorqueProgress::Pending { wake })) => Some(wake), _ => None }
+        let torque_wake = match self.torque { Some(Ok(TorqueProgress::Pending { wake })) => Some(wake), _ => None };
+        match (torque_wake, self.park_wake) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     /// The executor's extra service within the release ending at `release`: the pending
@@ -501,6 +518,22 @@ pub trait CoreOps {
     fn planning_snapshot(&self, ctx: &CommitCtx) -> PlanningSnapshot;
     /// Installs `primitive` for `d` after rechecking its stamp; refusal leaves active motion unchanged.
     fn commit_primitive(&mut self, d: &Descriptor, primitive: &Primitive, ctx: &CommitCtx) -> Result<Committed, &'static str>;
+    /// Installs an off-lock prepared jog (`PreparedMotionSlot`) for `d` with zero RT planning.
+    fn commit_install_slot(&mut self, _d: &Descriptor, _slot: &super::requests::motion::PreparedMotionSlot, _ctx: &CommitCtx) -> Result<Committed, &'static str> {
+        Err("UNSUPPORTED")
+    }
+    /// Installs an off-lock prepared `home` motion (`PreparedMotionSlot`) for `d`.
+    fn commit_home(&mut self, _d: &Descriptor, _slot: &super::requests::motion::PreparedMotionSlot, _ctx: &CommitCtx) -> Result<Committed, &'static str> {
+        Err("UNSUPPORTED")
+    }
+    /// Installs an off-lock prepared `park` motion (or `holding_after_clear` rearm) for `d`.
+    fn commit_park(&mut self, _d: &Descriptor, _slot: &super::requests::motion::PreparedMotionSlot, _ctx: &CommitCtx) -> Result<Committed, &'static str> {
+        Err("UNSUPPORTED")
+    }
+    /// Installs an off-lock prepared continuation trajectory onto an existing deferred `park` action.
+    fn commit_park_continuation(&mut self, _d: &Descriptor, _slot: &super::requests::motion::PreparedMotionSlot, _ctx: &CommitCtx) -> Result<Committed, &'static str> {
+        Err("UNSUPPORTED")
+    }
     fn commit_immediate(&mut self, d: &Descriptor, op: ImmediateOp, ctx: &CommitCtx) -> Result<Committed, &'static str>;
     /// Executes one lease lifecycle request (`LeaseAcquire`, `LeasePreempt`, `LeaseRelease`, `LeaseDisconnect`).
     fn commit_lease(
@@ -567,6 +600,15 @@ pub trait CoreOps {
     /// `frame.positions()` (a slice of the frame) into the core's preallocated target state.
     /// (The foundation adapter still delegates to `servo(Vec)`, which allocates: track D.)
     fn consume_target(&mut self, frame: &TargetFrame, ctx: &CommitCtx) -> Result<(), Refusal>;
+    /// Applies one target together with its atomic [`super::mailbox::PolicyValidityBounds`].
+    fn consume_target_with_validity(
+        &mut self,
+        frame: &TargetFrame,
+        _validity: super::mailbox::PolicyValidityBounds,
+        ctx: &CommitCtx,
+    ) -> Result<(), Refusal> {
+        self.consume_target(frame, ctx)
+    }
     /// Applies any pending urgent E-stop request; returns true when an E-stop was applied.
     fn apply_estop(&mut self) -> bool { false }
     /// Synchronizes any non-blocking socket-close lease fence (lock-free, zero allocations)
@@ -577,6 +619,10 @@ pub trait CoreOps {
     /// Drains displaced lease generations queued since the last drain (zero allocs) so the
     /// release engine can dispatch off-thread `close_servo(old_generation)` strictly after publish.
     fn drain_servo_closes(&mut self, _each: &mut dyn FnMut(u64)) {}
+    /// True when terminated policy action IDs await post-publication atomic close watermark flush.
+    fn has_pending_policy_close(&self) -> bool { false }
+    /// Advances the durable post-publication policy close watermark (zero allocs, lossless).
+    fn flush_policy_close_watermark(&mut self) -> u64 { 0 }
     /// An authorized stop was requested: stop active motion.
     fn apply_stop(&mut self);
     /// Applies an authorized stop at `generation` and synchronizes the owner's stop counter.
@@ -676,6 +722,20 @@ pub trait CoreOps {
     ) -> Result<Committed, &'static str> {
         Err("UNSUPPORTED")
     }
+    /// Commits one policy lifecycle broker command (`ReserveLoad`, `BeginPolicy`, `EndPolicy`).
+    #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+    fn commit_policy(
+        &mut self,
+        _d: &Descriptor,
+        _cmd: super::requests::policy::PolicyCommand,
+        _ctx: &CommitCtx,
+    ) -> Result<Committed, &'static str> {
+        Err("UNSUPPORTED")
+    }
+    /// Publishes the post-completion request watermark strictly AFTER `commit_policy` (or refusal)
+    /// finishes reading cancellation slots and updating active load/run tokens.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+    fn finish_policy_command(&mut self, _req_id: u64) {}
     /// True while a macro parent's current child still owns trajectory, settle, or deferred TX.
     fn macro_child_running(&self, _parent: ActionId) -> bool { false }
     /// Attaches the broker's lock-free closed-connection bitset for RT commit checks.
@@ -797,6 +857,128 @@ static STOP_DIAG: StopDiagSlot = StopDiagSlot::new();
 /// moves it onto `ArmCore` / `ExecutorStats`.
 pub fn stop_diag() -> &'static StopDiagSlot { &STOP_DIAG }
 
+/// Lock-free fixed-size diagnostic slot for RT gripper force-cap warnings (0 allocs, 0 tracing
+/// calls on `armd-control`; drained and emitted off-thread in `StateHub::refresh`).
+pub struct GripperForceDiagSlot {
+    unavail_count: AtomicU64,
+    unavail_drained: AtomicU64,
+    unavail_bus_fresh: std::sync::atomic::AtomicBool,
+    unavail_has_torque: std::sync::atomic::AtomicBool,
+    cap_trip_count: AtomicU64,
+    cap_trip_drained: AtomicU64,
+    cap_tau_milli_nm: AtomicU32,
+    cap_limit_milli_nm: AtomicU32,
+    cap_pos_milli_rad: std::sync::atomic::AtomicI32,
+    cap_trips: AtomicU32,
+    stream_stop_count: AtomicU64,
+    stream_stop_drained: AtomicU64,
+    stream_stop_max_trips: AtomicU32,
+}
+
+impl GripperForceDiagSlot {
+    pub const fn new() -> Self {
+        Self {
+            unavail_count: AtomicU64::new(0),
+            unavail_drained: AtomicU64::new(0),
+            unavail_bus_fresh: std::sync::atomic::AtomicBool::new(false),
+            unavail_has_torque: std::sync::atomic::AtomicBool::new(false),
+            cap_trip_count: AtomicU64::new(0),
+            cap_trip_drained: AtomicU64::new(0),
+            cap_tau_milli_nm: AtomicU32::new(0),
+            cap_limit_milli_nm: AtomicU32::new(0),
+            cap_pos_milli_rad: std::sync::atomic::AtomicI32::new(0),
+            cap_trips: AtomicU32::new(0),
+            stream_stop_count: AtomicU64::new(0),
+            stream_stop_drained: AtomicU64::new(0),
+            stream_stop_max_trips: AtomicU32::new(0),
+        }
+    }
+
+    pub fn record_feedback_unavailable(&self, bus_fresh: bool, has_torque: bool) {
+        self.unavail_bus_fresh.store(bus_fresh, Ordering::Relaxed);
+        self.unavail_has_torque.store(has_torque, Ordering::Relaxed);
+        self.unavail_count.fetch_add(1, Ordering::Release);
+    }
+
+    pub fn record_cap_trip(&self, tau_abs: f32, limit_nm: f32, pos_rad: f32, trips: u32) {
+        let to_u32 = |v: f32| if v.is_finite() && v >= 0.0 { (v * 1000.0).min(u32::MAX as f32) as u32 } else { 0 };
+        let to_i32 = |v: f32| if v.is_finite() { (v * 1000.0).clamp(i32::MIN as f32, i32::MAX as f32) as i32 } else { 0 };
+        self.cap_tau_milli_nm.store(to_u32(tau_abs), Ordering::Relaxed);
+        self.cap_limit_milli_nm.store(to_u32(limit_nm), Ordering::Relaxed);
+        self.cap_pos_milli_rad.store(to_i32(pos_rad), Ordering::Relaxed);
+        self.cap_trips.store(trips, Ordering::Relaxed);
+        self.cap_trip_count.fetch_add(1, Ordering::Release);
+    }
+
+    pub fn record_stream_stopped(&self, max_trips: u32) {
+        self.stream_stop_max_trips.store(max_trips, Ordering::Relaxed);
+        self.stream_stop_count.fetch_add(1, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub fn counts(&self) -> (u64, u64, u64) {
+        (
+            self.unavail_count.load(Ordering::Acquire),
+            self.cap_trip_count.load(Ordering::Acquire),
+            self.stream_stop_count.load(Ordering::Acquire),
+        )
+    }
+
+    pub fn drain_and_log_once(&self) {
+        loop {
+            let prev = self.unavail_drained.load(Ordering::Acquire);
+            let now = self.unavail_count.load(Ordering::Acquire);
+            if now == prev { break; }
+            if self.unavail_drained.compare_exchange(prev, now, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                tracing::warn!(
+                    "Gripper close stopped ({} event(s)): feedback_fresh={} torque_feedback={} while max_close_torque_nm is active; holding",
+                    now.wrapping_sub(prev),
+                    self.unavail_bus_fresh.load(Ordering::Relaxed),
+                    self.unavail_has_torque.load(Ordering::Relaxed),
+                );
+                break;
+            }
+        }
+        loop {
+            let prev = self.cap_trip_drained.load(Ordering::Acquire);
+            let now = self.cap_trip_count.load(Ordering::Acquire);
+            if now == prev { break; }
+            if self.cap_trip_drained.compare_exchange(prev, now, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                tracing::warn!(
+                    "Gripper torque cap ({} event(s)): |tau| {:.2} N·m above {:.2} N·m at {:.3} rad (trip {} on this contact); holding",
+                    now.wrapping_sub(prev),
+                    self.cap_tau_milli_nm.load(Ordering::Relaxed) as f32 / 1000.0,
+                    self.cap_limit_milli_nm.load(Ordering::Relaxed) as f32 / 1000.0,
+                    self.cap_pos_milli_rad.load(Ordering::Relaxed) as f32 / 1000.0,
+                    self.cap_trips.load(Ordering::Relaxed),
+                );
+                break;
+            }
+        }
+        loop {
+            let prev = self.stream_stop_drained.load(Ordering::Acquire);
+            let now = self.stream_stop_count.load(Ordering::Acquire);
+            if now == prev { break; }
+            if self.stream_stop_drained.compare_exchange(prev, now, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                tracing::warn!(
+                    "Gripper torque cap tripped {} times on one contact under a stream ({} event(s)); stopping the stream",
+                    self.stream_stop_max_trips.load(Ordering::Relaxed),
+                    now.wrapping_sub(prev),
+                );
+                break;
+            }
+        }
+    }
+}
+
+impl Default for GripperForceDiagSlot {
+    fn default() -> Self { Self::new() }
+}
+
+static GRIPPER_FORCE_DIAG: GripperForceDiagSlot = GripperForceDiagSlot::new();
+
+pub(crate) fn gripper_force_diag() -> &'static GripperForceDiagSlot { &GRIPPER_FORCE_DIAG }
+
 /// The protocol code of a delegated error, as a static string without allocating
 /// (unknown codes: `REJECTED`).
 pub(crate) fn static_code(e: ArmError) -> &'static str {
@@ -806,6 +988,7 @@ pub(crate) fn static_code(e: ArmError) -> &'static str {
         "WORKSPACE_VIOLATION", "JOINT_LIMIT", "PLAN_STALE", "LEASE_LOST", "NO_LEASE", "DISCONNECTED", "COLLISION_HOLD", "COMMISSIONING_REQUIRED",
         "INVALID_VALUE", "UNSUPPORTED", "INTERNAL", "FEEDBACK_STALE", "J7_FEEDBACK_STALE", "FEEDBACK_UNAVAILABLE", "CONFIG_BUSY", "ARM_NOT_AT_RESTING_POSE", "TOOL_MISMATCH",
         "MOTION_FORBIDDEN_IN_FAULT_STATE", "STOPPED", "TERMINALS_BUSY", "STAMP_REUSED", "HANDOVER_SETTLING", "DISABLE_PENDING", "TRANSITION_BUSY",
+        "WRONG_TARGET", "DEADLINE_EXPIRED",
     ];
     match &e {
         ArmError::Motion(m) => m.code(),
@@ -859,6 +1042,10 @@ impl SupervisorInner {
         if let Some(code) = d.stamp.check(ctx.arm, ctx.boot, ctx.now, &self.authority(ctx)) { return Err(code); }
         self.check_descriptor_lease_owner(d.stamp.client.0, d.stamp.authority.lease_generation)?;
         Ok(())
+    }
+
+    pub(crate) fn check_commit_for_motion(&self, d: &Descriptor, ctx: &CommitCtx) -> Result<(), &'static str> {
+        self.check_commit(d, ctx)
     }
 
     /// Stop-direction variant of [`Self::check_commit`]: exempt from `stop_generation` checks
@@ -938,24 +1125,28 @@ impl CoreOps for SupervisorInner {
                 let admitted = self.check_admission(stamp).map_err(|e| static_code(ArmError::Safety(e)))?;
                 SupervisorInner::commit_macro_child(admitted, primitive, ctx.now).map(|parent| Committed::authorized(d, Some(parent)))
             }
-            Primitive::JointQuintic { dof, start, q, duration_s } => {
-                // the fields are public: a hand-built primitive may name more joints than it holds
-                let n = usize::from(*dof);
-                if n == 0 || n > MAX_DOF {
-                    return Err("INVALID_COMMAND");
-                }
-                let mut eff_start = [0.0f32; MAX_DOF];
-                let (eff_dof, _) = self.post_quiesce_commanded_positions(&mut eff_start);
-                if !start_matches(&start[..n], &eff_start[..eff_dof]) {
-                    return Err("PLAN_STALE");
-                }
-                self.jog_precheck_static()?;
-                let admitted = self.check_admission(stamp).map_err(|e| static_code(ArmError::Safety(e)))?;
-                SupervisorInner::jog_action_slice(admitted, &q[..n], Some(*duration_s), Some(d.stamp.authority.epoch), "joint_move")
-                    .map(|(_, id, _)| Committed::authorized(d, Some(ActionId(id))))
-                    .map_err(static_code)
+            Primitive::JointQuintic { .. } => {
+                // Joint quintic plans must be prepared off armd-control and staged as a
+                // `PreparedMotionSlot` (`PlanSlot::motion` via `req::stage_jog`); never plan on RT.
+                Err("INVALID_COMMAND")
             }
         }
+    }
+
+    fn commit_install_slot(&mut self, d: &Descriptor, slot: &super::requests::motion::PreparedMotionSlot, ctx: &CommitCtx) -> Result<Committed, &'static str> {
+        super::requests::motion::commit_install_slot(self, d, slot, ctx)
+    }
+
+    fn commit_home(&mut self, d: &Descriptor, slot: &super::requests::motion::PreparedMotionSlot, ctx: &CommitCtx) -> Result<Committed, &'static str> {
+        super::requests::motion::commit_home(self, d, slot, ctx)
+    }
+
+    fn commit_park(&mut self, d: &Descriptor, slot: &super::requests::motion::PreparedMotionSlot, ctx: &CommitCtx) -> Result<Committed, &'static str> {
+        super::requests::motion::commit_park(self, d, slot, ctx)
+    }
+
+    fn commit_park_continuation(&mut self, d: &Descriptor, slot: &super::requests::motion::PreparedMotionSlot, ctx: &CommitCtx) -> Result<Committed, &'static str> {
+        super::requests::motion::commit_park_continuation(self, d, slot, ctx)
     }
 
     fn commit_prepared(&mut self, d: &Descriptor, primitive: &Primitive, path: &PreparedPath, ctx: &CommitCtx) -> Result<Committed, &'static str> {
@@ -1204,6 +1395,15 @@ impl CoreOps for SupervisorInner {
         self.consume_target_frame(frame, ctx)
     }
 
+    fn consume_target_with_validity(
+        &mut self,
+        frame: &TargetFrame,
+        validity: super::mailbox::PolicyValidityBounds,
+        ctx: &CommitCtx,
+    ) -> Result<(), Refusal> {
+        self.consume_target_frame_with_validity(frame, validity, ctx)
+    }
+
     fn apply_estop(&mut self) -> bool { self.consume_pending_estop() }
 
     fn sync_disconnect_fence(&mut self, now: Instant) -> bool {
@@ -1216,6 +1416,28 @@ impl CoreOps for SupervisorInner {
 
     fn drain_servo_closes(&mut self, each: &mut dyn FnMut(u64)) {
         self.drain_pending_servo_closes(each);
+    }
+
+    fn has_pending_policy_close(&self) -> bool {
+        #[cfg(feature = "policy-runtime")]
+        {
+            self.has_pending_policy_close()
+        }
+        #[cfg(not(feature = "policy-runtime"))]
+        {
+            false
+        }
+    }
+
+    fn flush_policy_close_watermark(&mut self) -> u64 {
+        #[cfg(feature = "policy-runtime")]
+        {
+            self.flush_pending_policy_close_watermark()
+        }
+        #[cfg(not(feature = "policy-runtime"))]
+        {
+            0
+        }
     }
 
     // ends client motion; a running watchdog park belongs to the lease watchdog and continues
@@ -1300,17 +1522,35 @@ impl CoreOps for SupervisorInner {
     }
 
     fn poll_transition_wake(&mut self, budget: &ServiceBudget) -> HardwarePoll {
+        self.last_clock_now = Some(budget.now);
         let trans = self.service_torque_transition(budget);
+        let mut park_wake = None;
+        let mut park_state_changed = false;
         let (rx_frames, trans_exhausted) = match trans {
             Some(tp) => {
-                self.core.begin_transition(tp.progress);
+                if tp.broker_owned {
+                    self.core.begin_transition(tp.progress);
+                } else {
+                    match tp.progress {
+                        Ok(TorqueProgress::Pending { wake }) => park_wake = Some(wake),
+                        Ok(TorqueProgress::Done) | Err(_) => park_state_changed = true,
+                    }
+                }
                 tp.rx.unwrap_or((0, false))
             }
             None => (0, false),
         };
         let budget_exhausted = budget.now > budget.deadline || trans_exhausted;
         let Some(driver) = self.driver.as_ref() else {
-            return HardwarePoll { driverless: true, rx_frames, budget_exhausted, torque: self.core.poll_transition(), ..HardwarePoll::default() };
+            return HardwarePoll {
+                driverless: true,
+                rx_frames,
+                budget_exhausted,
+                torque: self.core.poll_transition(),
+                park_wake,
+                park_state_changed,
+                ..HardwarePoll::default()
+            };
         };
         let d = driver.lock().unwrap_or_else(|e| e.into_inner());
         d.feedback_ages_into(&mut self.scratch.ages);
@@ -1323,6 +1563,8 @@ impl CoreOps for SupervisorInner {
             rx_frames,
             budget_exhausted,
             torque: self.core.poll_transition(),
+            park_wake,
+            park_state_changed,
         }
     }
 
@@ -1373,6 +1615,21 @@ impl CoreOps for SupervisorInner {
         super::requests::actions::commit_action(self, d, cmd, slot, ctx)
     }
 
+    #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+    fn commit_policy(
+        &mut self,
+        d: &Descriptor,
+        cmd: super::requests::policy::PolicyCommand,
+        ctx: &CommitCtx,
+    ) -> Result<Committed, &'static str> {
+        super::requests::policy::commit_policy(self, d, cmd, ctx)
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+    fn finish_policy_command(&mut self, req_id: u64) {
+        self.policy_cancel_slots.mark_policy_req_completed(req_id);
+    }
+
     fn macro_child_running(&self, parent: ActionId) -> bool {
         SupervisorInner::macro_child_running(self, parent.0)
     }
@@ -1381,7 +1638,6 @@ impl CoreOps for SupervisorInner {
     fn attach_closed_bitset(&mut self, bitset: std::sync::Arc<super::requests::actions::ClosedBitset>) {
         SupervisorInner::attach_closed_bitset(self, bitset);
     }
-
     fn set_boot_id(&mut self, boot: BootId) {
         self.boot_id = boot;
     }
@@ -1899,6 +2155,9 @@ impl ReleaseEngine {
                 self.lifecycle_replies_flushed = true;
             }
             let _ = self.flush_servo_closes(core);
+        if core.flush_policy_close_watermark() != 0 {
+            self.servo_closes_flushed = true;
+        }
             return report;
         }
         // 3. Urgent recheck + at most one ordinary command (replies deferred until strictly AFTER Step 6 publish)
@@ -1939,7 +2198,9 @@ impl ReleaseEngine {
                     let is_begin_macro = matches!(d.kind, CommandKind::Action(super::requests::actions::ActionCommand::BeginMacro(_)));
                     #[cfg(target_arch = "wasm32")]
                     let is_begin_macro = false;
-                    #[cfg(not(target_arch = "wasm32"))]
+                    #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+                    let is_action_cmd = matches!(d.kind, CommandKind::Action(_) | CommandKind::Policy(_));
+                    #[cfg(all(not(target_arch = "wasm32"), not(feature = "policy-runtime")))]
                     let is_action_cmd = matches!(d.kind, CommandKind::Action(_));
                     #[cfg(target_arch = "wasm32")]
                     let is_action_cmd = false;
@@ -1948,10 +2209,17 @@ impl ReleaseEngine {
                     #[cfg(target_arch = "wasm32")]
                     let is_child_cmd = false;
                     let starts_top_action = match d.kind {
-                        CommandKind::Install { .. } => true,
+                        CommandKind::Install { .. }
+                        | CommandKind::InstallHome { .. }
+                        | CommandKind::InstallPark { .. } => true,
                         #[cfg(not(target_arch = "wasm32"))]
                         CommandKind::Action(a) => a.starts_action(),
-                        CommandKind::Immediate(_) | CommandKind::Transition(_) | CommandKind::Lease(_) => false,
+                        #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+                        CommandKind::Policy(p) => p.starts_action(),
+                        CommandKind::ContinuePark { .. }
+                        | CommandKind::Immediate(_)
+                        | CommandKind::Transition(_)
+                        | CommandKind::Lease(_) => false,
                     };
                     // Provisional read-only capture before Step 3 mutates `core`: if a Step-1 Stop
                     // already ended the prior active action/macro, preserve its exact outcome & children
@@ -1975,6 +2243,10 @@ impl ReleaseEngine {
                             } else {
                                 match t.plan() {
                                     None => Err("PLAN_RETIRED"),
+                                    Some(slot) if slot.motion.is_some() => {
+                                        let m = slot.motion.expect("checked is_some");
+                                        core.commit_install_slot(&d, &m, &ctx)
+                                    }
                                     Some(slot) if matches!(slot.primitive, Primitive::Prepared { .. }) => match t.plan_ref() {
                                         Some(slot_ref) => core.commit_prepared_slot(&d, slot_ref, &ctx),
                                         None => Err("PLAN_RETIRED"),
@@ -1983,6 +2255,18 @@ impl ReleaseEngine {
                                 }
                             }
                         }
+                        CommandKind::InstallHome { .. } => match t.plan().and_then(|s| s.motion) {
+                            Some(m) => core.commit_home(&d, &m, &ctx),
+                            None => Err("PLAN_RETIRED"),
+                        },
+                        CommandKind::InstallPark { .. } => match t.plan().and_then(|s| s.motion) {
+                            Some(m) => core.commit_park(&d, &m, &ctx),
+                            None => Err("PLAN_RETIRED"),
+                        },
+                        CommandKind::ContinuePark { .. } => match t.plan().and_then(|s| s.motion) {
+                            Some(m) => core.commit_park_continuation(&d, &m, &ctx),
+                            None => Err("PLAN_RETIRED"),
+                        },
                         CommandKind::Immediate(op) => core.commit_immediate(&d, op, &ctx),
                         CommandKind::Transition(op) => core.commit_transition_for_release(&d, op, &ctx, release_deadline),
                         #[cfg(not(target_arch = "wasm32"))]
@@ -1997,11 +2281,17 @@ impl ReleaseEngine {
                                 Err(code) => Err(code),
                             }
                         }
+                        #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+                        CommandKind::Policy(cmd) => {
+                            let r = core.commit_policy(&d, cmd, &ctx);
+                            core.finish_policy_command(d.stamp.request.0);
+                            r
+                        }
                         CommandKind::Lease(_) => unreachable!(),
                     };
                     report.command = Some((d.stamp.request, match result {
                         Ok(c) => {
-                            let install = matches!(d.kind, CommandKind::Install { .. });
+                            let install = d.kind.is_install();
                             let supersedes = starts_top_action && c.action().is_some() && c.request() == d.stamp.request && self.active.is_some();
                             if supersedes {
                                 t.ack_deferred(c).map(|(acked, ack_reply)| {
@@ -2090,8 +2380,8 @@ impl ReleaseEngine {
         //    so off-thread command waiters always observe the post-motion published snapshot.
         let ctx = self.checkpoint(core, Checkpoint::BeforeTarget, &mut now_fn, &mut report);
         let mut deferred_target_outcome: Option<TargetOutcome> = None;
-        if let Some(f) = self.targets.take() {
-            let result = core.consume_target(&f, &ctx);
+        if let Some((f, validity)) = self.targets.take_with_validity() {
+            let result = core.consume_target_with_validity(&f, validity, &ctx);
             deferred_target_outcome = Some(TargetOutcome { stream: f.stream, seq: f.seq, result });
             report.target_refusal = result.err();
             report.target = Some((f.seq, result.map_err(|r| r.code)));
@@ -2148,6 +2438,9 @@ impl ReleaseEngine {
             }
         }
         let _ = self.flush_servo_closes(core);
+        if core.flush_policy_close_watermark() != 0 {
+            self.servo_closes_flushed = true;
+        }
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(ActiveSlot::Macro { parent, child_plan }) = self.active.as_mut() {
             if child_plan.is_some() && !core.macro_child_running(parent.action()) {
@@ -2191,11 +2484,29 @@ impl ReleaseEngine {
         let finished = self
             .take_finished_transition(report)
             .or_else(|| self.take_aborted_transition(core, report));
-        if urgent_applied || lifecycle_pending || core.has_pending_servo_closes() || finished.is_some() {
+        let active_ended = self.active().and_then(|a| core.action_outcome(a).map(|o| (a, o)));
+        if urgent_applied
+            || lifecycle_pending
+            || core.has_pending_servo_closes()
+            || core.has_pending_policy_close()
+            || finished.is_some()
+            || active_ended.is_some()
+            || report.poll.park_state_changed
+        {
             let ts = core.now_timestamp();
             core.publish(ts, publish_generation);
             if let Some((t, outcome)) = finished {
                 self.intake.terminal(t, outcome);
+            }
+            if let Some((action, outcome)) = active_ended {
+                let old_slot = self.active.take().expect("active above");
+                let (installed, child_plan) = old_slot.into_parts();
+                if let Some(cp) = child_plan {
+                    self.intake.retire_plan(cp);
+                }
+                let children = core.action_children(action);
+                self.intake.terminal_with_children(installed, outcome, children);
+                report.ended = Some((action, outcome));
             }
             if self.flush_urgent_stop_replies() {
                 self.urgent_replies_flushed = true;
@@ -2204,6 +2515,9 @@ impl ReleaseEngine {
                 self.lifecycle_replies_flushed = true;
             }
             let _ = self.flush_servo_closes(core);
+            if core.flush_policy_close_watermark() != 0 {
+                self.servo_closes_flushed = true;
+            }
             return true;
         }
         if self.has_pending_urgent_stop_replies() && self.flush_urgent_stop_replies() {
@@ -2252,6 +2566,7 @@ impl<O: CoreOps> ReleaseFixture<O> {
         caps: Capacities,
         clock: VirtualClock,
     ) -> (Self, Broker<PlanSlot>, TargetWriter, StopRequests) {
+        core.set_boot_id(boot);
         let (engine, broker, tw, stop) = ReleaseEngine::new(boot, caps);
         #[cfg(not(target_arch = "wasm32"))]
         core.attach_closed_bitset(broker.closed_bitset());

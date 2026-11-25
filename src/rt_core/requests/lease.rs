@@ -1360,11 +1360,11 @@ pub fn install_lease_acquire(
     inner.cancel_watchdog_park_for_new_lease(conn);
     #[cfg(feature = "policy-runtime")]
     if inner.policy_run.is_some() {
-        inner.terminate_policy_run(
+        inner.terminate_policy_run_static(
             "LEASE_LOST",
             "cancelled",
             Some("LEASE_LOST"),
-            Some("Control lease acquired by new controller".into()),
+            Some("Control lease acquired by new controller"),
         );
     }
     if let Some(old_gen) = inner.active_lease.as_ref().map(|a| a.generation) {
@@ -1470,11 +1470,11 @@ pub fn install_lease_preempt(
     inner.cancel_watchdog_park_for_new_lease(conn);
     #[cfg(feature = "policy-runtime")]
     if inner.policy_run.is_some() {
-        inner.terminate_policy_run(
+        inner.terminate_policy_run_static(
             "LEASE_LOST",
             "cancelled",
             Some("LEASE_LOST"),
-            Some("Control lease preempted".into()),
+            Some("Control lease preempted"),
         );
     }
 
@@ -1540,6 +1540,17 @@ pub fn install_lease_release(
         });
     };
 
+    // Terminate any active policy run BEFORE `fence_displaced_lease_generation` -> `stop_motion()`
+    // so it records `LEASE_LOST` rather than being masked as `STOPPED`.
+    #[cfg(feature = "policy-runtime")]
+    if inner.policy_run.is_some() {
+        inner.terminate_policy_run_static(
+            "LEASE_LOST",
+            "cancelled",
+            Some("LEASE_LOST"),
+            Some("Control lease released"),
+        );
+    }
     // Fence and stop active motion when valid OR when this release first observes expiry while
     // no autonomous watchdog park is active (preserving any running watchdog park explicitly).
     let stop_client_motion = valid
@@ -1548,15 +1559,6 @@ pub fn install_lease_release(
             && !inner.pending_normal_unload);
     inner.fence_displaced_lease_generation(req.generation, stop_client_motion);
     let _ = inner.clear_active_lease_in_place();
-    #[cfg(feature = "policy-runtime")]
-    if inner.policy_run.is_some() {
-        inner.terminate_policy_run(
-            "LEASE_LOST",
-            "cancelled",
-            Some("LEASE_LOST"),
-            Some("Control lease released".into()),
-        );
-    }
     Ok(LeaseOutcome::Released {
         released: valid,
         displaced_generation: req.generation,
@@ -1603,21 +1605,21 @@ pub fn install_lease_disconnect(
         };
     };
 
+    #[cfg(feature = "policy-runtime")]
+    if inner.policy_run.is_some() {
+        inner.terminate_policy_run_static(
+            "LEASE_LOST",
+            "cancelled",
+            Some("LEASE_LOST"),
+            Some("Control lease released on disconnect"),
+        );
+    }
     let stop_client_motion = valid
         || (inner.fenced_lease_generation < gen
             && inner.watchdog_park.is_none()
             && !inner.pending_normal_unload);
     inner.fence_displaced_lease_generation(gen, stop_client_motion);
     let _ = inner.clear_active_lease_in_place();
-    #[cfg(feature = "policy-runtime")]
-    if inner.policy_run.is_some() {
-        inner.terminate_policy_run(
-            "LEASE_LOST",
-            "cancelled",
-            Some("LEASE_LOST"),
-            Some("Control lease released on disconnect".into()),
-        );
-    }
     LeaseOutcome::Disconnected {
         released: valid,
         displaced_generation: gen,

@@ -828,7 +828,14 @@ fn commit_boundaries_for_path_replay_jog_and_config_do_not_allocate_or_free() {
         power_scale: None,
     };
 
-    let jog_prim = Primitive::JointQuintic { dof: dof as u8, start, q: goal, duration_s: 0.5 };
+    let jog_slot = {
+        let mut snap = armd::rt_core::requests::motion::MotionPlanSnapshot::from_supervisor(&fx.core);
+        snap.authority.deadline = deadline;
+        armd::rt_core::requests::motion::prepare_motion(
+            &snap,
+            &armd::rt_core::requests::motion::MotionRequest::jog(goal[..dof].to_vec(), Some(0.5), None),
+        ).unwrap().slot
+    };
 
     // 2. Direct commit checks for stale boot id, zero boot id, overtaken stop, stale start,
     //    invalid prepared path, and mismatched replay tool digest across jog, path, and replay
@@ -877,7 +884,15 @@ fn commit_boundaries_for_path_replay_jog_and_config_do_not_allocate_or_free() {
     };
     let mut stale_start = start;
     stale_start[0] += 0.01;
-    let stale_jog = Primitive::JointQuintic { dof: dof as u8, start: stale_start, q: goal, duration_s: 0.5 };
+    let stale_jog_slot = {
+        let mut snap = armd::rt_core::requests::motion::MotionPlanSnapshot::from_supervisor(&fx.core);
+        snap.commanded_positions = stale_start[..dof].to_vec();
+        snap.authority.deadline = deadline;
+        armd::rt_core::requests::motion::prepare_motion(
+            &snap,
+            &armd::rt_core::requests::motion::MotionRequest::jog(goal[..dof].to_vec(), Some(0.5), None),
+        ).unwrap().slot
+    };
 
     let (codes, allocs, frees) = counted(|| {
         let d_stale_boot = desc(stale_boot, 0, CommandKind::Install { plan: h_cart });
@@ -887,10 +902,10 @@ fn commit_boundaries_for_path_replay_jog_and_config_do_not_allocate_or_free() {
         let d_bad_path = desc(boot, 0, CommandKind::Install { plan: h_bad_path });
         let d_bad_tool = desc(boot, 0, CommandKind::Install { plan: h_bad_tool });
 
-        let c1 = fx.core.commit_primitive(&d_stale_boot, &jog_prim, &ctx_ok).unwrap_err();
-        let c2 = fx.core.commit_primitive(&d_zero_boot, &jog_prim, &ctx_ok).unwrap_err();
-        let c3 = fx.core.commit_primitive(&d_ok, &jog_prim, &ctx_stopped).unwrap_err();
-        let c4 = fx.core.commit_primitive(&d_ok, &stale_jog, &ctx_ok).unwrap_err();
+        let c1 = fx.core.commit_install_slot(&d_stale_boot, &jog_slot, &ctx_ok).unwrap_err();
+        let c2 = fx.core.commit_install_slot(&d_zero_boot, &jog_slot, &ctx_ok).unwrap_err();
+        let c3 = fx.core.commit_install_slot(&d_ok, &jog_slot, &ctx_stopped).unwrap_err();
+        let c4 = fx.core.commit_install_slot(&d_ok, &stale_jog_slot, &ctx_ok).unwrap_err();
 
         let p1 = fx.core.commit_prepared_slot(&d_stale_boot, pr.pin(h_cart).unwrap(), &ctx_ok).unwrap_err();
         let p2 = fx.core.commit_prepared_slot(&d_ok, pr.pin(h_cart).unwrap(), &ctx_stopped).unwrap_err();
@@ -1100,24 +1115,35 @@ fn commit_boundaries_for_path_replay_jog_and_config_do_not_allocate_or_free() {
     }
     let _ = fx.core.core.hub().latest();
 
-    // 7. Accepted Jog commit (`Primitive::JointQuintic` via `fx.step()`) performs (0, 0)
-    //    allocs/frees (including inline quintic planner + stack workspace sweep) and runs
-    //    steady-state ticks with (0, 0) allocs/frees.
-    let mut jog_start = [0.0f32; MAX_DOF];
-    jog_start[..dof].copy_from_slice(&fx.core.commanded_positions);
-    let mut jog_goal = jog_start;
+    // 7. Accepted Jog commit (prepared `PreparedMotionSlot` via `fx.step()`) performs (0, 0)
+    //    allocs/frees and runs steady-state ticks with (0, 0) allocs/frees.
+    let mut jog_goal = fx.core.commanded_positions.clone();
     jog_goal[0] -= 0.05;
-    let jog_after = Primitive::JointQuintic { dof: dof as u8, start: jog_start, q: jog_goal, duration_s: 1.0 };
+    let jog_after = {
+        let mut snap = armd::rt_core::requests::motion::MotionPlanSnapshot::from_supervisor(&fx.core);
+        let a = fx.core.authority(&fx.ctx(fx.now()));
+        snap.authority = armd::rt_core::requests::motion::PlanAuthority {
+            boot: fx.boot(),
+            epoch: a.epoch,
+            lease_generation: a.lease_generation,
+            stop_generation: a.stop_generation,
+            deadline,
+        };
+        armd::rt_core::requests::motion::prepare_motion(
+            &snap,
+            &armd::rt_core::requests::motion::MotionRequest::jog(jog_goal, Some(1.0), None),
+        ).unwrap().slot
+    };
     b.submit(
         ClientId(1),
         3,
         fx.core.authority(&fx.ctx(fx.now())),
         deadline,
-        Submit::Install(&move |s: &mut PlanSlot| s.set(jog_after)),
+        Submit::Install(&move |s: &mut PlanSlot| armd::rt_core::requests::motion::stage_jog(s, &jog_after)),
     )
     .unwrap();
     let (step_jog, a_jog_commit, f_jog_commit) = counted(|| fx.step());
-    assert!(step_jog.command.unwrap().1.is_ok(), "jog committed via jog_action_slice");
+    assert!(step_jog.command.unwrap().1.is_ok(), "jog committed via PreparedMotionSlot");
     assert_eq!(
         (a_jog_commit, f_jog_commit),
         (0, 0),
@@ -1237,17 +1263,30 @@ fn accepted_commits_on_device_profile_with_workspace_and_power_budget_do_not_all
     fx.step();
     b.poll(|_, _| true);
 
-    // 3. Accepted jog commit on device profile (exercises quintic planner + power planning + workspace sweep).
-    start[..dof].copy_from_slice(&fx.core.commanded_positions);
-    let mut goal = start;
-    goal[0] -= 0.04;
-    let jog = Primitive::JointQuintic { dof: dof as u8, start, q: goal, duration_s: 0.8 };
+    // 3. Accepted prepared jog commit on device profile (workspace + power budget prepared off-RT).
+    let mut goal_vec = fx.core.commanded_positions.clone();
+    goal_vec[0] -= 0.04;
+    let jog_slot = {
+        let mut snap = armd::rt_core::requests::motion::MotionPlanSnapshot::from_supervisor(&fx.core);
+        let a = fx.core.authority(&fx.ctx(fx.now()));
+        snap.authority = armd::rt_core::requests::motion::PlanAuthority {
+            boot: fx.boot(),
+            epoch: a.epoch,
+            lease_generation: a.lease_generation,
+            stop_generation: a.stop_generation,
+            deadline,
+        };
+        armd::rt_core::requests::motion::prepare_motion(
+            &snap,
+            &armd::rt_core::requests::motion::MotionRequest::jog(goal_vec, Some(0.8), None),
+        ).unwrap().slot
+    };
     b.submit(
         ClientId(1),
         3,
         fx.core.authority(&fx.ctx(fx.now())),
         deadline,
-        Submit::Install(&move |s: &mut PlanSlot| s.set(jog)),
+        Submit::Install(&move |s: &mut PlanSlot| armd::rt_core::requests::motion::stage_jog(s, &jog_slot)),
     )
     .unwrap();
     let (rep, a, f) = counted(|| fx.step());
@@ -1580,7 +1619,7 @@ fn gripper_short_stall_error_and_grasp_squeeze_settle_are_zero_alloc() {
     {
         use armd::rt_core::broker::{plan_slots, BootId, ClientId, CommandKind, Descriptor, RequestId, Stamp};
         use armd::rt_core::ids::ArmId;
-        use armd::rt_core::ops::{CommitCtx, CoreOps, PlanSlot, Primitive};
+        use armd::rt_core::ops::{CommitCtx, CoreOps, PlanSlot};
 
         let mut inner = supervisor(false);
         inner.rt_executor_owned = true;
@@ -1591,6 +1630,7 @@ fn gripper_short_stall_error_and_grasp_squeeze_settle_are_zero_alloc() {
         warm(&mut inner, 3);
 
         let boot = BootId::fresh();
+        inner.set_boot_id(boot);
         let (mut pw, _pr) = plan_slots(1, PlanSlot::default);
         let h_plan = pw.stage(|_| {}).unwrap();
         let mut last_id = 0u64;
@@ -1598,7 +1638,6 @@ fn gripper_short_stall_error_and_grasp_squeeze_settle_are_zero_alloc() {
         for round in 1..=3usize {
             let mut jog_target = inner.commanded_positions.clone();
             jog_target[0] += 0.05;
-            let prim = Primitive::joint_quintic(&inner.commanded_positions, &jog_target, 1.0).unwrap();
             let now = Instant::now();
             let ctx = CommitCtx {
                 arm: ArmId::LOCAL,
@@ -1607,6 +1646,18 @@ fn gripper_short_stall_error_and_grasp_squeeze_settle_are_zero_alloc() {
                 stop_generation: 0,
             };
             let auth = inner.authority(&ctx);
+            let mut snap = armd::rt_core::requests::motion::MotionPlanSnapshot::from_supervisor(&inner);
+            snap.authority = armd::rt_core::requests::motion::PlanAuthority {
+                boot,
+                epoch: auth.epoch,
+                lease_generation: auth.lease_generation,
+                stop_generation: auth.stop_generation,
+                deadline: now + Duration::from_secs(10),
+            };
+            let jog_slot = armd::rt_core::requests::motion::prepare_motion(
+                &snap,
+                &armd::rt_core::requests::motion::MotionRequest::jog(jog_target, Some(1.0), None),
+            ).unwrap().slot;
             let d = Descriptor {
                 stamp: Stamp {
                     arm: ArmId::LOCAL,
@@ -1619,8 +1670,8 @@ fn gripper_short_stall_error_and_grasp_squeeze_settle_are_zero_alloc() {
                 },
                 kind: CommandKind::Install { plan: h_plan },
             };
-            // `commit_primitive` enters `jog_action_slice` -> `begin_action_rt` (no off-RT spare refill).
-            let (res, a_start, f_start) = counted(|| inner.commit_primitive(&d, &prim, &ctx));
+            // `commit_install_slot` enters `install_jog_at` -> `begin_action_rt` (no off-RT spare refill).
+            let (res, a_start, f_start) = counted(|| inner.commit_install_slot(&d, &jog_slot, &ctx));
             let act_id = res.unwrap().action().unwrap().0;
             last_id = act_id;
             assert_eq!(

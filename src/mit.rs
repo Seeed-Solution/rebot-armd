@@ -553,6 +553,9 @@ pub struct MitRuntime {
     pub lost_reason: Option<crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>>,
     /// A park was requested while MIT moved the arm: it starts after rest and the hand back.
     pub park_after_hand_back: bool,
+    /// When true, MIT handback transitions `park_continuation` to `ReadyForPlan` instead of
+    /// planning synchronously inside `tick_control`.
+    pub deferred_park_off_owner: bool,
     /// Action id of that deferred park (its outcome is reported on it).
     pub deferred_park_action: Option<u64>,
     /// A rearm was refused while MIT moved the arm: brake, then hand back at rest.
@@ -602,6 +605,7 @@ impl crate::supervisor::SupervisorInner {
 
     /// Why a motion may not start: MIT is requested on an armed arm but does not own its joints.
     pub fn mit_motion_blocker(&self) -> Option<String> {
+        if self.park_continuation.is_some() { return Some("a park continuation is pending".into()); }
         if !self.mit_motion_blocked() { return None; }
         if self.mit.park_after_hand_back { return Some("a park waits for the MIT hand back at rest".into()); }
         if self.mit.revoke_pending { return Some("MIT authorization revoked: braking to rest and handing back".into()); }
@@ -848,37 +852,55 @@ impl crate::supervisor::SupervisorInner {
 
     /// Velocity ceiling (rad/s) currently authorized for joint `g` by the active motion,
     /// persistent gripper hold, fallback ramp, servo stream, or profile limit.
-    fn active_joint_velocity_ceiling(&self, g: usize) -> Option<f32> {
+    pub(crate) fn active_joint_velocity_ceiling(&self, g: usize) -> Option<f32> {
+        #[cfg(feature = "policy-runtime")]
+        let policy_scale = self
+            .policy_run
+            .as_ref()
+            .filter(|r| r.mode == crate::policy_runtime::PolicyMode::Live)
+            .and_then(crate::policy_runtime::PolicyRun::release_gate_max_speed_scale)
+            .map(|s| (s as f32).clamp(0.1, 1.0));
+        #[cfg(not(feature = "policy-runtime"))]
+        let policy_scale: Option<f32> = None;
+
         let base = if let Some(active) = &self.active_trajectory {
             if let crate::motion::Reference::Gripper(gm) = &active.reference {
                 if gm.gripper_index == g {
                     return Some(gm.wire_velocity_ceiling());
                 }
             }
-            active.motion_limits.as_ref().and_then(|ls| ls.get(g).map(|l| l.max_velocity))
+            active
+                .motion_limits
+                .as_ref()
+                .and_then(|ls| ls.get(g).map(|l| l.max_velocity))
+                .or_else(|| active.motion_vel_caps.and_then(|(caps, dof)| (g < dof).then_some(caps[g])))
         } else if let Some(ramp) = &self.tracking.fallback_ramp {
             ramp.limits.get(g).map(|l| l.max_velocity)
         } else if let Some(lim) = self.tracking.retained_motion_limits.as_ref().and_then(|ls| ls.get(g)) {
             Some(lim.max_velocity)
+        } else if let Some((caps, dof)) = self.tracking.retained_motion_vel_caps {
+            (g < dof).then_some(caps[g])
         } else if self.servo_target.is_some() {
             let mut v = self.config.limits.get(g)?.max_velocity;
-            #[cfg(feature = "policy-runtime")]
-            if let Some(ref run) = self.policy_run {
-                if run.mode == crate::policy_runtime::PolicyMode::Live {
-                    if let Some(ref gate) = run.verified_release_gate {
-                        v *= (gate.max_speed_scale() as f32).clamp(0.1, 1.0);
-                    }
-                }
+            if let Some(scale) = policy_scale {
+                v *= scale;
             }
             Some(v)
         } else {
             None
         };
-        let ceiling = base.or_else(|| self.config.limits.get(g).map(|l| l.max_velocity))?;
+        let mut ceiling = base.or_else(|| self.config.limits.get(g).map(|l| l.max_velocity))?;
+        if self.active_trajectory.is_none() && self.tracking.fallback_ramp.is_none() {
+            if let Some(scale) = policy_scale {
+                if let Some(prof_v) = self.config.limits.get(g).map(|l| l.max_velocity * scale) {
+                    ceiling = ceiling.min(prof_v);
+                }
+            }
+        }
         Some(self.gripper_hold_vel_ceiling.map_or(ceiling, |hold_v| ceiling.min(hold_v)))
     }
 
-    fn write_output_slice(
+    pub(crate) fn write_output_slice(
         &mut self,
         targets: &mut [JointTarget],
         dt: f64,
@@ -893,12 +915,37 @@ impl crate::supervisor::SupervisorInner {
             return TickOutput::None;
         }
         let is_hold = self.safety.state().is_stopped();
+        let non_target_stamp = self.current_j7_intent_stamp();
         // Capture the client lease generation BEFORE `post_stop_check_hook` and BEFORE locking
         // the driver so even a disconnect arriving in that exact window is caught at the driver's
         // single TX choke point (`DamiaoArmDriver::send`). Autonomous safety motions
         // (`watchdog_park`, `pending_normal_unload`) and stopped holds carry `0` (lease-exempt).
+        // Live policy output NEVER downgrades to lease-exempt `0` on expiry: if the lease
+        // expired between the top-of-tick fence and TX staging, fail closed and hold J7.
         let output_lease_gen = if !is_hold && self.watchdog_park.is_none() && !self.pending_normal_unload {
-            self.current_active_lease_gen()
+            #[cfg(feature = "policy-runtime")]
+            if let Some(run) = self
+                .policy_run
+                .as_ref()
+                .filter(|r| r.mode == crate::policy_runtime::PolicyMode::Live)
+            {
+                if self.lease_enabled {
+                    let active_gen = self.current_active_lease_gen();
+                    if run.lease_generation == 0 || active_gen != run.lease_generation {
+                        self.j7_intent = Some(PosForceIntent::hold(non_target_stamp));
+                        return TickOutput::None;
+                    }
+                    run.lease_generation
+                } else {
+                    self.current_active_lease_gen()
+                }
+            } else {
+                self.current_active_lease_gen()
+            }
+            #[cfg(not(feature = "policy-runtime"))]
+            {
+                self.current_active_lease_gen()
+            }
         } else {
             0
         };
@@ -911,7 +958,6 @@ impl crate::supervisor::SupervisorInner {
         // even right between the `urgent_stop_unapplied()` check above and intent creation — turns
         // the intent into `Hold` in the tick epilogue's single J7 emitter.
         let admitted_target_stamp = self.j7_admitted_stamp;
-        let non_target_stamp = self.current_j7_intent_stamp();
         let ff = match self.mit.owner {
             MitOwner::Off => None,
             MitOwner::Lost => {
@@ -1272,7 +1318,8 @@ impl crate::supervisor::SupervisorInner {
     /// the output (no motion, park, gravity compensation, hold or fault).
     pub(crate) fn mit_maybe_activate(&mut self) {
         if mit_joint_mask(&self.config) == 0 || self.mit.owner != MitOwner::Off || !self.mit.armed_ok || !self.is_torqued
-            || self.disable_pending || self.pending_rearm || self.pending_normal_unload || self.gravity_comp.is_some()
+            || self.disable_pending || self.pending_rearm || self.pending_normal_unload
+            || self.park_continuation.is_some() || self.gravity_comp.is_some()
             || self.safety.state().is_stopped() || !self.safety.state().is_operational() || self.handover_settling_since.is_some()
             || self.active_trajectory.is_some() || self.servo_target.is_some() || self.servo_stream_active
             || self.collision.hold.is_some() || self.torque_guard.hold.is_some() || self.servo_blocked_hold

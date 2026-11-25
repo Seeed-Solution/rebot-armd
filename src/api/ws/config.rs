@@ -14,7 +14,7 @@
 use super::*;
 use super::dispatch::{
     AdmissionClass, AuthRequirement, DispatchEntry, DispatchHandler, DispatchKey,
-    FrameKind, LeaseRequirement, OwnerDispatchCtx, ReplyPolicy,
+    FrameKind, LeaseRequirement, OwnerDispatchCtx, OwnerReply, ReplyPolicy,
 };
 use crate::model::{HolderLabel, KeepoutBox};
 use crate::motion::MotionError;
@@ -69,7 +69,7 @@ pub(super) struct PendingConfigJob {
     pub(super) require_expected_revision: bool,
 }
 
-fn dispatch_config_entry(ctx: &mut OwnerDispatchCtx<'_>) -> Option<Value> {
+fn dispatch_config_entry(ctx: &mut OwnerDispatchCtx<'_>) -> Option<OwnerReply> {
     let static_path = ENTRIES
         .iter()
         .find_map(|e| e.key.path.filter(|&p| p == ctx.path))
@@ -144,7 +144,7 @@ impl PreparedOffThreadConfig {
     }
 }
 
-fn off_lock_command_reject(request_id: &Value, epoch: u64, error: ApiError) -> Value {
+pub(super) fn off_lock_command_reject(request_id: &Value, epoch: u64, error: ApiError) -> Value {
     let mut reply = rejection(error, "command_reject", epoch);
     reply["request_id"] = request_id.clone();
     reply
@@ -1426,7 +1426,7 @@ async fn commit_prepared_config(
     }
 }
 
-fn current_epoch_off_lock(sup: &ArmSupervisor, fallback: u64) -> u64 {
+pub(super) fn current_epoch_off_lock(sup: &ArmSupervisor, fallback: u64) -> u64 {
     let hub_ep = sup.hub().latest().map_or(fallback, |s| s.obs.epoch_id);
     hub_ep.max(sup.estop_epoch())
 }

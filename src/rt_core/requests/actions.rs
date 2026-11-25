@@ -2833,7 +2833,7 @@ pub(crate) fn check_quintic_workspace_off_lock(
     workspace_samples_and_check_off_lock(traj, start, ws, cam, arm, tcp_offset).map(|_| ())
 }
 
-fn build_prepared_quintic_off_lock(
+pub(crate) fn build_prepared_quintic_off_lock(
     snap: &ActionSnapshot,
     target: &[f32],
     limits: &[JointLimit],
@@ -3370,7 +3370,7 @@ fn install_move_joint_rt(
     }
     this.release_servo_target();
     this.servo_settled_ticks.fill(0);
-    this.servo_ws_min_depths = None;
+    this.clear_servo_ws_min_depths_rt();
     crate::rt_core::scratch::copy_into(&mut this.target_positions, &tgt[..dof]);
     this.safety
         .mark_motion_started()
@@ -3571,7 +3571,7 @@ fn install_gripper_rt(
     this.gripper_hold_vel_ceiling = Some(wire_vel_ceiling);
     this.release_servo_target();
     this.servo_settled_ticks.fill(0);
-    this.servo_ws_min_depths = None;
+    this.clear_servo_ws_min_depths_rt();
     crate::rt_core::scratch::copy_into(&mut this.target_positions, &this.commanded_positions);
     if gripper_idx < this.target_positions.len() {
         this.target_positions[gripper_idx] = target_g;
@@ -3932,6 +3932,7 @@ pub enum MacroChildPayload {
         start: Vec<f32>,
         target: Vec<f32>,
         limits: Vec<JointLimit>,
+        prepared: Option<PreparedQuintic>,
     },
     /// Legacy prepared gripper child.
     LegacyGripper {
@@ -4068,6 +4069,7 @@ pub fn install_macro_child(
             start,
             target,
             limits,
+            prepared,
         } => {
             let parent_id = precheck_macro_child(inner, stamp, ctx, &spec, &start)
                 .map_err(|r| r.into_arm_error(inner))?;
@@ -4079,7 +4081,13 @@ pub fn install_macro_child(
                     return Err(r.into_arm_error(inner));
                 }
             };
-            let dur = match SupervisorInner::install_macro_quintic(admitted, parent_id, target, &limits) {
+            let dur = match SupervisorInner::install_macro_quintic_prepared(
+                admitted,
+                parent_id,
+                target,
+                &limits,
+                prepared,
+            ) {
                 Ok(d) => d,
                 Err(e) => {
                     inner.guard_next_macro_child(parent_id, None);
@@ -4591,7 +4599,7 @@ fn install_macro_child_slot_rt(
             this.gripper_hold_vel_ceiling = Some(wire_vel);
             this.release_servo_target();
             this.servo_settled_ticks.fill(0);
-            this.servo_ws_min_depths = None;
+            this.clear_servo_ws_min_depths_rt();
             crate::rt_core::scratch::copy_into(&mut this.target_positions, &this.commanded_positions);
             if gripper_idx < this.target_positions.len() {
                 this.target_positions[gripper_idx] = target_g;

@@ -125,6 +125,8 @@ pub struct PublishedConfig {
     pub torque_guard_thresholds: Vec<Option<f32>>,
     pub effective_planned_close_speed: f64,
     pub policy_live_allowed: bool,
+    #[cfg(feature = "policy-runtime")]
+    pub policy_ledger_path: Option<PathBuf>,
     pub fallback_measured_positions: Vec<f32>,
 }
 
@@ -201,6 +203,8 @@ impl PublishedConfig {
                     false
                 }
             },
+            #[cfg(feature = "policy-runtime")]
+            policy_ledger_path: inner.policy_ledger_path.clone(),
             fallback_measured_positions: inner.measured_positions.clone(),
         }
     }
@@ -331,6 +335,11 @@ impl PublishedConfig {
         self.calibration
             .as_ref()
             .is_some_and(|c| c.camera_mount.q_end_cam.is_some())
+    }
+
+    #[cfg(feature = "policy-runtime")]
+    pub fn active_calibration_digest(&self) -> String {
+        SupervisorInner::calibration_digest_of(self.calibration.as_ref())
     }
 
     pub fn pose_tcp(&self, q: &[f32]) -> Option<PoseTcp> {
@@ -1181,6 +1190,26 @@ pub enum ConfigRequest {
     /// Zero-alloc check on live owner whether `episode_id` may be deleted (not referenced by
     /// saved sequences, running sequence pins, or an active `Sequences` save reservation).
     CheckEpisodeDeleteAllowed(HolderLabel),
+}
+
+impl ConfigRequest {
+    /// Static command path attributed to this config request in lock diagnostics (zero allocation).
+    pub fn command_label(&self) -> &'static str {
+        match self {
+            Self::Reserve(r) => r.proposal.domain.command_path(),
+            Self::VerifyAuthority { domain, .. }
+            | Self::LatchConfigReconcileFault { domain, .. }
+            | Self::ForceReconcile(domain)
+            | Self::InspectHold(domain) => domain.command_path(),
+            Self::Persisted(p) => p.reservation.domain().command_path(),
+            Self::Activate(a) => a.reservation.domain().command_path(),
+            Self::FinishReconcile(f) => f.domain.command_path(),
+            Self::Release(r) => r.reservation.domain().command_path(),
+            Self::SampleTableCapture => "/api/v1/grasp/setup",
+            Self::GravityComp(_) => "/api/v1/mode/gravity_comp",
+            Self::CheckEpisodeDeleteAllowed(_) => "/api/v1/episodes/delete",
+        }
+    }
 }
 
 /// Reply produced on the owner and read off-thread from `ConfigExchange`.
