@@ -663,6 +663,48 @@ pub async fn begin_executor(
     plan: Plan,
     source: Arc<dyn DetectionSource>,
 ) -> Result<(u64, f64), ArmError> {
+    let (started, guard) = begin_executor_inner(
+        sup,
+        stamp,
+        plan,
+        source,
+        crate::rt_core::reply_router::ExternalDestinationPolicy::ConnectionOrGlobal,
+        false,
+        None,
+    )
+    .await?;
+    let _ = guard.confirm_enqueued();
+    Ok(started)
+}
+
+pub(crate) async fn begin_executor_ws(
+    sup: &Arc<ArmSupervisor>,
+    stamp: crate::supervisor::AdmissionStamp,
+    plan: Plan,
+    source: Arc<dyn DetectionSource>,
+    wire_tracker: Arc<crate::rt_core::reply_router::WsWireAckTracker>,
+) -> Result<((u64, f64), crate::rt_core::reply_router::AckCommitGuard), ArmError> {
+    begin_executor_inner(
+        sup,
+        stamp,
+        plan,
+        source,
+        crate::rt_core::reply_router::ExternalDestinationPolicy::ConnectionOnly,
+        true,
+        Some(wire_tracker),
+    )
+    .await
+}
+
+async fn begin_executor_inner(
+    sup: &Arc<ArmSupervisor>,
+    stamp: crate::supervisor::AdmissionStamp,
+    plan: Plan,
+    source: Arc<dyn DetectionSource>,
+    policy: crate::rt_core::reply_router::ExternalDestinationPolicy,
+    require_ack_commit: bool,
+    wire_tracker: Option<Arc<crate::rt_core::reply_router::WsWireAckTracker>>,
+) -> Result<((u64, f64), crate::rt_core::reply_router::AckCommitGuard), ArmError> {
     use crate::rt_core::requests::actions::{ActionStamp, DEFAULT_ACTION_DEADLINE};
     let handle = sup.executor_handle().ok_or_else(|| ArmError::Rejected {
         status: 503,
@@ -692,10 +734,17 @@ pub async fn begin_executor(
         parent_generation: 0,
         deadline: now + DEFAULT_ACTION_DEADLINE,
     };
-    let (id, _req_id) =
-        crate::macro_action::begin_macro_executor(sup, &action_stamp, spec, action_stamp.deadline)
-            .await?;
-    Ok(spawn_measure_worker(sup, id, plan, source, stamp, deadline_at))
+    let (id, _req_id, ack_guard) = crate::macro_action::begin_macro_executor_with_barrier(
+        sup,
+        &action_stamp,
+        spec,
+        action_stamp.deadline,
+        policy,
+        require_ack_commit,
+        wire_tracker,
+    )
+    .await?;
+    Ok((spawn_measure_worker(sup, id, plan, source, stamp, deadline_at), ack_guard))
 }
 
 /// Build the A7 [`BeginMacroSpec`] for a prepared multi-view measurement (shared by Legacy and RT Executor).

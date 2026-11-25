@@ -1590,6 +1590,10 @@ pub struct ArmConfig {
     /// Whether active tool dynamics are qualified for gravity compensation / feedforward.
     #[serde(default = "default_true", skip_deserializing, skip_serializing_if = "is_true")]
     pub dynamics_qualified: bool,
+    /// Enable observation-only `TorqueController` shadow mode on both control owners
+    /// (`ARMD_TORQUE_SHADOW=0|false|off|no` overrides to off at startup). Default: `true`.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub torque_shadow_enabled: bool,
     /// Arm model built from the fields above (not part of the profile JSON).
     #[serde(skip)]
     pub arm_model: crate::chain::ArmModel,
@@ -1684,6 +1688,7 @@ impl Default for ArmConfig {
             physical_contact_end_m: None,
             contact_opening_m: None,
             dynamics_qualified: true,
+            torque_shadow_enabled: true,
             arm_model: crate::chain::ArmModel::REBOT_DEV_ARM,
         }
     }
@@ -3498,6 +3503,7 @@ impl ArmConfig {
             physical_contact_end_m: None,
             contact_opening_m: None,
             dynamics_qualified: true,
+            torque_shadow_enabled: true,
             arm_model: crate::chain::ArmModel::REBOT_DEV_ARM,
         }
     }

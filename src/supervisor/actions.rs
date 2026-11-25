@@ -143,8 +143,6 @@ impl SupervisorInner {
                     old.message = Some(format!("Replaced by a new {kind} action"));
                 }
                 old.finished_at = Some(now);
-            }
-            if was_running {
                 self.record_terminal_transition_for(&old);
             }
             if let Some((evicting_prev, _)) = self.previous_action.as_ref() {

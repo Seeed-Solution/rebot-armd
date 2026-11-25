@@ -1977,12 +1977,28 @@ async fn review_b3_live_gripper_zero_check_refreshes_prep_env_for_subsequent_act
         .expect("fresh ActionSnapshot after live calibration must succeed (not PLAN_STALE)");
     assert!(snap.env.gripper_calib_revision > initial_rev);
 
+    // Register a per-connection reply sink for ClientId(1) so InstallPrepared commits through P-F1's router.
+    let conn1_terminals = Arc::new(Mutex::new(Vec::<Reply>::new()));
+    {
+        let out = Arc::clone(&conn1_terminals);
+        handle
+            .register_connection_reply_sink(
+                ClientId(1),
+                Arc::new(move |_, r| {
+                    out.lock().unwrap().push(r);
+                    DeliveryDecision::Delivered
+                }),
+                None,
+            )
+            .unwrap();
+    }
+
     // 1) Fresh standalone gripper succeeds!
     let g_prep = prepare_gripper(&snap, &json!({"command": "move", "fraction": 0.2, "speed": 1.0}), GripperBaselineCmd::None).unwrap();
     let g_slot = g_prep.to_plan_slot(None).unwrap();
     let write_g = |dst: &mut PlanSlot| *dst = g_slot.clone();
-    let (_, mut rx_g) = handle
-        .submit_internal_action(
+    let (_, mut rx_g, _guard_g) = handle
+        .submit_external_action(
             ClientId(1),
             1,
             snap.owner.authority,
@@ -1998,12 +2014,15 @@ async fn review_b3_live_gripper_zero_check_refreshes_prep_env_for_subsequent_act
                 gripper_calib_revision: g_prep.stamp.gripper_calib_revision,
                 power_budget_revision: None,
             },
+            armd::rt_core::reply_router::ExternalDestinationPolicy::ConnectionOnly,
+            false,
+            None,
         )
         .unwrap();
     let mut ack_g = None;
     for _ in 0..200 {
         handle.pump_broker_replies();
-        if let Ok(r) = rx_g.try_recv() {
+        if let Ok(Ok(r)) = rx_g.try_recv() {
             ack_g = Some(r);
             break;
         }
@@ -2017,13 +2036,14 @@ async fn review_b3_live_gripper_zero_check_refreshes_prep_env_for_subsequent_act
     let mut g_ended = false;
     let g_wait_dl = Instant::now() + Duration::from_secs(10);
     while Instant::now() < g_wait_dl {
-        handle.poll_external_replies(|_, r| {
-            if matches!(r, Reply::Terminal { action, .. } if action == g_action_id) {
-                g_ended = true;
-            }
-            DeliveryDecision::Delivered
-        });
-        if g_ended {
+        handle.pump_broker_replies();
+        if conn1_terminals
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| matches!(r, Reply::Terminal { action, .. } if *action == g_action_id))
+        {
+            g_ended = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2039,8 +2059,8 @@ async fn review_b3_live_gripper_zero_check_refreshes_prep_env_for_subsequent_act
     let m_prep = prepare_move_to(&snap2, &json!({"position": [p0[0] + 0.02, p0[1], p0[2]]})).unwrap();
     let m_slot = m_prep.to_plan_slot(None).unwrap();
     let write_m = |dst: &mut PlanSlot| *dst = m_slot.clone();
-    let (_, mut rx_m) = handle
-        .submit_internal_action(
+    let (_, mut rx_m, _guard_m) = handle
+        .submit_external_action(
             ClientId(1),
             2,
             snap2.owner.authority,
@@ -2056,12 +2076,15 @@ async fn review_b3_live_gripper_zero_check_refreshes_prep_env_for_subsequent_act
                 gripper_calib_revision: None,
                 power_budget_revision: Some(snap2.env.power_budget_revision),
             },
+            armd::rt_core::reply_router::ExternalDestinationPolicy::ConnectionOnly,
+            false,
+            None,
         )
         .unwrap();
     let mut ack_m = None;
     for _ in 0..200 {
         handle.pump_broker_replies();
-        if let Ok(r) = rx_m.try_recv() {
+        if let Ok(Ok(r)) = rx_m.try_recv() {
             ack_m = Some(r);
             break;
         }
@@ -2074,13 +2097,14 @@ async fn review_b3_live_gripper_zero_check_refreshes_prep_env_for_subsequent_act
     };
     let mut m_ended = false;
     for _ in 0..600 {
-        handle.poll_external_replies(|_, r| {
-            if matches!(r, Reply::Terminal { action, .. } if action == m_action_id) {
-                m_ended = true;
-            }
-            DeliveryDecision::Delivered
-        });
-        if m_ended {
+        handle.pump_broker_replies();
+        if conn1_terminals
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| matches!(r, Reply::Terminal { action, .. } if *action == m_action_id))
+        {
+            m_ended = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(5)).await;

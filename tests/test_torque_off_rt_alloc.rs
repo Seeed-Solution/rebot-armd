@@ -1813,3 +1813,216 @@ fn r12_m3_feetech_rt_disable_path_zero_alloc_and_honours_rx_budget_and_deadline(
         "M3: DisableProtective(0) must write all 6 disable frames with 0 RX reads"
     );
 }
+
+/// Shadow PR1 RT zero-allocation proof under BOTH outgoing SPSC ring saturation (>1024 records
+/// with no off-thread worker draining) AND driver staging overflow (>128 RX frames in one pass):
+/// proves strictly (0 allocs, 0 frees) across normal releases, stopped torque-off, and transition
+/// wakes while `interval_unverifiable` latches cleanly.
+#[test]
+fn rt_torque_off_shadow_on_ring_saturation_and_staging_overflow_zero_allocs() {
+    let clock = Arc::new(MockClock::new());
+    let bus = ZeroAllocBus::new(clock.clone());
+    let mut cfg = ArmConfig::rebot_dm();
+    cfg.torque_shadow_enabled = true;
+    cfg.resting_pose = Some(armd::model::RestingPosePolicy {
+        positions: Some(vec![0.0; 7]),
+        ..armd::model::RestingPosePolicy::rebot_dm()
+    });
+    let limits: Vec<DamiaoLimits> = cfg
+        .damiao_ranges
+        .as_ref()
+        .unwrap()
+        .iter()
+        .map(|r| r.limits())
+        .collect();
+    let mut drv = DamiaoArmDriver::new(bus.clone(), (1..=7).collect())
+        .with_joint_limits(limits)
+        .unwrap();
+    bus.with(|s| s.push_all_feedback());
+    drv.read_joint_states().unwrap();
+    drv.check_mapping_ranges();
+    drv.set_rt_mode(true);
+    let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
+    inner.lease_enabled = false;
+    inner.register_live_connection(1).unwrap();
+    inner.tick(0.02);
+    let (mut fx, mut b, _tw, _stop) = ReleaseFixture::new(
+        inner,
+        BOOT,
+        Capacities { commands: 8, plans: 1, replies: 16 },
+    );
+
+    // Warm up 2 releases off-count so lazy caches are initialized (worker is NOT started, so
+    // the 1024-entry SPSC ring is never drained during the measured saturation phase!).
+    for _ in 0..2 {
+        clock.advance(RELEASE);
+        bus.with(|s| s.push_all_feedback());
+        let _ = fx.step();
+        fx.core.test_flush_and_drain_torque_shadow();
+    }
+
+    // 1. Saturate the 1024-entry SPSC ring with 220 measured releases (~1760 records, no drain)
+    //    AND flush strictly on RT with 0 allocs and 0 frees!
+    let mut total_a = 0u64;
+    let mut total_f = 0u64;
+    for _ in 0..220 {
+        clock.advance(RELEASE);
+        bus.with(|s| s.push_all_feedback());
+        let (_, a, f) = counted(|| {
+            let _ = fx.step();
+            fx.core.torque_shadow_flush_for_test();
+        });
+        total_a += a;
+        total_f += f;
+    }
+    assert_eq!(
+        (total_a, total_f),
+        (0, 0),
+        "220 RT releases through full SPSC ring saturation must perform (0, 0) heap ops"
+    );
+
+    // Verify the outgoing SPSC ring is ALREADY saturated BEFORE the transition wake!
+    let pre_wake_diag = fx.core.torque_shadow_diagnostics();
+    assert!(
+        pre_wake_diag.ring.interval_unverifiable && pre_wake_diag.ring.ring_dropped_records > 0,
+        "SPSC ring must already be saturated before submitting transition wake: {pre_wake_diag:?}"
+    );
+
+    // 2. Submit a TorqueOff transition wake while ring is already saturated and burst RX
+    //    is queued; witness the transition start + wake polling and assert strictly (0, 0) heap ops!
+    submit_torque_off(&fx, &mut b, 10);
+    bus.with(|s| {
+        for _ in 0..25 {
+            s.push_all_feedback();
+        }
+    });
+    let mut witnessed_cmd = false;
+    let mut witnessed_transition_activity = false;
+    let mut wake_allocs = 0u64;
+    let mut wake_frees = 0u64;
+    for _ in 0..8 {
+        clock.advance(RELEASE);
+        bus.with(|s| s.push_all_feedback());
+        let (rep, a_ov, f_ov) = counted(|| {
+            let r = fx.step();
+            fx.core.torque_shadow_flush_for_test();
+            r
+        });
+        wake_allocs += a_ov;
+        wake_frees += f_ov;
+        if rep.command.is_some() {
+            witnessed_cmd = true;
+        }
+        if rep.transition_ended.is_some() || rep.poll.torque.is_some() {
+            witnessed_transition_activity = true;
+        }
+        if rep.transition_ended.is_some() {
+            break;
+        }
+    }
+    assert!(witnessed_cmd, "must witness TorqueOff command commit under ring saturation");
+    assert!(
+        witnessed_transition_activity,
+        "must witness transition wake/completion activity under ring saturation"
+    );
+    assert_eq!(
+        (wake_allocs, wake_frees),
+        (0, 0),
+        "RT release + witnessed transition wake under saturated SPSC ring + burst RX must perform (0, 0) heap ops"
+    );
+
+    // Drain off-thread and assert permanent session-latched unverifiable flag & ring drops.
+    fx.core.test_flush_and_drain_torque_shadow();
+    let diag = fx.core.torque_shadow_diagnostics();
+    assert!(diag.enabled);
+    assert!(
+        diag.ring.interval_unverifiable,
+        "ring saturation must latch interval_unverifiable = true: {diag:?}"
+    );
+    assert!(
+        diag.ring.ring_dropped_records > 0,
+        "saturated ring must report dropped records: {diag:?}"
+    );
+    assert_eq!(diag.taxonomy.invariant_violation, 0);
+
+    // 3. Direct driver inline staging overflow (> DRIVER_SHADOW_STAGING_CAP = 128 frames
+    //    in one read_joint_states_budgeted call): must perform strictly (0, 0) heap ops
+    //    and report non-zero dropped count on drain!
+    let limits2: Vec<DamiaoLimits> = ArmConfig::rebot_dm()
+        .damiao_ranges
+        .unwrap()
+        .iter()
+        .map(|r| r.limits())
+        .collect();
+    let bus2 = ZeroAllocBus::new(clock.clone());
+    let mut drv2 = DamiaoArmDriver::new(bus2.clone(), (1..=7).collect())
+        .with_joint_limits(limits2)
+        .unwrap();
+    drv2.set_rt_mode(true);
+    drv2.set_shadow_enabled(true);
+    let mut js_buf = Vec::with_capacity(7);
+    let mut obs_buf = vec![None; armd::torque::shadow::DRIVER_SHADOW_STAGING_CAP];
+    // Warm up one read off-count.
+    bus2.with(|s| s.push_all_feedback());
+    let _ = drv2.read_joint_states_budgeted(&mut js_buf, clock.now() + Duration::from_millis(5), 32);
+    let _ = drv2.drain_shadow_observations(&mut obs_buf);
+
+    // Push 160 * 7 = 1120 frames (> DRIVER_SHADOW_STAGING_CAP = 1024) into the pre-allocated VecDeque
+    // (ensure capacity off-count so bus push never affects measured RT ops).
+    bus2.with(|s| {
+        s.rx.reserve(1200);
+        for _ in 0..160 {
+            s.push_all_feedback();
+        }
+    });
+    let dl = clock.now() + Duration::from_millis(20);
+    let (res, a_st, f_st) = counted(|| {
+        // Each budgeted read is internally capped to 64 RX frames; 18 consecutive reads before
+        // draining stage 1120 frames into the 1024-slot buffer (overflowing by 96) with 0 allocs.
+        let mut last = Ok((0u16, false));
+        for _ in 0..18 {
+            last = drv2.read_joint_states_budgeted(&mut js_buf, dl, 64);
+            if last.is_err() {
+                break;
+            }
+        }
+        let drained = drv2.drain_shadow_observations(&mut obs_buf);
+        (last, drained)
+    });
+    assert!(res.0.is_ok());
+    assert_eq!(
+        (a_st, f_st),
+        (0, 0),
+        "driver staging overflow (>DRIVER_SHADOW_STAGING_CAP frames) + drain must perform (0, 0) heap ops"
+    );
+    assert_eq!(res.1.0, armd::torque::shadow::DRIVER_SHADOW_STAGING_CAP);
+    assert!(
+        res.1.1 >= 80,
+        "1120 staged frames into 1024-slot buffer must report >= 80 dropped, got {}",
+        res.1.1
+    );
+
+    // 4. Hard-RT teardown proof: dropping BOTH `ShadowDriverStaging` and `ShadowRuntime` on
+    //    `armd-control` (`ControlThreadGuard`) AND running `record_post_panic_disable_shadow`
+    //    on `armd-control` MUST perform strictly (0, 0) heap ops and NEVER touch the driver mutex!
+    let (td_rt, td_hub) = armd::torque::shadow::ShadowRuntime::new_with_hub(
+        &ArmConfig::rebot_dm(),
+        true,
+        armd::torque::VendorKind::Damiao,
+        true,
+        None,
+    );
+    td_hub.start_worker().unwrap();
+    let td_staging = armd::torque::shadow::ShadowDriverStaging::new(true);
+    let (_, a_td, f_td) = counted(|| {
+        let _rt_guard = armd::rt_core::executor::ControlThreadGuard::enter();
+        drop(td_staging);
+        drop(td_rt);
+    });
+    assert_eq!(
+        (a_td, f_td),
+        (0, 0),
+        "armd-control teardown dropping ShadowDriverStaging and ShadowRuntime must perform (0, 0) heap ops"
+    );
+    td_hub.stop_and_flush_bounded(Duration::from_secs(1));
+}

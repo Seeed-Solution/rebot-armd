@@ -941,6 +941,12 @@ pub struct SupervisorInner {
     /// Lock-free mirror of [`Self::control_release_seq`] so off-lock legacy WS waiters can detect
     /// whether a live control loop is ticking without contending for `SupervisorLock`.
     pub(crate) control_release_seq_atomic: Arc<AtomicU64>,
+    /// Inline observation-only `TorqueController` shadow runtime (zero alloc, zero lock on RT).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) torque_shadow: crate::torque::shadow::ShadowRuntime,
+    /// Stable live operation identifier of the currently active enable attempt (for shadow HandshakeResult join).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) shadow_enable_op_id: u64,
     /// Inline per-joint measured-position hold state (zero alloc on RT).
     pub(crate) measured_hold: driver_transitions::MeasuredHoldTracker,
     /// Inline owner-held driver snapshot refreshed whenever the owner already holds the driver
@@ -2229,7 +2235,11 @@ impl ConsumedStamps {
 }
 
 impl SupervisorInner {
-    pub fn new(mut config: ArmConfig) -> Self {
+    pub fn new(config: ArmConfig) -> Self {
+        Self::new_inner(config, true)
+    }
+
+    fn new_inner(mut config: ArmConfig, allow_shadow: bool) -> Self {
         config.validate().expect("Invalid ArmConfig: invariant violation");
         let dof = config.dof;
         let collision_policy = config.collision.unwrap_or_default();
@@ -2285,6 +2295,19 @@ impl SupervisorInner {
         let estop_state = Arc::new(crate::rt_core::urgent::EstopState::new());
         let e_stop_latched = crate::rt_core::urgent::EstopLatchView::new(estop_state.clone());
         let requested_estop_count = crate::rt_core::urgent::EstopCounterView::new(estop_state.clone());
+        #[cfg(not(target_arch = "wasm32"))]
+        let torque_shadow = if allow_shadow {
+            crate::torque::shadow::ShadowRuntime::new_with_hub(
+                &config,
+                config.torque_shadow_enabled,
+                crate::torque::VendorKind::Damiao,
+                false,
+                None,
+            )
+            .0
+        } else {
+            crate::torque::shadow::ShadowRuntime::disabled(&config)
+        };
 
         let mut inner = Self {
             config,
@@ -2312,6 +2335,10 @@ impl SupervisorInner {
             torque_intent: driver_transitions::TorqueIntent::Off,
             control_release_seq: 0,
             control_release_seq_atomic: Arc::new(AtomicU64::new(0)),
+            #[cfg(not(target_arch = "wasm32"))]
+            torque_shadow,
+            #[cfg(not(target_arch = "wasm32"))]
+            shadow_enable_op_id: 0,
             measured_hold: driver_transitions::MeasuredHoldTracker::new(dof),
             owner_driver_snapshot: driver_transitions::OwnerDriverSnapshot::new(dof),
             background_disable_retry: None,
@@ -2699,7 +2726,7 @@ impl SupervisorInner {
         atomic_fenced_lease_gen: Arc<AtomicU64>,
         pending_disconnect_hold: Arc<AtomicU64>,
     ) -> Self {
-        let mut shell = Self::new(config.clone());
+        let mut shell = Self::new_inner(config.clone(), false);
         shell.e_stop_latched = crate::rt_core::urgent::EstopLatchView::new(estop_state.clone());
         shell.requested_estop_count = crate::rt_core::urgent::EstopCounterView::new(estop_state.clone());
         shell.estop_state = estop_state;
@@ -3350,6 +3377,23 @@ impl SupervisorInner {
         self.terminal_capture_channel.clone()
     }
 
+    /// Returns cloned off-thread handles required for normal executor teardown to drain the
+    /// authoritative `TerminalCaptureChannel` into `TerminalBroadcaster` before final broker
+    /// reply delivery and route retirement (zero RT locks/allocs; cloned once at spawn).
+    pub(crate) fn terminal_capture_drain_handles(
+        &self,
+    ) -> Option<(
+        Arc<terminal_capture::TerminalCaptureChannel>,
+        Arc<TerminalBroadcaster>,
+        Arc<ArmObservation>,
+    )> {
+        Some((
+            self.terminal_capture_channel.clone()?,
+            self.terminals.clone()?,
+            self.template_obs_for_drain.clone()?,
+        ))
+    }
+
     /// Shared record-construction entry point wrapping `TerminalCaptureRecord::capture_from` so
     /// early capture paths (immediate supersession, pre-overwrite materialization, staged
     /// eviction) are audited by `terminal_capture_test_hook` identically to `capture_edge_terminals`.
@@ -3874,7 +3918,29 @@ impl SupervisorInner {
 
     /// Unified motion-start wrapper: requires an [`Admitted`] token by value under the owner lock.
     pub fn start_motion<Op: MotionStartOp>(admitted: Admitted<'_>, op: Op) -> Result<Op::Output, ArmError> {
-        admitted.verify_live()?;
+        let verify_res = admitted.verify_live();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let inner = &mut *admitted.inner;
+            let dof = inner.config.dof.min(crate::torque::MAX_CHANNELS) as u8;
+            let live_refusal = match &verify_res {
+                Ok(_) => None,
+                Err(SafetyError::EStopActive) => Some(crate::torque::shadow::LiveRefusalKind::EStopActive),
+                Err(SafetyError::FaultActive(_)) => Some(crate::torque::shadow::LiveRefusalKind::FaultLatched),
+                Err(_) => Some(crate::torque::shadow::LiveRefusalKind::Other),
+            };
+            inner
+                .torque_shadow
+                .enqueue(crate::torque::shadow::ShadowInputKind::MotionCommand {
+                    channels: crate::torque::ChannelMask::from_count(dof),
+                    live_allowed: verify_res.is_ok(),
+                    live_refusal,
+                    live_intent: inner.shadow_live_intent(),
+                    live_is_torqued: inner.is_torqued,
+                    live_stopped: inner.safety.state().is_stopped(),
+                });
+        }
+        verify_res?;
         op.execute(admitted)
     }
 
@@ -5712,7 +5778,7 @@ impl SupervisorInner {
                     let _ = self.request_disable_bounded(exit_kind);
                 }
             } else {
-                let outcome = self.attempt_panic_disable(PANIC_DISABLE_TIMEOUT);
+                let outcome = self.attempt_shutdown_protective_disable(PANIC_DISABLE_TIMEOUT);
                 outcome.log("Repeated shutdown protective disable", PANIC_DISABLE_TIMEOUT);
             }
             if self.shutdown_ready() {
@@ -5742,6 +5808,18 @@ impl SupervisorInner {
         self.shutdown_committed = true;
         self.estop_state.latch();
         self.stop_motion();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.torque_shadow
+                .enqueue(crate::torque::shadow::ShadowInputKind::ProcessExit {
+                    live_intent: self.shadow_live_intent(),
+                    live_is_torqued: self.is_torqued,
+                    live_stopped: self.safety.state().is_stopped(),
+                });
+            if !self.rt_executor_owned {
+                self.flush_torque_shadow();
+            }
+        }
         true
     }
 
@@ -6658,10 +6736,67 @@ impl SupervisorInner {
         self.capture_driver_cache = cache;
         self.refresh_owner_driver_snapshot_from_ref(driver.as_ref());
         self.torque_intent = crate::supervisor::TorqueIntent::On;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            driver.set_shadow_enabled(self.torque_shadow.is_enabled());
+            self.torque_shadow.reinit_for_driver(
+                &self.config,
+                driver.shadow_vendor_kind(),
+                driver.driver_clock(),
+            );
+            self.torque_shadow.drain_from_driver(&mut *driver);
+            self.torque_shadow.flush_deferred_steps();
+        }
         self.driver = Some(crate::supervisor_lock::DriverSlot::legacy_with_counter(
             driver,
             Arc::clone(&self.driver_lock_attempts),
         ));
+    }
+
+    /// Flush all pending shadow reducer steps and emit compact SPSC records (outer post-write boundary only).
+    #[inline]
+    pub(crate) fn flush_torque_shadow(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.torque_shadow.flush_deferred_steps();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[inline]
+    pub(crate) fn shadow_live_intent(&self) -> crate::torque::TorqueIntent {
+        match self.torque_intent {
+            crate::supervisor::TorqueIntent::On => crate::torque::TorqueIntent::On,
+            crate::supervisor::TorqueIntent::Off => crate::torque::TorqueIntent::Off,
+        }
+    }
+
+    /// Test-only shadow fault injection setter on `SupervisorInner` (never exposed via HTTP/WS/CLI/env/JSON).
+    #[cfg(not(target_arch = "wasm32"))]
+    #[doc(hidden)]
+    pub fn test_set_torque_shadow_fault(&mut self, fault: crate::torque::shadow::ShadowFaultInjection) {
+        self.torque_shadow.set_injected_fault(fault);
+    }
+
+    /// Test-only synchronous flush + drain on `SupervisorInner`.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[doc(hidden)]
+    pub fn test_flush_and_drain_torque_shadow(&mut self) {
+        self.torque_shadow.flush_and_drain_sync();
+    }
+
+    /// Test-only flush of pending shadow steps without blocking on the off-thread consumer.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[doc(hidden)]
+    pub fn torque_shadow_flush_for_test(&mut self) {
+        self.flush_torque_shadow();
+    }
+
+    /// Read current torque shadow diagnostics from `SupervisorInner`'s paired hub.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn torque_shadow_diagnostics(&self) -> crate::torque::shadow::TorqueShadowDiagnostics {
+        self.torque_shadow.hub().map_or_else(
+            || crate::torque::shadow::TorqueShadowDiagnostics::disabled(self.torque_shadow.owner()),
+            |h| h.snapshot(),
+        )
     }
 
     /// Lock-free Step-2 cached hardware feedback confirmation (`false` when driverless, lock failed,
@@ -7481,8 +7616,10 @@ impl SupervisorInner {
         let Some(d) = self.driver.as_mut() else {
             return;
         };
+        #[cfg(not(target_arch = "wasm32"))]
+        let shadow_rt = &mut self.torque_shadow;
         let Some(hold_update) = d.try_with_mut_recover(|drv| {
-            Self::emit_and_merge_pos_force_j7(
+            let out = Self::emit_and_merge_pos_force_j7(
                 drv,
                 j7_is_hold,
                 intent,
@@ -7490,7 +7627,10 @@ impl SupervisorInner {
                 cutoff,
                 tick_output,
                 allow_output_accepted,
-            )
+            );
+            #[cfg(not(target_arch = "wasm32"))]
+            shadow_rt.drain_from_driver(drv);
+            out
         }) else {
             return;
         };
@@ -8035,6 +8175,14 @@ impl SupervisorInner {
         self.control_release_seq = self.control_release_seq.wrapping_add(1).max(1);
         self.control_release_seq_atomic
             .store(self.control_release_seq, Ordering::Release);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.torque_shadow
+            .enqueue(crate::torque::shadow::ShadowInputKind::Release {
+                release_seq: self.control_release_seq,
+                live_intent: self.shadow_live_intent(),
+                live_is_torqued: self.is_torqued,
+                live_stopped: self.safety.state().is_stopped(),
+            });
         let was_thermal_active = self.thermal_protection_active();
         // Install the release publish-margin TX cap BEFORE enable-transition polling, background
         // disable polling, and RX feedback intake so every TX in Step 2 obeys the same cutoff.
@@ -8397,6 +8545,8 @@ impl SupervisorInner {
                     self.config.dof,
                     driver,
                 );
+                #[cfg(not(target_arch = "wasm32"))]
+                self.torque_shadow.drain_from_driver(driver);
             };
             let poll_res = if use_try {
                 d.try_with_mut(run_poll)
@@ -8427,7 +8577,39 @@ impl SupervisorInner {
         } else {
             // Driverless simulation mode: each control tick produces a fresh joint sample.
             self.driver_feedback_confirmed_cached = false;
-            self.core.simulate_feedback(self.config.dof, Instant::now());
+            let sim_now = Instant::now();
+            self.core.simulate_feedback(self.config.dof, sim_now);
+            #[cfg(not(target_arch = "wasm32"))]
+            if self.torque_shadow.is_enabled() {
+                let n = self.config.dof.min(crate::torque::MAX_CHANNELS);
+                for ch in 0..n {
+                    let pos = self.measured_positions.get(ch).copied().unwrap_or(0.0);
+                    let vel = self.measured_velocities.get(ch).copied();
+                    let temp = self.temperatures.get(ch).copied();
+                    self.torque_shadow.enqueue_at(
+                        sim_now,
+                        crate::torque::shadow::ShadowInputKind::DriverObs(
+                            crate::torque::shadow::ShadowDriverObs::CausalSample {
+                                channel: ch as u8,
+                                sample_id: self.control_release_seq.saturating_mul(64).saturating_add(ch as u64 + 1),
+                                stamp: crate::torque::shadow::RxStampKind::Valid {
+                                    rx_at: sim_now,
+                                    drift_ns: 0,
+                                    live_post_settle: true,
+                                },
+                                decode_now: sim_now,
+                                position_rad: pos,
+                                velocity_rad_s: vel,
+                                temperature_c: temp,
+                                reported_enabled: Some(self.is_torqued),
+                                correlated_after_write_done: None,
+                                poll_issued: None,
+                                provenance: crate::torque::shadow::EvidenceProvenance::MockSynthetic,
+                            },
+                        ),
+                    );
+                }
+            }
             self.joint_feedback_queue_bounds.clear();
             out.bus_feedback_fresh = true;
         }
@@ -8674,6 +8856,14 @@ impl SupervisorInner {
             self.control_release_seq = self.control_release_seq.wrapping_add(1).max(1);
             self.control_release_seq_atomic
                 .store(self.control_release_seq, Ordering::Release);
+            #[cfg(not(target_arch = "wasm32"))]
+            self.torque_shadow
+                .enqueue(crate::torque::shadow::ShadowInputKind::Release {
+                    release_seq: self.control_release_seq,
+                    live_intent: self.shadow_live_intent(),
+                    live_is_torqued: self.is_torqued,
+                    live_stopped: self.safety.state().is_stopped(),
+                });
             if self.has_non_broker_torque_transition() {
                 let now = legacy_step_start.unwrap_or_else(Instant::now);
                 let deadline = legacy_step_deadline.unwrap_or_else(|| now + LEGACY_TORQUE_STEP_BUDGET);
@@ -10415,15 +10605,20 @@ impl SupervisorInner {
                             &self.shared_closed_bitset,
                         );
                         let rt_owned = self.rt_executor_owned;
+                        #[cfg(not(target_arch = "wasm32"))]
+                        let shadow_rt = &mut self.torque_shadow;
                         if let Some(d) = self.driver.as_mut() {
                             let write_fn = |driver: &mut dyn ArmDriver| {
-                                Self::write_gravity_comp_targets_checked(
+                                let res = Self::write_gravity_comp_targets_checked(
                                     driver,
                                     &targets,
                                     is_hold,
                                     output_lease_gen,
                                     &fence,
-                                )
+                                );
+                                #[cfg(not(target_arch = "wasm32"))]
+                                shadow_rt.drain_from_driver(driver);
+                                res
                             };
                             let written = if rt_owned {
                                 d.try_with_mut(write_fn).ok().flatten()
@@ -11093,6 +11288,10 @@ impl SupervisorInner {
                 drv.set_tx_release_deadline(None);
             }
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        if !self.rt_executor_owned {
+            self.flush_torque_shadow();
+        }
         self.nonblocking_driver_release = false;
 
         timestamp
@@ -11257,10 +11456,11 @@ pub const TERMINAL_FIFO_CAPACITY: usize = 64;
 
 type TerminalSinkFn = Box<dyn Fn(&ArmObservation) -> bool + Send + Sync>;
 
-struct QueuedTerminal {
-    action: ActionStatus,
-    obs_override: Option<ArmObservation>,
-    required_publish_seq: Option<u64>,
+#[derive(Clone)]
+pub(crate) struct QueuedTerminal {
+    pub(crate) action: ActionStatus,
+    pub(crate) obs_override: Option<ArmObservation>,
+    pub(crate) required_publish_seq: Option<u64>,
 }
 
 struct ConnectionTerminalQueue {
@@ -11275,6 +11475,11 @@ struct TerminalBroadcasterInner {
     next_id: u64,
     capacity: usize,
     sinks: Vec<ConnectionTerminalQueue>,
+    /// Bounded cache of recently finished `QueuedTerminal` records (carrying `obs_override` and
+    /// `required_publish_seq` from the single authoritative `TerminalCaptureChannel`) so
+    /// per-connection WS broker reply sinks enforce the same publish barrier and retrieve the
+    /// exact enriched `ActionStatus` for their bound `ActionId`.
+    recent_finished: std::collections::VecDeque<QueuedTerminal>,
 }
 
 /// Lossless off-RT per-connection bounded FIFO of finished actions: every terminal action
@@ -11303,6 +11508,7 @@ impl Default for TerminalBroadcaster {
                 next_id: 1,
                 capacity: TERMINAL_FIFO_CAPACITY,
                 sinks: Vec::new(),
+                recent_finished: std::collections::VecDeque::with_capacity(64),
             }),
         }
     }
@@ -11423,8 +11629,8 @@ impl TerminalBroadcaster {
     /// Enqueues a terminal action with authoritative `terminal_seq` (0 when unassigned in direct
     /// unit tests) into every subscriber whose `min_terminal_seq < terminal_seq` (or 0) and that
     /// has not already seen `action.id`. Carries `required_publish_seq` through to delivery so
-    /// `drain_all` never pairs a terminal with a snapshot older than its required publication.
-    /// Updates `max_fifo_len` and `pending_total` with `Release`.
+    /// `drain_all` and owner reply sinks never pair a terminal with a snapshot older than its
+    /// required publication. Updates `max_fifo_len` and `pending_total` with `Release`.
     pub(crate) fn record_finished_with_seq(
         &self,
         terminal_seq: u64,
@@ -11432,10 +11638,23 @@ impl TerminalBroadcaster {
         obs_override: Option<ArmObservation>,
         required_publish_seq: Option<u64>,
     ) -> bool {
-        if action.is_running() || self.subscriber_count.load(Ordering::Acquire) == 0 {
+        if action.is_running() {
             return false;
         }
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let queued = QueuedTerminal {
+            action: action.clone(),
+            obs_override: obs_override.clone(),
+            required_publish_seq,
+        };
+        if let Some(existing) = g.recent_finished.iter_mut().find(|e| e.action.id == action.id) {
+            *existing = queued.clone();
+        } else {
+            if g.recent_finished.len() >= 64 {
+                g.recent_finished.pop_front();
+            }
+            g.recent_finished.push_back(queued.clone());
+        }
         if g.sinks.is_empty() {
             return false;
         }
@@ -11456,11 +11675,7 @@ impl TerminalBroadcaster {
                 q.seen.pop_front();
             }
             q.seen.push_back(action.id);
-            q.fifo.push_back(QueuedTerminal {
-                action: action.clone(),
-                obs_override: obs_override.clone(),
-                required_publish_seq,
-            });
+            q.fifo.push_back(queued.clone());
             enqueued = true;
         }
         if enqueued {
@@ -11469,11 +11684,25 @@ impl TerminalBroadcaster {
         enqueued
     }
 
+    pub(crate) fn lookup_finished_entry(&self, action_id: u64) -> Option<QueuedTerminal> {
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.recent_finished
+            .iter()
+            .rev()
+            .find(|e| e.action.id == action_id)
+            .cloned()
+    }
+
     pub(crate) fn update_failed_step(&self, action_id: u64, step: Option<usize>) {
-        if self.subscriber_count.load(Ordering::Acquire) == 0 {
-            return;
-        }
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = g.recent_finished.iter_mut().find(|e| e.action.id == action_id) {
+            entry.action.failed_step = step;
+            if let Some(obs) = entry.obs_override.as_mut() {
+                if let Some(a) = obs.action.as_mut().filter(|a| a.id == action_id) {
+                    a.failed_step = step;
+                }
+            }
+        }
         for q in &mut g.sinks {
             if let Some(entry) = q.fifo.iter_mut().find(|e| e.action.id == action_id) {
                 entry.action.failed_step = step;
@@ -11528,6 +11757,52 @@ impl TerminalBroadcaster {
         }
         self.recompute_atomics(&g);
         blocked_on_seq
+    }
+
+    /// Drains queued observer terminals with `action.id < max_exclusive_id` (enforcing
+    /// `required_publish_seq <= base_seq` whenever an entry relies on `base_obs`) so an
+    /// owner-routed terminal for `max_exclusive_id` never overtakes an earlier observer terminal
+    /// on the same socket. Returns `true` when no earlier observer terminal remains blocked.
+    pub(crate) fn drain_before_action_id(
+        &self,
+        base_obs: &ArmObservation,
+        base_seq: u64,
+        max_exclusive_id: u64,
+    ) -> bool {
+        if self.dispatch_paused.load(Ordering::Acquire)
+            || self.pending_total.load(Ordering::Acquire) == 0
+        {
+            return true;
+        }
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut all_earlier_flushed = true;
+        for q in &mut g.sinks {
+            while let Some(entry) = q.fifo.front() {
+                if entry.action.id >= max_exclusive_id {
+                    break;
+                }
+                if let Some(req_seq) = entry.required_publish_seq {
+                    if entry.obs_override.is_none() && base_seq < req_seq {
+                        all_earlier_flushed = false;
+                        break;
+                    }
+                }
+                let mut obs = match entry.obs_override.as_ref() {
+                    Some(captured) => captured.clone(),
+                    None => base_obs.clone(),
+                };
+                obs.action = Some(entry.action.clone());
+                obs.previous_action = None;
+                if (q.sink)(&obs) {
+                    q.fifo.pop_front();
+                } else {
+                    all_earlier_flushed = false;
+                    break;
+                }
+            }
+        }
+        self.recompute_atomics(&g);
+        all_earlier_flushed
     }
 
     pub(crate) fn set_capacity(&self, capacity: usize) {
@@ -11639,6 +11914,9 @@ pub struct ArmSupervisor {
     /// Off-thread bounded WS connection slot pool (`MAX_LIVE_CONNECTIONS = 64`), enforcing the
     /// fail-closed cap before allocating a monotonic connection ID and before touching any owner.
     ws_slots: Arc<WsConnectionSlotPool>,
+    /// Off-thread `TorqueController` shadow comparator/diagnostics hub (never locked on RT).
+    #[cfg(not(target_arch = "wasm32"))]
+    torque_shadow: Arc<crate::torque::shadow::TorqueShadowHub>,
     /// Unique identifier for this daemon/supervisor instance (changes across restarts).
     instance_id: String,
     /// Guards off-lock legacy watchdog park planning against concurrent duplicate spawns.
@@ -11669,10 +11947,11 @@ enum WsSlotPhase {
     Closing,
 }
 
-#[derive(Debug, Clone, Copy)]
 struct WsSlotEntry {
     phase: WsSlotPhase,
     opening: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    reply_sink: Option<Arc<crate::rt_core::reply_router::ConnectionReplySink>>,
 }
 
 struct WsConnectionSlotPool {
@@ -11707,9 +11986,62 @@ impl WsConnectionSlotPool {
             WsSlotEntry {
                 phase: WsSlotPhase::Admitted,
                 opening: false,
+                #[cfg(not(target_arch = "wasm32"))]
+                reply_sink: None,
             },
         );
         Ok(handle)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn attach_reply_sink(
+        &self,
+        conn_id: u64,
+        sink: Arc<crate::rt_core::reply_router::ConnectionReplySink>,
+    ) -> bool {
+        let mut g = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(entry) = g.get_mut(&conn_id) else {
+            return false;
+        };
+        if entry.phase == WsSlotPhase::Closing {
+            return false;
+        }
+        entry.reply_sink = Some(sink);
+        true
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn reply_sink(
+        &self,
+        conn_id: u64,
+    ) -> Option<Arc<crate::rt_core::reply_router::ConnectionReplySink>> {
+        let g = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = g.get(&conn_id)?;
+        if entry.phase == WsSlotPhase::Closing {
+            return None;
+        }
+        entry.reply_sink.clone()
+    }
+
+    /// Joins transferred `live_ids` against non-closing `WsSlotEntry` reply sinks for atomic
+    /// executor handover seeding (omits unregistered claimed slots and already-closing slots).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn sinks_for_live_ids(
+        &self,
+        live_ids: &[u64],
+    ) -> Vec<(u64, Arc<crate::rt_core::reply_router::ConnectionReplySink>)> {
+        let g = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::with_capacity(live_ids.len());
+        for &id in live_ids {
+            if let Some(entry) = g.get(&id) {
+                if entry.phase != WsSlotPhase::Closing {
+                    if let Some(sink) = entry.reply_sink.as_ref() {
+                        out.push((id, Arc::clone(sink)));
+                    }
+                }
+            }
+        }
+        out
     }
 
     fn begin_open(&self, conn_id: u64) -> bool {
@@ -11821,7 +12153,12 @@ enum Fresh<'a> {
 }
 
 impl Drop for ArmSupervisor {
-    fn drop(&mut self) { self.hub.close(); }
+    fn drop(&mut self) {
+        self.hub.close();
+        #[cfg(not(target_arch = "wasm32"))]
+        self.torque_shadow
+            .stop_and_flush_bounded(Duration::from_millis(50));
+    }
 }
 
 /// Immutable host/process boot identity exposed on `GET /api/v1/diagnostics/tick` so offline
@@ -11934,6 +12271,12 @@ impl ArmSupervisor {
         let (terminal_capture_tx, terminal_capture_channel) =
             terminal_capture::TerminalCaptureChannel::new();
         let mut inner = SupervisorInner::new(config);
+        #[cfg(not(target_arch = "wasm32"))]
+        let torque_shadow = inner
+            .torque_shadow
+            .hub()
+            .cloned()
+            .expect("SupervisorInner::new always pairs a TorqueShadowHub");
         inner.estop_state = estop_state.clone();
         inner.e_stop_latched = e_stop_latched.clone();
         inner.requested_estop_count = requested_estop_count.clone();
@@ -12027,6 +12370,8 @@ impl ArmSupervisor {
             template_obs,
             legacy_loop_stats: std::sync::Mutex::new(None),
             ws_slots: Arc::new(WsConnectionSlotPool::new()),
+            #[cfg(not(target_arch = "wasm32"))]
+            torque_shadow,
             instance_id,
             watchdog_park_planning: Arc::new(AtomicBool::new(false)),
             executor_hover_jobs: std::sync::Mutex::new(Vec::new()),
@@ -12589,6 +12934,8 @@ impl ArmSupervisor {
             _ => {}
         }
         let mut real = std::mem::replace(&mut *guard, shell);
+        let live_ids: Vec<u64> = real.live_connection_ids().collect();
+        let seeded_ws_sinks = self.ws_slots.sinks_for_live_ids(&live_ids);
         if let Some(slot) = real.driver.take() {
             match slot.into_exclusive() {
                 Ok(exclusive) => real.driver = Some(exclusive),
@@ -12603,6 +12950,14 @@ impl ArmSupervisor {
                         message: format!("Cannot transfer ownership: {reason}"),
                     });
                 }
+            }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            real.torque_shadow
+                .set_owner(crate::torque::shadow::ShadowOwner::Executor);
+            if let Err(e) = self.torque_shadow.start_worker() {
+                tracing::warn!("Failed to start torque shadow worker thread on executor handoff: {e}");
             }
         }
 
@@ -12623,6 +12978,7 @@ impl ArmSupervisor {
                 for slot in &handoff_slots {
                     any_settled |= slot.settle_owner_transferred();
                 }
+                handle.seed_connection_reply_sinks(seeded_ws_sinks);
                 self.published_config.publish(candidate_pub_cfg, initial_gen);
                 *self.sinks.lock().unwrap_or_else(|e| e.into_inner()) = Some(sinks);
                 self.executor_base_gen.store(initial_gen, Ordering::Release);
@@ -12652,6 +13008,10 @@ impl ArmSupervisor {
                 }
                 *guard = *core;
                 guard.torque_transition = saved_legacy_transition;
+                #[cfg(not(target_arch = "wasm32"))]
+                guard
+                    .torque_shadow
+                    .set_owner(crate::torque::shadow::ShadowOwner::Legacy);
                 let _ = self.drain_pending_disconnects_under_guard(&mut guard, None);
                 guard.purge_closed_live_connections();
                 restore_legacy(&mut rollback);
@@ -13000,6 +13360,36 @@ impl ArmSupervisor {
         }
     }
 
+    /// Looks up the enriched finished [`QueuedTerminal`] (including `obs_override` and
+    /// `required_publish_seq`) for `action_id` from the bounded off-RT terminal cache populated
+    /// by the single authoritative `TerminalCaptureChannel`.
+    pub(crate) fn lookup_finished_entry(&self, action_id: u64) -> Option<QueuedTerminal> {
+        self.terminals.lookup_finished_entry(action_id)
+    }
+
+    /// True if any captured terminal record is still in-flight in `TerminalCaptureChannel`.
+    #[inline]
+    pub(crate) fn terminal_capture_has_inflight(&self) -> bool {
+        self.terminal_capture_channel.inflight() > 0
+    }
+
+    /// Flushes any queued observer terminals strictly earlier than `max_exclusive_id` (enforcing
+    /// `required_publish_seq <= base_seq`) onto subscribed WS ordinary queues before an
+    /// owner-routed terminal for `max_exclusive_id` is enqueued, preserving exact chronological
+    /// order across both sources on the same socket.
+    pub(crate) fn flush_observer_terminals_before(&self, max_exclusive_id: u64, base_seq: u64) -> bool {
+        if !self.terminals.has_pending() {
+            return true;
+        }
+        let base = self
+            .hub
+            .latest()
+            .map(|s| s.obs.clone())
+            .unwrap_or_else(|| self.template_obs.clone());
+        self.terminals
+            .drain_before_action_id(&base, base_seq, max_exclusive_id)
+    }
+
     /// True if `action_id` has been emitted via a synthetic post-publish terminal (`obs_override`)
     /// across any consumer. Used by `ws.rs` writer lag-recovery and buffered telemetry send to
     /// prevent sending a stale `running` frame after a synthetic terminal for the same action.
@@ -13045,7 +13435,31 @@ impl ArmSupervisor {
             })
             .map_err(|e| ArmError::Internal(format!("cannot start the observation dispatcher thread: {e}")))?;
         self.hub.set_dispatcher(handle.thread().clone());
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Err(e) = self.torque_shadow.start_worker() {
+            tracing::warn!("Failed to start torque shadow worker thread: {e}");
+        }
         Ok(())
+    }
+
+    /// Snapshot of shadow `TorqueController` diagnostics (lock-free / off-RT; never touches RT owner).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn torque_shadow_diagnostics(&self) -> crate::torque::shadow::TorqueShadowDiagnostics {
+        self.torque_shadow.snapshot()
+    }
+
+    /// Shared handle to the off-thread shadow comparator/diagnostics hub.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn torque_shadow_hub(&self) -> &Arc<crate::torque::shadow::TorqueShadowHub> {
+        &self.torque_shadow
+    }
+
+    /// Lock-free atomic overflow/summary handle for primary `bb.jsonl` piggyback summaries.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn torque_shadow_overflow_atomics(
+        &self,
+    ) -> Arc<crate::torque::shadow::ShadowOverflowAtomics> {
+        self.torque_shadow.overflow_atomics().clone()
     }
 
     /// Test-only hook: configure per-connection bounded terminal FIFO and capture admission capacity.
@@ -13661,6 +14075,18 @@ impl ArmSupervisor {
         self.ws_slots.try_claim()
     }
 
+    /// Attaches a per-connection reply sink to an already-claimed WS slot BEFORE owner
+    /// registration begins, so both live executor registration and Legacy->Executor handover
+    /// seed the exact same sink boundary.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn attach_ws_reply_sink(
+        &self,
+        conn_id: u64,
+        sink: Arc<crate::rt_core::reply_router::ConnectionReplySink>,
+    ) -> bool {
+        self.ws_slots.attach_reply_sink(conn_id, sink)
+    }
+
     /// Number of currently admitted WS connection slots (including closing slots awaiting owner
     /// disconnect confirmation).
     pub fn live_ws_slot_count(&self) -> usize {
@@ -13765,7 +14191,12 @@ impl ArmSupervisor {
                     drop(inner);
                     if self.owner_mode() == OWNER_EXECUTOR {
                         if let Some(handle) = self.executor_handle() {
-                            return match handle.open_connection_async(conn_id).await {
+                            let open_res = if let Some(sink) = self.ws_slots.reply_sink(conn_id) {
+                                handle.open_connection_with_reply_sink_async(conn_id, sink).await
+                            } else {
+                                handle.open_connection_async(conn_id).await
+                            };
+                            return match open_res {
                                 Ok(Ok(())) => Ok(()),
                                 Ok(Err(code)) => {
                                     let status = if code == "TOO_MANY_CONNECTIONS" { 503 } else { 409 };
@@ -13787,7 +14218,9 @@ impl ArmSupervisor {
                                         message: "Connection identity is closed or invalid".into(),
                                     })
                                 }
-                                Err(ConnLifecycleError::Stopped) => Err(executor_unavailable()),
+                                Err(ConnLifecycleError::Stopped | ConnLifecycleError::ReentrantCallback) => {
+                                    Err(executor_unavailable())
+                                }
                             };
                         }
                     }
@@ -13806,7 +14239,12 @@ impl ArmSupervisor {
                 let Some(handle) = self.executor_handle() else {
                     return Err(executor_unavailable());
                 };
-                match handle.open_connection_async(conn_id).await {
+                let open_res = if let Some(sink) = self.ws_slots.reply_sink(conn_id) {
+                    handle.open_connection_with_reply_sink_async(conn_id, sink).await
+                } else {
+                    handle.open_connection_async(conn_id).await
+                };
+                match open_res {
                     Ok(Ok(())) => Ok(()),
                     Ok(Err(code)) => {
                         let status = if code == "TOO_MANY_CONNECTIONS" { 503 } else { 409 };
@@ -13828,7 +14266,9 @@ impl ArmSupervisor {
                             message: "Connection identity is closed or invalid".into(),
                         })
                     }
-                    Err(ConnLifecycleError::Stopped) => Err(executor_unavailable()),
+                    Err(ConnLifecycleError::Stopped | ConnLifecycleError::ReentrantCallback) => {
+                        Err(executor_unavailable())
+                    }
                 }
             }
             _ => Err(executor_unavailable()),
@@ -15564,8 +16004,17 @@ impl ArmSupervisor {
             match std::thread::Builder::new()
                 .name("armd-panic-disable".into())
                 .spawn(move || {
-                    let outcome = run_inline(inner, coop_deadline, hard_deadline, coop_budget);
-                    let _ = tx.send((outcome, Instant::now()));
+                    let (outcome, done_at) = {
+                        let res = run_inline(inner.clone(), coop_deadline, hard_deadline, coop_budget);
+                        (res, Instant::now())
+                    };
+                    // Seal and deliver the live outcome FIRST before touching shadow recording.
+                    let _ = tx.send((outcome.clone(), done_at));
+                    if let Ok(mut g) = inner.try_write() {
+                        if !g.detached {
+                            g.record_post_panic_disable_shadow(true, &outcome);
+                        }
+                    }
                 }) {
                 Ok(_) => {
                     let wait = hard_deadline.saturating_duration_since(Instant::now());
@@ -16484,18 +16933,15 @@ fn dispatch_loop(
             libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_OTHER, &param);
         }
     }
-    let drain_sinks = || {
-        let s = sinks.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        if let Some(s) = s {
-            s.drain_all(tick_stats);
-        }
-    };
     let mut last = 0u64;
     let mut last_diag = 0u64;
     let mut latest_snap: Option<Arc<crate::rt_core::publish::Snapshot>> = None;
     let mut pending_telemetry: Option<ArmObservation> = None;
     while !hub.is_closed() {
-        drain_sinks();
+        let active_sinks = sinks.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(s) = active_sinks.as_ref() {
+            s.drain_pre_broker(tick_stats);
+        }
         if let Some(ring) = hub.record_ring() { ring.drain(); }
         if hub.published_seq() != last {
             if let Some(s) = hub.latest().filter(|s| s.meta.seq > last) {
@@ -16549,6 +16995,12 @@ fn dispatch_loop(
                 );
             }
         }
+        // Stage 2 off-RT sinks: runs strictly AFTER `terminal_capture.drain_into` populated
+        // `TerminalBroadcaster` (respecting the `publish_seq` barrier), preserving Step 7 causal
+        // ordering (`broker_dispatcher` BEFORE `conn_lifecycle_client`).
+        if let Some(s) = active_sinks.as_ref() {
+            s.drain_post_terminal(true);
+        }
         // Drain every connection's bounded terminal FIFO into its higher-priority `ordinary_out_tx`
         // BEFORE forwarding telemetry so a newer telemetry snapshot can never overtake earlier
         // terminals on the wire.
@@ -16574,6 +17026,9 @@ fn dispatch_loop(
                         template_obs,
                         true,
                     );
+                    if let Some(s) = active_sinks.as_ref() {
+                        s.drain_post_terminal(true);
+                    }
                     if let Some(s_ref) = latest_snap.as_ref() {
                         let _ = terminals.drain_all(&s_ref.obs, s_ref.meta.seq);
                     }
@@ -16602,11 +17057,8 @@ fn dispatch_loop(
         std::thread::park_timeout(Duration::from_millis(50));
     }
     // Final drain on supervisor close so no retired/diagnostic/reply/terminal items are stranded,
-    // and emit any final safety overflow summary.
-    let s = sinks.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    if let Some(s) = s {
-        s.flush_and_report_shutdown(tick_stats);
-    }
+    // and emit any final safety overflow summary. Drain `terminal_capture` BEFORE
+    // `flush_and_report_shutdown` so final broker reply routing sees every captured entry.
     if let Some(ring) = hub.record_ring() { ring.drain(); }
     let final_snap = hub.latest().or(latest_snap);
     terminal_capture.drain_into(
@@ -16617,6 +17069,10 @@ fn dispatch_loop(
         template_obs,
         false,
     );
+    let s = sinks.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Some(s) = s {
+        s.flush_and_report_shutdown(tick_stats);
+    }
     if terminals.has_pending() {
         let final_seq = final_snap.as_ref().map_or(0, |s| s.meta.seq);
         let _ = terminals.drain_all(final_snap.as_ref().map_or(template_obs, |s| &s.obs), final_seq);

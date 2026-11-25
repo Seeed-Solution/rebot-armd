@@ -280,6 +280,14 @@ impl SupervisorInner {
 
     fn apply_estop_latch_impl(&mut self, ext_driver: Option<&std::sync::Mutex<Box<dyn ArmDriver>>>) {
         self.estop_state.latch();
+        #[cfg(not(target_arch = "wasm32"))]
+        self.torque_shadow
+            .enqueue(crate::torque::shadow::ShadowInputKind::Stop {
+                kind: crate::torque::StopKind::EStop,
+                live_intent: self.shadow_live_intent(),
+                live_is_torqued: self.is_torqued,
+                live_stopped: true,
+            });
         // Immediate rigid lock at current position, latch E-Stop, advance epoch.
         // Maintain active restorative torque hold: do NOT cut power or set is_torqued=false.
         self.pending_normal_unload = false;
@@ -655,6 +663,15 @@ impl SupervisorInner {
                         limit: self.config.max_temperature,
                     },
                 );
+                #[cfg(not(target_arch = "wasm32"))]
+                self.torque_shadow
+                    .enqueue(crate::torque::shadow::ShadowInputKind::Thermal {
+                        channel: (joint_idx.min(crate::torque::MAX_CHANNELS - 1)) as u8,
+                        temperature_c: temperature,
+                        live_intent: self.shadow_live_intent(),
+                        live_is_torqued: self.is_torqued,
+                        live_stopped: true,
+                    });
                 self.redispatch_thermal_protective_disable();
             }
             StopPolicy::BusLossFallback => {
@@ -682,7 +699,26 @@ impl SupervisorInner {
                     self.bus_loss_instant = Some(Instant::now());
                 }
                 self.safety.latch(crate::safety::FaultKind::BusLoss, crate::safety::FaultDetail::BusLoss);
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let multi_device_gap = self
+                        .torque_shadow
+                        .state()
+                        .is_some_and(|s| s.config.device_count > 1);
+                    self.torque_shadow
+                        .enqueue(crate::torque::shadow::ShadowInputKind::BusLoss {
+                            device: 0,
+                            multi_device_gap,
+                            live_intent: self.shadow_live_intent(),
+                            live_is_torqued: self.is_torqued,
+                            live_stopped: true,
+                        });
+                }
             }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if !self.rt_executor_owned {
+            self.flush_torque_shadow();
         }
     }
 
