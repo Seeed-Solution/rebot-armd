@@ -6561,7 +6561,7 @@ impl SupervisorInner {
         let mut ages = Vec::with_capacity(self.config.dof);
         driver.feedback_ages_into(&mut ages);
         let mut cache = terminal_capture::CaptureDriverCache {
-            enable_state: driver.enable_state(),
+            enable_state: EnableState::Unknown,
             driver_caps: caps,
             feedback_valid: driver_valid,
             ..terminal_capture::CaptureDriverCache::default()

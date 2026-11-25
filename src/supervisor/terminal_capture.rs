@@ -799,12 +799,25 @@ pub(crate) enum StagedTerminal {
     Captured(TerminalCaptureRecord),
 }
 
-/// Fixed-capacity inline staging buffer for terminal transitions produced during one control
-/// release before `publish_at` flushes them into the SPSC ring (0 heap allocations).
-#[derive(Default)]
+/// Fixed-capacity preallocated staging buffer for terminal transitions produced during one control
+/// release before `publish_at` flushes them into the SPSC ring (0 RT heap allocations; backing
+/// slice is allocated once at `SupervisorInner::new` to keep `SupervisorInner` small on the stack).
 pub(crate) struct StagedTerminalBuf {
-    slots: [Option<StagedTerminal>; 4],
+    slots: Box<[Option<StagedTerminal>]>,
     len: usize,
+}
+
+impl Default for StagedTerminalBuf {
+    fn default() -> Self {
+        let mut v = Vec::with_capacity(4);
+        for _ in 0..4 {
+            v.push(None);
+        }
+        Self {
+            slots: v.into_boxed_slice(),
+            len: 0,
+        }
+    }
 }
 
 impl StagedTerminalBuf {
