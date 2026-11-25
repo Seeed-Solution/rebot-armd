@@ -1824,6 +1824,26 @@ pub trait ArmDriver: Send {
     /// timestamps (returns `None` when the driver uses wall-clock `Instant::now()`).
     fn driver_clock(&self) -> Option<std::sync::Arc<dyn crate::transport::DriverClock>> { None }
 
+    /// Vendor family reported to the shadow `TorqueController` reducer.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn shadow_vendor_kind(&self) -> crate::torque::VendorKind {
+        crate::torque::VendorKind::Damiao
+    }
+
+    /// Enable or disable inline fixed-capacity shadow observation staging inside the driver.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn set_shadow_enabled(&mut self, _enabled: bool) {}
+
+    /// Drain staged shadow observations into `out` while the caller ALREADY holds the driver lock.
+    /// Returns `(copied, dropped_count)` with zero heap allocations.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn drain_shadow_observations(
+        &mut self,
+        _out: &mut [Option<crate::torque::shadow::ShadowDriverObs>],
+    ) -> (usize, u64) {
+        (0, 0)
+    }
+
     /// Wait `d` on the driver's clock (the transport's deterministic clock advances in tests).
     fn clock_pause(&self, d: Duration) { std::thread::sleep(d) }
 
@@ -1955,6 +1975,8 @@ pub struct FeetechArmDriver<T: Transport> {
     hold_sync_pkt_buf: Vec<u8>,
     consecutive_missed_echoes: u32,
     warned_missed_echoes: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    shadow_staging: crate::torque::shadow::ShadowDriverStaging,
 }
 
 impl<T: Transport> FeetechArmDriver<T> {
@@ -2025,6 +2047,8 @@ impl<T: Transport> FeetechArmDriver<T> {
             hold_sync_pkt_buf: Vec::with_capacity(16 + hold_cap * 3),
             consecutive_missed_echoes: 0,
             warned_missed_echoes: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            shadow_staging: crate::torque::shadow::ShadowDriverStaging::new(false),
         }
     }
 
@@ -2226,8 +2250,14 @@ impl<T: Transport> FeetechArmDriver<T> {
 
     #[inline]
     fn poison_line(&mut self) {
+        let now = self.clock_now();
         self.line_poisoned = true;
-        self.line_poison_quiet_since = Some(self.clock_now());
+        self.line_poison_quiet_since = Some(now);
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.shadow_staging.is_enabled() {
+            self.shadow_staging
+                .push(crate::torque::shadow::ShadowDriverObs::SerialTimeout { device: 0, now });
+        }
     }
 
     #[inline]
@@ -2364,6 +2394,24 @@ impl<T: Transport> FeetechArmDriver<T> {
         let decode_now = self.clock_now();
         if pkt_rx_at > decode_now {
             self.rest_pose_window[joint_idx].reset();
+            #[cfg(not(target_arch = "wasm32"))]
+            if self.shadow_staging.is_enabled() && joint_idx < crate::torque::MAX_CHANNELS {
+                let sample_id = self.shadow_staging.next_sample_id();
+                self.shadow_staging
+                    .push(crate::torque::shadow::ShadowDriverObs::CausalSample {
+                        channel: joint_idx as u8,
+                        sample_id,
+                        stamp: crate::torque::shadow::RxStampKind::Future,
+                        decode_now,
+                        position_rad: self.cached_states[joint_idx].position,
+                        velocity_rad_s: None,
+                        temperature_c: None,
+                        reported_enabled: self.reported_enable[joint_idx].map(|v| v == 1),
+                        correlated_after_write_done: self.last_motion_write_at[joint_idx],
+                        poll_issued: req_written_at,
+                        provenance: crate::torque::shadow::EvidenceProvenance::HardwareCausal,
+                    });
+            }
             return false;
         }
         let default_calib = feetech::FeetechJointCalib::default();
@@ -2400,6 +2448,32 @@ impl<T: Transport> FeetechArmDriver<T> {
         let after_motion = self.last_motion_write_at[joint_idx].is_none_or(|w| {
             pkt_rx_at >= w && req_written_at.is_none_or(|req_at| req_at >= w)
         });
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.shadow_staging.is_enabled() && joint_idx < crate::torque::MAX_CHANNELS {
+            let sample_id = self.shadow_staging.next_sample_id();
+            self.shadow_staging
+                .push(crate::torque::shadow::ShadowDriverObs::CausalSample {
+                    channel: joint_idx as u8,
+                    sample_id,
+                    stamp: crate::torque::shadow::RxStampKind::Valid {
+                        rx_at: pkt_rx_at,
+                        drift_ns: 0,
+                        live_post_settle: after_motion,
+                    },
+                    decode_now,
+                    position_rad: self.cached_states[joint_idx].position,
+                    velocity_rad_s: Some(self.cached_states[joint_idx].velocity),
+                    temperature_c: Some(self.cached_states[joint_idx].temperature),
+                    reported_enabled: self.reported_enable[joint_idx].map(|v| v == 1),
+                    correlated_after_write_done: if after_motion {
+                        self.last_motion_write_at[joint_idx]
+                    } else {
+                        None
+                    },
+                    poll_issued: req_written_at,
+                    provenance: crate::torque::shadow::EvidenceProvenance::HardwareCausal,
+                });
+        }
         if let Some(ref gate) = self.stopped_disable_gate {
             if gate.is_arm_joint(joint_idx) {
                 let pos = self.cached_states[joint_idx].position;
@@ -2746,9 +2820,68 @@ impl<T: Transport> FeetechArmDriver<T> {
                 }
                 self.torque_enable_commanded = prev_commanded;
             }
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(idx) = servo_idx {
+                if self.shadow_staging.is_enabled() && idx < crate::torque::MAX_CHANNELS {
+                    let now = self.clock_now();
+                    let mut outcomes = [crate::torque::MotorWriteOutcome::NotTargeted;
+                        crate::torque::MAX_CHANNELS];
+                    outcomes[idx] = crate::torque::MotorWriteOutcome::Failed;
+                    let wk = match kind {
+                        DisableKind::DisableRequested { .. } => {
+                            crate::torque::WriteKind::DisableRequested
+                        }
+                        DisableKind::DisableProtective { .. } => {
+                            crate::torque::WriteKind::DisableProtective
+                        }
+                    };
+                    self.shadow_staging
+                        .push(crate::torque::shadow::ShadowDriverObs::WriteResult {
+                            device: 0,
+                            kind: wk,
+                            write_done: now,
+                            now,
+                            target_mask: crate::torque::ChannelMask::bit(idx as u8),
+                            outcomes,
+                            ambiguous_gap: false,
+                        });
+                }
+            }
             return Err(e.into());
         }
-        let _ = self.transport.flush();
+        let flush_res = self.transport.flush();
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(idx) = servo_idx {
+            if self.shadow_staging.is_enabled() && idx < crate::torque::MAX_CHANNELS {
+                let now = self.clock_now();
+                let mut outcomes = [crate::torque::MotorWriteOutcome::NotTargeted;
+                    crate::torque::MAX_CHANNELS];
+                outcomes[idx] = if flush_res.is_ok() {
+                    crate::torque::MotorWriteOutcome::Sent
+                } else {
+                    crate::torque::MotorWriteOutcome::Ambiguous
+                };
+                let wk = match kind {
+                    DisableKind::DisableRequested { .. } => {
+                        crate::torque::WriteKind::DisableRequested
+                    }
+                    DisableKind::DisableProtective { .. } => {
+                        crate::torque::WriteKind::DisableProtective
+                    }
+                };
+                self.shadow_staging
+                    .push(crate::torque::shadow::ShadowDriverObs::WriteResult {
+                        device: 0,
+                        kind: wk,
+                        write_done: now,
+                        now,
+                        target_mask: crate::torque::ChannelMask::bit(idx as u8),
+                        outcomes,
+                        ambiguous_gap: flush_res.is_err(),
+                    });
+            }
+        }
+        let _ = flush_res;
         if *rx_budget > 0 && deadline.is_none_or(|dl| self.clock_now() < dl) {
             let _ = self.drain_tx_echo_until(&pkt, deadline);
         }
@@ -4792,6 +4925,28 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         true
     }
 
+    fn driver_clock(&self) -> Option<std::sync::Arc<dyn crate::transport::DriverClock>> {
+        self.clock.clone()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn shadow_vendor_kind(&self) -> crate::torque::VendorKind {
+        crate::torque::VendorKind::Feetech
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn set_shadow_enabled(&mut self, enabled: bool) {
+        self.shadow_staging.set_enabled(enabled);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn drain_shadow_observations(
+        &mut self,
+        out: &mut [Option<crate::torque::shadow::ShadowDriverObs>],
+    ) -> (usize, u64) {
+        self.shadow_staging.drain_into(out)
+    }
+
     fn begin_control_release(&mut self, release_seq: u64) {
         self.control_release_managed = true;
         self.control_release_id = release_seq;
@@ -5297,17 +5452,88 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                 }
                 let pkt = feetech::build_set_torque(id, true);
                 if let Err(e) = self.transport.write_all(&pkt) {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if self.shadow_staging.is_enabled() && idx < crate::torque::MAX_CHANNELS {
+                        let now = self.clock_now();
+                        let mut outcomes = [crate::torque::MotorWriteOutcome::NotTargeted;
+                            crate::torque::MAX_CHANNELS];
+                        outcomes[idx] = crate::torque::MotorWriteOutcome::Failed;
+                        self.shadow_staging.push(
+                            crate::torque::shadow::ShadowDriverObs::WriteResult {
+                                device: 0,
+                                kind: crate::torque::WriteKind::Enable,
+                                write_done: now,
+                                now,
+                                target_mask: crate::torque::ChannelMask::bit(idx as u8),
+                                outcomes,
+                                ambiguous_gap: false,
+                            },
+                        );
+                    }
                     write_err = Some(e.into());
                     break;
                 }
                 self.torque_enable_commanded = true;
                 if let Err(e) = self.strict_stop_check(Some(start_stamp)) {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if self.shadow_staging.is_enabled() && idx < crate::torque::MAX_CHANNELS {
+                        let now = self.clock_now();
+                        let mut outcomes = [crate::torque::MotorWriteOutcome::NotTargeted;
+                            crate::torque::MAX_CHANNELS];
+                        outcomes[idx] = crate::torque::MotorWriteOutcome::Ambiguous;
+                        self.shadow_staging.push(
+                            crate::torque::shadow::ShadowDriverObs::WriteResult {
+                                device: 0,
+                                kind: crate::torque::WriteKind::Enable,
+                                write_done: now,
+                                now,
+                                target_mask: crate::torque::ChannelMask::bit(idx as u8),
+                                outcomes,
+                                ambiguous_gap: true,
+                            },
+                        );
+                    }
                     write_err = Some(e);
                     break;
                 }
                 if let Err(e) = self.transport.flush() {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if self.shadow_staging.is_enabled() && idx < crate::torque::MAX_CHANNELS {
+                        let now = self.clock_now();
+                        let mut outcomes = [crate::torque::MotorWriteOutcome::NotTargeted;
+                            crate::torque::MAX_CHANNELS];
+                        outcomes[idx] = crate::torque::MotorWriteOutcome::Ambiguous;
+                        self.shadow_staging.push(
+                            crate::torque::shadow::ShadowDriverObs::WriteResult {
+                                device: 0,
+                                kind: crate::torque::WriteKind::Enable,
+                                write_done: now,
+                                now,
+                                target_mask: crate::torque::ChannelMask::bit(idx as u8),
+                                outcomes,
+                                ambiguous_gap: true,
+                            },
+                        );
+                    }
                     write_err = Some(e.into());
                     break;
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                if self.shadow_staging.is_enabled() && idx < crate::torque::MAX_CHANNELS {
+                    let now = self.clock_now();
+                    let mut outcomes = [crate::torque::MotorWriteOutcome::NotTargeted;
+                        crate::torque::MAX_CHANNELS];
+                    outcomes[idx] = crate::torque::MotorWriteOutcome::Sent;
+                    self.shadow_staging
+                        .push(crate::torque::shadow::ShadowDriverObs::WriteResult {
+                            device: 0,
+                            kind: crate::torque::WriteKind::Enable,
+                            write_done: now,
+                            now,
+                            target_mask: crate::torque::ChannelMask::bit(idx as u8),
+                            outcomes,
+                            ambiguous_gap: false,
+                        });
                 }
                 if let Err(e) = self.drain_tx_echo(&pkt) {
                     write_err = Some(e);
@@ -5509,6 +5735,31 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
             });
             self.hold_sync_pkt_buf = sync_pkt;
             tx_res?;
+            #[cfg(not(target_arch = "wasm32"))]
+            if self.shadow_staging.is_enabled() {
+                let now = self.clock_now();
+                let mut mask = crate::torque::ChannelMask::EMPTY;
+                let mut outcomes = [crate::torque::MotorWriteOutcome::NotTargeted;
+                    crate::torque::MAX_CHANNELS];
+                for i in 0..dof.min(crate::torque::MAX_CHANNELS) {
+                    if (held_mask & (1u64 << i)) != 0 {
+                        mask.insert(i as u8);
+                        outcomes[i] = crate::torque::MotorWriteOutcome::Sent;
+                    }
+                }
+                if !mask.is_empty() {
+                    self.shadow_staging
+                        .push(crate::torque::shadow::ShadowDriverObs::WriteResult {
+                            device: 0,
+                            kind: crate::torque::WriteKind::Hold,
+                            write_done: now,
+                            now,
+                            target_mask: mask,
+                            outcomes,
+                            ambiguous_gap: false,
+                        });
+                }
+            }
             if self.incomplete_chunk_idx.is_some() && !self.rx_buffer.is_empty() {
                 let fallback_ts = self.clock_now();
                 self.rx_timestamps.resize(self.rx_buffer.len(), fallback_ts);
@@ -5559,6 +5810,28 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         self.drain_tx_echo(&sync_pkt)?;
         let write_done = self.clock_now();
         self.last_motion_write_at.fill(Some(write_done));
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.shadow_staging.is_enabled() {
+            let mut mask = crate::torque::ChannelMask::EMPTY;
+            let mut outcomes = [crate::torque::MotorWriteOutcome::NotTargeted;
+                crate::torque::MAX_CHANNELS];
+            for i in 0..self.servo_ids.len().min(crate::torque::MAX_CHANNELS) {
+                mask.insert(i as u8);
+                outcomes[i] = crate::torque::MotorWriteOutcome::Sent;
+            }
+            if !mask.is_empty() {
+                self.shadow_staging
+                    .push(crate::torque::shadow::ShadowDriverObs::WriteResult {
+                        device: 0,
+                        kind: crate::torque::WriteKind::Motion,
+                        write_done,
+                        now: write_done,
+                        target_mask: mask,
+                        outcomes,
+                        ambiguous_gap: false,
+                    });
+            }
+        }
         if self.incomplete_chunk_idx.is_some() && !self.rx_buffer.is_empty() {
             let fallback_ts = self.clock_now();
             self.rx_timestamps.resize(self.rx_buffer.len(), fallback_ts);
@@ -5607,6 +5880,8 @@ pub struct FashionStarArmDriver<T: Transport> {
     stopped_disable_gate: Option<StoppedDisableGate>,
     tx_release_deadline: Option<Instant>,
     disable_dispatched_mask: u64,
+    #[cfg(not(target_arch = "wasm32"))]
+    shadow_staging: crate::torque::shadow::ShadowDriverStaging,
 }
 
 impl<T: Transport> FashionStarArmDriver<T> {
@@ -5637,6 +5912,8 @@ impl<T: Transport> FashionStarArmDriver<T> {
             stopped_disable_gate: None,
             tx_release_deadline: None,
             disable_dispatched_mask: 0,
+            #[cfg(not(target_arch = "wasm32"))]
+            shadow_staging: crate::torque::shadow::ShadowDriverStaging::new(false),
         }
     }
 
@@ -5645,6 +5922,11 @@ impl<T: Transport> FashionStarArmDriver<T> {
         self.line_poison_quiet_until = Some(now + TORQUE_CAUSAL_SETTLE_WINDOW);
         for w in &mut self.rest_pose_window {
             w.reset();
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.shadow_staging.is_enabled() {
+            self.shadow_staging
+                .push(crate::torque::shadow::ShadowDriverObs::SerialTimeout { device: 0, now });
         }
     }
 
@@ -5784,7 +6066,41 @@ impl<T: Transport> FashionStarArmDriver<T> {
         if let DisableKind::DisableRequested { started_at } = kind {
             self.check_disable_requested(started_at)?;
         }
-        self.transport.write_all(&pkt)?;
+        let res = self.transport.write_all(&pkt);
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.shadow_staging.is_enabled() {
+            if let Some(idx) = self.servo_ids.iter().position(|&s| s == id) {
+                if idx < crate::torque::MAX_CHANNELS {
+                    let now = self.now();
+                    let mut outcomes = [crate::torque::MotorWriteOutcome::NotTargeted;
+                        crate::torque::MAX_CHANNELS];
+                    outcomes[idx] = if res.is_ok() {
+                        crate::torque::MotorWriteOutcome::Sent
+                    } else {
+                        crate::torque::MotorWriteOutcome::Failed
+                    };
+                    let wk = match kind {
+                        DisableKind::DisableRequested { .. } => {
+                            crate::torque::WriteKind::DisableRequested
+                        }
+                        DisableKind::DisableProtective { .. } => {
+                            crate::torque::WriteKind::DisableProtective
+                        }
+                    };
+                    self.shadow_staging
+                        .push(crate::torque::shadow::ShadowDriverObs::WriteResult {
+                            device: 0,
+                            kind: wk,
+                            write_done: now,
+                            now,
+                            target_mask: crate::torque::ChannelMask::bit(idx as u8),
+                            outcomes,
+                            ambiguous_gap: false,
+                        });
+                }
+            }
+        }
+        res?;
         Ok(())
     }
 
@@ -5920,6 +6236,28 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
         Err(ArmDriverError::Protocol("UNSUPPORTED: serial driver does not support budgeted torque transitions".into()))
     }
 
+    fn driver_clock(&self) -> Option<std::sync::Arc<dyn crate::transport::DriverClock>> {
+        self.clock.clone()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn shadow_vendor_kind(&self) -> crate::torque::VendorKind {
+        crate::torque::VendorKind::FashionStar
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn set_shadow_enabled(&mut self, enabled: bool) {
+        self.shadow_staging.set_enabled(enabled);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn drain_shadow_observations(
+        &mut self,
+        out: &mut [Option<crate::torque::shadow::ShadowDriverObs>],
+    ) -> (usize, u64) {
+        self.shadow_staging.drain_into(out)
+    }
+
     fn set_abort_flag(&mut self, flag: Arc<AtomicBool>) {
         self.abort_flag = Some(flag);
     }
@@ -5950,6 +6288,29 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
             self.strict_stop_check(Some(start_stamp))?;
             self.transport.flush()?;
             self.record_motion_write_done_all();
+            #[cfg(not(target_arch = "wasm32"))]
+            if self.shadow_staging.is_enabled() {
+                let now = self.now();
+                let mut mask = crate::torque::ChannelMask::EMPTY;
+                let mut outcomes = [crate::torque::MotorWriteOutcome::NotTargeted;
+                    crate::torque::MAX_CHANNELS];
+                for i in 0..self.servo_ids.len().min(crate::torque::MAX_CHANNELS) {
+                    mask.insert(i as u8);
+                    outcomes[i] = crate::torque::MotorWriteOutcome::Sent;
+                }
+                if !mask.is_empty() {
+                    self.shadow_staging
+                        .push(crate::torque::shadow::ShadowDriverObs::WriteResult {
+                            device: 0,
+                            kind: crate::torque::WriteKind::Enable,
+                            write_done: now,
+                            now,
+                            target_mask: mask,
+                            outcomes,
+                            ambiguous_gap: false,
+                        });
+                }
+            }
             Ok(())
         }
     }
@@ -6154,6 +6515,31 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
             self.pending_stop_check(Some(start_stamp))?;
             self.transport.flush()?;
             self.record_motion_write_done_masked(sent_mask);
+            #[cfg(not(target_arch = "wasm32"))]
+            if self.shadow_staging.is_enabled() {
+                let now = self.now();
+                let mut mask = crate::torque::ChannelMask::EMPTY;
+                let mut outcomes = [crate::torque::MotorWriteOutcome::NotTargeted;
+                    crate::torque::MAX_CHANNELS];
+                for i in 0..dof.min(crate::torque::MAX_CHANNELS) {
+                    if (sent_mask & (1u64 << i)) != 0 {
+                        mask.insert(i as u8);
+                        outcomes[i] = crate::torque::MotorWriteOutcome::Sent;
+                    }
+                }
+                if !mask.is_empty() {
+                    self.shadow_staging
+                        .push(crate::torque::shadow::ShadowDriverObs::WriteResult {
+                            device: 0,
+                            kind: crate::torque::WriteKind::Hold,
+                            write_done: now,
+                            now,
+                            target_mask: mask,
+                            outcomes,
+                            ambiguous_gap: false,
+                        });
+                }
+            }
             for i in 0..dof {
                 if (sent_mask & (1u64 << i)) != 0 {
                     report.joint_status[i] = if (stale_mask & (1u64 << i)) != 0 {
@@ -6183,6 +6569,29 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
         }
         self.transport.flush()?;
         self.record_motion_write_done_all();
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.shadow_staging.is_enabled() {
+            let now = self.now();
+            let mut mask = crate::torque::ChannelMask::EMPTY;
+            let mut outcomes = [crate::torque::MotorWriteOutcome::NotTargeted;
+                crate::torque::MAX_CHANNELS];
+            for i in 0..self.servo_ids.len().min(crate::torque::MAX_CHANNELS) {
+                mask.insert(i as u8);
+                outcomes[i] = crate::torque::MotorWriteOutcome::Sent;
+            }
+            if !mask.is_empty() {
+                self.shadow_staging
+                    .push(crate::torque::shadow::ShadowDriverObs::WriteResult {
+                        device: 0,
+                        kind: crate::torque::WriteKind::Motion,
+                        write_done: now,
+                        now,
+                        target_mask: mask,
+                        outcomes,
+                        ambiguous_gap: false,
+                    });
+            }
+        }
         Ok(())
     }
 
@@ -6289,6 +6698,29 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
                             let decode_now = self.now();
                             if pkt_rx_at > decode_now {
                                 self.rest_pose_window[joint_idx].reset();
+                                #[cfg(not(target_arch = "wasm32"))]
+                                if self.shadow_staging.is_enabled()
+                                    && joint_idx < crate::torque::MAX_CHANNELS
+                                {
+                                    let sample_id = self.shadow_staging.next_sample_id();
+                                    self.shadow_staging.push(
+                                        crate::torque::shadow::ShadowDriverObs::CausalSample {
+                                            channel: joint_idx as u8,
+                                            sample_id,
+                                            stamp: crate::torque::shadow::RxStampKind::Future,
+                                            decode_now,
+                                            position_rad: self.cached_states[joint_idx].position,
+                                            velocity_rad_s: None,
+                                            temperature_c: None,
+                                            reported_enabled: None,
+                                            correlated_after_write_done: self.last_motion_write_at
+                                                [joint_idx],
+                                            poll_issued: Some(req_written_at),
+                                            provenance:
+                                                crate::torque::shadow::EvidenceProvenance::HardwareCausal,
+                                        },
+                                    );
+                                }
                                 break;
                             }
                             let tenth_deg = i16::from_le_bytes([content[0], content[1]]);
@@ -6334,6 +6766,41 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
                                         self.rest_pose_window[joint_idx].record_disagree();
                                     }
                                 }
+                            }
+                            #[cfg(not(target_arch = "wasm32"))]
+                            if self.shadow_staging.is_enabled()
+                                && joint_idx < crate::torque::MAX_CHANNELS
+                            {
+                                let sample_id = self.shadow_staging.next_sample_id();
+                                self.shadow_staging.push(
+                                    crate::torque::shadow::ShadowDriverObs::CausalSample {
+                                        channel: joint_idx as u8,
+                                        sample_id,
+                                        stamp: crate::torque::shadow::RxStampKind::Valid {
+                                            rx_at: pkt_rx_at,
+                                            drift_ns: 0,
+                                            live_post_settle: after_motion
+                                                && correlated_after_query
+                                                && !self.line_poisoned
+                                                && !self.rx_needs_post_motion_flush,
+                                        },
+                                        decode_now,
+                                        position_rad: pos,
+                                        velocity_rad_s: None,
+                                        temperature_c: None,
+                                        reported_enabled: None,
+                                        correlated_after_write_done: if correlated_after_query
+                                            && after_motion
+                                        {
+                                            self.last_motion_write_at[joint_idx]
+                                        } else {
+                                            None
+                                        },
+                                        poll_issued: Some(req_written_at),
+                                        provenance:
+                                            crate::torque::shadow::EvidenceProvenance::HardwareCausal,
+                                    },
+                                );
                             }
                             break;
                         } else if header == fashionstar::FASHIONSTAR_RESPONSE_HEADER {
@@ -6736,6 +7203,9 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     /// first `0x307` emission after the first provably fresh J7 sample arrives to be a stationary
     /// `Hold` at that measured position (`vel_raw = 0`, configured `current_raw`).
     pf_hold_on_first_fresh: bool,
+    /// Inline fixed-capacity shadow observation staging (zero alloc, zero lock).
+    #[cfg(not(target_arch = "wasm32"))]
+    shadow_staging: crate::torque::shadow::ShadowDriverStaging,
 }
 
 /// Transmit priority classes (lower value = higher priority):
@@ -6839,6 +7309,39 @@ fn can_rx_time_to_monotonic<C: CanTransport>(
             let mapped = decode_now.checked_sub(Duration::from_nanos(age_ns))?;
             Some((mapped, Some(offset_ns)))
         }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[inline]
+fn can_rx_time_reject_kind<C: CanTransport>(
+    can: &C,
+    rx_time: CanRxTime,
+    decode_now: Instant,
+) -> crate::torque::shadow::RxStampKind {
+    match rx_time {
+        CanRxTime::Monotonic(ts) if ts > decode_now => crate::torque::shadow::RxStampKind::Future,
+        CanRxTime::KernelRealtimeNs(rx_ns) => {
+            if let Some(sample) = can.rx_clock_sample() {
+                if let CanRxTime::KernelRealtimeNs(now_ns) = sample.rx_now {
+                    if sample.realtime_minus_monotonic_ns.is_some() && rx_ns > now_ns {
+                        return crate::torque::shadow::RxStampKind::Future;
+                    }
+                }
+            }
+            crate::torque::shadow::RxStampKind::Unmappable
+        }
+        _ => crate::torque::shadow::RxStampKind::Unmappable,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[inline]
+fn damiao_mode_to_shadow_control_mode(mode: DamiaoControlMode) -> crate::motor_mode::ControlMode {
+    match mode {
+        DamiaoControlMode::Mit => crate::motor_mode::ControlMode::Impedance,
+        DamiaoControlMode::PosVel => crate::motor_mode::ControlMode::PositionVelocity,
+        DamiaoControlMode::PosForce => crate::motor_mode::ControlMode::PositionForce,
     }
 }
 
@@ -7529,6 +8032,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             slot_last_tx_seq: [0; MAX_MODE_JOINTS * 2],
             pf_next_intent_is_hold: false,
             pf_hold_on_first_fresh: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            shadow_staging: crate::torque::shadow::ShadowDriverStaging::new(false),
         }
     }
 
@@ -8238,6 +8743,67 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let cpu0 = crate::diagnostics::tick::thread_cpu_ns();
         let res = self.can.transmit(&frame);
         let write_done = self.now();
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.shadow_staging.is_enabled() {
+            let shadow_info = match kind {
+                TxKind::DisableRequested { .. } | TxKind::ClientParkDisable { .. } => self
+                    .motor_ids
+                    .iter()
+                    .position(|&id| u32::from(id) == frame.id)
+                    .map(|idx| (crate::torque::WriteKind::DisableRequested, idx)),
+                TxKind::DisableProtective { .. } => self
+                    .motor_ids
+                    .iter()
+                    .position(|&id| u32::from(id) == frame.id)
+                    .map(|idx| (crate::torque::WriteKind::DisableProtective, idx)),
+                TxKind::Handshake if frame.data == damiao::CMD_ENABLE => self
+                    .motor_ids
+                    .iter()
+                    .position(|&id| u32::from(id) == frame.id)
+                    .map(|idx| (crate::torque::WriteKind::Enable, idx)),
+                TxKind::Target | TxKind::Recovery => {
+                    motion_idx.map(|idx| (crate::torque::WriteKind::Motion, idx))
+                }
+                TxKind::RollbackHold(j) | TxKind::MeasuredHold(j) => {
+                    Some((crate::torque::WriteKind::Hold, j))
+                }
+                _ if !frame.is_extended
+                    && !frame.is_rtr
+                    && frame.dlc == 8
+                    && frame.id == 0x7FF
+                    && frame.data[2] == damiao::REG_WRITE
+                    && frame.data[3] == damiao::RID_CTRL_MODE =>
+                {
+                    let target_id = u16::from_le_bytes([frame.data[0], frame.data[1]]);
+                    self.motor_ids
+                        .iter()
+                        .position(|&id| id == target_id)
+                        .map(|idx| (crate::torque::WriteKind::ModeSwitch, idx))
+                }
+                _ => None,
+            };
+            if let Some((wk, idx)) = shadow_info {
+                if idx < crate::torque::MAX_CHANNELS {
+                    let mut outcomes = [crate::torque::MotorWriteOutcome::NotTargeted;
+                        crate::torque::MAX_CHANNELS];
+                    outcomes[idx] = if res.is_ok() {
+                        crate::torque::MotorWriteOutcome::Sent
+                    } else {
+                        crate::torque::MotorWriteOutcome::Failed
+                    };
+                    self.shadow_staging
+                        .push(crate::torque::shadow::ShadowDriverObs::WriteResult {
+                            device: 0,
+                            kind: wk,
+                            write_done,
+                            now: write_done,
+                            target_mask: crate::torque::ChannelMask::bit(idx as u8),
+                            outcomes,
+                            ambiguous_gap: false,
+                        });
+                }
+            }
+        }
         let write_done_clock = if motion_idx.is_some() && res.is_ok() {
             Some(self.capture_rx_clock_sample(write_done))
         } else {
@@ -8473,6 +9039,17 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     self.joint_modes[i] = Some(DamiaoControlMode::PosForce);
                 }
                 self.verified_modes[i] = Some(base_mode);
+                #[cfg(not(target_arch = "wasm32"))]
+                if self.shadow_staging.is_enabled() && i < crate::torque::MAX_CHANNELS {
+                    let now = self.now();
+                    self.shadow_staging
+                        .push(crate::torque::shadow::ShadowDriverObs::ModeVerified {
+                            channel: i as u8,
+                            mode: damiao_mode_to_shadow_control_mode(base_mode),
+                            now,
+                            provenance: crate::torque::shadow::EvidenceProvenance::HardwareCausal,
+                        });
+                }
             } else if let Some(m) = verified_ctrl.or(ctrl_mode) {
                 if m != base {
                     tracing::warn!(
@@ -10114,8 +10691,19 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
         let u = |k: usize| u32::from_le_bytes(v[k].0);
         let f = |k: usize| f32::from_le_bytes(v[k].0);
+        let timeout_raw = u(7);
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.shadow_staging.is_enabled() && i < crate::torque::MAX_CHANNELS {
+            let now = self.now();
+            self.shadow_staging
+                .push(crate::torque::shadow::ShadowDriverObs::TimeoutReadback {
+                    channel: i as u8,
+                    raw_reg: timeout_raw,
+                    now,
+                });
+        }
         Ok(crate::mit::MotorIdentity { joint: i + 1, motor_id: self.motor_ids[i], reply_id, esc_id: u(0), mst_id: u(1), sw_ver: u(2),
-            ctrl_mode: u(3), pmax: f(4), vmax: f(5), tmax: f(6), timeout_raw: u(7) })
+            ctrl_mode: u(3), pmax: f(4), vmax: f(5), tmax: f(6), timeout_raw })
     }
 
     /// MIT-path mode write: the CTRL_MODE writes and holds of `joints`, then a matching
@@ -10398,6 +10986,19 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         for &i in joints {
             self.joint_modes[i] = if failed.contains(&i) { None } else { Some(modes[i]) };
             self.verified_modes[i] = self.joint_modes[i];
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(m) = self.verified_modes[i] {
+                if self.shadow_staging.is_enabled() && i < crate::torque::MAX_CHANNELS {
+                    let now = self.now();
+                    self.shadow_staging
+                        .push(crate::torque::shadow::ShadowDriverObs::ModeVerified {
+                            channel: i as u8,
+                            mode: damiao_mode_to_shadow_control_mode(m),
+                            now,
+                            provenance: crate::torque::shadow::EvidenceProvenance::HardwareCausal,
+                        });
+                }
+            }
         }
         Ok((failed, why))
     }
@@ -12416,6 +13017,44 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
     fn supports_budgeted_disable_await(&self) -> bool {
         true
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn shadow_vendor_kind(&self) -> crate::torque::VendorKind {
+        crate::torque::VendorKind::Damiao
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn set_shadow_enabled(&mut self, enabled: bool) {
+        self.shadow_staging.set_enabled(enabled);
+        if enabled {
+            let now = self.now();
+            for (i, verified) in self
+                .verified_modes
+                .iter()
+                .enumerate()
+                .take(crate::torque::MAX_CHANNELS)
+            {
+                if let Some(m) = *verified {
+                    self.shadow_staging.push(
+                        crate::torque::shadow::ShadowDriverObs::ModeVerified {
+                            channel: i as u8,
+                            mode: damiao_mode_to_shadow_control_mode(m),
+                            now,
+                            provenance: crate::torque::shadow::EvidenceProvenance::HardwareCausal,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn drain_shadow_observations(
+        &mut self,
+        out: &mut [Option<crate::torque::shadow::ShadowDriverObs>],
+    ) -> (usize, u64) {
+        self.shadow_staging.drain_into(out)
     }
 
     fn begin_control_release(&mut self, release_seq: u64) {
@@ -15461,6 +16100,19 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                             self.verified_modes[idx] = Some(mode);
                             self.joint_modes[idx] = Some(mode);
                             self.mode_readback_boundary[idx] = None;
+                            #[cfg(not(target_arch = "wasm32"))]
+                            if self.shadow_staging.is_enabled() && idx < crate::torque::MAX_CHANNELS
+                            {
+                                self.shadow_staging.push(
+                                    crate::torque::shadow::ShadowDriverObs::ModeVerified {
+                                        channel: idx as u8,
+                                        mode: damiao_mode_to_shadow_control_mode(mode),
+                                        now: decode_now,
+                                        provenance:
+                                            crate::torque::shadow::EvidenceProvenance::HardwareCausal,
+                                    },
+                                );
+                            }
                         }
                     }
                 }
@@ -15494,11 +16146,53 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 // Host dequeue time never counts: require a kernel/transport receive timestamp,
                 // and reject future-dated timestamps completely (never clamp).
                 let Some(rx_t) = rx_time else {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if self.shadow_staging.is_enabled() && idx < crate::torque::MAX_CHANNELS {
+                        let decode_now = self.now();
+                        let sample_id = self.shadow_staging.next_sample_id();
+                        self.shadow_staging.push(
+                            crate::torque::shadow::ShadowDriverObs::CausalSample {
+                                channel: idx as u8,
+                                sample_id,
+                                stamp: crate::torque::shadow::RxStampKind::Missing {
+                                    reset_window: false,
+                                },
+                                decode_now,
+                                position_rad: feedback.position,
+                                velocity_rad_s: Some(feedback.velocity),
+                                temperature_c: Some(feedback.t_mos.max(feedback.t_rotor)),
+                                reported_enabled: Some(feedback.state_or_error == 1),
+                                correlated_after_write_done: None,
+                                poll_issued: None,
+                                provenance: crate::torque::shadow::EvidenceProvenance::HardwareCausal,
+                            },
+                        );
+                    }
                     return;
                 };
                 let decode_now = self.now();
                 let Some((rx_at, decode_offset_ns)) = can_rx_time_to_monotonic(&self.can, rx_t, decode_now) else {
                     self.rest_pose_window[idx].reset();
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if self.shadow_staging.is_enabled() && idx < crate::torque::MAX_CHANNELS {
+                        let sample_id = self.shadow_staging.next_sample_id();
+                        let reject_stamp = can_rx_time_reject_kind(&self.can, rx_t, decode_now);
+                        self.shadow_staging.push(
+                            crate::torque::shadow::ShadowDriverObs::CausalSample {
+                                channel: idx as u8,
+                                sample_id,
+                                stamp: reject_stamp,
+                                decode_now,
+                                position_rad: feedback.position,
+                                velocity_rad_s: Some(feedback.velocity),
+                                temperature_c: Some(feedback.t_mos.max(feedback.t_rotor)),
+                                reported_enabled: Some(feedback.state_or_error == 1),
+                                correlated_after_write_done: None,
+                                poll_issued: None,
+                                provenance: crate::torque::shadow::EvidenceProvenance::HardwareCausal,
+                            },
+                        );
+                    }
                     return;
                 };
                 // Per-motor rest-pose causal boundary check (after last motion command):
@@ -15519,6 +16213,27 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         write_done_rx_clock: Some(cur_rx),
                         write_done_offset_ns: cur_off,
                     });
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if self.shadow_staging.is_enabled() && idx < crate::torque::MAX_CHANNELS {
+                        let sample_id = self.shadow_staging.next_sample_id();
+                        self.shadow_staging.push(
+                            crate::torque::shadow::ShadowDriverObs::CausalSample {
+                                channel: idx as u8,
+                                sample_id,
+                                stamp: crate::torque::shadow::RxStampKind::OffsetDrifted {
+                                    rebased_settle: true,
+                                },
+                                decode_now,
+                                position_rad: feedback.position,
+                                velocity_rad_s: Some(feedback.velocity),
+                                temperature_c: Some(feedback.t_mos.max(feedback.t_rotor)),
+                                reported_enabled: Some(feedback.state_or_error == 1),
+                                correlated_after_write_done: None,
+                                poll_issued: None,
+                                provenance: crate::torque::shadow::EvidenceProvenance::HardwareCausal,
+                            },
+                        );
+                    }
                     return;
                 }
                 let queue_bound = self.rx_empty_instant;
@@ -15567,6 +16282,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                             self.reported_torque_loss_sample_seq.wrapping_add(1).max(1);
                     }
                 }
+                let mut window_offset_drifted = false;
                 match boundary_check {
                     RestBoundaryCheck::OffsetDrifted => unreachable!(),
                     RestBoundaryCheck::InSettle => {
@@ -15591,6 +16307,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                                     decode_offset_ns,
                                 ) == WindowRecord::OffsetDrifted
                                 {
+                                    window_offset_drifted = true;
                                     let (cur_rx, cur_off) = self.capture_rx_clock_sample(decode_now);
                                     self.rest_pose_boundary[idx] = Some(RestPoseBoundary {
                                         write_done: decode_now,
@@ -15603,6 +16320,40 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                             }
                         }
                     }
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                if self.shadow_staging.is_enabled() && idx < crate::torque::MAX_CHANNELS {
+                    let sample_id = self.shadow_staging.next_sample_id();
+                    let stamp = if window_offset_drifted {
+                        crate::torque::shadow::RxStampKind::OffsetDrifted {
+                            rebased_settle: true,
+                        }
+                    } else {
+                        let drift_ns = self
+                            .rest_pose_boundary[idx]
+                            .and_then(|b| b.write_done_offset_ns)
+                            .zip(decode_offset_ns)
+                            .map_or(0, |(w, d)| (d - w).unsigned_abs().min(u128::from(u64::MAX)) as u64);
+                        crate::torque::shadow::RxStampKind::Valid {
+                            rx_at,
+                            drift_ns,
+                            live_post_settle: boundary_check == RestBoundaryCheck::Satisfied,
+                        }
+                    };
+                    self.shadow_staging
+                        .push(crate::torque::shadow::ShadowDriverObs::CausalSample {
+                            channel: idx as u8,
+                            sample_id,
+                            stamp,
+                            decode_now,
+                            position_rad: feedback.position,
+                            velocity_rad_s: Some(feedback.velocity),
+                            temperature_c: Some(feedback.t_mos.max(feedback.t_rotor)),
+                            reported_enabled: Some(feedback.state_or_error == 1),
+                            correlated_after_write_done: None,
+                            poll_issued: None,
+                            provenance: crate::torque::shadow::EvidenceProvenance::HardwareCausal,
+                        });
                 }
                 if let Some(cap) = self.refresh_capture.as_mut() {
                     if cap.joint == idx && seq > cap.boundary && rx_at >= cap.tx_at {
@@ -16551,6 +17302,8 @@ pub struct RobStrideArmDriver<C: CanTransport> {
     stopped_disable_gate: Option<StoppedDisableGate>,
     tx_release_deadline: Option<Instant>,
     disable_dispatched_mask: u64,
+    #[cfg(not(target_arch = "wasm32"))]
+    shadow_staging: crate::torque::shadow::ShadowDriverStaging,
 }
 
 impl<C: CanTransport> RobStrideArmDriver<C> {
@@ -16584,6 +17337,8 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
             stopped_disable_gate: None,
             tx_release_deadline: None,
             disable_dispatched_mask: 0,
+            #[cfg(not(target_arch = "wasm32"))]
+            shadow_staging: crate::torque::shadow::ShadowDriverStaging::new(false),
         }
     }
 
@@ -16710,11 +17465,39 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
     /// Per-write transmit choke point for RobStride type-4 stop / fault-clear CAN frames:
     /// re-evaluates freshness, rest pose (K=3 window), and 1 s request lifetime immediately
     /// before each `can.transmit` in every safety state.
-    fn send_type4_frame(&mut self, _idx: usize, frame: &CanFrame, kind: DisableKind) -> Result<(), ArmDriverError> {
+    fn send_type4_frame(&mut self, idx: usize, frame: &CanFrame, kind: DisableKind) -> Result<(), ArmDriverError> {
         if let DisableKind::DisableRequested { started_at } = kind {
             self.check_disable_requested(started_at)?;
         }
-        self.can.transmit(frame)?;
+        let res = self.can.transmit(frame);
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.shadow_staging.is_enabled() && idx < crate::torque::MAX_CHANNELS {
+            let now = self.now();
+            let mut outcomes = [crate::torque::MotorWriteOutcome::NotTargeted;
+                crate::torque::MAX_CHANNELS];
+            outcomes[idx] = if res.is_ok() {
+                crate::torque::MotorWriteOutcome::Sent
+            } else {
+                crate::torque::MotorWriteOutcome::Failed
+            };
+            let wk = match kind {
+                DisableKind::DisableRequested { .. } => crate::torque::WriteKind::DisableRequested,
+                DisableKind::DisableProtective { .. } => {
+                    crate::torque::WriteKind::DisableProtective
+                }
+            };
+            self.shadow_staging
+                .push(crate::torque::shadow::ShadowDriverObs::WriteResult {
+                    device: 0,
+                    kind: wk,
+                    write_done: now,
+                    now,
+                    target_mask: crate::torque::ChannelMask::bit(idx as u8),
+                    outcomes,
+                    ambiguous_gap: false,
+                });
+        }
+        res?;
         Ok(())
     }
 
@@ -16753,12 +17536,60 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
                                 self.rest_pose_window[idx].reset();
                                 self.feedback_continuity_epoch[idx] =
                                     self.feedback_continuity_epoch[idx].wrapping_add(1);
+                                #[cfg(not(target_arch = "wasm32"))]
+                                if self.shadow_staging.is_enabled()
+                                    && idx < crate::torque::MAX_CHANNELS
+                                {
+                                    let sample_id = self.shadow_staging.next_sample_id();
+                                    self.shadow_staging.push(
+                                        crate::torque::shadow::ShadowDriverObs::CausalSample {
+                                            channel: idx as u8,
+                                            sample_id,
+                                            stamp: crate::torque::shadow::RxStampKind::Missing {
+                                                reset_window: true,
+                                            },
+                                            decode_now,
+                                            position_rad: feedback.position,
+                                            velocity_rad_s: Some(feedback.velocity),
+                                            temperature_c: Some(feedback.mos_temperature),
+                                            reported_enabled: None,
+                                            correlated_after_write_done: None,
+                                            poll_issued: None,
+                                            provenance:
+                                                crate::torque::shadow::EvidenceProvenance::HardwareCausal,
+                                        },
+                                    );
+                                }
                                 continue;
                             };
                             let Some((rx_at, decode_offset_ns)) =
                                 can_rx_time_to_monotonic(&self.can, rx_t, decode_now)
                             else {
                                 self.rest_pose_window[idx].reset();
+                                #[cfg(not(target_arch = "wasm32"))]
+                                if self.shadow_staging.is_enabled()
+                                    && idx < crate::torque::MAX_CHANNELS
+                                {
+                                    let sample_id = self.shadow_staging.next_sample_id();
+                                    let reject_stamp =
+                                        can_rx_time_reject_kind(&self.can, rx_t, decode_now);
+                                    self.shadow_staging.push(
+                                        crate::torque::shadow::ShadowDriverObs::CausalSample {
+                                            channel: idx as u8,
+                                            sample_id,
+                                            stamp: reject_stamp,
+                                            decode_now,
+                                            position_rad: feedback.position,
+                                            velocity_rad_s: Some(feedback.velocity),
+                                            temperature_c: Some(feedback.mos_temperature),
+                                            reported_enabled: None,
+                                            correlated_after_write_done: None,
+                                            poll_issued: None,
+                                            provenance:
+                                                crate::torque::shadow::EvidenceProvenance::HardwareCausal,
+                                        },
+                                    );
+                                }
                                 continue;
                             };
                             let boundary_check = match self.rest_pose_boundary[idx] {
@@ -16778,6 +17609,31 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
                                     write_done_rx_clock: Some(cur_rx),
                                     write_done_offset_ns: cur_off,
                                 });
+                                #[cfg(not(target_arch = "wasm32"))]
+                                if self.shadow_staging.is_enabled()
+                                    && idx < crate::torque::MAX_CHANNELS
+                                {
+                                    let sample_id = self.shadow_staging.next_sample_id();
+                                    self.shadow_staging.push(
+                                        crate::torque::shadow::ShadowDriverObs::CausalSample {
+                                            channel: idx as u8,
+                                            sample_id,
+                                            stamp:
+                                                crate::torque::shadow::RxStampKind::OffsetDrifted {
+                                                    rebased_settle: true,
+                                                },
+                                            decode_now,
+                                            position_rad: feedback.position,
+                                            velocity_rad_s: Some(feedback.velocity),
+                                            temperature_c: Some(feedback.mos_temperature),
+                                            reported_enabled: None,
+                                            correlated_after_write_done: None,
+                                            poll_issued: None,
+                                            provenance:
+                                                crate::torque::shadow::EvidenceProvenance::HardwareCausal,
+                                        },
+                                    );
+                                }
                                 continue;
                             }
                             self.cached_states[idx] = JointState {
@@ -16799,6 +17655,7 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
                             self.last_feedback_instant[idx] = Some(rx_at);
                             self.feedback_seq[idx] = self.feedback_seq[idx].wrapping_add(1);
                             self.feedback_queue_bound[idx] = self.rx_empty_instant;
+                            let mut window_offset_drifted = false;
                             match boundary_check {
                                 RestBoundaryCheck::OffsetDrifted => unreachable!(),
                                 RestBoundaryCheck::InSettle => {
@@ -16820,6 +17677,7 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
                                                     decode_offset_ns,
                                                 ) == WindowRecord::OffsetDrifted
                                                 {
+                                                    window_offset_drifted = true;
                                                     let (cur_rx, cur_off) =
                                                         self.capture_rx_clock_sample(decode_now);
                                                     self.rest_pose_boundary[idx] = Some(RestPoseBoundary {
@@ -16834,6 +17692,46 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
                                         }
                                     }
                                 }
+                            }
+                            #[cfg(not(target_arch = "wasm32"))]
+                            if self.shadow_staging.is_enabled() && idx < crate::torque::MAX_CHANNELS
+                            {
+                                let sample_id = self.shadow_staging.next_sample_id();
+                                let stamp = if window_offset_drifted {
+                                    crate::torque::shadow::RxStampKind::OffsetDrifted {
+                                        rebased_settle: true,
+                                    }
+                                } else {
+                                    let drift_ns = self
+                                        .rest_pose_boundary[idx]
+                                        .and_then(|b| b.write_done_offset_ns)
+                                        .zip(decode_offset_ns)
+                                        .map_or(0, |(w, d)| {
+                                            (d - w).unsigned_abs().min(u128::from(u64::MAX)) as u64
+                                        });
+                                    crate::torque::shadow::RxStampKind::Valid {
+                                        rx_at,
+                                        drift_ns,
+                                        live_post_settle: boundary_check
+                                            == RestBoundaryCheck::Satisfied,
+                                    }
+                                };
+                                self.shadow_staging.push(
+                                    crate::torque::shadow::ShadowDriverObs::CausalSample {
+                                        channel: idx as u8,
+                                        sample_id,
+                                        stamp,
+                                        decode_now,
+                                        position_rad: feedback.position,
+                                        velocity_rad_s: Some(feedback.velocity),
+                                        temperature_c: Some(feedback.mos_temperature),
+                                        reported_enabled: None,
+                                        correlated_after_write_done: None,
+                                        poll_issued: None,
+                                        provenance:
+                                            crate::torque::shadow::EvidenceProvenance::HardwareCausal,
+                                    },
+                                );
                             }
                         }
                     }
@@ -16975,6 +17873,28 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
 
     fn clock_now(&self) -> Instant {
         self.now()
+    }
+
+    fn driver_clock(&self) -> Option<std::sync::Arc<dyn crate::transport::DriverClock>> {
+        self.clock.clone()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn shadow_vendor_kind(&self) -> crate::torque::VendorKind {
+        crate::torque::VendorKind::RobStride
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn set_shadow_enabled(&mut self, enabled: bool) {
+        self.shadow_staging.set_enabled(enabled);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn drain_shadow_observations(
+        &mut self,
+        out: &mut [Option<crate::torque::shadow::ShadowDriverObs>],
+    ) -> (usize, u64) {
+        self.shadow_staging.drain_into(out)
     }
 
     fn feedback_ages(&self) -> Vec<Option<Duration>> {
@@ -17195,6 +18115,29 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
             }
             self.strict_stop_check(Some(start_stamp))?;
             self.can.flush()?;
+            #[cfg(not(target_arch = "wasm32"))]
+            if self.shadow_staging.is_enabled() {
+                let now = self.now();
+                let mut mask = crate::torque::ChannelMask::EMPTY;
+                let mut outcomes = [crate::torque::MotorWriteOutcome::NotTargeted;
+                    crate::torque::MAX_CHANNELS];
+                for i in 0..self.motor_ids.len().min(crate::torque::MAX_CHANNELS) {
+                    mask.insert(i as u8);
+                    outcomes[i] = crate::torque::MotorWriteOutcome::Sent;
+                }
+                if !mask.is_empty() {
+                    self.shadow_staging
+                        .push(crate::torque::shadow::ShadowDriverObs::WriteResult {
+                            device: 0,
+                            kind: crate::torque::WriteKind::Enable,
+                            write_done: now,
+                            now,
+                            target_mask: mask,
+                            outcomes,
+                            ambiguous_gap: false,
+                        });
+                }
+            }
             Ok(())
         }
     }
@@ -17320,6 +18263,31 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
         if report.sent_any {
             self.pending_stop_check(Some(start_stamp))?;
             self.can.flush()?;
+            #[cfg(not(target_arch = "wasm32"))]
+            if self.shadow_staging.is_enabled() {
+                let now = self.now();
+                let mut mask = crate::torque::ChannelMask::EMPTY;
+                let mut outcomes = [crate::torque::MotorWriteOutcome::NotTargeted;
+                    crate::torque::MAX_CHANNELS];
+                for i in 0..dof.min(crate::torque::MAX_CHANNELS) {
+                    if (sent_mask & (1u64 << i)) != 0 {
+                        mask.insert(i as u8);
+                        outcomes[i] = crate::torque::MotorWriteOutcome::Sent;
+                    }
+                }
+                if !mask.is_empty() {
+                    self.shadow_staging
+                        .push(crate::torque::shadow::ShadowDriverObs::WriteResult {
+                            device: 0,
+                            kind: crate::torque::WriteKind::Hold,
+                            write_done: now,
+                            now,
+                            target_mask: mask,
+                            outcomes,
+                            ambiguous_gap: false,
+                        });
+                }
+            }
             for i in 0..dof {
                 if (sent_mask & (1u64 << i)) != 0 {
                     report.joint_status[i] = if (stale_mask & (1u64 << i)) != 0 {
@@ -17378,6 +18346,22 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
                 write_done_rx_clock: Some(write_done_rx_clock),
                 write_done_offset_ns,
             });
+            #[cfg(not(target_arch = "wasm32"))]
+            if self.shadow_staging.is_enabled() && i < crate::torque::MAX_CHANNELS {
+                let mut outcomes = [crate::torque::MotorWriteOutcome::NotTargeted;
+                    crate::torque::MAX_CHANNELS];
+                outcomes[i] = crate::torque::MotorWriteOutcome::Sent;
+                self.shadow_staging
+                    .push(crate::torque::shadow::ShadowDriverObs::WriteResult {
+                        device: 0,
+                        kind: crate::torque::WriteKind::Motion,
+                        write_done,
+                        now: write_done,
+                        target_mask: crate::torque::ChannelMask::bit(i as u8),
+                        outcomes,
+                        ambiguous_gap: false,
+                    });
+            }
         }
         self.can.flush()?;
         Ok(())

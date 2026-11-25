@@ -489,6 +489,35 @@ impl ArmDriver for ZeroOffsetDriver {
     fn driver_clock(&self) -> Option<std::sync::Arc<dyn crate::transport::DriverClock>> {
         self.inner.driver_clock()
     }
+    #[cfg(not(target_arch = "wasm32"))]
+    fn shadow_vendor_kind(&self) -> crate::torque::VendorKind {
+        self.inner.shadow_vendor_kind()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    fn set_shadow_enabled(&mut self, enabled: bool) {
+        self.inner.set_shadow_enabled(enabled);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    fn drain_shadow_observations(
+        &mut self,
+        out: &mut [Option<crate::torque::shadow::ShadowDriverObs>],
+    ) -> (usize, u64) {
+        let (count, dropped) = self.inner.drain_shadow_observations(out);
+        for slot in out.iter_mut().take(count) {
+            if let Some(crate::torque::shadow::ShadowDriverObs::CausalSample {
+                channel,
+                position_rad,
+                ..
+            }) = slot
+            {
+                let o = self.off(usize::from(*channel));
+                if o != 0.0 {
+                    *position_rad -= o;
+                }
+            }
+        }
+        (count, dropped)
+    }
     fn mit_expiry_recover(&mut self) -> Result<(), String> { self.inner.mit_expiry_recover() }
     fn mit_fresh_status(&mut self) -> Result<Vec<u8>, String> { self.inner.mit_fresh_status() }
     fn acknowledge_mit_fence_trip(&mut self) { self.inner.acknowledge_mit_fence_trip() }
