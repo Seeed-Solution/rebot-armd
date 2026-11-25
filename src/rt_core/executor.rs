@@ -3040,6 +3040,7 @@ impl ServoTargetDispatcher {
     where
         F: FnOnce(
             bool,
+            bool,
             &mut dyn FnMut(
                 &crate::supervisor::targets::PolicyTarget<'_>,
                 super::mailbox::PolicyValidityBounds,
@@ -3052,6 +3053,17 @@ impl ServoTargetDispatcher {
             let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             self.sync_authoritative_fence_locked(&mut g);
             g.pop_outcomes_locked(hub, &mut resolved_cmds, &mut stream_refusals);
+            let mut has_pending_refusal = false;
+            g.policy_outcomes.retain(|(aid, o)| {
+                if *aid == action_id {
+                    if o.result.is_err() {
+                        has_pending_refusal = true;
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
             let is_closed = g.closed
                 || self.exited.load(Ordering::Acquire)
                 || g.port.is_policy_closed(action_id);
@@ -3093,7 +3105,7 @@ impl ServoTargetDispatcher {
                     }
                     sub
                 };
-            gate(is_closed, &mut submit_fn)
+            gate(is_closed, has_pending_refusal, &mut submit_fn)
         };
         Self::deliver_drained(hub, (resolved_cmds, stream_refusals));
         res
@@ -3696,6 +3708,7 @@ impl RtExecutorHandle {
     pub(crate) fn submit_policy_gated<R, F>(&self, action_id: u64, gate: F) -> R
     where
         F: FnOnce(
+            bool,
             bool,
             &mut dyn FnMut(
                 &crate::supervisor::targets::PolicyTarget<'_>,

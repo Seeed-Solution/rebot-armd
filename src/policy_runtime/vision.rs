@@ -816,10 +816,13 @@ impl<'a> HubCommitGuard<'a> {
     }
 
     pub fn is_unbroken_active_renewal(&self, ticket_hs_gen: u64) -> bool {
+        self.is_unbroken_active_renewal_at(ticket_hs_gen, self.inner.now_ms())
+    }
+
+    pub fn is_unbroken_active_renewal_at(&self, ticket_hs_gen: u64, now_ms: u64) -> bool {
         let Some(ref live_hs) = self.inner.handshake else {
             return false;
         };
-        let now_ms = self.inner.now_ms();
         let floor = self.inner.continuous_renewal_floor_gen;
         if live_hs.handshake_generation == 0
             || floor == 0

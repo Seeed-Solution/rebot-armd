@@ -560,6 +560,42 @@ impl StrictPolicyContract {
     }
 }
 
+/// Validate structural bounds of a [`ChunkingSpec`] against `action_dim` (reused at manifest
+/// parse and at `PreparedPolicy::from_backend` so direct Rust callers cannot bypass validation).
+pub fn validate_chunking_spec(chunking: ChunkingSpec, action_dim: usize) -> Result<(), PolicyError> {
+    if chunking.chunk_size < 1 || chunking.chunk_size > MAX_CHUNK_SIZE {
+        return Err(PolicyError::InvalidManifest(format!(
+            "chunking.chunk_size must be in 1..={MAX_CHUNK_SIZE}, got {}",
+            chunking.chunk_size
+        )));
+    }
+    let total_out = chunking
+        .chunk_size
+        .checked_mul(action_dim)
+        .ok_or_else(|| PolicyError::InvalidManifest("chunk_size * action_dim overflow".into()))?;
+    if total_out > super::mlp::MAX_DIM {
+        return Err(PolicyError::InvalidManifest(format!(
+            "chunking output width ({} * {action_dim} = {total_out}) exceeds budget ({})",
+            chunking.chunk_size,
+            super::mlp::MAX_DIM
+        )));
+    }
+    if chunking.replan_every < 1 || chunking.replan_every > chunking.chunk_size {
+        return Err(PolicyError::InvalidManifest(format!(
+            "chunking.replan_every must be in 1..={}, got {}",
+            chunking.chunk_size, chunking.replan_every
+        )));
+    }
+    if let Some(k) = chunking.temporal_ensemble_k {
+        if !k.is_finite() || !(0.0..=MAX_TEMPORAL_ENSEMBLE_K).contains(&k) {
+            return Err(PolicyError::InvalidManifest(format!(
+                "chunking.temporal_ensemble_k must be a finite f32 in 0..={MAX_TEMPORAL_ENSEMBLE_K}, got {k}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Validate that the open-loop chunk horizon `replan_every * (1000 / fps)` does not exceed
 /// [`MAX_OPEN_LOOP_HORIZON_MS`] (1000 ms).
 pub fn validate_chunking_horizon(chunking: ChunkingSpec, fps: f64) -> Result<(), PolicyError> {

@@ -15,8 +15,8 @@ use crate::safety::SafetyState;
 use crate::supervisor::{ArmError, ArmSupervisor, SupervisorInner};
 
 use super::manifest::{
-    validate_chunking_horizon, PolicySnapshot, StrictPolicyContract, VideoEmbeddingSpec,
-    VisionStalePolicy,
+    validate_chunking_horizon, validate_chunking_spec, PolicySnapshot, StrictPolicyContract,
+    VideoEmbeddingSpec, VisionStalePolicy, VisionTargetLostPolicy,
 };
 use super::release_gate::VerifiedReleaseGate;
 use super::units::{
@@ -1201,6 +1201,7 @@ pub struct PreparedPolicy {
     last_step_sources: Vec<ChunkSource>,
     last_run_ctx: Option<ChunkRunContext>,
     last_commit_slot_expires_at: Option<Instant>,
+    last_commit_period_end: Option<Instant>,
     last_commit_handshake_expires_at: Option<Instant>,
 }
 
@@ -1212,6 +1213,7 @@ impl PreparedPolicy {
         backend: Box<dyn PolicyBackend>,
         config: &ArmConfig,
     ) -> Result<Self, PolicyError> {
+        validate_chunking_spec(contract.chunking, contract.action_dim)?;
         if config.dof != contract.action_dim {
             return Err(PolicyError::DimensionMismatch {
                 expected: config.dof,
@@ -1281,6 +1283,7 @@ impl PreparedPolicy {
             last_step_sources,
             last_run_ctx: None,
             last_commit_slot_expires_at: None,
+            last_commit_period_end: None,
             last_commit_handshake_expires_at: None,
         })
     }
@@ -1309,14 +1312,20 @@ impl PreparedPolicy {
         self.single_step_source = None;
         self.last_step_sources.clear();
         self.last_commit_slot_expires_at = None;
+        self.last_commit_period_end = None;
         self.last_commit_handshake_expires_at = None;
     }
 
-    /// Strictest remaining validity deadline across all contributing chunk sources and the
-    /// selected control period end from the most recent `commit_gate` `Submit` (`None` for
-    /// single-step policies or after `Skip` / clear).
+    /// Strictest contributing source expiry (inclusive: `now > exp`) from the most recent
+    /// `commit_gate` `Submit` (`None` for single-step policies or after `Skip` / clear).
     pub fn last_commit_slot_expires_at(&self) -> Option<Instant> {
         self.last_commit_slot_expires_at
+    }
+
+    /// Exclusive end instant of the selected control period (`now >= end` is past the slot)
+    /// from the most recent chunked `commit_gate` `Submit`.
+    pub fn last_commit_period_end(&self) -> Option<Instant> {
+        self.last_commit_period_end
     }
 
     /// Strictest embedding clock-handshake expiry across all contributing chunk sources from
@@ -1755,6 +1764,7 @@ impl PreparedPolicy {
         params: &CommitGateParams,
     ) -> Result<CommitGateDecision, PolicyError> {
         self.last_commit_slot_expires_at = None;
+        self.last_commit_period_end = None;
         self.last_commit_handshake_expires_at = None;
         let commit_period = (now
             .saturating_duration_since(interval_origin)
@@ -1936,9 +1946,9 @@ impl PreparedPolicy {
         let period_end_ns = (commit_period as u128)
             .saturating_add(1)
             .saturating_mul(period_ns.max(1));
-        if let Ok(ns_u64) = u64::try_from(period_end_ns) {
-            tighten(&mut slot_exp, interval_origin.checked_add(Duration::from_nanos(ns_u64)));
-        }
+        let period_end = u64::try_from(period_end_ns)
+            .ok()
+            .and_then(|ns_u64| interval_origin.checked_add(Duration::from_nanos(ns_u64)));
 
         let target = if self.staged_ready && self.staged_period == Some(commit_period) {
             self.chunk_ring.consume_front();
@@ -1955,6 +1965,7 @@ impl PreparedPolicy {
         self.staged_period = None;
         self.staged_infer_seq = None;
         self.last_commit_slot_expires_at = slot_exp;
+        self.last_commit_period_end = period_end;
         self.last_commit_handshake_expires_at = hs_exp;
         Ok(CommitGateDecision::Submit {
             target,
@@ -2222,6 +2233,7 @@ enum FinalCommitGateOutcome {
     },
     Skip,
     Hold,
+    Finish(&'static str),
     Fail {
         reason: &'static str,
         message: String,
@@ -2231,14 +2243,15 @@ enum FinalCommitGateOutcome {
 /// Single synchronous final commit gate shared by BOTH legacy (`spawn_policy_runner`) and
 /// RT-executor (`executor_commit_gate`) owners.
 ///
-/// Reads `gate_now` ONCE and (for detector policies) `collector.latest()` ONCE, enforces
-/// current-tick detector staleness / `model_generation` and current-tick embedding
-/// `InferenceTicket` with their configured `Hold`/`Stop` dispositions at `gate_now`, and then
-/// runs `prepared.commit_gate(gate_now, ...)` with zero intervening clock reads or extra snapshots.
+/// Acquires the latest detector snapshot (`collector.latest()`) BEFORE reading `gate_now` ONCE,
+/// then enforces deadline, coherent latest-frame detector timestamp / staleness / generation /
+/// target-lost disposition (`Hold` / `Stop` / `ZeroFeatures`), pre-inference detector staleness,
+/// current-tick embedding `InferenceTicket` (with `is_unbroken_active_renewal_at(..., eval_now_ms)`),
+/// and `prepared.commit_gate(gate_now, ...)` with zero intervening clock reads or extra snapshots.
 #[allow(clippy::too_many_arguments)]
 fn evaluate_final_commit_gate(
     prepared: &mut PreparedPolicy,
-    gate_now: Instant,
+    deadline: Option<Instant>,
     interval_origin_std: Instant,
     period_ns: u128,
     last_committed_period: Option<u64>,
@@ -2260,9 +2273,23 @@ fn evaluate_final_commit_gate(
     emb_ticket: Option<&InferenceTicket>,
     emb_mapped_and_unc_ms: Option<(u64, u64)>,
 ) -> FinalCommitGateOutcome {
-    // 1. Single coherent detector snapshot + current-tick detector staleness / generation check.
+    // Acquire the detector frame snapshot BEFORE sampling `gate_now` so lock acquisition and
+    // frame cloning cannot move the sampled instant behind a period boundary.
+    let latest_detector_frame = if video_embedding_spec.is_none() {
+        collector.and_then(VisionFeatureCollector::latest)
+    } else {
+        None
+    };
+
+    let gate_now = Instant::now();
+    if deadline.is_some_and(|dl| gate_now >= dl) {
+        prepared.clear_chunk_buffer();
+        return FinalCommitGateOutcome::Finish("MAX_SECONDS");
+    }
+
+    // 1. Single coherent detector snapshot check: timestamp presence, latest-frame and
+    //    pre-inference staleness, model_generation, and target-lost disposition.
     let commit_vision_target = if video_embedding_spec.is_none() {
-        let latest_frame = collector.and_then(VisionFeatureCollector::latest);
         if let (Some(spec), Some(vis_cap)) = (vision_spec, vision_captured_at) {
             let age_ms = gate_now
                 .saturating_duration_since(vis_cap)
@@ -2282,7 +2309,37 @@ fn evaluate_final_commit_gate(
                 };
             }
         }
-        if let (Some(spec), Some(ref frame)) = (vision_spec, &latest_frame) {
+        if let (Some(spec), Some(ref frame)) = (vision_spec, &latest_detector_frame) {
+            let Some(frame_cap) = frame.captured_at else {
+                prepared.clear_chunk_buffer();
+                return match spec.on_stale {
+                    VisionStalePolicy::Stop => FinalCommitGateOutcome::Fail {
+                        reason: "VISION_TIMESTAMP_MISSING",
+                        message: format!(
+                            "Vision frame {} has no capture timestamp before step commit",
+                            frame.frame_id
+                        ),
+                    },
+                    VisionStalePolicy::Hold => FinalCommitGateOutcome::Hold,
+                };
+            };
+            let latest_age_ms = gate_now
+                .saturating_duration_since(frame_cap)
+                .as_millis()
+                .min(u64::MAX as u128) as u64;
+            if latest_age_ms > spec.max_staleness_ms {
+                prepared.clear_chunk_buffer();
+                return match spec.on_stale {
+                    VisionStalePolicy::Stop => FinalCommitGateOutcome::Fail {
+                        reason: "VISION_STALE",
+                        message: format!(
+                            "Latest vision frame {} is stale before step commit ({latest_age_ms} ms > {} ms)",
+                            frame.frame_id, spec.max_staleness_ms
+                        ),
+                    },
+                    VisionStalePolicy::Hold => FinalCommitGateOutcome::Hold,
+                };
+            }
             if spec.require_model_generation && frame.model_generation != locked_generation {
                 prepared.clear_chunk_buffer();
                 let (reason, message) = match frame.model_generation {
@@ -2304,12 +2361,32 @@ fn evaluate_final_commit_gate(
                 };
                 return FinalCommitGateOutcome::Fail { reason, message };
             }
-        }
-        if let (Some(spec), Some(ref frame)) = (vision_spec, &latest_frame) {
-            Some(
-                extract_top1_target(frame, spec)
-                    .map_or(DetectorTargetIdentity::Absent, |(_, id)| id),
-            )
+            match extract_top1_target(frame, spec) {
+                Some((_, id)) => Some(id),
+                None => match spec.on_target_lost {
+                    VisionTargetLostPolicy::ZeroFeatures => Some(DetectorTargetIdentity::Absent),
+                    VisionTargetLostPolicy::Hold => {
+                        prepared.clear_chunk_buffer();
+                        return FinalCommitGateOutcome::Hold;
+                    }
+                    VisionTargetLostPolicy::Stop => {
+                        prepared.clear_chunk_buffer();
+                        return FinalCommitGateOutcome::Fail {
+                            reason: "TARGET_LOST",
+                            message: match spec.target_label {
+                                Some(ref label) => format!(
+                                    "Target '{label}' lost in vision frame {} before step commit",
+                                    frame.frame_id
+                                ),
+                                None => format!(
+                                    "No valid detection above min_score {} in frame {} before step commit",
+                                    spec.min_score, frame.frame_id
+                                ),
+                            },
+                        };
+                    }
+                },
+            }
         } else {
             vision_target
         }
@@ -2318,7 +2395,7 @@ fn evaluate_final_commit_gate(
     };
 
     // 2. Current-tick embedding `InferenceTicket` verification at `gate_now` (preserving
-    //    `is_unbroken_active_renewal`, `on_stale=hold`, `ClockHandshakeExpired`, and `Stop`).
+    //    `is_unbroken_active_renewal_at`, `on_stale=hold`, `ClockHandshakeExpired`, and `Stop`).
     let embedding_clock_override_ms = hub_guard.and_then(HubCommitGuard::test_now_ms);
     let eval_now_ms = embedding_clock_override_ms.unwrap_or_else(|| monotonic_ms_at(gate_now));
     let commit_ticket_ctx = hub_guard.map(|guard| {
@@ -2342,7 +2419,7 @@ fn evaluate_final_commit_gate(
             Ok(()) => {}
             Err(TicketViolation::ClockHandshakeGenerationMismatch { expected, actual }) => {
                 prepared.clear_chunk_buffer();
-                if actual != 0 && guard.is_unbroken_active_renewal(expected) {
+                if actual != 0 && guard.is_unbroken_active_renewal_at(expected, eval_now_ms) {
                     return FinalCommitGateOutcome::Hold;
                 }
                 if eval_now_ms > ticket.clock_handshake_expires_at_ms() {
@@ -2899,7 +2976,7 @@ pub fn spawn_policy_runner(
             let (target, committed_period, input_age_ms, post_vision_age_ms) =
                 match evaluate_final_commit_gate(
                     &mut prepared,
-                    Instant::now(),
+                    deadline,
                     interval_origin_std,
                     period_ns,
                     last_committed_period,
@@ -2932,6 +3009,10 @@ pub fn spawn_policy_runner(
                     FinalCommitGateOutcome::Hold => {
                         inner.hold_policy_run(action_id);
                         continue;
+                    }
+                    FinalCommitGateOutcome::Finish(reason) => {
+                        inner.finish_policy_run(action_id, reason);
+                        break;
                     }
                     FinalCommitGateOutcome::Fail { reason, message } => {
                         inner.fail_policy_run(action_id, reason, message);
@@ -3160,7 +3241,7 @@ async fn executor_commit_gate(
             .then_some(lease_generation);
         let outcome = evaluate_final_commit_gate(
             prepared,
-            Instant::now(),
+            deadline,
             interval_origin_std,
             period_ns,
             last_committed_period,
@@ -3214,6 +3295,7 @@ async fn executor_commit_gate(
                 ExecutorCommitOutcome::Skip
             }
             FinalCommitGateOutcome::Hold => ExecutorCommitOutcome::Hold,
+            FinalCommitGateOutcome::Finish(reason) => ExecutorCommitOutcome::Finish(reason),
             FinalCommitGateOutcome::Fail { reason, message } => {
                 ExecutorCommitOutcome::Fail { reason, message }
             }
@@ -3222,7 +3304,7 @@ async fn executor_commit_gate(
 
     // Live mode: run `evaluate_final_commit_gate` and `submit` atomically under BOTH `hub_guard`
     // and the target-dispatcher mutex (`submit_policy_gated`).
-    let outcome = handle.submit_policy_gated(action_id, |is_closed, submit| {
+    let outcome = handle.submit_policy_gated(action_id, |is_closed, has_pending_refusal, submit| {
         let mirror_lease = supervisor.lease_generation();
         let fenced_lease = supervisor.atomic_fenced_lease_gen();
         let hub_active = supervisor.hub().latest().is_some_and(|s| {
@@ -3239,14 +3321,14 @@ async fn executor_commit_gate(
             prepared.clear_chunk_buffer();
             return ExecutorCommitOutcome::RtEnded;
         }
-        let gate_now = Instant::now();
-        if deadline.is_some_and(|dl| gate_now >= dl) {
+        if has_pending_refusal {
             prepared.clear_chunk_buffer();
-            return ExecutorCommitOutcome::Finish("MAX_SECONDS");
+            step_stats.record(infer_us, step_us);
+            return ExecutorCommitOutcome::Skip;
         }
         match evaluate_final_commit_gate(
             prepared,
-            gate_now,
+            deadline,
             interval_origin_std,
             period_ns,
             last_committed_period,
@@ -3308,6 +3390,7 @@ async fn executor_commit_gate(
                     vision_window_expires_at,
                     handshake_expires_at,
                     chunk_slot_expires_at: prepared.last_commit_slot_expires_at(),
+                    chunk_period_end: prepared.last_commit_period_end(),
                 };
                 let policy_target = PolicyTarget {
                     action_id,
@@ -3377,6 +3460,7 @@ async fn executor_commit_gate(
                 ExecutorCommitOutcome::Skip
             }
             FinalCommitGateOutcome::Hold => ExecutorCommitOutcome::Hold,
+            FinalCommitGateOutcome::Finish(reason) => ExecutorCommitOutcome::Finish(reason),
             FinalCommitGateOutcome::Fail { reason, message } => {
                 ExecutorCommitOutcome::Fail { reason, message }
             }
@@ -6374,14 +6458,19 @@ mod chunking_tests {
         let slot_exp = prep4
             .last_commit_slot_expires_at()
             .expect("chunked commit must record slot expiry");
+        let period_end = prep4
+            .last_commit_period_end()
+            .expect("chunked commit must record exclusive period_end");
         let hs_exp = prep4
             .last_commit_handshake_expires_at()
             .expect("embedding contributor must record handshake expiry");
-        // Fresh slot 0 has ticket newest deadline remaining 15 ms (25 - 10) < period_end remaining 40 ms.
+        // Fresh slot 0 has ticket newest deadline remaining 15 ms (25 - 10); period_end is origin + 50 ms.
         assert_eq!(slot_exp, origin + Duration::from_millis(25));
+        assert_eq!(period_end, origin + Duration::from_millis(50));
         assert_eq!(hs_exp, origin + Duration::from_millis(40));
 
-        // RT mailbox check passes at slot_exp and refuses DEADLINE_EXPIRED 1 ms after slot_exp!
+        // RT mailbox check passes at slot_exp and refuses DEADLINE_EXPIRED 1 ms after slot_exp,
+        // and enforces chunk_period_end as an exclusive boundary (now == period_end -> DEADLINE_EXPIRED).
         let mut q = [0.0f32; MAX_DOF];
         q[0] = 0.05;
         let auth = Authority {
@@ -6416,6 +6505,7 @@ mod chunking_tests {
             vision_window_expires_at: Some(origin + Duration::from_millis(100)),
             handshake_expires_at: Some(hs_exp),
             chunk_slot_expires_at: Some(slot_exp),
+            chunk_period_end: Some(period_end),
         };
         assert_eq!(
             frame.check_policy_with_validity(ArmId(1), BootId(1), slot_exp, &auth, &ta, validity),
@@ -6431,6 +6521,52 @@ mod chunking_tests {
                 validity
             ),
             Some("DEADLINE_EXPIRED")
+        );
+        let period_only_validity = PolicyValidityBounds {
+            vision_window_expires_at: None,
+            handshake_expires_at: None,
+            chunk_slot_expires_at: None,
+            chunk_period_end: Some(period_end),
+        };
+        assert_eq!(
+            frame.check_policy_with_validity(
+                ArmId(1),
+                BootId(1),
+                period_end - Duration::from_nanos(1),
+                &auth,
+                &ta,
+                period_only_validity
+            ),
+            None
+        );
+        assert_eq!(
+            frame.check_policy_with_validity(
+                ArmId(1),
+                BootId(1),
+                period_end,
+                &auth,
+                &ta,
+                period_only_validity
+            ),
+            Some("DEADLINE_EXPIRED")
+        );
+
+        // 3. Direct Rust callers cannot bypass structural chunk validation in from_backend.
+        let (snap_bad, mut contract_bad, cfg_bad) = make_chunk_snapshot_and_contract(4, 2, None);
+        contract_bad.chunking.replan_every = 0;
+        let (backend_bad, _) = CountingChunkBackend::new(state_dim, 4 * state_dim, vec![]);
+        assert!(
+            PreparedPolicy::from_backend(snap_bad, contract_bad, Box::new(backend_bad), &cfg_bad)
+                .is_err(),
+            "replan_every=0 must be rejected by PreparedPolicy::from_backend"
+        );
+        let (snap_nan, mut contract_nan, cfg_nan) = make_chunk_snapshot_and_contract(4, 2, None);
+        contract_nan.chunking.temporal_ensemble_k = Some(f32::NAN);
+        let (backend_nan, _) = CountingChunkBackend::new(state_dim, 4 * state_dim, vec![]);
+        assert!(
+            PreparedPolicy::from_backend(snap_nan, contract_nan, Box::new(backend_nan), &cfg_nan)
+                .is_err(),
+            "NaN temporal_ensemble_k must be rejected by PreparedPolicy::from_backend"
         );
     }
 }

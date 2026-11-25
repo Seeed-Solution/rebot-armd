@@ -50,9 +50,12 @@ pub struct PolicyValidityBounds {
     pub vision_window_expires_at: Option<Instant>,
     /// Absolute clock-handshake expiry (`clock_handshake_expires_at_ms` anchored at submit).
     pub handshake_expires_at: Option<Instant>,
-    /// Strictest chunk-slot validity bound across contributing cached sources and the
-    /// selected control period end (enforced on RT as `DEADLINE_EXPIRED` -> clean hold).
+    /// Strictest contributing source expiry for a chunked slot (inclusive: `now > exp` refuses
+    /// with `DEADLINE_EXPIRED` -> clean hold).
     pub chunk_slot_expires_at: Option<Instant>,
+    /// Exclusive end of the selected chunked control period (`now >= end` refuses with
+    /// `DEADLINE_EXPIRED`, matching `commit_gate`'s half-open `[t_N, t_{N+1})` slot boundary).
+    pub chunk_period_end: Option<Instant>,
 }
 
 /// One target.
@@ -210,6 +213,9 @@ impl TargetFrame {
             if self.vision_at.and_then(|at| now.checked_duration_since(at)).is_none_or(|age| age > m) {
                 return Some("VISION_STALE");
             }
+        }
+        if validity.chunk_period_end.is_some_and(|end| now >= end) {
+            return Some("DEADLINE_EXPIRED");
         }
         if validity.chunk_slot_expires_at.is_some_and(|exp| now > exp) {
             return Some("DEADLINE_EXPIRED");
