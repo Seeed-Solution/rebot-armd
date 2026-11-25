@@ -129,6 +129,8 @@ pub fn rt_progress(enabled: bool, r: Result<TorqueProgress, super::ArmDriverErro
         Ok(TorqueProgress::Done(TorqueOutcome::Confirmed)) => Ok(Rt::Done),
         Ok(TorqueProgress::Done(TorqueOutcome::Unconfirmed)) => Err("FEEDBACK_UNCONFIRMED"),
         Err(e) if super::is_estop_inhibited(&e) => Err("ESTOP_ACTIVE"),
+        Err(E::LeaseFenced) => Err("LEASE_LOST"),
+        Err(E::PartialDisable { .. }) => Err("DRIVER_WRITE_FAILED"),
         Err(E::TorqueOffWouldDrop | E::DisableRequestExpired) => Err("TORQUE_OFF_WOULD_DROP"),
         Err(E::Transport(_)) => Err("DRIVER_WRITE_FAILED"),
         Err(_) if enabled => Err("ENABLE_FAILED"),

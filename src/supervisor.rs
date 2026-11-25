@@ -8434,12 +8434,15 @@ impl SupervisorInner {
             .store(self.control_release_seq, Ordering::Release);
         #[cfg(not(target_arch = "wasm32"))]
         self.torque_shadow
-            .enqueue(crate::torque::shadow::ShadowInputKind::Release {
-                release_seq: self.control_release_seq,
-                live_intent: self.shadow_live_intent(),
-                live_is_torqued: self.is_torqued,
-                live_stopped: self.safety.state().is_stopped(),
-            });
+            .enqueue_at(
+                now_fn(),
+                crate::torque::shadow::ShadowInputKind::Release {
+                    release_seq: self.control_release_seq,
+                    live_intent: self.shadow_live_intent(),
+                    live_is_torqued: self.is_torqued,
+                    live_stopped: self.safety.state().is_stopped(),
+                },
+            );
         let was_thermal_active = self.thermal_protection_active();
         // Install the release publish-margin TX cap BEFORE enable-transition polling, background
         // disable polling, and RX feedback intake so every TX in Step 2 obeys the same cutoff.
@@ -9171,9 +9174,25 @@ impl SupervisorInner {
         const LEGACY_TORQUE_STEP_BUDGET: Duration = Duration::from_millis(1);
         let has_legacy_transition =
             !self.pending_rx_poll.active && self.has_non_broker_torque_transition();
+        let has_legacy_enable_transition = has_legacy_transition
+            && matches!(
+                self.torque_transition,
+                Some(driver_transitions::TorqueTransition::Enable(_))
+            );
         self.nonblocking_driver_release = has_legacy_transition;
         let legacy_step_start = has_legacy_transition.then(&mut *now_fn);
-        let legacy_step_deadline = legacy_step_start.map(|t| t + LEGACY_TORQUE_STEP_BUDGET);
+        let period_tick =
+            Duration::from_secs_f64(1.0 / f64::from(self.config.control_frequency_hz.max(1)));
+        let margin_tick = self.tx_release_publish_margin();
+        let legacy_step_deadline = legacy_step_start.map(|t| {
+            if has_legacy_enable_transition {
+                t + LEGACY_TORQUE_STEP_BUDGET
+            } else if let Some(rd) = release_deadline {
+                rd.checked_sub(margin_tick).unwrap_or(t)
+            } else {
+                t + period_tick.saturating_sub(margin_tick)
+            }
+        });
         let (applied_rx_tx_cap, rx_tx_cap_expired) = if !self.pending_rx_poll.active && self.driver.is_some() {
             let margin = self.tx_release_publish_margin();
             let period = Duration::from_secs_f64(1.0 / f64::from(self.config.control_frequency_hz.max(1)));
@@ -9243,12 +9262,15 @@ impl SupervisorInner {
                 .store(self.control_release_seq, Ordering::Release);
             #[cfg(not(target_arch = "wasm32"))]
             self.torque_shadow
-                .enqueue(crate::torque::shadow::ShadowInputKind::Release {
-                    release_seq: self.control_release_seq,
-                    live_intent: self.shadow_live_intent(),
-                    live_is_torqued: self.is_torqued,
-                    live_stopped: self.safety.state().is_stopped(),
-                });
+                .enqueue_at(
+                    now_fn(),
+                    crate::torque::shadow::ShadowInputKind::Release {
+                        release_seq: self.control_release_seq,
+                        live_intent: self.shadow_live_intent(),
+                        live_is_torqued: self.is_torqued,
+                        live_stopped: self.safety.state().is_stopped(),
+                    },
+                );
             if rx_tx_cap_expired {
                 // Cutoff already expired: read cached feedback ONLY so unbudgeted RX can never
                 // emit Damiao recovery TX past the release cutoff (DRV-F1 B9).

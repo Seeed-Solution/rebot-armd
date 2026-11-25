@@ -2291,8 +2291,32 @@ impl ShadowRuntime {
                 // Evaluate the reducer's predicted hold mask at the checkpoint itself (after
                 // Step-2 transition service and RX intake have already applied to `self.state_ref`)
                 // so comparison aligns with live measured-hold selection within the same release.
-                let pred_hold =
+                let mut pred_hold =
                     crate::torque::reducer::predict_group_hold_mask(self.state_ref(), 0, now_us);
+                if pred_hold.is_empty() {
+                    if let Some(pend) = self.state_ref().groups[0].pending_disable_dispatch {
+                        if pend.kind == DisableKind::Requested
+                            && !pend.remaining_recipients.is_empty()
+                        {
+                            // During a multi-tick requested disable, still-enabled joints keep
+                            // receiving measured holds until their disable frame goes out.
+                            let st = self.state_ref();
+                            for r in pend.remaining_recipients.iter() {
+                                if let Some(rcfg) = st.config.recipients.get(r as usize) {
+                                    for ch in rcfg.channels.iter() {
+                                        if st
+                                            .joints
+                                            .get(ch as usize)
+                                            .is_some_and(|j| j.captured_position_rad.is_some())
+                                        {
+                                            pred_hold.insert(ch);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 let mut rt_actions = ActionSummary {
                     hold_mask: pred_hold,
                     ..ActionSummary::default()
@@ -3073,7 +3097,7 @@ struct PendingDisableExpectation {
     kind: DisableKind,
     generation: u64,
     dispatch_id: u64,
-    release_id: u64,
+    last_progress_release_id: u64,
     expected_recipients: ChannelMask,
     remaining_recipients: ChannelMask,
     owner: ShadowOwner,
@@ -3328,7 +3352,7 @@ impl TorqueShadowConsumer {
         // 2. Expire unresolved predicted disable obligations on a subsequent release boundary.
         if matches!(rec.event, Some(Event::Release { .. })) {
             if let Some(pending) = self.pending_disable {
-                if rec.release_id > pending.release_id.saturating_add(1)
+                if rec.release_id > pending.last_progress_release_id.saturating_add(1)
                     && !pending.remaining_recipients.is_empty()
                 {
                     self.pending_disable = None;
@@ -3434,7 +3458,7 @@ impl TorqueShadowConsumer {
                     kind: dk,
                     generation: rec.join.generation,
                     dispatch_id: rec.rt_actions.disable_dispatch_id,
-                    release_id: rec.release_id,
+                    last_progress_release_id: rec.release_id,
                     expected_recipients: rec.rt_actions.disable_recipients,
                     remaining_recipients: rec.rt_actions.disable_recipients,
                     owner: rec.owner,
@@ -3554,9 +3578,13 @@ impl TorqueShadowConsumer {
                             atomics,
                         );
                     }
+                    let prev_remaining = exp.remaining_recipients;
                     exp.remaining_recipients = ChannelMask(
                         exp.remaining_recipients.raw() & !live.live_disable_recipients.raw(),
                     );
+                    if exp.remaining_recipients != prev_remaining {
+                        exp.last_progress_release_id = rec.release_id;
+                    }
                     self.pending_disable = if exp.remaining_recipients.is_empty() {
                         None
                     } else {
