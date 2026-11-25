@@ -933,6 +933,7 @@ struct MaintClientInner {
     closed: bool,
     waiters: HashMap<u64, MaintWaiter>,
     exited: Arc<AtomicBool>,
+    hub: Arc<StateHub>,
 }
 
 impl MaintClientInner {
@@ -950,6 +951,10 @@ impl MaintClientInner {
                 let res = match reply.result {
                     MaintenanceResult::Stopped | MaintenanceResult::StoppedWithConfig(_) => {
                         Err(OwnerError::Stopped)
+                    }
+                    MaintenanceResult::Observation(mut obs) => {
+                        self.hub.attach_policy_diag(&mut obs);
+                        Ok(MaintenanceResult::Observation(obs))
                     }
                     other => Ok(other),
                 };
@@ -988,7 +993,12 @@ pub(crate) struct MaintClient {
 }
 
 impl MaintClient {
-    fn new(req_tx: Producer<MaintRequest>, rep_rx: Consumer<MaintReply>, exited: Arc<AtomicBool>) -> Self {
+    fn new(
+        req_tx: Producer<MaintRequest>,
+        rep_rx: Consumer<MaintReply>,
+        exited: Arc<AtomicBool>,
+        hub: Arc<StateHub>,
+    ) -> Self {
         Self {
             inner: Mutex::new(MaintClientInner {
                 req_tx,
@@ -998,6 +1008,7 @@ impl MaintClient {
                 closed: false,
                 waiters: HashMap::new(),
                 exited,
+                hub,
             }),
         }
     }
@@ -1795,6 +1806,72 @@ impl BrokerDispatcher {
         Ok((ack_rx, term_rx))
     }
 
+    #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+    fn submit_policy_command(
+        &self,
+        client: super::broker::ClientId,
+        client_seq: u64,
+        authority: super::broker::Authority,
+        deadline: Instant,
+        cmd: super::requests::policy::PolicyCommand,
+        on_admitted: impl FnOnce(super::broker::RequestId),
+    ) -> Result<
+        (
+            tokio::sync::oneshot::Receiver<Result<super::broker::Reply, OwnerError>>,
+            Option<tokio::sync::oneshot::Receiver<Result<super::broker::Reply, OwnerError>>>,
+        ),
+        BrokerDispatchError,
+    > {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.exited.load(Ordering::Acquire) {
+            return Err(BrokerDispatchError::Stopped);
+        }
+        if client.0 == 0 || !self.conn_lifecycle.is_slot_open(client.0) {
+            return Err(BrokerDispatchError::Admit(
+                super::broker::AdmitError::Disconnected,
+            ));
+        }
+        let starts_action = cmd.starts_action();
+        let req = self
+            .broker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .submit_with_pre_push(
+                client,
+                client_seq,
+                authority,
+                deadline,
+                super::broker::Submit::Policy(cmd),
+                on_admitted,
+            )
+            .map_err(BrokerDispatchError::Admit)?;
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        if starts_action {
+            let (term_tx, term_rx) = tokio::sync::oneshot::channel();
+            st.managed.insert(
+                req,
+                ManagedEntry {
+                    client,
+                    waiter: ManagedWaiter::Action {
+                        ack: Some(ack_tx),
+                        terminal: Some(term_tx),
+                        acked: false,
+                    },
+                },
+            );
+            Ok((ack_rx, Some(term_rx)))
+        } else {
+            st.managed.insert(
+                req,
+                ManagedEntry {
+                    client,
+                    waiter: ManagedWaiter::OneShot(Some(ack_tx)),
+                },
+            );
+            Ok((ack_rx, None))
+        }
+    }
+
     /// Linearizes connection teardown off-thread: prevents any subsequent `BrokerDispatcher`
     /// submission for `connection.id()`, marks the broker client disconnected (retiring its
     /// managed waiters immediately while continuing broker reclamation), and pushes a
@@ -2401,7 +2478,13 @@ struct ServoTargetDispatcherInner {
     >,
     stream_owners: std::collections::HashMap<super::mailbox::StreamId, ServoStreamOwner>,
     unclaimed_outcomes: VecDeque<super::mailbox::TargetOutcome>,
+    #[cfg(feature = "policy-runtime")]
+    policy_outcomes: VecDeque<(u64, super::mailbox::TargetOutcome)>,
     submitted_count: u64,
+    #[cfg(feature = "policy-runtime")]
+    policy_submitted_count: u64,
+    #[cfg(feature = "policy-runtime")]
+    policy_busy_count: u64,
     lease_refused_by_gen: std::collections::HashMap<u64, u64>,
     closed: bool,
 }
@@ -2434,6 +2517,14 @@ impl ServoTargetDispatcherInner {
         self.port.outcomes(|o| popped.push(o));
         let closed_gen = self.port.closed_servo_generation();
         for o in popped {
+            #[cfg(feature = "policy-runtime")]
+            if (o.stream.0 & crate::supervisor::targets::SERVO_STREAM_BIT) == 0 && o.stream.0 != 0 {
+                if self.policy_outcomes.len() >= UNCLAIMED_TARGET_OUTCOMES_CAP {
+                    self.policy_outcomes.pop_front();
+                }
+                self.policy_outcomes.push_back((o.stream.0, o));
+                continue;
+            }
             if (o.stream.0 & crate::supervisor::targets::SERVO_STREAM_BIT) != 0 {
                 if let Err(ref r) = o.result {
                     if matches!(r.code, "LEASE_LOST" | "NO_LEASE" | "STREAM_NOT_AUTHORIZED") {
@@ -2540,6 +2631,8 @@ pub(crate) struct ServoTargetDispatcher {
     inner: Mutex<ServoTargetDispatcherInner>,
     exited: Arc<AtomicBool>,
     atomic_fenced_lease_gen: Arc<AtomicU64>,
+    #[cfg(feature = "policy-runtime")]
+    atomic_closed_policy_action_id: Arc<AtomicU64>,
 }
 
 impl ServoTargetDispatcher {
@@ -2549,6 +2642,8 @@ impl ServoTargetDispatcher {
         boot: BootId,
         exited: Arc<AtomicBool>,
         atomic_fenced_lease_gen: Arc<AtomicU64>,
+        #[cfg(feature = "policy-runtime")]
+        atomic_closed_policy_action_id: Arc<AtomicU64>,
     ) -> Self {
         Self {
             inner: Mutex::new(ServoTargetDispatcherInner {
@@ -2557,12 +2652,20 @@ impl ServoTargetDispatcher {
                 command_waiters: std::collections::HashMap::new(),
                 stream_owners: std::collections::HashMap::new(),
                 unclaimed_outcomes: VecDeque::with_capacity(UNCLAIMED_TARGET_OUTCOMES_CAP),
+                #[cfg(feature = "policy-runtime")]
+                policy_outcomes: VecDeque::with_capacity(UNCLAIMED_TARGET_OUTCOMES_CAP),
                 submitted_count: 0,
+                #[cfg(feature = "policy-runtime")]
+                policy_submitted_count: 0,
+                #[cfg(feature = "policy-runtime")]
+                policy_busy_count: 0,
                 lease_refused_by_gen: std::collections::HashMap::new(),
                 closed: false,
             }),
             exited,
             atomic_fenced_lease_gen,
+            #[cfg(feature = "policy-runtime")]
+            atomic_closed_policy_action_id,
         }
     }
 
@@ -2571,6 +2674,13 @@ impl ServoTargetDispatcher {
         if fenced_gen > g.port.closed_servo_generation() {
             g.port.close_servo(fenced_gen);
             g.prune_closed_stream_owners_locked();
+        }
+        #[cfg(feature = "policy-runtime")]
+        {
+            let closed_policy = self.atomic_closed_policy_action_id.load(Ordering::Acquire);
+            if closed_policy > g.port.closed_policy_action_id() {
+                g.port.close_policy(closed_policy);
+            }
         }
     }
 
@@ -2855,6 +2965,113 @@ impl ServoTargetDispatcher {
         };
         Self::deliver_drained(hub, (resolved_cmds, stream_refusals));
         res
+    }
+
+    #[cfg(feature = "policy-runtime")]
+    pub(crate) fn submit_policy(
+        &self,
+        hub: &StateHub,
+        target: &crate::supervisor::targets::PolicyTarget<'_>,
+    ) -> super::mailbox::Submitted {
+        let mut resolved_cmds = Vec::new();
+        let mut stream_refusals = Vec::new();
+        let sub = {
+            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            self.sync_authoritative_fence_locked(&mut g);
+            g.pop_outcomes_locked(hub, &mut resolved_cmds, &mut stream_refusals);
+            if g.closed || self.exited.load(Ordering::Acquire) {
+                super::mailbox::Submitted::OutOfOrder
+            } else {
+                let coalesced_before = g.port.coalesced();
+                let prev_key = g.last_inflight_key;
+                let sub = g.port.submit_policy(target);
+                match sub {
+                    super::mailbox::Submitted::Accepted => {
+                        g.policy_submitted_count = g.policy_submitted_count.saturating_add(1);
+                        let assigned_seq = g.port.last_seq();
+                        let sid = crate::supervisor::targets::policy_stream(target.action_id);
+                        g.last_inflight_key = Some((sid, assigned_seq));
+                        if g.port.coalesced() > coalesced_before {
+                            g.note_coalesced_locked(prev_key, &mut resolved_cmds);
+                        }
+                    }
+                    super::mailbox::Submitted::Busy => {
+                        g.policy_busy_count = g.policy_busy_count.saturating_add(1);
+                    }
+                    _ => {}
+                }
+                sub
+            }
+        };
+        Self::deliver_drained(hub, (resolved_cmds, stream_refusals));
+        sub
+    }
+
+    #[cfg(feature = "policy-runtime")]
+    pub(crate) fn close_policy(&self, action_id: u64) {
+        if action_id == 0 {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.port.close_policy(action_id);
+    }
+
+    #[cfg(feature = "policy-runtime")]
+    pub(crate) fn is_policy_closed(&self, action_id: u64) -> bool {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        self.sync_authoritative_fence_locked(&mut g);
+        g.port.is_policy_closed(action_id)
+    }
+
+    #[cfg(feature = "policy-runtime")]
+    pub(crate) fn closed_policy_action_id(&self) -> u64 {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        self.sync_authoritative_fence_locked(&mut g);
+        g.port.closed_policy_action_id()
+    }
+
+    #[cfg(feature = "policy-runtime")]
+    pub(crate) fn policy_submitted_count(&self) -> u64 {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .policy_submitted_count
+    }
+
+    #[cfg(feature = "policy-runtime")]
+    pub(crate) fn policy_busy_count(&self) -> u64 {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .policy_busy_count
+    }
+
+    #[cfg(feature = "policy-runtime")]
+    pub(crate) fn drain_policy_outcomes(
+        &self,
+        hub: &StateHub,
+        action_id: u64,
+    ) -> Vec<super::mailbox::TargetOutcome> {
+        let mut resolved_cmds = Vec::new();
+        let mut stream_refusals = Vec::new();
+        let mut matching = Vec::new();
+        {
+            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            self.sync_authoritative_fence_locked(&mut g);
+            g.pop_outcomes_locked(hub, &mut resolved_cmds, &mut stream_refusals);
+            let closed_id = g.port.closed_policy_action_id();
+            let mut remaining = VecDeque::with_capacity(g.policy_outcomes.len());
+            while let Some((id, outcome)) = g.policy_outcomes.pop_front() {
+                if id == action_id {
+                    matching.push(outcome);
+                } else if id > closed_id {
+                    remaining.push_back((id, outcome));
+                }
+            }
+            g.policy_outcomes = remaining;
+        }
+        Self::deliver_drained(hub, (resolved_cmds, stream_refusals));
+        matching
     }
 }
 
@@ -3355,6 +3572,82 @@ impl RtExecutorHandle {
         self.shared
             .servo_dispatcher
             .submit_servo_command(&self.shared.hub, stream, msg)
+    }
+
+    /// Submits one live policy target frame synchronously through `TargetPort::submit_policy`
+    /// (called off-thread under `HubCommitGuard`, never called in Shadow mode).
+    #[cfg(feature = "policy-runtime")]
+    pub fn submit_policy(
+        &self,
+        target: &crate::supervisor::targets::PolicyTarget<'_>,
+    ) -> super::mailbox::Submitted {
+        self.shared
+            .servo_dispatcher
+            .submit_policy(&self.shared.hub, target)
+    }
+
+    /// Closes policy stream `action_id` off-thread (idempotent; frees stream slot in `TargetWriter`).
+    #[cfg(feature = "policy-runtime")]
+    pub fn close_policy(&self, action_id: u64) {
+        self.shared.servo_dispatcher.close_policy(action_id);
+    }
+
+    /// True once `action_id` has been closed via `close_policy` or the RT close watermark.
+    #[cfg(feature = "policy-runtime")]
+    pub fn is_policy_closed(&self, action_id: u64) -> bool {
+        self.shared.servo_dispatcher.is_policy_closed(action_id)
+    }
+
+    /// Highest closed policy action ID on this executor's `TargetPort`.
+    #[cfg(feature = "policy-runtime")]
+    pub fn closed_policy_action_id(&self) -> u64 {
+        self.shared.servo_dispatcher.closed_policy_action_id()
+    }
+
+    /// Total policy target frames accepted into the triple-buffer mailbox (must stay 0 in Shadow mode).
+    #[cfg(feature = "policy-runtime")]
+    pub fn policy_submitted_count(&self) -> u64 {
+        self.shared.servo_dispatcher.policy_submitted_count()
+    }
+
+    /// Total policy target submissions refused `Submitted::Busy` (previous target unconsumed).
+    #[cfg(feature = "policy-runtime")]
+    pub fn policy_busy_count(&self) -> u64 {
+        self.shared.servo_dispatcher.policy_busy_count()
+    }
+
+    /// Drains RT target outcomes belonging to policy run `action_id`.
+    #[cfg(feature = "policy-runtime")]
+    pub fn drain_policy_outcomes(&self, action_id: u64) -> Vec<super::mailbox::TargetOutcome> {
+        self.shared
+            .servo_dispatcher
+            .drain_policy_outcomes(&self.shared.hub, action_id)
+    }
+
+    /// Submits one `Copy` policy lifecycle command (`ReserveLoad`, `BeginPolicy`, `EndPolicy`),
+    /// invoking `on_admitted` strictly BEFORE ring publication on admitted descriptors.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+    pub async fn submit_policy_command_async(
+        &self,
+        client: super::broker::ClientId,
+        client_seq: u64,
+        authority: super::broker::Authority,
+        deadline: Instant,
+        cmd: super::requests::policy::PolicyCommand,
+        on_admitted: impl FnOnce(super::broker::RequestId),
+    ) -> Result<super::broker::Reply, BrokerDispatchError> {
+        let (ack_rx, _term_rx) = self.shared.broker_dispatcher.submit_policy_command(
+            client,
+            client_seq,
+            authority,
+            deadline,
+            cmd,
+            on_admitted,
+        )?;
+        match ack_rx.await {
+            Ok(Ok(reply)) => Ok(reply),
+            _ => Err(BrokerDispatchError::Stopped),
+        }
     }
     pub fn stop_requests(&self) -> &StopRequests { &self.shared.stop_requests }
     pub fn stats(&self) -> &Arc<ExecutorStats> { &self.shared.stats }
@@ -3934,12 +4227,16 @@ pub(crate) fn spawn_executor(
     let (servo_close_tx, servo_close_rx) = RingBuffer::<u64>::new(64);
     engine.attach_servo_close_tx(servo_close_tx);
     let atomic_fenced_lease_gen = core.atomic_fenced_lease_gen.clone();
+    #[cfg(feature = "policy-runtime")]
+    let atomic_closed_policy_action_id = core.atomic_closed_policy_action_id.clone();
     let servo_dispatcher = Arc::new(ServoTargetDispatcher::new(
         target_writer,
         core.core.id(),
         cfg.boot,
         exited.clone(),
         Arc::clone(&atomic_fenced_lease_gen),
+        #[cfg(feature = "policy-runtime")]
+        atomic_closed_policy_action_id,
     ));
     let target_writer_handle = TargetWriterHandle {
         dispatcher: Arc::clone(&servo_dispatcher),
@@ -3962,7 +4259,12 @@ pub(crate) fn spawn_executor(
 
     let shutdown_hold_error = Arc::new(Mutex::new(None));
     let persist_rep_rx = Arc::new(Mutex::new(persist_rep_rx));
-    let maint_client = Arc::new(MaintClient::new(maint_req_tx, maint_rep_rx, exited.clone()));
+    let maint_client = Arc::new(MaintClient::new(
+        maint_req_tx,
+        maint_rep_rx,
+        exited.clone(),
+        Arc::clone(&hub),
+    ));
     let sinks = Arc::new(OffThreadSinks {
         diag_rx: Mutex::new((diag_rx, diag_amend_rx)),
         estop_reg: estop_reg.clone(),
@@ -7596,6 +7898,7 @@ mod tests {
             closed: false,
             waiters: HashMap::new(),
             exited: exited.clone(),
+            hub: crate::rt_core::publish::state_channel(7).1,
         };
         let (tx, rx) = mpsc::sync_channel(1);
         inner.waiters.insert(1, MaintWaiter::Sync(tx));

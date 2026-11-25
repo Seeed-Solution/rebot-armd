@@ -357,6 +357,7 @@ pub const TERMINAL_CODES: &[&str] = &[
     "PLACE_TIMEOUT", "TARGET_TIMEOUT", "SEQUENCE_TIMEOUT", "HOVER_TIMEOUT", "MEASURE_TIMEOUT", "MAX_SECONDS", "NOT_HOLDING", "TARGET_LOST", "TARGET_DISPLACED",
     "DROPPED", "OBJECT_HELD", "OBJECT_TOO_TALL", "TOO_WIDE", "CENTRING_FAILED", "DETECTION_UNAVAILABLE", "TASK_UNSUPPORTED",
     "OBSERVATION_UNAVAILABLE", "PERSIST_FAILED", "POLICY_NOT_ACTIVE", "POWER_LIMIT",
+    "VISION_STALE", "INFERENCE_ERROR", "POLICY_REVOKED", "POLICY_FAILED", "MODEL_CHANGED",
 ];
 
 /// The static form of an action's code (None: it named none or an unlisted one).
@@ -679,6 +680,20 @@ pub trait CoreOps {
     ) -> Result<Committed, &'static str> {
         Err("UNSUPPORTED")
     }
+    /// Commits one policy lifecycle broker command (`ReserveLoad`, `BeginPolicy`, `EndPolicy`).
+    #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+    fn commit_policy(
+        &mut self,
+        _d: &Descriptor,
+        _cmd: super::requests::policy::PolicyCommand,
+        _ctx: &CommitCtx,
+    ) -> Result<Committed, &'static str> {
+        Err("UNSUPPORTED")
+    }
+    /// Publishes the post-completion request watermark strictly AFTER `commit_policy` (or refusal)
+    /// finishes reading cancellation slots and updating active load/run tokens.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+    fn finish_policy_command(&mut self, _req_id: u64) {}
     /// True while a macro parent's current child still owns trajectory, settle, or deferred TX.
     fn macro_child_running(&self, _parent: ActionId) -> bool { false }
     /// Attaches the broker's lock-free closed-connection bitset for RT commit checks.
@@ -1398,6 +1413,21 @@ impl CoreOps for SupervisorInner {
         super::requests::actions::commit_action(self, d, cmd, slot, ctx)
     }
 
+    #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+    fn commit_policy(
+        &mut self,
+        d: &Descriptor,
+        cmd: super::requests::policy::PolicyCommand,
+        ctx: &CommitCtx,
+    ) -> Result<Committed, &'static str> {
+        super::requests::policy::commit_policy(self, d, cmd, ctx)
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+    fn finish_policy_command(&mut self, req_id: u64) {
+        self.policy_cancel_slots.mark_policy_req_completed(req_id);
+    }
+
     fn macro_child_running(&self, parent: ActionId) -> bool {
         SupervisorInner::macro_child_running(self, parent.0)
     }
@@ -1967,7 +1997,9 @@ impl ReleaseEngine {
                     let is_begin_macro = matches!(d.kind, CommandKind::Action(super::requests::actions::ActionCommand::BeginMacro(_)));
                     #[cfg(target_arch = "wasm32")]
                     let is_begin_macro = false;
-                    #[cfg(not(target_arch = "wasm32"))]
+                    #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+                    let is_action_cmd = matches!(d.kind, CommandKind::Action(_) | CommandKind::Policy(_));
+                    #[cfg(all(not(target_arch = "wasm32"), not(feature = "policy-runtime")))]
                     let is_action_cmd = matches!(d.kind, CommandKind::Action(_));
                     #[cfg(target_arch = "wasm32")]
                     let is_action_cmd = false;
@@ -1979,6 +2011,8 @@ impl ReleaseEngine {
                         CommandKind::Install { .. } => true,
                         #[cfg(not(target_arch = "wasm32"))]
                         CommandKind::Action(a) => a.starts_action(),
+                        #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+                        CommandKind::Policy(p) => p.starts_action(),
                         CommandKind::Immediate(_) | CommandKind::Transition(_) | CommandKind::Lease(_) => false,
                     };
                     // Provisional read-only capture before Step 3 mutates `core`: if a Step-1 Stop
@@ -2024,6 +2058,12 @@ impl ReleaseEngine {
                                 Ok(slot_ref) => core.commit_action(&d, cmd, slot_ref, &ctx),
                                 Err(code) => Err(code),
                             }
+                        }
+                        #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+                        CommandKind::Policy(cmd) => {
+                            let r = core.commit_policy(&d, cmd, &ctx);
+                            core.finish_policy_command(d.stamp.request.0);
+                            r
                         }
                         CommandKind::Lease(_) => unreachable!(),
                     };

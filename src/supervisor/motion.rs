@@ -147,6 +147,12 @@ impl SupervisorInner {
             }
         }
         // (the message is built only when a run ends: a stop without one does not allocate)
+        #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+        if self.policy_load_reservation.take().is_some() {
+            self.policy_loading = false;
+            self.policy_cancel_slots.set_active_load_token(0);
+            self.reconcile_target_stream_authority(Instant::now());
+        }
         #[cfg(feature = "policy-runtime")]
         if self.policy_run.is_some() {
             self.terminate_policy_run_static("STOPPED", "cancelled", Some("STOPPED"), Some("Motion stopped"));
@@ -291,6 +297,11 @@ impl SupervisorInner {
     }
 
     pub(crate) fn apply_stop_policy_in_tick(&mut self, policy: StopPolicy, in_tick: bool) {
+        #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+        if self.policy_load_reservation.take().is_some() {
+            self.policy_loading = false;
+            self.policy_cancel_slots.set_active_load_token(0);
+        }
         #[cfg(feature = "policy-runtime")]
         if self.policy_run.is_some() {
             match policy {

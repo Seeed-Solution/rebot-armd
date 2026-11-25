@@ -23,7 +23,7 @@ use crate::motion::{
 mod driver_transitions;
 pub(crate) mod config;
 mod motion;
-mod streams;
+pub(crate) mod streams;
 mod actions;
 
 /// Broker side of the servo, teleop and policy latest-target path (track D); the WS loop
@@ -909,6 +909,12 @@ pub struct SupervisorInner {
     /// True while a policy pack is being loaded/prepared outside the supervisor lock.
     #[cfg(feature = "policy-runtime")]
     pub policy_loading: bool,
+    /// Inline owner-side reservation held during off-thread policy pack load/warmup on executor.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+    pub(crate) policy_load_reservation: Option<crate::rt_core::requests::policy::PolicyLoadReservation>,
+    /// Shared exclusive-lifetime lock-free cancellation slots for executor policy start/run.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+    pub(crate) policy_cancel_slots: Arc<crate::rt_core::requests::policy::PolicyCancelSlots>,
     /// Most recent policy observation telemetry (retained after policy run ends).
     #[cfg(feature = "policy-runtime")]
     pub last_policy_obs: Option<crate::model::PolicyObservation>,
@@ -2067,6 +2073,10 @@ impl SupervisorInner {
             policy_run: None,
             #[cfg(feature = "policy-runtime")]
             policy_loading: false,
+            #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+            policy_load_reservation: None,
+            #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+            policy_cancel_slots: Arc::new(crate::rt_core::requests::policy::PolicyCancelSlots::new()),
             #[cfg(feature = "policy-runtime")]
             last_policy_obs: None,
             #[cfg(feature = "policy-runtime")]
@@ -2496,7 +2506,53 @@ impl SupervisorInner {
             }
             fenced_any = true;
         }
+        #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+        {
+            self.prune_stale_policy_load(now);
+            if self.policy_run.as_ref().is_some_and(|r| {
+                r.rt_owned && self.policy_cancel_slots.is_cancelled(r.cancel_slot, r.load_token)
+            }) {
+                self.terminate_policy_run_static(
+                    "STOPPED",
+                    "cancelled",
+                    Some("STOPPED"),
+                    Some("Policy launch or runner cancelled"),
+                );
+                fenced_any = true;
+            }
+        }
         fenced_any
+    }
+
+    /// Prunes any expired, cancelled, disconnected, lease-fenced, epoch/stop-diverged, or
+    /// faulted/E-stopped executor policy load reservation without allocating (zero RT allocs).
+    #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+    pub(crate) fn prune_stale_policy_load(&mut self, now: Instant) {
+        let Some(res) = self.policy_load_reservation else {
+            return;
+        };
+        let expired = now > res.expires_at;
+        let cancelled = self.policy_cancel_slots.is_cancelled(res.cancel_slot, res.token);
+        let conn_closed = res.conn_id != 0 && self.is_connection_closed(res.conn_id);
+        let lease_invalid =
+            self.lease_valid_at(now).map_or(0, |l| l.generation) != res.lease_generation;
+        let epoch_changed = self.safety.epoch_id() != res.epoch_id;
+        let stop_changed = self.current_stop_gen() != res.stop_generation;
+        let estop_or_fault = self.estop_pending()
+            || matches!(self.safety.state(), SafetyState::EStop | SafetyState::Fault(_));
+        if expired
+            || cancelled
+            || conn_closed
+            || lease_invalid
+            || epoch_changed
+            || stop_changed
+            || estop_or_fault
+        {
+            self.policy_load_reservation = None;
+            self.policy_loading = false;
+            self.policy_cancel_slots.set_active_load_token(0);
+            self.reconcile_target_stream_authority(now);
+        }
     }
 
     /// Purges any connection ID already closed in the lock-free `shared_closed_bitset` from
@@ -2840,6 +2896,15 @@ impl SupervisorInner {
             self.pending_deferred_done = None;
         }
         self.sync_lease_gen_mirror();
+        #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+        if self
+            .policy_load_reservation
+            .is_some_and(|r| r.lease_generation <= displaced_gen)
+        {
+            self.policy_load_reservation = None;
+            self.policy_loading = false;
+            self.policy_cancel_slots.set_active_load_token(0);
+        }
         #[cfg(feature = "policy-runtime")]
         if self
             .policy_run
@@ -3530,6 +3595,7 @@ impl SupervisorInner {
             obs,
             owner,
             rt,
+            policy_diag_seq: 0,
         }
     }
 
@@ -9468,12 +9534,9 @@ pub struct ArmSupervisor {
     /// Shared persistent `PolicyAuthorization` for executor-owned policy runs (0 RT alloc/free).
     #[cfg(feature = "policy-runtime")]
     rt_policy_auth: crate::policy_runtime::PolicyAuthorization,
-    /// Pre-publication policy diagnostic seal watermark shared with `StateHub`.
-    #[cfg(feature = "policy-runtime")]
-    atomic_diag_sealed_policy_action_id: Arc<AtomicU64>,
-    /// Post-publication policy stream close watermark shared with `ServoTargetDispatcher`.
-    #[cfg(feature = "policy-runtime")]
-    atomic_closed_policy_action_id: Arc<AtomicU64>,
+    /// Shared exclusive-lifetime lock-free policy cancellation slots.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+    policy_cancel_slots: Arc<crate::rt_core::requests::policy::PolicyCancelSlots>,
     /// Leaf queue of socket-close disconnects deferred when the owner write lock is contended
     /// or ownership is transitioning (`OWNER_TRANSFERRING`); NEVER locked on `armd-control`.
     pending_disconnects: std::sync::Mutex<std::collections::VecDeque<crate::rt_core::requests::lease::ConnectionHandle>>,
@@ -9789,6 +9852,8 @@ impl ArmSupervisor {
         let atomic_diag_sealed_policy_action_id = Arc::new(AtomicU64::new(0));
         #[cfg(feature = "policy-runtime")]
         let atomic_closed_policy_action_id = Arc::new(AtomicU64::new(0));
+        #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+        let policy_cancel_slots = Arc::new(crate::rt_core::requests::policy::PolicyCancelSlots::new());
         let terminals = Arc::new(TerminalBroadcaster::default());
         let mut inner = SupervisorInner::new(config);
         inner.estop_state = estop_state.clone();
@@ -9808,11 +9873,17 @@ impl ArmSupervisor {
             inner.atomic_diag_sealed_policy_action_id = atomic_diag_sealed_policy_action_id.clone();
             inner.atomic_closed_policy_action_id = atomic_closed_policy_action_id.clone();
         }
+        #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+        {
+            inner.policy_cancel_slots = Arc::clone(&policy_cancel_slots);
+        }
         inner.terminals = Some(Arc::clone(&terminals));
         let template_obs = inner.current_observation();
         let initial_pub_cfg = crate::rt_core::requests::config::PublishedConfig::from_inner(&inner);
         let estop_epoch = inner.safety.epoch_mirror();
         let hub = inner.core.hub().clone();
+        #[cfg(feature = "policy-runtime")]
+        hub.attach_policy_diag_seal(atomic_diag_sealed_policy_action_id.clone());
         hub.update_prep_env(Arc::new(crate::rt_core::requests::actions::ActionPrepEnv::from_inner(&inner)));
         let control_frequency_hz = inner.config.control_frequency_hz.max(1);
         let control_period_us = (1e6 / f64::from(control_frequency_hz)) as u64;
@@ -9837,10 +9908,8 @@ impl ArmSupervisor {
             pending_disconnect_hold,
             #[cfg(feature = "policy-runtime")]
             rt_policy_auth,
-            #[cfg(feature = "policy-runtime")]
-            atomic_diag_sealed_policy_action_id,
-            #[cfg(feature = "policy-runtime")]
-            atomic_closed_policy_action_id,
+            #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+            policy_cancel_slots,
             pending_disconnects: std::sync::Mutex::new(std::collections::VecDeque::new()),
             tick_stats: Arc::new(crate::diagnostics::tick::LockFreeTickStats::new()),
             control_sched: Arc::new(std::sync::Mutex::new(None)),
@@ -10703,16 +10772,10 @@ impl ArmSupervisor {
         self.rt_policy_auth.clone()
     }
 
-    /// Pre-publication policy diagnostic seal watermark (`AtomicU64`).
-    #[cfg(feature = "policy-runtime")]
-    pub(crate) fn diag_sealed_policy_watermark(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.atomic_diag_sealed_policy_action_id)
-    }
-
-    /// Post-publication policy stream close watermark (`AtomicU64`).
-    #[cfg(feature = "policy-runtime")]
-    pub(crate) fn closed_policy_watermark(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.atomic_closed_policy_action_id)
+    /// Exclusive-lifetime lock-free cancellation slots for executor policy start/run.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+    pub fn policy_cancel_slots(&self) -> &Arc<crate::rt_core::requests::policy::PolicyCancelSlots> {
+        &self.policy_cancel_slots
     }
 
     /// The current observation, without the supervisor lock while the control loop runs
@@ -13330,7 +13393,8 @@ fn dispatch_loop(
             s.drain_all(tick_stats);
         }
     };
-    let mut last = 0;
+    let mut last = 0u64;
+    let mut last_diag = 0u64;
     while !hub.is_closed() {
         drain_sinks();
         if let Some(ring) = hub.record_ring() { ring.drain(); }
@@ -13338,8 +13402,23 @@ fn dispatch_loop(
         if hub.published_seq() != last {
             if let Some(s) = hub.latest().filter(|s| s.meta.seq > last) {
                 last = s.meta.seq;
+                last_diag = last_diag.max(s.policy_diag_seq);
                 terminals.record_from_observation(&s.obs);
                 new_obs = Some(s.obs.clone());
+            }
+        } else if hub.policy_diag_seq() != last_diag {
+            if let Some(s) = hub.latest() {
+                if s.meta.seq > last {
+                    last = s.meta.seq;
+                    last_diag = last_diag.max(s.policy_diag_seq);
+                    terminals.record_from_observation(&s.obs);
+                    new_obs = Some(s.obs.clone());
+                } else if s.policy_diag_seq > last_diag {
+                    last_diag = s.policy_diag_seq;
+                    // Diagnostic-only overlay update (Shadow steps / timing stats): forward
+                    // telemetry without re-enqueuing action terminals.
+                    new_obs = Some(s.obs.clone());
+                }
             }
         }
         // Drain every connection's bounded terminal FIFO into its higher-priority `ordinary_out_tx`

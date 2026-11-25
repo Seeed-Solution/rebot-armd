@@ -1309,7 +1309,7 @@ impl SupervisorInner {
 
     /// Zero-allocation, non-blocking equivalent of `self.policy_input_age_range_ms().is_some()`
     /// safe to call on `armd-control`.
-    pub(super) fn has_policy_input_age_range(&self) -> bool {
+    pub(crate) fn has_policy_input_age_range(&self) -> bool {
         if self.config.dof == 0 {
             return false;
         }
@@ -2479,6 +2479,8 @@ impl SupervisorInner {
         run.rt_gate_binding = None;
         run.load_token = 0;
         run.cancel_slot = 0;
+        #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
+        self.policy_cancel_slots.set_active_run_token(0);
         if run.rt_owned && self.policy_run_spare.is_none() {
             self.policy_run_spare = Some(run);
         } else {
