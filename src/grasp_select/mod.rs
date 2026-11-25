@@ -366,10 +366,9 @@ impl AdaptiveSelection {
 
 /// Ordered macro child step produced from a selected [`ExecutionPlan`] for Phase B execution.
 ///
-/// Phase A keeps live `strategy: "adaptive"` refused via [`refuse_execution`] and serves
-/// dry-run selection only. Phase B installs [`SelectedGraspMacro::begin`] as an A7 macro parent
-/// and feeds each [`SelectedMacroStep`] through `MacroCtx` / `InstallChild` without changing
-/// the A7 broker or owner contract.
+/// Phase B installs [`SelectedGraspMacro::begin`] as an A7 macro parent and feeds each
+/// [`SelectedMacroStep`] through `MacroCtx` / `InstallChild` without changing the A7 broker or
+/// owner contract.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SelectedMacroStep {
     /// Linear TCP sub-motion with optional contact guard (for insertion).

@@ -4251,6 +4251,9 @@ fn install_macro_child_slot_rt(
                 if inner.torque_guard.hold.is_some() || inner.power.gov.hold.is_some() {
                     return Err("PLAN_STALE");
                 }
+                if inner.commanded_velocities[..dof].iter().any(|v| v.abs() >= 1e-3) {
+                    return Err("PLAN_STALE");
+                }
                 let first = &slot.path.samples()[0][..dof];
                 if check_start_fresh(&inner.commanded_positions[..dof], first).is_err() {
                     return Err("PLAN_STALE");
