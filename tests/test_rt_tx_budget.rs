@@ -3102,19 +3102,32 @@ fn carried_and_retried_j7_enable_fails_closed_when_j7_feedback_goes_stale() {
         vbus.with(|s| s.push_all_feedback());
         d3.read_joint_states().unwrap();
 
-        // Age J7 to 85 ms before begin_torque so pre-enable 0x307 is still fresh, drop 0x307 reply,
-        // and carry all 7 enable frames under max_frames=1 so J7 crosses 100 ms on the next 20 ms release.
-        clock3.advance(ms(85));
+        // Age J7 to 40 ms before begin_torque (within pre-enable freshen threshold) and +40 ms once
+        // Readback sends REG_READ (still <= 85 ms readback freshness margin and < 50 ms readback
+        // timeout), so pre-enable 0x307 succeeds with dropped reply and send_enable() starts at
+        // elapsed = 0 ms with J7 age ~83 ms, crossing 100 ms on the first 20 ms carried release.
+        clock3.advance(ms(40));
         drop_307.store(true, Ordering::SeqCst);
         *delay_slot.lock().unwrap() = ms(reply_delay_ms);
         d3.set_tx_budget(TxBudget { max_frames: 1, max_duration: ms(5), frame_max_age: ms(45) });
         let _ = d3.begin_torque(true).expect("begin");
         let mut saw_pre_enable_hold = false;
+        let mut aged_for_carry = false;
         for _ in 0..10 {
             vbus.clear();
             clock3.advance(ms(1));
             let p = d3.poll_torque(clock3.now() + ms(5)).expect("poll before hold");
             assert!(matches!(p, armd::driver::TorqueProgress::Pending { .. }));
+            if !aged_for_carry
+                && vbus.with(|s| {
+                    s.tx_accepted
+                        .iter()
+                        .any(|f| f.id == 0x7FF && f.data[2] == damiao::REG_READ)
+                })
+            {
+                aged_for_carry = true;
+                clock3.advance(ms(38));
+            }
             if vbus.with(|s| s.tx_accepted.iter().any(|f| f.id == 0x307)) {
                 saw_pre_enable_hold = true;
                 break;
@@ -5647,8 +5660,7 @@ fn j7_enable_refresh_review_blocker_regressions() {
         vbus.with(|s| s.push_all_feedback());
         d.read_joint_states().unwrap();
 
-        // Age to 85 ms, carry enable under max_frames=1 through 0x307, then cross 100 ms to arm 0xCC.
-        clock.advance(ms(85));
+        // Start fresh through 0x307 (with 0x307 reply suppressed), then cross 100 ms to arm in-enable 0xCC.
         d.set_tx_budget(TxBudget { max_frames: 1, max_duration: ms(5), frame_max_age: ms(45) });
         let _ = d.begin_torque(true).unwrap();
         for _ in 0..10 {
@@ -5659,7 +5671,7 @@ fn j7_enable_refresh_review_blocker_regressions() {
                 break;
             }
         }
-        clock.advance(ms(20)); // J7 is now stale (> 100 ms); next poll sends 0xCC and leaves refresh pending.
+        clock.advance(ms(105)); // J7 is now stale (> 100 ms); next poll sends 0xCC and leaves refresh pending.
         d.set_tx_budget(TxBudget::default());
         vbus.clear();
         let p = d.poll_torque(clock.now() + ms(5)).expect("0xCC refresh armed");
@@ -5716,7 +5728,6 @@ fn j7_enable_refresh_review_blocker_regressions() {
         vbus.with(|s| s.push_all_feedback());
         d.read_joint_states().unwrap();
 
-        clock.advance(ms(85));
         d.set_tx_budget(TxBudget { max_frames: 1, max_duration: ms(5), frame_max_age: ms(45) });
         let _ = d.begin_torque(true).unwrap();
         for _ in 0..10 {
@@ -5729,7 +5740,7 @@ fn j7_enable_refresh_review_blocker_regressions() {
         }
         vbus.with(|s| s.rx.clear());
         // Exhaust TX budget (`max_frames = 0`) while stale so `pf_refresh` is armed with `boundary: None`.
-        clock.advance(ms(20));
+        clock.advance(ms(105));
         d.set_tx_budget(TxBudget { max_frames: 0, max_duration: ms(5), frame_max_age: ms(45) });
         let p = d.poll_torque(clock.now() + ms(5)).expect("deferred refresh pending");
         assert!(matches!(p, armd::driver::TorqueProgress::Pending { .. }));
@@ -5953,7 +5964,6 @@ fn j7_enable_refresh_review_blocker_regressions() {
         vbus.with(|s| s.push_all_feedback());
         d.read_joint_states().unwrap();
 
-        clock.advance(ms(85));
         d.set_tx_budget(TxBudget { max_frames: 1, max_duration: ms(5), frame_max_age: ms(45) });
         d.set_enable_authority(Some(clock.now() + ms(500)), Some(1));
         let _ = d.begin_torque(true).unwrap();
@@ -5968,7 +5978,7 @@ fn j7_enable_refresh_review_blocker_regressions() {
         }
         vbus.with(|s| s.rx.clear());
         // Cross 100 ms with empty TX budget so `pf_refresh` starts deferred (`boundary: None`).
-        clock.advance(ms(20));
+        clock.advance(ms(105));
         d.set_tx_budget(TxBudget { max_frames: 0, max_duration: ms(5), frame_max_age: ms(45) });
         d.set_enable_authority(Some(clock.now() + ms(500)), Some(1));
         let _ = d.poll_torque(clock.now() + ms(5)).unwrap();

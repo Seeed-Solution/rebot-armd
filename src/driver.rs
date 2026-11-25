@@ -285,6 +285,24 @@ pub enum ArmDriverError {
     #[error("Enable authority expired before hardware transmit")]
     EnableAuthorityExpired,
 
+    #[error(
+        "Hardware fault: joint {} pre-enable freshen failed: no fresh measured position within {} ms (needs fresh stationary feedback: fresh false)",
+        joint + 1,
+        ENABLE_FRESHEN_TIMEOUT.as_millis()
+    )]
+    EnableFreshenTimeout { joint: usize },
+
+    #[error(
+        "Hardware fault: joint {} pre-enable freshen refused: needs fresh stationary feedback with torque off (fresh true, still {still}, torque off {off}, status {status}); capped operation unavailable",
+        joint + 1
+    )]
+    EnableFreshenUnsafeGripper {
+        joint: usize,
+        still: bool,
+        off: bool,
+        status: u8,
+    },
+
     #[error("{}", format_partial_disable(*reason, *applied_mask, *uncertain_mask, *remaining_mask, *dof))]
     PartialDisable {
         reason: PartialDisableReason,
@@ -8559,6 +8577,10 @@ enum DamiaoTorque {
     RangeCheck(RangeCheckPhase),
     /// Budgeted enable waiting for an empty RX queue boundary before mode restore / enable TX.
     DrainBeforeEnable(Deadline),
+    /// Enable, initial bounded FRESHEN phase: polls every joint with read-only `0xCC` status
+    /// refreshes and waits for a fresh causal reply from every joint before CTRL_MODE restore,
+    /// readback, pre-enable hold, and `CMD_ENABLE`.
+    Freshen(EnableFreshen),
     /// Enable, pre-restore refresh: waiting for a fresh J7 0xCC feedback reply before writing CTRL_MODE.
     RefreshBeforeRestore {
         refresh: FeedbackRefresh,
@@ -8618,6 +8640,18 @@ struct RangeCheckPhase {
     active_joint: Option<u8>,
     boundary: Option<u64>,
     sent_rids: u8,
+    deadline: Deadline,
+}
+
+/// Inline zero-allocation state for enable's initial bounded `0xCC` FRESHEN phase.
+#[derive(Debug)]
+struct EnableFreshen {
+    target_mask: u32,
+    sent_mask: u32,
+    confirmed_mask: u32,
+    tx_boundary: [u64; MAX_MODE_JOINTS],
+    tx_at: [Option<Instant>; MAX_MODE_JOINTS],
+    next_retry_at: Option<Instant>,
     deadline: Deadline,
 }
 
@@ -8711,6 +8745,29 @@ const RANGE_CHECK_REPLY_TIMEOUT: Duration = Duration::from_millis(20);
 /// Feedback freshness bound for position-force gripper mode writes, pre-enable holds,
 /// stale-feedback recovery, and opening-speed allowance.
 const POS_FORCE_FEEDBACK_MAX_AGE: Duration = Duration::from_millis(100);
+/// Feedback freshness threshold for skipping enable's initial bounded `0xCC` FRESHEN phase
+/// on a `PosForce` gripper joint. Any age beyond this bound (or missing empty-queue bound)
+/// triggers FRESHEN across every joint before CTRL_MODE restore/readback, hold, and `CMD_ENABLE`.
+const ENABLE_FRESHEN_ENTRY_PF_MAX_AGE: Duration = Duration::from_millis(40);
+/// Feedback freshness threshold for skipping enable's initial bounded `0xCC` FRESHEN phase
+/// on non-`PosForce` arm joints (strictly below the 100 ms refresh/rest-gate bound so any
+/// disabled idle period triggers FRESHEN while avoiding spurious stalls on freshly-read rigs).
+const ENABLE_FRESHEN_ENTRY_ARM_MAX_AGE: Duration = Duration::from_millis(80);
+/// Maximum feedback age allowed for arm joints when exiting enable's FRESHEN phase (matches
+/// `DAMIAO_FEEDBACK_VALID_WINDOW` so an early arm reply stays confirmed while waiting on a
+/// slower joint within the 180 ms FRESHEN budget).
+const ENABLE_FRESHEN_EXIT_ARM_MAX_AGE: Duration = DAMIAO_FEEDBACK_VALID_WINDOW;
+/// Maximum feedback age allowed for a `PosForce` gripper joint when exiting enable's FRESHEN
+/// phase (leaves >= 40 ms margin before `POS_FORCE_FEEDBACK_MAX_AGE` for readback + hold).
+const ENABLE_FRESHEN_EXIT_PF_MAX_AGE: Duration = Duration::from_millis(60);
+/// Bounded wall-clock budget for enable's initial `0xCC` FRESHEN phase (<= 200 ms).
+const ENABLE_FRESHEN_TIMEOUT: Duration = Duration::from_millis(180);
+/// Minimum interval before retrying `0xCC` for unanswered joints within one FRESHEN window.
+const ENABLE_FRESHEN_RETRY_INTERVAL: Duration = Duration::from_millis(60);
+/// Safety margin below `POS_FORCE_FEEDBACK_MAX_AGE` when `poll_readback` decides whether J7
+/// can proceed directly to `finish_pos_force_readback` without a `PreEnableRefresh`, closing
+/// any boundary race near 100 ms.
+const POS_FORCE_READBACK_FRESH_MARGIN: Duration = Duration::from_millis(85);
 /// Bounded causal `0xCC` refresh window during `DamiaoTorque::Enable` (clamped to the enable
 /// confirmation deadline and authority deadline; accommodates 30-60 ms Damiao replies across
 /// 20 ms releases while staying strictly inside `POS_FORCE_FEEDBACK_MAX_AGE`).
@@ -12730,7 +12787,345 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
 
     fn continue_enable_after_drain(&mut self, drained_now: bool) -> Result<TorqueProgress, ArmDriverError> {
         self.enable_estop_inhibited()?;
+        self.check_enable_tx_authority()?;
         self.awaiting_rx_boundary = false;
+
+        let dof = self.motor_ids.len();
+        if dof > MAX_MODE_JOINTS {
+            self.enable_failed();
+            return Err(ArmDriverError::Protocol("joint count exceeds MAX_MODE_JOINTS".into()));
+        }
+        let all_mask = if dof == 0 {
+            0u32
+        } else if dof >= 32 {
+            u32::MAX
+        } else {
+            (1u32 << dof) - 1
+        };
+        let pf_joint = self.pos_force.as_ref().map(|p| p.joint);
+        let needs_freshen = (0..dof).any(|i| {
+            if pf_joint == Some(i) {
+                self.fresh_measured_position(i, ENABLE_FRESHEN_ENTRY_PF_MAX_AGE)
+                    .is_none()
+            } else {
+                !self.cached_states[i].position.is_finite()
+                    || self.last_feedback_instant[i]
+                        .is_none_or(|t| self.since(t) > ENABLE_FRESHEN_ENTRY_ARM_MAX_AGE)
+            }
+        });
+        if needs_freshen && all_mask != 0 {
+            return self.start_enable_freshen(all_mask, drained_now);
+        }
+        self.proceed_after_freshen(drained_now)
+    }
+
+    /// Start enable's initial bounded `0xCC` FRESHEN phase: polls every joint with read-only
+    /// `0xCC` status frames (allowed for J7 under `NoOutputUntilFresh`) and waits for a fresh
+    /// causal post-boundary reply from every joint before CTRL_MODE restore/readback, pre-enable
+    /// hold, and `CMD_ENABLE`. Zero locks, zero heap allocations.
+    fn start_enable_freshen(
+        &mut self,
+        target_mask: u32,
+        drained_now: bool,
+    ) -> Result<TorqueProgress, ArmDriverError> {
+        self.enable_estop_inhibited()?;
+        self.check_enable_tx_authority()?;
+        if self.pos_force.is_some() {
+            self.pos_force_verified = false;
+        }
+        self.refresh_capture = None;
+        let start = self.now();
+        let mut dl_at = start + ENABLE_FRESHEN_TIMEOUT;
+        if let Some(auth_dl) = self.enable_tx_deadline {
+            dl_at = dl_at.min(auth_dl);
+        }
+        let deadline = Deadline { at: dl_at };
+        let mut f = EnableFreshen {
+            target_mask,
+            sent_mask: 0,
+            confirmed_mask: 0,
+            tx_boundary: [0; MAX_MODE_JOINTS],
+            tx_at: [None; MAX_MODE_JOINTS],
+            next_retry_at: None,
+            deadline,
+        };
+        if drained_now && !deadline.passed(self.now()) && self.remaining_rx_frame_limit() > 0 {
+            let _ = self.send_freshen_polls(&mut f, target_mask)?;
+        }
+        let wake = self.freshen_pending_wake(&f);
+        self.torque_hs = Some(DamiaoTorque::Freshen(f));
+        Ok(TorqueProgress::Pending { wake })
+    }
+
+    fn freshen_pending_wake(&self, f: &EnableFreshen) -> Instant {
+        let now = self.now();
+        let unsent = f.target_mask & !f.sent_mask;
+        if unsent != 0 && self.tx_release_deadline.is_none_or(|cap| now < cap) {
+            now.min(f.deadline.at)
+        } else {
+            f.deadline.at
+        }
+    }
+
+    /// Establish a tight observed-empty RX boundary and transmit read-only `0xCC` status polls
+    /// for joints in `send_mask` within the per-tick TX budget, stop gate, and enable authority.
+    fn send_freshen_polls(
+        &mut self,
+        f: &mut EnableFreshen,
+        send_mask: u32,
+    ) -> Result<bool, ArmDriverError> {
+        self.enable_estop_inhibited()?;
+        self.check_enable_tx_authority()?;
+        if send_mask == 0 || f.deadline.passed(self.now()) {
+            return Ok(false);
+        }
+        if !self.drain_rx_for_boundary(f.deadline) {
+            self.enable_estop_inhibited()?;
+            self.check_enable_tx_authority()?;
+            return Ok(false);
+        }
+        self.enable_estop_inhibited()?;
+        self.check_enable_tx_authority()?;
+        if f.deadline.passed(self.now()) {
+            return Ok(false);
+        }
+        let mut sent_any = false;
+        for j in handshake::mask_joints(send_mask) {
+            self.enable_estop_inhibited()?;
+            self.check_enable_tx_authority()?;
+            if f.deadline.passed(self.now()) {
+                break;
+            }
+            let Some(&id) = self.motor_ids.get(j) else {
+                continue;
+            };
+            let boundary = self.rx_seq;
+            let tx_at = self.now();
+            match self.send_plain(
+                TxKind::Handshake,
+                self.enable_stop_stamp,
+                Some(f.deadline),
+                false,
+                |_| Some(damiao::build_refresh_frame(id)),
+            ) {
+                Ok(_) => {
+                    if (f.sent_mask & (1u32 << j)) == 0 {
+                        f.sent_mask |= 1u32 << j;
+                        f.tx_boundary[j] = boundary;
+                        f.tx_at[j] = Some(tx_at);
+                    }
+                    sent_any = true;
+                }
+                Err(TxRefusal::DeadlinePassed | TxRefusal::Deferred) => break,
+                Err(TxRefusal::Transport(e)) if e.is_tx_backpressure() => break,
+                Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged) => {
+                    self.abort_enable_for_estop();
+                    return Err(ArmDriverError::EstopInhibited);
+                }
+                Err(r) => {
+                    self.torque_hs = None;
+                    self.enable_failed();
+                    return Err(Self::refusal_to_driver_err(r));
+                }
+            }
+        }
+        if sent_any {
+            self.enable_estop_inhibited()?;
+            self.check_enable_tx_authority()?;
+            if let Err(e) = self.can.flush() {
+                self.enable_failed();
+                return Err(e.into());
+            }
+            if let Some(pf_j) = self.pos_force.as_ref().map(|p| p.joint) {
+                if pf_j < MAX_MODE_JOINTS
+                    && (f.sent_mask & (1u32 << pf_j)) != 0
+                    && self.refresh_capture.is_none()
+                {
+                    if let Some(tx_at) = f.tx_at[pf_j] {
+                        self.refresh_capture = Some(RefreshCapture {
+                            joint: pf_j,
+                            boundary: f.tx_boundary[pf_j],
+                            tx_at,
+                            deadline: f.deadline,
+                            allow_enabled_state: false,
+                            first: None,
+                            unsafe_sample: None,
+                        });
+                    }
+                }
+            }
+            if (f.target_mask & !f.sent_mask) == 0 {
+                f.next_retry_at = Some(self.now() + ENABLE_FRESHEN_RETRY_INTERVAL);
+            }
+        }
+        Ok(sent_any)
+    }
+
+    /// Advance enable's initial bounded `0xCC` FRESHEN phase by one poll step.
+    /// Accepts completion ONLY after every target joint has delivered a causal post-boundary
+    /// feedback reply observed through an empty RX queue and remains well within freshness bounds.
+    fn poll_freshen(&mut self, mut f: EnableFreshen) -> Result<TorqueProgress, ArmDriverError> {
+        self.enable_estop_inhibited()?;
+        self.check_enable_tx_authority()?;
+        let expired_before_read = f.deadline.passed(self.now());
+        if f.sent_mask != 0 || !expired_before_read {
+            let _ = self.receive_feedback();
+            self.enable_estop_inhibited()?;
+            self.check_enable_tx_authority()?;
+        }
+
+        let pf_joint = self.pos_force.as_ref().map(|p| p.joint);
+        // Sticky post-boundary J7 unsafe veto (fault, motion, or state != 0) cannot be masked by
+        // a later benign frame in the same RX pass.
+        if let Some(pf_j) = pf_joint {
+            let bad = self
+                .refresh_capture
+                .as_ref()
+                .filter(|c| c.joint == pf_j)
+                .and_then(|c| c.unsafe_sample);
+            if let Some(sample) = bad {
+                self.refresh_capture = None;
+                self.enable_failed();
+                let still = sample.velocity.is_finite() && sample.velocity.abs() <= 0.05;
+                let off = !self.is_enabled && sample.motor_status == 0;
+                return Err(ArmDriverError::EnableFreshenUnsafeGripper {
+                    joint: pf_j,
+                    still,
+                    off,
+                    status: sample.motor_status,
+                });
+            }
+        }
+
+        if self.last_read_drained {
+            for j in handshake::mask_joints(f.target_mask & f.sent_mask) {
+                let Some(tx_at) = f.tx_at[j] else {
+                    continue;
+                };
+                if pf_joint == Some(j) {
+                    let cap_first = self
+                        .refresh_capture
+                        .as_ref()
+                        .filter(|c| c.joint == j && c.boundary == f.tx_boundary[j])
+                        .and_then(|c| c.first);
+                    if let Some(sample) = cap_first {
+                        let timely = sample.seq > f.tx_boundary[j]
+                            && sample.rx_at >= tx_at
+                            && !f.deadline.passed(sample.rx_at)
+                            && sample.position.is_finite()
+                            && self.since(sample.rx_at) <= POS_FORCE_FEEDBACK_MAX_AGE
+                            && sample
+                                .queue_bound
+                                .is_some_and(|qb| self.since(qb) <= POS_FORCE_FEEDBACK_MAX_AGE);
+                        if timely {
+                            let st = self.motor_status[j];
+                            if damiao_fault_name(st).is_some() {
+                                let motor_id = self.motor_ids[j];
+                                self.refresh_capture = None;
+                                self.enable_failed();
+                                return Err(ArmDriverError::MotorHardwareFault {
+                                    joint: j,
+                                    motor_id,
+                                    status: st,
+                                });
+                            }
+                            let still = self.cached_states[j].velocity.is_finite()
+                                && self.cached_states[j].velocity.abs() <= 0.05;
+                            let off = !self.is_enabled && st == 0;
+                            if !(still && off) {
+                                self.refresh_capture = None;
+                                self.enable_failed();
+                                return Err(ArmDriverError::EnableFreshenUnsafeGripper {
+                                    joint: j,
+                                    still,
+                                    off,
+                                    status: st,
+                                });
+                            }
+                            if self.fresh_measured_position(j, POS_FORCE_FEEDBACK_MAX_AGE).is_some()
+                            {
+                                f.confirmed_mask |= 1u32 << j;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                let causal = self.last_feedback_seq[j] > f.tx_boundary[j]
+                    && self
+                        .last_feedback_instant[j]
+                        .is_some_and(|rx_at| rx_at >= tx_at && !f.deadline.passed(rx_at));
+                if causal {
+                    let st = self.motor_status[j];
+                    if damiao_fault_name(st).is_some() {
+                        let motor_id = self.motor_ids[j];
+                        self.refresh_capture = None;
+                        self.enable_failed();
+                        return Err(ArmDriverError::MotorHardwareFault {
+                            joint: j,
+                            motor_id,
+                            status: st,
+                        });
+                    }
+                    if self.fresh_measured_position(j, ENABLE_FRESHEN_EXIT_ARM_MAX_AGE).is_some() {
+                        f.confirmed_mask |= 1u32 << j;
+                    }
+                }
+            }
+
+            if (f.confirmed_mask & f.target_mask) == f.target_mask {
+                let mut re_stale = 0u32;
+                for j in handshake::mask_joints(f.target_mask) {
+                    let max_age = if pf_joint == Some(j) {
+                        ENABLE_FRESHEN_EXIT_PF_MAX_AGE
+                    } else {
+                        ENABLE_FRESHEN_EXIT_ARM_MAX_AGE
+                    };
+                    if self.fresh_measured_position(j, max_age).is_none() {
+                        re_stale |= 1u32 << j;
+                    }
+                }
+                if re_stale == 0 {
+                    self.refresh_capture = None;
+                    return self.proceed_after_freshen(true);
+                }
+                f.confirmed_mask &= !re_stale;
+                f.sent_mask &= !re_stale;
+                if pf_joint.is_some_and(|pf_j| (re_stale & (1u32 << pf_j)) != 0) {
+                    self.refresh_capture = None;
+                }
+            }
+        }
+
+        if expired_before_read || f.deadline.passed(self.now()) {
+            let missing = f.target_mask & !f.confirmed_mask;
+            let joint = if missing != 0 {
+                missing.trailing_zeros() as usize
+            } else {
+                0
+            };
+            self.refresh_capture = None;
+            self.enable_failed();
+            return Err(ArmDriverError::EnableFreshenTimeout { joint });
+        }
+
+        let unsent = f.target_mask & !f.sent_mask;
+        if unsent != 0 {
+            let _ = self.send_freshen_polls(&mut f, unsent)?;
+        } else if f.next_retry_at.is_some_and(|t| self.now() >= t) {
+            let unconfirmed = f.target_mask & !f.confirmed_mask;
+            if unconfirmed != 0 {
+                let _ = self.send_freshen_polls(&mut f, unconfirmed)?;
+            }
+        }
+
+        let wake = self.freshen_pending_wake(&f);
+        self.torque_hs = Some(DamiaoTorque::Freshen(f));
+        Ok(TorqueProgress::Pending { wake })
+    }
+
+    fn proceed_after_freshen(&mut self, drained_now: bool) -> Result<TorqueProgress, ArmDriverError> {
+        self.enable_estop_inhibited()?;
+        self.check_enable_tx_authority()?;
 
         // CTRL_MODE lives in motor RAM: a joint left in MIT by an interrupted gravity
         // compensation session must be back in the base mode before it is enabled.
@@ -13570,7 +13965,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             if r.remaining_mask == 0 {
                 if let Some(pf_j) = self.pos_force.as_ref().map(|p| p.joint) {
                     if self.last_read_drained
-                        && self.fresh_measured_position(pf_j, POS_FORCE_FEEDBACK_MAX_AGE).is_some()
+                        && self.fresh_measured_position(pf_j, POS_FORCE_READBACK_FRESH_MARGIN).is_some()
                     {
                         return self.finish_pos_force_readback(pf_j, None);
                     }
@@ -15895,6 +16290,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             None => Err(ArmDriverError::ProtocolStatic("no torque transition pending")),
             Some(DamiaoTorque::RangeCheck(rc)) => self.poll_range_check(rc),
             Some(DamiaoTorque::DrainBeforeEnable(d)) => self.poll_drain_before_enable(d),
+            Some(DamiaoTorque::Freshen(f)) => self.poll_freshen(f),
             Some(DamiaoTorque::RefreshBeforeRestore { refresh, stray, stray_len }) => {
                 self.poll_refresh_before_restore(refresh, stray, stray_len)
             }

@@ -2750,8 +2750,6 @@ fn j7_refresh_drain_counts_against_release_rx_budget_and_reports_consumed_frames
     raw_b.with(|s| s.push_all_feedback());
     drv_b.read_joint_states().unwrap();
     drv_b.check_mapping_ranges(); // verifies J7 already in CTRL_MODE 4 -> skip Restore, enter Readback
-    // Age J7 past 100 ms so readback reply triggers `PreEnableRefresh` -> `drain_rx_for_boundary`.
-    clock_b.advance(Duration::from_millis(120));
     drv_b.read_joint_states().unwrap();
     drv_b.set_rt_mode(true);
 
@@ -2774,6 +2772,8 @@ fn j7_refresh_drain_counts_against_release_rx_budget_and_reports_consumed_frames
         raw_b.tx_log().iter().any(|f| f.id == 0x7FF && f.data[0] == 7 && f.data[2] == damiao::REG_READ),
         "expected CTRL_MODE readback request"
     );
+    // Age J7 past 100 ms during Readback so readback reply triggers `PreEnableRefresh` -> `drain_rx_for_boundary`.
+    clock_b.advance(Duration::from_millis(120));
 
     // Queue N1 = 5 frames (4 filler + 1 valid CTRL_MODE=4 reply) and arm 10 extra frames on
     // WouldBlock so `drain_rx_for_boundary` runs immediately in the SAME release.

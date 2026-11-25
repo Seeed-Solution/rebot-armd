@@ -2100,6 +2100,8 @@ fn arm_driver_error_write_bounded_and_clear_fault_error_cover_all_variants_zero_
             ArmDriverError::DisableMitFenceUnconfirmed => "DisableMitFenceUnconfirmed",
             ArmDriverError::LeaseFenced => "LeaseFenced",
             ArmDriverError::EnableAuthorityExpired => "EnableAuthorityExpired",
+            ArmDriverError::EnableFreshenTimeout { .. } => "EnableFreshenTimeout",
+            ArmDriverError::EnableFreshenUnsafeGripper { .. } => "EnableFreshenUnsafeGripper",
             ArmDriverError::PartialDisable { .. } => "PartialDisable",
         }
     }
@@ -2169,6 +2171,13 @@ fn arm_driver_error_write_bounded_and_clear_fault_error_cover_all_variants_zero_
         ArmDriverError::DisableMitFenceUnconfirmed,
         ArmDriverError::LeaseFenced,
         ArmDriverError::EnableAuthorityExpired,
+        ArmDriverError::EnableFreshenTimeout { joint: 6 },
+        ArmDriverError::EnableFreshenUnsafeGripper {
+            joint: 6,
+            still: false,
+            off: true,
+            status: 0,
+        },
         ArmDriverError::PartialDisable {
             reason: armd::driver::PartialDisableReason::Estop,
             applied_mask: 0b0000_0011,
