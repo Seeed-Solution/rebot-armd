@@ -3122,11 +3122,11 @@ fn carried_and_retried_j7_enable_fails_closed_when_j7_feedback_goes_stale() {
                 && vbus.with(|s| {
                     s.tx_accepted
                         .iter()
-                        .any(|f| f.id == 0x7FF && f.data[2] == damiao::REG_READ)
+                        .any(|f| f.id == 0x7FF && f.data[0] == 7 && f.data[2] == damiao::REG_READ)
                 })
             {
                 aged_for_carry = true;
-                clock3.advance(ms(38));
+                clock3.advance(ms(32));
             }
             if vbus.with(|s| s.tx_accepted.iter().any(|f| f.id == 0x307)) {
                 saw_pre_enable_hold = true;
@@ -3212,19 +3212,31 @@ fn carried_and_retried_j7_enable_fails_closed_when_j7_feedback_goes_stale() {
         vbus.with(|s| s.push_all_feedback());
         d4.read_joint_states().unwrap();
 
-        // Age J7 to 65 ms so initial CMD_ENABLE sends fresh, its reply is dropped, and by the 40 ms
-        // tick (after 25 ms retry cursor) J7 age is 105 ms > 100 ms -> triggers 0xCC refresh with 40 ms reply delay.
-        clock4.advance(ms(65));
+        // Age J7 to 40 ms before begin_torque (within pre-enable freshen threshold) and +25 ms on
+        // J7 REG_READ (age ~65 ms <= 85 ms readback margin), so initial CMD_ENABLE sends fresh with
+        // dropped reply and by the 40 ms tick (after 25 ms retry cursor) J7 age is > 100 ms.
+        clock4.advance(ms(40));
         drop_307.store(true, Ordering::SeqCst);
         drop_en.store(true, Ordering::SeqCst);
         *delay_slot.lock().unwrap() = ms(40);
         d4.set_tx_budget(TxBudget { max_frames: 7, max_duration: ms(5), frame_max_age: ms(45) });
         let _ = d4.begin_torque(true).expect("begin");
         let mut saw_initial_j7 = false;
+        let mut aged_for_retry = false;
         for _ in 0..10 {
             clock4.advance(ms(1));
             let p = d4.poll_torque(clock4.now() + ms(5)).expect("poll to initial enable");
             assert!(matches!(p, armd::driver::TorqueProgress::Pending { .. }));
+            if !aged_for_retry
+                && vbus.with(|s| {
+                    s.tx_accepted
+                        .iter()
+                        .any(|f| f.id == 0x7FF && f.data[0] == 7 && f.data[2] == damiao::REG_READ)
+                })
+            {
+                aged_for_retry = true;
+                clock4.advance(ms(25));
+            }
             if vbus.with(|s| s.tx_accepted.iter().any(|f| f.id == 7 && f.data == damiao::CMD_ENABLE)) {
                 saw_initial_j7 = true;
                 break;
