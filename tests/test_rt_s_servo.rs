@@ -1162,3 +1162,846 @@ async fn executor_servo_zero_alloc_and_zero_supervisor_lock_proof() {
     drop(_legacy_write_hold);
     handle.stop_and_join();
 }
+
+// ============================================================================
+// 6. Round 2 B1: Lease fence at the TX choke point (BOTH Legacy and Executor):
+//    Close the client socket right between the output check (`mit.rs:892`) and
+//    driver TX -> ZERO old-gen motion frames on CAN (J1-J6 + J7 PosForce),
+//    stationary holds continue, and Disable frames remain exempt.
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b1_lease_fence_at_tx_choke_point_both_owners_and_disable_exempt() {
+    use armd::supervisor::OWNER_LEGACY;
+    use std::sync::atomic::AtomicU64;
+
+    for use_executor in [false, true] {
+        let cfg = ArmConfig {
+            lease_timeout_ms: 5_000,
+            control_frequency_hz: 50,
+            ..ArmConfig::rebot_dm()
+        };
+        let (sup, bus) = make_fakebus_supervisor(cfg, true);
+
+        let arm_hook = Arc::new(AtomicBool::new(false));
+        let hook_fired = Arc::new(AtomicBool::new(false));
+        let expected_gen = Arc::new(AtomicU64::new(0));
+        let close_tx_slot: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>> =
+            Arc::new(Mutex::new(None));
+
+        {
+            let arm_hook_cb = Arc::clone(&arm_hook);
+            let hook_fired_cb = Arc::clone(&hook_fired);
+            let expected_gen_cb = Arc::clone(&expected_gen);
+            let close_tx_cb = Arc::clone(&close_tx_slot);
+            let sup_cb = Arc::clone(&sup);
+            sup.inner().write().await.post_stop_check_hook = Some(Arc::new(move || {
+                if !arm_hook_cb.load(Ordering::Acquire) {
+                    return;
+                }
+                if hook_fired_cb.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                if let Some(tx) = close_tx_cb.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                let target_gen = expected_gen_cb.load(Ordering::Acquire);
+                let deadline = Instant::now() + Duration::from_secs(1);
+                while sup_cb.atomic_fenced_lease_gen() < target_gen && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }));
+        }
+
+        let addr = serve(sup.clone()).await;
+        let delay: Arc<Mutex<Option<Duration>>> = Arc::new(Mutex::new(None));
+        let exec_handle = if use_executor {
+            let h = sup
+                .start_executor_with_hooks(
+                    ExecutorConfig::for_tests(Duration::from_millis(10)),
+                    PersistTestHooks {
+                        release_delay_once: Some(delay.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(sup.owner_mode(), OWNER_EXECUTOR);
+            wait_until(Duration::from_secs(2), || sup.hub().latest().is_some()).await;
+            Some(h)
+        } else {
+            assert_eq!(sup.owner_mode(), OWNER_LEGACY);
+            sup.control_tick(0.02).await;
+            None
+        };
+
+        let mut ws1 = connect_ws(addr).await;
+        let gen1 = acquire(&mut ws1, "b1-owner", false, 1).await;
+        expected_gen.store(gen1, Ordering::Release);
+        let ep1 = if use_executor {
+            sup.fresh_snapshot(None).await.unwrap().obs.epoch_id
+        } else {
+            sup.get_observation().await.epoch_id
+        };
+        arm_via_ws(&mut ws1, gen1, ep1, 1).await;
+
+        if use_executor {
+            let seq = sup.hub().published_seq() + 4;
+            wait_until(Duration::from_secs(1), || sup.hub().published_seq() >= seq).await;
+        } else {
+            for _ in 0..4 {
+                sup.control_tick(0.02).await;
+            }
+        }
+
+        let baseline = if use_executor {
+            sup.fresh_snapshot(None)
+                .await
+                .unwrap()
+                .obs
+                .commanded_positions
+                .clone()
+        } else {
+            sup.get_observation().await.commanded_positions
+        };
+        let q0 = baseline[0];
+        let j7_0 = baseline[6];
+
+        // Queue a moving servo target for BOTH J1 (`q0 + 0.45`) and J7 (`0.0`, away from `-3.0`).
+        let mut q_move = baseline.clone();
+        q_move[0] = q0 + 0.45;
+        q_move[6] = 0.0;
+
+        if use_executor {
+            *delay.lock().unwrap() = Some(Duration::from_millis(60));
+            wait_until(Duration::from_secs(1), || delay.lock().unwrap().is_none()).await;
+        }
+        let sub_before = exec_handle.as_ref().map_or(0, |h| h.servo_submitted_count());
+        send(
+            &mut ws1,
+            json!({
+                "type": "servo",
+                "generation": gen1,
+                "epoch_id": ep1,
+                "sequence_id": 1,
+                "positions": q_move,
+            }),
+        )
+        .await;
+        if let Some(ref h) = exec_handle {
+            wait_until(Duration::from_secs(1), || h.servo_submitted_count() > sub_before).await;
+        } else {
+            wait_until(Duration::from_secs(1), || {
+                sup.inner()
+                    .try_read()
+                    .ok()
+                    .and_then(|g| g.servo_target.as_ref().map(|v| (v[0] - q_move[0]).abs() < 1e-3))
+                    .unwrap_or(false)
+            })
+            .await;
+        }
+
+        // Hand `ws1` to a dedicated closer task triggered INSIDE `post_stop_check_hook`.
+        let (close_tx, close_rx) = tokio::sync::oneshot::channel::<()>();
+        *close_tx_slot.lock().unwrap() = Some(close_tx);
+        let closer_task = tokio::spawn(async move {
+            let _ = close_rx.await;
+            drop(ws1);
+        });
+
+        // Arm the hook right before the moving tick runs and clear bus log.
+        bus.clear_log();
+        arm_hook.store(true, Ordering::Release);
+
+        if use_executor {
+            wait_until(Duration::from_secs(2), || {
+                hook_fired.load(Ordering::Acquire)
+                    && !sup
+                        .hub()
+                        .latest()
+                        .unwrap()
+                        .owner
+                        .is_lease_active_at(Instant::now())
+            })
+            .await;
+            let seq_after = sup.hub().published_seq() + 5;
+            wait_until(Duration::from_secs(1), || sup.hub().published_seq() >= seq_after).await;
+        } else {
+            // Tick 1 hits `post_stop_check_hook` between `mit.rs:892` and TX: old-gen motion MUST
+            // be blocked at the driver TX choke point!
+            sup.control_tick(0.02).await;
+            assert!(
+                hook_fired.load(Ordering::Acquire),
+                "Legacy post_stop_check_hook must fire"
+            );
+            // Subsequent ticks apply the queued disconnect and continue emitting stationary holds.
+            for _ in 0..5 {
+                sup.control_tick(0.02).await;
+            }
+        }
+        let _ = closer_task.await;
+
+        assert!(
+            sup.atomic_fenced_lease_gen() >= gen1,
+            "use_executor={use_executor}: real WS disconnect must fence gen1"
+        );
+        let log = bus.tx_log();
+        let j1_frames: Vec<_> = log.iter().filter(|f| f.id == 0x101).collect();
+        let j7_frames: Vec<_> = log.iter().filter(|f| f.id == 0x307).collect();
+        assert!(
+            !j1_frames.is_empty(),
+            "use_executor={use_executor}: stationary J1 holds must continue after lease loss"
+        );
+        assert!(
+            !j7_frames.is_empty(),
+            "use_executor={use_executor}: stationary J7 holds must continue after lease loss"
+        );
+        for f in &j1_frames {
+            let p = decode_pos_f32(f);
+            assert!(
+                (p - q0).abs() < 1e-3,
+                "use_executor={use_executor}: old-gen J1 motion leaked on CAN! pos={p} vs baseline {q0}"
+            );
+        }
+        for f in &j7_frames {
+            let p = decode_pos_f32(f);
+            let vel = decode_j7_pf_vel_raw(f);
+            assert_eq!(
+                vel, 0,
+                "use_executor={use_executor}: old-gen J7 target leaked on CAN (vel_raw={vel} != 0)"
+            );
+            assert!(
+                (p - j7_0).abs() < 0.05,
+                "use_executor={use_executor}: old-gen J7 pos leaked on CAN! pos={p} vs baseline {j7_0}"
+            );
+        }
+
+        // Verify Disable frames (`TxKind::Disable`) remain EXEMPT after lease loss.
+        let mut ws_dis = connect_ws(addr).await;
+        let gen_dis = acquire(&mut ws_dis, "b1-disable", false, 1).await;
+        let ep_dis = if use_executor {
+            sup.fresh_snapshot(None).await.unwrap().obs.epoch_id
+        } else {
+            sup.get_observation().await.epoch_id
+        };
+        bus.clear_log();
+        send(
+            &mut ws_dis,
+            json!({
+                "type": "command",
+                "path": "/api/v1/torque",
+                "body": {"enable": false},
+                "generation": gen_dis,
+                "epoch_id": ep_dis,
+                "request_id": 2,
+            }),
+        )
+        .await;
+        let dis_ack = next_of(&mut ws_dis, "command_ack").await;
+        assert_eq!(dis_ack["is_torqued"], false, "{dis_ack}");
+        let disable_frames: Vec<_> = bus
+            .tx_log()
+            .into_iter()
+            .filter(|f| f.data == [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD])
+            .collect();
+        assert!(
+            !disable_frames.is_empty(),
+            "use_executor={use_executor}: Disable frames must transmit after lease loss"
+        );
+
+        drop(ws_dis);
+        if let Some(h) = exec_handle {
+            h.stop_and_join();
+        }
+    }
+}
+
+#[test]
+fn b1_pending_tx_queue_drops_fenced_lease_targets_and_allows_hold_and_disable() {
+    use armd::driver::{ArmDriverError, JointTarget, TxBatchOutcome, TxBudget};
+    use armd::rt_core::urgent::{EstopGate, LeaseGate};
+    use std::sync::atomic::AtomicU64;
+
+    let limits = dm_limits();
+    let bus = FakeBus::new(&limits);
+    bus.with(|s| {
+        s.immediate_replies = true;
+        s.follow_commands = true;
+        s.push_all_feedback();
+    });
+    let current_lease = Arc::new(AtomicU64::new(7));
+    let fenced_lease = Arc::new(AtomicU64::new(0));
+    let pending_disc = Arc::new(AtomicU64::new(0));
+    let gate = EstopGate::new(Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)))
+        .with_lease_gate(LeaseGate::new(
+            Arc::clone(&current_lease),
+            Arc::clone(&fenced_lease),
+            Arc::clone(&pending_disc),
+        ));
+
+    // Tiny TX budget of 2 frames so a 7-joint batch transmits 2 frames and queues 5 in `pending_tx`.
+    let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(limits)
+        .unwrap()
+        .with_tx_budget(TxBudget {
+            max_frames: 2,
+            max_duration: Duration::from_secs(1),
+            frame_max_age: Duration::from_secs(1),
+        });
+    drv.set_estop_gate(gate);
+    drv.read_joint_states().unwrap();
+    drv.read_joint_states().unwrap();
+    drv.set_torque(true).unwrap();
+
+    // Queue a deferred motion batch under lease_gen = 7.
+    let moving: Vec<JointTarget> = (0..7)
+        .map(|i| {
+            let mut t = JointTarget::position(0.4 + 0.01 * (i as f32));
+            t.velocity = Some(0.5);
+            t
+        })
+        .collect();
+    drv.begin_tx_tick();
+    drv.set_output_lease_gen(7);
+    let first = drv.write_joint_targets_bounded(&moving).unwrap();
+    drv.set_output_lease_gen(0);
+    assert!(
+        matches!(first, TxBatchOutcome::Deferred { pending } if pending > 0),
+        "expected deferred pending_tx entries, got {first:?}"
+    );
+
+    // Fence lease_gen = 7 lock-free BEFORE draining pending_tx!
+    fenced_lease.store(7, Ordering::SeqCst);
+    current_lease.store(0, Ordering::SeqCst);
+    bus.clear_log();
+    drv.begin_tx_tick();
+    let drained = drv.drain_pending_tx().unwrap();
+    assert!(
+        matches!(drained, TxBatchOutcome::Complete),
+        "fenced pending_tx entries should drop cleanly, got {drained:?}"
+    );
+    assert!(
+        bus.tx_log().is_empty(),
+        "ZERO old-gen deferred target frames may transmit after lease fence: {:?}",
+        bus.tx_log()
+    );
+
+    // A direct new Target with old lease_gen = 7 is also rejected with `LeaseFenced` and 0 CAN TX.
+    drv.begin_tx_tick();
+    drv.set_output_lease_gen(7);
+    let err = drv.write_joint_targets_bounded(&moving).unwrap_err();
+    drv.set_output_lease_gen(0);
+    assert!(
+        matches!(err, ArmDriverError::LeaseFenced),
+        "expected ArmDriverError::LeaseFenced, got {err:?}"
+    );
+    assert!(bus.tx_log().is_empty(), "fenced write_joint_targets_bounded must emit 0 CAN frames");
+
+    // Exempt: Hold (`write_estop_hold_bounded`) still transmits after lease loss.
+    let hold: Vec<JointTarget> = (0..7).map(|_| JointTarget::position(0.0)).collect();
+    drv.begin_tx_tick();
+    let hold_res = drv.write_estop_hold_bounded(&hold).unwrap();
+    assert!(
+        matches!(hold_res, TxBatchOutcome::Complete | TxBatchOutcome::Deferred { .. }),
+        "hold must remain exempt: {hold_res:?}"
+    );
+    assert!(
+        !bus.tx_log().is_empty(),
+        "Hold frames must transmit on CAN even after lease loss"
+    );
+
+    // Exempt: Disable (`set_torque(false)` -> `TxKind::Disable`) still transmits after lease loss.
+    bus.clear_log();
+    drv.set_torque(false).unwrap();
+    let disable_frames: Vec<_> = bus
+        .tx_log()
+        .into_iter()
+        .filter(|f| f.data == [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD])
+        .collect();
+    assert_eq!(
+        disable_frames.len(),
+        7,
+        "all 7 motors must receive Disable frames after lease loss"
+    );
+}
+
+// ============================================================================
+// 7. Round 2 B2 + M1: Live executor zero-alloc & zero-lock proof with 32 end
+//    points + 4 keep-out boxes + 16 link capsules (>256 slots), workspace
+//    refusals on intake & step, Step 6 publish, and off-thread C config commit.
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b2_m1_executor_large_workspace_32_endpoints_keepout_refusal_and_config_commit_zero_alloc() {
+    use armd::model::{KeepoutBox, LinkCapsule};
+
+    ensure_tracing_subscriber();
+    let mut cfg = ArmConfig {
+        lease_timeout_ms: 5_000,
+        ..ArmConfig::rebot_dm()
+    };
+    let base_pose = common::INSPECT.to_vec();
+    let mut q_mid = base_pose.clone();
+    q_mid[0] += 0.15;
+    let mut q_far = base_pose.clone();
+    q_far[0] += 0.30;
+    let p_mid = cfg.arm_model.fk_f32(&q_mid).expect("fk q_mid").p;
+
+    {
+        let ws = cfg.workspace.as_mut().unwrap();
+        let mut idx = 0usize;
+        while ws.check_points_end_m.len() < 32 {
+            let x = -0.02 - 0.004 * (idx as f32);
+            let y = if idx.is_multiple_of(2) { 0.01 } else { -0.01 };
+            ws.check_points_end_m.push([x, y, 0.0]);
+            idx += 1;
+        }
+        let mut extra = 0usize;
+        while ws.link_capsules.len() < armd::model::MAX_LINK_CAPSULES {
+            ws.link_capsules.push(LinkCapsule {
+                id: format!("exec_cap_{extra}"),
+                frame: "link6".into(),
+                a_m: [0.0, 0.0, 0.015],
+                b_m: [0.0, 0.0, 0.022],
+                radius_m: 0.012,
+            });
+            extra += 1;
+        }
+        ws.keepout_boxes = vec![
+            KeepoutBox {
+                name: "kb_a".into(),
+                min_m: [-0.58, -0.58, 0.62],
+                max_m: [-0.45, -0.45, 0.75],
+            },
+            KeepoutBox {
+                name: "kb_b".into(),
+                min_m: [0.45, -0.58, 0.62],
+                max_m: [0.58, -0.45, 0.75],
+            },
+            KeepoutBox {
+                name: "kb_c".into(),
+                min_m: [-0.58, 0.45, 0.62],
+                max_m: [-0.45, 0.58, 0.75],
+            },
+            KeepoutBox {
+                name: "kb_mid_exec".into(),
+                min_m: [
+                    (p_mid[0] - 0.02) as f32,
+                    (p_mid[1] - 0.02) as f32,
+                    (p_mid[2] - 0.02) as f32,
+                ],
+                max_m: [
+                    (p_mid[0] + 0.02) as f32,
+                    (p_mid[1] + 0.02) as f32,
+                    (p_mid[2] + 0.02) as f32,
+                ],
+            },
+        ];
+        ws.validate().expect("legal >256-slot workspace");
+    }
+
+    let sup = Arc::new(ArmSupervisor::new(cfg));
+    {
+        let mut inner = sup.inner().write().await;
+        inner.commanded_positions.clone_from(&base_pose);
+        inner.measured_positions.clone_from(&base_pose);
+        inner.target_positions.clone_from(&base_pose);
+    }
+    let addr = serve(sup.clone()).await;
+
+    let mut ecfg = ExecutorConfig::for_tests(Duration::from_millis(5));
+    ecfg.alloc_timing = true;
+    let handle = sup.start_executor(ecfg).await.unwrap();
+    wait_until(Duration::from_secs(2), || sup.hub().latest().is_some()).await;
+    let _legacy_write_hold = sup.inner().write().await;
+
+    let rel_before = handle.stats().release_allocs.snapshot();
+    let wake_before = handle.stats().wake_allocs.snapshot();
+    let lock_before = sup.inner().control_thread_attempts();
+
+    let mut ws1 = connect_ws(addr).await;
+    let gen1 = acquire(&mut ws1, "ws-alloc", false, 1).await;
+    let ep1 = sup.fresh_snapshot(None).await.unwrap().obs.epoch_id;
+    arm_via_ws(&mut ws1, gen1, ep1, 1).await;
+
+    // 1. Valid streaming servo on >256-slot workspace.
+    for s in 1..=5u64 {
+        let mut q_step = base_pose.clone();
+        q_step[0] += 0.004 * (s as f32);
+        send(
+            &mut ws1,
+            json!({
+                "type": "servo",
+                "generation": gen1,
+                "epoch_id": ep1,
+                "sequence_id": s,
+                "positions": q_step,
+            }),
+        )
+        .await;
+    }
+    let seq1 = sup.hub().published_seq() + 4;
+    wait_until(Duration::from_secs(1), || sup.hub().published_seq() >= seq1).await;
+
+    // 2. Intake workspace refusal (`WORKSPACE_VIOLATION`) on >256-slot workspace.
+    send(
+        &mut ws1,
+        json!({
+            "type": "command",
+            "path": "/api/v1/motion/servo",
+            "body": {"targets": q_mid},
+            "generation": gen1,
+            "epoch_id": ep1,
+            "request_id": 2,
+        }),
+    )
+    .await;
+    let ws_rej = next_of(&mut ws1, "command_reject").await;
+    assert_eq!(ws_rej["request_id"], 2, "{ws_rej}");
+    assert_eq!(ws_rej["code"], "WORKSPACE_VIOLATION", "{ws_rej}");
+
+    // 3. In-motion keep-out sweep refusal (`enter_servo_keepout_hold_rt`) + Step 6 publish!
+    // Stream `q_far` continuously so servo motion-frame watchdog stays fresh while sweeping across `kb_mid_exec`.
+    let mut saw_ws_violation = false;
+    for s in 6..120u64 {
+        send(
+            &mut ws1,
+            json!({
+                "type": "servo",
+                "generation": gen1,
+                "epoch_id": ep1,
+                "sequence_id": s,
+                "positions": q_far,
+            }),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        if sup
+            .hub()
+            .latest()
+            .is_some_and(|snap| snap.obs.workspace_violation.is_some())
+        {
+            saw_ws_violation = true;
+            break;
+        }
+    }
+    assert!(
+        saw_ws_violation,
+        "sweeping across kb_mid_exec must trigger enter_servo_keepout_hold_rt and publish workspace_violation"
+    );
+
+    // 4. Off-thread C config commit adding a 5th keepout box, followed by another servo & refusal.
+    send(
+        &mut ws1,
+        json!({
+            "type": "command",
+            "path": "/api/v1/workspace/keepout",
+            "body": {
+                "boxes": [{
+                    "name": "kb_runtime_5",
+                    "min_m": [0.45, 0.45, 0.62],
+                    "max_m": [0.58, 0.58, 0.75]
+                }]
+            },
+            "generation": gen1,
+            "epoch_id": ep1,
+            "request_id": 4,
+        }),
+    )
+    .await;
+    let cfg_ack = next_of(&mut ws1, "command_ack").await;
+    assert_eq!(cfg_ack["request_id"], 4, "{cfg_ack}");
+
+    send(
+        &mut ws1,
+        json!({
+            "type": "command",
+            "path": "/api/v1/motion/servo",
+            "body": {"targets": q_mid},
+            "generation": gen1,
+            "epoch_id": ep1,
+            "request_id": 5,
+        }),
+    )
+    .await;
+    let ws_rej2 = next_of(&mut ws1, "command_reject").await;
+    assert_eq!(ws_rej2["code"], "WORKSPACE_VIOLATION", "{ws_rej2}");
+
+    let rel_delta = handle.stats().release_allocs.snapshot().delta_since(rel_before);
+    let wake_delta = handle.stats().wake_allocs.snapshot().delta_since(wake_before);
+    let lock_after = sup.inner().control_thread_attempts();
+
+    assert_eq!(lock_after - lock_before, 0);
+    assert_eq!(
+        rel_delta.total(),
+        0,
+        "armd-control must perform 0 heap ops across >256-slot workspace servo/refusal/config commit: {rel_delta:?}"
+    );
+    assert_eq!(
+        wake_delta.total(),
+        0,
+        "armd-control must perform 0 wake heap ops across >256-slot workspace: {wake_delta:?}"
+    );
+
+    drop(ws1);
+    drop(_legacy_write_hold);
+    handle.stop_and_join();
+}
+
+// ============================================================================
+// 8. Round 2 M2: Disconnect handling MUST NOT block when the servo dispatcher
+//    mutex is held; fence + Disconnect apply immediately while mutex is held.
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m2_disconnect_does_not_block_when_servo_dispatcher_mutex_is_held() {
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig {
+        lease_timeout_ms: 5_000,
+        ..ArmConfig::rebot_dm()
+    }));
+    let addr = serve(sup.clone()).await;
+    let handle = sup
+        .start_executor(ExecutorConfig::for_tests(Duration::from_millis(5)))
+        .await
+        .unwrap();
+    wait_until(Duration::from_secs(2), || sup.hub().latest().is_some()).await;
+
+    let mut ws1 = connect_ws(addr).await;
+    let gen1 = acquire(&mut ws1, "m2-owner", false, 1).await;
+    let ep1 = sup.fresh_snapshot(None).await.unwrap().obs.epoch_id;
+    arm_via_ws(&mut ws1, gen1, ep1, 1).await;
+    let sub_before = handle.servo_submitted_count();
+    send(
+        &mut ws1,
+        json!({
+            "type": "servo",
+            "generation": gen1,
+            "epoch_id": ep1,
+            "sequence_id": 1,
+            "positions": [0.02, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        }),
+    )
+    .await;
+    wait_until(Duration::from_secs(1), || handle.servo_submitted_count() > sub_before).await;
+
+    // Hold the servo dispatcher mutex (`ServoTargetDispatcher.inner`) continuously across disconnect!
+    let dispatcher_guard = handle.target_writer().lock().unwrap();
+    let t0 = Instant::now();
+    drop(ws1);
+
+    // Real socket disconnect MUST fence `gen1` AND enqueue + apply `Disconnect` on `armd-control`
+    // while `dispatcher_guard` is STILL held (proving teardown never blocked on the mutex!).
+    wait_until(Duration::from_secs(1), || {
+        sup.atomic_fenced_lease_gen() >= gen1
+            && !sup
+                .hub()
+                .latest()
+                .unwrap()
+                .owner
+                .is_lease_active_at(Instant::now())
+    })
+    .await;
+    let disc_elapsed = t0.elapsed();
+    assert!(
+        disc_elapsed < Duration::from_millis(500),
+        "disconnect with held dispatcher mutex took too long: {disc_elapsed:?}"
+    );
+
+    // Direct call to `fence_ws_connection_immediate` while mutex is held must return immediately.
+    let t_direct = Instant::now();
+    let dummy_conn = armd::rt_core::requests::lease::ConnectionHandle::from_ws_id(9999).unwrap();
+    sup.fence_ws_connection_immediate(dummy_conn, gen1);
+    assert!(
+        t_direct.elapsed() < Duration::from_millis(50),
+        "fence_ws_connection_immediate blocked on dispatcher mutex: {:?}",
+        t_direct.elapsed()
+    );
+
+    // Release the mutex: `armd-dispatch` / `is_servo_closed` immediately syncs `close_servo(gen1)`.
+    drop(dispatcher_guard);
+    wait_until(Duration::from_secs(2), || handle.is_servo_closed(gen1)).await;
+
+    handle.stop_and_join();
+}
+
+// ============================================================================
+// 9. Round 2 M3: Streaming servo frame preempted by Stop MUST emit `servo_reject`
+//    with `reason: "stopped"` and identical correlation on BOTH owners.
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m3_streaming_servo_frame_preempted_by_stop_emits_stopped_servo_reject_both_owners() {
+    use armd::supervisor::OWNER_LEGACY;
+
+    let mut replies = Vec::new();
+    for use_executor in [false, true] {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig {
+            lease_timeout_ms: 5_000,
+            control_frequency_hz: 50,
+            ..ArmConfig::rebot_dm()
+        }));
+        let addr = serve(sup.clone()).await;
+        let delay: Arc<Mutex<Option<Duration>>> = Arc::new(Mutex::new(None));
+        let exec_handle = if use_executor {
+            let h = sup
+                .start_executor_with_hooks(
+                    ExecutorConfig::for_tests(Duration::from_millis(10)),
+                    PersistTestHooks {
+                        release_delay_once: Some(delay.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(sup.owner_mode(), OWNER_EXECUTOR);
+            wait_until(Duration::from_secs(2), || sup.hub().latest().is_some()).await;
+            Some(h)
+        } else {
+            assert_eq!(sup.owner_mode(), OWNER_LEGACY);
+            sup.control_tick(0.02).await;
+            None
+        };
+
+        let mut ws = connect_ws(addr).await;
+        let gen = acquire(&mut ws, "m3-owner", false, 1).await;
+        let ep = if use_executor {
+            sup.fresh_snapshot(None).await.unwrap().obs.epoch_id
+        } else {
+            sup.get_observation().await.epoch_id
+        };
+        arm_via_ws(&mut ws, gen, ep, 1).await;
+        let ep = if use_executor {
+            sup.fresh_snapshot(None).await.unwrap().obs.epoch_id
+        } else {
+            sup.get_observation().await.epoch_id
+        };
+        let q0 = if use_executor {
+            sup.fresh_snapshot(None).await.unwrap().obs.commanded_positions[0]
+        } else {
+            sup.get_observation().await.commanded_positions[0]
+        };
+
+        if let Some(ref h) = exec_handle {
+            // Executor: pause one release so the streaming servo frame sits buffered in mailbox,
+            // then send Stop so Step 1 STOP preempts Step 4 target consumption!
+            *delay.lock().unwrap() = Some(Duration::from_millis(80));
+            wait_until(Duration::from_secs(1), || delay.lock().unwrap().is_none()).await;
+            let sub_before = h.servo_submitted_count();
+            send(
+                &mut ws,
+                json!({
+                    "type": "servo",
+                    "generation": gen,
+                    "epoch_id": ep,
+                    "sequence_id": 1,
+                    "positions": [q0 + 0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                }),
+            )
+            .await;
+            wait_until(Duration::from_secs(1), || h.servo_submitted_count() > sub_before).await;
+            send(
+                &mut ws,
+                json!({
+                    "type": "command",
+                    "request_id": 10,
+                    "generation": gen,
+                    "epoch_id": ep,
+                    "path": "/api/v1/motion/stop",
+                    "body": {},
+                }),
+            )
+            .await;
+        } else {
+            // Legacy: hold the ordinary WS worker right before `inner.write()`, send streaming
+            // servo, apply Stop, then release the worker so `check_admission` refuses STOPPED!
+            let conn_id = sup
+                .inner()
+                .read()
+                .await
+                .active_lease
+                .as_ref()
+                .unwrap()
+                .client_id
+                .clone();
+            armd::api::ws::set_test_ws_worker_before_lock_paused(&conn_id, true);
+            send(
+                &mut ws,
+                json!({
+                    "type": "servo",
+                    "generation": gen,
+                    "epoch_id": ep,
+                    "sequence_id": 1,
+                    "positions": [q0 + 0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                }),
+            )
+            .await;
+            wait_until(Duration::from_secs(1), || {
+                armd::api::ws::test_ws_worker_before_lock_blocked_count(&conn_id) >= 1
+            })
+            .await;
+            send(
+                &mut ws,
+                json!({
+                    "type": "command",
+                    "request_id": 10,
+                    "generation": gen,
+                    "epoch_id": ep,
+                    "path": "/api/v1/motion/stop",
+                    "body": {},
+                }),
+            )
+            .await;
+            let stop_ack = next_of(&mut ws, "command_ack").await;
+            assert_eq!(stop_ack["request_id"], 10, "{stop_ack}");
+            armd::api::ws::set_test_ws_worker_before_lock_paused(&conn_id, false);
+        }
+
+        // Collect `servo_reject` (and `command_ack` for Stop on executor, in either arrival order).
+        let mut saw_servo_reject: Option<Value> = None;
+        let mut saw_stop_ack = !use_executor;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while (saw_servo_reject.is_none() || !saw_stop_ack) && Instant::now() < deadline {
+            if let Some(msg) = next_non_telemetry_within(&mut ws, Duration::from_millis(500)).await {
+                match msg.get("type").and_then(Value::as_str) {
+                    Some("servo_reject") => saw_servo_reject = Some(msg),
+                    Some("command_ack") if msg["request_id"] == 10 => saw_stop_ack = true,
+                    _ => {}
+                }
+            }
+        }
+        assert!(saw_stop_ack, "use_executor={use_executor}: expected stop command_ack");
+        let rej = saw_servo_reject.expect("expected servo_reject for Stop-preempted streaming frame");
+        assert_eq!(rej["type"], "servo_reject", "use_executor={use_executor}: {rej}");
+        assert_eq!(rej["reason"], "stopped", "use_executor={use_executor}: {rej}");
+        assert_eq!(rej["code"], "STOPPED", "use_executor={use_executor}: {rej}");
+        assert_eq!(rej["error"], "STOPPED", "use_executor={use_executor}: {rej}");
+        assert_eq!(rej["status"], 409, "use_executor={use_executor}: {rej}");
+        assert_eq!(rej["epoch_id"], ep, "use_executor={use_executor}: {rej}");
+
+        let q_after = if use_executor {
+            let seq = sup.hub().published_seq() + 3;
+            wait_until(Duration::from_secs(1), || sup.hub().published_seq() >= seq).await;
+            sup.fresh_snapshot(None).await.unwrap().obs.commanded_positions[0]
+        } else {
+            sup.control_tick(0.02).await;
+            sup.get_observation().await.commanded_positions[0]
+        };
+        assert!(
+            (q_after - q0).abs() < 1e-4,
+            "use_executor={use_executor}: Stop-preempted servo moved arm: {q_after} vs {q0}"
+        );
+
+        replies.push(rej);
+        drop(ws);
+        if let Some(h) = exec_handle {
+            h.stop_and_join();
+        }
+    }
+
+    // Legacy and Executor `servo_reject` payloads must match field-for-field!
+    assert_eq!(
+        replies[0], replies[1],
+        "Legacy vs Executor Stop-preempted servo_reject mismatch:\nlegacy={}\nexecutor={}",
+        replies[0], replies[1]
+    );
+}

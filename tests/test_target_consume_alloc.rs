@@ -223,3 +223,269 @@ fn the_calibration_digest_is_cached_at_install() {
     inner.set_calibration(None);
     assert_eq!(inner.active_calibration_digest(), EMPTY_CALIBRATION_DIGEST);
 }
+
+/// B2 + M1: a legal workspace with 32 end points + 4 keep-out boxes + 16 link capsules (> 256
+/// clearance slots and > 48 geometries) must perform ZERO heap allocations and ZERO frees on
+/// `armd-control` across:
+/// 1. servo target intake (`consume_target`),
+/// 2. servo step (`tick_control`) + Step 6 observation publish (`fill_observation`),
+/// 3. workspace refusal on intake (`WORKSPACE_VIOLATION`),
+/// 4. in-motion keep-out sweep refusal (`enter_servo_keepout_hold_rt`) + Step 6 publish of
+///    `obs.workspace_violation`,
+/// 5. stop + clear violation + follow-up servo target & step.
+#[test]
+fn large_legal_workspace_servo_intake_step_refusal_and_publish_do_not_allocate() {
+    use armd::model::{ArmObservation, KeepoutBox, LinkCapsule};
+
+    let mut cfg = ArmConfig {
+        lease_timeout_ms: 600_000,
+        ..ArmConfig::rebot_dm()
+    };
+
+    // Start from the standard inspection pose (`INSPECT`) and sweep J1 by 0.30 rad (< 0.35 rad
+    // dirty-jump guard) across a 4 cm keep-out cube centered at the midpoint (`+0.15 rad`).
+    let base_pose = vec![0.0f32, -1.167, -1.565, 1.435, 0.0, 0.0, 0.0];
+    let mut q_ok = base_pose.clone();
+    q_ok[0] += 0.02;
+    let mut q_mid = base_pose.clone();
+    q_mid[0] += 0.15;
+    let mut q_far = base_pose.clone();
+    q_far[0] += 0.30;
+    let p_mid = cfg.arm_model.fk_f32(&q_mid).expect("fk q_mid").p;
+
+    {
+        let ws = cfg.workspace.as_mut().expect("rebot_dm workspace");
+        // Fill check_points_end_m to the legal maximum of 32 points inside the gripper envelope.
+        let mut idx = 0usize;
+        while ws.check_points_end_m.len() < 32 {
+            let x = -0.02 - 0.004 * (idx as f32);
+            let y = if idx.is_multiple_of(2) { 0.01 } else { -0.01 };
+            ws.check_points_end_m.push([x, y, 0.0]);
+            idx += 1;
+        }
+        assert_eq!(ws.check_points_end_m.len(), 32);
+
+        // Fill link_capsules to the legal maximum of 16 capsules (1 + 32 + 1 + 16 = 50 > 48 geoms).
+        let mut extra = 0usize;
+        while ws.link_capsules.len() < armd::model::MAX_LINK_CAPSULES {
+            ws.link_capsules.push(LinkCapsule {
+                id: format!("extra_cap_{extra}"),
+                frame: "link6".into(),
+                a_m: [0.0, 0.0, 0.015],
+                b_m: [0.0, 0.0, 0.022],
+                radius_m: 0.012,
+            });
+            extra += 1;
+        }
+        assert_eq!(ws.link_capsules.len(), armd::model::MAX_LINK_CAPSULES);
+
+        // 4 keep-out boxes: 3 away from the sweep + 1 sitting strictly at `p_mid` so `base_pose`
+        // and `q_far` are legal while `q_mid` (and the linear sweep `base_pose -> q_far`) hits it.
+        // Total slots = (1 + 32 + 1 + 16) * (7 + 4) + pairs >= 550 > 256 (`MAX_STACK_WORKSPACE_SLOTS`).
+        ws.keepout_boxes = vec![
+            KeepoutBox {
+                name: "kb_far_a".into(),
+                min_m: [-0.58, -0.58, 0.62],
+                max_m: [-0.45, -0.45, 0.75],
+            },
+            KeepoutBox {
+                name: "kb_far_b".into(),
+                min_m: [0.45, -0.58, 0.62],
+                max_m: [0.58, -0.45, 0.75],
+            },
+            KeepoutBox {
+                name: "kb_far_c".into(),
+                min_m: [-0.58, 0.45, 0.62],
+                max_m: [-0.45, 0.58, 0.75],
+            },
+            KeepoutBox {
+                name: "kb_mid_gate".into(),
+                min_m: [
+                    (p_mid[0] - 0.02) as f32,
+                    (p_mid[1] - 0.02) as f32,
+                    (p_mid[2] - 0.02) as f32,
+                ],
+                max_m: [
+                    (p_mid[0] + 0.02) as f32,
+                    (p_mid[1] + 0.02) as f32,
+                    (p_mid[2] + 0.02) as f32,
+                ],
+            },
+        ];
+        ws.validate().expect("32 endpoints + 16 capsules + 4 keepout boxes must be legal");
+    }
+
+    // Confirm the configuration genuinely overflows the 256-slot inline stack buffer and 48-geom cap.
+    {
+        let ws = cfg.workspace.as_ref().unwrap();
+        let ev = armd::chain::WorkspaceEvaluator::new(&cfg.arm_model, ws, &cfg.camera_mount);
+        assert!(
+            ev.total_slots > armd::kinematics::MAX_STACK_WORKSPACE_SLOTS,
+            "expected > 256 clearance slots, got {}",
+            ev.total_slots
+        );
+        assert!(
+            cfg.arm_model
+                .workspace_violation_with_tcp(&base_pose, ws, &cfg.camera_mount, cfg.active_tool.tcp_offset_m)
+                .worst
+                .is_none(),
+            "base_pose must be legal"
+        );
+        assert!(
+            cfg.arm_model
+                .workspace_violation_with_tcp(&q_far, ws, &cfg.camera_mount, cfg.active_tool.tcp_offset_m)
+                .worst
+                .is_none(),
+            "q_far must be legal"
+        );
+        assert!(
+            cfg.arm_model
+                .workspace_violation_with_tcp(&q_mid, ws, &cfg.camera_mount, cfg.active_tool.tcp_offset_m)
+                .worst
+                .is_some(),
+            "q_mid must hit kb_mid_gate"
+        );
+    }
+
+    let mut inner = SupervisorInner::new(cfg);
+    inner.tick(0.02);
+    {
+        let s = inner.current_admission_stamp();
+        let a = inner.check_admission(s).unwrap();
+        SupervisorInner::enable_torque(a).expect("arm");
+    }
+    let gen = inner.acquire_lease(CONN).expect("lease");
+    {
+        let s = inner.current_admission_stamp();
+        let a = inner.check_admission(s).unwrap();
+        SupervisorInner::authorize_servo_stream(a, gen).unwrap();
+    }
+    inner.commanded_positions.clone_from(&base_pose);
+    inner.measured_positions.clone_from(&base_pose);
+    inner.target_positions.clone_from(&base_pose);
+    inner.prewarm_rt_buffers();
+
+    let mut obs = ArmObservation::blank_rt();
+    inner.fill_observation(1.0, &mut obs);
+
+    let stream = inner.core.target_authority().stream.expect("authorized");
+    let now = Instant::now();
+    let authority = Authority {
+        lease_generation: gen,
+        epoch: inner.safety.epoch_id(),
+        config_revision: inner.workspace_revision,
+        ..Authority::default()
+    };
+
+    let make_frame = |q_vec: &[f32], seq: u64| {
+        let mut q = [0.0; MAX_DOF];
+        q[..q_vec.len()].copy_from_slice(q_vec);
+        TargetFrame {
+            arm: ArmId::LOCAL,
+            boot: BOOT,
+            stream,
+            seq,
+            authority,
+            policy_generation: 0,
+            input_at: now,
+            vision_at: None,
+            vision_frame_id: None,
+            deadline: now + Duration::from_secs(1),
+            dof: q_vec.len() as u8,
+            q,
+            replaceable: true,
+        }
+    };
+
+    let f_ok = make_frame(&q_ok, 1);
+    let f_mid = make_frame(&q_mid, 2);
+
+    // 1. Valid servo intake + 2. Valid servo step + Step 6 publish (all >256 slots, zero warmup target!).
+    let (intake_ok, allocs1, frees1) = counted(|| {
+        let r = inner.consume_target(&f_ok, &ctx(now));
+        inner.tick_control(0.02);
+        inner.fill_observation(1.02, &mut obs);
+        r
+    });
+    assert!(intake_ok.is_ok(), "valid target on >256-slot workspace must apply: {intake_ok:?}");
+    assert_eq!(
+        (allocs1, frees1),
+        (0, 0),
+        "valid servo intake + step + publish on >256-slot workspace must not touch the allocator"
+    );
+    assert!(
+        inner.servo_ws_min_depths.as_ref().is_some_and(|(_, b)| b.is_heap()),
+        "expected heap-backed preallocated min_depths SlotBuf for >256-slot workspace"
+    );
+
+    // 3. Workspace refusal on intake (`consume_target` -> `WORKSPACE_VIOLATION`): zero alloc / zero free.
+    let (intake_err, allocs2, frees2) = counted(|| inner.consume_target(&f_mid, &ctx(now)).unwrap_err());
+    assert_eq!(intake_err.code, "WORKSPACE_VIOLATION");
+    assert_eq!(
+        (allocs2, frees2),
+        (0, 0),
+        "workspace refusal on RT servo intake must not touch the allocator"
+    );
+
+    // 4. In-motion keep-out sweep refusal (`enter_servo_keepout_hold_rt`) + Step 6 publish of
+    //    `obs.workspace_violation`: zero alloc / zero free!
+    let sweep_frames: Vec<TargetFrame> = (3..303u64).map(|seq| make_frame(&q_far, seq)).collect();
+    let f_after_stop = make_frame(&q_ok, 400);
+    let (hit_keepout, allocs3, frees3) = counted(|| {
+        let mut violated = false;
+        for (step, sf) in sweep_frames.iter().enumerate() {
+            let _ = inner.consume_target(sf, &ctx(now));
+            inner.tick_control(0.02);
+            inner.fill_observation(1.04 + 0.02 * (step as f64), &mut obs);
+            if inner.workspace_violation.is_some() {
+                violated = true;
+                break;
+            }
+        }
+        violated
+    });
+    assert!(
+        hit_keepout,
+        "sweeping across kb_mid_gate must trigger enter_servo_keepout_hold_rt (cmd={:?}, target={:?}, motion_limit={:?}, blocked={}, safety={:?})",
+        inner.commanded_positions,
+        inner.servo_target,
+        inner.motion_limit,
+        inner.servo_blocked_hold,
+        inner.safety.state(),
+    );
+    assert_eq!(
+        (allocs3, frees3),
+        (0, 0),
+        "in-motion keep-out refusal + Step 6 workspace_violation publish must not touch the allocator"
+    );
+    let published_v = obs
+        .workspace_violation
+        .as_ref()
+        .expect("Step 6 observation must carry workspace_violation");
+    assert_eq!(published_v.violation_phase.as_deref(), Some("servo_step"));
+    assert!(
+        published_v
+            .constraint_id
+            .as_deref()
+            .is_some_and(|c| c.contains("kb_mid_gate")),
+        "expected kb_mid_gate in published workspace_violation: {published_v:?}"
+    );
+
+    // 5. Stop + clear violation + follow-up servo target & step: zero alloc / zero free!
+    let (after_ok, allocs4, frees4) = counted(|| {
+        inner.stop_motion();
+        inner.clear_workspace_violation_rt();
+        inner.fill_observation(3.0, &mut obs);
+        let r = inner.consume_target(&f_after_stop, &ctx(now));
+        inner.tick_control(0.02);
+        inner.fill_observation(3.02, &mut obs);
+        r
+    });
+    assert!(after_ok.is_ok(), "post-stop servo target must apply: {after_ok:?}");
+    assert!(obs.workspace_violation.is_none());
+    assert_eq!(
+        (allocs4, frees4),
+        (0, 0),
+        "stop + clear workspace_violation + follow-up servo step must not touch the allocator"
+    );
+}
