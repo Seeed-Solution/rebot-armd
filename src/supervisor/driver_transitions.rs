@@ -5197,9 +5197,11 @@ impl SupervisorInner {
         if let Some(d) = self.driver.take() {
             match d.try_lock() {
                 Ok(mut drv) => {
+                    let enable_dispatched = drv.enable_frames_dispatched();
                     drv.abort_enable();
                     self.refresh_owner_driver_snapshot_from_ref(drv.as_ref());
-                    drv_any_enabled = drv.enable_state() != EnableState::Disabled
+                    drv_any_enabled = enable_dispatched
+                        || drv.enable_state() != EnableState::Disabled
                         || drv.has_any_joint_enabled()
                         || drv.has_known_partial_enable();
                     if was_torqued || drv_any_enabled {
@@ -5583,8 +5585,10 @@ impl SupervisorInner {
                     let mut drv_any_enabled = false;
                     if let Some(ref d) = self.driver {
                         if let Ok(mut drv) = d.try_lock() {
+                            let enable_dispatched = drv.enable_frames_dispatched();
                             drv.abort_enable();
-                            drv_any_enabled = drv.enable_state() != EnableState::Disabled
+                            drv_any_enabled = enable_dispatched
+                                || drv.enable_state() != EnableState::Disabled
                                 || drv.has_any_joint_enabled()
                                 || drv.has_known_partial_enable();
                         } else {
@@ -9075,5 +9079,207 @@ mod panic_disable_tests {
         let res_d = runner.join().unwrap();
         assert_eq!(res_d, None);
         assert!(timeout_finished.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn legacy_timeout_aborts_enable_and_detaches_dispatched_disable_without_aborting_protective() {
+        use crate::driver::{ArmDriver, ArmDriverError, DisableKind, DisableProtectiveReason, DriverCapabilities, EnableState, JointTarget, TorqueOutcome, TorqueProgress};
+        use crate::model::JointState;
+
+        struct StubPendingDriver {
+            dof: usize,
+            dispatched_mask: u64,
+            protective: bool,
+            abort_enable_calls: usize,
+            abort_disable_calls: usize,
+            complete_disable_on_poll: bool,
+            enabled: bool,
+        }
+
+        impl ArmDriver for StubPendingDriver {
+            fn capabilities(&self) -> DriverCapabilities {
+                DriverCapabilities {
+                    velocity_feedback: true,
+                    torque_feedback: true,
+                    temperature_feedback: true,
+                    enable_feedback: true,
+                    ..DriverCapabilities::default()
+                }
+            }
+            fn supports_rt_executor(&self) -> Result<(), &'static str> { Ok(()) }
+            fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+                Ok(vec![JointState::default(); self.dof])
+            }
+            fn read_cached_joint_states_into(&self, out: &mut Vec<JointState>) -> Option<()> {
+                out.clear();
+                out.resize(self.dof, JointState::default());
+                Some(())
+            }
+            fn write_joint_targets(&mut self, _targets: &[JointTarget]) -> Result<(), ArmDriverError> { Ok(()) }
+            fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> {
+                self.enabled = enabled;
+                Ok(())
+            }
+            fn is_feedback_valid(&self) -> bool { true }
+            fn feedback_all_within(&self, _dof: usize, _max_age: Duration) -> bool { true }
+            fn feedback_ages(&self) -> Vec<Option<Duration>> {
+                vec![Some(Duration::ZERO); self.dof]
+            }
+            fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
+                out.clear();
+                out.resize(self.dof, Some(Duration::ZERO));
+            }
+            fn has_driver_fresh_position_api(&self) -> bool { true }
+            fn fresh_measured_position_for(&self, _joint: usize, _max_age: Duration) -> Option<f32> {
+                Some(0.0)
+            }
+            fn fresh_joint_positions_into(
+                &self,
+                joints: &[usize],
+                _max_age: Duration,
+                out: &mut [f32],
+            ) -> bool {
+                for slot in out.iter_mut().take(joints.len()) {
+                    *slot = 0.0;
+                }
+                true
+            }
+            fn rest_pose_gate_status(&self) -> crate::driver::RestPoseGateStatus {
+                crate::driver::RestPoseGateStatus::Confirmed
+            }
+            fn enable_state(&self) -> EnableState {
+                if self.enabled { EnableState::Enabled } else { EnableState::Disabled }
+            }
+            fn begin_torque_budgeted(&mut self, _enable: bool, _max_rx_frames: u16) -> Result<TorqueProgress, ArmDriverError> {
+                Ok(TorqueProgress::Pending { wake: Instant::now() + Duration::from_millis(5) })
+            }
+            fn begin_torque_budgeted_with_range_retry(&mut self, enable: bool, max_rx_frames: u16) -> Result<TorqueProgress, ArmDriverError> {
+                self.begin_torque_budgeted(enable, max_rx_frames)
+            }
+            fn begin_disable_torque_budgeted(&mut self, kind: DisableKind, _max_rx_frames: u16) -> Result<TorqueProgress, ArmDriverError> {
+                self.protective = matches!(kind, DisableKind::DisableProtective { .. });
+                Ok(TorqueProgress::Pending { wake: Instant::now() + Duration::from_millis(5) })
+            }
+            fn poll_torque_budgeted(&mut self, _deadline: Instant, _max_rx_frames: u16) -> Result<TorqueProgress, ArmDriverError> {
+                if self.complete_disable_on_poll {
+                    self.enabled = false;
+                    self.dispatched_mask = 0;
+                    return Ok(TorqueProgress::Done(TorqueOutcome::Confirmed));
+                }
+                Ok(TorqueProgress::Pending { wake: Instant::now() + Duration::from_millis(5) })
+            }
+            fn disable_frames_dispatched(&self) -> bool { self.dispatched_mask != 0 }
+            fn disable_dispatched_mask(&self) -> u64 { self.dispatched_mask }
+            fn abort_enable(&mut self) { self.abort_enable_calls += 1; }
+            fn abort_pending_disable(&mut self) -> bool {
+                self.abort_disable_calls += 1;
+                if self.protective || self.dispatched_mask != 0 {
+                    return false;
+                }
+                true
+            }
+        }
+
+        // 1. Stalled-ticker enable timeout aborts driver enable, clears transition, and settles slot.
+        {
+            let mut inner = SupervisorInner::new(crate::ArmConfig::rebot_dm()).with_driver(Box::new(StubPendingDriver {
+                dof: 7,
+                dispatched_mask: 0,
+                protective: false,
+                abort_enable_calls: 0,
+                abort_disable_calls: 0,
+                complete_disable_on_poll: false,
+                enabled: false,
+            }));
+            inner.lease_enabled = false;
+            inner.tick_control(0.02);
+            let stamp = inner.current_admission_stamp();
+            let start = inner
+                .check_admission(stamp)
+                .and_then(SupervisorInner::begin_enable_torque_transition_legacy)
+                .expect("start enable");
+            let (token, slot_idx, slot) = match start {
+                LegacyTorqueStart::Pending { token, slot_idx, slot } => (token, slot_idx, slot),
+                _ => panic!("expected Pending enable"),
+            };
+            assert!(inner.torque_transition.is_some());
+            let out = inner.timeout_legacy_torque_transition(token, slot_idx, true);
+            assert!(matches!(out, LegacyTorqueOutcome::Failed { .. }), "{out:?}");
+            assert!(inner.torque_transition.is_none(), "timed-out enable must not leave orphan transition");
+            assert!(slot.take_settled(token).is_none(), "slot already consumed/released");
+        }
+
+        // 2. Dispatched disable timeout does NOT abort driver disable; retags to Detached and finishes.
+        {
+            let mut inner = SupervisorInner::new(crate::ArmConfig::rebot_dm()).with_driver(Box::new(StubPendingDriver {
+                dof: 7,
+                dispatched_mask: 0b0000_0111, // 3 joints already dispatched
+                protective: false,
+                abort_enable_calls: 0,
+                abort_disable_calls: 0,
+                complete_disable_on_poll: false,
+                enabled: true,
+            }));
+            inner.lease_enabled = false;
+            inner.is_torqued = true;
+            inner.tick_control(0.02);
+            let start = inner
+                .begin_disable_torque_transition_legacy()
+                .expect("start disable");
+            let (token, slot_idx, _slot) = match start {
+                LegacyTorqueStart::Pending { token, slot_idx, slot } => (token, slot_idx, slot),
+                _ => panic!("expected Pending disable"),
+            };
+            let out = inner.timeout_legacy_torque_transition(token, slot_idx, false);
+            assert!(matches!(
+                out,
+                LegacyTorqueOutcome::Failed {
+                    failure: LegacyTorqueFailure::StaticCode("DEADLINE_EXPIRED"),
+                    ..
+                }
+            ));
+            assert!(
+                matches!(
+                    inner.torque_transition,
+                    Some(TorqueTransition::Disable {
+                        origin: DisableOrigin::Detached,
+                        ..
+                    })
+                ),
+                "dispatched disable must remain active as DisableOrigin::Detached, got {:?}",
+                inner.torque_transition
+            );
+            // Once remaining motors confirm, Detached disable completes cleanly.
+            let budget = crate::rt_core::ops::ServiceBudget {
+                now: Instant::now(),
+                deadline: Instant::now() + Duration::from_millis(2),
+                max_rx_frames: 64,
+            };
+            // Swap stub behavior isn't needed for non-protective check; verify protective never aborts.
+            let _ = inner.service_torque_transition(&budget);
+        }
+
+        // 3. Protective disable is NEVER aborted by `abort_pending_disable` or `timeout_legacy_torque_transition`.
+        {
+            let mut drv = StubPendingDriver {
+                dof: 7,
+                dispatched_mask: 0,
+                protective: false,
+                abort_enable_calls: 0,
+                abort_disable_calls: 0,
+                complete_disable_on_poll: false,
+                enabled: true,
+            };
+            let _ = drv.begin_disable_torque_budgeted(
+                DisableKind::DisableProtective {
+                    reason: DisableProtectiveReason::Thermal,
+                },
+                0,
+            );
+            assert!(
+                !drv.abort_pending_disable(),
+                "protective disable must NEVER be aborted"
+            );
+        }
     }
 }

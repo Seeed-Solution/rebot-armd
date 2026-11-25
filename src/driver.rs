@@ -1571,6 +1571,13 @@ pub trait ArmDriver: Send {
     /// (called when E-stop or a fault intervenes mid-enable).
     fn abort_enable(&mut self) {}
 
+    /// True if any enable command frame (`CMD_ENABLE`) has already been transmitted for the
+    /// active enable handshake or any joint is known enabled. False while the handshake is still
+    /// in pre-enable validation/drain phases before transmitting enable frames.
+    fn enable_frames_dispatched(&self) -> bool {
+        self.has_any_joint_enabled() || self.has_known_partial_enable()
+    }
+
     /// Aborts a pending non-protective disable handshake ONLY if no disable frame has been
     /// transmitted yet (`!disable_frames_dispatched()`). Returns `true` when aborted or idle,
     /// and `false` when disable frames have already been dispatched or the disable is protective
@@ -13449,12 +13456,21 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         if self.torque_hs.as_ref().is_some_and(|hs| {
             !matches!(hs, DamiaoTorque::Disable { .. } | DamiaoTorque::AwaitRestGate { .. })
         }) {
-            if matches!(self.torque_hs, Some(DamiaoTorque::DrainBeforeEnable(_))) {
+            if matches!(
+                self.torque_hs,
+                Some(DamiaoTorque::DrainBeforeEnable(_) | DamiaoTorque::RangeCheck(_))
+            ) {
                 self.awaiting_rx_boundary = false;
             }
             self.torque_hs = None;
             self.enable_failed();
         }
+    }
+
+    fn enable_frames_dispatched(&self) -> bool {
+        matches!(self.torque_hs, Some(DamiaoTorque::Enable { .. }))
+            || self.has_any_joint_enabled()
+            || self.has_known_partial_enable()
     }
 
     fn panic_disable_step(

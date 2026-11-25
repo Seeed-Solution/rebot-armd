@@ -405,6 +405,7 @@ impl ArmDriver for ZeroOffsetDriver {
     fn disable_dispatched_mask(&self) -> u64 { self.inner.disable_dispatched_mask() }
     fn finish_dispatched_disable(&mut self) -> Result<(), ArmDriverError> { self.inner.finish_dispatched_disable() }
     fn abort_enable(&mut self) { self.inner.abort_enable() }
+    fn enable_frames_dispatched(&self) -> bool { self.inner.enable_frames_dispatched() }
     fn abort_pending_disable(&mut self) -> bool { self.inner.abort_pending_disable() }
     fn panic_disable_step(&mut self, first: bool, deadline: Instant) -> Option<Result<Vec<usize>, ArmDriverError>> {
         self.inner.panic_disable_step(first, deadline)
