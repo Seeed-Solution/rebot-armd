@@ -1,0 +1,19 @@
+{
+  "name": "thermal_preempts_enable_with_damping",
+  "description": "Minimized race: thermal trip preempts ReadyToSwitchOn, runs configured MIT kd-only damping for 40 ms, then dispatches DisableProtective.",
+  "topology": {
+    "kind": "single_arm",
+    "joints": 1,
+    "damping_duration_us": 40000,
+    "impedance_mode": true
+  },
+  "events": [
+    { "type": "mode_verified", "channel": 0, "mode": "impedance", "now_us": 0 },
+    { "type": "enable_start", "group": 0, "now_us": 0 },
+    { "type": "thermal", "channel": 0, "temperature_c": 72.0, "now_us": 10000 },
+    { "type": "release", "now_us": 30000 },
+    { "type": "release", "now_us": 50000 }
+  ],
+  "expected_group_intents": ["on"],
+  "expected_group_states": ["protective_disabling"]
+}

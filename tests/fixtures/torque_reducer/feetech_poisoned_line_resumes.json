@@ -1,0 +1,47 @@
+{
+  "name": "feetech_poisoned_line_resumes",
+  "description": "Minimized Feetech trace: serial timeout poisons the line for 20 ms of silence; after silence completes, 3 fresh releases authorize disable.",
+  "topology": {
+    "kind": "single_arm",
+    "joints": 1,
+    "poison_silence_us": 20000
+  },
+  "events": [
+    { "type": "mode_verified", "channel": 0, "mode": "position_velocity", "now_us": 0 },
+    { "type": "enable_start", "group": 0, "now_us": 0 },
+    { "type": "handshake_result", "group": 0, "now_us": 1, "confirmed_mask": 1, "outcome": "confirmed" },
+    { "type": "disable_request", "group": 0, "now_us": 1, "explicit_release_authorized": false, "recipient_mask_override": null },
+    { "type": "serial_timeout", "device": 0, "now_us": 10000 },
+    { "type": "release", "now_us": 20000 },
+    { "type": "causal_sample", "channel": 0, "sample_id": 1, "rx_timestamp_us": 20000, "now_us": 20000, "clock_offset_drift_us": 0, "position_rad": 0.0, "velocity_rad_s": 0.0, "temperature_c": null, "reported_enabled": null, "correlated_after_write_done_us": null, "release_evidence": null, "is_handshake_ack_only": false },
+    { "type": "release", "now_us": 40000 },
+    { "type": "causal_sample", "channel": 0, "sample_id": 2, "rx_timestamp_us": 40000, "now_us": 40000, "clock_offset_drift_us": 0, "position_rad": 0.0, "velocity_rad_s": 0.0, "temperature_c": null, "reported_enabled": null, "correlated_after_write_done_us": null, "release_evidence": null, "is_handshake_ack_only": false },
+    { "type": "release", "now_us": 50000 },
+    { "type": "causal_sample", "channel": 0, "sample_id": 3, "rx_timestamp_us": 50000, "now_us": 50000, "clock_offset_drift_us": 0, "position_rad": 0.0, "velocity_rad_s": 0.0, "temperature_c": null, "reported_enabled": null, "correlated_after_write_done_us": null, "release_evidence": null, "is_handshake_ack_only": false },
+    { "type": "release", "now_us": 60000 },
+    { "type": "causal_sample", "channel": 0, "sample_id": 4, "rx_timestamp_us": 60000, "now_us": 60000, "clock_offset_drift_us": 0, "position_rad": 0.0, "velocity_rad_s": 0.0, "temperature_c": null, "reported_enabled": null, "correlated_after_write_done_us": null, "release_evidence": null, "is_handshake_ack_only": false },
+    {
+      "type": "write_result",
+      "group": 0,
+      "device": 0,
+      "kind": "disable_requested",
+      "generation": 0,
+      "write_done_us": 60500,
+      "now_us": 60500,
+      "target_mask": 1,
+      "outcomes": [
+        "sent",
+        "not_targeted", "not_targeted", "not_targeted", "not_targeted",
+        "not_targeted", "not_targeted", "not_targeted", "not_targeted",
+        "not_targeted", "not_targeted", "not_targeted", "not_targeted",
+        "not_targeted", "not_targeted", "not_targeted", "not_targeted",
+        "not_targeted", "not_targeted", "not_targeted", "not_targeted",
+        "not_targeted", "not_targeted", "not_targeted", "not_targeted",
+        "not_targeted", "not_targeted", "not_targeted", "not_targeted",
+        "not_targeted", "not_targeted", "not_targeted"
+      ]
+    }
+  ],
+  "expected_group_intents": ["off"],
+  "expected_group_states": ["quick_stop_active"]
+}

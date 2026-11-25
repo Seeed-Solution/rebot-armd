@@ -1,0 +1,14 @@
+{
+  "name": "enable_interrupted_by_failed_park",
+  "description": "Auto-shrunk from model test seq=203: ParkSettled(succeeded=false) while ReadyToSwitchOn must enter FailedHold + ENABLE_FAILED without rollback.",
+  "topology": {
+    "kind": "single_arm",
+    "joints": 1
+  },
+  "events": [
+    { "type": "enable_start", "group": 0, "now_us": 0 },
+    { "type": "park_settled", "group": 0, "succeeded": false, "now_us": 0 }
+  ],
+  "expected_group_intents": ["on"],
+  "expected_group_states": ["failed_hold"]
+}

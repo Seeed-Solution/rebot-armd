@@ -1,0 +1,15 @@
+{
+  "name": "handshake_ack_after_enable_expiry",
+  "description": "Auto-shrunk from model test seq=9708: a late handshake-only ACK arriving past the enable deadline fails into FailedHold and expires stale captures without treating the ACK as position evidence.",
+  "topology": {
+    "kind": "single_arm",
+    "joints": 1
+  },
+  "events": [
+    { "type": "enable_start", "group": 0, "now_us": 0 },
+    { "type": "causal_sample", "channel": 0, "sample_id": 1, "rx_timestamp_us": 0, "now_us": 0, "clock_offset_drift_us": 0, "position_rad": 0.0, "velocity_rad_s": 0.0, "temperature_c": null, "reported_enabled": true, "correlated_after_write_done_us": null, "release_evidence": "unknown", "is_handshake_ack_only": false },
+    { "type": "causal_sample", "channel": 0, "sample_id": 2, "rx_timestamp_us": 500000, "now_us": 500000, "clock_offset_drift_us": 0, "position_rad": 0.0, "velocity_rad_s": 0.0, "temperature_c": null, "reported_enabled": true, "correlated_after_write_done_us": null, "release_evidence": "verified_empty_grasp", "is_handshake_ack_only": true }
+  ],
+  "expected_group_intents": ["on"],
+  "expected_group_states": ["failed_hold"]
+}
