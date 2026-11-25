@@ -2838,7 +2838,17 @@ impl<T: Transport> FeetechArmDriver<T> {
                     let now = self.clock_now();
                     let mut outcomes = [crate::torque::MotorWriteOutcome::NotTargeted;
                         crate::torque::MAX_CHANNELS];
-                    outcomes[idx] = crate::torque::MotorWriteOutcome::Failed;
+                    outcomes[idx] = if matches!(
+                        e,
+                        TransportError::WouldBlock | TransportError::NoBufferSpace
+                    ) || matches!(
+                        &e,
+                        TransportError::Io(io) if io.kind() == std::io::ErrorKind::WouldBlock
+                    ) {
+                        crate::torque::MotorWriteOutcome::Deferred
+                    } else {
+                        crate::torque::MotorWriteOutcome::Failed
+                    };
                     let wk = match kind {
                         DisableKind::DisableRequested { .. } => {
                             crate::torque::WriteKind::DisableRequested
@@ -5484,7 +5494,17 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                         let now = self.clock_now();
                         let mut outcomes = [crate::torque::MotorWriteOutcome::NotTargeted;
                             crate::torque::MAX_CHANNELS];
-                        outcomes[idx] = crate::torque::MotorWriteOutcome::Failed;
+                        outcomes[idx] = if matches!(
+                            e,
+                            TransportError::WouldBlock | TransportError::NoBufferSpace
+                        ) || matches!(
+                            &e,
+                            TransportError::Io(io) if io.kind() == std::io::ErrorKind::WouldBlock
+                        ) {
+                            crate::torque::MotorWriteOutcome::Deferred
+                        } else {
+                            crate::torque::MotorWriteOutcome::Failed
+                        };
                         self.shadow_staging.push(
                             crate::torque::shadow::ShadowDriverObs::WriteResult {
                                 device: 0,

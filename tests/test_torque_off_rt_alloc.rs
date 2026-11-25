@@ -1989,4 +1989,28 @@ fn rt_torque_off_shadow_on_ring_saturation_and_staging_overflow_zero_allocs() {
         "1120 staged frames into 1024-slot buffer must report >= 80 dropped, got {}",
         res.1.1
     );
+
+    // 4. Hard-RT teardown proof: dropping BOTH `ShadowDriverStaging` and `ShadowRuntime` on
+    //    `armd-control` (`ControlThreadGuard`) MUST perform strictly (0, 0) heap ops (both
+    //    boxes retire lock-free off-thread and are reclaimed by the comparator worker).
+    let (td_rt, td_hub) = armd::torque::shadow::ShadowRuntime::new_with_hub(
+        &ArmConfig::rebot_dm(),
+        true,
+        armd::torque::VendorKind::Damiao,
+        true,
+        None,
+    );
+    td_hub.start_worker().unwrap();
+    let td_staging = armd::torque::shadow::ShadowDriverStaging::new(true);
+    let (_, a_td, f_td) = counted(|| {
+        let _rt_guard = armd::rt_core::executor::ControlThreadGuard::enter();
+        drop(td_staging);
+        drop(td_rt);
+    });
+    assert_eq!(
+        (a_td, f_td),
+        (0, 0),
+        "armd-control teardown dropping ShadowDriverStaging and ShadowRuntime must perform (0, 0) heap ops"
+    );
+    td_hub.stop_and_flush_bounded(Duration::from_secs(1));
 }

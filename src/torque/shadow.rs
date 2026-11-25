@@ -3557,10 +3557,7 @@ impl TorqueShadowConsumer {
                     };
                 }
             }
-            if live.live_partial_disable
-                && pred.disable_completed
-                && !pred.disable_partial
-            {
+            if pred.disable_completed && live.live_partial_disable != pred.disable_partial {
                 self.push_divergence(
                     ShadowDivergenceEntry {
                         seq: rec.seq,
@@ -3568,8 +3565,10 @@ impl TorqueShadowConsumer {
                         now_us: rec.now_us,
                         owner: rec.owner,
                         category: DivergenceCategory::OutcomeRefusalMismatch,
-                        detail: "live partial disable disagreed with non-partial reducer completion"
-                            .into(),
+                        detail: format!(
+                            "disable partiality mismatch: live_partial={} pred_partial={}",
+                            live.live_partial_disable, pred.disable_partial
+                        ),
                         violation: None,
                         coverage_gap: None,
                         reviewed_pr2: None,

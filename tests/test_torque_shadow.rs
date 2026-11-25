@@ -1687,13 +1687,15 @@ fn blackbox_slow_shadow_sink_never_displaces_primary_bb_jsonl() {
     }
 
     // While the shadow sink is deterministically blocked:
-    // 1. Live owner switch (`set_owner`) and HTTP diagnostics (`snapshot`) MUST complete immediately!
+    // 1. Live owner switch (`set_owner`), driver re-install (`reinit_for_driver`), and
+    //    diagnostics (`snapshot`) MUST complete immediately without blocking on stalled shadow I/O!
     let t_nonblock = Instant::now();
     hub.set_owner(ShadowOwner::Executor);
+    rt.reinit_for_driver(&cfg, VendorKind::Damiao, None);
     let snap_while_blocked = hub.snapshot();
     assert!(
         t_nonblock.elapsed() < Duration::from_millis(50),
-        "set_owner and snapshot must never block on stalled shadow disk I/O"
+        "set_owner, reinit_for_driver, and snapshot must never block on stalled shadow disk I/O"
     );
     assert_eq!(snap_while_blocked.owner, ShadowOwner::Executor);
 
