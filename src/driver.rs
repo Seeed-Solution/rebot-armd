@@ -7692,6 +7692,12 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     /// Per-axis causal confirmation that a fresh `state == 0` reply arrived after the axis's
     /// flushed `panic_disable_step` `CMD_DISABLE` transmission.
     panic_disable_confirmed: Vec<bool>,
+    /// True while `probe_hardware_disarmed_until` is actively polling read-only `0xCC` status.
+    disarm_probe_active: bool,
+    /// First non-disabled (`state != 0`) post-boundary feedback observed during an active
+    /// `probe_hardware_disarmed_until` pass so a later `state == 0` frame in the same RX batch
+    /// cannot mask an enabled or faulted reply.
+    disarm_probe_adverse: Option<(usize, u8)>,
     /// MIT tracking deadline fence (`set_mit_deadline_fence`); None = off (unchanged behaviour).
     mit_fence: Option<Duration>,
     /// Per joint: when its last confirmed command started out (the earliest frame of it, never
@@ -8875,6 +8881,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             panic_disable_active: false,
             panic_disable_tx_boundary: vec![None; dof],
             panic_disable_confirmed: vec![false; dof],
+            disarm_probe_active: false,
+            disarm_probe_adverse: None,
             rx_empty_seq: 0,
             last_read_drained: false,
             mit_fence: None,
@@ -16533,16 +16541,54 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         let hard_wall = now_wall + budget;
         const PROBE_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 
-        // Fence any undrained pre-probe RX frames and drain to an observed-empty RX boundary
-        // BEFORE capturing each axis's causal `0xCC` transmit boundary.
-        if !self.last_read_drained {
-            self.awaiting_rx_boundary = true;
-        }
+        let log_unconfirmed_axes = |drv: &Self, boundaries: &[Option<(u64, Instant)>; MAX_MODE_JOINTS]| {
+            for (i, boundary) in boundaries.iter().enumerate().take(n) {
+                let fresh_reply = boundary.is_some_and(|(p_seq, p_at)| {
+                    drv.last_feedback_seq[i] > p_seq
+                        && drv.last_feedback_instant[i].is_some_and(|t| {
+                            t >= p_at && drv.since(t) <= DAMIAO_FEEDBACK_VALID_WINDOW
+                        })
+                });
+                let id = drv.motor_ids[i];
+                if !fresh_reply {
+                    tracing::warn!(
+                        "Shutdown disarm proof unconfirmed: Damiao joint J{} (CAN ID 0x{:X}) did not reply to read-only 0xCC poll within {} ms",
+                        i + 1,
+                        id,
+                        budget.as_millis()
+                    );
+                } else if drv.motor_status[i] == 1 {
+                    tracing::warn!(
+                        "Shutdown disarm proof refused: Damiao joint J{} (CAN ID 0x{:X}) replied enabled (state=1)",
+                        i + 1,
+                        id
+                    );
+                } else if drv.motor_status[i] != 0 || !drv.motor_disarmed_after_enable[i] {
+                    tracing::warn!(
+                        "Shutdown disarm proof unconfirmed: Damiao joint J{} (CAN ID 0x{:X}) state=0x{:X}, disarmed_after_enable={}",
+                        i + 1,
+                        id,
+                        drv.motor_status[i],
+                        drv.motor_disarmed_after_enable[i]
+                    );
+                }
+            }
+        };
+
+        let mut probe_tx_boundary: [Option<(u64, Instant)>; MAX_MODE_JOINTS] =
+            [None; MAX_MODE_JOINTS];
+
+        // ALWAYS fence and drain to a fresh observed-empty RX boundary IMMEDIATELY before
+        // transmitting `0xCC` polls — NEVER reuse `last_read_drained` from an earlier tick, so
+        // pre-poll frames sitting in the RX queue are discarded before causal boundaries are armed.
+        self.last_read_drained = false;
+        self.awaiting_rx_boundary = true;
         while !self.last_read_drained {
             if self.now() >= drv_deadline || Instant::now() >= hard_wall {
                 tracing::warn!(
                     "Shutdown disarm proof refused: could not establish empty RX boundary before deadline"
                 );
+                log_unconfirmed_axes(self, &probe_tx_boundary);
                 return false;
             }
             self.last_poll_rx = None;
@@ -16554,10 +16600,11 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
         self.awaiting_rx_boundary = false;
 
-        let mut probe_tx_boundary: [Option<(u64, Instant)>; MAX_MODE_JOINTS] =
-            [None; MAX_MODE_JOINTS];
+        self.disarm_probe_adverse = None;
+        self.disarm_probe_active = true;
         let mut next_tx_at = self.now();
         let mut first_pass = true;
+        let mut confirmed = false;
 
         loop {
             let now_drv = self.now();
@@ -16632,6 +16679,29 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             self.rx_deadline = None;
             self.rx_frame_limit = None;
 
+            // Preserve any adverse (enabled/faulted) frame observed anywhere inside the RX batch so
+            // a subsequent `state == 0` frame in the same batch can never mask it.
+            if let Some((bad_idx, bad_st)) = self.disarm_probe_adverse {
+                let id = self.motor_ids[bad_idx];
+                if bad_st == 1 {
+                    tracing::warn!(
+                        "Shutdown disarm proof refused: Damiao joint J{} (CAN ID 0x{:X}) replied enabled (state=1)",
+                        bad_idx + 1,
+                        id
+                    );
+                } else {
+                    tracing::warn!(
+                        "Shutdown disarm proof refused: Damiao joint J{} (CAN ID 0x{:X}) replied non-disabled (state=0x{:X})",
+                        bad_idx + 1,
+                        id,
+                        bad_st
+                    );
+                }
+                self.disarm_probe_active = false;
+                self.disarm_probe_adverse = None;
+                return false;
+            }
+
             let mut all_post_probe_disarmed = true;
             for (i, boundary) in probe_tx_boundary.iter().enumerate().take(n) {
                 let fresh_reply = boundary.is_some_and(|(p_seq, p_at)| {
@@ -16651,6 +16721,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         i + 1,
                         self.motor_ids[i]
                     );
+                    self.disarm_probe_active = false;
+                    self.disarm_probe_adverse = None;
                     return false;
                 }
                 if st != 0 {
@@ -16660,11 +16732,18 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         self.motor_ids[i],
                         st
                     );
+                    self.disarm_probe_active = false;
+                    self.disarm_probe_adverse = None;
                     return false;
                 }
             }
+            // Enforce caller wall and driver deadlines BEFORE accepting proof.
+            if self.now() >= drv_deadline || Instant::now() >= hard_wall {
+                break;
+            }
             if all_post_probe_disarmed && self.is_hardware_disarmed_confirmed() {
-                return true;
+                confirmed = true;
+                break;
             }
 
             let rem_drv = drv_deadline.saturating_duration_since(self.now());
@@ -16676,37 +16755,12 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             self.pause(rem.min(Duration::from_millis(2)));
         }
 
-        for (i, boundary) in probe_tx_boundary.iter().enumerate().take(n) {
-            let fresh_reply = boundary.is_some_and(|(p_seq, p_at)| {
-                self.last_feedback_seq[i] > p_seq
-                    && self.last_feedback_instant[i].is_some_and(|t| {
-                        t >= p_at && self.since(t) <= DAMIAO_FEEDBACK_VALID_WINDOW
-                    })
-            });
-            let id = self.motor_ids[i];
-            if !fresh_reply {
-                tracing::warn!(
-                    "Shutdown disarm proof unconfirmed: Damiao joint J{} (CAN ID 0x{:X}) did not reply to read-only 0xCC poll within {} ms",
-                    i + 1,
-                    id,
-                    budget.as_millis()
-                );
-            } else if self.motor_status[i] == 1 {
-                tracing::warn!(
-                    "Shutdown disarm proof refused: Damiao joint J{} (CAN ID 0x{:X}) replied enabled (state=1)",
-                    i + 1,
-                    id
-                );
-            } else if self.motor_status[i] != 0 || !self.motor_disarmed_after_enable[i] {
-                tracing::warn!(
-                    "Shutdown disarm proof unconfirmed: Damiao joint J{} (CAN ID 0x{:X}) state=0x{:X}, disarmed_after_enable={}",
-                    i + 1,
-                    id,
-                    self.motor_status[i],
-                    self.motor_disarmed_after_enable[i]
-                );
-            }
+        self.disarm_probe_active = false;
+        self.disarm_probe_adverse = None;
+        if confirmed {
+            return true;
         }
+        log_unconfirmed_axes(self, &probe_tx_boundary);
         false
     }
 
@@ -20730,6 +20784,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     } else {
                         self.motor_disarmed_after_enable[idx] = false;
                         self.panic_disable_confirmed[idx] = false;
+                        if self.disarm_probe_active && self.disarm_probe_adverse.is_none() {
+                            self.disarm_probe_adverse = Some((idx, feedback.state_or_error));
+                        }
                     }
                 }
                 let mut window_offset_drifted = false;

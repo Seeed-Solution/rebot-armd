@@ -10145,7 +10145,8 @@ fn control_thread_main_inner(
         let explicit_dl = lifecycle
             .safe_hold
             .process_exit_requested()
-            .then(|| lifecycle.safe_hold.process_exit_deadline());
+            .then(|| lifecycle.safe_hold.process_exit_deadline())
+            .or_else(|| lifecycle.teardown_deadline());
         // If the arm was never enabled / is already idle & disarmed, actively obtain read-only
         // `0xCC` disarm proof within a bounded share of the ProcessExit deadline so we confirm
         // physical disarm cleanly without sending unnecessary torque-off frames (and if any axis

@@ -23,6 +23,7 @@ use mit_support::FakeBus;
 use tracing_subscriber::fmt::MakeWriter;
 
 static LOG_BUF: OnceLock<Arc<Mutex<String>>> = OnceLock::new();
+static LOG_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Clone)]
 struct SharedLogWriter(Arc<Mutex<String>>);
@@ -360,6 +361,7 @@ async fn executor_cold_boot_never_enabled_sigterm_and_stop_and_join_clean_under_
         })
         .await;
 
+        let _log_guard = LOG_TEST_LOCK.lock().await;
         let _ = take_logs();
         let obs_before = sup.get_observation().await;
         assert_eq!(obs_before.safety_state, SafetyState::Idle);
@@ -639,6 +641,7 @@ async fn executor_enabled_status_polls_retain_driver_and_refuse_shutdown() {
     })
     .await;
 
+    let _log_guard = LOG_TEST_LOCK.lock().await;
     let _ = take_logs();
     let deadline = Instant::now() + armd::supervisor::PANIC_DISABLE_TIMEOUT + Duration::from_millis(100);
     assert!(
@@ -711,6 +714,7 @@ async fn executor_silent_axis_retained_with_axis_named() {
     })
     .await;
 
+    let _log_guard = LOG_TEST_LOCK.lock().await;
     let _ = take_logs();
     let t0 = Instant::now();
     let deadline = t0 + armd::supervisor::PANIC_DISABLE_TIMEOUT + Duration::from_millis(100);
@@ -720,8 +724,8 @@ async fn executor_silent_axis_retained_with_axis_named() {
     );
     let elapsed = t0.elapsed();
     assert!(
-        elapsed < Duration::from_millis(550),
-        "silent-axis probe must be bounded (took {elapsed:?})"
+        elapsed < Duration::from_millis(400),
+        "silent-axis probe must be bounded to <= 300 ms window (took {elapsed:?})"
     );
     let logs = take_logs();
     assert!(
@@ -796,6 +800,7 @@ async fn damiao_fakebus_executor_3_cold_starts_sigterm_zero_faults() {
         assert!(!obs0.is_torqued, "cold start {cold_start}: expected !is_torqued");
         assert_eq!(sup.inner().control_thread_attempts(), 0, "cold start {cold_start}: 0 lock attempts");
 
+        let _log_guard = LOG_TEST_LOCK.lock().await;
         let _ = take_logs();
         let t0 = Instant::now();
         let deadline = t0 + armd::supervisor::PANIC_DISABLE_TIMEOUT + Duration::from_millis(100);
@@ -819,5 +824,125 @@ async fn damiao_fakebus_executor_3_cold_starts_sigterm_zero_faults() {
             "cold start {cold_start}: unexpected disarm warning: {logs:?}"
         );
         assert!(bus.tx_log().iter().all(|f| f.data != damiao::CMD_ENABLE));
+    }
+}
+
+#[test]
+fn disarm_probe_rejects_pre_poll_stale_rx_and_mixed_state_burst() {
+    let _log_guard = LOG_TEST_LOCK.blocking_lock();
+    let _ = log_buf();
+
+    // (a) Blocker regression: even if a prior tick observed an empty RX queue (`last_read_drained
+    // == true`), a stale pre-poll `state == 0` frame that entered the RX queue BEFORE the probe
+    // transmits `0xCC` MUST be discarded by the fresh pre-TX RX drain and MUST NOT confirm a
+    // silent axis!
+    {
+        let clock = MockClock::new();
+        let bus = FakeBus::with_clock(&dm_limits(), clock.clone());
+        bus.with(|s| {
+            s.immediate_replies = true;
+            s.motors[4].silent = true; // J5 silent
+        });
+        let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(dm_limits())
+            .unwrap();
+        // Establish `last_read_drained == true` on an earlier tick with an empty queue.
+        let _ = drv.read_joint_states().unwrap();
+
+        // Now inject a stale pre-poll `state == 0` frame for silent J5 into the RX queue BEFORE
+        // `probe_hardware_disarmed_until` runs.
+        clock.advance(Duration::from_millis(5));
+        bus.with(|s| {
+            let fb = s.motors[4].feedback_frame();
+            s.rx.push_back(fb);
+        });
+
+        let _ = take_logs();
+        let ok = drv.probe_hardware_disarmed_until(Instant::now() + Duration::from_millis(80));
+        assert!(
+            !ok,
+            "stale pre-poll state==0 frame sitting in RX before 0xCC must NOT confirm silent J5"
+        );
+        let logs = take_logs();
+        assert!(
+            logs.contains("J5") && logs.contains("0x5"),
+            "expected log naming silent J5 (0x5), got: {logs:?}"
+        );
+    }
+
+    // (b) Major 1 regression: an enabled (`state == 1`) reply followed immediately by a `state == 0`
+    // reply for J3 within the same RX batch must NOT be masked; probe must fail and name J3.
+    {
+        let clock = MockClock::new();
+        let bus = FakeBus::with_clock(&dm_limits(), clock.clone());
+        let injected = Arc::new(AtomicBool::new(false));
+        let injected_c = Arc::clone(&injected);
+        bus.with(|s| {
+            s.immediate_replies = true;
+        });
+        // Use a small transport wrapper to inject `[enabled, disabled]` for J3 on its 0xCC reply.
+        #[derive(Clone)]
+        struct BurstBus {
+            inner: FakeBus,
+            injected: Arc<AtomicBool>,
+        }
+        impl armd::transport::CanTransport for BurstBus {
+            fn transmit(&mut self, frame: &CanFrame) -> Result<(), armd::transport::TransportError> {
+                if frame.id == 0x7FF
+                    && frame.data[2] == 0xCC
+                    && frame.data[0] == 3
+                    && !self.injected.swap(true, Ordering::AcqRel)
+                {
+                    self.inner.with(|s| {
+                        let prev = s.motors[2].enabled;
+                        s.motors[2].enabled = true;
+                        let fb = s.motors[2].feedback_frame();
+                        s.motors[2].enabled = prev;
+                        s.rx.push_back(fb);
+                    });
+                }
+                self.inner.transmit(frame)
+            }
+            fn receive(&mut self) -> Result<CanFrame, armd::transport::TransportError> {
+                self.inner.receive()
+            }
+            fn receive_timestamped(
+                &mut self,
+            ) -> Result<(CanFrame, Option<Instant>), armd::transport::TransportError> {
+                self.inner.receive_timestamped()
+            }
+            fn flush(&mut self) -> Result<(), armd::transport::TransportError> {
+                self.inner.flush()
+            }
+            fn supports_nonblocking_rt(&self) -> bool {
+                self.inner.supports_nonblocking_rt()
+            }
+            fn supports_bounded_flush(&self) -> bool {
+                self.inner.supports_bounded_flush()
+            }
+            fn clock(&self) -> Option<Arc<dyn armd::transport::DriverClock>> {
+                self.inner.clock()
+            }
+        }
+
+        let burst_bus = BurstBus {
+            inner: bus.clone(),
+            injected: injected_c,
+        };
+        let mut drv = DamiaoArmDriver::new(burst_bus, vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(dm_limits())
+            .unwrap();
+        let _ = take_logs();
+        let ok = drv.probe_hardware_disarmed_until(Instant::now() + Duration::from_millis(80));
+        assert!(injected.load(Ordering::Acquire));
+        assert!(
+            !ok,
+            "enabled reply followed by disabled reply in the same RX batch must NOT confirm disarm"
+        );
+        let logs = take_logs();
+        assert!(
+            logs.contains("J3") && logs.contains("enabled"),
+            "expected log naming J3 enabled in mixed-state burst, got: {logs:?}"
+        );
     }
 }

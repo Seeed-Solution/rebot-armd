@@ -6132,8 +6132,9 @@ impl SupervisorInner {
             && self.shutdown_ready()
             && self.eligible_for_readonly_disarm_proof()
             && !crate::rt_core::executor::core_is_confirmed_disarmed(self)
+            && !self.probe_driver_disarmed_until(deadline)
         {
-            let _ = self.probe_driver_disarmed_until(deadline);
+            return false;
         }
         let ready = self.driver.is_none()
             || (self.shutdown_ready()
