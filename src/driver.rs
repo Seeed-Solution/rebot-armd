@@ -1406,6 +1406,12 @@ pub trait ArmDriver: Send {
     /// awaiting rest-pose evidence (`AwaitRestGate`) or idle.
     fn disable_frames_dispatched(&self) -> bool { false }
 
+    /// Completes remaining bounded disable repeats for an already-dispatched disable
+    /// (`disable_frames_dispatched() == true`) without re-invoking `begin_disable_torque`.
+    fn finish_dispatched_disable(&mut self) -> Result<(), ArmDriverError> {
+        Ok(())
+    }
+
     /// Aborts any pending enable handshake without transmitting further enable frames
     /// (called when E-stop or a fault intervenes mid-enable).
     fn abort_enable(&mut self) {}
@@ -1762,6 +1768,9 @@ pub struct FeetechArmDriver<T: Transport> {
     /// True once the owner has called `begin_control_release`, preventing receive passes from
     /// advancing `control_release_id` independently.
     control_release_managed: bool,
+    /// Most recent `control_release_id` for which `read_joint_states_inner` completed a bus pass,
+    /// avoiding redundant same-release polling inside `poll_torque` (R12 B1).
+    last_read_release_id: u64,
     /// Pending stopped disable awaiting rest-pose K=3 confirmation or poisoned-line drain within
     /// the single 1 s request lifetime (0 torque-off packets transmitted while pending).
     pending_disable: Option<DisableKind>,
@@ -1836,6 +1845,7 @@ impl<T: Transport> FeetechArmDriver<T> {
             line_poison_quiet_since: None,
             control_release_id: 0,
             control_release_managed: false,
+            last_read_release_id: 0,
             pending_disable: None,
             last_motion_write_at: vec![None; dof],
             last_poll_rx: None,
@@ -3522,6 +3532,7 @@ impl<T: Transport> FeetechArmDriver<T> {
             self.rx_buffer.drain(..trim);
         }
 
+        self.last_read_release_id = self.control_release_id;
         Ok(self.cached_states.clone())
     }
 }
@@ -3695,7 +3706,7 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         Err(ArmDriverError::Protocol("UNSUPPORTED: serial driver does not support budgeted torque transitions".into()))
     }
 
-    fn poll_torque(&mut self, _deadline: Instant) -> Result<TorqueProgress, ArmDriverError> {
+    fn poll_torque(&mut self, deadline: Instant) -> Result<TorqueProgress, ArmDriverError> {
         self.assert_clock_matches_transport();
         let Some(kind) = self.pending_disable.take() else {
             return Err(ArmDriverError::Protocol("no torque transition pending".into()));
@@ -3710,6 +3721,26 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         let exp = started_at + STOPPED_DISABLE_REQUEST_LIFETIME;
         if self.clock_now() >= exp {
             return Err(ArmDriverError::DisableRequestExpired);
+        }
+        // R12 B1: Re-check the rest-pose gate FIRST (the owner's `poll_hardware_rx` may already
+        // have read fresh feedback in this control release); never sleep or block waiting for K=3.
+        match self.evaluate_rest_pose_gate() {
+            RestPoseGateStatus::Confirmed => {
+                self.execute_disable_writes(kind)?;
+                return Ok(TorqueProgress::Done(TorqueOutcome::Confirmed));
+            }
+            RestPoseGateStatus::RefusedNonRest => {
+                return Err(ArmDriverError::TorqueOffWouldDrop);
+            }
+            RestPoseGateStatus::PendingDrainOrWindow | RestPoseGateStatus::StaleOrMissing => {}
+        }
+        let already_read_this_release =
+            self.control_release_managed && self.last_read_release_id == self.control_release_id;
+        if already_read_this_release || self.clock_now() >= deadline {
+            self.last_poll_rx = Some((0, false));
+            self.pending_disable = Some(kind);
+            let wake = (self.clock_now() + EVIDENCE_PROBE_INTERVAL).min(exp);
+            return Ok(TorqueProgress::Pending { wake });
         }
         if !self.control_release_managed {
             self.control_release_id = self.control_release_id.wrapping_add(1).max(1);
@@ -11396,6 +11427,21 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
     fn disable_frames_dispatched(&self) -> bool {
         matches!(self.torque_hs, Some(DamiaoTorque::Disable { .. }))
+    }
+
+    fn finish_dispatched_disable(&mut self) -> Result<(), ArmDriverError> {
+        let mut first = true;
+        while matches!(self.torque_hs, Some(DamiaoTorque::Disable { .. })) {
+            if !first {
+                self.pause(Duration::from_micros(500));
+            }
+            first = false;
+            let deadline = self.now() + DAMIAO_RX_PASS;
+            if let TorqueProgress::Done(_) = self.poll_torque(deadline)? {
+                return Ok(());
+            }
+        }
+        Ok(())
     }
 
     fn write_estop_hold_bounded(&mut self, targets: &[JointTarget]) -> Result<TxBatchOutcome, ArmDriverError> {

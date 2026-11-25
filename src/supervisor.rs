@@ -7758,6 +7758,7 @@ impl SupervisorInner {
         // Retries pass the original `DisableKind` (`started_at`) back into the driver transmit
         // choke point, which enforces Rule A′ and the single 1 s total request lifetime at send time.
         if !self.rt_executor_owned
+            && !self.service_legacy_pending_disable()
             && !self.confirm_background_disable_if_ready()
             && self
                 .last_disable_attempt

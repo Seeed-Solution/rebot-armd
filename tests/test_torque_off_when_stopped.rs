@@ -233,6 +233,18 @@ fn legacy_fault_at_rest_allows_disable_keeps_latch_and_ignores_gripper() {
         FaultCode::DriverWriteFailed,
         FaultReason::Other("simulated fault".into()),
     );
+    // Clear post-motion settle (> 20 ms) and establish K=3 stopped rest samples at 50 Hz (20 ms spacing).
+    clock.advance(Duration::from_millis(25));
+    for step in 0..3 {
+        if step > 0 {
+            clock.advance(Duration::from_millis(20));
+        }
+        bus.with(|s| {
+            s.rx.clear();
+            s.push_all_feedback();
+        });
+        inner.tick(0.02);
+    }
     assert!(matches!(inner.safety.state(), SafetyState::Fault(_)));
     assert!(inner.is_torqued);
     let epoch_before = inner.safety.epoch_id();
@@ -532,8 +544,21 @@ fn stale_and_missing_feedback_refused_as_not_at_rest_on_both_owners() {
         Err(StoppedTorqueOffRefusal::StaleOrMissingFeedback)
     );
     bus.clear_log();
-    let err = inner.disable_torque().unwrap_err();
-    assert!(matches!(err, SafetyError::TorqueOffWouldDrop { joint: None, .. }), "{err:?}");
+    // R12 B1: Legacy disable waiting for K=3 defers per-release without blocking under the driver
+    // mutex; step legacy releases across the 1 s lifetime -> expires with 0 CMD_DISABLE frames
+    // while `is_torqued` stays true and holds continue.
+    let res = inner.disable_torque();
+    assert!(res.is_ok(), "deferred legacy disable must not block/fail immediately: {res:?}");
+    assert!(inner.disable_pending);
+    assert_eq!(inner.torque_intent, armd::TorqueIntent::On);
+    for _ in 0..55 {
+        if !inner.disable_pending {
+            break;
+        }
+        clock.advance(Duration::from_millis(20));
+        inner.tick(0.02);
+    }
+    assert!(!inner.disable_pending, "silent legacy disable must expire after 1 s lifetime");
     assert_eq!(
         bus.tx_log().iter().filter(|f| f.data == damiao::CMD_DISABLE).count(),
         0
@@ -660,39 +685,21 @@ fn estop_same_rules_and_disable_exempt_from_stop_gate_on_both_owners() {
     assert_eq!(inner.safety.fault(), fault_before, "failed disable must not mutate fault detail");
     assert!(inner.disable_pending, "sticky disable_pending must stay set on failure");
 
-    // At rest -> stale + silent bus -> probe loop expires at 1 s without mutating EStop latch, fault record, or epoch.
+    // First verify confirmed disable at rest in pure E-Stop keeps exact EStop latch, fault
+    // record, and epoch intact (`TxKind::DisableRequested` bypasses the stop gate).
     bus.with(|s| {
         s.tx_error = false;
-        for m in &mut s.motors {
-            m.silent = true;
-        }
+        s.rx.clear();
+        s.pending.clear();
     });
-    clock.advance(Duration::from_millis(150));
-    assert!(matches!(
-        inner.disable_torque(),
-        Err(SafetyError::TorqueOffWouldDrop { joint: None, .. })
-    ));
-    bus.with(|s| {
-        for m in &mut s.motors {
-            m.silent = false;
-        }
-    });
-    assert_eq!(*inner.safety.state(), SafetyState::EStop);
-    assert_eq!(inner.safety.epoch_id(), epoch_before);
-    assert_eq!(inner.safety.latched_fault_kinds(), kinds_before);
-    assert_eq!(inner.safety.fault(), fault_before);
-
-    // Refresh driver RX queue bound without triggering a stale hold-output transmit, then confirm
-    // TxKind::Disable bypasses stop gate and keeps the exact EStop latch and epoch.
-    {
-        let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
-        let _ = drv.read_joint_states(); // observe empty RX queue after 150 ms stall
-    }
     for step in 0..3 {
         if step > 0 {
-            clock.advance(Duration::from_millis(10));
+            clock.advance(Duration::from_millis(20));
         }
-        bus.with(|s| s.push_all_feedback());
+        bus.with(|s| {
+            s.rx.clear();
+            s.push_all_feedback();
+        });
         inner.tick(0.02);
     }
     assert_eq!(*inner.safety.state(), SafetyState::EStop);
@@ -703,6 +710,35 @@ fn estop_same_rules_and_disable_exempt_from_stop_gate_on_both_owners() {
     assert_eq!(inner.safety.epoch_id(), epoch_before, "confirmed disable must not advance epoch");
     assert_eq!(inner.safety.latched_fault_kinds(), kinds_before, "confirmed disable must not mutate fault record");
     assert_eq!(inner.safety.fault(), fault_before, "confirmed disable must not mutate fault detail");
+    assert!(!inner.is_torqued);
+
+    // Next verify silent/stale deferred disable in E-Stop expires cleanly at 1 s without
+    // transmitting CMD_DISABLE or dropping the E-Stop latch (R12 B1).
+    let (mut inner_s, bus_s, clock_s) = make_driver_rig();
+    enable_torque_admitted(&mut inner_s).unwrap();
+    inner_s.apply_stop_policy(StopPolicy::EStopLatch);
+    bus_s.with(|s| {
+        for m in &mut s.motors {
+            m.silent = true;
+        }
+    });
+    clock_s.advance(Duration::from_millis(150));
+    bus_s.clear_log();
+    let _ = inner_s.disable_torque();
+    for _ in 0..55 {
+        if !inner_s.disable_pending {
+            break;
+        }
+        clock_s.advance(Duration::from_millis(20));
+        inner_s.tick(0.02);
+    }
+    assert!(!inner_s.disable_pending, "silent EStop disable must expire at 1 s");
+    assert!(inner_s.is_torqued);
+    assert!(
+        inner_s.safety.has_latched_fault_kind(armd::safety::FaultKind::Estop),
+        "E-Stop latch must remain recorded across silent disable expiry"
+    );
+    assert_eq!(spec_count_damiao_disables(&bus_s), 0, "silent expiry must send 0 CMD_DISABLE frames");
     assert!(inner.e_stop_latched.load(Ordering::SeqCst), "e_stop_latched must remain set");
     assert!(!inner.is_torqued);
     assert!(bus.with(|s| s.motors.iter().all(|m| !m.enabled)));
@@ -800,6 +836,18 @@ fn relatching_deferral_fault_loop_allows_disable_at_rest_on_both_owners() {
     bus.with(|s| s.push_all_feedback());
     let state = inner.disable_torque().expect("disable at rest must beat deferral fault loop");
     assert!(matches!(state, SafetyState::Fault(_)));
+    for _ in 0..5 {
+        if !inner.disable_pending {
+            break;
+        }
+        clock.advance(Duration::from_millis(20));
+        bus.with(|s| s.push_all_feedback());
+        inner.tick(0.02);
+        inner.safety.trigger_fault_coded(
+            FaultCode::DriverWriteFailed,
+            FaultReason::Other("TX deferral re-latch".into()),
+        );
+    }
     assert!(!inner.is_torqued);
     assert!(!inner.disable_pending);
     assert!(bus.with(|s| s.motors.iter().all(|m| !m.enabled)));
@@ -2367,6 +2415,17 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
                 }
             }
             inner.tick(0.02);
+            if pose == PoseCase::Stale {
+                // R12 B1: Stale periodic retry defers per-release without blocking under mutex;
+                // step through the 1 s request lifetime so it expires with 0 CMD_DISABLE frames.
+                for _ in 0..55 {
+                    if !inner.disable_pending {
+                        break;
+                    }
+                    clock.advance(Duration::from_millis(20));
+                    inner.tick(0.02);
+                }
+            }
             let disables = count_damiao_disables(&bus);
             match pose {
                 PoseCase::AtRest => {
@@ -9100,4 +9159,148 @@ fn r12_b5_operational_torque_off_enforces_rest_gate_on_both_owners_and_drivers()
             "B5: DisableProtective must transmit CMD_DISABLE to all motors even at raised pose"
         );
     }
+}
+
+/// Round 12 B1: Feetech (legacy) disable waiting for K=3 must NOT hold the driver mutex while
+/// collecting evidence or sleeping, and must NOT starve measured-position holds between releases.
+#[test]
+fn r12_b1_feetech_legacy_pending_disable_continues_holds_without_starvation() {
+    use armd::driver::{ArmDriver, FeetechArmDriver};
+    use armd::protocol::feetech;
+    use armd::transport::MockTransport;
+    use armd::TorqueIntent;
+
+    #[derive(Clone)]
+    struct SharedSerial(Arc<std::sync::Mutex<MockTransport>>);
+    impl armd::transport::Transport for SharedSerial {
+        fn write(&mut self, buf: &[u8]) -> Result<usize, armd::transport::TransportError> {
+            self.0.lock().unwrap().write(buf)
+        }
+        fn write_all(&mut self, buf: &[u8]) -> Result<(), armd::transport::TransportError> {
+            self.0.lock().unwrap().write_all(buf)
+        }
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, armd::transport::TransportError> {
+            self.0.lock().unwrap().read(buf)
+        }
+        fn flush(&mut self) -> Result<(), armd::transport::TransportError> {
+            self.0.lock().unwrap().flush()
+        }
+        fn clear_input_buffer(&mut self) {
+            self.0.lock().unwrap().clear_input_buffer();
+        }
+        fn clock(&self) -> Option<Arc<dyn armd::transport::DriverClock>> {
+            armd::transport::Transport::clock(&*self.0.lock().unwrap())
+        }
+    }
+
+    let clock = MockClock::new();
+    let serial = Arc::new(std::sync::Mutex::new(
+        MockTransport::new().with_clock(clock.clone()),
+    ));
+    let servo_ids = vec![1u8, 2, 3, 4, 5, 6];
+    let req1 = feetech::build_sync_read(&servo_ids[..3], feetech::REG_PRESENT_POSITION_L, 8).unwrap();
+    let req2 = feetech::build_sync_read(&servo_ids[3..], feetech::REG_PRESENT_POSITION_L, 8).unwrap();
+    {
+        let mut ser = serial.lock().unwrap();
+        ser.stage_reply(&req1, &feetech_feedback_bytes(&servo_ids[..3], &[2048; 3]));
+        ser.stage_reply(&req2, &feetech_feedback_bytes(&servo_ids[3..], &[2048; 3]));
+        for id in 1..=6u8 {
+            let r_en = feetech::build_read(id, feetech::REG_TORQUE_ENABLE, 1);
+            ser.stage_reply(&r_en, &feetech_reg_u8_resp(id, 0));
+        }
+    }
+    let mut drv = FeetechArmDriver::new(SharedSerial(Arc::clone(&serial)), servo_ids.clone())
+        .with_calibrated(true)
+        .with_tx_echo(Some(false))
+        .with_gripper_index(Some(5));
+    drv.read_joint_states().unwrap(); // only 1 sample so far (K < 3)
+
+    // Legacy owner (`rt_executor_owned == false`, as Feetech always runs on legacy).
+    let mut inner = SupervisorInner::new(feetech_6dof_config()).with_driver(Box::new(drv));
+    inner.lease_enabled = false;
+    assert!(!inner.rt_executor_owned);
+    inner.apply_stop_policy(StopPolicy::EStopLatch);
+
+    // Trigger disable while K=3 is still incomplete: MUST return immediately without sleeping
+    // or advancing the mock clock, leaving `disable_pending == true`, `torque_intent == On`,
+    // and 0 `TORQUE_ENABLE = 0` writes.
+    let _ = serial.lock().unwrap().take_tx();
+    let t_before = clock.now();
+    let st = inner
+        .disable_torque()
+        .expect("B1: legacy Feetech disable awaiting K=3 must defer cleanly");
+    assert_eq!(st, SafetyState::EStop);
+    assert_eq!(
+        clock.now(),
+        t_before,
+        "B1: legacy Feetech disable_torque must NOT sleep while awaiting K=3"
+    );
+    assert!(inner.disable_pending, "B1: disable must remain pending until K=3 completes");
+    assert_eq!(inner.torque_intent, TorqueIntent::On);
+    assert_eq!(
+        spec_count_feetech_torque_off_writes(&serial.lock().unwrap().take_tx()),
+        0,
+        "B1: zero TORQUE_ENABLE=0 writes before K=3"
+    );
+
+    // Driver mutex MUST be free immediately after `disable_torque()` returned.
+    assert!(
+        inner.driver.as_ref().unwrap().try_lock().is_ok(),
+        "B1: driver mutex must be released immediately after begin_disable_torque"
+    );
+
+    // Release 1 (+20 ms, sample 1 of 3 after gate installed): disable stays pending AND holds ARE transmitted!
+    let _ = serial.lock().unwrap().take_tx();
+    clock.advance(Duration::from_millis(20));
+    inner.tick(0.02);
+    let tx_r1 = serial.lock().unwrap().take_tx();
+    assert!(
+        !parse_feetech_sync_write_goal_steps(&tx_r1).is_empty(),
+        "B1: legacy Feetech holds MUST continue on pending release 1 (not starved)"
+    );
+    assert_eq!(
+        spec_count_feetech_torque_off_writes(&tx_r1),
+        0,
+        "B1: zero disable writes while K=1 < 3"
+    );
+    assert!(inner.disable_pending);
+    assert_eq!(inner.torque_intent, TorqueIntent::On);
+
+    // Release 2 (+20 ms, sample 2 of 3): disable STILL pending AND holds CONTINUE!
+    clock.advance(Duration::from_millis(20));
+    inner.tick(0.02);
+    let tx_r2 = serial.lock().unwrap().take_tx();
+    assert!(
+        !parse_feetech_sync_write_goal_steps(&tx_r2).is_empty(),
+        "B1: legacy Feetech holds MUST continue on pending release 2 (not starved)"
+    );
+    assert_eq!(
+        spec_count_feetech_torque_off_writes(&tx_r2),
+        0,
+        "B1: zero disable writes while K=2 < 3"
+    );
+    assert!(inner.disable_pending);
+    assert_eq!(inner.torque_intent, TorqueIntent::On);
+
+    // Release 3 (+20 ms, sample 3 of 3 spanning 40 ms >= 20 ms): K=3 confirmed -> TORQUE_ENABLE=0 written!
+    clock.advance(Duration::from_millis(20));
+    inner.tick(0.02);
+    let tx_r3 = serial.lock().unwrap().take_tx();
+    assert_eq!(
+        spec_count_feetech_torque_off_writes(&tx_r3),
+        6,
+        "B1: all 6 Feetech servos must receive TORQUE_ENABLE=0 once K=3 confirms"
+    );
+    assert!(!inner.disable_pending);
+    assert_eq!(inner.torque_intent, TorqueIntent::Off);
+    assert!(!inner.is_torqued);
+
+    // Release 4 (+20 ms): holds MUST stop after accepted disable.
+    clock.advance(Duration::from_millis(20));
+    inner.tick(0.02);
+    let tx_r4 = serial.lock().unwrap().take_tx();
+    assert!(
+        parse_feetech_sync_write_goal_steps(&tx_r4).is_empty(),
+        "B1: Feetech holds must stop after accepted disable"
+    );
 }

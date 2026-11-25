@@ -1595,7 +1595,106 @@ impl SupervisorInner {
                     });
                 }
             };
-            if let Err(e) = drv.disable_torque(kind) {
+            // R12 B1: Never hold the driver mutex while waiting/sleeping for K=3 rest-pose
+            // evidence on legacy owners. Drivers supporting deferred per-release rest-gate wait
+            // (`FeetechArmDriver`, `DamiaoArmDriver`) begin non-blockingly: if awaiting K=3
+            // (`Pending` with `!frames_dispatched`), release the mutex immediately so subsequent
+            // legacy releases advance one bounded poll step while holds keep running between
+            // releases.
+            if drv.supports_budgeted_disable_await() {
+                match drv.begin_disable_torque(kind) {
+                    Ok(crate::driver::TorqueProgress::Done(_)) => {}
+                    Ok(crate::driver::TorqueProgress::Pending { .. }) => {
+                        let frames_dispatched = drv.disable_frames_dispatched();
+                        if !frames_dispatched {
+                            let mut ages_buf = std::mem::take(&mut self.scratch.ages);
+                            let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
+                            self.owner_driver_snapshot = OwnerDriverSnapshot::capture_from_driver(
+                                drv.as_ref(),
+                                self.config.dof,
+                                self.feedback_numeric_valid,
+                                &self.measured_positions,
+                                &mut ages_buf,
+                                &mut bounds_buf,
+                            );
+                            self.scratch.ages = ages_buf;
+                            self.scratch.fb.bounds = bounds_buf;
+                            drop(drv);
+                            if pending_disable {
+                                self.torque_transition = Some(TorqueTransition::Disable { kind });
+                            }
+                            return Ok(());
+                        }
+                        // Frame 1 already dispatched (`torque_intent = Off`): complete remaining
+                        // bounded disable repeats without re-sending repeat 1 or starving holds.
+                        if let Err(e) = drv.finish_dispatched_disable() {
+                            let refused = matches!(
+                                e,
+                                crate::driver::ArmDriverError::TorqueOffWouldDrop
+                                    | crate::driver::ArmDriverError::DisableRequestExpired
+                            );
+                            let mut message = crate::safety::BoundedText::empty();
+                            message.push_str("Torque disable transmission failed: ");
+                            e.write_bounded(&mut message);
+                            drop(drv);
+                            self.disable_first_frame_accepted();
+                            let code = if pending_disable {
+                                self.torque_transition = None;
+                                let code = self.disable_step_failed(e);
+                                self.core.begin_transition(Err(code));
+                                code
+                            } else {
+                                if refused {
+                                    self.disable_pending = false;
+                                    self.active_disable_kind = None;
+                                    self.last_disable_attempt = None;
+                                    self.background_disable_retry = None;
+                                }
+                                crate::driver::handshake::rt_progress(false, Err(e))
+                                    .err()
+                                    .unwrap_or("HARDWARE_FAULT")
+                            };
+                            return Err(RequestDisableError {
+                                code,
+                                message,
+                                refused_by_chokepoint: refused,
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        let refused = matches!(
+                            e,
+                            crate::driver::ArmDriverError::TorqueOffWouldDrop
+                                | crate::driver::ArmDriverError::DisableRequestExpired
+                        );
+                        let mut message = crate::safety::BoundedText::empty();
+                        message.push_str("Torque disable transmission failed: ");
+                        e.write_bounded(&mut message);
+                        drop(drv);
+                        let code = if pending_disable {
+                            self.torque_transition = None;
+                            let code = self.disable_step_failed(e);
+                            self.core.begin_transition(Err(code));
+                            code
+                        } else {
+                            if refused {
+                                self.disable_pending = false;
+                                self.active_disable_kind = None;
+                                self.last_disable_attempt = None;
+                                self.background_disable_retry = None;
+                            }
+                            crate::driver::handshake::rt_progress(false, Err(e))
+                                .err()
+                                .unwrap_or("HARDWARE_FAULT")
+                        };
+                        return Err(RequestDisableError {
+                            code,
+                            message,
+                            refused_by_chokepoint: refused,
+                        });
+                    }
+                }
+            } else if let Err(e) = drv.disable_torque(kind) {
                 let refused = matches!(
                     e,
                     crate::driver::ArmDriverError::TorqueOffWouldDrop
@@ -2320,6 +2419,85 @@ impl SupervisorInner {
             crate::safety::FaultKind::Other,
             crate::safety::FaultDetail::Static(crate::safety::StaticFault::DisableUnconfirmed),
         );
+    }
+
+    /// R12 B1: Advances an in-flight deferred legacy disable (`FeetechArmDriver::pending_disable`
+    /// or `DamiaoArmDriver::AwaitRestGate` / `Disable`) by ONE bounded poll step per control
+    /// release, releasing the driver mutex immediately afterward so `service_stopped_measured_hold`
+    /// keeps servicing holds between releases.
+    ///
+    /// Returns `true` when the driver had a pending disable transition that was serviced this
+    /// release (suppressing the 250 ms fallback restart on the same tick).
+    pub(crate) fn service_legacy_pending_disable(&mut self) -> bool {
+        if self.rt_executor_owned || !self.disable_pending || self.torque_transition.is_some() {
+            return false;
+        }
+        let Some(d) = self.driver.as_ref() else {
+            return false;
+        };
+        let control_release_seq = self.control_release_seq;
+        let step = {
+            let Ok(mut drv) = d.lock() else {
+                return false;
+            };
+            if !drv.torque_transition_pending() {
+                return false;
+            }
+            if control_release_seq > 0 {
+                drv.begin_control_release(control_release_seq);
+            }
+            let drv_now = drv.clock_now();
+            let poll_res = drv.poll_torque(drv_now + Duration::from_millis(8));
+            let frames_dispatched = drv.disable_frames_dispatched();
+            let mut ages_buf = std::mem::take(&mut self.scratch.ages);
+            let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
+            let snap = OwnerDriverSnapshot::capture_from_driver(
+                drv.as_ref(),
+                self.config.dof,
+                self.feedback_numeric_valid,
+                &self.measured_positions,
+                &mut ages_buf,
+                &mut bounds_buf,
+            );
+            self.scratch.ages = ages_buf;
+            self.scratch.fb.bounds = bounds_buf;
+            (poll_res, frames_dispatched, snap)
+        };
+        let (poll_res, frames_dispatched, snap) = step;
+        self.owner_driver_snapshot = snap;
+        match poll_res {
+            Ok(crate::driver::TorqueProgress::Done(_)) => {
+                self.disable_accepted();
+                let _ = self.torque_off_finish_in_place();
+            }
+            Ok(crate::driver::TorqueProgress::Pending { .. }) => {
+                if frames_dispatched {
+                    self.disable_first_frame_accepted();
+                }
+            }
+            Err(
+                crate::driver::ArmDriverError::TorqueOffWouldDrop
+                | crate::driver::ArmDriverError::DisableRequestExpired,
+            ) => {
+                if frames_dispatched {
+                    self.disable_first_frame_accepted();
+                } else {
+                    self.disable_pending = false;
+                    self.active_disable_kind = None;
+                    self.last_disable_attempt = None;
+                    self.background_disable_retry = None;
+                }
+            }
+            Err(e) => {
+                if frames_dispatched {
+                    self.disable_first_frame_accepted();
+                }
+                if !self.safety.deferred_logging() {
+                    tracing::warn!("Legacy deferred torque disable step failed: {e}");
+                }
+            }
+        }
+        true
     }
 
     pub fn enable_torque(admitted: Admitted<'_>) -> Result<SafetyState, SafetyError> {

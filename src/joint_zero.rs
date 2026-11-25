@@ -380,6 +380,7 @@ impl ArmDriver for ZeroOffsetDriver {
     fn take_last_poll_rx(&mut self) -> Option<(u16, bool)> { self.inner.take_last_poll_rx() }
     fn torque_transition_pending(&self) -> bool { self.inner.torque_transition_pending() }
     fn disable_frames_dispatched(&self) -> bool { self.inner.disable_frames_dispatched() }
+    fn finish_dispatched_disable(&mut self) -> Result<(), ArmDriverError> { self.inner.finish_dispatched_disable() }
     fn abort_enable(&mut self) { self.inner.abort_enable() }
     fn panic_disable_step(&mut self, first: bool, deadline: Instant) -> Option<Result<Vec<usize>, ArmDriverError>> {
         self.inner.panic_disable_step(first, deadline)
