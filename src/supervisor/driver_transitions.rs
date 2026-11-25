@@ -1419,6 +1419,24 @@ impl SupervisorInner {
     pub(crate) fn probe_driver_limits_bounded(
         &self,
     ) -> Result<CandidateDriverLimits, crate::safety::BoundedText<256>> {
+        self.probe_driver_limits_with_offset_shift_bounded(None)
+    }
+
+    /// Probes driver limits for candidate `new_offsets` BEFORE mutating `ZeroOffsetDriver`
+    /// (zero heap allocations).
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn probe_driver_limits_for_offsets_bounded(
+        &self,
+        new_offsets: &[f32],
+    ) -> Result<CandidateDriverLimits, crate::safety::BoundedText<256>> {
+        self.probe_driver_limits_with_offset_shift_bounded(Some(new_offsets))
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn probe_driver_limits_with_offset_shift_bounded(
+        &self,
+        candidate_offsets: Option<&[f32]>,
+    ) -> Result<CandidateDriverLimits, crate::safety::BoundedText<256>> {
         use crate::safety::BoundedText;
         const MAX_DOF: usize = crate::rt_core::mailbox::MAX_DOF;
         let dof = self.config.dof;
@@ -1435,7 +1453,16 @@ impl SupervisorInner {
             d.with_ref(|drv| {
                 for i in 0..dof {
                     vel_limits[i] = drv.max_command_velocity(i);
-                    pos_limits[i] = drv.position_limits(i);
+                    pos_limits[i] = drv.position_limits(i).map(|(lo, hi)| {
+                        if let Some(new_off) = candidate_offsets {
+                            let old = self.joint_zero_offsets.get(i).copied().unwrap_or(0.0);
+                            let next = new_off.get(i).copied().unwrap_or(old);
+                            let shift = old - next;
+                            (lo + shift, hi + shift)
+                        } else {
+                            (lo, hi)
+                        }
+                    });
                 }
             })
             .is_some()
@@ -3432,8 +3459,13 @@ impl SupervisorInner {
         allow_sync_mit: bool,
         nonblocking_lock: bool,
     ) -> Result<(bool, Option<f32>), SafetyError> {
-        if self.shutdown_committed {
+        if self.internal_fault_lane.is_fenced() || self.shutdown_committed {
             return Err(SafetyError::EStopActive);
+        }
+        if self.core.motion_inhibited_by_config() {
+            return Err(SafetyError::ClearFaultRejected(
+                "CONFIG_BUSY: configuration or hardware commissioning reconciliation is active; rearm is blocked".into(),
+            ));
         }
         if let Some(ref err) = self.driver_config_error {
             return Err(SafetyError::MotionForbiddenInFaultState(format!("Driver limit configuration error: {err}")));
@@ -3753,14 +3785,20 @@ impl SupervisorInner {
 
     /// Zero-allocation RT preflight for torque enable (all refusal paths return static codes).
     fn enable_prepare_rt_precheck(&self) -> Result<(), &'static str> {
-        if self.calibration_busy && self.motor_zero_busy {
+        if (self.calibration_busy && self.motor_zero_busy) || self.commissioning.is_active() {
             return Err("MOTION_BUSY");
+        }
+        if self.core.motion_inhibited_by_config() {
+            return Err("CONFIG_BUSY");
         }
         if self.torque_transition.is_some() {
             return Err("TRANSITION_BUSY");
         }
         if self.gravity_comp.is_some() {
             return Err("MOTION_BUSY");
+        }
+        if self.internal_fault_lane.is_fenced() {
+            return Err("INTERNAL_FAULT");
         }
         if self.shutdown_committed {
             return Err("ESTOP_ACTIVE");
@@ -4209,6 +4247,18 @@ impl SupervisorInner {
         reducer: EnableReducer,
         budget: Option<&crate::rt_core::ops::ServiceBudget>,
     ) -> (EnableStepOutcome, Option<(u16, bool)>) {
+        let entry_wall = Instant::now();
+        let base = budget.map_or(entry_wall, |b| b.now);
+        let mut live_now = || base + Instant::now().saturating_duration_since(entry_wall);
+        self.poll_enable_reducer_with_clock(reducer, budget, &mut live_now)
+    }
+
+    fn poll_enable_reducer_with_clock(
+        &mut self,
+        reducer: EnableReducer,
+        budget: Option<&crate::rt_core::ops::ServiceBudget>,
+        now_fn: &mut dyn FnMut() -> Instant,
+    ) -> (EnableStepOutcome, Option<(u16, bool)>) {
         use crate::driver::{TorqueOutcome, TorqueProgress as Drv};
         if matches!(reducer.phase, EnableReducerPhase::Cancelling) {
             return (self.step_enable_cancel(reducer, budget), None);
@@ -4355,31 +4405,44 @@ impl SupervisorInner {
                         let caps = drv.capabilities();
                         let enable_fb = caps.enable_feedback;
                         let temp_fb = caps.temperature_feedback;
-                        let drv_now = drv.clock_now();
-                        let tx_dl = owner_dl.map(|dl| drv_now + dl.saturating_duration_since(owner_now));
-                        drv.set_enable_authority(tx_dl, expected_lease_gen);
-                        let (r, rx) = if let Some(b) = budget {
-                            // Use remaining budget at the moment of the driver call so time
-                            // already spent under the guard is never re-granted (R5 M2).
-                            let span = match reducer.origin {
-                                EnableOrigin::LegacyWs { .. } => {
-                                    b.deadline.saturating_duration_since(Instant::now())
+                        let (drv_now, r, rx, expired_defer) = if let Some(b) = budget {
+                            match crate::supervisor::translate_driver_cutoff_conservative(
+                                drv,
+                                b.deadline,
+                                now_fn,
+                            ) {
+                                Ok((drv_now, live_owner_now, drv_deadline)) => {
+                                    let tx_dl = owner_dl.map(|dl| {
+                                        drv_now + dl.saturating_duration_since(live_owner_now)
+                                    });
+                                    drv.set_enable_authority(tx_dl, expected_lease_gen);
+                                    let r = if reducer.budgeted {
+                                        drv.poll_torque_budgeted(drv_deadline, b.max_rx_frames)
+                                    } else {
+                                        drv.poll_torque(drv_deadline)
+                                    };
+                                    let rx = drv.take_last_poll_rx();
+                                    (drv_now, r, rx, None)
                                 }
-                                _ => b.deadline.saturating_duration_since(b.now),
-                            };
-                            let r = if reducer.budgeted {
-                                drv.poll_torque_budgeted(drv_now + span, b.max_rx_frames)
-                            } else {
-                                drv.poll_torque(drv_now + span)
-                            };
-                            let rx = drv.take_last_poll_rx();
-                            (r, rx)
+                                Err((drv_now, live_owner_now)) => (
+                                    drv_now,
+                                    Ok(Drv::Pending { wake: drv_now }),
+                                    Some((0, true)),
+                                    Some(live_owner_now),
+                                ),
+                            }
                         } else {
+                            let drv_now = drv.clock_now();
+                            let tx_dl = owner_dl.map(|dl| drv_now + dl.saturating_duration_since(owner_now));
+                            drv.set_enable_authority(tx_dl, expected_lease_gen);
                             let r = drv.poll_torque(drv_now + crate::driver::DAMIAO_RX_PASS);
-                            (r, None)
+                            (drv_now, r, None, None)
                         };
                         let mut cached_temps_read = false;
-                        if temp_fb && drv.read_cached_joint_states_into(&mut scratch_states).is_some() {
+                        if expired_defer.is_none()
+                            && temp_fb
+                            && drv.read_cached_joint_states_into(&mut scratch_states).is_some()
+                        {
                             drv.feedback_ages_into(&mut scratch_ages);
                             cached_temps_read = true;
                         }
@@ -4393,7 +4456,7 @@ impl SupervisorInner {
                         );
                         #[cfg(not(target_arch = "wasm32"))]
                         shadow_rt.drain_from_driver(drv);
-                        (r, rx, enable_fb, temp_fb, drv_now, cached_temps_read, snap)
+                        (r, rx, enable_fb, temp_fb, drv_now, cached_temps_read, snap, expired_defer)
                     };
                     if budget.is_some() || reducer.budgeted {
                         match d.try_with_mut(run_poll) {
@@ -4405,7 +4468,7 @@ impl SupervisorInner {
                         d.with_mut(run_poll).ok_or(false)
                     }
                 };
-                let (poll_res, rx, enable_fb, temp_fb, drv_now, cached_temps_read, snap) = match lock_res {
+                let (poll_res, rx, enable_fb, temp_fb, drv_now, cached_temps_read, snap, expired_defer) = match lock_res {
                     Ok(v) => v,
                     Err(true) => {
                         self.scratch.states = scratch_states;
@@ -4435,6 +4498,13 @@ impl SupervisorInner {
                     }
                 };
                 self.owner_driver_snapshot = snap;
+                if let Some(wake) = expired_defer {
+                    self.scratch.states = scratch_states;
+                    self.scratch.ages = scratch_ages;
+                    self.scratch.fb.bounds = scratch_bounds;
+                    self.torque_transition = Some(TorqueTransition::Enable(reducer));
+                    return (EnableStepOutcome::Pending { wake }, rx);
+                }
                 if cached_temps_read {
                     let n = self.config.dof.min(self.temperatures.len()).min(scratch_states.len());
                     for i in 0..n {
@@ -4683,12 +4753,24 @@ impl SupervisorInner {
                     if driver.read_cached_joint_states_into(&mut scratch_states).is_some() {
                         Ok(())
                     } else if let Some(b) = budget {
-                        let span = b.deadline.saturating_duration_since(b.now);
-                        let drv_deadline = driver.clock_now() + span;
-                        driver
-                            .read_joint_states_budgeted(&mut scratch_states, drv_deadline, b.max_rx_frames)
-                            .map(|_| ())
-                            .map_err(|_| ())
+                        let entry_wall = Instant::now();
+                        let mut live_now =
+                            || b.now + Instant::now().saturating_duration_since(entry_wall);
+                        match crate::supervisor::translate_driver_cutoff_conservative(
+                            driver,
+                            b.deadline,
+                            &mut live_now,
+                        ) {
+                            Ok((_, _, drv_deadline)) => driver
+                                .read_joint_states_budgeted(
+                                    &mut scratch_states,
+                                    drv_deadline,
+                                    b.max_rx_frames,
+                                )
+                                .map(|_| ())
+                                .map_err(|_| ()),
+                            Err(_) => Err(()),
+                        }
                     } else {
                         Err(())
                     }
@@ -5715,6 +5797,7 @@ impl SupervisorInner {
             "FAULT_ACTIVE" => MotionInstallError::FaultActive,
             "HANDOVER_SETTLING" => MotionInstallError::HandoverSettling,
             "FEEDBACK_UNAVAILABLE" | "FEEDBACK_STALE" => MotionInstallError::FeedbackStale,
+            "CONFIG_BUSY" => MotionInstallError::ConfigBusy,
             "MOTION_BUSY" | "TRANSITION_BUSY" | "DISABLE_PENDING" => MotionInstallError::MotionBusy,
             _ => MotionInstallError::EnableFailed,
         };
@@ -7270,9 +7353,10 @@ impl SupervisorInner {
     /// single request lifetime. Exhausting retries or the window latches
     /// `StaticFault::DisableUnconfirmed` with zero heap allocations; choke-point refusals
     /// (`TorqueOffWouldDrop` / `DisableRequestExpired`) terminate cleanly without retrying.
-    pub(crate) fn service_background_disable(
+    pub(crate) fn service_background_disable_with_clock(
         &mut self,
         budget: &crate::rt_core::ops::ServiceBudget,
+        now_fn: &mut dyn FnMut() -> Instant,
     ) -> Option<(u16, bool)> {
         if !self.disable_pending || self.torque_transition.is_some() {
             return None;
@@ -7284,12 +7368,12 @@ impl SupervisorInner {
         ) {
             return None;
         }
-        let span = budget.deadline.saturating_duration_since(budget.now);
         let control_release_seq = self.control_release_seq;
         // Probe / poll phase under non-blocking try_lock (M4).
         enum BgPollStep {
             Contended,
             Poisoned,
+            BudgetExpired,
             Polled {
                 poll_res: Result<crate::driver::TorqueProgress, crate::driver::ArmDriverError>,
                 rx: Option<(u16, bool)>,
@@ -7316,9 +7400,17 @@ impl SupervisorInner {
                 if control_release_seq > 0 {
                     drv.begin_control_release(control_release_seq);
                 }
-                let drv_now = drv.clock_now();
                 if drv.torque_transition_pending() {
-                    let poll_res = drv.poll_torque_budgeted(drv_now + span, budget.max_rx_frames);
+                    let Ok((_, _, drv_deadline)) =
+                        crate::supervisor::translate_driver_cutoff_conservative(
+                            drv,
+                            budget.deadline,
+                            now_fn,
+                        )
+                    else {
+                        return BgPollStep::BudgetExpired;
+                    };
+                    let poll_res = drv.poll_torque_budgeted(drv_deadline, budget.max_rx_frames);
                     let rx = drv.take_last_poll_rx();
                     let post_now = drv.clock_now();
                     new_snap = Some(OwnerDriverSnapshot::capture_from_driver(
@@ -7343,7 +7435,7 @@ impl SupervisorInner {
                         dispatched_mask,
                     }
                 } else {
-                    BgPollStep::Idle { drv_now }
+                    BgPollStep::Idle { drv_now: drv.clock_now() }
                 }
             }) {
                 Ok(v) => v,
@@ -7362,6 +7454,7 @@ impl SupervisorInner {
                 return None;
             }
             BgPollStep::Poisoned => return None,
+            BgPollStep::BudgetExpired => return Some((0, true)),
             BgPollStep::Polled {
                 poll_res,
                 rx,
@@ -7714,6 +7807,15 @@ impl SupervisorInner {
         &mut self,
         budget: &crate::rt_core::ops::ServiceBudget,
     ) -> Option<TransitionPoll> {
+        let mut live_now = Instant::now;
+        self.service_torque_transition_with_clock(budget, &mut live_now)
+    }
+
+    pub(crate) fn service_torque_transition_with_clock(
+        &mut self,
+        budget: &crate::rt_core::ops::ServiceBudget,
+        now_fn: &mut dyn FnMut() -> Instant,
+    ) -> Option<TransitionPoll> {
         use crate::rt_core::ops::TorqueProgress as Rt;
         let t = self.torque_transition.take()?;
         let ws_origin_dir = match t {
@@ -7778,13 +7880,13 @@ impl SupervisorInner {
                         // Already dispatched (or protective): let the next line poll to completion
                         // with `deadline: None`.
                         let next = self.torque_transition.take()?;
-                        return self.service_torque_transition_post_deadline(next, budget);
+                        return self.service_torque_transition_post_deadline(next, budget, now_fn);
                     }
                 }
             }
             _ => {}
         }
-        let out = self.service_torque_transition_post_deadline(t, budget);
+        let out = self.service_torque_transition_post_deadline(t, budget, now_fn);
         self.sync_detached_torque_flag();
         out
     }
@@ -7793,6 +7895,7 @@ impl SupervisorInner {
         &mut self,
         t: TorqueTransition,
         budget: &crate::rt_core::ops::ServiceBudget,
+        now_fn: &mut dyn FnMut() -> Instant,
     ) -> Option<TransitionPoll> {
         use crate::driver::TorqueProgress as Drv;
         use crate::rt_core::ops::TorqueProgress as Rt;
@@ -7804,7 +7907,7 @@ impl SupervisorInner {
         match t {
             TorqueTransition::Enable(reducer) => {
                 let origin = reducer.origin;
-                let (outcome, rx) = self.poll_enable_reducer(reducer, Some(budget));
+                let (outcome, rx) = self.poll_enable_reducer_with_clock(reducer, Some(budget), now_fn);
                 let progress = match outcome {
                     EnableStepOutcome::Armed(_) => {
                         match origin {
@@ -7894,6 +7997,21 @@ impl SupervisorInner {
                 let measured_positions = &self.measured_positions;
                 let mut ages_buf = std::mem::take(&mut self.scratch.ages);
                 let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
+                #[allow(clippy::large_enum_variant)] // RT stack-only enum; avoids heap Box
+                enum DisablePollOutcome {
+                    Ran(
+                        Instant,
+                        Result<Drv, crate::driver::ArmDriverError>,
+                        bool,
+                        u64,
+                        Option<(u16, bool)>,
+                        Instant,
+                        OwnerDriverSnapshot,
+                    ),
+                    BudgetExpired(Instant),
+                    Contended,
+                    Poisoned,
+                }
                 let poll_out = {
                     #[cfg(not(target_arch = "wasm32"))]
                     let shadow_rt = &mut self.torque_shadow;
@@ -7902,23 +8020,25 @@ impl SupervisorInner {
                         if control_release_seq > 0 {
                             drv.begin_control_release(control_release_seq);
                         }
-                        let drv_now = drv.clock_now();
-                        // Compute remaining service budget at the moment of the driver call,
-                        // and bound any undispatched non-protective WS/Detached disable by its
+                        let (drv_now, live_owner_now, mut drv_deadline) =
+                            match crate::supervisor::translate_driver_cutoff_conservative(
+                                drv,
+                                budget.deadline,
+                                now_fn,
+                            ) {
+                                Ok(translated) => translated,
+                                Err((_, owner_now)) => {
+                                    return DisablePollOutcome::BudgetExpired(owner_now);
+                                }
+                            };
+                        // Bound any undispatched non-protective WS/Detached disable by its
                         // remaining request deadline so first dispatch never crosses expiry (R5 B2/M2).
-                        let span = match origin {
-                            DisableOrigin::LegacyWs { .. } | DisableOrigin::Detached { .. } => {
-                                budget.deadline.saturating_duration_since(Instant::now())
-                            }
-                            _ => budget.deadline.saturating_duration_since(budget.now),
-                        };
-                        let mut eff_span = span;
                         let mut applied_ws_dl = false;
                         if let Some(dl) = req_deadline {
                             if !is_protective && !drv.disable_frames_dispatched() {
-                                let req_rem = dl.saturating_duration_since(Instant::now());
-                                eff_span = span.min(req_rem);
-                                drv.set_tx_release_deadline(Some(drv_now + eff_span));
+                                let req_rem = dl.saturating_duration_since(live_owner_now);
+                                drv_deadline = drv_deadline.min(drv_now + req_rem);
+                                drv.set_tx_release_deadline(Some(drv_deadline));
                                 applied_ws_dl = true;
                             }
                         }
@@ -7926,9 +8046,9 @@ impl SupervisorInner {
                             || rt_executor_owned
                             || drv.supports_rt_executor().is_ok();
                         let r = if use_budgeted {
-                            drv.poll_torque_budgeted(drv_now + eff_span, budget.max_rx_frames)
+                            drv.poll_torque_budgeted(drv_deadline, budget.max_rx_frames)
                         } else {
-                            drv.poll_torque(drv_now + eff_span)
+                            drv.poll_torque(drv_deadline)
                         };
                         if applied_ws_dl {
                             drv.set_tx_release_deadline(None);
@@ -7947,26 +8067,54 @@ impl SupervisorInner {
                         );
                         #[cfg(not(target_arch = "wasm32"))]
                         shadow_rt.drain_from_driver(drv);
-                        (drv_now, r, frames_dispatched, dispatched_mask, rx, post_now, snap)
+                        DisablePollOutcome::Ran(
+                            drv_now,
+                            r,
+                            frames_dispatched,
+                            dispatched_mask,
+                            rx,
+                            post_now,
+                            snap,
+                        )
                     };
                     if nonblocking_lock {
                         match d.try_with_mut(run_poll) {
-                            Ok(v) => Ok(v),
-                            Err(crate::supervisor_lock::DriverTryError::WouldBlock) => Err(true),
-                            Err(crate::supervisor_lock::DriverTryError::Poisoned) => Err(false),
+                            Ok(v) => v,
+                            Err(crate::supervisor_lock::DriverTryError::WouldBlock) => {
+                                DisablePollOutcome::Contended
+                            }
+                            Err(crate::supervisor_lock::DriverTryError::Poisoned) => {
+                                DisablePollOutcome::Poisoned
+                            }
                         }
                     } else {
-                        d.with_mut(run_poll).ok_or(false)
+                        d.with_mut(run_poll).unwrap_or(DisablePollOutcome::Poisoned)
                     }
                 };
                 self.scratch.ages = ages_buf;
                 self.scratch.fb.bounds = bounds_buf;
                 let (drv_now, r, frames_dispatched, dispatched_mask, rx, post_now, snap) = match poll_out {
-                    Ok(v) => {
+                    DisablePollOutcome::Ran(
+                        drv_now,
+                        r,
+                        frames_dispatched,
+                        dispatched_mask,
+                        rx,
+                        post_now,
+                        snap,
+                    ) => {
                         self.reset_disable_lock_contention();
-                        v
+                        (drv_now, r, frames_dispatched, dispatched_mask, rx, post_now, snap)
                     }
-                    Err(true) => {
+                    DisablePollOutcome::BudgetExpired(owner_now) => {
+                        self.torque_transition = Some(TorqueTransition::Disable { origin, kind });
+                        return Some(TransitionPoll {
+                            progress: Ok(Rt::Pending { wake: owner_now }),
+                            rx: Some((0, true)),
+                            broker_owned,
+                        });
+                    }
+                    DisablePollOutcome::Contended => {
                         self.torque_transition = Some(TorqueTransition::Disable { origin, kind });
                         self.record_disable_lock_contention();
                         return Some(TransitionPoll {
@@ -7975,7 +8123,7 @@ impl SupervisorInner {
                             broker_owned,
                         });
                     }
-                    Err(false) => {
+                    DisablePollOutcome::Poisoned => {
                         match origin {
                             DisableOrigin::Park { watchdog, action_id, .. } => {
                                 self.finish_park_disable_failed(
@@ -8950,7 +9098,7 @@ impl SupervisorInner {
     ) -> Result<SafetyState, ClearFaultWithAuthError> {
         use crate::rt_core::requests::lease::recheck_clear_fault_authority_readonly;
         use crate::safety::{ClearFaultError, ClearRefusal, FaultKind};
-        if self.shutdown_committed {
+        if self.internal_fault_lane.is_fenced() || self.shutdown_committed {
             return Err(ClearFaultWithAuthError::Clear(ClearFaultError::Rejected(ClearRefusal::ShutdownCommitted)));
         }
         // Build live pre-commit ClearContext right before committing so any concurrent E-stop,
@@ -9648,12 +9796,11 @@ impl SupervisorInner {
                     // Sample driver clock FIRST, then live owner clock, and refuse expired budgets
                     // before staging any driver TX deadline so guard wait or `clock_now()` latency
                     // can never add time back to the caller's cutoff.
-                    let drv_now = drv.clock_now();
-                    let owner_now = now_fn();
-                    if owner_now >= deadline {
+                    let Ok((_, _, drv_deadline)) =
+                        crate::supervisor::translate_driver_cutoff_conservative(drv, deadline, now_fn)
+                    else {
                         return BudgetedProbeAttempt::BudgetExpired;
-                    }
-                    let drv_deadline = drv_now + deadline.saturating_duration_since(owner_now);
+                    };
                     drv.set_tx_release_deadline(Some(drv_deadline));
                     let res = drv.probe_tx_ready_budgeted(drv_deadline);
                     drv.set_tx_release_deadline(None);
@@ -9748,12 +9895,13 @@ impl SupervisorInner {
                             }
                             // Sample driver clock FIRST, then live owner clock, and refuse expired
                             // budgets before staging any driver TX deadline.
-                            let drv_now = drv.clock_now();
-                            let owner_now = now_fn();
-                            if owner_now >= deadline {
+                            let Ok((_, _, drv_deadline)) =
+                                crate::supervisor::translate_driver_cutoff_conservative(
+                                    drv, deadline, now_fn,
+                                )
+                            else {
                                 return BudgetedResetAttempt::Refusal(R::BudgetExpired);
-                            }
-                            let drv_deadline = drv_now + deadline.saturating_duration_since(owner_now);
+                            };
                             drv.set_tx_release_deadline(Some(drv_deadline));
                             let res = drv.clear_fault_budgeted(drv_deadline);
                             drv.set_tx_release_deadline(None);
@@ -9875,10 +10023,22 @@ impl SupervisorInner {
         self.disable_requested();
     }
 
-    /// Bounded last-chance disable on a caught-panic path owned by this `SupervisorInner`.
-    /// Seals the live `PanicDisableOutcome` strictly BEFORE running shadow drain/flush so
-    /// shadow processing can never turn a confirmed panic disable into a hard deadline timeout.
+    /// Explicit test-only ProcessExit authorization on `SupervisorInner` (DRV-F1 B7).
+    #[doc(hidden)]
+    pub fn authorize_process_exit_for_test(&mut self) {
+        self.process_exit_authorized = true;
+    }
+
+    /// Bounded last-chance disable reserved for explicit `ProcessExit` paths owned by this
+    /// `SupervisorInner`. Refuses protective cuts unless explicit owner-bound ProcessExit
+    /// authorization is set (`process_exit_authorized` or `shutdown_committed`, DRV-F1 B7).
+    #[doc(hidden)]
     pub fn attempt_panic_disable(&mut self, timeout: Duration) -> PanicDisableOutcome {
+        if !self.process_exit_authorized && !self.shutdown_committed {
+            return PanicDisableOutcome::Failed(
+                "protective disable requires explicit ProcessExit authorization".into(),
+            );
+        }
         self.attempt_bounded_teardown_disable(timeout, true)
     }
 
@@ -10506,6 +10666,7 @@ mod panic_disable_tests {
             let _ = rel_rx.recv();
         });
         locked_rx.recv().unwrap();
+        sup.authorize_process_exit_for_test();
         let legacy_outcome = sup.attempt_legacy_panic_disable(Duration::from_millis(12));
         rel_tx.send(()).unwrap();
         holder.join().unwrap();

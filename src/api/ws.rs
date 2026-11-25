@@ -2832,6 +2832,24 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 let _ = worker_reg_rx.wait_for(|v| v.is_some()).await;
             }
             let raw_kind = value.get("type").and_then(Value::as_str).unwrap_or("");
+            if recv_supervisor.internal_fault_fenced()
+                && !matches!(raw_kind, "release_lease" | "heartbeat" | "auth")
+            {
+                let mut reply = json!({
+                    "type": "command_reject",
+                    "status": 503,
+                    "code": "INTERNAL_FAULT",
+                    "error": "INTERNAL_FAULT",
+                    "message": "Internal fault or SAFE-HOLD active; commands and rearm are fenced"
+                });
+                if let Some(rid) = value.get("request_id").cloned() {
+                    reply["request_id"] = rid;
+                }
+                if !worker_writer.send_ordinary_control(reply).await {
+                    break;
+                }
+                continue;
+            }
             let (frame_kind, entry) = dispatch::classify(&value);
             // Unified table-bound async session handlers (`acquire_lease`, `release_lease`)
             // dispatched strictly through `entry.handler` (single authority in `dispatch.rs`).
@@ -3510,8 +3528,22 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     // and NEVER aborts `reader_task` or triggers early teardown.
     enum FirstExit { Writer, Reader }
     let first_exit = tokio::select! {
-        _ = &mut writer_task => FirstExit::Writer,
-        _ = &mut reader_task => FirstExit::Reader,
+        res = &mut writer_task => {
+            if let Err(je) = res {
+                if je.is_panic() {
+                    tracing::error!("WS writer_task panicked on connection {conn_id}: {je}");
+                }
+            }
+            FirstExit::Writer
+        }
+        res = &mut reader_task => {
+            if let Err(je) = res {
+                if je.is_panic() {
+                    tracing::error!("WS reader_task panicked on connection {conn_id}: {je}");
+                }
+            }
+            FirstExit::Reader
+        }
     };
     // M1: The VERY FIRST action on socket close is a non-blocking owner-side fence of this
     // connection's lease generation BEFORE any task abort, join, or cleanup, so zero bus output
@@ -3530,7 +3562,11 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
 
     // Stop and JOIN all primary tasks so none outlives teardown; give writer <= 1 s grace on fatal overflow.
     worker_task.abort();
-    let _ = worker_task.await;
+    if let Err(je) = worker_task.await {
+        if je.is_panic() {
+            tracing::error!("WS worker_task panicked on connection {conn_id}: {je}");
+        }
+    }
     if let Some(handle) = supervisor.executor_handle() {
         let _ = handle.try_unregister_servo_connection(conn_id);
     }

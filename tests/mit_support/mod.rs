@@ -84,6 +84,10 @@ pub struct FakeMotor {
     pub last_pos_force: Option<(f32, u16, u16)>,
     /// Reported motor temperature (°C) carried in feedback bytes 6-7 (default 30).
     pub temperature_c: u8,
+    /// When true, `CMD_SET_ZERO` is acknowledged with feedback but does NOT reset `q` to 0.0.
+    pub ignore_set_zero: bool,
+    /// Number of `CMD_SET_ZERO` frames received by this motor.
+    pub set_zero_count: usize,
 }
 
 impl FakeMotor {
@@ -101,7 +105,8 @@ impl FakeMotor {
             silent: false, ignore_reg_writes: false, ack_value_override: None, no_write_ack: false, ack_value_override_once: None, silent_after_mode_ack: false,
             mute_feedback_after_mode_ack: false, mute_feedback: false, no_feedback: false, last_cmd: None, last_cmd_at: None, watchdog_expired_at: None, commands: 0,
             drop_torque_frames: 0, torque_reply_delay: Duration::ZERO, torque_ready_at: None,
-            stop_at: None, nm_per_raw: 0.0007, stop_stiffness: 250.0, last_pos_force: None, temperature_c: 30 }
+            stop_at: None, nm_per_raw: 0.0007, stop_stiffness: 250.0, last_pos_force: None, temperature_c: 30,
+            ignore_set_zero: false, set_zero_count: 0 }
     }
 
     pub fn reg_u32(&self, rid: u8) -> u32 { u32::from_le_bytes(self.regs[&rid]) }
@@ -207,6 +212,9 @@ pub struct FakeBusState {
     pub tx_attempts: usize,
     /// The next `n` flushes fail.
     pub fail_flushes: usize,
+    /// When true, arms `fail_flushes += 1` right as the next Damiao `REG_WRITE` frame is transmitted
+    /// so `flush()` immediately fails after that frame hits the wire (tests M3 `SentFlushFailed`).
+    pub fail_next_reg_write_flush: bool,
     /// When true, `CanTransport::flush_is_noop()` returns `false` so the driver enforces the
     /// tick TX cutoff before starting `flush()`.
     pub real_flush: bool,
@@ -344,6 +352,11 @@ impl FakeBusState {
                 self.motors[k].enabled = false;
             } else if cmd == damiao::CMD_CLEAR_FAULTS {
                 self.motors[k].state_override = None;
+            } else if cmd == damiao::CMD_SET_ZERO {
+                if !self.motors[k].ignore_set_zero {
+                    self.motors[k].q = 0.0;
+                }
+                self.motors[k].set_zero_count += 1;
             } else if self.motors[k].ctrl_mode() == damiao::CTRL_MODE_MIT {
                 let c = decode_mit(&cmd, &self.motors[k].limits);
                 self.command(k, Some(c));
@@ -447,6 +460,7 @@ impl FakeBus {
             tx_spike_step: Duration::ZERO,
             tx_attempts: 0,
             fail_flushes: 0,
+            fail_next_reg_write_flush: false,
             real_flush: false,
             poll_feeds_watchdog: false,
             follow_commands: true,
@@ -506,6 +520,10 @@ impl CanTransport for FakeBus {
         if !s.inject_on_next_tx.is_empty() {
             let state = &mut *s;
             state.rx.extend(state.inject_on_next_tx.drain(..));
+        }
+        if frame.id == 0x7FF && frame.data[2] == damiao::REG_WRITE && s.fail_next_reg_write_flush {
+            s.fail_next_reg_write_flush = false;
+            s.fail_flushes = s.fail_flushes.saturating_add(1);
         }
         if frame.id == 0x7FF && frame.data[2] == damiao::REG_WRITE && !s.inject_on_reg_write.is_empty() {
             let state = &mut *s;
@@ -602,7 +620,12 @@ impl CanTransport for FakeBus {
     }
     fn flush(&mut self) -> Result<(), TransportError> {
         let mut s = self.0.lock().unwrap();
-        if s.fail_flushes > 0 { s.fail_flushes -= 1; return Err(TransportError::Can("injected flush error".into())); }
+        if s.fail_flushes > 0 {
+            s.fail_flushes -= 1;
+            return Err(TransportError::Io(std::io::Error::from(
+                std::io::ErrorKind::BrokenPipe,
+            )));
+        }
         Ok(())
     }
     fn flush_is_noop(&self) -> bool {

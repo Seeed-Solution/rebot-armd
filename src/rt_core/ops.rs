@@ -593,6 +593,18 @@ pub trait CoreOps {
     ) -> Result<Committed, &'static str> {
         self.commit_transition(d, op, ctx)
     }
+    /// Release-bounded [`Self::commit_transition`] with a live owner clock callback for
+    /// conservative driver-clock-first cutoff translation.
+    fn commit_transition_for_release_with_clock(
+        &mut self,
+        d: &Descriptor,
+        op: TransitionOp,
+        ctx: &CommitCtx,
+        release_deadline: Instant,
+        _now_fn: &mut dyn FnMut() -> Instant,
+    ) -> Result<Committed, &'static str> {
+        self.commit_transition_for_release(d, op, ctx, release_deadline)
+    }
     /// Applies one target after rechecking it ([`TargetFrame::check`] against the core's
     /// [`super::mailbox::TargetAuthority`], then the configuration hold).
     ///
@@ -663,10 +675,28 @@ pub trait CoreOps {
     fn poll_hardware_for_release(&mut self, budget: &ServiceBudget, _release_deadline: Instant) -> HardwarePoll {
         self.poll_hardware(budget)
     }
+    /// Release-bounded [`Self::poll_hardware`] with a live owner clock callback for conservative
+    /// driver-clock-first cutoff translation.
+    fn poll_hardware_for_release_with_clock(
+        &mut self,
+        budget: &ServiceBudget,
+        release_deadline: Instant,
+        _now_fn: &mut dyn FnMut() -> Instant,
+    ) -> HardwarePoll {
+        self.poll_hardware_for_release(budget, release_deadline)
+    }
     /// Sub-release wake for a pending driver transition only (without running a full release
     /// feedback pass). Default delegates to [`Self::poll_hardware`].
     fn poll_transition_wake(&mut self, budget: &ServiceBudget) -> HardwarePoll {
         self.poll_hardware(budget)
+    }
+    /// Sub-release wake with a live owner clock callback.
+    fn poll_transition_wake_with_clock(
+        &mut self,
+        budget: &ServiceBudget,
+        _now_fn: &mut dyn FnMut() -> Instant,
+    ) -> HardwarePoll {
+        self.poll_transition_wake(budget)
     }
     /// Release-bounded [`Self::poll_transition_wake`] carrying the absolute control
     /// `release_deadline` so sub-release transition TX obeys `release_deadline - margin`.
@@ -676,6 +706,15 @@ pub trait CoreOps {
         _release_deadline: Instant,
     ) -> HardwarePoll {
         self.poll_transition_wake(budget)
+    }
+    /// Release-bounded [`Self::poll_transition_wake`] with a live owner clock callback.
+    fn poll_transition_wake_for_release_with_clock(
+        &mut self,
+        budget: &ServiceBudget,
+        release_deadline: Instant,
+        _now_fn: &mut dyn FnMut() -> Instant,
+    ) -> HardwarePoll {
+        self.poll_transition_wake_for_release(budget, release_deadline)
     }
     /// One release of the control tick (`generation`: the publication's lock generation).
     fn advance(&mut self, dt: f64, generation: u64);
@@ -1385,15 +1424,35 @@ impl CoreOps for SupervisorInner {
         ctx: &CommitCtx,
         release_deadline: Instant,
     ) -> Result<Committed, &'static str> {
-        let applied = self.install_driver_tx_release_cap(ctx.now, release_deadline);
-        let res = self.commit_transition(d, op, ctx);
-        if applied {
-            self.clear_driver_tx_release_cap();
+        let entry_wall = Instant::now();
+        let mut live_now = || ctx.now + Instant::now().saturating_duration_since(entry_wall);
+        self.commit_transition_for_release_with_clock(d, op, ctx, release_deadline, &mut live_now)
+    }
+
+    fn commit_transition_for_release_with_clock(
+        &mut self,
+        d: &Descriptor,
+        op: TransitionOp,
+        ctx: &CommitCtx,
+        release_deadline: Instant,
+        now_fn: &mut dyn FnMut() -> Instant,
+    ) -> Result<Committed, &'static str> {
+        match self.install_driver_tx_release_cap_with_clock(release_deadline, now_fn) {
+            crate::supervisor::DriverTxCapOutcome::Expired => Err("BUDGET_EXPIRED"),
+            outcome => {
+                let res = self.commit_transition(d, op, ctx);
+                if outcome == crate::supervisor::DriverTxCapOutcome::Installed {
+                    self.clear_driver_tx_release_cap();
+                }
+                res
+            }
         }
-        res
     }
 
     fn consume_target(&mut self, frame: &TargetFrame, ctx: &CommitCtx) -> Result<(), Refusal> {
+        if self.internal_fault_lane.is_fenced() {
+            return Err(Refusal::code("INTERNAL_FAULT"));
+        }
         // track D: identity, deadline, authority, stream, policy generation, input / camera
         // ages, config hold, then the servo / policy step checks (supervisor::streams::targets)
         self.consume_target_frame(frame, ctx)
@@ -1405,6 +1464,9 @@ impl CoreOps for SupervisorInner {
         validity: super::mailbox::PolicyValidityBounds,
         ctx: &CommitCtx,
     ) -> Result<(), Refusal> {
+        if self.internal_fault_lane.is_fenced() {
+            return Err(Refusal::code("INTERNAL_FAULT"));
+        }
         self.consume_target_frame_with_validity(frame, validity, ctx)
     }
 
@@ -1516,22 +1578,61 @@ impl CoreOps for SupervisorInner {
         self.poll_hardware_with_release_deadline(budget, Some(release_deadline))
     }
 
+    fn poll_hardware_for_release_with_clock(
+        &mut self,
+        budget: &ServiceBudget,
+        release_deadline: Instant,
+        now_fn: &mut dyn FnMut() -> Instant,
+    ) -> HardwarePoll {
+        self.poll_hardware_with_release_deadline_with_clock(budget, Some(release_deadline), now_fn)
+    }
+
     fn poll_transition_wake_for_release(
         &mut self,
         budget: &ServiceBudget,
         release_deadline: Instant,
     ) -> HardwarePoll {
-        let applied = self.install_driver_tx_release_cap(budget.now, release_deadline);
-        let poll = self.poll_transition_wake(budget);
-        if applied {
-            self.clear_driver_tx_release_cap();
+        let entry_wall = Instant::now();
+        let mut live_now = || budget.now + Instant::now().saturating_duration_since(entry_wall);
+        self.poll_transition_wake_for_release_with_clock(budget, release_deadline, &mut live_now)
+    }
+
+    fn poll_transition_wake_for_release_with_clock(
+        &mut self,
+        budget: &ServiceBudget,
+        release_deadline: Instant,
+        now_fn: &mut dyn FnMut() -> Instant,
+    ) -> HardwarePoll {
+        match self.install_driver_tx_release_cap_with_clock(release_deadline, now_fn) {
+            crate::supervisor::DriverTxCapOutcome::Expired => HardwarePoll {
+                driverless: self.driver.is_none(),
+                budget_exhausted: true,
+                torque: self.core.poll_transition(),
+                ..HardwarePoll::default()
+            },
+            outcome => {
+                let poll = self.poll_transition_wake_with_clock(budget, now_fn);
+                if outcome == crate::supervisor::DriverTxCapOutcome::Installed {
+                    self.clear_driver_tx_release_cap();
+                }
+                poll
+            }
         }
-        poll
     }
 
     fn poll_transition_wake(&mut self, budget: &ServiceBudget) -> HardwarePoll {
+        let entry_wall = Instant::now();
+        let mut live_now = || budget.now + Instant::now().saturating_duration_since(entry_wall);
+        self.poll_transition_wake_with_clock(budget, &mut live_now)
+    }
+
+    fn poll_transition_wake_with_clock(
+        &mut self,
+        budget: &ServiceBudget,
+        now_fn: &mut dyn FnMut() -> Instant,
+    ) -> HardwarePoll {
         self.last_clock_now = Some(budget.now);
-        let trans = self.service_torque_transition(budget);
+        let trans = self.service_torque_transition_with_clock(budget, now_fn);
         let mut park_wake = None;
         let mut park_state_changed = false;
         let (rx_frames, trans_exhausted) = match trans {
@@ -2150,7 +2251,7 @@ impl ReleaseEngine {
         // recovery TX path (`src/driver.rs:4701`) outside Step 5's `BeforeOutput` checkpoint;
         // that path is addressed on branch `feat/rt-tx-budget`, which merges after stage 3 step 1.
         let budget = ServiceBudget::for_release(now_fn(), release_deadline);
-        report.poll = core.poll_hardware_for_release(&budget, release_deadline);
+        report.poll = core.poll_hardware_for_release_with_clock(&budget, release_deadline, &mut now_fn);
         let finished_transition = self.take_finished_transition(&mut report);
         // 2b. Owner persistence and bounded maintenance run strictly after Step 2 feedback intake
         // and strictly before Step 3–6 commit, output, and publication.
@@ -2287,7 +2388,15 @@ impl ReleaseEngine {
                             None => Err("PLAN_RETIRED"),
                         },
                         CommandKind::Immediate(op) => core.commit_immediate(&d, op, &ctx),
-                        CommandKind::Transition(op) => core.commit_transition_for_release(&d, op, &ctx, release_deadline),
+                        CommandKind::Transition(op) => {
+                            core.commit_transition_for_release_with_clock(
+                                &d,
+                                op,
+                                &ctx,
+                                release_deadline,
+                                &mut now_fn,
+                            )
+                        }
                         #[cfg(not(target_arch = "wasm32"))]
                         CommandKind::Action(cmd) => {
                             let slot_res = if cmd.plan().is_some() {
@@ -2509,11 +2618,25 @@ impl ReleaseEngine {
         publish_generation: u64,
         report: &mut ReleaseReport,
     ) -> bool {
+        let entry_wall = Instant::now();
+        let mut live_now = || now + Instant::now().saturating_duration_since(entry_wall);
+        self.service_wake_with_clock(core, &mut live_now, release_deadline, publish_generation, report)
+    }
+
+    pub fn service_wake_with_clock<O: CoreOps>(
+        &mut self,
+        core: &mut O,
+        mut now_fn: impl FnMut() -> Instant,
+        release_deadline: Instant,
+        publish_generation: u64,
+        report: &mut ReleaseReport,
+    ) -> bool {
+        let now = now_fn();
         let urgent_applied = self.apply_pending_urgent_at(core, now);
         let lifecycle_pending = self.has_pending_lifecycle_replies();
         if urgent_applied { report.stopped = true; }
         let budget = ServiceBudget::for_release(now, release_deadline);
-        report.poll = core.poll_transition_wake_for_release(&budget, release_deadline);
+        report.poll = core.poll_transition_wake_for_release_with_clock(&budget, release_deadline, &mut now_fn);
         let finished = self
             .take_finished_transition(report)
             .or_else(|| self.take_aborted_transition(core, report));

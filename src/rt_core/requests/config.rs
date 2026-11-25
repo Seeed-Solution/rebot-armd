@@ -1101,6 +1101,13 @@ pub enum ReservePrecheck {
         expected_txn_id: Option<u64>,
         operator_grant: crate::auth::OperatorGrant,
         expected_gripper_calib_revision: Option<u64>,
+        is_hardware_motor_zero: bool,
+    },
+    MitCommissioning {
+        allow_during_calibration_busy: bool,
+        expected_txn_id: Option<u64>,
+        operator_grant: crate::auth::OperatorGrant,
+        require_driver: bool,
     },
 }
 
@@ -1112,6 +1119,7 @@ pub struct VerifyDomainChecks {
     pub require_workspace_unblocked: bool,
     pub require_kinematics_disarmed: bool,
     pub require_software_zero_idle: bool,
+    pub require_mit_torque_off: bool,
     pub expected_txn_id: Option<u64>,
     pub operator_grant: Option<crate::auth::OperatorGrant>,
 }
@@ -1131,7 +1139,14 @@ pub enum CalibrationTxnKind {
     SoftwareZero {
         set_busy: bool,
     },
+    MotorZero {
+        set_busy: bool,
+    },
     JointZeroRestore,
+    MitTimeout {
+        dry_run: bool,
+    },
+    MitQualification,
 }
 
 /// Stack-only snapshot returned by `BeginCalibrationTxn` / `SampleCalibrationState` (0 alloc on RT).
@@ -1199,6 +1214,9 @@ pub enum ConfigCandidate {
     SoftwareJointZero {
         new_offsets: [f32; crate::rt_core::mailbox::MAX_DOF],
         dof: usize,
+        is_hardware_motor_zero: bool,
+        zeroed_mask: u64,
+        raw_after: [f32; crate::rt_core::mailbox::MAX_DOF],
         calibration: Option<CalibrationFile>,
         #[cfg(feature = "policy-runtime")]
         calibration_digest: String,
@@ -1213,6 +1231,13 @@ pub enum ConfigCandidate {
         reset_gripper_baseline: bool,
         replacement_baseline: Option<crate::gripper_baseline::FreeTorqueBaseline>,
         replacement_baseline_pending: Option<Vec<crate::gripper_baseline::MoveRecord>>,
+    },
+    MitQualification {
+        calibration: Option<CalibrationFile>,
+        #[cfg(feature = "policy-runtime")]
+        calibration_digest: String,
+        expected_txn_id: Option<u64>,
+        operator_grant: crate::auth::OperatorGrant,
     },
 }
 
@@ -1340,6 +1365,7 @@ pub struct ConfigActivated {
     pub revision: u64,
     pub durability: Durability,
     pub workspace_revision: u64,
+    pub motion_config_revision: u64,
     pub poses_revision: u64,
     pub gripper_calib_revision: u64,
     pub grasp_setup_revision: u64,
@@ -1349,6 +1375,52 @@ pub struct ConfigActivated {
     pub safety_state: SafetyStateTag,
     pub gravity_comp_active: bool,
     pub activated_at: Instant,
+    pub limit_min: [f32; crate::rt_core::mailbox::MAX_DOF],
+    pub limit_max: [f32; crate::rt_core::mailbox::MAX_DOF],
+    pub limit_vel: [f32; crate::rt_core::mailbox::MAX_DOF],
+    pub limit_len: usize,
+}
+
+impl ConfigActivated {
+    fn from_core(
+        core: &SupervisorInner,
+        revision: u64,
+        durability: Durability,
+        activated_at: Instant,
+    ) -> Self {
+        let mut limit_min = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
+        let mut limit_max = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
+        let mut limit_vel = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
+        let limit_len = core
+            .config
+            .limits
+            .len()
+            .min(crate::rt_core::mailbox::MAX_DOF);
+        for i in 0..limit_len {
+            limit_min[i] = core.config.limits[i].min_position;
+            limit_max[i] = core.config.limits[i].max_position;
+            limit_vel[i] = core.config.limits[i].max_velocity;
+        }
+        Self {
+            revision,
+            durability,
+            workspace_revision: core.workspace_revision,
+            motion_config_revision: core.motion_config_revision,
+            poses_revision: core.poses.revision,
+            gripper_calib_revision: core.gripper_calib_revision,
+            grasp_setup_revision: core.grasp_setup_revision,
+            calibration_revision: core.calibration_revision,
+            epoch_id: core.safety.epoch_id(),
+            is_torqued: core.is_torqued,
+            safety_state: SafetyStateTag::from_state(core.safety.state()),
+            gravity_comp_active: core.gravity_comp_active(),
+            activated_at,
+            limit_min,
+            limit_max,
+            limit_vel,
+            limit_len,
+        }
+    }
 }
 
 /// All owner-side configuration and companion maintenance requests routed via `MaintenanceOp::Config`.
@@ -1412,6 +1484,34 @@ pub enum ConfigRequest {
     /// Clears `RunPins` for `action_id` on the live owner (`OWNER_EXECUTOR`) with zero free on
     /// `armd-control`.
     ClearSequenceRunPins { action_id: u64 },
+    /// Starts one tick-driven non-blocking hardware commissioning op on the RT owner (0 alloc).
+    StartCommissioning(crate::mit::CommissioningStartRequest),
+    /// Binds durable `.calibration_commit.pending` marker proof to an active `Reserved` calibration
+    /// hold before irreversible hardware commissioning TX (B2; 0 alloc).
+    BindCommissioningMarker { grant_id: GrantId },
+    /// Polls status and per-joint outcomes of commissioning op `op_id` (0 alloc).
+    PollCommissioning { op_id: u64 },
+    /// Cancels an active commissioning op matching `op_id` (stale ids ignored; forces
+    /// `Reconciling` if hardware or disk was already mutated; 0 alloc).
+    CancelCommissioning { op_id: u64, reason: &'static str },
+    /// Clears a terminal commissioning slot owned by `op_id` once off-thread handling completes.
+    ClearCommissioning {
+        op_id: u64,
+        clean_complete: bool,
+        force_reconcile: bool,
+    },
+    /// Commits an intermediate durable `calibration.json` update (e.g. pre-hardware MIT
+    /// qualification invalidation during `motor_zero`) on the single held `Calibration`
+    /// reservation without releasing it, advancing `reservation.from` in lockstep (0 alloc/free).
+    CommitIntermediateCalibration {
+        reservation: Reservation,
+        auth: ConfigAuthContext,
+        calibration: Option<CalibrationFile>,
+        #[cfg(feature = "policy-runtime")]
+        calibration_digest: String,
+        expected_txn_id: u64,
+        operator_grant: crate::auth::OperatorGrant,
+    },
 }
 
 impl ConfigRequest {
@@ -1432,7 +1532,13 @@ impl ConfigRequest {
             Self::CheckEpisodeDeleteAllowed(_) => "/api/v1/episodes/delete",
             Self::BeginCalibrationTxn { .. }
             | Self::EndCalibrationTxn { .. }
-            | Self::SampleCalibrationState { .. } => "/api/v1/calibration",
+            | Self::SampleCalibrationState { .. }
+            | Self::StartCommissioning(_)
+            | Self::BindCommissioningMarker { .. }
+            | Self::PollCommissioning { .. }
+            | Self::CancelCommissioning { .. }
+            | Self::ClearCommissioning { .. }
+            | Self::CommitIntermediateCalibration { .. } => "/api/v1/calibration",
             Self::InstallSequenceRunPins(_) | Self::ClearSequenceRunPins { .. } => {
                 "/api/v1/action/run_sequence"
             }
@@ -1460,6 +1566,12 @@ pub enum ConfigReply {
     CalibrationTxnEnded(bool),
     CalibrationStateSampled(Result<CalibrationStateSample, ConfigError>),
     SequenceRunPinsUpdated,
+    CommissioningStarted(Result<u64, ConfigError>),
+    CommissioningMarkerBound(Result<(), &'static str>),
+    CommissioningPolled(Option<crate::mit::CommissioningSnapshot>),
+    CommissioningCancelled(Option<crate::mit::CommissioningSnapshot>),
+    CommissioningCleared(bool),
+    IntermediateCalibrationCommitted(Result<(Reservation, u64), ConfigError>),
 }
 
 /// Displaced or unused heap payloads carried back inside the SAME `Box<ConfigExchange>`
@@ -1634,6 +1746,97 @@ pub(crate) fn handle_config_exchange(
             require_zero_state_checks,
             check_authority,
         )),
+        ConfigRequest::StartCommissioning(req) => {
+            ConfigReply::CommissioningStarted(core.start_commissioning_rt(req, ctx.now))
+        }
+        ConfigRequest::BindCommissioningMarker { grant_id } => ConfigReply::CommissioningMarkerBound(
+            core.core.config_mut().bind_commissioning_marker(grant_id),
+        ),
+        ConfigRequest::PollCommissioning { op_id } => {
+            ConfigReply::CommissioningPolled(core.poll_commissioning_rt(op_id))
+        }
+        ConfigRequest::CancelCommissioning { op_id, reason } => {
+            ConfigReply::CommissioningCancelled(core.cancel_commissioning_rt(op_id, reason))
+        }
+        ConfigRequest::ClearCommissioning {
+            op_id,
+            clean_complete,
+            force_reconcile,
+        } => ConfigReply::CommissioningCleared(core.clear_commissioning_rt(
+            op_id,
+            clean_complete,
+            force_reconcile,
+        )),
+        ConfigRequest::CommitIntermediateCalibration {
+            mut reservation,
+            auth,
+            calibration,
+            #[cfg(feature = "policy-runtime")]
+            calibration_digest,
+            expected_txn_id,
+            operator_grant,
+        } => {
+            let mut cal_slot = calibration;
+            #[cfg(feature = "policy-runtime")]
+            let mut digest_slot = Some(calibration_digest);
+            let res = (|| {
+                let domain = reservation.domain();
+                if domain != ConfigDomain::Calibration
+                    || core
+                        .core
+                        .config_held(domain)
+                        .is_none_or(|h| h.grant != Some(reservation.grant()))
+                {
+                    return Err(ConfigError::Reconciling("NOT_HELD"));
+                }
+                if core.calibration_txn_id != Some(expected_txn_id) {
+                    return Err(ConfigError::Reconciling("CONFIG_BUSY"));
+                }
+                if !operator_grant.is_valid_at(ctx.now, core.operator_auth_enforced) {
+                    return Err(ConfigError::Reconciling("OPERATOR_REQUIRED"));
+                }
+                let recheck_proposal = ConfigProposal {
+                    domain,
+                    expected_revision: reservation.from(),
+                    candidate: reservation.candidate(),
+                    stamp: *reservation.stamp(),
+                };
+                if check_config_authority(core, ctx, &recheck_proposal, &auth, false).is_err() {
+                    return Err(ConfigError::Reconciling("AUTHORITY_REVOKED"));
+                }
+                let current_rev = ConfigAuthority::revision(core, domain);
+                if current_rev != reservation.from() {
+                    return Err(ConfigError::Reconciling("REVISION_MISMATCH"));
+                }
+                let next_rev = core.calibration_revision + 1;
+                if let Err(code) = core.core.config_mut().advance_from(&mut reservation, next_rev) {
+                    return Err(ConfigError::Reconciling(code));
+                }
+                ex.retired.calibration_file =
+                    std::mem::replace(&mut core.calibration, cal_slot.take());
+                #[cfg(feature = "policy-runtime")]
+                if let Some(d) = digest_slot.take() {
+                    ex.retired.string_a = Some(std::mem::replace(&mut core.calibration_digest, d));
+                }
+                core.calibration_revision = next_rev;
+                if !core.rt_executor_owned {
+                    core.refresh_schema_cache();
+                }
+                Ok((reservation, next_rev))
+            })();
+            if res.is_err() {
+                ex.retired.calibration_file = cal_slot;
+                #[cfg(feature = "policy-runtime")]
+                {
+                    ex.retired.string_a = digest_slot;
+                }
+                let active_rev = ConfigAuthority::revision(core, ConfigDomain::Calibration);
+                core.core
+                    .config_mut()
+                    .force_reconcile(ConfigDomain::Calibration, active_rev);
+            }
+            ConfigReply::IntermediateCalibrationCommitted(res)
+        }
     };
     ex.reply = Some(reply);
 }
@@ -1823,19 +2026,13 @@ fn run_reserve_precheck(
             expected_txn_id,
             operator_grant,
             expected_gripper_calib_revision,
+            is_hardware_motor_zero,
         } => {
             if !operator_grant.is_valid_at(now, core.operator_auth_enforced) {
                 return Err(ConfigError::CalibPrecondition {
                     status: 403,
                     code: "OPERATOR_REQUIRED",
                     message: "Operator session expired or locked during calibration",
-                });
-            }
-            if core.rt_executor_owned && core.driver.is_some() {
-                return Err(ConfigError::CalibPrecondition {
-                    status: 409,
-                    code: "EXECUTOR_UNSUPPORTED",
-                    message: "software joint zero with an attached hardware driver is not available while the RT executor owns the arm; use the legacy owner",
                 });
             }
             if let Some(tid) = expected_txn_id {
@@ -1847,7 +2044,7 @@ fn run_reserve_precheck(
                     "a calibration apply, restore, zero, or configuration change is running",
                 ));
             }
-            if core.config.zero_reference.is_none() {
+            if !is_hardware_motor_zero && core.config.zero_reference.is_none() {
                 return Err(ConfigError::CalibPrecondition {
                     status: 400,
                     code: "UNSUPPORTED",
@@ -1864,7 +2061,78 @@ fn run_reserve_precheck(
             }
             Ok(())
         }
+        ReservePrecheck::MitCommissioning {
+            allow_during_calibration_busy,
+            expected_txn_id,
+            operator_grant,
+            require_driver,
+        } => {
+            if !operator_grant.is_valid_at(now, core.operator_auth_enforced) {
+                return Err(ConfigError::CalibPrecondition {
+                    status: 403,
+                    code: "OPERATOR_REQUIRED",
+                    message: "Operator session expired or locked during calibration",
+                });
+            }
+            if require_driver && core.driver.is_none() {
+                return Err(ConfigError::CalibPrecondition {
+                    status: 400,
+                    code: "UNSUPPORTED",
+                    message: "no motor driver",
+                });
+            }
+            if let Some(tid) = expected_txn_id {
+                if core.calibration_txn_id != Some(tid) {
+                    return Err(ConfigError::Busy("calibration transaction ownership was lost"));
+                }
+            } else if !allow_during_calibration_busy && core.calibration_busy {
+                return Err(ConfigError::Busy("a calibration transaction is running"));
+            }
+            check_mit_torque_off_rt(core)?;
+            Ok(())
+        }
     }
+}
+
+fn check_mit_torque_off_rt(core: &SupervisorInner) -> Result<(), ConfigError> {
+    if core.driver.is_none() {
+        return Err(ConfigError::CalibPrecondition {
+            status: 400,
+            code: "UNSUPPORTED",
+            message: "no motor driver",
+        });
+    }
+    if core.estop_pending() || core.safety.state().is_stopped() {
+        return Err(ConfigError::CalibPrecondition {
+            status: 409,
+            code: "MIT_TIMEOUT_ARMED",
+            message: "the arm is stopped or faulted; clear the fault first",
+        });
+    }
+    if core.is_torqued
+        || core.disable_pending
+        || core.torque_transition.is_some()
+        || core.handover_settling_since.is_some()
+    {
+        return Err(ConfigError::CalibPrecondition {
+            status: 409,
+            code: "MIT_TIMEOUT_ARMED",
+            message: "torque must be off (load mechanically supported) for the TIMEOUT commissioning",
+        });
+    }
+    if core.active_trajectory.is_some()
+        || core.servo_target.is_some()
+        || core.gravity_comp.is_some()
+        || core.last_action.as_ref().is_some_and(|a| a.is_running())
+        || core.macro_run.is_some()
+    {
+        return Err(ConfigError::CalibPrecondition {
+            status: 409,
+            code: "MIT_TIMEOUT_ARMED",
+            message: "a motion is running",
+        });
+    }
+    Ok(())
 }
 
 fn has_grasp_setup_rt(core: &SupervisorInner) -> bool {
@@ -2120,14 +2388,8 @@ fn install_begin_calibration_txn(
             core.calibration_txn_id = Some(txn_id);
             Ok(sample)
         }
-        CalibrationTxnKind::SoftwareZero { set_busy } => {
-            if core.rt_executor_owned && core.driver.is_some() {
-                return Err(ConfigError::CalibPrecondition {
-                    status: 409,
-                    code: "EXECUTOR_UNSUPPORTED",
-                    message: "/api/v1/calibration/motor_zero is not available while the RT executor owns the arm; use the legacy owner",
-                });
-            }
+        CalibrationTxnKind::SoftwareZero { set_busy }
+        | CalibrationTxnKind::MotorZero { set_busy } => {
             if core.calibration_busy || core.core.config().held().is_some() {
                 return Err(ConfigError::Busy(
                     "a calibration apply, restore, motor zero, or configuration change is running",
@@ -2143,13 +2405,6 @@ fn install_begin_calibration_txn(
             Ok(sample)
         }
         CalibrationTxnKind::JointZeroRestore => {
-            if core.rt_executor_owned && core.driver.is_some() {
-                return Err(ConfigError::CalibPrecondition {
-                    status: 409,
-                    code: "EXECUTOR_UNSUPPORTED",
-                    message: "/api/v1/calibration/joint_zero/restore is not available while the RT executor owns the arm; use the legacy owner",
-                });
-            }
             if core.calibration_busy || core.core.config().held().is_some() {
                 return Err(ConfigError::Busy(
                     "a calibration apply, restore, zero, or configuration change is running",
@@ -2159,6 +2414,42 @@ fn install_begin_calibration_txn(
             let sample = snapshot_calibration_sample_rt(core, false)?;
             core.calibration_busy = true;
             core.motor_zero_busy = true;
+            core.calibration_txn_id = Some(txn_id);
+            Ok(sample)
+        }
+        CalibrationTxnKind::MitTimeout { dry_run } => {
+            if core.driver.is_none() {
+                return Err(ConfigError::CalibPrecondition {
+                    status: 400,
+                    code: "UNSUPPORTED",
+                    message: "no motor driver",
+                });
+            }
+            if core.calibration_busy || core.core.config().held().is_some() {
+                return Err(ConfigError::Busy("a calibration transaction is running"));
+            }
+            check_mit_torque_off_rt(core)?;
+            let sample = snapshot_calibration_sample_rt(core, false)?;
+            if !dry_run {
+                core.calibration_busy = true;
+                core.calibration_txn_id = Some(txn_id);
+            }
+            Ok(sample)
+        }
+        CalibrationTxnKind::MitQualification => {
+            if core.driver.is_none() {
+                return Err(ConfigError::CalibPrecondition {
+                    status: 400,
+                    code: "UNSUPPORTED",
+                    message: "no motor driver",
+                });
+            }
+            if core.calibration_busy || core.core.config().held().is_some() {
+                return Err(ConfigError::Busy("a calibration transaction is running"));
+            }
+            check_mit_torque_off_rt(core)?;
+            let sample = snapshot_calibration_sample_rt(core, false)?;
+            core.calibration_busy = true;
             core.calibration_txn_id = Some(txn_id);
             Ok(sample)
         }
@@ -2421,14 +2712,10 @@ fn install_verify_authority(
         check_kinematics_disarmed_rt(core)?;
     }
     if domain_checks.require_software_zero_idle {
-        if core.rt_executor_owned && core.driver.is_some() {
-            return Err(ConfigError::CalibPrecondition {
-                status: 409,
-                code: "EXECUTOR_UNSUPPORTED",
-                message: "software joint zero with an attached hardware driver is not available while the RT executor owns the arm; use the legacy owner",
-            });
-        }
         check_software_zero_idle_rt(core)?;
+    }
+    if domain_checks.require_mit_torque_off {
+        check_mit_torque_off_rt(core)?;
     }
     Ok(())
 }
@@ -2591,20 +2878,9 @@ fn install_activate_config(
     }
 
     match ConfigAuthority::activate(core, reservation) {
-        Activated::Active { revision, durability } => Ok(ConfigActivated {
-            revision,
-            durability,
-            workspace_revision: core.workspace_revision,
-            poses_revision: core.poses.revision,
-            gripper_calib_revision: core.gripper_calib_revision,
-            grasp_setup_revision: core.grasp_setup_revision,
-            calibration_revision: core.calibration_revision,
-            epoch_id: core.safety.epoch_id(),
-            is_torqued: core.is_torqued,
-            safety_state: SafetyStateTag::from_state(core.safety.state()),
-            gravity_comp_active: core.gravity_comp_active(),
-            activated_at: ctx.now,
-        }),
+        Activated::Active { revision, durability } => {
+            Ok(ConfigActivated::from_core(core, revision, durability, ctx.now))
+        }
         Activated::Refused { code, reservation } => {
             let _ = ConfigAuthority::release(core, reservation);
             Err(ConfigError::Busy(code))
@@ -2705,7 +2981,9 @@ fn check_candidate_domain_invariants(
             Ok(())
         }
         ConfigCandidate::SoftwareJointZero {
+            new_offsets,
             dof,
+            is_hardware_motor_zero,
             expected_gripper_calib_revision,
             expected_txn_id,
             operator_grant,
@@ -2723,11 +3001,14 @@ fn check_candidate_domain_invariants(
                     return Err("CONFIG_BUSY");
                 }
             }
-            if core.rt_executor_owned && core.driver.is_some() {
-                return Err("EXECUTOR_UNSUPPORTED");
-            }
-            if core.config.zero_reference.is_none() || *dof != core.config.dof {
+            if (!*is_hardware_motor_zero && core.config.zero_reference.is_none())
+                || *dof != core.config.dof
+                || *dof > crate::rt_core::mailbox::MAX_DOF
+            {
                 return Err("UNSUPPORTED");
+            }
+            if !new_offsets[..*dof].iter().all(|v| v.is_finite()) {
+                return Err("INVALID_COMMAND");
             }
             if let Err(err) = check_software_zero_idle_rt(core) {
                 return Err(match err {
@@ -2740,6 +3021,44 @@ fn check_candidate_domain_invariants(
                 if core.gripper_calib_revision != *exp_gc {
                     return Err("PLAN_STALE");
                 }
+            }
+            if let Some(ref d) = core.driver {
+                let has_pos_limits = d
+                    .with_ref(|drv| (0..*dof).any(|i| drv.position_limits(i).is_some()))
+                    .unwrap_or(false);
+                if has_pos_limits
+                    && core
+                        .probe_driver_limits_for_offsets_bounded(&new_offsets[..*dof])
+                        .is_err()
+                {
+                    return Err("INVALID_CALIBRATION");
+                }
+            }
+            Ok(())
+        }
+        ConfigCandidate::MitQualification {
+            expected_txn_id,
+            operator_grant,
+            ..
+        } => {
+            if !operator_grant.is_valid_at(now, core.operator_auth_enforced) {
+                return Err("OPERATOR_REQUIRED");
+            }
+            if for_reconcile {
+                if core.calibration_txn_id.is_some() && core.calibration_txn_id != *expected_txn_id {
+                    return Err("CONFIG_BUSY");
+                }
+            } else if let Some(tid) = expected_txn_id {
+                if core.calibration_txn_id != Some(*tid) {
+                    return Err("CONFIG_BUSY");
+                }
+            }
+            if let Err(err) = check_mit_torque_off_rt(core) {
+                return Err(match err {
+                    ConfigError::CalibPrecondition { code, .. }
+                    | ConfigError::CalibPreconditionText { code, .. } => code,
+                    _ => "MIT_TIMEOUT_ARMED",
+                });
             }
             Ok(())
         }
@@ -2903,6 +3222,9 @@ fn swap_config_candidate_in_place(
         ConfigCandidate::SoftwareJointZero {
             new_offsets,
             dof,
+            is_hardware_motor_zero,
+            zeroed_mask,
+            raw_after,
             calibration,
             #[cfg(feature = "policy-runtime")]
             calibration_digest,
@@ -2926,7 +3248,25 @@ fn swap_config_candidate_in_place(
                 let new_v = new_offsets[i];
                 let d = old - new_v;
                 core.joint_zero_offsets[i] = new_v;
-                if d != 0.0 {
+                if is_hardware_motor_zero && (zeroed_mask & (1u64 << i)) != 0 {
+                    if i == 5 {
+                        j6_changed = true;
+                    }
+                    let pos_after = if raw_after[i].is_finite() {
+                        raw_after[i] - new_v
+                    } else {
+                        -new_v
+                    };
+                    if let Some(p) = core.measured_positions.get_mut(i) {
+                        *p = pos_after;
+                    }
+                    if let Some(p) = core.commanded_positions.get_mut(i) {
+                        *p = pos_after;
+                    }
+                    if let Some(p) = core.target_positions.get_mut(i) {
+                        *p = pos_after;
+                    }
+                } else if d != 0.0 {
                     if i == 5 {
                         j6_changed = true;
                     }
@@ -2939,6 +3279,17 @@ fn swap_config_candidate_in_place(
                     if let Some(p) = core.target_positions.get_mut(i) {
                         *p += d;
                     }
+                }
+            }
+            if let Some(ref mut d) = core.driver {
+                let has_pos_limits = d
+                    .with_mut(|drv| {
+                        drv.set_joint_zero_offsets(&core.joint_zero_offsets[..n]);
+                        (0..n).any(|i| drv.position_limits(i).is_some())
+                    })
+                    .unwrap_or(false);
+                if has_pos_limits {
+                    let _ = core.reapply_driver_limits_bounded();
                 }
             }
             retired.tracking = core.tracking.invalidate_retiring();
@@ -3001,6 +3352,27 @@ fn swap_config_candidate_in_place(
                 core.bump_motion_config_revision();
                 core.retire_servo_ws_min_depths();
             }
+            core.calibration_revision += 1;
+            if !core.rt_executor_owned {
+                core.refresh_schema_cache();
+            }
+        }
+        ConfigCandidate::MitQualification {
+            calibration,
+            #[cfg(feature = "policy-runtime")]
+            calibration_digest,
+            expected_txn_id: _,
+            operator_grant: _,
+        } => {
+            retired.calibration_file = std::mem::replace(&mut core.calibration, calibration);
+            #[cfg(feature = "policy-runtime")]
+            {
+                retired.string_a = Some(std::mem::replace(
+                    &mut core.calibration_digest,
+                    calibration_digest,
+                ));
+            }
+            retired.string_b = core.calibration_load_error.take();
             core.calibration_revision += 1;
             if !core.rt_executor_owned {
                 core.refresh_schema_cache();
@@ -3082,20 +3454,12 @@ fn install_finish_reconcile(
         core.calibration_busy = true;
         core.calibration_txn_id = Some(cleanup_tid);
     }
-    Ok(ConfigActivated {
-        revision: ConfigAuthority::revision(core, domain),
-        durability: Durability::Durable,
-        workspace_revision: core.workspace_revision,
-        poses_revision: core.poses.revision,
-        gripper_calib_revision: core.gripper_calib_revision,
-        grasp_setup_revision: core.grasp_setup_revision,
-        calibration_revision: core.calibration_revision,
-        epoch_id: core.safety.epoch_id(),
-        is_torqued: core.is_torqued,
-        safety_state: SafetyStateTag::from_state(core.safety.state()),
-        gravity_comp_active: core.gravity_comp_active(),
-        activated_at: ctx.now,
-    })
+    Ok(ConfigActivated::from_core(
+        core,
+        ConfigAuthority::revision(core, domain),
+        Durability::Durable,
+        ctx.now,
+    ))
 }
 
 /// Zero-allocation owner-side fault latch called when bounded post-rename reconciliation
@@ -3499,6 +3863,7 @@ pub struct ReservationGuard {
     sup: Arc<ArmSupervisor>,
     reservation: Option<Reservation>,
     renamed: bool,
+    hw_mutated: bool,
     pub_phase: Option<Arc<AtomicU8>>,
 }
 
@@ -3508,6 +3873,7 @@ impl ReservationGuard {
             sup,
             reservation: Some(reservation),
             renamed: false,
+            hw_mutated: false,
             pub_phase: None,
         }
     }
@@ -3521,6 +3887,7 @@ impl ReservationGuard {
             sup,
             reservation: Some(reservation),
             renamed: false,
+            hw_mutated: false,
             pub_phase: Some(pub_phase),
         }
     }
@@ -3531,6 +3898,10 @@ impl ReservationGuard {
 
     pub fn mark_renamed(&mut self) {
         self.renamed = true;
+    }
+
+    pub fn mark_hw_mutated(&mut self) {
+        self.hw_mutated = true;
     }
 
     pub fn take(&mut self) -> Option<Reservation> {
@@ -3546,6 +3917,7 @@ impl Drop for ReservationGuard {
         let domain = reservation.domain();
         let sup = Arc::clone(&self.sup);
         let renamed = self.renamed
+            || self.hw_mutated
             || self
                 .pub_phase
                 .as_ref()
@@ -3807,7 +4179,7 @@ where
     let pub_phase_w = Arc::clone(&pub_phase);
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        let res = run_config_commit_worker(sup_w, plan, auth_check, update_published, pub_phase_w).await;
+        let res = run_config_commit_worker(sup_w, plan, None, false, auth_check, update_published, pub_phase_w).await;
         let _ = done_tx.send(res);
     });
     match done_rx.await {
@@ -3816,6 +4188,63 @@ where
             if pub_phase.load(Ordering::Acquire) != PUB_PHASE_PRE_RENAME {
                 Err(ConfigCommitError::post_publish_unknown(ArmError::Internal(
                     "configuration commit worker aborted after disk publication began; reconciliation required".into(),
+                )))
+            } else {
+                Err(ConfigCommitError::pre_publish(ArmError::Internal(
+                    "configuration commit worker aborted".into(),
+                )))
+            }
+        }
+    }
+}
+
+/// Runs the unified off-thread two-phase config commit orchestrator on an ALREADY HELD
+/// [`Reservation`] (e.g. a single uninterrupted `Calibration` reservation held across hardware
+/// commissioning readback/write + staging + both commit boundaries + `PublishedConfigHub` update).
+///
+/// When `hw_mutated` is `true`, hardware registers/flash have already been mutated:
+/// - Any pre-rename, post-rename, or dir-sync failure enters `HoldState::Reconciling` and latches
+///   a non-recoverable fault rather than releasing `Cleared` or spawning config-only dir-sync retry.
+/// - Any pending commit marker is preserved on failure so restart quarantines until reconciled.
+pub async fn run_config_commit_on_held_reservation<FAuth, FPub>(
+    sup: &Arc<ArmSupervisor>,
+    plan: ConfigCommitPlan,
+    reservation: Reservation,
+    hw_mutated: bool,
+    auth_check: FAuth,
+    update_published: FPub,
+) -> Result<ConfigCommitOutcome, ConfigCommitError>
+where
+    FAuth: Fn() -> Result<(), (&'static str, ArmError)> + Send + 'static,
+    FPub: FnOnce(&mut PublishedConfig, ConfigActivated) + Send + 'static,
+{
+    let sup_w = Arc::clone(sup);
+    let pub_phase = Arc::new(AtomicU8::new(if hw_mutated {
+        PUB_PHASE_RENAMING
+    } else {
+        PUB_PHASE_PRE_RENAME
+    }));
+    let pub_phase_w = Arc::clone(&pub_phase);
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let res = run_config_commit_worker(
+            sup_w,
+            plan,
+            Some(reservation),
+            hw_mutated,
+            auth_check,
+            update_published,
+            pub_phase_w,
+        )
+        .await;
+        let _ = done_tx.send(res);
+    });
+    match done_rx.await {
+        Ok(res) => res,
+        Err(_) => {
+            if hw_mutated || pub_phase.load(Ordering::Acquire) != PUB_PHASE_PRE_RENAME {
+                Err(ConfigCommitError::post_publish_unknown(ArmError::Internal(
+                    "configuration commit worker aborted after hardware/disk publication began; reconciliation required".into(),
                 )))
             } else {
                 Err(ConfigCommitError::pre_publish(ArmError::Internal(
@@ -3957,6 +4386,11 @@ pub(crate) trait CommonCommitWorker: Send {
         err: String,
     ) -> impl std::future::Future<Output = Self::Err> + Send {
         self.reconcile_rename_join_error(err)
+    }
+    /// When true (hardware already mutated), any pending-commit marker is preserved on abort
+    /// so restart quarantines until physical hardware and disk are reconciled.
+    fn preserve_marker_on_abort(&self) -> bool {
+        false
     }
     fn worker_disconnected_err(&mut self) -> Self::Err;
 }
@@ -4128,18 +4562,20 @@ pub(crate) async fn execute_common_commit<W: CommonCommitWorker>(
     //    blocking target renames; no blocking marker I/O runs after this check).
     if let Err(err) = w.verify_authority_before_rename().await {
         abort_staged_ops(staged_ops);
-        if let Some(mp) = worker_marker.take() {
-            let rm_res = run_fs_step(W::RUN_BLOCKING_ON_TOKIO, move || {
-                remove_pending_commit_marker(&mp)
-            })
-            .await
-            .map_err(|re| re.to_string())
-            .and_then(|r| r);
-            if let Err(rm_err) = rm_res {
-                tracing::error!(
-                    "Pre-rename verification failed and pending marker cleanup failed ({rm_err}); entering Reconciling"
-                );
-                return Err(w.reconcile_after_marker_error(rm_err).await);
+        if !w.preserve_marker_on_abort() {
+            if let Some(mp) = worker_marker.take() {
+                let rm_res = run_fs_step(W::RUN_BLOCKING_ON_TOKIO, move || {
+                    remove_pending_commit_marker(&mp)
+                })
+                .await
+                .map_err(|re| re.to_string())
+                .and_then(|r| r);
+                if let Err(rm_err) = rm_res {
+                    tracing::error!(
+                        "Pre-rename verification failed and pending marker cleanup failed ({rm_err}); entering Reconciling"
+                    );
+                    return Err(w.reconcile_after_marker_error(rm_err).await);
+                }
             }
         }
         w.release_pre_rename().await;
@@ -4217,18 +4653,20 @@ pub(crate) async fn execute_common_commit<W: CommonCommitWorker>(
         let dir_syncs = match rename_outcome {
             Ok(Ok(ds)) => ds,
             Ok(Err((false, _failed_path, e))) => {
-                if let Some(mp) = worker_marker.take() {
-                    let rm_res = run_fs_step(W::RUN_BLOCKING_ON_TOKIO, move || {
-                        remove_pending_commit_marker(&mp)
-                    })
-                    .await
-                    .map_err(|re| re.to_string())
-                    .and_then(|r| r);
-                    if let Err(rm_err) = rm_res {
-                        tracing::error!(
-                            "Pre-rename publish failed ({e}) and marker cleanup failed ({rm_err}); entering Reconciling"
-                        );
-                        return Err(w.reconcile_after_marker_error(format!("{e}; cleanup: {rm_err}")).await);
+                if !w.preserve_marker_on_abort() {
+                    if let Some(mp) = worker_marker.take() {
+                        let rm_res = run_fs_step(W::RUN_BLOCKING_ON_TOKIO, move || {
+                            remove_pending_commit_marker(&mp)
+                        })
+                        .await
+                        .map_err(|re| re.to_string())
+                        .and_then(|r| r);
+                        if let Err(rm_err) = rm_res {
+                            tracing::error!(
+                                "Pre-rename publish failed ({e}) and marker cleanup failed ({rm_err}); entering Reconciling"
+                            );
+                            return Err(w.reconcile_after_marker_error(format!("{e}; cleanup: {rm_err}")).await);
+                        }
                     }
                 }
                 tracing::warn!("State file not published: {e}");
@@ -4311,7 +4749,7 @@ pub(crate) async fn execute_common_commit<W: CommonCommitWorker>(
                 w.note_marker_cleanup_warning(ok, rm_err);
             }
         }
-    } else if !disk_published {
+    } else if !disk_published && !w.preserve_marker_on_abort() {
         if let Some(mp) = worker_marker.take() {
             let rm_res = run_fs_step(W::RUN_BLOCKING_ON_TOKIO, move || {
                 remove_pending_commit_marker(&mp)
@@ -4356,6 +4794,8 @@ struct ConfigCommitBackend<FAuth, FPub> {
     auth_check: Option<FAuth>,
     update_published: Option<FPub>,
     guard: Option<ReservationGuard>,
+    pre_held: Option<Reservation>,
+    hw_mutated: bool,
     grant: Option<GrantId>,
     domain: ConfigDomain,
     episode_pin_guard: Option<crate::recording::store::EpisodePinGuard>,
@@ -4403,6 +4843,28 @@ where
     }
 
     async fn reserve(&mut self) -> Result<(), Self::Err> {
+        if let Some(reservation) = self.pre_held.take() {
+            self.grant = Some(reservation.grant());
+            self.domain = reservation.domain();
+            let mut g = ReservationGuard::with_phase(
+                Arc::clone(&self.sup),
+                reservation,
+                Arc::clone(&self.pub_phase),
+            );
+            if self.hw_mutated {
+                g.mark_hw_mutated();
+            }
+            self.guard = Some(g);
+            if let Err((_, err)) = (self.auth_check.as_ref().expect("auth_check present"))() {
+                self.release_pre_rename().await;
+                return Err(if self.hw_mutated {
+                    ConfigCommitError::post_publish_reconciling(err)
+                } else {
+                    ConfigCommitError::pre_publish(err)
+                });
+            }
+            return Ok(());
+        }
         if let Err((_, err)) = (self.auth_check.as_ref().expect("auth_check present"))() {
             return Err(ConfigCommitError::pre_publish(err));
         }
@@ -4690,6 +5152,34 @@ where
                     .await;
             }
         }
+        if self.hw_mutated {
+            // B3: Hardware has already mutated; do NOT spawn config-only dir-sync retry.
+            // Keep HoldState::Reconciling and .calibration_commit.pending until reconciled offline.
+            if let Some(pg) = self.episode_pin_guard.take() {
+                pg.keep_pinned_for_reconcile();
+            }
+            let file_name = target_paths
+                .first()
+                .map(|p| target_file_label(p))
+                .unwrap_or_else(|| "calibration.json".to_string());
+            let msg = format!(
+                "Hardware commissioning persisted {file_name} but parent dir fsync failed ({warn}); hardware and disk reconciliation required"
+            );
+            let bounded = BoundedText::<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>::new(&msg);
+            let domain = self.domain;
+            let _ = self
+                .sup
+                .dispatch_config_request_reliable(|| ConfigRequest::LatchConfigReconcileFault {
+                    domain,
+                    message: bounded,
+                })
+                .await;
+            return ConfigCommitError::post_publish_reconciling(ArmError::Rejected {
+                status: 500,
+                code: "PERSIST_FAILED".into(),
+                message: msg,
+            });
+        }
         if let (Some(candidate), Some(auth_check), Some(update_published)) = (
             self.candidate.take(),
             self.auth_check.take(),
@@ -4851,9 +5341,14 @@ where
             .expect("update_published called once");
         self.sup.published_config_hub().update(|cfg| {
             cfg.workspace_revision = activated.workspace_revision;
+            for i in 0..activated.limit_len.min(cfg.config.limits.len()) {
+                cfg.config.limits[i].min_position = activated.limit_min[i];
+                cfg.config.limits[i].max_position = activated.limit_max[i];
+                cfg.config.limits[i].max_velocity = activated.limit_vel[i];
+            }
             update_published(cfg, activated);
         });
-        sync_prep_env_from_published(&self.sup);
+        sync_prep_env_from_published(&self.sup, Some(activated.motion_config_revision));
         drop(self.episode_pin_guard.take());
 
         Ok(ConfigCommitOutcome {
@@ -4865,6 +5360,46 @@ where
     }
 
     async fn release_pre_rename(&mut self) {
+        if self.hw_mutated {
+            if let Some(pg) = self.episode_pin_guard.take() {
+                pg.keep_pinned_for_reconcile();
+            }
+            if let Some(g) = self.guard.as_mut() {
+                g.mark_renamed();
+                if let Some(r) = g.take() {
+                    if let Ok(ConfigReply::Persisted(Ok(pr))) = self
+                        .sup
+                        .dispatch_config_request_owned_reliable(ConfigRequest::Persisted(
+                            PersistedConfig {
+                                reservation: r,
+                                durability: Durability::DurableUnconfirmed,
+                            },
+                        ))
+                        .await
+                    {
+                        let _ = self
+                            .sup
+                            .dispatch_config_request_owned_reliable(ConfigRequest::Release(
+                                ReleaseConfig { reservation: pr },
+                            ))
+                            .await;
+                    } else {
+                        let domain = self.domain;
+                        let _ = self
+                            .sup
+                            .dispatch_config_request_reliable(|| ConfigRequest::ForceReconcile(domain))
+                            .await;
+                    }
+                }
+            } else {
+                let domain = self.domain;
+                let _ = self
+                    .sup
+                    .dispatch_config_request_reliable(|| ConfigRequest::ForceReconcile(domain))
+                    .await;
+            }
+            return;
+        }
         drop(self.episode_pin_guard.take());
         if let Some(r) = self.guard.as_mut().and_then(|g| g.take()) {
             let _ = self
@@ -4878,11 +5413,28 @@ where
 
     async fn abort_pre_rename_fs(&mut self, _phase: &'static str, err: String) -> Self::Err {
         self.release_pre_rename().await;
-        ConfigCommitError::pre_publish(ArmError::Rejected {
+        let arm_err = ArmError::Rejected {
             status: 500,
             code: "PERSIST_FAILED".into(),
             message: format!("Failed to persist configuration: {err}"),
-        })
+        };
+        if self.hw_mutated {
+            let domain = self.domain;
+            let msg = format!(
+                "Hardware commissioning persistence failed ({err}); hardware and disk reconciliation required"
+            );
+            let bounded = BoundedText::<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>::new(&msg);
+            let _ = self
+                .sup
+                .dispatch_config_request_reliable(|| ConfigRequest::LatchConfigReconcileFault {
+                    domain,
+                    message: bounded,
+                })
+                .await;
+            ConfigCommitError::post_publish_reconciling(arm_err)
+        } else {
+            ConfigCommitError::pre_publish(arm_err)
+        }
     }
 
     async fn reconcile_rename_join_error(&mut self, err: String) -> Self::Err {
@@ -4934,8 +5486,12 @@ where
             .await
     }
 
+    fn preserve_marker_on_abort(&self) -> bool {
+        self.hw_mutated
+    }
+
     fn worker_disconnected_err(&mut self) -> Self::Err {
-        if self.pub_phase.load(Ordering::Acquire) != PUB_PHASE_PRE_RENAME {
+        if self.hw_mutated || self.pub_phase.load(Ordering::Acquire) != PUB_PHASE_PRE_RENAME {
             ConfigCommitError::post_publish_unknown(ArmError::Internal(
                 "config commit worker disconnected after rename".into(),
             ))
@@ -4950,6 +5506,8 @@ where
 async fn run_config_commit_worker<FAuth, FPub>(
     sup: Arc<ArmSupervisor>,
     plan: ConfigCommitPlan,
+    pre_held: Option<Reservation>,
+    hw_mutated: bool,
     auth_check: FAuth,
     update_published: FPub,
     pub_phase: Arc<AtomicU8>,
@@ -4985,6 +5543,7 @@ where
             require_workspace_unblocked: true,
             require_kinematics_disarmed: *require_kinematics_disarmed,
             require_software_zero_idle: false,
+            require_mit_torque_off: false,
             expected_txn_id: *expected_txn_id,
             operator_grant: Some(*operator_grant),
         },
@@ -4999,6 +5558,21 @@ where
             require_workspace_unblocked: false,
             require_kinematics_disarmed: false,
             require_software_zero_idle: true,
+            require_mit_torque_off: false,
+            expected_txn_id: *expected_txn_id,
+            operator_grant: Some(*operator_grant),
+        },
+        ReservePrecheck::MitCommissioning {
+            expected_txn_id,
+            operator_grant,
+            ..
+        } => VerifyDomainChecks {
+            expected_grasp_setup_revision: None,
+            expected_gripper_calib_revision: None,
+            require_workspace_unblocked: false,
+            require_kinematics_disarmed: false,
+            require_software_zero_idle: false,
+            require_mit_torque_off: true,
             expected_txn_id: *expected_txn_id,
             operator_grant: Some(*operator_grant),
         },
@@ -5064,6 +5638,8 @@ where
         auth_check: Some(auth_check),
         update_published: Some(update_published),
         guard: None,
+        pre_held,
+        hw_mutated,
         grant: None,
         domain,
         episode_pin_guard: None,
@@ -5072,25 +5648,34 @@ where
     execute_common_commit(&mut backend).await
 }
 
-fn sync_prep_env_from_published(sup: &ArmSupervisor) {
+fn sync_prep_env_from_published(sup: &ArmSupervisor, motion_config_rev: Option<u64>) {
     let Some(pub_cfg) = sup.published_config_hub().latest() else {
         return;
     };
-    let Some(cur) = sup.hub().prep_env() else {
-        return;
-    };
-    let mut next = (*cur).clone();
-    next.config = pub_cfg.config.clone();
-    next.workspace_policy = pub_cfg.workspace_policy().map(|(ws, _)| ws.clone());
-    next.poses = pub_cfg.poses.list.clone();
-    next.sequences = pub_cfg.sequences.clone();
-    next.grasp_setup = pub_cfg.config.grasp.clone();
-    next.workspace_revision = pub_cfg.workspace_revision;
-    next.poses_revision = pub_cfg.poses.revision;
-    next.sequences_revision = pub_cfg.sequences.revision;
-    next.grasp_setup_revision = pub_cfg.grasp_setup_revision;
-    next.gripper_calib_revision = pub_cfg.gripper_calib_revision;
-    sup.hub().update_prep_env(Arc::new(next));
+    if let Some(cur) = sup.hub().prep_env() {
+        let mut next = (*cur).clone();
+        next.config = pub_cfg.config.clone();
+        next.workspace_policy = pub_cfg.workspace_policy().map(|(ws, _)| ws.clone());
+        next.poses = pub_cfg.poses.list.clone();
+        next.sequences = pub_cfg.sequences.clone();
+        next.grasp_setup = pub_cfg.config.grasp.clone();
+        next.workspace_revision = pub_cfg.workspace_revision;
+        next.poses_revision = pub_cfg.poses.revision;
+        next.sequences_revision = pub_cfg.sequences.revision;
+        next.grasp_setup_revision = pub_cfg.grasp_setup_revision;
+        next.gripper_calib_revision = pub_cfg.gripper_calib_revision;
+        sup.hub().update_prep_env(Arc::new(next));
+    }
+    if let Some(cur_mc) = sup.hub().motion_config() {
+        let mut next_mc = (*cur_mc).clone();
+        next_mc.config = pub_cfg.config.clone();
+        next_mc.workspace = pub_cfg.workspace_policy().map(|(ws, _)| ws.clone());
+        next_mc.workspace_revision = pub_cfg.workspace_revision;
+        if let Some(rev) = motion_config_rev {
+            next_mc.motion_config_revision = rev;
+        }
+        sup.hub().set_motion_config(Arc::new(next_mc));
+    }
 }
 
 fn target_file_label(path: &std::path::Path) -> String {
@@ -5270,9 +5855,14 @@ fn spawn_config_reconcile_retry<FAuth, FPub>(
                     if let Some(update_pub) = update_pub_opt.take() {
                         sup.published_config_hub().update(|cfg| {
                             cfg.workspace_revision = activated.workspace_revision;
+                            for i in 0..activated.limit_len.min(cfg.config.limits.len()) {
+                                cfg.config.limits[i].min_position = activated.limit_min[i];
+                                cfg.config.limits[i].max_position = activated.limit_max[i];
+                                cfg.config.limits[i].max_velocity = activated.limit_vel[i];
+                            }
                             update_pub(cfg, activated);
                         });
-                        sync_prep_env_from_published(&sup);
+                        sync_prep_env_from_published(&sup, Some(activated.motion_config_revision));
                     }
                     if let Some(mp) = pending_marker_path.take() {
                         let rm_res = tokio::task::spawn_blocking(move || {

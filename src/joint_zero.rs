@@ -124,6 +124,9 @@ impl ZeroOffsetDriver {
 impl ArmDriver for ZeroOffsetDriver {
     fn capabilities(&self) -> DriverCapabilities { self.inner.capabilities() }
     fn enable_state(&self) -> EnableState { self.inner.enable_state() }
+    fn is_hardware_disarmed_confirmed(&self) -> bool {
+        self.inner.is_hardware_disarmed_confirmed()
+    }
     fn reported_torque_loss_sample_seq(&self) -> Option<u64> {
         self.inner.reported_torque_loss_sample_seq()
     }
@@ -189,6 +192,14 @@ impl ArmDriver for ZeroOffsetDriver {
         }
         Ok(rx)
     }
+    fn read_joint_states_safe_hold(&mut self, out: &mut Vec<JointState>, deadline: Instant, max_rx_frames: u16) -> Result<(u16, bool), ArmDriverError> {
+        let rx = self.inner.read_joint_states_safe_hold(out, deadline, max_rx_frames)?;
+        for (i, s) in out.iter_mut().enumerate() {
+            let o = self.off(i);
+            if o != 0.0 { s.position -= o; }
+        }
+        Ok(rx)
+    }
     fn read_cached_joint_states_into(&self, out: &mut Vec<JointState>) -> Option<()> {
         self.inner.read_cached_joint_states_into(out)?;
         for (i, s) in out.iter_mut().enumerate() {
@@ -227,6 +238,22 @@ impl ArmDriver for ZeroOffsetDriver {
         let r = self.inner.write_joint_targets_bounded(&m);
         self.motor_targets = m;
         r
+    }
+    fn defer_motion_targets_past_cutoff(&mut self, targets: &[JointTarget]) {
+        if self.offsets.iter().all(|o| *o == 0.0) {
+            self.inner.defer_motion_targets_past_cutoff(targets);
+            return;
+        }
+        let mut m = std::mem::take(&mut self.motor_targets);
+        m.clear();
+        m.extend(targets.iter().enumerate().map(|(i, t)| {
+            let o = self.off(i);
+            let mut t = t.clone();
+            if o != 0.0 { t.position += o; }
+            t
+        }));
+        self.inner.defer_motion_targets_past_cutoff(&m);
+        self.motor_targets = m;
     }
     fn discard_pending_tx(&mut self) { self.inner.discard_pending_tx(); }
     fn set_tx_release_deadline(&mut self, deadline: Option<Instant>) { self.inner.set_tx_release_deadline(deadline); }
@@ -411,6 +438,7 @@ impl ArmDriver for ZeroOffsetDriver {
     fn disable_dispatched_mask(&self) -> u64 { self.inner.disable_dispatched_mask() }
     fn finish_dispatched_disable(&mut self) -> Result<(), ArmDriverError> { self.inner.finish_dispatched_disable() }
     fn abort_enable(&mut self) { self.inner.abort_enable() }
+    fn prepare_safe_hold(&mut self) { self.inner.prepare_safe_hold() }
     fn enable_frames_dispatched(&self) -> bool { self.inner.enable_frames_dispatched() }
     fn abort_pending_disable(&mut self) -> bool { self.inner.abort_pending_disable() }
     fn panic_disable_step(&mut self, first: bool, deadline: Instant) -> Option<Result<Vec<usize>, ArmDriverError>> {
@@ -444,6 +472,9 @@ impl ArmDriver for ZeroOffsetDriver {
     fn motor_status(&self) -> Option<Vec<u8>> { self.inner.motor_status() }
     fn joint_loads(&self) -> Option<Vec<f32>> { self.inner.joint_loads() }
     fn decode_motor_error(&self, code: u8) -> Option<String> { self.inner.decode_motor_error(code) }
+    fn decode_motor_error_static(&self, code: u8) -> Option<&'static str> {
+        self.inner.decode_motor_error_static(code)
+    }
     fn set_torque_flag(&mut self, enabled: bool) { self.inner.set_torque_flag(enabled) }
     fn set_pending_rearm(&mut self, pending: bool) { self.inner.set_pending_rearm(pending) }
     fn supports_mit_mode_switch(&self) -> bool { self.inner.supports_mit_mode_switch() }
@@ -473,7 +504,11 @@ impl ArmDriver for ZeroOffsetDriver {
     fn motor_zero_support(&self) -> MotorZeroSupport { self.inner.motor_zero_support() }
     fn set_zero_position(&mut self, joint: usize) -> Result<(), ArmDriverError> { self.inner.set_zero_position(joint) }
     fn set_joint_zero_offsets(&mut self, offsets: &[f32]) {
-        self.offsets = offsets.to_vec();
+        if self.offsets.len() == offsets.len() {
+            self.offsets.copy_from_slice(offsets);
+        } else {
+            self.offsets = offsets.to_vec();
+        }
         if let Some(ref gate) = self.stopped_disable_gate {
             self.inner.set_stopped_disable_gate(gate.with_motor_offsets(&self.offsets));
         }
@@ -536,6 +571,74 @@ impl ArmDriver for ZeroOffsetDriver {
     fn read_motor_identity(&mut self, joints: &[usize]) -> Result<Vec<crate::mit::MotorIdentity>, ArmDriverError> { self.inner.read_motor_identity(joints) }
     fn commission_motor_timeout(&mut self, joints: &[usize], counts: u32) -> Result<Vec<crate::mit::TimeoutCommissioning>, crate::mit::TimeoutBatchError> {
         self.inner.commission_motor_timeout(joints, counts)
+    }
+    fn supports_nonblocking_commissioning(&self) -> bool {
+        self.inner.supports_nonblocking_commissioning()
+    }
+    fn supports_nonblocking_motor_zero(&self) -> bool {
+        self.inner.supports_nonblocking_motor_zero()
+    }
+    fn commissioning_motor_id(&self, joint: usize) -> Option<u16> {
+        self.inner.commissioning_motor_id(joint)
+    }
+    fn commissioning_drain_rx_step(&mut self, max_frames: u16, deadline: Instant) -> Result<(u16, bool), ArmDriverError> {
+        self.inner.commissioning_drain_rx_step(max_frames, deadline)
+    }
+    fn commissioning_clear_register_log(&mut self) {
+        self.inner.commissioning_clear_register_log();
+    }
+    fn commissioning_try_send_register_read(
+        &mut self,
+        joint: usize,
+        rid: u8,
+        deadline: Instant,
+        pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> crate::mit::CommissioningTxStatus {
+        self.inner.commissioning_try_send_register_read(joint, rid, deadline, pre_tx_gate)
+    }
+    fn commissioning_try_send_timeout_write(
+        &mut self,
+        joint: usize,
+        counts: u32,
+        deadline: Instant,
+        pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> crate::mit::CommissioningTxStatus {
+        self.inner.commissioning_try_send_timeout_write(joint, counts, deadline, pre_tx_gate)
+    }
+    fn commissioning_find_register_reply(
+        &self,
+        joint: usize,
+        write: bool,
+        rid: u8,
+        after_tx_seq: u64,
+        min_rx_at: Instant,
+        tx_offset_ns: Option<i128>,
+    ) -> crate::mit::CommissioningRegMatch {
+        self.inner.commissioning_find_register_reply(joint, write, rid, after_tx_seq, min_rx_at, tx_offset_ns)
+    }
+    fn commissioning_disable_step(
+        &mut self,
+        started_at: Instant,
+        deadline: Instant,
+        pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> crate::mit::CommissioningDisableStep {
+        self.inner.commissioning_disable_step(started_at, deadline, pre_tx_gate)
+    }
+    fn commissioning_try_send_set_zero(
+        &mut self,
+        joint: usize,
+        deadline: Instant,
+        pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> crate::mit::CommissioningTxStatus {
+        self.inner.commissioning_try_send_set_zero(joint, deadline, pre_tx_gate)
+    }
+    fn commissioning_raw_feedback(&self, joint: usize) -> Option<crate::mit::CommissioningFeedback> {
+        let mut fb = self.inner.commissioning_raw_feedback(joint)?;
+        let o = self.off(joint);
+        if o != 0.0 {
+            fb.joint_position = fb.raw_position - o;
+        }
+        Some(fb)
     }
 }
 

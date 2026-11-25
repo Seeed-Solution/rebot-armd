@@ -1856,16 +1856,19 @@ async fn pf1_reentry_shutdown_emergency_teardown_and_open_rollback() {
         wait_pub_ready(&sup).await;
 
         sup.register_ws_connection(601).await.unwrap();
+        let entered_cb = Arc::new(AtomicBool::new(false));
         let stopped_inside_cb = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&stopped_inside_cb);
+        let entered_flag = Arc::clone(&entered_cb);
+        let done_flag = Arc::clone(&stopped_inside_cb);
         let h_cb = handle.clone();
         handle
             .register_connection_reply_sink(
                 ClientId(601),
                 Arc::new(move |_, r| {
-                    if matches!(r, Reply::Terminal { .. }) && !flag.swap(true, Ordering::SeqCst) {
+                    if matches!(r, Reply::Terminal { .. }) && !entered_flag.swap(true, Ordering::SeqCst) {
                         // Re-entrant stop_and_join on the exact thread holding SerialDrainGate!
                         h_cb.stop_and_join();
+                        done_flag.store(true, Ordering::Release);
                     }
                     DeliveryDecision::Delivered
                 }),
@@ -1917,6 +1920,9 @@ async fn pf1_reentry_shutdown_emergency_teardown_and_open_rollback() {
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
         assert!(stopped_inside_cb.load(Ordering::Acquire), "callback must fire and stop without deadlocking");
+        // Synchronize on SerialDrainGate in case `armd-dispatch` invoked the callback and is
+        // finishing `reconcile_in_flight` + deferred `finalize_stopped_under_gate`.
+        handle.pump_broker_replies();
         assert_eq!(handle.reply_router_stats().global_reserved, 0);
     }
 

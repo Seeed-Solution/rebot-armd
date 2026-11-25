@@ -235,10 +235,33 @@ pub trait ConfigAuthority {
 pub struct ConfigHold {
     held: Option<HeldConfig>,
     next_grant: u64,
+    /// Grant ID for which the durable `.calibration_commit.pending` marker has been written and
+    /// fsynced by the off-thread worker before irreversible hardware commissioning TX (B2).
+    marker_bound_grant: Option<GrantId>,
 }
 
 impl ConfigHold {
     pub fn held(&self) -> Option<HeldConfig> { self.held }
+
+    /// Binds durable pending-marker confirmation to the active `Reserved` hold for `grant` (B2).
+    pub fn bind_commissioning_marker(&mut self, grant: GrantId) -> Result<(), &'static str> {
+        let h = self.held.as_ref().ok_or("NOT_HELD")?;
+        if h.grant != Some(grant) || h.state != HoldState::Reserved {
+            return Err("INVALID_STATE");
+        }
+        self.marker_bound_grant = Some(grant);
+        Ok(())
+    }
+
+    /// True iff `grant` currently holds an active `Reserved` reservation AND has bound durable
+    /// pending-marker proof to that reservation (B2).
+    pub fn is_commissioning_marker_bound(&self, grant: GrantId) -> bool {
+        self.held.is_some_and(|h| {
+            h.grant == Some(grant)
+                && h.state == HoldState::Reserved
+                && self.marker_bound_grant == Some(grant)
+        })
+    }
 
     /// Any hold inhibits motion when it is on a motion domain; `Reconciling` always does.
     pub fn motion_inhibited(&self) -> bool {
@@ -249,6 +272,7 @@ impl ConfigHold {
     pub fn grant(&mut self, p: &ConfigProposal, from: u64) -> Option<Reservation> {
         if self.held.is_some() { return None; }
         self.next_grant += 1;
+        self.marker_bound_grant = None;
         let r = Reservation { grant: GrantId(self.next_grant), domain: p.domain, from, candidate: p.candidate, inhibits_motion: p.domain.affects_motion(), stamp: p.stamp };
         self.held = Some(HeldConfig { grant: Some(r.grant), domain: r.domain, from, candidate: Some(r.candidate), inhibits_motion: r.inhibits_motion, state: HoldState::Reserved });
         Some(r)
@@ -262,6 +286,17 @@ impl ConfigHold {
         let h = self.mine(r).ok_or("NOT_HELD")?;
         if h.state != HoldState::Reserved { return Err("INVALID_STATE"); }
         h.state = HoldState::PersistedAwaitingActivation { durability };
+        Ok(())
+    }
+
+    /// Advances the expected base revision of an active `Reserved` hold after an intermediate
+    /// durable commit (e.g. pre-hardware MIT qualification invalidation during `motor_zero`)
+    /// without releasing the single held reservation.
+    pub fn advance_from(&mut self, r: &mut Reservation, new_from: u64) -> Result<(), &'static str> {
+        let h = self.mine(r).ok_or("NOT_HELD")?;
+        if h.state != HoldState::Reserved { return Err("INVALID_STATE"); }
+        h.from = new_from;
+        r.from = new_from;
         Ok(())
     }
 
@@ -284,7 +319,11 @@ impl ConfigHold {
     /// reconciling).
     pub fn activated(&mut self, r: &Reservation) -> bool {
         match self.mine(r) {
-            Some(h) if h.state != HoldState::Reconciling => { self.held = None; true }
+            Some(h) if h.state != HoldState::Reconciling => {
+                self.held = None;
+                self.marker_bound_grant = None;
+                true
+            }
             _ => false,
         }
     }
@@ -292,25 +331,40 @@ impl ConfigHold {
     /// A failed activation of `r`: back to the caller before persistence, `Reconciling` after.
     pub fn activation_failed(&mut self, r: Reservation, code: &'static str) -> Activated {
         match self.mine(&r) {
-            Some(h) if matches!(h.state, HoldState::PersistedAwaitingActivation { .. }) => { h.state = HoldState::Reconciling; Activated::Reconciling { code } }
+            Some(h) if matches!(h.state, HoldState::PersistedAwaitingActivation { .. }) => {
+                h.state = HoldState::Reconciling;
+                self.marker_bound_grant = None;
+                Activated::Reconciling { code }
+            }
             _ => Activated::Refused { code, reservation: r },
         }
     }
 
     pub fn release(&mut self, r: Reservation) -> Released {
-        let Some(h) = self.mine(&r) else { return Released::NotHeld; };
-        match h.state {
+        let Some(state) = self.mine(&r).map(|h| h.state) else { return Released::NotHeld; };
+        self.marker_bound_grant = None;
+        match state {
             HoldState::Reserved => { self.held = None; Released::Cleared }
-            HoldState::PersistedAwaitingActivation { .. } | HoldState::Reconciling => { h.state = HoldState::Reconciling; Released::Reconciling }
+            HoldState::PersistedAwaitingActivation { .. } | HoldState::Reconciling => {
+                if let Some(h) = self.held.as_mut() {
+                    h.state = HoldState::Reconciling;
+                }
+                Released::Reconciling
+            }
         }
     }
 
     /// Start-up reconciliation of `domain` (replaces nothing: false when another hold exists).
     pub fn begin_reconcile(&mut self, domain: ConfigDomain, active: u64) -> bool {
         match &mut self.held {
-            Some(h) if h.domain == domain => { h.state = HoldState::Reconciling; true }
+            Some(h) if h.domain == domain => {
+                h.state = HoldState::Reconciling;
+                self.marker_bound_grant = None;
+                true
+            }
             Some(_) => false,
             None => {
+                self.marker_bound_grant = None;
                 self.held = Some(HeldConfig { grant: None, domain, from: active, candidate: None, inhibits_motion: true, state: HoldState::Reconciling });
                 true
             }
@@ -320,6 +374,7 @@ impl ConfigHold {
     /// Unconditionally enters `HoldState::Reconciling` for `domain`, inhibiting motion even
     /// when another hold occupies the slot (fail-closed after an ambiguous post-rename error).
     pub fn force_reconcile(&mut self, domain: ConfigDomain, active: u64) {
+        self.marker_bound_grant = None;
         self.held = Some(HeldConfig {
             grant: None,
             domain,
@@ -331,7 +386,11 @@ impl ConfigHold {
     }
 
     pub fn finish_reconcile(&mut self, domain: ConfigDomain) -> bool {
-        if self.held.is_some_and(|h| h.domain == domain && h.state == HoldState::Reconciling) { self.held = None; return true; }
+        if self.held.is_some_and(|h| h.domain == domain && h.state == HoldState::Reconciling) {
+            self.held = None;
+            self.marker_bound_grant = None;
+            return true;
+        }
         false
     }
 }

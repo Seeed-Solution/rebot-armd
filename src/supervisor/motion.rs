@@ -436,6 +436,14 @@ impl SupervisorInner {
     }
 
     pub(crate) fn apply_stop_policy_in_tick(&mut self, policy: StopPolicy, in_tick: bool) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let reason = match policy {
+                StopPolicy::EStopLatch => "ESTOP_ACTIVE",
+                _ => "STOPPED",
+            };
+            self.cancel_active_commissioning_on_stop(reason);
+        }
         #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
         if self.policy_load_reservation.take().is_some() {
             self.policy_loading = false;

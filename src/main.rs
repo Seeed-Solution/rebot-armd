@@ -300,28 +300,34 @@ fn run_tool_info(path: &str, robot: Option<&str>) -> Result<String, String> {
 #[global_allocator]
 static GLOBAL: armd::diagnostics::alloc::TimedAlloc = armd::diagnostics::alloc::TimedAlloc;
 
-/// Finalizes daemon shutdown after `supervisor.request_shutdown()` confirmed readiness.
+/// Finalizes daemon shutdown after `supervisor.request_shutdown_until(deadline)` confirmed readiness.
 ///
-/// The API server stays live until the owner's final shutdown commit succeeds. If the final
-/// commit is refused (for example because the arm was rearmed concurrently) or fails, the API is
-/// stopped, a bounded torque-off disable is issued through the current owner to preserve the
-/// torque-off guarantee, the reason is logged, and `Err` is returned so `armd` exits non-zero.
+/// The API server stays live until the active owner's final shutdown commit succeeds within ONE
+/// shared `deadline`. Resolves the authoritative active writer dynamically from `supervisor`
+/// (Executor, Legacy, or DetachedSafeHold) so post-handback Legacy and detached startup-loser
+/// SAFE-HOLD writers are always reached on deliberate process exit (B3 / B4).
+#[cfg(test)]
 async fn finalize_shutdown(
     supervisor: &Arc<ArmSupervisor>,
     server_handle: &mut tokio::task::JoinHandle<std::io::Result<()>>,
     executor_handle: Option<armd::rt_core::executor::RtExecutorHandle>,
     legacy_control_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<(), String> {
-    finalize_shutdown_with_hook(
+    let deadline = std::time::Instant::now()
+        + armd::supervisor::PANIC_DISABLE_TIMEOUT
+        + Duration::from_millis(100);
+    finalize_shutdown_with_hook_until(
         supervisor,
         server_handle,
         executor_handle,
         legacy_control_stop,
+        deadline,
         || async {},
     )
     .await
 }
 
+#[cfg(test)]
 async fn finalize_shutdown_with_hook<F, Fut>(
     supervisor: &Arc<ArmSupervisor>,
     server_handle: &mut tokio::task::JoinHandle<std::io::Result<()>>,
@@ -333,13 +339,127 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    if let Some(handle) = executor_handle {
-        let h_commit = handle.clone();
-        let commit_res = tokio::task::spawn_blocking(move || h_commit.shutdown_and_join()).await;
-        match commit_res {
-            Ok(Ok(())) => {
-                // A confirmed-safe exit must not wait indefinitely on connected WebSockets.
+    let deadline = std::time::Instant::now()
+        + armd::supervisor::PANIC_DISABLE_TIMEOUT
+        + Duration::from_millis(100);
+    finalize_shutdown_with_hook_until(
+        supervisor,
+        server_handle,
+        executor_handle,
+        legacy_control_stop,
+        deadline,
+        after_legacy_commit_before_abort,
+    )
+    .await
+}
+
+async fn finalize_shutdown_with_hook_until<F, Fut>(
+    supervisor: &Arc<ArmSupervisor>,
+    server_handle: &mut tokio::task::JoinHandle<std::io::Result<()>>,
+    _executor_handle: Option<armd::rt_core::executor::RtExecutorHandle>,
+    legacy_control_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
+    deadline: std::time::Instant,
+    after_legacy_commit_before_abort: F,
+) -> Result<(), String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    // Reserve part of the ONE shared `deadline` for fallback emergency ProcessExit disable so
+    // initial commit attempts never exhaust the entire budget and fallback never mints a fresh
+    // timeout (DRV-F1 B11).
+    let now = std::time::Instant::now();
+    let total_rem = deadline.saturating_duration_since(now);
+    let commit_deadline = now + total_rem / 2;
+
+    // Resolve authoritative active writer dynamically from `supervisor` (never preferring a stale
+    // startup `executor_handle` once handback switched ownership to Legacy — DRV-F1 B3).
+    let active = supervisor.active_writer_endpoint();
+    match active {
+        armd::supervisor::WriterEndpoint::DetachedSafeHold { .. } => {
+            error!("Final shutdown with detached SAFE-HOLD writer: issuing deliberate ProcessExit protective disable");
+            server_handle.abort();
+            let outcome = supervisor.emergency_process_exit_disable_until(deadline).await;
+            outcome.log(
+                "Detached SAFE-HOLD process-exit torque-off",
+                armd::supervisor::PANIC_DISABLE_TIMEOUT,
+            );
+            return Err(format!(
+                "Daemon exiting from detached SAFE-HOLD (process-exit torque-off: {outcome:?})"
+            ));
+        }
+        armd::supervisor::WriterEndpoint::Executor(handle) => {
+            let h_commit = handle.clone();
+            let commit_res = tokio::task::spawn_blocking(move || {
+                h_commit.shutdown_and_join_until(commit_deadline)
+            })
+            .await;
+            match commit_res {
+                Ok(Ok(())) => {
+                    server_handle.abort();
+                    info!("armd stopped after shutdown readiness confirmation");
+                    return Ok(());
+                }
+                Ok(Err(e)) => {
+                    error!("Final shutdown commit refused/timed out by RT owner: {e}");
+                    server_handle.abort();
+                    let outcome = supervisor
+                        .emergency_process_exit_disable_until(deadline)
+                        .await;
+                    outcome.log(
+                        "Refused final shutdown torque-off",
+                        armd::supervisor::PANIC_DISABLE_TIMEOUT,
+                    );
+                    return Err(format!(
+                        "Final shutdown commit refused by RT owner: {e} (torque-off: {outcome:?})"
+                    ));
+                }
+                Err(je) => {
+                    error!("Final shutdown commit task failed: {je}");
+                    server_handle.abort();
+                    let outcome = supervisor
+                        .emergency_process_exit_disable_until(deadline)
+                        .await;
+                    outcome.log(
+                        "Failed final shutdown torque-off",
+                        armd::supervisor::PANIC_DISABLE_TIMEOUT,
+                    );
+                    return Err(format!(
+                        "Final shutdown commit task failed: {je} (torque-off: {outcome:?})"
+                    ));
+                }
+            }
+        }
+        armd::supervisor::WriterEndpoint::Legacy {
+            control_stop: ep_stop,
+            ..
+        } => {
+            if let Some(control_stop) = ep_stop.or(legacy_control_stop) {
+                let lock_rem = commit_deadline.saturating_duration_since(std::time::Instant::now());
+                let confirmed = match tokio::time::timeout(lock_rem, supervisor.inner().write()).await
+                {
+                    Ok(mut inner) => inner.commit_shutdown(),
+                    Err(_) => false,
+                };
+                if !confirmed {
+                    error!("Final legacy shutdown recheck refused or timed out: hardware disable is not confirmed");
+                    server_handle.abort();
+                    supervisor.estop_state.latch();
+                    supervisor.signal_legacy_stop(&control_stop);
+                    let outcome = supervisor
+                        .emergency_process_exit_disable_until(deadline)
+                        .await;
+                    outcome.log(
+                        "Refused legacy final shutdown torque-off",
+                        armd::supervisor::PANIC_DISABLE_TIMEOUT,
+                    );
+                    return Err(format!(
+                        "Final legacy shutdown recheck refused: hardware disable is not confirmed (torque-off: {outcome:?})"
+                    ));
+                }
+                after_legacy_commit_before_abort().await;
                 server_handle.abort();
+                supervisor.signal_legacy_stop(&control_stop);
                 #[cfg(not(target_arch = "wasm32"))]
                 supervisor
                     .torque_shadow_hub()
@@ -347,68 +467,7 @@ where
                 info!("armd stopped after shutdown readiness confirmation");
                 return Ok(());
             }
-            Ok(Err(e)) => {
-                error!("Final shutdown commit refused by RT owner: {e}");
-                server_handle.abort();
-                supervisor.estop_state.request_and_latch();
-                let h_disable = handle.clone();
-                let outcome = tokio::task::spawn_blocking(move || h_disable.emergency_disable_and_join())
-                    .await
-                    .unwrap_or_else(|je| armd::supervisor::PanicDisableOutcome::Failed(je.to_string()));
-                outcome.log("Refused final shutdown torque-off", armd::supervisor::PANIC_DISABLE_TIMEOUT);
-                return Err(format!(
-                    "Final shutdown commit refused by RT owner: {e} (torque-off: {outcome:?})"
-                ));
-            }
-            Err(je) => {
-                error!("Final shutdown commit task failed: {je}");
-                server_handle.abort();
-                supervisor.estop_state.request_and_latch();
-                let h_disable = handle.clone();
-                let outcome = tokio::task::spawn_blocking(move || h_disable.emergency_disable_and_join())
-                    .await
-                    .unwrap_or_else(|e| armd::supervisor::PanicDisableOutcome::Failed(e.to_string()));
-                outcome.log("Failed final shutdown torque-off", armd::supervisor::PANIC_DISABLE_TIMEOUT);
-                return Err(format!(
-                    "Final shutdown commit task failed: {je} (torque-off: {outcome:?})"
-                ));
-            }
         }
-    }
-
-    if let Some(control_stop) = legacy_control_stop {
-        let confirmed = {
-            let mut inner = supervisor.inner().write().await;
-            inner.commit_shutdown()
-        };
-        if !confirmed {
-            error!("Final legacy shutdown recheck refused: hardware disable is not confirmed");
-            server_handle.abort();
-            supervisor.estop_state.request_and_latch();
-            // Stop the legacy periodic loop first so it stops competing for the supervisor lock
-            // and actuator bus while bounded emergency disable runs.
-            supervisor.signal_legacy_stop(&control_stop);
-            let sup = Arc::clone(supervisor);
-            let outcome = tokio::task::spawn_blocking(move || {
-                sup.attempt_legacy_panic_disable(armd::supervisor::PANIC_DISABLE_TIMEOUT)
-            })
-            .await
-            .unwrap_or_else(|je| armd::supervisor::PanicDisableOutcome::Failed(je.to_string()));
-            outcome.log("Refused legacy final shutdown torque-off", armd::supervisor::PANIC_DISABLE_TIMEOUT);
-            return Err(format!(
-                "Final legacy shutdown recheck refused: hardware disable is not confirmed (torque-off: {outcome:?})"
-            ));
-        }
-        after_legacy_commit_before_abort().await;
-        // A confirmed-safe exit must not wait indefinitely on connected WebSockets.
-        server_handle.abort();
-        supervisor.signal_legacy_stop(&control_stop);
-        #[cfg(not(target_arch = "wasm32"))]
-        supervisor
-            .torque_shadow_hub()
-            .stop_and_flush_bounded(Duration::from_millis(100));
-        info!("armd stopped after shutdown readiness confirmation");
-        return Ok(());
     }
 
     server_handle.abort();
@@ -525,6 +584,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
     let damiao_tx_budget = config.damiao_tx_budget();
     let supervisor = Arc::new(ArmSupervisor::new(config));
+    // Install the process-wide lock-free/zero-alloc tiered panic coordinator strictly BEFORE
+    // mounting or enabling any hardware (FU-PANIC / DRV-F1).
+    armd::panic_coord::install_process_panic_coordinator(Arc::clone(
+        supervisor.internal_fault_lane(),
+    ));
     // before the control loop: frees retired observations, feeds telemetry and recordings
     supervisor.start_dispatcher()?;
     supervisor.set_follower(follower).await;
@@ -687,28 +751,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     armd::diagnostics::alloc::time_this_thread();
                     info!("Control loop allocator timing on (ARMD_ALLOC_TIMING=1)");
                 }
-                armd::rt_core::executor::run_periodic_with_deadline(
+                control_supervisor.run_legacy_control_loop_blocking(
                     period,
-                    &control_stop_flag,
-                    &loop_stats,
-                    |dt, release_deadline| {
-                        let tick_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            runtime.block_on(control_supervisor.control_tick_with_deadline(dt, release_deadline));
-                        }));
-                    if let Err(e) = tick_res {
-                        armd::rt_core::executor::account_periodic_overrun_on_panic_exit(&loop_stats);
-                        control_supervisor.estop_state.request_and_latch();
-                        error!("Control thread panicked during tick: {:?}", e);
-                        let outcome = control_supervisor
-                            .attempt_legacy_panic_disable(armd::supervisor::PANIC_DISABLE_TIMEOUT);
-                        outcome.log("Legacy control thread panic", armd::supervisor::PANIC_DISABLE_TIMEOUT);
-                        // Non-blocking wake on fatal control panic (never block or join worker on fatal exit).
-                        #[cfg(not(target_arch = "wasm32"))]
-                        control_supervisor.torque_shadow_hub().wake();
-                        armd::diagnostics::logwriter::flush_all(Duration::from_millis(500));
-                        std::process::exit(1);
-                    }
-                });
+                    control_stop_flag,
+                    loop_stats,
+                    runtime,
+                    None,
+                );
             })?;
             executor_stats.spawn_monitor(control_stop.clone())?;
             legacy_control_stop = Some(control_stop);
@@ -724,12 +773,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 panic_policy: armd::rt_core::executor::PanicPolicy::AbortProcess,
                 apply_rt_sched: true,
             };
-            let handle = supervisor
-                .start_executor(cfg)
-                .await
-                .map_err(|e| format!("Failed to start RT executor: {e}"))?;
-            info!("RT executor owns ArmCore and bus (ARMD_RT_OWNER=executor)");
-            executor_handle = Some(handle);
+            match supervisor.start_executor(cfg).await {
+                Ok(handle) => {
+                    info!("RT executor owns ArmCore and bus (ARMD_RT_OWNER=executor)");
+                    executor_handle = Some(handle);
+                }
+                Err(e) if supervisor.has_detached_safe_hold() => {
+                    // B4: Keep daemon alive while a detached startup loser exclusively holds an
+                    // energized/unknown driver in SAFE-HOLD until deliberate process-exit signal.
+                    error!(
+                        "RT executor startup failed while detached writer holds driver in SAFE-HOLD ({e}); keeping daemon alive until deliberate shutdown signal"
+                    );
+                }
+                Err(e) => return Err(format!("Failed to start RT executor: {e}").into()),
+            }
         }
     }
     // Start the off-control-thread automatic gripper baseline consumer for both owners.
@@ -751,6 +808,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(unix)]
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
+    let mut shutdown_deadline;
+    let mut detached_safe_hold_sig_seen = false;
     loop {
         tokio::select! {
             result = &mut server_handle, if !server_finished => {
@@ -768,22 +827,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } => {}
         }
 
-        match supervisor.request_shutdown().await {
+        // B3: Start ONE absolute deadline at daemon shutdown request entry and carry it across
+        // admission (`request_shutdown_until`), commit (`CommitShutdown`), and teardown.
+        shutdown_deadline = std::time::Instant::now()
+            + armd::supervisor::PANIC_DISABLE_TIMEOUT
+            + Duration::from_millis(100);
+        if supervisor.has_detached_safe_hold() {
+            if detached_safe_hold_sig_seen {
+                warn!("Repeated shutdown signal while detached SAFE-HOLD holds driver: proceeding to deliberate ProcessExit protective disable");
+                break;
+            }
+            detached_safe_hold_sig_seen = true;
+            warn!("Shutdown signal received while detached SAFE-HOLD holds driver: arm stays held; send shutdown signal again for deliberate ProcessExit protective disable");
+            continue;
+        }
+        match supervisor.request_shutdown_until(shutdown_deadline).await {
             Ok(true) => break,
             Ok(false) => {
                 warn!("Shutdown refused: hardware disable is not confirmed. Stop is latched; control loop and API remain available. Explicit fault recovery and rearming are required before further motion.");
             }
             Err(e) => {
-                warn!("Shutdown request failed ({e}); keeping daemon active");
+                warn!("Shutdown request failed/timed out ({e}); keeping daemon active");
             }
         }
     }
 
-    finalize_shutdown(
+    finalize_shutdown_with_hook_until(
         &supervisor,
         &mut server_handle,
         executor_handle,
         legacy_control_stop,
+        shutdown_deadline,
+        || async {},
     )
     .await
     .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;

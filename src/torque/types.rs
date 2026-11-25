@@ -1510,10 +1510,7 @@ pub enum DisableOrigin {
 impl DisableOrigin {
     #[inline]
     pub const fn is_protective(self) -> bool {
-        matches!(
-            self,
-            Self::ProtectiveThermal | Self::ProtectiveProcessExit | Self::ProtectivePanicBusLoss
-        )
+        matches!(self, Self::ProtectiveThermal | Self::ProtectiveProcessExit)
     }
 
     #[inline]

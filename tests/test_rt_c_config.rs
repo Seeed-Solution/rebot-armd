@@ -1720,7 +1720,8 @@ async fn assert_executor_refuses_op_cleanly(
     let expected_msg =
         format!("{path} is not available while the RT executor owns the arm; use the legacy owner");
 
-    // 1. WS call on Executor MUST fail closed with 409 EXECUTOR_UNSUPPORTED.
+    // 1. WS call without a lease on this connection routes through the C-F1 part 2 executor
+    //    lease gate (`409 LEASE_LOST`) with zero disk/state mutations and zero RT allocs.
     let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
     let rej = ws_send_recv(
         &mut ws,
@@ -1736,10 +1737,9 @@ async fn assert_executor_refuses_op_cleanly(
     .await;
     assert_eq!(rej["type"], "command_reject", "{path}: {rej}");
     assert_eq!(rej["status"], 409, "{path}: {rej}");
-    assert_eq!(rej["code"], "EXECUTOR_UNSUPPORTED", "{path}: {rej}");
-    assert_eq!(rej["message"], expected_msg, "{path}: {rej}");
+    assert_eq!(rej["code"], "LEASE_LOST", "{path}: {rej}");
 
-    // 2. Direct Rust entry point on Executor MUST also fail closed with 409 EXECUTOR_UNSUPPORTED.
+    // 2. Direct legacy Rust entry point on Executor MUST still fail closed with 409 EXECUTOR_UNSUPPORTED.
     if let Some(res) = direct_call(&rig.sup, &cal_deps).await {
         let err = res.expect_err("direct op on executor must fail closed");
         assert_eq!(err.status, 409, "{path}: {err:?}");
@@ -1860,6 +1860,7 @@ async fn executor_refuses_driver_backed_software_zero_and_restore_without_side_e
     let grasp_deps = GraspDeps::http(det_up.clone(), Some(setup_path.clone()));
     let calib_path_chk = calib_path.clone();
     let cal_deps = CalibrationDeps::new(calib_path, Some(setup_path), det_up.clone());
+    let cal_deps_direct = cal_deps.clone();
     let router = armd::api::create_router_calibration(
         sup.clone(),
         det_up,
@@ -1897,8 +1898,36 @@ async fn executor_refuses_driver_backed_software_zero_and_restore_without_side_e
         .await;
         assert_eq!(rej["type"], "command_reject", "{path}: {rej}");
         assert_eq!(rej["status"], 409, "{path}: {rej}");
-        assert_eq!(rej["code"], "EXECUTOR_UNSUPPORTED", "{path}: {rej}");
+        assert_eq!(rej["code"], "LEASE_LOST", "{path}: {rej}");
     }
+
+    // Direct legacy Rust APIs still fail closed with 409 EXECUTOR_UNSUPPORTED on Executor.
+    let check: armd::calibration::LeaseCheck = Box::new(|_| Ok(()));
+    let direct_run_err = motor_zero::run(
+        &sup,
+        &cal_deps_direct,
+        MotorZeroRequest {
+            joints: vec![0],
+            dry_run: false,
+            force: false,
+            method: Some("software".into()),
+        },
+        &check,
+    )
+    .await
+    .expect_err("legacy motor_zero::run must fail closed on executor");
+    assert_eq!(direct_run_err.status, 409);
+    assert_eq!(direct_run_err.code, "EXECUTOR_UNSUPPORTED");
+    let direct_restore_err = motor_zero::restore(
+        &sup,
+        &cal_deps_direct,
+        "2026-01-01T00-00-00Z".into(),
+        &check,
+    )
+    .await
+    .expect_err("legacy motor_zero::restore must fail closed on executor");
+    assert_eq!(direct_restore_err.status, 409);
+    assert_eq!(direct_restore_err.code, "EXECUTOR_UNSUPPORTED");
 
     assert!(!calib_path_chk.exists(), "refused driver-backed zero must not touch disk");
     assert_eq!(
@@ -2167,7 +2196,7 @@ async fn ws_executor_routes_pr_c_paths_and_leaves_unmigrated_paths_pending() {
     assert_eq!(gc_rej["status"], 409);
     assert_eq!(gc_rej["code"], "LEASE_LOST");
 
-    // 4. Out-of-scope calibration/MIT path on Executor MUST fail closed 409 EXECUTOR_UNSUPPORTED.
+    // 4. MIT TIMEOUT commissioning path on Executor routes through C-F1 part 2 live lease gate (409 LEASE_LOST).
     let cal_rej = ws_send_recv(
         &mut ws,
         json!({
@@ -2182,7 +2211,7 @@ async fn ws_executor_routes_pr_c_paths_and_leaves_unmigrated_paths_pending() {
     .await;
     assert_eq!(cal_rej["type"], "command_reject");
     assert_eq!(cal_rej["status"], 409);
-    assert_eq!(cal_rej["code"], "EXECUTOR_UNSUPPORTED");
+    assert_eq!(cal_rej["code"], "LEASE_LOST");
 
     rig.assert_executor_zero_alloc("WS executor PR C routing");
     drop(_detached_guard);

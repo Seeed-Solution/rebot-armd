@@ -1027,6 +1027,17 @@ pub trait ArmDriver: Send {
     /// never an input to hold, disable, rollback, or recovery decisions).
     fn enable_state(&self) -> EnableState { EnableState::Unknown }
 
+    /// Driver-owned physical disarm proof for lifecycle teardown / replacement (DRV-F1 B6):
+    /// returns `true` ONLY when hardware has confirmed all joints disabled with fresh, causal
+    /// evidence (invalidated by staleness, ambiguous writes, or subsequent enable/motion writes).
+    fn is_hardware_disarmed_confirmed(&self) -> bool {
+        self.enable_state() == EnableState::Disabled
+            && self.is_feedback_valid()
+            && !self.has_any_joint_enabled()
+            && !self.has_known_partial_enable()
+            && !self.torque_transition_pending()
+    }
+
     /// Monotonic counter incremented strictly when a fresh causal hardware sample carrying
     /// non-enabled torque state (`enable_state != Enabled`) is decoded from the bus (R12 M2).
     /// Returns `None` for drivers without an explicit per-sample counter.
@@ -1177,6 +1188,17 @@ pub trait ArmDriver: Send {
     ) -> Result<(u16, bool), ArmDriverError> {
         self.read_joint_states_into(out)?;
         Ok((0, false))
+    }
+    /// Bounded live RX pass used by SAFE-HOLD so every supported legacy/RT driver (including
+    /// serial Feetech, RobStride, and Damiao) maintains live thermal/freshness monitoring without
+    /// heap allocation (DRV-F1 B9). Defaults to [`Self::read_joint_states_budgeted`].
+    fn read_joint_states_safe_hold(
+        &mut self,
+        out: &mut Vec<JointState>,
+        deadline: Instant,
+        max_rx_frames: u16,
+    ) -> Result<(u16, bool), ArmDriverError> {
+        self.read_joint_states_budgeted(out, deadline, max_rx_frames)
     }
     /// Copy the driver's already-cached joint states into `out` without touching the bus.
     /// Returns `None` if the driver does not maintain an inspectable cache.
@@ -1396,6 +1418,11 @@ pub trait ArmDriver: Send {
     /// from transient deferral ([`TxBatchOutcome::Deferred`]) without faulting or authorizing
     /// motion completion on deferral. Drivers and wrappers that support pending-queue carry-over
     /// override this method; the default forwards to fail-closed [`Self::write_joint_targets`].
+    /// Stages unfenced motion targets into the driver's carry-over TX queue with zero bus TX when
+    /// the release TX cutoff already expired before output started (avoids staging an already-expired
+    /// driver deadline while preserving carry-over parity).
+    fn defer_motion_targets_past_cutoff(&mut self, _targets: &[JointTarget]) {}
+
     fn write_joint_targets_bounded(&mut self, targets: &[JointTarget]) -> Result<TxBatchOutcome, ArmDriverError> {
         self.write_joint_targets(targets).map(|()| TxBatchOutcome::Complete)
     }
@@ -1587,6 +1614,14 @@ pub trait ArmDriver: Send {
     /// Aborts any pending enable handshake without transmitting further enable frames
     /// (called when E-stop or a fault intervenes mid-enable).
     fn abort_enable(&mut self) {}
+    /// Prepares an exclusively owned driver on SAFE-HOLD entry: aborts any interrupted enable
+    /// handshake AND reconciles any abandoned disable handshake while preserving
+    /// `disable_dispatched_mask` so remaining energized axes keep receiving measured-position holds
+    /// (DRV-F1 B10), and switches PosForce J7 into standalone emitter mode.
+    fn prepare_safe_hold(&mut self) {
+        self.abort_enable();
+        self.set_external_pos_force_emitter(false);
+    }
 
     /// True if any enable command frame (`CMD_ENABLE`) has already been transmitted for the
     /// active enable handshake or any joint is known enabled. False while the handshake is still
@@ -1752,6 +1787,11 @@ pub trait ArmDriver: Send {
     /// Decode motor fault/status code into descriptive string
     fn decode_motor_error(&self, code: u8) -> Option<String> {
         damiao_fault_name(code).map(str::to_string)
+    }
+
+    /// Zero-allocation static motor fault name for the RT control thread.
+    fn decode_motor_error_static(&self, code: u8) -> Option<&'static str> {
+        damiao_fault_name(code)
     }
 
     /// Update internal software enabled flag without transmitting physical frames
@@ -1923,6 +1963,93 @@ pub trait ArmDriver: Send {
     fn commission_motor_timeout(&mut self, joints: &[usize], _counts: u32) -> Result<Vec<crate::mit::TimeoutCommissioning>, crate::mit::TimeoutBatchError> {
         Err(crate::mit::TimeoutBatchError { not_attempted: joints.to_vec(),
             ..ArmDriverError::Protocol("motor timeout commissioning is not supported by this driver".into()).into() })
+    }
+
+    // ---- Non-blocking, zero-allocation RT commissioning primitives (C-F1 part 2) ----
+
+    /// True when the driver supports non-blocking, bounded-flush RT register commissioning.
+    fn supports_nonblocking_commissioning(&self) -> bool { false }
+
+    /// True when the driver supports non-blocking RT motor-zero commissioning.
+    fn supports_nonblocking_motor_zero(&self) -> bool { false }
+
+    /// Command CAN ID of 0-based `joint` (None when unsupported or out of range).
+    fn commissioning_motor_id(&self, _joint: usize) -> Option<u16> { None }
+
+    /// Bounded non-blocking RX drain for RT commissioning (records register replies into the
+    /// preallocated commissioning buffer without starting a new TX pass). Returns `(frames, drained)`.
+    fn commissioning_drain_rx_step(&mut self, _max_frames: u16, _deadline: Instant) -> Result<(u16, bool), ArmDriverError> {
+        Err(ArmDriverError::Protocol("non-blocking commissioning RX is not supported by this driver".into()))
+    }
+
+    /// Clears the preallocated commissioning register-reply buffer in-place (0 alloc/free).
+    fn commissioning_clear_register_log(&mut self) {}
+
+    /// Single non-blocking register read TX (`0x33`) under `deadline`, running `pre_tx_gate`
+    /// immediately before `can.transmit` (Step 5 submission boundary).
+    fn commissioning_try_send_register_read(
+        &mut self,
+        _joint: usize,
+        _rid: u8,
+        _deadline: Instant,
+        _pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> crate::mit::CommissioningTxStatus {
+        crate::mit::CommissioningTxStatus::Refused("register read commissioning unsupported")
+    }
+
+    /// Single non-blocking RAM TIMEOUT write TX (`0x55`, RID 9, never flash `0xAA`) under
+    /// `deadline`, running `pre_tx_gate` immediately before `can.transmit`.
+    fn commissioning_try_send_timeout_write(
+        &mut self,
+        _joint: usize,
+        _counts: u32,
+        _deadline: Instant,
+        _pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> crate::mit::CommissioningTxStatus {
+        crate::mit::CommissioningTxStatus::Refused("TIMEOUT write commissioning unsupported")
+    }
+
+    /// Scans the preallocated commissioning register-reply buffer for a reply causally matching
+    /// `(joint, write, rid)` strictly after `(after_tx_seq, min_rx_at, tx_offset_ns)`.
+    /// Returns [`CommissioningRegMatch::Ambiguous`] if multiple replies or any stale/drifted reply
+    /// for `(joint, write, rid)` arrived after `after_tx_seq` (B1 fail-closed attribution).
+    fn commissioning_find_register_reply(
+        &self,
+        _joint: usize,
+        _write: bool,
+        _rid: u8,
+        _after_tx_seq: u64,
+        _min_rx_at: Instant,
+        _tx_offset_ns: Option<i128>,
+    ) -> crate::mit::CommissioningRegMatch {
+        crate::mit::CommissioningRegMatch::Pending
+    }
+
+    /// One bounded non-blocking disable-all step (retaining per-motor `disable_dispatched_mask`
+    /// across releases) for hardware motor zero.
+    fn commissioning_disable_step(
+        &mut self,
+        _started_at: Instant,
+        _deadline: Instant,
+        _pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> crate::mit::CommissioningDisableStep {
+        crate::mit::CommissioningDisableStep::Refused("non-blocking motor zero disable unsupported")
+    }
+
+    /// Single non-blocking motor set-zero TX (`CMD_SET_ZERO`) under `deadline`, running
+    /// `pre_tx_gate` immediately before `can.transmit`.
+    fn commissioning_try_send_set_zero(
+        &mut self,
+        _joint: usize,
+        _deadline: Instant,
+        _pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> crate::mit::CommissioningTxStatus {
+        crate::mit::CommissioningTxStatus::Refused("non-blocking motor zero unsupported")
+    }
+
+    /// Latest per-joint feedback (raw motor position + calibrated joint position + rx_seq + rx_at).
+    fn commissioning_raw_feedback(&self, _joint: usize) -> Option<crate::mit::CommissioningFeedback> {
+        None
     }
 }
 
@@ -2952,15 +3079,24 @@ impl<T: Transport> FeetechArmDriver<T> {
                 }
             }
         }
+        let eff_deadline = match (deadline, self.tx_release_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        if eff_deadline.is_some_and(|dl| self.clock_now() >= dl) {
+            return Ok(false);
+        }
         // Invalidate per-motor torque windows immediately BEFORE the torque-changing write reaches
         // the transport; a gate refusal above leaves evidence intact. (Keep `rest_pose_window`
         // intact across the atomic multi-servo disable batch so servo 0's write does not poison
         // servos 1..N microseconds later; non-rest feedback or >100 ms staleness still invalidates it.)
         let servo_idx = self.servo_ids.iter().position(|&id| id == servo_id);
         let prev_reported = servo_idx.and_then(|idx| self.reported_enable[idx]);
+        let prev_confirmed = servo_idx.and_then(|idx| self.last_enable_confirmed[idx]);
         let prev_commanded = self.torque_enable_commanded;
         if let Some(idx) = servo_idx {
             self.reported_enable[idx] = None;
+            self.last_enable_confirmed[idx] = None;
         }
         self.torque_enable_commanded = false;
         let pkt = feetech::build_set_torque_array(servo_id, false);
@@ -2968,6 +3104,7 @@ impl<T: Transport> FeetechArmDriver<T> {
             if matches!(e, TransportError::WouldBlock) {
                 if let Some(idx) = servo_idx {
                     self.reported_enable[idx] = prev_reported;
+                    self.last_enable_confirmed[idx] = prev_confirmed;
                 }
                 self.torque_enable_commanded = prev_commanded;
             }
@@ -2976,8 +3113,8 @@ impl<T: Transport> FeetechArmDriver<T> {
         let flush_res = self.transport.flush();
         let flush_ok = flush_res.is_ok();
         let _ = flush_res;
-        if *rx_budget > 0 && deadline.is_none_or(|dl| self.clock_now() < dl) {
-            let _ = self.drain_tx_echo_until(&pkt, deadline);
+        if *rx_budget > 0 && eff_deadline.is_none_or(|dl| self.clock_now() < dl) {
+            let _ = self.drain_tx_echo_until(&pkt, eff_deadline);
         }
         // Record pure stack-only flush ambiguity flag; shadow clock sampling and staging are
         // deferred strictly until AFTER the entire disable batch + readback deadline check.
@@ -3442,6 +3579,7 @@ impl<T: Transport> FeetechArmDriver<T> {
             }
             _ => {
                 self.reported_enable[idx] = None;
+                self.last_enable_confirmed[idx] = None;
             }
         }
     }
@@ -3492,12 +3630,14 @@ impl<T: Transport> FeetechArmDriver<T> {
                 }
                 Ok(_) => {
                     self.reported_enable[idx] = None;
+                    self.last_enable_confirmed[idx] = None;
                     if first_error.is_none() {
                         first_error = Some((id, "FEETECH_UNEXPECTED_TORQUE_ENABLE_VALUE"));
                     }
                 }
                 Err(e) => {
                     self.reported_enable[idx] = None;
+                    self.last_enable_confirmed[idx] = None;
                     if first_error.is_none() {
                         first_error = Some((id, Self::readback_error_code(&e)));
                     }
@@ -3875,6 +4015,7 @@ impl<T: Transport> FeetechArmDriver<T> {
                 _ => {
                     if joint_idx < self.reported_enable.len() {
                         self.reported_enable[joint_idx] = None;
+                        self.last_enable_confirmed[joint_idx] = None;
                     }
                     all_enabled = false;
                     all_disabled = false;
@@ -4277,6 +4418,10 @@ impl<T: Transport> FeetechArmDriver<T> {
             [crate::torque::MotorWriteOutcome::NotTargeted; crate::torque::MAX_CHANNELS];
         #[cfg(not(target_arch = "wasm32"))]
         let mut shadow_ambiguous_gap = false;
+        let eff_deadline = match (deadline, self.tx_release_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         for (idx, &id) in ids[..n].iter().enumerate() {
             if skip_dispatched && idx < 64 && (self.disable_dispatched_mask & (1u64 << idx)) != 0 {
                 continue;
@@ -4292,7 +4437,7 @@ impl<T: Transport> FeetechArmDriver<T> {
                     break;
                 }
             }
-            match self.write_torque_off_checked_budgeted(id, kind, client_park, deadline, &mut rx_remaining) {
+            match self.write_torque_off_checked_budgeted(id, kind, client_park, eff_deadline, &mut rx_remaining) {
                 Ok(true) => {
                     wrote_any = true;
                     if idx < 64 {
@@ -5014,6 +5159,7 @@ impl<T: Transport> FeetechArmDriver<T> {
                     let id = self.servo_ids[idx];
                     if self.unmatched_1b_read.get(idx).copied().unwrap_or(false) {
                         self.reported_enable[idx] = None;
+                        self.last_enable_confirmed[idx] = None;
                         continue;
                     }
                     match replies.get(&id).copied() {
@@ -5022,6 +5168,7 @@ impl<T: Transport> FeetechArmDriver<T> {
                         }
                         Some(_) => {
                             self.reported_enable[idx] = None;
+                            self.last_enable_confirmed[idx] = None;
                         }
                         None => {
                             self.missed_enable_polls[idx] = self.missed_enable_polls[idx].saturating_add(1);
@@ -5029,6 +5176,7 @@ impl<T: Transport> FeetechArmDriver<T> {
                                 || self.last_enable_confirmed[idx].is_none_or(|t| now.saturating_duration_since(t) > Duration::from_millis(600))
                             {
                                 self.reported_enable[idx] = None;
+                                self.last_enable_confirmed[idx] = None;
                             }
                         }
                     }
@@ -5239,6 +5387,21 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         }
     }
 
+    fn is_hardware_disarmed_confirmed(&self) -> bool {
+        !self.servo_ids.is_empty()
+            && !self.torque_enable_commanded
+            && self.pending_disable.is_none()
+            && self.disable_dispatched_mask == 0
+            && self.is_feedback_valid()
+            && self.reported_enable.len() == self.servo_ids.len()
+            && self.last_enable_confirmed.len() == self.servo_ids.len()
+            && self.reported_enable.iter().all(|v| *v == Some(0))
+            && self
+                .last_enable_confirmed
+                .iter()
+                .all(|ts| ts.is_some_and(|t| self.elapsed_since(t) <= Duration::from_millis(600)))
+    }
+
     fn reported_torque_loss_sample_seq(&self) -> Option<u64> {
         Some(self.reported_torque_loss_sample_seq)
     }
@@ -5343,6 +5506,16 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         _max_rx_frames: u16,
     ) -> Result<(u16, bool), ArmDriverError> {
         Err(ArmDriverError::ProtocolStatic("UNSUPPORTED: serial driver does not support budgeted RX"))
+    }
+
+    fn read_joint_states_safe_hold(
+        &mut self,
+        out: &mut Vec<JointState>,
+        _deadline: Instant,
+        _max_rx_frames: u16,
+    ) -> Result<(u16, bool), ArmDriverError> {
+        self.read_joint_states_into(out)?;
+        Ok((out.len() as u16, false))
     }
 
     fn read_cached_joint_states_into(&self, out: &mut Vec<JointState>) -> Option<()> {
@@ -5475,6 +5648,10 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
 
     fn decode_motor_error(&self, code: u8) -> Option<String> {
         feetech::feetech_error_name(code)
+    }
+
+    fn decode_motor_error_static(&self, _code: u8) -> Option<&'static str> {
+        None
     }
 
     fn check_hardware_status(&self) -> Result<(), ArmDriverError> {
@@ -5715,6 +5892,7 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                 // Invalidate this servo's reported enable telemetry and rest-pose window BEFORE
                 // the write reaches the transport.
                 self.reported_enable[idx] = None;
+                self.last_enable_confirmed[idx] = None;
                 self.rest_pose_window[idx].reset();
                 if let Err(e) = self.discard_pending_rx_for_request() {
                     write_err = Some(e);
@@ -5907,8 +6085,12 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                 }
             }
         }
-        let (done, rx_used, exhausted) =
-            self.execute_disable_writes_budgeted(kind, None, None, Some(max_rx_frames))?;
+        let (done, rx_used, exhausted) = self.execute_disable_writes_budgeted(
+            kind,
+            None,
+            self.tx_release_deadline,
+            Some(max_rx_frames),
+        )?;
         self.last_poll_rx = Some((rx_used, exhausted));
         if done {
             Ok(TorqueProgress::Done(TorqueOutcome::Confirmed))
@@ -6346,6 +6528,9 @@ impl<T: Transport> FashionStarArmDriver<T> {
         if let DisableKind::DisableRequested { started_at } = kind {
             self.check_disable_requested(started_at)?;
         }
+        if self.tx_release_deadline.is_some_and(|dl| self.now() >= dl) {
+            return Err(ArmDriverError::Transport(TransportError::WouldBlock));
+        }
         let res = self.transport.write_all(&pkt);
         #[cfg(not(target_arch = "wasm32"))]
         if self.shadow_staging.is_enabled() {
@@ -6444,6 +6629,19 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
 
     fn feedback_ages(&self) -> Vec<Option<Duration>> {
         self.last_feedback_instant.iter().map(|t| t.map(|t| self.since(t))).collect()
+    }
+
+    fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
+        out.clear();
+        out.extend(self.last_feedback_instant.iter().map(|t| t.map(|t| self.since(t))));
+    }
+
+    fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool {
+        self.last_feedback_instant.len() == dof
+            && self
+                .last_feedback_instant
+                .iter()
+                .all(|t| t.is_some_and(|t| self.since(t) <= max_age))
     }
 
     fn feedback_instants(&self) -> Vec<Option<Instant>> {
@@ -7308,6 +7506,9 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     /// Register replies with the CAN ID they arrived on and their receive instant (MIT
     /// identity readback and TIMEOUT commissioning).
     register_reply_log: Vec<(damiao::RegisterReply, u32, Instant, u64, u64)>,
+    /// Preallocated inline register reply buffer for RT commissioning (zero heap alloc/free).
+    comm_reg_replies: [Option<crate::mit::CommissioningRegReply>; 64],
+    comm_reg_reply_len: usize,
     /// RX sequence number of the last observed-empty receive queue: every frame dequeued after
     /// it (sequence number larger) was enqueued after that observation.
     rx_empty_seq: u64,
@@ -8423,6 +8624,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             recovery_written_joints: Vec::with_capacity(dof.max(16)),
             strict_mode_handover: false,
             register_reply_log: Vec::with_capacity(64),
+            comm_reg_replies: [None; 64],
+            comm_reg_reply_len: 0,
             clock,
             rx_seq: 0,
             last_feedback_seq: vec![0; dof],
@@ -9069,7 +9272,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     ) -> Result<CanFrame, TxRefusal> {
         let prev = self.send_lease_gen;
         self.send_lease_gen = expected_lease_gen;
-        let res = self.send(kind, expected_stamp, deadline, fenced, build);
+        let res = self.send_plain(kind, expected_stamp, deadline, fenced, build);
         self.send_lease_gen = prev;
         res
     }
@@ -9145,7 +9348,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         );
     }
 
-    fn send(
+    fn send_plain(
         &mut self,
         kind: impl DamiaoTxKind,
         expected_stamp: Option<StopStamp>,
@@ -9153,6 +9356,43 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         fenced: bool,
         build: impl FnOnce(&Self) -> Option<CanFrame>,
     ) -> Result<CanFrame, TxRefusal> {
+        let mut revoked: Option<&'static str> = None;
+        self.send(kind, expected_stamp, deadline, fenced, None, &mut revoked, build)
+            .map(|(f, _, _, _)| f)
+    }
+
+    fn send_with_commissioning_gate(
+        &mut self,
+        kind: impl DamiaoTxKind,
+        expected_stamp: Option<StopStamp>,
+        deadline: Option<Deadline>,
+        pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+        build: impl FnOnce(&Self) -> Option<CanFrame>,
+    ) -> Result<(CanFrame, u64, Instant, Option<i128>), Result<&'static str, TxRefusal>> {
+        let mut revoked: Option<&'static str> = None;
+        match self.send(kind, expected_stamp, deadline, false, Some(pre_tx_gate), &mut revoked, build) {
+            Ok(ok) => Ok(ok),
+            Err(r) => {
+                if let Some(code) = revoked {
+                    Err(Ok(code))
+                } else {
+                    Err(Err(r))
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn send(
+        &mut self,
+        kind: impl DamiaoTxKind,
+        expected_stamp: Option<StopStamp>,
+        deadline: Option<Deadline>,
+        fenced: bool,
+        mut pre_tx_gate: Option<&mut dyn FnMut() -> Result<(), &'static str>>,
+        revoked_out: &mut Option<&'static str>,
+        build: impl FnOnce(&Self) -> Option<CanFrame>,
+    ) -> Result<(CanFrame, u64, Instant, Option<i128>), TxRefusal> {
         let tx_kind = kind.tx_kind();
         let res = 'send_body: {
             let expected_lease_gen = self.send_lease_gen;
@@ -9276,6 +9516,12 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             if budgeted && !self.can_start_tick_tx() {
                 break 'send_body Err(TxRefusal::Deferred);
             }
+            if let Some(gate) = pre_tx_gate.as_mut() {
+                if let Err(code) = (gate)() {
+                    *revoked_out = Some(code);
+                    break 'send_body Err(TxRefusal::LeaseFenced);
+                }
+            }
 
             // 6. Account budget attempt, precompute indices and CPU timestamp, reset non-enable
             //    boundaries, then run the final observable `CMD_ENABLE`/`CMD_DISABLE` deadline and
@@ -9341,6 +9587,11 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             if is_cmd_disable && deadline.is_some_and(|d| d.passed(t0)) {
                 break 'send_body Err(TxRefusal::DeadlinePassed);
             }
+            // B1: Capture the causal submission mark immediately adjacent to `can.transmit` after
+            // all pre-TX bookkeeping so no pre-submission gap can widen the attribution window.
+            let tx_seq_mark = self.rx_seq;
+            let tx_started_mark = t0;
+            let (_, tx_offset_ns_mark) = self.capture_rx_clock_sample(tx_started_mark);
             let res = self.can.transmit(&frame);
             if res.is_ok() {
                 if let Some(idx) = enable_motor_idx {
@@ -9379,7 +9630,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                             write_done_offset_ns,
                         });
                     }
-                    Ok(frame)
+                    Ok((frame, tx_seq_mark, tx_started_mark, tx_offset_ns_mark))
                 }
                 Err(e) => {
                     self.tx_probe = None;
@@ -9517,14 +9768,14 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let mut retries = 0u8;
         loop {
             let res = match pos_force_token {
-                Some(tok) => self.send(
+                Some(tok) => self.send_plain(
                     pos_force_emitter::authorize_kind(tok, kind),
                     expected_stamp,
                     deadline,
                     fenced,
                     |d| build(d),
                 ),
-                None => self.send(kind, expected_stamp, deadline, fenced, |d| build(d)),
+                None => self.send_plain(kind, expected_stamp, deadline, fenced, |d| build(d)),
             };
             match res {
                 Ok(frame) => return Ok(frame),
@@ -10059,7 +10310,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             return Ok(false);
         };
         let _ = self.ensure_tx_pass();
-        match self.send(TxKind::Refresh, Some(expected_stamp), deadline, false, |d| {
+        match self.send_plain(TxKind::Refresh, Some(expected_stamp), deadline, false, |d| {
             Some(damiao::build_refresh_frame(d.motor_ids[joint]))
         }) {
             Ok(_) => {
@@ -10133,7 +10384,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         {
             return Ok(false);
         }
-        match self.send(TxKind::Refresh, Some(expected_stamp), None, false, |d| {
+        match self.send_plain(TxKind::Refresh, Some(expected_stamp), None, false, |d| {
             Some(damiao::build_refresh_frame(d.motor_ids[pf_joint]))
         }) {
             Ok(_) => {
@@ -11027,7 +11278,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         // as every other TX in the release.
         self.begin_tx_tick();
         let probe_joint = 0usize;
-        match self.send(TxKind::Refresh, Some(start_stamp), deadline, false, |d| {
+        match self.send_plain(TxKind::Refresh, Some(start_stamp), deadline, false, |d| {
             Some(damiao::build_refresh_frame(d.motor_ids[probe_joint]))
         }) {
             Ok(_) => {}
@@ -12295,7 +12546,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 if (rc.sent_rids & (1u8 << k)) != 0 {
                     continue;
                 }
-                match self.send(TxKind::Handshake, self.enable_stop_stamp, Some(rc.deadline), false, |_| {
+                match self.send_plain(TxKind::Handshake, self.enable_stop_stamp, Some(rc.deadline), false, |_| {
                     Some(damiao::build_read_register_frame(id, rid))
                 }) {
                     Ok(_) => {
@@ -12519,7 +12770,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let boundary = self.rx_seq;
         let tx_at = self.now();
         let id = self.motor_ids[joint];
-        match self.send(TxKind::Handshake, self.enable_stop_stamp, Some(deadline), false, |_| {
+        match self.send_plain(TxKind::Handshake, self.enable_stop_stamp, Some(deadline), false, |_| {
             Some(damiao::build_refresh_frame(id))
         }) {
             Ok(_) => {}
@@ -12922,7 +13173,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             let mut first_sent_joint = None;
             for j in handshake::mask_joints(unsent) {
                 let id = self.motor_ids[j];
-                match self.send(TxKind::Handshake, self.enable_stop_stamp, Some(r.deadline), false, |_| {
+                match self.send_plain(TxKind::Handshake, self.enable_stop_stamp, Some(r.deadline), false, |_| {
                     Some(damiao::build_read_register_frame(id, damiao::RID_CTRL_MODE))
                 }) {
                     Ok(_) => {
@@ -13282,7 +13533,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 mask &= !(1 << i);
                 continue;
             };
-            match self.send(TxKind::Handshake, self.enable_stop_stamp, deadline, false, |d| {
+            match self.send_plain(TxKind::Handshake, self.enable_stop_stamp, deadline, false, |d| {
                 // L2: Never transmit `CMD_ENABLE` unless `verified_modes[i]` causally matches
                 // `base_mode(i)` after this daemon started.
                 if d.verified_modes.get(i).copied().flatten() != Some(d.base_mode(i))
@@ -14016,7 +14267,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             if skip_dispatched && idx < 64 && (self.disable_dispatched_mask & (1u64 << idx)) != 0 {
                 continue;
             }
-            match self.send(tx_kind, expected_stamp, step_dl, false, |d| {
+            match self.send_plain(tx_kind, expected_stamp, step_dl, false, |d| {
                 Some(damiao::build_disable_frame(d.motor_ids[idx]))
             }) {
                 Ok(_) => {
@@ -14256,7 +14507,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let mut probed_any = false;
         for i in handshake::mask_joints(probe_mask) {
             let Some(&id) = self.motor_ids.get(i) else { continue };
-            match self.send(TxKind::DisableProbe, None, dl, false, |_| {
+            match self.send_plain(TxKind::DisableProbe, None, dl, false, |_| {
                 Some(damiao::build_refresh_frame(id))
             }) {
                 Ok(_) => probed_any = true,
@@ -14409,7 +14660,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             if idx < 64 && (repeat_pass_mask & (1u64 << idx)) != 0 {
                 continue;
             }
-            match self.send(tx_kind, None, None, false, |d| {
+            match self.send_plain(tx_kind, None, None, false, |d| {
                 Some(damiao::build_disable_frame(d.motor_ids[idx]))
             }) {
                 Ok(_) => {
@@ -14771,7 +15022,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             }
             let id = self.motor_ids[i];
             let seq_before = self.rx_seq;
-            match self.send(TxKind::Refresh, None, None, false, |_| {
+            match self.send_plain(TxKind::Refresh, None, None, false, |_| {
                 Some(damiao::build_read_register_frame(id, damiao::RID_CTRL_MODE))
             }) {
                 Ok(_) => {
@@ -14822,6 +15073,19 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
     fn feedback_ages(&self) -> Vec<Option<Duration>> {
         self.last_feedback_instant.iter().map(|t| t.map(|t| self.since(t))).collect()
+    }
+
+    fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
+        out.clear();
+        out.extend(self.last_feedback_instant.iter().map(|t| t.map(|t| self.since(t))));
+    }
+
+    fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool {
+        self.last_feedback_instant.len() == dof
+            && self
+                .last_feedback_instant
+                .iter()
+                .all(|t| t.is_some_and(|t| self.since(t) <= max_age))
     }
 
     fn feedback_instants(&self) -> Vec<Option<Instant>> {
@@ -14988,7 +15252,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         let pre = self.rx_boundary().map_err(|e| e.to_string())?;
         self.pending_stop_check(Some(start_stamp)).map_err(|e| format!("status poll not sent: {e}"))?;
         for idx in 0..self.motor_ids.len() {
-            match self.send(TxKind::Refresh, Some(start_stamp), None, false, |d| {
+            match self.send_plain(TxKind::Refresh, Some(start_stamp), None, false, |d| {
                 Some(damiao::build_refresh_frame(d.motor_ids[idx]))
             }) {
                 Ok(_) => {}
@@ -15030,7 +15294,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         // 1. clear-error (FF..FB on the motor's ID) to every motor reporting an error state
         let faulted: Vec<usize> = (0..self.motor_ids.len()).filter(|&i| self.motor_status[i] >= 8).collect();
         for &i in &faulted {
-            match self.send(TxKind::ClearFault, Some(start_stamp), None, false, |d| {
+            match self.send_plain(TxKind::ClearFault, Some(start_stamp), None, false, |d| {
                 Some(damiao::build_clear_faults_frame(d.motor_ids[i]))
             }) {
                 Ok(_) => {}
@@ -15175,6 +15439,472 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         Ok(())
     }
 
+    fn supports_nonblocking_commissioning(&self) -> bool {
+        self.can.supports_nonblocking_rt() && self.can.supports_bounded_flush()
+    }
+
+    fn supports_nonblocking_motor_zero(&self) -> bool {
+        self.can.supports_nonblocking_rt() && self.can.supports_bounded_flush()
+    }
+
+    fn commissioning_motor_id(&self, joint: usize) -> Option<u16> {
+        self.motor_ids.get(joint).copied()
+    }
+
+    fn commissioning_drain_rx_step(
+        &mut self,
+        max_frames: u16,
+        deadline: Instant,
+    ) -> Result<(u16, bool), ArmDriverError> {
+        if !self.can.supports_nonblocking_rt() {
+            return Err(ArmDriverError::Protocol("non-blocking CAN RX unsupported".into()));
+        }
+        let limit = usize::from(max_frames.min(64));
+        let mut frames = 0u16;
+        let mut drained = false;
+        self.last_read_drained = false;
+        while usize::from(frames) < limit && self.now() < deadline {
+            let attempt = self.now();
+            match self.can.receive_with_rx_time() {
+                Ok((frame, rx_time)) => {
+                    frames = frames.saturating_add(1);
+                    self.process_rx_frame(&frame, true, rx_time);
+                }
+                Err(TransportError::Timeout) | Err(TransportError::WouldBlock) => {
+                    drained = true;
+                    self.mark_rx_empty(attempt);
+                    break;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok((frames, drained))
+    }
+
+    fn commissioning_clear_register_log(&mut self) {
+        self.comm_reg_reply_len = 0;
+    }
+
+    fn commissioning_try_send_register_read(
+        &mut self,
+        joint: usize,
+        rid: u8,
+        deadline: Instant,
+        pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> crate::mit::CommissioningTxStatus {
+        let Some(&id) = self.motor_ids.get(joint) else {
+            return crate::mit::CommissioningTxStatus::Refused("joint out of range");
+        };
+        let start_stamp = self.current_stop_stamp();
+        match self.send_with_commissioning_gate(
+            TxKind::Refresh,
+            Some(start_stamp),
+            Some(Deadline { at: deadline }),
+            pre_tx_gate,
+            |_| Some(damiao::build_read_register_frame(id, rid)),
+        ) {
+            Ok((_, tx_seq, tx_started, tx_offset_ns)) => {
+                if !self.can.flush_is_noop() {
+                    if self.flush_cutoff_exceeded() || self.now() >= deadline {
+                        return crate::mit::CommissioningTxStatus::SentFlushFailed {
+                            tx_seq,
+                            tx_started,
+                            tx_offset_ns,
+                        };
+                    }
+                    if self.can.flush().is_err() {
+                        return crate::mit::CommissioningTxStatus::SentFlushFailed {
+                            tx_seq,
+                            tx_started,
+                            tx_offset_ns,
+                        };
+                    }
+                }
+                crate::mit::CommissioningTxStatus::Sent {
+                    tx_seq,
+                    tx_started,
+                    tx_offset_ns,
+                }
+            }
+            Err(Ok(code)) => crate::mit::CommissioningTxStatus::Revoked(code),
+            Err(Err(TxRefusal::Deferred | TxRefusal::DeadlinePassed)) => {
+                crate::mit::CommissioningTxStatus::Backpressure
+            }
+            Err(Err(TxRefusal::Transport(e))) if e.is_tx_backpressure() => {
+                crate::mit::CommissioningTxStatus::Backpressure
+            }
+            Err(Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged)) => {
+                crate::mit::CommissioningTxStatus::Revoked("STOPPED")
+            }
+            Err(Err(_)) => crate::mit::CommissioningTxStatus::Refused("register read transmit failed"),
+        }
+    }
+
+    fn commissioning_try_send_timeout_write(
+        &mut self,
+        joint: usize,
+        counts: u32,
+        deadline: Instant,
+        pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> crate::mit::CommissioningTxStatus {
+        let Some(&id) = self.motor_ids.get(joint) else {
+            return crate::mit::CommissioningTxStatus::Refused("joint out of range");
+        };
+        if counts == 0 || counts > crate::mit::MAX_TIMEOUT_COUNTS {
+            return crate::mit::CommissioningTxStatus::Refused("TIMEOUT counts out of range");
+        }
+        if self.is_enabled || self.is_enabling {
+            return crate::mit::CommissioningTxStatus::Refused("torque must be off for TIMEOUT commissioning");
+        }
+        let fresh = !self.awaiting_rx_boundary
+            && self.last_feedback_instant[joint].is_some_and(|t| self.since(t) <= ZERO_FEEDBACK_MAX_AGE);
+        if !fresh || self.motor_status[joint] != 0 {
+            return crate::mit::CommissioningTxStatus::Refused("joint is not confirmed disabled");
+        }
+        let start_stamp = self.current_stop_stamp();
+        // RAM write opcode 0x55 only (NEVER flash store 0xAA).
+        match self.send_with_commissioning_gate(
+            TxKind::ModeWrite,
+            Some(start_stamp),
+            Some(Deadline { at: deadline }),
+            pre_tx_gate,
+            |_| Some(damiao::build_write_register_u32_frame(id, damiao::RID_TIMEOUT, counts)),
+        ) {
+            Ok((_, tx_seq, tx_started, tx_offset_ns)) => {
+                if !self.can.flush_is_noop() {
+                    if self.flush_cutoff_exceeded() || self.now() >= deadline {
+                        return crate::mit::CommissioningTxStatus::SentFlushFailed {
+                            tx_seq,
+                            tx_started,
+                            tx_offset_ns,
+                        };
+                    }
+                    if self.can.flush().is_err() {
+                        return crate::mit::CommissioningTxStatus::SentFlushFailed {
+                            tx_seq,
+                            tx_started,
+                            tx_offset_ns,
+                        };
+                    }
+                }
+                crate::mit::CommissioningTxStatus::Sent {
+                    tx_seq,
+                    tx_started,
+                    tx_offset_ns,
+                }
+            }
+            Err(Ok(code)) => crate::mit::CommissioningTxStatus::Revoked(code),
+            Err(Err(TxRefusal::Deferred | TxRefusal::DeadlinePassed)) => {
+                crate::mit::CommissioningTxStatus::Backpressure
+            }
+            Err(Err(TxRefusal::Transport(e))) if e.is_tx_backpressure() => {
+                crate::mit::CommissioningTxStatus::Backpressure
+            }
+            Err(Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged)) => {
+                crate::mit::CommissioningTxStatus::Revoked("STOPPED")
+            }
+            Err(Err(_)) => crate::mit::CommissioningTxStatus::Refused("TIMEOUT write transmit failed"),
+        }
+    }
+
+    fn commissioning_find_register_reply(
+        &self,
+        joint: usize,
+        write: bool,
+        rid: u8,
+        after_tx_seq: u64,
+        min_rx_at: Instant,
+        tx_offset_ns: Option<i128>,
+    ) -> crate::mit::CommissioningRegMatch {
+        let Some(&id) = self.motor_ids.get(joint) else {
+            return crate::mit::CommissioningRegMatch::Pending;
+        };
+        let mut matched: Option<crate::mit::CommissioningRegReply> = None;
+        for slot in &self.comm_reg_replies[..self.comm_reg_reply_len] {
+            let Some(rep) = *slot else { continue };
+            if rep.motor_id != id || rep.write != write || rep.rid != rid {
+                continue;
+            }
+            if rep.rx_seq <= after_tx_seq {
+                continue;
+            }
+            // B1: Any reply for `(motor_id, op, rid)` dequeued AFTER the empty-queue TX boundary
+            // whose timestamp precedes `min_rx_at` or whose realtime-to-monotonic clock offset
+            // drifted proves delayed/ambiguous in-flight bus traffic -> fail closed!
+            if rep.rx_at < min_rx_at {
+                return crate::mit::CommissioningRegMatch::Ambiguous;
+            }
+            let offset_ok = match (tx_offset_ns, rep.decode_offset_ns) {
+                (Some(w_off), Some(d_off)) => {
+                    (d_off - w_off).abs() <= MAX_REALTIME_MONOTONIC_OFFSET_DRIFT_NS
+                }
+                (None, None) => true,
+                _ => false,
+            };
+            if !offset_ok {
+                return crate::mit::CommissioningRegMatch::Ambiguous;
+            }
+            // Multiple replies for the same `(motor_id, op, rid)` in one request window ->
+            // cannot distinguish delayed stale traffic from the current request -> fail closed!
+            if matched.is_some() {
+                return crate::mit::CommissioningRegMatch::Ambiguous;
+            }
+            matched = Some(rep);
+        }
+        match matched {
+            Some(rep) => crate::mit::CommissioningRegMatch::Matched(rep),
+            None => crate::mit::CommissioningRegMatch::Pending,
+        }
+    }
+
+    fn commissioning_disable_step(
+        &mut self,
+        started_at: Instant,
+        deadline: Instant,
+        pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> crate::mit::CommissioningDisableStep {
+        let n = self.motor_ids.len().min(64);
+        let all_mask = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+        if (self.disable_dispatched_mask & all_mask) == all_mask {
+            self.disable_dispatched_mask = 0;
+        }
+        let start_stamp = self.current_stop_stamp();
+        let tx_kind = TxKind::DisableRequested { started_at };
+        let mut sent_any = false;
+        let mut wait_evidence = false;
+        let mut last_tx_seq = self.rx_seq;
+        let mut last_tx_started = self.now();
+        let mut last_tx_offset = None;
+        let mut early_ret: Option<crate::mit::CommissioningDisableStep> = None;
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut deferred_refusal_mask = crate::torque::ChannelMask::EMPTY;
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut deferred_refusal_outcomes =
+            [crate::torque::MotorWriteOutcome::NotTargeted; crate::torque::MAX_CHANNELS];
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.defer_disable_shadow = true;
+        }
+        for idx in 0..n {
+            if (self.disable_dispatched_mask & (1u64 << idx)) != 0 {
+                continue;
+            }
+            if self.now() >= deadline {
+                break;
+            }
+            let id = self.motor_ids[idx];
+            match self.send_with_commissioning_gate(
+                tx_kind,
+                Some(start_stamp),
+                Some(Deadline { at: deadline }),
+                pre_tx_gate,
+                |_| Some(damiao::build_disable_frame(id)),
+            ) {
+                Ok((_, tx_seq, tx_started, tx_offset)) => {
+                    sent_any = true;
+                    last_tx_seq = tx_seq;
+                    last_tx_started = tx_started;
+                    last_tx_offset = tx_offset;
+                    self.disable_dispatched_mask |= 1u64 << idx;
+                }
+                Err(Ok(code)) => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if idx < crate::torque::MAX_CHANNELS {
+                        deferred_refusal_mask.insert(idx as u8);
+                        deferred_refusal_outcomes[idx] =
+                            crate::torque::MotorWriteOutcome::RejectedStale;
+                    }
+                    if sent_any && !self.can.flush_is_noop() && !self.flush_cutoff_exceeded() {
+                        let _ = self.can.flush();
+                    }
+                    early_ret = Some(crate::mit::CommissioningDisableStep::Revoked(code));
+                    break;
+                }
+                Err(Err(TxRefusal::DisableWaitEvidence)) => {
+                    wait_evidence = true;
+                }
+                Err(Err(TxRefusal::TorqueOffWouldDrop)) => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if idx < crate::torque::MAX_CHANNELS {
+                        deferred_refusal_mask.insert(idx as u8);
+                        deferred_refusal_outcomes[idx] =
+                            crate::torque::MotorWriteOutcome::RejectedStale;
+                    }
+                    early_ret = Some(crate::mit::CommissioningDisableStep::Refused(
+                        "ARM_NOT_AT_RESTING_POSE",
+                    ));
+                    break;
+                }
+                Err(Err(TxRefusal::DisableRequestExpired)) => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if idx < crate::torque::MAX_CHANNELS {
+                        deferred_refusal_mask.insert(idx as u8);
+                        deferred_refusal_outcomes[idx] =
+                            crate::torque::MotorWriteOutcome::RejectedStale;
+                    }
+                    early_ret = Some(crate::mit::CommissioningDisableStep::Refused(
+                        "disable request expired",
+                    ));
+                    break;
+                }
+                Err(Err(TxRefusal::Deferred | TxRefusal::DeadlinePassed)) => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if idx < crate::torque::MAX_CHANNELS {
+                        deferred_refusal_mask.insert(idx as u8);
+                        deferred_refusal_outcomes[idx] =
+                            crate::torque::MotorWriteOutcome::Deferred;
+                    }
+                    break;
+                }
+                Err(Err(TxRefusal::Transport(e))) if e.is_tx_backpressure() => break,
+                Err(Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged)) => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if idx < crate::torque::MAX_CHANNELS {
+                        deferred_refusal_mask.insert(idx as u8);
+                        deferred_refusal_outcomes[idx] =
+                            crate::torque::MotorWriteOutcome::RejectedStale;
+                    }
+                    early_ret = Some(crate::mit::CommissioningDisableStep::Revoked("STOPPED"));
+                    break;
+                }
+                Err(Err(r)) => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if !matches!(r, TxRefusal::Transport(_)) && idx < crate::torque::MAX_CHANNELS {
+                        deferred_refusal_mask.insert(idx as u8);
+                        deferred_refusal_outcomes[idx] =
+                            crate::torque::MotorWriteOutcome::RejectedStale;
+                    }
+                    early_ret = Some(crate::mit::CommissioningDisableStep::Refused(
+                        "disable transmit failed",
+                    ));
+                    break;
+                }
+            }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.defer_disable_shadow = false;
+            if self.shadow_staging.is_enabled() && !deferred_refusal_mask.is_empty() {
+                PendingDisableShadowBatch::merge_batch(
+                    &mut self.pending_disable_shadow,
+                    PendingDisableShadowBatch {
+                        kind: crate::torque::WriteKind::DisableRequested,
+                        target_mask: deferred_refusal_mask,
+                        outcomes: deferred_refusal_outcomes,
+                        ambiguous_gap: false,
+                        write_done: None,
+                    },
+                );
+            }
+        }
+        if let Some(step) = early_ret {
+            return step;
+        }
+        if sent_any && !self.can.flush_is_noop() {
+            if self.flush_cutoff_exceeded() || self.now() >= deadline {
+                return crate::mit::CommissioningDisableStep::InProgress {
+                    dispatched_mask: self.disable_dispatched_mask,
+                };
+            }
+            if self.can.flush().is_err() {
+                return crate::mit::CommissioningDisableStep::Refused("disable flush failed");
+            }
+        }
+        if (self.disable_dispatched_mask & all_mask) == all_mask {
+            self.disable_dispatched_mask = 0;
+            crate::mit::CommissioningDisableStep::AllDispatched {
+                boundary_seq: last_tx_seq,
+                tx_started: last_tx_started,
+                tx_offset_ns: last_tx_offset,
+            }
+        } else if wait_evidence && !sent_any {
+            crate::mit::CommissioningDisableStep::WaitEvidence
+        } else {
+            crate::mit::CommissioningDisableStep::InProgress {
+                dispatched_mask: self.disable_dispatched_mask,
+            }
+        }
+    }
+
+    fn commissioning_try_send_set_zero(
+        &mut self,
+        joint: usize,
+        deadline: Instant,
+        pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> crate::mit::CommissioningTxStatus {
+        let Some(&id) = self.motor_ids.get(joint) else {
+            return crate::mit::CommissioningTxStatus::Refused("joint out of range");
+        };
+        if self.is_enabled || self.is_enabling {
+            return crate::mit::CommissioningTxStatus::Refused("set-zero needs torque off");
+        }
+        let fresh = !self.awaiting_rx_boundary
+            && self.last_feedback_instant[joint].is_some_and(|t| self.since(t) <= ZERO_FEEDBACK_MAX_AGE);
+        if !fresh || self.motor_status[joint] != 0 {
+            return crate::mit::CommissioningTxStatus::Refused("joint is not confirmed disabled");
+        }
+        let start_stamp = self.current_stop_stamp();
+        match self.send_with_commissioning_gate(
+            TxKind::ModeWrite,
+            Some(start_stamp),
+            Some(Deadline { at: deadline }),
+            pre_tx_gate,
+            |_| Some(damiao::build_set_zero_frame(id)),
+        ) {
+            Ok((_, tx_seq, tx_started, tx_offset_ns)) => {
+                if !self.can.flush_is_noop() {
+                    if self.flush_cutoff_exceeded() || self.now() >= deadline {
+                        return crate::mit::CommissioningTxStatus::SentFlushFailed {
+                            tx_seq,
+                            tx_started,
+                            tx_offset_ns,
+                        };
+                    }
+                    if self.can.flush().is_err() {
+                        return crate::mit::CommissioningTxStatus::SentFlushFailed {
+                            tx_seq,
+                            tx_started,
+                            tx_offset_ns,
+                        };
+                    }
+                }
+                crate::mit::CommissioningTxStatus::Sent {
+                    tx_seq,
+                    tx_started,
+                    tx_offset_ns,
+                }
+            }
+            Err(Ok(code)) => crate::mit::CommissioningTxStatus::Revoked(code),
+            Err(Err(TxRefusal::Deferred | TxRefusal::DeadlinePassed)) => {
+                crate::mit::CommissioningTxStatus::Backpressure
+            }
+            Err(Err(TxRefusal::Transport(e))) if e.is_tx_backpressure() => {
+                crate::mit::CommissioningTxStatus::Backpressure
+            }
+            Err(Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged)) => {
+                crate::mit::CommissioningTxStatus::Revoked("STOPPED")
+            }
+            Err(Err(_)) => crate::mit::CommissioningTxStatus::Refused("set-zero transmit failed"),
+        }
+    }
+
+    fn commissioning_raw_feedback(&self, joint: usize) -> Option<crate::mit::CommissioningFeedback> {
+        let s = self.cached_states.get(joint)?;
+        let rx_at = self.last_feedback_instant.get(joint).copied().flatten()?;
+        let rx_seq = self.last_feedback_seq.get(joint).copied()?;
+        let motor_status = self.motor_status.get(joint).copied()?;
+        let queue_bound = self.feedback_queue_bound.get(joint).copied().flatten();
+        Some(crate::mit::CommissioningFeedback {
+            raw_position: s.position,
+            joint_position: s.position,
+            velocity: s.velocity,
+            motor_status,
+            rx_seq,
+            rx_at,
+            queue_bound,
+        })
+    }
+
     fn is_feedback_valid(&self) -> bool {
         if self.last_feedback_instant.is_empty() {
             return false;
@@ -15229,7 +15959,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         let mut err: Option<ArmDriverError> = None;
         let mut sent_any = false;
         for idx in 0..self.motor_ids.len() {
-            match self.send(TxKind::ClearFault, Some(start_stamp), None, false, |d| {
+            match self.send_plain(TxKind::ClearFault, Some(start_stamp), None, false, |d| {
                 Some(damiao::build_clear_faults_frame(d.motor_ids[idx]))
             }) {
                 Ok(_) => sent_any = true,
@@ -15277,7 +16007,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         let mut err: Option<ArmDriverError> = None;
         let mut sent_any = false;
         for idx in 0..self.motor_ids.len() {
-            match self.send(TxKind::ClearFault, Some(start_stamp), Some(dl), false, |d| {
+            match self.send_plain(TxKind::ClearFault, Some(start_stamp), Some(dl), false, |d| {
                 Some(damiao::build_clear_faults_frame(d.motor_ids[idx]))
             }) {
                 Ok(_) => sent_any = true,
@@ -15423,8 +16153,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         max_rx_frames: u16,
     ) -> Result<TorqueProgress, ArmDriverError> {
         if !self.can.supports_nonblocking_rt() {
-            return Err(ArmDriverError::Protocol(
-                "UNSUPPORTED: CAN transport does not support non-blocking RT I/O".into(),
+            return Err(ArmDriverError::ProtocolStatic(
+                "UNSUPPORTED: CAN transport does not support non-blocking RT I/O",
             ));
         }
         self.begin_disable_budgeted(kind, Some(max_rx_frames))
@@ -15450,8 +16180,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
     fn poll_torque_budgeted(&mut self, deadline: Instant, max_rx_frames: u16) -> Result<TorqueProgress, ArmDriverError> {
         if !self.can.supports_nonblocking_rt() {
-            return Err(ArmDriverError::Protocol(
-                "UNSUPPORTED: CAN transport does not support non-blocking RT I/O".into(),
+            return Err(ArmDriverError::ProtocolStatic(
+                "UNSUPPORTED: CAN transport does not support non-blocking RT I/O",
             ));
         }
         self.poll_torque_inner(deadline, max_rx_frames)
@@ -15478,6 +16208,20 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             self.torque_hs = None;
             self.enable_failed();
         }
+    }
+
+    fn prepare_safe_hold(&mut self) {
+        self.abort_enable();
+        // Also clear any abandoned in-flight disable handshake while preserving
+        // `self.disable_dispatched_mask` so already-disabled axes remain `SkippedOff` while all
+        // remaining energized axes continue receiving measured-position holds (DRV-F1 B10).
+        if matches!(
+            self.torque_hs,
+            Some(DamiaoTorque::Disable { .. } | DamiaoTorque::AwaitRestGate { .. })
+        ) {
+            self.torque_hs = None;
+        }
+        self.set_external_pos_force_emitter(false);
     }
 
     fn enable_frames_dispatched(&self) -> bool {
@@ -15531,7 +16275,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
         for i in pending_before {
             let Some(&id) = self.motor_ids.get(i) else { continue };
-            match self.send(protective, None, Some(tx_deadline), false, |_| {
+            match self.send_plain(protective, None, Some(tx_deadline), false, |_| {
                 Some(damiao::build_disable_frame(id))
             }) {
                 Ok(_) => {
@@ -15828,7 +16572,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         if started[i].is_none() {
                             started[i] = Some(self.now());
                         }
-                        match self.send(TxKind::RollbackHold(i), Some(start_stamp), None, true, |d| {
+                        match self.send_plain(TxKind::RollbackHold(i), Some(start_stamp), None, true, |d| {
                             let fresh_pos = d.fresh_measured_position(i, POS_FORCE_FEEDBACK_MAX_AGE)?;
                             let hold_target = JointTarget {
                                 position: fresh_pos,
@@ -16089,7 +16833,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         let _ = self.pending_hold_tx.remove_at(idx);
                         continue;
                     };
-                    match self.send(
+                    match self.send_plain(
                         TxKind::RollbackHold(i),
                         Some(entry.stop_stamp),
                         Some(entry_deadline),
@@ -16575,7 +17319,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     if started[i].is_none() {
                         started[i] = Some(self.now());
                     }
-                    match self.send(TxKind::MeasuredHold(i), Some(start_stamp), None, true, |d| {
+                    match self.send_plain(TxKind::MeasuredHold(i), Some(start_stamp), None, true, |d| {
                         if !captured_pos.is_finite() {
                             return None;
                         }
@@ -16815,7 +17559,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         let _ = self.pending_hold_tx.remove_at(idx);
                         continue;
                     };
-                    match self.send(
+                    match self.send_plain(
                         TxKind::MeasuredHold(i),
                         Some(entry.stop_stamp),
                         Some(entry_deadline),
@@ -17134,6 +17878,35 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     fn pos_force_last_fresh_position(&self) -> Option<f32> {
         let _ = self.pos_force.as_ref()?;
         self.pf_last_fresh_position
+    }
+
+    fn defer_motion_targets_past_cutoff(&mut self, targets: &[JointTarget]) {
+        let batch_lease_gen = self.output_lease_gen;
+        self.output_lease_gen = 0;
+        if targets.len() != self.motor_ids.len()
+            || self.torque_hs.is_some()
+            || self.mit_fence.is_some()
+            || self.mit_fence_trip.is_some()
+            || self.target_frames_refused(None, true).is_some()
+            || self.strict_stop_check(None).is_err()
+            || self.is_lease_fenced(batch_lease_gen)
+        {
+            return;
+        }
+        let batch_stamp = self.current_stop_stamp();
+        let batch_ts = self.now();
+        for (i, target) in targets.iter().enumerate() {
+            if self.joint_modes.get(i).copied().flatten() == Some(DamiaoControlMode::PosForce) {
+                continue;
+            }
+            if let Ok(cmds) = self.pending_target_cmds_checked(i, target) {
+                for (frame_id, cmd) in cmds.into_iter().flatten() {
+                    let _ = self
+                        .pending_tx
+                        .upsert(i, frame_id, cmd, batch_ts, batch_stamp, batch_lease_gen);
+                }
+            }
+        }
     }
 
     fn write_joint_targets_bounded(&mut self, targets: &[JointTarget]) -> Result<TxBatchOutcome, ArmDriverError> {
@@ -17663,8 +18436,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         max_rx_frames: u16,
     ) -> Result<(u16, bool), ArmDriverError> {
         if !self.can.supports_nonblocking_rt() {
-            return Err(ArmDriverError::Protocol(
-                "UNSUPPORTED: CAN transport does not support non-blocking RT I/O".into(),
+            return Err(ArmDriverError::ProtocolStatic(
+                "UNSUPPORTED: CAN transport does not support non-blocking RT I/O",
             ));
         }
         if !self.control_release_managed {
@@ -17699,13 +18472,6 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
     }
 
-    fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
-        out.clear();
-        out.extend(self.last_feedback_instant.iter().map(|t| t.map(|t| self.since(t))));
-    }
-    fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool {
-        self.last_feedback_instant.len() == dof && self.last_feedback_instant.iter().all(|t| t.is_some_and(|t| self.since(t) <= max_age))
-    }
     fn feedback_joints_within(&self, joints: &[usize], max_age: Duration) -> bool {
         joints.iter().all(|&i| {
             self.last_feedback_instant
@@ -17836,7 +18602,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 return;
             };
             let decode_now = self.now();
-            let Ok((rx_at, _)) = can_rx_time_to_monotonic(&self.can, rx_t, decode_now) else {
+            let Ok((rx_at, decode_offset_ns)) = can_rx_time_to_monotonic(&self.can, rx_t, decode_now) else {
                 return;
             };
             let motor_idx = self.motor_ids.iter().position(|&id| id == reply.motor_id);
@@ -17879,6 +18645,20 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             if record_register_replies {
                 if self.register_replies.len() < 64 { self.register_replies.push(reply); }
                 if self.register_reply_log.len() < 64 { self.register_reply_log.push((reply, frame.id, rx_at, self.rx_seq, self.rx_empty_seq)); }
+                if self.comm_reg_reply_len < self.comm_reg_replies.len() {
+                    self.comm_reg_replies[self.comm_reg_reply_len] = Some(crate::mit::CommissioningRegReply {
+                        motor_id: reply.motor_id,
+                        write: reply.write,
+                        rid: reply.rid,
+                        reply_id: frame.id,
+                        value: reply.value,
+                        rx_at,
+                        rx_seq: self.rx_seq,
+                        rx_empty_seq: self.rx_empty_seq,
+                        decode_offset_ns,
+                    });
+                    self.comm_reg_reply_len += 1;
+                }
             }
             return;
         }
@@ -18325,7 +19105,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         recovery_vel,
                     )
                 } else {
-                    self.send(TxKind::Recovery, Some(rx_stop_stamp), None, false, |d| {
+                    self.send_plain(TxKind::Recovery, Some(rx_stop_stamp), None, false, |d| {
                         let id = d.motor_ids[i];
                         let p = d.cached_states.get(i).map_or(0.0, |s| s.position);
                         match resolved_mode {
@@ -19552,6 +20332,19 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
         self.last_feedback_instant.iter().map(|t| t.map(|t| self.since(t))).collect()
     }
 
+    fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
+        out.clear();
+        out.extend(self.last_feedback_instant.iter().map(|t| t.map(|t| self.since(t))));
+    }
+
+    fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool {
+        self.last_feedback_instant.len() == dof
+            && self
+                .last_feedback_instant
+                .iter()
+                .all(|t| t.is_some_and(|t| self.since(t) <= max_age))
+    }
+
     fn feedback_instants(&self) -> Vec<Option<Instant>> {
         self.last_feedback_instant.clone()
     }
@@ -20291,7 +21084,7 @@ mod tx_chokepoint_tests {
 
                         let stamp = drv.current_stop_stamp();
                         let mut build_called = false;
-                        let res = drv.send(kind, Some(stamp), deadline, false, |d| {
+                        let res = drv.send_plain(kind, Some(stamp), deadline, false, |d| {
                             build_called = true;
                             Some(damiao::build_pos_vel_frame(0x100, d.motor_ids[0], 0.25, 1.0))
                         });
@@ -20356,7 +21149,7 @@ mod tx_chokepoint_tests {
         clock.advance(Duration::from_millis(101));
         bus.clear_tx();
         let mut called = false;
-        let stale_res = drv.send(TxKind::RollbackHold(0), None, None, false, |d| {
+        let stale_res = drv.send_plain(TxKind::RollbackHold(0), None, None, false, |d| {
             called = true;
             Some(damiao::build_pos_vel_frame(0x100, d.motor_ids[0], 0.35, 1.0))
         });
@@ -20370,7 +21163,7 @@ mod tx_chokepoint_tests {
         drv.read_joint_states().unwrap();
         bus.clear_tx();
         assert!(drv
-            .send(TxKind::RollbackHold(0), None, None, false, |d| {
+            .send_plain(TxKind::RollbackHold(0), None, None, false, |d| {
                 let pos = d.fresh_measured_position(0, POS_FORCE_FEEDBACK_MAX_AGE)?;
                 Some(d.pos_vel_frame(0, pos))
             })
@@ -20387,13 +21180,13 @@ mod tx_chokepoint_tests {
         drv.set_abort_flag(Arc::new(AtomicBool::new(false)));
         bus.clear_tx();
         assert!(matches!(
-            drv.send(TxKind::Target, None, None, false, |_| None),
+            drv.send_plain(TxKind::Target, None, None, false, |_| None),
             Err(TxRefusal::BuildRefused)
         ));
         assert_eq!(bus.tx_len(), 0);
         // Budget slot was NOT consumed by BuildRefused, so the next valid frame succeeds.
         assert!(drv
-            .send(TxKind::Target, None, None, false, |d| Some(d.pos_vel_frame(0, 0.0)))
+            .send_plain(TxKind::Target, None, None, false, |d| Some(d.pos_vel_frame(0, 0.0)))
             .is_ok());
         assert_eq!(bus.tx_len(), 1);
 
@@ -20435,7 +21228,7 @@ mod tx_chokepoint_tests {
             let g = stops.request();
             stops.mark_applied(g);
             bus.clear_tx();
-            let res = drv.send(kind, Some(old_stamp), None, false, |d| {
+            let res = drv.send_plain(kind, Some(old_stamp), None, false, |d| {
                 Some(damiao::build_disable_frame(d.motor_ids[0]))
             });
             if matches!(
@@ -20523,7 +21316,7 @@ mod tx_chokepoint_tests {
 
             let stamp = drv.current_stop_stamp();
             let mut build_ran = false;
-            let res = drv.send(kind, Some(stamp), None, false, |d| {
+            let res = drv.send_plain(kind, Some(stamp), None, false, |d| {
                 build_ran = true;
                 // Flip latch mid-build; generation (`req`/`app`) deliberately unchanged!
                 latched.store(true, Ordering::SeqCst);
@@ -20558,7 +21351,7 @@ mod tx_chokepoint_tests {
             drv.set_estop_gate(EstopGate::new(req.clone(), app));
             drv.set_abort_flag(latched);
 
-            let res = drv.send(kind, None, None, false, |d| {
+            let res = drv.send_plain(kind, None, None, false, |d| {
                 req.fetch_add(1, Ordering::SeqCst);
                 Some(damiao::build_refresh_frame(d.motor_ids[0]))
             });
@@ -20577,7 +21370,7 @@ mod tx_chokepoint_tests {
         let latched = Arc::new(AtomicBool::new(false));
         drv.set_estop_gate(EstopGate::new(req.clone(), app));
         drv.set_abort_flag(latched.clone());
-        let res = drv.send(
+        let res = drv.send_plain(
             TxKind::DisableProtective { reason: DisableProtectiveReason::ProcessExit },
             None,
             None,
@@ -20609,7 +21402,7 @@ mod tx_chokepoint_tests {
             rest_pose_tolerance_rad: 0.05,
         });
         let started_at = clock.now();
-        let res = drv.send(
+        let res = drv.send_plain(
             TxKind::DisableRequested { started_at },
             None,
             None,
@@ -20648,7 +21441,7 @@ mod tx_chokepoint_tests {
         bus.clear_tx();
         let t0 = clock.now();
         assert!(matches!(
-            drv.send(TxKind::DisableRequested { started_at: t0 }, None, None, false, |d| {
+            drv.send_plain(TxKind::DisableRequested { started_at: t0 }, None, None, false, |d| {
                 Some(damiao::build_disable_frame(d.motor_ids[0]))
             }),
             Err(TxRefusal::TorqueOffWouldDrop)
@@ -20666,7 +21459,7 @@ mod tx_chokepoint_tests {
         }
         bus.clear_tx();
         assert!(drv
-            .send(TxKind::DisableRequested { started_at: t0 }, None, None, false, |d| {
+            .send_plain(TxKind::DisableRequested { started_at: t0 }, None, None, false, |d| {
                 Some(damiao::build_disable_frame(d.motor_ids[0]))
             })
             .is_ok());
@@ -20676,7 +21469,7 @@ mod tx_chokepoint_tests {
         clock.advance(Duration::from_millis(101));
         bus.clear_tx();
         assert!(matches!(
-            drv.send(TxKind::DisableRequested { started_at: t0 }, None, None, false, |d| {
+            drv.send_plain(TxKind::DisableRequested { started_at: t0 }, None, None, false, |d| {
                 Some(damiao::build_disable_frame(d.motor_ids[0]))
             }),
             Err(TxRefusal::DisableWaitEvidence)
@@ -20695,7 +21488,7 @@ mod tx_chokepoint_tests {
         }
         bus.clear_tx();
         assert!(matches!(
-            drv.send(TxKind::DisableRequested { started_at: t0 }, None, None, false, |d| {
+            drv.send_plain(TxKind::DisableRequested { started_at: t0 }, None, None, false, |d| {
                 Some(damiao::build_disable_frame(d.motor_ids[0]))
             }),
             Err(TxRefusal::DisableRequestExpired)
@@ -20729,7 +21522,7 @@ mod tx_chokepoint_tests {
         let t2 = clock2.now();
         for joint in 0..4 {
             assert!(matches!(
-                drv2.send(TxKind::DisableRequested { started_at: t2 }, None, None, false, |d| {
+                drv2.send_plain(TxKind::DisableRequested { started_at: t2 }, None, None, false, |d| {
                     Some(damiao::build_disable_frame(d.motor_ids[joint]))
                 }),
                 Err(TxRefusal::TorqueOffWouldDrop)
@@ -20746,7 +21539,7 @@ mod tx_chokepoint_tests {
         let t_op = clock.now();
         bus.clear_tx();
         assert!(matches!(
-            drv.send(TxKind::DisableRequested { started_at: t_op }, None, None, false, |d| {
+            drv.send_plain(TxKind::DisableRequested { started_at: t_op }, None, None, false, |d| {
                 Some(damiao::build_disable_frame(d.motor_ids[0]))
             }),
             Err(TxRefusal::TorqueOffWouldDrop)
@@ -20755,7 +21548,7 @@ mod tx_chokepoint_tests {
         clock.advance(Duration::from_millis(500));
         bus.clear_tx();
         assert!(matches!(
-            drv.send(TxKind::DisableRequested { started_at: t0 }, None, None, false, |d| {
+            drv.send_plain(TxKind::DisableRequested { started_at: t0 }, None, None, false, |d| {
                 Some(damiao::build_disable_frame(d.motor_ids[0]))
             }),
             Err(TxRefusal::DisableRequestExpired)
@@ -21323,7 +22116,7 @@ mod tx_chokepoint_tests {
             &damiao::encode_pos_force_payload(-1.0, 0, 460),
         )
         .unwrap();
-        let res = drv.send(TxKind::Target, None, None, false, |_| Some(forged));
+        let res = drv.send_plain(TxKind::Target, None, None, false, |_| Some(forged));
         assert!(
             matches!(res, Err(TxRefusal::BuildRefused)),
             "forged 0x307 through send() without PosForceSendToken must fail with BuildRefused, got {res:?}"

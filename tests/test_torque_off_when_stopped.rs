@@ -1440,6 +1440,7 @@ fn thermal_trip_and_shutdown_disable_at_raised_pose_without_consulting_rest_pose
         s.push_all_feedback();
     });
     inner_p.tick(0.02);
+    inner_p.authorize_process_exit_for_test();
     let outcome = inner_p.attempt_panic_disable(Duration::from_secs(1));
     assert_eq!(outcome, armd::supervisor::PanicDisableOutcome::Confirmed);
     assert!(!inner_p.is_torqued, "panic/forced teardown must cut torque at a raised pose");
@@ -3312,6 +3313,7 @@ fn only_thermal_and_process_exit_construct_disable_protective_and_no_already_off
 
     let mut expected: Vec<(String, &'static str)> = vec![
         ("src/driver.rs".to_string(), "ProcessExit"),
+        ("src/rt_core/safe_hold.rs".to_string(), "Thermal"),
         ("src/supervisor.rs".to_string(), "ProcessExit"),
         ("src/supervisor/driver_transitions.rs".to_string(), "ProcessExit"),
         ("src/supervisor/driver_transitions.rs".to_string(), "ProcessExit"),

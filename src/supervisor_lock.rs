@@ -628,6 +628,16 @@ impl DriverLock {
         }
     }
 
+    /// Extracts the underlying `Box<dyn ArmDriver>` even if poisoned, strictly for Legacy
+    /// SAFE-HOLD recovery after a control-thread unwind (single exclusive writer, zero locks
+    /// thereafter).
+    pub fn into_inner_recover_for_safe_hold(self) -> Box<dyn crate::driver::ArmDriver> {
+        match self.lock.into_inner() {
+            Ok(drv) => drv,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
     /// Extracts the underlying `std::sync::Mutex` (for legacy multi-thread contention tests).
     #[doc(hidden)]
     pub fn into_raw_mutex(self) -> std::sync::Mutex<Box<dyn crate::driver::ArmDriver>> {
@@ -781,6 +791,15 @@ impl DriverSlot {
                 .into_inner()
                 .map(Self::exclusive)
                 .map_err(|(lock, reason)| (Self::Legacy(lock), reason)),
+        }
+    }
+
+    /// Extracts the underlying `Box<dyn ArmDriver>` unconditionally (recovering legacy mutex
+    /// poison if present), strictly for single-writer SAFE-HOLD recovery after control panic.
+    pub fn into_driver_recover_for_safe_hold(self) -> Box<dyn crate::driver::ArmDriver> {
+        match self {
+            Self::Exclusive(drv) => drv.into_inner(),
+            Self::Legacy(lock) => lock.into_inner_recover_for_safe_hold(),
         }
     }
 
