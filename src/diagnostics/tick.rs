@@ -196,8 +196,114 @@ impl TxTickMetrics {
     };
 }
 
+/// Per-hold driver I/O timing breakdown (µs) attributed to a `SupervisorLock` hold or a
+/// control-tick torque transition step (zero heap allocation).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct HoldIoTiming {
+    pub tx_us: u32,
+    pub rx_us: u32,
+    pub sleep_us: u32,
+}
+
+#[derive(Clone, Copy, Default)]
+struct HoldIoAccum {
+    active: bool,
+    tx_ns: u64,
+    rx_ns: u64,
+    sleep_ns: u64,
+}
+
 thread_local! {
     static TX_TICK: Cell<TxTickMetrics> = const { Cell::new(TxTickMetrics::ZERO) };
+    static HOLD_IO: Cell<HoldIoAccum> = const { Cell::new(HoldIoAccum { active: false, tx_ns: 0, rx_ns: 0, sleep_ns: 0 }) };
+}
+
+/// Scoped synchronous thread-local accumulator for TX / RX / sleep time spent while holding a
+/// `SupervisorLock` guard (or servicing a torque transition step in a control tick). Zero heap
+/// allocations; restores the outer scope cleanly on drop (including early returns and panics).
+pub struct HoldIoScope {
+    prev: HoldIoAccum,
+}
+
+impl HoldIoScope {
+    #[inline]
+    pub fn enter() -> Self {
+        let prev = HOLD_IO
+            .try_with(|c| {
+                c.replace(HoldIoAccum {
+                    active: true,
+                    tx_ns: 0,
+                    rx_ns: 0,
+                    sleep_ns: 0,
+                })
+            })
+            .unwrap_or_default();
+        Self { prev }
+    }
+
+    #[inline]
+    pub fn snapshot(&self) -> HoldIoTiming {
+        let a = HOLD_IO.try_with(Cell::get).unwrap_or_default();
+        HoldIoTiming {
+            tx_us: ns_to_us_u32(a.tx_ns),
+            rx_us: ns_to_us_u32(a.rx_ns),
+            sleep_us: ns_to_us_u32(a.sleep_ns),
+        }
+    }
+
+    #[inline]
+    pub fn finish(self) -> HoldIoTiming {
+        self.snapshot()
+    }
+}
+
+impl Drop for HoldIoScope {
+    #[inline]
+    fn drop(&mut self) {
+        let _ = HOLD_IO.try_with(|c| c.set(self.prev));
+    }
+}
+
+/// Fast check whether a [`HoldIoScope`] is currently active on the calling thread.
+#[inline]
+pub fn hold_io_active() -> bool {
+    HOLD_IO.try_with(|c| c.get().active).unwrap_or(false)
+}
+
+/// Record TX wall nanoseconds into the active [`HoldIoScope`], if any (zero allocation).
+#[inline]
+pub fn record_hold_tx_ns(wall_ns: u64) {
+    let _ = HOLD_IO.try_with(|c| {
+        let mut a = c.get();
+        if a.active {
+            a.tx_ns = a.tx_ns.saturating_add(wall_ns);
+            c.set(a);
+        }
+    });
+}
+
+/// Record RX wall nanoseconds into the active [`HoldIoScope`], if any (zero allocation).
+#[inline]
+pub fn record_hold_rx_ns(wall_ns: u64) {
+    let _ = HOLD_IO.try_with(|c| {
+        let mut a = c.get();
+        if a.active {
+            a.rx_ns = a.rx_ns.saturating_add(wall_ns);
+            c.set(a);
+        }
+    });
+}
+
+/// Record sleep/pause nanoseconds into the active [`HoldIoScope`], if any (zero allocation).
+#[inline]
+pub fn record_hold_sleep_ns(sleep_ns: u64) {
+    let _ = HOLD_IO.try_with(|c| {
+        let mut a = c.get();
+        if a.active {
+            a.sleep_ns = a.sleep_ns.saturating_add(sleep_ns);
+            c.set(a);
+        }
+    });
 }
 
 /// Monotonic counter of stopped-hold TX ticks skipped because `driver.try_lock()` was contended
@@ -309,6 +415,7 @@ pub fn thread_cpu_ns() -> u64 {
 /// Record one CAN `transmit` attempt on the calling thread (zero allocation).
 #[inline]
 pub fn record_tx_attempt(kind: TxAttemptKind, wall_ns: u64, cpu_ns: u64) {
+    record_hold_tx_ns(wall_ns);
     let _ = TX_TICK.try_with(|c| {
         let mut m = c.get();
         match kind {
@@ -446,8 +553,12 @@ pub struct Holder {
     pub location: &'static std::panic::Location<'static>,
     /// Static WS/command path attributed to this hold (zero allocation on hot path).
     pub command: Option<&'static str>,
+    /// Optional static direction tag (e.g. `"on"` / `"off"` for `/api/v1/torque`).
+    pub direction: Option<&'static str>,
     /// Action id created or installed under this hold, if any.
     pub action_id: Option<u64>,
+    /// Optional TX / RX / sleep timing (µs) spent under this hold.
+    pub io_timing: Option<HoldIoTiming>,
     pub hold_us: u32,
     pub acquire_us: u32,
     /// How long before the tick started waiting the holder took the lock (negative: after).
@@ -462,15 +573,25 @@ impl Serialize for Holder {
         use serde::ser::SerializeStruct;
         let field_count = 6
             + usize::from(self.command.is_some())
-            + usize::from(self.action_id.is_some());
+            + usize::from(self.direction.is_some())
+            + usize::from(self.action_id.is_some())
+            + if self.io_timing.is_some() { 3 } else { 0 };
         let mut st = s.serialize_struct("Holder", field_count)?;
         st.serialize_field("kind", self.kind)?;
         st.serialize_field("location", &format!("{}:{}", self.location.file(), self.location.line()))?;
         if let Some(cmd) = self.command {
             st.serialize_field("command", cmd)?;
         }
+        if let Some(dir) = self.direction {
+            st.serialize_field("direction", dir)?;
+        }
         if let Some(id) = self.action_id {
             st.serialize_field("action_id", &id)?;
+        }
+        if let Some(io) = self.io_timing {
+            st.serialize_field("tx_us", &io.tx_us)?;
+            st.serialize_field("rx_us", &io.rx_us)?;
+            st.serialize_field("sleep_us", &io.sleep_us)?;
         }
         st.serialize_field("hold_us", &self.hold_us)?;
         st.serialize_field("acquire_us", &self.acquire_us)?;
@@ -973,8 +1094,15 @@ struct AtomicHolder {
     /// Null when `command` is `None`; otherwise points to the immutable `&'static str` bytes.
     command_ptr: AtomicPtr<u8>,
     command_len: AtomicUsize,
+    /// Null when `direction` is `None`; otherwise points to the immutable `&'static str` bytes.
+    direction_ptr: AtomicPtr<u8>,
+    direction_len: AtomicUsize,
     has_action_id: AtomicBool,
     action_id: AtomicU64,
+    has_io_timing: AtomicBool,
+    io_tx_us: AtomicU32,
+    io_rx_us: AtomicU32,
+    io_sleep_us: AtomicU32,
     hold_us: AtomicU32,
     acquire_us: AtomicU32,
     acquired_before_wait_us: AtomicI64,
@@ -987,8 +1115,14 @@ struct RawHolder {
     location: *const std::panic::Location<'static>,
     command_ptr: *const u8,
     command_len: usize,
+    direction_ptr: *const u8,
+    direction_len: usize,
     has_action_id: bool,
     action_id: u64,
+    has_io_timing: bool,
+    io_tx_us: u32,
+    io_rx_us: u32,
+    io_sleep_us: u32,
     hold_us: u32,
     acquire_us: u32,
     acquired_before_wait_us: i64,
@@ -1003,8 +1137,14 @@ impl AtomicHolder {
                 self.location.store(std::ptr::null_mut(), Ordering::Relaxed);
                 self.command_ptr.store(std::ptr::null_mut(), Ordering::Relaxed);
                 self.command_len.store(0, Ordering::Relaxed);
+                self.direction_ptr.store(std::ptr::null_mut(), Ordering::Relaxed);
+                self.direction_len.store(0, Ordering::Relaxed);
                 self.has_action_id.store(false, Ordering::Relaxed);
                 self.action_id.store(0, Ordering::Relaxed);
+                self.has_io_timing.store(false, Ordering::Relaxed);
+                self.io_tx_us.store(0, Ordering::Relaxed);
+                self.io_rx_us.store(0, Ordering::Relaxed);
+                self.io_sleep_us.store(0, Ordering::Relaxed);
             }
             Some(h) => {
                 let kind = if h.kind == "write" { 2u8 } else { 1u8 };
@@ -1023,6 +1163,16 @@ impl AtomicHolder {
                         self.command_len.store(0, Ordering::Relaxed);
                     }
                 }
+                match h.direction {
+                    Some(dir) => {
+                        self.direction_ptr.store(dir.as_ptr() as *mut u8, Ordering::Relaxed);
+                        self.direction_len.store(dir.len(), Ordering::Relaxed);
+                    }
+                    None => {
+                        self.direction_ptr.store(std::ptr::null_mut(), Ordering::Relaxed);
+                        self.direction_len.store(0, Ordering::Relaxed);
+                    }
+                }
                 match h.action_id {
                     Some(id) => {
                         self.has_action_id.store(true, Ordering::Relaxed);
@@ -1031,6 +1181,20 @@ impl AtomicHolder {
                     None => {
                         self.has_action_id.store(false, Ordering::Relaxed);
                         self.action_id.store(0, Ordering::Relaxed);
+                    }
+                }
+                match h.io_timing {
+                    Some(io) => {
+                        self.has_io_timing.store(true, Ordering::Relaxed);
+                        self.io_tx_us.store(io.tx_us, Ordering::Relaxed);
+                        self.io_rx_us.store(io.rx_us, Ordering::Relaxed);
+                        self.io_sleep_us.store(io.sleep_us, Ordering::Relaxed);
+                    }
+                    None => {
+                        self.has_io_timing.store(false, Ordering::Relaxed);
+                        self.io_tx_us.store(0, Ordering::Relaxed);
+                        self.io_rx_us.store(0, Ordering::Relaxed);
+                        self.io_sleep_us.store(0, Ordering::Relaxed);
                     }
                 }
                 self.hold_us.store(h.hold_us, Ordering::Relaxed);
@@ -1047,8 +1211,14 @@ impl AtomicHolder {
             location: self.location.load(Ordering::Relaxed) as *const std::panic::Location<'static>,
             command_ptr: self.command_ptr.load(Ordering::Relaxed) as *const u8,
             command_len: self.command_len.load(Ordering::Relaxed),
+            direction_ptr: self.direction_ptr.load(Ordering::Relaxed) as *const u8,
+            direction_len: self.direction_len.load(Ordering::Relaxed),
             has_action_id: self.has_action_id.load(Ordering::Relaxed),
             action_id: self.action_id.load(Ordering::Relaxed),
+            has_io_timing: self.has_io_timing.load(Ordering::Relaxed),
+            io_tx_us: self.io_tx_us.load(Ordering::Relaxed),
+            io_rx_us: self.io_rx_us.load(Ordering::Relaxed),
+            io_sleep_us: self.io_sleep_us.load(Ordering::Relaxed),
             hold_us: self.hold_us.load(Ordering::Relaxed),
             acquire_us: self.acquire_us.load(Ordering::Relaxed),
             acquired_before_wait_us: self.acquired_before_wait_us.load(Ordering::Relaxed),
@@ -1063,8 +1233,9 @@ impl RawHolder {
     /// # Safety
     /// Must only be called after the enclosing seqlock read succeeded (`v1 == v2`, even, Acquire-ordered
     /// with the writer's Release store) so `self.location` is guaranteed to be either null or an
-    /// immutable `&'static std::panic::Location<'static>` pointer and `(self.command_ptr, self.command_len)`
-    /// is either null or an immutable `&'static str` slice written by `AtomicHolder::store_relaxed`.
+    /// immutable `&'static std::panic::Location<'static>` pointer and `(command_ptr, command_len)` /
+    /// `(direction_ptr, direction_len)` are either null or immutable `&'static str` slices written by
+    /// `AtomicHolder::store_relaxed`.
     unsafe fn into_holder_validated(self) -> Option<Holder> {
         if self.kind == 0 || self.location.is_null() {
             return None;
@@ -1080,13 +1251,29 @@ impl RawHolder {
             // SAFETY: bytes were obtained from a valid `&'static str`.
             Some(unsafe { std::str::from_utf8_unchecked(bytes) })
         };
+        let direction = if self.direction_ptr.is_null() {
+            None
+        } else {
+            // SAFETY: upheld by caller's validated seqlock read and `'static str` provenance.
+            let bytes: &'static [u8] =
+                unsafe { std::slice::from_raw_parts(self.direction_ptr, self.direction_len) };
+            // SAFETY: bytes were obtained from a valid `&'static str`.
+            Some(unsafe { std::str::from_utf8_unchecked(bytes) })
+        };
         let action_id = self.has_action_id.then_some(self.action_id);
+        let io_timing = self.has_io_timing.then_some(HoldIoTiming {
+            tx_us: self.io_tx_us,
+            rx_us: self.io_rx_us,
+            sleep_us: self.io_sleep_us,
+        });
         let kind = if self.kind == 2 { "write" } else { "read" };
         Some(Holder {
             kind,
             location,
             command,
+            direction,
             action_id,
+            io_timing,
             hold_us: self.hold_us,
             acquire_us: self.acquire_us,
             acquired_before_wait_us: self.acquired_before_wait_us,
@@ -1831,7 +2018,9 @@ mod tests {
             kind: "read",
             location: std::panic::Location::caller(),
             command: None,
+            direction: None,
             action_id: None,
+            io_timing: None,
             hold_us: 31_000,
             acquire_us: 3,
             acquired_before_wait_us: 1_000,
@@ -1877,12 +2066,15 @@ mod tests {
         assert!(json["control_thread"].is_null());
         assert!(json["tx"]["send_us"]["max"].is_u64());
 
-        // Holder with command + action_id attribution serializes both fields and round-trips through LockFreeTickStats.
+        // Holder with command + direction + action_id + io_timing attribution serializes all fields
+        // and round-trips through LockFreeTickStats.
         let attributed = Holder {
             kind: "write",
             location: std::panic::Location::caller(),
-            command: Some("/api/v1/motion/jog"),
+            command: Some("/api/v1/torque"),
+            direction: Some("on"),
             action_id: Some(19),
+            io_timing: Some(HoldIoTiming { tx_us: 120, rx_us: 45, sleep_us: 500 }),
             hold_us: 420,
             acquire_us: 12,
             acquired_before_wait_us: 50,
@@ -1899,10 +2091,18 @@ mod tests {
         }));
         let lf_snap = lf.snapshot();
         let lf_json = serde_json::to_value(&lf_snap).unwrap();
-        assert_eq!(lf_json["max_tick"]["waited_for"]["command"], "/api/v1/motion/jog");
+        assert_eq!(lf_json["max_tick"]["waited_for"]["command"], "/api/v1/torque");
+        assert_eq!(lf_json["max_tick"]["waited_for"]["direction"], "on");
         assert_eq!(lf_json["max_tick"]["waited_for"]["action_id"], 19);
-        assert_eq!(lf_json["max_tick"]["longest_hold"]["command"], "/api/v1/motion/jog");
+        assert_eq!(lf_json["max_tick"]["waited_for"]["tx_us"], 120);
+        assert_eq!(lf_json["max_tick"]["waited_for"]["rx_us"], 45);
+        assert_eq!(lf_json["max_tick"]["waited_for"]["sleep_us"], 500);
+        assert_eq!(lf_json["max_tick"]["longest_hold"]["command"], "/api/v1/torque");
+        assert_eq!(lf_json["max_tick"]["longest_hold"]["direction"], "on");
         assert_eq!(lf_json["max_tick"]["longest_hold"]["action_id"], 19);
+        assert_eq!(lf_json["max_tick"]["longest_hold"]["tx_us"], 120);
+        assert_eq!(lf_json["max_tick"]["longest_hold"]["rx_us"], 45);
+        assert_eq!(lf_json["max_tick"]["longest_hold"]["sleep_us"], 500);
     }
 
     #[test]
@@ -1988,7 +2188,9 @@ mod tests {
             kind: "read",
             location: std::panic::Location::caller(),
             command: None,
+            direction: None,
             action_id: None,
+            io_timing: None,
             hold_us: 12_345,
             acquire_us: 67,
             acquired_before_wait_us: 890,
@@ -1998,7 +2200,9 @@ mod tests {
             kind: "write",
             location: std::panic::Location::caller(),
             command: Some("/api/v1/motion/jog"),
+            direction: None,
             action_id: Some(42),
+            io_timing: None,
             hold_us: 23_456,
             acquire_us: 89,
             acquired_before_wait_us: -34,
@@ -2183,7 +2387,9 @@ mod tests {
                     kind: "read",
                     location: loc_read,
                     command: None,
+                    direction: None,
                     action_id: None,
+                    io_timing: None,
                     hold_us: ku * 7 + 1,
                     acquire_us: ku * 3 + 2,
                     acquired_before_wait_us: k as i64 * 11,
@@ -2197,7 +2403,9 @@ mod tests {
                     kind: "write",
                     location: loc_write,
                     command: Some("/api/v1/motion/home"),
+                    direction: None,
                     action_id: Some(k + 100),
+                    io_timing: None,
                     hold_us: ku * 13 + 5,
                     acquire_us: ku * 5 + 4,
                     acquired_before_wait_us: -(k as i64 * 2),

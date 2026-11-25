@@ -1825,7 +1825,17 @@ pub trait ArmDriver: Send {
     fn driver_clock(&self) -> Option<std::sync::Arc<dyn crate::transport::DriverClock>> { None }
 
     /// Wait `d` on the driver's clock (the transport's deterministic clock advances in tests).
-    fn clock_pause(&self, d: Duration) { std::thread::sleep(d) }
+    fn clock_pause(&self, d: Duration) {
+        if crate::diagnostics::tick::hold_io_active() {
+            let t0 = Instant::now();
+            std::thread::sleep(d);
+            let wall_ns = t0.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+            let d_ns = d.as_nanos().min(u128::from(u64::MAX)) as u64;
+            crate::diagnostics::tick::record_hold_sleep_ns(wall_ns.max(d_ns));
+        } else {
+            std::thread::sleep(d);
+        }
+    }
 
     /// Why the MIT deadline fence tripped (None = not tripped).
     fn mit_fence_trip(&self) -> Option<String> { None }
@@ -2778,10 +2788,17 @@ impl<T: Transport> FeetechArmDriver<T> {
     }
 
     fn clock_sleep(&self, duration: Duration) {
+        let track = crate::diagnostics::tick::hold_io_active();
+        let t0 = track.then(Instant::now);
         if let Some(ref c) = self.clock {
             c.sleep(duration);
         } else {
             std::thread::sleep(duration);
+        }
+        if let Some(t0) = t0 {
+            let wall_ns = t0.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+            let d_ns = duration.as_nanos().min(u128::from(u64::MAX)) as u64;
+            crate::diagnostics::tick::record_hold_sleep_ns(wall_ns.max(d_ns));
         }
     }
 
@@ -9556,7 +9573,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 return false;
             }
             let attempt = self.now();
-            match self.can.receive_with_rx_time() {
+            match self.receive_with_rx_time_timed() {
                 Ok((frame, rx_time)) => {
                     frames += 1;
                     self.process_rx_frame(&frame, false, rx_time);
@@ -9727,7 +9744,27 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     fn now(&self) -> Instant { self.clock.as_ref().map_or_else(Instant::now, |c| c.now()) }
     fn since(&self, t: Instant) -> Duration { self.now().saturating_duration_since(t) }
     fn pause(&self, d: Duration) {
+        let track = crate::diagnostics::tick::hold_io_active();
+        let t0 = track.then(Instant::now);
         match &self.clock { Some(c) => c.sleep(d), None => std::thread::sleep(d) }
+        if let Some(t0) = t0 {
+            let wall_ns = t0.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+            let d_ns = d.as_nanos().min(u128::from(u64::MAX)) as u64;
+            crate::diagnostics::tick::record_hold_sleep_ns(wall_ns.max(d_ns));
+        }
+    }
+
+    #[inline]
+    fn receive_with_rx_time_timed(&mut self) -> Result<(CanFrame, Option<crate::transport::CanRxTime>), TransportError> {
+        if crate::diagnostics::tick::hold_io_active() {
+            let t0 = Instant::now();
+            let res = self.can.receive_with_rx_time();
+            let wall_ns = t0.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+            crate::diagnostics::tick::record_hold_rx_ns(wall_ns);
+            res
+        } else {
+            self.can.receive_with_rx_time()
+        }
     }
 
     fn trip_fence(&mut self, reason: MitFenceTripReason) {
@@ -10782,7 +10819,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let mut hit_err = false;
         while frames_processed < max_frames && !self.rx_over(t0) && !deadline.passed(self.now()) {
             let attempt = self.now();
-            match self.can.receive_with_rx_time() {
+            match self.receive_with_rx_time_timed() {
                 Ok((frame, rx_time)) => {
                     frames_processed += 1;
                     self.process_rx_frame(&frame, true, rx_time);
@@ -12300,7 +12337,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let mut hit_err = false;
         while frames_processed < limit && self.since(start) < Duration::from_millis(5) {
             let attempt = self.now();
-            match self.can.receive_with_rx_time() {
+            match self.receive_with_rx_time_timed() {
                 Ok((frame, rx_time)) => {
                     frames_processed += 1;
                     self.process_rx_frame(&frame, false, rx_time);
@@ -15665,7 +15702,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         while frames_processed < max_frames && !self.rx_over(t0) {
             // Taken before the receive: an empty result means the queue was empty after it.
             let attempt = self.now();
-            match self.can.receive_with_rx_time() {
+            match self.receive_with_rx_time_timed() {
                 Ok((frame, rx_time)) => {
                     frames_processed += 1;
                     self.process_rx_frame(&frame, true, rx_time);

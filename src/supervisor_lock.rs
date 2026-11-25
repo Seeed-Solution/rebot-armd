@@ -24,12 +24,14 @@ use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 use std::panic::Location;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{OwnedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
+
+use crate::diagnostics::tick::HoldIoTiming;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HoldKind { Read, Write }
@@ -46,8 +48,12 @@ pub struct HoldRecord {
     pub location: &'static Location<'static>,
     /// Static WS/command path attributed to this hold (zero allocation on hot path).
     pub command: Option<&'static str>,
+    /// Optional static direction tag (e.g. `"on"` / `"off"` for `/api/v1/torque`).
+    pub direction: Option<&'static str>,
     /// Action id created or installed under this hold, if any.
     pub action_id: Option<u64>,
+    /// Optional TX / RX / sleep timing (µs) recorded under this hold.
+    pub io_timing: Option<HoldIoTiming>,
     /// `read()` / `write()` called.
     pub called: Instant,
     /// Guard handed to the caller.
@@ -96,20 +102,40 @@ struct Holds {
     generation: AtomicU64,
     control_thread_attempts: AtomicU64,
     log: std::sync::Mutex<HoldLog>,
+    /// Optional per-hold recording for tests asserting every individual guard hold (disabled in
+    /// production: a single Relaxed atomic load avoids taking the history mutex or allocating).
+    history_enabled: AtomicBool,
+    history: std::sync::Mutex<Vec<HoldRecord>>,
 }
 
 impl Holds {
+    #[allow(clippy::too_many_arguments)]
     fn record(
         &self,
         kind: HoldKind,
         location: &'static Location<'static>,
         command: Option<&'static str>,
+        direction: Option<&'static str>,
         action_id: Option<u64>,
+        io_timing: Option<HoldIoTiming>,
         called: Instant,
         acquired: Instant,
     ) {
-        let r = HoldRecord { kind, location, command, action_id, called, acquired, released: Instant::now() };
+        let r = HoldRecord {
+            kind,
+            location,
+            command,
+            direction,
+            action_id,
+            io_timing,
+            called,
+            acquired,
+            released: Instant::now(),
+        };
         self.log.lock().unwrap_or_else(|e| e.into_inner()).add(r);
+        if self.history_enabled.load(Ordering::Relaxed) {
+            self.history.lock().unwrap_or_else(|e| e.into_inner()).push(r);
+        }
     }
 
     /// Counts any forbidden acquisition/poll attempt on the marked RT control thread strictly
@@ -269,13 +295,29 @@ impl<T> SupervisorLock<T> {
             Err(std::sync::TryLockError::WouldBlock) => None,
         }
     }
+
+    /// Enable or disable per-hold history recording (for lock-proof tests asserting every guard
+    /// hold, not only window maxima). Clears any buffered history when toggled.
+    #[doc(hidden)]
+    pub fn set_hold_history_enabled(&self, enabled: bool) {
+        self.holds.history_enabled.store(enabled, Ordering::Release);
+        self.holds.history.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
+    /// Drain all individual [`HoldRecord`] entries recorded while hold history was enabled.
+    #[doc(hidden)]
+    pub fn take_hold_history(&self) -> Vec<HoldRecord> {
+        std::mem::take(&mut *self.holds.history.lock().unwrap_or_else(|e| e.into_inner()))
+    }
 }
 
 #[derive(Clone, Copy)]
 struct Timing {
     location: &'static Location<'static>,
     command: Option<&'static str>,
+    direction: Option<&'static str>,
     action_id: Option<u64>,
+    io_timing: Option<HoldIoTiming>,
     called: Instant,
     acquired: Instant,
 }
@@ -283,7 +325,15 @@ struct Timing {
 impl Timing {
     #[inline]
     fn new(location: &'static Location<'static>, called: Instant) -> Self {
-        Self { location, command: None, action_id: None, called, acquired: Instant::now() }
+        Self {
+            location,
+            command: None,
+            direction: None,
+            action_id: None,
+            io_timing: None,
+            called,
+            acquired: Instant::now(),
+        }
     }
 }
 
@@ -295,7 +345,16 @@ pub struct SupReadGuard<'a, T> {
 
 impl<T> Drop for SupReadGuard<'_, T> {
     fn drop(&mut self) {
-        self.holds.record(HoldKind::Read, self.t.location, self.t.command, self.t.action_id, self.t.called, self.t.acquired);
+        self.holds.record(
+            HoldKind::Read,
+            self.t.location,
+            self.t.command,
+            self.t.direction,
+            self.t.action_id,
+            self.t.io_timing,
+            self.t.called,
+            self.t.acquired,
+        );
         // SAFETY: dropped once, here; the field is not used afterwards.
         unsafe { ManuallyDrop::drop(&mut self.guard) };
     }
@@ -319,16 +378,37 @@ impl<T> SupWriteGuard<'_, T> {
         self.t.command = Some(command);
     }
 
+    /// Attribute this write-lock hold to a static direction tag (e.g. `"on"` / `"off"`, zero allocation).
+    #[inline]
+    pub fn set_direction(&mut self, direction: &'static str) {
+        self.t.direction = Some(direction);
+    }
+
     /// Attribute this write-lock hold to the action id created or installed under it (zero allocation).
     #[inline]
     pub fn set_action_id(&mut self, action_id: u64) {
         self.t.action_id = Some(action_id);
     }
+
+    /// Attach TX / RX / sleep timing (µs) measured while this write guard was held (zero allocation).
+    #[inline]
+    pub fn set_io_timing(&mut self, io: HoldIoTiming) {
+        self.t.io_timing = Some(io);
+    }
 }
 
 impl<T> Drop for SupWriteGuard<'_, T> {
     fn drop(&mut self) {
-        self.holds.record(HoldKind::Write, self.t.location, self.t.command, self.t.action_id, self.t.called, self.t.acquired);
+        self.holds.record(
+            HoldKind::Write,
+            self.t.location,
+            self.t.command,
+            self.t.direction,
+            self.t.action_id,
+            self.t.io_timing,
+            self.t.called,
+            self.t.acquired,
+        );
         // SAFETY: dropped once, here; the field is not used afterwards.
         unsafe { ManuallyDrop::drop(&mut self.guard) };
     }
@@ -356,16 +436,37 @@ impl<T> SupOwnedWriteGuard<T> {
         self.t.command = Some(command);
     }
 
+    /// Attribute this write-lock hold to a static direction tag (e.g. `"on"` / `"off"`, zero allocation).
+    #[inline]
+    pub fn set_direction(&mut self, direction: &'static str) {
+        self.t.direction = Some(direction);
+    }
+
     /// Attribute this write-lock hold to the action id created or installed under it (zero allocation).
     #[inline]
     pub fn set_action_id(&mut self, action_id: u64) {
         self.t.action_id = Some(action_id);
     }
+
+    /// Attach TX / RX / sleep timing (µs) measured while this write guard was held (zero allocation).
+    #[inline]
+    pub fn set_io_timing(&mut self, io: HoldIoTiming) {
+        self.t.io_timing = Some(io);
+    }
 }
 
 impl<T> Drop for SupOwnedWriteGuard<T> {
     fn drop(&mut self) {
-        self.holds.record(HoldKind::Write, self.t.location, self.t.command, self.t.action_id, self.t.called, self.t.acquired);
+        self.holds.record(
+            HoldKind::Write,
+            self.t.location,
+            self.t.command,
+            self.t.direction,
+            self.t.action_id,
+            self.t.io_timing,
+            self.t.called,
+            self.t.acquired,
+        );
         // SAFETY: dropped once, here; the field is not used afterwards.
         unsafe { ManuallyDrop::drop(&mut self.guard) };
     }
@@ -482,5 +583,33 @@ mod tests {
         let last2 = log2.longest.unwrap();
         assert_eq!(last2.command, Some("/api/v1/motion/home"));
         assert_eq!(last2.action_id, Some(88));
+    }
+
+    #[tokio::test]
+    async fn write_guard_records_direction_io_timing_and_hold_history() {
+        let lock = Arc::new(SupervisorLock::new(0u32));
+        lock.set_hold_history_enabled(true);
+        {
+            let mut g = lock.write().await;
+            g.set_command("/api/v1/torque");
+            g.set_direction("on");
+            g.set_io_timing(HoldIoTiming { tx_us: 15, rx_us: 25, sleep_us: 350 });
+            *g += 1;
+        }
+        {
+            let mut g = lock.write().await;
+            g.set_command("/api/v1/torque");
+            g.set_direction("off");
+            g.set_io_timing(HoldIoTiming { tx_us: 5, rx_us: 10, sleep_us: 0 });
+            *g += 1;
+        }
+        let hist = lock.take_hold_history();
+        assert_eq!(hist.len(), 2);
+        assert_eq!(hist[0].command, Some("/api/v1/torque"));
+        assert_eq!(hist[0].direction, Some("on"));
+        assert_eq!(hist[0].io_timing, Some(HoldIoTiming { tx_us: 15, rx_us: 25, sleep_us: 350 }));
+        assert_eq!(hist[1].direction, Some("off"));
+        assert_eq!(hist[1].io_timing, Some(HoldIoTiming { tx_us: 5, rx_us: 10, sleep_us: 0 }));
+        lock.set_hold_history_enabled(false);
     }
 }
