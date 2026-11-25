@@ -67,6 +67,27 @@ impl ArmDriver for StopArm {
         let age = if self.0.lock().unwrap().stale { Duration::from_millis(600) } else { Duration::ZERO };
         vec![Some(age); 7]
     }
+    fn fresh_joint_positions_into(
+        &self,
+        joints: &[usize],
+        _max_age: Duration,
+        out: &mut [f32],
+    ) -> bool {
+        let s = self.0.lock().unwrap();
+        if s.stale || out.len() < joints.len() {
+            return false;
+        }
+        for (slot, &j) in out.iter_mut().zip(joints.iter()) {
+            let Some(&p) = s.q.get(j) else {
+                return false;
+            };
+            if !p.is_finite() {
+                return false;
+            }
+            *slot = p;
+        }
+        true
+    }
     fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
         let s = self.0.lock().unwrap();
         let mut q6 = [0.0; 6];

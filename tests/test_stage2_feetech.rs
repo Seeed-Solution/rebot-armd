@@ -1609,9 +1609,24 @@ async fn test_feetech_periodic_enable_poll_detects_torque_loss_and_triggers_faul
     mock.lock().unwrap().provide_rx(&rx_normal);
     mock.lock().unwrap().provide_rx(&rx_tq0);
 
+    // M1: While stationary/holding (no active motion), reported torque loss is telemetry +
+    // warning only — it does NOT latch UnexpectedTorqueLoss and holds remain active.
     let obs = supervisor.tick(0.02).await;
-    assert!(obs.fault.is_some());
-    assert_eq!(obs.fault.unwrap().code, FaultCode::HardwareFault);
+    assert_eq!(obs.enable_state, EnableState::Disabled);
+    assert!(obs.fault.is_none(), "M1: stationary hold must not fault on reported enable_state alone");
+    assert_eq!(supervisor.inner().read().await.torque_intent, armd::TorqueIntent::On);
+
+    // During active motion, the same reported torque loss latches UnexpectedTorqueLoss
+    // (FaultCode::HardwareFault) while keeping torque_intent == On so holds continue.
+    {
+        let mut inner = supervisor.inner().write().await;
+        inner.servo_stream_active = true;
+    }
+    mock.lock().unwrap().provide_rx(&rx_normal);
+    let obs_moving = supervisor.tick(0.02).await;
+    assert!(obs_moving.fault.is_some(), "M1: active motion must latch UnexpectedTorqueLoss");
+    assert_eq!(obs_moving.fault.unwrap().code, FaultCode::HardwareFault);
+    assert_eq!(supervisor.inner().read().await.torque_intent, armd::TorqueIntent::On);
 }
 
 // -------------------------------------------------------------------------

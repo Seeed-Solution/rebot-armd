@@ -136,6 +136,27 @@ impl ArmDriver for TrackingTestDriver {
         let s = self.0.lock().unwrap();
         vec![Some(s.feedback_age); s.dof]
     }
+    fn fresh_joint_positions_into(
+        &self,
+        joints: &[usize],
+        max_age: Duration,
+        out: &mut [f32],
+    ) -> bool {
+        let s = self.0.lock().unwrap();
+        if s.feedback_age > max_age || out.len() < joints.len() {
+            return false;
+        }
+        for (slot, &j) in out.iter_mut().zip(joints.iter()) {
+            let Some(&p) = s.q.get(j) else {
+                return false;
+            };
+            if !p.is_finite() {
+                return false;
+            }
+            *slot = p;
+        }
+        true
+    }
     fn feedback_instants(&self) -> Vec<Option<std::time::Instant>> {
         if let Some(instants) = self.0.lock().unwrap().feedback_instants.clone() {
             return instants.into_iter().map(Some).collect();
