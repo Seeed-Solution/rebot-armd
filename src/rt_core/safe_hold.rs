@@ -729,14 +729,17 @@ impl SafeHoldBuffers {
         FNow: FnMut() -> Instant,
         FSleep: FnMut(Duration),
     {
-        self.prepare_driver_on_entry(drv);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.prepare_driver_on_entry(drv);
+        }));
         ctrl.mark_active(reason);
         let period = self.period.max(Duration::from_millis(1));
         loop {
             if ctrl.process_exit_requested.load(Ordering::Acquire) {
                 return ctrl.process_exit_deadline();
             }
-            let tick_start = now_fn();
+            let tick_start = std::panic::catch_unwind(std::panic::AssertUnwindSafe(&mut now_fn))
+                .unwrap_or_else(|_| Instant::now());
             let release_deadline = tick_start + period;
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 self.step_driver_with_shadow(
@@ -750,9 +753,15 @@ impl SafeHoldBuffers {
             if ctrl.process_exit_requested.load(Ordering::Acquire) {
                 continue;
             }
-            let elapsed = now_fn().saturating_duration_since(tick_start);
+            let tick_end = std::panic::catch_unwind(std::panic::AssertUnwindSafe(&mut now_fn))
+                .unwrap_or_else(|_| Instant::now());
+            let elapsed = tick_end.saturating_duration_since(tick_start);
             if let Some(rem) = period.checked_sub(elapsed) {
-                sleep_dur(rem);
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sleep_dur(rem)))
+                    .is_err()
+                {
+                    std::thread::sleep(rem);
+                }
             }
         }
     }
@@ -791,10 +800,13 @@ impl SafeHoldBuffers {
         FNow: FnMut() -> Instant,
         FSleep: FnMut(Duration),
     {
-        self.prepare_driver_on_entry(drv);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.prepare_driver_on_entry(drv);
+        }));
         let period = self.period.max(Duration::from_millis(1));
         loop {
-            let tick_start = now_fn();
+            let tick_start = std::panic::catch_unwind(std::panic::AssertUnwindSafe(&mut now_fn))
+                .unwrap_or_else(|_| Instant::now());
             let release_deadline = tick_start + period;
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 self.step_driver_with_shadow(
@@ -805,9 +817,15 @@ impl SafeHoldBuffers {
                     shadow.as_deref_mut(),
                 );
             }));
-            let elapsed = now_fn().saturating_duration_since(tick_start);
+            let tick_end = std::panic::catch_unwind(std::panic::AssertUnwindSafe(&mut now_fn))
+                .unwrap_or_else(|_| Instant::now());
+            let elapsed = tick_end.saturating_duration_since(tick_start);
             if let Some(rem) = period.checked_sub(elapsed) {
-                sleep_dur(rem);
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sleep_dur(rem)))
+                    .is_err()
+                {
+                    std::thread::sleep(rem);
+                }
             }
         }
     }

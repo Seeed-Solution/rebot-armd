@@ -2563,6 +2563,122 @@ async fn drv_f1_blocker3_executor_outer_unwind_startup_setup_and_release_tail_re
         })
         .await;
     }
+
+    // Part C: Panicking `ExecutorClock::now` and `ExecutorClock::sleep` during energized SAFE-HOLD
+    // must NOT unwind out of SAFE-HOLD or drop the energized driver.
+    {
+        struct PanickingSafeHoldClock {
+            origin: Instant,
+            panic_now: Arc<AtomicBool>,
+            panic_sleep: Arc<AtomicBool>,
+            now_panics: Arc<AtomicUsize>,
+            sleep_panics: Arc<AtomicUsize>,
+        }
+        impl armd::rt_core::executor::ExecutorClock for PanickingSafeHoldClock {
+            fn now(&self) -> Instant {
+                if self.panic_now.load(Ordering::Acquire)
+                    && self.now_panics.fetch_add(1, Ordering::AcqRel) < 4
+                {
+                    panic!("injected ExecutorClock::now panic inside SAFE-HOLD");
+                }
+                Instant::now()
+            }
+            fn now_ns(&self) -> u64 {
+                self.origin.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+            }
+            fn sleep_until_ns(&self, target_ns: u64, stop: &AtomicBool) -> bool {
+                let cur = self.now_ns();
+                if cur >= target_ns || stop.load(Ordering::Acquire) {
+                    return false;
+                }
+                thread::park_timeout(Duration::from_nanos(target_ns - cur));
+                true
+            }
+            fn sleep(&self, dur: Duration, stop: &AtomicBool) {
+                if self.panic_sleep.load(Ordering::Acquire)
+                    && self.sleep_panics.fetch_add(1, Ordering::AcqRel) < 4
+                {
+                    panic!("injected ExecutorClock::sleep panic inside SAFE-HOLD");
+                }
+                if !stop.load(Ordering::Acquire) {
+                    thread::park_timeout(dur);
+                }
+            }
+        }
+
+        let (sup, bus, dropped) =
+            make_watched_energized_sup([0.15, -0.20, 0.35, 0.10, -0.10, 0.05, 0.0]);
+        sup.set_lease_enabled(false).await;
+        sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
+        let panic_now = Arc::new(AtomicBool::new(false));
+        let panic_sleep = Arc::new(AtomicBool::new(false));
+        let now_panics = Arc::new(AtomicUsize::new(0));
+        let sleep_panics = Arc::new(AtomicUsize::new(0));
+        let clock = Arc::new(PanickingSafeHoldClock {
+            origin: Instant::now(),
+            panic_now: Arc::clone(&panic_now),
+            panic_sleep: Arc::clone(&panic_sleep),
+            now_panics: Arc::clone(&now_panics),
+            sleep_panics: Arc::clone(&sleep_panics),
+        });
+        let tail_panic = Arc::new(AtomicBool::new(false));
+
+        let mut cfg = ExecutorConfig::for_tests(Duration::from_millis(5));
+        cfg.panic_policy = PanicPolicy::StopExecutor;
+        let handle = sup
+            .start_executor_with_hooks(
+                cfg,
+                PersistTestHooks {
+                    clock: Some(clock),
+                    panic_in_release_tail_once: Some(Arc::clone(&tail_panic)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        wait_until_async(Duration::from_secs(2), "executor running before SAFE-HOLD clock panic", || {
+            handle.stats().steps.load(Ordering::Relaxed) >= 3
+        })
+        .await;
+
+        bus.with(|s| s.tx_log.clear());
+        panic_now.store(true, Ordering::Release);
+        panic_sleep.store(true, Ordering::Release);
+        tail_panic.store(true, Ordering::Release);
+
+        wait_until_async(
+            Duration::from_secs(2),
+            "SAFE-HOLD survived injected clock/sleep panics and kept holding",
+            || {
+                handle.is_in_safe_hold()
+                    && now_panics.load(Ordering::Acquire) >= 2
+                    && sleep_panics.load(Ordering::Acquire) >= 2
+                    && handle.safe_hold_control().ticks() >= 3
+                    && handle.safe_hold_control().hold_tx_count() >= 1
+            },
+        )
+        .await;
+        assert!(
+            !dropped.load(Ordering::Acquire),
+            "clock/sleep panic inside SAFE-HOLD MUST NOT drop an energized driver"
+        );
+        let disables = bus.with(|s| {
+            s.tx_log
+                .iter()
+                .filter(|f| f.data == damiao::CMD_DISABLE)
+                .count()
+        });
+        assert_eq!(disables, 0);
+
+        let outcome = sup
+            .emergency_process_exit_disable_until(Instant::now() + Duration::from_secs(2))
+            .await;
+        assert_eq!(outcome, PanicDisableOutcome::Confirmed);
+        wait_until_async(Duration::from_secs(2), "driver dropped after ProcessExit", || {
+            dropped.load(Ordering::Acquire)
+        })
+        .await;
+    }
 }
 
 /// Blocker 3C regression (writer-transition fault injection):

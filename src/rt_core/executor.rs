@@ -8474,10 +8474,11 @@ fn mark_control_exited(
 /// Publishes the `ProcessExit` disable outcome immediately and drops `core` ONLY when hardware
 /// disarm is confirmed (`Confirmed`, `NoDriver`, or `core_is_confirmed_disarmed`). On any
 /// non-confirmed outcome (`Unconfirmed`, `TimedOut`, `Failed`), retains sole ownership of `core`
-/// in post-exit SAFE-HOLD so an energized/unconfirmed driver is NEVER dropped (DRV-F1 B5).
+/// in `core_slot` inside post-exit SAFE-HOLD so an energized/unconfirmed driver is NEVER dropped
+/// even if an unexpected unwind occurs (DRV-F1 B5).
 #[allow(clippy::too_many_arguments)]
 fn finalize_process_exit_or_retain_safe_hold(
-    mut core: Box<SupervisorInner>,
+    core_slot: &mut Option<Box<SupervisorInner>>,
     outcome: &crate::supervisor::PanicDisableOutcome,
     safe_hold_bufs: &mut super::safe_hold::SafeHoldBuffers,
     lifecycle: &Arc<LifecycleControl>,
@@ -8491,23 +8492,23 @@ fn finalize_process_exit_or_retain_safe_hold(
         outcome,
         crate::supervisor::PanicDisableOutcome::Confirmed
             | crate::supervisor::PanicDisableOutcome::NoDriver
-    ) || core_is_confirmed_disarmed(&core);
+    ) || core_slot.as_deref().is_none_or(core_is_confirmed_disarmed);
     lifecycle.safe_hold.record_process_exit_outcome_lockfree(outcome);
     lifecycle.safe_hold.mark_exited();
     if disarmed {
         lifecycle.set_owner_state(LC_OWNER_PROCESS_EXIT_DONE);
-        drop(core);
+        drop(core_slot.take());
         mark_control_exited(exited, control_exited_cv, hub);
         return;
     }
     // Outcome is non-confirmed (`Unconfirmed` / `TimedOut` / `Failed`): publish completion to
-    // callers immediately so teardown does not hang, then retain `core` in SAFE-HOLD forever
-    // without dropping the energized/unconfirmed driver.
+    // callers immediately so teardown does not hang, then retain `core` in `core_slot` inside
+    // SAFE-HOLD forever without dropping the energized/unconfirmed driver.
     lifecycle.set_owner_state(LC_OWNER_PROCESS_EXIT_DONE);
     hub.wake();
-    let has_drv = core
-        .driver
-        .as_ref()
+    let has_drv = core_slot
+        .as_deref()
+        .and_then(|c| c.driver.as_ref())
         .is_some_and(crate::supervisor_lock::DriverSlot::is_exclusive);
     if has_drv {
         let now_inst = || clock_hook.as_ref().map_or_else(Instant::now, |c| c.now());
@@ -8518,7 +8519,7 @@ fn finalize_process_exit_or_retain_safe_hold(
                 thread::park_timeout(d);
             }
         };
-        let core_ref = &mut *core;
+        let core_ref = core_slot.as_deref_mut().expect("core retained in slot");
         let drv = core_ref
             .driver
             .as_mut()
@@ -8539,10 +8540,12 @@ fn finalize_process_exit_or_retain_safe_hold(
 }
 
 /// Enters preallocated, lock-free, zero-allocation SAFE-HOLD on `armd-control` while retaining
-/// sole `ExclusiveDriver` ownership until deliberate `ProcessExit` protective disable is requested.
+/// sole `ExclusiveDriver` ownership in `core_slot` until deliberate `ProcessExit` protective
+/// disable is requested. Keeping `core` in `core_slot` guarantees an unexpected unwind inside
+/// SAFE-HOLD never drops an energized driver.
 #[allow(clippy::too_many_arguments)]
 fn run_executor_safe_hold(
-    mut core: Box<SupervisorInner>,
+    core_slot: &mut Option<Box<SupervisorInner>>,
     safe_hold_bufs: &mut super::safe_hold::SafeHoldBuffers,
     lifecycle: &Arc<LifecycleControl>,
     teardown_disable: &Arc<TeardownDisable>,
@@ -8559,46 +8562,48 @@ fn run_executor_safe_hold(
     estop_state.latch();
     internal_fault_lane.latch_control_safe_hold_fence();
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        core.cancel_active_commissioning_on_stop("SAFE_HOLD");
-        safe_hold_bufs.seed_on_entry(&core);
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            if let Some(drv) = core
-                .driver
-                .as_mut()
-                .and_then(crate::supervisor_lock::DriverSlot::as_exclusive_mut)
+        if let Some(core) = core_slot.as_deref_mut() {
+            core.cancel_active_commissioning_on_stop("SAFE_HOLD");
+            safe_hold_bufs.seed_on_entry(core);
+            #[cfg(not(target_arch = "wasm32"))]
             {
-                core.torque_shadow.drain_from_driver(drv);
-            }
-            let live_intent = core.shadow_live_intent();
-            let live_is_torqued = core.is_torqued;
-            match reason {
-                super::safe_hold::SafeHoldReason::ControlPanic => {
-                    core.torque_shadow
-                        .enqueue(crate::torque::shadow::ShadowInputKind::Panic {
-                            tier: crate::torque::PanicTier::CaughtControlPanic,
-                            live_intent,
-                            live_is_torqued,
-                            live_stopped: true,
-                        });
+                if let Some(drv) = core
+                    .driver
+                    .as_mut()
+                    .and_then(crate::supervisor_lock::DriverSlot::as_exclusive_mut)
+                {
+                    core.torque_shadow.drain_from_driver(drv);
                 }
-                _ => {
-                    core.torque_shadow
-                        .enqueue(crate::torque::shadow::ShadowInputKind::Stop {
-                            kind: crate::torque::StopKind::EStop,
-                            live_intent,
-                            live_is_torqued,
-                            live_stopped: true,
-                        });
+                let live_intent = core.shadow_live_intent();
+                let live_is_torqued = core.is_torqued;
+                match reason {
+                    super::safe_hold::SafeHoldReason::ControlPanic => {
+                        core.torque_shadow
+                            .enqueue(crate::torque::shadow::ShadowInputKind::Panic {
+                                tier: crate::torque::PanicTier::CaughtControlPanic,
+                                live_intent,
+                                live_is_torqued,
+                                live_stopped: true,
+                            });
+                    }
+                    _ => {
+                        core.torque_shadow
+                            .enqueue(crate::torque::shadow::ShadowInputKind::Stop {
+                                kind: crate::torque::StopKind::EStop,
+                                live_intent,
+                                live_is_torqued,
+                                live_stopped: true,
+                            });
+                    }
                 }
+                core.flush_torque_shadow();
             }
-            core.flush_torque_shadow();
         }
     }));
     lifecycle.set_owner_state(LC_OWNER_SAFE_HOLD);
-    let has_drv = core
-        .driver
-        .as_ref()
+    let has_drv = core_slot
+        .as_deref()
+        .and_then(|c| c.driver.as_ref())
         .is_some_and(crate::supervisor_lock::DriverSlot::is_exclusive);
     if has_drv {
         let now_inst = || clock_hook.as_ref().map_or_else(Instant::now, |c| c.now());
@@ -8610,7 +8615,7 @@ fn run_executor_safe_hold(
             }
         };
         let hard_deadline = {
-            let core_ref = &mut *core;
+            let core_ref = core_slot.as_deref_mut().expect("core retained in slot");
             let drv = core_ref
                 .driver
                 .as_mut()
@@ -8626,7 +8631,7 @@ fn run_executor_safe_hold(
             )
         };
         let outcome = run_bounded_teardown_disable(
-            &mut core,
+            core_slot.as_deref_mut().expect("core retained in slot"),
             teardown_disable,
             exited,
             control_exited_cv,
@@ -8639,7 +8644,7 @@ fn run_executor_safe_hold(
             Some(hard_deadline),
         );
         finalize_process_exit_or_retain_safe_hold(
-            core,
+            core_slot,
             &outcome,
             safe_hold_bufs,
             lifecycle,
@@ -8653,7 +8658,7 @@ fn run_executor_safe_hold(
         lifecycle.safe_hold.mark_active(reason);
         lifecycle.safe_hold.mark_exited();
         lifecycle.set_owner_state(LC_OWNER_DISARMED_EXITED);
-        drop(core);
+        drop(core_slot.take());
         mark_control_exited(exited, control_exited_cv, hub);
     }
 }
@@ -8826,9 +8831,8 @@ fn control_thread_main(
                 if let Some(mut safe_hold_bufs) = bufs {
                     let mut fallback_core = Some(core);
                     let hold_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let c = fallback_core.take().expect("core retained for SAFE-HOLD");
                         run_executor_safe_hold(
-                            c,
+                            &mut fallback_core,
                             &mut safe_hold_bufs,
                             &outer_lifecycle,
                             &outer_teardown_disable,
@@ -9082,10 +9086,9 @@ fn control_thread_main_inner(
                 drop(core_slot.take());
                 mark_control_exited(&exited, &control_exited_cv, &hub);
             } else {
-                let core = core_slot.take().expect("core owned by timeout loser");
                 let safe_hold_bufs = safe_hold_bufs_slot.as_mut().expect("safe_hold_bufs initialized");
                 run_executor_safe_hold(
-                    core,
+                    core_slot,
                     safe_hold_bufs,
                     &lifecycle,
                     &teardown_disable,
@@ -9889,9 +9892,8 @@ fn control_thread_main_inner(
     let req_kind = lifecycle.current_request();
     if panicked {
         if !core_is_confirmed_disarmed(core_slot.as_deref().expect("core owned")) {
-            let core = core_slot.take().expect("core owned");
             run_executor_safe_hold(
-                core,
+                core_slot,
                 safe_hold_bufs,
                 &lifecycle,
                 &teardown_disable,
@@ -9935,9 +9937,8 @@ fn control_thread_main_inner(
             None,
             explicit_dl,
         );
-        let core = core_slot.take().expect("core owned");
         finalize_process_exit_or_retain_safe_hold(
-            core,
+            core_slot,
             &outcome,
             safe_hold_bufs,
             &lifecycle,
@@ -10044,9 +10045,8 @@ fn control_thread_main_inner(
                 None,
                 explicit_dl,
             );
-            let core = core_slot.take().expect("core owned");
             finalize_process_exit_or_retain_safe_hold(
-                core,
+                core_slot,
                 &outcome,
                 safe_hold_bufs,
                 &lifecycle,
@@ -10061,9 +10061,8 @@ fn control_thread_main_inner(
             drop(core_slot.take());
             mark_control_exited(&exited, &control_exited_cv, &hub);
         } else {
-            let core = core_slot.take().expect("core owned");
             run_executor_safe_hold(
-                core,
+                core_slot,
                 safe_hold_bufs,
                 &lifecycle,
                 &teardown_disable,
@@ -10086,9 +10085,8 @@ fn control_thread_main_inner(
         drop(core_slot.take());
         mark_control_exited(&exited, &control_exited_cv, &hub);
     } else {
-        let core = core_slot.take().expect("core owned");
         run_executor_safe_hold(
-            core,
+            core_slot,
             safe_hold_bufs,
             &lifecycle,
             &teardown_disable,
