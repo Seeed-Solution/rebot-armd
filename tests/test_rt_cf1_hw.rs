@@ -1985,3 +1985,288 @@ async fn cf1_blocker4_timeout_write_pre_tx_revocation_late_reply_and_duplicate_b
         rig.shutdown().await;
     }
 }
+
+// ============================================================================
+// 11. Fix 1: Disarmed idle TIMEOUT commissioning actively gathers K=3 rest evidence
+//     via bounded read-only 0xCC polls (no artificial unsolicited feedback feeder)
+// ============================================================================
+
+/// Builds an executor-owned 50 Hz `DamiaoArmDriver<FakeBus>` rig with NO unsolicited feedback
+/// feeder — motors reply ONLY to host frames (`0xCC`, `0x33`, `0x55`), matching real B601-DM
+/// idle disarmed behavior where only the 1-slot `RefreshScheduler` runs.
+async fn spawn_disarmed_idle_50hz_rig(
+    configure_bus: impl FnOnce(&mut mit_support::FakeBusState, &[f32]),
+) -> HwRig {
+    let dir = tempfile::tempdir().unwrap();
+    let calib_path = dir.path().join("calibration.json");
+    let setup_path = dir.path().join("grasp_setup.json");
+    let poses_path = dir.path().join("poses.json");
+    let gripper_calib_path = dir.path().join("gripper_calib.json");
+
+    let mut cfg = ArmConfig::rebot_dm();
+    cfg.lease_timeout_ms = 60_000;
+    let rest_pos = cfg.resting_positions();
+    let limits = b601_limits();
+    let bus = FakeBus::new(&limits);
+    bus.with(|s| {
+        for (i, m) in s.motors.iter_mut().enumerate() {
+            m.q = rest_pos.get(i).copied().unwrap_or(0.0);
+            m.v = 0.0;
+            m.enabled = false;
+        }
+        configure_bus(s, &rest_pos);
+        // Single initial feedback snapshot at boot, no unsolicited feeder afterward.
+        s.push_all_feedback();
+    });
+
+    let mut raw_drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(limits)
+        .unwrap();
+    let _ = raw_drv.read_joint_states();
+    let zero_drv = ZeroOffsetDriver::new(Box::new(raw_drv), &vec![0.0; cfg.dof]);
+    let sup = Arc::new(ArmSupervisor::new(cfg.clone()).with_driver(Box::new(zero_drv)));
+    {
+        let mut inner = sup.inner().write().await;
+        inner.poses.path = Some(poses_path);
+        inner.gripper_calib_path = Some(gripper_calib_path);
+        let gate = inner.stopped_disable_gate();
+        if let Some(d) = inner.driver.as_mut() {
+            let _ = d.with_mut(|drv| drv.set_stopped_disable_gate(gate));
+        }
+    }
+    bus.clear_log();
+
+    let mut ecfg = ExecutorConfig::for_tests(Duration::from_millis(20));
+    ecfg.alloc_timing = true;
+    let handle = sup.start_executor(ecfg).await.unwrap();
+    let dl = Instant::now() + Duration::from_secs(3);
+    while sup.hub().latest().is_none() {
+        assert!(Instant::now() < dl, "executor never published initial snapshot");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let det_up = armd::api::proxy::DetectorUpstream::parse("http://127.0.0.1:9").unwrap();
+    let grasp_deps = GraspDeps::http(det_up.clone(), Some(setup_path.clone()));
+    let cal_deps = CalibrationDeps::new(calib_path.clone(), Some(setup_path.clone()), det_up.clone());
+    let router = armd::api::create_router_calibration(
+        sup.clone(),
+        det_up,
+        grasp_deps,
+        armd::diagnostics::DiagnosticsState::global(),
+        cal_deps.clone(),
+        OperatorAuth::disabled(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_jh = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    let ws_url = format!("ws://{addr}/api/v1/ws");
+
+    HwRig {
+        sup,
+        bus,
+        handle: Some(handle),
+        feeder_stop: Arc::new(AtomicBool::new(false)),
+        feeder_jh: None,
+        server_jh,
+        ws_url,
+        _dir: dir,
+        calib_path,
+        setup_path,
+        cal_deps,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mit_timeout_disarmed_idle_10s_at_rest_succeeds_all_axes_applied() {
+    let rig = spawn_disarmed_idle_50hz_rig(|_, _| {}).await;
+
+    // Sit disarmed and Idle for 10 s at 50 Hz with only the 1-slot RefreshScheduler running.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    // Connect, acquire lease, and commission TIMEOUT = 2000 counts on J1-J6 (RAM only, torque off).
+    let mut ws = rig.connect_ws().await;
+    let (gen, epoch) = ws_acquire_lease(&mut ws, "c-idle-10s").await;
+
+    rig.bus.clear_log();
+    let wr = ws_cmd(
+        &mut ws,
+        1,
+        gen,
+        epoch,
+        mit::TIMEOUT_PATH,
+        json!({ "joints": [1, 2, 3, 4, 5, 6], "timeout_counts": 2000, "dry_run": false }),
+    )
+    .await;
+    eprintln!("FAKEBUS_TIMEOUT_IDLE_10S_OUTPUT={wr}");
+    assert_eq!(
+        wr["type"], "command_ack",
+        "disarmed 10s-idle arm at rest must gather rest evidence and succeed: {wr}"
+    );
+    assert_eq!(wr["dry_run"], false);
+    assert_eq!(wr["timeout_counts"], 2000);
+    let comm = wr["commissioning"].as_array().unwrap();
+    assert_eq!(comm.len(), 6, "all 6 arm axes J1-J6 must be Applied: {wr}");
+    for (idx, row) in comm.iter().enumerate() {
+        let j = idx + 1;
+        assert_eq!(row["before"]["joint"], j, "row {idx}: {row}");
+        assert_eq!(row["written_raw"], 2000, "row {idx}: {row}");
+        assert_eq!(row["ack_raw"], 2000, "row {idx}: {row}");
+        assert_eq!(row["readback"]["joint"], j, "row {idx}: {row}");
+        assert_eq!(row["readback"]["timeout_raw"], 2000, "row {idx}: {row}");
+    }
+
+    let log = rig.bus.tx_log();
+    assert_no_flash_write(&log);
+    let cc_probes = log
+        .iter()
+        .filter(|f| f.id == 0x7FF && f.data[2] == 0xCC)
+        .count();
+    assert!(
+        cc_probes >= 18,
+        "expected bounded read-only 0xCC rest-evidence probes across J1-J6 (got {cc_probes})"
+    );
+    let writes: Vec<CanFrame> = log
+        .iter()
+        .copied()
+        .filter(|f| f.id == 0x7FF && f.data[2] == damiao::REG_WRITE && f.data[3] == damiao::RID_TIMEOUT)
+        .collect();
+    assert_eq!(writes.len(), 6, "expected exactly 1 RAM REG_WRITE per axis J1-J6");
+    for j in 0..6 {
+        assert_eq!(
+            rig.bus.with(|s| s.motors[j].reg_u32(damiao::RID_TIMEOUT)),
+            2000,
+            "motor J{} RAM RID_TIMEOUT must equal 2000",
+            j + 1
+        );
+    }
+    // J7 (gripper) must remain untouched (TIMEOUT = 0) and rejected if requested.
+    assert_eq!(rig.bus.with(|s| s.motors[6].reg_u32(damiao::RID_TIMEOUT)), 0);
+    let j7_err = ws_cmd(
+        &mut ws,
+        2,
+        gen,
+        epoch,
+        mit::TIMEOUT_PATH,
+        json!({ "joints": [7], "timeout_counts": 2000, "dry_run": false }),
+    )
+    .await;
+    assert_eq!(j7_err["type"], "command_reject", "J7 must be excluded: {j7_err}");
+    assert_eq!(j7_err["status"], 400);
+
+    assert!(!pending_commit_marker_path(&rig.calib_path).exists());
+    assert_eq!(rig.hold_state().await, None);
+    rig.assert_zero_alloc("disarmed idle 10s TIMEOUT commissioning");
+    rig.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mit_timeout_disarmed_idle_one_axis_off_rest_rejected_zero_writes() {
+    // Subcase A: axis J3 off rest after idle refresh -> rejected with 0 writes.
+    // Subcase B: axis J3 moves off rest while its cached feedback is stale (> 100 ms), so
+    // GatherRestEvidence must actively probe 0xCC and still reject with 0 writes.
+    for move_after_stale in [false, true] {
+        let rig = spawn_disarmed_idle_50hz_rig(|s, rest_pos| {
+            if !move_after_stale {
+                s.motors[2].q = rest_pos[2] + 0.35;
+            }
+        })
+        .await;
+
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        if move_after_stale {
+            let rest_j3 = ArmConfig::rebot_dm().resting_positions()[2];
+            rig.bus.with(|s| {
+                s.motors[2].q = rest_j3 + 0.35;
+            });
+        }
+
+        let mut ws = rig.connect_ws().await;
+        let (gen, epoch) = ws_acquire_lease(&mut ws, "c-off-rest").await;
+
+        rig.bus.clear_log();
+        let err = ws_cmd(
+            &mut ws,
+            1,
+            gen,
+            epoch,
+            mit::TIMEOUT_PATH,
+            json!({ "joints": [1, 2, 3, 4, 5, 6], "timeout_counts": 2000, "dry_run": false }),
+        )
+        .await;
+        assert_eq!(
+            err["type"], "command_reject",
+            "one axis off rest (move_after_stale={move_after_stale}) must reject: {err}"
+        );
+        assert_eq!(err["status"], 409, "{err}");
+        assert_eq!(err["code"], "ARM_NOT_AT_RESTING_POSE", "{err}");
+        let log = rig.bus.tx_log();
+        assert_no_flash_write(&log);
+        assert!(
+            !log.iter()
+                .any(|f| f.id == 0x7FF && f.data[2] == damiao::REG_WRITE),
+            "off-rest refusal must emit 0 register writes (move_after_stale={move_after_stale})"
+        );
+        for j in 0..7 {
+            assert_eq!(rig.bus.with(|s| s.motors[j].reg_u32(damiao::RID_TIMEOUT)), 0);
+        }
+        assert!(!pending_commit_marker_path(&rig.calib_path).exists());
+        assert_eq!(rig.hold_state().await, None);
+        rig.assert_zero_alloc("disarmed idle one axis off rest");
+        rig.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mit_timeout_disarmed_idle_silent_axis_rejected_zero_writes() {
+    let rig = spawn_disarmed_idle_50hz_rig(|_, _| {}).await;
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    // Silence J4 after boot while the arm sits disarmed at rest.
+    rig.bus.with(|s| {
+        s.motors[3].silent = true;
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut ws = rig.connect_ws().await;
+    let (gen, epoch) = ws_acquire_lease(&mut ws, "c-silent-axis").await;
+
+    rig.bus.clear_log();
+    let err = ws_cmd(
+        &mut ws,
+        1,
+        gen,
+        epoch,
+        mit::TIMEOUT_PATH,
+        json!({ "joints": [1, 2, 3, 4, 5, 6], "timeout_counts": 2000, "dry_run": false }),
+    )
+    .await;
+    assert_eq!(
+        err["type"], "command_reject",
+        "silent axis must reject TIMEOUT commissioning: {err}"
+    );
+    let status = err["status"].as_u64().unwrap_or(0);
+    let code = err["code"].as_str().unwrap_or("");
+    assert!(
+        matches!((status, code), (409, "ARM_NOT_AT_RESTING_POSE") | (502, "MIT_TIMEOUT_FAILED")),
+        "expected fail-closed rest/feedback refusal on silent axis, got: {err}"
+    );
+    let log = rig.bus.tx_log();
+    assert_no_flash_write(&log);
+    assert!(
+        log.iter().any(|f| f.id == 0x7FF && f.data[2] == 0xCC),
+        "expected read-only 0xCC probes before failing closed on silent axis"
+    );
+    assert!(
+        !log.iter()
+            .any(|f| f.id == 0x7FF && f.data[2] == damiao::REG_WRITE),
+        "silent axis refusal must emit 0 register writes"
+    );
+    for j in 0..7 {
+        assert_eq!(rig.bus.with(|s| s.motors[j].reg_u32(damiao::RID_TIMEOUT)), 0);
+    }
+    assert!(!pending_commit_marker_path(&rig.calib_path).exists());
+    assert_eq!(rig.hold_state().await, None);
+    rig.assert_zero_alloc("disarmed idle silent axis");
+    rig.shutdown().await;
+}

@@ -2123,6 +2123,18 @@ pub trait ArmDriver: Send {
         crate::mit::CommissioningTxStatus::Refused("register read commissioning unsupported")
     }
 
+    /// Single non-blocking read-only status refresh probe (`0xCC`) while disarmed to gather
+    /// fresh causal rest-pose evidence under `deadline`, running `pre_tx_gate` immediately
+    /// before `can.transmit` (Step 5 submission boundary).
+    fn commissioning_try_send_rest_probe(
+        &mut self,
+        _joint: usize,
+        _deadline: Instant,
+        _pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> crate::mit::CommissioningTxStatus {
+        crate::mit::CommissioningTxStatus::Refused("commissioning rest-pose probe unsupported")
+    }
+
     /// Single non-blocking RAM TIMEOUT write TX (`0x55`, RID 9, never flash `0xAA`) under
     /// `deadline`, running `pre_tx_gate` immediately before `can.transmit`.
     fn commissioning_try_send_timeout_write(
@@ -17440,6 +17452,67 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 crate::mit::CommissioningTxStatus::Revoked("STOPPED")
             }
             Err(Err(_)) => crate::mit::CommissioningTxStatus::Refused("register read transmit failed"),
+        }
+    }
+
+    fn commissioning_try_send_rest_probe(
+        &mut self,
+        joint: usize,
+        deadline: Instant,
+        pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> crate::mit::CommissioningTxStatus {
+        let Some(&id) = self.motor_ids.get(joint) else {
+            return crate::mit::CommissioningTxStatus::Refused("joint out of range");
+        };
+        if self.is_enabled || self.is_enabling {
+            return crate::mit::CommissioningTxStatus::Refused(
+                "torque must be off for TIMEOUT commissioning rest-pose probe",
+            );
+        }
+        let start_stamp = self.current_stop_stamp();
+        match self.send_with_commissioning_gate(
+            TxKind::Refresh,
+            Some(start_stamp),
+            Some(Deadline { at: deadline }),
+            pre_tx_gate,
+            |_| Some(damiao::build_refresh_frame(id)),
+        ) {
+            Ok((_, tx_seq, tx_started, tx_offset_ns)) => {
+                if !self.can.flush_is_noop() {
+                    if self.flush_cutoff_exceeded() || self.now() >= deadline {
+                        return crate::mit::CommissioningTxStatus::SentFlushFailed {
+                            tx_seq,
+                            tx_started,
+                            tx_offset_ns,
+                        };
+                    }
+                    if self.can.flush().is_err() {
+                        return crate::mit::CommissioningTxStatus::SentFlushFailed {
+                            tx_seq,
+                            tx_started,
+                            tx_offset_ns,
+                        };
+                    }
+                }
+                crate::mit::CommissioningTxStatus::Sent {
+                    tx_seq,
+                    tx_started,
+                    tx_offset_ns,
+                }
+            }
+            Err(Ok(code)) => crate::mit::CommissioningTxStatus::Revoked(code),
+            Err(Err(TxRefusal::Deferred | TxRefusal::DeadlinePassed)) => {
+                crate::mit::CommissioningTxStatus::Backpressure
+            }
+            Err(Err(TxRefusal::Transport(e))) if e.is_tx_backpressure() => {
+                crate::mit::CommissioningTxStatus::Backpressure
+            }
+            Err(Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged)) => {
+                crate::mit::CommissioningTxStatus::Revoked("STOPPED")
+            }
+            Err(Err(_)) => {
+                crate::mit::CommissioningTxStatus::Refused("rest-pose probe transmit failed")
+            }
         }
     }
 

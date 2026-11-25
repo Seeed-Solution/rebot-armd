@@ -369,6 +369,12 @@ pub struct TimeoutCommand {
 
 fn invalid(m: impl Into<String>) -> CalibError { CalibError::new(400, "INVALID_COMMAND", m) }
 
+/// Parses `/api/v1/calibration/mit_timeout` requests for arm joints (J1–J6) only.
+///
+/// J7 (the gripper, `CTRL_MODE_POS_FORCE = 4` or legacy `POS_VEL`) is intentionally excluded:
+/// it never enters MIT mode, its `PosForceBootFallback::NoOutputUntilFresh` recovery and
+/// MIT-fence hold contracts rely on `TIMEOUT = 0` so a held workpiece is not dropped on host
+/// restart or bus pause, and `RID_TIMEOUT` expiry in `POS_FORCE` is uncharacterized on B601-DM.
 pub fn parse_timeout_command(cfg: &ArmConfig, body: &Value) -> Result<TimeoutCommand, CalibError> {
     let o = body.as_object().ok_or_else(|| invalid("Command body must be an object"))?;
     for k in o.keys() {
@@ -2456,6 +2462,14 @@ const COMM_MAX_TX_PER_RELEASE: u8 = 4;
 /// Maximum stationary velocity tolerance (rad/s) for commissioning writes.
 #[cfg(not(target_arch = "wasm32"))]
 const COMM_STATIONARY_VEL_RAD_S: f32 = 0.05;
+/// Bounded wall/driver-clock window for active read-only `0xCC` rest-pose evidence gathering
+/// while disarmed before a TIMEOUT commissioning read/write step.
+#[cfg(not(target_arch = "wasm32"))]
+const COMM_REST_EVIDENCE_TIMEOUT: Duration = Duration::from_millis(500);
+/// Minimum spacing between read-only `0xCC` rest-pose probe bursts during commissioning precheck
+/// (aligned with `EVIDENCE_PROBE_INTERVAL` so K=3 causal samples span >= 20 ms across >= 3 ticks).
+#[cfg(not(target_arch = "wasm32"))]
+const COMM_REST_PROBE_INTERVAL: Duration = Duration::from_millis(10);
 
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2469,6 +2483,7 @@ enum RegReadPhase {
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WriteTimeoutPhase {
+    GatherRestEvidence,
     ReadBefore,
     DrainBeforeWrite,
     SendWrite,
@@ -2524,6 +2539,13 @@ pub struct CommissioningMachine {
     req_deadline: Option<std::time::Instant>,
     req_attempts: u8,
     req_in_flight: bool,
+    // Bounded read-only 0xCC rest-pose evidence gather state for disarmed WriteTimeout precheck
+    release_step_count: u64,
+    rest_gather_deadline: Option<std::time::Instant>,
+    rest_probe_next_at: Option<std::time::Instant>,
+    rest_probe_pending_mask: u64,
+    rest_probe_last_release_seq: u64,
+    rest_gather_resume_phase: WriteTimeoutPhase,
     // Motor-zero disable & write-verify state
     disable_started_at: Option<std::time::Instant>,
     disable_boundary_seq: u64,
@@ -2574,6 +2596,12 @@ impl Default for CommissioningMachine {
             req_deadline: None,
             req_attempts: 0,
             req_in_flight: false,
+            release_step_count: 0,
+            rest_gather_deadline: None,
+            rest_probe_next_at: None,
+            rest_probe_pending_mask: 0,
+            rest_probe_last_release_seq: 0,
+            rest_gather_resume_phase: WriteTimeoutPhase::ReadBefore,
             disable_started_at: None,
             disable_boundary_seq: 0,
             disable_tx_started: None,
@@ -2810,6 +2838,24 @@ impl crate::supervisor::SupervisorInner {
         joints: &[usize],
         drv: Option<&dyn crate::driver::ArmDriver>,
     ) -> Result<(), (u16, &'static str, &'static str)> {
+        self.commissioning_safety_check_with_driver_inner(kind, joints, drv, false)
+    }
+
+    /// Inner zero-allocation safety/hardware check.
+    /// When `allow_rest_evidence_gather` is true (ONLY for `WriteTimeout` admission and while
+    /// actively polling read-only `0xCC` rest-pose evidence before any register read/write),
+    /// hard safety refusals (fault, torque on, motion, non-stationary, fresh non-disabled motor,
+    /// or `RestPoseGateStatus::RefusedNonRest`) still fail immediately, while stale/incomplete
+    /// rest-pose evidence or stale disabled feedback is permitted so `GatherRestEvidence` can
+    /// actively collect K=3 causal fresh samples while disarmed.
+    fn commissioning_safety_check_with_driver_inner(
+        &self,
+        kind: CommissioningOpKind,
+        joints: &[usize],
+        drv: Option<&dyn crate::driver::ArmDriver>,
+        allow_rest_evidence_gather: bool,
+    ) -> Result<(), (u16, &'static str, &'static str)> {
+        let can_gather = allow_rest_evidence_gather && kind == CommissioningOpKind::WriteTimeout;
         let is_zero = matches!(
             kind,
             CommissioningOpKind::MotorZeroDisable | CommissioningOpKind::MotorZeroWriteVerify
@@ -2876,8 +2922,10 @@ impl crate::supervisor::SupervisorInner {
         if !kind.is_mutating() {
             return Ok(());
         }
-        // Stationary check: every joint velocity must be finite and within resting velocity bound.
+        // Stationary check: every joint velocity (both supervisor snapshot and any fresh driver
+        // feedback decoded in the current release) must be finite and within resting velocity bound.
         let dof = self.config.dof.min(self.measured_velocities.len());
+        let drv_now = drv.clock_now();
         for j in 0..dof {
             let v = self.measured_velocities[j];
             let vlim = self
@@ -2894,39 +2942,68 @@ impl crate::supervisor::SupervisorInner {
                     (409, "MIT_TIMEOUT_ARMED", "arm must be stationary for TIMEOUT commissioning")
                 });
             }
+            if let Some(fb) = drv.commissioning_raw_feedback(j) {
+                let age = drv_now.saturating_duration_since(fb.rx_at);
+                if age <= crate::driver::ZERO_FEEDBACK_MAX_AGE
+                    && (!fb.velocity.is_finite() || fb.velocity.abs() > vlim)
+                {
+                    return Err(if is_zero {
+                        (409, "MOTOR_ZERO_ARMED", "arm must be stationary for motor zero")
+                    } else {
+                        (409, "MIT_TIMEOUT_ARMED", "arm must be stationary for TIMEOUT commissioning")
+                    });
+                }
+            }
         }
         // Torque confirmed off at the driver.
-        if drv.is_enabled() {
+        if drv.is_enabled() || drv.has_any_joint_enabled() {
             return Err(if is_zero {
                 (409, "MOTOR_ZERO_ARMED", "driver reports torque enabled")
             } else {
                 (409, "MIT_TIMEOUT_ARMED", "driver reports torque enabled")
             });
         }
-        if drv.capabilities().enable_feedback && drv.enable_state() != crate::model::EnableState::Disabled {
-            return Err(if is_zero {
-                (409, "MOTOR_ZERO_NOT_DISABLED", "motors are not confirmed disabled from fresh feedback")
-            } else {
-                (502, "MIT_TIMEOUT_FAILED", "motors are not confirmed disabled from fresh feedback")
-            });
+        if drv.capabilities().enable_feedback {
+            // Any fresh non-zero motor_status is an immediate hard refusal (even when gathering).
+            for j in 0..dof {
+                if let Some(fb) = drv.commissioning_raw_feedback(j) {
+                    let age = drv_now.saturating_duration_since(fb.rx_at);
+                    if age <= crate::driver::ZERO_FEEDBACK_MAX_AGE && fb.motor_status != 0 {
+                        return Err(if is_zero {
+                            (409, "MOTOR_ZERO_NOT_DISABLED", "joint is not confirmed disabled from fresh feedback")
+                        } else {
+                            (502, "MIT_TIMEOUT_FAILED", "joint is not confirmed disabled from fresh feedback")
+                        });
+                    }
+                }
+            }
+            if !can_gather && drv.enable_state() != crate::model::EnableState::Disabled {
+                return Err(if is_zero {
+                    (409, "MOTOR_ZERO_NOT_DISABLED", "motors are not confirmed disabled from fresh feedback")
+                } else {
+                    (502, "MIT_TIMEOUT_FAILED", "motors are not confirmed disabled from fresh feedback")
+                });
+            }
         }
-        for &j in joints {
-            let Some(fb) = drv.commissioning_raw_feedback(j) else {
-                return Err(if is_zero {
-                    (409, "MOTOR_ZERO_NO_FEEDBACK", "the motor feedback is not fresh; check the bus and the motor power")
-                } else {
-                    (502, "MIT_TIMEOUT_FAILED", "the motor feedback is not fresh; check the bus and the motor power")
-                });
-            };
-            let age = drv.clock_now().saturating_duration_since(fb.rx_at);
-            if age > crate::driver::ZERO_FEEDBACK_MAX_AGE
-                || (drv.capabilities().enable_feedback && fb.motor_status != 0)
-            {
-                return Err(if is_zero {
-                    (409, "MOTOR_ZERO_NOT_DISABLED", "joint is not confirmed disabled from fresh feedback")
-                } else {
-                    (502, "MIT_TIMEOUT_FAILED", "joint is not confirmed disabled from fresh feedback")
-                });
+        if !can_gather {
+            for &j in joints {
+                let Some(fb) = drv.commissioning_raw_feedback(j) else {
+                    return Err(if is_zero {
+                        (409, "MOTOR_ZERO_NO_FEEDBACK", "the motor feedback is not fresh; check the bus and the motor power")
+                    } else {
+                        (502, "MIT_TIMEOUT_FAILED", "the motor feedback is not fresh; check the bus and the motor power")
+                    });
+                };
+                let age = drv_now.saturating_duration_since(fb.rx_at);
+                if age > crate::driver::ZERO_FEEDBACK_MAX_AGE
+                    || (drv.capabilities().enable_feedback && fb.motor_status != 0)
+                {
+                    return Err(if is_zero {
+                        (409, "MOTOR_ZERO_NOT_DISABLED", "joint is not confirmed disabled from fresh feedback")
+                    } else {
+                        (502, "MIT_TIMEOUT_FAILED", "joint is not confirmed disabled from fresh feedback")
+                    });
+                }
             }
         }
         // Fresh rest evidence: ALWAYS required before EVERY irreversible hardware write
@@ -2943,12 +3020,23 @@ impl crate::supervisor::SupervisorInner {
                 drv,
                 self.commissioning.zero_sent_joint_mask,
             )?;
-        } else if drv.rest_pose_gate_status() != crate::driver::RestPoseGateStatus::Confirmed {
-            return Err(if is_zero {
-                (409, "ARM_NOT_AT_RESTING_POSE", "hardware motor zero requires fresh confirmed rest-pose evidence")
+        } else {
+            let gate_status = drv.rest_pose_gate_status();
+            let rest_ok = if can_gather {
+                // While disarmed and idle, only 1-slot RefreshScheduler runs so rest evidence may
+                // be PendingDrainOrWindow / StaleOrMissing until GatherRestEvidence polls 0xCC.
+                // RefusedNonRest (no resting pose or observed off-rest) still refuses immediately.
+                gate_status != crate::driver::RestPoseGateStatus::RefusedNonRest
             } else {
-                (409, "ARM_NOT_AT_RESTING_POSE", "TIMEOUT commissioning requires fresh confirmed rest-pose evidence")
-            });
+                gate_status == crate::driver::RestPoseGateStatus::Confirmed
+            };
+            if !rest_ok {
+                return Err(if is_zero {
+                    (409, "ARM_NOT_AT_RESTING_POSE", "hardware motor zero requires fresh confirmed rest-pose evidence")
+                } else {
+                    (409, "ARM_NOT_AT_RESTING_POSE", "TIMEOUT commissioning requires fresh confirmed rest-pose evidence")
+                });
+            }
         }
         Ok(())
     }
@@ -3116,10 +3204,11 @@ impl crate::supervisor::SupervisorInner {
                 let mut mit_sw = false;
                 let locked = slot.try_with_ref(|drv| {
                     mit_sw = drv.supports_mit_mode_switch();
-                    check_res = self.commissioning_safety_check_with_driver(
+                    check_res = self.commissioning_safety_check_with_driver_inner(
                         req.kind,
                         &req.joints[..req.joint_len],
                         Some(drv),
+                        req.kind == CommissioningOpKind::WriteTimeout,
                     );
                 });
                 if locked.is_err() {
@@ -3171,7 +3260,12 @@ impl crate::supervisor::SupervisorInner {
         }
         self.commissioning.joint_idx = 0;
         self.commissioning.reset_reg_read();
-        self.commissioning.write_phase = WriteTimeoutPhase::ReadBefore;
+        self.commissioning.write_phase = WriteTimeoutPhase::GatherRestEvidence;
+        self.commissioning.rest_gather_deadline = None;
+        self.commissioning.rest_probe_next_at = None;
+        self.commissioning.rest_probe_pending_mask = 0;
+        self.commissioning.rest_probe_last_release_seq = 0;
+        self.commissioning.rest_gather_resume_phase = WriteTimeoutPhase::ReadBefore;
         self.commissioning.mz_phase = match req.kind {
             CommissioningOpKind::MotorZeroDisable => MotorZeroPhase::DisableDispatch,
             CommissioningOpKind::MotorZeroWriteVerify => MotorZeroPhase::ZeroSendLoop,
@@ -3288,6 +3382,8 @@ impl crate::supervisor::SupervisorInner {
         if self.commissioning.state != CommissioningOpState::Running {
             return;
         }
+        self.commissioning.release_step_count =
+            self.commissioning.release_step_count.wrapping_add(1).max(1);
         let Some(auth) = self.commissioning.authority else {
             self.commissioning.set_error(
                 CommissioningOpState::Failed,
@@ -3820,11 +3916,196 @@ impl crate::supervisor::SupervisorInner {
                 ));
             };
             match self.commissioning.write_phase {
-                WriteTimeoutPhase::ReadBefore => {
-                    if let Err((status, code, msg)) = self.commissioning_safety_check_with_driver(
+                WriteTimeoutPhase::GatherRestEvidence => {
+                    // Reject any hard safety/hardware/non-rest refusal immediately with 0 TX.
+                    let active_joints = self.commissioning.joints;
+                    let active_len = self.commissioning.joint_len;
+                    if let Err((status, code, msg)) = self.commissioning_safety_check_with_driver_inner(
+                        CommissioningOpKind::WriteTimeout,
+                        &active_joints[..active_len],
+                        Some(drv),
+                        true,
+                    ) {
+                        return Err((status, code, crate::safety::BoundedText::new(msg)));
+                    }
+                    // Drain any queued feedback to an observed-empty boundary before judging or
+                    // transmitting read-only 0xCC probes.
+                    let mut drained_now = false;
+                    if remaining_rx > 0 && drv.clock_now() < drv_cutoff {
+                        match drv.commissioning_drain_rx_step(remaining_rx, drv_cutoff) {
+                            Ok((frames, drained)) => {
+                                remaining_rx = remaining_rx.saturating_sub(frames);
+                                drained_now = drained;
+                            }
+                            Err(_) => {
+                                return Err((
+                                    502,
+                                    "MIT_TIMEOUT_FAILED",
+                                    crate::safety::BoundedText::new(
+                                        "CAN RX error while gathering rest-pose evidence",
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                    if !drained_now {
+                        if self
+                            .commissioning
+                            .rest_gather_deadline
+                            .is_some_and(|dl| drv.clock_now() >= dl)
+                        {
+                            return Err((
+                                409,
+                                "ARM_NOT_AT_RESTING_POSE",
+                                crate::safety::BoundedText::new(
+                                    "TIMEOUT commissioning requires fresh confirmed rest-pose evidence",
+                                ),
+                            ));
+                        }
+                        return Ok(());
+                    }
+                    // Strict check: only proceed once K=3 causal fresh rest-pose evidence on J1-J6,
+                    // fresh disabled feedback, and stationary checks ALL pass.
+                    match self.commissioning_safety_check_with_driver(
                         CommissioningOpKind::WriteTimeout,
                         &[joint],
                         Some(drv),
+                    ) {
+                        Ok(()) => {
+                            self.commissioning.rest_gather_deadline = None;
+                            self.commissioning.rest_probe_next_at = None;
+                            self.commissioning.rest_probe_pending_mask = 0;
+                            self.commissioning.write_phase =
+                                self.commissioning.rest_gather_resume_phase;
+                            continue;
+                        }
+                        Err((status, code, msg)) => {
+                            // If a hard safety/non-rest precondition broke during drain, abort now.
+                            if let Err((h_st, h_code, h_msg)) =
+                                self.commissioning_safety_check_with_driver_inner(
+                                    CommissioningOpKind::WriteTimeout,
+                                    &[joint],
+                                    Some(drv),
+                                    true,
+                                )
+                            {
+                                return Err((h_st, h_code, crate::safety::BoundedText::new(h_msg)));
+                            }
+                            let drv_now = drv.clock_now();
+                            let gather_dl = *self
+                                .commissioning
+                                .rest_gather_deadline
+                                .get_or_insert(drv_now + COMM_REST_EVIDENCE_TIMEOUT);
+                            if drv_now >= gather_dl {
+                                return Err((status, code, crate::safety::BoundedText::new(msg)));
+                            }
+                            // Issue at most one bounded read-only 0xCC burst per control release
+                            // (spaced by COMM_REST_PROBE_INTERVAL) so CausalWindow accumulates K=3
+                            // distinct control releases spanning >= 20 ms within 100 ms.
+                            if self.commissioning.rest_probe_pending_mask == 0 {
+                                if self.commissioning.rest_probe_last_release_seq
+                                    == self.commissioning.release_step_count
+                                    || self
+                                        .commissioning
+                                        .rest_probe_next_at
+                                        .is_some_and(|t| drv_now < t)
+                                {
+                                    return Ok(());
+                                }
+                                let gripper_idx = self.config.gripper_index();
+                                let dof = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
+                                let mut mask = 0u64;
+                                for i in 0..dof {
+                                    if gripper_idx != Some(i) {
+                                        mask |= 1u64 << i;
+                                    } else if drv.capabilities().enable_feedback {
+                                        let stale = drv.commissioning_raw_feedback(i).is_none_or(|fb| {
+                                            drv_now.saturating_duration_since(fb.rx_at)
+                                                > crate::driver::STOPPED_DISABLE_FEEDBACK_MAX_AGE
+                                        });
+                                        if stale
+                                            || drv.enable_state()
+                                                != crate::model::EnableState::Disabled
+                                        {
+                                            mask |= 1u64 << i;
+                                        }
+                                    }
+                                }
+                                self.commissioning.rest_probe_pending_mask = mask;
+                            }
+                            let probe_dl = drv_cutoff.min(gather_dl);
+                            let mut sent_any = false;
+                            let dof = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
+                            for i in 0..dof {
+                                if (self.commissioning.rest_probe_pending_mask & (1u64 << i)) == 0 {
+                                    continue;
+                                }
+                                if drv.clock_now() >= probe_dl {
+                                    break;
+                                }
+                                let mut gate = || -> Result<(), &'static str> {
+                                    self.commissioning_pre_tx_gate_ok(
+                                        CommissioningOpKind::WriteTimeout,
+                                        auth,
+                                        owner_now_fn(),
+                                    )
+                                };
+                                match drv.commissioning_try_send_rest_probe(i, probe_dl, &mut gate) {
+                                    CommissioningTxStatus::Sent { .. } => {
+                                        self.commissioning.rest_probe_pending_mask &= !(1u64 << i);
+                                        sent_any = true;
+                                    }
+                                    CommissioningTxStatus::SentFlushFailed { .. } => {
+                                        return Err((
+                                            502,
+                                            "MIT_TIMEOUT_FAILED",
+                                            crate::safety::BoundedText::new(
+                                                "CAN flush failed during rest-pose probe",
+                                            ),
+                                        ));
+                                    }
+                                    CommissioningTxStatus::Backpressure => {
+                                        break;
+                                    }
+                                    CommissioningTxStatus::Revoked(rc) => {
+                                        return Err(Self::map_commissioning_revoked(
+                                            CommissioningOpKind::WriteTimeout,
+                                            rc,
+                                            "authority revoked before rest-pose probe",
+                                        ));
+                                    }
+                                    CommissioningTxStatus::Refused(rm) => {
+                                        return Err((
+                                            502,
+                                            "MIT_TIMEOUT_FAILED",
+                                            crate::safety::BoundedText::new(rm),
+                                        ));
+                                    }
+                                }
+                            }
+                            if sent_any && self.commissioning.rest_probe_pending_mask == 0 {
+                                self.commissioning.rest_probe_last_release_seq =
+                                    self.commissioning.release_step_count;
+                                self.commissioning.rest_probe_next_at =
+                                    Some(drv.clock_now() + COMM_REST_PROBE_INTERVAL);
+                            }
+                            // Yield to the next control release so Step 2 decodes the 0xCC replies
+                            // under a fresh control_release_id and updates measured_velocities.
+                            return Ok(());
+                        }
+                    }
+                }
+                WriteTimeoutPhase::ReadBefore => {
+                    // `ReadBefore` issues read-only `0x33` register reads only. Enforce all hard
+                    // safety/non-rest preconditions on every tick without interrupting an in-flight
+                    // 50 ms register read if the 100 ms rest window ages during multi-register I/O;
+                    // `SendWrite` strictly enforces (and re-gathers if aged) K=3 rest evidence
+                    // immediately before any `0x55` `REG_WRITE` leaves the host.
+                    if let Err((status, code, msg)) = self.commissioning_safety_check_with_driver_inner(
+                        CommissioningOpKind::WriteTimeout,
+                        &[joint],
+                        Some(drv),
+                        true,
                     ) {
                         return Err((status, code, crate::safety::BoundedText::new(msg)));
                     }
@@ -3900,6 +4181,23 @@ impl crate::supervisor::SupervisorInner {
                         &[joint],
                         Some(drv),
                     ) {
+                        if self
+                            .commissioning_safety_check_with_driver_inner(
+                                CommissioningOpKind::WriteTimeout,
+                                &[joint],
+                                Some(drv),
+                                true,
+                            )
+                            .is_ok()
+                        {
+                            self.commissioning.rest_gather_deadline = None;
+                            self.commissioning.rest_probe_next_at = None;
+                            self.commissioning.rest_probe_pending_mask = 0;
+                            self.commissioning.rest_gather_resume_phase =
+                                WriteTimeoutPhase::DrainBeforeWrite;
+                            self.commissioning.write_phase = WriteTimeoutPhase::GatherRestEvidence;
+                            continue;
+                        }
                         return Err((status, code, crate::safety::BoundedText::new(msg)));
                     }
                     let mut gate = || -> Result<(), &'static str> {

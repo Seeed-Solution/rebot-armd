@@ -156,11 +156,23 @@ Operator session, torque off, load mechanically supported, operator at the power
 
 1. Read only: WS `/api/v1/calibration/mit_timeout` `{"joints": [4], "dry_run": true}`. Record the
    readback (IDs, sw_ver, CTRL_MODE, ranges, original TIMEOUT; 0 on the B601-DM on 2026-11-22).
-2. Write: `{"joints": [4], "timeout_counts": 2000}`. armd writes RID 9 with the RAM opcode 0x55 (never
-   0xAA), checks the acknowledgement value and reply ID, and confirms with a separate 0x33 read.
+2. Write: `{"joints": [4], "timeout_counts": 2000}`. Before writing, the commissioning precheck
+   confirms torque is off, the arm is stationary, and J1–J6 hold K = 3 causal fresh rest-pose
+   samples (actively polling read-only `0xCC` status frames on J1–J6 while disarmed if the idle
+   1-slot refresh scheduler has not built a confirmed window, failing closed with zero writes on
+   any off-rest or silent axis). armd writes RID 9 with the RAM opcode 0x55 (never 0xAA), checks
+   the acknowledgement value and reply ID, and confirms with a separate 0x33 read.
 3. The count is configurable (1..20000). 2000 counts = 100 ms with the documented unit of
    50 µs per count; on J4 (sw_ver 942747703) the timeout expired 96-98 ms after the last command
    (see [Current status](#current-status)). Other joints and firmware versions are not measured.
+4. **Scope (J1–J6 only; J7 excluded):** `/api/v1/calibration/mit_timeout` accepts arm joints
+   J1–J6 only and refuses J7 (the gripper). J7 runs in position-force mode (`CTRL_MODE = 4`,
+   hardware current-capped) or legacy `POS_VEL` (`CTRL_MODE = 2`) and never switches to MIT
+   impedance mode. Its safety contracts (`PosForceBootFallback::NoOutputUntilFresh` and MIT-fence
+   isolation in `docs/gripper_pos_force.md`) rely on J7 keeping `TIMEOUT = 0` so a held workpiece
+   is not dropped across a host restart or bus pause (on B601-DM firmware `sw_ver 942747703`,
+   `0xCC` polls do not refresh the Damiao timeout and expiry disables the motor with error `0xD`);
+   `RID_TIMEOUT` expiry in `CTRL_MODE = 4` is also uncharacterized on B601-DM firmware.
 
 ## Device qualification (one joint at a time)
 

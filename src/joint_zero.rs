@@ -602,6 +602,14 @@ impl ArmDriver for ZeroOffsetDriver {
     ) -> crate::mit::CommissioningTxStatus {
         self.inner.commissioning_try_send_register_read(joint, rid, deadline, pre_tx_gate)
     }
+    fn commissioning_try_send_rest_probe(
+        &mut self,
+        joint: usize,
+        deadline: Instant,
+        pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> crate::mit::CommissioningTxStatus {
+        self.inner.commissioning_try_send_rest_probe(joint, deadline, pre_tx_gate)
+    }
     fn commissioning_try_send_timeout_write(
         &mut self,
         joint: usize,
