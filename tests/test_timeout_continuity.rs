@@ -832,7 +832,7 @@ async fn enable_60s_hold_and_multitick_rest_disable_zero_expiries() {
             };
             stamp.request_id = 1;
             let sup_ws = sup.clone();
-            let conn_en = conn.clone();
+            let conn_en = conn;
             let en_task = tokio::spawn(async move {
                 sup_ws
                     .torque_ws_with_deadline(

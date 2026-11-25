@@ -3508,6 +3508,7 @@ impl crate::supervisor::SupervisorInner {
         // before unwinding (never dropping the sole driver or leaving `self.driver == None`).
         // Supports both `DriverSlot::Exclusive` (RT executor) and `DriverSlot::Legacy`
         // (non-blocking `try_lock`, yielding on contention so write-guard hold stays <= 2 ms).
+        #[allow(clippy::large_enum_variant)] // RT zero-alloc path; stack-only enum
         enum DriverCommStep {
             Ran(
                 Result<
@@ -3524,6 +3525,7 @@ impl crate::supervisor::SupervisorInner {
         }
         let mut taken = self.driver.take();
         let step_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            #[allow(clippy::result_large_err)] // RT zero-alloc path; BoundedText stays inline
             let mut run_with_drv = |drv: &mut dyn crate::driver::ArmDriver| {
                 let drv_now = drv.clock_now();
                 let span = owner_cutoff.saturating_duration_since(owner_now_fn());

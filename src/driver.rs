@@ -16635,17 +16635,15 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             }
         }
         let mut sent_any = sent_mask != 0;
-        if sent_any {
-            if self.flush_cutoff_exceeded() || self.can.flush().is_err() {
-                // On a real-flush transport where flush failed or overran cutoff, do not credit
-                // those unconfirmed transmits as watchdog refreshes.
-                for i in 0..n {
-                    if (sent_mask & (1u32 << i)) != 0 {
-                        self.motor_last_ctrl_tx[i] = prev_ctrl_tx[i];
-                    }
+        if sent_any && (self.flush_cutoff_exceeded() || self.can.flush().is_err()) {
+            // On a real-flush transport where flush failed or overran cutoff, do not credit
+            // those unconfirmed transmits as watchdog refreshes.
+            for i in 0..n {
+                if (sent_mask & (1u32 << i)) != 0 {
+                    self.motor_last_ctrl_tx[i] = prev_ctrl_tx[i];
                 }
-                sent_any = false;
             }
+            sent_any = false;
         }
 
         if abort_on_starve && self.tx_budget.max_frames >= n {
