@@ -5566,7 +5566,10 @@ impl SupervisorInner {
     /// unavailable, or gapped (> [`THERMAL_FEEDBACK_FRESHNESS_LIMIT`]) feedback resets or
     /// restarts the cooldown dwell.
     pub(crate) fn check_thermal_protection(&mut self, was_active: bool) {
-        self.check_thermal_protection_inner(was_active, self.rt_executor_owned);
+        self.check_thermal_protection_inner(
+            was_active,
+            self.rt_executor_owned || self.nonblocking_driver_release,
+        );
     }
 
     pub(crate) fn check_thermal_protection_inner(&mut self, was_active: bool, nonblocking: bool) {

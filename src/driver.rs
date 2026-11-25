@@ -8292,6 +8292,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let submit_now = self.now();
         let is_cmd_enable =
             !frame.is_extended && !frame.is_rtr && frame.dlc == 8 && frame.data == damiao::CMD_ENABLE;
+        let is_cmd_disable =
+            !frame.is_extended && !frame.is_rtr && frame.dlc == 8 && frame.data == damiao::CMD_DISABLE;
         if let Some(pf_joint) = self.frame_pos_force_joint(&frame) {
             // Type-system capability guard: NO caller outside private `mod pos_force_emitter`
             // can construct a `PosForceSendToken`, so any forged `0x307` frame is rejected here.
@@ -8332,13 +8334,14 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         } else {
             None
         };
+        let disable_motor_idx = if is_cmd_disable {
+            self.motor_ids.iter().position(|&id| u32::from(id) == frame.id)
+        } else {
+            None
+        };
         let mut motion_idx: Option<usize> = None;
-        if !frame.is_extended && !frame.is_rtr && frame.dlc == 8 && !is_cmd_enable {
-            if frame.data == damiao::CMD_DISABLE {
-                if let Some(idx) = self.motor_ids.iter().position(|&id| u32::from(id) == frame.id) {
-                    self.motor_post_enable_feedback[idx] = false;
-                }
-            } else if frame.id == 0x7FF
+        if !frame.is_extended && !frame.is_rtr && frame.dlc == 8 && !is_cmd_enable && !is_cmd_disable {
+            if frame.id == 0x7FF
                 && frame.data[2] == damiao::REG_WRITE
                 && frame.data[3] == damiao::RID_CTRL_MODE
             {
@@ -8363,12 +8366,17 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 return Err(TxRefusal::LeaseFenced);
             }
         }
+        if is_cmd_disable && deadline.is_some_and(|d| d.passed(t0)) {
+            return Err(TxRefusal::DeadlinePassed);
+        }
         let res = self.can.transmit(&frame);
         if res.is_ok() {
             if let Some(idx) = enable_motor_idx {
                 self.motor_post_enable_feedback[idx] = false;
                 self.motor_enable_seq[idx] = self.rx_seq;
                 self.mode_readback_boundary[idx] = None;
+            } else if let Some(idx) = disable_motor_idx {
+                self.motor_post_enable_feedback[idx] = false;
             }
         }
         let write_done = self.now();

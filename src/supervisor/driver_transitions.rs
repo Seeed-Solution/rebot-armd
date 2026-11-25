@@ -6049,6 +6049,8 @@ impl SupervisorInner {
             match d.try_with_mut(|drv| {
                 if drv.disable_frames_dispatched() || drv.torque_transition_pending() {
                     Err(2u8)
+                } else if Instant::now() >= deadline {
+                    Err(3u8)
                 } else {
                     let requested_at = drv.clock_now();
                     let disable_kind = crate::driver::DisableKind::DisableRequested {
@@ -6057,17 +6059,13 @@ impl SupervisorInner {
                     let step_budget = deadline
                         .saturating_duration_since(Instant::now())
                         .min(Duration::from_millis(1));
-                    if use_budgeted {
-                        drv.set_tx_release_deadline(Some(requested_at + step_budget));
-                    }
+                    drv.set_tx_release_deadline(Some(requested_at + step_budget));
                     let res = if use_budgeted {
                         drv.begin_disable_torque_budgeted(disable_kind, 0)
                     } else {
                         drv.begin_disable_torque(disable_kind)
                     };
-                    if use_budgeted {
-                        drv.set_tx_release_deadline(None);
-                    }
+                    drv.set_tx_release_deadline(None);
                     let frames_dispatched = drv.disable_frames_dispatched();
                     let dispatched_mask = drv.disable_dispatched_mask();
                     let post_now = drv.clock_now();
@@ -6103,6 +6101,14 @@ impl SupervisorInner {
                 Ok(v) => {
                     self.reset_disable_lock_contention();
                     v
+                }
+                Err(3u8) => {
+                    slot.release_unstarted(token);
+                    return Ok(LegacyTorqueStart::ImmediateRejected {
+                        failure: LegacyTorqueFailure::StaticCode("DEADLINE_EXPIRED"),
+                        epoch_id: self.safety.epoch_id(),
+                        safety_state: self.safety.state().clone(),
+                    });
                 }
                 Err(2u8) => {
                     slot.release_unstarted(token);
@@ -6183,8 +6189,10 @@ impl SupervisorInner {
                 );
                 if let Some(rk) = partial_retry {
                     let _ = self.arm_background_disable_retry_immediate_with_kind(rk, post_now);
-                } else if !refused {
+                } else if !refused && frames_dispatched {
                     let _ = self.arm_background_disable_retry_with_kind(disable_kind, post_now);
+                } else if !frames_dispatched {
+                    self.clear_active_disable_retry_state();
                 }
                 let code = self.disable_step_failed_inner(e, partial_retry.is_some());
                 let failure = match code {
@@ -6218,6 +6226,7 @@ impl SupervisorInner {
 enum DisableExpiryDecision {
     Aborted,
     KeepDetachedDispatched,
+    KeepDetachedWithDeadline,
     ContendedRetry,
 }
 
@@ -6225,11 +6234,11 @@ impl SupervisorInner {
     /// Single locked decision for an expired non-protective disable (`LegacyWs` or `Detached`):
     /// - Protective disable -> never aborted (`KeepDetachedDispatched`).
     /// - Missing driver or poisoned lock -> clears transition + retry state (`Aborted`).
-    /// - Contended `try_lock()` -> keeps `Detached { deadline: Some(dl) }` pending without clearing
+    /// - Contended `try_with_mut` -> keeps `Detached { deadline: Some(dl) }` pending without clearing
     ///   retry state (`ContendedRetry`).
-    /// - Acquired single driver guard -> inspects `disable_frames_dispatched()` and, when
-    ///   undispatched, calls `abort_pending_disable()` under the SAME guard; clears retry state
-    ///   (including `active_disable_client_park`) ONLY on confirmed abort.
+    /// - Acquired single driver borrow -> clears `deadline` ONLY when `disable_frames_dispatched()`
+    ///   proves at least one disable frame was already sent; otherwise attempts
+    ///   `abort_pending_disable()` and keeps `deadline` intact if abort is refused.
     fn try_abort_expired_undispatched_disable(
         &mut self,
         kind: crate::driver::DisableKind,
@@ -6244,20 +6253,19 @@ impl SupervisorInner {
             });
             return DisableExpiryDecision::KeepDetachedDispatched;
         }
-        let torque_intent_off = self.torque_intent == TorqueIntent::Off;
         let Some(ref mut d) = self.driver else {
             self.clear_active_disable_retry_state();
             return DisableExpiryDecision::Aborted;
         };
         let decision = match d.try_with_mut(|drv| {
-            if torque_intent_off || drv.disable_frames_dispatched() {
+            if drv.disable_frames_dispatched() {
                 DisableExpiryDecision::KeepDetachedDispatched
             } else if drv.abort_pending_disable() {
                 DisableExpiryDecision::Aborted
             } else {
-                // Driver refused abort (e.g., driver-internal protective state); keep active
-                // without clearing retry state and without misclassifying as aborted.
-                DisableExpiryDecision::KeepDetachedDispatched
+                // Driver refused abort without proving dispatch; keep deadline intact so no first
+                // disable frame can ever transmit after request expiry.
+                DisableExpiryDecision::KeepDetachedWithDeadline
             }
         }) {
             Ok(dec) => dec,
@@ -6268,7 +6276,8 @@ impl SupervisorInner {
         };
         match decision {
             DisableExpiryDecision::Aborted => self.clear_active_disable_retry_state(),
-            DisableExpiryDecision::ContendedRetry => {
+            DisableExpiryDecision::ContendedRetry
+            | DisableExpiryDecision::KeepDetachedWithDeadline => {
                 self.torque_transition = Some(TorqueTransition::Disable {
                     origin: DisableOrigin::Detached { deadline },
                     kind,
@@ -6676,7 +6685,7 @@ impl SupervisorInner {
                     }
                 }
             };
-            if rt_executor_owned {
+            if rt_executor_owned || self.nonblocking_driver_release {
                 match d.try_with_mut(run_start) {
                     Ok(v) => v,
                     Err(crate::supervisor_lock::DriverTryError::WouldBlock) => {
@@ -7428,7 +7437,8 @@ impl SupervisorInner {
                             broker_owned: false,
                         });
                     }
-                    DisableExpiryDecision::ContendedRetry => {
+                    DisableExpiryDecision::ContendedRetry
+                    | DisableExpiryDecision::KeepDetachedWithDeadline => {
                         return Some(TransitionPoll {
                             progress: Ok(Rt::Pending { wake: budget.now }),
                             rx: None,
@@ -7549,6 +7559,7 @@ impl SupervisorInner {
                 let driver_supports_rt_executor = self.driver_supports_rt_executor;
                 let driver_supports_budgeted_disable_await = self.driver_supports_budgeted_disable_await;
                 let nonblocking_lock = rt_executor_owned
+                    || self.nonblocking_driver_release
                     || broker_owned
                     || matches!(origin, DisableOrigin::LegacyWs { .. } | DisableOrigin::Detached { .. });
                 let dof = self.config.dof;
@@ -7788,10 +7799,19 @@ impl SupervisorInner {
                                 frames_dispatched,
                                 partial_remaining,
                             );
+                            let allow_undispatched_retry = !matches!(
+                                origin,
+                                DisableOrigin::LegacyWs { .. }
+                                    | DisableOrigin::Detached { deadline: Some(_), .. }
+                            );
                             if let Some(rk) = partial_retry {
                                 let _ = self.arm_background_disable_retry_immediate_with_kind(rk, post_now);
-                            } else if !refused {
+                            } else if !refused
+                                && (frames_dispatched || is_protective || allow_undispatched_retry)
+                            {
                                 let _ = self.arm_background_disable_retry_with_kind(kind, post_now);
+                            } else if !frames_dispatched && !is_protective && !allow_undispatched_retry {
+                                self.clear_active_disable_retry_state();
                             }
                             let code = self.disable_step_failed_inner(e, partial_retry.is_some());
                             let text = if refused && !frames_dispatched {
