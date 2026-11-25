@@ -9263,6 +9263,7 @@ impl SupervisorInner {
         release_deadline: Option<Instant>,
         now_fn: &mut dyn FnMut() -> Instant,
     ) -> f64 {
+        let tick_wall_start = Instant::now();
         if release_deadline.is_some() {
             self.last_clock_now = Some(now_fn());
         }
@@ -9439,19 +9440,26 @@ impl SupervisorInner {
                 .as_ref()
                 .is_some_and(|d| d.as_legacy_lock().is_some())
         {
+            // Clamp commissioning strictly to BOTH `tick_wall_start + 1 ms` (keeping total legacy
+            // write-guard hold <= 2 ms) AND `release_deadline - publish_margin` (never overrunning
+            // the scheduled release cutoff).
             const LEGACY_COMMISSIONING_STEP_BUDGET: Duration = Duration::from_millis(1);
             let comm_now = Instant::now();
-            let comm_ctx = crate::rt_core::ops::CommitCtx {
-                arm: self.core.id(),
-                boot: crate::rt_core::broker::BootId::process(),
-                now: comm_now,
-                stop_generation: self.current_stop_gen(),
-            };
-            self.service_commissioning_release(
-                &comm_ctx,
-                comm_now + LEGACY_COMMISSIONING_STEP_BUDGET,
-                &Instant::now,
-            );
+            let mut comm_deadline = tick_wall_start + LEGACY_COMMISSIONING_STEP_BUDGET;
+            if let Some(rd) = release_deadline {
+                if let Some(rel_cap) = rd.checked_sub(margin_tick) {
+                    comm_deadline = comm_deadline.min(rel_cap);
+                }
+            }
+            if comm_now < comm_deadline {
+                let comm_ctx = crate::rt_core::ops::CommitCtx {
+                    arm: self.core.id(),
+                    boot: crate::rt_core::broker::BootId::process(),
+                    now: comm_now,
+                    stop_generation: self.current_stop_gen(),
+                };
+                self.service_commissioning_release(&comm_ctx, comm_deadline, &Instant::now);
+            }
         }
         let driver_torque_lost = rx.driver_torque_lost;
         let driver_enable_confirmed_ok = rx.driver_enable_confirmed_ok;
@@ -14652,14 +14660,19 @@ impl ArmSupervisor {
         op_id: u64,
         expected_seq: u64,
     ) -> (u64, bool) {
-        const LEGACY_HEADLESS_COMM_BUDGET: Duration = Duration::from_millis(1);
+        // Matches TQ-LOCK `FALLBACK_STEP_BUDGET` (500 us) so headless write-guard holds stay well
+        // below the <= 2 ms bound and carry full HoldIoScope attribution.
+        const LEGACY_HEADLESS_COMM_BUDGET: Duration = Duration::from_micros(500);
         let mut inner = self.inner.write().await;
+        let io_scope = crate::diagnostics::tick::HoldIoScope::enter();
         inner.set_command(crate::mit::TIMEOUT_PATH);
         if inner.detached
             || inner.control_release_seq != expected_seq
             || !inner.commissioning.is_running_op(op_id)
         {
-            return (inner.control_release_seq, false);
+            let seq = inner.control_release_seq;
+            inner.set_io_timing(io_scope.finish());
+            return (seq, false);
         }
         inner.control_release_seq = inner.control_release_seq.wrapping_add(1).max(1);
         inner
@@ -14681,6 +14694,7 @@ impl ArmSupervisor {
             step_now + LEGACY_HEADLESS_COMM_BUDGET,
             &Instant::now,
         );
+        inner.set_io_timing(io_scope.finish());
         (seq, true)
     }
 

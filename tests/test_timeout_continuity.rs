@@ -1089,9 +1089,14 @@ fn injected_1tick_tx_budget_squeeze_and_multi_tick_blackout_abort_zero_expiries(
             fx.core.safety.state()
         );
         assert_eq!(bus.total_expiries(), 0, "1-tick TX squeeze must produce 0 expiries");
+        let squeeze_gap = bus.max_arm_ctrl_gap();
+        assert!(
+            squeeze_gap <= MAX_ALLOWED_CTRL_GAP,
+            "1-tick TX squeeze arm control gap {squeeze_gap:?} exceeded 40 ms bound"
+        );
         println!(
             "[TIMEOUT-CONT 1-tick-squeeze] completed=true expiries=0 max_arm_ctrl_gap_ms={:.2}",
-            bus.max_arm_ctrl_gap().as_secs_f64() * 1e3
+            squeeze_gap.as_secs_f64() * 1e3
         );
     }
 

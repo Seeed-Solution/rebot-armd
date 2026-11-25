@@ -235,7 +235,10 @@ impl VirtualBusState {
             .iter()
             .position(|m| m.0 == id.wrapping_sub(0x100) || m.0 == id.wrapping_sub(0x300))
         {
-            if self.motors[k].3 {
+            let is_pos_vel_frame = self.motors[k].0 == id.wrapping_sub(0x100);
+            let mode_matches = (is_pos_vel_frame && self.motors[k].4 == damiao::CTRL_MODE_POS_VEL)
+                || (!is_pos_vel_frame && self.motors[k].4 == damiao::CTRL_MODE_POS_FORCE);
+            if self.motors[k].3 && mode_matches {
                 self.motors[k].2 =
                     f32::from_le_bytes([frame.data[0], frame.data[1], frame.data[2], frame.data[3]]);
                 self.motor_last_ctrl_at[k] = Some(now);
