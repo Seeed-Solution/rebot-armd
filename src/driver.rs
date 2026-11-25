@@ -2251,6 +2251,22 @@ impl<T: Transport> FeetechArmDriver<T> {
             }
             DisableKind::DisableProtective { .. } => {}
         }
+        // E3: Discard pending RX before transmitting (best-effort on protective cut so noisy RX
+        // never blocks a thermal/exit disable write).
+        match kind {
+            DisableKind::DisableRequested { .. } => {
+                self.discard_pending_rx_for_request()?;
+            }
+            DisableKind::DisableProtective { .. } => {
+                let _ = self.discard_pending_rx_for_request();
+            }
+        }
+        // B4: Recheck stopped state, 1 s request lifetime, and K=3 rest evidence IMMEDIATELY
+        // before mutating enable telemetry or transmitting `TORQUE_ENABLE = 0`, strictly AFTER
+        // any RX clear/drain inside the same function as the write.
+        if let DisableKind::DisableRequested { started_at, rollback } = kind {
+            self.check_stopped_disable_requested(started_at, rollback)?;
+        }
         // Invalidate per-motor torque windows immediately BEFORE the torque-changing write reaches
         // the transport; a gate refusal above leaves evidence intact. (Keep `rest_pose_window`
         // intact across the atomic multi-servo disable batch so servo 0's write does not poison
@@ -2258,9 +2274,6 @@ impl<T: Transport> FeetechArmDriver<T> {
         if let Some(idx) = self.servo_ids.iter().position(|&id| id == servo_id) {
             self.reported_enable[idx] = None;
         }
-        // E3: Discard pending RX before transmitting (best-effort on protective cut so noisy RX
-        // never blocks a thermal/exit disable write).
-        let _ = self.discard_pending_rx_for_request();
         let pkt = feetech::build_set_torque(servo_id, false);
         self.transport.write_all(&pkt)?;
         let _ = self.transport.flush();

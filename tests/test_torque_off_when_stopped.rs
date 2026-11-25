@@ -8278,3 +8278,198 @@ fn r11_b3_watchdog_normal_unload_enforces_rest_pose_gate_and_holds_on_refusal() 
         );
     }
 }
+
+/// R11 B4: Feetech `write_torque_off` must recheck stopped state, 1 s lifetime, and K=3 rest
+/// evidence IMMEDIATELY before transmitting `TORQUE_ENABLE = 0`, strictly AFTER any RX
+/// clear/drain inside the same function.
+/// 1. An E-stop latching during RX drain while the arm lacks rest evidence -> refuses with
+///    `TorqueOffWouldDrop` and writes ZERO `TORQUE_ENABLE = 0` packets.
+/// 2. Request lifetime expiring during RX drain while stopped at rest -> refuses with
+///    `DisableRequestExpired` and writes ZERO `TORQUE_ENABLE = 0` packets.
+#[test]
+fn r11_b4_feetech_disable_rechecks_stopped_state_and_rest_evidence_after_drain() {
+    use armd::driver::{ArmDriverError, DisableKind, FeetechArmDriver, StoppedDisableGate};
+    use armd::transport::MockTransport;
+
+    #[derive(Clone)]
+    struct DrainHookSerial {
+        inner: Arc<std::sync::Mutex<MockTransport>>,
+        on_clear: Arc<std::sync::Mutex<Option<Box<dyn FnMut() + Send>>>>,
+    }
+    impl armd::transport::Transport for DrainHookSerial {
+        fn write(&mut self, buf: &[u8]) -> Result<usize, armd::transport::TransportError> {
+            self.inner.lock().unwrap().write(buf)
+        }
+        fn write_all(&mut self, buf: &[u8]) -> Result<(), armd::transport::TransportError> {
+            self.inner.lock().unwrap().write_all(buf)
+        }
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, armd::transport::TransportError> {
+            self.inner.lock().unwrap().read(buf)
+        }
+        fn flush(&mut self) -> Result<(), armd::transport::TransportError> {
+            self.inner.lock().unwrap().flush()
+        }
+        fn clear_input_buffer(&mut self) {
+            self.inner.lock().unwrap().clear_input_buffer();
+            if let Some(ref mut hook) = *self.on_clear.lock().unwrap() {
+                hook();
+            }
+        }
+        fn clock(&self) -> Option<Arc<dyn armd::transport::DriverClock>> {
+            armd::transport::Transport::clock(&*self.inner.lock().unwrap())
+        }
+    }
+
+    let servo_ids: Vec<u8> = (1..=6).collect();
+    let cfg = feetech_6dof_config();
+    let sync_pos_req_1 = armd::protocol::feetech::build_sync_read(
+        &servo_ids[..3],
+        armd::protocol::feetech::REG_PRESENT_POSITION_L,
+        8,
+    )
+    .unwrap();
+    let sync_pos_req_2 = armd::protocol::feetech::build_sync_read(
+        &servo_ids[3..],
+        armd::protocol::feetech::REG_PRESENT_POSITION_L,
+        8,
+    )
+    .unwrap();
+
+    let make_gate = |stopped: bool| StoppedDisableGate {
+        safety_stopped: Arc::new(std::sync::atomic::AtomicBool::new(stopped)),
+        has_resting_pose: true,
+        arm_joints: {
+            let mut a = [0usize; armd::rt_core::mailbox::MAX_DOF];
+            for i in 0..5 {
+                a[i] = i;
+            }
+            a
+        },
+        arm_joints_len: 5,
+        rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+        rest_pose_tolerance_rad: cfg.rest_pose_tolerance_rad,
+    };
+
+    // Case 1: Operational arm at raised pose (no rest evidence); E-stop latches DURING the RX
+    // clear/drain inside `write_torque_off` -> post-drain recheck MUST refuse with 0 writes!
+    {
+        let clock = MockClock::new();
+        let serial_inner = Arc::new(std::sync::Mutex::new(
+            MockTransport::new().with_clock(clock.clone()),
+        ));
+        let on_clear: Arc<std::sync::Mutex<Option<Box<dyn FnMut() + Send>>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let estop_state = Arc::new(armd::rt_core::urgent::EstopState::new());
+        let raised_steps: [u16; 6] = [2600, 2048, 2048, 2048, 2048, 2048];
+        {
+            let mut ser = serial_inner.lock().unwrap();
+            ser.stage_reply(
+                &sync_pos_req_1,
+                &feetech_feedback_bytes(&servo_ids[..3], &raised_steps[..3]),
+            );
+            ser.stage_reply(
+                &sync_pos_req_2,
+                &feetech_feedback_bytes(&servo_ids[3..], &raised_steps[3..]),
+            );
+        }
+        let mut drv = FeetechArmDriver::new(
+            DrainHookSerial {
+                inner: Arc::clone(&serial_inner),
+                on_clear: Arc::clone(&on_clear),
+            },
+            servo_ids.clone(),
+        )
+        .with_calibrated(true)
+        .with_tx_echo(Some(false))
+        .with_gripper_index(Some(5));
+        drv.set_estop_state(Arc::clone(&estop_state));
+        drv.set_stopped_disable_gate(make_gate(false));
+        drv.read_joint_states().unwrap();
+        let _ = serial_inner.lock().unwrap().take_tx();
+
+        // Latch E-stop during `clear_input_buffer()` (between pre-drain check and `write_all`).
+        let estop_hook = Arc::clone(&estop_state);
+        *on_clear.lock().unwrap() = Some(Box::new(move || {
+            let _ = estop_hook.request_and_latch();
+        }));
+
+        let started_at = drv.clock_now();
+        let res = drv.disable_torque(DisableKind::DisableRequested {
+            started_at,
+            rollback: false,
+        });
+        assert!(
+            matches!(res, Err(ArmDriverError::TorqueOffWouldDrop)),
+            "B4: E-stop latching during RX drain without rest evidence must refuse with TorqueOffWouldDrop, got {res:?}"
+        );
+        let tx = serial_inner.lock().unwrap().take_tx();
+        assert_eq!(
+            spec_count_feetech_torque_off_writes(&tx),
+            0,
+            "B4: ZERO TORQUE_ENABLE=0 writes permitted when E-stop latches between drain and write"
+        );
+    }
+
+    // Case 2: Stopped arm at rest with K=3 evidence; 1 s lifetime expires DURING RX drain ->
+    // post-drain recheck MUST refuse with `DisableRequestExpired` and write ZERO packets!
+    {
+        let clock = MockClock::new();
+        let serial_inner = Arc::new(std::sync::Mutex::new(
+            MockTransport::new().with_clock(clock.clone()),
+        ));
+        let on_clear: Arc<std::sync::Mutex<Option<Box<dyn FnMut() + Send>>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let rest_steps: [u16; 6] = [2048; 6];
+        let mut drv = FeetechArmDriver::new(
+            DrainHookSerial {
+                inner: Arc::clone(&serial_inner),
+                on_clear: Arc::clone(&on_clear),
+            },
+            servo_ids.clone(),
+        )
+        .with_calibrated(true)
+        .with_tx_echo(Some(false))
+        .with_gripper_index(Some(5));
+        drv.set_stopped_disable_gate(make_gate(true));
+        for step in 0..3 {
+            if step > 0 {
+                clock.advance(Duration::from_millis(12));
+            }
+            {
+                let mut ser = serial_inner.lock().unwrap();
+                ser.stage_reply(
+                    &sync_pos_req_1,
+                    &feetech_feedback_bytes(&servo_ids[..3], &rest_steps[..3]),
+                );
+                ser.stage_reply(
+                    &sync_pos_req_2,
+                    &feetech_feedback_bytes(&servo_ids[3..], &rest_steps[3..]),
+                );
+            }
+            drv.read_joint_states().unwrap();
+        }
+        let _ = serial_inner.lock().unwrap().take_tx();
+
+        // Advance clock past 1 s request lifetime during `clear_input_buffer()`.
+        let clock_hook = clock.clone();
+        *on_clear.lock().unwrap() = Some(Box::new(move || {
+            clock_hook.advance(Duration::from_millis(1100));
+        }));
+
+        let started_at = drv.clock_now();
+        let res = drv.disable_torque(DisableKind::DisableRequested {
+            started_at,
+            rollback: false,
+        });
+        assert!(
+            matches!(res, Err(ArmDriverError::DisableRequestExpired)),
+            "B4: 1 s request expiry during RX drain must refuse with DisableRequestExpired, got {res:?}"
+        );
+        let tx = serial_inner.lock().unwrap().take_tx();
+        assert_eq!(
+            spec_count_feetech_torque_off_writes(&tx),
+            0,
+            "B4: ZERO TORQUE_ENABLE=0 writes permitted when 1 s lifetime expires between drain and write"
+        );
+    }
+}
