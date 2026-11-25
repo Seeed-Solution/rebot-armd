@@ -1064,6 +1064,11 @@ pub struct SupervisorInner {
     /// A motor zero runs (`crate::motor_zero`, with `calibration_busy`): torque on and
     /// clear_fault are refused too.
     pub motor_zero_busy: bool,
+    /// Active executor calibration transaction token bound to `calibration_busy` / `motor_zero_busy`
+    /// so stale cleanup can never clear a newer transaction's busy flags.
+    pub(crate) calibration_txn_id: Option<u64>,
+    /// True when startup found an incomplete or unreadable pending calibration commit marker.
+    pub(crate) calibration_quarantined: bool,
     /// Cached raw driver position limits (updated off-RT / on bounded driver-limit commits) so
     /// RT gripper calibration validation never acquires the driver mutex on `armd-control`.
     pub(crate) cached_driver_pos_limits: [Option<(f32, f32)>; crate::rt_core::mailbox::MAX_DOF],
@@ -2164,6 +2169,8 @@ impl SupervisorInner {
             hover_jobs: Vec::new(),
             calibration_busy: false,
             motor_zero_busy: false,
+            calibration_txn_id: None,
+            calibration_quarantined: false,
             cached_driver_pos_limits: [None; crate::rt_core::mailbox::MAX_DOF],
             calibration_load_error: None,
             joint_zero_offsets: vec![0.0; dof],
@@ -10545,6 +10552,7 @@ impl ArmSupervisor {
         // and drop any legacy retired fault Arcs off-thread before transferring ownership.
         Self::flush_legacy_estop_acks_into(&self.estop_reg, &mut guard);
         guard.safety.drain_retired_state_arcs_off_thread();
+        guard.tracking.normalize_spares_off_thread();
         guard.prepare_workspace_eval_bufs();
         guard.prepare_park_release_spare();
         guard.core.hub().set_motion_config(Arc::new(

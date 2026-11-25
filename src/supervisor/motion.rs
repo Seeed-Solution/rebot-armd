@@ -783,6 +783,18 @@ impl SupervisorInner {
             }
             return;
         }
+        if self.calibration_busy {
+            let msg = "calibration active";
+            let reason = crate::safety::BoundedText::new(msg);
+            self.watchdog_park_pending = None;
+            self.watchdog_park_blocked_reason = Some(crate::model::HolderLabel::new(msg));
+            self.safety.log_watchdog_park_blocked(reason);
+            self.stop_motion();
+            if self.is_torqued {
+                self.latch_watchdog_fault();
+            }
+            return;
+        }
         if !self.pending_normal_unload && self.watchdog_park_pending.is_none() {
             if !self.rt_executor_owned {
                 tracing::warn!("Watchdog park interrupted (safety state {:?})", self.safety.state());
@@ -863,6 +875,9 @@ impl SupervisorInner {
                 "configuration hold active"
             };
             return Some(BoundedText::new(msg));
+        }
+        if self.calibration_busy {
+            return Some(BoundedText::new("calibration active"));
         }
         let Some(policy) = &self.config.resting_pose else {
             return Some(BoundedText::new("no resting pose configured"));
@@ -1379,6 +1394,27 @@ impl SupervisorInner {
             return Some("a park is running");
         }
         self.busy_reason_static()
+    }
+
+    /// Same as [`Self::workspace_change_blocker_static`], excluding `self.calibration_busy`
+    /// for checks made by the active calibration transaction that already owns `calibration_busy`.
+    pub(crate) fn workspace_change_blocker_for_calibration_static(&self) -> Option<&'static str> {
+        if self.macro_run.is_some() { return Some("a macro action is running"); }
+        if self.pending_normal_unload || self.park_continuation.is_some() || self.park_disable_in_flight() {
+            return Some("a park is running");
+        }
+        if self.macro_run.as_ref().is_some_and(|m| m.finishing) {
+            return Some("macro finishing hold pending bus acceptance");
+        }
+        if self.zero_check_persisting.is_some() { return Some("gripper calibration is being persisted"); }
+        #[cfg(feature = "policy-runtime")]
+        if self.policy_loading { return Some("a policy is loading"); }
+        #[cfg(feature = "policy-runtime")]
+        if self.policy_run.is_some() { return Some("a policy run is active"); }
+        if self.active_trajectory.is_some() { return Some("a trajectory is running"); }
+        if self.servo_target.is_some() { return Some("servo streaming is active"); }
+        if self.commanded_velocities.iter().any(|v| v.abs() >= 1e-3) { return Some("the arm is still moving"); }
+        None
     }
 
     pub(crate) fn busy_reason_static(&self) -> Option<&'static str> {
