@@ -912,8 +912,6 @@ pub struct SupervisorInner {
     /// Immutable driver capability cache captured on [`Self::install_driver`] so capability checks
     /// never lock `self.driver` or mistake mutex contention for missing capability.
     pub(crate) driver_has_load_feedback: bool,
-    pub(crate) driver_supports_rt_executor: bool,
-    pub(crate) driver_supports_budgeted_disable_await: bool,
     /// True for the duration of a legacy control release servicing an in-flight non-broker torque
     /// transition so every driver lock acquisition (`lock_driver_for_tick`) stays non-blocking.
     pub(crate) nonblocking_driver_release: bool,
@@ -2305,8 +2303,6 @@ impl SupervisorInner {
             legacy_torque_seq: 0,
             legacy_torque_slots: std::array::from_fn(|_| Arc::new(driver_transitions::LegacyTorqueSlot::new())),
             driver_has_load_feedback: false,
-            driver_supports_rt_executor: false,
-            driver_supports_budgeted_disable_await: false,
             nonblocking_driver_release: false,
             legacy_torque_settled_this_tick: false,
             detached_torque_pending_atomic: Arc::new(AtomicBool::new(false)),
@@ -6635,8 +6631,6 @@ impl SupervisorInner {
         let caps = driver.capabilities();
         self.driver_has_torque_feedback = caps.torque_feedback;
         self.driver_has_load_feedback = caps.load_feedback;
-        self.driver_supports_rt_executor = driver.supports_rt_executor().is_ok();
-        self.driver_supports_budgeted_disable_await = driver.supports_budgeted_disable_await();
         if let Some(pf) = self
             .config
             .gripper_index()
@@ -8485,6 +8479,17 @@ impl SupervisorInner {
         self.tick_control_inner(dt, None, now_fn)
     }
 
+    /// Zero-lock immutable borrow in `DriverSlot::Exclusive`; non-blocking `try_with_ref` in
+    /// `DriverSlot::Legacy` to check `supports_rt_executor()` without invoking it during
+    /// `install_driver` (preserves handover-preflight stall test semantics).
+    #[inline]
+    pub(crate) fn driver_supports_rt_executor_nonblocking(&self) -> bool {
+        self.driver.as_ref().is_some_and(|d| {
+            d.try_with_ref(|drv| drv.supports_rt_executor().is_ok())
+                .unwrap_or(false)
+        })
+    }
+
     /// Zero-lock immutable borrow in `DriverSlot::Exclusive`; non-blocking `try_read` when
     /// `rt_executor_owned` or `nonblocking_driver_release` in `DriverSlot::Legacy`; blocking
     /// `read` on ordinary legacy releases.
@@ -8679,7 +8684,7 @@ impl SupervisorInner {
                 };
                 let trans = self.service_torque_transition(&budget);
                 let transition_rx = trans.and_then(|tp| tp.rx);
-                if self.driver_supports_rt_executor {
+                if self.driver_supports_rt_executor_nonblocking() {
                     let after = Instant::now();
                     let rem_budget = crate::rt_core::ops::ServiceBudget {
                         now: after,
@@ -14783,7 +14788,7 @@ impl ArmSupervisor {
                     let tick_seq_counter = Arc::clone(&inner.control_release_seq_atomic);
                     let last_tick_seq = tick_seq_counter.load(Ordering::Acquire);
                     let res = if enabled {
-                        if inner.driver.is_some() && !inner.driver_supports_rt_executor {
+                        if inner.driver.is_some() && !inner.driver_supports_rt_executor_nonblocking() {
                             // Serial & RobStride drivers stay on the untouched synchronous
                             // `enable_torque` path (full bus read, calibration, range check, and
                             // measured-goal pre-seed with blocking driver lock).
@@ -14881,9 +14886,15 @@ impl ArmSupervisor {
                 //   re-verifies `inner.control_release_seq == last_tick_seq` under the write guard
                 //   so a live control tick that ran while queued keeps single progress ownership.
                 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(5);
-                const FALLBACK_STEP_INTERVAL: Duration = Duration::from_millis(25);
+                // Wait > one 50 Hz period (25 ms) before assuming headless mode (no live ticker);
+                // once confirmed headless, step every 5 ms so multi-phase Damiao POS_FORCE
+                // handshakes complete well inside phase/freshness bounds while still keeping every
+                // write guard <= 500 us and yielding immediately if a live ticker resumes.
+                const FALLBACK_IDLE_DETECT: Duration = Duration::from_millis(25);
+                const FALLBACK_HEADLESS_INTERVAL: Duration = Duration::from_millis(5);
                 const FALLBACK_STEP_BUDGET: Duration = Duration::from_micros(500);
                 let mut last_fallback_step = Instant::now();
+                let mut headless_active = false;
 
                 let outcome = loop {
                     if let Some(done) = slot.take_settled(token) {
@@ -14933,19 +14944,26 @@ impl ArmSupervisor {
                         break done;
                     }
                     let cur_tick_seq = tick_seq_counter.load(Ordering::Acquire);
+                    let step_interval = if headless_active {
+                        FALLBACK_HEADLESS_INTERVAL
+                    } else {
+                        FALLBACK_IDLE_DETECT
+                    };
                     if cur_tick_seq != last_tick_seq {
                         last_tick_seq = cur_tick_seq;
                         last_fallback_step = Instant::now();
-                    } else if last_fallback_step.elapsed() >= FALLBACK_STEP_INTERVAL
+                        headless_active = false;
+                    } else if last_fallback_step.elapsed() >= step_interval
                         && Instant::now() < deadline
                     {
                         last_fallback_step = Instant::now();
-                        let (expired_out, needs_headless_drain, settled_any, observed_seq) = {
+                        let (expired_out, needs_headless_drain, settled_any, observed_seq, did_headless_step) = {
                             let mut inner = self.inner.write().await;
                             let io_scope = crate::diagnostics::tick::HoldIoScope::enter();
                             inner.set_command("/api/v1/torque");
                             inner.set_direction(if enabled { "on" } else { "off" });
                             let step_now = Instant::now();
+                            let mut stepped = false;
                             let out = if step_now >= deadline {
                                 Some(if inner.detached {
                                     slot.take_settled(token)
@@ -14957,17 +14975,25 @@ impl ArmSupervisor {
                                 })
                             } else {
                                 // Re-verify under the write guard that no live control tick ran
-                                // while we waited to acquire `SupervisorLock::write`.
+                                // while we waited to acquire `SupervisorLock::write`, then advance
+                                // `control_release_seq` so Damiao's per-release TX budget refreshes
+                                // cleanly on each headless fallback step.
                                 if !inner.detached
                                     && inner.control_release_seq == last_tick_seq
                                     && inner.has_legacy_torque_transition_token(token)
                                 {
+                                    inner.control_release_seq =
+                                        inner.control_release_seq.wrapping_add(1).max(1);
+                                    inner
+                                        .control_release_seq_atomic
+                                        .store(inner.control_release_seq, Ordering::Release);
                                     let budget = crate::rt_core::ops::ServiceBudget {
                                         now: step_now,
                                         deadline: step_now + FALLBACK_STEP_BUDGET,
                                         max_rx_frames: crate::rt_core::ops::RX_FRAME_BUDGET,
                                     };
                                     let _ = inner.service_torque_transition(&budget);
+                                    stepped = true;
                                 }
                                 None
                             };
@@ -14977,7 +15003,7 @@ impl ArmSupervisor {
                                 std::mem::replace(&mut inner.legacy_torque_settled_this_tick, false);
                             let seq = inner.control_release_seq;
                             inner.set_io_timing(io_scope.finish());
-                            (out, needs_drain, settled_any, seq)
+                            (out, needs_drain, settled_any, seq, stepped)
                         };
                         if settled_any {
                             self.legacy_torque_notify.notify_waiters();
@@ -14989,6 +15015,7 @@ impl ArmSupervisor {
                             slot_guard.consumed = true;
                             break done;
                         }
+                        headless_active = did_headless_step;
                         last_tick_seq = observed_seq;
                     }
                 };

@@ -4218,6 +4218,7 @@ impl SupervisorInner {
                 let mut scratch_bounds = std::mem::take(&mut self.scratch.fb.bounds);
                 let dof = self.config.dof;
                 let feedback_numeric_valid = self.feedback_numeric_valid;
+                let control_release_seq = self.control_release_seq;
                 let owner_now = match reducer.origin {
                     EnableOrigin::LegacyWs { .. } => Instant::now(),
                     _ => budget.map_or_else(Instant::now, |b| b.now),
@@ -4234,6 +4235,9 @@ impl SupervisorInner {
                 let lock_res = {
                     let d = self.driver.as_mut().expect("checked is_some");
                     let run_poll = |drv: &mut dyn crate::driver::ArmDriver| {
+                        if control_release_seq > 0 {
+                            drv.begin_control_release(control_release_seq);
+                        }
                         let caps = drv.capabilities();
                         let enable_fb = caps.enable_feedback;
                         let temp_fb = caps.temperature_feedback;
@@ -5452,7 +5456,7 @@ impl SupervisorInner {
         let budgeted = !allow_legacy_fallback
             || self.rt_executor_owned
             || self.driver.is_none()
-            || self.driver_supports_rt_executor;
+            || self.driver_supports_rt_executor_nonblocking();
         Ok(
             match self.start_enable_reducer(
                 origin,
@@ -5870,7 +5874,7 @@ impl SupervisorInner {
             admitted_epoch: s.estop_epoch,
         };
         let prev_torque_intent = this.torque_intent;
-        let budgeted = this.driver.is_none() || this.driver_supports_rt_executor;
+        let budgeted = this.driver.is_none() || this.driver_supports_rt_executor_nonblocking();
         let origin = EnableOrigin::LegacyWs {
             token,
             slot: slot_idx,
@@ -6037,8 +6041,6 @@ impl SupervisorInner {
             });
         }
 
-        let use_budgeted =
-            self.driver_supports_rt_executor || self.driver_supports_budgeted_disable_await;
         let dof = self.config.dof;
         let feedback_numeric_valid = self.feedback_numeric_valid;
         let measured_positions = &self.measured_positions;
@@ -6059,6 +6061,7 @@ impl SupervisorInner {
                     let step_budget = deadline
                         .saturating_duration_since(Instant::now())
                         .min(Duration::from_millis(1));
+                    let use_budgeted = drv.supports_rt_executor().is_ok();
                     drv.set_tx_release_deadline(Some(requested_at + step_budget));
                     let res = if use_budgeted {
                         drv.begin_disable_torque_budgeted(disable_kind, 0)
@@ -7556,8 +7559,6 @@ impl SupervisorInner {
                     matches!(kind, crate::driver::DisableKind::DisableProtective { .. });
                 let control_release_seq = self.control_release_seq;
                 let rt_executor_owned = self.rt_executor_owned;
-                let driver_supports_rt_executor = self.driver_supports_rt_executor;
-                let driver_supports_budgeted_disable_await = self.driver_supports_budgeted_disable_await;
                 let nonblocking_lock = rt_executor_owned
                     || self.nonblocking_driver_release
                     || broker_owned
@@ -7595,8 +7596,7 @@ impl SupervisorInner {
                         }
                         let use_budgeted = broker_owned
                             || rt_executor_owned
-                            || driver_supports_rt_executor
-                            || driver_supports_budgeted_disable_await;
+                            || drv.supports_rt_executor().is_ok();
                         let r = if use_budgeted {
                             drv.poll_torque_budgeted(drv_now + eff_span, budget.max_rx_frames)
                         } else {

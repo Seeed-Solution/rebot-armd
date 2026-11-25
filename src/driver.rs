@@ -12895,7 +12895,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     }
 
     fn supports_budgeted_disable_await(&self) -> bool {
-        self.can.supports_nonblocking_rt()
+        true
     }
 
     fn set_enable_authority(&mut self, deadline: Option<Instant>, expected_lease_gen: Option<u64>) {
