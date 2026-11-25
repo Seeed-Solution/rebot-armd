@@ -398,11 +398,19 @@ where
         // A confirmed-safe exit must not wait indefinitely on connected WebSockets.
         server_handle.abort();
         supervisor.signal_legacy_stop(&control_stop);
+        #[cfg(not(target_arch = "wasm32"))]
+        supervisor
+            .torque_shadow_hub()
+            .stop_and_flush_bounded(Duration::from_millis(100));
         info!("armd stopped after shutdown readiness confirmation");
         return Ok(());
     }
 
     server_handle.abort();
+    #[cfg(not(target_arch = "wasm32"))]
+    supervisor
+        .torque_shadow_hub()
+        .stop_and_flush_bounded(Duration::from_millis(100));
     info!("armd stopped after shutdown readiness confirmation");
     Ok(())
 }
@@ -662,6 +670,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let outcome = control_supervisor
                             .attempt_legacy_panic_disable(armd::supervisor::PANIC_DISABLE_TIMEOUT);
                         outcome.log("Legacy control thread panic", armd::supervisor::PANIC_DISABLE_TIMEOUT);
+                        #[cfg(not(target_arch = "wasm32"))]
+                        control_supervisor
+                            .torque_shadow_hub()
+                            .stop_and_flush_bounded(Duration::from_millis(100));
                         armd::diagnostics::logwriter::flush_all(Duration::from_millis(500));
                         std::process::exit(1);
                     }

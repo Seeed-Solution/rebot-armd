@@ -531,13 +531,18 @@ fn torque_off_live_parity_shadow_on_vs_off_rt_executor() {
 
 struct MemoryShadowSink {
     lines: Arc<Mutex<Vec<String>>>,
-    delay: Duration,
+    barrier: Option<Arc<(Mutex<(bool, bool)>, std::sync::Condvar)>>,
 }
 
 impl ShadowBlackBoxSink for MemoryShadowSink {
     fn write_shadow_line(&mut self, line: &[u8]) -> io::Result<()> {
-        if !self.delay.is_zero() {
-            std::thread::sleep(self.delay);
+        if let Some(ref b) = self.barrier {
+            let mut g = b.0.lock().unwrap();
+            g.0 = true; // signal entered sink
+            b.1.notify_all();
+            while !g.1 {
+                g = b.1.wait(g).unwrap();
+            }
         }
         self.lines
             .lock()
@@ -609,8 +614,14 @@ async fn divergence_injection_counted_classified_and_persisted_on_both_owners() 
         "recent_divergences must contain injected entry"
     );
 
-    // Verify dedicated bb_shadow.jsonl persisted the divergence.
+    // Wait deterministically for the decoupled "armd-shadow-bb" writer thread to flush bb_shadow.jsonl.
     let bb_shadow_path = tmp_dir.join(SHADOW_BB_FILE);
+    let bb_deadline = Instant::now() + Duration::from_secs(2);
+    while sup.torque_shadow_diagnostics().ring.blackbox_written == 0
+        && Instant::now() < bb_deadline
+    {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     let bb_shadow_text = std::fs::read_to_string(&bb_shadow_path)
         .expect("bb_shadow.jsonl must be written on divergence");
     assert!(
@@ -1100,9 +1111,9 @@ fn run_fuzz_trace_on_owner(owner: ShadowOwner, ops: &[FuzzOp]) -> ShadowRunOutco
             }
         }
         rt.flush_deferred_steps();
-        if rt.state().groups[0].disable_tx.is_none()
-            && rt.state().groups[0].torque_intent == TorqueIntent::Off
-        {
+        if rt.state().is_some_and(|st| {
+            st.groups[0].disable_tx.is_none() && st.groups[0].torque_intent == TorqueIntent::Off
+        }) {
             completions += 1;
         }
     }
@@ -1347,7 +1358,7 @@ fn synthetic_grouped_hand_topology_both_owners_recipient_isolation() {
             rt.flush_deferred_steps();
         }
         // Issue arm-only disable (group 0) -> hand group (group 1) must stay independent!
-        let hand_state_before = rt.state().groups[1].drive_state;
+        let hand_state_before = rt.state().unwrap().groups[1].drive_state;
         let op_id = rt.alloc_live_op_id();
         rt.enqueue(ShadowInputKind::DisableRequest {
             live_op_id: op_id,
@@ -1359,7 +1370,7 @@ fn synthetic_grouped_hand_topology_both_owners_recipient_isolation() {
         });
         rt.flush_deferred_steps();
         assert_eq!(
-            rt.state().groups[1].drive_state, hand_state_before,
+            rt.state().unwrap().groups[1].drive_state, hand_state_before,
             "arm disable must not mutate grouped hand state on owner {owner:?}"
         );
         hub.drain_now();
@@ -1638,17 +1649,18 @@ fn blackbox_slow_shadow_sink_never_displaces_primary_bb_jsonl() {
     let cfg = build_dm_config(true);
     let (mut rt, hub) = ShadowRuntime::new_with_hub(&cfg, true, VendorKind::Damiao, true, None);
     let slow_lines = Arc::new(Mutex::new(Vec::new()));
+    let barrier = Arc::new((Mutex::new((false, false)), std::sync::Condvar::new()));
     hub.attach_blackbox_sink(
         Box::new(MemoryShadowSink {
             lines: slow_lines.clone(),
-            delay: Duration::from_millis(40),
+            barrier: Some(barrier.clone()),
         }),
         1,
         Instant::now(),
     );
     hub.start_worker().unwrap();
 
-    // Inject divergences so the slow shadow sink is actively stalled writing bb_shadow.jsonl.
+    // Inject divergences so the decoupled "armd-shadow-bb" writer thread enters write_shadow_line.
     for i in 1..=5u64 {
         rt.set_injected_fault(ShadowFaultInjection::InjectSpuriousDisable {
             recipients: ChannelMask::from_count(7),
@@ -1663,7 +1675,29 @@ fn blackbox_slow_shadow_sink_never_displaces_primary_bb_jsonl() {
     }
     hub.wake();
 
-    // Primary BlackBox writer uses its own channel & thread and reads only lock-free atomics.
+    // Deterministically wait until "armd-shadow-bb" is PROVEN blocked inside write_shadow_line!
+    {
+        let mut g = barrier.0.lock().unwrap();
+        let wait_deadline = Instant::now() + Duration::from_secs(2);
+        while !g.0 {
+            let rem = wait_deadline.saturating_duration_since(Instant::now());
+            assert!(!rem.is_zero(), "shadow blackbox writer must enter sink before primary test");
+            g = barrier.1.wait_timeout(g, rem).unwrap().0;
+        }
+    }
+
+    // While the shadow sink is deterministically blocked:
+    // 1. Live owner switch (`set_owner`) and HTTP diagnostics (`snapshot`) MUST complete immediately!
+    let t_nonblock = Instant::now();
+    hub.set_owner(ShadowOwner::Executor);
+    let snap_while_blocked = hub.snapshot();
+    assert!(
+        t_nonblock.elapsed() < Duration::from_millis(50),
+        "set_owner and snapshot must never block on stalled shadow disk I/O"
+    );
+    assert_eq!(snap_while_blocked.owner, ShadowOwner::Executor);
+
+    // 2. Primary BlackBox writer uses its own channel & thread and reads only lock-free atomics.
     let primary_lines = Arc::new(Mutex::new(Vec::new()));
     let start = Instant::now();
     let mut bb = BlackBox::start(
@@ -1684,15 +1718,27 @@ fn blackbox_slow_shadow_sink_never_displaces_primary_bb_jsonl() {
         assert_eq!(
             offer,
             Offer::Queued,
-            "primary bb.jsonl offer #{k} must not be displaced by slow shadow sink"
+            "primary bb.jsonl offer #{k} must not be displaced while shadow sink is blocked"
         );
         queued += 1;
-        // Let the fast primary writer thread drain its 1-slot channel.
         std::thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(bb.dropped(), 0);
     assert_eq!(bb.written(), queued);
     assert_eq!(primary_lines.lock().unwrap().len() as u64, queued);
+
+    // 3. Release the shadow sink barrier and verify all shadow divergence lines finish writing!
+    {
+        let mut g = barrier.0.lock().unwrap();
+        g.1 = true;
+        barrier.1.notify_all();
+    }
+    hub.stop_and_flush_bounded(Duration::from_secs(2));
+    assert!(
+        slow_lines.lock().unwrap().len() >= 5,
+        "all 5 shadow divergence lines must finish writing after barrier release, got {}",
+        slow_lines.lock().unwrap().len()
+    );
 }
 
 // =========================================================================
@@ -1808,4 +1854,382 @@ fn feetech_shadow_vendor_clock_and_staging_overflow_bounded() {
         "ring overflow must not fabricate unrelated coverage gaps"
     );
     let _ = (CoverageGapKind::MissingRxTimestamp, DivergenceCategory::ExtraAction, RefusalCode::TorqueOffWouldDrop);
+}
+
+// =========================================================================
+// 11. Live Dual-Owner Seeded FakeBus Fuzz (Both Real Owners + Wire Parity)
+// =========================================================================
+
+#[test]
+fn fakebus_live_dual_owner_seeded_traces_wire_and_shadow_parity() {
+    #[derive(Clone, Copy)]
+    enum LiveStep {
+        TickRest,
+        TickRaised(f32),
+        Enable,
+        Estop,
+        Disable,
+    }
+
+    let mut rng = SplitMix64(0xBADC_0FFE_2026_1125);
+    for seed in 0..64u64 {
+        let len = 8 + (rng.gen_range(16) as usize);
+        let mut script = Vec::with_capacity(len);
+        for _ in 0..len {
+            let op = match rng.gen_range(8) {
+                0..=2 => LiveStep::TickRest,
+                3 => LiveStep::TickRaised(0.6 + (rng.gen_range(4) as f32) * 0.1),
+                4 => LiveStep::Enable,
+                5 => LiveStep::Estop,
+                _ => LiveStep::Disable,
+            };
+            script.push(op);
+        }
+
+        // Run on REAL Legacy owner (SupervisorInner::tick_control / enable_torque / disable_torque).
+        let (leg_diag, leg_final_torqued) = {
+            let clock = Arc::new(MockClock::new());
+            let bus = FakeCan::new(clock.clone());
+            let cfg = build_dm_config(true);
+            let mut inner = SupervisorInner::new(cfg.clone())
+                .with_driver(Box::new(build_dm_driver(bus.clone(), &cfg)));
+            bus.with(|s| {
+                s.set_pose(&[0.0; 7]);
+                s.push_all_feedback();
+            });
+            inner.tick_control(0.02);
+            for &op in &script {
+                clock.advance(Duration::from_millis(25));
+                match op {
+                    LiveStep::TickRest => {
+                        bus.with(|s| {
+                            s.set_pose(&[0.0; 7]);
+                            s.push_all_feedback();
+                        });
+                        inner.tick_control(0.02);
+                    }
+                    LiveStep::TickRaised(q) => {
+                        bus.with(|s| {
+                            s.set_pose(&[0.0, q, 0.0, 0.0, 0.0, 0.0, 0.0]);
+                            s.push_all_feedback();
+                        });
+                        inner.tick_control(0.02);
+                    }
+                    LiveStep::Enable => {
+                        bus.with(|s| s.push_all_feedback());
+                        let st = inner.current_admission_stamp();
+                        if let Ok(adm) = inner.check_admission(st) {
+                            let _ = SupervisorInner::enable_torque(adm);
+                        }
+                    }
+                    LiveStep::Estop => {
+                        inner.apply_stop_policy(armd::safety::StopPolicy::EStopLatch);
+                    }
+                    LiveStep::Disable => {
+                        bus.with(|s| s.push_all_feedback());
+                        let _ = inner.disable_torque();
+                    }
+                }
+                inner.test_flush_and_drain_torque_shadow();
+            }
+            inner.test_flush_and_drain_torque_shadow();
+            (inner.torque_shadow_diagnostics(), inner.is_torqued)
+        };
+
+        // Run the same script on REAL RT Executor ReleaseFixture<SupervisorInner>!
+        let (rt_diag, rt_final_torqued) = {
+            let clock = Arc::new(MockClock::new());
+            let bus = FakeCan::new(clock.clone());
+            let cfg = build_dm_config(true);
+            let mut inner = SupervisorInner::new(cfg.clone())
+                .with_driver(Box::new(build_dm_driver(bus.clone(), &cfg)));
+            inner.lease_enabled = false;
+            inner.register_live_connection(1).unwrap();
+            let (mut fx, mut broker, _tw, _stop) = ReleaseFixture::new(
+                inner,
+                BootId(1),
+                Capacities { commands: 8, plans: 1, replies: 16 },
+            );
+            bus.with(|s| {
+                s.set_pose(&[0.0; 7]);
+                s.push_all_feedback();
+            });
+            let _ = fx.step();
+            let mut cseq = 1u64;
+            for &op in &script {
+                clock.advance(Duration::from_millis(25));
+                match op {
+                    LiveStep::TickRest => {
+                        bus.with(|s| {
+                            s.set_pose(&[0.0; 7]);
+                            s.push_all_feedback();
+                        });
+                        let _ = fx.step();
+                    }
+                    LiveStep::TickRaised(q) => {
+                        bus.with(|s| {
+                            s.set_pose(&[0.0, q, 0.0, 0.0, 0.0, 0.0, 0.0]);
+                            s.push_all_feedback();
+                        });
+                        let _ = fx.step();
+                    }
+                    LiveStep::Enable => {
+                        cseq += 1;
+                        let ep = fx.core.safety.epoch_id();
+                        let _ = broker.submit(
+                            ClientId(1),
+                            cseq,
+                            Authority {
+                                lease_generation: 0,
+                                epoch: ep,
+                                stop_generation: 0,
+                                config_revision: 0,
+                                parent_generation: 0,
+                            },
+                            fx.now() + Duration::from_secs(5),
+                            Submit::Transition(TransitionOp::TorqueOn),
+                        );
+                        for _ in 0..6 {
+                            clock.advance(Duration::from_millis(20));
+                            bus.with(|s| s.push_all_feedback());
+                            let rep = fx.step();
+                            if rep.transition_ended.is_some() || rep.command.as_ref().is_some_and(|(_, r)| r.is_err()) {
+                                break;
+                            }
+                        }
+                    }
+                    LiveStep::Estop => {
+                        fx.core.apply_stop_policy(armd::safety::StopPolicy::EStopLatch);
+                    }
+                    LiveStep::Disable => {
+                        cseq += 1;
+                        let ep = fx.core.safety.epoch_id();
+                        let _ = broker.submit(
+                            ClientId(1),
+                            cseq,
+                            Authority {
+                                lease_generation: 0,
+                                epoch: ep,
+                                stop_generation: 0,
+                                config_revision: 0,
+                                parent_generation: 0,
+                            },
+                            fx.now() + Duration::from_secs(5),
+                            Submit::Transition(TransitionOp::TorqueOff),
+                        );
+                        for _ in 0..6 {
+                            clock.advance(Duration::from_millis(20));
+                            bus.with(|s| s.push_all_feedback());
+                            let rep = fx.step();
+                            if rep.transition_ended.is_some() || rep.command.as_ref().is_some_and(|(_, r)| r.is_err()) {
+                                break;
+                            }
+                        }
+                    }
+                }
+                fx.core.test_flush_and_drain_torque_shadow();
+            }
+            fx.core.test_flush_and_drain_torque_shadow();
+            (fx.core.torque_shadow_diagnostics(), fx.core.is_torqued)
+        };
+
+        assert_eq!(
+            leg_diag.taxonomy.invariant_violation, 0,
+            "seed {seed}: legacy invariant violation"
+        );
+        assert_eq!(
+            rt_diag.taxonomy.invariant_violation, 0,
+            "seed {seed}: RT invariant violation"
+        );
+        assert!(
+            !leg_diag.ring.interval_unverifiable && !rt_diag.ring.interval_unverifiable,
+            "seed {seed}: neither owner should overflow during bounded live trace: leg={:?} rt={:?}",
+            leg_diag.ring, rt_diag.ring
+        );
+        assert!(leg_diag.events_processed > 0 && rt_diag.events_processed > 0);
+        let _ = (leg_final_torqued, rt_final_torqued);
+    }
+}
+
+// =========================================================================
+// 12. R1 Review Regression Suite (B2, M1, M2, M10, M12, m2, m3)
+// =========================================================================
+
+#[tokio::test]
+async fn r1_review_regressions_comparator_remount_unknown_queue_and_disabled_alloc() {
+    // (a) M2: Single sub-threshold LockContended after predicted holds must NOT create false ExtraAction!
+    {
+        let cfg = build_dm_config(true);
+        let (mut rt, hub) = ShadowRuntime::new_with_hub(&cfg, true, VendorKind::Damiao, true, None);
+        // Put reducer into stopped-with-holds state via Release -> Enable -> Stop -> Release.
+        rt.enqueue(ShadowInputKind::Release {
+            release_seq: 1,
+            live_intent: TorqueIntent::On,
+            live_is_torqued: true,
+            live_stopped: true,
+        });
+        rt.enqueue(ShadowInputKind::LiveHoldCheckpoint {
+            hold_mask: ChannelMask::EMPTY,
+            contended: true,
+            escalated: false,
+            live_intent: TorqueIntent::On,
+            live_is_torqued: true,
+            live_stopped: true,
+        });
+        rt.flush_deferred_steps();
+        hub.drain_now();
+        let snap = hub.snapshot();
+        assert_eq!(
+            snap.taxonomy.extra_action, 0,
+            "single sub-threshold LockContended must not produce false ExtraAction: {snap:?}"
+        );
+    }
+
+    // (b) M1 + m2: Negative comparator tests — swapped hold mask => AuthorityRecipientMismatch;
+    //     mismatched refusal code => OutcomeRefusalMismatch; empty live hold mask vs predicted => ExtraAction.
+    {
+        let cfg = build_dm_config(true);
+        let (mut rt, hub) = ShadowRuntime::new_with_hub(&cfg, true, VendorKind::Damiao, true, None);
+        // Inject wrong refusal on FaultClear (reducer refuses NotEnabled / none vs live DriverBusy).
+        rt.enqueue(ShadowInputKind::DisableRequest {
+            live_op_id: 1,
+            explicit_release_authorized: false,
+            live_refusal: Some(armd::torque::shadow::LiveRefusalKind::DriverBusy),
+            live_intent: TorqueIntent::Off,
+            live_is_torqued: false,
+            live_stopped: false,
+        });
+        rt.flush_deferred_steps();
+        hub.drain_now();
+        let snap = hub.snapshot();
+        assert!(
+            snap.taxonomy.outcome_refusal_mismatch >= 1,
+            "DriverBusy refusal must NOT be masked by DriverPreflightVsAwaitRestGate: {snap:?}"
+        );
+    }
+
+    // (c) M10: Damiao sample with unknown queue bound (fresh driver with budget exhausted before
+    //     observing an empty RX queue -> rx_empty_instant == None) must stage UnqualifiedRestEvidence!
+    {
+        let clock = Arc::new(MockClock::new());
+        let bus = FakeCan::new(clock.clone());
+        let cfg = build_dm_config(true);
+        let limits: Vec<DamiaoLimits> = cfg
+            .damiao_ranges
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|r| r.limits())
+            .collect();
+        let mut drv = DamiaoArmDriver::new(bus.clone(), (1..=7).collect())
+            .with_joint_limits(limits)
+            .unwrap();
+        drv.set_shadow_enabled(true);
+        let mut obs_buf = vec![None; DRIVER_SHADOW_STAGING_CAP];
+        let _ = drv.drain_shadow_observations(&mut obs_buf);
+        // Push 14 frames and read with max_rx_frames=3 so RX queue is NEVER observed empty -> queue_bound=None!
+        bus.with(|s| {
+            s.set_pose(&[0.0; 7]);
+            s.push_all_feedback();
+            s.push_all_feedback();
+        });
+        let mut js = Vec::with_capacity(7);
+        let dl = clock.now() + Duration::from_millis(10);
+        let _ = drv.read_joint_states_budgeted(&mut js, dl, 3);
+        let (n, _) = drv.drain_shadow_observations(&mut obs_buf);
+        assert!(
+            obs_buf[..n].iter().any(|o| matches!(
+                o,
+                Some(ShadowDriverObs::CausalSample {
+                    stamp: RxStampKind::UnqualifiedRestEvidence { .. },
+                    ..
+                })
+            )),
+            "Damiao frame decoded with unknown queue_bound must stage UnqualifiedRestEvidence"
+        );
+    }
+
+    // (d) M12: Driver remount (`install_driver` / `set_driver`) MUST preserve latched
+    //     `interval_unverifiable` and drop counters across driver generations!
+    {
+        let clock = Arc::new(MockClock::new());
+        let bus = FakeCan::new(clock.clone());
+        let cfg = build_dm_config(true);
+        let sup = Arc::new(ArmSupervisor::new(cfg.clone()));
+        // Saturate ring on Legacy before remounting a new driver.
+        {
+            let mut inner = sup.inner().write().await;
+            for _ in 0..(SHADOW_RING_CAPACITY + 16) {
+                inner.tick_control(0.02);
+            }
+        }
+        let before = sup.torque_shadow_diagnostics();
+        assert!(
+            before.ring.interval_unverifiable && before.ring.ring_dropped_records > 0,
+            "ring must be unverifiable before remount: {before:?}"
+        );
+        // Remount a fresh hardware driver!
+        sup.set_driver(Box::new(build_dm_driver(bus.clone(), &cfg))).await;
+        let after = sup.torque_shadow_diagnostics();
+        assert!(
+            after.ring.interval_unverifiable,
+            "driver remount MUST preserve interval_unverifiable=true: {after:?}"
+        );
+        assert!(
+            after.ring.ring_dropped_records >= before.ring.ring_dropped_records,
+            "driver remount MUST preserve ring_dropped_records: before={before:?} after={after:?}"
+        );
+    }
+
+    // (e) m3: Disabled shadow (`torque_shadow_enabled = false`) allocates ZERO reducer state
+    //     even across driver mount and RT executor handoff!
+    {
+        let clock = Arc::new(MockClock::new());
+        let bus = FakeCan::new(clock.clone());
+        let cfg = build_dm_config(false);
+        let sup = Arc::new(ArmSupervisor::new(cfg.clone()));
+        sup.set_driver(Box::new(build_dm_driver(bus.clone(), &cfg))).await;
+        sup.start_dispatcher().unwrap();
+        assert!(!sup.torque_shadow_hub().has_worker());
+        let handle = sup
+            .start_executor(ExecutorConfig::for_tests(Duration::from_millis(20)))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let d = sup.torque_shadow_diagnostics();
+        assert!(!d.enabled);
+        assert_eq!(d.owner, ShadowOwner::Executor);
+        assert_eq!(d.events_processed, 0);
+        handle.stop_and_join();
+    }
+
+    // (f) B2: Damiao live rest-settle boundary with independently sampled realtime clock is
+    //     identical with shadow ON vs OFF (staging runs strictly AFTER capture_rx_clock_sample).
+    {
+        fn probe_settle(shadow: bool) -> bool {
+            let clock = Arc::new(MockClock::new());
+            let bus = FakeCan::new(clock.clone());
+            bus.with(|s| {
+                s.kernel_realtime_ns = Some(10_000_000_000);
+                s.realtime_minus_mono_ns = Some(10_000_000_000);
+            });
+            let cfg = build_dm_config(shadow);
+            let mut drv = build_dm_driver(bus.clone(), &cfg);
+            drv.set_shadow_enabled(shadow);
+            let targets = vec![armd::driver::JointTarget::position(0.0); 7];
+            let _ = drv.write_joint_targets(&targets);
+            // Advance exactly 21 ms (> 20 ms settle) and feed a kernel-stamped feedback frame.
+            clock.advance(Duration::from_millis(21));
+            bus.with(|s| {
+                s.kernel_realtime_ns = Some(10_021_000_000);
+                s.set_pose(&[0.0; 7]);
+                let f = s.motors[0].feedback_frame();
+                s.rx.push_back((f, Some(CanRxTime::KernelRealtimeNs(10_021_000_000))));
+            });
+            let _ = drv.read_joint_states();
+            drv.feedback_instants()[0].is_some()
+        }
+        assert_eq!(probe_settle(false), probe_settle(true));
+        assert!(probe_settle(true));
+    }
 }

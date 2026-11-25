@@ -7237,6 +7237,8 @@ fn control_thread_main(
                 },
             );
             if let Some(outcome) = completed {
+                #[cfg(not(target_arch = "wasm32"))]
+                core.record_post_panic_disable_shadow(true, &outcome);
                 outcome.log("RT executor panic", disable_timeout);
                 match cfg.panic_policy {
                     PanicPolicy::AbortProcess => {
@@ -7249,6 +7251,11 @@ fn control_thread_main(
                 }
             } else {
                 // Deadline observer already handled timeout logging / exit signaling.
+                #[cfg(not(target_arch = "wasm32"))]
+                core.record_post_panic_disable_shadow(
+                    true,
+                    &crate::supervisor::PanicDisableOutcome::TimedOut,
+                );
                 break;
             }
         }
@@ -7294,7 +7301,15 @@ fn control_thread_main(
             },
         );
         if let Some(outcome) = completed {
+            #[cfg(not(target_arch = "wasm32"))]
+            core.record_post_panic_disable_shadow(false, &outcome);
             outcome.log("RT executor emergency shutdown", disable_timeout);
+        } else {
+            #[cfg(not(target_arch = "wasm32"))]
+            core.record_post_panic_disable_shadow(
+                false,
+                &crate::supervisor::PanicDisableOutcome::TimedOut,
+            );
         }
     }
 

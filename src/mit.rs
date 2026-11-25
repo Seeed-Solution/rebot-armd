@@ -411,14 +411,33 @@ impl crate::supervisor::SupervisorInner {
         let cmd = parse_timeout_command(&self.config, body)?;
         self.mit_torque_off_checks()?;
         let d = self.driver.as_ref().expect("checked above");
-        let mut driver = d.lock().map_err(|_| CalibError::new(500, "DRIVER", "driver lock poisoned"))?;
         let unit = json!({"unit_us": damiao::TIMEOUT_UNIT_US_DOCUMENTED, "unit_verified": false,
             "note": "50 us per count is documented by Damiao and not verified on this firmware; RAM only (0x55), lost at power-off"});
+        #[cfg(not(target_arch = "wasm32"))]
+        let shadow_rt = &mut self.torque_shadow;
         if cmd.dry_run {
-            let rb = driver.read_motor_identity(&cmd.joints).map_err(|e| CalibError::new(502, "MIT_TIMEOUT_READ", e.to_string()))?;
+            let mut driver = d.lock().map_err(|_| CalibError::new(500, "DRIVER", "driver lock poisoned"))?;
+            let rb = driver.read_motor_identity(&cmd.joints);
+            #[cfg(not(target_arch = "wasm32"))]
+            shadow_rt.drain_from_driver(&mut **driver);
+            drop(driver);
+            #[cfg(not(target_arch = "wasm32"))]
+            if !self.rt_executor_owned {
+                self.flush_torque_shadow();
+            }
+            let rb = rb.map_err(|e| CalibError::new(502, "MIT_TIMEOUT_READ", e.to_string()))?;
             return Ok(json!({"dry_run": true, "readback": rb, "timeout_unit": unit}));
         }
-        let res = driver.commission_motor_timeout(&cmd.joints, cmd.timeout_counts).map_err(|e| {
+        let mut driver = d.lock().map_err(|_| CalibError::new(500, "DRIVER", "driver lock poisoned"))?;
+        let res = driver.commission_motor_timeout(&cmd.joints, cmd.timeout_counts);
+        #[cfg(not(target_arch = "wasm32"))]
+        shadow_rt.drain_from_driver(&mut **driver);
+        drop(driver);
+        #[cfg(not(target_arch = "wasm32"))]
+        if !self.rt_executor_owned {
+            self.flush_torque_shadow();
+        }
+        let res = res.map_err(|e| {
             let one = |v: &[usize]| v.iter().map(|j| j + 1).collect::<Vec<_>>();
             let mut err = CalibError::new(502, "MIT_TIMEOUT_FAILED", format!("{}; applied {:?}, uncertain {:?} (write sent, not confirmed), not attempted {:?}",
                 e.error, e.applied.iter().map(|c| c.before.joint).collect::<Vec<_>>(), one(&e.uncertain), one(&e.not_attempted)));
@@ -1541,6 +1560,8 @@ impl crate::supervisor::SupervisorInner {
             .map(|i| if joints.contains(&i) { crate::driver::JointMode::Mit } else { crate::driver::JointMode::Position }).collect();
         let holdoff = self.mit_holdoff();
         let (res, uncertain) = {
+            #[cfg(not(target_arch = "wasm32"))]
+            let shadow_rt = &mut self.torque_shadow;
             let Some(Ok(mut drv)) = self.driver.as_ref().map(|d| d.lock()) else { return };
             // armed before the first MIT-capable switch frame: a lost acknowledgement or a slow
             // confirmation cannot outlast the deadline, and a rollback after a trip sends nothing
@@ -1551,6 +1572,8 @@ impl crate::supervisor::SupervisorInner {
                 // switched back and confirmed in position control: nothing to fence
                 drv.set_mit_deadline_fence(None, Duration::ZERO);
             }
+            #[cfg(not(target_arch = "wasm32"))]
+            shadow_rt.drain_from_driver(&mut **drv);
             (res, uncertain || drv.mit_fence_trip().is_some())
         };
         match res {
@@ -1565,6 +1588,22 @@ impl crate::supervisor::SupervisorInner {
                 self.mit.last_ff = ff;
                 self.mit.last_output = Some(self.mit_now());
                 self.mit.handover_error = None;
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let mut mask = crate::torque::ChannelMask::EMPTY;
+                    for &j in &joints {
+                        if j < crate::torque::MAX_CHANNELS {
+                            mask.insert(j as u8);
+                        }
+                    }
+                    self.torque_shadow.enqueue(
+                        crate::torque::shadow::ShadowInputKind::MitOwnershipChange {
+                            channels: mask,
+                            target_mode: crate::motor_mode::ControlMode::Impedance,
+                            device_wide: false,
+                        },
+                    );
+                }
                 tracing::warn!("MIT tracking owns joints {:?}", joints.iter().map(|j| j + 1).collect::<Vec<_>>());
             }
             Err(e) => {
@@ -1610,10 +1649,14 @@ impl crate::supervisor::SupervisorInner {
         }
         let modes = vec![crate::driver::JointMode::Position; self.config.dof];
         let (res, uncertain) = {
+            #[cfg(not(target_arch = "wasm32"))]
+            let shadow_rt = &mut self.torque_shadow;
             let Some(d) = self.driver.as_ref() else { return Err("no driver".into()) };
             let mut drv = d.lock().map_err(|_| "driver lock poisoned".to_string())?;
             let res = drv.set_joint_modes_confirmed(&modes, &hold);
             if res.is_ok() { drv.set_mit_deadline_fence(None, Duration::ZERO); }
+            #[cfg(not(target_arch = "wasm32"))]
+            shadow_rt.drain_from_driver(&mut **drv);
             (res, drv.joint_modes_uncertain())
         };
         match res {
@@ -1626,6 +1669,22 @@ impl crate::supervisor::SupervisorInner {
                 self.mit.owner = MitOwner::Off;
                 self.mit.joints.clear();
                 self.mit.last_output = None;
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let mut mask = crate::torque::ChannelMask::EMPTY;
+                    for &j in &joints {
+                        if j < crate::torque::MAX_CHANNELS {
+                            mask.insert(j as u8);
+                        }
+                    }
+                    self.torque_shadow.enqueue(
+                        crate::torque::shadow::ShadowInputKind::MitOwnershipChange {
+                            channels: mask,
+                            target_mode: crate::motor_mode::ControlMode::PositionVelocity,
+                            device_wide: false,
+                        },
+                    );
+                }
                 tracing::warn!("MIT tracking handed back to position control ({why})");
                 Ok(())
             }

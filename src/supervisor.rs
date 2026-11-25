@@ -905,6 +905,9 @@ pub struct SupervisorInner {
     /// Inline observation-only `TorqueController` shadow runtime (zero alloc, zero lock on RT).
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) torque_shadow: crate::torque::shadow::ShadowRuntime,
+    /// Stable live operation identifier of the currently active enable attempt (for shadow HandshakeResult join).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) shadow_enable_op_id: u64,
     /// Inline per-joint measured-position hold state (zero alloc on RT).
     pub(crate) measured_hold: driver_transitions::MeasuredHoldTracker,
     /// Inline owner-held driver snapshot refreshed whenever the owner already holds the driver
@@ -2182,6 +2185,8 @@ impl SupervisorInner {
             control_release_seq: 0,
             #[cfg(not(target_arch = "wasm32"))]
             torque_shadow,
+            #[cfg(not(target_arch = "wasm32"))]
+            shadow_enable_op_id: 0,
             measured_hold: driver_transitions::MeasuredHoldTracker::new(dof),
             owner_driver_snapshot: driver_transitions::OwnerDriverSnapshot::new(dof),
             background_disable_retry: None,
@@ -3263,7 +3268,29 @@ impl SupervisorInner {
 
     /// Unified motion-start wrapper: requires an [`Admitted`] token by value under the owner lock.
     pub fn start_motion<Op: MotionStartOp>(admitted: Admitted<'_>, op: Op) -> Result<Op::Output, ArmError> {
-        admitted.verify_live()?;
+        let verify_res = admitted.verify_live();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let inner = &mut *admitted.inner;
+            let dof = inner.config.dof.min(crate::torque::MAX_CHANNELS) as u8;
+            let live_refusal = match &verify_res {
+                Ok(_) => None,
+                Err(SafetyError::EStopActive) => Some(crate::torque::shadow::LiveRefusalKind::EStopActive),
+                Err(SafetyError::FaultActive(_)) => Some(crate::torque::shadow::LiveRefusalKind::FaultLatched),
+                Err(_) => Some(crate::torque::shadow::LiveRefusalKind::Other),
+            };
+            inner
+                .torque_shadow
+                .enqueue(crate::torque::shadow::ShadowInputKind::MotionCommand {
+                    channels: crate::torque::ChannelMask::from_count(dof),
+                    live_allowed: verify_res.is_ok(),
+                    live_refusal,
+                    live_intent: inner.shadow_live_intent(),
+                    live_is_torqued: inner.is_torqued,
+                    live_stopped: inner.safety.state().is_stopped(),
+                });
+        }
+        verify_res?;
         op.execute(admitted)
     }
 
@@ -5003,7 +5030,7 @@ impl SupervisorInner {
                     let _ = self.request_disable_bounded(exit_kind);
                 }
             } else {
-                let outcome = self.attempt_panic_disable(PANIC_DISABLE_TIMEOUT);
+                let outcome = self.attempt_shutdown_protective_disable(PANIC_DISABLE_TIMEOUT);
                 outcome.log("Repeated shutdown protective disable", PANIC_DISABLE_TIMEOUT);
             }
             if self.shutdown_ready() {
@@ -10980,7 +11007,12 @@ enum Fresh<'a> {
 }
 
 impl Drop for ArmSupervisor {
-    fn drop(&mut self) { self.hub.close(); }
+    fn drop(&mut self) {
+        self.hub.close();
+        #[cfg(not(target_arch = "wasm32"))]
+        self.torque_shadow
+            .stop_and_flush_bounded(Duration::from_millis(50));
+    }
 }
 
 /// Immutable host/process boot identity exposed on `GET /api/v1/diagnostics/tick` so offline

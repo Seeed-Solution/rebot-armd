@@ -1713,5 +1713,11 @@ fn rt_executor_torque_shadow_on_zero_locks_and_diagnostics_readable() {
         hold_stop.store(true, Ordering::Release);
         holder.join().unwrap();
         handle.stop_and_join();
+        // Verify off-thread reclamation of `ShadowRuntimeInner` allocations retired on `armd-control` exit (M19).
+        sup.torque_shadow_hub().drain_now();
+        assert!(
+            sup.torque_shadow_hub().test_retired_reclaimed_count() >= 1,
+            "ShadowRuntimeInner must be retired lock-free on armd-control exit and reclaimed off-thread"
+        );
     });
 }

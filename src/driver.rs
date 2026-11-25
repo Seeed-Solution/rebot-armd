@@ -2261,6 +2261,42 @@ impl<T: Transport> FeetechArmDriver<T> {
     }
 
     #[inline]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn stage_feetech_causal_sample(
+        &mut self,
+        joint_idx: usize,
+        pkt_rx_at: Instant,
+        decode_now: Instant,
+        req_written_at: Option<Instant>,
+        after_motion: bool,
+    ) {
+        if self.shadow_staging.is_enabled() && joint_idx < crate::torque::MAX_CHANNELS {
+            let sample_id = self.shadow_staging.next_sample_id();
+            self.shadow_staging
+                .push(crate::torque::shadow::ShadowDriverObs::CausalSample {
+                    channel: joint_idx as u8,
+                    sample_id,
+                    stamp: crate::torque::shadow::RxStampKind::Valid {
+                        rx_at: pkt_rx_at,
+                        drift_ns: 0,
+                        live_post_settle: after_motion,
+                    },
+                    decode_now,
+                    position_rad: self.cached_states[joint_idx].position,
+                    velocity_rad_s: Some(self.cached_states[joint_idx].velocity),
+                    temperature_c: Some(self.cached_states[joint_idx].temperature),
+                    reported_enabled: self.reported_enable[joint_idx].map(|v| v == 1),
+                    correlated_after_write_done: if after_motion {
+                        self.last_motion_write_at[joint_idx]
+                    } else {
+                        None
+                    },
+                    poll_issued: req_written_at,
+                    provenance: crate::torque::shadow::EvidenceProvenance::HardwareCausal,
+                });
+        }
+    }
+
     fn clear_rx(&mut self) {
         self.rx_buffer.clear();
         self.rx_timestamps.clear();
@@ -2449,31 +2485,7 @@ impl<T: Transport> FeetechArmDriver<T> {
             pkt_rx_at >= w && req_written_at.is_none_or(|req_at| req_at >= w)
         });
         #[cfg(not(target_arch = "wasm32"))]
-        if self.shadow_staging.is_enabled() && joint_idx < crate::torque::MAX_CHANNELS {
-            let sample_id = self.shadow_staging.next_sample_id();
-            self.shadow_staging
-                .push(crate::torque::shadow::ShadowDriverObs::CausalSample {
-                    channel: joint_idx as u8,
-                    sample_id,
-                    stamp: crate::torque::shadow::RxStampKind::Valid {
-                        rx_at: pkt_rx_at,
-                        drift_ns: 0,
-                        live_post_settle: after_motion,
-                    },
-                    decode_now,
-                    position_rad: self.cached_states[joint_idx].position,
-                    velocity_rad_s: Some(self.cached_states[joint_idx].velocity),
-                    temperature_c: Some(self.cached_states[joint_idx].temperature),
-                    reported_enabled: self.reported_enable[joint_idx].map(|v| v == 1),
-                    correlated_after_write_done: if after_motion {
-                        self.last_motion_write_at[joint_idx]
-                    } else {
-                        None
-                    },
-                    poll_issued: req_written_at,
-                    provenance: crate::torque::shadow::EvidenceProvenance::HardwareCausal,
-                });
-        }
+        self.stage_feetech_causal_sample(joint_idx, pkt_rx_at, decode_now, req_written_at, after_motion);
         if let Some(ref gate) = self.stopped_disable_gate {
             if gate.is_arm_joint(joint_idx) {
                 let pos = self.cached_states[joint_idx].position;
@@ -3969,6 +3981,18 @@ impl<T: Transport> FeetechArmDriver<T> {
                                     pkt_rx_at >= w
                                         && window.is_some_and(|(req_at, _)| req_at >= w)
                                 });
+                                #[cfg(not(target_arch = "wasm32"))]
+                                {
+                                    let decode_now = self.clock_now();
+                                    let req_at = window.map(|(r, _)| r);
+                                    self.stage_feetech_causal_sample(
+                                        joint_idx,
+                                        pkt_rx_at,
+                                        decode_now,
+                                        req_at,
+                                        after_motion,
+                                    );
+                                }
                                 if let Some(ref gate) = self.stopped_disable_gate {
                                     if gate.is_arm_joint(joint_idx) {
                                         let pos = self.cached_states[joint_idx].position;
@@ -7278,60 +7302,55 @@ fn check_rest_pose_boundary(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CanRxTimeReject {
+    Future,
+    Unmappable,
+}
+
 /// Convert a present kernel/transport [`CanRxTime`] to `(monotonic_rx_at, realtime_minus_monotonic_ns)`.
 ///
-/// Rejects future-dated timestamps (`None`, NEVER clamped to `decode_now`):
-/// - `Monotonic(ts)` with `ts > decode_now` -> `None`
-/// - `KernelRealtimeNs(rx_ns)` with `rx_ns > now_ns` or missing `RxClockSample` / offset -> `None`
+/// Rejects future-dated timestamps with `Err(CanRxTimeReject::Future)` (NEVER clamped to `decode_now`),
+/// and missing/unmappable clock samples with `Err(CanRxTimeReject::Unmappable)` in a single clock read.
 #[inline]
 fn can_rx_time_to_monotonic<C: CanTransport>(
     can: &C,
     rx_time: CanRxTime,
     decode_now: Instant,
-) -> Option<(Instant, Option<i128>)> {
+) -> Result<(Instant, Option<i128>), CanRxTimeReject> {
     match rx_time {
         CanRxTime::Monotonic(ts) => {
             if ts > decode_now {
-                return None;
+                return Err(CanRxTimeReject::Future);
             }
-            Some((ts, None))
+            Ok((ts, None))
         }
         CanRxTime::KernelRealtimeNs(rx_ns) => {
-            let sample = can.rx_clock_sample()?;
+            let sample = can.rx_clock_sample().ok_or(CanRxTimeReject::Unmappable)?;
             let CanRxTime::KernelRealtimeNs(now_ns) = sample.rx_now else {
-                return None;
+                return Err(CanRxTimeReject::Unmappable);
             };
-            let offset_ns = sample.realtime_minus_monotonic_ns?;
+            let offset_ns = sample
+                .realtime_minus_monotonic_ns
+                .ok_or(CanRxTimeReject::Unmappable)?;
             if rx_ns > now_ns {
-                return None;
+                return Err(CanRxTimeReject::Future);
             }
             let age_ns = (now_ns - rx_ns).min(i128::from(u64::MAX)) as u64;
-            let mapped = decode_now.checked_sub(Duration::from_nanos(age_ns))?;
-            Some((mapped, Some(offset_ns)))
+            let mapped = decode_now
+                .checked_sub(Duration::from_nanos(age_ns))
+                .ok_or(CanRxTimeReject::Unmappable)?;
+            Ok((mapped, Some(offset_ns)))
         }
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 #[inline]
-fn can_rx_time_reject_kind<C: CanTransport>(
-    can: &C,
-    rx_time: CanRxTime,
-    decode_now: Instant,
-) -> crate::torque::shadow::RxStampKind {
-    match rx_time {
-        CanRxTime::Monotonic(ts) if ts > decode_now => crate::torque::shadow::RxStampKind::Future,
-        CanRxTime::KernelRealtimeNs(rx_ns) => {
-            if let Some(sample) = can.rx_clock_sample() {
-                if let CanRxTime::KernelRealtimeNs(now_ns) = sample.rx_now {
-                    if sample.realtime_minus_monotonic_ns.is_some() && rx_ns > now_ns {
-                        return crate::torque::shadow::RxStampKind::Future;
-                    }
-                }
-            }
-            crate::torque::shadow::RxStampKind::Unmappable
-        }
-        _ => crate::torque::shadow::RxStampKind::Unmappable,
+fn can_rx_reject_to_shadow_stamp(reject: CanRxTimeReject) -> crate::torque::shadow::RxStampKind {
+    match reject {
+        CanRxTimeReject::Future => crate::torque::shadow::RxStampKind::Future,
+        CanRxTimeReject::Unmappable => crate::torque::shadow::RxStampKind::Unmappable,
     }
 }
 
@@ -8602,7 +8621,95 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         res
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    #[inline]
+    fn stage_damiao_mode_verified(&mut self, idx: usize, mode: DamiaoControlMode) {
+        if self.shadow_staging.is_enabled() && idx < crate::torque::MAX_CHANNELS {
+            let now = self.now();
+            self.shadow_staging
+                .push(crate::torque::shadow::ShadowDriverObs::ModeVerified {
+                    channel: idx as u8,
+                    mode: damiao_mode_to_shadow_control_mode(mode),
+                    now,
+                    provenance: crate::torque::shadow::EvidenceProvenance::HardwareCausal,
+                });
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[inline]
+    fn stage_damiao_pretransport_refusal(&mut self, kind: TxKind, refusal: &TxRefusal) {
+        if !self.shadow_staging.is_enabled()
+            || matches!(
+                refusal,
+                TxRefusal::Transport(_) | TxRefusal::DisableWaitEvidence
+            )
+        {
+            return;
+        }
+        let n = self.motor_ids.len().min(crate::torque::MAX_CHANNELS) as u8;
+        let (wk, mask) = match kind {
+            TxKind::DisableRequested { .. } | TxKind::ClientParkDisable { .. } => {
+                (crate::torque::WriteKind::DisableRequested, crate::torque::ChannelMask::from_count(n))
+            }
+            TxKind::DisableProtective { .. } => {
+                (crate::torque::WriteKind::DisableProtective, crate::torque::ChannelMask::from_count(n))
+            }
+            TxKind::RollbackHold(j) | TxKind::MeasuredHold(j) if j < crate::torque::MAX_CHANNELS => {
+                (crate::torque::WriteKind::Hold, crate::torque::ChannelMask::bit(j as u8))
+            }
+            TxKind::Hold => (crate::torque::WriteKind::Hold, crate::torque::ChannelMask::from_count(n)),
+            TxKind::Target | TxKind::Recovery => {
+                (crate::torque::WriteKind::Motion, crate::torque::ChannelMask::from_count(n))
+            }
+            _ => return,
+        };
+        if mask.is_empty() {
+            return;
+        }
+        let outcome = match refusal {
+            TxRefusal::Deferred => crate::torque::MotorWriteOutcome::Deferred,
+            _ => crate::torque::MotorWriteOutcome::RejectedStale,
+        };
+        let mut outcomes = [crate::torque::MotorWriteOutcome::NotTargeted; crate::torque::MAX_CHANNELS];
+        for c in mask.iter() {
+            outcomes[c as usize] = outcome;
+        }
+        let now = self.now();
+        self.shadow_staging.push_dedup_refusal(
+            wk,
+            mask,
+            outcome,
+            crate::torque::shadow::ShadowDriverObs::WriteResult {
+                device: 0,
+                kind: wk,
+                write_done: now,
+                now,
+                target_mask: mask,
+                outcomes,
+                ambiguous_gap: false,
+            },
+        );
+    }
+
     fn send(
+        &mut self,
+        kind: impl DamiaoTxKind,
+        expected_stamp: Option<StopStamp>,
+        deadline: Option<Deadline>,
+        fenced: bool,
+        build: impl FnOnce(&Self) -> Option<CanFrame>,
+    ) -> Result<CanFrame, TxRefusal> {
+        let tx_kind = kind.tx_kind();
+        let res = self.send_core(kind, expected_stamp, deadline, fenced, build);
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Err(ref refusal) = res {
+            self.stage_damiao_pretransport_refusal(tx_kind, refusal);
+        }
+        res
+    }
+
+    fn send_core(
         &mut self,
         kind: impl DamiaoTxKind,
         expected_stamp: Option<StopStamp>,
@@ -8743,6 +8850,45 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let cpu0 = crate::diagnostics::tick::thread_cpu_ns();
         let res = self.can.transmit(&frame);
         let write_done = self.now();
+        let write_done_clock = if motion_idx.is_some() && res.is_ok() {
+            Some(self.capture_rx_clock_sample(write_done))
+        } else {
+            None
+        };
+        let wall_ns = write_done.saturating_duration_since(t0).as_nanos().min(u128::from(u64::MAX)) as u64;
+        let cpu_ns = crate::diagnostics::tick::thread_cpu_ns().saturating_sub(cpu0);
+        let attempt_kind = match &res {
+            Ok(()) => crate::diagnostics::tick::TxAttemptKind::Sent,
+            Err(TransportError::WouldBlock) => crate::diagnostics::tick::TxAttemptKind::WouldBlock,
+            Err(TransportError::NoBufferSpace) => crate::diagnostics::tick::TxAttemptKind::Enobufs,
+            Err(_) => crate::diagnostics::tick::TxAttemptKind::Error,
+        };
+        crate::diagnostics::tick::record_tx_attempt(attempt_kind, wall_ns, cpu_ns);
+        let final_res = match res {
+            Ok(()) => {
+                // Record the same-clock boundary + CLOCK_REALTIME - CLOCK_MONOTONIC offset AFTER
+                // `transmit()` returns for the rest-pose gate (after the last motion command).
+                if let (Some(idx), Some((write_done_rx_clock, write_done_offset_ns))) =
+                    (motion_idx, write_done_clock)
+                {
+                    self.rest_pose_boundary[idx] = Some(RestPoseBoundary {
+                        write_done,
+                        write_done_rx_clock: Some(write_done_rx_clock),
+                        write_done_offset_ns,
+                    });
+                }
+                Ok(frame)
+            }
+            Err(e) => {
+                self.tx_probe = None;
+                if budgeted && e.is_tx_backpressure() {
+                    self.mark_tx_pass_backpressured();
+                }
+                Err(TxRefusal::Transport(e))
+            }
+        };
+        // Shadow staging runs strictly AFTER live RX clock capture and live TX bookkeeping so
+        // the live Damiao 20 ms rest-settle boundary is never perturbed by shadow work.
         #[cfg(not(target_arch = "wasm32"))]
         if self.shadow_staging.is_enabled() {
             let shadow_info = match kind {
@@ -8767,6 +8913,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 TxKind::RollbackHold(j) | TxKind::MeasuredHold(j) => {
                     Some((crate::torque::WriteKind::Hold, j))
                 }
+                TxKind::Hold => self
+                    .damiao_command_motor_index(&frame)
+                    .map(|idx| (crate::torque::WriteKind::Hold, idx)),
                 _ if !frame.is_extended
                     && !frame.is_rtr
                     && frame.dlc == 8
@@ -8786,10 +8935,12 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 if idx < crate::torque::MAX_CHANNELS {
                     let mut outcomes = [crate::torque::MotorWriteOutcome::NotTargeted;
                         crate::torque::MAX_CHANNELS];
-                    outcomes[idx] = if res.is_ok() {
-                        crate::torque::MotorWriteOutcome::Sent
-                    } else {
-                        crate::torque::MotorWriteOutcome::Failed
+                    outcomes[idx] = match &final_res {
+                        Ok(_) => crate::torque::MotorWriteOutcome::Sent,
+                        Err(TxRefusal::Transport(
+                            TransportError::WouldBlock | TransportError::NoBufferSpace,
+                        )) => crate::torque::MotorWriteOutcome::Deferred,
+                        Err(_) => crate::torque::MotorWriteOutcome::Failed,
                     };
                     self.shadow_staging
                         .push(crate::torque::shadow::ShadowDriverObs::WriteResult {
@@ -8804,43 +8955,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 }
             }
         }
-        let write_done_clock = if motion_idx.is_some() && res.is_ok() {
-            Some(self.capture_rx_clock_sample(write_done))
-        } else {
-            None
-        };
-        let wall_ns = write_done.saturating_duration_since(t0).as_nanos().min(u128::from(u64::MAX)) as u64;
-        let cpu_ns = crate::diagnostics::tick::thread_cpu_ns().saturating_sub(cpu0);
-        let attempt_kind = match &res {
-            Ok(()) => crate::diagnostics::tick::TxAttemptKind::Sent,
-            Err(TransportError::WouldBlock) => crate::diagnostics::tick::TxAttemptKind::WouldBlock,
-            Err(TransportError::NoBufferSpace) => crate::diagnostics::tick::TxAttemptKind::Enobufs,
-            Err(_) => crate::diagnostics::tick::TxAttemptKind::Error,
-        };
-        crate::diagnostics::tick::record_tx_attempt(attempt_kind, wall_ns, cpu_ns);
-        match res {
-            Ok(()) => {
-                // Record the same-clock boundary + CLOCK_REALTIME - CLOCK_MONOTONIC offset AFTER
-                // `transmit()` returns for the rest-pose gate (after the last motion command).
-                if let (Some(idx), Some((write_done_rx_clock, write_done_offset_ns))) =
-                    (motion_idx, write_done_clock)
-                {
-                    self.rest_pose_boundary[idx] = Some(RestPoseBoundary {
-                        write_done,
-                        write_done_rx_clock: Some(write_done_rx_clock),
-                        write_done_offset_ns,
-                    });
-                }
-                Ok(frame)
-            }
-            Err(e) => {
-                self.tx_probe = None;
-                if budgeted && e.is_tx_backpressure() {
-                    self.mark_tx_pass_backpressured();
-                }
-                Err(TxRefusal::Transport(e))
-            }
-        }
+        final_res
     }
 
     /// Off-tick retry wrapper over [`Self::send`]: retries transient backpressure up to 3 times
@@ -10106,6 +10221,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             {
                 self.joint_modes[i] = Some(w.modes[i]);
                 self.verified_modes[i] = Some(w.modes[i]);
+                #[cfg(not(target_arch = "wasm32"))]
+                self.stage_damiao_mode_verified(i, w.modes[i]);
             } else {
                 self.verified_modes[i] = None;
                 if strict || self.base_mode(i) == DamiaoControlMode::PosForce {
@@ -11833,6 +11950,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         self.verified_modes[j] = Some(base_mode);
                         self.joint_modes[j] = Some(base_mode);
                         self.mode_readback_boundary[j] = None;
+                        #[cfg(not(target_arch = "wasm32"))]
+                        self.stage_damiao_mode_verified(j, base_mode);
                         r.remaining_mask &= !(1u32 << j);
                     }
                     Some(v) => {
@@ -11980,6 +12099,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.joint_modes[joint] = Some(DamiaoControlMode::PosForce);
         self.verified_modes[joint] = Some(DamiaoControlMode::PosForce);
         self.pos_force_verified = true;
+        #[cfg(not(target_arch = "wasm32"))]
+        self.stage_damiao_mode_verified(joint, DamiaoControlMode::PosForce);
         tracing::info!("Damiao joint {} confirmed in position-force mode (CTRL_MODE 4); pre-enable hold sent at {:.4} rad", joint + 1, hold_pos);
         self.send_enable()
     }
@@ -16077,7 +16198,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 return;
             };
             let decode_now = self.now();
-            let Some((rx_at, _)) = can_rx_time_to_monotonic(&self.can, rx_t, decode_now) else {
+            let Ok((rx_at, _)) = can_rx_time_to_monotonic(&self.can, rx_t, decode_now) else {
                 return;
             };
             let motor_idx = self.motor_ids.iter().position(|&id| id == reply.motor_id);
@@ -16171,29 +16292,31 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     return;
                 };
                 let decode_now = self.now();
-                let Some((rx_at, decode_offset_ns)) = can_rx_time_to_monotonic(&self.can, rx_t, decode_now) else {
-                    self.rest_pose_window[idx].reset();
-                    #[cfg(not(target_arch = "wasm32"))]
-                    if self.shadow_staging.is_enabled() && idx < crate::torque::MAX_CHANNELS {
-                        let sample_id = self.shadow_staging.next_sample_id();
-                        let reject_stamp = can_rx_time_reject_kind(&self.can, rx_t, decode_now);
-                        self.shadow_staging.push(
-                            crate::torque::shadow::ShadowDriverObs::CausalSample {
-                                channel: idx as u8,
-                                sample_id,
-                                stamp: reject_stamp,
-                                decode_now,
-                                position_rad: feedback.position,
-                                velocity_rad_s: Some(feedback.velocity),
-                                temperature_c: Some(feedback.t_mos.max(feedback.t_rotor)),
-                                reported_enabled: Some(feedback.state_or_error == 1),
-                                correlated_after_write_done: None,
-                                poll_issued: None,
-                                provenance: crate::torque::shadow::EvidenceProvenance::HardwareCausal,
-                            },
-                        );
+                let (rx_at, decode_offset_ns) = match can_rx_time_to_monotonic(&self.can, rx_t, decode_now) {
+                    Ok(mapped) => mapped,
+                    Err(reject) => {
+                        self.rest_pose_window[idx].reset();
+                        #[cfg(not(target_arch = "wasm32"))]
+                        if self.shadow_staging.is_enabled() && idx < crate::torque::MAX_CHANNELS {
+                            let sample_id = self.shadow_staging.next_sample_id();
+                            self.shadow_staging.push(
+                                crate::torque::shadow::ShadowDriverObs::CausalSample {
+                                    channel: idx as u8,
+                                    sample_id,
+                                    stamp: can_rx_reject_to_shadow_stamp(reject),
+                                    decode_now,
+                                    position_rad: feedback.position,
+                                    velocity_rad_s: Some(feedback.velocity),
+                                    temperature_c: Some(feedback.t_mos.max(feedback.t_rotor)),
+                                    reported_enabled: Some(feedback.state_or_error == 1),
+                                    correlated_after_write_done: None,
+                                    poll_issued: None,
+                                    provenance: crate::torque::shadow::EvidenceProvenance::HardwareCausal,
+                                },
+                            );
+                        }
+                        return;
                     }
-                    return;
                 };
                 // Per-motor rest-pose causal boundary check (after last motion command):
                 // - OffsetDrifted (> 1 ms CLOCK_REALTIME step): discard completely and restart window.
@@ -16324,6 +16447,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 #[cfg(not(target_arch = "wasm32"))]
                 if self.shadow_staging.is_enabled() && idx < crate::torque::MAX_CHANNELS {
                     let sample_id = self.shadow_staging.next_sample_id();
+                    let rest_qualified = !self.awaiting_rx_boundary
+                        && queue_bound.is_some()
+                        && joint_state_valid(&self.cached_states[idx], self.capabilities());
                     let stamp = if window_offset_drifted {
                         crate::torque::shadow::RxStampKind::OffsetDrifted {
                             rebased_settle: true,
@@ -16334,10 +16460,17 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                             .and_then(|b| b.write_done_offset_ns)
                             .zip(decode_offset_ns)
                             .map_or(0, |(w, d)| (d - w).unsigned_abs().min(u128::from(u64::MAX)) as u64);
-                        crate::torque::shadow::RxStampKind::Valid {
-                            rx_at,
-                            drift_ns,
-                            live_post_settle: boundary_check == RestBoundaryCheck::Satisfied,
+                        if rest_qualified {
+                            crate::torque::shadow::RxStampKind::Valid {
+                                rx_at,
+                                drift_ns,
+                                live_post_settle: boundary_check == RestBoundaryCheck::Satisfied,
+                            }
+                        } else {
+                            crate::torque::shadow::RxStampKind::UnqualifiedRestEvidence {
+                                rx_at,
+                                drift_ns,
+                            }
                         }
                     };
                     self.shadow_staging
@@ -17562,35 +17695,34 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
                                 }
                                 continue;
                             };
-                            let Some((rx_at, decode_offset_ns)) =
-                                can_rx_time_to_monotonic(&self.can, rx_t, decode_now)
-                            else {
-                                self.rest_pose_window[idx].reset();
-                                #[cfg(not(target_arch = "wasm32"))]
-                                if self.shadow_staging.is_enabled()
-                                    && idx < crate::torque::MAX_CHANNELS
-                                {
-                                    let sample_id = self.shadow_staging.next_sample_id();
-                                    let reject_stamp =
-                                        can_rx_time_reject_kind(&self.can, rx_t, decode_now);
-                                    self.shadow_staging.push(
-                                        crate::torque::shadow::ShadowDriverObs::CausalSample {
-                                            channel: idx as u8,
-                                            sample_id,
-                                            stamp: reject_stamp,
-                                            decode_now,
-                                            position_rad: feedback.position,
-                                            velocity_rad_s: Some(feedback.velocity),
-                                            temperature_c: Some(feedback.mos_temperature),
-                                            reported_enabled: None,
-                                            correlated_after_write_done: None,
-                                            poll_issued: None,
-                                            provenance:
-                                                crate::torque::shadow::EvidenceProvenance::HardwareCausal,
-                                        },
-                                    );
+                            let (rx_at, decode_offset_ns) = match can_rx_time_to_monotonic(&self.can, rx_t, decode_now) {
+                                Ok(mapped) => mapped,
+                                Err(reject) => {
+                                    self.rest_pose_window[idx].reset();
+                                    #[cfg(not(target_arch = "wasm32"))]
+                                    if self.shadow_staging.is_enabled()
+                                        && idx < crate::torque::MAX_CHANNELS
+                                    {
+                                        let sample_id = self.shadow_staging.next_sample_id();
+                                        self.shadow_staging.push(
+                                            crate::torque::shadow::ShadowDriverObs::CausalSample {
+                                                channel: idx as u8,
+                                                sample_id,
+                                                stamp: can_rx_reject_to_shadow_stamp(reject),
+                                                decode_now,
+                                                position_rad: feedback.position,
+                                                velocity_rad_s: Some(feedback.velocity),
+                                                temperature_c: Some(feedback.mos_temperature),
+                                                reported_enabled: None,
+                                                correlated_after_write_done: None,
+                                                poll_issued: None,
+                                                provenance:
+                                                    crate::torque::shadow::EvidenceProvenance::HardwareCausal,
+                                            },
+                                        );
+                                    }
+                                    continue;
                                 }
-                                continue;
                             };
                             let boundary_check = match self.rest_pose_boundary[idx] {
                                 None => RestBoundaryCheck::Satisfied,

@@ -670,14 +670,20 @@ impl SupervisorInner {
                 }
                 self.safety.latch(crate::safety::FaultKind::BusLoss, crate::safety::FaultDetail::BusLoss);
                 #[cfg(not(target_arch = "wasm32"))]
-                self.torque_shadow
-                    .enqueue(crate::torque::shadow::ShadowInputKind::BusLoss {
-                        device: 0,
-                        multi_device_gap: false,
-                        live_intent: self.shadow_live_intent(),
-                        live_is_torqued: self.is_torqued,
-                        live_stopped: true,
-                    });
+                {
+                    let multi_device_gap = self
+                        .torque_shadow
+                        .state()
+                        .is_some_and(|s| s.config.device_count > 1);
+                    self.torque_shadow
+                        .enqueue(crate::torque::shadow::ShadowInputKind::BusLoss {
+                            device: 0,
+                            multi_device_gap,
+                            live_intent: self.shadow_live_intent(),
+                            live_is_torqued: self.is_torqued,
+                            live_stopped: true,
+                        });
+                }
             }
         }
         #[cfg(not(target_arch = "wasm32"))]

@@ -1869,23 +1869,54 @@ fn rt_torque_off_shadow_on_ring_saturation_and_staging_overflow_zero_allocs() {
         "220 RT releases through full SPSC ring saturation must perform (0, 0) heap ops"
     );
 
+    // Verify the outgoing SPSC ring is ALREADY saturated BEFORE the transition wake!
+    let pre_wake_diag = fx.core.torque_shadow_diagnostics();
+    assert!(
+        pre_wake_diag.ring.interval_unverifiable && pre_wake_diag.ring.ring_dropped_records > 0,
+        "SPSC ring must already be saturated before submitting transition wake: {pre_wake_diag:?}"
+    );
+
     // 2. Submit a TorqueOff transition wake while ring is already saturated and burst RX
-    //    is queued; assert strictly (0, 0) heap ops on RT!
+    //    is queued; witness the transition start + wake polling and assert strictly (0, 0) heap ops!
     submit_torque_off(&fx, &mut b, 10);
     bus.with(|s| {
         for _ in 0..25 {
             s.push_all_feedback();
         }
     });
-    clock.advance(RELEASE);
-    let (_, a_ov, f_ov) = counted(|| {
-        let _ = fx.step();
-        fx.core.torque_shadow_flush_for_test();
-    });
+    let mut witnessed_cmd = false;
+    let mut witnessed_transition_activity = false;
+    let mut wake_allocs = 0u64;
+    let mut wake_frees = 0u64;
+    for _ in 0..8 {
+        clock.advance(RELEASE);
+        bus.with(|s| s.push_all_feedback());
+        let (rep, a_ov, f_ov) = counted(|| {
+            let r = fx.step();
+            fx.core.torque_shadow_flush_for_test();
+            r
+        });
+        wake_allocs += a_ov;
+        wake_frees += f_ov;
+        if rep.command.is_some() {
+            witnessed_cmd = true;
+        }
+        if rep.transition_ended.is_some() || rep.poll.torque.is_some() {
+            witnessed_transition_activity = true;
+        }
+        if rep.transition_ended.is_some() {
+            break;
+        }
+    }
+    assert!(witnessed_cmd, "must witness TorqueOff command commit under ring saturation");
+    assert!(
+        witnessed_transition_activity,
+        "must witness transition wake/completion activity under ring saturation"
+    );
     assert_eq!(
-        (a_ov, f_ov),
+        (wake_allocs, wake_frees),
         (0, 0),
-        "RT release + transition wake under saturated SPSC ring + burst RX must perform (0, 0) heap ops"
+        "RT release + witnessed transition wake under saturated SPSC ring + burst RX must perform (0, 0) heap ops"
     );
 
     // Drain off-thread and assert permanent session-latched unverifiable flag & ring drops.
@@ -1924,31 +1955,38 @@ fn rt_torque_off_shadow_on_ring_saturation_and_staging_overflow_zero_allocs() {
     let _ = drv2.read_joint_states_budgeted(&mut js_buf, clock.now() + Duration::from_millis(5), 32);
     let _ = drv2.drain_shadow_observations(&mut obs_buf);
 
+    // Push 160 * 7 = 1120 frames (> DRIVER_SHADOW_STAGING_CAP = 1024) into the pre-allocated VecDeque
+    // (ensure capacity off-count so bus push never affects measured RT ops).
     bus2.with(|s| {
-        for _ in 0..24 {
-            s.push_all_feedback(); // 24 * 7 = 168 > 128 staging cap
+        s.rx.reserve(1200);
+        for _ in 0..160 {
+            s.push_all_feedback();
         }
     });
     let dl = clock.now() + Duration::from_millis(20);
     let (res, a_st, f_st) = counted(|| {
-        // Each budgeted read is internally capped to 64 RX frames; 3 consecutive reads before
-        // draining stage 168 frames into the 128-slot inline buffer (overflowing by 40) with 0 allocs.
-        let r1 = drv2.read_joint_states_budgeted(&mut js_buf, dl, 64);
-        let r2 = drv2.read_joint_states_budgeted(&mut js_buf, dl, 64);
-        let r3 = drv2.read_joint_states_budgeted(&mut js_buf, dl, 64);
+        // Each budgeted read is internally capped to 64 RX frames; 18 consecutive reads before
+        // draining stage 1120 frames into the 1024-slot buffer (overflowing by 96) with 0 allocs.
+        let mut last = Ok((0u16, false));
+        for _ in 0..18 {
+            last = drv2.read_joint_states_budgeted(&mut js_buf, dl, 64);
+            if last.is_err() {
+                break;
+            }
+        }
         let drained = drv2.drain_shadow_observations(&mut obs_buf);
-        (r1.and(r2).and(r3), drained)
+        (last, drained)
     });
     assert!(res.0.is_ok());
     assert_eq!(
         (a_st, f_st),
         (0, 0),
-        "driver staging overflow (>128 frames) + drain must perform (0, 0) heap ops"
+        "driver staging overflow (>DRIVER_SHADOW_STAGING_CAP frames) + drain must perform (0, 0) heap ops"
     );
     assert_eq!(res.1.0, armd::torque::shadow::DRIVER_SHADOW_STAGING_CAP);
     assert!(
-        res.1.1 >= 40,
-        "168 staged frames into 128-slot buffer must report >= 40 dropped, got {}",
+        res.1.1 >= 80,
+        "1120 staged frames into 1024-slot buffer must report >= 80 dropped, got {}",
         res.1.1
     );
 }

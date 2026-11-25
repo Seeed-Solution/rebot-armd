@@ -132,9 +132,24 @@ static SEND_DROPS: AtomicU64 = AtomicU64::new(0);
 /// Send without blocking the control tick (the socket itself stays blocking for the
 /// receiver thread, which shares it): a full buffer drops the datagram and counts it, like a
 /// lost CAN frame. Other errors are ignored for the same reason.
-fn send_nonblocking(socket: &UdpSocket, bytes: &[u8]) {
+#[cfg(not(target_arch = "wasm32"))]
+fn send_nonblocking(socket: &UdpSocket, bytes: &[u8]) -> crate::torque::MotorWriteOutcome {
     use std::os::fd::AsRawFd;
     // SAFETY: valid fd and buffer for the duration of the call.
+    let n = unsafe { libc::send(socket.as_raw_fd(), bytes.as_ptr().cast(), bytes.len(), libc::MSG_DONTWAIT) };
+    if n >= 0 {
+        crate::torque::MotorWriteOutcome::Sent
+    } else if std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock {
+        SEND_DROPS.fetch_add(1, Ordering::Relaxed);
+        crate::torque::MotorWriteOutcome::Deferred
+    } else {
+        crate::torque::MotorWriteOutcome::Failed
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn send_nonblocking(socket: &UdpSocket, bytes: &[u8]) {
+    use std::os::fd::AsRawFd;
     let n = unsafe { libc::send(socket.as_raw_fd(), bytes.as_ptr().cast(), bytes.len(), libc::MSG_DONTWAIT) };
     if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock {
         SEND_DROPS.fetch_add(1, Ordering::Relaxed);
@@ -484,7 +499,7 @@ impl SimArmDriver {
         if serialized {
             // A lost datagram is equivalent to a lost CAN frame: the missing feedback,
             // not the write error, is what the supervisor acts on (BUS_LOSS).
-            send_nonblocking(&self.socket, &self.tx_buf);
+            let send_outcome = send_nonblocking(&self.socket, &self.tx_buf);
             self.last_send_ms.store(self.epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
             #[cfg(not(target_arch = "wasm32"))]
             if self.shadow_staging.is_enabled() {
@@ -511,7 +526,7 @@ impl SimArmDriver {
                             || self.cmd_hold_targets.get(i).is_some_and(Option::is_some);
                         if include {
                             mask.insert(i as u8);
-                            *slot = crate::torque::MotorWriteOutcome::Sent;
+                            *slot = send_outcome;
                         }
                     }
                     if !mask.is_empty() {
