@@ -8122,6 +8122,14 @@ impl RefreshScheduler {
         !self.slot_used_this_tick
     }
 
+    /// Consume this tick's single `0xCC` slot (used by causal enable `RefreshCapture` and
+    /// post-freeze J7 refreshes so they share the 1-`0xCC`-per-tick cap without perturbing
+    /// the round-robin sweep cursor or masks).
+    #[inline]
+    fn mark_slot_used(&mut self) {
+        self.slot_used_this_tick = true;
+    }
+
     /// Select the next stale joint to receive this tick's single `0xCC` slot, or `None` if no
     /// slot is available, no joint is stale, or every stale joint was already polled within
     /// `cooldown`. Newly stale joints (not in `swept_mask`) are served immediately without
@@ -10010,9 +10018,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     /// Service the unified owner-local `0xCC` refresh scheduler: transmits and flushes at most
     /// ONE `0xCC` read-only status refresh frame per tick, reserved before ordinary TX.
     ///
-    /// Preserves all stop, MIT fence (`poll_tx_allowed`), deadline, authority (when enabling),
-    /// and RX-provenance (`last_read_drained && !awaiting_rx_boundary`) checks with zero locks
-    /// and zero heap allocations.
+    /// Preserves all stop, MIT fence (`poll_tx_allowed`), deadline, and RX-provenance
+    /// (`last_read_drained && !awaiting_rx_boundary`) checks with zero locks and zero heap
+    /// allocations. (Enable-transition causal `0xCC` refreshes run through
+    /// [`Self::send_refresh_with_boundary_opts`] sharing the same `slot_used_this_tick` cap.)
     fn service_refresh_scheduler(
         &mut self,
         expected_stamp: StopStamp,
@@ -10020,16 +10029,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         defer_active_pf_freeze: bool,
         allowed_mask: u64,
     ) -> Result<bool, ArmDriverError> {
-        if !self.refresh_scheduler.slot_available() {
+        if self.is_enabling || !self.refresh_scheduler.slot_available() {
             return Ok(false);
         }
         if !self.last_read_drained || self.awaiting_rx_boundary || !self.poll_tx_allowed() {
             return Ok(false);
         }
-        if self.is_enabling {
-            self.enable_estop_inhibited()?;
-            self.check_enable_tx_authority()?;
-        } else if self.pending_stop_check(Some(expected_stamp)).is_err() {
+        if self.pending_stop_check(Some(expected_stamp)).is_err() {
             return Ok(false);
         }
         let now = self.now();
@@ -10045,24 +10051,11 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             return Ok(false);
         };
         let _ = self.ensure_tx_pass();
-        let kind = if self.is_enabling {
-            TxKind::Handshake
-        } else {
-            TxKind::Refresh
-        };
-        let stamp = if self.is_enabling {
-            self.enable_stop_stamp
-        } else {
-            Some(expected_stamp)
-        };
-        match self.send(kind, stamp, deadline, false, |d| {
+        match self.send(TxKind::Refresh, Some(expected_stamp), deadline, false, |d| {
             Some(damiao::build_refresh_frame(d.motor_ids[joint]))
         }) {
             Ok(_) => {
-                if self.is_enabling {
-                    self.enable_estop_inhibited()?;
-                    self.check_enable_tx_authority()?;
-                } else if self.pending_stop_check(Some(expected_stamp)).is_err() {
+                if self.pending_stop_check(Some(expected_stamp)).is_err() {
                     self.discard_all_pending_tx();
                     self.refresh_scheduler.record_deferred();
                     return Err(ArmDriverError::EstopInhibited);
@@ -10095,23 +10088,11 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 Ok(false)
             }
             Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged) => {
-                if self.is_enabling {
-                    self.abort_enable_for_estop();
-                } else {
-                    self.discard_all_pending_tx();
-                }
+                self.discard_all_pending_tx();
                 Err(ArmDriverError::EstopInhibited)
             }
-            Err(r @ (TxRefusal::LeaseFenced | TxRefusal::EnableAuthorityExpired)) => {
-                self.torque_hs = None;
-                self.enable_failed();
-                Err(Self::refusal_to_driver_err(r))
-            }
             Err(TxRefusal::Transport(e)) if e.is_tx_backpressure() => {
-                if self.is_enabling {
-                    self.enable_estop_inhibited()?;
-                    self.check_enable_tx_authority()?;
-                } else if self.pending_stop_check(Some(expected_stamp)).is_err() {
+                if self.pending_stop_check(Some(expected_stamp)).is_err() {
                     self.discard_all_pending_tx();
                     return Err(ArmDriverError::EstopInhibited);
                 }
@@ -10144,12 +10125,11 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         {
             return Ok(false);
         }
-        let n = self.motor_ids.len().min(self.last_feedback_instant.len()).min(64);
         match self.send(TxKind::Refresh, Some(expected_stamp), None, false, |d| {
             Some(damiao::build_refresh_frame(d.motor_ids[pf_joint]))
         }) {
             Ok(_) => {
-                self.refresh_scheduler.commit_sent(pf_joint, n, self.now());
+                self.refresh_scheduler.mark_slot_used();
                 self.pf_refresh_pending = false;
                 self.pf_refresh_deferred_ticks = 0;
                 Ok(true)
@@ -12557,8 +12537,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.enable_estop_inhibited()?;
         self.check_enable_tx_authority()?;
         self.can.flush()?;
-        let n = self.motor_ids.len().min(self.last_feedback_instant.len()).min(64);
-        self.refresh_scheduler.commit_sent(joint, n, self.now());
+        self.refresh_scheduler.mark_slot_used();
         self.refresh_capture = Some(RefreshCapture {
             joint,
             boundary,
