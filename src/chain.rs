@@ -1158,6 +1158,9 @@ impl EvalBufs {
         let need_caps = eval.capsules.len();
         let need_geoms = eval.num_geoms;
         eval.recycle(self);
+        if need_slots > k::MAX_STACK_WORKSPACE_SLOTS && self.slots.capacity() < need_slots {
+            self.slots.reserve(need_slots - self.slots.len());
+        }
         let ensure_f64 = |v: &mut Vec<f64>, n: usize| {
             if v.capacity() < n {
                 v.reserve(n - v.len());
