@@ -863,7 +863,7 @@ fn relatching_deferral_fault_loop_allows_disable_at_rest_on_both_owners() {
         .count();
     assert_eq!(post_targets, 0, "no hold frames after torque-off");
     assert_eq!(
-        inner.driver.as_ref().unwrap().lock().unwrap().enable_state(),
+        inner.driver.as_ref().unwrap().read().unwrap().enable_state(),
         EnableState::Disabled
     );
 
@@ -1241,7 +1241,7 @@ fn fresh_driver_timestamps_never_vouch_for_stale_measured_positions_and_zero_off
     clock.advance(Duration::from_millis(300));
     // Observe empty RX queue so the next J1..J6 frames get a fresh queue bound.
     {
-        let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+        let mut drv = inner.driver.as_mut().unwrap().write().unwrap();
         let _ = drv.read_joint_states();
     }
     // Lift J2 to 0.45 rad and push fresh J1..J6 feedback only; call clear_fault (fails because
@@ -1293,7 +1293,7 @@ fn fresh_driver_timestamps_never_vouch_for_stale_measured_positions_and_zero_off
                 s.push_feedback(j);
             }
         });
-        let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+        let mut drv = inner.driver.as_mut().unwrap().write().unwrap();
         drv.begin_control_release(100 + step as u64);
         let _ = drv.read_joint_states();
     }
@@ -1311,7 +1311,7 @@ fn fresh_driver_timestamps_never_vouch_for_stale_measured_positions_and_zero_off
     for step in 0..3 {
         clock.advance(Duration::from_millis(10));
         bus.with(|s| s.push_all_feedback());
-        let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+        let mut drv = inner.driver.as_mut().unwrap().write().unwrap();
         drv.begin_control_release(110 + step as u64);
         let _ = drv.read_joint_states();
     }
@@ -2081,7 +2081,7 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
             s.tx_log.clear();
         });
         let started_at = {
-            let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+            let mut drv = inner.driver.as_mut().unwrap().write().unwrap();
             let t0 = drv.clock_now();
             let p = drv
                 .begin_disable_torque(DisableKind::DisableRequested {
@@ -2120,7 +2120,7 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
             }
         }
         let poll_res = {
-            let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+            let mut drv = inner.driver.as_mut().unwrap().write().unwrap();
             let dl = drv.clock_now() + Duration::from_millis(5);
             drv.poll_torque(dl)
         };
@@ -2152,7 +2152,7 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
                 );
                 clock.advance(Duration::from_secs(1));
                 let exp_res = {
-                    let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+                    let mut drv = inner.driver.as_mut().unwrap().write().unwrap();
                     let dl = drv.clock_now() + Duration::from_millis(5);
                     drv.poll_torque(dl)
                 };
@@ -2196,7 +2196,7 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
             inner.tick(0.02);
         }
         {
-            let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+            let mut drv = inner.driver.as_mut().unwrap().write().unwrap();
             let p = drv
                 .begin_disable_torque(DisableKind::DisableRequested {
                     started_at: t_req,
@@ -2213,7 +2213,7 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
         clock.advance(Duration::from_millis(30)); // now t_req + 1015 ms, feedback is fresh (30 ms)!
         bus.with(|s| s.push_all_feedback());
         let res = {
-            let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+            let mut drv = inner.driver.as_mut().unwrap().write().unwrap();
             let dl = drv.clock_now() + Duration::from_millis(5);
             drv.poll_torque(dl)
         };
@@ -2348,7 +2348,7 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
                 // `CMD_DISABLE` transmission itself (leaving `disable_pending == true`).
                 clock.advance(Duration::from_millis(25));
                 {
-                    let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+                    let mut drv = inner.driver.as_mut().unwrap().write().unwrap();
                     let _ = drv.read_joint_states();
                     for step in 0..3 {
                         if step > 0 {
@@ -2389,7 +2389,7 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
                                 clock.advance(Duration::from_millis(10));
                             }
                             bus.with(|s| s.push_all_feedback());
-                            let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+                            let mut drv = inner.driver.as_mut().unwrap().write().unwrap();
                             drv.begin_control_release(200 + step as u64);
                             let _ = drv.read_joint_states();
                         }
@@ -2492,7 +2492,7 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
                 }
             });
             {
-                let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+                let mut drv = inner.driver.as_mut().unwrap().write().unwrap();
                 drv.read_joint_states().unwrap();
                 if prior_all_off {
                     assert_eq!(drv.enable_state(), EnableState::Disabled);
@@ -2854,7 +2854,7 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
             }
             bus.clear_log();
             {
-                let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+                let mut drv = inner.driver.as_mut().unwrap().write().unwrap();
                 drv.begin_disable_torque(DisableKind::DisableProtective { reason })
                     .unwrap();
             }
@@ -4048,7 +4048,7 @@ fn spec_5_joint_without_fresh_feedback_gets_no_hold_frame_drops_queued_and_recap
     bus.clear_log();
     inner.tick(0.02);
     {
-        let drv = inner.driver.as_ref().unwrap().lock().unwrap();
+        let drv = inner.driver.as_ref().unwrap().read().unwrap();
         assert!(drv.pending_tx_len_total() > 0, "J3..J7 holds should be queued in hold queue");
     }
 
@@ -4102,7 +4102,7 @@ fn spec_5_joint_without_fresh_feedback_gets_no_hold_frame_drops_queued_and_recap
         JointHoldStatus::Queued,
         "J3 hold must be specifically queued right before crossing the 100 ms freshness boundary"
     );
-    let pending_before_stale = inner.driver.as_ref().unwrap().lock().unwrap().pending_tx_len_total();
+    let pending_before_stale = inner.driver.as_ref().unwrap().read().unwrap().pending_tx_len_total();
     assert!(pending_before_stale > 0);
 
     // Cross the 100 ms freshness boundary by advancing 20 ms (J3 age = 105..110 ms > 100 ms, while
@@ -4881,7 +4881,7 @@ fn e2_rest_pose_disable_gate_refuses_queued_raised_pose_behind_exhausted_drain()
             s.rx.push_back(make_dm_fb(1, 1, 0.45));
         });
         {
-            let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+            let mut drv = inner.driver.as_mut().unwrap().write().unwrap();
             let mut out = Vec::new();
             let dl = drv.clock_now() + Duration::from_millis(10);
             let (frames, more) = drv.read_joint_states_budgeted(&mut out, dl, 64).unwrap();
@@ -4918,7 +4918,7 @@ fn e2_rest_pose_disable_gate_refuses_queued_raised_pose_behind_exhausted_drain()
         // Second: bounded pre-disable drain (`max_rx_frames = 4`) also exhausts BEFORE reaching
         // the queued raised-pose frame -> STILL stays Pending with ZERO CMD_DISABLE frames!
         {
-            let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+            let mut drv = inner.driver.as_mut().unwrap().write().unwrap();
             let started = drv.clock_now();
             let p = drv
                 .begin_disable_torque_budgeted(
@@ -4943,7 +4943,7 @@ fn e2_rest_pose_disable_gate_refuses_queued_raised_pose_behind_exhausted_drain()
         // timestamps -> M3 defers in AwaitRestGate with 0 CMD_DISABLE frames). Then fresh
         // post-boundary feedback at the raised pose (0.45 rad) refuses immediately as TorqueOffWouldDrop!
         {
-            let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+            let mut drv = inner.driver.as_mut().unwrap().write().unwrap();
             let _ = drv.read_joint_states().unwrap();
             let started = drv.clock_now();
             let p = drv
@@ -4969,7 +4969,7 @@ fn e2_rest_pose_disable_gate_refuses_queued_raised_pose_behind_exhausted_drain()
             s.push_all_feedback();
         });
         {
-            let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+            let mut drv = inner.driver.as_mut().unwrap().write().unwrap();
             let dl = drv.clock_now() + Duration::from_millis(5);
             let err = drv.poll_torque_budgeted(dl, 64).unwrap_err();
             assert!(
@@ -5001,7 +5001,7 @@ fn e2_rest_pose_disable_gate_refuses_queued_raised_pose_behind_exhausted_drain()
             s.rx.push_back(make_dm_fb(1, 1, 0.0));
         });
         {
-            let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+            let mut drv = inner.driver.as_mut().unwrap().write().unwrap();
             // Tick 1: 4-frame drain exhausts -> Pending (`AwaitRestGate`, 0 CMD_DISABLE frames).
             let p1 = drv
                 .begin_disable_torque_budgeted(
@@ -5045,7 +5045,7 @@ fn e2_rest_pose_disable_gate_refuses_queued_raised_pose_behind_exhausted_drain()
             }
         });
         {
-            let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+            let mut drv = inner.driver.as_mut().unwrap().write().unwrap();
             let p = drv
                 .begin_disable_torque_budgeted(
                     DisableKind::DisableProtective {
@@ -6184,7 +6184,7 @@ fn r10_holds_continue_after_stop_and_fault_when_feedback_claims_all_motors_off()
             }
         }
         {
-            let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+            let mut drv = inner.driver.as_mut().unwrap().write().unwrap();
             assert_eq!(drv.refresh_enable_state().unwrap(), EnableState::Disabled);
         }
         inner.apply_stop_policy(StopPolicy::EStopLatch);
@@ -7896,7 +7896,7 @@ fn l2_energized_unverified_mode_readback_200ms_bound_latches_non_recoverable_fau
             s.fail_tx_ids.push(0x7FF); // fail mode write to invalidate J3 mode verification
         });
         {
-            let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+            let mut drv = inner.driver.as_mut().unwrap().write().unwrap();
             let hold = vec![armd::driver::JointTarget::position(0.25); 7];
             let modes = [
                 armd::driver::JointMode::Position,
@@ -8018,7 +8018,7 @@ fn l2_energized_unverified_mode_readback_200ms_bound_latches_non_recoverable_fau
             s.fail_tx_ids.push(0x7FF);
         });
         {
-            let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+            let mut drv = inner.driver.as_mut().unwrap().write().unwrap();
             let hold = vec![armd::driver::JointTarget::position(0.25); 7];
             let modes = [
                 armd::driver::JointMode::Position,
@@ -8060,7 +8060,7 @@ fn l2_energized_unverified_mode_readback_200ms_bound_latches_non_recoverable_fau
             inner.tick(0.02);
         }
         assert!(
-            inner.driver.as_ref().unwrap().lock().unwrap().joint_hold_mode_verified(2),
+            inner.driver.as_ref().unwrap().read().unwrap().joint_hold_mode_verified(2),
             "L2: causal on-tick readback reply before 200 ms must verify J3"
         );
         assert_eq!(
@@ -8125,7 +8125,7 @@ fn r11_b1_pending_disable_continues_holds_until_first_disable_frame_accepted() {
 
     // Submit TorqueOff while K=1 (< 3): enters `AwaitRestGate` (Pending, 0 CMD_DISABLE frames).
     // Holds MUST continue on this tick!
-    let gate_before = r.fx.core.driver.as_ref().unwrap().lock().unwrap().rest_pose_gate_status();
+    let gate_before = r.fx.core.driver.as_ref().unwrap().read().unwrap().rest_pose_gate_status();
     let eval_before = r.fx.core.may_disable_torque_while_stopped();
     r.bus.clear_log();
     r.submit_transition(TransitionOp::TorqueOff);
@@ -8176,7 +8176,7 @@ fn r11_b1_pending_disable_continues_holds_until_first_disable_frame_accepted() {
         "K=3 confirmed must dispatch first CMD_DISABLE batch (got {disables_k3})"
     );
     let (drv_dispatched, drv_pending) = {
-        let d = r.fx.core.driver.as_ref().unwrap().lock().unwrap();
+        let d = r.fx.core.driver.as_ref().unwrap().read().unwrap();
         (d.disable_frames_dispatched(), d.torque_transition_pending())
     };
     assert_eq!(
@@ -8333,7 +8333,7 @@ fn r11_b2_holds_never_dropped_on_stale_feedback_or_mit_owner_lost() {
         inner.mit.owner = MitOwner::Lost;
         inner.apply_stop_policy(StopPolicy::EStopLatch);
         {
-            let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+            let mut drv = inner.driver.as_mut().unwrap().write().unwrap();
             drv.set_mit_deadline_fence(Some(Duration::from_millis(50)), Duration::ZERO);
         }
 
@@ -8968,7 +8968,7 @@ fn r11_m3_drained_bus_stale_or_missing_defers_and_probes_within_1s_lifetime() {
     // Advance > 100 ms without pushing new feedback (bus is drained and stale).
     r.clock.advance(Duration::from_millis(150));
     {
-        let drv = r.fx.core.driver.as_ref().unwrap().lock().unwrap();
+        let drv = r.fx.core.driver.as_ref().unwrap().read().unwrap();
         assert_eq!(
             drv.rest_pose_gate_status(),
             armd::driver::RestPoseGateStatus::StaleOrMissing,
@@ -9168,7 +9168,7 @@ fn r12_b5_operational_torque_off_enforces_rest_gate_on_both_owners_and_drivers()
     );
     // Direct driver begin_disable_torque(DisableRequested) while operational + raised also refuses (0 TX).
     {
-        let mut drv = inner_leg.driver.as_ref().unwrap().lock().unwrap();
+        let mut drv = inner_leg.driver.as_mut().unwrap().write().unwrap();
         let started_at = drv.clock_now();
         let err = drv
             .begin_disable_torque(DisableKind::DisableRequested { started_at })
@@ -9279,7 +9279,7 @@ fn r12_b1_feetech_legacy_pending_disable_continues_holds_without_starvation() {
 
     // Driver mutex MUST be free immediately after `disable_torque()` returned.
     assert!(
-        inner.driver.as_ref().unwrap().try_lock().is_ok(),
+        inner.driver.as_ref().unwrap().try_read().is_some(),
         "B1: driver mutex must be released immediately after begin_disable_torque"
     );
 
@@ -9391,7 +9391,7 @@ fn r12_b2_mit_lost_falls_back_to_verified_posvel_hold_or_faults_under_l2_bound()
         enable_torque_admitted(&mut inner).unwrap();
         if j4_in_mit_mode {
             // Switch J4 into MIT mode with verified mode evidence.
-            let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+            let mut drv = inner.driver.as_mut().unwrap().write().unwrap();
             let modes = [
                 JointMode::Position,
                 JointMode::Position,
@@ -9584,7 +9584,7 @@ fn r12_b3_partial_disable_commits_intent_off_retries_remaining_and_skips_holds_o
             "R12 B3 (RT): disable_pending must stay true to retry remaining motors"
         );
         {
-            let drv = r.fx.core.driver.as_ref().unwrap().lock().unwrap();
+            let drv = r.fx.core.driver.as_ref().unwrap().read().unwrap();
             assert!(drv.disable_frames_dispatched());
             assert_eq!(
                 drv.disable_dispatched_mask(),
@@ -9601,7 +9601,7 @@ fn r12_b3_partial_disable_commits_intent_off_retries_remaining_and_skips_holds_o
         // Direct driver hold call must skip already-disabled J1.
         {
             r.bus.clear_log();
-            let mut drv = r.fx.core.driver.as_ref().unwrap().lock().unwrap();
+            let mut drv = r.fx.core.driver.as_mut().unwrap().write().unwrap();
             let targets = vec![
                 JointTarget {
                     position: 0.0,
@@ -9646,7 +9646,7 @@ fn r12_b3_partial_disable_commits_intent_off_retries_remaining_and_skips_holds_o
                 "R12 B3 (RT): remaining motor J{id} must receive CMD_DISABLE on retry: {all_retry_tx:?}"
             );
         }
-        let drv = r.fx.core.driver.as_ref().unwrap().lock().unwrap();
+        let drv = r.fx.core.driver.as_ref().unwrap().read().unwrap();
         assert_eq!(drv.disable_dispatched_mask(), 0);
     }
 
@@ -9690,7 +9690,7 @@ fn r12_b3_partial_disable_commits_intent_off_retries_remaining_and_skips_holds_o
         assert_eq!(inner.torque_intent, TorqueIntent::Off);
         assert!(inner.disable_pending);
         {
-            let drv = inner.driver.as_ref().unwrap().lock().unwrap();
+            let drv = inner.driver.as_ref().unwrap().read().unwrap();
             assert!(drv.disable_frames_dispatched());
             assert_eq!(drv.disable_dispatched_mask(), 0b0000_0001);
         }
@@ -9724,7 +9724,7 @@ fn r12_b3_partial_disable_commits_intent_off_retries_remaining_and_skips_holds_o
                 "R12 B3 (legacy): remaining motor J{id} must receive CMD_DISABLE on retry: {all_retry_tx:?}"
             );
         }
-        let drv = inner.driver.as_ref().unwrap().lock().unwrap();
+        let drv = inner.driver.as_ref().unwrap().read().unwrap();
         assert_eq!(drv.disable_dispatched_mask(), 0);
     }
 }
@@ -9798,7 +9798,7 @@ fn r12_b4_rt_thermal_cut_retries_every_release_after_first_contention() {
         r.bus.clear_log();
         let t_wall = Instant::now();
         {
-            let driver_ref = r.fx.core.driver.as_ref().unwrap();
+            let driver_ref = r.fx.core.driver.as_ref().unwrap().as_legacy_lock().unwrap().raw_mutex();
             let addr =
                 (driver_ref as *const std::sync::Mutex<Box<dyn ArmDriver>>) as usize;
             let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel::<()>(1);

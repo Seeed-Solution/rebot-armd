@@ -348,6 +348,19 @@ pub struct TrackingRuntime {
     spare_nominal: Option<(Vec<f32>, Vec<f32>)>,
 }
 
+/// Heap buffers displaced by [`TrackingRuntime::invalidate_retiring`] so callers on the RT
+/// tick thread can retire them off-thread without freeing inside a release.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Default)]
+pub(crate) struct TrackingRetiredBuffers {
+    pub(crate) issued_positions: Option<Vec<f32>>,
+    pub(crate) issued_velocities: Option<Vec<f32>>,
+    pub(crate) nominal: Option<(Vec<f32>, Vec<f32>)>,
+    pub(crate) ws_min_depths: Option<(u64, crate::kinematics::SlotBuf)>,
+    pub(crate) ws_keepout_min_depths: Option<(u64, crate::kinematics::SlotBuf)>,
+    pub(crate) fallback_ramp: Option<FallbackRamp>,
+}
+
 /// Rejection-fallback braking ramp state (`TrackingRuntime::fallback_ramp`).
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone)]
@@ -537,6 +550,63 @@ impl TrackingRuntime {
         self.ws_keepout_min_depths = ws_keepout_min_depths;
     }
 
+    /// Off-thread normalization before RT executor handoff: drops only redundant spare buffers
+    /// that collide with currently-occupied active history buffers while preserving live tracking
+    /// history, workspace escape depths, and any active fallback braking ramp.
+    pub(crate) fn normalize_spares_off_thread(&mut self) {
+        if self.last_issued_positions.is_some() {
+            self.spare_issued_positions = None;
+        }
+        if self.last_issued_velocities.is_some() {
+            self.spare_issued_velocities = None;
+        }
+        if self.last_nominal.is_some() {
+            self.spare_nominal = None;
+        }
+    }
+
+    /// Zero-free variant of [`Self::invalidate`] for RT-thread callers: moves any displaced heap
+    /// buffers (including when preallocated spares, heap-backed depth slots, or `fallback_ramp`
+    /// are occupied) into the returned [`TrackingRetiredBuffers`] so the caller can drop them off
+    /// the RT thread.
+    pub(crate) fn invalidate_retiring(&mut self) -> TrackingRetiredBuffers {
+        self.history_state = TrackingHistoryState::Unknown;
+        self.retained_motion_vel_caps = None;
+        let mut retired = TrackingRetiredBuffers::default();
+        if let Some(v) = self.last_issued_positions.take() {
+            if self.spare_issued_positions.is_none() {
+                self.spare_issued_positions = Some(v);
+            } else {
+                retired.issued_positions = Some(v);
+            }
+        }
+        if let Some(v) = self.last_issued_velocities.take() {
+            if self.spare_issued_velocities.is_none() {
+                self.spare_issued_velocities = Some(v);
+            } else {
+                retired.issued_velocities = Some(v);
+            }
+        }
+        if let Some(pair) = self.last_nominal.take() {
+            if self.spare_nominal.is_none() {
+                self.spare_nominal = Some(pair);
+            } else {
+                retired.nominal = Some(pair);
+            }
+        }
+        retired.ws_min_depths = self.ws_min_depths.take();
+        retired.ws_keepout_min_depths = self.ws_keepout_min_depths.take();
+        retired.fallback_ramp = self.fallback_ramp.take();
+        self.holding_fallback_pose = false;
+        retired
+    }
+
+    /// Test hook exposing [`Self::invalidate_retiring`] as an opaque drop-deferred token.
+    #[doc(hidden)]
+    pub fn invalidate_retiring_for_test(&mut self) -> impl Sized {
+        self.invalidate_retiring()
+    }
+
     /// Invalidate output history (partial writes, suspension, holds/faults, mode changes).
     pub fn invalidate(&mut self) {
         self.history_state = TrackingHistoryState::Unknown;
@@ -654,7 +724,7 @@ impl crate::supervisor::SupervisorInner {
         let velocity_feedback = self
             .driver
             .as_ref()
-            .is_some_and(|d| d.lock().is_ok_and(|drv| drv.capabilities().velocity_feedback));
+            .is_some_and(|d| d.with_ref(|drv| drv.capabilities().velocity_feedback).unwrap_or(false));
         if velocity_feedback {
             return arm.iter().all(|&j| {
                 self.measured_velocities

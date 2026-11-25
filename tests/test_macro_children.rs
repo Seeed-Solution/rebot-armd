@@ -3,7 +3,6 @@
 //! the RT deadline of a child and the contact guard evaluated by the control tick.
 mod common;
 
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use armd::macro_action::{ActionId, ChildSpec, ChildTicket, ContactGuard, SubState};
@@ -29,7 +28,7 @@ fn driven() -> (SupervisorInner, TestArm) {
     let arm = TestArm::new();
     let mut inner = SupervisorInner::new(ArmConfig { collision: None, lease_timeout_ms: 600_000, ..ArmConfig::rebot_dm() });
     inner.lease_enabled = false;
-    inner.driver = Some(Mutex::new(Box::new(arm.clone())));
+    inner.driver = Some(armd::supervisor_lock::DriverSlot::legacy(Box::new(arm.clone())));
     inner.commanded_positions = INSPECT.to_vec();
     inner.measured_positions = INSPECT.to_vec();
     inner.target_positions = INSPECT.to_vec();

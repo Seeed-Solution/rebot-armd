@@ -1560,49 +1560,30 @@ impl CoreOps for SupervisorInner {
                 ..HardwarePoll::default()
             };
         };
-        match driver.try_lock() {
-            Ok(d) => {
-                d.feedback_ages_into(&mut self.scratch.ages);
-                let oldest = self.scratch.ages.iter().copied().try_fold(Duration::ZERO, |m, a| a.map(|a| m.max(a)));
-                HardwarePoll {
-                    driverless: false,
-                    feedback_valid: d.is_feedback_valid(),
-                    enable_state: Some(d.enable_state()),
-                    oldest_feedback_age: oldest,
-                    rx_frames,
-                    budget_exhausted,
-                    torque: self.core.poll_transition(),
-                    park_wake,
-                    park_state_changed,
-                }
+        let sample = |d: &dyn crate::driver::ArmDriver, ages: &mut Vec<Option<Duration>>| {
+            d.feedback_ages_into(ages);
+            let oldest = ages.iter().copied().try_fold(Duration::ZERO, |m, a| a.map(|a| m.max(a)));
+            (d.is_feedback_valid(), d.enable_state(), oldest)
+        };
+        let (feedback_valid, enable_state, oldest) = match driver.try_with_ref(|d| sample(d, &mut self.scratch.ages)) {
+            Ok(v) => v,
+            Err(crate::supervisor_lock::DriverTryError::WouldBlock) => {
+                (false, crate::driver::EnableState::Unknown, None)
             }
-            Err(std::sync::TryLockError::WouldBlock) => HardwarePoll {
-                driverless: false,
-                feedback_valid: false,
-                enable_state: Some(crate::driver::EnableState::Unknown),
-                oldest_feedback_age: None,
-                rx_frames,
-                budget_exhausted,
-                torque: self.core.poll_transition(),
-                park_wake,
-                park_state_changed,
-            },
-            Err(std::sync::TryLockError::Poisoned(e)) => {
-                let d = e.into_inner();
-                d.feedback_ages_into(&mut self.scratch.ages);
-                let oldest = self.scratch.ages.iter().copied().try_fold(Duration::ZERO, |m, a| a.map(|a| m.max(a)));
-                HardwarePoll {
-                    driverless: false,
-                    feedback_valid: d.is_feedback_valid(),
-                    enable_state: Some(d.enable_state()),
-                    oldest_feedback_age: oldest,
-                    rx_frames,
-                    budget_exhausted,
-                    torque: self.core.poll_transition(),
-                    park_wake,
-                    park_state_changed,
-                }
+            Err(crate::supervisor_lock::DriverTryError::Poisoned) => {
+                driver.with_ref_recover(|d| sample(d, &mut self.scratch.ages))
             }
+        };
+        HardwarePoll {
+            driverless: false,
+            feedback_valid,
+            enable_state: Some(enable_state),
+            oldest_feedback_age: oldest,
+            rx_frames,
+            budget_exhausted,
+            torque: self.core.poll_transition(),
+            park_wake,
+            park_state_changed,
         }
     }
 

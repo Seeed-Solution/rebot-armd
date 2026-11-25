@@ -1317,20 +1317,16 @@ impl SupervisorInner {
         }
         match &self.driver {
             None => true,
-            Some(d) => match d.try_lock() {
-                Ok(drv) => drv.feedback_all_within(self.config.dof, Duration::MAX),
-                Err(std::sync::TryLockError::Poisoned(p)) => {
-                    p.into_inner().feedback_all_within(self.config.dof, Duration::MAX)
-                }
-                Err(std::sync::TryLockError::WouldBlock) => false,
-            },
+            Some(d) => d
+                .try_with_ref_recover(|drv| drv.feedback_all_within(self.config.dof, Duration::MAX))
+                .unwrap_or(false),
         }
     }
 
     pub fn policy_input_age_range_ms(&self) -> Option<(u64, u64)> {
         match &self.driver {
             None => Some((0, 0)),
-            Some(d) => d.lock().ok().and_then(|drv| {
+            Some(d) => d.with_ref(|drv| {
                 let ages = drv.feedback_ages();
                 if ages.len() != self.config.dof {
                     return None;
@@ -1347,7 +1343,7 @@ impl SupervisorInner {
                     return None;
                 }
                 Some((min_ms, max_ms))
-            }),
+            })?,
         }
     }
 
@@ -1359,7 +1355,7 @@ impl SupervisorInner {
     ) -> Option<((u64, u64), std::time::Instant)> {
         match &self.driver {
             None => Some(((0, 0), now)),
-            Some(d) => d.lock().ok().and_then(|drv| {
+            Some(d) => d.with_ref(|drv| {
                 let ages = drv.feedback_ages();
                 if ages.len() != self.config.dof {
                     return None;
@@ -1381,7 +1377,7 @@ impl SupervisorInner {
                 }
                 let oldest = now.checked_sub(max_dur).unwrap_or(now);
                 Some(((min_ms, max_ms), oldest))
-            }),
+            })?,
         }
     }
 

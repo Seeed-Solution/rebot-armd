@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <iomanip>
 #include <sstream>
 
@@ -43,6 +44,22 @@ static void json_escape(std::ostringstream& s, const char* str) {
         if (*c == '"' || *c == '\\') s << '\\' << *c;
         else if (static_cast<unsigned char>(*c) >= 0x20) s << *c;
     }
+}
+
+static void append_contour_json(std::ostringstream& s, const Contour& contour, const ContentRect& rect, int inference_w,
+                                int inference_h) {
+    const float rw = rect.w > 0 ? rect.w : 1.0f;
+    const float rh = rect.h > 0 ? rect.h : 1.0f;
+    s << std::fixed << '[' << std::setprecision(4);
+    const size_t n = std::min(contour.size(), static_cast<size_t>(kMaxContourVertices));
+    for (size_t k = 0; k < n; ++k) {
+        if (k) s << ',';
+        const float cu = (contour[k][0] * inference_w - rect.x) / rw;
+        const float cv = (contour[k][1] * inference_h - rect.y) / rh;
+        s << '[' << std::min(1.0f, std::max(0.0f, std::isfinite(cu) ? cu : 0.0f)) << ','
+          << std::min(1.0f, std::max(0.0f, std::isfinite(cv) ? cv : 0.0f)) << ']';
+    }
+    s << ']';
 }
 
 std::string detections_json(const std::vector<DetBox>& dets, const ContentRect& rect, int inference_w,
@@ -95,16 +112,8 @@ std::string detections_json(const std::vector<DetBox>& dets, const ContentRect& 
             s << ",\"depth_angle_conf\":" << std::setprecision(3) << d.depth_angle_conf;
         if (std::isfinite(d.depth_width_px)) s << ",\"depth_width_px\":" << std::setprecision(2) << d.depth_width_px;
         if (d.contour.size() >= 3) {
-            s << ",\"contour\":[" << std::setprecision(4);
-            const size_t n = std::min(d.contour.size(), static_cast<size_t>(kMaxContourVertices));
-            for (size_t k = 0; k < n; ++k) {
-                if (k) s << ',';
-                const float cu = (d.contour[k][0] * inference_w - rect.x) / rw;
-                const float cv = (d.contour[k][1] * inference_h - rect.y) / rh;
-                s << '[' << std::min(1.0f, std::max(0.0f, std::isfinite(cu) ? cu : 0.0f)) << ','
-                  << std::min(1.0f, std::max(0.0f, std::isfinite(cv) ? cv : 0.0f)) << ']';
-            }
-            s << ']';
+            s << ",\"contour\":";
+            append_contour_json(s, d.contour, rect, inference_w, inference_h);
         }
         s << '}';
     }
@@ -130,11 +139,61 @@ std::string markers_json(const std::vector<MarkerOut>& markers, double sx, doubl
     return out;
 }
 
-std::string debug_extra(Mode mode, const std::string& display_markers_json) {
+size_t ws_contours_budget(Mode mode, const std::vector<DetBox>& dets, const std::string& display_markers_json,
+                          size_t max_frame_bytes) noexcept {
+    // Upper bound on debug_stream_build_results() bytes excluding the contours array value.
+    size_t base = 160;
+    for (const auto& d : dets) {
+        const size_t name_len = d.class_name ? std::strlen(d.class_name) : 0;
+        base += 52 + 2 * name_len;
+    }
+    base += 9 + std::strlen(mode_name(mode));
+    base += 11 + (display_markers_json.empty() ? 2 : display_markers_json.size());
+    base += 12;  // ,"contours":
+    return max_frame_bytes > base ? (max_frame_bytes - base) : 0;
+}
+
+std::string contours_json(const std::vector<DetBox>& dets, const ContentRect& rect, int inference_w, int inference_h,
+                          size_t max_bytes) {
+    const size_t count = dets.size();
+    const size_t min_bytes = count == 0 ? 2 : (1 + 5 * count);  // "[]" or "[null,...,null]"
+    if (max_bytes < min_bytes) return {};
+    if (count == 0) return "[]";
+
+    std::string out;
+    out.reserve(std::min(max_bytes, count * 256));
+    out.push_back('[');
+    std::ostringstream entry;
+    for (size_t i = 0; i < count; ++i) {
+        const size_t sep = i ? 1 : 0;
+        const size_t tail_min = (count - 1 - i) * 5 + 1;  // remaining ",null" entries + ']'
+        if (dets[i].contour.size() >= 3) {
+            entry.str("");
+            entry.clear();
+            append_contour_json(entry, dets[i].contour, rect, inference_w, inference_h);
+            const std::string poly = entry.str();
+            if (out.size() + sep + poly.size() + tail_min <= max_bytes) {
+                if (i) out.push_back(',');
+                out.append(poly);
+                continue;
+            }
+        }
+        if (i) out.push_back(',');
+        out.append("null");
+    }
+    out.push_back(']');
+    return out;
+}
+
+std::string debug_extra(Mode mode, const std::string& display_markers_json, const std::string& contours_json) {
     std::string s = "\"mode\":\"";
     s += mode_name(mode);
     s += "\",\"markers\":";
     s += display_markers_json.empty() ? "[]" : display_markers_json;
+    if (!contours_json.empty()) {
+        s += ",\"contours\":";
+        s += contours_json;
+    }
     return s;
 }
 

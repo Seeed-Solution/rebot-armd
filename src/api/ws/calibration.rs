@@ -66,6 +66,457 @@ pub(super) fn is_calibration_path(path: &str) -> bool {
     ENTRIES.iter().any(|e| e.key.path == Some(path))
 }
 
+/// Returns true if `path` (and its request body) is an out-of-scope hardware commissioning
+/// operation that must still fail closed with `409 EXECUTOR_UNSUPPORTED` on the RT executor.
+pub(super) async fn is_executor_calibration_unsupported(
+    path: &str,
+    body: &Value,
+    sup: &Arc<ArmSupervisor>,
+) -> bool {
+    if path == crate::mit::TIMEOUT_PATH || path == crate::mit::QUALIFICATION_PATH {
+        return true;
+    }
+    if path == crate::motor_zero::RESTORE_PATH {
+        return sup
+            .published_config()
+            .await
+            .map_or(true, |cfg| cfg.has_driver);
+    }
+    if path == crate::motor_zero::PATH {
+        let Ok(pub_cfg) = sup.published_config().await else {
+            return true;
+        };
+        if pub_cfg.has_driver {
+            return true;
+        }
+        return match body.get("method") {
+            Some(Value::String(m)) if m == "motor" => true,
+            Some(Value::String(m)) if m == "software" => false,
+            None | Some(Value::Null) => pub_cfg.calibration_tools().motor_zero.motor,
+            // Invalid method values (non-string or unknown string) fall through to software
+            // validation so they return the exact legacy `400 INVALID_COMMAND` reply.
+            Some(_) => false,
+        };
+    }
+    false
+}
+
+/// Formats a synchronous WS ingress calibration error from the RT owner, preserving the exact
+/// legacy ingress lease-loss reply (`This connection does not own an active lease` + `epoch_id`)
+/// and legacy `ws.rs:2902` concurrent `CONFIG_BUSY` envelope (`epoch_id` + `safety_state`) when
+/// another calibration transaction is already running.
+fn ingress_calib_reject(
+    request_id: &Value,
+    epoch: u64,
+    err: crate::rt_core::requests::config::ConfigError,
+) -> Value {
+    use crate::rt_core::requests::config::ConfigError;
+    match err {
+        ConfigError::LeaseLost | ConfigError::ConnectionClosed => json!({
+            "type": "command_reject",
+            "request_id": request_id,
+            "status": 409,
+            "code": "LEASE_LOST",
+            "error": "LEASE_LOST",
+            "message": "This connection does not own an active lease",
+            "epoch_id": epoch,
+        }),
+        ConfigError::Busy(msg) if msg == "a calibration apply, restore or motor zero is running" => {
+            let mut reply = rejection(
+                ApiError(StatusCode::CONFLICT, msg.into(), "CONFIG_BUSY".into()),
+                "command_reject",
+                epoch,
+            );
+            reply["request_id"] = request_id.clone();
+            reply
+        }
+        other => calibration_reject(request_id, &crate::calibration::calib_error_from_config(other)),
+    }
+}
+
+/// Forward a detached calibration worker's `JoinHandle<Value>` to `ack_tx`, ensuring a worker
+/// panic or join failure still produces the legacy deferred `500 INTERNAL` reply while the WS
+/// connection stays open.
+fn forward_deferred_calib_job(
+    worker_tasks: &ConnectionTasks,
+    job: tokio::task::JoinHandle<Value>,
+    request_id: Value,
+    ack_tx: mpsc::Sender<Value>,
+) {
+    worker_tasks.spawn(async move {
+        let reply = match job.await {
+            Ok(reply) => reply,
+            Err(e) => {
+                tracing::error!("executor calibration task failed: {e}");
+                calibration_reject(
+                    &request_id,
+                    &crate::calibration::CalibError::new(
+                        500,
+                        "INTERNAL",
+                        "calibration task failed: channel closed; check GET /api/v1/calibration and the backups",
+                    ),
+                )
+            }
+        };
+        let _ = ack_tx.send(reply).await;
+    });
+}
+
+/// Executor-mode WS handler for in-scope persistent calibration commands:
+/// `/api/v1/calibration/apply`, `/api/v1/calibration/restore`,
+/// software `/api/v1/calibration/motor_zero`, and `/api/v1/calibration/joint_zero/restore`.
+///
+/// Preserves the exact legacy synchronous-reject / immediate-dry-run vs deferred `ack_tx`
+/// split so wire replies remain byte-identical to legacy for the same inputs.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn handle_executor_calibration_ws(
+    path: &str,
+    request_id: Value,
+    body: Value,
+    generation: u64,
+    epoch: u64,
+    mut stamp: crate::supervisor::AdmissionStamp,
+    conn_id: u64,
+    recv_connection: &str,
+    recv_generation: &Arc<AtomicU64>,
+    ws_auth: &WsAuth,
+    recv_supervisor: &Arc<ArmSupervisor>,
+    recv_calib: &crate::calibration::CalibrationDeps,
+    ack_tx: &mpsc::Sender<Value>,
+    worker_tasks: &ConnectionTasks,
+) -> Option<Value> {
+    // Preserve `stamp.stop_gen` captured once at WS ingress (`ws.rs:2462`) so a Stop arriving
+    // while this command was queued is never overtaken.
+    stamp.connection_id = conn_id;
+    stamp.lease_gen = generation;
+    stamp.estop_epoch = epoch;
+
+    let ws_auth_c = ws_auth.clone();
+    let gen_now_c = recv_generation.clone();
+    let auth_check: Arc<
+        dyn Fn() -> Result<(), (&'static str, crate::supervisor::ArmError)> + Send + Sync,
+    > = Arc::new(move || {
+        if !ws_auth_c.is_operator() {
+            return Err((
+                "OPERATOR_REQUIRED",
+                crate::supervisor::ArmError::Rejected {
+                    status: 403,
+                    code: "OPERATOR_REQUIRED".into(),
+                    message: "Operator session expired or locked during calibration".into(),
+                },
+            ));
+        }
+        if gen_now_c.load(Ordering::SeqCst) != generation {
+            return Err((
+                "LEASE_LOST",
+                crate::supervisor::ArmError::Rejected {
+                    status: 409,
+                    code: "LEASE_LOST".into(),
+                    message: "This connection lost the lease during the calibration".into(),
+                },
+            ));
+        }
+        Ok(())
+    });
+    let mut auth = crate::calibration::ExecutorCalibAuth {
+        admission: stamp,
+        lease_holder: Some((crate::model::HolderLabel::new(recv_connection), generation)),
+        operator_grant: ws_auth.operator_grant(),
+        auth_check,
+        txn_id: None,
+    };
+
+    let cfg_auth = crate::rt_core::requests::config::ConfigAuthContext {
+        admission: auth.admission,
+        lease_holder: auth.lease_holder,
+    };
+
+    if path == crate::motor_zero::PATH || path == crate::motor_zero::RESTORE_PATH {
+        // Match legacy `ws.rs:2902` precedence authoritatively on RT: validate live owner lease,
+        // epoch, stop_gen, and operator grant BEFORE checking `calibration_busy` and BEFORE body parsing.
+        match recv_supervisor
+            .dispatch_config_request(
+                crate::rt_core::requests::config::ConfigRequest::BeginCalibrationTxn {
+                    txn_id: 0,
+                    auth: cfg_auth,
+                    operator_grant: auth.operator_grant,
+                    expected_epoch: auth.admission.estop_epoch,
+                    expected_stop_gen: auth.admission.stop_gen,
+                    kind: crate::rt_core::requests::config::CalibrationTxnKind::IngressBusyCheck,
+                },
+            )
+            .await
+        {
+            Ok(crate::rt_core::requests::config::ConfigReply::CalibrationTxnBegan(Ok(_))) => {}
+            Ok(crate::rt_core::requests::config::ConfigReply::CalibrationTxnBegan(Err(e))) => {
+                return Some(ingress_calib_reject(&request_id, epoch, e));
+            }
+            Err(e) => {
+                return Some(ingress_calib_reject(&request_id, epoch, e));
+            }
+            _ => {
+                return Some(calibration_reject(
+                    &request_id,
+                    &crate::calibration::CalibError::new(
+                        500,
+                        "INTERNAL",
+                        "unexpected ingress check reply",
+                    ),
+                ));
+            }
+        }
+    }
+
+    if path == crate::motor_zero::PATH {
+        match crate::motor_zero::check_software_executor(recv_supervisor, &body, &auth).await {
+            Ok(crate::motor_zero::ExecutorZeroStart::DryRunReply(reply)) => {
+                return Some(fields_ack(&request_id, reply));
+            }
+            Ok(crate::motor_zero::ExecutorZeroStart::Run(req, pre_guard)) => {
+                auth.txn_id = Some(pre_guard.txn_id());
+                let (sup, calib, tx) = (recv_supervisor.clone(), recv_calib.clone(), ack_tx.clone());
+                let req_id_job = request_id.clone();
+                let job = tokio::spawn(async move {
+                    match crate::motor_zero::run_software_executor_with_guard(
+                        &sup,
+                        &calib,
+                        req,
+                        auth,
+                        Some(pre_guard),
+                    )
+                    .await
+                    {
+                        Ok(v) => fields_ack(&req_id_job, v),
+                        Err(e) => calibration_reject(&req_id_job, &e),
+                    }
+                });
+                forward_deferred_calib_job(worker_tasks, job, request_id, tx);
+                return None;
+            }
+            Err(e) => {
+                if e.code == "LEASE_LOST" {
+                    return Some(ingress_calib_reject(
+                        &request_id,
+                        epoch,
+                        crate::rt_core::requests::config::ConfigError::LeaseLost,
+                    ));
+                }
+                return Some(calibration_reject(&request_id, &e));
+            }
+        }
+    }
+
+    if path == crate::motor_zero::RESTORE_PATH {
+        match crate::motor_zero::check_restore_executor(recv_supervisor, &body, &auth).await {
+            Ok((name, pre_guard)) => {
+                auth.txn_id = Some(pre_guard.txn_id());
+                let (sup, calib, tx) = (recv_supervisor.clone(), recv_calib.clone(), ack_tx.clone());
+                let req_id_job = request_id.clone();
+                let job = tokio::spawn(async move {
+                    match crate::motor_zero::restore_executor_with_guard(
+                        &sup,
+                        &calib,
+                        name,
+                        auth,
+                        Some(pre_guard),
+                    )
+                    .await
+                    {
+                        Ok(v) => fields_ack(&req_id_job, v),
+                        Err(e) => calibration_reject(&req_id_job, &e),
+                    }
+                });
+                forward_deferred_calib_job(worker_tasks, job, request_id, tx);
+                return None;
+            }
+            Err(e) => {
+                if e.code == "LEASE_LOST" {
+                    return Some(ingress_calib_reject(
+                        &request_id,
+                        epoch,
+                        crate::rt_core::requests::config::ConfigError::LeaseLost,
+                    ));
+                }
+                return Some(calibration_reject(&request_id, &e));
+            }
+        }
+    }
+
+    // `/api/v1/calibration/apply` and `/api/v1/calibration/restore`:
+    // Run authoritative RT `CameraPreflight` BEFORE body parsing to match legacy `begin_checks`
+    // -> `parse_apply` / object check -> `kinematics_armed` precedence exactly.
+    match recv_supervisor
+        .dispatch_config_request(
+            crate::rt_core::requests::config::ConfigRequest::BeginCalibrationTxn {
+                txn_id: 0,
+                auth: cfg_auth,
+                operator_grant: auth.operator_grant,
+                expected_epoch: auth.admission.estop_epoch,
+                expected_stop_gen: auth.admission.stop_gen,
+                kind: crate::rt_core::requests::config::CalibrationTxnKind::CameraPreflight,
+            },
+        )
+        .await
+    {
+        Ok(crate::rt_core::requests::config::ConfigReply::CalibrationTxnBegan(Ok(_))) => {}
+        Ok(crate::rt_core::requests::config::ConfigReply::CalibrationTxnBegan(Err(e))) => {
+            return Some(ingress_calib_reject(&request_id, epoch, e));
+        }
+        Err(e) => {
+            return Some(ingress_calib_reject(&request_id, epoch, e));
+        }
+        _ => {
+            return Some(calibration_reject(
+                &request_id,
+                &crate::calibration::CalibError::new(500, "INTERNAL", "unexpected preflight reply"),
+            ));
+        }
+    }
+
+    if path == "/api/v1/calibration/apply" {
+        let req = match crate::calibration::parse_apply(&body) {
+            Ok(r) => r,
+            Err(e) => return Some(calibration_reject(&request_id, &e)),
+        };
+        let txn_id = crate::rt_core::requests::config::next_calibration_txn_id();
+        let mut pre_guard = (!req.dry_run)
+            .then(|| crate::calibration::ExecutorTxnGuard::new(recv_supervisor.clone(), txn_id));
+        match recv_supervisor
+            .dispatch_config_request(
+                crate::rt_core::requests::config::ConfigRequest::BeginCalibrationTxn {
+                    txn_id,
+                    auth: cfg_auth,
+                    operator_grant: auth.operator_grant,
+                    expected_epoch: auth.admission.estop_epoch,
+                    expected_stop_gen: auth.admission.stop_gen,
+                    kind: crate::rt_core::requests::config::CalibrationTxnKind::CameraApply {
+                        require_kinematics_disarmed: !req.dry_run && req.kinematics.is_some(),
+                        dry_run: req.dry_run,
+                    },
+                },
+            )
+            .await
+        {
+            Ok(crate::rt_core::requests::config::ConfigReply::CalibrationTxnBegan(Ok(_))) => {
+                if !req.dry_run {
+                    recv_supervisor.published_config_hub().update(|cfg| {
+                        cfg.calibration_busy = true;
+                        cfg.calibration_txn_id = Some(txn_id);
+                    });
+                    auth.txn_id = Some(txn_id);
+                }
+            }
+            Ok(crate::rt_core::requests::config::ConfigReply::CalibrationTxnBegan(Err(e))) => {
+                if let Some(g) = pre_guard.take() {
+                    let _ = g.disarm();
+                }
+                return Some(ingress_calib_reject(&request_id, epoch, e));
+            }
+            Err(e) => {
+                if let Some(g) = pre_guard.take() {
+                    g.release().await;
+                }
+                return Some(ingress_calib_reject(&request_id, epoch, e));
+            }
+            _ => {
+                if let Some(g) = pre_guard.take() {
+                    g.release().await;
+                }
+                return Some(calibration_reject(
+                    &request_id,
+                    &crate::calibration::CalibError::new(500, "INTERNAL", "unexpected begin reply"),
+                ));
+            }
+        }
+        let (sup, calib, tx) = (recv_supervisor.clone(), recv_calib.clone(), ack_tx.clone());
+        let req_id_job = request_id.clone();
+        let job = tokio::spawn(async move {
+            match crate::calibration::apply_executor_with_guard(
+                &sup,
+                &calib,
+                req,
+                auth,
+                pre_guard,
+            )
+            .await
+            {
+                Ok(v) => fields_ack(&req_id_job, v),
+                Err(e) => calibration_reject(&req_id_job, &e),
+            }
+        });
+        forward_deferred_calib_job(worker_tasks, job, request_id, tx);
+        return None;
+    }
+
+    // `/api/v1/calibration/restore`
+    if !body.is_object() {
+        return Some(calibration_reject(
+            &request_id,
+            &crate::calibration::CalibError::new(
+                400,
+                "INVALID_COMMAND",
+                "Command body must be an object",
+            ),
+        ));
+    }
+    let txn_id = crate::rt_core::requests::config::next_calibration_txn_id();
+    let pre_guard = crate::calibration::ExecutorTxnGuard::new(recv_supervisor.clone(), txn_id);
+    match recv_supervisor
+        .dispatch_config_request(
+            crate::rt_core::requests::config::ConfigRequest::BeginCalibrationTxn {
+                txn_id,
+                auth: cfg_auth,
+                operator_grant: auth.operator_grant,
+                expected_epoch: auth.admission.estop_epoch,
+                expected_stop_gen: auth.admission.stop_gen,
+                kind: crate::rt_core::requests::config::CalibrationTxnKind::CameraRestore,
+            },
+        )
+        .await
+    {
+        Ok(crate::rt_core::requests::config::ConfigReply::CalibrationTxnBegan(Ok(_))) => {
+            recv_supervisor.published_config_hub().update(|cfg| {
+                cfg.calibration_busy = true;
+                cfg.calibration_txn_id = Some(txn_id);
+            });
+            auth.txn_id = Some(txn_id);
+        }
+        Ok(crate::rt_core::requests::config::ConfigReply::CalibrationTxnBegan(Err(e))) => {
+            let _ = pre_guard.disarm();
+            return Some(ingress_calib_reject(&request_id, epoch, e));
+        }
+        Err(e) => {
+            pre_guard.release().await;
+            return Some(ingress_calib_reject(&request_id, epoch, e));
+        }
+        _ => {
+            pre_guard.release().await;
+            return Some(calibration_reject(
+                &request_id,
+                &crate::calibration::CalibError::new(500, "INTERNAL", "unexpected begin reply"),
+            ));
+        }
+    }
+    let (sup, calib, tx) = (recv_supervisor.clone(), recv_calib.clone(), ack_tx.clone());
+    let req_id_job = request_id.clone();
+    let job = tokio::spawn(async move {
+        match crate::calibration::restore_executor_with_guard(
+            &sup,
+            &calib,
+            &body,
+            auth,
+            Some(pre_guard),
+        )
+        .await
+        {
+            Ok(v) => fields_ack(&req_id_job, v),
+            Err(e) => calibration_reject(&req_id_job, &e),
+        }
+    });
+    forward_deferred_calib_job(worker_tasks, job, request_id, tx);
+    None
+}
+
 /// Fail-closed capability refusal for calibration, motor-zero, joint-zero, and MIT endpoints
 /// while the RT executor owns the arm (never touches disk or live state).
 pub(super) fn dispatch_executor_calibration_command(path: &str, value: &Value, epoch: u64) -> Value {
