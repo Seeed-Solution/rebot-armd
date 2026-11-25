@@ -98,10 +98,10 @@ pub fn step(state: &mut TorqueState, event: Event) -> ActionSet {
             group,
             succeeded,
             now_us: _,
-        } => handle_park_settled(state, group, succeeded, now_us),
+        } => handle_park_settled(state, group, succeeded, now_us, &mut actions),
         Event::Panic { tier, now_us: _ } => handle_panic(state, tier, now_us, &mut actions),
         Event::ProcessExit { now_us: _ } => handle_process_exit(state, now_us, &mut actions),
-        Event::BusLoss { device, now_us: _ } => handle_bus_loss(state, device, now_us),
+        Event::BusLoss { device, now_us: _ } => handle_bus_loss(state, device, now_us, &mut actions),
     }
 
     populate_telemetry(state, now_us, &mut actions);
@@ -869,6 +869,15 @@ fn handle_causal_sample(
     // Valid, fresh, causal sample: update joint telemetry and anchored capture.
     {
         let rt = &mut state.joints[ch];
+        // If prior feedback had already gone stale without an intervening Release, drop the
+        // stale capture so this fresh sample recaptures the current measured position.
+        let prev_was_fresh = rt
+            .last_sample_us
+            .is_some_and(|prev_ts| is_sample_fresh(prev_ts, now_us, ch_cfg.max_capture_age_us));
+        if !prev_was_fresh {
+            rt.captured_position_rad = None;
+            rt.captured_at_us = None;
+        }
         rt.last_sample_id = Some(sample.sample_id);
         rt.last_sample_us = Some(sample.rx_timestamp_us);
         rt.last_sample_release_id = Some(state.current_release_id);
@@ -1396,7 +1405,9 @@ fn handle_disable_write_result(
     let gi = g as usize;
     let grp_cfg = state.config.groups[gi];
 
-    let matches_active_or_recent = state.groups[gi].disable_tx.is_some()
+    let matches_active_or_recent = state.groups[gi]
+        .disable_tx
+        .is_some_and(|tx| tx.last_dispatched_release_id.is_some())
         || state.groups[gi].last_authorized_disable_gen == Some(wr.generation);
     if !matches_active_or_recent {
         return;
@@ -1536,6 +1547,14 @@ fn handle_enable_start(state: &mut TorqueState, group: u8, now_us: u64, actions:
         actions.refusals[gi] = Some(RefusalEvent {
             group,
             code: RefusalCode::ControlPanicSafeHold,
+            channel: None,
+        });
+        return;
+    }
+    if grp.park_in_flight {
+        actions.refusals[gi] = Some(RefusalEvent {
+            group,
+            code: RefusalCode::InternalFault,
             channel: None,
         });
         return;
@@ -1879,6 +1898,14 @@ fn handle_motion_command(
         });
         return;
     }
+    if grp.park_in_flight {
+        actions.refusals[gi] = Some(RefusalEvent {
+            group,
+            code: RefusalCode::InternalFault,
+            channel: None,
+        });
+        return;
+    }
     if state.worker_panic_latched {
         actions.refusals[gi] = Some(RefusalEvent {
             group,
@@ -1973,6 +2000,14 @@ fn handle_disable_request(
         actions.refusals[gi] = Some(RefusalEvent {
             group,
             code: RefusalCode::ControlPanicSafeHold,
+            channel: None,
+        });
+        return;
+    }
+    if grp.park_in_flight {
+        actions.refusals[gi] = Some(RefusalEvent {
+            group,
+            code: RefusalCode::InternalFault,
             channel: None,
         });
         return;
@@ -2190,7 +2225,11 @@ fn handle_stop(
                         DriveState::Fault | DriveState::FailedHold
                     )
                 {
-                    state.groups[gi].drive_state = DriveState::QuickStopActive;
+                    state.groups[gi].drive_state = if state.groups[gi].faults.is_empty() {
+                        DriveState::QuickStopActive
+                    } else {
+                        DriveState::Fault
+                    };
                 }
             }
             StopKind::EStop | StopKind::Watchdog | StopKind::Fault(_) => {
@@ -2530,6 +2569,7 @@ fn handle_park_settled(
     group: u8,
     succeeded: bool,
     now_us: u64,
+    actions: &mut ActionSet,
 ) {
     if group >= state.config.group_count {
         return;
@@ -2540,6 +2580,13 @@ fn handle_park_settled(
     if state.groups[gi].drive_state.is_protective()
         || state.groups[gi].drive_state == DriveState::SafeHold
     {
+        return;
+    }
+
+    if state.groups[gi].drive_state == DriveState::ReadyToSwitchOn {
+        if !succeeded {
+            enter_failed_hold(state, group, now_us, actions);
+        }
         return;
     }
 
@@ -2708,7 +2755,7 @@ fn handle_process_exit(state: &mut TorqueState, now_us: u64, actions: &mut Actio
     }
 }
 
-fn handle_bus_loss(state: &mut TorqueState, device: u8, now_us: u64) {
+fn handle_bus_loss(state: &mut TorqueState, device: u8, now_us: u64, actions: &mut ActionSet) {
     if device >= state.config.device_count {
         return;
     }
@@ -2745,11 +2792,7 @@ fn handle_bus_loss(state: &mut TorqueState, device: u8, now_us: u64) {
             continue;
         }
         if state.groups[gi].drive_state == DriveState::ReadyToSwitchOn {
-            state.groups[gi].drive_state = DriveState::FailedHold;
-            state.groups[gi].enable_phase = EnablePhase::FailedHold;
-            state.groups[gi].enable_tx = None;
-            state.groups[gi].torque_intent = TorqueIntent::On;
-            state.groups[gi].faults.insert(TorqueFaultKind::EnableFailed);
+            enter_failed_hold(state, g, now_us, actions);
             continue;
         }
         if let Some(tx) = state.groups[gi].disable_tx {

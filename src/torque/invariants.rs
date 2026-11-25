@@ -472,8 +472,18 @@ fn check_rest_gate_invariants(
             let ci = s.channel as usize;
             let ch_cfg = &state.config.channels[ci];
             if s.is_handshake_ack_only {
-                if state.joints[ci].captured_position_rad != prev.joints[ci].captured_position_rad
+                let capture_created_or_moved = match (
+                    prev.joints[ci].captured_position_rad,
+                    state.joints[ci].captured_position_rad,
+                ) {
+                    (_, None) => false, // dropping an expired stale capture is not position evidence
+                    (Some(a), Some(b)) => a != b,
+                    (None, Some(_)) => true,
+                };
+                if capture_created_or_moved
                     || state.joints[ci].last_sample_us != prev.joints[ci].last_sample_us
+                    || state.joints[ci].last_measured_pos_rad
+                        != prev.joints[ci].last_measured_pos_rad
                 {
                     return Err(Violation::new(
                         ViolationKind::HandshakeAckTreatedAsPositionEvidence,
@@ -680,7 +690,9 @@ fn check_dispatch_invariants(
             )
         {
             let gi = wr.group as usize;
-            let matched = prev.groups[gi].disable_tx.is_some()
+            let matched = prev.groups[gi]
+                .disable_tx
+                .is_some_and(|tx| tx.last_dispatched_release_id.is_some())
                 || prev.groups[gi].last_authorized_disable_gen == Some(wr.generation);
             let any_sent_or_ambiguous = wr
                 .target_mask
