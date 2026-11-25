@@ -5771,7 +5771,7 @@ fn j7_enable_refresh_review_blocker_regressions() {
         let arm_jump = Arc::new(AtomicBool::new(false));
         let countdown = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let jumped = Arc::new(AtomicBool::new(false));
-        let jump_ms = if case == "freshness_100ms" { 10 } else { 10 };
+        let jump_ms = 10;
         let clk = Arc::new(JumpBeforeTxClock {
             inner: base_clock.clone(),
             arm_jump: arm_jump.clone(),
