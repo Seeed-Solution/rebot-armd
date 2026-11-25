@@ -3313,6 +3313,23 @@ impl SupervisorInner {
         self.terminal_capture_channel.clone()
     }
 
+    /// Returns cloned off-thread handles required for normal executor teardown to drain the
+    /// authoritative `TerminalCaptureChannel` into `TerminalBroadcaster` before final broker
+    /// reply delivery and route retirement (zero RT locks/allocs; cloned once at spawn).
+    pub(crate) fn terminal_capture_drain_handles(
+        &self,
+    ) -> Option<(
+        Arc<terminal_capture::TerminalCaptureChannel>,
+        Arc<TerminalBroadcaster>,
+        Arc<ArmObservation>,
+    )> {
+        Some((
+            self.terminal_capture_channel.clone()?,
+            self.terminals.clone()?,
+            self.template_obs_for_drain.clone()?,
+        ))
+    }
+
     /// Shared record-construction entry point wrapping `TerminalCaptureRecord::capture_from` so
     /// early capture paths (immediate supersession, pre-overwrite materialization, staged
     /// eviction) are audited by `terminal_capture_test_hook` identically to `capture_edge_terminals`.

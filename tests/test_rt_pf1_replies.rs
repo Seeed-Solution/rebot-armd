@@ -2509,3 +2509,137 @@ async fn pf1_reentry_shutdown_emergency_teardown_and_open_rollback() {
         handle.stop_and_join();
     }
 }
+
+/// Regression proof for post-merge review Blocker #1:
+/// When `armd-control` publishes and emits the final broker `Reply::Terminal` while the
+/// authoritative `TerminalCaptureChannel` still holds the in-flight capture (before
+/// `armd-dispatch` drains it), normal executor teardown (`stop_and_join`) MUST drain the capture
+/// channel against the final snapshot BEFORE the final broker delivery pass and route retirement
+/// so the originating WS socket receives the terminal instead of discarding it on `Backpressured`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pf1_normal_teardown_drains_inflight_terminal_capture_before_broker_finalization() {
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    // Intentionally do NOT start `armd-dispatch` so the SPSC capture remains in-flight until
+    // normal executor teardown drains it.
+    let app = create_router(sup.clone(), OperatorAuth::disabled());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let (mut ws_ctrl, gen_ctrl) = controller(addr).await;
+    let ep0 = sup.get_observation().await.epoch_id;
+    let tq_ack = rpc(
+        &mut ws_ctrl,
+        gen_ctrl,
+        ep0,
+        "/api/v1/torque",
+        json!({"enable": true}),
+    )
+    .await;
+    assert_eq!(tq_ack["type"], "command_ack", "{tq_ack}");
+
+    let handle = sup
+        .start_executor(ExecutorConfig::for_tests(Duration::from_millis(5)))
+        .await
+        .expect("start RT executor");
+    assert_eq!(sup.owner_mode(), OWNER_EXECUTOR);
+    wait_pub_ready(&sup).await;
+    let epoch = sup.hub().latest().unwrap().obs.epoch_id;
+
+    // Pause `TerminalCaptureChannel` drain so `armd-dispatch` cannot consume the capture before
+    // normal executor teardown runs.
+    sup.test_set_terminal_capture_drain_paused(true);
+
+    // Submit a fast prepared action over WS; `command_ack` returns as soon as RT admits it.
+    send(
+        &mut ws_ctrl,
+        json!({
+            "type": "command",
+            "request_id": 2,
+            "generation": gen_ctrl,
+            "epoch_id": epoch,
+            "path": "/api/v1/action/move_relative",
+            "body": {"delta": [0.02, 0.0, 0.0], "frame": "base", "speed_scale": 1.0},
+        }),
+    )
+    .await;
+    let ack = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let text = ws_ctrl.next().await.unwrap().unwrap().into_text().unwrap();
+            let v: Value = serde_json::from_str(&text).unwrap();
+            if v.get("type").is_some() && v["request_id"].as_u64() == Some(2) {
+                return v;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for move_relative ACK");
+    assert_eq!(ack["type"], "command_ack", "{ack}");
+    assert_eq!(ack["status"], "accepted", "{ack}");
+    let action_id = ack["action_id"].as_u64().expect("action_id");
+
+    // Wait for `armd-control` to finish `move_relative` and push its capture into the SPSC ring.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while sup.test_terminal_capture_stats().queued == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for in-flight terminal capture of action {action_id}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Pumping broker replies BEFORE capture drain must hold back (`Backpressured`), proving the
+    // capture-to-broadcaster gate is active.
+    let delivered_before_drain = handle.pump_broker_replies();
+    assert_eq!(
+        delivered_before_drain, 0,
+        "owner reply must wait for TerminalCaptureChannel drain"
+    );
+
+    // Close the hub while capture drain is still paused so `armd-dispatch` exits cleanly without
+    // draining the capture, then unpause capture drain: now ONLY `handle.stop_and_join()` can
+    // drain the in-flight capture before final broker delivery & route retirement.
+    sup.hub().close();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert!(
+        sup.test_terminal_capture_stats().queued >= 1,
+        "capture must remain in-flight after dispatcher exit while paused"
+    );
+    sup.test_set_terminal_capture_drain_paused(false);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        sup.test_terminal_capture_stats().queued >= 1,
+        "no background dispatcher may drain capture before stop_and_join"
+    );
+
+    // Normal executor teardown MUST drain `TerminalCaptureChannel` before the final broker
+    // delivery pass and route retirement.
+    tokio::task::spawn_blocking({
+        let handle = handle.clone();
+        move || handle.stop_and_join()
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        sup.test_terminal_capture_stats().queued,
+        0,
+        "normal teardown must drain in-flight captures"
+    );
+    assert_eq!(handle.reply_router_stats().global_reserved, 0);
+    assert!(
+        handle.reply_router_stats().terminals_delivered >= 1,
+        "normal teardown must deliver the captured owner terminal instead of discarding it: {:?}",
+        handle.reply_router_stats()
+    );
+
+    // Originating WS socket receives the delivered terminal frame with `state == "done"`.
+    let terminal = wait_action_terminal_ws(&mut ws_ctrl, action_id, Duration::from_secs(5)).await;
+    assert_eq!(terminal["id"].as_u64(), Some(action_id));
+    assert_eq!(terminal["state"].as_str(), Some("done"));
+
+    drop(ws_ctrl);
+    server.abort();
+}

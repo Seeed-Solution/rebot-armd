@@ -1681,6 +1681,12 @@ pub(crate) struct BrokerDispatcher {
     broker: Arc<Mutex<Broker<PlanSlot>>>,
     conn_lifecycle: Arc<super::requests::lease::ConnLifecycleClient>,
     reply_router: Arc<Mutex<ActionReplyRouter>>,
+    hub: Arc<StateHub>,
+    terminal_capture_drain: Option<(
+        Arc<crate::supervisor::terminal_capture::TerminalCaptureChannel>,
+        Arc<crate::supervisor::TerminalBroadcaster>,
+        Arc<crate::model::ArmObservation>,
+    )>,
     broker_discarded: AtomicBool,
     state: Mutex<BrokerDispatcherState>,
 }
@@ -1719,6 +1725,12 @@ impl BrokerDispatcher {
         broker: Arc<Mutex<Broker<PlanSlot>>>,
         conn_lifecycle: Arc<super::requests::lease::ConnLifecycleClient>,
         reply_router: Arc<Mutex<ActionReplyRouter>>,
+        hub: Arc<StateHub>,
+        terminal_capture_drain: Option<(
+            Arc<crate::supervisor::terminal_capture::TerminalCaptureChannel>,
+            Arc<crate::supervisor::TerminalBroadcaster>,
+            Arc<crate::model::ArmObservation>,
+        )>,
         exited: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -1726,6 +1738,8 @@ impl BrokerDispatcher {
             broker,
             conn_lifecycle,
             reply_router,
+            hub,
+            terminal_capture_drain,
             broker_discarded: AtomicBool::new(false),
             state: Mutex::new(BrokerDispatcherState {
                 managed: HashMap::with_capacity(super::broker::REPLY_CAPACITY),
@@ -2498,10 +2512,24 @@ impl BrokerDispatcher {
     }
 
     fn finalize_stopped_under_gate(&self, rt_joined: bool, allow_callbacks: bool) {
-        // 1. On normal shutdown (`allow_callbacks == true`), give already-emitted replies one
-        //    final delivery pass. On emergency shutdown (`allow_callbacks == false`), NEVER invoke
-        //    sink callbacks so a slow or stalled sink cannot defeat the emergency deadline.
+        // 1. On normal shutdown (`allow_callbacks == true`), drain any in-flight records from the
+        //    authoritative `TerminalCaptureChannel` against the final snapshot BEFORE the final
+        //    broker delivery pass so WS owner reply sinks observe every captured terminal instead
+        //    of returning `Backpressured` and having finalization discard the reply.
+        //    On emergency shutdown (`allow_callbacks == false`), NEVER drain or invoke sink
+        //    callbacks so a slow or stalled sink cannot defeat the emergency deadline.
         if allow_callbacks {
+            if let Some((ch, terminals, template_obs)) = self.terminal_capture_drain.as_ref() {
+                let final_snap = self.hub.latest();
+                let _ = ch.drain_into(
+                    terminals,
+                    &self.hub,
+                    final_snap.as_deref(),
+                    &[],
+                    template_obs,
+                    false,
+                );
+            }
             let _ = self.deliver_ready_under_gate(true);
         }
         // 2. Finalize all remaining off-RT state and recover reservations (lock-only).
@@ -4956,6 +4984,8 @@ pub(crate) fn spawn_executor(
         Arc::clone(&broker),
         Arc::clone(&conn_lifecycle_client),
         Arc::clone(&reply_router),
+        Arc::clone(&hub),
+        core.terminal_capture_drain_handles(),
         exited.clone(),
     ));
     let control_exited_cv = Arc::new((Mutex::new(ControlExitState::default()), Condvar::new()));
