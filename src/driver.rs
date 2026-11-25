@@ -8101,8 +8101,16 @@ enum DamiaoTorque {
     /// before transmitting the capped 0x307 pre-enable hold.
     PreEnableRefresh(FeedbackRefresh),
     /// Enable frames sent (or still queued in `unsent_mask` across TX-budgeted polls), awaiting
-    /// fresh state-1 feedback from every motor.
-    Enable { window: ConfirmWindow, unsent_mask: u32 },
+    /// fresh state-1 feedback from every motor. Reserves a bounded causal J7 `0xCC` refresh slot
+    /// and fair J7 TX priority so a carried or retried J7 enable neither starves nor goes stale.
+    Enable {
+        window: ConfirmWindow,
+        unsent_mask: u32,
+        tx_cursor: u8,
+        j7_prioritize: bool,
+        pf_refresh: Option<FeedbackRefresh>,
+        pf_refresh_count: u8,
+    },
     /// Stopped disable waiting for an exhausted RX drain or incomplete K=3 rest-pose window
     /// to complete inside the 1 s request lifetime before transmitting any `CMD_DISABLE` (L1).
     AwaitRestGate {
@@ -8159,10 +8167,15 @@ struct RefreshCapture {
     boundary: u64,
     tx_at: Instant,
     deadline: Deadline,
+    /// When true (in-enable J7 refresh), `motor_status == 1` (already enabled on a retry after a
+    /// dropped enable reply) is valid and does not trigger an immediate unsafe veto. Hardware
+    /// faults and invalid states still veto immediately.
+    allow_enabled_state: bool,
     first: Option<RefreshSample>,
     /// First post-boundary J7 reply observed during this refresh that violated stationary
-    /// torque-off (`|v| > 0.05`, non-finite velocity, or `motor_status != 0`). Sticky across
-    /// polls so a later benign reply cannot mask an intervening motion or fault event.
+    /// torque-off (`|v| > 0.05`, non-finite velocity, or `motor_status != 0`; when
+    /// `allow_enabled_state` is true, `motor_status == 1` with finite velocity is permitted).
+    /// Sticky across polls so a later benign reply cannot mask an intervening motion or fault event.
     unsafe_sample: Option<RefreshSample>,
 }
 
@@ -8219,6 +8232,12 @@ const RANGE_CHECK_REPLY_TIMEOUT: Duration = Duration::from_millis(20);
 /// Feedback freshness bound for position-force gripper mode writes, pre-enable holds,
 /// stale-feedback recovery, and opening-speed allowance.
 const POS_FORCE_FEEDBACK_MAX_AGE: Duration = Duration::from_millis(100);
+/// Bounded causal `0xCC` refresh window during `DamiaoTorque::Enable` (clamped to the enable
+/// confirmation deadline and authority deadline; accommodates 30-60 ms Damiao replies across
+/// 20 ms releases while staying strictly inside `POS_FORCE_FEEDBACK_MAX_AGE`).
+const ENABLE_PF_REFRESH_TIMEOUT: Duration = Duration::from_millis(80);
+/// Maximum bounded causal J7 `0xCC` refreshes permitted within one `DamiaoTorque::Enable` window.
+const MAX_ENABLE_PF_REFRESHES: u8 = 2;
 
 impl<C: CanTransport> DamiaoArmDriver<C> {
     pub fn new(can: C, motor_ids: Vec<u16>) -> Self {
@@ -12174,8 +12193,14 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     /// Establish a tight pre-transmit RX boundary, transmit `0xCC` for `joint` within the
     /// per-tick TX budget, and arm `refresh_capture`. Returns `Ok(None)` if RX cannot be drained
     /// or the TX budget is exhausted/backpressured before `deadline`.
-    fn send_refresh_with_boundary(&mut self, joint: usize, deadline: Deadline) -> Result<Option<u64>, ArmDriverError> {
+    fn send_refresh_with_boundary_opts(
+        &mut self,
+        joint: usize,
+        deadline: Deadline,
+        allow_enabled_state: bool,
+    ) -> Result<Option<u64>, ArmDriverError> {
         self.enable_estop_inhibited()?;
+        self.check_enable_tx_authority()?;
         if !self.drain_rx_for_boundary(deadline) || deadline.passed(self.now()) {
             return Ok(None);
         }
@@ -12203,6 +12228,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             boundary,
             tx_at,
             deadline,
+            allow_enabled_state,
             first: None,
             unsafe_sample: None,
         });
@@ -12219,7 +12245,40 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let start = self.now();
         let deadline = Deadline::after(start, REGISTER_REPLY_TIMEOUT);
         let boundary = if drained_now && !deadline.passed(self.now()) {
-            self.send_refresh_with_boundary(joint, deadline)?
+            self.send_refresh_with_boundary_opts(joint, deadline, false)?
+        } else {
+            None
+        };
+        Ok(FeedbackRefresh { joint, boundary, deadline })
+    }
+
+    /// Start a bounded causal `0xCC` feedback refresh for J7 while `DamiaoTorque::Enable` is in
+    /// flight. The refresh deadline is fixed before any drain/TX and clamped to both
+    /// `window_deadline` and `enable_tx_deadline`.
+    fn start_enable_pf_refresh(
+        &mut self,
+        joint: usize,
+        window_deadline: Deadline,
+        drained_now: bool,
+    ) -> Result<FeedbackRefresh, ArmDriverError> {
+        self.enable_estop_inhibited()?;
+        self.check_enable_tx_authority()?;
+        self.refresh_capture = None;
+        let start = self.now();
+        let mut refresh_at = (start + ENABLE_PF_REFRESH_TIMEOUT).min(window_deadline.at);
+        if let Some(auth_dl) = self.enable_tx_deadline {
+            refresh_at = refresh_at.min(auth_dl);
+        }
+        let deadline = Deadline { at: refresh_at };
+        let boundary = if drained_now && !deadline.passed(self.now()) {
+            match self.send_refresh_with_boundary_opts(joint, deadline, true) {
+                Ok(b) => b,
+                Err(e) if is_estop_inhibited(&e) => return Err(e),
+                Err(e) => {
+                    self.enable_failed();
+                    return Err(e);
+                }
+            }
         } else {
             None
         };
@@ -12233,13 +12292,22 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     /// never be skipped. Any post-boundary unsafe J7 sample (motion or non-zero status/fault)
     /// vetoes immediately. Even at the expiry wake, runs one bounded RX drain before deciding;
     /// if the queue still has not drained at the deadline, fails closed (`TimedOut`).
-    fn poll_feedback_refresh(&mut self, mut r: FeedbackRefresh) -> Result<RefreshStep, ArmDriverError> {
+    fn poll_feedback_refresh(&mut self, r: FeedbackRefresh) -> Result<RefreshStep, ArmDriverError> {
+        self.poll_feedback_refresh_opts(r, false)
+    }
+
+    fn poll_feedback_refresh_opts(
+        &mut self,
+        mut r: FeedbackRefresh,
+        allow_enabled_state: bool,
+    ) -> Result<RefreshStep, ArmDriverError> {
         self.enable_estop_inhibited()?;
         let expired_before_read = r.deadline.passed(self.now());
         match r.boundary {
             None => {
                 if !expired_before_read {
-                    r.boundary = self.send_refresh_with_boundary(r.joint, r.deadline)?;
+                    r.boundary =
+                        self.send_refresh_with_boundary_opts(r.joint, r.deadline, allow_enabled_state)?;
                 }
             }
             Some(b) => {
@@ -12776,19 +12844,50 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
 
     /// Transmit enable frames for joints in `mask` through [`Self::send`] (`TxKind::Handshake`),
     /// enforcing **deadline -> budget -> stop gate -> J7 freshness revalidation -> stamp -> transmit**
-    /// on every frame and checking the stop gate before flush. Returns the bitmask of joints still
-    /// unsent because the TX budget or backpressure stopped this pass (to be carried into subsequent
-    /// `poll_enable` ticks).
+    /// on every frame and checking the stop gate before flush.
+    ///
+    /// Fair TX scheduling: when `prioritize_joint` is set in `mask` (e.g., a J7 enable carried
+    /// across a previous release), it is attempted first so J7 cannot starve behind earlier joints
+    /// across more than one release; remaining joints proceed round-robin from `*tx_cursor`.
+    /// When `defer_stale_pf` is true and J7's feedback expires mid-batch while its CTRL_MODE is
+    /// verified, J7's bit is left in the returned `mask` so the caller can run its bounded causal
+    /// `0xCC` refresh slot instead of failing closed before trying a refresh.
     fn send_enable_masked(
         &mut self,
         mut mask: u32,
         fail_on_error: bool,
         deadline: Option<Deadline>,
+        tx_cursor: &mut u8,
+        prioritize_joint: Option<usize>,
+        defer_stale_pf: bool,
     ) -> Result<u32, ArmDriverError> {
         self.enable_estop_inhibited()?;
         self.check_enable_tx_authority()?;
+        let n = self.motor_ids.len().min(handshake::MAX_MASK_JOINTS);
+        let mut order = [0u8; handshake::MAX_MASK_JOINTS];
+        let mut order_len = 0usize;
+        if let Some(prio) = prioritize_joint {
+            if prio < n && (mask & (1u32 << prio)) != 0 {
+                order[order_len] = prio as u8;
+                order_len += 1;
+            }
+        }
+        if n > 0 {
+            let start = usize::from(*tx_cursor) % n;
+            for offset in 0..n {
+                let i = (start + offset) % n;
+                if Some(i) == prioritize_joint {
+                    continue;
+                }
+                if (mask & (1u32 << i)) != 0 {
+                    order[order_len] = i as u8;
+                    order_len += 1;
+                }
+            }
+        }
         let mut sent_any = false;
-        for i in handshake::mask_joints(mask) {
+        for &i_u8 in &order[..order_len] {
+            let i = usize::from(i_u8);
             self.check_enable_tx_authority()?;
             let Some(&id) = self.motor_ids.get(i) else {
                 mask &= !(1 << i);
@@ -12811,6 +12910,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     mask &= !(1 << i);
                     sent_any = true;
                     self.enable_frames_sent_any = true;
+                    if Some(i) != prioritize_joint && n > 0 {
+                        *tx_cursor = ((i + 1) % n) as u8;
+                    }
                 }
                 Err(TxRefusal::DeadlinePassed | TxRefusal::Deferred) => break,
                 Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged) => {
@@ -12818,11 +12920,17 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     return Err(ArmDriverError::EstopInhibited);
                 }
                 Err(TxRefusal::BuildRefused | TxRefusal::PosForceFeedbackExpired(_)) => {
+                    let mode_ok = self.verified_modes.get(i).copied().flatten() == Some(self.base_mode(i))
+                        && self.joint_modes.get(i).copied().flatten() == Some(self.base_mode(i));
+                    if mode_ok
+                        && defer_stale_pf
+                        && self.pos_force.as_ref().is_some_and(|pf| pf.joint == i)
+                    {
+                        continue;
+                    }
                     self.torque_hs = None;
                     self.enable_failed();
-                    if self.verified_modes.get(i).copied().flatten() != Some(self.base_mode(i))
-                        || self.joint_modes.get(i).copied().flatten() != Some(self.base_mode(i))
-                    {
+                    if !mode_ok {
                         return Err(ArmDriverError::HardwareFault(format!(
                             "joint {} CTRL_MODE unverified before enable",
                             i + 1
@@ -12880,11 +12988,32 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         Ok(mask)
     }
 
+    fn enable_pending_wake(
+        after: Instant,
+        window_wake: Instant,
+        actionable_unsent: u32,
+        pf_refresh: &Option<FeedbackRefresh>,
+        tx_release_deadline: Option<Instant>,
+    ) -> Instant {
+        let mut wake = window_wake;
+        if let Some(ref r) = pf_refresh {
+            wake = wake.min(r.deadline.at);
+        }
+        let needs_tx_now =
+            actionable_unsent != 0 || pf_refresh.as_ref().is_some_and(|r| r.boundary.is_none());
+        if needs_tx_now && tx_release_deadline.is_none_or(|cap| after < cap) {
+            after
+        } else {
+            wake
+        }
+    }
+
     /// Enable frames to every motor (bounded by the per-tick TX budget, carrying any remaining
     /// motors into subsequent `poll_enable` ticks), then the confirmation window
     /// (DAMIAO_ENABLE_CONFIRM, bounded by time only).
     fn send_enable(&mut self) -> Result<TorqueProgress, ArmDriverError> {
         self.enable_estop_inhibited()?;
+        self.check_enable_tx_authority()?;
         let handshake_start = self.now();
         self.last_enable_command = Some(handshake_start);
         self.last_enable_command_rx_seq = Some(self.rx_seq);
@@ -12893,16 +13022,78 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let n = self.motor_ids.len().min(handshake::MAX_MASK_JOINTS);
         let all_mask = if n >= 32 { u32::MAX } else { (1u32 << n) - 1 };
         let initial_deadline = Deadline::after(handshake_start, DAMIAO_ENABLE_CONFIRM);
-        let unsent_mask = self.send_enable_masked(all_mask, true, Some(initial_deadline))?;
-        let poll_start = self.now();
-        let window = ConfirmWindow::new(TorqueDirection::Enable, self.motor_ids.len(), handshake_start, poll_start,
-            DAMIAO_ENABLE_CONFIRM, &DAMIAO_ENABLE_RETRY_AT);
-        let wake = if unsent_mask != 0 {
-            poll_start
+        let pf_joint = self.pos_force.as_ref().map(|p| p.joint).filter(|&j| j < n);
+        let pf_bit = pf_joint.map_or(0u32, |j| 1u32 << j);
+        let mut tx_cursor = 0u8;
+        let mut pf_refresh: Option<FeedbackRefresh> = None;
+        let mut pf_refresh_count = 0u8;
+
+        let send_mask = if let Some(pf_j) = pf_joint {
+            if !self.pf_enable_feedback_fresh(pf_j) {
+                pf_refresh_count += 1;
+                let drained_now = self.last_read_drained;
+                pf_refresh = Some(self.start_enable_pf_refresh(pf_j, initial_deadline, drained_now)?);
+                all_mask & !pf_bit
+            } else {
+                all_mask
+            }
         } else {
-            window.wake()
+            all_mask
         };
-        self.torque_hs = Some(DamiaoTorque::Enable { window, unsent_mask });
+
+        let defer_stale_pf = pf_refresh.is_none() && pf_refresh_count < MAX_ENABLE_PF_REFRESHES;
+        let mut unsent_mask = self.send_enable_masked(
+            send_mask,
+            true,
+            Some(initial_deadline),
+            &mut tx_cursor,
+            None,
+            defer_stale_pf,
+        )?;
+        if pf_refresh.is_some() {
+            unsent_mask |= pf_bit;
+        } else if let Some(pf_j) = pf_joint {
+            if (unsent_mask & pf_bit) != 0
+                && !self.pf_enable_feedback_fresh(pf_j)
+                && pf_refresh_count < MAX_ENABLE_PF_REFRESHES
+            {
+                pf_refresh_count += 1;
+                let drained_now = self.last_read_drained;
+                pf_refresh = Some(self.start_enable_pf_refresh(pf_j, initial_deadline, drained_now)?);
+            }
+        }
+        let j7_prioritize = (unsent_mask & pf_bit) != 0;
+        let poll_start = self.now();
+        let window = ConfirmWindow::new(
+            TorqueDirection::Enable,
+            self.motor_ids.len(),
+            handshake_start,
+            poll_start,
+            DAMIAO_ENABLE_CONFIRM,
+            &DAMIAO_ENABLE_RETRY_AT,
+        );
+        let held_j7 = if pf_refresh.is_some()
+            && pf_joint.is_some_and(|j| !self.pf_enable_feedback_fresh(j))
+        {
+            unsent_mask & pf_bit
+        } else {
+            0
+        };
+        let wake = Self::enable_pending_wake(
+            poll_start,
+            window.wake(),
+            unsent_mask & !held_j7,
+            &pf_refresh,
+            self.tx_release_deadline,
+        );
+        self.torque_hs = Some(DamiaoTorque::Enable {
+            window,
+            unsent_mask,
+            tx_cursor,
+            j7_prioritize,
+            pf_refresh,
+            pf_refresh_count,
+        });
         Ok(TorqueProgress::Pending { wake })
     }
 
@@ -12977,6 +13168,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.is_enabling = false;
         self.is_enabled = true;
         self.pending_rearm = false;
+        self.refresh_capture = None;
         self.disable_dispatched_mask = 0;
         self.enable_stop_stamp = None;
         self.enable_tx_deadline = None;
@@ -13022,61 +13214,309 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         (confirmed_mask, all_post_fb, fault)
     }
 
-    fn poll_enable(&mut self, mut window: ConfirmWindow, mut unsent_mask: u32) -> Result<TorqueProgress, ArmDriverError> {
+    fn poll_enable(
+        &mut self,
+        mut window: ConfirmWindow,
+        mut unsent_mask: u32,
+        mut tx_cursor: u8,
+        mut j7_prioritize: bool,
+        mut pf_refresh: Option<FeedbackRefresh>,
+        mut pf_refresh_count: u8,
+    ) -> Result<TorqueProgress, ArmDriverError> {
         self.enable_estop_inhibited()?;
+        self.check_enable_tx_authority()?;
+        let n = self.motor_ids.len().min(handshake::MAX_MASK_JOINTS);
+        let pf_joint = self.pos_force.as_ref().map(|p| p.joint).filter(|&j| j < n);
+        let pf_bit = pf_joint.map_or(0u32, |j| 1u32 << j);
+
         if window.expire(self.now()).is_some() {
+            self.enable_failed();
+            if let Some(pf_j) = pf_joint {
+                if pf_refresh.is_some()
+                    || ((unsent_mask & pf_bit) != 0 && !self.pf_enable_feedback_fresh(pf_j))
+                {
+                    return Err(ArmDriverError::PosForceFeedbackStaleBeforeTransmit { joint: pf_j });
+                }
+            }
             let feedback_valid = self.is_feedback_valid();
             let mut statuses = [0u8; crate::rt_core::mailbox::MAX_DOF];
             let dof = self.motor_status.len().min(crate::rt_core::mailbox::MAX_DOF);
             statuses[..dof].copy_from_slice(&self.motor_status[..dof]);
-            self.enable_failed();
             return Err(ArmDriverError::EnableTimeout {
                 feedback_valid,
                 statuses,
                 dof: dof as u8,
             });
         }
-        let _ = self.receive_feedback();
-        self.enable_estop_inhibited()?;
+
         let deadline = Deadline { at: window.deadline };
-        if unsent_mask != 0 {
-            unsent_mask = self.send_enable_masked(unsent_mask, true, Some(deadline))?;
+
+        // Single RX pass + bounded causal J7 0xCC refresh service.
+        if let Some(r) = pf_refresh.take() {
+            let r_joint = r.joint;
+            if r.boundary.is_some() {
+                match self.poll_feedback_refresh_opts(r, true) {
+                    Ok(RefreshStep::Ready(sample)) => {
+                        let pf_j = r_joint;
+                        if damiao_fault_name(sample.motor_status).is_some() {
+                            let motor_id = self.motor_ids[pf_j];
+                            self.enable_failed();
+                            return Err(ArmDriverError::MotorHardwareFault {
+                                joint: pf_j,
+                                motor_id,
+                                status: sample.motor_status,
+                            });
+                        }
+                        let state_ok = sample.motor_status == 0 || sample.motor_status == 1;
+                        let vel_ok = if sample.motor_status == 0 {
+                            sample.velocity.is_finite() && sample.velocity.abs() <= 0.05
+                        } else {
+                            sample.velocity.is_finite()
+                        };
+                        let sample_fresh = sample.position.is_finite()
+                            && self.since(sample.rx_at) <= POS_FORCE_FEEDBACK_MAX_AGE
+                            && sample
+                                .queue_bound
+                                .is_some_and(|qb| self.since(qb) <= POS_FORCE_FEEDBACK_MAX_AGE);
+                        if !(state_ok && vel_ok && sample_fresh && self.pf_enable_feedback_fresh(pf_j)) {
+                            self.enable_failed();
+                            return Err(ArmDriverError::PosForceFeedbackStaleBeforeTransmit { joint: pf_j });
+                        }
+                        // Verified fresh reply accepted: `pf_refresh` remains `None` so J7
+                        // revalidates and transmits CMD_ENABLE in THIS release if TX budget remains.
+                    }
+                    Ok(RefreshStep::Pending(r_next)) => {
+                        pf_refresh = Some(r_next);
+                    }
+                    Ok(RefreshStep::TimedOut) => {
+                        self.enable_failed();
+                        return Err(ArmDriverError::PosForceFeedbackStaleBeforeTransmit { joint: r_joint });
+                    }
+                    Err(e) if is_estop_inhibited(&e) => return Err(e),
+                    Err(e) => {
+                        self.enable_failed();
+                        return Err(e);
+                    }
+                }
+                self.check_enable_tx_authority()?;
+            } else {
+                let _ = self.receive_feedback();
+                self.enable_estop_inhibited()?;
+                self.check_enable_tx_authority()?;
+                let pf_j = r_joint;
+                if self.last_read_drained && self.pf_enable_feedback_fresh(pf_j) {
+                    self.refresh_capture = None;
+                } else {
+                    match self.poll_feedback_refresh_opts(r, true) {
+                        Ok(RefreshStep::Pending(r_next)) => {
+                            pf_refresh = Some(r_next);
+                        }
+                        Ok(RefreshStep::Ready(_)) => unreachable!("boundary was None"),
+                        Ok(RefreshStep::TimedOut) => {
+                            self.enable_failed();
+                            return Err(ArmDriverError::PosForceFeedbackStaleBeforeTransmit { joint: pf_j });
+                        }
+                        Err(e) if is_estop_inhibited(&e) => return Err(e),
+                        Err(e) => {
+                            self.enable_failed();
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+        } else {
+            let _ = self.receive_feedback();
+            self.enable_estop_inhibited()?;
+            self.check_enable_tx_authority()?;
         }
+
+        // If J7 is in `unsent_mask` and stale, reserve the bounded 0xCC refresh slot FIRST before
+        // earlier joints consume TX budget.
+        if let Some(pf_j) = pf_joint {
+            if pf_refresh.is_none()
+                && (unsent_mask & pf_bit) != 0
+                && !self.pf_enable_feedback_fresh(pf_j)
+            {
+                if pf_refresh_count >= MAX_ENABLE_PF_REFRESHES {
+                    self.enable_failed();
+                    return Err(ArmDriverError::PosForceFeedbackStaleBeforeTransmit { joint: pf_j });
+                }
+                pf_refresh_count += 1;
+                let drained_now = self.last_read_drained;
+                pf_refresh = Some(self.start_enable_pf_refresh(pf_j, deadline, drained_now)?);
+            }
+        }
+
+        if unsent_mask != 0 {
+            let pf_stale = pf_joint.is_some_and(|j| !self.pf_enable_feedback_fresh(j));
+            let held_j7 = if pf_refresh.is_some() && pf_stale {
+                unsent_mask & pf_bit
+            } else {
+                0
+            };
+            let tx_mask = unsent_mask & !held_j7;
+            if tx_mask != 0 {
+                let prio = pf_joint.filter(|_| j7_prioritize && (tx_mask & pf_bit) != 0);
+                let defer_stale_pf =
+                    pf_refresh.is_none() && pf_refresh_count < MAX_ENABLE_PF_REFRESHES;
+                let rem = self.send_enable_masked(
+                    tx_mask,
+                    true,
+                    Some(deadline),
+                    &mut tx_cursor,
+                    prio,
+                    defer_stale_pf,
+                )?;
+                let j7_was_in_tx = (tx_mask & pf_bit) != 0;
+                unsent_mask = rem | held_j7;
+                if j7_was_in_tx && (rem & pf_bit) == 0 && pf_refresh.is_some() {
+                    pf_refresh = None;
+                    self.refresh_capture = None;
+                }
+            }
+            if let Some(pf_j) = pf_joint {
+                if pf_refresh.is_none()
+                    && (unsent_mask & pf_bit) != 0
+                    && !self.pf_enable_feedback_fresh(pf_j)
+                {
+                    if pf_refresh_count >= MAX_ENABLE_PF_REFRESHES {
+                        self.enable_failed();
+                        return Err(ArmDriverError::PosForceFeedbackStaleBeforeTransmit { joint: pf_j });
+                    }
+                    pf_refresh_count += 1;
+                    let drained_now = self.last_read_drained;
+                    pf_refresh = Some(self.start_enable_pf_refresh(pf_j, deadline, drained_now)?);
+                }
+            }
+        }
+
         let (confirmed_mask, all_post_fb, fault) = self.enable_confirm_snapshot(unsent_mask);
         let now = self.now();
         match window.service(now, confirmed_mask, all_post_fb, fault) {
             Service::Confirmed => Ok(self.finish_enable_confirmed(window.started)),
             Service::Fault { .. } => {
-                let e = self.check_hardware_status().err()
-                    .unwrap_or(ArmDriverError::MotorHardwareFault { joint: 0, motor_id: 0, status: 0xFF });
+                let e = self
+                    .check_hardware_status()
+                    .err()
+                    .unwrap_or(ArmDriverError::MotorHardwareFault {
+                        joint: 0,
+                        motor_id: 0,
+                        status: 0xFF,
+                    });
                 self.enable_failed();
                 Err(e)
             }
             Service::Retry { mask, wake } => {
-                if unsent_mask != 0 || mask != 0 {
-                    unsent_mask = self.send_enable_masked(unsent_mask | mask, false, Some(deadline))?;
+                unsent_mask |= mask;
+                if let Some(pf_j) = pf_joint {
+                    if pf_refresh.is_none()
+                        && (unsent_mask & pf_bit) != 0
+                        && !self.pf_enable_feedback_fresh(pf_j)
+                    {
+                        if pf_refresh_count >= MAX_ENABLE_PF_REFRESHES {
+                            self.enable_failed();
+                            return Err(ArmDriverError::PosForceFeedbackStaleBeforeTransmit {
+                                joint: pf_j,
+                            });
+                        }
+                        pf_refresh_count += 1;
+                        let drained_now = self.last_read_drained;
+                        pf_refresh = Some(self.start_enable_pf_refresh(pf_j, deadline, drained_now)?);
+                    }
                 }
-                let after = self.now();
-                let wake = if unsent_mask != 0
-                    && self.tx_release_deadline.is_none_or(|cap| after < cap)
-                {
-                    after
+                let pf_stale = pf_joint.is_some_and(|j| !self.pf_enable_feedback_fresh(j));
+                let held_j7 = if pf_refresh.is_some() && pf_stale {
+                    unsent_mask & pf_bit
                 } else {
-                    wake
+                    0
                 };
-                self.torque_hs = Some(DamiaoTorque::Enable { window, unsent_mask });
+                let tx_mask = unsent_mask & !held_j7;
+                if tx_mask != 0 {
+                    let prio = pf_joint.filter(|_| j7_prioritize && (tx_mask & pf_bit) != 0);
+                    let defer_stale_pf =
+                        pf_refresh.is_none() && pf_refresh_count < MAX_ENABLE_PF_REFRESHES;
+                    let rem = self.send_enable_masked(
+                        tx_mask,
+                        false,
+                        Some(deadline),
+                        &mut tx_cursor,
+                        prio,
+                        defer_stale_pf,
+                    )?;
+                    let j7_was_in_tx = (tx_mask & pf_bit) != 0;
+                    unsent_mask = rem | held_j7;
+                    if j7_was_in_tx && (rem & pf_bit) == 0 && pf_refresh.is_some() {
+                        pf_refresh = None;
+                        self.refresh_capture = None;
+                    }
+                }
+                if let Some(pf_j) = pf_joint {
+                    if pf_refresh.is_none()
+                        && (unsent_mask & pf_bit) != 0
+                        && !self.pf_enable_feedback_fresh(pf_j)
+                    {
+                        if pf_refresh_count >= MAX_ENABLE_PF_REFRESHES {
+                            self.enable_failed();
+                            return Err(ArmDriverError::PosForceFeedbackStaleBeforeTransmit {
+                                joint: pf_j,
+                            });
+                        }
+                        pf_refresh_count += 1;
+                        let drained_now = self.last_read_drained;
+                        pf_refresh = Some(self.start_enable_pf_refresh(pf_j, deadline, drained_now)?);
+                    }
+                }
+                j7_prioritize = (unsent_mask & pf_bit) != 0;
+                let after = self.now();
+                let final_held_j7 = if pf_refresh.is_some()
+                    && pf_joint.is_some_and(|j| !self.pf_enable_feedback_fresh(j))
+                {
+                    unsent_mask & pf_bit
+                } else {
+                    0
+                };
+                let wake = Self::enable_pending_wake(
+                    after,
+                    wake,
+                    unsent_mask & !final_held_j7,
+                    &pf_refresh,
+                    self.tx_release_deadline,
+                );
+                self.torque_hs = Some(DamiaoTorque::Enable {
+                    window,
+                    unsent_mask,
+                    tx_cursor,
+                    j7_prioritize,
+                    pf_refresh,
+                    pf_refresh_count,
+                });
                 Ok(TorqueProgress::Pending { wake })
             }
             Service::Wait { wake } => {
+                j7_prioritize = (unsent_mask & pf_bit) != 0;
                 let after = self.now();
-                let wake = if unsent_mask != 0
-                    && self.tx_release_deadline.is_none_or(|cap| after < cap)
+                let final_held_j7 = if pf_refresh.is_some()
+                    && pf_joint.is_some_and(|j| !self.pf_enable_feedback_fresh(j))
                 {
-                    after
+                    unsent_mask & pf_bit
                 } else {
-                    wake
+                    0
                 };
-                self.torque_hs = Some(DamiaoTorque::Enable { window, unsent_mask });
+                let wake = Self::enable_pending_wake(
+                    after,
+                    wake,
+                    unsent_mask & !final_held_j7,
+                    &pf_refresh,
+                    self.tx_release_deadline,
+                );
+                self.torque_hs = Some(DamiaoTorque::Enable {
+                    window,
+                    unsent_mask,
+                    tx_cursor,
+                    j7_prioritize,
+                    pf_refresh,
+                    pf_refresh_count,
+                });
                 Ok(TorqueProgress::Pending { wake })
             }
         }
@@ -13827,7 +14267,21 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             Some(DamiaoTorque::Restore { write, pf_refreshed }) => self.poll_restore(write, pf_refreshed),
             Some(DamiaoTorque::Readback(r)) => self.poll_readback(r),
             Some(DamiaoTorque::PreEnableRefresh(refresh)) => self.poll_pre_enable_refresh(refresh),
-            Some(DamiaoTorque::Enable { window, unsent_mask }) => self.poll_enable(window, unsent_mask),
+            Some(DamiaoTorque::Enable {
+                window,
+                unsent_mask,
+                tx_cursor,
+                j7_prioritize,
+                pf_refresh,
+                pf_refresh_count,
+            }) => self.poll_enable(
+                window,
+                unsent_mask,
+                tx_cursor,
+                j7_prioritize,
+                pf_refresh,
+                pf_refresh_count,
+            ),
             Some(DamiaoTorque::AwaitRestGate {
                 kind,
                 next_probe_at,
@@ -17335,9 +17789,17 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                             queue_bound,
                             seq,
                         };
-                        let unsafe_motion_or_state =
+                        let status_unsafe = if cap.allow_enabled_state {
+                            feedback.state_or_error != 0 && feedback.state_or_error != 1
+                        } else {
+                            feedback.state_or_error != 0
+                        };
+                        let vel_unsafe = if cap.allow_enabled_state && feedback.state_or_error == 1 {
+                            !feedback.velocity.is_finite()
+                        } else {
                             !(feedback.velocity.is_finite() && feedback.velocity.abs() <= 0.05)
-                                || feedback.state_or_error != 0;
+                        };
+                        let unsafe_motion_or_state = vel_unsafe || status_unsafe;
                         if unsafe_motion_or_state && cap.unsafe_sample.is_none() {
                             cap.unsafe_sample = Some(sample);
                         }
