@@ -1661,6 +1661,30 @@ impl ShadowRuntime {
         }
     }
 
+    /// Out-of-line step + summary helper so `ActionSet` (~4.5 KB) occupies only a single stack
+    /// slot rather than N separate unoptimized match-arm slots inside `process_one_input` and
+    /// `process_driver_obs` (keeps debug/RT stack usage bounded to < 8 KB).
+    #[inline(never)]
+    fn run_step_summarized(
+        &mut self,
+        event: Event,
+        update_bindings: bool,
+        live_op_id: u64,
+        is_tier1_panic: bool,
+        apply_fault: bool,
+    ) -> ActionSummary {
+        let actions = step(self.state_mut(), event);
+        if update_bindings {
+            self.update_bindings_from_actions(&actions, live_op_id, is_tier1_panic);
+        }
+        let mut summary = ActionSummary::from_action_set(&actions);
+        if apply_fault {
+            self.apply_fault_injection(&mut summary);
+        }
+        summary
+    }
+
+    #[inline(never)]
     fn process_one_input(&mut self, input: ShadowInput) {
         let seq = input.seq;
 
@@ -1703,10 +1727,7 @@ impl ShadowRuntime {
             } => {
                 let now_us = self.clock.advance_now_us(input.edge_instant);
                 let event = Event::Release { now_us };
-                let actions = step(self.state_mut(), event);
-                self.update_bindings_from_actions(&actions, 0, false);
-                let mut rt_actions = ActionSummary::from_action_set(&actions);
-                self.apply_fault_injection(&mut rt_actions);
+                let rt_actions = self.run_step_summarized(event, true, 0, false, true);
                 self.last_release_hold_mask = rt_actions.hold_mask;
                 let reviewed_pr2 = if !rt_actions.damp_mask.is_empty() {
                     Some(ReviewedPr2Kind::ProtectiveDamping)
@@ -1744,10 +1765,7 @@ impl ShadowRuntime {
             } => {
                 let now_us = self.clock.advance_now_us(input.edge_instant);
                 let event = Event::EnableStart { group: 0, now_us };
-                let actions = step(self.state_mut(), event);
-                self.update_bindings_from_actions(&actions, live_op_id, false);
-                let mut rt_actions = ActionSummary::from_action_set(&actions);
-                self.apply_fault_injection(&mut rt_actions);
+                let rt_actions = self.run_step_summarized(event, true, live_op_id, false, true);
                 let reviewed_pr2 = if rt_actions.refusal == Some(RefusalCode::TimeoutMismatch) {
                     Some(ReviewedPr2Kind::TimeoutReadbackGate)
                 } else {
@@ -1806,10 +1824,7 @@ impl ShadowRuntime {
                     confirmed_mask,
                     outcome,
                 };
-                let actions = step(self.state_mut(), event);
-                self.update_bindings_from_actions(&actions, live_op_id, false);
-                let mut rt_actions = ActionSummary::from_action_set(&actions);
-                self.apply_fault_injection(&mut rt_actions);
+                let rt_actions = self.run_step_summarized(event, true, live_op_id, false, true);
                 let live_refusal = match outcome {
                     HandshakeOutcome::Failed | HandshakeOutcome::FaultReported { .. } => {
                         Some(LiveRefusalKind::EnableFailed)
@@ -1857,10 +1872,7 @@ impl ShadowRuntime {
                     explicit_release_authorized,
                     recipient_mask_override: None,
                 };
-                let actions = step(self.state_mut(), event);
-                self.update_bindings_from_actions(&actions, live_op_id, false);
-                let mut rt_actions = ActionSummary::from_action_set(&actions);
-                self.apply_fault_injection(&mut rt_actions);
+                let rt_actions = self.run_step_summarized(event, true, live_op_id, false, true);
                 // Exact PR2 reviewed exception: ONLY live rest-pose preflight refusals
                 // (`TorqueOffWouldDrop` / `ArmNotAtRestingPose`) differ from reducer `AwaitRestGate`.
                 // Unrelated refusals like `DriverBusy` or `BusyOrTransition` MUST NOT be masked!
@@ -1915,10 +1927,7 @@ impl ShadowRuntime {
                     kind,
                     now_us,
                 };
-                let actions = step(self.state_mut(), event);
-                self.update_bindings_from_actions(&actions, 0, false);
-                let mut rt_actions = ActionSummary::from_action_set(&actions);
-                self.apply_fault_injection(&mut rt_actions);
+                let rt_actions = self.run_step_summarized(event, true, 0, false, true);
                 let gen = self.state_ref().groups[0].stop_generation;
                 self.emit_record(
                     seq,
@@ -1952,10 +1961,7 @@ impl ShadowRuntime {
                     groups: GroupMask::bit(0),
                     now_us,
                 };
-                let actions = step(self.state_mut(), event);
-                self.update_bindings_from_actions(&actions, 0, false);
-                let mut rt_actions = ActionSummary::from_action_set(&actions);
-                self.apply_fault_injection(&mut rt_actions);
+                let rt_actions = self.run_step_summarized(event, true, 0, false, true);
                 let gen = self.state_ref().groups[0].stop_generation;
                 self.emit_record(
                     seq,
@@ -1992,10 +1998,7 @@ impl ShadowRuntime {
                     temperature_c,
                     now_us,
                 };
-                let actions = step(self.state_mut(), event);
-                self.update_bindings_from_actions(&actions, 0, false);
-                let mut rt_actions = ActionSummary::from_action_set(&actions);
-                self.apply_fault_injection(&mut rt_actions);
+                let rt_actions = self.run_step_summarized(event, true, 0, false, true);
                 let reviewed_pr2 = if !rt_actions.damp_mask.is_empty() {
                     Some(ReviewedPr2Kind::ProtectiveDamping)
                 } else {
@@ -2033,10 +2036,7 @@ impl ShadowRuntime {
             } => {
                 let now_us = self.clock.advance_now_us(input.edge_instant);
                 let event = Event::BusLoss { device, now_us };
-                let actions = step(self.state_mut(), event);
-                self.update_bindings_from_actions(&actions, 0, false);
-                let mut rt_actions = ActionSummary::from_action_set(&actions);
-                self.apply_fault_injection(&mut rt_actions);
+                let rt_actions = self.run_step_summarized(event, true, 0, false, true);
                 let gen = self.state_ref().groups[0].stop_generation;
                 self.emit_record(
                     seq,
@@ -2074,9 +2074,7 @@ impl ShadowRuntime {
                     channels,
                     now_us,
                 };
-                let actions = step(self.state_mut(), event);
-                let mut rt_actions = ActionSummary::from_action_set(&actions);
-                self.apply_fault_injection(&mut rt_actions);
+                let rt_actions = self.run_step_summarized(event, false, 0, false, true);
                 let gen = self.state_ref().groups[0].stop_generation;
                 self.emit_record(
                     seq,
@@ -2114,8 +2112,7 @@ impl ShadowRuntime {
                     force_limit_raw,
                     now_us,
                 };
-                let actions = step(self.state_mut(), event);
-                let rt_actions = ActionSummary::from_action_set(&actions);
+                let rt_actions = self.run_step_summarized(event, false, 0, false, false);
                 self.emit_record(
                     seq,
                     now_us,
@@ -2146,9 +2143,7 @@ impl ShadowRuntime {
                     device_wide,
                     now_us,
                 };
-                let actions = step(self.state_mut(), event);
-                self.update_bindings_from_actions(&actions, 0, false);
-                let rt_actions = ActionSummary::from_action_set(&actions);
+                let rt_actions = self.run_step_summarized(event, true, 0, false, false);
                 let gen = self.state_ref().groups[0].stop_generation;
                 self.emit_record(
                     seq,
@@ -2173,10 +2168,7 @@ impl ShadowRuntime {
             } => {
                 let now_us = self.clock.advance_now_us(input.edge_instant);
                 let event = Event::ProcessExit { now_us };
-                let actions = step(self.state_mut(), event);
-                self.update_bindings_from_actions(&actions, 0, false);
-                let mut rt_actions = ActionSummary::from_action_set(&actions);
-                self.apply_fault_injection(&mut rt_actions);
+                let rt_actions = self.run_step_summarized(event, true, 0, false, true);
                 let reviewed_pr2 = if live_intent == TorqueIntent::Off
                     && rt_actions.disable_kind == Some(DisableKind::Protective)
                 {
@@ -2215,14 +2207,13 @@ impl ShadowRuntime {
             } => {
                 let now_us = self.clock.advance_now_us(input.edge_instant);
                 let event = Event::Panic { tier, now_us };
-                let actions = step(self.state_mut(), event);
-                self.update_bindings_from_actions(
-                    &actions,
+                let rt_actions = self.run_step_summarized(
+                    event,
+                    true,
                     0,
                     matches!(tier, PanicTier::WorkerPanic { .. }),
+                    true,
                 );
-                let mut rt_actions = ActionSummary::from_action_set(&actions);
-                self.apply_fault_injection(&mut rt_actions);
                 let gen = self.state_ref().groups[0].stop_generation;
                 self.emit_record(
                     seq,
@@ -2269,11 +2260,9 @@ impl ShadowRuntime {
                         MotorWriteOutcome::LockContended,
                     );
                     let event = Event::WriteResult(wr);
-                    let actions = step(self.state_mut(), event);
                     // Keep `step_sum` strictly identical to `ActionSummary::from_action_set(&actions)`
                     // so off-thread replay never gets a false `ExtraAction` from `last_release_hold_mask`.
-                    let mut step_sum = ActionSummary::from_action_set(&actions);
-                    self.apply_fault_injection(&mut step_sum);
+                    let step_sum = self.run_step_summarized(event, false, 0, false, true);
                     self.emit_record(
                         seq,
                         now_us,
@@ -2357,8 +2346,7 @@ impl ShadowRuntime {
                     } else {
                         return;
                     };
-                    let actions = step(self.state_mut(), event);
-                    let rt_actions = ActionSummary::from_action_set(&actions);
+                    let rt_actions = self.run_step_summarized(event, false, 0, false, false);
                     self.emit_record(
                         seq,
                         now_us,
@@ -2392,6 +2380,7 @@ impl ShadowRuntime {
         }
     }
 
+    #[inline(never)]
     fn process_driver_obs(&mut self, seq: u64, obs: ShadowDriverObs) {
         match obs {
             ShadowDriverObs::CausalSample {
@@ -2517,10 +2506,7 @@ impl ShadowRuntime {
                     is_handshake_ack_only: false,
                 };
                 let event = Event::CausalSample(sample);
-                let actions = step(self.state_mut(), event);
-                self.update_bindings_from_actions(&actions, 0, false);
-                let mut rt_actions = ActionSummary::from_action_set(&actions);
-                self.apply_fault_injection(&mut rt_actions);
+                let rt_actions = self.run_step_summarized(event, true, 0, false, true);
                 let gen = self.state_ref().groups[0].stop_generation;
                 self.emit_record(
                     seq,
@@ -2601,10 +2587,7 @@ impl ShadowRuntime {
                     outcomes,
                 };
                 let event = Event::WriteResult(wr);
-                let actions = step(self.state_mut(), event);
-                self.update_bindings_from_actions(&actions, live_op_id, false);
-                let mut rt_actions = ActionSummary::from_action_set(&actions);
-                self.apply_fault_injection(&mut rt_actions);
+                let rt_actions = self.run_step_summarized(event, true, live_op_id, false, true);
 
                 let live_disable_kind = match kind {
                     WriteKind::DisableRequested => Some(DisableKind::Requested),
@@ -2668,8 +2651,7 @@ impl ShadowRuntime {
                     mode,
                     now_us,
                 };
-                let actions = step(self.state_mut(), event);
-                let rt_actions = ActionSummary::from_action_set(&actions);
+                let rt_actions = self.run_step_summarized(event, false, 0, false, false);
                 let gap = match provenance {
                     EvidenceProvenance::DriverNativeFixed => {
                         Some(CoverageGapKind::NativeModeAssumed)
@@ -2704,8 +2686,7 @@ impl ShadowRuntime {
                             timeout_reg,
                             now_us,
                         };
-                        let actions = step(self.state_mut(), event);
-                        let rt_actions = ActionSummary::from_action_set(&actions);
+                        let rt_actions = self.run_step_summarized(event, false, 0, false, false);
                         self.emit_record(
                             seq,
                             now_us,
@@ -2742,8 +2723,7 @@ impl ShadowRuntime {
             ShadowDriverObs::SerialTimeout { device, now } => {
                 let now_us = self.clock.advance_now_us(now);
                 let event = Event::SerialTimeout { device, now_us };
-                let actions = step(self.state_mut(), event);
-                let rt_actions = ActionSummary::from_action_set(&actions);
+                let rt_actions = self.run_step_summarized(event, false, 0, false, false);
                 self.emit_record(
                     seq,
                     now_us,

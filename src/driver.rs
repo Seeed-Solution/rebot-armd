@@ -8786,261 +8786,258 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         build: impl FnOnce(&Self) -> Option<CanFrame>,
     ) -> Result<CanFrame, TxRefusal> {
         let tx_kind = kind.tx_kind();
-        let res = self.send_core(kind, expected_stamp, deadline, fenced, build);
+        let res = 'send_body: {
+            let expected_lease_gen = self.send_lease_gen;
+            let has_pos_force_token = kind.pos_force_token().is_some();
+            let kind = tx_kind;
+            // 1. Deadline check (inclusive: now >= deadline.at).
+            if deadline.is_some_and(|d| d.passed(self.now())) {
+                break 'send_body Err(TxRefusal::DeadlinePassed);
+            }
+
+            // 2. Tick TX budget check (DisableRequested / ClientParkDisable / DisableProtective / DisableProbe exempt from motion TX budget).
+            let budgeted = !Self::is_disable_tx_kind(kind);
+            if budgeted {
+                let _ = self.ensure_tx_pass();
+                if !self.can_start_tick_tx() {
+                    break 'send_body Err(TxRefusal::Deferred);
+                }
+            }
+
+            // 3. Stop gate and lease fence by TxKind (stop/hold-class and Disable are lease-exempt).
+            let latched_before = match self.stop_gate_for_kind(kind) {
+                Ok(v) => v,
+                Err(e) => break 'send_body Err(e),
+            };
+            if matches!(kind, TxKind::Target) && self.is_lease_fenced(expected_lease_gen) {
+                break 'send_body Err(TxRefusal::LeaseFenced);
+            }
+
+            // 4. MIT deadline fence (when fenced) + build frame fresh at send time.
+            if fenced {
+                if let Err(ArmDriverError::MitFenceTripped(reason)) = self.fence_check() {
+                    break 'send_body Err(TxRefusal::MitFenceTripped(reason));
+                }
+            }
+            if let TxKind::RollbackHold(joint) = kind {
+                if latched_before
+                    && self.fresh_measured_position(joint, POS_FORCE_FEEDBACK_MAX_AGE).is_none()
+                    && self.active_pos_force_joint() != Some(joint)
+                {
+                    break 'send_body Err(TxRefusal::BuildRefused);
+                }
+            }
+            let Some(frame) = build(self) else {
+                if let TxKind::RollbackHold(joint) = kind {
+                    if self.active_pos_force_joint() == Some(joint)
+                        && !self.pos_force_feedback_valid(joint, self.now())
+                    {
+                        break 'send_body Err(TxRefusal::PosForceFeedbackExpired(joint));
+                    }
+                }
+                break 'send_body Err(TxRefusal::BuildRefused);
+            };
+
+            // 5. Re-read physical stop latch, pending gate, stop-generation stamp, lease fence,
+            //    MIT fence, position-force submission freshness, deadline, and tick TX cutoff AFTER
+            //    `build`, immediately before `can.transmit` (host submission boundary).
+            let latched_after = match self.stop_gate_for_kind(kind) {
+                Ok(v) => v,
+                Err(e) => break 'send_body Err(e),
+            };
+            if matches!(kind, TxKind::RollbackHold(_) | TxKind::MeasuredHold(_))
+                && !latched_before
+                && latched_after
+            {
+                break 'send_body Err(TxRefusal::StopInhibited);
+            }
+            let skip_stamp_check = matches!(
+                kind,
+                TxKind::DisableRequested { .. }
+                    | TxKind::DisableProtective { .. }
+                    | TxKind::DisableProbe
+            );
+            if !skip_stamp_check
+                && expected_stamp.is_some_and(|stamp| self.current_stop_stamp() != stamp)
+            {
+                break 'send_body Err(TxRefusal::StopStampChanged);
+            }
+            if matches!(kind, TxKind::Target) && self.is_lease_fenced(expected_lease_gen) {
+                break 'send_body Err(TxRefusal::LeaseFenced);
+            }
+            if fenced {
+                if let Err(ArmDriverError::MitFenceTripped(reason)) = self.fence_check() {
+                    break 'send_body Err(TxRefusal::MitFenceTripped(reason));
+                }
+            }
+            let submit_now = self.now();
+            if let Some(pf_joint) = self.frame_pos_force_joint(&frame) {
+                // Type-system capability guard: NO caller outside private `mod pos_force_emitter`
+                // can construct a `PosForceSendToken`, so any forged `0x307` frame is rejected here.
+                if !has_pos_force_token {
+                    break 'send_body Err(TxRefusal::BuildRefused);
+                }
+                if !self.pos_force_feedback_valid(pf_joint, submit_now)
+                    && !self.is_pos_force_freeze_frame(&frame)
+                {
+                    break 'send_body Err(TxRefusal::PosForceFeedbackExpired(pf_joint));
+                }
+            }
+            if deadline.is_some_and(|d| d.passed(submit_now)) {
+                break 'send_body Err(TxRefusal::DeadlinePassed);
+            }
+            if budgeted && !self.can_start_tick_tx() {
+                break 'send_body Err(TxRefusal::Deferred);
+            }
+
+            // 6. Account budget attempt, reset per-motor rest-pose/enable boundaries BEFORE any
+            //    motion/enable/mode write reaches the transport, transmit, and record diagnostics.
+            if budgeted {
+                self.record_tx_pass_attempt();
+            }
+            let mut motion_idx: Option<usize> = None;
+            if !frame.is_extended && !frame.is_rtr && frame.dlc == 8 {
+                if frame.data == damiao::CMD_ENABLE {
+                    if let Some(idx) = self.motor_ids.iter().position(|&id| u32::from(id) == frame.id) {
+                        self.motor_post_enable_feedback[idx] = false;
+                        self.motor_enable_seq[idx] = self.rx_seq;
+                        self.mode_readback_boundary[idx] = None;
+                    }
+                } else if frame.data == damiao::CMD_DISABLE {
+                    if let Some(idx) = self.motor_ids.iter().position(|&id| u32::from(id) == frame.id) {
+                        self.motor_post_enable_feedback[idx] = false;
+                    }
+                } else if frame.id == 0x7FF
+                    && frame.data[2] == damiao::REG_WRITE
+                    && frame.data[3] == damiao::RID_CTRL_MODE
+                {
+                    let target_id = u16::from_le_bytes([frame.data[0], frame.data[1]]);
+                    if let Some(idx) = self.motor_ids.iter().position(|&id| id == target_id) {
+                        self.mode_readback_boundary[idx] = None;
+                    }
+                } else if matches!(kind, TxKind::Target | TxKind::Recovery) {
+                    if let Some(idx) = self.damiao_command_motor_index(&frame) {
+                        self.rest_pose_window[idx].reset();
+                        motion_idx = Some(idx);
+                    }
+                }
+            }
+            let t0 = self.now();
+            let cpu0 = crate::diagnostics::tick::thread_cpu_ns();
+            let res = self.can.transmit(&frame);
+            let write_done = self.now();
+            let write_done_clock = if motion_idx.is_some() && res.is_ok() {
+                Some(self.capture_rx_clock_sample(write_done))
+            } else {
+                None
+            };
+            let wall_ns = write_done.saturating_duration_since(t0).as_nanos().min(u128::from(u64::MAX)) as u64;
+            let cpu_ns = crate::diagnostics::tick::thread_cpu_ns().saturating_sub(cpu0);
+            let attempt_kind = match &res {
+                Ok(()) => crate::diagnostics::tick::TxAttemptKind::Sent,
+                Err(TransportError::WouldBlock) => crate::diagnostics::tick::TxAttemptKind::WouldBlock,
+                Err(TransportError::NoBufferSpace) => crate::diagnostics::tick::TxAttemptKind::Enobufs,
+                Err(_) => crate::diagnostics::tick::TxAttemptKind::Error,
+            };
+            crate::diagnostics::tick::record_tx_attempt(attempt_kind, wall_ns, cpu_ns);
+            let final_res = match res {
+                Ok(()) => {
+                    // Record the same-clock boundary + CLOCK_REALTIME - CLOCK_MONOTONIC offset AFTER
+                    // `transmit()` returns for the rest-pose gate (after the last motion command).
+                    if let (Some(idx), Some((write_done_rx_clock, write_done_offset_ns))) =
+                        (motion_idx, write_done_clock)
+                    {
+                        self.rest_pose_boundary[idx] = Some(RestPoseBoundary {
+                            write_done,
+                            write_done_rx_clock: Some(write_done_rx_clock),
+                            write_done_offset_ns,
+                        });
+                    }
+                    Ok(frame)
+                }
+                Err(e) => {
+                    self.tx_probe = None;
+                    if budgeted && e.is_tx_backpressure() {
+                        self.mark_tx_pass_backpressured();
+                    }
+                    Err(TxRefusal::Transport(e))
+                }
+            };
+            // Shadow staging runs strictly AFTER live RX clock capture and live TX bookkeeping so
+            // the live Damiao 20 ms rest-settle boundary is never perturbed by shadow work.
+            #[cfg(not(target_arch = "wasm32"))]
+            if self.shadow_staging.is_enabled() {
+                let shadow_info = match kind {
+                    TxKind::DisableRequested { .. } | TxKind::ClientParkDisable { .. } => self
+                        .motor_ids
+                        .iter()
+                        .position(|&id| u32::from(id) == frame.id)
+                        .map(|idx| (crate::torque::WriteKind::DisableRequested, idx)),
+                    TxKind::DisableProtective { .. } => self
+                        .motor_ids
+                        .iter()
+                        .position(|&id| u32::from(id) == frame.id)
+                        .map(|idx| (crate::torque::WriteKind::DisableProtective, idx)),
+                    TxKind::Handshake if frame.data == damiao::CMD_ENABLE => self
+                        .motor_ids
+                        .iter()
+                        .position(|&id| u32::from(id) == frame.id)
+                        .map(|idx| (crate::torque::WriteKind::Enable, idx)),
+                    TxKind::Target | TxKind::Recovery => {
+                        motion_idx.map(|idx| (crate::torque::WriteKind::Motion, idx))
+                    }
+                    TxKind::RollbackHold(j) | TxKind::MeasuredHold(j) => {
+                        Some((crate::torque::WriteKind::Hold, j))
+                    }
+                    TxKind::Hold => self
+                        .damiao_command_motor_index(&frame)
+                        .map(|idx| (crate::torque::WriteKind::Hold, idx)),
+                    _ if !frame.is_extended
+                        && !frame.is_rtr
+                        && frame.dlc == 8
+                        && frame.id == 0x7FF
+                        && frame.data[2] == damiao::REG_WRITE
+                        && frame.data[3] == damiao::RID_CTRL_MODE =>
+                    {
+                        let target_id = u16::from_le_bytes([frame.data[0], frame.data[1]]);
+                        self.motor_ids
+                            .iter()
+                            .position(|&id| id == target_id)
+                            .map(|idx| (crate::torque::WriteKind::ModeSwitch, idx))
+                    }
+                    _ => None,
+                };
+                if let Some((wk, idx)) = shadow_info {
+                    if idx < crate::torque::MAX_CHANNELS {
+                        let mut outcomes = [crate::torque::MotorWriteOutcome::NotTargeted;
+                            crate::torque::MAX_CHANNELS];
+                        outcomes[idx] = match &final_res {
+                            Ok(_) => crate::torque::MotorWriteOutcome::Sent,
+                            Err(TxRefusal::Transport(
+                                TransportError::WouldBlock | TransportError::NoBufferSpace,
+                            )) => crate::torque::MotorWriteOutcome::Deferred,
+                            Err(_) => crate::torque::MotorWriteOutcome::Failed,
+                        };
+                        self.shadow_staging
+                            .push(crate::torque::shadow::ShadowDriverObs::WriteResult {
+                                device: 0,
+                                kind: wk,
+                                write_done,
+                                now: write_done,
+                                target_mask: crate::torque::ChannelMask::bit(idx as u8),
+                                outcomes,
+                                ambiguous_gap: false,
+                            });
+                    }
+                }
+            }
+            final_res
+        };
         #[cfg(not(target_arch = "wasm32"))]
         if let Err(ref refusal) = res {
             self.stage_damiao_pretransport_refusal(tx_kind, refusal);
         }
         res
-    }
-
-    fn send_core(
-        &mut self,
-        kind: impl DamiaoTxKind,
-        expected_stamp: Option<StopStamp>,
-        deadline: Option<Deadline>,
-        fenced: bool,
-        build: impl FnOnce(&Self) -> Option<CanFrame>,
-    ) -> Result<CanFrame, TxRefusal> {
-        let expected_lease_gen = self.send_lease_gen;
-        let has_pos_force_token = kind.pos_force_token().is_some();
-        let kind = kind.tx_kind();
-        // 1. Deadline check (inclusive: now >= deadline.at).
-        if deadline.is_some_and(|d| d.passed(self.now())) {
-            return Err(TxRefusal::DeadlinePassed);
-        }
-
-        // 2. Tick TX budget check (DisableRequested / ClientParkDisable / DisableProtective / DisableProbe exempt from motion TX budget).
-        let budgeted = !Self::is_disable_tx_kind(kind);
-        if budgeted {
-            let _ = self.ensure_tx_pass();
-            if !self.can_start_tick_tx() {
-                return Err(TxRefusal::Deferred);
-            }
-        }
-
-        // 3. Stop gate and lease fence by TxKind (stop/hold-class and Disable are lease-exempt).
-        let latched_before = self.stop_gate_for_kind(kind)?;
-        if matches!(kind, TxKind::Target) && self.is_lease_fenced(expected_lease_gen) {
-            return Err(TxRefusal::LeaseFenced);
-        }
-
-        // 4. MIT deadline fence (when fenced) + build frame fresh at send time.
-        if fenced {
-            if let Err(ArmDriverError::MitFenceTripped(reason)) = self.fence_check() {
-                return Err(TxRefusal::MitFenceTripped(reason));
-            }
-        }
-        if let TxKind::RollbackHold(joint) = kind {
-            if latched_before
-                && self.fresh_measured_position(joint, POS_FORCE_FEEDBACK_MAX_AGE).is_none()
-                && self.active_pos_force_joint() != Some(joint)
-            {
-                return Err(TxRefusal::BuildRefused);
-            }
-        }
-        let Some(frame) = build(self) else {
-            if let TxKind::RollbackHold(joint) = kind {
-                if self.active_pos_force_joint() == Some(joint)
-                    && !self.pos_force_feedback_valid(joint, self.now())
-                {
-                    return Err(TxRefusal::PosForceFeedbackExpired(joint));
-                }
-            }
-            return Err(TxRefusal::BuildRefused);
-        };
-
-        // 5. Re-read physical stop latch, pending gate, stop-generation stamp, lease fence,
-        //    MIT fence, position-force submission freshness, deadline, and tick TX cutoff AFTER
-        //    `build`, immediately before `can.transmit` (host submission boundary).
-        let latched_after = self.stop_gate_for_kind(kind)?;
-        if matches!(kind, TxKind::RollbackHold(_) | TxKind::MeasuredHold(_))
-            && !latched_before
-            && latched_after
-        {
-            return Err(TxRefusal::StopInhibited);
-        }
-        let skip_stamp_check = matches!(
-            kind,
-            TxKind::DisableRequested { .. }
-                | TxKind::DisableProtective { .. }
-                | TxKind::DisableProbe
-        );
-        if !skip_stamp_check
-            && expected_stamp.is_some_and(|stamp| self.current_stop_stamp() != stamp)
-        {
-            return Err(TxRefusal::StopStampChanged);
-        }
-        if matches!(kind, TxKind::Target) && self.is_lease_fenced(expected_lease_gen) {
-            return Err(TxRefusal::LeaseFenced);
-        }
-        if fenced {
-            if let Err(ArmDriverError::MitFenceTripped(reason)) = self.fence_check() {
-                return Err(TxRefusal::MitFenceTripped(reason));
-            }
-        }
-        let submit_now = self.now();
-        if let Some(pf_joint) = self.frame_pos_force_joint(&frame) {
-            // Type-system capability guard: NO caller outside private `mod pos_force_emitter`
-            // can construct a `PosForceSendToken`, so any forged `0x307` frame is rejected here.
-            if !has_pos_force_token {
-                return Err(TxRefusal::BuildRefused);
-            }
-            if !self.pos_force_feedback_valid(pf_joint, submit_now)
-                && !self.is_pos_force_freeze_frame(&frame)
-            {
-                return Err(TxRefusal::PosForceFeedbackExpired(pf_joint));
-            }
-        }
-        if deadline.is_some_and(|d| d.passed(submit_now)) {
-            return Err(TxRefusal::DeadlinePassed);
-        }
-        if budgeted && !self.can_start_tick_tx() {
-            return Err(TxRefusal::Deferred);
-        }
-
-        // 6. Account budget attempt, reset per-motor rest-pose/enable boundaries BEFORE any
-        //    motion/enable/mode write reaches the transport, transmit, and record diagnostics.
-        if budgeted {
-            self.record_tx_pass_attempt();
-        }
-        let mut motion_idx: Option<usize> = None;
-        if !frame.is_extended && !frame.is_rtr && frame.dlc == 8 {
-            if frame.data == damiao::CMD_ENABLE {
-                if let Some(idx) = self.motor_ids.iter().position(|&id| u32::from(id) == frame.id) {
-                    self.motor_post_enable_feedback[idx] = false;
-                    self.motor_enable_seq[idx] = self.rx_seq;
-                    self.mode_readback_boundary[idx] = None;
-                }
-            } else if frame.data == damiao::CMD_DISABLE {
-                if let Some(idx) = self.motor_ids.iter().position(|&id| u32::from(id) == frame.id) {
-                    self.motor_post_enable_feedback[idx] = false;
-                }
-            } else if frame.id == 0x7FF
-                && frame.data[2] == damiao::REG_WRITE
-                && frame.data[3] == damiao::RID_CTRL_MODE
-            {
-                let target_id = u16::from_le_bytes([frame.data[0], frame.data[1]]);
-                if let Some(idx) = self.motor_ids.iter().position(|&id| id == target_id) {
-                    self.mode_readback_boundary[idx] = None;
-                }
-            } else if matches!(kind, TxKind::Target | TxKind::Recovery) {
-                if let Some(idx) = self.damiao_command_motor_index(&frame) {
-                    self.rest_pose_window[idx].reset();
-                    motion_idx = Some(idx);
-                }
-            }
-        }
-        let t0 = self.now();
-        let cpu0 = crate::diagnostics::tick::thread_cpu_ns();
-        let res = self.can.transmit(&frame);
-        let write_done = self.now();
-        let write_done_clock = if motion_idx.is_some() && res.is_ok() {
-            Some(self.capture_rx_clock_sample(write_done))
-        } else {
-            None
-        };
-        let wall_ns = write_done.saturating_duration_since(t0).as_nanos().min(u128::from(u64::MAX)) as u64;
-        let cpu_ns = crate::diagnostics::tick::thread_cpu_ns().saturating_sub(cpu0);
-        let attempt_kind = match &res {
-            Ok(()) => crate::diagnostics::tick::TxAttemptKind::Sent,
-            Err(TransportError::WouldBlock) => crate::diagnostics::tick::TxAttemptKind::WouldBlock,
-            Err(TransportError::NoBufferSpace) => crate::diagnostics::tick::TxAttemptKind::Enobufs,
-            Err(_) => crate::diagnostics::tick::TxAttemptKind::Error,
-        };
-        crate::diagnostics::tick::record_tx_attempt(attempt_kind, wall_ns, cpu_ns);
-        let final_res = match res {
-            Ok(()) => {
-                // Record the same-clock boundary + CLOCK_REALTIME - CLOCK_MONOTONIC offset AFTER
-                // `transmit()` returns for the rest-pose gate (after the last motion command).
-                if let (Some(idx), Some((write_done_rx_clock, write_done_offset_ns))) =
-                    (motion_idx, write_done_clock)
-                {
-                    self.rest_pose_boundary[idx] = Some(RestPoseBoundary {
-                        write_done,
-                        write_done_rx_clock: Some(write_done_rx_clock),
-                        write_done_offset_ns,
-                    });
-                }
-                Ok(frame)
-            }
-            Err(e) => {
-                self.tx_probe = None;
-                if budgeted && e.is_tx_backpressure() {
-                    self.mark_tx_pass_backpressured();
-                }
-                Err(TxRefusal::Transport(e))
-            }
-        };
-        // Shadow staging runs strictly AFTER live RX clock capture and live TX bookkeeping so
-        // the live Damiao 20 ms rest-settle boundary is never perturbed by shadow work.
-        #[cfg(not(target_arch = "wasm32"))]
-        if self.shadow_staging.is_enabled() {
-            let shadow_info = match kind {
-                TxKind::DisableRequested { .. } | TxKind::ClientParkDisable { .. } => self
-                    .motor_ids
-                    .iter()
-                    .position(|&id| u32::from(id) == frame.id)
-                    .map(|idx| (crate::torque::WriteKind::DisableRequested, idx)),
-                TxKind::DisableProtective { .. } => self
-                    .motor_ids
-                    .iter()
-                    .position(|&id| u32::from(id) == frame.id)
-                    .map(|idx| (crate::torque::WriteKind::DisableProtective, idx)),
-                TxKind::Handshake if frame.data == damiao::CMD_ENABLE => self
-                    .motor_ids
-                    .iter()
-                    .position(|&id| u32::from(id) == frame.id)
-                    .map(|idx| (crate::torque::WriteKind::Enable, idx)),
-                TxKind::Target | TxKind::Recovery => {
-                    motion_idx.map(|idx| (crate::torque::WriteKind::Motion, idx))
-                }
-                TxKind::RollbackHold(j) | TxKind::MeasuredHold(j) => {
-                    Some((crate::torque::WriteKind::Hold, j))
-                }
-                TxKind::Hold => self
-                    .damiao_command_motor_index(&frame)
-                    .map(|idx| (crate::torque::WriteKind::Hold, idx)),
-                _ if !frame.is_extended
-                    && !frame.is_rtr
-                    && frame.dlc == 8
-                    && frame.id == 0x7FF
-                    && frame.data[2] == damiao::REG_WRITE
-                    && frame.data[3] == damiao::RID_CTRL_MODE =>
-                {
-                    let target_id = u16::from_le_bytes([frame.data[0], frame.data[1]]);
-                    self.motor_ids
-                        .iter()
-                        .position(|&id| id == target_id)
-                        .map(|idx| (crate::torque::WriteKind::ModeSwitch, idx))
-                }
-                _ => None,
-            };
-            if let Some((wk, idx)) = shadow_info {
-                if idx < crate::torque::MAX_CHANNELS {
-                    let mut outcomes = [crate::torque::MotorWriteOutcome::NotTargeted;
-                        crate::torque::MAX_CHANNELS];
-                    outcomes[idx] = match &final_res {
-                        Ok(_) => crate::torque::MotorWriteOutcome::Sent,
-                        Err(TxRefusal::Transport(
-                            TransportError::WouldBlock | TransportError::NoBufferSpace,
-                        )) => crate::torque::MotorWriteOutcome::Deferred,
-                        Err(_) => crate::torque::MotorWriteOutcome::Failed,
-                    };
-                    self.shadow_staging
-                        .push(crate::torque::shadow::ShadowDriverObs::WriteResult {
-                            device: 0,
-                            kind: wk,
-                            write_done,
-                            now: write_done,
-                            target_mask: crate::torque::ChannelMask::bit(idx as u8),
-                            outcomes,
-                            ambiguous_gap: false,
-                        });
-                }
-            }
-        }
-        final_res
     }
 
     /// Off-tick retry wrapper over [`Self::send`]: retries transient backpressure up to 3 times
