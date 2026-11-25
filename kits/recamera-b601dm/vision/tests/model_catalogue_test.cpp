@@ -195,6 +195,37 @@ static void test_default_models() {
     parse_catalogue(R"({"models": {}})", a, w);
     parse_catalogue(R"({"fps": 5})", b, w);
     CHECK(a.configured && !b.configured);
+    // bundled models under /usr/share/rebot-teleop/models are discovered by the catalogue and defaults
+    const std::vector<std::string> bundled_only = {
+        "/usr/share/rebot-teleop/models/yolo11n_seg_384x640_cv181x_int8_fuse.cvimodel",
+        "/usr/share/rebot-teleop/models/zipdepth_metric_384x224_bf16_rgb.cvimodel",
+        "/usr/share/supervisor/models/yolo11n_detection_cv181x_int8.cvimodel"};
+    Catalogue bc;
+    add_default_models(bc, [&](const std::string& p) {
+        for (const std::string& q : bundled_only) if (q == p) return true;
+        return false;
+    }, builtin_manifest());
+    CHECK(bc.models.size() == 3);
+    CHECK(bc.find("yolo11n_seg_384x640_cv181x_int8_fuse") &&
+          bc.find("yolo11n_seg_384x640_cv181x_int8_fuse")->path == bundled_only[0]);
+    CHECK(bc.find("zipdepth_metric_384x224_bf16_rgb") &&
+          bc.find("zipdepth_metric_384x224_bf16_rgb")->path == bundled_only[1]);
+    // default startup order puts detector-segment (seg384) before detector-detect and includes /usr/share/rebot-teleop/models
+    const auto det_cands = default_detector_candidates(builtin_manifest());
+    const auto dep_cands = default_depth_candidates(builtin_manifest());
+    CHECK(!det_cands.empty() && det_cands[0] == "/userdata/local/models/yolo11n_seg_384x640_cv181x_int8_fuse.cvimodel");
+    CHECK(det_cands.size() >= 3 && det_cands[2] == "/usr/share/rebot-teleop/models/yolo11n_seg_384x640_cv181x_int8_fuse.cvimodel");
+    CHECK(!dep_cands.empty() && dep_cands[0] == "/userdata/local/models/zipdepth_metric_384x224_bf16_rgb.cvimodel");
+    CHECK(dep_cands.size() >= 3 && dep_cands[2] == "/usr/share/rebot-teleop/models/zipdepth_metric_384x224_bf16_rgb.cvimodel");
+    // parse_manifest parses TSV comments and rows cleanly
+    const auto parsed = parse_manifest(
+        "# comment\n"
+        "detector-segment\tseg.cvimodel\t1111\t100\t13.1\thttps://example/seg\tbundled\tAGPL\tnote\n"
+        "depth\tdep.cvimodel\t2222\t200\t20.0\thttps://example/dep\tbundled\tMIT\tnote\n");
+    CHECK(parsed.size() == 2 && parsed[0].role == "detector-segment" && parsed[0].file == "seg.cvimodel" &&
+          parsed[0].size == 100 && parsed[0].ion_mb == 13.1 && parsed[1].role == "depth");
+    const auto custom_det = default_detector_candidates(parsed);
+    CHECK(!custom_det.empty() && custom_det[0] == "/userdata/local/models/seg.cvimodel");
 }
 
 static void test_first_loadable() {
