@@ -10246,8 +10246,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         // single 0xCC slot for joints lacking reply-producing traffic (NoOutputUntilFresh J7,
         // or post-freeze J7). In FailedHold, Idle-torqued (!output_ran_since_rx), and stopped
         // states, every stale joint J1–J7 is served directly here.
-        let active_operational_output =
-            self.is_enabled && self.output_ran_since_rx && !self.is_stopped_for_disable();
+        let active_operational_output = self.is_enabled
+            && self.output_ran_since_rx
+            && !self.is_stopped_for_disable()
+            && self.is_feedback_valid();
         let mut stale = 0u64;
         for i in 0..n {
             let is_stale = if pf_configured == Some(i) {
