@@ -491,9 +491,61 @@ static void test_result_json() {
     CHECK(json::parse(markers_json({})).empty());
 
     json extra = json::parse("{" + debug_extra(Mode::Both, markers_json({m}, 2, 2)) + "}");
-    CHECK(extra["mode"] == "both" && extra["markers"].size() == 1);
+    CHECK(extra["mode"] == "both" && extra["markers"].size() == 1 && !extra.contains("contours"));
     extra = json::parse("{" + debug_extra(Mode::Yolo, "") + "}");
-    CHECK(extra["markers"].empty());
+    CHECK(extra["markers"].empty() && !extra.contains("contours"));
+
+    // WS contours: aligned with detections, normalised to content rect, null for objects without a mask,
+    // capped at kMaxContourVertices per object and bounded to the frame size budget.
+    const ContentRect cr = content_rect(640, 640, 1280, 720);
+    CHECK(contours_json({}, cr, 640, 640) == "[]");
+    CHECK(contours_json({}, cr, 640, 640, 1).empty());
+
+    std::vector<DetBox> ws_dets(3);
+    ws_dets[0] = {0.5f, 0.5f, 0.2f, 0.2f, 0.9f, 39, "bottle"};
+    ws_dets[0].contour = {{0.25f, 140.0f / 640}, {0.5f, 0.5f}, {0.25f, 600.0f / 640}};
+    ws_dets[1] = {0.2f, 0.5f, 0.1f, 0.1f, 0.7f, 41, "cup"};  // no mask -> null
+    ws_dets[2] = {0.7f, 0.5f, 0.1f, 0.1f, 0.6f, 46, "banana"};
+    ws_dets[2].contour = {{0.6f, 0.5f}, {0.8f, 0.5f}};      // < 3 vertices -> null
+
+    const std::string c_str = contours_json(ws_dets, cr, 640, 640);
+    json cj = json::parse(c_str);
+    CHECK(cj.size() == 3 && cj[0].is_array() && cj[0].size() == 3 && cj[1].is_null() && cj[2].is_null());
+    CHECK(std::abs(cj[0][0][0].get<double>() - 0.25) < 1e-3 && std::abs(cj[0][0][1].get<double>()) < 1e-3);
+    CHECK(std::abs(cj[0][1][1].get<double>() - 0.5) < 1e-3 && cj[0][2][1].get<double>() == 1.0);
+    // matches HTTP detections_json contour verbatim
+    json hj = json::parse(detections_json(ws_dets, cr, 640, 640));
+    CHECK(cj[0] == hj[0]["contour"]);
+
+    extra = json::parse("{" + debug_extra(Mode::Yolo, "", c_str) + "}");
+    CHECK(extra["mode"] == "yolo" && extra["contours"].size() == 3 && extra["contours"][0] == cj[0] &&
+          extra["contours"][1].is_null() && extra["contours"][2].is_null());
+
+    // Per-object vertex cap (kMaxContourVertices = 128) and total WS frame size cap (kMaxWsFrameBytes)
+    std::vector<DetBox> many(12);
+    for (size_t i = 0; i < many.size(); ++i) {
+        many[i] = {0.5f, 0.5f, 0.1f, 0.1f, 0.9f - 0.05f * static_cast<float>(i), 39, "bottle"};
+        many[i].contour.assign(300, {0.123456f, 0.5f});
+    }
+    const size_t budget = ws_contours_budget(Mode::Yolo, many, "");
+    CHECK(budget > 0 && budget < kMaxWsFrameBytes);
+    const std::string capped = contours_json(many, cr, 640, 640, budget);
+    CHECK(!capped.empty() && capped.size() <= budget);
+    json cap_j = json::parse(capped);
+    CHECK(cap_j.size() == many.size());
+    CHECK(cap_j[0].is_array() && cap_j[0].size() == static_cast<size_t>(kMaxContourVertices));
+    size_t non_null = 0, nulls = 0;
+    for (const auto& entry : cap_j) {
+        if (entry.is_null()) ++nulls;
+        else {
+            CHECK(entry.size() == static_cast<size_t>(kMaxContourVertices));
+            ++non_null;
+        }
+    }
+    CHECK(non_null > 0 && nulls > 0);  // 12 * ~2 KB > 16 KB: earlier detections fit, tail degrades to null
+    // Budget smaller than minimal aligned array omits contours cleanly
+    CHECK(contours_json(many, cr, 640, 640, 10).empty());
+    CHECK(ws_contours_budget(Mode::Both, many, std::string(kMaxWsFrameBytes, 'x')) == 0);
 }
 
 static std::string sub_body(const std::string& client, const std::string& pipes, int fps = 0, int ttl = 0) {

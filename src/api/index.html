@@ -5007,6 +5007,8 @@ function parseDetections(rawData, refRes) {
     if (inner && typeof inner === 'object' && !rawData.boxes && !rawData.detections) return parseDetections(inner, refRes || (rawData.width && rawData.height ? [rawData.width, rawData.height] : null));
   }
   let items = [];
+  let rawContours = null;
+  let boxCount = 0;
   let refW = null;
   let refH = null;
 
@@ -5016,22 +5018,28 @@ function parseDetections(rawData, refRes) {
     } else {
       items = rawData;
     }
+    boxCount = items.length;
   } else if (rawData && typeof rawData === 'object') {
     if (rawData.format) {
       items = [rawData];
     } else if (Array.isArray(rawData.boxes)) {
       items = rawData.boxes;
+      if (Array.isArray(rawData.contours)) rawContours = rawData.contours;
     } else if (Array.isArray(rawData.detections)) {
       items = rawData.detections;
+      if (Array.isArray(rawData.contours)) rawContours = rawData.contours;
     } else if (rawData.data && Array.isArray(rawData.data.boxes)) {
       items = rawData.data.boxes;
+      if (Array.isArray(rawData.data.contours)) rawContours = rawData.data.contours;
     } else if (rawData.data && Array.isArray(rawData.data.detections)) {
       items = rawData.data.detections;
+      if (Array.isArray(rawData.data.contours)) rawContours = rawData.data.contours;
     } else if (Array.isArray(rawData.data)) {
       items = rawData.data;
     } else if (Array.isArray(rawData.results)) {
       items = rawData.results;
     }
+    boxCount = items.length;
     // ArUco markers may arrive in a separate list next to (or instead of) the boxes
     for (const k of ['markers', 'aruco']) {
       const m = Array.isArray(rawData[k]) ? rawData[k] : (rawData.data && Array.isArray(rawData.data[k]) ? rawData.data[k] : null);
@@ -5063,7 +5071,8 @@ function parseDetections(rawData, refRes) {
   const hasRef = Number.isFinite(refW) && Number.isFinite(refH) && refW > 0 && refH > 0;
 
   const results = [];
-  for (const item of items) {
+  for (let idx = 0; idx < items.length; idx++) {
+    const item = items[idx];
     let rawCx, rawCy, rawW, rawH, score, label, track_id = null;
     const aru = POSE.fromItem(item);
 
@@ -5212,10 +5221,15 @@ function parseDetections(rawData, refRes) {
       obbCorners = item.obb_corners.map(([u, v]) => (isPixelUnit ? [Number(u) / refW, Number(v) / refH] : [Number(u), Number(v)]));
     }
 
-    // segment models: exterior outline of the mask, same unit as the box (rebot-vision HTTP results)
+    // segment models: exterior outline of the mask. HTTP detections carry `item.contour` in the box's
+    // unit; WS frames carry top-level `contours` aligned with `boxes` in normalised [0, 1] coordinates.
     let contour = null;
-    if (Array.isArray(item.contour) && item.contour.length >= 3) {
+    if (item && !Array.isArray(item) && Array.isArray(item.contour) && item.contour.length >= 3) {
       contour = item.contour.filter((c) => Array.isArray(c) && c.length >= 2).map(([u, v]) => (isPixelUnit ? [Number(u) / refW, Number(v) / refH] : [Number(u), Number(v)]))
+        .filter(([u, v]) => Number.isFinite(u) && Number.isFinite(v));
+      if (contour.length < 3) contour = null;
+    } else if (rawContours && idx < boxCount && Array.isArray(rawContours[idx]) && rawContours[idx].length >= 3) {
+      contour = rawContours[idx].filter((c) => Array.isArray(c) && c.length >= 2).map(([u, v]) => [Number(u), Number(v)])
         .filter(([u, v]) => Number.isFinite(u) && Number.isFinite(v));
       if (contour.length < 3) contour = null;
     }
@@ -11904,11 +11918,11 @@ function graspDraw(g, rect, fresh) {
   if (s) {
     const stale = performance.now() - s.seenAt > 800;
     const x = rect.x + s.box[0] * rect.w, y = rect.y + s.box[1] * rect.h, w = (s.box[2] - s.box[0]) * rect.w, h = (s.box[3] - s.box[1]) * rect.h;
-    // the outline when one was read (selContour); then the box is only a faint dashed frame
-    const sc = showOpt('contour') ? (selContour(s) || (() => {
+    // the outline from the live stream when carried, else the /detection/latest fallback (selContour)
+    const sc = showOpt('contour') ? ((() => {
       const d = (S.detections || []).find((q) => q.contour && q.label === s.label && graspIou(s.box, [q.x0, q.y0, q.x1, q.y1]) > 0.5);
       return d ? { pts: d.contour, shift: null } : null;
-    })()) : null;
+    })() || selContour(s)) : null;
     g.save();
     g.setLineDash(stale ? [6, 5] : []);
     if (sc) {
@@ -12354,9 +12368,8 @@ function initSVis() {
   renderSVis();
 }
 
-/* Outline of the selected object. The detection WebSocket (rebot-vision's /results stream) carries boxes only; the
-   HTTP result (GET /api/v1/detection/latest) carries `contour` for segment models. With the segment kind the page
-   reads it for the selected object only, at most every 500 ms, and draws it shifted with the tracked box. */
+/* Outline fallback for older rebot-vision builds whose /results WebSocket carries boxes only; when WS frames lack
+   `contours`, read `contour` from GET /api/v1/detection/latest for the selected object at most every 500 ms. */
 const CT = { busy: false, at: 0 };
 async function graspContourPoll() {
   const s = GR.sel;
