@@ -1351,3 +1351,453 @@ fn r11_m4_rt_off_rest_refusal_and_disable_try_lock_escalation_zero_alloc() {
         }
     });
 }
+
+// =========================================================================
+// R12 M3: Zero-allocation Feetech RT disable path + RX budget & deadline proof
+// =========================================================================
+
+struct ZeroAllocFeetechState {
+    clock: Arc<MockClock>,
+    rx: [u8; 4096],
+    rx_head: usize,
+    rx_tail: usize,
+    tx: [u8; 4096],
+    tx_len: usize,
+    read_calls: u64,
+    // Fixed-size staged replies (zero heap alloc during `write_all`):
+    stage_req: [[u8; 16]; 10],
+    stage_req_len: [usize; 10],
+    stage_rep: [[u8; 64]; 10],
+    stage_rep_len: [usize; 10],
+    stage_used: [bool; 10],
+}
+
+impl ZeroAllocFeetechState {
+    fn new(clock: Arc<MockClock>) -> Self {
+        Self {
+            clock,
+            rx: [0u8; 4096],
+            rx_head: 0,
+            rx_tail: 0,
+            tx: [0u8; 4096],
+            tx_len: 0,
+            read_calls: 0,
+            stage_req: [[0u8; 16]; 10],
+            stage_req_len: [0; 10],
+            stage_rep: [[0u8; 64]; 10],
+            stage_rep_len: [0; 10],
+            stage_used: [false; 10],
+        }
+    }
+
+    fn clear_tx(&mut self) {
+        self.tx_len = 0;
+    }
+
+    fn clear_rx(&mut self) {
+        self.rx_head = 0;
+        self.rx_tail = 0;
+    }
+
+    fn push_rx(&mut self, bytes: &[u8]) {
+        assert!(self.rx_tail + bytes.len() <= self.rx.len());
+        self.rx[self.rx_tail..self.rx_tail + bytes.len()].copy_from_slice(bytes);
+        self.rx_tail += bytes.len();
+    }
+
+    fn stage_reply(&mut self, slot: usize, req: &[u8], rep: &[u8]) {
+        self.stage_req[slot][..req.len()].copy_from_slice(req);
+        self.stage_req_len[slot] = req.len();
+        self.stage_rep[slot][..rep.len()].copy_from_slice(rep);
+        self.stage_rep_len[slot] = rep.len();
+        self.stage_used[slot] = true;
+    }
+
+    fn clear_staged(&mut self) {
+        self.stage_used = [false; 10];
+    }
+
+    fn count_torque_off_writes(&self) -> usize {
+        let mut count = 0;
+        let data = &self.tx[..self.tx_len];
+        let mut i = 0;
+        while i + 8 <= data.len() {
+            if data[i] == 0xFF
+                && data[i + 1] == 0xFF
+                && data[i + 3] == 0x04
+                && data[i + 4] == 0x03
+                && data[i + 5] == armd::protocol::feetech::REG_TORQUE_ENABLE
+                && data[i + 6] == 0x00
+            {
+                count += 1;
+                i += 8;
+            } else {
+                i += 1;
+            }
+        }
+        count
+    }
+}
+
+#[derive(Clone)]
+struct ZeroAllocFeetechTransport(Arc<Mutex<ZeroAllocFeetechState>>);
+
+impl ZeroAllocFeetechTransport {
+    fn new(clock: Arc<MockClock>) -> Self {
+        Self(Arc::new(Mutex::new(ZeroAllocFeetechState::new(clock))))
+    }
+    fn with<R>(&self, f: impl FnOnce(&mut ZeroAllocFeetechState) -> R) -> R {
+        f(&mut self.0.lock().unwrap())
+    }
+}
+
+impl armd::transport::Transport for ZeroAllocFeetechTransport {
+    fn write(&mut self, data: &[u8]) -> Result<usize, TransportError> {
+        self.write_all(data)?;
+        Ok(data.len())
+    }
+
+    fn write_all(&mut self, data: &[u8]) -> Result<(), TransportError> {
+        let mut s = self.0.lock().unwrap();
+        assert!(s.tx_len + data.len() <= s.tx.len());
+        let start = s.tx_len;
+        s.tx[start..start + data.len()].copy_from_slice(data);
+        s.tx_len += data.len();
+        for slot in 0..10 {
+            if s.stage_used[slot] && s.stage_req_len[slot] == data.len() && &s.stage_req[slot][..data.len()] == data {
+                let rlen = s.stage_rep_len[slot];
+                let mut rep_copy = [0u8; 64];
+                rep_copy[..rlen].copy_from_slice(&s.stage_rep[slot][..rlen]);
+                s.stage_used[slot] = false;
+                s.push_rx(&rep_copy[..rlen]);
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
+        let mut s = self.0.lock().unwrap();
+        s.read_calls += 1;
+        let avail = s.rx_tail.saturating_sub(s.rx_head);
+        if avail == 0 {
+            s.clock.advance(Duration::from_millis(1));
+            return Err(TransportError::WouldBlock);
+        }
+        let n = avail.min(buf.len());
+        buf[..n].copy_from_slice(&s.rx[s.rx_head..s.rx_head + n]);
+        s.rx_head += n;
+        if s.rx_head == s.rx_tail {
+            s.rx_head = 0;
+            s.rx_tail = 0;
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> Result<(), TransportError> {
+        Ok(())
+    }
+
+    fn clear_input_buffer(&mut self) {
+        self.0.lock().unwrap().clear_rx();
+    }
+
+    fn clock(&self) -> Option<Arc<dyn DriverClock>> {
+        Some(self.0.lock().unwrap().clock.clone() as Arc<dyn DriverClock>)
+    }
+}
+
+fn build_feetech_pos_replies(ids: &[u8], steps: &[u16], out: &mut [u8]) -> usize {
+    let mut off = 0;
+    for (&id, &pos) in ids.iter().zip(steps.iter()) {
+        let [p_lo, p_hi] = pos.to_le_bytes();
+        let params = [p_lo, p_hi, 0, 0, 0, 0, 120, 30];
+        let cs = armd::protocol::feetech::calculate_checksum(id, 10, 0, &params);
+        out[off] = 0xFF;
+        out[off + 1] = 0xFF;
+        out[off + 2] = id;
+        out[off + 3] = 10;
+        out[off + 4] = 0;
+        out[off + 5..off + 13].copy_from_slice(&params);
+        out[off + 13] = cs;
+        off += 14;
+    }
+    off
+}
+
+#[test]
+fn r12_m3_feetech_rt_disable_path_zero_alloc_and_honours_rx_budget_and_deadline() {
+    use armd::driver::{
+        ArmDriverError, DisableKind, DisableProtectiveReason, FeetechArmDriver, TorqueOutcome,
+        TorqueProgress,
+    };
+    use armd::protocol::feetech;
+
+    let clock = Arc::new(MockClock::new());
+    let transport = ZeroAllocFeetechTransport::new(clock.clone());
+    let servo_ids: [u8; 6] = [1, 2, 3, 4, 5, 6];
+    let rest_steps: [u16; 6] = [2048; 6];
+    let raised_steps: [u16; 6] = [2400, 2048, 2048, 2048, 2048, 2048];
+    let mut drv = FeetechArmDriver::new(transport.clone(), servo_ids.to_vec())
+        .with_calibrated(true)
+        .with_tx_echo(Some(false));
+    drv.set_stopped_disable_gate(StoppedDisableGate {
+        safety_stopped: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        has_resting_pose: true,
+        arm_joints: {
+            let mut a = [0usize; armd::rt_core::mailbox::MAX_DOF];
+            for i in 0..5 {
+                a[i] = i;
+            }
+            a
+        },
+        arm_joints_len: 5,
+        rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+        rest_pose_tolerance_rad: 0.15,
+    });
+
+    let mut req1 = [0u8; 16];
+    let req1_len = feetech::write_sync_read_slice(&servo_ids[..3], feetech::REG_PRESENT_POSITION_L, 8, &mut req1).unwrap();
+    let mut req2 = [0u8; 16];
+    let req2_len = feetech::write_sync_read_slice(&servo_ids[3..], feetech::REG_PRESENT_POSITION_L, 8, &mut req2).unwrap();
+    let mut rep_rest1 = [0u8; 64];
+    let rep_rest1_len = build_feetech_pos_replies(&servo_ids[..3], &rest_steps[..3], &mut rep_rest1);
+    let mut rep_rest2 = [0u8; 64];
+    let rep_rest2_len = build_feetech_pos_replies(&servo_ids[3..], &rest_steps[3..], &mut rep_rest2);
+    let mut rep_raised1 = [0u8; 64];
+    let rep_raised1_len = build_feetech_pos_replies(&servo_ids[..3], &raised_steps[..3], &mut rep_raised1);
+
+    // 1. Unsupported budgeted entry points & idle poll_torque return static error codes with (0, 0) allocs.
+    let mut states_buf = Vec::with_capacity(6);
+    let dl0 = clock.now() + Duration::from_millis(8);
+    let (r_rx, a, f) = counted(|| drv.read_joint_states_budgeted(&mut states_buf, dl0, 6));
+    assert!(matches!(r_rx, Err(ArmDriverError::ProtocolStatic(_))));
+    assert_eq!((a, f), (0, 0), "M3: read_joint_states_budgeted unsupported must allocate (0, 0)");
+
+    let (r_bt, a, f) = counted(|| drv.begin_torque_budgeted(true, 6));
+    assert!(matches!(r_bt, Err(ArmDriverError::ProtocolStatic(_))));
+    assert_eq!((a, f), (0, 0), "M3: begin_torque_budgeted unsupported must allocate (0, 0)");
+
+    let (r_pb, a, f) = counted(|| drv.poll_torque_budgeted(dl0, 6));
+    assert!(matches!(r_pb, Err(ArmDriverError::ProtocolStatic(_))));
+    assert_eq!((a, f), (0, 0), "M3: idle poll_torque_budgeted must allocate (0, 0)");
+
+    let (r_pt, a, f) = counted(|| drv.poll_torque(dl0));
+    assert!(matches!(r_pt, Err(ArmDriverError::ProtocolStatic(_))));
+    assert_eq!((a, f), (0, 0), "M3: idle poll_torque must allocate (0, 0)");
+
+    // 2. Off-rest refusal: begin_disable_torque_budgeted(DisableRequested, 0) refuses with (0, 0) allocs & 0 bus I/O.
+    transport.with(|s| {
+        s.stage_reply(0, &req1[..req1_len], &rep_raised1[..rep_raised1_len]);
+        s.stage_reply(1, &req2[..req2_len], &rep_rest2[..rep_rest2_len]);
+    });
+    drv.read_joint_states().unwrap();
+    transport.with(|s| {
+        s.clear_tx();
+        s.read_calls = 0;
+    });
+    let started_raised = clock.now();
+    let (r_refuse, a, f) = counted(|| {
+        drv.begin_disable_torque_budgeted(
+            DisableKind::DisableRequested { started_at: started_raised },
+            0,
+        )
+    });
+    assert!(matches!(r_refuse, Err(ArmDriverError::TorqueOffWouldDrop)));
+    assert_eq!((a, f), (0, 0), "M3: off-rest refusal must allocate (0, 0)");
+    assert_eq!(transport.with(|s| (s.tx_len, s.read_calls)), (0, 0));
+
+    // 3. Move to rest pose (no K=3 window yet): begin_disable_torque_budgeted(kind, 0) defers with (0, 0) allocs.
+    clock.advance(Duration::from_millis(120)); // age out raised sample so gate sees stale/missing -> defer
+    transport.with(|s| {
+        s.clear_tx();
+        s.clear_staged();
+        s.read_calls = 0;
+    });
+    let started_rest = clock.now();
+    let (r_defer, a, f) = counted(|| {
+        drv.begin_disable_torque_budgeted(
+            DisableKind::DisableRequested { started_at: started_rest },
+            0,
+        )
+    });
+    assert!(matches!(r_defer, Ok(TorqueProgress::Pending { .. })));
+    assert_eq!((a, f), (0, 0), "M3: deferred begin_disable_torque_budgeted must allocate (0, 0)");
+    assert_eq!(transport.with(|s| (s.tx_len, s.read_calls)), (0, 0));
+
+    // 4. Expired deadline (deadline <= now): poll_torque_budgeted performs 0 bus TX/RX with (0, 0) allocs.
+    transport.with(|s| {
+        s.clear_tx();
+        s.read_calls = 0;
+        s.stage_reply(0, &req1[..req1_len], &rep_rest1[..rep_rest1_len]);
+        s.stage_reply(1, &req2[..req2_len], &rep_rest2[..rep_rest2_len]);
+    });
+    let expired_dl = clock.now();
+    let (r_exp_dl, a, f) = counted(|| drv.poll_torque_budgeted(expired_dl, 6));
+    assert!(matches!(r_exp_dl, Ok(TorqueProgress::Pending { .. })));
+    assert_eq!(drv.take_last_poll_rx(), Some((0, false)));
+    assert_eq!((a, f), (0, 0), "M3: expired-deadline poll must allocate (0, 0)");
+    assert_eq!(
+        transport.with(|s| (s.tx_len, s.read_calls)),
+        (0, 0),
+        "M3: expired deadline must perform 0 bus TX/RX"
+    );
+
+    // 5. Zero RX budget (max_rx_frames == 0): poll_torque_budgeted performs 0 bus TX/RX with (0, 0) allocs.
+    let valid_dl = clock.now() + Duration::from_millis(8);
+    let (r_zero_rx, a, f) = counted(|| drv.poll_torque_budgeted(valid_dl, 0));
+    assert!(matches!(r_zero_rx, Ok(TorqueProgress::Pending { .. })));
+    assert_eq!(drv.take_last_poll_rx(), Some((0, true)));
+    assert_eq!((a, f), (0, 0), "M3: max_rx_frames=0 poll must allocate (0, 0)");
+    assert_eq!(
+        transport.with(|s| (s.tx_len, s.read_calls)),
+        (0, 0),
+        "M3: max_rx_frames=0 must perform 0 bus TX/RX"
+    );
+
+    // 5b. Tight mid-poll deadline (2 ms < CHUNK_TIMEOUT 4 ms < MAX_READ_DURATION 8 ms) with no
+    //     replies staged: poll_torque_budgeted MUST stop at the caller deadline, not 4/8 ms, and allocate (0, 0).
+    transport.with(|s| {
+        s.clear_tx();
+        s.clear_rx();
+        s.clear_staged();
+    });
+    let t_before_tight = clock.now();
+    let tight_dl = t_before_tight + Duration::from_millis(2);
+    let (r_tight, a, f) = counted(|| drv.poll_torque_budgeted(tight_dl, 6));
+    assert!(matches!(r_tight, Ok(TorqueProgress::Pending { .. })));
+    assert_eq!((a, f), (0, 0), "M3: tight-deadline poll must allocate (0, 0)");
+    let elapsed_tight = clock.now().saturating_duration_since(t_before_tight);
+    assert!(
+        elapsed_tight <= Duration::from_millis(3),
+        "M3: poll_torque_budgeted must honour caller 2 ms deadline (elapsed {elapsed_tight:?} > 3 ms)"
+    );
+    // Clear poisoned line from the intentional silent-bus timeout (20 ms idle).
+    clock.advance(Duration::from_millis(25));
+
+    // 6. Partial RX budget (max_rx_frames == 2 on 6-servo arm): decodes at most 2 frames, marks
+    //    budget_exhausted = true, does NOT poll chunk 2, and allocates (0, 0)!
+    transport.with(|s| {
+        s.clear_tx();
+        s.clear_rx();
+        s.clear_staged();
+        s.stage_reply(0, &req1[..req1_len], &rep_rest1[..rep_rest1_len]);
+        s.stage_reply(1, &req2[..req2_len], &rep_rest2[..rep_rest2_len]);
+    });
+    let (r_cap2, a, f) = counted(|| drv.poll_torque_budgeted(clock.now() + Duration::from_millis(8), 2));
+    assert!(matches!(r_cap2, Ok(TorqueProgress::Pending { .. })));
+    assert_eq!(
+        drv.take_last_poll_rx(),
+        Some((2, true)),
+        "M3: poll_torque_budgeted(max_rx_frames=2) must stop at 2 decoded frames with exhausted=true"
+    );
+    assert_eq!((a, f), (0, 0), "M3: partial RX budget poll must allocate (0, 0)");
+    assert!(
+        transport.with(|s| s.stage_used[0] ^ s.stage_used[1]),
+        "M3: exactly one chunk may be requested before exhausting max_rx_frames=2; second chunk must NOT be requested"
+    );
+
+    // 7. Complete K=3 rest confirmation & disable dispatch across spaced polls with max_rx_frames=6:
+    //    every single poll (including post-disable REG_TORQUE_ENABLE readback!) allocates (0, 0),
+    //    stays <= 6 RX frames, and transmits all 6 TORQUE_ENABLE=0 writes!
+    let mut done = false;
+    for poll_idx in 0..5 {
+        clock.advance(Duration::from_millis(15));
+        transport.with(|s| {
+            s.clear_tx();
+            s.clear_rx();
+            s.clear_staged();
+            s.stage_reply(0, &req1[..req1_len], &rep_rest1[..rep_rest1_len]);
+            s.stage_reply(1, &req2[..req2_len], &rep_rest2[..rep_rest2_len]);
+            for (idx, &id) in servo_ids.iter().enumerate() {
+                let rd = feetech::build_read_array(id, feetech::REG_TORQUE_ENABLE, 1);
+                let cs = feetech::calculate_checksum(id, 3, 0, &[0]);
+                let rep = [0xFF, 0xFF, id, 3, 0, 0, cs];
+                s.stage_reply(2 + idx, &rd, &rep);
+            }
+        });
+        let dl = clock.now() + Duration::from_millis(8);
+        let (res, a, f) = counted(|| drv.poll_torque_budgeted(dl, 6));
+        assert_eq!((a, f), (0, 0), "M3: poll #{poll_idx} must allocate (0, 0)");
+        let (rx_used, _exhausted) = drv.take_last_poll_rx().unwrap();
+        assert!(rx_used <= 6, "M3: poll #{poll_idx} exceeded max_rx_frames=6 (got {rx_used})");
+        match res.unwrap() {
+            TorqueProgress::Done(TorqueOutcome::Confirmed) => {
+                done = true;
+                break;
+            }
+            TorqueProgress::Done(TorqueOutcome::Unconfirmed) => {
+                panic!("M3: unexpected TorqueOutcome::Unconfirmed");
+            }
+            TorqueProgress::Pending { .. } => {}
+        }
+    }
+    assert!(done, "M3: deferred Feetech RT disable must complete on K=3");
+    assert_eq!(
+        transport.with(|s| s.count_torque_off_writes()),
+        6,
+        "M3: all 6 servos must receive TORQUE_ENABLE=0"
+    );
+
+    // 8. M1 + M3 interaction: when K=3 is ALREADY confirmed and a queued non-rest position reply
+    //    sits in transport RX, begin_disable_torque_budgeted(DisableRequested, 0) honours
+    //    max_rx_frames=0 (0 RX reads, 0 TX writes, (0, 0) allocs) AND DEFERS instead of discarding
+    //    the queued reply; the following poll_torque_budgeted(dl, 6) drains+decodes it within
+    //    budget and refuses with TorqueOffWouldDrop (0 torque-off writes, (0, 0) allocs)!
+    transport.with(|s| {
+        s.clear_tx();
+        s.clear_rx();
+        s.push_rx(&rep_raised1[..rep_raised1_len]);
+        s.read_calls = 0;
+    });
+    let started_already_confirmed = clock.now();
+    let (r_imm, a, f) = counted(|| {
+        drv.begin_disable_torque_budgeted(
+            DisableKind::DisableRequested { started_at: started_already_confirmed },
+            0,
+        )
+    });
+    assert!(
+        matches!(r_imm, Ok(TorqueProgress::Pending { .. })),
+        "M1+M3: begin_disable_torque_budgeted(0) must defer rather than discard queued RX or violate rx_budget=0"
+    );
+    assert_eq!((a, f), (0, 0), "M3: begin_disable_torque_budgeted(0) must allocate (0, 0)");
+    assert_eq!(
+        transport.with(|s| (s.tx_len, s.read_calls)),
+        (0, 0),
+        "M3: begin_disable_torque_budgeted(0) must perform 0 bus TX/RX"
+    );
+
+    let dl_check = clock.now() + Duration::from_millis(8);
+    let (r_refuse_queued, a, f) = counted(|| drv.poll_torque_budgeted(dl_check, 6));
+    assert!(
+        matches!(r_refuse_queued, Err(ArmDriverError::TorqueOffWouldDrop)),
+        "M1+M3: budgeted poll must decode the queued raised reply before clearing and refuse, got {r_refuse_queued:?}"
+    );
+    assert_eq!((a, f), (0, 0), "M3: queued-reply refusal on poll_torque_budgeted must allocate (0, 0)");
+    assert_eq!(
+        transport.with(|s| s.count_torque_off_writes()),
+        0,
+        "M1+M3: 0 torque-off writes after queued non-rest reply"
+    );
+
+    // 9. DisableProtective with max_rx_frames=0: dispatches all 6 writes with 0 RX reads and (0, 0) allocs.
+    transport.with(|s| {
+        s.clear_tx();
+        s.clear_rx();
+        s.read_calls = 0;
+    });
+    let (r_prot, a, f) = counted(|| {
+        drv.begin_disable_torque_budgeted(
+            DisableKind::DisableProtective { reason: DisableProtectiveReason::Thermal },
+            0,
+        )
+    });
+    assert!(matches!(r_prot, Ok(TorqueProgress::Done(TorqueOutcome::Confirmed))));
+    assert_eq!((a, f), (0, 0), "M3: DisableProtective begin_disable_torque_budgeted(0) must allocate (0, 0)");
+    assert_eq!(
+        transport.with(|s| (s.count_torque_off_writes(), s.read_calls)),
+        (6, 0),
+        "M3: DisableProtective(0) must write all 6 disable frames with 0 RX reads"
+    );
+}

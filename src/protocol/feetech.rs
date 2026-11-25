@@ -129,9 +129,33 @@ pub fn build_ping(id: u8) -> Vec<u8> {
     build_packet(id, INST_PING, &[])
 }
 
+/// Zero-allocation stack-array Ping packet (identical bytes to [`build_ping`]).
+#[inline]
+pub fn build_ping_array(id: u8) -> [u8; 6] {
+    let checksum = calculate_checksum(id, 2, INST_PING, &[]);
+    [FEETECH_HEADER[0], FEETECH_HEADER[1], id, 2, INST_PING, checksum]
+}
+
 /// Build a Read register packet
 pub fn build_read(id: u8, start_addr: u8, length_to_read: u8) -> Vec<u8> {
     build_packet(id, INST_READ, &[start_addr, length_to_read])
+}
+
+/// Zero-allocation stack-array Read register packet (identical bytes to [`build_read`]).
+#[inline]
+pub fn build_read_array(id: u8, start_addr: u8, length_to_read: u8) -> [u8; 8] {
+    let params = [start_addr, length_to_read];
+    let checksum = calculate_checksum(id, 4, INST_READ, &params);
+    [
+        FEETECH_HEADER[0],
+        FEETECH_HEADER[1],
+        id,
+        4,
+        INST_READ,
+        start_addr,
+        length_to_read,
+        checksum,
+    ]
 }
 
 /// Build a single Write register packet
@@ -157,6 +181,24 @@ pub fn build_write_u16(id: u8, reg: u8, val: u16) -> Vec<u8> {
 pub fn build_set_torque(id: u8, enabled: bool) -> Vec<u8> {
     let val = if enabled { 1u8 } else { 0u8 };
     build_write(id, REG_TORQUE_ENABLE, &[val])
+}
+
+/// Zero-allocation stack-array Torque Enable/Disable packet (identical bytes to [`build_set_torque`]).
+#[inline]
+pub fn build_set_torque_array(id: u8, enabled: bool) -> [u8; 8] {
+    let val = u8::from(enabled);
+    let params = [REG_TORQUE_ENABLE, val];
+    let checksum = calculate_checksum(id, 4, INST_WRITE, &params);
+    [
+        FEETECH_HEADER[0],
+        FEETECH_HEADER[1],
+        id,
+        4,
+        INST_WRITE,
+        REG_TORQUE_ENABLE,
+        val,
+        checksum,
+    ]
 }
 
 /// Build Goal Position write packet (Address 0x2A) with position, time and speed
@@ -340,6 +382,45 @@ pub fn parse_response_ref(buf: &[u8]) -> Result<(FeetechPacketRef<'_>, usize), F
         },
         header_pos + total_packet_len,
     ))
+}
+
+/// Zero-allocation `SYNC_READ` builder writing directly into a caller-owned slice, returning the
+/// written packet byte length.
+pub fn write_sync_read_slice(
+    ids: &[u8],
+    start_addr: u8,
+    data_len: u8,
+    out: &mut [u8],
+) -> Result<usize, &'static str> {
+    if ids.is_empty() {
+        return Err("SYNC_READ_EMPTY_IDS");
+    }
+    if ids.len() > 32 {
+        return Err("SYNC_READ_TOO_MANY_IDS");
+    }
+    let total = 8 + ids.len();
+    if out.len() < total {
+        return Err("SYNC_READ_BUF_TOO_SMALL");
+    }
+    let length = (4 + ids.len()) as u8;
+    out[0] = 0xFF;
+    out[1] = 0xFF;
+    out[2] = BROADCAST_ID;
+    out[3] = length;
+    out[4] = INST_SYNC_READ;
+    out[5] = start_addr;
+    out[6] = data_len;
+    out[7..7 + ids.len()].copy_from_slice(ids);
+    let mut sum: u32 = u32::from(BROADCAST_ID)
+        + u32::from(length)
+        + u32::from(INST_SYNC_READ)
+        + u32::from(start_addr)
+        + u32::from(data_len);
+    for &id in ids {
+        sum += u32::from(id);
+    }
+    out[7 + ids.len()] = (!(sum & 0xFF)) as u8;
+    Ok(total)
 }
 
 /// Zero-allocation `SYNC_READ` builder writing directly into a caller-owned buffer.
