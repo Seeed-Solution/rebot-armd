@@ -4635,8 +4635,10 @@ fn review_m01_m06_m07_m08_m09_unverified_mode_thermal_late_reply_and_gap_recaptu
         let err = enable_torque_admitted(&mut inner).unwrap_err();
         assert!(matches!(err, SafetyError::ClearFaultRejected(_)));
         assert_eq!(inner.enable_lifecycle(), armd::supervisor::EnableLifecycle::FailedHold);
-        // Enable timed out after 150 ms (> 100 ms hold freshness) so initial status is unheld(no_fresh_fb).
-        assert_eq!(inner.joint_hold_status()[1], JointHoldStatus::UnheldNoFreshFeedback);
+        // Watchdog hold continuity keeps already-enabled arm joints (J1–J6) refreshed across the
+        // 150 ms enable timeout while waiting on J7, so J2 enters FailedHold with fresh feedback
+        // (`Queued`) and advances `Queued -> Held` on the next tick without bumping the epoch.
+        assert_eq!(inner.joint_hold_status()[1], JointHoldStatus::Queued);
         let epoch_at_latch = inner.safety.epoch_id();
 
         // M-07: Tick transmits hold at pose[1] = 0.30 -> live observation fault updates to `held`

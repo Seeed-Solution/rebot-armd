@@ -9284,10 +9284,17 @@ impl SupervisorInner {
         let period_tick =
             Duration::from_secs_f64(1.0 / f64::from(self.config.control_frequency_hz.max(1)));
         let margin_tick = self.tx_release_publish_margin();
-        let legacy_step_deadline = legacy_step_start.map(|t| {
+        let legacy_rx_deadline = legacy_step_start.map(|t| {
             if has_legacy_enable_transition {
                 t + LEGACY_TORQUE_STEP_BUDGET
             } else if let Some(rd) = release_deadline {
+                rd.checked_sub(margin_tick).unwrap_or(t)
+            } else {
+                t + period_tick.saturating_sub(margin_tick)
+            }
+        });
+        let legacy_tx_deadline = legacy_step_start.map(|t| {
+            if let Some(rd) = release_deadline {
                 rd.checked_sub(margin_tick).unwrap_or(t)
             } else {
                 t + period_tick.saturating_sub(margin_tick)
@@ -9303,7 +9310,7 @@ impl SupervisorInner {
                             match translate_driver_cutoff_conservative(drv.as_ref(), owner_cap, now_fn) {
                                 Ok((drv_now, _, mut cap)) => {
                                     if let (Some(step_start), Some(step_dl)) =
-                                        (legacy_step_start, legacy_step_deadline)
+                                        (legacy_step_start, legacy_tx_deadline)
                                     {
                                         let step_cap =
                                             drv_now + step_dl.saturating_duration_since(step_start);
@@ -9324,7 +9331,7 @@ impl SupervisorInner {
                         let _ = now_fn();
                         let mut cap = drv_now + period.saturating_sub(margin);
                         if let (Some(step_start), Some(step_dl)) =
-                            (legacy_step_start, legacy_step_deadline)
+                            (legacy_step_start, legacy_tx_deadline)
                         {
                             let step_cap = drv_now + step_dl.saturating_duration_since(step_start);
                             if step_cap < cap {
@@ -9388,7 +9395,7 @@ impl SupervisorInner {
                 )
             } else if self.has_non_broker_torque_transition() {
                 let now = legacy_step_start.unwrap_or_else(&mut *now_fn);
-                let deadline = legacy_step_deadline.unwrap_or_else(|| now + LEGACY_TORQUE_STEP_BUDGET);
+                let deadline = legacy_rx_deadline.unwrap_or_else(|| now + LEGACY_TORQUE_STEP_BUDGET);
                 let budget = crate::rt_core::ops::ServiceBudget {
                     now,
                     deadline,

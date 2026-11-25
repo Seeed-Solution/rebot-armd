@@ -2103,6 +2103,7 @@ fn arm_driver_error_write_bounded_and_clear_fault_error_cover_all_variants_zero_
             ArmDriverError::EnableFreshenTimeout { .. } => "EnableFreshenTimeout",
             ArmDriverError::EnableFreshenUnsafeGripper { .. } => "EnableFreshenUnsafeGripper",
             ArmDriverError::PartialDisable { .. } => "PartialDisable",
+            ArmDriverError::WatchdogContinuityAbort { .. } => "WatchdogContinuityAbort",
         }
     }
 
@@ -2184,6 +2185,10 @@ fn arm_driver_error_write_bounded_and_clear_fault_error_cover_all_variants_zero_
             uncertain_mask: 0,
             remaining_mask: 0b0111_1100,
             dof: 7,
+        },
+        ArmDriverError::WatchdogContinuityAbort {
+            joint: 0,
+            age_ms: 60,
         },
     ];
     #[cfg(unix)]
