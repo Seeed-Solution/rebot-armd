@@ -1052,4 +1052,90 @@ fn disarm_probe_rejects_pre_poll_stale_rx_and_mixed_state_burst() {
             "expected log naming J6 enabled past frame 64, got: {logs:?}"
         );
     }
+
+    // (d) R4 Blocker 3 regression: an untimestamped (`rx_time == None`) enabled reply arriving
+    // after timestamped disabled replies for all 7 axes must STILL refuse disarm proof and leave
+    // passive proof invalidated.
+    {
+        let clock = MockClock::new();
+        let bus = FakeBus::with_clock(&dm_limits(), clock.clone());
+        bus.with(|s| {
+            s.immediate_replies = true;
+        });
+        #[derive(Clone)]
+        struct UntimestampedAdverseBus {
+            inner: FakeBus,
+            pending_extra: Arc<Mutex<Option<CanFrame>>>,
+            injected: Arc<AtomicBool>,
+        }
+        impl armd::transport::CanTransport for UntimestampedAdverseBus {
+            fn transmit(&mut self, frame: &CanFrame) -> Result<(), armd::transport::TransportError> {
+                let res = self.inner.transmit(frame);
+                if frame.id == 0x7FF
+                    && frame.data[2] == 0xCC
+                    && frame.data[0] == 7
+                    && !self.injected.swap(true, Ordering::AcqRel)
+                {
+                    let f2_en = self.inner.with(|s| {
+                        let prev = s.motors[1].enabled;
+                        s.motors[1].enabled = true;
+                        let fb = s.motors[1].feedback_frame();
+                        s.motors[1].enabled = prev;
+                        fb
+                    });
+                    *self.pending_extra.lock().unwrap() = Some(f2_en);
+                }
+                res
+            }
+            fn receive(&mut self) -> Result<CanFrame, armd::transport::TransportError> {
+                self.inner.receive()
+            }
+            fn receive_timestamped(
+                &mut self,
+            ) -> Result<(CanFrame, Option<Instant>), armd::transport::TransportError> {
+                match self.inner.receive_timestamped() {
+                    Ok(v) => Ok(v),
+                    Err(e) => {
+                        if let Some(f) = self.pending_extra.lock().unwrap().take() {
+                            return Ok((f, None));
+                        }
+                        Err(e)
+                    }
+                }
+            }
+            fn flush(&mut self) -> Result<(), armd::transport::TransportError> {
+                self.inner.flush()
+            }
+            fn supports_nonblocking_rt(&self) -> bool {
+                self.inner.supports_nonblocking_rt()
+            }
+            fn supports_bounded_flush(&self) -> bool {
+                self.inner.supports_bounded_flush()
+            }
+            fn clock(&self) -> Option<Arc<dyn armd::transport::DriverClock>> {
+                self.inner.clock()
+            }
+        }
+
+        let u_bus = UntimestampedAdverseBus {
+            inner: bus.clone(),
+            pending_extra: Arc::new(Mutex::new(None)),
+            injected: Arc::new(AtomicBool::new(false)),
+        };
+        let mut drv = DamiaoArmDriver::new(u_bus, vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(dm_limits())
+            .unwrap();
+        let _ = take_logs();
+        let ok = drv.probe_hardware_disarmed_until(Instant::now() + Duration::from_millis(80));
+        assert!(
+            !ok,
+            "untimestamped enabled reply during probe must still refuse disarm proof"
+        );
+        assert!(!drv.is_hardware_disarmed_confirmed());
+        let logs = take_logs();
+        assert!(
+            logs.contains("J2") && logs.contains("enabled"),
+            "expected log naming J2 enabled on untimestamped adverse frame, got: {logs:?}"
+        );
+    }
 }
