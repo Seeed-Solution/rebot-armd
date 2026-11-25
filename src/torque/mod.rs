@@ -72,9 +72,10 @@
 //!
 //! `ActionSet` is fixed-capacity and zero-allocation, with strict emitter priority ordering via
 //! [`types::ActionSet::visit_by_priority`]:
-//! `Protective` (`Damp`, `DisableProtective`) > `StopHold` (`DisableRequested`, `Hold`, `RequestPark`)
-//! > `Motion` (`Enable`, `MotionAllowed`) > `RefreshRoutine` (`Refresh`, `DisableComplete`, `Refusal`,
-//! `EscalateContention`).
+//! - `Protective` (`Damp`, `DisableProtective`)
+//! - `StopHold` (`DisableRequested`, `Hold`, `RequestPark`)
+//! - `Motion` (`Enable`, `MotionAllowed`)
+//! - `RefreshRoutine` (`Refresh`, `DisableComplete`, `Refusal`, `EscalateContention`)
 //!
 //! # Invariants
 //!
@@ -122,6 +123,10 @@
 //!    per-bus normal + reserved-safety quotas, and feeds the exact per-motor `Event::WriteResult`
 //!    back into `step()`.
 
+pub mod invariants;
+pub mod reducer;
 pub mod types;
 
+pub use invariants::{check_invariants, Violation, ViolationKind};
+pub use reducer::{compute_thermal_derate_scale, event_now_us, step};
 pub use types::*;

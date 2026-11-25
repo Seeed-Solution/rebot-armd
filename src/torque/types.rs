@@ -857,14 +857,13 @@ impl TorqueConfig {
                     return Err(ConfigError::InvalidThermalConfig { channel: c });
                 }
             }
-            if ch.damping.duration_us > 0 {
-                if !ch.damping.kd.is_finite()
+            if ch.damping.duration_us > 0
+                && (!ch.damping.kd.is_finite()
                     || ch.damping.kd <= 0.0
                     || !ch.damping.max_torque_nm.is_finite()
-                    || ch.damping.max_torque_nm <= 0.0
-                {
-                    return Err(ConfigError::InvalidDampingConfig { channel: c });
-                }
+                    || ch.damping.max_torque_nm <= 0.0)
+            {
+                return Err(ConfigError::InvalidDampingConfig { channel: c });
             }
             if let Some(reg) = ch.damiao_timeout_reg {
                 if reg == 0 || reg > DAMIAO_TIMEOUT_MAX_REG {
