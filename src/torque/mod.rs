@@ -60,13 +60,15 @@
 //!   `<= 1 ms` clock-offset drift, poisoned-line silence, and post-motion settle (`> 20 ms`);
 //!   updates anchored captures and feeds active `K = 3` rest windows. Whole-hand ACKs complete
 //!   handshakes only and are never position evidence.
-//! - `WriteResult`: per-motor outcomes from the emitter; stationary holds preserve the motion-write
-//!   boundary; the first `Sent` or `Ambiguous` disable commits `TorqueIntent::Off`; zero writes keep `On`;
-//!   25 consecutive lock-contention skips escalate and latch `DriverWriteFailed`.
-//! - `HandshakeResult`, `EnableStart`, `DisableRequest`, `Stop` (Stop / E-Stop / Fault / Watchdog /
-//!   LeaseLoss), `FaultClear`, `Thermal`, `MitOwnershipChange`, `ModeVerified`, `TimeoutReadback`,
-//!   `MotionCommand`, `SerialTimeout`, `GraspStateUpdate`, `ParkSettled`, `Panic`, `ProcessExit`,
-//!   `BusLoss`.
+//! - `WriteResult`: per-motor outcomes from the emitter, correlated by `dispatch_id` /
+//!   `attempt_id` + `kind` + `generation`; stationary holds preserve the motion-write boundary;
+//!   the first correlated `Sent` or `Ambiguous` disable commits `TorqueIntent::Off`; zero writes
+//!   keep `On`; 25 consecutive lock-contention releases escalate once and latch `DriverWriteFailed`.
+//! - `HandshakeResult` (correlated by `attempt_id`), `EnableStart`, `DisableRequest`, `Stop`
+//!   (Stop / E-Stop / Fault / Watchdog / LeaseLoss), `FaultClear`, `Thermal`,
+//!   `MitOwnershipChange`, `ModeVerified`, `TimeoutReadback`, `MotionCommand`, `SerialTimeout`,
+//!   `GraspStateUpdate`, `ParkAccepted` / `ParkSettled` (correlated by `park_id`), `Panic`,
+//!   `ProcessExit`, `BusLoss`.
 //!
 //! # Actions & Priority
 //!
@@ -79,8 +81,9 @@
 //!
 //! # Invariants
 //!
-//! Every safety property is machine-checked on `(state, prev, event, actions)` by
-//! `check_invariants` (added in the reducer/invariants module):
+//! Every safety property is independently machine-checked on `(state, prev, event, actions)` by
+//! [`check_invariants`], and write-time capability validity is exposed via
+//! [`is_disable_authorized`]:
 //!
 //! - **Hold**: `TorqueIntent::On` while stopped or `FailedHold` emits a hold for every captured
 //!   joint every release regardless of reported enable state; captures require finite measured
@@ -128,5 +131,5 @@ pub mod reducer;
 pub mod types;
 
 pub use invariants::{check_invariants, Violation, ViolationKind};
-pub use reducer::{compute_thermal_derate_scale, event_now_us, step};
+pub use reducer::{compute_thermal_derate_scale, event_now_us, is_disable_authorized, step};
 pub use types::*;

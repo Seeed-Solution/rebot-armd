@@ -1,16 +1,11 @@
-//! Machine-checked invariants for every transition `(prev, event) -> (state, actions)` of the
-//! [`crate::torque`] reducer.
-//!
-//! Every safety property from `torque-reducer-spec.md` is verified in zero allocations by
-//! [`check_invariants`].
+//! Independent machine-checked invariants for every transition `(prev, event) -> (state, actions)`
+//! of the [`crate::torque`] reducer (M15: checks rest-gate snapshots, capability correlation,
+//! thermal coverage, and safety boundaries directly without reusing reducer predicates).
 
 use serde::{Deserialize, Serialize};
 
 use crate::motor_mode::ControlMode;
 
-use super::reducer::{
-    device_wide_mode_fenced, group_active_channels, is_sample_fresh, recipient_passes_gate,
-};
 use super::types::*;
 
 /// Categorized invariant violation reported by [`check_invariants`].
@@ -32,6 +27,7 @@ pub enum ViolationKind {
     // Rest-gate invariants
     RequestedDisableFailedRestGate,
     RequestedDisableGenerationOrReleaseMismatch,
+    RequestedDisableIncompleteGroupCoverage,
     StationaryHoldMutatedMotionBoundary,
     InvalidOrFutureSampleAdvancedRestWindow,
     HandshakeAckTreatedAsPositionEvidence,
@@ -39,8 +35,8 @@ pub enum ViolationKind {
     ArmParkAuthorizedHandRelease,
     CrossGroupDisableBleed,
     // Dispatch invariants
-    IntentCommittedOffWithoutSentOrAmbiguousWrite,
-    FirstSentOrAmbiguousDidNotCommitOff,
+    IntentCommittedOffWithoutCorrelatedSentOrAmbiguousWrite,
+    FirstCorrelatedSentOrAmbiguousDidNotCommitOff,
     DisableRepeatOutOfBoundsOrPastDeadline,
     MotionOrEnableNotFencedDuringDisable,
     PartialOrAmbiguousDispatchNotSurfaced,
@@ -56,6 +52,7 @@ pub enum ViolationKind {
     OrdinaryBusLossGrantedProtectiveAuthority,
     SafeHoldEmittedDisallowedDisable,
     FailedParkDispatchedDisableOrDroppedHold,
+    UnsolicitedParkSettledMutatedPolicy,
     DeviceWideModeSwitchDidNotFenceGroup,
 }
 
@@ -85,6 +82,127 @@ impl Violation {
     }
 }
 
+#[inline]
+const fn fresh_at(ts_us: u64, now_us: u64, max_age_us: u64) -> bool {
+    ts_us <= now_us && (now_us - ts_us) <= max_age_us
+}
+
+fn indep_device_mode_fenced(state: &TorqueState, devices: DeviceMask) -> bool {
+    for d in devices.iter() {
+        if d >= state.config.device_count {
+            continue;
+        }
+        if state.devices[d as usize].mode_fence_active {
+            return true;
+        }
+        if state.config.devices[d as usize].device_wide_mode_switch {
+            for c in 0..state.config.channel_count {
+                let ch = &state.config.channels[c as usize];
+                if ch.device == d && !matches!(ch.role, JointRole::PassiveSensor) {
+                    let rt = &state.joints[c as usize];
+                    if rt.verified_mode != Some(rt.desired_mode) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Independent check of whether recipient `r` satisfies the spec's rest/release gate (M15).
+fn indep_recipient_passes(
+    state: &TorqueState,
+    r: u8,
+    explicit_release_authorized: bool,
+    now_us: u64,
+) -> bool {
+    if r >= state.config.recipient_count {
+        return false;
+    }
+    let rec = &state.config.recipients[r as usize];
+    let dev = &state.devices[rec.device as usize];
+    let win = &state.rest_windows[r as usize];
+
+    if matches!(rec.role, JointRole::LoadBearing) && !rec.rest_evidence_qualified {
+        return false;
+    }
+    if win.count != REST_WINDOW_SAMPLES {
+        return false;
+    }
+    let [s0, s1, s2] = win.snapshots;
+    if !(s0.release_id < s1.release_id && s1.release_id < s2.release_id) {
+        return false;
+    }
+    if !(s0.min_ts_us <= s1.min_ts_us && s1.min_ts_us <= s2.min_ts_us) {
+        return false;
+    }
+    if now_us < dev.poisoned_until_us || s0.min_ts_us < dev.poisoned_until_us {
+        return false;
+    }
+    if s2.min_ts_us.saturating_sub(s0.max_ts_us) < REST_WINDOW_MIN_SPAN_US {
+        return false;
+    }
+
+    for c in rec.channels.iter() {
+        let ch_cfg = &state.config.channels[c as usize];
+        let rt = &state.joints[c as usize];
+        // All 3 snapshots must be fresh under this channel's capture age ceiling (B8).
+        if !fresh_at(s0.min_ts_us, now_us, ch_cfg.max_capture_age_us)
+            || !fresh_at(s2.max_ts_us, now_us, ch_cfg.max_capture_age_us)
+        {
+            return false;
+        }
+        if let Some(last_mw) = rt.last_motion_write_us {
+            if s0.min_ts_us <= last_mw.saturating_add(REST_SETTLE_US) {
+                return false;
+            }
+        }
+        match ch_cfg.role {
+            JointRole::LoadBearing => {
+                let Some(pos) = rt.last_measured_pos_rad else {
+                    return false;
+                };
+                if !pos.is_finite()
+                    || (pos - ch_cfg.rest_position_rad).abs() > ch_cfg.rest_tolerance_rad
+                {
+                    return false;
+                }
+                if let (Some(mv), Some(v)) =
+                    (ch_cfg.rest_max_velocity_rad_s, rt.last_measured_vel_rad_s)
+                {
+                    if !v.is_finite() || v.abs() > mv {
+                        return false;
+                    }
+                }
+            }
+            JointRole::Gripper(GripperReleasePolicy::LegacyJ7) => {
+                if !rt.last_measured_pos_rad.is_some_and(f32::is_finite) {
+                    return false;
+                }
+            }
+            JointRole::Gripper(GripperReleasePolicy::ExplicitHand)
+            | JointRole::ActiveTool(ActiveToolSafeOutput::BoundedRetention { .. }) => {
+                if !explicit_release_authorized
+                    || !matches!(
+                        rt.last_release_evidence,
+                        ReleaseEvidence::SupportedObject | ReleaseEvidence::VerifiedEmptyGrasp
+                    )
+                {
+                    return false;
+                }
+            }
+            JointRole::ActiveTool(ActiveToolSafeOutput::StopOutput) => {
+                if !rt.last_measured_pos_rad.is_some_and(f32::is_finite) {
+                    return false;
+                }
+            }
+            JointRole::PassiveSensor => return false,
+        }
+    }
+    true
+}
+
 /// Machine-check every specification invariant across one reducer step:
 /// `(prev, event) -> (state, actions)`.
 pub fn check_invariants(
@@ -112,7 +230,6 @@ fn check_structural_invariants(
     event: &Event,
     actions: &ActionSet,
 ) -> Result<(), Violation> {
-    // Release ID advances by 1 iff Event::Release.
     let expected_release = match event {
         Event::Release { .. } => prev.current_release_id.saturating_add(1),
         _ => prev.current_release_id,
@@ -128,13 +245,14 @@ fn check_structural_invariants(
 
     let valid_channels = state.valid_channels();
     let valid_recipients = state.valid_recipients();
-    let valid_groups = state.valid_groups();
     let valid_devices = state.valid_devices();
 
     if !actions.refresh_requests.is_subset_of(valid_channels)
         || !actions.telemetry.unheld_mask.is_subset_of(valid_channels)
-        || !actions.telemetry.reported_enabled_mask.is_subset_of(valid_channels)
-        || !actions.park_requests.intersect(valid_groups).eq(&actions.park_requests)
+        || !actions
+            .telemetry
+            .reported_enabled_mask
+            .is_subset_of(valid_channels)
         || !actions
             .contention_escalations
             .intersect(valid_devices)
@@ -210,7 +328,6 @@ fn check_hold_invariants(
     event: &Event,
     actions: &ActionSet,
 ) -> Result<(), Violation> {
-    // Passive sensors are NEVER commanded (hold, damp, enable, disable).
     for c in 0..state.config.channel_count {
         let ci = c as usize;
         if matches!(state.config.channels[ci].role, JointRole::PassiveSensor)
@@ -242,18 +359,16 @@ fn check_hold_invariants(
         }
     }
 
-    // Check every emitted hold command for validity, freshness, intent, and role safety.
     for c in 0..state.config.channel_count {
         let ci = c as usize;
         let ch_cfg = &state.config.channels[ci];
         let rt = &state.joints[ci];
 
-        // Any active capture in state must be finite and <= max_capture_age_us on Release.
         if matches!(event, Event::Release { .. }) {
             if let Some(pos) = rt.captured_position_rad {
                 let fresh = rt
                     .last_sample_us
-                    .is_some_and(|ts| is_sample_fresh(ts, state.now_us, ch_cfg.max_capture_age_us));
+                    .is_some_and(|ts| fresh_at(ts, state.now_us, ch_cfg.max_capture_age_us));
                 if !pos.is_finite() || !fresh {
                     return Err(Violation::new(
                         ViolationKind::HoldWithStaleOrNonFiniteCapture,
@@ -275,8 +390,10 @@ fn check_hold_invariants(
                     None,
                 ));
             }
-            if !hcmd.position_rad.is_finite()
-                || !is_sample_fresh(hcmd.last_sample_us, state.now_us, ch_cfg.max_capture_age_us)
+            // M5: Position-captured holds must carry fresh finite positions; ActiveToolStop may be positionless.
+            if hcmd.uses_position_capture
+                && (!hcmd.position_rad.is_finite()
+                    || !fresh_at(hcmd.last_sample_us, state.now_us, ch_cfg.max_capture_age_us))
             {
                 return Err(Violation::new(
                     ViolationKind::HoldWithStaleOrNonFiniteCapture,
@@ -285,7 +402,6 @@ fn check_hold_invariants(
                     None,
                 ));
             }
-            // Gripper / hand: stop and FailedHold NEVER open jaws and NEVER raise force.
             if matches!(ch_cfg.role, JointRole::Gripper(_)) {
                 match hcmd.hold_kind {
                     HoldKind::GripperFreeze {
@@ -317,7 +433,6 @@ fn check_hold_invariants(
         }
     }
 
-    // Grasp force cap must never increase when the group is stopped or in FailedHold.
     for c in 0..state.config.channel_count {
         let ci = c as usize;
         if matches!(state.config.channels[ci].role, JointRole::Gripper(_)) {
@@ -341,23 +456,35 @@ fn check_hold_invariants(
         }
     }
 
-    // On Release: Intent On (stopped or FailedHold or SafeHold) => every captured joint gets a hold
-    // intent every release, whatever the reported enable state; uncaptured/unverified are reported unheld.
     if matches!(event, Event::Release { .. }) {
         for g in 0..state.config.group_count {
             let gi = g as usize;
             let grp = state.groups[gi];
             let needs_holds = grp.torque_intent == TorqueIntent::On
                 && (grp.drive_state.requires_holds_when_on()
-                    || (grp.drive_state == DriveState::FaultReactionActive && !grp.park_in_flight));
+                    || (grp.drive_state == DriveState::FaultReactionActive
+                        && !grp.pending_park.is_some_and(|p| p.accepted)));
             if !needs_holds {
                 continue;
             }
-            let active = group_active_channels(state, g);
-            let dev_fenced = device_wide_mode_fenced(state, state.config.groups[gi].devices);
-            for c in active.iter() {
+            let dev_fenced = indep_device_mode_fenced(state, state.config.groups[gi].devices);
+            for c in state.config.groups[gi].channels.iter() {
                 let ci = c as usize;
+                let ch_cfg = state.config.channels[ci];
+                if matches!(ch_cfg.role, JointRole::PassiveSensor) {
+                    continue;
+                }
                 let rt = &state.joints[ci];
+                let mode_ok = rt.verified_mode == Some(rt.desired_mode) && !dev_fenced;
+                let active_tool_stop_required = match ch_cfg.role {
+                    JointRole::ActiveTool(ActiveToolSafeOutput::StopOutput) => true,
+                    JointRole::ActiveTool(ActiveToolSafeOutput::BoundedRetention {
+                        max_retention_us,
+                    }) => rt
+                        .retention_started_us
+                        .is_some_and(|st| state.now_us.saturating_sub(st) >= max_retention_us),
+                    _ => false,
+                };
                 if rt.captured_position_rad.is_some() {
                     if actions.holds[ci].is_none() {
                         return Err(Violation::new(
@@ -367,7 +494,31 @@ fn check_hold_invariants(
                             None,
                         ));
                     }
-                    let mode_ok = rt.verified_mode == Some(rt.desired_mode) && !dev_fenced;
+                    if !mode_ok && !actions.telemetry.unheld_mask.contains(c) {
+                        return Err(Violation::new(
+                            ViolationKind::UncapturedOrUnverifiedNotReportedUnheld,
+                            Some(g),
+                            Some(c),
+                            None,
+                        ));
+                    }
+                } else if active_tool_stop_required {
+                    // M5: Qualified StopOutput or expired BoundedRetention emits positionless
+                    // ActiveToolStop even without positional encoder capture.
+                    if !matches!(
+                        actions.holds[ci],
+                        Some(HoldCommand {
+                            hold_kind: HoldKind::ActiveToolStop,
+                            ..
+                        })
+                    ) {
+                        return Err(Violation::new(
+                            ViolationKind::MissingHoldForCapturedJoint,
+                            Some(g),
+                            Some(c),
+                            None,
+                        ));
+                    }
                     if !mode_ok && !actions.telemetry.unheld_mask.contains(c) {
                         return Err(Violation::new(
                             ViolationKind::UncapturedOrUnverifiedNotReportedUnheld,
@@ -401,8 +552,6 @@ fn check_rest_gate_invariants(
     event: &Event,
     actions: &ActionSet,
 ) -> Result<(), Violation> {
-    // Any initial Requested disable (repeat_index == 0) must pass every actual recipient in the
-    // current release and match the current stop_generation and release_id.
     for g in 0..state.config.group_count {
         let gi = g as usize;
         if let Some(dcmd) = actions.disables[gi] {
@@ -417,6 +566,15 @@ fn check_rest_gate_invariants(
                         None,
                     ));
                 }
+                // B5: Requested disable must cover the entire independently switchable group.
+                if dcmd.recipients != state.config.groups[gi].recipients {
+                    return Err(Violation::new(
+                        ViolationKind::RequestedDisableIncompleteGroupCoverage,
+                        Some(g),
+                        None,
+                        None,
+                    ));
+                }
                 if dcmd.repeat_index == 0 {
                     let Some(tx) = state.groups[gi].disable_tx else {
                         return Err(Violation::new(
@@ -426,16 +584,13 @@ fn check_rest_gate_invariants(
                             None,
                         ));
                     };
-                    if dcmd.recipients.is_empty() {
-                        return Err(Violation::new(
-                            ViolationKind::RequestedDisableFailedRestGate,
-                            Some(g),
-                            None,
-                            None,
-                        ));
-                    }
                     for r in dcmd.recipients.iter() {
-                        if !recipient_passes_gate(state, r, &tx, state.now_us) {
+                        if !indep_recipient_passes(
+                            state,
+                            r,
+                            tx.explicit_release_authorized,
+                            state.now_us,
+                        ) {
                             return Err(Violation::new(
                                 ViolationKind::RequestedDisableFailedRestGate,
                                 Some(g),
@@ -449,7 +604,6 @@ fn check_rest_gate_invariants(
         }
     }
 
-    // Stationary hold preserves last_motion_write_us boundary.
     if let Event::WriteResult(wr) = event {
         if wr.kind == WriteKind::Hold {
             for c in 0..state.config.channel_count {
@@ -466,24 +620,18 @@ fn check_rest_gate_invariants(
         }
     }
 
-    // CausalSample invariants: future timestamps, >1ms drift, non-finite, handshake ACK, definite non-rest.
     if let Event::CausalSample(s) = event {
         if s.channel < state.config.channel_count {
             let ci = s.channel as usize;
             let ch_cfg = &state.config.channels[ci];
             if s.is_handshake_ack_only {
-                let capture_created_or_moved = match (
-                    prev.joints[ci].captured_position_rad,
-                    state.joints[ci].captured_position_rad,
-                ) {
-                    (_, None) => false, // dropping an expired stale capture is not position evidence
-                    (Some(a), Some(b)) => a != b,
-                    (None, Some(_)) => true,
-                };
-                if capture_created_or_moved
+                // B2: Handshake-only ACK never touches position capture, sample time, rest window, OR arms enable!
+                if state.joints[ci].captured_position_rad != prev.joints[ci].captured_position_rad
                     || state.joints[ci].last_sample_us != prev.joints[ci].last_sample_us
                     || state.joints[ci].last_measured_pos_rad
                         != prev.joints[ci].last_measured_pos_rad
+                    || state.groups[ch_cfg.group as usize].drive_state
+                        != prev.groups[ch_cfg.group as usize].drive_state
                 {
                     return Err(Violation::new(
                         ViolationKind::HandshakeAckTreatedAsPositionEvidence,
@@ -512,6 +660,10 @@ fn check_rest_gate_invariants(
                     || !s.position_rad.is_finite()
                     || s.velocity_rad_s.is_some_and(|v| !v.is_finite())
                     || s.rx_timestamp_us < prev.devices[ch_cfg.device as usize].poisoned_until_us
+                    || s.poll_issued_us.is_some_and(|p| {
+                        p < prev.devices[ch_cfg.device as usize].poisoned_until_us
+                            || s.rx_timestamp_us < p
+                    })
                     || s.correlated_after_write_done_us
                         .is_some_and(|wd| s.rx_timestamp_us < wd);
                 if invalid_sample && state.rest_windows[rec].count != 0 {
@@ -526,15 +678,27 @@ fn check_rest_gate_invariants(
                 // Definite non-rest pose during AwaitRestGate -> TORQUE_OFF_WOULD_DROP, 0 disables.
                 let gi = ch_cfg.group as usize;
                 if !invalid_sample
-                    && is_sample_fresh(s.rx_timestamp_us, state.now_us, ch_cfg.max_capture_age_us)
+                    && fresh_at(s.rx_timestamp_us, state.now_us, ch_cfg.max_capture_age_us)
                     && prev.joints[ci]
                         .last_sample_us
                         .is_none_or(|p| s.rx_timestamp_us >= p)
                 {
                     if let Some(prev_tx) = prev.groups[gi].disable_tx {
+                        let feetech_ok = !matches!(ch_cfg.vendor, VendorKind::Feetech)
+                            || s.poll_issued_us
+                                .zip(s.correlated_after_write_done_us)
+                                .is_some_and(|(p, wd)| {
+                                    p >= wd
+                                        && p >= prev.devices[ch_cfg.device as usize].poisoned_until_us
+                                });
+                        let settle_ts = if matches!(ch_cfg.vendor, VendorKind::Feetech) {
+                            s.poll_issued_us.unwrap_or(0)
+                        } else {
+                            s.rx_timestamp_us
+                        };
                         let post_settle = prev.joints[ci]
                             .last_motion_write_us
-                            .is_none_or(|w| s.rx_timestamp_us > w.saturating_add(REST_SETTLE_US));
+                            .is_none_or(|w| settle_ts > w.saturating_add(REST_SETTLE_US));
                         let thermal_tripped_now = s
                             .temperature_c
                             .is_some_and(|t| t.is_finite() && t >= ch_cfg.thermal.trip_c);
@@ -542,6 +706,7 @@ fn check_rest_gate_invariants(
                             && !prev_tx.origin.is_protective()
                             && prev_tx.recipient_mask.contains(ch_cfg.recipient)
                             && state.now_us < prev_tx.deadline_us
+                            && feetech_ok
                             && post_settle
                             && !thermal_tripped_now
                             && matches!(ch_cfg.role, JointRole::LoadBearing)
@@ -575,8 +740,26 @@ fn check_rest_gate_invariants(
         }
     }
 
-    // Arm ParkSettled MUST NEVER authorize or disable any other group (e.g., hand group).
-    if let Event::ParkSettled { group, .. } = event {
+    if let Event::ParkSettled { group, park_id, .. } = event {
+        // B3: Unsolicited or superseded ParkSettled MUST leave policy unchanged.
+        if *group < state.config.group_count {
+            let gi = *group as usize;
+            let matched = prev.groups[gi]
+                .pending_park
+                .is_some_and(|p| p.park_id == *park_id);
+            if !matched
+                && (state.groups[gi].drive_state != prev.groups[gi].drive_state
+                    || state.groups[gi].disable_tx != prev.groups[gi].disable_tx
+                    || state.groups[gi].torque_intent != prev.groups[gi].torque_intent)
+            {
+                return Err(Violation::new(
+                    ViolationKind::UnsolicitedParkSettledMutatedPolicy,
+                    Some(*group),
+                    None,
+                    None,
+                ));
+            }
+        }
         for g in 0..state.config.group_count {
             if g == *group {
                 continue;
@@ -595,8 +778,6 @@ fn check_rest_gate_invariants(
         }
     }
 
-    // Non-protective DisableRequest or non-protective disable WriteResult on group g1 must never
-    // flip TorqueIntent of any other group g2 != g1.
     match event {
         Event::DisableRequest { group, .. } => {
             for g in 0..state.config.group_count {
@@ -644,35 +825,39 @@ fn check_dispatch_invariants(
     event: &Event,
     actions: &ActionSet,
 ) -> Result<(), Violation> {
-    // Zero writes => intent stays On (Off is committed ONLY by a disable WriteResult with Sent or Ambiguous).
+    // B1 + Zero-write invariant: Off can ONLY be committed by a correlated WriteResult for the
+    // live pending_disable_dispatch with at least one remaining recipient Sent or Ambiguous!
     for g in 0..state.config.group_count {
         let gi = g as usize;
         if prev.groups[gi].torque_intent == TorqueIntent::On
             && state.groups[gi].torque_intent == TorqueIntent::Off
         {
-            let valid_commit = match event {
-                Event::WriteResult(wr)
-                    if wr.group == g
-                        && matches!(
-                            wr.kind,
-                            WriteKind::DisableRequested | WriteKind::DisableProtective
-                        ) =>
-                {
-                    wr.target_mask
-                        .intersect(state.config.groups[gi].recipients)
-                        .iter()
-                        .any(|r| {
-                            matches!(
-                                wr.outcomes[r as usize],
-                                MotorWriteOutcome::Sent | MotorWriteOutcome::Ambiguous
-                            )
-                        })
+            let valid_commit = match (event, prev.groups[gi].pending_disable_dispatch) {
+                (Event::WriteResult(wr), Some(pend)) => {
+                    let expected_kind = match pend.kind {
+                        DisableKind::Requested => WriteKind::DisableRequested,
+                        DisableKind::Protective => WriteKind::DisableProtective,
+                    };
+                    wr.group == g
+                        && wr.kind == expected_kind
+                        && wr.dispatch_id == pend.dispatch_id
+                        && wr.generation == pend.generation
+                        && wr
+                            .target_mask
+                            .intersect(pend.remaining_recipients)
+                            .iter()
+                            .any(|r| {
+                                matches!(
+                                    wr.outcomes[r as usize],
+                                    MotorWriteOutcome::Sent | MotorWriteOutcome::Ambiguous
+                                )
+                            })
                 }
                 _ => false,
             };
             if !valid_commit {
                 return Err(Violation::new(
-                    ViolationKind::IntentCommittedOffWithoutSentOrAmbiguousWrite,
+                    ViolationKind::IntentCommittedOffWithoutCorrelatedSentOrAmbiguousWrite,
                     Some(g),
                     None,
                     None,
@@ -681,7 +866,6 @@ fn check_dispatch_invariants(
         }
     }
 
-    // First Sent or Ambiguous disable write matching active/authorized disable MUST commit Off immediately.
     if let Event::WriteResult(wr) = event {
         if wr.group < state.config.group_count
             && matches!(
@@ -690,35 +874,39 @@ fn check_dispatch_invariants(
             )
         {
             let gi = wr.group as usize;
-            let matched = prev.groups[gi]
-                .disable_tx
-                .is_some_and(|tx| tx.last_dispatched_release_id.is_some())
-                || prev.groups[gi].last_authorized_disable_gen == Some(wr.generation);
-            let any_sent_or_ambiguous = wr
-                .target_mask
-                .intersect(state.config.groups[gi].recipients)
-                .iter()
-                .any(|r| {
-                    matches!(
-                        wr.outcomes[r as usize],
-                        MotorWriteOutcome::Sent | MotorWriteOutcome::Ambiguous
-                    )
-                });
-            if matched
-                && any_sent_or_ambiguous
-                && state.groups[gi].torque_intent != TorqueIntent::Off
-            {
-                return Err(Violation::new(
-                    ViolationKind::FirstSentOrAmbiguousDidNotCommitOff,
-                    Some(wr.group),
-                    None,
-                    None,
-                ));
+            if let Some(pend) = prev.groups[gi].pending_disable_dispatch {
+                let expected_kind = match pend.kind {
+                    DisableKind::Requested => WriteKind::DisableRequested,
+                    DisableKind::Protective => WriteKind::DisableProtective,
+                };
+                let correlated = wr.dispatch_id == pend.dispatch_id
+                    && wr.kind == expected_kind
+                    && wr.generation == pend.generation;
+                let any_sent_or_ambiguous = wr
+                    .target_mask
+                    .intersect(pend.remaining_recipients)
+                    .iter()
+                    .any(|r| {
+                        matches!(
+                            wr.outcomes[r as usize],
+                            MotorWriteOutcome::Sent | MotorWriteOutcome::Ambiguous
+                        )
+                    });
+                if correlated
+                    && any_sent_or_ambiguous
+                    && state.groups[gi].torque_intent != TorqueIntent::Off
+                {
+                    return Err(Violation::new(
+                        ViolationKind::FirstCorrelatedSentOrAmbiguousDidNotCommitOff,
+                        Some(wr.group),
+                        None,
+                        None,
+                    ));
+                }
             }
         }
     }
 
-    // Bounded repeats inside original deadline.
     for g in 0..state.config.group_count {
         let gi = g as usize;
         let grp_cfg = state.config.groups[gi];
@@ -742,11 +930,14 @@ fn check_dispatch_invariants(
         }
     }
 
-    // Motion and enable are fenced while a disable transaction is in flight.
+    // B1: Motion and enable are fenced while EITHER disable_tx OR pending_disable_dispatch exists.
     match event {
         Event::EnableStart { group, .. } if *group < state.config.group_count => {
             let gi = *group as usize;
-            if prev.groups[gi].disable_tx.is_some() && actions.enables[gi].is_some() {
+            if (prev.groups[gi].disable_tx.is_some()
+                || prev.groups[gi].pending_disable_dispatch.is_some())
+                && actions.enables[gi].is_some()
+            {
                 return Err(Violation::new(
                     ViolationKind::MotionOrEnableNotFencedDuringDisable,
                     Some(*group),
@@ -757,7 +948,10 @@ fn check_dispatch_invariants(
         }
         Event::MotionCommand { group, .. } if *group < state.config.group_count => {
             let gi = *group as usize;
-            if prev.groups[gi].disable_tx.is_some() && actions.motion_allowed[gi].is_some() {
+            if (prev.groups[gi].disable_tx.is_some()
+                || prev.groups[gi].pending_disable_dispatch.is_some())
+                && actions.motion_allowed[gi].is_some()
+            {
                 return Err(Violation::new(
                     ViolationKind::MotionOrEnableNotFencedDuringDisable,
                     Some(*group),
@@ -769,7 +963,6 @@ fn check_dispatch_invariants(
         _ => {}
     }
 
-    // Partial or ambiguous dispatch MUST be surfaced explicitly on completion.
     for g in 0..state.config.group_count {
         let gi = g as usize;
         if let Some(comp) = actions.disable_completions[gi] {
@@ -801,15 +994,19 @@ fn check_enable_invariants(
     event: &Event,
     actions: &ActionSet,
 ) -> Result<(), Violation> {
-    // EnableStart accepted => TorqueIntent::On and ReadyToSwitchOn; TIMEOUT mismatch => refused.
     if let Event::EnableStart { group, .. } = event {
         if *group < state.config.group_count {
             let gi = *group as usize;
-            let active = group_active_channels(prev, *group);
-            let timeout_mismatch = active.iter().any(|c| {
-                prev.config.channels[c as usize]
-                    .damiao_timeout_reg
-                    .is_some_and(|exp| prev.joints[c as usize].verified_timeout_reg != Some(exp))
+            let timeout_mismatch = prev.config.groups[gi].channels.iter().any(|c| {
+                let ch = &prev.config.channels[c as usize];
+                if matches!(ch.role, JointRole::PassiveSensor) {
+                    return false;
+                }
+                ch.damiao_timeout_reg.is_some_and(|exp| {
+                    let cur_sess = prev.devices[ch.device as usize].session_id;
+                    prev.joints[c as usize].verified_timeout_reg != Some(exp)
+                        || prev.joints[c as usize].verified_timeout_session != Some(cur_sess)
+                })
             });
             if timeout_mismatch && actions.enables[gi].is_some() {
                 return Err(Violation::new(
@@ -833,8 +1030,6 @@ fn check_enable_invariants(
         }
     }
 
-    // Failed, interrupted, or expired enable => FailedHold + ENABLE_FAILED, NO rollback
-    // (unless preempted by protective thermal/process-exit or Tier-2 SafeHold).
     for g in 0..state.config.group_count {
         let gi = g as usize;
         if prev.groups[gi].drive_state == DriveState::ReadyToSwitchOn
@@ -856,21 +1051,32 @@ fn check_enable_invariants(
         }
     }
 
-    // Reported enable state feeds telemetry and handshake completion only.
+    // B2: Ordinary CausalSample.reported_enabled feeds telemetry only — NEVER arms or flips intent!
     if let Event::CausalSample(s) = event {
-        if s.channel < state.config.channel_count && s.reported_enabled == Some(false) {
-            let g = state.config.channels[s.channel as usize].group;
-            let gi = g as usize;
-            let thermal_tripped_now = s.temperature_c.is_some_and(|t| {
-                t.is_finite() && t >= state.config.channels[s.channel as usize].thermal.trip_c
-            });
-            if !thermal_tripped_now
+        if s.channel < state.config.channel_count {
+            let ch_cfg = &state.config.channels[s.channel as usize];
+            let gi = ch_cfg.group as usize;
+            let thermal_tripped_now = s
+                .temperature_c
+                .is_some_and(|t| t.is_finite() && t >= ch_cfg.thermal.trip_c);
+            if s.reported_enabled == Some(false)
+                && !thermal_tripped_now
                 && prev.groups[gi].torque_intent == TorqueIntent::On
                 && state.groups[gi].torque_intent != TorqueIntent::On
             {
                 return Err(Violation::new(
                     ViolationKind::ReportedEnableMutatedTorquePolicy,
-                    Some(g),
+                    Some(ch_cfg.group),
+                    Some(s.channel),
+                    None,
+                ));
+            }
+            if prev.groups[gi].drive_state == DriveState::ReadyToSwitchOn
+                && state.groups[gi].drive_state == DriveState::OperationEnabled
+            {
+                return Err(Violation::new(
+                    ViolationKind::ReportedEnableMutatedTorquePolicy,
+                    Some(ch_cfg.group),
                     Some(s.channel),
                     None,
                 ));
@@ -878,7 +1084,6 @@ fn check_enable_invariants(
         }
     }
 
-    // FaultClear NEVER dispatches a disable and NEVER changes TorqueIntent.
     if matches!(event, Event::FaultClear { .. }) {
         if actions.any_disable() {
             return Err(Violation::new(
@@ -914,24 +1119,38 @@ fn check_thermal_and_panic_invariants(
     event: &Event,
     actions: &ActionSet,
 ) -> Result<(), Violation> {
-    // Thermal preempts everything: protective disable scheduled by N=1 with reserved TX budget
-    // (unless damping phase is actively running).
+    // B10: Thermal N=1 preemption applies whenever hot AND (intent On OR unresolved physical off recipients!).
     if matches!(event, Event::Release { .. }) {
         for g in 0..state.config.group_count {
             let gi = g as usize;
             let grp = state.groups[gi];
-            if !grp.thermal_tripped_mask.is_empty() && grp.torque_intent == TorqueIntent::On {
+            let unresolved_off = grp.torque_intent == TorqueIntent::On
+                || !state.config.groups[gi]
+                    .recipients
+                    .is_subset_of(grp.physically_sent_off_mask);
+            if !grp.thermal_tripped_mask.is_empty() && unresolved_off {
                 if let Some(trip_rel) = grp.thermal_trip_release_id {
                     if state.current_release_id >= trip_rel.saturating_add(1) {
                         let damping_active = grp.drive_state == DriveState::ProtectiveDamping;
                         let protective_scheduled = actions.disables[gi].is_some_and(|d| {
                             matches!(d.kind, DisableKind::Protective) && d.use_reserved_budget
                         });
-                        let already_awaiting_this_rel = grp.disable_tx.is_some_and(|tx| {
-                            tx.origin.is_protective()
-                                && tx.last_dispatched_release_id == Some(state.current_release_id)
+                        let awaiting_protective_tx = grp.pending_disable_dispatch.is_some_and(|p| {
+                            matches!(p.kind, DisableKind::Protective) && p.tx_still_active
                         });
-                        if !damping_active && !protective_scheduled && !already_awaiting_this_rel {
+                        let between_protective_repeats = grp.disable_tx.is_some_and(|tx| {
+                            tx.origin.is_protective()
+                                && matches!(tx.phase, DisablePhase::Dispatched)
+                                && state.now_us < tx.next_repeat_at_us
+                        });
+                        let closed_this_release = actions.disable_completions[gi]
+                            .is_some_and(|c| c.origin.is_protective());
+                        if !damping_active
+                            && !protective_scheduled
+                            && !awaiting_protective_tx
+                            && !between_protective_repeats
+                            && !closed_this_release
+                        {
                             return Err(Violation::new(
                                 ViolationKind::ThermalDidNotScheduleProtectiveByNextRelease,
                                 Some(g),
@@ -945,7 +1164,6 @@ fn check_thermal_and_panic_invariants(
         }
     }
 
-    // MIT kd-only damping emitted ONLY when configured (duration > 0), supported, and verified Impedance.
     for c in 0..state.config.channel_count {
         let ci = c as usize;
         if let Some(damp) = actions.damps[ci] {
@@ -968,7 +1186,6 @@ fn check_thermal_and_panic_invariants(
         }
     }
 
-    // Ordinary bus loss grants NO protective authority.
     if let Event::BusLoss { .. } = event {
         for g in 0..state.config.group_count {
             let gi = g as usize;
@@ -987,7 +1204,6 @@ fn check_thermal_and_panic_invariants(
         }
     }
 
-    // SafeHold never emits DisableRequested, and only cuts on thermal or panic bus-loss limit.
     for g in 0..state.config.group_count {
         let gi = g as usize;
         if prev.groups[gi].drive_state == DriveState::SafeHold {
@@ -1017,7 +1233,6 @@ fn check_thermal_and_panic_invariants(
         }
     }
 
-    // Failed park in Tier-1 worker panic must hold and never disable.
     if let Event::ParkSettled {
         group,
         succeeded: false,
@@ -1040,11 +1255,10 @@ fn check_thermal_and_panic_invariants(
         }
     }
 
-    // Device-wide mode switch fences the whole group until verified.
     match event {
         Event::EnableStart { group, .. } if *group < state.config.group_count => {
             let gi = *group as usize;
-            if device_wide_mode_fenced(prev, prev.config.groups[gi].devices)
+            if indep_device_mode_fenced(prev, prev.config.groups[gi].devices)
                 && actions.enables[gi].is_some()
             {
                 return Err(Violation::new(
@@ -1057,7 +1271,7 @@ fn check_thermal_and_panic_invariants(
         }
         Event::MotionCommand { group, .. } if *group < state.config.group_count => {
             let gi = *group as usize;
-            if device_wide_mode_fenced(prev, prev.config.groups[gi].devices)
+            if indep_device_mode_fenced(prev, prev.config.groups[gi].devices)
                 && actions.motion_allowed[gi].is_some()
             {
                 return Err(Violation::new(

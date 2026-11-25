@@ -25,7 +25,7 @@ pub const MAX_GROUPS: usize = 8;
 /// Microseconds per millisecond.
 pub const US_PER_MS: u64 = 1_000;
 
-/// Default maximum age of a measured position sample to capture or keep a hold (100 ms).
+/// Maximum permitted age of a measured position sample to capture or keep a hold (100 ms).
 pub const DEFAULT_CAPTURE_MAX_AGE_US: u64 = 100 * US_PER_MS;
 
 /// Post-motion settle delay before rest-gate evidence is eligible (strictly `> 20 ms`).
@@ -37,7 +37,7 @@ pub const REST_WINDOW_MIN_SPAN_US: u64 = 20 * US_PER_MS;
 /// Consecutive distinct samples from distinct releases required by the rest gate (`K = 3`).
 pub const REST_WINDOW_SAMPLES: u8 = 3;
 
-/// Default lifetime of an explicit disable request / rest-gate defer window (1 s).
+/// Maximum / default lifetime of an explicit disable request / rest-gate defer window (1 s).
 pub const DEFAULT_DISABLE_DEADLINE_US: u64 = 1_000 * US_PER_MS;
 
 /// Default enable handshake deadline (500 ms).
@@ -55,7 +55,7 @@ pub const FEETECH_POISON_SILENCE_US: u64 = 20 * US_PER_MS;
 /// Maximum tolerated `CLOCK_REALTIME - CLOCK_MONOTONIC` offset drift (1 ms).
 pub const CLOCK_OFFSET_MAX_DRIFT_US: u64 = US_PER_MS;
 
-/// Consecutive lock-contention skips before escalating and latching `DriverWriteFailed`.
+/// Consecutive serviced releases skipped due to hold lock contention before escalating (25).
 pub const CONTENTION_ESCALATION_RELEASES: u16 = 25;
 
 /// Maximum allowed Damiao Reg 9 `TIMEOUT` register count (`8000 × 50 µs = 400 ms`).
@@ -455,8 +455,8 @@ pub enum JointRole {
     PassiveSensor,
 }
 
-/// Optional active-tool qualification wrapper used during profile validation so an unqualified
-/// active tool is rejected at profile load.
+/// Qualification wrapper used during profile validation so an unqualified active tool is
+/// rejected at profile load.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActiveToolConfig {
@@ -529,9 +529,9 @@ pub struct ChannelConfig {
     pub damping: DampingConfig,
     pub thermal: ThermalConfig,
     /// Configured Damiao Reg 9 `TIMEOUT` value (`1..=8000`, 50 µs/count).
-    /// When `Some(v)`, enable is refused until readback equals `v`.
+    /// When `Some(v)`, enable is refused until current-session readback equals `v`.
     pub damiao_timeout_reg: Option<u16>,
-    /// Freshness bound for hold capture and rest-window validity (default 100 ms).
+    /// Freshness bound for hold capture and rest-window validity (`1..=100_000` µs).
     pub max_capture_age_us: u64,
 }
 
@@ -595,19 +595,19 @@ impl Default for RecipientConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupConfig {
     pub id: u8,
-    /// Logical channels belonging to this group (may include passive sensors).
+    /// Logical channels belonging to this group (must equal canonical channel ownership).
     pub channels: ChannelMask,
-    /// Physical disable recipients belonging to this group.
+    /// Physical disable recipients belonging to this group (must equal canonical recipient ownership).
     pub recipients: ChannelMask,
-    /// Devices spanned by this group.
+    /// Devices spanned by this group (must equal canonical device ownership).
     pub devices: DeviceMask,
-    /// Bounded disable repeat count (`3` for Damiao, `1` for others).
+    /// Bounded disable repeat count (`1..=3` for Damiao, `1..=3` general).
     pub disable_repeats: u8,
-    /// Spacing between bounded disable repeats (`20 ms` for Damiao).
+    /// Spacing between bounded disable repeats (`>= 20 ms` for Damiao when `disable_repeats > 1`).
     pub disable_repeat_interval_us: u64,
-    /// Single deadline for disable request rest-gate defer + bounded repeats (`1 s`).
+    /// Single deadline for disable request rest-gate defer + bounded repeats (`1..=1_000_000` µs).
     pub disable_deadline_us: u64,
-    /// Deadline for enable handshake (`500 ms`).
+    /// Deadline for enable handshake (`> 0`).
     pub enable_deadline_us: u64,
     /// Whether Tier-1 worker panic may execute a park-to-rest trajectory on this group.
     pub has_park_path: bool,
@@ -633,11 +633,12 @@ impl Default for GroupConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceConfig {
     pub id: u8,
-    /// Shared physical bus identifier (`0..MAX_DEVICES`); devices with the same `bus_id` share TX budget.
+    /// Shared physical bus identifier (`0..MAX_DEVICES`); devices sharing `bus_id` must agree on
+    /// bus-level normal/reserved TX quotas.
     pub bus_id: u8,
-    /// Per-release normal TX frame quota contributed/used on this bus.
+    /// Shared normal TX frame quota per release on `bus_id`.
     pub tx_quota_per_release: u16,
-    /// Reserved safety TX capacity per release (for protective damping / protective disable).
+    /// Shared reserved safety TX capacity per release on `bus_id` (protective damping / disable).
     pub reserved_safety_tx: u16,
     /// Device operation deadline (µs).
     pub deadline_us: u64,
@@ -719,11 +720,14 @@ pub enum ConfigError {
     PassiveSensorListedAsRecipient { channel: u8, recipient: u8 },
     InvalidGroupTiming { group: u8 },
     InvalidDeviceBudget { device: u8 },
+    SharedBusBudgetMismatch { bus_id: u8 },
     MismatchedChannelTopology { channel: u8 },
+    MismatchedGroupTopology { group: u8 },
 }
 
 impl TorqueConfig {
-    /// Validate capacity bounds, cross-references, role qualifications, and physical constraints.
+    /// Validate capacity bounds, canonical group membership, role qualifications, timing bounds,
+    /// and physical constraints.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if (self.channel_count as usize) > MAX_CHANNELS {
             return Err(ConfigError::ChannelCapacityExceeded {
@@ -757,6 +761,8 @@ impl TorqueConfig {
         let valid_recipients = ChannelMask::from_count(self.recipient_count);
         let valid_devices = DeviceMask::from_count(self.device_count);
 
+        // Validate devices and enforce consistent shared-bus budgets (M14).
+        let mut bus_quota: [Option<(u16, u16)>; MAX_DEVICES] = [None; MAX_DEVICES];
         for d in 0..self.device_count {
             let dev = &self.devices[d as usize];
             if dev.id != d || (dev.bus_id as usize) >= MAX_DEVICES {
@@ -769,84 +775,32 @@ impl TorqueConfig {
             {
                 return Err(ConfigError::InvalidDeviceBudget { device: d });
             }
+            let b = dev.bus_id as usize;
+            match bus_quota[b] {
+                None => bus_quota[b] = Some((dev.tx_quota_per_release, dev.reserved_safety_tx)),
+                Some((q, r)) if q == dev.tx_quota_per_release && r == dev.reserved_safety_tx => {}
+                Some(_) => return Err(ConfigError::SharedBusBudgetMismatch { bus_id: dev.bus_id }),
+            }
         }
 
-        let mut claimed_recipients = ChannelMask::EMPTY;
-        for g in 0..self.group_count {
-            let grp = &self.groups[g as usize];
-            if grp.id != g
-                || grp.channels.is_empty()
-                || !grp.channels.is_subset_of(valid_channels)
-                || !grp.recipients.is_subset_of(valid_recipients)
-                || !grp.devices.intersect(valid_devices).eq(&grp.devices)
-            {
-                return Err(ConfigError::InvalidGroupRef { group: g });
-            }
-            if grp.disable_repeats == 0 || grp.disable_deadline_us == 0 || grp.enable_deadline_us == 0
-            {
-                return Err(ConfigError::InvalidGroupTiming { group: g });
-            }
-            let overlap = claimed_recipients.intersect(grp.recipients);
-            if !overlap.is_empty() {
-                let first = overlap.iter().next().unwrap_or(0);
-                return Err(ConfigError::DuplicateRecipientOwner { recipient: first });
-            }
-            claimed_recipients = claimed_recipients.union(grp.recipients);
-        }
-
-        for r in 0..self.recipient_count {
-            let rec = &self.recipients[r as usize];
-            if rec.id != r
-                || rec.device >= self.device_count
-                || rec.group >= self.group_count
-                || !rec.channels.is_subset_of(valid_channels)
-                || rec.channels.is_empty()
-            {
-                return Err(ConfigError::InvalidRecipientRef { recipient: r });
-            }
-            if !rec.grouped_packet_mask.contains(r)
-                || !rec.grouped_packet_mask.is_subset_of(valid_recipients)
-            {
-                return Err(ConfigError::InvalidGroupedPacketMask { recipient: r });
-            }
-            if matches!(rec.role, JointRole::PassiveSensor) {
-                let first_ch = rec.channels.iter().next().unwrap_or(0);
-                return Err(ConfigError::PassiveSensorListedAsRecipient {
-                    channel: first_ch,
-                    recipient: r,
-                });
-            }
-            let grp = &self.groups[rec.group as usize];
-            if !grp.recipients.contains(r) {
-                return Err(ConfigError::InvalidRecipientRef { recipient: r });
-            }
-            for target in rec.grouped_packet_mask.iter() {
-                if self.recipients[target as usize].group != rec.group {
-                    return Err(ConfigError::CrossGroupRecipientBleed {
-                        recipient: r,
-                        target,
-                    });
-                }
-            }
-            for c in rec.channels.iter() {
-                let ch = &self.channels[c as usize];
-                if ch.recipient != r || ch.role != rec.role {
-                    return Err(ConfigError::MismatchedChannelTopology { channel: c });
-                }
-            }
-        }
+        // Canonical group membership derived from channel and recipient ownership (B4).
+        let mut derived_group_channels = [ChannelMask::EMPTY; MAX_GROUPS];
+        let mut derived_group_devices = [DeviceMask::EMPTY; MAX_GROUPS];
+        let mut derived_group_recipients = [ChannelMask::EMPTY; MAX_GROUPS];
+        let mut group_has_damiao = [false; MAX_GROUPS];
 
         for c in 0..self.channel_count {
             let ch = &self.channels[c as usize];
             if ch.id != c || ch.device >= self.device_count || ch.group >= self.group_count {
                 return Err(ConfigError::InvalidChannelRef { channel: c });
             }
-            if !self.groups[ch.group as usize].channels.contains(c)
-                || !self.groups[ch.group as usize].devices.contains(ch.device)
-            {
-                return Err(ConfigError::MismatchedChannelTopology { channel: c });
+            derived_group_channels[ch.group as usize].insert(c);
+            derived_group_devices[ch.group as usize].insert(ch.device);
+            if matches!(ch.vendor, VendorKind::Damiao) {
+                group_has_damiao[ch.group as usize] = true;
             }
-            if ch.max_capture_age_us == 0 {
+            // M4: hold capture age ceiling <= 100 ms.
+            if ch.max_capture_age_us == 0 || ch.max_capture_age_us > DEFAULT_CAPTURE_MAX_AGE_US {
                 return Err(ConfigError::InvalidCaptureAge { channel: c });
             }
             if !ch.thermal.trip_c.is_finite() || ch.thermal.trip_c <= 0.0 {
@@ -912,6 +866,86 @@ impl TorqueConfig {
                     self.validate_channel_recipient(c, ch)?;
                 }
             }
+        }
+
+        for r in 0..self.recipient_count {
+            let rec = &self.recipients[r as usize];
+            if rec.id != r
+                || rec.device >= self.device_count
+                || rec.group >= self.group_count
+                || !rec.channels.is_subset_of(valid_channels)
+                || rec.channels.is_empty()
+            {
+                return Err(ConfigError::InvalidRecipientRef { recipient: r });
+            }
+            if !rec.grouped_packet_mask.contains(r)
+                || !rec.grouped_packet_mask.is_subset_of(valid_recipients)
+            {
+                return Err(ConfigError::InvalidGroupedPacketMask { recipient: r });
+            }
+            if matches!(rec.role, JointRole::PassiveSensor) {
+                let first_ch = rec.channels.iter().next().unwrap_or(0);
+                return Err(ConfigError::PassiveSensorListedAsRecipient {
+                    channel: first_ch,
+                    recipient: r,
+                });
+            }
+            derived_group_recipients[rec.group as usize].insert(r);
+            for target in rec.grouped_packet_mask.iter() {
+                if self.recipients[target as usize].group != rec.group {
+                    return Err(ConfigError::CrossGroupRecipientBleed {
+                        recipient: r,
+                        target,
+                    });
+                }
+            }
+            for c in rec.channels.iter() {
+                let ch = &self.channels[c as usize];
+                if ch.recipient != r || ch.role != rec.role || ch.group != rec.group {
+                    return Err(ConfigError::MismatchedChannelTopology { channel: c });
+                }
+            }
+        }
+
+        let mut claimed_recipients = ChannelMask::EMPTY;
+        for g in 0..self.group_count {
+            let grp = &self.groups[g as usize];
+            if grp.id != g
+                || grp.channels.is_empty()
+                || !grp.channels.is_subset_of(valid_channels)
+                || !grp.recipients.is_subset_of(valid_recipients)
+                || !grp.devices.intersect(valid_devices).eq(&grp.devices)
+            {
+                return Err(ConfigError::InvalidGroupRef { group: g });
+            }
+            // M9: enforce bounded 1 s request lifetime and Damiao 3 × 20 ms repeat bounds.
+            if grp.disable_repeats == 0
+                || grp.disable_repeats > DAMIAO_DISABLE_REPEATS
+                || grp.disable_deadline_us == 0
+                || grp.disable_deadline_us > DEFAULT_DISABLE_DEADLINE_US
+                || grp.enable_deadline_us == 0
+            {
+                return Err(ConfigError::InvalidGroupTiming { group: g });
+            }
+            if group_has_damiao[g as usize]
+                && grp.disable_repeats > 1
+                && grp.disable_repeat_interval_us < DAMIAO_DISABLE_REPEAT_INTERVAL_US
+            {
+                return Err(ConfigError::InvalidGroupTiming { group: g });
+            }
+            // B4: declared group masks MUST exactly match canonical channel/recipient ownership.
+            if grp.channels != derived_group_channels[g as usize]
+                || grp.recipients != derived_group_recipients[g as usize]
+                || grp.devices != derived_group_devices[g as usize]
+            {
+                return Err(ConfigError::MismatchedGroupTopology { group: g });
+            }
+            let overlap = claimed_recipients.intersect(grp.recipients);
+            if !overlap.is_empty() {
+                let first = overlap.iter().next().unwrap_or(0);
+                return Err(ConfigError::DuplicateRecipientOwner { recipient: first });
+            }
+            claimed_recipients = claimed_recipients.union(grp.recipients);
         }
 
         Ok(())
@@ -1137,8 +1171,12 @@ impl TorqueConfig {
             max_capture_age_us: DEFAULT_CAPTURE_MAX_AGE_US,
         };
 
-        let rec6_channels = ChannelMask::bit(6).union(ChannelMask::bit(7)).union(ChannelMask::bit(8));
-        let rec7_channels = ChannelMask::bit(9).union(ChannelMask::bit(10)).union(ChannelMask::bit(11));
+        let rec6_channels = ChannelMask::bit(6)
+            .union(ChannelMask::bit(7))
+            .union(ChannelMask::bit(8));
+        let rec7_channels = ChannelMask::bit(9)
+            .union(ChannelMask::bit(10))
+            .union(ChannelMask::bit(11));
         cfg.recipients[6] = RecipientConfig {
             id: 6,
             device: 1,
@@ -1305,20 +1343,28 @@ pub struct JointRuntime {
     pub last_measured_pos_rad: Option<f32>,
     /// Last accepted causal measured velocity (rad/s).
     pub last_measured_vel_rad_s: Option<f32>,
-    /// Latest causal release evidence (for gripper/hand channels).
+    /// Latest causal release evidence (for gripper/hand channels; cleared on grasp/motion change).
     pub last_release_evidence: ReleaseEvidence,
+    /// Last sample_id consumed by the active rest-gate K-window for this channel (prevents replay, B8).
+    pub last_window_sample_id: Option<u64>,
+    /// Last release_id consumed by the active rest-gate K-window for this channel.
+    pub last_window_release_id: Option<u64>,
     /// Monotonic timestamp (µs) of the last motion write completion (preserved by stationary holds).
     pub last_motion_write_us: Option<u64>,
     /// Desired semantic control mode.
     pub desired_mode: ControlMode,
     /// Hardware-verified control mode (`None` while unverified / mode switch in flight).
     pub verified_mode: Option<ControlMode>,
-    /// Readback of Damiao Reg 9 `TIMEOUT` register (when read from hardware).
+    /// Readback of Damiao Reg 9 `TIMEOUT` register.
     pub verified_timeout_reg: Option<u16>,
-    /// Reported motor enable bit from feedback (telemetry & enable handshake completion ONLY).
+    /// Device session id in which `verified_timeout_reg` was read back (invalidated on session loss, M11).
+    pub verified_timeout_session: Option<u64>,
+    /// Reported motor enable bit from feedback (telemetry ONLY — never mutates torque policy, B2).
     pub reported_enabled: Option<bool>,
     /// Last finite motor temperature (°C).
     pub last_temperature_c: Option<f32>,
+    /// Monotonic timestamp (µs) of the last accepted thermal observation (rejects out-of-order cool samples, M6).
+    pub last_temperature_us: Option<u64>,
     /// Linear thermal derating multiplier in `0.0..=1.0` (`1.0` when no derate configured).
     pub thermal_derate_scale: f32,
     /// Optional bounded grasp setpoint for a gripper/hand channel.
@@ -1340,12 +1386,16 @@ impl Default for JointRuntime {
             last_measured_pos_rad: None,
             last_measured_vel_rad_s: None,
             last_release_evidence: ReleaseEvidence::Unknown,
+            last_window_sample_id: None,
+            last_window_release_id: None,
             last_motion_write_us: None,
             desired_mode: ControlMode::PositionVelocity,
             verified_mode: None,
             verified_timeout_reg: None,
+            verified_timeout_session: None,
             reported_enabled: None,
             last_temperature_c: None,
+            last_temperature_us: None,
             thermal_derate_scale: 1.0,
             grasp_setpoint_rad: None,
             grasp_force_limit_raw: None,
@@ -1354,42 +1404,94 @@ impl Default for JointRuntime {
     }
 }
 
-/// Per-recipient rest-gate `K = 3` evidence window.
+/// One complete, qualified per-release snapshot recorded in a recipient's 3-slot sliding window (B8).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestSnapshot {
+    pub release_id: u64,
+    /// Earliest causal sample timestamp among mapped channels in this release.
+    pub min_ts_us: u64,
+    /// Latest causal sample timestamp among mapped channels in this release.
+    pub max_ts_us: u64,
+}
+
+/// Per-recipient rest-gate `K = 3` sliding window of complete qualified snapshots (B8).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RestWindow {
-    /// Count of consecutive valid distinct samples from distinct releases (`0..=3`, saturating).
+    /// Number of valid consecutive snapshots currently stored (`0..=3`).
     pub count: u8,
-    /// Timestamp (µs) of the first sample in the current consecutive valid run.
-    pub first_ts_us: u64,
-    /// Timestamp (µs) of the latest sample in the current consecutive valid run.
-    pub last_ts_us: u64,
-    /// Sample id of the latest sample counted in this window.
-    pub last_sample_id: u64,
-    /// Release id of the latest sample counted in this window.
-    pub last_release_id: u64,
-    /// Channels of this recipient that have reported agreeing evidence in the current release.
-    pub release_agreed_channels: ChannelMask,
-    /// Release id that `release_agreed_channels` belongs to.
-    pub release_agreed_id: u64,
+    /// Sliding window of up to 3 consecutive qualified snapshots (oldest at index 0).
+    pub snapshots: [RestSnapshot; 3],
+    /// Channels of this recipient that have contributed an unused agreeing sample in `pending_release_id`.
+    pub pending_agreed_channels: ChannelMask,
+    /// Release id currently accumulating channel agreement.
+    pub pending_release_id: u64,
+    /// Minimum causal timestamp among channels agreed so far in `pending_release_id`.
+    pub pending_min_ts_us: u64,
+    /// Maximum causal timestamp among channels agreed so far in `pending_release_id`.
+    pub pending_max_ts_us: u64,
 }
 
 impl RestWindow {
     pub const fn reset(&mut self) {
         self.count = 0;
-        self.first_ts_us = 0;
-        self.last_ts_us = 0;
-        self.last_sample_id = 0;
-        self.last_release_id = 0;
-        self.release_agreed_channels = ChannelMask::EMPTY;
-        self.release_agreed_id = 0;
+        self.snapshots = [RestSnapshot {
+            release_id: 0,
+            min_ts_us: 0,
+            max_ts_us: 0,
+        }; 3];
+        self.pending_agreed_channels = ChannelMask::EMPTY;
+        self.pending_release_id = 0;
+        self.pending_min_ts_us = 0;
+        self.pending_max_ts_us = 0;
     }
 
+    /// Conservative span across the 3 qualified snapshots (`newest.min_ts - oldest.max_ts`).
     #[inline]
     pub const fn span_us(&self) -> u64 {
         if self.count >= 2 {
-            self.last_ts_us.saturating_sub(self.first_ts_us)
+            let newest = self.snapshots[(self.count - 1) as usize];
+            let oldest = self.snapshots[0];
+            newest.min_ts_us.saturating_sub(oldest.max_ts_us)
         } else {
             0
+        }
+    }
+
+    #[inline]
+    pub const fn oldest_ts_us(&self) -> u64 {
+        if self.count > 0 {
+            self.snapshots[0].min_ts_us
+        } else {
+            0
+        }
+    }
+
+    #[inline]
+    pub const fn latest_ts_us(&self) -> u64 {
+        if self.count > 0 {
+            self.snapshots[(self.count - 1) as usize].min_ts_us
+        } else {
+            0
+        }
+    }
+
+    #[inline]
+    pub const fn latest_release_id(&self) -> u64 {
+        if self.count > 0 {
+            self.snapshots[(self.count - 1) as usize].release_id
+        } else {
+            0
+        }
+    }
+
+    pub fn push_snapshot(&mut self, snap: RestSnapshot) {
+        if self.count < 3 {
+            self.snapshots[self.count as usize] = snap;
+            self.count += 1;
+        } else {
+            self.snapshots[0] = self.snapshots[1];
+            self.snapshots[1] = self.snapshots[2];
+            self.snapshots[2] = snap;
         }
     }
 }
@@ -1438,12 +1540,16 @@ pub enum DisableKind {
 pub enum DisablePhase {
     /// Collecting rest / release evidence across all actual recipients within the 1 s deadline.
     AwaitRestGate,
-    /// Gate passed in `release_id`; one generation-bound dispatch authorized for this release only.
-    AuthorizedForRelease { release_id: u64, generation: u64 },
-    /// Protective MIT kd-only damping phase preceding `DisableProtective`.
+    /// Gate passed in `release_id`; one generation- and dispatch-bound write authorized for this release.
+    AuthorizedForRelease {
+        release_id: u64,
+        generation: u64,
+        dispatch_id: u64,
+    },
+    /// Protective MIT kd-only damping phase preceding `DisableProtective` (per-channel durations, M8).
     ProtectiveDamping {
         started_us: u64,
-        end_us: u64,
+        max_end_us: u64,
         dampable_mask: ChannelMask,
     },
     /// Protective disable ready to dispatch on the next serviced release (`N = 1`) using reserved budget.
@@ -1453,26 +1559,47 @@ pub enum DisablePhase {
     Dispatched,
 }
 
+/// Live unresolved wire disable dispatch awaiting per-recipient outcomes (B1).
+/// Preserved across cancellation so stale/delayed wire receipts are correlated exactly once
+/// and enable/motion remain fenced until any possibly-sent write is reconciled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingDisableDispatch {
+    pub dispatch_id: u64,
+    pub tx_id: u64,
+    pub kind: DisableKind,
+    pub origin: DisableOrigin,
+    pub release_id: u64,
+    pub generation: u64,
+    pub target_recipients: ChannelMask,
+    pub remaining_recipients: ChannelMask,
+    pub sent_mask: ChannelMask,
+    pub ambiguous_mask: ChannelMask,
+    pub failed_mask: ChannelMask,
+    pub deferred_mask: ChannelMask,
+    pub rejected_stale_mask: ChannelMask,
+    /// False if the owning transaction was cancelled/expired while this wire dispatch was in flight.
+    pub tx_still_active: bool,
+}
+
 /// Per-group active disable transaction (at most one active per group).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DisableTransaction {
+    pub tx_id: u64,
     pub origin: DisableOrigin,
     pub phase: DisablePhase,
     pub started_us: u64,
     pub deadline_us: u64,
     pub auth_generation: u64,
-    /// Full expanded set of physical recipients addressed by this disable.
+    /// Full expanded set of physical recipients addressed by this disable (must cover group, B5).
     pub recipient_mask: ChannelMask,
     /// Explicit operator authorization for releasing a new hand / bounded-retention tool.
     pub explicit_release_authorized: bool,
     /// True once at least one disable write was confirmed `Sent` or `Ambiguous`.
     pub committed_off: bool,
-    /// Number of disable transmit passes completed (for bounded Damiao 3 × 20 ms repeats).
+    /// Number of distinct wire attempts completed (for bounded Damiao 3 × 20 ms repeats).
     pub repeats_completed: u8,
     /// Earliest monotonic timestamp (µs) for the next bounded repeat.
     pub next_repeat_at_us: u64,
-    /// True while a disable command has been emitted and awaits its `WriteResult`.
-    pub awaiting_write_result: bool,
     /// Release id in which the latest disable dispatch was emitted.
     pub last_dispatched_release_id: Option<u64>,
     /// Cumulative per-recipient outcomes across the transaction.
@@ -1482,14 +1609,24 @@ pub struct DisableTransaction {
     pub deferred_mask: ChannelMask,
 }
 
-/// Active enable handshake tracking for a group in `DriveState::ReadyToSwitchOn`.
+/// Active enable handshake tracking for a group in `DriveState::ReadyToSwitchOn` (B2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnableTransaction {
+    pub attempt_id: u64,
     pub started_us: u64,
     pub deadline_us: u64,
     pub generation: u64,
     pub target_channels: ChannelMask,
     pub confirmed_channels: ChannelMask,
+}
+
+/// Pending Tier-1 worker-panic park capability bound to one unique `park_id` (B3, M1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingPark {
+    pub park_id: u64,
+    pub generation: u64,
+    /// Holds continue until the owner explicitly accepts the park capability (`Event::ParkAccepted`).
+    pub accepted: bool,
 }
 
 /// Per-group runtime state.
@@ -1501,29 +1638,38 @@ pub struct GroupRuntime {
     pub enable_phase: EnablePhase,
     pub enable_tx: Option<EnableTransaction>,
     pub disable_tx: Option<DisableTransaction>,
+    /// Unresolved wire disable dispatch (B1); fences enable/motion until reconciled.
+    pub pending_disable_dispatch: Option<PendingDisableDispatch>,
+    /// Physical recipients confirmed `Sent` off since the last `EnableStart` (B10: tracks partial coverage).
+    pub physically_sent_off_mask: ChannelMask,
     pub faults: TorqueFaultMask,
     pub protective_latch: bool,
     /// Channels in this group currently above their thermal trip threshold.
     pub thermal_tripped_mask: ChannelMask,
     /// Release id when thermal trip first latched (for checking N=1 protective scheduling).
     pub thermal_trip_release_id: Option<u64>,
-    /// True while Tier-1 worker panic has requested a park and awaits `ParkSettled`.
-    pub park_in_flight: bool,
-    /// Monotonic timestamp (µs) when continuous bus-loss started inside `SafeHold`.
-    pub safe_hold_bus_loss_since_us: Option<u64>,
-    /// Stop generation of the most recent emitted disable command (cleared on `EnableStart`),
-    /// so a late wire outcome racing a `Stop` still commits `TorqueIntent::Off`.
-    pub last_authorized_disable_gen: Option<u64>,
+    /// Live Tier-1 worker-panic park capability (`None` when no park is pending, B3/M1).
+    pub pending_park: Option<PendingPark>,
 }
 
 /// Per-device runtime state.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceRuntime {
-    /// Feetech/serial poisoned line: samples before this timestamp are rejected.
+    /// Connection/power session id; incremented on bus loss/reset to invalidate cached TIMEOUT readbacks (M11).
+    pub session_id: u64,
+    /// Live device-wide mode transition fence (B13); cleared only once every channel on this device is verified.
+    pub mode_fence_active: bool,
+    /// Feetech/serial poisoned line: samples/polls before this timestamp are rejected.
     pub poisoned_until_us: u64,
-    /// Consecutive releases skipped due to lock contention (escalates at 25).
+    /// Per-device continuous bus-loss timer while any group on this device is in Tier-2 `SafeHold` (B11).
+    pub safe_hold_bus_loss_since_us: Option<u64>,
+    /// Consecutive serviced releases where stopped-hold writes were skipped due to lock contention (M10).
     pub consecutive_contention_skips: u16,
-    /// True once contention has escalated and latched `DriverWriteFailed`.
+    /// True if a stopped-hold `LockContended` was observed in the current release (M10).
+    pub hold_contended_in_release: bool,
+    /// True if a stopped-hold write succeeded (`Sent`/`Ambiguous`) in the current release (M10).
+    pub hold_succeeded_in_release: bool,
+    /// True once contention has escalated (escalates once per streak, resets on hold success, M10).
     pub contention_escalated: bool,
 }
 
@@ -1533,6 +1679,8 @@ pub struct TorqueState {
     pub config: TorqueConfig,
     pub now_us: u64,
     pub current_release_id: u64,
+    /// Monotonic capability id allocator for disable dispatches, enable attempts, and park requests.
+    pub next_capability_id: u64,
     pub worker_panic_latched: bool,
     pub worker_panic_thread_tag: Option<u16>,
     pub control_panic_latched: bool,
@@ -1551,6 +1699,7 @@ impl TorqueState {
             config,
             now_us: 0,
             current_release_id: 0,
+            next_capability_id: 1,
             worker_panic_latched: false,
             worker_panic_thread_tag: None,
             control_panic_latched: false,
@@ -1564,6 +1713,14 @@ impl TorqueState {
             state.joints[c as usize].desired_mode = config.channels[c as usize].desired_mode;
         }
         Ok(state)
+    }
+
+    /// Allocate the next monotonic capability / attempt / dispatch identifier.
+    #[inline]
+    pub(crate) fn alloc_capability_id(&mut self) -> u64 {
+        let id = self.next_capability_id;
+        self.next_capability_id = self.next_capability_id.saturating_add(1);
+        id
     }
 
     /// Mask of configured logical channels.
@@ -1600,7 +1757,7 @@ impl TorqueState {
 pub struct CausalSample {
     pub channel: u8,
     pub sample_id: u64,
-    /// Kernel RX or monotonic poll timestamp (µs) in the reducer clock domain.
+    /// Kernel RX or monotonic poll reply timestamp (µs) in the reducer clock domain.
     pub rx_timestamp_us: u64,
     /// Monotonic clock reading (µs) at ingestion.
     pub now_us: u64,
@@ -1609,13 +1766,17 @@ pub struct CausalSample {
     pub position_rad: f32,
     pub velocity_rad_s: Option<f32>,
     pub temperature_c: Option<f32>,
-    /// Reported motor enable state (telemetry and enable handshake completion only).
+    /// Reported motor enable state (telemetry ONLY — never mutates torque policy or arms enable).
     pub reported_enabled: Option<bool>,
-    /// Optional correlated write-done timestamp (µs) for serial/grouped reply correlation.
+    /// Correlated write-done timestamp (µs) for serial/grouped reply correlation (required for Feetech, B7).
     pub correlated_after_write_done_us: Option<u64>,
-    /// Causal release evidence for gripper / dexterous hand channels.
+    /// Monotonic timestamp (µs) when the correlated poll was issued (required for Feetech, B7: must be
+    /// strictly `> last_motion_write_us + 20 ms` and `>= poisoned_until_us`).
+    #[serde(default)]
+    pub poll_issued_us: Option<u64>,
+    /// Causal release evidence for gripper / dexterous hand channels (must be affirmative on qualifying sample, B6).
     pub release_evidence: Option<ReleaseEvidence>,
-    /// True for a whole-device/hand ACK that completes handshake only and is NOT position evidence.
+    /// True for a whole-device/hand ACK that carries no position evidence (never creates capture or rest evidence).
     pub is_handshake_ack_only: bool,
 }
 
@@ -1648,7 +1809,7 @@ pub enum MotorWriteOutcome {
     Deferred,
     /// Rejected by write-time recheck (generation, authorization, mode, freshness, deadline).
     RejectedStale,
-    /// Skipped due to lock contention (feeds 25-release contention escalation).
+    /// Skipped due to lock contention (feeds 25-release stopped-hold contention escalation).
     LockContended,
     /// Definitive pre-transmit failure (0 wire bytes).
     Failed,
@@ -1660,6 +1821,9 @@ pub struct WriteResult {
     pub group: u8,
     pub device: u8,
     pub kind: WriteKind,
+    /// Capability / dispatch / attempt identity returned on the corresponding emitted command (B1, B2).
+    #[serde(default)]
+    pub dispatch_id: u64,
     pub generation: u64,
     pub write_done_us: u64,
     pub now_us: u64,
@@ -1673,6 +1837,7 @@ impl WriteResult {
         group: u8,
         device: u8,
         kind: WriteKind,
+        dispatch_id: u64,
         generation: u64,
         write_done_us: u64,
         now_us: u64,
@@ -1687,6 +1852,7 @@ impl WriteResult {
             group,
             device,
             kind,
+            dispatch_id,
             generation,
             write_done_us,
             now_us,
@@ -1739,9 +1905,11 @@ pub enum Event {
     CausalSample(CausalSample),
     /// Per-motor wire result returned by the emitter.
     WriteResult(WriteResult),
-    /// Enable handshake readback / completion progress.
+    /// Enable handshake readback / completion progress bound to `attempt_id` (B2).
     HandshakeResult {
         group: u8,
+        #[serde(default)]
+        attempt_id: u64,
         now_us: u64,
         confirmed_mask: ChannelMask,
         outcome: HandshakeOutcome,
@@ -1783,7 +1951,7 @@ pub enum Event {
         mode: ControlMode,
         now_us: u64,
     },
-    /// Damiao Reg 9 `TIMEOUT` readback confirmed `timeout_reg` on `channel`.
+    /// Damiao Reg 9 `TIMEOUT` readback confirmed `timeout_reg` on `channel` in the current device session.
     TimeoutReadback {
         channel: u8,
         timeout_reg: u16,
@@ -1804,9 +1972,17 @@ pub enum Event {
         force_limit_raw: Option<u16>,
         now_us: u64,
     },
-    /// Outcome of a park-to-rest trajectory (e.g., Tier-1 worker panic).
+    /// Owner accepted the pending Tier-1 worker-panic park capability `park_id` (M1).
+    ParkAccepted {
+        group: u8,
+        park_id: u64,
+        now_us: u64,
+    },
+    /// Outcome of a pending park-to-rest trajectory bound to `park_id` (B3).
     ParkSettled {
         group: u8,
+        #[serde(default)]
+        park_id: u64,
         succeeded: bool,
         now_us: u64,
     },
@@ -1832,7 +2008,7 @@ pub enum ActionPriority {
     RefreshRoutine = 3,
 }
 
-/// Role-specific hold directive emitted for one captured channel.
+/// Role-specific hold / safe-output directive emitted for one channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HoldKind {
@@ -1840,13 +2016,13 @@ pub enum HoldKind {
     PositionHold,
     /// Gripper / hand freeze: never opens jaws and never raises force.
     GripperFreeze { max_force_limit_raw: Option<u16> },
-    /// Active tool safe stop output (e.g. screwdriver zero velocity).
+    /// Active tool safe stop output (e.g. screwdriver zero velocity; emitted even without position capture, M5).
     ActiveToolStop,
     /// Active tool bounded retention (e.g. vacuum suction held within remaining budget).
     ActiveToolRetain { remaining_us: u64 },
 }
 
-/// Per-channel hold intent emitted on a release.
+/// Per-channel hold / safe-output intent emitted on a release.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct HoldCommand {
     pub channel: u8,
@@ -1855,6 +2031,8 @@ pub struct HoldCommand {
     pub position_rad: f32,
     pub captured_at_us: u64,
     pub last_sample_us: u64,
+    /// True for position-anchored holds; false for position-independent semantic tool stops (M5).
+    pub uses_position_capture: bool,
     pub verified_mode: Option<ControlMode>,
     pub hold_kind: HoldKind,
     /// Thermal derating multiplier (`0.0..=1.0`).
@@ -1862,7 +2040,7 @@ pub struct HoldCommand {
     pub generation: u64,
 }
 
-/// Per-channel MIT kd-only damping intent emitted during `ProtectiveDamping`.
+/// Per-channel MIT kd-only damping intent emitted during `ProtectiveDamping` (per-channel end_us, M8).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct DampCommand {
     pub channel: u8,
@@ -1876,24 +2054,30 @@ pub struct DampCommand {
     pub use_reserved_budget: bool,
 }
 
-/// Per-group enable command.
+/// Per-group enable command carrying its unique `attempt_id` (B2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnableCommand {
     pub group: u8,
+    pub attempt_id: u64,
     pub channels: ChannelMask,
     pub generation: u64,
     pub deadline_us: u64,
 }
 
-/// Per-group typed disable command.
+/// Per-group typed disable command carrying its unique `dispatch_id` and per-device deadlines (B1, M14).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DisableCommand {
     pub group: u8,
+    pub tx_id: u64,
+    pub dispatch_id: u64,
     pub kind: DisableKind,
     pub origin: DisableOrigin,
     pub recipients: ChannelMask,
+    /// Distinct physical packets required to address `recipients` (grouped packets counted once, M14).
+    pub packet_count: u16,
     pub generation: u64,
     pub release_id: u64,
+    /// Effective deadline capped by both the group deadline and the tightest addressed device deadline (M14).
     pub deadline_us: u64,
     pub repeat_index: u8,
     pub use_reserved_budget: bool,
@@ -1903,6 +2087,7 @@ pub struct DisableCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DisableCompletion {
     pub group: u8,
+    pub tx_id: u64,
     pub origin: DisableOrigin,
     pub recipient_mask: ChannelMask,
     pub sent_mask: ChannelMask,
@@ -1915,7 +2100,7 @@ pub struct DisableCompletion {
     pub repeats_completed: u8,
 }
 
-/// Refusal emitted for one group.
+/// Refusal emitted for one group (or an out-of-range group).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RefusalEvent {
     pub group: u8,
@@ -1923,15 +2108,24 @@ pub struct RefusalEvent {
     pub channel: Option<u8>,
 }
 
-/// Authorized motion pass-through (emitted only when all motion fences pass).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Authorized motion pass-through carrying authoritative per-channel thermal derate scales (M7).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct MotionAllowed {
     pub group: u8,
     pub channels: ChannelMask,
     pub generation: u64,
+    pub thermal_derate_scales: [f32; MAX_CHANNELS],
 }
 
-/// Per-bus TX budget summary computed for the emitter on each step.
+/// Tier-1 worker-panic park capability emitted to the owner (B3, M1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParkRequest {
+    pub group: u8,
+    pub park_id: u64,
+    pub generation: u64,
+}
+
+/// Per-bus TX budget summary computed for the emitter on each step (M14: packet-accurate accounting).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BusBudgetSummary {
     pub normal_quota: u16,
@@ -1979,7 +2173,7 @@ pub enum Action {
     Damp(DampCommand),
     Disable(DisableCommand),
     Hold(HoldCommand),
-    RequestPark { group: u8, generation: u64 },
+    RequestPark(ParkRequest),
     Enable(EnableCommand),
     MotionAllowed(MotionAllowed),
     Refresh(ChannelMask),
@@ -1997,7 +2191,7 @@ impl Action {
             Self::Disable(d) if matches!(d.kind, DisableKind::Protective) => {
                 ActionPriority::Protective
             }
-            Self::Disable(_) | Self::Hold(_) | Self::RequestPark { .. } => ActionPriority::StopHold,
+            Self::Disable(_) | Self::Hold(_) | Self::RequestPark(_) => ActionPriority::StopHold,
             Self::Enable(_) | Self::MotionAllowed(_) => ActionPriority::Motion,
             Self::Refresh(_)
             | Self::DisableComplete(_)
@@ -2016,8 +2210,10 @@ pub struct ActionSet {
     pub disables: [Option<DisableCommand>; MAX_GROUPS],
     pub disable_completions: [Option<DisableCompletion>; MAX_GROUPS],
     pub refusals: [Option<RefusalEvent>; MAX_GROUPS],
+    /// Dedicated refusal slot for out-of-range group ids (never dropped by `visit_by_priority`, m2).
+    pub invalid_group_refusal: Option<RefusalEvent>,
     pub motion_allowed: [Option<MotionAllowed>; MAX_GROUPS],
-    pub park_requests: GroupMask,
+    pub park_requests: [Option<ParkRequest>; MAX_GROUPS],
     pub refresh_requests: ChannelMask,
     pub contention_escalations: DeviceMask,
     pub telemetry: TelemetrySnapshot,
@@ -2032,8 +2228,9 @@ impl Default for ActionSet {
             disables: [None; MAX_GROUPS],
             disable_completions: [None; MAX_GROUPS],
             refusals: [None; MAX_GROUPS],
+            invalid_group_refusal: None,
             motion_allowed: [None; MAX_GROUPS],
-            park_requests: GroupMask::EMPTY,
+            park_requests: [None; MAX_GROUPS],
             refresh_requests: ChannelMask::EMPTY,
             contention_escalations: DeviceMask::EMPTY,
             telemetry: TelemetrySnapshot::default(),
@@ -2064,12 +2261,21 @@ impl ActionSet {
 
     #[inline]
     pub fn refusal_for(&self, group: u8) -> Option<RefusalEvent> {
-        self.refusals.get(group as usize).copied().flatten()
+        self.refusals
+            .get(group as usize)
+            .copied()
+            .flatten()
+            .or_else(|| self.invalid_group_refusal.filter(|r| r.group == group))
     }
 
     #[inline]
     pub fn completion_for(&self, group: u8) -> Option<DisableCompletion> {
         self.disable_completions.get(group as usize).copied().flatten()
+    }
+
+    #[inline]
+    pub fn park_for(&self, group: u8) -> Option<ParkRequest> {
+        self.park_requests.get(group as usize).copied().flatten()
     }
 
     #[inline]
@@ -2111,12 +2317,9 @@ impl ActionSet {
                 f(Action::Hold(h));
             }
         }
-        for g in self.park_requests.iter() {
-            if g < state.config.group_count {
-                f(Action::RequestPark {
-                    group: g,
-                    generation: state.groups[g as usize].stop_generation,
-                });
+        for g in 0..state.config.group_count {
+            if let Some(p) = self.park_requests[g as usize] {
+                f(Action::RequestPark(p));
             }
         }
         // Tier 2: Motion (enable, motion allowed)
@@ -2136,9 +2339,12 @@ impl ActionSet {
             if let Some(c) = self.disable_completions[g as usize] {
                 f(Action::DisableComplete(c));
             }
-            if let Some(r) = self.refusals[g as usize] {
-                f(Action::Refusal(r));
-            }
+        }
+        for r in self.refusals.into_iter().flatten() {
+            f(Action::Refusal(r));
+        }
+        if let Some(r) = self.invalid_group_refusal {
+            f(Action::Refusal(r));
         }
         for d in self.contention_escalations.iter() {
             if d < state.config.device_count {
