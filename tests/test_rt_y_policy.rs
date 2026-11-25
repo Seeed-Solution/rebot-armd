@@ -1051,7 +1051,7 @@ async fn y4_lease_loss_mid_run_zero_old_gen_tx_close_watermark_and_slot_reclamat
         .obs
         .policy
         .as_ref()
-        .and_then(|p| p.stop_reason.clone());
+        .and_then(|p| p.stop_reason);
     assert!(
         matches!(exp_reason.as_deref(), Some("LEASE_LOST") | Some("WATCHDOG_TIMEOUT")),
         "expected LEASE_LOST or WATCHDOG_TIMEOUT on lease expiry, got {exp_reason:?}"
@@ -1333,7 +1333,7 @@ async fn y5_rest_off_lock_embedding_ticket_operator_lock_and_qualification_ledge
         .obs
         .policy
         .as_ref()
-        .and_then(|p| p.stop_reason.clone());
+        .and_then(|p| p.stop_reason);
     assert!(
         matches!(
             emb_stop_reason.as_deref(),

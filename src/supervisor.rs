@@ -3831,7 +3831,7 @@ impl SupervisorInner {
         out.disable_pending = self.disable_pending;
         out.feedback_valid = self.hardware_feedback_fresh(Duration::from_millis(250));
         out.commanded_positions.clone_from(&self.commanded_positions);
-        let (action_spare, prev_action_spare) = match spares.as_deref_mut() {
+        let (action_spare, prev_action_spare) = match spares.as_mut() {
             Some(s) => (Some(&mut s.action_msg), Some(&mut s.prev_action_msg)),
             None => (None, None),
         };

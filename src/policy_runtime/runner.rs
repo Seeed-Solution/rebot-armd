@@ -1680,14 +1680,10 @@ async fn send_executor_end_policy(
             .await
         {
             Ok(Reply::Ack { .. }) => return true,
-            Ok(Reply::Refused { code, .. })
-                if matches!(
-                    code,
-                    "POLICY_NOT_ACTIVE" | "LEASE_LOST" | "EPOCH_MISMATCH" | "STOPPED"
-                ) =>
-            {
-                return true;
-            }
+            Ok(Reply::Refused {
+                code: "POLICY_NOT_ACTIVE" | "LEASE_LOST" | "EPOCH_MISMATCH" | "STOPPED",
+                ..
+            }) => return true,
             Ok(Reply::Refused { .. } | Reply::Lease { .. } | Reply::Terminal { .. }) => {
                 return false;
             }
