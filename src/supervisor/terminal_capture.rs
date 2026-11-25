@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use crate::model::{
     ArmObservation, ControlMode, DriverCapabilities, EnableState, GripperBaselineObs, GripperObs,
-    HolderLabel, MAX_MOTION_DOF,
+    HolderLabel, TcpState, MAX_MOTION_DOF,
 };
 use crate::motion::{ActionStatus, PolicyStats};
 use crate::rt_core::publish::{Snapshot, StateHub};
@@ -174,6 +174,26 @@ impl CapturedGripperObs {
     }
 }
 
+/// `Copy` inline mirror of [`TcpState`] so synthesized observations recompute TCP pose from the
+/// same captured joint sample rather than retaining a stale snapshot's pose.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CapturedTcpState {
+    pub(crate) xyz_m: [f32; 3],
+    pub(crate) rpy_rad: [f32; 3],
+    pub(crate) quat_wxyz: [f32; 4],
+}
+
+impl CapturedTcpState {
+    #[inline]
+    fn to_tcp_state(self) -> TcpState {
+        TcpState {
+            xyz_m: self.xyz_m,
+            rpy_rad: self.rpy_rad,
+            quat_wxyz: self.quat_wxyz,
+        }
+    }
+}
+
 /// Fixed-size `Copy` terminal record captured on `armd-control` with zero heap ops and zero locks.
 #[derive(Clone, Copy)]
 pub(crate) struct TerminalCaptureRecord {
@@ -226,6 +246,7 @@ pub(crate) struct TerminalCaptureRecord {
     pub(crate) torques: [f32; CAPTURE_MAX_DOF],
     pub(crate) temperatures: [f32; CAPTURE_MAX_DOF],
     pub(crate) commanded_positions: [f32; CAPTURE_MAX_DOF],
+    pub(crate) tcp: Option<CapturedTcpState>,
     pub(crate) gripper: Option<CapturedGripperObs>,
     pub(crate) gravity_compensated: bool,
     pub(crate) gravity_torques_len: u8,
@@ -339,6 +360,27 @@ impl TerminalCaptureRecord {
             None
         };
         let dof = inner.config.dof.min(CAPTURE_MAX_DOF) as u8;
+        let tcp = if inner.config.dof >= inner.config.arm_dof()
+            && inner.measured_positions.len() >= inner.config.arm_dof()
+        {
+            inner.config.arm_model.fk_f32(&inner.measured_positions).map(|end| {
+                let pose = inner.config.end_to_tcp(&end);
+                let rpy = crate::kinematics::r_to_rpy(&pose.r);
+                let quat = crate::kinematics::r_to_quat(&pose.r);
+                CapturedTcpState {
+                    xyz_m: [pose.p[0] as f32, pose.p[1] as f32, pose.p[2] as f32],
+                    rpy_rad: [rpy[0] as f32, rpy[1] as f32, rpy[2] as f32],
+                    quat_wxyz: [
+                        quat[0] as f32,
+                        quat[1] as f32,
+                        quat[2] as f32,
+                        quat[3] as f32,
+                    ],
+                }
+            })
+        } else {
+            None
+        };
         let gripper = if let (Some(idx), Some(policy)) = (
             inner.config.gripper_index(),
             inner.config.gripper_policy.as_ref(),
@@ -477,6 +519,7 @@ impl TerminalCaptureRecord {
             torques,
             temperatures,
             commanded_positions,
+            tcp,
             gripper,
             gravity_compensated,
             gravity_torques_len,
@@ -666,6 +709,7 @@ impl TerminalCaptureRecord {
         obs.commanded_positions.clear();
         obs.commanded_positions
             .extend_from_slice(&self.commanded_positions[..dof]);
+        obs.tcp = self.tcp.map(CapturedTcpState::to_tcp_state);
         obs.gripper = self.gripper.map(CapturedGripperObs::to_gripper_obs);
         obs.gravity_compensated = self.gravity_compensated;
         let gt_len = usize::from(self.gravity_torques_len).min(CAPTURE_MAX_DOF);
@@ -1956,6 +2000,12 @@ mod tests {
                     reason: Some("z below table".into()),
                 },
             );
+            inner.update_action(id, |a| {
+                a.approach = Some("same_side".into());
+            });
+            // Contact interrupts same-side approach -> must update mirror so delayed cancellation
+            // reports `direct` + `contact` instead of stale `same_side`.
+            inner.approach_interrupted(id, "contact");
             // Guarded cancellation clears workspace violation fields (`finish_action`).
             inner.defer_terminal_capture = true;
             inner.finish_action(id, "cancelled", Some("STOPPED"), None, None, None, None);
@@ -2055,6 +2105,10 @@ mod tests {
                 "synthesized positions[gripper.joint] ({}) and gripper.rad ({}) must agree",
                 got[0].positions[gripper_idx],
                 grip.rad
+            );
+            assert!(
+                got[0].tcp.is_some(),
+                "synthesized observation must compute tcp from captured joint positions"
             );
             assert_eq!(got[0].feedback_age_ms.len(), got[0].positions.len());
             assert_eq!(got[0].gravity_comp.phase, None);

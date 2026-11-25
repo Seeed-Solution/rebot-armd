@@ -3219,6 +3219,9 @@ pub fn install_move_joint(
                 if let Some(a) = this.last_action.as_mut().filter(|a| a.id == id) {
                     outcome.apply(a);
                 }
+                if let Some(a) = this.last_action.as_ref().filter(|a| a.id == id) {
+                    this.mirror_rich_action_off_rt(a);
+                }
             }
             Ok((id, duration))
         }

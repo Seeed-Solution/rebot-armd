@@ -820,6 +820,9 @@ mod runtime {
             if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id && a.approach.as_deref() == Some("same_side")) {
                 Outcome::direct(reason).apply(a);
             }
+            if let Some(a) = self.last_action.as_ref().filter(|a| a.id == id) {
+                self.mirror_rich_action_off_rt(a);
+            }
         }
     }
 }

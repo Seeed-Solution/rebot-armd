@@ -6925,8 +6925,7 @@ fn control_thread_main(
                         }
                         return None;
                     }
-                    let (phases, body_end) = core.take_tick_phases();
-                    let body_end = body_end.unwrap_or_else(now_inst);
+                    let (phases, _body_end) = core.take_tick_phases();
                     core.defer_zero_check_persist = false;
                     if let Some(p) = core.watchdog_park_pending.filter(|p| !p.waiting_mit_handback) {
                         let key = (p.generation, p.attempt);
@@ -7025,7 +7024,7 @@ fn control_thread_main(
                             tx_us: phases[2],
                             finish_us: phases[3],
                             obs_us: phases[4],
-                            publish_us: crate::diagnostics::tick::us(done.saturating_duration_since(body_end)),
+                            publish_us: core.take_publish_only_us(),
                         },
                         phases_us: ReleasePhasesUs {
                             terminal: core.take_phase_terminal_us(),

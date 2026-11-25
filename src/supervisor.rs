@@ -1350,6 +1350,13 @@ pub struct SupervisorInner {
     terminal_edge_tracker: terminal_capture::TerminalEdgeTracker,
     /// Accumulated wall time (µs) spent in `capture_edge_terminals` during the latest release.
     last_phase_terminal_us: u32,
+    /// Wall time (µs) spent strictly in `StatePublisher::publish_with_rt_meta` during the latest
+    /// release (disjoint from `last_phase_terminal_us`).
+    last_publish_only_us: u32,
+    /// Context-switch baseline sampled right before the FIRST terminal capture of the release
+    /// (whether early supersession/materialization or `capture_edge_terminals`), consumed by
+    /// `publish_at` so `mid_nvcsw` attributes stalls in every capture path.
+    first_terminal_csw_mark: Option<crate::diagnostics::tick::CswMark>,
     /// Dedicated per-tick cached driver state read exclusively by terminal capture (isolated
     /// from hardware park/torque-off interlock fields `last_poll_*`).
     pub(crate) capture_driver_cache: terminal_capture::CaptureDriverCache,
@@ -2380,6 +2387,8 @@ impl SupervisorInner {
             staged_terminals: terminal_capture::StagedTerminalBuf::default(),
             terminal_edge_tracker: terminal_capture::TerminalEdgeTracker::default(),
             last_phase_terminal_us: 0,
+            last_publish_only_us: 0,
+            first_terminal_csw_mark: None,
             capture_driver_cache: terminal_capture::CaptureDriverCache::default(),
             template_obs_for_drain: None,
             terminal_capture_test_hook: None,
@@ -3255,8 +3264,12 @@ impl SupervisorInner {
         evicted: terminal_capture::StagedTerminal,
         obs_timestamp: f64,
         publish_seq: Option<u64>,
+        charge_timing: bool,
     ) {
-        let t0 = Instant::now();
+        if self.first_terminal_csw_mark.is_none() {
+            self.first_terminal_csw_mark = Some(crate::diagnostics::tick::CswMark::now());
+        }
+        let t0 = charge_timing.then(Instant::now);
         let rec = match evicted {
             terminal_capture::StagedTerminal::Captured(mut r) => {
                 r.publish_seq = publish_seq;
@@ -3276,15 +3289,20 @@ impl SupervisorInner {
         if let (Some(r), Some(tx)) = (rec, self.terminal_capture_tx.as_mut()) {
             let _ = tx.try_push(r);
         }
-        self.last_phase_terminal_us = self
-            .last_phase_terminal_us
-            .saturating_add(crate::diagnostics::tick::us(t0.elapsed()));
+        if let Some(t0) = t0 {
+            self.last_phase_terminal_us = self
+                .last_phase_terminal_us
+                .saturating_add(crate::diagnostics::tick::us(t0.elapsed()));
+        }
     }
 
     /// Materializes a `StagedTerminal::Deferred` entry in-place into `StagedTerminal::Captured`
     /// right before `action_id`'s live slot (`previous_action` / `last_action`) is overwritten so
     /// no deferred terminal can ever be silently skipped at `capture_edge_terminals`.
     pub(crate) fn materialize_deferred_staged_by_id(&mut self, action_id: u64, obs_timestamp: f64) {
+        if self.first_terminal_csw_mark.is_none() {
+            self.first_terminal_csw_mark = Some(crate::diagnostics::tick::CswMark::now());
+        }
         let t0 = Instant::now();
         let Some(seq) = self.staged_terminals.deferred_seq_for(action_id) else {
             return;
@@ -3315,6 +3333,9 @@ impl SupervisorInner {
             return;
         }
         if self.rt_executor_owned || self.defer_terminal_capture {
+            if self.first_terminal_csw_mark.is_none() {
+                self.first_terminal_csw_mark = Some(crate::diagnostics::tick::CswMark::now());
+            }
             let t0 = Instant::now();
             let seq = self.alloc_terminal_seq();
             if !self.terminal_edge_tracker.record_edge(action.id, seq) {
@@ -3327,7 +3348,7 @@ impl SupervisorInner {
                 .push_evicting_oldest(terminal_capture::StagedTerminal::Captured(rec))
             {
                 let next_pub_seq = Some(self.core.next_publish_seq());
-                self.flush_evicted_staged(oldest, ts, next_pub_seq);
+                self.flush_evicted_staged(oldest, ts, next_pub_seq, false);
             }
             self.last_phase_terminal_us = self
                 .last_phase_terminal_us
@@ -3368,7 +3389,7 @@ impl SupervisorInner {
                     },
                 ) {
                     let next_pub_seq = Some(self.core.next_publish_seq());
-                    self.flush_evicted_staged(oldest, ts, next_pub_seq);
+                    self.flush_evicted_staged(oldest, ts, next_pub_seq, true);
                 }
                 return;
             }
@@ -3421,7 +3442,7 @@ impl SupervisorInner {
                         terminal_seq: seq,
                     },
                 ) {
-                    self.flush_evicted_staged(oldest, obs_timestamp, publish_seq);
+                    self.flush_evicted_staged(oldest, obs_timestamp, publish_seq, false);
                 }
             }
         }
@@ -3439,7 +3460,7 @@ impl SupervisorInner {
                         terminal_seq: seq,
                     },
                 ) {
-                    self.flush_evicted_staged(oldest, obs_timestamp, publish_seq);
+                    self.flush_evicted_staged(oldest, obs_timestamp, publish_seq, false);
                 }
             }
         }
@@ -3519,10 +3540,19 @@ impl SupervisorInner {
         id
     }
 
-    /// Consumes and resets the accumulated `phases_us.terminal` duration (µs) for the current release.
+    /// Consumes and resets the accumulated `phases_us.terminal` duration (µs) and first-capture
+    /// CSW baseline for the current release.
     #[inline]
     pub(crate) fn take_phase_terminal_us(&mut self) -> u32 {
+        self.first_terminal_csw_mark = None;
         std::mem::replace(&mut self.last_phase_terminal_us, 0)
+    }
+
+    /// Consumes and resets the disjoint `StatePublisher::publish_with_rt_meta` duration (µs) for
+    /// the current release (excludes `phases_us.terminal`).
+    #[inline]
+    pub(crate) fn take_publish_only_us(&mut self) -> u32 {
+        std::mem::replace(&mut self.last_publish_only_us, 0)
     }
 
     /// Patches `failed_step` on a queued terminal action if still awaiting dispatcher drain.
@@ -4211,7 +4241,11 @@ impl SupervisorInner {
         };
         let owner = self.published_owner_meta();
         let next_pub_seq = self.core.next_publish_seq();
-        let mid_csw_start = Some(crate::diagnostics::tick::CswMark::now());
+        let mid_csw_start = Some(
+            self.first_terminal_csw_mark
+                .take()
+                .unwrap_or_else(crate::diagnostics::tick::CswMark::now),
+        );
         let (phase_terminal_us, captured_any) =
             self.capture_edge_terminals(timestamp, Some(next_pub_seq));
         let publish_start = Instant::now();
@@ -4239,6 +4273,7 @@ impl SupervisorInner {
             meta,
         );
         let publish_only_us = crate::diagnostics::tick::us(publish_start.elapsed());
+        self.last_publish_only_us = publish_only_us;
         TickPublished {
             kept,
             body_end,
@@ -11867,6 +11902,15 @@ impl ArmSupervisor {
             broadcaster: Arc::clone(&self.terminals),
             id,
         }
+    }
+
+    /// True if `action_id` has been emitted via a synthetic post-publish terminal (`obs_override`)
+    /// across any consumer. Used by `ws.rs` writer lag-recovery and buffered telemetry send to
+    /// prevent sending a stale `running` frame after a synthetic terminal for the same action.
+    #[inline]
+    pub(crate) fn is_action_synthetically_terminated(&self, action_id: u64) -> bool {
+        self.terminal_capture_channel
+            .was_synthetically_terminated(action_id)
     }
 
     /// Starts the dispatcher thread (armd does at startup, before the control loop): it

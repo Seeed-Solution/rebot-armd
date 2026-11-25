@@ -2257,6 +2257,14 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 },
                 _ = std::future::ready(()), if pending_latest_telemetry.is_some() => {
                     if let Some(obs) = pending_latest_telemetry.take() {
+                        // Suppress any buffered or lag-resynced `running` snapshot whose action
+                        // already terminated via a synthetic post-publish terminal frame.
+                        if obs.action.as_ref().is_some_and(|a| {
+                            a.is_running()
+                                && writer_supervisor.is_action_synthetically_terminated(a.id)
+                        }) {
+                            continue;
+                        }
                         if let Some(rate) = obs_rate {
                             if !rate.due(last_sent, obs.timestamp) { continue; }
                             last_sent = Some(obs.timestamp);
