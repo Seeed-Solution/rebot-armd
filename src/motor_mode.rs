@@ -7,9 +7,10 @@
 use std::f32::consts::PI;
 use std::fmt;
 
-use serde::de::{self, Deserializer};
+use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde::ser::{SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 
 use crate::model::{DamiaoGripperDrive, DamiaoGripperMode};
 
@@ -82,8 +83,31 @@ pub const IMPEDANCE_WIRE_KD_MAX: f32 = 5.0;
 /// Full scale of Damiao `POS_FORCE` `i_des` field (`1/10000` of maximum phase current).
 pub const POS_FORCE_CURRENT_MAX_RAW: u16 = 10_000;
 
-/// Maximum representable speed on the Damiao `POS_FORCE` `u16` wire field (`65535 * 0.01 rad/s`).
-pub const POS_FORCE_MAX_WIRE_SPEED_RAD_S: f64 = 655.35;
+/// Highest `f32` speed representable on the Damiao `POS_FORCE` `u16` wire field (`vel_raw = 65535`).
+///
+/// Defined via [`DamiaoGripperDrive::wire_speed_f32`] so `u16::MAX` (`0xFFFF`) is reachable in `f32`
+/// without rejecting the smallest `f32` that floors back to `65535` (whereas `655.35_f32` is
+/// slightly below `655.35` and floors to `65534`).
+pub fn pos_force_max_wire_speed_f32() -> f32 {
+    DamiaoGripperDrive::wire_speed_f32(u16::MAX)
+}
+
+/// Predicate verifying that `[min_val, max_val]` will not overflow `span = max_val - min_val`
+/// or the intermediate `span * ((1 << bits) - 1)` in `f32` linear quantization / de-quantization.
+pub fn is_valid_quantized_range(min_val: f32, max_val: f32, bits: u32) -> bool {
+    if !(min_val.is_finite() && max_val.is_finite() && min_val < max_val) {
+        return false;
+    }
+    if bits == 0 || bits > 16 {
+        return false;
+    }
+    let span = max_val - min_val;
+    if !span.is_finite() || span <= 0.0 {
+        return false;
+    }
+    let max_int = ((1u32 << bits) - 1) as f32;
+    (span * max_int).is_finite()
+}
 
 /// Typed limits for [`ControlMode::Position`].
 ///
@@ -206,11 +230,19 @@ impl ImpedanceLimits {
         }
     }
 
+    /// Effective operational torque/effort ceiling (`effort_limit_nm` clamped to `t_max`).
+    pub fn effective_effort_limit_nm(&self) -> f32 {
+        self.effort_limit_nm
+            .map_or(self.t_max, |eff| eff.min(self.t_max))
+    }
+
     pub fn validate(&self) -> Result<(), String> {
-        let pos = |x: f32| x.is_finite() && x > 0.0;
-        if !pos(self.p_max) || !pos(self.v_max) || !pos(self.t_max) {
+        if !is_valid_quantized_range(-self.p_max, self.p_max, 16)
+            || !is_valid_quantized_range(-self.v_max, self.v_max, 16)
+            || !is_valid_quantized_range(-self.t_max, self.t_max, 16)
+        {
             return Err(format!(
-                "impedance p_max/v_max/t_max must be positive finite, got ({}, {}, {})",
+                "impedance p_max/v_max/t_max must be positive finite quantized ranges, got ({}, {}, {})",
                 self.p_max, self.v_max, self.t_max
             ));
         }
@@ -301,9 +333,10 @@ impl PositionForceLimits {
                 self.close_speed_rad_s
             ));
         }
-        if f64::from(self.close_speed_rad_s) > POS_FORCE_MAX_WIRE_SPEED_RAD_S {
+        let max_wire_speed = pos_force_max_wire_speed_f32();
+        if self.close_speed_rad_s > max_wire_speed {
             return Err(format!(
-                "position_force.close_speed_rad_s ({}) exceeds wire maximum {POS_FORCE_MAX_WIRE_SPEED_RAD_S} rad/s",
+                "position_force.close_speed_rad_s ({}) exceeds wire maximum {max_wire_speed} rad/s",
                 self.close_speed_rad_s
             ));
         }
@@ -318,9 +351,9 @@ impl PositionForceLimits {
                     "position_force.max_speed_rad_s must be positive finite, got {max_v}"
                 ));
             }
-            if f64::from(max_v) > POS_FORCE_MAX_WIRE_SPEED_RAD_S {
+            if max_v > max_wire_speed {
                 return Err(format!(
-                    "position_force.max_speed_rad_s ({max_v}) exceeds wire maximum {POS_FORCE_MAX_WIRE_SPEED_RAD_S} rad/s"
+                    "position_force.max_speed_rad_s ({max_v}) exceeds wire maximum {max_wire_speed} rad/s"
                 ));
             }
             if DamiaoGripperDrive::quantize_vel_raw(max_v) == 0 {
@@ -477,56 +510,107 @@ impl JointControlModeConfig {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawJointControlModeConfig {
-    mode: ControlMode,
-    #[serde(default)]
-    limits: Option<serde_json::Value>,
-    #[serde(default)]
-    vendor: Option<VendorBinding>,
-    #[serde(default)]
-    runtime_modes: Option<Vec<ControlMode>>,
-}
-
 impl<'de> Deserialize<'de> for JointControlModeConfig {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        let raw = RawJointControlModeConfig::deserialize(deserializer)?;
-        let limits = match raw.limits {
-            None => None,
-            Some(val) => {
-                let parsed = match raw.mode {
-                    ControlMode::Position => serde_json::from_value::<PositionLimits>(val)
-                        .map(ModeLimits::Position),
-                    ControlMode::PositionVelocity => {
-                        serde_json::from_value::<PositionVelocityLimits>(val)
-                            .map(ModeLimits::PositionVelocity)
-                    }
-                    ControlMode::Impedance => serde_json::from_value::<ImpedanceLimits>(val)
-                        .map(ModeLimits::Impedance),
-                    ControlMode::PositionForce => {
-                        serde_json::from_value::<PositionForceLimits>(val)
-                            .map(ModeLimits::PositionForce)
+        struct JointControlModeVisitor;
+
+        impl<'de> Visitor<'de> for JointControlModeVisitor {
+            type Value = JointControlModeConfig;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a joint control_mode object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut mode: Option<ControlMode> = None;
+                let mut raw_limits: Option<Option<Box<RawValue>>> = None;
+                let mut vendor: Option<Option<VendorBinding>> = None;
+                let mut runtime_modes: Option<Option<Vec<ControlMode>>> = None;
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "mode" => {
+                            if mode.is_some() {
+                                return Err(de::Error::duplicate_field("mode"));
+                            }
+                            mode = Some(map.next_value()?);
+                        }
+                        "limits" => {
+                            if raw_limits.is_some() {
+                                return Err(de::Error::duplicate_field("limits"));
+                            }
+                            raw_limits = Some(map.next_value()?);
+                        }
+                        "vendor" => {
+                            if vendor.is_some() {
+                                return Err(de::Error::duplicate_field("vendor"));
+                            }
+                            vendor = Some(map.next_value()?);
+                        }
+                        "runtime_modes" => {
+                            if runtime_modes.is_some() {
+                                return Err(de::Error::duplicate_field("runtime_modes"));
+                            }
+                            runtime_modes = Some(map.next_value()?);
+                        }
+                        other => {
+                            return Err(de::Error::unknown_field(
+                                other,
+                                &["mode", "limits", "vendor", "runtime_modes"],
+                            ));
+                        }
                     }
                 }
-                .map_err(|e| {
-                    de::Error::custom(format!(
-                        "invalid limits for control_mode '{}': {e}",
-                        raw.mode
-                    ))
-                })?;
-                Some(parsed)
+
+                let mode = mode.ok_or_else(|| de::Error::missing_field("mode"))?;
+                let limits = match raw_limits.flatten() {
+                    None => None,
+                    Some(raw) => {
+                        let json = raw.get();
+                        let parsed = match mode {
+                            ControlMode::Position => serde_json::from_str::<PositionLimits>(json)
+                                .map(ModeLimits::Position),
+                            ControlMode::PositionVelocity => {
+                                serde_json::from_str::<PositionVelocityLimits>(json)
+                                    .map(ModeLimits::PositionVelocity)
+                            }
+                            ControlMode::Impedance => {
+                                serde_json::from_str::<ImpedanceLimits>(json)
+                                    .map(ModeLimits::Impedance)
+                            }
+                            ControlMode::PositionForce => {
+                                serde_json::from_str::<PositionForceLimits>(json)
+                                    .map(ModeLimits::PositionForce)
+                            }
+                        }
+                        .map_err(|e| {
+                            de::Error::custom(format!(
+                                "invalid limits for control_mode '{mode}': {e}"
+                            ))
+                        })?;
+                        Some(parsed)
+                    }
+                };
+                Ok(JointControlModeConfig {
+                    mode,
+                    limits,
+                    vendor: vendor.flatten(),
+                    runtime_modes: runtime_modes.flatten(),
+                })
             }
-        };
-        Ok(Self {
-            mode: raw.mode,
-            limits,
-            vendor: raw.vendor,
-            runtime_modes: raw.runtime_modes,
-        })
+        }
+
+        deserializer.deserialize_struct(
+            "JointControlModeConfig",
+            &["mode", "limits", "vendor", "runtime_modes"],
+            JointControlModeVisitor,
+        )
     }
 }
 
@@ -578,6 +662,9 @@ pub struct ResolvedJointMode {
     /// Validated runtime mode switch targets permitted from `mode` (e.g. `[Impedance]` on
     /// Damiao arm joints when `gravity_comp` or MIT `joint_tracking` is configured).
     pub runtime_modes: Vec<ControlMode>,
+    /// Active impedance wire mapping limits when `runtime_modes` permits [`ControlMode::Impedance`]
+    /// (derived from commissioned `damiao_ranges[joint]` or Damiao defaults).
+    pub runtime_impedance_limits: Option<ImpedanceLimits>,
 }
 
 // =========================================================================
@@ -694,8 +781,22 @@ pub struct VendorCapability {
     pub feedback_load: bool,
     pub feedback_temperature: bool,
     pub feedback_enable_state: bool,
+    /// General driver feedback freshness bound (ms) where defined (`None` = unverified / needs-vendor-doc).
     pub default_feedback_max_age_ms: Option<u64>,
+    /// Mode-specific stricter feedback freshness bounds (ms), e.g. Damiao J7 `PositionForce` (`100 ms`).
+    pub mode_feedback_max_age_ms: &'static [(ControlMode, u64)],
     pub needs_vendor_doc: &'static [&'static str],
+}
+
+impl VendorCapability {
+    /// Effective feedback freshness bound (ms) for `mode`: mode-specific override if present,
+    /// otherwise the vendor's general `default_feedback_max_age_ms`.
+    pub fn feedback_max_age_ms(&self, mode: ControlMode) -> Option<u64> {
+        self.mode_feedback_max_age_ms
+            .iter()
+            .find_map(|&(m, ms)| (m == mode).then_some(ms))
+            .or(self.default_feedback_max_age_ms)
+    }
 }
 
 /// Damiao capability record (`src/protocol/damiao.rs`).
@@ -734,7 +835,8 @@ pub const DAMIAO_CAPABILITY: VendorCapability = VendorCapability {
     feedback_load: false,
     feedback_temperature: true,
     feedback_enable_state: true,
-    default_feedback_max_age_ms: Some(100),
+    default_feedback_max_age_ms: Some(250),
+    mode_feedback_max_age_ms: &[(ControlMode::PositionForce, 100)],
     needs_vendor_doc: &[
         "CTRL_MODE 3 (VEL) command frame layout and semantics",
         "Per-motor-model supported CTRL_MODE matrix",
@@ -770,6 +872,7 @@ pub const FEETECH_CAPABILITY: VendorCapability = VendorCapability {
     feedback_temperature: true,
     feedback_enable_state: true,
     default_feedback_max_age_ms: Some(250),
+    mode_feedback_max_age_ms: &[],
     needs_vendor_doc: &[
         "REG_OPERATING_MODE (0x21) values and command semantics for wheel/speed and PWM modes",
         "REG_PRESENT_CURRENT_L (0x45) scaling and latency (outside the 8-byte sync-read poll)",
@@ -807,6 +910,7 @@ pub const ROBSTRIDE_CAPABILITY: VendorCapability = VendorCapability {
     feedback_temperature: true,
     feedback_enable_state: false,
     default_feedback_max_age_ms: Some(250),
+    mode_feedback_max_age_ms: &[],
     needs_vendor_doc: &[
         "Position, speed, and current operating modes, selection registers, and readback via TYPE_PARAM_READ/TYPE_PARAM_WRITE",
         "Type-2 feedback reply pairing, periodic reporting cadence, and current telemetry",
@@ -842,6 +946,7 @@ pub const FASHIONSTAR_CAPABILITY: VendorCapability = VendorCapability {
     feedback_temperature: false,
     feedback_enable_state: false,
     default_feedback_max_age_ms: None,
+    mode_feedback_max_age_ms: &[],
     needs_vendor_doc: &[
         "Mode selection/readback and any non-position operating modes",
         "CMD_SET_SERVO_ANGLE (0x08) ACK semantics and power=0 meaning",

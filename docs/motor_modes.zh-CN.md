@@ -5,6 +5,8 @@
 `armd` 按**指令语义**（`ControlMode`）对执行器控制建模，而非按电机型号或关节序号硬编码。各厂商的编解码器、模式切换握手与反馈能力在 profile 加载阶段绑定，且全部校验在打开底层传输之前完成。
 
 > **第 1 步范围（当前分支）：** 本阶段仅落地 `ControlMode`、按模式区分的类型化限位、profile 字段与加载期校验、缺省字段向后兼容翻译、厂商能力表，以及达妙纯编解码函数（`encode_command` / `decode_feedback_bytes`）和单元测试。`src/driver.rs` 中的发送、使能、失能、保持与 emitter 路径暂不切换（见下文第 2–5 步迁移计划）。
+>
+> **第 1 步实机启动门禁：** 由于 `src/driver.rs` 当前仍消费既有 profile 字段（`damiao_gripper`、`damiao_ranges`、`feetech` 与厂商默认值），`armd` 启动在打开底层硬件传输之前会执行 `ArmConfig::validate_step1_driver_parity()`。只要显式声明的 `control_mode` 与未迁移驱动实际执行的模式或限位不一致（例如删掉 `damiao_gripper` 而仅在 `control_mode` 中配置 J7 电流上限），守护进程会直接 fail-closed 拒绝启动，避免静默落回无电流上限的旧路径。在第 2–5 步完成对应驱动迁移前，显式 `control_mode` 须与既有字段保持一致（或省略 `control_mode`）。
 
 ---
 
@@ -17,7 +19,7 @@
 | `position` | 位置目标 | `PositionLimits` | 无必填项（可选 `max_velocity_rad_s`、`step_range` 范围 `0..=4095`、`interval_ms >= 1`、`power_limit >= 1`） |
 | `position_velocity` | 位置目标 + 逐帧速度上限 | `PositionVelocityLimits` | `max_velocity_rad_s`（有限正数，且不超过厂商线协议 `v_max`） |
 | `impedance` | 位置 + 速度 + `kp` + `kd` + 前馈力矩（MIT 阻抗） | `ImpedanceLimits` | `p_max`、`v_max`、`t_max`（有限正数对称映射范围），`kp_max`（`0..=500`），`kd_max`（`0..=5`），可选 `effort_limit_nm`（`(0, t_max]`） |
-| `position_force` | 位置目标 + 逐帧速度上限 + 电机相电流上限 | `PositionForceLimits` | `current_ceiling_raw`（`1..=10000`），`close_speed_rad_s`（向下量化后 `>= 0.01 rad/s` 且 `<= 655.35 rad/s`），可选 `max_speed_rad_s`、`calibrated` / `ceiling_torque_nm` / `torque_reference`、`feedback_stale_fault_ms`（`200..=450`） |
+| `position_force` | 位置目标 + 逐帧速度上限 + 电机相电流上限 | `PositionForceLimits` | `current_ceiling_raw`（`1..=10000`），`close_speed_rad_s`（向下量化后 `>= 0.01 rad/s` 且 `<= pos_force_max_wire_speed_f32()` 即 `wire_speed_f32(65535)`），可选 `max_speed_rad_s`、`calibrated` / `ceiling_torque_nm` / `torque_reference`、`feedback_stale_fault_ms`（`200..=450`） |
 
 ### Profile 配置格式（`ArmConfig::control_mode`）
 
@@ -57,13 +59,14 @@ Profile 可声明可选顶层字段 `control_mode`（长度为 `dof` 的数组�
 
 ### 加载期校验（传输打开之前）
 
-`src/main.rs`（`resolve_follower_config`）在绑定网络端口或打开 CAN / 串口传输之前调用 `ArmConfig::validate()` 与 `ArmConfig::resolve_control_modes_for_follower()`，拒绝以下配置：
+`src/main.rs`（`resolve_follower_config`）在绑定网络端口或打开 CAN / 串口传输之前调用 `ArmConfig::validate()` 与 `ArmConfig::validate_step1_driver_parity()`，拒绝以下配置：
 
-- 长度与 `dof` 不一致；
+- 长度与 `dof` 不一致，或 `control_mode` / `limits` 对象中存在重复 JSON 键；
 - 缺少模式必填限位，或限位变体与 `mode` 不匹配；
-- 厂商能力表不支持的 `(vendor, mode)` 或 `(vendor, base_mode -> runtime_mode)` 绑定；
-- `control_mode` 与既有字段（`damiao_gripper`、`damiao_ranges`、`feetech`、`gravity_comp`、已启用的 MIT `joint_tracking`）冲突，或不同关节 / follower 间的 `vendor` 冲突；
-- 非法线协议范围（非有限浮点数、关节限位超出 `[-p_max, p_max]` 或 FashionStar `i16` 0.1° 范围、`kp_max > 500`、`kd_max > 5`、`current_ceiling_raw` 超出 `1..=10000`、`POS_FORCE` 速度量化为 `0` 或超过 `655.35 rad/s`、12-bit `step_range` 超出 `0..=4095`，以及跨厂商误填字段如 Feetech 填 `interval_ms`/`power_limit` 或 FashionStar 填 `step_range`）。
+- 厂商能力表不支持的 `(vendor, mode)`、关节角色不匹配（达妙 `position_force` 仅限夹爪关节；达妙 `impedance` 与运行时 MIT 切换仅限手臂关节），或不支持的 `(vendor, base_mode -> runtime_mode)` 绑定；
+- `control_mode` 与既有字段（`damiao_gripper`、`damiao_ranges`、`feetech`、`gravity_comp` 有效力矩/增益上限、已启用的 MIT `joint_tracking`）冲突、不同关节 / follower 间的 `vendor` 冲突，或显式阻抗映射范围与当前生效的驱动映射范围不一致；
+- 第 1 步驱动一致性偏差（显式 `control_mode` 与尚未迁移的驱动实际执行的模式或限位不一致）；
+- 非法线协议范围（非有限值或会导致量化/反量化溢出的端点、关节限位超出 `[-p_max, p_max]` 或 FashionStar `i16` 0.1° 范围、`kp_max > 500`、`kd_max > 5`、`current_ceiling_raw` 超出 `1..=10000`、`POS_FORCE` 速度量化为 `0` 或超过 `pos_force_max_wire_speed_f32()`、12-bit `step_range` 超出 `0..=4095`，以及跨厂商误填字段如 Feetech 填 `interval_ms`/`power_limit` 或 FashionStar 填 `step_range`）。
 
 ### 缺省字段翻译与 `damiao_gripper` 兼容读取
 
@@ -94,7 +97,7 @@ Profile 可声明可选顶层字段 `control_mode`（长度为 `dof` 的数组�
 
 | 厂商 | 协议源码 | `armd` 已支持的 `ControlMode` | 默认基础模式 | 模式选择与回读 | 运行时切换 | 反馈来源与运行时字段 | 需核实厂商文档（needs vendor-doc check） |
 |---|---|---|---|---|---|---|---|
-| **Damiao** | `src/protocol/damiao.rs` | `position_velocity`（`CTRL_MODE = 2`）、`impedance`（`CTRL_MODE = 1`）、`position_force`（`CTRL_MODE = 4`） | `position_velocity` | RAM 寄存器写（`0x7FF`、`0x55`、`RID_CTRL_MODE = 10`）+ 匹配 ACK + 独立回读（`0x33`）。J7 `POS_FORCE` 使能要求先具备新鲜（`<= 100 ms`）、静止（`|v| <= 0.05 rad/s`）、状态为 0 的反馈，写入并回读确认后再发零速预使能保持帧（见 `docs/gripper_pos_force.md`）。 | 手臂关节 `position_velocity <-> impedance` | 指令回复 + 只读 `0xCC` 刷新（`0x7FF`）。解码 `position`、`velocity`、`torque`、`t_mos`、`t_rotor`、`state_or_error`。 | `CTRL_MODE = 3`（VEL）帧格式与语义；各型号电机的模式支持矩阵；不同模式与固件下的反馈回复节奏与可靠性；`RID_TIMEOUT`（寄存器 9）单位（文档记为 `50 us`）、超时延迟及在 B601-DM 固件（`sw_ver 942747703`）上的实际响应。 |
+| **Damiao** | `src/protocol/damiao.rs` | `position_velocity`（`CTRL_MODE = 2`）、`impedance`（`CTRL_MODE = 1`）、`position_force`（`CTRL_MODE = 4`，仅限夹爪关节） | `position_velocity` | RAM 寄存器写（`0x7FF`、`0x55`、`RID_CTRL_MODE = 10`）+ 匹配 ACK + 独立回读（`0x33`）。J7 `POS_FORCE` 使能要求先具备新鲜（`<= 100 ms`）、静止（`|v| <= 0.05 rad/s`）、状态为 0 的反馈，写入并回读确认后再发零速预使能保持帧（见 `docs/gripper_pos_force.md`）。 | 手臂关节 `position_velocity <-> impedance` | 指令回复 + 只读 `0xCC` 刷新（`0x7FF`）。解码 `position`、`velocity`、`torque`、`t_mos`、`t_rotor`、`state_or_error`。常规新鲜度上限 `250 ms`；`position_force` 要求 `<= 100 ms`。 | `CTRL_MODE = 3`（VEL）帧格式与语义；各型号电机的模式支持矩阵；不同模式与固件下的反馈回复节奏与可靠性；`RID_TIMEOUT`（寄存器 9）单位（文档记为 `50 us`）、超时延迟及在 B601-DM 固件（`sw_ver 942747703`）上的实际响应。 |
 | **Feetech STS3215** | `src/protocol/feetech.rs` | `position`（`INST_SYNC_WRITE` `0x83` 写 `REG_GOAL_POSITION` `0x2A`） | `position` | 上线配置读取 `REG_OPERATING_MODE`（`0x21`），不一致时在力矩关闭且解锁 `REG_LOCK = 0x37` 后写入 `0` 并回读核验。 | 否 | 有界分块 `INST_SYNC_READ`（`0x82`，自 `0x38` 读 8 字节）：`position`、`speed`、`load`、`voltage`、`temperature`（由负载折算的力矩仅作估算，非实测力矩）；`REG_TORQUE_ENABLE`（`0x28`）单独回读。 | `REG_OPERATING_MODE`（`0x21`）轮式/速度模式与 PWM 模式的寄存器值与指令语义；`REG_PRESENT_CURRENT_L`（`0x45`）的量纲与延迟（协议已定义，但不在当前 8 字节轮询内）。 |
 | **RobStride** | `src/protocol/robstride.rs` | `impedance`（`TYPE_MOTION_CONTROL = 1` 29 位扩展 CAN 帧：载荷为 4 个 16-bit 大端 `pos`/`vel`/`kp`/`kd`，CAN ID 位 23..8 为 16-bit `torque`） | `impedance` | 固定运动控制帧类型（`TYPE_ENABLE = 3`、`TYPE_STOP = 4`）。协议已声明 `TYPE_PARAM_READ = 17` 与 `TYPE_PARAM_WRITE = 18` 常量。 | 否 | 排空 `TYPE_FEEDBACK = 2` 29 位扩展 CAN 反馈帧：`position`、`velocity`、`torque`、`mos_temperature`（`0.1 °C`）、`fault_flags`。 | 位置、速度、电流模式及其选择寄存器和经 `TYPE_PARAM_READ` / `TYPE_PARAM_WRITE` 的回读；Type-2 反馈应答配对、周期上报节奏与电流遥测；`TYPE_ENABLE` / `TYPE_STOP` 是否产生因果力矩状态证据；`TYPE_SET_ZERO`（6）掉电保持与保存参数序列（type 22）。 |
 | **FashionStar** | `src/protocol/fashionstar.rs` | `position`（`CMD_SET_SERVO_ANGLE = 0x08`：`0.1°` `i16`、`interval_ms = 20`、`power = 1000`；独立 `CMD_SET_TORQUE = 0x1A`） | `position` | 隐式角度指令。 | 否 | 轮询发送 `CMD_QUERY_SERVO_ANGLE`（`0x0A`），仅更新 `position`。协议另定义了 `CMD_QUERY_STATUS`（`0x1E`）解码器（电压、温度、电流、状态），运行时主循环未轮询。 | 模式选择/回读及非位置模式；`CMD_SET_SERVO_ANGLE`（`0x08`）应答语义与 `power = 0` 含义；速度与力矩遥测支持情况。 |

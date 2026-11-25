@@ -1,7 +1,7 @@
 use thiserror::Error;
 use crate::motor_mode::{
-    ControlMode, ImpedanceLimits, ModeLimits, IMPEDANCE_WIRE_KD_MAX, IMPEDANCE_WIRE_KP_MAX,
-    POS_FORCE_MAX_WIRE_SPEED_RAD_S,
+    is_valid_quantized_range, pos_force_max_wire_speed_f32, ControlMode, ImpedanceLimits,
+    ModeLimits, IMPEDANCE_WIRE_KD_MAX, IMPEDANCE_WIRE_KP_MAX,
 };
 use crate::transport::CanFrame;
 
@@ -142,17 +142,15 @@ pub fn build_refresh_frame(motor_id: u16) -> CanFrame {
     CanFrame::new_standard(0x7FF, &[lo, hi, 0xCC, 0, 0, 0, 0, 0]).unwrap()
 }
 
-/// Build Damiao MIT mode control CAN frame
-/// Packs: position (16-bit), velocity (12-bit), Kp (12-bit), Kd (12-bit), Torque (12-bit)
-pub fn build_mit_frame(
-    motor_id: u16,
+/// Pure 8-byte MIT payload packer shared by [`build_mit_frame`] and [`encode_command`].
+fn encode_mit_payload(
     pos: f32,
     vel: f32,
     kp: f32,
     kd: f32,
     torque: f32,
     limits: &DamiaoLimits,
-) -> CanFrame {
+) -> [u8; 8] {
     let p_int = float_to_uint(pos, limits.p_min, limits.p_max, 16);
     let v_int = float_to_uint(vel, limits.v_min, limits.v_max, 12);
     let kp_int = float_to_uint(kp, limits.kp_min, limits.kp_max, 12);
@@ -168,17 +166,62 @@ pub fn build_mit_frame(
     data[5] = (kd_int >> 4) as u8;
     data[6] = (((kd_int & 0x0F) << 4) | (t_int >> 8)) as u8;
     data[7] = (t_int & 0xFF) as u8;
+    data
+}
 
+/// Pure 8-byte POS_VEL payload packer shared by [`build_pos_vel_frame`] and [`encode_command`].
+fn encode_pos_vel_payload(pos: f32, vel: f32) -> [u8; 8] {
+    let mut data = [0u8; 8];
+    data[0..4].copy_from_slice(&pos.to_le_bytes());
+    data[4..8].copy_from_slice(&vel.to_le_bytes());
+    data
+}
+
+/// Pure 8-byte feedback payload unpacker shared by [`unpack_feedback_frame`] and [`decode_feedback_bytes`].
+fn decode_feedback_payload(data: &[u8; 8], limits: &DamiaoLimits) -> DamiaoFeedback {
+    let motor_id = data[0] & 0x0F;
+    let state_or_error = (data[0] >> 4) & 0x0F;
+
+    let p_raw = ((data[1] as u16) << 8) | (data[2] as u16);
+    let v_raw = ((data[3] as u16) << 4) | ((data[4] as u16) >> 4);
+    let t_raw = (((data[4] as u16) & 0x0F) << 8) | (data[5] as u16);
+
+    let position = uint_to_float(p_raw, limits.p_min, limits.p_max, 16);
+    let velocity = uint_to_float(v_raw, limits.v_min, limits.v_max, 12);
+    let torque = uint_to_float(t_raw, limits.t_min, limits.t_max, 12);
+
+    let t_mos = data[6] as f32;
+    let t_rotor = data[7] as f32;
+
+    DamiaoFeedback {
+        motor_id,
+        state_or_error,
+        position,
+        velocity,
+        torque,
+        t_mos,
+        t_rotor,
+    }
+}
+
+/// Build Damiao MIT mode control CAN frame
+/// Packs: position (16-bit), velocity (12-bit), Kp (12-bit), Kd (12-bit), Torque (12-bit)
+pub fn build_mit_frame(
+    motor_id: u16,
+    pos: f32,
+    vel: f32,
+    kp: f32,
+    kd: f32,
+    torque: f32,
+    limits: &DamiaoLimits,
+) -> CanFrame {
+    let data = encode_mit_payload(pos, vel, kp, kd, torque, limits);
     CanFrame::new_standard(motor_id, &data).unwrap()
 }
 
 /// Build Position-Velocity mode CAN frame (CAN ID = base_id + motor_id, float32 pos, float32 vel)
 pub fn build_pos_vel_frame(base_id: u16, motor_id: u16, pos: f32, vel: f32) -> CanFrame {
-    let p_bytes = pos.to_le_bytes();
-    let v_bytes = vel.to_le_bytes();
-    let mut data = [0u8; 8];
-    data[0..4].copy_from_slice(&p_bytes);
-    data[4..8].copy_from_slice(&v_bytes);
+    let data = encode_pos_vel_payload(pos, vel);
     CanFrame::new_standard(base_id + motor_id, &data).unwrap()
 }
 
@@ -231,31 +274,7 @@ pub fn unpack_feedback_frame(
             actual: frame.dlc as usize,
         });
     }
-
-    let data = &frame.data;
-    let motor_id = data[0] & 0x0F;
-    let state_or_error = (data[0] >> 4) & 0x0F;
-
-    let p_raw = ((data[1] as u16) << 8) | (data[2] as u16);
-    let v_raw = ((data[3] as u16) << 4) | ((data[4] as u16) >> 4);
-    let t_raw = (((data[4] as u16) & 0x0F) << 8) | (data[5] as u16);
-
-    let position = uint_to_float(p_raw, limits.p_min, limits.p_max, 16);
-    let velocity = uint_to_float(v_raw, limits.v_min, limits.v_max, 12);
-    let torque = uint_to_float(t_raw, limits.t_min, limits.t_max, 12);
-
-    let t_mos = data[6] as f32;
-    let t_rotor = data[7] as f32;
-
-    Ok(DamiaoFeedback {
-        motor_id,
-        state_or_error,
-        position,
-        velocity,
-        torque,
-        t_mos,
-        t_rotor,
-    })
+    Ok(decode_feedback_payload(&frame.data, limits))
 }
 
 // =========================================================================
@@ -556,9 +575,7 @@ pub fn encode_command(
                 }
                 None => lim.max_velocity_rad_s,
             };
-            let mut data = [0u8; 8];
-            data[0..4].copy_from_slice(&position.to_le_bytes());
-            data[4..8].copy_from_slice(&eff_vel.to_le_bytes());
+            let data = encode_pos_vel_payload(position, eff_vel);
             Ok(DamiaoEncodedFrame { can_id, data })
         }
         (
@@ -575,12 +592,9 @@ pub fn encode_command(
             if motor_id > MAX_STANDARD_CAN_ID {
                 return Err(DamiaoEncodeRefusal::InvalidMotorId);
             }
-            let valid_limits = lim.p_max.is_finite()
-                && lim.p_max > 0.0
-                && lim.v_max.is_finite()
-                && lim.v_max > 0.0
-                && lim.t_max.is_finite()
-                && lim.t_max > 0.0
+            let valid_limits = is_valid_quantized_range(-lim.p_max, lim.p_max, 16)
+                && is_valid_quantized_range(-lim.v_max, lim.v_max, 12)
+                && is_valid_quantized_range(-lim.t_max, lim.t_max, 12)
                 && lim.kp_max.is_finite()
                 && (0.0..=IMPEDANCE_WIRE_KP_MAX).contains(&lim.kp_max)
                 && lim.kd_max.is_finite()
@@ -605,24 +619,10 @@ pub fn encode_command(
             let vel_c = velocity.clamp(wire.v_min, wire.v_max);
             let kp_c = kp.clamp(wire.kp_min, lim.kp_max);
             let kd_c = kd.clamp(wire.kd_min, lim.kd_max);
-            let t_cap = lim.effort_limit_nm.map_or(wire.t_max, |e| e.min(wire.t_max));
+            let t_cap = lim.effective_effort_limit_nm();
             let torque_c = torque.clamp(-t_cap, t_cap);
 
-            let p_int = float_to_uint(pos_c, wire.p_min, wire.p_max, 16);
-            let v_int = float_to_uint(vel_c, wire.v_min, wire.v_max, 12);
-            let kp_int = float_to_uint(kp_c, wire.kp_min, wire.kp_max, 12);
-            let kd_int = float_to_uint(kd_c, wire.kd_min, wire.kd_max, 12);
-            let t_int = float_to_uint(torque_c, wire.t_min, wire.t_max, 12);
-
-            let mut data = [0u8; 8];
-            data[0] = (p_int >> 8) as u8;
-            data[1] = (p_int & 0xFF) as u8;
-            data[2] = (v_int >> 4) as u8;
-            data[3] = (((v_int & 0x0F) << 4) | (kp_int >> 8)) as u8;
-            data[4] = (kp_int & 0xFF) as u8;
-            data[5] = (kd_int >> 4) as u8;
-            data[6] = (((kd_int & 0x0F) << 4) | (t_int >> 8)) as u8;
-            data[7] = (t_int & 0xFF) as u8;
+            let data = encode_mit_payload(pos_c, vel_c, kp_c, kd_c, torque_c, &wire);
             Ok(DamiaoEncodedFrame {
                 can_id: motor_id,
                 data,
@@ -642,15 +642,14 @@ pub fn encode_command(
                 .checked_add(motor_id)
                 .filter(|&id| id <= MAX_STANDARD_CAN_ID)
                 .ok_or(DamiaoEncodeRefusal::InvalidMotorId)?;
+            let max_wire_speed = pos_force_max_wire_speed_f32();
             let valid_limits = (1..=POS_FORCE_I_DES_FULL).contains(&lim.current_ceiling_raw)
                 && lim.close_speed_rad_s.is_finite()
                 && lim.close_speed_rad_s > 0.0
-                && f64::from(lim.close_speed_rad_s) <= POS_FORCE_MAX_WIRE_SPEED_RAD_S
+                && lim.close_speed_rad_s <= max_wire_speed
                 && pos_force_vel_raw(lim.close_speed_rad_s) >= 1
                 && lim.max_speed_rad_s.is_none_or(|m| {
-                    m.is_finite()
-                        && m >= lim.close_speed_rad_s
-                        && f64::from(m) <= POS_FORCE_MAX_WIRE_SPEED_RAD_S
+                    m.is_finite() && m >= lim.close_speed_rad_s && m <= max_wire_speed
                 });
             if !valid_limits {
                 return Err(DamiaoEncodeRefusal::InvalidLimits);
@@ -685,7 +684,8 @@ pub fn encode_command(
 
 /// Pure Damiao 8-byte feedback payload decoder (no `CanFrame` / transport dependency).
 ///
-/// Decodes identical values to [`unpack_feedback_frame`] while rejecting invalid mapping ranges.
+/// Decodes identical values to [`unpack_feedback_frame`] while rejecting invalid or
+/// arithmetic-overflowing mapping ranges.
 pub fn decode_feedback_bytes(
     data: &[u8],
     limits: &DamiaoLimits,
@@ -702,42 +702,16 @@ pub fn decode_feedback_bytes(
             data.len()
         )));
     }
-    if !(limits.p_min.is_finite()
-        && limits.p_max.is_finite()
-        && limits.p_min < limits.p_max
-        && limits.v_min.is_finite()
-        && limits.v_max.is_finite()
-        && limits.v_min < limits.v_max
-        && limits.t_min.is_finite()
-        && limits.t_max.is_finite()
-        && limits.t_min < limits.t_max)
+    if !(is_valid_quantized_range(limits.p_min, limits.p_max, 16)
+        && is_valid_quantized_range(limits.v_min, limits.v_max, 12)
+        && is_valid_quantized_range(limits.t_min, limits.t_max, 12))
     {
         return Err(DamiaoError::ParameterError(
-            "DamiaoLimits must have finite p_min < p_max, v_min < v_max, t_min < t_max".into(),
+            "DamiaoLimits must have finite non-overflowing quantized ranges p/v/t".into(),
         ));
     }
-
-    let motor_id = data[0] & 0x0F;
-    let state_or_error = (data[0] >> 4) & 0x0F;
-
-    let p_raw = ((data[1] as u16) << 8) | (data[2] as u16);
-    let v_raw = ((data[3] as u16) << 4) | ((data[4] as u16) >> 4);
-    let t_raw = (((data[4] as u16) & 0x0F) << 8) | (data[5] as u16);
-
-    let position = uint_to_float(p_raw, limits.p_min, limits.p_max, 16);
-    let velocity = uint_to_float(v_raw, limits.v_min, limits.v_max, 12);
-    let torque = uint_to_float(t_raw, limits.t_min, limits.t_max, 12);
-
-    let t_mos = data[6] as f32;
-    let t_rotor = data[7] as f32;
-
-    Ok(DamiaoFeedback {
-        motor_id,
-        state_or_error,
-        position,
-        velocity,
-        torque,
-        t_mos,
-        t_rotor,
-    })
+    let bytes: [u8; 8] = [
+        data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+    ];
+    Ok(decode_feedback_payload(&bytes, limits))
 }

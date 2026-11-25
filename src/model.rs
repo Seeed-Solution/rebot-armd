@@ -2532,12 +2532,142 @@ impl ArmConfig {
         Ok(())
     }
 
-    fn validate_joint_wire_limits(
+    fn active_impedance_wire_range(
+        &self,
+        vendor: VendorBinding,
+        joint: usize,
+    ) -> Option<(f32, f32, f32)> {
+        match vendor {
+            VendorBinding::Damiao => Some(
+                self.damiao_ranges
+                    .as_ref()
+                    .and_then(|rs| rs.get(joint))
+                    .map_or(
+                        (
+                            crate::motor_mode::DAMIAO_DEFAULT_P_MAX,
+                            crate::motor_mode::DAMIAO_DEFAULT_V_MAX,
+                            crate::motor_mode::DAMIAO_DEFAULT_T_MAX,
+                        ),
+                        |r| (r.p_max, r.v_max, r.t_max),
+                    ),
+            ),
+            VendorBinding::RobStride => Some((
+                crate::motor_mode::ROBSTRIDE_DEFAULT_P_MAX,
+                crate::motor_mode::ROBSTRIDE_DEFAULT_V_MAX,
+                crate::motor_mode::ROBSTRIDE_DEFAULT_T_MAX,
+            )),
+            VendorBinding::Feetech | VendorBinding::FashionStar => None,
+        }
+    }
+
+    fn runtime_impedance_limits_for(
+        &self,
+        vendor: VendorBinding,
+        joint: usize,
+        runtime_modes: &[MotorControlMode],
+    ) -> Option<ImpedanceLimits> {
+        if !runtime_modes.contains(&MotorControlMode::Impedance) {
+            return None;
+        }
+        let (p_max, v_max, t_max) = self.active_impedance_wire_range(vendor, joint)?;
+        Some(ImpedanceLimits {
+            p_max,
+            v_max,
+            t_max,
+            kp_max: crate::motor_mode::IMPEDANCE_WIRE_KP_MAX,
+            kd_max: crate::motor_mode::IMPEDANCE_WIRE_KD_MAX,
+            effort_limit_nm: None,
+        })
+    }
+
+    fn validate_impedance_policy_compatibility(
+        &self,
+        joint: usize,
+        imp: &ImpedanceLimits,
+    ) -> Result<(), String> {
+        let eff_cap = imp.effective_effort_limit_nm();
+        let arm_indices = self.arm_joint_indices();
+        if let Some(gc) = &self.gravity_comp {
+            if arm_indices.contains(&joint) {
+                if let Some(&t_lim) = gc.torque_limits_nm.get(joint) {
+                    if t_lim > eff_cap {
+                        return Err(format!(
+                            "control_mode[{joint}] impedance effective effort limit ({eff_cap}) is below gravity_comp torque_limits_nm[{joint}] ({t_lim})"
+                        ));
+                    }
+                }
+                if let Some(&kp_lim) = gc.hold_kp.get(joint) {
+                    if kp_lim > imp.kp_max {
+                        return Err(format!(
+                            "control_mode[{joint}] impedance kp_max ({}) is below gravity_comp hold_kp[{joint}] ({kp_lim})",
+                            imp.kp_max
+                        ));
+                    }
+                }
+                if let Some(&kd_lim) = gc.hold_kd.get(joint) {
+                    if kd_lim > imp.kd_max {
+                        return Err(format!(
+                            "control_mode[{joint}] impedance kd_max ({}) is below gravity_comp hold_kd[{joint}] ({kd_lim})",
+                            imp.kd_max
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(jt) = self.joint_tracking.as_ref().filter(|jt| jt.enabled) {
+            if let Some(slot) = arm_indices.iter().position(|&j| j == joint) {
+                if let Some(jcfg) = jt.joints.get(slot) {
+                    if jcfg.strategy == crate::tracking::TrackingStrategy::Mit {
+                        if jcfg.effort_limit_nm > eff_cap {
+                            return Err(format!(
+                                "control_mode[{joint}] impedance effective effort limit ({eff_cap}) is below joint_tracking.joints[{slot}].effort_limit_nm ({})",
+                                jcfg.effort_limit_nm
+                            ));
+                        }
+                        if jcfg.kp > imp.kp_max {
+                            return Err(format!(
+                                "control_mode[{joint}] impedance kp_max ({}) is below joint_tracking.joints[{slot}].kp ({})",
+                                imp.kp_max, jcfg.kp
+                            ));
+                        }
+                        if jcfg.kd > imp.kd_max {
+                            return Err(format!(
+                                "control_mode[{joint}] impedance kd_max ({}) is below joint_tracking.joints[{slot}].kd ({})",
+                                imp.kd_max, jcfg.kd
+                            ));
+                        }
+                        if let Some(hkp) = jcfg.hold_kp {
+                            if hkp > imp.kp_max {
+                                return Err(format!(
+                                    "control_mode[{joint}] impedance kp_max ({}) is below joint_tracking.joints[{slot}].hold_kp ({hkp})",
+                                    imp.kp_max
+                                ));
+                            }
+                        }
+                        if let Some(hkd) = jcfg.hold_kd {
+                            if hkd > imp.kd_max {
+                                return Err(format!(
+                                    "control_mode[{joint}] impedance kd_max ({}) is below joint_tracking.joints[{slot}].hold_kd ({hkd})",
+                                    imp.kd_max
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Single-authority validator for one **explicit** `control_mode[joint]` declaration bound
+    /// to a concrete [`VendorBinding`]. Omitted slots keep legacy acceptance rules untouched.
+    fn validate_explicit_joint_for_vendor(
         &self,
         vendor: VendorBinding,
         joint: usize,
         mode: MotorControlMode,
         limits: &ModeLimits,
+        runtime_modes: &[MotorControlMode],
     ) -> Result<(), String> {
         if !vendor.supports_mode(mode) {
             return Err(format!(
@@ -2553,23 +2683,44 @@ impl ArmConfig {
         limits
             .validate()
             .map_err(|e| format!("control_mode[{joint}]: {e}"))?;
+
+        for &rt in runtime_modes {
+            if !vendor.supports_runtime_switch(mode, rt) {
+                return Err(format!(
+                    "control_mode[{joint}]: vendor '{vendor}' does not support runtime switch '{mode}' -> '{rt}'"
+                ));
+            }
+        }
+
+        // Joint-role capability checks for Damiao: POS_FORCE is gripper-only; MIT / runtime
+        // Impedance transitions are arm-joint-only (never on the gripper joint).
+        if vendor == VendorBinding::Damiao {
+            let is_gripper = Some(joint) == self.gripper_index();
+            if mode == MotorControlMode::PositionForce && !is_gripper {
+                return Err(format!(
+                    "control_mode[{joint}]: Damiao position_force is only supported on the gripper joint"
+                ));
+            }
+            if is_gripper
+                && (mode == MotorControlMode::Impedance
+                    || runtime_modes.contains(&MotorControlMode::Impedance))
+            {
+                return Err(format!(
+                    "control_mode[{joint}]: Damiao impedance / runtime MIT transition is only supported on arm joints, not the gripper joint"
+                ));
+            }
+        }
+
         let jl = self
             .limits
             .get(joint)
             .ok_or_else(|| format!("control_mode[{joint}]: missing joint limits entry"))?;
+
         match (vendor, limits) {
             (VendorBinding::Damiao, ModeLimits::PositionVelocity(pv)) => {
-                let (wire_p_max, wire_v_max) = self
-                    .damiao_ranges
-                    .as_ref()
-                    .and_then(|r| r.get(joint))
-                    .map_or(
-                        (
-                            crate::motor_mode::DAMIAO_DEFAULT_P_MAX,
-                            crate::motor_mode::DAMIAO_DEFAULT_V_MAX,
-                        ),
-                        |r| (r.p_max, r.v_max),
-                    );
+                let (wire_p_max, wire_v_max, _) = self
+                    .active_impedance_wire_range(VendorBinding::Damiao, joint)
+                    .unwrap();
                 if pv.max_velocity_rad_s > wire_v_max {
                     return Err(format!(
                         "control_mode[{joint}] position_velocity.max_velocity_rad_s ({}) exceeds Damiao wire v_max ({wire_v_max})",
@@ -2584,16 +2735,17 @@ impl ArmConfig {
                 }
             }
             (VendorBinding::Damiao, ModeLimits::Impedance(imp)) => {
-                if let Some(r) = self.damiao_ranges.as_ref().and_then(|rs| rs.get(joint)) {
-                    if (r.p_max - imp.p_max).abs() > 1e-5
-                        || (r.v_max - imp.v_max).abs() > 1e-5
-                        || (r.t_max - imp.t_max).abs() > 1e-5
-                    {
-                        return Err(format!(
-                            "control_mode[{joint}] impedance wire range ({}/{}/{}) conflicts with damiao_ranges[{joint}] ({}/{}/{})",
-                            imp.p_max, imp.v_max, imp.t_max, r.p_max, r.v_max, r.t_max
-                        ));
-                    }
+                let (wire_p, wire_v, wire_t) = self
+                    .active_impedance_wire_range(VendorBinding::Damiao, joint)
+                    .unwrap();
+                if (wire_p - imp.p_max).abs() > 1e-5
+                    || (wire_v - imp.v_max).abs() > 1e-5
+                    || (wire_t - imp.t_max).abs() > 1e-5
+                {
+                    return Err(format!(
+                        "control_mode[{joint}] impedance wire range ({}/{}/{}) conflicts with active Damiao wire mapping ({wire_p}/{wire_v}/{wire_t})",
+                        imp.p_max, imp.v_max, imp.t_max
+                    ));
                 }
                 if jl.min_position < -imp.p_max || jl.max_position > imp.p_max {
                     return Err(format!(
@@ -2601,13 +2753,12 @@ impl ArmConfig {
                         jl.min_position, jl.max_position, imp.p_max
                     ));
                 }
+                self.validate_impedance_policy_compatibility(joint, imp)?;
             }
             (VendorBinding::Damiao, ModeLimits::PositionForce(_pf)) => {
-                let wire_p_max = self
-                    .damiao_ranges
-                    .as_ref()
-                    .and_then(|r| r.get(joint))
-                    .map_or(crate::motor_mode::DAMIAO_DEFAULT_P_MAX, |r| r.p_max);
+                let (wire_p_max, _, _) = self
+                    .active_impedance_wire_range(VendorBinding::Damiao, joint)
+                    .unwrap();
                 if jl.min_position < -wire_p_max || jl.max_position > wire_p_max {
                     return Err(format!(
                         "control_mode[{joint}]: joint position range [{}, {}] exceeds Damiao wire p_max +/-{wire_p_max}",
@@ -2619,18 +2770,16 @@ impl ArmConfig {
                         "control_mode[{joint}]: joint max_velocity encodes to 0 on the pos-force wire (must quantize to >= 0.01 rad/s)"
                     ));
                 }
-                if Some(joint) == self.gripper_index() {
-                    let gp = self.gripper_policy.as_ref().ok_or_else(|| {
-                        format!(
-                            "control_mode[{joint}] (position_force) on gripper joint requires gripper_policy (closed_rad / open_rad)"
-                        )
-                    })?;
-                    if DamiaoGripperDrive::quantize_vel_raw_f64(gp.close_speed()) == 0 {
-                        return Err(
-                            "gripper_policy.close_speed_rad_s encodes to 0 on the pos-force wire (must quantize to >= 0.01 rad/s)"
-                                .into(),
-                        );
-                    }
+                let gp = self.gripper_policy.as_ref().ok_or_else(|| {
+                    format!(
+                        "control_mode[{joint}] (position_force) on gripper joint requires gripper_policy (closed_rad / open_rad)"
+                    )
+                })?;
+                if DamiaoGripperDrive::quantize_vel_raw_f64(gp.close_speed()) == 0 {
+                    return Err(
+                        "gripper_policy.close_speed_rad_s encodes to 0 on the pos-force wire (must quantize to >= 0.01 rad/s)"
+                            .into(),
+                    );
                 }
             }
             (VendorBinding::Feetech, ModeLimits::Position(pos)) => {
@@ -2651,12 +2800,25 @@ impl ArmConfig {
                 }
             }
             (VendorBinding::RobStride, ModeLimits::Impedance(imp)) => {
+                let (wire_p, wire_v, wire_t) = self
+                    .active_impedance_wire_range(VendorBinding::RobStride, joint)
+                    .unwrap();
+                if (wire_p - imp.p_max).abs() > 1e-5
+                    || (wire_v - imp.v_max).abs() > 1e-5
+                    || (wire_t - imp.t_max).abs() > 1e-5
+                {
+                    return Err(format!(
+                        "control_mode[{joint}] impedance wire range ({}/{}/{}) conflicts with active RobStride wire mapping ({wire_p}/{wire_v}/{wire_t})",
+                        imp.p_max, imp.v_max, imp.t_max
+                    ));
+                }
                 if jl.min_position < -imp.p_max || jl.max_position > imp.p_max {
                     return Err(format!(
                         "control_mode[{joint}]: joint position range [{}, {}] exceeds RobStride wire p_max +/-{}",
                         jl.min_position, jl.max_position, imp.p_max
                     ));
                 }
+                self.validate_impedance_policy_compatibility(joint, imp)?;
             }
             (VendorBinding::FashionStar, ModeLimits::Position(pos)) => {
                 if pos.step_range.is_some() {
@@ -2681,13 +2843,11 @@ impl ArmConfig {
         Ok(())
     }
 
-    /// Validate optional per-joint `control_mode` declarations, checking missing mode-specific
-    /// limits, mismatched variants, invalid wire ranges, unsupported explicit vendor bindings,
-    /// and conflicts with `damiao_gripper`, `damiao_ranges`, `feetech`, `gravity_comp`, and
-    /// `joint_tracking`.
-    pub fn validate_control_mode(&self) -> Result<(), String> {
+    /// Vendor-agnostic shape and cross-section checks for `control_mode`.
+    /// Returns the single explicit `VendorBinding` if any joint declared one.
+    fn validate_control_mode_shape(&self) -> Result<Option<VendorBinding>, String> {
         let Some(entries) = &self.control_mode else {
-            return Ok(());
+            return Ok(None);
         };
         if entries.len() != self.dof {
             return Err(format!(
@@ -2703,27 +2863,20 @@ impl ArmConfig {
                 self.dof
             ));
         }
-        let mut profile_vendor: Option<VendorBinding> = None;
+        let mut explicit_vendor: Option<VendorBinding> = None;
         for (i, slot) in entries.iter().enumerate() {
             let Some(entry) = slot else {
                 continue;
             };
             if let Some(v) = entry.vendor {
-                if let Some(first) = profile_vendor {
+                if let Some(first) = explicit_vendor {
                     if first != v {
                         return Err(format!(
                             "control_mode[{i}] vendor '{v}' conflicts with earlier vendor '{first}'"
                         ));
                     }
                 } else {
-                    profile_vendor = Some(v);
-                }
-                self.validate_vendor_profile_sections(v)?;
-                if !v.supports_mode(entry.mode) {
-                    return Err(format!(
-                        "control_mode[{i}]: vendor '{v}' does not support control mode '{}'",
-                        entry.mode
-                    ));
+                    explicit_vendor = Some(v);
                 }
             }
 
@@ -2763,58 +2916,13 @@ impl ArmConfig {
                             "control_mode[{i}]: duplicate runtime_mode '{m}'"
                         ));
                     }
-                    if let Some(v) = entry.vendor {
-                        if !v.supports_runtime_switch(entry.mode, m) {
-                            return Err(format!(
-                                "control_mode[{i}]: vendor '{v}' does not support runtime switch '{}' -> '{m}'",
-                                entry.mode
-                            ));
-                        }
-                    }
                 }
             }
 
-            // Mode-level wire range and cross-section checks (even before follower binding).
+            // Mode-level shape checks independent of vendor.
             let jl = &self.limits[i];
             match &resolved_limits {
-                ModeLimits::Position(pos) => {
-                    if self.has_feetech_config() {
-                        if pos.interval_ms.is_some() || pos.power_limit.is_some() {
-                            return Err(format!(
-                                "control_mode[{i}]: Feetech profile does not support interval_ms / power_limit"
-                            ));
-                        }
-                        if let Some([lo, hi]) = pos.step_range {
-                            if let Some((exp_min, exp_max)) =
-                                self.feetech_joint_explicit_step_bounds(i)
-                            {
-                                if exp_min.is_some_and(|m| m != lo)
-                                    || exp_max.is_some_and(|m| m != hi)
-                                {
-                                    return Err(format!(
-                                        "control_mode[{i}] position.step_range [{lo}, {hi}] conflicts with feetech.joints[{i}]"
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                }
-                ModeLimits::PositionVelocity(pv) => {
-                    if let Some(r) = self.damiao_ranges.as_ref().and_then(|rs| rs.get(i)) {
-                        if pv.max_velocity_rad_s > r.v_max {
-                            return Err(format!(
-                                "control_mode[{i}] position_velocity.max_velocity_rad_s ({}) exceeds damiao_ranges[{i}].v_max ({})",
-                                pv.max_velocity_rad_s, r.v_max
-                            ));
-                        }
-                        if jl.min_position < -r.p_max || jl.max_position > r.p_max {
-                            return Err(format!(
-                                "control_mode[{i}]: joint position range [{}, {}] exceeds damiao_ranges[{i}].p_max +/-{}",
-                                jl.min_position, jl.max_position, r.p_max
-                            ));
-                        }
-                    }
-                }
+                ModeLimits::Position(_) | ModeLimits::PositionVelocity(_) => {}
                 ModeLimits::Impedance(imp) => {
                     if jl.min_position < -imp.p_max || jl.max_position > imp.p_max {
                         return Err(format!(
@@ -2822,37 +2930,9 @@ impl ArmConfig {
                             jl.min_position, jl.max_position, imp.p_max
                         ));
                     }
-                    if let Some(r) = self.damiao_ranges.as_ref().and_then(|rs| rs.get(i)) {
-                        if (r.p_max - imp.p_max).abs() > 1e-5
-                            || (r.v_max - imp.v_max).abs() > 1e-5
-                            || (r.t_max - imp.t_max).abs() > 1e-5
-                        {
-                            return Err(format!(
-                                "control_mode[{i}] impedance wire range ({}/{}/{}) conflicts with damiao_ranges[{i}] ({}/{}/{})",
-                                imp.p_max, imp.v_max, imp.t_max, r.p_max, r.v_max, r.t_max
-                            ));
-                        }
-                    }
-                    if let Some(gc) = &self.gravity_comp {
-                        if let Some(&t_lim) = gc.torque_limits_nm.get(i) {
-                            if t_lim > imp.t_max {
-                                return Err(format!(
-                                    "control_mode[{i}] impedance t_max ({}) is below gravity_comp torque_limits_nm[{i}] ({t_lim})",
-                                    imp.t_max
-                                ));
-                            }
-                        }
-                    }
+                    self.validate_impedance_policy_compatibility(i, imp)?;
                 }
-                ModeLimits::PositionForce(_pf) => {
-                    if let Some(r) = self.damiao_ranges.as_ref().and_then(|rs| rs.get(i)) {
-                        if jl.min_position < -r.p_max || jl.max_position > r.p_max {
-                            return Err(format!(
-                                "control_mode[{i}]: joint position range [{}, {}] exceeds damiao_ranges[{i}].p_max +/-{}",
-                                jl.min_position, jl.max_position, r.p_max
-                            ));
-                        }
-                    }
+                ModeLimits::PositionForce(_) => {
                     if DamiaoGripperDrive::quantize_vel_raw(jl.max_velocity) == 0 {
                         return Err(format!(
                             "control_mode[{i}]: joint max_velocity encodes to 0 on the pos-force wire (must quantize to >= 0.01 rad/s)"
@@ -2872,10 +2952,6 @@ impl ArmConfig {
                         }
                     }
                 }
-            }
-
-            if let Some(v) = entry.vendor {
-                self.validate_joint_wire_limits(v, i, entry.mode, &resolved_limits)?;
             }
 
             // Conflict check with legacy `damiao_gripper` block on the gripper joint.
@@ -2913,38 +2989,149 @@ impl ArmConfig {
             }
 
             // Conflict check with runtime MIT transitions (`gravity_comp` / enabled MIT `joint_tracking`).
-            if self.joint_requires_runtime_impedance(i) {
-                if entry.vendor.is_some_and(|v| !v.supports_mode(MotorControlMode::Impedance)) {
-                    return Err(format!(
-                        "control_mode[{i}] vendor '{}' cannot support impedance required by gravity_comp / MIT joint_tracking",
-                        entry.vendor.unwrap()
-                    ));
-                }
-                if entry.mode != MotorControlMode::Impedance {
-                    if let Some(rt) = &entry.runtime_modes {
-                        if !rt.contains(&MotorControlMode::Impedance) {
-                            return Err(format!(
-                                "control_mode[{i}] forbids runtime impedance required by gravity_comp / MIT joint_tracking"
-                            ));
-                        }
+            if self.joint_requires_runtime_impedance(i) && entry.mode != MotorControlMode::Impedance
+            {
+                if let Some(rt) = &entry.runtime_modes {
+                    if !rt.contains(&MotorControlMode::Impedance) {
+                        return Err(format!(
+                            "control_mode[{i}] forbids runtime impedance required by gravity_comp / MIT joint_tracking"
+                        ));
                     }
                 }
             }
         }
+        Ok(explicit_vendor)
+    }
+
+    /// Validate optional per-joint `control_mode` declarations.
+    ///
+    /// Runs vendor-agnostic shape checks and, whenever a vendor binding is explicitly declared
+    /// or inferred from profile sections, delegates directly to [`Self::resolve_control_modes`]
+    /// so `validate()` and follower resolution share one authoritative rule set.
+    pub fn validate_control_mode(&self) -> Result<(), String> {
+        let explicit_vendor = self.validate_control_mode_shape()?;
+        if self.control_mode.is_none() {
+            return Ok(());
+        }
+        if let Some(vendor) = explicit_vendor.or_else(|| self.infer_vendor_binding()) {
+            let _ = self.resolve_control_modes(vendor)?;
+        }
         Ok(())
+    }
+
+    /// Translate one omitted joint slot from legacy profile settings for `vendor`, preserving
+    /// legacy acceptance rules.
+    fn resolve_omitted_joint(
+        &self,
+        vendor: VendorBinding,
+        joint: usize,
+    ) -> Result<ResolvedJointMode, String> {
+        let gripper_idx = self.gripper_index();
+        let (mode, limits, runtime_modes) = match vendor {
+            VendorBinding::Damiao => {
+                if Some(joint) == gripper_idx {
+                    if let Some(dg) = &self.damiao_gripper {
+                        match dg.mode {
+                            DamiaoGripperMode::PosForce => {
+                                let gp = self.gripper_policy.as_ref().ok_or_else(|| {
+                                    "damiao_gripper pos_force needs gripper_policy (closed_rad / open_rad)"
+                                        .to_string()
+                                })?;
+                                if DamiaoGripperDrive::quantize_vel_raw_f64(gp.close_speed()) == 0 {
+                                    return Err(
+                                        "gripper_policy.close_speed_rad_s encodes to 0 on the pos-force wire (must quantize to >= 0.01 rad/s)"
+                                            .into(),
+                                    );
+                                }
+                                (
+                                    MotorControlMode::PositionForce,
+                                    ModeLimits::PositionForce(
+                                        PositionForceLimits::from_damiao_gripper(dg),
+                                    ),
+                                    Vec::new(),
+                                )
+                            }
+                            DamiaoGripperMode::PosVel => (
+                                MotorControlMode::PositionVelocity,
+                                ModeLimits::PositionVelocity(
+                                    PositionVelocityLimits::damiao_default(),
+                                ),
+                                Vec::new(),
+                            ),
+                        }
+                    } else {
+                        (
+                            MotorControlMode::PositionVelocity,
+                            ModeLimits::PositionVelocity(PositionVelocityLimits::damiao_default()),
+                            Vec::new(),
+                        )
+                    }
+                } else {
+                    let rt = if self.joint_requires_runtime_impedance(joint) {
+                        vec![MotorControlMode::Impedance]
+                    } else {
+                        Vec::new()
+                    };
+                    (
+                        MotorControlMode::PositionVelocity,
+                        ModeLimits::PositionVelocity(PositionVelocityLimits::damiao_default()),
+                        rt,
+                    )
+                }
+            }
+            VendorBinding::Feetech => (
+                MotorControlMode::Position,
+                ModeLimits::Position(PositionLimits {
+                    step_range: self.feetech_joint_step_range(joint),
+                    ..PositionLimits::default()
+                }),
+                Vec::new(),
+            ),
+            VendorBinding::RobStride => (
+                MotorControlMode::Impedance,
+                ModeLimits::Impedance(ImpedanceLimits::robstride_default()),
+                Vec::new(),
+            ),
+            VendorBinding::FashionStar => (
+                MotorControlMode::Position,
+                ModeLimits::Position(PositionLimits {
+                    interval_ms: Some(crate::motor_mode::FASHIONSTAR_DEFAULT_INTERVAL_MS),
+                    power_limit: Some(crate::motor_mode::FASHIONSTAR_DEFAULT_POWER),
+                    ..PositionLimits::default()
+                }),
+                Vec::new(),
+            ),
+        };
+        let runtime_impedance_limits =
+            self.runtime_impedance_limits_for(vendor, joint, &runtime_modes);
+        Ok(ResolvedJointMode {
+            joint,
+            vendor: Some(vendor),
+            mode,
+            limits,
+            runtime_modes,
+            runtime_impedance_limits,
+        })
     }
 
     /// Resolve every joint's effective control mode, typed limits, and permitted runtime
     /// transitions for a concrete hardware [`VendorBinding`].
     ///
-    /// Omitted `control_mode` entries translate to today's exact behaviour for each vendor
+    /// Omitted `control_mode` entries translate to today's exact behaviour and acceptance rules
     /// (including `damiao_gripper` compatibility and existing runtime MIT transitions).
-    /// Rejects conflicts, unsupported vendor bindings, missing limits, and invalid wire ranges.
+    /// Explicit entries are checked by the single-authority vendor validator.
     pub fn resolve_control_modes(
         &self,
         vendor: VendorBinding,
     ) -> Result<Vec<ResolvedJointMode>, String> {
-        self.validate_control_mode()?;
+        let explicit_vendor = self.validate_control_mode_shape()?;
+        if let Some(v) = explicit_vendor {
+            if v != vendor {
+                return Err(format!(
+                    "control_mode vendor '{v}' conflicts with follower vendor '{vendor}'"
+                ));
+            }
+        }
         self.validate_vendor_profile_sections(vendor)?;
         if self.limits.len() != self.dof {
             return Err(format!(
@@ -2954,7 +3141,6 @@ impl ArmConfig {
             ));
         }
 
-        let gripper_idx = self.gripper_index();
         let mut out = Vec::with_capacity(self.dof);
 
         for i in 0..self.dof {
@@ -2964,20 +3150,7 @@ impl ArmConfig {
                 .and_then(|v| v.get(i))
                 .and_then(|e| e.as_ref());
 
-            let (mode, limits, runtime_modes) = if let Some(entry) = explicit {
-                if let Some(v) = entry.vendor {
-                    if v != vendor {
-                        return Err(format!(
-                            "control_mode[{i}] vendor '{v}' conflicts with follower vendor '{vendor}'"
-                        ));
-                    }
-                }
-                if !vendor.supports_mode(entry.mode) {
-                    return Err(format!(
-                        "control_mode[{i}]: vendor '{vendor}' does not support control mode '{}'",
-                        entry.mode
-                    ));
-                }
+            if let Some(entry) = explicit {
                 let lim = match (&entry.limits, vendor) {
                     (Some(ModeLimits::Position(p)), VendorBinding::Feetech) => {
                         let mut merged = p.clone();
@@ -3005,7 +3178,9 @@ impl ArmConfig {
                             ..PositionLimits::default()
                         })
                     }
-                    (None, VendorBinding::FashionStar) if entry.mode == MotorControlMode::Position => {
+                    (None, VendorBinding::FashionStar)
+                        if entry.mode == MotorControlMode::Position =>
+                    {
                         ModeLimits::Position(PositionLimits {
                             interval_ms: Some(crate::motor_mode::FASHIONSTAR_DEFAULT_INTERVAL_MS),
                             power_limit: Some(crate::motor_mode::FASHIONSTAR_DEFAULT_POWER),
@@ -3023,17 +3198,7 @@ impl ArmConfig {
                     }
                 };
                 let rt = match &entry.runtime_modes {
-                    Some(rt) => {
-                        for &m in rt {
-                            if !vendor.supports_runtime_switch(entry.mode, m) {
-                                return Err(format!(
-                                    "control_mode[{i}]: vendor '{vendor}' does not support runtime switch '{}' -> '{m}'",
-                                    entry.mode
-                                ));
-                            }
-                        }
-                        rt.clone()
-                    }
+                    Some(rt) => rt.clone(),
                     None => {
                         if vendor == VendorBinding::Damiao
                             && entry.mode == MotorControlMode::PositionVelocity
@@ -3045,95 +3210,29 @@ impl ArmConfig {
                         }
                     }
                 };
-                (entry.mode, lim, rt)
-            } else {
-                // Omitted entry: translate to today's exact behaviour for `vendor`.
-                match vendor {
-                    VendorBinding::Damiao => {
-                        if Some(i) == gripper_idx {
-                            if let Some(dg) = &self.damiao_gripper {
-                                match dg.mode {
-                                    DamiaoGripperMode::PosForce => (
-                                        MotorControlMode::PositionForce,
-                                        ModeLimits::PositionForce(
-                                            PositionForceLimits::from_damiao_gripper(dg),
-                                        ),
-                                        Vec::new(),
-                                    ),
-                                    DamiaoGripperMode::PosVel => (
-                                        MotorControlMode::PositionVelocity,
-                                        ModeLimits::PositionVelocity(
-                                            PositionVelocityLimits::damiao_default(),
-                                        ),
-                                        Vec::new(),
-                                    ),
-                                }
-                            } else {
-                                (
-                                    MotorControlMode::PositionVelocity,
-                                    ModeLimits::PositionVelocity(
-                                        PositionVelocityLimits::damiao_default(),
-                                    ),
-                                    Vec::new(),
-                                )
-                            }
-                        } else {
-                            let rt = if self.joint_requires_runtime_impedance(i) {
-                                vec![MotorControlMode::Impedance]
-                            } else {
-                                Vec::new()
-                            };
-                            (
-                                MotorControlMode::PositionVelocity,
-                                ModeLimits::PositionVelocity(
-                                    PositionVelocityLimits::damiao_default(),
-                                ),
-                                rt,
-                            )
-                        }
-                    }
-                    VendorBinding::Feetech => (
-                        MotorControlMode::Position,
-                        ModeLimits::Position(PositionLimits {
-                            step_range: self.feetech_joint_step_range(i),
-                            ..PositionLimits::default()
-                        }),
-                        Vec::new(),
-                    ),
-                    VendorBinding::RobStride => (
-                        MotorControlMode::Impedance,
-                        ModeLimits::Impedance(ImpedanceLimits::robstride_default()),
-                        Vec::new(),
-                    ),
-                    VendorBinding::FashionStar => (
-                        MotorControlMode::Position,
-                        ModeLimits::Position(PositionLimits {
-                            interval_ms: Some(crate::motor_mode::FASHIONSTAR_DEFAULT_INTERVAL_MS),
-                            power_limit: Some(crate::motor_mode::FASHIONSTAR_DEFAULT_POWER),
-                            ..PositionLimits::default()
-                        }),
-                        Vec::new(),
-                    ),
+                self.validate_explicit_joint_for_vendor(vendor, i, entry.mode, &lim, &rt)?;
+                if self.joint_requires_runtime_impedance(i)
+                    && entry.mode != MotorControlMode::Impedance
+                    && !rt.contains(&MotorControlMode::Impedance)
+                {
+                    return Err(format!(
+                        "control_mode[{i}]: vendor '{vendor}' / mode '{}' cannot satisfy runtime impedance required by gravity_comp / MIT joint_tracking",
+                        entry.mode
+                    ));
                 }
-            };
-
-            if self.joint_requires_runtime_impedance(i)
-                && mode != MotorControlMode::Impedance
-                && !runtime_modes.contains(&MotorControlMode::Impedance)
-            {
-                return Err(format!(
-                    "control_mode[{i}]: vendor '{vendor}' / mode '{mode}' cannot satisfy runtime impedance required by gravity_comp / MIT joint_tracking"
-                ));
+                let runtime_impedance_limits =
+                    self.runtime_impedance_limits_for(vendor, i, &rt);
+                out.push(ResolvedJointMode {
+                    joint: i,
+                    vendor: Some(vendor),
+                    mode: entry.mode,
+                    limits: lim,
+                    runtime_modes: rt,
+                    runtime_impedance_limits,
+                });
+            } else {
+                out.push(self.resolve_omitted_joint(vendor, i)?);
             }
-
-            self.validate_joint_wire_limits(vendor, i, mode, &limits)?;
-            out.push(ResolvedJointMode {
-                joint: i,
-                vendor: Some(vendor),
-                mode,
-                limits,
-                runtime_modes,
-            });
         }
 
         Ok(out)
@@ -3149,9 +3248,9 @@ impl ArmConfig {
             return self.resolve_control_modes(vendor);
         }
         if matches!(follower, "sim" | "mock") {
-            self.validate_control_mode()?;
-            if let Some(inferred) = self.infer_vendor_binding() {
-                return self.resolve_control_modes(inferred);
+            let explicit_vendor = self.validate_control_mode_shape()?;
+            if let Some(vendor) = explicit_vendor.or_else(|| self.infer_vendor_binding()) {
+                return self.resolve_control_modes(vendor);
             }
             let mut out = Vec::with_capacity(self.dof);
             for i in 0..self.dof {
@@ -3171,6 +3270,7 @@ impl ArmConfig {
                         mode: entry.mode,
                         limits: lim,
                         runtime_modes: entry.runtime_modes.clone().unwrap_or_default(),
+                        runtime_impedance_limits: None,
                     });
                 } else {
                     out.push(ResolvedJointMode {
@@ -3179,12 +3279,47 @@ impl ArmConfig {
                         mode: MotorControlMode::Position,
                         limits: ModeLimits::Position(PositionLimits::default()),
                         runtime_modes: Vec::new(),
+                        runtime_impedance_limits: None,
                     });
                 }
             }
             return Ok(out);
         }
         Err(format!("Unknown follower model: {follower}"))
+    }
+
+    /// Step-1 startup guard called before opening any hardware transport (`src/main.rs`).
+    ///
+    /// Resolves per-joint control modes for `follower` and, when a real hardware follower has
+    /// explicit `control_mode` entries, verifies that every declared mode, limit set, and
+    /// runtime transition matches what the unmigrated Step-1 driver path will actually apply.
+    /// Fails closed if an explicit declaration would be silently ignored on hardware (e.g.
+    /// removing `damiao_gripper` and declaring J7 `position_force` solely in `control_mode`).
+    pub fn validate_step1_driver_parity(
+        &self,
+        follower: &str,
+    ) -> Result<Vec<ResolvedJointMode>, String> {
+        let declared = self.resolve_control_modes_for_follower(follower)?;
+        let Some(vendor) = VendorBinding::from_follower_name(follower) else {
+            return Ok(declared);
+        };
+        let has_explicit = self
+            .control_mode
+            .as_ref()
+            .is_some_and(|entries| entries.iter().any(Option::is_some));
+        if !has_explicit {
+            return Ok(declared);
+        }
+        for (i, resolved) in declared.iter().enumerate() {
+            let active = self.resolve_omitted_joint(vendor, i)?;
+            if resolved != &active {
+                return Err(format!(
+                    "control_mode[{i}] diverges from Step-1 driver path for follower '{follower}' (declared '{}', active driver applies '{}'); Step 1 has not migrated src/driver.rs TX paths yet — keep legacy profile fields matching or omit control_mode until Step 2",
+                    resolved.mode, active.mode
+                ));
+            }
+        }
+        Ok(declared)
     }
 
     /// Joint limits for servo stepping: `max_velocity` capped at `servo_max_velocity`

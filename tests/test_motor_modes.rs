@@ -93,7 +93,10 @@ fn vendor_capability_table_matches_protocol_implementations() {
     assert_eq!(dm.feedback_source, FeedbackSource::CommandReplyAndRefresh);
     assert!(dm.feedback_position && dm.feedback_velocity && dm.feedback_torque && dm.feedback_temperature && dm.feedback_enable_state);
     assert!(!dm.feedback_load);
-    assert_eq!(dm.default_feedback_max_age_ms, Some(100));
+    assert_eq!(dm.default_feedback_max_age_ms, Some(250));
+    assert_eq!(dm.feedback_max_age_ms(ControlMode::PositionVelocity), Some(250));
+    assert_eq!(dm.feedback_max_age_ms(ControlMode::Impedance), Some(250));
+    assert_eq!(dm.feedback_max_age_ms(ControlMode::PositionForce), Some(100));
     assert!(!dm.needs_vendor_doc.is_empty());
 
     let ft = VendorBinding::Feetech.capability();
@@ -181,11 +184,32 @@ fn every_shipped_profile_loads_and_resolves_expected_modes() {
                         })
                     );
                     assert_eq!(jm.runtime_modes, vec![ControlMode::Impedance]);
+                    let expected_rt_imp = if i < 3 {
+                        ImpedanceLimits {
+                            p_max: 12.5,
+                            v_max: 10.0,
+                            t_max: 28.0,
+                            kp_max: 500.0,
+                            kd_max: 5.0,
+                            effort_limit_nm: None,
+                        }
+                    } else {
+                        ImpedanceLimits {
+                            p_max: 12.5,
+                            v_max: 30.0,
+                            t_max: 10.0,
+                            kp_max: 500.0,
+                            kd_max: 5.0,
+                            effort_limit_nm: None,
+                        }
+                    };
+                    assert_eq!(jm.runtime_impedance_limits, Some(expected_rt_imp));
                 }
                 let j7 = &resolved[6];
                 assert_eq!(j7.joint, 6);
                 assert_eq!(j7.vendor, Some(VendorBinding::Damiao));
                 assert_eq!(j7.mode, ControlMode::PositionForce);
+                assert_eq!(j7.runtime_impedance_limits, None);
                 assert_eq!(
                     j7.limits,
                     ModeLimits::PositionForce(PositionForceLimits {
@@ -627,7 +651,7 @@ fn profile_conflicts_and_invalid_wire_ranges_rejected() {
     }));
     c.control_mode = Some(cm);
     let err = c.validate().unwrap_err();
-    assert!(err.contains("conflicts with damiao_ranges[0]"), "{err}");
+    assert!(err.contains("conflicts with active Damiao wire mapping"), "{err}");
 
     // 4. Explicit runtime_modes: [] conflicts with gravity_comp on arm joint.
     let mut c = ArmConfig::rebot_dm();
@@ -650,37 +674,56 @@ fn profile_conflicts_and_invalid_wire_ranges_rejected() {
     ));
     c.control_mode = Some(cm);
     let err = c.validate().unwrap_err();
-    assert!(err.contains("exceeds damiao_ranges[0].v_max"), "{err}");
+    assert!(err.contains("exceeds Damiao wire v_max"), "{err}");
 
     // 6. Invalid wire ranges: Impedance kp_max > 500, kd_max > 5, effort_limit > t_max, joint pos > p_max.
-    for bad in [
-        ImpedanceLimits { p_max: 12.5, v_max: 10.0, t_max: 28.0, kp_max: 500.1, kd_max: 5.0, effort_limit_nm: None },
-        ImpedanceLimits { p_max: 12.5, v_max: 10.0, t_max: 28.0, kp_max: 500.0, kd_max: 5.1, effort_limit_nm: None },
-        ImpedanceLimits { p_max: 12.5, v_max: 10.0, t_max: 28.0, kp_max: 500.0, kd_max: 5.0, effort_limit_nm: Some(29.0) },
-        ImpedanceLimits { p_max: 2.0, v_max: 10.0, t_max: 28.0, kp_max: 500.0, kd_max: 5.0, effort_limit_nm: None }, // joint_1 limit +/-3.14 > 2.0
+    for (bad, expected_substr) in [
+        (ImpedanceLimits { p_max: 12.5, v_max: 30.0, t_max: 18.0, kp_max: 500.1, kd_max: 5.0, effort_limit_nm: None }, "kp_max"),
+        (ImpedanceLimits { p_max: 12.5, v_max: 30.0, t_max: 18.0, kp_max: 500.0, kd_max: 5.1, effort_limit_nm: None }, "kd_max"),
+        (ImpedanceLimits { p_max: 12.5, v_max: 30.0, t_max: 18.0, kp_max: 500.0, kd_max: 5.0, effort_limit_nm: Some(19.0) }, "effort_limit_nm"),
     ] {
         let mut c = ArmConfig::default();
         let mut cm = vec![None; 6];
         cm[0] = Some(JointControlModeConfig::impedance(bad));
         c.control_mode = Some(cm);
-        assert!(c.validate().is_err(), "expected invalid impedance range to fail: {bad:?}");
+        let err = c.validate().unwrap_err();
+        assert!(err.contains(expected_substr), "expected '{expected_substr}' for {bad:?}, got: {err}");
     }
+    // Joint limit exceeding impedance p_max (with matching damiao_ranges[0].p_max = 2.0).
+    let mut c = ArmConfig::default();
+    c.damiao_ranges = Some(vec![
+        armd::model::DamiaoRange { p_max: 2.0, v_max: 30.0, t_max: 18.0 };
+        6
+    ]);
+    let mut cm = vec![None; 6];
+    cm[0] = Some(JointControlModeConfig::impedance(ImpedanceLimits {
+        p_max: 2.0,
+        v_max: 30.0,
+        t_max: 18.0,
+        kp_max: 500.0,
+        kd_max: 5.0,
+        effort_limit_nm: None,
+    }));
+    c.control_mode = Some(cm);
+    let err = c.validate().unwrap_err();
+    assert!(err.contains("exceeds impedance wire p_max"), "{err}");
 
-    // 7. Invalid wire ranges: PositionForce current_raw=0/10001, zero-quantizing close_speed, >655.35 rad/s, max_speed < close_speed.
-    for bad in [
-        PositionForceLimits { current_ceiling_raw: 0, close_speed_rad_s: 0.3, max_speed_rad_s: None, calibrated: false, ceiling_torque_nm: None, torque_reference: None, feedback_stale_fault_ms: None },
-        PositionForceLimits { current_ceiling_raw: 10_001, close_speed_rad_s: 0.3, max_speed_rad_s: None, calibrated: false, ceiling_torque_nm: None, torque_reference: None, feedback_stale_fault_ms: None },
-        PositionForceLimits { current_ceiling_raw: 460, close_speed_rad_s: 0.005, max_speed_rad_s: None, calibrated: false, ceiling_torque_nm: None, torque_reference: None, feedback_stale_fault_ms: None },
-        PositionForceLimits { current_ceiling_raw: 460, close_speed_rad_s: 700.0, max_speed_rad_s: None, calibrated: false, ceiling_torque_nm: None, torque_reference: None, feedback_stale_fault_ms: None },
-        PositionForceLimits { current_ceiling_raw: 460, close_speed_rad_s: 0.5, max_speed_rad_s: Some(0.2), calibrated: false, ceiling_torque_nm: None, torque_reference: None, feedback_stale_fault_ms: None },
-        PositionForceLimits { current_ceiling_raw: 460, close_speed_rad_s: 0.3, max_speed_rad_s: None, calibrated: false, ceiling_torque_nm: None, torque_reference: None, feedback_stale_fault_ms: Some(150) },
+    // 7. Invalid wire ranges: PositionForce current_raw=0/10001, zero-quantizing close_speed, >max wire speed, max_speed < close_speed.
+    for (bad, expected_substr) in [
+        (PositionForceLimits { current_ceiling_raw: 0, close_speed_rad_s: 0.3, max_speed_rad_s: None, calibrated: false, ceiling_torque_nm: None, torque_reference: None, feedback_stale_fault_ms: None }, "current_ceiling_raw"),
+        (PositionForceLimits { current_ceiling_raw: 10_001, close_speed_rad_s: 0.3, max_speed_rad_s: None, calibrated: false, ceiling_torque_nm: None, torque_reference: None, feedback_stale_fault_ms: None }, "current_ceiling_raw"),
+        (PositionForceLimits { current_ceiling_raw: 460, close_speed_rad_s: 0.005, max_speed_rad_s: None, calibrated: false, ceiling_torque_nm: None, torque_reference: None, feedback_stale_fault_ms: None }, "encodes to 0 on the wire"),
+        (PositionForceLimits { current_ceiling_raw: 460, close_speed_rad_s: 700.0, max_speed_rad_s: None, calibrated: false, ceiling_torque_nm: None, torque_reference: None, feedback_stale_fault_ms: None }, "exceeds"),
+        (PositionForceLimits { current_ceiling_raw: 460, close_speed_rad_s: 0.5, max_speed_rad_s: Some(0.2), calibrated: false, ceiling_torque_nm: None, torque_reference: None, feedback_stale_fault_ms: None }, "max_speed_rad_s"),
+        (PositionForceLimits { current_ceiling_raw: 460, close_speed_rad_s: 0.3, max_speed_rad_s: None, calibrated: false, ceiling_torque_nm: None, torque_reference: None, feedback_stale_fault_ms: Some(150) }, "feedback_stale_fault_ms"),
     ] {
         let mut c = ArmConfig::rebot_dm();
         c.damiao_gripper = None;
         let mut cm = vec![None; 7];
         cm[6] = Some(JointControlModeConfig::position_force(bad.clone()));
         c.control_mode = Some(cm);
-        assert!(c.validate().is_err(), "expected invalid pos-force limits to fail: {bad:?}");
+        let err = c.validate().unwrap_err();
+        assert!(err.contains(expected_substr), "expected '{expected_substr}' for {bad:?}, got: {err}");
     }
 
     // 8. Feetech invalid step_range / FashionStar-only fields rejected; FashionStar step_range rejected.
@@ -717,14 +760,260 @@ fn profile_conflicts_and_invalid_wire_ranges_rejected() {
     no_gp.control_mode = Some(cm);
     assert!(no_gp.validate().unwrap_err().contains("gripper_policy"));
 
-    // 10. Damiao joint position limits exceeding wire p_max rejected.
+    // 10. Explicit Damiao declaration rejects joint position limits exceeding wire p_max,
+    //     while legacy omitted `control_mode` preserves existing acceptance rules (Major 1).
+    let mut legacy_low_vmax = ArmConfig::rebot_dm();
+    legacy_low_vmax.damiao_ranges.as_mut().unwrap()[0].v_max = 1.5;
+    legacy_low_vmax.validate().unwrap();
+    let legacy_res = legacy_low_vmax
+        .resolve_control_modes(VendorBinding::Damiao)
+        .unwrap();
+    assert_eq!(legacy_res[0].mode, ControlMode::PositionVelocity);
+
     let mut big_pos = ArmConfig::rebot_dm();
     big_pos.damiao_ranges.as_mut().unwrap()[0] = DamiaoRange { p_max: 2.0, v_max: 10.0, t_max: 28.0 };
+    let mut cm = vec![None; 7];
+    cm[0] = Some(JointControlModeConfig::position_velocity(
+        PositionVelocityLimits::damiao_default(),
+    ));
+    big_pos.control_mode = Some(cm);
     assert!(
         big_pos
-            .resolve_control_modes(VendorBinding::Damiao)
+            .validate()
             .unwrap_err()
             .contains("exceeds Damiao wire p_max")
+    );
+}
+
+#[test]
+fn review_regressions_parity_roles_wire_mapping_overflow_effort_duplicates_and_top_speed() {
+    use armd::motor_mode::pos_force_max_wire_speed_f32;
+    use armd::protocol::damiao::{
+        self, DamiaoEncodeRefusal, DamiaoError, DamiaoIntentPayload, DamiaoLimits,
+    };
+
+    // Blocker 1: explicit `control_mode` that diverges from Step-1 driver path fails closed.
+    let mut migrated = ArmConfig::rebot_dm();
+    migrated.damiao_gripper = None;
+    let mut cm = vec![None; 7];
+    cm[6] = Some(JointControlModeConfig::position_force(
+        PositionForceLimits::from_damiao_gripper(&DamiaoGripperDrive::rebot_dm()),
+    ));
+    migrated.control_mode = Some(cm);
+    migrated.validate().unwrap();
+    assert!(
+        migrated
+            .validate_step1_driver_parity("rebot-dm")
+            .unwrap_err()
+            .contains("Step-1 driver path")
+    );
+
+    // Major 2: Damiao role restrictions (PositionForce on J1 arm joint; MIT switch on J7 gripper).
+    let mut pf_on_j1 = ArmConfig::rebot_dm();
+    pf_on_j1.gravity_comp = None;
+    let mut cm = vec![None; 7];
+    cm[0] = Some(JointControlModeConfig::position_force(
+        PositionForceLimits::from_damiao_gripper(&DamiaoGripperDrive::rebot_dm()),
+    ));
+    pf_on_j1.control_mode = Some(cm);
+    assert!(
+        pf_on_j1
+            .validate()
+            .unwrap_err()
+            .contains("only supported on the gripper joint")
+    );
+
+    let mut mit_on_j7 = ArmConfig::rebot_dm();
+    mit_on_j7.damiao_gripper = None;
+    let mut cm = vec![None; 7];
+    cm[6] = Some(
+        JointControlModeConfig::position_velocity(PositionVelocityLimits::damiao_default())
+            .with_runtime_modes(vec![ControlMode::Impedance]),
+    );
+    mit_on_j7.control_mode = Some(cm);
+    assert!(
+        mit_on_j7
+            .validate()
+            .unwrap_err()
+            .contains("only supported on arm joints")
+    );
+
+    // Major 3: explicit impedance wire mappings must match active Damiao default (18 Nm) and
+    // active RobStride default (4*PI / 30 / 18).
+    let mut dm_no_ranges = ArmConfig::rebot_dm();
+    dm_no_ranges.damiao_ranges = None;
+    dm_no_ranges.torque_guard = None;
+    dm_no_ranges.gravity_comp = None;
+    let mut cm = vec![None; 7];
+    cm[0] = Some(JointControlModeConfig::impedance(ImpedanceLimits {
+        p_max: 12.5,
+        v_max: 30.0,
+        t_max: 36.0, // conflicts with default Damiao 18 Nm
+        kp_max: 500.0,
+        kd_max: 5.0,
+        effort_limit_nm: None,
+    }));
+    dm_no_ranges.control_mode = Some(cm);
+    assert!(
+        dm_no_ranges
+            .validate()
+            .unwrap_err()
+            .contains("active Damiao wire mapping")
+    );
+
+    let mut rs = ArmConfig::from_profile_file(repo_root().join("profiles/rebot_b601_rs.json"))
+        .unwrap();
+    let mut cm = vec![None; 6];
+    cm[0] = Some(JointControlModeConfig::impedance(ImpedanceLimits {
+        p_max: 12.5,
+        v_max: 30.0,
+        t_max: 25.0, // conflicts with default RobStride 4*PI / 30 / 18
+        kp_max: 500.0,
+        kd_max: 5.0,
+        effort_limit_nm: None,
+    }));
+    rs.control_mode = Some(cm);
+    assert!(
+        rs.validate()
+            .unwrap_err()
+            .contains("active RobStride wire mapping")
+    );
+
+    // Major 4: finite endpoints overflowing span or `span * max_int` refused in validator and codec.
+    for huge in [f32::MAX, f32::MAX / 4.0] {
+        let huge_imp = ImpedanceLimits {
+            p_max: huge,
+            v_max: 10.0,
+            t_max: 10.0,
+            kp_max: 100.0,
+            kd_max: 1.0,
+            effort_limit_nm: None,
+        };
+        assert!(huge_imp.validate().is_err());
+        assert_eq!(
+            damiao::encode_command(
+                1,
+                ControlMode::Impedance,
+                DamiaoIntentPayload::Impedance {
+                    position: 1.0,
+                    velocity: 0.0,
+                    kp: 10.0,
+                    kd: 0.5,
+                    torque: 0.0,
+                },
+                &ModeLimits::Impedance(huge_imp),
+            ),
+            Err(DamiaoEncodeRefusal::InvalidLimits)
+        );
+        let huge_wire = DamiaoLimits::symmetric(huge, 10.0, 10.0);
+        assert!(matches!(
+            damiao::decode_feedback_bytes(&[0x11, 0xFF, 0xFF, 0x80, 0x08, 0x00, 30, 30], &huge_wire),
+            Err(DamiaoError::ParameterError(_))
+        ));
+    }
+
+    // Major 5: gravity_comp and MIT tracking checked against effective effort_limit_nm, not only t_max.
+    let mut gc_eff = ArmConfig::rebot_dm();
+    let mut cm = vec![None; 7];
+    cm[0] = Some(JointControlModeConfig::impedance(ImpedanceLimits {
+        p_max: 12.5,
+        v_max: 10.0,
+        t_max: 28.0,
+        kp_max: 500.0,
+        kd_max: 5.0,
+        effort_limit_nm: Some(0.5), // fits t_max=28, below gravity_comp torque_limits_nm[0]=2.0
+    }));
+    gc_eff.control_mode = Some(cm);
+    assert!(
+        gc_eff
+            .validate()
+            .unwrap_err()
+            .contains("effective effort limit")
+    );
+
+    // Minor 1: duplicate JSON keys in `limits` and top-level object are rejected.
+    let dup_limit = r#"{"mode":"position_force","limits":{"current_ceiling_raw":460,"current_ceiling_raw":9000,"close_speed_rad_s":0.3}}"#;
+    let dup_err = serde_json::from_str::<JointControlModeConfig>(dup_limit).unwrap_err();
+    assert!(dup_err.to_string().contains("duplicate field"), "{dup_err}");
+    let dup_top = r#"{"mode":"position","mode":"position"}"#;
+    let dup_top_err = serde_json::from_str::<JointControlModeConfig>(dup_top).unwrap_err();
+    assert!(dup_top_err.to_string().contains("duplicate field"), "{dup_top_err}");
+
+    // Minor 3: independent hardcoded golden byte vectors for MIT and POS_VEL (detects shared packing bugs).
+    let mit_golden = damiao::encode_command(
+        1,
+        ControlMode::Impedance,
+        DamiaoIntentPayload::Impedance {
+            position: 0.0,
+            velocity: 0.0,
+            kp: 0.0,
+            kd: 0.0,
+            torque: 0.0,
+        },
+        &ModeLimits::Impedance(ImpedanceLimits::damiao_default()),
+    )
+    .unwrap();
+    // Midpoint quantization: p=0x8000, v=0x800, kp=0x000, kd=0x000, t=0x800.
+    assert_eq!(mit_golden.can_id, 0x001);
+    assert_eq!(mit_golden.data, [0x80, 0x00, 0x80, 0x00, 0x00, 0x00, 0x08, 0x00]);
+
+    let pv_golden = damiao::encode_command(
+        2,
+        ControlMode::PositionVelocity,
+        DamiaoIntentPayload::PositionVelocity {
+            position: 1.0,
+            velocity: Some(2.0),
+        },
+        &ModeLimits::PositionVelocity(PositionVelocityLimits { max_velocity_rad_s: 2.0 }),
+    )
+    .unwrap();
+    assert_eq!(pv_golden.can_id, 0x102);
+    assert_eq!(pv_golden.data, [0x00, 0x00, 0x80, 0x3F, 0x00, 0x00, 0x00, 0x40]);
+
+    // Minor 4: highest representable POS_FORCE speed encodes to exact top wire value 0xFFFF.
+    let top_speed = pos_force_max_wire_speed_f32();
+    let top_lim = PositionForceLimits {
+        current_ceiling_raw: 460,
+        close_speed_rad_s: top_speed,
+        max_speed_rad_s: Some(top_speed),
+        calibrated: false,
+        ceiling_torque_nm: None,
+        torque_reference: None,
+        feedback_stale_fault_ms: None,
+    };
+    top_lim.validate().unwrap();
+    let enc_top = damiao::encode_command(
+        7,
+        ControlMode::PositionForce,
+        DamiaoIntentPayload::PositionForce {
+            position: 0.0,
+            velocity: Some(top_speed),
+            current_raw: None,
+            hold: false,
+        },
+        &ModeLimits::PositionForce(top_lim.clone()),
+    )
+    .unwrap();
+    assert_eq!(enc_top.data, [0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xCC, 0x01]);
+    let over_top = PositionForceLimits {
+        close_speed_rad_s: top_speed.next_up(),
+        max_speed_rad_s: None,
+        ..top_lim
+    };
+    assert!(over_top.validate().is_err());
+    assert_eq!(
+        damiao::encode_command(
+            7,
+            ControlMode::PositionForce,
+            DamiaoIntentPayload::PositionForce {
+                position: 0.0,
+                velocity: Some(top_speed),
+                current_raw: None,
+                hold: false,
+            },
+            &ModeLimits::PositionForce(over_top),
+        ),
+        Err(DamiaoEncodeRefusal::InvalidLimits)
     );
 }
 
