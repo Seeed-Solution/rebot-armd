@@ -22,6 +22,7 @@ type Fx = ReleaseFixture<SupervisorInner>;
 
 fn fixture() -> (Fx, Broker<PlanSlot>) {
     let mut inner = common::sim_at(ArmConfig { collision: None, ..ArmConfig::rebot_dm() }, &INSPECT);
+    inner.register_live_connection(1).unwrap();
     for _ in 0..5 { inner.tick(0.02); }
     let (fx, b, _tw, _stop) = ReleaseFixture::new(inner, BOOT, Capacities { commands: 4, plans: 2, replies: 16 });
     (fx, b)
@@ -114,9 +115,21 @@ fn replay_slot(fx: &Fx, tool_digest: u64) -> PlanSlot {
     }
     let mut s = [0.0; MAX_DOF];
     s[..start.len()].copy_from_slice(&start);
+    slot.replay_approach = Some(
+        armd::replay::PreparedReplayApproach::from_endpoints(&start, &start, 0.2, None, true)
+            .unwrap(),
+    );
     slot.primitive = Primitive::Prepared {
         child: None, dof: start.len() as u8, start: s,
-        kind: PathKind::Replay { episode: EpisodeRef::new("ep1").unwrap(), speed: 1.0, gripper: false, sample_dt: 0.02, tool_digest },
+        kind: PathKind::Replay {
+            episode: EpisodeRef::new("ep1").unwrap(),
+            speed: 1.0,
+            gripper: false,
+            sample_dt: 0.02,
+            approach_duration_s: 0.2,
+            approach_power_scale: None,
+            tool_digest,
+        },
         duration_s: 1.0, power_scale: None,
     };
     slot
@@ -187,6 +200,7 @@ fn a_prepared_path_or_replay_with_stale_boot_or_overtaken_stop_is_refused() {
     use armd::rt_core::ops::CommitCtx;
 
     let mut inner = common::sim_at(ArmConfig { collision: None, ..ArmConfig::rebot_dm() }, &INSPECT);
+    inner.register_live_connection(1).unwrap();
     for _ in 0..5 { inner.tick(0.02); }
     let live_boot = BootId::fresh();
     let stale_boot = BootId::fresh();

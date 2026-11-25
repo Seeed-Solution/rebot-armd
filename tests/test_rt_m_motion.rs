@@ -277,6 +277,7 @@ fn dm_config_with_planning_load() -> ArmConfig {
 
 async fn start_scripted_executor(sup: &Arc<ArmSupervisor>, period: Duration, clock: Arc<ScriptedClock>, alloc_timing: bool) -> RtExecutorHandle {
     sup.set_lease_enabled(false).await;
+    sup.inner().write().await.register_live_connection(1).unwrap();
     let mut cfg = ExecutorConfig::for_tests(period);
     cfg.alloc_timing = alloc_timing;
     let mut hooks = PersistTestHooks::default();
@@ -905,11 +906,24 @@ async fn holding_after_clear_bounded_rearm_and_continue_park() {
             ClientId(1), 2, auth, clock.now() + Duration::from_secs(15),
             Submit::InstallPark(&|s: &mut PlanSlot| req::stage_park(s, &park.slot)),
         ).unwrap();
-        for _ in 0..1400 {
+        // Park trajectory (~3.2 s) + Opening 2.0 rad at 1.0 rad/s (~2.0 s) +
+        // Closing 4.85 rad at 1.0 rad/s (~4.85 s) + UnloadSettle (0.8 s) ~= 10.9 s (~2180 ticks).
+        for _ in 0..2600 {
             clock.run_steps(period_ns, 1);
             if knobs.disable_started.load(Ordering::Acquire) { break; }
         }
-        assert!(knobs.disable_started.load(Ordering::Acquire), "7-DOF park with gripper release did not reach disable");
+        assert!(
+            knobs.disable_started.load(Ordering::Acquire),
+            "7-DOF park with gripper release (Opening -> Closing -> UnloadSettle) did not reach disable; replies={:?}, obs={:?}",
+            drain_replies(&handle),
+            sup.hub().latest().map(|s| (s.obs.safety_state.clone(), s.obs.is_torqued, s.obs.action.clone(), s.obs.positions.clone()))
+        );
+        let pre_estop_j7 = sup.hub().latest().unwrap().obs.positions[g_idx];
+        assert!(
+            (pre_estop_j7 - gp.closed_rad).abs() < 0.05,
+            "Opening -> Closing must close J7 before disable, got j7={pre_estop_j7} (closed={})",
+            gp.closed_rad
+        );
         // Trigger E-stop AFTER first disable write while disable confirmation is in flight!
         let estop_done = Arc::new(AtomicBool::new(false));
         let estop_done_bg = estop_done.clone();

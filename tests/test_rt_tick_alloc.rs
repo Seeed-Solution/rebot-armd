@@ -434,7 +434,14 @@ fn ticks_with_a_full_retire_ring_do_not_touch_the_allocator() {
     let buf = inner.core.take_observation_buffer();
     let now = Instant::now();
     assert!(inner.core.publish_displacing(1, now, now, template.clone(), &q, &q).is_err());
-    inner.core.publish(buf, 1, now, now, &q, &q);
+    inner.core.publish(
+        buf,
+        1,
+        now,
+        now,
+        &q,
+        &q,
+    );
 }
 
 /// Like [`count_ticks`] without the reader between ticks (the hub reader is held).
@@ -757,7 +764,9 @@ fn commit_boundaries_for_path_replay_jog_and_config_do_not_allocate_or_free() {
     let stale_boot = BootId::fresh();
     assert_ne!(boot, stale_boot);
 
-    let (mut fx, mut b, _tw, stop) = ReleaseFixture::new(supervisor(false), boot, Capacities::default());
+    let mut inner = supervisor(false);
+    inner.register_live_connection(1).unwrap();
+    let (mut fx, mut b, _tw, stop) = ReleaseFixture::new(inner, boot, Capacities::default());
     let now = fx.now();
     let deadline = now + Duration::from_secs(30);
     let auth = fx.core.authority(&fx.ctx(now));
@@ -792,6 +801,16 @@ fn commit_boundaries_for_path_replay_jog_and_config_do_not_allocate_or_free() {
         q[0] += 0.05 * f;
         replay_slot.path.push(&q[..dof], k as f64).unwrap();
     }
+    replay_slot.replay_approach = Some(
+        armd::replay::PreparedReplayApproach::from_endpoints(
+            &start[..dof],
+            &start[..dof],
+            0.04,
+            None,
+            true,
+        )
+        .unwrap(),
+    );
     replay_slot.primitive = Primitive::Prepared {
         child: None,
         dof: dof as u8,
@@ -801,6 +820,8 @@ fn commit_boundaries_for_path_replay_jog_and_config_do_not_allocate_or_free() {
             speed: 1.0,
             gripper: false,
             sample_dt: 0.02,
+            approach_duration_s: 0.04,
+            approach_power_scale: None,
             tool_digest: tool,
         },
         duration_s: 0.4,
@@ -833,6 +854,8 @@ fn commit_boundaries_for_path_replay_jog_and_config_do_not_allocate_or_free() {
             speed: 1.0,
             gripper: false,
             sample_dt: 0.02,
+            approach_duration_s: 0.2,
+            approach_power_scale: None,
             tool_digest: tool ^ 1,
         },
         duration_s: 0.4,
@@ -1149,6 +1172,7 @@ fn accepted_commits_on_device_profile_with_workspace_and_power_budget_do_not_all
     warm(&mut inner, 4);
 
     let boot = BootId::fresh();
+    inner.register_live_connection(1).unwrap();
     let (mut fx, mut b, _tw, stop) = ReleaseFixture::new(inner, boot, Capacities::default());
     for _ in 0..4 { fx.step(); }
     let _ = fx.core.core.hub().latest();
@@ -1198,6 +1222,16 @@ fn accepted_commits_on_device_profile_with_workspace_and_power_budget_do_not_all
         q[0] += 0.04 * f;
         replay.path.push(&q[..dof], k as f64).unwrap();
     }
+    replay.replay_approach = Some(
+        armd::replay::PreparedReplayApproach::from_endpoints(
+            &start[..dof],
+            &start[..dof],
+            0.2,
+            None,
+            true,
+        )
+        .unwrap(),
+    );
     replay.primitive = Primitive::Prepared {
         child: None,
         dof: dof as u8,
@@ -1207,6 +1241,8 @@ fn accepted_commits_on_device_profile_with_workspace_and_power_budget_do_not_all
             speed: 1.0,
             gripper: false,
             sample_dt: 0.02,
+            approach_duration_s: 0.2,
+            approach_power_scale: None,
             tool_digest: tool,
         },
         duration_s: 0.4,
@@ -1587,6 +1623,7 @@ fn gripper_short_stall_error_and_grasp_squeeze_settle_are_zero_alloc() {
 
         let mut inner = supervisor(false);
         inner.rt_executor_owned = true;
+        inner.register_live_connection(1).unwrap();
         inner.commanded_positions[g_idx] = -2.0;
         inner.measured_positions[g_idx] = -2.0;
         inner.target_positions[g_idx] = -2.0;

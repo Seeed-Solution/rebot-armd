@@ -22,7 +22,7 @@ impl SupervisorInner {
             }
         }
         if reason != MotionLimitReason::Workspace {
-            self.workspace_violation = None;
+            self.clear_workspace_violation_rt();
         }
         self.motion_limit = Some(MotionLimit { reason, joint, since_ms: (now * 1000.0) as u64 });
         self.motion_limit_seen_s = now;
@@ -58,26 +58,70 @@ impl SupervisorInner {
         }
         if self.motion_limit.is_some() && self.now_s() - self.motion_limit_seen_s > MOTION_LIMIT_CLEAR_S {
             self.motion_limit = None;
-            self.workspace_violation = None;
+            self.clear_workspace_violation_rt();
         }
     }
 
     pub(crate) fn retire_servo_ws_min_depths(&mut self) {
-        if let Some(depths) = self.servo_ws_min_depths.take() {
-            if depths.1.is_heap() {
-                self.push_retired_stop(crate::rt_core::urgent::RetiredStopPayloads {
-                    servo_ws_min_depths: Some(depths),
-                    ..Default::default()
-                });
-            }
-        }
+        self.clear_servo_ws_min_depths_rt();
     }
 
     pub(crate) fn retire_motion_payloads(&mut self) {
         self.release_servo_target();
-        let servo_ws_min_depths = self.servo_ws_min_depths.take().filter(|d| d.1.is_heap());
+        self.clear_servo_ws_min_depths_rt();
+        let servo_ws_min_depths = None;
         let trajectory = match self.active_trajectory.take() {
-            Some(old) => self.recycle_or_keep_heap_trajectory(old),
+            Some(traj) => {
+                if self.rt_executor_owned
+                    && traj.motion_limits.is_none()
+                    && traj.then.is_none()
+                {
+                    match traj.reference {
+                        Reference::Gripper(mut b) => {
+                            if self.move_samples_spares.len() < self.move_samples_spares.capacity() {
+                                if let Some(samples) = b.take_samples_spare() {
+                                    self.recycle_move_samples_rt(samples);
+                                }
+                            }
+                            if traj.action_id.is_none()
+                                && b.is_park_release_clean()
+                                && self.park_release_spare.is_none()
+                            {
+                                self.park_release_spare = Some(b);
+                                None
+                            } else if !b.has_inner_heap_storage() && self.gripper_motion_spare.is_none() {
+                                self.gripper_motion_spare = Some(b);
+                                None
+                            } else {
+                                let rebuilt = ActiveTrajectory {
+                                    action_id: traj.action_id,
+                                    reference: Reference::Gripper(b),
+                                    then: None,
+                                    span: traj.span,
+                                    motion_limits: None,
+                                    motion_vel_caps: traj.motion_vel_caps,
+                                    motion_max_velocity: traj.motion_max_velocity,
+                                };
+                                rebuilt.has_heap_storage().then_some(rebuilt)
+                            }
+                        }
+                        reference => {
+                            let rebuilt = ActiveTrajectory {
+                                action_id: traj.action_id,
+                                reference,
+                                then: None,
+                                span: traj.span,
+                                motion_limits: None,
+                                motion_vel_caps: traj.motion_vel_caps,
+                                motion_max_velocity: traj.motion_max_velocity,
+                            };
+                            rebuilt.has_heap_storage().then_some(rebuilt)
+                        }
+                    }
+                } else {
+                    self.recycle_or_keep_heap_trajectory(traj)
+                }
+            }
             None => None,
         };
         self.clear_unload_settle();
@@ -170,6 +214,7 @@ impl SupervisorInner {
         self.pending_normal_unload = false;
         self.zero_check_persisting = None;
         self.end_gripper_stream();
+        self.j7_admitted_stamp = None;
         crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
     }
 
@@ -186,7 +231,7 @@ impl SupervisorInner {
     /// against the exact production latch path in safe Rust.
     #[doc(hidden)]
     pub fn apply_estop_latch_with_driver(&mut self, driver: Option<&std::sync::Mutex<Box<dyn ArmDriver>>>) {
-        self.e_stop_latched.store(true, Ordering::SeqCst);
+        self.estop_state.latch();
         // Immediate rigid lock at current position, latch E-Stop, advance epoch.
         // Maintain active restorative torque hold: do NOT cut power or set is_torqued=false.
         self.pending_normal_unload = false;
@@ -495,9 +540,9 @@ impl SupervisorInner {
                 self.tracking.invalidate();
                 self.replace_active_trajectory(None);
                 self.reset_gripper_stall();
-                self.commanded_velocities = vec![0.0; self.config.dof];
+                self.commanded_velocities.fill(0.0);
                 if self.driver.is_none() {
-                    self.measured_velocities = vec![0.0; self.config.dof];
+                    self.measured_velocities.fill(0.0);
                 }
                 let _ = self.safety.set_torque(false);
                 self.mit_torque_off();
@@ -527,7 +572,13 @@ impl SupervisorInner {
                         limit: self.config.max_temperature,
                     },
                 );
-                if !self.disable_pending
+                if self.rt_executor_owned {
+                    if !self.disable_pending {
+                        if let Err(code) = self.request_disable_rt() {
+                            tracing::error!(code, "Thermal shutdown not confirmed");
+                        }
+                    }
+                } else if !self.disable_pending
                     || self.last_disable_attempt.is_none_or(|t| t.elapsed() >= Duration::from_millis(250))
                 {
                     if let Err(e) = self.request_disable() { tracing::error!("Thermal shutdown not confirmed: {e}"); }
@@ -568,9 +619,12 @@ impl SupervisorInner {
         }
         let now = Instant::now();
         if let Some(ref active) = self.active_lease {
-            let is_expired = active.acquired_at.elapsed() >= self.lease_timeout;
+            let is_expired = active.generation <= self.fenced_lease_generation
+                || active.acquired_at.elapsed() >= self.lease_timeout;
             if active.client_id == conn && !is_expired {
-                return Ok((active.generation, None));
+                let gen = active.generation;
+                self.authorize_servo_stream_for_committed_lease(gen);
+                return Ok((gen, None));
             }
 
             if active.client_id != conn {
@@ -587,7 +641,9 @@ impl SupervisorInner {
         self.cancel_watchdog_park_for_new_lease(conn);
 
         #[cfg(feature = "policy-runtime")]
-        self.terminate_policy_run("LEASE_LOST", "cancelled", Some("LEASE_LOST"), Some("Control lease preempted".into()));
+        if self.policy_run.is_some() {
+            self.terminate_policy_run("LEASE_LOST", "cancelled", Some("LEASE_LOST"), Some("Control lease preempted".into()));
+        }
 
         // Four-category state categorization (strictly fail-closed, no unwrap/panic, driver lock poison returns false)
         let confirmed_hardware_disabled = match &self.driver {
@@ -604,35 +660,36 @@ impl SupervisorInner {
                 }),
         };
 
-        if confirmed_hardware_disabled
+        let old_gen = self.active_lease.as_ref().map_or(0, |a| a.generation);
+        let needs_stop = !(confirmed_hardware_disabled
             || self.safety.state().is_stopped()
-            || self.is_fully_settled_armed_hold()
-        {
-            self.handover_settling_since = None;
-        } else {
-            self.stop_motion();
+            || self.is_fully_settled_armed_hold());
+        if needs_stop {
             self.handover_settling_since = Some(now);
+        } else {
+            self.handover_settling_since = None;
+        }
+        if old_gen != 0 {
+            self.fence_displaced_lease_generation(old_gen, needs_stop);
+        } else if needs_stop {
+            self.stop_motion();
         }
 
         let evicted = self.active_lease.as_ref().filter(|a| a.client_id != conn).map(|a| (a.client_id.clone(), a.generation));
 
         self.lease_generation_counter += 1;
         let gen = self.lease_generation_counter;
-        self.active_lease = Some(ActiveLease {
-            client_id: conn.to_string(),
-            generation: gen,
-            label: label.to_string(),
-            acquired_at: now,
-            last_valid_motion_instant: None,
-        });
-        self.sync_lease_gen_mirror();
+        self.set_active_lease_in_place(0, conn, label, gen, now);
+        self.authorize_servo_stream_for_committed_lease(gen);
         self.last_heartbeat = now;
-        if evicted.is_some() {
+        if let Some((ref ev_conn, ev_gen)) = evicted {
             self.last_preemption = Some(now);
-            self.last_evicted = evicted.clone();
+            self.set_last_evicted_in_place(ev_conn, ev_gen);
         }
 
-        tracing::info!("Preempted lease for connection {} (label {}), generation {}, evicted: {:?}", conn, label, gen, evicted);
+        if !self.rt_executor_owned {
+            tracing::info!("Preempted lease for connection {} (label {}), generation {}, evicted: {:?}", conn, label, gen, evicted);
+        }
         Ok((gen, evicted))
     }
 
@@ -642,9 +699,14 @@ impl SupervisorInner {
         }
         let now = Instant::now();
         if let Some(ref active) = self.active_lease {
-            let is_expired = active.acquired_at.elapsed() >= self.lease_timeout;
+            let is_expired = active.generation <= self.fenced_lease_generation
+                || active.acquired_at.elapsed() >= self.lease_timeout;
             if !is_expired {
-                if active.client_id == client_id { return Ok(active.generation); }
+                if active.client_id == client_id {
+                    let gen = active.generation;
+                    self.authorize_servo_stream_for_committed_lease(gen);
+                    return Ok(gen);
+                }
                 return Err((active.client_id.clone(), active.generation));
             }
         }
@@ -652,24 +714,22 @@ impl SupervisorInner {
         // nor a watchdog park started after the previous lease was released.
         self.cancel_watchdog_park_for_new_lease(client_id);
         #[cfg(feature = "policy-runtime")]
-        self.terminate_policy_run("LEASE_LOST", "cancelled", Some("LEASE_LOST"), Some("Control lease acquired by new controller".into()));
-        if self.active_lease.is_some() { self.stop_motion(); }
+        if self.policy_run.is_some() {
+            self.terminate_policy_run("LEASE_LOST", "cancelled", Some("LEASE_LOST"), Some("Control lease acquired by new controller".into()));
+        }
+        if let Some(old_gen) = self.active_lease.as_ref().map(|a| a.generation) {
+            self.fence_displaced_lease_generation(old_gen, true);
+        }
         self.lease_generation_counter += 1;
         let gen = self.lease_generation_counter;
-        self.active_lease = Some(ActiveLease {
-            client_id: client_id.to_string(),
-            generation: gen,
-            label: String::new(),
-            acquired_at: now,
-            last_valid_motion_instant: None,
-        });
-        self.sync_lease_gen_mirror();
+        self.set_active_lease_in_place(0, client_id, "", gen, now);
+        self.authorize_servo_stream_for_committed_lease(gen);
         Ok(gen)
     }
 
     /// A new lease owner takes over from a running watchdog park: the park's
     /// motion is cancelled like any other queued motion and the arm brakes to a hold.
-    pub(super) fn cancel_watchdog_park_for_new_lease(&mut self, client_id: &str) {
+    pub(crate) fn cancel_watchdog_park_for_new_lease(&mut self, client_id: &str) {
         let had_pending = self.watchdog_park_pending.take().is_some();
         if self.watchdog_park.take().is_some() && (self.pending_normal_unload || had_pending) {
             if !self.rt_executor_owned {
@@ -707,6 +767,22 @@ impl SupervisorInner {
     /// [`WATCHDOG_PARK_SETTLE_GRACE`]; otherwise torque is held and WatchdogTimeout latched.
     pub(super) fn supervise_watchdog_park(&mut self, dt: f64) {
         let Some(mut park) = self.watchdog_park.take() else { return; };
+        if let Some(held) = self.core.config().held() {
+            let msg = if held.state == crate::rt_core::config_iface::HoldState::Reconciling {
+                "configuration reconciliation active"
+            } else {
+                "configuration hold active"
+            };
+            let reason = crate::safety::BoundedText::new(msg);
+            self.watchdog_park_pending = None;
+            self.watchdog_park_blocked_reason = Some(crate::model::HolderLabel::new(msg));
+            self.safety.log_watchdog_park_blocked(reason);
+            self.stop_motion();
+            if self.is_torqued {
+                self.latch_watchdog_fault();
+            }
+            return;
+        }
         if !self.pending_normal_unload && self.watchdog_park_pending.is_none() {
             if !self.rt_executor_owned {
                 tracing::warn!("Watchdog park interrupted (safety state {:?})", self.safety.state());
@@ -780,6 +856,14 @@ impl SupervisorInner {
     /// watchdog expires. Returns the reason the park is not allowed, or `None` when it is.
     pub(super) fn watchdog_park_blocker_bounded(&self) -> Option<crate::safety::BoundedText<160>> {
         use crate::safety::BoundedText;
+        if let Some(held) = self.core.config().held() {
+            let msg = if held.state == crate::rt_core::config_iface::HoldState::Reconciling {
+                "configuration reconciliation active"
+            } else {
+                "configuration hold active"
+            };
+            return Some(BoundedText::new(msg));
+        }
         let Some(policy) = &self.config.resting_pose else {
             return Some(BoundedText::new("no resting pose configured"));
         };
@@ -882,11 +966,14 @@ impl SupervisorInner {
         }
         if let Some(ref active) = self.active_lease {
             if active.client_id == client_id && active.generation == generation {
-                let valid = active.acquired_at.elapsed() < self.lease_timeout;
-                self.active_lease = None;
-                self.sync_lease_gen_mirror();
+                let valid = active.generation > self.fenced_lease_generation
+                    && active.acquired_at.elapsed() < self.lease_timeout;
+                let displaced = self.clear_active_lease_in_place().unwrap_or(generation);
+                self.fence_displaced_lease_generation(displaced, false);
                 #[cfg(feature = "policy-runtime")]
-                self.terminate_policy_run("LEASE_LOST", "cancelled", Some("LEASE_LOST"), Some("Control lease released".into()));
+                if self.policy_run.is_some() {
+                    self.terminate_policy_run("LEASE_LOST", "cancelled", Some("LEASE_LOST"), Some("Control lease released".into()));
+                }
                 return valid;
             }
         }
@@ -962,7 +1049,13 @@ impl SupervisorInner {
 
     /// [`Self::lease_holder`] without the copy.
     pub fn lease_holder_str(&self) -> Option<&str> {
-        self.active_lease.as_ref().filter(|a| a.acquired_at.elapsed() < self.lease_timeout).map(|a| a.label.as_str())
+        self.active_lease
+            .as_ref()
+            .filter(|a| {
+                a.generation > self.fenced_lease_generation
+                    && a.acquired_at.elapsed() < self.lease_timeout
+            })
+            .map(|a| a.label.as_str())
     }
 
     /// Why `client_id` no longer holds `generation`: "preempted" when a forced acquire
@@ -976,7 +1069,8 @@ impl SupervisorInner {
 
     pub fn is_lease_active(&self) -> bool {
         if let Some(ref active) = self.active_lease {
-            active.acquired_at.elapsed() < self.lease_timeout
+            active.generation > self.fenced_lease_generation
+                && active.acquired_at.elapsed() < self.lease_timeout
         } else {
             false
         }
@@ -993,10 +1087,13 @@ impl SupervisorInner {
             });
         }
         if let Some(ref mut active) = self.active_lease {
-            if active.client_id == client_id && active.acquired_at.elapsed() < self.lease_timeout {
+            if active.client_id == client_id
+                && active.generation > self.fenced_lease_generation
+                && active.acquired_at.elapsed() < self.lease_timeout
+            {
                 active.acquired_at = Instant::now();
                 self.last_heartbeat = Instant::now();
-            } else {
+            } else if !self.rt_executor_owned {
                 tracing::debug!(
                     "Heartbeat ignored from non-lease owner '{}' (lease owner is '{}')",
                     client_id, active.client_id
@@ -1181,6 +1278,9 @@ impl SupervisorInner {
         if self.disable_pending || self.torque_transition.is_some() || self.park_continuation.is_some() {
             return Err(MotionError::MotionBusy("a torque transition or park is pending".into()).into());
         }
+        if self.macro_run.as_ref().is_some_and(|m| m.finishing) {
+            return Err(MotionError::MotionBusy("macro finishing hold pending bus acceptance".into()).into());
+        }
         self.pending_normal_unload = false;
 
         // 1. Validate command against single controller authority, safety state, and soft limits
@@ -1189,6 +1289,13 @@ impl SupervisorInner {
             &target_positions,
             &self.config.limits,
         )?;
+        if self.config.gripper_index().is_some_and(|g| {
+            target_positions.len() > g
+                && self.commanded_positions.len() > g
+                && (target_positions[g] - self.commanded_positions[g]).abs() > 1e-4
+        }) {
+            self.check_pos_force_gripper_fresh()?;
+        }
         self.torque_hold_filter(&mut target_positions);
         self.power_hold_filter(&mut target_positions);
 
@@ -1265,26 +1372,53 @@ impl SupervisorInner {
     }
 
     /// Why the workspace rule may not change now: a motion, macro, stream or park is
+    /// running (each was checked against the current rule). Zero-allocation static variant.
+    pub(crate) fn workspace_change_blocker_static(&self) -> Option<&'static str> {
+        if self.macro_run.is_some() { return Some("a macro action is running"); }
+        if self.pending_normal_unload || self.park_continuation.is_some() || self.park_disable_in_flight() {
+            return Some("a park is running");
+        }
+        self.busy_reason_static()
+    }
+
+    pub(crate) fn busy_reason_static(&self) -> Option<&'static str> {
+        if self.macro_run.as_ref().is_some_and(|m| m.finishing) {
+            return Some("macro finishing hold pending bus acceptance");
+        }
+        if self.calibration_busy { return Some("a calibration apply is running"); }
+        if self.zero_check_persisting.is_some() { return Some("gripper calibration is being persisted"); }
+        #[cfg(feature = "policy-runtime")]
+        if self.policy_loading { return Some("a policy is loading"); }
+        #[cfg(feature = "policy-runtime")]
+        if self.policy_run.is_some() { return Some("a policy run is active"); }
+        if self.active_trajectory.is_some() { return Some("a trajectory is running"); }
+        if self.servo_target.is_some() { return Some("servo streaming is active"); }
+        if self.commanded_velocities.iter().any(|v| v.abs() >= 1e-3) { return Some("the arm is still moving"); }
+        None
+    }
+
+    /// Why the workspace rule may not change now: a motion, macro, stream or park is
     /// running (each was checked against the current rule).
     pub fn workspace_change_blocker(&self) -> Option<String> {
-        if self.macro_run.is_some() { return Some("a macro action is running".into()); }
-        if self.pending_normal_unload || self.park_continuation.is_some() || self.park_disable_in_flight() {
-            return Some("a park is running".into());
+        self.workspace_change_blocker_static().map(String::from)
+    }
+
+    /// Zero-allocation predicate equivalent to `self.busy_reason().is_some()`.
+    pub(crate) fn has_busy_reason(&self) -> bool {
+        if self.calibration_busy || self.zero_check_persisting.is_some() {
+            return true;
         }
-        self.busy_reason()
+        #[cfg(feature = "policy-runtime")]
+        if self.policy_loading || self.policy_run.is_some() {
+            return true;
+        }
+        self.active_trajectory.is_some()
+            || self.servo_target.is_some()
+            || self.commanded_velocities.iter().any(|v| v.abs() >= 1e-3)
     }
 
     pub(super) fn busy_reason(&self) -> Option<String> {
-        if self.calibration_busy { return Some("a calibration apply is running".into()); }
-        if self.zero_check_persisting.is_some() { return Some("gripper calibration is being persisted".into()); }
-        #[cfg(feature = "policy-runtime")]
-        if self.policy_loading { return Some("a policy is loading".into()); }
-        #[cfg(feature = "policy-runtime")]
-        if self.policy_run.is_some() { return Some("a policy run is active".into()); }
-        if self.active_trajectory.is_some() { return Some("a trajectory is running".into()); }
-        if self.servo_target.is_some() { return Some("servo streaming is active".into()); }
-        if self.commanded_velocities.iter().any(|v| v.abs() >= 1e-3) { return Some("the arm is still moving".into()); }
-        None
+        self.busy_reason_static().map(String::from)
     }
 
     /// Snapshot for planning a Cartesian action outside the lock (default [`crate::motion::GoalFrame::EndLink`]).
@@ -1380,7 +1514,8 @@ impl SupervisorInner {
         }
         if self.collision.hold.is_some() { return Err("COLLISION_HOLD"); }
         if self.core.motion_inhibited_by_config() { return Err("CONFIG_BUSY"); }
-        if self.mit_motion_blocker().is_some() { return Err("PLAN_STALE"); }
+        if self.macro_run.as_ref().is_some_and(|m| m.finishing) { return Err("MOTION_BUSY"); }
+        if self.mit_motion_blocked() { return Err("PLAN_STALE"); }
         if self.calibration_busy
             || self.zero_check_persisting.is_some()
             || self.active_trajectory.is_some()

@@ -111,8 +111,10 @@ impl SimCamera {
 
 impl SimCamera {
     /// One frame through the measured pose.
-    async fn frame_now(&self) -> DetectionFrame {
-        tokio::time::sleep(Duration::from_millis(15)).await;
+    async fn frame_now(&self, pace_ms: u64) -> DetectionFrame {
+        if pace_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(pace_ms)).await;
+        }
         let captured = Instant::now();
         let q = self.sup.inner().read().await.measured_positions.clone();
         let pose = ARM.fk(&kinematics::q6(&q));
@@ -257,7 +259,7 @@ impl DetectionSource for SimCamera {
                 tokio::time::sleep(Duration::from_millis(wait_ms)).await;
                 return Ok(None);
             }
-            Ok(Some(self.frame_now().await))
+            Ok(Some(self.frame_now(5).await))
         })
     }
     fn per_request_pipelines(&self) -> BoxFuture<'_, Result<bool, String>> {
@@ -323,7 +325,7 @@ impl DetectionSource for SimCamera {
                 return Err("detector returned 409 Conflict yolo unavailable".into());
             }
             // runs whatever the global mode is: no continuous inference needed
-            Ok(Some(self.frame_now().await))
+            Ok(Some(self.frame_now(0).await))
         })
     }
 }
@@ -342,7 +344,13 @@ impl Truth {
     }
 }
 
-struct Rig { sup: Arc<ArmSupervisor>, sim: Arc<SimCamera>, object: Vec3, hold: Arc<AtomicBool> }
+struct Rig { sup: Arc<ArmSupervisor>, sim: Arc<SimCamera>, object: Vec3, hold: Arc<AtomicBool>, ticker: tokio::task::JoinHandle<()> }
+
+impl Drop for Rig {
+    fn drop(&mut self) {
+        self.ticker.abort();
+    }
+}
 
 fn look_down_start(tilt_from_vertical_deg: f64, z: f64) -> ([f32; 7], Pose) {
     let r0 = grasp::look_down(&ARM.fk(&INSPECT).r);
@@ -427,23 +435,39 @@ async fn rig_driven(setup: GraspSetup, truth: Truth, mount_rot_deg: f32, start: 
         models: Mutex::new(None), set_models_calls: Mutex::new(Vec::new()), set_models_reply: Mutex::new(None), frame_generation: Mutex::new(None),
     });
     let hold = Arc::new(AtomicBool::new(true));
-    let (ticker, hold_t) = (sup.clone(), hold.clone());
-    tokio::spawn(async move {
+    let (ticker_sup, hold_t) = (sup.clone(), hold.clone());
+    let ticker = tokio::spawn(async move {
+        let step_one = |ticker_sup: &Arc<ArmSupervisor>, hold_t: &Arc<AtomicBool>| {
+            let ticker_sup = ticker_sup.clone();
+            let hold_t = hold_t.clone();
+            async move {
+                ticker_sup.tick(DT).await;
+                if hold_t.load(Ordering::SeqCst) {
+                    // the jaws stop on the object while closing
+                    let mut inner = ticker_sup.inner().write().await;
+                    if inner.commanded_positions[6] > OBJECT_J7 && inner.measured_positions[6] >= OBJECT_J7 - 0.3 {
+                        inner.measured_positions[6] = OBJECT_J7;
+                        inner.measured_velocities[6] = 0.0;
+                        inner.torques[6] = 0.3;
+                    } else { inner.torques[6] = 0.0; }
+                }
+            }
+        };
         loop {
-            tokio::time::sleep(Duration::from_millis(2)).await;
-            ticker.tick(DT).await;
-            if hold_t.load(Ordering::SeqCst) {
-                // the jaws stop on the object while closing
-                let mut inner = ticker.inner().write().await;
-                if inner.commanded_positions[6] > OBJECT_J7 && inner.measured_positions[6] >= OBJECT_J7 - 0.3 {
-                    inner.measured_positions[6] = OBJECT_J7;
-                    inner.measured_velocities[6] = 0.0;
-                    inner.torques[6] = 0.3;
-                } else { inner.torques[6] = 0.0; }
+            let moving = ticker_sup.inner().read().await.active_trajectory.is_some();
+            if moving {
+                for _ in 0..2 {
+                    step_one(&ticker_sup, &hold_t).await;
+                    if ticker_sup.inner().read().await.active_trajectory.is_none() { break; }
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            } else {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                step_one(&ticker_sup, &hold_t).await;
             }
         }
     });
-    Rig { sup, sim, object, hold }
+    Rig { sup, sim, object, hold, ticker }
 }
 
 /// The grip pixel the user would record: the object's box centre with the object under the
@@ -474,7 +498,7 @@ async fn wait_done(sup: &ArmSupervisor, id: u64, max_s: f64, mut each: impl FnMu
             each(&a);
             if !a.is_running() { return a; }
         } else if let Some(p) = obs.previous_action.filter(|p| p.id == id) { return p; }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
 }
 
@@ -489,7 +513,7 @@ async fn wait_phase(sup: &ArmSupervisor, id: u64, phase: &str, needs_motion: Opt
             if a.id == id && a.phase.as_deref() == Some(phase) && needs_motion.is_none_or(|m| m == moving) { return; }
             assert!(a.is_running(), "grasp ended before {phase}: {a:?}");
         }
-        tokio::time::sleep(Duration::from_millis(2)).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
 }
 
@@ -756,15 +780,19 @@ async fn ws_rig_on(rig: Rig, setup_path: Option<std::path::PathBuf>) -> WsRig {
 
 async fn heartbeat_until_done(w: &mut WsRig, id: u64, max_s: f64) -> Value {
     let deadline = Instant::now() + Duration::from_secs_f64(max_s);
+    let mut last_hb = Instant::now() - Duration::from_secs(1);
     loop {
         assert!(Instant::now() < deadline, "grasp not finished");
-        common::send(&mut w.ws, json!({"type":"heartbeat", "generation":w.generation, "epoch_id":w.epoch})).await;
-        common::drain(&mut w.ws, 5).await;
+        if last_hb.elapsed() > Duration::from_millis(200) {
+            common::send(&mut w.ws, json!({"type":"heartbeat", "generation":w.generation, "epoch_id":w.epoch})).await;
+            common::drain(&mut w.ws, 5).await;
+            last_hb = Instant::now();
+        }
         let obs = w.rig.sup.get_observation().await;
         for a in [obs.action, obs.previous_action].into_iter().flatten() {
             if a.id == id && !a.is_running() { return serde_json::to_value(a).unwrap(); }
         }
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        tokio::time::sleep(Duration::from_millis(2)).await;
     }
 }
 
@@ -2124,10 +2152,10 @@ async fn orchestrator_test_pre_open_j7_before_descend() {
     assert!(held_w > 0.02 && held_w < 0.06, "held_width_m {held_w} within object bounds");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pre_open_skip_conditions() {
     // 1. PreOpen::Auto without calibration skips with "skipped:uncalibrated"
-    {
+    let c1 = async {
         let setup_auto = GraspSetup {
             pre_open: armd::grasp::PreOpen::Auto,
             ..GraspSetup::default()
@@ -2142,10 +2170,10 @@ async fn pre_open_skip_conditions() {
         let (id, _) = grasp::start(&r.sup, r.sup.capture_admission_stamp(), r.sim.clone(), &tap(&r).await).await.expect("grasp accepted");
         let a = wait_done(&r.sup, id, 30.0, |_| {}).await;
         assert_eq!(a.pre_open.as_deref(), Some("skipped:uncalibrated"));
-    }
+    };
 
     // 2. PreOpen::Off records "off"
-    {
+    let c2 = async {
         let setup_off = GraspSetup {
             pre_open: armd::grasp::PreOpen::Off,
             ..GraspSetup::default()
@@ -2160,11 +2188,11 @@ async fn pre_open_skip_conditions() {
         let (id, _) = grasp::start(&r.sup, r.sup.capture_admission_stamp(), r.sim.clone(), &tap(&r).await).await.expect("grasp accepted");
         let a = wait_done(&r.sup, id, 30.0, |_| {}).await;
         assert_eq!(a.pre_open.as_deref(), Some("off"));
-    }
+    };
 
     // 3. PreOpen::On with width reaching/exceeding open_rad skips with "skipped:open_rad"
     // At approach height 0.15 m, fx 600, 310 px -> ~0.077 m + 0.015 margin = 0.092 m >= 0.085 m (open_rad)
-    {
+    let c3 = async {
         let setup_wide = GraspSetup {
             pre_open: armd::grasp::PreOpen::On,
             pre_open_margin_m: 0.015,
@@ -2181,10 +2209,10 @@ async fn pre_open_skip_conditions() {
         let (id, _) = grasp::start(&r.sup, r.sup.capture_admission_stamp(), r.sim.clone(), &tap(&r).await).await.expect("grasp accepted");
         let a = wait_done(&r.sup, id, 30.0, |_| {}).await;
         assert_eq!(a.pre_open.as_deref(), Some("skipped:open_rad"));
-    }
+    };
 
     // 4. No width reported -> "skipped:no_width"
-    {
+    let c4 = async {
         let setup_nowidth = GraspSetup {
             pre_open: armd::grasp::PreOpen::On,
             ..GraspSetup::default()
@@ -2199,7 +2227,9 @@ async fn pre_open_skip_conditions() {
         let (id, _) = grasp::start(&r.sup, r.sup.capture_admission_stamp(), r.sim.clone(), &tap(&r).await).await.expect("grasp accepted");
         let a = wait_done(&r.sup, id, 30.0, |_| {}).await;
         assert_eq!(a.pre_open.as_deref(), Some("skipped:no_width"));
-    }
+    };
+
+    tokio::join!(c1, c2, c3, c4);
 }
 
 #[tokio::test]
@@ -2837,30 +2867,41 @@ fn entries(e: &[EstimateEntry]) -> Vec<(&str, bool, bool, Option<&str>)> {
     e.iter().map(|e| (e.source.as_str(), e.used, e.record_only, e.reason.as_deref())).collect()
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn yaw_and_width_estimates_follow_the_source_order() {
+    let base = GraspSetup { camera_tilt_deg: 0.0, height_sources: DEPTH_DECIDES.to_vec(), ..GraspSetup::default() };
     // default: the mask width decides; the depth yaw is recorded (the mock reports no depth angle)
-    let setup = GraspSetup { camera_tilt_deg: 0.0, height_sources: DEPTH_DECIDES.to_vec(), ..GraspSetup::default() };
-    let rig = depth_estimates_rig(setup.clone(), false, false).await;
-    let (id, _) = grasp::start(&rig.sup, rig.sup.capture_admission_stamp(), rig.sim.clone(), &tap(&rig).await).await.expect("grasp accepted");
-    let a = wait_done(&rig.sup, id, 30.0, |_| {}).await;
-    println!("default: {} align {:?} yaw {:?} width {:?} grasp_width_m {:?}", a.state, a.align, a.yaw_estimates, a.width_estimates, a.grasp_width_m);
-    assert_eq!((a.state.as_str(), a.holding), ("done", Some(true)), "{a:?}");
-    assert_eq!(entries(&a.width_estimates), [("mask", true, false, None)]);
-    assert_eq!(a.width_estimates[0].value, a.grasp_width_m);
-    assert_eq!(entries(&a.yaw_estimates)[0], ("depth", false, true, Some("no_angle")));
-    let mask_w = f64::from(a.grasp_width_m.unwrap());
+    let default_case = {
+        let setup = base.clone();
+        async move {
+            let rig = depth_estimates_rig(setup, false, false).await;
+            let (id, _) = grasp::start(&rig.sup, rig.sup.capture_admission_stamp(), rig.sim.clone(), &tap(&rig).await).await.expect("grasp accepted");
+            let a = wait_done(&rig.sup, id, 30.0, |_| {}).await;
+            println!("default: {} align {:?} yaw {:?} width {:?} grasp_width_m {:?}", a.state, a.align, a.yaw_estimates, a.width_estimates, a.grasp_width_m);
+            assert_eq!((a.state.as_str(), a.holding), ("done", Some(true)), "{a:?}");
+            assert_eq!(entries(&a.width_estimates), [("mask", true, false, None)]);
+            assert_eq!(a.width_estimates[0].value, a.grasp_width_m);
+            assert_eq!(entries(&a.yaw_estimates)[0], ("depth", false, true, Some("no_angle")));
+            f64::from(a.grasp_width_m.unwrap())
+        }
+    };
 
     // width_sources [depth], width_record [mask]: the depth measurement's width decides (the detector's width
     // at the measured depth); the mask width is recorded
-    let setup = GraspSetup { width_sources: vec![grasp::WidthSource::Depth], width_record: vec![grasp::WidthSource::Mask], ..setup };
-    let rig = depth_estimates_rig(setup, false, false).await;
-    let (id, _) = grasp::start(&rig.sup, rig.sup.capture_admission_stamp(), rig.sim.clone(), &tap(&rig).await).await.expect("grasp accepted");
-    let a = wait_done(&rig.sup, id, 30.0, |_| {}).await;
-    println!("depth first: {} width {:?} grasp_width_m {:?}", a.state, a.width_estimates, a.grasp_width_m);
-    assert_eq!((a.state.as_str(), a.holding), ("done", Some(true)), "{a:?}");
-    assert_eq!(entries(&a.width_estimates), [("mask", false, true, None), ("depth", true, false, None)]);
-    let depth_w = f64::from(a.grasp_width_m.unwrap());
+    let depth_case = {
+        let setup = GraspSetup { width_sources: vec![grasp::WidthSource::Depth], width_record: vec![grasp::WidthSource::Mask], ..base };
+        async move {
+            let rig = depth_estimates_rig(setup, false, false).await;
+            let (id, _) = grasp::start(&rig.sup, rig.sup.capture_admission_stamp(), rig.sim.clone(), &tap(&rig).await).await.expect("grasp accepted");
+            let a = wait_done(&rig.sup, id, 30.0, |_| {}).await;
+            println!("depth first: {} width {:?} grasp_width_m {:?}", a.state, a.width_estimates, a.grasp_width_m);
+            assert_eq!((a.state.as_str(), a.holding), ("done", Some(true)), "{a:?}");
+            assert_eq!(entries(&a.width_estimates), [("mask", false, true, None), ("depth", true, false, None)]);
+            f64::from(a.grasp_width_m.unwrap())
+        }
+    };
+
+    let (mask_w, depth_w) = tokio::join!(default_case, depth_case);
     assert!((depth_w - mask_w).abs() < 0.01, "depth width {depth_w} vs mask width {mask_w}");
 }
 
@@ -3172,7 +3213,7 @@ async fn models_rig() -> WsRig {
     w
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn task_models_switch_before_the_grasp_once() {
     let mut w = models_rig().await;
     let mut body = tap(&w.rig).await;

@@ -294,7 +294,7 @@ pub enum MotionInstallError {
     UnsupportedUnload, ConfigBusy, MotionBusy, CollisionHold, HandoverSettling,
     EStopActive, FaultActive, NotArmed, WrongTarget, DeadlineExpired,
     EpochMismatch, LeaseLost, Stopped, StampReused, TerminalsBusy,
-    FeedbackStale, StartDrifted, PlanStale, SoftLimitExceeded, ContinuationMismatch, EnableFailed,
+    FeedbackStale, J7FeedbackStale, StartDrifted, PlanStale, SoftLimitExceeded, ContinuationMismatch, EnableFailed,
 }
 
 impl MotionInstallError {
@@ -318,6 +318,7 @@ impl MotionInstallError {
             Self::StampReused => "STAMP_REUSED",
             Self::TerminalsBusy => "TERMINALS_BUSY",
             Self::FeedbackStale => "FEEDBACK_STALE",
+            Self::J7FeedbackStale => "J7_FEEDBACK_STALE",
             Self::StartDrifted | Self::PlanStale | Self::ContinuationMismatch => "PLAN_STALE",
             Self::SoftLimitExceeded => "JOINT_LIMIT",
             Self::EnableFailed => "ENABLE_FAILED",
@@ -349,6 +350,11 @@ impl MotionInstallError {
             Self::StampReused => SafetyError::StampAlreadyConsumed.into(),
             Self::TerminalsBusy => SafetyError::TerminalsBusy.into(),
             Self::FeedbackStale => rej("FEEDBACK_STALE", "Hardware feedback is stale or invalid"),
+            Self::J7FeedbackStale => ArmError::RejectedStatic {
+                status: 409,
+                code: "J7_FEEDBACK_STALE",
+                message: "Gripper (J7) position-force feedback is stale (> 100 ms); new gripper targets are refused until fresh feedback returns",
+            },
             Self::StartDrifted | Self::PlanStale | Self::ContinuationMismatch => MotionError::PlanStale("arm state or motion configuration changed while planning".into()).into(),
             Self::SoftLimitExceeded => MotionError::InvalidCommand("target position exceeds joint soft limits".into()).into(),
             Self::EnableFailed => SafetyError::ClearFaultRejected("Park rearm enable failed".into()).into(),
@@ -650,14 +656,20 @@ pub fn verify_motion_authority(inner: &SupervisorInner, kind: MotionKind, speed_
     check_common_blockers(inner)?;
     if kind != MotionKind::Park {
         if inner.park_continuation.is_some() || inner.mit.park_after_hand_back || inner.mit.revoke_pending
-            || (inner.is_torqued && !crate::mit::mit_joints(&inner.config).is_empty() && !inner.mit_active())
+            || (inner.is_torqued && crate::mit::mit_joint_mask(&inner.config) != 0 && !inner.mit_active())
         { return Err(MotionInstallError::MotionBusy); }
         #[cfg(feature = "policy-runtime")]
         if inner.policy_loading || inner.policy_run.is_some() { return Err(MotionInstallError::MotionBusy); }
     } else if !inner.supports_automatic_unload() {
         return Err(MotionInstallError::UnsupportedUnload);
     }
-    if inner.disable_pending || inner.torque_transition.is_some() || inner.park_continuation.is_some() || inner.mit.park_after_hand_back || inner.watchdog_park_pending.is_some() {
+    if inner.disable_pending
+        || inner.torque_transition.is_some()
+        || inner.park_continuation.is_some()
+        || inner.mit.park_after_hand_back
+        || inner.watchdog_park_pending.is_some()
+        || inner.macro_run.as_ref().is_some_and(|m| m.finishing)
+    {
         return Err(MotionInstallError::MotionBusy);
     }
     if expected_epoch.is_some_and(|ep| ep != inner.safety.epoch_id()) { return Err(MotionInstallError::EpochMismatch); }
@@ -679,6 +691,13 @@ pub fn verify_motion_authority(inner: &SupervisorInner, kind: MotionKind, speed_
         for (&val, lim) in target.iter().zip(&inner.config.limits) {
             if !val.is_finite() { return Err(MotionInstallError::InvalidCommand); }
             if val < lim.min_position || val > lim.max_position { return Err(MotionInstallError::SoftLimitExceeded); }
+        }
+        if inner.config.gripper_index().is_some_and(|g| {
+            target.len() > g
+                && inner.commanded_positions.len() > g
+                && (target[g] - inner.commanded_positions[g]).abs() > 1e-4
+        }) {
+            inner.check_pos_force_gripper_fresh_static().map_err(|_| MotionInstallError::J7FeedbackStale)?;
         }
     }
     Ok(())
@@ -719,14 +738,31 @@ pub fn verify_motion_freshness(inner: &SupervisorInner, slot: &PreparedMotionSlo
     };
     let clamp = slot.kind == MotionKind::Park;
     if inner.commanded_positions.len() != dof || inner.commanded_velocities.len() != dof { return Err(MotionInstallError::StartDrifted); }
+    let mut eff_pos = [0.0f32; MAX_DOF];
+    let (eff_dof, quiesce_macro_gripper) = if !clamp && dof <= MAX_DOF {
+        inner.post_quiesce_commanded_positions(&mut eff_pos)
+    } else {
+        (0, false)
+    };
+    let gripper_idx = inner.config.gripper_index();
     for i in 0..dof {
-        let cur = if clamp {
-            inner.config.limits.get(i).map_or(inner.commanded_positions[i], |l| inner.commanded_positions[i].clamp(l.min_position, l.max_position))
+        let raw_cur = if !clamp && i < eff_dof {
+            eff_pos[i]
         } else {
             inner.commanded_positions[i]
         };
+        let cur = if clamp {
+            inner.config.limits.get(i).map_or(raw_cur, |l| raw_cur.clamp(l.min_position, l.max_position))
+        } else {
+            raw_cur
+        };
+        let cur_vel = if quiesce_macro_gripper && gripper_idx == Some(i) {
+            0.0
+        } else {
+            inner.commanded_velocities[i]
+        };
         if (cur - slot.start[i]).abs() >= crate::rt_core::ops::START_TOLERANCE
-            || (inner.commanded_velocities[i] - slot.v0[i]).abs() > EXACT_START_TOL
+            || (cur_vel - slot.v0[i]).abs() > EXACT_START_TOL
         {
             return Err(MotionInstallError::StartDrifted);
         }
@@ -751,8 +787,18 @@ fn commit_quintic_slot(
     verify_motion_authority(inner, slot.kind, slot.speed_scale_opt(), &slot.target[..dof], expected_epoch, require_fresh_feedback)?;
     let (torque_clamped, power_clamped) = verify_motion_freshness(inner, slot)?;
     inner.preflight_admission(stamp).map_err(map_admission_err)?;
+    let mut eff_pos = [0.0f32; MAX_DOF];
+    let (_, quiesce_macro_gripper) = if dof <= MAX_DOF {
+        inner.post_quiesce_commanded_positions(&mut eff_pos)
+    } else {
+        (0, false)
+    };
 
     let (this, _proof) = inner.check_admission(stamp).map_err(map_admission_err)?.consume().map_err(map_admission_err)?;
+    if quiesce_macro_gripper {
+        this.hold_gripper_at_measured();
+        this.releasing = false;
+    }
     this.pending_normal_unload = false;
     this.commit_hold_filter_notes(torque_clamped, power_clamped);
     let target = &slot.target[..dof];
@@ -999,7 +1045,7 @@ fn install_park_trajectory(this: &mut SupervisorInner, mode: ParkActionMode, slo
     this.servo_settled_ticks.fill(0);
     this.retire_servo_ws_min_depths();
     this.servo_stream_active = false;
-    let _ = this.safety.set_torque(true);
+    let _ = this.safety.set_torque_rt(true);
     let _ = this.safety.mark_motion_started();
     this.unload_planned_duration = Some(slot.duration);
     let action_id = match mode {
@@ -1041,7 +1087,13 @@ pub fn stage_park_continuation(slot: &mut PlanSlot, action_id: u64, prepared: &P
 fn commit_broker(inner: &mut SupervisorInner, d: &Descriptor, ctx: &CommitCtx, f: impl FnOnce(&mut SupervisorInner, AdmissionStamp, u64) -> Result<MotionInstalled, MotionInstallError>) -> Result<Committed, &'static str> {
     inner.check_commit_for_motion(d, ctx)?;
     inner.sync_stop_generation(ctx.stop_generation);
-    let stamp = AdmissionStamp::from_broker(d.stamp.authority.stop_generation, d.stamp.authority.epoch, d.stamp.authority.lease_generation, d.stamp.request.0);
+    let stamp = AdmissionStamp::from_broker_conn(
+        d.stamp.authority.stop_generation,
+        d.stamp.authority.epoch,
+        d.stamp.authority.lease_generation,
+        d.stamp.client.0,
+        d.stamp.request.0,
+    );
     let installed = f(inner, stamp, d.stamp.authority.epoch).map_err(MotionInstallError::code)?;
     Ok(Committed::authorized(d, Some(ActionId(installed.action_id()))))
 }

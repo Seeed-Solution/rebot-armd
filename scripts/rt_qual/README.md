@@ -18,7 +18,22 @@ Harness for the Stage 3 §6 qualification gate on the SG2002 reCamera arm (`armd
 4. **Allocation gate**: zero allocations/frees in release body (requires authoritative run-scoped `control_thread_alloc_ops` delta `== 0` under `ARMD_ALLOC_TIMING=1` for `PASS`; peak-sample breakdown `lock_alloc_calls` alone is treated as a proxy with an explicit `INCOMPLETE` gap, and absent/malformed breakdowns never default to `0`).
 5. **MIT watchdog budget**: `20 ms + worst additional scheduling/RX/TX latency + 5 ms < 45 ms` (uses the maximum of windowed `wake_lateness_us.max`, any same-instance in-run `wake_late_max_ever` increase, and active `since_marker.wake_late_max`; marks `INCOMPLETE` if `diag_dropped > 0` or if a pre-run `wake_late_max_ever` high-water mark could mask an in-run wake peak across a `> 1000`-tick sample gap without an active `since_marker`).
 6. **Zero faults**: no arm fault or E-stop during the run (`load.py` halts on fault and never clears faults).
-7. **Cold-start verification**: repeat across cold starts and verify single-core `PREEMPT` / `HZ 250`, thread priorities (`armd-control` `SCHED_FIFO`, IRQ/SPI thread priorities), and `mlockall` (`memory_locked: true`, `VmLck > 0`).
+7. **Cold-start verification**: repeat across cold starts and verify single-core `PREEMPT` / `HZ 250`, thread priorities (`armd-control` `SCHED_FIFO 79`, `spi0` / SPI-CAN IRQ threads `SCHED_FIFO 80`, unpinned `cvitask_*` and `rebot-vision` RT threads at `70`, pinned `cvitask_*` untouched at `85`/`90`), and `mlockall` (`memory_locked: true`, `VmLck > 0`).
+
+## SG2002 RT Priority Layout
+
+The vendor SG2002 kernel (`linux_5.10/kernel/sched/cvi_sched.h`) caps non-`cvitask` tasks at priority `80` and pins `cvitask_isp_pre`, `cvitask_vpss_0/1` (`90`) and `cvitask_tpu_wor` (`85`). `armd` defaults to `SCHED_FIFO 79` (`ARMD_RT_PRIORITY` overrides), and `/etc/init.d/K92rebot-teleop` applies the remaining layout on SG2002 at boot and on `rebot-vision` restart:
+
+- `spi0` and SPI/CAN IRQ threads (`irq/*spi*`, `irq/*mcp251*`): `SCHED_FIFO 80`
+- `armd-control`: `SCHED_FIFO 79`
+- 4 unpinned `cvitask` threads (`cvitask_vc_wt2`, `cvitask_vc_bh2`, `cvitask_isp_bla`, `cvitask_isp_err`): `70`
+- `rebot-vision` RT SDK threads (`ISP0_RUN`, `Thread_Venc0_Pr`, `Thread_Venc2_Pr`, `tz_event_handle`, `vi_dbg_handler`): `SCHED_RR 70`
+- Pinned `cvitask` threads (`85`/`90`) and non-SPI IRQ threads (`50`): untouched
+
+Measured on the spare reCamera SG2002 (2026-11-24, `ARMD_RT_OWNER=executor`, vision ON, all loads, 90 s, run `iso4-j`):
+
+- Default layout (`armd-control` FIFO 45): wake lateness max `14.4 ms`; MIT budget fails at `52 ms`.
+- Target layout (`armd-control` FIFO 79, SPI FIFO 80, vision & unpinned `cvitask` 70): wake lateness max `5.6 ms` (`>5 ms` 2×), MIT budget `35.7 ms < 45 ms`, vision `15 fps` with 0 errors.
 
 ## Baseline Marker (`POST /api/v1/diagnostics/tick/mark`)
 

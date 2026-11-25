@@ -182,6 +182,118 @@ fn read_commissioning_file_strict(path: &std::path::Path) -> Result<Option<ToolC
     Ok(Some(file))
 }
 
+/// Off-lock/off-RT preparation for `tool/commissioning/confirm` (reads any existing
+/// `tool_commissioning.json` inside `spawn_blocking` so neither `SupervisorLock` nor
+/// `armd-control` performs blocking disk I/O).
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn prepare_commissioning_confirm_off_thread(
+    pub_cfg: &crate::rt_core::requests::config::PublishedConfig,
+    body: &serde_json::Value,
+    require_expected_revision: bool,
+) -> Result<PreparedToolCommissioning, crate::supervisor::ArmError> {
+    use crate::motion::MotionError;
+    use crate::supervisor::ArmError;
+
+    let obj = body
+        .as_object()
+        .ok_or_else(|| MotionError::InvalidCommand("tool commissioning confirm body must be a JSON object".into()))?;
+    for k in obj.keys() {
+        if !["expected_revision", "tool_id", "tool_config_digest", "confirm"].contains(&k.as_str()) {
+            return Err(MotionError::InvalidCommand(format!("unknown field: {k}")).into());
+        }
+    }
+    if obj.get("confirm").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err(MotionError::InvalidCommand("confirm must be boolean true".into()).into());
+    }
+    if let Some(exp) = crate::persist::parse_expected_revision(body, require_expected_revision)
+        .map_err(MotionError::InvalidCommand)?
+    {
+        if exp != pub_cfg.tool_commissioning_revision {
+            return Err(ArmError::PolicyRevisionMismatch {
+                expected: exp,
+                current: pub_cfg.tool_commissioning_revision,
+            });
+        }
+    }
+    let active = &pub_cfg.config.active_tool;
+    let tid = obj
+        .get("tool_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| MotionError::InvalidCommand("tool_id must be a non-empty string".into()))?;
+    if tid != active.id {
+        return Err(MotionError::InvalidCommand(format!(
+            "tool_id '{}' does not match active tool '{}'",
+            tid, active.id
+        ))
+        .into());
+    }
+    let dig = obj
+        .get("tool_config_digest")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| MotionError::InvalidCommand("tool_config_digest must be a non-empty string".into()))?;
+    if dig != active.config_digest {
+        return Err(MotionError::InvalidCommand(format!(
+            "tool_config_digest '{}' does not match active tool digest '{}'",
+            dig, active.config_digest
+        ))
+        .into());
+    }
+    let robot_id = active_robot_id(&pub_cfg.config);
+    let confirmed_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let write = match pub_cfg.tool_commissioning_path.clone() {
+        Some(path) => {
+            let path_read = path.clone();
+            let existing = tokio::task::spawn_blocking(move || read_commissioning_file_strict(&path_read))
+                .await
+                .map_err(|e| ArmError::Rejected {
+                    status: 500,
+                    code: "COMMISSIONING_STORE_DAMAGED".into(),
+                    message: format!("tool commissioning read task failed: {e}"),
+                })?;
+            let mut file = match existing {
+                Ok(Some(f)) => f,
+                Ok(None) => ToolCommissioningFile::default(),
+                Err(e) => {
+                    return Err(ArmError::Rejected {
+                        status: 500,
+                        code: "COMMISSIONING_STORE_DAMAGED".into(),
+                        message: format!(
+                            "tool commissioning store is damaged or unreadable ({e}); refusing to overwrite"
+                        ),
+                    });
+                }
+            };
+            file.records.retain(|r| {
+                !(r.robot_id == robot_id
+                    && r.tool_id == active.id
+                    && r.tool_config_digest == active.config_digest)
+            });
+            file.records.push(ToolCommissioningRecord {
+                robot_id,
+                tool_id: active.id.clone(),
+                tool_config_digest: active.config_digest.clone(),
+                confirmed_at: confirmed_at.clone(),
+            });
+            Some(crate::persist::PendingWrite::new(
+                path,
+                serde_json::to_string_pretty(&file).unwrap_or_default(),
+            ))
+        }
+        None => None,
+    };
+    Ok(PreparedToolCommissioning {
+        base_revision: pub_cfg.tool_commissioning_revision,
+        tool_id: active.id.clone(),
+        tool_config_digest: active.config_digest.clone(),
+        confirmed_at,
+        write,
+    })
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub fn prepare_commissioning_confirm(
     inner: &crate::supervisor::SupervisorInner,

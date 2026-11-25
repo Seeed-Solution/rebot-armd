@@ -208,13 +208,15 @@ dump_once() {
     fi
 
     echo "--- irq_and_rt_threads ---"
-    for sfile in /proc/[0-9]*/stat; do
+    for sfile in /proc/[0-9]*/task/[0-9]*/stat; do
         [ -r "$sfile" ] || continue
-        pdir=${sfile%/stat}
-        p=${pdir#/proc/}
+        tdir=${sfile%/stat}
+        tid=${tdir##*/}
+        pdir=${tdir%/task/*}
+        tgid=${pdir#/proc/}
         comm=""
-        [ -r "$pdir/comm" ] && comm=$(cat "$pdir/comm" 2>/dev/null)
-        # Include all irq/*, spi*, ksoftirqd*, and any thread running with RT policy (policy != 0).
+        [ -r "$tdir/comm" ] && comm=$(cat "$tdir/comm" 2>/dev/null)
+        # Include all irq/*, spi*, ksoftirqd*, and any thread (including non-leader tasks) running with RT policy.
         want=0
         case "$comm" in
             irq/*|spi*|ksoftirqd*|mcp251*|mmc*|cviusb*) want=1 ;;
@@ -230,7 +232,10 @@ dump_once() {
             esac
         fi
         if [ "$want" -eq 1 ]; then
-            print_thread_sched "$p" "$sfile"
+            owner=""
+            [ -r "$pdir/comm" ] && owner=$(cat "$pdir/comm" 2>/dev/null)
+            printf 'pid=%s owner=%s ' "$tgid" "${owner:-?}"
+            print_thread_sched "$tid" "$sfile"
         fi
     done
     echo "=== ONCE_END ==="

@@ -145,7 +145,7 @@ TODO / 路线图：
 │   租约 + epoch 校验 → 规划（五次多项式 / S 曲线、笛卡尔 IK）           │
 │   安全状态机：Booting、Idle、Armed、Moving、EStop、Fault               │
 │   看门狗、关节限位、工作空间盒、限速、跟踪误差                         │
-│        │ 控制 tick，默认 50 Hz（权限允许时 SCHED_FIFO 50）             │
+│        │ 控制 tick，默认 50 Hz（SG2002 默认 SCHED_FIFO 79）            │
 │ 驱动：达妙 / RobStride（SocketCAN），飞特 / FashionStar（串口）        │
 └────────────────────────────────────────────────────────────────────────┘
         │ CAN 1 Mbit/s
@@ -153,7 +153,7 @@ TODO / 路线图：
    reBot B601-DM 电机
 ```
 
-- **控制循环**：固定周期 tick（`control_frequency_hz`，内置 profile 为 50 Hz，允许范围 1..1000）。tick 晚于 80 ms 时锁存安全保持，不继续执行旧轨迹。视频不经过 armd：驾驶舱用 JMuxer 直接播放摄像头的 H.264 WebSocket 流（`ws://<host>:8001/`）。
+- **控制循环**：固定周期 tick（`control_frequency_hz`，内置 profile 为 50 Hz，允许范围 1..1000）。tick 晚于 80 ms 时锁存安全保持，不继续执行旧轨迹。在 SG2002 上，厂商内核（`cvi_sched.h`）将非 `cvitask` 任务优先级上限固定为 80，并锁定 `cvitask_isp_pre`、`cvitask_vpss_0/1`（90）和 `cvitask_tpu_wor`（85）。`armd-control` 默认使用 `SCHED_FIFO 79`（可用 `ARMD_RT_PRIORITY` 覆盖），`K92rebot-teleop` 将 `spi0` / SPI-CAN 中断线程设为 `SCHED_FIFO 80`，将 4 个未锁定 `cvitask` 线程（`cvitask_vc_wt2`、`cvitask_vc_bh2`、`cvitask_isp_bla`、`cvitask_isp_err`）和 `rebot-vision` 的实时 SDK 线程降至 `70`（不触碰已锁定 `cvitask` 线程）。在 SG2002 开启视觉与全负载的 90 s 实测中（executor 模式，`iso4-j`），默认 FIFO 45 布局的最大唤醒延迟为 14.4 ms（MIT 预算 52 ms 未通过），目标布局下最大唤醒延迟为 5.6 ms（`>5 ms` 2 次），MIT 预算 35.7 ms < 45 ms，视觉维持 15 fps 且无错误。视频不经过 armd：驾驶舱用 JMuxer 直接播放摄像头的 H.264 WebSocket 流（`ws://<host>:8001/`）。
 - **租约**：执行器权限属于发送了 `acquire_lease` 并持续发送 `heartbeat` 的 WebSocket 连接（租约超时 2500 ms）。每条 `command` 都带租约 `generation`、当前安全 `epoch_id` 和严格递增的 `request_id`。REST 执行器路由（`torque`、`motion/*`、`action/*`、`clear_fault`）返回 `409 LEASE_REQUIRED`，不执行动作。急停例外：REST 与 WebSocket 都不需要租约。其他客户端可用 `force` 接管，接管后在机械臂稳定前拒绝运动（`HANDOVER_SETTLING`）。
 - **安全层**（详见 [docs/control_safety_contract.md](docs/control_safety_contract.md)）：关节位置、速度、加速度限位；`max_temperature` 温度保护（内置 profile 为 70 °C）；反馈新鲜度（250 ms）；跟随误差故障（`max_error_rad` 0.5，持续 500 ms）及动作的 `TRACKING_STALL`；规划运动限速（`planned_max_velocity`，rebot-dm 为 0.45 rad/s）；servo 流式限速与领先量上限（`servo_max_velocity`、`servo_max_lead_rad` 0.2），关节跟不上时保持位置而不报 Fault，并在观测 `motion_limit` 中报告；力矩保护（J1–J6 的 |力矩| ≥ `torque_guard.ratio` × TMAX 持续 100 ms 时停止运动并保持力矩，动作码 `TORQUE_LIMIT`；rebot-dm 的 ratio 为 0.60：J1–J3 16.8 N·m，J4–J6 6.0 N·m）；电源功率预算（`power_budget`：由电机力矩和速度按数据手册参数估算电源电流，无电流传感器；超过电源额定值 80 % 时降速，超过 95 % 时保持，动作码 `POWER_LIMIT`；规划运动用 URDF 逆动力学做时间缩放以保持在 75 % 以下，否则以 `POWER_BUDGET` 拒绝；rebot-dm 为 6.5 A 的 LRS-150-24；驾驶舱显示电源负载条）；Fault 期间电机以 Disabled 恢复时 `is_torqued` 置为 false；笛卡尔工作空间检查（地面、包围盒、伸展范围）；租约看门狗自动收纳；不在收纳位时拒绝断力矩（`ARM_NOT_AT_RESTING_POSE`），避免机械臂下坠。
 
@@ -274,7 +274,13 @@ v1.4.0 release 产物的大小（release profile：`opt-level = "z"`、fat LTO�
 - **点位抽屉**（仅在 `capabilities.poses` 为 true 时显示）：用名称（`^[A-Za-z0-9_-]{1,64}$`）记录当前位置，按驾驶舱速度前往已存点位（`move_to_pose` 动作），或删除点位。
 - **已保存的录制**（专家模式录制卡片，仅在 `capabilities.replay` 为 true 时显示）：列出已保存的片段（id、时长、保存时间），以 0.5x 或 1x 回放（可选是否包含夹爪），显示阶段与录制时间的进度条、停止按钮，删除需在页面内再点一次确认。保存后列表自动刷新；被拒绝时以提示条显示错误码。
 
-驾驶舱打开时不取得租约，在第一次控制输入（点动、摇杆、按键、笛卡尔输入、预设、使能、夹爪、抓取、重力补偿、收纳或回零）时取得；30 秒无输入后释放，且仅在力矩关闭、没有动作、重力补偿、串流或运动时释放（力矩开启时释放租约，armd 会让机械臂回到停靠位）。因此驾驶舱页面打开时，智能体也能取得租约。其他客户端持有租约时，驾驶舱切换为观察模式，按观测中的 `lease_holder` 显示持有者（另一个驾驶舱页面、AI 智能体 `rebot-mcp` 或该客户端的标签），并提供需确认的接管操作。急停不需要租约。
+- **驾驶舱租约**：
+  - 打开、刷新或重连驾驶舱页面从不取得控制租约。页面以只读方式连接（观测与遥测）并显示当前租约持有者（或只读 / 无持有者），因此驾驶舱页面打开时智能体也能取得租约。
+  - 驾驶舱仅在操作员明确操作时取得租约：长按 **使能**（或点按以复位急停 / 清除故障），或在未持有租约时发起运动、力矩或其他需要租约的操作。未持有租约时发起需要租约的操作会先弹出页内 **「Take control?」（获取控制权？）** 确认提示（不使用 `window.confirm`）；确认后仅取得租约，不会自动重放之前的运动或力矩操作，操作员随后重新发起该操作或开始新的输入。
+  - 若其他客户端持有租约，驾驶舱切换为只读观察模式，按 `observation.lease_holder` 显示持有者（另一个驾驶舱页面——接管确认时显示其 ID——AI 智能体，或客户端标签 / 未命名客户端），并提供显式的 **「Take control」（接管控制权）** 按钮（使用 `force: true`）。强制接管在启用鉴权时需要操作员认证，从不自动执行，且接管确认仅针对最近一次观测到的 `lease_holder` 标签授权抢占（若在点击前观测到的持有者发生变化或清空，驾驶舱会使该确认失效）。
+  - 曾持有租约的页面在重连后（或租约过期后）不会静默重新取得租约，而是显示 **「Control released」（控制权已释放）** 横幅，并提供显式按钮用于再次取得控制权。
+  - 空闲释放：驾驶舱仅在力矩关闭且没有动作、重力补偿、串流或运动运行时，在 30 秒无输入后释放空闲租约（若在力矩开启时释放租约，`armd` 会触发租约看门狗收纳或保持并锁存 `WatchdogTimeout`）。空闲释放后不会自动重新取得控制权——操作员在需要时使用 **使能** 或确认 **「Take control?」**。
+  - 普通 **停止**（`#btn-stop` 以及租约确认和操作员 PIN 弹窗内的 `Stop` 按钮）从不取得租约：持有租约时发送 `/api/v1/motion/stop` 且仅在收到 ACK 后确认 `"Stopped, holding position"`；处于观察模式（无租约）或无有效租约 / WebSocket 会话时仍可操作以取消本地控制意图，不发送 `acquire_lease`，提示停止未能确认并指向 **急停**（始终无需租约即可触发，包括 `Space` 键及弹窗内的急停按钮）。
 
 ### 相机标定向导
 
@@ -505,9 +511,10 @@ armd 驱动的真实机械臂有足以伤人和损坏物品的力量。使用风
 ## 开发
 
 ```bash
-cargo test                                 # 316 个测试（2 个 ignored），使用仿真机械臂，不需要硬件
+cargo test                                  # 316 个测试（2 个 ignored），使用仿真机械臂，不需要硬件
+cargo nextest run --workspace --profile quick  # 迭代快速通道：排除慢集成套件并设 10 s 慢测警告
 cargo nextest run --workspace --profile fast   # 日常快速通道（cargo-nextest；见 CONTRIBUTING.md「Faster test runs」）
-cargo nextest run --workspace --profile ci     # 全部测试，合并前运行
+cargo nextest run --workspace --profile ci     # 全量测试，合并前运行（default profile 默认 test-threads = "num-cpus"）
 cargo clippy --all-targets -- -D warnings
 node scripts/view_ik_selftest.mjs          # 驾驶舱视角坐标系 IK
 node scripts/calib_selftest.mjs            # 驾驶舱手眼标定（c 部分需要 ../rebot-companion 和 uv）

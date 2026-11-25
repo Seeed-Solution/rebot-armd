@@ -193,6 +193,9 @@ impl SupervisorInner {
         #[cfg(feature = "policy-runtime")]
         { self.calibration_digest = Self::calibration_digest_of(self.calibration.as_ref()); }
         self.refresh_effective_floor();
+        if !self.rt_executor_owned {
+            self.refresh_schema_cache();
+        }
     }
 
     /// Recompute `config.workspace.floor_z_m` = max(profile floor, valid calibrated table
@@ -238,6 +241,9 @@ impl SupervisorInner {
         if let Some(g) = self.config.grasp.as_mut() { g.camera_tilt_deg = tilt; }
         self.refresh_effective_floor();
         self.prepare_workspace_eval_bufs();
+        if !self.rt_executor_owned {
+            self.refresh_schema_cache();
+        }
     }
 
     /// Install the kinematic correction of the built-in model (calibration apply / restore /
@@ -256,6 +262,9 @@ impl SupervisorInner {
         self.calibration_revision += 1;
         self.refresh_pose_tcps();
         self.refresh_effective_floor();
+        if !self.rt_executor_owned {
+            self.refresh_schema_cache();
+        }
         Ok(())
     }
 
@@ -590,6 +599,44 @@ impl SupervisorInner {
         ret
     }
 
+    /// Zero-allocation terminal update when parent-directory fsync fails after `rename_only()`
+    /// for `gripper_zero_check(store_offset=true)`: marks action failed (`PERSIST_FAILED`),
+    /// records `durability_confirmed = Some(false)` and the worker-allocated `warning`, and
+    /// returns any displaced buffers for off-thread reclamation.
+    pub(crate) fn fail_zero_check_dir_sync_in_place(
+        &mut self,
+        action_id: u64,
+        warning: String,
+        mut msg_buf: Option<String>,
+    ) -> (Option<String>, Option<String>) {
+        let now = self.now_s();
+        if let Some(a) = self.last_action.as_mut().filter(|a| a.id == action_id) {
+            if a.is_running() {
+                a.state = crate::model::HolderLabel::new("failed");
+                a.code = Some(crate::model::HolderLabel::new("PERSIST_FAILED"));
+                a.finished_at = Some(now);
+            }
+            a.durability_confirmed = Some(false);
+            let old_warn = a.durability_warning.replace(warning);
+            let old_msg = match msg_buf.take() {
+                Some(mut b) => {
+                    b.clear();
+                    const MSG: &str = "Parent directory fsync failed after rename; reconciliation required";
+                    if b.capacity() >= MSG.len() {
+                        b.push_str(MSG);
+                        a.message.replace(b)
+                    } else {
+                        Some(b)
+                    }
+                }
+                None => None,
+            };
+            self.record_finished_action_by_id(action_id);
+            return (old_msg, old_warn);
+        }
+        (msg_buf, Some(warning))
+    }
+
     /// Infallibly commit a pre-validated [`GripperCalibrationCandidate`] after disk rename.
     pub fn commit_gripper_calibration_candidate(&mut self, cand: GripperCalibrationCandidate) {
         self.config = cand.config;
@@ -600,6 +647,9 @@ impl SupervisorInner {
         self.driver_config_error = cand.driver_config_error;
         self.prepare_park_release_spare();
         self.bump_motion_config_revision();
+        if !self.rt_executor_owned {
+            self.refresh_schema_cache();
+        }
     }
 
     pub fn validate_gripper_calibration_with_driver(
@@ -635,7 +685,7 @@ impl SupervisorInner {
     pub fn active_calibration_digest_str(&self) -> &str { &self.calibration_digest }
 
     #[cfg(feature = "policy-runtime")]
-    fn calibration_digest_of(c: Option<&crate::calibration::CalibrationFile>) -> String {
+    pub(crate) fn calibration_digest_of(c: Option<&crate::calibration::CalibrationFile>) -> String {
         match c {
             None => crate::policy_runtime::EMPTY_CALIBRATION_DIGEST.to_string(),
             Some(cal) => {

@@ -1053,8 +1053,74 @@ impl<T: Copy, const N: usize> std::ops::Deref for SmallBuf<T, N> {
     }
 }
 
-/// The overflow vectors of a [`WorkspaceEvaluator`], kept between evaluators
-/// ([`WorkspaceEvaluator::new_with_tcp_in`] / [`WorkspaceEvaluator::recycle`]).
+/// Fixed pool capacity for zero-allocation adaptive linear-step subdivision on `armd-control`
+/// (`2 * MAX_KEEPOUT_EVALS_PER_TICK + 4` with `MAX_KEEPOUT_EVALS_PER_TICK = 64`).
+pub const RT_SWEEP_POOL_SLOTS: usize = 2 * 64 + 4;
+
+/// Zero-allocation workspace refusal payload for `armd-control` (static codes & indices;
+/// formatted into preallocated [`k::WorkspaceViolationDetail`] text without touching the heap).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum WorkspaceFailureKindRt {
+    Invalid(&'static str),
+    UnknownCapsule(usize),
+    InvalidSelfPair(usize),
+    BudgetExceeded { max_budget: usize },
+    Constraint { slot: usize, depth: f64, min_d: f64 },
+}
+
+/// Zero-allocation refusal returned by RT workspace evaluation/sweep helpers.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WorkspaceFailureRt {
+    pub kind: WorkspaceFailureKindRt,
+    pub phase: &'static str,
+}
+
+impl WorkspaceFailureRt {
+    #[inline]
+    pub const fn code(&self) -> &'static str {
+        match self.kind {
+            WorkspaceFailureKindRt::Invalid(_)
+            | WorkspaceFailureKindRt::UnknownCapsule(_)
+            | WorkspaceFailureKindRt::InvalidSelfPair(_) => "invalid",
+            WorkspaceFailureKindRt::BudgetExceeded { .. } => "sweep_budget",
+            WorkspaceFailureKindRt::Constraint { .. } => "workspace_violation",
+        }
+    }
+}
+
+/// Writes formatted text into a preallocated `String` without ever reallocating past its capacity.
+struct CappedStrWriter<'a>(&'a mut String);
+
+impl core::fmt::Write for CappedStrWriter<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let avail = self.0.capacity().saturating_sub(self.0.len());
+        if avail == 0 {
+            return Ok(());
+        }
+        if s.len() <= avail {
+            self.0.push_str(s);
+        } else {
+            let mut end = avail;
+            while end > 0 && !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.0.push_str(&s[..end]);
+        }
+        Ok(())
+    }
+}
+
+fn write_opt_str_rt(dst: &mut Option<String>, f: impl FnOnce(&mut CappedStrWriter<'_>)) {
+    if let Some(buf) = dst.as_mut() {
+        buf.clear();
+        let mut w = CappedStrWriter(buf);
+        f(&mut w);
+    }
+}
+
+/// The overflow and clearance scratch vectors of a [`WorkspaceEvaluator`], preallocated off-thread
+/// at profile load or workspace config commit time ([`EvalBufs::prepare_for`]) so `armd-control`
+/// never allocates for any legal workspace configuration.
 #[derive(Debug, Default)]
 pub struct EvalBufs {
     end_locals: Vec<[f64; 3]>,
@@ -1063,12 +1129,23 @@ pub struct EvalBufs {
     self_pairs: Vec<Option<(usize, usize, [f64; MAX_CHAIN_JOINTS])>>,
     keepouts: Vec<([f64; 3], [f64; 3])>,
     slots: Vec<f64>,
+    pub(crate) scratch_c0: Vec<f64>,
+    pub(crate) scratch_c1: Vec<f64>,
+    pub(crate) scratch_cm: Vec<f64>,
+    pub(crate) scratch_min_d: Vec<f64>,
+    pub(crate) scratch_cand_min_d: Vec<f64>,
+    pub(crate) sweep_slab: Vec<f64>,
+    pub(crate) sweep_stack: Vec<(f64, usize, f64, usize)>,
+    pub(crate) sweep_free: Vec<usize>,
+    pub(crate) geom_bounds: Vec<f64>,
+    pub(crate) min_depths_spare: Option<k::SlotBuf>,
     pub(crate) world_caps: Vec<([f64; 3], [f64; 3], f64)>,
 }
 
 impl EvalBufs {
-    /// Pre-sizes overflow buffers off the RT thread so evaluating `ws` (including workspaces with
-    /// more than [`k::MAX_STACK_WORKSPACE_SLOTS`] slots) allocates zero heap memory on RT paths.
+    /// Pre-sizes all evaluator and clearance scratch buffers off the RT thread so evaluating or
+    /// sweeping `ws` (including legal workspaces exceeding [`k::MAX_STACK_WORKSPACE_SLOTS`] = 256
+    /// slots, e.g. 32 end points + keep-out boxes) allocates zero heap memory on `armd-control`.
     pub fn prepare_for(
         &mut self,
         model: &ArmModel,
@@ -1079,12 +1156,39 @@ impl EvalBufs {
         let eval = WorkspaceEvaluator::new_with_tcp_in(model, ws, cam, tcp_offset, self);
         let need_slots = eval.total_slots;
         let need_caps = eval.capsules.len();
+        let need_geoms = eval.num_geoms;
         eval.recycle(self);
         if need_slots > k::MAX_STACK_WORKSPACE_SLOTS && self.slots.capacity() < need_slots {
             self.slots.reserve(need_slots - self.slots.len());
         }
+        let ensure_f64 = |v: &mut Vec<f64>, n: usize| {
+            if v.capacity() < n {
+                v.reserve(n - v.len());
+            }
+            v.resize(n, 0.0);
+        };
+        ensure_f64(&mut self.scratch_c0, need_slots);
+        ensure_f64(&mut self.scratch_c1, need_slots);
+        ensure_f64(&mut self.scratch_cm, need_slots);
+        ensure_f64(&mut self.scratch_min_d, need_slots);
+        ensure_f64(&mut self.scratch_cand_min_d, need_slots);
+        ensure_f64(&mut self.geom_bounds, need_geoms);
+        ensure_f64(&mut self.sweep_slab, RT_SWEEP_POOL_SLOTS * need_slots);
+        if self.sweep_stack.capacity() < RT_SWEEP_POOL_SLOTS {
+            self.sweep_stack.reserve(RT_SWEEP_POOL_SLOTS - self.sweep_stack.len());
+        }
+        if self.sweep_free.capacity() < RT_SWEEP_POOL_SLOTS {
+            self.sweep_free.reserve(RT_SWEEP_POOL_SLOTS - self.sweep_free.len());
+        }
         if need_caps > crate::model::MAX_LINK_CAPSULES && self.world_caps.capacity() < need_caps {
             self.world_caps.reserve(need_caps - self.world_caps.len());
+        }
+        let reuse_spare = self
+            .min_depths_spare
+            .as_ref()
+            .is_some_and(|s| s.as_slice().len() == need_slots);
+        if !reuse_spare {
+            self.min_depths_spare = Some(k::SlotBuf::zeros(need_slots));
         }
     }
 }
@@ -1418,6 +1522,484 @@ impl<'a> WorkspaceEvaluator<'a> {
         Ok(())
     }
 
+    /// Zero-allocation RT clearance evaluation directly into a pre-sized slice (`len >= total_slots`).
+    pub fn eval_into_slice_rt(
+        &self,
+        q: &[f32],
+        out: &mut [f64],
+        heap_caps: &mut Vec<([f64; 3], [f64; 3], f64)>,
+        phase: &'static str,
+    ) -> Result<(), WorkspaceFailureRt> {
+        if out.len() < self.total_slots {
+            return Err(WorkspaceFailureRt {
+                kind: WorkspaceFailureKindRt::Invalid("workspace scratch undersized"),
+                phase,
+            });
+        }
+        let Some(f) = self.model.frames_f32(q) else {
+            return Err(WorkspaceFailureRt {
+                kind: WorkspaceFailureKindRt::Invalid("non-finite or incomplete joint positions"),
+                phase,
+            });
+        };
+        let buf = &mut out[..self.total_slots];
+        for (gi, local) in self.end_locals.iter().enumerate() {
+            let p = f.end.transform_point(local);
+            let base = gi * self.slots_per_geom;
+            buf[base] = p[2] - self.floor;
+            for axis in 0..3 {
+                buf[base + 1 + axis] = p[axis] - self.box_lo[axis];
+                buf[base + 4 + axis] = self.box_hi[axis] - p[axis];
+            }
+            for (bi, (kb_lo, kb_hi)) in self.keepouts.iter().enumerate() {
+                let depth = (0..3)
+                    .map(|axis| (p[axis] - kb_lo[axis]).min(kb_hi[axis] - p[axis]))
+                    .fold(f64::INFINITY, f64::min);
+                buf[base + 7 + bi] = -depth;
+            }
+        }
+        let mut stack_caps = [([0.0f64; 3], [0.0f64; 3], 0.0f64); crate::model::MAX_LINK_CAPSULES];
+        let world_caps: &mut [([f64; 3], [f64; 3], f64)] = if self.capsules.len() <= stack_caps.len() {
+            &mut stack_caps[..self.capsules.len()]
+        } else {
+            heap_caps.clear();
+            if heap_caps.capacity() < self.capsules.len() {
+                return Err(WorkspaceFailureRt {
+                    kind: WorkspaceFailureKindRt::Invalid("capsule scratch undersized"),
+                    phase,
+                });
+            }
+            heap_caps.resize(self.capsules.len(), ([0.0; 3], [0.0; 3], 0.0));
+            heap_caps.as_mut_slice()
+        };
+        for (ci, (fr_opt, a_local, b_local, radius)) in self.capsules.iter().enumerate() {
+            let Some(fr) = fr_opt else {
+                return Err(WorkspaceFailureRt {
+                    kind: WorkspaceFailureKindRt::UnknownCapsule(ci),
+                    phase,
+                });
+            };
+            let pose = fr.pose(&f);
+            let a = pose.transform_point(a_local);
+            let b = pose.transform_point(b_local);
+            world_caps[ci] = (a, b, *radius);
+            let base = (self.num_end_pts + ci) * self.slots_per_geom;
+            if matches!(fr, FrameRef::BaseRel(_, _)) {
+                buf[base..base + self.slots_per_geom].fill(0.0);
+            } else {
+                buf[base] = a[2].min(b[2]) - *radius - self.floor;
+                for axis in 0..3 {
+                    buf[base + 1 + axis] = (a[axis].min(b[axis]) - *radius) - self.box_lo[axis];
+                    buf[base + 4 + axis] = self.box_hi[axis] - (a[axis].max(b[axis]) + *radius);
+                }
+                for (bi, (kb_lo, kb_hi)) in self.keepouts.iter().enumerate() {
+                    buf[base + 7 + bi] = k::capsule_aabb_clearance(&a, &b, *radius, kb_lo, kb_hi);
+                }
+            }
+        }
+        if let Some(reach) = self.ws.max_reach_m {
+            let reach_base = self.num_geoms * self.slots_per_geom;
+            let p0 = f.end.p;
+            let d = k::shoulder_reach_from(&p0, &self.shoulder);
+            buf[reach_base] = f64::from(reach) - d;
+            if self.has_tcp_reach {
+                let p_tcp = f.end.transform_point(&self.tcp_offset);
+                let d_tcp = k::shoulder_reach_from(&p_tcp, &self.shoulder);
+                buf[reach_base + 1] = f64::from(reach) - d_tcp;
+            }
+        }
+        if !self.self_pairs.is_empty() {
+            if !self.self_collision_min_clearance.is_finite() || self.self_collision_min_clearance < 0.0 {
+                return Err(WorkspaceFailureRt {
+                    kind: WorkspaceFailureKindRt::Invalid("invalid self_collision_min_clearance_m"),
+                    phase,
+                });
+            }
+            for (pi, pair) in self.self_pairs.iter().enumerate() {
+                let Some(&(ia, ib, _)) = pair.as_ref() else {
+                    return Err(WorkspaceFailureRt {
+                        kind: WorkspaceFailureKindRt::InvalidSelfPair(pi),
+                        phase,
+                    });
+                };
+                let (a0, a1, ra) = world_caps[ia];
+                let (b0, b1, rb) = world_caps[ib];
+                let dist = seg_seg_dist(&a0, &a1, &b0, &b1);
+                buf[self.self_collision_slot_start + pi] = dist - (ra + rb) - self.self_collision_min_clearance;
+            }
+        }
+        Ok(())
+    }
+
+    /// Formats a [`WorkspaceFailureRt`] into preallocated [`k::WorkspaceViolationDetail`] string
+    /// buffers without heap allocation.
+    pub fn write_failure_detail_rt(
+        &self,
+        failure: &WorkspaceFailureRt,
+        dst: &mut k::WorkspaceViolationDetail,
+    ) {
+        use core::fmt::Write as _;
+        write_opt_str_rt(&mut dst.violation_phase, |w| {
+            let _ = w.write_str(failure.phase);
+        });
+        match failure.kind {
+            WorkspaceFailureKindRt::Invalid(msg) => {
+                write_opt_str_rt(&mut dst.constraint_id, |w| { let _ = w.write_str("invalid"); });
+                write_opt_str_rt(&mut dst.geometry_id, |w| { let _ = w.write_str("end_origin"); });
+                write_opt_str_rt(&mut dst.reason, |w| { let _ = w.write_str(msg); });
+            }
+            WorkspaceFailureKindRt::UnknownCapsule(ci) => {
+                let (cap_id, cap_frame) = self
+                    .ws
+                    .link_capsules
+                    .get(ci)
+                    .map_or(("?", "?"), |c| (c.id.as_str(), c.frame.as_str()));
+                write_opt_str_rt(&mut dst.constraint_id, |w| { let _ = w.write_str("invalid"); });
+                write_opt_str_rt(&mut dst.geometry_id, |w| { let _ = write!(w, "capsule:{cap_id}"); });
+                write_opt_str_rt(&mut dst.reason, |w| {
+                    let _ = write!(w, "unknown frame '{cap_frame}' for capsule '{cap_id}'");
+                });
+            }
+            WorkspaceFailureKindRt::InvalidSelfPair(pi) => {
+                write_opt_str_rt(&mut dst.constraint_id, |w| { let _ = w.write_str("invalid"); });
+                write_opt_str_rt(&mut dst.geometry_id, |w| { let _ = w.write_str("end_origin"); });
+                write_opt_str_rt(&mut dst.reason, |w| {
+                    if let Some([a, b]) = self.ws.self_collision_pairs.get(pi) {
+                        let _ = write!(w, "unknown or invalid self_collision pair ['{a}', '{b}']");
+                    } else {
+                        let _ = w.write_str("invalid self-collision pair");
+                    }
+                });
+            }
+            WorkspaceFailureKindRt::BudgetExceeded { max_budget } => {
+                write_opt_str_rt(&mut dst.constraint_id, |w| { let _ = w.write_str("sweep_budget"); });
+                write_opt_str_rt(&mut dst.geometry_id, |w| { let _ = w.write_str("end_origin"); });
+                write_opt_str_rt(&mut dst.reason, |w| {
+                    let _ = write!(w, "workspace sweep exceeded {max_budget} FK evaluations");
+                });
+            }
+            WorkspaceFailureKindRt::Constraint { slot, depth, min_d } => {
+                if slot >= self.self_collision_slot_start {
+                    let pi = slot - self.self_collision_slot_start;
+                    let (id_a, id_b) = self
+                        .ws
+                        .self_collision_pairs
+                        .get(pi)
+                        .map_or(("?", "?"), |[a, b]| (a.as_str(), b.as_str()));
+                    write_opt_str_rt(&mut dst.constraint_id, |w| {
+                        let _ = write!(w, "self_collision:{id_a}:{id_b}");
+                    });
+                    write_opt_str_rt(&mut dst.geometry_id, |w| {
+                        let _ = write!(w, "capsule:{id_a}");
+                    });
+                } else if self.has_reach && slot >= self.num_geoms * self.slots_per_geom {
+                    let reach_idx = slot - self.num_geoms * self.slots_per_geom;
+                    write_opt_str_rt(&mut dst.constraint_id, |w| { let _ = w.write_str("max_reach"); });
+                    write_opt_str_rt(&mut dst.geometry_id, |w| {
+                        let _ = w.write_str(if reach_idx == 0 { "end_origin" } else { "tcp_origin" });
+                    });
+                } else {
+                    let gi = slot / self.slots_per_geom;
+                    let ci = slot % self.slots_per_geom;
+                    write_opt_str_rt(&mut dst.geometry_id, |w| {
+                        if gi == 0 {
+                            let _ = w.write_str("end_origin");
+                        } else if gi < self.num_end_pts {
+                            if self.has_cam && gi + 1 == self.num_end_pts {
+                                let _ = w.write_str("camera_mount");
+                            } else {
+                                let _ = write!(w, "end_point:{gi}");
+                            }
+                        } else {
+                            let id = self
+                                .ws
+                                .link_capsules
+                                .get(gi - self.num_end_pts)
+                                .map_or("?", |c| c.id.as_str());
+                            let _ = write!(w, "capsule:{id}");
+                        }
+                    });
+                    write_opt_str_rt(&mut dst.constraint_id, |w| {
+                        if ci == 0 {
+                            let _ = w.write_str("floor_z");
+                        } else if ci <= 3 {
+                            let _ = w.write_str(k::BOX_CONSTRAINT_IDS[ci - 1][0]);
+                        } else if ci <= 6 {
+                            let _ = w.write_str(k::BOX_CONSTRAINT_IDS[ci - 4][1]);
+                        } else {
+                            let bi = ci - 7;
+                            let name = self.ws.keepout_boxes.get(bi).map_or("?", |b| b.name.as_str());
+                            let _ = write!(w, "keepout:{name}");
+                        }
+                    });
+                }
+                let cid_ref = dst.constraint_id.as_deref().unwrap_or("workspace");
+                let gid_ref = dst.geometry_id.as_deref().unwrap_or("end_origin");
+                if let Some(reason_buf) = dst.reason.as_mut() {
+                    reason_buf.clear();
+                    let mut w = CappedStrWriter(reason_buf);
+                    if !depth.is_finite() {
+                        let _ = write!(w, "invalid workspace check for {cid_ref} ({gid_ref})");
+                    } else if min_d <= k::WORKSPACE_EPS {
+                        let _ = write!(w, "new intrusion into {cid_ref} by {depth:.3}m (geometry {gid_ref})");
+                    } else {
+                        let _ = write!(
+                            w,
+                            "deepened {cid_ref} intrusion from {min_d:.3}m to {depth:.3}m (geometry {gid_ref})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Initialize `min_depths` directly into a pre-sized slice (zero allocation).
+    pub fn init_min_depths_slice(&self, clr: &[f64], out: &mut [f64]) {
+        for (dst, &c) in out[..self.total_slots].iter_mut().zip(&clr[..self.total_slots]) {
+            *dst = if c.is_nan() { f64::NAN } else { (-c).max(0.0) };
+        }
+    }
+
+    /// Zero-allocation slice variant of [`Self::check_and_advance`].
+    pub fn check_and_advance_slice_rt(
+        &self,
+        clr: &[f64],
+        min_depths: &mut [f64],
+        phase: &'static str,
+    ) -> Result<(), WorkspaceFailureRt> {
+        let cs = &clr[..self.total_slots];
+        let md = &mut min_depths[..self.total_slots];
+        if let Some((slot, depth, min_d, _)) =
+            k::first_workspace_rejection_with_tol(cs, md, self.escape_tol)
+        {
+            return Err(WorkspaceFailureRt {
+                kind: WorkspaceFailureKindRt::Constraint { slot, depth, min_d },
+                phase,
+            });
+        }
+        k::advance_min_depths(cs, md);
+        Ok(())
+    }
+
+    /// Zero-allocation slice variant of [`Self::check_readonly`].
+    pub fn check_readonly_slice_rt(
+        &self,
+        clr: &[f64],
+        min_depths: &[f64],
+        phase: &'static str,
+    ) -> Result<(), WorkspaceFailureRt> {
+        let cs = &clr[..self.total_slots];
+        let md = &min_depths[..self.total_slots];
+        if let Some((slot, depth, min_d, _)) =
+            k::first_workspace_rejection_with_tol(cs, md, self.escape_tol)
+        {
+            return Err(WorkspaceFailureRt {
+                kind: WorkspaceFailureKindRt::Constraint { slot, depth, min_d },
+                phase,
+            });
+        }
+        Ok(())
+    }
+
+    fn interval_needs_split_slice_rt(
+        &self,
+        c0: &[f64],
+        c1: &[f64],
+        min_depths: &[f64],
+        tr: &[f64],
+        arm_dof: usize,
+        geom_bounds: &mut [f64],
+        phase: &'static str,
+    ) -> Result<Option<(usize, f64, f64)>, WorkspaceFailureRt> {
+        if geom_bounds.len() < self.num_geoms {
+            return Err(WorkspaceFailureRt {
+                kind: WorkspaceFailureKindRt::Invalid("geom_bounds scratch undersized"),
+                phase,
+            });
+        }
+        let bounds = &mut geom_bounds[..self.num_geoms];
+        for (g, b) in bounds.iter_mut().enumerate() {
+            let v = self.geom_bound(g, tr, arm_dof);
+            if !v.is_finite() {
+                return Err(WorkspaceFailureRt {
+                    kind: WorkspaceFailureKindRt::Invalid("non-finite joint travel bound"),
+                    phase,
+                });
+            }
+            *b = v;
+        }
+        for slot in 0..self.total_slots {
+            let l_g = if slot >= self.self_collision_slot_start {
+                let pi = slot - self.self_collision_slot_start;
+                let Some((_, _, reach)) = &self.self_pairs[pi] else {
+                    return Err(WorkspaceFailureRt {
+                        kind: WorkspaceFailureKindRt::InvalidSelfPair(pi),
+                        phase,
+                    });
+                };
+                let v: f64 = tr.iter().take(arm_dof).zip(reach).map(|(d, r)| d * r).sum();
+                if !v.is_finite() {
+                    return Err(WorkspaceFailureRt {
+                        kind: WorkspaceFailureKindRt::Invalid("non-finite joint travel bound"),
+                        phase,
+                    });
+                }
+                v
+            } else {
+                bounds[self.slot_geom(slot)]
+            };
+            if l_g <= 0.0 {
+                continue;
+            }
+            let min_d = min_depths[slot];
+            let allowed = if min_d <= k::WORKSPACE_EPS {
+                k::WORKSPACE_EPS
+            } else {
+                min_d + self.escape_tol
+            };
+            let d_max = 0.5 * (l_g - c0[slot] - c1[slot]);
+            if d_max > allowed {
+                return Ok(Some((slot, d_max, min_d)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Zero-allocation adaptive linear-step sweep for `armd-control` using pre-sized scratch
+    /// buffers from [`EvalBufs`] (zero heap allocations for any legal workspace size, including
+    /// subdivision and refusal paths).
+    #[allow(clippy::too_many_arguments)]
+    pub fn sweep_linear_step_rt(
+        &self,
+        a: &[f32],
+        b: &[f32],
+        c_a: &[f64],
+        min_depths: &mut [f64],
+        remaining_budget: &mut usize,
+        max_budget: usize,
+        endpoint_phase: &'static str,
+        sweep_phase: &'static str,
+        scratch_c1: &mut [f64],
+        scratch_cm: &mut [f64],
+        sweep_slab: &mut [f64],
+        sweep_stack: &mut Vec<(f64, usize, f64, usize)>,
+        sweep_free: &mut Vec<usize>,
+        geom_bounds: &mut [f64],
+        world_caps: &mut Vec<([f64; 3], [f64; 3], f64)>,
+    ) -> Result<(), WorkspaceFailureRt> {
+        let n = self.total_slots;
+        self.eval_into_slice_rt(b, scratch_c1, world_caps, endpoint_phase)?;
+        self.check_readonly_slice_rt(scratch_c1, min_depths, endpoint_phase)?;
+
+        let dof = a.len().min(b.len()).min(MAX_CHAIN_JOINTS);
+        let arm_dof = self.model.arm_dof().min(dof);
+        let mut full_tr = [0.0f64; MAX_CHAIN_JOINTS];
+        for j in 0..arm_dof {
+            full_tr[j] = f64::from((b[j] - a[j]).abs());
+        }
+        if self
+            .interval_needs_split_slice_rt(
+                c_a,
+                scratch_c1,
+                min_depths,
+                &full_tr[..arm_dof],
+                arm_dof,
+                geom_bounds,
+                sweep_phase,
+            )?
+            .is_none()
+        {
+            self.check_and_advance_slice_rt(scratch_c1, min_depths, endpoint_phase)?;
+            return Ok(());
+        }
+
+        let pool_slots = sweep_slab
+            .len()
+            .checked_div(n)
+            .unwrap_or(0)
+            .min(sweep_free.capacity());
+        if pool_slots < 2 || sweep_stack.capacity() == 0 {
+            return Err(WorkspaceFailureRt {
+                kind: WorkspaceFailureKindRt::BudgetExceeded { max_budget },
+                phase: sweep_phase,
+            });
+        }
+        sweep_stack.clear();
+        sweep_free.clear();
+        for idx in (0..pool_slots).rev() {
+            sweep_free.push(idx);
+        }
+        let idx_a = sweep_free.pop().unwrap();
+        let idx_b = sweep_free.pop().unwrap();
+        sweep_slab[idx_a * n..(idx_a + 1) * n].copy_from_slice(&c_a[..n]);
+        sweep_slab[idx_b * n..(idx_b + 1) * n].copy_from_slice(&scratch_c1[..n]);
+        sweep_stack.push((0.0, idx_a, 1.0, idx_b));
+
+        let mut qm_buf = [0.0f32; MAX_CHAIN_JOINTS];
+        let mut tr_buf = [0.0f64; MAX_CHAIN_JOINTS];
+        while let Some((t0, i0, t1, i1)) = sweep_stack.pop() {
+            let dt = t1 - t0;
+            for j in 0..arm_dof {
+                tr_buf[j] = full_tr[j] * dt;
+            }
+            let failing = {
+                let s0 = &sweep_slab[i0 * n..(i0 + 1) * n];
+                let s1 = &sweep_slab[i1 * n..(i1 + 1) * n];
+                self.interval_needs_split_slice_rt(
+                    s0,
+                    s1,
+                    min_depths,
+                    &tr_buf[..arm_dof],
+                    arm_dof,
+                    geom_bounds,
+                    sweep_phase,
+                )?
+            };
+            let Some((slot, d_max, min_d)) = failing else {
+                let ph = if (t1 - 1.0).abs() < 1e-12 { endpoint_phase } else { sweep_phase };
+                let s1 = &sweep_slab[i1 * n..(i1 + 1) * n];
+                self.check_and_advance_slice_rt(s1, min_depths, ph)?;
+                sweep_free.push(i0);
+                sweep_free.push(i1);
+                continue;
+            };
+            if dt <= 1e-9 {
+                return Err(WorkspaceFailureRt {
+                    kind: WorkspaceFailureKindRt::Constraint {
+                        slot,
+                        depth: d_max,
+                        min_d,
+                    },
+                    phase: sweep_phase,
+                });
+            }
+            if *remaining_budget == 0
+                || sweep_free.len() < 2
+                || sweep_stack.len() + 2 > sweep_stack.capacity()
+            {
+                return Err(WorkspaceFailureRt {
+                    kind: WorkspaceFailureKindRt::BudgetExceeded { max_budget },
+                    phase: sweep_phase,
+                });
+            }
+            *remaining_budget -= 1;
+            let tm = 0.5 * (t0 + t1);
+            let tm32 = tm as f32;
+            for j in 0..dof {
+                qm_buf[j] = a[j] + tm32 * (b[j] - a[j]);
+            }
+            self.eval_into_slice_rt(&qm_buf[..dof], scratch_cm, world_caps, sweep_phase)?;
+            self.check_readonly_slice_rt(scratch_cm, min_depths, sweep_phase)?;
+            let im1 = sweep_free.pop().unwrap();
+            let im2 = sweep_free.pop().unwrap();
+            sweep_slab[im1 * n..(im1 + 1) * n].copy_from_slice(&scratch_cm[..n]);
+            sweep_slab[im2 * n..(im2 + 1) * n].copy_from_slice(&scratch_cm[..n]);
+            sweep_stack.push((tm, im1, t1, i1));
+            sweep_stack.push((t0, i0, tm, im2));
+        }
+        Ok(())
+    }
+
     pub fn describe_failure(
         &self,
         slot: usize,
@@ -1568,6 +2150,26 @@ impl<'a> WorkspaceEvaluator<'a> {
         }
         k::advance_min_depths(cs, min_depths.as_mut_slice());
         Ok(())
+    }
+
+    /// True when every configured link capsule resolves to a known frame (zero-alloc RT precheck).
+    pub fn capsules_valid(&self) -> bool {
+        self.capsules.iter().all(|(fr_opt, _, _, _)| fr_opt.is_some())
+    }
+
+    /// Zero-allocation variant of [`Self::check_and_advance`]: returns `false` if any workspace
+    /// constraint is rejected, otherwise advances `min_depths` and returns `true`.
+    pub fn check_and_advance_rt(
+        &self,
+        clr: &k::SlotBuf,
+        min_depths: &mut k::SlotBuf,
+    ) -> bool {
+        let cs = clr.as_slice();
+        if k::first_workspace_rejection_with_tol(cs, min_depths.as_slice(), self.escape_tol).is_some() {
+            return false;
+        }
+        k::advance_min_depths(cs, min_depths.as_mut_slice());
+        true
     }
 
     /// Check `clr` against `min_depths` without mutating `min_depths`.

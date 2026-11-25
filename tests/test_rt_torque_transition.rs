@@ -48,6 +48,7 @@ fn rig_with(drive: impl FnOnce(DamiaoArmDriver<FakeBus>) -> DamiaoArmDriver<Fake
     d.check_mapping_ranges();
     let mut inner = SupervisorInner::new(ArmConfig { lease_timeout_ms: 600_000, ..ArmConfig::rebot_dm() }).with_driver(Box::new(d));
     inner.lease_enabled = false;
+    inner.register_live_connection(1).unwrap();
     inner.tick(0.02);
     let (fx, b, _tw, _stop) = ReleaseFixture::new(inner, BOOT, Capacities { commands: 4, plans: 1, replies: 8 });
     Rig { fx, b, bus, clock, seq: 0 }

@@ -2209,6 +2209,7 @@ async fn tail_stall_sub_release_overrun_in_flight_stall_and_load_py_boundaries()
         };
         let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
         sup.set_lease_enabled(false).await;
+        sup.inner().write().await.register_live_connection(1).unwrap();
         let handle = sup
             .start_executor_with_hooks(
                 ExecutorConfig::for_tests(Duration::from_millis(20)),

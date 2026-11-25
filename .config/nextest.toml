@@ -1,12 +1,14 @@
 # cargo-nextest configuration (https://nexte.st). Install: `cargo install cargo-nextest --locked`.
 #
-#   cargo nextest run --workspace                 # every test, one process per test
-#   cargo nextest run --workspace --profile fast  # day-to-day: without the slow motion/vision binaries
-#   cargo nextest run --workspace --profile ci    # before a merge (and `cargo test --workspace` once)
+#   cargo nextest run --workspace                  # every test, one process per test
+#   cargo nextest run --workspace --profile quick  # iteration: excludes slow motion/vision/replay integration suites
+#   cargo nextest run --workspace --profile fast   # day-to-day: without the slow motion/vision binaries
+#   cargo nextest run --workspace --profile ci     # full suite before a merge (and `cargo test --workspace` once)
 #
 # Each test runs in its own process, so tests of one binary do not share statics or env vars.
 
 [profile.default]
+test-threads = "num-cpus"
 retries = 0
 fail-fast = false
 # report a test as SLOW after 30 s, kill it after 6 periods (3 min)
@@ -21,6 +23,21 @@ fail-fast = false
 slow-timeout = { period = "60s", terminate-after = 5 }
 final-status-level = "slow"
 junit = { path = "junit.xml" }
+
+# Fast iteration lane: excludes the slow motion/vision/replay integration tests and warns
+# early on slow tests (10 s). Keep `ci` (or default) for full verification before merging.
+[profile.quick]
+default-filter = """
+not (binary(test_mview_gray_bundle) | binary(test_ws_replay) | binary(test_move_path_joint)
+     | binary(test_place) | binary(test_grasp) | binary(test_replay) | binary(test_poses)
+     | binary(test_yaw_outward) | binary(test_teach_sequences) | binary(test_measure_multiview)
+     | binary(test_mview_stereo) | binary(test_calib_hover)
+     | test(=test_5dof_place_execution_lateral_target))
+"""
+retries = 0
+fail-fast = true
+slow-timeout = { period = "10s", terminate-after = 6 }
+final-status-level = "slow"
 
 # Day-to-day lane: leaves out the test binaries that drive simulated motions or the multi-view
 # measurement in real time (over 85 % of the test time, spark 2026-11-23). Run them with the

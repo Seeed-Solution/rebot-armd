@@ -1,5 +1,4 @@
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
@@ -8,6 +7,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use armd::{create_router_with_auth, ArmConfig, ArmSupervisor, OperatorAuth};
 #[cfg(test)]
 use armd::SupervisorInner;
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 
 #[derive(Debug, Default)]
 struct CliArgs {
@@ -246,6 +247,7 @@ fn resolve_follower_config(follower: &str, config_path: Option<&str>) -> Result<
             expected_dof.unwrap()
         ));
     }
+    config.validate_step1_driver_parity(follower)?;
     Ok(config)
 }
 
@@ -336,8 +338,7 @@ where
             Ok(Err(e)) => {
                 error!("Final shutdown commit refused by RT owner: {e}");
                 server_handle.abort();
-                supervisor.e_stop_latched.store(true, Ordering::SeqCst);
-                supervisor.requested_estop_count.fetch_add(1, Ordering::SeqCst);
+                supervisor.estop_state.request_and_latch();
                 let h_disable = handle.clone();
                 let outcome = tokio::task::spawn_blocking(move || h_disable.emergency_disable_and_join())
                     .await
@@ -350,8 +351,7 @@ where
             Err(je) => {
                 error!("Final shutdown commit task failed: {je}");
                 server_handle.abort();
-                supervisor.e_stop_latched.store(true, Ordering::SeqCst);
-                supervisor.requested_estop_count.fetch_add(1, Ordering::SeqCst);
+                supervisor.estop_state.request_and_latch();
                 let h_disable = handle.clone();
                 let outcome = tokio::task::spawn_blocking(move || h_disable.emergency_disable_and_join())
                     .await
@@ -372,8 +372,7 @@ where
         if !confirmed {
             error!("Final legacy shutdown recheck refused: hardware disable is not confirmed");
             server_handle.abort();
-            supervisor.e_stop_latched.store(true, Ordering::SeqCst);
-            supervisor.requested_estop_count.fetch_add(1, Ordering::SeqCst);
+            supervisor.estop_state.request_and_latch();
             // Stop the legacy periodic loop first so it stops competing for the supervisor lock
             // and actuator bus while bounded emergency disable runs.
             supervisor.signal_legacy_stop(&control_stop);
@@ -465,6 +464,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     armd::rt_core::executor::validate_startup_owner(rt_owner, follower)?;
     let config = resolve_follower_config(follower, cli.config.as_deref())?;
     let config = apply_cli_tool(config, cli.tool.as_deref())?;
+    config.validate_step1_driver_parity(follower)?;
     if follower == "mock" && cli.follower_port.is_some() {
         return Err("--follower-port requires a hardware follower".into());
     }
@@ -642,7 +642,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }));
                     if let Err(e) = tick_res {
                         armd::rt_core::executor::account_periodic_overrun_on_panic_exit(&loop_stats);
-                        control_supervisor.e_stop_latched.store(true, Ordering::SeqCst);
+                        control_supervisor.estop_state.request_and_latch();
                         error!("Control thread panicked during tick: {:?}", e);
                         let outcome = control_supervisor
                             .attempt_legacy_panic_disable(armd::supervisor::PANIC_DISABLE_TIMEOUT);
@@ -1132,6 +1132,94 @@ mod shutdown_tests {
         let rs = resolve_follower_config("rebot-rs", Some(profile)).unwrap();
         assert_eq!(rs.dof, 6);
         assert!(rs.kinematics.is_some() && rs.workspace.is_some());
+
+        // Pre-transport validation rejects unsupported vendor bindings and conflicts.
+        let dir = tempfile::tempdir().unwrap();
+        let bad_rs = dir.path().join("bad_rs_mode.json");
+        let mut val: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(profile).unwrap()).unwrap();
+        val["urdf"] = serde_json::json!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/ReBot_Arm_RS.urdf"));
+        val["control_mode"] = serde_json::json!([
+            {"mode": "position"},
+            null, null, null, null, null
+        ]);
+        std::fs::write(&bad_rs, serde_json::to_string_pretty(&val).unwrap()).unwrap();
+        let err = resolve_follower_config("rebot-rs", Some(bad_rs.to_str().unwrap())).unwrap_err();
+        assert!(err.contains("does not support control mode 'position'"), "{err}");
+
+        // Cross-vendor profile (Feetech profile passed to rebot-rs) fails before transport open.
+        let so101 = concat!(env!("CARGO_MANIFEST_DIR"), "/profiles/so_arm101.json");
+        let err = resolve_follower_config("rebot-rs", Some(so101)).unwrap_err();
+        assert!(err.contains("conflicts with feetech"), "{err}");
+
+        // Blocker 1 regression: migrated B601-DM profile removing `damiao_gripper` and declaring
+        // J7 `position_force` solely via `control_mode` MUST be refused before transport opens
+        // in Step 1, because `src/driver.rs` still reads `damiao_gripper` and would otherwise
+        // silently run J7 in uncapped legacy POS_VEL.
+        let dm_profile = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/kits/recamera-b601dm/profile/rebot-b601dm.json"
+        );
+        let dm_base: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dm_profile).unwrap()).unwrap();
+
+        let mut migrated_j7 = dm_base.clone();
+        migrated_j7.as_object_mut().unwrap().remove("damiao_gripper");
+        migrated_j7["control_mode"] = serde_json::json!([
+            null, null, null, null, null, null,
+            {
+                "mode": "position_force",
+                "limits": {
+                    "current_ceiling_raw": 460,
+                    "close_speed_rad_s": 0.3,
+                    "calibrated": false
+                }
+            }
+        ]);
+        let migrated_j7_path = dir.path().join("migrated_j7_only.json");
+        std::fs::write(&migrated_j7_path, serde_json::to_string_pretty(&migrated_j7).unwrap())
+            .unwrap();
+        let err = resolve_follower_config("rebot-dm", Some(migrated_j7_path.to_str().unwrap()))
+            .unwrap_err();
+        assert!(err.contains("Step-1 driver path"), "{err}");
+
+        // Matching `damiao_gripper` + explicit `control_mode[6]` passes Step-1 parity check.
+        let mut parity_j7 = dm_base.clone();
+        parity_j7["control_mode"] = migrated_j7["control_mode"].clone();
+        let parity_j7_path = dir.path().join("parity_j7.json");
+        std::fs::write(&parity_j7_path, serde_json::to_string_pretty(&parity_j7).unwrap())
+            .unwrap();
+        let ok_parity =
+            resolve_follower_config("rebot-dm", Some(parity_j7_path.to_str().unwrap())).unwrap();
+        assert_eq!(ok_parity.dof, 7);
+
+        // Major 1 regression: legacy Damiao profile with omitted `control_mode` and lower
+        // commissioned `damiao_ranges[0].v_max = 1.5` remains accepted at daemon startup.
+        let mut low_vmax = dm_base.clone();
+        low_vmax["damiao_ranges"][0]["v_max"] = serde_json::json!(1.5);
+        let low_vmax_path = dir.path().join("legacy_low_vmax.json");
+        std::fs::write(&low_vmax_path, serde_json::to_string_pretty(&low_vmax).unwrap()).unwrap();
+        let ok_low =
+            resolve_follower_config("rebot-dm", Some(low_vmax_path.to_str().unwrap())).unwrap();
+        assert_eq!(ok_low.dof, 7);
+
+        // Major 6 regression: Damiao profile without `damiao_ranges` declaring explicit POS_VEL
+        // velocity 31.0 (above default wire v_max 30.0) fails identically in `validate()` and startup.
+        let mut over_vmax = dm_base;
+        over_vmax.as_object_mut().unwrap().remove("damiao_ranges");
+        over_vmax.as_object_mut().unwrap().remove("torque_guard");
+        over_vmax["control_mode"] = serde_json::json!([
+            { "mode": "position_velocity", "limits": { "max_velocity_rad_s": 31.0 } },
+            null, null, null, null, null, null
+        ]);
+        let over_vmax_path = dir.path().join("over_vmax_dm.json");
+        std::fs::write(&over_vmax_path, serde_json::to_string_pretty(&over_vmax).unwrap()).unwrap();
+        let mut parsed_over = ArmConfig::from_profile_file(&over_vmax_path).unwrap();
+        let err_val = parsed_over.validate().unwrap_err();
+        let err_start =
+            resolve_follower_config("rebot-dm", Some(over_vmax_path.to_str().unwrap())).unwrap_err();
+        assert_eq!(err_val, err_start);
+        assert!(err_start.contains("exceeds Damiao wire v_max"), "{err_start}");
     }
 
     #[test]

@@ -18,17 +18,279 @@ use rtrb::{Consumer, Producer, RingBuffer};
 /// ordinary `Broker` command/plan/reply admission and `MaintClient` capacity.
 pub const URGENT_STOP_CAPACITY: usize = 64;
 
+/// Single lock-free atomic state packing the monotonic E-stop request generation (upper 63
+/// bits) and the E-stop latch flag (bit 0) into ONE `AtomicU64`.
+///
+/// Layout: `(generation << 1) | (latched as u64)`
+///
+/// Because generation and latch live in the same 64-bit word:
+/// - Triggering an E-stop ([`Self::request_and_latch`]) atomically increments `generation`
+///   and sets bit 0 in one CAS loop (zero gap between counter bump and latch).
+/// - Clearing a prior E-stop ([`Self::try_clear_if_generation`]) clears bit 0 via a single
+///   `compare_exchange` only when `generation == expected_gen`. If any concurrent E-stop
+///   has already incremented `generation`, the CAS fails and bit 0 is NEVER cleared (zero
+///   transient-false window).
+#[derive(Debug, Default)]
+pub struct EstopState {
+    word: AtomicU64,
+}
+
+impl EstopState {
+    const LATCH_BIT: u64 = 1;
+
+    #[inline]
+    pub const fn new() -> Self {
+        Self { word: AtomicU64::new(0) }
+    }
+
+    #[inline]
+    pub const fn pack(generation: u64, latched: bool) -> u64 {
+        (generation << 1) | (latched as u64)
+    }
+
+    #[inline]
+    pub const fn unpack_gen(word: u64) -> u64 {
+        word >> 1
+    }
+
+    #[inline]
+    pub const fn unpack_latched(word: u64) -> bool {
+        (word & Self::LATCH_BIT) != 0
+    }
+
+    /// Atomically increments the request generation AND sets the latch bit in one step.
+    /// Returns the new generation (`>= 1`). Lock-free and allocation-free.
+    #[inline]
+    pub fn request_and_latch(&self) -> u64 {
+        let prev = self
+            .word
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |w| {
+                let next_gen = (w >> 1).checked_add(1)?;
+                Some((next_gen << 1) | Self::LATCH_BIT)
+            })
+            .expect("E-stop generation overflow (2^63)");
+        (prev >> 1) + 1
+    }
+
+    /// Atomically sets the latch bit without advancing the request generation (for owner-side
+    /// internal latches such as shutdown, panic, or `StopPolicy::EStopLatch`).
+    #[inline]
+    pub fn latch(&self) {
+        self.word.fetch_or(Self::LATCH_BIT, Ordering::SeqCst);
+    }
+
+    /// Atomically returns `(generation, latched)` from a single load.
+    #[inline]
+    pub fn snapshot(&self) -> (u64, bool) {
+        let w = self.word.load(Ordering::SeqCst);
+        (Self::unpack_gen(w), Self::unpack_latched(w))
+    }
+
+    #[inline]
+    pub fn is_latched(&self) -> bool {
+        Self::unpack_latched(self.word.load(Ordering::SeqCst))
+    }
+
+    #[inline]
+    pub fn is_latched_with(&self, order: Ordering) -> bool {
+        Self::unpack_latched(self.word.load(order))
+    }
+
+    #[inline]
+    pub fn requested_count(&self) -> u64 {
+        Self::unpack_gen(self.word.load(Ordering::SeqCst))
+    }
+
+    #[inline]
+    pub fn requested_count_with(&self, order: Ordering) -> u64 {
+        Self::unpack_gen(self.word.load(order))
+    }
+
+    /// Atomically clears the latch bit ONLY if `generation == expected_gen`.
+    ///
+    /// Returns `Ok(())` when the latch bit is confirmed `false` at `expected_gen`, or
+    /// `Err(observed_gen)` when a newer E-stop has already advanced `generation` — leaving
+    /// the latch bit untouched (never transiently `false`).
+    #[inline]
+    pub fn try_clear_if_generation(&self, expected_gen: u64) -> Result<(), u64> {
+        let latched_word = Self::pack(expected_gen, true);
+        let cleared_word = Self::pack(expected_gen, false);
+        match self.word.compare_exchange(
+            latched_word,
+            cleared_word,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => Ok(()),
+            Err(obs) if obs == cleared_word => Ok(()),
+            Err(obs) => Err(Self::unpack_gen(obs)),
+        }
+    }
+
+    /// Advances the upper 63-bit generation by `delta` while preserving the latch bit.
+    /// Returns the previous generation.
+    #[inline]
+    pub fn fetch_add_generation(&self, delta: u64, order: Ordering) -> u64 {
+        let prev = self.word.fetch_add(delta << 1, order);
+        Self::unpack_gen(prev)
+    }
+
+    /// Replaces the upper 63-bit generation while preserving the latch bit (test helper).
+    #[inline]
+    pub fn store_generation_preserving_latch(&self, gen: u64, order: Ordering) {
+        let _ = self.word.fetch_update(order, Ordering::SeqCst, |w| {
+            Some((gen << 1) | (w & Self::LATCH_BIT))
+        });
+    }
+
+    /// Sets or clears bit 0 while preserving generation (used by [`EstopLatchView::store`]
+    /// in legacy tests; production code clears ONLY via [`Self::try_clear_if_generation`]).
+    #[inline]
+    pub fn store_latched_raw(&self, val: bool, order: Ordering) {
+        if val {
+            self.word.fetch_or(Self::LATCH_BIT, order);
+        } else {
+            self.word.fetch_and(!Self::LATCH_BIT, order);
+        }
+    }
+}
+
+/// Zero-overhead view of the latch bit inside the arm's single packed [`EstopState`].
+#[derive(Debug, Clone)]
+#[repr(transparent)]
+pub struct EstopLatchView(Arc<EstopState>);
+
+impl EstopLatchView {
+    #[inline]
+    pub fn new(state: Arc<EstopState>) -> Self { Self(state) }
+
+    #[inline]
+    pub fn load(&self, order: Ordering) -> bool { self.0.is_latched_with(order) }
+
+    #[inline]
+    pub fn store(&self, val: bool, order: Ordering) { self.0.store_latched_raw(val, order); }
+
+    #[inline]
+    pub fn state(&self) -> &Arc<EstopState> { &self.0 }
+}
+
+/// Zero-overhead view of the monotonic request counter inside the arm's single packed [`EstopState`].
+#[derive(Debug, Clone)]
+#[repr(transparent)]
+pub struct EstopCounterView(Arc<EstopState>);
+
+impl EstopCounterView {
+    #[inline]
+    pub fn new(state: Arc<EstopState>) -> Self { Self(state) }
+
+    #[inline]
+    pub fn load(&self, order: Ordering) -> u64 { self.0.requested_count_with(order) }
+
+    #[inline]
+    pub fn fetch_add(&self, val: u64, order: Ordering) -> u64 { self.0.fetch_add_generation(val, order) }
+
+    #[inline]
+    pub fn store(&self, val: u64, order: Ordering) { self.0.store_generation_preserving_latch(val, order); }
+
+    #[inline]
+    pub fn state(&self) -> &Arc<EstopState> { &self.0 }
+}
+
+#[derive(Debug, Clone)]
+enum EstopRequestedSource {
+    /// Production packed `(generation << 1) | latched` atomic word.
+    Packed(Arc<EstopState>),
+    /// Standalone counter for isolated driver/gate unit tests.
+    Raw(Arc<AtomicU64>),
+}
+
+impl EstopRequestedSource {
+    #[inline]
+    fn generation(&self) -> u64 {
+        match self {
+            Self::Packed(state) => state.requested_count(),
+            Self::Raw(counter) => counter.load(Ordering::SeqCst),
+        }
+    }
+
+    #[inline]
+    fn is_latched(&self) -> bool {
+        match self {
+            Self::Packed(state) => state.is_latched(),
+            Self::Raw(_) => false,
+        }
+    }
+}
+
 /// Requested vs applied E-stop generations of one arm, and optionally its authorized-stop
 /// generations ([`Self::with_stops`]): the output gate.
 #[derive(Debug, Clone)]
+/// Lock-free view of the arm's live lease generation and fence-first disconnect atomics,
+/// carried on [`EstopGate`] so the driver's single TX choke point (`DamiaoArmDriver::send`)
+/// and the single J7 emitter drop stale client-lease motion frames immediately after a
+/// disconnect, release, preemption, or expiry without acquiring any lock.
+pub struct LeaseGate {
+    current_gen: Arc<AtomicU64>,
+    fenced_gen: Arc<AtomicU64>,
+    pending_disconnect_hold: Arc<AtomicU64>,
+}
+
+impl LeaseGate {
+    pub fn new(
+        current_gen: Arc<AtomicU64>,
+        fenced_gen: Arc<AtomicU64>,
+        pending_disconnect_hold: Arc<AtomicU64>,
+    ) -> Self {
+        Self { current_gen, fenced_gen, pending_disconnect_hold }
+    }
+
+    /// Current unfenced live lease generation (`0` when no lease, fenced, or disconnect pending).
+    #[inline]
+    pub fn current_lease_gen(&self) -> u64 {
+        if self.pending_disconnect_hold.load(Ordering::SeqCst) > 0 {
+            return 0;
+        }
+        let cur = self.current_gen.load(Ordering::SeqCst);
+        let fenced = self.fenced_gen.load(Ordering::SeqCst);
+        if cur > 0 && cur > fenced { cur } else { 0 }
+    }
+
+    /// True when a motion frame produced under `entry_lease_gen` (`> 0`) has been fenced by
+    /// disconnect, release, preemption, or expiry. `entry_lease_gen == 0` (stop/hold, autonomous
+    /// watchdog park/unload, or lease-disabled) is never fenced.
+    #[inline]
+    pub fn is_fenced(&self, entry_lease_gen: u64) -> bool {
+        if entry_lease_gen == 0 {
+            return false;
+        }
+        if self.pending_disconnect_hold.load(Ordering::SeqCst) > 0 {
+            return true;
+        }
+        let fenced = self.fenced_gen.load(Ordering::SeqCst);
+        if entry_lease_gen <= fenced {
+            return true;
+        }
+        self.current_gen.load(Ordering::SeqCst) != entry_lease_gen
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct EstopGate {
-    requested: Arc<AtomicU64>,
+    requested: EstopRequestedSource,
     applied: Arc<AtomicU64>,
     stops: Option<StopRequests>,
+    lease: Option<LeaseGate>,
 }
 
 impl EstopGate {
-    pub fn new(requested: Arc<AtomicU64>, applied: Arc<AtomicU64>) -> Self { Self { requested, applied, stops: None } }
+    pub fn new(requested: Arc<AtomicU64>, applied: Arc<AtomicU64>) -> Self {
+        Self { requested: EstopRequestedSource::Raw(requested), applied, stops: None, lease: None }
+    }
+
+    /// Builds a gate reading directly from the arm's single packed [`EstopState`].
+    pub fn from_state(state: Arc<EstopState>, applied: Arc<AtomicU64>) -> Self {
+        Self { requested: EstopRequestedSource::Packed(state), applied, stops: None, lease: None }
+    }
 
     /// The gate also holds output while an authorized stop is requested and not applied
     /// ([`StopRequests::pending`]): a stop that arrives after the release's last check
@@ -38,12 +300,25 @@ impl EstopGate {
         self
     }
 
+    /// Attaches the arm's lock-free lease fence atomics so the driver TX choke point drops
+    /// stale client-lease motion frames immediately after disconnect, release, preemption, or expiry.
+    pub fn with_lease_gate(mut self, lease: LeaseGate) -> Self {
+        self.lease = Some(lease);
+        self
+    }
+
     /// An E-stop (or, with [`Self::with_stops`], an authorized stop) was requested and the
     /// tick has not applied it yet.
     #[inline]
     pub fn pending(&self) -> bool {
-        self.requested.load(Ordering::SeqCst) != self.applied.load(Ordering::SeqCst)
+        self.requested.generation() != self.applied.load(Ordering::SeqCst)
             || self.stops.as_ref().is_some_and(StopRequests::pending)
+    }
+
+    /// Whether the underlying packed [`EstopState`] currently has its latch bit set.
+    #[inline]
+    pub fn is_latched(&self) -> bool {
+        self.requested.is_latched()
     }
 
     /// Monotonic `(estop_requested, stop_requested)` generations observed through this gate
@@ -52,9 +327,22 @@ impl EstopGate {
     #[inline]
     pub fn generations(&self) -> (u64, u64) {
         (
-            self.requested.load(Ordering::SeqCst),
+            self.requested.generation(),
             self.stops.as_ref().map_or(0, StopRequests::current),
         )
+    }
+
+    /// Current live unfenced lease generation (`0` when no lease gate is attached, no active
+    /// lease exists, or a disconnect fence is active).
+    #[inline]
+    pub fn current_lease_gen(&self) -> u64 {
+        self.lease.as_ref().map_or(0, LeaseGate::current_lease_gen)
+    }
+
+    /// True when a motion frame produced under `entry_lease_gen` (`> 0`) has been fenced.
+    #[inline]
+    pub fn is_lease_fenced(&self, entry_lease_gen: u64) -> bool {
+        self.lease.as_ref().is_some_and(|l| l.is_fenced(entry_lease_gen))
     }
 }
 

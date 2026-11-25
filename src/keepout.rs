@@ -73,7 +73,7 @@ impl Default for Keepout {
 }
 
 impl SupervisorInner {
-    fn profile_keepout(&self) -> Vec<KeepoutBox> {
+    pub(crate) fn profile_keepout(&self) -> Vec<KeepoutBox> {
         self.keepout.profile.clone()
             .unwrap_or_else(|| self.config.workspace.as_ref().map(|ws| ws.keepout_boxes.clone()).unwrap_or_default())
     }

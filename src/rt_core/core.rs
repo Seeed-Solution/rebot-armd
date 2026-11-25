@@ -8,7 +8,7 @@ use super::config_iface::{ConfigDomain, ConfigHold, HeldConfig};
 use super::mailbox::TargetAuthority;
 use super::ops::TorqueProgress;
 use super::ids::{ArmId, BusId};
-use super::publish::{state_channel, ObservationSpares, RtInputs, RtMotionMeta, StateHub, StatePublisher};
+use super::publish::{state_channel, ObservationSpares, OwnerStateSnapshot, PublishedOwnerMeta, RtInputs, RtMotionMeta, StateHub, StatePublisher};
 use super::record_ring::{Fence, Finished, RecordProducer, RecordRing};
 use crate::driver::ArmDriver;
 use crate::model::ArmObservation;
@@ -190,19 +190,38 @@ impl ArmCore {
     /// nothing is displaced, so the tick never frees an observation (whatever the readers
     /// and the retire ring do).
     pub fn publish(&mut self, buffer: ObservationBuffer, generation: u64, sampled_at: Instant, valid_until: Instant, positions: &[f32], velocities: &[f32]) {
-        self.publish_with_motion(buffer, generation, sampled_at, valid_until, positions, velocities, &[], RtMotionMeta::default());
+        self.publish_with_rt_meta(
+            buffer,
+            generation,
+            sampled_at,
+            valid_until,
+            OwnerStateSnapshot::default(),
+            positions,
+            velocities,
+            positions,
+            &[],
+            &[],
+            PublishedOwnerMeta::default(),
+            RtMotionMeta::default(),
+        );
     }
 
-    /// Publishes one tick's observation alongside `commanded_velocities` and motion metadata (0 alloc).
-    pub fn publish_with_motion(
+    /// In-place zero-alloc publication carrying [`OwnerStateSnapshot`], commanded joints, driver
+    /// RX queue bounds, live `Copy` [`PublishedOwnerMeta`], and [`RtMotionMeta`] alongside the observation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_with_rt_meta(
         &mut self,
         buffer: ObservationBuffer,
         generation: u64,
         sampled_at: Instant,
         valid_until: Instant,
+        owner_state: OwnerStateSnapshot,
         positions: &[f32],
         velocities: &[f32],
+        commanded_positions: &[f32],
         commanded_velocities: &[f32],
+        feedback_queue_bounds: &[Option<Instant>],
+        owner: PublishedOwnerMeta,
         meta: RtMotionMeta,
     ) {
         self.buffer_out = false;
@@ -210,12 +229,15 @@ impl ArmCore {
         let rt = RtInputs {
             positions,
             velocities,
+            commanded_positions,
             commanded_velocities,
             feedback_instants: &self.feedback.instants,
             feedback_seqs: &self.feedback.seqs,
+            feedback_queue_bounds,
+            owner,
             meta,
         };
-        let displaced = self.publisher.publish(generation, sampled_at, valid_until, buffer.0, rt);
+        let displaced = self.publisher.publish_with_owner(generation, sampled_at, valid_until, buffer.0, owner_state, rt);
         // the slot was emptied by take_observation_buffer and nothing wrote it since
         debug_assert!(displaced.is_none(), "an in-place publication displaced an observation");
         if let Some(d) = displaced { self.publisher.restore_back_observation(d); }
@@ -232,9 +254,12 @@ impl ArmCore {
         let rt = RtInputs {
             positions,
             velocities,
+            commanded_positions: positions,
             commanded_velocities: &[],
             feedback_instants: &self.feedback.instants,
             feedback_seqs: &self.feedback.seqs,
+            feedback_queue_bounds: &[],
+            owner: PublishedOwnerMeta::default(),
             meta: RtMotionMeta::default(),
         };
         Ok(self.publisher.publish(generation, sampled_at, valid_until, obs, rt))
@@ -312,6 +337,17 @@ impl ArmCore {
         let p = self.transition?;
         if !matches!(p, Ok(TorqueProgress::Pending { .. })) { self.transition = None; }
         Some(p)
+    }
+
+    /// Consumes a failed/aborted transition outcome without touching a pending transition or
+    /// synchronous Step-3 `Ok(TorqueProgress::Done)` completion.
+    pub fn take_aborted_transition(&mut self) -> Option<&'static str> {
+        if let Some(Err(code)) = self.transition {
+            self.transition = None;
+            Some(code)
+        } else {
+            None
+        }
     }
 
     // -- macro terminals ------------------------------------------------------------------

@@ -7,7 +7,7 @@
 use super::*;
 use super::dispatch::{
     AdmissionClass, AuthRequirement, DispatchEntry, DispatchHandler, DispatchKey,
-    LeaseRequirement, OwnerDispatchCtx, ReplyPolicy,
+    LeaseRequirement, OwnerDispatchCtx, OwnerReply, ReplyPolicy,
 };
 
 pub(super) const ENTRIES: &[DispatchEntry] = &[
@@ -61,7 +61,26 @@ pub(super) const ENTRIES: &[DispatchEntry] = &[
     },
 ];
 
-fn dispatch_calibration_entry(ctx: &mut OwnerDispatchCtx<'_>) -> Option<Value> {
+/// Returns true if `path` is one of the WS calibration / motor-zero / joint-zero / MIT endpoints.
+pub(super) fn is_calibration_path(path: &str) -> bool {
+    ENTRIES.iter().any(|e| e.key.path == Some(path))
+}
+
+/// Fail-closed capability refusal for calibration, motor-zero, joint-zero, and MIT endpoints
+/// while the RT executor owns the arm (never touches disk or live state).
+pub(super) fn dispatch_executor_calibration_command(path: &str, value: &Value, epoch: u64) -> Value {
+    json!({
+        "type": "command_reject",
+        "request_id": value["request_id"],
+        "status": 409,
+        "code": "EXECUTOR_UNSUPPORTED",
+        "error": "EXECUTOR_UNSUPPORTED",
+        "message": format!("{path} is not available while the RT executor owns the arm; use the legacy owner"),
+        "epoch_id": epoch,
+    })
+}
+
+fn dispatch_calibration_entry(ctx: &mut OwnerDispatchCtx<'_>) -> Option<OwnerReply> {
     dispatch_calibration_command(
         ctx.inner,
         ctx.path,
@@ -146,14 +165,14 @@ pub(super) fn dispatch_calibration_command(
     local_generation: u64,
     epoch: u64,
     pending_calibration: &mut Option<(Value, CalibJob, u64, u64, bool)>,
-) -> Option<Value> {
+) -> Option<OwnerReply> {
     match calibration_job(inner, path, &value["body"]) {
         Ok(CalibStart::Job(job, busy)) => {
             *pending_calibration = Some((value["request_id"].clone(), job, local_generation, epoch, busy));
             None
         }
-        Ok(CalibStart::Reply(reply)) => Some(fields_ack(&value["request_id"], reply)),
-        Err(e) => Some(calibration_reject(&value["request_id"], &e)),
+        Ok(CalibStart::Reply(reply)) => Some(OwnerReply::FieldsAck(reply)),
+        Err(e) => Some(OwnerReply::CalibReject(e)),
     }
 }
 

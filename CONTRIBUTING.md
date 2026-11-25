@@ -34,17 +34,24 @@ test binaries; `.config/nextest.toml` holds the profiles.
 
 ```bash
 cargo install cargo-nextest --locked                    # once
+cargo nextest run --workspace --profile quick           # iteration lane: excludes slow integration suites, 10 s slow warning
 cargo nextest run --workspace --profile fast            # day to day (~1375 of ~1550 tests)
-cargo nextest run --workspace                           # every test
-cargo nextest run --workspace --profile ci              # before a merge, then `cargo test --workspace` once
+cargo nextest run --workspace                           # every test (test-threads = "num-cpus")
+cargo nextest run --workspace --profile ci              # full suite before a merge, then `cargo test --workspace` once
 cargo nextest run --workspace -j $(( $(nproc) * 2 ))    # more test processes than CPUs (see below)
 ```
 
+- `quick` is the fast iteration lane: it excludes the slow motion, vision, replay and multi-view
+  integration suites (`test_mview_gray_bundle`, `test_ws_replay`, `test_move_path_joint`,
+  `test_place`, `test_grasp`, `test_replay`, `test_poses`, `test_yaw_outward`,
+  `test_teach_sequences`, `test_measure_multiview`, `test_mview_stereo`, `test_calib_hover`,
+  and `test_5dof_place_execution_lateral_target`) and warns after 10 s.
 - `fast` leaves out the ten test binaries that drive simulated motions or the multi-view
   measurement in real time (`test_grasp`, `test_measure_multiview`, `test_mview_stereo`,
   `test_mview_gray_bundle`, `test_move_path_joint`, `test_place`, `test_calib_hover`,
-  `test_yaw_outward`, `test_teach_sequences`, `test_poses`). Run the default profile when a change
-  touches grasp, place, measurement, calibration hover or motion planning, and before a merge.
+  `test_yaw_outward`, `test_teach_sequences`, `test_poses`). Run `ci` (or the default profile,
+  which uses `test-threads = "num-cpus"`) when a change touches grasp, place, measurement,
+  calibration hover, replay or motion planning, and before a merge.
 - No profile retries a failing test, except `ci` for the wall-clock-rate tests
   (`test_damiao_smoothness`, `test_obs_rate`, `test_kincal_timing`, `test_alloc_timing`), which also
   run one at a time. A test is reported SLOW after 30 s and killed after 3 min.

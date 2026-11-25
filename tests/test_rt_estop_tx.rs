@@ -5,7 +5,6 @@
 //! one that arrives during the receive suppresses the whole output of that tick.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -28,7 +27,7 @@ enum Trigger {
 struct Shared {
     trigger: Trigger,
     targets_sent: usize,
-    requested: Option<(Arc<AtomicU64>, Arc<AtomicBool>)>,
+    requested: Option<Arc<armd::rt_core::urgent::EstopState>>,
 }
 
 /// Damiao motors answering every command frame with a feedback frame; counts target frames
@@ -43,9 +42,8 @@ struct Bus {
 impl Bus {
     fn raise(&self) {
         let s = self.shared.lock().unwrap();
-        if let Some((req, latched)) = &s.requested {
-            req.fetch_add(1, Ordering::SeqCst);
-            latched.store(true, Ordering::SeqCst);
+        if let Some(state) = &s.requested {
+            state.request_and_latch();
         }
     }
 
@@ -122,7 +120,7 @@ fn rig() -> (SupervisorInner, Arc<Mutex<Shared>>, MockClock) {
     let dof = cfg.dof;
     let driver = DamiaoArmDriver::new(bus, (1..=dof as u16).collect()).with_joint_limits(limits).unwrap();
     let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(driver));
-    shared.lock().unwrap().requested = Some((inner.requested_estop_count.clone(), inner.e_stop_latched.clone()));
+    shared.lock().unwrap().requested = Some(inner.estop_state.clone());
     inner.lease_enabled = false;
     step(&mut inner, &clock);
     { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.expect("arm");

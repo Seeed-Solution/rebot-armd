@@ -8,7 +8,7 @@ use super::*;
 #[cfg(feature = "policy-runtime")]
 use super::dispatch::{
     AdmissionClass, AuthRequirement, DispatchHandler, DispatchKey, LeaseRequirement,
-    OwnerDispatchCtx, ReplyPolicy,
+    OwnerDispatchCtx, OwnerReply, ReplyPolicy,
 };
 use super::dispatch::DispatchEntry;
 
@@ -51,14 +51,13 @@ fn policy_start_auth_check(
 pub(super) const ENTRIES: &[DispatchEntry] = &[];
 
 #[cfg(feature = "policy-runtime")]
-fn dispatch_policy_start(ctx: &mut OwnerDispatchCtx<'_>) -> Option<Value> {
+fn dispatch_policy_start(ctx: &mut OwnerDispatchCtx<'_>) -> Option<OwnerReply> {
     let body = &ctx.value["body"];
     if !body.is_object() {
-        return Some(command_reject(
-            ctx.inner,
-            &ctx.value["request_id"],
-            invalid_command("Command body must be an object"),
-        ));
+        return Some(OwnerReply::CommandReject {
+            epoch: ctx.inner.safety.epoch_id(),
+            error: invalid_command("Command body must be an object"),
+        });
     }
     match prepare_policy_start(ctx.inner, ctx.stamp, body, ctx.epoch) {
         Ok(pending) => {
@@ -72,27 +71,27 @@ fn dispatch_policy_start(ctx: &mut OwnerDispatchCtx<'_>) -> Option<Value> {
             ));
             None
         }
-        Err(error) => Some(command_reject(ctx.inner, &ctx.value["request_id"], error)),
+        Err(error) => Some(OwnerReply::CommandReject {
+            epoch: ctx.inner.safety.epoch_id(),
+            error,
+        }),
     }
 }
 
 #[cfg(feature = "policy-runtime")]
-fn dispatch_policy_stop(ctx: &mut OwnerDispatchCtx<'_>) -> Option<Value> {
+fn dispatch_policy_stop(ctx: &mut OwnerDispatchCtx<'_>) -> Option<OwnerReply> {
     let body = &ctx.value["body"];
     if !body.is_object() {
-        return Some(command_reject(
-            ctx.inner,
-            &ctx.value["request_id"],
-            invalid_command("Command body must be an object"),
-        ));
+        return Some(OwnerReply::CommandReject {
+            epoch: ctx.inner.safety.epoch_id(),
+            error: invalid_command("Command body must be an object"),
+        });
     }
     let stopped = prepare_policy_stop(ctx.inner);
-    Some(format_policy_stop_ack(
-        ctx.inner,
-        &ctx.value["request_id"],
+    Some(OwnerReply::PolicyStopAck {
+        snap: AckSnapshot::from_inner(ctx.inner),
         stopped,
-        ctx.pending_policy_loads,
-    ))
+    })
 }
 
 #[cfg(feature = "policy-runtime")]
@@ -183,19 +182,6 @@ pub(super) fn prepare_policy_start(
 pub(super) fn prepare_policy_stop(inner: &mut SupervisorInner) -> bool {
     inner.advance_stop_generation();
     inner.stop_policy_run(None, "STOPPED")
-}
-
-#[cfg(feature = "policy-runtime")]
-pub(super) fn format_policy_stop_ack(
-    inner: &SupervisorInner,
-    request_id: &Value,
-    stopped: bool,
-    pending_policy_loads: &AtomicUsize,
-) -> Value {
-    let had_pending = pending_policy_loads.load(Ordering::SeqCst) > 0;
-    let mut ack = command_ack(inner, request_id, None);
-    ack["stopped"] = json!(stopped || had_pending);
-    ack
 }
 
 /// Spawn off-lock policy preparation (artifact load, release gate, warmup speed gate) and
@@ -345,20 +331,48 @@ pub(super) fn spawn_policy_start(
             return;
         }
 
-        let reply = match prepared {
+        enum PolicyStartOutcome {
+            Closed,
+            Reject { epoch: u64, error: ApiError },
+            LeaseLost { epoch: u64 },
+            EpochMismatch { epoch: u64 },
+            RejectWithSpeed {
+                epoch: u64,
+                error: ApiError,
+                speed: crate::policy_runtime::SpeedGateReport,
+            },
+            Started {
+                snap: AckSnapshot,
+                action_id: u64,
+                prepared_policy: crate::policy_runtime::PreparedPolicy,
+                fps: f64,
+                deadline: Option<std::time::Instant>,
+                speed: crate::policy_runtime::SpeedGateReport,
+            },
+        }
+
+        let outcome = match prepared {
             Err(e) => {
-                let mut inner = sup.inner().write().await;
-                loading_guard.clear(&mut inner);
-                command_reject(
-                    &inner,
-                    &request_id,
-                    ArmError::Internal(format!("policy load task failed: {e}")).into(),
-                )
+                let epoch = {
+                    let mut inner = sup.inner().write().await;
+                    loading_guard.clear(&mut inner);
+                    inner.safety.epoch_id()
+                };
+                PolicyStartOutcome::Reject {
+                    epoch,
+                    error: ArmError::Internal(format!("policy load task failed: {e}")).into(),
+                }
             }
             Ok(Err(error)) => {
-                let mut inner = sup.inner().write().await;
-                loading_guard.clear(&mut inner);
-                command_reject(&inner, &request_id, error.into())
+                let epoch = {
+                    let mut inner = sup.inner().write().await;
+                    loading_guard.clear(&mut inner);
+                    inner.safety.epoch_id()
+                };
+                PolicyStartOutcome::Reject {
+                    epoch,
+                    error: error.into(),
+                }
             }
             Ok(Ok((prepared_policy, fps, verified_release_gate, speed))) => {
                 let deadline_res =
@@ -377,30 +391,35 @@ pub(super) fn spawn_policy_start(
                 let mut inner = sup.inner().write().await;
                 loading_guard.clear(&mut inner);
                 if ws_closed_c.load(Ordering::SeqCst) || inner.is_connection_closed(recv_conn_id) {
-                    return;
-                }
-                if gen_now.load(Ordering::SeqCst) != generation
+                    PolicyStartOutcome::Closed
+                } else if gen_now.load(Ordering::SeqCst) != generation
                     || !inner.validate_servo_lease(&conn, generation)
                 {
-                    json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while loading policy", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
+                    PolicyStartOutcome::LeaseLost {
+                        epoch: inner.safety.epoch_id(),
+                    }
                 } else if inner.safety.epoch_id() != epoch_id {
-                    json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"EPOCH_MISMATCH", "message":"Epoch changed while loading policy", "error":"EPOCH_MISMATCH", "epoch_id":inner.safety.epoch_id()})
+                    PolicyStartOutcome::EpochMismatch {
+                        epoch: inner.safety.epoch_id(),
+                    }
                 } else if !inner.policy_live_allowed() && !ws_auth_c.is_operator() {
                     // the operator session may have expired or been locked while loading
-                    command_reject(
-                        &inner,
-                        &request_id,
-                        ApiError::operator_required("policy/start (real arm)"),
-                    )
-                } else if let Err(err) = speed.check(request_mode) {
-                    let mut reply = command_reject(&inner, &request_id, err.into());
-                    for (k, v) in speed.ack_fields() {
-                        reply[k] = v;
+                    PolicyStartOutcome::Reject {
+                        epoch: inner.safety.epoch_id(),
+                        error: ApiError::operator_required("policy/start (real arm)"),
                     }
-                    reply
+                } else if let Err(err) = speed.check(request_mode) {
+                    PolicyStartOutcome::RejectWithSpeed {
+                        epoch: inner.safety.epoch_id(),
+                        error: err.into(),
+                        speed,
+                    }
                 } else {
                     match deadline_res {
-                        Err(err) => command_reject(&inner, &request_id, err.into()),
+                        Err(err) => PolicyStartOutcome::Reject {
+                            epoch: inner.safety.epoch_id(),
+                            error: err.into(),
+                        },
                         Ok(deadline) => {
                             let deployment_check = if let Some(ref gate) = verified_release_gate {
                                 let (cur_scene, cur_tool) = active_scene_tool.unwrap_or_default();
@@ -414,7 +433,10 @@ pub(super) fn spawn_policy_start(
                                 Ok(())
                             };
                             if let Err(err) = deployment_check {
-                                command_reject(&inner, &request_id, err.into())
+                                PolicyStartOutcome::Reject {
+                                    epoch: inner.safety.epoch_id(),
+                                    error: err.into(),
+                                }
                             } else {
                                 let start_req = crate::policy_runtime::PolicyRunStart {
                                     epoch_id,
@@ -439,56 +461,86 @@ pub(super) fn spawn_policy_start(
                                     .and_then(|admitted| {
                                         SupervisorInner::begin_policy_run(admitted, start_req)
                                     }) {
-                                    Ok(action_id) => {
-                                        let digest = prepared_policy.artifact_digest().to_string();
-                                        let backend = prepared_policy.backend_name().to_string();
-                                        let mode_str = pending.request.mode.as_str().to_string();
-                                        let vision_source = prepared_policy
-                                            .contract()
-                                            .vision
-                                            .as_ref()
-                                            .map(|_| {
-                                                Arc::new(
-                                                    crate::policy_runtime::DetectionSourceAdapter(
-                                                        vision_src.clone(),
-                                                    ),
-                                                )
-                                                    as Arc<
-                                                        dyn crate::policy_runtime::PolicyVisionSource,
-                                                    >
-                                            });
-                                        crate::policy_runtime::spawn_policy_runner(
-                                            sup.clone(),
-                                            action_id,
-                                            prepared_policy,
-                                            fps,
-                                            deadline,
-                                            vision_source,
-                                            Some(sandbox_c.clone()),
-                                        );
-                                        let mut ack = command_ack(
-                                            &inner,
-                                            &request_id,
-                                            Some((
-                                                action_id,
-                                                pending.request.max_seconds.unwrap_or(0.0),
-                                            )),
-                                        );
-                                        ack["policy_id"] = json!(policy_id);
-                                        ack["artifact_digest"] = json!(digest);
-                                        ack["backend"] = json!(backend);
-                                        ack["mode"] = json!(mode_str);
-                                        for (k, v) in speed.ack_fields() {
-                                            ack[k] = v;
-                                        }
-                                        ack
-                                    }
-                                    Err(error) => command_reject(&inner, &request_id, error.into()),
+                                    Ok(action_id) => PolicyStartOutcome::Started {
+                                        snap: AckSnapshot::from_inner(&inner),
+                                        action_id,
+                                        prepared_policy,
+                                        fps,
+                                        deadline,
+                                        speed,
+                                    },
+                                    Err(error) => PolicyStartOutcome::Reject {
+                                        epoch: inner.safety.epoch_id(),
+                                        error: error.into(),
+                                    },
                                 }
                             }
                         }
                     }
                 }
+            }
+        };
+        // Write guard is now released; spawn runner and build every JSON reply strictly off-lock.
+        let reply = match outcome {
+            PolicyStartOutcome::Closed => return,
+            PolicyStartOutcome::Reject { epoch, error } => {
+                command_reject_at(epoch, &request_id, error)
+            }
+            PolicyStartOutcome::LeaseLost { epoch } => {
+                json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while loading policy", "error":"LEASE_LOST", "epoch_id":epoch})
+            }
+            PolicyStartOutcome::EpochMismatch { epoch } => {
+                json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"EPOCH_MISMATCH", "message":"Epoch changed while loading policy", "error":"EPOCH_MISMATCH", "epoch_id":epoch})
+            }
+            PolicyStartOutcome::RejectWithSpeed { epoch, error, speed } => {
+                let mut reply = command_reject_at(epoch, &request_id, error);
+                for (k, v) in speed.ack_fields() {
+                    reply[k] = v;
+                }
+                reply
+            }
+            PolicyStartOutcome::Started {
+                snap,
+                action_id,
+                prepared_policy,
+                fps,
+                deadline,
+                speed,
+            } => {
+                let digest = prepared_policy.artifact_digest().to_string();
+                let backend = prepared_policy.backend_name().to_string();
+                let mode_str = pending.request.mode.as_str().to_string();
+                let vision_source = prepared_policy
+                    .contract()
+                    .vision
+                    .as_ref()
+                    .map(|_| {
+                        Arc::new(crate::policy_runtime::DetectionSourceAdapter(
+                            vision_src.clone(),
+                        )) as Arc<dyn crate::policy_runtime::PolicyVisionSource>
+                    });
+                crate::policy_runtime::spawn_policy_runner(
+                    sup.clone(),
+                    action_id,
+                    prepared_policy,
+                    fps,
+                    deadline,
+                    vision_source,
+                    Some(sandbox_c.clone()),
+                );
+                let mut ack = command_ack_from_snap(
+                    &snap,
+                    &request_id,
+                    Some((action_id, pending.request.max_seconds.unwrap_or(0.0))),
+                );
+                ack["policy_id"] = json!(policy_id);
+                ack["artifact_digest"] = json!(digest);
+                ack["backend"] = json!(backend);
+                ack["mode"] = json!(mode_str);
+                for (k, v) in speed.ack_fields() {
+                    ack[k] = v;
+                }
+                ack
             }
         };
         let _ = tx.send(reply).await;

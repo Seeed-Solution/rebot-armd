@@ -635,7 +635,7 @@ impl crate::supervisor::SupervisorInner {
         {
             return false;
         }
-        let arm = self.config.arm_joint_indices();
+        let arm = self.config.arm_joints();
         let velocity_feedback = self
             .driver
             .as_ref()
@@ -676,7 +676,7 @@ impl crate::supervisor::SupervisorInner {
             self.tracking.position_sample = None;
             return;
         }
-        let arm = self.config.arm_joint_indices();
+        let arm = self.config.arm_joints();
         let range = self.feedback_instant_range();
         let keep = self.tracking.position_sample.as_ref().is_some_and(|(oldest, newest, q_ref)| {
             // Age of the reference (its oldest reply) against this sample's newest reply
@@ -721,6 +721,16 @@ impl crate::supervisor::SupervisorInner {
                 if dof == base.len() {
                     for (l, &v) in base.iter_mut().zip(&vcaps[..dof]) {
                         l.max_velocity = l.max_velocity.min(v);
+                    }
+                }
+            } else if let Some(max_v) = self
+                .active_trajectory
+                .as_ref()
+                .and_then(|a| a.motion_max_velocity)
+            {
+                for (i, l) in base.iter_mut().enumerate().take(max_v.len()) {
+                    if max_v[i].is_finite() && max_v[i] > 0.0 {
+                        l.max_velocity = l.max_velocity.min(max_v[i]);
                     }
                 }
             }

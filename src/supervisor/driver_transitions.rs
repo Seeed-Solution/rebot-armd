@@ -24,6 +24,17 @@ pub(crate) struct CandidateDriverLimits {
     min: [f32; crate::rt_core::mailbox::MAX_DOF],
     max: [f32; crate::rt_core::mailbox::MAX_DOF],
     vel: [f32; crate::rt_core::mailbox::MAX_DOF],
+    raw_pos: [Option<(f32, f32)>; crate::rt_core::mailbox::MAX_DOF],
+}
+
+/// Side effects staged during `clear_fault` preflight and applied ONLY AFTER
+/// `SafetyManager::clear_with_check` commits (zero state mutations on refusal).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ClearFaultCommit {
+    pub(crate) candidate_limits: Option<CandidateDriverLimits>,
+    pub(crate) reapply_legacy_limits: bool,
+    pub(crate) is_torqued: Option<bool>,
+    pub(crate) thermal_cooldown: Option<ThermalCooldown>,
 }
 
 /// Result of a bounded last-chance hardware disable attempt on a panic or forced teardown path.
@@ -525,21 +536,81 @@ pub(crate) enum ParkRearmStart {
     Pending,
 }
 
-/// A torque transition started by the owner and served once per poll: the driver's
+/// Maximum retries of a background hardware disable before latching `DisableUnconfirmed`.
+pub const BACKGROUND_DISABLE_MAX_RETRIES: u8 = 8;
+/// Spacing between bounded background hardware disable retries (driver clock).
+pub const BACKGROUND_DISABLE_RETRY_INTERVAL: Duration = Duration::from_millis(25);
+/// Upper time bound for bounded background hardware disable retries before latching a fault.
+pub const BACKGROUND_DISABLE_MAX_WINDOW: Duration = Duration::from_millis(500);
+
+/// Single executor-owned bounded retry state machine for a background hardware disable whose
+/// initial disable attempt failed or ended unconfirmed.
+///
+/// Every retry is funneled strictly through the driver's single `begin_torque_budgeted(false, 0)`
+/// (`send(TxKind::Disable, ...)`) choke point so torque-off rest rules apply uniformly.
+/// Once [`Self::Exhausted`] is entered, retries stop permanently until hardware confirms disabled
+/// (`disable_confirmed`) or an explicit recovery action clears the fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BackgroundDisableRetry {
+    Active {
+        attempts: u8,
+        started_at: Instant,
+        next_retry_at: Instant,
+    },
+    Exhausted,
+}
+
+/// Authority tuple captured from [`AdmittedProof`] when a `TorqueTransition::Enable` starts,
+/// re-verified before every subsequent enable retry TX so a displaced lease, disconnect, E-stop,
+/// fault, or epoch change aborts immediately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EnableAuthority {
+    pub lease_generation: u64,
+    pub owner_conn_id: u64,
+    pub admitted_epoch: u64,
+}
+
+/// A torque transition started by the owner ([`crate::rt_core::ops::CoreOps::commit_transition`]
+/// or park rearm/disable) and served once per [`crate::rt_core::ops::CoreOps::poll_hardware`]: the driver's
 /// handshake (`ArmDriver::begin_torque` / `poll_torque`), then, for a disable, the
 /// supervisor's own confirmation ([`DisableConfirm`]). Its outcome is applied to the
 /// supervisor state when it ends (torque flags, safety state, fault on failure), exactly as
 /// the blocking `set_torque` applies it.
 #[derive(Debug, Clone, Copy)]
 pub enum TorqueTransition {
-    /// Waiting for the driver's enable confirmation.
-    Enable { origin: EnableOrigin, was_torqued: bool, prev_gripper_cmd: Option<f32> },
+    /// Waiting for the driver's enable confirmation under `authority`.
+    Enable {
+        origin: EnableOrigin,
+        was_torqued: bool,
+        prev_gripper_cmd: Option<f32>,
+        authority: EnableAuthority,
+    },
     /// Waiting for the driver's disable handshake (`confirm` None), then for fresh feedback
-    /// reporting every motor disabled.
-    Disable { origin: DisableOrigin, confirm: Option<DisableConfirm> },
+    /// reporting every motor disabled, anchored to the original `DisableRequested` timestamp
+    /// (`requested_at`, driver clock) so any background retries keep the request's original lifetime.
+    Disable {
+        origin: DisableOrigin,
+        confirm: Option<DisableConfirm>,
+        requested_at: Instant,
+    },
+}
+
+/// Static protocol code for an admission refusal on RT torque paths (zero allocations).
+fn torque_admission_error_code(e: &SafetyError) -> &'static str {
+    match e {
+        SafetyError::EStopActive => "ESTOP_ACTIVE",
+        SafetyError::Stopped => "STOPPED",
+        SafetyError::LeaseLost => "LEASE_LOST",
+        SafetyError::EpochMismatch { .. } => "EPOCH_MISMATCH",
+        SafetyError::StampAlreadyConsumed => "STAMP_REUSED",
+        SafetyError::OwnerTransferred => "OWNER_TRANSFERRED",
+        SafetyError::FaultActive(_) => "FAULT_ACTIVE",
+        _ => "REJECTED",
+    }
 }
 
 /// The terminal code of a refused or failed enable / disable step.
+#[allow(dead_code)]
 fn torque_error_code(e: &SafetyError) -> &'static str {
     match e {
         SafetyError::EStopActive => "ESTOP_ACTIVE",
@@ -550,9 +621,43 @@ fn torque_error_code(e: &SafetyError) -> &'static str {
     }
 }
 
+/// Zero-allocation error returned by RT `clear_fault_executor_bounded_for_release_with_authority`.
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // inline ClearFaultError keeps RT clear_fault strictly zero-alloc
+pub(crate) enum ClearFaultWithAuthError {
+    Authority(crate::rt_core::requests::lease::ClearFaultAuthorityError),
+    Clear(crate::safety::ClearFaultError),
+}
+
+/// Legacy internal error distinguishing M3 live authority revocation from `SafetyError`.
+#[derive(Debug)]
+pub(crate) enum ClearFaultLegacyInnerError {
+    Authority(crate::rt_core::requests::lease::ClearFaultAuthorityError),
+    Safety(SafetyError),
+}
+
+/// Legacy confirmed clear_fault error distinguishing M3 live authority revocation from `ArmError`.
+#[derive(Debug)]
+pub(crate) enum ClearFaultLegacyWithAuthError {
+    Authority(crate::rt_core::requests::lease::ClearFaultAuthorityError),
+    Arm(crate::supervisor::ArmError),
+}
+
+impl From<SafetyError> for ClearFaultLegacyInnerError {
+    fn from(e: SafetyError) -> Self {
+        Self::Safety(e)
+    }
+}
+
+impl From<crate::safety::ClearFaultError> for ClearFaultWithAuthError {
+    fn from(e: crate::safety::ClearFaultError) -> Self {
+        Self::Clear(e)
+    }
+}
+
 impl SupervisorInner {
     pub fn with_driver(mut self, mut driver: Box<dyn ArmDriver>) -> Self {
-        driver.set_abort_flag(self.e_stop_latched.clone());
+        driver.set_estop_state(self.estop_state.clone());
         driver.set_estop_gate(self.estop_gate());
         driver.set_gripper_index(self.config.gripper_index());
         driver.set_strict_mode_handover(self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled));
@@ -562,8 +667,9 @@ impl SupervisorInner {
         let driver: Box<dyn ArmDriver> = Box::new(crate::joint_zero::ZeroOffsetDriver::new(driver, &self.joint_zero_offsets));
         self.driver_caps = driver.capabilities();
         self.apply_driver_limits(driver.as_ref());
-        self.driver = Some(std::sync::Mutex::new(driver));
+        self.install_driver(driver);
         self.bump_motion_config_revision();
+        self.refresh_schema_cache();
         self
     }
 
@@ -628,6 +734,9 @@ impl SupervisorInner {
         trigger_fault: bool,
     ) {
         self.driver_config_error = None;
+        for (i, slot) in self.cached_driver_pos_limits.iter_mut().enumerate() {
+            *slot = pos_limits.get(i).copied().flatten();
+        }
         let mut candidate = self.config.clone();
 
         for (i, limit) in candidate.limits.iter_mut().enumerate() {
@@ -732,6 +841,9 @@ impl SupervisorInner {
 
         self.config = candidate;
         self.bump_motion_config_revision();
+        if !self.rt_executor_owned {
+            self.refresh_schema_cache();
+        }
     }
 
     pub fn reapply_driver_limits(&mut self) -> bool {
@@ -774,6 +886,61 @@ impl SupervisorInner {
                 false
             }
         }
+    }
+
+    /// Zero-allocation check whether a candidate `GripperPolicy` satisfies both profile and
+    /// driver hardware position limits without mutating `self`.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn validate_gripper_policy_against_driver_bounded(
+        &self,
+        gp: &crate::model::GripperPolicy,
+    ) -> Result<(), crate::safety::BoundedText<256>> {
+        use crate::safety::BoundedText;
+        let Some(g_idx) = self.config.gripper_index() else {
+            return Err(BoundedText::new("Gripper calibration requires a gripper joint"));
+        };
+        let Some(lim) = self.config.limits.get(g_idx) else {
+            return Err(BoundedText::new("Gripper calibration requires gripper joint limits"));
+        };
+        let mut lo = lim.min_position;
+        let mut hi = lim.max_position;
+        if self.rt_executor_owned {
+            if let Some((d_min, d_max)) = self.cached_driver_pos_limits.get(g_idx).copied().flatten() {
+                if !d_min.is_finite() || !d_max.is_finite() || d_min >= d_max {
+                    return Err(BoundedText::new("Driver position limits for gripper joint are invalid"));
+                }
+                lo = lo.max(d_min);
+                hi = hi.min(d_max);
+            }
+        } else if let Some(d) = self.driver.as_ref() {
+            let drv = d
+                .lock()
+                .map_err(|_| BoundedText::new("driver unavailable while validating gripper calibration"))?;
+            if let Some((d_min, d_max)) = drv.position_limits(g_idx) {
+                if !d_min.is_finite() || !d_max.is_finite() || d_min >= d_max {
+                    return Err(BoundedText::new("Driver position limits for gripper joint are invalid"));
+                }
+                lo = lo.max(d_min);
+                hi = hi.min(d_max);
+            }
+        }
+        if self.driver_config_error.is_some() && self.driver.is_none() {
+            return Err(self
+                .driver_config_error
+                .as_deref()
+                .map(BoundedText::new)
+                .unwrap_or_else(|| BoundedText::new("Driver limit configuration error prevents gripper calibration")));
+        }
+        let in_lim = |v: f32| v.is_finite() && v >= lo && v <= hi;
+        if !(in_lim(gp.closed_rad)
+            && in_lim(gp.open_rad)
+            && gp.jaw_opening.as_ref().is_none_or(|jo| jo.points.iter().all(|&[q, _]| in_lim(q))))
+        {
+            return Err(BoundedText::new(
+                "Driver limits violated config invariants: Invalid gripper policy (open/closed inside the gripper joint limits, 0 <= squeeze_rad <= 0.5)",
+            ));
+        }
+        Ok(())
     }
 
     /// Pure read-only validation of driver position/velocity limits into bounded stack storage
@@ -914,6 +1081,7 @@ impl SupervisorInner {
             min: cand_min,
             max: cand_max,
             vel: cand_vel,
+            raw_pos: pos_limits,
         })
     }
 
@@ -924,6 +1092,7 @@ impl SupervisorInner {
             self.config.limits[i].min_position = cand.min[i];
             self.config.limits[i].max_position = cand.max[i];
             self.config.limits[i].max_velocity = cand.vel[i];
+            self.cached_driver_pos_limits[i] = cand.raw_pos[i];
         }
         self.bump_motion_config_revision();
         if let Some(prev) = self.driver_config_error.take() {
@@ -937,7 +1106,7 @@ impl SupervisorInner {
 
     /// Pure read-only check of `positions` against either validated candidate limits (if
     /// `driver_config_error` just resolved) or current `self.config.limits` (zero heap allocations).
-    fn joint_limit_clear_violation_for_positions(
+    pub(crate) fn joint_limit_clear_violation_for_positions(
         &self,
         positions: &[f32],
         cand: Option<&CandidateDriverLimits>,
@@ -980,7 +1149,7 @@ impl SupervisorInner {
 
     /// Pure read-only check of measured positions against either validated candidate limits (if
     /// `driver_config_error` just resolved) or current `self.config.limits` (zero heap allocations).
-    fn joint_limit_clear_violation_with_candidates(
+    pub(crate) fn joint_limit_clear_violation_with_candidates(
         &self,
         cand: Option<&CandidateDriverLimits>,
     ) -> Option<crate::safety::JointLimitClearViolation> {
@@ -1038,6 +1207,19 @@ impl SupervisorInner {
         self.driver.as_ref().is_none_or(|d| d.lock().is_ok_and(|drv| drv.feedback_all_within(self.config.dof, max_age)))
     }
 
+    /// True when every arm joint (excluding a `PosForce` Damiao gripper) has valid numeric
+    /// feedback within `max_age`. Used by gravity compensation so transient J7 pos-force
+    /// staleness does not prematurely abort or wedge arm-only handback before
+    /// `feedback_stale_fault_ms` latches `J7_FEEDBACK_STALE`.
+    pub fn hardware_arm_feedback_fresh(&self, max_age: Duration) -> bool {
+        if !self.feedback_numeric_valid { return false; }
+        if !self.config.damiao_gripper.as_ref().is_some_and(|g| g.mode == crate::model::DamiaoGripperMode::PosForce) {
+            return self.hardware_feedback_fresh(max_age);
+        }
+        let arm = self.config.arm_joints();
+        self.driver.as_ref().is_none_or(|d| d.lock().is_ok_and(|drv| drv.feedback_joints_within(&arm, max_age)))
+    }
+
     /// Per arm joint, an instant before which its last sample cannot have been enqueued: the
     /// driver's receive-queue bound, or the receive instant for drivers without a receive queue.
     pub fn arm_feedback_queue_bounds(&self) -> Vec<Option<Instant>> {
@@ -1063,18 +1245,79 @@ impl SupervisorInner {
         (self.measured_positions.clone(), vels, instants, seqs)
     }
 
-    /// A successful transport write is not confirmation that torque was removed.
-    pub(super) fn request_disable(&mut self) -> Result<(), SafetyError> {
+    /// Zero-allocation RT executor background disable entry point: routes strictly through the
+    /// driver's single `begin_torque_budgeted(false, 0)` choke point and respects the single
+    /// [`BackgroundDisableRetry`] exhaustion state so exhausted disables never restart.
+    pub(super) fn request_disable_rt(&mut self) -> Result<(), &'static str> {
         // On RT executor ownership, if a park disable transition is already in flight on the single
         // TorqueTransition::Disable authority, keep it as the owner so its bounded DisableConfirm
         // deadline and FEEDBACK_UNCONFIRMED terminal are preserved when a safety event joins.
-        if self.rt_executor_owned
-            && matches!(self.torque_transition, Some(TorqueTransition::Disable { origin: DisableOrigin::Park { .. }, .. }))
-        {
+        if matches!(
+            self.torque_transition,
+            Some(TorqueTransition::Disable { origin: DisableOrigin::Park { .. }, .. })
+        ) {
             self.disable_requested();
             return Ok(());
         }
-        // a blocking disable (thermal trip, fault path) replaces a transition in flight
+        // Supersede any in-flight torque transition before issuing a safety/shutdown disable.
+        if let Some(t) = self.torque_transition.take() {
+            match t {
+                TorqueTransition::Enable { origin: EnableOrigin::BrokerTransition, .. }
+                | TorqueTransition::Disable { origin: DisableOrigin::BrokerTransition, .. } => {
+                    self.core.begin_transition(Err("SUPERSEDED"));
+                }
+                TorqueTransition::Enable { origin: EnableOrigin::ParkRearm { action_id, .. }, .. } => {
+                    self.finish_park_rearm_failed(action_id, "UNLOAD_FAILED");
+                }
+                TorqueTransition::Disable { origin: DisableOrigin::Park { .. }, .. } => {}
+            }
+        }
+        if matches!(
+            self.background_disable_retry,
+            Some(BackgroundDisableRetry::Exhausted)
+        ) {
+            return Err("DISABLE_UNCONFIRMED");
+        }
+        self.disable_requested();
+        let Some(ref d) = self.driver else {
+            self.disable_confirmed();
+            return Ok(());
+        };
+        let mut drv = d.lock().map_err(|_| "FEEDBACK_UNAVAILABLE")?;
+        let res = drv.begin_torque_budgeted(false, 0);
+        let drv_now = drv.clock_now();
+        match res {
+            Ok(progress) => {
+                let confirmed_now = matches!(
+                    progress,
+                    crate::driver::TorqueProgress::Done(crate::driver::TorqueOutcome::Confirmed)
+                ) && DisableConfirm::confirmed(&**drv);
+                drop(drv);
+                if confirmed_now {
+                    self.disable_confirmed();
+                } else {
+                    self.is_torqued = true;
+                    self.arm_background_disable_retry(drv_now);
+                }
+                Ok(())
+            }
+            Err(_) => {
+                drop(drv);
+                self.is_torqued = true;
+                self.arm_background_disable_retry(drv_now);
+                Err("DRIVER_WRITE_FAILED")
+            }
+        }
+    }
+
+    /// A successful transport write is not confirmation that torque was removed.
+    pub(super) fn request_disable(&mut self) -> Result<(), SafetyError> {
+        if self.rt_executor_owned {
+            return self
+                .request_disable_rt()
+                .map_err(|_| SafetyError::FeedbackUnavailable);
+        }
+        // a blocking disable (park, thermal trip, fault path) replaces a transition in flight
         // (the driver's disable replaces its pending enable): only broker transitions emit SUPERSEDED
         let mut joined_park: Option<(bool, Option<u64>)> = None;
         if let Some(t) = self.torque_transition.take() {
@@ -1094,19 +1337,6 @@ impl SupervisorInner {
         self.disable_requested();
         if let Some(ref d) = self.driver {
             let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
-            if self.rt_executor_owned {
-                let res = drv.begin_torque_budgeted(false, 0)
-                    .map_err(|e| SafetyError::ClearFaultRejected(format!("Torque disable transmission failed: {e}")))?;
-                let confirmed_now = matches!(res, crate::driver::TorqueProgress::Done(crate::driver::TorqueOutcome::Confirmed))
-                    && DisableConfirm::confirmed(&**drv);
-                drop(drv);
-                if confirmed_now {
-                    self.disable_confirmed();
-                } else {
-                    self.is_torqued = true;
-                }
-                return Ok(());
-            }
             if let Err(e) = drv.set_torque(false) {
                 drop(drv);
                 if let Some((watchdog, action_id)) = joined_park {
@@ -1135,11 +1365,15 @@ impl SupervisorInner {
 
     /// State at the first disable frame: MIT off, `disable_pending` until confirmed.
     fn disable_requested(&mut self) {
+        self.disable_requested_at(Instant::now());
+    }
+
+    fn disable_requested_at(&mut self, now: Instant) {
         self.mit_torque_off();
         self.disable_pending = true;
         self.tracking.invalidate();
         self.tracking.clear_recovery_suspension();
-        self.last_disable_attempt = Some(Instant::now());
+        self.last_disable_attempt = Some(now);
     }
 
     /// State once fresh feedback confirmed the disable.
@@ -1147,9 +1381,101 @@ impl SupervisorInner {
         self.is_torqued = false;
         self.pending_rearm = false;
         self.disable_pending = false;
+        self.background_disable_retry = None;
         self.gripper_hold_vel_ceiling = None;
         self.last_poll_enable_state = EnableState::Disabled;
         self.last_poll_partial_enable = false;
+    }
+
+    /// Hook point for `feat/torque-off-when-stopped` (torque-off rest/policy rules before a
+    /// background disable retry). Pass-through on PR L so we never duplicate that branch's rules
+    /// while ensuring every retry routes strictly through the driver's single
+    /// `begin_torque_budgeted(false, 0)` (`send(TxKind::Disable, ...)`) choke point.
+    #[inline]
+    fn torque_off_when_stopped_hook(&self) -> bool {
+        true
+    }
+
+    fn arm_background_disable_retry(&mut self, drv_now: Instant) {
+        let _ = self.arm_background_disable_retry_with_origin(drv_now, drv_now);
+    }
+
+    /// Arms bounded [`BackgroundDisableRetry`] preserving the original `DisableRequested`
+    /// timestamp (`requested_at`, driver clock) so retries stay bounded within the request's
+    /// original `BACKGROUND_DISABLE_MAX_WINDOW` lifetime (M4).
+    fn arm_background_disable_retry_with_origin(
+        &mut self,
+        requested_at: Instant,
+        drv_now: Instant,
+    ) -> bool {
+        if matches!(
+            self.background_disable_retry,
+            Some(BackgroundDisableRetry::Exhausted)
+        ) {
+            return false;
+        }
+        if drv_now.saturating_duration_since(requested_at) >= BACKGROUND_DISABLE_MAX_WINDOW {
+            self.exhaust_background_disable_retry();
+            return false;
+        }
+        if self.background_disable_retry.is_none() {
+            self.background_disable_retry = Some(BackgroundDisableRetry::Active {
+                attempts: 0,
+                started_at: requested_at,
+                next_retry_at: drv_now + BACKGROUND_DISABLE_RETRY_INTERVAL,
+            });
+        }
+        true
+    }
+
+    fn exhaust_background_disable_retry(&mut self) {
+        self.background_disable_retry = Some(BackgroundDisableRetry::Exhausted);
+        self.safety.latch(
+            crate::safety::FaultKind::Other,
+            crate::safety::FaultDetail::Static(crate::safety::StaticFault::DisableUnconfirmed),
+        );
+    }
+
+    /// Single merge-time choke point for every PR L rollback disable triggered by a failed or
+    /// interrupted torque-enable transition (`enable_finish_rt`, `enable_step_failed`,
+    /// `abort_enable_transition_for_fenced_lease_impl`, `service_torque_transition` authority
+    /// revocation). Routes strictly through the driver's single `begin_torque_budgeted(false, 0)`
+    /// choke point (zero RX, zero sleep, zero RT allocs) and arms bounded
+    /// [`BackgroundDisableRetry`] whenever torque-off is not immediately confirmed.
+    ///
+    /// TODO(torque-off-merge): Replace this rollback disable with `feat/torque-off-when-stopped`'s
+    /// `FailedHold` reducer when integrating both branches (no automatic rollback disable at any
+    /// pose, while carrying PR L's live authority revocation / fencing checks into `FailedHold`).
+    fn rollback_disable_after_failed_or_interrupted_enable(&mut self, now: Instant) {
+        self.disable_requested_at(now);
+        let Some(ref d) = self.driver else {
+            self.disable_confirmed();
+            return;
+        };
+        let outcome = match d.lock() {
+            Ok(mut driver) => {
+                driver.abort_enable();
+                let sent = driver.begin_torque_budgeted(false, 0);
+                let confirmed_now = matches!(
+                    sent,
+                    Ok(crate::driver::TorqueProgress::Done(crate::driver::TorqueOutcome::Confirmed))
+                ) && DisableConfirm::confirmed(&**driver);
+                let drv_now = driver.clock_now();
+                Some((confirmed_now, drv_now))
+            }
+            Err(_) => None,
+        };
+        match outcome {
+            Some((true, _)) => self.disable_confirmed(),
+            Some((false, drv_now)) => {
+                self.is_torqued = true;
+                self.arm_background_disable_retry(drv_now);
+            }
+            None => {
+                self.is_torqued = true;
+                self.arm_background_disable_retry(now);
+            }
+        }
     }
 
     pub fn enable_torque(admitted: Admitted<'_>) -> Result<SafetyState, SafetyError> {
@@ -1220,7 +1546,7 @@ impl SupervisorInner {
             && (self.gravity_comp.is_some()
                 || self.mit_active()
                 || self.mit.revoke_pending
-                || !crate::mit::mit_joints(&self.config).is_empty())
+                || crate::mit::mit_joint_mask(&self.config) != 0)
         {
             return Err(SafetyError::ClearFaultRejected(
                 "UNSUPPORTED: MIT mode qualification/handover and gravity compensation are not supported under synchronous RT executor step 1".into(),
@@ -1326,41 +1652,222 @@ impl SupervisorInner {
         SafetyError::ClearFaultRejected(err_msg)
     }
 
-    /// Zero-allocation non-blocking enable failure handler for RT transitions: sends disable
-    /// frames with zero RX and zero sleep when the arm was not previously torqued, leaving
-    /// confirmation to Step 2 and latching bounded stack-formatted fault text.
-    fn enable_failed_budgeted_rt(&mut self, was_torqued: bool, err: Option<&crate::driver::ArmDriverError>) {
-        if !was_torqued {
-            let disable_outcome = self.driver.as_ref().and_then(|d| {
-                d.lock().ok().map(|mut driver| {
-                    driver.abort_enable();
-                    let sent = driver.begin_torque_budgeted(false, 0);
-                    matches!(
-                        sent,
-                        Ok(crate::driver::TorqueProgress::Done(crate::driver::TorqueOutcome::Confirmed))
-                    ) && driver.is_feedback_valid()
-                        && driver.enable_state() == EnableState::Disabled
-                })
+    /// Zero-allocation RT preflight for torque enable (all refusal paths return static codes).
+    fn enable_prepare_rt_precheck(&self) -> Result<(), &'static str> {
+        if self.calibration_busy && self.motor_zero_busy {
+            return Err("MOTION_BUSY");
+        }
+        if self.torque_transition.is_some() {
+            return Err("TRANSITION_BUSY");
+        }
+        if self.gravity_comp.is_some() {
+            return Err("MOTION_BUSY");
+        }
+        if self.shutdown_committed {
+            return Err("ESTOP_ACTIVE");
+        }
+        if self.driver_config_error.is_some() {
+            return Err("MOTION_FORBIDDEN_IN_FAULT_STATE");
+        }
+        if self.handover_settling_since.is_some() {
+            return Err("HANDOVER_SETTLING");
+        }
+        if self.disable_pending {
+            return Err("DISABLE_PENDING");
+        }
+        if self.estop_pending() {
+            return Err("ESTOP_ACTIVE");
+        }
+        if self.safety.state().is_stopped() {
+            return Err(if matches!(self.safety.state(), SafetyState::Fault(_)) {
+                "FAULT_ACTIVE"
+            } else {
+                "ESTOP_ACTIVE"
             });
-            if let Some(confirmed_off) = disable_outcome {
-                if confirmed_off {
-                    self.disable_confirmed();
-                } else {
-                    self.is_torqued = true;
-                    self.disable_requested();
-                }
+        }
+        if self.mit_active() || self.mit.revoke_pending || crate::mit::has_mit_joints(&self.config) {
+            return Err("UNSUPPORTED");
+        }
+        Ok(())
+    }
+
+    /// Zero-allocation RT enable prepare (runs after [`Self::enable_prepare_rt_precheck`]).
+    fn enable_prepare_rt(&mut self) -> Result<(bool, Option<f32>), &'static str> {
+        self.enable_prepare_rt_precheck()?;
+        let any_driver_enabled = self
+            .driver
+            .as_ref()
+            .is_some_and(|d| d.lock().is_ok_and(|drv| drv.has_any_joint_enabled()));
+        let was_torqued = self.is_torqued || any_driver_enabled;
+        let prev_gripper_cmd = if was_torqued {
+            self.config
+                .gripper_index()
+                .and_then(|i| self.commanded_positions.get(i).copied())
+        } else {
+            None
+        };
+        if let Some(ref d) = self.driver {
+            if self.estop_pending() {
+                return Err("ESTOP_ACTIVE");
+            }
+            let _driver = d.lock().map_err(|_| "FEEDBACK_UNAVAILABLE")?;
+            if self.estop_pending() {
+                return Err("ESTOP_ACTIVE");
             }
         }
-        self.safety.latch(
-            crate::safety::FaultKind::Other,
-            crate::safety::FaultDetail::formatted(FaultCode::EnableFailed, |buf| {
-                buf.push_str("Hardware torque enable failed: ");
-                match err {
-                    Some(e) => e.write_bounded(buf),
-                    None => buf.push_str("enable not confirmed"),
+        Ok((was_torqued, prev_gripper_cmd))
+    }
+
+    /// Zero-allocation RT enable finish using cached driver feedback and bounded background disable
+    /// cleanup on feedback validation failure.
+    fn enable_finish_rt(
+        &mut self,
+        was_torqued: bool,
+        prev_gripper_cmd: Option<f32>,
+        now: Instant,
+    ) -> Result<(), &'static str> {
+        if let Some(ref d) = self.driver {
+            let mut scratch_states = std::mem::take(&mut self.scratch.states);
+            let mut scratch_ages = std::mem::take(&mut self.scratch.ages);
+            let mut scratch_loads = std::mem::take(&mut self.scratch.loads);
+            let mut driver = match d.lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    self.scratch.states = scratch_states;
+                    self.scratch.ages = scratch_ages;
+                    self.scratch.loads = scratch_loads;
+                    return Err("FEEDBACK_UNAVAILABLE");
                 }
-            }),
-        );
+            };
+            let read_res = if driver.read_cached_joint_states_into(&mut scratch_states).is_some() {
+                Ok(())
+            } else {
+                driver.read_joint_states_into(&mut scratch_states)
+            };
+            if read_res.is_err() {
+                drop(driver);
+                self.scratch.states = scratch_states;
+                self.scratch.ages = scratch_ages;
+                self.scratch.loads = scratch_loads;
+                if !was_torqued {
+                    self.rollback_disable_after_failed_or_interrupted_enable(now);
+                }
+                return Err("FEEDBACK_UNAVAILABLE");
+            }
+            let has_loads = driver.joint_loads_into(&mut scratch_loads);
+            let loads_slice = has_loads.then_some(scratch_loads.as_slice());
+            if !driver.is_feedback_valid()
+                || !Self::states_valid(&scratch_states, driver.capabilities(), self.config.dof, loads_slice)
+                || (driver.capabilities().enable_feedback && driver.enable_state() != EnableState::Enabled)
+            {
+                drop(driver);
+                self.scratch.states = scratch_states;
+                self.scratch.ages = scratch_ages;
+                self.scratch.loads = scratch_loads;
+                if !was_torqued {
+                    self.rollback_disable_after_failed_or_interrupted_enable(now);
+                }
+                return Err("FEEDBACK_UNAVAILABLE");
+            }
+            driver.feedback_ages_into(&mut scratch_ages);
+            let oldest_age = if scratch_ages.iter().all(Option::is_some) {
+                scratch_ages.iter().flatten().copied().max()
+            } else {
+                None
+            };
+            self.feedback_numeric_valid = true;
+            self.last_can_feedback_instant = oldest_age.and_then(|age| now.checked_sub(age));
+            self.core.poll_feedback(
+                &mut self.joint_feedback_queue_bounds,
+                self.config.dof,
+                driver.as_ref(),
+                &mut self.scratch.fb,
+            );
+            Self::apply_feedback(
+                &mut self.measured_positions,
+                &mut self.measured_velocities,
+                &mut self.torques,
+                &mut self.temperatures,
+                &mut self.loads,
+                self.config.dof,
+                &scratch_states,
+                loads_slice,
+            );
+            drop(driver);
+            self.scratch.states = scratch_states;
+            self.scratch.ages = scratch_ages;
+            self.scratch.loads = scratch_loads;
+        }
+
+        copy_into(&mut self.commanded_positions, &self.measured_positions);
+        copy_into(&mut self.target_positions, &self.measured_positions);
+        if let Some(g_cmd) = prev_gripper_cmd {
+            if let Some(grip_idx) = self.config.gripper_index() {
+                self.commanded_positions[grip_idx] = g_cmd;
+                self.target_positions[grip_idx] = g_cmd;
+            }
+        }
+        self.commanded_velocities.fill(0.0);
+        self.commanded_accelerations.fill(0.0);
+        if self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled) {
+            let arm_indices = self.config.arm_joints();
+            let has_vel_fb = self.driver.as_ref().is_none_or(|d| {
+                d.lock().is_ok_and(|drv| drv.capabilities().velocity_feedback)
+            });
+            let arm_stationary = has_vel_fb
+                && arm_indices.iter().all(|&j| {
+                    self.measured_velocities
+                        .get(j)
+                        .is_some_and(|v| v.is_finite() && v.abs() <= crate::tracking::STATIONARY_VELOCITY_RAD_S)
+                });
+            let aligned_with_issued = !self
+                .tracking
+                .has_residual_lead(&self.commanded_positions, &arm_indices);
+            if was_torqued && self.tracking.last_issued_positions.is_some() {
+                if arm_stationary && aligned_with_issued {
+                    self.tracking.seed(&self.commanded_positions);
+                } else {
+                    self.tracking.ws_min_depths = None;
+                }
+            } else if arm_stationary {
+                self.tracking.seed(&self.commanded_positions);
+            } else {
+                self.tracking.invalidate();
+            }
+        } else {
+            self.tracking.invalidate();
+        }
+        if self.driver.is_none() {
+            self.measured_velocities.fill(0.0);
+        }
+        self.retire_motion_payloads();
+        self.pending_normal_unload = false;
+        self.watchdog_park = None;
+        self.servo_stream_active = false;
+        self.gripper_hold_vel_ceiling = None;
+
+        if self.estop_pending() || self.safety.state().is_stopped() {
+            self.is_torqued = true;
+            self.pending_rearm = true;
+            return Err(if !self.estop_pending() && matches!(self.safety.state(), SafetyState::Fault(_)) {
+                "FAULT_ACTIVE"
+            } else {
+                "ESTOP_ACTIVE"
+            });
+        }
+        self.safety.set_torque_rt(true)?;
+        self.is_torqued = true;
+        self.pending_rearm = false;
+        self.disable_pending = false;
+        self.background_disable_retry = None;
+        self.mit.armed_ok = self
+            .config
+            .joint_tracking
+            .as_ref()
+            .is_some_and(|jt| jt.mit_requested());
+        self.last_heartbeat = now;
+        self.last_motion_frame = now;
+        Ok(())
     }
 
     /// Enable, after the driver confirmed it: validates fresh feedback (a failure disables
@@ -1631,6 +2138,141 @@ impl SupervisorInner {
         Ok(state)
     }
 
+    /// Zero-allocation RT torque-off precheck (static protocol error codes).
+    fn torque_off_check_rt(&mut self, stillness_verified: bool) -> Result<(), &'static str> {
+        if self.calibration_busy && self.motor_zero_busy {
+            return Err("MOTION_BUSY");
+        }
+        if self.torque_transition.is_some() {
+            return Err("TRANSITION_BUSY");
+        }
+        if self.gravity_comp.is_some() {
+            return Err("MOTION_BUSY");
+        }
+        if self.safety.state().is_stopped() || self.e_stop_latched.load(Ordering::SeqCst) {
+            return Err("MOTION_FORBIDDEN_IN_FAULT_STATE");
+        }
+        if self.has_resting_pose_violation_rt(stillness_verified) {
+            return Err("ARM_NOT_AT_RESTING_POSE");
+        }
+        Ok(())
+    }
+
+    /// Zero-allocation RT torque-off finish after confirmed disable.
+    fn torque_off_finish_rt(&mut self) -> Result<(), &'static str> {
+        self.safety.set_torque_rt(false)?;
+        self.reset_gripper_stall();
+        self.gripper_hold_vel_ceiling = None;
+        if self.driver.is_none() {
+            self.measured_velocities.fill(0.0);
+        }
+        Ok(())
+    }
+
+    /// Re-checks live authority for an in-flight `TorqueTransition::Enable` BEFORE any retry TX.
+    pub(crate) fn enable_authority_revoked(
+        &self,
+        auth: EnableAuthority,
+        now: Instant,
+    ) -> Option<&'static str> {
+        if self.shutdown_committed
+            || self.estop_pending()
+            || matches!(self.safety.state(), SafetyState::EStop)
+        {
+            return Some("ESTOP_ACTIVE");
+        }
+        if self.safety.state().is_stopped() {
+            return Some("FAULT_ACTIVE");
+        }
+        if auth.admitted_epoch != 0 && self.safety.epoch_id() != auth.admitted_epoch {
+            return Some("EPOCH_MISMATCH");
+        }
+        if auth.owner_conn_id != 0
+            && self.check_client_connection_live(auth.owner_conn_id).is_err()
+        {
+            return Some("DISCONNECTED");
+        }
+        if self.pending_disconnect_hold.load(Ordering::SeqCst) > 0 {
+            return Some("LEASE_LOST");
+        }
+        let fenced_gen = self.effective_fenced_lease_generation();
+        if auth.lease_generation != 0 {
+            if auth.lease_generation <= fenced_gen {
+                return Some("LEASE_LOST");
+            }
+            let owner_matches = auth.owner_conn_id == 0
+                || self.active_lease_conn_id == auth.owner_conn_id;
+            let lease_matches = owner_matches
+                && self.active_lease.as_ref().is_some_and(|a| {
+                    a.generation == auth.lease_generation
+                        && a.generation > fenced_gen
+                        && (self.active_lease_conn_id == 0
+                            || !self.is_connection_closed(self.active_lease_conn_id))
+                        && now.saturating_duration_since(a.acquired_at) < self.lease_timeout
+                });
+            if !lease_matches {
+                return Some("LEASE_LOST");
+            }
+        }
+        None
+    }
+
+    /// Aborts any in-flight `TorqueTransition::Enable` owned by `displaced_gen` (called by
+    /// `fence_displaced_lease_generation` on release, expiry, preemption, or disconnect).
+    pub(crate) fn abort_enable_transition_for_fenced_lease_impl(&mut self, displaced_gen: u64) {
+        let matches = matches!(
+            self.torque_transition,
+            Some(TorqueTransition::Enable { authority, .. })
+                if displaced_gen != 0 && authority.lease_generation == displaced_gen
+        );
+        if !matches {
+            return;
+        }
+        let Some(TorqueTransition::Enable {
+            origin,
+            was_torqued,
+            authority,
+            ..
+        }) = self.torque_transition.take()
+        else {
+            return;
+        };
+        let code = if authority.owner_conn_id != 0
+            && self.is_connection_closed(authority.owner_conn_id)
+        {
+            "DISCONNECTED"
+        } else {
+            "LEASE_LOST"
+        };
+        let stopped = self.estop_pending() || self.safety.state().is_stopped();
+        if stopped {
+            let still_enabled = self.driver.as_ref().is_some_and(|d| {
+                d.lock().is_ok_and(|mut drv| {
+                    drv.abort_enable();
+                    drv.enable_state() != EnableState::Disabled
+                        || drv.has_any_joint_enabled()
+                        || drv.has_known_partial_enable()
+                })
+            });
+            self.is_torqued = was_torqued || still_enabled;
+            self.pending_rearm = true;
+        } else if !was_torqued {
+            self.rollback_disable_after_failed_or_interrupted_enable(Instant::now());
+        } else {
+            if let Some(ref d) = self.driver {
+                if let Ok(mut drv) = d.lock() {
+                    drv.abort_enable();
+                }
+            }
+            self.is_torqued = true;
+            self.pending_rearm = true;
+        }
+        match origin {
+            EnableOrigin::BrokerTransition => self.core.begin_transition(Err(code)),
+            EnableOrigin::ParkRearm { action_id, .. } => self.finish_park_rearm_failed(action_id, code),
+        }
+    }
+
     /// A transition is in flight ([`TorqueTransition`]): ordinary output and blocking torque
     /// changes wait for it.
     pub fn torque_transition_pending(&self) -> bool { self.torque_transition.is_some() }
@@ -1657,21 +2299,81 @@ impl SupervisorInner {
         }))
     }
 
-    /// Shared bounded enable starter for broker torque-on and park `holding_after_clear` rearm.
-    fn start_enable_transition(
+    /// Starts a torque-enable transition without waiting for its confirmation (the RT's
+    /// `commit_transition`). Requires a valid [`AdmissionStamp`] checked first under the owner lock.
+    pub(crate) fn begin_enable_torque_transition(
+        admitted: Admitted<'_>,
+    ) -> Result<Result<crate::rt_core::ops::TorqueProgress, &'static str>, &'static str> {
+        let (this, proof) = admitted
+            .consume()
+            .map_err(|e| torque_admission_error_code(&e))?;
+        let s = proof.stamp();
+        let authority = EnableAuthority {
+            lease_generation: s.lease_gen,
+            owner_conn_id: s.connection_id,
+            admitted_epoch: s.estop_epoch,
+        };
+        this.begin_enable_torque_transition_inner(
+            EnableOrigin::BrokerTransition,
+            authority,
+            Instant::now(),
+            false,
+            false,
+        )
+    }
+
+    /// Driverless immediate torque-enable on RT (zero-alloc, consumes A1's [`Admitted`]).
+    pub(crate) fn enable_torque_immediate_rt(
+        admitted: Admitted<'_>,
+        now: Instant,
+    ) -> Result<(), &'static str> {
+        let (this, _proof) = admitted
+            .consume()
+            .map_err(|e| torque_admission_error_code(&e))?;
+        if this.driver.is_some() {
+            return Err("UNSUPPORTED");
+        }
+        let (was_torqued, prev_gripper_cmd) = this.enable_prepare_rt()?;
+        this.enable_finish_rt(was_torqued, prev_gripper_cmd, now)
+    }
+
+    /// Driverless immediate torque-disable on RT (zero-alloc, exempt from `Admitted`).
+    pub(crate) fn disable_torque_immediate_rt(&mut self, now: Instant) -> Result<(), &'static str> {
+        if self.driver.is_some() {
+            return Err("UNSUPPORTED");
+        }
+        self.torque_off_check_rt(false)?;
+        self.stop_motion();
+        self.commanded_velocities.fill(0.0);
+        self.disable_requested_at(now);
+        self.disable_confirmed();
+        self.torque_off_finish_rt()
+    }
+
+    fn begin_enable_torque_transition_inner(
         &mut self,
         origin: EnableOrigin,
+        authority: EnableAuthority,
+        now: Instant,
         allow_sync_mit: bool,
         allow_legacy_fallback: bool,
-    ) -> Result<Result<crate::rt_core::ops::TorqueProgress, &'static str>, SafetyError> {
+    ) -> Result<Result<crate::rt_core::ops::TorqueProgress, &'static str>, &'static str> {
         use crate::rt_core::ops::TorqueProgress as Rt;
-        if self.torque_transition.is_some() { return Err(SafetyError::ClearFaultRejected("A torque transition is pending".into())); }
-        self.gravity_comp_servo_busy()?;
-        let (was_torqued, prev_gripper_cmd) = self.enable_prepare_inner(false, allow_sync_mit)?;
+        let use_rt_path = self.rt_executor_owned || matches!(origin, EnableOrigin::BrokerTransition);
+        let (was_torqued, prev_gripper_cmd) = if use_rt_path {
+            self.enable_prepare_rt()?
+        } else {
+            if self.torque_transition.is_some() {
+                return Err("TRANSITION_BUSY");
+            }
+            self.gravity_comp_servo_busy().map_err(|_| "MOTION_BUSY")?;
+            self.enable_prepare_inner(false, allow_sync_mit)
+                .map_err(|e| torque_error_code(&e))?
+        };
         let started = match self.driver.as_ref() {
             None => None,
             Some(d) => {
-                let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
+                let mut drv = d.lock().map_err(|_| "FEEDBACK_UNAVAILABLE")?;
                 let drv_now = drv.clock_now();
                 let res = if !allow_legacy_fallback || self.rt_executor_owned || drv.supports_rt_executor().is_ok() {
                     drv.begin_torque_budgeted(true, 0)
@@ -1682,26 +2384,38 @@ impl SupervisorInner {
             }
         };
         Ok(match started {
-            None | Some((Ok(crate::driver::TorqueProgress::Done(crate::driver::TorqueOutcome::Confirmed)), _)) =>
-                self.enable_finish_inner(was_torqued, prev_gripper_cmd, true).map(|_| Rt::Done).map_err(|e| torque_error_code(&e)),
-            Some((Ok(crate::driver::TorqueProgress::Pending { .. }), now)) => {
-                self.torque_transition = Some(TorqueTransition::Enable { origin, was_torqued, prev_gripper_cmd });
-                Ok(Rt::Pending { wake: now })
+            None
+            | Some((
+                Ok(crate::driver::TorqueProgress::Done(
+                    crate::driver::TorqueOutcome::Confirmed,
+                )),
+                _,
+            )) => {
+                if use_rt_path {
+                    self.enable_finish_rt(was_torqued, prev_gripper_cmd, now)
+                        .map(|()| Rt::Done)
+                } else {
+                    self.enable_finish_inner(was_torqued, prev_gripper_cmd, true)
+                        .map(|_| Rt::Done)
+                        .map_err(|e| torque_error_code(&e))
+                }
+            }
+            Some((Ok(crate::driver::TorqueProgress::Pending { .. }), drv_now)) => {
+                self.torque_transition = Some(TorqueTransition::Enable {
+                    origin,
+                    was_torqued,
+                    prev_gripper_cmd,
+                    authority,
+                });
+                Ok(Rt::Pending { wake: drv_now })
             }
             Some((Err(ref e), _)) if crate::driver::is_estop_inhibited(e) => {
                 self.is_torqued = was_torqued || self.driver_any_enabled();
                 self.pending_rearm = true;
-                return Err(SafetyError::EStopActive);
+                return Err("ESTOP_ACTIVE");
             }
-            Some((r, _)) => self.enable_step_failed(was_torqued, r),
+            Some((r, _)) => self.enable_step_failed(was_torqued, now, r),
         })
-    }
-
-    /// Starts a torque-enable transition without waiting for its confirmation (the RT's
-    /// `commit_transition`). Requires a valid [`AdmissionStamp`] checked first under the owner lock.
-    pub(crate) fn begin_enable_torque_transition(admitted: Admitted<'_>) -> Result<Result<crate::rt_core::ops::TorqueProgress, &'static str>, SafetyError> {
-        let (this, _proof) = admitted.consume()?;
-        this.start_enable_transition(EnableOrigin::BrokerTransition, false, false)
     }
 
     /// Starts a bounded, confirmed `TorqueTransition::Enable` inside park `action_id` when
@@ -1709,7 +2423,7 @@ impl SupervisorInner {
     /// Zero heap allocations on RT failure paths.
     pub(crate) fn begin_park_rearm_transition(
         &mut self,
-        _proof: &crate::supervisor::AdmittedProof,
+        proof: &crate::supervisor::AdmittedProof,
         action_id: u64,
         stop_gen: u64,
     ) -> Result<ParkRearmStart, crate::rt_core::requests::motion::MotionInstallError> {
@@ -1717,14 +2431,31 @@ impl SupervisorInner {
         if self.urgent_stop_unapplied() || self.current_stop_gen() != stop_gen {
             return Err(MotionInstallError::Stopped);
         }
-        let map_safety = |e: SafetyError| match e {
-            SafetyError::EStopActive => MotionInstallError::EStopActive,
-            SafetyError::FaultActive(_) => MotionInstallError::FaultActive,
-            SafetyError::HandoverSettling => MotionInstallError::HandoverSettling,
-            SafetyError::FeedbackUnavailable => MotionInstallError::FeedbackStale,
+        let s = proof.stamp();
+        let authority = EnableAuthority {
+            lease_generation: s.lease_gen,
+            owner_conn_id: s.connection_id,
+            admitted_epoch: s.estop_epoch,
+        };
+        let map_code = |c: &'static str| match c {
+            "ESTOP_ACTIVE" => MotionInstallError::EStopActive,
+            "FAULT_ACTIVE" => MotionInstallError::FaultActive,
+            "HANDOVER_SETTLING" => MotionInstallError::HandoverSettling,
+            "FEEDBACK_UNAVAILABLE" | "FEEDBACK_STALE" => MotionInstallError::FeedbackStale,
+            "MOTION_BUSY" | "TRANSITION_BUSY" | "DISABLE_PENDING" => MotionInstallError::MotionBusy,
             _ => MotionInstallError::EnableFailed,
         };
-        match self.start_enable_transition(EnableOrigin::ParkRearm { action_id, stop_gen }, !self.rt_executor_owned, true).map_err(map_safety)? {
+        let now = self.driver_clock_now_or(Instant::now());
+        match self
+            .begin_enable_torque_transition_inner(
+                EnableOrigin::ParkRearm { action_id, stop_gen },
+                authority,
+                now,
+                !self.rt_executor_owned,
+                true,
+            )
+            .map_err(map_code)?
+        {
             Ok(crate::rt_core::ops::TorqueProgress::Done) => Ok(ParkRearmStart::ConfirmedNow),
             Ok(crate::rt_core::ops::TorqueProgress::Pending { .. }) => Ok(ParkRearmStart::Pending),
             Err(_) => Err(MotionInstallError::EnableFailed),
@@ -1740,34 +2471,62 @@ impl SupervisorInner {
         self.pending_rearm = true;
     }
 
-    /// Starts a torque-disable transition without waiting for its confirmation (Invariant 1c).
-    pub(crate) fn begin_disable_torque_transition(&mut self) -> Result<Result<crate::rt_core::ops::TorqueProgress, &'static str>, SafetyError> {
+    /// Starts a torque-disable transition without waiting for its confirmation.
+    ///
+    /// Exempt from `Admitted` (Invariant 1c): torque disable is a stop-direction action that
+    /// removes actuator output and must never be blocked by a Stop or admission check (still
+    /// governed by resting-pose and torque-off safety checks).
+    pub(crate) fn begin_disable_torque_transition(
+        &mut self,
+    ) -> Result<Result<crate::rt_core::ops::TorqueProgress, &'static str>, &'static str> {
         use crate::rt_core::ops::TorqueProgress as Rt;
-        if self.torque_transition.is_some() { return Err(SafetyError::ClearFaultRejected("A torque transition is pending".into())); }
-        self.gravity_comp_servo_busy()?;
-        self.torque_off_check(false)?;
+        self.torque_off_check_rt(false)?;
         self.stop_motion();
         self.commanded_velocities.fill(0.0);
-        self.disable_requested();
+        self.background_disable_retry = None;
         let started = match self.driver.as_ref() {
-            None => None,
+            None => {
+                self.disable_requested();
+                None
+            }
             Some(d) => {
-                let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
-                let drv_now = drv.clock_now();
-                Some((drv.begin_torque_budgeted(false, 0), drv_now))
+                let (res, requested_at, post_now) = {
+                    let mut drv = d.lock().map_err(|_| "FEEDBACK_UNAVAILABLE")?;
+                    let requested_at = drv.clock_now();
+                    let res = drv.begin_torque_budgeted(false, 0);
+                    let post_now = drv.clock_now();
+                    (res, requested_at, post_now)
+                };
+                self.disable_requested_at(requested_at);
+                Some((res, requested_at, post_now))
             }
         };
         Ok(match started {
-            None => { self.disable_confirmed(); self.torque_off_finish().map(|_| Rt::Done).map_err(|e| torque_error_code(&e)) }
-            Some((Ok(crate::driver::TorqueProgress::Pending { .. }), now)) => {
-                self.torque_transition = Some(TorqueTransition::Disable { origin: DisableOrigin::BrokerTransition, confirm: None });
-                Ok(Rt::Pending { wake: now })
+            None => {
+                self.disable_confirmed();
+                self.torque_off_finish_rt().map(|()| Rt::Done)
             }
-            Some((Ok(crate::driver::TorqueProgress::Done(_)), now)) => {
-                self.torque_transition = Some(TorqueTransition::Disable { origin: DisableOrigin::BrokerTransition, confirm: Some(DisableConfirm::start(now)) });
-                Ok(Rt::Pending { wake: now })
+            Some((Ok(crate::driver::TorqueProgress::Pending { .. }), requested_at, post_now)) => {
+                self.torque_transition = Some(TorqueTransition::Disable {
+                    origin: DisableOrigin::BrokerTransition,
+                    confirm: None,
+                    requested_at,
+                });
+                Ok(Rt::Pending { wake: post_now })
             }
-            Some((Err(e), _)) => Err(self.disable_step_failed(e)),
+            // the frames went out: the supervisor's confirmation follows (as in request_disable)
+            Some((Ok(crate::driver::TorqueProgress::Done(_)), requested_at, post_now)) => {
+                self.torque_transition = Some(TorqueTransition::Disable {
+                    origin: DisableOrigin::BrokerTransition,
+                    confirm: Some(DisableConfirm::start(post_now)),
+                    requested_at,
+                });
+                Ok(Rt::Pending { wake: post_now })
+            }
+            Some((Err(e), requested_at, post_now)) => {
+                let _ = self.arm_background_disable_retry_with_origin(requested_at, post_now);
+                Err(self.disable_step_failed(e))
+            }
         })
     }
 
@@ -1800,7 +2559,7 @@ impl SupervisorInner {
             self.complete_park_disable_confirmed(watchdog, action_id);
             return;
         };
-        let stop_before_write = Arc::clone(&self.e_stop_latched);
+        let stop_before_write = self.e_stop_latched.clone();
         let expected_stop_gen = self.stop_requests.as_ref().map(|s| s.applied());
         let started = d.lock().ok().map(|mut drv| {
             // Linearize client Stop and hardware E-stop against EVERY motor's disable transmit
@@ -1810,9 +2569,10 @@ impl SupervisorInner {
                 return None;
             }
             if stop_before_write.load(Ordering::SeqCst) || self.estop_pending() {
-                return Some((Err(crate::driver::ArmDriverError::EstopInhibited), drv.clock_now(), false));
+                let now = drv.clock_now();
+                return Some((Err(crate::driver::ArmDriverError::EstopInhibited), now, now, false));
             }
-            let now = drv.clock_now();
+            let requested_at = drv.clock_now();
             let res = if !watchdog {
                 let max_rx = if self.rt_executor_owned || drv.supports_rt_executor().is_ok() { Some(0) } else { None };
                 drv.begin_client_park_disable(max_rx, expected_stop_gen)
@@ -1821,6 +2581,7 @@ impl SupervisorInner {
             } else {
                 drv.begin_torque(false)
             };
+            let post_now = drv.clock_now();
             if !watchdog
                 && matches!(&res, Err(e) if crate::driver::is_estop_inhibited(e))
                 && !stop_before_write.load(Ordering::SeqCst)
@@ -1834,7 +2595,7 @@ impl SupervisorInner {
                 return None;
             }
             let confirmed_now = matches!(res, Ok(crate::driver::TorqueProgress::Done(_))) && DisableConfirm::confirmed(&**drv);
-            Some((res, now, confirmed_now))
+            Some((res, requested_at, post_now, confirmed_now))
         });
         let started = match started {
             Some(None) => {
@@ -1849,19 +2610,32 @@ impl SupervisorInner {
         self.end_gripper_stream();
         crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
         self.commanded_velocities.fill(0.0);
-        self.disable_requested();
+        self.background_disable_retry = None;
+        if let Some((_, requested_at, _, _)) = &started {
+            self.disable_requested_at(*requested_at);
+        } else {
+            self.disable_requested();
+        }
         match started {
             None => self.finish_park_disable_failed(watchdog, action_id, "FEEDBACK_UNAVAILABLE", "Driver unavailable during park disable"),
-            Some((Ok(crate::driver::TorqueProgress::Pending { .. }), _, _)) => {
-                self.torque_transition = Some(TorqueTransition::Disable { origin: DisableOrigin::Park { watchdog, action_id }, confirm: None });
+            Some((Ok(crate::driver::TorqueProgress::Pending { .. }), requested_at, _, _)) => {
+                self.torque_transition = Some(TorqueTransition::Disable {
+                    origin: DisableOrigin::Park { watchdog, action_id },
+                    confirm: None,
+                    requested_at,
+                });
             }
-            Some((Ok(crate::driver::TorqueProgress::Done(_)), _, true)) => {
+            Some((Ok(crate::driver::TorqueProgress::Done(_)), _, _, true)) => {
                 self.complete_park_disable_confirmed(watchdog, action_id);
             }
-            Some((Ok(crate::driver::TorqueProgress::Done(_)), now, false)) => {
-                self.torque_transition = Some(TorqueTransition::Disable { origin: DisableOrigin::Park { watchdog, action_id }, confirm: Some(DisableConfirm::start(now)) });
+            Some((Ok(crate::driver::TorqueProgress::Done(_)), requested_at, post_now, false)) => {
+                self.torque_transition = Some(TorqueTransition::Disable {
+                    origin: DisableOrigin::Park { watchdog, action_id },
+                    confirm: Some(DisableConfirm::start(post_now)),
+                    requested_at,
+                });
             }
-            Some((Err(ref e), _, _)) if crate::driver::is_estop_inhibited(e) => {
+            Some((Err(ref e), _, _, _)) if crate::driver::is_estop_inhibited(e) => {
                 // Keep `disable_pending` set (torque is not confirmed off) and do not latch `DriverWriteFailed`.
                 if let Some(id) = action_id {
                     if self.last_action.as_ref().is_some_and(|a| a.id == id && a.is_running()) {
@@ -1871,7 +2645,8 @@ impl SupervisorInner {
                     }
                 }
             }
-            Some((Err(e), _, _)) => {
+            Some((Err(e), requested_at, post_now, _)) => {
+                let _ = self.arm_background_disable_retry_with_origin(requested_at, post_now);
                 let code = self.disable_step_failed(e);
                 self.finish_park_disable_failed(watchdog, action_id, code, "Torque disable transmission failed");
             }
@@ -1892,7 +2667,7 @@ impl SupervisorInner {
     fn complete_park_disable_confirmed(&mut self, watchdog: bool, action_id: Option<u64>) {
         self.disable_confirmed();
         if !self.safety.state().is_stopped() {
-            let _ = self.torque_off_finish();
+            let _ = self.torque_off_finish_rt();
         } else {
             self.reset_gripper_stall();
             self.gripper_hold_vel_ceiling = None;
@@ -1926,12 +2701,29 @@ impl SupervisorInner {
         }
     }
 
-    /// An enable step that is not a confirmation: the code of the RT contract
-    /// (`handshake::rt_progress`), with zero-allocation non-blocking budgeted cleanup.
-    fn enable_step_failed(&mut self, was_torqued: bool, r: Result<crate::driver::TorqueProgress, crate::driver::ArmDriverError>)
-        -> Result<crate::rt_core::ops::TorqueProgress, &'static str> {
-        self.enable_failed_budgeted_rt(was_torqued, r.as_ref().err());
-        let code = crate::driver::handshake::rt_progress(true, r).err().unwrap_or("ENABLE_FAILED");
+    /// An enable step that is not a confirmation: zero-allocation RT contract code
+    /// (`handshake::rt_progress`), bounded background disable cleanup via the driver's single
+    /// disable choke point, and inline bounded `FaultDetail::formatted`.
+    fn enable_step_failed(
+        &mut self,
+        was_torqued: bool,
+        now: Instant,
+        r: Result<crate::driver::TorqueProgress, crate::driver::ArmDriverError>,
+    ) -> Result<crate::rt_core::ops::TorqueProgress, &'static str> {
+        let detail = crate::safety::FaultDetail::formatted(FaultCode::EnableFailed, |buf| {
+            buf.push_str("Hardware torque enable failed: ");
+            match &r {
+                Err(e) => e.write_bounded(buf),
+                Ok(_) => buf.push_str("enable not confirmed"),
+            }
+        });
+        let code = crate::driver::handshake::rt_progress(true, r)
+            .err()
+            .unwrap_or("ENABLE_FAILED");
+        if !was_torqued {
+            self.rollback_disable_after_failed_or_interrupted_enable(now);
+        }
+        self.safety.latch(crate::safety::FaultKind::Other, detail);
         Err(code)
     }
 
@@ -1942,13 +2734,20 @@ impl SupervisorInner {
             buf.push_str("Torque disable transmission failed: ");
             e.write_bounded(buf);
         });
-        let code = crate::driver::handshake::rt_progress(false, Err(e)).err().unwrap_or("HARDWARE_FAULT");
+        let code = crate::driver::handshake::rt_progress(false, Err(e))
+            .err()
+            .unwrap_or("HARDWARE_FAULT");
         self.safety.latch(crate::safety::FaultKind::Other, detail);
         code
     }
 
-    /// Serves any background (non-broker) disable handshake started by `enable_failed_budgeted`
-    /// or `request_disable` under RT executor ownership, sharing Step 2's single RX budget.
+    /// Serves any background (non-broker) disable handshake and bounded [`BackgroundDisableRetry`]
+    /// started by enable-failure cleanup, fenced-enable abort, or `request_disable` under RT
+    /// executor ownership, sharing Step 2's single RX budget.
+    ///
+    /// Every retry routes strictly through the driver's single `begin_torque_budgeted(false, 0)`
+    /// (`send(TxKind::Disable, ...)`) choke point; exhausting retries or the time bound latches
+    /// `StaticFault::DisableUnconfirmed` with zero heap allocations.
     pub(crate) fn service_background_disable(
         &mut self,
         budget: &crate::rt_core::ops::ServiceBudget,
@@ -1958,20 +2757,129 @@ impl SupervisorInner {
         }
         let d = self.driver.as_ref()?;
         let mut drv = d.lock().ok()?;
-        if !drv.torque_transition_pending() {
-            return None;
-        }
         let drv_now = drv.clock_now();
         let span = budget.deadline.saturating_duration_since(budget.now);
-        let _ = drv.poll_torque_budgeted(drv_now + span, budget.max_rx_frames);
-        drv.take_last_poll_rx()
+
+        if DisableConfirm::confirmed(&**drv) {
+            drop(drv);
+            self.disable_confirmed();
+            return None;
+        }
+        // Once exhausted, never poll or re-issue disable TX again; passive feedback confirmation
+        // above (or an explicit recovery after clear_fault) still clears `disable_pending`.
+        if matches!(
+            self.background_disable_retry,
+            Some(BackgroundDisableRetry::Exhausted)
+        ) {
+            drop(drv);
+            return None;
+        }
+
+        if drv.torque_transition_pending() {
+            let poll_res = drv.poll_torque_budgeted(drv_now + span, budget.max_rx_frames);
+            let rx = drv.take_last_poll_rx();
+            let confirmed_now = DisableConfirm::confirmed(&**drv);
+            let still_pending = drv.torque_transition_pending();
+            let post_now = drv.clock_now();
+            drop(drv);
+            if confirmed_now {
+                self.disable_confirmed();
+            } else {
+                match self.background_disable_retry {
+                    Some(BackgroundDisableRetry::Active {
+                        attempts,
+                        started_at,
+                        ..
+                    }) => {
+                        let window_expired = post_now.saturating_duration_since(started_at)
+                            >= BACKGROUND_DISABLE_MAX_WINDOW;
+                        let finished_unconfirmed = !still_pending
+                            && !matches!(
+                                poll_res,
+                                Ok(crate::driver::TorqueProgress::Pending { .. })
+                            );
+                        if window_expired
+                            || (finished_unconfirmed && attempts >= BACKGROUND_DISABLE_MAX_RETRIES)
+                        {
+                            self.exhaust_background_disable_retry();
+                        } else if finished_unconfirmed {
+                            self.background_disable_retry =
+                                Some(BackgroundDisableRetry::Active {
+                                    attempts,
+                                    started_at,
+                                    next_retry_at: post_now + BACKGROUND_DISABLE_RETRY_INTERVAL,
+                                });
+                        }
+                    }
+                    Some(BackgroundDisableRetry::Exhausted) => {}
+                    None => {
+                        self.arm_background_disable_retry(post_now);
+                    }
+                }
+            }
+            return rx;
+        }
+
+        let Some(BackgroundDisableRetry::Active {
+            attempts,
+            started_at,
+            next_retry_at,
+        }) = self.background_disable_retry
+        else {
+            drop(drv);
+            return None;
+        };
+        if attempts >= BACKGROUND_DISABLE_MAX_RETRIES
+            || drv_now.saturating_duration_since(started_at) >= BACKGROUND_DISABLE_MAX_WINDOW
+        {
+            drop(drv);
+            self.exhaust_background_disable_retry();
+            return None;
+        }
+        if drv_now < next_retry_at || !self.torque_off_when_stopped_hook() {
+            drop(drv);
+            return None;
+        }
+
+        let res = drv.begin_torque_budgeted(false, 0);
+        let confirmed_now = matches!(
+            res,
+            Ok(crate::driver::TorqueProgress::Done(
+                crate::driver::TorqueOutcome::Confirmed
+            ))
+        ) && DisableConfirm::confirmed(&**drv);
+        let handshake_pending = drv.torque_transition_pending();
+        let post_now = drv.clock_now();
+        drop(drv);
+
+        if confirmed_now {
+            self.disable_confirmed();
+            return None;
+        }
+
+        let next_attempts = attempts.saturating_add(1);
+        let window_expired =
+            post_now.saturating_duration_since(started_at) >= BACKGROUND_DISABLE_MAX_WINDOW;
+        if window_expired || (!handshake_pending && next_attempts >= BACKGROUND_DISABLE_MAX_RETRIES)
+        {
+            self.exhaust_background_disable_retry();
+        } else {
+            self.background_disable_retry = Some(BackgroundDisableRetry::Active {
+                attempts: next_attempts,
+                started_at,
+                next_retry_at: post_now + BACKGROUND_DISABLE_RETRY_INTERVAL,
+            });
+        }
+        None
     }
 
     /// Serves the transition in flight once, within `budget` (the executor's clock; the
     /// driver's receive pass gets the same span on the driver's clock). None: none in flight.
     /// `Pending { wake }` is on the executor's clock.
-    pub(crate) fn service_torque_transition(&mut self, budget: &crate::rt_core::ops::ServiceBudget)
-        -> Option<TransitionPoll> {
+    pub(crate) fn service_torque_transition(
+        &mut self,
+        budget: &crate::rt_core::ops::ServiceBudget,
+    ) -> Option<TransitionPoll> {
         use crate::driver::{TorqueOutcome, TorqueProgress as Drv};
         use crate::rt_core::ops::TorqueProgress as Rt;
         let t = self.torque_transition.take()?;
@@ -1991,20 +2899,28 @@ impl SupervisorInner {
         let to_exec = |wake: Instant| budget.now + wake.saturating_duration_since(drv_now);
         let use_budgeted = broker_owned || self.rt_executor_owned || drv.supports_rt_executor().is_ok();
         match t {
-            TorqueTransition::Enable { origin, was_torqued, prev_gripper_cmd } => {
-                if self.estop_pending() || self.safety.state().is_stopped() {
+            TorqueTransition::Enable {
+                origin,
+                was_torqued,
+                prev_gripper_cmd,
+                authority,
+            } => {
+                // Re-verify live enable authority BEFORE any CMD_ENABLE retry TX.
+                if let Some(code) = self.enable_authority_revoked(authority, budget.now) {
                     drv.abort_enable();
                     let still_enabled = drv.enable_state() != EnableState::Disabled
                         || drv.has_any_joint_enabled()
                         || drv.has_known_partial_enable();
                     drop(drv);
-                    self.is_torqued = was_torqued || still_enabled;
-                    self.pending_rearm = true;
-                    let code = if self.estop_pending() || matches!(self.safety.state(), SafetyState::EStop) {
-                        "ESTOP_ACTIVE"
+                    if matches!(code, "ESTOP_ACTIVE" | "FAULT_ACTIVE") {
+                        self.is_torqued = was_torqued || still_enabled;
+                        self.pending_rearm = true;
+                    } else if !was_torqued {
+                        self.rollback_disable_after_failed_or_interrupted_enable(budget.now);
                     } else {
-                        "FAULT_ACTIVE"
-                    };
+                        self.is_torqued = true;
+                        self.pending_rearm = true;
+                    }
                     if let EnableOrigin::ParkRearm { action_id, .. } = origin {
                         self.finish_park_rearm_failed(action_id, code);
                     }
@@ -2078,8 +2994,15 @@ impl SupervisorInner {
                                 return Some(TransitionPoll { progress: Err("STOPPED"), rx, broker_owned });
                             }
                         }
-                        match self.enable_finish_inner(was_torqued, prev_gripper_cmd, true) {
-                            Ok(_) => {
+                        let finish_res = if self.rt_executor_owned || broker_owned {
+                            self.enable_finish_rt(was_torqued, prev_gripper_cmd, budget.now)
+                        } else {
+                            self.enable_finish_inner(was_torqued, prev_gripper_cmd, true)
+                                .map(|_| ())
+                                .map_err(|e| torque_error_code(&e))
+                        };
+                        match finish_res {
+                            Ok(()) => {
                                 if let EnableOrigin::ParkRearm { action_id, stop_gen } = origin {
                                     if let Some(c) = self.park_continuation.as_mut().filter(|c| c.action_id == action_id && c.stop_gen == stop_gen) {
                                         c.phase = super::ParkContinuationPhase::ReadyForPlan;
@@ -2088,8 +3011,7 @@ impl SupervisorInner {
                                 }
                                 Ok(Rt::Done)
                             }
-                            Err(e) => {
-                                let code = torque_error_code(&e);
+                            Err(code) => {
                                 if let EnableOrigin::ParkRearm { action_id, .. } = origin {
                                     self.finish_park_rearm_failed(action_id, code);
                                 }
@@ -2098,7 +3020,7 @@ impl SupervisorInner {
                         }
                     }
                     r => {
-                        let res = self.enable_step_failed(was_torqued, r);
+                        let res = self.enable_step_failed(was_torqued, budget.now, r);
                         if let (EnableOrigin::ParkRearm { action_id, .. }, Err(code)) = (origin, res) {
                             self.finish_park_rearm_failed(action_id, code);
                         }
@@ -2107,13 +3029,18 @@ impl SupervisorInner {
                 };
                 Some(TransitionPoll { progress, rx, broker_owned })
             }
-            TorqueTransition::Disable { origin, confirm: None } => {
+            TorqueTransition::Disable {
+                origin,
+                confirm: None,
+                requested_at,
+            } => {
                 let r = if use_budgeted {
                     drv.poll_torque_budgeted(drv_now + span, budget.max_rx_frames)
                 } else {
                     drv.poll_torque(drv_now + span)
                 };
                 let rx = drv.take_last_poll_rx();
+                let post_now = drv.clock_now();
                 match r {
                     Ok(Drv::Pending { wake }) => {
                         drop(drv);
@@ -2123,11 +3050,11 @@ impl SupervisorInner {
                     // confirmed or not by the driver's window: the supervisor's confirmation decides
                     // (an unconfirmed disable is never success; `request_disable` does the same)
                     Ok(Drv::Done(_)) => {
-                        let now = drv.clock_now();
                         drop(drv);
                         self.torque_transition = Some(TorqueTransition::Disable {
                             origin,
-                            confirm: Some(DisableConfirm::start(now)),
+                            confirm: Some(DisableConfirm::start(post_now)),
+                            requested_at,
                         });
                         Some(TransitionPoll { progress: Ok(Rt::Pending { wake: budget.now }), rx, broker_owned })
                     }
@@ -2140,6 +3067,7 @@ impl SupervisorInner {
                     }
                     Err(e) => {
                         drop(drv);
+                        let _ = self.arm_background_disable_retry_with_origin(requested_at, post_now);
                         let code = self.disable_step_failed(e);
                         if let DisableOrigin::Park { watchdog, action_id } = origin {
                             self.finish_park_disable_failed(watchdog, action_id, code, "Torque disable transmission failed");
@@ -2148,15 +3076,24 @@ impl SupervisorInner {
                     }
                 }
             }
-            TorqueTransition::Disable { origin, confirm: Some(mut c) } => {
+            TorqueTransition::Disable {
+                origin,
+                confirm: Some(mut c),
+                requested_at,
+            } => {
                 let mut states = std::mem::take(&mut self.scratch.states);
                 let served = c.serve_budgeted(&mut **drv, drv_now + span, budget.max_rx_frames, &mut states);
+                let post_now = drv.clock_now();
                 self.scratch.states = states;
                 drop(drv);
                 let rx = served.did_rx.then_some((served.rx_frames, served.budget_exhausted));
                 let progress = match served.outcome {
                     None => {
-                        self.torque_transition = Some(TorqueTransition::Disable { origin, confirm: Some(c) });
+                        self.torque_transition = Some(TorqueTransition::Disable {
+                            origin,
+                            confirm: Some(c),
+                            requested_at,
+                        });
                         let wake = (drv_now + DISABLE_CONFIRM_SERVICE).min(c.deadline());
                         Ok(Rt::Pending { wake: to_exec(wake) })
                     }
@@ -2164,7 +3101,7 @@ impl SupervisorInner {
                         match origin {
                             DisableOrigin::BrokerTransition => {
                                 self.disable_confirmed();
-                                self.torque_off_finish().map(|_| Rt::Done).map_err(|e| torque_error_code(&e))
+                                self.torque_off_finish_rt().map(|()| Rt::Done)
                             }
                             DisableOrigin::Park { watchdog, action_id } => {
                                 self.complete_park_disable_confirmed(watchdog, action_id);
@@ -2173,9 +3110,16 @@ impl SupervisorInner {
                         }
                     }
                     Some(false) => {
+                        // M4: Sends succeeded but confirmation timed out — arm bounded
+                        // BackgroundDisableRetry keeping the original DisableRequested timestamp
+                        // BEFORE latching the fault so background service keeps retrying within
+                        // the request's original lifetime.
+                        let _ = self.arm_background_disable_retry_with_origin(requested_at, post_now);
                         self.safety.latch(
                             crate::safety::FaultKind::Other,
-                            crate::safety::FaultDetail::Static(crate::safety::StaticFault::DisableUnconfirmed),
+                            crate::safety::FaultDetail::Static(
+                                crate::safety::StaticFault::DisableUnconfirmed,
+                            ),
                         );
                         if let DisableOrigin::Park { watchdog, action_id } = origin {
                             self.finish_park_disable_failed(
@@ -2258,10 +3202,13 @@ impl SupervisorInner {
             shutdown_committed: self.shutdown_committed,
             driver_config_error: driver_config_error_override
                 .or_else(|| self.driver_config_error.as_deref().map(BoundedText::new)),
+            config_reconcile_fault: self.config_reconcile_fault,
             gravity_comp_unconfirmed: self.gravity_comp_blocks_clear(),
             disable_pending: self.disable_pending,
             has_driver: self.driver.is_some(),
             feedback_fresh: self.driver.is_none(),
+            j7_feedback_fresh: self.driver.is_none()
+                && !self.safety.has_latched_fault_kind(crate::safety::FaultKind::J7FeedbackStale),
             tx_queue_drained: self.driver.is_none(),
             tx_probe_confirmed: self.driver.is_none(),
             tx_probe_sent: false,
@@ -2295,6 +3242,7 @@ impl SupervisorInner {
                 ctx.feedback_fresh = self.feedback_numeric_valid
                     && drv.is_feedback_valid()
                     && drv.feedback_all_within(self.config.dof, Duration::from_millis(250));
+                ctx.j7_feedback_fresh = drv.pos_force_feedback_fresh();
                 ctx.tx_queue_drained = drv.pending_tx_len_total() == 0;
                 ctx.tx_probe_confirmed = drv.tx_probe_confirmed();
                 ctx.tx_probe_sent = drv.tx_probe_pending();
@@ -2381,23 +3329,38 @@ impl SupervisorInner {
     /// `SafetyManager::clear_check` runs FIRST before any motor reset, driver limit mutation,
     /// concurrent E-stop consumption, or other side effect.
     pub fn clear_fault_for_epoch(&mut self, expected_epoch: Option<u64>) -> Result<SafetyState, SafetyError> {
+        match self.clear_fault_for_epoch_with_authority(expected_epoch, None) {
+            Ok(state) => Ok(state),
+            Err(ClearFaultLegacyInnerError::Safety(e)) => Err(e),
+            Err(ClearFaultLegacyInnerError::Authority(_)) => {
+                unreachable!("authority is None on direct clear_fault_for_epoch")
+            }
+        }
+    }
+
+    pub(crate) fn clear_fault_for_epoch_with_authority(
+        &mut self,
+        expected_epoch: Option<u64>,
+        authority: Option<crate::rt_core::requests::lease::ClearFaultAuthority>,
+    ) -> Result<SafetyState, ClearFaultLegacyInnerError> {
+        use crate::rt_core::requests::lease::recheck_clear_fault_authority_readonly;
         use crate::safety::ClearRefusal;
         let had_driver_config_error = self.driver_config_error.is_some();
         let (candidate_limits, driver_err_override, clear_driver_err_field) = match self.probe_driver_limits_legacy() {
             Ok(cand) => (cand, None, had_driver_config_error),
             Err(err) => (None, Some(err), false),
         };
-        let apply_estop_refusal = |this: &mut Self| -> SafetyError {
+        let apply_estop_refusal = |this: &mut Self| -> ClearFaultLegacyInnerError {
             this.consume_pending_estop();
             if let Some(received) = expected_epoch {
                 if received != this.safety.epoch_id() {
-                    return SafetyError::EpochMismatch {
+                    return ClearFaultLegacyInnerError::Safety(SafetyError::EpochMismatch {
                         expected: this.safety.epoch_id(),
                         received,
-                    };
+                    });
                 }
             }
-            SafetyError::EStopActive
+            ClearFaultLegacyInnerError::Safety(SafetyError::EStopActive)
         };
         let commit_probed_limits = |this: &mut Self| {
             if let Some(ref cand) = candidate_limits {
@@ -2429,6 +3392,7 @@ impl SupervisorInner {
         // telemetry; universal blockers and supervisor-known checks (including `has_active_lease`
         // / `lease_heartbeat_fresh`) run FIRST here before any bus poll or state change.
         pre_ctx.feedback_fresh = true;
+        pre_ctx.j7_feedback_fresh = true;
         pre_ctx.tx_queue_drained = true;
         pre_ctx.tx_probe_confirmed = true;
         pre_ctx.thermal_sensor_available = true;
@@ -2440,7 +3404,7 @@ impl SupervisorInner {
             if refusal == ClearRefusal::EStopActive {
                 return Err(apply_estop_refusal(self));
             }
-            return Err(refusal.into_safety_error());
+            return Err(ClearFaultLegacyInnerError::Safety(refusal.into_safety_error()));
         }
         if !self.safety.state().is_stopped() && !self.safety.has_latched_fault() {
             commit_probed_limits(self);
@@ -2475,6 +3439,7 @@ impl SupervisorInner {
                             && ages.len() == self.config.dof
                             && ages.iter().all(|a| a.is_some_and(|t| t <= THERMAL_FEEDBACK_FRESHNESS_LIMIT))
                             && Self::states_valid(&states, caps, self.config.dof, loads.as_deref());
+                        let j7_fb_fresh = drv.pos_force_feedback_fresh();
                         let threshold = self.config.max_temperature - THERMAL_CLEAR_MARGIN_C;
                         let thermal_below = fb_fresh
                             && caps.temperature_feedback
@@ -2489,9 +3454,9 @@ impl SupervisorInner {
                         );
                         Some((
                             states,
-                            loads,
                             caps.temperature_feedback,
                             fb_fresh,
+                            j7_fb_fresh,
                             tx_queue_drained,
                             tx_probe_confirmed,
                             tx_probe_sent,
@@ -2507,10 +3472,11 @@ impl SupervisorInner {
                 }
                 mit_ctx.expected_epoch = expected_epoch;
                 mit_ctx.pending_estop = self.estop_request_unapplied();
-                if let Some((ref states, _, temp_fb, fb_fresh, tx_queue_drained, tx_probe_confirmed, tx_probe_sent, thermal_below, next_cd, modes_uncertain)) = snapshot {
+                if let Some((ref states, temp_fb, fb_fresh, j7_fb_fresh, tx_queue_drained, tx_probe_confirmed, tx_probe_sent, thermal_below, next_cd, modes_uncertain)) = snapshot {
                     mit_ctx.mit_modes_uncertain = modes_uncertain;
                     mit_ctx.thermal_sensor_available = temp_fb;
                     mit_ctx.feedback_fresh = fb_fresh;
+                    mit_ctx.j7_feedback_fresh = j7_fb_fresh;
                     mit_ctx.tx_queue_drained = tx_queue_drained;
                     mit_ctx.tx_probe_confirmed = tx_probe_confirmed;
                     mit_ctx.tx_probe_sent = tx_probe_sent;
@@ -2526,6 +3492,7 @@ impl SupervisorInner {
                         self.joint_limit_clear_violation_for_positions(&positions, candidate_limits.as_ref());
                 } else {
                     mit_ctx.feedback_fresh = false;
+                    mit_ctx.j7_feedback_fresh = false;
                     mit_ctx.tx_queue_drained = false;
                     mit_ctx.tx_probe_confirmed = false;
                     mit_ctx.tx_probe_sent = false;
@@ -2540,46 +3507,52 @@ impl SupervisorInner {
                     if refusal == ClearRefusal::EStopActive {
                         return Err(apply_estop_refusal(self));
                     }
-                    return Err(refusal.into_safety_error());
+                    return Err(ClearFaultLegacyInnerError::Safety(refusal.into_safety_error()));
                 }
                 if !self.mit.recovery_confirmed {
-                    return Err(SafetyError::ClearFaultRejected(format!(
+                    return Err(ClearFaultLegacyInnerError::Safety(SafetyError::ClearFaultRejected(format!(
                         "{}: {}",
                         crate::mit::RECOVERY_CONFIRM_CODE,
                         crate::mit::RECOVERY_WARNING
-                    )));
+                    ))));
                 }
-                // Full `clear_check` and operator confirmation passed: commit synced state now.
-                self.mit.recovery_confirmed = false;
-                if let Some((states, loads, _, fb_fresh, _, _, _, _, next_cd, _)) = snapshot {
-                    if fb_fresh {
-                        self.feedback_numeric_valid = true;
-                        Self::apply_feedback(
-                            &mut self.measured_positions,
-                            &mut self.measured_velocities,
-                            &mut self.torques,
-                            &mut self.temperatures,
-                            &mut self.loads,
-                            self.config.dof,
-                            &states,
-                            loads.as_deref(),
-                        );
-                        self.thermal_cooldown = next_cd;
-                    }
+                // Keep operator confirmation, feedback, cooldown, and probed limits staged through
+                // `mit_expiry_recovery_for_epoch`'s final `clear_with_check` decision (fail-closed:
+                // zero premature commits if pre- or post-recovery clear_check refuses).
+                let mit_commit = ClearFaultCommit {
+                    candidate_limits,
+                    reapply_legacy_limits: clear_driver_err_field && candidate_limits.is_none(),
+                    is_torqued: None,
+                    thermal_cooldown: None,
+                };
+                if let Some(auth) = authority {
+                    recheck_clear_fault_authority_readonly(self, auth, Instant::now())
+                        .map_err(ClearFaultLegacyInnerError::Authority)?;
                 }
-                commit_probed_limits(self);
-                return self.mit_expiry_recovery_for_epoch(expected_epoch);
+                return self.mit_expiry_recovery_for_epoch(
+                    expected_epoch,
+                    mit_ctx,
+                    mit_commit,
+                    driver_err_override,
+                ).map_err(ClearFaultLegacyInnerError::Safety);
             }
         }
 
         let mut ctx;
+        let mut commit = ClearFaultCommit {
+            candidate_limits,
+            reapply_legacy_limits: clear_driver_err_field && candidate_limits.is_none(),
+            is_torqued: None,
+            thermal_cooldown: None,
+        };
+        let mut staged_feedback = None;
         if let Some(ref d) = self.driver {
             let mut ws_bufs = std::mem::take(&mut self.ws_eval_bufs);
             let mut drv = match d.lock() {
                 Ok(g) => g,
                 Err(_) => {
                     self.ws_eval_bufs = ws_bufs;
-                    return Err(SafetyError::FeedbackUnavailable);
+                    return Err(ClearFaultLegacyInnerError::Safety(SafetyError::FeedbackUnavailable));
                 }
             };
             // Pure read-only telemetry & status snapshot FIRST — ZERO motor resets or side effects.
@@ -2588,7 +3561,7 @@ impl SupervisorInner {
                 Err(e) => {
                     drop(drv);
                     self.ws_eval_bufs = ws_bufs;
-                    return Err(SafetyError::ClearFaultRejected(e.to_string()));
+                    return Err(ClearFaultLegacyInnerError::Safety(SafetyError::ClearFaultRejected(e.to_string())));
                 }
             };
             let ages = drv.feedback_ages();
@@ -2600,6 +3573,7 @@ impl SupervisorInner {
             let mut partial = drv.has_known_partial_enable();
             let mut any_enabled = drv.has_any_joint_enabled();
             let fb_valid = drv.is_feedback_valid();
+            let mut j7_fb_fresh = drv.pos_force_feedback_fresh();
             let tx_queue_drained = drv.pending_tx_len_total() == 0;
             let tx_probe_confirmed = drv.tx_probe_confirmed();
             let tx_probe_sent = drv.tx_probe_pending();
@@ -2619,31 +3593,16 @@ impl SupervisorInner {
                 && ages.iter().all(|a| a.is_some_and(|t| t <= max_rest_age))
                 && states_ok;
 
-            let defer_mit_commit = self.mit.owner == crate::mit::MitOwner::Lost;
-            if fb_fresh && !defer_mit_commit {
-                self.feedback_numeric_valid = true;
-                self.last_can_feedback_instant = ages
-                    .iter()
-                    .copied()
-                    .try_fold(Duration::ZERO, |m, a| a.map(|t| m.max(t)))
-                    .and_then(|age| Instant::now().checked_sub(age));
-                self.core.poll_feedback(
-                    &mut self.joint_feedback_queue_bounds,
-                    self.config.dof,
-                    drv.as_ref(),
-                    &mut self.scratch.fb,
-                );
-                Self::apply_feedback(
-                    &mut self.measured_positions,
-                    &mut self.measured_velocities,
-                    &mut self.torques,
-                    &mut self.temperatures,
-                    &mut self.loads,
-                    self.config.dof,
-                    &states,
-                    loads.as_deref(),
-                );
-            }
+            // Stage sampled feedback and thermal cooldown WITHOUT mutating supervisor state
+            // before `clear_check` / `clear_with_check` succeeds.
+            let dof = self.config.dof;
+            let staged_positions: Vec<f32> = states.iter().take(dof).map(|s| s.position).collect();
+            let staged_velocities: Vec<f32> = states.iter().take(dof).map(|s| s.velocity).collect();
+            let staged_torques: Vec<f32> = states.iter().take(dof).map(|s| s.torque).collect();
+            let staged_loads_vec: Vec<f32> = match loads.as_deref() {
+                Some(ls) => ls.iter().take(dof).copied().collect(),
+                None => self.loads.clone(),
+            };
             let threshold = self.config.max_temperature - THERMAL_CLEAR_MARGIN_C;
             let thermal_below = fb_fresh
                 && caps.temperature_feedback
@@ -2657,9 +3616,6 @@ impl SupervisorInner {
                 thermal_below,
                 &mut rx_buf,
             );
-            if !defer_mit_commit {
-                self.thermal_cooldown = next_cd;
-            }
 
             let mut resting_feedback_missing = false;
             let mut resting_pose_violation = None;
@@ -2667,8 +3623,16 @@ impl SupervisorInner {
                 if !resting_fb_ok {
                     resting_feedback_missing = true;
                 } else {
-                    resting_pose_violation =
-                        self.resting_pose_support_violation_bounded(Some(drv.as_ref()), &ages, &mut ws_bufs);
+                    resting_pose_violation = self.resting_pose_support_violation_for_feedback(
+                        Some(drv.as_ref()),
+                        &ages,
+                        &staged_positions,
+                        &staged_velocities,
+                        &staged_torques,
+                        &staged_loads_vec,
+                        true,
+                        &mut ws_bufs,
+                    );
                 }
             }
             let enable_known = state != EnableState::Unknown || partial;
@@ -2682,23 +3646,18 @@ impl SupervisorInner {
             ctx.expected_epoch = expected_epoch;
             ctx.pending_estop = self.estop_request_unapplied();
             ctx.feedback_fresh = fb_fresh;
+            ctx.j7_feedback_fresh = j7_fb_fresh;
             ctx.tx_queue_drained = tx_queue_drained;
             ctx.tx_probe_confirmed = tx_probe_confirmed;
             ctx.tx_probe_sent = tx_probe_sent;
             ctx.thermal_sensor_available = caps.temperature_feedback;
             ctx.thermal_below_threshold = thermal_below;
-            if defer_mit_commit {
-                ctx.thermal_cooldown_elapsed_ms = if thermal_below { next_cd.elapsed_ms() } else { 0 };
-                let positions: Vec<f32> = states.iter().take(self.config.dof).map(|s| s.position).collect();
-                ctx.joint_limit_violation = if fb_fresh {
-                    self.joint_limit_clear_violation_for_positions(&positions, candidate_limits.as_ref())
-                } else {
-                    self.joint_limit_clear_violation_with_candidates(candidate_limits.as_ref())
-                };
+            ctx.thermal_cooldown_elapsed_ms = if thermal_below { next_cd.elapsed_ms() } else { 0 };
+            ctx.joint_limit_violation = if fb_fresh {
+                self.joint_limit_clear_violation_for_positions(&staged_positions, candidate_limits.as_ref())
             } else {
-                ctx.joint_limit_violation =
-                    self.joint_limit_clear_violation_with_candidates(candidate_limits.as_ref());
-            }
+                self.joint_limit_clear_violation_with_candidates(candidate_limits.as_ref())
+            };
             ctx.resting_feedback_missing = resting_feedback_missing;
             ctx.resting_pose_violation = resting_pose_violation;
             ctx.hardware_reset_required = hw_fault;
@@ -2710,8 +3669,16 @@ impl SupervisorInner {
             if clear_res == Err(ClearRefusal::TxProbeRequired) {
                 // Every OTHER recorded kind's condition passed and the software TX queue is empty:
                 // run one read-only refresh/status TX probe and verify fresh post-probe feedback.
-                let (probe_res, drained_after, probe_ok, probe_pending, hw_fault_after, st_after, partial_after, any_en_after, fb_valid_after, ages_after) = {
+                let (probe_res, drained_after, probe_ok, probe_pending, hw_fault_after, st_after, partial_after, any_en_after, fb_valid_after, j7_fresh_after, ages_after) = {
                     let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
+                    if let Some(auth) = authority {
+                        if let Err(auth_err) =
+                            recheck_clear_fault_authority_readonly(self, auth, Instant::now())
+                        {
+                            drop(drv);
+                            return Err(ClearFaultLegacyInnerError::Authority(auth_err));
+                        }
+                    }
                     let res = drv.probe_tx_ready();
                     (
                         res,
@@ -2723,15 +3690,18 @@ impl SupervisorInner {
                         drv.has_known_partial_enable(),
                         drv.has_any_joint_enabled(),
                         drv.is_feedback_valid(),
+                        drv.pos_force_feedback_fresh(),
                         drv.feedback_ages(),
                     )
                 };
                 state = st_after;
                 partial = partial_after;
                 any_enabled = any_en_after;
+                j7_fb_fresh = j7_fresh_after;
                 ctx.tx_queue_drained = drained_after;
                 ctx.enable_state_known = state != EnableState::Unknown || partial;
                 ctx.hardware_reset_required = hw_fault_after;
+                ctx.j7_feedback_fresh = j7_fb_fresh;
                 ctx.pending_estop = self.estop_request_unapplied();
                 match probe_res {
                     Ok(confirmed) => {
@@ -2755,10 +3725,31 @@ impl SupervisorInner {
                 Err(ClearRefusal::EStopActive) => return Err(apply_estop_refusal(self)),
                 Err(ClearRefusal::HardwareResetRequired) => {
                     // Explicitly modeled exception: every OTHER recorded kind's condition passed,
-                    // so transmitting the motor fault reset is now permitted; re-evaluate
-                    // `clear_check` immediately after the reset.
+                    // so transmitting the motor fault reset is now permitted. Recheck live grant,
+                    // lease, operator session (M3), J7 freshness, and pending E-stop under the
+                    // SAME driver lock guard before sending the reset (zero check-to-command gap).
                     let reset_res = {
                         let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
+                        if let Some(auth) = authority {
+                            if let Err(auth_err) =
+                                recheck_clear_fault_authority_readonly(self, auth, Instant::now())
+                            {
+                                drop(drv);
+                                return Err(ClearFaultLegacyInnerError::Authority(auth_err));
+                            }
+                        }
+                        ctx.j7_feedback_fresh = drv.pos_force_feedback_fresh();
+                        ctx.feedback_fresh = ctx.feedback_fresh && drv.is_feedback_valid();
+                        ctx.pending_estop = self.estop_request_unapplied();
+                        if let Err(refusal) = self.safety.clear_check(&ctx) {
+                            if refusal != ClearRefusal::HardwareResetRequired {
+                                drop(drv);
+                                if refusal == ClearRefusal::EStopActive {
+                                    return Err(apply_estop_refusal(self));
+                                }
+                                return Err(ClearFaultLegacyInnerError::Safety(refusal.into_safety_error()));
+                            }
+                        }
                         drv.clear_fault()
                     };
                     ctx.hardware_reset_required = false;
@@ -2771,93 +3762,250 @@ impl SupervisorInner {
                     if post_refusal == ClearRefusal::EStopActive {
                         return Err(apply_estop_refusal(self));
                     }
-                    return Err(post_refusal.into_safety_error());
+                    return Err(ClearFaultLegacyInnerError::Safety(post_refusal.into_safety_error()));
                 }
                 Err(ClearRefusal::EnableStateUnknown) if fb_fresh && !hw_fault && !partial => {
                     // Every other condition passed; probe enable state once and re-run clear_check.
                     {
                         let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
+                        if let Some(auth) = authority {
+                            if let Err(auth_err) =
+                                recheck_clear_fault_authority_readonly(self, auth, Instant::now())
+                            {
+                                drop(drv);
+                                return Err(ClearFaultLegacyInnerError::Authority(auth_err));
+                            }
+                        }
                         let _ = drv.refresh_enable_state();
                         state = drv.enable_state();
                         partial = drv.has_known_partial_enable();
                         any_enabled = drv.has_any_joint_enabled();
+                        j7_fb_fresh = drv.pos_force_feedback_fresh();
                     }
                     ctx.enable_state_known = state != EnableState::Unknown || partial;
+                    ctx.j7_feedback_fresh = j7_fb_fresh;
                     ctx.pending_estop = self.estop_request_unapplied();
                     if let Err(refusal) = self.safety.clear_check(&ctx) {
                         if refusal == ClearRefusal::EStopActive {
                             return Err(apply_estop_refusal(self));
                         }
-                        return Err(refusal.into_safety_error());
+                        return Err(ClearFaultLegacyInnerError::Safety(refusal.into_safety_error()));
                     }
                 }
-                Err(refusal) => return Err(refusal.into_safety_error()),
-            }
-            if defer_mit_commit && fb_fresh {
-                self.feedback_numeric_valid = true;
-                self.last_can_feedback_instant = ages
-                    .iter()
-                    .copied()
-                    .try_fold(Duration::ZERO, |m, a| a.map(|t| m.max(t)))
-                    .and_then(|age| Instant::now().checked_sub(age));
-                if let Ok(drv) = d.lock() {
-                    self.core.poll_feedback(
-                        &mut self.joint_feedback_queue_bounds,
-                        self.config.dof,
-                        drv.as_ref(),
-                        &mut self.scratch.fb,
-                    );
+                Err(refusal) => {
+                    if matches!(refusal, ClearRefusal::ThermalCooldownNotElapsed { .. })
+                        && (!self.safety.has_latched_fault_kind(crate::safety::FaultKind::J7FeedbackStale)
+                            || ctx.j7_feedback_fresh)
+                    {
+                        self.thermal_cooldown = next_cd;
+                    }
+                    return Err(ClearFaultLegacyInnerError::Safety(refusal.into_safety_error()));
                 }
-                Self::apply_feedback(
-                    &mut self.measured_positions,
-                    &mut self.measured_velocities,
-                    &mut self.torques,
-                    &mut self.temperatures,
-                    &mut self.loads,
-                    self.config.dof,
-                    &states,
-                    loads.as_deref(),
-                );
-                self.thermal_cooldown = next_cd;
             }
-            commit_probed_limits(self);
-            self.is_torqued = state == EnableState::Enabled || partial || any_enabled;
+            if fb_fresh {
+                staged_feedback = Some((states, loads, ages));
+            }
+            commit.is_torqued = Some(state == EnableState::Enabled || partial || any_enabled);
+            commit.thermal_cooldown = Some(next_cd);
         } else {
-            self.update_thermal_cooldown_driverless(Instant::now());
+            let next_cd = self.evaluate_thermal_cooldown_driverless(Instant::now());
             ctx = self.build_clear_context_base(driver_err_override);
             if clear_driver_err_field && driver_err_override.is_none() {
                 ctx.driver_config_error = None;
             }
             ctx.expected_epoch = expected_epoch;
             ctx.pending_estop = self.estop_request_unapplied();
+            ctx.thermal_cooldown_elapsed_ms = if ctx.thermal_below_threshold {
+                next_cd.elapsed_ms()
+            } else {
+                0
+            };
             ctx.joint_limit_violation =
                 self.joint_limit_clear_violation_with_candidates(candidate_limits.as_ref());
             if let Err(refusal) = self.safety.clear_check(&ctx) {
                 if refusal == ClearRefusal::EStopActive {
                     return Err(apply_estop_refusal(self));
                 }
-                return Err(refusal.into_safety_error());
+                if matches!(refusal, ClearRefusal::ThermalCooldownNotElapsed { .. })
+                    && (!self.safety.has_latched_fault_kind(crate::safety::FaultKind::J7FeedbackStale)
+                        || ctx.j7_feedback_fresh)
+                {
+                    self.thermal_cooldown = next_cd;
+                }
+                return Err(ClearFaultLegacyInnerError::Safety(refusal.into_safety_error()));
             }
-            commit_probed_limits(self);
+            commit.thermal_cooldown = Some(next_cd);
         }
-        self.clear_fault_finish(&ctx)
-    }
-
-    fn clear_fault_finish(&mut self, ctx: &crate::safety::ClearContext) -> Result<SafetyState, SafetyError> {
-        self.clear_fault_finish_bounded(ctx).map_err(SafetyError::from)
+        self.clear_fault_finish_bounded_with_authority(&ctx, commit, authority, None, move |this| {
+            if let Some((states, loads, ages)) = staged_feedback {
+                this.feedback_numeric_valid = true;
+                this.last_can_feedback_instant = ages
+                    .iter()
+                    .copied()
+                    .try_fold(Duration::ZERO, |m, a| a.map(|t| m.max(t)))
+                    .and_then(|age| Instant::now().checked_sub(age));
+                if let Some(ref d) = this.driver {
+                    if let Ok(drv) = d.lock() {
+                        this.core.poll_feedback(
+                            &mut this.joint_feedback_queue_bounds,
+                            this.config.dof,
+                            drv.as_ref(),
+                            &mut this.scratch.fb,
+                        );
+                    }
+                }
+                Self::apply_feedback(
+                    &mut this.measured_positions,
+                    &mut this.measured_velocities,
+                    &mut this.torques,
+                    &mut this.temperatures,
+                    &mut this.loads,
+                    this.config.dof,
+                    &states,
+                    loads.as_deref(),
+                );
+            }
+        })
+        .map_err(|e| match e {
+            ClearFaultWithAuthError::Authority(a) => ClearFaultLegacyInnerError::Authority(a),
+            ClearFaultWithAuthError::Clear(c) => ClearFaultLegacyInnerError::Safety(SafetyError::from(c)),
+        })
     }
 
     #[allow(clippy::result_large_err)] // inline refusal keeps RT clear_fault zero-alloc
-    fn clear_fault_finish_bounded(
+    fn clear_fault_finish_bounded_with_authority(
         &mut self,
         ctx: &crate::safety::ClearContext,
-    ) -> Result<SafetyState, crate::safety::ClearFaultError> {
-        use crate::safety::{ClearFaultError, ClearRefusal};
+        commit: ClearFaultCommit,
+        authority: Option<crate::rt_core::requests::lease::ClearFaultAuthority>,
+        now_override: Option<Instant>,
+        on_committed: impl FnOnce(&mut Self),
+    ) -> Result<SafetyState, ClearFaultWithAuthError> {
+        use crate::rt_core::requests::lease::recheck_clear_fault_authority_readonly;
+        use crate::safety::{ClearFaultError, ClearRefusal, FaultKind};
         if self.shutdown_committed {
-            return Err(ClearFaultError::Rejected(ClearRefusal::ShutdownCommitted));
+            return Err(ClearFaultWithAuthError::Clear(ClearFaultError::Rejected(ClearRefusal::ShutdownCommitted)));
         }
-        // Single authoritative clear_check FIRST before mutating/resetting state.
-        self.safety.clear_check(ctx).map_err(ClearFaultError::Rejected)?;
+        // Build live pre-commit ClearContext right before committing so any concurrent E-stop,
+        // authority revocation (M3), or J7 freshness expiry between preflight/probe and commit
+        // fails closed with ZERO mutations.
+        let mut final_ctx = *ctx;
+        let was_estop = *self.safety.state() == SafetyState::EStop;
+        let state = if let Some(ref d) = self.driver {
+            let drv = match d.lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    final_ctx.j7_feedback_fresh = false;
+                    final_ctx.feedback_fresh = false;
+                    final_ctx.pending_estop = self.estop_request_unapplied();
+                    return Err(ClearFaultWithAuthError::Clear(
+                        self.safety
+                            .clear_check(&final_ctx)
+                            .err()
+                            .map_or(ClearFaultError::FeedbackUnavailable, ClearFaultError::from),
+                    ));
+                }
+            };
+            if let Some(auth) = authority {
+                let check_now = now_override.unwrap_or_else(Instant::now);
+                if let Err(auth_err) = recheck_clear_fault_authority_readonly(self, auth, check_now) {
+                    drop(drv);
+                    return Err(ClearFaultWithAuthError::Authority(auth_err));
+                }
+            }
+            final_ctx.pending_estop = self.estop_request_unapplied();
+            if self.safety.has_latched_fault_kind(FaultKind::J7FeedbackStale) {
+                final_ctx.j7_feedback_fresh = drv.pos_force_feedback_fresh();
+                final_ctx.feedback_fresh = final_ctx.feedback_fresh && drv.is_feedback_valid();
+            }
+            if let Err(refusal) = self.safety.clear_check(&final_ctx) {
+                drop(drv);
+                if refusal == ClearRefusal::EStopActive {
+                    self.consume_pending_estop();
+                    if let Some(received) = final_ctx.expected_epoch {
+                        if received != self.safety.epoch_id() {
+                            return Err(ClearFaultWithAuthError::Clear(ClearFaultError::EpochMismatch {
+                                expected: self.safety.epoch_id(),
+                                received,
+                            }));
+                        }
+                    }
+                    return Err(ClearFaultWithAuthError::Clear(ClearFaultError::EStopActive));
+                }
+                return Err(ClearFaultWithAuthError::Clear(ClearFaultError::from(refusal)));
+            }
+            if self.estop_request_unapplied() {
+                drop(drv);
+                self.consume_pending_estop();
+                if let Some(received) = final_ctx.expected_epoch {
+                    if received != self.safety.epoch_id() {
+                        return Err(ClearFaultWithAuthError::Clear(ClearFaultError::EpochMismatch {
+                            expected: self.safety.epoch_id(),
+                            received,
+                        }));
+                    }
+                }
+                return Err(ClearFaultWithAuthError::Clear(ClearFaultError::EStopActive));
+            }
+            // Commit the safety clear under the SAME driver lock guard before applying staged
+            // limits, torque flag, or cleanup (zero check-to-commit gap).
+            self.safety
+                .clear_with_check(&final_ctx)
+                .map_err(|r| ClearFaultWithAuthError::Clear(ClearFaultError::from(r)))?
+        } else {
+            if let Some(auth) = authority {
+                let check_now = now_override.unwrap_or_else(Instant::now);
+                recheck_clear_fault_authority_readonly(self, auth, check_now)
+                    .map_err(ClearFaultWithAuthError::Authority)?;
+            }
+            final_ctx.pending_estop = self.estop_request_unapplied();
+            if self.safety.has_latched_fault_kind(FaultKind::J7FeedbackStale) {
+                final_ctx.j7_feedback_fresh = false;
+            }
+            if let Err(refusal) = self.safety.clear_check(&final_ctx) {
+                if refusal == ClearRefusal::EStopActive {
+                    self.consume_pending_estop();
+                    if let Some(received) = final_ctx.expected_epoch {
+                        if received != self.safety.epoch_id() {
+                            return Err(ClearFaultWithAuthError::Clear(ClearFaultError::EpochMismatch {
+                                expected: self.safety.epoch_id(),
+                                received,
+                            }));
+                        }
+                    }
+                    return Err(ClearFaultWithAuthError::Clear(ClearFaultError::EStopActive));
+                }
+                return Err(ClearFaultWithAuthError::Clear(ClearFaultError::from(refusal)));
+            }
+            if self.consume_pending_estop() {
+                if let Some(received) = final_ctx.expected_epoch {
+                    if received != self.safety.epoch_id() {
+                        return Err(ClearFaultWithAuthError::Clear(ClearFaultError::EpochMismatch {
+                            expected: self.safety.epoch_id(),
+                            received,
+                        }));
+                    }
+                }
+                return Err(ClearFaultWithAuthError::Clear(ClearFaultError::EStopActive));
+            }
+            self.safety
+                .clear_with_check(&final_ctx)
+                .map_err(|r| ClearFaultWithAuthError::Clear(ClearFaultError::from(r)))?
+        };
+
+        let clear_estop_gen = self.applied_estop_count;
+        on_committed(self);
+        if let Some(ref cand) = commit.candidate_limits {
+            self.commit_driver_limits_bounded(cand);
+        } else if commit.reapply_legacy_limits {
+            self.reapply_driver_limits();
+        }
+        if let Some(is_torqued) = commit.is_torqued {
+            self.is_torqued = is_torqued;
+        }
+        if let Some(cd) = commit.thermal_cooldown {
+            self.thermal_cooldown = cd;
+        }
         let was_mit_lost = self.mit.owner == crate::mit::MitOwner::Lost;
         self.pending_rearm = true;
         self.stop_motion();
@@ -2865,9 +4013,12 @@ impl SupervisorInner {
         self.tracking.invalidate();
         self.tracking.clear_recovery_suspension();
         self.reset_tx_joint_progress();
-        self.hold_tx_unsent_since = None;
+        self.reset_hold_tx_joint_progress();
         self.hold_tx_stalled_latched = false;
-        self.last_hold_tx_error_log = None;
+        self.last_hold_tx_stall_log = None;
+        self.j7_stale_since = None;
+        // Preserve `self.last_hold_tx_error_log` across fault clears so rapid clear/re-fault
+        // cycles cannot bypass the 1/s stopped-hold error log rate limit.
         self.pending_deferred_done = None;
         if let Some(ref d) = self.driver {
             if let Ok(mut drv) = d.lock() {
@@ -2882,40 +4033,51 @@ impl SupervisorInner {
         self.last_commanded_velocities.fill(0.0);
         self.commanded_accelerations.fill(0.0);
         self.following_error_since = None;
+        self.watchdog_park_blocked_reason = None;
         self.bus_loss_instant = None;
         self.reset_gripper_stall();
-        if self.consume_pending_estop() {
-            if let Some(received) = ctx.expected_epoch {
-                if received != self.safety.epoch_id() {
-                    return Err(ClearFaultError::EpochMismatch {
-                        expected: self.safety.epoch_id(),
-                        received,
-                    });
-                }
-            }
-            return Err(ClearFaultError::EStopActive);
-        }
-        let was_estop = *self.safety.state() == SafetyState::EStop;
-        let state = self.safety.clear_with_check(ctx).map_err(ClearFaultError::from)?;
         self.handover_settling_since = None;
-        if !was_estop && self.e_stop_latched.load(Ordering::SeqCst) {
-            self.apply_stop_policy(StopPolicy::EStopLatch);
-            self.last_heartbeat = Instant::now();
-            self.last_motion_frame = Instant::now();
-            return Ok(self.safety.state().clone());
+        if let Some(hook) = self.before_estop_unlatch_hook.take() {
+            hook();
         }
-        self.e_stop_latched.store(false, Ordering::SeqCst);
-        self.shutdown_refused_unknown = false;
-        if self.consume_pending_estop() {
-            if let Some(received) = ctx.expected_epoch {
-                if received != self.safety.epoch_id() {
-                    return Err(ClearFaultError::EpochMismatch {
-                        expected: self.safety.epoch_id(),
-                        received,
-                    });
+        if !was_estop {
+            // Clearing a non-E-stop fault must never overwrite a prior or concurrent E-stop latch.
+            if self.consume_pending_estop() || self.estop_state.is_latched() {
+                if self.safety.state() != &SafetyState::EStop {
+                    self.apply_stop_policy(StopPolicy::EStopLatch);
+                }
+                self.last_heartbeat = Instant::now();
+                self.last_motion_frame = Instant::now();
+                return Ok(self.safety.state().clone());
+            }
+            self.shutdown_refused_unknown = false;
+        } else {
+            // Atomically clear bit 0 ONLY if no newer E-stop has advanced `generation` past
+            // `clear_estop_gen`. A concurrent newer E-stop causes CAS failure without ever
+            // transiently clearing the latch bit.
+            match self.estop_state.try_clear_if_generation(clear_estop_gen) {
+                Ok(()) => {
+                    self.shutdown_refused_unknown = false;
+                    if self.consume_pending_estop() {
+                        // A concurrent E-stop arrived strictly AFTER the CAS unlatched the prior
+                        // E-stop; keep the newly applied E-stop state and return Ok(EStop).
+                        self.last_heartbeat = Instant::now();
+                        self.last_motion_frame = Instant::now();
+                        return Ok(self.safety.state().clone());
+                    }
+                }
+                Err(_newer_gen) => {
+                    // A newer E-stop arrived before unlatch: latch bit stayed true throughout
+                    // (zero transient-false window). Apply the newer E-stop immediately.
+                    let _ = self.consume_pending_estop();
+                    if self.safety.state() != &SafetyState::EStop {
+                        self.apply_stop_policy(StopPolicy::EStopLatch);
+                    }
+                    self.last_heartbeat = Instant::now();
+                    self.last_motion_frame = Instant::now();
+                    return Ok(self.safety.state().clone());
                 }
             }
-            return Err(ClearFaultError::EStopActive);
         }
         if was_mit_lost {
             // Only after full clear passed: release MIT lost ownership and allow read-only polls.
@@ -2924,6 +4086,15 @@ impl SupervisorInner {
             self.mit.armed_ok = false;
             if let Some(mut drv) = self.driver.as_ref().and_then(|d| d.lock().ok()) {
                 drv.acknowledge_mit_fence_trip();
+            }
+        }
+        // If a valid lease was acquired while E-stop was latched, its servo stream could not be
+        // authorized until E-stop cleared; authorize it now when no policy stream owns targets.
+        if self.core.target_authority().stream.is_none() {
+            let check_now = now_override.unwrap_or_else(Instant::now);
+            let active_gen = self.active_lease_gen_at(check_now);
+            if active_gen != 0 {
+                self.authorize_servo_stream_for_committed_lease(active_gen);
             }
         }
         self.last_heartbeat = Instant::now();
@@ -2935,9 +4106,17 @@ impl SupervisorInner {
         &self,
         bufs: &mut crate::chain::EvalBufs,
     ) -> Option<crate::safety::WorkspaceSupportViolation> {
+        self.workspace_violation_for_positions_bounded(&self.measured_positions, bufs)
+    }
+
+    pub(super) fn workspace_violation_for_positions_bounded(
+        &self,
+        positions: &[f32],
+        bufs: &mut crate::chain::EvalBufs,
+    ) -> Option<crate::safety::WorkspaceSupportViolation> {
         use crate::safety::{BoundedText, WorkspaceSupportViolation};
         let (ws, cam) = self.workspace_policy()?;
-        if self.config.arm_model.frames_f32(&self.measured_positions).is_none() {
+        if self.config.arm_model.frames_f32(positions).is_none() {
             return Some(WorkspaceSupportViolation::EvalFailed {
                 limit: BoundedText::new("invalid"),
                 reason: BoundedText::new("non-finite or incomplete joint positions"),
@@ -2963,7 +4142,7 @@ impl SupervisorInner {
             &self.config.arm_model, ws, cam, self.config.tcp_offset, bufs,
         );
         let mut buf = eval.alloc_buf_in(bufs);
-        let violation = match eval.eval_into_in(&self.measured_positions, &mut buf, &mut bufs.world_caps, "clear_fault") {
+        let violation = match eval.eval_into_in(positions, &mut buf, &mut bufs.world_caps, "clear_fault") {
             Err(f) => Some(WorkspaceSupportViolation::EvalFailed {
                 limit: BoundedText::new(&f.limit),
                 reason: BoundedText::new(f.detail.reason.as_deref().unwrap_or("invalid joint positions")),
@@ -2984,9 +4163,33 @@ impl SupervisorInner {
         ages: &[Option<Duration>],
         bufs: &mut crate::chain::EvalBufs,
     ) -> Option<crate::safety::RestingSupportViolation> {
+        self.resting_pose_support_violation_for_feedback(
+            drv,
+            ages,
+            &self.measured_positions,
+            &self.measured_velocities,
+            &self.torques,
+            &self.loads,
+            self.feedback_numeric_valid,
+            bufs,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resting_pose_support_violation_for_feedback(
+        &self,
+        drv: Option<&dyn ArmDriver>,
+        ages: &[Option<Duration>],
+        positions: &[f32],
+        velocities: &[f32],
+        torques: &[f32],
+        loads: &[f32],
+        feedback_numeric_valid: bool,
+        bufs: &mut crate::chain::EvalBufs,
+    ) -> Option<crate::safety::RestingSupportViolation> {
         use crate::safety::{RestingSupportJointItem as Item, RestingSupportViolation as V, MAX_RESTING_SUPPORT_ITEMS};
         let dof = self.config.dof;
-        if self.measured_positions.len() != dof || self.measured_velocities.len() != dof {
+        if positions.len() != dof || velocities.len() != dof {
             return Some(V::FeedbackLengthMismatch);
         }
         let Some(policy) = self.config.resting_pose.as_ref() else { return Some(V::NoRestingPoseConfigured); };
@@ -2997,14 +4200,14 @@ impl SupervisorInner {
             if !policy.support_torque_limits.is_empty() && !caps.torque_feedback { return Some(V::DriverLacksTorqueFeedback); }
             if !policy.support_load_limits.is_empty() && !caps.load_feedback { return Some(V::DriverLacksLoadFeedback); }
             let max_age = Duration::from_millis(policy.feedback_max_age_ms);
-            if !self.feedback_numeric_valid || ages.len() != dof || !ages.iter().all(|a| a.is_some_and(|age| age <= max_age)) {
+            if !feedback_numeric_valid || ages.len() != dof || !ages.iter().all(|a| a.is_some_and(|age| age <= max_age)) {
                 return Some(V::FeedbackTooOld { max_age_ms: policy.feedback_max_age_ms });
             }
         }
         let mut items = [None; MAX_RESTING_SUPPORT_ITEMS];
         let mut len = 0usize;
         let mut overflowed = 0u16;
-        for (i, &v) in self.measured_velocities.iter().enumerate().take(dof) {
+        for (i, &v) in velocities.iter().enumerate().take(dof) {
             let limit = policy.max_velocity_of(i);
             if !v.is_finite() || v.abs() > limit {
                 if len < MAX_RESTING_SUPPORT_ITEMS {
@@ -3018,7 +4221,7 @@ impl SupervisorInner {
         let mut total = 0.0;
         let rest = self.config.resting_positions();
         for (i, &tol) in policy.position_tolerances.iter().enumerate().take(dof) {
-            let dev = (self.measured_positions[i] - rest[i]).abs();
+            let dev = (positions[i] - rest[i]).abs();
             if !dev.is_finite() || dev > tol {
                 if len < MAX_RESTING_SUPPORT_ITEMS {
                     items[len] = Some(Item::JointOffHome { joint: i as u16, deviation: dev, limit: tol });
@@ -3036,7 +4239,7 @@ impl SupervisorInner {
         if self.driver.is_some() {
             for &(i, max_tau) in &policy.support_torque_limits {
                 if i >= dof { return Some(V::SupportTorqueIndexOutOfRange { index: i }); }
-                let tau = self.torques.get(i).copied().unwrap_or(f32::NAN);
+                let tau = torques.get(i).copied().unwrap_or(f32::NAN);
                 if !tau.is_finite() || tau.abs() > max_tau {
                     if len < MAX_RESTING_SUPPORT_ITEMS {
                         items[len] = Some(Item::JointTorque { joint: i as u16, torque: tau, limit: max_tau });
@@ -3048,7 +4251,7 @@ impl SupervisorInner {
             }
             for &(i, max_load) in &policy.support_load_limits {
                 if i >= dof { return Some(V::SupportLoadIndexOutOfRange { index: i }); }
-                let load = self.loads.get(i).copied().unwrap_or(f32::NAN);
+                let load = loads.get(i).copied().unwrap_or(f32::NAN);
                 if !load.is_finite() || load.abs() > max_load {
                     if len < MAX_RESTING_SUPPORT_ITEMS {
                         items[len] = Some(Item::JointLoad { joint: i as u16, load, limit: max_load });
@@ -3059,7 +4262,7 @@ impl SupervisorInner {
                 }
             }
         }
-        let mut workspace = self.measured_workspace_violation_bounded(bufs);
+        let mut workspace = self.workspace_violation_for_positions_bounded(positions, bufs);
         if workspace.is_some() && len >= MAX_RESTING_SUPPORT_ITEMS {
             workspace = None;
             overflowed = overflowed.saturating_add(1);
@@ -3086,7 +4289,13 @@ impl SupervisorInner {
         deadline: Instant,
         expected_epoch: Option<u64>,
     ) -> Result<SafetyState, crate::safety::ClearFaultError> {
-        self.clear_fault_executor_inner(None, deadline, expected_epoch)
+        match self.clear_fault_executor_inner(None, deadline, expected_epoch, None) {
+            Ok(state) => Ok(state),
+            Err(ClearFaultWithAuthError::Clear(e)) => Err(e),
+            Err(ClearFaultWithAuthError::Authority(_)) => {
+                unreachable!("authority is None on clear_fault_executor_bounded_for_epoch")
+            }
+        }
     }
 
     /// Release-bounded, allocation-free fault clearing for Step 2b of an RT release: caps every
@@ -3101,7 +4310,33 @@ impl SupervisorInner {
         let tx_deadline = release_deadline
             .checked_sub(self.tx_release_publish_margin())
             .unwrap_or(now);
-        self.clear_fault_executor_inner(Some(now), tx_deadline, expected_epoch)
+        match self.clear_fault_executor_inner(Some(now), tx_deadline, expected_epoch, None) {
+            Ok(state) => Ok(state),
+            Err(ClearFaultWithAuthError::Clear(e)) => Err(e),
+            Err(ClearFaultWithAuthError::Authority(_)) => {
+                unreachable!("authority is None on clear_fault_executor_bounded_for_release")
+            }
+        }
+    }
+
+    /// Release-bounded, allocation-free fault clearing carrying M3 live owner authority through
+    /// driver preflight, hardware reset (`drv.clear_fault_budgeted`), and final `safety.clear_with_check`.
+    #[allow(clippy::result_large_err)] // inline refusal keeps RT clear_fault zero-alloc
+    pub(crate) fn clear_fault_executor_bounded_for_release_with_authority(
+        &mut self,
+        now: Instant,
+        release_deadline: Instant,
+        authority: crate::rt_core::requests::lease::ClearFaultAuthority,
+    ) -> Result<SafetyState, ClearFaultWithAuthError> {
+        let tx_deadline = release_deadline
+            .checked_sub(self.tx_release_publish_margin())
+            .unwrap_or(now);
+        self.clear_fault_executor_inner(
+            Some(now),
+            tx_deadline,
+            Some(authority.expected_epoch),
+            Some(authority),
+        )
     }
 
     #[allow(clippy::result_large_err)] // inline refusal keeps RT clear_fault zero-alloc
@@ -3110,19 +4345,21 @@ impl SupervisorInner {
         now_override: Option<Instant>,
         deadline: Instant,
         expected_epoch: Option<u64>,
-    ) -> Result<SafetyState, crate::safety::ClearFaultError> {
+        authority: Option<crate::rt_core::requests::lease::ClearFaultAuthority>,
+    ) -> Result<SafetyState, ClearFaultWithAuthError> {
+        use crate::rt_core::requests::lease::recheck_clear_fault_authority_readonly;
         use crate::safety::{ClearFaultError as E, ClearRefusal as R};
-        let apply_estop_refusal = |this: &mut Self| -> E {
+        let apply_estop_refusal = |this: &mut Self| -> ClearFaultWithAuthError {
             this.consume_pending_estop();
             if let Some(received) = expected_epoch {
                 if received != this.safety.epoch_id() {
-                    return E::EpochMismatch {
+                    return ClearFaultWithAuthError::Clear(E::EpochMismatch {
                         expected: this.safety.epoch_id(),
                         received,
-                    };
+                    });
                 }
             }
-            E::EStopActive
+            ClearFaultWithAuthError::Clear(E::EStopActive)
         };
         let had_driver_config_error = self.driver_config_error.is_some();
         let (candidate_limits, driver_err_override) = if had_driver_config_error {
@@ -3147,7 +4384,7 @@ impl SupervisorInner {
                 if refusal == R::EStopActive {
                     return Err(apply_estop_refusal(self));
                 }
-                return Err(E::from(refusal));
+                return Err(ClearFaultWithAuthError::Clear(E::from(refusal)));
             }
             if let Some(ref cand) = candidate_limits {
                 self.commit_driver_limits_bounded(cand);
@@ -3156,6 +4393,12 @@ impl SupervisorInner {
         }
 
         let mut ctx;
+        let mut commit = ClearFaultCommit {
+            candidate_limits,
+            reapply_legacy_limits: false,
+            is_torqued: None,
+            thermal_cooldown: None,
+        };
         if let Some(ref d) = self.driver {
             let mut scratch_ages = std::mem::take(&mut self.scratch.ages);
             let mut scratch_rx = std::mem::take(&mut self.scratch.rx);
@@ -3166,7 +4409,7 @@ impl SupervisorInner {
                     self.scratch.ages = scratch_ages;
                     self.scratch.rx = scratch_rx;
                     self.ws_eval_bufs = ws_bufs;
-                    return Err(E::FeedbackUnavailable);
+                    return Err(ClearFaultWithAuthError::Clear(E::FeedbackUnavailable));
                 }
             };
             // Pure read-only driver snapshot FIRST — ZERO motor resets or mutations.
@@ -3174,6 +4417,7 @@ impl SupervisorInner {
             let ages_valid = scratch_ages.len() == self.config.dof
                 && !scratch_ages.iter().any(|a| a.is_none_or(|t| t > THERMAL_FEEDBACK_FRESHNESS_LIMIT));
             let fb_valid = drv.is_feedback_valid();
+            let j7_fb_fresh = drv.pos_force_feedback_fresh();
             let tx_queue_drained = drv.pending_tx_len_total() == 0;
             let tx_probe_confirmed = drv.tx_probe_confirmed();
             let tx_probe_sent = drv.tx_probe_pending();
@@ -3208,7 +4452,8 @@ impl SupervisorInner {
                 }
             }
             let fb_fresh = self.feedback_numeric_valid && fb_valid && ages_valid;
-            // Cooldown accrues ONLY across consecutive fresh cool samples; stale/unavailable/gapped temp resets it.
+            // Cooldown accrues ONLY across consecutive fresh cool samples; evaluate without
+            // mutating `self.thermal_cooldown` until clear commits (or ThermalCooldownNotElapsed).
             let threshold = self.config.max_temperature - THERMAL_CLEAR_MARGIN_C;
             let thermal_below = fb_fresh
                 && temp_fb
@@ -3224,7 +4469,6 @@ impl SupervisorInner {
             self.scratch.ages = scratch_ages;
             self.scratch.rx = scratch_rx;
             self.ws_eval_bufs = ws_bufs;
-            self.thermal_cooldown = next_cd;
 
             ctx = self.build_clear_context_base(driver_err_override);
             if candidate_limits.is_some() {
@@ -3234,11 +4478,13 @@ impl SupervisorInner {
             ctx.pending_estop = self.estop_request_unapplied();
             ctx.mit_lost_unsupported = self.mit.owner == crate::mit::MitOwner::Lost;
             ctx.feedback_fresh = fb_fresh;
+            ctx.j7_feedback_fresh = j7_fb_fresh;
             ctx.tx_queue_drained = tx_queue_drained;
             ctx.tx_probe_confirmed = tx_probe_confirmed;
             ctx.tx_probe_sent = tx_probe_sent;
             ctx.thermal_sensor_available = temp_fb;
             ctx.thermal_below_threshold = thermal_below;
+            ctx.thermal_cooldown_elapsed_ms = if thermal_below { next_cd.elapsed_ms() } else { 0 };
             ctx.joint_limit_violation =
                 self.joint_limit_clear_violation_with_candidates(candidate_limits.as_ref());
             ctx.resting_feedback_missing = resting_feedback_missing;
@@ -3252,17 +4498,24 @@ impl SupervisorInner {
             if clear_res == Err(R::TxProbeRequired) {
                 let now = now_override.unwrap_or_else(Instant::now);
                 if now >= deadline {
-                    return Err(E::Rejected(R::BudgetExpired));
+                    return Err(ClearFaultWithAuthError::Clear(E::Rejected(R::BudgetExpired)));
                 }
                 let mut scratch_ages = std::mem::take(&mut self.scratch.ages);
-                let (probe_res, drained_after, probe_ok, probe_pending, hw_fault_after, st_after, partial_after, any_en_after, fb_valid_after, ages_valid_after) = {
+                let (probe_res, drained_after, probe_ok, probe_pending, hw_fault_after, st_after, partial_after, any_en_after, fb_valid_after, j7_fresh_after, ages_valid_after) = {
                     let mut drv = match d.lock() {
                         Ok(g) => g,
                         Err(_) => {
                             self.scratch.ages = scratch_ages;
-                            return Err(E::FeedbackUnavailable);
+                            return Err(ClearFaultWithAuthError::Clear(E::FeedbackUnavailable));
                         }
                     };
+                    if let Some(auth) = authority {
+                        if let Err(auth_err) = recheck_clear_fault_authority_readonly(self, auth, now) {
+                            drop(drv);
+                            self.scratch.ages = scratch_ages;
+                            return Err(ClearFaultWithAuthError::Authority(auth_err));
+                        }
+                    }
                     let drv_deadline = drv.clock_now() + deadline.saturating_duration_since(now);
                     drv.set_tx_release_deadline(Some(drv_deadline));
                     let res = drv.probe_tx_ready_budgeted(drv_deadline);
@@ -3280,6 +4533,7 @@ impl SupervisorInner {
                         drv.has_known_partial_enable(),
                         drv.has_any_joint_enabled(),
                         drv.is_feedback_valid(),
+                        drv.pos_force_feedback_fresh(),
                         ages_ok,
                     )
                 };
@@ -3290,6 +4544,7 @@ impl SupervisorInner {
                 ctx.tx_queue_drained = drained_after;
                 ctx.enable_state_known = state != EnableState::Unknown || partial;
                 ctx.hardware_reset_required = hw_fault_after;
+                ctx.j7_feedback_fresh = j7_fresh_after;
                 ctx.pending_estop = self.estop_request_unapplied();
                 match probe_res {
                     Ok(confirmed) => {
@@ -3310,13 +4565,35 @@ impl SupervisorInner {
                 Err(R::EStopActive) => return Err(apply_estop_refusal(self)),
                 Err(R::HardwareResetRequired) => {
                     // Explicitly modeled exception: every OTHER recorded kind's condition passed,
-                    // so a budgeted motor reset is now permitted; re-evaluate `clear_check` after.
+                    // so a budgeted motor reset is now permitted. Recheck live grant, lease,
+                    // operator session (M3), J7 freshness, and pending E-stop under the SAME
+                    // driver lock guard before sending the reset (zero check-to-command gap).
                     let now = now_override.unwrap_or_else(Instant::now);
                     if now >= deadline {
-                        return Err(E::Rejected(R::BudgetExpired));
+                        return Err(ClearFaultWithAuthError::Clear(E::Rejected(R::BudgetExpired)));
                     }
                     let reset_res = {
-                        let mut drv = d.lock().map_err(|_| E::FeedbackUnavailable)?;
+                        let mut drv = d.lock().map_err(|_| ClearFaultWithAuthError::Clear(E::FeedbackUnavailable))?;
+                        if let Some(auth) = authority {
+                            if let Err(auth_err) =
+                                recheck_clear_fault_authority_readonly(self, auth, now)
+                            {
+                                drop(drv);
+                                return Err(ClearFaultWithAuthError::Authority(auth_err));
+                            }
+                        }
+                        ctx.j7_feedback_fresh = drv.pos_force_feedback_fresh();
+                        ctx.feedback_fresh = ctx.feedback_fresh && drv.is_feedback_valid();
+                        ctx.pending_estop = self.estop_request_unapplied();
+                        if let Err(refusal) = self.safety.clear_check(&ctx) {
+                            if refusal != R::HardwareResetRequired {
+                                drop(drv);
+                                if refusal == R::EStopActive {
+                                    return Err(apply_estop_refusal(self));
+                                }
+                                return Err(ClearFaultWithAuthError::Clear(E::from(refusal)));
+                            }
+                        }
                         let drv_deadline = drv.clock_now() + deadline.saturating_duration_since(now);
                         drv.set_tx_release_deadline(Some(drv_deadline));
                         let res = drv.clear_fault_budgeted(drv_deadline);
@@ -3333,17 +4610,23 @@ impl SupervisorInner {
                     if post_refusal == R::EStopActive {
                         return Err(apply_estop_refusal(self));
                     }
-                    return Err(E::from(post_refusal));
+                    return Err(ClearFaultWithAuthError::Clear(E::from(post_refusal)));
                 }
-                Err(refusal) => return Err(E::from(refusal)),
+                Err(refusal) => {
+                    if matches!(refusal, R::ThermalCooldownNotElapsed { .. })
+                        && (!self.safety.has_latched_fault_kind(crate::safety::FaultKind::J7FeedbackStale)
+                            || ctx.j7_feedback_fresh)
+                    {
+                        self.thermal_cooldown = next_cd;
+                    }
+                    return Err(ClearFaultWithAuthError::Clear(E::from(refusal)));
+                }
             }
-            if let Some(ref cand) = candidate_limits {
-                self.commit_driver_limits_bounded(cand);
-            }
-            self.is_torqued = state == EnableState::Enabled || partial || any_enabled;
+            commit.is_torqued = Some(state == EnableState::Enabled || partial || any_enabled);
+            commit.thermal_cooldown = Some(next_cd);
         } else {
-            // Driverless simulation mode: update cooldown clock in place (0 alloc).
-            self.update_thermal_cooldown_driverless(Instant::now());
+            // Driverless simulation mode: evaluate cooldown without pre-committing (0 alloc).
+            let next_cd = self.evaluate_thermal_cooldown_driverless(Instant::now());
             ctx = self.build_clear_context_base(driver_err_override);
             if candidate_limits.is_some() {
                 ctx.driver_config_error = None;
@@ -3351,19 +4634,28 @@ impl SupervisorInner {
             ctx.expected_epoch = expected_epoch;
             ctx.pending_estop = self.estop_request_unapplied();
             ctx.mit_lost_unsupported = self.mit.owner == crate::mit::MitOwner::Lost;
+            ctx.thermal_cooldown_elapsed_ms = if ctx.thermal_below_threshold {
+                next_cd.elapsed_ms()
+            } else {
+                0
+            };
             ctx.joint_limit_violation =
                 self.joint_limit_clear_violation_with_candidates(candidate_limits.as_ref());
             if let Err(refusal) = self.safety.clear_check(&ctx) {
                 if refusal == R::EStopActive {
                     return Err(apply_estop_refusal(self));
                 }
-                return Err(E::from(refusal));
+                if matches!(refusal, R::ThermalCooldownNotElapsed { .. })
+                    && (!self.safety.has_latched_fault_kind(crate::safety::FaultKind::J7FeedbackStale)
+                        || ctx.j7_feedback_fresh)
+                {
+                    self.thermal_cooldown = next_cd;
+                }
+                return Err(ClearFaultWithAuthError::Clear(E::from(refusal)));
             }
-            if let Some(ref cand) = candidate_limits {
-                self.commit_driver_limits_bounded(cand);
-            }
+            commit.thermal_cooldown = Some(next_cd);
         }
-        self.clear_fault_finish_bounded(&ctx)
+        self.clear_fault_finish_bounded_with_authority(&ctx, commit, authority, now_override, |_| {})
     }
 
     /// Bounded fault clearing for the RT executor rendered into [`SafetyError`] for direct callers.
@@ -3386,7 +4678,7 @@ impl SupervisorInner {
     /// Runs synchronously on the caller holding `&mut SupervisorInner` (preserving exclusive driver
     /// ownership) while logging timeout independently at `hard_deadline`.
     pub fn attempt_panic_disable(&mut self, timeout: Duration) -> PanicDisableOutcome {
-        self.e_stop_latched.store(true, Ordering::SeqCst);
+        self.estop_state.latch();
         self.disable_requested();
         let origin = Instant::now();
         let (coop_deadline, hard_deadline) = panic_disable_deadlines(origin, timeout);
@@ -3408,7 +4700,7 @@ impl SupervisorInner {
         hard_deadline: Instant,
         coop_budget: Duration,
     ) -> PanicDisableOutcome {
-        self.e_stop_latched.store(true, Ordering::SeqCst);
+        self.estop_state.latch();
         self.disable_requested();
         let Some(ref d) = self.driver else {
             self.disable_confirmed();

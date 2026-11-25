@@ -58,6 +58,7 @@ async fn serve(sup: Arc<ArmSupervisor>) -> SocketAddr {
 
 fn fill_ordinary_queues(
     handle: &RtExecutorHandle,
+    client_id: u64,
     lease_gen: u64,
     epoch: u64,
     stop_gen: u64,
@@ -74,7 +75,7 @@ fn fill_ordinary_queues(
         let mut b = handle.broker().lock().unwrap();
         let err = loop {
             let seq = NEXT_SEQ.fetch_add(1, Ordering::Relaxed);
-            match b.submit(ClientId(9), seq, auth, dl, Submit::Install(&|slot: &mut PlanSlot| {
+            match b.submit(ClientId(client_id), seq, auth, dl, Submit::Install(&|slot: &mut PlanSlot| {
                 slot.set(Primitive::JointQuintic { dof, start: s, q, duration_s: 0.5 });
             })) {
                 Ok(_) => {}
@@ -104,6 +105,15 @@ async fn rest_and_ws_estop_and_urgent_stop_with_ordinary_queues_full() {
     let sup = Arc::new(ArmSupervisor::new(ArmConfig { lease_timeout_ms: 5_000, ..ArmConfig::rebot_dm() }));
     let addr = serve(sup.clone()).await;
     let (mut ws, gen) = controller(addr).await;
+    let owner_conn_id: u64 = sup
+        .inner()
+        .read()
+        .await
+        .active_lease
+        .as_ref()
+        .and_then(|l| l.client_id.strip_prefix("connection:"))
+        .and_then(|s| s.parse().ok())
+        .expect("active WS lease connection id");
     let ep0 = sup.get_observation().await.epoch_id;
     assert_eq!(rpc(&mut ws, gen, ep0, "/api/v1/torque", json!({"enable": true})).await["type"], "command_ack");
     let ep1 = sup.get_observation().await.epoch_id;
@@ -118,7 +128,7 @@ async fn rest_and_ws_estop_and_urgent_stop_with_ordinary_queues_full() {
     *delay.lock().unwrap() = Some(Duration::from_millis(60));
     wait_until(Duration::from_secs(1), || delay.lock().unwrap().is_none()).await;
     let obs = sup.observation().await.unwrap();
-    let sat = fill_ordinary_queues(&handle, gen, obs.epoch_id, 0, &obs.positions, [0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    let sat = fill_ordinary_queues(&handle, owner_conn_id, gen, obs.epoch_id, 0, &obs.positions, [0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
     assert!(matches!(sat, AdmitError::CommandsFull | AdmitError::PlansFull | AdmitError::RepliesFull));
     // Also saturate maintenance queue (`MAINT_QUEUE_CAPACITY == 16`) with concurrent requests.
     let mut maint_tasks = Vec::new();
@@ -145,7 +155,7 @@ async fn rest_and_ws_estop_and_urgent_stop_with_ordinary_queues_full() {
     let ep_pre = sup.observation().await.unwrap().epoch_id;
     *delay.lock().unwrap() = Some(Duration::from_millis(35));
     wait_until(Duration::from_secs(1), || delay.lock().unwrap().is_none()).await;
-    fill_ordinary_queues(&handle, gen, ep_pre, sg, &obs.positions, [0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    fill_ordinary_queues(&handle, owner_conn_id, gen, ep_pre, sg, &obs.positions, [0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
     let rest_resp = http.post(format!("http://{addr}/api/v1/safety/e_stop")).send().await.unwrap();
     assert_eq!(rest_resp.status(), reqwest::StatusCode::OK);
     let rest_body: serde_json::Value = rest_resp.json().await.unwrap();
@@ -159,7 +169,7 @@ async fn rest_and_ws_estop_and_urgent_stop_with_ordinary_queues_full() {
         let ep_c = sup.observation().await.unwrap().epoch_id;
         *delay.lock().unwrap() = Some(Duration::from_millis(30));
         wait_until(Duration::from_secs(1), || delay.lock().unwrap().is_none()).await;
-        fill_ordinary_queues(&handle, gen, ep_c, sg, &obs.positions, [0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        fill_ordinary_queues(&handle, owner_conn_id, gen, ep_c, sg, &obs.positions, [0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
         let r = ws_reply(&mut ws, json!({"type": kind}), &["epoch_sync", "estop_reject"]).await;
         assert_eq!((r["type"].as_str(), r["safety_state"].as_str()), (Some("epoch_sync"), Some("EStop")), "{r}");
         assert!(r["epoch_id"].as_u64().unwrap() > ep_c);
@@ -242,12 +252,21 @@ async fn stale_and_foreign_callers_rest_restrictions_and_legacy_semantics() {
     assert_eq!(rpc(&mut ws_owner, gen, ep, "/api/v1/motion/jog", json!({"target_positions": [0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], "duration_secs": 1.0})).await["type"], "command_ack");
     let handle = sup.start_executor(ExecutorConfig::for_tests(Duration::from_millis(5))).await.unwrap();
 
+    // PR L2 serves REST `/api/v1/torque` from StateHub (409 LEASE_ACTIVE while ws_owner holds the
+    // lease); unmigrated REST `/api/v1/motion/jog` still returns 503 EXECUTOR_ROUTING_PENDING.
     let r_rest = http.post(format!("http://{addr}/api/v1/torque")).json(&json!({"enable": true})).send().await.unwrap();
-    assert_eq!((r_rest.status(), r_rest.json::<serde_json::Value>().await.unwrap()["code"].as_str()), (reqwest::StatusCode::SERVICE_UNAVAILABLE, Some("EXECUTOR_ROUTING_PENDING")));
+    assert_eq!((r_rest.status(), r_rest.json::<serde_json::Value>().await.unwrap()["code"].as_str()), (reqwest::StatusCode::CONFLICT, Some("LEASE_ACTIVE")));
+    let r_jog = http.post(format!("http://{addr}/api/v1/motion/jog")).json(&json!({"target_positions": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]})).send().await.unwrap();
+    assert_eq!((r_jog.status(), r_jog.json::<serde_json::Value>().await.unwrap()["code"].as_str()), (reqwest::StatusCode::SERVICE_UNAVAILABLE, Some("EXECUTOR_ROUTING_PENDING")));
 
     let (mut ws_foreign, _) = connect_async(format!("ws://{addr}/api/v1/ws")).await.unwrap();
+    // PR L1 routes `acquire_lease` through the RT executor: foreign acquire sees `controller_busy`
+    // while `ws_owner` holds the lease, whereas an unmigrated motion command still fails closed
+    // with `503 EXECUTOR_ROUTING_PENDING`.
     let acq = ws_reply(&mut ws_foreign, json!({"type": "acquire_lease", "client_id": "intruder", "seq": 1}), &["lease_rejected"]).await;
-    assert_eq!((acq["status"].as_u64(), acq["code"].as_str()), (Some(503), Some("EXECUTOR_ROUTING_PENDING")), "{acq}");
+    assert_eq!(acq["error"].as_str(), Some("controller_busy"), "{acq}");
+    let unmigrated = ws_reply(&mut ws_foreign, json!({"type": "command", "request_id": 1, "generation": gen, "epoch_id": ep, "path": "/api/v1/motion/jog", "body": {"target_positions": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]}}), &["command_reject"]).await;
+    assert_eq!((unmigrated["status"].as_u64(), unmigrated["code"].as_str()), (Some(503), Some("EXECUTOR_ROUTING_PENDING")), "{unmigrated}");
     let spoof = ws_reply(&mut ws_foreign, json!({"type": "command", "request_id": 1, "generation": gen, "client_id": "test_controller", "epoch_id": ep, "path": "/api/v1/motion/stop", "body": {}}), &["command_reject"]).await;
     assert_eq!((spoof["status"].as_u64(), spoof["code"].as_str(), spoof["epoch_id"].as_u64()), (Some(409), Some("LEASE_LOST"), Some(ep)), "{spoof}");
     assert_eq!(handle.stop_requests().current(), 0);
@@ -343,6 +362,15 @@ async fn no_stale_dynamic_frames_after_applied_stop_and_post_stop_frame_transmit
     let sup = Arc::new(ArmSupervisor::new(ArmConfig { lease_timeout_ms: 5_000, ..ArmConfig::rebot_dm() }).with_driver(Box::new(dm)));
     let addr = serve(sup.clone()).await;
     let (mut ws, gen) = controller(addr).await;
+    let owner_conn_id: u64 = sup
+        .inner()
+        .read()
+        .await
+        .active_lease
+        .as_ref()
+        .and_then(|l| l.client_id.strip_prefix("connection:"))
+        .and_then(|s| s.parse().ok())
+        .expect("active WS lease connection id");
     let ep0 = sup.get_observation().await.epoch_id;
     assert_eq!(rpc(&mut ws, gen, ep0, "/api/v1/torque", json!({"enable": true})).await["type"], "command_ack");
     let ep1 = sup.get_observation().await.epoch_id;
@@ -375,7 +403,7 @@ async fn no_stale_dynamic_frames_after_applied_stop_and_post_stop_frame_transmit
     *delay.lock().unwrap() = Some(Duration::from_millis(80));
     wait_until(Duration::from_secs(1), || delay.lock().unwrap().is_none()).await;
     let obs = sup.observation().await.unwrap();
-    fill_ordinary_queues(&handle, gen, obs.epoch_id, 0, &obs.positions, [-0.5, -0.4, 0.4, -0.4, 0.4, -0.4, 0.0, 0.0]);
+    fill_ordinary_queues(&handle, owner_conn_id, gen, obs.epoch_id, 0, &obs.positions, [-0.5, -0.4, 0.4, -0.4, 0.4, -0.4, 0.0, 0.0]);
     let tx_before_stop_send = bus.with(|s| s.tx_log.len());
 
     let ack = rpc(&mut ws, gen, obs.epoch_id, "/api/v1/motion/stop", json!({})).await;
@@ -439,7 +467,7 @@ async fn no_stale_dynamic_frames_after_applied_stop_and_post_stop_frame_transmit
     ).unwrap();
     let goal = goal_vec;
     let req = handle.broker().lock().unwrap().submit(
-        ClientId(10), 1, snap.authority, dl,
+        ClientId(owner_conn_id), 1, snap.authority, dl,
         Submit::Install(&move |slot: &mut PlanSlot| armd::rt_core::requests::motion::stage_jog(slot, &plan.slot)),
     ).unwrap();
     let mut reply_for_req = None;
@@ -3952,6 +3980,7 @@ async fn stop_never_cancels_or_blocks_queued_torque_disable_on_ws_and_rt_broker(
         // Driverless: ImmediateOp::TorqueOff succeeds after Stop; ImmediateOp::TorqueOn fails STOPPED.
         let mut core = SupervisorInner::new(ArmConfig::rebot_dm());
         core.lease_enabled = false;
+        core.register_live_connection(1).unwrap();
         let st = core.current_admission_stamp();
         let adm = core.check_admission(st).unwrap();
         armd::SupervisorInner::enable_torque(adm).unwrap();
@@ -4006,6 +4035,7 @@ async fn stop_never_cancels_or_blocks_queued_torque_disable_on_ws_and_rt_broker(
         drv.check_mapping_ranges();
         let mut core_drv = SupervisorInner::new(cfg_drv).with_driver(Box::new(drv));
         core_drv.lease_enabled = false;
+        core_drv.register_live_connection(1).unwrap();
         core_drv.tick(0.02);
         let st = core_drv.current_admission_stamp();
         let adm = core_drv.check_admission(st).unwrap();
@@ -4049,10 +4079,38 @@ fn single_use_admission_stamp_refuses_second_use_zero_id_and_broker_replay() {
     use armd::api::rest::ApiError;
     use armd::rt_core::broker::{Authority, BootId, ClientId, CommandKind, Descriptor, ImmediateOp, RequestId, Stamp};
     use armd::rt_core::ops::{CommitCtx, CoreOps};
+    use armd::rt_core::requests::lease::{
+        install_lease_acquire, ConnectionHandle, LeaseAcquire, LeaseInstallCtx, LeaseOutcome,
+    };
     use armd::{AdmissionStamp, SafetyError};
 
     let mut inner = SupervisorInner::new(ArmConfig { lease_timeout_ms: 30_000, ..ArmConfig::rebot_dm() });
-    let gen = inner.acquire_lease("conn:single-use").unwrap();
+    inner.register_live_connection(1).unwrap();
+    let conn = ConnectionHandle::from_ws_id(1).unwrap();
+    let boot0 = BootId(7);
+    let now0 = Instant::now();
+    let gen = match install_lease_acquire(
+        &mut inner,
+        &LeaseAcquire {
+            connection: conn,
+            label: armd::model::HolderLabel::new("conn:single-use"),
+            has_label: true,
+        },
+        &LeaseInstallCtx {
+            expected_arm: ArmId::LOCAL,
+            expected_boot: boot0,
+            stamp_arm: ArmId::LOCAL,
+            stamp_boot: boot0,
+            now: now0,
+            request_id: 1,
+            client: ClientId(1),
+            deadline: now0 + Duration::from_secs(5),
+            enforce_single_use: false,
+        },
+    ) {
+        Ok(LeaseOutcome::Granted { generation, .. }) => generation,
+        other => panic!("unexpected lease acquire outcome: {other:?}"),
+    };
 
     // (a) Copyable AdmissionStamp succeeds once and is refused on its second use.
     let s1 = inner.current_admission_stamp();

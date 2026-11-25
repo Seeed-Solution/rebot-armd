@@ -7772,11 +7772,15 @@ mod tests {
                     let permit = permit_slot
                         .and_then(|Extension(slot)| slot.0.lock().ok().and_then(|mut g| g.take()));
                     tokio::task::spawn_blocking(move || {
-                        let _permit = permit;
-                        let _ = started_tx.send(());
-                        if let Ok(rx) = unblock_rx.lock() {
-                            let _ = rx.recv();
+                        {
+                            let _permit = permit;
+                            let _ = started_tx.send(());
+                            if let Ok(rx) = unblock_rx.lock() {
+                                let _ = rx.recv();
+                            }
                         }
+                        // Signal only after `_permit` has been dropped so the next request sees
+                        // the released semaphore deterministically under CPU load.
                         let _ = finished_tx.send(());
                         StatusCode::OK
                     })

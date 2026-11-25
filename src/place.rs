@@ -61,29 +61,41 @@ fn invalid(m: impl Into<String>) -> ArmError { MotionError::InvalidCommand(m.int
 
 /// Body of `/api/v1/action/place` (named poses looked up in `inner`).
 pub fn parse_place(inner: &SupervisorInner, body: &Value) -> Result<PlaceRequest, ArmError> {
+    parse_place_with(&inner.config, &inner.poses.list, body)
+}
+
+fn parse_place_with(
+    config: &crate::model::ArmConfig,
+    poses: &crate::poses::PoseList,
+    body: &Value,
+) -> Result<PlaceRequest, ArmError> {
     let has = |k: &str| body.get(k).is_some_and(|v| !v.is_null());
     if has("pose") == has("position") { return Err(invalid("exactly one of pose or position is required")); }
     let requested = motion::parse_orientation(body)?;
     let (pose, target, orientation) = if has("pose") {
         let name = body["pose"].as_str().ok_or_else(|| invalid("pose must be a string"))?;
-        let stored = inner.poses.find(name)?;
+        let stored = poses.poses.iter().find(|p| p.name == name).ok_or_else(|| ArmError::Rejected {
+            status: 404,
+            code: "POSE_NOT_FOUND".into(),
+            message: format!("No pose named '{name}'"),
+        })?;
         // FK of the stored joint positions (live TCP for the active tool); cached-only pose
         // (without valid joint vector) is accepted only for legacy stock-on-stock.
-        let tcp = match (inner.config.tcp_pose_f32(&stored.positions), &stored.tcp) {
+        let tcp = match (config.tcp_pose_f32(&stored.positions), &stored.tcp) {
             (Some(pose), _) => pose,
             (None, Some(t)) => {
-                let legacy_stock_only = inner.config.active_tool.is_stock
+                let legacy_stock_only = config.active_tool.is_stock
                     && stored.tool_id.is_none()
                     && stored.tool_config_digest.is_none();
                 if !legacy_stock_only {
                     return Err(invalid(format!(
                         "pose '{name}' has no valid joint vector for active tool '{}'",
-                        inner.config.active_tool.id
+                        config.active_tool.id
                     )));
                 }
                 Pose::new(kinematics::rpy_to_r(t.rpy[0], t.rpy[1], t.rpy[2]), t.position)
             }
-            (None, None) if stored.positions.len() >= inner.config.arm_dof() => return Err(invalid(format!("pose '{name}' positions are not a valid joint vector"))),
+            (None, None) if stored.positions.len() >= config.arm_dof() => return Err(invalid(format!("pose '{name}' positions are not a valid joint vector"))),
             (None, None) => return Err(invalid(format!("pose '{name}' has no TCP"))),
         };
         (Some(name.to_string()), tcp.p, Some(requested.unwrap_or(tcp.r)))
@@ -185,6 +197,71 @@ pub fn prepare(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<Pend
     Ok(PendingPlace { input, request, open_rad, held_spill_safe, spill_max_tilt_deg, table_clearance })
 }
 
+/// Prepare a `place` action from a published [`ActionSnapshot`] (0 `SupervisorLock` on
+/// `OWNER_EXECUTOR`).
+pub fn prepare_from_snapshot(
+    snap: &crate::rt_core::requests::actions::ActionSnapshot,
+    body: &Value,
+    epoch: u64,
+) -> Result<PendingPlace, ArmError> {
+    if !body.is_object() {
+        return Err(invalid("Command body must be an object"));
+    }
+    if snap.env.config.active_tool.commissioning_required {
+        return Err(crate::safety::SafetyError::CommissioningRequired(
+            "place (blocked while active tool requires commissioning; use jog/move_to/move_relative/gripper at speed_scale <= 0.2)".into(),
+        )
+        .into());
+    }
+    if !snap.env.config.has_cartesian_with_gripper() || snap.env.config.kinematics.is_none() {
+        return Err(MotionError::Unsupported("Place needs an arm with kinematics and a gripper policy".into()).into());
+    }
+    let Some(policy) = snap.env.config.gripper_policy.as_ref() else {
+        return Err(MotionError::Unsupported("Place needs a gripper policy".into()).into());
+    };
+    let open_rad = policy.open_rad;
+    let request = parse_place_with(&snap.env.config, &snap.env.poses, body)?;
+    if epoch != snap.owner.authority.epoch {
+        return Err(crate::safety::SafetyError::EpochMismatch {
+            expected: snap.owner.authority.epoch,
+            received: epoch,
+        }
+        .into());
+    }
+    let input = snap.plan_input_in(GoalFrame::Tcp)?;
+    let held_spill_safe = snap.owner.held.as_ref().is_some_and(|h| h.spill_safe);
+    let spill_max_tilt_deg = snap.env.grasp_setup.as_ref().map_or(8.0, |s| s.spill_max_tilt_deg);
+    let table_clearance = match (snap.env.workspace_policy.as_ref(), snap.env.grasp_setup.as_ref()) {
+        (Some(w), gs) => {
+            let rec = gs
+                .map(|s| crate::grasp::CamModel::assumed(&snap.env.config.arm_model, s, &snap.env.config.camera_mount).rec)
+                .unwrap_or_else(|| crate::kinematics::rpy_to_r(0.0, 0.0, f64::from(snap.env.config.camera_mount.rot_deg).to_radians()));
+            let pts = crate::grasp::envelope_with_contact(
+                Some(w),
+                &snap.env.config.camera_mount,
+                &rec,
+                snap.env.config.effective_physical_contact_end_m(),
+            );
+            let bound = gs
+                .map(|s| s.table_z_m + crate::grasp::TABLE_CLEARANCE_M)
+                .unwrap_or_else(|| f64::from(w.floor_z_m));
+            Some((pts, bound))
+        }
+        (None, Some(s)) => {
+            let rec = crate::grasp::CamModel::assumed(&snap.env.config.arm_model, s, &snap.env.config.camera_mount).rec;
+            let pts = crate::grasp::envelope_with_contact(
+                None,
+                &snap.env.config.camera_mount,
+                &rec,
+                snap.env.config.effective_physical_contact_end_m(),
+            );
+            Some((pts, s.table_z_m + crate::grasp::TABLE_CLEARANCE_M))
+        }
+        (None, None) => None,
+    };
+    Ok(PendingPlace { input, request, open_rad, held_spill_safe, spill_max_tilt_deg, table_clearance })
+}
+
 /// Height the lift phase goes to from `z`.
 fn lift_z(z: f64, req: &PlaceRequest) -> f64 { z.max(req.target[2] + req.approach_m) }
 
@@ -262,9 +339,124 @@ pub fn expected_duration(planned: &PlannedPlace) -> f64 {
     moves + if planned.request.release { 2.0 } else { 0.0 }
 }
 
+/// Build the A7 [`BeginMacroSpec`] for a planned `place` macro (shared by Legacy and RT Executor).
+pub fn begin_macro_spec(
+    planned: &PlannedPlace,
+    prepared_boot: crate::rt_core::broker::BootId,
+    dof: usize,
+    gripper_idx: Option<usize>,
+    deadline: Instant,
+) -> crate::rt_core::requests::actions::BeginMacroSpec {
+    use crate::rt_core::requests::actions::{BeginMacroSpec, MacroKind};
+    let mut start = vec![0.0f32; dof];
+    let arm_dof = planned.input.arm.arm_dof().min(dof).min(6);
+    for (i, dst) in start.iter_mut().take(arm_dof).enumerate() {
+        *dst = planned.input.q0[i] as f32;
+    }
+    if let Some(g) = gripper_idx.filter(|&g| g < dof) {
+        start[g] = planned.input.j7;
+    }
+    let mut spec = BeginMacroSpec::new(MacroKind::Place, prepared_boot);
+    if let Ok(s) = spec.with_start(&start) {
+        spec = s;
+    }
+    spec.check_workspace_revision = true;
+    spec.macro_deadline = Some(deadline);
+    spec.timeout_code = crate::safety::BoundedText::new("PLACE_TIMEOUT");
+    spec.orientation_levelled = planned.orientation_levelled;
+    if let Some(tag) = planned.request.tag.as_deref() {
+        spec.tag = crate::model::HolderLabel::new(tag);
+    }
+    spec
+}
+
+/// Begin a planned place through the single owner-side [`install_begin_macro_admitted`] path
+/// and spawn its orchestrator. Returns (action id, expected duration).
+pub fn begin(
+    admitted: crate::supervisor::Admitted<'_>,
+    supervisor: &Arc<ArmSupervisor>,
+    planned: PlannedPlace,
+) -> Result<(u64, f64), ArmError> {
+    let stamp = admitted.stamp();
+    let budget = expected_duration(&planned) * 2.0 + 20.0;
+    let deadline = Instant::now() + Duration::from_secs_f64(budget);
+    let (inner, proof) = admitted.consume()?;
+    let spec = begin_macro_spec(
+        &planned,
+        inner.boot_id,
+        inner.config.dof,
+        inner.config.gripper_index(),
+        deadline,
+    );
+    let duration = expected_duration(&planned)
+        + inner.approach_estimate_s("place_final", planned.request.approach);
+    let ws_rev = planned.input.workspace_revision;
+    let tag = planned.request.tag.clone();
+    let id = crate::rt_core::requests::actions::install_begin_macro_with_proof(
+        inner,
+        &proof,
+        &spec,
+        Some(ws_rev),
+        tag,
+        None,
+    )?;
+    spawn_with_deadline(supervisor.clone(), id, planned, stamp, deadline, budget);
+    Ok((id, duration))
+}
+
+/// Begin a planned place under a short write lock through the single owner-side
+/// [`crate::rt_core::requests::actions::install_begin_macro`] function and spawn its orchestrator.
+pub fn begin_with_stamp(
+    inner: &mut SupervisorInner,
+    stamp: crate::supervisor::AdmissionStamp,
+    supervisor: &Arc<ArmSupervisor>,
+    planned: PlannedPlace,
+) -> Result<(u64, f64), ArmError> {
+    use crate::rt_core::requests::actions::{
+        install_begin_macro, ActionStamp, OwnerCheckCtx, DEFAULT_ACTION_DEADLINE,
+    };
+    let budget = expected_duration(&planned) * 2.0 + 20.0;
+    let deadline = Instant::now() + Duration::from_secs_f64(budget);
+    let spec = begin_macro_spec(
+        &planned,
+        inner.boot_id,
+        inner.config.dof,
+        inner.config.gripper_index(),
+        deadline,
+    );
+    let action_stamp = ActionStamp {
+        arm: inner.core.id(),
+        boot: inner.boot_id,
+        admission: stamp,
+        config_revision: planned.input.workspace_revision,
+        calibration_revision: None,
+        poses_revision: None,
+        sequences_revision: None,
+        grasp_setup_revision: None,
+        gripper_calib_revision: None,
+        power_budget_revision: None,
+        parent_generation: 0,
+        deadline: Instant::now() + DEFAULT_ACTION_DEADLINE,
+    };
+    let owner_ctx = OwnerCheckCtx::for_legacy(inner);
+    let id = install_begin_macro(
+        inner,
+        &action_stamp,
+        &owner_ctx,
+        &spec,
+        planned.request.tag.clone(),
+        None,
+    )
+    .map_err(|r| r.into_arm_error(inner))?;
+    let duration = expected_duration(&planned)
+        + inner.approach_estimate_s("place_final", planned.request.approach);
+    spawn_with_deadline(supervisor.clone(), id, planned, stamp, deadline, budget);
+    Ok((id, duration))
+}
+
 /// Start a place (tests, in-process agents): caller passes the `AdmissionStamp` captured at
 /// admission (never re-sampled internally). Prepares, plans, validates `stamp` under the owner
-/// lock, and spawns the orchestrator. Returns (action id, expected duration).
+/// lock through [`begin_with_stamp`], and spawns the orchestrator. Returns (action id, expected duration).
 pub async fn start(supervisor: &Arc<ArmSupervisor>, stamp: crate::supervisor::AdmissionStamp, body: &Value) -> Result<(u64, f64), ApiError> {
     let pending = {
         let inner = supervisor.inner().read().await;
@@ -272,25 +464,89 @@ pub async fn start(supervisor: &Arc<ArmSupervisor>, stamp: crate::supervisor::Ad
     };
     let planned = tokio::task::spawn_blocking(move || plan(pending)).await
         .map_err(|e| ArmError::Internal(format!("planner task failed: {e}")))??;
-    let (id, duration) = {
-        let mut inner = supervisor.inner().write().await;
-        let admitted = inner.check_admission(stamp).map_err(ArmError::from)?;
-        let id = SupervisorInner::begin_macro(admitted, "place", &planned.input, planned.request.tag.clone())?;
-        if planned.orientation_levelled {
-            inner.update_action(id, |a| {
-                a.orientation = Some("levelled".into());
-            });
-        }
-        let duration = expected_duration(&planned) + inner.approach_estimate_s("place_final", planned.request.approach);
-        (id, duration)
+    let mut inner = supervisor.inner().write().await;
+    Ok(begin_with_stamp(&mut inner, stamp, supervisor, planned)?)
+}
+
+/// Production broker-to-worker handoff for `place` on `OWNER_EXECUTOR` (A7):
+/// submits `BeginMacro` carrying the caller's original `AdmissionStamp` and exact absolute
+/// `deadline`, then spawns the orchestrator with the accepted parent `ActionId`, original
+/// `stamp`, and exact `deadline` (0 `SupervisorLock`).
+pub async fn begin_executor(
+    supervisor: &Arc<ArmSupervisor>,
+    stamp: crate::supervisor::AdmissionStamp,
+    planned: PlannedPlace,
+) -> Result<(u64, f64), ArmError> {
+    use crate::rt_core::requests::actions::{ActionStamp, DEFAULT_ACTION_DEADLINE};
+    let handle = supervisor.executor_handle().ok_or_else(|| ArmError::Rejected {
+        status: 503,
+        code: "EXECUTOR_UNAVAILABLE".into(),
+        message: "RT executor is not active".into(),
+    })?;
+    let boot = handle.boot();
+    let arm = supervisor
+        .hub()
+        .latest()
+        .map_or(crate::rt_core::ids::ArmId::LOCAL, |s| s.rt.owner.arm);
+    let now = Instant::now();
+    let budget = expected_duration(&planned) * 2.0 + 20.0;
+    let deadline = now + Duration::from_secs_f64(budget);
+    let (dof, gripper_idx) = supervisor
+        .hub()
+        .prep_env()
+        .map_or((planned.input.limits.len(), planned.input.limits.len().checked_sub(1)), |e| {
+            (e.config.dof, e.config.gripper_index())
+        });
+    let mut spec = begin_macro_spec(&planned, boot, dof, gripper_idx, deadline);
+    spec.admission_request_id = stamp.request_id;
+    let action_stamp = ActionStamp {
+        arm,
+        boot,
+        admission: stamp,
+        config_revision: planned.input.workspace_revision,
+        calibration_revision: None,
+        poses_revision: None,
+        sequences_revision: None,
+        grasp_setup_revision: None,
+        gripper_calib_revision: None,
+        power_budget_revision: None,
+        parent_generation: 0,
+        deadline: now + DEFAULT_ACTION_DEADLINE,
     };
-    spawn(supervisor.clone(), id, planned, stamp);
+    let (id, _req_id) =
+        crate::macro_action::begin_macro_executor(supervisor, &action_stamp, spec, action_stamp.deadline)
+            .await?;
+    let approach_extra = supervisor
+        .hub()
+        .prep_env()
+        .and_then(|env| env.approach_plan("place_final", planned.request.approach).ok())
+        .map_or(0.0, |p| {
+            (1.875 * f64::from(p.policy.delta_rad()) / f64::from(p.policy.speed_rad_s))
+                .max(crate::backlash::MIN_SEGMENT_S)
+                + 0.5
+        });
+    let duration = expected_duration(&planned) + approach_extra;
+    spawn_with_deadline(supervisor.clone(), id, planned, stamp, deadline, budget);
     Ok((id, duration))
 }
 
 /// Spawn the orchestrator for an action begun with `SupervisorInner::begin_macro(stamp, "place", ..)`.
 pub fn spawn(supervisor: Arc<ArmSupervisor>, id: u64, planned: PlannedPlace, stamp: crate::supervisor::AdmissionStamp) {
-    tokio::spawn(run(supervisor, id, planned, stamp));
+    let budget = expected_duration(&planned) * 2.0 + 20.0;
+    let deadline = Instant::now() + Duration::from_secs_f64(budget);
+    spawn_with_deadline(supervisor, id, planned, stamp, deadline, budget);
+}
+
+/// Spawn the `place` orchestrator with an explicit pre-committed `deadline` and `budget` (broker handoff).
+pub fn spawn_with_deadline(
+    supervisor: Arc<ArmSupervisor>,
+    id: u64,
+    planned: PlannedPlace,
+    stamp: crate::supervisor::AdmissionStamp,
+    deadline: Instant,
+    budget: f64,
+) {
+    tokio::spawn(run(supervisor, id, planned, stamp, deadline, budget));
 }
 
 async fn phases(ctx: &MacroCtx, planned: &PlannedPlace) -> Result<(), Stop> {
@@ -361,29 +617,72 @@ async fn phases(ctx: &MacroCtx, planned: &PlannedPlace) -> Result<(), Stop> {
     Ok(())
 }
 
-async fn run(sup: Arc<ArmSupervisor>, id: u64, planned: PlannedPlace, stamp: crate::supervisor::AdmissionStamp) {
-    // generous whole-action budget: twice the planned time plus 20 s
-    let budget = expected_duration(&planned) * 2.0 + 20.0;
+async fn run(
+    sup: Arc<ArmSupervisor>,
+    id: u64,
+    planned: PlannedPlace,
+    stamp: crate::supervisor::AdmissionStamp,
+    deadline: Instant,
+    budget: f64,
+) {
+    use crate::rt_core::requests::actions::{FinishState, HeldUpdate};
     let ctx = MacroCtx {
-        sup: sup.clone(), id, stamp,
-        deadline: Instant::now() + Duration::from_secs_f64(budget),
-        phase_timeout_s: PHASE_TIMEOUT_S, timeout_code: "PLACE_TIMEOUT",
+        sup: sup.clone(),
+        id,
+        stamp,
+        deadline,
+        phase_timeout_s: PHASE_TIMEOUT_S,
+        timeout_code: "PLACE_TIMEOUT",
         timeout_message: format!("Place did not finish within {budget:.0} s"),
     };
     let result = phases(&ctx, &planned).await;
-    let mut inner = sup.inner().write().await;
     match result {
         // released: the jaws are open, nothing is held
-        Ok(()) => inner.finish_macro(id, "done", None, None, planned.request.release.then_some(false), None),
-        Err(Stop::Fail(code, message)) => {
-            inner.finish_macro(id, "failed", Some(&code), Some(message), None, None);
+        Ok(()) => {
+            ctx.finish(
+                FinishState::Done,
+                None,
+                None,
+                planned.request.release.then_some(false),
+                None,
+                if planned.request.release {
+                    HeldUpdate::Clear
+                } else {
+                    HeldUpdate::Unchanged
+                },
+            )
+            .await;
         }
-        Err(Stop::Cancelled) => inner.finish_macro(id, "cancelled", None, None, None, None),
+        Err(Stop::Fail(code, message)) => {
+            ctx.finish(
+                FinishState::Failed,
+                Some(&code),
+                Some(message),
+                None,
+                None,
+                HeldUpdate::Unchanged,
+            )
+            .await;
+        }
+        Err(Stop::Cancelled) => {
+            ctx.finish(
+                FinishState::Cancelled,
+                None,
+                None,
+                None,
+                None,
+                HeldUpdate::Unchanged,
+            )
+            .await;
+        }
     }
-    if let Some(a) = inner.last_action.as_ref().filter(|a| a.id == id) {
-        let code = a.code.as_deref().unwrap_or(if a.state == "done" { "OK" } else { &a.state });
-        let worst = a.motions.iter().max_by(|x, y| x.track_mm.total_cmp(&y.track_mm));
-        tracing::info!("Place {id} {code}: phase_ms {:?}, worst motion {:?}", a.phase_ms, worst);
+    if !ctx.is_executor() {
+        let inner = sup.inner().read().await;
+        if let Some(a) = inner.last_action.as_ref().filter(|a| a.id == id) {
+            let code = a.code.as_deref().unwrap_or(if a.state == "done" { "OK" } else { &a.state });
+            let worst = a.motions.iter().max_by(|x, y| x.track_mm.total_cmp(&y.track_mm));
+            tracing::info!("Place {id} {code}: phase_ms {:?}, worst motion {:?}", a.phase_ms, worst);
+        }
     }
 }
 

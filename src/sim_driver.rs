@@ -200,6 +200,8 @@ pub struct SimArmDriver {
     torque_hs: Option<(bool, Deadline)>,
     /// Physical E-stop latch inhibiting any new enable command.
     abort_flag: Option<Arc<AtomicBool>>,
+    /// Authoritative packed E-stop state (`ArmDriver::set_estop_state`).
+    estop_state: Option<Arc<crate::rt_core::urgent::EstopState>>,
     /// Pending-E-stop gate checked immediately before target and enable sends.
     estop_gate: Option<crate::rt_core::urgent::EstopGate>,
     /// Deterministic test hook invoked inside `send_ref` strictly after JSON serialization and
@@ -278,6 +280,7 @@ impl SimArmDriver {
             zero_offsets: None,
             torque_hs: None,
             abort_flag: None,
+            estop_state: None,
             estop_gate: None,
             before_send_hook: None,
         })
@@ -353,7 +356,8 @@ impl SimArmDriver {
 
     /// Aborts an enable attempt if E-stop is latched or an urgent stop is pending.
     fn enable_estop_inhibited(&mut self) -> Result<(), ArmDriverError> {
-        let latched = self.abort_flag.as_ref().is_some_and(|f| f.load(Ordering::SeqCst));
+        let latched = self.estop_state.as_ref().is_some_and(|s| s.is_latched())
+            || self.abort_flag.as_ref().is_some_and(|f| f.load(Ordering::SeqCst));
         let pending = self.estop_gate.as_ref().is_some_and(|g| g.pending());
         if latched || pending {
             if matches!(self.torque_hs, Some((true, _))) {
@@ -592,6 +596,11 @@ impl ArmDriver for SimArmDriver {
     fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool {
         if dof != self.dof { return false; }
         self.rx_metadata().1.map(|t| t.elapsed()).is_some_and(|age| age <= max_age)
+    }
+
+    fn feedback_joints_within(&self, joints: &[usize], max_age: Duration) -> bool {
+        joints.iter().all(|&j| j < self.dof)
+            && self.rx_metadata().1.map(|t| t.elapsed()).is_some_and(|age| age <= max_age)
     }
 
     fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
@@ -842,6 +851,8 @@ impl ArmDriver for SimArmDriver {
     fn set_torque_flag(&mut self, enabled: bool) { self.enable_requested = enabled; }
 
     fn set_abort_flag(&mut self, flag: Arc<AtomicBool>) { self.abort_flag = Some(flag); }
+
+    fn set_estop_state(&mut self, state: Arc<crate::rt_core::urgent::EstopState>) { self.estop_state = Some(state); }
 
     fn set_estop_gate(&mut self, gate: crate::rt_core::urgent::EstopGate) { self.estop_gate = Some(gate); }
 

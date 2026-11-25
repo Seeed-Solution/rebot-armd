@@ -113,6 +113,9 @@ pub(super) enum AuthRequirement {
     /// Always requires an operator session when operator auth is enforced.
     /// Optional label overrides the operation name in `ApiError::operator_required`; `None` uses `path`.
     Operator(Option<&'static str>),
+    /// Owner-side operator authorization policy evaluated live against a lock-free [`OperatorGrant`]
+    /// (shared across legacy lock and RT executor with zero heap allocation).
+    OwnerGrant(crate::rt_core::requests::lease::OwnerAuthPolicy),
     /// Conditional operator privilege evaluated under the supervisor write lock by a family predicate.
     Conditional(fn(&WsAuth, &mut SupervisorInner, &str, &Value, u64) -> Option<ApiError>),
     /// Conditional operator privilege evaluated pre-lock for lease-free commands.
@@ -122,6 +125,18 @@ pub(super) enum AuthRequirement {
 }
 
 impl AuthRequirement {
+    /// Converts a table-declared auth policy into the zero-alloc owner-side policy used by
+    /// `DispatchHandler::CommandAsync` handlers across legacy and RT executor owners.
+    pub(super) fn owner_auth_policy(self) -> Option<crate::rt_core::requests::lease::OwnerAuthPolicy> {
+        use crate::rt_core::requests::lease::OwnerAuthPolicy;
+        match self {
+            Self::None => Some(OwnerAuthPolicy::None),
+            Self::Operator(label) => Some(OwnerAuthPolicy::Operator(label)),
+            Self::OwnerGrant(policy) => Some(policy),
+            Self::Conditional(_) | Self::ConditionalLeaseFree(_) | Self::InHandler => None,
+        }
+    }
+
     /// Enforce operator privilege for an owner-locked command row directly from the table entry.
     pub(super) fn check_owner(
         self,
@@ -138,6 +153,29 @@ impl AuthRequirement {
                     None
                 } else {
                     Some(ApiError::operator_required(label.unwrap_or(path)))
+                }
+            }
+            Self::OwnerGrant(policy) => {
+                use crate::rt_core::requests::lease::{evaluate_owner_auth_policy, OwnerAuthError};
+                match evaluate_owner_auth_policy(
+                    policy,
+                    ws_auth.operator_grant(),
+                    inner,
+                    epoch,
+                    std::time::Instant::now(),
+                    "/api/v1/safety/clear_fault",
+                ) {
+                    Ok(()) => None,
+                    Err(OwnerAuthError::EpochMismatch { expected, received }) => Some(
+                        crate::supervisor::ArmError::Safety(crate::safety::SafetyError::EpochMismatch {
+                            expected,
+                            received,
+                        })
+                        .into(),
+                    ),
+                    Err(OwnerAuthError::OperatorRequired { operation }) => {
+                        Some(ApiError::operator_required(operation))
+                    }
                 }
             }
             Self::Conditional(pred) => pred(ws_auth, inner, path, body, epoch),
@@ -162,7 +200,7 @@ impl AuthRequirement {
                 }
             }
             Self::ConditionalLeaseFree(pred) => pred(ws_auth, path, body),
-            Self::Conditional(_) => {
+            Self::Conditional(_) | Self::OwnerGrant(_) => {
                 unreachable!("lease-free row cannot use an owner-locked auth predicate")
             }
         }
@@ -236,24 +274,225 @@ pub(super) struct OwnerDispatchCtx<'a> {
     pub(super) value: &'a Value,
     pub(super) epoch: u64,
     pub(super) local_generation: u64,
-    pub(super) recv_conn_id: u64,
-    pub(super) recv_connection: &'a str,
-    pub(super) recv_generation: &'a AtomicU64,
-    pub(super) recv_client_label: &'a Mutex<Option<String>>,
-    pub(super) worker_closing: &'a AtomicBool,
     pub(super) ws_auth: &'a WsAuth,
     pub(super) recv_supervisor: &'a Arc<ArmSupervisor>,
     pub(super) recv_deps: &'a crate::grasp::GraspDeps,
     pub(super) recv_calib: &'a crate::calibration::CalibrationDeps,
-    #[cfg(feature = "policy-runtime")]
-    pub(super) pending_policy_loads: &'a AtomicUsize,
     pub(super) last_sequence: &'a mut Option<u64>,
-    pub(super) evicted_notify: &'a mut Option<(String, u64)>,
     pub(super) action_pending: &'a mut actions::ActionPending,
     pub(super) pending_motion: &'a mut Option<motion::PendingMotion>,
-    pub(super) pending_config_write: &'a mut Option<(Value, config::PreparedConfigWrite, u64, u64)>,
+    pub(super) pending_config_write: &'a mut Option<config::PendingConfigJob>,
     pub(super) pending_calibration: &'a mut Option<(Value, calibration::CalibJob, u64, u64, bool)>,
 }
+
+/// Lightweight WS reply payload captured under `SupervisorLock` and formatted into JSON
+/// strictly AFTER the lock guard is released (zero JSON serialization under the guard).
+#[allow(clippy::large_enum_variant)]
+pub(super) enum OwnerReply {
+    CommandAck {
+        snap: super::AckSnapshot,
+        started: super::Started,
+    },
+    CommandAckJob {
+        snap: super::AckSnapshot,
+        started: super::Started,
+        job_id: String,
+    },
+    CommandReject {
+        epoch: u64,
+        error: ApiError,
+    },
+    PresetReject {
+        epoch: u64,
+        name: String,
+        error: ApiError,
+    },
+    PresetCalibrationBusy {
+        epoch: u64,
+    },
+    ServoRejectReason(&'static str),
+    ServoRejectApi {
+        epoch: u64,
+        error: ApiError,
+    },
+    FieldsAck(Value),
+    CalibReject(crate::calibration::CalibError),
+    LeaseLost {
+        epoch: u64,
+        local_generation: u64,
+        reason: Option<&'static str>,
+    },
+    EpochMismatch {
+        epoch: u64,
+        safety_state: crate::safety::SafetyState,
+    },
+    InvalidRequestId,
+    #[cfg(feature = "policy-runtime")]
+    PolicyStopAck {
+        snap: super::AckSnapshot,
+        stopped: bool,
+    },
+}
+
+impl OwnerReply {
+    pub(super) fn into_value(
+        self,
+        raw_kind: &str,
+        frame_kind: FrameKind,
+        value: &Value,
+        #[cfg(feature = "policy-runtime")] pending_policy_loads: &AtomicUsize,
+    ) -> Value {
+        match self {
+            Self::CommandAck { snap, started } => {
+                super::command_ack_from_snap(&snap, &value["request_id"], started)
+            }
+            Self::CommandAckJob {
+                snap,
+                started,
+                job_id,
+            } => {
+                let mut ack = super::command_ack_from_snap(&snap, &value["request_id"], started);
+                ack["job_id"] = serde_json::json!(job_id);
+                ack
+            }
+            Self::CommandReject { epoch, error } => {
+                super::command_reject_at(epoch, &value["request_id"], error)
+            }
+            Self::PresetReject { epoch, name, error } => {
+                let mut reply = super::rejection(error, "preset_reject", epoch);
+                reply["name"] = serde_json::json!(name);
+                reply
+            }
+            Self::PresetCalibrationBusy { epoch } => serde_json::json!({
+                "type": "preset_reject",
+                "name": value.get("name"),
+                "status": 409,
+                "code": "MOTION_BUSY",
+                "error": "MOTION_BUSY",
+                "message": "a camera calibration apply or restore is running",
+                "epoch_id": epoch,
+            }),
+            Self::ServoRejectReason(reason) => {
+                serde_json::json!({"type": "servo_reject", "reason": reason})
+            }
+            Self::ServoRejectApi { epoch, error } => {
+                let stopped = error.code.as_deref() == Some("STOPPED");
+                let mut r = super::rejection(error, "servo_reject", epoch);
+                if stopped {
+                    r["reason"] = serde_json::json!("stopped");
+                }
+                r
+            }
+            Self::FieldsAck(reply) => super::fields_ack(&value["request_id"], reply),
+            Self::CalibReject(e) => calibration::calibration_reject(&value["request_id"], &e),
+            Self::LeaseLost {
+                epoch,
+                local_generation,
+                reason,
+            } => {
+                if raw_kind == "command" {
+                    serde_json::json!({
+                        "type": "command_reject",
+                        "request_id": value.get("request_id"),
+                        "status": 409,
+                        "code": "LEASE_LOST",
+                        "message": "This connection does not own an active lease",
+                        "error": "LEASE_LOST",
+                        "epoch_id": epoch,
+                    })
+                } else if raw_kind == "release_lease" {
+                    serde_json::json!({"type": "lease_released", "success": false})
+                } else if local_generation == 0 {
+                    serde_json::json!({"type": "lease_lost", "generation": 0})
+                } else {
+                    serde_json::json!({
+                        "type": "lease_lost",
+                        "generation": local_generation,
+                        "reason": reason.unwrap_or("expired"),
+                    })
+                }
+            }
+            Self::EpochMismatch {
+                epoch,
+                safety_state,
+            } => {
+                if frame_kind == FrameKind::Command {
+                    serde_json::json!({
+                        "type": "command_reject",
+                        "request_id": value.get("request_id"),
+                        "status": 409,
+                        "code": "EPOCH_MISMATCH",
+                        "message": "Command epoch is no longer current",
+                        "error": "EPOCH_MISMATCH",
+                        "epoch_id": epoch,
+                    })
+                } else {
+                    serde_json::json!({
+                        "type": "epoch_sync",
+                        "epoch_id": epoch,
+                        "safety_state": safety_state,
+                    })
+                }
+            }
+            Self::InvalidRequestId => serde_json::json!({
+                "type": "command_reject",
+                "request_id": value.get("request_id"),
+                "status": 400,
+                "code": "INVALID_COMMAND",
+                "message": "request_id must be present and strictly increase",
+                "error": "INVALID_COMMAND",
+            }),
+            #[cfg(feature = "policy-runtime")]
+            Self::PolicyStopAck { snap, stopped } => {
+                let had_pending = pending_policy_loads.load(std::sync::atomic::Ordering::SeqCst) > 0;
+                let mut ack = super::command_ack_from_snap(&snap, &value["request_id"], None);
+                ack["stopped"] = serde_json::json!(stopped || had_pending);
+                ack
+            }
+        }
+    }
+}
+
+/// Boxed future returned by the table-bound unified heartbeat handler.
+pub(super) type HeartbeatFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Option<Value>> + Send + 'a>>;
+
+/// Arguments passed to unified async session handlers (`acquire_lease`, `release_lease`).
+pub(super) struct SessionDispatchCtx<'a> {
+    pub(super) supervisor: &'a ArmSupervisor,
+    pub(super) value: &'a Value,
+    pub(super) conn_handle: crate::rt_core::requests::lease::ConnectionHandle,
+    pub(super) recv_generation: &'a AtomicU64,
+    pub(super) recv_client_label: &'a Mutex<Option<String>>,
+    pub(super) worker_closing: &'a AtomicBool,
+    pub(super) ws_auth: &'a WsAuth,
+    pub(super) last_sequence: &'a mut Option<u64>,
+}
+
+/// Boxed future returned by table-bound unified async session handlers (`acquire_lease`, `release_lease`).
+pub(super) type SessionFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = (Option<Value>, Option<(String, u64)>)> + Send + 'a>,
+>;
+
+/// Arguments passed to unified async command handlers (`/api/v1/torque`, `/api/v1/arm`,
+/// `/api/v1/safety/clear_fault`) routed through the active owner (legacy or RT executor).
+///
+/// Both `local_generation` (from `entry.lease`) and `auth_policy` (from `entry.auth`) are enforced
+/// and supplied directly by the dispatcher from the [`DispatchEntry`] row.
+pub(super) struct CommandAsyncCtx<'a> {
+    pub(super) supervisor: &'a ArmSupervisor,
+    pub(super) value: &'a Value,
+    pub(super) stamp: AdmissionStamp,
+    pub(super) conn_handle: crate::rt_core::requests::lease::ConnectionHandle,
+    pub(super) local_generation: u64,
+    pub(super) auth_policy: crate::rt_core::requests::lease::OwnerAuthPolicy,
+    pub(super) operator: crate::auth::OperatorGrant,
+    pub(super) last_ordinary_request: &'a mut Option<u64>,
+}
+
+/// Boxed future returned by table-bound unified async command handlers.
+pub(super) type CommandAsyncFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Value> + Send + 'a>>;
 
 /// Concrete executable handler binding stored in each [`DispatchEntry`].
 #[derive(Clone, Copy)]
@@ -264,20 +503,25 @@ pub(super) enum DispatchHandler {
     UrgentStop(fn(&mut UrgentStopCtx<'_>) -> bool),
     /// Dedicated off-reader auth frame processor (`auth`).
     Auth(fn(&WsAuth, &Value) -> Value),
-    /// Dedicated latest-wins heartbeat processor (`heartbeat`).
+    /// Dedicated latest-wins heartbeat processor (`heartbeat`), routed through the active owner.
     Heartbeat(
-        fn(
-            &mut SupervisorInner,
-            &Value,
-            &str,
-            &AtomicU64,
-            &Mutex<Option<String>>,
-        ) -> Option<Value>,
+        for<'a> fn(
+            &'a ArmSupervisor,
+            &'a Value,
+            crate::rt_core::requests::lease::ConnectionHandle,
+            &'a AtomicU64,
+            &'a Mutex<Option<String>>,
+        ) -> HeartbeatFuture<'a>,
     ),
+    /// Unified async session handler (`acquire_lease`, `release_lease`), routed through the active owner.
+    SessionAsync(for<'a> fn(SessionDispatchCtx<'a>) -> SessionFuture<'a>),
+    /// Unified async command handler (`/api/v1/torque`, `/api/v1/arm`, `/api/v1/safety/clear_fault`),
+    /// routed through the active owner (legacy or RT executor) with immediate wire reply.
+    CommandAsync(for<'a> fn(CommandAsyncCtx<'a>) -> CommandAsyncFuture<'a>),
     /// Pre-lock lease-free command handler (`depth_measure`, `teach`).
     LeaseFree(fn(LeaseFreeCtx<'_>)),
     /// Owner-locked handler executed under `supervisor.inner().write()`.
-    Owner(fn(&mut OwnerDispatchCtx<'_>) -> Option<Value>),
+    Owner(fn(&mut OwnerDispatchCtx<'_>) -> Option<OwnerReply>),
 }
 
 /// One row of the unified WS dispatch table.
@@ -365,6 +609,31 @@ fn validate_entry(entry: &DispatchEntry) {
                 "{:?}",
                 entry.key
             );
+        }
+        DispatchHandler::SessionAsync(_) => {
+            assert_eq!(entry.admission, AdmissionClass::OrdinarySession, "{:?}", entry.key);
+            assert_eq!(entry.reply, ReplyPolicy::LeaseReply, "{:?}", entry.key);
+        }
+        DispatchHandler::CommandAsync(_) => {
+            assert!(
+                matches!(
+                    entry.admission,
+                    AdmissionClass::OrdinaryTorqueOrStopExempt | AdmissionClass::Ordinary
+                ),
+                "CommandAsync handler must use Ordinary/OrdinaryTorqueOrStopExempt admission: {:?}",
+                entry.key
+            );
+            assert!(
+                matches!(entry.lease, LeaseRequirement::Required | LeaseRequirement::None),
+                "CommandAsync handler must declare Required or None lease policy: {:?}",
+                entry.key
+            );
+            assert!(
+                entry.auth.owner_auth_policy().is_some(),
+                "CommandAsync handler must declare None, Operator, or OwnerGrant auth policy: {:?}",
+                entry.key
+            );
+            assert_eq!(entry.reply, ReplyPolicy::CommandImmediate, "{:?}", entry.key);
         }
         DispatchHandler::LeaseFree(_) => {
             assert_eq!(entry.admission, AdmissionClass::Ordinary, "{:?}", entry.key);
@@ -653,9 +922,10 @@ mod tests {
         let mixed_release = json!({"type": "release_lease", "positions": null});
         let mixed_acquire = json!({"type": "acquire_lease", "client_id": "a", "mode": "cartesian_joint_stream"});
         let clean_release = json!({"type": "release_lease"});
-        assert!(q.try_push(mixed_release.clone(), stamp).is_ok());
-        assert!(q.try_push(mixed_acquire.clone(), stamp).is_ok());
-        assert!(q.try_push(clean_release.clone(), stamp).is_ok());
+        let now = std::time::Instant::now();
+        assert!(q.try_push(mixed_release.clone(), stamp, now).is_ok());
+        assert!(q.try_push(mixed_acquire.clone(), stamp, now).is_ok());
+        assert!(q.try_push(clean_release.clone(), stamp, now).is_ok());
 
         let replies = q.drain_cancellable("STOPPED", Some(7));
         assert_eq!(replies.len(), 2, "both mixed-field lease frames must cancel like baseline");

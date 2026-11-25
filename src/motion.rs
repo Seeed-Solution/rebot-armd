@@ -1365,10 +1365,19 @@ impl GripperContactDetector {
     }
 
     pub fn step(&mut self, input: &GripperContactInput<'_>) -> GripperContactEval {
+        let data = input.baseline.map(FreeTorqueBaseline::data_snapshot);
+        self.step_with_baseline_data(input, data.as_ref())
+    }
+
+    pub fn step_with_baseline_data(
+        &mut self,
+        input: &GripperContactInput<'_>,
+        baseline: Option<&crate::gripper_baseline::BaselineData>,
+    ) -> GripperContactEval {
         let window_s = gripper_progress_window_s(input.window_speed, 0.10);
         let (progressed, progress_stopped) = self.progress.update(input.measured_pos, input.dir, input.dt, window_s);
-        let (base_thresh, threshold_source, baseline_nm) = match crate::gripper_baseline::closing_contact_threshold(
-            input.baseline,
+        let (base_thresh, threshold_source, baseline_nm) = match crate::gripper_baseline::closing_contact_threshold_data(
+            baseline,
             input.measured_pos,
             input.baseline_speed.abs(),
             input.contact_torque_nm,
@@ -1793,8 +1802,8 @@ pub struct GripperMotion {
     pub contact_rad: Option<f32>,
     contact_detector: GripperContactDetector,
     lag_window: GripperProgressWindow,
-    /// Free-motion torque baseline of the active tool (snapshot at the start of the move).
-    baseline: Option<FreeTorqueBaseline>,
+    /// Free-motion torque baseline of the active tool (Copy numeric snapshot at the start of the move).
+    baseline: Option<crate::gripper_baseline::BaselineData>,
     /// Which moves are recorded for learning ([`Self::take_learning`]).
     learn: LearnMode,
     samples: Option<MoveSamples>,
@@ -1995,6 +2004,78 @@ impl GripperMotion {
         self.request.tag.is_none() && self.samples.is_none() && self.baseline.is_none() && self.learned.is_none()
     }
 
+    /// Zero-allocation RT counterpart of [`Self::try_with_close_speed_limit`] returning a static
+    /// refusal code on invalid speed/quantization (never allocates `String` on `armd-control`).
+    pub fn try_with_close_speed_limit_static(
+        request: GripperRequest,
+        policy: GripperPolicy,
+        limit: JointLimit,
+        start: f32,
+        gripper_index: usize,
+        close_speed_limit: Option<f32>,
+    ) -> Result<Self, &'static str> {
+        let dir = if policy.closed_rad >= policy.open_rad { 1.0 } else { -1.0 };
+        let target = match request.command {
+            GripperCommand::Open => policy.open_rad,
+            GripperCommand::Close => policy.closed_rad,
+            GripperCommand::Move => policy.closed_rad + request.fraction.unwrap_or(0.0) as f32 * (policy.open_rad - policy.closed_rad),
+            GripperCommand::Seek => policy.closed_rad + dir * 0.6,
+        }.clamp(limit.min_position, limit.max_position);
+        let closing = (target - start) * dir > 1e-6;
+        let (planned_speed, max_velocity, planned_vel_raw) = match close_speed_limit {
+            Some(cap) => {
+                if !(cap.is_finite() && cap > 0.0) {
+                    return Err("INVALID_COMMAND");
+                }
+                let max_v = if limit.max_velocity.is_finite() && limit.max_velocity > 0.0 {
+                    f64::from(limit.max_velocity)
+                } else {
+                    request.speed
+                };
+                if closing {
+                    let effective = request.speed.min(max_v).min(f64::from(cap));
+                    let raw = crate::model::DamiaoGripperDrive::quantize_vel_raw_f64(effective);
+                    if raw == 0 {
+                        return Err("INVALID_COMMAND");
+                    }
+                    (
+                        f64::from(raw) / 100.0,
+                        crate::model::DamiaoGripperDrive::step_speed_f32(raw),
+                        Some(raw),
+                    )
+                } else {
+                    let effective = request.speed.min(max_v);
+                    if crate::model::DamiaoGripperDrive::quantize_vel_raw_f64(effective) == 0 {
+                        return Err("INVALID_COMMAND");
+                    }
+                    (request.speed, request.speed as f32, None)
+                }
+            }
+            None => (request.speed, request.speed as f32, None),
+        };
+        let limit = JointLimit { max_velocity, ..limit };
+        let mut m = Self {
+            request, policy, limit, target, start, gripper_index, planned_speed, planned_vel_raw,
+            ceiling_torque_estimate_nm: None,
+            elapsed: 0.0, timeout_s: 0.0, still_for: 0.0, still_anchor: None, moved: false, phase: GripPhase::Moving,
+            contact_rad: None,
+            contact_detector: GripperContactDetector::default(),
+            lag_window: GripperProgressWindow::default(),
+            baseline: None, learn: LearnMode::Off, samples: None,
+            last_contact: None, loaded: false, learned: None,
+            extendable: false, hard_timeout_s: 0.0, progress_ref: (0.0, start),
+            window_unloaded: true, cap_k: None,
+        };
+        m.extendable = m.request.timeout_s.is_none();
+        m.timeout_s = m.request.timeout_s.unwrap_or_else(|| m.default_timeout_s());
+        m.hard_timeout_s = if m.extendable {
+            (m.timeout_s + GRIPPER_MAX_EXTENSION_S).min(GRIPPER_MAX_DEFAULT_TIMEOUT_S).max(m.timeout_s)
+        } else {
+            m.timeout_s
+        };
+        Ok(m)
+    }
+
     /// Switch from an explicit caller timeout to the unified derived default deadline.
     pub fn use_default_timeout(&mut self) {
         self.request.timeout_s = None;
@@ -2016,17 +2097,66 @@ impl GripperMotion {
     /// Use `baseline` (the active tool's free-motion torque) for the contact threshold and record
     /// the move for [`Self::take_learning`] as `learn` allows (Seek moves and grasp closes are
     /// never recorded).
-    pub fn with_baseline(mut self, baseline: Option<FreeTorqueBaseline>, learn: LearnMode) -> Self {
-        self.baseline = baseline;
+    pub fn with_baseline(self, baseline: Option<FreeTorqueBaseline>, learn: LearnMode) -> Self {
+        self.with_baseline_data(baseline.as_ref().map(FreeTorqueBaseline::data_snapshot), learn)
+    }
+
+    /// Zero-alloc variant of [`Self::with_baseline`] using `Copy` [`crate::gripper_baseline::BaselineData`].
+    pub fn with_baseline_data(self, baseline: Option<crate::gripper_baseline::BaselineData>, learn: LearnMode) -> Self {
+        let needs_samples = self.will_record_learning(learn);
+        let samples = needs_samples.then(MoveSamples::default);
+        self.with_baseline_data_and_samples(baseline, learn, samples).0
+    }
+
+    /// True if `learn` will record free-motion samples for this move.
+    pub fn will_record_learning(&self, learn: LearnMode) -> bool {
         let closing = (self.target - self.start) * self.close_dir() > 0.0;
         let recorded = match learn {
             LearnMode::Off => false,
             LearnMode::Opening => !closing,
             LearnMode::Calibration => !(closing && self.request.grasp),
         };
-        self.learn = if recorded && self.request.command != GripperCommand::Seek { learn } else { LearnMode::Off };
-        if self.learn != LearnMode::Off { self.samples = Some(MoveSamples::default()); }
-        self
+        recorded && self.request.command != GripperCommand::Seek
+    }
+
+    /// Strictly zero-alloc RT variant using a caller-supplied preallocated [`MoveSamples`] buffer.
+    /// If `samples` is `None` when learning would apply, disables recording cleanly rather than
+    /// allocating. If learning does not apply, returns `samples` back to the caller untouched so
+    /// the caller can recycle it into the RT pool without dropping it on `armd-control`.
+    pub fn with_baseline_data_and_samples(
+        mut self,
+        baseline: Option<crate::gripper_baseline::BaselineData>,
+        learn: LearnMode,
+        samples: Option<MoveSamples>,
+    ) -> (Self, Option<MoveSamples>) {
+        self.baseline = baseline;
+        if self.will_record_learning(learn) {
+            if let Some(mut buf) = samples {
+                buf.reset();
+                self.learn = learn;
+                self.samples = Some(buf);
+            } else {
+                self.learn = LearnMode::Off;
+            }
+            (self, None)
+        } else {
+            self.learn = LearnMode::Off;
+            (self, samples)
+        }
+    }
+
+    /// Takes any un-emitted `MoveSamples` buffer for zero-dealloc recycling on `armd-control`.
+    pub(crate) fn take_samples_spare(&mut self) -> Option<MoveSamples> {
+        self.samples.take().or_else(|| self.learned.take().map(|r| r.samples))
+    }
+
+    /// True when dropping this `GripperMotion` (excluding its enclosing `Box`) would free heap memory.
+    pub fn has_inner_heap_storage(&self) -> bool {
+        self.request.tag.as_ref().is_some_and(|s| s.capacity() > 0)
+            || self.limit.name.capacity() > 0
+            || self.policy.jaw_opening.is_some()
+            || self.samples.is_some()
+            || self.learned.is_some()
     }
 
     /// The finished move when it was unloaded (no contact, stall or torque cap trip away from
@@ -2362,8 +2492,8 @@ impl GripperMotion {
         // `contact_rad` and `last_contact` populated when a rigid stop reaches the window.
         if grasping && self.contact_rad.is_none() && ctx.feedback_fresh && !(stalled && ctx.gripper_force_capped) {
             let progress_window_s = gripper_progress_window_s(Some(self.planned_speed), 0.10);
-            let eval = self.contact_detector.step(&GripperContactInput {
-                baseline: self.baseline.as_ref(),
+            let eval = self.contact_detector.step_with_baseline_data(&GripperContactInput {
+                baseline: None,
                 contact_torque_nm: self.policy.contact_torque_nm,
                 max_close_torque_nm: self.policy.max_close_torque_nm,
                 ceiling_torque_estimate_nm: self.ceiling_torque_estimate_nm,
@@ -2376,7 +2506,7 @@ impl GripperMotion {
                 dt: ctx.dt,
                 torque_feedback: ctx.torque_feedback,
                 active: self.moved,
-            });
+            }, self.baseline.as_ref());
             let lag_hit = if (q_g - m_g) * dir >= GRIPPER_CONTACT_LAG_RAD && m_g.is_finite() {
                 self.lag_window.update(m_g, dir, ctx.dt, progress_window_s).1
             } else {
@@ -2551,11 +2681,14 @@ pub struct ActiveTrajectory {
     pub motion_limits: Option<Vec<JointLimit>>,
     /// Zero-allocation inline per-joint velocity caps (used by RT prepared jog/home/park with `speed_scale`).
     pub motion_vel_caps: Option<([f32; crate::model::MAX_MOTION_DOF], usize)>,
+    /// Zero-alloc inline per-joint max velocity caps used by RT joint moves (`move_to_pose`,
+    /// `path: "joint"`, macro `JointQuinticLimited`), avoiding `Vec<JointLimit>` allocation on RT.
+    pub motion_max_velocity: Option<[f32; 8]>,
 }
 
 impl ActiveTrajectory {
     pub fn new(action_id: Option<u64>, reference: Reference) -> Self {
-        Self { action_id, reference, then: None, span: None, motion_limits: None, motion_vel_caps: None }
+        Self { action_id, reference, then: None, span: None, motion_limits: None, motion_vel_caps: None, motion_max_velocity: None }
     }
     pub fn quintic(traj: MultiJointQuinticTrajectory, action_id: Option<u64>) -> Self {
         Self::new(action_id, Reference::Quintic(traj))
@@ -2566,6 +2699,10 @@ impl ActiveTrajectory {
     }
     pub fn with_motion_vel_caps(mut self, caps: [f32; crate::model::MAX_MOTION_DOF], dof: usize) -> Self {
         self.motion_vel_caps = Some((caps, dof));
+        self
+    }
+    pub fn with_motion_max_velocity(mut self, max_velocity: [f32; 8]) -> Self {
+        self.motion_max_velocity = Some(max_velocity);
         self
     }
     /// `reference` followed by the short segment `then` (same-side approach).

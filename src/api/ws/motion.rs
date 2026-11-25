@@ -8,7 +8,7 @@ use std::time::Instant;
 use super::*;
 use super::dispatch::{
     AdmissionClass, AuthRequirement, DispatchEntry, DispatchHandler, DispatchKey, FrameKind,
-    LeaseRequirement, OwnerDispatchCtx, ReplyPolicy,
+    LeaseRequirement, OwnerDispatchCtx, OwnerReply, ReplyPolicy,
 };
 use crate::rt_core::requests::motion as req;
 
@@ -70,22 +70,22 @@ pub(super) struct PendingMotion {
     generation: u64,
 }
 
-fn format_motion_ack(inner: &SupervisorInner, kind: &MotionReplyKind, started: Started) -> Value {
+fn format_motion_ack_from_snap(snap: &AckSnapshot, kind: &MotionReplyKind, started: Started) -> Value {
     match kind {
-        MotionReplyKind::Command { request_id } => command_ack(inner, request_id, started),
+        MotionReplyKind::Command { request_id } => command_ack_from_snap(snap, request_id, started),
         MotionReplyKind::Preset { name } => {
-            let mut ack = json!({"type":"preset_ack", "name":name, "epoch_id":inner.safety.epoch_id()});
+            let mut ack = json!({"type":"preset_ack", "name":name, "epoch_id":snap.epoch_id});
             if let Some((id, _)) = started { ack["action_id"] = json!(id); }
             ack
         }
     }
 }
 
-fn format_motion_reject(inner: &SupervisorInner, kind: &MotionReplyKind, error: ApiError) -> Value {
+fn format_motion_reject_at(epoch_id: u64, kind: &MotionReplyKind, error: ApiError) -> Value {
     match kind {
-        MotionReplyKind::Command { request_id } => command_reject(inner, request_id, error),
+        MotionReplyKind::Command { request_id } => command_reject_at(epoch_id, request_id, error),
         MotionReplyKind::Preset { name } => {
-            let mut reply = rejection(error, "preset_reject", inner.safety.epoch_id());
+            let mut reply = rejection(error, "preset_reject", epoch_id);
             reply["name"] = json!(name);
             reply
         }
@@ -120,38 +120,45 @@ fn parse_motion_command(path: &str, body: &Value) -> Result<req::MotionRequest, 
     }
 }
 
-fn dispatch_preset(ctx: &mut OwnerDispatchCtx<'_>) -> Option<Value> {
+fn dispatch_preset(ctx: &mut OwnerDispatchCtx<'_>) -> Option<OwnerReply> {
     if ctx.inner.calibration_busy {
-        return Some(json!({
-            "type":"preset_reject", "name":ctx.value.get("name"), "status":409, "code":"MOTION_BUSY",
-            "error":"MOTION_BUSY", "message":"a camera calibration apply or restore is running", "epoch_id":ctx.epoch,
-        }));
+        return Some(OwnerReply::PresetCalibrationBusy { epoch: ctx.epoch });
     }
     let name = ctx.value.get("name").and_then(Value::as_str).unwrap_or("").to_string();
-    let reply_kind = MotionReplyKind::Preset { name: name.clone() };
     let parsed = match name.as_str() {
         "home" => Ok(req::MotionRequest::home(None)),
         "park" | "unload" => Ok(req::MotionRequest::park()),
-        _ => {
-            let mut j = json!({"target_positions":ctx.value.get("positions")});
-            if let Some(s) = ctx.value.get("speed_scale") { j["speed_scale"] = s.clone(); }
-            parse_motion_command("/api/v1/motion/jog", &j)
-        }
+        _ => (|| -> Result<req::MotionRequest, ApiError> {
+            let speed_scale = crate::motion::num(ctx.value, "speed_scale").map_err(ArmError::from)?;
+            let target = positions(ctx.value.get("positions"))?;
+            Ok(req::MotionRequest::jog(target, None, speed_scale))
+        })(),
     };
     let request = match parsed {
         Ok(r) => r,
-        Err(e) => return Some(format_motion_reject(ctx.inner, &reply_kind, e)),
+        Err(error) => {
+            return Some(OwnerReply::PresetReject {
+                epoch: ctx.inner.safety.epoch_id(),
+                name,
+                error,
+            });
+        }
     };
     match req::preflight_motion_request_at(ctx.inner, ctx.stamp, &request, Some(ctx.epoch), ctx.received_at) {
         Ok(snapshot) => {
+            let reply_kind = MotionReplyKind::Preset { name };
             *ctx.pending_motion = Some(PendingMotion { reply_kind, request, snapshot, epoch: ctx.epoch, generation: ctx.local_generation });
             None
         }
-        Err(e) => Some(format_motion_reject(ctx.inner, &reply_kind, e.into())),
+        Err(e) => Some(OwnerReply::PresetReject {
+            epoch: ctx.inner.safety.epoch_id(),
+            name,
+            error: e.into(),
+        }),
     }
 }
 
-fn dispatch_motion_command(ctx: &mut OwnerDispatchCtx<'_>) -> Option<Value> {
+fn dispatch_motion_command(ctx: &mut OwnerDispatchCtx<'_>) -> Option<OwnerReply> {
     if ctx.path == "/api/v1/mode/gravity_comp" {
         let result = (|| -> Result<Started, ApiError> {
             validate_command_body_common(&ctx.value["body"]).map_err(invalid_command)?;
@@ -167,26 +174,42 @@ fn dispatch_motion_command(ctx: &mut OwnerDispatchCtx<'_>) -> Option<Value> {
             Ok(None)
         })();
         return Some(match result {
-            Ok(started) => command_ack(ctx.inner, &ctx.value["request_id"], started),
-            Err(error) => command_reject(ctx.inner, &ctx.value["request_id"], error),
+            Ok(started) => OwnerReply::CommandAck {
+                snap: AckSnapshot::from_inner(ctx.inner),
+                started,
+            },
+            Err(error) => OwnerReply::CommandReject {
+                epoch: ctx.inner.safety.epoch_id(),
+                error,
+            },
         });
     }
-    let reply_kind = MotionReplyKind::Command { request_id: ctx.value["request_id"].clone() };
     let request = match parse_motion_command(ctx.path, &ctx.value["body"]) {
         Ok(r) => r,
-        Err(e) => return Some(format_motion_reject(ctx.inner, &reply_kind, e)),
+        Err(error) => {
+            return Some(OwnerReply::CommandReject {
+                epoch: ctx.inner.safety.epoch_id(),
+                error,
+            });
+        }
     };
     match req::preflight_motion_request_at(ctx.inner, ctx.stamp, &request, Some(ctx.epoch), ctx.received_at) {
         Ok(snapshot) => {
+            let reply_kind = MotionReplyKind::Command { request_id: ctx.value["request_id"].clone() };
             *ctx.pending_motion = Some(PendingMotion { reply_kind, request, snapshot, epoch: ctx.epoch, generation: ctx.local_generation });
             None
         }
-        Err(e) => Some(format_motion_reject(ctx.inner, &reply_kind, e.into())),
+        Err(e) => Some(OwnerReply::CommandReject {
+            epoch: ctx.inner.safety.epoch_id(),
+            error: e.into(),
+        }),
     }
 }
 
 /// Complete an off-lock jog/home/park/preset preparation and install under a short write lock.
 /// Retries off-lock on `StartDrifted` only (bounded), with zero in-lock planning fallback.
+/// Releases the write guard BEFORE formatting any JSON reply while keeping [`CommandReplyGateGuard`]
+/// active until the caller enqueues the reply on `ordinary_tx` so terminals cannot overtake ACK.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn complete_pending_motion(
     pending: PendingMotion,
@@ -195,8 +218,25 @@ pub(super) async fn complete_pending_motion(
     recv_connection: &str,
     recv_generation: &AtomicU64,
     worker_closing: &Arc<AtomicBool>,
+    command_reply_pending: &Arc<AtomicBool>,
     worker_tasks: &ConnectionTasks,
-) -> Option<Value> {
+) -> Option<(Option<Value>, Option<CommandReplyGateGuard>)> {
+    enum InstallStep {
+        Closed,
+        Detached,
+        LeaseLost { epoch: u64 },
+        Reject { epoch: u64, error: ApiError },
+        Ack { snap: AckSnapshot, started: Started },
+        DeferredParkAck {
+            snap: AckSnapshot,
+            started: Started,
+            action_id: u64,
+            deadline: Instant,
+            notify: Arc<tokio::sync::Notify>,
+        },
+        RetryDrift(req::MotionPlanSnapshot),
+    }
+
     let PendingMotion { reply_kind, request, mut snapshot, epoch, generation } = pending;
     for attempt in 0..MAX_START_DRIFT_RETRIES {
         let snap_for_plan = snapshot.clone();
@@ -216,69 +256,129 @@ pub(super) async fn complete_pending_motion(
             Ok(None) => return None,
             Ok(Some(res)) => res,
             Err(e) => {
-                let inner = recv_supervisor.inner().read().await;
-                return Some(format_motion_reject(&inner, &reply_kind, ArmError::Internal(format!("motion planner failed: {e}")).into()));
+                let epoch_id = recv_supervisor.inner().read().await.safety.epoch_id();
+                let reply = format_motion_reject_at(epoch_id, &reply_kind, ArmError::Internal(format!("motion planner failed: {e}")).into());
+                return Some((Some(reply), None));
             }
         };
 
-        let mut inner = recv_supervisor.inner().write().await;
-        if worker_closing.load(Ordering::SeqCst) { return None; }
-        if inner.detached {
-            let ep = recv_supervisor.hub().latest().map(|s| s.obs.epoch_id);
-            return Some(format_status_reject(&reply_kind, 503, "OWNER_TRANSFERRED", "Ownership transferred to RT executor while planning", ep));
-        }
-        if let Some(hook) = inner.before_install_hook.take() { hook(&mut inner); }
-        if recv_generation.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(recv_connection, generation) {
-            return Some(format_status_reject(&reply_kind, 409, "LEASE_LOST", "This connection lost the lease while planning", Some(inner.safety.epoch_id())));
-        }
-        let plan = match prepared {
-            Ok(p) => p,
-            Err(e) => {
-                if Instant::now() > snapshot.authority.deadline {
-                    return Some(format_motion_reject(&inner, &reply_kind, req::MotionInstallError::DeadlineExpired.into_arm_error(&inner, request.action_kind, Some(epoch)).into()));
+        // Keep per-connection reply gate closed from BEFORE acquiring the install lock until
+        // the caller enqueues the ACK/reply on `ordinary_tx` so no terminal can overtake ACK.
+        let gate = CommandReplyGateGuard::enter(command_reply_pending, recv_supervisor.hub());
+        let step = {
+            let mut inner = recv_supervisor.inner().write().await;
+            if worker_closing.load(Ordering::SeqCst) {
+                InstallStep::Closed
+            } else if inner.detached {
+                InstallStep::Detached
+            } else {
+                if let Some(hook) = inner.before_install_hook.take() { hook(&mut inner); }
+                if recv_generation.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(recv_connection, generation) {
+                    InstallStep::LeaseLost { epoch: inner.safety.epoch_id() }
+                } else {
+                    match prepared {
+                        Err(e) => {
+                            let epoch_id = inner.safety.epoch_id();
+                            let err = if Instant::now() > snapshot.authority.deadline {
+                                req::MotionInstallError::DeadlineExpired.into_arm_error(&inner, request.action_kind, Some(epoch))
+                            } else if let Err(err) = inner.preflight_admission(stamp) {
+                                ArmError::from(err)
+                            } else {
+                                e
+                            };
+                            InstallStep::Reject { epoch: epoch_id, error: err.into() }
+                        }
+                        Ok(plan) => {
+                            let installed = match request.kind {
+                                req::MotionKind::Jog => req::install_jog(&mut inner, stamp, &plan.slot, plan.heap_traj, Some(epoch), false),
+                                req::MotionKind::Home => req::install_home(&mut inner, stamp, &plan.slot, plan.heap_traj, Some(epoch), false),
+                                req::MotionKind::Park => req::install_park(&mut inner, stamp, &plan.slot, plan.heap_traj, Some(epoch), false),
+                            };
+                            match installed {
+                                Ok(req::MotionInstalled::Started { action_id, expected_duration_s, .. }) => {
+                                    InstallStep::Ack {
+                                        snap: AckSnapshot::from_inner(&inner),
+                                        started: Some((action_id, expected_duration_s)),
+                                    }
+                                }
+                                Ok(req::MotionInstalled::DeferredContinuation { action_id, expected_duration_s, .. }) => {
+                                    let notify = Arc::clone(&inner.park_continuation_notify);
+                                    let deadline = inner.park_continuation.map_or(snapshot.authority.deadline, |c| c.deadline);
+                                    InstallStep::DeferredParkAck {
+                                        snap: AckSnapshot::from_inner(&inner),
+                                        started: Some((action_id, expected_duration_s)),
+                                        action_id,
+                                        deadline,
+                                        notify,
+                                    }
+                                }
+                                Err(req::MotionInstallError::StartDrifted) if attempt + 1 < MAX_START_DRIFT_RETRIES => {
+                                    if Instant::now() > snapshot.authority.deadline {
+                                        InstallStep::Reject {
+                                            epoch: inner.safety.epoch_id(),
+                                            error: req::MotionInstallError::DeadlineExpired.into_arm_error(&inner, request.action_kind, Some(epoch)).into(),
+                                        }
+                                    } else if let Some(next) = req::MotionPlanSnapshot::refresh_for_drift_retry(&inner, &snapshot) {
+                                        InstallStep::RetryDrift(next)
+                                    } else {
+                                        InstallStep::Reject {
+                                            epoch: inner.safety.epoch_id(),
+                                            error: req::MotionInstallError::PlanStale.into_arm_error(&inner, request.action_kind, Some(epoch)).into(),
+                                        }
+                                    }
+                                }
+                                Err(err) => InstallStep::Reject {
+                                    epoch: inner.safety.epoch_id(),
+                                    error: err.into_arm_error(&inner, request.action_kind, Some(epoch)).into(),
+                                },
+                            }
+                        }
+                    }
                 }
-                if let Err(err) = inner.preflight_admission(stamp) {
-                    return Some(format_motion_reject(&inner, &reply_kind, ArmError::from(err).into()));
-                }
-                return Some(format_motion_reject(&inner, &reply_kind, e.into()));
             }
         };
-        let installed = match request.kind {
-            req::MotionKind::Jog => req::install_jog(&mut inner, stamp, &plan.slot, plan.heap_traj, Some(epoch), false),
-            req::MotionKind::Home => req::install_home(&mut inner, stamp, &plan.slot, plan.heap_traj, Some(epoch), false),
-            req::MotionKind::Park => req::install_park(&mut inner, stamp, &plan.slot, plan.heap_traj, Some(epoch), false),
-        };
-        match installed {
-            Ok(req::MotionInstalled::Started { action_id, expected_duration_s, .. }) => {
-                return Some(format_motion_ack(&inner, &reply_kind, Some((action_id, expected_duration_s))));
+        // Write guard is now released; build every JSON reply strictly off-lock.
+        match step {
+            InstallStep::Closed => return None,
+            InstallStep::Detached => {
+                drop(gate);
+                let ep = recv_supervisor.hub().latest().map(|s| s.obs.epoch_id);
+                let reply = format_status_reject(&reply_kind, 503, "OWNER_TRANSFERRED", "Ownership transferred to RT executor while planning", ep);
+                return Some((Some(reply), None));
             }
-            Ok(req::MotionInstalled::DeferredContinuation { action_id, expected_duration_s, .. }) => {
-                let notify = Arc::clone(&inner.park_continuation_notify);
-                let deadline = inner.park_continuation.map_or(snapshot.authority.deadline, |c| c.deadline);
-                let ack = format_motion_ack(&inner, &reply_kind, Some((action_id, expected_duration_s)));
-                drop(inner);
+            InstallStep::LeaseLost { epoch: epoch_id } => {
+                drop(gate);
+                let reply = format_status_reject(&reply_kind, 409, "LEASE_LOST", "This connection lost the lease while planning", Some(epoch_id));
+                return Some((Some(reply), None));
+            }
+            InstallStep::Reject { epoch: epoch_id, error } => {
+                drop(gate);
+                let reply = format_motion_reject_at(epoch_id, &reply_kind, error);
+                return Some((Some(reply), None));
+            }
+            InstallStep::Ack { snap, started } => {
+                let ack = format_motion_ack_from_snap(&snap, &reply_kind, started);
+                return Some((Some(ack), Some(gate)));
+            }
+            InstallStep::DeferredParkAck { snap, started, action_id, deadline, notify } => {
                 spawn_park_continuation(
                     action_id, epoch, stamp.stop_gen, deadline, recv_connection.to_string(), notify, recv_supervisor.clone(), worker_closing.clone(), worker_tasks,
                 );
-                return Some(ack);
+                let ack = format_motion_ack_from_snap(&snap, &reply_kind, started);
+                return Some((Some(ack), Some(gate)));
             }
-            Err(req::MotionInstallError::StartDrifted) if attempt + 1 < MAX_START_DRIFT_RETRIES => {
-                if Instant::now() > snapshot.authority.deadline {
-                    return Some(format_motion_reject(&inner, &reply_kind, req::MotionInstallError::DeadlineExpired.into_arm_error(&inner, request.action_kind, Some(epoch)).into()));
-                }
-                let Some(next) = req::MotionPlanSnapshot::refresh_for_drift_retry(&inner, &snapshot) else {
-                    return Some(format_motion_reject(&inner, &reply_kind, req::MotionInstallError::PlanStale.into_arm_error(&inner, request.action_kind, Some(epoch)).into()));
-                };
+            InstallStep::RetryDrift(next) => {
+                drop(gate);
                 snapshot = next;
                 continue;
             }
-            Err(err) => {
-                return Some(format_motion_reject(&inner, &reply_kind, err.into_arm_error(&inner, request.action_kind, Some(epoch)).into()));
-            }
         }
     }
-    let inner = recv_supervisor.inner().read().await;
-    Some(format_motion_reject(&inner, &reply_kind, req::MotionInstallError::PlanStale.into_arm_error(&inner, request.action_kind, Some(epoch)).into()))
+    let (epoch_id, err) = {
+        let inner = recv_supervisor.inner().read().await;
+        (inner.safety.epoch_id(), req::MotionInstallError::PlanStale.into_arm_error(&inner, request.action_kind, Some(epoch)))
+    };
+    Some((Some(format_motion_reject_at(epoch_id, &reply_kind, err.into())), None))
 }
 
 #[allow(clippy::too_many_arguments)]

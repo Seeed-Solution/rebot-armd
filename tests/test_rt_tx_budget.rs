@@ -3862,3 +3862,875 @@ fn slow_cadence_unconfirmed_joint_rotates_both_posvel_and_mit_hold_slots() {
         );
     }
 }
+
+/// Remove every `#[cfg(test)]` item (module, function, or `mod foo;` declaration) from a
+/// comment/literal-stripped Rust source string so static production-code proofs never trip on
+/// unit tests while preserving all non-test production tokens.
+fn strip_cfg_test_items(clean: &str) -> String {
+    let bytes = clean.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len);
+    let mut i = 0usize;
+    while i < len {
+        if bytes[i] == b'#' {
+            // Match `#[cfg(test)]` allowing arbitrary whitespace inside the attribute.
+            let mut j = i + 1;
+            while j < len && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < len && bytes[j] == b'[' {
+                let mut depth = 0usize;
+                let attr_start = j;
+                while j < len {
+                    match bytes[j] {
+                        b'[' => depth += 1,
+                        b']' => {
+                            depth -= 1;
+                            j += 1;
+                            if depth == 0 {
+                                break;
+                            }
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                let attr_compact: String = clean[attr_start..j]
+                    .chars()
+                    .filter(|c| !c.is_ascii_whitespace())
+                    .collect();
+                if attr_compact == "[cfg(test)]" {
+                    // Skip any chained outer attributes (`#[path = "..."]`, `#[allow(...)]`, ...),
+                    // then skip either the item's balanced `{ ... }` block or terminating `;`.
+                    loop {
+                        while j < len && bytes[j].is_ascii_whitespace() {
+                            j += 1;
+                        }
+                        if j < len && bytes[j] == b'#' {
+                            j += 1;
+                            while j < len && bytes[j].is_ascii_whitespace() {
+                                j += 1;
+                            }
+                            if j < len && bytes[j] == b'[' {
+                                let mut ad = 0usize;
+                                while j < len {
+                                    match bytes[j] {
+                                        b'[' => ad += 1,
+                                        b']' => {
+                                            ad -= 1;
+                                            j += 1;
+                                            if ad == 0 {
+                                                break;
+                                            }
+                                            continue;
+                                        }
+                                        _ => {}
+                                    }
+                                    j += 1;
+                                }
+                                continue;
+                            }
+                        }
+                        break;
+                    }
+                    while j < len {
+                        if bytes[j] == b';' {
+                            j += 1;
+                            break;
+                        }
+                        if bytes[j] == b'{' {
+                            let mut bd = 0usize;
+                            while j < len {
+                                match bytes[j] {
+                                    b'{' => bd += 1,
+                                    b'}' => {
+                                        bd -= 1;
+                                        j += 1;
+                                        if bd == 0 {
+                                            break;
+                                        }
+                                        continue;
+                                    }
+                                    _ => {}
+                                }
+                                j += 1;
+                            }
+                            break;
+                        }
+                        j += 1;
+                    }
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        let ch = clean[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Partition `clean` (already comment/literal/test-stripped) around the unique function definition
+/// matching `fn_prefix` (e.g. `"fn emit_pos_force_frame("`) into `(outside_compact, body_compact)`.
+fn partition_unique_fn_compact(clean: &str, fn_prefix: &str) -> (String, String) {
+    let matches: Vec<usize> = clean.match_indices(fn_prefix).map(|(idx, _)| idx).collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "expected exactly one `{fn_prefix}` definition, found {}",
+        matches.len()
+    );
+    let fn_start = matches[0];
+    let body_open = clean[fn_start..]
+        .find('{')
+        .map(|rel| fn_start + rel)
+        .unwrap_or_else(|| panic!("missing opening brace for `{fn_prefix}`"));
+    let mut depth = 0usize;
+    let mut body_end = None;
+    for (rel, ch) in clean[body_open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    body_end = Some(body_open + rel);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let body_end = body_end.unwrap_or_else(|| panic!("missing closing brace for `{fn_prefix}`"));
+    let body = &clean[body_open..=body_end];
+    let outside = format!("{}{}", &clean[..fn_start], &clean[body_end + 1..]);
+    let compact = |s: &str| -> String { s.chars().filter(|c| !c.is_ascii_whitespace()).collect() };
+    (compact(&outside), compact(body))
+}
+
+fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()))
+        .map(|e| e.expect("dir entry").path())
+        .collect();
+    entries.sort();
+    for path in entries {
+        if path.is_dir() {
+            collect_rs_files(&path, out);
+        } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// True iff `compact_lower` (whitespace-stripped, lowercased production source) contains a hex
+/// literal token equal to `hex_token` (e.g. `"0x307"` or `"0x300"`) not extended by another hex
+/// digit (so unrelated CJK codepoints like `0x3005`/`0x3007` are ignored while `0x300`, `0x300u32`,
+/// `0x300+id`, and `0x307` are all caught).
+fn has_hex_literal_token(compact_lower: &str, hex_token: &str) -> bool {
+    let bytes = compact_lower.as_bytes();
+    for (idx, _) in compact_lower.match_indices(hex_token) {
+        let after = idx + hex_token.len();
+        let next_is_hex = bytes.get(after).is_some_and(|b| b.is_ascii_hexdigit());
+        if !next_is_hex {
+            return true;
+        }
+    }
+    false
+}
+
+/// Strip the balanced `{ ... }` bodies (and headers from `fn_prefix`) of every allow-listed
+/// function from `clean` (comment/literal/`#[cfg(test)]`-stripped source), asserting each
+/// allow-listed function exists once, and return `(outside_all_compact, per_fn_body_compact)`.
+fn partition_allowlisted_fns_compact<'a>(
+    clean: &str,
+    allowlist: &[(&'a str, &str)],
+) -> (String, Vec<(&'a str, String)>) {
+    let mut ranges: Vec<(usize, usize, &'a str, String)> = Vec::with_capacity(allowlist.len());
+    let compact = |s: &str| -> String { s.chars().filter(|c| !c.is_ascii_whitespace()).collect() };
+    for &(fn_prefix, _why_safe) in allowlist {
+        let matches: Vec<usize> = clean.match_indices(fn_prefix).map(|(idx, _)| idx).collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected exactly one allow-listed `{fn_prefix}` definition, found {}",
+            matches.len()
+        );
+        let fn_start = matches[0];
+        let body_open = clean[fn_start..]
+            .find('{')
+            .map(|rel| fn_start + rel)
+            .unwrap_or_else(|| panic!("missing opening brace for allow-listed `{fn_prefix}`"));
+        let mut depth = 0usize;
+        let mut body_end = None;
+        for (rel, ch) in clean[body_open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        body_end = Some(body_open + rel);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body_end =
+            body_end.unwrap_or_else(|| panic!("missing closing brace for allow-listed `{fn_prefix}`"));
+        ranges.push((fn_start, body_end, fn_prefix, compact(&clean[body_open..=body_end])));
+    }
+    ranges.sort_by_key(|(start, _, _, _)| *start);
+    let mut outside = String::with_capacity(clean.len());
+    let mut cursor = 0usize;
+    let mut bodies = Vec::with_capacity(ranges.len());
+    for (start, end, name, body) in ranges {
+        assert!(start >= cursor, "overlapping allow-listed function `{name}`");
+        outside.push_str(&clean[cursor..start]);
+        cursor = end + 1;
+        bodies.push((name, body));
+    }
+    outside.push_str(&clean[cursor..]);
+    (compact(&outside), bodies)
+}
+
+#[test]
+fn pos_force_0x307_frame_construction_exists_only_in_single_emitter() {
+    // Self-check: verify multi-line splits, raw 0x307 / 0x300 / CanFrame literals, and unlisted
+    // `emit_pos_force_frame(` callers inside driver.rs are ALL caught, while comments / literals /
+    // `#[cfg(test)]` items are ignored.
+    let synthetic = r#"
+        impl Demo {
+            // damiao::build_pos_force_frame(0x300, 7, 0.0, 0, 0);
+            fn emit_pos_force_frame(&mut self) {
+                let _s = "build_pos_force_frame(0x307)";
+                damiao::
+                    build_pos_force_frame(0x300, 7, 0.0, 0, 0);
+            }
+            fn sneaky_build(&mut self) {
+                build_pos_force_frame
+                    (0x300, 7, 0.0, 0, 0);
+            }
+            fn ok_ret(&self) -> CanFrame {
+                damiao::build_pos_vel_frame(0x100, 1, 0.0, 1.0)
+            }
+            fn sneaky_raw(&mut self) {
+                let _raw = CanFrame { id: 0x307, dlc: 8 };
+                let _ctor = CanFrame::new(0x307, &[]);
+                let _base = 0x300 + 7;
+                self.emit_pos_force_frame();
+            }
+        }
+        #[cfg(test)]
+        mod tests {
+            fn t() { let _ = (0x307, CanFrame { id: 0x300 }, build_pos_force_frame(0x300, 7, 0.0, 0, 0)); }
+        }
+    "#;
+    let syn_prod = strip_cfg_test_items(&strip_rust_comments_and_literals(synthetic));
+    let (syn_out, syn_in) = partition_unique_fn_compact(&syn_prod, "fn emit_pos_force_frame(");
+    assert_eq!(syn_in.matches("build_pos_force_frame(").count(), 1);
+    assert_eq!(
+        syn_out.matches("build_pos_force_frame(").count(),
+        1,
+        "must catch multi-line build_pos_force_frame( outside emitter: {syn_out}"
+    );
+    let syn_out_lower = syn_out.to_ascii_lowercase();
+    assert!(has_hex_literal_token(&syn_out_lower, "0x307"), "must catch raw 0x307 in driver.rs");
+    assert!(has_hex_literal_token(&syn_out_lower, "0x300"), "must catch raw 0x300 in driver.rs");
+    assert!(!has_hex_literal_token("0x3005|0x3007", "0x300"), "must not trip on 0x3005/0x3007 CJK ranges");
+    let count_raw_can_frame_ctors = |compact_src: &str| -> usize {
+        let struct_lits = compact_src
+            .match_indices("CanFrame{")
+            .filter(|&(idx, _)| !compact_src[..idx].ends_with("->"))
+            .count();
+        struct_lits + compact_src.matches("CanFrame::new").count()
+    };
+    assert_eq!(count_raw_can_frame_ctors(&syn_out), 2, "must catch raw CanFrame literal + CanFrame::new (ignoring `-> CanFrame {{`)");
+    assert_eq!(
+        syn_out.matches("emit_pos_force_frame(").count(),
+        1,
+        "must catch unlisted emit_pos_force_frame( caller in driver.rs"
+    );
+
+    let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    collect_rs_files(&src_root, &mut files);
+    assert!(!files.is_empty(), "expected Rust source files under src/");
+
+    let mut total_driver_build_sites = 0usize;
+    let mut total_owner_emit_j7_calls = 0usize;
+
+    for path in &files {
+        let rel = path
+            .strip_prefix(&src_root)
+            .expect("relative under src/")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let raw = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let prod = strip_cfg_test_items(&strip_rust_comments_and_literals(&raw));
+        let compact: String = prod.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+        let compact_lower = compact.to_ascii_lowercase();
+
+        // Raw CAN ID `0x307` is forbidden across ALL production source files, INCLUDING driver.rs
+        // and protocol/damiao.rs.
+        assert!(
+            !has_hex_literal_token(&compact_lower, "0x307"),
+            "production file src/{rel} must not hardcode CAN ID 0x307"
+        );
+
+        if rel == "protocol/damiao.rs" {
+            // `build_pos_force_frame` MUST be `pub(crate)` and require `&crate::driver::PosForceSendToken`
+            // so only private `driver::pos_force_emitter` can invoke it at compile time.
+            assert_eq!(
+                compact.matches("build_pos_force_frame(").count(),
+                1,
+                "src/protocol/damiao.rs must contain only the build_pos_force_frame definition"
+            );
+            assert!(
+                compact.contains("pub(crate)fnbuild_pos_force_frame(_token:&crate::driver::PosForceSendToken,"),
+                "build_pos_force_frame in src/protocol/damiao.rs must be pub(crate) and sealed by &PosForceSendToken"
+            );
+            assert!(
+                !compact.contains("pubfnbuild_pos_force_frame("),
+                "build_pos_force_frame must not be publicly callable without PosForceSendToken"
+            );
+            continue;
+        }
+
+        // Raw base ID `0x300` is forbidden across ALL production source files outside protocol/damiao.rs,
+        // INCLUDING src/driver.rs!
+        assert!(
+            !has_hex_literal_token(&compact_lower, "0x300"),
+            "production file src/{rel} must not hardcode PosForce base CAN ID 0x300"
+        );
+
+        if rel == "driver.rs" {
+            // 1. No raw `CanFrame { ... }` struct literal or `CanFrame::new*` constructor in
+            //    production driver.rs (prevents bypassing `damiao::build_pos_force_frame` with
+            //    hand-built CAN frames).
+            assert_eq!(
+                count_raw_can_frame_ctors(&compact),
+                0,
+                "src/driver.rs must not hand-construct raw CanFrame literals/constructors in production code"
+            );
+
+            // 2a. `build_pos_force_frame(` exists ONLY inside private `pos_force_emitter::build_wire_frame`.
+            let (outside_build, inside_build) =
+                partition_unique_fn_compact(&prod, "fn build_wire_frame(");
+            assert_eq!(
+                inside_build.matches("build_pos_force_frame(").count(),
+                1,
+                "pos_force_emitter::build_wire_frame must contain EXACTLY ONE build_pos_force_frame( call"
+            );
+            assert_eq!(
+                outside_build.matches("build_pos_force_frame(").count(),
+                0,
+                "src/driver.rs must have ZERO build_pos_force_frame( calls outside pos_force_emitter::build_wire_frame"
+            );
+            total_driver_build_sites += inside_build.matches("build_pos_force_frame(").count();
+
+            // 2b. `PosForceSendToken(` is defined and constructed ONLY inside private `mod pos_force_emitter`
+            //     (`struct PosForceSendToken(())` + `PosForceSendToken(())` inside `fn send_frame(`).
+            let (outside_send_frame, inside_send_frame) =
+                partition_unique_fn_compact(&prod, "fn send_frame<");
+            assert_eq!(
+                inside_send_frame.matches("PosForceSendToken(").count(),
+                1,
+                "pos_force_emitter::send_frame must construct PosForceSendToken(()) once"
+            );
+            assert_eq!(
+                outside_send_frame.matches("PosForceSendToken(").count(),
+                1,
+                "outside send_frame, only `struct PosForceSendToken(())` may contain `PosForceSendToken(`"
+            );
+            assert!(
+                outside_send_frame.contains("pub(crate)structPosForceSendToken(())"),
+                "PosForceSendToken must be a private-field tuple struct inside private mod pos_force_emitter"
+            );
+            assert!(
+                !compact.contains("pubmodpos_force_emitter"),
+                "mod pos_force_emitter must remain private"
+            );
+
+            // 3. Explicit allow-list for EVERY `POS_FORCE_BASE_ID` reference in production driver.rs:
+            //    all non-emitter sites are strictly read-only CAN ID predicates or key lookups.
+            const POS_FORCE_BASE_ID_ALLOWLIST: &[(&str, &str)] = &[
+                (
+                    "fn build_wire_frame(",
+                    "Sole production constructor inside private mod pos_force_emitter calling damiao::build_pos_force_frame",
+                ),
+                (
+                    "fn frame_pos_force_joint(",
+                    "Read-only CAN ID predicate used by DamiaoArmDriver::send submission guard",
+                ),
+                (
+                    "fn is_pos_force_freeze_frame(",
+                    "Read-only bit-for-bit freeze payload predicate (constructs no frame)",
+                ),
+                (
+                    "fn validate_pos_force_target_static(",
+                    "Pure static validation returning expected CAN ID (constructs no frame)",
+                ),
+                (
+                    "fn process_rx_frame(",
+                    "Read-only SocketCAN local-echo RX filter (drops echoed 0x300+id TX frames)",
+                ),
+                (
+                    "fn receive_feedback(",
+                    "Read-only last_target_frames CAN ID match for standalone recovery speed lookup",
+                ),
+            ];
+            let (outside_base_id, _) =
+                partition_allowlisted_fns_compact(&prod, POS_FORCE_BASE_ID_ALLOWLIST);
+            assert_eq!(
+                outside_base_id.matches("POS_FORCE_BASE_ID").count(),
+                0,
+                "src/driver.rs references POS_FORCE_BASE_ID outside its explicit allow-list"
+            );
+
+            // 4. Secondary text check on EVERY caller of `pos_force_emitter::send_frame` and the
+            //    narrow `pos_force_emitter::emit_*` APIs in production driver.rs.
+            const NARROW_EMITTER_CALLERS: &[(&str, &str, &str)] = &[
+                (
+                    "fn finish_pos_force_readback(",
+                    "pos_force_emitter::emit_pre_enable_hold(",
+                    "Pre-enable stationary hold during torque-on handshake right after CTRL_MODE readback while motor is still disabled (allow_freeze = false)",
+                ),
+                (
+                    "fn write_modes_send(",
+                    "pos_force_emitter::emit_mode_switch_hold(",
+                    "Immediate hold frame directly following a CTRL_MODE register switch (allow_freeze = false)",
+                ),
+                (
+                    "fn write_modes_confirmed(",
+                    "pos_force_emitter::emit_mode_switch_hold(",
+                    "Immediate hold frame directly following a confirmed CTRL_MODE register switch (allow_freeze = false)",
+                ),
+                (
+                    "fn receive_feedback(",
+                    "pos_force_emitter::emit_standalone_recovery_hold(",
+                    "Standalone-driver recovery only (refuses with BuildRefused whenever external_pos_force_emitter == true; allow_freeze = false)",
+                ),
+            ];
+            let narrow_allowlist: Vec<(&str, &str)> = NARROW_EMITTER_CALLERS
+                .iter()
+                .map(|&(fn_sig, _, why)| (fn_sig, why))
+                .collect();
+            let (outside_narrow, narrow_bodies) =
+                partition_allowlisted_fns_compact(&prod, &narrow_allowlist);
+            for &(_, api, _) in NARROW_EMITTER_CALLERS {
+                assert_eq!(
+                    outside_narrow.matches(api).count(),
+                    0,
+                    "src/driver.rs calls {api} outside its explicit allow-list"
+                );
+            }
+            for (fn_name, body) in &narrow_bodies {
+                let &(_, api, _) = NARROW_EMITTER_CALLERS
+                    .iter()
+                    .find(|&&(sig, _, _)| sig == *fn_name)
+                    .unwrap_or_else(|| panic!("unexpected narrow allow-list entry {fn_name}"));
+                assert_eq!(
+                    body.matches(api).count(),
+                    1,
+                    "allow-listed {fn_name} expected exactly 1 {api} call"
+                );
+            }
+            // Partition `DamiaoArmDriver` vs the rest of `driver.rs` (trait default methods and
+            // other arm drivers) so `EMIT_TICK_ALLOWLIST` matches Damiao's unique trait impls and
+            // proves ZERO `pos_force_emitter::` calls exist anywhere outside Damiao.
+            let dm_impl_start = prod
+                .find("impl<C: CanTransport> DamiaoArmDriver<C>")
+                .expect("DamiaoArmDriver impl block");
+            let rs_impl_start = prod
+                .find("pub struct RobStrideArmDriver")
+                .expect("RobStrideArmDriver struct");
+            assert!(dm_impl_start < rs_impl_start);
+            let outside_dm_compact: String = format!("{}{}", &prod[..dm_impl_start], &prod[rs_impl_start..])
+                .chars()
+                .filter(|c| !c.is_ascii_whitespace())
+                .collect();
+            assert_eq!(
+                outside_dm_compact.matches("pos_force_emitter::").count(),
+                0,
+                "src/driver.rs must have ZERO pos_force_emitter:: calls outside DamiaoArmDriver"
+            );
+            let dm_prod = &prod[dm_impl_start..rs_impl_start];
+            const EMIT_TICK_ALLOWLIST: &[(&str, &str)] = &[
+                (
+                    "fn emit_pos_force_j7(",
+                    "ArmDriver trait entrypoint called once per tick from SupervisorInner tick epilogue (Legacy & RT Executor)",
+                ),
+                (
+                    "fn write_estop_hold_bounded(",
+                    "Direct-driver fallback when external_pos_force_emitter == false (returns early when true)",
+                ),
+                (
+                    "fn write_joint_targets_bounded(",
+                    "Direct-driver fallback when external_pos_force_emitter == false (returns early when true)",
+                ),
+                (
+                    "fn drain_pending_tx(",
+                    "Direct-driver fallback when external_pos_force_emitter == false (returns early when true)",
+                ),
+            ];
+            let (outside_emit_tick, emit_tick_bodies) =
+                partition_allowlisted_fns_compact(dm_prod, EMIT_TICK_ALLOWLIST);
+            assert_eq!(
+                outside_emit_tick.matches("pos_force_emitter::emit_tick(").count(),
+                0,
+                "src/driver.rs calls pos_force_emitter::emit_tick( outside its explicit allow-list"
+            );
+            for (fn_name, body) in emit_tick_bodies {
+                assert!(
+                    body.matches("pos_force_emitter::emit_tick(").count() >= 1,
+                    "allow-listed {fn_name} expected at least 1 pos_force_emitter::emit_tick( call"
+                );
+            }
+            continue;
+        }
+
+        // Every other production source file in src/: ZERO POS_FORCE_BASE_ID / build_pos_force_frame.
+        assert_eq!(
+            compact.matches("build_pos_force_frame(").count(),
+            0,
+            "production file src/{rel} must not call build_pos_force_frame("
+        );
+        assert_eq!(
+            compact.matches("POS_FORCE_BASE_ID").count(),
+            0,
+            "production file src/{rel} must not reference POS_FORCE_BASE_ID"
+        );
+
+        // Outside driver.rs and joint_zero.rs (trait + zero-offset wrapper), `emit_pos_force_j7(`
+        // may be invoked ONLY inside `SupervisorInner::emit_and_merge_pos_force_j7` in supervisor.rs,
+        // which itself is called ONLY from `emit_j7_tick_epilogue`, which is called ONLY once in
+        // `tick_control_inner` (shared by BOTH Legacy and RT Executor owners).
+        if rel == "supervisor.rs" {
+            let (outside_merge, inside_merge) =
+                partition_unique_fn_compact(&prod, "fn emit_and_merge_pos_force_j7(");
+            assert_eq!(
+                inside_merge.matches("emit_pos_force_j7(").count(),
+                1,
+                "SupervisorInner::emit_and_merge_pos_force_j7 must call emit_pos_force_j7( once"
+            );
+            assert_eq!(
+                outside_merge.matches("emit_pos_force_j7(").count(),
+                0,
+                "src/supervisor.rs must have ZERO emit_pos_force_j7( calls outside emit_and_merge_pos_force_j7"
+            );
+            total_owner_emit_j7_calls += inside_merge.matches("emit_pos_force_j7(").count();
+
+            let (outside_epilogue, inside_epilogue) =
+                partition_unique_fn_compact(&prod, "fn emit_j7_tick_epilogue(");
+            assert_eq!(
+                inside_epilogue.matches("emit_and_merge_pos_force_j7(").count(),
+                1,
+                "emit_j7_tick_epilogue must call emit_and_merge_pos_force_j7( once"
+            );
+            // Outside `emit_j7_tick_epilogue`, only the definition `fn emit_and_merge_pos_force_j7(` exists.
+            assert_eq!(
+                outside_epilogue.matches("emit_and_merge_pos_force_j7(").count(),
+                1,
+                "emit_and_merge_pos_force_j7 must have no callers outside emit_j7_tick_epilogue"
+            );
+
+            let (outside_tick, inside_tick) =
+                partition_unique_fn_compact(&prod, "fn tick_control_inner(");
+            assert_eq!(
+                inside_tick.matches("emit_j7_tick_epilogue(").count(),
+                1,
+                "tick_control_inner must call emit_j7_tick_epilogue( exactly once"
+            );
+            // Outside `tick_control_inner`, only the definition `fn emit_j7_tick_epilogue(` exists.
+            assert_eq!(
+                outside_tick.matches("emit_j7_tick_epilogue(").count(),
+                1,
+                "emit_j7_tick_epilogue must have no callers outside tick_control_inner"
+            );
+        } else if rel != "joint_zero.rs" {
+            assert_eq!(
+                compact.matches("emit_pos_force_j7(").count(),
+                0,
+                "production file src/{rel} must not call emit_pos_force_j7("
+            );
+            assert_eq!(
+                compact.matches("emit_and_merge_pos_force_j7(").count(),
+                0,
+                "production file src/{rel} must not call emit_and_merge_pos_force_j7("
+            );
+        }
+    }
+
+    assert_eq!(
+        total_driver_build_sites, 1,
+        "expected exactly 1 production build_pos_force_frame call site across src/"
+    );
+    assert_eq!(
+        total_owner_emit_j7_calls, 1,
+        "expected exactly 1 owner-side emit_pos_force_j7 call site across src/"
+    );
+}
+
+/// Round 7 M2 regression: under tight per-tick budgets (`max_frames = 1, 2, 3`), J1–J6 stopped
+/// hold frames ALWAYS take strict priority over J7 `0xCC` refresh and J7 `0x307` freeze/hold; J7
+/// is served only after all due J1–J6 holds have been queued/sent and remaining capacity allows.
+#[test]
+fn j1_j6_stopped_holds_prioritized_over_j7_under_tight_budget_1_2_3() {
+    let pf_cfg = armd::driver::GripperPosForce {
+        joint: 6,
+        current_raw: 460,
+        close_speed_rad_s: 0.30,
+        closed_rad: 0.0,
+        open_rad: -5.7,
+        calibrated: false,
+        ceiling_torque_nm: None,
+        torque_reference: None,
+    };
+
+    // Part A: 7-motor arm (6 arm joints + PosForce J7), J7 stale (> 100 ms, refresh pending) while
+    // J1–J6 stay fresh. Under max_frames = 1, 2, 3 across 12 consecutive stopped-hold ticks:
+    // - EVERY tick transmits exact `max_frames` J1–J6 arm holds (0 starvation ticks!);
+    // - Round-robin services all 6 arm joints J1–J6;
+    // - Neither J7 0xCC refresh nor J7 0x307 freeze steals a slot while J1–J6 holds remain due.
+    for max_frames in [1usize, 2, 3] {
+        let (bus, clock) = VirtualBus::new(&b601_limits());
+        let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(b601_limits())
+            .unwrap()
+            .with_gripper_pos_force(pf_cfg.clone())
+            .unwrap();
+        d.read_joint_states().unwrap();
+        bus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+        d.check_mapping_ranges();
+        d.set_torque(true).unwrap();
+        bus.with(|s| {
+            s.rx.clear();
+            s.push_all_feedback();
+        });
+        d.read_joint_states().unwrap();
+
+        // First issue one motion pass so all 7 joints (J1-J6 + J7) are executing motion (`vel > 0`).
+        d.begin_tx_tick();
+        assert_eq!(d.write_joint_targets_bounded(&targets_const(0.2)).unwrap(), TxBatchOutcome::Complete);
+        clock.advance(ms(20));
+        bus.with(|s| {
+            s.rx.clear();
+            s.push_all_feedback();
+        });
+        d.read_joint_states().unwrap();
+
+        // Make J7 stale (> 100 ms) so both J7 freeze (Class 1 -> Class 3) AND 0xCC refresh (Class 4)
+        // want slots, then tighten budget to `max_frames` ∈ {1, 2, 3}.
+        clock.advance(ms(115));
+        bus.with(|s| {
+            s.rx.clear();
+            for i in 0..6 {
+                s.push_feedback(i);
+            }
+        });
+        d.read_joint_states().unwrap();
+        assert!(!d.pos_force_feedback_fresh(), "J7 must be stale");
+
+        d.set_tx_budget(TxBudget {
+            max_frames,
+            max_duration: ms(10),
+            frame_max_age: ms(45),
+        });
+
+        let bound_ticks = 7usize.div_ceil(max_frames);
+        let mut seen_arm_ids = std::collections::BTreeSet::new();
+        let mut j7_freeze_first_tick: Option<usize> = None;
+        let mut total_j7_freezes = 0usize;
+        for tick in 1..=14 {
+            clock.advance(ms(20));
+            bus.with(|s| {
+                s.rx.clear();
+                for i in 0..6 {
+                    s.push_feedback(i);
+                }
+                s.tx_log.clear();
+                s.tx_accepted.clear();
+            });
+            d.read_joint_states().unwrap();
+            let out = d.write_estop_hold_bounded(&targets_const(0.0)).unwrap();
+            assert!(
+                matches!(out, TxBatchOutcome::Deferred { .. } | TxBatchOutcome::Expired { .. }),
+                "max_frames={max_frames} tick={tick}: 7 joints cannot complete in {max_frames} frames: {out:?}"
+            );
+            let tx = bus.with(|s| s.tx_accepted.clone());
+            let arm_holds: Vec<u32> = tx
+                .iter()
+                .filter(|f| (0x101..=0x106).contains(&f.id))
+                .map(|f| f.id)
+                .collect();
+            let j7_frames: Vec<_> = tx.iter().filter(|f| f.id == 0x307).collect();
+            let j7_refresh: Vec<_> = tx
+                .iter()
+                .filter(|f| f.id == 0x7FF && f.data[0] == 7 && f.data[2] == 0xCC)
+                .collect();
+            assert_eq!(
+                arm_holds.len() + j7_frames.len(),
+                max_frames,
+                "max_frames={max_frames} tick={tick}: Class 1/3 holds+freeze must fill all {max_frames} slots: tx={tx:?}"
+            );
+            assert!(
+                j7_refresh.is_empty(),
+                "max_frames={max_frames} tick={tick}: Class-4 0xCC refresh must not steal slot from Class 1/3: tx={tx:?}"
+            );
+            for id in arm_holds {
+                seen_arm_ids.insert(id);
+            }
+            if !j7_frames.is_empty() {
+                assert_eq!(u16::from_le_bytes([j7_frames[0].data[4], j7_frames[0].data[5]]), 0);
+                j7_freeze_first_tick.get_or_insert(tick);
+                total_j7_freezes += 1;
+            }
+        }
+        assert_eq!(
+            seen_arm_ids,
+            (0x101u32..=0x106).collect(),
+            "max_frames={max_frames}: all 6 arm joints J1-J6 must receive holds via round-robin"
+        );
+        assert!(
+            j7_freeze_first_tick.is_some_and(|t| t <= bound_ticks),
+            "max_frames={max_frames}: J7 Class-1 freeze must transmit within ceil(7/{max_frames})={bound_ticks} ticks, got {j7_freeze_first_tick:?}"
+        );
+        assert!(
+            total_j7_freezes >= 2,
+            "max_frames={max_frames}: J7 must also rotate fairly in Class 3 across 14 ticks, got {total_j7_freezes}"
+        );
+
+        // Part B1: Once capacity allows on the same driver (max_frames = 7 -> 6 arm holds + 1 J7 freeze;
+        // max_frames = 8 -> 6 arm holds + 1 J7 freeze + 1 J7 0xCC refresh), all 6 arm holds transmit
+        // FIRST, then J7 freeze, then 0xCC refresh!
+        for (budget, expect_refresh) in [(7usize, false), (8usize, true)] {
+            d.set_tx_budget(TxBudget {
+                max_frames: budget,
+                max_duration: ms(10),
+                frame_max_age: ms(45),
+            });
+            clock.advance(ms(20));
+            bus.with(|s| {
+                s.rx.clear();
+                for i in 0..6 {
+                    s.push_feedback(i);
+                }
+                s.tx_log.clear();
+                s.tx_accepted.clear();
+            });
+            d.read_joint_states().unwrap();
+            let out = d.write_estop_hold_bounded(&targets_const(0.0)).unwrap();
+            assert!(
+                matches!(out, TxBatchOutcome::Complete | TxBatchOutcome::Expired { pending: 0, .. }),
+                "budget={budget}: all 6 arm holds + J7 freeze must drain with pending=0, got {out:?}"
+            );
+            let tx = bus.with(|s| s.tx_accepted.clone());
+            let arm_indices: Vec<usize> = tx
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| (0x101..=0x106).contains(&f.id))
+                .map(|(idx, _)| idx)
+                .collect();
+            let j7_idx = tx
+                .iter()
+                .position(|f| f.id == 0x307)
+                .unwrap_or_else(|| panic!("budget={budget}: expected J7 freeze once capacity allows: {tx:?}"));
+            assert_eq!(arm_indices.len(), 6, "budget={budget}: all 6 arm holds must send: {tx:?}");
+            assert!(
+                arm_indices.iter().all(|&i| i < j7_idx),
+                "budget={budget}: all 6 arm holds must precede J7 freeze: {tx:?}"
+            );
+            assert_eq!(u16::from_le_bytes([tx[j7_idx].data[4], tx[j7_idx].data[5]]), 0);
+            let refresh_idx = tx
+                .iter()
+                .position(|f| f.id == 0x7FF && f.data[0] == 7 && f.data[2] == 0xCC);
+            if expect_refresh {
+                let r_idx = refresh_idx.unwrap_or_else(|| panic!("budget={budget}: expected 0xCC refresh after J7 freeze: {tx:?}"));
+                assert!(r_idx > j7_idx, "budget={budget}: 0xCC refresh must follow J7 freeze: {tx:?}");
+            } else {
+                assert!(refresh_idx.is_none(), "budget={budget}: 0xCC must not steal slot from 6 arm holds + J7 freeze: {tx:?}");
+            }
+        }
+    }
+
+    // Part B2: With max_frames = 2 on a 1-arm + J7 bus (or max_frames = 3 on a 2-arm + J7 bus),
+    // all due arm holds transmit FIRST and J7 freeze takes the remaining slot (0xCC does not steal
+    // J7's freeze slot)!
+    for (max_frames, arm_count) in [(2usize, 1usize), (3usize, 2usize)] {
+        let mut motor_ids: Vec<u16> = (1..=arm_count as u16).collect();
+        motor_ids.push(7);
+        let mut lims: Vec<DamiaoLimits> = b601_limits()[..arm_count].to_vec();
+        lims.push(b601_limits()[6]);
+        let mut sub_pf = pf_cfg.clone();
+        sub_pf.joint = arm_count;
+
+        let (bus, clock) = VirtualBus::new(&lims);
+        // Set the gripper motor's ID in VirtualBus to 7 so 0x307 matches cleanly.
+        bus.with(|s| {
+            s.motors[arm_count].0 = 7;
+        });
+        let mut d = DamiaoArmDriver::new(bus.clone(), motor_ids)
+            .with_joint_limits(lims)
+            .unwrap()
+            .with_gripper_pos_force(sub_pf)
+            .unwrap();
+        d.read_joint_states().unwrap();
+        bus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+        d.check_mapping_ranges();
+        d.set_torque(true).unwrap();
+        bus.with(|s| {
+            s.rx.clear();
+            s.push_all_feedback();
+        });
+        d.read_joint_states().unwrap();
+
+        // Age J7 past 100 ms while keeping all arm joints fresh (with fresh empty-queue bound).
+        clock.advance(ms(115));
+        bus.with(|s| s.rx.clear());
+        d.read_joint_states().unwrap();
+        bus.with(|s| {
+            for i in 0..arm_count {
+                s.push_feedback(i);
+            }
+        });
+        d.set_tx_budget(TxBudget {
+            max_frames,
+            max_duration: ms(10),
+            frame_max_age: ms(45),
+        });
+        bus.with(|s| {
+            s.tx_log.clear();
+            s.tx_accepted.clear();
+        });
+        d.read_joint_states().unwrap();
+        let hold_tgts = vec![JointTarget::position(0.0); arm_count + 1];
+        let out = d.write_estop_hold_bounded(&hold_tgts).unwrap();
+        assert_eq!(out, TxBatchOutcome::Complete);
+        let tx = bus.with(|s| s.tx_accepted.clone());
+        let arm_indices: Vec<usize> = tx
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| (0x101..=0x106).contains(&f.id))
+            .map(|(idx, _)| idx)
+            .collect();
+        let j7_idx = tx
+            .iter()
+            .position(|f| f.id == 0x307)
+            .unwrap_or_else(|| panic!("max_frames={max_frames}: expected J7 freeze in spare slot: {tx:?}"));
+        assert_eq!(arm_indices.len(), arm_count, "expected {arm_count} arm holds: {tx:?}");
+        assert!(
+            arm_indices.iter().all(|&i| i < j7_idx),
+            "due arm holds must precede J7 freeze in spare slot: {tx:?}"
+        );
+        assert_eq!(u16::from_le_bytes([tx[j7_idx].data[4], tx[j7_idx].data[5]]), 0);
+        assert!(
+            !tx.iter().any(|f| f.id == 0x7FF && f.data[0] == 7 && f.data[2] == 0xCC),
+            "0xCC refresh must not steal the J7 freeze slot when budget equals arm_count + 1: {tx:?}"
+        );
+    }
+}
