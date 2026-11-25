@@ -31,7 +31,7 @@ use super::urgent::{
     UrgentStopError, UrgentStopOutcome, URGENT_STOP_CAPACITY,
 };
 use crate::diagnostics::tick::{
-    LockPhases, ThreadUsage, TickSample, UsageMark, RELEASE_FLAG_CLEAR_OK,
+    LockPhases, ReleasePhasesUs, ThreadUsage, TickSample, UsageMark, RELEASE_FLAG_CLEAR_OK,
     RELEASE_FLAG_CLEAR_REFUSED, RELEASE_FLAG_ESTOP_APPLIED, RELEASE_FLAG_INJECT_ALLOC,
     RELEASE_FLAG_SAFETY_LATCH, RELEASE_FLAG_THERMAL_TRIP, RELEASE_FLAG_WATCHDOG_LATCH,
 };
@@ -1472,6 +1472,8 @@ pub struct PersistTestHooks {
     pub panic_on_release: Option<u64>,
     /// Forces `armd-control` init to fail (`Some(true)` returns `real`; `Some(false)` drops `real`).
     pub fail_init: Option<bool>,
+    /// Simulates `armd-control` thread spawn failure before ownership is sent to the thread.
+    pub fail_control_spawn: bool,
     /// Injects a one-shot sleep inside the next release body (tests overrun + `skipped_releases`).
     pub release_delay_once: Option<Arc<Mutex<Option<Duration>>>>,
     /// Injects a one-shot sleep strictly AFTER StateHub publication, `tick_us` end mark,
@@ -1670,11 +1672,22 @@ enum OffloadReclaim {
 /// linearization against [`ConnLifecycleClient`], and reply/terminal reclamation (even after
 /// caller disconnect or cancellation). Never touched by `armd-control`.
 ///
-/// Strict acyclic lock order: `BrokerDispatcher::state` -> `ConnLifecycleClient::inner` -> `broker` -> `reply_router`.
+/// Strict acyclic lock order:
+/// `SerialDrainGate` (0) -> `BrokerDispatcher::state` (1) -> `ConnLifecycleClient::inner` (2) -> `broker` (3) -> `reply_router` (4).
+/// `BrokerDispatcher::state` serializes every `submit_*` and `disconnect_*` mutation against
+/// `ConnLifecycleClient`, preventing TOCTOU admission races with connection teardown.
 pub(crate) struct BrokerDispatcher {
+    drain_gate: super::reply_router::SerialDrainGate,
     broker: Arc<Mutex<Broker<PlanSlot>>>,
     conn_lifecycle: Arc<super::requests::lease::ConnLifecycleClient>,
     reply_router: Arc<Mutex<ActionReplyRouter>>,
+    hub: Arc<StateHub>,
+    terminal_capture_drain: Option<(
+        Arc<crate::supervisor::terminal_capture::TerminalCaptureChannel>,
+        Arc<crate::supervisor::TerminalBroadcaster>,
+        Arc<crate::model::ArmObservation>,
+    )>,
+    broker_discarded: AtomicBool,
     state: Mutex<BrokerDispatcherState>,
 }
 
@@ -1712,12 +1725,22 @@ impl BrokerDispatcher {
         broker: Arc<Mutex<Broker<PlanSlot>>>,
         conn_lifecycle: Arc<super::requests::lease::ConnLifecycleClient>,
         reply_router: Arc<Mutex<ActionReplyRouter>>,
+        hub: Arc<StateHub>,
+        terminal_capture_drain: Option<(
+            Arc<crate::supervisor::terminal_capture::TerminalCaptureChannel>,
+            Arc<crate::supervisor::TerminalBroadcaster>,
+            Arc<crate::model::ArmObservation>,
+        )>,
         exited: Arc<AtomicBool>,
     ) -> Self {
         Self {
+            drain_gate: super::reply_router::SerialDrainGate::new(),
             broker,
             conn_lifecycle,
             reply_router,
+            hub,
+            terminal_capture_drain,
+            broker_discarded: AtomicBool::new(false),
             state: Mutex::new(BrokerDispatcherState {
                 managed: HashMap::with_capacity(super::broker::REPLY_CAPACITY),
                 draining_disconnected: false,
@@ -1806,6 +1829,234 @@ impl BrokerDispatcher {
         Ok((ack_rx, term_rx))
     }
 
+    /// Atomically verifies connection liveness, resolves the bound destination, reserves bounded
+    /// reply capacity, submits an external action (`BeginMacro` or `InstallPrepared`), and binds
+    /// `RequestId -> ReplyTarget` with an RAII [`AckCommitGuard`].
+    #[allow(clippy::too_many_arguments)]
+    fn submit_external_action<'a>(
+        &self,
+        client: super::broker::ClientId,
+        client_seq: u64,
+        authority: super::broker::Authority,
+        deadline: Instant,
+        sub: super::requests::actions::ActionSubmit<'a, PlanSlot>,
+        policy: ExternalDestinationPolicy,
+        require_ack_commit: bool,
+        wire_tracker: Option<Arc<WsWireAckTracker>>,
+    ) -> Result<
+        (
+            super::broker::RequestId,
+            tokio::sync::oneshot::Receiver<Result<super::broker::Reply, OwnerError>>,
+            AckCommitGuard,
+        ),
+        ExternalSubmitError,
+    > {
+        if !sub.starts_action() {
+            return Err(ExternalSubmitError::NotAnExternalAction);
+        }
+        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.exited.load(Ordering::Acquire) {
+            return Err(ExternalSubmitError::Stopped);
+        }
+        if (client.0 == 0 && policy == ExternalDestinationPolicy::ConnectionOnly)
+            || (client.0 != 0 && !self.conn_lifecycle.is_slot_open(client.0))
+        {
+            return Err(ExternalSubmitError::Admit(
+                super::broker::AdmitError::Disconnected,
+            ));
+        }
+        let mut broker = self.broker.lock().unwrap_or_else(|e| e.into_inner());
+        broker.reclaim_plans();
+        let mut router = self.reply_router.lock().unwrap_or_else(|e| e.into_inner());
+        let target = router.check_external_admission(client, policy)?;
+        let req_id = broker
+            .submit(
+                client,
+                client_seq,
+                authority,
+                deadline,
+                super::broker::Submit::Action(sub),
+            )
+            .map_err(ExternalSubmitError::Admit)?;
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        router.commit_external_route(
+            req_id,
+            client,
+            target,
+            ack_tx,
+            require_ack_commit,
+            wire_tracker.clone(),
+        );
+        let guard = AckCommitGuard::new(
+            Arc::clone(&self.reply_router),
+            req_id,
+            wire_tracker,
+            require_ack_commit,
+        );
+        Ok((req_id, ack_rx, guard))
+    }
+
+    /// Submits an internal non-action macro RPC (`InstallChild` or `FinishMacro`) under the
+    /// unified lock order and registers its private ACK waiter in `internal_waiters`.
+    /// Rejects `starts_action()` commands (`BeginMacro`, `InstallPrepared`) fail-closed.
+    fn submit_internal_action<'a>(
+        &self,
+        client: super::broker::ClientId,
+        client_seq: u64,
+        authority: super::broker::Authority,
+        deadline: Instant,
+        sub: super::requests::actions::ActionSubmit<'a, PlanSlot>,
+    ) -> Result<
+        (
+            super::broker::RequestId,
+            tokio::sync::oneshot::Receiver<super::broker::Reply>,
+        ),
+        super::broker::AdmitError,
+    > {
+        if sub.starts_action() {
+            return Err(super::broker::AdmitError::RepliesFull);
+        }
+        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.exited.load(Ordering::Acquire) {
+            return Err(super::broker::AdmitError::Disconnected);
+        }
+        if client.0 != 0 && !self.conn_lifecycle.is_slot_open(client.0) {
+            return Err(super::broker::AdmitError::Disconnected);
+        }
+        let mut broker = self.broker.lock().unwrap_or_else(|e| e.into_inner());
+        broker.reclaim_plans();
+        let req_id = broker.submit(
+            client,
+            client_seq,
+            authority,
+            deadline,
+            super::broker::Submit::Action(sub),
+        )?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.reply_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .register_internal_waiter(req_id, client, tx);
+        Ok((req_id, rx))
+    }
+
+    fn cancel_internal_waiter(&self, req_id: super::broker::RequestId) {
+        self.reply_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .cancel_internal_waiter(req_id);
+    }
+
+    fn register_connection_reply_sink(
+        &self,
+        client: super::broker::ClientId,
+        sink: Arc<ConnectionReplySink>,
+        per_conn_cap: Option<usize>,
+    ) -> Result<super::reply_router::ConnectionSlotToken, super::broker::AdmitError> {
+        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.exited.load(Ordering::Acquire) {
+            return Err(super::broker::AdmitError::Disconnected);
+        }
+        if client.0 == 0 || !self.conn_lifecycle.is_slot_open(client.0) {
+            return Err(super::broker::AdmitError::Disconnected);
+        }
+        self.reply_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .register_connection(client, sink, per_conn_cap)
+    }
+
+    fn seed_connection_reply_sinks(
+        &self,
+        sinks: impl IntoIterator<Item = (u64, Arc<ConnectionReplySink>)>,
+    ) {
+        let _st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut router = self.reply_router.lock().unwrap_or_else(|e| e.into_inner());
+        for (conn_id, sink) in sinks {
+            if conn_id != 0 && self.conn_lifecycle.is_slot_open(conn_id) {
+                let _ = router.register_connection(ClientId(conn_id), sink, None);
+            }
+        }
+    }
+
+    async fn open_connection_with_reply_sink(
+        self: &Arc<Self>,
+        conn_id: u64,
+        sink: Arc<ConnectionReplySink>,
+    ) -> Result<Result<(), &'static str>, super::requests::lease::ConnLifecycleError> {
+        struct OpenRollbackGuard {
+            dispatcher: Arc<BrokerDispatcher>,
+            conn_id: u64,
+            token: Option<super::reply_router::ConnectionSlotToken>,
+            committed: bool,
+        }
+        impl Drop for OpenRollbackGuard {
+            fn drop(&mut self) {
+                if !self.committed {
+                    if let Some(tok) = self.token.take() {
+                        let _st = self
+                            .dispatcher
+                            .state
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        self.dispatcher
+                            .reply_router
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .rollback_unopened_connection(tok);
+                    }
+                    if let Some(conn) =
+                        super::requests::lease::ConnectionHandle::from_ws_id(self.conn_id)
+                    {
+                        self.dispatcher.enqueue_disconnect_detached(conn);
+                    }
+                }
+            }
+        }
+
+        let (rx, token) = {
+            let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if st.exited.load(Ordering::Acquire) {
+                return Err(super::requests::lease::ConnLifecycleError::Stopped);
+            }
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            // Lock order: state (1) -> conn_lifecycle (2) -> reply_router (4).
+            self.conn_lifecycle.enqueue_open_oneshot(conn_id, tx)?;
+            let tok = match self
+                .reply_router
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .register_connection(ClientId(conn_id), sink, None)
+            {
+                Ok(t) => t,
+                Err(_) => {
+                    if let Some(conn) =
+                        super::requests::lease::ConnectionHandle::from_ws_id(conn_id)
+                    {
+                        self.conn_lifecycle.enqueue_disconnect_detached(conn);
+                    }
+                    return Err(super::requests::lease::ConnLifecycleError::TooManyConnections);
+                }
+            };
+            (rx, tok)
+        };
+        let mut rollback = OpenRollbackGuard {
+            dispatcher: Arc::clone(self),
+            conn_id,
+            token: Some(token),
+            committed: false,
+        };
+        let res = match rx.await {
+            Ok(Ok(super::requests::lease::LifecycleReply::Opened { result, .. })) => Ok(result),
+            Ok(Err(e)) => Err(e),
+            _ => Err(super::requests::lease::ConnLifecycleError::Stopped),
+        };
+        if matches!(res, Ok(Ok(()))) {
+            rollback.committed = true;
+        }
+        res
+    }
+
     #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
     fn submit_policy_command(
         &self,
@@ -1873,9 +2124,10 @@ impl BrokerDispatcher {
     }
 
     /// Linearizes connection teardown off-thread: prevents any subsequent `BrokerDispatcher`
-    /// submission for `connection.id()`, marks the broker client disconnected (retiring its
-    /// managed waiters immediately while continuing broker reclamation), and pushes a
-    /// guaranteed-non-full priority `LifecycleCmd::Disconnect` onto the lifecycle channel.
+    /// submission for `connection.id()`, marks the broker client and reply router slot closed
+    /// (retiring its managed/external waiters immediately while continuing broker reclamation),
+    /// and pushes a guaranteed-non-full priority `LifecycleCmd::Disconnect` onto the lifecycle
+    /// channel. Always runs broker + router cleanup even if lifecycle enqueue returns an error.
     async fn disconnect_connection(
         &self,
         connection: super::requests::lease::ConnectionHandle,
@@ -1884,9 +2136,15 @@ impl BrokerDispatcher {
         let rx = {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let (tx, rx) = tokio::sync::oneshot::channel();
-            // Strict acyclic lock order: `state` (1) -> `conn_lifecycle` (2) -> `broker` (3).
-            self.conn_lifecycle.enqueue_disconnect_oneshot(connection, tx)?;
-            Self::disconnect_broker_client_locked(&mut st, &self.broker, connection.id());
+            // Strict acyclic lock order: `state` (1) -> `conn_lifecycle` (2) -> `broker` (3) -> `reply_router` (4).
+            let enq = self.conn_lifecycle.enqueue_disconnect_oneshot(connection, tx);
+            Self::disconnect_broker_client_locked(
+                &mut st,
+                &self.broker,
+                &self.reply_router,
+                connection.id(),
+            );
+            enq?;
             rx
         };
         match rx.await {
@@ -1903,11 +2161,24 @@ impl BrokerDispatcher {
         connection: super::requests::lease::ConnectionHandle,
     ) -> Result<super::requests::lease::LeaseOutcome, super::requests::lease::ConnLifecycleError>
     {
+        if self.drain_gate.is_owned_by_current_thread() {
+            // Calling a synchronous lifecycle wait from inside a sink callback on the drain
+            // thread would deadlock waiting for itself to drain the lifecycle reply. Enqueue
+            // the disconnect detached + retire router/broker state immediately and fail fast.
+            self.enqueue_disconnect_detached(connection);
+            return Err(super::requests::lease::ConnLifecycleError::ReentrantCallback);
+        }
         let rx = {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let (tx, rx) = mpsc::sync_channel(1);
-            self.conn_lifecycle.enqueue_disconnect_sync(connection, tx)?;
-            Self::disconnect_broker_client_locked(&mut st, &self.broker, connection.id());
+            let enq = self.conn_lifecycle.enqueue_disconnect_sync(connection, tx);
+            Self::disconnect_broker_client_locked(
+                &mut st,
+                &self.broker,
+                &self.reply_router,
+                connection.id(),
+            );
+            enq?;
             rx
         };
         match rx.recv() {
@@ -1925,12 +2196,26 @@ impl BrokerDispatcher {
     ) {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         self.conn_lifecycle.enqueue_disconnect_detached(connection);
-        Self::disconnect_broker_client_locked(&mut st, &self.broker, connection.id());
+        Self::disconnect_broker_client_locked(
+            &mut st,
+            &self.broker,
+            &self.reply_router,
+            connection.id(),
+        );
+    }
+
+    fn disconnect_client_only(&self, client: super::broker::ClientId) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(handle) = super::requests::lease::ConnectionHandle::from_ws_id(client.0) {
+            self.conn_lifecycle.enqueue_disconnect_detached(handle);
+        }
+        Self::disconnect_broker_client_locked(&mut st, &self.broker, &self.reply_router, client.0);
     }
 
     fn disconnect_broker_client_locked(
         st: &mut BrokerDispatcherState,
         broker: &Mutex<Broker<PlanSlot>>,
+        reply_router: &Mutex<ActionReplyRouter>,
         conn_id: u64,
     ) {
         if conn_id == 0 {
@@ -1941,6 +2226,10 @@ impl BrokerDispatcher {
         st.managed.retain(|_, entry| entry.client != client);
         let mut guard = broker.lock().unwrap_or_else(|e| e.into_inner());
         guard.disconnect(client);
+        reply_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .close_connection(client);
         if st.managed.len() < before || guard.outstanding() > 0 {
             st.draining_disconnected = true;
         }
@@ -1951,17 +2240,16 @@ impl BrokerDispatcher {
         broker: &Mutex<Broker<PlanSlot>>,
         reply_router: &Mutex<ActionReplyRouter>,
         force_poll: bool,
-    ) -> (usize, Option<Arc<dyn ExternalReplySink>>) {
+    ) -> usize {
         use super::broker::DeliveryDecision;
         let mut guard = broker.lock().unwrap_or_else(|e| e.into_inner());
         let mut router = reply_router.lock().unwrap_or_else(|e| e.into_inner());
         let has_consumers = force_poll
             || !st.managed.is_empty()
             || st.draining_disconnected
-            || !router.waiters.is_empty()
-            || router.external_sink.is_some();
+            || router.has_external_consumers();
         if !has_consumers {
-            return (0, None);
+            return 0;
         }
         let n = guard.try_poll(|client, reply| {
             let req = reply.request();
@@ -1972,12 +2260,19 @@ impl BrokerDispatcher {
                         st.managed.remove(&req);
                         ok
                     }
-                    ManagedWaiter::Action { ack, terminal, acked } => match reply {
-                        super::broker::Reply::Ack { .. } => {
+                    ManagedWaiter::Action {
+                        ack,
+                        terminal,
+                        acked,
+                    } => match reply {
+                        super::broker::Reply::Ack {
+                            action: Some(_), ..
+                        } => {
                             *acked = true;
                             ack.take().is_some_and(|tx| tx.send(Ok(reply)).is_ok())
                         }
-                        super::broker::Reply::Refused { .. }
+                        super::broker::Reply::Ack { action: None, .. }
+                        | super::broker::Reply::Refused { .. }
                         | super::broker::Reply::Lease { .. } => {
                             let ok = ack.take().is_some_and(|tx| tx.send(Ok(reply)).is_ok());
                             st.managed.remove(&req);
@@ -1996,78 +2291,303 @@ impl BrokerDispatcher {
                 } else {
                     DeliveryDecision::Abandoned
                 }
-            } else if let Some(tx) = router.waiters.remove(&req) {
-                let _ = tx.send(reply);
-                DeliveryDecision::Delivered
-            } else if router.external.len() < router.external_cap {
-                router.external.push_back((client, reply));
-                DeliveryDecision::Delivered
             } else {
-                DeliveryDecision::Backpressured
+                router.route_broker_reply(client, reply)
             }
         });
         guard.reclaim_plans();
         if guard.outstanding() == 0 && st.managed.is_empty() {
             st.draining_disconnected = false;
         }
-        (n, router.external_sink.clone())
+        n
     }
 
-    fn pump_to_router(&self) -> (usize, Option<Arc<dyn ExternalReplySink>>) {
-        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        Self::poll_all_locked(&mut st, &self.broker, &self.reply_router, true)
-    }
+    /// Executes one full serialized delivery pass (called ONLY while holding `self.drain_gate`).
+    fn deliver_ready_under_gate(&self, force_poll: bool) -> usize {
+        use super::broker::DeliveryDecision;
+        use super::reply_router::{InFlightDelivery, ReplyTarget};
+        use crate::supervisor::MAX_LIVE_CONNECTIONS;
 
-    fn drain_replies(&self) {
-        let sink = {
-            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let (_, sink) = Self::poll_all_locked(&mut st, &self.broker, &self.reply_router, false);
-            if st.exited.load(Ordering::Acquire) {
-                let _ = Self::poll_all_locked(&mut st, &self.broker, &self.reply_router, false);
-                Self::fail_remaining(&mut st.managed, OwnerError::Stopped);
-                st.draining_disconnected = false;
+        // Unwind-safe reconciliation guard: if a user sink callback panics while an
+        // `InFlightDelivery` is popped, Drop reconciles it as `Abandoned` so credits never leak.
+        struct InFlightGuard<'a> {
+            router: &'a Mutex<ActionReplyRouter>,
+            item: Option<InFlightDelivery>,
+        }
+        impl Drop for InFlightGuard<'_> {
+            fn drop(&mut self) {
+                if let Some(item) = self.item.take() {
+                    self.router
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .reconcile_in_flight(item, DeliveryDecision::Abandoned);
+                }
             }
-            sink
-        };
-        if let Some(sink) = sink {
-            use super::broker::DeliveryDecision;
+        }
+
+        let mut total = 0usize;
+        let mut backpressured_slots = [false; MAX_LIVE_CONNECTIONS];
+        let mut global_backpressured = false;
+
+        loop {
+            let polled = {
+                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                Self::poll_all_locked(&mut st, &self.broker, &self.reply_router, force_poll)
+            };
+            total += polled;
+
             let mut delivered_any = false;
             loop {
                 let next = self
                     .reply_router
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .external
-                    .pop_front();
-                let Some((client, reply)) = next else {
+                    .pop_next_delivery(&mut backpressured_slots, global_backpressured);
+                let Some(item) = next else {
                     break;
                 };
-                match sink.deliver(client, reply) {
-                    DeliveryDecision::Delivered | DeliveryDecision::Abandoned => {
+                let mut guard = InFlightGuard {
+                    router: &self.reply_router,
+                    item: Some(item),
+                };
+                let decision = {
+                    let it = guard.item.as_ref().expect("set above");
+                    if it
+                        .closed
+                        .as_ref()
+                        .is_some_and(|c| c.load(Ordering::Acquire))
+                    {
+                        DeliveryDecision::Abandoned
+                    } else {
+                        it.sink.deliver(it.client, it.reply)
+                    }
+                };
+                let item = guard.item.take().expect("set above");
+                match (decision, item.target) {
+                    (
+                        DeliveryDecision::Backpressured,
+                        ReplyTarget::Connection { slot_idx, .. },
+                    ) => {
+                        backpressured_slots[slot_idx] = true;
+                    }
+                    (DeliveryDecision::Backpressured, ReplyTarget::GlobalSink { .. }) => {
+                        global_backpressured = true;
+                    }
+                    (DeliveryDecision::Delivered | DeliveryDecision::Abandoned, _) => {
                         delivered_any = true;
                     }
-                    DeliveryDecision::Backpressured => {
-                        self.reply_router
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .external
-                            .push_front((client, reply));
-                        break;
-                    }
                 }
+                self.reply_router
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .reconcile_in_flight(item, decision);
             }
-            if delivered_any {
-                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                let _ = Self::poll_all_locked(&mut st, &self.broker, &self.reply_router, false);
+
+            if !delivered_any {
+                break;
             }
+        }
+        total
+    }
+
+    fn run_deferred_and_release_gate(&self) {
+        while let Some((rt_joined, allow_callbacks)) =
+            self.drain_gate.try_release_or_take_deferred()
+        {
+            self.finalize_stopped_under_gate(rt_joined, allow_callbacks);
         }
     }
 
-    fn finish_stopped(&self) {
+    /// Unwind-safe RAII owner of `SerialDrainGate`: runs any deferred shutdown finalization on
+    /// normal exit and guarantees gate release even if a sink callback panics/unwinds.
+    fn enter_drain_guard(&self) -> Option<SerialDrainGuard<'_>> {
+        if matches!(
+            self.drain_gate.enter(),
+            super::reply_router::DrainEnter::Entered
+        ) {
+            Some(SerialDrainGuard {
+                dispatcher: self,
+                released: false,
+            })
+        } else {
+            None
+        }
+    }
+
+    fn pump_replies(&self, force_poll: bool) -> usize {
+        let Some(guard) = self.enter_drain_guard() else {
+            return 0;
+        };
+        let n = self.deliver_ready_under_gate(force_poll);
+        guard.finish();
+        n
+    }
+
+    fn drain_replies(&self) {
+        let Some(guard) = self.enter_drain_guard() else {
+            return;
+        };
+        let _ = self.deliver_ready_under_gate(false);
+        let exited = {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if st.exited.load(Ordering::Acquire) {
+                let _ = Self::poll_all_locked(&mut st, &self.broker, &self.reply_router, false);
+                Self::fail_remaining(&mut st.managed, OwnerError::Stopped);
+                st.draining_disconnected = false;
+                true
+            } else {
+                false
+            }
+        };
+        if exited {
+            let _ = self.deliver_ready_under_gate(false);
+            self.reply_router
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .fail_pending_waiters_on_stop();
+        }
+        guard.finish();
+    }
+
+    /// Drains ONLY unrouted raw-broker replies (never steals replies bound to a per-connection
+    /// slot or global sink) under the single serial drain gate.
+    fn poll_unrouted_external<F>(&self, mut deliver: F) -> usize
+    where
+        F: FnMut(ClientId, super::broker::Reply) -> super::broker::DeliveryDecision,
+    {
+        use super::broker::DeliveryDecision;
+        struct UnroutedGuard<'a> {
+            router: &'a Mutex<ActionReplyRouter>,
+            item: Option<(ClientId, super::broker::Reply)>,
+        }
+        impl Drop for UnroutedGuard<'_> {
+            fn drop(&mut self) {
+                if let Some((client, reply)) = self.item.take() {
+                    self.router
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .finish_unrouted_in_flight(client, reply, DeliveryDecision::Abandoned);
+                }
+            }
+        }
+
+        let Some(gate_guard) = self.enter_drain_guard() else {
+            return 0;
+        };
+        let _ = self.deliver_ready_under_gate(true);
+        let mut delivered = 0usize;
+        loop {
+            let next = self
+                .reply_router
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pop_unrouted();
+            let Some((client, reply)) = next else {
+                break;
+            };
+            let mut uguard = UnroutedGuard {
+                router: &self.reply_router,
+                item: Some((client, reply)),
+            };
+            let decision = deliver(client, reply);
+            let (c, r) = uguard.item.take().expect("set above");
+            self.reply_router
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .finish_unrouted_in_flight(c, r, decision);
+            match decision {
+                DeliveryDecision::Delivered | DeliveryDecision::Abandoned => {
+                    delivered += 1;
+                }
+                DeliveryDecision::Backpressured => {
+                    break;
+                }
+            }
+        }
+        if delivered > 0 {
+            let _ = self.deliver_ready_under_gate(true);
+        }
+        gate_guard.finish();
+        delivered
+    }
+
+    fn finalize_stopped_under_gate(&self, rt_joined: bool, allow_callbacks: bool) {
+        // 1. On normal shutdown (`allow_callbacks == true`), drain any in-flight records from the
+        //    authoritative `TerminalCaptureChannel` against the final snapshot BEFORE the final
+        //    broker delivery pass so WS owner reply sinks observe every captured terminal instead
+        //    of returning `Backpressured` and having finalization discard the reply.
+        //    On emergency shutdown (`allow_callbacks == false`), NEVER drain or invoke sink
+        //    callbacks so a slow or stalled sink cannot defeat the emergency deadline.
+        if allow_callbacks {
+            if let Some((ch, terminals, template_obs)) = self.terminal_capture_drain.as_ref() {
+                let final_snap = self.hub.latest();
+                let _ = ch.drain_into(
+                    terminals,
+                    &self.hub,
+                    final_snap.as_deref(),
+                    &[],
+                    template_obs,
+                    false,
+                );
+            }
+            let _ = self.deliver_ready_under_gate(true);
+        }
+        // 2. Finalize all remaining off-RT state and recover reservations (lock-only).
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = Self::poll_all_locked(&mut st, &self.broker, &self.reply_router, false);
         Self::fail_remaining(&mut st.managed, OwnerError::Stopped);
         st.draining_disconnected = false;
+        let mut broker = self.broker.lock().unwrap_or_else(|e| e.into_inner());
+        let mut router = self.reply_router.lock().unwrap_or_else(|e| e.into_inner());
+        router.finalize_stopped(false);
+        if rt_joined && !self.broker_discarded.swap(true, Ordering::AcqRel) {
+            broker.discard_stopped_after_rt_exit();
+        } else {
+            broker.reclaim_plans();
+        }
+    }
+
+    fn finish_stopped_inner(&self, emergency_bound: Option<Duration>, rt_joined: bool) {
+        // Step 1 (lock-only, NEVER waits on SerialDrainGate): wake all waiting callers immediately.
+        {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            Self::fail_remaining(&mut st.managed, OwnerError::Stopped);
+            st.draining_disconnected = false;
+            self.reply_router
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .fail_pending_waiters_on_stop();
+        }
+        // Step 2: acquire SerialDrainGate (bounded for emergency teardown; deferred on same-thread
+        // re-entry or emergency timeout so teardown never deadlocks or hangs behind a slow sink).
+        match self
+            .drain_gate
+            .enter_for_shutdown(emergency_bound, rt_joined)
+        {
+            super::reply_router::DrainEnter::Entered => {
+                let guard = SerialDrainGuard {
+                    dispatcher: self,
+                    released: false,
+                };
+                self.finalize_stopped_under_gate(rt_joined, emergency_bound.is_none());
+                guard.finish();
+            }
+            super::reply_router::DrainEnter::SameThreadReentrant => {
+                // Deferred finalization is recorded atomically under `drain_gate` and will run
+                // before the outer active drain releases the gate.
+            }
+            super::reply_router::DrainEnter::TimedOut => {
+                // Emergency bound elapsed while another thread is blocked inside a sink callback:
+                // clear all non-in-flight state without invoking callbacks; deferred finalization
+                // runs when that callback eventually unwinds.
+                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                Self::fail_remaining(&mut st.managed, OwnerError::Stopped);
+                st.draining_disconnected = false;
+                self.reply_router
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .finalize_stopped(true);
+            }
+        }
     }
 
     fn fail_remaining(
@@ -2180,7 +2700,12 @@ impl OffThreadSinks {
         }
     }
 
-    pub(crate) fn drain_all(&self, tick_stats: &crate::diagnostics::tick::LockFreeTickStats) {
+    /// Stage 1 of off-RT sink draining: diagnostics, reclaims, safety logs, maintenance, and
+    /// urgent stop replies — runs BEFORE `TerminalCaptureChannel::drain_into`.
+    pub(crate) fn drain_pre_broker(
+        &self,
+        tick_stats: &crate::diagnostics::tick::LockFreeTickStats,
+    ) {
         self.drain_diag(tick_stats);
         self.estop_reg.lock().unwrap_or_else(|e| e.into_inner()).drain();
         {
@@ -2242,9 +2767,17 @@ impl OffThreadSinks {
         }
         self.maint_client.drain_replies();
         self.urgent_stop_client.drain_replies();
+    }
+
+    /// Stage 2 of off-RT sink draining: runs strictly AFTER `TerminalCaptureChannel::drain_into`
+    /// populates `TerminalBroadcaster` (respecting the `publish_seq` barrier), preserving Step 7
+    /// causal ordering (`broker_dispatcher` BEFORE `conn_lifecycle_client`).
+    pub(crate) fn drain_post_terminal(&self, drain_broker: bool) {
         // Preserve owner Step 7 causal ordering off-thread: broker terminals (e.g. an aborted
         // TorqueOn fenced by Disconnect) resolve strictly BEFORE lifecycle waiters (Disconnect).
-        self.broker_dispatcher.drain_replies();
+        if drain_broker {
+            self.broker_dispatcher.drain_replies();
+        }
         self.conn_lifecycle_client.drain_replies();
         {
             let mut ev_rx = self.eviction_rx.lock().unwrap_or_else(|e| e.into_inner());
@@ -2288,8 +2821,27 @@ impl OffThreadSinks {
 
     /// Final off-thread drain at executor/dispatcher shutdown: emits any remaining events and a
     /// shutdown summary carrying the authoritative monotonic safety drop count.
-    pub(crate) fn flush_and_report_shutdown(&self, tick_stats: &crate::diagnostics::tick::LockFreeTickStats) {
-        self.drain_all(tick_stats);
+    pub(crate) fn flush_and_report_shutdown(
+        &self,
+        tick_stats: &crate::diagnostics::tick::LockFreeTickStats,
+    ) {
+        self.flush_and_report_shutdown_inner(tick_stats, true);
+    }
+
+    pub(crate) fn flush_and_report_shutdown_without_broker(
+        &self,
+        tick_stats: &crate::diagnostics::tick::LockFreeTickStats,
+    ) {
+        self.flush_and_report_shutdown_inner(tick_stats, false);
+    }
+
+    fn flush_and_report_shutdown_inner(
+        &self,
+        tick_stats: &crate::diagnostics::tick::LockFreeTickStats,
+        drain_broker: bool,
+    ) {
+        self.drain_pre_broker(tick_stats);
+        self.drain_post_terminal(drain_broker);
         let mut log_g = self.safety_log_rx.lock().unwrap_or_else(|e| e.into_inner());
         let total = self.stats.safety_log_dropped.load(Ordering::Relaxed);
         if total > 0 && total != log_g.2 {
@@ -2352,62 +2904,11 @@ impl TeardownDisable {
     }
 }
 
-/// Single plug-in hook for PR L's per-connection WebSocket reply router (A6/A7).
-///
-/// In PR P, WebSocket ordinary commands on `OWNER_EXECUTOR` remain gated at `503
-/// EXECUTOR_ROUTING_PENDING` (`src/api/ws.rs:492, 2461`) because connection lifecycle and
-/// per-client reply routing belong to PR L. PR L installs its per-connection router once via
-/// [`RtExecutorHandle::attach_external_reply_sink`]. Until a sink is attached,
-/// [`crate::macro_action::begin_macro_executor`] refuses new executor macros at admission with
-/// `503 EXECUTOR_ROUTING_PENDING` so no macro can commit without a terminal reply sink.
-pub trait ExternalReplySink: Send + Sync {
-    fn deliver(
-        &self,
-        client: ClientId,
-        reply: super::broker::Reply,
-    ) -> super::broker::DeliveryDecision;
-}
-
-impl<F> ExternalReplySink for F
-where
-    F: Fn(ClientId, super::broker::Reply) -> super::broker::DeliveryDecision + Send + Sync,
-{
-    fn deliver(
-        &self,
-        client: ClientId,
-        reply: super::broker::Reply,
-    ) -> super::broker::DeliveryDecision {
-        (self)(client, reply)
-    }
-}
-
-/// Shared bounded FIFO broker reply dispatcher (A7 / Major 10):
-/// routes replies for internal broker RPCs (`BeginMacro` ACK/Refused, `InstallChild`, `FinishMacro`)
-/// directly to their keyed oneshot waiters without head-of-line blocking behind unrelated replies,
-/// while buffering all other replies (including `BeginMacro` `Terminal`s and external client traffic)
-/// in a bounded (`<= external_cap`) FIFO queue and forwarding them to the attached
-/// [`ExternalReplySink`] (PR L's per-connection WS reply router hook).
-///
-/// Lock order: ALWAYS lock `RtExecutorShared::broker` BEFORE `RtExecutorShared::reply_router`.
-/// NEVER invoke `ExternalReplySink::deliver` while holding either lock.
-struct ActionReplyRouter {
-    waiters: std::collections::HashMap<super::broker::RequestId, tokio::sync::oneshot::Sender<super::broker::Reply>>,
-    external: VecDeque<(ClientId, super::broker::Reply)>,
-    external_cap: usize,
-    external_sink: Option<Arc<dyn ExternalReplySink>>,
-}
-
-impl ActionReplyRouter {
-    fn new(external_cap: usize) -> Self {
-        let cap = external_cap.max(1);
-        Self {
-            waiters: std::collections::HashMap::new(),
-            external: VecDeque::with_capacity(cap),
-            external_cap: cap,
-            external_sink: None,
-        }
-    }
-}
+pub use super::reply_router::{
+    AckCommitGuard, ConnectionReplySink, ConnectionSlotToken, ExternalDestinationPolicy,
+    ExternalReplySink, ExternalSubmitError, ReplyRouterStats, WsWireAckTracker,
+};
+use super::reply_router::ActionReplyRouter;
 
 /// Outcome of a correlated WS `/api/v1/motion/servo` command routed through [`TargetPort::submit_servo`].
 pub(crate) enum ServoCommandOutcome {
@@ -2638,6 +3139,8 @@ pub(crate) struct ServoTargetDispatcher {
     atomic_fenced_lease_gen: Arc<AtomicU64>,
     #[cfg(feature = "policy-runtime")]
     atomic_closed_policy_action_id: Arc<AtomicU64>,
+    #[cfg(feature = "policy-runtime")]
+    policy_refusal_gen: Arc<AtomicU64>,
 }
 
 impl ServoTargetDispatcher {
@@ -2650,6 +3153,8 @@ impl ServoTargetDispatcher {
         #[cfg(feature = "policy-runtime")]
         atomic_closed_policy_action_id: Arc<AtomicU64>,
     ) -> Self {
+        #[cfg(feature = "policy-runtime")]
+        let policy_refusal_gen = writer.policy_refusal_gen_arc();
         Self {
             inner: Mutex::new(ServoTargetDispatcherInner {
                 port: crate::supervisor::targets::TargetPort::new(writer, arm, boot),
@@ -2673,7 +3178,14 @@ impl ServoTargetDispatcher {
             atomic_fenced_lease_gen,
             #[cfg(feature = "policy-runtime")]
             atomic_closed_policy_action_id,
+            #[cfg(feature = "policy-runtime")]
+            policy_refusal_gen,
         }
+    }
+
+    #[cfg(feature = "policy-runtime")]
+    pub(crate) fn policy_refusal_gen(&self) -> u64 {
+        self.policy_refusal_gen.load(Ordering::Acquire)
     }
 
     fn sync_authoritative_fence_locked(&self, g: &mut ServoTargetDispatcherInner) {
@@ -3026,6 +3538,91 @@ impl ServoTargetDispatcher {
         sub
     }
 
+    /// Runs a synchronous final policy commit gate and optional mailbox publication under a
+    /// single acquisition of the dispatcher mutex (after draining outcomes and verifying stream
+    /// liveness), so no mutex stall can occur between slot selection (`gate_now`) and triple-buffer
+    /// publication.
+    #[cfg(feature = "policy-runtime")]
+    pub(crate) fn submit_policy_gated<R, F>(
+        &self,
+        hub: &StateHub,
+        action_id: u64,
+        gate: F,
+    ) -> R
+    where
+        F: FnOnce(
+            bool,
+            bool,
+            &mut dyn FnMut(
+                &crate::supervisor::targets::PolicyTarget<'_>,
+                super::mailbox::PolicyValidityBounds,
+            ) -> super::mailbox::Submitted,
+        ) -> R,
+    {
+        let mut resolved_cmds = Vec::new();
+        let mut stream_refusals = Vec::new();
+        let res = {
+            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            self.sync_authoritative_fence_locked(&mut g);
+            g.pop_outcomes_locked(hub, &mut resolved_cmds, &mut stream_refusals);
+            let mut has_pending_refusal = false;
+            g.policy_outcomes.retain(|(aid, o)| {
+                if *aid == action_id {
+                    if o.result.is_err() {
+                        has_pending_refusal = true;
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
+            let is_closed = g.closed
+                || self.exited.load(Ordering::Acquire)
+                || g.port.is_policy_closed(action_id);
+            let mut submit_fn =
+                |target: &crate::supervisor::targets::PolicyTarget<'_>,
+                 validity: super::mailbox::PolicyValidityBounds|
+                 -> super::mailbox::Submitted {
+                    if is_closed {
+                        return super::mailbox::Submitted::OutOfOrder;
+                    }
+                    let coalesced_before = g.port.coalesced();
+                    let prev_key = g.last_inflight_key;
+                    let sub = g.port.submit_policy_with_validity(target, validity);
+                    match sub {
+                        super::mailbox::Submitted::Accepted
+                        | super::mailbox::Submitted::Coalesced { .. } => {
+                            g.policy_submitted_count = g.policy_submitted_count.saturating_add(1);
+                            if target.action_id != 0
+                                && !g.tracked_policy_streams.contains(&target.action_id)
+                            {
+                                if g.tracked_policy_streams.len() >= 64 {
+                                    g.tracked_policy_streams.pop_front();
+                                }
+                                g.tracked_policy_streams.push_back(target.action_id);
+                            }
+                            let assigned_seq = g.port.last_seq();
+                            let sid = crate::supervisor::targets::policy_stream(target.action_id);
+                            g.last_inflight_key = Some((sid, assigned_seq));
+                            if matches!(sub, super::mailbox::Submitted::Coalesced { .. })
+                                || g.port.coalesced() > coalesced_before
+                            {
+                                g.note_coalesced_locked(prev_key, &mut resolved_cmds);
+                            }
+                        }
+                        super::mailbox::Submitted::Busy => {
+                            g.policy_busy_count = g.policy_busy_count.saturating_add(1);
+                        }
+                        _ => {}
+                    }
+                    sub
+                };
+            gate(is_closed, has_pending_refusal, &mut submit_fn)
+        };
+        Self::deliver_drained(hub, (resolved_cmds, stream_refusals));
+        res
+    }
+
     #[cfg(feature = "policy-runtime")]
     pub(crate) fn close_policy(&self, action_id: u64) {
         if action_id == 0 {
@@ -3168,6 +3765,56 @@ impl TargetWriterGuard<'_> {
     }
 }
 
+/// Explicit RT thread join-lifetime state (distinguishes running vs joined vs detached so a
+/// detached control thread is NEVER mistaken for a completed join on subsequent teardown).
+const RT_STATE_RUNNING: u8 = 0;
+const RT_STATE_JOINED: u8 = 1;
+const RT_STATE_DETACHED: u8 = 2;
+
+struct SerialDrainGuard<'a> {
+    dispatcher: &'a BrokerDispatcher,
+    released: bool,
+}
+
+impl SerialDrainGuard<'_> {
+    fn finish(mut self) {
+        // Keep `self.released == false` until `run_deferred_and_release_gate()` completes so a
+        // panic inside a deferred-shutdown callback still triggers unwind recovery in `Drop`.
+        self.dispatcher.run_deferred_and_release_gate();
+        self.released = true;
+    }
+}
+
+impl Drop for SerialDrainGuard<'_> {
+    fn drop(&mut self) {
+        if !self.released {
+            // Unwinding after a callback panic (possibly inside deferred normal shutdown):
+            // finish any remaining deferred retirement strictly WITHOUT invoking callbacks,
+            // then guarantee the gate is released so no future drainer or teardown can wedge.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                while let Some((rt_joined, _)) =
+                    self.dispatcher.drain_gate.try_release_or_take_deferred()
+                {
+                    self.dispatcher.finalize_stopped_under_gate(rt_joined, false);
+                }
+            }));
+            if self.dispatcher.drain_gate.is_owned_by_current_thread() {
+                self.dispatcher.drain_gate.release_on_unwind();
+            }
+        }
+    }
+}
+
+/// Synchronized completion state for `armd-control`:
+/// - `dropping` becomes `true` under the mutex only after the final `teardown_disable.requested`
+///   checkpoint immediately before `drop(core)`.
+/// - `exited` becomes `true` strictly AFTER `drop(core)` completes on `armd-control`.
+#[derive(Clone, Copy, Default)]
+struct ControlExitState {
+    dropping: bool,
+    exited: bool,
+}
+
 struct RtExecutorShared {
     boot: BootId,
     broker: Arc<Mutex<Broker<PlanSlot>>>,
@@ -3175,6 +3822,7 @@ struct RtExecutorShared {
     target_writer: TargetWriterHandle,
     servo_dispatcher: Arc<ServoTargetDispatcher>,
     stop_requests: StopRequests,
+    estop_state: Arc<crate::rt_core::urgent::EstopState>,
     stats: Arc<ExecutorStats>,
     maint_client: Arc<MaintClient>,
     urgent_stop_client: Arc<UrgentStopClient>,
@@ -3187,7 +3835,8 @@ struct RtExecutorShared {
     control_stop: Arc<AtomicBool>,
     persist_stop: Arc<AtomicBool>,
     exited: Arc<AtomicBool>,
-    control_exited_cv: Arc<(Mutex<bool>, Condvar)>,
+    control_rt_state: std::sync::atomic::AtomicU8,
+    control_exited_cv: Arc<(Mutex<ControlExitState>, Condvar)>,
     persist_worker_exited: Arc<AtomicBool>,
     persist_exited_cv: Arc<(Mutex<bool>, Condvar)>,
     shutdown_confirmed: Arc<AtomicBool>,
@@ -3202,23 +3851,6 @@ struct RtExecutorShared {
 }
 
 impl RtExecutorShared {
-    fn wait_flag(cv: &(Mutex<bool>, Condvar), timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        let mut g = cv.0.lock().unwrap_or_else(|e| e.into_inner());
-        while !*g {
-            let rem = deadline.saturating_duration_since(Instant::now());
-            if rem.is_zero() {
-                break;
-            }
-            let (next, res) = cv.1.wait_timeout(g, rem).unwrap_or_else(|e| e.into_inner());
-            g = next;
-            if res.timed_out() {
-                break;
-            }
-        }
-        *g
-    }
-
     /// Stops the RT owner (`armd-control`) FIRST so a stalled persistence worker can never block
     /// owner shutdown or emergency hardware disable, then joins or bounds persistence cleanup.
     fn teardown_and_join_inner(&self, emergency_bound: Option<Duration>) {
@@ -3234,81 +3866,99 @@ impl RtExecutorShared {
             clock.wake();
         }
 
-        if let Some(bound) = emergency_bound {
-            // Wait up to `bound` for `armd-control` to finish its bounded disable and exit;
-            // if a driver syscall stalls past the bound, take and detach the join handle so no
-            // later teardown or `Drop` can join it without a deadline.
-            let _ = self.teardown_disable.wait_outcome(bound);
-            let finished = !self.teardown_disable.timed_out.load(Ordering::Acquire)
-                && Self::wait_flag(&self.control_exited_cv, Duration::from_millis(50));
-            if let Some(jh) = self.control_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
-                if finished {
-                    let _ = jh.join();
-                } else {
-                    self.exited.store(true, Ordering::Release);
-                    tracing::error!(
-                        "Emergency teardown: detaching stalled RT executor thread (`armd-control`) after {:?} timeout so later teardown/Drop cannot block indefinitely",
-                        bound
-                    );
-                    drop(jh);
+        // Unified bounded completion protocol across emergency, panic, and ordinary teardown:
+        // - Emergency teardown shares ONE absolute deadline across `wait_outcome` and thread exit.
+        // - `control_exited_cv.exited` is published strictly AFTER `drop(core)` completes.
+        // - On timeout before `armd-control` finishes, lock `control_exited_cv.0`: if not yet
+        //   exited and shutdown was NOT owner-confirmed, latch `estop_state` and set
+        //   `teardown_disable.requested = true` UNDER THAT SAME MUTEX so `armd-control` cannot
+        //   enter `drop(core)` without observing the disable request and fencing remaining TX.
+        let mut finished = if let Some(bound) = emergency_bound {
+            let control_deadline = Instant::now() + bound;
+            let _ = self
+                .teardown_disable
+                .wait_outcome(control_deadline.saturating_duration_since(Instant::now()));
+            wait_control_exited_or_timed_out_until(
+                &self.control_exited_cv,
+                &self.teardown_disable,
+                control_deadline.max(Instant::now() + Duration::from_millis(25)),
+            )
+        } else {
+            let control_deadline =
+                Instant::now() + self.teardown_disable_timeout + Duration::from_millis(100);
+            wait_control_exited_or_timed_out_until(
+                &self.control_exited_cv,
+                &self.teardown_disable,
+                control_deadline,
+            )
+        };
+        if !finished {
+            let st = self
+                .control_exited_cv
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if st.exited {
+                finished = true;
+            } else if !self.shutdown_confirmed.load(Ordering::Acquire) {
+                self.estop_state.request_and_latch();
+                if !st.dropping {
+                    self.teardown_disable.requested.store(true, Ordering::Release);
                 }
             }
-        } else if self.teardown_disable.timed_out.load(Ordering::Acquire) {
-            // A prior panic or emergency deadline observer already recorded `TimedOut`:
-            // wait only briefly for clean exit, then detach so `Drop`/`stop_and_join` stay bounded.
-            let finished = Self::wait_flag(&self.control_exited_cv, Duration::from_millis(50));
-            if let Some(jh) = self.control_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
-                if finished {
-                    let _ = jh.join();
-                } else {
-                    self.exited.store(true, Ordering::Release);
-                    tracing::error!(
-                        "Teardown: detaching stalled RT executor thread (`armd-control`) after panic/emergency timeout so Drop cannot block indefinitely"
-                    );
-                    drop(jh);
-                }
-            }
-        } else if let Some(jh) = self.control_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            let _ = jh.join();
         }
+        if let Some(jh) = self.control_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            if finished {
+                let _ = jh.join();
+                self.control_rt_state.store(RT_STATE_JOINED, Ordering::Release);
+            } else {
+                self.control_rt_state.store(RT_STATE_DETACHED, Ordering::Release);
+                self.exited.store(true, Ordering::Release);
+                tracing::error!(
+                    "Teardown: detaching stalled RT executor thread (`armd-control`) after bounded wait so later teardown/Drop cannot block indefinitely"
+                );
+                drop(jh);
+            }
+        }
+        let rt_joined = self.control_rt_state.load(Ordering::Acquire) == RT_STATE_JOINED;
 
         if let Some(jh) = self.monitor_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
             jh.thread().unpark();
             let _ = jh.join();
         }
 
-        // Now wait for persistence cleanup: bounded + detach on emergency teardown (so a hung
-        // `sync_all` cannot block returning the torque-off outcome or a subsequent `Drop`),
-        // full join on normal teardown / Drop.
-        if emergency_bound.is_some() {
-            let finished = Self::wait_flag(&self.persist_exited_cv, Duration::from_millis(50));
-            if let Some(jh) = self.persist_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
-                if finished {
-                    let _ = jh.join();
-                } else {
-                    tracing::warn!(
-                        "Emergency teardown: detaching stalled persistence worker (`armd-persist`) after bounded wait so later teardown/Drop cannot block indefinitely"
-                    );
-                    drop(jh);
-                }
-            }
-        } else if let Some(jh) = self.persist_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            let _ = jh.join();
+        // Bounded persistence cleanup on BOTH emergency (`50ms`) and ordinary teardown
+        // (`teardown_disable_timeout + 100ms`): normal fsync finishes in milliseconds and joins
+        // cleanly with durability intact, while a stalled parent-directory fsync detaches after
+        // the bound instead of hanging `shutdown_and_join`, `stop_and_join`, or `Drop`.
+        let persist_bound = if emergency_bound.is_some() {
+            Duration::from_millis(50)
+        } else {
+            self.teardown_disable_timeout + Duration::from_millis(100)
+        };
+        if let Some(jh) = self.persist_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            stop_and_join_persist_bounded(
+                &self.persist_stop,
+                &self.persist_park_thread,
+                &self.persist_exited_cv,
+                jh,
+                Instant::now() + persist_bound,
+            );
         }
 
-        // Final off-thread drain and reclamation.
+        // Final off-thread drain and reclamation (single finalization owner for broker/router).
         self.maint_client.finish_stopped();
         self.urgent_stop_client.finish_stopped();
         self.conn_lifecycle_client.finish_stopped();
-        self.broker_dispatcher.finish_stopped();
-        self.sinks.flush_and_report_shutdown(&self.tick_stats);
+        self.broker_dispatcher
+            .finish_stopped_inner(emergency_bound, rt_joined);
+        self.sinks
+            .flush_and_report_shutdown_without_broker(&self.tick_stats);
         self.servo_dispatcher.finish_stopped(&self.hub);
         if let Some(ring) = self.hub.record_ring() {
             ring.drain();
         }
         let _ = self.hub.latest();
-        self.broker.lock().unwrap_or_else(|e| e.into_inner()).poll(|_, _| true);
-        self.reply_router.lock().unwrap_or_else(|e| e.into_inner()).waiters.clear();
     }
 
     fn teardown_and_join(&self) {
@@ -3330,16 +3980,51 @@ pub struct RtExecutorHandle {
 
 impl RtExecutorHandle {
     pub fn boot(&self) -> BootId { self.shared.boot }
+
+    /// Test-fixture-only raw broker accessor for isolated RT-alloc / broker-ring unit fixtures.
+    /// Production code must never call this directly; use `submit_external_action`,
+    /// `submit_internal_action`, or the typed `submit_*_async` methods instead.
+    #[doc(hidden)]
     pub fn broker(&self) -> &Arc<Mutex<Broker<PlanSlot>>> { &self.shared.broker }
 
-    /// Submits an internal A6/A7 action command (`BeginMacro`, `InstallChild`, `FinishMacro`, or
-    /// `InstallPrepared`) and atomically registers a keyed oneshot waiter in the shared bounded
-    /// FIFO reply router BEFORE releasing the broker lock (preventing ACK stealing and
-    /// head-of-line deadlock behind unrelated replies).
-    ///
-    /// For `BeginMacro` (which produces `Ack` followed later by `Terminal` under the same
-    /// `RequestId`), the oneshot receives ONLY the initial `Ack`/`Refused`; the subsequent
-    /// `Terminal` automatically routes into the external FIFO queue.
+    /// Atomically verifies connection liveness, reserves bounded per-connection + global reply
+    /// capacity, submits an external action (`BeginMacro` or `InstallPrepared`), and binds its
+    /// terminal destination + RAII [`AckCommitGuard`] before releasing the broker lock.
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_external_action<'a>(
+        &self,
+        client: ClientId,
+        seq: u64,
+        auth: super::broker::Authority,
+        deadline: Instant,
+        sub: super::requests::actions::ActionSubmit<'a, PlanSlot>,
+        policy: ExternalDestinationPolicy,
+        require_ack_commit: bool,
+        wire_tracker: Option<Arc<WsWireAckTracker>>,
+    ) -> Result<
+        (
+            super::broker::RequestId,
+            tokio::sync::oneshot::Receiver<Result<super::broker::Reply, OwnerError>>,
+            AckCommitGuard,
+        ),
+        ExternalSubmitError,
+    > {
+        self.shared.broker_dispatcher.submit_external_action(
+            client,
+            seq,
+            auth,
+            deadline,
+            sub,
+            policy,
+            require_ack_commit,
+            wire_tracker,
+        )
+    }
+
+    /// Submits an internal non-action macro RPC (`InstallChild` or `FinishMacro`) and atomically
+    /// registers its private ACK waiter in the separate `internal_waiters` table under the
+    /// unified dispatcher lock order. Rejects `starts_action()` commands (`BeginMacro`,
+    /// `InstallPrepared`) fail-closed.
     pub fn submit_internal_action<'a>(
         &self,
         client: ClientId,
@@ -3354,163 +4039,140 @@ impl RtExecutorHandle {
         ),
         super::broker::AdmitError,
     > {
-        if client.0 != 0 && !self.shared.conn_lifecycle_client.is_slot_open(client.0) {
-            return Err(super::broker::AdmitError::Disconnected);
-        }
-        let mut broker = self.shared.broker.lock().unwrap_or_else(|e| e.into_inner());
-        broker.reclaim_plans();
-        let req_id = broker.submit(
-            client,
-            seq,
-            auth,
-            deadline,
-            super::broker::Submit::Action(sub),
-        )?;
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let mut router = self
-            .shared
-            .reply_router
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        router.waiters.insert(req_id, tx);
-        Ok((req_id, rx))
+        self.shared
+            .broker_dispatcher
+            .submit_internal_action(client, seq, auth, deadline, sub)
     }
 
     /// Removes a previously registered internal waiter (e.g. on timeout/cancellation).
     pub fn cancel_internal_waiter(&self, req_id: super::broker::RequestId) {
+        self.shared.broker_dispatcher.cancel_internal_waiter(req_id);
+    }
+
+    /// Registers a per-connection reply sink for an already-open connection slot.
+    pub fn register_connection_reply_sink(
+        &self,
+        client: ClientId,
+        sink: Arc<ConnectionReplySink>,
+        per_conn_cap: Option<usize>,
+    ) -> Result<ConnectionSlotToken, super::broker::AdmitError> {
+        self.shared
+            .broker_dispatcher
+            .register_connection_reply_sink(client, sink, per_conn_cap)
+    }
+
+    /// Seeds per-connection reply sinks for connections that were already live prior to executor
+    /// handover (called under `OWNER_TRANSFERRING` before publishing `OWNER_EXECUTOR`).
+    pub(crate) fn seed_connection_reply_sinks(
+        &self,
+        sinks: impl IntoIterator<Item = (u64, Arc<ConnectionReplySink>)>,
+    ) {
+        self.shared
+            .broker_dispatcher
+            .seed_connection_reply_sinks(sinks);
+    }
+
+    /// Opens a live connection slot on RT and atomically binds its per-connection reply sink in
+    /// the router (rolling back both router slot and RT registration on rejection or cancellation).
+    pub async fn open_connection_with_reply_sink_async(
+        &self,
+        conn_id: u64,
+        sink: Arc<ConnectionReplySink>,
+    ) -> Result<Result<(), &'static str>, super::requests::lease::ConnLifecycleError> {
+        self.shared
+            .broker_dispatcher
+            .open_connection_with_reply_sink(conn_id, sink)
+            .await
+    }
+
+    /// Returns `true` when `client` currently has an open per-connection reply slot registered.
+    pub fn has_connection_reply_sink(&self, client: ClientId) -> bool {
         self.shared
             .reply_router
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .waiters
-            .remove(&req_id);
+            .has_connection_slot(client)
     }
 
-    /// Single hook where PR L plugs in its per-connection WebSocket reply router.
-    /// Once attached, [`Self::has_external_reply_sink`] becomes `true`,
-    /// [`crate::macro_action::begin_macro_executor`] admits executor macros, and
-    /// [`Self::pump_broker_replies`] forwards external replies (including `BeginMacro`
-    /// `Reply::Terminal`s) to `sink` in strict FIFO order without holding broker/router locks.
+    /// Configures the per-connection bounded reply capacity (for saturation testing).
+    pub fn set_per_connection_reply_cap(&self, cap: usize) {
+        self.shared
+            .reply_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_per_connection_cap(cap);
+    }
+
+    /// Snapshot of reply router reservations, routes, and invariant counters.
+    pub fn reply_router_stats(&self) -> ReplyRouterStats {
+        self.shared
+            .reply_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .stats()
+    }
+
+    /// Attaches a fallback global [`ExternalReplySink`] for non-WS callers/tests.
+    /// WS sockets always bind via per-connection slots (`ConnectionOnly`) and never fall back
+    /// to this global sink.
     pub fn attach_external_reply_sink(&self, sink: Arc<dyn ExternalReplySink>) {
         self.shared
             .reply_router
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .external_sink = Some(sink);
+            .attach_global_sink(sink);
         self.pump_broker_replies();
     }
 
-    /// Detaches the external reply sink (returning executor macro admission to fail-closed
-    /// `503 EXECUTOR_ROUTING_PENDING`).
+    /// Detaches the fallback global external reply sink and retires old-generation credits.
     pub fn detach_external_reply_sink(&self) {
         self.shared
             .reply_router
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .external_sink = None;
+            .detach_global_sink();
     }
 
-    /// Returns `true` when an external reply sink (PR L's per-connection WS reply router) is
-    /// currently attached to this executor handle.
+    /// Returns `true` when a fallback global external reply sink is currently attached.
     pub fn has_external_reply_sink(&self) -> bool {
         self.shared
             .reply_router
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .external_sink
-            .is_some()
+            .has_global_sink()
     }
 
-    fn pump_broker_to_router(&self) -> (usize, Option<Arc<dyn ExternalReplySink>>) {
-        self.shared.broker_dispatcher.pump_to_router()
-    }
-
-    /// Pumps ready replies from the broker into matching internal waiters or the bounded external
-    /// FIFO buffer (`<= reply_capacity`), forwarding buffered external replies to the attached
-    /// [`ExternalReplySink`] (if any) without holding broker/router locks, and reclaims retired
-    /// plan slots.
+    /// Pumps ready replies from the broker through the single serial off-RT drain gate into
+    /// matching managed waiters, internal ACK waiters, per-connection slots, or the attached
+    /// global sink, and reclaims retired plan slots.
     pub fn pump_broker_replies(&self) -> usize {
-        use super::broker::DeliveryDecision;
-        let (mut total, sink) = self.pump_broker_to_router();
-        if let Some(sink) = sink {
-            let mut delivered_any = false;
-            loop {
-                let next = self
-                    .shared
-                    .reply_router
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .external
-                    .pop_front();
-                let Some((client, reply)) = next else {
-                    break;
-                };
-                match sink.deliver(client, reply) {
-                    DeliveryDecision::Delivered | DeliveryDecision::Abandoned => {
-                        delivered_any = true;
-                    }
-                    DeliveryDecision::Backpressured => {
-                        self.shared
-                            .reply_router
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .external
-                            .push_front((client, reply));
-                        break;
-                    }
-                }
-            }
-            if delivered_any {
-                total += self.pump_broker_to_router().0;
-            }
-        }
-        total
+        self.shared.broker_dispatcher.pump_replies(true)
     }
 
-    /// Drains external (non-internal-waiter) replies in strict broker FIFO order while honouring
-    /// downstream backpressure (`DeliveryDecision::Backpressured` keeps the undelivered reply at
-    /// the front of the bounded queue and never steals internal macro ACKs).
-    pub fn poll_external_replies<F>(&self, mut deliver: F) -> usize
+    /// Drains ONLY unrouted raw-broker replies (never steals replies bound to a per-connection
+    /// slot or attached global sink) under the single serial off-RT drain gate.
+    pub fn poll_external_replies<F>(&self, deliver: F) -> usize
     where
         F: FnMut(ClientId, super::broker::Reply) -> super::broker::DeliveryDecision,
     {
-        use super::broker::DeliveryDecision;
-        self.pump_broker_replies();
-        let mut delivered = 0usize;
-        {
-            let mut router = self
-                .shared
-                .reply_router
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            while let Some((client, reply)) = router.external.pop_front() {
-                match deliver(client, reply) {
-                    DeliveryDecision::Delivered | DeliveryDecision::Abandoned => delivered += 1,
-                    DeliveryDecision::Backpressured => {
-                        router.external.push_front((client, reply));
-                        break;
-                    }
-                }
-            }
-        }
-        if delivered > 0 {
-            self.pump_broker_replies();
-        }
-        delivered
+        self.shared
+            .broker_dispatcher
+            .poll_unrouted_external(deliver)
     }
 
-    /// Number of buffered external replies currently waiting in the bounded router queue.
+    /// Number of buffered external replies currently waiting in the router queues.
     pub fn pending_external_replies(&self) -> usize {
         self.shared
             .reply_router
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .external
-            .len()
+            .pending_external_count()
     }
 
     pub fn disconnect_client(&self, client: ClientId) {
-        self.shared.broker.lock().unwrap_or_else(|e| e.into_inner()).disconnect(client);
+        self.shared
+            .broker_dispatcher
+            .disconnect_client_only(client);
     }
     pub fn target_writer(&self) -> &TargetWriterHandle { &self.shared.target_writer }
 
@@ -3616,6 +4278,26 @@ impl RtExecutorHandle {
             .submit_policy(&self.shared.hub, target, validity)
     }
 
+    /// Runs `gate` synchronously inside the target-dispatcher lock (after draining outcomes and
+    /// checking stream closure) so `commit_gate(now)` slot selection and triple-buffer publication
+    /// execute atomically without intervening mutex waits.
+    #[cfg(feature = "policy-runtime")]
+    pub(crate) fn submit_policy_gated<R, F>(&self, action_id: u64, gate: F) -> R
+    where
+        F: FnOnce(
+            bool,
+            bool,
+            &mut dyn FnMut(
+                &crate::supervisor::targets::PolicyTarget<'_>,
+                super::mailbox::PolicyValidityBounds,
+            ) -> super::mailbox::Submitted,
+        ) -> R,
+    {
+        self.shared
+            .servo_dispatcher
+            .submit_policy_gated(&self.shared.hub, action_id, gate)
+    }
+
     /// Closes policy stream `action_id` off-thread (idempotent; frees stream slot in `TargetWriter`).
     #[cfg(feature = "policy-runtime")]
     pub fn close_policy(&self, action_id: u64) {
@@ -3644,6 +4326,13 @@ impl RtExecutorHandle {
     #[cfg(feature = "policy-runtime")]
     pub fn policy_busy_count(&self) -> u64 {
         self.shared.servo_dispatcher.policy_busy_count()
+    }
+
+    /// Lock-free monotonic RT policy-refusal generation counter (bumped immediately on Step 4
+    /// whenever RT refuses a policy target frame, before Step 7 outcome delivery).
+    #[cfg(feature = "policy-runtime")]
+    pub fn policy_refusal_gen(&self) -> u64 {
+        self.shared.servo_dispatcher.policy_refusal_gen()
     }
 
     /// Drains RT target outcomes belonging to policy run `action_id`.
@@ -3726,6 +4415,9 @@ impl RtExecutorHandle {
         &self,
         conn_id: u64,
     ) -> Result<Result<(), &'static str>, super::requests::lease::ConnLifecycleError> {
+        if self.shared.broker_dispatcher.drain_gate.is_owned_by_current_thread() {
+            return Err(super::requests::lease::ConnLifecycleError::ReentrantCallback);
+        }
         self.shared.conn_lifecycle_client.open_sync(conn_id)
     }
 
@@ -4189,9 +4881,20 @@ impl RtExecutorHandle {
     }
 }
 
+/// Typed startup error preserving `503 UNSUPPORTED_RT_DRIVER` and untouched Legacy core rollback
+/// vs fatal `OWNER_FAILED` transitions.
+pub(crate) enum SpawnExecutorError {
+    Recoverable {
+        core: Box<SupervisorInner>,
+        unsupported_reason: Option<&'static str>,
+        msg: String,
+    },
+    Fatal(String),
+}
+
 /// Spawns the synchronous RT executor (`armd-control`) and dedicated persistence worker (`armd-persist`).
 pub(crate) fn spawn_executor(
-    mut core: SupervisorInner,
+    core: SupervisorInner,
     cfg: ExecutorConfig,
     initial_generation: u64,
     config_write_mutex: Arc<tokio::sync::Mutex<()>>,
@@ -4201,7 +4904,7 @@ pub(crate) fn spawn_executor(
     control_sched: Arc<Mutex<Option<crate::diagnostics::tick::ControlThreadSched>>>,
     control_period_us: Arc<AtomicU64>,
     hooks: PersistTestHooks,
-) -> Result<(RtExecutorHandle, Arc<OffThreadSinks>), (Option<Box<SupervisorInner>>, String)> {
+) -> Result<(RtExecutorHandle, Arc<OffThreadSinks>), SpawnExecutorError> {
     let hub = core.core.hub().clone();
     let estop_state = core.estop_state.clone();
     let baseline_identity = BaselineIdentity {
@@ -4211,10 +4914,12 @@ pub(crate) fn spawn_executor(
         path: core.gripper_baseline_path.clone(),
     };
     let (mut engine, broker, target_writer, stop_requests) = ReleaseEngine::new(cfg.boot, cfg.capacities);
-    core.set_boot_id(cfg.boot);
-    core.attach_stop_requests(stop_requests.clone());
-    core.attach_closed_bitset(broker.closed_bitset());
-    hub.update_prep_env(Arc::new(super::requests::actions::ActionPrepEnv::from_inner(&core)));
+    let closed_bitset = broker.closed_bitset();
+    // Defer mutating `core`'s boot ID, `StopRequests`, driver E-stop gate, closed-connection
+    // bitset, and `ActionPrepEnv` until inside `armd-control`'s `catch_unwind` startup transaction
+    // so: (a) recoverable spawn/init failure returns `core` cleanly with Legacy routing intact,
+    // and (b) any driver panic during gate/capability setup is caught on `armd-control` and
+    // transitions cleanly to `OWNER_FAILED` instead of unwinding past the moved core on the caller.
 
     let (diag_tx, diag_rx) = RingBuffer::<TickSample>::new(DIAG_RING_CAPACITY);
     let (diag_amend_tx, diag_amend_rx) = RingBuffer::<(u64, u32)>::new(DIAG_RING_CAPACITY);
@@ -4279,9 +4984,11 @@ pub(crate) fn spawn_executor(
         Arc::clone(&broker),
         Arc::clone(&conn_lifecycle_client),
         Arc::clone(&reply_router),
+        Arc::clone(&hub),
+        core.terminal_capture_drain_handles(),
         exited.clone(),
     ));
-    let control_exited_cv = Arc::new((Mutex::new(false), Condvar::new()));
+    let control_exited_cv = Arc::new((Mutex::new(ControlExitState::default()), Condvar::new()));
     let persist_worker_exited = Arc::new(AtomicBool::new(false));
     let persist_exited_cv = Arc::new((Mutex::new(false), Condvar::new()));
     let teardown_disable = Arc::new(TeardownDisable::default());
@@ -4322,7 +5029,13 @@ pub(crate) fn spawn_executor(
         offload_reclaim_rx: Mutex::new(offload_reclaim_rx),
     });
 
+    let startup_bound = hooks
+        .panic_disable_timeout
+        .unwrap_or(crate::supervisor::PANIC_DISABLE_TIMEOUT);
+    let startup_deadline = Instant::now() + startup_bound;
+
     // Spawn dedicated persistence worker first so its thread handle can be woken on job push.
+    let persist_terminal_capture = core.terminal_capture_channel();
     let persist_thread = match spawn_persist_worker(
         persist_job_rx,
         persist_cmd_tx,
@@ -4335,14 +5048,23 @@ pub(crate) fn spawn_executor(
         persist_worker_exited.clone(),
         persist_exited_cv.clone(),
         hub.clone(),
+        persist_terminal_capture,
         hooks.clone(),
     ) {
         Ok(jh) => jh,
-        Err(e) => return Err((Some(Box::new(core)), format!("failed to spawn armd-persist: {e}"))),
+        Err(e) => {
+            return Err(SpawnExecutorError::Recoverable {
+                core: Box::new(core),
+                unsupported_reason: None,
+                msg: format!("failed to spawn armd-persist: {e}"),
+            });
+        }
     };
     let persist_park_thread = persist_thread.thread().clone();
 
-    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<ThreadId, (Option<Box<SupervisorInner>>, String)>>(1);
+    let startup_gate = StartupGate::new();
+    let (core_tx, core_rx) = mpsc::sync_channel::<SupervisorInner>(1);
+    let estop_state_caller = Arc::clone(&estop_state);
     let control_thread = {
         let cfg_clone = cfg.clone();
         let control_stop = control_stop.clone();
@@ -4354,72 +5076,134 @@ pub(crate) fn spawn_executor(
         let hub_clone = hub.clone();
         let persist_wake = persist_park_thread.clone();
         let hooks = hooks.clone();
-        match thread::Builder::new().name("armd-control".into()).spawn(move || {
-            let _control_thread_guard = ControlThreadGuard::enter();
-            control_thread_main(
-                core,
-                engine,
-                cfg_clone,
-                initial_generation,
-                ready_tx,
-                control_stop,
-                exited,
-                control_exited_cv,
-                teardown_disable,
-                stats,
-                control_sched,
-                control_period_us,
-                diag_tx,
-                diag_amend_tx,
-                maint_req_rx,
-                maint_rep_tx,
-                estop_ack_tx,
-                estop_overflow_gen,
-                reclaim_state_tx,
-                reclaim_stop_tx,
-                reclaim_traj_tx,
-                reclaim_macro_tx,
-                #[cfg(feature = "policy-runtime")]
-                reclaim_policy_tx,
-                reclaim_return_rx,
-                safety_log_tx,
-                shutdown_hold_error,
-                persist_job_tx,
-                persist_cmd_rx,
-                persist_rep_tx,
-                watchdog_plan_rx,
-                offload_reclaim_tx,
-                persist_wake,
-                estop_state,
-                hub_clone,
-                hooks,
-            );
-        }) {
+        let stop_requests_ctrl = stop_requests.clone();
+        let closed_bitset_ctrl = Arc::clone(&closed_bitset);
+        let startup_gate_ctrl = startup_gate.clone();
+        let spawn_res = if hooks.fail_control_spawn {
+            Err(std::io::Error::other("simulated armd-control spawn failure"))
+        } else {
+            thread::Builder::new().name("armd-control".into()).spawn(move || {
+                let _control_thread_guard = ControlThreadGuard::enter();
+                let Ok(core) = core_rx.recv() else {
+                    return;
+                };
+                control_thread_main(
+                    core,
+                    engine,
+                    cfg_clone,
+                    initial_generation,
+                    stop_requests_ctrl,
+                    closed_bitset_ctrl,
+                    startup_gate_ctrl,
+                    control_stop,
+                    exited,
+                    control_exited_cv,
+                    teardown_disable,
+                    stats,
+                    control_sched,
+                    control_period_us,
+                    diag_tx,
+                    diag_amend_tx,
+                    maint_req_rx,
+                    maint_rep_tx,
+                    estop_ack_tx,
+                    estop_overflow_gen,
+                    reclaim_state_tx,
+                    reclaim_stop_tx,
+                    reclaim_traj_tx,
+                    reclaim_macro_tx,
+                    #[cfg(feature = "policy-runtime")]
+                    reclaim_policy_tx,
+                    reclaim_return_rx,
+                    safety_log_tx,
+                    shutdown_hold_error,
+                    persist_job_tx,
+                    persist_cmd_rx,
+                    persist_rep_tx,
+                    watchdog_plan_rx,
+                    offload_reclaim_tx,
+                    persist_wake,
+                    estop_state,
+                    hub_clone,
+                    hooks,
+                );
+            })
+        };
+        match spawn_res {
             Ok(jh) => jh,
             Err(e) => {
-                persist_stop.store(true, Ordering::Release);
-                persist_park_thread.unpark();
-                let _ = persist_thread.join();
-                return Err((None, format!("failed to spawn armd-control: {e}")));
+                stop_and_join_persist_bounded(
+                    &persist_stop,
+                    &persist_park_thread,
+                    &persist_exited_cv,
+                    persist_thread,
+                    startup_deadline,
+                );
+                return Err(SpawnExecutorError::Recoverable {
+                    core: Box::new(core),
+                    unsupported_reason: None,
+                    msg: format!("failed to spawn armd-control: {e}"),
+                });
             }
         }
     };
-
-    let executor_thread_id = match ready_rx.recv() {
-        Ok(Ok(tid)) => tid,
-        Ok(Err((returned_core, msg))) => {
-            persist_stop.store(true, Ordering::Release);
-            persist_park_thread.unpark();
-            let _ = persist_thread.join();
+    if let Err(mpsc::SendError(core)) = core_tx.send(core) {
+        stop_and_join_persist_bounded(
+            &persist_stop,
+            &persist_park_thread,
+            &persist_exited_cv,
+            persist_thread,
+            startup_deadline,
+        );
+        if wait_control_exited_or_timed_out_until(
+            &control_exited_cv,
+            &teardown_disable,
+            startup_deadline,
+        ) {
             let _ = control_thread.join();
-            return Err((returned_core, msg));
         }
-        Err(_) => {
-            persist_stop.store(true, Ordering::Release);
-            persist_park_thread.unpark();
-            let _ = persist_thread.join();
-            let _ = control_thread.join();
-            return Err((None, "armd-control exited before signaling readiness".into()));
+        return Err(SpawnExecutorError::Recoverable {
+            core: Box::new(core),
+            unsupported_reason: None,
+            msg: "armd-control exited before receiving core ownership".into(),
+        });
+    }
+
+    let executor_thread_id = match startup_gate.wait_until(startup_deadline) {
+        StartupWaitOutcome::Ready(tid) => tid,
+        StartupWaitOutcome::Failed(err) => {
+            stop_and_join_persist_bounded(
+                &persist_stop,
+                &persist_park_thread,
+                &persist_exited_cv,
+                persist_thread,
+                startup_deadline,
+            );
+            if wait_control_exited_or_timed_out_until(
+                &control_exited_cv,
+                &teardown_disable,
+                startup_deadline,
+            ) {
+                let _ = control_thread.join();
+            }
+            return Err(err);
+        }
+        StartupWaitOutcome::TimedOut => {
+            // Driver stalled during preflight (`position_limits` / `supports_rt_executor`) or
+            // startup init (`set_estop_gate` / `set_rt_mode`): latch E-stop immediately, detach
+            // `armd-control` (late worker sees `TimedOut`, runs bounded disable, and drops `core`
+            // exclusively on `armd-control`), and fail startup so `OWNER_FAILED` is committed.
+            estop_state_caller.request_and_latch();
+            exited.store(true, Ordering::Release);
+            stop_and_join_persist_bounded(
+                &persist_stop,
+                &persist_park_thread,
+                &persist_exited_cv,
+                persist_thread,
+                Instant::now() + Duration::from_millis(50),
+            );
+            drop(control_thread);
+            return Err(SpawnExecutorError::Fatal("RT executor startup timed out".into()));
         }
     };
 
@@ -4438,6 +5222,7 @@ pub(crate) fn spawn_executor(
         target_writer: target_writer_handle,
         servo_dispatcher,
         stop_requests,
+        estop_state: estop_state_caller,
         stats,
         maint_client,
         urgent_stop_client,
@@ -4450,14 +5235,13 @@ pub(crate) fn spawn_executor(
         control_stop,
         persist_stop,
         exited,
+        control_rt_state: std::sync::atomic::AtomicU8::new(RT_STATE_RUNNING),
         control_exited_cv,
         persist_worker_exited,
         persist_exited_cv,
         shutdown_confirmed: Arc::new(AtomicBool::new(false)),
         teardown_disable,
-        teardown_disable_timeout: hooks
-            .panic_disable_timeout
-            .unwrap_or(crate::supervisor::PANIC_DISABLE_TIMEOUT),
+        teardown_disable_timeout: startup_bound,
         persist_thread: Mutex::new(Some(persist_thread)),
         control_thread: Mutex::new(Some(control_thread)),
         monitor_thread: Mutex::new(monitor_thread),
@@ -4891,10 +5675,13 @@ impl ControlState {
             MaintenanceOp::Observation => MaintenanceResult::Observation(Box::new(core.current_observation())),
             MaintenanceOp::ClearFault { expected_epoch } => {
                 self.shutdown_committed = false;
-                let res = core.clear_fault_executor_bounded_for_release(
+                let clock_hook = self.hooks.clock.clone();
+                let mut live_now = || clock_hook.as_ref().map_or_else(Instant::now, |c| c.now());
+                let res = core.clear_fault_executor_bounded_for_release_with_clock(
                     ctx.now,
                     release_deadline,
                     expected_epoch,
+                    &mut live_now,
                 );
                 if res.is_ok() {
                     *release_flags |= RELEASE_FLAG_CLEAR_OK;
@@ -4913,7 +5700,9 @@ impl ControlState {
                 auth_policy,
                 operator,
             } => {
-                let out = super::requests::lease::install_lease_clear_fault_rt(
+                let clock_hook = self.hooks.clock.clone();
+                let mut live_now = || clock_hook.as_ref().map_or_else(Instant::now, |c| c.now());
+                let out = super::requests::lease::install_lease_clear_fault_rt_with_clock(
                     core,
                     connection,
                     lease_generation,
@@ -4924,6 +5713,7 @@ impl ControlState {
                     operator,
                     ctx.now,
                     release_deadline,
+                    &mut live_now,
                 );
                 if matches!(out, super::requests::lease::LeaseClearFaultOutcome::Cleared { .. }) {
                     self.shutdown_committed = false;
@@ -5444,6 +6234,7 @@ impl ControlState {
                 }
             }
             a.finished_at = Some(now);
+            core.record_terminal_transition_by_id(id);
         }
     }
 
@@ -5859,8 +6650,30 @@ fn spawn_persist_worker(
     persist_worker_exited: Arc<AtomicBool>,
     persist_exited_cv: Arc<(Mutex<bool>, Condvar)>,
     hub: Arc<StateHub>,
+    terminal_capture: Option<Arc<crate::supervisor::terminal_capture::TerminalCaptureChannel>>,
     hooks: PersistTestHooks,
 ) -> std::io::Result<JoinHandle<()>> {
+    fn mirror_persist_cmd_text(
+        ch: Option<&crate::supervisor::terminal_capture::TerminalCaptureChannel>,
+        cmd: &PersistCmd,
+    ) {
+        let Some(ch) = ch else {
+            return;
+        };
+        match cmd {
+            PersistCmd::Fail { action_id, message, .. }
+            | PersistCmd::Abort { action_id, message, .. } => {
+                ch.mirror_action_message(*action_id, message);
+            }
+            PersistCmd::DirSyncFailed {
+                action_id, warning, ..
+            } => {
+                ch.mirror_action_durability_warning(*action_id, warning);
+            }
+            _ => {}
+        }
+    }
+
     struct ExitFlag(Arc<AtomicBool>, Arc<(Mutex<bool>, Condvar)>, Arc<StateHub>);
     impl Drop for ExitFlag {
         fn drop(&mut self) {
@@ -5877,6 +6690,7 @@ fn spawn_persist_worker(
         let _exit_guard = ExitFlag(persist_worker_exited, persist_exited_cv, hub);
         let mut last_sent_watchdog_park: Option<(u64, u8)> = None;
         let push_cmd = |tx: &mut Producer<PersistCmd>, cmd: PersistCmd, stop: &AtomicBool, dead: &AtomicBool| -> bool {
+            mirror_persist_cmd_text(terminal_capture.as_deref(), &cmd);
             let mut pending = Some(cmd);
             while let Some(c) = pending.take() {
                 if stop.load(Ordering::Acquire) || dead.load(Ordering::Acquire) || tx.is_abandoned() {
@@ -6007,6 +6821,7 @@ fn spawn_persist_worker(
                 cw_guard: Some(_cw),
                 published_config: &published_config,
                 hub: &hub_for_refresh,
+                terminal_capture: terminal_capture.as_deref(),
                 persist_stop: &persist_stop,
                 control_exited: &control_exited,
                 hooks: &hooks,
@@ -6035,6 +6850,7 @@ struct ExecutorPersistBackend<'a> {
     cw_guard: Option<tokio::sync::MutexGuard<'a, ()>>,
     published_config: &'a Arc<super::requests::config::PublishedConfigHub>,
     hub: &'a Arc<StateHub>,
+    terminal_capture: Option<&'a crate::supervisor::terminal_capture::TerminalCaptureChannel>,
     persist_stop: &'a Arc<AtomicBool>,
     control_exited: &'a Arc<AtomicBool>,
     hooks: &'a PersistTestHooks,
@@ -6049,6 +6865,20 @@ struct ExecutorPersistBackend<'a> {
 
 impl ExecutorPersistBackend<'_> {
     fn push_cmd(&mut self, cmd: PersistCmd) -> bool {
+        if let Some(ch) = self.terminal_capture {
+            match &cmd {
+                PersistCmd::Fail { action_id, message, .. }
+                | PersistCmd::Abort { action_id, message, .. } => {
+                    ch.mirror_action_message(*action_id, message);
+                }
+                PersistCmd::DirSyncFailed {
+                    action_id, warning, ..
+                } => {
+                    ch.mirror_action_durability_warning(*action_id, warning);
+                }
+                _ => {}
+            }
+        }
         let mut pending = Some(cmd);
         while let Some(c) = pending.take() {
             if self.persist_stop.load(Ordering::Acquire)
@@ -6540,16 +7370,336 @@ impl Drop for WholeReleaseAllocGuard<'_> {
     }
 }
 
+enum StartupSlot {
+    Pending,
+    Ready(ThreadId),
+    Failed(SpawnExecutorError),
+    TimedOut,
+    Taken,
+}
+
+enum StartupWaitOutcome {
+    Ready(ThreadId),
+    Failed(SpawnExecutorError),
+    TimedOut,
+}
+
+/// Single-authority synchronized startup slot carrying BOTH the readiness decision AND any
+/// rollback payload atomically under one mutex/condvar (zero split publication).
+#[derive(Clone)]
+struct StartupGate(Arc<(Mutex<StartupSlot>, Condvar)>);
+
+impl StartupGate {
+    fn new() -> Self {
+        Self(Arc::new((Mutex::new(StartupSlot::Pending), Condvar::new())))
+    }
+
+    fn is_timed_out(&self) -> bool {
+        matches!(
+            *self.0 .0.lock().unwrap_or_else(|e| e.into_inner()),
+            StartupSlot::TimedOut
+        )
+    }
+
+    fn try_settle_ready(&self, tid: ThreadId) -> bool {
+        let mut g = self.0 .0.lock().unwrap_or_else(|e| e.into_inner());
+        if !matches!(*g, StartupSlot::Pending) {
+            return false;
+        }
+        *g = StartupSlot::Ready(tid);
+        self.0 .1.notify_all();
+        true
+    }
+
+    /// Attempts to publish `err` as the single startup outcome. If the caller already timed out,
+    /// returns any rejected recoverable `core` BACK to `armd-control` so the worker can run
+    /// bounded teardown disable before dropping the driver.
+    fn try_settle_failed(&self, err: SpawnExecutorError) -> Option<Box<SupervisorInner>> {
+        let mut g = self.0 .0.lock().unwrap_or_else(|e| e.into_inner());
+        if !matches!(*g, StartupSlot::Pending) {
+            return match err {
+                SpawnExecutorError::Recoverable { core, .. } => Some(core),
+                SpawnExecutorError::Fatal(_) => None,
+            };
+        }
+        *g = StartupSlot::Failed(err);
+        self.0 .1.notify_all();
+        None
+    }
+
+    fn wait_until(&self, deadline: Instant) -> StartupWaitOutcome {
+        let mut g = self.0 .0.lock().unwrap_or_else(|e| e.into_inner());
+        while matches!(*g, StartupSlot::Pending) {
+            let rem = deadline.saturating_duration_since(Instant::now());
+            if rem.is_zero() {
+                *g = StartupSlot::TimedOut;
+                return StartupWaitOutcome::TimedOut;
+            }
+            let (next, res) = self.0 .1.wait_timeout(g, rem).unwrap_or_else(|e| e.into_inner());
+            g = next;
+            if matches!(*g, StartupSlot::Pending) && res.timed_out() {
+                *g = StartupSlot::TimedOut;
+                return StartupWaitOutcome::TimedOut;
+            }
+        }
+        match std::mem::replace(&mut *g, StartupSlot::Taken) {
+            StartupSlot::Ready(tid) => StartupWaitOutcome::Ready(tid),
+            StartupSlot::Failed(err) => StartupWaitOutcome::Failed(err),
+            StartupSlot::TimedOut | StartupSlot::Pending | StartupSlot::Taken => {
+                StartupWaitOutcome::TimedOut
+            }
+        }
+    }
+}
+
+/// RAII fallback guard on `armd-control`: if startup exits or unwinds unexpectedly before
+/// settling `StartupGate`, latches shared E-stop BEFORE publishing terminal failure.
+struct StartupAbortGuard {
+    gate: StartupGate,
+    estop_state: Arc<crate::rt_core::urgent::EstopState>,
+    control_exited_cv: Arc<(Mutex<ControlExitState>, Condvar)>,
+    exited: Arc<AtomicBool>,
+    hub: Arc<StateHub>,
+}
+
+impl Drop for StartupAbortGuard {
+    fn drop(&mut self) {
+        let still_pending = matches!(
+            *self.gate.0 .0.lock().unwrap_or_else(|e| e.into_inner()),
+            StartupSlot::Pending
+        );
+        if still_pending {
+            self.estop_state.request_and_latch();
+            let _ = self.gate.try_settle_failed(SpawnExecutorError::Fatal(
+                "armd-control exited unexpectedly before signaling readiness".into(),
+            ));
+            self.exited.store(true, Ordering::Release);
+            {
+                let mut st = self
+                    .control_exited_cv
+                    .0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                st.dropping = true;
+                st.exited = true;
+            }
+            self.control_exited_cv.1.notify_all();
+            self.hub.wake();
+        }
+    }
+}
+
+fn wait_bool_cv_until(cv: &(Mutex<bool>, Condvar), deadline: Instant) -> bool {
+    let mut g = cv.0.lock().unwrap_or_else(|e| e.into_inner());
+    while !*g {
+        let rem = deadline.saturating_duration_since(Instant::now());
+        if rem.is_zero() {
+            break;
+        }
+        let (next, res) = cv.1.wait_timeout(g, rem).unwrap_or_else(|e| e.into_inner());
+        g = next;
+        if res.timed_out() {
+            break;
+        }
+    }
+    *g
+}
+
+fn stop_and_join_persist_bounded(
+    persist_stop: &AtomicBool,
+    persist_park_thread: &Thread,
+    persist_exited_cv: &(Mutex<bool>, Condvar),
+    persist_thread: JoinHandle<()>,
+    deadline: Instant,
+) {
+    persist_stop.store(true, Ordering::Release);
+    persist_park_thread.unpark();
+    if wait_bool_cv_until(persist_exited_cv, deadline) {
+        let _ = persist_thread.join();
+    } else {
+        tracing::warn!(
+            "Teardown: detaching stalled persistence worker (`armd-persist`) after bounded wait so startup/shutdown/Drop cannot block indefinitely"
+        );
+        drop(persist_thread);
+    }
+}
+
+/// Shared bounded wait for `armd-control` completion across startup failure, ordinary teardown,
+/// panic teardown, and emergency teardown. Returns `true` ONLY when `control_exited_cv.exited`
+/// became `true` (published strictly AFTER `drop(core)` completes on `armd-control`); returns
+/// `false` immediately if `teardown_disable.timed_out` is set or `deadline` elapses.
+fn wait_control_exited_or_timed_out_until(
+    control_exited_cv: &(Mutex<ControlExitState>, Condvar),
+    teardown_disable: &TeardownDisable,
+    deadline: Instant,
+) -> bool {
+    let (lock, cv) = control_exited_cv;
+    let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while !st.exited {
+        if teardown_disable.timed_out.load(Ordering::Acquire) {
+            return false;
+        }
+        let rem = deadline.saturating_duration_since(Instant::now());
+        if rem.is_zero() {
+            return false;
+        }
+        let (next, res) = cv.wait_timeout(st, rem).unwrap_or_else(|e| e.into_inner());
+        st = next;
+        if st.exited {
+            return true;
+        }
+        if teardown_disable.timed_out.load(Ordering::Acquire) || res.timed_out() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Shared bounded teardown/panic-disable helper used across startup failure, startup panic,
+/// release-loop panic, and emergency shutdown so there is one deadline/observer/abort path.
+///
+/// When `probe_enable_with_estop` is `Some(estop_state)`, the driver enable-state probe runs
+/// INSIDE the armed deadline observer and `catch_unwind` before deciding whether disable can be
+/// skipped: any non-disabled state, unknown state, or probe panic latches E-stop and runs
+/// `attempt_panic_disable_until`; any probe or disable stall latches E-stop in the deadline
+/// observer before publishing timeout.
+#[allow(clippy::too_many_arguments)]
+fn run_bounded_teardown_disable(
+    core: &mut SupervisorInner,
+    teardown_disable: &Arc<TeardownDisable>,
+    exited: &Arc<AtomicBool>,
+    control_exited_cv: &Arc<(Mutex<ControlExitState>, Condvar)>,
+    hub: &Arc<StateHub>,
+    hooks: &PersistTestHooks,
+    policy: Option<PanicPolicy>,
+    context: &'static str,
+    secondary_panic_msg: &'static str,
+    startup_gate_on_timeout: Option<StartupGate>,
+    probe_enable_with_estop: Option<&Arc<crate::rt_core::urgent::EstopState>>,
+) {
+    let disable_timeout = hooks
+        .panic_disable_timeout
+        .unwrap_or(crate::supervisor::PANIC_DISABLE_TIMEOUT);
+    let td_obs = Arc::clone(teardown_disable);
+    let exited_obs = Arc::clone(exited);
+    let cv_obs = Arc::clone(control_exited_cv);
+    let hub_obs = Arc::clone(hub);
+    let timeout_hook = hooks.on_panic_disable_timeout.clone();
+    let estop_obs = probe_enable_with_estop.map(Arc::clone);
+    let origin = Instant::now();
+    let (coop_deadline, hard_deadline) =
+        crate::supervisor::panic_disable_deadlines(origin, disable_timeout);
+    let coop_budget = coop_deadline.saturating_duration_since(origin);
+    let completed = crate::supervisor::run_with_panic_deadline_observer_until(
+        hard_deadline,
+        || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if let Some(estop_state) = probe_enable_with_estop {
+                    let confirmed_disabled = !core.is_torqued
+                        && !core.disable_pending
+                        && match core.driver.as_ref() {
+                            None => true,
+                            Some(d) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                d.with_ref(|drv| {
+                                    drv.enable_state() == crate::driver::EnableState::Disabled
+                                        && !drv.has_any_joint_enabled()
+                                        && !drv.has_known_partial_enable()
+                                })
+                                .unwrap_or(false)
+                            }))
+                            .unwrap_or(false),
+                        };
+                    if confirmed_disabled {
+                        return crate::supervisor::PanicDisableOutcome::Confirmed;
+                    }
+                    estop_state.request_and_latch();
+                }
+                core.attempt_panic_disable_until(coop_deadline, hard_deadline, coop_budget)
+            }))
+            .unwrap_or_else(|_| {
+                crate::supervisor::PanicDisableOutcome::Failed(secondary_panic_msg.into())
+            })
+        },
+        |outcome| teardown_disable.try_set_outcome_before(outcome.clone(), hard_deadline),
+        move || {
+            // If the enable-state probe stalled before reaching `request_and_latch`, latch the
+            // shared E-stop BEFORE publishing timeout so callers always observe an E-stop latch.
+            if let Some(ref estop) = estop_obs {
+                estop.request_and_latch();
+            }
+            let timed_out = crate::supervisor::PanicDisableOutcome::TimedOut;
+            td_obs.set_outcome(timed_out.clone());
+            // Wake any teardown waiter on `control_exited_cv` WITHOUT setting `exited = true`,
+            // so `wait_control_exited_or_timed_out_until` observes `timed_out` immediately and detaches.
+            {
+                let _g = cv_obs.0.lock().unwrap_or_else(|e| e.into_inner());
+                cv_obs.1.notify_all();
+            }
+            timed_out.log(context, disable_timeout);
+            if matches!(policy, Some(PanicPolicy::AbortProcess)) {
+                crate::diagnostics::logwriter::flush_all(Duration::from_millis(200));
+                std::process::exit(1);
+            }
+            if let Some(ref gate) = startup_gate_on_timeout {
+                let _ = gate.try_settle_failed(SpawnExecutorError::Fatal(format!(
+                    "{context}: bounded disable timed out"
+                )));
+            }
+            if policy.is_some() || startup_gate_on_timeout.is_some() {
+                // Do NOT mark `control_exited_cv.exited` true here: `armd-control` is still
+                // blocked inside the driver call and must be detached rather than joined.
+                exited_obs.store(true, Ordering::Release);
+                hub_obs.wake();
+                if let Some(hook) = timeout_hook {
+                    hook();
+                }
+            }
+        },
+    );
+    if let Some(outcome) = completed {
+        #[cfg(not(target_arch = "wasm32"))]
+        core.record_post_panic_disable_shadow(policy.is_some(), &outcome);
+        outcome.log(context, disable_timeout);
+        if matches!(policy, Some(PanicPolicy::AbortProcess)) {
+            crate::diagnostics::logwriter::flush_all(Duration::from_millis(500));
+            std::process::exit(1);
+        }
+    } else {
+        #[cfg(not(target_arch = "wasm32"))]
+        core.record_post_panic_disable_shadow(
+            policy.is_some(),
+            &crate::supervisor::PanicDisableOutcome::TimedOut,
+        );
+    }
+}
+
+fn mark_control_exited(
+    exited: &AtomicBool,
+    control_exited_cv: &(Mutex<ControlExitState>, Condvar),
+    hub: &StateHub,
+) {
+    exited.store(true, Ordering::Release);
+    {
+        let mut st = control_exited_cv.0.lock().unwrap_or_else(|e| e.into_inner());
+        st.dropping = true;
+        st.exited = true;
+    }
+    control_exited_cv.1.notify_all();
+    hub.wake();
+}
+
 #[allow(clippy::too_many_arguments)]
 fn control_thread_main(
     mut core: SupervisorInner,
     engine: ReleaseEngine,
     cfg: ExecutorConfig,
     initial_generation: u64,
-    ready_tx: mpsc::SyncSender<Result<ThreadId, (Option<Box<SupervisorInner>>, String)>>,
+    stop_requests_init: super::urgent::StopRequests,
+    closed_bitset_init: Arc<super::requests::actions::ClosedBitset>,
+    startup_gate: StartupGate,
     control_stop: Arc<AtomicBool>,
     exited: Arc<AtomicBool>,
-    control_exited_cv: Arc<(Mutex<bool>, Condvar)>,
+    control_exited_cv: Arc<(Mutex<ControlExitState>, Condvar)>,
     teardown_disable: Arc<TeardownDisable>,
     stats: Arc<ExecutorStats>,
     control_sched: Arc<Mutex<Option<crate::diagnostics::tick::ControlThreadSched>>>,
@@ -6579,64 +7729,245 @@ fn control_thread_main(
     hub: Arc<StateHub>,
     hooks: PersistTestHooks,
 ) {
-    if let Some(return_core) = hooks.fail_init {
-        if return_core {
-            let _ = ready_tx.send(Err((Some(Box::new(core)), "simulated executor init failure (recoverable)".into())));
-        } else {
-            drop(core);
-            let _ = ready_tx.send(Err((None, "simulated executor init failure (core lost)".into())));
-        }
-        exited.store(true, Ordering::Release);
-        *control_exited_cv.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
-        control_exited_cv.1.notify_all();
-        hub.wake();
-        return;
+    let _abort_guard = StartupAbortGuard {
+        gate: startup_gate.clone(),
+        estop_state: Arc::clone(&estop_state),
+        control_exited_cv: Arc::clone(&control_exited_cv),
+        exited: Arc::clone(&exited),
+        hub: Arc::clone(&hub),
+    };
+
+    enum StartupStepOutcome {
+        Ready {
+            staged_motion_cfg: Arc<super::requests::motion::MotionConfigSnapshot>,
+            staged_prep_env: Arc<super::requests::actions::ActionPrepEnv>,
+        },
+        Recoverable {
+            unsupported_reason: Option<&'static str>,
+            msg: String,
+        },
+        NonRecoverable {
+            msg: String,
+        },
+        TimedOut,
     }
 
-    // Complete driver RT mode handoff (including any startup transport writer synchronization)
-    // and nonblocking observation-slot prewarming BEFORE applying SCHED_FIFO so normal-priority
-    // helper threads (e.g. `armd-sim-rx`) can never suffer priority inversion during startup and
-    // release #1 allocates nothing even under stalled readers.
-    core.rt_executor_owned = true;
-    core.before_publish_hook = hooks.before_publish.clone();
-    core.safety.set_off_thread_reclaim(true);
-    core.prewarm_rt_buffers();
-    if let Some(ref d) = core.driver {
-        if let Ok(mut drv) = d.lock() {
+    // Complete ALL driver preflight (`position_limits`, `supports_rt_executor`), executor routing,
+    // driver RT mode handoff, and observation-slot prewarming INSIDE a single unwind boundary
+    // while retaining `core` outside `catch_unwind` for cleanup. Shared hub snapshots are staged
+    // locally and only published AFTER `startup_gate.try_settle_ready` wins so a timed-out worker
+    // never mutates `hub`. Under unwind-enabled builds (`dev`/`test` or `panic = "unwind"`),
+    // `catch_unwind` latches E-stop and runs bounded panic-disable before obeying `cfg.panic_policy`;
+    // under `[profile.release]` (`panic = "abort"`), a Rust panic aborts immediately without
+    // unwinding (relying on motor hardware watchdog / external E-stop).
+    let init_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert!(
+            core.driver
+                .as_ref()
+                .is_none_or(crate::supervisor_lock::DriverSlot::is_exclusive),
+            "RT executor must exclusively own driver without mutex"
+        );
+        if let Some(ref mut slot) = core.driver {
+            slot.bind_current_thread();
+        }
+        if let Some(return_core) = hooks.fail_init {
+            return if return_core {
+                StartupStepOutcome::Recoverable {
+                    unsupported_reason: None,
+                    msg: "simulated executor init failure (recoverable)".into(),
+                }
+            } else {
+                StartupStepOutcome::NonRecoverable {
+                    msg: "simulated executor init failure (core lost)".into(),
+                }
+            };
+        }
+        // Driver preflight before any mutation of `core`'s routing/config fields so explicit
+        // `Err(reason)` from `supports_rt_executor()` returns the untouched core cleanly to Legacy.
+        let mut cached_pos = [None; crate::rt_core::mailbox::MAX_DOF];
+        if let Some(ref d) = core.driver {
+            let dof = core.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
+            let cap_res = d
+                .with_ref(|drv| {
+                    for (i, slot) in cached_pos.iter_mut().take(dof).enumerate() {
+                        *slot = drv.position_limits(i);
+                    }
+                    drv.supports_rt_executor()
+                })
+                .unwrap_or(Err("driver unavailable"));
+            if let Err(reason) = cap_res {
+                return StartupStepOutcome::Recoverable {
+                    unsupported_reason: Some(reason),
+                    msg: format!("Cannot transfer ownership: {reason}"),
+                };
+            }
+        }
+        if startup_gate.is_timed_out() {
+            return StartupStepOutcome::TimedOut;
+        }
+        core.cached_driver_pos_limits = cached_pos;
+        let staged_motion_cfg = Arc::new(
+            super::requests::motion::MotionConfigSnapshot::from_supervisor(&core),
+        );
+        core.set_boot_id(cfg.boot);
+        core.attach_stop_requests(stop_requests_init);
+        core.attach_closed_bitset(closed_bitset_init);
+        let staged_prep_env = Arc::new(super::requests::actions::ActionPrepEnv::from_inner(&core));
+        core.rt_executor_owned = true;
+        core.before_publish_hook = hooks.before_publish.clone();
+        core.safety.set_off_thread_reclaim(true);
+        core.prewarm_rt_buffers();
+        if let Some(drv) = core
+            .driver
+            .as_mut()
+            .and_then(crate::supervisor_lock::DriverSlot::as_exclusive_mut)
+        {
             drv.set_rt_mode(true);
         }
-    }
-    core.prewarm_observation_slots();
-    // Preserve servo stream authorization across legacy -> executor handoff if a valid lease was
-    // already committed before `start_executor`.
-    let pre_lease_gen = core.active_lease_gen_at(Instant::now());
-    if pre_lease_gen != 0 && core.core.target_authority().stream.is_none() {
-        core.authorize_servo_stream_for_committed_lease(pre_lease_gen);
-    }
+        core.prewarm_observation_slots();
+        // Preserve servo stream authorization across legacy -> executor handoff if a valid lease was
+        // already committed before `start_executor`.
+        let pre_lease_gen = core.active_lease_gen_at(Instant::now());
+        if pre_lease_gen != 0 && core.core.target_authority().stream.is_none() {
+            core.authorize_servo_stream_for_committed_lease(pre_lease_gen);
+        }
 
-    if cfg.apply_rt_sched {
-        let s = sched::apply_to_current_thread(&cfg.rt_sched, &cfg.memory_lock);
-        if s.realtime {
-            tracing::info!(
-                "RT executor running at SCHED_FIFO priority {}{}",
-                s.priority,
-                s.cpu.map(|c| format!(" on CPU {c}")).unwrap_or_default()
-            );
+        if cfg.apply_rt_sched {
+            let s = sched::apply_to_current_thread(&cfg.rt_sched, &cfg.memory_lock);
+            if s.realtime {
+                tracing::info!(
+                    "RT executor running at SCHED_FIFO priority {}{}",
+                    s.priority,
+                    s.cpu.map(|c| format!(" on CPU {c}")).unwrap_or_default()
+                );
+            } else {
+                tracing::warn!(
+                    "RT executor real-time scheduling unavailable ({}); using normal scheduling, MIT tracking (when configured) refused",
+                    s.errors.join("; ")
+                );
+            }
+            sched::set_readiness(RtReadiness::from_sched(&s));
+            *control_sched.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
         } else {
-            tracing::warn!(
-                "RT executor real-time scheduling unavailable ({}); using normal scheduling, MIT tracking (when configured) refused",
-                s.errors.join("; ")
+            let s = sched::observe_current_thread(&cfg.memory_lock);
+            *control_sched.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
+        }
+        if cfg.alloc_timing {
+            crate::diagnostics::alloc::time_this_thread();
+        }
+        StartupStepOutcome::Ready {
+            staged_motion_cfg,
+            staged_prep_env,
+        }
+    }));
+
+    let teardown_timeout_loser = |mut core: SupervisorInner| {
+        if core.driver.is_some() || core.is_torqued || core.disable_pending {
+            run_bounded_teardown_disable(
+                &mut core,
+                &teardown_disable,
+                &exited,
+                &control_exited_cv,
+                &hub,
+                &hooks,
+                None,
+                "RT executor late startup abort",
+                "secondary panic during late startup abort disable",
+                None,
+                Some(&estop_state),
             );
         }
-        sched::set_readiness(RtReadiness::from_sched(&s));
-        *control_sched.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
-    } else {
-        let s = sched::observe_current_thread(&cfg.memory_lock);
-        *control_sched.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
+        drop(core);
+        mark_control_exited(&exited, &control_exited_cv, &hub);
+    };
+
+    let (staged_motion_cfg, staged_prep_env) = match init_res {
+        Ok(StartupStepOutcome::Ready {
+            staged_motion_cfg,
+            staged_prep_env,
+        }) => (staged_motion_cfg, staged_prep_env),
+        Ok(StartupStepOutcome::Recoverable {
+            unsupported_reason,
+            msg,
+        }) => {
+            if let Some(rejected_core) = startup_gate.try_settle_failed(
+                SpawnExecutorError::Recoverable {
+                    core: Box::new(core),
+                    unsupported_reason,
+                    msg,
+                },
+            ) {
+                // Caller already timed out while preflight was blocked: never drop a potentially
+                // torqued driver without running bounded disable first.
+                teardown_timeout_loser(*rejected_core);
+            } else {
+                mark_control_exited(&exited, &control_exited_cv, &hub);
+            }
+            return;
+        }
+        Ok(StartupStepOutcome::TimedOut) => {
+            teardown_timeout_loser(core);
+            return;
+        }
+        Ok(StartupStepOutcome::NonRecoverable { msg }) => {
+            if core.driver.is_some() || core.is_torqued || core.disable_pending {
+                run_bounded_teardown_disable(
+                    &mut core,
+                    &teardown_disable,
+                    &exited,
+                    &control_exited_cv,
+                    &hub,
+                    &hooks,
+                    None,
+                    "RT executor init failure",
+                    "secondary panic during RT executor init-failure disable",
+                    Some(startup_gate.clone()),
+                    Some(&estop_state),
+                );
+            }
+            // Publish terminal startup failure BEFORE destroying `core` so a stalling driver
+            // destructor cannot block startup beyond `startup_deadline`.
+            let _ = startup_gate.try_settle_failed(SpawnExecutorError::Fatal(msg));
+            drop(core);
+            mark_control_exited(&exited, &control_exited_cv, &hub);
+            return;
+        }
+        Err(err) => {
+            estop_state.request_and_latch();
+            tracing::error!("RT executor thread panicked during startup initialization: {:?}", err);
+            run_bounded_teardown_disable(
+                &mut core,
+                &teardown_disable,
+                &exited,
+                &control_exited_cv,
+                &hub,
+                &hooks,
+                Some(cfg.panic_policy),
+                "RT executor startup panic",
+                "secondary panic during RT executor startup panic-disable",
+                Some(startup_gate.clone()),
+                None,
+            );
+            let _ = startup_gate.try_settle_failed(SpawnExecutorError::Fatal(
+                "RT executor panicked during startup initialization".into(),
+            ));
+            drop(core);
+            mark_control_exited(&exited, &control_exited_cv, &hub);
+            return;
+        }
+    };
+
+    if !startup_gate.try_settle_ready(thread::current().id()) {
+        // Caller timed out (and latched E-stop + committed OWNER_FAILED) while startup was in
+        // flight: NEVER mutate `hub` or enter the release loop; run bounded teardown disable and
+        // destroy `core` exclusively on `armd-control`.
+        teardown_timeout_loser(core);
+        return;
     }
-    if cfg.alloc_timing {
-        crate::diagnostics::alloc::time_this_thread();
-    }
+    // Publish executor-only snapshots into `hub` strictly AFTER winning startup readiness and
+    // BEFORE release #1 can consume them.
+    hub.set_motion_config(staged_motion_cfg);
+    hub.update_prep_env(staged_prep_env);
 
     let mut engine = engine;
     let stop_requests = engine.stop_requests().clone();
@@ -6675,14 +8006,6 @@ fn control_thread_main(
         sat_msg_buf: Some(String::with_capacity(160)),
         hooks,
     };
-
-    if ready_tx.send(Ok(thread::current().id())).is_err() {
-        exited.store(true, Ordering::Release);
-        *control_exited_cv.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
-        control_exited_cv.1.notify_all();
-        hub.wake();
-        return;
-    }
 
     let clock_hook = state.hooks.clock.clone();
     let now_inst = || -> Instant {
@@ -6865,6 +8188,7 @@ fn control_thread_main(
                         },
                     );
                     if control_stop.load(Ordering::Acquire) {
+                        let (_, captured_any) = core.capture_edge_terminals(core.now_s(), None);
                         if let Some(p) = injected_job_probe.take() {
                             if state.offload_reclaim_tx.push(OffloadReclaim::Probe(p)).is_ok() {
                                 core.core.hub().wake();
@@ -6874,7 +8198,8 @@ fn control_thread_main(
                         state.emit_estop_ack_if_advanced(&mut core);
                         state.drain_retired_states(&mut core, now_inst());
                         core.flush_torque_shadow();
-                        if engine.take_urgent_replies_flushed()
+                        if captured_any
+                            || engine.take_urgent_replies_flushed()
                             || engine.take_lifecycle_replies_flushed()
                             || engine.take_servo_closes_flushed()
                         {
@@ -6882,8 +8207,7 @@ fn control_thread_main(
                         }
                         return None;
                     }
-                    let (phases, body_end) = core.take_tick_phases();
-                    let body_end = body_end.unwrap_or_else(now_inst);
+                    let (phases, _body_end) = core.take_tick_phases();
                     core.defer_zero_check_persist = false;
                     if let Some(p) = core.watchdog_park_pending.filter(|p| !p.waiting_mit_handback) {
                         let key = (p.generation, p.attempt);
@@ -6907,6 +8231,10 @@ fn control_thread_main(
                             }
                             Err(rtrb::PushError::Full(job)) => {
                                 state.reject_saturated_persist_job(&mut core, job, injected_job_probe.take());
+                                let (_, captured_any) = core.capture_edge_terminals(core.now_s(), None);
+                                if captured_any {
+                                    hub.wake();
+                                }
                             }
                         }
                     }
@@ -6950,8 +8278,16 @@ fn control_thread_main(
                     state.drain_retired_states(&mut core, now_inst());
                     let control_hz = core.config.control_frequency_hz;
                     let done = now_inst();
+                    let alloc_t0 = now_inst();
                     let allocs = crate::diagnostics::alloc::take();
+                    let phase_alloc_read = crate::diagnostics::tick::us(
+                        now_inst().saturating_duration_since(alloc_t0),
+                    );
                     let usage_done = UsageMark::now();
+                    let (mid_nvcsw, mid_nivcsw) = match core.take_mid_csw_start() {
+                        Some(m) => crate::diagnostics::tick::mid_csw_delta(&m, &usage_done),
+                        None => (0, 0),
+                    };
                     control_period_us.store((1e6 / f64::from(control_hz.max(1))) as u64, Ordering::Relaxed);
 
                     let sample = TickSample {
@@ -6978,9 +8314,16 @@ fn control_thread_main(
                             tx_us: phases[2],
                             finish_us: phases[3],
                             obs_us: phases[4],
-                            publish_us: crate::diagnostics::tick::us(done.saturating_duration_since(body_end)),
+                            publish_us: core.take_publish_only_us(),
+                        },
+                        phases_us: ReleasePhasesUs {
+                            alloc_read: phase_alloc_read,
+                            terminal: core.take_phase_terminal_us(),
+                            ..ReleasePhasesUs::default()
                         },
                         usage: ThreadUsage {
+                            mid_nvcsw,
+                            mid_nivcsw,
                             lock_alloc_calls: allocs.calls.min(u64::from(u32::MAX)) as u32,
                             lock_alloc_us: (allocs.total_ns / 1000).min(u64::from(u32::MAX)) as u32,
                             lock_alloc_max_us: (allocs.max_ns / 1000).min(u64::from(u32::MAX)) as u32,
@@ -7189,75 +8532,20 @@ fn control_thread_main(
             panicked = true;
             estop_state.request_and_latch();
             tracing::error!("RT executor thread panicked during release: {:?}", err);
-            let disable_timeout = state
-                .hooks
-                .panic_disable_timeout
-                .unwrap_or(crate::supervisor::PANIC_DISABLE_TIMEOUT);
-            let policy = cfg.panic_policy;
-            let td_obs = Arc::clone(&teardown_disable);
-            let exited_obs = Arc::clone(&exited);
-            let hub_obs = Arc::clone(&hub);
-            let timeout_hook = state.hooks.on_panic_disable_timeout.clone();
-            let origin = Instant::now();
-            let (coop_deadline, hard_deadline) =
-                crate::supervisor::panic_disable_deadlines(origin, disable_timeout);
-            let coop_budget = coop_deadline.saturating_duration_since(origin);
-            let completed = crate::supervisor::run_with_panic_deadline_observer_until(
-                hard_deadline,
-                || {
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        core.attempt_panic_disable_until(coop_deadline, hard_deadline, coop_budget)
-                    }))
-                    .unwrap_or_else(|_| {
-                        crate::supervisor::PanicDisableOutcome::Failed(
-                            "secondary panic during RT executor panic-disable".into(),
-                        )
-                    })
-                },
-                |outcome| teardown_disable.try_set_outcome_before(outcome.clone(), hard_deadline),
-                move || {
-                    let timed_out = crate::supervisor::PanicDisableOutcome::TimedOut;
-                    td_obs.set_outcome(timed_out.clone());
-                    timed_out.log("RT executor panic", disable_timeout);
-                    match policy {
-                        PanicPolicy::AbortProcess => {
-                            crate::diagnostics::logwriter::flush_all(Duration::from_millis(200));
-                            std::process::exit(1);
-                        }
-                        PanicPolicy::StopExecutor => {
-                            // Do NOT mark `control_exited_cv` here: `armd-control` is still blocked
-                            // inside the driver call and must be detached rather than joined.
-                            exited_obs.store(true, Ordering::Release);
-                            hub_obs.wake();
-                            if let Some(hook) = timeout_hook {
-                                hook();
-                            }
-                        }
-                    }
-                },
+            run_bounded_teardown_disable(
+                &mut core,
+                &teardown_disable,
+                &exited,
+                &control_exited_cv,
+                &hub,
+                &state.hooks,
+                Some(cfg.panic_policy),
+                "RT executor panic",
+                "secondary panic during RT executor panic-disable",
+                None,
+                None,
             );
-            if let Some(outcome) = completed {
-                #[cfg(not(target_arch = "wasm32"))]
-                core.record_post_panic_disable_shadow(true, &outcome);
-                outcome.log("RT executor panic", disable_timeout);
-                match cfg.panic_policy {
-                    PanicPolicy::AbortProcess => {
-                        crate::diagnostics::logwriter::flush_all(Duration::from_millis(500));
-                        std::process::exit(1);
-                    }
-                    PanicPolicy::StopExecutor => {
-                        break;
-                    }
-                }
-            } else {
-                // Deadline observer already handled timeout logging / exit signaling.
-                #[cfg(not(target_arch = "wasm32"))]
-                core.record_post_panic_disable_shadow(
-                    true,
-                    &crate::supervisor::PanicDisableOutcome::TimedOut,
-                );
-                break;
-            }
+            break;
         }
     }
 
@@ -7271,46 +8559,22 @@ fn control_thread_main(
     };
     stats.finalize_loop_exit(exit_skips);
 
+    let mut disable_ran = false;
     if !panicked && teardown_disable.requested.load(Ordering::Acquire) {
-        let disable_timeout = state
-            .hooks
-            .panic_disable_timeout
-            .unwrap_or(crate::supervisor::PANIC_DISABLE_TIMEOUT);
-        let td_obs = Arc::clone(&teardown_disable);
-        let origin = Instant::now();
-        let (coop_deadline, hard_deadline) =
-            crate::supervisor::panic_disable_deadlines(origin, disable_timeout);
-        let coop_budget = coop_deadline.saturating_duration_since(origin);
-        let completed = crate::supervisor::run_with_panic_deadline_observer_until(
-            hard_deadline,
-            || {
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    core.attempt_panic_disable_until(coop_deadline, hard_deadline, coop_budget)
-                }))
-                .unwrap_or_else(|_| {
-                    crate::supervisor::PanicDisableOutcome::Failed(
-                        "panic during emergency teardown disable".into(),
-                    )
-                })
-            },
-            |outcome| teardown_disable.try_set_outcome_before(outcome.clone(), hard_deadline),
-            move || {
-                let timed_out = crate::supervisor::PanicDisableOutcome::TimedOut;
-                td_obs.set_outcome(timed_out.clone());
-                timed_out.log("RT executor emergency shutdown", disable_timeout);
-            },
+        run_bounded_teardown_disable(
+            &mut core,
+            &teardown_disable,
+            &exited,
+            &control_exited_cv,
+            &hub,
+            &state.hooks,
+            None,
+            "RT executor emergency shutdown",
+            "panic during emergency teardown disable",
+            None,
+            None,
         );
-        if let Some(outcome) = completed {
-            #[cfg(not(target_arch = "wasm32"))]
-            core.record_post_panic_disable_shadow(false, &outcome);
-            outcome.log("RT executor emergency shutdown", disable_timeout);
-        } else {
-            #[cfg(not(target_arch = "wasm32"))]
-            core.record_post_panic_disable_shadow(
-                false,
-                &crate::supervisor::PanicDisableOutcome::TimedOut,
-            );
-        }
+        disable_ran = true;
     }
 
     // Clean exit drain: return queued maintenance and persistence payloads off-thread without
@@ -7339,10 +8603,37 @@ fn control_thread_main(
     }
     state.drain_estop_and_retired_stopped(&mut core, now_inst());
     state.flush_pending_hold_error_for_shutdown(&mut core);
-    exited.store(true, Ordering::Release);
-    *control_exited_cv.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
-    control_exited_cv.1.notify_all();
-    hub.wake();
+    // Synchronized pre-drop checkpoint under `control_exited_cv.0`: if a timed-out forced teardown
+    // requested disable while `armd-control` was finishing a release or post-loop drain, run
+    // bounded disable BEFORE marking `dropping = true` and destroying `core`.
+    loop {
+        let mut st = control_exited_cv.0.lock().unwrap_or_else(|e| e.into_inner());
+        if !panicked && !disable_ran && teardown_disable.requested.load(Ordering::Acquire) {
+            drop(st);
+            run_bounded_teardown_disable(
+                &mut core,
+                &teardown_disable,
+                &exited,
+                &control_exited_cv,
+                &hub,
+                &state.hooks,
+                None,
+                "RT executor forced teardown disable",
+                "panic during forced teardown disable",
+                None,
+                Some(&estop_state),
+            );
+            disable_ran = true;
+            continue;
+        }
+        st.dropping = true;
+        break;
+    }
+    // Destroy `core` (and the exclusively owned driver) BEFORE publishing `control_exited_cv.exited`,
+    // so `teardown_and_join_inner` never enters an unbounded `join()` while a driver destructor
+    // is stalled.
+    drop(core);
+    mark_control_exited(&exited, &control_exited_cv, &hub);
 }
 
 /// Monotonic nanoseconds of `CLOCK_MONOTONIC` (the clock of `Instant` on Linux).
@@ -7737,11 +9028,19 @@ pub fn run_periodic_with_deadline_and_clock(
                         ACTIVE_PERIODIC_RELEASE.try_with(|c| c.take()).ok().flatten()
                     {
                         if std::thread::panicking() {
-                            let sample = crate::diagnostics::tick::take_periodic_sample();
-                            if let (Some(sample), Some(ring)) = (sample, self.stats.legacy_tick_ring.get()) {
-                                let _ = ring.record_staged(&sample, || {
+                            let stashed = crate::diagnostics::tick::take_periodic_sample_with_post_end();
+                            if let (Some((sample, post_end)), Some(ring)) =
+                                (stashed, self.stats.legacy_tick_ring.get())
+                            {
+                                let _ = ring.record_staged_with_publish(&sample, || {
                                     let t = self.clock.map_or_else(mono_now_ns, ExecutorClock::now_ns);
-                                    crate::diagnostics::tick::ns_to_us_u32(t.saturating_sub(actual_ns))
+                                    let rel = crate::diagnostics::tick::ns_to_us_u32(
+                                        t.saturating_sub(actual_ns),
+                                    );
+                                    let pub_us = crate::diagnostics::tick::us(
+                                        Instant::now().saturating_duration_since(post_end),
+                                    );
+                                    (rel, pub_us)
                                 });
                             }
                             let mut exit_releases = Releases { period_ns, next_ns };
@@ -7759,8 +9058,10 @@ pub fn run_periodic_with_deadline_and_clock(
             }
             let _unwind_grid = PeriodicUnwindGridGuard { stats, clock };
             step(elapsed.as_secs_f64(), release_deadline);
+            let step_end_ns = now_ns();
             let _ = ACTIVE_PERIODIC_RELEASE.try_with(|c| c.take());
-            let sample = crate::diagnostics::tick::take_periodic_sample();
+            let sample = crate::diagnostics::tick::take_periodic_sample_with_post_end()
+                .map(|(s, post_end)| (s, post_end, step_end_ns));
             drop(_unwind_grid);
             sample
             // `_lateness_guard` drops here, strictly BEFORE final timing & ring publication.
@@ -7772,26 +9073,46 @@ pub fn run_periodic_with_deadline_and_clock(
             sleep_dur(Duration::from_nanos(post_stats_delay_ns));
         }
 
-        // Publish rolling sample FIRST (before completion seal). `record_staged` stages all
-        // payload fields into the unpublished slot, stamps `release_us` from `now_ns()`, and
-        // publishes `slot.seq` + `meta_seq`.
+        // Publish rolling sample FIRST (before completion seal). `record_staged_with_publish`
+        // stages all payload fields into the unpublished slot, stamps `release_us` and
+        // `phases_us.publish`, and publishes `slot.seq` + `meta_seq`.
         let mut stamped_us: u32 = 0;
+        let mut stamped_pub_us: u32 = 0;
+        let mut stashed_marks: Option<(Instant, u64)> = None;
         let recorded_seq = match (stashed_sample, stats.legacy_tick_ring.get()) {
-            (Some(sample), Some(ring)) => ring.record_staged(&sample, || {
-                let t = now_ns();
-                stamped_us = crate::diagnostics::tick::ns_to_us_u32(t.saturating_sub(actual_ns));
-                stamped_us
-            }),
+            (Some((sample, post_end, step_end_ns)), Some(ring)) => {
+                stashed_marks = Some((post_end, step_end_ns));
+                ring.record_staged_with_publish(&sample, || {
+                    let t = now_ns();
+                    stamped_us = crate::diagnostics::tick::ns_to_us_u32(t.saturating_sub(actual_ns));
+                    let wall_pub = crate::diagnostics::tick::us(
+                        Instant::now().saturating_duration_since(post_end),
+                    );
+                    let clock_pub =
+                        crate::diagnostics::tick::ns_to_us_u32(t.saturating_sub(step_end_ns));
+                    stamped_pub_us = wall_pub.max(clock_pub);
+                    (stamped_us, stamped_pub_us)
+                })
+            }
             _ => None,
         };
 
-        // If OS preemption crossed `record_staged`, amend the slot monotonically BEFORE the
-        // completion seal.
-        let probe_release_us =
-            crate::diagnostics::tick::ns_to_us_u32(now_ns().saturating_sub(actual_ns));
-        if let (Some(seq), Some(ring)) = (recorded_seq, stats.legacy_tick_ring.get()) {
-            if probe_release_us > stamped_us {
-                ring.amend_slot_release_us(seq, probe_release_us);
+        // If OS preemption crossed `record_staged_with_publish`, amend the slot monotonically
+        // BEFORE the completion seal.
+        if let (Some(seq), Some((post_end, step_end_ns)), Some(ring)) =
+            (recorded_seq, stashed_marks, stats.legacy_tick_ring.get())
+        {
+            let t2 = now_ns();
+            let probe_release_us =
+                crate::diagnostics::tick::ns_to_us_u32(t2.saturating_sub(actual_ns));
+            let probe_pub_us = crate::diagnostics::tick::us(
+                Instant::now().saturating_duration_since(post_end),
+            )
+            .max(crate::diagnostics::tick::ns_to_us_u32(
+                t2.saturating_sub(step_end_ns),
+            ));
+            if probe_release_us > stamped_us || probe_pub_us > stamped_pub_us {
+                ring.amend_slot_release_and_publish_us(seq, probe_release_us, probe_pub_us);
             }
         }
 

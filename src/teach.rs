@@ -152,6 +152,13 @@ impl ArmSupervisor {
     /// Load the episode catalog (boot recovery) once; later calls do nothing.
     pub async fn ensure_episodes_loaded(&self) -> Result<Option<store::RecoveryReport>, ArmError> {
         let pub_cfg = self.published_config().await?;
+        if pub_cfg.calibration_quarantined {
+            return Err(rejected(
+                409,
+                "CONFIG_BUSY",
+                "calibration is quarantined pending offline recovery; episode adoption is paused",
+            ));
+        }
         let st = pub_cfg.episodes.clone();
         if !st.enabled() || st.is_loaded() { return Ok(None); }
         let offsets = pub_cfg.joint_zero_offsets.clone();

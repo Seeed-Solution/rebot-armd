@@ -468,7 +468,7 @@ pub async fn start(supervisor: &Arc<ArmSupervisor>, stamp: crate::supervisor::Ad
     Ok(begin_with_stamp(&mut inner, stamp, supervisor, planned)?)
 }
 
-/// Production broker-to-worker handoff for `place` on `OWNER_EXECUTOR` (A7):
+/// Production broker-to-worker handoff for `place` on `OWNER_EXECUTOR` (A7 / P-F1):
 /// submits `BeginMacro` carrying the caller's original `AdmissionStamp` and exact absolute
 /// `deadline`, then spawns the orchestrator with the accepted parent `ActionId`, original
 /// `stamp`, and exact `deadline` (0 `SupervisorLock`).
@@ -477,6 +477,44 @@ pub async fn begin_executor(
     stamp: crate::supervisor::AdmissionStamp,
     planned: PlannedPlace,
 ) -> Result<(u64, f64), ArmError> {
+    let ((id, duration), guard) = begin_executor_inner(
+        supervisor,
+        stamp,
+        planned,
+        crate::rt_core::reply_router::ExternalDestinationPolicy::ConnectionOrGlobal,
+        false,
+        None,
+    )
+    .await?;
+    let _ = guard.confirm_enqueued();
+    Ok((id, duration))
+}
+
+pub(crate) async fn begin_executor_ws(
+    supervisor: &Arc<ArmSupervisor>,
+    stamp: crate::supervisor::AdmissionStamp,
+    planned: PlannedPlace,
+    wire_tracker: Arc<crate::rt_core::reply_router::WsWireAckTracker>,
+) -> Result<((u64, f64), crate::rt_core::reply_router::AckCommitGuard), ArmError> {
+    begin_executor_inner(
+        supervisor,
+        stamp,
+        planned,
+        crate::rt_core::reply_router::ExternalDestinationPolicy::ConnectionOnly,
+        true,
+        Some(wire_tracker),
+    )
+    .await
+}
+
+async fn begin_executor_inner(
+    supervisor: &Arc<ArmSupervisor>,
+    stamp: crate::supervisor::AdmissionStamp,
+    planned: PlannedPlace,
+    policy: crate::rt_core::reply_router::ExternalDestinationPolicy,
+    require_ack_commit: bool,
+    wire_tracker: Option<Arc<crate::rt_core::reply_router::WsWireAckTracker>>,
+) -> Result<((u64, f64), crate::rt_core::reply_router::AckCommitGuard), ArmError> {
     use crate::rt_core::requests::actions::{ActionStamp, DEFAULT_ACTION_DEADLINE};
     let handle = supervisor.executor_handle().ok_or_else(|| ArmError::Rejected {
         status: 503,
@@ -513,9 +551,16 @@ pub async fn begin_executor(
         parent_generation: 0,
         deadline: now + DEFAULT_ACTION_DEADLINE,
     };
-    let (id, _req_id) =
-        crate::macro_action::begin_macro_executor(supervisor, &action_stamp, spec, action_stamp.deadline)
-            .await?;
+    let (id, _req_id, ack_guard) = crate::macro_action::begin_macro_executor_with_barrier(
+        supervisor,
+        &action_stamp,
+        spec,
+        action_stamp.deadline,
+        policy,
+        require_ack_commit,
+        wire_tracker,
+    )
+    .await?;
     let approach_extra = supervisor
         .hub()
         .prep_env()
@@ -527,7 +572,7 @@ pub async fn begin_executor(
         });
     let duration = expected_duration(&planned) + approach_extra;
     spawn_with_deadline(supervisor.clone(), id, planned, stamp, deadline, budget);
-    Ok((id, duration))
+    Ok(((id, duration), ack_guard))
 }
 
 /// Spawn the orchestrator for an action begun with `SupervisorInner::begin_macro(stamp, "place", ..)`.

@@ -1010,6 +1010,9 @@ impl MacroCtx {
                         });
                     }
                 }
+                if let Some(a) = inner.last_action.as_ref().filter(|a| a.id == self.id) {
+                    inner.mirror_rich_action_off_rt(a);
+                }
             }
         }
         sub_res.map(|done| (done, watch)).map_err(|s| (s, true))
@@ -1152,6 +1155,9 @@ impl MacroCtx {
                             contact: contact_flag,
                         });
                     }
+                }
+                if let Some(a) = inner.last_action.as_ref().filter(|a| a.id == self.id) {
+                    inner.mirror_rich_action_off_rt(a);
                 }
             }
         }
@@ -1827,20 +1833,26 @@ fn tag_phase_stop(phase: &str, stop: Stop) -> Stop {
     }
 }
 
-/// Production broker-to-worker `BeginMacro` handoff on `OWNER_EXECUTOR` (A7 / Major 11):
-/// submits `ActionSubmit::BeginMacro(spec)` through the shared bounded FIFO `ActionReplyRouter`
-/// carrying the caller's original `AdmissionStamp` (including `admission_request_id`) and exact
-/// absolute `spec.macro_deadline`, returning `(accepted ActionId, broker RequestId)` on `Ack`
-/// while leaving the parent's subsequent `Reply::Terminal` in the external FIFO queue.
-pub async fn begin_macro_executor(
+/// Production broker-to-worker `BeginMacro` handoff on `OWNER_EXECUTOR` (P-F1):
+/// atomically reserves bounded reply capacity and binds the terminal destination via
+/// [`RtExecutorHandle::submit_external_action`], carrying the caller's original `AdmissionStamp`
+/// (including `admission_request_id`) and exact absolute `spec.macro_deadline`.
+///
+/// Returns `(accepted ActionId, broker RequestId, AckCommitGuard)` on `Ack`. For WebSocket
+/// callers (`require_ack_commit == true`), the caller MUST call `guard.confirm_enqueued()`
+/// strictly AFTER enqueuing `command_ack` onto the socket's outbound control queue.
+pub(crate) async fn begin_macro_executor_with_barrier(
     sup: &ArmSupervisor,
     stamp: &crate::rt_core::requests::actions::ActionStamp,
     spec: crate::rt_core::requests::actions::BeginMacroSpec,
     submit_deadline: Instant,
-) -> Result<(u64, crate::rt_core::broker::RequestId), ArmError> {
+    policy: crate::rt_core::reply_router::ExternalDestinationPolicy,
+    require_ack_commit: bool,
+    wire_tracker: Option<Arc<crate::rt_core::reply_router::WsWireAckTracker>>,
+) -> Result<(u64, crate::rt_core::broker::RequestId, crate::rt_core::reply_router::AckCommitGuard), ArmError> {
     use crate::rt_core::broker::{AdmitError, ClientId, Reply};
+    use crate::rt_core::reply_router::ExternalSubmitError;
     use crate::rt_core::requests::actions::{ActionRefusal, ActionSubmit};
-    use tokio::sync::oneshot::error::TryRecvError;
     let Some(handle) = sup.executor_handle() else {
         return Err(ArmError::Rejected {
             status: 503,
@@ -1848,30 +1860,49 @@ pub async fn begin_macro_executor(
             message: "RT executor is not active".into(),
         });
     };
-    // M1: Refuse at admission before committing any macro if PR L's external reply sink has not
-    // been plugged into `RtExecutorHandle::attach_external_reply_sink`.
-    if !handle.has_external_reply_sink() {
-        return Err(ArmError::Rejected {
-            status: 503,
-            code: "EXECUTOR_ROUTING_PENDING".into(),
-            message: "RT executor has no external reply sink attached for action replies".into(),
-        });
-    }
     let client = ClientId(stamp.admission.connection_id);
     let auth = stamp.broker_authority();
-    let (req_id, mut rx) = loop {
-        match handle.submit_internal_action(
+    let (req_id, mut rx, ack_guard) = loop {
+        match handle.submit_external_action(
             client,
             0,
             auth,
             submit_deadline,
             ActionSubmit::BeginMacro(spec),
+            policy,
+            require_ack_commit,
+            wire_tracker.clone(),
         ) {
-            Ok(pair) => break pair,
-            Err(AdmitError::Disconnected) => {
+            Ok(triple) => break triple,
+            Err(ExternalSubmitError::NoDestination) => {
+                return Err(ArmError::Rejected {
+                    status: 503,
+                    code: "EXECUTOR_ROUTING_PENDING".into(),
+                    message: "RT executor has no reply destination bound for this connection".into(),
+                });
+            }
+            Err(ExternalSubmitError::Stopped) => {
+                return Err(ArmError::Rejected {
+                    status: 503,
+                    code: "EXECUTOR_STOPPED".into(),
+                    message: "RT executor stopped before admitting BeginMacro".into(),
+                });
+            }
+            Err(ExternalSubmitError::NotAnExternalAction) => {
+                return Err(ArmError::Internal("BeginMacro rejected as non-external action".into()));
+            }
+            Err(ExternalSubmitError::Admit(AdmitError::Disconnected)) => {
                 return Err(ActionRefusal::new("LEASE_LOST").into_arm_error_with_epoch(auth.epoch));
             }
-            Err(AdmitError::PlansFull | AdmitError::CommandsFull | AdmitError::RepliesFull) => {
+            Err(ExternalSubmitError::Admit(AdmitError::RepliesFull)) => {
+                handle.pump_broker_replies();
+                if Instant::now() > submit_deadline {
+                    return Err(ActionRefusal::new("TERMINALS_BUSY")
+                        .into_arm_error_with_epoch(auth.epoch));
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            Err(ExternalSubmitError::Admit(AdmitError::PlansFull | AdmitError::CommandsFull)) => {
                 handle.pump_broker_replies();
                 if Instant::now() > submit_deadline {
                     return Err(ActionRefusal::new("DEADLINE_EXPIRED")
@@ -1884,37 +1915,70 @@ pub async fn begin_macro_executor(
     let wait_limit = submit_deadline + Duration::from_secs(2);
     loop {
         handle.pump_broker_replies();
-        match rx.try_recv() {
-            Ok(Reply::Ack { action: Some(id), .. }) => return Ok((id.0, req_id)),
-            Ok(Reply::Ack { action: None, .. }) => {
+        let remaining = wait_limit.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            // Dropping `ack_guard` unconfirmed abandons the terminal and recovers credit cleanly.
+            drop(ack_guard);
+            return Err(ActionRefusal::new("DEADLINE_EXPIRED").into_arm_error_with_epoch(auth.epoch));
+        }
+        let step = remaining.min(Duration::from_millis(2));
+        match tokio::time::timeout(step, &mut rx).await {
+            Ok(Ok(Ok(Reply::Ack { action: Some(id), .. }))) => return Ok((id.0, req_id, ack_guard)),
+            Ok(Ok(Ok(Reply::Ack { action: None, .. }))) => {
+                drop(ack_guard);
                 return Err(ArmError::Internal("BeginMacro ACK omitted ActionId".into()));
             }
-            Ok(Reply::Refused { code, .. }) => {
+            Ok(Ok(Ok(Reply::Refused { code, .. }))) => {
+                drop(ack_guard);
                 let epoch = sup
                     .hub()
                     .latest()
                     .map_or(auth.epoch, |s| s.rt.owner.authority.epoch);
                 return Err(ActionRefusal::new(code).into_arm_error_with_epoch(epoch));
             }
-            Ok(Reply::Terminal { .. }) => {
+            Ok(Ok(Ok(Reply::Terminal { .. }))) => {
+                drop(ack_guard);
                 return Err(ArmError::Internal("unexpected Terminal before BeginMacro ACK".into()));
             }
-            Ok(Reply::Lease { .. }) => {
+            Ok(Ok(Ok(Reply::Lease { .. }))) => {
+                drop(ack_guard);
                 return Err(ArmError::Internal("unexpected Lease reply for BeginMacro".into()));
             }
-            Err(TryRecvError::Closed) => {
+            Ok(Ok(Err(_))) | Ok(Err(_)) => {
+                drop(ack_guard);
                 return Err(ArmError::Rejected {
                     status: 503,
                     code: "EXECUTOR_STOPPED".into(),
                     message: "RT executor stopped before acknowledging BeginMacro".into(),
                 });
             }
-            Err(TryRecvError::Empty) => {}
+            Err(_) => {
+                // Step timeout: loop to pump broker replies (for tests without `armd-dispatch`).
+            }
         }
-        if Instant::now() > wait_limit {
-            handle.cancel_internal_waiter(req_id);
-            return Err(ActionRefusal::new("DEADLINE_EXPIRED").into_arm_error_with_epoch(auth.epoch));
-        }
-        tokio::time::sleep(Duration::from_millis(2)).await;
     }
+}
+
+/// Production broker-to-worker `BeginMacro` handoff on `OWNER_EXECUTOR` (A7 / P-F1):
+/// submits `ActionSubmit::BeginMacro(spec)` through the per-connection reply router (or attached
+/// global fallback sink for direct non-WS callers/tests), returning `(accepted ActionId,
+/// broker RequestId)` on `Ack`.
+pub async fn begin_macro_executor(
+    sup: &ArmSupervisor,
+    stamp: &crate::rt_core::requests::actions::ActionStamp,
+    spec: crate::rt_core::requests::actions::BeginMacroSpec,
+    submit_deadline: Instant,
+) -> Result<(u64, crate::rt_core::broker::RequestId), ArmError> {
+    let (id, req_id, guard) = begin_macro_executor_with_barrier(
+        sup,
+        stamp,
+        spec,
+        submit_deadline,
+        crate::rt_core::reply_router::ExternalDestinationPolicy::ConnectionOrGlobal,
+        false,
+        None,
+    )
+    .await?;
+    let _ = guard.confirm_enqueued();
+    Ok((id, req_id))
 }

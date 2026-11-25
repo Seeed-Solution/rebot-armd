@@ -528,14 +528,85 @@ fn apply_pending_joint_zero(
     }
 }
 
+/// Result of inspecting the durable pending calibration/zero commit marker at startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingMarkerState {
+    /// Confirmed absent (`ErrorKind::NotFound`).
+    Absent,
+    /// Regular pending commit marker file exists on disk.
+    Present(PathBuf),
+    /// Could not inspect marker path or entry is non-regular: fail closed and quarantine.
+    Error(String),
+}
+
+/// Inspect the durable pending calibration/zero commit marker ONCE using `symlink_metadata`.
+/// Only `ErrorKind::NotFound` is treated as absence; any metadata error or non-regular entry
+/// fails closed so startup quarantines uncertain files.
+pub fn inspect_pending_commit_marker(path: &Path) -> PendingMarkerState {
+    let marker_path = crate::rt_core::requests::config::pending_commit_marker_path(path);
+    match std::fs::symlink_metadata(&marker_path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => PendingMarkerState::Absent,
+        Ok(meta) if meta.is_file() => PendingMarkerState::Present(marker_path),
+        Ok(_) => PendingMarkerState::Error(format!(
+            "pending commit marker path {} is not a regular file",
+            marker_path.display()
+        )),
+        Err(e) => PendingMarkerState::Error(format!(
+            "could not inspect pending commit marker {}: {e}",
+            marker_path.display()
+        )),
+    }
+}
+
+/// Returns true if an incomplete calibration or software-zero commit marker exists or cannot be
+/// confirmed absent beside `path`.
+pub fn has_pending_commit_marker(path: &Path) -> bool {
+    !matches!(inspect_pending_commit_marker(path), PendingMarkerState::Absent)
+}
+
 /// Read `calibration.json` at startup (after the grasp setup) and install its camera mount.
-/// A malformed or invalid file is moved aside and the profile mount stays; the grasp setup's
-/// camera model (fx_px, fy_px, cx_px, cy_px, image_size_px, camera_tilt_deg, grip_pixel_norm),
-/// which an apply wrote for the calibrated mount, is reset to the profile values (live and in
-/// `setup_path`, the old file kept as `<name>.pre-reset-<ts>`) so no grasp mixes a calibrated
-/// camera model with the profile mount. The error is reported in `GET /api/v1/calibration`
-/// (`load_error`) until an apply or restore succeeds.
+/// Quarantines into `HoldState::Reconciling` if the pending commit marker is present or unreadable.
 pub async fn load_into(supervisor: &ArmSupervisor, path: &Path, setup_path: Option<&Path>) -> Result<(), String> {
+    let state = inspect_pending_commit_marker(path);
+    load_into_with_marker_state(supervisor, path, setup_path, &state).await
+}
+
+/// Same as [`load_into`] using a single pre-inspected [`PendingMarkerState`] shared across all
+/// startup loaders so startup never observes a changing marker between loaders.
+pub async fn load_into_with_marker_state(
+    supervisor: &ArmSupervisor,
+    path: &Path,
+    setup_path: Option<&Path>,
+    marker_state: &PendingMarkerState,
+) -> Result<(), String> {
+    let quarantine_reason = match marker_state {
+        PendingMarkerState::Absent => None,
+        PendingMarkerState::Present(marker_path) => Some(format!(
+            "Incomplete calibration commit marker {} found at startup; uncertain files quarantined and motion inhibited. \
+             Perform offline recovery: inspect the referenced backup directory, restore the complete affected file set \
+             (calibration.json, grasp_setup.json, poses.json, gripper_calib.json) and rebot-vision intrinsics, remove the marker file, and restart armd",
+            marker_path.display()
+        )),
+        PendingMarkerState::Error(err) => Some(format!(
+            "Pending calibration commit marker check failed at startup ({err}); uncertain files quarantined and motion inhibited until resolved offline and restarted"
+        )),
+    };
+    if let Some(msg) = quarantine_reason {
+        let mut inner = supervisor.inner().write().await;
+        let rev = inner.calibration_revision;
+        inner
+            .core
+            .config_mut()
+            .begin_reconcile(crate::rt_core::config_iface::ConfigDomain::Calibration, rev);
+        tracing::error!("{msg}");
+        inner.calibration_quarantined = true;
+        inner.calibration_load_error = Some(msg);
+        return Ok(());
+    }
+    load_into_inner(supervisor, path, setup_path).await
+}
+
+async fn load_into_inner(supervisor: &ArmSupervisor, path: &Path, setup_path: Option<&Path>) -> Result<(), String> {
     let loaded = crate::persist::load::<CalibrationFile>(path, CalibrationFile::validate);
     let mut inner = supervisor.inner().write().await;
     match loaded {
@@ -750,8 +821,8 @@ impl CalibError {
     pub fn new(status: u16, code: &str, message: impl Into<String>) -> Self {
         Self { status, code: code.into(), message: message.into(), step: None, extra: Map::new() }
     }
-    fn at(mut self, step: &'static str) -> Self { self.step = Some(step); self }
-    fn invalid(message: impl Into<String>) -> Self { Self::new(400, "INVALID_COMMAND", message) }
+    pub(crate) fn at(mut self, step: &'static str) -> Self { self.step = Some(step); self }
+    pub(crate) fn invalid(message: impl Into<String>) -> Self { Self::new(400, "INVALID_COMMAND", message) }
 
     /// Fields of a `command_reject`.
     pub fn reply_fields(&self) -> Map<String, Value> {
@@ -1193,12 +1264,15 @@ async fn vision_put(deps: &CalibrationDeps, values: &Map<String, Value>, expecte
 
 fn revision(v: &Value) -> u64 { v.get("revision").and_then(Value::as_u64).unwrap_or(0) }
 
-/// The intrinsics in `values` (fx..k3, width, height; null / missing skipped) equal those in `got`.
+/// The intrinsics in `values` (fx..k3, width, height, marker_size; null / missing skipped) equal those in `got`.
 fn intrinsics_match(got: &Value, values: &Map<String, Value>) -> bool {
-    INTRINSIC_KEYS.iter().chain(&["width", "height"]).all(|k| match values.get(*k).filter(|v| !v.is_null()).and_then(Value::as_f64) {
-        None => true,
-        Some(want) => got.get(*k).and_then(Value::as_f64).is_some_and(|v| (v - want).abs() <= 1e-9 * want.abs().max(1.0)),
-    })
+    INTRINSIC_KEYS
+        .iter()
+        .chain(&["width", "height", "marker_size"])
+        .all(|k| match values.get(*k).filter(|v| !v.is_null()).and_then(Value::as_f64) {
+            None => true,
+            Some(want) => got.get(*k).and_then(Value::as_f64).is_some_and(|v| (v - want).abs() <= 1e-9 * want.abs().max(1.0)),
+        })
 }
 
 /// What rebot-vision holds after a PUT whose reply was an error (timeout, 500 after the rename).
@@ -1276,7 +1350,8 @@ async fn write_backup(deps: &CalibrationDeps, reason: &str, vision: &Value, stat
         "tool_id": state.tool_id, "tool_config_digest": state.tool_config_digest});
     let vision = vision.clone();
     blocking(move || {
-        std::fs::create_dir_all(&root)?;
+        let durable_root = calib.parent().filter(|p| p.is_dir());
+        crate::persist::create_dir_all_durable_under(&root, durable_root)?;
         let dir = root.join(backup_name(&root));
         std::fs::create_dir(&dir)?;
         let mut files = vec!["vision_intrinsics.json", "manifest.json"];
@@ -1288,7 +1363,20 @@ async fn write_backup(deps: &CalibrationDeps, reason: &str, vision: &Value, stat
         }
         let mut manifest = manifest;
         manifest["files"] = json!(files);
-        crate::persist::write_atomic(&dir.join("manifest.json"), &serde_json::to_string_pretty(&manifest).unwrap_or_default())?;
+        let manifest_path = dir.join("manifest.json");
+        crate::persist::write_atomic(&manifest_path, &serde_json::to_string_pretty(&manifest).unwrap_or_default())?;
+        // Durably fsync the backup directory and backup root so references from a pending commit
+        // marker survive power loss.
+        if let crate::persist::PublishOutcome::PublishedDurabilityUnconfirmed(w) =
+            crate::persist::PendingDirSync::for_path(&manifest_path).sync_parent_dir()
+        {
+            return Err(std::io::Error::other(format!("backup dir fsync failed: {w}")));
+        }
+        if let crate::persist::PublishOutcome::PublishedDurabilityUnconfirmed(w) =
+            crate::persist::PendingDirSync::for_path(&dir).sync_parent_dir()
+        {
+            return Err(std::io::Error::other(format!("backup root fsync failed: {w}")));
+        }
         Ok(dir)
     }).await
 }
@@ -1773,6 +1861,1548 @@ fn diff_view(vision: &Value, state: &ArmdState, inner: &SupervisorInner) -> Valu
         "floor": inner.profile_floor_z_m.map(|p| floor_view_for_with_legacy(p, c, &fp, Some(&legacy_fp), &inner.config.active_tool))});
     if let Some(p) = state.grip_pixel_model { v["grip_pixel_model"] = json!(p); }
     v
+}
+
+/// Off-RT caller authority context for executor-mode calibration and software joint-zero commits.
+pub struct ExecutorCalibAuth {
+    pub admission: crate::supervisor::AdmissionStamp,
+    pub lease_holder: Option<(crate::model::HolderLabel, u64)>,
+    /// Lock-free revocable operator grant verified live on RT at every commit boundary.
+    /// Callers with operator auth disabled pass `OperatorGrant::unenforced()`.
+    pub operator_grant: crate::auth::OperatorGrant,
+    pub auth_check: Arc<dyn Fn() -> Result<(), (&'static str, crate::supervisor::ArmError)> + Send + Sync>,
+    /// Pre-acquired calibration transaction token (set synchronously at WS ingress); `None` for direct callers.
+    pub txn_id: Option<u64>,
+}
+
+/// RAII transaction-bound cleanup guard for `calibration_busy` / `motor_zero_busy` on Executor.
+/// Bound to `txn_id` so stale cleanup can never clear another transaction's busy flag, and
+/// establishes `HoldState::Reconciling` before clearing busy if dropped abnormally after a remote
+/// Vision mutation became possible.
+pub(crate) struct ExecutorTxnGuard {
+    sup: Option<Arc<ArmSupervisor>>,
+    txn_id: u64,
+    remote_mutated: bool,
+}
+
+impl ExecutorTxnGuard {
+    pub(crate) fn new(sup: Arc<ArmSupervisor>, txn_id: u64) -> Self {
+        Self {
+            sup: Some(sup),
+            txn_id,
+            remote_mutated: false,
+        }
+    }
+
+    pub(crate) fn txn_id(&self) -> u64 {
+        self.txn_id
+    }
+
+    pub(crate) fn mark_remote_mutated(&mut self) {
+        self.remote_mutated = true;
+    }
+
+    pub(crate) fn clear_remote_mutated(&mut self) {
+        self.remote_mutated = false;
+    }
+
+    pub(crate) fn disarm(mut self) -> u64 {
+        self.sup = None;
+        self.remote_mutated = false;
+        self.txn_id
+    }
+
+    pub(crate) async fn release(mut self) {
+        if let Some(sup) = self.sup.as_ref().cloned() {
+            let tid = self.txn_id;
+            let force_reconcile = self.remote_mutated;
+            let cleared = matches!(
+                sup.dispatch_config_request_reliable(|| {
+                    crate::rt_core::requests::config::ConfigRequest::EndCalibrationTxn {
+                        txn_id: tid,
+                        force_reconcile,
+                    }
+                })
+                .await,
+                Ok(crate::rt_core::requests::config::ConfigReply::CalibrationTxnEnded(true))
+            );
+            // Disarm ONLY after EndCalibrationTxn completes so cancellation during queue backoff
+            // still runs reliable cleanup in Drop.
+            self.sup = None;
+            self.remote_mutated = false;
+            if cleared {
+                sup.published_config_hub().update(|cfg| {
+                    if cfg.calibration_txn_id == Some(tid) {
+                        cfg.calibration_busy = false;
+                        cfg.calibration_txn_id = None;
+                    }
+                });
+            }
+        }
+    }
+}
+
+impl Drop for ExecutorTxnGuard {
+    fn drop(&mut self) {
+        let Some(sup) = self.sup.take() else { return; };
+        let tid = self.txn_id;
+        let force_reconcile = self.remote_mutated;
+        match tokio::runtime::Handle::try_current() {
+            Ok(h) => {
+                h.spawn(async move {
+                    let cleared = matches!(
+                        sup.dispatch_config_request_reliable(|| {
+                            crate::rt_core::requests::config::ConfigRequest::EndCalibrationTxn {
+                                txn_id: tid,
+                                force_reconcile,
+                            }
+                        })
+                        .await,
+                        Ok(crate::rt_core::requests::config::ConfigReply::CalibrationTxnEnded(true))
+                    );
+                    if cleared {
+                        sup.published_config_hub().update(|cfg| {
+                            if cfg.calibration_txn_id == Some(tid) {
+                                cfg.calibration_busy = false;
+                                cfg.calibration_txn_id = None;
+                            }
+                        });
+                    }
+                });
+            }
+            Err(_) => {
+                if let Some(h) = sup.executor_handle() {
+                    let cleared = matches!(
+                        h.call_config(
+                            crate::rt_core::requests::config::ConfigRequest::EndCalibrationTxn {
+                                txn_id: tid,
+                                force_reconcile,
+                            },
+                        ),
+                        Ok(crate::rt_core::requests::config::ConfigReply::CalibrationTxnEnded(true))
+                    );
+                    if cleared {
+                        sup.published_config_hub().update(|cfg| {
+                            if cfg.calibration_txn_id == Some(tid) {
+                                cfg.calibration_busy = false;
+                                cfg.calibration_txn_id = None;
+                            }
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn calib_error_from_config(err: crate::rt_core::requests::config::ConfigError) -> CalibError {
+    use crate::rt_core::requests::config::ConfigError;
+    match err {
+        ConfigError::CalibPrecondition {
+            status,
+            code,
+            message,
+        } => CalibError::new(status, code, message),
+        ConfigError::CalibPreconditionText {
+            status,
+            code,
+            message,
+        } => CalibError::new(status, code, message.as_str()),
+        ConfigError::MotionBusy { subject, reason } => CalibError::new(
+            409,
+            "MOTION_BUSY",
+            format!("{subject} cannot change while {reason}"),
+        ),
+        other => CalibError::from(other.to_arm_error()),
+    }
+}
+
+pub(crate) fn calib_error_from_deferred_config(
+    err: crate::rt_core::requests::config::ConfigError,
+) -> CalibError {
+    use crate::rt_core::requests::config::ConfigError;
+    match err {
+        ConfigError::LeaseLost | ConfigError::ConnectionClosed => CalibError::new(
+            409,
+            "LEASE_LOST",
+            "This connection lost the lease during the calibration",
+        ),
+        ConfigError::EpochMismatch { .. } => CalibError::new(
+            409,
+            "EPOCH_MISMATCH",
+            "The epoch changed during the calibration (stop or e-stop)",
+        ),
+        ConfigError::Stopped => CalibError::new(
+            409,
+            "STOPPED",
+            "The arm was stopped during the calibration",
+        ),
+        other => calib_error_from_config(other),
+    }
+}
+
+pub(crate) fn calib_error_from_commit(
+    err: crate::rt_core::requests::config::ConfigCommitError,
+    step: &'static str,
+    backup: Option<&Path>,
+) -> CalibError {
+    let disp = err.disposition();
+    let mut ce = CalibError::from(err.error).at(step);
+    if let Some(b) = backup {
+        ce.extra.insert("backup".into(), json!(b.display().to_string()));
+    }
+    if disp == crate::rt_core::requests::config::CommitDisposition::Uncertain {
+        ce.extra.insert("reconciling".into(), json!(true));
+        ce.extra.insert("outcome".into(), json!("uncertain"));
+    }
+    ce
+}
+
+fn calibrated_mount_from_published(
+    pub_cfg: &crate::rt_core::requests::config::PublishedConfig,
+    offset: [f32; 3],
+    q: [f64; 4],
+) -> CameraMount {
+    let mut m = CameraMount {
+        offset_m: Some(offset),
+        q_end_cam: Some(q),
+        ..pub_cfg.profile_camera_mount.clone()
+    };
+    m.tilt_deg = pub_cfg.config.arm_model.mount_tilt_deg(&m) as f32;
+    m
+}
+
+fn armd_state_from_published(
+    pub_cfg: &crate::rt_core::requests::config::PublishedConfig,
+) -> ArmdState {
+    ArmdState {
+        camera_mount: pub_cfg.config.camera_mount.clone(),
+        calibration: pub_cfg.calibration.clone(),
+        grasp_setup: pub_cfg.config.grasp.clone(),
+        tool_id: Some(pub_cfg.config.active_tool.id.clone()),
+        tool_config_digest: Some(pub_cfg.config.active_tool.config_digest.clone()),
+        grip_pixel_model: None,
+    }
+}
+
+fn after_state_from_published(
+    pub_cfg: &crate::rt_core::requests::config::PublishedConfig,
+    req: &ApplyRequest,
+) -> Result<ArmdState, CalibError> {
+    let Some(base) = pub_cfg.config.grasp.clone() else {
+        return Err(CalibError::new(400, "UNSUPPORTED", "This profile has no grasp setup"));
+    };
+    let kinematics = match &req.kinematics {
+        None => pub_cfg.calibration.as_ref().and_then(|c| c.kinematics.clone()),
+        Some(k) => k.clone(),
+    };
+    if let Some(k) = &kinematics {
+        pub_cfg
+            .config
+            .arm_model
+            .with_correction(Some(&k.joints))
+            .map_err(|e| CalibError::new(400, "UNSUPPORTED", e))?;
+    }
+    let mount = calibrated_mount_from_published(pub_cfg, req.offset_m, req.q_end_cam);
+    let g = |k: &str| req.intrinsics[k].as_f64().unwrap_or(f64::NAN);
+    let mut setup = GraspSetup {
+        fx_px: g("fx"),
+        fy_px: g("fy"),
+        cx_px: Some(g("cx")),
+        cy_px: Some(g("cy")),
+        image_size_px: IMAGE_SIZE_PX,
+        table_z_m: req.table_z_m,
+        camera_tilt_deg: f64::from(mount.tilt_deg),
+        ..base
+    };
+    let cam = CamModel::assumed(&pub_cfg.config.arm_model, &setup, &mount);
+    let grip_pixel_model = grip_pixel_norm_for_tcp(&cam, &setup, &pub_cfg.config.tcp_offset);
+    if let Some(p) = grip_pixel_model.filter(|p| p.iter().all(|v| (0.0..=1.0).contains(v))) {
+        setup.grip_pixel_norm = p;
+    }
+    setup
+        .validate()
+        .map_err(|e| CalibError::invalid(format!("grasp setup after the calibration: {e}")))?;
+    let now = || chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let intrinsics = Some(Value::Object(req.intrinsics.clone()));
+    let x_fp = x_fingerprint(intrinsics.as_ref(), &mount);
+    let tool = match &req.tool {
+        None => pub_cfg
+            .calibration
+            .as_ref()
+            .and_then(|c| c.tool.clone())
+            .filter(|t| {
+                t.x_fingerprint == x_fp
+                    && pub_cfg
+                        .config
+                        .active_tool
+                        .matches_tool_calib(&t.tool_id, t.tool_config_digest.as_deref())
+            }),
+        Some(None) => None,
+        Some(Some(t)) => {
+            if t.x_fingerprint != x_fp {
+                return Err(CalibError::new(
+                    409,
+                    "TOOL_STALE",
+                    "tool.x_fingerprint does not match this calibration (intrinsics or camera mount changed since the fingertip was measured); measure the fingertip again",
+                ));
+            }
+            if !pub_cfg
+                .config
+                .active_tool
+                .matches_tool_calib(&t.tool_id, t.tool_config_digest.as_deref())
+            {
+                return Err(CalibError::new(
+                    409,
+                    "TOOL_STALE",
+                    format!(
+                        "tool ({:?} / {:?}) does not match active tool '{}' ({}); measure the fingertip again",
+                        t.tool_id,
+                        t.tool_config_digest,
+                        pub_cfg.config.active_tool.id,
+                        pub_cfg.config.active_tool.config_digest
+                    ),
+                ));
+            }
+            let spec = pub_cfg
+                .config
+                .calibration_tool
+                .as_ref()
+                .filter(|s| s.tool_id == t.tool_id);
+            let tool = ToolCalibration {
+                tool_id: t.tool_id.clone(),
+                tip_cam_m: t.tip_cam_m,
+                edge_to_low_m: spec.and_then(|s| s.edge_to_low_m),
+                gripper_opening: t.gripper_opening,
+                measured_at: t
+                    .measured_at
+                    .clone()
+                    .filter(|m| !m.is_empty())
+                    .unwrap_or_else(now),
+                x_fingerprint: t.x_fingerprint.clone(),
+                fit: t.fit.clone(),
+                tool_config_digest: Some(pub_cfg.config.active_tool.config_digest.clone()),
+            };
+            validate_tool(&tool).map_err(CalibError::invalid)?;
+            Some(tool)
+        }
+    };
+    let mut file = CalibrationFile {
+        camera_mount: mount.clone(),
+        intrinsics,
+        table_z_m: Some(req.table_z_m),
+        solved_at: Some(req.solved_at.clone().unwrap_or_else(now)),
+        rms: req.rms.clone(),
+        kinematics,
+        stale: None,
+        joint_zero: pub_cfg.calibration.as_ref().and_then(|c| c.joint_zero.clone()),
+        table_z_source: Some(req.table_z_source.clone()),
+        tool,
+        acceptance: None,
+        mit_qualification: pub_cfg
+            .calibration
+            .as_ref()
+            .and_then(|c| c.mit_qualification.clone()),
+    };
+    let (_, fp) = file_fingerprints(
+        Some(&file),
+        &mount,
+        &pub_cfg.joint_zero_offsets,
+        Some(&pub_cfg.config.active_tool.config_digest),
+    );
+    if let Some(a) = &req.acceptance {
+        if a.fingerprint != fp {
+            return Err(CalibError::new(
+                409,
+                "ACCEPTANCE_STALE",
+                "acceptance.fingerprint does not match this calibration (camera, kinematics, joint zero or tool changed since the hovers); run the acceptance again",
+            ));
+        }
+        let rec = AcceptanceRecord {
+            fingerprint: a.fingerprint.clone(),
+            gate_version: a.gate_version,
+            passed: a.passed,
+            measured_at: a
+                .measured_at
+                .clone()
+                .filter(|m| !m.is_empty())
+                .unwrap_or_else(now),
+            board: a.board.clone(),
+            points: a.points.clone(),
+            summary: a.summary.clone(),
+            job_id: a.job_id.clone(),
+            invalidated: None,
+            tool_id: Some(pub_cfg.config.active_tool.id.clone()),
+            tool_config_digest: Some(pub_cfg.config.active_tool.config_digest.clone()),
+        };
+        validate_acceptance(&rec).map_err(CalibError::invalid)?;
+        file.acceptance = Some(rec);
+    }
+    if req.table_z_source == "hover" {
+        let ok = file.acceptance.as_ref().is_some_and(|a| a.passed)
+            && file
+                .tool
+                .as_ref()
+                .is_some_and(|t| t.edge_to_low_m.is_some());
+        if !ok {
+            return Err(CalibError::new(
+                400,
+                "TABLE_Z_UNVERIFIED",
+                "table_z_source hover needs a passed acceptance and a fingertip of a known tool (profile calibration_tool with edge_to_low_m)",
+            ));
+        }
+        let summary_z = file
+            .acceptance
+            .as_ref()
+            .and_then(|a| a.summary.get("table_z_m"))
+            .and_then(Value::as_f64);
+        if summary_z.is_none_or(|z| (z - req.table_z_m).abs() > 1e-6) {
+            return Err(CalibError::invalid(
+                "table_z_source hover: table_z_m must equal acceptance.summary.table_z_m",
+            ));
+        }
+    }
+    Ok(ArmdState {
+        camera_mount: mount,
+        calibration: Some(file),
+        grasp_setup: Some(setup),
+        tool_id: Some(pub_cfg.config.active_tool.id.clone()),
+        tool_config_digest: Some(pub_cfg.config.active_tool.config_digest.clone()),
+        grip_pixel_model,
+    })
+}
+
+fn diff_view_from_published(
+    vision: &Value,
+    state: &ArmdState,
+    pub_cfg: &crate::rt_core::requests::config::PublishedConfig,
+) -> Value {
+    let c = state.calibration.as_ref();
+    let (x_fp, fp) = file_fingerprints(
+        c,
+        &state.camera_mount,
+        &pub_cfg.joint_zero_offsets,
+        Some(&pub_cfg.config.active_tool.config_digest),
+    );
+    let legacy_fp =
+        legacy_file_fingerprint(c, &state.camera_mount, &pub_cfg.joint_zero_offsets);
+    let mut v = json!({
+        "vision_intrinsics": vision,
+        "camera_mount": mount_summary(&state.camera_mount),
+        "kinematics": c.and_then(|c| c.kinematics.as_ref()),
+        "grasp": state.grasp_setup.as_ref().map(grasp_fields),
+        "x_fingerprint": x_fp,
+        "fingerprint": fp,
+        "table_z_m": c.and_then(|c| c.table_z_m),
+        "table_z_source": c.and_then(|c| c.table_z_source.as_deref()),
+        "tool": c.and_then(|c| c.tool.as_ref()),
+        "acceptance": c.and_then(|c| c.acceptance.as_ref()).map(|a| json!({"passed": a.passed, "fingerprint": a.fingerprint, "job_id": a.job_id})),
+        "floor": pub_cfg.profile_floor_z_m.map(|p| floor_view_for_with_legacy(p, c, &fp, Some(&legacy_fp), &pub_cfg.config.active_tool))
+    });
+    if let Some(p) = state.grip_pixel_model {
+        v["grip_pixel_model"] = json!(p);
+    }
+    v
+}
+
+async fn recheck_executor_calib_authority(
+    sup: &ArmSupervisor,
+    auth: &ExecutorCalibAuth,
+    txn_id: u64,
+    step: &'static str,
+) -> Result<(), CalibError> {
+    if let Err((_, arm_err)) = (auth.auth_check)() {
+        return Err(CalibError::from(arm_err).at(step));
+    }
+    let cfg_auth = crate::rt_core::requests::config::ConfigAuthContext {
+        admission: auth.admission,
+        lease_holder: auth.lease_holder,
+    };
+    match sup
+        .dispatch_config_request_reliable(|| {
+            crate::rt_core::requests::config::ConfigRequest::SampleCalibrationState {
+                auth: cfg_auth,
+                operator_grant: auth.operator_grant,
+                expected_epoch: auth.admission.estop_epoch,
+                expected_stop_gen: auth.admission.stop_gen,
+                expected_txn_id: Some(txn_id),
+                require_zero_state_checks: false,
+                check_authority: true,
+            }
+        })
+        .await
+    {
+        Ok(crate::rt_core::requests::config::ConfigReply::CalibrationStateSampled(Ok(_))) => Ok(()),
+        Ok(crate::rt_core::requests::config::ConfigReply::CalibrationStateSampled(Err(e))) => {
+            Err(calib_error_from_deferred_config(e).at(step))
+        }
+        Err(e) => Err(calib_error_from_deferred_config(e).at(step)),
+        _ => Err(CalibError::new(500, "INTERNAL", "unexpected calibration state reply").at(step)),
+    }
+}
+
+/// Fail-closed executor-mode Vision PUT outcome: distinguishes validated 2xx ownership,
+/// terminal 4xx server refusal (no mutation), and ambiguous 5xx/timeout/malformed-2xx outcomes
+/// where no speculative rollback PUT may be issued.
+enum VisionPutOutcome {
+    Applied(u64),
+    Refused(CalibError),
+    Unknown(CalibError),
+}
+
+async fn vision_put_executor(
+    deps: &CalibrationDeps,
+    values: &Map<String, Value>,
+    expected_revision: u64,
+) -> VisionPutOutcome {
+    let mut body = values.clone();
+    body.insert("expected_revision".into(), json!(expected_revision));
+    let bytes = serde_json::to_vec(&Value::Object(body)).unwrap_or_default();
+    match crate::api::proxy::request_status_json(
+        &deps.upstream,
+        "PUT",
+        VISION_INTRINSICS_PATH,
+        Some(&bytes),
+        deps.vision_timeout,
+    )
+    .await
+    {
+        Ok((StatusCode::NOT_FOUND, _)) => VisionPutOutcome::Refused(CalibError::new(
+            409,
+            "VISION_CALIBRATION_UNSUPPORTED",
+            "rebot-vision has no /api/calibration/intrinsics",
+        )),
+        Ok((s, v)) if s.is_success() => match v.get("revision").and_then(Value::as_u64) {
+            Some(rev) if rev > expected_revision => VisionPutOutcome::Applied(rev),
+            other => VisionPutOutcome::Unknown(CalibError::new(
+                502,
+                "VISION_ERROR",
+                format!(
+                    "rebot-vision PUT intrinsics returned {s} without a valid incremented revision (expected > {expected_revision}, got {other:?})"
+                ),
+            )),
+        },
+        Ok((s, v)) if s.is_client_error() => {
+            let code = v
+                .get("code")
+                .or_else(|| v.get("error"))
+                .and_then(Value::as_str)
+                .filter(|c| c.chars().all(|c| c.is_ascii_uppercase() || c == '_'))
+                .unwrap_or("VISION_ERROR");
+            VisionPutOutcome::Refused(CalibError::new(
+                502,
+                code,
+                format!("rebot-vision PUT intrinsics returned {s}: {v}"),
+            ))
+        }
+        Ok((s, v)) => {
+            let code = v
+                .get("code")
+                .or_else(|| v.get("error"))
+                .and_then(Value::as_str)
+                .filter(|c| c.chars().all(|c| c.is_ascii_uppercase() || c == '_'))
+                .unwrap_or("VISION_ERROR");
+            VisionPutOutcome::Unknown(CalibError::new(
+                502,
+                code,
+                format!("rebot-vision PUT intrinsics returned {s}: {v}"),
+            ))
+        }
+        Err(e) => VisionPutOutcome::Unknown(CalibError::new(
+            502,
+            "VISION_UNREACHABLE",
+            format!("rebot-vision: {e}"),
+        )),
+    }
+}
+
+/// Strict executor-mode Vision rollback: uses `vision_put_executor` (requiring a validated 2xx
+/// incremented revision against our exact forward revision) and confirms exact restoration of
+/// optional fields like `marker_size` before clearing the durable intent marker.
+async fn revert_vision_only_executor(
+    deps: &CalibrationDeps,
+    old_validated: &Map<String, Value>,
+    forward_values: &Map<String, Value>,
+    vision_written: Option<u64>,
+    vision_unknown: bool,
+) -> Result<(), Map<String, Value>> {
+    let mut state = Map::new();
+    if vision_unknown {
+        state.insert("vision".into(), json!("unknown"));
+        return Err(state);
+    }
+    let Some(rev) = vision_written else {
+        return Ok(());
+    };
+    match vision_put_executor(deps, old_validated, rev).await {
+        VisionPutOutcome::Applied(_) => {
+            // Confirm optional field parity (e.g., if forward PUT added marker_size that was
+            // absent in old_validated, verify Vision restored exact marker_size presence/value).
+            if forward_values.contains_key("marker_size") != old_validated.contains_key("marker_size")
+            {
+                match vision_get(deps).await {
+                    Ok(got)
+                        if intrinsics_match(&got, old_validated)
+                            && got
+                                .get("marker_size")
+                                .filter(|v| !v.is_null())
+                                .is_some()
+                                == old_validated.contains_key("marker_size") =>
+                    {
+                        Ok(())
+                    }
+                    Ok(_) => {
+                        state.insert(
+                            "vision".into(),
+                            json!("rollback readback did not restore optional marker_size"),
+                        );
+                        Err(state)
+                    }
+                    Err(g) => {
+                        state.insert(
+                            "vision".into(),
+                            json!(format!("rollback readback failed: {}", g.message)),
+                        );
+                        Err(state)
+                    }
+                }
+            } else {
+                Ok(())
+            }
+        }
+        VisionPutOutcome::Refused(e) | VisionPutOutcome::Unknown(e) => {
+            state.insert("vision".into(), json!(format!("revert failed: {}", e.message)));
+            Err(state)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn revert_vision_or_latch_inconsistent(
+    sup: &ArmSupervisor,
+    deps: &CalibrationDeps,
+    old_validated: &Map<String, Value>,
+    forward_values: &Map<String, Value>,
+    vision_written: Option<u64>,
+    vision_unknown: bool,
+    marker_path: Option<&Path>,
+    mut err: CalibError,
+    mut guard: ExecutorTxnGuard,
+) -> CalibError {
+    use crate::rt_core::config_iface::ConfigDomain;
+    use crate::rt_core::requests::config::{remove_pending_commit_marker, ConfigRequest};
+
+    let revert_res = match revert_vision_only_executor(
+        deps,
+        old_validated,
+        forward_values,
+        vision_written,
+        vision_unknown,
+    )
+    .await
+    {
+        Ok(()) => {
+            if let Some(mp) = marker_path {
+                let mp_owned = mp.to_path_buf();
+                let rm_res =
+                    tokio::task::spawn_blocking(move || remove_pending_commit_marker(&mp_owned))
+                        .await
+                        .map_err(|e| e.to_string())
+                        .and_then(|r| r);
+                if let Err(rm_err) = rm_res {
+                    let mut st = Map::new();
+                    st.insert("vision".into(), json!("reverted"));
+                    st.insert("pending_marker".into(), json!(format!("cleanup failed: {rm_err}")));
+                    Err(st)
+                } else {
+                    Ok(())
+                }
+            } else {
+                Ok(())
+            }
+        }
+        Err(st) => Err(st),
+    };
+
+    match revert_res {
+        Ok(()) => {
+            err.extra.insert("reverted".into(), json!(true));
+            guard.clear_remote_mutated();
+            guard.release().await;
+            err
+        }
+        Err(state) => {
+            let msg = format!(
+                "{} failed ({}) and the revert failed; restore the backup",
+                err.step.unwrap_or("calibration_file"),
+                err.message
+            );
+            let bounded = crate::safety::BoundedText::new(&msg);
+            // First atomically establish HoldState::Reconciling and clear calibration_busy via
+            // guard.release(), THEN latch the non-recoverable fault against the Reconciling hold.
+            guard.mark_remote_mutated();
+            guard.release().await;
+            let _ = sup
+                .dispatch_config_request_reliable(|| {
+                    ConfigRequest::LatchConfigReconcileFault {
+                        domain: ConfigDomain::Calibration,
+                        message: bounded,
+                    }
+                })
+                .await;
+            let mut c = CalibError::new(500, "CALIBRATION_INCONSISTENT", msg);
+            c.step = err.step;
+            c.extra = err.extra;
+            c.extra.insert("reconciling".into(), json!(true));
+            c.extra.insert("outcome".into(), json!("uncertain"));
+            c.extra.insert("state".into(), Value::Object(state));
+            c
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_executor_calibration_txn(
+    sup: Arc<ArmSupervisor>,
+    deps: CalibrationDeps,
+    auth: ExecutorCalibAuth,
+    mut guard: ExecutorTxnGuard,
+    reason: &'static str,
+    before: ArmdState,
+    after: ArmdState,
+    vision_before: Value,
+    vision_values: Map<String, Value>,
+    extra_restored: Option<String>,
+) -> Result<Value, CalibError> {
+    use crate::rt_core::config_iface::ConfigDomain;
+    use crate::rt_core::requests::config::{
+        build_config_proposal_with_deadline, pending_commit_marker_path,
+        prepare_eval_bufs_off_thread, run_config_commit_detailed, write_pending_commit_marker,
+        CommitDisposition, ConfigAuthContext, ConfigCandidate, ConfigCommitPlan, ConfigWriteOp,
+        FileWriteOp, ReservePrecheck,
+    };
+
+    let txn_id = guard.txn_id();
+    // Validate the complete Vision before-image and revision BEFORE writing intent or touching Vision.
+    let vision_before_validated = match validate_intrinsics(&vision_before) {
+        Ok(m) => m,
+        Err(e) => {
+            guard.release().await;
+            return Err(CalibError::new(
+                502,
+                "VISION_ERROR",
+                format!("rebot-vision before-image intrinsics invalid: {e}"),
+            )
+            .at("vision"));
+        }
+    };
+    let Some(vision_before_rev) = vision_before.get("revision").and_then(Value::as_u64) else {
+        guard.release().await;
+        return Err(CalibError::new(
+            502,
+            "VISION_ERROR",
+            "rebot-vision before-image missing numeric revision",
+        )
+        .at("vision"));
+    };
+
+    let backup = match write_backup(&deps, reason, &vision_before, &before).await {
+        Ok(b) => b,
+        Err(e) => {
+            guard.release().await;
+            return Err(CalibError::new(500, "PERSIST_FAILED", format!("backup: {e}")).at("backup"));
+        }
+    };
+
+    // Persist a durable intent marker BEFORE issuing the remote vision PUT so a crash, abort,
+    // or panic after vision PUT takes effect quarantines startup into Reconciling rather than
+    // allowing motion with mismatched vision intrinsics and arm calibration.
+    let marker_path = pending_commit_marker_path(&deps.path);
+    let mut planned_files = vec![deps.path.display().to_string()];
+    if let Some(setup_path) = deps.setup_path.as_ref() {
+        planned_files.push(setup_path.display().to_string());
+    }
+    let intent_text = json!({
+        "reason": reason,
+        "txn_id": txn_id,
+        "backup": backup.display().to_string(),
+        "vision_before_revision": vision_before_rev,
+        "files": planned_files,
+    })
+    .to_string();
+    let mp_write = marker_path.clone();
+    let intent_res = tokio::task::spawn_blocking(move || write_pending_commit_marker(&mp_write, &intent_text))
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|r| r);
+    if let Err(e) = intent_res {
+        let mut err = CalibError::new(
+            500,
+            "PERSIST_FAILED",
+            format!("pending intent marker failed before vision PUT: {e}"),
+        )
+        .at("vision");
+        err.extra.insert("backup".into(), json!(backup.display().to_string()));
+        return Err(revert_vision_or_latch_inconsistent(
+            &sup,
+            &deps,
+            &vision_before_validated,
+            &vision_values,
+            None,
+            false,
+            Some(&marker_path),
+            err,
+            guard,
+        )
+        .await);
+    }
+
+    // Fresh authority recheck AFTER durable marker fsync and IMMEDIATELY before remote Vision PUT.
+    if let Err(mut e) = recheck_executor_calib_authority(&sup, &auth, txn_id, "vision").await {
+        e.extra.insert("backup".into(), json!(backup.display().to_string()));
+        return Err(revert_vision_or_latch_inconsistent(
+            &sup,
+            &deps,
+            &vision_before_validated,
+            &vision_values,
+            None,
+            false,
+            Some(&marker_path),
+            e,
+            guard,
+        )
+        .await);
+    }
+
+    // Arm the live-owner reconciliation interlock on `guard` BEFORE remote Vision mutation becomes
+    // possible so an abnormal worker panic/abort never lifts motion inhibit.
+    guard.mark_remote_mutated();
+    let vision_unknown = false;
+    let vision_written: Option<u64> =
+        match vision_put_executor(&deps, &vision_values, vision_before_rev).await {
+            VisionPutOutcome::Applied(rev) => Some(rev),
+        VisionPutOutcome::Refused(e) => {
+            // Terminal 4xx refusal from rebot-vision: remote state was NOT mutated.
+            let mut err = e.at("vision");
+            err.extra
+                .insert("backup".into(), json!(backup.display().to_string()));
+            return Err(revert_vision_or_latch_inconsistent(
+                &sup,
+                &deps,
+                &vision_before_validated,
+                &vision_values,
+                None,
+                false,
+                Some(&marker_path),
+                err,
+                guard,
+            )
+            .await);
+        }
+        VisionPutOutcome::Unknown(e) => {
+            // Timeout, transport failure, 5xx, or malformed 2xx: never guess ownership via GET or
+            // issue a speculative rollback PUT that could overwrite a competing writer. Keep the
+            // durable intent marker and force Reconciling + fault latch.
+            let mut err = e.at("vision");
+            err.extra
+                .insert("backup".into(), json!(backup.display().to_string()));
+            return Err(revert_vision_or_latch_inconsistent(
+                &sup,
+                &deps,
+                &vision_before_validated,
+                &vision_values,
+                None,
+                true,
+                Some(&marker_path),
+                err,
+                guard,
+            )
+            .await);
+        }
+    };
+
+    // Build pre-validated candidate and multi-file batch off-RT from PublishedConfig.
+    let pub_cfg = match sup.published_config().await {
+        Ok(p) => p,
+        Err(arm_err) => {
+            let mut err = CalibError::from(arm_err).at("calibration_file");
+            err.extra
+                .insert("backup".into(), json!(backup.display().to_string()));
+            return Err(revert_vision_or_latch_inconsistent(
+                &sup,
+                &deps,
+                &vision_before_validated,
+                &vision_values,
+                vision_written,
+                vision_unknown,
+                Some(&marker_path),
+                err,
+                guard,
+            )
+            .await);
+        }
+    };
+
+    let kin = correction_of(after.calibration.as_ref()).copied();
+    let kin_changed = kin.as_ref() != correction_of(before.calibration.as_ref());
+    let arm_model = match pub_cfg.config.arm_model.with_correction(kin.as_ref()) {
+        Ok(m) => m,
+        Err(e) => {
+            let mut err = CalibError::new(400, "UNSUPPORTED", e).at("calibration_file");
+            err.extra
+                .insert("backup".into(), json!(backup.display().to_string()));
+            return Err(revert_vision_or_latch_inconsistent(
+                &sup,
+                &deps,
+                &vision_before_validated,
+                &vision_values,
+                vision_written,
+                vision_unknown,
+                Some(&marker_path),
+                err,
+                guard,
+            )
+            .await);
+        }
+    };
+
+    let next_pose_list = if kin_changed {
+        let mut list = pub_cfg.poses.list.clone();
+        for p in &mut list.poses {
+            p.tcp = pub_cfg.recompute_pose_tcp_for(&arm_model, p);
+        }
+        Some(list)
+    } else {
+        None
+    };
+    let expected_poses_revision = next_pose_list.as_ref().map(|_| pub_cfg.poses.revision);
+
+    let next_grasp = after.grasp_setup.clone().map(|mut g| {
+        g.camera_tilt_deg = f64::from(after.camera_mount.tilt_deg);
+        g
+    });
+    let expected_grasp_setup_revision = next_grasp.as_ref().map(|_| pub_cfg.grasp_setup_revision);
+
+    let effective_floor = pub_cfg.profile_floor_z_m.map(|profile| {
+        let (_, fp) = file_fingerprints(
+            after.calibration.as_ref(),
+            &after.camera_mount,
+            &pub_cfg.joint_zero_offsets,
+            Some(&pub_cfg.config.active_tool.config_digest),
+        );
+        let legacy_fp = legacy_file_fingerprint(
+            after.calibration.as_ref(),
+            &after.camera_mount,
+            &pub_cfg.joint_zero_offsets,
+        );
+        let (eff, src, _) = effective_floor_for_with_legacy(
+            profile,
+            after.calibration.as_ref(),
+            &fp,
+            Some(&legacy_fp),
+            &pub_cfg.config.active_tool,
+        );
+        (eff, src)
+    });
+
+    let ws_eval_bufs = pub_cfg.workspace_policy().map(|(ws, _)| {
+        let mut next_ws = ws.clone();
+        if let Some((eff, _)) = effective_floor {
+            next_ws.floor_z_m = eff;
+        }
+        prepare_eval_bufs_off_thread(
+            &arm_model,
+            &next_ws,
+            &after.camera_mount,
+            pub_cfg.config.active_tool.tcp_offset_m,
+        )
+    });
+
+    let mut file_ops = Vec::with_capacity(2);
+    match after.calibration.as_ref() {
+        Some(c) => {
+            let text = serde_json::to_string_pretty(c).unwrap_or_default();
+            file_ops.push(FileWriteOp::Replace(crate::persist::PendingWrite::new(
+                deps.path.clone(),
+                text,
+            )));
+        }
+        None => {
+            file_ops.push(FileWriteOp::Remove(deps.path.clone()));
+        }
+    }
+    if let (Some(setup_path), Some(setup)) = (deps.setup_path.as_ref(), next_grasp.as_ref()) {
+        let text = crate::grasp::serialize_setup_for_tool(setup, &pub_cfg.config.active_tool);
+        file_ops.push(FileWriteOp::Replace(crate::persist::PendingWrite::new(
+            setup_path.clone(),
+            text,
+        )));
+    }
+
+    let lease_gen = auth.lease_holder.map_or(0, |(_, g)| g);
+    let proposal = build_config_proposal_with_deadline(
+        &sup,
+        ConfigDomain::Calibration,
+        pub_cfg.calibration_revision,
+        auth.admission,
+        lease_gen,
+        pub_cfg.workspace_revision,
+        std::time::Instant::now() + crate::supervisor::config::CONFIG_PROPOSAL_BUDGET,
+    );
+    let cfg_auth = ConfigAuthContext {
+        admission: auth.admission,
+        lease_holder: auth.lease_holder,
+    };
+
+    let pub_cal = after.calibration.clone();
+    let pub_mount = after.camera_mount.clone();
+    let pub_arm_model = arm_model.clone();
+    let pub_poses = next_pose_list.clone();
+    let pub_grasp = next_grasp.clone();
+    let pub_floor = effective_floor;
+
+    let plan = ConfigCommitPlan {
+        proposal,
+        auth: cfg_auth,
+        precheck: ReservePrecheck::Calibration {
+            allow_during_calibration_busy: true,
+            expected_txn_id: Some(txn_id),
+            operator_grant: auth.operator_grant,
+            require_kinematics_disarmed: kin_changed,
+            expected_grasp_setup_revision,
+        },
+        candidate: ConfigCandidate::Calibration {
+            calibration: after.calibration.clone(),
+            #[cfg(feature = "policy-runtime")]
+            calibration_digest: SupervisorInner::calibration_digest_of(after.calibration.as_ref()),
+            camera_mount: after.camera_mount.clone(),
+            arm_model,
+            kinematics_changed: kin_changed,
+            next_pose_list,
+            grasp_setup: next_grasp,
+            expected_grasp_setup_revision,
+            expected_txn_id: Some(txn_id),
+            operator_grant: auth.operator_grant,
+            effective_floor,
+            ws_eval_bufs,
+        },
+        write: ConfigWriteOp::Batch {
+            ops: file_ops,
+            pending_marker: None,
+            existing_marker: Some(marker_path.clone()),
+        },
+        expected_workspace_revision: Some(pub_cfg.workspace_revision),
+        expected_poses_revision,
+    };
+
+    let auth_cb = Arc::clone(&auth.auth_check);
+    let commit_res = run_config_commit_detailed(
+        &sup,
+        plan,
+        move || (auth_cb)(),
+        move |cfg, act| {
+            cfg.calibration = pub_cal;
+            cfg.calibration_load_error = None;
+            cfg.config.camera_mount = pub_mount;
+            cfg.config.arm_model = pub_arm_model;
+            if let Some(pl) = pub_poses {
+                cfg.poses.list = pl;
+            }
+            if let Some(g) = pub_grasp {
+                cfg.config.camera_mount.tilt_deg = g.camera_tilt_deg as f32;
+                cfg.config.grasp = Some(g);
+                cfg.grasp_setup_revision = act.grasp_setup_revision;
+            } else if let Some(g) = cfg.config.grasp.as_mut() {
+                g.camera_tilt_deg = f64::from(cfg.config.camera_mount.tilt_deg);
+            }
+            if let Some((eff, src)) = pub_floor {
+                cfg.floor_source = src;
+                if let Some(ws) = cfg.config.workspace.as_mut() {
+                    ws.floor_z_m = eff;
+                }
+            }
+            cfg.calibration_revision = act.calibration_revision;
+            cfg.workspace_revision = act.workspace_revision;
+        },
+    )
+    .await;
+
+    match commit_res {
+        Ok(outcome) => {
+            debug_assert_eq!(outcome.disposition(), CommitDisposition::Applied);
+            let vision = vision_get(&deps)
+                .await
+                .unwrap_or_else(|e| json!({"error": e.message}));
+            // Capture the committed PublishedConfig BEFORE releasing transaction busy so a
+            // subsequent calibration cannot interleave into this reply.
+            let pub_after = sup.published_config().await.map_err(CalibError::from)?;
+            guard.clear_remote_mutated();
+            guard.release().await;
+            let mut out = json!({
+                "backup": backup.display().to_string(),
+                "vision_intrinsics": vision,
+                "camera_mount": mount_summary(&pub_after.config.camera_mount),
+                "calibration": pub_after.calibration,
+                "kinematics_correction": pub_after.config.arm_model.correction(),
+                "grasp": pub_after.grasp_setup().map(|s| grasp_fields(&s)),
+                "grasp_revision": pub_after.grasp_setup_revision,
+                "durability_confirmed": outcome.durability_confirmed,
+            });
+            if let Some(warn) = outcome.durability_warning {
+                out["durability_warning"] = json!(warn);
+            }
+            if reason == "apply" {
+                out["grip_pixel_model"] = json!(after.grip_pixel_model);
+                tracing::info!(
+                    "Camera calibration applied via executor worker (backup {})",
+                    backup.display()
+                );
+            } else if let Some(restored_name) = extra_restored {
+                out["restored"] = json!(restored_name);
+                tracing::info!("Camera calibration restored from backup {restored_name} via executor worker");
+            }
+            Ok(out)
+        }
+        Err(commit_err) => {
+            if commit_err.disposition() == CommitDisposition::Unattempted {
+                // Failed strictly before rename: disk & live state untouched; revert remote vision
+                // and remove intent marker only after vision rollback succeeds.
+                let ce = calib_error_from_commit(commit_err, "calibration_file", Some(&backup));
+                Err(revert_vision_or_latch_inconsistent(
+                    &sup,
+                    &deps,
+                    &vision_before_validated,
+                    &vision_values,
+                    vision_written,
+                    vision_unknown,
+                    Some(&marker_path),
+                    ce,
+                    guard,
+                )
+                .await)
+            } else {
+                // Post-rename failure (Uncertain): run_config_commit_detailed ALREADY owns
+                // HoldState::Reconciling (and any dir-fsync retry). Clear `remote_mutated` before
+                // releasing our txn guard so a fast retry that already finished Reconciling is
+                // never re-forced into Reconciling by this guard.
+                let ce = calib_error_from_commit(commit_err, "calibration_file", Some(&backup));
+                guard.clear_remote_mutated();
+                guard.release().await;
+                Err(ce)
+            }
+        }
+    }
+}
+
+/// Executor-mode `/api/v1/calibration/apply` through PR C's two-phase config worker.
+pub async fn apply_executor(
+    sup: &Arc<ArmSupervisor>,
+    deps: &CalibrationDeps,
+    req: ApplyRequest,
+    auth: ExecutorCalibAuth,
+) -> Result<Value, CalibError> {
+    apply_executor_with_guard(sup, deps, req, auth, None).await
+}
+
+pub(crate) async fn apply_executor_with_guard(
+    sup: &Arc<ArmSupervisor>,
+    deps: &CalibrationDeps,
+    req: ApplyRequest,
+    auth: ExecutorCalibAuth,
+    existing_guard: Option<ExecutorTxnGuard>,
+) -> Result<Value, CalibError> {
+    if req.dry_run {
+        if let Some(g) = existing_guard {
+            g.release().await;
+        }
+        let pub_cfg = sup.published_config().await.map_err(CalibError::from)?;
+        let before = armd_state_from_published(&pub_cfg);
+        let after = after_state_from_published(&pub_cfg, &req)?;
+        let vision_before = vision_get(deps).await.map_err(|e| e.at("vision"))?;
+        let mut vision_after = vision_before.as_object().cloned().unwrap_or_default();
+        for (k, v) in &req.intrinsics {
+            vision_after.insert(k.clone(), v.clone());
+        }
+        vision_after.remove("revision");
+        return Ok(json!({
+            "dry_run": true,
+            "before": diff_view_from_published(&vision_before, &before, &pub_cfg),
+            "after": diff_view_from_published(&Value::Object(vision_after), &after, &pub_cfg),
+        }));
+    }
+
+    let sup_w = Arc::clone(sup);
+    let deps_w = deps.clone();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let res = async move {
+            let guard = match existing_guard {
+                Some(g) => g,
+                None => match auth.txn_id {
+                    Some(id) => ExecutorTxnGuard::new(Arc::clone(&sup_w), id),
+                    None => {
+                        if let Err((_, arm_err)) = (auth.auth_check)() {
+                            return Err(CalibError::from(arm_err));
+                        }
+                        let tid = crate::rt_core::requests::config::next_calibration_txn_id();
+                        let cfg_auth = crate::rt_core::requests::config::ConfigAuthContext {
+                            admission: auth.admission,
+                            lease_holder: auth.lease_holder,
+                        };
+                        let pre_g = ExecutorTxnGuard::new(Arc::clone(&sup_w), tid);
+                        match sup_w
+                            .dispatch_config_request(
+                                crate::rt_core::requests::config::ConfigRequest::BeginCalibrationTxn {
+                                    txn_id: tid,
+                                    auth: cfg_auth,
+                                    operator_grant: auth.operator_grant,
+                                    expected_epoch: auth.admission.estop_epoch,
+                                    expected_stop_gen: auth.admission.stop_gen,
+                                    kind: crate::rt_core::requests::config::CalibrationTxnKind::CameraApply {
+                                        require_kinematics_disarmed: req.kinematics.is_some(),
+                                        dry_run: false,
+                                    },
+                                },
+                            )
+                            .await
+                        {
+                            Ok(crate::rt_core::requests::config::ConfigReply::CalibrationTxnBegan(Ok(_))) => {
+                                sup_w.published_config_hub().update(|cfg| {
+                                    cfg.calibration_busy = true;
+                                    cfg.calibration_txn_id = Some(tid);
+                                });
+                                pre_g
+                            }
+                            Ok(crate::rt_core::requests::config::ConfigReply::CalibrationTxnBegan(Err(e))) => {
+                                let _ = pre_g.disarm();
+                                return Err(calib_error_from_config(e));
+                            }
+                            Err(e) => {
+                                pre_g.release().await;
+                                return Err(calib_error_from_config(e));
+                            }
+                            _ => {
+                                pre_g.release().await;
+                                return Err(CalibError::new(500, "INTERNAL", "unexpected begin reply"));
+                            }
+                        }
+                    }
+                },
+            };
+            let pub_cfg = match sup_w.published_config().await {
+                Ok(p) => p,
+                Err(e) => {
+                    guard.release().await;
+                    return Err(CalibError::from(e));
+                }
+            };
+            let before = armd_state_from_published(&pub_cfg);
+            let after = match after_state_from_published(&pub_cfg, &req) {
+                Ok(a) => a,
+                Err(e) => {
+                    guard.release().await;
+                    return Err(e);
+                }
+            };
+            let vision_before = match vision_get(&deps_w).await {
+                Ok(v) => v,
+                Err(e) => {
+                    guard.release().await;
+                    return Err(e.at("vision"));
+                }
+            };
+            run_executor_calibration_txn(
+                sup_w,
+                deps_w,
+                auth,
+                guard,
+                "apply",
+                before,
+                after,
+                vision_before,
+                req.intrinsics,
+                None,
+            )
+            .await
+        }
+        .await;
+        let _ = done_tx.send(res);
+    });
+    done_rx.await.unwrap_or_else(|e| {
+        tracing::error!("calibration apply worker failed: {e}");
+        Err(CalibError::new(
+            500,
+            "INTERNAL",
+            "calibration task failed: channel closed; check GET /api/v1/calibration and the backups",
+        ))
+    })
+}
+
+/// Executor-mode `/api/v1/calibration/restore` through PR C's two-phase config worker.
+pub async fn restore_executor(
+    sup: &Arc<ArmSupervisor>,
+    deps: &CalibrationDeps,
+    body: &Value,
+    auth: ExecutorCalibAuth,
+) -> Result<Value, CalibError> {
+    restore_executor_with_guard(sup, deps, body, auth, None).await
+}
+
+pub(crate) async fn restore_executor_with_guard(
+    sup: &Arc<ArmSupervisor>,
+    deps: &CalibrationDeps,
+    body: &Value,
+    auth: ExecutorCalibAuth,
+    existing_guard: Option<ExecutorTxnGuard>,
+) -> Result<Value, CalibError> {
+    let sup_w = Arc::clone(sup);
+    let deps_w = deps.clone();
+    let body_w = body.clone();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let res = async move {
+            let guard = match existing_guard {
+                Some(g) => g,
+                None => match auth.txn_id {
+                    Some(id) => ExecutorTxnGuard::new(Arc::clone(&sup_w), id),
+                    None => {
+                        if let Err((_, arm_err)) = (auth.auth_check)() {
+                            return Err(CalibError::from(arm_err));
+                        }
+                        let tid = crate::rt_core::requests::config::next_calibration_txn_id();
+                        let cfg_auth = crate::rt_core::requests::config::ConfigAuthContext {
+                            admission: auth.admission,
+                            lease_holder: auth.lease_holder,
+                        };
+                        let pre_g = ExecutorTxnGuard::new(Arc::clone(&sup_w), tid);
+                        match sup_w
+                            .dispatch_config_request(
+                                crate::rt_core::requests::config::ConfigRequest::BeginCalibrationTxn {
+                                    txn_id: tid,
+                                    auth: cfg_auth,
+                                    operator_grant: auth.operator_grant,
+                                    expected_epoch: auth.admission.estop_epoch,
+                                    expected_stop_gen: auth.admission.stop_gen,
+                                    kind: crate::rt_core::requests::config::CalibrationTxnKind::CameraRestore,
+                                },
+                            )
+                            .await
+                        {
+                            Ok(crate::rt_core::requests::config::ConfigReply::CalibrationTxnBegan(Ok(_))) => {
+                                sup_w.published_config_hub().update(|cfg| {
+                                    cfg.calibration_busy = true;
+                                    cfg.calibration_txn_id = Some(tid);
+                                });
+                                pre_g
+                            }
+                            Ok(crate::rt_core::requests::config::ConfigReply::CalibrationTxnBegan(Err(e))) => {
+                                let _ = pre_g.disarm();
+                                return Err(calib_error_from_config(e));
+                            }
+                            Err(e) => {
+                                pre_g.release().await;
+                                return Err(calib_error_from_config(e));
+                            }
+                            _ => {
+                                pre_g.release().await;
+                                return Err(CalibError::new(500, "INTERNAL", "unexpected begin reply"));
+                            }
+                        }
+                    }
+                },
+            };
+            let name = match body_w
+                .get("backup")
+                .and_then(Value::as_str)
+                .filter(|n| {
+                    !n.is_empty()
+                        && n.len() <= 64
+                        && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                })
+                .map(str::to_string)
+            {
+                Some(n) => n,
+                None => {
+                    guard.release().await;
+                    return Err(CalibError::invalid(
+                        "backup must be the name of a backup (GET /api/v1/calibration)",
+                    ));
+                }
+            };
+            let dir = deps_w.backup_dir.join(&name);
+            let name_c = name.clone();
+            let loaded = tokio::task::spawn_blocking(move || -> Result<(ArmdState, Map<String, Value>, (Option<String>, Option<String>)), CalibError> {
+                let read = |f: &str| -> Result<Value, CalibError> {
+                    let t = std::fs::read_to_string(dir.join(f)).map_err(|e| {
+                        CalibError::new(404, "BACKUP_NOT_FOUND", format!("backup {name_c}: {f}: {e}"))
+                    })?;
+                    serde_json::from_str(&t)
+                        .map_err(|e| CalibError::invalid(format!("backup {name_c}: {f}: {e}")))
+                };
+                let manifest = read("manifest.json")?;
+                let vision_target = read("vision_intrinsics.json")?;
+                let target: ArmdState = serde_json::from_value(manifest).map_err(|e| {
+                    CalibError::invalid(format!("backup {name_c}: manifest.json: {e}"))
+                })?;
+                let vision_values = validate_intrinsics(&vision_target).map_err(|e| {
+                    CalibError::invalid(format!("backup {name_c}: vision_intrinsics.json: {e}"))
+                })?;
+                if let Some(c) = &target.calibration {
+                    c.validate().map_err(CalibError::invalid)?;
+                }
+                if let Some(g) = &target.grasp_setup {
+                    g.validate()
+                        .map_err(|e| CalibError::invalid(format!("backup {name_c}: grasp setup: {e}")))?;
+                }
+                let backup_tool = if target.tool_id.is_some() || target.tool_config_digest.is_some() {
+                    (target.tool_id.clone(), target.tool_config_digest.clone())
+                } else if let Some(gs_val) = std::fs::read_to_string(dir.join("grasp_setup.json"))
+                    .ok()
+                    .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+                {
+                    (
+                        gs_val.get("tool_id").and_then(Value::as_str).map(str::to_string),
+                        gs_val
+                            .get("tool_config_digest")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                    )
+                } else {
+                    (None, None)
+                };
+                Ok((target, vision_values, backup_tool))
+            })
+            .await
+            .map_err(|e| CalibError::new(500, "INTERNAL", format!("restore read task: {e}")));
+
+            let (mut target, vision_values, (backup_tool_id, backup_tool_digest)) = match loaded {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) | Err(e) => {
+                    guard.release().await;
+                    return Err(e);
+                }
+            };
+
+            let pub_cfg = match sup_w.published_config().await {
+                Ok(p) => p,
+                Err(e) => {
+                    guard.release().await;
+                    return Err(CalibError::from(e));
+                }
+            };
+            if let Some(k) = target.calibration.as_ref().and_then(|c| c.kinematics.as_ref()) {
+                if let Err(e) = pub_cfg.config.arm_model.with_correction(Some(&k.joints)) {
+                    guard.release().await;
+                    return Err(CalibError::new(400, "UNSUPPORTED", format!("backup {name}: {e}")));
+                }
+            }
+            let kin_changes =
+                correction_of(target.calibration.as_ref()) != correction_of(pub_cfg.calibration.as_ref());
+            if kin_changes {
+                if let Some(snap) = sup_w.hub().latest() {
+                    if snap.obs.is_torqued || snap.owner.motion_active {
+                        let why = if snap.owner.motion_active {
+                            "an action is running"
+                        } else {
+                            "torque is on"
+                        };
+                        guard.release().await;
+                        return Err(CalibError::new(
+                            409,
+                            "KINEMATICS_ARMED",
+                            format!("the kinematic correction can change only with torque off and no action running ({why}); park or disable torque first"),
+                        ));
+                    }
+                }
+            }
+
+            let before = armd_state_from_published(&pub_cfg);
+            let active_tool = pub_cfg.config.active_tool.clone();
+            if let Some(c) = target.calibration.as_mut() {
+                strip_mismatched_tool_records(c, &active_tool);
+            }
+            let tool_matches =
+                active_tool.matches_record(backup_tool_id.as_deref(), backup_tool_digest.as_deref());
+            if !tool_matches {
+                if target.grasp_setup.is_some() {
+                    tracing::warn!(
+                        "Calibration restore {name}: stripping tool-scoped grasp_setup for {:?}/{:?} (active tool is '{}' / '{}')",
+                        backup_tool_id, backup_tool_digest, active_tool.id, active_tool.config_digest
+                    );
+                    target.grasp_setup = None;
+                }
+                if let Some(mut live_b) = before.grasp_setup.clone() {
+                    let intrinsics_val = Value::Object(vision_values.clone());
+                    refresh_grasp_setup_camera_fields(
+                        &mut live_b,
+                        Some(&intrinsics_val),
+                        &target.camera_mount,
+                        target.calibration.as_ref().and_then(|c| c.table_z_m),
+                        &pub_cfg.config.arm_model,
+                        &pub_cfg.config.tcp_offset,
+                    );
+                    if let Err(e) = live_b.validate() {
+                        guard.release().await;
+                        return Err(CalibError::invalid(format!(
+                            "grasp setup after cross-tool restore: {e}"
+                        )));
+                    }
+                    target.grasp_setup = Some(live_b);
+                    target.tool_id = Some(active_tool.id.clone());
+                    target.tool_config_digest = Some(active_tool.config_digest.clone());
+                }
+            }
+            let live_zero = before.calibration.as_ref().and_then(|c| c.joint_zero.clone());
+            let live_mit = before
+                .calibration
+                .as_ref()
+                .and_then(|c| c.mit_qualification.clone());
+            match target.calibration.as_mut() {
+                Some(c) => {
+                    c.joint_zero = live_zero;
+                    c.mit_qualification = live_mit;
+                }
+                None if live_zero.is_some() || live_mit.is_some() => {
+                    target.calibration = Some(CalibrationFile {
+                        joint_zero: live_zero,
+                        mit_qualification: live_mit,
+                        ..Default::default()
+                    });
+                }
+                None => {}
+            }
+            let vision_before = match vision_get(&deps_w).await {
+                Ok(v) => v,
+                Err(e) => {
+                    guard.release().await;
+                    return Err(e.at("vision"));
+                }
+            };
+            run_executor_calibration_txn(
+                sup_w,
+                deps_w,
+                auth,
+                guard,
+                "restore",
+                before,
+                target,
+                vision_before,
+                vision_values,
+                Some(name),
+            )
+            .await
+        }
+        .await;
+        let _ = done_tx.send(res);
+    });
+    done_rx.await.unwrap_or_else(|e| {
+        tracing::error!("calibration restore worker failed: {e}");
+        Err(CalibError::new(
+            500,
+            "INTERNAL",
+            "calibration task failed: channel closed; check GET /api/v1/calibration and the backups",
+        ))
+    })
 }
 
 /// `/api/v1/calibration/apply` after [`begin_checks`] (the caller set `calibration_busy` for a

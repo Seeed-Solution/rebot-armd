@@ -1708,6 +1708,7 @@ mod pr_y_policy_unit_tests {
             PolicyValidityBounds {
                 vision_window_expires_at: Some(r.fx.now() - Duration::from_millis(1)),
                 handshake_expires_at: Some(r.fx.now() + Duration::from_secs(5)),
+                ..PolicyValidityBounds::default()
             },
         );
         assert!(
@@ -1740,6 +1741,7 @@ mod pr_y_policy_unit_tests {
             PolicyValidityBounds {
                 vision_window_expires_at: Some(r.fx.now() + Duration::from_secs(5)),
                 handshake_expires_at: Some(r.fx.now() - Duration::from_millis(1)),
+                ..PolicyValidityBounds::default()
             },
         );
         assert_eq!(sub2, Submitted::Accepted);

@@ -3870,7 +3870,7 @@ pub async fn start(supervisor: &Arc<ArmSupervisor>, stamp: crate::supervisor::Ad
     Ok(begin_with_stamp(&mut inner, stamp, supervisor, source, planned)?)
 }
 
-/// Production broker-to-worker handoff for `grasp` on `OWNER_EXECUTOR` (A7 / Major 11):
+/// Production broker-to-worker handoff for `grasp` on `OWNER_EXECUTOR` (A7 / P-F1):
 /// submits `BeginMacro` carrying the caller's original `AdmissionStamp` and exact absolute
 /// `deadline`, then spawns the orchestrator with the accepted parent `ActionId`, original
 /// `stamp`, and exact `deadline` (0 `SupervisorLock`).
@@ -3880,6 +3880,50 @@ pub async fn begin_executor(
     source: Arc<dyn DetectionSource>,
     planned: PlannedGrasp,
 ) -> Result<(u64, f64), ArmError> {
+    let ((id, duration), guard) = begin_executor_inner(
+        supervisor,
+        stamp,
+        source,
+        planned,
+        crate::rt_core::reply_router::ExternalDestinationPolicy::ConnectionOrGlobal,
+        false,
+        None,
+    )
+    .await?;
+    let _ = guard.confirm_enqueued();
+    Ok((id, duration))
+}
+
+/// WebSocket-bound `grasp` executor handoff returning the RAII [`AckCommitGuard`] so the WS
+/// worker confirms wire-ACK enqueue strictly after `ordinary_tx` accepts `command_ack`.
+pub(crate) async fn begin_executor_ws(
+    supervisor: &Arc<ArmSupervisor>,
+    stamp: crate::supervisor::AdmissionStamp,
+    source: Arc<dyn DetectionSource>,
+    planned: PlannedGrasp,
+    wire_tracker: Arc<crate::rt_core::reply_router::WsWireAckTracker>,
+) -> Result<((u64, f64), crate::rt_core::reply_router::AckCommitGuard), ArmError> {
+    begin_executor_inner(
+        supervisor,
+        stamp,
+        source,
+        planned,
+        crate::rt_core::reply_router::ExternalDestinationPolicy::ConnectionOnly,
+        true,
+        Some(wire_tracker),
+    )
+    .await
+}
+
+async fn begin_executor_inner(
+    supervisor: &Arc<ArmSupervisor>,
+    stamp: crate::supervisor::AdmissionStamp,
+    source: Arc<dyn DetectionSource>,
+    planned: PlannedGrasp,
+    policy: crate::rt_core::reply_router::ExternalDestinationPolicy,
+    require_ack_commit: bool,
+    wire_tracker: Option<Arc<crate::rt_core::reply_router::WsWireAckTracker>>,
+) -> Result<((u64, f64), crate::rt_core::reply_router::AckCommitGuard), ArmError> {
     use crate::rt_core::requests::actions::{ActionStamp, DEFAULT_ACTION_DEADLINE};
     let handle = supervisor.executor_handle().ok_or_else(|| ArmError::Rejected {
         status: 503,
@@ -3916,9 +3960,16 @@ pub async fn begin_executor(
         parent_generation: 0,
         deadline: now + DEFAULT_ACTION_DEADLINE,
     };
-    let (id, _req_id) =
-        crate::macro_action::begin_macro_executor(supervisor, &action_stamp, spec, action_stamp.deadline)
-            .await?;
+    let (id, _req_id, ack_guard) = crate::macro_action::begin_macro_executor_with_barrier(
+        supervisor,
+        &action_stamp,
+        spec,
+        action_stamp.deadline,
+        policy,
+        require_ack_commit,
+        wire_tracker,
+    )
+    .await?;
     let duration = if planned.adaptive.is_some() {
         expected_duration(&planned)
     } else {
@@ -3934,7 +3985,7 @@ pub async fn begin_executor(
         expected_duration(&planned) + approach_extra
     };
     spawn_with_deadline(supervisor.clone(), source, id, planned, stamp, deadline);
-    Ok((id, duration))
+    Ok(((id, duration), ack_guard))
 }
 
 /// Spawn the orchestrator for an action begun with `SupervisorInner::begin_macro(stamp, "grasp", ..)`.
@@ -5758,12 +5809,11 @@ impl Orchestrator {
                 let j7_seq = inner.core.feedback().seqs().get(g_idx).copied();
 
                 let (torque_fb, load_fb) = if let Some(ref d) = inner.driver {
-                    if let Ok(driver) = d.lock() {
+                    d.with_ref(|driver| {
                         let caps = driver.capabilities();
                         (caps.torque_feedback, caps.load_feedback)
-                    } else {
-                        (false, false)
-                    }
+                    })
+                    .unwrap_or((false, false))
                 } else {
                     (true, !inner.loads.is_empty())
                 };

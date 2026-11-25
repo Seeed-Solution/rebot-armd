@@ -1565,10 +1565,12 @@ pub(super) async fn handle_executor_ws_command(
     let request_id_val = value.get("request_id").cloned().unwrap_or(Value::Null);
     let epoch = current_epoch_off_lock(recv_supervisor, 1);
 
-    // Out-of-scope calibration, joint/motor zero, zero restore, and MIT ops fail closed
-    // unconditionally on the RT executor before touching any file or live state.
-    if is_cal {
-        let _ = recv_calib;
+    // Out-of-scope hardware calibration / motor-zero / MIT ops fail closed unconditionally
+    // on the RT executor before touching any file or live state.
+    if is_cal
+        && calibration::is_executor_calibration_unsupported(path, &value["body"], recv_supervisor)
+            .await
+    {
         return Some(Some(calibration::dispatch_executor_calibration_command(
             path, value, epoch,
         )));
@@ -1582,13 +1584,18 @@ pub(super) async fn handle_executor_ws_command(
         value.get("client_id").is_none_or(|id| id.as_str() == lbl.as_deref())
     };
     if local_generation == 0 || supplied_generation != local_generation || !label_matches {
+        let lease_msg = if is_cal {
+            "This connection does not own an active lease"
+        } else {
+            "This connection does not hold the active lease"
+        };
         return Some(Some(json!({
             "type": "command_reject",
             "request_id": request_id_val,
             "status": 409,
             "code": "LEASE_LOST",
             "error": "LEASE_LOST",
-            "message": "This connection does not hold the active lease",
+            "message": lease_msg,
             "epoch_id": epoch
         })));
     }
@@ -1632,6 +1639,26 @@ pub(super) async fn handle_executor_ws_command(
     }
 
     // 5. Route by family.
+    if is_cal {
+        let reply = calibration::handle_executor_calibration_ws(
+            path,
+            request_id_val,
+            value["body"].clone(),
+            local_generation,
+            epoch,
+            stamp,
+            recv_conn_id,
+            recv_connection,
+            recv_generation,
+            ws_auth,
+            recv_supervisor,
+            recv_calib,
+            ack_tx,
+            worker_tasks,
+        )
+        .await;
+        return Some(reply);
+    }
     if is_cfg {
         let job = PendingConfigJob {
             request_id: request_id_val,

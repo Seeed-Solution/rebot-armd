@@ -242,3 +242,51 @@ async fn tick_thread_usage_tells_a_parked_wait_from_a_busy_one() {
     assert!(m.usage.wait_cpu_us < m.wait_us / 2, "{m:?}");
     assert!(m.usage.lock_cpu_us <= m.lock_us + 1_000, "{m:?}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tick_phase_marks_mid_csw_and_max_wait_breakdown() {
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    let writer_line = line!() + 1;
+    let mut writer = sup.inner().write().await;
+    writer.set_command("/api/v1/motion/jog");
+    writer.set_action_id(42);
+    let handle = tokio::runtime::Handle::current();
+    let control = {
+        let sup = sup.clone();
+        std::thread::spawn(move || {
+            handle.block_on(sup.control_tick(0.02));
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(16)).await;
+    drop(writer);
+    tokio::task::spawn_blocking(move || control.join().unwrap()).await.unwrap();
+
+    // Run one uncontended tick afterward so `max_wait` is distinct from `ticks_ago == 0`.
+    sup.tick(0.02).await;
+
+    let snap = sup.tick_stats();
+    let mw = snap.max_wait.expect("max_wait breakdown");
+    assert_eq!(mw.ticks_ago, 1, "waited tick should be 1 tick ago: {mw:?}");
+    assert!(mw.sample.wait_us >= 14_000, "{mw:?}");
+    let wf = mw.sample.waited_for.expect("max_wait waited_for");
+    assert_eq!(wf.kind, "write");
+    assert_eq!(wf.location.file(), file!());
+    assert_eq!(wf.location.line(), writer_line);
+    assert_eq!(wf.command, Some("/api/v1/motion/jog"));
+    assert_eq!(wf.action_id, Some(42));
+    assert_eq!(mw.handoff_us, Some(wf.released_before_lock_us));
+    assert!(mw.handoff_us.unwrap() >= 0, "handoff_us should be non-negative: {mw:?}");
+
+    let json = serde_json::to_value(&snap).unwrap();
+    for slot in ["max_release", "max_tick", "max_wait"] {
+        let pu = &json[slot]["phases_us"];
+        for k in ["alloc_read", "ack_flush", "terminal", "guard_drop", "post", "publish"] {
+            assert!(pu[k].is_u64(), "{slot}.phases_us.{k} missing in {json}");
+        }
+        assert!(json[slot]["mid_nvcsw"].is_u64(), "{slot}.mid_nvcsw missing in {json}");
+        assert!(json[slot]["mid_nivcsw"].is_u64(), "{slot}.mid_nivcsw missing in {json}");
+    }
+    assert_eq!(json["max_wait"]["waited_for"]["command"], "/api/v1/motion/jog");
+    assert_eq!(json["max_wait"]["waited_for"]["action_id"], 42);
+    assert!(json["max_wait"]["handoff_us"].is_i64(), "max_wait.handoff_us missing in {json}");
+}

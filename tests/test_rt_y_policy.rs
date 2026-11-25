@@ -1908,3 +1908,300 @@ async fn y7_review_regressions_qualification_stop_and_load_cancel() {
 
     handle.stop_and_join();
 }
+
+// ============================================================================
+// 8. Action chunking on OWNER_EXECUTOR:
+//    - Open-loop horizon > 1000 ms refused at WS policy/start (`INVALID_POLICY`)
+//    - Chunked RMLP (`chunk_size=4, replan_every=2, temporal_ensemble_k=0.5`) runs
+//      Live on FakeBus with ZERO RT alloc/realloc/free, ZERO SupervisorLock attempts,
+//      verified CAN TX motion, and J7 speed cap preserved
+// ============================================================================
+
+fn write_dm_chunked_rmlp_pack(
+    sandbox_root: &Path,
+    policy_id: &str,
+    chunk_biases: &[[f32; 7]],
+    extra_manifest: Value,
+) -> String {
+    let dir = sandbox_root.join("policies").join(policy_id);
+    fs::create_dir_all(&dir).unwrap();
+    let joint_names = [
+        "joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6", "gripper",
+    ];
+    let chunk_size = chunk_biases.len();
+    let out_dim = chunk_size * 7;
+    let mut flat_bias = Vec::with_capacity(out_dim);
+    for step in chunk_biases {
+        flat_bias.extend_from_slice(step);
+    }
+    let layers = vec![MlpLayerSpec::new(
+        7,
+        out_dim,
+        Activation::None,
+        vec![0.0; 7 * out_dim],
+        flat_bias,
+    )];
+    let rmlp = encode_rmlp_bytes(&layers).unwrap();
+    let mut manifest = json!({
+        "format": "rebot-onnx-policy/v1",
+        "name": policy_id,
+        "unit_mode": "rad",
+        "action_dim": 7,
+        "action_space": "joint_positions",
+        "joint_names": joint_names,
+        "model_file": "model.rmlp",
+        "outputs": {
+            "action": {
+                "name": "action",
+                "shape": [1, out_dim]
+            }
+        }
+    });
+    if let (Some(m), Some(e)) = (manifest.as_object_mut(), extra_manifest.as_object()) {
+        for (k, v) in e {
+            m.insert(k.clone(), v.clone());
+        }
+    }
+    let pj = serde_json::to_vec_pretty(&manifest).unwrap();
+    fs::write(dir.join("policy.json"), &pj).unwrap();
+    fs::write(dir.join("model.rmlp"), &rmlp).unwrap();
+    compute_release_digest(&pj, &rmlp, "model.rmlp")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn y8_executor_action_chunking_horizon_live_tx_and_zero_alloc_proof() {
+    ensure_tracing_subscriber();
+    let dir = tempdir().unwrap();
+    let sandbox = Arc::new(SandboxState::new(dir.path().to_path_buf()));
+    let cfg = ArmConfig {
+        lease_timeout_ms: 10_000,
+        ..ArmConfig::rebot_dm()
+    };
+    let (sup, bus) = make_fakebus_supervisor(cfg, true);
+    sup.set_operator_auth_enforced(false).await;
+
+    let mut exec_cfg = ExecutorConfig::for_tests(Duration::from_millis(10));
+    exec_cfg.alloc_timing = true;
+    let handle = sup.start_executor(exec_cfg).await.unwrap();
+    assert_eq!(sup.owner_mode(), OWNER_EXECUTOR);
+    wait_until(Duration::from_secs(2), || sup.hub().latest().is_some()).await;
+
+    let addr = serve(sup.clone(), sandbox.clone(), OperatorAuth::disabled()).await;
+
+    // Hold detached legacy SupervisorLock write guard across the entire chunked policy lifecycle!
+    let _detached_writer = sup.inner().write().await;
+
+    let mut ws = connect_ws(addr).await;
+    let gen = acquire(&mut ws, "y8-chunk", false, 1).await;
+    let ep = sup.fresh_snapshot(None).await.unwrap().obs.epoch_id;
+    arm_via_ws(&mut ws, gen, ep, 1).await;
+
+    let settle_seq = sup.hub().published_seq() + 4;
+    wait_until(Duration::from_secs(1), || sup.hub().published_seq() >= settle_seq).await;
+    let cur = sup.hub().latest().unwrap().obs.commanded_positions.clone();
+
+    // (a) Open-loop horizon > 1000 ms (replan_every=24 at 20 fps -> 1200 ms) MUST be refused
+    //     at WS `/api/v1/action/policy/start` on OWNER_EXECUTOR with 422 `INVALID_POLICY`.
+    let mut base_q = [0.0f32; 7];
+    base_q.copy_from_slice(&cur);
+    let over_horizon_biases = vec![base_q; 24];
+    write_dm_chunked_rmlp_pack(
+        dir.path(),
+        "p_chunk_over_horizon",
+        &over_horizon_biases,
+        json!({
+            "chunking": {
+                "chunk_size": 24,
+                "replan_every": 24
+            }
+        }),
+    );
+    send(
+        &mut ws,
+        json!({
+            "type": "command",
+            "path": "/api/v1/action/policy/start",
+            "body": {
+                "policy_id": "p_chunk_over_horizon",
+                "mode": "shadow",
+                "fps": 20.0,
+                "max_seconds": 0.5
+            },
+            "generation": gen,
+            "epoch_id": ep,
+            "request_id": 2,
+        }),
+    )
+    .await;
+    let rej_h = next_of_any(&mut ws, &["command_ack", "command_reject"]).await;
+    assert_eq!(rej_h["type"], "command_reject", "horizon > 1000 ms must be rejected: {rej_h}");
+    assert_eq!(rej_h["status"], 422, "{rej_h}");
+    assert_eq!(rej_h["code"], "INVALID_POLICY", "{rej_h}");
+
+    // (b) Live chunked RMLP (`chunk_size=4, replan_every=2, temporal_ensemble_k=0.5`) with
+    //     valid supervised release gate: proves CAN TX advances J1/J7 under zero-alloc RT.
+    let mut step0 = base_q;
+    let mut step1 = base_q;
+    let mut step2 = base_q;
+    let mut step3 = base_q;
+    // Distinct per-slot targets: slot 0 only moves +0.01 rad so exceeding +0.04 rad on CAN TX
+    // proves cached / ensembled later slots (not repeated slot 0) reached the motor bus.
+    step0[0] += 0.01;
+    step1[0] += 0.06;
+    step2[0] += 0.10;
+    step3[0] += 0.13;
+    step0[6] = (base_q[6] + 0.06).min(0.0);
+    step1[6] = (base_q[6] + 0.08).min(0.0);
+    step2[6] = (base_q[6] + 0.10).min(0.0);
+    step3[6] = (base_q[6] + 0.10).min(0.0);
+
+    let dig = write_dm_chunked_rmlp_pack(
+        dir.path(),
+        "p_chunk_live",
+        &[step0, step1, step2, step3],
+        json!({
+            "chunking": {
+                "chunk_size": 4,
+                "replan_every": 2,
+                "temporal_ensemble_k": 0.5
+            }
+        }),
+    );
+    let (scene_id, tool_id) = sandbox.active_scene_and_tool().await;
+    let gate = make_release_gate_json(
+        &dig,
+        "supervised_first_run",
+        20,
+        0.25,
+        &scene_id,
+        &tool_id,
+        EMPTY_CALIBRATION_DIGEST,
+    );
+
+    // Baseline RT alloc counters after warmup releases.
+    let base_rel = handle.stats().completed_releases.load(std::sync::atomic::Ordering::Acquire) + 2;
+    wait_until(Duration::from_secs(1), || {
+        handle.stats().completed_releases.load(std::sync::atomic::Ordering::Acquire) >= base_rel
+    })
+    .await;
+    let rel_allocs_before = handle.stats().release_allocs.snapshot();
+    let wake_allocs_before = handle.stats().wake_allocs.snapshot();
+
+    bus.clear_log();
+    send(
+        &mut ws,
+        json!({
+            "type": "command",
+            "path": "/api/v1/action/policy/start",
+            "body": {
+                "policy_id": "p_chunk_live",
+                "mode": "live",
+                "fps": 20.0,
+                "max_seconds": 0.35,
+                "i_am_at_the_arm": true,
+                "release_gate": gate
+            },
+            "generation": gen,
+            "epoch_id": ep,
+            "request_id": 3,
+        }),
+    )
+    .await;
+    let ack = next_of_any(&mut ws, &["command_ack", "command_reject"]).await;
+    assert_eq!(ack["type"], "command_ack", "live chunked policy start failed: {ack}");
+    let aid = ack["action_id"].as_u64().expect("chunked action_id");
+    wait_until(Duration::from_secs(3), || {
+        sup.hub().latest().is_some_and(|s| {
+            s.obs
+                .policy
+                .as_ref()
+                .is_some_and(|p| p.action_id == aid && !p.active)
+        })
+    })
+    .await;
+    let snap_done = sup.hub().latest().unwrap();
+    let pol_done = snap_done.obs.policy.as_ref().unwrap();
+    assert_eq!(pol_done.stop_reason.as_deref(), Some("MAX_SECONDS"), "{pol_done:?}");
+    assert!(pol_done.steps >= 3, "expected >= 3 live chunked steps, got {}", pol_done.steps);
+
+    let final_target = pol_done
+        .last_shadow_target
+        .as_ref()
+        .expect("live chunked run must record committed target");
+    assert!(
+        final_target[0] > base_q[0] + 0.05,
+        "chunked live policy must emit later/ensembled slots past slot 0 (+0.01): final_target[0]={}, base={}",
+        final_target[0],
+        base_q[0]
+    );
+
+    let max_j1_cmd = bus
+        .tx_log()
+        .iter()
+        .filter(|f| f.id == 0x101 && f.data.len() >= 4)
+        .map(decode_pos_f32)
+        .fold(f32::NEG_INFINITY, f32::max);
+    assert!(
+        max_j1_cmd > base_q[0] + 0.025,
+        "chunked live policy on executor must advance J1 CAN TX past slot 0 (+0.01) into later/ensembled chunk slots (max_j1_cmd={max_j1_cmd}, base={})",
+        base_q[0]
+    );
+
+    let j7_vel_raws: Vec<u16> = bus
+        .tx_log()
+        .iter()
+        .filter(|f| f.id == 0x307 && f.data.len() >= 6)
+        .map(decode_j7_pf_vel_raw)
+        .collect();
+    assert!(!j7_vel_raws.is_empty(), "chunked live policy must emit J7 PosForce frames");
+    let max_j7_vel_raw = *j7_vel_raws.iter().max().unwrap();
+    assert!(
+        max_j7_vel_raw <= 250,
+        "J7 PosForce velocity raw must remain capped under release gate max_speed_scale=0.25 (got {max_j7_vel_raw})"
+    );
+
+    let rel_allocs_after = handle.stats().release_allocs.snapshot();
+    let wake_allocs_after = handle.stats().wake_allocs.snapshot();
+    let rel_delta = armd::diagnostics::alloc::AllocCounts {
+        alloc: rel_allocs_after.alloc.saturating_sub(rel_allocs_before.alloc),
+        alloc_zeroed: rel_allocs_after
+            .alloc_zeroed
+            .saturating_sub(rel_allocs_before.alloc_zeroed),
+        realloc: rel_allocs_after
+            .realloc
+            .saturating_sub(rel_allocs_before.realloc),
+        dealloc: rel_allocs_after
+            .dealloc
+            .saturating_sub(rel_allocs_before.dealloc),
+    };
+    let wake_delta = armd::diagnostics::alloc::AllocCounts {
+        alloc: wake_allocs_after.alloc.saturating_sub(wake_allocs_before.alloc),
+        alloc_zeroed: wake_allocs_after
+            .alloc_zeroed
+            .saturating_sub(wake_allocs_before.alloc_zeroed),
+        realloc: wake_allocs_after
+            .realloc
+            .saturating_sub(wake_allocs_before.realloc),
+        dealloc: wake_allocs_after
+            .dealloc
+            .saturating_sub(wake_allocs_before.dealloc),
+    };
+    assert_eq!(
+        rel_delta.total(),
+        0,
+        "armd-control whole releases must perform ZERO heap alloc/realloc/free for chunked live policy: {rel_delta:?}"
+    );
+    assert_eq!(
+        wake_delta.total(),
+        0,
+        "armd-control sub-release wakes must perform ZERO heap alloc/realloc/free for chunked live policy: {wake_delta:?}"
+    );
+    assert_eq!(
+        sup.inner().control_thread_attempts(),
+        0,
+        "armd-control must perform ZERO SupervisorLock attempts during chunked live policy"
+    );
+
+    drop(_detached_writer);
+    handle.stop_and_join();
+}
