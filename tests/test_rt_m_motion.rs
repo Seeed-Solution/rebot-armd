@@ -612,14 +612,17 @@ async fn executor_broker_jog_home_park_supersession_and_zero_alloc_b1_b2() {
     assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO, "B2 violation: RT thread allocated during jog/home/park/disable");
     assert_eq!(sup.inner().control_thread_attempts(), 0, "B1 violation: RT thread touched SupervisorLock");
 
-    // Executor WS entry stays at 503 EXECUTOR_ROUTING_PENDING until PR L lands.
+    // Executor WS entry routes `/api/v1/motion/jog` through executor admission (409 LEASE_LOST
+    // without a lease), while unmigrated `/api/v1/mode/gravity_comp` stays at 503 EXECUTOR_ROUTING_PENDING.
     let router = create_router(sup.clone(), OperatorAuth::disabled());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
     let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/api/v1/ws")).await.unwrap();
     let r = common::rpc(&mut ws, 0, final_snap.obs.epoch_id, "/api/v1/motion/jog", json!({"target_positions": [0.0, 0.0]})).await;
-    assert_eq!((&r["type"], &r["status"], &r["code"]), (&json!("command_reject"), &json!(503), &json!("EXECUTOR_ROUTING_PENDING")), "{r}");
+    assert_eq!((&r["type"], &r["status"], &r["code"]), (&json!("command_reject"), &json!(409), &json!("LEASE_LOST")), "{r}");
+    let r_gc = common::rpc(&mut ws, 0, final_snap.obs.epoch_id, "/api/v1/mode/gravity_comp", json!({"enable": true})).await;
+    assert_eq!((&r_gc["type"], &r_gc["status"], &r_gc["code"]), (&json!("command_reject"), &json!(503), &json!("EXECUTOR_ROUTING_PENDING")), "{r_gc}");
     drop(handle);
 }
 

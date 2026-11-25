@@ -87,6 +87,18 @@ impl RtOwner {
         Self::from_var(std::env::var("ARMD_RT_OWNER").ok().as_deref())
     }
 
+    /// Resolves the startup owner with explicit precedence: CLI `--owner` > `ARMD_RT_OWNER` > `legacy`.
+    pub fn resolve(cli_owner: Option<&str>, env_owner: Option<&str>) -> Result<Self, String> {
+        if let Some(raw) = cli_owner {
+            return match raw.trim() {
+                "legacy" => Ok(Self::Legacy),
+                "executor" => Ok(Self::Executor),
+                other => Err(format!("--owner must be 'legacy' or 'executor', got {other:?}")),
+            };
+        }
+        Self::from_var(env_owner)
+    }
+
     pub fn from_var(raw: Option<&str>) -> Result<Self, String> {
         match raw.map(str::trim).filter(|s| !s.is_empty()) {
             None | Some("legacy") => Ok(Self::Legacy),
@@ -94,16 +106,25 @@ impl RtOwner {
             Some(other) => Err(format!("ARMD_RT_OWNER must be 'legacy' or 'executor', got {other:?}")),
         }
     }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Executor => "executor",
+        }
+    }
 }
 
-/// Step-1 startup gate: CLI `ARMD_RT_OWNER=executor` is positively allowed only for
-/// driverless `"mock"` until step 2 routes WS commands through the broker.
+/// Startup owner admission gate: `RtOwner::Executor` is allowed behind explicit opt-in
+/// (`--owner executor` or `ARMD_RT_OWNER=executor`) only for qualified followers
+/// (`"rebot-dm"` and driverless `"mock"`). Other followers stay gated to `legacy` until
+/// qualified.
 pub fn validate_startup_owner(owner: RtOwner, follower: &str) -> Result<(), String> {
     match owner {
         RtOwner::Legacy => Ok(()),
-        RtOwner::Executor if follower == "mock" => Ok(()),
+        RtOwner::Executor if matches!(follower, "mock" | "rebot-dm") => Ok(()),
         RtOwner::Executor => Err(format!(
-            "ARMD_RT_OWNER=executor is gated to '--follower mock' in stage 3 step 1 (got '--follower {follower}'); use ARMD_RT_OWNER=legacy for sim/hardware until step 2 broker routing"
+            "RT executor owner (--owner executor / ARMD_RT_OWNER=executor) is only qualified for '--follower rebot-dm' and '--follower mock' (got '--follower {follower}'); use '--owner legacy' until '{follower}' is qualified"
         )),
     }
 }
@@ -347,6 +368,8 @@ pub struct ExecutorStats {
     /// Cumulative per-op heap counts across all sub-release wakes (entry through wake service,
     /// publication, reply/ack handling, and local destruction; disjoint from releases).
     pub wake_allocs: AtomicAllocCounters,
+    /// True once `ARMD_ALLOC_TIMING=1` (`alloc_timing`) has been enabled on the control thread.
+    pub alloc_timing_enabled: AtomicBool,
     /// Release sequence (`TickSample::release_seq`) of the most recent fault latch on `armd-control`.
     pub last_fault_latch_release_seq: AtomicU64,
     /// Release sequence (`TickSample::release_seq`) of the most recent E-stop applied on `armd-control`.
@@ -1955,6 +1978,69 @@ impl BrokerDispatcher {
                 deadline,
                 super::broker::Submit::Action(sub),
             )
+            .map_err(ExternalSubmitError::Admit)?;
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        router.commit_external_route(
+            req_id,
+            client,
+            target,
+            ack_tx,
+            require_ack_commit,
+            wire_tracker.clone(),
+        );
+        let guard = AckCommitGuard::new(
+            Arc::clone(&self.reply_router),
+            req_id,
+            wire_tracker,
+            require_ack_commit,
+        );
+        Ok((req_id, ack_rx, guard))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn submit_external_motion<'a>(
+        &self,
+        client: super::broker::ClientId,
+        client_seq: u64,
+        authority: super::broker::Authority,
+        deadline: Instant,
+        sub: super::broker::Submit<'a, PlanSlot>,
+        policy: ExternalDestinationPolicy,
+        require_ack_commit: bool,
+        wire_tracker: Option<Arc<WsWireAckTracker>>,
+    ) -> Result<
+        (
+            super::broker::RequestId,
+            tokio::sync::oneshot::Receiver<Result<super::broker::Reply, OwnerError>>,
+            AckCommitGuard,
+        ),
+        ExternalSubmitError,
+    > {
+        if !matches!(
+            sub,
+            super::broker::Submit::Install(_)
+                | super::broker::Submit::InstallHome(_)
+                | super::broker::Submit::InstallPark(_)
+        ) {
+            return Err(ExternalSubmitError::NotAnExternalAction);
+        }
+        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.exited.load(Ordering::Acquire) {
+            return Err(ExternalSubmitError::Stopped);
+        }
+        if (client.0 == 0 && policy == ExternalDestinationPolicy::ConnectionOnly)
+            || (client.0 != 0 && !self.conn_lifecycle.is_slot_open(client.0))
+        {
+            return Err(ExternalSubmitError::Admit(
+                super::broker::AdmitError::Disconnected,
+            ));
+        }
+        let mut broker = self.broker.lock().unwrap_or_else(|e| e.into_inner());
+        broker.reclaim_plans();
+        let mut router = self.reply_router.lock().unwrap_or_else(|e| e.into_inner());
+        let target = router.check_external_admission(client, policy)?;
+        let req_id = broker
+            .submit(client, client_seq, authority, deadline, sub)
             .map_err(ExternalSubmitError::Admit)?;
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         router.commit_external_route(
@@ -4505,6 +4591,40 @@ impl RtExecutorHandle {
         ExternalSubmitError,
     > {
         self.shared.broker_dispatcher.submit_external_action(
+            client,
+            seq,
+            auth,
+            deadline,
+            sub,
+            policy,
+            require_ack_commit,
+            wire_tracker,
+        )
+    }
+
+    /// Atomically verifies connection liveness, reserves bounded per-connection + global reply
+    /// capacity, submits an external family-M motion (`Install`, `InstallHome`, `InstallPark`),
+    /// and binds its terminal destination + RAII [`AckCommitGuard`] before releasing the broker lock.
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_external_motion<'a>(
+        &self,
+        client: ClientId,
+        seq: u64,
+        auth: super::broker::Authority,
+        deadline: Instant,
+        sub: super::broker::Submit<'a, PlanSlot>,
+        policy: ExternalDestinationPolicy,
+        require_ack_commit: bool,
+        wire_tracker: Option<Arc<WsWireAckTracker>>,
+    ) -> Result<
+        (
+            super::broker::RequestId,
+            tokio::sync::oneshot::Receiver<Result<super::broker::Reply, OwnerError>>,
+            AckCommitGuard,
+        ),
+        ExternalSubmitError,
+    > {
+        self.shared.broker_dispatcher.submit_external_motion(
             client,
             seq,
             auth,
@@ -8823,6 +8943,7 @@ fn control_thread_main(
         };
         if cfg.alloc_timing {
             crate::diagnostics::alloc::time_this_thread();
+            stats.alloc_timing_enabled.store(true, Ordering::Release);
         }
         StartupStepOutcome::Ready {
             payload: Box::new(StartupReadyPayload {
@@ -9114,7 +9235,7 @@ fn control_thread_main(
             publish_gen += 1;
 
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                || -> Option<(TickSample, Option<(super::ops::ReleaseReport, Instant, u64)>)> {
+                || -> Option<(TickSample, Instant, Option<(super::ops::ReleaseReport, Instant, u64)>)> {
                     let _guard = ReleaseGuard::enter();
                     assert!(
                         tokio::runtime::Handle::try_current().is_err(),
@@ -9282,9 +9403,13 @@ fn control_thread_main(
                     }
                     // Deliver the pre-commit maintenance reply strictly AFTER Step 6 publication, then
                     // drain any E-stop acks / retired states produced during Steps 3-7.
+                    let ack_t0 = now_inst();
                     state.flush_pending_maint_reply(&core);
                     state.emit_estop_ack_if_advanced(&mut core);
                     state.drain_retired_states(&mut core, now_inst());
+                    let phase_ack_flush = crate::diagnostics::tick::us(
+                        now_inst().saturating_duration_since(ack_t0),
+                    );
                     let control_hz = core.config.control_frequency_hz;
                     let done = now_inst();
                     let alloc_t0 = now_inst();
@@ -9327,6 +9452,7 @@ fn control_thread_main(
                         },
                         phases_us: ReleasePhasesUs {
                             alloc_read: phase_alloc_read,
+                            ack_flush: phase_ack_flush,
                             terminal: core.take_phase_terminal_us(),
                             ..ReleasePhasesUs::default()
                         },
@@ -9347,6 +9473,7 @@ fn control_thread_main(
                         maint_req_id,
                         release_flags,
                     };
+                    let post_t0 = now_inst();
                     // Wake dispatcher immediately after Window 1 publication/drain work (preserving
                     // pre-Window-2 service latency for observations, acks, and safety logs).
                     hub.wake();
@@ -9354,22 +9481,25 @@ fn control_thread_main(
 
                     let next_wake = report.poll.wake_before(release_deadline);
                     drop(_guard);
-                    Some((sample, next_wake.map(|_| (report, release_deadline, next_release_ns))))
+                    Some((sample, post_t0, next_wake.map(|_| (report, release_deadline, next_release_ns))))
                 },
             ))
         };
 
         // ---- Window 2: Disjoint sub-release transition wakes before `next_release_ns` ----
         let mut step_sample: Option<TickSample> = None;
+        let mut step_post_t0: Option<Instant> = None;
         let step_res: Result<(), Box<dyn Any + Send>> = match release_res {
             Err(err) => Err(err),
             Ok(None) => Ok(()),
-            Ok(Some((sample, None))) => {
+            Ok(Some((sample, post_t0, None))) => {
                 step_sample = Some(sample);
+                step_post_t0 = Some(post_t0);
                 Ok(())
             }
-            Ok(Some((sample, Some((mut report, release_deadline, next_release_ns))))) => {
+            Ok(Some((sample, post_t0, Some((mut report, release_deadline, next_release_ns))))) => {
                 step_sample = Some(sample);
+                step_post_t0 = Some(post_t0);
                 let mut wakes = 0u32;
                 let mut next_wake = report.poll.wake_before(release_deadline);
                 let mut wake_err: Option<Box<dyn Any + Send>> = None;
@@ -9474,6 +9604,13 @@ fn control_thread_main(
                 ..Default::default()
             });
             sample.release_us = stamped_release_us;
+            if let Some(post_t0) = step_post_t0 {
+                let post_us = crate::diagnostics::tick::us(
+                    now_inst().saturating_duration_since(post_t0),
+                );
+                sample.post_us = post_us;
+                sample.phases_us.post = post_us;
+            }
             if diag_tx.push(sample).is_err() {
                 diag_dropped_delta = 1;
             }
@@ -10506,10 +10643,26 @@ mod tests {
         assert_eq!(RtOwner::from_var(Some("legacy")).unwrap(), RtOwner::Legacy);
         assert_eq!(RtOwner::from_var(Some("executor")).unwrap(), RtOwner::Executor);
         assert!(RtOwner::from_var(Some("unknown")).is_err());
+
+        // CLI `--owner` wins over `ARMD_RT_OWNER`, default stays `legacy`.
+        assert_eq!(RtOwner::resolve(None, None).unwrap(), RtOwner::Legacy);
+        assert_eq!(RtOwner::resolve(None, Some("executor")).unwrap(), RtOwner::Executor);
+        assert_eq!(RtOwner::resolve(Some("legacy"), Some("executor")).unwrap(), RtOwner::Legacy);
+        assert_eq!(RtOwner::resolve(Some("executor"), Some("legacy")).unwrap(), RtOwner::Executor);
+        assert_eq!(RtOwner::resolve(Some("executor"), None).unwrap(), RtOwner::Executor);
+        let bad_cli = RtOwner::resolve(Some("bogus"), Some("executor")).unwrap_err();
+        assert!(bad_cli.contains("--owner"), "{bad_cli}");
+
+        // Legacy works for any follower; executor is explicitly allowed only for `mock` and `rebot-dm`.
         assert!(validate_startup_owner(RtOwner::Legacy, "rebot-dm").is_ok());
+        assert!(validate_startup_owner(RtOwner::Legacy, "so-arm101").is_ok());
         assert!(validate_startup_owner(RtOwner::Executor, "mock").is_ok());
-        assert!(validate_startup_owner(RtOwner::Executor, "sim").is_err());
-        assert!(validate_startup_owner(RtOwner::Executor, "rebot-dm").is_err());
+        assert!(validate_startup_owner(RtOwner::Executor, "rebot-dm").is_ok());
+        for refused in ["sim", "so-arm101", "so-arm100", "rebot-rs", "fashionstar", "star-arm102"] {
+            let err = validate_startup_owner(RtOwner::Executor, refused).unwrap_err();
+            assert!(err.contains(refused), "error must name follower {refused}: {err}");
+            assert!(err.contains("rebot-dm"), "error must state qualified followers: {err}");
+        }
     }
 
     #[test]

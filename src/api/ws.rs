@@ -3000,7 +3000,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         }
                         continue;
                     }
-                    if let Some(action_disp) = actions::handle_executor_ws_action(
+                    let motion_or_action = match motion::handle_executor_ws_motion(
                         frame_kind,
                         entry,
                         &value,
@@ -3010,24 +3010,48 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         &recv_generation,
                         &recv_client_label,
                         &mut last_ordinary_request,
-                        &ws_auth,
                         &recv_supervisor,
-                        &recv_deps,
-                        &recv_calib,
                         &worker_closing,
                         &worker_command_reply_pending,
                         &worker_ack_tracker,
-                        &worker_tasks,
                     )
                     .await
                     {
+                        Some(disp) => Some(disp),
+                        None => {
+                            actions::handle_executor_ws_action(
+                                frame_kind,
+                                entry,
+                                &value,
+                                stamp,
+                                recv_conn_id,
+                                &recv_connection,
+                                &recv_generation,
+                                &recv_client_label,
+                                &mut last_ordinary_request,
+                                &ws_auth,
+                                &recv_supervisor,
+                                &recv_deps,
+                                &recv_calib,
+                                &worker_closing,
+                                &worker_command_reply_pending,
+                                &worker_ack_tracker,
+                                &worker_tasks,
+                            )
+                            .await
+                        }
+                    };
+                    if let Some(action_disp) = motion_or_action {
                         match action_disp {
                             actions::ExecutorActionDispatch::Reply {
                                 reply,
                                 gate,
                                 ack_guard,
                             } => {
-                                if reply.get("type").and_then(Value::as_str) == Some("command_ack") {
+                                if matches!(
+                                    reply.get("type").and_then(Value::as_str),
+                                    Some("command_ack" | "preset_ack")
+                                ) {
                                     if let Some(aid) = reply.get("action_id").and_then(Value::as_u64) {
                                         worker_ack_tracker.mark_ack_queued_for_wire(aid);
                                     }

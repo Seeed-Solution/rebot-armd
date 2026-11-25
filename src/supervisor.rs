@@ -13919,7 +13919,10 @@ impl ArmSupervisor {
                 unsupported_reason,
                 msg,
             }) => {
-                if let Some(slot) = core.driver.take() {
+                if let Some(mut slot) = core.driver.take() {
+                    if let Some(drv) = slot.as_exclusive_mut() {
+                        drv.set_rt_mode(false);
+                    }
                     core.driver = Some(slot.into_legacy(Arc::clone(&self.driver_lock_attempts)));
                 }
                 *guard = *core;
@@ -18089,8 +18092,10 @@ impl ArmSupervisor {
     /// without ever blocking the control thread.
     pub fn tick_stats(&self) -> crate::diagnostics::tick::TickSnapshot {
         const MAX_ALIGN_ATTEMPTS: usize = 4;
-        let active_stats = if let Some(h) = self.executor_handle() {
-            Some(Arc::clone(h.stats()))
+        let executor_stats = self.executor_handle().map(|h| Arc::clone(h.stats()));
+        let is_executor = executor_stats.is_some();
+        let active_stats = if let Some(s) = executor_stats {
+            Some(s)
         } else {
             self.legacy_loop_stats
                 .lock()
@@ -18098,7 +18103,7 @@ impl ArmSupervisor {
                 .clone()
         };
 
-        let mut snap = if let Some(s) = active_stats {
+        let mut snap = if let Some(ref s) = active_stats {
             // Bounded alignment loop: read monotonic snapshot FIRST (Acquire on `stats_seq`),
             // drain off-thread diagnostics (guaranteed to include all samples & amendments
             // published before `mono1`), copy the lock-free window (fast memcpy, no sort),
@@ -18188,6 +18193,25 @@ impl ArmSupervisor {
                 |s| s.safety_log_dropped(),
             );
         snap.log_writer_dropped = crate::diagnostics::logwriter::total_dropped();
+        if is_executor {
+            snap.control_thread_lock_attempts = Some(
+                self.inner
+                    .control_thread_attempts()
+                    .saturating_add(self.driver_lock_attempts.load(Ordering::Acquire))
+                    .saturating_add(self.terminal_capture_channel.control_thread_lock_attempts()),
+            );
+        }
+        if let Some(ref s) = active_stats {
+            if s.alloc_timing_enabled.load(Ordering::Acquire) {
+                snap.alloc_timing_enabled = Some(true);
+                if is_executor {
+                    snap.control_thread_alloc_ops = Some(s.total_allocs().total());
+                }
+            }
+            if is_executor {
+                snap.executor_wakes = Some(s.completed_wakes.load(Ordering::Acquire));
+            }
+        }
         snap
     }
 

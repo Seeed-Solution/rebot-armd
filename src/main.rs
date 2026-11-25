@@ -14,6 +14,7 @@ use std::sync::atomic::Ordering;
 struct CliArgs {
     follower: Option<String>,
     follower_port: Option<String>,
+    owner: Option<String>,
     port: Option<u16>,
     config: Option<String>,
     tool: Option<String>,
@@ -28,13 +29,22 @@ struct CliArgs {
 }
 
 fn parse_cli_args() -> Result<CliArgs, String> {
-    let mut args = std::env::args().skip(1);
+    parse_cli_args_from(std::env::args().skip(1))
+}
+
+fn parse_cli_args_from<I, S>(iter: I) -> Result<CliArgs, String>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let mut args = iter.into_iter().map(Into::into);
     let mut cli = CliArgs::default();
     while let Some(arg) = args.next() {
         if arg == "--help" || arg == "-h" {
             println!("armd - Robotic arm daemon\n\nUSAGE: armd [OPTIONS]\n\n\
                 --follower <MODEL>           rebot-rs, rebot-dm, so-arm101, fashionstar, star-arm102, sim, mock (default)\n\
                 --follower-port <PORT>       CAN interface, serial device, or udp://HOST:PORT for sim (default udp://127.0.0.1:47600)\n\
+                --owner <OWNER>              control-loop owner: legacy (default) or executor (explicit opt-in for rebot-dm and mock; or ARMD_RT_OWNER)\n\
                 --config <JSON>              ArmConfig profile (must match follower joint count)\n\
                 --tool <JSON>                Tool pack manifest (tool.json; or ARMD_TOOL)\n\
                 --tool-info <JSON>           Validate tool.json and print single-line summary JSON to stdout\n\
@@ -63,6 +73,7 @@ fn parse_cli_args() -> Result<CliArgs, String> {
             arg.as_str(),
             "--follower"
                 | "--follower-port"
+                | "--owner"
                 | "--port"
                 | "--config"
                 | "--tool"
@@ -83,6 +94,12 @@ fn parse_cli_args() -> Result<CliArgs, String> {
         match arg.as_str() {
             "--follower" => cli.follower = Some(value),
             "--follower-port" => cli.follower_port = Some(value),
+            "--owner" => {
+                if value.trim().is_empty() {
+                    return Err("--owner must not be empty".into());
+                }
+                cli.owner = Some(value);
+            }
             "--config" => cli.config = Some(value),
             "--tool" => {
                 if value.is_empty() {
@@ -479,6 +496,173 @@ where
     Ok(())
 }
 
+struct StartedControlOwner {
+    executor_handle: Option<armd::rt_core::executor::RtExecutorHandle>,
+    legacy_control_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    fell_back_to_legacy: bool,
+}
+
+fn spawn_legacy_control_loop(
+    supervisor: &Arc<ArmSupervisor>,
+    period: Duration,
+    rt_sched: armd::rt_core::sched::RtSchedConfig,
+    memory_lock: armd::rt_core::sched::MemoryLock,
+    alloc_timing: bool,
+    apply_rt_sched: bool,
+) -> Result<Arc<std::sync::atomic::AtomicBool>, String> {
+    let control_supervisor = supervisor.clone();
+    let control_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let control_stop_flag = control_stop.clone();
+    let executor_stats = Arc::new(armd::rt_core::executor::ExecutorStats::default());
+    supervisor.attach_legacy_loop_stats(executor_stats.clone());
+    let loop_stats = executor_stats.clone();
+    let runtime = tokio::runtime::Handle::current();
+    std::thread::Builder::new()
+        .name("armd-control".into())
+        .spawn(move || {
+            let sched = if apply_rt_sched {
+                let s = armd::rt_core::sched::apply_to_current_thread(&rt_sched, &memory_lock);
+                if s.realtime {
+                    info!(
+                        "Control loop running at SCHED_FIFO priority {}{}",
+                        s.priority,
+                        s.cpu.map(|c| format!(" on CPU {c}")).unwrap_or_default()
+                    );
+                } else {
+                    warn!(
+                        "Control loop real-time scheduling unavailable ({}); using normal scheduling, MIT tracking (when configured) refused",
+                        s.errors.join("; ")
+                    );
+                }
+                armd::rt_core::sched::set_readiness(armd::rt_core::sched::RtReadiness::from_sched(&s));
+                s
+            } else {
+                armd::rt_core::sched::observe_current_thread(&memory_lock)
+            };
+            control_supervisor.set_control_thread_sched(sched);
+            if alloc_timing {
+                armd::diagnostics::alloc::time_this_thread();
+                loop_stats
+                    .alloc_timing_enabled
+                    .store(true, std::sync::atomic::Ordering::Release);
+                info!("Control loop allocator timing on (ARMD_ALLOC_TIMING=1)");
+            }
+            control_supervisor.run_legacy_control_loop_blocking(
+                period,
+                control_stop_flag,
+                loop_stats,
+                runtime,
+                None,
+            );
+        })
+        .map_err(|e| format!("Failed to spawn legacy control loop thread: {e}"))?;
+    executor_stats
+        .spawn_monitor(control_stop.clone())
+        .map_err(|e| format!("Failed to spawn legacy loop monitor: {e}"))?;
+    Ok(control_stop)
+}
+
+async fn start_control_owner_with_hooks(
+    supervisor: &Arc<ArmSupervisor>,
+    follower: &str,
+    rt_owner: armd::rt_core::executor::RtOwner,
+    period: Duration,
+    rt_sched: armd::rt_core::sched::RtSchedConfig,
+    memory_lock: armd::rt_core::sched::MemoryLock,
+    alloc_timing: bool,
+    apply_rt_sched: bool,
+    panic_policy: armd::rt_core::executor::PanicPolicy,
+    hooks: armd::rt_core::executor::PersistTestHooks,
+) -> Result<StartedControlOwner, String> {
+    match rt_owner {
+        armd::rt_core::executor::RtOwner::Legacy => {
+            let stop = spawn_legacy_control_loop(
+                supervisor,
+                period,
+                rt_sched,
+                memory_lock,
+                alloc_timing,
+                apply_rt_sched,
+            )?;
+            Ok(StartedControlOwner {
+                executor_handle: None,
+                legacy_control_stop: Some(stop),
+                fell_back_to_legacy: false,
+            })
+        }
+        armd::rt_core::executor::RtOwner::Executor => {
+            let fallback_sched = rt_sched;
+            let fallback_mlock = memory_lock.clone();
+            let cfg = armd::rt_core::executor::ExecutorConfig {
+                period,
+                boot: armd::rt_core::broker::BootId(1),
+                capacities: armd::rt_core::broker::Capacities::default(),
+                rt_sched,
+                memory_lock,
+                alloc_timing,
+                panic_policy,
+                apply_rt_sched,
+            };
+            match supervisor.start_executor_with_hooks(cfg, hooks).await {
+                Ok(handle) => {
+                    info!(
+                        "RT executor owns ArmCore and bus (follower={follower}, owner={})",
+                        rt_owner.as_str()
+                    );
+                    Ok(StartedControlOwner {
+                        executor_handle: Some(handle),
+                        legacy_control_stop: None,
+                        fell_back_to_legacy: false,
+                    })
+                }
+                Err(e) if supervisor.has_detached_safe_hold() => {
+                    // B4: Keep daemon alive while a detached startup loser exclusively holds an
+                    // energized/unknown driver in SAFE-HOLD until deliberate process-exit signal.
+                    error!(
+                        "RT executor startup failed on follower '{follower}' while detached writer holds driver in SAFE-HOLD ({e}); keeping daemon alive until deliberate shutdown signal without torque-off"
+                    );
+                    Ok(StartedControlOwner {
+                        executor_handle: None,
+                        legacy_control_stop: None,
+                        fell_back_to_legacy: false,
+                    })
+                }
+                Err(e)
+                    if follower != "mock"
+                        && supervisor.owner_mode() == armd::supervisor::OWNER_LEGACY =>
+                {
+                    // DRV-F1 handback: executor startup failed recoverably and returned `ArmCore`
+                    // and the hardware driver cleanly to Legacy ownership. Start the legacy
+                    // control loop holding immediately — never exit and never torque-off away from rest.
+                    error!(
+                        "RT executor startup failed on real follower '{follower}' ({e}); falling back to legacy owner holding (DRV-F1 handback) without torque-off"
+                    );
+                    let stop = spawn_legacy_control_loop(
+                        supervisor,
+                        period,
+                        fallback_sched,
+                        fallback_mlock,
+                        alloc_timing,
+                        apply_rt_sched,
+                    )
+                    .map_err(|leg_err| {
+                        format!(
+                            "RT executor startup failed ({e}) and legacy fallback control loop failed to start: {leg_err}"
+                        )
+                    })?;
+                    Ok(StartedControlOwner {
+                        executor_handle: None,
+                        legacy_control_stop: Some(stop),
+                        fell_back_to_legacy: true,
+                    })
+                }
+                Err(e) => Err(format!("Failed to start RT executor: {e}")),
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let started = std::time::Instant::now();
@@ -539,7 +723,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         m => warn!("Process memory not locked ({}); MIT tracking, when configured, is refused", m.describe()),
     }
     let follower = cli.follower.as_deref().unwrap_or("mock");
-    let rt_owner = armd::rt_core::executor::RtOwner::from_env()?;
+    let env_rt_owner = std::env::var("ARMD_RT_OWNER").ok();
+    let rt_owner = armd::rt_core::executor::RtOwner::resolve(
+        cli.owner.as_deref(),
+        env_rt_owner.as_deref(),
+    )?;
     armd::rt_core::executor::validate_startup_owner(rt_owner, follower)?;
     let config = resolve_follower_config(follower, cli.config.as_deref())?;
     let mut config = apply_cli_tool(config, cli.tool.as_deref())?;
@@ -720,75 +908,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // One owner selected at startup: legacy supervisor-lock loop (default) or the synchronous
     // RT executor OS thread owning `ArmCore` and the bus with zero Tokio entry.
     let alloc_timing = std::env::var("ARMD_ALLOC_TIMING").is_ok_and(|v| v == "1");
-    let mut legacy_control_stop: Option<Arc<std::sync::atomic::AtomicBool>> = None;
-    let mut executor_handle: Option<armd::rt_core::executor::RtExecutorHandle> = None;
-    match rt_owner {
-        armd::rt_core::executor::RtOwner::Legacy => {
-            let control_supervisor = supervisor.clone();
-            let control_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let control_stop_flag = control_stop.clone();
-            let executor_stats = Arc::new(armd::rt_core::executor::ExecutorStats::default());
-            supervisor.attach_legacy_loop_stats(executor_stats.clone());
-            let loop_stats = executor_stats.clone();
-            let runtime = tokio::runtime::Handle::current();
-            std::thread::Builder::new().name("armd-control".into()).spawn(move || {
-                let sched = armd::rt_core::sched::apply_to_current_thread(&rt_sched, &memory_lock);
-                if sched.realtime {
-                    info!(
-                        "Control loop running at SCHED_FIFO priority {}{}",
-                        sched.priority,
-                        sched.cpu.map(|c| format!(" on CPU {c}")).unwrap_or_default()
-                    );
-                } else {
-                    warn!(
-                        "Control loop real-time scheduling unavailable ({}); using normal scheduling, MIT tracking (when configured) refused",
-                        sched.errors.join("; ")
-                    );
-                }
-                armd::rt_core::sched::set_readiness(armd::rt_core::sched::RtReadiness::from_sched(&sched));
-                control_supervisor.set_control_thread_sched(sched);
-                if alloc_timing {
-                    armd::diagnostics::alloc::time_this_thread();
-                    info!("Control loop allocator timing on (ARMD_ALLOC_TIMING=1)");
-                }
-                control_supervisor.run_legacy_control_loop_blocking(
-                    period,
-                    control_stop_flag,
-                    loop_stats,
-                    runtime,
-                    None,
-                );
-            })?;
-            executor_stats.spawn_monitor(control_stop.clone())?;
-            legacy_control_stop = Some(control_stop);
-        }
-        armd::rt_core::executor::RtOwner::Executor => {
-            let cfg = armd::rt_core::executor::ExecutorConfig {
-                period,
-                boot: armd::rt_core::broker::BootId(1),
-                capacities: armd::rt_core::broker::Capacities::default(),
-                rt_sched,
-                memory_lock,
-                alloc_timing,
-                panic_policy: armd::rt_core::executor::PanicPolicy::AbortProcess,
-                apply_rt_sched: true,
-            };
-            match supervisor.start_executor(cfg).await {
-                Ok(handle) => {
-                    info!("RT executor owns ArmCore and bus (ARMD_RT_OWNER=executor)");
-                    executor_handle = Some(handle);
-                }
-                Err(e) if supervisor.has_detached_safe_hold() => {
-                    // B4: Keep daemon alive while a detached startup loser exclusively holds an
-                    // energized/unknown driver in SAFE-HOLD until deliberate process-exit signal.
-                    error!(
-                        "RT executor startup failed while detached writer holds driver in SAFE-HOLD ({e}); keeping daemon alive until deliberate shutdown signal"
-                    );
-                }
-                Err(e) => return Err(format!("Failed to start RT executor: {e}").into()),
-            }
-        }
-    }
+    let started_owner = start_control_owner_with_hooks(
+        &supervisor,
+        follower,
+        rt_owner,
+        period,
+        rt_sched,
+        memory_lock,
+        alloc_timing,
+        true,
+        armd::rt_core::executor::PanicPolicy::AbortProcess,
+        armd::rt_core::executor::PersistTestHooks::default(),
+    )
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    let legacy_control_stop = started_owner.legacy_control_stop;
+    let executor_handle = started_owner.executor_handle;
     // Start the off-control-thread automatic gripper baseline consumer for both owners.
     armd::gripper_calib::spawn_baseline_persister(supervisor.clone());
 
@@ -1461,5 +1596,164 @@ mod shutdown_tests {
             assert_eq!(loaded.active_tool.id, "soft_finray_gripper");
             assert!(loaded.active_tool.commissioning_required);
         }
+    }
+
+    #[test]
+    fn cli_owner_flag_and_follower_gate() {
+        let parsed = parse_cli_args_from(["--follower", "rebot-dm", "--owner", "executor"]).unwrap();
+        assert_eq!(parsed.follower.as_deref(), Some("rebot-dm"));
+        assert_eq!(parsed.owner.as_deref(), Some("executor"));
+        let owner = armd::rt_core::executor::RtOwner::resolve(parsed.owner.as_deref(), Some("legacy")).unwrap();
+        assert_eq!(owner, armd::rt_core::executor::RtOwner::Executor);
+        assert!(armd::rt_core::executor::validate_startup_owner(owner, "rebot-dm").is_ok());
+
+        // Missing or empty --owner value is rejected.
+        assert!(parse_cli_args_from(["--owner"]).is_err());
+        assert!(parse_cli_args_from(["--owner", ""]).is_err());
+
+        // Default stays legacy when neither CLI nor env is set.
+        let default_cli = parse_cli_args_from(["--follower", "rebot-dm"]).unwrap();
+        assert_eq!(
+            armd::rt_core::executor::RtOwner::resolve(default_cli.owner.as_deref(), None).unwrap(),
+            armd::rt_core::executor::RtOwner::Legacy
+        );
+
+        // Unqualified real followers refuse executor with clear error.
+        let err = armd::rt_core::executor::validate_startup_owner(
+            armd::rt_core::executor::RtOwner::Executor,
+            "so-arm101",
+        )
+        .unwrap_err();
+        assert!(err.contains("so-arm101"), "{err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_follower_executor_startup_failure_falls_back_to_legacy_holding_without_torque_off() {
+        // Energized real follower (away from rest) where executor init fails recoverably:
+        // must fall back to Legacy owner holding with zero torque-off commands sent!
+        let state = Arc::new(std::sync::Mutex::new(EnableState::Enabled));
+        let enable_sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let disable_sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let drv = ToggleableRtDriver {
+            state: state.clone(),
+            enable_sent: enable_sent.clone(),
+            disable_sent: disable_sent.clone(),
+        };
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
+        sup.set_lease_enabled(false).await;
+        sup.start_dispatcher().unwrap();
+        sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
+
+        let hooks = armd::rt_core::executor::PersistTestHooks {
+            fail_init: Some(true),
+            ..Default::default()
+        };
+        let started = start_control_owner_with_hooks(
+            &sup,
+            "rebot-dm",
+            armd::rt_core::executor::RtOwner::Executor,
+            Duration::from_millis(10),
+            armd::rt_core::sched::RtSchedConfig::default(),
+            armd::rt_core::sched::MemoryLock::Skipped("test".into()),
+            false,
+            false,
+            armd::rt_core::executor::PanicPolicy::StopExecutor,
+            hooks,
+        )
+        .await
+        .expect("recoverable executor startup failure on rebot-dm must fall back to legacy");
+
+        assert!(started.fell_back_to_legacy);
+        assert!(started.executor_handle.is_none());
+        let leg_stop = started
+            .legacy_control_stop
+            .expect("fallback must start a live legacy control loop");
+        assert_eq!(sup.owner_mode(), armd::supervisor::OWNER_LEGACY);
+
+        // Wait for at least 3 legacy control ticks to prove the fallback loop is actively holding.
+        let wait_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while sup.tick_stats().releases_total < 3 && std::time::Instant::now() < wait_deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let snap = sup.tick_stats();
+        assert_eq!(snap.owner_mode, "legacy");
+        assert!(snap.loop_active, "fallback legacy loop must be active: {snap:?}");
+        assert!(snap.releases_total >= 3, "fallback legacy loop must advance releases: {snap:?}");
+        assert_eq!(
+            disable_sent.load(Ordering::SeqCst),
+            0,
+            "fallback to legacy holding must NEVER send torque-off away from rest"
+        );
+        assert_eq!(*state.lock().unwrap(), EnableState::Enabled);
+
+        // Clean teardown via deliberate process-exit signal.
+        sup.signal_legacy_stop(&leg_stop);
+        let _ = sup
+            .emergency_process_exit_disable_until(std::time::Instant::now() + Duration::from_millis(500))
+            .await;
+
+        // Also verify MIT-configured profile triggers recoverable refusal -> fallback to legacy holding.
+        let mut mit_cfg = ArmConfig::rebot_dm();
+        if let Some(jt) = mit_cfg.joint_tracking.as_mut() {
+            jt.enabled = true;
+            jt.joints[0].strategy = armd::model::TrackingStrategy::Mit;
+            jt.joints[0].kp = 10.0;
+            jt.joints[0].kd = 0.5;
+            jt.joints[0].effort_limit_nm = 5.0;
+            jt.joints[0].hold_kp = Some(10.0);
+            jt.joints[0].hold_kd = Some(0.5);
+        }
+        let state_mit = Arc::new(std::sync::Mutex::new(EnableState::Disabled));
+        let disable_mit = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let drv_mit = ToggleableRtDriver {
+            state: state_mit,
+            enable_sent: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            disable_sent: disable_mit.clone(),
+        };
+        let sup_mit = Arc::new(ArmSupervisor::new(mit_cfg).with_driver(Box::new(drv_mit)));
+        sup_mit.start_dispatcher().unwrap();
+        let started_mit = start_control_owner_with_hooks(
+            &sup_mit,
+            "rebot-dm",
+            armd::rt_core::executor::RtOwner::Executor,
+            Duration::from_millis(10),
+            armd::rt_core::sched::RtSchedConfig::default(),
+            armd::rt_core::sched::MemoryLock::Skipped("test".into()),
+            false,
+            false,
+            armd::rt_core::executor::PanicPolicy::StopExecutor,
+            armd::rt_core::executor::PersistTestHooks::default(),
+        )
+        .await
+        .expect("MIT refusal on rebot-dm must fall back to legacy owner");
+        assert!(started_mit.fell_back_to_legacy);
+        assert_eq!(sup_mit.owner_mode(), armd::supervisor::OWNER_LEGACY);
+        assert_eq!(disable_mit.load(Ordering::SeqCst), 0);
+        if let Some(stop) = started_mit.legacy_control_stop {
+            sup_mit.signal_legacy_stop(&stop);
+        }
+
+        // Mock follower (no real hardware) still fails fast on executor startup error.
+        let sup_mock = Arc::new(ArmSupervisor::new(ArmConfig::default()));
+        sup_mock.start_dispatcher().unwrap();
+        let mock_err = start_control_owner_with_hooks(
+            &sup_mock,
+            "mock",
+            armd::rt_core::executor::RtOwner::Executor,
+            Duration::from_millis(10),
+            armd::rt_core::sched::RtSchedConfig::default(),
+            armd::rt_core::sched::MemoryLock::Skipped("test".into()),
+            false,
+            false,
+            armd::rt_core::executor::PanicPolicy::StopExecutor,
+            armd::rt_core::executor::PersistTestHooks {
+                fail_init: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .err()
+        .expect("mock executor startup failure must fail fast");
+        assert!(mock_err.contains("Failed to start RT executor"), "{mock_err}");
     }
 }

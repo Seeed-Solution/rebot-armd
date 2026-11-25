@@ -1032,6 +1032,20 @@ pub struct TickSnapshot {
     /// Coherent deltas and peaks since the latest `POST /api/v1/diagnostics/tick/mark`, if requested.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub since_marker: Option<TickSinceMarker>,
+    /// Cumulative forbidden lock attempts from `armd-control` (`SupervisorLock` + `DriverSlot` +
+    /// terminal capture) when the RT executor owns the arm (`None` in legacy mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_thread_lock_attempts: Option<u64>,
+    /// Cumulative control-thread heap ops across whole releases and sub-release wakes when
+    /// `ARMD_ALLOC_TIMING=1` is active in executor mode (`None` otherwise).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_thread_alloc_ops: Option<u64>,
+    /// True when `ARMD_ALLOC_TIMING=1` is active on the owning control thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alloc_timing_enabled: Option<bool>,
+    /// Cumulative completed sub-release transition wakes in executor mode (`None` in legacy mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor_wakes: Option<u64>,
 }
 
 impl Default for TickStats {
@@ -2236,6 +2250,10 @@ impl TickWindow {
             stats_reader_retries: 0,
             stats_writer_drops: 0,
             since_marker: None,
+            control_thread_lock_attempts: None,
+            control_thread_alloc_ops: None,
+            alloc_timing_enabled: None,
+            executor_wakes: None,
         }
     }
 }

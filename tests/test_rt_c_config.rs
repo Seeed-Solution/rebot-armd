@@ -2128,23 +2128,23 @@ async fn ws_executor_routes_pr_c_paths_and_leaves_unmigrated_paths_pending() {
 
     let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
 
-    // 1. Unmigrated path (`/api/v1/motion/jog`) MUST still return 503 EXECUTOR_ROUTING_PENDING,
-    // while PR L's migrated `/api/v1/torque` without lease now returns 409 LEASE_LOST.
-    let jog_rej = ws_send_recv(
+    // 1. Unmigrated path (`/api/v1/mode/gravity_comp`) MUST still return 503 EXECUTOR_ROUTING_PENDING,
+    // while migrated `/api/v1/torque` without lease returns 409 LEASE_LOST.
+    let gc_rej = ws_send_recv(
         &mut ws,
         json!({
             "type": "command",
             "request_id": 1,
             "generation": 1,
             "epoch_id": 1,
-            "path": "/api/v1/motion/jog",
-            "body": { "target_positions": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] }
+            "path": "/api/v1/mode/gravity_comp",
+            "body": { "enable": true }
         }),
     )
     .await;
-    assert_eq!(jog_rej["type"], "command_reject");
-    assert_eq!(jog_rej["status"], 503);
-    assert_eq!(jog_rej["code"], "EXECUTOR_ROUTING_PENDING");
+    assert_eq!(gc_rej["type"], "command_reject");
+    assert_eq!(gc_rej["status"], 503);
+    assert_eq!(gc_rej["code"], "EXECUTOR_ROUTING_PENDING");
 
     let torque_rej = ws_send_recv(
         &mut ws,

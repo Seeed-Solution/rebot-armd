@@ -510,3 +510,540 @@ pub(super) fn gravity_comp_request(body: &Value) -> Result<crate::gravity_comp::
     };
     Ok(crate::gravity_comp::GravityCompRequest { scale, damping_kd })
 }
+
+enum ExecutorMotionSubmitOutcome {
+    Ack {
+        action_id: u64,
+        expected_duration_s: f64,
+        ack_guard: crate::rt_core::reply_router::AckCommitGuard,
+    },
+    StartDrifted,
+    Reject {
+        epoch: u64,
+        error: ArmError,
+    },
+}
+
+async fn submit_prepared_motion_executor_ws(
+    sup: &Arc<ArmSupervisor>,
+    conn_id: u64,
+    kind: req::MotionKind,
+    plan: &req::PreparedMotionPlan,
+    authority: crate::rt_core::broker::Authority,
+    deadline: Instant,
+    wire_tracker: Arc<crate::rt_core::reply_router::WsWireAckTracker>,
+) -> ExecutorMotionSubmitOutcome {
+    use crate::rt_core::broker::{AdmitError, ClientId, Reply, Submit};
+    use crate::rt_core::ops::PlanSlot;
+    use crate::rt_core::reply_router::{ExternalDestinationPolicy, ExternalSubmitError};
+    use crate::rt_core::requests::actions::ActionRefusal;
+
+    let cur_epoch = || {
+        sup.hub()
+            .latest()
+            .map_or(authority.epoch, |s| s.rt.owner.authority.epoch)
+    };
+    let Some(handle) = sup.executor_handle() else {
+        return ExecutorMotionSubmitOutcome::Reject {
+            epoch: cur_epoch(),
+            error: ArmError::Rejected {
+                status: 503,
+                code: "EXECUTOR_UNAVAILABLE".into(),
+                message: "RT executor is not active".into(),
+            },
+        };
+    };
+
+    let client = ClientId(conn_id);
+    let submit_deadline = deadline.max(Instant::now() + Duration::from_millis(50));
+    let retry_until = Instant::now() + Duration::from_millis(50);
+
+    let (_req_id, mut rx, ack_guard) = loop {
+        let write = |dst: &mut PlanSlot| match kind {
+            req::MotionKind::Jog => req::stage_jog(dst, &plan.slot),
+            req::MotionKind::Home => req::stage_home(dst, &plan.slot),
+            req::MotionKind::Park => req::stage_park(dst, &plan.slot),
+        };
+        let sub = match kind {
+            req::MotionKind::Jog => Submit::Install(&write),
+            req::MotionKind::Home => Submit::InstallHome(&write),
+            req::MotionKind::Park => Submit::InstallPark(&write),
+        };
+        match handle.submit_external_motion(
+            client,
+            0,
+            authority,
+            submit_deadline,
+            sub,
+            ExternalDestinationPolicy::ConnectionOnly,
+            true,
+            Some(Arc::clone(&wire_tracker)),
+        ) {
+            Ok(triple) => break triple,
+            Err(ExternalSubmitError::NoDestination) => {
+                return ExecutorMotionSubmitOutcome::Reject {
+                    epoch: cur_epoch(),
+                    error: ArmError::Rejected {
+                        status: 503,
+                        code: "EXECUTOR_ROUTING_PENDING".into(),
+                        message: "RT executor has no per-connection reply route bound".into(),
+                    },
+                };
+            }
+            Err(ExternalSubmitError::Stopped) => {
+                return ExecutorMotionSubmitOutcome::Reject {
+                    epoch: cur_epoch(),
+                    error: ArmError::Rejected {
+                        status: 503,
+                        code: "EXECUTOR_UNAVAILABLE".into(),
+                        message: "RT executor stopped before admitting motion".into(),
+                    },
+                };
+            }
+            Err(ExternalSubmitError::NotAnExternalAction) => {
+                return ExecutorMotionSubmitOutcome::Reject {
+                    epoch: cur_epoch(),
+                    error: ArmError::Internal("motion command rejected as non-external".into()),
+                };
+            }
+            Err(ExternalSubmitError::Admit(AdmitError::Disconnected)) => {
+                return ExecutorMotionSubmitOutcome::Reject {
+                    epoch: cur_epoch(),
+                    error: ActionRefusal::new("LEASE_LOST").into_arm_error_with_epoch(authority.epoch),
+                };
+            }
+            Err(ExternalSubmitError::Admit(AdmitError::RepliesFull)) => {
+                handle.pump_broker_replies();
+                if Instant::now() >= retry_until || Instant::now() > submit_deadline {
+                    return ExecutorMotionSubmitOutcome::Reject {
+                        epoch: cur_epoch(),
+                        error: ActionRefusal::new("TERMINALS_BUSY")
+                            .into_arm_error_with_epoch(authority.epoch),
+                    };
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            Err(ExternalSubmitError::Admit(AdmitError::CommandsFull | AdmitError::PlansFull)) => {
+                handle.pump_broker_replies();
+                let now = Instant::now();
+                if now > submit_deadline {
+                    return ExecutorMotionSubmitOutcome::Reject {
+                        epoch: cur_epoch(),
+                        error: ActionRefusal::new("DEADLINE_EXPIRED")
+                            .into_arm_error_with_epoch(authority.epoch),
+                    };
+                }
+                if now >= retry_until {
+                    return ExecutorMotionSubmitOutcome::Reject {
+                        epoch: cur_epoch(),
+                        error: ArmError::Rejected {
+                            status: 503,
+                            code: "MOTION_BUSY".into(),
+                            message: "RT executor command or plan queue is saturated".into(),
+                        },
+                    };
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+    };
+
+    let wait_limit = submit_deadline + Duration::from_secs(2);
+    loop {
+        handle.pump_broker_replies();
+        let remaining = wait_limit.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            drop(ack_guard);
+            return ExecutorMotionSubmitOutcome::Reject {
+                epoch: cur_epoch(),
+                error: ActionRefusal::new("DEADLINE_EXPIRED")
+                    .into_arm_error_with_epoch(authority.epoch),
+            };
+        }
+        let step = remaining.min(Duration::from_millis(2));
+        match tokio::time::timeout(step, &mut rx).await {
+            Ok(Ok(Ok(Reply::Ack { action: Some(id), .. }))) => {
+                return ExecutorMotionSubmitOutcome::Ack {
+                    action_id: id.0,
+                    expected_duration_s: plan.slot.duration,
+                    ack_guard,
+                };
+            }
+            Ok(Ok(Ok(Reply::Ack { action: None, .. }))) => {
+                drop(ack_guard);
+                return ExecutorMotionSubmitOutcome::Reject {
+                    epoch: cur_epoch(),
+                    error: ArmError::Internal("motion install ACK omitted ActionId".into()),
+                };
+            }
+            Ok(Ok(Ok(Reply::Refused { code: "START_DRIFTED", .. }))) => {
+                drop(ack_guard);
+                return ExecutorMotionSubmitOutcome::StartDrifted;
+            }
+            Ok(Ok(Ok(Reply::Refused { code, .. }))) => {
+                drop(ack_guard);
+                let ep = cur_epoch();
+                return ExecutorMotionSubmitOutcome::Reject {
+                    epoch: ep,
+                    error: ActionRefusal::new(code).into_arm_error_with_epoch(ep),
+                };
+            }
+            Ok(Ok(Ok(Reply::Terminal { .. } | Reply::Lease { .. }))) => {
+                drop(ack_guard);
+                return ExecutorMotionSubmitOutcome::Reject {
+                    epoch: cur_epoch(),
+                    error: ArmError::Internal("unexpected reply variant for motion install".into()),
+                };
+            }
+            Ok(Ok(Err(_))) | Ok(Err(_)) => {
+                drop(ack_guard);
+                return ExecutorMotionSubmitOutcome::Reject {
+                    epoch: cur_epoch(),
+                    error: ArmError::Rejected {
+                        status: 503,
+                        code: "EXECUTOR_UNAVAILABLE".into(),
+                        message: "RT executor stopped before acknowledging motion".into(),
+                    },
+                };
+            }
+            Err(_) => {}
+        }
+    }
+}
+
+/// Executor-owner WebSocket router for family M prepared motion commands:
+/// - `/api/v1/motion/jog`, `/api/v1/motion/home`, `/api/v1/motion/unload`
+/// - `preset` frames (`home`, `park`/`unload`, or explicit joint positions)
+///
+/// Returns `None` for `/api/v1/mode/gravity_comp` (unmigrated) and all non-M frames.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn handle_executor_ws_motion(
+    frame_kind: FrameKind,
+    entry: Option<&'static DispatchEntry>,
+    value: &Value,
+    stamp: crate::supervisor::AdmissionStamp,
+    recv_conn_id: u64,
+    recv_connection: &str,
+    recv_generation: &Arc<AtomicU64>,
+    recv_client_label: &Mutex<Option<String>>,
+    last_ordinary_request: &mut Option<u64>,
+    recv_supervisor: &Arc<ArmSupervisor>,
+    worker_closing: &Arc<AtomicBool>,
+    command_reply_pending: &Arc<AtomicBool>,
+    wire_ack_tracker: &Arc<crate::rt_core::reply_router::WsWireAckTracker>,
+) -> Option<actions::ExecutorActionDispatch> {
+    let reply_kind = match frame_kind {
+        FrameKind::Command => {
+            let path = entry?.key.path?;
+            if !matches!(
+                path,
+                "/api/v1/motion/jog" | "/api/v1/motion/home" | "/api/v1/motion/unload"
+            ) {
+                return None;
+            }
+            MotionReplyKind::Command {
+                request_id: value.get("request_id").cloned().unwrap_or(Value::Null),
+            }
+        }
+        FrameKind::Preset => MotionReplyKind::Preset {
+            name: value
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        },
+        _ => return None,
+    };
+
+    let epoch = recv_supervisor
+        .hub()
+        .latest()
+        .map_or_else(|| recv_supervisor.estop_epoch(), |s| s.obs.epoch_id);
+    let immediate = |reply: Value| {
+        Some(actions::ExecutorActionDispatch::Reply {
+            reply,
+            gate: None,
+            ack_guard: None,
+        })
+    };
+
+    // 1. Lease authority check (off-lock).
+    let local_generation = recv_generation.load(Ordering::SeqCst);
+    let supplied_generation = value.get("generation").and_then(Value::as_u64).unwrap_or(0);
+    let label_matches = {
+        let lbl = recv_client_label.lock().unwrap_or_else(|e| e.into_inner());
+        value.get("client_id").is_none_or(|id| id.as_str() == lbl.as_deref())
+    };
+    if local_generation == 0 || supplied_generation != local_generation || !label_matches {
+        return immediate(format_status_reject(
+            &reply_kind,
+            409,
+            "LEASE_LOST",
+            "This connection does not hold the active lease",
+            Some(epoch),
+        ));
+    }
+
+    // 2. Epoch check against live published state.
+    if value.get("epoch_id").and_then(Value::as_u64) != Some(epoch) {
+        return immediate(format_status_reject(
+            &reply_kind,
+            409,
+            "EPOCH_MISMATCH",
+            "Command epoch is no longer current",
+            Some(epoch),
+        ));
+    }
+
+    // 3. Monotonic request_id + object body check for Command frames.
+    if frame_kind == FrameKind::Command {
+        let request_id = value.get("request_id").and_then(Value::as_u64);
+        if request_id.is_none() || last_ordinary_request.is_some_and(|last| request_id.unwrap() <= last)
+        {
+            return immediate(format_status_reject(
+                &reply_kind,
+                400,
+                "INVALID_COMMAND",
+                "request_id must be present and strictly increase",
+                None,
+            ));
+        }
+        *last_ordinary_request = request_id;
+        if !value["body"].is_object() {
+            return immediate(format_motion_reject_at(
+                epoch,
+                &reply_kind,
+                invalid_command("Command body must be an object"),
+            ));
+        }
+    }
+
+    // 4. Parse request.
+    let request = match frame_kind {
+        FrameKind::Command => {
+            let path = entry?.key.path?;
+            match parse_motion_command(path, &value["body"]) {
+                Ok(r) => r,
+                Err(error) => return immediate(format_motion_reject_at(epoch, &reply_kind, error)),
+            }
+        }
+        FrameKind::Preset => {
+            let name = match &reply_kind {
+                MotionReplyKind::Preset { name } => name.as_str(),
+                _ => unreachable!(),
+            };
+            let parsed = match name {
+                "home" => Ok(req::MotionRequest::home(None)),
+                "park" | "unload" => Ok(req::MotionRequest::park()),
+                _ => (|| -> Result<req::MotionRequest, ApiError> {
+                    let speed_scale = crate::motion::num(value, "speed_scale").map_err(ArmError::from)?;
+                    let target = positions(value.get("positions"))?;
+                    Ok(req::MotionRequest::jog(target, None, speed_scale))
+                })(),
+            };
+            match parsed {
+                Ok(r) => r,
+                Err(error) => return immediate(format_motion_reject_at(epoch, &reply_kind, error)),
+            }
+        }
+        _ => unreachable!(),
+    };
+
+    let deadline = Instant::now() + req::DEFAULT_MOTION_PLAN_DEADLINE;
+    for attempt in 0..MAX_START_DRIFT_RETRIES {
+        let Some(latest) = recv_supervisor.hub().latest() else {
+            return immediate(format_status_reject(
+                &reply_kind,
+                503,
+                "EXECUTOR_UNAVAILABLE",
+                "RT executor has not published an observation snapshot yet",
+                Some(epoch),
+            ));
+        };
+        let Some(motion_cfg) = recv_supervisor.hub().motion_config() else {
+            return immediate(format_status_reject(
+                &reply_kind,
+                503,
+                "EXECUTOR_UNAVAILABLE",
+                "RT executor motion config snapshot is unavailable",
+                Some(latest.obs.epoch_id),
+            ));
+        };
+        if latest.rt.calibration_busy {
+            return immediate(format_status_reject(
+                &reply_kind,
+                409,
+                "CALIBRATION_BUSY",
+                "Calibration is in progress",
+                Some(latest.obs.epoch_id),
+            ));
+        }
+        let Some(mut plan_snap) = req::MotionPlanSnapshot::from_published(&latest, motion_cfg) else {
+            return immediate(format_motion_reject_at(
+                latest.obs.epoch_id,
+                &reply_kind,
+                ArmError::Motion(crate::motion::MotionError::PlanStale(
+                    "published state revision is updating; retry".into(),
+                ))
+                .into(),
+            ));
+        };
+        plan_snap.authority.epoch = epoch;
+        plan_snap.authority.lease_generation = local_generation;
+        plan_snap.authority.stop_generation = stamp.stop_gen;
+        plan_snap.authority.deadline = deadline;
+
+        let config_revision = plan_snap.workspace_revision;
+        let req_for_plan = request.clone();
+        let cancel = Arc::clone(worker_closing);
+        let plan_conn = recv_connection.to_string();
+        let planned = tokio::task::spawn_blocking(move || {
+            maybe_pause_blocking_plan(&plan_conn);
+            if cancel.load(Ordering::Acquire) {
+                return None;
+            }
+            let res = req::prepare_motion(&plan_snap, &req_for_plan);
+            if cancel.load(Ordering::Acquire) {
+                return None;
+            }
+            Some((plan_snap.authority, res))
+        })
+        .await;
+
+        if worker_closing.load(Ordering::SeqCst) {
+            return Some(actions::ExecutorActionDispatch::Closed);
+        }
+        let cur_epoch = recv_supervisor
+            .hub()
+            .latest()
+            .map_or(epoch, |s| s.obs.epoch_id);
+        if recv_supervisor.owner_mode() != crate::supervisor::OWNER_EXECUTOR {
+            return immediate(format_status_reject(
+                &reply_kind,
+                503,
+                "EXECUTOR_UNAVAILABLE",
+                "RT executor is no longer active",
+                Some(cur_epoch),
+            ));
+        }
+        let (plan_auth, prepared) = match planned {
+            Ok(None) => return Some(actions::ExecutorActionDispatch::Closed),
+            Err(e) => {
+                return immediate(format_motion_reject_at(
+                    cur_epoch,
+                    &reply_kind,
+                    ArmError::Internal(format!("motion planner failed: {e}")).into(),
+                ));
+            }
+            Ok(Some((auth, res))) => (auth, res),
+        };
+        if recv_generation.load(Ordering::SeqCst) != local_generation {
+            return immediate(format_status_reject(
+                &reply_kind,
+                409,
+                "LEASE_LOST",
+                "This connection lost the lease while planning",
+                Some(cur_epoch),
+            ));
+        }
+        let plan = match prepared {
+            Ok(p) => p,
+            Err(e) => {
+                return immediate(format_motion_reject_at(cur_epoch, &reply_kind, e.into()));
+            }
+        };
+
+        let broker_auth = crate::rt_core::broker::Authority {
+            lease_generation: local_generation,
+            epoch: plan_auth.epoch,
+            stop_generation: stamp.stop_gen,
+            config_revision,
+            parent_generation: 0,
+        };
+        let gate = CommandReplyGateGuard::enter_with_tracker(
+            command_reply_pending,
+            recv_supervisor.hub(),
+            wire_ack_tracker,
+        );
+        match submit_prepared_motion_executor_ws(
+            recv_supervisor,
+            recv_conn_id,
+            request.kind,
+            &plan,
+            broker_auth,
+            deadline,
+            Arc::clone(wire_ack_tracker),
+        )
+        .await
+        {
+            ExecutorMotionSubmitOutcome::Ack {
+                action_id,
+                expected_duration_s,
+                ack_guard,
+            } => {
+                let ack_epoch = recv_supervisor
+                    .hub()
+                    .latest()
+                    .map_or(cur_epoch, |s| s.obs.epoch_id);
+                let reply = match &reply_kind {
+                    MotionReplyKind::Command { request_id } => json!({
+                        "type": "command_ack",
+                        "request_id": request_id,
+                        "epoch_id": ack_epoch,
+                        "action_id": action_id,
+                        "expected_duration_s": expected_duration_s,
+                    }),
+                    MotionReplyKind::Preset { name } => json!({
+                        "type": "preset_ack",
+                        "name": name,
+                        "epoch_id": ack_epoch,
+                        "action_id": action_id,
+                    }),
+                };
+                return Some(actions::ExecutorActionDispatch::Reply {
+                    reply,
+                    gate: Some(gate),
+                    ack_guard: Some(ack_guard),
+                });
+            }
+            ExecutorMotionSubmitOutcome::StartDrifted
+                if attempt + 1 < MAX_START_DRIFT_RETRIES && Instant::now() <= deadline =>
+            {
+                drop(gate);
+                continue;
+            }
+            ExecutorMotionSubmitOutcome::StartDrifted => {
+                drop(gate);
+                let ep = recv_supervisor
+                    .hub()
+                    .latest()
+                    .map_or(cur_epoch, |s| s.obs.epoch_id);
+                return immediate(format_motion_reject_at(
+                    ep,
+                    &reply_kind,
+                    ArmError::Motion(crate::motion::MotionError::PlanStale(
+                        "arm position drifted while planning".into(),
+                    ))
+                    .into(),
+                ));
+            }
+            ExecutorMotionSubmitOutcome::Reject { epoch: ep, error } => {
+                drop(gate);
+                return immediate(format_motion_reject_at(ep, &reply_kind, error.into()));
+            }
+        }
+    }
+
+    let ep = recv_supervisor
+        .hub()
+        .latest()
+        .map_or(epoch, |s| s.obs.epoch_id);
+    immediate(format_motion_reject_at(
+        ep,
+        &reply_kind,
+        ArmError::Motion(crate::motion::MotionError::PlanStale(
+            "arm position drifted across planning retries".into(),
+        ))
+        .into(),
+    ))
+}
