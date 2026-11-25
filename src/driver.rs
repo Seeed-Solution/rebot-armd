@@ -7642,6 +7642,9 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     clock: Option<std::sync::Arc<dyn crate::transport::DriverClock>>,
     /// Sequence number of the last processed RX frame, and of each joint's last feedback.
     rx_seq: u64,
+    /// Exact `(rx_seq, now)` mark captured immediately before `can.transmit(&frame)` on the most
+    /// recent successful `send_inner` call (with zero intervening transport callbacks or hooks).
+    last_tx_mark: Option<(u64, Instant)>,
     last_feedback_seq: Vec<u64>,
     /// Incremented whenever joint `i`'s feedback continuity breaks (`> 100 ms` gap or non-finite).
     feedback_continuity_epoch: Vec<u64>,
@@ -8846,6 +8849,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             before_final_tx_gate_hook: None,
             clock,
             rx_seq: 0,
+            last_tx_mark: None,
             last_feedback_seq: vec![0; dof],
             feedback_continuity_epoch: vec![0; dof],
             rest_pose_boundary: vec![None; dof],
@@ -9947,11 +9951,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             }
             let tx_seq_mark = self.rx_seq;
             let tx_started_mark = self.now();
+            self.last_tx_mark = None;
             if deadline.is_some_and(|d| d.passed(tx_started_mark)) {
                 break 'send_body Err(TxRefusal::DeadlinePassed);
             }
             let res = self.can.transmit(&frame);
             if res.is_ok() {
+                self.last_tx_mark = Some((tx_seq_mark, tx_started_mark));
                 if let Some(idx) = enable_motor_idx {
                     self.motor_post_enable_feedback[idx] = false;
                     self.motor_enable_seq[idx] = self.rx_seq;
@@ -12893,6 +12899,32 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
     }
 
+    /// Sticky post-boundary J7 unsafe veto (fault, motion, or state != 0) cannot be masked by
+    /// a later benign frame in the same RX pass or swallowed by a replacement-poll drain.
+    fn check_freshen_j7_unsafe_capture(&mut self) -> Result<(), ArmDriverError> {
+        let Some(pf_j) = self.pos_force.as_ref().map(|p| p.joint) else {
+            return Ok(());
+        };
+        let bad = self
+            .refresh_capture
+            .as_ref()
+            .filter(|c| c.joint == pf_j)
+            .and_then(|c| c.unsafe_sample);
+        if let Some(sample) = bad {
+            self.refresh_capture = None;
+            self.enable_failed();
+            let still = sample.velocity.is_finite() && sample.velocity.abs() <= 0.05;
+            let off = !self.is_enabled && sample.motor_status == 0;
+            return Err(ArmDriverError::EnableFreshenUnsafeGripper {
+                joint: pf_j,
+                still,
+                off,
+                status: sample.motor_status,
+            });
+        }
+        Ok(())
+    }
+
     /// Establish a tight observed-empty RX boundary and transmit read-only `0xCC` status polls
     /// for joints in `send_mask` within the per-tick TX budget, stop gate, and enable authority.
     fn send_freshen_polls(
@@ -12905,16 +12937,17 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if send_mask == 0 || f.deadline.passed(self.now()) {
             return Ok(false);
         }
-        if !self.drain_rx_for_boundary(f.deadline) {
-            self.enable_estop_inhibited()?;
-            self.check_enable_tx_authority()?;
-            return Ok(false);
-        }
+        let drained = self.drain_rx_for_boundary(f.deadline);
         self.enable_estop_inhibited()?;
         self.check_enable_tx_authority()?;
+        self.check_freshen_j7_unsafe_capture()?;
+        if !drained {
+            return Ok(false);
+        }
         if f.deadline.passed(self.now()) {
             return Ok(false);
         }
+        let pf_joint = self.pos_force.as_ref().map(|p| p.joint);
         let mut sent_any = false;
         for j in handshake::mask_joints(send_mask) {
             self.enable_estop_inhibited()?;
@@ -12925,8 +12958,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             let Some(&id) = self.motor_ids.get(j) else {
                 continue;
             };
-            let boundary = self.rx_seq;
-            let tx_at = self.now();
             match self.send_plain(
                 TxKind::Handshake,
                 self.enable_stop_stamp,
@@ -12936,7 +12967,20 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             ) {
                 Ok(_) => {
                     if (f.sent_mask & (1u32 << j)) == 0 {
+                        let (boundary, tx_at) =
+                            self.last_tx_mark.unwrap_or((self.rx_seq, self.now()));
                         f.record_tx(j, boundary, tx_at);
+                        if pf_joint == Some(j) && j < MAX_MODE_JOINTS {
+                            self.refresh_capture = Some(RefreshCapture {
+                                joint: j,
+                                boundary: f.tx_boundary(j),
+                                tx_at: f.tx_at(j).unwrap_or(tx_at),
+                                deadline: f.deadline,
+                                allow_enabled_state: false,
+                                first: None,
+                                unsafe_sample: None,
+                            });
+                        }
                     }
                     sent_any = true;
                 }
@@ -12960,24 +13004,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 self.enable_failed();
                 return Err(e.into());
             }
-            if let Some(pf_j) = self.pos_force.as_ref().map(|p| p.joint) {
-                if pf_j < MAX_MODE_JOINTS
-                    && (f.sent_mask & (1u32 << pf_j)) != 0
-                    && self.refresh_capture.is_none()
-                {
-                    if let Some(tx_at) = f.tx_at(pf_j) {
-                        self.refresh_capture = Some(RefreshCapture {
-                            joint: pf_j,
-                            boundary: f.tx_boundary(pf_j),
-                            tx_at,
-                            deadline: f.deadline,
-                            allow_enabled_state: false,
-                            first: None,
-                            unsafe_sample: None,
-                        });
-                    }
-                }
-            }
             if (f.target_mask & !f.sent_mask) == 0 {
                 f.next_retry_at = Some(self.now() + ENABLE_FRESHEN_RETRY_INTERVAL);
             }
@@ -12999,27 +13025,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
 
         let pf_joint = self.pos_force.as_ref().map(|p| p.joint);
-        // Sticky post-boundary J7 unsafe veto (fault, motion, or state != 0) cannot be masked by
-        // a later benign frame in the same RX pass.
-        if let Some(pf_j) = pf_joint {
-            let bad = self
-                .refresh_capture
-                .as_ref()
-                .filter(|c| c.joint == pf_j)
-                .and_then(|c| c.unsafe_sample);
-            if let Some(sample) = bad {
-                self.refresh_capture = None;
-                self.enable_failed();
-                let still = sample.velocity.is_finite() && sample.velocity.abs() <= 0.05;
-                let off = !self.is_enabled && sample.motor_status == 0;
-                return Err(ArmDriverError::EnableFreshenUnsafeGripper {
-                    joint: pf_j,
-                    still,
-                    off,
-                    status: sample.motor_status,
-                });
-            }
-        }
+        self.check_freshen_j7_unsafe_capture()?;
 
         if self.last_read_drained {
             for j in handshake::mask_joints(f.target_mask & f.sent_mask) {
@@ -13118,9 +13124,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 for j in handshake::mask_joints(re_stale) {
                     f.tx_offset_ns[j] = EnableFreshen::UNSET_NS;
                 }
-                if pf_joint.is_some_and(|pf_j| (re_stale & (1u32 << pf_j)) != 0) {
-                    self.refresh_capture = None;
-                }
+                // Keep `self.refresh_capture` armed across the replacement drain so any fault,
+                // motion, or state != 0 J7 frame arriving before the replacement 0xCC still vetoes.
             }
         }
 

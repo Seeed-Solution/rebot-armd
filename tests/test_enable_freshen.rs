@@ -95,6 +95,7 @@ struct SgBusState {
     follow_commands: bool,
     rx: VecDeque<(CanFrame, Option<CanRxTime>)>,
     delayed: Vec<(Instant, CanFrame)>,
+    inject_after_empty: VecDeque<CanFrame>,
     tx_log: Vec<CanFrame>,
 }
 
@@ -181,6 +182,7 @@ impl Sg2002Bus {
             follow_commands: true,
             rx: VecDeque::with_capacity(512),
             delayed: Vec::new(),
+            inject_after_empty: VecDeque::new(),
             tx_log: Vec::new(),
         })))
     }
@@ -349,7 +351,16 @@ impl CanTransport for Sg2002Bus {
     fn receive_with_rx_time(&mut self) -> Result<(CanFrame, Option<CanRxTime>), TransportError> {
         let mut s = self.0.lock().unwrap();
         s.flush_due_delayed();
-        s.rx.pop_front().ok_or(TransportError::WouldBlock)
+        if let Some(item) = s.rx.pop_front() {
+            return Ok(item);
+        }
+        if !s.inject_after_empty.is_empty() {
+            let now = s.clock.now();
+            while let Some(f) = s.inject_after_empty.pop_front() {
+                s.rx.push_back((f, Some(CanRxTime::Monotonic(now))));
+            }
+        }
+        Err(TransportError::WouldBlock)
     }
 
     fn flush(&mut self) -> Result<(), TransportError> {
@@ -1144,5 +1155,173 @@ async fn dev20_soak_cycle_30x_enable_j1_motion_stop_park_rest_torque_off_idle_ze
 
     println!(
         "dev20_soak_cycle_30x: 30/30 cycles PASSED, faults=0 (max_idle_age_ms={max_idle_age_seen}, j7_age_at_enable_ms={min_j7_age_at_enable}..={max_j7_age_at_enable})"
+    );
+}
+
+/// Blocker 1 regression: a delayed idle-poll reply arriving AFTER `send_plain` starts (e.g.,
+/// during pre-TX clock sampling / hook) but BEFORE `can.transmit` MUST NOT satisfy FRESHEN's
+/// causal `rx_at >= tx_at` provenance check when J7 never replies to the FRESHEN poll itself.
+#[test]
+fn freshen_rejects_delayed_pre_tx_reply_arriving_before_can_transmit() {
+    let clock = Arc::new(MockClock::new());
+    let bus = Sg2002Bus::new(clock.clone(), Duration::from_micros(500), [1, 1, 1, 1, 1, 1, 1], true);
+    let cfg = build_b601_config();
+    let limits: Vec<DamiaoLimits> = cfg
+        .damiao_ranges
+        .as_ref()
+        .unwrap()
+        .iter()
+        .map(|r| r.limits())
+        .collect();
+    let grip = gripper_drive_from_profile(&cfg).expect("pos-force gripper");
+
+    let injected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let bus_hook = bus.clone();
+    let clk_hook = clock.clone();
+    let inj_hook = injected.clone();
+    let mut drv = DamiaoArmDriver::new(bus.clone(), (1..=7).collect())
+        .with_joint_limits(limits)
+        .unwrap()
+        .with_gripper_drive(grip)
+        .unwrap()
+        .with_tx_budget(cfg.damiao_tx_budget())
+        .with_before_final_tx_gate_hook(Arc::new(move |frame| {
+            if is_cc_for_joint(frame, 7)
+                && !inj_hook.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                // Inject a delayed idle-poll J7 feedback frame at the hook instant, then advance
+                // the clock by 500 us before `send_inner` captures `tx_started_mark` and calls
+                // `can.transmit(&frame)`.
+                let pre_tx_ts = clk_hook.now();
+                bus_hook.with(|s| {
+                    let fb = s.motors[6].feedback_frame();
+                    s.rx.push_back((fb, Some(CanRxTime::Monotonic(pre_tx_ts))));
+                });
+                clk_hook.advance(Duration::from_micros(500));
+            }
+        }));
+
+    drv.read_joint_states().unwrap();
+    bus.with(|s| s.push_all_feedback_now());
+    drv.read_joint_states().unwrap();
+    assert_eq!(drv.check_mapping_ranges().status, armd::driver::RangeCheckStatus::Passed);
+    bus.with(|s| {
+        s.immediate_init = false;
+        s.motors[6].silent = true;
+    });
+
+    // Age past FRESHEN entry threshold, then start budgeted enable.
+    clock.advance(Duration::from_millis(140));
+    bus.clear_log();
+    let mut err = None;
+    let first = drv.begin_torque_budgeted(true, 64);
+    match first {
+        Err(e) => err = Some(e),
+        Ok(armd::driver::TorqueProgress::Done(_)) => {
+            panic!("enable must not succeed when J7 only delivered a pre-TX delayed reply")
+        }
+        Ok(armd::driver::TorqueProgress::Pending { .. }) => {
+            for _ in 0..20 {
+                clock.advance(RELEASE_PERIOD);
+                let dl = clock.now() + RELEASE_PERIOD;
+                match drv.poll_torque_budgeted(dl, 64) {
+                    Ok(armd::driver::TorqueProgress::Pending { .. }) => {}
+                    Ok(armd::driver::TorqueProgress::Done(_)) => {
+                        panic!("enable must not succeed on pre-TX delayed J7 reply")
+                    }
+                    Err(e) => {
+                        err = Some(e);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        injected.load(std::sync::atomic::Ordering::SeqCst),
+        "before_final_tx_gate_hook must have injected the pre-TX J7 frame"
+    );
+    assert!(
+        matches!(err, Some(ArmDriverError::EnableFreshenTimeout { joint: 6 })),
+        "expected EnableFreshenTimeout for silent J7 despite pre-TX reply, got {err:?}"
+    );
+    let log = bus.tx_log();
+    assert!(log.iter().all(|f| f.id != 0x307), "must not emit 0x307");
+    assert!(
+        log.iter().all(|f| f.data != damiao::CMD_ENABLE),
+        "must not emit CMD_ENABLE"
+    );
+}
+
+/// Blocker 2 regression: when J7 ages past `ENABLE_FRESHEN_EXIT_PF_MAX_AGE` (60 ms) while waiting
+/// on a slower arm joint, `refresh_capture` MUST stay armed across the replacement poll's
+/// `drain_rx_for_boundary` so an unsafe J7 frame (motion/fault/state!=0) arriving right before the
+/// replacement poll cannot be swallowed and masked by a later stationary state-0 reply.
+#[test]
+fn freshen_re_stale_replacement_drain_preserves_j7_unsafe_veto() {
+    let clock = Arc::new(MockClock::new());
+    let bus = Sg2002Bus::new(clock.clone(), Duration::from_micros(400), [1, 1, 1, 1, 1, 1, 1], true);
+    let cfg = build_b601_config();
+    let mut drv = build_b601_driver(bus.clone(), &cfg);
+
+    // Hold J1 silent initially so J7 confirms early at ~20 ms while J1 waits for retry at ~60 ms.
+    bus.with(|s| s.motors[0].silent = true);
+    clock.advance(Duration::from_millis(140));
+    bus.clear_log();
+
+    let mut prog = drv.begin_torque_budgeted(true, 64).unwrap();
+    assert!(matches!(prog, armd::driver::TorqueProgress::Pending { .. }));
+
+    // Ticks at +20, +40, +60 ms: J2..J7 confirm at +20 ms; retry for J1 fires at +60 ms.
+    for tick in 1..=3 {
+        if tick == 3 {
+            // Re-enable J1 right before the 60 ms retry so J1 replies at ~61 ms and confirms at +80 ms,
+            // when J7's sample is already ~79 ms old (> 60 ms exit bound -> re_stale for J7).
+            bus.with(|s| s.motors[0].silent = false);
+        }
+        clock.advance(RELEASE_PERIOD);
+        let dl = clock.now() + RELEASE_PERIOD;
+        prog = drv.poll_torque_budgeted(dl, 64).unwrap();
+        assert!(matches!(prog, armd::driver::TorqueProgress::Pending { .. }));
+    }
+
+    // Queue `[bad_fb, good_fb]` into `inject_after_empty` so that on tick 4 (+80 ms):
+    //   1) `poll_freshen`'s initial `receive_feedback()` drains J1's reply and observes empty RX
+    //      (`WouldBlock` -> `last_read_drained = true`), confirming all 7 joints and triggering
+    //      `re_stale` for J7 (age ~79 ms > 60 ms exit bound);
+    //   2) the empty observation immediately arms `[bad_fb, good_fb]` in `bus.rx` right before
+    //      `send_freshen_polls` calls `drain_rx_for_boundary` for J7's replacement `0xCC` poll;
+    //   3) `drain_rx_for_boundary` consumes both frames with `refresh_capture` STILL armed, so
+    //      `check_freshen_j7_unsafe_capture()` vetoes fail-closed instead of swallowing `bad_fb`.
+    bus.with(|s| {
+        let mut bad_m = s.motors[6];
+        bad_m.enabled = true;
+        bad_m.v = 0.6;
+        let bad_fb = bad_m.feedback_frame();
+        let good_fb = s.motors[6].feedback_frame();
+        s.inject_after_empty.push_back(bad_fb);
+        s.inject_after_empty.push_back(good_fb);
+    });
+
+    clock.advance(RELEASE_PERIOD);
+    let dl = clock.now() + RELEASE_PERIOD;
+    let res = drv.poll_torque_budgeted(dl, 64);
+    assert!(
+        matches!(
+            res,
+            Err(ArmDriverError::EnableFreshenUnsafeGripper {
+                joint: 6,
+                still: false,
+                off: false,
+                status: 1,
+            })
+        ),
+        "unsafe J7 frame across re_stale replacement must veto with EnableFreshenUnsafeGripper, got {res:?}"
+    );
+    let log = bus.tx_log();
+    assert!(log.iter().all(|f| f.id != 0x307), "must not emit 0x307 after veto");
+    assert!(
+        log.iter().all(|f| f.data != damiao::CMD_ENABLE),
+        "must not emit CMD_ENABLE after veto"
     );
 }
