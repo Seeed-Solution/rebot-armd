@@ -96,6 +96,7 @@ struct BusState {
     clock: Arc<MockClock>,
     tx_would_block: bool,
     silent_disable: bool,
+    silent_mask: u8,
     drop_enable_mask: u8,
     mit_tx_count: u64,
 }
@@ -134,6 +135,7 @@ impl ZeroAllocBus {
             clock,
             tx_would_block: false,
             silent_disable: false,
+            silent_mask: 0,
             drop_enable_mask: 0,
             mit_tx_count: 0,
         })))
@@ -156,12 +158,19 @@ impl CanTransport for ZeroAllocBus {
             return Err(TransportError::WouldBlock);
         }
         let silent_disable = s.silent_disable;
+        let silent_mask = s.silent_mask;
         let drop_enable_mask = s.drop_enable_mask;
         let now = s.clock.now();
         if frame.id == 0x7FF && frame.data[2] == 0xCC {
             let id = u16::from_le_bytes([frame.data[0], frame.data[1]]);
             if let Some(f) = (!silent_disable)
-                .then(|| s.motors.iter().find(|m| m.id == id).map(Motor::feedback_frame))
+                .then(|| {
+                    s.motors
+                        .iter()
+                        .enumerate()
+                        .find(|(idx, m)| m.id == id && (silent_mask & (1 << idx)) == 0)
+                        .map(|(_, m)| m.feedback_frame())
+                })
                 .flatten()
             {
                 s.rx.push_back((f, Some(now)));
@@ -171,7 +180,12 @@ impl CanTransport for ZeroAllocBus {
         if frame.id == 0x7FF && frame.data[2] == damiao::REG_READ {
             let id = u16::from_le_bytes([frame.data[0], frame.data[1]]);
             let rid = frame.data[3];
-            if let Some((idx, m)) = s.motors.iter().enumerate().find(|(_, m)| m.id == id) {
+            if let Some((idx, m)) = s
+                .motors
+                .iter()
+                .enumerate()
+                .find(|(idx, m)| m.id == id && (silent_mask & (1 << idx)) == 0)
+            {
                 let ctrl_mode = s.ctrl_modes[idx];
                 let val: Option<[u8; 4]> = match rid {
                     damiao::RID_CTRL_MODE => Some(ctrl_mode.to_le_bytes()),
@@ -196,7 +210,12 @@ impl CanTransport for ZeroAllocBus {
             let id = u16::from_le_bytes([frame.data[0], frame.data[1]]);
             let rid = frame.data[3];
             let v = [frame.data[4], frame.data[5], frame.data[6], frame.data[7]];
-            if let Some(idx) = s.motors.iter().position(|m| m.id == id) {
+            if let Some(idx) = s
+                .motors
+                .iter()
+                .position(|m| m.id == id)
+                .filter(|idx| (silent_mask & (1 << idx)) == 0)
+            {
                 if rid == damiao::RID_CTRL_MODE {
                     s.ctrl_modes[idx] = u32::from_le_bytes(v);
                 }
@@ -211,6 +230,9 @@ impl CanTransport for ZeroAllocBus {
             return Ok(());
         }
         if let Some((idx, m)) = s.motors.iter_mut().enumerate().find(|(_, m)| u32::from(m.id) == frame.id) {
+            if (silent_mask & (1 << idx)) != 0 {
+                return Ok(());
+            }
             if frame.data == damiao::CMD_ENABLE {
                 if (drop_enable_mask & (1 << idx)) == 0 {
                     m.enabled = true;
@@ -229,7 +251,16 @@ impl CanTransport for ZeroAllocBus {
             }
             return Ok(());
         }
-        if let Some(m) = s.motors.iter().find(|m| u32::from(m.id) + 0x100 == frame.id) {
+        if let Some(m) = s
+            .motors
+            .iter()
+            .enumerate()
+            .find(|(idx, m)| {
+                (silent_mask & (1 << idx)) == 0
+                    && (u32::from(m.id) + 0x100 == frame.id || u32::from(m.id) + 0x300 == frame.id)
+            })
+            .map(|(_, m)| m)
+        {
             let f = m.feedback_frame();
             s.rx.push_back((f, Some(now)));
         }
@@ -2025,4 +2056,137 @@ fn rt_torque_off_shadow_on_ring_saturation_and_staging_overflow_zero_allocs() {
         "armd-control teardown dropping ShadowDriverStaging and ShadowRuntime must perform (0, 0) heap ops"
     );
     td_hub.stop_and_flush_bounded(Duration::from_secs(1));
+}
+
+#[test]
+fn rt_enable_freshen_zero_alloc_on_stale_idle_and_silent_j7() {
+    // Verify that `DamiaoTorque::Freshen` on `armd-control` performs strictly (0, 0) heap
+    // allocations and frees for BOTH:
+    //   (a) successful enable after stale disabled idle (> 120 ms), and
+    //   (b) fail-closed `EnableFreshenTimeout` into `FailedHold` when J7 is silent.
+    let build_pf_disarmed = |j7_silent: bool| {
+        let clock = Arc::new(MockClock::new());
+        let bus = ZeroAllocBus::new(clock.clone());
+        bus.with(|s| {
+            s.motors[6].q = -0.14;
+            s.ctrl_modes[6] = damiao::CTRL_MODE_POS_FORCE;
+        });
+        let cfg = ArmConfig {
+            lease_timeout_ms: 600_000,
+            ..ArmConfig::rebot_dm()
+        };
+        let limits: Vec<DamiaoLimits> = cfg
+            .damiao_ranges
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|r| r.limits())
+            .collect();
+        let grip = armd::driver::gripper_drive_from_profile(&cfg).expect("pos-force gripper");
+        let mut drv = DamiaoArmDriver::new(bus.clone(), (1..=7).collect())
+            .with_joint_limits(limits)
+            .unwrap()
+            .with_gripper_drive(grip)
+            .unwrap();
+        bus.with(|s| s.push_all_feedback());
+        drv.read_joint_states().unwrap();
+        drv.check_mapping_ranges();
+        let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
+        inner.lease_enabled = false;
+        inner.rt_executor_owned = true;
+        inner.register_live_connection(1).unwrap();
+        inner.tick(0.02);
+        let (mut fx, b, _tw, _stop) = ReleaseFixture::new(
+            inner,
+            BOOT,
+            Capacities {
+                commands: 8,
+                plans: 2,
+                replies: 16,
+            },
+        );
+        // Pre-warm observation slots before counting allocations.
+        for _ in 0..5 {
+            bus.with(|s| s.push_all_feedback());
+            fx.step();
+            clock.advance(RELEASE);
+        }
+        if j7_silent {
+            bus.with(|s| s.silent_mask = 1 << 6);
+        }
+        (fx, b, bus, clock)
+    };
+
+    // (a) Stale idle (140 ms) -> Freshen -> Readback -> 0x307 -> CMD_ENABLE: strictly (0, 0).
+    {
+        let (mut fx, mut b, _bus, clock) = build_pf_disarmed(false);
+        clock.advance(Duration::from_millis(140));
+        let auth = fx.core.authority(&fx.ctx(fx.now()));
+        b.submit(
+            ClientId(1),
+            1,
+            auth,
+            fx.now() + Duration::from_secs(5),
+            Submit::Transition(TransitionOp::TorqueOn),
+        )
+        .unwrap();
+        let mut total_a = 0u64;
+        let mut total_f = 0u64;
+        let mut ended = None;
+        for _ in 0..25 {
+            let (rep, a, f) = counted(|| fx.step());
+            total_a += a;
+            total_f += f;
+            clock.advance(RELEASE);
+            if let Some((_, o)) = rep.transition_ended {
+                ended = Some(o);
+                break;
+            }
+        }
+        assert_eq!(ended, Some(Outcome::Completed));
+        assert!(fx.core.is_torqued);
+        assert_eq!(
+            (total_a, total_f),
+            (0, 0),
+            "RT stale-idle enable through Freshen must allocate/free 0"
+        );
+    }
+
+    // (b) Stale idle (140 ms) with silent J7 -> EnableFreshenTimeout -> FailedHold: strictly (0, 0).
+    {
+        let (mut fx, mut b, _bus, clock) = build_pf_disarmed(true);
+        clock.advance(Duration::from_millis(140));
+        let auth = fx.core.authority(&fx.ctx(fx.now()));
+        b.submit(
+            ClientId(1),
+            1,
+            auth,
+            fx.now() + Duration::from_secs(5),
+            Submit::Transition(TransitionOp::TorqueOn),
+        )
+        .unwrap();
+        let mut total_a = 0u64;
+        let mut total_f = 0u64;
+        let mut ended = None;
+        for _ in 0..25 {
+            let (rep, a, f) = counted(|| fx.step());
+            total_a += a;
+            total_f += f;
+            clock.advance(RELEASE);
+            if let Some((_, o)) = rep.transition_ended {
+                ended = Some(o);
+                break;
+            }
+        }
+        assert_eq!(ended, Some(Outcome::Failed("ENABLE_FAILED")));
+        assert_eq!(
+            fx.core.enable_lifecycle(),
+            armd::supervisor::EnableLifecycle::FailedHold
+        );
+        assert_eq!(
+            (total_a, total_f),
+            (0, 0),
+            "RT silent-J7 EnableFreshenTimeout into FailedHold must allocate/free 0"
+        );
+    }
 }
