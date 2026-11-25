@@ -20,10 +20,9 @@ use std::time::{Duration, Instant};
 
 use crate::model::{
     ArmObservation, ControlMode, DriverCapabilities, EnableState, GripperBaselineObs, GripperObs,
-    HolderLabel,
+    HolderLabel, MAX_MOTION_DOF,
 };
 use crate::motion::{ActionStatus, PolicyStats};
-use crate::rt_core::mailbox::MAX_DOF;
 use crate::rt_core::publish::{Snapshot, StateHub};
 use crate::safety::{BoundedFaultReason, BoundedText, FaultInfo, FaultReason, SafetyState};
 
@@ -33,6 +32,8 @@ use super::{SupervisorInner, TerminalBroadcaster, TERMINAL_FIFO_CAPACITY};
 pub const TERMINAL_CAPTURE_RING_CAPACITY: usize = TERMINAL_FIFO_CAPACITY * 2;
 /// Logical admission reservation ceiling matching `TERMINAL_FIFO_CAPACITY`.
 pub const TERMINAL_CAPTURE_ADMISSION_CAP: usize = TERMINAL_FIFO_CAPACITY;
+/// Inline joint-array width matching the maximum valid profile DOF (`MAX_MOTION_DOF`).
+pub(crate) const CAPTURE_MAX_DOF: usize = MAX_MOTION_DOF;
 
 /// Inline stack mirror of [`SafetyState`] for zero-allocation terminal capture.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -107,7 +108,8 @@ pub(crate) struct CaptureDriverCache {
     pub(crate) enable_state: EnableState,
     pub(crate) driver_caps: DriverCapabilities,
     pub(crate) feedback_valid: bool,
-    pub(crate) oldest_age: Option<Duration>,
+    pub(crate) ages: [Option<Duration>; CAPTURE_MAX_DOF],
+    pub(crate) ages_len: u8,
     pub(crate) feedback_at: Option<Instant>,
 }
 
@@ -117,9 +119,28 @@ impl Default for CaptureDriverCache {
             enable_state: EnableState::Unknown,
             driver_caps: DriverCapabilities::default(),
             feedback_valid: false,
-            oldest_age: None,
+            ages: [None; CAPTURE_MAX_DOF],
+            ages_len: 0,
             feedback_at: None,
         }
+    }
+}
+
+impl CaptureDriverCache {
+    #[inline]
+    pub(crate) fn copy_ages_from(&mut self, src: &[Option<Duration>], dof: usize, polled_at: Instant) {
+        self.ages = [None; CAPTURE_MAX_DOF];
+        let n = src.len().min(dof).min(CAPTURE_MAX_DOF);
+        self.ages[..n].copy_from_slice(&src[..n]);
+        self.ages_len = n as u8;
+        self.feedback_at = (n > 0 && self.ages[..n].iter().any(Option::is_some)).then_some(polled_at);
+    }
+
+    #[inline]
+    pub(crate) fn clear_ages(&mut self) {
+        self.ages = [None; CAPTURE_MAX_DOF];
+        self.ages_len = 0;
+        self.feedback_at = None;
     }
 }
 
@@ -200,15 +221,23 @@ pub(crate) struct TerminalCaptureRecord {
     pub(crate) phase_ms_len: u8,
     pub(crate) phase_ms: [(BoundedText<24>, u32); 12],
     pub(crate) dof: u8,
-    pub(crate) positions: [f32; MAX_DOF],
-    pub(crate) velocities: [f32; MAX_DOF],
-    pub(crate) torques: [f32; MAX_DOF],
-    pub(crate) temperatures: [f32; MAX_DOF],
-    pub(crate) commanded_positions: [f32; MAX_DOF],
+    pub(crate) positions: [f32; CAPTURE_MAX_DOF],
+    pub(crate) velocities: [f32; CAPTURE_MAX_DOF],
+    pub(crate) torques: [f32; CAPTURE_MAX_DOF],
+    pub(crate) temperatures: [f32; CAPTURE_MAX_DOF],
+    pub(crate) commanded_positions: [f32; CAPTURE_MAX_DOF],
     pub(crate) gripper: Option<CapturedGripperObs>,
     pub(crate) gravity_compensated: bool,
-    pub(crate) gravity_torques: [f32; MAX_DOF],
-    pub(crate) feedback_age_ms: [Option<u64>; MAX_DOF],
+    pub(crate) gravity_torques_len: u8,
+    pub(crate) gravity_torques: [f32; CAPTURE_MAX_DOF],
+    pub(crate) gravity_comp_phase: Option<HolderLabel>,
+    pub(crate) gravity_comp_ramp: f32,
+    pub(crate) gravity_comp_scale: f32,
+    pub(crate) gravity_comp_damping_kd_len: u8,
+    pub(crate) gravity_comp_damping_kd: [f32; CAPTURE_MAX_DOF],
+    pub(crate) gravity_comp_tau_ff_len: u8,
+    pub(crate) gravity_comp_tau_ff: [f32; CAPTURE_MAX_DOF],
+    pub(crate) feedback_age_ms: [Option<u64>; CAPTURE_MAX_DOF],
     pub(crate) is_torqued: bool,
     pub(crate) disable_pending: bool,
     pub(crate) feedback_valid: bool,
@@ -222,11 +251,11 @@ pub(crate) struct TerminalCaptureRecord {
 }
 
 #[inline]
-fn copy_f32_slice(src: &[f32]) -> [f32; MAX_DOF] {
-    let mut out = [0.0f32; MAX_DOF];
-    let n = src.len().min(MAX_DOF);
+fn copy_f32_slice(src: &[f32]) -> ([f32; CAPTURE_MAX_DOF], u8) {
+    let mut out = [0.0f32; CAPTURE_MAX_DOF];
+    let n = src.len().min(CAPTURE_MAX_DOF);
     out[..n].copy_from_slice(&src[..n]);
-    out
+    (out, n as u8)
 }
 
 #[inline]
@@ -309,7 +338,7 @@ impl TerminalCaptureRecord {
         } else {
             None
         };
-        let dof = inner.config.dof.min(MAX_DOF) as u8;
+        let dof = inner.config.dof.min(CAPTURE_MAX_DOF) as u8;
         let gripper = if let (Some(idx), Some(policy)) = (
             inner.config.gripper_index(),
             inner.config.gripper_policy.as_ref(),
@@ -336,37 +365,18 @@ impl TerminalCaptureRecord {
         } else {
             None
         };
-        let mut feedback_age_ms = [None; MAX_DOF];
         let now_clock = inner.cached_driver_clock_now();
-        let dof_usize = usize::from(dof);
-        if inner.driver.is_none() {
-            for slot in &mut feedback_age_ms[..dof_usize] {
-                *slot = Some(0);
-            }
-        } else {
-            let instants = inner.core.feedback().instants();
-            if instants.len() >= dof_usize && instants[..dof_usize].iter().any(Option::is_some) {
-                for (dst, &inst) in feedback_age_ms[..dof_usize].iter_mut().zip(&instants[..dof_usize]) {
-                    *dst = inst.map(|t| {
-                        now_clock
-                            .saturating_duration_since(t)
-                            .as_millis()
-                            .min(u128::from(u64::MAX)) as u64
-                    });
-                }
-            } else if let (Some(oldest), Some(polled_at)) = (
-                inner.capture_driver_cache.oldest_age,
-                inner.capture_driver_cache.feedback_at,
-            ) {
-                let total_ms = oldest
-                    .saturating_add(now_clock.saturating_duration_since(polled_at))
-                    .as_millis()
-                    .min(u128::from(u64::MAX)) as u64;
-                for slot in &mut feedback_age_ms[..dof_usize] {
-                    *slot = Some(total_ms);
-                }
-            }
-        }
+        let (feedback_age_ms, feedback_valid) = compute_cached_feedback_state(
+            inner.feedback_numeric_valid,
+            inner.capture_driver_cache.feedback_valid,
+            inner.driver.is_some(),
+            usize::from(dof),
+            inner.core.feedback().instants(),
+            &inner.capture_driver_cache.ages[..usize::from(inner.capture_driver_cache.ages_len)],
+            inner.capture_driver_cache.feedback_at,
+            now_clock,
+            Duration::from_millis(250),
+        );
 
         let driver_caps = inner.cached_capture_driver_caps();
         let gravity_compensated = inner.gravity_compensated
@@ -374,6 +384,50 @@ impl TerminalCaptureRecord {
             && inner.config.gravity_model.is_some()
             && inner.config.dof >= inner.config.arm_dof()
             && (inner.driver.is_none() || driver_caps.torque_feedforward);
+        let (positions, _) = copy_f32_slice(&inner.measured_positions);
+        let (velocities, _) = copy_f32_slice(&inner.measured_velocities);
+        let (torques, _) = copy_f32_slice(&inner.torques);
+        let (temperatures, _) = copy_f32_slice(&inner.temperatures);
+        let (commanded_positions, _) = copy_f32_slice(&inner.commanded_positions);
+        let (gravity_torques, gravity_torques_len) = copy_f32_slice(&inner.gravity_torques);
+        let (
+            gravity_comp_phase,
+            gravity_comp_ramp,
+            gravity_comp_scale,
+            gravity_comp_damping_kd,
+            gravity_comp_damping_kd_len,
+            gravity_comp_tau_ff,
+            gravity_comp_tau_ff_len,
+        ) = match &inner.gravity_comp {
+            Some(run) => {
+                let (kd, kd_len) = copy_f32_slice(&run.damping_kd);
+                let (tau, tau_len) = copy_f32_slice(&run.tau_ff);
+                (
+                    Some(HolderLabel::new(run.phase.name())),
+                    run.ramp(),
+                    run.scale,
+                    kd,
+                    kd_len,
+                    tau,
+                    tau_len,
+                )
+            }
+            None => {
+                let policy = inner
+                    .config
+                    .gravity_comp
+                    .as_ref()
+                    .filter(|_| inner.config.six_plus_gripper() && inner.config.gravity_model.is_some());
+                let (scale, kd, kd_len) = match policy {
+                    Some(p) => {
+                        let (kd, len) = copy_f32_slice(&p.damping_kd);
+                        (p.scale, kd, len)
+                    }
+                    None => (0.0, [0.0; CAPTURE_MAX_DOF], 0),
+                };
+                (None, 0.0, scale, kd, kd_len, [0.0; CAPTURE_MAX_DOF], 0)
+            }
+        };
 
         Self {
             terminal_seq,
@@ -418,18 +472,26 @@ impl TerminalCaptureRecord {
             phase_ms_len,
             phase_ms,
             dof,
-            positions: copy_f32_slice(&inner.measured_positions),
-            velocities: copy_f32_slice(&inner.measured_velocities),
-            torques: copy_f32_slice(&inner.torques),
-            temperatures: copy_f32_slice(&inner.temperatures),
-            commanded_positions: copy_f32_slice(&inner.commanded_positions),
+            positions,
+            velocities,
+            torques,
+            temperatures,
+            commanded_positions,
             gripper,
             gravity_compensated,
-            gravity_torques: copy_f32_slice(&inner.gravity_torques),
+            gravity_torques_len,
+            gravity_torques,
+            gravity_comp_phase,
+            gravity_comp_ramp,
+            gravity_comp_scale,
+            gravity_comp_damping_kd_len,
+            gravity_comp_damping_kd,
+            gravity_comp_tau_ff_len,
+            gravity_comp_tau_ff,
             feedback_age_ms,
             is_torqued: inner.is_torqued,
             disable_pending: inner.disable_pending,
-            feedback_valid: inner.cached_hardware_feedback_fresh(Duration::from_millis(250)),
+            feedback_valid,
             epoch_id: inner.safety.epoch_id(),
             safety_state: CapturedSafetyState::from_safety_state(state),
             fault,
@@ -591,7 +653,7 @@ impl TerminalCaptureRecord {
         action: ActionStatus,
     ) -> ArmObservation {
         let mut obs = base_obs.clone();
-        let dof = usize::from(self.dof).min(MAX_DOF);
+        let dof = usize::from(self.dof).min(CAPTURE_MAX_DOF);
         obs.timestamp = self.obs_timestamp;
         obs.positions.clear();
         obs.positions.extend_from_slice(&self.positions[..dof]);
@@ -606,9 +668,10 @@ impl TerminalCaptureRecord {
             .extend_from_slice(&self.commanded_positions[..dof]);
         obs.gripper = self.gripper.map(CapturedGripperObs::to_gripper_obs);
         obs.gravity_compensated = self.gravity_compensated;
+        let gt_len = usize::from(self.gravity_torques_len).min(CAPTURE_MAX_DOF);
         obs.gravity_torques.clear();
         obs.gravity_torques
-            .extend_from_slice(&self.gravity_torques[..dof]);
+            .extend_from_slice(&self.gravity_torques[..gt_len]);
         obs.feedback_age_ms.clear();
         obs.feedback_age_ms
             .extend_from_slice(&self.feedback_age_ms[..dof]);
@@ -619,9 +682,19 @@ impl TerminalCaptureRecord {
         obs.safety_state = self.safety_state.to_safety_state();
         obs.fault = self.fault;
         obs.control_mode = self.control_mode;
-        if self.control_mode != ControlMode::GravityComp {
-            obs.gravity_comp.phase = None;
-        }
+        obs.gravity_comp.phase = self.gravity_comp_phase;
+        obs.gravity_comp.ramp = self.gravity_comp_ramp;
+        obs.gravity_comp.scale = self.gravity_comp_scale;
+        let kd_len = usize::from(self.gravity_comp_damping_kd_len).min(CAPTURE_MAX_DOF);
+        obs.gravity_comp.damping_kd.clear();
+        obs.gravity_comp
+            .damping_kd
+            .extend_from_slice(&self.gravity_comp_damping_kd[..kd_len]);
+        let tau_len = usize::from(self.gravity_comp_tau_ff_len).min(CAPTURE_MAX_DOF);
+        obs.gravity_comp.tau_ff.clear();
+        obs.gravity_comp
+            .tau_ff
+            .extend_from_slice(&self.gravity_comp_tau_ff[..tau_len]);
         obs.driver_capabilities = self.driver_caps;
         obs.enable_state = self.enable_state;
         obs.lease_holder = self.lease_holder;
@@ -806,15 +879,6 @@ impl TerminalCaptureTx {
     }
 }
 
-/// Outcome of draining ready terminal records from the SPSC ring into `TerminalBroadcaster`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct DrainOutcome {
-    pub(crate) drained: usize,
-    /// Action ID of the latest synthetic (`obs_override.is_some()`) terminal drained, so
-    /// `dispatch_loop` can suppress any older `running` `pending_telemetry` for the same action.
-    pub(crate) last_synthetic_action_id: Option<u64>,
-}
-
 struct CachedRichEntry {
     id: u64,
     status: Option<ActionStatus>,
@@ -831,6 +895,12 @@ pub(crate) struct TerminalCaptureChannel {
     /// (bounded to `TERMINAL_FIFO_CAPACITY`) so delayed dispatch past the 2 s window never drops
     /// or truncates any field without touching `SupervisorLock`. Never accessed on `armd-control`.
     rich_action_cache: Mutex<VecDeque<CachedRichEntry>>,
+    /// Bounded off-RT history of action IDs emitted via synthetic (`obs_override`) terminals across
+    /// ALL consumers (`dispatch_loop`, `drain_and_activate_subscriber`, off-tick drains) so
+    /// `dispatch_loop` suppresses any stale `running` telemetry (including after diagnostic-only
+    /// snapshot reloads or multi-synthetic batches). Leaf mutex; fast-path gated by atomic flag.
+    synthetic_terminal_ids: Mutex<VecDeque<u64>>,
+    has_synthetic_ids: AtomicBool,
     control_thread_lock_attempts: AtomicU64,
     next_terminal_seq: AtomicU64,
     captured: AtomicU64,
@@ -848,6 +918,8 @@ impl TerminalCaptureChannel {
         let channel = Arc::new(Self {
             rx: Mutex::new(consumer),
             rich_action_cache: Mutex::new(VecDeque::with_capacity(TERMINAL_FIFO_CAPACITY)),
+            synthetic_terminal_ids: Mutex::new(VecDeque::with_capacity(TERMINAL_FIFO_CAPACITY)),
+            has_synthetic_ids: AtomicBool::new(false),
             control_thread_lock_attempts: AtomicU64::new(0),
             next_terminal_seq: AtomicU64::new(0),
             captured: AtomicU64::new(0),
@@ -863,6 +935,36 @@ impl TerminalCaptureChannel {
             channel: Arc::clone(&channel),
         };
         (tx, channel)
+    }
+
+    fn record_synthetic_terminal_id(&self, action_id: u64) {
+        if action_id == 0 {
+            return;
+        }
+        let mut ids = self
+            .synthetic_terminal_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !ids.contains(&action_id) {
+            while ids.len() >= TERMINAL_FIFO_CAPACITY.max(128) {
+                ids.pop_front();
+            }
+            ids.push_back(action_id);
+        }
+        self.has_synthetic_ids.store(true, Ordering::Release);
+    }
+
+    /// True if `action_id` has been emitted via a synthetic (`obs_override`) terminal by ANY
+    /// drain consumer. O(1) atomic fast path when no synthetic terminal has ever been emitted.
+    #[inline]
+    pub(crate) fn was_synthetically_terminated(&self, action_id: u64) -> bool {
+        if action_id == 0 || !self.has_synthetic_ids.load(Ordering::Acquire) {
+            return false;
+        }
+        self.synthetic_terminal_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&action_id)
     }
 
     #[inline]
@@ -1049,11 +1151,11 @@ impl TerminalCaptureChannel {
         live_slots: &[Option<&ActionStatus>],
         template_obs: &ArmObservation,
         respect_publish_barrier: bool,
-    ) -> DrainOutcome {
+    ) -> usize {
         if self.drain_paused.load(Ordering::Acquire) {
-            return DrainOutcome::default();
+            return 0;
         }
-        let mut outcome = DrainOutcome::default();
+        let mut drained = 0usize;
         let hub_closed = hub.is_closed();
         // Single authoritative barrier policy governing BOTH ring eligibility AND synthesis:
         // when the hub is closed or barrier is disabled, an unmet `publish_seq` synthesizes a
@@ -1080,7 +1182,7 @@ impl TerminalCaptureChannel {
                 || (latest_obs.is_none() && hub.published_seq() == 0)
                 || (!enforce_barrier && rec.publish_seq.is_some_and(|req| consumed_seq < req));
             let (obs_override, required_publish_seq) = if needs_captured_obs {
-                outcome.last_synthetic_action_id = Some(rec.action_id);
+                self.record_synthetic_terminal_id(rec.action_id);
                 (
                     Some(rec.build_observation(latest_obs.unwrap_or(template_obs), action.clone())),
                     None,
@@ -1098,9 +1200,9 @@ impl TerminalCaptureChannel {
                 required_publish_seq,
             );
             self.inflight.fetch_sub(1, Ordering::Release);
-            outcome.drained += 1;
+            drained += 1;
         }
-        outcome
+        drained
     }
 
     /// Drains ready records from the SPSC ring into `terminals` in strict `terminal_seq` order.
@@ -1112,9 +1214,9 @@ impl TerminalCaptureChannel {
         live_slots: &[Option<&ActionStatus>],
         template_obs: &ArmObservation,
         respect_publish_barrier: bool,
-    ) -> DrainOutcome {
+    ) -> usize {
         if self.drain_paused.load(Ordering::Acquire) {
-            return DrainOutcome::default();
+            return 0;
         }
         let mut rx = self.lock_rx();
         self.drain_locked(
@@ -1206,42 +1308,99 @@ fn resolve_full_action(
     None
 }
 
-/// Pure, lock-free cached driver freshness check shared by terminal capture and tests.
-/// Gates on `feedback_numeric_valid` and `last_poll_feedback_valid` without touching
-/// `ArmCore::feedback().instants()` on failed polls (preserving synthesized feedback sequences).
+/// Single authoritative per-joint feedback age & freshness computation shared by
+/// `TerminalCaptureRecord::capture_from` (`feedback_age_ms` + `feedback_valid`) and
+/// `cached_hardware_feedback_fresh`. Never mutates `ArmCore::feedback().instants()`.
 #[inline]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_cached_feedback_state(
+    feedback_numeric_valid: bool,
+    last_poll_feedback_valid: bool,
+    has_driver: bool,
+    dof: usize,
+    instants: &[Option<Instant>],
+    cached_ages: &[Option<Duration>],
+    cached_feedback_at: Option<Instant>,
+    now: Instant,
+    max_age: Duration,
+) -> ([Option<u64>; CAPTURE_MAX_DOF], bool) {
+    let n = dof.min(CAPTURE_MAX_DOF);
+    let mut age_ms = [None; CAPTURE_MAX_DOF];
+    if !has_driver {
+        for slot in &mut age_ms[..n] {
+            *slot = Some(0);
+        }
+        return (age_ms, feedback_numeric_valid);
+    }
+
+    let complete_instants =
+        instants.len() >= n && n > 0 && instants[..n].iter().all(Option::is_some);
+    let elapsed_since_poll = cached_feedback_at.map(|t| now.saturating_duration_since(t));
+    let mut all_fresh = feedback_numeric_valid && last_poll_feedback_valid && n > 0;
+
+    for (i, slot) in age_ms.iter_mut().enumerate().take(n) {
+        let dur = if complete_instants {
+            instants[i].map(|rx| now.saturating_duration_since(rx))
+        } else {
+            let from_poll = cached_ages
+                .get(i)
+                .copied()
+                .flatten()
+                .zip(elapsed_since_poll)
+                .map(|(age, elapsed)| age.saturating_add(elapsed));
+            from_poll.or_else(|| {
+                instants
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .map(|rx| now.saturating_duration_since(rx))
+            })
+        };
+        match dur {
+            Some(d) => {
+                *slot = Some(d.as_millis().min(u128::from(u64::MAX)) as u64);
+                if d > max_age {
+                    all_fresh = false;
+                }
+            }
+            None => {
+                *slot = None;
+                all_fresh = false;
+            }
+        }
+    }
+    (age_ms, all_fresh)
+}
+
+/// Pure, lock-free cached driver freshness check shared by terminal capture tests.
+/// Derives from [`compute_cached_feedback_state`] so `feedback_valid` and `feedback_age_ms`
+/// always agree on the exact same per-joint sample.
+#[cfg(test)]
+#[inline]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn evaluate_cached_feedback_fresh(
     feedback_numeric_valid: bool,
     last_poll_feedback_valid: bool,
     has_driver: bool,
     dof: usize,
     instants: &[Option<Instant>],
-    last_poll_oldest_age: Option<Duration>,
-    last_poll_feedback_at: Option<Instant>,
+    cached_ages: &[Option<Duration>],
+    cached_feedback_at: Option<Instant>,
     now: Instant,
     max_age: Duration,
 ) -> bool {
-    if !feedback_numeric_valid {
-        return false;
-    }
-    if !has_driver {
-        return true;
-    }
-    if !last_poll_feedback_valid {
-        return false;
-    }
-    if instants.len() == dof && instants.iter().all(Option::is_some) {
-        return instants
-            .iter()
-            .all(|t| t.is_some_and(|rx| now.saturating_duration_since(rx) <= max_age));
-    }
-    match (last_poll_oldest_age, last_poll_feedback_at) {
-        (Some(oldest_at_poll), Some(polled_before)) => {
-            let elapsed = now.saturating_duration_since(polled_before);
-            oldest_at_poll.saturating_add(elapsed) <= max_age
-        }
-        _ => false,
-    }
+    compute_cached_feedback_state(
+        feedback_numeric_valid,
+        last_poll_feedback_valid,
+        has_driver,
+        dof,
+        instants,
+        cached_ages,
+        cached_feedback_at,
+        now,
+        max_age,
+    )
+    .1
 }
 
 #[cfg(test)]
@@ -1865,7 +2024,7 @@ mod tests {
             inner.defer_terminal_capture = false;
             id
         };
-        let out_sat = sup.terminal_capture_channel.drain_into(
+        let drained_sat = sup.terminal_capture_channel.drain_into(
             &sup.terminals,
             &sup.hub,
             Some(&snap_n),
@@ -1873,11 +2032,11 @@ mod tests {
             &sup.template_obs,
             true,
         );
-        assert_eq!(out_sat.drained, 1);
-        assert_eq!(
-            out_sat.last_synthetic_action_id,
-            Some(id_sat),
-            "synthetic post-publish drain must report action_id so stale running pending_telemetry is suppressed"
+        assert_eq!(drained_sat, 1);
+        assert!(
+            sup.terminal_capture_channel
+                .was_synthetically_terminated(id_sat),
+            "synthetic post-publish drain must record action_id across all consumers so stale running pending_telemetry is suppressed"
         );
         assert!(!sup.terminals.drain_all(&snap_n.obs, snap_n.meta.seq));
         {
@@ -1898,6 +2057,9 @@ mod tests {
                 grip.rad
             );
             assert_eq!(got[0].feedback_age_ms.len(), got[0].positions.len());
+            assert_eq!(got[0].gravity_comp.phase, None);
+            assert_eq!(got[0].gravity_comp.ramp, 0.0);
+            assert!(got[0].gravity_comp.tau_ff.is_empty());
         }
 
         // Simulate hub closing between loop check and normal `drain_into(..., respect_publish_barrier = true)`
@@ -1916,7 +2078,7 @@ mod tests {
             id
         };
         sup.hub().close();
-        let out_shut = sup.terminal_capture_channel.drain_into(
+        let drained_shut = sup.terminal_capture_channel.drain_into(
             &sup.terminals,
             &sup.hub,
             Some(&snap_n),
@@ -1924,8 +2086,9 @@ mod tests {
             &sup.template_obs,
             true,
         );
-        assert_eq!(out_shut.drained, 1);
-        assert_eq!(out_shut.last_synthetic_action_id, Some(id_shut));
+        assert_eq!(drained_shut, 1);
+        assert!(sup.terminal_capture_channel.was_synthetically_terminated(id_sat));
+        assert!(sup.terminal_capture_channel.was_synthetically_terminated(id_shut));
         let blocked = sup.terminals.drain_all(&snap_n.obs, snap_n.meta.seq);
         assert!(
             !blocked,
@@ -1955,14 +2118,17 @@ mod tests {
         }));
 
         // 1) 127-byte ASCII prefix + multibyte UTF-8 char (`'é'`, 2 bytes -> total 129 bytes)
-        //    produces a 127-byte `HolderLabel` that MUST NOT overwrite the original cached string.
+        //    in BOTH user-supplied `tag` (from off-RT `begin_action`) and `reason` MUST NOT be
+        //    truncated on delayed recovery past the 2 s window.
         let utf8_reason = format!("{}é-suffix", "a".repeat(127));
+        let long_tag = format!("{}é-user-tag", "t".repeat(127));
         assert!(utf8_reason.len() > HolderLabel::CAPACITY);
         assert_eq!(HolderLabel::new(&utf8_reason).len(), 127);
+        assert!(long_tag.len() > HolderLabel::CAPACITY);
 
         let (id_utf8, expected_utf8) = {
             let mut inner = sup.inner().write().await;
-            let id = inner.begin_action("grasp", None);
+            let id = inner.begin_action("gripper", Some(long_tag.clone()));
             inner.set_action_workspace_violation(
                 id,
                 crate::kinematics::WorkspaceViolationDetail {
@@ -2027,7 +2193,8 @@ mod tests {
         let got = delivered.lock().unwrap().clone();
         assert_eq!(got.len(), 3, "expected [id_utf8, superseded park, id_long]");
         assert_eq!(got[0].id, id_utf8);
-        assert_eq!(got[0], expected_utf8, "UTF-8 boundary truncated label must preserve full cached reason");
+        assert_eq!(got[0], expected_utf8, "UTF-8 boundary truncated label/tag must preserve full cached values");
+        assert_eq!(got[0].tag.as_deref(), Some(long_tag.as_str()));
         assert_eq!(got[0].reason.as_deref(), Some(utf8_reason.as_str()));
         assert_eq!(got[1].code.as_deref(), Some("SUPERSEDED"));
         assert_eq!(got[2].id, id_long);
@@ -2045,10 +2212,10 @@ mod tests {
         let max_age = Duration::from_millis(250);
         // Driverless: solely gated by feedback_numeric_valid.
         assert!(evaluate_cached_feedback_fresh(
-            true, false, false, 7, &[], None, None, t0, max_age
+            true, false, false, 7, &[], &[], None, t0, max_age
         ));
         assert!(!evaluate_cached_feedback_fresh(
-            false, true, false, 7, &[], None, None, t0, max_age
+            false, true, false, 7, &[], &[], None, t0, max_age
         ));
 
         // Driver with per-joint instants: fresh at +240ms, stale at +260ms, false when numeric
@@ -2060,7 +2227,7 @@ mod tests {
             true,
             7,
             &instants,
-            None,
+            &[],
             None,
             t0 + Duration::from_millis(240),
             max_age,
@@ -2071,7 +2238,7 @@ mod tests {
             true,
             7,
             &instants,
-            None,
+            &[],
             None,
             t0 + Duration::from_millis(260),
             max_age,
@@ -2082,7 +2249,7 @@ mod tests {
             true,
             7,
             &instants,
-            None,
+            &[],
             None,
             t0 + Duration::from_millis(10),
             max_age,
@@ -2093,38 +2260,69 @@ mod tests {
             true,
             7,
             &instants,
-            None,
+            &[],
             None,
             t0 + Duration::from_millis(10),
             max_age,
         ));
 
-        // Fallback (empty instants): conservative oldest_age + (now - poll_before) <= max_age.
-        assert!(evaluate_cached_feedback_fresh(
+        // Distinct per-joint ages without instants: preserves per-joint values and agrees with freshness!
+        let distinct_ages = [
+            Some(Duration::from_millis(10)),
+            Some(Duration::from_millis(20)),
+            Some(Duration::from_millis(30)),
+            Some(Duration::from_millis(40)),
+            Some(Duration::from_millis(50)),
+            Some(Duration::from_millis(60)),
+            Some(Duration::from_millis(200)),
+        ];
+        let (ages_40, fresh_40) = compute_cached_feedback_state(
             true,
             true,
             true,
             7,
             &[],
-            Some(Duration::from_millis(200)),
+            &distinct_ages,
             Some(t0),
             t0 + Duration::from_millis(40),
             max_age,
-        ));
+        );
+        assert!(fresh_40);
+        assert_eq!(ages_40[0], Some(50));
+        assert_eq!(ages_40[6], Some(240));
+
+        // Partial instants + complete distinct ages: freshness and per-joint age_ms derive from
+        // the exact same sample (no missing ages while fresh == true).
+        let partial_instants = [Some(t0), None, None, None, None, None, None];
+        let (ages_partial, fresh_partial) = compute_cached_feedback_state(
+            true,
+            true,
+            true,
+            7,
+            &partial_instants,
+            &distinct_ages,
+            Some(t0),
+            t0 + Duration::from_millis(40),
+            max_age,
+        );
+        assert!(fresh_partial);
+        assert!(ages_partial[..7].iter().all(Option::is_some));
+        assert_eq!(ages_partial[1], Some(60));
+
         assert!(!evaluate_cached_feedback_fresh(
             true,
             true,
             true,
             7,
             &[],
-            Some(Duration::from_millis(200)),
+            &distinct_ages,
             Some(t0),
             t0 + Duration::from_millis(60),
             max_age,
         ));
         // Cleared poll cache (after read/lock error) fails closed.
         assert!(!evaluate_cached_feedback_fresh(
-            true, false, true, 7, &[], None, None, t0, max_age
+            true, false, true, 7, &[], &[], None, t0, max_age
         ));
     }
 }

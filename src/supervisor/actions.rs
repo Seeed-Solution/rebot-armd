@@ -197,6 +197,11 @@ impl SupervisorInner {
             constraint_id: None, geometry_id: None, violation_phase: None, reason: None,
             durability_confirmed: None, durability_warning: None, policy_stats: None, measurement: None,
         });
+        if !self.rt_executor_owned && !self.defer_terminal_capture {
+            if let Some(a) = self.last_action.as_ref().filter(|a| a.tag.is_some()) {
+                self.mirror_rich_action_off_rt(a);
+            }
+        }
         self.action_lease_generation = self.active_lease.as_ref().map(|l| l.generation);
         self.quintic_settle = None;
         id

@@ -822,6 +822,9 @@ pub struct TickPublished {
     pub body_end: Option<Instant>,
     /// Wall duration (µs) spent in edge-triggered terminal-action capture before publish.
     pub phase_terminal_us: u32,
+    /// Wall duration (µs) spent strictly in `StatePublisher::publish_with_rt_meta` (disjoint from
+    /// terminal capture, including early supersession/materialization).
+    pub publish_only_us: u32,
     /// True if at least one newly terminal action record was pushed during this publish.
     pub captured_any: bool,
     /// Context-switch baseline sampled strictly before `capture_edge_terminals` so `mid_nvcsw`
@@ -3116,20 +3119,20 @@ impl SupervisorInner {
     }
 
     /// Per-tick cached hardware feedback freshness within `max_age` (zero driver mutex acquisitions).
-    /// Always checks `feedback_numeric_valid` and `capture_driver_cache.feedback_valid` first;
-    /// evaluates per-joint receive instants from `ArmCore::feedback()` against
-    /// `cached_driver_clock_now()`, with a fail-closed fallback to `capture_driver_cache`
-    /// `(oldest_age, feedback_at)` for drivers without per-joint instants. Never mutates
-    /// `ArmCore::feedback().instants()` or hardware park interlock fields.
+    /// Derives freshness from the exact same per-joint age computation used for `feedback_age_ms`
+    /// in `TerminalCaptureRecord`, never mutating `ArmCore::feedback().instants()` or hardware park
+    /// interlock fields.
+    #[cfg(test)]
     #[inline]
     pub(crate) fn cached_hardware_feedback_fresh(&self, max_age: Duration) -> bool {
+        let dof = self.config.dof.min(terminal_capture::CAPTURE_MAX_DOF);
         terminal_capture::evaluate_cached_feedback_fresh(
             self.feedback_numeric_valid,
             self.capture_driver_cache.feedback_valid,
             self.driver.is_some(),
-            self.config.dof,
+            dof,
             self.core.feedback().instants(),
-            self.capture_driver_cache.oldest_age,
+            &self.capture_driver_cache.ages[..usize::from(self.capture_driver_cache.ages_len)],
             self.capture_driver_cache.feedback_at,
             self.cached_driver_clock_now(),
             max_age,
@@ -3253,6 +3256,7 @@ impl SupervisorInner {
         obs_timestamp: f64,
         publish_seq: Option<u64>,
     ) {
+        let t0 = Instant::now();
         let rec = match evicted {
             terminal_capture::StagedTerminal::Captured(mut r) => {
                 r.publish_seq = publish_seq;
@@ -3272,6 +3276,9 @@ impl SupervisorInner {
         if let (Some(r), Some(tx)) = (rec, self.terminal_capture_tx.as_mut()) {
             let _ = tx.try_push(r);
         }
+        self.last_phase_terminal_us = self
+            .last_phase_terminal_us
+            .saturating_add(crate::diagnostics::tick::us(t0.elapsed()));
     }
 
     /// Materializes a `StagedTerminal::Deferred` entry in-place into `StagedTerminal::Captured`
@@ -4207,6 +4214,7 @@ impl SupervisorInner {
         let mid_csw_start = Some(crate::diagnostics::tick::CswMark::now());
         let (phase_terminal_us, captured_any) =
             self.capture_edge_terminals(timestamp, Some(next_pub_seq));
+        let publish_start = Instant::now();
         let SupervisorInner {
             core,
             measured_positions,
@@ -4230,10 +4238,12 @@ impl SupervisorInner {
             owner,
             meta,
         );
+        let publish_only_us = crate::diagnostics::tick::us(publish_start.elapsed());
         TickPublished {
             kept,
             body_end,
             phase_terminal_us,
+            publish_only_us,
             captured_any,
             mid_csw_start,
         }
@@ -6134,18 +6144,14 @@ impl SupervisorInner {
         let poll_before = self.cached_driver_clock_now();
         let mut ages = Vec::with_capacity(self.config.dof);
         driver.feedback_ages_into(&mut ages);
-        let all_ages = ages.len() == self.config.dof && ages.iter().all(Option::is_some);
-        self.capture_driver_cache = terminal_capture::CaptureDriverCache {
+        let mut cache = terminal_capture::CaptureDriverCache {
             enable_state: driver.enable_state(),
             driver_caps: driver.capabilities(),
             feedback_valid: driver_valid,
-            oldest_age: if all_ages {
-                ages.iter().flatten().copied().max()
-            } else {
-                None
-            },
-            feedback_at: all_ages.then_some(poll_before),
+            ..terminal_capture::CaptureDriverCache::default()
         };
+        cache.copy_ages_from(&ages, self.config.dof, poll_before);
+        self.capture_driver_cache = cache;
         self.driver = Some(std::sync::Mutex::new(driver));
     }
 
@@ -7619,13 +7625,16 @@ impl SupervisorInner {
                             self.last_poll_partial_enable = driver.has_known_partial_enable();
                             self.last_poll_feedback_valid = driver_valid;
                             self.last_poll_oldest_age = oldest_age;
-                            self.capture_driver_cache = terminal_capture::CaptureDriverCache {
+                            let mut cap_cache = terminal_capture::CaptureDriverCache {
                                 enable_state,
                                 driver_caps: caps,
                                 feedback_valid: driver_valid && self.feedback_numeric_valid,
-                                oldest_age: if self.feedback_numeric_valid { oldest_age } else { None },
-                                feedback_at: (self.feedback_numeric_valid && all_ages).then_some(poll_before),
+                                ..terminal_capture::CaptureDriverCache::default()
                             };
+                            if self.feedback_numeric_valid {
+                                cap_cache.copy_ages_from(&sc.ages, self.config.dof, poll_before);
+                            }
+                            self.capture_driver_cache = cap_cache;
                             let all_fresh_age = sc.ages.len() == self.config.dof
                                 && sc.ages.iter().all(|a| a.is_some_and(|age| age <= Duration::from_millis(250)));
                             if self.feedback_numeric_valid && sc.ages.len() == self.config.dof && driver_valid {
@@ -7683,8 +7692,7 @@ impl SupervisorInner {
                             self.last_poll_oldest_age = None;
                             self.capture_driver_cache.enable_state = driver.enable_state();
                             self.capture_driver_cache.feedback_valid = false;
-                            self.capture_driver_cache.oldest_age = None;
-                            self.capture_driver_cache.feedback_at = None;
+                            self.capture_driver_cache.clear_ages();
                             self.thermal_cooldown.reset();
                             out.reset_stillness_on_read_err = true;
                         }
@@ -7727,8 +7735,7 @@ impl SupervisorInner {
                     self.last_can_feedback_instant = None;
                     self.capture_driver_cache.enable_state = EnableState::Unknown;
                     self.capture_driver_cache.feedback_valid = false;
-                    self.capture_driver_cache.oldest_age = None;
-                    self.capture_driver_cache.feedback_at = None;
+                    self.capture_driver_cache.clear_ages();
                     self.thermal_cooldown.reset();
                     out.reset_stillness_on_read_err = true;
                 }
@@ -11930,7 +11937,7 @@ impl ArmSupervisor {
     #[doc(hidden)]
     pub fn test_drain_terminal_captures(&self) -> usize {
         let latest = self.hub.latest();
-        let outcome = self.terminal_capture_channel.drain_into(
+        let drained = self.terminal_capture_channel.drain_into(
             &self.terminals,
             &self.hub,
             latest.as_deref(),
@@ -11946,7 +11953,7 @@ impl ArmSupervisor {
             let base_seq = latest.as_ref().map_or(0, |s| s.meta.seq);
             let _ = self.terminals.drain_all(base, base_seq);
         }
-        outcome.drained
+        drained
     }
 
     /// Test-only accessor for lock-free terminal capture statistics.
@@ -14556,6 +14563,7 @@ impl ArmSupervisor {
                 kept,
                 body_end,
                 phase_terminal_us,
+                publish_only_us,
                 captured_any,
                 mid_csw_start,
             } = inner.tick_publish_with_deadline(
@@ -14564,7 +14572,7 @@ impl ArmSupervisor {
                 keep,
                 Some(release_deadline),
             );
-            let body_end = body_end.unwrap_or(body_start);
+            let _ = body_end.unwrap_or(body_start);
             let phases = inner.tick_phases_us;
             let _ = inner.take_phase_terminal_us();
             inner.defer_terminal_capture = false;
@@ -14591,7 +14599,7 @@ impl ArmSupervisor {
                 locked,
                 usage_locked,
                 body_start.saturating_duration_since(locked),
-                after_publish.saturating_duration_since(body_end),
+                publish_only_us,
                 mid_csw_start,
                 us(after_ack_flush.saturating_duration_since(after_publish)),
                 phase_terminal_us,
@@ -14675,7 +14683,7 @@ impl ArmSupervisor {
             phases: crate::diagnostics::tick::LockPhases {
                 pre_us: us(pre),
                 rx_us: phases[0], control_us: phases[1], tx_us: phases[2], finish_us: phases[3], obs_us: phases[4],
-                publish_us: us(publish).saturating_sub(phase_terminal),
+                publish_us: publish,
             },
             phases_us: ReleasePhasesUs {
                 alloc_read: phase_alloc_read,
@@ -14961,21 +14969,8 @@ fn dispatch_loop(
         }
         // Single authoritative terminal ingestion path: drain ready SPSC capture records into
         // `TerminalBroadcaster` in strict `terminal_seq` order, binding publish-barrier eligibility
-        // strictly to `latest_snap.meta.seq`. If a synthetic post-publish terminal (`obs_override`)
-        // drained for the same action currently marked `running` in `pending_telemetry`, suppress
-        // that stale `running` telemetry so wire order never reverses (`failed` -> `running`).
-        let suppress_stale_running = |pending: &mut Option<ArmObservation>, syn_id: Option<u64>| {
-            if let Some(id) = syn_id {
-                if pending
-                    .as_ref()
-                    .and_then(|o| o.action.as_ref())
-                    .is_some_and(|a| a.id == id && a.is_running())
-                {
-                    *pending = None;
-                }
-            }
-        };
-        let drain_out = terminal_capture.drain_into(
+        // strictly to `latest_snap.meta.seq`.
+        let _ = terminal_capture.drain_into(
             terminals,
             hub,
             latest_snap.as_deref(),
@@ -14983,7 +14978,6 @@ fn dispatch_loop(
             template_obs,
             true,
         );
-        suppress_stale_running(&mut pending_telemetry, drain_out.last_synthetic_action_id);
         // If a new publication landed concurrently while draining, refresh `latest_snap` once so a
         // waiting `publish_seq`-gated capture consumes against the matching snapshot immediately.
         if hub.published_seq() != last {
@@ -14992,7 +14986,7 @@ fn dispatch_loop(
                 last_diag = last_diag.max(s.policy_diag_seq);
                 pending_telemetry = Some(s.obs.clone());
                 latest_snap = Some(s);
-                let drain_out2 = terminal_capture.drain_into(
+                let _ = terminal_capture.drain_into(
                     terminals,
                     hub,
                     latest_snap.as_deref(),
@@ -15000,7 +14994,6 @@ fn dispatch_loop(
                     template_obs,
                     true,
                 );
-                suppress_stale_running(&mut pending_telemetry, drain_out2.last_synthetic_action_id);
             }
         }
         // Drain every connection's bounded terminal FIFO into its higher-priority `ordinary_out_tx`
@@ -15020,7 +15013,7 @@ fn dispatch_loop(
                     last_diag = last_diag.max(s.policy_diag_seq);
                     pending_telemetry = Some(s.obs.clone());
                     latest_snap = Some(s);
-                    let drain_out3 = terminal_capture.drain_into(
+                    let _ = terminal_capture.drain_into(
                         terminals,
                         hub,
                         latest_snap.as_deref(),
@@ -15028,7 +15021,6 @@ fn dispatch_loop(
                         template_obs,
                         true,
                     );
-                    suppress_stale_running(&mut pending_telemetry, drain_out3.last_synthetic_action_id);
                     if let Some(s_ref) = latest_snap.as_ref() {
                         let _ = terminals.drain_all(&s_ref.obs, s_ref.meta.seq);
                     }
@@ -15040,10 +15032,16 @@ fn dispatch_loop(
         // write order (`pending_total` Release -> `inflight` Release) so `(0, 0)` cannot be
         // observed while a terminal is moving into the FIFO. Keep `pending_telemetry` across
         // iterations so a gated snapshot is still forwarded once terminals clear without requiring
-        // another publication.
+        // another publication, while suppressing any stale `running` observation for an action
+        // already delivered via a synthetic post-publish terminal (across all consumers and
+        // diagnostic-only refreshes).
         if terminal_capture.inflight() == 0 && terminals.pending_total() == 0 {
             if let Some(obs) = pending_telemetry.take() {
-                if tx.receiver_count() > 0 {
+                let stale_running = obs
+                    .action
+                    .as_ref()
+                    .is_some_and(|a| a.is_running() && terminal_capture.was_synthetically_terminated(a.id));
+                if !stale_running && tx.receiver_count() > 0 {
                     let _ = tx.send(obs);
                 }
             }
