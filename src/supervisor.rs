@@ -916,6 +916,10 @@ pub struct SupervisorInner {
     pub last_disable_attempt: Option<Instant>,
     /// Active background/transition disable intent carried into driver sends and periodic retries.
     pub(crate) active_disable_kind: Option<crate::driver::DisableKind>,
+    /// When the active disable originated from a client-initiated park (`!watchdog`), carries its
+    /// captured `expected_stop_gen` so every retry preserves the Stop fence and never sends a
+    /// motor its first disable write after Stop.
+    pub(crate) active_disable_client_park: Option<Option<u64>>,
     pub(crate) last_stopped_torque_off_refusal: Option<StoppedTorqueOffRefusal>,
     /// Rate-limit timestamp for non-motion telemetry warnings when hardware reports `enable_state != Enabled`.
     pub(crate) last_reported_torque_loss_warn: Option<Instant>,
@@ -2161,6 +2165,7 @@ impl SupervisorInner {
             background_disable_retry: None,
             last_disable_attempt: None,
             active_disable_kind: None,
+            active_disable_client_park: None,
             last_stopped_torque_off_refusal: None,
             last_reported_torque_loss_warn: None,
             reported_torque_loss_count: 0,
@@ -8729,14 +8734,20 @@ impl SupervisorInner {
                 .last_disable_attempt
                 .is_none_or(|t| t.elapsed() >= Duration::from_millis(250))
         {
-            let kind = self.active_disable_kind.unwrap_or_else(|| {
-                crate::driver::DisableKind::DisableRequested {
-                    started_at: self.driver_clock_now(),
+            if let Some(expected_stop_gen) = self.active_disable_client_park {
+                if self.client_park_stop_invalidated(expected_stop_gen) {
+                    self.clear_active_disable_retry_state();
                 }
-            });
-            if let Err(e) = self.request_disable_bounded(kind) {
-                if !e.refused_by_chokepoint && !self.safety.deferred_logging() {
-                    tracing::warn!("Torque shutdown remains unconfirmed: {}", e.message.as_str());
+            } else {
+                let kind = self.active_disable_kind.unwrap_or_else(|| {
+                    crate::driver::DisableKind::DisableRequested {
+                        started_at: self.driver_clock_now(),
+                    }
+                });
+                if let Err(e) = self.request_disable_bounded(kind) {
+                    if !e.refused_by_chokepoint && !self.safety.deferred_logging() {
+                        tracing::warn!("Torque shutdown remains unconfirmed: {}", e.message.as_str());
+                    }
                 }
             }
         }

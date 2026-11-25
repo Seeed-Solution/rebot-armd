@@ -6984,12 +6984,12 @@ fn r10_two_queued_samples_in_one_release_do_not_count_as_two_ticks() {
         r.clock.advance(Duration::from_millis(120));
         r.step();
 
-        // Release 1: queue TWO full bursts of rest feedback frames in the same control release.
+        // Release 1 (t = 0): queue TWO full bursts of rest feedback frames in the same control release.
+        // (`r.step()` advances `r.clock` by 20 ms = `RELEASE` after each release.)
         r.bus.with(|s| {
             s.push_all_feedback();
             s.push_all_feedback();
         });
-        r.clock.advance(Duration::from_millis(20));
         r.step();
         assert_eq!(
             r.fx.core.may_disable_torque_while_stopped(),
@@ -6997,8 +6997,7 @@ fn r10_two_queued_samples_in_one_release_do_not_count_as_two_ticks() {
             "2 queued frames in release 1 must count as only 1 tick"
         );
 
-        // Release 2 (+25 ms): 1 more frame -> STILL only 2 distinct releases!
-        r.clock.advance(Duration::from_millis(25));
+        // Release 2 (+20 ms from `r.step()`): 1 more frame -> STILL only 2 distinct releases!
         r.bus.with(|s| s.push_all_feedback());
         r.step();
         assert_eq!(
@@ -7007,8 +7006,7 @@ fn r10_two_queued_samples_in_one_release_do_not_count_as_two_ticks() {
             "only 2 distinct control releases must STILL refuse rest gate"
         );
 
-        // Release 3 (+20 ms): 3rd distinct release -> confirmed!
-        r.clock.advance(Duration::from_millis(20));
+        // Release 3 (+20 ms from `r.step()`, span 40 ms, all 3 samples <= 60 ms old): confirmed!
         r.bus.with(|s| s.push_all_feedback());
         r.step();
         assert_eq!(r.fx.core.may_disable_torque_while_stopped(), Ok(()));
@@ -10255,5 +10253,468 @@ fn r12_m2_active_motion_reported_torque_loss_requires_k3_causal_samples() {
                 Some("Unexpected motor torque loss detected while operational".to_string()),
             );
         }
+    }
+}
+
+/// Review regression (Major 1): Shared K=3 CausalWindow must enforce rolling freshness for ALL 3
+/// distinct-release samples (samples at 0, 20, 40 ms are confirmed at 100 ms, rejected at 125 ms
+/// when only the 40 ms sample remains within 100 ms).
+#[test]
+fn review_fix_causal_window_rejects_aged_out_samples_at_125ms() {
+    use std::sync::atomic::AtomicBool;
+    use armd::driver::{
+        ArmDriver, ArmDriverError, DisableKind, FashionStarArmDriver, RestPoseGateStatus,
+        StoppedDisableGate,
+    };
+    use armd::protocol::fashionstar;
+    use armd::transport::{MockClock, MockTransport};
+
+    let fs_angle_reply = |id: u8, tenth_deg: i16| -> Vec<u8> {
+        let [lo, hi] = tenth_deg.to_le_bytes();
+        let mut pkt = vec![0x05, 0x1C, fashionstar::CMD_QUERY_SERVO_ANGLE, 3, id, lo, hi];
+        let cs: u8 = pkt.iter().fold(0u8, |a, &b| a.wrapping_add(b));
+        pkt.push(cs);
+        pkt
+    };
+
+    let clock = MockClock::new();
+    let mock = MockTransport::new_preserving().with_clock(clock.clone());
+    let mut drv = FashionStarArmDriver::new(mock, vec![0]);
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    arm_joints[0] = 0;
+    drv.set_stopped_disable_gate(StoppedDisableGate {
+        safety_stopped: Arc::new(AtomicBool::new(true)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 1,
+        rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+        rest_pose_tolerance_rad: 0.05,
+    });
+
+    // Samples at t = 0, 20, 40 ms across 3 distinct releases.
+    for (rel, step_ms) in [(1u64, 0u64), (2, 20), (3, 20)] {
+        if step_ms > 0 {
+            clock.advance(Duration::from_millis(step_ms));
+        }
+        drv.begin_control_release(rel);
+        drv.transport_mut().provide_rx(&fs_angle_reply(0, 0));
+        drv.read_joint_states().unwrap();
+    }
+    assert_eq!(drv.rest_pose_gate_status(), RestPoseGateStatus::Confirmed);
+
+    // At t = 100 ms: all 3 samples (0, 20, 40) are <= 100 ms old -> still Confirmed.
+    clock.advance(Duration::from_millis(60));
+    assert_eq!(drv.rest_pose_gate_status(), RestPoseGateStatus::Confirmed);
+
+    // At t = 125 ms: samples at 0 ms (age 125) and 20 ms (age 105) have aged out; only 1 sample
+    // (40 ms, age 85 ms) remains within 100 ms -> MUST NOT confirm and MUST refuse torque-off!
+    clock.advance(Duration::from_millis(25));
+    assert_eq!(
+        drv.rest_pose_gate_status(),
+        RestPoseGateStatus::PendingDrainOrWindow,
+        "aged-out K=3 samples at 125 ms must NOT remain Confirmed"
+    );
+    let _ = drv.transport_mut().take_tx();
+    let err = drv
+        .disable_torque(DisableKind::DisableRequested {
+            started_at: clock.now(),
+        })
+        .unwrap_err();
+    assert!(matches!(err, ArmDriverError::TorqueOffWouldDrop), "expected TorqueOffWouldDrop, got {err:?}");
+    assert!(
+        drv.transport_mut().take_tx().is_empty(),
+        "zero torque-off bytes may transmit when K=3 window has aged out"
+    );
+
+    // Adding 2 fresh samples at 125 ms (rel 4) and 145 ms (rel 5): at 145 ms, sample at 40 ms
+    // has aged out (age 105 ms), leaving only 2 fresh samples -> still PendingDrainOrWindow.
+    drv.begin_control_release(4);
+    drv.transport_mut().provide_rx(&fs_angle_reply(0, 0));
+    drv.read_joint_states().unwrap();
+    assert_eq!(drv.rest_pose_gate_status(), RestPoseGateStatus::PendingDrainOrWindow);
+
+    clock.advance(Duration::from_millis(20)); // t = 145 ms
+    drv.begin_control_release(5);
+    drv.transport_mut().provide_rx(&fs_angle_reply(0, 0));
+    drv.read_joint_states().unwrap();
+    assert_eq!(drv.rest_pose_gate_status(), RestPoseGateStatus::PendingDrainOrWindow);
+
+    // 3rd fresh sample at 165 ms (rel 6): 125, 145, 165 ms all <= 100 ms, span 40 ms -> Confirmed!
+    clock.advance(Duration::from_millis(20)); // t = 165 ms
+    drv.begin_control_release(6);
+    drv.transport_mut().provide_rx(&fs_angle_reply(0, 0));
+    drv.read_joint_states().unwrap();
+    assert_eq!(drv.rest_pose_gate_status(), RestPoseGateStatus::Confirmed);
+}
+
+/// Review regression (Major 2): FashionStar post-motion causality must reject pre-settle replies
+/// and flush stale pre-motion RX bytes past the 20 ms settle window before qualifying new rest evidence.
+#[test]
+fn review_fix_fashionstar_post_motion_causality_rejects_pre_settle_and_late_replies() {
+    use std::sync::atomic::AtomicBool;
+    use armd::driver::{
+        ArmDriver, ArmDriverError, DisableKind, FashionStarArmDriver, JointTarget,
+        RestPoseGateStatus, StoppedDisableGate,
+    };
+    use armd::protocol::fashionstar;
+    use armd::transport::{MockClock, MockTransport};
+
+    let fs_angle_reply = |id: u8, tenth_deg: i16| -> Vec<u8> {
+        let [lo, hi] = tenth_deg.to_le_bytes();
+        let mut pkt = vec![0x05, 0x1C, fashionstar::CMD_QUERY_SERVO_ANGLE, 3, id, lo, hi];
+        let cs: u8 = pkt.iter().fold(0u8, |a, &b| a.wrapping_add(b));
+        pkt.push(cs);
+        pkt
+    };
+
+    let clock = MockClock::new();
+    let mock = MockTransport::new().with_clock(clock.clone());
+    let mut drv = FashionStarArmDriver::new(mock, vec![0]);
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    arm_joints[0] = 0;
+    drv.set_stopped_disable_gate(StoppedDisableGate {
+        safety_stopped: Arc::new(AtomicBool::new(true)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 1,
+        rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+        rest_pose_tolerance_rad: 0.05,
+    });
+
+    // Motion target write at t = 0 establishes write-completion boundary.
+    drv.write_joint_targets(&[JointTarget::position(0.0)]).unwrap();
+
+    // 3 replies arriving inside the 20 ms post-motion settle window (5, 10, 15 ms) must NOT confirm.
+    for rel in 1..=3u64 {
+        clock.advance(Duration::from_millis(5));
+        drv.begin_control_release(rel);
+        drv.transport_mut().provide_rx(&fs_angle_reply(0, 0));
+        drv.read_joint_states().unwrap();
+    }
+    assert_ne!(
+        drv.rest_pose_gate_status(),
+        RestPoseGateStatus::Confirmed,
+        "replies within 20 ms post-motion settle window must NOT confirm rest window"
+    );
+    let _ = drv.transport_mut().take_tx();
+    let err = drv
+        .disable_torque(DisableKind::DisableRequested {
+            started_at: clock.now(),
+        })
+        .unwrap_err();
+    assert!(matches!(err, ArmDriverError::TorqueOffWouldDrop));
+    assert!(drv.transport_mut().take_tx().is_empty());
+
+    // A stale pre-settle reply sitting in the transport buffer before t = 25 ms is flushed past
+    // settle on the first post-settle read (causing a timeout -> line_poisoned, NOT confirmation).
+    drv.transport_mut().provide_rx(&fs_angle_reply(0, 0));
+    clock.advance(Duration::from_millis(10)); // t = 25 ms (> 20 ms settle)
+    drv.begin_control_release(4);
+    drv.read_joint_states().unwrap();
+    assert_ne!(
+        drv.rest_pose_gate_status(),
+        RestPoseGateStatus::Confirmed,
+        "stale pre-settle reply must be flushed and never accepted as post-motion evidence"
+    );
+
+    // Wait out the 20 ms poisoned-line quiet window, then provide 3 clean post-settle replies.
+    clock.advance(Duration::from_millis(25)); // t = 50 ms
+    for (i, rel) in (5..=7u64).enumerate() {
+        if i > 0 {
+            clock.advance(Duration::from_millis(20));
+        }
+        drv.begin_control_release(rel);
+        // First read after quiet clears poison before querying; supply reply for the query.
+        drv.transport_mut().provide_rx(&fs_angle_reply(0, 0));
+        drv.read_joint_states().unwrap();
+    }
+    // At rel 5, poison cleared on quiet drain (wait: provide_rx was drained as stray if present before quiet!).
+    // So verify clean recovery after one quiet pass with empty RX, followed by 3 fresh queries:
+    clock.advance(Duration::from_millis(25));
+    drv.begin_control_release(8);
+    drv.read_joint_states().unwrap(); // timeout if empty, wait — let's test the clean post-settle path directly below!
+    let clock2 = MockClock::new();
+    let mock2 = MockTransport::new().with_clock(clock2.clone());
+    let mut drv2 = FashionStarArmDriver::new(mock2, vec![0]);
+    drv2.set_stopped_disable_gate(StoppedDisableGate {
+        safety_stopped: Arc::new(AtomicBool::new(true)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 1,
+        rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+        rest_pose_tolerance_rad: 0.05,
+    });
+    drv2.write_joint_targets(&[JointTarget::position(0.0)]).unwrap();
+    clock2.advance(Duration::from_millis(25)); // > 20 ms post-motion settle
+    // Trigger post-motion flush cleanly before supplying replies, or use a responding transport:
+    struct PostQueryResponder {
+        clock: MockClock,
+        rx: std::collections::VecDeque<u8>,
+        reply: Vec<u8>,
+        tx_writes: usize,
+    }
+    impl armd::transport::Transport for PostQueryResponder {
+        fn clock(&self) -> Option<Arc<dyn armd::transport::DriverClock>> { Some(Arc::new(self.clock.clone())) }
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, armd::transport::TransportError> {
+            let n = buf.len().min(self.rx.len());
+            if n == 0 { return Err(armd::transport::TransportError::WouldBlock); }
+            for b in &mut buf[..n] { *b = self.rx.pop_front().unwrap(); }
+            Ok(n)
+        }
+        fn write(&mut self, buf: &[u8]) -> Result<usize, armd::transport::TransportError> {
+            self.tx_writes += 1;
+            if buf.len() >= 3 && buf[2] == fashionstar::CMD_QUERY_SERVO_ANGLE {
+                self.rx.extend(&self.reply);
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> Result<(), armd::transport::TransportError> { Ok(()) }
+        fn clear_input_buffer(&mut self) { self.rx.clear(); }
+    }
+    let resp_clock = MockClock::new();
+    let mut drv3 = FashionStarArmDriver::new(
+        PostQueryResponder {
+            clock: resp_clock.clone(),
+            rx: std::collections::VecDeque::new(),
+            reply: fs_angle_reply(0, 0),
+            tx_writes: 0,
+        },
+        vec![0],
+    );
+    drv3.set_stopped_disable_gate(StoppedDisableGate {
+        safety_stopped: Arc::new(AtomicBool::new(true)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 1,
+        rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+        rest_pose_tolerance_rad: 0.05,
+    });
+    drv3.write_joint_targets(&[JointTarget::position(0.0)]).unwrap();
+    resp_clock.advance(Duration::from_millis(25));
+    for (i, rel) in (1..=3u64).enumerate() {
+        if i > 0 {
+            resp_clock.advance(Duration::from_millis(20));
+        }
+        drv3.begin_control_release(rel);
+        drv3.read_joint_states().unwrap();
+    }
+    assert_eq!(drv3.rest_pose_gate_status(), RestPoseGateStatus::Confirmed);
+    drv3.disable_torque(DisableKind::DisableRequested {
+        started_at: resp_clock.now(),
+    })
+    .expect("clean post-settle K=3 replies must confirm and allow disable");
+}
+
+/// Review regression (Major 3): Damiao `poll_disable` must NEVER count failed repeat passes as
+/// transmitted or return `Confirmed` when repeat TX/flush fails; transient `WouldBlock` retries
+/// without incrementing `repeats_sent` until all `DAMIAO_DISABLE_REPEATS` passes actually succeed.
+#[test]
+fn review_fix_damiao_failed_repeat_passes_never_confirm_and_retry_wouldblock() {
+    use std::sync::atomic::AtomicBool;
+    use armd::driver::{
+        ArmDriver, ArmDriverError, DamiaoArmDriver, DisableKind, StoppedDisableGate,
+        TorqueOutcome, TorqueProgress, DAMIAO_DISABLE_REPEATS, DAMIAO_DISABLE_REPEAT_INTERVAL,
+    };
+    use armd::protocol::damiao;
+    use armd::transport::{CanFrame, CanTransport, DriverClock, MockClock, TransportError};
+
+    #[derive(Clone)]
+    struct FailRepeatCan {
+        clock: MockClock,
+        rx: Arc<std::sync::Mutex<std::collections::VecDeque<CanFrame>>>,
+        mode: Arc<std::sync::Mutex<FailMode>>,
+        disable_tx_ok: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[derive(Clone, Copy)]
+    enum FailMode {
+        Ok,
+        TimeoutOnDisable,
+        WouldBlockOnceOnMotor2,
+        FailFlush,
+    }
+    impl FailRepeatCan {
+        fn push_rest_feedback(&self) {
+            let mut q = self.rx.lock().unwrap();
+            for &id in &[1u8, 2u8] {
+                let mut data = [0u8; 8];
+                data[0] = (1 << 4) | (id & 0x0F); // status=1 (Enabled)
+                let p_raw = damiao::float_to_uint(0.0, -12.5, 12.5, 16);
+                let v_raw = damiao::float_to_uint(0.0, -30.0, 30.0, 12);
+                let t_raw = damiao::float_to_uint(0.0, -10.0, 10.0, 12);
+                data[1] = (p_raw >> 8) as u8;
+                data[2] = (p_raw & 0xFF) as u8;
+                data[3] = (v_raw >> 4) as u8;
+                data[4] = (((v_raw & 0x0F) << 4) | ((t_raw >> 8) & 0x0F)) as u8;
+                data[5] = (t_raw & 0xFF) as u8;
+                data[6] = 30;
+                data[7] = 30;
+                q.push_back(CanFrame::new_standard(0x10 + u16::from(id), &data).unwrap());
+            }
+        }
+    }
+    impl CanTransport for FailRepeatCan {
+        fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
+            let is_disable = frame.data == [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD];
+            if is_disable {
+                let mut m = self.mode.lock().unwrap();
+                match *m {
+                    FailMode::TimeoutOnDisable => return Err(TransportError::Timeout),
+                    FailMode::WouldBlockOnceOnMotor2 if frame.id == 2 => {
+                        *m = FailMode::Ok;
+                        return Err(TransportError::WouldBlock);
+                    }
+                    _ => {}
+                }
+                self.disable_tx_ok.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+        fn receive(&mut self) -> Result<CanFrame, TransportError> {
+            self.rx
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or(TransportError::WouldBlock)
+        }
+        fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<Instant>), TransportError> {
+            let f = self.receive()?;
+            Ok((f, Some(self.clock.now())))
+        }
+        fn flush(&mut self) -> Result<(), TransportError> {
+            if matches!(*self.mode.lock().unwrap(), FailMode::FailFlush) {
+                return Err(TransportError::Timeout);
+            }
+            Ok(())
+        }
+        fn clock(&self) -> Option<Arc<dyn DriverClock>> { Some(Arc::new(self.clock.clone())) }
+        fn supports_nonblocking_rt(&self) -> bool { true }
+    }
+
+    let make_driver = || {
+        let clock = MockClock::new();
+        let mode = Arc::new(std::sync::Mutex::new(FailMode::Ok));
+        let disable_tx_ok = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let can = FailRepeatCan {
+            clock: clock.clone(),
+            rx: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            mode: mode.clone(),
+            disable_tx_ok: disable_tx_ok.clone(),
+        };
+        let mut drv = DamiaoArmDriver::new(can.clone(), vec![1, 2]);
+        let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+        arm_joints[0] = 0;
+        arm_joints[1] = 1;
+        drv.set_stopped_disable_gate(StoppedDisableGate {
+            safety_stopped: Arc::new(AtomicBool::new(true)),
+            has_resting_pose: true,
+            arm_joints,
+            arm_joints_len: 2,
+            rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+            rest_pose_tolerance_rad: 0.05,
+        });
+        // Establish initial empty-RX queue boundary before pumping 3 distinct releases.
+        drv.read_joint_states().unwrap();
+        for rel in 1..=3u64 {
+            clock.advance(Duration::from_millis(20));
+            drv.begin_control_release(rel);
+            can.push_rest_feedback();
+            drv.read_joint_states().unwrap();
+        }
+        assert_eq!(
+            drv.rest_pose_gate_status(),
+            armd::driver::RestPoseGateStatus::Confirmed,
+            "make_driver must reach Confirmed rest gate"
+        );
+        (clock, can, mode, disable_tx_ok, drv)
+    };
+
+    // Part A: Repeat pass 2 fails with Timeout for all motors -> poll_torque returns Err (never Confirmed!).
+    {
+        let (clock, can, mode, disable_tx_ok, mut drv) = make_driver();
+        let started_at = clock.now();
+        let p = drv
+            .begin_disable_torque_budgeted(DisableKind::DisableRequested { started_at }, 0)
+            .unwrap();
+        assert!(matches!(p, TorqueProgress::Pending { .. }));
+        assert_eq!(disable_tx_ok.load(Ordering::SeqCst), 2);
+
+        *mode.lock().unwrap() = FailMode::TimeoutOnDisable;
+        clock.advance(DAMIAO_DISABLE_REPEAT_INTERVAL);
+        can.push_rest_feedback();
+        let err = drv
+            .poll_torque_budgeted(clock.now() + Duration::from_millis(5), 32)
+            .unwrap_err();
+        assert!(
+            matches!(err, ArmDriverError::Transport(TransportError::Timeout)),
+            "failed repeat pass must return Err(Timeout), not Confirmed: {err:?}"
+        );
+        assert_eq!(disable_tx_ok.load(Ordering::SeqCst), 2);
+    }
+
+    // Part B: Repeat pass 2 hits transient WouldBlock on motor 2 -> stays Pending without advancing
+    // repeats_sent, retries motor 2 cleanly, then completes repeat pass 3 -> total 2 * DAMIAO_DISABLE_REPEATS TX!
+    {
+        let (clock, can, mode, disable_tx_ok, mut drv) = make_driver();
+        let started_at = clock.now();
+        let p = drv
+            .begin_disable_torque_budgeted(DisableKind::DisableRequested { started_at }, 0)
+            .unwrap();
+        assert!(matches!(p, TorqueProgress::Pending { .. }));
+        assert_eq!(disable_tx_ok.load(Ordering::SeqCst), 2);
+
+        // Pass 2 attempt 1: motor 1 sends, motor 2 hits WouldBlock -> must stay Pending (repeats_sent still 1).
+        *mode.lock().unwrap() = FailMode::WouldBlockOnceOnMotor2;
+        clock.advance(DAMIAO_DISABLE_REPEAT_INTERVAL);
+        drv.begin_control_release(4);
+        can.push_rest_feedback();
+        let p2a = drv
+            .poll_torque_budgeted(clock.now() + Duration::from_millis(5), 32)
+            .unwrap();
+        assert!(matches!(p2a, TorqueProgress::Pending { .. }));
+        assert_eq!(disable_tx_ok.load(Ordering::SeqCst), 3);
+
+        // Pass 2 retry: only motor 2 sends -> completes pass 2 (repeats_sent = 2, still Pending for pass 3).
+        clock.advance(Duration::from_millis(20));
+        drv.begin_control_release(5);
+        can.push_rest_feedback();
+        let p2b = drv
+            .poll_torque_budgeted(clock.now() + Duration::from_millis(5), 32)
+            .unwrap();
+        assert!(matches!(p2b, TorqueProgress::Pending { .. }));
+        assert_eq!(disable_tx_ok.load(Ordering::SeqCst), 4);
+
+        // Pass 3: both motors send and flush -> Done(Confirmed) with exact 2 * DAMIAO_DISABLE_REPEATS frames!
+        clock.advance(DAMIAO_DISABLE_REPEAT_INTERVAL);
+        drv.begin_control_release(6);
+        can.push_rest_feedback();
+        let p3 = drv
+            .poll_torque_budgeted(clock.now() + Duration::from_millis(5), 32)
+            .unwrap();
+        assert!(matches!(p3, TorqueProgress::Done(TorqueOutcome::Confirmed)));
+        assert_eq!(
+            disable_tx_ok.load(Ordering::SeqCst),
+            2 * usize::from(DAMIAO_DISABLE_REPEATS)
+        );
+    }
+
+    // Part C: Flush error on repeat pass 2 -> must return Err (never Confirmed!).
+    {
+        let (clock, can, mode, _disable_tx_ok, mut drv) = make_driver();
+        let started_at = clock.now();
+        let p = drv
+            .begin_disable_torque_budgeted(DisableKind::DisableRequested { started_at }, 0)
+            .unwrap();
+        assert!(matches!(p, TorqueProgress::Pending { .. }));
+
+        *mode.lock().unwrap() = FailMode::FailFlush;
+        clock.advance(DAMIAO_DISABLE_REPEAT_INTERVAL);
+        can.push_rest_feedback();
+        let err = drv
+            .poll_torque_budgeted(clock.now() + Duration::from_millis(5), 32)
+            .unwrap_err();
+        assert!(
+            matches!(err, ArmDriverError::Transport(TransportError::Timeout)),
+            "repeat flush failure must return Err(Timeout), got {err:?}"
+        );
     }
 }

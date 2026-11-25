@@ -383,6 +383,15 @@ impl ArmDriver for ZeroOffsetDriver {
     ) -> Result<crate::driver::TorqueProgress, ArmDriverError> {
         self.inner.begin_client_park_disable(max_rx_frames, expected_stop_gen)
     }
+    fn begin_client_park_disable_with_kind(
+        &mut self,
+        kind: DisableKind,
+        max_rx_frames: Option<u16>,
+        expected_stop_gen: Option<u64>,
+    ) -> Result<crate::driver::TorqueProgress, ArmDriverError> {
+        self.inner
+            .begin_client_park_disable_with_kind(kind, max_rx_frames, expected_stop_gen)
+    }
     fn poll_torque(&mut self, deadline: Instant) -> Result<crate::driver::TorqueProgress, ArmDriverError> { self.inner.poll_torque(deadline) }
     fn poll_torque_budgeted(&mut self, deadline: Instant, max_rx_frames: u16) -> Result<crate::driver::TorqueProgress, ArmDriverError> {
         self.inner.poll_torque_budgeted(deadline, max_rx_frames)

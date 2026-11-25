@@ -642,26 +642,45 @@ enum WindowRecord {
     OffsetDrifted,
 }
 
+/// Fixed capacity for distinct-release timestamps tracked inside [`CausalWindow`] (zero-alloc).
+const CAUSAL_WINDOW_CAP: usize = 32;
+
 /// Zero-allocation K=3 consecutive causal rest-pose evidence accumulator shared across all drivers.
 ///
-/// Confirmation requires `count >= EVIDENCE_WINDOW_SAMPLES` (3) **distinct control releases**,
-/// `last_rx - first_rx >= EVIDENCE_WINDOW_MIN_SPAN` (20 ms), and `now - last_rx <= max_age`.
-/// Multiple queued frames within the same control release update `last_rx` without incrementing
-/// `count`. Any disagreeing sample, gap `> max_gap`, or `CLOCK_REALTIME - CLOCK_MONOTONIC` offset
-/// change `> 1 ms` resets the window.
-#[derive(Clone, Copy, Debug, Default)]
+/// Confirmation requires at least `EVIDENCE_WINDOW_SAMPLES` (3) **distinct control releases**
+/// whose timestamps ALL lie within `max_age` of `now`, spanning at least
+/// `EVIDENCE_WINDOW_MIN_SPAN` (20 ms) from the oldest still-fresh sample to the newest sample.
+/// Multiple queued frames within the same control release update the current release's timestamp
+/// without incrementing the distinct-release count. Any disagreeing sample, gap `> max_gap`, or
+/// `CLOCK_REALTIME - CLOCK_MONOTONIC` offset change `> 1 ms` resets the window.
+#[derive(Clone, Copy, Debug)]
 struct CausalWindow {
-    count: u8,
-    first_rx: Option<Instant>,
-    last_rx: Option<Instant>,
+    len: u8,
+    samples: [Option<Instant>; CAUSAL_WINDOW_CAP],
     last_release: u64,
     anchor_offset_ns: Option<i128>,
+}
+
+impl Default for CausalWindow {
+    fn default() -> Self {
+        Self {
+            len: 0,
+            samples: [None; CAUSAL_WINDOW_CAP],
+            last_release: 0,
+            anchor_offset_ns: None,
+        }
+    }
 }
 
 impl CausalWindow {
     #[inline]
     fn reset(&mut self) {
         *self = Self::default();
+    }
+
+    #[inline]
+    fn last_rx(&self) -> Option<Instant> {
+        self.len.checked_sub(1).and_then(|i| self.samples[usize::from(i)])
     }
 
     #[inline]
@@ -672,7 +691,7 @@ impl CausalWindow {
         max_gap: Duration,
         offset_ns: Option<i128>,
     ) -> WindowRecord {
-        if self.count > 0 {
+        if self.len > 0 {
             match (self.anchor_offset_ns, offset_ns) {
                 (Some(anchor), Some(cur))
                     if (cur - anchor).abs() > MAX_REALTIME_MONOTONIC_OFFSET_DRIFT_NS =>
@@ -687,26 +706,60 @@ impl CausalWindow {
                 _ => {}
             }
         }
-        if self.last_rx.is_some_and(|prev| rx_at < prev) {
+        if self.last_rx().is_some_and(|prev| rx_at < prev) {
             return WindowRecord::IgnoredOlder;
         }
-        if self.count == 0
+        if self.len == 0
             || self
-                .last_rx
+                .last_rx()
                 .is_some_and(|prev| rx_at.saturating_duration_since(prev) > max_gap)
         {
-            self.count = 1;
-            self.first_rx = Some(rx_at);
-            self.last_rx = Some(rx_at);
+            self.samples = [None; CAUSAL_WINDOW_CAP];
+            self.samples[0] = Some(rx_at);
+            self.len = 1;
             self.last_release = release_id;
             self.anchor_offset_ns = offset_ns;
         } else if release_id == self.last_release {
             // Same control release: multiple queued samples never count as > 1 tick.
-            self.last_rx = Some(rx_at);
+            self.samples[usize::from(self.len - 1)] = Some(rx_at);
         } else {
-            self.count = self.count.saturating_add(1);
+            // Evict any prefix samples already older than `max_gap` relative to `rx_at`:
+            // timestamps are monotonically non-decreasing, so aged-out entries can never be fresh.
+            let len = usize::from(self.len);
+            let mut keep_from = 0usize;
+            while keep_from < len {
+                if self.samples[keep_from]
+                    .is_some_and(|ts| rx_at.saturating_duration_since(ts) > max_gap)
+                {
+                    keep_from += 1;
+                } else {
+                    break;
+                }
+            }
+            if keep_from > 0 {
+                let remaining = len - keep_from;
+                for i in 0..remaining {
+                    self.samples[i] = self.samples[keep_from + i];
+                }
+                for i in remaining..len {
+                    self.samples[i] = None;
+                }
+                self.len = remaining as u8;
+            }
+            // If > CAUSAL_WINDOW_CAP distinct releases arrived inside `max_gap`, drop an interior
+            // entry (`samples[1]`) so the oldest fresh timestamp (`samples[0]`) and all newest
+            // entries remain exact without falsely shrinking the span.
+            if usize::from(self.len) == CAUSAL_WINDOW_CAP {
+                for i in 1..(CAUSAL_WINDOW_CAP - 1) {
+                    self.samples[i] = self.samples[i + 1];
+                }
+                self.samples[CAUSAL_WINDOW_CAP - 1] = None;
+                self.len -= 1;
+            }
+            let idx = usize::from(self.len);
+            self.samples[idx] = Some(rx_at);
+            self.len += 1;
             self.last_release = release_id;
-            self.last_rx = Some(rx_at);
         }
         WindowRecord::Accepted
     }
@@ -718,14 +771,34 @@ impl CausalWindow {
 
     #[inline]
     fn is_confirmed(&self, now: Instant, max_age: Duration) -> bool {
-        self.count >= EVIDENCE_WINDOW_SAMPLES
-            && self
-                .first_rx
-                .zip(self.last_rx)
-                .is_some_and(|(first, last)| {
-                    last.saturating_duration_since(first) >= EVIDENCE_WINDOW_MIN_SPAN
-                        && now.saturating_duration_since(last) <= max_age
-                })
+        let len = usize::from(self.len);
+        if len < usize::from(EVIDENCE_WINDOW_SAMPLES) {
+            return false;
+        }
+        let Some(last) = self.samples[len - 1] else {
+            return false;
+        };
+        if last > now || now.saturating_duration_since(last) > max_age {
+            return false;
+        }
+        let mut first_fresh_idx = None;
+        for i in 0..len {
+            if let Some(ts) = self.samples[i] {
+                if ts <= now && now.saturating_duration_since(ts) <= max_age {
+                    first_fresh_idx = Some(i);
+                    break;
+                }
+            }
+        }
+        let Some(start) = first_fresh_idx else {
+            return false;
+        };
+        let fresh_count = len - start;
+        let Some(first_fresh) = self.samples[start] else {
+            return false;
+        };
+        fresh_count >= usize::from(EVIDENCE_WINDOW_SAMPLES)
+            && last.saturating_duration_since(first_fresh) >= EVIDENCE_WINDOW_MIN_SPAN
     }
 }
 
@@ -1426,11 +1499,22 @@ pub trait ArmDriver: Send {
     fn begin_client_park_disable(
         &mut self,
         max_rx_frames: Option<u16>,
-        _expected_stop_gen: Option<u64>,
+        expected_stop_gen: Option<u64>,
     ) -> Result<TorqueProgress, ArmDriverError> {
         let kind = DisableKind::DisableRequested {
             started_at: self.clock_now(),
         };
+        self.begin_client_park_disable_with_kind(kind, max_rx_frames, expected_stop_gen)
+    }
+
+    /// Starts or retries a client-initiated park disable carrying an explicit [`DisableKind`]
+    /// (preserving the original request `started_at` lifetime) and Stop generation fence.
+    fn begin_client_park_disable_with_kind(
+        &mut self,
+        kind: DisableKind,
+        max_rx_frames: Option<u16>,
+        _expected_stop_gen: Option<u64>,
+    ) -> Result<TorqueProgress, ArmDriverError> {
         match max_rx_frames {
             Some(limit) => self.begin_disable_torque_budgeted(kind, limit),
             None => self.begin_disable_torque(kind),
@@ -5030,23 +5114,21 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         self.estop_gate = Some(gate);
     }
 
-    fn begin_client_park_disable(
+    fn begin_client_park_disable_with_kind(
         &mut self,
+        kind: DisableKind,
         max_rx_frames: Option<u16>,
         expected_stop_gen: Option<u64>,
     ) -> Result<TorqueProgress, ArmDriverError> {
         self.assert_clock_matches_transport();
         let initial_estop_gen = self.estop_gate.as_ref().map(|g| g.generations().0);
         self.client_park_stop_check(initial_estop_gen, expected_stop_gen)?;
-        let kind = DisableKind::DisableRequested {
-            started_at: self.clock_now(),
-        };
         let client_park = Some((initial_estop_gen, expected_stop_gen));
         let exp = match kind {
             DisableKind::DisableRequested { started_at } => started_at + STOPPED_DISABLE_REQUEST_LIFETIME,
             DisableKind::DisableProtective { .. } => self.clock_now(),
         };
-        if self.clock_now() >= exp {
+        if matches!(kind, DisableKind::DisableRequested { .. }) && self.clock_now() >= exp {
             return Err(ArmDriverError::DisableRequestExpired);
         }
         match self.evaluate_rest_pose_gate() {
@@ -5509,6 +5591,16 @@ pub struct FashionStarArmDriver<T: Transport> {
     control_release_id: u64,
     control_release_managed: bool,
     rest_pose_window: Vec<CausalWindow>,
+    /// Per-servo monotonic instant of the last motion or enable write completion (`flush()`),
+    /// establishing the post-motion causality bound (`TORQUE_CAUSAL_SETTLE_WINDOW`).
+    last_motion_write_at: Vec<Option<Instant>>,
+    /// True after a motion/enable write until the transport input buffer has been flushed past
+    /// `TORQUE_CAUSAL_SETTLE_WINDOW` so stale pre-motion serial replies cannot enter the window.
+    rx_needs_post_motion_flush: bool,
+    /// True when an unexpected/late/corrupt RS485 frame or query timeout was observed; cleared
+    /// only after `TORQUE_CAUSAL_SETTLE_WINDOW` passes with no stray bytes.
+    line_poisoned: bool,
+    line_poison_quiet_until: Option<Instant>,
     clock: Option<Arc<dyn crate::transport::DriverClock>>,
     abort_flag: Option<Arc<AtomicBool>>,
     estop_gate: Option<crate::rt_core::urgent::EstopGate>,
@@ -5535,6 +5627,10 @@ impl<T: Transport> FashionStarArmDriver<T> {
             control_release_id: 0,
             control_release_managed: false,
             rest_pose_window: vec![CausalWindow::default(); dof],
+            last_motion_write_at: vec![None; dof],
+            rx_needs_post_motion_flush: false,
+            line_poisoned: false,
+            line_poison_quiet_until: None,
             clock,
             abort_flag: None,
             estop_gate: None,
@@ -5542,6 +5638,40 @@ impl<T: Transport> FashionStarArmDriver<T> {
             tx_release_deadline: None,
             disable_dispatched_mask: 0,
         }
+    }
+
+    fn poison_line(&mut self, now: Instant) {
+        self.line_poisoned = true;
+        self.line_poison_quiet_until = Some(now + TORQUE_CAUSAL_SETTLE_WINDOW);
+        for w in &mut self.rest_pose_window {
+            w.reset();
+        }
+    }
+
+    fn record_motion_write_done_all(&mut self) {
+        let write_done = self.now();
+        for w in &mut self.rest_pose_window {
+            w.reset();
+        }
+        self.last_motion_write_at.fill(Some(write_done));
+        self.rx_needs_post_motion_flush = true;
+        self.rx_buffer.clear();
+        self.rx_timestamps.clear();
+        self.transport.clear_input_buffer();
+    }
+
+    fn record_motion_write_done_masked(&mut self, mask: u64) {
+        let write_done = self.now();
+        for i in 0..self.servo_ids.len().min(64) {
+            if (mask & (1u64 << i)) != 0 {
+                self.rest_pose_window[i].reset();
+                self.last_motion_write_at[i] = Some(write_done);
+            }
+        }
+        self.rx_needs_post_motion_flush = true;
+        self.rx_buffer.clear();
+        self.rx_timestamps.clear();
+        self.transport.clear_input_buffer();
     }
 
     #[inline]
@@ -5819,6 +5949,7 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
             }
             self.strict_stop_check(Some(start_stamp))?;
             self.transport.flush()?;
+            self.record_motion_write_done_all();
             Ok(())
         }
     }
@@ -5892,6 +6023,68 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
         self.begin_disable_torque(kind)
     }
 
+    fn begin_client_park_disable_with_kind(
+        &mut self,
+        kind: DisableKind,
+        _max_rx_frames: Option<u16>,
+        expected_stop_gen: Option<u64>,
+    ) -> Result<TorqueProgress, ArmDriverError> {
+        let mut stamp = self.current_stop_stamp();
+        if let Some(gen) = expected_stop_gen {
+            stamp.1 = gen;
+        }
+        self.strict_stop_check(Some(stamp))?;
+        let n = self.servo_ids.len().min(64);
+        let all_mask = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+        if (self.disable_dispatched_mask & all_mask) == all_mask {
+            self.disable_dispatched_mask = 0;
+        }
+        let skip_dispatched = matches!(kind, DisableKind::DisableRequested { .. });
+        let mut wrote_any = false;
+        let mut refused_err = None;
+        let mut last_err = None;
+        for idx in 0..self.servo_ids.len() {
+            if skip_dispatched && idx < 64 && (self.disable_dispatched_mask & (1u64 << idx)) != 0 {
+                continue;
+            }
+            if let Err(e) = self.strict_stop_check(Some(stamp)) {
+                if !wrote_any && self.disable_dispatched_mask == 0 {
+                    return Err(e);
+                }
+                last_err = Some(ArmDriverError::HardwareFault(
+                    "Client park disable stopped mid-batch after partial servo disable".into(),
+                ));
+                break;
+            }
+            let id = self.servo_ids[idx];
+            match self.write_torque_off(id, kind) {
+                Ok(()) => {
+                    wrote_any = true;
+                    if idx < 64 {
+                        self.disable_dispatched_mask |= 1u64 << idx;
+                    }
+                }
+                Err(e @ (ArmDriverError::TorqueOffWouldDrop | ArmDriverError::DisableRequestExpired)) => {
+                    refused_err = Some(e);
+                    break;
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        if wrote_any {
+            if let Err(e) = self.transport.flush() {
+                last_err = Some(e.into());
+            }
+        }
+        if let Some(e) = refused_err.or(last_err) {
+            return Err(e);
+        }
+        if (self.disable_dispatched_mask & all_mask) == all_mask {
+            self.disable_dispatched_mask = 0;
+        }
+        Ok(TorqueProgress::Done(TorqueOutcome::Unconfirmed))
+    }
+
     fn write_estop_hold(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
         let n = self.servo_ids.len().min(64);
         let mask = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
@@ -5960,6 +6153,7 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
         if report.sent_any {
             self.pending_stop_check(Some(start_stamp))?;
             self.transport.flush()?;
+            self.record_motion_write_done_masked(sent_mask);
             for i in 0..dof {
                 if (sent_mask & (1u64 << i)) != 0 {
                     report.joint_status[i] = if (stale_mask & (1u64 << i)) != 0 {
@@ -5988,6 +6182,7 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
             self.transport.write_all(&pkt)?;
         }
         self.transport.flush()?;
+        self.record_motion_write_done_all();
         Ok(())
     }
 
@@ -6003,6 +6198,42 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
             self.control_release_id = self.control_release_id.wrapping_add(1).max(1);
         }
         let release_id = self.control_release_id;
+        // Post-motion flush: once past `TORQUE_CAUSAL_SETTLE_WINDOW` after the latest motion or
+        // enable write, clear any buffered pre-motion bytes before issuing qualifying angle queries.
+        // Backends whose transport cannot clear its input buffer stay fail-closed (`rx_needs_post_motion_flush == true`).
+        if self.rx_needs_post_motion_flush {
+            let latest_motion = self.last_motion_write_at.iter().flatten().copied().max();
+            let past_settle = latest_motion.is_none_or(|w| {
+                start_time > w && start_time.saturating_duration_since(w) > TORQUE_CAUSAL_SETTLE_WINDOW
+            });
+            if past_settle && self.transport.clears_input_buffer() {
+                self.rx_buffer.clear();
+                self.rx_timestamps.clear();
+                self.transport.clear_input_buffer();
+                self.rx_needs_post_motion_flush = false;
+            }
+        }
+        if self.line_poisoned {
+            let mut saw_stray = false;
+            let mut drain_buf = [0u8; 32];
+            while let Ok(n) = self.transport.read(&mut drain_buf) {
+                if n == 0 {
+                    break;
+                }
+                saw_stray = true;
+            }
+            let now = self.now();
+            if saw_stray {
+                self.rx_buffer.clear();
+                self.rx_timestamps.clear();
+                self.poison_line(now);
+            } else if self.line_poison_quiet_until.is_none_or(|until| now >= until) {
+                self.rx_buffer.clear();
+                self.rx_timestamps.clear();
+                self.line_poisoned = false;
+                self.line_poison_quiet_until = None;
+            }
+        }
         const MAX_READ_DURATION: Duration = Duration::from_millis(3);
         const MAX_TOTAL_BYTES: usize = 256;
         let mut total_bytes_read = 0;
@@ -6023,6 +6254,7 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
             let req_written_at = self.now();
 
             let mut attempts = 0;
+            let mut got_reply = false;
             while attempts < 10 {
                 if self.since(start_time) >= MAX_READ_DURATION || total_bytes_read >= MAX_TOTAL_BYTES {
                     self.poll_cursor = (joint_idx + 1) % dof;
@@ -6031,6 +6263,11 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
 
                 match fashionstar::parse_packet(&self.rx_buffer) {
                     Ok((FashionStarPacket { header, id: pkt_id, cmd_id, content }, consumed)) => {
+                        let pkt_first_rx_at = self
+                            .rx_timestamps
+                            .first()
+                            .copied()
+                            .unwrap_or(req_written_at);
                         let pkt_rx_at = self
                             .rx_timestamps
                             .get(consumed.saturating_sub(1))
@@ -6048,6 +6285,7 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
                             && cmd_id == fashionstar::CMD_QUERY_SERVO_ANGLE
                             && content.len() >= 2
                         {
+                            got_reply = true;
                             let decode_now = self.now();
                             if pkt_rx_at > decode_now {
                                 self.rest_pose_window[joint_idx].reset();
@@ -6065,9 +6303,25 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
                             }
                             self.last_feedback_instant[joint_idx] = Some(pkt_rx_at);
                             self.feedback_seq[joint_idx] = self.feedback_seq[joint_idx].wrapping_add(1);
+                            let correlated_after_query = pkt_first_rx_at >= req_written_at;
+                            let after_motion = self.last_motion_write_at[joint_idx].is_none_or(|w| {
+                                req_written_at > w
+                                    && req_written_at.saturating_duration_since(w)
+                                        > TORQUE_CAUSAL_SETTLE_WINDOW
+                                    && pkt_first_rx_at > w
+                                    && pkt_first_rx_at.saturating_duration_since(w)
+                                        > TORQUE_CAUSAL_SETTLE_WINDOW
+                                    && pkt_rx_at > w
+                                    && pkt_rx_at.saturating_duration_since(w)
+                                        > TORQUE_CAUSAL_SETTLE_WINDOW
+                            });
                             if let Some(ref gate) = self.stopped_disable_gate {
                                 if gate.is_arm_joint(joint_idx) {
-                                    if joint_state_valid(&self.cached_states[joint_idx], self.capabilities())
+                                    if !self.line_poisoned
+                                        && !self.rx_needs_post_motion_flush
+                                        && correlated_after_query
+                                        && after_motion
+                                        && joint_state_valid(&self.cached_states[joint_idx], self.capabilities())
                                         && gate.joint_at_rest(joint_idx, pos)
                                     {
                                         let _ = self.rest_pose_window[joint_idx].record_agree(
@@ -6082,13 +6336,21 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
                                 }
                             }
                             break;
+                        } else if header == fashionstar::FASHIONSTAR_RESPONSE_HEADER {
+                            // Unsolicited/mismatched response on half-duplex RS485 line: fail closed
+                            // until the line stays quiet for `TORQUE_CAUSAL_SETTLE_WINDOW`.
+                            let now = self.now();
+                            self.poison_line(now);
                         }
                     }
                     Err(fashionstar::FashionStarError::IncompleteFrame { .. }) => {
                         // Incomplete frame; read more bytes from transport
                     }
                     Err(_) => {
-                        // Checksum mismatch or corruption: slide window by 1 byte to recover
+                        // Checksum mismatch or corruption: slide window by 1 byte to recover and
+                        // fail-closed rest evidence until the RS485 line settles.
+                        let now = self.now();
+                        self.poison_line(now);
                         if !self.rx_buffer.is_empty() {
                             self.rx_buffer.remove(0);
                             if !self.rx_timestamps.is_empty() {
@@ -6120,6 +6382,10 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
                         }
                     }
                 }
+            }
+            if !got_reply {
+                let now = self.now();
+                self.poison_line(now);
             }
         }
 
@@ -7058,6 +7324,7 @@ enum DamiaoTorque {
     Disable {
         kind: DisableKind,
         repeats_sent: u8,
+        repeat_pass_mask: u64,
         next_repeat_at: Instant,
         mit_fenced: bool,
     },
@@ -11685,6 +11952,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.torque_hs = Some(DamiaoTorque::Disable {
             kind,
             repeats_sent: 1,
+            repeat_pass_mask: 0,
             next_repeat_at,
             mit_fenced,
         });
@@ -11809,6 +12077,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         &mut self,
         kind: DisableKind,
         mut repeats_sent: u8,
+        mut repeat_pass_mask: u64,
         mut next_repeat_at: Instant,
         mit_fenced: bool,
     ) -> Result<TorqueProgress, ArmDriverError> {
@@ -11841,20 +12110,32 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             self.torque_hs = Some(DamiaoTorque::Disable {
                 kind,
                 repeats_sent,
+                repeat_pass_mask,
                 next_repeat_at,
                 mit_fenced,
             });
             return Ok(TorqueProgress::Pending { wake });
         }
+        let n = self.motor_ids.len().min(64);
+        let all_mask = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
         let tx_kind = Self::disable_tx_kind(kind);
         let mut sent_any = false;
         let mut wait_evidence = false;
         let mut refused_err = None;
+        let mut other_err = None;
         for idx in 0..self.motor_ids.len() {
+            if idx < 64 && (repeat_pass_mask & (1u64 << idx)) != 0 {
+                continue;
+            }
             match self.send(tx_kind, None, None, false, |d| {
                 Some(damiao::build_disable_frame(d.motor_ids[idx]))
             }) {
-                Ok(_) => sent_any = true,
+                Ok(_) => {
+                    sent_any = true;
+                    if idx < 64 {
+                        repeat_pass_mask |= 1u64 << idx;
+                    }
+                }
                 Err(TxRefusal::DisableWaitEvidence) => wait_evidence = true,
                 Err(r @ (TxRefusal::TorqueOffWouldDrop | TxRefusal::DisableRequestExpired)) => {
                     if refused_err.is_none() {
@@ -11863,32 +12144,70 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 }
                 Err(r) => {
                     tracing::warn!("Repeat disable transmit failed for motor {}: {:?}", self.motor_ids[idx], r);
+                    if other_err.is_none() {
+                        other_err = Some(Self::refusal_to_driver_err(r));
+                    }
                 }
             }
         }
+        let mut flush_ok = true;
         if sent_any {
             if let Err(e) = self.can.flush() {
                 tracing::warn!("Repeat disable CAN flush failed: {:?}", e);
+                flush_ok = false;
+                if other_err.is_none() {
+                    other_err = Some(e.into());
+                }
             }
             let _ = self.receive_feedback();
         }
         if let Some(e) = refused_err {
             return Err(e);
         }
-        if !sent_any && wait_evidence {
-            let after = self.now();
-            let wake = expiry.map_or(after + Duration::from_millis(20), |exp| {
-                (after + Duration::from_millis(20)).min(exp)
-            });
-            self.torque_hs = Some(DamiaoTorque::Disable {
-                kind,
-                repeats_sent,
-                next_repeat_at,
-                mit_fenced,
-            });
-            return Ok(TorqueProgress::Pending { wake });
+        let pass_complete = (repeat_pass_mask & all_mask) == all_mask && flush_ok;
+        if let Some(e) = other_err {
+            // Never count a failed repeat pass as transmitted or return `Confirmed`.
+            // Transient `WouldBlock` inside a bounded `DisableRequested` lifetime retries without
+            // advancing `repeats_sent`; other transport/flush errors fail the transition.
+            let can_retry_wb = matches!(e, ArmDriverError::Transport(TransportError::WouldBlock))
+                && expiry.is_some_and(|exp| self.now() < exp);
+            if can_retry_wb {
+                let after = self.now();
+                let wake = expiry.map_or(after + Duration::from_millis(20), |exp| {
+                    (after + Duration::from_millis(20)).min(exp)
+                });
+                self.torque_hs = Some(DamiaoTorque::Disable {
+                    kind,
+                    repeats_sent,
+                    repeat_pass_mask,
+                    next_repeat_at,
+                    mit_fenced,
+                });
+                return Ok(TorqueProgress::Pending { wake });
+            }
+            return Err(e);
+        }
+        if !pass_complete {
+            if wait_evidence {
+                let after = self.now();
+                let wake = expiry.map_or(after + Duration::from_millis(20), |exp| {
+                    (after + Duration::from_millis(20)).min(exp)
+                });
+                self.torque_hs = Some(DamiaoTorque::Disable {
+                    kind,
+                    repeats_sent,
+                    repeat_pass_mask,
+                    next_repeat_at,
+                    mit_fenced,
+                });
+                return Ok(TorqueProgress::Pending { wake });
+            }
+            return Err(ArmDriverError::HardwareFault(
+                "Incomplete Damiao disable repeat pass".into(),
+            ));
         }
         repeats_sent = repeats_sent.saturating_add(1);
+        repeat_pass_mask = 0;
         if repeats_sent >= DAMIAO_DISABLE_REPEATS {
             if mit_fenced {
                 self.mit_fence = None;
@@ -11901,6 +12220,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.torque_hs = Some(DamiaoTorque::Disable {
             kind,
             repeats_sent,
+            repeat_pass_mask,
             next_repeat_at,
             mit_fenced,
         });
@@ -11985,9 +12305,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 client_park,
                 expected_stamp,
             }) => self.poll_await_rest_gate(kind, next_probe_at, client_park, expected_stamp),
-            Some(DamiaoTorque::Disable { kind, repeats_sent, next_repeat_at, mit_fenced }) => {
-                self.poll_disable(kind, repeats_sent, next_repeat_at, mit_fenced)
-            }
+            Some(DamiaoTorque::Disable {
+                kind,
+                repeats_sent,
+                repeat_pass_mask,
+                next_repeat_at,
+                mit_fenced,
+            }) => self.poll_disable(kind, repeats_sent, repeat_pass_mask, next_repeat_at, mit_fenced),
         };
         self.rx_deadline = None;
         self.rx_frame_limit = None;
@@ -12708,8 +13032,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         self.begin_disable_budgeted(kind, Some(max_rx_frames))
     }
 
-    fn begin_client_park_disable(
+    fn begin_client_park_disable_with_kind(
         &mut self,
+        kind: DisableKind,
         max_rx_frames: Option<u16>,
         expected_stop_gen: Option<u64>,
     ) -> Result<TorqueProgress, ArmDriverError> {
@@ -12718,13 +13043,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 "UNSUPPORTED: CAN transport does not support non-blocking RT I/O".into(),
             ));
         }
-        let started_at = self.now();
-        self.begin_disable_inner(
-            DisableKind::DisableRequested { started_at },
-            max_rx_frames,
-            true,
-            expected_stop_gen,
-        )
+        self.begin_disable_inner(kind, max_rx_frames, true, expected_stop_gen)
     }
 
     fn poll_torque(&mut self, deadline: Instant) -> Result<TorqueProgress, ArmDriverError> {

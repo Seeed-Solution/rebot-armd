@@ -682,7 +682,11 @@ pub enum EnableOrigin {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisableOrigin {
     BrokerTransition,
-    Park { watchdog: bool, action_id: Option<u64> },
+    Park {
+        watchdog: bool,
+        action_id: Option<u64>,
+        expected_stop_gen: Option<u64>,
+    },
 }
 
 /// Immediate outcome of starting a park `holding_after_clear` rearm transition.
@@ -717,6 +721,9 @@ pub(crate) enum BackgroundDisableRetry {
         kind: crate::driver::DisableKind,
         started_at: Instant,
         next_retry_at: Instant,
+        /// When `Some(expected_stop_gen)`, this retry belongs to a client-initiated park and MUST
+        /// dispatch via `begin_client_park_disable_with_kind` (cancelling immediately if Stop arrived).
+        client_park: Option<Option<u64>>,
     },
     Exhausted,
 }
@@ -1526,6 +1533,7 @@ impl SupervisorInner {
         }
         if is_protective {
             self.mit_torque_off();
+            self.active_disable_client_park = None;
         }
         self.active_disable_kind = Some(kind);
         self.disable_requested();
@@ -1591,7 +1599,7 @@ impl SupervisorInner {
                                 DisableOrigin::BrokerTransition => {
                                     self.core.begin_transition(Err("FEEDBACK_UNAVAILABLE"));
                                 }
-                                DisableOrigin::Park { watchdog, action_id } => {
+                                DisableOrigin::Park { watchdog, action_id, .. } => {
                                     self.finish_park_disable_failed(
                                         watchdog,
                                         action_id,
@@ -1640,7 +1648,7 @@ impl SupervisorInner {
                                 DisableOrigin::BrokerTransition => {
                                     self.core.begin_transition(Err(code));
                                 }
-                                DisableOrigin::Park { watchdog, action_id } => {
+                                DisableOrigin::Park { watchdog, action_id, .. } => {
                                     self.finish_park_disable_failed(
                                         watchdog,
                                         action_id,
@@ -1685,7 +1693,7 @@ impl SupervisorInner {
                                 let terminal = self.torque_off_finish_rt().map(|()| Rt::Done);
                                 self.core.begin_transition(terminal);
                             }
-                            DisableOrigin::Park { watchdog, action_id } => {
+                            DisableOrigin::Park { watchdog, action_id, .. } => {
                                 self.finish_park_disable_after_accepted(watchdog, action_id);
                             }
                         }
@@ -1709,7 +1717,7 @@ impl SupervisorInner {
                         DisableOrigin::BrokerTransition => {
                             self.core.begin_transition(Err("FEEDBACK_UNAVAILABLE"));
                         }
-                        DisableOrigin::Park { watchdog, action_id } => {
+                        DisableOrigin::Park { watchdog, action_id, .. } => {
                             self.finish_park_disable_failed(
                                 watchdog,
                                 action_id,
@@ -1795,7 +1803,7 @@ impl SupervisorInner {
                                     DisableOrigin::BrokerTransition => {
                                         self.core.begin_transition(Err(code));
                                     }
-                                    DisableOrigin::Park { watchdog, action_id } => {
+                                    DisableOrigin::Park { watchdog, action_id, .. } => {
                                         self.finish_park_disable_failed(
                                             watchdog,
                                             action_id,
@@ -1850,7 +1858,7 @@ impl SupervisorInner {
                                 DisableOrigin::BrokerTransition => {
                                     self.core.begin_transition(Err(code));
                                 }
-                                DisableOrigin::Park { watchdog, action_id } => {
+                                DisableOrigin::Park { watchdog, action_id, .. } => {
                                     self.finish_park_disable_failed(
                                         watchdog,
                                         action_id,
@@ -1905,7 +1913,7 @@ impl SupervisorInner {
                         DisableOrigin::BrokerTransition => {
                             self.core.begin_transition(Err(code));
                         }
-                        DisableOrigin::Park { watchdog, action_id } => {
+                        DisableOrigin::Park { watchdog, action_id, .. } => {
                             self.finish_park_disable_failed(
                                 watchdog,
                                 action_id,
@@ -1957,7 +1965,7 @@ impl SupervisorInner {
                         .map_err(|e| torque_error_code(&e));
                     self.core.begin_transition(terminal);
                 }
-                DisableOrigin::Park { watchdog, action_id } => {
+                DisableOrigin::Park { watchdog, action_id, .. } => {
                     self.finish_park_disable_after_accepted(watchdog, action_id);
                 }
             }
@@ -2022,6 +2030,7 @@ impl SupervisorInner {
         self.pending_rearm = false;
         self.disable_pending = false;
         self.active_disable_kind = None;
+        self.active_disable_client_park = None;
         self.background_disable_retry = None;
         self.gripper_hold_vel_ceiling = None;
         self.enable_lifecycle = EnableLifecycle::Disarmed;
@@ -2634,6 +2643,23 @@ impl SupervisorInner {
         Some(retry_kind)
     }
 
+    #[inline]
+    pub(crate) fn client_park_stop_invalidated(&self, expected_stop_gen: Option<u64>) -> bool {
+        self.e_stop_latched.load(Ordering::SeqCst)
+            || self.estop_pending()
+            || self.urgent_stop_unapplied()
+            || expected_stop_gen.is_some_and(|g| self.current_stop_gen() != g)
+    }
+
+    #[inline]
+    pub(crate) fn clear_active_disable_retry_state(&mut self) {
+        self.disable_pending = false;
+        self.active_disable_kind = None;
+        self.active_disable_client_park = None;
+        self.last_disable_attempt = None;
+        self.background_disable_retry = None;
+    }
+
     /// Arms bounded [`BackgroundDisableRetry`] retrying immediately on the next release
     /// (`next_retry_at: drv_now`), used for committed partial disables (R12 B3) and contended
     /// protective thermal cuts (R12 B4).
@@ -2647,6 +2673,16 @@ impl SupervisorInner {
             Some(BackgroundDisableRetry::Exhausted)
         ) {
             return false;
+        }
+        let client_park = if matches!(kind, crate::driver::DisableKind::DisableProtective { .. }) {
+            None
+        } else {
+            self.active_disable_client_park
+        };
+        if let Some(expected_stop_gen) = client_park {
+            if self.client_park_stop_invalidated(expected_stop_gen) {
+                return false;
+            }
         }
         let origin = match kind {
             crate::driver::DisableKind::DisableRequested { started_at, .. } => started_at,
@@ -2663,6 +2699,7 @@ impl SupervisorInner {
                 kind,
                 started_at: origin,
                 next_retry_at: drv_now,
+                client_park,
             });
         }
         true
@@ -2683,6 +2720,16 @@ impl SupervisorInner {
         ) {
             return false;
         }
+        let client_park = if matches!(kind, crate::driver::DisableKind::DisableProtective { .. }) {
+            None
+        } else {
+            self.active_disable_client_park
+        };
+        if let Some(expected_stop_gen) = client_park {
+            if self.client_park_stop_invalidated(expected_stop_gen) {
+                return false;
+            }
+        }
         let origin = match kind {
             crate::driver::DisableKind::DisableRequested { started_at, .. } => started_at,
             crate::driver::DisableKind::DisableProtective { .. } => drv_now,
@@ -2698,6 +2745,7 @@ impl SupervisorInner {
                 kind,
                 started_at: origin,
                 next_retry_at: drv_now + BACKGROUND_DISABLE_RETRY_INTERVAL,
+                client_park,
             });
         }
         true
@@ -2737,6 +2785,13 @@ impl SupervisorInner {
         };
         let control_release_seq = self.control_release_seq;
         let retry_kind = self.active_disable_kind;
+        let client_park = self.active_disable_client_park;
+        if let Some(expected_stop_gen) = client_park {
+            if self.client_park_stop_invalidated(expected_stop_gen) {
+                self.clear_active_disable_retry_state();
+                return true;
+            }
+        }
         let step = {
             let Ok(mut drv) = d.lock() else {
                 return false;
@@ -2756,7 +2811,11 @@ impl SupervisorInner {
                 let k = retry_kind.unwrap_or(crate::driver::DisableKind::DisableRequested {
                     started_at: drv_now,
                 });
-                drv.begin_disable_torque(k)
+                if let Some(expected_stop_gen) = client_park {
+                    drv.begin_client_park_disable_with_kind(k, None, expected_stop_gen)
+                } else {
+                    drv.begin_disable_torque(k)
+                }
             };
             let post_now = drv.clock_now();
             let frames_dispatched = drv.disable_frames_dispatched();
@@ -2826,6 +2885,14 @@ impl SupervisorInner {
                 }
             }
             Err(e) => {
+                if let Some(expected_stop_gen) = client_park {
+                    if crate::driver::is_estop_inhibited(&e)
+                        || self.client_park_stop_invalidated(expected_stop_gen)
+                    {
+                        self.clear_active_disable_retry_state();
+                        return true;
+                    }
+                }
                 if frames_dispatched {
                     self.disable_first_frame_accepted();
                 }
@@ -4510,6 +4577,7 @@ impl SupervisorInner {
         };
         if let Some((_, _, disable_kind, _, _)) = started {
             self.active_disable_kind = Some(disable_kind);
+            self.active_disable_client_park = None;
         }
         Ok(match started {
             None => {
@@ -4880,6 +4948,7 @@ impl SupervisorInner {
         self.commanded_velocities.fill(0.0);
         self.background_disable_retry = None;
         self.active_disable_kind = Some(disable_kind);
+        self.active_disable_client_park = (!watchdog).then_some(expected_stop_gen);
         self.disable_requested_at(requested_at);
 
         match res {
@@ -4888,7 +4957,11 @@ impl SupervisorInner {
                     self.disable_first_frame_accepted();
                 }
                 self.torque_transition = Some(TorqueTransition::Disable {
-                    origin: DisableOrigin::Park { watchdog, action_id },
+                    origin: DisableOrigin::Park {
+                        watchdog,
+                        action_id,
+                        expected_stop_gen,
+                    },
                     kind: disable_kind,
                 });
             }
@@ -4924,23 +4997,35 @@ impl SupervisorInner {
                     crate::driver::ArmDriverError::TorqueOffWouldDrop
                         | crate::driver::ArmDriverError::DisableRequestExpired
                 );
-                let partial_remaining = self.is_partial_disable_remaining(dispatched_mask);
-                let partial_retry = self.commit_partial_disable_retry_kind(
-                    disable_kind,
-                    post_now,
-                    frames_dispatched,
-                    partial_remaining,
-                );
-                if let Some(rk) = partial_retry {
-                    let _ = self.arm_background_disable_retry_immediate_with_kind(rk, post_now);
-                } else if !refused {
-                    let _ = self.arm_background_disable_retry_with_kind(disable_kind, post_now);
-                }
-                let code = self.disable_step_failed_inner(e, partial_retry.is_some());
-                let text = if refused && !frames_dispatched {
-                    "Park torque-off refused by rest-pose gate"
+                let client_park_stopped =
+                    !watchdog && self.client_park_stop_invalidated(expected_stop_gen);
+                let (code, text) = if client_park_stopped {
+                    // Stop arrived mid-batch after partial motor disable: NEVER hand the remaining
+                    // undispatched motors to an unstamped retry; hold remaining energized motors
+                    // and latch `DriverWriteFailed`.
+                    self.clear_active_disable_retry_state();
+                    let code = self.disable_step_failed_inner(e, false);
+                    (code, "Client park disable stopped mid-batch")
                 } else {
-                    "Torque disable transmission failed"
+                    let partial_remaining = self.is_partial_disable_remaining(dispatched_mask);
+                    let partial_retry = self.commit_partial_disable_retry_kind(
+                        disable_kind,
+                        post_now,
+                        frames_dispatched,
+                        partial_remaining,
+                    );
+                    if let Some(rk) = partial_retry {
+                        let _ = self.arm_background_disable_retry_immediate_with_kind(rk, post_now);
+                    } else if !refused {
+                        let _ = self.arm_background_disable_retry_with_kind(disable_kind, post_now);
+                    }
+                    let code = self.disable_step_failed_inner(e, partial_retry.is_some());
+                    let text = if refused && !frames_dispatched {
+                        "Park torque-off refused by rest-pose gate"
+                    } else {
+                        "Torque disable transmission failed"
+                    };
+                    (code, text)
                 };
                 self.finish_park_disable_failed(watchdog, action_id, code, text);
             }
@@ -5176,8 +5261,15 @@ impl SupervisorInner {
                                     attempts,
                                     kind,
                                     started_at,
+                                    client_park,
                                     ..
                                 }) => {
+                                    if let Some(expected_stop_gen) = client_park {
+                                        if self.client_park_stop_invalidated(expected_stop_gen) {
+                                            self.clear_active_disable_retry_state();
+                                            return rx;
+                                        }
+                                    }
                                     let window = self.background_disable_window_for(kind);
                                     if post_now.saturating_duration_since(started_at) >= window
                                         || attempts >= BACKGROUND_DISABLE_MAX_RETRIES
@@ -5190,6 +5282,7 @@ impl SupervisorInner {
                                                 kind,
                                                 started_at,
                                                 next_retry_at: post_now,
+                                                client_park,
                                             });
                                     }
                                 }
@@ -5237,8 +5330,15 @@ impl SupervisorInner {
                                 attempts,
                                 kind,
                                 started_at,
+                                client_park,
                                 ..
                             }) => {
+                                if let Some(expected_stop_gen) = client_park {
+                                    if self.client_park_stop_invalidated(expected_stop_gen) {
+                                        self.clear_active_disable_retry_state();
+                                        return rx;
+                                    }
+                                }
                                 let window = self.background_disable_window_for(kind);
                                 let window_expired =
                                     post_now.saturating_duration_since(started_at) >= window;
@@ -5247,10 +5347,7 @@ impl SupervisorInner {
                                     && self.torque_off_stopped()
                                     && !frames_dispatched
                                 {
-                                    self.disable_pending = false;
-                                    self.active_disable_kind = None;
-                                    self.last_disable_attempt = None;
-                                    self.background_disable_retry = None;
+                                    self.clear_active_disable_retry_state();
                                 } else if window_expired
                                     || (!still_pending && attempts >= BACKGROUND_DISABLE_MAX_RETRIES)
                                 {
@@ -5270,6 +5367,7 @@ impl SupervisorInner {
                                             } else {
                                                 post_now + BACKGROUND_DISABLE_RETRY_INTERVAL
                                             },
+                                            client_park,
                                         });
                                 }
                             }
@@ -5313,10 +5411,17 @@ impl SupervisorInner {
             kind,
             started_at,
             next_retry_at,
+            client_park,
         }) = self.background_disable_retry
         else {
             return None;
         };
+        if let Some(expected_stop_gen) = client_park {
+            if self.client_park_stop_invalidated(expected_stop_gen) {
+                self.clear_active_disable_retry_state();
+                return None;
+            }
+        }
         let window = self.background_disable_window_for(kind);
         let window_expired = drv_now.saturating_duration_since(started_at) >= window;
         if window_expired
@@ -5324,10 +5429,7 @@ impl SupervisorInner {
             && self.torque_off_stopped()
             && self.torque_intent != TorqueIntent::Off
         {
-            self.disable_pending = false;
-            self.active_disable_kind = None;
-            self.last_disable_attempt = None;
-            self.background_disable_retry = None;
+            self.clear_active_disable_retry_state();
             return None;
         }
         if attempts >= BACKGROUND_DISABLE_MAX_RETRIES || window_expired {
@@ -5344,7 +5446,11 @@ impl SupervisorInner {
                 Err(std::sync::TryLockError::WouldBlock) => Err(true),
                 Err(std::sync::TryLockError::Poisoned(_)) => Err(false),
                 Ok(mut drv) => {
-                    let res = drv.begin_disable_torque_budgeted(kind, 0);
+                    let res = if let Some(expected_stop_gen) = client_park {
+                        drv.begin_client_park_disable_with_kind(kind, Some(0), expected_stop_gen)
+                    } else {
+                        drv.begin_disable_torque_budgeted(kind, 0)
+                    };
                     let handshake_pending = drv.torque_transition_pending();
                     let frames_dispatched = drv.disable_frames_dispatched();
                     let dispatched_mask = drv.disable_dispatched_mask();
@@ -5405,7 +5511,15 @@ impl SupervisorInner {
                     self.disable_first_frame_accepted();
                 }
             }
-            Err(_) => {
+            Err(e) => {
+                if let Some(expected_stop_gen) = client_park {
+                    if crate::driver::is_estop_inhibited(&e)
+                        || self.client_park_stop_invalidated(expected_stop_gen)
+                    {
+                        self.clear_active_disable_retry_state();
+                        return None;
+                    }
+                }
                 if frames_dispatched {
                     self.disable_first_frame_accepted();
                 }
@@ -5419,10 +5533,7 @@ impl SupervisorInner {
             && self.torque_off_stopped()
             && !frames_dispatched
         {
-            self.disable_pending = false;
-            self.active_disable_kind = None;
-            self.last_disable_attempt = None;
-            self.background_disable_retry = None;
+            self.clear_active_disable_retry_state();
         } else if window_expired || (!handshake_pending && next_attempts >= BACKGROUND_DISABLE_MAX_RETRIES)
         {
             self.exhaust_background_disable_retry();
@@ -5440,6 +5551,7 @@ impl SupervisorInner {
                 } else {
                     post_now + BACKGROUND_DISABLE_RETRY_INTERVAL
                 },
+                client_park,
             });
         }
         None
@@ -5492,7 +5604,7 @@ impl SupervisorInner {
             }
             TorqueTransition::Disable { origin, kind } => {
                 if self.driver.is_none() {
-                    if let DisableOrigin::Park { watchdog, action_id } = origin {
+                    if let DisableOrigin::Park { watchdog, action_id, .. } = origin {
                         self.finish_park_disable_failed(
                             watchdog,
                             action_id,
@@ -5566,7 +5678,7 @@ impl SupervisorInner {
                         });
                     }
                     Err(false) => {
-                        if let DisableOrigin::Park { watchdog, action_id } = origin {
+                        if let DisableOrigin::Park { watchdog, action_id, .. } = origin {
                             self.finish_park_disable_failed(
                                 watchdog,
                                 action_id,
@@ -5601,23 +5713,25 @@ impl SupervisorInner {
                             let progress = self.torque_off_finish_rt().map(|()| Rt::Done);
                             Some(TransitionPoll { progress, rx, broker_owned })
                         }
-                        DisableOrigin::Park { watchdog, action_id } => {
+                        DisableOrigin::Park { watchdog, action_id, .. } => {
                             self.complete_park_disable_accepted(watchdog, action_id);
                             Some(TransitionPoll { progress: Ok(Rt::Done), rx, broker_owned })
                         }
                     },
                     Err(e) => {
-                        if let DisableOrigin::Park { watchdog: false, action_id } = origin {
+                        if let DisableOrigin::Park {
+                            watchdog: false,
+                            action_id,
+                            ..
+                        } = origin
+                        {
                             if !frames_dispatched
                                 && crate::driver::is_estop_inhibited(&e)
                                 && !self.e_stop_latched.load(Ordering::SeqCst)
                                 && !self.estop_pending()
                                 && !self.safety.state().is_stopped()
                             {
-                                self.disable_pending = false;
-                                self.active_disable_kind = None;
-                                self.last_disable_attempt = None;
-                                self.background_disable_retry = None;
+                                self.clear_active_disable_retry_state();
                                 self.cancel_park_before_disable(action_id);
                                 return Some(TransitionPoll {
                                     progress: Err("STOPPED"),
@@ -5627,7 +5741,7 @@ impl SupervisorInner {
                             }
                         }
                         if crate::driver::is_estop_inhibited(&e) {
-                            if let DisableOrigin::Park { watchdog, action_id } = origin {
+                            if let DisableOrigin::Park { watchdog, action_id, .. } = origin {
                                 self.finish_park_disable_failed(
                                     watchdog,
                                     action_id,
@@ -5646,25 +5760,48 @@ impl SupervisorInner {
                             crate::driver::ArmDriverError::TorqueOffWouldDrop
                                 | crate::driver::ArmDriverError::DisableRequestExpired
                         );
-                        let partial_remaining = self.is_partial_disable_remaining(dispatched_mask);
-                        let partial_retry = self.commit_partial_disable_retry_kind(
-                            kind,
-                            post_now,
-                            frames_dispatched,
-                            partial_remaining,
+                        let client_park_stopped = matches!(
+                            origin,
+                            DisableOrigin::Park {
+                                watchdog: false,
+                                expected_stop_gen,
+                                ..
+                            } if self.client_park_stop_invalidated(expected_stop_gen)
                         );
-                        if let Some(rk) = partial_retry {
-                            let _ = self.arm_background_disable_retry_immediate_with_kind(rk, post_now);
-                        } else if !refused {
-                            let _ = self.arm_background_disable_retry_with_kind(kind, post_now);
-                        }
-                        let code = self.disable_step_failed_inner(e, partial_retry.is_some());
-                        if let DisableOrigin::Park { watchdog, action_id } = origin {
+                        let (code, text) = if client_park_stopped {
+                            self.clear_active_disable_retry_state();
+                            let code = self.disable_step_failed_inner(e, false);
+                            (code, "Client park disable stopped mid-batch")
+                        } else {
+                            if let DisableOrigin::Park {
+                                watchdog: false,
+                                expected_stop_gen,
+                                ..
+                            } = origin
+                            {
+                                self.active_disable_client_park = Some(expected_stop_gen);
+                            }
+                            let partial_remaining = self.is_partial_disable_remaining(dispatched_mask);
+                            let partial_retry = self.commit_partial_disable_retry_kind(
+                                kind,
+                                post_now,
+                                frames_dispatched,
+                                partial_remaining,
+                            );
+                            if let Some(rk) = partial_retry {
+                                let _ = self.arm_background_disable_retry_immediate_with_kind(rk, post_now);
+                            } else if !refused {
+                                let _ = self.arm_background_disable_retry_with_kind(kind, post_now);
+                            }
+                            let code = self.disable_step_failed_inner(e, partial_retry.is_some());
                             let text = if refused && !frames_dispatched {
                                 "Park torque-off refused by rest-pose gate"
                             } else {
                                 "Torque disable transmission failed"
                             };
+                            (code, text)
+                        };
+                        if let DisableOrigin::Park { watchdog, action_id, .. } = origin {
                             self.finish_park_disable_failed(watchdog, action_id, code, text);
                         }
                         Some(TransitionPoll {
