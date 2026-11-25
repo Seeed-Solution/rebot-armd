@@ -823,12 +823,7 @@ async fn prepare_config_write_off_thread(
                 code: "INVALID_COMMAND".into(),
                 message: "id must be a string".into(),
             })?;
-            if pub_cfg
-                .sequences
-                .pins
-                .as_ref()
-                .is_some_and(|p| p.sequence_id == id)
-            {
+            if pub_cfg.is_sequence_running(id) {
                 return Err(ArmError::Rejected {
                     status: 409,
                     code: "SEQUENCE_RUNNING".into(),

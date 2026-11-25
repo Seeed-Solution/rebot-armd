@@ -990,12 +990,14 @@ impl ActionPrepEnv {
             }),
             None => (true, !inner.loads.is_empty()),
         };
+        let mut sequences = inner.sequences.clone();
+        sequences.pins = inner.active_sequence_pins().cloned();
         Self {
             config: inner.config.clone(),
             workspace_policy: inner.workspace_policy().map(|(ws, _)| ws.clone()),
             power_budget: inner.power_budget().cloned(),
             poses: inner.poses.list.clone(),
-            sequences: inner.sequences.clone(),
+            sequences,
             grasp_setup: inner.grasp_setup(),
             episodes: inner.episodes.clone(),
             gripper_close_speed_limit: inner.gripper_close_speed_limit(),

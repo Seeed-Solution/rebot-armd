@@ -43,7 +43,7 @@ use armd::rt_core::ops::PlanSlot;
 use armd::rt_core::urgent::StopRequests;
 use armd::supervisor::OWNER_EXECUTOR;
 use armd::supervisor_lock::{HoldKind, SupervisorLock};
-use armd::transport::{CanFrame, CanTransport, DriverClock, TransportError};
+use armd::transport::{CanFrame, CanTransport, DriverClock, MockClock, TransportError};
 use armd::{ArmConfig, ArmSupervisor, SafetyState};
 use mit_support::FakeBus;
 
@@ -1110,7 +1110,10 @@ fn production_executor_bus_trace_dynamic_output_inhibited_while_legacy_writer_he
             .build()
             .unwrap();
         rt.block_on(async move {
-            let fake_bus = FakeBus::new(&dm_limits());
+            // Use an injected driver clock and a 20 ms release period matching `ArmConfig::rebot_dm()`
+            // (50 Hz) so OS scheduling jitter under CPU load cannot spuriously trip wall-clock
+            // `DAMIAO_TX_FRAME_MAX_AGE` (45 ms), `resolved_tx_stall_ticks()` (4), or `BUS_LOSS_TIMEOUT`.
+            let fake_bus = FakeBus::with_clock(&dm_limits(), MockClock::new());
             fake_bus.with(|s| {
                 s.immediate_replies = true;
                 s.record_tx_log = false;
@@ -1128,7 +1131,7 @@ fn production_executor_bus_trace_dynamic_output_inhibited_while_legacy_writer_he
             sup.set_lease_enabled(false).await;
             sup.register_ws_connection(1).await.unwrap();
             let handle = sup
-                .start_executor(ExecutorConfig::for_tests(Duration::from_millis(5)))
+                .start_executor(ExecutorConfig::for_tests(Duration::from_millis(20)))
                 .await
                 .expect("start production executor with DamiaoArmDriver<TracingBus>");
             assert_eq!(sup.owner_mode(), OWNER_EXECUTOR);
@@ -1173,6 +1176,17 @@ fn production_executor_bus_trace_dynamic_output_inhibited_while_legacy_writer_he
             ));
 
             wait_until_deadline(deadline, "bus-triggered mid-batch urgent stop applied", || {
+                assert!(!handle.is_exited(), "executor exited unexpectedly before mid-batch stop");
+                if let Some(s) = sup.hub().latest() {
+                    assert!(
+                        !matches!(s.obs.safety_state, SafetyState::Fault(_)),
+                        "executor faulted before mid-batch stop: state={:?} j1_seen={} triggered_gen={} applied={}",
+                        s.obs.safety_state,
+                        bus.advancing_j1_seen.load(Ordering::Acquire),
+                        bus.triggered_gen.load(Ordering::Acquire),
+                        handle.stop_requests().applied(),
+                    );
+                }
                 let gen = bus.triggered_gen.load(Ordering::Acquire);
                 gen > 0 && handle.stop_requests().applied() == gen
             });

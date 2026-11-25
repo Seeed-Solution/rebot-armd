@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures_util::StreamExt;
 use armd::model::ArmConfig;
 use armd::sequences::{Sequence, Step};
 use armd::ArmSupervisor;
@@ -179,18 +180,32 @@ impl Rig {
         }
         each(&a);
         if !a.is_running() { return (a, seen); }
-        let mut last_drain = Instant::now();
+        let deadline = tokio::time::sleep_until(tokio::time::Instant::from_std(until));
+        tokio::pin!(deadline);
+        let mut ws_open = true;
         loop {
-            assert!(Instant::now() < until, "action {id} did not end in {max_s} s");
-            if last_drain.elapsed() > Duration::from_millis(100) {
-                common::drain(&mut self.ws, 1).await;
-                last_drain = Instant::now();
-            }
-            let obs = match tokio::time::timeout(Duration::from_millis(20), rx.recv()).await {
-                Ok(Ok(obs)) if obs.timestamp <= first_ts => continue,
-                Ok(Ok(obs)) => obs,
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) | Err(_) => self.sup.get_observation().await,
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => panic!("telemetry channel closed while waiting for action {id}"),
+            // Wait directly on telemetry broadcasts while draining WS frames concurrently:
+            // avoids the 20 ms `rx.recv()` timeout that raced with 20 ms real-time pacing and
+            // fell back to `get_observation()`, skipping queued step observations under load.
+            let obs = tokio::select! {
+                biased;
+                res = rx.recv() => match res {
+                    Ok(obs) if obs.timestamp <= first_ts => continue,
+                    Ok(obs) => obs,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        panic!("telemetry channel closed while waiting for action {id}")
+                    }
+                },
+                msg = self.ws.next(), if ws_open => {
+                    if !matches!(msg, Some(Ok(_))) {
+                        ws_open = false;
+                    }
+                    continue;
+                }
+                _ = &mut deadline => {
+                    panic!("action {id} did not end in {max_s} s");
+                }
             };
             let a = obs.action.into_iter().chain(obs.previous_action).find(|a| a.id == id).expect("the action");
             if let (Some(r), Some(k)) = (a.repeat_index, a.step_index) {
