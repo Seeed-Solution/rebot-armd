@@ -600,6 +600,10 @@ impl StatePublisher {
 
     pub fn hub(&self) -> &Arc<StateHub> { &self.hub }
 
+    /// Exact sequence number the next [`Self::publish_with_owner`] will store in `hub.published`.
+    #[inline]
+    pub fn next_seq(&self) -> u64 { self.seq + 1 }
+
     /// Moves the observation out of the slot the next [`Self::publish`] writes (see
     /// `ArmCore::take_observation_buffer`).
     pub fn take_back_observation(&mut self) -> Option<ArmObservation> { self.producer.back_mut().obs.take() }
@@ -723,9 +727,6 @@ pub struct StateHub {
     /// ID (never touched on `armd-control`; bounded to 16 entries). Attached in [`Self::refresh`]
     /// to `obs.action` and `obs.previous_action` before any snapshot or terminal is delivered.
     action_measurements: Mutex<std::collections::HashMap<u64, serde_json::Value>>,
-    /// Bounded off-RT sidecar store of full untruncated `durability_warning` strings keyed by
-    /// action ID (cap 64; never touched on `armd-control`).
-    action_durability_warnings: Mutex<std::collections::HashMap<u64, String>>,
     /// Pre-publication policy diagnostic seal watermark shared with `SupervisorInner` (never
     /// locked on `armd-control`).
     #[cfg(feature = "policy-runtime")]
@@ -764,7 +765,6 @@ pub fn state_channel(dof: usize) -> (StatePublisher, Arc<StateHub>) {
         schema_cache: Mutex::new(None),
         prep_env: Mutex::new(None),
         action_measurements: Mutex::new(std::collections::HashMap::new()),
-        action_durability_warnings: Mutex::new(std::collections::HashMap::new()),
         #[cfg(feature = "policy-runtime")]
         policy_diag_sealed: OnceLock::new(),
         #[cfg(feature = "policy-runtime")]
@@ -1074,7 +1074,8 @@ impl StateHub {
         self.prep_env.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    /// Records an off-RT measurement payload for action `id` (bounded to 16 entries) and patches
+    /// Records an off-RT measurement payload for action `id` (bounded to `TERMINAL_FIFO_CAPACITY`
+    /// entries so sidecars survive across the full terminal reservation window) and patches
     /// the cached latest snapshot if it already carries `id` without a measurement. Never called
     /// on `armd-control`; lock order is strictly `state -> action_measurements` (never nested in
     /// reverse).
@@ -1085,7 +1086,7 @@ impl StateHub {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             map.insert(id, value.clone());
-            while map.len() > 16 {
+            while map.len() > crate::supervisor::TERMINAL_FIFO_CAPACITY {
                 if let Some(&oldest) = map.keys().min() {
                     map.remove(&oldest);
                 } else {
@@ -1137,45 +1138,18 @@ impl StateHub {
             .cloned()
     }
 
-    /// Records a worker-owned untruncated durability warning for `action_id` off-RT so
-    /// `OffThreadSinks::drain_rt_terminals` preserves full warnings (>160 UTF-8 bytes) on the
-    /// very first terminal frame without RT allocation.
-    pub fn record_action_durability_warning(&self, id: u64, warning: String) {
-        if id == 0 {
+    /// Populates `action.measurement` from the off-RT sidecar store when missing.
+    pub fn attach_action_measurement_to_action(&self, action: &mut crate::motion::ActionStatus) {
+        if action.measurement.is_some() {
             return;
         }
-        let mut g = self
-            .action_durability_warnings
+        let map = self
+            .action_measurements
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if g.len() >= 64 && !g.contains_key(&id) {
-            if let Some(&oldest) = g.keys().min() {
-                g.remove(&oldest);
-            }
+        if let Some(v) = map.get(&action.id) {
+            action.measurement = Some(v.clone());
         }
-        g.insert(id, warning);
-    }
-
-    /// Returns the full untruncated durability warning for `action_id`, if recorded off-RT.
-    pub fn action_durability_warning(&self, id: u64) -> Option<String> {
-        self.action_durability_warnings
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&id)
-            .cloned()
-    }
-
-    /// Returns the latest recorded `PolicyStats` for `action_id`, if any (used by off-RT
-    /// `OffThreadSinks::drain_rt_terminals` so the first terminal frame preserves `policy_stats`).
-    #[cfg(feature = "policy-runtime")]
-    pub fn action_policy_stats(&self, id: u64) -> Option<crate::motion::PolicyStats> {
-        let g = self.policy_diag.lock().unwrap_or_else(|e| e.into_inner());
-        g.iter().find(|e| e.action_id == id).map(|e| e.stats)
-    }
-
-    #[cfg(not(feature = "policy-runtime"))]
-    pub fn action_policy_stats(&self, _id: u64) -> Option<crate::motion::PolicyStats> {
-        None
     }
 
     /// Populates `obs.action.measurement` and `obs.previous_action.measurement` from the off-RT

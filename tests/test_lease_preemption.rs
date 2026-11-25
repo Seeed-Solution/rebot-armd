@@ -355,7 +355,7 @@ async fn test_fail_closed_driver_lock_poison_protection() {
         Arc::try_unwrap(m).map_err(|_| "unwrap failed").unwrap()
     };
 
-    inner.driver = Some(poisoned_mutex);
+    inner.driver = Some(armd::supervisor_lock::DriverSlot::from_mutex(poisoned_mutex));
     inner.is_torqued = true;
 
     // 1. Preempt with poisoned driver: ZERO PANIC, Fail-Closed into Cat 4
@@ -700,6 +700,7 @@ fn test_dormant_disabled_arm_with_stale_feedback_preempts_without_handover_fault
 
     let mut inner = SupervisorInner::new(test_config())
         .with_driver(Box::new(DormantDriver { _motor_status: vec![0, 0] }));
+    inner.torque_intent = armd::TorqueIntent::Off;
 
     // Verify initial conditions: unpowered, idle, dormant stale feedback
     assert!(!inner.is_torqued);

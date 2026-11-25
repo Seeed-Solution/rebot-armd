@@ -984,18 +984,20 @@ impl ActionPrepEnv {
     /// at startup, before executor transfer, and after config mutations).
     pub fn from_inner(inner: &SupervisorInner) -> Self {
         let (has_torque_feedback, has_load_feedback) = match inner.driver.as_ref() {
-            Some(d) => d.lock().map_or((false, false), |drv| {
+            Some(d) => d.with_ref(|drv| {
                 let caps = drv.capabilities();
                 (caps.torque_feedback, caps.load_feedback)
-            }),
+            }).unwrap_or((false, false)),
             None => (true, !inner.loads.is_empty()),
         };
+        let mut sequences = inner.sequences.clone();
+        sequences.pins = inner.active_sequence_pins().cloned();
         Self {
             config: inner.config.clone(),
             workspace_policy: inner.workspace_policy().map(|(ws, _)| ws.clone()),
             power_budget: inner.power_budget().cloned(),
             poses: inner.poses.list.clone(),
-            sequences: inner.sequences.clone(),
+            sequences,
             grasp_setup: inner.grasp_setup(),
             episodes: inner.episodes.clone(),
             gripper_close_speed_limit: inner.gripper_close_speed_limit(),
@@ -3218,6 +3220,9 @@ pub fn install_move_joint(
             if let Some(outcome) = prep.approach_outcome {
                 if let Some(a) = this.last_action.as_mut().filter(|a| a.id == id) {
                     outcome.apply(a);
+                }
+                if let Some(a) = this.last_action.as_ref().filter(|a| a.id == id) {
+                    this.mirror_rich_action_off_rt(a);
                 }
             }
             Ok((id, duration))

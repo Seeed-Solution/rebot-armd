@@ -63,6 +63,7 @@ thread_local! {
     static CURRENT_WAKE_LATENESS_NS: Cell<u64> = const { Cell::new(0) };
     static PERIODIC_DEFER_SAMPLE_PUBLISH: Cell<bool> = const { Cell::new(false) };
     static PENDING_PERIODIC_SAMPLE: Cell<Option<TickSample>> = const { Cell::new(None) };
+    static PENDING_PERIODIC_POST_END: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
 }
 
 /// Scoped thread-local handoff carrying raw wakeup lateness (ns) and periodic single-completion
@@ -72,6 +73,7 @@ pub struct WakeLatenessGuard {
     prev_lateness: u64,
     prev_defer_publish: bool,
     prev_pending_sample: Option<TickSample>,
+    prev_pending_post_end: Option<std::time::Instant>,
 }
 
 impl WakeLatenessGuard {
@@ -91,10 +93,14 @@ impl WakeLatenessGuard {
         let prev_pending_sample = PENDING_PERIODIC_SAMPLE
             .try_with(|c| c.replace(None))
             .unwrap_or(None);
+        let prev_pending_post_end = PENDING_PERIODIC_POST_END
+            .try_with(|c| c.replace(None))
+            .unwrap_or(None);
         Self {
             prev_lateness,
             prev_defer_publish,
             prev_pending_sample,
+            prev_pending_post_end,
         }
     }
 }
@@ -105,6 +111,7 @@ impl Drop for WakeLatenessGuard {
         let _ = CURRENT_WAKE_LATENESS_NS.try_with(|c| c.set(self.prev_lateness));
         let _ = PERIODIC_DEFER_SAMPLE_PUBLISH.try_with(|c| c.set(self.prev_defer_publish));
         let _ = PENDING_PERIODIC_SAMPLE.try_with(|c| c.set(self.prev_pending_sample.take()));
+        let _ = PENDING_PERIODIC_POST_END.try_with(|c| c.set(self.prev_pending_post_end.take()));
     }
 }
 
@@ -129,16 +136,37 @@ pub fn periodic_defers_sample_publish() -> bool {
 /// stamps its full `release_us` and publishes it once at release completion.
 #[inline]
 pub fn stash_periodic_sample(sample: TickSample) {
+    stash_periodic_sample_with_post_end(sample, std::time::Instant::now());
+}
+
+/// Stashes the calling thread's prepared legacy `TickSample` together with its `post_end`
+/// monotonic instant so `run_periodic_with_clock` stamps both `release_us` and `phases_us.publish`.
+#[inline]
+pub fn stash_periodic_sample_with_post_end(sample: TickSample, post_end: std::time::Instant) {
     let _ = PENDING_PERIODIC_SAMPLE.try_with(|c| c.set(Some(sample)));
+    let _ = PENDING_PERIODIC_POST_END.try_with(|c| c.set(Some(post_end)));
 }
 
 /// Takes the calling thread's stashed legacy `TickSample` at periodic release completion.
 #[inline]
 pub fn take_periodic_sample() -> Option<TickSample> {
+    let _ = PENDING_PERIODIC_POST_END.try_with(|c| c.take());
     PENDING_PERIODIC_SAMPLE
         .try_with(|c| c.take())
         .ok()
         .flatten()
+}
+
+/// Takes the calling thread's stashed legacy `TickSample` and its `post_end` monotonic instant.
+#[inline]
+pub fn take_periodic_sample_with_post_end() -> Option<(TickSample, std::time::Instant)> {
+    let sample = PENDING_PERIODIC_SAMPLE.try_with(|c| c.take()).ok().flatten()?;
+    let post_end = PENDING_PERIODIC_POST_END
+        .try_with(|c| c.take())
+        .ok()
+        .flatten()
+        .unwrap_or_else(std::time::Instant::now);
+    Some((sample, post_end))
 }
 
 /// Outcome of one CAN `transmit` attempt recorded in the tick's TX diagnostics.
@@ -198,6 +226,92 @@ impl TxTickMetrics {
 
 thread_local! {
     static TX_TICK: Cell<TxTickMetrics> = const { Cell::new(TxTickMetrics::ZERO) };
+}
+
+/// Monotonic counter of stopped-hold TX ticks skipped because `driver.try_lock()` was contended
+/// (L3: stopped-hold TX never blocks on the driver mutex).
+static STOPPED_HOLD_LOCK_CONTENDED: AtomicU64 = AtomicU64::new(0);
+/// Monotonic counter of stopped-hold `try_lock` contention escalations triggered after
+/// `STOPPED_HOLD_CONTENTION_ESCALATE_SKIPS` (25) consecutive contended ticks (0.5 s at 50 Hz).
+static STOPPED_HOLD_CONTENTION_ESCALATIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Record one stopped-hold TX tick skipped due to driver mutex contention (zero allocation).
+#[inline]
+pub fn record_stopped_hold_lock_contended() {
+    STOPPED_HOLD_LOCK_CONTENDED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Total stopped-hold TX ticks skipped due to driver mutex contention since boot.
+#[inline]
+pub fn stopped_hold_lock_contended_count() -> u64 {
+    STOPPED_HOLD_LOCK_CONTENDED.load(Ordering::Relaxed)
+}
+
+/// Reset the stopped-hold driver lock contention counter (tests).
+#[inline]
+pub fn reset_stopped_hold_lock_contended() {
+    STOPPED_HOLD_LOCK_CONTENDED.store(0, Ordering::Relaxed);
+}
+
+/// Record one stopped-hold `try_lock` contention escalation warning/fault (zero allocation).
+#[inline]
+pub fn record_stopped_hold_contention_escalation() {
+    STOPPED_HOLD_CONTENTION_ESCALATIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Total stopped-hold `try_lock` contention escalations since boot.
+#[inline]
+pub fn stopped_hold_contention_escalations_count() -> u64 {
+    STOPPED_HOLD_CONTENTION_ESCALATIONS.load(Ordering::Relaxed)
+}
+
+/// Reset the stopped-hold `try_lock` contention escalation counter (tests).
+#[inline]
+pub fn reset_stopped_hold_contention_escalations() {
+    STOPPED_HOLD_CONTENTION_ESCALATIONS.store(0, Ordering::Relaxed);
+}
+
+/// Monotonic counter of RT disable dispatch/poll ticks skipped because `driver.try_lock()` was
+/// contended (M4: `armd-control` disable paths never block on the driver mutex).
+static DISABLE_LOCK_CONTENDED: AtomicU64 = AtomicU64::new(0);
+/// Monotonic counter of RT disable `try_lock` contention escalations triggered after
+/// `STOPPED_HOLD_CONTENTION_ESCALATE_SKIPS` (25) consecutive contended ticks (0.5 s at 50 Hz).
+static DISABLE_CONTENTION_ESCALATIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Record one RT disable dispatch/poll tick skipped due to driver mutex contention (zero allocation).
+#[inline]
+pub fn record_disable_lock_contended() {
+    DISABLE_LOCK_CONTENDED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Total RT disable dispatch/poll ticks skipped due to driver mutex contention since boot.
+#[inline]
+pub fn disable_lock_contended_count() -> u64 {
+    DISABLE_LOCK_CONTENDED.load(Ordering::Relaxed)
+}
+
+/// Reset the RT disable driver lock contention counter (tests).
+#[inline]
+pub fn reset_disable_lock_contended() {
+    DISABLE_LOCK_CONTENDED.store(0, Ordering::Relaxed);
+}
+
+/// Record one RT disable `try_lock` contention escalation warning/fault (zero allocation).
+#[inline]
+pub fn record_disable_contention_escalation() {
+    DISABLE_CONTENTION_ESCALATIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Total RT disable `try_lock` contention escalations since boot.
+#[inline]
+pub fn disable_contention_escalations_count() -> u64 {
+    DISABLE_CONTENTION_ESCALATIONS.load(Ordering::Relaxed)
+}
+
+/// Reset the RT disable `try_lock` contention escalation counter (tests).
+#[inline]
+pub fn reset_disable_contention_escalations() {
+    DISABLE_CONTENTION_ESCALATIONS.store(0, Ordering::Relaxed);
 }
 
 /// Calling thread's CPU time in nanoseconds from `CLOCK_THREAD_CPUTIME_ID` (Linux; 0 elsewhere).
@@ -304,6 +418,24 @@ pub struct LockPhases {
     pub publish_us: u32,
 }
 
+/// Sub-phase monotonic duration deltas (µs) across `lock_end → release completion`
+/// for the legacy control release.
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+pub struct ReleasePhasesUs {
+    /// `lock_end` → after allocator-counter read (`alloc::take()`).
+    pub alloc_read: u32,
+    /// After allocator-counter read → after legacy E-stop ACK flush.
+    pub ack_flush: u32,
+    /// After ACK flush → after conditional terminal-observation capture.
+    pub terminal: u32,
+    /// After terminal capture → after write-guard drop (`released`).
+    pub guard_drop: u32,
+    /// `released` → post-lock work end (`done`).
+    pub post: u32,
+    /// Post-lock work end (`done`) → ring publication / completion seal.
+    pub publish: u32,
+}
+
 /// What the control thread did while it waited and while it held the lock, from
 /// `getrusage(RUSAGE_THREAD)` and `CLOCK_THREAD_CPUTIME_ID` around the phases (Linux; zero
 /// elsewhere). Valid for the control thread, which polls the tick on one OS thread.
@@ -319,6 +451,9 @@ pub struct ThreadUsage {
     /// Voluntary (blocked, slept) / involuntary (preempted) switches while holding the lock.
     pub lock_vcsw: u32,
     pub lock_ivcsw: u32,
+    /// Voluntary / involuntary context switches across `lock_end → released` (Linux; 0 elsewhere).
+    pub mid_nvcsw: u32,
+    pub mid_nivcsw: u32,
     /// Major / minor page faults during the wait and during the hold.
     pub wait_majflt: u32,
     pub lock_majflt: u32,
@@ -433,6 +568,8 @@ pub struct TickSample {
     pub stats_wait_us: u32,
     #[serde(flatten)]
     pub phases: LockPhases,
+    /// Monotonic sub-phase deltas (µs) across `lock_end → release completion`.
+    pub phases_us: ReleasePhasesUs,
     #[serde(flatten)]
     pub usage: ThreadUsage,
     /// The guard the tick waited for; None when no other guard was released since the
@@ -490,6 +627,9 @@ pub struct Percentiles {
 pub struct TickBreakdown {
     #[serde(flatten)]
     pub sample: TickSample,
+    /// Holder release timestamp → tick acquire timestamp (µs) when `waited_for` is present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handoff_us: Option<i64>,
     /// Ticks recorded after this one (0: the latest tick).
     pub ticks_ago: usize,
 }
@@ -545,6 +685,19 @@ pub struct ObservationCacheStats {
     pub published: u64,
 }
 
+/// Edge-triggered terminal-observation capture counters (`armd-control` -> off-thread drain).
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+pub struct TerminalCaptureStats {
+    /// Edge-triggered terminal records captured on the control release path since boot.
+    pub captured: u64,
+    /// Terminal records dropped because the preallocated SPSC capture ring was saturated.
+    pub saturated: u64,
+    /// Latched indicator set true if capture ring saturation has ever occurred since boot.
+    pub ever_saturated: bool,
+    /// Captured records currently queued in flight awaiting off-thread drain.
+    pub queued: u64,
+}
+
 /// Percentiles of the tick's lock phases.
 #[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
 pub struct LockPhasePercentiles {
@@ -587,6 +740,18 @@ pub struct TxDiagnostics {
     pub since_boot_deferred: u64,
     pub since_boot_dropped_stale: u64,
     pub since_boot_dropped_stopped: u64,
+    /// Stopped-hold TX ticks skipped because `driver.try_lock()` was contended (L3).
+    #[serde(default)]
+    pub stopped_hold_lock_contended: u64,
+    /// Stopped-hold `try_lock` contention escalations triggered after 25 consecutive skips (0.5 s).
+    #[serde(default)]
+    pub stopped_hold_contention_escalations: u64,
+    /// RT disable dispatch/poll ticks skipped because `driver.try_lock()` was contended (M4).
+    #[serde(default)]
+    pub disable_lock_contended: u64,
+    /// RT disable `try_lock` contention escalations triggered after 25 consecutive skips (0.5 s).
+    #[serde(default)]
+    pub disable_contention_escalations: u64,
 }
 
 /// Coherent per-run baseline deltas and peaks since the latest operator
@@ -700,6 +865,8 @@ pub struct TickSnapshot {
     pub max_release: Option<TickBreakdown>,
     /// The tick with the longest lock hold in the window, all phases.
     pub max_lock: Option<TickBreakdown>,
+    /// The tick with the largest supervisor-lock wait (`wait_us`) in the window, all phases.
+    pub max_wait: Option<TickBreakdown>,
     /// The tick with the largest summed CAN TX send wall time in the window.
     pub max_tx: Option<TickBreakdown>,
     /// Per-frame CAN TX timing and backpressure metrics over the window.
@@ -707,6 +874,9 @@ pub struct TickSnapshot {
     /// Control thread scheduling; None until the control thread reported it (tests).
     pub control_thread: Option<ControlThreadSched>,
     pub observation_cache: ObservationCacheStats,
+    /// Edge-triggered terminal-observation capture counters (`armd-control` -> off-thread drain).
+    #[serde(default)]
+    pub terminal_capture: TerminalCaptureStats,
     /// Monotonic count of deferred safety log events dropped on overflow (never reset).
     #[serde(default)]
     pub safety_log_dropped: u64,
@@ -776,6 +946,43 @@ impl UsageMark {
         #[cfg(not(target_os = "linux"))]
         UsageMark { tx, ..UsageMark::default() }
     }
+}
+
+/// Lightweight thread context-switch mark from `getrusage(RUSAGE_THREAD)` (Linux; zero elsewhere).
+/// Does not touch `TX_TICK` or `CLOCK_THREAD_CPUTIME_ID` (zero allocation).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CswMark {
+    vcsw: i64,
+    ivcsw: i64,
+}
+
+impl CswMark {
+    /// One syscall on Linux (zero elsewhere), zero allocation.
+    #[inline]
+    pub fn now() -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: plain syscall on the calling thread with a valid out-pointer.
+            unsafe {
+                let mut ru: libc::rusage = std::mem::zeroed();
+                libc::getrusage(libc::RUSAGE_THREAD, &mut ru);
+                CswMark {
+                    vcsw: ru.ru_nvcsw as i64,
+                    ivcsw: ru.ru_nivcsw as i64,
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        CswMark::default()
+    }
+}
+
+/// Voluntary and involuntary context-switch deltas between a `CswMark` (at `lock_end`)
+/// and a `UsageMark` (at `released`).
+#[inline]
+pub fn mid_csw_delta(lock_end: &CswMark, released: &UsageMark) -> (u32, u32) {
+    let n = |a: i64, b: i64| u32::try_from(b.saturating_sub(a).max(0)).unwrap_or(u32::MAX);
+    (n(lock_end.vcsw, released.vcsw), n(lock_end.ivcsw, released.ivcsw))
 }
 
 /// [`ThreadUsage`] from marks at tick start, lock acquired and lock released.
@@ -1023,6 +1230,13 @@ struct AtomicTickSlot {
     finish_us: AtomicU32,
     obs_us: AtomicU32,
     publish_us: AtomicU32,
+    // ReleasePhasesUs (`phases_us`)
+    phase_alloc_read: AtomicU32,
+    phase_ack_flush: AtomicU32,
+    phase_terminal: AtomicU32,
+    phase_guard_drop: AtomicU32,
+    phase_post: AtomicU32,
+    phase_publish: AtomicU32,
     // ThreadUsage
     wait_cpu_us: AtomicU32,
     lock_cpu_us: AtomicU32,
@@ -1030,6 +1244,8 @@ struct AtomicTickSlot {
     wait_ivcsw: AtomicU32,
     lock_vcsw: AtomicU32,
     lock_ivcsw: AtomicU32,
+    mid_nvcsw: AtomicU32,
+    mid_nivcsw: AtomicU32,
     wait_majflt: AtomicU32,
     lock_majflt: AtomicU32,
     lock_minflt: AtomicU32,
@@ -1072,6 +1288,7 @@ struct RawTickSlot {
     writer_acquire_us: u32,
     stats_wait_us: u32,
     phases: LockPhases,
+    phases_us: ReleasePhasesUs,
     usage: ThreadUsage,
     waited_for: RawHolder,
     longest_hold: RawHolder,
@@ -1104,12 +1321,20 @@ impl AtomicTickSlot {
         self.finish_us.store(s.phases.finish_us, Ordering::Relaxed);
         self.obs_us.store(s.phases.obs_us, Ordering::Relaxed);
         self.publish_us.store(s.phases.publish_us, Ordering::Relaxed);
+        self.phase_alloc_read.store(s.phases_us.alloc_read, Ordering::Relaxed);
+        self.phase_ack_flush.store(s.phases_us.ack_flush, Ordering::Relaxed);
+        self.phase_terminal.store(s.phases_us.terminal, Ordering::Relaxed);
+        self.phase_guard_drop.store(s.phases_us.guard_drop, Ordering::Relaxed);
+        self.phase_post.store(s.phases_us.post, Ordering::Relaxed);
+        self.phase_publish.store(s.phases_us.publish, Ordering::Relaxed);
         self.wait_cpu_us.store(s.usage.wait_cpu_us, Ordering::Relaxed);
         self.lock_cpu_us.store(s.usage.lock_cpu_us, Ordering::Relaxed);
         self.wait_vcsw.store(s.usage.wait_vcsw, Ordering::Relaxed);
         self.wait_ivcsw.store(s.usage.wait_ivcsw, Ordering::Relaxed);
         self.lock_vcsw.store(s.usage.lock_vcsw, Ordering::Relaxed);
         self.lock_ivcsw.store(s.usage.lock_ivcsw, Ordering::Relaxed);
+        self.mid_nvcsw.store(s.usage.mid_nvcsw, Ordering::Relaxed);
+        self.mid_nivcsw.store(s.usage.mid_nivcsw, Ordering::Relaxed);
         self.wait_majflt.store(s.usage.wait_majflt, Ordering::Relaxed);
         self.lock_majflt.store(s.usage.lock_majflt, Ordering::Relaxed);
         self.lock_minflt.store(s.usage.lock_minflt, Ordering::Relaxed);
@@ -1160,6 +1385,14 @@ impl AtomicTickSlot {
                 obs_us: self.obs_us.load(Ordering::Relaxed),
                 publish_us: self.publish_us.load(Ordering::Relaxed),
             },
+            phases_us: ReleasePhasesUs {
+                alloc_read: self.phase_alloc_read.load(Ordering::Relaxed),
+                ack_flush: self.phase_ack_flush.load(Ordering::Relaxed),
+                terminal: self.phase_terminal.load(Ordering::Relaxed),
+                guard_drop: self.phase_guard_drop.load(Ordering::Relaxed),
+                post: self.phase_post.load(Ordering::Relaxed),
+                publish: self.phase_publish.load(Ordering::Relaxed),
+            },
             usage: ThreadUsage {
                 wait_cpu_us: self.wait_cpu_us.load(Ordering::Relaxed),
                 lock_cpu_us: self.lock_cpu_us.load(Ordering::Relaxed),
@@ -1167,6 +1400,8 @@ impl AtomicTickSlot {
                 wait_ivcsw: self.wait_ivcsw.load(Ordering::Relaxed),
                 lock_vcsw: self.lock_vcsw.load(Ordering::Relaxed),
                 lock_ivcsw: self.lock_ivcsw.load(Ordering::Relaxed),
+                mid_nvcsw: self.mid_nvcsw.load(Ordering::Relaxed),
+                mid_nivcsw: self.mid_nivcsw.load(Ordering::Relaxed),
                 wait_majflt: self.wait_majflt.load(Ordering::Relaxed),
                 lock_majflt: self.lock_majflt.load(Ordering::Relaxed),
                 lock_minflt: self.lock_minflt.load(Ordering::Relaxed),
@@ -1216,6 +1451,7 @@ impl RawTickSlot {
                 writer_acquire_us: self.writer_acquire_us,
                 stats_wait_us: self.stats_wait_us,
                 phases: self.phases,
+                phases_us: self.phases_us,
                 usage: self.usage,
                 // SAFETY: seqlock read validated by caller.
                 waited_for: unsafe { self.waited_for.into_holder_validated() },
@@ -1313,6 +1549,17 @@ impl LockFreeTickStats {
     /// Returns `Some(sample_seq)` on success, or `None` (incrementing `writer_contention_drops`)
     /// if two writers contend concurrently.
     pub fn record_staged(&self, s: &TickSample, finalize: impl FnOnce() -> u32) -> Option<u64> {
+        let initial_publish = s.phases_us.publish;
+        self.record_staged_with_publish(s, || (finalize(), initial_publish))
+    }
+
+    /// Wait-free staged publication that stamps both authoritative `release_us` and
+    /// `phases_us.publish` from `finalize()` immediately before sealing the slot seqlock.
+    pub fn record_staged_with_publish(
+        &self,
+        s: &TickSample,
+        finalize: impl FnOnce() -> (u32, u32),
+    ) -> Option<u64> {
         if self
             .writer_busy
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -1340,8 +1587,9 @@ impl LockFreeTickStats {
         slot.seq.store(s0.wrapping_add(1), Ordering::Relaxed);
         fence(Ordering::Release);
         slot.store_relaxed(sample_seq, s);
-        let final_release_us = finalize();
+        let (final_release_us, final_publish_us) = finalize();
         slot.release_us.store(final_release_us, Ordering::Relaxed);
+        slot.phase_publish.store(final_publish_us, Ordering::Relaxed);
         slot.seq.store(s0.wrapping_add(2), Ordering::Release);
 
         // Coherent metadata seqlock write: odd -> Release fence -> totals + write_seq -> even (Release).
@@ -1372,6 +1620,12 @@ impl LockFreeTickStats {
     /// Wait-free single-writer tail amendment of `slot.release_us` for a specific `sample_seq`
     /// if a post-publication instrumentation tail extended the release duration.
     pub fn amend_slot_release_us(&self, sample_seq: u64, release_us: u32) {
+        self.amend_slot_release_and_publish_us(sample_seq, release_us, 0);
+    }
+
+    /// Wait-free single-writer tail amendment of both `slot.release_us` and `slot.phase_publish`
+    /// monotonically for a specific `sample_seq`.
+    pub fn amend_slot_release_and_publish_us(&self, sample_seq: u64, release_us: u32, publish_us: u32) {
         if sample_seq == 0 {
             return;
         }
@@ -1394,14 +1648,21 @@ impl LockFreeTickStats {
 
         let slot_idx = ((sample_seq.wrapping_sub(1)) as usize) & (LOCK_FREE_RING_CAPACITY - 1);
         let slot = &self.slots[slot_idx];
-        if slot.sample_seq.load(Ordering::Relaxed) == sample_seq
-            && slot.release_us.load(Ordering::Relaxed) < release_us
-        {
-            let s0 = slot.seq.load(Ordering::Relaxed);
-            slot.seq.store(s0.wrapping_add(1), Ordering::Relaxed);
-            fence(Ordering::Release);
-            slot.release_us.store(release_us, Ordering::Relaxed);
-            slot.seq.store(s0.wrapping_add(2), Ordering::Release);
+        if slot.sample_seq.load(Ordering::Relaxed) == sample_seq {
+            let cur_rel = slot.release_us.load(Ordering::Relaxed);
+            let cur_pub = slot.phase_publish.load(Ordering::Relaxed);
+            if cur_rel < release_us || cur_pub < publish_us {
+                let s0 = slot.seq.load(Ordering::Relaxed);
+                slot.seq.store(s0.wrapping_add(1), Ordering::Relaxed);
+                fence(Ordering::Release);
+                if cur_rel < release_us {
+                    slot.release_us.store(release_us, Ordering::Relaxed);
+                }
+                if cur_pub < publish_us {
+                    slot.phase_publish.store(publish_us, Ordering::Relaxed);
+                }
+                slot.seq.store(s0.wrapping_add(2), Ordering::Release);
+            }
         }
     }
 
@@ -1616,7 +1877,11 @@ impl TickWindow {
     fn max_by(&self, key: impl Fn(&TickSample) -> u32) -> Option<TickBreakdown> {
         let n = self.rows.len();
         self.rows.iter().enumerate().rev().max_by_key(|(_, r)| key(r))
-            .map(|(i, r)| TickBreakdown { sample: *r, ticks_ago: n - 1 - i })
+            .map(|(i, r)| TickBreakdown {
+                sample: *r,
+                handoff_us: r.waited_for.map(|h| h.released_before_lock_us),
+                ticks_ago: n - 1 - i,
+            })
     }
 
     pub fn snapshot(&self) -> TickSnapshot {
@@ -1666,6 +1931,7 @@ impl TickWindow {
             max_tick: self.max_by(|r| r.tick_us),
             max_release: self.max_by(|r| r.release_us),
             max_lock: self.max_by(|r| r.lock_us),
+            max_wait: self.max_by(|r| r.wait_us),
             max_tx: self.max_by(|r| r.usage.tx_send_us),
             tx: TxDiagnostics {
                 frames: self.col(|r| r.usage.tx_frames),
@@ -1686,9 +1952,14 @@ impl TickWindow {
                 since_boot_deferred: self.tx_totals.deferred,
                 since_boot_dropped_stale: self.tx_totals.dropped_stale,
                 since_boot_dropped_stopped: self.tx_totals.dropped_stopped,
+                stopped_hold_lock_contended: stopped_hold_lock_contended_count(),
+                stopped_hold_contention_escalations: stopped_hold_contention_escalations_count(),
+                disable_lock_contended: disable_lock_contended_count(),
+                disable_contention_escalations: disable_contention_escalations_count(),
             },
             control_thread: None,
             observation_cache: ObservationCacheStats::default(),
+            terminal_capture: TerminalCaptureStats::default(),
             safety_log_dropped: 0,
             log_writer_dropped: 0,
             stats_snapshot_lapped: self.snapshot_lapped,
@@ -1925,7 +2196,17 @@ mod tests {
                     obs_us: 12,
                     publish_us: 3,
                 },
+                phases_us: ReleasePhasesUs {
+                    alloc_read: 1 + (i % 3),
+                    ack_flush: 2 + (i % 5),
+                    terminal: 3 + (i % 7),
+                    guard_drop: 4 + (i % 11),
+                    post: 15,
+                    publish: 6 + (i % 13),
+                },
                 usage: ThreadUsage {
+                    mid_nvcsw: u32::from(i % 17 == 0),
+                    mid_nivcsw: u32::from(i % 19 == 0),
                     tx_frames: if i % 3 == 0 { 2 } else { 1 },
                     tx_would_block: u32::from(i % 11 == 0),
                     tx_enobufs: u32::from(i % 13 == 0),
@@ -2126,8 +2407,18 @@ mod tests {
                     obs_us: ku % 41,
                     publish_us: ku % 43,
                 },
+                phases_us: ReleasePhasesUs {
+                    alloc_read: ku % 7,
+                    ack_flush: ku % 11,
+                    terminal: ku % 13,
+                    guard_drop: ku % 17,
+                    post: ku % 53,
+                    publish: ku % 29,
+                },
                 usage: ThreadUsage {
                     lock_cpu_us: ku % 500,
+                    mid_nvcsw: ku % 3,
+                    mid_nivcsw: ku % 5,
                     tx_frames: 2,
                     tx_would_block: u32::from(k.is_multiple_of(5)),
                     tx_enobufs: u32::from(k.is_multiple_of(11)),
@@ -2234,5 +2525,111 @@ mod tests {
         assert_eq!(frozen_win.ticks, TOTAL_SAMPLES);
         assert_eq!(frozen_win.rows.len(), TICK_WINDOW);
         assert_eq!(*frozen_win.rows.last().unwrap(), make_sample(TOTAL_SAMPLES));
+    }
+
+    #[test]
+    fn phases_us_mid_csw_and_max_wait_serialize_and_round_trip() {
+        let lf = LockFreeTickStats::new();
+        let holder = Holder {
+            kind: "write",
+            location: std::panic::Location::caller(),
+            command: Some("/api/v1/motion/jog"),
+            action_id: Some(77),
+            hold_us: 1_800,
+            acquire_us: 12,
+            acquired_before_wait_us: 400,
+            released_before_lock_us: 350,
+        };
+        let slow_rel = TickSample {
+            tick_us: 24_000,
+            release_us: 0,
+            wait_us: 120,
+            lock_us: 1_500,
+            post_us: 80,
+            phases_us: ReleasePhasesUs {
+                alloc_read: 5,
+                ack_flush: 12,
+                terminal: 18_200,
+                guard_drop: 42,
+                post: 80,
+                publish: 0,
+            },
+            usage: ThreadUsage {
+                mid_nvcsw: 2,
+                mid_nivcsw: 5,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let seq1 = lf
+            .record_staged_with_publish(&slow_rel, || (25_100, 95))
+            .expect("staged record");
+        // Monotonic amendment increases both release_us and publish without decreasing either.
+        lf.amend_slot_release_and_publish_us(seq1, 24_000, 50);
+        lf.amend_slot_release_and_publish_us(seq1, 25_600, 140);
+
+        let long_wait = TickSample {
+            tick_us: 9_500,
+            release_us: 9_600,
+            wait_us: 8_200,
+            lock_us: 1_100,
+            post_us: 40,
+            phases_us: ReleasePhasesUs {
+                alloc_read: 2,
+                ack_flush: 3,
+                terminal: 4,
+                guard_drop: 5,
+                post: 40,
+                publish: 15,
+            },
+            waited_for: Some(holder),
+            longest_hold: Some(holder),
+            ..Default::default()
+        };
+        assert!(lf.record(&long_wait));
+
+        let snap = lf.snapshot();
+        let mr = snap.max_release.expect("max_release");
+        assert_eq!(mr.sample.release_us, 25_600);
+        assert_eq!(
+            mr.sample.phases_us,
+            ReleasePhasesUs {
+                alloc_read: 5,
+                ack_flush: 12,
+                terminal: 18_200,
+                guard_drop: 42,
+                post: 80,
+                publish: 140,
+            }
+        );
+        assert_eq!(mr.sample.usage.mid_nvcsw, 2);
+        assert_eq!(mr.sample.usage.mid_nivcsw, 5);
+        assert_eq!(mr.handoff_us, None);
+
+        let mw = snap.max_wait.expect("max_wait");
+        assert_eq!(mw.sample.wait_us, 8_200);
+        assert_eq!(mw.handoff_us, Some(350));
+        assert_eq!(mw.ticks_ago, 0);
+        assert_eq!(mw.sample.waited_for.unwrap().command, Some("/api/v1/motion/jog"));
+
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["max_release"]["phases_us"]["alloc_read"], 5);
+        assert_eq!(json["max_release"]["phases_us"]["ack_flush"], 12);
+        assert_eq!(json["max_release"]["phases_us"]["terminal"], 18_200);
+        assert_eq!(json["max_release"]["phases_us"]["guard_drop"], 42);
+        assert_eq!(json["max_release"]["phases_us"]["post"], 80);
+        assert_eq!(json["max_release"]["phases_us"]["publish"], 140);
+        assert_eq!(json["max_release"]["mid_nvcsw"], 2);
+        assert_eq!(json["max_release"]["mid_nivcsw"], 5);
+        assert!(json["max_release"].get("handoff_us").is_none());
+
+        assert_eq!(json["max_tick"]["phases_us"]["terminal"], 18_200);
+        assert_eq!(json["max_tick"]["mid_nvcsw"], 2);
+        assert_eq!(json["max_tick"]["mid_nivcsw"], 5);
+
+        assert_eq!(json["max_wait"]["wait_us"], 8_200);
+        assert_eq!(json["max_wait"]["handoff_us"], 350);
+        assert_eq!(json["max_wait"]["waited_for"]["command"], "/api/v1/motion/jog");
+        assert_eq!(json["max_wait"]["waited_for"]["released_before_lock_us"], 350);
     }
 }

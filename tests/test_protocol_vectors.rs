@@ -215,7 +215,7 @@ fn test_feetech_driver_mock_loopback() {
 
     driver.set_torque(true).unwrap();
     let tx_bytes = driver.transport_mut().take_tx();
-    // Pre-seeding SYNC_WRITE (17 bytes) + 3 servos write (8 bytes each) + 3 servos read (8 bytes each) = 65 bytes
+    // Pre-seeding SYNC_WRITE (17 bytes) + 3 servos write (8 bytes each) + 1 round * 3 servos read (8 bytes each) = 65 bytes
     assert_eq!(tx_bytes.len(), 65);
 
     // 3. Test write_joint_targets
@@ -526,21 +526,29 @@ fn test_damiao_driver_mock_loopback() {
     let motor_ids = vec![1, 2];
     let mut driver = DamiaoArmDriver::new(mock_can, motor_ids.clone());
 
-    // 1. Receive enable feedback only after each enable command is transmitted.
+    // 1. Receive CTRL_MODE readback and enable feedback only after each command is transmitted.
+    let mode = damiao::CTRL_MODE_POS_VEL.to_le_bytes();
     let mut d1_en = [0u8; 8];
     d1_en[0] = 0x11; // state=1 (enabled), motor_id=1
     let mut d2_en = [0u8; 8];
     d2_en[0] = 0x12; // state=1 (enabled), motor_id=2
-    driver.can_mut().respond_to_transmit(damiao::build_enable_frame(1), CanFrame::new_standard(0x11, &d1_en).unwrap());
-    driver.can_mut().respond_to_transmit(damiao::build_enable_frame(2), CanFrame::new_standard(0x12, &d2_en).unwrap());
+    let f1 = CanFrame::new_standard(0x11, &d1_en).unwrap();
+    let f2 = CanFrame::new_standard(0x12, &d2_en).unwrap();
+    let m1 = CanFrame::new_standard(0x11, &[1, 0, damiao::REG_READ, damiao::RID_CTRL_MODE, mode[0], mode[1], mode[2], mode[3]]).unwrap();
+    let m2 = CanFrame::new_standard(0x12, &[2, 0, damiao::REG_READ, damiao::RID_CTRL_MODE, mode[0], mode[1], mode[2], mode[3]]).unwrap();
+    driver.can_mut().respond_to_transmit(damiao::build_read_register_frame(1, damiao::RID_CTRL_MODE), m1);
+    driver.can_mut().respond_to_transmit(damiao::build_read_register_frame(2, damiao::RID_CTRL_MODE), m2);
+    driver.can_mut().respond_to_transmit(damiao::build_enable_frame(1), f1);
+    driver.can_mut().respond_to_transmit(damiao::build_enable_frame(2), f2);
+    driver.can_mut().respond_to_transmit(damiao::build_refresh_frame(1), f1);
+    driver.can_mut().respond_to_transmit(damiao::build_refresh_frame(2), f2);
 
     driver.set_torque(true).unwrap();
     let tx = driver.can_mut().take_tx_frames();
-    assert_eq!(tx.len(), 2);
-    assert_eq!(tx[0].id, 1);
-    assert_eq!(tx[0].data, CMD_ENABLE);
-    assert_eq!(tx[1].id, 2);
-    assert_eq!(tx[1].data, CMD_ENABLE);
+    let enables: Vec<_> = tx.iter().filter(|f| f.data == CMD_ENABLE).collect();
+    assert_eq!(enables.len(), 2);
+    assert_eq!(enables[0].id, 1);
+    assert_eq!(enables[1].id, 2);
 
     // 2. Write joint targets
     let targets = vec![
@@ -597,6 +605,31 @@ fn test_damiao_driver_mock_loopback() {
     let _ = driver.read_joint_states().unwrap();
 
     // 5. Test best-effort disable: no motor confirms, the frame is resent at 25 and 75 ms
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    arm_joints[0] = 0;
+    arm_joints[1] = 1;
+    let mut rest_positions = [0.0f32; armd::rt_core::mailbox::MAX_DOF];
+    rest_positions[0] = 0.5;
+    rest_positions[1] = 0.5;
+    driver.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+        safety_stopped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 2,
+        rest_positions,
+        rest_pose_tolerance_rad: 0.05,
+    });
+    // Wait past TORQUE_CAUSAL_SETTLE_WINDOW (20 ms) after write_joint_targets, then establish K=3 rest samples.
+    std::thread::sleep(std::time::Duration::from_millis(22));
+    for step in 0..3 {
+        if step > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(11));
+        }
+        driver.can_mut().provide_rx_frame(CanFrame::new_standard(0x11, &d1_master).unwrap());
+        driver.can_mut().provide_rx_frame(CanFrame::new_standard(0x12, &d2_master).unwrap());
+        let _ = driver.read_joint_states().unwrap();
+    }
+    let _ = driver.can_mut().take_tx_frames();
     driver.set_torque(false).unwrap();
     let disable_tx = driver.can_mut().take_tx_frames();
     assert_eq!(disable_tx[0].data, CMD_DISABLE);
@@ -859,10 +892,18 @@ fn test_e2e_damiao_over_slcan_mock_serial() {
     let slcan = SlcanTransport::new(mock_serial);
     let mut arm = DamiaoArmDriver::new(slcan, vec![1]);
 
-    // Configure post-enable motor 1 feedback with state=1 (enabled)
+    // Configure causal REG_READ(RID_CTRL_MODE) -> POS_VEL reply and post-enable motor 1
+    // feedback with state=1 (enabled) for both CMD_ENABLE and the 0x7FF 0xCC refresh probe.
     // Motor 1 feedback: CAN ID 0x11, DLC 8, data[0] = 0x11 (enabled, motor_id=1)
     // In SLCAN format: t01181100000000002823\r
+    let mode = damiao::CTRL_MODE_POS_VEL.to_le_bytes();
+    let mode_req = SlcanCodec::encode_frame(&damiao::build_read_register_frame(1, damiao::RID_CTRL_MODE));
+    let mode_rep = SlcanCodec::encode_frame(
+        &CanFrame::new_standard(0x11, &[1, 0, damiao::REG_READ, damiao::RID_CTRL_MODE, mode[0], mode[1], mode[2], mode[3]]).unwrap(),
+    );
+    arm.can_mut().inner_mut().respond_to_write(mode_req.as_bytes(), mode_rep.as_bytes());
     arm.can_mut().inner_mut().respond_to_write(b"t0018FFFFFFFFFFFFFFFC\r", b"t01181100000000002823\r");
+    arm.can_mut().inner_mut().respond_to_write(b"t7FF80100CC0000000000\r", b"t01181100000000002823\r");
 
     // Command arm torque
     arm.set_torque(true).unwrap();

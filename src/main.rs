@@ -507,20 +507,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => info!("Episode storage off: recording and replay are refused"),
     }
     supervisor.set_episodes_dir(episodes.dir().map(std::path::Path::to_path_buf)).await;
+    let calib_path = armd::calibration::path_from_env();
     let grasp_setup_path = armd::grasp::setup_path_from_env();
-    armd::grasp::load_into(&supervisor, &grasp_setup_path).await;
+    let pending_marker_state = armd::calibration::inspect_pending_commit_marker(&calib_path);
+    let pending_calib_commit = !matches!(
+        pending_marker_state,
+        armd::calibration::PendingMarkerState::Absent
+    );
+    if !pending_calib_commit {
+        armd::grasp::load_into(&supervisor, &grasp_setup_path).await;
+    }
     // after the grasp setup: the calibration wins for camera_mount and camera_tilt_deg
-    if let Err(e) = armd::calibration::load_into(&supervisor, &armd::calibration::path_from_env(), Some(&grasp_setup_path)).await {
+    // (when a pending calibration/zero commit marker is present or unreadable,
+    // calibration::load_into_with_marker_state quarantines startup into Reconciling without
+    // installing uncertain calibration/offsets).
+    if let Err(e) = armd::calibration::load_into_with_marker_state(
+        &supervisor,
+        &calib_path,
+        Some(&grasp_setup_path),
+        &pending_marker_state,
+    )
+    .await
+    {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e).into());
     }
-    // after the calibration: legacy episodes are adopted with the joint zero in effect
-    supervisor.load_episodes().await;
+    // after the calibration: legacy episodes are adopted with the joint zero in effect;
+    // skip adoption during quarantined startup so fallback zeros are never stamped onto sidecars.
+    if !pending_calib_commit {
+        supervisor.load_episodes().await;
+    }
     if let Err(e) = armd::keepout::load_into(&supervisor, &armd::keepout::path_from_env()).await {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e).into());
     }
-    armd::poses::load_into(&supervisor, &armd::poses::path_from_env()).await;
+    if !pending_calib_commit {
+        armd::poses::load_into(&supervisor, &armd::poses::path_from_env()).await;
+    }
     armd::sequences::load_into(&supervisor, &armd::sequences::path_from_env()).await;
-    armd::calib_hover::load_into(&supervisor, &armd::calibration::path_from_env()).await;
+    if !pending_calib_commit {
+        armd::calib_hover::load_into(&supervisor, &calib_path).await;
+    }
     armd::collision::load_into(&supervisor, &armd::collision::path_from_env()).await;
     armd::tool::load_commissioning_into(&supervisor, &armd::tool::commissioning_path_from_env()).await;
     match follower {
@@ -593,7 +618,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "mock" => info!("Follower configured as mock simulation"),
         _ => unreachable!(),
     }
-    armd::gripper_calib::load_into(&supervisor, &armd::gripper_calib::path_from_env()).await;
+    if !pending_calib_commit {
+        armd::gripper_calib::load_into(&supervisor, &armd::gripper_calib::path_from_env()).await;
+    }
     // Complete all startup configuration BEFORE transferring ownership or starting the control loop.
     let operator_auth = resolve_operator_auth(follower, &cli)?;
     supervisor.set_operator_auth_enforced(operator_auth.is_enforced()).await;
@@ -760,6 +787,21 @@ mod shutdown_tests {
         fn is_feedback_valid(&self) -> bool {
             true
         }
+        fn has_driver_fresh_position_api(&self) -> bool {
+            true
+        }
+        fn fresh_joint_positions_into(
+            &self,
+            joints: &[usize],
+            _max_age: Duration,
+            out: &mut [f32],
+        ) -> bool {
+            if out.len() < joints.len() {
+                return false;
+            }
+            out[..joints.len()].fill(0.0);
+            true
+        }
         fn feedback_ages(&self) -> Vec<Option<Duration>> {
             vec![Some(Duration::ZERO); 6]
         }
@@ -785,6 +827,8 @@ mod shutdown_tests {
         if state == EnableState::Enabled {
             inner.is_torqued = true;
             inner.safety.set_torque(true).unwrap();
+        } else if state == EnableState::Disabled {
+            inner.torque_intent = armd::TorqueIntent::Off;
         }
         inner
     }
@@ -867,6 +911,21 @@ mod shutdown_tests {
             *self.state.lock().unwrap() == EnableState::Enabled
         }
         fn is_feedback_valid(&self) -> bool {
+            true
+        }
+        fn has_driver_fresh_position_api(&self) -> bool {
+            true
+        }
+        fn fresh_joint_positions_into(
+            &self,
+            joints: &[usize],
+            _max_age: Duration,
+            out: &mut [f32],
+        ) -> bool {
+            if out.len() < joints.len() {
+                return false;
+            }
+            out[..joints.len()].fill(0.0);
             true
         }
         fn feedback_ages(&self) -> Vec<Option<Duration>> {
@@ -998,6 +1057,7 @@ mod shutdown_tests {
         };
         let sup_ok = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_ok)));
         sup_ok.set_lease_enabled(false).await;
+        sup_ok.disable_torque().await.unwrap();
         let handle_ok = sup_ok
             .start_executor(armd::rt_core::executor::ExecutorConfig::for_tests(Duration::from_millis(5)))
             .await
@@ -1052,6 +1112,7 @@ mod shutdown_tests {
         };
         let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
         sup.set_lease_enabled(false).await;
+        sup.inner().write().await.torque_intent = armd::TorqueIntent::Off;
         let _ = sup.trigger_e_stop().await;
         assert!(sup.request_shutdown().await.unwrap());
 

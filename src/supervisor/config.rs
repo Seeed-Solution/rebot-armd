@@ -71,7 +71,7 @@ impl SupervisorInner {
     /// The driver's motor zero support; the mock follower (no driver) zeroes its readings.
     pub fn motor_zero_support(&self) -> crate::model::MotorZeroSupport {
         match self.driver.as_ref() {
-            Some(d) => d.lock().map_or_else(|_| crate::model::MotorZeroSupport::unsupported("driver unavailable"), |drv| drv.motor_zero_support()),
+            Some(d) => d.with_ref(|drv| drv.motor_zero_support()).unwrap_or_else(|| crate::model::MotorZeroSupport::unsupported("driver unavailable")),
             None => crate::model::MotorZeroSupport::set_current("process", true,
                 vec!["mock follower: the readings of the zeroed joints become 0 (the simulated arm has no encoder offset)".into()]),
         }
@@ -89,12 +89,15 @@ impl SupervisorInner {
         let old = std::mem::replace(&mut self.joint_zero_offsets, offsets.to_vec());
         self.tracking.invalidate();
         if old != offsets { self.calibration_revision += 1; self.refresh_effective_floor(); }
-        if let Some(d) = self.driver.as_ref() {
-            let mut drv = d.lock().map_err(|_| "driver unavailable".to_string())?;
-            drv.set_joint_zero_offsets(offsets);
-            let pos: Vec<_> = (0..self.config.dof).map(|i| drv.position_limits(i)).collect();
-            drop(drv);
-            if pos.iter().any(Option::is_some) { self.reapply_driver_limits(); }
+        if let Some(d) = self.driver.as_mut() {
+            let dof = self.config.dof;
+            let has_pos_limits = d
+                .with_mut(|drv| {
+                    drv.set_joint_zero_offsets(offsets);
+                    (0..dof).any(|i| drv.position_limits(i).is_some())
+                })
+                .ok_or_else(|| "driver unavailable".to_string())?;
+            if has_pos_limits { self.reapply_driver_limits(); }
         }
         let mut gripper_zero_moved = false;
         for (i, (o, n)) in old.iter().zip(offsets).enumerate() {
@@ -130,7 +133,7 @@ impl SupervisorInner {
         if !self.zero_check_pending || self.is_torqued || self.calibration_busy { return; }
         if self.config.zero_reference.is_none() { self.zero_check_pending = false; return; }
         if let Some(d) = self.driver.as_ref() {
-            if !d.lock().is_ok_and(|drv| drv.is_feedback_valid()) { return; }
+            if !d.with_ref(|drv| drv.is_feedback_valid()).unwrap_or(false) { return; }
         }
         let tol: &[f32] = match &self.config.resting_pose {
             Some(p) => &p.position_tolerances,
@@ -159,8 +162,8 @@ impl SupervisorInner {
         // a new J6 zero ends a legacy_j6 verdict; the next check decides again
         if joint == 5 { self.zero_convention = Default::default(); }
         self.zero_check_pending = true;
-        match self.driver.as_ref() {
-            Some(d) => d.lock().map_err(|_| "driver unavailable".to_string())?.set_zero_position(joint).map_err(|e| e.to_string()),
+        match self.driver.as_mut() {
+            Some(d) => d.with_mut(|drv| drv.set_zero_position(joint)).ok_or_else(|| "driver unavailable".to_string())?.map_err(|e| e.to_string()),
             None => {
                 // the simulated motor reads 0: the joint reads 0 - its joint zero offset
                 let r = -self.joint_zero_offsets.get(joint).copied().unwrap_or(0.0);
@@ -534,7 +537,7 @@ impl SupervisorInner {
                 }
             };
             a.finished_at = Some(now);
-            self.record_finished_action_by_id(action_id);
+            self.record_terminal_transition_by_id(action_id);
             return (code_buf, old_msg);
         }
         (code_buf, msg_buf)
@@ -555,7 +558,7 @@ impl SupervisorInner {
             a.code = Some(crate::model::HolderLabel::new(&code));
             let old_msg = a.message.replace(message);
             a.finished_at = Some(now);
-            self.record_finished_action_by_id(action_id);
+            self.record_terminal_transition_by_id(action_id);
             return (Some(code), old_msg);
         }
         (Some(code), Some(message))
@@ -568,11 +571,13 @@ impl SupervisorInner {
         warning: Option<String>,
     ) -> Option<String> {
         let now = self.now_s();
+        let mut transitioned_terminal = false;
         let ret = if let Some(a) = self.last_action.as_mut().filter(|a| a.id == action_id) {
             if a.is_running() {
                 a.state = crate::model::HolderLabel::new("done");
                 a.progress = 1.0;
                 a.finished_at = Some(now);
+                transitioned_terminal = true;
             }
             match durability {
                 crate::rt_core::config_iface::Durability::Durable => {
@@ -595,7 +600,9 @@ impl SupervisorInner {
         } else {
             return warning;
         };
-        self.record_finished_action_by_id(action_id);
+        if transitioned_terminal {
+            self.record_terminal_transition_by_id(action_id);
+        }
         ret
     }
 
@@ -610,11 +617,13 @@ impl SupervisorInner {
         mut msg_buf: Option<String>,
     ) -> (Option<String>, Option<String>) {
         let now = self.now_s();
+        let mut transitioned_terminal = false;
         if let Some(a) = self.last_action.as_mut().filter(|a| a.id == action_id) {
             if a.is_running() {
                 a.state = crate::model::HolderLabel::new("failed");
                 a.code = Some(crate::model::HolderLabel::new("PERSIST_FAILED"));
                 a.finished_at = Some(now);
+                transitioned_terminal = true;
             }
             a.durability_confirmed = Some(false);
             let old_warn = a.durability_warning.replace(warning);
@@ -631,7 +640,9 @@ impl SupervisorInner {
                 }
                 None => None,
             };
-            self.record_finished_action_by_id(action_id);
+            if transitioned_terminal {
+                self.record_terminal_transition_by_id(action_id);
+            }
             return (old_msg, old_warn);
         }
         (msg_buf, Some(warning))

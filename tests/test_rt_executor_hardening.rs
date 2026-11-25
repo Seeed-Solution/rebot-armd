@@ -148,6 +148,7 @@ impl CanTransport for FaultInjectBus {
         r
     }
     fn receive(&mut self) -> Result<CanFrame, TransportError> { self.inner.receive() }
+    fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<Instant>), TransportError> { self.inner.receive_timestamped() }
     fn flush(&mut self) -> Result<(), TransportError> {
         self.flush_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.flush()
@@ -523,6 +524,21 @@ impl ArmDriver for DelayedWakeDriver {
     fn supports_rt_executor(&self) -> Result<(), &'static str> { Ok(()) }
     fn is_feedback_valid(&self) -> bool { true }
     fn is_enabled(&self) -> bool { self.enabled }
+    fn fresh_joint_positions_into(&self, joints: &[usize], max_age: Duration, out: &mut [f32]) -> bool {
+        if joints.is_empty() || out.len() < joints.len() || Duration::from_millis(1) > max_age {
+            return false;
+        }
+        for (dst, &j) in out.iter_mut().zip(joints.iter()) {
+            let Some(s) = self.states.get(j) else {
+                return false;
+            };
+            if !s.position.is_finite() {
+                return false;
+            }
+            *dst = s.position;
+        }
+        true
+    }
     fn feedback_all_within(&self, dof: usize, _: Duration) -> bool { dof == self.dof }
     fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) { out.clear(); out.resize(self.dof, Some(Duration::from_millis(1))); }
     fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) { out.clear(); out.resize(self.dof, Some(1)); }
@@ -808,10 +824,10 @@ async fn damiao_fresh_unknown_shutdown_gate_and_panic_disable_paths() {
     assert_eq!(
         fresh.enable_state(),
         EnableState::Disabled,
-        "state-0 feedback from every motor after startup confirms Disabled"
+        "telemetry reports Disabled once all motors report fresh state=0"
     );
 
-    // On a frozen MockClock, pre-disable state-0 feedback must NOT satisfy enable_state() after begin_torque(false).
+    // On a frozen MockClock, begin_torque(false) stays Pending across bounded 20 ms repeats.
     let frozen_clock = MockClock::new();
     let frozen_bus = FakeBus::with_clock(&dm_limits(), frozen_clock.clone());
     frozen_bus.with(|s| {
@@ -822,18 +838,45 @@ async fn damiao_fresh_unknown_shutdown_gate_and_panic_disable_paths() {
         .with_joint_limits(dm_limits())
         .unwrap();
     frozen_drv.read_joint_states().unwrap();
-    assert_eq!(frozen_drv.enable_state(), EnableState::Disabled);
-    let _ = frozen_drv.begin_torque(false).unwrap();
     assert_eq!(
         frozen_drv.enable_state(),
-        EnableState::Unknown,
-        "pre-disable feedback on frozen clock must not confirm Disabled"
+        EnableState::Disabled,
+        "fresh state-0 feedback from all motors reports Disabled telemetry"
     );
-    frozen_bus.with(|s| s.push_all_feedback());
-    let _ = frozen_drv.poll_torque(frozen_clock.now() + Duration::from_millis(50)).unwrap();
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    for (i, slot) in arm_joints.iter_mut().enumerate().take(6) {
+        *slot = i;
+    }
+    frozen_drv.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+        safety_stopped: Arc::new(AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 6,
+        rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+        rest_pose_tolerance_rad: 0.05,
+    });
+    for step in 0..3 {
+        if step > 0 {
+            frozen_clock.advance(Duration::from_millis(10));
+        }
+        frozen_bus.with(|s| s.push_all_feedback());
+        frozen_drv.read_joint_states().unwrap();
+    }
+    let prog = frozen_drv.begin_torque(false).unwrap();
+    assert!(matches!(prog, TorqueProgress::Pending { .. }));
+    assert!(frozen_drv.torque_transition_pending());
+    let prog0 = frozen_drv.poll_torque(frozen_clock.now() + Duration::from_millis(50)).unwrap();
+    assert!(matches!(prog0, TorqueProgress::Pending { .. }));
+    frozen_clock.advance(Duration::from_millis(20));
+    let prog2 = frozen_drv.poll_torque(frozen_clock.now() + Duration::from_millis(50)).unwrap();
+    assert!(matches!(prog2, TorqueProgress::Pending { .. }));
+    frozen_clock.advance(Duration::from_millis(20));
+    let prog3 = frozen_drv.poll_torque(frozen_clock.now() + Duration::from_millis(50)).unwrap();
+    assert_eq!(prog3, TorqueProgress::Done(TorqueOutcome::Confirmed));
+    assert!(!frozen_drv.torque_transition_pending());
     assert_eq!(frozen_drv.enable_state(), EnableState::Disabled);
 
-    // (b) Shutdown gate refuses fresh Damiao driver (Unknown) until disable feedback arrives (Legacy + Executor).
+    // (b) Shutdown gate refuses until accepted disable sets torque_intent = Off (Legacy + Executor).
     let bus_gate = FakeBus::new(&dm_limits());
     bus_gate.with(|s| {
         for m in &mut s.motors {
@@ -1086,8 +1129,10 @@ async fn sim_driver_estop_gate_and_pre_publish_maintenance_ordering() {
         "zero UDP cmd datagrams may be transmitted when E-stop arrives after serialization"
     );
 
-    // Disable (`begin_torque(false)`) is NEVER inhibited even when BOTH pending and latched
-    // E-stop arrive right before `send_nonblocking`!
+    // Requested disable (`begin_torque(false)`) without a calibrated rest-pose gate / fresh rest
+    // feedback is refused by Rule A′ when E-stop arrives right before `send_nonblocking`, whereas
+    // `DisableProtective` (thermal / process-exit) is NEVER inhibited even when BOTH pending and
+    // latched E-stop arrive right before `send_nonblocking`!
     {
         let req_h = req.clone();
         let latched_h = latched.clone();
@@ -1098,10 +1143,26 @@ async fn sim_driver_estop_gate_and_pre_publish_maintenance_ordering() {
             latched_h.store(true, Ordering::SeqCst);
         })));
     }
-    let _ = drv.begin_torque(false).unwrap();
+    req.store(0, Ordering::SeqCst);
+    latched.store(false, Ordering::SeqCst);
+    let err_dis_req = drv.begin_torque(false).unwrap_err();
+    assert!(
+        matches!(err_dis_req, armd::driver::ArmDriverError::TorqueOffWouldDrop),
+        "DisableRequested without rest pose must fail closed under E-stop: {err_dis_req:?}"
+    );
     assert_eq!(hook_hits.load(Ordering::SeqCst), 4);
+    assert!(
+        drain_cmds(&peer).is_empty(),
+        "zero UDP cmd datagrams may be transmitted when DisableRequested is refused"
+    );
+    let _ = drv
+        .begin_disable_torque(armd::driver::DisableKind::DisableProtective {
+            reason: armd::driver::DisableProtectiveReason::Thermal,
+        })
+        .unwrap();
+    assert_eq!(hook_hits.load(Ordering::SeqCst), 5);
     let dis_cmds = drain_cmds(&peer);
-    assert_eq!(dis_cmds.len(), 1, "disable cmd must still transmit under E-stop: {dis_cmds:?}");
+    assert_eq!(dis_cmds.len(), 1, "protective disable cmd must still transmit under E-stop: {dis_cmds:?}");
     assert_eq!(dis_cmds[0].enable, Some(false));
     assert!(dis_cmds[0].targets.is_none());
 
@@ -1637,8 +1698,9 @@ async fn panic_disable_deadline_observer_fires_on_blocking_driver_and_preserves_
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn damiao_unified_fresh_boundary_and_stale_shutdown_gate_virtual_clock() {
-    // (a) Frozen virtual clock + MIT fence: pre-command state-0 feedback must NOT confirm
-    // `poll_disable` or release the MIT fence when `enable_state()` is `Unknown`.
+    // (a) Frozen virtual clock + MIT fence: state-0 feedback is telemetry only and never
+    // short-circuits bounded disable repeats or releases the MIT fence early; the fence
+    // releases only once all `DAMIAO_DISABLE_REPEATS` spaced repeats finish.
     let clock = MockClock::new();
     let bus = FakeBus::with_clock(&dm_limits(), clock.clone());
     bus.with(|s| {
@@ -1648,13 +1710,25 @@ async fn damiao_unified_fresh_boundary_and_stale_shutdown_gate_virtual_clock() {
     let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
         .with_joint_limits(dm_limits())
         .unwrap();
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    for (i, slot) in arm_joints.iter_mut().enumerate().take(6) {
+        *slot = i;
+    }
+    drv.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+        safety_stopped: Arc::new(AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 6,
+        rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+        rest_pose_tolerance_rad: 0.05,
+    });
     drv.read_joint_states().unwrap();
     drv.set_torque(true).unwrap();
     assert_eq!(drv.enable_state(), EnableState::Enabled);
     drv.set_mit_deadline_fence(Some(Duration::from_millis(500)), Duration::from_millis(200));
 
-    // Inject pre-disable state-0 feedback at the current frozen virtual timestamp, then stop
-    // immediate replies so `begin_torque(false)` gets zero post-command replies at the same `t`.
+    // Inject state-0 feedback before disable: telemetry updates to Disabled, but the MIT fence
+    // stays armed and bounded disable repeats must still execute.
     bus.with(|s| {
         s.immediate_replies = false;
         for m in &mut s.motors {
@@ -1663,20 +1737,23 @@ async fn damiao_unified_fresh_boundary_and_stale_shutdown_gate_virtual_clock() {
         s.push_all_feedback();
     });
     drv.read_joint_states().unwrap();
+    for _ in 0..2 {
+        clock.advance(Duration::from_millis(10));
+        bus.with(|s| s.push_all_feedback());
+        drv.read_joint_states().unwrap();
+    }
     assert_eq!(drv.enable_state(), EnableState::Disabled);
 
     let p0 = drv.begin_torque(false).unwrap();
     assert!(matches!(p0, TorqueProgress::Pending { .. }));
-    assert_eq!(drv.enable_state(), EnableState::Unknown);
 
-    // Polling at the SAME frozen timestamp with NO post-command feedback MUST stay Pending
+    // Polling at the SAME frozen timestamp (before the 20 ms repeat interval) MUST stay Pending
     // and MUST keep the MIT fence armed!
     let p1 = drv.poll_torque(clock.now() + Duration::from_millis(50)).unwrap();
     assert!(
         matches!(p1, TorqueProgress::Pending { .. }),
-        "frozen-clock pre-command state-0 feedback must not confirm disable handshake: {p1:?}"
+        "disable repeats must stay Pending until spaced repeats finish: {p1:?}"
     );
-    assert_eq!(drv.enable_state(), EnableState::Unknown);
     assert!(drv.mit_fence_trip().is_none(), "fence must stay armed, not tripped yet");
     let hold = vec![JointTarget::position(0.0); 7];
     let mode_err = drv
@@ -1684,69 +1761,53 @@ async fn damiao_unified_fresh_boundary_and_stale_shutdown_gate_virtual_clock() {
         .unwrap_err();
     assert!(
         mode_err.to_string().contains("MIT tracking holds the deadline fence"),
-        "MIT fence must stay armed while disable is unconfirmed: {mode_err}"
+        "MIT fence must stay armed while disable repeats are pending: {mode_err}"
     );
 
-    // Advance virtual clock past DAMIAO_DISABLE_CONFIRM (still below the 500 ms fence deadline)
-    // with no post-command replies: disable fails and MIT fence STILL stays armed.
-    clock.advance(Duration::from_millis(350));
-    let expire_err = drv
-        .poll_torque(clock.now() + Duration::from_millis(50))
-        .expect_err("unconfirmed fenced disable must error on expiry");
-    assert!(expire_err.to_string().contains("MIT fence stays"), "{expire_err}");
-    assert!(drv.mit_fence_trip().is_none(), "fence stayed armed via unconfirmed disable, not age trip");
-    assert!(drv
-        .set_joint_modes(&[JointMode::Position; 7], &hold)
-        .is_err());
+    // Repeat #2 at +20 ms: still Pending and MIT fence still armed.
+    clock.advance(Duration::from_millis(20));
+    let p2 = drv.poll_torque(clock.now() + Duration::from_millis(50)).unwrap();
+    assert!(matches!(p2, TorqueProgress::Pending { .. }));
+    assert!(drv.set_joint_modes(&[JointMode::Position; 7], &hold).is_err());
 
-    // Now start disable again and provide genuine post-command state-0 feedback on the same
-    // frozen timestamp: `rx_seq` advances past the command boundary, confirming disable and
-    // releasing the MIT fence!
-    let _ = drv.begin_torque(false).unwrap();
-    bus.with(|s| s.push_all_feedback());
+    // Repeat #3 at +20 ms: completes bounded repeats and releases the MIT fence!
+    clock.advance(Duration::from_millis(20));
     let p_ok = drv.poll_torque(clock.now() + Duration::from_millis(50)).unwrap();
     assert_eq!(p_ok, TorqueProgress::Done(TorqueOutcome::Confirmed));
-    assert_eq!(drv.enable_state(), EnableState::Disabled);
     drv.set_joint_modes(&[JointMode::Position; 7], &hold)
-        .expect("confirmed post-command disable must release MIT fence");
+        .expect("completed bounded disable repeats must release MIT fence");
 
-    // (b) Stale disabled feedback (virtual clock advances past 250 ms with silent CAN bus):
-    // `enable_state()` MUST become `Unknown` even with `!is_enabled`, and `shutdown_ready()`
-    // / `request_shutdown()` MUST refuse until current state-0 feedback returns!
+    // (b) Startup unsolicited 0x0 feedback is telemetry only: owner `torque_intent` defaults to
+    // `On`, so `shutdown_ready()` refuses until an explicit disable is accepted by the owner.
     let clock2 = MockClock::new();
     let bus2 = FakeBus::with_clock(&dm_limits(), clock2.clone());
     bus2.with(|s| {
-        s.immediate_replies = false;
+        s.immediate_replies = true;
         s.push_all_feedback();
     });
     let mut drv2 = DamiaoArmDriver::new(bus2.clone(), vec![1, 2, 3, 4, 5, 6, 7])
         .with_joint_limits(dm_limits())
         .unwrap();
     drv2.read_joint_states().unwrap();
-    assert_eq!(drv2.enable_state(), EnableState::Disabled);
+    assert_eq!(
+        drv2.enable_state(),
+        EnableState::Disabled,
+        "telemetry reports motor state 0 as Disabled"
+    );
     let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv2)));
     sup.set_lease_enabled(false).await;
-    assert!(sup.shutdown_ready().await, "current state-0 feedback confirms shutdown_ready");
-
-    // Advance virtual clock past 250 ms without any new CAN frames -> stale feedback -> Unknown!
-    clock2.advance(Duration::from_millis(300));
     assert!(
         !sup.shutdown_ready().await,
-        "stale disabled Damiao feedback (>250 ms) must make enable_state Unknown and refuse shutdown_ready"
+        "unsolicited startup 0x0 without accepted disable must refuse shutdown_ready"
     );
-    assert!(
-        !sup.request_shutdown().await.unwrap(),
-        "request_shutdown must refuse stale disabled Damiao feedback"
-    );
-
-    // Fresh state-0 feedback restores Disabled and shutdown_ready!
-    bus2.with(|s| s.push_all_feedback());
-    {
-        let inner = sup.inner().read().await;
-        let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
-        drv.read_joint_states().unwrap();
-        assert_eq!(drv.enable_state(), EnableState::Disabled);
+    // Explicit accepted disable via the supervisor goes through the K=3 rest-pose gate (R12 B5)
+    // and records `torque_intent = Off` -> `shutdown_ready`.
+    for _ in 0..3 {
+        clock2.advance(Duration::from_millis(15));
+        bus2.with(|s| s.push_all_feedback());
+        sup.tick(0.02).await;
     }
+    sup.disable_torque().await.unwrap();
     assert!(sup.shutdown_ready().await);
     assert!(sup.request_shutdown().await.unwrap());
 }
@@ -1996,6 +2057,9 @@ async fn panic_disable_retries_transient_j3_send_failure_and_disables_all_motors
         fn receive(&mut self) -> Result<CanFrame, TransportError> {
             self.inner.receive()
         }
+        fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<Instant>), TransportError> {
+            self.inner.receive_timestamped()
+        }
         fn flush(&mut self) -> Result<(), TransportError> {
             self.inner.flush()
         }
@@ -2175,14 +2239,17 @@ async fn mit_fence_trip_confirmed_disable_stays_shutdown_ready_and_repeated_unkn
     let _ = drv.read_joint_states();
     assert!(drv.mit_fence_trip().is_some(), "MIT deadline fence must be tripped");
 
-    // Disable torque and confirm from fresh post-command state-0 feedback while leaving the
-    // MIT fence trip UNACKNOWLEDGED (`poll_tx_allowed()` stays false).
-    drv.set_torque(false).unwrap();
-    assert_eq!(drv.enable_state(), EnableState::Disabled);
-    assert!(drv.mit_fence_trip().is_some(), "unacknowledged MIT fence trip must remain set");
-
+    // Disable torque via supervisor while leaving the MIT fence trip UNACKNOWLEDGED
+    // (`poll_tx_allowed()` stays false): satisfy K=3 rest-pose gate (R12 B5) with arriving
+    // feedback across 3 releases, then disable records `torque_intent = Off`.
     let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
     sup.set_lease_enabled(false).await;
+    for _ in 0..3 {
+        clock.advance(Duration::from_millis(15));
+        bus.with(|s| s.push_all_feedback());
+        sup.tick(0.02).await;
+    }
+    sup.disable_torque().await.unwrap();
     assert!(sup.shutdown_ready().await);
 
     // Advance virtual clock by 1 full second with ZERO polls (and verify `read_joint_states()`
@@ -2193,8 +2260,8 @@ async fn mit_fence_trip_confirmed_disable_stays_shutdown_ready_and_repeated_unkn
     });
     clock.advance(Duration::from_secs(1));
     {
-        let inner = sup.inner().read().await;
-        let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+        let mut inner = sup.inner().write().await;
+        let mut drv = inner.driver.as_mut().unwrap().write().unwrap();
         drv.read_joint_states().unwrap();
         assert!(!drv.is_feedback_valid(), "1 s without polls must make feedback ages stale (>250 ms)");
         assert!(drv.mit_fence_trip().is_some(), "MIT fence trip for output must stay active");
@@ -2204,8 +2271,14 @@ async fn mit_fence_trip_confirmed_disable_stays_shutdown_ready_and_repeated_unkn
         );
         assert_eq!(
             drv.enable_state(),
-            EnableState::Disabled,
-            "confirmed post-command disable must stay sticky Disabled after 1 s without polls"
+            EnableState::Unknown,
+            "telemetry enable_state must report Unknown after 1 s without polls"
+        );
+        drop(drv);
+        assert_eq!(
+            inner.torque_intent(),
+            armd::TorqueIntent::Off,
+            "accepted disable decision torque_intent must remain Off after 1 s without polls"
         );
     }
     assert!(
@@ -2214,25 +2287,25 @@ async fn mit_fence_trip_confirmed_disable_stays_shutdown_ready_and_repeated_unkn
     );
     assert!(
         sup.shutdown_ready().await,
-        "shutdown_ready must be true 1 s after confirmed disable following an MIT fence trip"
+        "shutdown_ready must remain true 1 s after accepted disable following an MIT fence trip"
     );
     assert!(
         sup.request_shutdown().await.unwrap(),
-        "request_shutdown must succeed on sticky confirmed disable"
+        "request_shutdown must succeed by decision (torque_intent == Off)"
     );
 
-    // Verify a later enable request clears sticky Disabled (so enable_state is no longer sticky).
+    // Verify a later enable request sets `torque_intent = On` and revokes shutdown readiness.
     {
         let inner = sup.inner().write().await;
         inner.e_stop_latched.store(false, Ordering::SeqCst);
-        let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
-        let _ = drv.begin_torque(true);
-        assert_ne!(
-            drv.enable_state(),
-            EnableState::Disabled,
-            "starting a later enable request must clear sticky Disabled"
-        );
     }
+    let _ = sup.enable_torque(sup.capture_admission_stamp()).await;
+    assert_eq!(
+        sup.inner().read().await.torque_intent(),
+        armd::TorqueIntent::On,
+        "starting a later enable must set torque_intent = On"
+    );
+    assert!(!sup.shutdown_ready().await);
 
     // (b) Repeated shutdown signal when state is Unknown issues a new bounded disable request
     // (Legacy path): fresh Damiao driver starts with no feedback (`Unknown`) and `immediate_replies`
@@ -2499,7 +2572,10 @@ fn j7_refresh_drain_counts_against_release_rx_budget_and_reports_consumed_frames
             self.inner.transmit(frame)
         }
         fn receive(&mut self) -> Result<CanFrame, TransportError> {
-            match self.inner.receive() {
+            self.receive_timestamped().map(|(f, _)| f)
+        }
+        fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<Instant>), TransportError> {
+            match self.inner.receive_timestamped() {
                 Ok(f) => {
                     self.rx_dequeued.fetch_add(1, Ordering::SeqCst);
                     Ok(f)
@@ -2803,6 +2879,9 @@ async fn panic_disable_rt_persistent_j3_unconfirmed_and_damiao_stale_refresh_and
         fn receive(&mut self) -> Result<CanFrame, TransportError> {
             self.inner.receive()
         }
+        fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<Instant>), TransportError> {
+            self.inner.receive_timestamped()
+        }
         fn flush(&mut self) -> Result<(), TransportError> {
             self.inner.flush()
         }
@@ -2904,6 +2983,7 @@ async fn panic_disable_rt_persistent_j3_unconfirmed_and_damiao_stale_refresh_and
     drv_clk.check_mapping_ranges();
     drv_clk.set_torque(true).unwrap();
 
+    // Pass 1 at t = 0: J1,J2,J4..J7 transmit CMD_DISABLE (J3 fails TX once) -> returns [2].
     let rem_pass1 = drv_clk
         .panic_disable_step(true, clock.now() + Duration::from_millis(10))
         .unwrap()
@@ -2911,46 +2991,33 @@ async fn panic_disable_rt_persistent_j3_unconfirmed_and_damiao_stale_refresh_and
     assert_eq!(rem_pass1, vec![2]);
     assert_eq!(bus_clk.j3_failures.load(Ordering::SeqCst), 1);
 
-    // Advance past the 250 ms feedback validity window so J1,J2,J4..J7 become stale.
+    // Advance past the 250 ms feedback validity window so feedback telemetry becomes Unknown.
     clock.advance(Duration::from_millis(300));
     assert!(!drv_clk.is_feedback_valid());
+    assert_eq!(drv_clk.enable_state(), EnableState::Unknown);
+    assert_eq!(drv_clk.unconfirmed_disable_joints(), vec![2]);
     inner_clk.clear_log();
 
+    // Pass 2: sends CMD_DISABLE to pending J3, completing immediately.
     let rem_pass2 = drv_clk
         .panic_disable_step(false, clock.now() + Duration::from_millis(10))
         .unwrap()
         .unwrap();
-    assert!(rem_pass2.is_empty(), "pass 2 must confirm all 7 motors: {rem_pass2:?}");
-    assert!(drv_clk.is_feedback_valid());
-    assert_eq!(drv_clk.enable_state(), EnableState::Disabled);
-    let pass2_disable_ids: Vec<u32> = inner_clk
-        .tx_log()
-        .iter()
-        .filter(|f| f.data == armd::protocol::damiao::CMD_DISABLE)
-        .map(|f| f.id)
-        .collect();
-    for id in 1u32..=7 {
-        assert!(
-            pass2_disable_ids.contains(&id),
-            "pass 2 must refresh stale motor J{id} alongside J3: {pass2_disable_ids:?}"
-        );
-    }
-
-    // Post-confirmed sticky expiry > 250ms: disable_confirmed_sticky is true, feedback is stale.
-    clock.advance(Duration::from_millis(300));
-    assert_eq!(drv_clk.enable_state(), EnableState::Disabled);
-    assert!(!drv_clk.is_feedback_valid());
-    inner_clk.with(|s| s.immediate_replies = false);
-    assert_eq!(
-        drv_clk.unconfirmed_disable_joints(),
-        vec![0, 1, 2, 3, 4, 5, 6],
-        "stale motors with no CAN replies must all appear in unconfirmed_disable_joints()"
+    assert!(rem_pass2.is_empty(), "pass 2 must complete after J3 CMD_DISABLE TX succeeds: {rem_pass2:?}");
+    assert!(
+        inner_clk.tx_log().iter().any(|f| f.id == 3 && f.data == armd::protocol::damiao::CMD_DISABLE),
+        "pass 2 must send CMD_DISABLE to pending J3"
     );
-    inner_clk.clear_log();
+    assert_eq!(bus_clk.j3_successes.load(Ordering::SeqCst), 1);
+    assert!(drv_clk.unconfirmed_disable_joints().is_empty());
 
-    // Already-expired step deadline transmits 0 CMD_DISABLE frames (Damiao TX deadline gate).
+    // Already-expired step deadline on a fresh panic_disable_step(true, ...) transmits 0 CMD_DISABLE frames (Damiao TX deadline gate).
+    clock.advance(Duration::from_millis(300));
+    assert!(!drv_clk.is_feedback_valid());
+    assert_eq!(drv_clk.enable_state(), EnableState::Unknown);
+    inner_clk.clear_log();
     let rem_expired = drv_clk
-        .panic_disable_step(false, clock.now())
+        .panic_disable_step(true, clock.now())
         .unwrap()
         .unwrap();
     assert_eq!(rem_expired, vec![0, 1, 2, 3, 4, 5, 6]);
@@ -2962,27 +3029,15 @@ async fn panic_disable_rt_persistent_j3_unconfirmed_and_damiao_stale_refresh_and
         "expired step deadline must transmit 0 CMD_DISABLE frames"
     );
 
-    inner_clk.with(|s| s.immediate_replies = true);
+    // Follow-up step with a valid deadline disables all 7 motors and restores fresh Disabled telemetry.
     inner_clk.clear_log();
-    let rem_sticky = drv_clk
+    let rem_retry = drv_clk
         .panic_disable_step(false, clock.now() + Duration::from_millis(10))
         .unwrap()
         .unwrap();
-    assert!(rem_sticky.is_empty());
-    assert!(drv_clk.is_feedback_valid(), "stale sticky disable step must refresh feedback validity");
+    assert!(rem_retry.is_empty());
+    assert!(drv_clk.is_feedback_valid());
     assert_eq!(drv_clk.enable_state(), EnableState::Disabled);
-    let sticky_disable_ids: Vec<u32> = inner_clk
-        .tx_log()
-        .iter()
-        .filter(|f| f.data == armd::protocol::damiao::CMD_DISABLE)
-        .map(|f| f.id)
-        .collect();
-    for id in 1u32..=7 {
-        assert!(
-            sticky_disable_ids.contains(&id),
-            "stale sticky disable step must refresh all 7 motors (missing J{id}): {sticky_disable_ids:?}"
-        );
-    }
 
     // (c) Undrained RX boundary on single `panic_disable_step(true, ...)`:
     // Queue stale state-0 feedback without draining (`last_read_drained == false`), then run one

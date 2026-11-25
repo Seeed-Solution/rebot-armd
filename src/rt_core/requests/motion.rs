@@ -787,6 +787,7 @@ fn commit_quintic_slot(
     verify_motion_authority(inner, slot.kind, slot.speed_scale_opt(), &slot.target[..dof], expected_epoch, require_fresh_feedback)?;
     let (torque_clamped, power_clamped) = verify_motion_freshness(inner, slot)?;
     inner.preflight_admission(stamp).map_err(map_admission_err)?;
+    inner.check_terminal_fifo_for_new_action().map_err(map_admission_err)?;
     let mut eff_pos = [0.0f32; MAX_DOF];
     let (_, quiesce_macro_gripper) = if dof <= MAX_DOF {
         inner.post_quiesce_commanded_positions(&mut eff_pos)
@@ -875,6 +876,7 @@ pub fn install_park_at(inner: &mut SupervisorInner, stamp: AdmissionStamp, slot:
         return Err(MotionInstallError::PlanStale);
     }
     inner.preflight_admission(stamp).map_err(map_admission_err)?;
+    inner.check_terminal_fifo_for_new_action().map_err(map_admission_err)?;
 
     let (this, proof) = inner.check_admission(stamp).map_err(map_admission_err)?.consume().map_err(map_admission_err)?;
     let (epoch, stop_gen, lease_gen, ws_rev, mc_rev) = (this.safety.epoch_id(), stamp.stop_gen, this.active_lease.as_ref().map(|l| l.generation), this.workspace_revision, this.motion_config_revision);
@@ -993,6 +995,7 @@ pub fn install_watchdog_park(
     }
     if !inner.is_torqued || inner.pending_rearm || inner.disable_pending || inner.torque_transition.is_some()
         || inner.mit_active() || inner.handover_settling_since.is_some() || inner.collision.hold.is_some()
+        || inner.core.motion_inhibited_by_config() || inner.calibration_busy
     {
         return Err(MotionInstallError::MotionBusy);
     }

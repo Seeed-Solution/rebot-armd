@@ -266,19 +266,20 @@ fn spawn_simulator(q: Vec<f32>, stop: Arc<AtomicBool>) -> String {
 #[tokio::test]
 async fn sim_follower_sets_the_zero_and_reads_it_back() {
     let stop = Arc::new(AtomicBool::new(false));
-    let raw = vec![0.2f32, -0.3, 0.4, 0.05, -0.1, 0.25, 0.02];
+    // Arm rests within the resting-pose gate tolerance (0.05 rad) so DisableRequested passes B5.
+    let raw = vec![0.02f32, -0.03, 0.04, 0.01, -0.01, 0.025, 0.02];
     let addr = spawn_simulator(raw.clone(), stop.clone());
     let drv = armd::sim_driver::SimArmDriver::connect(&addr, 7).unwrap();
     let mut r = rig(Some(Box::new(drv)), |_| {}).await;
     // feedback flowing
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    while (r.sup.inner().read().await.measured_positions[0] - 0.2).abs() > 1e-6 {
+    while (r.sup.inner().read().await.measured_positions[0] - 0.02).abs() > 1e-6 {
         assert!(tokio::time::Instant::now() < deadline, "no sim feedback");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let dry = cmd(&mut r, PATH, json!({"joints": [2, 3], "dry_run": true})).await;
     assert_eq!(dry["persist"], json!("simulator"), "{dry}");
-    assert!((dry["joints"][0]["reading_rad"].as_f64().unwrap() + 0.3).abs() < 1e-6);
+    assert!((dry["joints"][0]["reading_rad"].as_f64().unwrap() + 0.03).abs() < 1e-6);
     let ok = cmd(&mut r, PATH, json!({"joints": [2, 3]})).await;
     assert_eq!(ok["type"], "command_ack", "{ok}");
     for row in ok["joints"].as_array().unwrap() {
@@ -289,7 +290,7 @@ async fn sim_follower_sets_the_zero_and_reads_it_back() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     let q = r.sup.inner().read().await.measured_positions.clone();
     assert!(q[1].abs() < 1e-6 && q[2].abs() < 1e-6, "{q:?}");
-    assert!((q[0] - 0.2).abs() < 1e-6 && (q[3] - 0.05).abs() < 1e-6, "others keep their reading: {q:?}");
+    assert!((q[0] - 0.02).abs() < 1e-6 && (q[3] - 0.01).abs() < 1e-6, "others keep their reading: {q:?}");
     assert!(!r.sup.inner().read().await.is_torqued);
     stop.store(true, Ordering::SeqCst);
 }

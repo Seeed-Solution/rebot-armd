@@ -53,13 +53,14 @@ pub mod tool;
 pub mod trajectory;
 pub mod urdf;
 #[cfg(not(target_arch = "wasm32"))] pub mod transport;
+#[cfg(not(target_arch = "wasm32"))] pub mod vision_detector;
 pub mod wasm_api;
 
 #[cfg(not(target_arch = "wasm32"))] pub use api::{create_router, create_router_with_auth};
 #[cfg(not(target_arch = "wasm32"))] pub use auth::OperatorAuth;
 #[cfg(not(target_arch = "wasm32"))] pub use driver::{
     ArmDriver, ArmDriverError, DamiaoArmDriver, FashionStarArmDriver, FeetechArmDriver,
-    JointMode, JointTarget, RobStrideArmDriver,
+    HoldPassReport, JointHoldStatus, JointMode, JointTarget, RobStrideArmDriver,
 };
 pub use gravity::{compute_gravity_torques, GravityError};
 #[cfg(not(target_arch = "wasm32"))]
@@ -77,15 +78,16 @@ pub use motor_mode::{
 pub use safety::{FaultCode, FaultInfo, FaultKind, FaultReason, SafetyError, SafetyManager, SafetyState, StopPolicy};
 #[cfg(not(target_arch = "wasm32"))] pub use supervisor::{
     AdmissionStamp, Admitted, ArmError, ArmSupervisor, MotionStartKind, MotionStartOp,
-    PreemptError, SupervisorInner,
+    PreemptError, SupervisorInner, TorqueIntent, STOPPED_HOLD_CONTENTION_ESCALATE_SKIPS,
 };
 pub use trajectory::{
     MultiJointQuinticTrajectory, QuinticPolynomial, TrajectoryError, TrajectoryPlanner,
     TrajectoryPoint,
 };
 #[cfg(not(target_arch = "wasm32"))] pub use transport::{
-    AsyncTransport, CanFrame, CanTransport, DriverClock, MockCanTransport, MockClock, MockTransport,
-    SerialTransport, SerialTransportConfig, SlcanCodec, SlcanTransport, Transport, TransportError,
+    AsyncTransport, CanFrame, CanRxTime, CanTransport, DriverClock, MockCanTransport, MockClock,
+    MockTransport, SerialTransport, SerialTransportConfig, SlcanCodec, SlcanTransport, Transport,
+    TransportError,
 };
 
 #[cfg(all(not(target_arch = "wasm32"), target_os = "linux"))]

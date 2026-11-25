@@ -206,6 +206,41 @@ impl ArmDriver for WakeDriver {
         true
     }
 
+    fn has_driver_fresh_position_api(&self) -> bool {
+        true
+    }
+
+    fn fresh_joint_positions_into(
+        &self,
+        joints: &[usize],
+        max_age: Duration,
+        out: &mut [f32],
+    ) -> bool {
+        if joints.is_empty() || out.len() < joints.len() {
+            return false;
+        }
+        let now = self.now();
+        for (slot, &i) in out.iter_mut().zip(joints.iter()) {
+            let fresh = self
+                .rx_at
+                .get(i)
+                .copied()
+                .flatten()
+                .is_some_and(|t| now.saturating_duration_since(t) <= max_age);
+            if !fresh {
+                return false;
+            }
+            let Some(&p) = self.q.get(i) else {
+                return false;
+            };
+            if !p.is_finite() {
+                return false;
+            }
+            *slot = p;
+        }
+        true
+    }
+
     fn feedback_ages(&self) -> Vec<Option<Duration>> {
         let now = self.now();
         self.rx_at.iter().map(|t| t.map(|t| now.saturating_duration_since(t))).collect()
@@ -1347,4 +1382,538 @@ fn a8_blocked_zero_check_store_offset_serialization_zero_alloc() {
         .join()
         .unwrap();
     }
+}
+
+#[test]
+fn phase_marks_csw_mark_and_staged_publish_zero_alloc() {
+    use armd::diagnostics::tick::{
+        mid_csw_delta, stash_periodic_sample_with_post_end, take_periodic_sample_with_post_end,
+        us, CswMark, Holder, LockFreeTickStats, ReleasePhasesUs, ThreadUsage, TickSample,
+        UsageMark, WakeLatenessGuard,
+    };
+
+    let (delta, snap) = thread::spawn(|| {
+        let lf = LockFreeTickStats::new();
+        let loc = std::panic::Location::caller();
+        alloc::time_this_thread();
+
+        // Warm up TLS slots once before measuring.
+        {
+            let _g = WakeLatenessGuard::enter_periodic(100, true);
+            stash_periodic_sample_with_post_end(TickSample::default(), Instant::now());
+            let _ = take_periodic_sample_with_post_end();
+        }
+        let _ = CswMark::now();
+        let _ = UsageMark::now();
+        let _ = alloc::take();
+
+        let before = alloc::snapshot_counts();
+        for i in 0..200u32 {
+            let _g = WakeLatenessGuard::enter_periodic(u64::from(i) * 1_000, true);
+            let started = Instant::now();
+            let usage_start = UsageMark::now();
+            let locked = Instant::now();
+            let usage_locked = UsageMark::now();
+            let mid_csw_start = CswMark::now();
+            let lock_end = Instant::now();
+            let _allocs = alloc::take();
+            let after_alloc_read = Instant::now();
+            let after_ack_flush = Instant::now();
+            let after_terminal = Instant::now();
+            let released = Instant::now();
+            let usage_released = UsageMark::now();
+            let (mid_nvcsw, mid_nivcsw) = mid_csw_delta(&mid_csw_start, &usage_released);
+            let done = Instant::now();
+            let holder = Holder {
+                kind: "write",
+                location: loc,
+                command: Some("/api/v1/motion/jog"),
+                action_id: Some(u64::from(i)),
+                hold_us: 50,
+                acquire_us: 2,
+                acquired_before_wait_us: 10,
+                released_before_lock_us: 5,
+            };
+            let sample = TickSample {
+                tick_us: us(done.saturating_duration_since(started)),
+                release_us: 0,
+                wait_us: i,
+                lock_us: us(lock_end.saturating_duration_since(locked)),
+                post_us: us(done.saturating_duration_since(released)),
+                phases_us: ReleasePhasesUs {
+                    alloc_read: us(after_alloc_read.saturating_duration_since(lock_end)),
+                    ack_flush: us(after_ack_flush.saturating_duration_since(after_alloc_read)),
+                    terminal: us(after_terminal.saturating_duration_since(after_ack_flush)),
+                    guard_drop: us(released.saturating_duration_since(after_terminal)),
+                    post: us(done.saturating_duration_since(released)),
+                    publish: 0,
+                },
+                usage: ThreadUsage {
+                    mid_nvcsw,
+                    mid_nivcsw,
+                    ..armd::diagnostics::tick::thread_usage(&usage_start, &usage_locked, &usage_released)
+                },
+                waited_for: Some(holder),
+                longest_hold: Some(holder),
+                ..Default::default()
+            };
+            stash_periodic_sample_with_post_end(sample, done);
+            let (stashed, post_end) = take_periodic_sample_with_post_end().expect("stashed sample");
+            let seq = lf
+                .record_staged_with_publish(&stashed, || {
+                    let now = Instant::now();
+                    (
+                        us(now.saturating_duration_since(started)),
+                        us(now.saturating_duration_since(post_end)),
+                    )
+                })
+                .expect("record_staged_with_publish");
+            lf.amend_slot_release_and_publish_us(seq, 1, 1);
+        }
+        let delta = alloc::snapshot_counts().delta_since(before);
+        (delta, lf.snapshot())
+    })
+    .join()
+    .unwrap();
+
+    assert_eq!(
+        delta,
+        AllocCounts::ZERO,
+        "phase marks + CswMark + record_staged_with_publish must allocate 0 bytes: {delta:?}"
+    );
+    let mw = snap.max_wait.expect("max_wait");
+    assert_eq!(mw.sample.wait_us, 199);
+    assert_eq!(mw.handoff_us, Some(5));
+    assert!(snap.max_release.unwrap().sample.phases_us.publish >= 1);
+}
+
+#[test]
+fn terminal_capture_action_completion_dwell_saturation_and_positive_control_zero_alloc() {
+    use std::sync::atomic::AtomicUsize;
+
+    // 1) Legacy control release (`control_tick`, `keep = false`): verify zero allocations on
+    //    action completion, 50 dwell ticks (0 captures per tick), ring saturation (counted &
+    //    marked, no dwell retry), and positive control proving `alloc::take()` covers capture.
+    let (legacy_clean, legacy_dwell, legacy_sat, legacy_pos_sample_calls, legacy_pos_mono) =
+        thread::spawn(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+                sup.set_lease_enabled(false).await;
+                sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
+                sup.inner().write().await.prewarm_observation_slots();
+                // Warm up all 3 triple-buffer slots + TLS stats before opting in.
+                for _ in 0..4 {
+                    sup.control_tick(0.02).await;
+                }
+
+                alloc::time_this_thread();
+                let _ = alloc::take();
+
+                // (a) Real in-tick trajectory completion on legacy control release:
+                //     `tick_control_inner` -> `finish_action` -> `capture_edge_terminals`
+                //     (`capture_from` + SPSC push) all execute strictly inside the measured window.
+                sup.inner().write().await.test_start_zero_heap_jog_rt(0.02, 0.04);
+                let b_complete = alloc::snapshot_counts();
+                for _ in 0..40 {
+                    sup.control_tick(0.02).await;
+                    if sup.test_terminal_capture_stats().captured >= 1 {
+                        break;
+                    }
+                }
+                let d_complete = alloc::snapshot_counts().delta_since(b_complete);
+                let s_complete = sup.tick_samples().last().copied().unwrap();
+                assert_eq!(s_complete.usage.lock_alloc_calls, 0, "completion lock_alloc_calls must be 0");
+                let st_complete = sup.test_terminal_capture_stats();
+                assert_eq!((st_complete.captured, st_complete.saturated, st_complete.ever_saturated), (1, 0, false));
+
+                // (b) 50 dwell ticks after terminal action: 0 additional captures, 0 heap ops.
+                let b_dwell = alloc::snapshot_counts();
+                for _ in 0..50 {
+                    sup.control_tick(0.02).await;
+                }
+                let d_dwell = alloc::snapshot_counts().delta_since(b_dwell);
+                let s_dwell = sup.tick_samples().last().copied().unwrap();
+                assert_eq!(s_dwell.usage.lock_alloc_calls, 0, "dwell lock_alloc_calls must be 0");
+                let st_dwell = sup.test_terminal_capture_stats();
+                assert_eq!(st_dwell.captured, 1, "dwell must perform 0 captures per tick");
+                assert_eq!(st_dwell.saturated, 0);
+
+                // (c) Ring saturation: pause drain, cap ring at 4, complete 8 more real in-tick
+                //     jogs -> 4 captured, 5 saturated, ever_saturated=true, 0 heap ops, and
+                //     20 dwell ticks do not retry.
+                sup.test_set_terminal_capture_drain_paused(true);
+                sup.test_set_terminal_capture_push_cap(4);
+                let mut d_sat = AllocCounts::ZERO;
+                for k in 0..8 {
+                    let delta = if k % 2 == 0 { -0.02 } else { 0.02 };
+                    sup.inner().write().await.test_start_zero_heap_jog_rt(delta, 0.04);
+                    let target_total = 1 + (k + 1) as u64;
+                    for _ in 0..40 {
+                        let before_tick = alloc::snapshot_counts();
+                        sup.control_tick(0.02).await;
+                        let delta_tick = alloc::snapshot_counts().delta_since(before_tick);
+                        d_sat.alloc += delta_tick.alloc;
+                        d_sat.alloc_zeroed += delta_tick.alloc_zeroed;
+                        d_sat.realloc += delta_tick.realloc;
+                        d_sat.dealloc += delta_tick.dealloc;
+                        assert_eq!(
+                            sup.tick_samples().last().copied().unwrap().usage.lock_alloc_calls,
+                            0,
+                            "saturated completion release lock_alloc_calls must be 0"
+                        );
+                        let st = sup.test_terminal_capture_stats();
+                        if st.captured + st.saturated >= target_total {
+                            break;
+                        }
+                    }
+                }
+                let b_sat_dwell = alloc::snapshot_counts();
+                for _ in 0..20 {
+                    sup.control_tick(0.02).await;
+                }
+                let d_sat_dwell = alloc::snapshot_counts().delta_since(b_sat_dwell);
+                d_sat.alloc += d_sat_dwell.alloc;
+                d_sat.alloc_zeroed += d_sat_dwell.alloc_zeroed;
+                d_sat.realloc += d_sat_dwell.realloc;
+                d_sat.dealloc += d_sat_dwell.dealloc;
+                let st_sat = sup.test_terminal_capture_stats();
+                assert_eq!(st_sat.captured, 4, "cap=4 (1 already queued + 3 more)");
+                assert_eq!(st_sat.saturated, 5, "5 saturated edges must be counted exactly once each");
+                assert!(st_sat.ever_saturated, "ever_saturated must latch true");
+                let s_sat = sup.tick_samples().last().copied().unwrap();
+                assert_eq!(s_sat.usage.lock_alloc_calls, 0, "saturated release lock_alloc_calls must be 0");
+
+                // (d) Positive control: inject a heap allocation strictly inside capture_edge_terminals
+                //     and verify BOTH `lock_alloc_calls` (moved `alloc::take()`) AND monotonic counts fail.
+                let fired = Arc::new(AtomicUsize::new(0));
+                let fired_c = Arc::clone(&fired);
+                sup.inner().write().await.terminal_capture_test_hook = Some(Arc::new(move |_, entering| {
+                    if entering && fired_c.fetch_add(1, Ordering::AcqRel) == 0 {
+                        let b = Box::new([0xA5u8; 128]);
+                        std::hint::black_box(&b);
+                        drop(b);
+                    }
+                }));
+                let b_pos = alloc::snapshot_counts();
+                sup.control_tick(0.02).await;
+                let d_pos = alloc::snapshot_counts().delta_since(b_pos);
+                let s_pos = sup.tick_samples().last().copied().unwrap();
+                sup.inner().write().await.terminal_capture_test_hook = None;
+                (d_complete, d_dwell, d_sat, s_pos.usage.lock_alloc_calls, d_pos)
+            })
+        })
+        .join()
+        .unwrap();
+
+    assert_eq!(legacy_clean, AllocCounts::ZERO, "legacy terminal completion must allocate 0 bytes");
+    assert_eq!(legacy_dwell, AllocCounts::ZERO, "legacy dwell must allocate 0 bytes");
+    assert_eq!(legacy_sat, AllocCounts::ZERO, "legacy saturated ring must allocate 0 bytes");
+    assert!(
+        legacy_pos_sample_calls >= 2,
+        "positive control: injected alloc in capture MUST be caught by TickSample.usage.lock_alloc_calls (got {legacy_pos_sample_calls})"
+    );
+    assert!(
+        legacy_pos_mono.alloc >= 1 && legacy_pos_mono.dealloc >= 1,
+        "positive control: injected alloc in capture MUST be caught by monotonic AllocCounts (got {legacy_pos_mono:?})"
+    );
+
+    // 2) RT Executor (`start_executor_with_hooks`): action completion, dwell (0 captures/tick),
+    //    ring saturation, and positive control on `armd-control`.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let clock = ScriptedClock::new();
+        let (drv, _) = WakeDriver::new(7, Duration::from_millis(14), Some(clock.clone()));
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
+        sup.set_lease_enabled(false).await;
+        sup.test_set_terminal_capture_drain_paused(true);
+        sup.test_set_terminal_capture_push_cap(2);
+        sup.register_ws_connection(1).await.unwrap();
+
+        let hook_arm = Arc::new(AtomicBool::new(false));
+        let hook_arm_c = Arc::clone(&hook_arm);
+        sup.inner().write().await.terminal_capture_test_hook = Some(Arc::new(move |_, entering| {
+            if entering && hook_arm_c.swap(false, Ordering::AcqRel) {
+                let b = Box::new(0x55AA_u64);
+                std::hint::black_box(&b);
+                drop(b);
+            }
+        }));
+
+        // Capture motion config snapshot before starting executor.
+        let motion_cfg = {
+            let inner = sup.inner().read().await;
+            Arc::new(armd::rt_core::requests::motion::MotionConfigSnapshot::from_supervisor(&inner))
+        };
+
+        let hooks = PersistTestHooks {
+            clock: Some(clock.clone()),
+            ..Default::default()
+        };
+        let handle = sup
+            .start_executor_with_hooks(
+                ExecutorConfig {
+                    alloc_timing: true,
+                    ..ExecutorConfig::for_tests(Duration::from_millis(10))
+                },
+                hooks,
+            )
+            .await
+            .unwrap();
+        let period_ns = 10_000_000u64;
+        clock.run_steps(period_ns, 3);
+        assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO);
+
+        // Enable torque (sub-release wake) then run 4 short jogs -> 2 captured, 2 saturated.
+        let auth0 = Authority {
+            lease_generation: 0,
+            epoch: sup.capture_admission_stamp().estop_epoch,
+            stop_generation: 0,
+            config_revision: 0,
+            parent_generation: 0,
+        };
+        let _tok = handle
+            .broker()
+            .lock()
+            .unwrap()
+            .submit(
+                ClientId(1),
+                1,
+                auth0,
+                clock.now() + Duration::from_secs(5),
+                Submit::Transition(TransitionOp::TorqueOn),
+            )
+            .unwrap();
+        clock.run_steps(period_ns, 4);
+
+        let mut client_seq = 10u64;
+        for k in 0..4u64 {
+            let snap = sup.hub().latest().unwrap();
+            let from = snap.rt.commanded_positions.clone();
+            let v0 = vec![0.0f32; from.len()];
+            let mut to = from.clone();
+            to[0] += if k % 2 == 0 { 0.02 } else { -0.02 };
+            let msnap = armd::rt_core::requests::motion::MotionPlanSnapshot {
+                config: Arc::clone(&motion_cfg),
+                commanded_positions: from.clone(),
+                commanded_velocities: v0,
+                measured_positions: from,
+                torque_hold: None,
+                power_hold: None,
+                holding_after_clear: false,
+                mit_active: false,
+                authority: armd::rt_core::requests::motion::PlanAuthority {
+                    boot: snap.rt.boot_id,
+                    epoch: snap.obs.epoch_id,
+                    lease_generation: 0,
+                    stop_generation: snap.rt.stop_generation,
+                    deadline: clock.now() + Duration::from_secs(5),
+                },
+                workspace_revision: snap.rt.workspace_revision,
+                motion_config_revision: snap.rt.motion_config_revision,
+            };
+            let jog_slot = armd::rt_core::requests::motion::prepare_motion(
+                &msnap,
+                &armd::rt_core::requests::motion::MotionRequest::jog(to, Some(0.05), None),
+            )
+            .unwrap()
+            .slot;
+            client_seq += 1;
+            let auth = Authority {
+                lease_generation: 0,
+                epoch: snap.obs.epoch_id,
+                stop_generation: snap.rt.stop_generation,
+                config_revision: 0,
+                parent_generation: 0,
+            };
+            let req = handle
+                .broker()
+                .lock()
+                .unwrap()
+                .submit(
+                    ClientId(1),
+                    client_seq,
+                    auth,
+                    clock.now() + Duration::from_secs(5),
+                    Submit::Install(&move |s: &mut PlanSlot| {
+                        armd::rt_core::requests::motion::stage_jog(s, &jog_slot);
+                    }),
+                )
+                .unwrap();
+            // Advance until this jog reaches a terminal state (bounded).
+            let mut finished = false;
+            for _ in 0..80 {
+                clock.run_steps(period_ns, 1);
+                let _ = drain_broker(&handle);
+                if let Some(s) = sup.hub().latest() {
+                    if s.obs
+                        .action
+                        .as_ref()
+                        .is_some_and(|a| a.id > k && !a.is_running())
+                    {
+                        finished = true;
+                        break;
+                    }
+                }
+            }
+            assert!(finished, "jog {k} ({req:?}) did not reach terminal state");
+        }
+
+        let stats_after_moves = sup.test_terminal_capture_stats();
+        assert_eq!(stats_after_moves.captured, 2, "push_cap=2: {stats_after_moves:?}");
+        assert_eq!(stats_after_moves.saturated, 2, "2 actions must saturate: {stats_after_moves:?}");
+        assert!(stats_after_moves.ever_saturated);
+        assert_eq!(
+            handle.stats().total_allocs(),
+            AllocCounts::ZERO,
+            "RT executor action completion + saturation must perform 0 heap ops"
+        );
+
+        // 20 dwell releases: 0 additional captures, 0 additional saturates, 0 heap ops.
+        clock.run_steps(period_ns, 20);
+        let stats_after_dwell = sup.test_terminal_capture_stats();
+        assert_eq!(stats_after_dwell.captured, stats_after_moves.captured);
+        assert_eq!(stats_after_dwell.saturated, stats_after_moves.saturated);
+        assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO);
+
+        // Positive control on RT executor: arm the capture hook allocation -> total_allocs() > 0.
+        hook_arm.store(true, Ordering::Release);
+        clock.run_steps(period_ns, 1);
+        let pos_allocs = handle.stats().total_allocs();
+        assert!(
+            pos_allocs.alloc >= 1 && pos_allocs.dealloc >= 1,
+            "positive control: injected capture alloc on RT executor must be caught: {pos_allocs:?}"
+        );
+
+        handle.stop_and_join();
+    });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cf1_calibration_and_software_zero_executor_zero_rt_alloc() {
+    use armd::calibration::{CalibrationDeps, ExecutorCalibAuth};
+    use armd::model::HolderLabel;
+    use armd::motor_zero::{self, MotorZeroRequest};
+    use armd::rt_core::requests::config::capture_config_admission;
+
+    let dir = tempfile::tempdir().unwrap();
+    let calib_path = dir.path().join("calibration.json");
+    let setup_path = dir.path().join("grasp_setup.json");
+
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    let lease_conn = "alloc-cf1-conn".to_string();
+    let (lease_gen, epoch) = {
+        let mut inner = sup.inner().write().await;
+        inner.measured_positions = vec![0.0, 0.25, -0.25, 0.0, 0.0, 0.0, 0.0];
+        inner.commanded_positions = inner.measured_positions.clone();
+        inner.target_positions = inner.measured_positions.clone();
+        // Seed populated tracking history WITH occupied spares so executor handoff
+        // (`normalize_spares_off_thread`) normalizes colliding spares while preserving active
+        // history, and the first RT tick + software-zero activation execute 0 allocs / 0 frees.
+        inner.tracking.record_issued(vec![0.1; 7], vec![0.01; 7]);
+        inner.tracking.invalidate(); // moves vectors into spare_issued_*
+        inner.tracking.record_issued(vec![0.2; 7], vec![0.02; 7]);
+        inner.tracking.last_nominal = Some((vec![0.2; 7], vec![0.0; 7]));
+        let g = inner.acquire_lease(&lease_conn).unwrap();
+        (g, inner.safety.epoch_id())
+    };
+    let handle = sup
+        .start_executor(alloc_cfg(Duration::from_millis(2)))
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while sup.hub().latest().is_none() {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO);
+
+    let det_up = armd::api::proxy::DetectorUpstream::parse("http://127.0.0.1:9").unwrap();
+    let cal_deps = CalibrationDeps::new(calib_path, Some(setup_path), det_up);
+
+    // Software joint zero + joint-zero restore on Executor MUST perform 0 RT allocs/frees.
+    let auth_zero = ExecutorCalibAuth {
+        admission: capture_config_admission(&sup, 1, lease_gen, Some(epoch)),
+        lease_holder: Some((HolderLabel::new(&lease_conn), lease_gen)),
+        operator_grant: armd::auth::OperatorGrant::unenforced(),
+        auth_check: Arc::new(|| Ok(())),
+        txn_id: None,
+    };
+    let sw_req = MotorZeroRequest {
+        joints: vec![1, 2],
+        dry_run: false,
+        force: false,
+        method: Some("software".into()),
+    };
+    let sw_out = motor_zero::run_software_executor(&sup, &cal_deps, sw_req, auth_zero)
+        .await
+        .expect("software zero on executor");
+    let backup = sw_out["restore"]["backup"].as_str().unwrap().to_string();
+
+    let auth_restore = ExecutorCalibAuth {
+        admission: capture_config_admission(&sup, 1, lease_gen, Some(epoch)),
+        lease_holder: Some((HolderLabel::new(&lease_conn), lease_gen)),
+        operator_grant: armd::auth::OperatorGrant::unenforced(),
+        auth_check: Arc::new(|| Ok(())),
+        txn_id: None,
+    };
+    let _restored = motor_zero::restore_executor(&sup, &cal_deps, backup, auth_restore)
+        .await
+        .expect("joint-zero restore on executor");
+
+    let counts = handle.stats().total_allocs();
+    let lock_attempts = sup.inner().control_thread_attempts();
+    tokio::task::spawn_blocking(move || handle.stop_and_join())
+        .await
+        .unwrap();
+    assert_eq!(
+        counts,
+        AllocCounts::ZERO,
+        "C-F1 software zero + restore allocated on RT: {counts:?}"
+    );
+    assert_eq!(lock_attempts, 0, "C-F1 attempted SupervisorLock on RT");
+
+    // Directly verify zero RT alloc/free when TrackingRuntime holds occupied active history,
+    // occupied spares, heap-backed SlotBuf depths (len > 16), AND a populated FallbackRamp
+    // simultaneously at the moment of software-zero invalidation.
+    let mut inner = armd::supervisor::SupervisorInner::new(ArmConfig::rebot_dm());
+    inner.tracking.record_issued(vec![0.1; 7], vec![0.01; 7]);
+    inner.tracking.invalidate(); // fills spares
+    inner.tracking.record_issued_with_ws_depths(
+        vec![0.2; 7],
+        vec![0.02; 7],
+        Some((1, armd::kinematics::SlotBuf::zeros(32))),
+        Some((1, armd::kinematics::SlotBuf::zeros(32))),
+    );
+    inner.tracking.last_nominal = Some((vec![0.2; 7], vec![0.0; 7]));
+    inner.tracking.fallback_ramp = Some(armd::tracking::FallbackRamp {
+        hold: vec![0.0; 7],
+        keepout_only: false,
+        limits: Vec::with_capacity(7),
+    });
+    alloc::time_this_thread();
+    let before = alloc::snapshot_counts();
+    let retired = inner.tracking.invalidate_retiring_for_test();
+    let delta = alloc::snapshot_counts().delta_since(before);
+    assert_eq!(
+        delta,
+        AllocCounts::ZERO,
+        "invalidate_retiring allocated/freed on RT with occupied spares + heap depths + fallback_ramp: {delta:?}"
+    );
+    // Dropping `retired` off-RT frees the displaced buffers (positive control: dealloc > 0).
+    let before_drop = alloc::snapshot_counts();
+    drop(retired);
+    let drop_delta = alloc::snapshot_counts().delta_since(before_drop);
+    assert!(
+        drop_delta.dealloc >= 6,
+        "retired tracking payload must actually own displaced heap buffers for off-RT drop: {drop_delta:?}"
+    );
+    drop(inner);
 }

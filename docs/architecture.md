@@ -38,7 +38,8 @@ targets; they are not packaged by the script.
 ## Contracts
 
 Core and kits interact only through these four contracts. Versions are those in the code at
-the time of writing.
+the time of writing. For the learned-policy package and runtime contract (`rebot-onnx-policy/v1`,
+backends, freshness fences, and action chunking), see [policy_runtime.md](policy_runtime.md).
 
 ### 1. Arm profile
 
@@ -205,6 +206,7 @@ have no `capabilities` object; it parses as all false, `version` 0.
 | `torque_guard` | the profile enables `torque_guard` with `damiao_ranges` and the driver reports torque: a joint at or above `ratio` × TMAX for `persist_ms` stops the motion (action code `TORQUE_LIMIT`, `motion_limit.reason` `torque`); the policy is `schema.torque_guard` (version 8) |
 | `vision.detection_proxy` | always true: the detection routes exist; reachability of the provider is not checked |
 | `vision.mode_endpoint` | (string) always `/api/v1/vision/mode` |
+| `vision.detector_switch` | always true: `POST /api/v1/vision/detector` switches the detector between the default `detect` and `segment` models ([detection API](detection_api.md)) |
 | `vision.modes` | (list) modes the provider reports (`off`, `yolo`, `aruco`, `both`); empty when it is unreachable or has no `/api/mode` |
 | `vision.mode` | (string or null) the provider's current base mode |
 | `vision.api_version` | (number or null) the provider's perception API version |

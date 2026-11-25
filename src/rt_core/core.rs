@@ -169,6 +169,10 @@ impl ArmCore {
     /// `seq` of the last publication (0: none yet).
     pub fn published_seq(&self) -> u64 { self.hub().published_seq() }
 
+    /// Exact publication sequence number the next [`Self::publish_with_rt_meta`] will assign.
+    #[inline]
+    pub fn next_publish_seq(&self) -> u64 { self.publisher.next_seq() }
+
     /// Pre-warms empty triple-buffer observation slots before the RT release loop begins,
     /// without blocking on a contended reader or advancing `published_seq`.
     pub fn try_prewarm_observations(&mut self, make: impl FnMut() -> ArmObservation) {

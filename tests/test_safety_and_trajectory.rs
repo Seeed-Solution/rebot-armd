@@ -634,10 +634,12 @@ async fn test_set_torque_fails_when_feedback_unavailable() {
         Err(ArmError::Safety(SafetyError::FeedbackUnavailable))
     ));
 
-    // Confirm arm remains un-torqued
+    // No automatic rollback: arm enters FailedHold + non-recoverable ENABLE_FAILED.
     let obs = supervisor.get_observation().await;
     assert!(obs.is_torqued, "Missing feedback cannot confirm de-energization");
-    assert!(obs.disable_pending);
+    assert!(!obs.disable_pending);
+    assert_eq!(obs.fault.as_ref().map(|f| f.code), Some(armd::FaultCode::EnableFailed));
+    assert_eq!(obs.fault.as_ref().map(|f| f.recoverable), Some(false));
 }
 
 #[tokio::test]
@@ -741,19 +743,21 @@ async fn test_enable_hardware_failure_rolls_back_and_latches_fault() {
     };
     supervisor.set_driver(Box::new(driver)).await;
 
-    // Enabling torque must fail and rollback
+    // Enabling torque must fail without automatic rollback and latch non-recoverable ENABLE_FAILED
     let res = supervisor.enable_torque(supervisor.capture_admission_stamp()).await;
     assert!(res.is_err());
 
-    // 1 call to set_torque(true), followed by 1 rollback call to set_torque(false)
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
-    assert!(!last_state.load(Ordering::SeqCst));
+    // 1 call to set_torque(true); ZERO automatic rollback calls to set_torque(false)
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(last_state.load(Ordering::SeqCst));
 
-    // Rollback write is not hardware confirmation; preserve the possible-powered state.
+    // Preserve the possible-powered state in FailedHold until operator clears & re-enables / disables.
     let obs = supervisor.get_observation().await;
     assert!(obs.is_torqued);
-    assert!(obs.disable_pending);
+    assert!(!obs.disable_pending);
     assert!(matches!(obs.safety_state, SafetyState::Fault(_)));
+    assert_eq!(obs.fault.as_ref().map(|f| f.code), Some(armd::FaultCode::EnableFailed));
+    assert_eq!(obs.fault.as_ref().map(|f| f.recoverable), Some(false));
 }
 
 struct StaleAfterEnableDriver {

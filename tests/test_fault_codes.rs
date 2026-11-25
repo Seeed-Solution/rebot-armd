@@ -68,6 +68,7 @@ fn fault_code_all_lists_every_variant_once() {
         "INVALID_TELEMETRY", "DRIVER_WRITE_FAILED", "CAN_TX_STALLED", "J7_FEEDBACK_STALE", "HARDWARE_FAULT", "ENABLE_FAILED", "SERVO_NO_BRAKE",
         "HANDOVER_UNSETTLED", "GRAVITY_COMP_FAILED", "COLLISION", "OTHER",
     ]);
+    assert!(!FaultCode::EnableFailed.recoverable());
 }
 
 #[test]

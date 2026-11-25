@@ -2028,60 +2028,93 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         if sink_tracker.is_abandoned(action.0) {
                             return DeliveryDecision::Abandoned;
                         }
-                        // Preserve exact chronological order on this socket: flush any queued
-                        // observer terminals with `id < action.0` onto `ordinary_out_tx` BEFORE
-                        // enqueuing this owner-routed terminal.
-                        if !sink_sup.flush_observer_terminals_before(action.0) {
+                        let latest_snap = sink_sup.hub().latest();
+                        let base_seq = latest_snap.as_ref().map_or(0, |s| s.meta.seq);
+                        // Respect the single authoritative `TerminalCaptureChannel` + `publish_seq`
+                        // barrier. Read `terminal_capture_has_inflight()` (Acquire) STRICTLY BEFORE
+                        // `lookup_finished_entry()` — the exact inverse of `drain_into`'s write
+                        // order (`record_finished_with_seq` -> `inflight.fetch_sub(Release)`) so a
+                        // concurrent handoff can never observe `(None, inflight == 0)`.
+                        let has_inflight = sink_sup.terminal_capture_has_inflight();
+                        let captured_entry = sink_sup.lookup_finished_entry(action.0);
+                        if let Some(entry) = captured_entry.as_ref() {
+                            if entry.obs_override.is_none()
+                                && (latest_snap.is_none()
+                                    || entry
+                                        .required_publish_seq
+                                        .is_some_and(|req_seq| base_seq < req_seq))
+                            {
+                                return DeliveryDecision::Backpressured;
+                            }
+                        } else if has_inflight || latest_snap.is_none() {
                             return DeliveryDecision::Backpressured;
                         }
-                        let mut obs = match sink_sup.hub().latest() {
-                            Some(s) => s.obs.clone(),
-                            None => return DeliveryDecision::Backpressured,
+                        // Preserve exact chronological order on this socket: flush any queued
+                        // observer terminals with `id < action.0` (respecting `base_seq`) onto
+                        // `ordinary_out_tx` BEFORE enqueuing this owner-routed terminal.
+                        if !sink_sup.flush_observer_terminals_before(action.0, base_seq) {
+                            return DeliveryDecision::Backpressured;
+                        }
+                        let (mut obs, status) = match captured_entry {
+                            Some(entry) => {
+                                let base = match entry.obs_override {
+                                    Some(captured) => captured,
+                                    None => match latest_snap {
+                                        Some(snap) => snap.obs.clone(),
+                                        None => return DeliveryDecision::Backpressured,
+                                    },
+                                };
+                                (base, entry.action)
+                            }
+                            None => {
+                                let Some(snap) = latest_snap else {
+                                    return DeliveryDecision::Backpressured;
+                                };
+                                let base = snap.obs.clone();
+                                let status = base
+                                    .action
+                                    .as_ref()
+                                    .filter(|a| a.id == action.0 && !a.is_running())
+                                    .cloned()
+                                    .or_else(|| {
+                                        base.previous_action
+                                            .as_ref()
+                                            .filter(|a| a.id == action.0 && !a.is_running())
+                                            .cloned()
+                                    })
+                                    .unwrap_or_else(|| {
+                                        let mut s = crate::motion::ActionStatus::blank();
+                                        s.id = action.0;
+                                        s.state = crate::model::HolderLabel::new(match outcome {
+                                            Outcome::Completed => "done",
+                                            Outcome::Cancelled(_)
+                                            | Outcome::Superseded
+                                            | Outcome::Stopped => "cancelled",
+                                            Outcome::Failed(_) => "failed",
+                                        });
+                                        s.code = match outcome {
+                                            Outcome::Completed => None,
+                                            Outcome::Cancelled(code) | Outcome::Failed(code) => {
+                                                Some(crate::model::HolderLabel::new(code))
+                                            }
+                                            Outcome::Superseded => {
+                                                Some(crate::model::HolderLabel::new("SUPERSEDED"))
+                                            }
+                                            Outcome::Stopped => {
+                                                Some(crate::model::HolderLabel::new("STOPPED"))
+                                            }
+                                        };
+                                        s.progress = if matches!(outcome, Outcome::Completed) {
+                                            1.0
+                                        } else {
+                                            0.0
+                                        };
+                                        s.finished_at = Some(base.timestamp);
+                                        s
+                                    });
+                                (base, status)
+                            }
                         };
-                        let status = sink_sup
-                            .lookup_finished_action(action.0)
-                            .or_else(|| {
-                                obs.action
-                                    .as_ref()
-                                    .filter(|a| a.id == action.0 && !a.is_running())
-                                    .cloned()
-                            })
-                            .or_else(|| {
-                                obs.previous_action
-                                    .as_ref()
-                                    .filter(|a| a.id == action.0 && !a.is_running())
-                                    .cloned()
-                            })
-                            .unwrap_or_else(|| {
-                                let mut s = crate::motion::ActionStatus::blank();
-                                s.id = action.0;
-                                s.state = crate::model::HolderLabel::new(match outcome {
-                                    Outcome::Completed => "done",
-                                    Outcome::Cancelled(_) | Outcome::Superseded | Outcome::Stopped => {
-                                        "cancelled"
-                                    }
-                                    Outcome::Failed(_) => "failed",
-                                });
-                                s.code = match outcome {
-                                    Outcome::Completed => None,
-                                    Outcome::Cancelled(code) | Outcome::Failed(code) => {
-                                        Some(crate::model::HolderLabel::new(code))
-                                    }
-                                    Outcome::Superseded => {
-                                        Some(crate::model::HolderLabel::new("SUPERSEDED"))
-                                    }
-                                    Outcome::Stopped => {
-                                        Some(crate::model::HolderLabel::new("STOPPED"))
-                                    }
-                                };
-                                s.progress = if matches!(outcome, Outcome::Completed) {
-                                    1.0
-                                } else {
-                                    0.0
-                                };
-                                s.finished_at = Some(obs.timestamp);
-                                s
-                            });
                         obs.action = Some(status);
                         obs.previous_action = None;
                         let Ok(val) = serde_json::to_value(&obs) else {
@@ -2427,6 +2460,14 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 },
                 _ = std::future::ready(()), if pending_latest_telemetry.is_some() => {
                     if let Some(mut obs) = pending_latest_telemetry.take() {
+                        // Suppress any buffered or lag-resynced `running` snapshot whose action
+                        // already terminated via a synthetic post-publish terminal frame.
+                        if obs.action.as_ref().is_some_and(|a| {
+                            a.is_running()
+                                && writer_supervisor.is_action_synthetically_terminated(a.id)
+                        }) {
+                            continue;
+                        }
                         if let Some(rate) = obs_rate {
                             if !rate.due(last_sent, obs.timestamp) { continue; }
                             last_sent = Some(obs.timestamp);
@@ -2630,7 +2671,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             // (never re-sampled downstream).
             let received_at = Instant::now();
             let stamp = crate::supervisor::AdmissionStamp {
-                stop_gen: reader_supervisor.stop_generation(),
+                stop_gen: reader_supervisor.current_stop_gen(),
                 estop_epoch: value
                     .get("epoch_id")
                     .and_then(Value::as_u64)

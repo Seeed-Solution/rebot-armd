@@ -31,7 +31,7 @@ use super::urgent::{
     UrgentStopError, UrgentStopOutcome, URGENT_STOP_CAPACITY,
 };
 use crate::diagnostics::tick::{
-    LockPhases, ThreadUsage, TickSample, UsageMark, RELEASE_FLAG_CLEAR_OK,
+    LockPhases, ReleasePhasesUs, ThreadUsage, TickSample, UsageMark, RELEASE_FLAG_CLEAR_OK,
     RELEASE_FLAG_CLEAR_REFUSED, RELEASE_FLAG_ESTOP_APPLIED, RELEASE_FLAG_INJECT_ALLOC,
     RELEASE_FLAG_SAFETY_LATCH, RELEASE_FLAG_THERMAL_TRIP, RELEASE_FLAG_WATCHDOG_LATCH,
 };
@@ -1472,6 +1472,8 @@ pub struct PersistTestHooks {
     pub panic_on_release: Option<u64>,
     /// Forces `armd-control` init to fail (`Some(true)` returns `real`; `Some(false)` drops `real`).
     pub fail_init: Option<bool>,
+    /// Simulates `armd-control` thread spawn failure before ownership is sent to the thread.
+    pub fail_control_spawn: bool,
     /// Injects a one-shot sleep inside the next release body (tests overrun + `skipped_releases`).
     pub release_delay_once: Option<Arc<Mutex<Option<Duration>>>>,
     /// Injects a one-shot sleep strictly AFTER StateHub publication, `tick_us` end mark,
@@ -2615,10 +2617,6 @@ pub(crate) struct OffThreadSinks {
     servo_dispatcher: Arc<ServoTargetDispatcher>,
     hub: Arc<StateHub>,
     offload_reclaim_rx: Mutex<Consumer<OffloadReclaim>>,
-    rt_terminal_rx: Mutex<Consumer<RtTerminalStatus>>,
-    rt_terminal_popped: Arc<AtomicU64>,
-    rt_terminal_overflow: Arc<AtomicU64>,
-    terminals: Option<Arc<crate::supervisor::TerminalBroadcaster>>,
 }
 
 impl OffThreadSinks {
@@ -2674,14 +2672,11 @@ impl OffThreadSinks {
         }
     }
 
-    pub(crate) fn drain_all(&self, tick_stats: &crate::diagnostics::tick::LockFreeTickStats) {
-        self.drain_all_inner(tick_stats, true);
-    }
-
-    fn drain_all_inner(
+    /// Stage 1 of off-RT sink draining: diagnostics, reclaims, safety logs, maintenance, and
+    /// urgent stop replies — runs BEFORE `TerminalCaptureChannel::drain_into`.
+    pub(crate) fn drain_pre_broker(
         &self,
         tick_stats: &crate::diagnostics::tick::LockFreeTickStats,
-        drain_broker: bool,
     ) {
         self.drain_diag(tick_stats);
         self.estop_reg.lock().unwrap_or_else(|e| e.into_inner()).drain();
@@ -2744,7 +2739,12 @@ impl OffThreadSinks {
         }
         self.maint_client.drain_replies();
         self.urgent_stop_client.drain_replies();
-        self.drain_rt_terminals();
+    }
+
+    /// Stage 2 of off-RT sink draining: runs strictly AFTER `TerminalCaptureChannel::drain_into`
+    /// populates `TerminalBroadcaster` (respecting the `publish_seq` barrier), preserving Step 7
+    /// causal ordering (`broker_dispatcher` BEFORE `conn_lifecycle_client`).
+    pub(crate) fn drain_post_terminal(&self, drain_broker: bool) {
         // Preserve owner Step 7 causal ordering off-thread: broker terminals (e.g. an aborted
         // TorqueOn fenced by Disconnect) resolve strictly BEFORE lifecycle waiters (Disconnect).
         if drain_broker {
@@ -2812,37 +2812,13 @@ impl OffThreadSinks {
         tick_stats: &crate::diagnostics::tick::LockFreeTickStats,
         drain_broker: bool,
     ) {
-        self.drain_all_inner(tick_stats, drain_broker);
+        self.drain_pre_broker(tick_stats);
+        self.drain_post_terminal(drain_broker);
         let mut log_g = self.safety_log_rx.lock().unwrap_or_else(|e| e.into_inner());
         let total = self.stats.safety_log_dropped.load(Ordering::Relaxed);
         if total > 0 && total != log_g.2 {
             log_g.2 = total;
             crate::safety::emit_safety_log_shutdown_summary(total);
-        }
-    }
-
-    pub(crate) fn rt_terminal_overflow(&self) -> u64 {
-        self.rt_terminal_overflow.load(Ordering::Acquire)
-    }
-
-    fn drain_rt_terminals(&self) {
-        let mut rx = self
-            .rt_terminal_rx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        while let Ok(rec) = rx.pop() {
-            self.rt_terminal_popped.fetch_add(1, Ordering::Release);
-            if let Some(terminals) = self.terminals.as_ref() {
-                let measurement = self.hub.action_measurement(rec.id);
-                let policy_stats = if rec.policy_stats.is_none() && rec.kind.as_str() == "policy" {
-                    self.hub.action_policy_stats(rec.id)
-                } else {
-                    None
-                };
-                let durability_warning = self.hub.action_durability_warning(rec.id);
-                let status = rec.into_action_status(measurement, policy_stats, durability_warning);
-                terminals.record_finished(&status);
-            }
         }
     }
 }
@@ -2902,7 +2878,7 @@ impl TeardownDisable {
 
 pub use super::reply_router::{
     AckCommitGuard, ConnectionReplySink, ConnectionSlotToken, ExternalDestinationPolicy,
-    ExternalReplySink, ExternalSubmitError, ReplyRouterStats, RtTerminalStatus, WsWireAckTracker,
+    ExternalReplySink, ExternalSubmitError, ReplyRouterStats, WsWireAckTracker,
 };
 use super::reply_router::ActionReplyRouter;
 
@@ -3135,6 +3111,8 @@ pub(crate) struct ServoTargetDispatcher {
     atomic_fenced_lease_gen: Arc<AtomicU64>,
     #[cfg(feature = "policy-runtime")]
     atomic_closed_policy_action_id: Arc<AtomicU64>,
+    #[cfg(feature = "policy-runtime")]
+    policy_refusal_gen: Arc<AtomicU64>,
 }
 
 impl ServoTargetDispatcher {
@@ -3147,6 +3125,8 @@ impl ServoTargetDispatcher {
         #[cfg(feature = "policy-runtime")]
         atomic_closed_policy_action_id: Arc<AtomicU64>,
     ) -> Self {
+        #[cfg(feature = "policy-runtime")]
+        let policy_refusal_gen = writer.policy_refusal_gen_arc();
         Self {
             inner: Mutex::new(ServoTargetDispatcherInner {
                 port: crate::supervisor::targets::TargetPort::new(writer, arm, boot),
@@ -3170,7 +3150,14 @@ impl ServoTargetDispatcher {
             atomic_fenced_lease_gen,
             #[cfg(feature = "policy-runtime")]
             atomic_closed_policy_action_id,
+            #[cfg(feature = "policy-runtime")]
+            policy_refusal_gen,
         }
+    }
+
+    #[cfg(feature = "policy-runtime")]
+    pub(crate) fn policy_refusal_gen(&self) -> u64 {
+        self.policy_refusal_gen.load(Ordering::Acquire)
     }
 
     fn sync_authoritative_fence_locked(&self, g: &mut ServoTargetDispatcherInner) {
@@ -3523,6 +3510,91 @@ impl ServoTargetDispatcher {
         sub
     }
 
+    /// Runs a synchronous final policy commit gate and optional mailbox publication under a
+    /// single acquisition of the dispatcher mutex (after draining outcomes and verifying stream
+    /// liveness), so no mutex stall can occur between slot selection (`gate_now`) and triple-buffer
+    /// publication.
+    #[cfg(feature = "policy-runtime")]
+    pub(crate) fn submit_policy_gated<R, F>(
+        &self,
+        hub: &StateHub,
+        action_id: u64,
+        gate: F,
+    ) -> R
+    where
+        F: FnOnce(
+            bool,
+            bool,
+            &mut dyn FnMut(
+                &crate::supervisor::targets::PolicyTarget<'_>,
+                super::mailbox::PolicyValidityBounds,
+            ) -> super::mailbox::Submitted,
+        ) -> R,
+    {
+        let mut resolved_cmds = Vec::new();
+        let mut stream_refusals = Vec::new();
+        let res = {
+            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            self.sync_authoritative_fence_locked(&mut g);
+            g.pop_outcomes_locked(hub, &mut resolved_cmds, &mut stream_refusals);
+            let mut has_pending_refusal = false;
+            g.policy_outcomes.retain(|(aid, o)| {
+                if *aid == action_id {
+                    if o.result.is_err() {
+                        has_pending_refusal = true;
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
+            let is_closed = g.closed
+                || self.exited.load(Ordering::Acquire)
+                || g.port.is_policy_closed(action_id);
+            let mut submit_fn =
+                |target: &crate::supervisor::targets::PolicyTarget<'_>,
+                 validity: super::mailbox::PolicyValidityBounds|
+                 -> super::mailbox::Submitted {
+                    if is_closed {
+                        return super::mailbox::Submitted::OutOfOrder;
+                    }
+                    let coalesced_before = g.port.coalesced();
+                    let prev_key = g.last_inflight_key;
+                    let sub = g.port.submit_policy_with_validity(target, validity);
+                    match sub {
+                        super::mailbox::Submitted::Accepted
+                        | super::mailbox::Submitted::Coalesced { .. } => {
+                            g.policy_submitted_count = g.policy_submitted_count.saturating_add(1);
+                            if target.action_id != 0
+                                && !g.tracked_policy_streams.contains(&target.action_id)
+                            {
+                                if g.tracked_policy_streams.len() >= 64 {
+                                    g.tracked_policy_streams.pop_front();
+                                }
+                                g.tracked_policy_streams.push_back(target.action_id);
+                            }
+                            let assigned_seq = g.port.last_seq();
+                            let sid = crate::supervisor::targets::policy_stream(target.action_id);
+                            g.last_inflight_key = Some((sid, assigned_seq));
+                            if matches!(sub, super::mailbox::Submitted::Coalesced { .. })
+                                || g.port.coalesced() > coalesced_before
+                            {
+                                g.note_coalesced_locked(prev_key, &mut resolved_cmds);
+                            }
+                        }
+                        super::mailbox::Submitted::Busy => {
+                            g.policy_busy_count = g.policy_busy_count.saturating_add(1);
+                        }
+                        _ => {}
+                    }
+                    sub
+                };
+            gate(is_closed, has_pending_refusal, &mut submit_fn)
+        };
+        Self::deliver_drained(hub, (resolved_cmds, stream_refusals));
+        res
+    }
+
     #[cfg(feature = "policy-runtime")]
     pub(crate) fn close_policy(&self, action_id: u64) {
         if action_id == 0 {
@@ -3705,6 +3777,16 @@ impl Drop for SerialDrainGuard<'_> {
     }
 }
 
+/// Synchronized completion state for `armd-control`:
+/// - `dropping` becomes `true` under the mutex only after the final `teardown_disable.requested`
+///   checkpoint immediately before `drop(core)`.
+/// - `exited` becomes `true` strictly AFTER `drop(core)` completes on `armd-control`.
+#[derive(Clone, Copy, Default)]
+struct ControlExitState {
+    dropping: bool,
+    exited: bool,
+}
+
 struct RtExecutorShared {
     boot: BootId,
     broker: Arc<Mutex<Broker<PlanSlot>>>,
@@ -3712,6 +3794,7 @@ struct RtExecutorShared {
     target_writer: TargetWriterHandle,
     servo_dispatcher: Arc<ServoTargetDispatcher>,
     stop_requests: StopRequests,
+    estop_state: Arc<crate::rt_core::urgent::EstopState>,
     stats: Arc<ExecutorStats>,
     maint_client: Arc<MaintClient>,
     urgent_stop_client: Arc<UrgentStopClient>,
@@ -3725,7 +3808,7 @@ struct RtExecutorShared {
     persist_stop: Arc<AtomicBool>,
     exited: Arc<AtomicBool>,
     control_rt_state: std::sync::atomic::AtomicU8,
-    control_exited_cv: Arc<(Mutex<bool>, Condvar)>,
+    control_exited_cv: Arc<(Mutex<ControlExitState>, Condvar)>,
     persist_worker_exited: Arc<AtomicBool>,
     persist_exited_cv: Arc<(Mutex<bool>, Condvar)>,
     shutdown_confirmed: Arc<AtomicBool>,
@@ -3740,23 +3823,6 @@ struct RtExecutorShared {
 }
 
 impl RtExecutorShared {
-    fn wait_flag(cv: &(Mutex<bool>, Condvar), timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        let mut g = cv.0.lock().unwrap_or_else(|e| e.into_inner());
-        while !*g {
-            let rem = deadline.saturating_duration_since(Instant::now());
-            if rem.is_zero() {
-                break;
-            }
-            let (next, res) = cv.1.wait_timeout(g, rem).unwrap_or_else(|e| e.into_inner());
-            g = next;
-            if res.timed_out() {
-                break;
-            }
-        }
-        *g
-    }
-
     /// Stops the RT owner (`armd-control`) FIRST so a stalled persistence worker can never block
     /// owner shutdown or emergency hardware disable, then joins or bounds persistence cleanup.
     fn teardown_and_join_inner(&self, emergency_bound: Option<Duration>) {
@@ -3772,47 +3838,59 @@ impl RtExecutorShared {
             clock.wake();
         }
 
-        if let Some(bound) = emergency_bound {
-            // Wait up to `bound` for `armd-control` to finish its bounded disable and exit;
-            // if a driver syscall stalls past the bound, take and detach the join handle so no
-            // later teardown or `Drop` can join it without a deadline.
-            let _ = self.teardown_disable.wait_outcome(bound);
-            let finished = !self.teardown_disable.timed_out.load(Ordering::Acquire)
-                && Self::wait_flag(&self.control_exited_cv, Duration::from_millis(50));
-            if let Some(jh) = self.control_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
-                if finished {
-                    let _ = jh.join();
-                    self.control_rt_state.store(RT_STATE_JOINED, Ordering::Release);
-                } else {
-                    self.control_rt_state.store(RT_STATE_DETACHED, Ordering::Release);
-                    self.exited.store(true, Ordering::Release);
-                    tracing::error!(
-                        "Emergency teardown: detaching stalled RT executor thread (`armd-control`) after {:?} timeout so later teardown/Drop cannot block indefinitely",
-                        bound
-                    );
-                    drop(jh);
+        // Unified bounded completion protocol across emergency, panic, and ordinary teardown:
+        // - Emergency teardown shares ONE absolute deadline across `wait_outcome` and thread exit.
+        // - `control_exited_cv.exited` is published strictly AFTER `drop(core)` completes.
+        // - On timeout before `armd-control` finishes, lock `control_exited_cv.0`: if not yet
+        //   exited and shutdown was NOT owner-confirmed, latch `estop_state` and set
+        //   `teardown_disable.requested = true` UNDER THAT SAME MUTEX so `armd-control` cannot
+        //   enter `drop(core)` without observing the disable request and fencing remaining TX.
+        let mut finished = if let Some(bound) = emergency_bound {
+            let control_deadline = Instant::now() + bound;
+            let _ = self
+                .teardown_disable
+                .wait_outcome(control_deadline.saturating_duration_since(Instant::now()));
+            wait_control_exited_or_timed_out_until(
+                &self.control_exited_cv,
+                &self.teardown_disable,
+                control_deadline.max(Instant::now() + Duration::from_millis(25)),
+            )
+        } else {
+            let control_deadline =
+                Instant::now() + self.teardown_disable_timeout + Duration::from_millis(100);
+            wait_control_exited_or_timed_out_until(
+                &self.control_exited_cv,
+                &self.teardown_disable,
+                control_deadline,
+            )
+        };
+        if !finished {
+            let st = self
+                .control_exited_cv
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if st.exited {
+                finished = true;
+            } else if !self.shutdown_confirmed.load(Ordering::Acquire) {
+                self.estop_state.request_and_latch();
+                if !st.dropping {
+                    self.teardown_disable.requested.store(true, Ordering::Release);
                 }
             }
-        } else if self.teardown_disable.timed_out.load(Ordering::Acquire) {
-            // A prior panic or emergency deadline observer already recorded `TimedOut`:
-            // wait only briefly for clean exit, then detach so `Drop`/`stop_and_join` stay bounded.
-            let finished = Self::wait_flag(&self.control_exited_cv, Duration::from_millis(50));
-            if let Some(jh) = self.control_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
-                if finished {
-                    let _ = jh.join();
-                    self.control_rt_state.store(RT_STATE_JOINED, Ordering::Release);
-                } else {
-                    self.control_rt_state.store(RT_STATE_DETACHED, Ordering::Release);
-                    self.exited.store(true, Ordering::Release);
-                    tracing::error!(
-                        "Teardown: detaching stalled RT executor thread (`armd-control`) after panic/emergency timeout so Drop cannot block indefinitely"
-                    );
-                    drop(jh);
-                }
+        }
+        if let Some(jh) = self.control_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            if finished {
+                let _ = jh.join();
+                self.control_rt_state.store(RT_STATE_JOINED, Ordering::Release);
+            } else {
+                self.control_rt_state.store(RT_STATE_DETACHED, Ordering::Release);
+                self.exited.store(true, Ordering::Release);
+                tracing::error!(
+                    "Teardown: detaching stalled RT executor thread (`armd-control`) after bounded wait so later teardown/Drop cannot block indefinitely"
+                );
+                drop(jh);
             }
-        } else if let Some(jh) = self.control_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            let _ = jh.join();
-            self.control_rt_state.store(RT_STATE_JOINED, Ordering::Release);
         }
         let rt_joined = self.control_rt_state.load(Ordering::Acquire) == RT_STATE_JOINED;
 
@@ -3821,23 +3899,23 @@ impl RtExecutorShared {
             let _ = jh.join();
         }
 
-        // Now wait for persistence cleanup: bounded + detach on emergency teardown (so a hung
-        // `sync_all` cannot block returning the torque-off outcome or a subsequent `Drop`),
-        // full join on normal teardown / Drop.
-        if emergency_bound.is_some() {
-            let finished = Self::wait_flag(&self.persist_exited_cv, Duration::from_millis(50));
-            if let Some(jh) = self.persist_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
-                if finished {
-                    let _ = jh.join();
-                } else {
-                    tracing::warn!(
-                        "Emergency teardown: detaching stalled persistence worker (`armd-persist`) after bounded wait so later teardown/Drop cannot block indefinitely"
-                    );
-                    drop(jh);
-                }
-            }
-        } else if let Some(jh) = self.persist_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            let _ = jh.join();
+        // Bounded persistence cleanup on BOTH emergency (`50ms`) and ordinary teardown
+        // (`teardown_disable_timeout + 100ms`): normal fsync finishes in milliseconds and joins
+        // cleanly with durability intact, while a stalled parent-directory fsync detaches after
+        // the bound instead of hanging `shutdown_and_join`, `stop_and_join`, or `Drop`.
+        let persist_bound = if emergency_bound.is_some() {
+            Duration::from_millis(50)
+        } else {
+            self.teardown_disable_timeout + Duration::from_millis(100)
+        };
+        if let Some(jh) = self.persist_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            stop_and_join_persist_bounded(
+                &self.persist_stop,
+                &self.persist_park_thread,
+                &self.persist_exited_cv,
+                jh,
+                Instant::now() + persist_bound,
+            );
         }
 
         // Final off-thread drain and reclamation (single finalization owner for broker/router).
@@ -4172,6 +4250,26 @@ impl RtExecutorHandle {
             .submit_policy(&self.shared.hub, target, validity)
     }
 
+    /// Runs `gate` synchronously inside the target-dispatcher lock (after draining outcomes and
+    /// checking stream closure) so `commit_gate(now)` slot selection and triple-buffer publication
+    /// execute atomically without intervening mutex waits.
+    #[cfg(feature = "policy-runtime")]
+    pub(crate) fn submit_policy_gated<R, F>(&self, action_id: u64, gate: F) -> R
+    where
+        F: FnOnce(
+            bool,
+            bool,
+            &mut dyn FnMut(
+                &crate::supervisor::targets::PolicyTarget<'_>,
+                super::mailbox::PolicyValidityBounds,
+            ) -> super::mailbox::Submitted,
+        ) -> R,
+    {
+        self.shared
+            .servo_dispatcher
+            .submit_policy_gated(&self.shared.hub, action_id, gate)
+    }
+
     /// Closes policy stream `action_id` off-thread (idempotent; frees stream slot in `TargetWriter`).
     #[cfg(feature = "policy-runtime")]
     pub fn close_policy(&self, action_id: u64) {
@@ -4200,6 +4298,13 @@ impl RtExecutorHandle {
     #[cfg(feature = "policy-runtime")]
     pub fn policy_busy_count(&self) -> u64 {
         self.shared.servo_dispatcher.policy_busy_count()
+    }
+
+    /// Lock-free monotonic RT policy-refusal generation counter (bumped immediately on Step 4
+    /// whenever RT refuses a policy target frame, before Step 7 outcome delivery).
+    #[cfg(feature = "policy-runtime")]
+    pub fn policy_refusal_gen(&self) -> u64 {
+        self.shared.servo_dispatcher.policy_refusal_gen()
     }
 
     /// Drains RT target outcomes belonging to policy run `action_id`.
@@ -4748,9 +4853,20 @@ impl RtExecutorHandle {
     }
 }
 
+/// Typed startup error preserving `503 UNSUPPORTED_RT_DRIVER` and untouched Legacy core rollback
+/// vs fatal `OWNER_FAILED` transitions.
+pub(crate) enum SpawnExecutorError {
+    Recoverable {
+        core: Box<SupervisorInner>,
+        unsupported_reason: Option<&'static str>,
+        msg: String,
+    },
+    Fatal(String),
+}
+
 /// Spawns the synchronous RT executor (`armd-control`) and dedicated persistence worker (`armd-persist`).
 pub(crate) fn spawn_executor(
-    mut core: SupervisorInner,
+    core: SupervisorInner,
     cfg: ExecutorConfig,
     initial_generation: u64,
     config_write_mutex: Arc<tokio::sync::Mutex<()>>,
@@ -4760,7 +4876,7 @@ pub(crate) fn spawn_executor(
     control_sched: Arc<Mutex<Option<crate::diagnostics::tick::ControlThreadSched>>>,
     control_period_us: Arc<AtomicU64>,
     hooks: PersistTestHooks,
-) -> Result<(RtExecutorHandle, Arc<OffThreadSinks>), (Option<Box<SupervisorInner>>, String)> {
+) -> Result<(RtExecutorHandle, Arc<OffThreadSinks>), SpawnExecutorError> {
     let hub = core.core.hub().clone();
     let estop_state = core.estop_state.clone();
     let baseline_identity = BaselineIdentity {
@@ -4770,10 +4886,12 @@ pub(crate) fn spawn_executor(
         path: core.gripper_baseline_path.clone(),
     };
     let (mut engine, broker, target_writer, stop_requests) = ReleaseEngine::new(cfg.boot, cfg.capacities);
-    core.set_boot_id(cfg.boot);
-    core.attach_stop_requests(stop_requests.clone());
-    core.attach_closed_bitset(broker.closed_bitset());
-    hub.update_prep_env(Arc::new(super::requests::actions::ActionPrepEnv::from_inner(&core)));
+    let closed_bitset = broker.closed_bitset();
+    // Defer mutating `core`'s boot ID, `StopRequests`, driver E-stop gate, closed-connection
+    // bitset, and `ActionPrepEnv` until inside `armd-control`'s `catch_unwind` startup transaction
+    // so: (a) recoverable spawn/init failure returns `core` cleanly with Legacy routing intact,
+    // and (b) any driver panic during gate/capability setup is caught on `armd-control` and
+    // transitions cleanly to `OWNER_FAILED` instead of unwinding past the moved core on the caller.
 
     let (diag_tx, diag_rx) = RingBuffer::<TickSample>::new(DIAG_RING_CAPACITY);
     let (diag_amend_tx, diag_amend_rx) = RingBuffer::<(u64, u32)>::new(DIAG_RING_CAPACITY);
@@ -4797,17 +4915,6 @@ pub(crate) fn spawn_executor(
     let (watchdog_plan_tx, watchdog_plan_rx) = RingBuffer::<WatchdogParkPlan>::new(2);
     let (offload_reclaim_tx, offload_reclaim_rx) =
         RingBuffer::<OffloadReclaim>::new(OFFLOAD_RECLAIM_CAPACITY);
-    let rt_terminal_cap = cfg.capacities.replies.max(64).saturating_mul(2);
-    let (rt_terminal_tx_raw, rt_terminal_rx) = RingBuffer::<RtTerminalStatus>::new(rt_terminal_cap);
-    let rt_terminal_popped = Arc::new(AtomicU64::new(0));
-    let rt_terminal_tx = super::reply_router::RtTerminalTx::new(
-        rt_terminal_tx_raw,
-        rt_terminal_cap,
-        Arc::clone(&rt_terminal_popped),
-    );
-    let rt_terminal_overflow = Arc::new(AtomicU64::new(0));
-    let terminals_handle = core.terminals_handle();
-    core.attach_rt_terminal_tx(rt_terminal_tx, Arc::clone(&rt_terminal_overflow));
 
     let estop_overflow_gen = Arc::new(AtomicU64::new(0));
     let control_stop = Arc::new(AtomicBool::new(false));
@@ -4851,7 +4958,7 @@ pub(crate) fn spawn_executor(
         Arc::clone(&reply_router),
         exited.clone(),
     ));
-    let control_exited_cv = Arc::new((Mutex::new(false), Condvar::new()));
+    let control_exited_cv = Arc::new((Mutex::new(ControlExitState::default()), Condvar::new()));
     let persist_worker_exited = Arc::new(AtomicBool::new(false));
     let persist_exited_cv = Arc::new((Mutex::new(false), Condvar::new()));
     let teardown_disable = Arc::new(TeardownDisable::default());
@@ -4890,13 +4997,15 @@ pub(crate) fn spawn_executor(
         servo_dispatcher: Arc::clone(&servo_dispatcher),
         hub: Arc::clone(&hub),
         offload_reclaim_rx: Mutex::new(offload_reclaim_rx),
-        rt_terminal_rx: Mutex::new(rt_terminal_rx),
-        rt_terminal_popped,
-        rt_terminal_overflow,
-        terminals: terminals_handle,
     });
 
+    let startup_bound = hooks
+        .panic_disable_timeout
+        .unwrap_or(crate::supervisor::PANIC_DISABLE_TIMEOUT);
+    let startup_deadline = Instant::now() + startup_bound;
+
     // Spawn dedicated persistence worker first so its thread handle can be woken on job push.
+    let persist_terminal_capture = core.terminal_capture_channel();
     let persist_thread = match spawn_persist_worker(
         persist_job_rx,
         persist_cmd_tx,
@@ -4909,14 +5018,23 @@ pub(crate) fn spawn_executor(
         persist_worker_exited.clone(),
         persist_exited_cv.clone(),
         hub.clone(),
+        persist_terminal_capture,
         hooks.clone(),
     ) {
         Ok(jh) => jh,
-        Err(e) => return Err((Some(Box::new(core)), format!("failed to spawn armd-persist: {e}"))),
+        Err(e) => {
+            return Err(SpawnExecutorError::Recoverable {
+                core: Box::new(core),
+                unsupported_reason: None,
+                msg: format!("failed to spawn armd-persist: {e}"),
+            });
+        }
     };
     let persist_park_thread = persist_thread.thread().clone();
 
-    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<ThreadId, (Option<Box<SupervisorInner>>, String)>>(1);
+    let startup_gate = StartupGate::new();
+    let (core_tx, core_rx) = mpsc::sync_channel::<SupervisorInner>(1);
+    let estop_state_caller = Arc::clone(&estop_state);
     let control_thread = {
         let cfg_clone = cfg.clone();
         let control_stop = control_stop.clone();
@@ -4928,72 +5046,134 @@ pub(crate) fn spawn_executor(
         let hub_clone = hub.clone();
         let persist_wake = persist_park_thread.clone();
         let hooks = hooks.clone();
-        match thread::Builder::new().name("armd-control".into()).spawn(move || {
-            let _control_thread_guard = ControlThreadGuard::enter();
-            control_thread_main(
-                core,
-                engine,
-                cfg_clone,
-                initial_generation,
-                ready_tx,
-                control_stop,
-                exited,
-                control_exited_cv,
-                teardown_disable,
-                stats,
-                control_sched,
-                control_period_us,
-                diag_tx,
-                diag_amend_tx,
-                maint_req_rx,
-                maint_rep_tx,
-                estop_ack_tx,
-                estop_overflow_gen,
-                reclaim_state_tx,
-                reclaim_stop_tx,
-                reclaim_traj_tx,
-                reclaim_macro_tx,
-                #[cfg(feature = "policy-runtime")]
-                reclaim_policy_tx,
-                reclaim_return_rx,
-                safety_log_tx,
-                shutdown_hold_error,
-                persist_job_tx,
-                persist_cmd_rx,
-                persist_rep_tx,
-                watchdog_plan_rx,
-                offload_reclaim_tx,
-                persist_wake,
-                estop_state,
-                hub_clone,
-                hooks,
-            );
-        }) {
+        let stop_requests_ctrl = stop_requests.clone();
+        let closed_bitset_ctrl = Arc::clone(&closed_bitset);
+        let startup_gate_ctrl = startup_gate.clone();
+        let spawn_res = if hooks.fail_control_spawn {
+            Err(std::io::Error::other("simulated armd-control spawn failure"))
+        } else {
+            thread::Builder::new().name("armd-control".into()).spawn(move || {
+                let _control_thread_guard = ControlThreadGuard::enter();
+                let Ok(core) = core_rx.recv() else {
+                    return;
+                };
+                control_thread_main(
+                    core,
+                    engine,
+                    cfg_clone,
+                    initial_generation,
+                    stop_requests_ctrl,
+                    closed_bitset_ctrl,
+                    startup_gate_ctrl,
+                    control_stop,
+                    exited,
+                    control_exited_cv,
+                    teardown_disable,
+                    stats,
+                    control_sched,
+                    control_period_us,
+                    diag_tx,
+                    diag_amend_tx,
+                    maint_req_rx,
+                    maint_rep_tx,
+                    estop_ack_tx,
+                    estop_overflow_gen,
+                    reclaim_state_tx,
+                    reclaim_stop_tx,
+                    reclaim_traj_tx,
+                    reclaim_macro_tx,
+                    #[cfg(feature = "policy-runtime")]
+                    reclaim_policy_tx,
+                    reclaim_return_rx,
+                    safety_log_tx,
+                    shutdown_hold_error,
+                    persist_job_tx,
+                    persist_cmd_rx,
+                    persist_rep_tx,
+                    watchdog_plan_rx,
+                    offload_reclaim_tx,
+                    persist_wake,
+                    estop_state,
+                    hub_clone,
+                    hooks,
+                );
+            })
+        };
+        match spawn_res {
             Ok(jh) => jh,
             Err(e) => {
-                persist_stop.store(true, Ordering::Release);
-                persist_park_thread.unpark();
-                let _ = persist_thread.join();
-                return Err((None, format!("failed to spawn armd-control: {e}")));
+                stop_and_join_persist_bounded(
+                    &persist_stop,
+                    &persist_park_thread,
+                    &persist_exited_cv,
+                    persist_thread,
+                    startup_deadline,
+                );
+                return Err(SpawnExecutorError::Recoverable {
+                    core: Box::new(core),
+                    unsupported_reason: None,
+                    msg: format!("failed to spawn armd-control: {e}"),
+                });
             }
         }
     };
-
-    let executor_thread_id = match ready_rx.recv() {
-        Ok(Ok(tid)) => tid,
-        Ok(Err((returned_core, msg))) => {
-            persist_stop.store(true, Ordering::Release);
-            persist_park_thread.unpark();
-            let _ = persist_thread.join();
+    if let Err(mpsc::SendError(core)) = core_tx.send(core) {
+        stop_and_join_persist_bounded(
+            &persist_stop,
+            &persist_park_thread,
+            &persist_exited_cv,
+            persist_thread,
+            startup_deadline,
+        );
+        if wait_control_exited_or_timed_out_until(
+            &control_exited_cv,
+            &teardown_disable,
+            startup_deadline,
+        ) {
             let _ = control_thread.join();
-            return Err((returned_core, msg));
         }
-        Err(_) => {
-            persist_stop.store(true, Ordering::Release);
-            persist_park_thread.unpark();
-            let _ = persist_thread.join();
-            let _ = control_thread.join();
-            return Err((None, "armd-control exited before signaling readiness".into()));
+        return Err(SpawnExecutorError::Recoverable {
+            core: Box::new(core),
+            unsupported_reason: None,
+            msg: "armd-control exited before receiving core ownership".into(),
+        });
+    }
+
+    let executor_thread_id = match startup_gate.wait_until(startup_deadline) {
+        StartupWaitOutcome::Ready(tid) => tid,
+        StartupWaitOutcome::Failed(err) => {
+            stop_and_join_persist_bounded(
+                &persist_stop,
+                &persist_park_thread,
+                &persist_exited_cv,
+                persist_thread,
+                startup_deadline,
+            );
+            if wait_control_exited_or_timed_out_until(
+                &control_exited_cv,
+                &teardown_disable,
+                startup_deadline,
+            ) {
+                let _ = control_thread.join();
+            }
+            return Err(err);
+        }
+        StartupWaitOutcome::TimedOut => {
+            // Driver stalled during preflight (`position_limits` / `supports_rt_executor`) or
+            // startup init (`set_estop_gate` / `set_rt_mode`): latch E-stop immediately, detach
+            // `armd-control` (late worker sees `TimedOut`, runs bounded disable, and drops `core`
+            // exclusively on `armd-control`), and fail startup so `OWNER_FAILED` is committed.
+            estop_state_caller.request_and_latch();
+            exited.store(true, Ordering::Release);
+            stop_and_join_persist_bounded(
+                &persist_stop,
+                &persist_park_thread,
+                &persist_exited_cv,
+                persist_thread,
+                Instant::now() + Duration::from_millis(50),
+            );
+            drop(control_thread);
+            return Err(SpawnExecutorError::Fatal("RT executor startup timed out".into()));
         }
     };
 
@@ -5012,6 +5192,7 @@ pub(crate) fn spawn_executor(
         target_writer: target_writer_handle,
         servo_dispatcher,
         stop_requests,
+        estop_state: estop_state_caller,
         stats,
         maint_client,
         urgent_stop_client,
@@ -5030,9 +5211,7 @@ pub(crate) fn spawn_executor(
         persist_exited_cv,
         shutdown_confirmed: Arc::new(AtomicBool::new(false)),
         teardown_disable,
-        teardown_disable_timeout: hooks
-            .panic_disable_timeout
-            .unwrap_or(crate::supervisor::PANIC_DISABLE_TIMEOUT),
+        teardown_disable_timeout: startup_bound,
         persist_thread: Mutex::new(Some(persist_thread)),
         control_thread: Mutex::new(Some(control_thread)),
         monitor_thread: Mutex::new(monitor_thread),
@@ -5466,10 +5645,13 @@ impl ControlState {
             MaintenanceOp::Observation => MaintenanceResult::Observation(Box::new(core.current_observation())),
             MaintenanceOp::ClearFault { expected_epoch } => {
                 self.shutdown_committed = false;
-                let res = core.clear_fault_executor_bounded_for_release(
+                let clock_hook = self.hooks.clock.clone();
+                let mut live_now = || clock_hook.as_ref().map_or_else(Instant::now, |c| c.now());
+                let res = core.clear_fault_executor_bounded_for_release_with_clock(
                     ctx.now,
                     release_deadline,
                     expected_epoch,
+                    &mut live_now,
                 );
                 if res.is_ok() {
                     *release_flags |= RELEASE_FLAG_CLEAR_OK;
@@ -5488,7 +5670,9 @@ impl ControlState {
                 auth_policy,
                 operator,
             } => {
-                let out = super::requests::lease::install_lease_clear_fault_rt(
+                let clock_hook = self.hooks.clock.clone();
+                let mut live_now = || clock_hook.as_ref().map_or_else(Instant::now, |c| c.now());
+                let out = super::requests::lease::install_lease_clear_fault_rt_with_clock(
                     core,
                     connection,
                     lease_generation,
@@ -5499,6 +5683,7 @@ impl ControlState {
                     operator,
                     ctx.now,
                     release_deadline,
+                    &mut live_now,
                 );
                 if matches!(out, super::requests::lease::LeaseClearFaultOutcome::Cleared { .. }) {
                     self.shutdown_committed = false;
@@ -6019,6 +6204,7 @@ impl ControlState {
                 }
             }
             a.finished_at = Some(now);
+            core.record_terminal_transition_by_id(id);
         }
     }
 
@@ -6434,8 +6620,30 @@ fn spawn_persist_worker(
     persist_worker_exited: Arc<AtomicBool>,
     persist_exited_cv: Arc<(Mutex<bool>, Condvar)>,
     hub: Arc<StateHub>,
+    terminal_capture: Option<Arc<crate::supervisor::terminal_capture::TerminalCaptureChannel>>,
     hooks: PersistTestHooks,
 ) -> std::io::Result<JoinHandle<()>> {
+    fn mirror_persist_cmd_text(
+        ch: Option<&crate::supervisor::terminal_capture::TerminalCaptureChannel>,
+        cmd: &PersistCmd,
+    ) {
+        let Some(ch) = ch else {
+            return;
+        };
+        match cmd {
+            PersistCmd::Fail { action_id, message, .. }
+            | PersistCmd::Abort { action_id, message, .. } => {
+                ch.mirror_action_message(*action_id, message);
+            }
+            PersistCmd::DirSyncFailed {
+                action_id, warning, ..
+            } => {
+                ch.mirror_action_durability_warning(*action_id, warning);
+            }
+            _ => {}
+        }
+    }
+
     struct ExitFlag(Arc<AtomicBool>, Arc<(Mutex<bool>, Condvar)>, Arc<StateHub>);
     impl Drop for ExitFlag {
         fn drop(&mut self) {
@@ -6452,6 +6660,7 @@ fn spawn_persist_worker(
         let _exit_guard = ExitFlag(persist_worker_exited, persist_exited_cv, hub);
         let mut last_sent_watchdog_park: Option<(u64, u8)> = None;
         let push_cmd = |tx: &mut Producer<PersistCmd>, cmd: PersistCmd, stop: &AtomicBool, dead: &AtomicBool| -> bool {
+            mirror_persist_cmd_text(terminal_capture.as_deref(), &cmd);
             let mut pending = Some(cmd);
             while let Some(c) = pending.take() {
                 if stop.load(Ordering::Acquire) || dead.load(Ordering::Acquire) || tx.is_abandoned() {
@@ -6582,6 +6791,7 @@ fn spawn_persist_worker(
                 cw_guard: Some(_cw),
                 published_config: &published_config,
                 hub: &hub_for_refresh,
+                terminal_capture: terminal_capture.as_deref(),
                 persist_stop: &persist_stop,
                 control_exited: &control_exited,
                 hooks: &hooks,
@@ -6610,6 +6820,7 @@ struct ExecutorPersistBackend<'a> {
     cw_guard: Option<tokio::sync::MutexGuard<'a, ()>>,
     published_config: &'a Arc<super::requests::config::PublishedConfigHub>,
     hub: &'a Arc<StateHub>,
+    terminal_capture: Option<&'a crate::supervisor::terminal_capture::TerminalCaptureChannel>,
     persist_stop: &'a Arc<AtomicBool>,
     control_exited: &'a Arc<AtomicBool>,
     hooks: &'a PersistTestHooks,
@@ -6624,6 +6835,20 @@ struct ExecutorPersistBackend<'a> {
 
 impl ExecutorPersistBackend<'_> {
     fn push_cmd(&mut self, cmd: PersistCmd) -> bool {
+        if let Some(ch) = self.terminal_capture {
+            match &cmd {
+                PersistCmd::Fail { action_id, message, .. }
+                | PersistCmd::Abort { action_id, message, .. } => {
+                    ch.mirror_action_message(*action_id, message);
+                }
+                PersistCmd::DirSyncFailed {
+                    action_id, warning, ..
+                } => {
+                    ch.mirror_action_durability_warning(*action_id, warning);
+                }
+                _ => {}
+            }
+        }
         let mut pending = Some(cmd);
         while let Some(c) = pending.take() {
             if self.persist_stop.load(Ordering::Acquire)
@@ -6840,10 +7065,6 @@ impl super::requests::config::CommonCommitWorker for ExecutorPersistBackend<'_> 
             } else {
                 (self.new_policy.take(), self.new_jaw.take())
             };
-            // Record the full worker-owned warning off-RT on `StateHub` BEFORE pushing to RT so
-            // the very first terminal frame preserves untruncated warnings (>160 UTF-8 bytes).
-            self.hub
-                .record_action_durability_warning(self.job.action_id, warn.clone());
             let _ = self.push_cmd(PersistCmd::DirSyncFailed {
                 action_id: self.job.action_id,
                 reservation,
@@ -7119,16 +7340,328 @@ impl Drop for WholeReleaseAllocGuard<'_> {
     }
 }
 
+enum StartupSlot {
+    Pending,
+    Ready(ThreadId),
+    Failed(SpawnExecutorError),
+    TimedOut,
+    Taken,
+}
+
+enum StartupWaitOutcome {
+    Ready(ThreadId),
+    Failed(SpawnExecutorError),
+    TimedOut,
+}
+
+/// Single-authority synchronized startup slot carrying BOTH the readiness decision AND any
+/// rollback payload atomically under one mutex/condvar (zero split publication).
+#[derive(Clone)]
+struct StartupGate(Arc<(Mutex<StartupSlot>, Condvar)>);
+
+impl StartupGate {
+    fn new() -> Self {
+        Self(Arc::new((Mutex::new(StartupSlot::Pending), Condvar::new())))
+    }
+
+    fn is_timed_out(&self) -> bool {
+        matches!(
+            *self.0 .0.lock().unwrap_or_else(|e| e.into_inner()),
+            StartupSlot::TimedOut
+        )
+    }
+
+    fn try_settle_ready(&self, tid: ThreadId) -> bool {
+        let mut g = self.0 .0.lock().unwrap_or_else(|e| e.into_inner());
+        if !matches!(*g, StartupSlot::Pending) {
+            return false;
+        }
+        *g = StartupSlot::Ready(tid);
+        self.0 .1.notify_all();
+        true
+    }
+
+    /// Attempts to publish `err` as the single startup outcome. If the caller already timed out,
+    /// returns any rejected recoverable `core` BACK to `armd-control` so the worker can run
+    /// bounded teardown disable before dropping the driver.
+    fn try_settle_failed(&self, err: SpawnExecutorError) -> Option<Box<SupervisorInner>> {
+        let mut g = self.0 .0.lock().unwrap_or_else(|e| e.into_inner());
+        if !matches!(*g, StartupSlot::Pending) {
+            return match err {
+                SpawnExecutorError::Recoverable { core, .. } => Some(core),
+                SpawnExecutorError::Fatal(_) => None,
+            };
+        }
+        *g = StartupSlot::Failed(err);
+        self.0 .1.notify_all();
+        None
+    }
+
+    fn wait_until(&self, deadline: Instant) -> StartupWaitOutcome {
+        let mut g = self.0 .0.lock().unwrap_or_else(|e| e.into_inner());
+        while matches!(*g, StartupSlot::Pending) {
+            let rem = deadline.saturating_duration_since(Instant::now());
+            if rem.is_zero() {
+                *g = StartupSlot::TimedOut;
+                return StartupWaitOutcome::TimedOut;
+            }
+            let (next, res) = self.0 .1.wait_timeout(g, rem).unwrap_or_else(|e| e.into_inner());
+            g = next;
+            if matches!(*g, StartupSlot::Pending) && res.timed_out() {
+                *g = StartupSlot::TimedOut;
+                return StartupWaitOutcome::TimedOut;
+            }
+        }
+        match std::mem::replace(&mut *g, StartupSlot::Taken) {
+            StartupSlot::Ready(tid) => StartupWaitOutcome::Ready(tid),
+            StartupSlot::Failed(err) => StartupWaitOutcome::Failed(err),
+            StartupSlot::TimedOut | StartupSlot::Pending | StartupSlot::Taken => {
+                StartupWaitOutcome::TimedOut
+            }
+        }
+    }
+}
+
+/// RAII fallback guard on `armd-control`: if startup exits or unwinds unexpectedly before
+/// settling `StartupGate`, latches shared E-stop BEFORE publishing terminal failure.
+struct StartupAbortGuard {
+    gate: StartupGate,
+    estop_state: Arc<crate::rt_core::urgent::EstopState>,
+    control_exited_cv: Arc<(Mutex<ControlExitState>, Condvar)>,
+    exited: Arc<AtomicBool>,
+    hub: Arc<StateHub>,
+}
+
+impl Drop for StartupAbortGuard {
+    fn drop(&mut self) {
+        let still_pending = matches!(
+            *self.gate.0 .0.lock().unwrap_or_else(|e| e.into_inner()),
+            StartupSlot::Pending
+        );
+        if still_pending {
+            self.estop_state.request_and_latch();
+            let _ = self.gate.try_settle_failed(SpawnExecutorError::Fatal(
+                "armd-control exited unexpectedly before signaling readiness".into(),
+            ));
+            self.exited.store(true, Ordering::Release);
+            {
+                let mut st = self
+                    .control_exited_cv
+                    .0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                st.dropping = true;
+                st.exited = true;
+            }
+            self.control_exited_cv.1.notify_all();
+            self.hub.wake();
+        }
+    }
+}
+
+fn wait_bool_cv_until(cv: &(Mutex<bool>, Condvar), deadline: Instant) -> bool {
+    let mut g = cv.0.lock().unwrap_or_else(|e| e.into_inner());
+    while !*g {
+        let rem = deadline.saturating_duration_since(Instant::now());
+        if rem.is_zero() {
+            break;
+        }
+        let (next, res) = cv.1.wait_timeout(g, rem).unwrap_or_else(|e| e.into_inner());
+        g = next;
+        if res.timed_out() {
+            break;
+        }
+    }
+    *g
+}
+
+fn stop_and_join_persist_bounded(
+    persist_stop: &AtomicBool,
+    persist_park_thread: &Thread,
+    persist_exited_cv: &(Mutex<bool>, Condvar),
+    persist_thread: JoinHandle<()>,
+    deadline: Instant,
+) {
+    persist_stop.store(true, Ordering::Release);
+    persist_park_thread.unpark();
+    if wait_bool_cv_until(persist_exited_cv, deadline) {
+        let _ = persist_thread.join();
+    } else {
+        tracing::warn!(
+            "Teardown: detaching stalled persistence worker (`armd-persist`) after bounded wait so startup/shutdown/Drop cannot block indefinitely"
+        );
+        drop(persist_thread);
+    }
+}
+
+/// Shared bounded wait for `armd-control` completion across startup failure, ordinary teardown,
+/// panic teardown, and emergency teardown. Returns `true` ONLY when `control_exited_cv.exited`
+/// became `true` (published strictly AFTER `drop(core)` completes on `armd-control`); returns
+/// `false` immediately if `teardown_disable.timed_out` is set or `deadline` elapses.
+fn wait_control_exited_or_timed_out_until(
+    control_exited_cv: &(Mutex<ControlExitState>, Condvar),
+    teardown_disable: &TeardownDisable,
+    deadline: Instant,
+) -> bool {
+    let (lock, cv) = control_exited_cv;
+    let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while !st.exited {
+        if teardown_disable.timed_out.load(Ordering::Acquire) {
+            return false;
+        }
+        let rem = deadline.saturating_duration_since(Instant::now());
+        if rem.is_zero() {
+            return false;
+        }
+        let (next, res) = cv.wait_timeout(st, rem).unwrap_or_else(|e| e.into_inner());
+        st = next;
+        if st.exited {
+            return true;
+        }
+        if teardown_disable.timed_out.load(Ordering::Acquire) || res.timed_out() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Shared bounded teardown/panic-disable helper used across startup failure, startup panic,
+/// release-loop panic, and emergency shutdown so there is one deadline/observer/abort path.
+///
+/// When `probe_enable_with_estop` is `Some(estop_state)`, the driver enable-state probe runs
+/// INSIDE the armed deadline observer and `catch_unwind` before deciding whether disable can be
+/// skipped: any non-disabled state, unknown state, or probe panic latches E-stop and runs
+/// `attempt_panic_disable_until`; any probe or disable stall latches E-stop in the deadline
+/// observer before publishing timeout.
+#[allow(clippy::too_many_arguments)]
+fn run_bounded_teardown_disable(
+    core: &mut SupervisorInner,
+    teardown_disable: &Arc<TeardownDisable>,
+    exited: &Arc<AtomicBool>,
+    control_exited_cv: &Arc<(Mutex<ControlExitState>, Condvar)>,
+    hub: &Arc<StateHub>,
+    hooks: &PersistTestHooks,
+    policy: Option<PanicPolicy>,
+    context: &'static str,
+    secondary_panic_msg: &'static str,
+    startup_gate_on_timeout: Option<StartupGate>,
+    probe_enable_with_estop: Option<&Arc<crate::rt_core::urgent::EstopState>>,
+) {
+    let disable_timeout = hooks
+        .panic_disable_timeout
+        .unwrap_or(crate::supervisor::PANIC_DISABLE_TIMEOUT);
+    let td_obs = Arc::clone(teardown_disable);
+    let exited_obs = Arc::clone(exited);
+    let cv_obs = Arc::clone(control_exited_cv);
+    let hub_obs = Arc::clone(hub);
+    let timeout_hook = hooks.on_panic_disable_timeout.clone();
+    let estop_obs = probe_enable_with_estop.map(Arc::clone);
+    let origin = Instant::now();
+    let (coop_deadline, hard_deadline) =
+        crate::supervisor::panic_disable_deadlines(origin, disable_timeout);
+    let coop_budget = coop_deadline.saturating_duration_since(origin);
+    let completed = crate::supervisor::run_with_panic_deadline_observer_until(
+        hard_deadline,
+        || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if let Some(estop_state) = probe_enable_with_estop {
+                    let confirmed_disabled = !core.is_torqued
+                        && !core.disable_pending
+                        && match core.driver.as_ref() {
+                            None => true,
+                            Some(d) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                d.with_ref(|drv| {
+                                    drv.enable_state() == crate::driver::EnableState::Disabled
+                                        && !drv.has_any_joint_enabled()
+                                        && !drv.has_known_partial_enable()
+                                })
+                                .unwrap_or(false)
+                            }))
+                            .unwrap_or(false),
+                        };
+                    if confirmed_disabled {
+                        return crate::supervisor::PanicDisableOutcome::Confirmed;
+                    }
+                    estop_state.request_and_latch();
+                }
+                core.attempt_panic_disable_until(coop_deadline, hard_deadline, coop_budget)
+            }))
+            .unwrap_or_else(|_| {
+                crate::supervisor::PanicDisableOutcome::Failed(secondary_panic_msg.into())
+            })
+        },
+        |outcome| teardown_disable.try_set_outcome_before(outcome.clone(), hard_deadline),
+        move || {
+            // If the enable-state probe stalled before reaching `request_and_latch`, latch the
+            // shared E-stop BEFORE publishing timeout so callers always observe an E-stop latch.
+            if let Some(ref estop) = estop_obs {
+                estop.request_and_latch();
+            }
+            let timed_out = crate::supervisor::PanicDisableOutcome::TimedOut;
+            td_obs.set_outcome(timed_out.clone());
+            // Wake any teardown waiter on `control_exited_cv` WITHOUT setting `exited = true`,
+            // so `wait_control_exited_or_timed_out_until` observes `timed_out` immediately and detaches.
+            {
+                let _g = cv_obs.0.lock().unwrap_or_else(|e| e.into_inner());
+                cv_obs.1.notify_all();
+            }
+            timed_out.log(context, disable_timeout);
+            if matches!(policy, Some(PanicPolicy::AbortProcess)) {
+                crate::diagnostics::logwriter::flush_all(Duration::from_millis(200));
+                std::process::exit(1);
+            }
+            if let Some(ref gate) = startup_gate_on_timeout {
+                let _ = gate.try_settle_failed(SpawnExecutorError::Fatal(format!(
+                    "{context}: bounded disable timed out"
+                )));
+            }
+            if policy.is_some() || startup_gate_on_timeout.is_some() {
+                // Do NOT mark `control_exited_cv.exited` true here: `armd-control` is still
+                // blocked inside the driver call and must be detached rather than joined.
+                exited_obs.store(true, Ordering::Release);
+                hub_obs.wake();
+                if let Some(hook) = timeout_hook {
+                    hook();
+                }
+            }
+        },
+    );
+    if let Some(outcome) = completed {
+        outcome.log(context, disable_timeout);
+        if matches!(policy, Some(PanicPolicy::AbortProcess)) {
+            crate::diagnostics::logwriter::flush_all(Duration::from_millis(500));
+            std::process::exit(1);
+        }
+    }
+}
+
+fn mark_control_exited(
+    exited: &AtomicBool,
+    control_exited_cv: &(Mutex<ControlExitState>, Condvar),
+    hub: &StateHub,
+) {
+    exited.store(true, Ordering::Release);
+    {
+        let mut st = control_exited_cv.0.lock().unwrap_or_else(|e| e.into_inner());
+        st.dropping = true;
+        st.exited = true;
+    }
+    control_exited_cv.1.notify_all();
+    hub.wake();
+}
+
 #[allow(clippy::too_many_arguments)]
 fn control_thread_main(
     mut core: SupervisorInner,
     engine: ReleaseEngine,
     cfg: ExecutorConfig,
     initial_generation: u64,
-    ready_tx: mpsc::SyncSender<Result<ThreadId, (Option<Box<SupervisorInner>>, String)>>,
+    stop_requests_init: super::urgent::StopRequests,
+    closed_bitset_init: Arc<super::requests::actions::ClosedBitset>,
+    startup_gate: StartupGate,
     control_stop: Arc<AtomicBool>,
     exited: Arc<AtomicBool>,
-    control_exited_cv: Arc<(Mutex<bool>, Condvar)>,
+    control_exited_cv: Arc<(Mutex<ControlExitState>, Condvar)>,
     teardown_disable: Arc<TeardownDisable>,
     stats: Arc<ExecutorStats>,
     control_sched: Arc<Mutex<Option<crate::diagnostics::tick::ControlThreadSched>>>,
@@ -7158,64 +7691,245 @@ fn control_thread_main(
     hub: Arc<StateHub>,
     hooks: PersistTestHooks,
 ) {
-    if let Some(return_core) = hooks.fail_init {
-        if return_core {
-            let _ = ready_tx.send(Err((Some(Box::new(core)), "simulated executor init failure (recoverable)".into())));
-        } else {
-            drop(core);
-            let _ = ready_tx.send(Err((None, "simulated executor init failure (core lost)".into())));
-        }
-        exited.store(true, Ordering::Release);
-        *control_exited_cv.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
-        control_exited_cv.1.notify_all();
-        hub.wake();
-        return;
+    let _abort_guard = StartupAbortGuard {
+        gate: startup_gate.clone(),
+        estop_state: Arc::clone(&estop_state),
+        control_exited_cv: Arc::clone(&control_exited_cv),
+        exited: Arc::clone(&exited),
+        hub: Arc::clone(&hub),
+    };
+
+    enum StartupStepOutcome {
+        Ready {
+            staged_motion_cfg: Arc<super::requests::motion::MotionConfigSnapshot>,
+            staged_prep_env: Arc<super::requests::actions::ActionPrepEnv>,
+        },
+        Recoverable {
+            unsupported_reason: Option<&'static str>,
+            msg: String,
+        },
+        NonRecoverable {
+            msg: String,
+        },
+        TimedOut,
     }
 
-    // Complete driver RT mode handoff (including any startup transport writer synchronization)
-    // and nonblocking observation-slot prewarming BEFORE applying SCHED_FIFO so normal-priority
-    // helper threads (e.g. `armd-sim-rx`) can never suffer priority inversion during startup and
-    // release #1 allocates nothing even under stalled readers.
-    core.rt_executor_owned = true;
-    core.before_publish_hook = hooks.before_publish.clone();
-    core.safety.set_off_thread_reclaim(true);
-    core.prewarm_rt_buffers();
-    if let Some(ref d) = core.driver {
-        if let Ok(mut drv) = d.lock() {
+    // Complete ALL driver preflight (`position_limits`, `supports_rt_executor`), executor routing,
+    // driver RT mode handoff, and observation-slot prewarming INSIDE a single unwind boundary
+    // while retaining `core` outside `catch_unwind` for cleanup. Shared hub snapshots are staged
+    // locally and only published AFTER `startup_gate.try_settle_ready` wins so a timed-out worker
+    // never mutates `hub`. Under unwind-enabled builds (`dev`/`test` or `panic = "unwind"`),
+    // `catch_unwind` latches E-stop and runs bounded panic-disable before obeying `cfg.panic_policy`;
+    // under `[profile.release]` (`panic = "abort"`), a Rust panic aborts immediately without
+    // unwinding (relying on motor hardware watchdog / external E-stop).
+    let init_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert!(
+            core.driver
+                .as_ref()
+                .is_none_or(crate::supervisor_lock::DriverSlot::is_exclusive),
+            "RT executor must exclusively own driver without mutex"
+        );
+        if let Some(ref mut slot) = core.driver {
+            slot.bind_current_thread();
+        }
+        if let Some(return_core) = hooks.fail_init {
+            return if return_core {
+                StartupStepOutcome::Recoverable {
+                    unsupported_reason: None,
+                    msg: "simulated executor init failure (recoverable)".into(),
+                }
+            } else {
+                StartupStepOutcome::NonRecoverable {
+                    msg: "simulated executor init failure (core lost)".into(),
+                }
+            };
+        }
+        // Driver preflight before any mutation of `core`'s routing/config fields so explicit
+        // `Err(reason)` from `supports_rt_executor()` returns the untouched core cleanly to Legacy.
+        let mut cached_pos = [None; crate::rt_core::mailbox::MAX_DOF];
+        if let Some(ref d) = core.driver {
+            let dof = core.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
+            let cap_res = d
+                .with_ref(|drv| {
+                    for (i, slot) in cached_pos.iter_mut().take(dof).enumerate() {
+                        *slot = drv.position_limits(i);
+                    }
+                    drv.supports_rt_executor()
+                })
+                .unwrap_or(Err("driver unavailable"));
+            if let Err(reason) = cap_res {
+                return StartupStepOutcome::Recoverable {
+                    unsupported_reason: Some(reason),
+                    msg: format!("Cannot transfer ownership: {reason}"),
+                };
+            }
+        }
+        if startup_gate.is_timed_out() {
+            return StartupStepOutcome::TimedOut;
+        }
+        core.cached_driver_pos_limits = cached_pos;
+        let staged_motion_cfg = Arc::new(
+            super::requests::motion::MotionConfigSnapshot::from_supervisor(&core),
+        );
+        core.set_boot_id(cfg.boot);
+        core.attach_stop_requests(stop_requests_init);
+        core.attach_closed_bitset(closed_bitset_init);
+        let staged_prep_env = Arc::new(super::requests::actions::ActionPrepEnv::from_inner(&core));
+        core.rt_executor_owned = true;
+        core.before_publish_hook = hooks.before_publish.clone();
+        core.safety.set_off_thread_reclaim(true);
+        core.prewarm_rt_buffers();
+        if let Some(drv) = core
+            .driver
+            .as_mut()
+            .and_then(crate::supervisor_lock::DriverSlot::as_exclusive_mut)
+        {
             drv.set_rt_mode(true);
         }
-    }
-    core.prewarm_observation_slots();
-    // Preserve servo stream authorization across legacy -> executor handoff if a valid lease was
-    // already committed before `start_executor`.
-    let pre_lease_gen = core.active_lease_gen_at(Instant::now());
-    if pre_lease_gen != 0 && core.core.target_authority().stream.is_none() {
-        core.authorize_servo_stream_for_committed_lease(pre_lease_gen);
-    }
+        core.prewarm_observation_slots();
+        // Preserve servo stream authorization across legacy -> executor handoff if a valid lease was
+        // already committed before `start_executor`.
+        let pre_lease_gen = core.active_lease_gen_at(Instant::now());
+        if pre_lease_gen != 0 && core.core.target_authority().stream.is_none() {
+            core.authorize_servo_stream_for_committed_lease(pre_lease_gen);
+        }
 
-    if cfg.apply_rt_sched {
-        let s = sched::apply_to_current_thread(&cfg.rt_sched, &cfg.memory_lock);
-        if s.realtime {
-            tracing::info!(
-                "RT executor running at SCHED_FIFO priority {}{}",
-                s.priority,
-                s.cpu.map(|c| format!(" on CPU {c}")).unwrap_or_default()
-            );
+        if cfg.apply_rt_sched {
+            let s = sched::apply_to_current_thread(&cfg.rt_sched, &cfg.memory_lock);
+            if s.realtime {
+                tracing::info!(
+                    "RT executor running at SCHED_FIFO priority {}{}",
+                    s.priority,
+                    s.cpu.map(|c| format!(" on CPU {c}")).unwrap_or_default()
+                );
+            } else {
+                tracing::warn!(
+                    "RT executor real-time scheduling unavailable ({}); using normal scheduling, MIT tracking (when configured) refused",
+                    s.errors.join("; ")
+                );
+            }
+            sched::set_readiness(RtReadiness::from_sched(&s));
+            *control_sched.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
         } else {
-            tracing::warn!(
-                "RT executor real-time scheduling unavailable ({}); using normal scheduling, MIT tracking (when configured) refused",
-                s.errors.join("; ")
+            let s = sched::observe_current_thread(&cfg.memory_lock);
+            *control_sched.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
+        }
+        if cfg.alloc_timing {
+            crate::diagnostics::alloc::time_this_thread();
+        }
+        StartupStepOutcome::Ready {
+            staged_motion_cfg,
+            staged_prep_env,
+        }
+    }));
+
+    let teardown_timeout_loser = |mut core: SupervisorInner| {
+        if core.driver.is_some() || core.is_torqued || core.disable_pending {
+            run_bounded_teardown_disable(
+                &mut core,
+                &teardown_disable,
+                &exited,
+                &control_exited_cv,
+                &hub,
+                &hooks,
+                None,
+                "RT executor late startup abort",
+                "secondary panic during late startup abort disable",
+                None,
+                Some(&estop_state),
             );
         }
-        sched::set_readiness(RtReadiness::from_sched(&s));
-        *control_sched.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
-    } else {
-        let s = sched::observe_current_thread(&cfg.memory_lock);
-        *control_sched.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
+        drop(core);
+        mark_control_exited(&exited, &control_exited_cv, &hub);
+    };
+
+    let (staged_motion_cfg, staged_prep_env) = match init_res {
+        Ok(StartupStepOutcome::Ready {
+            staged_motion_cfg,
+            staged_prep_env,
+        }) => (staged_motion_cfg, staged_prep_env),
+        Ok(StartupStepOutcome::Recoverable {
+            unsupported_reason,
+            msg,
+        }) => {
+            if let Some(rejected_core) = startup_gate.try_settle_failed(
+                SpawnExecutorError::Recoverable {
+                    core: Box::new(core),
+                    unsupported_reason,
+                    msg,
+                },
+            ) {
+                // Caller already timed out while preflight was blocked: never drop a potentially
+                // torqued driver without running bounded disable first.
+                teardown_timeout_loser(*rejected_core);
+            } else {
+                mark_control_exited(&exited, &control_exited_cv, &hub);
+            }
+            return;
+        }
+        Ok(StartupStepOutcome::TimedOut) => {
+            teardown_timeout_loser(core);
+            return;
+        }
+        Ok(StartupStepOutcome::NonRecoverable { msg }) => {
+            if core.driver.is_some() || core.is_torqued || core.disable_pending {
+                run_bounded_teardown_disable(
+                    &mut core,
+                    &teardown_disable,
+                    &exited,
+                    &control_exited_cv,
+                    &hub,
+                    &hooks,
+                    None,
+                    "RT executor init failure",
+                    "secondary panic during RT executor init-failure disable",
+                    Some(startup_gate.clone()),
+                    Some(&estop_state),
+                );
+            }
+            // Publish terminal startup failure BEFORE destroying `core` so a stalling driver
+            // destructor cannot block startup beyond `startup_deadline`.
+            let _ = startup_gate.try_settle_failed(SpawnExecutorError::Fatal(msg));
+            drop(core);
+            mark_control_exited(&exited, &control_exited_cv, &hub);
+            return;
+        }
+        Err(err) => {
+            estop_state.request_and_latch();
+            tracing::error!("RT executor thread panicked during startup initialization: {:?}", err);
+            run_bounded_teardown_disable(
+                &mut core,
+                &teardown_disable,
+                &exited,
+                &control_exited_cv,
+                &hub,
+                &hooks,
+                Some(cfg.panic_policy),
+                "RT executor startup panic",
+                "secondary panic during RT executor startup panic-disable",
+                Some(startup_gate.clone()),
+                None,
+            );
+            let _ = startup_gate.try_settle_failed(SpawnExecutorError::Fatal(
+                "RT executor panicked during startup initialization".into(),
+            ));
+            drop(core);
+            mark_control_exited(&exited, &control_exited_cv, &hub);
+            return;
+        }
+    };
+
+    if !startup_gate.try_settle_ready(thread::current().id()) {
+        // Caller timed out (and latched E-stop + committed OWNER_FAILED) while startup was in
+        // flight: NEVER mutate `hub` or enter the release loop; run bounded teardown disable and
+        // destroy `core` exclusively on `armd-control`.
+        teardown_timeout_loser(core);
+        return;
     }
-    if cfg.alloc_timing {
-        crate::diagnostics::alloc::time_this_thread();
-    }
+    // Publish executor-only snapshots into `hub` strictly AFTER winning startup readiness and
+    // BEFORE release #1 can consume them.
+    hub.set_motion_config(staged_motion_cfg);
+    hub.update_prep_env(staged_prep_env);
 
     let mut engine = engine;
     let stop_requests = engine.stop_requests().clone();
@@ -7254,14 +7968,6 @@ fn control_thread_main(
         sat_msg_buf: Some(String::with_capacity(160)),
         hooks,
     };
-
-    if ready_tx.send(Ok(thread::current().id())).is_err() {
-        exited.store(true, Ordering::Release);
-        *control_exited_cv.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
-        control_exited_cv.1.notify_all();
-        hub.wake();
-        return;
-    }
 
     let clock_hook = state.hooks.clock.clone();
     let now_inst = || -> Instant {
@@ -7444,6 +8150,7 @@ fn control_thread_main(
                         },
                     );
                     if control_stop.load(Ordering::Acquire) {
+                        let (_, captured_any) = core.capture_edge_terminals(core.now_s(), None);
                         if let Some(p) = injected_job_probe.take() {
                             if state.offload_reclaim_tx.push(OffloadReclaim::Probe(p)).is_ok() {
                                 core.core.hub().wake();
@@ -7452,7 +8159,8 @@ fn control_thread_main(
                         state.flush_pending_maint_reply(&core);
                         state.emit_estop_ack_if_advanced(&mut core);
                         state.drain_retired_states(&mut core, now_inst());
-                        if engine.take_urgent_replies_flushed()
+                        if captured_any
+                            || engine.take_urgent_replies_flushed()
                             || engine.take_lifecycle_replies_flushed()
                             || engine.take_servo_closes_flushed()
                         {
@@ -7460,8 +8168,7 @@ fn control_thread_main(
                         }
                         return None;
                     }
-                    let (phases, body_end) = core.take_tick_phases();
-                    let body_end = body_end.unwrap_or_else(now_inst);
+                    let (phases, _body_end) = core.take_tick_phases();
                     core.defer_zero_check_persist = false;
                     if let Some(p) = core.watchdog_park_pending.filter(|p| !p.waiting_mit_handback) {
                         let key = (p.generation, p.attempt);
@@ -7485,6 +8192,10 @@ fn control_thread_main(
                             }
                             Err(rtrb::PushError::Full(job)) => {
                                 state.reject_saturated_persist_job(&mut core, job, injected_job_probe.take());
+                                let (_, captured_any) = core.capture_edge_terminals(core.now_s(), None);
+                                if captured_any {
+                                    hub.wake();
+                                }
                             }
                         }
                     }
@@ -7528,8 +8239,16 @@ fn control_thread_main(
                     state.drain_retired_states(&mut core, now_inst());
                     let control_hz = core.config.control_frequency_hz;
                     let done = now_inst();
+                    let alloc_t0 = now_inst();
                     let allocs = crate::diagnostics::alloc::take();
+                    let phase_alloc_read = crate::diagnostics::tick::us(
+                        now_inst().saturating_duration_since(alloc_t0),
+                    );
                     let usage_done = UsageMark::now();
+                    let (mid_nvcsw, mid_nivcsw) = match core.take_mid_csw_start() {
+                        Some(m) => crate::diagnostics::tick::mid_csw_delta(&m, &usage_done),
+                        None => (0, 0),
+                    };
                     control_period_us.store((1e6 / f64::from(control_hz.max(1))) as u64, Ordering::Relaxed);
 
                     let sample = TickSample {
@@ -7556,9 +8275,16 @@ fn control_thread_main(
                             tx_us: phases[2],
                             finish_us: phases[3],
                             obs_us: phases[4],
-                            publish_us: crate::diagnostics::tick::us(done.saturating_duration_since(body_end)),
+                            publish_us: core.take_publish_only_us(),
+                        },
+                        phases_us: ReleasePhasesUs {
+                            alloc_read: phase_alloc_read,
+                            terminal: core.take_phase_terminal_us(),
+                            ..ReleasePhasesUs::default()
                         },
                         usage: ThreadUsage {
+                            mid_nvcsw,
+                            mid_nivcsw,
                             lock_alloc_calls: allocs.calls.min(u64::from(u32::MAX)) as u32,
                             lock_alloc_us: (allocs.total_ns / 1000).min(u64::from(u32::MAX)) as u32,
                             lock_alloc_max_us: (allocs.max_ns / 1000).min(u64::from(u32::MAX)) as u32,
@@ -7765,68 +8491,20 @@ fn control_thread_main(
             panicked = true;
             estop_state.request_and_latch();
             tracing::error!("RT executor thread panicked during release: {:?}", err);
-            let disable_timeout = state
-                .hooks
-                .panic_disable_timeout
-                .unwrap_or(crate::supervisor::PANIC_DISABLE_TIMEOUT);
-            let policy = cfg.panic_policy;
-            let td_obs = Arc::clone(&teardown_disable);
-            let exited_obs = Arc::clone(&exited);
-            let hub_obs = Arc::clone(&hub);
-            let timeout_hook = state.hooks.on_panic_disable_timeout.clone();
-            let origin = Instant::now();
-            let (coop_deadline, hard_deadline) =
-                crate::supervisor::panic_disable_deadlines(origin, disable_timeout);
-            let coop_budget = coop_deadline.saturating_duration_since(origin);
-            let completed = crate::supervisor::run_with_panic_deadline_observer_until(
-                hard_deadline,
-                || {
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        core.attempt_panic_disable_until(coop_deadline, hard_deadline, coop_budget)
-                    }))
-                    .unwrap_or_else(|_| {
-                        crate::supervisor::PanicDisableOutcome::Failed(
-                            "secondary panic during RT executor panic-disable".into(),
-                        )
-                    })
-                },
-                |outcome| teardown_disable.try_set_outcome_before(outcome.clone(), hard_deadline),
-                move || {
-                    let timed_out = crate::supervisor::PanicDisableOutcome::TimedOut;
-                    td_obs.set_outcome(timed_out.clone());
-                    timed_out.log("RT executor panic", disable_timeout);
-                    match policy {
-                        PanicPolicy::AbortProcess => {
-                            crate::diagnostics::logwriter::flush_all(Duration::from_millis(200));
-                            std::process::exit(1);
-                        }
-                        PanicPolicy::StopExecutor => {
-                            // Do NOT mark `control_exited_cv` here: `armd-control` is still blocked
-                            // inside the driver call and must be detached rather than joined.
-                            exited_obs.store(true, Ordering::Release);
-                            hub_obs.wake();
-                            if let Some(hook) = timeout_hook {
-                                hook();
-                            }
-                        }
-                    }
-                },
+            run_bounded_teardown_disable(
+                &mut core,
+                &teardown_disable,
+                &exited,
+                &control_exited_cv,
+                &hub,
+                &state.hooks,
+                Some(cfg.panic_policy),
+                "RT executor panic",
+                "secondary panic during RT executor panic-disable",
+                None,
+                None,
             );
-            if let Some(outcome) = completed {
-                outcome.log("RT executor panic", disable_timeout);
-                match cfg.panic_policy {
-                    PanicPolicy::AbortProcess => {
-                        crate::diagnostics::logwriter::flush_all(Duration::from_millis(500));
-                        std::process::exit(1);
-                    }
-                    PanicPolicy::StopExecutor => {
-                        break;
-                    }
-                }
-            } else {
-                // Deadline observer already handled timeout logging / exit signaling.
-                break;
-            }
+            break;
         }
     }
 
@@ -7840,38 +8518,22 @@ fn control_thread_main(
     };
     stats.finalize_loop_exit(exit_skips);
 
+    let mut disable_ran = false;
     if !panicked && teardown_disable.requested.load(Ordering::Acquire) {
-        let disable_timeout = state
-            .hooks
-            .panic_disable_timeout
-            .unwrap_or(crate::supervisor::PANIC_DISABLE_TIMEOUT);
-        let td_obs = Arc::clone(&teardown_disable);
-        let origin = Instant::now();
-        let (coop_deadline, hard_deadline) =
-            crate::supervisor::panic_disable_deadlines(origin, disable_timeout);
-        let coop_budget = coop_deadline.saturating_duration_since(origin);
-        let completed = crate::supervisor::run_with_panic_deadline_observer_until(
-            hard_deadline,
-            || {
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    core.attempt_panic_disable_until(coop_deadline, hard_deadline, coop_budget)
-                }))
-                .unwrap_or_else(|_| {
-                    crate::supervisor::PanicDisableOutcome::Failed(
-                        "panic during emergency teardown disable".into(),
-                    )
-                })
-            },
-            |outcome| teardown_disable.try_set_outcome_before(outcome.clone(), hard_deadline),
-            move || {
-                let timed_out = crate::supervisor::PanicDisableOutcome::TimedOut;
-                td_obs.set_outcome(timed_out.clone());
-                timed_out.log("RT executor emergency shutdown", disable_timeout);
-            },
+        run_bounded_teardown_disable(
+            &mut core,
+            &teardown_disable,
+            &exited,
+            &control_exited_cv,
+            &hub,
+            &state.hooks,
+            None,
+            "RT executor emergency shutdown",
+            "panic during emergency teardown disable",
+            None,
+            None,
         );
-        if let Some(outcome) = completed {
-            outcome.log("RT executor emergency shutdown", disable_timeout);
-        }
+        disable_ran = true;
     }
 
     // Clean exit drain: return queued maintenance and persistence payloads off-thread without
@@ -7900,10 +8562,37 @@ fn control_thread_main(
     }
     state.drain_estop_and_retired_stopped(&mut core, now_inst());
     state.flush_pending_hold_error_for_shutdown(&mut core);
-    exited.store(true, Ordering::Release);
-    *control_exited_cv.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
-    control_exited_cv.1.notify_all();
-    hub.wake();
+    // Synchronized pre-drop checkpoint under `control_exited_cv.0`: if a timed-out forced teardown
+    // requested disable while `armd-control` was finishing a release or post-loop drain, run
+    // bounded disable BEFORE marking `dropping = true` and destroying `core`.
+    loop {
+        let mut st = control_exited_cv.0.lock().unwrap_or_else(|e| e.into_inner());
+        if !panicked && !disable_ran && teardown_disable.requested.load(Ordering::Acquire) {
+            drop(st);
+            run_bounded_teardown_disable(
+                &mut core,
+                &teardown_disable,
+                &exited,
+                &control_exited_cv,
+                &hub,
+                &state.hooks,
+                None,
+                "RT executor forced teardown disable",
+                "panic during forced teardown disable",
+                None,
+                Some(&estop_state),
+            );
+            disable_ran = true;
+            continue;
+        }
+        st.dropping = true;
+        break;
+    }
+    // Destroy `core` (and the exclusively owned driver) BEFORE publishing `control_exited_cv.exited`,
+    // so `teardown_and_join_inner` never enters an unbounded `join()` while a driver destructor
+    // is stalled.
+    drop(core);
+    mark_control_exited(&exited, &control_exited_cv, &hub);
 }
 
 /// Monotonic nanoseconds of `CLOCK_MONOTONIC` (the clock of `Instant` on Linux).
@@ -8298,11 +8987,19 @@ pub fn run_periodic_with_deadline_and_clock(
                         ACTIVE_PERIODIC_RELEASE.try_with(|c| c.take()).ok().flatten()
                     {
                         if std::thread::panicking() {
-                            let sample = crate::diagnostics::tick::take_periodic_sample();
-                            if let (Some(sample), Some(ring)) = (sample, self.stats.legacy_tick_ring.get()) {
-                                let _ = ring.record_staged(&sample, || {
+                            let stashed = crate::diagnostics::tick::take_periodic_sample_with_post_end();
+                            if let (Some((sample, post_end)), Some(ring)) =
+                                (stashed, self.stats.legacy_tick_ring.get())
+                            {
+                                let _ = ring.record_staged_with_publish(&sample, || {
                                     let t = self.clock.map_or_else(mono_now_ns, ExecutorClock::now_ns);
-                                    crate::diagnostics::tick::ns_to_us_u32(t.saturating_sub(actual_ns))
+                                    let rel = crate::diagnostics::tick::ns_to_us_u32(
+                                        t.saturating_sub(actual_ns),
+                                    );
+                                    let pub_us = crate::diagnostics::tick::us(
+                                        Instant::now().saturating_duration_since(post_end),
+                                    );
+                                    (rel, pub_us)
                                 });
                             }
                             let mut exit_releases = Releases { period_ns, next_ns };
@@ -8320,8 +9017,10 @@ pub fn run_periodic_with_deadline_and_clock(
             }
             let _unwind_grid = PeriodicUnwindGridGuard { stats, clock };
             step(elapsed.as_secs_f64(), release_deadline);
+            let step_end_ns = now_ns();
             let _ = ACTIVE_PERIODIC_RELEASE.try_with(|c| c.take());
-            let sample = crate::diagnostics::tick::take_periodic_sample();
+            let sample = crate::diagnostics::tick::take_periodic_sample_with_post_end()
+                .map(|(s, post_end)| (s, post_end, step_end_ns));
             drop(_unwind_grid);
             sample
             // `_lateness_guard` drops here, strictly BEFORE final timing & ring publication.
@@ -8333,26 +9032,46 @@ pub fn run_periodic_with_deadline_and_clock(
             sleep_dur(Duration::from_nanos(post_stats_delay_ns));
         }
 
-        // Publish rolling sample FIRST (before completion seal). `record_staged` stages all
-        // payload fields into the unpublished slot, stamps `release_us` from `now_ns()`, and
-        // publishes `slot.seq` + `meta_seq`.
+        // Publish rolling sample FIRST (before completion seal). `record_staged_with_publish`
+        // stages all payload fields into the unpublished slot, stamps `release_us` and
+        // `phases_us.publish`, and publishes `slot.seq` + `meta_seq`.
         let mut stamped_us: u32 = 0;
+        let mut stamped_pub_us: u32 = 0;
+        let mut stashed_marks: Option<(Instant, u64)> = None;
         let recorded_seq = match (stashed_sample, stats.legacy_tick_ring.get()) {
-            (Some(sample), Some(ring)) => ring.record_staged(&sample, || {
-                let t = now_ns();
-                stamped_us = crate::diagnostics::tick::ns_to_us_u32(t.saturating_sub(actual_ns));
-                stamped_us
-            }),
+            (Some((sample, post_end, step_end_ns)), Some(ring)) => {
+                stashed_marks = Some((post_end, step_end_ns));
+                ring.record_staged_with_publish(&sample, || {
+                    let t = now_ns();
+                    stamped_us = crate::diagnostics::tick::ns_to_us_u32(t.saturating_sub(actual_ns));
+                    let wall_pub = crate::diagnostics::tick::us(
+                        Instant::now().saturating_duration_since(post_end),
+                    );
+                    let clock_pub =
+                        crate::diagnostics::tick::ns_to_us_u32(t.saturating_sub(step_end_ns));
+                    stamped_pub_us = wall_pub.max(clock_pub);
+                    (stamped_us, stamped_pub_us)
+                })
+            }
             _ => None,
         };
 
-        // If OS preemption crossed `record_staged`, amend the slot monotonically BEFORE the
-        // completion seal.
-        let probe_release_us =
-            crate::diagnostics::tick::ns_to_us_u32(now_ns().saturating_sub(actual_ns));
-        if let (Some(seq), Some(ring)) = (recorded_seq, stats.legacy_tick_ring.get()) {
-            if probe_release_us > stamped_us {
-                ring.amend_slot_release_us(seq, probe_release_us);
+        // If OS preemption crossed `record_staged_with_publish`, amend the slot monotonically
+        // BEFORE the completion seal.
+        if let (Some(seq), Some((post_end, step_end_ns)), Some(ring)) =
+            (recorded_seq, stashed_marks, stats.legacy_tick_ring.get())
+        {
+            let t2 = now_ns();
+            let probe_release_us =
+                crate::diagnostics::tick::ns_to_us_u32(t2.saturating_sub(actual_ns));
+            let probe_pub_us = crate::diagnostics::tick::us(
+                Instant::now().saturating_duration_since(post_end),
+            )
+            .max(crate::diagnostics::tick::ns_to_us_u32(
+                t2.saturating_sub(step_end_ns),
+            ));
+            if probe_release_us > stamped_us || probe_pub_us > stamped_pub_us {
+                ring.amend_slot_release_and_publish_us(seq, probe_release_us, probe_pub_us);
             }
         }
 

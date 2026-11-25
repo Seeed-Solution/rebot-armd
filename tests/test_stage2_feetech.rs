@@ -34,6 +34,9 @@ impl Transport for SharedTransport {
     fn flush(&mut self) -> Result<(), TransportError> {
         self.0.lock().unwrap().flush()
     }
+    fn clears_input_buffer(&self) -> bool {
+        self.0.lock().unwrap().clears_input_buffer()
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -164,6 +167,17 @@ fn test_feetech_torque_enable_rollback() {
     let mock = MockTransport::new_preserving();
     let servo_ids = vec![1, 2];
     let mut driver = FeetechArmDriver::new(mock, servo_ids.clone()).with_calibrated(true);
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    arm_joints[0] = 0;
+    arm_joints[1] = 1;
+    driver.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+        safety_stopped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 2,
+        rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+        rest_pose_tolerance_rad: 0.05,
+    });
 
     // Provide feedback first
     let mut rx_fb = Vec::new();
@@ -179,7 +193,7 @@ fn test_feetech_torque_enable_rollback() {
     driver.read_joint_states().unwrap();
     let _ = driver.transport_mut().take_tx();
 
-    // Servo 1 reports 1 (enabled), Servo 2 fails (reports 0)
+    // Servo 1 reports 1 (enabled), Servo 2 fails (reports 0) — NO local rollback.
     let cs1 = calculate_checksum(1, 3, 0x00, &[1]);
     let resp1 = vec![0xFF, 0xFF, 1, 3, 0x00, 1, cs1];
     let cs2 = calculate_checksum(2, 3, 0x00, &[0]);
@@ -188,30 +202,20 @@ fn test_feetech_torque_enable_rollback() {
     let mut rx = Vec::new();
     rx.extend_from_slice(&resp1);
     rx.extend_from_slice(&resp2);
-    // Rollback readbacks: both return 0 (disabled)
-    let cs_rb1 = calculate_checksum(1, 3, 0x00, &[0]);
-    let resp_rb1 = vec![0xFF, 0xFF, 1, 3, 0x00, 0, cs_rb1];
-    let cs_rb2 = calculate_checksum(2, 3, 0x00, &[0]);
-    let resp_rb2 = vec![0xFF, 0xFF, 2, 3, 0x00, 0, cs_rb2];
-    rx.extend_from_slice(&resp_rb1);
-    rx.extend_from_slice(&resp_rb2);
     driver.transport_mut().provide_rx(&rx);
 
     let res = driver.set_torque(true);
     assert!(res.is_err());
     let err = res.unwrap_err();
     assert!(matches!(err, ArmDriverError::HardwareFault(_)));
-    assert_eq!(driver.enable_state(), EnableState::Disabled);
+    // Telemetry reflects causal readback: servo 1 enabled, servo 2 disabled -> aggregate Unknown.
+    assert_eq!(driver.enable_state(), EnableState::Unknown);
+    assert!(driver.has_known_partial_enable());
+    assert!(driver.has_any_joint_enabled());
 
-    // Verify rollback: driver wrote disable packets (REG_TORQUE_ENABLE = 0) and read back status
+    // Verify NO local rollback: only pre-seeding SYNC_WRITE (14) + Enable writes (2*8=16) + 1 round Readback reads (2*8=16) = 46 bytes
     let tx = driver.transport_mut().take_tx();
-    // Pre-seeding SYNC_WRITE (14) + Enable writes (2*8=16) + Readback reads (2*8=16) + Rollback writes (2*8=16) + Rollback reads (2*8=16) = 78 bytes
-    assert_eq!(tx.len(), 78);
-    // Rollback write to servo 1 at offset 46: [0xFF, 0xFF, 1, 4, 3, 0x28, 0, cs]
-    assert_eq!(tx[46 + 2], 1); // ID 1
-    assert_eq!(tx[46 + 4], INST_WRITE);
-    assert_eq!(tx[46 + 5], REG_TORQUE_ENABLE);
-    assert_eq!(tx[46 + 6], 0); // Torque disable
+    assert_eq!(tx.len(), 46, "Feetech must not transmit automatic rollback disable packets");
 }
 
 // -------------------------------------------------------------------------
@@ -640,6 +644,17 @@ fn test_feetech_set_torque_already_enabled_no_rollback_on_failure() {
     let mock = MockTransport::new_preserving();
     let servo_ids = vec![1, 2];
     let mut driver = FeetechArmDriver::new(mock, servo_ids.clone()).with_calibrated(true);
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    arm_joints[0] = 0;
+    arm_joints[1] = 1;
+    driver.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+        safety_stopped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 2,
+        rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+        rest_pose_tolerance_rad: 0.05,
+    });
 
     // Provide feedback first
     let mut rx_fb = Vec::new();
@@ -684,7 +699,7 @@ fn test_feetech_set_torque_already_enabled_no_rollback_on_failure() {
     assert_eq!(driver.enable_state(), EnableState::Unknown);
 
     // M4: Holding targets are preserved on already-enabled joints, so no pre-seeding SYNC_WRITE is sent.
-    // TX should contain 2 enable writes + 2 readback reads = 32 bytes.
+    // TX should contain 2 enable writes + 1 round * 2 readback reads = 32 bytes.
     // It must NOT contain rollback disable writes (which would be another 16 bytes with value 0).
     let tx = driver.transport_mut().take_tx();
     assert_eq!(tx.len(), 32);
@@ -1206,9 +1221,12 @@ async fn test_feetech_overload_status_hardware_fault_and_supervisor_clear_fault(
     let cs_tq1 = calculate_checksum(1, 3, 0x00, &[1]);
     let rx_tq1 = vec![0xFF, 0xFF, 1, 3, 0x00, 1, cs_tq1];
 
-    mock.lock().unwrap().provide_rx(&rx_normal);
-    mock.lock().unwrap().provide_rx(&rx_tq1);
-    mock.lock().unwrap().provide_rx(&rx_normal);
+    {
+        let mut m = mock.lock().unwrap();
+        m.provide_rx(&rx_normal);
+        m.provide_rx(&rx_tq1);
+        m.provide_rx(&rx_normal);
+    }
 
     supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
     assert!(supervisor.inner().read().await.is_torqued);
@@ -1219,7 +1237,11 @@ async fn test_feetech_overload_status_hardware_fault_and_supervisor_clear_fault(
     rx_overload.extend_from_slice(&normal_params);
     rx_overload.push(cs_overload);
 
-    mock.lock().unwrap().provide_rx(&rx_overload);
+    {
+        let mut m = mock.lock().unwrap();
+        m.advance_clock(Duration::from_millis(10));
+        m.provide_rx(&rx_overload);
+    }
 
     let obs = supervisor.tick(0.02).await;
     assert!(obs.fault.is_some(), "Supervisor must transition to fault on hardware error");
@@ -1229,15 +1251,27 @@ async fn test_feetech_overload_status_hardware_fault_and_supervisor_clear_fault(
 
     // Attempting clear_fault() calls drv.clear_fault(), which disables torque on the bus (REG_TORQUE_ENABLE = 0),
     // and asks to wait for fresh fault-free feedback before retrying.
-    // Provide fresh feedback for resting-pose support pre-check (still showing 0x20 error), followed by tq0 for clear_fault readback
+    // Feed 3 spaced rest-pose ticks (>= 20 ms span across 3 control releases) so the K=3 rest-pose gate passes,
+    // followed by fresh rest feedback and 1 causal tq0 reply for clear_fault's own check + readback.
     let mut rx_rest = vec![0xFF, 0xFF, 1, 10, 0x20];
     rx_rest.extend_from_slice(&normal_params);
     rx_rest.push(cs_overload);
-    mock.lock().unwrap().provide_rx(&rx_rest);
-
+    for _ in 0..3 {
+        {
+            let mut m = mock.lock().unwrap();
+            m.advance_clock(Duration::from_millis(10));
+            m.provide_rx(&rx_rest);
+        }
+        supervisor.tick(0.02).await;
+    }
     let cs_tq0 = calculate_checksum(1, 3, 0x00, &[0]);
     let rx_tq0 = vec![0xFF, 0xFF, 1, 3, 0x00, 0, cs_tq0];
-    mock.lock().unwrap().provide_rx(&rx_tq0);
+    {
+        let mut m = mock.lock().unwrap();
+        m.advance_clock(Duration::from_millis(10));
+        m.provide_rx(&rx_rest);
+        m.provide_rx(&rx_tq0);
+    }
 
     let clear_err = supervisor.clear_fault().await.unwrap_err();
     assert!(
@@ -1466,6 +1500,17 @@ fn test_feetech_partial_fault_disables_only_faulted_and_detects_partial_enable()
     let mock = MockTransport::new_preserving();
     let servo_ids = vec![1, 2];
     let mut driver = FeetechArmDriver::new(mock, servo_ids);
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    arm_joints[0] = 0;
+    arm_joints[1] = 1;
+    driver.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+        safety_stopped: Arc::new(AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 2,
+        rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+        rest_pose_tolerance_rad: 0.05,
+    });
 
     let mut rx_fb = Vec::new();
     for &id in &[1u8, 2u8] {
@@ -1478,6 +1523,10 @@ fn test_feetech_partial_fault_disables_only_faulted_and_detects_partial_enable()
     }
     driver.transport_mut().provide_rx(&rx_fb);
     driver.read_joint_states().unwrap();
+    driver.transport_mut().advance_clock(Duration::from_millis(11));
+    driver.transport_mut().provide_rx(&rx_fb);
+    driver.read_joint_states().unwrap();
+    driver.transport_mut().advance_clock(Duration::from_millis(11));
     let _ = driver.transport_mut().take_tx();
 
     let mut rx_err = Vec::new();
@@ -1554,9 +1603,12 @@ async fn test_feetech_periodic_enable_poll_detects_torque_loss_and_triggers_faul
     let cs_tq1 = calculate_checksum(1, 3, 0x00, &[1]);
     let rx_tq1 = vec![0xFF, 0xFF, 1, 3, 0x00, 1, cs_tq1];
 
-    mock.lock().unwrap().provide_rx(&rx_normal);
-    mock.lock().unwrap().provide_rx(&rx_tq1);
-    mock.lock().unwrap().provide_rx(&rx_normal);
+    {
+        let mut m = mock.lock().unwrap();
+        m.provide_rx(&rx_normal);
+        m.provide_rx(&rx_tq1);
+        m.provide_rx(&rx_normal);
+    }
 
     supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
     assert!(supervisor.inner().read().await.is_torqued);
@@ -1568,16 +1620,74 @@ async fn test_feetech_periodic_enable_poll_detects_torque_loss_and_triggers_faul
         assert!(obs.fault.is_none());
     }
 
-    // On 8th tick (poll 10), driver does a SYNC_READ of REG_TORQUE_ENABLE.
-    // Provide normal feedback followed by torque enable response reporting 0 (torque lost!)
+    // On 8th tick (poll 10), driver does a SYNC_READ of REG_TORQUE_ENABLE BEFORE position SYNC_READ.
+    // Provide torque-enable response (0 = torque lost) first, followed by normal position feedback.
     let cs_tq0 = calculate_checksum(1, 3, 0x00, &[0]);
     let rx_tq0 = vec![0xFF, 0xFF, 1, 3, 0x00, 0, cs_tq0];
-    mock.lock().unwrap().provide_rx(&rx_normal);
     mock.lock().unwrap().provide_rx(&rx_tq0);
+    mock.lock().unwrap().provide_rx(&rx_normal);
 
+    // M1: While stationary/holding (no active motion), reported torque loss is telemetry +
+    // warning only — it does NOT latch UnexpectedTorqueLoss and holds remain active.
     let obs = supervisor.tick(0.02).await;
-    assert!(obs.fault.is_some());
-    assert_eq!(obs.fault.unwrap().code, FaultCode::HardwareFault);
+    assert_eq!(obs.enable_state, EnableState::Disabled);
+    assert!(obs.fault.is_none(), "M1: stationary hold must not fault on reported enable_state alone");
+    assert_eq!(supervisor.inner().read().await.torque_intent, armd::TorqueIntent::On);
+
+    // R12 M2: During active motion, sample 1 of reported torque loss stops active motion
+    // immediately while keeping `torque_intent == On` (holds continue), and does NOT latch
+    // `UnexpectedTorqueLoss` until it persists across K=3 distinct causal REG_TORQUE_ENABLE samples.
+    {
+        let mut inner = supervisor.inner().write().await;
+        inner.servo_stream_active = true;
+    }
+    mock.lock().unwrap().provide_rx(&rx_normal);
+    let obs_sample1 = supervisor.tick(0.02).await;
+    assert!(
+        !supervisor.inner().read().await.servo_stream_active,
+        "M2: sample 1 during active motion must stop motion"
+    );
+    assert!(
+        obs_sample1.fault.is_none(),
+        "M2: sample 1 alone must NOT latch UnexpectedTorqueLoss"
+    );
+    assert_eq!(supervisor.inner().read().await.torque_intent, armd::TorqueIntent::On);
+
+    // Polls 12..19 carry only position replies (no new causal REG_TORQUE_ENABLE read) -> count stays 1.
+    for _ in 0..8 {
+        mock.lock().unwrap().provide_rx(&rx_normal);
+        let obs_mid = supervisor.tick(0.02).await;
+        assert!(obs_mid.fault.is_none(), "M2: cached enable state without new causal sample must not fault");
+    }
+
+    // Poll 20: 2nd causal REG_TORQUE_ENABLE == 0 sample -> still < K=3, no fault yet.
+    mock.lock().unwrap().provide_rx(&rx_tq0);
+    mock.lock().unwrap().provide_rx(&rx_normal);
+    let obs_sample2 = supervisor.tick(0.02).await;
+    assert!(
+        obs_sample2.fault.is_none(),
+        "M2: 2nd causal sample (< K=3) must NOT latch UnexpectedTorqueLoss yet"
+    );
+    assert_eq!(supervisor.inner().read().await.torque_intent, armd::TorqueIntent::On);
+
+    // Polls 21..29 carry only position replies.
+    for _ in 0..9 {
+        mock.lock().unwrap().provide_rx(&rx_normal);
+        let obs_mid = supervisor.tick(0.02).await;
+        assert!(obs_mid.fault.is_none());
+    }
+
+    // Poll 30: 3rd causal REG_TORQUE_ENABLE == 0 sample (K=3) -> latches UnexpectedTorqueLoss
+    // while keeping `torque_intent == On` so holds continue.
+    mock.lock().unwrap().provide_rx(&rx_tq0);
+    mock.lock().unwrap().provide_rx(&rx_normal);
+    let obs_sample3 = supervisor.tick(0.02).await;
+    assert!(
+        obs_sample3.fault.is_some(),
+        "M2: 3rd causal sample (K=3) must latch UnexpectedTorqueLoss"
+    );
+    assert_eq!(obs_sample3.fault.unwrap().code, FaultCode::HardwareFault);
+    assert_eq!(supervisor.inner().read().await.torque_intent, armd::TorqueIntent::On);
 }
 
 // -------------------------------------------------------------------------
@@ -1616,9 +1726,12 @@ async fn test_supervisor_set_torque_and_clear_fault_sync_loads_enforcing_support
     let cs_tq1 = calculate_checksum(1, 3, 0x00, &[1]);
     let rx_tq1 = vec![0xFF, 0xFF, 1, 3, 0x00, 1, cs_tq1];
 
-    mock.lock().unwrap().provide_rx(&rx_heavy);
-    mock.lock().unwrap().provide_rx(&rx_tq1);
-    mock.lock().unwrap().provide_rx(&rx_heavy);
+    {
+        let mut m = mock.lock().unwrap();
+        m.provide_rx(&rx_heavy);
+        m.provide_rx(&rx_tq1);
+        m.provide_rx(&rx_heavy);
+    }
 
     supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
 
@@ -1806,10 +1919,22 @@ fn test_feetech_abort_flag_stops_bus_operations_and_latches() {
     driver.write_joint_targets(&targets).unwrap();
     assert!(!driver.transport_mut().take_tx().is_empty());
 
-    // 6. set_torque(false) must succeed while aborted
+    // 6. Requested disable (`set_torque(false)`) without a resting-pose gate is refused while
+    //    aborted (Rule A′ at the transmit choke point, 0 bus writes); protective disable still
+    //    succeeds while aborted.
+    assert!(matches!(
+        driver.set_torque(false),
+        Err(ArmDriverError::TorqueOffWouldDrop)
+    ));
+    assert!(driver.transport_mut().take_tx().is_empty());
+
     let rx_tq_off = vec![0xFF, 0xFF, 1, 3, 0x00, 0, cs_en1, 0xFF, 0xFF, 2, 3, 0x00, 0, cs_en2];
     driver.transport_mut().provide_rx(&rx_tq_off);
-    driver.set_torque(false).unwrap();
+    driver
+        .disable_torque(armd::driver::DisableKind::DisableProtective {
+            reason: armd::driver::DisableProtectiveReason::ProcessExit,
+        })
+        .unwrap();
     assert_eq!(driver.enable_state(), EnableState::Disabled);
 }
 
@@ -1820,6 +1945,20 @@ fn test_feetech_abort_flag_stops_bus_operations_and_latches() {
 fn test_feetech_partial_enable_holding_preservation() {
     let mock = MockTransport::new_preserving();
     let mut driver = FeetechArmDriver::new(mock, vec![1, 2]).with_calibrated(true);
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    arm_joints[0] = 0;
+    arm_joints[1] = 1;
+    let mut rest_positions = [0.0f32; armd::rt_core::mailbox::MAX_DOF];
+    rest_positions[0] = feetech::FeetechJointCalib::default().steps_to_rad(2048);
+    rest_positions[1] = feetech::FeetechJointCalib::default().steps_to_rad(2500);
+    driver.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+        safety_stopped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 2,
+        rest_positions,
+        rest_pose_tolerance_rad: 0.05,
+    });
 
     // 1. Simulate joint feedback so driver has valid feedback for both servos
     let pos_1 = 2048u16.to_le_bytes(); // 0 rad
@@ -1853,11 +1992,9 @@ fn test_feetech_partial_enable_holding_preservation() {
     // NOT joint 1 (which is already holding at Some(true)).
     let cs_tq_rb1 = calculate_checksum(1, 3, 0x00, &[1]);
     let cs_tq_rb2 = calculate_checksum(2, 3, 0x00, &[0]); // joint 2 fails
-    let cs_rb2 = calculate_checksum(2, 3, 0x00, &[0]); // rollback readback for joint 2 verifies 0
     let rx_enable_rb = vec![
         0xFF, 0xFF, 1, 3, 0x00, 1, cs_tq_rb1,
         0xFF, 0xFF, 2, 3, 0x00, 0, cs_tq_rb2,
-        0xFF, 0xFF, 2, 3, 0x00, 0, cs_rb2,
     ];
     driver.transport_mut().provide_rx(&rx_enable_rb);
 
@@ -1872,16 +2009,11 @@ fn test_feetech_partial_enable_holding_preservation() {
     assert_eq!(tx[4], feetech::INST_SYNC_WRITE);
     assert_eq!(tx[7], 2); // Servo ID 2 only!
 
-    // Verify rollback wrote disable ONLY to joint 2, NOT joint 1, and read back joint 2!
-    // tx structure: SyncWrite (11) + Enable writes (2*8=16) + Readback reads (2*8=16) + Rollback write (1*8=8) + Rollback read (1*8=8) = 59 bytes
-    assert_eq!(tx.len(), 59);
-    let rb_pkt = &tx[43..51];
-    assert_eq!(rb_pkt[2], 2); // ID 2
-    assert_eq!(rb_pkt[4], INST_WRITE);
-    assert_eq!(rb_pkt[5], REG_TORQUE_ENABLE);
-    assert_eq!(rb_pkt[6], 0); // Torque disabled on joint 2
+    // Verify NO local rollback write: SyncWrite (11) + Enable writes (2*8=16) + 1 round Readback reads (2*8=16) = 43 bytes
+    assert_eq!(tx.len(), 43);
 
-    // And joint 1 remains known enabled while joint 2 is disabled!
+    // And telemetry reports joint 1 enabled while joint 2 disabled (partial enable).
+    assert_eq!(driver.enable_state(), EnableState::Unknown);
     assert!(driver.has_known_partial_enable());
     assert!(driver.has_any_joint_enabled());
 }
@@ -1956,9 +2088,12 @@ async fn test_supervisor_clear_fault_rejects_stale_or_moving_pose_before_hardwar
     let cs_tq1 = calculate_checksum(1, 3, 0x00, &[1]);
     let rx_tq1 = vec![0xFF, 0xFF, 1, 3, 0x00, 1, cs_tq1];
 
-    mock.lock().unwrap().provide_rx(&rx_normal);
-    mock.lock().unwrap().provide_rx(&rx_tq1);
-    mock.lock().unwrap().provide_rx(&rx_normal);
+    {
+        let mut m = mock.lock().unwrap();
+        m.provide_rx(&rx_normal);
+        m.provide_rx(&rx_tq1);
+        m.provide_rx(&rx_normal);
+    }
 
     supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
     assert!(supervisor.inner().read().await.is_torqued);
@@ -2058,6 +2193,17 @@ fn test_feetech_missing_rollback_readback_leaves_state_unknown() {
     let mock = MockTransport::new_preserving();
     let servo_ids = vec![1, 2];
     let mut driver = FeetechArmDriver::new(mock, servo_ids.clone()).with_calibrated(true);
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    arm_joints[0] = 0;
+    arm_joints[1] = 1;
+    driver.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+        safety_stopped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 2,
+        rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+        rest_pose_tolerance_rad: 0.05,
+    });
 
     // Provide feedback first
     let mut rx_fb = Vec::new();
@@ -2254,12 +2400,12 @@ async fn test_feetech_supervisor_estop_abort_lifecycle() {
     let tx_tick = mock.lock().unwrap().take_tx();
     assert!(!tx_tick.is_empty(), "tick sends hold targets during E-stop hold");
 
-    // Clear fault: supervisor.clear_fault() succeeds
-    let cs_en1 = calculate_checksum(1, 3, 0x00, &[0]);
-    let cs_en2 = calculate_checksum(2, 3, 0x00, &[0]);
-    let rx_cf = vec![0xFF, 0xFF, 1, 3, 0x00, 0, cs_en1, 0xFF, 0xFF, 2, 3, 0x00, 0, cs_en2];
-    mock.lock().unwrap().provide_rx(&rx_fb);
-    mock.lock().unwrap().provide_rx(&rx_cf);
+    // Clear fault: supervisor.clear_fault() succeeds (enable state is telemetry only under R10,
+    // so clear_fault only reads joint states when no hardware fault is latched).
+    {
+        let mut m = mock.lock().unwrap();
+        m.provide_rx(&rx_fb);
+    }
     let clear_res = supervisor.clear_fault().await;
     assert!(clear_res.is_ok(), "clear_fault must succeed: {:?}", clear_res);
 
@@ -2267,7 +2413,10 @@ async fn test_feetech_supervisor_estop_abort_lifecycle() {
     let cs_tq1 = calculate_checksum(1, 3, 0x00, &[1]);
     let cs_tq2 = calculate_checksum(2, 3, 0x00, &[1]);
     let rx_enable = vec![0xFF, 0xFF, 1, 3, 0x00, 1, cs_tq1, 0xFF, 0xFF, 2, 3, 0x00, 1, cs_tq2];
-    mock.lock().unwrap().provide_rx(&rx_enable);
+    {
+        let mut m = mock.lock().unwrap();
+        m.provide_rx(&rx_enable);
+    }
     let enable_res = supervisor.enable_torque(supervisor.capture_admission_stamp()).await;
     assert!(enable_res.is_ok(), "set_torque(true) must succeed after clear_fault: {:?}", enable_res);
 }
@@ -2616,12 +2765,20 @@ fn test_feetech_enable_poll_unstarves_when_position_chunk_timeouts() {
     driver.transport_mut().provide_rx(&rx_tq0);
 
     // read_joint_states() should poll REG_TORQUE_ENABLE first (before position chunks),
-    // detect disabled torque, and update enable_state to Disabled!
+    // updating reported enable telemetry to EnableState::Disabled on the single causal 0 read,
+    // and refresh_enable_state() also confirms EnableState::Disabled after position chunk timeout.
     let _ = driver.read_joint_states();
     assert_eq!(
         driver.enable_state(),
         EnableState::Disabled,
-        "Torque disable must be detected even when position chunk hits timeout"
+        "Telemetry must update to EnableState::Disabled on single causal 0 read even when position chunk hits timeout"
+    );
+    let en_read = feetech::build_read(1, REG_TORQUE_ENABLE, 1);
+    driver.transport_mut().stage_reply(&en_read, &rx_tq0);
+    assert_eq!(
+        driver.refresh_enable_state().unwrap(),
+        EnableState::Disabled,
+        "Torque disable must be confirmed by causal readback after position chunk timeout"
     );
 }
 
@@ -3078,6 +3235,9 @@ fn test_feetech_6servo_incomplete_chunk_idx_cross_call_reassembly_and_ghost_head
     rx3.extend_from_slice(&build_resp_pos(3, 2700));
     driver.transport_mut().stage_reply(&sync_c0, &rx3);
 
+    let _ = driver.read_joint_states().expect("Ghost header discard must not fail");
+    // Advance past LINE_IDLE_QUIET (20 ms) so non-blocking poison drain clears and polls Chunk 0
+    driver.transport().advance_clock(Duration::from_millis(20));
     let states3 = driver.read_joint_states().expect("Must not starve or fail on ghost header");
     let calib = armd::protocol::feetech::FeetechJointCalib::default();
     let exp1 = calib.steps_to_rad(2500);
@@ -3097,11 +3257,13 @@ fn test_feetech_6servo_incomplete_chunk_idx_cross_call_reassembly_and_ghost_head
         );
     }
 
-    // Subsequent poll for Chunk 1 progresses cleanly
+    // Subsequent poll for Chunk 1 progresses cleanly after LINE_IDLE_QUIET (20 ms) clears
+    // the line poison from Chunk 1's earlier unstaged timeout.
     let mut rx4 = Vec::new();
     for id in 4..=6 {
         rx4.extend_from_slice(&build_resp_pos(id, 2800));
     }
+    driver.transport().advance_clock(Duration::from_millis(20));
     driver.transport_mut().stage_reply(&sync_c1, &rx4);
     let states4 = driver.read_joint_states().expect("Subsequent poll for Chunk 1 must progress cleanly");
     assert_eq!(states4.len(), 6);
@@ -3156,7 +3318,12 @@ async fn test_feetech_narrower_effective_ranges_narrows_config_limits() {
 fn test_feetech_incomplete_chunk_preserved_across_enable_poll_and_completed_on_next_call() {
     let mock = MockTransport::new();
     let mut driver = FeetechArmDriver::new(mock, vec![1]).with_tx_echo(Some(false));
-    driver.set_confirmed_enable_state(EnableState::Enabled);
+    let en_read = feetech::build_read(1, feetech::REG_TORQUE_ENABLE, 1);
+    let en_cs = calculate_checksum(1, 3, 0x00, &[1]);
+    driver.transport_mut().stage_reply(&en_read, &[0xFF, 0xFF, 1, 3, 0x00, 1, en_cs]);
+    driver.refresh_enable_state().unwrap();
+    driver.transport_mut().clear_write_responses();
+    assert_eq!(driver.enable_state(), EnableState::Enabled);
     driver.set_read_poll_count(8);
     driver.last_enable_poll = Some(driver.clock_now());
 
@@ -3211,7 +3378,12 @@ fn test_feetech_incomplete_chunk_preserved_across_enable_poll_and_completed_on_n
 fn test_feetech_partial_rx_frame_survives_50hz_tick_gap() {
     let mock = MockTransport::new();
     let mut driver = FeetechArmDriver::new(mock, vec![1]).with_tx_echo(Some(false));
-    driver.set_confirmed_enable_state(EnableState::Enabled);
+    let en_read = feetech::build_read(1, feetech::REG_TORQUE_ENABLE, 1);
+    let en_cs = calculate_checksum(1, 3, 0x00, &[1]);
+    driver.transport_mut().stage_reply(&en_read, &[0xFF, 0xFF, 1, 3, 0x00, 1, en_cs]);
+    driver.refresh_enable_state().unwrap();
+    driver.transport_mut().clear_write_responses();
+    assert_eq!(driver.enable_state(), EnableState::Enabled);
     driver.last_enable_poll = Some(driver.clock_now());
 
     let build_resp = |id: u8| -> Vec<u8> {
@@ -3418,9 +3590,12 @@ async fn test_feetech_driver_backed_arm_joint_0x20_rising_edge_triggers_hardware
     let cs_tq1 = calculate_checksum(1, 3, 0x00, &[1]);
     let rx_tq1 = vec![0xFF, 0xFF, 1, 3, 0x00, 1, cs_tq1];
 
-    mock.lock().unwrap().provide_rx(&rx_normal);
-    mock.lock().unwrap().provide_rx(&rx_tq1);
-    mock.lock().unwrap().provide_rx(&rx_normal);
+    {
+        let mut m = mock.lock().unwrap();
+        m.provide_rx(&rx_normal);
+        m.provide_rx(&rx_tq1);
+        m.provide_rx(&rx_normal);
+    }
 
     supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
     assert!(supervisor.inner().read().await.is_torqued);
@@ -3435,12 +3610,18 @@ async fn test_feetech_driver_backed_arm_joint_0x20_rising_edge_triggers_hardware
     mock.lock().unwrap().advance_clock(Duration::from_millis(5));
     supervisor.tick(0.02).await;
 
-    // Now rising edge: hardware packet arrives with error byte 0x20 on arm joint 1
+    // Now rising edge: hardware packet arrives in response to the next SYNC_READ with error byte 0x20
     let cs_overload = calculate_checksum(1, 10, 0x20, &normal_params);
     let mut rx_overload = vec![0xFF, 0xFF, 1, 10, 0x20];
     rx_overload.extend_from_slice(&normal_params);
     rx_overload.push(cs_overload);
-    mock.lock().unwrap().provide_rx(&rx_overload);
+    let sync_read_pos = feetech::build_sync_read(&[1], feetech::REG_PRESENT_POSITION_L, 8).unwrap();
+    {
+        let mut m = mock.lock().unwrap();
+        // Wait LINE_IDLE_QUIET (20 ms) after the timed-out SYNC_READ poisoned the line.
+        m.advance_clock(Duration::from_millis(20));
+        m.stage_reply(&sync_read_pos, &rx_overload);
+    }
 
     // Tick: Feetech driver decodes 0x20, check_hardware_status detects rising edge and faults
     let obs_fault = supervisor.tick(0.02).await;
@@ -3459,7 +3640,12 @@ fn test_feetech_cross_tick_reassembly_with_active_torque_and_echo_drain() {
     let mut driver = FeetechArmDriver::new(mock, vec![1])
         .with_calibrated(true)
         .with_tx_echo(Some(false));
-    driver.set_confirmed_enable_state(EnableState::Enabled);
+    let en_read = feetech::build_read(1, feetech::REG_TORQUE_ENABLE, 1);
+    let en_cs = calculate_checksum(1, 3, 0x00, &[1]);
+    driver.transport_mut().stage_reply(&en_read, &[0xFF, 0xFF, 1, 3, 0x00, 1, en_cs]);
+    driver.refresh_enable_state().unwrap();
+    driver.transport_mut().clear_write_responses();
+    assert_eq!(driver.enable_state(), EnableState::Enabled);
 
     let build_resp_pos = |id: u8, pos_steps: u16| -> Vec<u8> {
         let pos = pos_steps.to_le_bytes();

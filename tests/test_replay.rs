@@ -105,7 +105,7 @@ fn rig(config: ArmConfig, dir: &std::path::Path) -> (SupervisorInner, LagArm) {
     let arm = LagArm::new(INSPECT, false);
     let mut inner = SupervisorInner::new(config);
     inner.lease_enabled = false;
-    inner.driver = Some(Mutex::new(Box::new(arm.clone())));
+    inner.driver = Some(armd::supervisor_lock::DriverSlot::legacy(Box::new(arm.clone())));
     inner.commanded_positions = INSPECT.to_vec();
     inner.measured_positions = INSPECT.to_vec();
     inner.target_positions = INSPECT.to_vec();

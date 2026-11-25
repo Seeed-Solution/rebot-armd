@@ -35,7 +35,10 @@ fn backlog_decoded_after_fence_keeps_pre_fence_queue_bound() {
     driver.read_joint_states().unwrap();
     driver.read_joint_states().unwrap();
     assert_eq!(driver.feedback_seqs()[0].wrapping_sub(seq0), 2, "both old joint-1 replies were decoded");
-    assert!(driver.feedback_instants()[0].unwrap() >= fence, "decode stamps are post-fence");
+    assert!(
+        driver.feedback_instants()[0].is_some_and(|t| t <= fence),
+        "S1: transport arrival stamps precede the fence even when decoded afterwards"
+    );
     let bounds = driver.feedback_queue_bounds();
     assert_eq!(bounds.len(), 2);
     assert!(bounds[0].is_none_or(|b| b < fence), "a pre-fence reply reports a post-fence queue bound: {bounds:?}");

@@ -239,6 +239,10 @@ impl Transport for MockTransport {
         Some(Arc::new(self.clock.clone()))
     }
 
+    fn clears_input_buffer(&self) -> bool {
+        !self.preserve_on_clear
+    }
+
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
         if let Some(err_msg) = self.error_on_next_read.take() {
             if !buf.is_empty() {
@@ -341,7 +345,7 @@ impl AsyncTransport for MockTransport {
 /// Mock CAN bus frame transport for testing CAN controllers and protocols
 #[derive(Debug, Clone, Default)]
 pub struct MockCanTransport {
-    rx_frames: VecDeque<CanFrame>,
+    rx_frames: VecDeque<(CanFrame, Option<Instant>)>,
     tx_frames: VecDeque<CanFrame>,
     loopback: bool,
     error_on_next_tx: Option<String>,
@@ -353,6 +357,10 @@ pub struct MockCanTransport {
 impl MockCanTransport {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn now(&self) -> Instant {
+        self.clock.as_ref().map_or_else(Instant::now, MockClock::now)
     }
 
     /// Attach a deterministic virtual clock so drivers using this mock transport
@@ -371,13 +379,34 @@ impl MockCanTransport {
         self.transmit_responses.push((request, response));
     }
 
+    /// Replace any previously registered response(s) for `request` with `response`.
+    pub fn replace_transmit_response(&mut self, request: CanFrame, response: CanFrame) {
+        self.transmit_responses.retain(|(req, _)| *req != request);
+        self.transmit_responses.push((request, response));
+    }
+
+    /// Remove any previously registered response(s) for `request`.
+    pub fn remove_transmit_response(&mut self, request: &CanFrame) {
+        self.transmit_responses.retain(|(req, _)| req != request);
+    }
+
     pub fn provide_rx_frame(&mut self, frame: CanFrame) {
-        self.rx_frames.push_back(frame);
+        let ts = self.now();
+        self.rx_frames.push_back((frame, Some(ts)));
+    }
+
+    pub fn provide_rx_frame_at(&mut self, frame: CanFrame, ts: Instant) {
+        self.rx_frames.push_back((frame, Some(ts)));
+    }
+
+    pub fn provide_rx_frame_untimestamped(&mut self, frame: CanFrame) {
+        self.rx_frames.push_back((frame, None));
     }
 
     pub fn provide_rx_frames(&mut self, frames: &[CanFrame]) {
+        let ts = self.now();
         for f in frames {
-            self.rx_frames.push_back(*f);
+            self.rx_frames.push_back((*f, Some(ts)));
         }
     }
 
@@ -422,13 +451,14 @@ impl CanTransport for MockCanTransport {
         }
 
         self.tx_frames.push_back(*frame);
+        let reply_ts = self.now();
         if self.loopback {
-            self.rx_frames.push_back(*frame);
+            self.rx_frames.push_back((*frame, Some(reply_ts)));
         }
 
         for (request, response) in &self.transmit_responses {
             if frame == request {
-                self.rx_frames.push_back(*response);
+                self.rx_frames.push_back((*response, Some(reply_ts)));
             }
         }
 
@@ -436,6 +466,12 @@ impl CanTransport for MockCanTransport {
     }
 
     fn receive(&mut self) -> Result<CanFrame, TransportError> {
+        self.receive_timestamped().map(|(f, _)| f)
+    }
+
+    fn receive_timestamped(
+        &mut self,
+    ) -> Result<(CanFrame, Option<std::time::Instant>), TransportError> {
         if let Some(err) = self.error_on_next_rx.take() {
             return Err(TransportError::Can(err));
         }

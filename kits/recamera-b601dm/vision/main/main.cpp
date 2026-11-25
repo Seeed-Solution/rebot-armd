@@ -76,32 +76,15 @@ struct Config {
     std::string depth_metric_str = "auto";  // "auto", "on", "off"
     std::string model_kind_str = "auto";    // "auto", "detect", "segment", "obb"
     rv::Catalogue catalogue;  // vision.json "models" and "ion_*_mb", plus the startup models
+    std::vector<rv::ManifestEntry> manifest;  // models.tsv (or compiled-in mirror)
     bool intrinsics_cli = false;  // --fx..--k3 or --marker-size given: PUT /api/calibration/intrinsics refused
     bool verbose = false;
 } g_cfg;
 
-// seg384 first: a resident segmentation model gives masks (grasp angle, measure_multiview
-// contours) without a model swap; then detect, OBB and the 640x640 segment model
-const char* kDefaultModels[] = {
-    "/userdata/local/models/yolo11n_seg_384x640_cv181x_int8_fuse.cvimodel",
-    "/userdata/rebot-teleop/models/yolo11n.cvimodel",
-    "/usr/share/supervisor/models/yolo11n_detection_cv181x_int8.cvimodel",
-    "/userdata/local/models/yolo11n_detection_cv181x_int8.cvimodel",
-    "/userdata/local/models/yolo11n_cv181x_int8.cvimodel",
-    "/userdata/rebot-teleop/models/yolo11n-obb.cvimodel",
-    "/userdata/local/models/yolo11n_obb_cv181x_int8_fuse_qout.cvimodel",
-    "/userdata/local/models/yolo11n_obb_cv181x_int8.cvimodel",
-    "/userdata/local/models/yolo26n_obb_cv181x_int8.cvimodel",
-    "/usr/share/supervisor/models/yolo11n_segment_cv181x_int8.cvimodel",
-    "/userdata/local/models/yolo11n_segment_cv181x_int8.cvimodel",
-};
-
-const char* kDefaultDepthModels[] = {
-    "/userdata/rebot-teleop/models/zipdepth_metric_384x224_bf16_rgb.cvimodel",
-    "/userdata/rebot-teleop/models/zipdepth_base_384x224_bf16_rgb.cvimodel",
-    "/userdata/local/models/zipdepth_metric_384x224_bf16_rgb.cvimodel",
-    "/userdata/local/models/zipdepth_base_384x224_bf16_rgb.cvimodel",
-};
+std::string manifest_path_from_env() {
+    const char* env = std::getenv("REBOT_MODELS_TSV");
+    return (env && env[0] != '\0') ? std::string(env) : std::string(rv::kDefaultManifestPath);
+}
 
 /** Collects ArUco frame timings and logs p50/p95 per stage every n frames. */
 class ArucoStats {
@@ -304,9 +287,10 @@ bool parse_args(int argc, char** argv) {
         if (std::strcmp(argv[i], "--config") == 0) g_cfg.config_path = argv[i + 1];
     }
     load_config_file(g_cfg.config_path);
+    g_cfg.manifest = rv::load_manifest_or_builtin(manifest_path_from_env());
     // no `models` in vision.json: the built-in catalogue of the model files on this unit
     if (!g_cfg.catalogue.configured) {
-        rv::add_default_models(g_cfg.catalogue, [](const std::string& p) { return file_exists(p); });
+        rv::add_default_models(g_cfg.catalogue, [](const std::string& p) { return file_exists(p); }, g_cfg.manifest);
         for (const rv::ModelEntry& e : g_cfg.catalogue.models) MA_LOGI(TAG, "Model catalogue: %s (%s) %s", e.name.c_str(), e.kind.c_str(), e.path.c_str());
     }
 
@@ -531,9 +515,9 @@ int main(int argc, char** argv) {
     std::unique_ptr<rv::DepthStage> depth_stage;
     rv::ModelSet resident;
     if (model.empty()) {
-        // automatic: the first default that exists and loads (a corrupt seg384 does not hide the
-        // detect model behind it); an explicitly configured model is loaded alone, below
-        const std::vector<std::string> candidates(std::begin(kDefaultModels), std::end(kDefaultModels));
+        // automatic: default order from manifest roles (seg384 fuse first, then detect, OBB,
+        // fallback 640x640 segment); an explicitly pinned path in vision.json still wins below
+        const std::vector<std::string> candidates = rv::default_detector_candidates(g_cfg.manifest);
         const int k = rv::first_loadable(
             candidates, [](const std::string& p) { return file_exists(p); },
             [&](const std::string& p) {
@@ -567,7 +551,7 @@ int main(int argc, char** argv) {
     std::string depth_model = g_cfg.depth_model_path;
     bool depth_disabled = (depth_model == "off");
     if (!depth_disabled && depth_model.empty()) {
-        for (const char* p : kDefaultDepthModels) {
+        for (const std::string& p : rv::default_depth_candidates(g_cfg.manifest)) {
             if (file_exists(p)) {
                 depth_model = p;
                 break;
@@ -948,7 +932,12 @@ int main(int argc, char** argv) {
             r.height = frame.height;
             r.inference_ms = vr.inference_ms;
             r.set_boxes(boxes.data(), boxes.size());
-            extra = rv::debug_extra(vr.mode, display_markers);
+            std::string display_contours;
+            if (vr.ran_yolo && detector && detector->getKind() == yolo::Kind::Segment) {
+                const size_t budget = rv::ws_contours_budget(vr.mode, dets, display_markers);
+                display_contours = rv::contours_json(dets, content, frame.width, frame.height, budget);
+            }
+            extra = rv::debug_extra(vr.mode, display_markers, display_contours);
             r.debug_extra = extra;
 
             if (g_cfg.verbose) {

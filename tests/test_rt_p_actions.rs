@@ -93,7 +93,7 @@ fn fixture_driven() -> (Fx, Broker<PlanSlot>, VirtualClock, TestArm) {
         ..ArmConfig::rebot_dm()
     });
     inner.lease_enabled = false;
-    inner.driver = Some(Mutex::new(Box::new(arm.clone())));
+    inner.driver = Some(armd::supervisor_lock::DriverSlot::legacy(Box::new(arm.clone())));
     inner.commanded_positions = INSPECT.to_vec();
     inner.measured_positions = INSPECT.to_vec();
     inner.target_positions = INSPECT.to_vec();
@@ -1684,7 +1684,7 @@ fn review_b2_forced_finish_and_timeout_under_rejected_bus_holds_jaw_and_refuses_
         ..ArmConfig::rebot_dm()
     });
     inner.lease_enabled = false;
-    inner.driver = Some(Mutex::new(Box::new(drv.clone())));
+    inner.driver = Some(armd::supervisor_lock::DriverSlot::legacy(Box::new(drv.clone())));
     inner.register_live_connection(1).unwrap();
     inner.commanded_positions = INSPECT.to_vec();
     inner.measured_positions = INSPECT.to_vec();
@@ -2414,7 +2414,7 @@ fn review_m8_m9_mixed_legacy_child_refused_and_gripper_to_jog_replacement_order(
         ..ArmConfig::rebot_dm()
     });
     inner.lease_enabled = false;
-    inner.driver = Some(Mutex::new(Box::new(drv.clone())));
+    inner.driver = Some(armd::supervisor_lock::DriverSlot::legacy(Box::new(drv.clone())));
     inner.register_live_connection(1).unwrap();
     inner.commanded_positions = INSPECT.to_vec();
     inner.measured_positions = INSPECT.to_vec();
@@ -3444,7 +3444,7 @@ fn r2_m3_macro_parent_deadline_stops_output_pre_tx_with_no_advance() {
         ..ArmConfig::rebot_dm()
     });
     core.lease_enabled = false;
-    core.driver = Some(Mutex::new(Box::new(drv.clone())));
+    core.driver = Some(armd::supervisor_lock::DriverSlot::legacy(Box::new(drv.clone())));
     core.commanded_positions = INSPECT.to_vec();
     core.measured_positions = INSPECT.to_vec();
     core.target_positions = INSPECT.to_vec();
@@ -4214,7 +4214,7 @@ fn driven_inner(drv: RecordingHoldDriver) -> SupervisorInner {
         ..ArmConfig::rebot_dm()
     });
     inner.lease_enabled = false;
-    inner.driver = Some(Mutex::new(Box::new(drv)));
+    inner.driver = Some(armd::supervisor_lock::DriverSlot::legacy(Box::new(drv)));
     inner.commanded_positions = INSPECT.to_vec();
     inner.measured_positions = INSPECT.to_vec();
     inner.target_positions = INSPECT.to_vec();

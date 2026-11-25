@@ -541,7 +541,7 @@ pub fn begin_calibration(admitted: crate::supervisor::Admitted<'_>, sup: &std::s
     let (Some(_), Some(policy)) = (inner.config.gripper_index(), inner.config.gripper_policy.clone()) else {
         return Err(MotionError::Unsupported("Gripper calibration needs a profile with a gripper joint and policy".into()).into());
     };
-    let torque_feedback = inner.driver.as_ref().and_then(|d| d.lock().ok().map(|d| d.capabilities().torque_feedback)).unwrap_or(true);
+    let torque_feedback = inner.driver.as_ref().and_then(|d| d.with_ref(|d| d.capabilities().torque_feedback)).unwrap_or(true);
     if !torque_feedback {
         return Err(MotionError::Unsupported("Gripper calibration needs torque feedback".into()).into());
     }

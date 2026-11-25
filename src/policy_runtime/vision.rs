@@ -139,12 +139,104 @@ impl Drop for VisionFeatureCollector {
     }
 }
 
-/// Extract `[1.0, cx, cy, w, h, score]` from the highest-score valid detection
-/// matching `spec.target_label` and `spec.min_score`.
-pub fn extract_top1_box_norm_v1(
+/// Minimum bounding-box IoU required for two detections with the same label to be treated
+/// as the same target when the detector does not report a track identifier.
+pub const DETECTOR_TARGET_SAME_IOU_MIN: f32 = 0.5;
+
+/// Fixed-size identity of the top-1 detector target used to compute an action chunk.
+///
+/// Uses [`Self::TrackId`] when the detector supplies a track identifier; otherwise
+/// identifies the target by a 128-bit SHA-256 prefix of its label and its normalized
+/// `[x1, y1, x2, y2]` bounding box (`frame_id` is excluded so a stationary target stays
+/// identical across new frames).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DetectorTargetIdentity {
+    Absent,
+    TrackId(u64),
+    Detection {
+        label_digest: [u8; 16],
+        box_norm: [f32; 4],
+    },
+}
+
+impl DetectorTargetIdentity {
+    /// Construct identity from a detector track id when available, otherwise from
+    /// `label` and normalized box `[x1, y1, x2, y2]`.
+    pub fn from_detection(
+        track_id: Option<u64>,
+        label: &str,
+        box_norm: [f64; 4],
+    ) -> Self {
+        if let Some(tid) = track_id {
+            return Self::TrackId(tid);
+        }
+        let mut hasher = crate::gravity::Sha256::new();
+        hasher.update(label.as_bytes());
+        let full = hasher.finalize();
+        let mut label_digest = [0u8; 16];
+        label_digest.copy_from_slice(&full[..16]);
+        let box_f32 = [
+            box_norm[0].clamp(0.0, 1.0) as f32,
+            box_norm[1].clamp(0.0, 1.0) as f32,
+            box_norm[2].clamp(0.0, 1.0) as f32,
+            box_norm[3].clamp(0.0, 1.0) as f32,
+        ];
+        Self::Detection {
+            label_digest,
+            box_norm: box_f32,
+        }
+    }
+
+    /// Returns `true` when `self` and `other` refer to the same target:
+    /// - `Absent` matches `Absent`;
+    /// - `TrackId(a)` matches `TrackId(b)` iff `a == b`;
+    /// - `Detection` matches `Detection` iff the labels match and `IoU >= 0.5`.
+    pub fn matches(&self, other: &Self) -> bool {
+        match (*self, *other) {
+            (Self::Absent, Self::Absent) => true,
+            (Self::TrackId(a), Self::TrackId(b)) => a == b,
+            (
+                Self::Detection {
+                    label_digest: la,
+                    box_norm: ba,
+                },
+                Self::Detection {
+                    label_digest: lb,
+                    box_norm: bb,
+                },
+            ) => la == lb && box_iou_f32(ba, bb) >= DETECTOR_TARGET_SAME_IOU_MIN,
+            _ => false,
+        }
+    }
+}
+
+fn box_iou_f32(a: [f32; 4], b: [f32; 4]) -> f32 {
+    let ix1 = a[0].max(b[0]);
+    let iy1 = a[1].max(b[1]);
+    let ix2 = a[2].min(b[2]);
+    let iy2 = a[3].min(b[3]);
+    let iw = (ix2 - ix1).max(0.0);
+    let ih = (iy2 - iy1).max(0.0);
+    let inter = iw * ih;
+    if inter <= 0.0 {
+        return 0.0;
+    }
+    let area_a = (a[2] - a[0]).max(0.0) * (a[3] - a[1]).max(0.0);
+    let area_b = (b[2] - b[0]).max(0.0) * (b[3] - b[1]).max(0.0);
+    let union = area_a + area_b - inter;
+    if union <= 0.0 {
+        0.0
+    } else {
+        inter / union
+    }
+}
+
+/// Extract `[1.0, cx, cy, w, h, score]` and the fixed-size [`DetectorTargetIdentity`]
+/// from the highest-score valid detection matching `spec.target_label` and `spec.min_score`.
+pub fn extract_top1_target(
     frame: &PolicyVisionFrame,
     spec: &VisionFeatureSpec,
-) -> Option<[f32; 6]> {
+) -> Option<([f32; 6], DetectorTargetIdentity)> {
     let mut best: Option<&Detection> = None;
     for det in &frame.detections {
         if let Some(ref target) = spec.target_label {
@@ -197,7 +289,17 @@ pub fn extract_top1_box_norm_v1(
     {
         return None;
     }
-    Some([1.0, cx, cy, w, h, score])
+    let identity = DetectorTargetIdentity::from_detection(None, &det.label, det.box_norm);
+    Some(([1.0, cx, cy, w, h, score], identity))
+}
+
+/// Extract `[1.0, cx, cy, w, h, score]` from the highest-score valid detection
+/// matching `spec.target_label` and `spec.min_score`.
+pub fn extract_top1_box_norm_v1(
+    frame: &PolicyVisionFrame,
+    spec: &VisionFeatureSpec,
+) -> Option<[f32; 6]> {
+    extract_top1_target(frame, spec).map(|(features, _)| features)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -206,6 +308,7 @@ pub enum VisionStepDecision {
         features: [f32; 6],
         vision_age_ms: u64,
         frame_id: u64,
+        target_identity: DetectorTargetIdentity,
     },
     Hold,
     Stop {
@@ -322,17 +425,19 @@ pub fn evaluate_vision_frame(
         );
     }
 
-    match extract_top1_box_norm_v1(frame, spec) {
-        Some(features) => VisionStepDecision::Ready {
+    match extract_top1_target(frame, spec) {
+        Some((features, target_identity)) => VisionStepDecision::Ready {
             features,
             vision_age_ms,
             frame_id: frame.frame_id,
+            target_identity,
         },
         None => match spec.on_target_lost {
             VisionTargetLostPolicy::ZeroFeatures => VisionStepDecision::Ready {
                 features: [0.0; 6],
                 vision_age_ms,
                 frame_id: frame.frame_id,
+                target_identity: DetectorTargetIdentity::Absent,
             },
             VisionTargetLostPolicy::Hold => VisionStepDecision::Hold,
             VisionTargetLostPolicy::Stop => VisionStepDecision::Stop {
@@ -365,8 +470,17 @@ static MONOTONIC_EPOCH: OnceLock<Instant> = OnceLock::new();
 
 /// Process-wide monotonic clock in milliseconds (immune to wall-clock rollbacks).
 pub fn monotonic_now_ms() -> u64 {
-    let epoch = MONOTONIC_EPOCH.get_or_init(Instant::now);
-    epoch.elapsed().as_millis().min(u64::MAX as u128) as u64
+    monotonic_ms_at(Instant::now())
+}
+
+/// Convert a monotonic [`Instant`] into process-wide `armd_ms` using the same
+/// [`MONOTONIC_EPOCH`] as [`monotonic_now_ms`].
+pub fn monotonic_ms_at(instant: Instant) -> u64 {
+    let epoch = *MONOTONIC_EPOCH.get_or_init(|| instant);
+    instant
+        .saturating_duration_since(epoch)
+        .as_millis()
+        .min(u64::MAX as u128) as u64
 }
 
 fn normalize_sha256_hex(raw: &str, field: &str) -> Result<String, EmbeddingIngestError> {
@@ -671,7 +785,10 @@ impl EmbeddingHubInner {
     }
 
     fn live_ticket_state(&self) -> LiveEmbeddingTicketState {
-        let now_armd_ms = self.now_ms();
+        self.live_ticket_state_at(self.now_ms())
+    }
+
+    fn live_ticket_state_at(&self, now_armd_ms: u64) -> LiveEmbeddingTicketState {
         let (clock_handshake_generation, clock_handshake_expires_at_ms) = match &self.handshake {
             Some(hs) => (hs.handshake_generation, hs.handshake_expires_at_ms),
             None => (0, 0),
@@ -701,11 +818,18 @@ impl<'a> HubCommitGuard<'a> {
         self.inner.live_ticket_state()
     }
 
+    pub fn live_ticket_state_at(&self, now_armd_ms: u64) -> LiveEmbeddingTicketState {
+        self.inner.live_ticket_state_at(now_armd_ms)
+    }
+
     pub fn is_unbroken_active_renewal(&self, ticket_hs_gen: u64) -> bool {
+        self.is_unbroken_active_renewal_at(ticket_hs_gen, self.inner.now_ms())
+    }
+
+    pub fn is_unbroken_active_renewal_at(&self, ticket_hs_gen: u64, now_ms: u64) -> bool {
         let Some(ref live_hs) = self.inner.handshake else {
             return false;
         };
-        let now_ms = self.inner.now_ms();
         let floor = self.inner.continuous_renewal_floor_gen;
         if live_hs.handshake_generation == 0
             || floor == 0
@@ -719,6 +843,12 @@ impl<'a> HubCommitGuard<'a> {
         } else {
             ticket_hs_gen >= floor || ticket_hs_gen <= live_hs.handshake_generation
         }
+    }
+
+    /// Synthetic test clock override when active (`None` in production, where callers use
+    /// [`monotonic_ms_at`] on the commit gate's `Instant`).
+    pub fn test_now_ms(&self) -> Option<u64> {
+        self.inner.test_now_ms
     }
 }
 

@@ -86,8 +86,30 @@ struct MarkerOut {
 /** Markers JSON array (aruco-detector field set); pixel coordinates multiplied by scale. */
 std::string markers_json(const std::vector<MarkerOut>& markers, double scale_x = 1.0, double scale_y = 1.0);
 
-/** Extra members for the debug /results envelope: "mode":"...","markers":[...] (display pixels). */
-std::string debug_extra(Mode mode, const std::string& display_markers_json);
+/** Hard cap on the total debug /results WebSocket frame size when contours are included. */
+constexpr size_t kMaxWsFrameBytes = 16384;
+
+/**
+ * Remaining byte budget for the WS `contours` JSON array so the full debug /results envelope
+ * (header, boxes, labels, mode, markers, contours) stays within `max_frame_bytes`.
+ */
+size_t ws_contours_budget(Mode mode, const std::vector<DetBox>& dets, const std::string& display_markers_json,
+                          size_t max_frame_bytes = kMaxWsFrameBytes) noexcept;
+
+/**
+ * Contours JSON array aligned 1-to-1 with `dets`: each entry is `[[x,y],...]` normalised to
+ * `rect` (clamped to [0, 1], at most kMaxContourVertices vertices, same format as `detections_json`)
+ * or `null` when the detection has fewer than 3 contour vertices or does not fit `max_bytes`.
+ * Returns an empty string when even the minimal aligned array (`[]` / `[null,...]`) exceeds `max_bytes`.
+ */
+std::string contours_json(const std::vector<DetBox>& dets, const ContentRect& rect, int inference_w, int inference_h,
+                          size_t max_bytes = kMaxWsFrameBytes);
+
+/**
+ * Extra members for the debug /results envelope: "mode":"...","markers":[...] (display pixels),
+ * and optionally "contours":[...] (normalised to the visible image) when non-empty.
+ */
+std::string debug_extra(Mode mode, const std::string& display_markers_json, const std::string& contours_json = {});
 
 }  // namespace rv
 
