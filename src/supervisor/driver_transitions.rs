@@ -7698,12 +7698,24 @@ impl SupervisorInner {
         .unwrap_or(PanicDisableOutcome::TimedOut);
         #[cfg(not(target_arch = "wasm32"))]
         if self.torque_shadow.is_enabled() {
+            let deferred_mit = self.torque_shadow.take_deferred_mit_off();
+            if !deferred_mit.is_empty() {
+                self.torque_shadow.enqueue(
+                    crate::torque::shadow::ShadowInputKind::MitOwnershipChange {
+                        channels: deferred_mit,
+                        target_mode: crate::motor_mode::ControlMode::PositionVelocity,
+                        device_wide: false,
+                    },
+                );
+            }
             match &outcome {
                 PanicDisableOutcome::Confirmed
                 | PanicDisableOutcome::Unconfirmed
                 | PanicDisableOutcome::NoDriver => {
                     if let Some(ref d) = self.driver {
-                        if let Ok(mut drv) = d.try_lock() {
+                        if crate::rt_core::executor::on_rt_control_thread() {
+                            self.torque_shadow.record_external_staging_loss(1);
+                        } else if let Ok(mut drv) = d.try_lock() {
                             self.torque_shadow.drain_from_driver(&mut **drv);
                         } else {
                             self.torque_shadow.record_external_staging_loss(1);
