@@ -1486,6 +1486,9 @@ pub enum ConfigRequest {
     ClearSequenceRunPins { action_id: u64 },
     /// Starts one tick-driven non-blocking hardware commissioning op on the RT owner (0 alloc).
     StartCommissioning(crate::mit::CommissioningStartRequest),
+    /// Binds durable `.calibration_commit.pending` marker proof to an active `Reserved` calibration
+    /// hold before irreversible hardware commissioning TX (B2; 0 alloc).
+    BindCommissioningMarker { grant_id: GrantId },
     /// Polls status and per-joint outcomes of commissioning op `op_id` (0 alloc).
     PollCommissioning { op_id: u64 },
     /// Cancels an active commissioning op matching `op_id` (stale ids ignored; forces
@@ -1531,6 +1534,7 @@ impl ConfigRequest {
             | Self::EndCalibrationTxn { .. }
             | Self::SampleCalibrationState { .. }
             | Self::StartCommissioning(_)
+            | Self::BindCommissioningMarker { .. }
             | Self::PollCommissioning { .. }
             | Self::CancelCommissioning { .. }
             | Self::ClearCommissioning { .. }
@@ -1563,6 +1567,7 @@ pub enum ConfigReply {
     CalibrationStateSampled(Result<CalibrationStateSample, ConfigError>),
     SequenceRunPinsUpdated,
     CommissioningStarted(Result<u64, ConfigError>),
+    CommissioningMarkerBound(Result<(), &'static str>),
     CommissioningPolled(Option<crate::mit::CommissioningSnapshot>),
     CommissioningCancelled(Option<crate::mit::CommissioningSnapshot>),
     CommissioningCleared(bool),
@@ -1744,6 +1749,9 @@ pub(crate) fn handle_config_exchange(
         ConfigRequest::StartCommissioning(req) => {
             ConfigReply::CommissioningStarted(core.start_commissioning_rt(req, ctx.now))
         }
+        ConfigRequest::BindCommissioningMarker { grant_id } => ConfigReply::CommissioningMarkerBound(
+            core.core.config_mut().bind_commissioning_marker(grant_id),
+        ),
         ConfigRequest::PollCommissioning { op_id } => {
             ConfigReply::CommissioningPolled(core.poll_commissioning_rt(op_id))
         }

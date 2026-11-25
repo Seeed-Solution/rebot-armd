@@ -1904,6 +1904,8 @@ pub trait ArmDriver: Send {
 
     /// Scans the preallocated commissioning register-reply buffer for a reply causally matching
     /// `(joint, write, rid)` strictly after `(after_tx_seq, min_rx_at, tx_offset_ns)`.
+    /// Returns [`CommissioningRegMatch::Ambiguous`] if multiple replies or any stale/drifted reply
+    /// for `(joint, write, rid)` arrived after `after_tx_seq` (B1 fail-closed attribution).
     fn commissioning_find_register_reply(
         &self,
         _joint: usize,
@@ -1912,8 +1914,8 @@ pub trait ArmDriver: Send {
         _after_tx_seq: u64,
         _min_rx_at: Instant,
         _tx_offset_ns: Option<i128>,
-    ) -> Option<crate::mit::CommissioningRegReply> {
-        None
+    ) -> crate::mit::CommissioningRegMatch {
+        crate::mit::CommissioningRegMatch::Pending
     }
 
     /// One bounded non-blocking disable-all step (retaining per-motor `disable_dispatched_mask`
@@ -8343,9 +8345,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 return Err(TxRefusal::LeaseFenced);
             }
         }
-        let tx_seq_mark = self.rx_seq;
-        let tx_started_mark = self.now();
-        let (_, tx_offset_ns_mark) = self.capture_rx_clock_sample(tx_started_mark);
 
         // 6. Account budget attempt, reset per-motor rest-pose/enable boundaries BEFORE any
         //    motion/enable/mode write reaches the transport, transmit, and record diagnostics.
@@ -8379,7 +8378,12 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 }
             }
         }
+        // B1: Capture the causal submission mark immediately adjacent to `can.transmit` after
+        // all pre-TX bookkeeping so no pre-submission gap can widen the attribution window.
+        let tx_seq_mark = self.rx_seq;
         let t0 = self.now();
+        let tx_started_mark = t0;
+        let (_, tx_offset_ns_mark) = self.capture_rx_clock_sample(tx_started_mark);
         let cpu0 = crate::diagnostics::tick::thread_cpu_ns();
         let res = self.can.transmit(&frame);
         let write_done = self.now();
@@ -13168,29 +13172,46 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         after_tx_seq: u64,
         min_rx_at: Instant,
         tx_offset_ns: Option<i128>,
-    ) -> Option<crate::mit::CommissioningRegReply> {
-        let id = *self.motor_ids.get(joint)?;
-        for slot in self.comm_reg_replies[..self.comm_reg_reply_len].iter().rev() {
+    ) -> crate::mit::CommissioningRegMatch {
+        let Some(&id) = self.motor_ids.get(joint) else {
+            return crate::mit::CommissioningRegMatch::Pending;
+        };
+        let mut matched: Option<crate::mit::CommissioningRegReply> = None;
+        for slot in &self.comm_reg_replies[..self.comm_reg_reply_len] {
             let Some(rep) = *slot else { continue };
             if rep.motor_id != id || rep.write != write || rep.rid != rid {
                 continue;
             }
-            if rep.rx_seq <= after_tx_seq || rep.rx_at < min_rx_at {
+            if rep.rx_seq <= after_tx_seq {
                 continue;
             }
-            // Account for kernel realtime-to-monotonic offset uncertainty on Linux SocketCAN.
-            match (tx_offset_ns, rep.decode_offset_ns) {
-                (Some(w_off), Some(d_off)) => {
-                    if (d_off - w_off).abs() > MAX_REALTIME_MONOTONIC_OFFSET_DRIFT_NS {
-                        continue;
-                    }
-                }
-                (None, None) => {}
-                _ => continue,
+            // B1: Any reply for `(motor_id, op, rid)` dequeued AFTER the empty-queue TX boundary
+            // whose timestamp precedes `min_rx_at` or whose realtime-to-monotonic clock offset
+            // drifted proves delayed/ambiguous in-flight bus traffic -> fail closed!
+            if rep.rx_at < min_rx_at {
+                return crate::mit::CommissioningRegMatch::Ambiguous;
             }
-            return Some(rep);
+            let offset_ok = match (tx_offset_ns, rep.decode_offset_ns) {
+                (Some(w_off), Some(d_off)) => {
+                    (d_off - w_off).abs() <= MAX_REALTIME_MONOTONIC_OFFSET_DRIFT_NS
+                }
+                (None, None) => true,
+                _ => false,
+            };
+            if !offset_ok {
+                return crate::mit::CommissioningRegMatch::Ambiguous;
+            }
+            // Multiple replies for the same `(motor_id, op, rid)` in one request window ->
+            // cannot distinguish delayed stale traffic from the current request -> fail closed!
+            if matched.is_some() {
+                return crate::mit::CommissioningRegMatch::Ambiguous;
+            }
+            matched = Some(rep);
         }
-        None
+        match matched {
+            Some(rep) => crate::mit::CommissioningRegMatch::Matched(rep),
+            None => crate::mit::CommissioningRegMatch::Pending,
+        }
     }
 
     fn commissioning_disable_step(

@@ -2019,7 +2019,7 @@ pub(crate) async fn run_motor_executor_with_guard(
                                 }))
                                 .await;
                         }
-                        return Err(e.at("disable"));
+                        return Err(e.into_calib_error().at("disable"));
                     }
                 };
                 if disable_snap.state != CommissioningOpState::Done {
@@ -2082,6 +2082,37 @@ pub(crate) async fn run_motor_executor_with_guard(
                         500,
                         "PERSIST_FAILED",
                         format!("pending commit marker could not be written: {e}; nothing was changed"),
+                    ));
+                }
+
+                // B2: Bind durable pending-marker proof to the active Reserved hold on the RT owner
+                // BEFORE any pre-HW MIT invalidation or `StartCommissioning(MotorZeroWriteVerify)`.
+                let bind_res = sup_w
+                    .dispatch_config_request_reliable(|| ConfigRequest::BindCommissioningMarker { grant_id })
+                    .await;
+                if !matches!(bind_res, Ok(ConfigReply::CommissioningMarkerBound(Ok(())))) {
+                    let mp_rm = marker_path.clone();
+                    let rm_ok = tokio::task::spawn_blocking(move || remove_pending_commit_marker(&mp_rm))
+                        .await
+                        .map_err(|e| e.to_string())
+                        .and_then(|r| r)
+                        .is_ok();
+                    if rm_ok {
+                        if let Some(r_tok) = res_guard.take() {
+                            let _ = sup_w
+                                .dispatch_config_request_owned_reliable(ConfigRequest::Release(ReleaseConfig {
+                                    reservation: r_tok,
+                                }))
+                                .await;
+                        }
+                    } else {
+                        res_guard.mark_hw_mutated();
+                        txn_guard.mark_remote_mutated();
+                    }
+                    return Err(CalibError::new(
+                        409,
+                        "CONFIG_BUSY",
+                        "commissioning reservation lost before binding durable pending marker; nothing was changed",
                     ));
                 }
 
@@ -2277,7 +2308,7 @@ pub(crate) async fn run_motor_executor_with_guard(
                 };
                 let snap = match run_rt_commissioning_op(&sup_w, zero_req, auth.auth_check.as_ref()).await {
                     Ok(s) => s,
-                    Err(e) => {
+                    Err(crate::mit::CommissioningRunError::DefinitivePreTxRefusal(e)) => {
                         let mp_rm = marker_path.clone();
                         let rm_ok = tokio::task::spawn_blocking(move || remove_pending_commit_marker(&mp_rm))
                             .await
@@ -2296,6 +2327,18 @@ pub(crate) async fn run_motor_executor_with_guard(
                             res_guard.mark_hw_mutated();
                             txn_guard.mark_remote_mutated();
                         }
+                        return Err(e.at("set_zero"));
+                    }
+                    Err(crate::mit::CommissioningRunError::UnknownPostStartOutcome(e)) => {
+                        // B3: Outcome after start submission is unknown — NEVER unlink `.calibration_commit.pending`;
+                        // force Reconciling fail-closed so the restart fence survives process exit.
+                        res_guard.mark_hw_mutated();
+                        txn_guard.mark_remote_mutated();
+                        let _ = sup_w
+                            .dispatch_config_request_reliable(|| {
+                                ConfigRequest::ForceReconcile(ConfigDomain::Calibration)
+                            })
+                            .await;
                         return Err(e.at("set_zero"));
                     }
                 };

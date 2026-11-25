@@ -2153,6 +2153,21 @@ pub struct CommissioningFeedback {
     pub queue_bound: Option<std::time::Instant>,
 }
 
+/// Fail-closed causal match result for a single commissioning register request (B1).
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy)]
+pub enum CommissioningRegMatch {
+    /// No matching reply dequeued after `after_tx_seq` yet.
+    Pending,
+    /// Exactly one reply matched `(motor_id, op, rid)` strictly after `(after_tx_seq, min_rx_at)`
+    /// with bounded realtime-to-monotonic clock offset drift.
+    Matched(CommissioningRegReply),
+    /// Multiple replies for `(motor_id, op, rid)` or a stale/drifted reply arrived after the
+    /// empty-queue TX boundary: causal attribution cannot prove this reply belongs to the current
+    /// request, so callers MUST fail closed (preserving `Uncertain` on writes).
+    Ambiguous,
+}
+
 /// Copyable live authority binding checked on the RT owner before EVERY irreversible TX.
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, Copy)]
@@ -2328,6 +2343,11 @@ const COMM_IDENTITY_RIDS: [u8; 8] = [
 /// Bounded per-request register reply wait timeout on the driver clock.
 #[cfg(not(target_arch = "wasm32"))]
 const COMM_REG_REPLY_TIMEOUT: Duration = Duration::from_millis(50);
+/// Documented quiet-bus latency bound after an unanswered or ambiguous register request on 1 Mbps
+/// Damiao CAN (2x `COMM_REG_REPLY_TIMEOUT`): no subsequent register request may start until the bus
+/// stays quiet past this bound.
+#[cfg(not(target_arch = "wasm32"))]
+const COMM_REG_QUIET_BOUND: Duration = Duration::from_millis(100);
 /// Maximum non-blocking TX attempts for one register or motor-zero frame before failing.
 #[cfg(not(target_arch = "wasm32"))]
 const COMM_MAX_FRAME_ATTEMPTS: u8 = 16;
@@ -2414,6 +2434,9 @@ pub struct CommissioningMachine {
     zero_boundary_seq: [u64; crate::rt_core::mailbox::MAX_DOF],
     zero_tx_started: [Option<std::time::Instant>; crate::rt_core::mailbox::MAX_DOF],
     zero_sent_mask: u64,
+    /// Bitmask indexed by physical 0-based joint index (`1u64 << joint`) of joints that already
+    /// received `CMD_SET_ZERO` in this batch (used by B4 mid-batch whole-arm rest-pose verification).
+    zero_sent_joint_mask: u64,
     zero_verify_deadline: Option<std::time::Instant>,
 }
 
@@ -2460,6 +2483,7 @@ impl Default for CommissioningMachine {
             zero_boundary_seq: [0; crate::rt_core::mailbox::MAX_DOF],
             zero_tx_started: [None; crate::rt_core::mailbox::MAX_DOF],
             zero_sent_mask: 0,
+            zero_sent_joint_mask: 0,
             zero_verify_deadline: None,
         }
     }
@@ -2540,7 +2564,7 @@ impl CommissioningMachine {
 
     fn mark_quiet_if_in_flight(&mut self, drv_now: std::time::Instant) {
         if self.req_in_flight {
-            let until = drv_now + COMM_REG_REPLY_TIMEOUT;
+            let until = drv_now + COMM_REG_QUIET_BOUND;
             self.unmatched_reply_quiet_until = Some(
                 self.unmatched_reply_quiet_until
                     .map_or(until, |prev| prev.max(until)),
@@ -2565,8 +2589,15 @@ impl CommissioningMachine {
 impl crate::supervisor::SupervisorInner {
     /// Zero-allocation live authority recheck for RT commissioning operations, using a fresh
     /// owner clock read (`owner_now`) and live atomic stop/E-stop/disconnect/operator grants.
+    ///
+    /// B2: All mutating/hardware-commissioning ops (`WriteTimeout`, `MotorZeroDisable`,
+    /// `MotorZeroWriteVerify`) strictly require an owner-validated `txn_id` and active
+    /// `HoldState::Reserved` calibration reservation; irreversible write ops (`WriteTimeout`,
+    /// `MotorZeroWriteVerify`) additionally require durable pending-marker proof bound to that
+    /// reservation on the RT owner.
     pub(crate) fn commissioning_live_authority_ok(
         &self,
+        kind: CommissioningOpKind,
         auth: &CommissioningAuthority,
         owner_now: std::time::Instant,
     ) -> Result<(), (u16, &'static str, &'static str)> {
@@ -2605,25 +2636,67 @@ impl crate::supervisor::SupervisorInner {
                 "Operator session expired or locked during commissioning",
             ));
         }
-        if auth.txn_id != 0 && self.calibration_txn_id != Some(auth.txn_id) {
-            return Err((
-                409,
-                "CONFIG_BUSY",
-                "Commissioning transaction ownership was lost",
-            ));
-        }
-        if let Some(grant) = auth.grant_id {
-            if !self
-                .core
-                .config()
-                .held()
-                .is_some_and(|h| h.grant == Some(grant))
-            {
+        let requires_txn_and_hold = matches!(
+            kind,
+            CommissioningOpKind::WriteTimeout
+                | CommissioningOpKind::MotorZeroDisable
+                | CommissioningOpKind::MotorZeroWriteVerify
+        );
+        if requires_txn_and_hold {
+            if auth.txn_id == 0 || self.calibration_txn_id != Some(auth.txn_id) {
                 return Err((
                     409,
                     "CONFIG_BUSY",
-                    "Commissioning reservation was lost",
+                    "Commissioning requires an active owner-validated calibration transaction",
                 ));
+            }
+            let Some(grant) = auth.grant_id else {
+                return Err((
+                    409,
+                    "CONFIG_BUSY",
+                    "Commissioning requires an active Reserved calibration hold",
+                ));
+            };
+            let hold_ok = self.core.config().held().is_some_and(|h| {
+                h.domain == crate::rt_core::config_iface::ConfigDomain::Calibration
+                    && h.grant == Some(grant)
+                    && h.state == crate::rt_core::config_iface::HoldState::Reserved
+            });
+            if !hold_ok {
+                return Err((
+                    409,
+                    "CONFIG_BUSY",
+                    "Commissioning reservation is missing or no longer Reserved",
+                ));
+            }
+            if kind.is_mutating() && !self.core.config().is_commissioning_marker_bound(grant) {
+                return Err((
+                    409,
+                    "CONFIG_BUSY",
+                    "Commissioning write requires durable pending-marker binding on the active reservation",
+                ));
+            }
+        } else {
+            if auth.txn_id != 0 && self.calibration_txn_id != Some(auth.txn_id) {
+                return Err((
+                    409,
+                    "CONFIG_BUSY",
+                    "Commissioning transaction ownership was lost",
+                ));
+            }
+            if let Some(grant) = auth.grant_id {
+                if !self
+                    .core
+                    .config()
+                    .held()
+                    .is_some_and(|h| h.grant == Some(grant))
+                {
+                    return Err((
+                        409,
+                        "CONFIG_BUSY",
+                        "Commissioning reservation was lost",
+                    ));
+                }
             }
         }
         Ok(())
@@ -2757,23 +2830,144 @@ impl crate::supervisor::SupervisorInner {
                 });
             }
         }
-        // Fresh rest evidence: ALWAYS required for irreversible hardware commissioning writes
-        // (fail-closed; no relaxation for `force`). During a multi-joint `MotorZeroWriteVerify`
-        // batch, once >=1 joint has already received `CMD_SET_ZERO` (whose raw position jumped
-        // to 0 while `ZeroOffsetDriver` intentionally keeps the old offsets until atomic swap),
-        // the initial rest-pose gate was already verified before TX #0 and every subsequent joint
-        // continues to enforce stationary velocity, disabled feedback, fault-free state, and live
-        // authority right before `can.transmit`.
-        let skip_rest_recheck_mid_zero_batch =
-            kind == CommissioningOpKind::MotorZeroWriteVerify && self.commissioning.zero_sent_mask != 0;
-        if !skip_rest_recheck_mid_zero_batch
-            && drv.rest_pose_gate_status() != crate::driver::RestPoseGateStatus::Confirmed
+        // Fresh rest evidence: ALWAYS required before EVERY irreversible hardware write
+        // (fail-closed; no relaxation for `force`).
+        // B4: During a multi-joint `MotorZeroWriteVerify` batch, once >=1 joint already received
+        // `CMD_SET_ZERO` (whose raw motor reading jumped to ~0 while `ZeroOffsetDriver` still
+        // holds the old offsets until atomic commit per M2), evaluate fresh whole-arm rest-pose
+        // evidence across EVERY arm joint in its exact coordinate frame (raw `0.0` for already-
+        // zeroed joints, `raw - old_offset` vs `rest_ref` for unzeroed joints).
+        if kind == CommissioningOpKind::MotorZeroWriteVerify
+            && self.commissioning.zero_sent_joint_mask != 0
         {
+            self.verify_mid_zero_batch_rest_pose_evidence(
+                drv,
+                self.commissioning.zero_sent_joint_mask,
+            )?;
+        } else if drv.rest_pose_gate_status() != crate::driver::RestPoseGateStatus::Confirmed {
             return Err(if is_zero {
                 (409, "ARM_NOT_AT_RESTING_POSE", "hardware motor zero requires fresh confirmed rest-pose evidence")
             } else {
                 (409, "ARM_NOT_AT_RESTING_POSE", "TIMEOUT commissioning requires fresh confirmed rest-pose evidence")
             });
+        }
+        Ok(())
+    }
+
+    /// B4: Zero-allocation fresh whole-arm rest-pose verification before every subsequent
+    /// `CMD_SET_ZERO` in a multi-joint batch (using raw `0.0` for joints already zeroed in this
+    /// batch and `raw - joint_zero_offsets[i]` vs `rest_ref[i]` for joints not yet zeroed).
+    fn verify_mid_zero_batch_rest_pose_evidence(
+        &self,
+        drv: &dyn crate::driver::ArmDriver,
+        zero_sent_joint_mask: u64,
+    ) -> Result<(), (u16, &'static str, &'static str)> {
+        let Some(rp) = self.config.resting_pose.as_ref() else {
+            return Err((
+                409,
+                "ARM_NOT_AT_RESTING_POSE",
+                "hardware motor zero requires a configured resting pose",
+            ));
+        };
+        if !drv.is_feedback_valid() {
+            return Err((
+                409,
+                "ARM_NOT_AT_RESTING_POSE",
+                "fresh whole-arm feedback lost during motor zero batch",
+            ));
+        }
+        let rest_ref: &[f32] = rp
+            .positions
+            .as_deref()
+            .unwrap_or(self.config.home_positions.as_slice());
+        let gripper_idx = self.config.gripper_index();
+        let dof = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
+        let now = drv.clock_now();
+        let max_age = crate::driver::STOPPED_DISABLE_FEEDBACK_MAX_AGE;
+        let enable_fb = drv.capabilities().enable_feedback;
+        let mut arm_count = 0usize;
+        let mut total_dev = 0.0f32;
+        for i in 0..dof {
+            if gripper_idx == Some(i) {
+                continue;
+            }
+            arm_count += 1;
+            let Some(fb) = drv.commissioning_raw_feedback(i) else {
+                return Err((
+                    409,
+                    "ARM_NOT_AT_RESTING_POSE",
+                    "missing fresh feedback for arm joint during motor zero batch",
+                ));
+            };
+            if now.saturating_duration_since(fb.rx_at) > max_age {
+                return Err((
+                    409,
+                    "ARM_NOT_AT_RESTING_POSE",
+                    "arm joint feedback exceeded rest-pose freshness bound during motor zero batch",
+                ));
+            }
+            if !fb
+                .queue_bound
+                .is_some_and(|b| now.saturating_duration_since(b) <= max_age)
+            {
+                return Err((
+                    409,
+                    "ARM_NOT_AT_RESTING_POSE",
+                    "arm joint receive-queue bound exceeded rest-pose freshness window during motor zero batch",
+                ));
+            }
+            if !fb.raw_position.is_finite() || !fb.velocity.is_finite() {
+                return Err((
+                    409,
+                    "ARM_NOT_AT_RESTING_POSE",
+                    "non-finite feedback during motor zero batch",
+                ));
+            }
+            if enable_fb && fb.motor_status != 0 {
+                return Err((
+                    409,
+                    "MOTOR_ZERO_NOT_DISABLED",
+                    "arm joint no longer confirmed disabled during motor zero batch",
+                ));
+            }
+            let vlim = rp.max_velocity_of(i).min(COMM_STATIONARY_VEL_RAD_S);
+            if fb.velocity.abs() > vlim {
+                return Err((
+                    409,
+                    "ARM_NOT_AT_RESTING_POSE",
+                    "arm moved during motor zero batch",
+                ));
+            }
+            let dev = if (zero_sent_joint_mask & (1u64 << i)) != 0 {
+                // Already zeroed in this batch: motor raw position must stay near 0.0.
+                fb.raw_position.abs()
+            } else {
+                let Some(&target_rest) = rest_ref.get(i) else {
+                    return Err((
+                        409,
+                        "ARM_NOT_AT_RESTING_POSE",
+                        "missing resting reference for arm joint",
+                    ));
+                };
+                let offset = self.joint_zero_offsets.get(i).copied().unwrap_or(0.0);
+                ((fb.raw_position - offset) - target_rest).abs()
+            };
+            let tol = self.config.rest_pose_tolerance_rad;
+            if !dev.is_finite() || dev > tol {
+                return Err((
+                    409,
+                    "ARM_NOT_AT_RESTING_POSE",
+                    "arm left resting pose during motor zero batch",
+                ));
+            }
+            total_dev += dev;
+        }
+        if arm_count == 0 || !total_dev.is_finite() || total_dev > rp.max_total_deviation {
+            return Err((
+                409,
+                "ARM_NOT_AT_RESTING_POSE",
+                "whole-arm deviation exceeded resting pose limit during motor zero batch",
+            ));
         }
         Ok(())
     }
@@ -2796,7 +2990,9 @@ impl crate::supervisor::SupervisorInner {
                 message: "invalid commissioning joint list",
             });
         }
-        if let Err((status, code, message)) = self.commissioning_live_authority_ok(&req.authority, owner_now) {
+        if let Err((status, code, message)) =
+            self.commissioning_live_authority_ok(req.kind, &req.authority, owner_now)
+        {
             return Err(match code {
                 "LEASE_LOST" => ConfigError::LeaseLost,
                 "EPOCH_MISMATCH" => ConfigError::EpochMismatch {
@@ -2890,6 +3086,7 @@ impl crate::supervisor::SupervisorInner {
         self.commissioning.zero_boundary_seq = [0; crate::rt_core::mailbox::MAX_DOF];
         self.commissioning.zero_tx_started = [None; crate::rt_core::mailbox::MAX_DOF];
         self.commissioning.zero_sent_mask = 0;
+        self.commissioning.zero_sent_joint_mask = 0;
         self.commissioning.zero_verify_deadline = None;
         Ok(op_id)
     }
@@ -3002,7 +3199,8 @@ impl crate::supervisor::SupervisorInner {
             return;
         };
         let owner_now = owner_now_fn();
-        if let Err((status, code, msg)) = self.commissioning_live_authority_ok(&auth, owner_now) {
+        let kind = self.commissioning.kind;
+        if let Err((status, code, msg)) = self.commissioning_live_authority_ok(kind, &auth, owner_now) {
             self.abort_running_commissioning(status, code, msg);
             return;
         }
@@ -3053,7 +3251,9 @@ impl crate::supervisor::SupervisorInner {
                 }
                 let now = owner_now_fn();
                 for k in 0..joint_len {
-                    if let Err((status, code, msg)) = self.commissioning_live_authority_ok(&auth, owner_now_fn()) {
+                    if let Err((status, code, msg)) =
+                        self.commissioning_live_authority_ok(kind, &auth, owner_now_fn())
+                    {
                         self.abort_running_commissioning(status, code, msg);
                         return;
                     }
@@ -3188,7 +3388,9 @@ impl crate::supervisor::SupervisorInner {
             if drv.clock_now() >= drv_cutoff {
                 return Ok(None);
             }
-            if let Err((status, code, msg)) = self.commissioning_live_authority_ok(auth, owner_now_fn()) {
+            if let Err((status, code, msg)) =
+                self.commissioning_live_authority_ok(self.commissioning.kind, auth, owner_now_fn())
+            {
                 return Err((status, code, crate::safety::BoundedText::new(msg)));
             }
             match self.commissioning.reg_phase {
@@ -3229,8 +3431,9 @@ impl crate::supervisor::SupervisorInner {
                         return Ok(None);
                     }
                     let rid = COMM_IDENTITY_RIDS[self.commissioning.rid_idx];
+                    let op_kind = self.commissioning.kind;
                     let mut gate = || -> Result<(), &'static str> {
-                        self.commissioning_live_authority_ok(auth, owner_now_fn())
+                        self.commissioning_live_authority_ok(op_kind, auth, owner_now_fn())
                             .map_err(|(_, code, _)| code)
                     };
                     *tx_budget_left = tx_budget_left.saturating_sub(1);
@@ -3291,7 +3494,7 @@ impl crate::supervisor::SupervisorInner {
                             *remaining_rx = remaining_rx.saturating_sub(frames);
                         }
                     }
-                    if let Some(rep) = drv.commissioning_find_register_reply(
+                    match drv.commissioning_find_register_reply(
                         joint,
                         false,
                         rid,
@@ -3299,18 +3502,34 @@ impl crate::supervisor::SupervisorInner {
                         tx_started,
                         self.commissioning.req_tx_offset_ns,
                     ) {
-                        self.commissioning.req_in_flight = false;
-                        self.commissioning.read_vals[self.commissioning.rid_idx] = (rep.value, rep.reply_id);
-                        self.commissioning.rid_idx += 1;
-                        if self.commissioning.rid_idx >= COMM_IDENTITY_RIDS.len() {
-                            let ident = self.commissioning.build_identity(joint, motor_id).map_err(|m| {
-                                (502, "MIT_TIMEOUT_READ", crate::safety::BoundedText::new(m))
-                            })?;
-                            self.commissioning.reset_reg_read();
-                            return Ok(Some(ident));
+                        CommissioningRegMatch::Matched(rep) => {
+                            self.commissioning.req_in_flight = false;
+                            self.commissioning.read_vals[self.commissioning.rid_idx] = (rep.value, rep.reply_id);
+                            self.commissioning.rid_idx += 1;
+                            if self.commissioning.rid_idx >= COMM_IDENTITY_RIDS.len() {
+                                let ident = self.commissioning.build_identity(joint, motor_id).map_err(|m| {
+                                    (502, "MIT_TIMEOUT_READ", crate::safety::BoundedText::new(m))
+                                })?;
+                                self.commissioning.reset_reg_read();
+                                return Ok(Some(ident));
+                            }
+                            self.commissioning.reg_phase = RegReadPhase::DrainBeforeReq;
+                            continue;
                         }
-                        self.commissioning.reg_phase = RegReadPhase::DrainBeforeReq;
-                        continue;
+                        CommissioningRegMatch::Ambiguous => {
+                            self.commissioning.mark_quiet_if_in_flight(drv.clock_now());
+                            let mut buf = crate::safety::BoundedText::empty();
+                            let _ = core::fmt::write(
+                                &mut buf,
+                                format_args!(
+                                    "Joint {} (CAN ID 0x{:X}) received ambiguous/stale register reply for RID {rid}; failing closed",
+                                    joint + 1,
+                                    motor_id
+                                ),
+                            );
+                            return Err((502, "MIT_TIMEOUT_READ", buf));
+                        }
+                        CommissioningRegMatch::Pending => {}
                     }
                     if self
                         .commissioning
@@ -3483,8 +3702,12 @@ impl crate::supervisor::SupervisorInner {
                         return Err((status, code, crate::safety::BoundedText::new(msg)));
                     }
                     let mut gate = || -> Result<(), &'static str> {
-                        self.commissioning_live_authority_ok(auth, owner_now_fn())
-                            .map_err(|(_, code, _)| code)
+                        self.commissioning_live_authority_ok(
+                            CommissioningOpKind::WriteTimeout,
+                            auth,
+                            owner_now_fn(),
+                        )
+                        .map_err(|(_, code, _)| code)
                     };
                     tx_budget = tx_budget.saturating_sub(1);
                     match drv.commissioning_try_send_timeout_write(joint, counts, drv_cutoff, &mut gate) {
@@ -3556,7 +3779,7 @@ impl crate::supervisor::SupervisorInner {
                             remaining_rx = remaining_rx.saturating_sub(frames);
                         }
                     }
-                    if let Some(ack) = drv.commissioning_find_register_reply(
+                    match drv.commissioning_find_register_reply(
                         joint,
                         true,
                         damiao::RID_TIMEOUT,
@@ -3564,26 +3787,41 @@ impl crate::supervisor::SupervisorInner {
                         tx_started,
                         self.commissioning.req_tx_offset_ns,
                     ) {
-                        self.commissioning.req_in_flight = false;
-                        let ack_val = u32::from_le_bytes(ack.value);
-                        if ack.reply_id != before.mst_id || ack_val != counts {
+                        CommissioningRegMatch::Matched(ack) => {
+                            self.commissioning.req_in_flight = false;
+                            let ack_val = u32::from_le_bytes(ack.value);
+                            if ack.reply_id != before.mst_id || ack_val != counts {
+                                let mut buf = crate::safety::BoundedText::empty();
+                                let _ = core::fmt::write(
+                                    &mut buf,
+                                    format_args!(
+                                        "joint {}: TIMEOUT write acknowledged with {} on 0x{:X} (wrote {counts}, MST_ID {})",
+                                        joint + 1,
+                                        ack_val,
+                                        ack.reply_id,
+                                        before.mst_id
+                                    ),
+                                );
+                                return Err((502, "MIT_TIMEOUT_FAILED", buf));
+                            }
+                            self.commissioning.outcomes[idx].ack_raw = ack_val;
+                            self.commissioning.reset_reg_read();
+                            self.commissioning.write_phase = WriteTimeoutPhase::ReadAfter;
+                            continue;
+                        }
+                        CommissioningRegMatch::Ambiguous => {
+                            self.commissioning.mark_quiet_if_in_flight(drv.clock_now());
                             let mut buf = crate::safety::BoundedText::empty();
                             let _ = core::fmt::write(
                                 &mut buf,
                                 format_args!(
-                                    "joint {}: TIMEOUT write acknowledged with {} on 0x{:X} (wrote {counts}, MST_ID {})",
-                                    joint + 1,
-                                    ack_val,
-                                    ack.reply_id,
-                                    before.mst_id
+                                    "joint {}: ambiguous or stale TIMEOUT write ack observed; failing closed as Uncertain",
+                                    joint + 1
                                 ),
                             );
                             return Err((502, "MIT_TIMEOUT_FAILED", buf));
                         }
-                        self.commissioning.outcomes[idx].ack_raw = ack_val;
-                        self.commissioning.reset_reg_read();
-                        self.commissioning.write_phase = WriteTimeoutPhase::ReadAfter;
-                        continue;
+                        CommissioningRegMatch::Pending => {}
                     }
                     if self
                         .commissioning
@@ -3680,8 +3918,12 @@ impl crate::supervisor::SupervisorInner {
         match self.commissioning.mz_phase {
             MotorZeroPhase::DisableDispatch => {
                 let mut gate = || -> Result<(), &'static str> {
-                    self.commissioning_live_authority_ok(auth, owner_now_fn())
-                        .map_err(|(_, code, _)| code)
+                    self.commissioning_live_authority_ok(
+                        CommissioningOpKind::MotorZeroDisable,
+                        auth,
+                        owner_now_fn(),
+                    )
+                    .map_err(|(_, code, _)| code)
                 };
                 match drv.commissioning_disable_step(started_at, drv_cutoff, &mut gate) {
                     CommissioningDisableStep::AllDispatched {
@@ -3789,8 +4031,12 @@ impl crate::supervisor::SupervisorInner {
                         return Err((status, code, crate::safety::BoundedText::new(msg)));
                     }
                     let mut gate = || -> Result<(), &'static str> {
-                        self.commissioning_live_authority_ok(auth, owner_now_fn())
-                            .map_err(|(_, code, _)| code)
+                        self.commissioning_live_authority_ok(
+                            CommissioningOpKind::MotorZeroWriteVerify,
+                            auth,
+                            owner_now_fn(),
+                        )
+                        .map_err(|(_, code, _)| code)
                     };
                     match drv.commissioning_try_send_set_zero(joint, drv_cutoff, &mut gate) {
                         CommissioningTxStatus::Sent {
@@ -3802,6 +4048,7 @@ impl crate::supervisor::SupervisorInner {
                             // Do NOT mutate joint_zero_offsets or ZeroOffsetDriver yet (M2).
                             self.commissioning.hw_mutated = true;
                             self.commissioning.zero_sent_mask |= 1u64 << idx;
+                            self.commissioning.zero_sent_joint_mask |= 1u64 << joint;
                             self.commissioning.zero_boundary_seq[idx] = tx_seq;
                             self.commissioning.zero_tx_started[idx] = Some(tx_started);
                             self.commissioning.outcomes[idx].disposition = JointCommissioningDisposition::Uncertain;
@@ -3823,6 +4070,7 @@ impl crate::supervisor::SupervisorInner {
                         } => {
                             self.commissioning.hw_mutated = true;
                             self.commissioning.zero_sent_mask |= 1u64 << idx;
+                            self.commissioning.zero_sent_joint_mask |= 1u64 << joint;
                             self.commissioning.zero_boundary_seq[idx] = tx_seq;
                             self.commissioning.zero_tx_started[idx] = Some(tx_started);
                             self.commissioning.outcomes[idx].disposition = JointCommissioningDisposition::Uncertain;
@@ -4012,6 +4260,24 @@ impl Drop for CommissioningOpGuard {
     }
 }
 
+/// Distinguishes a definitive pre-TX start refusal from an unknown post-submission outcome (B3).
+/// Callers MUST preserve `.calibration_commit.pending` and force `HoldState::Reconciling` on
+/// `UnknownPostStartOutcome` and may unlink the marker only on `DefinitivePreTxRefusal`.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) enum CommissioningRunError {
+    DefinitivePreTxRefusal(CalibError),
+    UnknownPostStartOutcome(CalibError),
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl CommissioningRunError {
+    pub(crate) fn into_calib_error(self) -> CalibError {
+        match self {
+            Self::DefinitivePreTxRefusal(e) | Self::UnknownPostStartOutcome(e) => e,
+        }
+    }
+}
+
 /// Runs one tick-driven RT commissioning operation on the exclusive RT owner, polling off-thread
 /// while checking live off-thread operator/lease authority, cancelling on revocation or drop,
 /// and clearing the RT slot once the terminal snapshot is captured.
@@ -4020,10 +4286,12 @@ pub(crate) async fn run_rt_commissioning_op(
     sup: &std::sync::Arc<crate::supervisor::ArmSupervisor>,
     req: CommissioningStartRequest,
     auth_check: &(dyn Fn() -> Result<(), (&'static str, crate::supervisor::ArmError)> + Send + Sync),
-) -> Result<CommissioningSnapshot, CalibError> {
+) -> Result<CommissioningSnapshot, CommissioningRunError> {
     use crate::rt_core::requests::config::{ConfigReply, ConfigRequest};
     if let Err((_, arm_err)) = (auth_check)() {
-        return Err(CalibError::from(arm_err));
+        return Err(CommissioningRunError::DefinitivePreTxRefusal(CalibError::from(
+            arm_err,
+        )));
     }
     let op_id = match sup
         .dispatch_config_request_owned_reliable(ConfigRequest::StartCommissioning(req))
@@ -4031,15 +4299,21 @@ pub(crate) async fn run_rt_commissioning_op(
     {
         Ok(ConfigReply::CommissioningStarted(Ok(id))) => id,
         Ok(ConfigReply::CommissioningStarted(Err(e))) => {
-            return Err(crate::calibration::calib_error_from_config(e));
+            return Err(CommissioningRunError::DefinitivePreTxRefusal(
+                crate::calibration::calib_error_from_config(e),
+            ));
         }
-        Err(e) => return Err(crate::calibration::calib_error_from_config(e)),
+        Err(e) => {
+            return Err(CommissioningRunError::UnknownPostStartOutcome(
+                crate::calibration::calib_error_from_config(e),
+            ));
+        }
         _ => {
-            return Err(CalibError::new(
+            return Err(CommissioningRunError::UnknownPostStartOutcome(CalibError::new(
                 500,
                 "INTERNAL",
                 "unexpected start commissioning reply",
-            ));
+            )));
         }
     };
     let op_guard = CommissioningOpGuard::new(std::sync::Arc::clone(sup), op_id);
@@ -4061,7 +4335,7 @@ pub(crate) async fn run_rt_commissioning_op(
                 Ok(ConfigReply::CommissioningCancelled(Some(s))) => s,
                 _ => {
                     op_guard.clear(false, req.kind.is_mutating()).await;
-                    return Err(match code {
+                    let ce = match code {
                         "OPERATOR_REQUIRED" => CalibError::new(
                             403,
                             "OPERATOR_REQUIRED",
@@ -4073,7 +4347,8 @@ pub(crate) async fn run_rt_commissioning_op(
                             "This connection lost the lease during commissioning",
                         ),
                         _ => CalibError::new(409, "CANCELLED", "commissioning cancelled"),
-                    });
+                    };
+                    return Err(CommissioningRunError::UnknownPostStartOutcome(ce));
                 }
             };
             break cancelled;
@@ -4088,24 +4363,26 @@ pub(crate) async fn run_rt_commissioning_op(
                 }
             }
             Ok(ConfigReply::CommissioningPolled(None)) => {
-                op_guard.clear(false, false).await;
-                return Err(CalibError::new(
+                op_guard.clear(false, req.kind.is_mutating()).await;
+                return Err(CommissioningRunError::UnknownPostStartOutcome(CalibError::new(
                     500,
                     "INTERNAL",
                     "commissioning operation vanished before completion",
-                ));
+                )));
             }
             Err(e) => {
                 op_guard.clear(false, req.kind.is_mutating()).await;
-                return Err(crate::calibration::calib_error_from_deferred_config(e));
+                return Err(CommissioningRunError::UnknownPostStartOutcome(
+                    crate::calibration::calib_error_from_deferred_config(e),
+                ));
             }
             _ => {
                 op_guard.clear(false, req.kind.is_mutating()).await;
-                return Err(CalibError::new(
+                return Err(CommissioningRunError::UnknownPostStartOutcome(CalibError::new(
                     500,
                     "INTERNAL",
                     "unexpected poll commissioning reply",
-                ));
+                )));
             }
         }
         tokio::time::sleep(COMMISSIONING_POLL_INTERVAL).await;
@@ -4248,7 +4525,9 @@ pub(crate) async fn run_mit_timeout_executor_with_guard(
             txn_deadline: std::time::Instant::now() + COMMISSIONING_TXN_TIMEOUT,
             prior_disk_mutated: false,
         };
-        let snap = run_rt_commissioning_op(sup, start_req, auth.auth_check.as_ref()).await?;
+        let snap = run_rt_commissioning_op(sup, start_req, auth.auth_check.as_ref())
+            .await
+            .map_err(CommissioningRunError::into_calib_error)?;
         if snap.state != CommissioningOpState::Done {
             let status = if snap.error_status != 0 {
                 snap.error_status
@@ -4377,6 +4656,38 @@ pub(crate) async fn run_mit_timeout_executor_with_guard(
         ));
     }
 
+    // B2: Bind durable pending-marker proof to the active Reserved hold on the RT owner
+    // BEFORE dispatching `StartCommissioning(WriteTimeout)`.
+    let bind_res = sup
+        .dispatch_config_request_reliable(|| ConfigRequest::BindCommissioningMarker { grant_id })
+        .await;
+    if !matches!(bind_res, Ok(ConfigReply::CommissioningMarkerBound(Ok(())))) {
+        let mp_rm = marker_path.clone();
+        let rm_ok = tokio::task::spawn_blocking(move || remove_pending_commit_marker(&mp_rm))
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|r| r)
+            .is_ok();
+        if rm_ok {
+            if let Some(r) = res_guard.take() {
+                let _ = sup
+                    .dispatch_config_request_owned_reliable(ConfigRequest::Release(ReleaseConfig {
+                        reservation: r,
+                    }))
+                    .await;
+            }
+        } else {
+            res_guard.mark_hw_mutated();
+            txn_guard.mark_remote_mutated();
+        }
+        txn_guard.release().await;
+        return Err(CalibError::new(
+            409,
+            "CONFIG_BUSY",
+            "commissioning reservation lost before binding durable pending marker; nothing was changed",
+        ));
+    }
+
     let start_req = CommissioningStartRequest {
         kind: CommissioningOpKind::WriteTimeout,
         joints: joints_arr,
@@ -4399,8 +4710,9 @@ pub(crate) async fn run_mit_timeout_executor_with_guard(
     let snap_res = run_rt_commissioning_op(sup, start_req, auth.auth_check.as_ref()).await;
     let snap = match snap_res {
         Ok(s) => s,
-        Err(err) => {
-            // Start refused before any TX left host: clean up marker & release reservation.
+        Err(CommissioningRunError::DefinitivePreTxRefusal(err)) => {
+            // RT owner definitively refused StartCommissioning before any TX could occur:
+            // safe to unlink marker & release reservation.
             let mp_rm = marker_path.clone();
             let rm_ok = tokio::task::spawn_blocking(move || remove_pending_commit_marker(&mp_rm))
                 .await
@@ -4419,6 +4731,19 @@ pub(crate) async fn run_mit_timeout_executor_with_guard(
                 res_guard.mark_hw_mutated();
                 txn_guard.mark_remote_mutated();
             }
+            txn_guard.release().await;
+            return Err(err);
+        }
+        Err(CommissioningRunError::UnknownPostStartOutcome(err)) => {
+            // B3: Outcome after start submission is unknown — NEVER unlink `.calibration_commit.pending`;
+            // force Reconciling fail-closed so the restart fence survives process exit.
+            res_guard.mark_hw_mutated();
+            txn_guard.mark_remote_mutated();
+            let _ = sup
+                .dispatch_config_request_reliable(|| {
+                    ConfigRequest::ForceReconcile(ConfigDomain::Calibration)
+                })
+                .await;
             txn_guard.release().await;
             return Err(err);
         }
@@ -4769,7 +5094,7 @@ pub(crate) async fn run_mit_qualification_executor_with_guard(
                         ))
                         .await;
                 }
-                return Err(e);
+                return Err(e.into_calib_error());
             }
         };
         if snap.state != CommissioningOpState::Done {

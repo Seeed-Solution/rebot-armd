@@ -1372,3 +1372,200 @@ async fn legacy_vs_executor_ws_parity_direct_guards_and_real_follower_gate() {
         );
     }
 }
+
+// ============================================================================
+// 11. Code-Review Blocker Regressions (B1 ambiguous reply, B2 direct RT gate,
+//     B3 unknown post-start marker preservation, B4 mid-batch rest-pose drift)
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocker_regressions_b1_b2_b3_b4() {
+    // B1: Duplicate/ambiguous post-TX register ACK (matching value injected twice on REG_WRITE)
+    // must NEVER be promoted to Applied -> fails closed as MIT_TIMEOUT_FAILED + uncertain: [1].
+    {
+        let rig = HwRig::new(RtOwner::Executor, true, None, |_| {}).await;
+        let mut ws = rig.connect_ws().await;
+        let (gen, epoch) = ws_acquire_lease(&mut ws, "c-b1-dup").await;
+        let dup_ack = CanFrame::new_standard(
+            0x11,
+            &[1, 0, damiao::REG_WRITE, damiao::RID_TIMEOUT, 0xD0, 0x07, 0, 0],
+        )
+        .unwrap();
+        rig.bus.with(|s| {
+            s.immediate_replies = true;
+            s.inject_on_reg_write.push(dup_ack);
+        });
+        let bad = ws_cmd(
+            &mut ws,
+            1,
+            gen,
+            epoch,
+            mit::TIMEOUT_PATH,
+            json!({ "joints": [1], "timeout_counts": 2000, "dry_run": false }),
+        )
+        .await;
+        assert_eq!(bad["type"], "command_reject", "{bad}");
+        assert_eq!(bad["code"], "MIT_TIMEOUT_FAILED");
+        assert_eq!(bad["uncertain"], json!([1]));
+        assert_eq!(rig.hold_state().await, Some(HoldState::Reconciling));
+        assert!(pending_commit_marker_path(&rig.calib_path).exists());
+        rig.assert_zero_alloc("B1 ambiguous duplicate reply");
+        rig.shutdown().await;
+    }
+
+    // B2: Direct `StartCommissioning(WriteTimeout | MotorZeroWriteVerify)` through the public
+    // config dispatcher with missing `txn_id: 0` / `grant_id: None` / unbound marker is refused
+    // fail-closed with 0 TX emitted.
+    {
+        let rig = HwRig::new(RtOwner::Executor, true, None, |_| {}).await;
+        let mut ws = rig.connect_ws().await;
+        let (gen, epoch) = ws_acquire_lease(&mut ws, "c-b2-direct").await;
+        let mut joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+        joints[0] = 0;
+        let mut req = armd::mit::CommissioningStartRequest {
+            kind: armd::mit::CommissioningOpKind::WriteTimeout,
+            joints,
+            joint_len: 1,
+            timeout_counts: 2000,
+            references: [0.0; armd::rt_core::mailbox::MAX_DOF],
+            authority: armd::mit::CommissioningAuthority {
+                conn_id: 0,
+                lease_holder: Some((armd::model::HolderLabel::new("c-b2-direct"), gen)),
+                operator_grant: armd::auth::OperatorGrant::unenforced(),
+                expected_epoch: epoch,
+                expected_stop_gen: 0,
+                grant_id: None,
+                txn_id: 0,
+            },
+            txn_deadline: Instant::now() + Duration::from_secs(5),
+            prior_disk_mutated: false,
+        };
+        rig.bus.clear_log();
+        let r1 = rig
+            .sup
+            .dispatch_config_request_owned_reliable(ConfigRequest::StartCommissioning(req))
+            .await
+            .unwrap();
+        assert!(
+            matches!(r1, ConfigReply::CommissioningStarted(Err(_))),
+            "missing txn_id & grant_id must be refused by RT write gate"
+        );
+        req.kind = armd::mit::CommissioningOpKind::MotorZeroWriteVerify;
+        let r2 = rig
+            .sup
+            .dispatch_config_request_owned_reliable(ConfigRequest::StartCommissioning(req))
+            .await
+            .unwrap();
+        assert!(
+            matches!(r2, ConfigReply::CommissioningStarted(Err(_))),
+            "missing txn_id & grant_id must be refused for MotorZeroWriteVerify"
+        );
+        assert!(
+            rig.bus.tx_log().is_empty(),
+            "refused direct StartCommissioning must emit 0 TX frames"
+        );
+        rig.assert_zero_alloc("B2 direct RT write gate");
+        rig.shutdown().await;
+    }
+
+    // B3: If the RT executor disappears after accepting a TIMEOUT write (unknown post-start
+    // outcome while polling), `.calibration_commit.pending` MUST survive on disk (not unlinked).
+    {
+        let mut rig = HwRig::new(RtOwner::Executor, true, None, |_| {}).await;
+        let mut ws = rig.connect_ws().await;
+        let (gen, epoch) = ws_acquire_lease(&mut ws, "c-b3-drop").await;
+        rig.bus.with(|s| {
+            // Stall REG_WRITE ack long enough that we can stop the executor mid-op after TX.
+            s.motors[0].no_write_ack = true;
+        });
+        let handle = rig.handle.take().unwrap();
+        let bus_watch = rig.bus.clone();
+        let killer = tokio::spawn(async move {
+            let dl = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < dl {
+                let sent = bus_watch.tx_log().iter().any(|f| {
+                    f.id == 0x7FF && f.data[2] == damiao::REG_WRITE && f.data[3] == damiao::RID_TIMEOUT
+                });
+                if sent {
+                    tokio::task::spawn_blocking(move || handle.stop_and_join())
+                        .await
+                        .unwrap();
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            tokio::task::spawn_blocking(move || handle.stop_and_join())
+                .await
+                .unwrap();
+            false
+        });
+
+        let res = ws_cmd(
+            &mut ws,
+            1,
+            gen,
+            epoch,
+            mit::TIMEOUT_PATH,
+            json!({ "joints": [1], "timeout_counts": 2000, "dry_run": false }),
+        )
+        .await;
+        let killed_after_tx = killer.await.unwrap();
+        assert!(killed_after_tx, "executor must have sent REG_WRITE before stop");
+        assert_eq!(res["type"], "command_reject", "{res}");
+        assert!(
+            pending_commit_marker_path(&rig.calib_path).exists(),
+            "B3: unknown post-start poll failure MUST preserve .calibration_commit.pending on disk"
+        );
+        rig.shutdown().await;
+    }
+
+    // B4: During the 100 ms inter-joint gap of a multi-joint hardware motor_zero (J1, J2),
+    // if an arm joint drifts out of rest pose after J1 is zeroed, J2 MUST be refused with
+    // ARM_NOT_AT_RESTING_POSE (set_zero_count == 0) while preserving Reconciling + pending marker.
+    {
+        let rig = HwRig::new(RtOwner::Executor, true, None, |_| {}).await;
+        let mut ws = rig.connect_ws().await;
+        let (gen, epoch) = ws_acquire_lease(&mut ws, "c-b4-drift").await;
+        let bus_watch = rig.bus.clone();
+        let drifter = tokio::spawn(async move {
+            let dl = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < dl {
+                let j1_zeroed = bus_watch.with(|s| s.motors[0].set_zero_count >= 1);
+                if j1_zeroed {
+                    // Disturb J3 well outside rest_pose_tolerance_rad (0.05 rad) during the 100 ms gap.
+                    bus_watch.with(|s| {
+                        s.motors[2].q += 0.25;
+                        s.push_all_feedback();
+                    });
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            false
+        });
+
+        let err = ws_cmd(
+            &mut ws,
+            1,
+            gen,
+            epoch,
+            motor_zero::PATH,
+            json!({ "joints": [1, 2], "method": "motor", "dry_run": false }),
+        )
+        .await;
+        let drifted = drifter.await.unwrap();
+        assert!(drifted, "drifter must have disturbed arm after J1 zero");
+        assert_eq!(err["type"], "command_reject", "{err}");
+        assert_eq!(err["code"], "ARM_NOT_AT_RESTING_POSE", "{err}");
+        assert_eq!(rig.bus.with(|s| s.motors[0].set_zero_count), 1);
+        assert_eq!(
+            rig.bus.with(|s| s.motors[1].set_zero_count),
+            0,
+            "B4: J2 MUST NOT be zeroed after arm left resting pose during inter-joint gap"
+        );
+        assert_eq!(rig.hold_state().await, Some(HoldState::Reconciling));
+        assert!(pending_commit_marker_path(&rig.calib_path).exists());
+        rig.assert_zero_alloc("B4 mid-batch rest-pose drift refusal");
+        rig.shutdown().await;
+    }
+}
