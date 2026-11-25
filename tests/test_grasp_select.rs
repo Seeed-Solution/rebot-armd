@@ -400,17 +400,31 @@ async fn legacy_semantics_and_strategy_gating() {
     bad["strategy"] = json!("best");
     let v = dry(&sc, &bad).await;
     assert_eq!((v["reachable"].clone(), v["code"].clone()), (json!(false), json!("INVALID_COMMAND")));
-    // an executed grasp with the adaptive strategy is refused before anything starts
+    // Phase B: live adaptive strategy is accepted on 6-DOF (gated by grasp_select_exec)
     let inner = sc.sup.inner().read().await;
     let mut exec = adaptive.clone();
     exec.as_object_mut().unwrap().remove("dry_run");
-    let err = grasp::prepare(&inner, &exec, inner.safety.epoch_id()).err().expect("refused");
-    assert!(format!("{err:?}").contains("dry_run only"), "{err:?}");
+    let pending = grasp::prepare(&inner, &exec, inner.safety.epoch_id()).expect("Phase B adaptive prepare accepted on 6-DOF");
+    assert!(pending.adaptive.is_some());
     drop(inner);
-    // capability
-    assert!(armd::model::Capabilities::from_config(&ArmConfig::rebot_dm()).grasp_select);
+    // capability: both grasp_select and grasp_select_exec are true on 6-DOF and false on 5-DOF
+    let dm_caps = armd::model::Capabilities::from_config(&ArmConfig::rebot_dm());
+    assert!(dm_caps.grasp_select && dm_caps.grasp_select_exec);
     let so101 = armd::tool::baseline_arm_config_for_robot("so101").unwrap();
-    assert!(!armd::model::Capabilities::from_config(&so101).grasp_select);
+    let so_caps = armd::model::Capabilities::from_config(&so101);
+    assert!(!so_caps.grasp_select && !so_caps.grasp_select_exec);
+    // 5-DOF refuses live adaptive prepare
+    let so_sup = ArmSupervisor::new(so101);
+    {
+        let mut inner = so_sup.inner().write().await;
+        inner.lease_enabled = false;
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).unwrap();
+        armd::SupervisorInner::enable_torque(admitted).unwrap();
+    }
+    let so_inner = so_sup.inner().read().await;
+    let err = grasp::prepare(&so_inner, &exec, so_inner.safety.epoch_id()).err().expect("5-DOF refused");
+    assert!(format!("{err:?}").contains("6-DOF"), "{err:?}");
 }
 
 #[tokio::test]

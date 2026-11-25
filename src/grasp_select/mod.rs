@@ -49,15 +49,6 @@ pub fn parse_strategy(body: &Value) -> Result<Strategy, MotionError> {
     }
 }
 
-/// Refusal of an executed (not dry-run) grasp with `strategy: "adaptive"`: execution with a
-/// selected candidate is not available yet.
-pub fn refuse_execution(body: &Value) -> Result<(), MotionError> {
-    match parse_strategy(body)? {
-        Strategy::Legacy => Ok(()),
-        Strategy::Adaptive => Err(MotionError::Unsupported("strategy \"adaptive\" is available for dry_run only; execution uses the legacy strategy".into())),
-    }
-}
-
 /// Shortlist size (candidates given the full path check).
 pub const SHORTLIST: usize = 8;
 /// Shortlist places reserved for radial obliques.

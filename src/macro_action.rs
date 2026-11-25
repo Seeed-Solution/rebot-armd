@@ -590,15 +590,37 @@ impl MacroCtx {
         gripper_gap_rad: Option<f32>,
         held: crate::rt_core::requests::actions::HeldUpdate,
     ) {
+        let _ = self
+            .finish_fenced(state, code, message, holding, gripper_gap_rad, held, None)
+            .await;
+    }
+
+    /// Revision-fenced variant of [`Self::finish`]: when `revisions` is `Some(rev)` and
+    /// `state == FinishState::Done`, binds ALL five captured revisions atomically on the owner
+    /// commit before updating `held` (both Legacy and RT Executor). Returns `Err(code)` if a
+    /// revision changed before commit so the caller can immediately terminate the parent cleanly
+    /// with `FinishState::Failed` and `HeldUpdate::Clear`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn finish_fenced(
+        &self,
+        state: crate::rt_core::requests::actions::FinishState,
+        code: Option<&str>,
+        message: Option<String>,
+        holding: Option<bool>,
+        gripper_gap_rad: Option<f32>,
+        held: crate::rt_core::requests::actions::HeldUpdate,
+        revisions: Option<crate::grasp_select::AdaptiveRevisions>,
+    ) -> Result<(), &'static str> {
         use crate::rt_core::requests::actions::{
-            install_finish_macro, ActionStamp, FinishMacroSpec, OwnerCheckCtx,
+            install_finish_macro, ActionStamp, FinishMacroSpec, FinishState, OwnerCheckCtx,
             DEFAULT_FINISH_DEADLINE,
         };
         let now = Instant::now();
         let finish_deadline = now + DEFAULT_FINISH_DEADLINE;
+        let fence = revisions.filter(|_| state == FinishState::Done);
         if self.is_executor() {
             let Some(handle) = self.sup.executor_handle() else {
-                return;
+                return Ok(());
             };
             let boot = handle.boot();
             let arm = self
@@ -607,23 +629,21 @@ impl MacroCtx {
                 .latest()
                 .map_or(crate::rt_core::ids::ArmId::LOCAL, |s| s.rt.owner.arm);
             let mut spec = match state {
-                crate::rt_core::requests::actions::FinishState::Done => {
-                    FinishMacroSpec::done(ActionId(self.id), boot)
-                }
-                crate::rt_core::requests::actions::FinishState::Failed => FinishMacroSpec::failed(
+                FinishState::Done => FinishMacroSpec::done(ActionId(self.id), boot),
+                FinishState::Failed => FinishMacroSpec::failed(
                     ActionId(self.id),
                     boot,
                     code.unwrap_or("FAILED"),
                     message.as_deref().unwrap_or(""),
                 ),
-                crate::rt_core::requests::actions::FinishState::Cancelled => {
+                FinishState::Cancelled => {
                     FinishMacroSpec::cancelled(ActionId(self.id), boot, code, message.as_deref())
                 }
             };
             spec.holding = holding;
             spec.gripper_gap_rad = gripper_gap_rad;
             spec.held = held;
-            let stamp = ActionStamp {
+            let mut stamp = ActionStamp {
                 arm,
                 boot,
                 admission: self.stamp,
@@ -637,32 +657,48 @@ impl MacroCtx {
                 parent_generation: self.id,
                 deadline: finish_deadline,
             };
-            let _ = self
+            if let Some(rev) = fence {
+                spec.check_workspace_revision = true;
+                spec.calibration_revision = Some(rev.calibration_revision);
+                spec.grasp_setup_revision = Some(rev.grasp_setup_revision);
+                spec.gripper_calib_revision = Some(rev.gripper_calib_revision);
+                spec.power_budget_revision = Some(rev.power_budget_revision);
+                stamp.config_revision = rev.workspace_revision;
+                stamp.calibration_revision = Some(rev.calibration_revision);
+                stamp.grasp_setup_revision = Some(rev.grasp_setup_revision);
+                stamp.gripper_calib_revision = Some(rev.gripper_calib_revision);
+                stamp.power_budget_revision = Some(rev.power_budget_revision);
+            }
+            match self
                 .submit_action_executor(
                     &stamp,
                     finish_deadline,
                     || crate::rt_core::requests::actions::ActionSubmit::FinishMacro(spec),
                     true,
                 )
-                .await;
-            return;
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(Stop::Fail(c, _)) if fence.is_some() && matches!(c.as_str(), "PLAN_STALE" | "CALIBRATION_CHANGED") => {
+                    return Err(if c == "CALIBRATION_CHANGED" { "CALIBRATION_CHANGED" } else { "PLAN_STALE" });
+                }
+                Err(_) => return Ok(()),
+            }
         }
         let mut inner = self.sup.inner().write().await;
         if !inner.macro_alive(self.id) {
-            return;
+            return Ok(());
         }
         let boot = inner.boot_id;
         let mut spec = match state {
-            crate::rt_core::requests::actions::FinishState::Done => {
-                FinishMacroSpec::done(ActionId(self.id), boot)
-            }
-            crate::rt_core::requests::actions::FinishState::Failed => FinishMacroSpec::failed(
+            FinishState::Done => FinishMacroSpec::done(ActionId(self.id), boot),
+            FinishState::Failed => FinishMacroSpec::failed(
                 ActionId(self.id),
                 boot,
                 code.unwrap_or("FAILED"),
                 message.as_deref().unwrap_or(""),
             ),
-            crate::rt_core::requests::actions::FinishState::Cancelled => {
+            FinishState::Cancelled => {
                 FinishMacroSpec::cancelled(ActionId(self.id), boot, code, message.as_deref())
             }
         };
@@ -670,7 +706,7 @@ impl MacroCtx {
         spec.gripper_gap_rad = gripper_gap_rad;
         spec.held = held;
         let ctx = OwnerCheckCtx::for_legacy(&inner);
-        let stamp = ActionStamp {
+        let mut stamp = ActionStamp {
             arm: inner.core.id(),
             boot,
             admission: self.stamp,
@@ -684,7 +720,23 @@ impl MacroCtx {
             parent_generation: self.id,
             deadline: finish_deadline,
         };
-        let _ = install_finish_macro(&mut inner, &stamp, &ctx, &spec, message);
+        if let Some(rev) = fence {
+            spec.check_workspace_revision = true;
+            spec.calibration_revision = Some(rev.calibration_revision);
+            spec.grasp_setup_revision = Some(rev.grasp_setup_revision);
+            spec.gripper_calib_revision = Some(rev.gripper_calib_revision);
+            spec.power_budget_revision = Some(rev.power_budget_revision);
+            stamp.config_revision = rev.workspace_revision;
+            stamp.calibration_revision = Some(rev.calibration_revision);
+            stamp.grasp_setup_revision = Some(rev.grasp_setup_revision);
+            stamp.gripper_calib_revision = Some(rev.gripper_calib_revision);
+            stamp.power_budget_revision = Some(rev.power_budget_revision);
+        }
+        match install_finish_macro(&mut inner, &stamp, &ctx, &spec, message) {
+            Ok(_) => Ok(()),
+            Err(r) if fence.is_some() && matches!(r.code, "PLAN_STALE" | "CALIBRATION_CHANGED") => Err(r.code),
+            Err(_) => Ok(()),
+        }
     }
 
     /// Plan (outside the lock) a Cartesian path from the current commanded state, install it
@@ -916,6 +968,149 @@ impl MacroCtx {
             let mut inner = self.sup.inner().write().await;
             let meas_opt = inner.config.arm_model.fk_f32(&inner.measured_positions).map(|p| motion::end_to_frame(&p, &input));
             let cmd_opt = inner.config.arm_model.fk_f32(&inner.commanded_positions).map(|p| motion::end_to_frame(&p, &input));
+            if let (Some(meas), Some(cmd)) = (meas_opt, cmd_opt) {
+                let track_mm = (crate::kinematics::norm(&crate::kinematics::sub(&meas.p, &cmd.p)) * 1000.0) as f32;
+                let track_deg = crate::kinematics::angle_between(&meas.r, &cmd.r).to_degrees() as f32;
+                let goal_mm = (crate::kinematics::norm(&crate::kinematics::sub(&meas.p, &goal.p)) * 1000.0) as f32;
+                let goal_deg = crate::kinematics::angle_between(&meas.r, &goal.r).to_degrees() as f32;
+                let contact_flag = inner.last_action.as_ref().filter(|a| a.id == self.id).and_then(|a| a.descend_contact);
+                if let Some(a) = inner.last_action.as_mut().filter(|a| a.id == self.id) {
+                    if a.motions.len() < 32 {
+                        a.motions.push(motion::MacroMotionDiag {
+                            phase: phase.to_string(),
+                            ms,
+                            track_mm,
+                            track_deg,
+                            goal_mm,
+                            goal_deg,
+                            contact: contact_flag,
+                        });
+                    }
+                }
+            }
+        }
+        sub_res.map(|done| (done, watch)).map_err(|s| (s, true))
+    }
+
+    /// Install an already-checked adaptive arm [`motion::JointPath`] (Cartesian TCP line or
+    /// swept-joint fallback) verbatim with `lock_j7_hold: true` and ALL FIVE captured revisions
+    /// fenced on both Legacy and RT Executor owners (0 `SupervisorLock` on Executor).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn install_adaptive_path_child(
+        &self,
+        phase: &str,
+        snap: &crate::rt_core::requests::actions::ActionSnapshot,
+        input: &motion::PlanInput,
+        goal: crate::kinematics::Pose,
+        path: motion::JointPath,
+        revisions: crate::grasp_select::AdaptiveRevisions,
+        contact: Option<ContactGuard>,
+    ) -> Result<(SubDone, ContactWatch), (Stop, bool)> {
+        use crate::rt_core::requests::actions as req;
+        let before = |s: Stop| (s, false);
+        if !self.alive().await {
+            return Err(before(Stop::Cancelled));
+        }
+        let mut child_stamp = snap.stamp.for_child(ActionId(self.id), self.deadline);
+        child_stamp.config_revision = revisions.workspace_revision;
+        child_stamp.calibration_revision = Some(revisions.calibration_revision);
+        child_stamp.poses_revision = None;
+        child_stamp.sequences_revision = None;
+        child_stamp.grasp_setup_revision = Some(revisions.grasp_setup_revision);
+        child_stamp.gripper_calib_revision = Some(revisions.gripper_calib_revision);
+        child_stamp.power_budget_revision = Some(revisions.power_budget_revision);
+
+        let ticket = if self.is_executor() {
+            let m = snap.owner.macro_state;
+            let next_seq = (m.active_id == self.id && m.alive)
+                .then(|| m.child_seq.checked_add(1))
+                .flatten()
+                .ok_or_else(|| before(Stop::Cancelled))?;
+            let timeout_s = ((path.duration + 0.5) * 2.0 + 5.0).min(self.phase_timeout_s);
+            let child_spec = ChildSpec {
+                ticket: ChildTicket {
+                    parent: ActionId(self.id),
+                    child_seq: next_seq,
+                },
+                timeout_s,
+                timeout_code: self.timeout_code,
+                contact,
+            };
+            let slot = req::prepare_child_cartesian_slot_with_options(
+                &snap.commanded_positions,
+                &path,
+                input.power.as_ref().map(|_| path.power_scale),
+                None,
+                true,
+                child_spec,
+            )
+            .map_err(|c| before(fail(c, format!("[{phase}] failed to stage adaptive path child: {c}"))))?;
+            self.submit_child_slot_executor(
+                &child_stamp,
+                slot,
+                true,
+                Some(revisions.calibration_revision),
+            )
+            .await
+            .map_err(before)?;
+            child_spec.ticket
+        } else {
+            let mut inner = self.sup.inner().write().await;
+            let Some(next_seq) = inner
+                .macro_run
+                .as_ref()
+                .filter(|m| m.id == self.id && inner.macro_alive(self.id))
+                .and_then(|m| m.next_child_seq())
+            else {
+                return Err(before(Stop::Cancelled));
+            };
+            let child_spec = ChildSpec {
+                ticket: ChildTicket {
+                    parent: ActionId(self.id),
+                    child_seq: next_seq,
+                },
+                timeout_s: self.phase_timeout_s,
+                timeout_code: self.timeout_code,
+                contact,
+            };
+            let expected_duration_s = path.duration;
+            let owner_ctx = req::OwnerCheckCtx::for_legacy(&inner);
+            let installed = match req::install_macro_child(
+                &mut inner,
+                &child_stamp,
+                &owner_ctx,
+                true,
+                req::MacroChildPayload::LegacyCartesian {
+                    spec: child_spec,
+                    start: snap.commanded_positions.clone(),
+                    input: input.clone(),
+                    resolved: req::ResolvedCartesianLegs {
+                        path,
+                        approach_leg: None,
+                        outcome: None,
+                        expected_duration_s,
+                    },
+                    lock_j7_hold: true,
+                },
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    if let Some(detail) = e.workspace_detail() {
+                        inner.set_action_workspace_violation(self.id, detail);
+                    }
+                    return Err(before(self.map_install_err(&mut inner, e)));
+                }
+            };
+            installed.ticket
+        };
+        let t0 = Instant::now();
+        let sub_res = self.wait_child(ticket).await;
+        let ms = t0.elapsed().as_millis() as u32;
+        let watch = self.child_watch(ticket).await;
+        if !self.is_executor() {
+            let mut inner = self.sup.inner().write().await;
+            let meas_opt = inner.config.arm_model.fk_f32(&inner.measured_positions).map(|p| motion::end_to_frame(&p, input));
+            let cmd_opt = inner.config.arm_model.fk_f32(&inner.commanded_positions).map(|p| motion::end_to_frame(&p, input));
             if let (Some(meas), Some(cmd)) = (meas_opt, cmd_opt) {
                 let track_mm = (crate::kinematics::norm(&crate::kinematics::sub(&meas.p, &cmd.p)) * 1000.0) as f32;
                 let track_deg = crate::kinematics::angle_between(&meas.r, &cmd.r).to_degrees() as f32;
@@ -1408,6 +1603,154 @@ impl MacroCtx {
     pub async fn gripper_phase(&self, phase: &str, progress: f32, command: GripperCommand) -> Result<SubDone, Stop> {
         self.phase(phase, progress).await?;
         self.gripper(phase, command).await
+    }
+
+    /// Revision-fenced gripper child for adaptive Phase B execution: checks ALL FIVE captured
+    /// revisions before staging AND binds ALL FIVE revisions atomically on `InstallChild`
+    /// (both Legacy and RT Executor, strictly J7 intents through `GripperMotion`).
+    pub async fn run_gripper_fenced(
+        &self,
+        phase: &str,
+        progress: f32,
+        command: GripperCommand,
+        fraction: Option<f64>,
+        grasp: bool,
+        revisions: crate::grasp_select::AdaptiveRevisions,
+    ) -> Result<SubDone, Stop> {
+        use crate::rt_core::requests::actions as req;
+        self.phase(phase, progress).await?;
+        if !self.alive().await {
+            return Err(Stop::Cancelled);
+        }
+        let now = Instant::now();
+        if now >= self.deadline {
+            return Err(fail(self.timeout_code, self.timeout_message.clone()));
+        }
+        let snap = self.snapshot(self.deadline).await?;
+        if snap.env.calibration_revision != revisions.calibration_revision {
+            return Err(fail("CALIBRATION_CHANGED", format!("[{phase}] calibration changed during adaptive grasp")));
+        }
+        if snap.env.workspace_revision != revisions.workspace_revision
+            || snap.env.grasp_setup_revision != revisions.grasp_setup_revision
+            || snap.env.gripper_calib_revision != revisions.gripper_calib_revision
+            || snap.env.power_budget_revision != revisions.power_budget_revision
+        {
+            return Err(fail("PLAN_STALE", format!("[{phase}] configuration changed during adaptive grasp")));
+        }
+        let closes = match command {
+            GripperCommand::Close | GripperCommand::Seek => true,
+            GripperCommand::Open => false,
+            GripperCommand::Move => match (
+                snap.env.config.gripper_policy.as_ref(),
+                snap.env.config.gripper_index(),
+            ) {
+                (Some(p), Some(g)) => {
+                    let target =
+                        p.closed_rad + fraction.unwrap_or(0.0) as f32 * (p.open_rad - p.closed_rad);
+                    let dir = if p.closed_rad >= p.open_rad { 1.0 } else { -1.0 };
+                    (target - snap.commanded_positions.get(g).copied().unwrap_or(target)) * dir
+                        > 1e-3
+                }
+                _ => true,
+            },
+        };
+        let close_speed = snap
+            .env
+            .config
+            .gripper_policy
+            .as_ref()
+            .map_or(f64::from(crate::model::DEFAULT_CLOSE_SPEED_RAD_S), |p| p.close_speed());
+        let (speed, timeout_s) = if closes { (close_speed, None) } else { (1.0, Some(8.0)) };
+        let request = GripperRequest { command, fraction, grasp, speed, timeout_s, tag: None };
+        let remaining_s = self.deadline.saturating_duration_since(Instant::now()).as_secs_f64();
+        let mut child_stamp = snap.stamp.for_child(ActionId(self.id), self.deadline);
+        child_stamp.config_revision = revisions.workspace_revision;
+        child_stamp.calibration_revision = Some(revisions.calibration_revision);
+        child_stamp.poses_revision = None;
+        child_stamp.sequences_revision = None;
+        child_stamp.grasp_setup_revision = Some(revisions.grasp_setup_revision);
+        child_stamp.gripper_calib_revision = Some(revisions.gripper_calib_revision);
+        child_stamp.power_budget_revision = Some(revisions.power_budget_revision);
+
+        let ticket = if self.is_executor() {
+            let m = snap.owner.macro_state;
+            let next_seq = (m.active_id == self.id && m.alive)
+                .then(|| m.child_seq.checked_add(1))
+                .flatten()
+                .ok_or(Stop::Cancelled)?;
+            let child_spec = ChildSpec {
+                ticket: ChildTicket {
+                    parent: ActionId(self.id),
+                    child_seq: next_seq,
+                },
+                timeout_s: self.phase_timeout_s,
+                timeout_code: self.timeout_code,
+                contact: None,
+            };
+            let slot = req::prepare_child_gripper_slot(
+                &snap.commanded_positions,
+                command,
+                fraction,
+                grasp,
+                speed,
+                timeout_s,
+                Some(remaining_s),
+                true,
+                child_spec,
+            )
+            .map_err(|c| fail(c, format!("[{phase}] failed to stage gripper child: {c}")))?;
+            self.submit_child_slot_executor(
+                &child_stamp,
+                slot,
+                true,
+                Some(revisions.calibration_revision),
+            )
+            .await?;
+            child_spec.ticket
+        } else {
+            let mut inner = self.sup.inner().write().await;
+            let Some(next_seq) = inner
+                .macro_run
+                .as_ref()
+                .filter(|m| m.id == self.id && inner.macro_alive(self.id))
+                .and_then(|m| m.next_child_seq())
+            else {
+                return Err(Stop::Cancelled);
+            };
+            let child_spec = ChildSpec {
+                ticket: ChildTicket {
+                    parent: ActionId(self.id),
+                    child_seq: next_seq,
+                },
+                timeout_s: self.phase_timeout_s,
+                timeout_code: self.timeout_code,
+                contact: None,
+            };
+            let owner_ctx = req::OwnerCheckCtx::for_legacy(&inner);
+            match req::install_macro_child(
+                &mut inner,
+                &child_stamp,
+                &owner_ctx,
+                true,
+                req::MacroChildPayload::LegacyGripper {
+                    spec: child_spec,
+                    start: snap.commanded_positions,
+                    request,
+                    learn: crate::motion::LearnMode::Opening,
+                    max_budget_s: Some(remaining_s),
+                    extend_pos_force_close_timeout: true,
+                },
+            ) {
+                Ok(v) => v.ticket,
+                Err(ArmError::Motion(crate::motion::MotionError::InvalidCommand(msg)))
+                    if msg.contains("remaining macro budget") =>
+                {
+                    return Err(fail(self.timeout_code, format!("[{phase}] {msg}")));
+                }
+                Err(other) => return Err(self.map_install_err(&mut inner, other)),
+            }
+        };
+        self.wait_child(ticket).await
     }
 }
 
