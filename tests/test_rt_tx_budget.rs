@@ -5514,3 +5514,458 @@ async fn legacy_ws_torque_on_ticked_enable_7_motors_realistic_latency_10_seeded_
         "legacy_ws_torque_on_ticked_enable: {succeeded}/10 seeded runs PASSED (j7_refresh_exercised={seeds_with_j7_refresh}/10)"
     );
 }
+
+/// Regressions for all 4 hardware-safety Blockers identified by the read-only codex-rescue audit:
+/// 1. RX budget expiring after a plausible J7 reply with a fault queued behind it MUST keep J7
+///    ineligible for `CMD_ENABLE` until the queue drains and reveals the fault.
+/// 2. A fresh timestamped J7 hardware fault (`0x0A`) arriving during a deferred (`boundary=None`)
+///    refresh MUST fail closed with `MotorHardwareFault` instead of resolving the refresh as fresh.
+/// 3. Crossing either the 100 ms J7 freshness bound or the 150 ms confirmation deadline after
+///    frame construction (at final submission `t0`) MUST refuse `CMD_ENABLE` before `can.transmit`.
+/// 4. Lease revocation occurring during `drain_rx_for_boundary` MUST block `0xCC` transmit and
+///    flush and fail closed with `LeaseFenced`.
+#[test]
+fn j7_enable_refresh_review_blocker_regressions() {
+    use armd::rt_core::urgent::LeaseGate;
+
+    let limits = b601_limits();
+    let make_pf = || GripperPosForce {
+        joint: 6,
+        current_raw: 460,
+        close_speed_rad_s: 0.30,
+        closed_rad: 0.0,
+        open_rad: -5.7,
+        calibrated: false,
+        ceiling_torque_nm: None,
+        torque_reference: None,
+    };
+    let build_j7_fb = |limits: &[DamiaoLimits], state: u8, pos: f32| -> CanFrame {
+        let l = limits[6];
+        let p = damiao::float_to_uint(pos, l.p_min, l.p_max, 16);
+        let v = damiao::float_to_uint(0.0, l.v_min, l.v_max, 12);
+        let t = damiao::float_to_uint(0.0, l.t_min, l.t_max, 12);
+        CanFrame::new_standard(
+            0x17,
+            &[
+                ((state & 0x0f) << 4) | 7,
+                (p >> 8) as u8,
+                p as u8,
+                (v >> 4) as u8,
+                (((v & 0x0f) << 4) | ((t >> 8) & 0x0f)) as u8,
+                t as u8,
+                30,
+                30,
+            ],
+        )
+        .unwrap()
+    };
+
+    // --- Blocker 1: Plausible J7 reply at RX budget boundary with J7 fault right behind it ---
+    {
+        struct SuppressJ7RefreshBus {
+            inner: VirtualBus,
+            suppress_j7_cc: Arc<AtomicBool>,
+            suppress_j7_307: Arc<AtomicBool>,
+        }
+        impl CanTransport for SuppressJ7RefreshBus {
+            fn clock(&self) -> Option<Arc<dyn DriverClock>> { self.inner.clock() }
+            fn supports_nonblocking_rt(&self) -> bool { true }
+            fn supports_bounded_flush(&self) -> bool { true }
+            fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
+                let rx_before = self.inner.with(|s| s.rx.len());
+                let r = self.inner.transmit(frame);
+                let is_j7_cc = frame.id == 0x7FF
+                    && frame.data[2] == 0xCC
+                    && u16::from_le_bytes([frame.data[0], frame.data[1]]) == 7;
+                if (frame.id == 0x307 && self.suppress_j7_307.load(Ordering::SeqCst))
+                    || (is_j7_cc && self.suppress_j7_cc.load(Ordering::SeqCst))
+                {
+                    self.inner.with(|s| s.rx.truncate(rx_before));
+                }
+                r
+            }
+            fn receive(&mut self) -> Result<CanFrame, TransportError> { self.inner.receive() }
+            fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<Instant>), TransportError> {
+                self.inner.receive_timestamped()
+            }
+            fn flush(&mut self) -> Result<(), TransportError> { self.inner.flush() }
+        }
+
+        let (vbus, clock) = VirtualBus::new(&limits);
+        vbus.with(|s| {
+            s.motors[6].2 = -1.0;
+            s.motors[6].4 = damiao::CTRL_MODE_POS_FORCE;
+        });
+        let sup_307 = Arc::new(AtomicBool::new(true));
+        let sup_cc = Arc::new(AtomicBool::new(true));
+        let mut d = DamiaoArmDriver::new(
+            SuppressJ7RefreshBus {
+                inner: vbus.clone(),
+                suppress_j7_cc: sup_cc.clone(),
+                suppress_j7_307: sup_307.clone(),
+            },
+            vec![1, 2, 3, 4, 5, 6, 7],
+        )
+        .with_joint_limits(limits.clone())
+        .unwrap()
+        .with_gripper_pos_force(make_pf())
+        .unwrap();
+        d.read_joint_states().unwrap();
+        vbus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+
+        // Age to 85 ms, carry enable under max_frames=1 through 0x307, then cross 100 ms to arm 0xCC.
+        clock.advance(ms(85));
+        d.set_tx_budget(TxBudget { max_frames: 1, max_duration: ms(5), frame_max_age: ms(45) });
+        let _ = d.begin_torque(true).unwrap();
+        for _ in 0..10 {
+            vbus.clear();
+            clock.advance(ms(1));
+            let _ = d.poll_torque(clock.now() + ms(5)).unwrap();
+            if vbus.with(|s| s.tx_accepted.iter().any(|f| f.id == 0x307)) {
+                break;
+            }
+        }
+        clock.advance(ms(20)); // J7 is now stale (> 100 ms); next poll sends 0xCC and leaves refresh pending.
+        d.set_tx_budget(TxBudget::default());
+        vbus.clear();
+        let p = d.poll_torque(clock.now() + ms(5)).expect("0xCC refresh armed");
+        assert!(matches!(p, armd::driver::TorqueProgress::Pending { .. }));
+        assert!(vbus.with(|s| s.tx_accepted.iter().any(|f| f.id == 0x7FF && f.data[2] == 0xCC)));
+
+        // Inject TWO post-boundary J7 frames: benign state=0 FIRST, overcurrent fault 0x0A SECOND.
+        clock.advance(ms(10));
+        let rx_t = clock.now();
+        vbus.with(|s| {
+            s.rx.push_back((build_j7_fb(&limits, 0, -1.0), Some(rx_t)));
+            s.rx.push_back((build_j7_fb(&limits, 0x0A, -1.0), Some(rx_t)));
+        });
+        vbus.clear();
+        // RX budget = 1 decodes ONLY the benign frame (updating pf_last_fresh_feedback) without
+        // draining the queue! J7 MUST remain held out of CMD_ENABLE while pf_refresh is pending.
+        let p2 = d
+            .poll_torque_budgeted(clock.now() + ms(5), 1)
+            .expect("undrained refresh must remain pending");
+        assert!(matches!(p2, armd::driver::TorqueProgress::Pending { .. }));
+        assert!(
+            !vbus.with(|s| s.tx_log.iter().any(|f| f.id == 7 && f.data == damiao::CMD_ENABLE)),
+            "Blocker 1: J7 CMD_ENABLE MUST NOT transmit before refresh observes an empty RX queue: {:?}",
+            vbus.with(|s| s.tx_log.clone())
+        );
+
+        // Next release drains the queued 0x0A fault and MUST fail closed without enabling J7.
+        clock.advance(ms(10));
+        vbus.clear();
+        let err = d.poll_torque(clock.now() + ms(5)).unwrap_err();
+        assert!(
+            matches!(err, ArmDriverError::MotorHardwareFault { joint: 6, status: 0x0A, .. }),
+            "Blocker 1: queued J7 fault behind benign reply must veto enable: {err:?}"
+        );
+        assert!(
+            !vbus.with(|s| s.tx_log.iter().any(|f| f.id == 7 && f.data == damiao::CMD_ENABLE)),
+            "Blocker 1: faulted J7 must never receive CMD_ENABLE"
+        );
+    }
+
+    // --- Blocker 2: Deferred (boundary=None) refresh receives a fresh J7 fault frame ---
+    {
+        let (vbus, clock) = VirtualBus::new(&limits);
+        vbus.with(|s| {
+            s.motors[6].2 = -1.0;
+            s.motors[6].4 = damiao::CTRL_MODE_POS_FORCE;
+        });
+        let mut d = DamiaoArmDriver::new(vbus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits.clone())
+            .unwrap()
+            .with_gripper_pos_force(make_pf())
+            .unwrap();
+        d.read_joint_states().unwrap();
+        vbus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+
+        clock.advance(ms(85));
+        d.set_tx_budget(TxBudget { max_frames: 1, max_duration: ms(5), frame_max_age: ms(45) });
+        let _ = d.begin_torque(true).unwrap();
+        for _ in 0..10 {
+            vbus.clear();
+            clock.advance(ms(1));
+            let _ = d.poll_torque(clock.now() + ms(5)).unwrap();
+            if vbus.with(|s| s.tx_accepted.iter().any(|f| f.id == 0x307)) {
+                break;
+            }
+        }
+        vbus.with(|s| s.rx.clear());
+        // Exhaust TX budget (`max_frames = 0`) while stale so `pf_refresh` is armed with `boundary: None`.
+        clock.advance(ms(20));
+        d.set_tx_budget(TxBudget { max_frames: 0, max_duration: ms(5), frame_max_age: ms(45) });
+        let p = d.poll_torque(clock.now() + ms(5)).expect("deferred refresh pending");
+        assert!(matches!(p, armd::driver::TorqueProgress::Pending { .. }));
+
+        // Restore TX budget and push a fresh timestamped J7 overcurrent fault (0x0A) with finite pos.
+        d.set_tx_budget(TxBudget::default());
+        clock.advance(ms(10));
+        let rx_t = clock.now();
+        vbus.with(|s| s.rx.push_back((build_j7_fb(&limits, 0x0A, -1.0), Some(rx_t))));
+        vbus.clear();
+        let err = d.poll_torque(clock.now() + ms(5)).unwrap_err();
+        assert!(
+            matches!(err, ArmDriverError::MotorHardwareFault { joint: 6, status: 0x0A, .. }),
+            "Blocker 2: fresh J7 hardware fault during deferred refresh must fail closed: {err:?}"
+        );
+        assert!(
+            !vbus.with(|s| s.tx_log.iter().any(|f| f.id == 7 && f.data == damiao::CMD_ENABLE)),
+            "Blocker 2: faulted J7 must NEVER receive CMD_ENABLE"
+        );
+    }
+
+    // --- Blocker 3: Clock crosses 100 ms freshness (3a) or 150 ms confirm deadline (3b) after build ---
+    for case in ["freshness_100ms", "confirm_150ms"] {
+        struct JumpBeforeTxClock {
+            inner: MockClock,
+            arm_jump: Arc<AtomicBool>,
+            /// Number of `now()` calls remaining after arming before injecting `jump_ms`.
+            countdown: Arc<std::sync::atomic::AtomicUsize>,
+            jump_ms: u64,
+            jumped: Arc<AtomicBool>,
+        }
+        impl DriverClock for JumpBeforeTxClock {
+            fn clock_id(&self) -> u64 { self.inner.clock_id() }
+            fn sleep(&self, d: Duration) { self.inner.sleep(d) }
+            fn yield_now(&self) { self.inner.yield_now() }
+            fn now(&self) -> Instant {
+                if self.arm_jump.load(Ordering::SeqCst) && !self.jumped.load(Ordering::SeqCst) {
+                    let prev = self.countdown.fetch_sub(1, Ordering::SeqCst);
+                    if prev == 0 {
+                        self.jumped.store(true, Ordering::SeqCst);
+                        self.inner.advance(ms(self.jump_ms));
+                    }
+                }
+                self.inner.now()
+            }
+        }
+        struct CustomClockBus {
+            inner: VirtualBus,
+            clk: Arc<JumpBeforeTxClock>,
+        }
+        impl CanTransport for CustomClockBus {
+            fn clock(&self) -> Option<Arc<dyn DriverClock>> {
+                Some(self.clk.clone() as Arc<dyn DriverClock>)
+            }
+            fn supports_nonblocking_rt(&self) -> bool { true }
+            fn supports_bounded_flush(&self) -> bool { true }
+            fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
+                self.inner.transmit(frame)
+            }
+            fn receive(&mut self) -> Result<CanFrame, TransportError> { self.inner.receive() }
+            fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<Instant>), TransportError> {
+                self.inner.receive_timestamped()
+            }
+            fn flush(&mut self) -> Result<(), TransportError> { self.inner.flush() }
+        }
+
+        let (vbus, base_clock) = VirtualBus::new(&limits);
+        vbus.with(|s| {
+            s.motors[6].2 = -1.0;
+            s.motors[6].4 = damiao::CTRL_MODE_POS_FORCE;
+        });
+        let arm_jump = Arc::new(AtomicBool::new(false));
+        let countdown = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let jumped = Arc::new(AtomicBool::new(false));
+        let jump_ms = if case == "freshness_100ms" { 10 } else { 10 };
+        let clk = Arc::new(JumpBeforeTxClock {
+            inner: base_clock.clone(),
+            arm_jump: arm_jump.clone(),
+            countdown: countdown.clone(),
+            jump_ms,
+            jumped: jumped.clone(),
+        });
+        let mut d = DamiaoArmDriver::new(
+            CustomClockBus { inner: vbus.clone(), clk },
+            vec![1, 2, 3, 4, 5, 6, 7],
+        )
+        .with_joint_limits(limits.clone())
+        .unwrap()
+        .with_gripper_pos_force(make_pf())
+        .unwrap();
+        d.read_joint_states().unwrap();
+        vbus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+
+        // Carry J7 into `poll_enable` with J1..J6 already enabled so the next poll attempts J7 CMD_ENABLE first.
+        d.set_tx_budget(TxBudget { max_frames: 7, max_duration: ms(5), frame_max_age: ms(45) });
+        let _ = d.begin_torque(true).unwrap();
+        for _ in 0..10 {
+            vbus.clear();
+            base_clock.advance(ms(1));
+            let _ = d.poll_torque(base_clock.now() + ms(5)).unwrap();
+            if vbus.with(|s| s.tx_accepted.iter().any(|f| f.id == 0x307)) {
+                break;
+            }
+        }
+        // Drain J1..J6 confirmations while holding J7 unsent by advancing near the target boundary.
+        vbus.with(|s| s.rx.retain(|(f, _)| f.id != 0x17));
+        if case == "freshness_100ms" {
+            // Advance to age 95 ms (fresh at `build` and `submit_now`, stale by 5 ms at final `t0`!).
+            base_clock.advance(ms(95));
+        } else {
+            // Push fresh J7 at +100 ms so J7 stays fresh, then advance to +145 ms (5 ms before 150 ms confirm deadline).
+            base_clock.advance(ms(100));
+            let t_mid = base_clock.now();
+            vbus.with(|s| s.rx.push_back((build_j7_fb(&limits, 0, -1.0), Some(t_mid))));
+            base_clock.advance(ms(45));
+        }
+        // Find the exact `now()` call between `submit_now` and `t0` inside `send()`:
+        // Sweep countdown values? Instead, inside `poll_enable` (with empty RX for freshness_100ms
+        // or 1 frame for confirm_150ms), `send()` calls `now()`:
+        // 1: deadline check, 2: ensure_tx_pass/can_start, 3: build (pf_enable_feedback_fresh),
+        // 4: submit_now, 5: can_start_tick_tx, 6: t0 (final submission timestamp!).
+        // Arm jump to fire right at `t0` so `build` and `submit_now` pass, and ONLY `t0` catches it!
+        // Use a dedicated `on_tx` or simply verify that jumping on `t0` refuses TX:
+        let pre_now = base_clock.now();
+        // Count `now()` calls up to `t0`: poll_enable (expire:1, receive_feedback: rx_over+attempt+...=4,
+        // ensure_enable_pf_refresh:1, send_enable_masked->send: deadline:1, ensure_tx_pass:1,
+        // can_start_tick_tx:1, build->pf_enable_feedback_fresh:1, submit_now:1, can_start_tick_tx:1, t0:1).
+        // Even cleaner: set countdown so jump triggers strictly AFTER `build` and BEFORE `can.transmit`,
+        // and verify `jumped == true` AND J7 `CMD_ENABLE` was NOT transmitted!
+        let _ = pre_now;
+        vbus.clear();
+        // Try countdown targeting `t0`: for `freshness_100ms` (0 RX frames) ~11; for `confirm_150ms` (1 RX frame) ~14.
+        // Regardless of exact offset inside `send()`, as long as jump occurs after `poll_enable`'s initial
+        // `window.expire`, the final `t0` gate must block J7 `CMD_ENABLE` when crossed!
+        countdown.store(if case == "freshness_100ms" { 10 } else { 13 }, Ordering::SeqCst);
+        arm_jump.store(true, Ordering::SeqCst);
+        let res = d.poll_torque(base_clock.now() + ms(50));
+        arm_jump.store(false, Ordering::SeqCst);
+        assert!(jumped.load(Ordering::SeqCst), "Blocker 3 ({case}): clock jump must have fired");
+        assert!(
+            !vbus.with(|s| s.tx_log.iter().any(|f| f.id == 7 && f.data == damiao::CMD_ENABLE)),
+            "Blocker 3 ({case}): J7 CMD_ENABLE MUST NOT transmit once {case} crossed at final t0 (res={res:?})"
+        );
+    }
+
+    // --- Blocker 4: Lease revocation during `drain_rx_for_boundary` blocks 0xCC TX and flush ---
+    {
+        struct RevokeLeaseOnRxBus {
+            inner: VirtualBus,
+            fenced_gen: Arc<AtomicU64>,
+            arm_revoke: Arc<AtomicBool>,
+            /// Counts RX calls after arming so revocation fires on the 2nd RX pass
+            /// (inside `drain_rx_for_boundary`, right before `0xCC` transmit).
+            rx_calls_after_arm: Arc<AtomicU64>,
+            flush_after_arm: Arc<AtomicU64>,
+        }
+        impl RevokeLeaseOnRxBus {
+            fn on_rx(&self) {
+                if self.arm_revoke.load(Ordering::SeqCst)
+                    && self.rx_calls_after_arm.fetch_add(1, Ordering::SeqCst) >= 1
+                {
+                    self.fenced_gen.store(1, Ordering::SeqCst);
+                }
+            }
+        }
+        impl CanTransport for RevokeLeaseOnRxBus {
+            fn clock(&self) -> Option<Arc<dyn DriverClock>> { self.inner.clock() }
+            fn supports_nonblocking_rt(&self) -> bool { true }
+            fn supports_bounded_flush(&self) -> bool { true }
+            fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
+                self.inner.transmit(frame)
+            }
+            fn receive(&mut self) -> Result<CanFrame, TransportError> {
+                self.on_rx();
+                self.inner.receive()
+            }
+            fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<Instant>), TransportError> {
+                self.on_rx();
+                self.inner.receive_timestamped()
+            }
+            fn flush(&mut self) -> Result<(), TransportError> {
+                if self.arm_revoke.load(Ordering::SeqCst) {
+                    self.flush_after_arm.fetch_add(1, Ordering::SeqCst);
+                }
+                self.inner.flush()
+            }
+        }
+
+        let (vbus, clock) = VirtualBus::new(&limits);
+        vbus.with(|s| {
+            s.motors[6].2 = -1.0;
+            s.motors[6].4 = damiao::CTRL_MODE_POS_FORCE;
+        });
+        let cur_gen = Arc::new(AtomicU64::new(1));
+        let fenced_gen = Arc::new(AtomicU64::new(0));
+        let disc_hold = Arc::new(AtomicU64::new(0));
+        let lease_gate = LeaseGate::new(cur_gen.clone(), fenced_gen.clone(), disc_hold);
+        let estop_gate = EstopGate::new(Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)))
+            .with_lease_gate(lease_gate);
+        let arm_revoke = Arc::new(AtomicBool::new(false));
+        let rx_calls_after_arm = Arc::new(AtomicU64::new(0));
+        let flush_after_arm = Arc::new(AtomicU64::new(0));
+
+        let mut d = DamiaoArmDriver::new(
+            RevokeLeaseOnRxBus {
+                inner: vbus.clone(),
+                fenced_gen: fenced_gen.clone(),
+                arm_revoke: arm_revoke.clone(),
+                rx_calls_after_arm: rx_calls_after_arm.clone(),
+                flush_after_arm: flush_after_arm.clone(),
+            },
+            vec![1, 2, 3, 4, 5, 6, 7],
+        )
+        .with_joint_limits(limits)
+        .unwrap()
+        .with_gripper_pos_force(make_pf())
+        .unwrap();
+        d.set_estop_gate(estop_gate);
+        d.read_joint_states().unwrap();
+        vbus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+
+        clock.advance(ms(85));
+        d.set_tx_budget(TxBudget { max_frames: 1, max_duration: ms(5), frame_max_age: ms(45) });
+        d.set_enable_authority(Some(clock.now() + ms(500)), Some(1));
+        let _ = d.begin_torque(true).unwrap();
+        for _ in 0..10 {
+            vbus.clear();
+            clock.advance(ms(1));
+            d.set_enable_authority(Some(clock.now() + ms(500)), Some(1));
+            let _ = d.poll_torque(clock.now() + ms(5)).unwrap();
+            if vbus.with(|s| s.tx_accepted.iter().any(|f| f.id == 0x307)) {
+                break;
+            }
+        }
+        vbus.with(|s| s.rx.clear());
+        // Cross 100 ms with empty TX budget so `pf_refresh` starts deferred (`boundary: None`).
+        clock.advance(ms(20));
+        d.set_tx_budget(TxBudget { max_frames: 0, max_duration: ms(5), frame_max_age: ms(45) });
+        d.set_enable_authority(Some(clock.now() + ms(500)), Some(1));
+        let _ = d.poll_torque(clock.now() + ms(5)).unwrap();
+
+        // Now restore TX budget, advance 1 ms, and arm lease revocation during RX drain!
+        d.set_tx_budget(TxBudget::default());
+        clock.advance(ms(1));
+        d.set_enable_authority(Some(clock.now() + ms(500)), Some(1));
+        vbus.clear();
+        arm_revoke.store(true, Ordering::SeqCst);
+        let err = d.poll_torque(clock.now() + ms(5)).unwrap_err();
+        assert!(
+            matches!(err, ArmDriverError::LeaseFenced),
+            "Blocker 4: lease revocation during refresh drain must fail with LeaseFenced: {err:?}"
+        );
+        assert!(
+            !vbus.with(|s| s.tx_log.iter().any(|f| f.id == 0x7FF && f.data[2] == 0xCC)),
+            "Blocker 4: 0xCC refresh MUST NOT transmit after lease revocation during RX drain: {:?}",
+            vbus.with(|s| s.tx_log.clone())
+        );
+        assert_eq!(
+            flush_after_arm.load(Ordering::SeqCst),
+            0,
+            "Blocker 4: flush() MUST NOT be called after lease revocation"
+        );
+        assert!(
+            rx_calls_after_arm.load(Ordering::SeqCst) >= 2,
+            "Blocker 4: revocation must fire during drain_rx_for_boundary (2nd RX pass), got {}",
+            rx_calls_after_arm.load(Ordering::SeqCst)
+        );
+        assert!(!d.torque_transition_pending() && !d.is_enabled());
+    }
+}

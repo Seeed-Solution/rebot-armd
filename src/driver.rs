@@ -9116,9 +9116,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     break 'send_body Err(TxRefusal::PosForceFeedbackExpired(pf_joint));
                 }
             }
-            // Terminal `CMD_ENABLE` authority check MUST run BEFORE per-release `DeadlinePassed` so
-            // revoked/expired authority never degrades into a retryable budget deferral.
-            if is_cmd_enable {
+            // Terminal enable-phase authority check (`CMD_ENABLE` and `TxKind::Handshake` such as
+            // `0xCC` refreshes) MUST run BEFORE per-release `DeadlinePassed` so revoked/expired
+            // authority never degrades into a retryable budget deferral.
+            if is_cmd_enable || matches!(kind, TxKind::Handshake) {
                 if self.enable_lease_gen.is_some_and(|g| self.is_lease_fenced(g)) {
                     break 'send_body Err(TxRefusal::LeaseFenced);
                 }
@@ -9174,12 +9175,24 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             }
             let cpu0 = crate::diagnostics::tick::thread_cpu_ns();
             let t0 = self.now();
-            if is_cmd_enable {
+            if is_cmd_enable || matches!(kind, TxKind::Handshake) {
                 if self.enable_tx_deadline.is_some_and(|dl| t0 >= dl) {
                     break 'send_body Err(TxRefusal::EnableAuthorityExpired);
                 }
                 if self.enable_lease_gen.is_some_and(|g| self.is_lease_fenced(g)) {
                     break 'send_body Err(TxRefusal::LeaseFenced);
+                }
+            }
+            if is_cmd_enable {
+                if deadline.is_some_and(|d| d.passed(t0)) {
+                    break 'send_body Err(TxRefusal::DeadlinePassed);
+                }
+                if let Some(idx) = enable_motor_idx {
+                    if self.pos_force.as_ref().is_some_and(|pf| pf.joint == idx)
+                        && !self.pf_enable_feedback_fresh_at(idx, t0)
+                    {
+                        break 'send_body Err(TxRefusal::PosForceFeedbackExpired(idx));
+                    }
                 }
             }
             if is_cmd_disable && deadline.is_some_and(|d| d.passed(t0)) {
@@ -12201,7 +12214,14 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     ) -> Result<Option<u64>, ArmDriverError> {
         self.enable_estop_inhibited()?;
         self.check_enable_tx_authority()?;
-        if !self.drain_rx_for_boundary(deadline) || deadline.passed(self.now()) {
+        if !self.drain_rx_for_boundary(deadline) {
+            self.enable_estop_inhibited()?;
+            self.check_enable_tx_authority()?;
+            return Ok(None);
+        }
+        self.enable_estop_inhibited()?;
+        self.check_enable_tx_authority()?;
+        if deadline.passed(self.now()) {
             return Ok(None);
         }
         // Snapshot the receive sequence and transmit instant right before transmitting `0xCC`:
@@ -12218,10 +12238,16 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 self.abort_enable_for_estop();
                 return Err(ArmDriverError::EstopInhibited);
             }
+            Err(r @ (TxRefusal::LeaseFenced | TxRefusal::EnableAuthorityExpired)) => {
+                self.torque_hs = None;
+                self.enable_failed();
+                return Err(Self::refusal_to_driver_err(r));
+            }
             Err(TxRefusal::Transport(e)) if e.is_tx_backpressure() => return Ok(None),
             Err(r) => return Err(Self::refusal_to_driver_err(r)),
         }
         self.enable_estop_inhibited()?;
+        self.check_enable_tx_authority()?;
         self.can.flush()?;
         self.refresh_capture = Some(RefreshCapture {
             joint,
@@ -12824,10 +12850,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.send_enable()
     }
 
-    /// Revalidate that a position-force gripper joint still has provably fresh (`<= 100 ms`)
-    /// feedback (both decode instant and empty-queue bound) and verified CTRL_MODE 4 right before
-    /// transmitting an initial, carried, or retried `CMD_ENABLE` frame.
-    fn pf_enable_feedback_fresh(&self, joint: usize) -> bool {
+    /// Revalidate at `now` that a position-force gripper joint still has provably fresh (`<= 100 ms`)
+    /// non-faulted feedback (both decode instant and empty-queue bound) and verified CTRL_MODE 4
+    /// right before transmitting an initial, carried, or retried `CMD_ENABLE` frame.
+    fn pf_enable_feedback_fresh_at(&self, joint: usize, now: Instant) -> bool {
         if !self.pos_force.as_ref().is_some_and(|pf| pf.joint == joint) {
             return true;
         }
@@ -12837,9 +12863,75 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let Some((rx_at, queue_bound)) = self.pf_last_fresh_feedback else {
             return false;
         };
-        self.cached_states.get(joint).is_some_and(|s| s.position.is_finite())
-            && self.since(rx_at) <= POS_FORCE_FEEDBACK_MAX_AGE
-            && self.since(queue_bound) <= POS_FORCE_FEEDBACK_MAX_AGE
+        let status = self.motor_status.get(joint).copied().unwrap_or(0xFF);
+        let status_ok = status == 0 || status == 1;
+        let state_ok = self.cached_states.get(joint).is_some_and(|s| {
+            s.position.is_finite()
+                && if status == 0 {
+                    s.velocity.is_finite() && s.velocity.abs() <= 0.05
+                } else {
+                    s.velocity.is_finite()
+                }
+        });
+        status_ok
+            && state_ok
+            && now.saturating_duration_since(rx_at) <= POS_FORCE_FEEDBACK_MAX_AGE
+            && now.saturating_duration_since(queue_bound) <= POS_FORCE_FEEDBACK_MAX_AGE
+    }
+
+    fn pf_enable_feedback_fresh(&self, joint: usize) -> bool {
+        self.pf_enable_feedback_fresh_at(joint, self.now())
+    }
+
+    /// Fail closed immediately if the configured `PosForce` gripper has decoded a hardware fault.
+    fn check_pf_enable_hardware_fault(&mut self, pf_joint: Option<usize>) -> Result<(), ArmDriverError> {
+        if let Some(pf_j) = pf_joint {
+            let status = self.motor_status.get(pf_j).copied().unwrap_or(0);
+            if damiao_fault_name(status).is_some() {
+                let motor_id = self.motor_ids[pf_j];
+                self.torque_hs = None;
+                self.enable_failed();
+                return Err(ArmDriverError::MotorHardwareFault {
+                    joint: pf_j,
+                    motor_id,
+                    status,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Single J7 enable refresh-arming helper shared across initial, carried, and retry passes:
+    /// refuses immediately on a decoded J7 hardware fault, and if J7 is pending in `unsent_mask`
+    /// and not fresh, reserves the bounded causal `0xCC` refresh slot (failing closed once the
+    /// bounded slot budget is exhausted).
+    fn ensure_enable_pf_refresh(
+        &mut self,
+        pf_joint: Option<usize>,
+        unsent_mask: u32,
+        deadline: Deadline,
+        pf_refresh: &mut Option<FeedbackRefresh>,
+        pf_refresh_count: &mut u8,
+    ) -> Result<(), ArmDriverError> {
+        self.check_pf_enable_hardware_fault(pf_joint)?;
+        let Some(pf_j) = pf_joint else {
+            return Ok(());
+        };
+        let pf_bit = 1u32 << pf_j;
+        if pf_refresh.is_none()
+            && (unsent_mask & pf_bit) != 0
+            && !self.pf_enable_feedback_fresh(pf_j)
+        {
+            if *pf_refresh_count >= MAX_ENABLE_PF_REFRESHES {
+                self.torque_hs = None;
+                self.enable_failed();
+                return Err(ArmDriverError::PosForceFeedbackStaleBeforeTransmit { joint: pf_j });
+            }
+            *pf_refresh_count += 1;
+            let drained_now = self.last_read_drained;
+            *pf_refresh = Some(self.start_enable_pf_refresh(pf_j, deadline, drained_now)?);
+        }
+        Ok(())
     }
 
     /// Transmit enable frames for joints in `mask` through [`Self::send`] (`TxKind::Handshake`),
@@ -12922,7 +13014,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 Err(TxRefusal::BuildRefused | TxRefusal::PosForceFeedbackExpired(_)) => {
                     let mode_ok = self.verified_modes.get(i).copied().flatten() == Some(self.base_mode(i))
                         && self.joint_modes.get(i).copied().flatten() == Some(self.base_mode(i));
+                    let status = self.motor_status.get(i).copied().unwrap_or(0);
+                    let hw_fault = damiao_fault_name(status).is_some();
                     if mode_ok
+                        && !hw_fault
                         && defer_stale_pf
                         && self.pos_force.as_ref().is_some_and(|pf| pf.joint == i)
                     {
@@ -12935,6 +13030,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                             "joint {} CTRL_MODE unverified before enable",
                             i + 1
                         )));
+                    }
+                    if hw_fault {
+                        return Err(ArmDriverError::MotorHardwareFault {
+                            joint: i,
+                            motor_id: id,
+                            status,
+                        });
                     }
                     return Err(ArmDriverError::PosForceFeedbackStaleBeforeTransmit { joint: i });
                 }
@@ -12977,6 +13079,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
         if sent_any {
             self.enable_estop_inhibited()?;
+            self.check_enable_tx_authority()?;
             if let Err(e) = self.can.flush() {
                 if fail_on_error {
                     self.enable_failed();
@@ -13028,15 +13131,15 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let mut pf_refresh: Option<FeedbackRefresh> = None;
         let mut pf_refresh_count = 0u8;
 
-        let send_mask = if let Some(pf_j) = pf_joint {
-            if !self.pf_enable_feedback_fresh(pf_j) {
-                pf_refresh_count += 1;
-                let drained_now = self.last_read_drained;
-                pf_refresh = Some(self.start_enable_pf_refresh(pf_j, initial_deadline, drained_now)?);
-                all_mask & !pf_bit
-            } else {
-                all_mask
-            }
+        self.ensure_enable_pf_refresh(
+            pf_joint,
+            all_mask,
+            initial_deadline,
+            &mut pf_refresh,
+            &mut pf_refresh_count,
+        )?;
+        let send_mask = if pf_refresh.is_some() {
+            all_mask & !pf_bit
         } else {
             all_mask
         };
@@ -13052,15 +13155,14 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         )?;
         if pf_refresh.is_some() {
             unsent_mask |= pf_bit;
-        } else if let Some(pf_j) = pf_joint {
-            if (unsent_mask & pf_bit) != 0
-                && !self.pf_enable_feedback_fresh(pf_j)
-                && pf_refresh_count < MAX_ENABLE_PF_REFRESHES
-            {
-                pf_refresh_count += 1;
-                let drained_now = self.last_read_drained;
-                pf_refresh = Some(self.start_enable_pf_refresh(pf_j, initial_deadline, drained_now)?);
-            }
+        } else {
+            self.ensure_enable_pf_refresh(
+                pf_joint,
+                unsent_mask,
+                initial_deadline,
+                &mut pf_refresh,
+                &mut pf_refresh_count,
+            )?;
         }
         let j7_prioritize = (unsent_mask & pf_bit) != 0;
         let poll_start = self.now();
@@ -13072,13 +13174,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             DAMIAO_ENABLE_CONFIRM,
             &DAMIAO_ENABLE_RETRY_AT,
         );
-        let held_j7 = if pf_refresh.is_some()
-            && pf_joint.is_some_and(|j| !self.pf_enable_feedback_fresh(j))
-        {
-            unsent_mask & pf_bit
-        } else {
-            0
-        };
+        let held_j7 = if pf_refresh.is_some() { unsent_mask & pf_bit } else { 0 };
         let wake = Self::enable_pending_wake(
             poll_start,
             window.wake(),
@@ -13304,6 +13400,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 self.enable_estop_inhibited()?;
                 self.check_enable_tx_authority()?;
                 let pf_j = r_joint;
+                self.check_pf_enable_hardware_fault(Some(pf_j))?;
                 if self.last_read_drained && self.pf_enable_feedback_fresh(pf_j) {
                     self.refresh_capture = None;
                 } else {
@@ -13328,32 +13425,23 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             let _ = self.receive_feedback();
             self.enable_estop_inhibited()?;
             self.check_enable_tx_authority()?;
+            self.check_pf_enable_hardware_fault(pf_joint)?;
         }
 
         // If J7 is in `unsent_mask` and stale, reserve the bounded 0xCC refresh slot FIRST before
-        // earlier joints consume TX budget.
-        if let Some(pf_j) = pf_joint {
-            if pf_refresh.is_none()
-                && (unsent_mask & pf_bit) != 0
-                && !self.pf_enable_feedback_fresh(pf_j)
-            {
-                if pf_refresh_count >= MAX_ENABLE_PF_REFRESHES {
-                    self.enable_failed();
-                    return Err(ArmDriverError::PosForceFeedbackStaleBeforeTransmit { joint: pf_j });
-                }
-                pf_refresh_count += 1;
-                let drained_now = self.last_read_drained;
-                pf_refresh = Some(self.start_enable_pf_refresh(pf_j, deadline, drained_now)?);
-            }
-        }
+        // earlier joints consume TX budget. While ANY `pf_refresh` is active, J7 MUST stay held
+        // out of `CMD_ENABLE` until `poll_feedback_refresh_opts` verifies a post-boundary reply
+        // through an observed empty RX queue.
+        self.ensure_enable_pf_refresh(
+            pf_joint,
+            unsent_mask,
+            deadline,
+            &mut pf_refresh,
+            &mut pf_refresh_count,
+        )?;
 
         if unsent_mask != 0 {
-            let pf_stale = pf_joint.is_some_and(|j| !self.pf_enable_feedback_fresh(j));
-            let held_j7 = if pf_refresh.is_some() && pf_stale {
-                unsent_mask & pf_bit
-            } else {
-                0
-            };
+            let held_j7 = if pf_refresh.is_some() { unsent_mask & pf_bit } else { 0 };
             let tx_mask = unsent_mask & !held_j7;
             if tx_mask != 0 {
                 let prio = pf_joint.filter(|_| j7_prioritize && (tx_mask & pf_bit) != 0);
@@ -13367,27 +13455,15 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     prio,
                     defer_stale_pf,
                 )?;
-                let j7_was_in_tx = (tx_mask & pf_bit) != 0;
                 unsent_mask = rem | held_j7;
-                if j7_was_in_tx && (rem & pf_bit) == 0 && pf_refresh.is_some() {
-                    pf_refresh = None;
-                    self.refresh_capture = None;
-                }
             }
-            if let Some(pf_j) = pf_joint {
-                if pf_refresh.is_none()
-                    && (unsent_mask & pf_bit) != 0
-                    && !self.pf_enable_feedback_fresh(pf_j)
-                {
-                    if pf_refresh_count >= MAX_ENABLE_PF_REFRESHES {
-                        self.enable_failed();
-                        return Err(ArmDriverError::PosForceFeedbackStaleBeforeTransmit { joint: pf_j });
-                    }
-                    pf_refresh_count += 1;
-                    let drained_now = self.last_read_drained;
-                    pf_refresh = Some(self.start_enable_pf_refresh(pf_j, deadline, drained_now)?);
-                }
-            }
+            self.ensure_enable_pf_refresh(
+                pf_joint,
+                unsent_mask,
+                deadline,
+                &mut pf_refresh,
+                &mut pf_refresh_count,
+            )?;
         }
 
         let (confirmed_mask, all_post_fb, fault) = self.enable_confirm_snapshot(unsent_mask);
@@ -13408,28 +13484,14 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             }
             Service::Retry { mask, wake } => {
                 unsent_mask |= mask;
-                if let Some(pf_j) = pf_joint {
-                    if pf_refresh.is_none()
-                        && (unsent_mask & pf_bit) != 0
-                        && !self.pf_enable_feedback_fresh(pf_j)
-                    {
-                        if pf_refresh_count >= MAX_ENABLE_PF_REFRESHES {
-                            self.enable_failed();
-                            return Err(ArmDriverError::PosForceFeedbackStaleBeforeTransmit {
-                                joint: pf_j,
-                            });
-                        }
-                        pf_refresh_count += 1;
-                        let drained_now = self.last_read_drained;
-                        pf_refresh = Some(self.start_enable_pf_refresh(pf_j, deadline, drained_now)?);
-                    }
-                }
-                let pf_stale = pf_joint.is_some_and(|j| !self.pf_enable_feedback_fresh(j));
-                let held_j7 = if pf_refresh.is_some() && pf_stale {
-                    unsent_mask & pf_bit
-                } else {
-                    0
-                };
+                self.ensure_enable_pf_refresh(
+                    pf_joint,
+                    unsent_mask,
+                    deadline,
+                    &mut pf_refresh,
+                    &mut pf_refresh_count,
+                )?;
+                let held_j7 = if pf_refresh.is_some() { unsent_mask & pf_bit } else { 0 };
                 let tx_mask = unsent_mask & !held_j7;
                 if tx_mask != 0 {
                     let prio = pf_joint.filter(|_| j7_prioritize && (tx_mask & pf_bit) != 0);
@@ -13443,38 +13505,18 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         prio,
                         defer_stale_pf,
                     )?;
-                    let j7_was_in_tx = (tx_mask & pf_bit) != 0;
                     unsent_mask = rem | held_j7;
-                    if j7_was_in_tx && (rem & pf_bit) == 0 && pf_refresh.is_some() {
-                        pf_refresh = None;
-                        self.refresh_capture = None;
-                    }
                 }
-                if let Some(pf_j) = pf_joint {
-                    if pf_refresh.is_none()
-                        && (unsent_mask & pf_bit) != 0
-                        && !self.pf_enable_feedback_fresh(pf_j)
-                    {
-                        if pf_refresh_count >= MAX_ENABLE_PF_REFRESHES {
-                            self.enable_failed();
-                            return Err(ArmDriverError::PosForceFeedbackStaleBeforeTransmit {
-                                joint: pf_j,
-                            });
-                        }
-                        pf_refresh_count += 1;
-                        let drained_now = self.last_read_drained;
-                        pf_refresh = Some(self.start_enable_pf_refresh(pf_j, deadline, drained_now)?);
-                    }
-                }
+                self.ensure_enable_pf_refresh(
+                    pf_joint,
+                    unsent_mask,
+                    deadline,
+                    &mut pf_refresh,
+                    &mut pf_refresh_count,
+                )?;
                 j7_prioritize = (unsent_mask & pf_bit) != 0;
                 let after = self.now();
-                let final_held_j7 = if pf_refresh.is_some()
-                    && pf_joint.is_some_and(|j| !self.pf_enable_feedback_fresh(j))
-                {
-                    unsent_mask & pf_bit
-                } else {
-                    0
-                };
+                let final_held_j7 = if pf_refresh.is_some() { unsent_mask & pf_bit } else { 0 };
                 let wake = Self::enable_pending_wake(
                     after,
                     wake,
@@ -13495,13 +13537,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             Service::Wait { wake } => {
                 j7_prioritize = (unsent_mask & pf_bit) != 0;
                 let after = self.now();
-                let final_held_j7 = if pf_refresh.is_some()
-                    && pf_joint.is_some_and(|j| !self.pf_enable_feedback_fresh(j))
-                {
-                    unsent_mask & pf_bit
-                } else {
-                    0
-                };
+                let final_held_j7 = if pf_refresh.is_some() { unsent_mask & pf_bit } else { 0 };
                 let wake = Self::enable_pending_wake(
                     after,
                     wake,
