@@ -2014,7 +2014,7 @@ async fn spawn_disarmed_idle_50hz_rig(
             m.v = 0.0;
             m.enabled = false;
         }
-        configure_bus(s, &rest_pos);
+        configure_bus(s, rest_pos);
         // Single initial feedback snapshot at boot, no unsolicited feeder afterward.
         s.push_all_feedback();
     });
