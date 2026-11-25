@@ -9005,12 +9005,12 @@ fn control_thread_main_inner(
         }
         core.cached_driver_pos_limits = cached_pos;
         let staged_motion_cfg = Arc::new(
-            super::requests::motion::MotionConfigSnapshot::from_supervisor(&core),
+            super::requests::motion::MotionConfigSnapshot::from_supervisor(core),
         );
         core.set_boot_id(cfg.boot);
         core.attach_stop_requests(stop_requests_init);
         core.attach_closed_bitset(closed_bitset_init);
-        let staged_prep_env = Arc::new(super::requests::actions::ActionPrepEnv::from_inner(&core));
+        let staged_prep_env = Arc::new(super::requests::actions::ActionPrepEnv::from_inner(core));
         core.rt_executor_owned = true;
         core.before_publish_hook = hooks.before_publish.clone();
         core.safety.set_off_thread_reclaim(true);
@@ -9314,7 +9314,7 @@ fn control_thread_main_inner(
     let mut publish_gen = initial_generation;
     let mut panicked = false;
     {
-        let mut core = core_slot.as_deref_mut().expect("core owned during control loop");
+        let core = core_slot.as_deref_mut().expect("core owned during control loop");
         let safe_hold_bufs = safe_hold_bufs_slot
             .as_mut()
             .expect("safe_hold_bufs preallocated before control loop");
@@ -9467,9 +9467,9 @@ fn control_thread_main_inner(
                                 core.core.hub().wake();
                             }
                         }
-                        state.flush_pending_maint_reply(&core);
-                        state.emit_estop_ack_if_advanced(&mut core);
-                        state.drain_retired_states(&mut core, now_inst());
+                        state.flush_pending_maint_reply(core);
+                        state.emit_estop_ack_if_advanced(core);
+                        state.drain_retired_states(core, now_inst());
                         core.flush_torque_shadow();
                         if captured_any
                             || engine.take_urgent_replies_flushed()
@@ -9503,7 +9503,7 @@ fn control_thread_main_inner(
                                 }
                             }
                             Err(rtrb::PushError::Full(job)) => {
-                                state.reject_saturated_persist_job(&mut core, job, injected_job_probe.take());
+                                state.reject_saturated_persist_job(core, job, injected_job_probe.take());
                                 let (_, captured_any) = core.capture_edge_terminals(core.now_s(), None);
                                 if captured_any {
                                     hub.wake();
@@ -9546,9 +9546,9 @@ fn control_thread_main_inner(
                     }
                     // Deliver the pre-commit maintenance reply strictly AFTER Step 6 publication, then
                     // drain any E-stop acks / retired states produced during Steps 3-7.
-                    state.flush_pending_maint_reply(&core);
-                    state.emit_estop_ack_if_advanced(&mut core);
-                    state.drain_retired_states(&mut core, now_inst());
+                    state.flush_pending_maint_reply(core);
+                    state.emit_estop_ack_if_advanced(core);
+                    state.drain_retired_states(core, now_inst());
                     let control_hz = core.config.control_frequency_hz;
                     let done = now_inst();
                     let alloc_t0 = now_inst();
@@ -9690,8 +9690,8 @@ fn control_thread_main_inner(
                                 std::hint::black_box(&v);
                                 drop(v);
                             }
-                            state.emit_estop_ack_if_advanced(&mut core);
-                            state.drain_retired_states(&mut core, now_inst());
+                            state.emit_estop_ack_if_advanced(core);
+                            state.drain_retired_states(core, now_inst());
                             core.flush_torque_shadow();
                             let _wake_tail_local =
                                 state.run_tail_alloc_probe(&state.hooks.inject_wake_tail_once);
@@ -9819,7 +9819,7 @@ fn control_thread_main_inner(
             tracing::error!("RT executor thread panicked during release; transitioning to SAFE-HOLD / teardown");
             break;
         } else {
-            safe_hold_bufs.mirror_from_core(&core);
+            safe_hold_bufs.mirror_from_core(core);
         }
     }
 
@@ -9842,7 +9842,7 @@ fn control_thread_main_inner(
             "STOPPED"
         });
         state.drain_maintenance_stopped();
-        state.drain_persistence_stopped(&core);
+        state.drain_persistence_stopped(core);
         if !panicked {
             if !core.pending_estop_acks.is_empty()
                 || engine.has_applied_urgent_stop_pending()
@@ -9855,14 +9855,14 @@ fn control_thread_main_inner(
             engine.drain_urgent_stops_stopped(true);
             engine.drain_conn_lifecycle_stopped(true);
             let _ = engine.flush_servo_closes(&mut *core);
-            state.emit_estop_ack_if_advanced(&mut core);
+            state.emit_estop_ack_if_advanced(core);
         } else {
             engine.drain_urgent_stops_stopped(false);
             engine.drain_conn_lifecycle_stopped(false);
-            state.retire_unpublished_estop_acks(&mut core);
+            state.retire_unpublished_estop_acks(core);
         }
-        state.drain_estop_and_retired_stopped(&mut core, now_inst());
-        state.flush_pending_hold_error_for_shutdown(&mut core);
+        state.drain_estop_and_retired_stopped(core, now_inst());
+        state.flush_pending_hold_error_for_shutdown(core);
         core.flush_torque_shadow();
     }));
     if let Err(err) = drain_res {
