@@ -1533,10 +1533,13 @@ pub struct PathTrajectory {
     pub stalled_for: f64,
     pub settle: Option<Settle>,
     index: usize,
+    /// When set, keeps this joint (J7 gripper) strictly at `ctx.commanded[g]` with zero velocity
+    /// on every tick so arm-only adaptive children can never command J7 motion.
+    hold_j7_idx: Option<usize>,
 }
 
 impl PathTrajectory {
-    pub fn new(path: JointPath) -> Self { Self { source: PathSource::Owned(path), elapsed: 0.0, stalled_for: 0.0, settle: None, index: 0 } }
+    pub fn new(path: JointPath) -> Self { Self { source: PathSource::Owned(path), elapsed: 0.0, stalled_for: 0.0, settle: None, index: 0, hold_j7_idx: None } }
 
     /// Borrows a prepared Cartesian path directly from an immutable pinned plan slot
     /// without copying sample or parameter vectors.
@@ -1553,7 +1556,14 @@ impl PathTrajectory {
             stalled_for: 0.0,
             settle: None,
             index: 0,
+            hold_j7_idx: None,
         }
+    }
+
+    /// Enforce owner-side J7 hold invariant on an arm-only trajectory (0 alloc).
+    pub fn with_hold_j7(mut self, gripper_idx: Option<usize>) -> Self {
+        self.hold_j7_idx = gripper_idx;
+        self
     }
 
     /// True when samples and path parameters are borrowed directly from a pinned plan slot.
@@ -1593,6 +1603,9 @@ impl PathTrajectory {
                 None => StepStatus::Running,
             };
             refill(&mut positions, self.source.last_slice(dof));
+            if let Some(g) = self.hold_j7_idx.filter(|&g| g < dof) {
+                positions[g] = ctx.commanded[g];
+            }
             zeros(&mut velocities, dof);
             return StepOut { positions, velocities, status, progress: 1.0, clear_gripper_stall: false };
         }
@@ -1623,15 +1636,27 @@ impl PathTrajectory {
         self.elapsed = (self.elapsed + ctx.dt * rate * ctx.time_scale).min(duration);
         let u = self.elapsed / duration;
         let s = u * u * u * (10.0 - 15.0 * u + 6.0 * u * u);
-        let q = self.position_at(s);
+        let mut q = self.position_at(s);
+        if let Some(g) = self.hold_j7_idx.filter(|&g| g < dof && g < 7) {
+            q[g] = ctx.commanded[g];
+        }
         if self.elapsed >= duration {
             self.settle = Some(Settle::default());
             refill(&mut positions, self.source.last_slice(dof));
+            if let Some(g) = self.hold_j7_idx.filter(|&g| g < dof) {
+                positions[g] = ctx.commanded[g];
+            }
             zeros(&mut velocities, dof);
             return StepOut { positions, velocities, status: StepStatus::Running, progress: 1.0, clear_gripper_stall: false };
         }
         velocities.clear();
-        velocities.extend((0..dof).map(|i| ((q[i] - ctx.commanded[i]) as f64 / ctx.dt) as f32));
+        velocities.extend((0..dof).map(|i| {
+            if self.hold_j7_idx == Some(i) {
+                0.0
+            } else {
+                ((q[i] - ctx.commanded[i]) as f64 / ctx.dt) as f32
+            }
+        }));
         refill(&mut positions, &q[..dof]);
         StepOut { positions, velocities, status: StepStatus::Running, progress: u as f32, clear_gripper_stall: false }
     }

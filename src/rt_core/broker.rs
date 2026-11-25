@@ -859,6 +859,7 @@ impl<P> Broker<P> {
                         prepared_boot,
                         check_workspace_revision,
                         calibration_revision,
+                        grasp_setup_revision,
                         gripper_calib_revision,
                         power_budget_revision,
                     } => match self.plans.stage(write) {
@@ -867,6 +868,7 @@ impl<P> Broker<P> {
                             prepared_boot,
                             check_workspace_revision,
                             calibration_revision,
+                            grasp_setup_revision,
                             gripper_calib_revision,
                             power_budget_revision,
                         }),

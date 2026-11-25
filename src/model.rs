@@ -4184,6 +4184,10 @@ pub struct Capabilities {
     /// (false) from older armd.
     #[serde(default)]
     pub grasp_select: bool,
+    /// Live grasp execution with `strategy: "adaptive"` (`grasp_select` phase B): `grasp` on a
+    /// 6-DOF arm. Absent (false) from older armd (phase A was dry-run only).
+    #[serde(default)]
+    pub grasp_select_exec: bool,
     /// Action `/api/v1/action/measure_multiview` (lease, operator session): motion-stereo object
     /// measurement from views around the object (`ActionStatus.measurement`); same value as `grasp`.
     /// Absent (false) from older armd.
@@ -4514,6 +4518,7 @@ impl Capabilities {
             move_path_joint: arm_with_gripper && kin,
             grasp_measure: grasp,
             grasp_select: grasp && config.arm_dof() == 6,
+            grasp_select_exec: grasp && config.arm_dof() == 6,
             measure_multiview: grasp,
             calibration_apply: grasp,
             calibration_kinematics: grasp && config.arm_model.chain().is_none(),

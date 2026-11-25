@@ -1087,12 +1087,17 @@ impl SupervisorInner {
     }
 
     pub(crate) fn install_macro_path_inner(&mut self, proof: &crate::supervisor::AdmittedProof, id: u64, input: &PlanInput, path: JointPath) -> Result<f64, ArmError> {
+        self.install_macro_path_inner_with_j7_lock(proof, id, input, path, false)
+    }
+
+    pub(crate) fn install_macro_path_inner_with_j7_lock(&mut self, proof: &crate::supervisor::AdmittedProof, id: u64, input: &PlanInput, path: JointPath, lock_j7_hold: bool) -> Result<f64, ArmError> {
         let epoch = self.macro_sub_ready(id)?;
         if input.epoch != epoch { return Err(MotionError::PlanStale("epoch changed during the action".into()).into()); }
         self.check_plan_fresh(input)?;
         let duration = self.start_path_motion_at_inner(proof, input.epoch, &path)?;
         if input.power.is_some() { self.note_action_power_scale(id, path.power_scale); }
-        self.active_trajectory = Some(ActiveTrajectory::new(Some(id), Reference::Path(PathTrajectory::new(path))));
+        let hold_j7 = if lock_j7_hold { self.config.gripper_index() } else { None };
+        self.active_trajectory = Some(ActiveTrajectory::new(Some(id), Reference::Path(PathTrajectory::new(path).with_hold_j7(hold_j7))));
         self.set_macro_sub_running(id);
         Ok(duration + 0.5)
     }

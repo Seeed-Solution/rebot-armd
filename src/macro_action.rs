@@ -895,6 +895,7 @@ impl MacroCtx {
                     start: snap.commanded_positions.clone(),
                     input: input.clone(),
                     resolved,
+                    lock_j7_hold: false,
                 },
             ) {
                 Ok(v) => v,
@@ -1321,6 +1322,7 @@ impl MacroCtx {
                     prepared_boot: boot,
                     check_workspace_revision,
                     calibration_revision,
+                    grasp_setup_revision: stamp.grasp_setup_revision,
                     gripper_calib_revision: stamp.gripper_calib_revision,
                     power_budget_revision: stamp.power_budget_revision,
                 },

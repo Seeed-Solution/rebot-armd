@@ -777,9 +777,10 @@ mod runtime {
             path: JointPath,
             approach_seg: Option<(MultiJointQuinticTrajectory, Vec<f32>, Option<f64>)>,
             outcome: Option<&Outcome>,
+            lock_j7_hold: bool,
         ) -> Result<f64, ArmError> {
             let (this, proof) = admitted.consume()?;
-            let d1 = this.install_macro_path_inner(&proof, id, input, path)?;
+            let d1 = this.install_macro_path_inner_with_j7_lock(&proof, id, input, path, lock_j7_hold)?;
             let total = if let Some((seg, target, seg_scale)) = approach_seg {
                 let d2 = seg.duration;
                 if let Some(active) = this.active_trajectory.take() {
