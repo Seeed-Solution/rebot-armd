@@ -410,13 +410,40 @@ async fn legacy_control_release_zero_alloc_across_enable_disable_rangecheck_stop
             "expected Accepted enable: {res:?}"
         );
 
-        // Steady-state rest ticks so K=3 rest window is ready.
+        // Steady-state rest ticks + install heap-backed `servo_ws_min_depths` and verify rearm
+        // does NOT free the heap-backed workspace buffer on the control release (Major 5).
         for _ in 0..4 {
             clock.advance(Duration::from_millis(20));
             let mut inner = sup.inner().write().await;
             let (_, allocs, frees) = counted(|| inner.tick_control(0.02));
             assert_eq!((allocs, frees), (0, 0));
         }
+        {
+            let mut inner = sup.inner().write().await;
+            inner.servo_ws_min_depths = Some((1, armd::kinematics::SlotBuf::Heap(vec![0.1; 300])));
+        }
+        let ep_rearm = sup.inner().read().await.safety.epoch_id();
+        let rearm_task = spawn_torque_ws(&sup, conn, gen, ep_rearm, 11, true);
+        // If rearm went Pending, tick to completion with 0 allocs/frees.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        for _ in 0..4 {
+            clock.advance(Duration::from_millis(20));
+            let mut inner = sup.inner().write().await;
+            let (_, allocs, frees) = counted(|| inner.tick_control(0.02));
+            assert_eq!(
+                (allocs, frees),
+                (0, 0),
+                "already-torqued rearm with heap-backed servo_ws_min_depths allocated/freed ({allocs}, {frees})"
+            );
+            if !inner.torque_transition_pending() {
+                break;
+            }
+        }
+        let res_rearm = rearm_task.await.unwrap().unwrap();
+        assert!(
+            matches!(res_rearm, TorqueWsOutcome::Accepted { is_torqued: true, .. }),
+            "expected Accepted rearm: {res_rearm:?}"
+        );
 
         // Disable while motor 5 is briefly silent, then confirms -> zero alloc on pending & completion.
         bus.with(|s| s.motors[4].silent_disable = true);
@@ -514,8 +541,12 @@ async fn legacy_control_release_zero_alloc_across_enable_disable_rangecheck_stop
         assert!(finished, "expected enable timeout to settle within 30 ticks");
         let res = enable_task.await.unwrap().unwrap();
         assert!(
-            matches!(res, TorqueWsOutcome::Rejected { ref error, .. } if error.code.as_deref() == Some("ENABLE_FAILED")),
-            "expected ENABLE_FAILED rejection: {res:?}"
+            matches!(res, TorqueWsOutcome::Rejected { ref error, .. } if error.code.as_deref() == Some("CLEAR_FAULT_REJECTED")),
+            "expected legacy CLEAR_FAULT_REJECTED wire rejection (with EnableFailed fault latched): {res:?}"
+        );
+        assert!(
+            sup.inner().read().await.safety.has_latched_fault_code(armd::FaultCode::EnableFailed),
+            "EnableFailed fault code must remain latched"
         );
     }
 }

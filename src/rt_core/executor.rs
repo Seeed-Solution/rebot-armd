@@ -6987,6 +6987,7 @@ fn control_thread_main(
                         },
                         waited_for: None,
                         longest_hold: None,
+                        torque_step: None,
                         late: !dt.is_finite() || dt > 2.0 / f64::from(control_hz.max(1)),
                         release_seq: step_num,
                         safety_epoch: core.safety.epoch_id(),

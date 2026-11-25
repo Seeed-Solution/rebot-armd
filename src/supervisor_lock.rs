@@ -301,7 +301,45 @@ impl<T> SupervisorLock<T> {
     #[doc(hidden)]
     pub fn set_hold_history_enabled(&self, enabled: bool) {
         self.holds.history_enabled.store(enabled, Ordering::Release);
-        self.holds.history.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let mut h = self.holds.history.lock().unwrap_or_else(|e| e.into_inner());
+        h.clear();
+        if enabled && h.capacity() < 256 {
+            let need = 256 - h.capacity();
+            h.reserve(need);
+        }
+    }
+
+    /// Record a control-tick write-guard hold into opt-in test history ONLY (never touches
+    /// `HoldLog` / `waited_for`). One Relaxed atomic load when disabled.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_tick_hold_for_history(
+        &self,
+        location: &'static Location<'static>,
+        command: Option<&'static str>,
+        direction: Option<&'static str>,
+        io_timing: Option<HoldIoTiming>,
+        called: Instant,
+        acquired: Instant,
+        released: Instant,
+    ) {
+        if self.holds.history_enabled.load(Ordering::Relaxed) {
+            self.holds
+                .history
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(HoldRecord {
+                    kind: HoldKind::Write,
+                    location,
+                    command,
+                    direction,
+                    action_id: None,
+                    io_timing,
+                    called,
+                    acquired,
+                    released,
+                });
+        }
     }
 
     /// Drain all individual [`HoldRecord`] entries recorded while hold history was enabled.
@@ -345,6 +383,10 @@ pub struct SupReadGuard<'a, T> {
 
 impl<T> Drop for SupReadGuard<'_, T> {
     fn drop(&mut self) {
+        // Release the underlying RwLock guard BEFORE sampling `released` and acquiring
+        // hold-log / history mutexes so lock recording never extends the actual hold duration.
+        // SAFETY: dropped once, here; the field is not used afterwards.
+        unsafe { ManuallyDrop::drop(&mut self.guard) };
         self.holds.record(
             HoldKind::Read,
             self.t.location,
@@ -355,8 +397,6 @@ impl<T> Drop for SupReadGuard<'_, T> {
             self.t.called,
             self.t.acquired,
         );
-        // SAFETY: dropped once, here; the field is not used afterwards.
-        unsafe { ManuallyDrop::drop(&mut self.guard) };
     }
 }
 
@@ -399,6 +439,10 @@ impl<T> SupWriteGuard<'_, T> {
 
 impl<T> Drop for SupWriteGuard<'_, T> {
     fn drop(&mut self) {
+        // Release the underlying RwLock guard BEFORE sampling `released` and acquiring
+        // hold-log / history mutexes so lock recording never extends the actual hold duration.
+        // SAFETY: dropped once, here; the field is not used afterwards.
+        unsafe { ManuallyDrop::drop(&mut self.guard) };
         self.holds.record(
             HoldKind::Write,
             self.t.location,
@@ -409,8 +453,6 @@ impl<T> Drop for SupWriteGuard<'_, T> {
             self.t.called,
             self.t.acquired,
         );
-        // SAFETY: dropped once, here; the field is not used afterwards.
-        unsafe { ManuallyDrop::drop(&mut self.guard) };
     }
 }
 
@@ -457,6 +499,10 @@ impl<T> SupOwnedWriteGuard<T> {
 
 impl<T> Drop for SupOwnedWriteGuard<T> {
     fn drop(&mut self) {
+        // Release the underlying RwLock guard BEFORE sampling `released` and acquiring
+        // hold-log / history mutexes so lock recording never extends the actual hold duration.
+        // SAFETY: dropped once, here; the field is not used afterwards.
+        unsafe { ManuallyDrop::drop(&mut self.guard) };
         self.holds.record(
             HoldKind::Write,
             self.t.location,
@@ -467,8 +513,6 @@ impl<T> Drop for SupOwnedWriteGuard<T> {
             self.t.called,
             self.t.acquired,
         );
-        // SAFETY: dropped once, here; the field is not used afterwards.
-        unsafe { ManuallyDrop::drop(&mut self.guard) };
     }
 }
 

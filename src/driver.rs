@@ -8514,15 +8514,12 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             let l = self.limits[i];
             let configured = [l.p_max, l.v_max, l.t_max];
             let ctrl_mode = replies[0].map(|r| r.as_u32());
-            let reported = match (replies[1], replies[2], replies[3]) {
-                (Some(p), Some(v), Some(t)) => Some([p.as_f32(), v.as_f32(), t.as_f32()]),
-                _ => None,
-            };
-            let status = match reported {
-                None => RangeCheckStatus::Unverified,
-                Some(r) if Self::ranges_match(&r, &configured) => RangeCheckStatus::Passed,
-                Some(_) => RangeCheckStatus::Mismatch,
-            };
+            let (status, reported) = Self::evaluate_range_reading(
+                replies[1].map(|r| r.as_f32()),
+                replies[2].map(|r| r.as_f32()),
+                replies[3].map(|r| r.as_f32()),
+                &configured,
+            );
             self.mit_limits_verified[i] = status == RangeCheckStatus::Passed;
             // E4: Require a causal post-boundary `RID_CTRL_MODE` readback after this daemon start
             // to mark joint `i`'s hold mode verified; silent or mismatched motors stay unverified.
@@ -8582,8 +8579,40 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.range_check.insert(DriverRangeCheck { status, message, joints, duration_ms })
     }
 
+    fn range_value_matches(got: f32, want: f32) -> bool {
+        got.is_finite() && (got - want).abs() <= 0.01 + want.abs() * 1e-3
+    }
+
+    /// Evaluates startup and ticked mapping-range replies with a single shared rule:
+    /// any received out-of-tolerance or non-finite register value is immediately a `Mismatch`
+    /// even when another register reply was missing; only a complete in-tolerance triple is
+    /// `Passed`; partial/missing replies whose received values all match remain `Unverified`.
+    fn evaluate_range_reading(
+        p: Option<f32>,
+        v: Option<f32>,
+        t: Option<f32>,
+        configured: &[f32; 3],
+    ) -> (RangeCheckStatus, Option<[f32; 3]>) {
+        let any_mismatch = p.is_some_and(|g| !Self::range_value_matches(g, configured[0]))
+            || v.is_some_and(|g| !Self::range_value_matches(g, configured[1]))
+            || t.is_some_and(|g| !Self::range_value_matches(g, configured[2]));
+        let reported = match (p, v, t) {
+            (Some(p), Some(v), Some(t)) => Some([p, v, t]),
+            _ => None,
+        };
+        let status = if any_mismatch {
+            RangeCheckStatus::Mismatch
+        } else if reported.is_some() {
+            RangeCheckStatus::Passed
+        } else {
+            RangeCheckStatus::Unverified
+        };
+        (status, reported)
+    }
+
+    #[allow(dead_code)]
     fn ranges_match(got: &[f32; 3], want: &[f32; 3]) -> bool {
-        got.iter().zip(want).all(|(g, w)| g.is_finite() && (g - w).abs() <= 0.01 + w.abs() * 1e-3)
+        got.iter().zip(want).all(|(&g, &w)| Self::range_value_matches(g, w))
     }
 
     /// Mapping range used for each joint.
@@ -10985,15 +11014,12 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let l = self.limits[j];
         let configured = [l.p_max, l.v_max, l.t_max];
         let ctrl_mode = r_mode_any.map(|r| r.as_u32());
-        let reported = match (r_p, r_v, r_t) {
-            (Some(p), Some(v), Some(t)) => Some([p.as_f32(), v.as_f32(), t.as_f32()]),
-            _ => None,
-        };
-        let status = match reported {
-            None => RangeCheckStatus::Unverified,
-            Some(r) if Self::ranges_match(&r, &configured) => RangeCheckStatus::Passed,
-            Some(_) => RangeCheckStatus::Mismatch,
-        };
+        let (status, reported) = Self::evaluate_range_reading(
+            r_p.map(|r| r.as_f32()),
+            r_v.map(|r| r.as_f32()),
+            r_t.map(|r| r.as_f32()),
+            &configured,
+        );
         self.mit_limits_verified[j] = status == RangeCheckStatus::Passed;
         let verified_ctrl = r_mode.map(|r| r.as_u32());
         let verified_mode = verified_ctrl.and_then(Self::mode_from_u32);
@@ -12044,6 +12070,29 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             None
         };
         if !client_park {
+            // Never downgrade or replace an active protective or already-dispatched hardware
+            // disable with a new ordinary DisableRequested.
+            if matches!(kind, DisableKind::DisableRequested { .. }) {
+                let keep_existing = matches!(
+                    self.torque_hs,
+                    Some(
+                        DamiaoTorque::Disable {
+                            kind: DisableKind::DisableProtective { .. },
+                            ..
+                        } | DamiaoTorque::AwaitRestGate {
+                            kind: DisableKind::DisableProtective { .. },
+                            ..
+                        }
+                    )
+                ) || (self.disable_dispatched_mask != 0
+                    && matches!(
+                        self.torque_hs,
+                        Some(DamiaoTorque::Disable { .. } | DamiaoTorque::AwaitRestGate { .. })
+                    ));
+                if keep_existing {
+                    return Ok(TorqueProgress::Pending { wake: self.now() });
+                }
+            }
             self.refresh_capture = None;
             if let Some(hs) = self.torque_hs.take() {
                 if matches!(hs, DamiaoTorque::DrainBeforeEnable(_)) {
@@ -12732,7 +12781,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     }
 
     fn supports_budgeted_disable_await(&self) -> bool {
-        true
+        self.can.supports_nonblocking_rt()
     }
 
     fn begin_control_release(&mut self, release_seq: u64) {

@@ -205,6 +205,17 @@ pub struct HoldIoTiming {
     pub sleep_us: u32,
 }
 
+/// Control-tick torque transition attribution recorded on [`TickSample`] when a tick services a
+/// torque transition step (omitted from JSON when `None`, zero heap allocation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct TorqueStepAttribution {
+    pub command: &'static str,
+    pub direction: &'static str,
+    pub tx_us: u32,
+    pub rx_us: u32,
+    pub sleep_us: u32,
+}
+
 #[derive(Clone, Copy, Default)]
 struct HoldIoAccum {
     active: bool,
@@ -647,6 +658,10 @@ pub struct TickSample {
     pub waited_for: Option<Holder>,
     /// The longest other hold since the previous tick (may differ from `waited_for`).
     pub longest_hold: Option<Holder>,
+    /// Torque transition step attribution recorded when this control tick serviced a torque
+    /// handshake (`None` on ordinary ticks; omitted from JSON when absent).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub torque_step: Option<TorqueStepAttribution>,
     #[serde(skip)]
     pub late: bool,
     /// Monotonic RT executor release sequence (`1`-based; `0` outside RT executor).
@@ -1334,6 +1349,14 @@ struct AtomicTickSlot {
     tx_frame_cpu_max_us: AtomicU32,
     waited_for: AtomicHolder,
     longest_hold: AtomicHolder,
+    has_torque_step: AtomicBool,
+    torque_step_cmd_ptr: AtomicPtr<u8>,
+    torque_step_cmd_len: AtomicUsize,
+    torque_step_dir_ptr: AtomicPtr<u8>,
+    torque_step_dir_len: AtomicUsize,
+    torque_step_tx_us: AtomicU32,
+    torque_step_rx_us: AtomicU32,
+    torque_step_sleep_us: AtomicU32,
     late: AtomicBool,
     release_seq: AtomicU64,
     safety_epoch: AtomicU64,
@@ -1360,6 +1383,14 @@ struct RawTickSlot {
     usage: ThreadUsage,
     waited_for: RawHolder,
     longest_hold: RawHolder,
+    has_torque_step: bool,
+    torque_step_cmd_ptr: *const u8,
+    torque_step_cmd_len: usize,
+    torque_step_dir_ptr: *const u8,
+    torque_step_dir_len: usize,
+    torque_step_tx_us: u32,
+    torque_step_rx_us: u32,
+    torque_step_sleep_us: u32,
     late: bool,
     release_seq: u64,
     safety_epoch: u64,
@@ -1414,6 +1445,28 @@ impl AtomicTickSlot {
         self.tx_frame_cpu_max_us.store(s.usage.tx_frame_cpu_max_us, Ordering::Relaxed);
         self.waited_for.store_relaxed(s.waited_for);
         self.longest_hold.store_relaxed(s.longest_hold);
+        match s.torque_step {
+            Some(ts) => {
+                self.has_torque_step.store(true, Ordering::Relaxed);
+                self.torque_step_cmd_ptr.store(ts.command.as_ptr() as *mut u8, Ordering::Relaxed);
+                self.torque_step_cmd_len.store(ts.command.len(), Ordering::Relaxed);
+                self.torque_step_dir_ptr.store(ts.direction.as_ptr() as *mut u8, Ordering::Relaxed);
+                self.torque_step_dir_len.store(ts.direction.len(), Ordering::Relaxed);
+                self.torque_step_tx_us.store(ts.tx_us, Ordering::Relaxed);
+                self.torque_step_rx_us.store(ts.rx_us, Ordering::Relaxed);
+                self.torque_step_sleep_us.store(ts.sleep_us, Ordering::Relaxed);
+            }
+            None => {
+                self.has_torque_step.store(false, Ordering::Relaxed);
+                self.torque_step_cmd_ptr.store(std::ptr::null_mut(), Ordering::Relaxed);
+                self.torque_step_cmd_len.store(0, Ordering::Relaxed);
+                self.torque_step_dir_ptr.store(std::ptr::null_mut(), Ordering::Relaxed);
+                self.torque_step_dir_len.store(0, Ordering::Relaxed);
+                self.torque_step_tx_us.store(0, Ordering::Relaxed);
+                self.torque_step_rx_us.store(0, Ordering::Relaxed);
+                self.torque_step_sleep_us.store(0, Ordering::Relaxed);
+            }
+        }
         self.late.store(s.late, Ordering::Relaxed);
         self.release_seq.store(s.release_seq, Ordering::Relaxed);
         self.safety_epoch.store(s.safety_epoch, Ordering::Relaxed);
@@ -1472,6 +1525,14 @@ impl AtomicTickSlot {
             },
             waited_for: self.waited_for.load_raw_relaxed(),
             longest_hold: self.longest_hold.load_raw_relaxed(),
+            has_torque_step: self.has_torque_step.load(Ordering::Relaxed),
+            torque_step_cmd_ptr: self.torque_step_cmd_ptr.load(Ordering::Relaxed) as *const u8,
+            torque_step_cmd_len: self.torque_step_cmd_len.load(Ordering::Relaxed),
+            torque_step_dir_ptr: self.torque_step_dir_ptr.load(Ordering::Relaxed) as *const u8,
+            torque_step_dir_len: self.torque_step_dir_len.load(Ordering::Relaxed),
+            torque_step_tx_us: self.torque_step_tx_us.load(Ordering::Relaxed),
+            torque_step_rx_us: self.torque_step_rx_us.load(Ordering::Relaxed),
+            torque_step_sleep_us: self.torque_step_sleep_us.load(Ordering::Relaxed),
             late: self.late.load(Ordering::Relaxed),
             release_seq: self.release_seq.load(Ordering::Relaxed),
             safety_epoch: self.safety_epoch.load(Ordering::Relaxed),
@@ -1506,6 +1567,28 @@ impl RawTickSlot {
                 waited_for: unsafe { self.waited_for.into_holder_validated() },
                 // SAFETY: seqlock read validated by caller.
                 longest_hold: unsafe { self.longest_hold.into_holder_validated() },
+                torque_step: if self.has_torque_step
+                    && !self.torque_step_cmd_ptr.is_null()
+                    && !self.torque_step_dir_ptr.is_null()
+                {
+                    // SAFETY: pointers and lengths originate from `'static str` written in `store_relaxed`,
+                    // validated by the enclosing seqlock Acquire fence.
+                    let cmd_bytes: &'static [u8] = unsafe {
+                        std::slice::from_raw_parts(self.torque_step_cmd_ptr, self.torque_step_cmd_len)
+                    };
+                    let dir_bytes: &'static [u8] = unsafe {
+                        std::slice::from_raw_parts(self.torque_step_dir_ptr, self.torque_step_dir_len)
+                    };
+                    Some(TorqueStepAttribution {
+                        command: unsafe { std::str::from_utf8_unchecked(cmd_bytes) },
+                        direction: unsafe { std::str::from_utf8_unchecked(dir_bytes) },
+                        tx_us: self.torque_step_tx_us,
+                        rx_us: self.torque_step_rx_us,
+                        sleep_us: self.torque_step_sleep_us,
+                    })
+                } else {
+                    None
+                },
                 late: self.late,
                 release_seq: self.release_seq,
                 safety_epoch: self.safety_epoch,
@@ -2247,6 +2330,7 @@ mod tests {
                 },
                 waited_for: (i == TICK_WINDOW as u32 + 100).then_some(read_holder),
                 longest_hold: (i == TICK_WINDOW as u32 + 100).then_some(write_holder),
+                torque_step: None,
                 late: i % 9 == 0,
                 release_seq: u64::from(i),
                 safety_epoch: u64::from(i % 5),
@@ -2453,6 +2537,7 @@ mod tests {
                 },
                 waited_for,
                 longest_hold,
+                torque_step: None,
                 late: k.is_multiple_of(7),
                 release_seq: k,
                 safety_epoch: k * 3 + 1,

@@ -36,6 +36,7 @@ struct WallMotor {
     pmax_override: Option<f32>,
     silent: bool,
     drop_reg_read: bool,
+    drop_vmax_read: bool,
     drop_enable: bool,
     enable_reply_delay: Duration,
     disable_reply_delay: Duration,
@@ -52,6 +53,7 @@ impl WallMotor {
             pmax_override: None,
             silent: false,
             drop_reg_read: false,
+            drop_vmax_read: false,
             drop_enable: false,
             enable_reply_delay: Duration::ZERO,
             disable_reply_delay: Duration::ZERO,
@@ -84,6 +86,11 @@ struct WallBusState {
     rx: VecDeque<(CanFrame, Option<Instant>)>,
     delayed: Vec<(Instant, CanFrame)>,
     tx_log: Vec<CanFrame>,
+    /// When true, `receive_timestamped` continuously supplies extra background feedback frames
+    /// to test bounded RX pass discipline under sustained CAN RX backlog.
+    sustained_rx_backlog: bool,
+    /// When true, `CMD_DISABLE` transmits fail with `TransportError::WouldBlock`.
+    fail_disable_tx: bool,
 }
 
 impl WallBusState {
@@ -124,6 +131,8 @@ impl WallClockDelayedBus {
             rx: VecDeque::with_capacity(256),
             delayed: Vec::new(),
             tx_log: Vec::new(),
+            sustained_rx_backlog: false,
+            fail_disable_tx: false,
         })))
     }
 
@@ -186,6 +195,9 @@ impl CanTransport for WallClockDelayedBus {
                     if s.motors[k].drop_reg_read {
                         return Ok(());
                     }
+                    if s.motors[k].drop_vmax_read && rid == damiao::RID_VMAX {
+                        return Ok(());
+                    }
                     let m = &s.motors[k];
                     let val: Option<[u8; 4]> = match rid {
                         damiao::RID_CTRL_MODE => Some(damiao::CTRL_MODE_POS_VEL.to_le_bytes()),
@@ -240,6 +252,9 @@ impl CanTransport for WallClockDelayedBus {
                 return Ok(());
             }
             if frame.data == damiao::CMD_DISABLE {
+                if s.fail_disable_tx {
+                    return Err(TransportError::WouldBlock);
+                }
                 s.motors[k].enabled = false;
                 let delay = s.motors[k].disable_reply_delay;
                 if !delay.is_zero() {
@@ -289,7 +304,15 @@ impl CanTransport for WallClockDelayedBus {
         let now = Instant::now();
         let mut s = self.0.lock().unwrap();
         s.drain_matured(now);
-        s.rx.pop_front().ok_or(TransportError::WouldBlock)
+        if let Some(frame) = s.rx.pop_front() {
+            return Ok(frame);
+        }
+        if s.sustained_rx_backlog {
+            // Simulate a continuously readable CAN RX queue (always another frame ready).
+            let fb = s.motors[0].feedback_frame();
+            return Ok((fb, Some(now)));
+        }
+        Err(TransportError::WouldBlock)
     }
 
     fn flush(&mut self) -> Result<(), TransportError> {
@@ -336,11 +359,12 @@ async fn spawn_legacy_rig(
         let stop_tick = stop_flag.clone();
         let ticks_bg = ticks.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(10));
+            // Production 50 Hz (20 ms) control cadence.
+            let mut interval = tokio::time::interval(Duration::from_millis(20));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             while !stop_tick.load(Ordering::Relaxed) {
                 interval.tick().await;
-                sup_tick.control_tick(0.01).await;
+                sup_tick.control_tick(0.02).await;
                 ticks_bg.fetch_add(1, Ordering::Release);
             }
         });
@@ -414,23 +438,41 @@ async fn lock_proof_legacy_ws_enable_withheld_35ms_bounds_every_guard_hold_under
     let samples = sup.tick_samples();
     let window_samples = &samples[samples_before.min(samples.len())..];
     let max_tick_wait_us = window_samples.iter().map(|s| s.wait_us).max().unwrap_or(0);
-    let torque_sample_holder = window_samples.iter().find_map(|s| {
-        s.longest_hold
-            .as_ref()
-            .filter(|h| h.command == Some("/api/v1/torque"))
-            .or_else(|| {
-                s.waited_for
-                    .as_ref()
-                    .filter(|h| h.command == Some("/api/v1/torque"))
-            })
-    });
-    if let Some(holder) = torque_sample_holder {
-        let v = serde_json::to_value(holder).unwrap();
-        assert_eq!(v["direction"], "on", "Holder JSON must serialize direction: {v}");
-        assert!(v.get("tx_us").is_some(), "Holder JSON must include tx_us: {v}");
-        assert!(v.get("rx_us").is_some(), "Holder JSON must include rx_us: {v}");
-        assert_eq!(v["sleep_us"], 0, "Holder JSON must report sleep_us=0: {v}");
-    }
+    // Unconditionally assert BOTH:
+    // (a) Holder JSON from WS admission guard, AND
+    // (b) Live control-tick `torque_step` attribution JSON on ticks that serviced the handshake.
+    let torque_sample_holder = window_samples
+        .iter()
+        .find_map(|s| {
+            s.longest_hold
+                .as_ref()
+                .filter(|h| h.command == Some("/api/v1/torque"))
+                .or_else(|| {
+                    s.waited_for
+                        .as_ref()
+                        .filter(|h| h.command == Some("/api/v1/torque"))
+                })
+        })
+        .expect("expected /api/v1/torque Holder attribution in tick_samples window");
+    let v = serde_json::to_value(torque_sample_holder).unwrap();
+    assert_eq!(v["direction"], "on", "Holder JSON must serialize direction: {v}");
+    assert!(v.get("tx_us").is_some(), "Holder JSON must include tx_us: {v}");
+    assert!(v.get("rx_us").is_some(), "Holder JSON must include rx_us: {v}");
+    assert_eq!(v["sleep_us"], 0, "Holder JSON must report sleep_us=0: {v}");
+
+    let tick_torque_step = window_samples
+        .iter()
+        .find_map(|s| s.torque_step)
+        .expect("expected live control-tick torque_step attribution during 35 ms enable");
+    let ts_json = serde_json::to_value(tick_torque_step).unwrap();
+    assert_eq!(ts_json["command"], "/api/v1/torque", "{ts_json}");
+    assert_eq!(ts_json["direction"], "on", "{ts_json}");
+    assert_eq!(ts_json["sleep_us"], 0, "{ts_json}");
+    assert!(
+        torque_holds.len() >= 2,
+        "hold history must record both WS admission and live control-tick torque holds (got {})",
+        torque_holds.len()
+    );
 
     let tq_max = torque_holds.iter().map(|h| h.hold()).max().unwrap();
     let tq_io = torque_holds[0].io_timing.unwrap();
@@ -894,11 +936,441 @@ async fn legacy_ws_unverified_range_check_recovers_and_mismatch_refuses_with_zer
         stop_flag.store(true, Ordering::Relaxed);
 
         assert_eq!(reply["type"], "command_reject", "{reply}");
-        assert_eq!(reply["code"], "ENABLE_FAILED", "{reply}");
+        assert_eq!(
+            reply["code"], "CLEAR_FAULT_REJECTED",
+            "legacy WS wire code for hardware enable failure must remain CLEAR_FAULT_REJECTED: {reply}"
+        );
+        assert_eq!(reply["safety_state"], "Fault", "{reply}");
+        assert!(
+            sup.inner()
+                .read()
+                .await
+                .safety
+                .has_latched_fault_code(FaultCode::EnableFailed),
+            "EnableFailed fault code must be latched on range mismatch"
+        );
         assert_eq!(
             bus.enable_tx_count(),
             0,
             "mismatched range check must refuse with ZERO CMD_ENABLE frames"
         );
     }
+
+    // Subcase C (Major 8): partial range reply where PMAX mismatches AND VMAX is withheld ->
+    // MUST still reject as Mismatch with ZERO CMD_ENABLE frames (never fall through as Unverified).
+    {
+        let bus = WallClockDelayedBus::new();
+        bus.with(|s| {
+            s.motors[1].silent = true;
+            s.push_all_feedback();
+        });
+        let mut dm = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(dm_limits())
+            .unwrap();
+        let _ = dm.read_joint_states();
+        assert_eq!(dm.check_mapping_ranges().status, RangeCheckStatus::Unverified);
+
+        let sup = Arc::new(
+            ArmSupervisor::new(ArmConfig {
+                lease_timeout_ms: 5_000,
+                ..ArmConfig::rebot_dm()
+            })
+            .with_driver(Box::new(dm)),
+        );
+        let router = create_router(sup.clone(), OperatorAuth::disabled());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let sup_tick = sup.clone();
+        let stop_tick = stop_flag.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(20));
+            while !stop_tick.load(Ordering::Relaxed) {
+                interval.tick().await;
+                sup_tick.control_tick(0.02).await;
+            }
+        });
+
+        let (mut ws, gen) = common::controller(addr).await;
+        bus.with(|s| {
+            s.motors[1].silent = false;
+            s.motors[1].pmax_override = Some(s.motors[1].limits.p_max * 2.0 + 3.0);
+            s.motors[1].drop_vmax_read = true;
+            s.push_all_feedback();
+            s.tx_log.clear();
+        });
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let ep = sup.get_observation().await.epoch_id;
+
+        let reply = common::rpc(&mut ws, gen, ep, "/api/v1/torque", json!({"enable": true})).await;
+        stop_flag.store(true, Ordering::Relaxed);
+
+        assert_eq!(reply["type"], "command_reject", "{reply}");
+        assert_eq!(reply["code"], "CLEAR_FAULT_REJECTED", "{reply}");
+        assert_eq!(
+            bus.enable_tx_count(),
+            0,
+            "partial range reply with mismatched PMAX + missing VMAX must refuse with ZERO CMD_ENABLE frames"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn legacy_ws_sustained_rx_backlog_at_50hz_stays_under_2ms() {
+    let bus = WallClockDelayedBus::new();
+    let (addr, sup, stop_flag, ticks) = spawn_legacy_rig(bus.clone(), true).await;
+    let (mut ws, gen) = common::controller(addr).await;
+
+    let t0 = ticks.load(Ordering::Acquire);
+    while ticks.load(Ordering::Acquire) < t0 + 2 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    bus.with(|s| {
+        s.motors[2].enable_reply_delay = Duration::from_millis(35);
+        s.sustained_rx_backlog = true;
+    });
+    let ep = sup.get_observation().await.epoch_id;
+    sup.inner().set_hold_history_enabled(true);
+    let reply = common::rpc(&mut ws, gen, ep, "/api/v1/torque", json!({"enable": true})).await;
+    let holds = sup.inner().take_hold_history();
+    sup.inner().set_hold_history_enabled(false);
+    stop_flag.store(true, Ordering::Relaxed);
+
+    // Under continuous RX flood, transition may succeed or fail cleanly (RxDrainTimeout),
+    // but EVERY SupervisorLock guard hold (WS + 50 Hz ticks) must strictly remain <= 2 ms.
+    assert!(
+        reply["type"] == "command_ack" || reply["type"] == "command_reject",
+        "{reply}"
+    );
+    let max_hold = holds.iter().map(|h| h.hold()).max().unwrap_or(Duration::ZERO);
+    assert!(
+        max_hold <= Duration::from_millis(2),
+        "sustained RX backlog at 50 Hz must keep EVERY guard hold <= 2 ms (got {max_hold:?})"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn legacy_ws_stalled_ticker_real_deadline_cleans_up_enable_and_detaches_dispatched_disable() {
+    use armd::auth::OperatorGrant;
+    use armd::rt_core::requests::lease::{OwnerAuthPolicy, TorqueWsOutcome};
+
+    // 1. Real WS deadline with paused ticker on Damiao enable: waiter gets DEADLINE_EXPIRED,
+    //    driver's `torque_hs` is actually cancelled (not pending), and measured hold write succeeds.
+    {
+        let bus = WallClockDelayedBus::new();
+        bus.with(|s| s.push_all_feedback());
+        let mut dm = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(dm_limits())
+            .unwrap();
+        dm.read_joint_states().unwrap();
+        dm.check_mapping_ranges();
+        let sup = Arc::new(
+            ArmSupervisor::new(ArmConfig {
+                lease_timeout_ms: 5_000,
+                ..ArmConfig::rebot_dm()
+            })
+            .with_driver(Box::new(dm)),
+        );
+        let conn = sup.try_claim_ws_slot().unwrap();
+        sup.register_ws_connection_for_slot(conn.id()).await.unwrap();
+        let gen = {
+            let mut inner = sup.inner().write().await;
+            let gen = inner
+                .acquire_lease(&format!("connection:{}", conn.id()))
+                .unwrap();
+            inner.tick_control(0.02);
+            gen
+        };
+        // Withhold motor 3 longer than our 90 ms WS deadline, and keep ticker paused.
+        bus.with(|s| s.motors[2].enable_reply_delay = Duration::from_millis(400));
+        let ep = sup.inner().read().await.safety.epoch_id();
+        let stamp = sup.inner().read().await.current_admission_stamp();
+        let out = sup
+            .torque_ws_with_deadline(
+                conn,
+                gen,
+                Some(ep),
+                true,
+                201,
+                Ok(true),
+                OwnerAuthPolicy::None,
+                OperatorGrant::unenforced(),
+                stamp,
+                Duration::from_millis(90),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(out, TorqueWsOutcome::Rejected { ref error, .. } if error.code.as_deref() == Some("DEADLINE_EXPIRED")),
+            "expected DEADLINE_EXPIRED on stalled ticker enable: {out:?}"
+        );
+        let mut inner = sup.inner().write().await;
+        assert!(!inner.torque_transition_pending(), "enable transition must be cleaned up");
+        let drv_pending = inner
+            .driver
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .torque_transition_pending();
+        assert!(
+            !drv_pending,
+            "Damiao driver torque_hs must be cancelled on deadline so measured hold writes succeed"
+        );
+        // Verify subsequent control tick runs measured hold cleanly (no TorqueTransitionPending).
+        inner.tick_control(0.02);
+    }
+
+    // 2. Real WS deadline during partially dispatched disable: waiter gets DEADLINE_EXPIRED,
+    //    disable stays Detached (NOT aborted), and resuming ticks finishes disabling hardware!
+    {
+        let bus = WallClockDelayedBus::new();
+        bus.with(|s| s.push_all_feedback());
+        let mut dm = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(dm_limits())
+            .unwrap();
+        dm.read_joint_states().unwrap();
+        dm.check_mapping_ranges();
+        let sup = Arc::new(
+            ArmSupervisor::new(ArmConfig {
+                lease_timeout_ms: 5_000,
+                ..ArmConfig::rebot_dm()
+            })
+            .with_driver(Box::new(dm)),
+        );
+        let conn = sup.try_claim_ws_slot().unwrap();
+        sup.register_ws_connection_for_slot(conn.id()).await.unwrap();
+        let gen = {
+            let mut inner = sup.inner().write().await;
+            let gen = inner
+                .acquire_lease(&format!("connection:{}", conn.id()))
+                .unwrap();
+            let stamp = inner.current_admission_stamp();
+            inner
+                .check_admission(stamp)
+                .and_then(armd::SupervisorInner::enable_torque)
+                .unwrap();
+            for _ in 0..4 {
+                inner.tick_control(0.02);
+            }
+            gen
+        };
+        // Motor 5 delays disable confirmation by 220 ms; WS deadline is 90 ms.
+        bus.with(|s| s.motors[4].disable_reply_delay = Duration::from_millis(220));
+        let ep = sup.inner().read().await.safety.epoch_id();
+        let stamp = sup.inner().read().await.current_admission_stamp();
+        let sup_bg = sup.clone();
+        // Run four ticks right after disable starts so RX drains, K=3 rest-pose window confirms,
+        // and CMD_DISABLE frames are dispatched to motors 1..7, then pause the ticker so the
+        // 120 ms deadline fires while motor 5's confirmation is still withheld.
+        let tick_helper = tokio::spawn(async move {
+            for _ in 0..4 {
+                tokio::time::sleep(Duration::from_millis(12)).await;
+                sup_bg.control_tick(0.02).await;
+            }
+        });
+        let out = sup
+            .torque_ws_with_deadline(
+                conn,
+                gen,
+                Some(ep),
+                true,
+                202,
+                Ok(false),
+                OwnerAuthPolicy::None,
+                OperatorGrant::unenforced(),
+                stamp,
+                Duration::from_millis(120),
+            )
+            .await
+            .unwrap();
+        let _ = tick_helper.await;
+        assert!(
+            matches!(out, TorqueWsOutcome::Rejected { ref error, .. } if error.code.as_deref() == Some("DEADLINE_EXPIRED")),
+            "expected DEADLINE_EXPIRED on delayed dispatched disable: {out:?}"
+        );
+        assert!(
+            sup.inner().read().await.torque_transition_pending(),
+            "dispatched disable must remain active as Detached after waiter timeout"
+        );
+        // Wait for motor 5's delayed reply to mature, then resume ticks and assert full disable!
+        tokio::time::sleep(Duration::from_millis(180)).await;
+        for _ in 0..10 {
+            sup.control_tick(0.02).await;
+            if !sup.inner().read().await.torque_transition_pending() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let inner = sup.inner().read().await;
+        assert!(
+            !inner.torque_transition_pending(),
+            "detached disable must complete once control ticks resume"
+        );
+        assert!(!inner.is_torqued, "arm must reach torqued=false after detached disable completes");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn legacy_ws_lease_expiry_during_enable_poll_is_fenced() {
+    let bus = WallClockDelayedBus::new();
+    bus.with(|s| s.push_all_feedback());
+    let mut dm = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(dm_limits())
+        .unwrap();
+    dm.read_joint_states().unwrap();
+    dm.check_mapping_ranges();
+    // Short 70 ms lease timeout; motor 3 withholds enable reply for 140 ms so lease expires mid-enable.
+    let sup = Arc::new(
+        ArmSupervisor::new(ArmConfig {
+            lease_timeout_ms: 70,
+            ..ArmConfig::rebot_dm()
+        })
+        .with_driver(Box::new(dm)),
+    );
+    sup.control_tick(0.02).await;
+    let router = create_router(sup.clone(), OperatorAuth::disabled());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let sup_tick = sup.clone();
+    let stop_tick = stop_flag.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(20));
+        while !stop_tick.load(Ordering::Relaxed) {
+            interval.tick().await;
+            sup_tick.control_tick(0.02).await;
+        }
+    });
+
+    let (mut ws, gen) = common::controller(addr).await;
+    bus.with(|s| s.motors[2].enable_reply_delay = Duration::from_millis(140));
+    let ep = sup.get_observation().await.epoch_id;
+    let reply = common::rpc(&mut ws, gen, ep, "/api/v1/torque", json!({"enable": true})).await;
+    stop_flag.store(true, Ordering::Relaxed);
+
+    assert_eq!(
+        reply["type"], "command_reject",
+        "lease expiring mid-enable must NOT arm: {reply}"
+    );
+    assert!(
+        reply["code"] == "LEASE_LOST" || reply["code"] == "NO_LEASE",
+        "expected LEASE_LOST rejection when lease expired during enable: {reply}"
+    );
+    assert!(
+        !sup.inner().read().await.safety.state().is_operational(),
+        "must not enter Armed after lease expired mid-enable"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn legacy_ws_contended_stop_drains_cancelling_phase_and_allows_measured_hold() {
+    let bus = WallClockDelayedBus::new();
+    let (addr, sup, stop_flag, _) = spawn_legacy_rig(bus.clone(), false).await;
+    let (mut ws, gen) = common::controller(addr).await;
+    // Motors 1..6 enable immediately; motor 7 drops enable so handshake stays pending.
+    bus.with(|s| s.motors[6].drop_enable = true);
+    let ep = sup.get_observation().await.epoch_id;
+    common::send(
+        &mut ws,
+        json!({"type": "command", "request_id": 301, "generation": gen, "epoch_id": ep, "path": "/api/v1/torque", "body": {"enable": true}}),
+    )
+    .await;
+
+    let dl = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < dl {
+        if sup.inner().read().await.torque_transition_pending() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    assert!(sup.inner().read().await.torque_transition_pending());
+
+    // Trigger Stop WHILE the driver mutex is contended -> must settle STOPPED immediately AND
+    // retain `Cancelling` phase instead of dropping the reducer while Damiao still holds torque_hs.
+    let tx_at_stop = {
+        let mut inner = sup.inner().write().await;
+        inner.with_contended_driver_for_test(|s| {
+            s.authorized_stop();
+        });
+        assert!(
+            inner.torque_transition_pending(),
+            "contended Stop must keep Cancelling reducer until drv.abort_enable() runs"
+        );
+        bus.enable_tx_count()
+    };
+    let reply = common::next_of(&mut ws, &["command_ack", "command_reject"]).await;
+    assert_eq!(reply["type"], "command_reject", "{reply}");
+    assert_eq!(reply["code"], "STOPPED", "{reply}");
+
+    // Once contention clears, the next control tick drains Cancelling -> calls abort_enable()
+    // with ZERO enable TX and clears Damiao's torque_hs so measured hold works cleanly.
+    sup.control_tick(0.02).await;
+    let tx_after = bus.enable_tx_count();
+    stop_flag.store(true, Ordering::Relaxed);
+    assert_eq!(tx_after, tx_at_stop, "Cancelling phase must emit ZERO enable TX");
+    let inner = sup.inner().read().await;
+    assert!(!inner.torque_transition_pending(), "Cancelling must clear once driver lock is free");
+    assert!(
+        !inner
+            .driver
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .torque_transition_pending(),
+        "Damiao torque_hs must be cleared so subsequent measured holds are never rejected"
+    );
+    assert!(inner.is_torqued);
+    assert_eq!(inner.enable_lifecycle(), EnableLifecycle::FailedHold);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn legacy_ws_torque_off_cannot_clobber_active_protective_disable() {
+    let bus = WallClockDelayedBus::new();
+    let (addr, sup, stop_flag, _) = spawn_legacy_rig(bus.clone(), false).await;
+    let (mut ws, gen) = common::controller(addr).await;
+
+    // Arm, then trigger a thermal protective disable while disable TX returns WouldBlock so
+    // `active_disable_kind = Some(DisableProtective { Thermal })` and `disable_pending = true`
+    // remain armed without a `torque_transition` (the exact Blocker 3 window).
+    {
+        let mut inner = sup.inner().write().await;
+        let stamp = inner.current_admission_stamp();
+        inner
+            .check_admission(stamp)
+            .and_then(armd::SupervisorInner::enable_torque)
+            .unwrap();
+        for _ in 0..4 {
+            inner.tick_control(0.02);
+        }
+        bus.with(|s| s.fail_disable_tx = true);
+        inner.apply_stop_policy(armd::StopPolicy::ThermalTrip);
+        bus.with(|s| s.fail_disable_tx = false);
+        assert!(
+            inner.disable_pending,
+            "failed ThermalTrip TX must leave protective disable_pending armed"
+        );
+    }
+    let ep = sup.get_observation().await.epoch_id;
+    let reply = common::rpc(&mut ws, gen, ep, "/api/v1/torque", json!({"enable": false})).await;
+    stop_flag.store(true, Ordering::Relaxed);
+
+    assert_eq!(
+        reply["type"], "command_reject",
+        "WS torque-off must not replace active protective disable: {reply}"
+    );
+    // Verify the active protective disable was NOT replaced or cleared.
+    let inner = sup.inner().read().await;
+    assert!(
+        inner.disable_pending,
+        "protective disable work must remain active and unreplaced"
+    );
 }
