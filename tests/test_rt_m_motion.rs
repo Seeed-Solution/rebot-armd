@@ -2693,3 +2693,473 @@ async fn ws_lock_attribution_records_static_command_and_action_id_in_tick_diagno
         assert_eq!(h_json["kind"], "write", "{h_json}");
     }
 }
+
+// ============================================================================
+// 12. Exhaustive <= 2 ms Legacy Lock-Hold Audit Across ALL WS Ordinary Owner Handlers
+// ============================================================================
+
+struct StubDetectionSource;
+
+impl armd::grasp::DetectionSource for StubDetectionSource {
+    fn inference_enabled(&self) -> armd::grasp::BoxFuture<'_, Result<bool, String>> {
+        Box::pin(async { Ok(true) })
+    }
+    fn set_inference(&self, _enabled: bool) -> armd::grasp::BoxFuture<'_, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn next_frame(
+        &self,
+        after: Option<u64>,
+        _wait_ms: u64,
+    ) -> armd::grasp::BoxFuture<'_, Result<Option<armd::grasp::DetectionFrame>, String>> {
+        Box::pin(async move {
+            Ok(Some(armd::grasp::DetectionFrame {
+                frame_id: after.unwrap_or(0) + 1,
+                captured_at: Instant::now(),
+                policy_captured_at: Some(Instant::now()),
+                image_size_px: [640.0, 360.0],
+                detections: Vec::new(),
+                depth: None,
+                model_generation: None,
+            }))
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_ws_ordinary_owner_handlers_lock_hold_under_2ms_with_real_planning() {
+    Box::pin(run_legacy_ws_ordinary_owner_handlers_lock_hold_audit()).await;
+}
+
+async fn reset_test_arm_state(arm: &common::TestArm, sup: &Arc<ArmSupervisor>, q: [f32; 7]) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        sup.stop_motion().await;
+        {
+            let mut s = arm.0.lock().unwrap();
+            s.q = q;
+            s.mit = false;
+        }
+        let idle = {
+            let mut inner = sup.inner().write().await;
+            inner.commanded_positions = q.to_vec();
+            inner.measured_positions = q.to_vec();
+            inner.target_positions = q.to_vec();
+            inner.commanded_velocities.fill(0.0);
+            inner.measured_velocities.fill(0.0);
+            inner.pending_normal_unload = false;
+            inner.park_release = None;
+            inner.park_gripper_contact = false;
+            inner.active_trajectory.is_none()
+                && inner.macro_run.is_none()
+                && inner.gripper_calibration.is_none()
+                && !inner.gravity_comp_active()
+                && !inner.last_action.as_ref().is_some_and(|a| a.is_running())
+        };
+        tokio::time::sleep(Duration::from_millis(45)).await;
+        if idle || Instant::now() >= deadline {
+            break;
+        }
+    }
+}
+
+async fn measure_ws_rpc(
+    ws: &mut common::TestSocket,
+    gen: u64,
+    sup: &Arc<ArmSupervisor>,
+    label: &'static str,
+    path: &str,
+    body: serde_json::Value,
+    expect_ack: bool,
+    measurements: &mut Vec<(&'static str, u32, String)>,
+) -> serde_json::Value {
+    let before = sup.tick_samples().len();
+    let ep = sup.get_observation().await.epoch_id;
+    let r = common::rpc(ws, gen, ep, path, body).await;
+    if expect_ack {
+        assert_eq!(r["type"], "command_ack", "{label}: {r}");
+    }
+    tokio::time::sleep(Duration::from_millis(45)).await;
+    let samples = sup.tick_samples();
+    let slice = &samples[before.min(samples.len())..];
+    let mut max_hold = 0u32;
+    let mut max_holder_desc = String::new();
+    for s in slice {
+        if s.writer_hold_us >= max_hold {
+            max_hold = s.writer_hold_us;
+            if let Some(h) = s.longest_hold.filter(|h| h.kind == "write").or(s.waited_for.filter(|h| h.kind == "write")) {
+                max_holder_desc = format!(
+                    "{}:{} cmd={:?} action={:?}",
+                    h.location.file(),
+                    h.location.line(),
+                    h.command,
+                    h.action_id
+                );
+            }
+        }
+    }
+    measurements.push((label, max_hold, format!("{} ({})", r["type"], max_holder_desc)));
+    r
+}
+
+async fn run_legacy_ws_ordinary_owner_handlers_lock_hold_audit() {
+    use armd::api::create_router_calibration;
+    use armd::api::proxy::DetectorUpstream;
+    use armd::calibration::CalibrationDeps;
+    use armd::diagnostics::DiagnosticsState;
+    use armd::grasp::GraspDeps;
+    use armd::recording::{write_frames_to_parquet, RecordFrame};
+    use common::{TestArm, INSPECT};
+    use tokio::net::TcpListener;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let keepout_path = tmp.path().join("keepout.json");
+    let collision_path = tmp.path().join("collision.json");
+    let gripper_calib_path = tmp.path().join("gripper_calib.json");
+    let poses_path = tmp.path().join("poses.json");
+    let sequences_path = tmp.path().join("sequences.json");
+    let setup_path = tmp.path().join("grasp_setup.json");
+    let commissioning_path = tmp.path().join("tool_commissioning.json");
+    let calib_path = tmp.path().join("calibration.json");
+    let episodes_dir = tmp.path().join("episodes");
+    std::fs::create_dir_all(&episodes_dir).unwrap();
+
+    // Seed a real 4 s 50 Hz episode parquet (201 frames) for /api/v1/action/replay & sequences.
+    let ep_frames: Vec<RecordFrame> = (0..=200)
+        .map(|k| {
+            let t = k as f64 * 0.02;
+            let s = (1.0 - (2.0 * std::f64::consts::PI * t / 4.0).cos()) as f32 / 2.0;
+            let mut q = INSPECT.to_vec();
+            q[0] += 0.25 * s;
+            q[3] += 0.15 * s;
+            RecordFrame { timestamp: 100.0 + t, observation_state: q.clone(), action: q }
+        })
+        .collect();
+    write_frames_to_parquet(&episodes_dir.join("ep_wave.parquet"), &ep_frames).unwrap();
+
+    // Real planning load: B601-DM 7-DOF profile + URDF kinematics + workspace + 2 extra keepout
+    // boxes + power budget + resting pose policy + TestArm driver (torque/velocity/MIT caps).
+    let mut cfg = dm_config_with_planning_load();
+    if let Some(ws) = cfg.workspace.as_mut() {
+        ws.keepout_boxes.push(KeepoutBox {
+            name: "rear_box".into(),
+            min_m: [-0.55, -0.45, 0.05],
+            max_m: [-0.35, -0.25, 0.25],
+        });
+    }
+    let arm = TestArm::new();
+    let sup = Arc::new(ArmSupervisor::new(cfg).with_driver(Box::new(arm.clone())));
+    sup.set_episodes_dir(Some(episodes_dir.clone())).await;
+    {
+        let inner = sup.inner().read().await;
+        let _ = inner.episodes.get_or_adopt(
+            "ep_wave",
+            &inner.joint_zero_offsets,
+            &inner.config.joint_names,
+            inner.config.profile_id.as_deref(),
+            50.0,
+        ).expect("adopt ep_wave parquet");
+    }
+    armd::keepout::load_into(&sup, &keepout_path).await.unwrap();
+    armd::collision::load_into(&sup, &collision_path).await;
+    armd::gripper_calib::load_into(&sup, &gripper_calib_path).await;
+    armd::poses::load_into(&sup, &poses_path).await;
+    armd::sequences::load_into(&sup, &sequences_path).await;
+    armd::grasp::load_into(&sup, &setup_path).await;
+    armd::tool::load_commissioning_into(&sup, &commissioning_path).await;
+    armd::calibration::load_into(&sup, &calib_path, None).await.unwrap();
+
+    let up = DetectorUpstream::parse("http://127.0.0.1:9").unwrap();
+    let grasp_deps = GraspDeps {
+        source: Arc::new(StubDetectionSource),
+        setup_path: Some(setup_path.clone()),
+    };
+    let mut calib_deps = CalibrationDeps::new(calib_path.clone(), Some(setup_path.clone()), up.clone());
+    calib_deps.backup_dir = tmp.path().join("backups");
+    let router = create_router_calibration(
+        sup.clone(),
+        up,
+        grasp_deps,
+        DiagnosticsState::global(),
+        calib_deps,
+        OperatorAuth::disabled(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+    // Concurrent 50 Hz legacy control tick loop.
+    let ticker_stop = Arc::new(AtomicBool::new(false));
+    let ticker_stop_bg = ticker_stop.clone();
+    let ticker_sup = sup.clone();
+    let ticker_jh = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(20));
+        while !ticker_stop_bg.load(Ordering::Acquire) {
+            interval.tick().await;
+            ticker_sup.tick(0.02).await;
+        }
+    });
+
+    // Warm up Tokio blocking pool & first-call dispatch tables before measuring holds.
+    let _ = tokio::task::spawn_blocking(|| {}).await;
+    let (mut ws, mut gen) = common::controller(addr).await;
+    let ep = sup.get_observation().await.epoch_id;
+    let ack = common::rpc(&mut ws, gen, ep, "/api/v1/torque", json!({"enable": true})).await;
+    assert_eq!(ack["type"], "command_ack", "{ack}");
+    reset_test_arm_state(&arm, &sup, INSPECT).await;
+
+    // Seed an initial grasp_setup + saved pose + sequence so grasp/place/move_to_pose/measure_multiview/run_sequence
+    // execute REAL planning rather than rejecting with MISSING_SETUP / POSE_NOT_FOUND.
+    let ep = sup.get_observation().await.epoch_id;
+    let setup_ack = common::rpc(&mut ws, gen, ep, "/api/v1/grasp/setup", json!({"table_z_m": 0.01})).await;
+    assert_eq!(setup_ack["type"], "command_ack", "seed grasp_setup: {setup_ack}");
+    let mut pose_q = INSPECT.to_vec();
+    pose_q[0] += 0.18;
+    pose_q[3] -= 0.12;
+    let pose_ack = common::rpc(
+        &mut ws,
+        gen,
+        sup.get_observation().await.epoch_id,
+        "/api/v1/poses/save",
+        json!({"name": "seed_pose", "positions": pose_q}),
+    )
+    .await;
+    assert_eq!(pose_ack["type"], "command_ack", "seed pose: {pose_ack}");
+    let seed_pose_id = pose_ack["pose"]["id"].as_str().unwrap().to_string();
+    let seq_ack = common::rpc(
+        &mut ws,
+        gen,
+        sup.get_observation().await.epoch_id,
+        "/api/v1/sequences/save",
+        json!({
+            "name": "seed_seq",
+            "steps": [
+                {"type": "pose", "pose_id": seed_pose_id},
+                {"type": "gripper", "action": "open"},
+                {"type": "replay", "episode_id": "ep_wave", "speed": 1.0, "gripper": true}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(seq_ack["type"], "command_ack", "seed sequence: {seq_ack}");
+    let seed_seq_id = seq_ack["sequence"]["id"].as_str().unwrap().to_string();
+    let tcp = sup.inner().read().await.config.tcp_pose_f32(&INSPECT).expect("FK TCP pose at INSPECT");
+    let tcp_pos = tcp.p;
+    let tcp_rpy = armd::kinematics::r_to_rpy(&tcp.r);
+
+    let mut measurements: Vec<(&'static str, u32, String)> = Vec::new();
+    tokio::time::sleep(Duration::from_millis(45)).await;
+
+    // --- 1. Motion family (jog/move_joints, home, unload, presets, gravity_comp) ---
+    let mut jog_t = INSPECT.to_vec();
+    jog_t[0] += 0.22;
+    jog_t[1] += 0.12;
+    measure_ws_rpc(&mut ws, gen, &sup, "/api/v1/motion/jog", "/api/v1/motion/jog", json!({"target_positions": jog_t, "duration_secs": 0.6}), true, &mut measurements).await;
+    reset_test_arm_state(&arm, &sup, INSPECT).await;
+
+    measure_ws_rpc(&mut ws, gen, &sup, "/api/v1/motion/home", "/api/v1/motion/home", json!({"duration_secs": 0.6}), true, &mut measurements).await;
+    reset_test_arm_state(&arm, &sup, INSPECT).await;
+
+    measure_ws_rpc(&mut ws, gen, &sup, "/api/v1/motion/unload", "/api/v1/motion/unload", json!({}), true, &mut measurements).await;
+    reset_test_arm_state(&arm, &sup, INSPECT).await;
+    if !sup.get_observation().await.is_torqued {
+        let ep = sup.get_observation().await.epoch_id;
+        let _ = common::rpc(&mut ws, gen, ep, "/api/v1/torque", json!({"enable": true})).await;
+        reset_test_arm_state(&arm, &sup, INSPECT).await;
+    }
+
+    for (label, name, pos_opt) in [
+        ("preset:home", "home", None),
+        ("preset:park", "park", None),
+        ("preset:custom", "custom_pose", Some({ let mut q = INSPECT.to_vec(); q[0] -= 0.20; q })),
+    ] {
+        let before = sup.tick_samples().len();
+        let ep = sup.get_observation().await.epoch_id;
+        let r = common::preset(&mut ws, gen, ep, name, pos_opt).await;
+        assert_eq!(r["type"], "preset_ack", "{label}: {r}");
+        tokio::time::sleep(Duration::from_millis(45)).await;
+        let samples = sup.tick_samples();
+        let max_hold = samples[before.min(samples.len())..].iter().map(|s| s.writer_hold_us).max().unwrap_or(0);
+        measurements.push((label, max_hold, r["type"].to_string()));
+        reset_test_arm_state(&arm, &sup, INSPECT).await;
+        if !sup.get_observation().await.is_torqued {
+            let ep = sup.get_observation().await.epoch_id;
+            let _ = common::rpc(&mut ws, gen, ep, "/api/v1/torque", json!({"enable": true})).await;
+            reset_test_arm_state(&arm, &sup, INSPECT).await;
+        }
+    }
+
+    measure_ws_rpc(&mut ws, gen, &sup, "/api/v1/mode/gravity_comp(on)", "/api/v1/mode/gravity_comp", json!({"enable": true}), false, &mut measurements).await;
+    measure_ws_rpc(&mut ws, gen, &sup, "/api/v1/mode/gravity_comp(off)", "/api/v1/mode/gravity_comp", json!({"enable": false}), false, &mut measurements).await;
+    reset_test_arm_state(&arm, &sup, INSPECT).await;
+
+    // --- 2. Servo family (FrameKind::Servo, FrameKind::ImplicitServo, /api/v1/motion/servo) ---
+    {
+        let mut s_q = INSPECT;
+        s_q[0] += 0.02;
+        let before = sup.tick_samples().len();
+        let ep = sup.get_observation().await.epoch_id;
+        common::send(
+            &mut ws,
+            json!({"type": "servo", "generation": gen, "epoch_id": ep, "sequence_id": 100, "positions": s_q}),
+        )
+        .await;
+        let rej = common::servo_reject_within(&mut ws, 50).await;
+        assert!(rej.is_none(), "frame:servo rejected: {rej:?}");
+        let samples = sup.tick_samples();
+        let max_hold = samples[before.min(samples.len())..].iter().map(|s| s.writer_hold_us).max().unwrap_or(0);
+        measurements.push(("frame:servo", max_hold, "accepted".into()));
+        reset_test_arm_state(&arm, &sup, INSPECT).await;
+    }
+    {
+        let mut s_q = INSPECT;
+        s_q[0] += 0.015;
+        let before = sup.tick_samples().len();
+        let ep = sup.get_observation().await.epoch_id;
+        common::send(
+            &mut ws,
+            json!({"type": "joint_positions", "generation": gen, "epoch_id": ep, "sequence_id": 101, "positions": s_q}),
+        )
+        .await;
+        let rej = common::servo_reject_within(&mut ws, 50).await;
+        assert!(rej.is_none(), "frame:implicit_servo rejected: {rej:?}");
+        let samples = sup.tick_samples();
+        let max_hold = samples[before.min(samples.len())..].iter().map(|s| s.writer_hold_us).max().unwrap_or(0);
+        measurements.push(("frame:implicit_servo", max_hold, "accepted".into()));
+        reset_test_arm_state(&arm, &sup, INSPECT).await;
+    }
+    {
+        let mut s_q = INSPECT;
+        s_q[0] += 0.015;
+        measure_ws_rpc(&mut ws, gen, &sup, "/api/v1/motion/servo", "/api/v1/motion/servo", json!({"targets": s_q}), true, &mut measurements).await;
+        reset_test_arm_state(&arm, &sup, INSPECT).await;
+    }
+
+    // --- 3. Actions family (all 12 DispatchHandler::Owner entries with real planning) ---
+    let action_cases: Vec<(&'static str, &'static str, serde_json::Value, bool)> = vec![
+        ("/api/v1/action/move_to(cartesian)", "/api/v1/action/move_to", json!({"position": [tcp_pos[0], tcp_pos[1] + 0.03, tcp_pos[2] + 0.02], "rpy": tcp_rpy, "speed": {"linear": 0.10, "angular": 0.5}}), true),
+        ("/api/v1/action/move_to(joint)", "/api/v1/action/move_to", json!({"position": [tcp_pos[0], tcp_pos[1] - 0.03, tcp_pos[2] + 0.02], "rpy": tcp_rpy, "path": "joint", "speed_scale": 0.5}), true),
+        ("/api/v1/action/move_relative", "/api/v1/action/move_relative", json!({"frame": "base", "d": [0.0, 0.02, 0.02], "speed": {"linear": 0.10, "angular": 0.5}}), true),
+        ("/api/v1/action/move_to_pose", "/api/v1/action/move_to_pose", json!({"name": "seed_pose", "speed_scale": 0.5}), true),
+        ("/api/v1/action/gripper", "/api/v1/action/gripper", json!({"command": "open", "speed": 1.0}), true),
+        ("/api/v1/action/gripper_zero_check", "/api/v1/action/gripper_zero_check", json!({"store_offset": false}), true),
+        ("/api/v1/action/grasp(dry_run)", "/api/v1/action/grasp", json!({"dry_run": true, "label": "cup", "box_norm": [0.45, 0.70, 0.55, 0.80], "overrides": {"table_z_m": 0.10}}), true),
+        ("/api/v1/action/grasp", "/api/v1/action/grasp", json!({"label": "cup", "box_norm": [0.45, 0.70, 0.55, 0.80], "overrides": {"table_z_m": 0.10}}), true),
+        ("/api/v1/action/place", "/api/v1/action/place", json!({"position": [0.30, 0.0, 0.05]}), true),
+        ("/api/v1/action/replay", "/api/v1/action/replay", json!({"episode": "ep_wave", "speed": 1.0, "gripper": true}), true),
+        ("/api/v1/action/run_sequence", "/api/v1/action/run_sequence", json!({"id": seed_seq_id}), true),
+        (armd::calib_hover::PATH, armd::calib_hover::PATH, json!({"candidate_fingerprint": "cafe0123", "points": [{"id": "p0", "approach_m": [0.30, 0.0, 0.08], "hover_m": [0.30, 0.0, 0.06]}], "rpy_rad": [std::f64::consts::PI, 0.0, 0.0], "approach_speed_mps": 0.05, "descent_speed_mps": 0.015, "settle_s": 2.5}), true),
+        (armd::gripper_calib::CALIBRATE_PATH, armd::gripper_calib::CALIBRATE_PATH, json!({}), true),
+        (armd::measure_multiview::PATH, armd::measure_multiview::PATH, json!({"motion": "orbit", "axes": "x", "views": 3, "baseline_m": 0.08}), true),
+    ];
+    for (label, path, body, expect_ack) in action_cases {
+        let pq_before = sup.inner().read().await.prepared_quintics_used;
+        let samples_before = sup.tick_samples().len();
+        measure_ws_rpc(&mut ws, gen, &sup, label, path, body, expect_ack, &mut measurements).await;
+        if label == "/api/v1/action/run_sequence" {
+            let wait_deadline = Instant::now() + Duration::from_millis(500);
+            while sup.inner().read().await.prepared_quintics_used == pq_before
+                && Instant::now() < wait_deadline
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(
+                sup.inner().read().await.prepared_quintics_used > pq_before,
+                "run_sequence pose child must install via off-lock PreparedQuintic (zero in-lock planning fallback)"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let samples = sup.tick_samples();
+            let post_max = samples[samples_before.min(samples.len())..]
+                .iter()
+                .map(|s| s.writer_hold_us)
+                .max()
+                .unwrap_or(0);
+            if let Some(last) = measurements.last_mut() {
+                last.1 = last.1.max(post_max);
+            }
+        }
+        reset_test_arm_state(&arm, &sup, INSPECT).await;
+    }
+
+    // --- 4. Config family (all 10 DispatchHandler::Owner entries with real persistence + EvalBufs) ---
+    measure_ws_rpc(&mut ws, gen, &sup, "/api/v1/workspace/keepout", "/api/v1/workspace/keepout", json!({"boxes": [{"name": "dyn_box", "min_m": [0.45, -0.45, 0.05], "max_m": [0.55, -0.35, 0.20]}]}), true, &mut measurements).await;
+    measure_ws_rpc(&mut ws, gen, &sup, "/api/v1/safety/collision", "/api/v1/safety/collision", json!({"enabled": true, "sensitivity": "medium"}), true, &mut measurements).await;
+    measure_ws_rpc(&mut ws, gen, &sup, "/api/v1/gripper/calibration", "/api/v1/gripper/calibration", json!({"jaw_opening": {"points": [[0.0, 0.0], [-5.7, 0.08]], "calibrated": true}, "offset_rad": 0.02}), true, &mut measurements).await;
+    let saved_pose = measure_ws_rpc(&mut ws, gen, &sup, "/api/v1/poses/save", "/api/v1/poses/save", json!({"name": "tmp_pose", "positions": INSPECT}), true, &mut measurements).await;
+    let tmp_pose_id = saved_pose["pose"]["id"].as_str().unwrap().to_string();
+    measure_ws_rpc(&mut ws, gen, &sup, "/api/v1/poses/rename", "/api/v1/poses/rename", json!({"id": tmp_pose_id, "name": "tmp_pose_renamed"}), true, &mut measurements).await;
+    measure_ws_rpc(&mut ws, gen, &sup, "/api/v1/poses/delete", "/api/v1/poses/delete", json!({"name": "tmp_pose_renamed"}), true, &mut measurements).await;
+    let saved_seq = measure_ws_rpc(&mut ws, gen, &sup, "/api/v1/sequences/save", "/api/v1/sequences/save", json!({"name": "tmp_seq", "steps": [{"type": "wait", "s": 0.1}]}), true, &mut measurements).await;
+    let tmp_seq_id = saved_seq["sequence"]["id"].as_str().unwrap().to_string();
+    measure_ws_rpc(&mut ws, gen, &sup, "/api/v1/sequences/delete", "/api/v1/sequences/delete", json!({"id": tmp_seq_id}), true, &mut measurements).await;
+    measure_ws_rpc(&mut ws, gen, &sup, "/api/v1/grasp/setup", "/api/v1/grasp/setup", json!({"table_z_m": 0.015}), true, &mut measurements).await;
+    measure_ws_rpc(&mut ws, gen, &sup, "/api/v1/tool/commissioning/confirm", "/api/v1/tool/commissioning/confirm", json!({"operator_confirmed": true}), false, &mut measurements).await;
+
+    // --- 5. Policy family (when policy-runtime feature is enabled) ---
+    #[cfg(feature = "policy-runtime")]
+    {
+        measure_ws_rpc(&mut ws, gen, &sup, "/api/v1/action/policy/start", "/api/v1/action/policy/start", json!({"policy_id": "probe_missing_policy", "mode": "shadow"}), false, &mut measurements).await;
+        measure_ws_rpc(&mut ws, gen, &sup, "/api/v1/action/policy/stop", "/api/v1/action/policy/stop", json!({}), true, &mut measurements).await;
+    }
+
+    // --- 6. Torque off + Calibration / MotorZero / MIT family (all 6 DispatchHandler::Owner entries) ---
+    arm.set_residual(2, 7.62);
+    reset_test_arm_state(&arm, &sup, [0.0; 7]).await;
+    measure_ws_rpc(&mut ws, gen, &sup, "/api/v1/torque(off)", "/api/v1/torque", json!({"enable": false}), true, &mut measurements).await;
+    arm.clear();
+    let calib_cases: Vec<(&'static str, &'static str, serde_json::Value)> = vec![
+        ("/api/v1/calibration/apply", "/api/v1/calibration/apply", json!({
+            "intrinsics": {"fx": 831.5, "fy": 829.0, "cx": 318.2, "cy": 183.4, "k1": 0.05, "k2": -0.1, "p1": 0.0, "p2": 0.0, "k3": 0.0, "width": 640, "height": 360, "marker_size": 0.0495},
+            "camera_mount": {"offset_m": [-0.0728, 0.0012, 0.0655], "q_end_cam": [0.0, 0.0, 0.0, 1.0]},
+            "table_z_m": 0.012,
+            "rms": {"intrinsics_px": 0.21, "hand_eye_mm": 1.4, "hand_eye_deg": 0.3},
+            "dry_run": true
+        })),
+        ("/api/v1/calibration/restore", "/api/v1/calibration/restore", json!({"backup": "none"})),
+        (armd::motor_zero::PATH, armd::motor_zero::PATH, json!({"joints": [1, 2, 3], "dry_run": true})),
+        (armd::motor_zero::RESTORE_PATH, armd::motor_zero::RESTORE_PATH, json!({"backup": "2026-01-01T00-00-00Z"})),
+        (armd::mit::TIMEOUT_PATH, armd::mit::TIMEOUT_PATH, json!({})),
+        (armd::mit::QUALIFICATION_PATH, armd::mit::QUALIFICATION_PATH, json!({"joints": [1]})),
+    ];
+    for (label, path, body) in calib_cases {
+        measure_ws_rpc(&mut ws, gen, &sup, label, path, body, false, &mut measurements).await;
+    }
+
+    // --- 7. SessionAsync & CommandAsync ordinary worker handlers ---
+    measure_ws_rpc(&mut ws, gen, &sup, "/api/v1/arm", "/api/v1/arm", json!({"enable": true}), true, &mut measurements).await;
+    measure_ws_rpc(&mut ws, gen, &sup, "/api/v1/safety/clear_fault", "/api/v1/safety/clear_fault", json!({}), false, &mut measurements).await;
+    {
+        let before = sup.tick_samples().len();
+        let r = common::ws_reply(&mut ws, json!({"type": "release_lease", "generation": gen}), &["lease_released"]).await;
+        assert_eq!(r["success"], json!(true), "release_lease: {r}");
+        tokio::time::sleep(Duration::from_millis(45)).await;
+        let samples = sup.tick_samples();
+        let max_hold = samples[before.min(samples.len())..].iter().map(|s| s.writer_hold_us).max().unwrap_or(0);
+        measurements.push(("release_lease", max_hold, "lease_released".into()));
+    }
+    {
+        let before = sup.tick_samples().len();
+        let r = common::ws_reply(&mut ws, json!({"type": "acquire_lease", "client_id": "reacquire_probe"}), &["lease_granted"]).await;
+        gen = r["generation"].as_u64().unwrap();
+        let _ = gen;
+        tokio::time::sleep(Duration::from_millis(45)).await;
+        let samples = sup.tick_samples();
+        let max_hold = samples[before.min(samples.len())..].iter().map(|s| s.writer_hold_us).max().unwrap_or(0);
+        measurements.push(("acquire_lease", max_hold, "lease_granted".into()));
+    }
+
+    ticker_stop.store(true, Ordering::Release);
+    let _ = ticker_jh.await;
+
+    let mut over_2ms = Vec::new();
+    for (label, hold_us, tag) in &measurements {
+        eprintln!("[WS_LOCK_HOLD] {label:<36} writer_hold_us={hold_us:>6} reply={tag}");
+        if *hold_us > 2_000 {
+            over_2ms.push((*label, *hold_us));
+        }
+    }
+    assert!(
+        over_2ms.is_empty(),
+        "WS ordinary owner handlers exceeded 2 ms write-lock hold budget: {over_2ms:?}\nAll measurements: {measurements:?}"
+    );
+}
