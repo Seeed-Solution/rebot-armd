@@ -9880,3 +9880,216 @@ fn r12_b4_rt_thermal_cut_retries_every_release_after_first_contention() {
         assert_eq!(r.fx.core.torque_intent, TorqueIntent::Off);
     }
 }
+
+/// R12 M1: Feetech recheck after RX clear/drain:
+/// 1. Any position reply already queued in RX BEFORE the clear is decoded and fed into
+///    `rest_pose_window` first (never discarded): a queued raised position reply causes immediate
+///    `TorqueOffWouldDrop` with 0 `TORQUE_ENABLE=0` writes even when prior K=3 was at rest.
+/// 2. If the rest-pose window ages out (> 100 ms) during the RX drain while still inside the 1 s
+///    request lifetime, `begin_disable_torque` DEFERS (`Ok(TorqueProgress::Pending)`) instead of
+///    returning `TorqueOffWouldDrop`, and completes once fresh K=3 rest replies arrive within 1 s.
+#[test]
+fn r12_m1_feetech_disable_decodes_queued_rx_before_clear_and_defers_if_window_aged() {
+    use armd::driver::{ArmDriverError, DisableKind, FeetechArmDriver, StoppedDisableGate, TorqueProgress};
+    use armd::transport::MockTransport;
+
+    #[derive(Clone)]
+    struct DrainHookSerial {
+        inner: Arc<std::sync::Mutex<MockTransport>>,
+        on_clear: Arc<std::sync::Mutex<Option<Box<dyn FnMut() + Send>>>>,
+    }
+    impl armd::transport::Transport for DrainHookSerial {
+        fn write(&mut self, buf: &[u8]) -> Result<usize, armd::transport::TransportError> {
+            self.inner.lock().unwrap().write(buf)
+        }
+        fn write_all(&mut self, buf: &[u8]) -> Result<(), armd::transport::TransportError> {
+            self.inner.lock().unwrap().write_all(buf)
+        }
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, armd::transport::TransportError> {
+            self.inner.lock().unwrap().read(buf)
+        }
+        fn flush(&mut self) -> Result<(), armd::transport::TransportError> {
+            self.inner.lock().unwrap().flush()
+        }
+        fn clear_input_buffer(&mut self) {
+            self.inner.lock().unwrap().clear_input_buffer();
+            if let Some(ref mut hook) = *self.on_clear.lock().unwrap() {
+                hook();
+            }
+        }
+        fn clock(&self) -> Option<Arc<dyn armd::transport::DriverClock>> {
+            armd::transport::Transport::clock(&*self.inner.lock().unwrap())
+        }
+    }
+
+    let servo_ids: Vec<u8> = (1..=6).collect();
+    let cfg = feetech_6dof_config();
+    let sync_pos_req_1 = armd::protocol::feetech::build_sync_read(
+        &servo_ids[..3],
+        armd::protocol::feetech::REG_PRESENT_POSITION_L,
+        8,
+    )
+    .unwrap();
+    let sync_pos_req_2 = armd::protocol::feetech::build_sync_read(
+        &servo_ids[3..],
+        armd::protocol::feetech::REG_PRESENT_POSITION_L,
+        8,
+    )
+    .unwrap();
+    let make_gate = || StoppedDisableGate {
+        safety_stopped: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        has_resting_pose: true,
+        arm_joints: {
+            let mut a = [0usize; armd::rt_core::mailbox::MAX_DOF];
+            for i in 0..5 {
+                a[i] = i;
+            }
+            a
+        },
+        arm_joints_len: 5,
+        rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+        rest_pose_tolerance_rad: cfg.rest_pose_tolerance_rad,
+    };
+    let rest_steps: [u16; 6] = [2048; 6];
+
+    // Part 1: Queued raised position reply sitting in RX before disable MUST be decoded into
+    // `rest_pose_window` (never discarded by clear), refusing with `TorqueOffWouldDrop` and 0 writes.
+    {
+        let clock = MockClock::new();
+        let serial_inner = Arc::new(std::sync::Mutex::new(
+            MockTransport::new().with_clock(clock.clone()),
+        ));
+        let on_clear: Arc<std::sync::Mutex<Option<Box<dyn FnMut() + Send>>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let mut drv = FeetechArmDriver::new(
+            DrainHookSerial {
+                inner: Arc::clone(&serial_inner),
+                on_clear: Arc::clone(&on_clear),
+            },
+            servo_ids.clone(),
+        )
+        .with_calibrated(true)
+        .with_tx_echo(Some(false))
+        .with_gripper_index(Some(5));
+        drv.set_stopped_disable_gate(make_gate());
+
+        // Establish K=3 confirmed at rest.
+        for step in 0..3 {
+            if step > 0 {
+                clock.advance(Duration::from_millis(12));
+            }
+            {
+                let mut ser = serial_inner.lock().unwrap();
+                ser.stage_reply(&sync_pos_req_1, &feetech_feedback_bytes(&servo_ids[..3], &rest_steps[..3]));
+                ser.stage_reply(&sync_pos_req_2, &feetech_feedback_bytes(&servo_ids[3..], &rest_steps[3..]));
+            }
+            drv.read_joint_states().unwrap();
+        }
+        // Now queue a fresh RAISED position reply for servo 1 (2600 steps >> rest 2048) directly in RX!
+        clock.advance(Duration::from_millis(5));
+        {
+            let mut ser = serial_inner.lock().unwrap();
+            let _ = ser.take_tx();
+            ser.provide_rx(&feetech_feedback_bytes(&[1], &[2600]));
+        }
+        let started_at = drv.clock_now();
+        let res = drv.begin_disable_torque(DisableKind::DisableRequested { started_at });
+        assert!(
+            matches!(res, Err(ArmDriverError::TorqueOffWouldDrop)),
+            "M1 Part 1: queued raised position reply must be decoded before clear and refuse with TorqueOffWouldDrop, got {res:?}"
+        );
+        let tx = serial_inner.lock().unwrap().take_tx();
+        assert_eq!(
+            spec_count_feetech_torque_off_writes(&tx),
+            0,
+            "M1 Part 1: ZERO TORQUE_ENABLE=0 writes when queued raised reply decoded"
+        );
+    }
+
+    // Part 2: Rest-pose window ages out (> 100 ms) DURING the RX drain while still inside the 1 s
+    // request lifetime -> MUST DEFER (`Ok(TorqueProgress::Pending)`) instead of `TorqueOffWouldDrop`,
+    // and succeed once fresh K=3 rest replies arrive within 1 s!
+    {
+        let clock = MockClock::new();
+        let serial_inner = Arc::new(std::sync::Mutex::new(
+            MockTransport::new().with_clock(clock.clone()),
+        ));
+        let on_clear: Arc<std::sync::Mutex<Option<Box<dyn FnMut() + Send>>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let mut drv = FeetechArmDriver::new(
+            DrainHookSerial {
+                inner: Arc::clone(&serial_inner),
+                on_clear: Arc::clone(&on_clear),
+            },
+            servo_ids.clone(),
+        )
+        .with_calibrated(true)
+        .with_tx_echo(Some(false))
+        .with_gripper_index(Some(5));
+        drv.set_stopped_disable_gate(make_gate());
+
+        for step in 0..3 {
+            if step > 0 {
+                clock.advance(Duration::from_millis(12));
+            }
+            {
+                let mut ser = serial_inner.lock().unwrap();
+                ser.stage_reply(&sync_pos_req_1, &feetech_feedback_bytes(&servo_ids[..3], &rest_steps[..3]));
+                ser.stage_reply(&sync_pos_req_2, &feetech_feedback_bytes(&servo_ids[3..], &rest_steps[3..]));
+            }
+            drv.read_joint_states().unwrap();
+        }
+        let _ = serial_inner.lock().unwrap().take_tx();
+
+        // Advance clock by 120 ms (> 100 ms feedback freshness, < 1000 ms request lifetime) ONCE
+        // during `clear_input_buffer()` so the window ages out mid-drain!
+        let clock_hook = clock.clone();
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fired_hook = Arc::clone(&fired);
+        *on_clear.lock().unwrap() = Some(Box::new(move || {
+            if !fired_hook.swap(true, Ordering::SeqCst) {
+                clock_hook.advance(Duration::from_millis(120));
+            }
+        }));
+
+        let started_at = drv.clock_now();
+        let res = drv.begin_disable_torque(DisableKind::DisableRequested { started_at });
+        assert!(
+            matches!(res, Ok(TorqueProgress::Pending { .. })),
+            "M1 Part 2: window aging out during drain within 1 s lifetime MUST defer (Pending), NOT TorqueOffWouldDrop, got {res:?}"
+        );
+        assert!(fired.load(Ordering::SeqCst), "M1 Part 2: drain hook must have fired");
+        assert!(drv.torque_transition_pending(), "M1 Part 2: pending_disable must stay armed");
+        assert_eq!(
+            spec_count_feetech_torque_off_writes(&serial_inner.lock().unwrap().take_tx()),
+            0,
+            "M1 Part 2: zero writes while deferred"
+        );
+
+        // Now deliver 3 fresh spaced rest polls within the remaining 1 s lifetime -> completes!
+        let mut done = false;
+        for _ in 0..4 {
+            clock.advance(Duration::from_millis(15));
+            {
+                let mut ser = serial_inner.lock().unwrap();
+                ser.stage_reply(&sync_pos_req_1, &feetech_feedback_bytes(&servo_ids[..3], &rest_steps[..3]));
+                ser.stage_reply(&sync_pos_req_2, &feetech_feedback_bytes(&servo_ids[3..], &rest_steps[3..]));
+            }
+            let deadline = drv.clock_now() + Duration::from_millis(8);
+            match drv.poll_torque(deadline).unwrap() {
+                TorqueProgress::Done(_) => {
+                    done = true;
+                    break;
+                }
+                TorqueProgress::Pending { .. } => {}
+            }
+        }
+        assert!(done, "M1 Part 2: deferred Feetech disable must complete once K=3 re-confirms within 1 s");
+        let tx = serial_inner.lock().unwrap().take_tx();
+        assert_eq!(
+            spec_count_feetech_torque_off_writes(&tx),
+            6,
+            "M1 Part 2: all 6 servos must receive TORQUE_ENABLE=0 once K=3 confirms"
+        );
+    }
+}

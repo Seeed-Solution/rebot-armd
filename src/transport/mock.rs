@@ -239,6 +239,10 @@ impl Transport for MockTransport {
         Some(Arc::new(self.clock.clone()))
     }
 
+    fn clears_input_buffer(&self) -> bool {
+        !self.preserve_on_clear
+    }
+
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
         if let Some(err_msg) = self.error_on_next_read.take() {
             if !buf.is_empty() {

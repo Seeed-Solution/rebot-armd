@@ -2189,6 +2189,217 @@ impl<T: Transport> FeetechArmDriver<T> {
         Ok(())
     }
 
+    /// Zero-allocation position reply applicator shared by RX polling and M1 pre-clear draining.
+    /// Feeds decoded position into `cached_states`, `last_feedback_instant`, and `rest_pose_window`
+    /// without discarding queued replies. Returns `true` when a valid 8-byte position reply for a
+    /// known servo was applied.
+    fn apply_decoded_position_reply(
+        &mut self,
+        pkt_id: u8,
+        pkt_error: u8,
+        params: &[u8; 8],
+        pkt_rx_at: Instant,
+        req_written_at: Option<Instant>,
+    ) -> bool {
+        if pkt_id == feetech::BROADCAST_ID {
+            return false;
+        }
+        let Some(joint_idx) = self.servo_ids.iter().position(|&id| id == pkt_id) else {
+            return false;
+        };
+        let decode_now = self.clock_now();
+        if pkt_rx_at > decode_now {
+            self.rest_pose_window[joint_idx].reset();
+            return false;
+        }
+        let default_calib = feetech::FeetechJointCalib::default();
+        let pos_raw = u16::from_le_bytes([params[0], params[1]]);
+        let speed_raw = u16::from_le_bytes([params[2], params[3]]);
+        let load_raw = u16::from_le_bytes([params[4], params[5]]);
+        let temp_raw = params[7];
+
+        let calib = self.config.joints.get(joint_idx).unwrap_or(&default_calib);
+        let raw_vel = feetech::raw_speed_to_rad_s(speed_raw);
+        let velocity = if calib.drive_mode_invert { -raw_vel } else { raw_vel };
+        let raw_load = feetech::raw_load_to_fraction(load_raw);
+        let load = if calib.drive_mode_invert { -raw_load } else { raw_load };
+        let pos_steps = feetech::decode_present_position(pos_raw);
+        self.cached_raw_steps[joint_idx] = pos_steps;
+        self.cached_states[joint_idx] = JointState {
+            position: calib.steps_to_rad(pos_steps),
+            velocity,
+            torque: 0.0,
+            temperature: feetech::raw_to_temperature(temp_raw),
+        };
+        self.cached_loads[joint_idx] = load;
+        self.motor_status[joint_idx] = pkt_error;
+        if self.last_feedback_instant[joint_idx].is_none_or(|prev| {
+            pkt_rx_at.saturating_duration_since(prev) > STOPPED_DISABLE_FEEDBACK_MAX_AGE
+        }) || !self.cached_states[joint_idx].position.is_finite()
+        {
+            self.feedback_continuity_epoch[joint_idx] =
+                self.feedback_continuity_epoch[joint_idx].wrapping_add(1);
+        }
+        self.last_feedback_instant[joint_idx] = Some(pkt_rx_at);
+        self.feedback_seq[joint_idx] = self.feedback_seq[joint_idx].wrapping_add(1);
+        // Feed causal post-motion position sample into per-joint K=3 rest-pose window.
+        let after_motion = self.last_motion_write_at[joint_idx].is_none_or(|w| {
+            pkt_rx_at >= w && req_written_at.is_none_or(|req_at| req_at >= w)
+        });
+        if let Some(ref gate) = self.stopped_disable_gate {
+            if gate.is_arm_joint(joint_idx) {
+                let pos = self.cached_states[joint_idx].position;
+                if after_motion
+                    && joint_state_valid(&self.cached_states[joint_idx], self.capabilities())
+                    && gate.joint_at_rest(joint_idx, pos)
+                {
+                    let release_id = self.control_release_id;
+                    let _ = self.rest_pose_window[joint_idx].record_agree(
+                        pkt_rx_at,
+                        release_id,
+                        STOPPED_DISABLE_FEEDBACK_MAX_AGE,
+                        None,
+                    );
+                } else {
+                    self.rest_pose_window[joint_idx].record_disagree();
+                }
+            }
+        }
+        true
+    }
+
+    /// Zero-allocation decoder draining any complete 8-byte position replies currently queued in
+    /// `self.rx_buffer` into `cached_states` and `rest_pose_window` (R12 M1).
+    fn decode_queued_position_replies_in_rx(&mut self, fallback_time: Instant) {
+        while !self.rx_buffer.is_empty() {
+            match feetech::parse_response_ref(&self.rx_buffer) {
+                Ok((pkt, consumed)) => {
+                    let pkt_id = pkt.id;
+                    let pkt_error = pkt.error;
+                    let params8: Option<[u8; 8]> = if pkt.params.len() == 8 {
+                        let mut a = [0u8; 8];
+                        a.copy_from_slice(pkt.params);
+                        Some(a)
+                    } else {
+                        None
+                    };
+                    let pkt_rx_at = self
+                        .rx_timestamps
+                        .get(consumed.saturating_sub(1))
+                        .copied()
+                        .unwrap_or(fallback_time);
+                    self.drain_rx_prefix(consumed);
+                    if let Some(p8) = params8 {
+                        let _ = self.apply_decoded_position_reply(
+                            pkt_id,
+                            pkt_error,
+                            &p8,
+                            pkt_rx_at,
+                            None,
+                        );
+                    }
+                }
+                Err(feetech::FeetechRefParseError::Incomplete) => break,
+                Err(_) => {
+                    self.drain_rx_prefix(1);
+                }
+            }
+        }
+    }
+
+    /// R12 M1: Drain and decode any queued position replies from `partial_pos_rx`, `rx_buffer`,
+    /// and the transport BEFORE clearing the input buffer; if `line_poisoned`, also decode any
+    /// position replies that arrive while waiting for continuous 20 ms line idle. Never discards
+    /// a queued position reply before feeding it into `rest_pose_window`.
+    fn drain_and_decode_pending_rx_for_disable(&mut self) -> Result<(), ArmDriverError> {
+        let now = self.clock_now();
+        // 1. Decode any previously buffered partial position bytes before clearing them.
+        if !self.partial_pos_rx.is_empty() {
+            let mut partial = std::mem::take(&mut self.partial_pos_rx);
+            let mut partial_ts = std::mem::take(&mut self.partial_pos_rx_timestamps);
+            partial_ts.resize(partial.len(), now);
+            for (&b, &t) in partial.iter().zip(partial_ts.iter()) {
+                self.push_rx(&[b], t);
+            }
+            partial.clear();
+            partial_ts.clear();
+            self.partial_pos_rx = partial;
+            self.partial_pos_rx_timestamps = partial_ts;
+            self.incomplete_chunk_idx = None;
+            self.incomplete_frame_started_at = None;
+        }
+        // 2. Pull any immediately queued transport bytes (non-blocking bounded drain) and decode
+        //    all complete 8-byte position replies into `rest_pose_window` FIRST, whenever the
+        //    transport's `clear_input_buffer()` would discard queued bytes.
+        if self.transport.clears_input_buffer() {
+            let mut buf = [0u8; 32];
+            for _ in 0..16 {
+                match self.transport.read(&mut buf) {
+                    Ok(n) if n > 0 => {
+                        let rx_at = self.clock_now();
+                        self.push_rx(&buf[..n], rx_at);
+                        self.decode_queued_position_replies_in_rx(rx_at);
+                    }
+                    _ => break,
+                }
+            }
+        }
+        let decode_ts = self.clock_now();
+        self.decode_queued_position_replies_in_rx(decode_ts);
+        // 3. Clear remaining non-position / partial noise from RX.
+        self.transport.clear_input_buffer();
+        self.clear_rx();
+        // 4. If line was poisoned, drain until continuous 20 ms idle while decoding any arriving
+        //    position replies instead of discarding them.
+        if self.line_poisoned {
+            let start = self.clock_now();
+            let mut quiet_since = self.line_poison_quiet_since.unwrap_or(start);
+            let mut idle_buf = [0u8; 64];
+            loop {
+                let before_read = self.clock_now();
+                match self.transport.read(&mut idle_buf) {
+                    Ok(n) if n > 0 => {
+                        let rx_at = self.clock_now();
+                        quiet_since = rx_at;
+                        self.line_poison_quiet_since = Some(rx_at);
+                        self.push_rx(&idle_buf[..n], rx_at);
+                        self.decode_queued_position_replies_in_rx(rx_at);
+                        if self.elapsed_since(start) >= Self::LINE_IDLE_MAX_WAIT {
+                            self.clear_rx();
+                            return Err(ArmDriverError::Protocol(
+                                "Feetech serial line remained busy while clearing timed-out request".into(),
+                            ));
+                        }
+                    }
+                    Ok(_) | Err(TransportError::Timeout) | Err(TransportError::WouldBlock) => {
+                        if self.elapsed_since(quiet_since) >= Self::LINE_IDLE_QUIET {
+                            self.line_poisoned = false;
+                            self.line_poison_quiet_since = None;
+                            self.transport.clear_input_buffer();
+                            self.clear_rx();
+                            return Ok(());
+                        }
+                        if self.clock_now() == before_read {
+                            self.clock_sleep(Duration::from_millis(1));
+                        }
+                        if self.elapsed_since(start) >= Self::LINE_IDLE_MAX_WAIT {
+                            self.clear_rx();
+                            return Err(ArmDriverError::Protocol(
+                                "Feetech serial line did not reach idle before timeout".into(),
+                            ));
+                        }
+                        self.clock_yield();
+                    }
+                    Err(e) => {
+                        self.clear_rx();
+                        return Err(e.into());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn is_aborted(&self) -> bool {
         self.estop_state.as_ref().is_some_and(|s| s.is_latched())
             || self
@@ -2248,43 +2459,57 @@ impl<T: Transport> FeetechArmDriver<T> {
         }
     }
 
-    fn check_stopped_disable_requested(&self, started_at: Instant) -> Result<(), ArmDriverError> {
-        if self.elapsed_since(started_at) >= STOPPED_DISABLE_REQUEST_LIFETIME {
-            return Err(ArmDriverError::DisableRequestExpired);
-        }
-        if self.evaluate_rest_pose_gate() != RestPoseGateStatus::Confirmed {
-            return Err(ArmDriverError::TorqueOffWouldDrop);
-        }
-        Ok(())
-    }
-
-    /// Single transmit choke point for Feetech `TORQUE_ENABLE = 0` writes.
-    fn write_torque_off(
+    /// Single transmit choke point for Feetech `TORQUE_ENABLE = 0` writes, returning `Ok(true)`
+    /// when `TORQUE_ENABLE = 0` was transmitted and `Ok(false)` when a `DisableRequested` must
+    /// DEFER within its 1 s request lifetime (e.g., because `rest_pose_window` aged out during
+    /// the pre-write RX drain — R12 M1).
+    fn write_torque_off_checked(
         &mut self,
         servo_id: u8,
         kind: DisableKind,
-    ) -> Result<(), ArmDriverError> {
-        match kind {
-            DisableKind::DisableRequested { started_at } => {
-                self.check_stopped_disable_requested(started_at)?;
+    ) -> Result<bool, ArmDriverError> {
+        if let DisableKind::DisableRequested { started_at } = kind {
+            if self.elapsed_since(started_at) >= STOPPED_DISABLE_REQUEST_LIFETIME {
+                return Err(ArmDriverError::DisableRequestExpired);
             }
-            DisableKind::DisableProtective { .. } => {}
+            match self.evaluate_rest_pose_gate() {
+                RestPoseGateStatus::Confirmed => {}
+                RestPoseGateStatus::RefusedNonRest => {
+                    return Err(ArmDriverError::TorqueOffWouldDrop);
+                }
+                RestPoseGateStatus::PendingDrainOrWindow | RestPoseGateStatus::StaleOrMissing => {
+                    return Ok(false);
+                }
+            }
         }
-        // E3: Discard pending RX before transmitting (best-effort on protective cut so noisy RX
-        // never blocks a thermal/exit disable write).
+        // R12 M1 / E3: For `DisableRequested`, decode any queued position replies into
+        // `rest_pose_window` BEFORE clearing RX (never discard queued position replies); for
+        // `DisableProtective`, clear best-effort so noisy RX never blocks a thermal/exit cut.
         match kind {
             DisableKind::DisableRequested { .. } => {
-                self.discard_pending_rx_for_request()?;
+                self.drain_and_decode_pending_rx_for_disable()?;
             }
             DisableKind::DisableProtective { .. } => {
                 let _ = self.discard_pending_rx_for_request();
             }
         }
-        // B4: Recheck 1 s request lifetime and K=3 rest evidence IMMEDIATELY before mutating
-        // enable telemetry or transmitting `TORQUE_ENABLE = 0`, strictly AFTER any RX clear/drain
-        // inside the same function as the write.
+        // B4 / R12 M1: Recheck 1 s request lifetime and K=3 rest evidence IMMEDIATELY before
+        // mutating enable telemetry or transmitting `TORQUE_ENABLE = 0`, strictly AFTER the RX
+        // drain & decode. If the window aged out during the drain (within the 1 s lifetime),
+        // DEFER (`Ok(false)`) instead of returning `TorqueOffWouldDrop`!
         if let DisableKind::DisableRequested { started_at } = kind {
-            self.check_stopped_disable_requested(started_at)?;
+            if self.elapsed_since(started_at) >= STOPPED_DISABLE_REQUEST_LIFETIME {
+                return Err(ArmDriverError::DisableRequestExpired);
+            }
+            match self.evaluate_rest_pose_gate() {
+                RestPoseGateStatus::Confirmed => {}
+                RestPoseGateStatus::RefusedNonRest => {
+                    return Err(ArmDriverError::TorqueOffWouldDrop);
+                }
+                RestPoseGateStatus::PendingDrainOrWindow | RestPoseGateStatus::StaleOrMissing => {
+                    return Ok(false);
+                }
+            }
         }
         // Invalidate per-motor torque windows immediately BEFORE the torque-changing write reaches
         // the transport; a gate refusal above leaves evidence intact. (Keep `rest_pose_window`
@@ -2297,7 +2522,20 @@ impl<T: Transport> FeetechArmDriver<T> {
         self.transport.write_all(&pkt)?;
         let _ = self.transport.flush();
         let _ = self.drain_tx_echo(&pkt);
-        Ok(())
+        Ok(true)
+    }
+
+    /// Direct non-deferred wrapper around [`Self::write_torque_off_checked`] (used by `clear_fault`).
+    fn write_torque_off(
+        &mut self,
+        servo_id: u8,
+        kind: DisableKind,
+    ) -> Result<(), ArmDriverError> {
+        if self.write_torque_off_checked(servo_id, kind)? {
+            Ok(())
+        } else {
+            Err(ArmDriverError::TorqueOffWouldDrop)
+        }
     }
 
     pub fn clock_now(&self) -> Instant {
@@ -3207,9 +3445,11 @@ impl<T: Transport> FeetechArmDriver<T> {
         self.partial_pos_rx = rx;
         self.partial_pos_rx_timestamps = ts;
     }
-    fn execute_disable_writes(&mut self, kind: DisableKind) -> Result<(), ArmDriverError> {
+    /// Executes Feetech `TORQUE_ENABLE = 0` writes through `write_torque_off_checked`, returning
+    /// `Ok(true)` when all servos completed, or `Ok(false)` when deferred within the 1 s lifetime
+    /// (setting `self.pending_disable = Some(kind)` — R12 M1).
+    fn execute_disable_writes(&mut self, kind: DisableKind) -> Result<bool, ArmDriverError> {
         self.assert_clock_matches_transport();
-        self.invalidate_partial_pos_rx();
         let n = self.servo_ids.len().min(crate::rt_core::mailbox::MAX_DOF);
         let all_mask = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
         if (self.disable_dispatched_mask & all_mask) == all_mask {
@@ -3219,18 +3459,23 @@ impl<T: Transport> FeetechArmDriver<T> {
         let mut ids = [0u8; crate::rt_core::mailbox::MAX_DOF];
         ids[..n].copy_from_slice(&self.servo_ids[..n]);
         let mut wrote_any = false;
+        let mut deferred = false;
         let mut refused_err = None;
         let mut write_err = None;
         for (idx, &id) in ids[..n].iter().enumerate() {
             if skip_dispatched && idx < 64 && (self.disable_dispatched_mask & (1u64 << idx)) != 0 {
                 continue;
             }
-            match self.write_torque_off(id, kind) {
-                Ok(()) => {
+            match self.write_torque_off_checked(id, kind) {
+                Ok(true) => {
                     wrote_any = true;
                     if idx < 64 {
                         self.disable_dispatched_mask |= 1u64 << idx;
                     }
+                }
+                Ok(false) => {
+                    deferred = true;
+                    break;
                 }
                 Err(e @ (ArmDriverError::TorqueOffWouldDrop | ArmDriverError::DisableRequestExpired)) => {
                     if refused_err.is_none() {
@@ -3241,6 +3486,13 @@ impl<T: Transport> FeetechArmDriver<T> {
                     write_err = Some(e);
                 }
             }
+        }
+        if deferred && refused_err.is_none() && write_err.is_none() {
+            if wrote_any {
+                let _ = self.read_torque_enable_states(&ids[..n]);
+            }
+            self.pending_disable = Some(kind);
+            return Ok(false);
         }
         if !wrote_any && self.disable_dispatched_mask == 0 {
             if let Some(e) = refused_err.take().or_else(|| write_err.take()) {
@@ -3256,7 +3508,7 @@ impl<T: Transport> FeetechArmDriver<T> {
         if (self.disable_dispatched_mask & all_mask) == all_mask {
             self.disable_dispatched_mask = 0;
         }
-        Ok(())
+        Ok(true)
     }
 
     fn read_joint_states_inner(&mut self, advance_unmanaged_release: bool) -> Result<Vec<JointState>, ArmDriverError> {
@@ -3744,7 +3996,7 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         let started_at = match kind {
             DisableKind::DisableRequested { started_at } => started_at,
             DisableKind::DisableProtective { .. } => {
-                self.execute_disable_writes(kind)?;
+                let _ = self.execute_disable_writes(kind)?;
                 return Ok(TorqueProgress::Done(TorqueOutcome::Confirmed));
             }
         };
@@ -3756,8 +4008,11 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         // have read fresh feedback in this control release); never sleep or block waiting for K=3.
         match self.evaluate_rest_pose_gate() {
             RestPoseGateStatus::Confirmed => {
-                self.execute_disable_writes(kind)?;
-                return Ok(TorqueProgress::Done(TorqueOutcome::Confirmed));
+                if self.execute_disable_writes(kind)? {
+                    return Ok(TorqueProgress::Done(TorqueOutcome::Confirmed));
+                }
+                let wake = (self.clock_now() + EVIDENCE_PROBE_INTERVAL).min(exp);
+                return Ok(TorqueProgress::Pending { wake });
             }
             RestPoseGateStatus::RefusedNonRest => {
                 return Err(ArmDriverError::TorqueOffWouldDrop);
@@ -3782,8 +4037,12 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         }
         match self.evaluate_rest_pose_gate() {
             RestPoseGateStatus::Confirmed => {
-                self.execute_disable_writes(kind)?;
-                Ok(TorqueProgress::Done(TorqueOutcome::Confirmed))
+                if self.execute_disable_writes(kind)? {
+                    Ok(TorqueProgress::Done(TorqueOutcome::Confirmed))
+                } else {
+                    let wake = (self.clock_now() + EVIDENCE_PROBE_INTERVAL).min(exp);
+                    Ok(TorqueProgress::Pending { wake })
+                }
             }
             RestPoseGateStatus::RefusedNonRest => Err(ArmDriverError::TorqueOffWouldDrop),
             RestPoseGateStatus::PendingDrainOrWindow | RestPoseGateStatus::StaleOrMissing => {
@@ -4195,8 +4454,18 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                 }
             }
         }
-        self.execute_disable_writes(kind)?;
-        Ok(TorqueProgress::Done(TorqueOutcome::Confirmed))
+        if self.execute_disable_writes(kind)? {
+            Ok(TorqueProgress::Done(TorqueOutcome::Confirmed))
+        } else {
+            let wake = match kind {
+                DisableKind::DisableRequested { started_at } => {
+                    let exp = started_at + STOPPED_DISABLE_REQUEST_LIFETIME;
+                    (self.clock_now() + EVIDENCE_PROBE_INTERVAL).min(exp)
+                }
+                DisableKind::DisableProtective { .. } => self.clock_now(),
+            };
+            Ok(TorqueProgress::Pending { wake })
+        }
     }
 
     fn begin_disable_torque_budgeted(

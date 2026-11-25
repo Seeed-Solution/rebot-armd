@@ -34,6 +34,9 @@ impl Transport for SharedTransport {
     fn flush(&mut self) -> Result<(), TransportError> {
         self.0.lock().unwrap().flush()
     }
+    fn clears_input_buffer(&self) -> bool {
+        self.0.lock().unwrap().clears_input_buffer()
+    }
 }
 
 // -------------------------------------------------------------------------

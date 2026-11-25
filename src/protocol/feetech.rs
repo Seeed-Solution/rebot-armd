@@ -288,6 +288,95 @@ pub fn build_sync_write_positions(positions: &[(u8, u16)]) -> Result<Vec<u8>, Fe
     Ok(out)
 }
 
+/// Zero-allocation borrowed view of a parsed Feetech response packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeetechPacketRef<'a> {
+    pub id: u8,
+    pub error: u8,
+    pub params: &'a [u8],
+}
+
+/// Zero-allocation parse error for [`parse_response_ref`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeetechRefParseError {
+    Incomplete,
+    InvalidLength,
+    ChecksumMismatch,
+}
+
+/// Zero-allocation version of [`parse_response`]: returns a borrowed slice into `buf` and the
+/// number of bytes consumed without allocating `Vec` or error `String`s.
+pub fn parse_response_ref(buf: &[u8]) -> Result<(FeetechPacketRef<'_>, usize), FeetechRefParseError> {
+    let header_pos = match buf.windows(2).position(|w| w == FEETECH_HEADER) {
+        Some(pos) => pos,
+        None => return Err(FeetechRefParseError::Incomplete),
+    };
+    let slice = &buf[header_pos..];
+    if slice.len() < 6 {
+        return Err(FeetechRefParseError::Incomplete);
+    }
+    let id = slice[2];
+    let length = slice[3] as usize;
+    if !(2..=64).contains(&length) {
+        return Err(FeetechRefParseError::InvalidLength);
+    }
+    let total_packet_len = 4 + length;
+    if slice.len() < total_packet_len {
+        return Err(FeetechRefParseError::Incomplete);
+    }
+    let error_byte = slice[4];
+    let params_len = length - 2;
+    let params = &slice[5..5 + params_len];
+    let expected_checksum = slice[4 + length - 1];
+    let calc_checksum = calculate_checksum(id, slice[3], error_byte, params);
+    if calc_checksum != expected_checksum {
+        return Err(FeetechRefParseError::ChecksumMismatch);
+    }
+    Ok((
+        FeetechPacketRef {
+            id,
+            error: error_byte,
+            params,
+        },
+        header_pos + total_packet_len,
+    ))
+}
+
+/// Zero-allocation `SYNC_READ` builder writing directly into a caller-owned buffer.
+pub fn write_sync_read_into(
+    ids: &[u8],
+    start_addr: u8,
+    data_len: u8,
+    out: &mut Vec<u8>,
+) -> Result<(), &'static str> {
+    if ids.is_empty() {
+        return Err("SYNC_READ_EMPTY_IDS");
+    }
+    if ids.len() > 32 {
+        return Err("SYNC_READ_TOO_MANY_IDS");
+    }
+    out.clear();
+    let length = (4 + ids.len()) as u8;
+    out.push(0xFF);
+    out.push(0xFF);
+    out.push(BROADCAST_ID);
+    out.push(length);
+    out.push(INST_SYNC_READ);
+    out.push(start_addr);
+    out.push(data_len);
+    out.extend_from_slice(ids);
+    let mut sum: u32 = u32::from(BROADCAST_ID)
+        + u32::from(length)
+        + u32::from(INST_SYNC_READ)
+        + u32::from(start_addr)
+        + u32::from(data_len);
+    for &id in ids {
+        sum += u32::from(id);
+    }
+    out.push((!(sum & 0xFF)) as u8);
+    Ok(())
+}
+
 /// Parse a response packet from a byte stream.
 /// Returns the parsed `FeetechPacket` and the number of bytes consumed.
 pub fn parse_response(buf: &[u8]) -> Result<(FeetechPacket, usize), FeetechError> {

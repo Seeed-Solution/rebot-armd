@@ -262,6 +262,12 @@ pub trait Transport: Send {
     /// Discard unread bytes from the hardware input buffer if supported
     fn clear_input_buffer(&mut self) {}
 
+    /// True when [`Self::clear_input_buffer`] actually discards queued input bytes (real serial
+    /// ports and non-preserving mocks); false only for preserving pre-scripted reply-tape mocks.
+    fn clears_input_buffer(&self) -> bool {
+        true
+    }
+
     /// Write entire buffer until finished
     fn write_all(&mut self, mut buf: &[u8]) -> Result<(), TransportError> {
         while !buf.is_empty() {
