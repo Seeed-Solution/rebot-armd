@@ -127,6 +127,9 @@ impl ArmDriver for ZeroOffsetDriver {
     fn is_hardware_disarmed_confirmed(&self) -> bool {
         self.inner.is_hardware_disarmed_confirmed()
     }
+    fn probe_hardware_disarmed_until(&mut self, deadline: Instant) -> bool {
+        self.inner.probe_hardware_disarmed_until(deadline)
+    }
     fn reported_torque_loss_sample_seq(&self) -> Option<u64> {
         self.inner.reported_torque_loss_sample_seq()
     }

@@ -855,7 +855,7 @@ pub struct BaselineTakeReply {
 /// Bounded maintenance and shutdown operations routed through the single RT owner.
 #[allow(clippy::large_enum_variant)] // inline FreeTorqueBaseline keeps RT baseline store zero-alloc
 pub enum MaintenanceOp {
-    RequestShutdown,
+    RequestShutdown { deadline: Instant },
     CommitShutdown { token: u64 },
     ShutdownReady,
     PlanningSnapshot,
@@ -3135,6 +3135,7 @@ pub(crate) struct LifecycleControl {
     commit_token: AtomicU64,
     commit_deadline_ns: AtomicU64,
     commit_state: AtomicU8,
+    teardown_deadline_ns: AtomicU64,
     handback_token: AtomicU64,
     handback_deadline_ns: AtomicU64,
     handback_state: AtomicU8,
@@ -3172,6 +3173,7 @@ impl LifecycleControl {
             commit_token: AtomicU64::new(0),
             commit_deadline_ns: AtomicU64::new(0),
             commit_state: AtomicU8::new(COMMIT_IDLE),
+            teardown_deadline_ns: AtomicU64::new(0),
             handback_token: AtomicU64::new(0),
             handback_deadline_ns: AtomicU64::new(0),
             handback_state: AtomicU8::new(HB_IDLE),
@@ -3213,6 +3215,24 @@ impl LifecycleControl {
     #[inline]
     pub(crate) fn owner_state(&self) -> u8 {
         self.owner_state.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub(crate) fn set_teardown_deadline(&self, deadline: Instant) {
+        self.teardown_deadline_ns
+            .store(self.to_rel_ns(deadline).max(1), Ordering::Release);
+    }
+
+    #[inline]
+    pub(crate) fn teardown_deadline(&self) -> Option<Instant> {
+        let rel = self.teardown_deadline_ns.load(Ordering::Acquire);
+        (rel != 0).then(|| self.epoch + Duration::from_nanos(rel))
+    }
+
+    #[inline]
+    pub(crate) fn commit_deadline(&self) -> Option<Instant> {
+        let rel = self.commit_deadline_ns.load(Ordering::Acquire);
+        (rel != 0).then(|| self.epoch + Duration::from_nanos(rel))
     }
 
     /// Arms a unique token-bound `CommitShutdown` window with one absolute `deadline`.
@@ -4400,6 +4420,7 @@ impl RtExecutorShared {
     ///    granting another writer.
     fn teardown_and_join_until(&self, deadline: Instant, req_kind: u8) {
         // 1. Record the lifecycle obligation BEFORE signaling `control_stop` (fixes R5 Blocker 1).
+        self.lifecycle.set_teardown_deadline(deadline);
         self.lifecycle.raise_request(req_kind);
         if req_kind == LC_REQ_PROCESS_EXIT {
             self.teardown_disable.requested.store(true, Ordering::Release);
@@ -5237,14 +5258,23 @@ impl RtExecutorHandle {
     }
 
     pub fn request_shutdown(&self) -> Result<bool, OwnerError> {
-        match self.call_maintenance(MaintenanceOp::RequestShutdown)? {
+        let deadline = Instant::now()
+            + crate::supervisor::PANIC_DISABLE_TIMEOUT
+            + Duration::from_millis(100);
+        match self.call_maintenance(MaintenanceOp::RequestShutdown { deadline })? {
             MaintenanceResult::ShutdownRequested(confirmed) => Ok(confirmed),
             _ => Err(OwnerError::Protocol),
         }
     }
 
     pub async fn request_shutdown_async(&self) -> Result<bool, OwnerError> {
-        match self.call_maintenance_async(MaintenanceOp::RequestShutdown).await? {
+        let deadline = Instant::now()
+            + crate::supervisor::PANIC_DISABLE_TIMEOUT
+            + Duration::from_millis(100);
+        match self
+            .call_maintenance_async(MaintenanceOp::RequestShutdown { deadline })
+            .await?
+        {
             MaintenanceResult::ShutdownRequested(confirmed) => Ok(confirmed),
             _ => Err(OwnerError::Protocol),
         }
@@ -5470,7 +5500,7 @@ impl RtExecutorHandle {
         match self
             .shared
             .maint_client
-            .call_async_until(MaintenanceOp::RequestShutdown, deadline)
+            .call_async_until(MaintenanceOp::RequestShutdown { deadline }, deadline)
             .await?
         {
             MaintenanceResult::ShutdownRequested(ok) => Ok(ok),
@@ -6500,8 +6530,17 @@ impl ControlState {
         let mut returned_samples = None;
         let mut returned_baseline = None;
         let result = match req.op {
-            MaintenanceOp::RequestShutdown => {
-                let confirmed = core.request_shutdown();
+            MaintenanceOp::RequestShutdown { deadline } => {
+                // Reserve a small reply margin so a silent-axis probe returns `false` cleanly
+                // before `call_async_until` times out on `deadline`.
+                let now = Instant::now();
+                let rem = deadline.saturating_duration_since(now);
+                let probe_deadline = if rem > Duration::from_millis(20) {
+                    deadline - Duration::from_millis(10)
+                } else {
+                    deadline
+                };
+                let confirmed = core.request_shutdown_until(probe_deadline);
                 self.shutdown_committed = confirmed;
                 MaintenanceResult::ShutdownRequested(confirmed)
             }
@@ -6509,8 +6548,18 @@ impl ControlState {
                 if let Some(hook) = self.hooks.on_commit_shutdown.as_ref() {
                     hook();
                 }
+                let commit_dl = self.lifecycle.commit_deadline().unwrap_or_else(|| {
+                    Instant::now() + crate::driver::SHUTDOWN_DISARM_PROOF_WINDOW
+                });
+                let now = Instant::now();
+                let rem = commit_dl.saturating_duration_since(now);
+                let probe_deadline = if rem > Duration::from_millis(20) {
+                    commit_dl - Duration::from_millis(10)
+                } else {
+                    commit_dl
+                };
                 let valid = self.lifecycle.arbitrate_commit_shutdown(token, || {
-                    self.shutdown_committed && core.commit_shutdown()
+                    self.shutdown_committed && core.commit_shutdown_until(probe_deadline)
                 });
                 if valid {
                     core.cancel_active_commissioning_on_stop("shutdown");
@@ -8496,6 +8545,27 @@ pub(crate) fn core_is_confirmed_disarmed(core: &SupervisorInner) -> bool {
     )
 }
 
+/// Like [`core_is_confirmed_disarmed`], but when an idle/never-enabled driver lacks fresh causal
+/// disarm proof at teardown (`stop_and_join` / `CommitShutdown` / idle `ProcessExit`), actively
+/// probes hardware read-only (`0xCC` on Damiao) within `deadline` (`<= SHUTDOWN_DISARM_PROOF_WINDOW`).
+/// Never transmits enable, motion, or disable frames; never accepts an enabled or silent axis.
+pub(crate) fn core_is_confirmed_disarmed_or_probe_until(
+    core: &mut SupervisorInner,
+    deadline: Instant,
+) -> bool {
+    if core_is_confirmed_disarmed(core) {
+        return true;
+    }
+    if !core.eligible_for_readonly_disarm_proof() {
+        return false;
+    }
+    if core.probe_driver_disarmed_until(deadline) && core_is_confirmed_disarmed(core) {
+        core.record_cold_boot_disarm_proof();
+        return true;
+    }
+    false
+}
+
 /// Bounded `DisableProtective { ProcessExit }` helper reserved strictly for deliberate
 /// process-exit emergency disable (`emergency_disable_and_join`). Probe-and-disable cleanup has
 /// been removed: ordinary teardown and startup timeout-losers retain exclusive ownership in
@@ -10076,19 +10146,46 @@ fn control_thread_main_inner(
             .safe_hold
             .process_exit_requested()
             .then(|| lifecycle.safe_hold.process_exit_deadline());
-        let outcome = run_bounded_teardown_disable(
-            core_slot.as_deref_mut().expect("core owned"),
-            &teardown_disable,
-            &exited,
-            &control_exited_cv,
-            &hub,
-            &state.hooks,
-            None,
-            "RT executor emergency shutdown",
-            "panic during emergency teardown disable",
-            None,
-            explicit_dl,
-        );
+        // If the arm was never enabled / is already idle & disarmed, actively obtain read-only
+        // `0xCC` disarm proof within a bounded share of the ProcessExit deadline so we confirm
+        // physical disarm cleanly without sending unnecessary torque-off frames (and if any axis
+        // replies enabled or silent, fall through to bounded `DisableProtective { ProcessExit }`).
+        let core_ref = core_slot.as_deref_mut().expect("core owned");
+        let idle_disarm_proven = if core_ref.eligible_for_readonly_disarm_proof() {
+            let now = Instant::now();
+            let base_dl = explicit_dl.unwrap_or_else(|| {
+                now + state
+                    .hooks
+                    .panic_disable_timeout
+                    .unwrap_or(crate::supervisor::PANIC_DISABLE_TIMEOUT)
+            });
+            let rem = base_dl.saturating_duration_since(now);
+            let probe_dl = now + (rem / 2).min(crate::driver::SHUTDOWN_DISARM_PROOF_WINDOW);
+            core_is_confirmed_disarmed_or_probe_until(core_ref, probe_dl)
+        } else {
+            false
+        };
+        let outcome = if idle_disarm_proven {
+            let outcome = crate::supervisor::PanicDisableOutcome::Confirmed;
+            #[cfg(not(target_arch = "wasm32"))]
+            core_ref.record_post_panic_disable_shadow(false, &outcome);
+            teardown_disable.set_outcome(outcome.clone());
+            outcome
+        } else {
+            run_bounded_teardown_disable(
+                core_ref,
+                &teardown_disable,
+                &exited,
+                &control_exited_cv,
+                &hub,
+                &state.hooks,
+                None,
+                "RT executor emergency shutdown",
+                "panic during emergency teardown disable",
+                None,
+                explicit_dl,
+            )
+        };
         finalize_process_exit_or_retain_safe_hold(
             core_slot,
             &outcome,
@@ -10235,7 +10332,13 @@ fn control_thread_main_inner(
         return;
     }
 
-    if core_is_confirmed_disarmed(core_slot.as_deref().expect("core owned")) {
+    let teardown_deadline = lifecycle.teardown_deadline().unwrap_or_else(|| {
+        Instant::now() + crate::driver::SHUTDOWN_DISARM_PROOF_WINDOW
+    });
+    if core_is_confirmed_disarmed_or_probe_until(
+        core_slot.as_deref_mut().expect("core owned"),
+        teardown_deadline,
+    ) {
         lifecycle.set_owner_state(LC_OWNER_DISARMED_EXITED);
         if let Some(mut c) = core_slot.take() {
             c.shutdown_committed = true;

@@ -1127,6 +1127,9 @@ pub enum PosForceEmitOutcome {
     Deferred { joint: usize, pf_status: PosForceTxStatus },
 }
 
+/// Bounded maximum window for an active read-only shutdown disarm proof probe (`0xCC` polls).
+pub const SHUTDOWN_DISARM_PROOF_WINDOW: Duration = Duration::from_millis(300);
+
 pub trait ArmDriver: Send {
     fn capabilities(&self) -> DriverCapabilities { DriverCapabilities::default() }
 
@@ -1143,6 +1146,14 @@ pub trait ArmDriver: Send {
             && !self.has_any_joint_enabled()
             && !self.has_known_partial_enable()
             && !self.torque_transition_pending()
+    }
+
+    /// Actively obtain fresh causal per-axis physical disarm proof within `deadline` using ONLY
+    /// read-only status polls (NEVER transmitting enable, motion, or disable frames).
+    /// Returns `true` ONLY when [`Self::is_hardware_disarmed_confirmed`] holds after probing;
+    /// otherwise logs which axis/axes failed proof and returns `false`.
+    fn probe_hardware_disarmed_until(&mut self, _deadline: Instant) -> bool {
+        self.is_hardware_disarmed_confirmed()
     }
 
     /// Monotonic counter incremented strictly when a fresh causal hardware sample carrying
@@ -16449,6 +16460,254 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         .unwrap_or(false);
                 causal_after_enable && causal_after_panic_disable
             })
+    }
+
+    /// Actively obtain fresh causal per-axis physical disarm proof for Damiao motors using ONLY
+    /// read-only `0x7FF 0xCC` status polls (`TxKind::DisableProbe`) within a bounded window
+    /// (`<= SHUTDOWN_DISARM_PROOF_WINDOW`, clamped to `wall_deadline`).
+    ///
+    /// - Never sends `CMD_ENABLE`, motion, or `CMD_DISABLE` frames.
+    /// - Accepts fresh causal `state == 0` replies (including axes never enabled in this boot)
+    ///   as disarm proof.
+    /// - Fast-fails and logs the offending axis if any axis replies enabled (`state == 1`) or
+    ///   faulted (`state != 0`), and logs every silent/unconfirmed axis on timeout.
+    fn probe_hardware_disarmed_until(&mut self, wall_deadline: Instant) -> bool {
+        let n = self.motor_ids.len();
+        if n == 0
+            || n > MAX_MODE_JOINTS
+            || self.is_enabled
+            || self.is_enabling
+            || self.torque_transition_pending()
+            || self.disable_dispatched_mask != 0
+            || self.panic_disable_active
+        {
+            tracing::warn!(
+                "Shutdown disarm proof skipped: active Damiao torque state or transition \
+                 (dof={}, is_enabled={}, is_enabling={}, pending={}, disable_mask=0x{:x}, panic_active={})",
+                n,
+                self.is_enabled,
+                self.is_enabling,
+                self.torque_transition_pending(),
+                self.disable_dispatched_mask,
+                self.panic_disable_active,
+            );
+            return false;
+        }
+        if self.is_hardware_disarmed_confirmed() {
+            return true;
+        }
+        if !self.poll_tx_allowed() {
+            tracing::warn!(
+                "Shutdown disarm proof refused: read-only 0xCC polling inhibited by active/unacknowledged MIT deadline fence"
+            );
+            return false;
+        }
+        let now_wall = Instant::now();
+        let budget = wall_deadline
+            .saturating_duration_since(now_wall)
+            .min(SHUTDOWN_DISARM_PROOF_WINDOW);
+        if budget.is_zero() {
+            for i in 0..n {
+                let id = self.motor_ids[i];
+                let fresh = self
+                    .last_feedback_instant
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|t| self.since(t) <= DAMIAO_FEEDBACK_VALID_WINDOW);
+                let st = self.motor_status[i];
+                if !fresh || st != 0 || !self.motor_disarmed_after_enable[i] {
+                    tracing::warn!(
+                        "Shutdown disarm proof deadline expired before probe: Damiao joint J{} (CAN ID 0x{:X}) unconfirmed (fresh={}, state=0x{:X})",
+                        i + 1,
+                        id,
+                        fresh,
+                        st
+                    );
+                }
+            }
+            return false;
+        }
+
+        let drv_deadline = self.now() + budget;
+        let hard_wall = now_wall + budget;
+        const PROBE_RETRY_INTERVAL: Duration = Duration::from_millis(20);
+
+        // Fence any undrained pre-probe RX frames and drain to an observed-empty RX boundary
+        // BEFORE capturing each axis's causal `0xCC` transmit boundary.
+        if !self.last_read_drained {
+            self.awaiting_rx_boundary = true;
+        }
+        while !self.last_read_drained {
+            if self.now() >= drv_deadline || Instant::now() >= hard_wall {
+                tracing::warn!(
+                    "Shutdown disarm proof refused: could not establish empty RX boundary before deadline"
+                );
+                return false;
+            }
+            self.last_poll_rx = None;
+            self.rx_deadline = Some(drv_deadline);
+            self.rx_frame_limit = Some(64);
+            let _ = self.receive_feedback();
+            self.rx_deadline = None;
+            self.rx_frame_limit = None;
+        }
+        self.awaiting_rx_boundary = false;
+
+        let mut probe_tx_boundary: [Option<(u64, Instant)>; MAX_MODE_JOINTS] =
+            [None; MAX_MODE_JOINTS];
+        let mut next_tx_at = self.now();
+        let mut first_pass = true;
+
+        loop {
+            let now_drv = self.now();
+            let now_w = Instant::now();
+            if now_drv >= drv_deadline || now_w >= hard_wall {
+                break;
+            }
+
+            if first_pass || now_drv >= next_tx_at {
+                first_pass = false;
+                let tx_dl = Deadline { at: drv_deadline };
+                let mut sent_any = false;
+                let mut newly_armed_mask = 0u32;
+                let clean_rx_boundary = !self.awaiting_rx_boundary;
+                for i in 0..n {
+                    let already_confirmed = probe_tx_boundary[i].is_some_and(|(p_seq, p_at)| {
+                        self.last_feedback_seq[i] > p_seq
+                            && self.last_feedback_instant[i].is_some_and(|t| {
+                                t >= p_at && self.since(t) <= DAMIAO_FEEDBACK_VALID_WINDOW / 2
+                            })
+                            && self.motor_status[i] == 0
+                            && self.motor_disarmed_after_enable[i]
+                    });
+                    if already_confirmed {
+                        continue;
+                    }
+                    let id = self.motor_ids[i];
+                    match self.send_plain(
+                        TxKind::DisableProbe,
+                        None,
+                        Some(tx_dl),
+                        false,
+                        |_| Some(damiao::build_refresh_frame(id)),
+                    ) {
+                        Ok(_) => {
+                            sent_any = true;
+                            if clean_rx_boundary && probe_tx_boundary[i].is_none() {
+                                let (seq_mark, at_mark) =
+                                    self.last_tx_mark.unwrap_or((self.rx_seq, self.now()));
+                                probe_tx_boundary[i] = Some((seq_mark, at_mark));
+                                newly_armed_mask |= 1u32 << i;
+                            }
+                        }
+                        Err(TxRefusal::DeadlinePassed) => break,
+                        Err(r) => {
+                            tracing::warn!(
+                                "Shutdown disarm proof 0xCC TX failed for Damiao joint J{} (CAN ID 0x{:X}): {:?}",
+                                i + 1,
+                                id,
+                                r
+                            );
+                        }
+                    }
+                }
+                if sent_any {
+                    if let Err(e) = self.can.flush() {
+                        tracing::warn!("Shutdown disarm proof CAN flush failed: {e}");
+                        for (i, slot) in probe_tx_boundary.iter_mut().enumerate().take(n) {
+                            if (newly_armed_mask & (1u32 << i)) != 0 {
+                                *slot = None;
+                            }
+                        }
+                    }
+                }
+                next_tx_at = self.now() + PROBE_RETRY_INTERVAL;
+            }
+
+            self.last_poll_rx = None;
+            self.rx_deadline = Some(drv_deadline);
+            self.rx_frame_limit = Some(64);
+            let _ = self.receive_feedback();
+            self.rx_deadline = None;
+            self.rx_frame_limit = None;
+
+            let mut all_post_probe_disarmed = true;
+            for (i, boundary) in probe_tx_boundary.iter().enumerate().take(n) {
+                let fresh_reply = boundary.is_some_and(|(p_seq, p_at)| {
+                    self.last_feedback_seq[i] > p_seq
+                        && self.last_feedback_instant[i].is_some_and(|t| {
+                            t >= p_at && self.since(t) <= DAMIAO_FEEDBACK_VALID_WINDOW
+                        })
+                });
+                if !fresh_reply {
+                    all_post_probe_disarmed = false;
+                    continue;
+                }
+                let st = self.motor_status[i];
+                if st == 1 {
+                    tracing::warn!(
+                        "Shutdown disarm proof refused: Damiao joint J{} (CAN ID 0x{:X}) replied enabled (state=1)",
+                        i + 1,
+                        self.motor_ids[i]
+                    );
+                    return false;
+                }
+                if st != 0 {
+                    tracing::warn!(
+                        "Shutdown disarm proof refused: Damiao joint J{} (CAN ID 0x{:X}) replied non-disabled (state=0x{:X})",
+                        i + 1,
+                        self.motor_ids[i],
+                        st
+                    );
+                    return false;
+                }
+            }
+            if all_post_probe_disarmed && self.is_hardware_disarmed_confirmed() {
+                return true;
+            }
+
+            let rem_drv = drv_deadline.saturating_duration_since(self.now());
+            let rem_wall = hard_wall.saturating_duration_since(Instant::now());
+            let rem = rem_drv.min(rem_wall);
+            if rem.is_zero() {
+                break;
+            }
+            self.pause(rem.min(Duration::from_millis(2)));
+        }
+
+        for (i, boundary) in probe_tx_boundary.iter().enumerate().take(n) {
+            let fresh_reply = boundary.is_some_and(|(p_seq, p_at)| {
+                self.last_feedback_seq[i] > p_seq
+                    && self.last_feedback_instant[i].is_some_and(|t| {
+                        t >= p_at && self.since(t) <= DAMIAO_FEEDBACK_VALID_WINDOW
+                    })
+            });
+            let id = self.motor_ids[i];
+            if !fresh_reply {
+                tracing::warn!(
+                    "Shutdown disarm proof unconfirmed: Damiao joint J{} (CAN ID 0x{:X}) did not reply to read-only 0xCC poll within {} ms",
+                    i + 1,
+                    id,
+                    budget.as_millis()
+                );
+            } else if self.motor_status[i] == 1 {
+                tracing::warn!(
+                    "Shutdown disarm proof refused: Damiao joint J{} (CAN ID 0x{:X}) replied enabled (state=1)",
+                    i + 1,
+                    id
+                );
+            } else if self.motor_status[i] != 0 || !self.motor_disarmed_after_enable[i] {
+                tracing::warn!(
+                    "Shutdown disarm proof unconfirmed: Damiao joint J{} (CAN ID 0x{:X}) state=0x{:X}, disarmed_after_enable={}",
+                    i + 1,
+                    id,
+                    self.motor_status[i],
+                    self.motor_disarmed_after_enable[i]
+                );
+            }
+        }
+        false
     }
 
     fn reported_torque_loss_sample_seq(&self) -> Option<u64> {

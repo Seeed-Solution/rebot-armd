@@ -5997,15 +5997,80 @@ impl SupervisorInner {
         }
     }
 
+    /// True when this supervisor is idle/disarmed with no active torque, gravity-comp, or
+    /// disable transition (never enabled or cleanly disarmed), making a bounded read-only
+    /// hardware status poll (`0xCC`) safe to confirm physical disarm on shutdown/teardown.
+    #[inline]
+    pub(crate) fn eligible_for_readonly_disarm_proof(&self) -> bool {
+        self.driver.is_some()
+            && !self.is_torqued
+            && !self.disable_pending
+            && self.gravity_comp.is_none()
+            && !self.torque_transition_pending()
+            && self.enable_lifecycle == driver_transitions::EnableLifecycle::Disarmed
+    }
+
+    /// Actively probe causal hardware disarm proof within `deadline` using ONLY read-only
+    /// driver status polls (`0xCC` on Damiao; never enables or disables motors).
+    pub(crate) fn probe_driver_disarmed_until(&mut self, deadline: Instant) -> bool {
+        if self.driver.is_none() {
+            return true;
+        }
+        if !self.eligible_for_readonly_disarm_proof() {
+            return false;
+        }
+        let Some(slot) = self.driver.as_mut() else {
+            return true;
+        };
+        matches!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                slot.try_with_mut(|drv| drv.probe_hardware_disarmed_until(deadline))
+            })),
+            Ok(Ok(true))
+        )
+    }
+
+    /// Record a causally proven idle/cold-boot physical disarm (`torque_intent = Off`) without
+    /// altering safety state or emitting any disable frames.
+    pub(crate) fn record_cold_boot_disarm_proof(&mut self) {
+        self.torque_intent = TorqueIntent::Off;
+        self.measured_hold.clear();
+        self.last_poll_enable_state = EnableState::Disabled;
+        self.last_poll_partial_enable = false;
+    }
+
     /// Authoritative shutdown gate shared by legacy lock and RT executor ownership paths.
     /// Returns `true` when safe to stop the control loop and exit; returns `false` after
-    /// latching stop when no accepted disable has recorded `torque_intent = Off` yet. When
-    /// shutdown was refused while not armed (`!is_torqued || disable_pending`), a repeated
+    /// latching stop when hardware disarm is not confirmed. When idle/never-enabled on boot,
+    /// actively obtains causal disarm proof via bounded read-only status polls (`0xCC`).
+    /// When shutdown was refused while not armed (`!is_torqued || disable_pending`), a repeated
     /// shutdown signal issues `DisableProtective { ProcessExit }`.
     pub fn request_shutdown(&mut self) -> bool {
+        self.request_shutdown_until(Instant::now() + crate::driver::SHUTDOWN_DISARM_PROOF_WINDOW)
+    }
+
+    /// Bounded variant of [`Self::request_shutdown`] carrying the caller's absolute `deadline`.
+    pub fn request_shutdown_until(&mut self, deadline: Instant) -> bool {
         if self.driver.is_none() || self.shutdown_ready() {
             self.shutdown_refused_unknown = false;
             tracing::info!("shutdown: latching EStop so the control loop stops before exit (in memory only, not persisted; the next start is Idle)");
+            self.estop_state.latch();
+            return true;
+        }
+        // Cold-boot / never-enabled idle arm: `set_driver` initializes `torque_intent = On`
+        // fail-closed, so `shutdown_ready()` is false until physical disarm is causally proven.
+        // Actively poll every axis read-only (`0xCC`, bounded <= 300 ms under `deadline`); accept
+        // ONLY when every axis replies disabled with fresh causal evidence. Never send enable
+        // frames, and keep repeated refused-Unknown shutdowns on the ProcessExit disable path.
+        if self.eligible_for_readonly_disarm_proof()
+            && !self.shutdown_refused_unknown
+            && self.probe_driver_disarmed_until(deadline)
+        {
+            self.record_cold_boot_disarm_proof();
+            self.shutdown_refused_unknown = false;
+            tracing::info!(
+                "shutdown: hardware disarm causally confirmed on all axes; latching EStop in memory before exit (not persisted; the next start is Idle)"
+            );
             self.estop_state.latch();
             return true;
         }
@@ -6057,6 +6122,19 @@ impl SupervisorInner {
     /// shutdown is safe so no concurrent `clear_fault`, torque enable, or motion command can
     /// re-energize the arm before process exit; hardware disable paths remain permitted.
     pub fn commit_shutdown(&mut self) -> bool {
+        self.commit_shutdown_until(Instant::now() + crate::driver::SHUTDOWN_DISARM_PROOF_WINDOW)
+    }
+
+    /// Bounded variant of [`Self::commit_shutdown`] that actively refreshes missing/stale
+    /// read-only disarm proof (`0xCC`) within `deadline` when software state is already disarmed.
+    pub fn commit_shutdown_until(&mut self, deadline: Instant) -> bool {
+        if self.driver.is_some()
+            && self.shutdown_ready()
+            && self.eligible_for_readonly_disarm_proof()
+            && !crate::rt_core::executor::core_is_confirmed_disarmed(self)
+        {
+            let _ = self.probe_driver_disarmed_until(deadline);
+        }
         let ready = self.driver.is_none()
             || (self.shutdown_ready()
                 && !self.is_torqued
@@ -17541,7 +17619,7 @@ impl ArmSupervisor {
                     if rem_after_lock.is_zero() {
                         return Err(crate::rt_core::executor::OwnerError::TimedOut.into());
                     }
-                    let task = tokio::task::spawn_blocking(move || inner.request_shutdown());
+                    let task = tokio::task::spawn_blocking(move || inner.request_shutdown_until(deadline));
                     return match tokio::time::timeout(rem_after_lock, task).await {
                         Ok(Ok(ok)) => Ok(ok),
                         Ok(Err(e)) => Err(ArmError::Internal(format!(

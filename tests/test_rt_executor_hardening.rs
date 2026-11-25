@@ -2348,11 +2348,14 @@ async fn mit_fence_trip_confirmed_disable_stays_shutdown_ready_and_repeated_unkn
     assert!(!sup.shutdown_ready().await);
 
     // (b) Repeated shutdown signal when state is Unknown issues a new bounded disable request
-    // (Legacy path): fresh Damiao driver starts with no feedback (`Unknown`) and `immediate_replies`
-    // enabled so motors only answer explicit commands.
+    // (Legacy path): fresh Damiao driver starts with silent motors (`Unknown` even after active
+    // read-only `0xCC` shutdown probing), then motors respond on the repeated shutdown signal.
     let bus_rep = FakeBus::new(&dm_limits());
     bus_rep.with(|s| {
         s.immediate_replies = true;
+        for m in &mut s.motors {
+            m.silent = true;
+        }
         s.tx_log.clear();
     });
     let drv_rep = DamiaoArmDriver::new(bus_rep.clone(), vec![1, 2, 3, 4, 5, 6, 7])
@@ -2362,12 +2365,18 @@ async fn mit_fence_trip_confirmed_disable_stays_shutdown_ready_and_repeated_unkn
     sup_rep.set_lease_enabled(false).await;
     assert!(!sup_rep.shutdown_ready().await);
 
-    // 1st shutdown signal: refused because state is Unknown; latches EStop.
+    // 1st shutdown signal: refused because motors are silent (state remains Unknown); latches EStop.
     assert!(!sup_rep.request_shutdown().await.unwrap());
     assert!(
         !bus_rep.with(|s| s.tx_log.iter().any(|f| f.data == armd::protocol::damiao::CMD_DISABLE)),
         "first refused shutdown signal only latches EStop"
     );
+    bus_rep.with(|s| {
+        s.tx_log.clear();
+        for m in &mut s.motors {
+            m.silent = false;
+        }
+    });
     // Repeated shutdown signal while still Unknown: MUST issue a bounded disable request!
     assert!(
         sup_rep.request_shutdown().await.unwrap(),

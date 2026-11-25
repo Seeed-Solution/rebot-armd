@@ -456,7 +456,7 @@ where
                 let lock_rem = commit_deadline.saturating_duration_since(std::time::Instant::now());
                 let confirmed = match tokio::time::timeout(lock_rem, supervisor.inner().write()).await
                 {
-                    Ok(mut inner) => inner.commit_shutdown(),
+                    Ok(mut inner) => inner.commit_shutdown_until(commit_deadline),
                     Err(_) => false,
                 };
                 if !confirmed {

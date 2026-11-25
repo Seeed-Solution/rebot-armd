@@ -1592,6 +1592,9 @@ async fn drv_f1_blocker1_process_exit_requires_causal_disarm_proof_and_retains_d
         fn capabilities(&self) -> DriverCapabilities { self.inner.capabilities() }
         fn enable_state(&self) -> EnableState { self.inner.enable_state() }
         fn is_hardware_disarmed_confirmed(&self) -> bool { self.inner.is_hardware_disarmed_confirmed() }
+        fn probe_hardware_disarmed_until(&mut self, deadline: Instant) -> bool {
+            self.inner.probe_hardware_disarmed_until(deadline)
+        }
         fn has_driver_fresh_position_api(&self) -> bool { self.inner.has_driver_fresh_position_api() }
         fn fresh_measured_position_for(&self, joint: usize, max_age: Duration) -> Option<f32> {
             self.inner.fresh_measured_position_for(joint, max_age)
@@ -1948,6 +1951,9 @@ async fn drv_f1_blocker2_energized_handback_rejects_stale_or_unverified_hold_cov
             fn capabilities(&self) -> DriverCapabilities { self.inner.capabilities() }
             fn enable_state(&self) -> EnableState { self.inner.enable_state() }
             fn is_hardware_disarmed_confirmed(&self) -> bool { self.inner.is_hardware_disarmed_confirmed() }
+        fn probe_hardware_disarmed_until(&mut self, deadline: Instant) -> bool {
+            self.inner.probe_hardware_disarmed_until(deadline)
+        }
             fn has_driver_fresh_position_api(&self) -> bool { self.inner.has_driver_fresh_position_api() }
             fn fresh_measured_position_for(&self, joint: usize, max_age: Duration) -> Option<f32> {
                 self.inner.fresh_measured_position_for(joint, max_age)
@@ -2137,6 +2143,9 @@ async fn drv_f1_blocker2_energized_handback_rejects_stale_or_unverified_hold_cov
             fn capabilities(&self) -> DriverCapabilities { self.inner.capabilities() }
             fn enable_state(&self) -> EnableState { self.inner.enable_state() }
             fn is_hardware_disarmed_confirmed(&self) -> bool { self.inner.is_hardware_disarmed_confirmed() }
+        fn probe_hardware_disarmed_until(&mut self, deadline: Instant) -> bool {
+            self.inner.probe_hardware_disarmed_until(deadline)
+        }
             fn has_driver_fresh_position_api(&self) -> bool { self.inner.has_driver_fresh_position_api() }
             fn fresh_measured_position_for(&self, joint: usize, max_age: Duration) -> Option<f32> {
                 self.inner.fresh_measured_position_for(joint, max_age)
