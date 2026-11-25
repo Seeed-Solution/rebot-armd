@@ -226,6 +226,10 @@ pub struct FakeBusState {
     pub delayed: Vec<(Instant, CanFrame)>,
     /// Called on every transmit attempt, after it was logged (inject events between attempts).
     pub on_tx: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Delays delivery of the next `REG_WRITE` acknowledgement by this duration on the subsequent
+    /// `receive_timestamped()` call and stamps it with the late arrival time (Blocker 4 test).
+    pub delay_next_reg_write_ack: Option<Duration>,
+    late_reg_write_ack: Option<(Duration, CanFrame)>,
 }
 
 impl FakeBusState {
@@ -327,6 +331,10 @@ impl FakeBusState {
                         m.silent_after_mode_ack = false;
                         if let Some(r) = r { self.rx.push_back(r); }
                         self.motors[k].silent = true;
+                        return;
+                    }
+                    if let (Some(d), Some(frame_ack)) = (self.delay_next_reg_write_ack.take(), r) {
+                        self.late_reg_write_ack = Some((d, frame_ack));
                         return;
                     }
                     r
@@ -466,6 +474,8 @@ impl FakeBus {
             follow_commands: true,
             delayed: Vec::with_capacity(64),
             on_tx: None,
+            delay_next_reg_write_ack: None,
+            late_reg_write_ack: None,
         })))
     }
     pub fn with<R>(&self, f: impl FnOnce(&mut FakeBusState) -> R) -> R { f(&mut self.0.lock().unwrap()) }
@@ -607,6 +617,18 @@ impl CanTransport for FakeBus {
                 Ok((f, ts))
             }
             None => {
+                if let Some((delay, late_frame)) = s.late_reg_write_ack.take() {
+                    let clk = s.clock.clone();
+                    drop(s);
+                    let ts = if let Some(c) = clk {
+                        c.advance(delay);
+                        c.now()
+                    } else {
+                        std::thread::sleep(delay);
+                        Instant::now()
+                    };
+                    return Ok((late_frame, Some(ts)));
+                }
                 s.rx_timestamps.clear();
                 while let Some(f) = s.pending.pop_front() {
                     let ts = s.pending_timestamps.pop_front().flatten().or(Some(now));

@@ -612,9 +612,18 @@ impl ArmDriver for ZeroOffsetDriver {
         rid: u8,
         after_tx_seq: u64,
         min_rx_at: Instant,
+        max_rx_at: Option<Instant>,
         tx_offset_ns: Option<i128>,
     ) -> crate::mit::CommissioningRegMatch {
-        self.inner.commissioning_find_register_reply(joint, write, rid, after_tx_seq, min_rx_at, tx_offset_ns)
+        self.inner.commissioning_find_register_reply(
+            joint,
+            write,
+            rid,
+            after_tx_seq,
+            min_rx_at,
+            max_rx_at,
+            tx_offset_ns,
+        )
     }
     fn commissioning_disable_step(
         &mut self,

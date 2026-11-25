@@ -2010,9 +2010,11 @@ pub trait ArmDriver: Send {
     }
 
     /// Scans the preallocated commissioning register-reply buffer for a reply causally matching
-    /// `(joint, write, rid)` strictly after `(after_tx_seq, min_rx_at, tx_offset_ns)`.
-    /// Returns [`CommissioningRegMatch::Ambiguous`] if multiple replies or any stale/drifted reply
-    /// for `(joint, write, rid)` arrived after `after_tx_seq` (B1 fail-closed attribution).
+    /// `(joint, write, rid)` strictly after `(after_tx_seq, min_rx_at, tx_offset_ns)` and before
+    /// `max_rx_at` (when provided).
+    /// Returns [`CommissioningRegMatch::Ambiguous`] if multiple replies, buffer overflow, or any
+    /// stale/drifted reply for `(joint, write, rid)` arrived after `after_tx_seq` (B1 fail-closed).
+    #[allow(clippy::too_many_arguments)]
     fn commissioning_find_register_reply(
         &self,
         _joint: usize,
@@ -2020,6 +2022,7 @@ pub trait ArmDriver: Send {
         _rid: u8,
         _after_tx_seq: u64,
         _min_rx_at: Instant,
+        _max_rx_at: Option<Instant>,
         _tx_offset_ns: Option<i128>,
     ) -> crate::mit::CommissioningRegMatch {
         crate::mit::CommissioningRegMatch::Pending
@@ -7509,6 +7512,12 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     /// Preallocated inline register reply buffer for RT commissioning (zero heap alloc/free).
     comm_reg_replies: [Option<crate::mit::CommissioningRegReply>; 64],
     comm_reg_reply_len: usize,
+    /// True if more than 64 register replies arrived since the last `commissioning_clear_register_log`;
+    /// forces `commissioning_find_register_reply` to fail closed as `Ambiguous`.
+    comm_reg_reply_overflow: bool,
+    /// Test-only hook invoked strictly AFTER section-6 pre-TX bookkeeping and immediately BEFORE
+    /// the final authority/deadline check and `can.transmit(&frame)`.
+    before_final_tx_gate_hook: Option<std::sync::Arc<dyn Fn(&CanFrame) + Send + Sync>>,
     /// RX sequence number of the last observed-empty receive queue: every frame dequeued after
     /// it (sequence number larger) was enqueued after that observation.
     rx_empty_seq: u64,
@@ -8639,6 +8648,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             register_reply_log: Vec::with_capacity(64),
             comm_reg_replies: [None; 64],
             comm_reg_reply_len: 0,
+            comm_reg_reply_overflow: false,
+            before_final_tx_gate_hook: None,
             clock,
             rx_seq: 0,
             last_feedback_seq: vec![0; dof],
@@ -9604,11 +9615,39 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             if is_cmd_disable && deadline.is_some_and(|d| d.passed(t0)) {
                 break 'send_body Err(TxRefusal::DeadlinePassed);
             }
-            // B1: Capture the causal submission mark immediately adjacent to `can.transmit` after
-            // all pre-TX bookkeeping so no pre-submission gap can widen the attribution window.
+            // B1: Capture the causal submission mark after all section-6 bookkeeping, then run the
+            // terminal authority (`pre_tx_gate`, stop latch/stamp) and transaction/frame deadline
+            // re-checks immediately before `can.transmit` with ZERO intervening bookkeeping.
             let tx_seq_mark = self.rx_seq;
             let tx_started_mark = t0;
             let (_, tx_offset_ns_mark) = self.capture_rx_clock_sample(tx_started_mark);
+            if let Some(ref hook) = self.before_final_tx_gate_hook {
+                hook(&frame);
+            }
+            let latched_final = match self.stop_gate_for_kind(kind) {
+                Ok(v) => v,
+                Err(e) => break 'send_body Err(e),
+            };
+            if matches!(kind, TxKind::RollbackHold(_) | TxKind::MeasuredHold(_))
+                && !latched_before
+                && latched_final
+            {
+                break 'send_body Err(TxRefusal::StopInhibited);
+            }
+            if !skip_stamp_check
+                && expected_stamp.is_some_and(|stamp| self.current_stop_stamp() != stamp)
+            {
+                break 'send_body Err(TxRefusal::StopStampChanged);
+            }
+            if let Some(gate) = pre_tx_gate.as_mut() {
+                if let Err(code) = (gate)() {
+                    *revoked_out = Some(code);
+                    break 'send_body Err(TxRefusal::LeaseFenced);
+                }
+            }
+            if deadline.is_some_and(|d| d.passed(self.now())) {
+                break 'send_body Err(TxRefusal::DeadlinePassed);
+            }
             let res = self.can.transmit(&frame);
             if res.is_ok() {
                 if let Some(idx) = enable_motor_idx {
@@ -14832,6 +14871,15 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         &mut self.can
     }
 
+    #[doc(hidden)]
+    pub fn with_before_final_tx_gate_hook(
+        mut self,
+        hook: std::sync::Arc<dyn Fn(&CanFrame) + Send + Sync>,
+    ) -> Self {
+        self.before_final_tx_gate_hook = Some(hook);
+        self
+    }
+
     /// A command acknowledgement must be separated from buffered pre-command telemetry.
     /// Drained telemetry frames update the feedback cache so pre-write checks (state 0,
     /// stationarity, position) reflect the newest bus state; stale register replies are
@@ -15562,6 +15610,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
     fn commissioning_clear_register_log(&mut self) {
         self.comm_reg_reply_len = 0;
+        self.comm_reg_reply_overflow = false;
     }
 
     fn commissioning_try_send_register_read(
@@ -15693,11 +15742,15 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         rid: u8,
         after_tx_seq: u64,
         min_rx_at: Instant,
+        max_rx_at: Option<Instant>,
         tx_offset_ns: Option<i128>,
     ) -> crate::mit::CommissioningRegMatch {
         let Some(&id) = self.motor_ids.get(joint) else {
             return crate::mit::CommissioningRegMatch::Pending;
         };
+        if self.comm_reg_reply_overflow {
+            return crate::mit::CommissioningRegMatch::Ambiguous;
+        }
         let mut matched: Option<crate::mit::CommissioningRegReply> = None;
         for slot in &self.comm_reg_replies[..self.comm_reg_reply_len] {
             let Some(rep) = *slot else { continue };
@@ -15727,6 +15780,11 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             // cannot distinguish delayed stale traffic from the current request -> fail closed!
             if matched.is_some() {
                 return crate::mit::CommissioningRegMatch::Ambiguous;
+            }
+            // Blocker 4: Never accept a late reply whose arrival timestamp reached/passed the
+            // request expiry deadline (`max_rx_at`).
+            if max_rx_at.is_some_and(|dl| rep.rx_at >= dl) {
+                continue;
             }
             matched = Some(rep);
         }
@@ -18789,6 +18847,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         decode_offset_ns,
                     });
                     self.comm_reg_reply_len += 1;
+                } else {
+                    self.comm_reg_reply_overflow = true;
                 }
             }
             return;
