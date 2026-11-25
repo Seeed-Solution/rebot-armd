@@ -2285,9 +2285,18 @@ impl SupervisorInner {
         };
         let reclaimed_live = run.last_live_target.take();
         run.live_target_auth_gen = None;
-        if let Some(v) = reclaimed_live {
-            if v.capacity() >= self.policy_live_vec_spare.capacity() {
-                self.policy_live_vec_spare = v;
+        if let Some(mut v) = reclaimed_live {
+            if v.capacity() > 0 {
+                v.clear();
+                if self.policy_live_vec_spare.capacity() == 0 {
+                    self.policy_live_vec_spare = v;
+                } else if let Some(spare) = self
+                    .policy_run_spare
+                    .as_mut()
+                    .filter(|s| s.last_live_target.is_none())
+                {
+                    spare.last_live_target = Some(v);
+                }
             }
         }
         self.release_servo_target();
@@ -2465,16 +2474,6 @@ impl SupervisorInner {
         run.to_observation_into_with_vec_spare(false, dst, &mut self.last_policy_obs_vec_spare);
         dst.stop_reason = Some(crate::model::HolderLabel::new(stop_reason));
 
-        if let Some(v) = run.last_live_target.take() {
-            if v.capacity() >= self.policy_live_vec_spare.capacity() {
-                self.policy_live_vec_spare = v;
-            }
-        }
-        if let Some(v) = run.last_shadow_target.take() {
-            if v.capacity() >= self.policy_shadow_vec_spare.capacity() {
-                self.policy_shadow_vec_spare = v;
-            }
-        }
         run.live_target_auth_gen = None;
         run.rt_gate_binding = None;
         run.load_token = 0;
@@ -2482,8 +2481,22 @@ impl SupervisorInner {
         #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
         self.policy_cancel_slots.set_active_run_token(0);
         if run.rt_owned && self.policy_run_spare.is_none() {
+            if self.policy_live_vec_spare.capacity() == 0 {
+                if let Some(mut v) = run.last_live_target.take() {
+                    v.clear();
+                    self.policy_live_vec_spare = v;
+                }
+            }
+            if self.policy_shadow_vec_spare.capacity() == 0 {
+                if let Some(mut v) = run.last_shadow_target.take() {
+                    v.clear();
+                    self.policy_shadow_vec_spare = v;
+                }
+            }
             self.policy_run_spare = Some(run);
         } else {
+            // Leave heap target buffers attached to `run` so `retire_policy_run` frees them
+            // off-thread with 0 frees on `armd-control`.
             self.retire_policy_run(run);
         }
         self.reconcile_target_stream_authority(now);

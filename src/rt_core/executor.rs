@@ -2480,6 +2480,8 @@ struct ServoTargetDispatcherInner {
     unclaimed_outcomes: VecDeque<super::mailbox::TargetOutcome>,
     #[cfg(feature = "policy-runtime")]
     policy_outcomes: VecDeque<(u64, super::mailbox::TargetOutcome)>,
+    #[cfg(feature = "policy-runtime")]
+    tracked_policy_streams: VecDeque<u64>,
     submitted_count: u64,
     #[cfg(feature = "policy-runtime")]
     policy_submitted_count: u64,
@@ -2518,7 +2520,10 @@ impl ServoTargetDispatcherInner {
         let closed_gen = self.port.closed_servo_generation();
         for o in popped {
             #[cfg(feature = "policy-runtime")]
-            if (o.stream.0 & crate::supervisor::targets::SERVO_STREAM_BIT) == 0 && o.stream.0 != 0 {
+            if (o.stream.0 & crate::supervisor::targets::SERVO_STREAM_BIT) == 0
+                && o.stream.0 != 0
+                && self.tracked_policy_streams.contains(&o.stream.0)
+            {
                 if self.policy_outcomes.len() >= UNCLAIMED_TARGET_OUTCOMES_CAP {
                     self.policy_outcomes.pop_front();
                 }
@@ -2654,6 +2659,8 @@ impl ServoTargetDispatcher {
                 unclaimed_outcomes: VecDeque::with_capacity(UNCLAIMED_TARGET_OUTCOMES_CAP),
                 #[cfg(feature = "policy-runtime")]
                 policy_outcomes: VecDeque::with_capacity(UNCLAIMED_TARGET_OUTCOMES_CAP),
+                #[cfg(feature = "policy-runtime")]
+                tracked_policy_streams: VecDeque::with_capacity(64),
                 submitted_count: 0,
                 #[cfg(feature = "policy-runtime")]
                 policy_submitted_count: 0,
@@ -2988,6 +2995,14 @@ impl ServoTargetDispatcher {
                 match sub {
                     super::mailbox::Submitted::Accepted => {
                         g.policy_submitted_count = g.policy_submitted_count.saturating_add(1);
+                        if target.action_id != 0
+                            && !g.tracked_policy_streams.contains(&target.action_id)
+                        {
+                            if g.tracked_policy_streams.len() >= 64 {
+                                g.tracked_policy_streams.pop_front();
+                            }
+                            g.tracked_policy_streams.push_back(target.action_id);
+                        }
                         let assigned_seq = g.port.last_seq();
                         let sid = crate::supervisor::targets::policy_stream(target.action_id);
                         g.last_inflight_key = Some((sid, assigned_seq));
