@@ -108,7 +108,10 @@ impl DetectionSource for GrayOnlyVision {
     }
 }
 
-async fn run_one(debug: bool) -> (Value, u64) {
+/// Runs one `measure_multiview` session.
+/// When `settle_min_s` is `None`, the request omits `settle_min_s` (exercising the default 1.0 s
+/// settle), and `idle_tick` sets the feedback cadence while settled (20 ms = real 50 Hz cadence).
+async fn run_one(debug: bool, settle_min_s: Option<f64>, idle_tick: Duration) -> (Value, u64) {
     let config = ArmConfig::rebot_dm();
     let setup = SupervisorInner::new(config.clone()).grasp_setup().unwrap();
     let cam = CamModel::assumed(&config.arm_model, &setup, &config.camera_mount);
@@ -126,11 +129,22 @@ async fn run_one(debug: bool) -> (Value, u64) {
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+    let srv = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
     let ticker = sup.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(20));
-        loop { interval.tick().await; ticker.tick(0.02).await; }
+    let ticker_task = tokio::spawn(async move {
+        loop {
+            let moving = ticker.inner().read().await.active_trajectory.is_some();
+            if moving {
+                for _ in 0..4 {
+                    ticker.tick(0.02).await;
+                    if ticker.inner().read().await.active_trajectory.is_none() { break; }
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            } else {
+                tokio::time::sleep(idle_tick).await;
+                ticker.tick(0.02).await;
+            }
+        }
     });
     let (mut ws, generation) = common::controller(addr).await;
     let epoch = sup.get_observation().await.epoch_id;
@@ -143,37 +157,53 @@ async fn run_one(debug: bool) -> (Value, u64) {
         inner.target_positions = START.to_vec();
     }
     let epoch = sup.get_observation().await.epoch_id;
-    let ack = common::rpc(&mut ws, generation, epoch, mm::PATH, json!({"label": "box", "speed_scale": 0.5, "debug": debug})).await;
+    let mut body = json!({"label": "box", "speed_scale": 0.5, "debug": debug});
+    if let Some(s) = settle_min_s {
+        body["settle_min_s"] = json!(s);
+    }
+    let ack = common::rpc(&mut ws, generation, epoch, mm::PATH, body).await;
     let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}"));
     let until = Instant::now() + Duration::from_secs(120);
-    loop {
+    let mut last_hb = Instant::now();
+    let res = loop {
         assert!(Instant::now() < until, "action {id} did not end");
-        common::send(&mut ws, json!({"type":"heartbeat", "generation": generation, "epoch_id": epoch})).await;
-        common::drain(&mut ws, 5).await;
+        if last_hb.elapsed() > Duration::from_millis(200) {
+            common::send(&mut ws, json!({"type":"heartbeat", "generation": generation, "epoch_id": epoch})).await;
+            common::drain(&mut ws, 5).await;
+            last_hb = Instant::now();
+        }
         let obs = sup.get_observation().await;
         if let Some(a) = [obs.action, obs.previous_action].into_iter().flatten().find(|a| a.id == id && !a.is_running()) {
-            return (serde_json::to_value(a).unwrap(), id);
+            break (serde_json::to_value(a).unwrap(), id);
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    ticker_task.abort();
+    srv.abort();
+    res
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gray_pgm_debug_bundle_off_on_replay_and_write_failure() {
     let dir = tempfile::tempdir().unwrap();
-    // 1. debug: false writes nothing
+    // 1. debug: false writes nothing (fast settle_min_s: 0.5 case)
     unsafe { std::env::set_var("ARMD_MVIEW_DEBUG_DIR", dir.path()) };
-    let (a_off, _) = run_one(false).await;
+    let (a_off, _) = run_one(false, Some(0.5), Duration::from_millis(2)).await;
     assert_eq!(a_off["state"], "done", "{a_off}");
     assert!(a_off["measurement"].get("debug").is_none());
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 
-    // 2. debug: true writes canonical P5 PGM v2 bundle and replays identically
-    let (a_on, id) = run_one(true).await;
+    // 2. debug: true writes canonical P5 PGM v2 bundle and replays identically, using the
+    //    DEFAULT 1.0 s settle and real 50 Hz (20 ms) feedback cadence so default settling stays covered.
+    let (a_on, id) = run_one(true, None, Duration::from_millis(20)).await;
     assert_eq!(a_on["state"], "done", "{a_on}");
     let m = &a_on["measurement"];
     assert_eq!(m["frame_source"], "gray");
     assert_eq!(m["debug"]["written"], true, "{}", m["debug"]);
+    for k in 1..3 {
+        let settle_ms = m["views"][k]["timing"]["settle_ms"].as_f64().unwrap();
+        assert!(settle_ms >= 1000.0, "view {k} must honour default 1.0 s settle at 50 Hz: {settle_ms} ms");
+    }
     let bdir = dir.path().join(id.to_string());
     for k in 0..3 {
         let p = bdir.join(format!("view_{k}.pgm"));
@@ -198,7 +228,7 @@ async fn gray_pgm_debug_bundle_off_on_replay_and_write_failure() {
     let blocker = dir.path().join("not_a_dir");
     std::fs::write(&blocker, b"x").unwrap();
     unsafe { std::env::set_var("ARMD_MVIEW_DEBUG_DIR", &blocker) };
-    let (a_fail, _) = run_one(true).await;
+    let (a_fail, _) = run_one(true, Some(0.5), Duration::from_millis(2)).await;
     assert_eq!(a_fail["state"], "done", "{a_fail}");
     assert_eq!(a_fail["measurement"]["debug"]["written"], false, "{}", a_fail["measurement"]["debug"]);
     assert!(a_fail["measurement"]["debug"]["error"].as_str().is_some_and(|s| !s.is_empty()));

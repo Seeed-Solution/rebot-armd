@@ -474,10 +474,10 @@ async fn test_5dof_place_execution_lateral_target() {
 
     let ticker = sup.clone();
     let ticker_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(10));
+        let mut interval = tokio::time::interval(Duration::from_millis(1));
         loop {
             interval.tick().await;
-            ticker.tick(0.01).await;
+            ticker.tick(0.02).await;
         }
     });
 
@@ -488,13 +488,23 @@ async fn test_5dof_place_execution_lateral_target() {
         "release": true,
         "retreat": true,
     });
+    let mut rx = sup.subscribe_telemetry().ok();
     let (id, _) = place::start(&sup, sup.capture_admission_stamp(), &body).await.expect("place::start should succeed");
 
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     let mut seen_phases = Vec::new();
     let a = loop {
         assert!(std::time::Instant::now() < deadline, "place execution timed out");
-        let obs = sup.get_observation().await;
+        let obs = match rx.as_mut() {
+            Some(rx) => match tokio::time::timeout(Duration::from_millis(20), rx.recv()).await {
+                Ok(Ok(obs)) => obs,
+                _ => sup.get_observation().await,
+            },
+            None => {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                sup.get_observation().await
+            }
+        };
         if let Some(act) = obs.action.as_ref().or(obs.previous_action.as_ref()).filter(|a| a.id == id) {
             if let Some(ref p) = act.phase {
                 if seen_phases.last() != Some(p) {
@@ -505,7 +515,6 @@ async fn test_5dof_place_execution_lateral_target() {
                 break act.clone();
             }
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
     };
 
     ticker_task.abort();

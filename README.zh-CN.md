@@ -511,9 +511,10 @@ armd 驱动的真实机械臂有足以伤人和损坏物品的力量。使用风
 ## 开发
 
 ```bash
-cargo test                                 # 316 个测试（2 个 ignored），使用仿真机械臂，不需要硬件
+cargo test                                  # 316 个测试（2 个 ignored），使用仿真机械臂，不需要硬件
+cargo nextest run --workspace --profile quick  # 迭代快速通道：排除慢集成套件并设 10 s 慢测警告
 cargo nextest run --workspace --profile fast   # 日常快速通道（cargo-nextest；见 CONTRIBUTING.md「Faster test runs」）
-cargo nextest run --workspace --profile ci     # 全部测试，合并前运行
+cargo nextest run --workspace --profile ci     # 全量测试，合并前运行（default profile 默认 test-threads = "num-cpus"）
 cargo clippy --all-targets -- -D warnings
 node scripts/view_ik_selftest.mjs          # 驾驶舱视角坐标系 IK
 node scripts/calib_selftest.mjs            # 驾驶舱手眼标定（c 部分需要 ../rebot-companion 和 uv）
