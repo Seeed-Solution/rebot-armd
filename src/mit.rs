@@ -3303,28 +3303,27 @@ impl crate::supervisor::SupervisorInner {
             self.abort_running_commissioning(status, code, msg);
             return;
         }
-        if self
-            .commissioning
-            .txn_deadline
-            .is_some_and(|dl| owner_now >= dl)
-        {
-            let code = match self.commissioning.kind {
-                CommissioningOpKind::ReadIdentity => "MIT_TIMEOUT_READ",
-                CommissioningOpKind::WriteTimeout => "MIT_TIMEOUT_FAILED",
-                CommissioningOpKind::MotorZeroDisable => "MOTOR_ZERO_NOT_DISABLED",
-                CommissioningOpKind::MotorZeroWriteVerify => "MOTOR_ZERO_UNVERIFIED",
-            };
-            self.abort_running_commissioning(502, code, "commissioning transaction deadline expired");
+        if let Err((status, code, msg)) = self.commissioning_txn_deadline_ok(kind, owner_now) {
+            self.abort_running_commissioning(status, code, msg);
             return;
         }
 
-        // Compute bounded release cutoff on driver clock, sharing Step 2's remaining RX budget.
+        // Compute bounded release cutoff on driver clock, sharing Step 2's remaining RX budget,
+        // and clamp it to the commissioning transaction deadline.
         let total_span = release_deadline.saturating_duration_since(owner_now);
         let publish_margin = self.tx_release_publish_margin().min(total_span / 2);
-        let owner_cutoff = release_deadline
+        let mut owner_cutoff = release_deadline
             .checked_sub(publish_margin)
             .unwrap_or(owner_now);
+        if let Some(txn_dl) = self.commissioning.txn_deadline {
+            owner_cutoff = owner_cutoff.min(txn_dl);
+        }
         if owner_now_fn() >= owner_cutoff {
+            if let Err((status, code, msg)) =
+                self.commissioning_txn_deadline_ok(kind, owner_now_fn())
+            {
+                self.abort_running_commissioning(status, code, msg);
+            }
             return;
         }
         let remaining_rx = crate::rt_core::ops::RX_FRAME_BUDGET
@@ -3387,40 +3386,48 @@ impl crate::supervisor::SupervisorInner {
         }
 
         // Temporarily take driver out so the live submission gate closure can borrow `&*self`
-        // right before `can.transmit` (closing B2 with zero allocation).
+        // right before `can.transmit` (closing B2 with zero allocation). Wrap in `catch_unwind`
+        // so ANY panic in `drv.clock_now()` or CAN I/O unconditionally restores `self.driver`
+        // before unwinding (never dropping the sole driver or leaving `self.driver == None`).
         let mut taken = self.driver.take();
-        let step_result = if let Some(drv) = taken
-            .as_mut()
-            .and_then(crate::supervisor_lock::DriverSlot::as_exclusive_mut)
-        {
-            let drv_now = drv.clock_now();
-            let span = owner_cutoff.saturating_duration_since(owner_now_fn());
-            let drv_cutoff = drv_now + span;
-            drv.set_tx_release_deadline(Some(drv_cutoff));
+        let step_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if let Some(drv) = taken
+                .as_mut()
+                .and_then(crate::supervisor_lock::DriverSlot::as_exclusive_mut)
+            {
+                let drv_now = drv.clock_now();
+                let span = owner_cutoff.saturating_duration_since(owner_now_fn());
+                let drv_cutoff = drv_now + span;
+                drv.set_tx_release_deadline(Some(drv_cutoff));
 
-            let res = match kind {
-                CommissioningOpKind::ReadIdentity => {
-                    self.step_read_identity_with_drv(drv, &auth, drv_cutoff, remaining_rx, owner_now_fn)
-                }
-                CommissioningOpKind::WriteTimeout => {
-                    self.step_write_timeout_with_drv(drv, &auth, drv_cutoff, remaining_rx, owner_now_fn)
-                }
-                CommissioningOpKind::MotorZeroDisable => {
-                    self.step_motor_zero_disable_with_drv(drv, &auth, drv_cutoff, remaining_rx, owner_now_fn)
-                }
-                CommissioningOpKind::MotorZeroWriteVerify => {
-                    self.step_motor_zero_write_verify_with_drv(drv, &auth, drv_cutoff, remaining_rx, owner_now_fn)
-                }
-            };
+                let res = match kind {
+                    CommissioningOpKind::ReadIdentity => {
+                        self.step_read_identity_with_drv(drv, &auth, drv_cutoff, remaining_rx, owner_now_fn)
+                    }
+                    CommissioningOpKind::WriteTimeout => {
+                        self.step_write_timeout_with_drv(drv, &auth, drv_cutoff, remaining_rx, owner_now_fn)
+                    }
+                    CommissioningOpKind::MotorZeroDisable => {
+                        self.step_motor_zero_disable_with_drv(drv, &auth, drv_cutoff, remaining_rx, owner_now_fn)
+                    }
+                    CommissioningOpKind::MotorZeroWriteVerify => {
+                        self.step_motor_zero_write_verify_with_drv(drv, &auth, drv_cutoff, remaining_rx, owner_now_fn)
+                    }
+                };
 
-            drv.set_tx_release_deadline(None);
-            #[cfg(not(target_arch = "wasm32"))]
-            self.torque_shadow.drain_from_driver(drv);
-            Some(res)
-        } else {
-            None
-        };
+                drv.set_tx_release_deadline(None);
+                #[cfg(not(target_arch = "wasm32"))]
+                self.torque_shadow.drain_from_driver(drv);
+                Some(res)
+            } else {
+                None
+            }
+        }));
         self.driver = taken;
+        let step_result = match step_outcome {
+            Ok(r) => r,
+            Err(payload) => std::panic::resume_unwind(payload),
+        };
         let Some(step_result) = step_result else {
             self.abort_running_commissioning(500, "DRIVER", "exclusive driver unavailable");
             return;
@@ -3430,6 +3437,70 @@ impl crate::supervisor::SupervisorInner {
         if let Err((status, code, msg_buf)) = step_result {
             self.abort_running_commissioning_bounded(status, code, msg_buf);
         }
+    }
+
+    fn commissioning_deadline_error_code(kind: CommissioningOpKind) -> &'static str {
+        match kind {
+            CommissioningOpKind::ReadIdentity => "MIT_TIMEOUT_READ",
+            CommissioningOpKind::WriteTimeout => "MIT_TIMEOUT_FAILED",
+            CommissioningOpKind::MotorZeroDisable => "MOTOR_ZERO_NOT_DISABLED",
+            CommissioningOpKind::MotorZeroWriteVerify => "MOTOR_ZERO_UNVERIFIED",
+        }
+    }
+
+    fn commissioning_txn_deadline_ok(
+        &self,
+        kind: CommissioningOpKind,
+        owner_now: std::time::Instant,
+    ) -> Result<(), (u16, &'static str, &'static str)> {
+        if self
+            .commissioning
+            .txn_deadline
+            .is_some_and(|dl| owner_now >= dl)
+        {
+            return Err((
+                502,
+                Self::commissioning_deadline_error_code(kind),
+                "commissioning transaction deadline expired",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Combined terminal pre-TX gate re-checking BOTH live authority (operator, lease, epoch,
+    /// stop, reservation, durable marker binding) AND `txn_deadline` immediately before each TX.
+    fn commissioning_pre_tx_gate_ok(
+        &self,
+        kind: CommissioningOpKind,
+        auth: &CommissioningAuthority,
+        owner_now: std::time::Instant,
+    ) -> Result<(), &'static str> {
+        self.commissioning_live_authority_ok(kind, auth, owner_now)
+            .map_err(|(_, code, _)| code)?;
+        if self
+            .commissioning
+            .txn_deadline
+            .is_some_and(|dl| owner_now >= dl)
+        {
+            return Err("TXN_DEADLINE_EXPIRED");
+        }
+        Ok(())
+    }
+
+    fn map_commissioning_revoked(
+        kind: CommissioningOpKind,
+        code: &'static str,
+        revoked_msg: &'static str,
+    ) -> (u16, &'static str, crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>) {
+        if code == "TXN_DEADLINE_EXPIRED" {
+            return (
+                502,
+                Self::commissioning_deadline_error_code(kind),
+                crate::safety::BoundedText::new("commissioning transaction deadline expired"),
+            );
+        }
+        let status = if code == "OPERATOR_REQUIRED" { 403 } else { 409 };
+        (status, code, crate::safety::BoundedText::new(revoked_msg))
     }
 
     fn abort_running_commissioning(&mut self, status: u16, code: &'static str, msg: &str) {
@@ -3486,13 +3557,18 @@ impl crate::supervisor::SupervisorInner {
             ));
         };
         loop {
-            if drv.clock_now() >= drv_cutoff {
-                return Ok(None);
-            }
             if let Err((status, code, msg)) =
                 self.commissioning_live_authority_ok(self.commissioning.kind, auth, owner_now_fn())
             {
                 return Err((status, code, crate::safety::BoundedText::new(msg)));
+            }
+            if let Err((status, code, msg)) =
+                self.commissioning_txn_deadline_ok(self.commissioning.kind, owner_now_fn())
+            {
+                return Err((status, code, crate::safety::BoundedText::new(msg)));
+            }
+            if drv.clock_now() >= drv_cutoff {
+                return Ok(None);
             }
             match self.commissioning.reg_phase {
                 RegReadPhase::QuietWait => {
@@ -3534,8 +3610,7 @@ impl crate::supervisor::SupervisorInner {
                     let rid = COMM_IDENTITY_RIDS[self.commissioning.rid_idx];
                     let op_kind = self.commissioning.kind;
                     let mut gate = || -> Result<(), &'static str> {
-                        self.commissioning_live_authority_ok(op_kind, auth, owner_now_fn())
-                            .map_err(|(_, code, _)| code)
+                        self.commissioning_pre_tx_gate_ok(op_kind, auth, owner_now_fn())
                     };
                     *tx_budget_left = tx_budget_left.saturating_sub(1);
                     match drv.commissioning_try_send_register_read(joint, rid, drv_cutoff, &mut gate) {
@@ -3575,11 +3650,10 @@ impl crate::supervisor::SupervisorInner {
                             return Ok(None);
                         }
                         CommissioningTxStatus::Revoked(code) => {
-                            let status = if code == "OPERATOR_REQUIRED" { 403 } else { 409 };
-                            return Err((
-                                status,
+                            return Err(Self::map_commissioning_revoked(
+                                op_kind,
                                 code,
-                                crate::safety::BoundedText::new("authority revoked before register read"),
+                                "authority revoked before register read",
                             ));
                         }
                         CommissioningTxStatus::Refused(msg) => {
@@ -3590,53 +3664,54 @@ impl crate::supervisor::SupervisorInner {
                 RegReadPhase::AwaitReply => {
                     let rid = COMM_IDENTITY_RIDS[self.commissioning.rid_idx];
                     let tx_started = self.commissioning.req_tx_started.unwrap_or_else(|| drv.clock_now());
+                    let req_deadline = self.commissioning.req_deadline;
+                    let mut drained = false;
                     if *remaining_rx > 0 && drv.clock_now() < drv_cutoff {
-                        if let Ok((frames, _)) = drv.commissioning_drain_rx_step(*remaining_rx, drv_cutoff) {
-                            *remaining_rx = remaining_rx.saturating_sub(frames);
+                        match drv.commissioning_drain_rx_step(*remaining_rx, drv_cutoff) {
+                            Ok((frames, d)) => {
+                                *remaining_rx = remaining_rx.saturating_sub(frames);
+                                drained = d;
+                            }
+                            Err(_) => {
+                                self.commissioning.mark_quiet_if_in_flight(drv.clock_now());
+                                return Err((
+                                    502,
+                                    "MIT_TIMEOUT_READ",
+                                    crate::safety::BoundedText::new("CAN RX error while awaiting register reply"),
+                                ));
+                            }
                         }
                     }
-                    match drv.commissioning_find_register_reply(
+                    if let Err((status, code, msg)) =
+                        self.commissioning_txn_deadline_ok(self.commissioning.kind, owner_now_fn())
+                    {
+                        self.commissioning.mark_quiet_if_in_flight(drv.clock_now());
+                        return Err((status, code, crate::safety::BoundedText::new(msg)));
+                    }
+                    let reply_expired = req_deadline.is_some_and(|dl| drv.clock_now() >= dl);
+                    let match_res = drv.commissioning_find_register_reply(
                         joint,
                         false,
                         rid,
                         self.commissioning.req_tx_seq,
                         tx_started,
+                        req_deadline,
                         self.commissioning.req_tx_offset_ns,
-                    ) {
-                        CommissioningRegMatch::Matched(rep) => {
-                            self.commissioning.req_in_flight = false;
-                            self.commissioning.read_vals[self.commissioning.rid_idx] = (rep.value, rep.reply_id);
-                            self.commissioning.rid_idx += 1;
-                            if self.commissioning.rid_idx >= COMM_IDENTITY_RIDS.len() {
-                                let ident = self.commissioning.build_identity(joint, motor_id).map_err(|m| {
-                                    (502, "MIT_TIMEOUT_READ", crate::safety::BoundedText::new(m))
-                                })?;
-                                self.commissioning.reset_reg_read();
-                                return Ok(Some(ident));
-                            }
-                            self.commissioning.reg_phase = RegReadPhase::DrainBeforeReq;
-                            continue;
-                        }
-                        CommissioningRegMatch::Ambiguous => {
-                            self.commissioning.mark_quiet_if_in_flight(drv.clock_now());
-                            let mut buf = crate::safety::BoundedText::empty();
-                            let _ = core::fmt::write(
-                                &mut buf,
-                                format_args!(
-                                    "Joint {} (CAN ID 0x{:X}) received ambiguous/stale register reply for RID {rid}; failing closed",
-                                    joint + 1,
-                                    motor_id
-                                ),
-                            );
-                            return Err((502, "MIT_TIMEOUT_READ", buf));
-                        }
-                        CommissioningRegMatch::Pending => {}
+                    );
+                    if matches!(match_res, CommissioningRegMatch::Ambiguous) {
+                        self.commissioning.mark_quiet_if_in_flight(drv.clock_now());
+                        let mut buf = crate::safety::BoundedText::empty();
+                        let _ = core::fmt::write(
+                            &mut buf,
+                            format_args!(
+                                "Joint {} (CAN ID 0x{:X}) received ambiguous/stale register reply for RID {rid}; failing closed",
+                                joint + 1,
+                                motor_id
+                            ),
+                        );
+                        return Err((502, "MIT_TIMEOUT_READ", buf));
                     }
-                    if self
-                        .commissioning
-                        .req_deadline
-                        .is_some_and(|dl| drv.clock_now() >= dl)
-                    {
+                    if reply_expired {
                         self.commissioning.mark_quiet_if_in_flight(drv.clock_now());
                         let mut buf = crate::safety::BoundedText::empty();
                         let _ = core::fmt::write(
@@ -3648,6 +3723,25 @@ impl crate::supervisor::SupervisorInner {
                             ),
                         );
                         return Err((502, "MIT_TIMEOUT_READ", buf));
+                    }
+                    // Blocker 4: Complete the RX drain before accepting any matched reply so a
+                    // duplicate reply sitting beyond this release's RX drain budget cannot slip past.
+                    if !drained {
+                        return Ok(None);
+                    }
+                    if let CommissioningRegMatch::Matched(rep) = match_res {
+                        self.commissioning.req_in_flight = false;
+                        self.commissioning.read_vals[self.commissioning.rid_idx] = (rep.value, rep.reply_id);
+                        self.commissioning.rid_idx += 1;
+                        if self.commissioning.rid_idx >= COMM_IDENTITY_RIDS.len() {
+                            let ident = self.commissioning.build_identity(joint, motor_id).map_err(|m| {
+                                (502, "MIT_TIMEOUT_READ", crate::safety::BoundedText::new(m))
+                            })?;
+                            self.commissioning.reset_reg_read();
+                            return Ok(Some(ident));
+                        }
+                        self.commissioning.reg_phase = RegReadPhase::DrainBeforeReq;
+                        continue;
                     }
                     return Ok(None);
                 }
@@ -3707,6 +3801,12 @@ impl crate::supervisor::SupervisorInner {
         let mut tx_budget = COMM_MAX_TX_PER_RELEASE;
         let counts = self.commissioning.timeout_counts;
         while self.commissioning.joint_idx < self.commissioning.joint_len {
+            if let Err((status, code, msg)) = self.commissioning_txn_deadline_ok(
+                CommissioningOpKind::WriteTimeout,
+                owner_now_fn(),
+            ) {
+                return Err((status, code, crate::safety::BoundedText::new(msg)));
+            }
             if drv.clock_now() >= drv_cutoff {
                 return Ok(());
             }
@@ -3803,12 +3903,11 @@ impl crate::supervisor::SupervisorInner {
                         return Err((status, code, crate::safety::BoundedText::new(msg)));
                     }
                     let mut gate = || -> Result<(), &'static str> {
-                        self.commissioning_live_authority_ok(
+                        self.commissioning_pre_tx_gate_ok(
                             CommissioningOpKind::WriteTimeout,
                             auth,
                             owner_now_fn(),
                         )
-                        .map_err(|(_, code, _)| code)
                     };
                     tx_budget = tx_budget.saturating_sub(1);
                     match drv.commissioning_try_send_timeout_write(joint, counts, drv_cutoff, &mut gate) {
@@ -3858,11 +3957,10 @@ impl crate::supervisor::SupervisorInner {
                             return Ok(());
                         }
                         CommissioningTxStatus::Revoked(code) => {
-                            let status = if code == "OPERATOR_REQUIRED" { 403 } else { 409 };
-                            return Err((
-                                status,
+                            return Err(Self::map_commissioning_revoked(
+                                CommissioningOpKind::WriteTimeout,
                                 code,
-                                crate::safety::BoundedText::new("authority revoked before TIMEOUT write"),
+                                "authority revoked before TIMEOUT write",
                             ));
                         }
                         CommissioningTxStatus::Refused(msg) => {
@@ -3875,60 +3973,54 @@ impl crate::supervisor::SupervisorInner {
                         return Err((500, "INTERNAL", crate::safety::BoundedText::new("missing before identity")));
                     };
                     let tx_started = self.commissioning.req_tx_started.unwrap_or_else(|| drv.clock_now());
+                    let req_deadline = self.commissioning.req_deadline;
+                    let mut drained = false;
                     if remaining_rx > 0 && drv.clock_now() < drv_cutoff {
-                        if let Ok((frames, _)) = drv.commissioning_drain_rx_step(remaining_rx, drv_cutoff) {
-                            remaining_rx = remaining_rx.saturating_sub(frames);
+                        match drv.commissioning_drain_rx_step(remaining_rx, drv_cutoff) {
+                            Ok((frames, d)) => {
+                                remaining_rx = remaining_rx.saturating_sub(frames);
+                                drained = d;
+                            }
+                            Err(_) => {
+                                self.commissioning.mark_quiet_if_in_flight(drv.clock_now());
+                                return Err((
+                                    502,
+                                    "MIT_TIMEOUT_FAILED",
+                                    crate::safety::BoundedText::new("CAN RX error while awaiting TIMEOUT write ack"),
+                                ));
+                            }
                         }
                     }
-                    match drv.commissioning_find_register_reply(
+                    if let Err((status, code, msg)) = self.commissioning_txn_deadline_ok(
+                        CommissioningOpKind::WriteTimeout,
+                        owner_now_fn(),
+                    ) {
+                        self.commissioning.mark_quiet_if_in_flight(drv.clock_now());
+                        return Err((status, code, crate::safety::BoundedText::new(msg)));
+                    }
+                    let reply_expired = req_deadline.is_some_and(|dl| drv.clock_now() >= dl);
+                    let match_res = drv.commissioning_find_register_reply(
                         joint,
                         true,
                         damiao::RID_TIMEOUT,
                         self.commissioning.req_tx_seq,
                         tx_started,
+                        req_deadline,
                         self.commissioning.req_tx_offset_ns,
-                    ) {
-                        CommissioningRegMatch::Matched(ack) => {
-                            self.commissioning.req_in_flight = false;
-                            let ack_val = u32::from_le_bytes(ack.value);
-                            if ack.reply_id != before.mst_id || ack_val != counts {
-                                let mut buf = crate::safety::BoundedText::empty();
-                                let _ = core::fmt::write(
-                                    &mut buf,
-                                    format_args!(
-                                        "joint {}: TIMEOUT write acknowledged with {} on 0x{:X} (wrote {counts}, MST_ID {})",
-                                        joint + 1,
-                                        ack_val,
-                                        ack.reply_id,
-                                        before.mst_id
-                                    ),
-                                );
-                                return Err((502, "MIT_TIMEOUT_FAILED", buf));
-                            }
-                            self.commissioning.outcomes[idx].ack_raw = ack_val;
-                            self.commissioning.reset_reg_read();
-                            self.commissioning.write_phase = WriteTimeoutPhase::ReadAfter;
-                            continue;
-                        }
-                        CommissioningRegMatch::Ambiguous => {
-                            self.commissioning.mark_quiet_if_in_flight(drv.clock_now());
-                            let mut buf = crate::safety::BoundedText::empty();
-                            let _ = core::fmt::write(
-                                &mut buf,
-                                format_args!(
-                                    "joint {}: ambiguous or stale TIMEOUT write ack observed; failing closed as Uncertain",
-                                    joint + 1
-                                ),
-                            );
-                            return Err((502, "MIT_TIMEOUT_FAILED", buf));
-                        }
-                        CommissioningRegMatch::Pending => {}
+                    );
+                    if matches!(match_res, CommissioningRegMatch::Ambiguous) {
+                        self.commissioning.mark_quiet_if_in_flight(drv.clock_now());
+                        let mut buf = crate::safety::BoundedText::empty();
+                        let _ = core::fmt::write(
+                            &mut buf,
+                            format_args!(
+                                "joint {}: ambiguous or stale TIMEOUT write ack observed; failing closed as Uncertain",
+                                joint + 1
+                            ),
+                        );
+                        return Err((502, "MIT_TIMEOUT_FAILED", buf));
                     }
-                    if self
-                        .commissioning
-                        .req_deadline
-                        .is_some_and(|dl| drv.clock_now() >= dl)
-                    {
+                    if reply_expired {
                         self.commissioning.mark_quiet_if_in_flight(drv.clock_now());
                         let mut buf = crate::safety::BoundedText::empty();
                         let _ = core::fmt::write(
@@ -3940,6 +4032,33 @@ impl crate::supervisor::SupervisorInner {
                             ),
                         );
                         return Err((502, "MIT_TIMEOUT_FAILED", buf));
+                    }
+                    // Blocker 4: Complete the RX drain before accepting the write ACK so a
+                    // duplicate ACK beyond this release's RX drain budget cannot slip past.
+                    if !drained {
+                        return Ok(());
+                    }
+                    if let CommissioningRegMatch::Matched(ack) = match_res {
+                        self.commissioning.req_in_flight = false;
+                        let ack_val = u32::from_le_bytes(ack.value);
+                        if ack.reply_id != before.mst_id || ack_val != counts {
+                            let mut buf = crate::safety::BoundedText::empty();
+                            let _ = core::fmt::write(
+                                &mut buf,
+                                format_args!(
+                                    "joint {}: TIMEOUT write acknowledged with {} on 0x{:X} (wrote {counts}, MST_ID {})",
+                                    joint + 1,
+                                    ack_val,
+                                    ack.reply_id,
+                                    before.mst_id
+                                ),
+                            );
+                            return Err((502, "MIT_TIMEOUT_FAILED", buf));
+                        }
+                        self.commissioning.outcomes[idx].ack_raw = ack_val;
+                        self.commissioning.reset_reg_read();
+                        self.commissioning.write_phase = WriteTimeoutPhase::ReadAfter;
+                        continue;
                     }
                     return Ok(());
                 }
@@ -4038,12 +4157,11 @@ impl crate::supervisor::SupervisorInner {
         match self.commissioning.mz_phase {
             MotorZeroPhase::DisableDispatch => {
                 let mut gate = || -> Result<(), &'static str> {
-                    self.commissioning_live_authority_ok(
+                    self.commissioning_pre_tx_gate_ok(
                         CommissioningOpKind::MotorZeroDisable,
                         auth,
                         owner_now_fn(),
                     )
-                    .map_err(|(_, code, _)| code)
                 };
                 match drv.commissioning_disable_step(started_at, drv_cutoff, &mut gate) {
                     CommissioningDisableStep::AllDispatched {
@@ -4058,11 +4176,10 @@ impl crate::supervisor::SupervisorInner {
                     CommissioningDisableStep::InProgress { .. }
                     | CommissioningDisableStep::WaitEvidence => return Ok(()),
                     CommissioningDisableStep::Revoked(code) => {
-                        let status = if code == "OPERATOR_REQUIRED" { 403 } else { 409 };
-                        return Err((
-                            status,
+                        return Err(Self::map_commissioning_revoked(
+                            CommissioningOpKind::MotorZeroDisable,
                             code,
-                            crate::safety::BoundedText::new("authority revoked before disable"),
+                            "authority revoked before disable",
                         ));
                     }
                     CommissioningDisableStep::Refused(msg) => {
@@ -4151,12 +4268,11 @@ impl crate::supervisor::SupervisorInner {
                         return Err((status, code, crate::safety::BoundedText::new(msg)));
                     }
                     let mut gate = || -> Result<(), &'static str> {
-                        self.commissioning_live_authority_ok(
+                        self.commissioning_pre_tx_gate_ok(
                             CommissioningOpKind::MotorZeroWriteVerify,
                             auth,
                             owner_now_fn(),
                         )
-                        .map_err(|(_, code, _)| code)
                     };
                     match drv.commissioning_try_send_set_zero(joint, drv_cutoff, &mut gate) {
                         CommissioningTxStatus::Sent {
@@ -4214,11 +4330,10 @@ impl crate::supervisor::SupervisorInner {
                             return Ok(());
                         }
                         CommissioningTxStatus::Revoked(code) => {
-                            let status = if code == "OPERATOR_REQUIRED" { 403 } else { 409 };
-                            return Err((
-                                status,
+                            return Err(Self::map_commissioning_revoked(
+                                CommissioningOpKind::MotorZeroWriteVerify,
                                 code,
-                                crate::safety::BoundedText::new("authority revoked before set-zero"),
+                                "authority revoked before set-zero",
                             ));
                         }
                         CommissioningTxStatus::Refused(msg) => {

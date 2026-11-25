@@ -549,11 +549,13 @@ impl SafeHoldBuffers {
                 };
                 if !self.thermal_disable_started {
                     match drv.begin_disable_torque_budgeted(kind, 0) {
-                        Ok(TorqueProgress::Done(crate::driver::TorqueOutcome::Confirmed)) => {
+                        Ok(TorqueProgress::Done(crate::driver::TorqueOutcome::Confirmed))
+                            if drv.is_hardware_disarmed_confirmed() =>
+                        {
                             self.thermal_disable_started = true;
                             ctrl.thermal_disable_confirmed.store(true, Ordering::Release);
                         }
-                        Ok(TorqueProgress::Done(crate::driver::TorqueOutcome::Unconfirmed)) => {
+                        Ok(TorqueProgress::Done(_)) => {
                             // Never falsely mark unconfirmed thermal disable as confirmed; retry.
                             self.thermal_disable_started = false;
                         }
@@ -569,10 +571,12 @@ impl SafeHoldBuffers {
                     && !ctrl.thermal_disable_confirmed.load(Ordering::Acquire)
                 {
                     match drv.poll_torque_budgeted(drv_cap, RX_FRAME_BUDGET) {
-                        Ok(TorqueProgress::Done(crate::driver::TorqueOutcome::Confirmed)) => {
+                        Ok(TorqueProgress::Done(crate::driver::TorqueOutcome::Confirmed))
+                            if drv.is_hardware_disarmed_confirmed() =>
+                        {
                             ctrl.thermal_disable_confirmed.store(true, Ordering::Release);
                         }
-                        Ok(TorqueProgress::Done(crate::driver::TorqueOutcome::Unconfirmed)) => {
+                        Ok(TorqueProgress::Done(_)) => {
                             self.thermal_disable_started = false;
                         }
                         Ok(TorqueProgress::Pending { .. }) => {}
@@ -729,14 +733,17 @@ impl SafeHoldBuffers {
         FNow: FnMut() -> Instant,
         FSleep: FnMut(Duration),
     {
-        self.prepare_driver_on_entry(drv);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.prepare_driver_on_entry(drv);
+        }));
         ctrl.mark_active(reason);
         let period = self.period.max(Duration::from_millis(1));
         loop {
             if ctrl.process_exit_requested.load(Ordering::Acquire) {
                 return ctrl.process_exit_deadline();
             }
-            let tick_start = now_fn();
+            let tick_start = std::panic::catch_unwind(std::panic::AssertUnwindSafe(&mut now_fn))
+                .unwrap_or_else(|_| Instant::now());
             let release_deadline = tick_start + period;
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 self.step_driver_with_shadow(
@@ -750,9 +757,15 @@ impl SafeHoldBuffers {
             if ctrl.process_exit_requested.load(Ordering::Acquire) {
                 continue;
             }
-            let elapsed = now_fn().saturating_duration_since(tick_start);
+            let tick_end = std::panic::catch_unwind(std::panic::AssertUnwindSafe(&mut now_fn))
+                .unwrap_or_else(|_| Instant::now());
+            let elapsed = tick_end.saturating_duration_since(tick_start);
             if let Some(rem) = period.checked_sub(elapsed) {
-                sleep_dur(rem);
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sleep_dur(rem)))
+                    .is_err()
+                {
+                    std::thread::sleep(rem);
+                }
             }
         }
     }
@@ -791,10 +804,13 @@ impl SafeHoldBuffers {
         FNow: FnMut() -> Instant,
         FSleep: FnMut(Duration),
     {
-        self.prepare_driver_on_entry(drv);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.prepare_driver_on_entry(drv);
+        }));
         let period = self.period.max(Duration::from_millis(1));
         loop {
-            let tick_start = now_fn();
+            let tick_start = std::panic::catch_unwind(std::panic::AssertUnwindSafe(&mut now_fn))
+                .unwrap_or_else(|_| Instant::now());
             let release_deadline = tick_start + period;
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 self.step_driver_with_shadow(
@@ -805,9 +821,15 @@ impl SafeHoldBuffers {
                     shadow.as_deref_mut(),
                 );
             }));
-            let elapsed = now_fn().saturating_duration_since(tick_start);
+            let tick_end = std::panic::catch_unwind(std::panic::AssertUnwindSafe(&mut now_fn))
+                .unwrap_or_else(|_| Instant::now());
+            let elapsed = tick_end.saturating_duration_since(tick_start);
             if let Some(rem) = period.checked_sub(elapsed) {
-                sleep_dur(rem);
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sleep_dur(rem)))
+                    .is_err()
+                {
+                    std::thread::sleep(rem);
+                }
             }
         }
     }

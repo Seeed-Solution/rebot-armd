@@ -3041,25 +3041,27 @@ async fn panic_disable_rt_persistent_j3_unconfirmed_and_damiao_stale_refresh_and
     assert_eq!(rem_pass1, vec![2]);
     assert_eq!(bus_clk.j3_failures.load(Ordering::SeqCst), 1);
 
-    // Advance past the 250 ms feedback validity window so feedback telemetry becomes Unknown.
+    // Advance past the 250 ms feedback validity window so feedback telemetry becomes Unknown
+    // and previously confirmed axes require fresh causal disable feedback again.
     clock.advance(Duration::from_millis(300));
     assert!(!drv_clk.is_feedback_valid());
     assert_eq!(drv_clk.enable_state(), EnableState::Unknown);
-    assert_eq!(drv_clk.unconfirmed_disable_joints(), vec![2]);
+    assert_eq!(drv_clk.unconfirmed_disable_joints(), vec![0, 1, 2, 3, 4, 5, 6]);
     inner_clk.clear_log();
 
-    // Pass 2: sends CMD_DISABLE to pending J3, completing immediately.
+    // Pass 2: sends CMD_DISABLE to stale axes + pending J3 and confirms fresh causal state==0.
     let rem_pass2 = drv_clk
         .panic_disable_step(false, clock.now() + Duration::from_millis(10))
         .unwrap()
         .unwrap();
-    assert!(rem_pass2.is_empty(), "pass 2 must complete after J3 CMD_DISABLE TX succeeds: {rem_pass2:?}");
+    assert!(rem_pass2.is_empty(), "pass 2 must complete after fresh causal disabled feedback on all axes: {rem_pass2:?}");
     assert!(
         inner_clk.tx_log().iter().any(|f| f.id == 3 && f.data == armd::protocol::damiao::CMD_DISABLE),
         "pass 2 must send CMD_DISABLE to pending J3"
     );
     assert_eq!(bus_clk.j3_successes.load(Ordering::SeqCst), 1);
     assert!(drv_clk.unconfirmed_disable_joints().is_empty());
+    assert!(drv_clk.is_hardware_disarmed_confirmed());
 
     // Already-expired step deadline on a fresh panic_disable_step(true, ...) transmits 0 CMD_DISABLE frames (Damiao TX deadline gate).
     clock.advance(Duration::from_millis(300));

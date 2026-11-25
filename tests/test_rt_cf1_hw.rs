@@ -1569,3 +1569,419 @@ async fn blocker_regressions_b1_b2_b3_b4() {
         rig.shutdown().await;
     }
 }
+
+/// Blocker 4 regression (`src/mit.rs` + `src/driver.rs` TIMEOUT write deadline & drain gaps):
+/// 1. Authority revocation AND transaction-deadline expiry injected strictly AFTER section-6
+///    bookkeeping and immediately BEFORE `can.transmit` MUST abort before any `REG_WRITE` hits
+///    the CAN bus (0 `REG_WRITE` frames, marker cleanly removed).
+/// 2. A late `REG_WRITE` ACK arriving at/after `COMM_REG_REPLY_TIMEOUT` (50 ms) MUST NOT be
+///    accepted even when already present in the RX buffer on the poll.
+/// 3. A duplicate `REG_WRITE` ACK sitting beyond a single release's 16-frame RX drain budget
+///    MUST be caught by completing the RX drain before accepting, failing closed as `Uncertain`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cf1_blocker4_timeout_write_pre_tx_revocation_late_reply_and_duplicate_beyond_drain_budget() {
+    // Part A1: Authority revocation (E-stop) injected strictly AFTER section-6 bookkeeping,
+    // immediately before `can.transmit` on `REG_WRITE RID_TIMEOUT`.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let calib_path = dir.path().join("calibration.json");
+        let setup_path = dir.path().join("grasp_setup.json");
+        let poses_path = dir.path().join("poses.json");
+        let gripper_calib_path = dir.path().join("gripper_calib.json");
+
+        let cfg = ArmConfig::rebot_dm();
+        let rest_pos = cfg.resting_positions();
+        let limits = b601_limits();
+        let bus = FakeBus::new(&limits);
+        bus.with(|s| {
+            for (i, m) in s.motors.iter_mut().enumerate() {
+                m.q = rest_pos.get(i).copied().unwrap_or(0.0);
+                m.v = 0.0;
+                m.enabled = false;
+            }
+            s.immediate_replies = true;
+            s.push_all_feedback();
+        });
+
+        let hook_fired = Arc::new(AtomicBool::new(false));
+        let estop_cell: Arc<std::sync::Mutex<Option<Arc<armd::rt_core::urgent::EstopState>>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let hook_fired_c = Arc::clone(&hook_fired);
+        let estop_cell_c = Arc::clone(&estop_cell);
+        let mut raw_drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits)
+            .unwrap()
+            .with_before_final_tx_gate_hook(Arc::new(move |frame: &CanFrame| {
+                if frame.id == 0x7FF
+                    && frame.data[2] == damiao::REG_WRITE
+                    && frame.data[3] == damiao::RID_TIMEOUT
+                    && !hook_fired_c.swap(true, Ordering::AcqRel)
+                {
+                    if let Some(es) = estop_cell_c.lock().unwrap().as_ref() {
+                        es.request_and_latch();
+                    }
+                }
+            }));
+        let _ = raw_drv.read_joint_states();
+        let zero_drv = ZeroOffsetDriver::new(Box::new(raw_drv), &vec![0.0; cfg.dof]);
+        let sup = Arc::new(ArmSupervisor::new(cfg.clone()).with_driver(Box::new(zero_drv)));
+        *estop_cell.lock().unwrap() = Some(Arc::clone(&sup.estop_state));
+        {
+            let mut inner = sup.inner().write().await;
+            inner.poses.path = Some(poses_path);
+            inner.gripper_calib_path = Some(gripper_calib_path);
+            let gate = inner.stopped_disable_gate();
+            if let Some(d) = inner.driver.as_mut() {
+                let _ = d.with_mut(|drv| drv.set_stopped_disable_gate(gate));
+            }
+        }
+        for _ in 0..4 {
+            bus.with(|s| s.push_all_feedback());
+            let mut inner = sup.inner().write().await;
+            if let Some(d) = inner.driver.as_mut() {
+                let _ = d.with_mut(|drv| drv.read_joint_states());
+            }
+        }
+        bus.clear_log();
+
+        let feeder_stop = Arc::new(AtomicBool::new(false));
+        let b = bus.clone();
+        let stop = Arc::clone(&feeder_stop);
+        let feeder_jh = tokio::spawn(async move {
+            while !stop.load(Ordering::Acquire) {
+                b.with(|s| {
+                    if s.rx.len() < 16 && s.pending.len() < 16 {
+                        s.push_all_feedback();
+                    }
+                });
+                tokio::time::sleep(Duration::from_millis(8)).await;
+            }
+        });
+
+        let mut ecfg = ExecutorConfig::for_tests(Duration::from_millis(8));
+        ecfg.alloc_timing = true;
+        let handle = sup.start_executor(ecfg).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        let det_up = armd::api::proxy::DetectorUpstream::parse("http://127.0.0.1:9").unwrap();
+        let grasp_deps = GraspDeps::http(det_up.clone(), Some(setup_path));
+        let cal_deps = CalibrationDeps::new(calib_path.clone(), None, det_up.clone());
+        let router = armd::api::create_router_calibration(
+            sup.clone(),
+            det_up,
+            grasp_deps,
+            armd::diagnostics::DiagnosticsState::global(),
+            cal_deps,
+            OperatorAuth::disabled(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_jh = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/api/v1/ws"))
+            .await
+            .unwrap();
+        let (gen, epoch) = ws_acquire_lease(&mut ws, "b4-pre-tx-revoke").await;
+        let res = ws_cmd(
+            &mut ws,
+            1,
+            gen,
+            epoch,
+            mit::TIMEOUT_PATH,
+            json!({ "joints": [1], "timeout_counts": 2000, "dry_run": false }),
+        )
+        .await;
+        assert!(hook_fired.load(Ordering::Acquire), "pre-TX hook must have run right before REG_WRITE");
+        assert_eq!(res["type"], "command_reject", "revoked pre-TX must reject: {res}");
+        assert_eq!(res["code"], "STOPPED", "{res}");
+        let reg_writes = bus.tx_log().iter().filter(|f| {
+            f.id == 0x7FF && f.data[2] == damiao::REG_WRITE && f.data[3] == damiao::RID_TIMEOUT
+        }).count();
+        assert_eq!(
+            reg_writes, 0,
+            "authority revocation immediately before send MUST emit 0 REG_WRITE frames"
+        );
+        assert_eq!(
+            bus.with(|s| s.motors[0].reg_u32(damiao::RID_TIMEOUT)),
+            0,
+            "motor TIMEOUT RAM must remain untouched"
+        );
+        assert!(
+            !pending_commit_marker_path(&calib_path).exists(),
+            "unmutated pre-TX revocation should cleanly remove .calibration_commit.pending"
+        );
+
+        feeder_stop.store(true, Ordering::Release);
+        let _ = feeder_jh.await;
+        server_jh.abort();
+        tokio::task::spawn_blocking(move || handle.stop_and_join())
+            .await
+            .unwrap();
+    }
+
+    // Part A2: Transaction deadline expiry injected strictly AFTER bookkeeping and immediately
+    // before `can.transmit` MUST abort before any `REG_WRITE` hits the bus.
+    {
+        use std::sync::atomic::AtomicU64;
+        struct OffsetExecClock {
+            base: Instant,
+            offset_ns: AtomicU64,
+        }
+        impl armd::rt_core::executor::ExecutorClock for OffsetExecClock {
+            fn now(&self) -> Instant {
+                Instant::now() + Duration::from_nanos(self.offset_ns.load(Ordering::Acquire))
+            }
+            fn now_ns(&self) -> u64 {
+                self.base
+                    .elapsed()
+                    .as_nanos()
+                    .min(u128::from(u64::MAX)) as u64
+            }
+            fn sleep_until_ns(&self, target_ns: u64, stop: &AtomicBool) -> bool {
+                let now = self.now_ns();
+                if now >= target_ns {
+                    return false;
+                }
+                let rem = Duration::from_nanos(target_ns - now).min(Duration::from_millis(5));
+                if !stop.load(Ordering::Acquire) {
+                    std::thread::sleep(rem);
+                }
+                true
+            }
+            fn sleep(&self, dur: Duration, stop: &AtomicBool) {
+                if !stop.load(Ordering::Acquire) {
+                    std::thread::sleep(dur.min(Duration::from_millis(5)));
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let calib_path = dir.path().join("calibration.json");
+        let setup_path = dir.path().join("grasp_setup.json");
+        let poses_path = dir.path().join("poses.json");
+        let gripper_calib_path = dir.path().join("gripper_calib.json");
+
+        let mut cfg = ArmConfig::rebot_dm();
+        cfg.lease_timeout_ms = 60_000;
+        let rest_pos = cfg.resting_positions();
+        let limits = b601_limits();
+        let bus = FakeBus::new(&limits);
+        bus.with(|s| {
+            for (i, m) in s.motors.iter_mut().enumerate() {
+                m.q = rest_pos.get(i).copied().unwrap_or(0.0);
+                m.v = 0.0;
+                m.enabled = false;
+            }
+            s.immediate_replies = true;
+            s.push_all_feedback();
+        });
+
+        let exec_clock = Arc::new(OffsetExecClock {
+            base: Instant::now(),
+            offset_ns: AtomicU64::new(0),
+        });
+        let hook_fired = Arc::new(AtomicBool::new(false));
+        let hook_fired_c = Arc::clone(&hook_fired);
+        let clock_c = Arc::clone(&exec_clock);
+        let mut raw_drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits)
+            .unwrap()
+            .with_before_final_tx_gate_hook(Arc::new(move |frame: &CanFrame| {
+                if frame.id == 0x7FF
+                    && frame.data[2] == damiao::REG_WRITE
+                    && frame.data[3] == damiao::RID_TIMEOUT
+                    && !hook_fired_c.swap(true, Ordering::AcqRel)
+                {
+                    // Jump owner clock +20 s (> 15 s COMMISSIONING_TXN_TIMEOUT) strictly AFTER
+                    // section-6 bookkeeping and right BEFORE the terminal pre-TX check + transmit.
+                    clock_c.offset_ns.store(20_000_000_000, Ordering::Release);
+                }
+            }));
+        let _ = raw_drv.read_joint_states();
+        let zero_drv = ZeroOffsetDriver::new(Box::new(raw_drv), &vec![0.0; cfg.dof]);
+        let sup = Arc::new(ArmSupervisor::new(cfg.clone()).with_driver(Box::new(zero_drv)));
+        {
+            let mut inner = sup.inner().write().await;
+            inner.poses.path = Some(poses_path);
+            inner.gripper_calib_path = Some(gripper_calib_path);
+            let gate = inner.stopped_disable_gate();
+            if let Some(d) = inner.driver.as_mut() {
+                let _ = d.with_mut(|drv| drv.set_stopped_disable_gate(gate));
+            }
+        }
+        for _ in 0..4 {
+            bus.with(|s| s.push_all_feedback());
+            let mut inner = sup.inner().write().await;
+            if let Some(d) = inner.driver.as_mut() {
+                let _ = d.with_mut(|drv| drv.read_joint_states());
+            }
+        }
+        bus.clear_log();
+
+        let feeder_stop = Arc::new(AtomicBool::new(false));
+        let b = bus.clone();
+        let stop = Arc::clone(&feeder_stop);
+        let feeder_jh = tokio::spawn(async move {
+            while !stop.load(Ordering::Acquire) {
+                b.with(|s| {
+                    if s.rx.len() < 16 && s.pending.len() < 16 {
+                        s.push_all_feedback();
+                    }
+                });
+                tokio::time::sleep(Duration::from_millis(8)).await;
+            }
+        });
+
+        let handle = sup
+            .start_executor_with_hooks(
+                ExecutorConfig::for_tests(Duration::from_millis(8)),
+                armd::rt_core::executor::PersistTestHooks {
+                    clock: Some(exec_clock),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        let det_up = armd::api::proxy::DetectorUpstream::parse("http://127.0.0.1:9").unwrap();
+        let grasp_deps = GraspDeps::http(det_up.clone(), Some(setup_path));
+        let cal_deps = CalibrationDeps::new(calib_path.clone(), None, det_up.clone());
+        let router = armd::api::create_router_calibration(
+            sup.clone(),
+            det_up,
+            grasp_deps,
+            armd::diagnostics::DiagnosticsState::global(),
+            cal_deps,
+            OperatorAuth::disabled(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_jh = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/api/v1/ws"))
+            .await
+            .unwrap();
+        let (gen, epoch) = ws_acquire_lease(&mut ws, "b4-txn-dl").await;
+        let res = ws_cmd(
+            &mut ws,
+            1,
+            gen,
+            epoch,
+            mit::TIMEOUT_PATH,
+            json!({ "joints": [1], "timeout_counts": 2000, "dry_run": false }),
+        )
+        .await;
+        assert!(hook_fired.load(Ordering::Acquire), "pre-TX hook must have run right before REG_WRITE");
+        assert_eq!(res["type"], "command_reject", "expired txn_deadline before send must reject: {res}");
+        assert_eq!(res["code"], "MIT_TIMEOUT_FAILED", "{res}");
+        let reg_writes = bus.tx_log().iter().filter(|f| {
+            f.id == 0x7FF && f.data[2] == damiao::REG_WRITE && f.data[3] == damiao::RID_TIMEOUT
+        }).count();
+        assert_eq!(
+            reg_writes, 0,
+            "expired txn_deadline immediately before send MUST emit 0 REG_WRITE frames"
+        );
+        assert_eq!(bus.with(|s| s.motors[0].reg_u32(damiao::RID_TIMEOUT)), 0);
+        assert!(
+            !pending_commit_marker_path(&calib_path).exists(),
+            "unmutated pre-TX deadline expiry should cleanly remove .calibration_commit.pending"
+        );
+
+        feeder_stop.store(true, Ordering::Release);
+        let _ = feeder_jh.await;
+        server_jh.abort();
+        tokio::task::spawn_blocking(move || handle.stop_and_join())
+            .await
+            .unwrap();
+    }
+
+    // Part B: Late reply (arriving after `COMM_REG_REPLY_TIMEOUT` = 50 ms) MUST NOT be accepted
+    // even when already present in the RX buffer during `AwaitWriteAck`.
+    {
+        let rig = HwRig::new(RtOwner::Executor, true, None, |_| {}).await;
+        let mut ws = rig.connect_ws().await;
+        let (gen, epoch) = ws_acquire_lease(&mut ws, "b4-late-reply").await;
+
+        // Pause the periodic feeder so the first RX read in AwaitWriteAck triggers our 70 ms
+        // delayed valid ACK strictly past the 50 ms COMM_REG_REPLY_TIMEOUT.
+        rig.bus.with(|s| {
+            s.immediate_replies = true;
+            s.delay_next_reg_write_ack = Some(Duration::from_millis(70));
+        });
+
+        let res = ws_cmd(
+            &mut ws,
+            1,
+            gen,
+            epoch,
+            mit::TIMEOUT_PATH,
+            json!({ "joints": [1], "timeout_counts": 2000, "dry_run": false }),
+        )
+        .await;
+        assert_eq!(
+            res["type"], "command_reject",
+            "late REG_WRITE ACK past req_deadline MUST be rejected, never accepted: {res}"
+        );
+        assert_eq!(res["code"], "MIT_TIMEOUT_FAILED", "{res}");
+        assert_eq!(rig.hold_state().await, Some(HoldState::Reconciling));
+        assert!(pending_commit_marker_path(&rig.calib_path).exists());
+        rig.shutdown().await;
+    }
+
+    // Part C: Duplicate reply sitting BEYOND the 16-frame per-release RX drain budget MUST be
+    // caught by completing the RX drain before accepting, failing closed as Uncertain/Ambiguous.
+    {
+        let rig = HwRig::new(RtOwner::Executor, true, None, |_| {}).await;
+        let mut ws = rig.connect_ws().await;
+        let (gen, epoch) = ws_acquire_lease(&mut ws, "b4-dup-beyond-drain").await;
+
+        rig.bus.with(|s| {
+            s.immediate_replies = true;
+            let [lo, hi] = 1u16.to_le_bytes();
+            let val = 2000u32.to_le_bytes();
+            let first_ack = CanFrame::new_standard(
+                0x11,
+                &[lo, hi, damiao::REG_WRITE, damiao::RID_TIMEOUT, val[0], val[1], val[2], val[3]],
+            )
+            .unwrap();
+            // Queue: [ACK #1, 19 filler feedback frames (> 16-frame drain budget)], then
+            // `FakeBus::handle` appends the real ACK #2 at index 20 (frame #21!).
+            s.inject_on_reg_write.clear();
+            s.inject_on_reg_write.push(first_ack);
+            for _ in 0..19 {
+                s.inject_on_reg_write.push(s.motors[1].feedback_frame());
+            }
+        });
+
+        let res = ws_cmd(
+            &mut ws,
+            1,
+            gen,
+            epoch,
+            mit::TIMEOUT_PATH,
+            json!({ "joints": [1], "timeout_counts": 2000, "dry_run": false }),
+        )
+        .await;
+        assert_eq!(
+            res["type"], "command_reject",
+            "duplicate ACK beyond 16-frame RX drain budget MUST fail closed, never accept: {res}"
+        );
+        assert_eq!(res["code"], "MIT_TIMEOUT_FAILED", "{res}");
+        assert!(
+            res["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("ambiguous"),
+            "expected ambiguous duplicate rejection message, got: {res}"
+        );
+        assert_eq!(rig.hold_state().await, Some(HoldState::Reconciling));
+        assert!(pending_commit_marker_path(&rig.calib_path).exists());
+        rig.assert_zero_alloc("Blocker 4 duplicate beyond RX drain budget");
+        rig.shutdown().await;
+    }
+}
