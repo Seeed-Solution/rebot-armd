@@ -8142,6 +8142,11 @@ impl RefreshScheduler {
         };
         let stale = stale_mask & valid_mask;
         // Any joint that received fresh feedback leaves both masks immediately.
+        // If a previously polled joint recovered (replied), the bus is actively answering so do not
+        // hold remaining stale joints behind the silent-sweep cooldown.
+        if (self.swept_mask & !stale) != 0 {
+            self.last_sweep_completed = None;
+        }
         self.swept_mask &= stale;
         self.unfinished_mask &= stale;
         if stale == 0 || !self.slot_available() {
