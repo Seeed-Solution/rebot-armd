@@ -2137,8 +2137,7 @@ impl ReleaseEngine {
                                     acked.commit_seq
                                 })
                             } else if install {
-                                t.ack_deferred(c).map(|(acked, ack_reply)| {
-                                    deferred_step3_reply = Some(ack_reply);
+                                t.ack(c).map(|acked| {
                                     if let Some(i) = acked.installed {
                                         self.active = Some(ActiveSlot::Standalone(i));
                                     }
