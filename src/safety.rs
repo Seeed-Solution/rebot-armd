@@ -2797,6 +2797,39 @@ impl SafetyManager {
         Ok(())
     }
 
+    /// Zero-allocation variant of [`Self::validate_motion_command`] for RT servo target intake.
+    /// Returns `Err((protocol_code, offending_joint_index))`.
+    pub fn validate_motion_command_rt(
+        &self,
+        cmd_epoch_id: Option<u64>,
+        target_positions: &[f32],
+        limits: &[JointLimit],
+    ) -> Result<(), (&'static str, Option<usize>)> {
+        match &*self.state_arc {
+            SafetyState::EStop => return Err(("ESTOP_ACTIVE", None)),
+            SafetyState::Fault(_) => return Err(("FAULT_ACTIVE", None)),
+            SafetyState::Booting | SafetyState::Idle => return Err(("NOT_ARMED", None)),
+            SafetyState::Armed | SafetyState::Moving => {}
+        }
+        if let Some(cmd_epoch) = cmd_epoch_id {
+            if cmd_epoch != self.epoch_id {
+                return Err(("EPOCH_MISMATCH", None));
+            }
+        }
+        if target_positions.len() != limits.len() {
+            return Err(("SAFETY_ERROR", None));
+        }
+        for (idx, (&target, limit)) in target_positions.iter().zip(limits.iter()).enumerate() {
+            if !target.is_finite() {
+                return Err(("SAFETY_ERROR", None));
+            }
+            if target < limit.min_position || target > limit.max_position {
+                return Err(("SOFT_LIMIT_EXCEEDED", Some(idx)));
+            }
+        }
+        Ok(())
+    }
+
     /// Check motion limits across positions, velocities, and torques with NaN/Inf protection
     pub fn check_motion_limits(
         &self,

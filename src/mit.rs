@@ -553,6 +553,9 @@ pub struct MitRuntime {
     pub lost_reason: Option<crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>>,
     /// A park was requested while MIT moved the arm: it starts after rest and the hand back.
     pub park_after_hand_back: bool,
+    /// When true, MIT handback transitions `park_continuation` to `ReadyForPlan` instead of
+    /// planning synchronously inside `tick_control`.
+    pub deferred_park_off_owner: bool,
     /// Action id of that deferred park (its outcome is reported on it).
     pub deferred_park_action: Option<u64>,
     /// A rearm was refused while MIT moved the arm: brake, then hand back at rest.
@@ -602,6 +605,7 @@ impl crate::supervisor::SupervisorInner {
 
     /// Why a motion may not start: MIT is requested on an armed arm but does not own its joints.
     pub fn mit_motion_blocker(&self) -> Option<String> {
+        if self.park_continuation.is_some() { return Some("a park continuation is pending".into()); }
         if !self.mit_motion_blocked() { return None; }
         if self.mit.park_after_hand_back { return Some("a park waits for the MIT hand back at rest".into()); }
         if self.mit.revoke_pending { return Some("MIT authorization revoked: braking to rest and handing back".into()); }
@@ -1038,11 +1042,17 @@ impl crate::supervisor::SupervisorInner {
                     return Some(gm.wire_velocity_ceiling());
                 }
             }
-            active.motion_limits.as_ref().and_then(|ls| ls.get(g).map(|l| l.max_velocity))
+            active
+                .motion_limits
+                .as_ref()
+                .and_then(|ls| ls.get(g).map(|l| l.max_velocity))
+                .or_else(|| active.motion_vel_caps.and_then(|(caps, dof)| (g < dof).then_some(caps[g])))
         } else if let Some(ramp) = &self.tracking.fallback_ramp {
             ramp.limits.get(g).map(|l| l.max_velocity)
         } else if let Some(lim) = self.tracking.retained_motion_limits.as_ref().and_then(|ls| ls.get(g)) {
             Some(lim.max_velocity)
+        } else if let Some((caps, dof)) = self.tracking.retained_motion_vel_caps {
+            (g < dof).then_some(caps[g])
         } else if self.servo_target.is_some() {
             let mut v = self.config.limits.get(g)?.max_velocity;
             #[cfg(feature = "policy-runtime")]
@@ -1075,10 +1085,19 @@ impl crate::supervisor::SupervisorInner {
         if self.urgent_stop_unapplied() || self.disconnect_fence_blocks_output() {
             return TickOutput::None;
         }
+        let is_hold = self.safety.state().is_stopped();
+        // Capture the client lease generation BEFORE `post_stop_check_hook` and BEFORE locking
+        // the driver so even a disconnect arriving in that exact window is caught at the driver's
+        // single TX choke point (`DamiaoArmDriver::send`). Autonomous safety motions
+        // (`watchdog_park`, `pending_normal_unload`) and stopped holds carry `0` (lease-exempt).
+        let output_lease_gen = if !is_hold && self.watchdog_park.is_none() && !self.pending_normal_unload {
+            self.current_active_lease_gen()
+        } else {
+            0
+        };
         if let Some(ref hook) = self.post_stop_check_hook {
             hook();
         }
-        let is_hold = self.safety.state().is_stopped();
         // Every J7 `Target` carries the `(stop_gen, estop_epoch)` from the A1 `AdmissionStamp` of
         // the command that produced it (`self.j7_admitted_stamp`). It is NEVER re-stamped later
         // and NEVER stamped with `max(local, requested)`, so any STOP accepted after admission —
@@ -1190,7 +1209,7 @@ impl crate::supervisor::SupervisorInner {
                 let j7_hold_hint = is_hold
                     || computed_j7_intent.is_some_and(|intent| {
                         !matches!(intent.kind, crate::driver::PosForceIntentKind::Target { .. })
-                            || intent.stamp != non_target_stamp
+                            || intent.stamp.is_stale_against(non_target_stamp)
                     });
                 drv.set_pending_pos_force_hold_hint(j7_hold_hint);
                 // Single TX cutoff choke point under the driver lock:
@@ -1217,9 +1236,13 @@ impl crate::supervisor::SupervisorInner {
                     }
                 }
                 let write_res = if is_hold {
+                    drv.set_output_lease_gen(0);
                     drv.write_estop_hold_bounded(targets)
                 } else {
-                    drv.write_joint_targets_bounded(targets)
+                    drv.set_output_lease_gen(output_lease_gen);
+                    let r = drv.write_joint_targets_bounded(targets);
+                    drv.set_output_lease_gen(0);
+                    r
                 };
                 let now = drv.clock_now();
                 if !is_hold
@@ -1258,6 +1281,9 @@ impl crate::supervisor::SupervisorInner {
                         format_args!("MIT batch write failed: {}", crate::driver::ESTOP_INHIBITED),
                     );
                     self.mit_lose_bounded(reason, crate::safety::FaultCode::BusLoss);
+                }
+                TickOutput::LeaseFenced => {
+                    self.j7_intent = Some(PosForceIntent::hold(self.current_j7_intent_stamp()));
                 }
                 TickOutput::Error { message, .. } => {
                     self.j7_intent = Some(PosForceIntent::stop(self.current_j7_intent_stamp()));
@@ -1439,7 +1465,8 @@ impl crate::supervisor::SupervisorInner {
     /// the output (no motion, park, gravity compensation, hold or fault).
     pub(crate) fn mit_maybe_activate(&mut self) {
         if mit_joint_mask(&self.config) == 0 || self.mit.owner != MitOwner::Off || !self.mit.armed_ok || !self.is_torqued
-            || self.disable_pending || self.pending_rearm || self.pending_normal_unload || self.gravity_comp.is_some()
+            || self.disable_pending || self.pending_rearm || self.pending_normal_unload
+            || self.park_continuation.is_some() || self.gravity_comp.is_some()
             || self.safety.state().is_stopped() || !self.safety.state().is_operational() || self.handover_settling_since.is_some()
             || self.active_trajectory.is_some() || self.servo_target.is_some() || self.servo_stream_active
             || self.collision.hold.is_some() || self.torque_guard.hold.is_some() || self.servo_blocked_hold

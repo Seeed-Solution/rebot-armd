@@ -2,7 +2,7 @@
 //! [`TICK_WINDOW`] ticks, recorded by [`crate::ArmSupervisor::tick`].
 
 use std::cell::Cell;
-use std::sync::atomic::{fence, AtomicBool, AtomicI64, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{fence, AtomicBool, AtomicI64, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use serde::{Serialize, Serializer};
 
@@ -444,6 +444,10 @@ pub struct ThreadUsage {
 pub struct Holder {
     pub kind: &'static str,
     pub location: &'static std::panic::Location<'static>,
+    /// Static WS/command path attributed to this hold (zero allocation on hot path).
+    pub command: Option<&'static str>,
+    /// Action id created or installed under this hold, if any.
+    pub action_id: Option<u64>,
     pub hold_us: u32,
     pub acquire_us: u32,
     /// How long before the tick started waiting the holder took the lock (negative: after).
@@ -456,9 +460,18 @@ pub struct Holder {
 impl Serialize for Holder {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut st = s.serialize_struct("Holder", 6)?;
+        let field_count = 6
+            + usize::from(self.command.is_some())
+            + usize::from(self.action_id.is_some());
+        let mut st = s.serialize_struct("Holder", field_count)?;
         st.serialize_field("kind", self.kind)?;
         st.serialize_field("location", &format!("{}:{}", self.location.file(), self.location.line()))?;
+        if let Some(cmd) = self.command {
+            st.serialize_field("command", cmd)?;
+        }
+        if let Some(id) = self.action_id {
+            st.serialize_field("action_id", &id)?;
+        }
         st.serialize_field("hold_us", &self.hold_us)?;
         st.serialize_field("acquire_us", &self.acquire_us)?;
         st.serialize_field("acquired_before_wait_us", &self.acquired_before_wait_us)?;
@@ -957,6 +970,11 @@ struct AtomicHolder {
     /// 0 = None, 1 = "read", 2 = "write"
     kind: AtomicU8,
     location: AtomicPtr<std::panic::Location<'static>>,
+    /// Null when `command` is `None`; otherwise points to the immutable `&'static str` bytes.
+    command_ptr: AtomicPtr<u8>,
+    command_len: AtomicUsize,
+    has_action_id: AtomicBool,
+    action_id: AtomicU64,
     hold_us: AtomicU32,
     acquire_us: AtomicU32,
     acquired_before_wait_us: AtomicI64,
@@ -967,6 +985,10 @@ struct AtomicHolder {
 struct RawHolder {
     kind: u8,
     location: *const std::panic::Location<'static>,
+    command_ptr: *const u8,
+    command_len: usize,
+    has_action_id: bool,
+    action_id: u64,
     hold_us: u32,
     acquire_us: u32,
     acquired_before_wait_us: i64,
@@ -979,6 +1001,10 @@ impl AtomicHolder {
             None => {
                 self.kind.store(0, Ordering::Relaxed);
                 self.location.store(std::ptr::null_mut(), Ordering::Relaxed);
+                self.command_ptr.store(std::ptr::null_mut(), Ordering::Relaxed);
+                self.command_len.store(0, Ordering::Relaxed);
+                self.has_action_id.store(false, Ordering::Relaxed);
+                self.action_id.store(0, Ordering::Relaxed);
             }
             Some(h) => {
                 let kind = if h.kind == "write" { 2u8 } else { 1u8 };
@@ -987,6 +1013,26 @@ impl AtomicHolder {
                     h.location as *const std::panic::Location<'static> as *mut std::panic::Location<'static>,
                     Ordering::Relaxed,
                 );
+                match h.command {
+                    Some(cmd) => {
+                        self.command_ptr.store(cmd.as_ptr() as *mut u8, Ordering::Relaxed);
+                        self.command_len.store(cmd.len(), Ordering::Relaxed);
+                    }
+                    None => {
+                        self.command_ptr.store(std::ptr::null_mut(), Ordering::Relaxed);
+                        self.command_len.store(0, Ordering::Relaxed);
+                    }
+                }
+                match h.action_id {
+                    Some(id) => {
+                        self.has_action_id.store(true, Ordering::Relaxed);
+                        self.action_id.store(id, Ordering::Relaxed);
+                    }
+                    None => {
+                        self.has_action_id.store(false, Ordering::Relaxed);
+                        self.action_id.store(0, Ordering::Relaxed);
+                    }
+                }
                 self.hold_us.store(h.hold_us, Ordering::Relaxed);
                 self.acquire_us.store(h.acquire_us, Ordering::Relaxed);
                 self.acquired_before_wait_us.store(h.acquired_before_wait_us, Ordering::Relaxed);
@@ -999,6 +1045,10 @@ impl AtomicHolder {
         RawHolder {
             kind: self.kind.load(Ordering::Relaxed),
             location: self.location.load(Ordering::Relaxed) as *const std::panic::Location<'static>,
+            command_ptr: self.command_ptr.load(Ordering::Relaxed) as *const u8,
+            command_len: self.command_len.load(Ordering::Relaxed),
+            has_action_id: self.has_action_id.load(Ordering::Relaxed),
+            action_id: self.action_id.load(Ordering::Relaxed),
             hold_us: self.hold_us.load(Ordering::Relaxed),
             acquire_us: self.acquire_us.load(Ordering::Relaxed),
             acquired_before_wait_us: self.acquired_before_wait_us.load(Ordering::Relaxed),
@@ -1013,17 +1063,30 @@ impl RawHolder {
     /// # Safety
     /// Must only be called after the enclosing seqlock read succeeded (`v1 == v2`, even, Acquire-ordered
     /// with the writer's Release store) so `self.location` is guaranteed to be either null or an
-    /// immutable `&'static std::panic::Location<'static>` pointer written by `AtomicHolder::store_relaxed`.
+    /// immutable `&'static std::panic::Location<'static>` pointer and `(self.command_ptr, self.command_len)`
+    /// is either null or an immutable `&'static str` slice written by `AtomicHolder::store_relaxed`.
     unsafe fn into_holder_validated(self) -> Option<Holder> {
         if self.kind == 0 || self.location.is_null() {
             return None;
         }
         // SAFETY: upheld by caller's validated seqlock read and `'static` location provenance.
         let location: &'static std::panic::Location<'static> = unsafe { &*self.location };
+        let command = if self.command_ptr.is_null() {
+            None
+        } else {
+            // SAFETY: upheld by caller's validated seqlock read and `'static str` provenance.
+            let bytes: &'static [u8] =
+                unsafe { std::slice::from_raw_parts(self.command_ptr, self.command_len) };
+            // SAFETY: bytes were obtained from a valid `&'static str`.
+            Some(unsafe { std::str::from_utf8_unchecked(bytes) })
+        };
+        let action_id = self.has_action_id.then_some(self.action_id);
         let kind = if self.kind == 2 { "write" } else { "read" };
         Some(Holder {
             kind,
             location,
+            command,
+            action_id,
             hold_us: self.hold_us,
             acquire_us: self.acquire_us,
             acquired_before_wait_us: self.acquired_before_wait_us,
@@ -1767,6 +1830,8 @@ mod tests {
         let holder = Holder {
             kind: "read",
             location: std::panic::Location::caller(),
+            command: None,
+            action_id: None,
             hold_us: 31_000,
             acquire_us: 3,
             acquired_before_wait_us: 1_000,
@@ -1801,6 +1866,8 @@ mod tests {
         assert_eq!(mt["wait_us"], 32_000);
         assert_eq!(mt["waited_for"]["kind"], "read");
         assert_eq!(mt["waited_for"]["hold_us"], 31_000);
+        assert!(mt["waited_for"].get("command").is_none(), "{mt}");
+        assert!(mt["waited_for"].get("action_id").is_none(), "{mt}");
         assert!(mt["waited_for"]["location"].as_str().unwrap().starts_with("src/diagnostics/tick.rs:"), "{mt}");
         assert!(mt["longest_hold"].is_null());
         assert!(mt.get("late").is_none());
@@ -1809,6 +1876,33 @@ mod tests {
         assert_eq!(json["lock_phases"]["rx_us"]["max"], 12_000);
         assert!(json["control_thread"].is_null());
         assert!(json["tx"]["send_us"]["max"].is_u64());
+
+        // Holder with command + action_id attribution serializes both fields and round-trips through LockFreeTickStats.
+        let attributed = Holder {
+            kind: "write",
+            location: std::panic::Location::caller(),
+            command: Some("/api/v1/motion/jog"),
+            action_id: Some(19),
+            hold_us: 420,
+            acquire_us: 12,
+            acquired_before_wait_us: 50,
+            released_before_lock_us: 8,
+        };
+        let lf = LockFreeTickStats::new();
+        assert!(lf.record(&TickSample {
+            tick_us: 900,
+            wait_us: 400,
+            lock_us: 300,
+            waited_for: Some(attributed),
+            longest_hold: Some(attributed),
+            ..Default::default()
+        }));
+        let lf_snap = lf.snapshot();
+        let lf_json = serde_json::to_value(&lf_snap).unwrap();
+        assert_eq!(lf_json["max_tick"]["waited_for"]["command"], "/api/v1/motion/jog");
+        assert_eq!(lf_json["max_tick"]["waited_for"]["action_id"], 19);
+        assert_eq!(lf_json["max_tick"]["longest_hold"]["command"], "/api/v1/motion/jog");
+        assert_eq!(lf_json["max_tick"]["longest_hold"]["action_id"], 19);
     }
 
     #[test]
@@ -1893,6 +1987,8 @@ mod tests {
         let read_holder = Holder {
             kind: "read",
             location: std::panic::Location::caller(),
+            command: None,
+            action_id: None,
             hold_us: 12_345,
             acquire_us: 67,
             acquired_before_wait_us: 890,
@@ -1901,6 +1997,8 @@ mod tests {
         let write_holder = Holder {
             kind: "write",
             location: std::panic::Location::caller(),
+            command: Some("/api/v1/motion/jog"),
+            action_id: Some(42),
             hold_us: 23_456,
             acquire_us: 89,
             acquired_before_wait_us: -34,
@@ -2084,6 +2182,8 @@ mod tests {
                 Some(Holder {
                     kind: "read",
                     location: loc_read,
+                    command: None,
+                    action_id: None,
                     hold_us: ku * 7 + 1,
                     acquire_us: ku * 3 + 2,
                     acquired_before_wait_us: k as i64 * 11,
@@ -2096,6 +2196,8 @@ mod tests {
                 Some(Holder {
                     kind: "write",
                     location: loc_write,
+                    command: Some("/api/v1/motion/home"),
+                    action_id: Some(k + 100),
                     hold_us: ku * 13 + 5,
                     acquire_us: ku * 5 + 4,
                     acquired_before_wait_us: -(k as i64 * 2),

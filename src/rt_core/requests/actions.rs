@@ -2617,7 +2617,7 @@ pub(crate) fn check_quintic_workspace_off_lock(
     workspace_samples_and_check_off_lock(traj, start, ws, cam, arm, tcp_offset).map(|_| ())
 }
 
-fn build_prepared_quintic_off_lock(
+pub(crate) fn build_prepared_quintic_off_lock(
     snap: &ActionSnapshot,
     target: &[f32],
     limits: &[JointLimit],
@@ -3674,6 +3674,7 @@ pub enum MacroChildPayload {
         start: Vec<f32>,
         target: Vec<f32>,
         limits: Vec<JointLimit>,
+        prepared: Option<PreparedQuintic>,
     },
     /// Legacy prepared gripper child.
     LegacyGripper {
@@ -3778,6 +3779,7 @@ pub fn install_macro_child(
             start,
             target,
             limits,
+            prepared,
         } => {
             let parent_id = precheck_macro_child(inner, stamp, ctx, &spec, &start)
                 .map_err(|r| r.into_arm_error(inner))?;
@@ -3789,7 +3791,13 @@ pub fn install_macro_child(
                     return Err(r.into_arm_error(inner));
                 }
             };
-            let dur = match SupervisorInner::install_macro_quintic(admitted, parent_id, target, &limits) {
+            let dur = match SupervisorInner::install_macro_quintic_prepared(
+                admitted,
+                parent_id,
+                target,
+                &limits,
+                prepared,
+            ) {
                 Ok(d) => d,
                 Err(e) => {
                     inner.guard_next_macro_child(parent_id, None);

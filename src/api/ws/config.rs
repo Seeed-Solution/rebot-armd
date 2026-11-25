@@ -14,7 +14,7 @@
 use super::*;
 use super::dispatch::{
     AdmissionClass, AuthRequirement, DispatchEntry, DispatchHandler, DispatchKey,
-    FrameKind, LeaseRequirement, OwnerDispatchCtx, ReplyPolicy,
+    FrameKind, LeaseRequirement, OwnerDispatchCtx, OwnerReply, ReplyPolicy,
 };
 use crate::model::{HolderLabel, KeepoutBox};
 use crate::motion::MotionError;
@@ -69,7 +69,7 @@ pub(super) struct PendingConfigJob {
     pub(super) require_expected_revision: bool,
 }
 
-fn dispatch_config_entry(ctx: &mut OwnerDispatchCtx<'_>) -> Option<Value> {
+fn dispatch_config_entry(ctx: &mut OwnerDispatchCtx<'_>) -> Option<OwnerReply> {
     let static_path = ENTRIES
         .iter()
         .find_map(|e| e.key.path.filter(|&p| p == ctx.path))

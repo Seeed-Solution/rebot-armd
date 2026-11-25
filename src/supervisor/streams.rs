@@ -6,6 +6,11 @@
 #[allow(unused_imports)]
 use super::*;
 
+#[inline]
+fn buf_len_ok(v: &[f64], n: usize) -> bool {
+    v.len() >= n
+}
+
 /// Copies `src` into `dst`, reusing its memory when it holds a vector.
 fn set_vec(dst: &mut Option<Vec<f32>>, src: &[f32]) {
     match dst {
@@ -124,6 +129,42 @@ impl SupervisorInner {
         }
     }
 
+    /// Zero-allocation RT workspace refusal hold for `armd-control`: static codes & preallocated
+    /// `WorkspaceViolationDetail` text (zero heap allocations, zero frees).
+    pub(super) fn enter_servo_keepout_hold_rt(&mut self, f: crate::chain::WorkspaceFailureRt) {
+        #[cfg(feature = "policy-runtime")]
+        if self.policy_run.is_some() {
+            let msg = if self.rt_executor_owned {
+                None
+            } else {
+                Some("Policy step violated workspace".to_string())
+            };
+            self.terminate_policy_run("WORKSPACE_HOLD", "cancelled", Some("WORKSPACE_HOLD"), msg);
+        }
+        self.servo_hold(MotionLimitReason::Workspace, None);
+        if self.motion_limit.as_ref().is_some_and(|m| m.reason == MotionLimitReason::Workspace) {
+            let mut bufs = std::mem::take(&mut self.ws_eval_bufs);
+            let mut detail = self
+                .workspace_violation
+                .take()
+                .or_else(|| self.workspace_violation_spare.take())
+                .unwrap_or_else(crate::kinematics::WorkspaceViolationDetail::preallocated_rt);
+            if let Some((ws, cam)) = self.workspace_policy() {
+                let eval = crate::chain::WorkspaceEvaluator::new_with_tcp_in(
+                    &self.config.arm_model,
+                    ws,
+                    cam,
+                    self.config.tcp_offset,
+                    &mut bufs,
+                );
+                eval.write_failure_detail_rt(&f, &mut detail);
+                eval.recycle(&mut bufs);
+            }
+            self.ws_eval_bufs = bufs;
+            self.workspace_violation = Some(detail);
+        }
+    }
+
     /// Joint-space step from the commanded position to `next` (linear in joint space)
     /// against the full workspace (floor, outer box, reach, keep-out boxes, link capsules),
     /// using the persistent per-constraint monotonic escape rule and up to [`MAX_KEEPOUT_EVALS_PER_TICK`]
@@ -133,21 +174,14 @@ impl SupervisorInner {
     }
 
     /// Full workspace sweep check for a servo streaming or braking tick.
-    /// Pre-warms `ws_eval_bufs` before `armd-control` enters `SCHED_FIFO` so the first
-    /// braking tick after an RT urgent stop performs zero heap allocations.
+    /// Pre-warms `ws_eval_bufs` and `scratch` joint-limit name buffers before `armd-control`
+    /// enters `SCHED_FIFO` so the very first servo or braking tick performs zero heap allocations.
     pub fn prewarm_rt_buffers(&mut self) {
-        let mut bufs = std::mem::take(&mut self.ws_eval_bufs);
-        if let Some((ws, cam)) = self.workspace_policy() {
-            let eval = crate::chain::WorkspaceEvaluator::new_with_tcp_in(
-                &self.config.arm_model,
-                ws,
-                cam,
-                self.config.tcp_offset,
-                &mut bufs,
-            );
-            eval.recycle(&mut bufs);
-        }
-        self.ws_eval_bufs = bufs;
+        self.prepare_workspace_eval_bufs();
+        // Populate `JointLimit::name` String buffers once off-RT so `copy_limits` on the first
+        // servo or fallback braking tick reuses them in place via `clone_from` (0 heap allocs).
+        crate::rt_core::scratch::copy_limits(&mut self.scratch.step_limits, &self.config.limits);
+        crate::rt_core::scratch::copy_limits(&mut self.scratch.fallback_limits, &self.config.limits);
     }
 
     pub fn servo_step_workspace(&mut self, next: &[f32], phase: &str) -> Result<(), SafetyError> {
@@ -158,6 +192,139 @@ impl SupervisorInner {
         let cand_min_d = result?;
         if let Some(min_d) = cand_min_d { self.servo_ws_min_depths = Some((self.workspace_revision, min_d)); }
         Ok(())
+    }
+
+    /// Zero-allocation RT workspace sweep for servo streaming and braking ticks on `armd-control`:
+    /// uses pre-sized clearance slices and sweep slab from `self.ws_eval_bufs` (zero heap ops
+    /// for any legal workspace size, including 32 end points + multiple keep-out boxes and
+    /// refusal / budget-exceeded paths).
+    pub(super) fn servo_step_workspace_rt(
+        &mut self,
+        next: &[f32],
+        phase: &'static str,
+    ) -> Result<(), crate::chain::WorkspaceFailureRt> {
+        let mut bufs = std::mem::take(&mut self.ws_eval_bufs);
+        let mut updated_len = 0usize;
+        let result = (|| {
+            let Some((ws, cam)) = self.workspace_policy() else {
+                return Ok(false);
+            };
+            let mut eval = crate::chain::WorkspaceEvaluator::new_with_tcp_in(
+                &self.config.arm_model,
+                ws,
+                cam,
+                self.config.tcp_offset,
+                &mut bufs,
+            );
+            let mut n = eval.total_slots;
+            if !buf_len_ok(&bufs.scratch_c0, n)
+                || !buf_len_ok(&bufs.scratch_c1, n)
+                || !buf_len_ok(&bufs.scratch_cm, n)
+                || !buf_len_ok(&bufs.scratch_cand_min_d, n)
+                || !buf_len_ok(&bufs.geom_bounds, eval.num_geoms)
+                || bufs.sweep_slab.len() < 2 * n
+            {
+                // Fallback only if a non-RT caller/test mutated `config.workspace` directly
+                // without calling `prepare_workspace_eval_bufs()`; on `armd-control`, every
+                // workspace load and config commit pre-sizes `ws_eval_bufs` off-thread.
+                eval.recycle(&mut bufs);
+                bufs.prepare_for(&self.config.arm_model, ws, cam, self.config.tcp_offset);
+                eval = crate::chain::WorkspaceEvaluator::new_with_tcp_in(
+                    &self.config.arm_model,
+                    ws,
+                    cam,
+                    self.config.tcp_offset,
+                    &mut bufs,
+                );
+                n = eval.total_slots;
+            }
+            let checked = (|| {
+                eval.eval_into_slice_rt(
+                    &self.commanded_positions,
+                    &mut bufs.scratch_c0,
+                    &mut bufs.world_caps,
+                    phase,
+                )?;
+                if buf_len_ok(&bufs.scratch_cand_min_d, n) {
+                    match &self.servo_ws_min_depths {
+                        Some((rev, min_d))
+                            if *rev == self.workspace_revision && min_d.as_slice().len() == n =>
+                        {
+                            bufs.scratch_cand_min_d[..n].copy_from_slice(min_d.as_slice());
+                        }
+                        _ => eval.init_min_depths_slice(&bufs.scratch_c0, &mut bufs.scratch_cand_min_d),
+                    }
+                } else {
+                    return Err(crate::chain::WorkspaceFailureRt {
+                        kind: crate::chain::WorkspaceFailureKindRt::Invalid("workspace scratch undersized"),
+                        phase,
+                    });
+                }
+                let mut budget = MAX_KEEPOUT_EVALS_PER_TICK;
+                eval.sweep_linear_step_rt(
+                    &self.commanded_positions,
+                    next,
+                    &bufs.scratch_c0,
+                    &mut bufs.scratch_cand_min_d,
+                    &mut budget,
+                    MAX_KEEPOUT_EVALS_PER_TICK,
+                    phase,
+                    phase,
+                    &mut bufs.scratch_c1,
+                    &mut bufs.scratch_cm,
+                    &mut bufs.sweep_slab,
+                    &mut bufs.sweep_stack,
+                    &mut bufs.sweep_free,
+                    &mut bufs.geom_bounds,
+                    &mut bufs.world_caps,
+                )?;
+                updated_len = n;
+                Ok(true)
+            })();
+            eval.recycle(&mut bufs);
+            checked
+        })();
+        let rev = self.workspace_revision;
+        if result.as_ref().is_ok_and(|&updated| updated) {
+            // Update `servo_ws_min_depths` in place (or from `bufs.min_depths_spare`) with 0 heap ops.
+            let src = &bufs.scratch_cand_min_d[..updated_len];
+            let updated_in_place = match self.servo_ws_min_depths.as_mut() {
+                Some((cur_rev, dst)) if dst.as_slice().len() == updated_len => {
+                    *cur_rev = rev;
+                    dst.as_mut_slice().copy_from_slice(src);
+                    true
+                }
+                _ => false,
+            };
+            if !updated_in_place {
+                if let Some((_, old)) = self.servo_ws_min_depths.take() {
+                    if old.is_heap() {
+                        if bufs.min_depths_spare.is_none() {
+                            bufs.min_depths_spare = Some(old);
+                        } else {
+                            self.push_retired_stop(crate::rt_core::urgent::RetiredStopPayloads {
+                                servo_ws_min_depths: Some((0, old)),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                }
+                if let Some(mut spare) = bufs
+                    .min_depths_spare
+                    .take()
+                    .filter(|s| s.as_slice().len() == updated_len)
+                {
+                    spare.as_mut_slice().copy_from_slice(src);
+                    self.servo_ws_min_depths = Some((rev, spare));
+                } else {
+                    let mut b = crate::kinematics::SlotBuf::zeros(updated_len);
+                    b.as_mut_slice().copy_from_slice(src);
+                    self.servo_ws_min_depths = Some((rev, b));
+                }
+            }
+        }
+        self.ws_eval_bufs = bufs;
+        result.map(|_| ())
     }
 
     /// `check_workspace_path(commanded, [target])` with the evaluator's reused vectors (no
@@ -176,6 +343,78 @@ impl SupervisorInner {
                 eval.eval_into(target, &mut clr, "plan").map_err(SafetyError::from_workspace)?;
                 eval.check_and_advance(&clr, &mut min_depths, "plan").map_err(SafetyError::from_workspace)
             })();
+            eval.recycle(&mut bufs);
+            checked
+        })();
+        self.ws_eval_bufs = bufs;
+        result
+    }
+
+    /// Zero-allocation RT variant of [`Self::servo_target_workspace`]: uses pre-sized clearance
+    /// scratch slices from `self.ws_eval_bufs` (zero heap allocations for any legal workspace
+    /// size, including 32 end points + multiple keep-out boxes, and never builds allocating
+    /// [`crate::chain::WorkspaceFailure`] strings on refusal).
+    fn servo_target_workspace_rt(&mut self, target: &[f32]) -> Result<(), &'static str> {
+        let mut bufs = std::mem::take(&mut self.ws_eval_bufs);
+        let result = (|| {
+            let Some((ws, cam)) = self.workspace_policy() else { return Ok(()); };
+            let mut eval = crate::chain::WorkspaceEvaluator::new_with_tcp_in(
+                &self.config.arm_model,
+                ws,
+                cam,
+                self.config.tcp_offset,
+                &mut bufs,
+            )
+            .with_escape_tol(crate::kinematics::WORKSPACE_EPS);
+            let mut n = eval.total_slots;
+            if !buf_len_ok(&bufs.scratch_c0, n)
+                || !buf_len_ok(&bufs.scratch_c1, n)
+                || !buf_len_ok(&bufs.scratch_min_d, n)
+            {
+                eval.recycle(&mut bufs);
+                bufs.prepare_for(&self.config.arm_model, ws, cam, self.config.tcp_offset);
+                eval = crate::chain::WorkspaceEvaluator::new_with_tcp_in(
+                    &self.config.arm_model,
+                    ws,
+                    cam,
+                    self.config.tcp_offset,
+                    &mut bufs,
+                )
+                .with_escape_tol(crate::kinematics::WORKSPACE_EPS);
+                n = eval.total_slots;
+            }
+            let checked = if !eval.capsules_valid()
+                || !buf_len_ok(&bufs.scratch_c0, n)
+                || !buf_len_ok(&bufs.scratch_c1, n)
+                || !buf_len_ok(&bufs.scratch_min_d, n)
+                || eval
+                    .eval_into_slice_rt(
+                        &self.commanded_positions,
+                        &mut bufs.scratch_c0,
+                        &mut bufs.world_caps,
+                        "plan",
+                    )
+                    .is_err()
+            {
+                Err("WORKSPACE_VIOLATION")
+            } else {
+                eval.init_min_depths_slice(&bufs.scratch_c0, &mut bufs.scratch_min_d);
+                if eval
+                    .eval_into_slice_rt(target, &mut bufs.scratch_c1, &mut bufs.world_caps, "plan")
+                    .is_err()
+                    || eval
+                        .check_and_advance_slice_rt(
+                            &bufs.scratch_c1,
+                            &mut bufs.scratch_min_d,
+                            "servo_target",
+                        )
+                        .is_err()
+                {
+                    Err("WORKSPACE_VIOLATION")
+                } else {
+                    Ok(())
+                }
+            };
             eval.recycle(&mut bufs);
             checked
         })();
@@ -286,10 +525,34 @@ impl SupervisorInner {
         }
     }
 
+    fn clamp_j7_if_stale(&self, targets: &mut [f32], j7_gate: crate::supervisor::J7PosForceGate) {
+        if j7_gate.stale {
+            if let Some(g) = self.config.gripper_index() {
+                if targets.len() > g {
+                    if let Some(freeze_pos) = j7_gate.freeze_pos {
+                        targets[g] = freeze_pos;
+                    } else if g < self.commanded_positions.len() {
+                        targets[g] = self.commanded_positions[g];
+                    }
+                }
+            }
+        }
+    }
+
     pub(super) fn validate_and_filter_servo_targets(
         &mut self,
         targets: &mut [f32],
         epoch_id: u64,
+    ) -> Result<(), SafetyError> {
+        let j7_gate = self.sample_pos_force_j7_gate();
+        self.validate_and_filter_servo_targets_with_gate(targets, epoch_id, j7_gate)
+    }
+
+    fn validate_and_filter_servo_targets_with_gate(
+        &mut self,
+        targets: &mut [f32],
+        epoch_id: u64,
+        j7_gate: crate::supervisor::J7PosForceGate,
     ) -> Result<(), SafetyError> {
         if self.config.active_tool.commissioning_required {
             return Err(SafetyError::CommissioningRequired("servo".into()));
@@ -336,17 +599,64 @@ impl SupervisorInner {
         }
         self.torque_hold_filter(targets);
         self.power_hold_filter(targets);
-        if self.is_pos_force_j7_stale() {
-            if let Some(g) = self.config.gripper_index() {
-                if targets.len() > g {
-                    if let Some(freeze_pos) = self.pos_force_j7_freeze_position() {
-                        targets[g] = freeze_pos;
-                    } else if g < self.commanded_positions.len() {
-                        targets[g] = self.commanded_positions[g];
-                    }
-                }
-            }
+        self.clamp_j7_if_stale(targets, j7_gate);
+        Ok(())
+    }
+
+    /// Zero-allocation RT validation & filtering for mailbox servo targets (`armd-control`).
+    fn validate_and_filter_servo_targets_rt(
+        &mut self,
+        targets: &mut [f32],
+        epoch_id: u64,
+        j7_gate: crate::supervisor::J7PosForceGate,
+    ) -> Result<(), crate::rt_core::mailbox::Refusal> {
+        use crate::rt_core::mailbox::{Refusal, RefusalDetail};
+        if self.config.active_tool.commissioning_required {
+            return Err(Refusal::code("COMMISSIONING_REQUIRED"));
         }
+        if self.gravity_comp.is_some() {
+            return Err(Refusal::code("MOTION_BUSY"));
+        }
+        if self.collision.hold.is_some() {
+            return Err(Refusal::code("COLLISION_HOLD"));
+        }
+        if self.handover_settling_since.is_some() {
+            return Err(Refusal::code("HANDOVER_SETTLING"));
+        }
+        if self.shutdown_committed || self.estop_pending() {
+            return Err(Refusal::code("ESTOP_ACTIVE"));
+        }
+        if epoch_id != self.safety.epoch_id() {
+            return Err(Refusal::code("EPOCH_MISMATCH"));
+        }
+        if self.pending_rearm || self.pending_normal_unload {
+            return Err(Refusal::code("NOT_ARMED"));
+        }
+        if self.active_trajectory.is_some() || self.macro_run.is_some() {
+            return Err(Refusal::code("MOTION_BUSY"));
+        }
+        if let Err((code, idx)) =
+            self.safety
+                .validate_motion_command_rt(Some(epoch_id), targets, &self.config.limits)
+        {
+            if code == "SOFT_LIMIT_EXCEEDED" {
+                self.note_motion_limit(MotionLimitReason::JointLimit, idx);
+                return Err(Refusal {
+                    code,
+                    detail: RefusalDetail::Limit {
+                        joint: idx.map(|i| i as u8),
+                    },
+                });
+            }
+            return Err(Refusal::code(code));
+        }
+        if let Err(code) = self.servo_target_workspace_rt(targets) {
+            self.note_motion_limit(MotionLimitReason::Workspace, None);
+            return Err(Refusal::code(code));
+        }
+        self.torque_hold_filter(targets);
+        self.power_hold_filter(targets);
+        self.clamp_j7_if_stale(targets, j7_gate);
         Ok(())
     }
 
@@ -354,7 +664,16 @@ impl SupervisorInner {
     /// releases the stall latch on a target away from the stall. A torque-cap latch needs the
     /// target [`GRIPPER_FORCE_RELEASE_MARGIN_RAD`] more open than the hold.
     pub(super) fn release_gripper_stall_on_reverse(&mut self, targets: &[f32]) {
-        if self.is_pos_force_j7_stale() {
+        let j7_gate = self.sample_pos_force_j7_gate();
+        self.release_gripper_stall_on_reverse_with_gate(targets, j7_gate);
+    }
+
+    fn release_gripper_stall_on_reverse_with_gate(
+        &mut self,
+        targets: &[f32],
+        j7_gate: crate::supervisor::J7PosForceGate,
+    ) {
+        if j7_gate.stale {
             self.gripper_stream_target = None;
             return;
         }
@@ -379,6 +698,13 @@ impl SupervisorInner {
         }
     }
 
+    fn frame_moves_j7(&self, targets: &[f32], prev_cmd_j7: f32, prev_tgt_j7: f32) -> bool {
+        self.config.gripper_index().is_some_and(|g| {
+            g < targets.len()
+                && ((targets[g] - prev_cmd_j7).abs() > 1e-6 || (targets[g] - prev_tgt_j7).abs() > 1e-6)
+        })
+    }
+
     pub fn servo(admitted: Admitted<'_>, targets: Vec<f32>, epoch_id: u64) -> Result<(), SafetyError> {
         Self::servo_slice(admitted, &targets, epoch_id)
     }
@@ -386,13 +712,23 @@ impl SupervisorInner {
     /// [`Self::servo`] from a slice: no allocation once the servo buffers hold a target
     /// (the latest-target path consumes through it).
     pub fn servo_slice(admitted: Admitted<'_>, targets_in: &[f32], epoch_id: u64) -> Result<(), SafetyError> {
-        let (this, _proof) = admitted.consume()?;
-        this.servo_slice_inner(targets_in, epoch_id)
+        let prev_j7_stamp = admitted.inner.j7_admitted_stamp;
+        let (this, proof) = admitted.consume()?;
+        // Restore prior J7 stamp until validation succeeds AND the frame moves J7 while J7 is fresh.
+        this.j7_admitted_stamp = prev_j7_stamp;
+        let j7_gate = this.sample_pos_force_j7_gate();
+        this.servo_slice_inner(targets_in, epoch_id, j7_gate, proof.stamp())
     }
 
-    fn servo_slice_inner(&mut self, targets_in: &[f32], epoch_id: u64) -> Result<(), SafetyError> {
-        if targets_in.len() > crate::rt_core::mailbox::MAX_DOF { return self.servo_slice_oversized(targets_in.to_vec(), epoch_id); }
-        let mut buf = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
+    fn servo_slice_inner(
+        &mut self,
+        targets_in: &[f32],
+        epoch_id: u64,
+        j7_gate: crate::supervisor::J7PosForceGate,
+        stamp: crate::supervisor::AdmissionStamp,
+    ) -> Result<(), SafetyError> {
+        if targets_in.len() > crate::model::MAX_MOTION_DOF { return self.servo_slice_oversized(targets_in.to_vec(), epoch_id); }
+        let mut buf = [0.0f32; crate::model::MAX_MOTION_DOF];
         let targets = &mut buf[..targets_in.len()];
         targets.copy_from_slice(targets_in);
         #[cfg(feature = "policy-runtime")]
@@ -400,7 +736,17 @@ impl SupervisorInner {
             return Err(SafetyError::MotionBusy);
         }
         if self.mit_motion_blocked() { return Err(SafetyError::MotionBusy); }
-        self.validate_and_filter_servo_targets(targets, epoch_id)?;
+        let (prev_cmd_j7, prev_tgt_j7) = self
+            .config
+            .gripper_index()
+            .map(|g| {
+                (
+                    self.commanded_positions.get(g).copied().unwrap_or(0.0),
+                    self.target_positions.get(g).copied().unwrap_or(0.0),
+                )
+            })
+            .unwrap_or((0.0, 0.0));
+        self.validate_and_filter_servo_targets_with_gate(targets, epoch_id, j7_gate)?;
         if self.servo_blocked_hold { self.clear_blocked_hold(); }
 
         // Only renew lease and motion frame timestamp AFTER command validation succeeds
@@ -410,8 +756,15 @@ impl SupervisorInner {
             l.last_valid_motion_instant = Some(Instant::now());
         }
 
-        // Gripper stall release check on reverse command
-        self.release_gripper_stall_on_reverse(targets);
+        // Gripper stall release check on reverse command (reusing the same single J7 freshness sample)
+        self.release_gripper_stall_on_reverse_with_gate(targets, j7_gate);
+        if !j7_gate.stale && self.frame_moves_j7(targets, prev_cmd_j7, prev_tgt_j7) {
+            self.j7_admitted_stamp = Some(crate::driver::PosForceIntentStamp {
+                stop_gen: stamp.stop_gen,
+                estop_epoch: stamp.estop_epoch,
+                lease_gen: stamp.lease_gen,
+            });
+        }
 
         let _ = self.safety.mark_motion_started();
 
@@ -421,6 +774,71 @@ impl SupervisorInner {
         self.servo_stream_active = true;
         self.servo_settled_ticks.fill(0);
 
+        Ok(())
+    }
+
+    /// Zero-allocation RT servo target intake (used by [`Self::consume_target_frame`]).
+    /// Never allocates on either acceptance or refusal, samples J7 freshness at most once from
+    /// Step 2's snapshot, and updates `j7_admitted_stamp` only when a fresh accepted frame moves J7.
+    pub(crate) fn servo_slice_rt(
+        admitted: Admitted<'_>,
+        targets_in: &[f32],
+        epoch_id: u64,
+    ) -> Result<(), crate::rt_core::mailbox::Refusal> {
+        use crate::rt_core::mailbox::Refusal;
+        let prev_j7_stamp = admitted.inner.j7_admitted_stamp;
+        let (this, proof) = admitted
+            .consume()
+            .map_err(|e| Refusal::code(targets::safety_code(&e)))?;
+        this.j7_admitted_stamp = prev_j7_stamp;
+        if targets_in.len() > crate::rt_core::mailbox::MAX_DOF {
+            return Err(Refusal::code("SAFETY_ERROR"));
+        }
+        let mut buf = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
+        let targets = &mut buf[..targets_in.len()];
+        targets.copy_from_slice(targets_in);
+        #[cfg(feature = "policy-runtime")]
+        if this.policy_run.is_some() || this.policy_loading {
+            return Err(Refusal::code("MOTION_BUSY"));
+        }
+        if this.mit_motion_blocked() {
+            return Err(Refusal::code("MOTION_BUSY"));
+        }
+        let (prev_cmd_j7, prev_tgt_j7) = this
+            .config
+            .gripper_index()
+            .map(|g| {
+                (
+                    this.commanded_positions.get(g).copied().unwrap_or(0.0),
+                    this.target_positions.get(g).copied().unwrap_or(0.0),
+                )
+            })
+            .unwrap_or((0.0, 0.0));
+        let j7_gate = this.sample_pos_force_j7_gate();
+        this.validate_and_filter_servo_targets_rt(targets, epoch_id, j7_gate)?;
+        if this.servo_blocked_hold {
+            this.clear_blocked_hold();
+        }
+        let now = Instant::now();
+        this.last_heartbeat = now;
+        this.last_motion_frame = now;
+        if let Some(ref mut l) = this.active_lease {
+            l.last_valid_motion_instant = Some(now);
+        }
+        this.release_gripper_stall_on_reverse_with_gate(targets, j7_gate);
+        if !j7_gate.stale && this.frame_moves_j7(targets, prev_cmd_j7, prev_tgt_j7) {
+            let stamp = proof.stamp();
+            this.j7_admitted_stamp = Some(crate::driver::PosForceIntentStamp {
+                stop_gen: stamp.stop_gen,
+                estop_epoch: stamp.estop_epoch,
+                lease_gen: stamp.lease_gen,
+            });
+        }
+        let _ = this.safety.mark_motion_started();
+        copy_into(&mut this.target_positions, targets);
+        this.set_servo_target(targets);
+        this.servo_stream_active = true;
+        this.servo_settled_ticks.fill(0);
         Ok(())
     }
 
@@ -607,6 +1025,7 @@ impl SupervisorInner {
                     TickOutput::Expired { .. }
                     | TickOutput::Error { .. }
                     | TickOutput::EstopInhibited { .. }
+                    | TickOutput::LeaseFenced
                     | TickOutput::ActionDeadlineRefused { .. }
                     | TickOutput::None => {
                         self.tracking.invalidate();
@@ -665,9 +1084,9 @@ impl SupervisorInner {
                 ),
             );
         });
-        self.servo_target = None;
+        self.release_servo_target();
         self.servo_settled_ticks.fill(0);
-        self.servo_ws_min_depths = None;
+        self.clear_servo_ws_min_depths_rt();
         self.servo_stream_active = false;
         self.tracking.invalidate();
         self.active_trajectory = None;
@@ -1037,8 +1456,8 @@ impl SupervisorInner {
     ) -> Result<(), ArmError> {
         use crate::policy_runtime::PolicyMode;
 
-        let mut buf = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
-        let n = targets_in.len().min(crate::rt_core::mailbox::MAX_DOF);
+        let mut buf = [0.0f32; crate::model::MAX_MOTION_DOF];
+        let n = targets_in.len().min(crate::model::MAX_MOTION_DOF);
         buf[..n].copy_from_slice(&targets_in[..n]);
         let targets = &mut buf[..n];
 
@@ -1504,7 +1923,7 @@ impl SupervisorInner {
         if run.mode == crate::policy_runtime::PolicyMode::Live {
             self.release_servo_target();
             self.servo_settled_ticks.fill(0);
-            self.servo_ws_min_depths = None;
+            self.clear_servo_ws_min_depths_rt();
             copy_into(&mut self.target_positions, &self.commanded_positions);
         }
         if let Some(obs) = self.last_policy_obs.as_mut() {
@@ -1632,7 +2051,7 @@ pub mod targets {
     }
 
     /// Status, `error` and `safety_state` of a refusal code, as `ApiError::from` gives them.
-    fn reject_fields(code: &str) -> (u16, &str, Option<&'static str>) {
+    pub(crate) fn reject_fields(code: &str) -> (u16, &str, Option<&'static str>) {
         match code {
             "ESTOP_ACTIVE" => (409, code, Some("EStop")),
             "FAULT_ACTIVE" => (409, code, Some("Fault")),
@@ -1667,15 +2086,19 @@ pub mod targets {
 
     /// The WS reply to a servo target the RT refused (None: no reply).
     ///
-    /// As the legacy loop answers the same conditions: an unauthorized frame (lease lost,
-    /// stream not authorized, no lease) with `lease_lost` (with the loss reason when known),
-    /// a stale epoch with `epoch_sync`, a calibration with `servo_reject`
+    /// As the legacy loop answers the same conditions: a stop-preempted frame with `servo_reject`
+    /// (`code: "STOPPED"`, `reason: "stopped"` matching `api/ws/servo.rs`), an unauthorized frame
+    /// (lease lost, stream not authorized, no lease) with `lease_lost` (with the loss reason when
+    /// known), a stale epoch with `epoch_sync`, a calibration with `servo_reject`
     /// `reason: calibration_busy`, other refusals with `servo_reject` (and `current_revision`
-    /// when known). A frame refused because a stop overtook it gets no reply (legacy applied
-    /// it before the stop, which has its own reply). Messages are generic.
+    /// when known). Messages match the legacy path.
     pub fn servo_outcome_reply(refusal: &Refusal, ctx: &ReplyCtx) -> Option<Value> {
         Some(match refusal.code {
-            "STOPPED" => return None,
+            "STOPPED" => {
+                let mut v = servo_reject("STOPPED", "Stopped before motion began", ctx.epoch_id);
+                v["reason"] = json!("stopped");
+                v
+            }
             "LEASE_LOST" | "NO_LEASE" | "STREAM_NOT_AUTHORIZED" => {
                 let mut v = json!({"type":"lease_lost", "generation":ctx.lease_generation});
                 if let (RefusalDetail::LeaseLoss { reason }, true) = (refusal.detail, ctx.lease_generation != 0) { v["reason"] = json!(reason); }
@@ -1705,6 +2128,17 @@ pub mod targets {
         pub fn lease_granted(&mut self, generation: u64) {
             if self.lease_generation != generation { self.last_sequence = None; }
             self.lease_generation = generation;
+        }
+
+        /// Synchronize sequence state across an owner handoff (legacy <-> executor) on the same lease.
+        pub fn sync_from(&mut self, generation: u64, last_sequence: Option<u64>) {
+            self.lease_generation = generation;
+            self.last_sequence = last_sequence;
+        }
+
+        /// Advance `last_sequence` after passing sequence validation on a malformed-payload frame.
+        pub fn advance_sequence(&mut self, sequence: u64) {
+            self.last_sequence = Some(sequence);
         }
 
         pub fn last_sequence(&self) -> Option<u64> { self.last_sequence }
@@ -1741,19 +2175,68 @@ pub mod targets {
         arm: ArmId,
         boot: BootId,
         seq: u64,
+        /// Monotonic high-water mark of closed servo lease generations: late submissions for any
+        /// non-zero generation `<= closed_servo_gen` are rejected immediately off-thread.
+        closed_servo_gen: u64,
+        /// Non-zero servo lease generations currently open in `writer` (bounded by `MAX_STREAMS`).
+        open_servo_gens: Vec<u64>,
     }
 
     impl TargetPort {
-        pub fn new(writer: TargetWriter, arm: ArmId, boot: BootId) -> Self { Self { writer, arm, boot, seq: 0 } }
+        pub fn new(writer: TargetWriter, arm: ArmId, boot: BootId) -> Self {
+            Self {
+                writer,
+                arm,
+                boot,
+                seq: 0,
+                closed_servo_gen: 0,
+                open_servo_gens: Vec::with_capacity(crate::rt_core::mailbox::MAX_STREAMS),
+            }
+        }
 
         /// Frames replaced before consumption.
         pub fn coalesced(&self) -> u64 { self.writer.coalesced() }
 
+        /// Sequence number assigned to the most recently built frame (0 before first submission).
+        pub fn last_seq(&self) -> u64 { self.seq }
+
+        /// Highest lease generation permanently closed on this port (0 if none closed yet).
+        pub fn closed_servo_generation(&self) -> u64 { self.closed_servo_gen }
+
+        /// True when `lease_generation` (non-zero) has been closed via [`Self::close_servo`].
+        pub fn is_servo_closed(&self, lease_generation: u64) -> bool {
+            lease_generation != 0 && lease_generation <= self.closed_servo_gen
+        }
+
+        /// Underlying target writer (for low-level mailbox access / tests).
+        pub fn writer(&self) -> &TargetWriter { &self.writer }
+
+        /// Mutable access to the underlying target writer (for low-level mailbox access / tests).
+        pub fn writer_mut(&mut self) -> &mut TargetWriter { &mut self.writer }
+
         /// Drains the RT's outcomes of consumed frames.
         pub fn outcomes(&mut self, each: impl FnMut(TargetOutcome)) -> usize { self.writer.outcomes(each) }
 
-        /// The connection holding lease `lease_generation` closed: forget its stream.
-        pub fn close_servo(&mut self, lease_generation: u64) { self.writer.close_stream(servo_stream(lease_generation)); }
+        /// The connection holding lease `lease_generation` ended (release, preemption, expiry, or
+        /// disconnect): forget its stream (and any older open servo streams) in the mailbox writer
+        /// and fence late submissions from that generation.
+        pub fn close_servo(&mut self, lease_generation: u64) {
+            if lease_generation == 0 {
+                return;
+            }
+            self.closed_servo_gen = self.closed_servo_gen.max(lease_generation);
+            self.writer.close_stream(servo_stream(lease_generation));
+            let closed = self.closed_servo_gen;
+            let writer = &mut self.writer;
+            self.open_servo_gens.retain(|&g| {
+                if g <= closed {
+                    writer.close_stream(servo_stream(g));
+                    false
+                } else {
+                    true
+                }
+            });
+        }
 
         /// Policy run `action_id` ended: forget its stream.
         pub fn close_policy(&mut self, action_id: u64) { self.writer.close_stream(policy_stream(action_id)); }
@@ -1770,9 +2253,14 @@ pub mod targets {
         }
 
         /// Submits one WS servo message; returns the WS reply (None: queued, no reply).
+        /// Rejects late submissions from closed lease generations before touching sequence state.
         /// Sequence rules as the legacy loop: a missing `sequence_id`, a repeat or a jump of
         /// more than 1000 (wrapping) is refused; the sequence advances once it passes them.
         pub fn submit_servo(&mut self, stream: &mut ServoStream, msg: &ServoMessage<'_>) -> Option<Value> {
+            let lease_gen = msg.authority.lease_generation;
+            if self.is_servo_closed(lease_gen) {
+                return Some(json!({"type":"lease_lost", "generation": lease_gen}));
+            }
             if msg.calibration_busy { return Some(json!({"type":"servo_reject", "reason":"calibration_busy"})); }
             let Some(sequence) = msg.sequence_id else { return Some(json!({"type":"servo_reject", "reason":"missing_sequence_id"})); };
             if stream.last_sequence.is_some_and(|last| { let delta = sequence.wrapping_sub(last); delta == 0 || delta > 1000 }) {
@@ -1780,13 +2268,18 @@ pub mod targets {
             }
             stream.last_sequence = Some(sequence);
             let epoch = msg.authority.epoch;
-            let stream_id = servo_stream(msg.authority.lease_generation);
+            let stream_id = servo_stream(lease_gen);
             let Some(frame) = self.frame(stream_id, msg.authority, 0, msg.positions, msg.received_at, None, None,
                 msg.received_at + SERVO_TARGET_TTL, true) else {
                 return Some(servo_reject("SAFETY_ERROR", "servo target is empty, has non-finite values or more joints than the arm", epoch));
             };
             match self.writer.submit(frame) {
-                Submitted::Accepted | Submitted::Coalesced { .. } => None,
+                Submitted::Accepted | Submitted::Coalesced { .. } => {
+                    if lease_gen != 0 && !self.open_servo_gens.contains(&lease_gen) {
+                        self.open_servo_gens.push(lease_gen);
+                    }
+                    None
+                }
                 Submitted::Busy => Some(servo_reject("MOTION_BUSY", "a policy target is waiting to be applied", epoch)),
                 Submitted::StreamsFull => Some(servo_reject("STREAMS_FULL", "too many open target streams", epoch)),
                 Submitted::OutOfOrder => Some(json!({"type":"servo_reject", "reason":"invalid_sequence_id"})),
@@ -1830,6 +2323,38 @@ pub mod targets {
             }
             this.core.authorize_stream(TargetAuthority { stream: Some(servo_stream(lease_generation)), ..TargetAuthority::default() });
             Ok(())
+        }
+
+        /// Authorizes the committed lease generation's servo stream through
+        /// [`Self::authorize_servo_stream`] (zero allocations, zero locks), preserving any active
+        /// policy stream. Fails closed (revokes the stream) if admission cannot currently pass
+        /// (for example while E-stop is latched; restored automatically on `clear_fault`).
+        pub(crate) fn authorize_servo_stream_for_committed_lease(&mut self, lease_generation: u64) {
+            if lease_generation == 0 {
+                self.core.revoke_stream();
+                return;
+            }
+            #[cfg(feature = "policy-runtime")]
+            if let Some(run) = self.policy_run.as_ref() {
+                if self.core.target_authority().stream == Some(policy_stream(run.action_id)) {
+                    return;
+                }
+            }
+            let stamp = crate::supervisor::AdmissionStamp::for_rt_internal(
+                self.current_stop_gen(),
+                self.safety.epoch_id(),
+                lease_generation,
+            );
+            match self.check_admission(stamp) {
+                Ok(admitted) => {
+                    if Self::authorize_servo_stream(admitted, lease_generation).is_err() {
+                        self.core.revoke_stream();
+                    }
+                }
+                Err(_) => {
+                    self.core.revoke_stream();
+                }
+            }
         }
 
         /// After a policy run of `action_id`: hand the targets back to the lease holder's
@@ -1922,14 +2447,7 @@ pub mod targets {
                 frame.authority.lease_generation,
             );
             let admitted = self.check_admission(stamp).map_err(|e| Refusal::code(safety_code(&e)))?;
-            Self::servo_slice(admitted, frame.positions(), frame.authority.epoch).map_err(|e| {
-                let joint = match &e {
-                    SafetyError::SoftLimitExceeded { joint, .. } => self.config.limits.iter().position(|l| &l.name == joint).map(|i| i as u8),
-                    _ => None,
-                };
-                let code = safety_code(&e);
-                Refusal { code, detail: if joint.is_some() { RefusalDetail::Limit { joint } } else { RefusalDetail::None } }
-            })
+            Self::servo_slice_rt(admitted, frame.positions(), frame.authority.epoch)
         }
 
         #[cfg(not(feature = "policy-runtime"))]

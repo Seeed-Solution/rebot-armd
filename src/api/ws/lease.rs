@@ -117,7 +117,7 @@ pub(super) fn format_command_lease_lost(request_id: &Value, epoch_id: u64) -> Va
     })
 }
 
-fn format_command_epoch_mismatch(request_id: &Value, epoch_id: u64) -> Value {
+pub(super) fn format_command_epoch_mismatch(request_id: &Value, epoch_id: u64) -> Value {
     json!({
         "type": "command_reject",
         "request_id": request_id,
@@ -129,7 +129,7 @@ fn format_command_epoch_mismatch(request_id: &Value, epoch_id: u64) -> Value {
     })
 }
 
-fn format_command_invalid_request_id(request_id: &Value) -> Value {
+pub(super) fn format_command_invalid_request_id(request_id: &Value) -> Value {
     json!({
         "type": "command_reject",
         "request_id": request_id,
@@ -140,7 +140,7 @@ fn format_command_invalid_request_id(request_id: &Value) -> Value {
     })
 }
 
-fn format_command_ack_state(
+pub(super) fn format_command_ack_state(
     request_id: &Value,
     epoch_id: u64,
     safety_state: &crate::safety::SafetyState,
@@ -163,7 +163,7 @@ fn format_command_ack_state(
     })
 }
 
-fn format_command_reject_api(request_id: &Value, error: ApiError, epoch_id: u64) -> Value {
+pub(super) fn format_command_reject_api(request_id: &Value, error: ApiError, epoch_id: u64) -> Value {
     let mut reply = rejection(error, "command_reject", epoch_id);
     reply["request_id"] = request_id.clone();
     reply
@@ -676,24 +676,6 @@ pub(super) fn check_lease_authority(
 }
 
 /// Format the lease-loss reply for an unauthorized ordinary frame.
-pub(super) fn lease_loss_reply(
-    inner: &SupervisorInner,
-    kind: &str,
-    value: &Value,
-    recv_connection: &str,
-    local_generation: u64,
-) -> Value {
-    if kind == "command" {
-        json!({"type":"command_reject", "request_id":value.get("request_id"), "status":409, "code":"LEASE_LOST", "message":"This connection does not own an active lease", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
-    } else if kind == "release_lease" {
-        json!({"type":"lease_released", "success":false})
-    } else if local_generation == 0 {
-        json!({"type":"lease_lost", "generation":0})
-    } else {
-        json!({"type":"lease_lost", "generation":local_generation, "reason":inner.lease_loss_reason(recv_connection, local_generation)})
-    }
-}
-
 /// Deliver a `lease_lost` (`reason: "preempted"`) notice to an evicted connection via the registry.
 pub(super) fn notify_evicted(evicted_conn: &str, evicted_gen: u64) {
     let (sender_opt, closer_opt) = {

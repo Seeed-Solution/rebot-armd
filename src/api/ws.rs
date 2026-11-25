@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use axum::{extract::{ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade}, State}, response::IntoResponse};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -1212,6 +1212,7 @@ impl ConnectionTasks {
 struct QueuedOrdinary {
     value: Value,
     stamp: crate::supervisor::AdmissionStamp,
+    received_at: Instant,
 }
 
 struct OrdinaryQueueInner {
@@ -1236,12 +1237,21 @@ impl OrdinaryQueue {
         }
     }
 
-    fn try_push(&self, value: Value, stamp: crate::supervisor::AdmissionStamp) -> Result<(), Value> {
+    fn try_push(
+        &self,
+        value: Value,
+        stamp: crate::supervisor::AdmissionStamp,
+        received_at: Instant,
+    ) -> Result<(), Value> {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if g.closed || g.items.len() >= ORDINARY_IN_CAPACITY {
             return Err(value);
         }
-        g.items.push_back(QueuedOrdinary { value, stamp });
+        g.items.push_back(QueuedOrdinary {
+            value,
+            stamp,
+            received_at,
+        });
         drop(g);
         self.notify.notify_one();
         Ok(())
@@ -1457,9 +1467,34 @@ async fn deliver_urgent_stop_batch(
     }
 }
 
-fn command_ack(inner: &SupervisorInner, request_id: &Value, started: Started) -> Value {
-    let control_mode = if inner.gravity_comp_active() { "gravity_comp" } else { "position" };
-    let mut ack = json!({"type":"command_ack", "request_id":request_id, "status":"accepted", "epoch_id":inner.safety.epoch_id(), "safety_state":inner.safety.state(), "is_torqued":inner.is_torqued, "control_mode":control_mode});
+pub(super) struct AckSnapshot {
+    pub(super) epoch_id: u64,
+    pub(super) safety_state: crate::safety::SafetyState,
+    pub(super) is_torqued: bool,
+    pub(super) control_mode: &'static str,
+}
+
+impl AckSnapshot {
+    pub(super) fn from_inner(inner: &SupervisorInner) -> Self {
+        Self {
+            epoch_id: inner.safety.epoch_id(),
+            safety_state: inner.safety.state().clone(),
+            is_torqued: inner.is_torqued,
+            control_mode: if inner.gravity_comp_active() { "gravity_comp" } else { "position" },
+        }
+    }
+}
+
+pub(super) fn command_ack_from_snap(snap: &AckSnapshot, request_id: &Value, started: Started) -> Value {
+    let mut ack = json!({
+        "type": "command_ack",
+        "request_id": request_id,
+        "status": "accepted",
+        "epoch_id": snap.epoch_id,
+        "safety_state": &snap.safety_state,
+        "is_torqued": snap.is_torqued,
+        "control_mode": snap.control_mode,
+    });
     if let Some((id, duration)) = started {
         ack["action_id"] = json!(id);
         ack["expected_duration_s"] = json!(duration);
@@ -1808,8 +1843,8 @@ fn fields_ack(request_id: &Value, reply: Value) -> Value {
     ack
 }
 
-fn command_reject(inner: &SupervisorInner, request_id: &Value, error: ApiError) -> Value {
-    let mut reply = rejection(error, "command_reject", inner.safety.epoch_id());
+pub(super) fn command_reject_at(epoch_id: u64, request_id: &Value, error: ApiError) -> Value {
+    let mut reply = rejection(error, "command_reject", epoch_id);
     reply["request_id"] = request_id.clone();
     reply
 }
@@ -2420,7 +2455,9 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 continue;
             }
 
-            // Capture AdmissionStamp ONCE in the reader before queuing (never re-sampled downstream).
+            // Capture AdmissionStamp and ingress timestamp ONCE in the reader before queuing
+            // (never re-sampled downstream).
+            let received_at = Instant::now();
             let stamp = crate::supervisor::AdmissionStamp {
                 stop_gen: reader_supervisor.stop_generation(),
                 estop_epoch: value
@@ -2435,7 +2472,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 request_id: crate::supervisor::next_admission_request_id(),
             };
             // Every other frame goes onto the connection's bounded ordinary queue (non-blocking).
-            if let Err(value) = reader_ordinary_queue.try_push(value, stamp) {
+            if let Err(value) = reader_ordinary_queue.try_push(value, stamp, received_at) {
                 if let Some(reply) = backlog_full_reject(&value) {
                     reader_writer.try_send_ordinary_control(reply);
                     if reader_writer.is_writer_closed() {
@@ -2471,6 +2508,14 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
         // the operator session of this connection: from the upgrade request, updated by `auth` messages in reader
         let ws_auth = worker_ws_auth;
         let mut last_sequence: Option<u64> = None;
+        let mut streaming_servo = crate::supervisor::targets::ServoStream::new();
+        let mut cmd_servo = crate::supervisor::targets::ServoStream::new();
+        let servo_reply_sink: Arc<dyn Fn(Value) + Send + Sync> = {
+            let w = worker_writer.clone();
+            Arc::new(move |reply| {
+                let _ = w.try_send_ordinary_control(reply);
+            })
+        };
         let mut last_ordinary_request: Option<u64> = None;
         // Delayed acks (sent after a state-file write) come back here and are stamped with
         // the current epoch and enqueued; the writer task enforces wire epoch monotonicity.
@@ -2514,9 +2559,10 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     continue;
                 }
                 joined = async { (&mut macro_check.as_mut().expect("guarded by the precondition").rx).await }, if macro_active => {
-                    let MacroCheck { request_id, generation, stamp, .. } = macro_check.take().expect("checked above");
+                    let MacroCheck { request_id, command_path, generation, stamp, .. } = macro_check.take().expect("checked above");
                     let Some((reply, macro_gate)) = actions::complete_macro_check(
                         request_id,
+                        command_path,
                         generation,
                         stamp,
                         joined,
@@ -2543,7 +2589,11 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     None => break,
                 }
             };
-            let QueuedOrdinary { value, stamp } = queued;
+            let QueuedOrdinary {
+                value,
+                stamp,
+                received_at,
+            } = queued;
             if worker_reg_rx.borrow().is_none() {
                 let _ = worker_reg_rx.wait_for(|v| v.is_some()).await;
             }
@@ -2574,6 +2624,10 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     }
                     if let Some(response) = response {
                         if response.get("type").and_then(Value::as_str) == Some("lease_granted") {
+                            if let Some(g) = response.get("generation").and_then(Value::as_u64) {
+                                streaming_servo.lease_granted(g);
+                                cmd_servo.lease_granted(g);
+                            }
                             let delay_ms = TEST_LEASE_GRANTED_DELAY_MS.load(Ordering::Relaxed);
                             if delay_ms > 0 {
                                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -2643,6 +2697,31 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             // `ArmCore` is not owned by the legacy supervisor lock.
             if owner_mode != crate::supervisor::OWNER_LEGACY {
                 if owner_mode == crate::supervisor::OWNER_EXECUTOR {
+                    if let Some(opt_reply) = servo::handle_executor_ws_servo(
+                        frame_kind,
+                        &value,
+                        stamp,
+                        received_at,
+                        recv_conn_id,
+                        &recv_connection,
+                        &recv_generation,
+                        &recv_client_label,
+                        &mut streaming_servo,
+                        &mut cmd_servo,
+                        &mut last_sequence,
+                        &mut last_ordinary_request,
+                        &recv_supervisor,
+                        &servo_reply_sink,
+                    )
+                    .await
+                    {
+                        if let Some(reply) = opt_reply {
+                            if !worker_writer.send_ordinary_control(reply).await {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
                     if let Some(opt_reply) = config::handle_executor_ws_command(
                         frame_kind,
                         entry,
@@ -2727,12 +2806,17 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 policy: None,
                 dry_run_grasp: None,
             };
+            let mut pending_motion: Option<motion::PendingMotion> = None;
             let mut pending_config_write: Option<config::PendingConfigJob> = None;
             let mut pending_calibration: Option<(Value, CalibJob, u64, u64, bool)> = None;
             maybe_pause_worker_before_lock(&recv_connection).await;
+            let command_label: &'static str = entry
+                .and_then(|e| e.key.path)
+                .unwrap_or_else(|| frame_kind.as_static_str());
             let mut reply_gate_guard;
-            {
+            let lock1_reply: Option<dispatch::OwnerReply> = {
                 let mut inner = recv_supervisor.inner().write().await;
+                inner.set_command(command_label);
                 if inner.detached {
                     drop(inner);
                     if let Some(reply) = executor_routing_reject(&value, recv_supervisor.owner_mode()) {
@@ -2740,6 +2824,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     }
                     continue;
                 }
+                let prev_action_id = inner.last_action.as_ref().map(|a| a.id);
                 reply_gate_guard = Some(CommandReplyGateGuard::enter(
                     &worker_command_reply_pending,
                     recv_supervisor.hub(),
@@ -2749,6 +2834,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         let mut ctx = OwnerDispatchCtx {
                             inner: &mut inner,
                             stamp,
+                            received_at,
                             path: $path,
                             value: &value,
                             epoch: $epoch,
@@ -2757,109 +2843,175 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             recv_supervisor: &recv_supervisor,
                             recv_deps: &recv_deps,
                             recv_calib: &recv_calib,
-                            #[cfg(feature = "policy-runtime")]
-                            pending_policy_loads: &pending_policy_loads,
                             last_sequence: &mut last_sequence,
                             action_pending: &mut action_pending,
+                            pending_motion: &mut pending_motion,
                             pending_config_write: &mut pending_config_write,
                             pending_calibration: &mut pending_calibration,
                         };
                         ($handler)(&mut ctx)
                     }};
                 }
-                {
-                    let (local_generation, authorized) = lease::check_lease_authority(
-                        &mut inner,
-                        raw_kind,
-                        &value,
-                        &recv_connection,
-                        &recv_generation,
-                        &recv_client_label,
-                    );
-                    let is_dry_run = entry.is_some_and(|e| e.lease == LeaseRequirement::RequiredExceptDryRun)
-                        && value.get("body").and_then(|b| b.get("dry_run")).and_then(Value::as_bool) == Some(true);
-                    let missing_gen = (entry.is_some_and(|e| e.lease == LeaseRequirement::RequiredExplicitGeneration)
-                        && value.get("generation").and_then(Value::as_u64).is_none())
-                        .then(|| json!({"type":"servo_reject", "reason":"missing_generation"}))
-                        .or_else(|| servo::missing_generation_reject(raw_kind, &value));
-                    if let Some(reject) = missing_gen {
-                        response = Some(reject);
-                    } else if !authorized && !is_dry_run {
-                        response = Some(lease::lease_loss_reply(&inner, raw_kind, &value, &recv_connection, local_generation));
+                let (local_generation, authorized) = lease::check_lease_authority(
+                    &mut inner,
+                    raw_kind,
+                    &value,
+                    &recv_connection,
+                    &recv_generation,
+                    &recv_client_label,
+                );
+                let is_dry_run = entry.is_some_and(|e| e.lease == LeaseRequirement::RequiredExceptDryRun)
+                    && value.get("body").and_then(|b| b.get("dry_run")).and_then(Value::as_bool) == Some(true);
+                let missing_gen = (entry.is_some_and(|e| e.lease == LeaseRequirement::RequiredExplicitGeneration)
+                    && value.get("generation").and_then(Value::as_u64).is_none())
+                    || servo::is_missing_generation(raw_kind, &value);
+                let out = if missing_gen {
+                    Some(dispatch::OwnerReply::ServoRejectReason("missing_generation"))
+                } else if !authorized && !is_dry_run {
+                    let reason = if raw_kind != "command" && raw_kind != "release_lease" && local_generation != 0 {
+                        Some(inner.lease_loss_reason(&recv_connection, local_generation))
                     } else {
-                        inner.consume_pending_estop();
-                        let epoch = inner.safety.epoch_id();
-                        if !is_dry_run && value.get("epoch_id").and_then(Value::as_u64) != Some(epoch) {
-                            response = Some(if frame_kind == FrameKind::Command {
-                                json!({"type":"command_reject", "request_id":value.get("request_id"), "status":409, "code":"EPOCH_MISMATCH", "message":"Command epoch is no longer current", "error":"EPOCH_MISMATCH", "epoch_id":epoch})
-                            } else { json!({"type":"epoch_sync", "epoch_id":epoch, "safety_state":inner.safety.state()}) });
-                        } else if frame_kind == FrameKind::Command {
-                            let request_id = value.get("request_id").and_then(Value::as_u64);
-                            if request_id.is_none() || last_ordinary_request.is_some_and(|last| request_id.unwrap() <= last) {
-                                response = Some(json!({"type":"command_reject", "request_id":value.get("request_id"), "status":400, "code":"INVALID_COMMAND", "message":"request_id must be present and strictly increase", "error":"INVALID_COMMAND"}));
-                            } else {
-                                last_ordinary_request = request_id;
-                                let path = value.get("path").and_then(Value::as_str).unwrap_or("");
-                                let auth_req = entry.map_or(AuthRequirement::None, |e| e.auth);
-                                if let Some(auth_err) = auth_req.check_owner(&ws_auth, &mut inner, path, &value["body"], epoch) {
-                                    response = Some(command_reject(&inner, &value["request_id"], auth_err));
-                                } else if let Some(code) = calibration_busy_code(&inner, path) {
-                                    response = Some(command_reject(&inner, &value["request_id"],
-                                        ApiError(StatusCode::CONFLICT, "a calibration apply, restore or motor zero is running".into(), code.into())));
-                                } else if let Some(DispatchHandler::Owner(handler)) = entry.map(|e| e.handler) {
-                                    response = call_owner!(handler, path, epoch, local_generation);
-                                } else if path.starts_with("/api/v1/action/") {
-                                    let err = if !value["body"].is_object() {
-                                        invalid_command("Command body must be an object")
-                                    } else {
-                                        invalid_command("Unknown action")
-                                    };
-                                    response = Some(command_reject(&inner, &value["request_id"], err));
-                                } else {
-                                    let result = validate_command_body_common(&value["body"])
-                                        .map_err(invalid_command)
-                                        .and_then(|()| Err::<Started, ApiError>(invalid_command("Unknown actuator command")));
-                                    response = Some(match result {
-                                        Ok(started) => command_ack(&inner, &value["request_id"], started),
-                                        Err(error) => command_reject(&inner, &value["request_id"], error),
-                                    });
-                                }
-                            }
-                        } else if let Some(DispatchHandler::Owner(handler)) = entry.map(|e| e.handler) {
-                            response = call_owner!(handler, "", epoch, local_generation);
+                        None
+                    };
+                    Some(dispatch::OwnerReply::LeaseLost {
+                        epoch: inner.safety.epoch_id(),
+                        local_generation,
+                        reason,
+                    })
+                } else {
+                    inner.consume_pending_estop();
+                    let epoch = inner.safety.epoch_id();
+                    if !is_dry_run && value.get("epoch_id").and_then(Value::as_u64) != Some(epoch) {
+                        Some(dispatch::OwnerReply::EpochMismatch {
+                            epoch,
+                            safety_state: inner.safety.state().clone(),
+                        })
+                    } else if frame_kind == FrameKind::Command {
+                        let request_id = value.get("request_id").and_then(Value::as_u64);
+                        if request_id.is_none() || last_ordinary_request.is_some_and(|last| request_id.unwrap() <= last) {
+                            Some(dispatch::OwnerReply::InvalidRequestId)
                         } else {
-                            response = None;
+                            last_ordinary_request = request_id;
+                            let path = value.get("path").and_then(Value::as_str).unwrap_or("");
+                            let auth_req = entry.map_or(AuthRequirement::None, |e| e.auth);
+                            if let Some(auth_err) = auth_req.check_owner(&ws_auth, &mut inner, path, &value["body"], epoch) {
+                                Some(dispatch::OwnerReply::CommandReject {
+                                    epoch: inner.safety.epoch_id(),
+                                    error: auth_err,
+                                })
+                            } else if let Some(code) = calibration_busy_code(&inner, path) {
+                                Some(dispatch::OwnerReply::CommandReject {
+                                    epoch: inner.safety.epoch_id(),
+                                    error: ApiError(
+                                        StatusCode::CONFLICT,
+                                        "a calibration apply, restore or motor zero is running".into(),
+                                        code.into(),
+                                    ),
+                                })
+                            } else if let Some(DispatchHandler::Owner(handler)) = entry.map(|e| e.handler) {
+                                call_owner!(handler, path, epoch, local_generation)
+                            } else if path.starts_with("/api/v1/action/") {
+                                let err = if !value["body"].is_object() {
+                                    invalid_command("Command body must be an object")
+                                } else {
+                                    invalid_command("Unknown action")
+                                };
+                                Some(dispatch::OwnerReply::CommandReject {
+                                    epoch: inner.safety.epoch_id(),
+                                    error: err,
+                                })
+                            } else {
+                                let error = match validate_command_body_common(&value["body"]) {
+                                    Ok(()) => invalid_command("Unknown actuator command"),
+                                    Err(msg) => invalid_command(msg),
+                                };
+                                Some(dispatch::OwnerReply::CommandReject {
+                                    epoch: inner.safety.epoch_id(),
+                                    error,
+                                })
+                            }
                         }
+                    } else if let Some(DispatchHandler::Owner(handler)) = entry.map(|e| e.handler) {
+                        call_owner!(handler, "", epoch, local_generation)
+                    } else {
+                        None
                     }
-                }
-                // Enqueue immediate control replies before dropping `inner` and before releasing
-                // `reply_gate_guard` so any terminal caused by this command (either via
-                // `record_finished_action` inside `inner` or via a subsequent tick's telemetry)
-                // cannot overtake this command's ack on the wire.
-                if evicted_notify.is_none()
-                    && response
+                };
+                let started_action_id = match &out {
+                    Some(
+                        dispatch::OwnerReply::CommandAck {
+                            started: Some((aid, _)),
+                            ..
+                        }
+                        | dispatch::OwnerReply::CommandAckJob {
+                            started: Some((aid, _)),
+                            ..
+                        },
+                    ) => Some(*aid),
+                    _ => inner
+                        .last_action
                         .as_ref()
-                        .is_some_and(|r| r.get("type").and_then(Value::as_str) != Some("lease_granted"))
-                    && !worker_writer.is_fatal()
-                {
-                    if let Some(reply) = response.take() {
-                        match worker_writer.ordinary_tx.try_send(reply) {
-                            Ok(()) => {
-                                response_sent = true;
-                            }
-                            Err(mpsc::error::TrySendError::Full(reply)) => {
-                                response = Some(reply);
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                drop(reply_gate_guard.take());
-                                break;
-                            }
+                        .map(|a| a.id)
+                        .filter(|&id| Some(id) != prev_action_id),
+                };
+                if let Some(aid) = started_action_id {
+                    inner.set_action_id(aid);
+                }
+                out
+            };
+            // Write guard is now released; format every immediate WS reply strictly off-lock and
+            // enqueue it onto `ordinary_tx` while `reply_gate_guard` stays active so any terminal
+            // caused by this command cannot overtake its ACK on the wire.
+            response = lock1_reply.map(|r| {
+                r.into_value(
+                    raw_kind,
+                    frame_kind,
+                    &value,
+                    #[cfg(feature = "policy-runtime")]
+                    &pending_policy_loads,
+                )
+            });
+            if evicted_notify.is_none()
+                && response
+                    .as_ref()
+                    .is_some_and(|r| r.get("type").and_then(Value::as_str) != Some("lease_granted"))
+                && !worker_writer.is_fatal()
+            {
+                if let Some(reply) = response.take() {
+                    match worker_writer.ordinary_tx.try_send(reply) {
+                        Ok(()) => {
+                            response_sent = true;
+                        }
+                        Err(mpsc::error::TrySendError::Full(reply)) => {
+                            response = Some(reply);
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            drop(reply_gate_guard.take());
+                            break;
                         }
                     }
                 }
             }
             if response.is_none() {
                 drop(reply_gate_guard.take());
+            }
+
+            let allows_motion_deferred = entry.is_some_and(|e| matches!(e.reply, ReplyPolicy::CommandDeferred | ReplyPolicy::PresetReply));
+            if allows_motion_deferred {
+                if let Some(pending) = pending_motion.take() {
+                    let Some((next, gate)) = motion::complete_pending_motion(
+                        pending,
+                        stamp,
+                        &recv_supervisor,
+                        &recv_connection,
+                        &recv_generation,
+                        &worker_closing,
+                        &worker_command_reply_pending,
+                        &worker_tasks,
+                    ).await else { break; };
+                    reply_gate_guard = gate;
+                    response = next;
+                }
             }
 
             let allows_deferred = entry.is_some_and(|e| e.reply == ReplyPolicy::CommandDeferred);
@@ -2973,6 +3125,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     || action_pending.replay.is_some()
                     || has_policy
                     || action_pending.dry_run_grasp.is_some()
+                    || pending_motion.is_some()
                     || pending_calibration.is_some()
                     || pending_config_write.is_some();
                 debug_assert!(
@@ -3047,6 +3200,9 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     // Stop and JOIN all primary tasks so none outlives teardown; give writer <= 1 s grace on fatal overflow.
     worker_task.abort();
     let _ = worker_task.await;
+    if let Some(handle) = supervisor.executor_handle() {
+        let _ = handle.try_unregister_servo_connection(conn_id);
+    }
     heartbeat_task.abort();
     let _ = heartbeat_task.await;
     auth_task.abort();

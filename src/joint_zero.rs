@@ -376,6 +376,13 @@ impl ArmDriver for ZeroOffsetDriver {
     fn begin_disable_torque_budgeted(&mut self, kind: DisableKind, max_rx_frames: u16) -> Result<crate::driver::TorqueProgress, ArmDriverError> {
         self.inner.begin_disable_torque_budgeted(kind, max_rx_frames)
     }
+    fn begin_client_park_disable(
+        &mut self,
+        max_rx_frames: Option<u16>,
+        expected_stop_gen: Option<u64>,
+    ) -> Result<crate::driver::TorqueProgress, ArmDriverError> {
+        self.inner.begin_client_park_disable(max_rx_frames, expected_stop_gen)
+    }
     fn poll_torque(&mut self, deadline: Instant) -> Result<crate::driver::TorqueProgress, ArmDriverError> { self.inner.poll_torque(deadline) }
     fn poll_torque_budgeted(&mut self, deadline: Instant, max_rx_frames: u16) -> Result<crate::driver::TorqueProgress, ArmDriverError> {
         self.inner.poll_torque_budgeted(deadline, max_rx_frames)
@@ -411,6 +418,7 @@ impl ArmDriver for ZeroOffsetDriver {
         self.stopped_disable_gate = Some(gate);
         self.inner.set_stopped_disable_gate(motor_gate);
     }
+    fn set_output_lease_gen(&mut self, lease_gen: u64) { self.inner.set_output_lease_gen(lease_gen) }
     fn set_gripper_index(&mut self, index: Option<usize>) { self.inner.set_gripper_index(index) }
     fn is_enabled(&self) -> bool { self.inner.is_enabled() }
     fn motor_status(&self) -> Option<Vec<u8>> { self.inner.motor_status() }

@@ -5944,9 +5944,9 @@ fn dual_owner_b1_stop_during_arm_write_degrades_prestamped_j7_target_to_hold() {
             0.0,
             Some(0.30),
             None,
-            PosForceIntentStamp { stop_gen: 0, estop_epoch: 1 },
+            PosForceIntentStamp { stop_gen: 0, estop_epoch: 1, lease_gen: 0 },
         );
-        let newer_stop_current = PosForceIntentStamp { stop_gen: 1, estop_epoch: 1 };
+        let newer_stop_current = PosForceIntentStamp { stop_gen: 1, estop_epoch: 1, lease_gen: 0 };
         bus.clear_log();
         drv.begin_tx_tick();
         let out = drv.emit_pos_force_j7(stale_stop_intent, newer_stop_current).unwrap();
@@ -5957,7 +5957,7 @@ fn dual_owner_b1_stop_during_arm_write_degrades_prestamped_j7_target_to_hold() {
         assert_eq!(u16::from_le_bytes([j7[0].data[4], j7[0].data[5]]), 0);
 
         // Older estop_epoch (1 vs current 2), fresh J7 -> Hold at -2.5 with vel_raw = 0.
-        let newer_epoch_current = PosForceIntentStamp { stop_gen: 0, estop_epoch: 2 };
+        let newer_epoch_current = PosForceIntentStamp { stop_gen: 0, estop_epoch: 2, lease_gen: 0 };
         bus.clear_log();
         drv.begin_tx_tick();
         let out2 = drv.emit_pos_force_j7(stale_stop_intent, newer_epoch_current).unwrap();

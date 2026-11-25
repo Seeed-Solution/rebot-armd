@@ -46,6 +46,23 @@ pub(super) enum FrameKind {
     Unknown,
 }
 
+impl FrameKind {
+    pub(super) const fn as_static_str(self) -> &'static str {
+        match self {
+            Self::EStop => "estop",
+            Self::Auth => "auth",
+            Self::Heartbeat => "heartbeat",
+            Self::AcquireLease => "acquire_lease",
+            Self::ReleaseLease => "release_lease",
+            Self::Command => "command",
+            Self::Preset => "preset",
+            Self::Servo => "servo",
+            Self::ImplicitServo => "implicit_servo",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// Primary lookup key in the unified WS dispatch table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct DispatchKey {
@@ -269,6 +286,7 @@ pub(super) struct LeaseFreeCtx<'a> {
 pub(super) struct OwnerDispatchCtx<'a> {
     pub(super) inner: &'a mut SupervisorInner,
     pub(super) stamp: AdmissionStamp,
+    pub(super) received_at: std::time::Instant,
     pub(super) path: &'a str,
     pub(super) value: &'a Value,
     pub(super) epoch: u64,
@@ -277,12 +295,179 @@ pub(super) struct OwnerDispatchCtx<'a> {
     pub(super) recv_supervisor: &'a Arc<ArmSupervisor>,
     pub(super) recv_deps: &'a crate::grasp::GraspDeps,
     pub(super) recv_calib: &'a crate::calibration::CalibrationDeps,
-    #[cfg(feature = "policy-runtime")]
-    pub(super) pending_policy_loads: &'a AtomicUsize,
     pub(super) last_sequence: &'a mut Option<u64>,
     pub(super) action_pending: &'a mut actions::ActionPending,
+    pub(super) pending_motion: &'a mut Option<motion::PendingMotion>,
     pub(super) pending_config_write: &'a mut Option<config::PendingConfigJob>,
     pub(super) pending_calibration: &'a mut Option<(Value, calibration::CalibJob, u64, u64, bool)>,
+}
+
+/// Lightweight WS reply payload captured under `SupervisorLock` and formatted into JSON
+/// strictly AFTER the lock guard is released (zero JSON serialization under the guard).
+#[allow(clippy::large_enum_variant)]
+pub(super) enum OwnerReply {
+    CommandAck {
+        snap: super::AckSnapshot,
+        started: super::Started,
+    },
+    CommandAckJob {
+        snap: super::AckSnapshot,
+        started: super::Started,
+        job_id: String,
+    },
+    CommandReject {
+        epoch: u64,
+        error: ApiError,
+    },
+    PresetReject {
+        epoch: u64,
+        name: String,
+        error: ApiError,
+    },
+    PresetCalibrationBusy {
+        epoch: u64,
+    },
+    ServoRejectReason(&'static str),
+    ServoRejectApi {
+        epoch: u64,
+        error: ApiError,
+    },
+    FieldsAck(Value),
+    CalibReject(crate::calibration::CalibError),
+    LeaseLost {
+        epoch: u64,
+        local_generation: u64,
+        reason: Option<&'static str>,
+    },
+    EpochMismatch {
+        epoch: u64,
+        safety_state: crate::safety::SafetyState,
+    },
+    InvalidRequestId,
+    #[cfg(feature = "policy-runtime")]
+    PolicyStopAck {
+        snap: super::AckSnapshot,
+        stopped: bool,
+    },
+}
+
+impl OwnerReply {
+    pub(super) fn into_value(
+        self,
+        raw_kind: &str,
+        frame_kind: FrameKind,
+        value: &Value,
+        #[cfg(feature = "policy-runtime")] pending_policy_loads: &AtomicUsize,
+    ) -> Value {
+        match self {
+            Self::CommandAck { snap, started } => {
+                super::command_ack_from_snap(&snap, &value["request_id"], started)
+            }
+            Self::CommandAckJob {
+                snap,
+                started,
+                job_id,
+            } => {
+                let mut ack = super::command_ack_from_snap(&snap, &value["request_id"], started);
+                ack["job_id"] = serde_json::json!(job_id);
+                ack
+            }
+            Self::CommandReject { epoch, error } => {
+                super::command_reject_at(epoch, &value["request_id"], error)
+            }
+            Self::PresetReject { epoch, name, error } => {
+                let mut reply = super::rejection(error, "preset_reject", epoch);
+                reply["name"] = serde_json::json!(name);
+                reply
+            }
+            Self::PresetCalibrationBusy { epoch } => serde_json::json!({
+                "type": "preset_reject",
+                "name": value.get("name"),
+                "status": 409,
+                "code": "MOTION_BUSY",
+                "error": "MOTION_BUSY",
+                "message": "a camera calibration apply or restore is running",
+                "epoch_id": epoch,
+            }),
+            Self::ServoRejectReason(reason) => {
+                serde_json::json!({"type": "servo_reject", "reason": reason})
+            }
+            Self::ServoRejectApi { epoch, error } => {
+                let stopped = error.code.as_deref() == Some("STOPPED");
+                let mut r = super::rejection(error, "servo_reject", epoch);
+                if stopped {
+                    r["reason"] = serde_json::json!("stopped");
+                }
+                r
+            }
+            Self::FieldsAck(reply) => super::fields_ack(&value["request_id"], reply),
+            Self::CalibReject(e) => calibration::calibration_reject(&value["request_id"], &e),
+            Self::LeaseLost {
+                epoch,
+                local_generation,
+                reason,
+            } => {
+                if raw_kind == "command" {
+                    serde_json::json!({
+                        "type": "command_reject",
+                        "request_id": value.get("request_id"),
+                        "status": 409,
+                        "code": "LEASE_LOST",
+                        "message": "This connection does not own an active lease",
+                        "error": "LEASE_LOST",
+                        "epoch_id": epoch,
+                    })
+                } else if raw_kind == "release_lease" {
+                    serde_json::json!({"type": "lease_released", "success": false})
+                } else if local_generation == 0 {
+                    serde_json::json!({"type": "lease_lost", "generation": 0})
+                } else {
+                    serde_json::json!({
+                        "type": "lease_lost",
+                        "generation": local_generation,
+                        "reason": reason.unwrap_or("expired"),
+                    })
+                }
+            }
+            Self::EpochMismatch {
+                epoch,
+                safety_state,
+            } => {
+                if frame_kind == FrameKind::Command {
+                    serde_json::json!({
+                        "type": "command_reject",
+                        "request_id": value.get("request_id"),
+                        "status": 409,
+                        "code": "EPOCH_MISMATCH",
+                        "message": "Command epoch is no longer current",
+                        "error": "EPOCH_MISMATCH",
+                        "epoch_id": epoch,
+                    })
+                } else {
+                    serde_json::json!({
+                        "type": "epoch_sync",
+                        "epoch_id": epoch,
+                        "safety_state": safety_state,
+                    })
+                }
+            }
+            Self::InvalidRequestId => serde_json::json!({
+                "type": "command_reject",
+                "request_id": value.get("request_id"),
+                "status": 400,
+                "code": "INVALID_COMMAND",
+                "message": "request_id must be present and strictly increase",
+                "error": "INVALID_COMMAND",
+            }),
+            #[cfg(feature = "policy-runtime")]
+            Self::PolicyStopAck { snap, stopped } => {
+                let had_pending = pending_policy_loads.load(std::sync::atomic::Ordering::SeqCst) > 0;
+                let mut ack = super::command_ack_from_snap(&snap, &value["request_id"], None);
+                ack["stopped"] = serde_json::json!(stopped || had_pending);
+                ack
+            }
+        }
+    }
 }
 
 /// Boxed future returned by the table-bound unified heartbeat handler.
@@ -353,7 +538,7 @@ pub(super) enum DispatchHandler {
     /// Pre-lock lease-free command handler (`depth_measure`, `teach`).
     LeaseFree(fn(LeaseFreeCtx<'_>)),
     /// Owner-locked handler executed under `supervisor.inner().write()`.
-    Owner(fn(&mut OwnerDispatchCtx<'_>) -> Option<Value>),
+    Owner(fn(&mut OwnerDispatchCtx<'_>) -> Option<OwnerReply>),
 }
 
 /// One row of the unified WS dispatch table.
@@ -754,9 +939,10 @@ mod tests {
         let mixed_release = json!({"type": "release_lease", "positions": null});
         let mixed_acquire = json!({"type": "acquire_lease", "client_id": "a", "mode": "cartesian_joint_stream"});
         let clean_release = json!({"type": "release_lease"});
-        assert!(q.try_push(mixed_release.clone(), stamp).is_ok());
-        assert!(q.try_push(mixed_acquire.clone(), stamp).is_ok());
-        assert!(q.try_push(clean_release.clone(), stamp).is_ok());
+        let now = std::time::Instant::now();
+        assert!(q.try_push(mixed_release.clone(), stamp, now).is_ok());
+        assert!(q.try_push(mixed_acquire.clone(), stamp, now).is_ok());
+        assert!(q.try_push(clean_release.clone(), stamp, now).is_ok());
 
         let replies = q.drain_cancellable("STOPPED", Some(7));
         assert_eq!(replies.len(), 2, "both mixed-field lease frames must cancel like baseline");

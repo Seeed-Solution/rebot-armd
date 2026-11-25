@@ -184,6 +184,40 @@ pub struct SampleMeta {
     pub valid_until: Instant,
 }
 
+/// Scalar motion/authority metadata published alongside [`RtSample`] (Copy, 0 alloc on RT).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RtMotionMeta {
+    pub boot_id: super::broker::BootId,
+    pub clock_now: Option<Instant>,
+    pub workspace_revision: u64,
+    pub motion_config_revision: u64,
+    pub stop_generation: u64,
+    pub lease_generation: u64,
+    pub config_inhibited: bool,
+    pub calibration_busy: bool,
+    pub holding_after_clear: bool,
+    pub watchdog_park_pending_gen: u64,
+    pub watchdog_park_pending_attempt: u8,
+}
+
+impl Default for RtMotionMeta {
+    fn default() -> Self {
+        Self {
+            boot_id: super::broker::BootId(0),
+            clock_now: None,
+            workspace_revision: 0,
+            motion_config_revision: 0,
+            stop_generation: 0,
+            lease_generation: 0,
+            config_inhibited: false,
+            calibration_busy: false,
+            holding_after_clear: false,
+            watchdog_park_pending_gen: 0,
+            watchdog_park_pending_attempt: 0,
+        }
+    }
+}
+
 /// Zero-alloc `Copy` snapshot of live held-object state published per tick.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PublishedHeld {
@@ -281,7 +315,7 @@ impl Default for PublishedOwnerMeta {
 }
 
 /// Per-joint feedback and owner metadata of a sample; every vector has the profile's dof.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RtSample {
     pub positions: Vec<f32>,
     pub velocities: Vec<f32>,
@@ -297,6 +331,21 @@ pub struct RtSample {
     pub feedback_queue_bounds: Vec<Option<Instant>>,
     /// Live owner authority, domain revisions, flags, held state, and macro child state.
     pub owner: PublishedOwnerMeta,
+    pub boot_id: super::broker::BootId,
+    pub clock_now: Option<Instant>,
+    pub workspace_revision: u64,
+    pub motion_config_revision: u64,
+    pub stop_generation: u64,
+    pub lease_generation: u64,
+    pub config_inhibited: bool,
+    pub calibration_busy: bool,
+    pub holding_after_clear: bool,
+    pub watchdog_park_pending_gen: u64,
+    pub watchdog_park_pending_attempt: u8,
+}
+
+impl Default for RtSample {
+    fn default() -> Self { Self::with_dof(0) }
 }
 
 impl RtSample {
@@ -310,6 +359,17 @@ impl RtSample {
             feedback_seqs: Vec::with_capacity(dof),
             feedback_queue_bounds: Vec::with_capacity(dof),
             owner: PublishedOwnerMeta::default(),
+            boot_id: super::broker::BootId(0),
+            clock_now: None,
+            workspace_revision: 0,
+            motion_config_revision: 0,
+            stop_generation: 0,
+            lease_generation: 0,
+            config_inhibited: false,
+            calibration_busy: false,
+            holding_after_clear: false,
+            watchdog_park_pending_gen: 0,
+            watchdog_park_pending_attempt: 0,
         }
     }
 
@@ -437,6 +497,7 @@ pub struct RtInputs<'a> {
     pub feedback_seqs: &'a [u64],
     pub feedback_queue_bounds: &'a [Option<Instant>],
     pub owner: PublishedOwnerMeta,
+    pub meta: RtMotionMeta,
 }
 
 impl StatePublisher {
@@ -478,6 +539,17 @@ impl StatePublisher {
         copy_into(&mut slot.rt.feedback_seqs, rt.feedback_seqs);
         copy_into(&mut slot.rt.feedback_queue_bounds, rt.feedback_queue_bounds);
         slot.rt.owner = rt.owner;
+        slot.rt.boot_id = rt.meta.boot_id;
+        slot.rt.clock_now = rt.meta.clock_now;
+        slot.rt.workspace_revision = rt.meta.workspace_revision;
+        slot.rt.motion_config_revision = rt.meta.motion_config_revision;
+        slot.rt.stop_generation = rt.meta.stop_generation;
+        slot.rt.lease_generation = rt.meta.lease_generation;
+        slot.rt.config_inhibited = rt.meta.config_inhibited;
+        slot.rt.calibration_busy = rt.meta.calibration_busy;
+        slot.rt.holding_after_clear = rt.meta.holding_after_clear;
+        slot.rt.watchdog_park_pending_gen = rt.meta.watchdog_park_pending_gen;
+        slot.rt.watchdog_park_pending_attempt = rt.meta.watchdog_park_pending_attempt;
         let _ = self.producer.publish();
         self.hub.published.store(seq, Ordering::Release);
         self.hub.wake();
@@ -587,6 +659,8 @@ pub struct StateHub {
     /// Pre-sized observation template recorded at executor startup so a contended reader warms
     /// its own `front` slot off-thread before handing it back to the RT producer.
     prewarm_template: OnceLock<Box<ArmObservation>>,
+    /// Immutable motion planning config snapshot updated off-tick for zero-lock workers.
+    motion_config: std::sync::RwLock<Option<Arc<super::requests::motion::MotionConfigSnapshot>>>,
     /// Off-thread schema cache paired with [`OwnerStateSnapshot::schema_revision`]. Never locked
     /// on the RT control thread.
     schema_cache: Mutex<Option<(u64, Arc<ObservationSchema>)>>,
@@ -620,6 +694,7 @@ pub fn state_channel(dof: usize) -> (StatePublisher, Arc<StateHub>) {
         retire: RetireRing::new(),
         tick_frees: AtomicU64::new(0),
         prewarm_template: OnceLock::new(),
+        motion_config: std::sync::RwLock::new(None),
         schema_cache: Mutex::new(None),
         prep_env: Mutex::new(None),
         action_measurements: Mutex::new(std::collections::HashMap::new()),
@@ -730,6 +805,16 @@ impl StateHub {
     }
 
     pub fn is_closed(&self) -> bool { self.closed.load(Ordering::Acquire) }
+
+    /// Publishes an immutable motion planning config snapshot off the RT tick.
+    pub fn set_motion_config(&self, cfg: Arc<super::requests::motion::MotionConfigSnapshot>) {
+        *self.motion_config.write().unwrap_or_else(|e| e.into_inner()) = Some(cfg);
+    }
+
+    /// Reads the latest immutable motion planning config snapshot without touching the owner lock.
+    pub fn motion_config(&self) -> Option<Arc<super::requests::motion::MotionConfigSnapshot>> {
+        self.motion_config.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
 
     /// Records the off-thread [`ObservationSchema`] corresponding to `revision`.
     pub fn set_schema_cache(&self, revision: u64, schema: Arc<ObservationSchema>) {
@@ -886,6 +971,7 @@ mod tests {
             feedback_seqs: s,
             feedback_queue_bounds: &[],
             owner: PublishedOwnerMeta::default(),
+            meta: RtMotionMeta::default(),
         }
     }
 
@@ -941,6 +1027,7 @@ mod tests {
             commanded_positions: &[1.0, 2.0, 3.0], commanded_velocities: &[0.0, 0.0, 0.0],
             feedback_instants: &[Some(now), None, Some(now)], feedback_seqs: &[5, 6, 7],
             feedback_queue_bounds: &[], owner: PublishedOwnerMeta::default(),
+            meta: RtMotionMeta::default(),
         });
         let (p, v, i, s) = hub.latest().unwrap().rt.arm_feedback(&[0, 2]);
         assert_eq!((p, v, i, s), (vec![1.0, 2.0, 3.0], vec![0.1, 0.3], vec![Some(now), Some(now)], vec![5, 7]));

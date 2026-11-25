@@ -78,6 +78,10 @@ macro_rules! fieldwise_clone {
     };
 }
 
+/// Maximum total joint count supported inline across motion planning, trajectories,
+/// power budgeting, and stationary settle tracking: an 8-joint URDF chain plus 1 gripper.
+pub const MAX_MOTION_DOF: usize = crate::chain::MAX_CHAIN_JOINTS + 1;
+
 /// Up to [`ArmJoints::CAP`] joint indices without a heap allocation (the arm joints of a
 /// profile, [`ArmConfig::arm_joints`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2067,6 +2071,13 @@ impl ArmConfig {
         if self.dof == 0 {
             return Err("DOF cannot be zero".into());
         }
+        if self.dof > MAX_MOTION_DOF {
+            return Err(format!(
+                "DOF {} exceeds maximum supported {MAX_MOTION_DOF} (up to {} arm joints + gripper)",
+                self.dof,
+                crate::chain::MAX_CHAIN_JOINTS
+            ));
+        }
         if let Some(t) = &self.calibration_tool { t.validate()?; }
         if self.limits.len() != self.dof {
             return Err(format!("Limits length {} does not match DOF {}", self.limits.len(), self.dof));
@@ -3646,6 +3657,22 @@ impl Clone for SafetyTextSpare {
     fn clone_from(&mut self, _source: &Self) {}
 }
 
+/// Reusable preallocated [`crate::kinematics::WorkspaceViolationDetail`] parked on an
+/// [`ArmObservation`] slot while `workspace_violation` is `None`, so RT `fill_observation`
+/// transitions perform 0 heap allocations or frees. Ignored by `PartialEq` and `serde`.
+#[derive(Debug, Default)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+pub(crate) struct WorkspaceViolationSpare(Option<crate::kinematics::WorkspaceViolationDetail>);
+
+impl PartialEq for WorkspaceViolationSpare {
+    fn eq(&self, _other: &Self) -> bool { true }
+}
+
+impl Clone for WorkspaceViolationSpare {
+    fn clone(&self) -> Self { Self(None) }
+    fn clone_from(&mut self, _source: &Self) {}
+}
+
 /// Full arm telemetry / observation
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct ArmObservation {
@@ -3746,6 +3773,10 @@ pub struct ArmObservation {
     /// `JointLimitExceeded`) so RT `fill_observation` transitions perform 0 heap allocations or drops.
     #[serde(skip)]
     pub(crate) safety_text_spare: SafetyTextSpare,
+    /// Preallocated [`crate::kinematics::WorkspaceViolationDetail`] moved into/out of
+    /// `workspace_violation` so RT `fill_observation` transitions perform 0 heap ops.
+    #[serde(skip)]
+    pub(crate) workspace_violation_spare: WorkspaceViolationSpare,
 }
 
 fn is_zero_u64(v: &u64) -> bool { *v == 0 }
@@ -3763,12 +3794,13 @@ impl ArmObservation {
             fault: None, residual_torques: None, collision: None, power: None, gripper_zero: None, tcp: None, gripper: None,
             loads: None, policy: None, watchdog_park_blocked_reason: None, safety_log_dropped: 0,
             safety_text_spare: SafetyTextSpare(String::new()),
+            workspace_violation_spare: WorkspaceViolationSpare(None),
         }
     }
 
     /// Blank observation for an RT triple-buffer slot with preallocated `safety_state` text capacity.
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn blank_rt() -> Self {
+    pub fn blank_rt() -> Self {
         let mut obs = Self::blank();
         obs.ensure_rt_safety_text_spare();
         obs
@@ -3799,6 +3831,41 @@ impl ArmObservation {
         }
         if self.gravity_comp.damping_kd.capacity() < 6 {
             self.gravity_comp.damping_kd.reserve(6 - self.gravity_comp.damping_kd.len());
+        }
+        if self.workspace_violation.is_none() && self.workspace_violation_spare.0.is_none() {
+            self.workspace_violation_spare.0 =
+                Some(crate::kinematics::WorkspaceViolationDetail::preallocated_rt());
+        }
+    }
+
+    /// Updates `self.workspace_violation` reusing preallocated buffers between
+    /// `self.workspace_violation` and `self.workspace_violation_spare` (0 alloc / 0 free on RT).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn set_workspace_violation_rt(
+        &mut self,
+        src: Option<&crate::kinematics::WorkspaceViolationDetail>,
+    ) {
+        if self.workspace_violation.as_ref() == src {
+            return;
+        }
+        match src {
+            Some(s) => {
+                if let Some(dst) = self.workspace_violation.as_mut() {
+                    dst.copy_from_rt(s);
+                } else if let Some(mut spare) = self.workspace_violation_spare.0.take() {
+                    spare.copy_from_rt(s);
+                    self.workspace_violation = Some(spare);
+                } else {
+                    self.workspace_violation = Some(s.clone());
+                }
+            }
+            None => {
+                if let Some(old) = self.workspace_violation.take() {
+                    if self.workspace_violation_spare.0.is_none() {
+                        self.workspace_violation_spare.0 = Some(old);
+                    }
+                }
+            }
         }
     }
 
@@ -3866,7 +3933,7 @@ impl ArmObservation {
     }
 }
 
-crate::fieldwise_clone!(ArmObservation { timestamp, positions, velocities, torques, temperatures, is_torqued, safety_state, epoch_id, gravity_compensated, gravity_torques, driver_capabilities, enable_state, feedback_age_ms, disable_pending, feedback_valid, commanded_positions, action, previous_action, control_mode, gravity_comp, driver_range_check, lease_holder, motion_limit, workspace_violation, motor_errors, fault, residual_torques, collision, power, gripper_zero, tcp, gripper, loads, policy, watchdog_park_blocked_reason, safety_log_dropped, safety_text_spare });
+crate::fieldwise_clone!(ArmObservation { timestamp, positions, velocities, torques, temperatures, is_torqued, safety_state, epoch_id, gravity_compensated, gravity_torques, driver_capabilities, enable_state, feedback_age_ms, disable_pending, feedback_valid, commanded_positions, action, previous_action, control_mode, gravity_comp, driver_range_check, lease_holder, motion_limit, workspace_violation, motor_errors, fault, residual_torques, collision, power, gripper_zero, tcp, gripper, loads, policy, watchdog_park_blocked_reason, safety_log_dropped, safety_text_spare, workspace_violation_spare });
 
 /// Policy runtime execution state published in `observation.policy`.
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq)]

@@ -21,9 +21,10 @@ use rtrb::{Consumer, Producer, RingBuffer};
 
 use super::broker::{BootId, Broker, Capacities, ClientId};
 use super::config_iface::{ConfigAuthority, ConfigDomain, ConfigProposal, Reservation};
+use super::ids::ArmId;
 use super::mailbox::TargetWriter;
 use super::ops::{CoreOps, PlanSlot, PlanningSnapshot, ReleaseEngine, MAX_SERVICE_WAKES};
-use super::publish::StateHub;
+use super::publish::{Snapshot, StateHub};
 use super::sched::{self, MemoryLock, RtReadiness, RtSchedConfig};
 use super::urgent::{
     urgent_stop_channel, RetiredStopPayloads, StopRequests, UrgentStop, UrgentStopClient,
@@ -2042,6 +2043,10 @@ pub(crate) struct OffThreadSinks {
     conn_lifecycle_client: Arc<super::requests::lease::ConnLifecycleClient>,
     broker_dispatcher: Arc<BrokerDispatcher>,
     eviction_rx: Mutex<Consumer<(super::requests::lease::ConnectionHandle, u64)>>,
+    servo_close_rx: Mutex<Consumer<u64>>,
+    atomic_fenced_lease_gen: Arc<AtomicU64>,
+    servo_dispatcher: Arc<ServoTargetDispatcher>,
+    hub: Arc<StateHub>,
     offload_reclaim_rx: Mutex<Consumer<OffloadReclaim>>,
 }
 
@@ -2169,6 +2174,19 @@ impl OffThreadSinks {
             while let Ok((ev_conn, ev_gen)) = ev_rx.pop() {
                 crate::api::ws::notify_evicted_connection(ev_conn.as_str(), ev_gen);
             }
+        }
+        // Drain RT servo target outcomes BEFORE applying `close_servo(old_gen)` so an already-
+        // consumed frame from a displaced lease resolves with its exact RT refusal before closing.
+        self.servo_dispatcher.drain_outcomes(&self.hub);
+        {
+            let mut close_rx = self.servo_close_rx.lock().unwrap_or_else(|e| e.into_inner());
+            while let Ok(old_gen) = close_rx.pop() {
+                self.servo_dispatcher.close_servo(old_gen);
+            }
+        }
+        let fenced_gen = self.atomic_fenced_lease_gen.load(Ordering::Acquire);
+        if fenced_gen > 0 {
+            self.servo_dispatcher.sync_fenced_generation(fenced_gen);
         }
         if self.persist_worker_exited.load(Ordering::Acquire) {
             let mut rx = self.persist_rep_rx.lock().unwrap_or_else(|e| e.into_inner());
@@ -2314,11 +2332,612 @@ impl ActionReplyRouter {
     }
 }
 
+/// Outcome of a correlated WS `/api/v1/motion/servo` command routed through [`TargetPort::submit_servo`].
+pub(crate) enum ServoCommandOutcome {
+    Applied {
+        result: Result<(), super::mailbox::Refusal>,
+        post: Option<Arc<Snapshot>>,
+    },
+    /// Overwritten in the triple buffer before consumption by a newer target frame.
+    Coalesced,
+    /// Displaced/closed generation was overwritten before consumption.
+    Closed,
+    /// Executor stopped before consuming the frame.
+    Stopped,
+}
+
+/// Immediate refusal from [`RtExecutorHandle::submit_servo_command`].
+pub(crate) enum ServoCommandSubmitError {
+    Immediate(serde_json::Value),
+    Unavailable,
+}
+
+/// Drop-safe waiter for one correlated `/api/v1/motion/servo` submission.
+pub(crate) struct ServoCommandWaiter {
+    dispatcher: Arc<ServoTargetDispatcher>,
+    key: (super::mailbox::StreamId, u64),
+    rx: tokio::sync::oneshot::Receiver<ServoCommandOutcome>,
+    completed: bool,
+}
+
+impl ServoCommandWaiter {
+    pub(crate) async fn wait(mut self) -> ServoCommandOutcome {
+        let out = match (&mut self.rx).await {
+            Ok(outcome) => outcome,
+            Err(_) => ServoCommandOutcome::Stopped,
+        };
+        self.completed = true;
+        out
+    }
+}
+
+impl Drop for ServoCommandWaiter {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.dispatcher.cancel_command_waiter(self.key);
+        }
+    }
+}
+
+type ServoStreamReplySink = Arc<dyn Fn(serde_json::Value) + Send + Sync>;
+
+struct ServoStreamOwner {
+    conn_id: u64,
+    conn_name: String,
+    lease_generation: u64,
+    reply_sink: ServoStreamReplySink,
+    pending_seqs: VecDeque<u64>,
+}
+
+const UNCLAIMED_TARGET_OUTCOMES_CAP: usize = 64;
+const STREAM_PENDING_SEQS_CAP: usize = 64;
+
+struct ServoTargetDispatcherInner {
+    port: crate::supervisor::targets::TargetPort,
+    last_inflight_key: Option<(super::mailbox::StreamId, u64)>,
+    command_waiters: std::collections::HashMap<
+        (super::mailbox::StreamId, u64),
+        tokio::sync::oneshot::Sender<ServoCommandOutcome>,
+    >,
+    stream_owners: std::collections::HashMap<super::mailbox::StreamId, ServoStreamOwner>,
+    unclaimed_outcomes: VecDeque<super::mailbox::TargetOutcome>,
+    submitted_count: u64,
+    lease_refused_by_gen: std::collections::HashMap<u64, u64>,
+    closed: bool,
+}
+
+type DrainedServoDeliveries = (
+    Vec<(tokio::sync::oneshot::Sender<ServoCommandOutcome>, ServoCommandOutcome)>,
+    Vec<(ServoStreamReplySink, String, u64, super::mailbox::Refusal)>,
+);
+
+impl ServoTargetDispatcherInner {
+    fn prune_closed_stream_owners_locked(&mut self) {
+        let closed = self.port.closed_servo_generation();
+        if closed == 0 {
+            return;
+        }
+        self.stream_owners.retain(|_, owner| {
+            !(owner.lease_generation != 0
+                && owner.lease_generation <= closed
+                && owner.pending_seqs.is_empty())
+        });
+    }
+
+    fn pop_outcomes_locked(
+        &mut self,
+        hub: &StateHub,
+        resolved_cmds: &mut Vec<(tokio::sync::oneshot::Sender<ServoCommandOutcome>, ServoCommandOutcome)>,
+        stream_refusals: &mut Vec<(ServoStreamReplySink, String, u64, super::mailbox::Refusal)>,
+    ) {
+        let mut popped = Vec::new();
+        self.port.outcomes(|o| popped.push(o));
+        let closed_gen = self.port.closed_servo_generation();
+        for o in popped {
+            if (o.stream.0 & crate::supervisor::targets::SERVO_STREAM_BIT) != 0 {
+                if let Err(ref r) = o.result {
+                    if matches!(r.code, "LEASE_LOST" | "NO_LEASE" | "STREAM_NOT_AUTHORIZED") {
+                        let gen = o.stream.0 & !crate::supervisor::targets::SERVO_STREAM_BIT;
+                        *self.lease_refused_by_gen.entry(gen).or_insert(0) += 1;
+                    }
+                }
+            }
+            if let Some(tx) = self.command_waiters.remove(&(o.stream, o.seq)) {
+                resolved_cmds.push((
+                    tx,
+                    ServoCommandOutcome::Applied {
+                        result: o.result,
+                        post: hub.latest(),
+                    },
+                ));
+                continue;
+            }
+            let mut claimed_by_stream = false;
+            let mut drop_closed_owner = false;
+            if let Some(owner) = self.stream_owners.get_mut(&o.stream) {
+                if owner.pending_seqs.iter().any(|&s| s == o.seq) {
+                    claimed_by_stream = true;
+                    while let Some(&front) = owner.pending_seqs.front() {
+                        owner.pending_seqs.pop_front();
+                        if front == o.seq {
+                            break;
+                        }
+                    }
+                    if let Err(refusal) = o.result {
+                        stream_refusals.push((
+                            Arc::clone(&owner.reply_sink),
+                            owner.conn_name.clone(),
+                            owner.lease_generation,
+                            refusal,
+                        ));
+                    }
+                    if owner.lease_generation != 0
+                        && owner.lease_generation <= closed_gen
+                        && owner.pending_seqs.is_empty()
+                    {
+                        drop_closed_owner = true;
+                    }
+                }
+            }
+            if drop_closed_owner {
+                self.stream_owners.remove(&o.stream);
+            }
+            if !claimed_by_stream {
+                if self.unclaimed_outcomes.len() >= UNCLAIMED_TARGET_OUTCOMES_CAP {
+                    self.unclaimed_outcomes.pop_front();
+                }
+                self.unclaimed_outcomes.push_back(o);
+            }
+        }
+    }
+
+    fn note_coalesced_locked(
+        &mut self,
+        prev_key: Option<(super::mailbox::StreamId, u64)>,
+        resolved_cmds: &mut Vec<(tokio::sync::oneshot::Sender<ServoCommandOutcome>, ServoCommandOutcome)>,
+    ) {
+        let Some(old_key) = prev_key else {
+            return;
+        };
+        if let Some(tx) = self.command_waiters.remove(&old_key) {
+            let old_gen = old_key.0 .0 & !crate::supervisor::targets::SERVO_STREAM_BIT;
+            let is_servo = (old_key.0 .0 & crate::supervisor::targets::SERVO_STREAM_BIT) != 0;
+            let outcome = if is_servo && self.port.is_servo_closed(old_gen) {
+                ServoCommandOutcome::Closed
+            } else {
+                ServoCommandOutcome::Coalesced
+            };
+            resolved_cmds.push((tx, outcome));
+        }
+        // Retire the overwritten streaming seq from its owner too so a closed stream whose
+        // buffered frame was coalesced by a replacement generation cannot pin its owner forever.
+        let closed_gen = self.port.closed_servo_generation();
+        let mut drop_closed_owner = false;
+        if let Some(owner) = self.stream_owners.get_mut(&old_key.0) {
+            while let Some(&front) = owner.pending_seqs.front() {
+                if front <= old_key.1 {
+                    owner.pending_seqs.pop_front();
+                } else {
+                    break;
+                }
+            }
+            if owner.lease_generation != 0
+                && owner.lease_generation <= closed_gen
+                && owner.pending_seqs.is_empty()
+            {
+                drop_closed_owner = true;
+            }
+        }
+        if drop_closed_owner {
+            self.stream_owners.remove(&old_key.0);
+        }
+    }
+}
+
+/// Off-thread coordinator owning [`TargetPort`], `close_servo` dispatch, streaming outcome
+/// delivery, and `/api/v1/motion/servo` command reply correlation (never touched by `armd-control`).
+pub(crate) struct ServoTargetDispatcher {
+    inner: Mutex<ServoTargetDispatcherInner>,
+    exited: Arc<AtomicBool>,
+    atomic_fenced_lease_gen: Arc<AtomicU64>,
+}
+
+impl ServoTargetDispatcher {
+    fn new(
+        writer: TargetWriter,
+        arm: ArmId,
+        boot: BootId,
+        exited: Arc<AtomicBool>,
+        atomic_fenced_lease_gen: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            inner: Mutex::new(ServoTargetDispatcherInner {
+                port: crate::supervisor::targets::TargetPort::new(writer, arm, boot),
+                last_inflight_key: None,
+                command_waiters: std::collections::HashMap::new(),
+                stream_owners: std::collections::HashMap::new(),
+                unclaimed_outcomes: VecDeque::with_capacity(UNCLAIMED_TARGET_OUTCOMES_CAP),
+                submitted_count: 0,
+                lease_refused_by_gen: std::collections::HashMap::new(),
+                closed: false,
+            }),
+            exited,
+            atomic_fenced_lease_gen,
+        }
+    }
+
+    fn sync_authoritative_fence_locked(&self, g: &mut ServoTargetDispatcherInner) {
+        let fenced_gen = self.atomic_fenced_lease_gen.load(Ordering::Acquire);
+        if fenced_gen > g.port.closed_servo_generation() {
+            g.port.close_servo(fenced_gen);
+            g.prune_closed_stream_owners_locked();
+        }
+    }
+
+    fn deliver_drained(hub: &StateHub, (resolved_cmds, stream_refusals): DrainedServoDeliveries) {
+        for (tx, outcome) in resolved_cmds {
+            let _ = tx.send(outcome);
+        }
+        if stream_refusals.is_empty() {
+            return;
+        }
+        let snap = hub.latest();
+        for (sink, conn_name, lease_gen, refusal) in stream_refusals {
+            let ctx = crate::supervisor::targets::ReplyCtx {
+                epoch_id: snap.as_ref().map_or(0, |s| s.obs.epoch_id),
+                safety_state: snap
+                    .as_ref()
+                    .map_or_else(|| serde_json::json!("Idle"), |s| serde_json::json!(s.obs.safety_state)),
+                lease_generation: lease_gen,
+            };
+            if let Some(mut reply) = crate::supervisor::targets::servo_outcome_reply(&refusal, &ctx) {
+                if reply.get("type").and_then(serde_json::Value::as_str) == Some("lease_lost")
+                    && lease_gen != 0
+                    && reply.get("reason").is_none()
+                {
+                    if let Some(ref s) = snap {
+                        reply["reason"] =
+                            serde_json::json!(s.owner.lease_loss_reason(&conn_name, lease_gen));
+                    }
+                }
+                (sink)(reply);
+            }
+        }
+    }
+
+    pub(crate) fn drain_outcomes(&self, hub: &StateHub) {
+        let mut resolved_cmds = Vec::new();
+        let mut stream_refusals = Vec::new();
+        {
+            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            self.sync_authoritative_fence_locked(&mut g);
+            g.pop_outcomes_locked(hub, &mut resolved_cmds, &mut stream_refusals);
+            if self.exited.load(Ordering::Acquire) {
+                g.pop_outcomes_locked(hub, &mut resolved_cmds, &mut stream_refusals);
+                for (_, tx) in g.command_waiters.drain() {
+                    resolved_cmds.push((tx, ServoCommandOutcome::Stopped));
+                }
+            }
+        }
+        Self::deliver_drained(hub, (resolved_cmds, stream_refusals));
+    }
+
+    pub(crate) fn close_servo(&self, lease_generation: u64) {
+        if lease_generation == 0 {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.port.close_servo(lease_generation);
+        g.prune_closed_stream_owners_locked();
+    }
+
+    /// Non-blocking variant of [`Self::close_servo`] for disconnect teardown: attempts `try_lock`
+    /// and returns `false` without blocking if the dispatcher mutex is contended (the caller's
+    /// lock-free `atomic_fenced_lease_gen` update already fences the generation at every boundary
+    /// and `armd-dispatch` drains the close asynchronously).
+    pub(crate) fn try_close_servo(&self, lease_generation: u64) -> bool {
+        if lease_generation == 0 {
+            return true;
+        }
+        match self.inner.try_lock() {
+            Ok(mut g) => {
+                g.port.close_servo(lease_generation);
+                g.prune_closed_stream_owners_locked();
+                true
+            }
+            Err(std::sync::TryLockError::Poisoned(p)) => {
+                let mut g = p.into_inner();
+                g.port.close_servo(lease_generation);
+                g.prune_closed_stream_owners_locked();
+                true
+            }
+            Err(std::sync::TryLockError::WouldBlock) => false,
+        }
+    }
+
+    pub(crate) fn sync_fenced_generation(&self, fenced_gen: u64) {
+        if fenced_gen == 0 {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if fenced_gen > g.port.closed_servo_generation() {
+            g.port.close_servo(fenced_gen);
+            g.prune_closed_stream_owners_locked();
+        }
+    }
+
+    pub(crate) fn is_servo_closed(&self, lease_generation: u64) -> bool {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        self.sync_authoritative_fence_locked(&mut g);
+        g.port.is_servo_closed(lease_generation)
+    }
+
+    pub(crate) fn closed_servo_generation(&self) -> u64 {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        self.sync_authoritative_fence_locked(&mut g);
+        g.port.closed_servo_generation()
+    }
+
+    pub(crate) fn coalesced(&self) -> u64 {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .port
+            .coalesced()
+    }
+
+    pub(crate) fn submitted_count(&self) -> u64 {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .submitted_count
+    }
+
+    pub(crate) fn lease_refused_count(&self, lease_generation: u64) -> u64 {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .lease_refused_by_gen
+            .get(&lease_generation)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn unregister_connection(&self, conn_id: u64) {
+        if conn_id == 0 {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.stream_owners.retain(|_, owner| owner.conn_id != conn_id);
+    }
+
+    /// Non-blocking variant of [`Self::unregister_connection`] for disconnect teardown (returns
+    /// immediately if the dispatcher mutex is contended; `prune_closed_stream_owners_locked`
+    /// reaps closed generations once the mutex is free).
+    pub(crate) fn try_unregister_connection(&self, conn_id: u64) -> bool {
+        if conn_id == 0 {
+            return true;
+        }
+        match self.inner.try_lock() {
+            Ok(mut g) => {
+                g.stream_owners.retain(|_, owner| owner.conn_id != conn_id);
+                true
+            }
+            Err(std::sync::TryLockError::Poisoned(p)) => {
+                let mut g = p.into_inner();
+                g.stream_owners.retain(|_, owner| owner.conn_id != conn_id);
+                true
+            }
+            Err(std::sync::TryLockError::WouldBlock) => false,
+        }
+    }
+
+    fn cancel_command_waiter(&self, key: (super::mailbox::StreamId, u64)) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .command_waiters
+            .remove(&key);
+    }
+
+    pub(crate) fn finish_stopped(&self, hub: &StateHub) {
+        let mut resolved_cmds = Vec::new();
+        let mut stream_refusals = Vec::new();
+        {
+            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            g.closed = true;
+            g.pop_outcomes_locked(hub, &mut resolved_cmds, &mut stream_refusals);
+            for (_, tx) in g.command_waiters.drain() {
+                resolved_cmds.push((tx, ServoCommandOutcome::Stopped));
+            }
+            g.stream_owners.clear();
+        }
+        Self::deliver_drained(hub, (resolved_cmds, stream_refusals));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn submit_servo_stream(
+        &self,
+        hub: &StateHub,
+        conn_id: u64,
+        conn_name: &str,
+        reply_sink: &ServoStreamReplySink,
+        stream: &mut crate::supervisor::targets::ServoStream,
+        msg: &crate::supervisor::targets::ServoMessage<'_>,
+    ) -> Result<Option<serde_json::Value>, ()> {
+        let mut resolved_cmds = Vec::new();
+        let mut stream_refusals = Vec::new();
+        let res = {
+            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            self.sync_authoritative_fence_locked(&mut g);
+            g.pop_outcomes_locked(hub, &mut resolved_cmds, &mut stream_refusals);
+            if g.closed || self.exited.load(Ordering::Acquire) {
+                Err(())
+            } else {
+                let coalesced_before = g.port.coalesced();
+                let prev_key = g.last_inflight_key;
+                let seq_before = g.port.last_seq();
+                let immediate = g.port.submit_servo(stream, msg);
+                if immediate.is_none() && g.port.last_seq() > seq_before {
+                    g.submitted_count = g.submitted_count.saturating_add(1);
+                    let assigned_seq = g.port.last_seq();
+                    let sid = crate::supervisor::targets::servo_stream(msg.authority.lease_generation);
+                    g.last_inflight_key = Some((sid, assigned_seq));
+                    if g.port.coalesced() > coalesced_before {
+                        g.note_coalesced_locked(prev_key, &mut resolved_cmds);
+                    }
+                    let owner = g.stream_owners.entry(sid).or_insert_with(|| ServoStreamOwner {
+                        conn_id,
+                        conn_name: conn_name.to_owned(),
+                        lease_generation: msg.authority.lease_generation,
+                        reply_sink: Arc::clone(reply_sink),
+                        pending_seqs: VecDeque::with_capacity(STREAM_PENDING_SEQS_CAP),
+                    });
+                    owner.conn_id = conn_id;
+                    if owner.conn_name != conn_name {
+                        owner.conn_name.clear();
+                        owner.conn_name.push_str(conn_name);
+                    }
+                    owner.lease_generation = msg.authority.lease_generation;
+                    owner.reply_sink = Arc::clone(reply_sink);
+                    if owner.pending_seqs.len() >= STREAM_PENDING_SEQS_CAP {
+                        owner.pending_seqs.pop_front();
+                    }
+                    owner.pending_seqs.push_back(assigned_seq);
+                }
+                Ok(immediate)
+            }
+        };
+        Self::deliver_drained(hub, (resolved_cmds, stream_refusals));
+        res
+    }
+
+    pub(crate) fn submit_servo_command(
+        self: &Arc<Self>,
+        hub: &StateHub,
+        stream: &mut crate::supervisor::targets::ServoStream,
+        msg: &crate::supervisor::targets::ServoMessage<'_>,
+    ) -> Result<ServoCommandWaiter, ServoCommandSubmitError> {
+        let mut resolved_cmds = Vec::new();
+        let mut stream_refusals = Vec::new();
+        let res = {
+            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            self.sync_authoritative_fence_locked(&mut g);
+            g.pop_outcomes_locked(hub, &mut resolved_cmds, &mut stream_refusals);
+            if g.closed || self.exited.load(Ordering::Acquire) {
+                Err(ServoCommandSubmitError::Unavailable)
+            } else {
+                let coalesced_before = g.port.coalesced();
+                let prev_key = g.last_inflight_key;
+                let seq_before = g.port.last_seq();
+                match g.port.submit_servo(stream, msg) {
+                    Some(reply) => Err(ServoCommandSubmitError::Immediate(reply)),
+                    None if g.port.last_seq() > seq_before => {
+                        g.submitted_count = g.submitted_count.saturating_add(1);
+                        let assigned_seq = g.port.last_seq();
+                        let sid = crate::supervisor::targets::servo_stream(msg.authority.lease_generation);
+                        g.last_inflight_key = Some((sid, assigned_seq));
+                        if g.port.coalesced() > coalesced_before {
+                            g.note_coalesced_locked(prev_key, &mut resolved_cmds);
+                        }
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        g.command_waiters.insert((sid, assigned_seq), tx);
+                        Ok(ServoCommandWaiter {
+                            dispatcher: Arc::clone(self),
+                            key: (sid, assigned_seq),
+                            rx,
+                            completed: false,
+                        })
+                    }
+                    None => Err(ServoCommandSubmitError::Unavailable),
+                }
+            }
+        };
+        Self::deliver_drained(hub, (resolved_cmds, stream_refusals));
+        res
+    }
+}
+
+/// Low-level mutex view onto the executor's [`TargetWriter`] (preserving compatibility for raw
+/// mailbox tests without stealing outcomes owned by [`ServoTargetDispatcher`]).
+pub struct TargetWriterHandle {
+    dispatcher: Arc<ServoTargetDispatcher>,
+    hub: Arc<StateHub>,
+}
+
+/// Guard returned by [`TargetWriterHandle::lock`].
+pub struct TargetWriterGuard<'a> {
+    inner: std::sync::MutexGuard<'a, ServoTargetDispatcherInner>,
+    hub: &'a StateHub,
+}
+
+impl TargetWriterHandle {
+    pub fn lock(&self) -> std::sync::LockResult<TargetWriterGuard<'_>> {
+        match self.dispatcher.inner.lock() {
+            Ok(inner) => Ok(TargetWriterGuard { inner, hub: &self.hub }),
+            Err(poisoned) => Err(std::sync::PoisonError::new(TargetWriterGuard {
+                inner: poisoned.into_inner(),
+                hub: &self.hub,
+            })),
+        }
+    }
+}
+
+impl TargetWriterGuard<'_> {
+    pub fn submit(&mut self, frame: super::mailbox::TargetFrame) -> super::mailbox::Submitted {
+        let coalesced_before = self.inner.port.coalesced();
+        let prev_key = self.inner.last_inflight_key;
+        let sub = self.inner.port.writer_mut().submit(frame);
+        if matches!(
+            sub,
+            super::mailbox::Submitted::Accepted | super::mailbox::Submitted::Coalesced { .. }
+        ) {
+            self.inner.last_inflight_key = Some((frame.stream, frame.seq));
+            if self.inner.port.coalesced() > coalesced_before {
+                let mut resolved = Vec::new();
+                self.inner.note_coalesced_locked(prev_key, &mut resolved);
+                for (tx, outcome) in resolved {
+                    let _ = tx.send(outcome);
+                }
+            }
+        }
+        sub
+    }
+
+    pub fn outcomes(&mut self, mut each: impl FnMut(super::mailbox::TargetOutcome)) -> usize {
+        let mut resolved_cmds = Vec::new();
+        let mut stream_refusals = Vec::new();
+        self.inner
+            .pop_outcomes_locked(self.hub, &mut resolved_cmds, &mut stream_refusals);
+        let mut n = 0;
+        while let Some(o) = self.inner.unclaimed_outcomes.pop_front() {
+            each(o);
+            n += 1;
+        }
+        for (tx, outcome) in resolved_cmds {
+            let _ = tx.send(outcome);
+        }
+        if !stream_refusals.is_empty() {
+            ServoTargetDispatcher::deliver_drained(self.hub, (Vec::new(), stream_refusals));
+        }
+        n
+    }
+
+    pub fn close_stream(&mut self, stream: super::mailbox::StreamId) {
+        self.inner.port.writer_mut().close_stream(stream);
+    }
+
+    pub fn coalesced(&self) -> u64 {
+        self.inner.port.coalesced()
+    }
+}
+
 struct RtExecutorShared {
     boot: BootId,
     broker: Arc<Mutex<Broker<PlanSlot>>>,
     reply_router: Arc<Mutex<ActionReplyRouter>>,
-    target_writer: Arc<Mutex<TargetWriter>>,
+    target_writer: TargetWriterHandle,
+    servo_dispatcher: Arc<ServoTargetDispatcher>,
     stop_requests: StopRequests,
     stats: Arc<ExecutorStats>,
     maint_client: Arc<MaintClient>,
@@ -2447,6 +3066,7 @@ impl RtExecutorShared {
         self.conn_lifecycle_client.finish_stopped();
         self.broker_dispatcher.finish_stopped();
         self.sinks.flush_and_report_shutdown(&self.tick_stats);
+        self.servo_dispatcher.finish_stopped(&self.hub);
         if let Some(ring) = self.hub.record_ring() {
             ring.drain();
         }
@@ -2656,7 +3276,86 @@ impl RtExecutorHandle {
     pub fn disconnect_client(&self, client: ClientId) {
         self.shared.broker.lock().unwrap_or_else(|e| e.into_inner()).disconnect(client);
     }
-    pub fn target_writer(&self) -> &Arc<Mutex<TargetWriter>> { &self.shared.target_writer }
+    pub fn target_writer(&self) -> &TargetWriterHandle { &self.shared.target_writer }
+
+    /// Dispatches `TargetPort::close_servo(lease_generation)` off-thread (idempotent; fences late
+    /// submissions from `lease_generation` and frees its stream slot in `TargetWriter`).
+    pub fn close_servo(&self, lease_generation: u64) {
+        self.shared.servo_dispatcher.close_servo(lease_generation);
+    }
+
+    /// Non-blocking `try_lock` variant of [`Self::close_servo`] for disconnect teardown.
+    pub fn try_close_servo(&self, lease_generation: u64) -> bool {
+        self.shared.servo_dispatcher.try_close_servo(lease_generation)
+    }
+
+    /// True when `lease_generation` (non-zero) has been closed via `close_servo`.
+    pub fn is_servo_closed(&self, lease_generation: u64) -> bool {
+        self.shared.servo_dispatcher.is_servo_closed(lease_generation)
+    }
+
+    /// Highest closed servo lease generation on this executor's `TargetPort`.
+    pub fn closed_servo_generation(&self) -> u64 {
+        self.shared.servo_dispatcher.closed_servo_generation()
+    }
+
+    /// Total servo target frames coalesced before RT consumption.
+    pub fn servo_coalesced(&self) -> u64 {
+        self.shared.servo_dispatcher.coalesced()
+    }
+
+    /// Total servo target frames accepted into the triple-buffer mailbox by `TargetPort::submit_servo`.
+    pub fn servo_submitted_count(&self) -> u64 {
+        self.shared.servo_dispatcher.submitted_count()
+    }
+
+    /// Total RT owner-side lease/stream refusals observed for `servo_stream(lease_generation)`.
+    pub fn servo_lease_refused_count(&self, lease_generation: u64) -> u64 {
+        self.shared.servo_dispatcher.lease_refused_count(lease_generation)
+    }
+
+    /// Unregisters streaming outcome delivery state for a closing WS connection.
+    pub fn unregister_servo_connection(&self, conn_id: u64) {
+        self.shared.servo_dispatcher.unregister_connection(conn_id);
+    }
+
+    /// Non-blocking `try_lock` variant of [`Self::unregister_servo_connection`] for disconnect teardown.
+    pub fn try_unregister_servo_connection(&self, conn_id: u64) -> bool {
+        self.shared.servo_dispatcher.try_unregister_connection(conn_id)
+    }
+
+    /// Routes one WS streaming servo frame (`servo`, `cartesian_joint_stream`, or implicit
+    /// `positions`) through [`TargetPort::submit_servo`] off-thread.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn submit_servo_stream(
+        &self,
+        conn_id: u64,
+        conn_name: &str,
+        reply_sink: &ServoStreamReplySink,
+        stream: &mut crate::supervisor::targets::ServoStream,
+        msg: &crate::supervisor::targets::ServoMessage<'_>,
+    ) -> Result<Option<serde_json::Value>, ()> {
+        self.shared.servo_dispatcher.submit_servo_stream(
+            &self.shared.hub,
+            conn_id,
+            conn_name,
+            reply_sink,
+            stream,
+            msg,
+        )
+    }
+
+    /// Routes one WS `/api/v1/motion/servo` command through [`TargetPort::submit_servo`] and
+    /// returns a drop-safe waiter correlated to the submitted frame's `(stream, seq)`.
+    pub(crate) fn submit_servo_command(
+        &self,
+        stream: &mut crate::supervisor::targets::ServoStream,
+        msg: &crate::supervisor::targets::ServoMessage<'_>,
+    ) -> Result<ServoCommandWaiter, ServoCommandSubmitError> {
+        self.shared
+            .servo_dispatcher
+            .submit_servo_command(&self.shared.hub, stream, msg)
+    }
     pub fn stop_requests(&self) -> &StopRequests { &self.shared.stop_requests }
     pub fn stats(&self) -> &Arc<ExecutorStats> { &self.shared.stats }
     pub fn executor_thread_id(&self) -> ThreadId { self.shared.executor_thread_id }
@@ -3189,10 +3888,9 @@ pub(crate) fn spawn_executor(
         path: core.gripper_baseline_path.clone(),
     };
     let (mut engine, broker, target_writer, stop_requests) = ReleaseEngine::new(cfg.boot, cfg.capacities);
-    core.boot_id = cfg.boot;
+    core.set_boot_id(cfg.boot);
     core.attach_stop_requests(stop_requests.clone());
     core.attach_closed_bitset(broker.closed_bitset());
-    core.boot_id = cfg.boot;
     hub.update_prep_env(Arc::new(super::requests::actions::ActionPrepEnv::from_inner(&core)));
 
     let (diag_tx, diag_rx) = RingBuffer::<TickSample>::new(DIAG_RING_CAPACITY);
@@ -3214,6 +3912,7 @@ pub(crate) fn spawn_executor(
     let (persist_job_tx, persist_job_rx) = RingBuffer::<PendingZeroCheckPersist>::new(4);
     let (persist_cmd_tx, persist_cmd_rx) = RingBuffer::<PersistCmd>::new(2);
     let (persist_rep_tx, persist_rep_rx) = RingBuffer::<PersistReply>::new(PERSIST_REP_CAPACITY);
+    let (watchdog_plan_tx, watchdog_plan_rx) = RingBuffer::<WatchdogParkPlan>::new(2);
     let (offload_reclaim_tx, offload_reclaim_rx) =
         RingBuffer::<OffloadReclaim>::new(OFFLOAD_RECLAIM_CAPACITY);
 
@@ -3232,6 +3931,20 @@ pub(crate) fn spawn_executor(
     let (eviction_tx, eviction_rx) =
         RingBuffer::<(super::requests::lease::ConnectionHandle, u64)>::new(32);
     engine.attach_eviction_tx(eviction_tx);
+    let (servo_close_tx, servo_close_rx) = RingBuffer::<u64>::new(64);
+    engine.attach_servo_close_tx(servo_close_tx);
+    let atomic_fenced_lease_gen = core.atomic_fenced_lease_gen.clone();
+    let servo_dispatcher = Arc::new(ServoTargetDispatcher::new(
+        target_writer,
+        core.core.id(),
+        cfg.boot,
+        exited.clone(),
+        Arc::clone(&atomic_fenced_lease_gen),
+    ));
+    let target_writer_handle = TargetWriterHandle {
+        dispatcher: Arc::clone(&servo_dispatcher),
+        hub: Arc::clone(&hub),
+    };
     let conn_lifecycle_client = Arc::new(conn_lifecycle_client);
     let broker = Arc::new(Mutex::new(broker));
     let reply_router = Arc::new(Mutex::new(ActionReplyRouter::new(cfg.capacities.replies)));
@@ -3270,6 +3983,10 @@ pub(crate) fn spawn_executor(
         conn_lifecycle_client: conn_lifecycle_client.clone(),
         broker_dispatcher: broker_dispatcher.clone(),
         eviction_rx: Mutex::new(eviction_rx),
+        servo_close_rx: Mutex::new(servo_close_rx),
+        atomic_fenced_lease_gen,
+        servo_dispatcher: Arc::clone(&servo_dispatcher),
+        hub: Arc::clone(&hub),
         offload_reclaim_rx: Mutex::new(offload_reclaim_rx),
     });
 
@@ -3278,6 +3995,7 @@ pub(crate) fn spawn_executor(
         persist_job_rx,
         persist_cmd_tx,
         persist_rep_rx.clone(),
+        watchdog_plan_tx,
         config_write_mutex,
         Arc::clone(&published_config),
         persist_stop.clone(),
@@ -3337,6 +4055,7 @@ pub(crate) fn spawn_executor(
                 persist_job_tx,
                 persist_cmd_rx,
                 persist_rep_tx,
+                watchdog_plan_rx,
                 offload_reclaim_tx,
                 persist_wake,
                 estop_state,
@@ -3384,7 +4103,8 @@ pub(crate) fn spawn_executor(
         boot: cfg.boot,
         broker,
         reply_router,
-        target_writer: Arc::new(Mutex::new(target_writer)),
+        target_writer: target_writer_handle,
+        servo_dispatcher,
         stop_requests,
         stats,
         maint_client,
@@ -3414,6 +4134,15 @@ pub(crate) fn spawn_executor(
         baseline_identity,
     });
     Ok((RtExecutorHandle { shared }, sinks))
+}
+
+/// Copy-only off-RT watchdog park preparation result pushed by `armd-persist` and installed on
+/// `armd-control` with zero heap allocations and zero frees.
+#[derive(Clone, Copy)]
+struct WatchdogParkPlan {
+    generation: u64,
+    attempt: u8,
+    plan: Result<super::requests::motion::PreparedMotionSlot, crate::safety::BoundedText<160>>,
 }
 
 /// Single production forwarding path from `core.safety`'s inline log ring into the bounded
@@ -3506,6 +4235,9 @@ struct ControlState {
     persist_job_tx: Producer<PendingZeroCheckPersist>,
     persist_cmd_rx: Consumer<PersistCmd>,
     persist_rep_tx: Producer<PersistReply>,
+    /// Precomputed off-RT watchdog park plans (Copy-only, 0 alloc / 0 free on `armd-control`).
+    watchdog_plan_rx: Consumer<WatchdogParkPlan>,
+    last_woken_watchdog_park: Option<(u64, u8)>,
     /// Retained persistence reply if `persist_rep_tx` was temporarily full (flushed before popping).
     pending_persist_reply: Option<PersistReply>,
     /// Retained rejected persistence job if `persist_job_tx` and `offload_reclaim_tx` were both saturated.
@@ -3749,6 +4481,37 @@ impl ControlState {
         core.estop_ack_overflow_gen = 0;
         if drained {
             core.core.hub().wake();
+        }
+    }
+
+    fn service_watchdog_park_plan(&mut self, core: &mut SupervisorInner) {
+        use super::requests::motion as req;
+        const MAX_DRIFT_RETRIES: u8 = 5;
+        let Ok(wp) = self.watchdog_plan_rx.pop() else { return; };
+        if !core.watchdog_park_pending.is_some_and(|p| p.generation == wp.generation && p.attempt == wp.attempt) {
+            return;
+        }
+        match wp.plan {
+            Ok(slot) => match req::install_watchdog_park(core, wp.generation, &slot, None) {
+                Ok(_) | Err(req::MotionInstallError::ContinuationMismatch) => {}
+                Err(req::MotionInstallError::StartDrifted) => {
+                    if let Some(p) = core.watchdog_park_pending.as_mut().filter(|p| p.generation == wp.generation) {
+                        if p.attempt.saturating_add(1) < MAX_DRIFT_RETRIES {
+                            p.attempt = p.attempt.saturating_add(1);
+                            return;
+                        }
+                    }
+                    req::fail_watchdog_park_plan(
+                        core,
+                        wp.generation,
+                        crate::safety::BoundedText::new("watchdog park drifted repeatedly"),
+                    );
+                }
+                Err(e) => {
+                    req::fail_watchdog_park_plan(core, wp.generation, crate::safety::BoundedText::new(e.code()));
+                }
+            },
+            Err(reason) => req::fail_watchdog_park_plan(core, wp.generation, reason),
         }
     }
 
@@ -4756,6 +5519,7 @@ fn spawn_persist_worker(
     mut job_rx: Consumer<PendingZeroCheckPersist>,
     mut cmd_tx: Producer<PersistCmd>,
     rep_rx: Arc<Mutex<Consumer<PersistReply>>>,
+    mut watchdog_plan_tx: Producer<WatchdogParkPlan>,
     config_write_mutex: Arc<tokio::sync::Mutex<()>>,
     published_config: Arc<super::requests::config::PublishedConfigHub>,
     persist_stop: Arc<AtomicBool>,
@@ -4776,8 +5540,10 @@ fn spawn_persist_worker(
     }
 
     thread::Builder::new().name("armd-persist".into()).spawn(move || {
+        let hub_watch = Arc::clone(&hub);
         let hub_for_refresh = Arc::clone(&hub);
         let _exit_guard = ExitFlag(persist_worker_exited, persist_exited_cv, hub);
+        let mut last_sent_watchdog_park: Option<(u64, u8)> = None;
         let push_cmd = |tx: &mut Producer<PersistCmd>, cmd: PersistCmd, stop: &AtomicBool, dead: &AtomicBool| -> bool {
             let mut pending = Some(cmd);
             while let Some(c) = pending.take() {
@@ -4807,6 +5573,33 @@ fn spawn_persist_worker(
         };
 
         while !persist_stop.load(Ordering::Acquire) && !control_exited.load(Ordering::Acquire) {
+            if let Some(snap) = hub_watch.latest() {
+                let wd_gen = snap.rt.watchdog_park_pending_gen;
+                if wd_gen != 0 {
+                    let key = (wd_gen, snap.rt.watchdog_park_pending_attempt);
+                    if last_sent_watchdog_park != Some(key) {
+                        let plan = match hub_watch.motion_config().and_then(|cfg| {
+                            super::requests::motion::MotionPlanSnapshot::from_published(&snap, cfg)
+                        }) {
+                            Some(plan_snap) => match super::requests::motion::prepare_motion(
+                                &plan_snap,
+                                &super::requests::motion::MotionRequest::park(),
+                            ) {
+                                Ok(p) => Ok(p.slot),
+                                Err(e) => {
+                                    let mut msg = crate::safety::BoundedText::<160>::empty();
+                                    let _ = core::fmt::write(&mut msg, format_args!("watchdog park could not be planned: {e}"));
+                                    Err(msg)
+                                }
+                            },
+                            None => Err(crate::safety::BoundedText::new("watchdog park snapshot or motion config unavailable")),
+                        };
+                        if watchdog_plan_tx.push(WatchdogParkPlan { generation: key.0, attempt: key.1, plan }).is_ok() {
+                            last_sent_watchdog_park = Some(key);
+                        }
+                    }
+                }
+            }
             if hooks.pause_persist_worker.as_ref().is_some_and(|p| p.load(Ordering::Acquire)) {
                 thread::park_timeout(Duration::from_millis(2));
                 continue;
@@ -5447,6 +6240,7 @@ fn control_thread_main(
     persist_job_tx: Producer<PendingZeroCheckPersist>,
     persist_cmd_rx: Consumer<PersistCmd>,
     persist_rep_tx: Producer<PersistReply>,
+    watchdog_plan_rx: Consumer<WatchdogParkPlan>,
     offload_reclaim_tx: Producer<OffloadReclaim>,
     persist_wake: Thread,
     estop_state: Arc<crate::rt_core::urgent::EstopState>,
@@ -5481,6 +6275,12 @@ fn control_thread_main(
         }
     }
     core.prewarm_observation_slots();
+    // Preserve servo stream authorization across legacy -> executor handoff if a valid lease was
+    // already committed before `start_executor`.
+    let pre_lease_gen = core.active_lease_gen_at(Instant::now());
+    if pre_lease_gen != 0 && core.core.target_authority().stream.is_none() {
+        core.authorize_servo_stream_for_committed_lease(pre_lease_gen);
+    }
 
     if cfg.apply_rt_sched {
         let s = sched::apply_to_current_thread(&cfg.rt_sched, &cfg.memory_lock);
@@ -5530,6 +6330,8 @@ fn control_thread_main(
         persist_job_tx,
         persist_cmd_rx,
         persist_rep_tx,
+        watchdog_plan_rx,
+        last_woken_watchdog_park: None,
         pending_persist_reply: None,
         retained_persist_job: None,
         offload_reclaim_tx,
@@ -5718,6 +6520,7 @@ fn control_thread_main(
                             // in `core.pending_estop_acks` (keeping their `Arc<SafetyState>` alive) and
                             // deliver them ONLY after Step 6 publishes the corresponding snapshot.
                             state.service_persistence(core, ctx);
+                            state.service_watchdog_park_plan(core);
                             state.service_one_maintenance(
                                 core,
                                 ctx,
@@ -5740,6 +6543,7 @@ fn control_thread_main(
                         state.drain_retired_states(&mut core, now_inst());
                         if engine.take_urgent_replies_flushed()
                             || engine.take_lifecycle_replies_flushed()
+                            || engine.take_servo_closes_flushed()
                         {
                             hub.wake();
                         }
@@ -5748,6 +6552,15 @@ fn control_thread_main(
                     let (phases, body_end) = core.take_tick_phases();
                     let body_end = body_end.unwrap_or_else(now_inst);
                     core.defer_zero_check_persist = false;
+                    if let Some(p) = core.watchdog_park_pending.filter(|p| !p.waiting_mit_handback) {
+                        let key = (p.generation, p.attempt);
+                        if state.last_woken_watchdog_park != Some(key) {
+                            state.last_woken_watchdog_park = Some(key);
+                            state.persist_wake.unpark();
+                        }
+                    } else {
+                        state.last_woken_watchdog_park = None;
+                    }
                     if let Some(mut job) = core.pending_zero_check_persist.take() {
                         job.stop_gen = state.stop_requests.current();
                         match state.persist_job_tx.push(job) {
@@ -5908,7 +6721,8 @@ fn control_thread_main(
                                 &mut report,
                             );
                             let urgent_flushed = engine.take_urgent_replies_flushed()
-                                || engine.take_lifecycle_replies_flushed();
+                                || engine.take_lifecycle_replies_flushed()
+                                || engine.take_servo_closes_flushed();
                             if published {
                                 publish_gen += 1;
                             }
@@ -5977,6 +6791,7 @@ fn control_thread_main(
             }
             let _ = engine.take_urgent_replies_flushed();
             let _ = engine.take_lifecycle_replies_flushed();
+            let _ = engine.take_servo_closes_flushed();
             hub.wake();
         }
         // Positive-control tail probe (strictly AFTER `diag_tx.push` and `hub.wake()`);
@@ -6165,6 +6980,7 @@ fn control_thread_main(
         }
         engine.drain_urgent_stops_stopped(true);
         engine.drain_conn_lifecycle_stopped(true);
+        let _ = engine.flush_servo_closes(&mut core);
         state.emit_estop_ack_if_advanced(&mut core);
     } else {
         engine.drain_urgent_stops_stopped(false);
@@ -7074,6 +7890,8 @@ mod tests {
             persist_job_tx,
             persist_cmd_rx,
             persist_rep_tx,
+            watchdog_plan_rx: RingBuffer::<WatchdogParkPlan>::new(2).1,
+            last_woken_watchdog_park: None,
             pending_persist_reply: None,
             retained_persist_job: None,
             offload_reclaim_tx,
@@ -7149,6 +7967,7 @@ mod tests {
         let (persist_job_tx, _) = RingBuffer::<PendingZeroCheckPersist>::new(2);
         let (_, persist_cmd_rx) = RingBuffer::<PersistCmd>::new(2);
         let (persist_rep_tx, _) = RingBuffer::<PersistReply>::new(2);
+        let (_, watchdog_plan_rx) = RingBuffer::<WatchdogParkPlan>::new(4);
         let (offload_reclaim_tx, _) = RingBuffer::<OffloadReclaim>::new(OFFLOAD_RECLAIM_CAPACITY);
 
         // Pre-fill downstream `safety_log_tx` (cap 2) with 2 unrelated events.
@@ -7180,6 +7999,8 @@ mod tests {
             persist_rep_tx,
             pending_persist_reply: None,
             retained_persist_job: None,
+            watchdog_plan_rx,
+            last_woken_watchdog_park: None,
             offload_reclaim_tx,
             persist_wake: thread::current(),
             persist_granted: None,
@@ -7431,6 +8252,8 @@ mod tests {
             persist_job_tx,
             persist_cmd_rx,
             persist_rep_tx,
+            watchdog_plan_rx: RingBuffer::<WatchdogParkPlan>::new(2).1,
+            last_woken_watchdog_park: None,
             pending_persist_reply: None,
             retained_persist_job: None,
             offload_reclaim_tx,
@@ -7602,6 +8425,8 @@ mod tests {
             persist_job_tx,
             persist_cmd_rx,
             persist_rep_tx,
+            watchdog_plan_rx: RingBuffer::<WatchdogParkPlan>::new(2).1,
+            last_woken_watchdog_park: None,
             pending_persist_reply: None,
             retained_persist_job: None,
             offload_reclaim_tx,

@@ -57,6 +57,21 @@ impl ConfigDomain {
     pub fn affects_motion(&self) -> bool {
         !matches!(self, Self::Poses | Self::Sequences)
     }
+
+    /// Static WS/REST command path label for lock diagnostics (zero allocation).
+    pub const fn command_path(self) -> &'static str {
+        match self {
+            Self::Workspace => "/api/v1/workspace",
+            Self::Keepout => "/api/v1/workspace/keepout",
+            Self::Collision => "/api/v1/safety/collision",
+            Self::Calibration => "/api/v1/calibration",
+            Self::GripperCalibration => "/api/v1/gripper/calibration",
+            Self::GraspSetup => "/api/v1/grasp/setup",
+            Self::ToolCommissioning => "/api/v1/tool/commissioning/confirm",
+            Self::Poses => "/api/v1/poses",
+            Self::Sequences => "/api/v1/sequences",
+        }
+    }
 }
 
 /// A staged candidate's identity (assigned by the worker; keys its candidate store).

@@ -201,6 +201,9 @@ pub enum ArmDriverError {
     #[error("{ESTOP_INHIBITED}")]
     EstopInhibited,
 
+    #[error("motion target dropped: lease generation fenced")]
+    LeaseFenced,
+
     #[error("MIT deadline fence tripped: {0}")]
     MitFenceTripped(MitFenceTripReason),
 
@@ -836,6 +839,21 @@ pub struct PosForceIntentStamp {
     pub stop_gen: u64,
     /// Safety / E-stop epoch (`SupervisorInner::safety.epoch_id()` / `EstopGate::estop_gen`).
     pub estop_epoch: u64,
+    /// Lease generation under which a `Target` intent was produced (`0` when hold/stop-class
+    /// or not bound to a client lease).
+    pub lease_gen: u64,
+}
+
+impl PosForceIntentStamp {
+    /// True when a `Target` intent stamped with `self` is stale relative to `current`:
+    /// stop generation or safety epoch changed, or a client-lease target (`self.lease_gen != 0`)
+    /// no longer matches `current.lease_gen`.
+    #[inline]
+    pub const fn is_stale_against(self, current: Self) -> bool {
+        self.stop_gen != current.stop_gen
+            || self.estop_epoch != current.estop_epoch
+            || (self.lease_gen != 0 && self.lease_gen != current.lease_gen)
+    }
 }
 
 /// Desired position-force J7 gripper action before stop-generation / epoch resolution.
@@ -1398,6 +1416,27 @@ pub trait ArmDriver: Send {
         self.begin_torque_budgeted(false, max_rx_frames)
     }
 
+    /// Starts a client-initiated park disable routed through the single `DisableRequested`
+    /// rest-pose gate whose EVERY per-motor disable write is also gated against pending Stop,
+    /// E-stop latch, and `expected_stop_gen` immediately before transmit (e.g.,
+    /// `DamiaoArmDriver::send(TxKind::ClientParkDisable)` and
+    /// `FeetechArmDriver::write_torque_off_checked_budgeted`).
+    /// Watchdog / fault disables continue using [`Self::begin_disable_torque_budgeted`] /
+    /// [`Self::begin_disable_torque`].
+    fn begin_client_park_disable(
+        &mut self,
+        max_rx_frames: Option<u16>,
+        _expected_stop_gen: Option<u64>,
+    ) -> Result<TorqueProgress, ArmDriverError> {
+        let kind = DisableKind::DisableRequested {
+            started_at: self.clock_now(),
+        };
+        match max_rx_frames {
+            Some(limit) => self.begin_disable_torque_budgeted(kind, limit),
+            None => self.begin_disable_torque(kind),
+        }
+    }
+
     /// Serve the pending torque transition once: one receive pass ending by `deadline` (and the
     /// driver's own frame / time bound), at most one retransmit per joint, no sleep. Err when the
     /// transition failed (or none is pending).
@@ -1561,6 +1600,10 @@ pub trait ArmDriver: Send {
     /// Inject the supervisor's stopped-disable policy so the driver's transmit choke point
     /// enforces Rule A′ at send time for `DisableRequested` frames while stopped.
     fn set_stopped_disable_gate(&mut self, _gate: StoppedDisableGate) {}
+
+    /// Sets the client lease generation (`0` for hold/autonomous/lease-disabled output) stamped on
+    /// motion target entries queued by the immediately following [`Self::write_joint_targets_bounded`].
+    fn set_output_lease_gen(&mut self, _lease_gen: u64) {}
 
     /// Set the gripper joint index if the arm model defines a gripper
     fn set_gripper_index(&mut self, _index: Option<usize>) {}
@@ -1743,6 +1786,12 @@ pub enum JointMode {
 // 1. Feetech STS3215 Arm Driver (SO-ARM 101)
 // =========================================================================
 
+#[derive(Clone, Copy, Debug)]
+struct PendingFeetechDisable {
+    kind: DisableKind,
+    client_park: Option<(Option<u64>, Option<u64>)>,
+}
+
 pub struct FeetechArmDriver<T: Transport> {
     transport: T,
     clock: Option<Arc<dyn crate::transport::DriverClock>>,
@@ -1805,7 +1854,7 @@ pub struct FeetechArmDriver<T: Transport> {
     last_read_release_id: u64,
     /// Pending stopped disable awaiting rest-pose K=3 confirmation or poisoned-line drain within
     /// the single 1 s request lifetime (0 torque-off packets transmitted while pending).
-    pending_disable: Option<DisableKind>,
+    pending_disable: Option<PendingFeetechDisable>,
     /// Bitmask of 0-based servo indices that have already received `TORQUE_ENABLE = 0` in an
     /// active/partial disable sequence (R12 B3). Cleared on full completion or `set_torque(true)`.
     disable_dispatched_mask: u64,
@@ -2532,9 +2581,13 @@ impl<T: Transport> FeetechArmDriver<T> {
         &mut self,
         servo_id: u8,
         kind: DisableKind,
+        client_park: Option<(Option<u64>, Option<u64>)>,
         deadline: Option<Instant>,
         rx_budget: &mut u16,
     ) -> Result<bool, ArmDriverError> {
+        if let Some((initial_estop_gen, expected_stop_gen)) = client_park {
+            self.client_park_stop_check(initial_estop_gen, expected_stop_gen)?;
+        }
         if let DisableKind::DisableRequested { started_at } = kind {
             if self.elapsed_since(started_at) >= STOPPED_DISABLE_REQUEST_LIFETIME {
                 return Err(ArmDriverError::DisableRequestExpired);
@@ -2569,6 +2622,9 @@ impl<T: Transport> FeetechArmDriver<T> {
                 }
             }
         }
+        if let Some((initial_estop_gen, expected_stop_gen)) = client_park {
+            self.client_park_stop_check(initial_estop_gen, expected_stop_gen)?;
+        }
         // B4 / R12 M1: Recheck 1 s request lifetime and K=3 rest evidence IMMEDIATELY before
         // mutating enable telemetry or transmitting `TORQUE_ENABLE = 0`, strictly AFTER the RX
         // drain & decode. If the window aged out during the drain (within the 1 s lifetime),
@@ -2591,12 +2647,23 @@ impl<T: Transport> FeetechArmDriver<T> {
         // the transport; a gate refusal above leaves evidence intact. (Keep `rest_pose_window`
         // intact across the atomic multi-servo disable batch so servo 0's write does not poison
         // servos 1..N microseconds later; non-rest feedback or >100 ms staleness still invalidates it.)
-        if let Some(idx) = self.servo_ids.iter().position(|&id| id == servo_id) {
+        let servo_idx = self.servo_ids.iter().position(|&id| id == servo_id);
+        let prev_reported = servo_idx.and_then(|idx| self.reported_enable[idx]);
+        let prev_commanded = self.torque_enable_commanded;
+        if let Some(idx) = servo_idx {
             self.reported_enable[idx] = None;
         }
         self.torque_enable_commanded = false;
         let pkt = feetech::build_set_torque_array(servo_id, false);
-        self.transport.write_all(&pkt)?;
+        if let Err(e) = self.transport.write_all(&pkt) {
+            if matches!(e, TransportError::WouldBlock) {
+                if let Some(idx) = servo_idx {
+                    self.reported_enable[idx] = prev_reported;
+                }
+                self.torque_enable_commanded = prev_commanded;
+            }
+            return Err(e.into());
+        }
         let _ = self.transport.flush();
         if *rx_budget > 0 && deadline.is_none_or(|dl| self.clock_now() < dl) {
             let _ = self.drain_tx_echo_until(&pkt, deadline);
@@ -2611,7 +2678,7 @@ impl<T: Transport> FeetechArmDriver<T> {
         kind: DisableKind,
     ) -> Result<(), ArmDriverError> {
         let mut rx_budget = u16::MAX;
-        if self.write_torque_off_checked_budgeted(servo_id, kind, None, &mut rx_budget)? {
+        if self.write_torque_off_checked_budgeted(servo_id, kind, None, None, &mut rx_budget)? {
             Ok(())
         } else {
             Err(ArmDriverError::TorqueOffWouldDrop)
@@ -2790,6 +2857,30 @@ impl<T: Transport> FeetechArmDriver<T> {
         }
 
         Ok(drained)
+    }
+
+    /// Per-write Stop / E-stop / stop-generation gate for client-initiated park disable on
+    /// Feetech / SO-ARM101 servos (rechecked before EVERY per-servo disable write).
+    fn client_park_stop_check(
+        &self,
+        initial_estop_gen: Option<u64>,
+        expected_stop_gen: Option<u64>,
+    ) -> Result<(), ArmDriverError> {
+        if self.is_aborted() || self.estop_state.as_ref().is_some_and(|s| s.is_latched()) {
+            return Err(ArmDriverError::EstopInhibited);
+        }
+        if let Some(ref gate) = self.estop_gate {
+            if gate.pending() {
+                return Err(ArmDriverError::EstopInhibited);
+            }
+            let (estop_gen, stop_gen) = gate.generations();
+            if initial_estop_gen.is_some_and(|expected| estop_gen != expected)
+                || expected_stop_gen.is_some_and(|expected| stop_gen != expected)
+            {
+                return Err(ArmDriverError::EstopInhibited);
+            }
+        }
+        Ok(())
     }
 
     #[inline]
@@ -3751,10 +3842,14 @@ impl<T: Transport> FeetechArmDriver<T> {
     fn execute_disable_writes_budgeted(
         &mut self,
         kind: DisableKind,
+        client_park: Option<(Option<u64>, Option<u64>)>,
         deadline: Option<Instant>,
         max_rx_frames: Option<u16>,
     ) -> Result<(bool, u16, bool), ArmDriverError> {
         self.assert_clock_matches_transport();
+        if let Some((eg, sg)) = client_park {
+            self.client_park_stop_check(eg, sg)?;
+        }
         let n = self.servo_ids.len().min(crate::rt_core::mailbox::MAX_DOF);
         let all_mask = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
         if (self.disable_dispatched_mask & all_mask) == all_mask {
@@ -3774,7 +3869,18 @@ impl<T: Transport> FeetechArmDriver<T> {
             if skip_dispatched && idx < 64 && (self.disable_dispatched_mask & (1u64 << idx)) != 0 {
                 continue;
             }
-            match self.write_torque_off_checked_budgeted(id, kind, deadline, &mut rx_remaining) {
+            if let Some((eg, sg)) = client_park {
+                if let Err(e) = self.client_park_stop_check(eg, sg) {
+                    if !wrote_any && self.disable_dispatched_mask == 0 {
+                        return Err(e);
+                    }
+                    write_err = Some(ArmDriverError::HardwareFault(
+                        "Client park disable stopped mid-batch after partial servo disable".into(),
+                    ));
+                    break;
+                }
+            }
+            match self.write_torque_off_checked_budgeted(id, kind, client_park, deadline, &mut rx_remaining) {
                 Ok(true) => {
                     wrote_any = true;
                     if idx < 64 {
@@ -3783,6 +3889,15 @@ impl<T: Transport> FeetechArmDriver<T> {
                 }
                 Ok(false) => {
                     deferred = true;
+                    break;
+                }
+                Err(e) if client_park.is_some() && is_estop_inhibited(&e) => {
+                    if !wrote_any && self.disable_dispatched_mask == 0 {
+                        return Err(e);
+                    }
+                    write_err = Some(ArmDriverError::HardwareFault(
+                        "Client park disable stopped mid-batch after partial servo disable".into(),
+                    ));
                     break;
                 }
                 Err(e @ (ArmDriverError::TorqueOffWouldDrop | ArmDriverError::DisableRequestExpired)) => {
@@ -3804,7 +3919,7 @@ impl<T: Transport> FeetechArmDriver<T> {
                     budget_exhausted |= rb_ex;
                 }
             }
-            self.pending_disable = Some(kind);
+            self.pending_disable = Some(PendingFeetechDisable { kind, client_park });
             return Ok((false, rx_start.saturating_sub(rx_remaining), budget_exhausted));
         }
         if !wrote_any && self.disable_dispatched_mask == 0 {
@@ -4178,14 +4293,17 @@ impl<T: Transport> FeetechArmDriver<T> {
         max_rx_frames: u16,
     ) -> Result<TorqueProgress, ArmDriverError> {
         self.assert_clock_matches_transport();
-        let Some(kind) = self.pending_disable.take() else {
+        let Some(PendingFeetechDisable { kind, client_park }) = self.pending_disable.take() else {
             return Err(ArmDriverError::ProtocolStatic("NO_TORQUE_TRANSITION_PENDING"));
         };
+        if let Some((eg, sg)) = client_park {
+            self.client_park_stop_check(eg, sg)?;
+        }
         let started_at = match kind {
             DisableKind::DisableRequested { started_at } => started_at,
             DisableKind::DisableProtective { .. } => {
                 let (_, rx_used, exhausted) =
-                    self.execute_disable_writes_budgeted(kind, Some(deadline), Some(max_rx_frames))?;
+                    self.execute_disable_writes_budgeted(kind, client_park, Some(deadline), Some(max_rx_frames))?;
                 self.last_poll_rx = Some((rx_used, exhausted));
                 return Ok(TorqueProgress::Done(TorqueOutcome::Confirmed));
             }
@@ -4199,7 +4317,7 @@ impl<T: Transport> FeetechArmDriver<T> {
         match self.evaluate_rest_pose_gate() {
             RestPoseGateStatus::Confirmed => {
                 let (done, rx_used, exhausted) =
-                    self.execute_disable_writes_budgeted(kind, Some(deadline), Some(max_rx_frames))?;
+                    self.execute_disable_writes_budgeted(kind, client_park, Some(deadline), Some(max_rx_frames))?;
                 self.last_poll_rx = Some((rx_used, exhausted));
                 if done {
                     return Ok(TorqueProgress::Done(TorqueOutcome::Confirmed));
@@ -4216,13 +4334,13 @@ impl<T: Transport> FeetechArmDriver<T> {
             self.control_release_managed && self.last_read_release_id == self.control_release_id;
         if max_rx_frames == 0 {
             self.last_poll_rx = Some((0, true));
-            self.pending_disable = Some(kind);
+            self.pending_disable = Some(PendingFeetechDisable { kind, client_park });
             let wake = (self.clock_now() + EVIDENCE_PROBE_INTERVAL).min(exp);
             return Ok(TorqueProgress::Pending { wake });
         }
         if already_read_this_release || self.clock_now() >= deadline {
             self.last_poll_rx = Some((0, false));
-            self.pending_disable = Some(kind);
+            self.pending_disable = Some(PendingFeetechDisable { kind, client_park });
             let wake = (self.clock_now() + EVIDENCE_PROBE_INTERVAL).min(exp);
             return Ok(TorqueProgress::Pending { wake });
         }
@@ -4236,11 +4354,14 @@ impl<T: Transport> FeetechArmDriver<T> {
             self.last_poll_rx = Some((poll_frames, poll_exhausted));
             return Err(ArmDriverError::DisableRequestExpired);
         }
+        if let Some((eg, sg)) = client_park {
+            self.client_park_stop_check(eg, sg)?;
+        }
         match self.evaluate_rest_pose_gate() {
             RestPoseGateStatus::Confirmed => {
                 let rem_rx = max_rx_frames.saturating_sub(poll_frames);
                 let (done, write_rx, write_exhausted) =
-                    self.execute_disable_writes_budgeted(kind, Some(deadline), Some(rem_rx))?;
+                    self.execute_disable_writes_budgeted(kind, client_park, Some(deadline), Some(rem_rx))?;
                 self.last_poll_rx = Some((
                     poll_frames.saturating_add(write_rx),
                     poll_exhausted || write_exhausted,
@@ -4258,7 +4379,7 @@ impl<T: Transport> FeetechArmDriver<T> {
             }
             RestPoseGateStatus::PendingDrainOrWindow | RestPoseGateStatus::StaleOrMissing => {
                 self.last_poll_rx = Some((poll_frames, poll_exhausted));
-                self.pending_disable = Some(kind);
+                self.pending_disable = Some(PendingFeetechDisable { kind, client_park });
                 let wake = (self.clock_now() + EVIDENCE_PROBE_INTERVAL).min(exp);
                 Ok(TorqueProgress::Pending { wake })
             }
@@ -4905,9 +5026,51 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
     }
 
     fn set_estop_gate(&mut self, gate: crate::rt_core::urgent::EstopGate) {
+        self.assert_clock_matches_transport();
         self.estop_gate = Some(gate);
     }
 
+    fn begin_client_park_disable(
+        &mut self,
+        max_rx_frames: Option<u16>,
+        expected_stop_gen: Option<u64>,
+    ) -> Result<TorqueProgress, ArmDriverError> {
+        self.assert_clock_matches_transport();
+        let initial_estop_gen = self.estop_gate.as_ref().map(|g| g.generations().0);
+        self.client_park_stop_check(initial_estop_gen, expected_stop_gen)?;
+        let kind = DisableKind::DisableRequested {
+            started_at: self.clock_now(),
+        };
+        let client_park = Some((initial_estop_gen, expected_stop_gen));
+        let exp = match kind {
+            DisableKind::DisableRequested { started_at } => started_at + STOPPED_DISABLE_REQUEST_LIFETIME,
+            DisableKind::DisableProtective { .. } => self.clock_now(),
+        };
+        if self.clock_now() >= exp {
+            return Err(ArmDriverError::DisableRequestExpired);
+        }
+        match self.evaluate_rest_pose_gate() {
+            RestPoseGateStatus::Confirmed => {}
+            RestPoseGateStatus::PendingDrainOrWindow | RestPoseGateStatus::StaleOrMissing => {
+                self.pending_disable = Some(PendingFeetechDisable { kind, client_park });
+                self.last_poll_rx = Some((0, false));
+                let wake = (self.clock_now() + EVIDENCE_PROBE_INTERVAL).min(exp);
+                return Ok(TorqueProgress::Pending { wake });
+            }
+            RestPoseGateStatus::RefusedNonRest => {
+                return Err(ArmDriverError::TorqueOffWouldDrop);
+            }
+        }
+        let (done, rx_used, exhausted) =
+            self.execute_disable_writes_budgeted(kind, client_park, None, max_rx_frames)?;
+        self.last_poll_rx = Some((rx_used, exhausted));
+        if done {
+            Ok(TorqueProgress::Done(TorqueOutcome::Confirmed))
+        } else {
+            let wake = (self.clock_now() + EVIDENCE_PROBE_INTERVAL).min(exp);
+            Ok(TorqueProgress::Pending { wake })
+        }
+    }
     fn set_estop_state(&mut self, state: Arc<crate::rt_core::urgent::EstopState>) {
         self.assert_clock_matches_transport();
         self.estop_state = Some(state);
@@ -5146,7 +5309,7 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                 // 1 s probe loop; refuse immediately only on a real non-rest pose or 1 s expiry.
                 RestPoseGateStatus::PendingDrainOrWindow
                 | RestPoseGateStatus::StaleOrMissing => {
-                    self.pending_disable = Some(kind);
+                    self.pending_disable = Some(PendingFeetechDisable { kind, client_park: None });
                     self.last_poll_rx = Some((0, false));
                     let wake = (self.clock_now() + EVIDENCE_PROBE_INTERVAL).min(exp);
                     return Ok(TorqueProgress::Pending { wake });
@@ -5157,7 +5320,7 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
             }
         }
         let (done, rx_used, exhausted) =
-            self.execute_disable_writes_budgeted(kind, None, Some(max_rx_frames))?;
+            self.execute_disable_writes_budgeted(kind, None, None, Some(max_rx_frames))?;
         self.last_poll_rx = Some((rx_used, exhausted));
         if done {
             Ok(TorqueProgress::Done(TorqueOutcome::Confirmed))
@@ -6057,6 +6220,10 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     can: C,
     /// Checked before each frame of a target batch (`ArmDriver::set_estop_gate`).
     estop_gate: Option<crate::rt_core::urgent::EstopGate>,
+    /// Client lease generation stamped onto queued motion target frames (`0` for hold/autonomous).
+    output_lease_gen: u64,
+    /// Per-call client lease generation checked inside [`Self::send`] (set by `send_with_lease`).
+    send_lease_gen: u64,
     /// Atomic E-stop latch (`ArmDriver::set_abort_flag`), checked before enable transmissions.
     abort_flag: Option<Arc<AtomicBool>>,
     /// Supervisor-injected stopped-disable gate enforced at send time for `DisableRequested`.
@@ -6439,6 +6606,11 @@ enum TxKind {
     /// unconditionally subject in every safety state to send-time K=3 rest-pose evaluation from
     /// fresh (`<= 100 ms`) feedback and the single 1 s request lifetime.
     DisableRequested { started_at: Instant },
+    /// Per-motor disable frame of a client-initiated park (`CMD_DISABLE`): exempt from the motion
+    /// TX budget, subject to the exact same K=3 rest-pose gate and 1 s request lifetime as
+    /// `DisableRequested`, AND stop-gated (pending Stop/E-stop, E-stop latch, and stop-generation
+    /// stamp rechecked immediately before EVERY motor's `can.transmit`).
+    ClientParkDisable { started_at: Instant },
     /// Protective torque-off (`CMD_DISABLE`): exempt from the motion TX budget and never
     /// refused by the stopped rest-pose rule or 1 s lifetime. Used ONLY for `Thermal` and
     /// `ProcessExit`.
@@ -6499,6 +6671,8 @@ enum TxRefusal {
     BuildRefused,
     /// Step 5: stop/E-stop generation stamp changed since admission or operation start.
     StopStampChanged,
+    /// Step 3/5: motion frame's client lease generation was fenced (disconnect/release/preempt/expiry).
+    LeaseFenced,
     /// Step 6: underlying CAN transport returned an error (backpressure already marked on pass).
     Transport(TransportError),
 }
@@ -6535,6 +6709,8 @@ struct PendingTxFrame {
     cmd: PendingTargetCmd,
     queued_at: Instant,
     stop_stamp: StopStamp,
+    /// Client lease generation under which this motion target was produced (`0` for hold/autonomous).
+    lease_gen: u64,
     /// Counted once in `tx_deferred` per command instance; reset on in-place target replacement.
     was_deferred: bool,
 }
@@ -6692,6 +6868,27 @@ impl PendingTxQueue {
             .any(|slot| slot.is_some_and(|e| e.stop_stamp != current))
     }
 
+    /// Drop entries whose client lease generation has been fenced, compacting in place.
+    fn drop_fenced_lease(&mut self, mut is_fenced: impl FnMut(u64) -> bool) -> usize {
+        let mut write = 0usize;
+        let mut dropped = 0usize;
+        for read in 0..self.len {
+            if let Some(entry) = self.buf[read] {
+                if is_fenced(entry.lease_gen) {
+                    dropped += 1;
+                } else {
+                    self.buf[write] = Some(entry);
+                    write += 1;
+                }
+            }
+        }
+        for slot in &mut self.buf[write..self.len] {
+            *slot = None;
+        }
+        self.len = write;
+        dropped
+    }
+
     /// Remove every queued entry targeting `joint`, compacting in place (zero allocation).
     fn remove_joint(&mut self, joint: usize) {
         let mut write = 0usize;
@@ -6772,15 +6969,20 @@ impl PendingTxQueue {
         cmd: PendingTargetCmd,
         queued_at: Instant,
         stop_stamp: StopStamp,
+        lease_gen: u64,
     ) -> bool {
         if let Some(idx) = self.find_key(joint, frame_id) {
-            if let Some(prev) = self.buf[idx].filter(|prev| prev.stop_stamp == stop_stamp) {
+            if let Some(prev) = self
+                .buf[idx]
+                .filter(|prev| prev.stop_stamp == stop_stamp && prev.lease_gen == lease_gen)
+            {
                 self.buf[idx] = Some(PendingTxFrame {
                     joint,
                     frame_id,
                     cmd,
                     queued_at: prev.queued_at,
                     stop_stamp,
+                    lease_gen,
                     was_deferred: false,
                 });
                 return true;
@@ -6800,6 +7002,7 @@ impl PendingTxQueue {
             cmd,
             queued_at,
             stop_stamp,
+            lease_gen,
             was_deferred: false,
         });
         self.len += 1;
@@ -6844,7 +7047,12 @@ enum DamiaoTorque {
     Enable { window: ConfirmWindow, unsent_mask: u32 },
     /// Stopped disable waiting for an exhausted RX drain or incomplete K=3 rest-pose window
     /// to complete inside the 1 s request lifetime before transmitting any `CMD_DISABLE` (L1).
-    AwaitRestGate { kind: DisableKind, next_probe_at: Instant },
+    AwaitRestGate {
+        kind: DisableKind,
+        next_probe_at: Instant,
+        client_park: bool,
+        expected_stamp: Option<StopStamp>,
+    },
     /// Accepted disable transmitting bounded repeats (`DAMIAO_DISABLE_REPEATS`) spaced by
     /// `DAMIAO_DISABLE_REPEAT_INTERVAL` within the single 1 s request lifetime.
     Disable {
@@ -6997,6 +7205,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             mit_fence: None,
             mit_fence_last_cmd: vec![None; dof],
             estop_gate: None,
+            output_lease_gen: 0,
+            send_lease_gen: 0,
             abort_flag: None,
             stopped_disable_gate: None,
             estop_state: None,
@@ -7087,7 +7297,21 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         StopStamp { estop_gen, stop_gen }
     }
 
-    /// Current driver-gate `(stop_gen, estop_epoch)` stamp for direct-driver callers of
+    #[inline]
+    fn current_lease_gen(&self) -> u64 {
+        self.estop_gate
+            .as_ref()
+            .map_or(0, crate::rt_core::urgent::EstopGate::current_lease_gen)
+    }
+
+    #[inline]
+    fn is_lease_fenced(&self, entry_lease_gen: u64) -> bool {
+        self.estop_gate
+            .as_ref()
+            .is_some_and(|g| g.is_lease_fenced(entry_lease_gen))
+    }
+
+    /// Current driver-gate `(stop_gen, estop_epoch, lease_gen)` stamp for direct-driver callers of
     /// [`ArmDriver::emit_pos_force_j7`].
     #[inline]
     pub fn current_j7_intent_stamp(&self) -> PosForceIntentStamp {
@@ -7095,6 +7319,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         PosForceIntentStamp {
             stop_gen: s.stop_gen,
             estop_epoch: s.estop_gen,
+            lease_gen: self.current_lease_gen(),
         }
     }
 
@@ -7435,7 +7660,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     fn is_disable_tx_kind(kind: TxKind) -> bool {
         matches!(
             kind,
-            TxKind::DisableRequested { .. } | TxKind::DisableProtective { .. } | TxKind::DisableProbe
+            TxKind::DisableRequested { .. }
+                | TxKind::ClientParkDisable { .. }
+                | TxKind::DisableProtective { .. }
+                | TxKind::DisableProbe
         )
     }
 
@@ -7550,6 +7778,12 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             TxKind::DisableRequested { started_at } => {
                 self.check_stopped_disable_requested(started_at)?;
             }
+            TxKind::ClientParkDisable { started_at } => {
+                if pending || latched {
+                    return Err(TxRefusal::StopInhibited);
+                }
+                self.check_stopped_disable_requested(started_at)?;
+            }
             TxKind::DisableProtective { .. } | TxKind::DisableProbe => {}
             TxKind::Refresh | TxKind::RollbackHold(_) | TxKind::MeasuredHold(_) | TxKind::ClearFault => {
                 if pending {
@@ -7579,6 +7813,22 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     /// 5. Post-build re-read of stop latch, pending gate, stop stamp, MIT fence, type-system
     ///    `PosForceSendToken` capability for `0x307` frames, submission freshness, deadline, and cutoff.
     /// 6. Account budget attempt, transmit, and record per-frame wall/CPU diagnostics.
+    fn send_with_lease(
+        &mut self,
+        kind: impl DamiaoTxKind,
+        expected_stamp: Option<StopStamp>,
+        expected_lease_gen: u64,
+        deadline: Option<Deadline>,
+        fenced: bool,
+        build: impl FnOnce(&Self) -> Option<CanFrame>,
+    ) -> Result<CanFrame, TxRefusal> {
+        let prev = self.send_lease_gen;
+        self.send_lease_gen = expected_lease_gen;
+        let res = self.send(kind, expected_stamp, deadline, fenced, build);
+        self.send_lease_gen = prev;
+        res
+    }
+
     fn send(
         &mut self,
         kind: impl DamiaoTxKind,
@@ -7587,6 +7837,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         fenced: bool,
         build: impl FnOnce(&Self) -> Option<CanFrame>,
     ) -> Result<CanFrame, TxRefusal> {
+        let expected_lease_gen = self.send_lease_gen;
         let has_pos_force_token = kind.pos_force_token().is_some();
         let kind = kind.tx_kind();
         // 1. Deadline check (inclusive: now >= deadline.at).
@@ -7594,7 +7845,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             return Err(TxRefusal::DeadlinePassed);
         }
 
-        // 2. Tick TX budget check (DisableRequested / DisableProtective exempt from motion TX budget).
+        // 2. Tick TX budget check (DisableRequested / ClientParkDisable / DisableProtective / DisableProbe exempt from motion TX budget).
         let budgeted = !Self::is_disable_tx_kind(kind);
         if budgeted {
             let _ = self.ensure_tx_pass();
@@ -7603,8 +7854,11 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             }
         }
 
-        // 3. Stop gate by TxKind.
+        // 3. Stop gate and lease fence by TxKind (stop/hold-class and Disable are lease-exempt).
         let latched_before = self.stop_gate_for_kind(kind)?;
+        if matches!(kind, TxKind::Target) && self.is_lease_fenced(expected_lease_gen) {
+            return Err(TxRefusal::LeaseFenced);
+        }
 
         // 4. MIT deadline fence (when fenced) + build frame fresh at send time.
         if fenced {
@@ -7631,9 +7885,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             return Err(TxRefusal::BuildRefused);
         };
 
-        // 5. Re-read physical stop latch, pending gate, stop-generation stamp, MIT fence,
-        //    position-force submission freshness, deadline, and tick TX cutoff AFTER `build`,
-        //    immediately before `can.transmit` (host submission boundary).
+        // 5. Re-read physical stop latch, pending gate, stop-generation stamp, lease fence,
+        //    MIT fence, position-force submission freshness, deadline, and tick TX cutoff AFTER
+        //    `build`, immediately before `can.transmit` (host submission boundary).
         let latched_after = self.stop_gate_for_kind(kind)?;
         if matches!(kind, TxKind::RollbackHold(_) | TxKind::MeasuredHold(_))
             && !latched_before
@@ -7641,10 +7895,19 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         {
             return Err(TxRefusal::StopInhibited);
         }
-        if !Self::is_disable_tx_kind(kind)
+        let skip_stamp_check = matches!(
+            kind,
+            TxKind::DisableRequested { .. }
+                | TxKind::DisableProtective { .. }
+                | TxKind::DisableProbe
+        );
+        if !skip_stamp_check
             && expected_stamp.is_some_and(|stamp| self.current_stop_stamp() != stamp)
         {
             return Err(TxRefusal::StopStampChanged);
+        }
+        if matches!(kind, TxKind::Target) && self.is_lease_fenced(expected_lease_gen) {
+            return Err(TxRefusal::LeaseFenced);
         }
         if fenced {
             if let Err(ArmDriverError::MitFenceTripped(reason)) = self.fence_check() {
@@ -8537,6 +8800,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 ArmDriverError::TorqueOffWouldDrop
             }
             TxRefusal::DisableRequestExpired => ArmDriverError::DisableRequestExpired,
+            TxRefusal::LeaseFenced => ArmDriverError::LeaseFenced,
             TxRefusal::MitFenceTripped(reason) => ArmDriverError::MitFenceTripped(reason),
             TxRefusal::PosForceFeedbackExpired(joint) => {
                 ArmDriverError::PosForceFeedbackStaleBeforeTransmit { joint }
@@ -9250,6 +9514,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     fn drain_pending_pass(
         &mut self,
         pass_stop_stamp: StopStamp,
+        pass_lease_gen: u64,
         pre_dropped_stale: usize,
         pre_oldest_expired: Option<Duration>,
         stop_on_expiry: bool,
@@ -9279,9 +9544,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 }
             }
             let entry_deadline = Deadline::after(entry.queued_at, self.tx_budget.frame_max_age);
-            match self.send(
+            match self.send_with_lease(
                 TxKind::Target,
                 Some(entry.stop_stamp),
+                entry.lease_gen,
                 Some(entry_deadline),
                 false,
                 |d| d.build_pending_target_frame(&entry),
@@ -9328,6 +9594,17 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     self.discard_pending_tx_stopped();
                     return Err(ArmDriverError::EstopInhibited);
                 }
+                Err(TxRefusal::LeaseFenced) => {
+                    let gate = self.estop_gate.as_ref();
+                    let dropped = self
+                        .pending_tx
+                        .drop_fenced_lease(|g| gate.is_some_and(|gt| gt.is_lease_fenced(g)));
+                    if dropped > 0 {
+                        crate::diagnostics::tick::record_tx_dropped_stopped(dropped as u32);
+                    }
+                    crate::diagnostics::tick::record_tx_deferred(0, self.total_pending_tx_len());
+                    return Err(ArmDriverError::LeaseFenced);
+                }
                 Err(TxRefusal::BuildRefused) => {
                     self.discard_pending_tx_stopped();
                     return Err(ArmDriverError::PosForceTargetUnavailable { joint: entry.joint });
@@ -9354,10 +9631,21 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 }
             }
         }
-        // Pre-flush stop check: a stop/E-stop arriving during the final frame transmit skips flush.
+        // Pre-flush stop and lease-fence check: a stop/E-stop or disconnect arriving during the
+        // final frame transmit skips flush and drops any remaining fenced entries.
         if let Err(e) = self.strict_stop_check(Some(pass_stop_stamp)) {
             self.discard_pending_tx_stopped();
             return Err(e);
+        }
+        if self.is_lease_fenced(pass_lease_gen) {
+            let gate = self.estop_gate.as_ref();
+            let dropped = self
+                .pending_tx
+                .drop_fenced_lease(|g| gate.is_some_and(|gt| gt.is_lease_fenced(g)));
+            if dropped > 0 {
+                crate::diagnostics::tick::record_tx_dropped_stopped(dropped as u32);
+            }
+            return Err(ArmDriverError::LeaseFenced);
         }
         if sent_any {
             if self.flush_cutoff_exceeded() {
@@ -9373,10 +9661,20 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 return Err(e.into());
             }
         }
-        // Post-flush stop check: catches pending, latched, or already-applied stops raised during flush.
+        // Post-flush stop & lease-fence check.
         if let Err(e) = self.strict_stop_check(Some(pass_stop_stamp)) {
             self.discard_pending_tx_stopped();
             return Err(e);
+        }
+        if self.is_lease_fenced(pass_lease_gen) {
+            let gate = self.estop_gate.as_ref();
+            let dropped = self
+                .pending_tx
+                .drop_fenced_lease(|g| gate.is_some_and(|gt| gt.is_lease_fenced(g)));
+            if dropped > 0 {
+                crate::diagnostics::tick::record_tx_dropped_stopped(dropped as u32);
+            }
+            return Err(ArmDriverError::LeaseFenced);
         }
         for &joint in &sent_order[..sent_order_len] {
             self.record_flushed_joint_tx(joint, 0, true);
@@ -9448,12 +9746,20 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             self.discard_pending_tx_stopped();
             return Err(ArmDriverError::EstopInhibited);
         }
+        let fenced_dropped = {
+            let gate = self.estop_gate.as_ref();
+            self.pending_tx
+                .drop_fenced_lease(|g| gate.is_some_and(|gt| gt.is_lease_fenced(g)))
+        };
+        if fenced_dropped > 0 {
+            crate::diagnostics::tick::record_tx_dropped_stopped(fenced_dropped as u32);
+        }
         let cleanup_now = self.now();
         let (stale, pre_oldest) = self.pending_tx.drop_stale(cleanup_now, self.tx_budget.frame_max_age);
         if stale > 0 {
             crate::diagnostics::tick::record_tx_dropped_stale(stale as u32);
         }
-        let arm_out = self.drain_pending_pass(current_stamp, stale, pre_oldest, false)?;
+        let arm_out = self.drain_pending_pass(current_stamp, 0, stale, pre_oldest, false)?;
         if self.external_pos_force_emitter || !self.pf_deferred_motion {
             return Ok(arm_out);
         }
@@ -10905,6 +11211,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     self.enable_failed();
                     return Err(Self::refusal_to_driver_err(r));
                 }
+                Err(TxRefusal::LeaseFenced) => {
+                    unreachable!("TxKind::Handshake is exempt from lease fence");
+                }
             }
         }
         if sent_any {
@@ -11130,26 +11439,48 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         kind: DisableKind,
         max_rx_frames: Option<u16>,
     ) -> Result<TorqueProgress, ArmDriverError> {
-        self.refresh_capture = None;
-        if let Some(hs) = self.torque_hs.take() {
-            if matches!(hs, DamiaoTorque::DrainBeforeEnable(_)) {
-                self.awaiting_rx_boundary = false;
+        self.begin_disable_inner(kind, max_rx_frames, false, None)
+    }
+
+    fn begin_disable_inner(
+        &mut self,
+        kind: DisableKind,
+        max_rx_frames: Option<u16>,
+        client_park: bool,
+        expected_stop_gen: Option<u64>,
+    ) -> Result<TorqueProgress, ArmDriverError> {
+        let expected_stamp = if client_park {
+            let mut stamp = self.current_stop_stamp();
+            if let Some(gen) = expected_stop_gen {
+                stamp.stop_gen = gen;
             }
-            if !matches!(hs, DamiaoTorque::Disable { .. } | DamiaoTorque::AwaitRestGate { .. }) {
-                self.enable_failed();
+            self.strict_stop_check(Some(stamp))?;
+            Some(stamp)
+        } else {
+            None
+        };
+        if !client_park {
+            self.refresh_capture = None;
+            if let Some(hs) = self.torque_hs.take() {
+                if matches!(hs, DamiaoTorque::DrainBeforeEnable(_)) {
+                    self.awaiting_rx_boundary = false;
+                }
+                if !matches!(hs, DamiaoTorque::Disable { .. } | DamiaoTorque::AwaitRestGate { .. }) {
+                    self.enable_failed();
+                }
             }
+            self.discard_all_pending_tx();
+            self.begin_tx_tick();
+            self.refresh_unfinished = 0;
         }
-        self.discard_all_pending_tx();
-        self.begin_tx_tick();
-        self.refresh_unfinished = 0;
         let prev_awaiting_rx_boundary = self.awaiting_rx_boundary;
         // E2/L1: Drain RX before checking Rule A′ in `send` so the send-time check sees the
         // freshest bus feedback. If `max_rx_frames == Some(0)` without a completed prior drain,
         // or if the drain exhausts without reaching an empty queue, `awaiting_rx_boundary` becomes
-        // true and `send(DisableRequested)` returns `DisableWaitEvidence`, holding the request
-        // pending (`DamiaoTorque::AwaitRestGate`) to retry on subsequent releases inside the 1 s
-        // lifetime (0 `CMD_DISABLE` frames). Protective disables bypass Rule A′.
-        self.awaiting_rx_boundary = match max_rx_frames {
+        // true and `send(DisableRequested | ClientParkDisable)` returns `DisableWaitEvidence`,
+        // holding the request pending (`DamiaoTorque::AwaitRestGate`) to retry on subsequent
+        // releases inside the 1 s lifetime (0 `CMD_DISABLE` frames). Protective disables bypass Rule A′.
+        let new_awaiting_rx_boundary = match max_rx_frames {
             Some(0) => self.awaiting_rx_boundary || !self.last_read_drained,
             Some(limit) => {
                 self.last_poll_rx = None;
@@ -11160,7 +11491,16 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             }
             None => !self.drain_rx_before_command(),
         };
-        self.send_disable_frames(kind, prev_awaiting_rx_boundary)
+        if !client_park {
+            self.awaiting_rx_boundary = new_awaiting_rx_boundary;
+        }
+        self.send_disable_frames(
+            kind,
+            prev_awaiting_rx_boundary,
+            new_awaiting_rx_boundary,
+            client_park,
+            expected_stamp,
+        )
     }
 
     /// Transmits `CMD_DISABLE` to every motor through the single choke point `send` and enters
@@ -11171,6 +11511,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         &mut self,
         kind: DisableKind,
         prev_awaiting_rx_boundary: bool,
+        new_awaiting_rx_boundary: bool,
+        client_park: bool,
+        expected_stamp: Option<StopStamp>,
     ) -> Result<TorqueProgress, ArmDriverError> {
         let after_seq = self.rx_seq;
         let cmd_start = self.now();
@@ -11179,7 +11522,29 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if (self.disable_dispatched_mask & all_mask) == all_mask {
             self.disable_dispatched_mask = 0;
         }
+        if client_park && self.motor_ids.is_empty() {
+            self.strict_stop_check(expected_stamp)?;
+            self.refresh_capture = None;
+            if let Some(hs) = self.torque_hs.take() {
+                if matches!(hs, DamiaoTorque::DrainBeforeEnable(_)) {
+                    self.awaiting_rx_boundary = false;
+                }
+                if !matches!(hs, DamiaoTorque::Disable { .. } | DamiaoTorque::AwaitRestGate { .. }) {
+                    self.enable_failed();
+                }
+            }
+            self.discard_all_pending_tx();
+            self.begin_tx_tick();
+            self.refresh_unfinished = 0;
+            self.awaiting_rx_boundary = new_awaiting_rx_boundary;
+        }
         let skip_dispatched = matches!(kind, DisableKind::DisableRequested { .. });
+        let tx_kind = match (client_park, kind) {
+            (true, DisableKind::DisableRequested { started_at }) => {
+                TxKind::ClientParkDisable { started_at }
+            }
+            _ => Self::disable_tx_kind(kind),
+        };
         let mut sent_any = false;
         let mut wait_evidence = false;
         let mut refused_err = None;
@@ -11188,15 +11553,39 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             if skip_dispatched && idx < 64 && (self.disable_dispatched_mask & (1u64 << idx)) != 0 {
                 continue;
             }
-            let tx_kind = Self::disable_tx_kind(kind);
-            match self.send(tx_kind, None, None, false, |d| {
+            match self.send(tx_kind, expected_stamp, None, false, |d| {
                 Some(damiao::build_disable_frame(d.motor_ids[idx]))
             }) {
                 Ok(_) => {
+                    if client_park && !sent_any {
+                        self.refresh_capture = None;
+                        if let Some(hs) = self.torque_hs.take() {
+                            if matches!(hs, DamiaoTorque::DrainBeforeEnable(_)) {
+                                self.awaiting_rx_boundary = false;
+                            }
+                            if !matches!(hs, DamiaoTorque::Disable { .. } | DamiaoTorque::AwaitRestGate { .. }) {
+                                self.enable_failed();
+                            }
+                        }
+                        self.discard_all_pending_tx();
+                        self.begin_tx_tick();
+                        self.refresh_unfinished = 0;
+                        self.awaiting_rx_boundary = new_awaiting_rx_boundary;
+                    }
                     sent_any = true;
                     if idx < 64 {
                         self.disable_dispatched_mask |= 1u64 << idx;
                     }
+                }
+                Err(r @ (TxRefusal::StopInhibited | TxRefusal::StopStampChanged)) if client_park => {
+                    if !sent_any && self.disable_dispatched_mask == 0 {
+                        self.awaiting_rx_boundary = prev_awaiting_rx_boundary || !self.last_read_drained;
+                        return Err(Self::refusal_to_driver_err(r));
+                    }
+                    other_err = Some(ArmDriverError::HardwareFault(
+                        "Client park disable stopped mid-batch after partial motor disable".into(),
+                    ));
+                    break;
                 }
                 Err(TxRefusal::DisableWaitEvidence) => {
                     wait_evidence = true;
@@ -11240,6 +11629,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 self.torque_hs = Some(DamiaoTorque::AwaitRestGate {
                     kind,
                     next_probe_at: cmd_start,
+                    client_park,
+                    expected_stamp,
                 });
                 return Ok(TorqueProgress::Pending { wake });
             }
@@ -11255,16 +11646,18 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             self.slot_in_unchanged_hold = [false; MAX_MODE_JOINTS * 2];
             self.pf_next_intent_is_hold = false;
             self.clear_cached_targets();
-        } else if self.mit_fence.is_some() || self.mit_fence_trip.is_some() {
+        } else if !client_park && (self.mit_fence.is_some() || self.mit_fence_trip.is_some()) {
             self.clear_cached_targets();
         }
-        if refused_err.is_none() && !wait_evidence {
+        if refused_err.is_none() && !wait_evidence && (any_dispatched || !client_park) {
             self.last_enable_command = Some(cmd_start);
             self.last_enable_command_rx_seq = Some(after_seq);
             self.last_command_was_disable = true;
         }
-        if let Err(e) = self.can.flush() {
-            other_err = Some(e.into());
+        if any_dispatched || !client_park {
+            if let Err(e) = self.can.flush() {
+                other_err = Some(e.into());
+            }
         }
         if let Some(e) = refused_err.or(other_err) {
             return Err(e);
@@ -11307,22 +11700,30 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         &mut self,
         kind: DisableKind,
         mut next_probe_at: Instant,
+        client_park: bool,
+        expected_stamp: Option<StopStamp>,
     ) -> Result<TorqueProgress, ArmDriverError> {
+        if client_park {
+            self.strict_stop_check(expected_stamp)?;
+        }
         let started_at = match kind {
             DisableKind::DisableRequested { started_at } => started_at,
             DisableKind::DisableProtective { .. } => {
                 let prev = self.awaiting_rx_boundary;
-                return self.send_disable_frames(kind, prev);
+                return self.send_disable_frames(kind, prev, prev, false, None);
             }
         };
         if self.now().saturating_duration_since(started_at) >= STOPPED_DISABLE_REQUEST_LIFETIME {
             return Err(ArmDriverError::DisableRequestExpired);
         }
         let _ = self.receive_feedback();
+        if client_park {
+            self.strict_stop_check(expected_stamp)?;
+        }
         match self.evaluate_rest_pose_gate() {
             RestPoseGateStatus::Confirmed => {
                 let prev = self.awaiting_rx_boundary;
-                return self.send_disable_frames(kind, prev);
+                return self.send_disable_frames(kind, prev, prev, client_park, expected_stamp);
             }
             RestPoseGateStatus::RefusedNonRest => {
                 return Err(ArmDriverError::TorqueOffWouldDrop);
@@ -11368,10 +11769,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     next_probe_at = self.now() + EVIDENCE_PROBE_INTERVAL;
                     let _ = self.can.flush();
                     let _ = self.receive_feedback();
+                    if client_park {
+                        self.strict_stop_check(expected_stamp)?;
+                    }
                     match self.evaluate_rest_pose_gate() {
                         RestPoseGateStatus::Confirmed => {
                             let prev = self.awaiting_rx_boundary;
-                            return self.send_disable_frames(kind, prev);
+                            return self.send_disable_frames(kind, prev, prev, client_park, expected_stamp);
                         }
                         RestPoseGateStatus::RefusedNonRest => {
                             return Err(ArmDriverError::TorqueOffWouldDrop);
@@ -11392,7 +11796,12 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         } else {
             next_probe_at.min(exp)
         };
-        self.torque_hs = Some(DamiaoTorque::AwaitRestGate { kind, next_probe_at });
+        self.torque_hs = Some(DamiaoTorque::AwaitRestGate {
+            kind,
+            next_probe_at,
+            client_park,
+            expected_stamp,
+        });
         Ok(TorqueProgress::Pending { wake })
     }
 
@@ -11570,9 +11979,12 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             Some(DamiaoTorque::Readback(r)) => self.poll_readback(r),
             Some(DamiaoTorque::PreEnableRefresh(refresh)) => self.poll_pre_enable_refresh(refresh),
             Some(DamiaoTorque::Enable { window, unsent_mask }) => self.poll_enable(window, unsent_mask),
-            Some(DamiaoTorque::AwaitRestGate { kind, next_probe_at }) => {
-                self.poll_await_rest_gate(kind, next_probe_at)
-            }
+            Some(DamiaoTorque::AwaitRestGate {
+                kind,
+                next_probe_at,
+                client_park,
+                expected_stamp,
+            }) => self.poll_await_rest_gate(kind, next_probe_at, client_park, expected_stamp),
             Some(DamiaoTorque::Disable { kind, repeats_sent, next_repeat_at, mit_fenced }) => {
                 self.poll_disable(kind, repeats_sent, next_repeat_at, mit_fenced)
             }
@@ -12296,6 +12708,25 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         self.begin_disable_budgeted(kind, Some(max_rx_frames))
     }
 
+    fn begin_client_park_disable(
+        &mut self,
+        max_rx_frames: Option<u16>,
+        expected_stop_gen: Option<u64>,
+    ) -> Result<TorqueProgress, ArmDriverError> {
+        if max_rx_frames.is_some() && !self.can.supports_nonblocking_rt() {
+            return Err(ArmDriverError::Protocol(
+                "UNSUPPORTED: CAN transport does not support non-blocking RT I/O".into(),
+            ));
+        }
+        let started_at = self.now();
+        self.begin_disable_inner(
+            DisableKind::DisableRequested { started_at },
+            max_rx_frames,
+            true,
+            expected_stop_gen,
+        )
+    }
+
     fn poll_torque(&mut self, deadline: Instant) -> Result<TorqueProgress, ArmDriverError> {
         self.poll_torque_inner(deadline, 64)
     }
@@ -12736,6 +13167,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                             Err(r @ (TxRefusal::TorqueOffWouldDrop | TxRefusal::DisableWaitEvidence | TxRefusal::DisableRequestExpired)) => {
                                 return Err(Self::refusal_to_driver_err(r));
                             }
+                            Err(TxRefusal::LeaseFenced) => {
+                                unreachable!("TxKind::RollbackHold is exempt from lease fence");
+                            }
                         }
                     }
                 }
@@ -12867,7 +13301,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         torque: target.torque,
                         slot: slot as u8,
                     };
-                    let ok = self.pending_hold_tx.upsert(i, frame_id, cmd, batch_ts, start_stamp);
+                    let ok = self.pending_hold_tx.upsert(i, frame_id, cmd, batch_ts, start_stamp, 0);
                     debug_assert!(ok, "preflight checked pending_hold_tx capacity");
                 }
             }
@@ -13013,6 +13447,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                             self.last_hold_tx_sent_mask = 0;
                             self.discard_pending_hold_tx();
                             return Err(Self::refusal_to_driver_err(r));
+                        }
+                        Err(TxRefusal::LeaseFenced) => {
+                            unreachable!("TxKind::RollbackHold is exempt from lease fence");
                         }
                     }
                 }
@@ -13468,6 +13905,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         Err(r @ (TxRefusal::TorqueOffWouldDrop | TxRefusal::DisableWaitEvidence | TxRefusal::DisableRequestExpired)) => {
                             return Err(Self::refusal_to_driver_err(r));
                         }
+                        Err(TxRefusal::LeaseFenced) => {
+                            unreachable!("TxKind::MeasuredHold is exempt from lease fence");
+                        }
                     }
                 }
                 if self.pending_stop_check(Some(start_stamp)).is_err() {
@@ -13590,7 +14030,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                             kd: target.kd,
                             torque: target.torque,
                         };
-                        let ok = self.pending_hold_tx.upsert(i, frame_id, cmd, batch_ts, start_stamp);
+                        let ok = self.pending_hold_tx.upsert(i, frame_id, cmd, batch_ts, start_stamp, 0);
                         debug_assert!(ok, "preflight checked pending_hold_tx capacity");
                     }
                 }
@@ -13732,6 +14172,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                             self.last_hold_tx_sent_mask = 0;
                             self.discard_pending_hold_tx();
                             return Err(Self::refusal_to_driver_err(r));
+                        }
+                        Err(TxRefusal::LeaseFenced) => {
+                            unreachable!("TxKind::MeasuredHold is exempt from lease fence");
                         }
                     }
                 }
@@ -13943,6 +14386,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     }
 
     fn write_joint_targets_bounded(&mut self, targets: &[JointTarget]) -> Result<TxBatchOutcome, ArmDriverError> {
+        let batch_lease_gen = self.output_lease_gen;
+        self.output_lease_gen = 0;
         self.last_target_tx_sent_mask = 0;
         self.last_tx_pf_status = PosForceTxStatus::Unobserved;
         self.last_output_was_hold = false;
@@ -13990,6 +14435,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             if let Err(e) = self.strict_stop_check(None) {
                 self.trip_fence(MitFenceTripReason::EstopBeforeBatch { total_joints });
                 return Err(e);
+            }
+            if self.is_lease_fenced(batch_lease_gen) {
+                return Err(ArmDriverError::LeaseFenced);
             }
             let pre_arm_intent_stamp = self.current_j7_intent_stamp();
             let arm_res: Result<TxBatchOutcome, ArmDriverError> = (|| {
@@ -14069,9 +14517,14 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         if started[i].is_none() {
                             started[i] = Some(self.now());
                         }
-                        match self.send(TxKind::Target, Some(start_stamp), None, true, |d| {
-                            d.target_frames_checked(i, target).ok()?.0.get(slot).copied().flatten()
-                        }) {
+                        match self.send_with_lease(
+                            TxKind::Target,
+                            Some(start_stamp),
+                            batch_lease_gen,
+                            None,
+                            true,
+                            |d| d.target_frames_checked(i, target).ok()?.0.get(slot).copied().flatten(),
+                        ) {
                             Ok(sent_frame) => {
                                 let mit_params = self.resolved_mit_params(target);
                                 self.record_sent_target(i, sent_frame, Some(mit_params));
@@ -14093,6 +14546,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                                     total_joints,
                                 });
                                 return Err(ArmDriverError::EstopInhibited);
+                            }
+                            Err(TxRefusal::LeaseFenced) => {
+                                return Err(ArmDriverError::LeaseFenced);
                             }
                             Err(TxRefusal::PosForceFeedbackExpired(joint)) => {
                                 self.trip_fence(MitFenceTripReason::TargetUnavailable {
@@ -14143,6 +14599,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     self.trip_fence(MitFenceTripReason::EstopBeforeFlush { total_joints });
                     return Err(ArmDriverError::EstopInhibited);
                 }
+                if self.is_lease_fenced(batch_lease_gen) {
+                    return Err(ArmDriverError::LeaseFenced);
+                }
                 if self.flush_cutoff_exceeded() {
                     self.mark_tx_pass_backpressured();
                     self.trip_fence(MitFenceTripReason::FlushFailed {
@@ -14164,6 +14623,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 if self.strict_stop_check(Some(start_stamp)).is_err() {
                     self.trip_fence(MitFenceTripReason::EstopAfterFlush { total_joints });
                     return Err(ArmDriverError::EstopInhibited);
+                }
+                if self.is_lease_fenced(batch_lease_gen) {
+                    return Err(ArmDriverError::LeaseFenced);
                 }
                 self.fence_check()?;
                 let mut sent_mask: u64 = 0;
@@ -14253,6 +14715,17 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             self.discard_pending_tx_stopped();
             return Err(e);
         }
+        let fenced_carry = {
+            let gate = self.estop_gate.as_ref();
+            self.pending_tx
+                .drop_fenced_lease(|g| gate.is_some_and(|gt| gt.is_lease_fenced(g)))
+        };
+        if fenced_carry > 0 {
+            crate::diagnostics::tick::record_tx_dropped_stopped(fenced_carry as u32);
+        }
+        if self.is_lease_fenced(batch_lease_gen) {
+            return Err(ArmDriverError::LeaseFenced);
+        }
         self.output_ran_since_rx = true;
         let batch_stamp = self.current_stop_stamp();
         let stopped_carry = self.pending_tx.drop_stopped(batch_stamp);
@@ -14308,12 +14781,14 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 }
             };
             for (frame_id, cmd) in cmds.into_iter().flatten() {
-                let ok = self.pending_tx.upsert(i, frame_id, cmd, batch_ts, batch_stamp);
+                let ok = self
+                    .pending_tx
+                    .upsert(i, frame_id, cmd, batch_ts, batch_stamp, batch_lease_gen);
                 debug_assert!(ok, "preflight checked pending queue capacity");
             }
         }
         let pre_arm_intent_stamp = self.current_j7_intent_stamp();
-        let arm_out = self.drain_pending_pass(batch_stamp, 0, None, true)?;
+        let arm_out = self.drain_pending_pass(batch_stamp, batch_lease_gen, 0, None, true)?;
         if self.external_pos_force_emitter {
             return Ok(arm_out);
         }
@@ -14544,6 +15019,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     fn set_estop_state(&mut self, state: Arc<crate::rt_core::urgent::EstopState>) { self.estop_state = Some(state); }
     fn set_estop_gate(&mut self, gate: crate::rt_core::urgent::EstopGate) { self.estop_gate = Some(gate); }
     fn set_stopped_disable_gate(&mut self, gate: StoppedDisableGate) { self.stopped_disable_gate = Some(gate); }
+    fn set_output_lease_gen(&mut self, lease_gen: u64) { self.output_lease_gen = lease_gen; }
 }
 
 impl<C: CanTransport> DamiaoArmDriver<C> {
@@ -15259,6 +15735,7 @@ mod pos_force_emitter {
         driver: &mut DamiaoArmDriver<C>,
         kind: TxKind,
         expected_stamp: Option<StopStamp>,
+        expected_lease_gen: u64,
         intent: PosForceIntentKind,
         allow_freeze: bool,
         retry: bool,
@@ -15315,7 +15792,14 @@ mod pos_force_emitter {
         if retry {
             driver.send_with_retry_inner(kind, expected_stamp, None, fenced, Some(&token), build)
         } else {
-            driver.send(authorize_kind(&token, kind), expected_stamp, None, fenced, build)
+            driver.send_with_lease(
+                authorize_kind(&token, kind),
+                expected_stamp,
+                expected_lease_gen,
+                None,
+                fenced,
+                build,
+            )
         }
     }
 
@@ -15332,6 +15816,7 @@ mod pos_force_emitter {
             driver,
             TxKind::Handshake,
             expected_stamp,
+            0,
             PosForceIntentKind::Hold,
             false,
             false,
@@ -15351,7 +15836,7 @@ mod pos_force_emitter {
         fenced: bool,
     ) -> Result<CanFrame, TxRefusal> {
         let kind = if is_rollback { TxKind::RollbackHold(joint) } else { TxKind::Hold };
-        send_frame(driver, kind, expected_stamp, intent, false, true, fenced)
+        send_frame(driver, kind, expected_stamp, 0, intent, false, true, fenced)
     }
 
     /// Narrow standalone-driver recovery API: called ONLY from `DamiaoArmDriver::receive_feedback`
@@ -15370,6 +15855,7 @@ mod pos_force_emitter {
             driver,
             TxKind::Recovery,
             expected_stamp,
+            0,
             PosForceIntentKind::Target {
                 position: hold_pos,
                 velocity: Some(speed),
@@ -15389,9 +15875,9 @@ mod pos_force_emitter {
     /// Always runs unfenced (`fenced = false`) with `allow_freeze = true` so a tripped MIT fence
     /// suppresses ONLY MIT arm joints and J7 (`TIMEOUT=0`) always receives its resolved frame.
     ///
-    /// Single stop-generation / E-stop epoch enforcement rule: any `Target` intent whose
-    /// `(stop_gen, estop_epoch)` stamp differs from `current` is degraded to `Hold` and is NEVER
-    /// re-stamped with the newer generation.
+    /// Single stop-generation / E-stop epoch / lease-generation enforcement rule: any `Target`
+    /// intent whose `(stop_gen, estop_epoch, lease_gen)` stamp is stale or lease-fenced is
+    /// degraded to `Hold` and is NEVER re-stamped with a newer generation.
     pub(super) fn emit_tick<C: CanTransport>(
         driver: &mut DamiaoArmDriver<C>,
         intent: PosForceIntent,
@@ -15408,8 +15894,8 @@ mod pos_force_emitter {
         {
             return Ok(PosForceEmitOutcome::NotApplicable);
         }
-        let stamp_stale = intent.stamp.stop_gen != current.stop_gen
-            || intent.stamp.estop_epoch != current.estop_epoch;
+        let stamp_stale = intent.stamp.is_stale_against(current)
+            || driver.is_lease_fenced(intent.stamp.lease_gen);
         let effective_kind = match intent.kind {
             PosForceIntentKind::Target { .. }
                 if stamp_stale || driver.pf_hold_on_first_fresh =>
@@ -15418,7 +15904,7 @@ mod pos_force_emitter {
             }
             other => other,
         };
-        let is_target_intent = matches!(effective_kind, PosForceIntentKind::Target { .. });
+        let mut is_target_intent = matches!(effective_kind, PosForceIntentKind::Target { .. });
         if is_target_intent {
             driver.strict_stop_check(None)?;
         } else {
@@ -15488,12 +15974,30 @@ mod pos_force_emitter {
         let mut active_kind = effective_kind;
         let mut retried = false;
         let sent_frame = loop {
-            let kind = match active_kind {
-                PosForceIntentKind::Target { .. } => TxKind::Target,
-                PosForceIntentKind::Hold | PosForceIntentKind::Stop => TxKind::RollbackHold(pf_j),
+            let (kind, target_lease_gen) = match active_kind {
+                PosForceIntentKind::Target { .. } => (TxKind::Target, intent.stamp.lease_gen),
+                PosForceIntentKind::Hold | PosForceIntentKind::Stop => (TxKind::RollbackHold(pf_j), 0),
             };
-            match send_frame(driver, kind, Some(start_stamp), active_kind, true, false, false) {
+            match send_frame(
+                driver,
+                kind,
+                Some(start_stamp),
+                target_lease_gen,
+                active_kind,
+                true,
+                false,
+                false,
+            ) {
                 Ok(frame) => break Some(frame),
+                Err(TxRefusal::LeaseFenced) => {
+                    if !retried && matches!(active_kind, PosForceIntentKind::Target { .. }) {
+                        retried = true;
+                        active_kind = PosForceIntentKind::Hold;
+                        is_target_intent = false;
+                        continue;
+                    }
+                    break None;
+                }
                 Err(TxRefusal::PosForceFeedbackExpired(_)) => {
                     let _ = driver.check_pos_force_freshness_for_tx();
                     if !retried {
@@ -16611,9 +17115,10 @@ mod tx_chokepoint_tests {
         }
     }
 
-    fn all_tx_kinds(started_at: Instant) -> [TxKind; 12] {
+    fn all_tx_kinds(started_at: Instant) -> [TxKind; 13] {
         [
             TxKind::DisableRequested { started_at },
+            TxKind::ClientParkDisable { started_at },
             TxKind::DisableProtective { reason: DisableProtectiveReason::Thermal },
             TxKind::DisableProtective { reason: DisableProtectiveReason::ProcessExit },
             TxKind::DisableProbe,
@@ -16665,11 +17170,14 @@ mod tx_chokepoint_tests {
         if deadline == DeadlineCase::Passed {
             return Expected::RefusedDeadline;
         }
-        // Step 2: Tick TX budget runs before stop gate (DisableRequested / DisableProtective / DisableProbe exempt).
+        // Step 2: Tick TX budget runs before stop gate (DisableRequested / ClientParkDisable / DisableProtective / DisableProbe exempt).
         if budget == BudgetCase::Exhausted
             && !matches!(
                 kind,
-                TxKind::DisableRequested { .. } | TxKind::DisableProtective { .. } | TxKind::DisableProbe
+                TxKind::DisableRequested { .. }
+                    | TxKind::ClientParkDisable { .. }
+                    | TxKind::DisableProtective { .. }
+                    | TxKind::DisableProbe
             )
         {
             return Expected::Deferred;
@@ -16679,6 +17187,10 @@ mod tx_chokepoint_tests {
             TxKind::DisableRequested { .. }
             | TxKind::DisableProtective { .. }
             | TxKind::DisableProbe => Expected::Sent,
+            TxKind::ClientParkDisable { .. } => match stop {
+                StopCase::NoStop => Expected::Sent,
+                StopCase::Pending | StopCase::Latched => Expected::RefusedStop,
+            },
             TxKind::Refresh | TxKind::RollbackHold(_) | TxKind::MeasuredHold(_) | TxKind::ClearFault => match stop {
                 StopCase::Pending => Expected::RefusedStop,
                 StopCase::NoStop | StopCase::Latched => Expected::Sent,
@@ -16750,6 +17262,9 @@ mod tx_chokepoint_tests {
                         let kind = match kind {
                             TxKind::DisableRequested { .. } => {
                                 TxKind::DisableRequested { started_at: clock.now() }
+                            }
+                            TxKind::ClientParkDisable { .. } => {
+                                TxKind::ClientParkDisable { started_at: clock.now() }
                             }
                             other => other,
                         };

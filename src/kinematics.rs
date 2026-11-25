@@ -639,6 +639,47 @@ impl WorkspaceViolationDetail {
             && self.violation_phase.is_none()
             && self.reason.is_none()
     }
+
+    /// Preallocated empty detail holding reusable String capacities for zero-alloc RT writes.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn preallocated_rt() -> Self {
+        Self {
+            constraint_id: Some(String::with_capacity(128)),
+            geometry_id: Some(String::with_capacity(128)),
+            violation_phase: Some(String::with_capacity(64)),
+            reason: Some(String::with_capacity(256)),
+        }
+    }
+
+    /// Copies all 4 optional strings from `src` into `self`'s preallocated String buffers without
+    /// allocating or freeing when `self` was created with [`Self::preallocated_rt`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn copy_from_rt(&mut self, src: &Self) {
+        fn copy_opt_capped(dst: &mut Option<String>, src: Option<&String>) {
+            match (dst.as_mut(), src) {
+                (Some(d), Some(s)) => {
+                    d.clear();
+                    let cap = d.capacity();
+                    if s.len() <= cap {
+                        d.push_str(s);
+                    } else {
+                        let mut end = cap;
+                        while end > 0 && !s.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        d.push_str(&s[..end]);
+                    }
+                }
+                (Some(d), None) => d.clear(),
+                (None, Some(s)) => *dst = Some(s.clone()),
+                (None, None) => {}
+            }
+        }
+        copy_opt_capped(&mut self.constraint_id, src.constraint_id.as_ref());
+        copy_opt_capped(&mut self.geometry_id, src.geometry_id.as_ref());
+        copy_opt_capped(&mut self.violation_phase, src.violation_phase.as_ref());
+        copy_opt_capped(&mut self.reason, src.reason.as_ref());
+    }
 }
 
 /// The largest single excess of a workspace check.

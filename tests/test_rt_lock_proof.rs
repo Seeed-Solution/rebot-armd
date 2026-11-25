@@ -39,7 +39,7 @@ use armd::rt_core::executor::{
     in_rt_release, on_rt_control_thread, validate_startup_owner, ControlThreadGuard,
     ExecutorConfig, PersistTestHooks, ReleaseGuard, RtExecutorHandle, RtOwner,
 };
-use armd::rt_core::ops::{PlanSlot, Primitive};
+use armd::rt_core::ops::PlanSlot;
 use armd::rt_core::urgent::StopRequests;
 use armd::supervisor::OWNER_EXECUTOR;
 use armd::supervisor_lock::{HoldKind, SupervisorLock};
@@ -179,6 +179,7 @@ fn wait_broker_terminal(handle: &RtExecutorHandle, req: RequestId, deadline: Ins
 }
 
 fn submit_joint_quintic(
+    sup: &ArmSupervisor,
     handle: &RtExecutorHandle,
     seq: u64,
     authority: Authority,
@@ -186,15 +187,25 @@ fn submit_joint_quintic(
     goal: &[f32],
     duration_s: f64,
 ) -> RequestId {
-    let prim = Primitive::joint_quintic(start, goal, duration_s).unwrap();
+    use armd::rt_core::requests::motion::{self as req_motion, MotionPlanSnapshot, MotionRequest};
     let deadline = Instant::now() + Duration::from_secs(5);
+    let published = sup.hub().latest().expect("published snapshot for jog prepare");
+    let cfg = sup.hub().motion_config().expect("motion config cached on hub");
+    let mut snap = MotionPlanSnapshot::from_published(&published, cfg).expect("from_published");
+    snap.commanded_positions = start.to_vec();
+    snap.authority.epoch = authority.epoch;
+    snap.authority.lease_generation = authority.lease_generation;
+    snap.authority.stop_generation = authority.stop_generation;
+    snap.authority.deadline = deadline;
+    let plan = req_motion::prepare_motion(&snap, &MotionRequest::jog(goal.to_vec(), Some(duration_s), None))
+        .expect("prepare_motion");
     let mut b = handle.broker().lock().unwrap();
     b.submit(
         ClientId(1),
         seq,
         authority,
         deadline,
-        Submit::Install(&move |slot: &mut PlanSlot| slot.set(prim)),
+        Submit::Install(&move |slot: &mut PlanSlot| req_motion::stage_jog(slot, &plan.slot)),
     )
     .unwrap()
 }
@@ -892,7 +903,7 @@ fn production_executor_mock_owner_zero_attempts_while_legacy_writer_held() {
             let start = snap.commanded.clone();
             let mut goal = start.clone();
             goal[0] += 0.50;
-            let req_jog = submit_joint_quintic(&handle, 1, snap.authority, &start, &goal, 10.0);
+            let req_jog = submit_joint_quintic(&sup, &handle, 1, snap.authority, &start, &goal, 10.0);
             assert!(matches!(
                 wait_broker_reply(&handle, req_jog, deadline, |r| matches!(r, Reply::Ack { .. }).then_some(r)),
                 Reply::Ack { .. }
@@ -935,7 +946,7 @@ fn production_executor_mock_owner_zero_attempts_while_legacy_writer_held() {
             );
 
             // A stale-generation command stamped with the pre-stop authority must be refused `STOPPED`.
-            let req_stale = submit_joint_quintic(&handle, 2, snap.authority, &frozen_pos, &goal, 1.0);
+            let req_stale = submit_joint_quintic(&sup, &handle, 2, snap.authority, &frozen_pos, &goal, 1.0);
             assert!(matches!(
                 wait_broker_reply(&handle, req_stale, deadline, |r| matches!(r, Reply::Refused { .. }).then_some(r)),
                 Reply::Refused { code: "STOPPED", .. }
@@ -1155,7 +1166,7 @@ fn production_executor_bus_trace_dynamic_output_inhibited_while_legacy_writer_he
             let trace_before_jog = bus.trace_len();
             bus.arm_mid_batch_stop_after_j1_progress(start[0] + 5e-4);
 
-            let req_jog = submit_joint_quintic(&handle, 2, snap.authority, &start, &goal, 10.0);
+            let req_jog = submit_joint_quintic(&sup, &handle, 2, snap.authority, &start, &goal, 10.0);
             assert!(matches!(
                 wait_broker_reply(&handle, req_jog, deadline, |r| matches!(r, Reply::Ack { .. }).then_some(r)),
                 Reply::Ack { .. }
@@ -1199,7 +1210,7 @@ fn production_executor_bus_trace_dynamic_output_inhibited_while_legacy_writer_he
                 .obs
                 .commanded_positions
                 .clone();
-            let req_stale = submit_joint_quintic(&handle, 3, snap.authority, &frozen_pos, &goal, 1.0);
+            let req_stale = submit_joint_quintic(&sup, &handle, 3, snap.authority, &frozen_pos, &goal, 1.0);
             assert!(matches!(
                 wait_broker_reply(&handle, req_stale, deadline, |r| matches!(r, Reply::Refused { .. }).then_some(r)),
                 Reply::Refused { code: "STOPPED", .. }

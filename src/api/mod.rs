@@ -395,6 +395,7 @@ async fn gate_executor_owner(
                         | "/api/v1/auth/unlock"
                         | "/api/v1/auth/lock"
                         | "/api/v1/heartbeat"
+                        | "/api/v1/motion/servo"
                         | "/api/v1/diagnostics/tick/mark"
                         | "/api/v1/tool/commissioning/confirm"
                 ),

@@ -223,6 +223,7 @@ impl SupervisorInner {
             tracing::info!("Effective floor {:.4} m (was {:.4} m, profile {profile:.4} m, source {source})", floor, ws.floor_z_m);
             ws.floor_z_m = floor;
             self.workspace_revision += 1;
+            self.bump_motion_config_revision();
             self.servo_ws_min_depths = None;
         }
     }
@@ -232,6 +233,7 @@ impl SupervisorInner {
     pub fn set_camera_mount(&mut self, mount: crate::model::CameraMount) {
         if self.config.camera_mount != mount {
             self.workspace_revision += 1;
+            self.bump_motion_config_revision();
             self.servo_ws_min_depths = None;
         }
         self.config.camera_mount = mount;
@@ -255,6 +257,7 @@ impl SupervisorInner {
         self.config.arm_model = model;
         // the servo escape baseline was measured with the old model
         self.workspace_revision += 1;
+        self.bump_motion_config_revision();
         self.servo_ws_min_depths = None;
         self.calibration_revision += 1;
         self.refresh_pose_tcps();
@@ -269,6 +272,7 @@ impl SupervisorInner {
     pub fn set_grasp_setup(&mut self, setup: crate::grasp::GraspSetup) {
         if self.config.camera_mount.tilt_deg != setup.camera_tilt_deg as f32 {
             self.workspace_revision += 1;
+            self.bump_motion_config_revision();
             self.servo_ws_min_depths = None;
         }
         self.config.camera_mount.tilt_deg = setup.camera_tilt_deg as f32;
@@ -641,6 +645,8 @@ impl SupervisorInner {
         self.gripper_calib_jaw_opening = cand.gripper_calib_jaw_opening;
         self.gripper_calib_invalid = cand.gripper_calib_invalid;
         self.driver_config_error = cand.driver_config_error;
+        self.prepare_park_release_spare();
+        self.bump_motion_config_revision();
         if !self.rt_executor_owned {
             self.refresh_schema_cache();
         }
