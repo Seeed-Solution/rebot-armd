@@ -214,6 +214,45 @@ fn invalid(m: String) -> ArmError { MotionError::InvalidCommand(m).into() }
 /// Under the lock: bind the parsed request (`pending`) and the request's evidence to the
 /// supervisor state.
 pub fn capture(inner: &SupervisorInner, pending: &PendingGrasp, body: &Value) -> Result<Snapshot, ArmError> {
+    let policy = inner.config.gripper_policy.clone()
+        .ok_or_else(|| ArmError::from(MotionError::Unsupported("Grasp needs a gripper policy".into())))?;
+    capture_from_parts(
+        pending,
+        body,
+        &policy,
+        inner.requires_real_jaw_curve(),
+        inner.config.gravity_comp.as_ref(),
+        inner.config.damiao_ranges.as_deref(),
+    )
+}
+
+/// Zero-lock capture from a published [`crate::rt_core::requests::actions::ActionPrepEnv`]
+/// (used by both live `ActionSnapshot` and lease-free `ReadOnlySnapshot` on `OWNER_EXECUTOR`).
+pub fn capture_from_env(
+    env: &crate::rt_core::requests::actions::ActionPrepEnv,
+    pending: &PendingGrasp,
+    body: &Value,
+) -> Result<Snapshot, ArmError> {
+    let policy = env.config.gripper_policy.clone()
+        .ok_or_else(|| ArmError::from(MotionError::Unsupported("Grasp needs a gripper policy".into())))?;
+    capture_from_parts(
+        pending,
+        body,
+        &policy,
+        env.requires_real_jaw_curve,
+        env.config.gravity_comp.as_ref(),
+        env.config.damiao_ranges.as_deref(),
+    )
+}
+
+fn capture_from_parts(
+    pending: &PendingGrasp,
+    body: &Value,
+    policy: &crate::model::GripperPolicy,
+    requires_real_jaw_curve: bool,
+    gravity_comp: Option<&crate::model::GravityCompPolicy>,
+    damiao_ranges: Option<&[crate::model::DamiaoRange]>,
+) -> Result<Snapshot, ArmError> {
     let evidence = parse_evidence(body).map_err(invalid)?;
     let prefs = parse_preferences(body).map_err(invalid)?;
     let wall_ms = parse_budget(body).map_err(invalid)?;
@@ -227,19 +266,18 @@ pub fn capture(inner: &SupervisorInner, pending: &PendingGrasp, body: &Value) ->
     let cam = CamModel::assumed(&input.arm, &setup, &input.cam);
     let camera_down = grasp::camera_down_mode(&setup, &input.cam).map_err(invalid)?;
     let envelope = grasp::envelope_with_contact(input.ws.as_ref(), &input.cam, &cam.rec, pending.physical_contact_end_m);
-    let policy = inner.config.gripper_policy.clone()
-        .ok_or_else(|| ArmError::from(MotionError::Unsupported("Grasp needs a gripper policy".into())))?;
     let open_width = f64::from(policy.opening_m(policy.open_rad));
     let max_w = if policy.is_calibrated() {
         let calib = open_width - setup.pre_open_margin_m;
         if setup.max_grasp_width_m > 0.0 { setup.max_grasp_width_m.min(calib) } else { calib }
     } else {
-        inner.grasp_width_check(setup.max_grasp_width_m).map_or(setup.max_grasp_width_m, |c| c.effective_max_m(setup.max_grasp_width_m))
+        let check = crate::model::check_grasp_width(policy, setup.max_grasp_width_m, requires_real_jaw_curve);
+        check.effective_max_m(setup.max_grasp_width_m)
     };
-    let torque_limits = inner.config.gravity_comp.as_ref()
+    let torque_limits = gravity_comp
         .filter(|gc| gc.torque_limits_nm.len() >= 6)
         .map(|gc| (gc.torque_limits_nm.iter().take(6).map(|t| f64::from(*t)).collect(), "gravity_comp.torque_limits_nm"))
-        .or_else(|| inner.config.damiao_ranges.as_ref().filter(|r| r.len() >= 6)
+        .or_else(|| damiao_ranges.filter(|r| r.len() >= 6)
             .map(|r| (r.iter().take(6).map(|d| 0.5 * f64::from(d.t_max)).collect(), "damiao_ranges.t_max x 0.5")));
     let mut snap = Snapshot {
         id: String::new(), input, setup, cam, camera_down, label: request.label.clone(), box_norm: request.box_norm,
