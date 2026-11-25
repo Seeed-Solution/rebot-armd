@@ -438,6 +438,11 @@ pub fn evaluate_owner_auth_policy(
                     operation: "clear_fault (non-recoverable fault or EStop)",
                 });
             }
+            if inner.has_reported_motor_errors() {
+                return Err(OwnerAuthError::OperatorRequired {
+                    operation: "clear_fault (motor hardware error)",
+                });
+            }
             Ok(())
         }
     }
@@ -910,6 +915,15 @@ pub(crate) fn recheck_clear_fault_authority_readonly(
     auth: ClearFaultAuthority,
     now: Instant,
 ) -> Result<(), ClearFaultAuthorityError> {
+    recheck_clear_fault_authority_readonly_with_op(inner, auth, now, false)
+}
+
+pub(crate) fn recheck_clear_fault_authority_readonly_with_op(
+    inner: &SupervisorInner,
+    auth: ClearFaultAuthority,
+    now: Instant,
+    force_operator_motor_error: bool,
+) -> Result<(), ClearFaultAuthorityError> {
     let check_now = now.max(Instant::now());
     let lease_ok = auth.lease_generation != 0
         && inner.check_client_connection_live(auth.connection.id()).is_ok()
@@ -931,11 +945,13 @@ pub(crate) fn recheck_clear_fault_authority_readonly(
             received: auth.expected_epoch,
         });
     }
-    // Never clear a non-recoverable fault (or E-stop) through this path unless it is an explicit
-    // operator clear backed by a live valid operator session.
+    // Never clear a non-recoverable fault, E-stop, or reported motor hardware error through this
+    // path unless it is an explicit operator clear backed by a live valid operator session.
+    let has_motor_err = force_operator_motor_error || inner.has_reported_motor_errors();
     let non_recoverable = inner.e_stop_latched.load(Ordering::SeqCst)
         || ((inner.safety.state().is_stopped() || inner.safety.has_latched_fault())
-            && !inner.safety.recoverable());
+            && !inner.safety.recoverable())
+        || has_motor_err;
     if non_recoverable {
         let explicit_operator_clear = matches!(
             auth.auth_policy,
@@ -949,6 +965,10 @@ pub(crate) fn recheck_clear_fault_authority_readonly(
             return Err(ClearFaultAuthorityError::OperatorRequired {
                 operation: if inner.e_stop_latched.load(Ordering::SeqCst) {
                     "clear_fault (EStop latched)"
+                } else if has_motor_err
+                    && !(inner.safety.state().is_stopped() || inner.safety.has_latched_fault())
+                {
+                    "clear_fault (motor hardware error)"
                 } else {
                     "clear_fault (non-recoverable fault or EStop)"
                 },

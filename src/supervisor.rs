@@ -7077,6 +7077,23 @@ impl SupervisorInner {
         cache.copy_ages_from(&ages, self.config.dof, poll_before);
         self.capture_driver_cache = cache;
         self.refresh_owner_driver_snapshot_from_ref(driver.as_ref());
+        let dof = self.config.dof;
+        if self.motor_errors.capacity() < dof {
+            self.motor_errors.reserve(dof - self.motor_errors.len());
+        }
+        if driver.has_hardware_fault() {
+            let mut status = Vec::with_capacity(dof);
+            if driver.motor_status_into(&mut status) {
+                self.motor_errors.resize_with(status.len(), || None);
+                for (slot, &code) in self.motor_errors.iter_mut().zip(status.iter()) {
+                    *slot = driver
+                        .decode_motor_error_static(code)
+                        .map(std::borrow::Cow::Borrowed)
+                        .or_else(|| driver.decode_motor_error(code).map(std::borrow::Cow::Owned))
+                        .map(|name| crate::model::MotorError { code, name });
+                }
+            }
+        }
         self.torque_intent = crate::supervisor::TorqueIntent::On;
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -7093,6 +7110,13 @@ impl SupervisorInner {
             driver,
             Arc::clone(&self.driver_lock_attempts),
         ));
+    }
+
+    /// True when any joint currently reports a decoded motor hardware error in `self.motor_errors`.
+    /// Lock-free and zero-allocation; safe to call on RT authority checks and under driver locks.
+    #[inline]
+    pub(crate) fn has_reported_motor_errors(&self) -> bool {
+        self.motor_errors.iter().any(Option::is_some)
     }
 
     /// Flush all pending shadow reducer steps and emit compact SPSC records (outer post-write boundary only).
