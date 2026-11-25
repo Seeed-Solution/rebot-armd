@@ -12416,6 +12416,16 @@ pub struct ArmSupervisor {
     /// Supervisor-wide sticky flag set when deliberate `ProcessExit` protective disable is
     /// requested so concurrent ownership handback never strands the driver without disable (B3).
     process_exit_requested: AtomicBool,
+    /// Test-only fault-injection flag forcing `ArmSupervisor::drop`'s SAFE-HOLD thread spawn to
+    /// fail so inline ownership retention is deterministically verified.
+    #[cfg(not(target_arch = "wasm32"))]
+    fail_drop_safe_hold_spawn: AtomicBool,
+}
+
+#[derive(Clone)]
+enum LegacyPanicDisableStep {
+    Outcome(PanicDisableOutcome),
+    Detached,
 }
 
 /// Authoritative endpoint for the single active hardware bus writer across startup, handback,
@@ -12426,6 +12436,10 @@ pub enum WriterEndpoint {
         control_stop: Option<Arc<AtomicBool>>,
         safe_hold: Arc<crate::rt_core::safe_hold::SafeHoldControl>,
     },
+    /// Ownership transfer is in progress (e.g. `start_executor` extracting `SupervisorInner`
+    /// into `armd-control`); `ProcessExit` must wait for the authoritative endpoint rather than
+    /// selecting `Legacy` or reading the detached shell.
+    Transferring,
     Executor(crate::rt_core::executor::RtExecutorHandle),
     DetachedSafeHold {
         safe_hold: Arc<crate::rt_core::safe_hold::SafeHoldControl>,
@@ -12624,6 +12638,7 @@ fn executor_unavailable() -> ArmError {
 struct TransferGuard<'a> {
     sup: &'a ArmSupervisor,
     armed: bool,
+    saved_legacy_stop: Option<Arc<AtomicBool>>,
 }
 
 impl Drop for TransferGuard<'_> {
@@ -12634,6 +12649,15 @@ impl Drop for TransferGuard<'_> {
                 if matches!(*slot, OwnerSlot::Transferring) {
                     *slot = OwnerSlot::Legacy;
                     self.sup.owner_mode.store(OWNER_LEGACY, Ordering::Release);
+                }
+            }
+            {
+                let mut w = self.sup.active_writer.lock().unwrap_or_else(|e| e.into_inner());
+                if matches!(*w, WriterEndpoint::Transferring) {
+                    *w = WriterEndpoint::Legacy {
+                        control_stop: self.saved_legacy_stop.take(),
+                        safe_hold: Arc::clone(&self.sup.legacy_safe_hold),
+                    };
                 }
             }
             self.sup.try_drain_pending_disconnects_legacy();
@@ -12651,7 +12675,14 @@ impl Drop for ArmSupervisor {
     fn drop(&mut self) {
         // DRV-F1 B2: NEVER destroy an energized or unconfirmed Legacy driver on Drop.
         // If this Legacy shell still holds a non-disarmed driver, extract it and hand it to a
-        // detached SAFE-HOLD writer thread.
+        // detached SAFE-HOLD writer thread; if spawning fails, retain sole ownership and run
+        // SAFE-HOLD inline (NEVER dropping an energized driver inside a failed spawn closure).
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut extracted_for_drop: Option<(
+            Box<dyn crate::driver::ArmDriver>,
+            crate::rt_core::safe_hold::SafeHoldBuffers,
+            crate::torque::shadow::ShadowRuntime,
+        )> = None;
         #[cfg(not(target_arch = "wasm32"))]
         if self.owner_mode.load(Ordering::Acquire) == OWNER_LEGACY
             && !self.process_exit_requested.load(Ordering::Acquire)
@@ -12679,37 +12710,99 @@ impl Drop for ArmSupervisor {
                         .driver
                         .take()
                         .map(crate::supervisor_lock::DriverSlot::into_driver_recover_for_safe_hold);
-                    let mut extracted_shadow = {
+                    let extracted_shadow = {
                         let disabled =
                             crate::torque::shadow::ShadowRuntime::disabled(&guard.config);
                         std::mem::replace(&mut guard.torque_shadow, disabled)
                     };
-                    if let Some(mut drv) = extracted {
+                    if let Some(drv) = extracted {
                         guard.detached = true;
-                        let sh_ctrl = Arc::clone(&self.legacy_safe_hold);
-                        let spawn_res = std::thread::Builder::new()
-                            .name("armd-safe-hold-drop".into())
-                            .spawn(move || {
-                                let _ = safe_hold_bufs.run_loop_with_shadow(
-                                    drv.as_mut(),
-                                    &sh_ctrl,
-                                    crate::rt_core::safe_hold::SafeHoldReason::TeardownWhileEnergized,
-                                    Instant::now,
-                                    std::thread::sleep,
-                                    Some(&mut extracted_shadow),
-                                );
-                                drop(drv);
-                            });
-                        if let Err(e) = spawn_res {
-                            tracing::error!(
-                                "Failed to spawn SAFE-HOLD retention thread on ArmSupervisor::drop: {e}"
-                            );
+                        {
+                            let mut slot = self.owner.lock().unwrap_or_else(|e| e.into_inner());
+                            *slot = OwnerSlot::Failed;
+                            self.owner_mode.store(OWNER_FAILED, Ordering::Release);
                         }
+                        {
+                            let mut w = self.active_writer.lock().unwrap_or_else(|e| e.into_inner());
+                            *w = WriterEndpoint::DetachedSafeHold {
+                                safe_hold: Arc::clone(&self.legacy_safe_hold),
+                                control_stop: Arc::new(AtomicBool::new(true)),
+                            };
+                        }
+                        extracted_for_drop = Some((drv, safe_hold_bufs, extracted_shadow));
                     }
                 }
             }
         }
         self.hub.close();
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some((drv, safe_hold_bufs, extracted_shadow)) = extracted_for_drop {
+            let sh_ctrl = Arc::clone(&self.legacy_safe_hold);
+            // Store the energized driver in a shared slot BEFORE calling `Builder::spawn` so a
+            // spawn error NEVER drops the closure's captured driver.
+            let handoff = Arc::new(std::sync::Mutex::new(Some((
+                drv,
+                safe_hold_bufs,
+                extracted_shadow,
+            ))));
+            let handoff_thread = Arc::clone(&handoff);
+            let sh_thread = Arc::clone(&sh_ctrl);
+            let spawn_res = if self.fail_drop_safe_hold_spawn.load(Ordering::Acquire) {
+                Err(std::io::Error::other(
+                    "injected SAFE-HOLD retention thread spawn failure",
+                ))
+            } else {
+                std::thread::Builder::new()
+                    .name("armd-safe-hold-drop".into())
+                    .spawn(move || {
+                        let Some((mut drv, mut safe_hold_bufs, mut extracted_shadow)) =
+                            handoff_thread.lock().unwrap_or_else(|e| e.into_inner()).take()
+                        else {
+                            return;
+                        };
+                        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let _ = safe_hold_bufs.run_loop_with_shadow(
+                                drv.as_mut(),
+                                &sh_thread,
+                                crate::rt_core::safe_hold::SafeHoldReason::TeardownWhileEnergized,
+                                Instant::now,
+                                std::thread::sleep,
+                                Some(&mut extracted_shadow),
+                            );
+                        }));
+                        if res.is_err() {
+                            // Never drop an energized driver on unexpected unwind.
+                            std::mem::forget(drv);
+                        } else {
+                            drop(drv);
+                        }
+                    })
+            };
+            if let Err(e) = spawn_res {
+                tracing::error!(
+                    "Failed to spawn SAFE-HOLD retention thread on ArmSupervisor::drop ({e}); retaining driver in inline SAFE-HOLD"
+                );
+                if let Some((mut drv, mut safe_hold_bufs, mut extracted_shadow)) =
+                    handoff.lock().unwrap_or_else(|e| e.into_inner()).take()
+                {
+                    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let _ = safe_hold_bufs.run_loop_with_shadow(
+                            drv.as_mut(),
+                            &sh_ctrl,
+                            crate::rt_core::safe_hold::SafeHoldReason::TeardownWhileEnergized,
+                            Instant::now,
+                            std::thread::sleep,
+                            Some(&mut extracted_shadow),
+                        );
+                    }));
+                    if res.is_err() {
+                        std::mem::forget(drv);
+                    } else {
+                        drop(drv);
+                    }
+                }
+            }
+        }
         #[cfg(not(target_arch = "wasm32"))]
         self.torque_shadow
             .stop_and_flush_bounded(Duration::from_millis(50));
@@ -12946,7 +13039,15 @@ impl ArmSupervisor {
                 safe_hold: legacy_safe_hold,
             }),
             process_exit_requested: AtomicBool::new(false),
+            #[cfg(not(target_arch = "wasm32"))]
+            fail_drop_safe_hold_spawn: AtomicBool::new(false),
         }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[doc(hidden)]
+    pub fn set_fail_drop_safe_hold_spawn_for_test(&self, fail: bool) {
+        self.fail_drop_safe_hold_spawn.store(fail, Ordering::Release);
     }
 
     pub fn internal_fault_lane(&self) -> &Arc<crate::panic_coord::InternalFaultLane> {
@@ -12993,6 +13094,7 @@ impl ArmSupervisor {
             WriterEndpoint::Legacy { safe_hold, .. } => {
                 safe_hold.is_active() && !safe_hold.is_exited()
             }
+            WriterEndpoint::Transferring => false,
         }
     }
 
@@ -13010,6 +13112,7 @@ impl ArmSupervisor {
             WriterEndpoint::Legacy { safe_hold, .. } => {
                 safe_hold.is_active() && !safe_hold.is_exited()
             }
+            WriterEndpoint::Transferring => false,
         }
     }
 
@@ -13019,6 +13122,7 @@ impl ArmSupervisor {
             WriterEndpoint::DetachedSafeHold { safe_hold, .. } => safe_hold,
             WriterEndpoint::Executor(h) => h.safe_hold_control(),
             WriterEndpoint::Legacy { safe_hold, .. } => safe_hold,
+            WriterEndpoint::Transferring => Arc::clone(&self.legacy_safe_hold),
         }
     }
 
@@ -13653,7 +13757,7 @@ impl ArmSupervisor {
         hooks: crate::rt_core::executor::PersistTestHooks,
     ) -> Result<crate::rt_core::executor::RtExecutorHandle, ArmError> {
         self.ensure_dispatcher()?;
-        {
+        let saved_legacy_stop = {
             let mut slot = self.owner.lock().unwrap_or_else(|e| e.into_inner());
             if !matches!(*slot, OwnerSlot::Legacy) {
                 return Err(ArmError::Rejected {
@@ -13664,17 +13768,39 @@ impl ArmSupervisor {
             }
             *slot = OwnerSlot::Transferring;
             self.owner_mode.store(OWNER_TRANSFERRING, Ordering::Release);
-        }
-        let mut rollback = TransferGuard { sup: self, armed: true };
+            let mut w = self.active_writer.lock().unwrap_or_else(|e| e.into_inner());
+            let prev_stop = match &*w {
+                WriterEndpoint::Legacy { control_stop, .. } => control_stop.clone(),
+                _ => None,
+            };
+            *w = WriterEndpoint::Transferring;
+            prev_stop
+        };
+        let mut rollback = TransferGuard {
+            sup: self,
+            armed: true,
+            saved_legacy_stop,
+        };
 
         // The single `.await` point in handoff: if cancelled here, `TransferGuard` rolls back to `Legacy`.
         let mut guard = self.inner.write().await;
 
         let restore_legacy = |rollback: &mut TransferGuard<'_>| {
-            let mut slot = self.owner.lock().unwrap_or_else(|e| e.into_inner());
-            if matches!(*slot, OwnerSlot::Transferring) {
-                *slot = OwnerSlot::Legacy;
-                self.owner_mode.store(OWNER_LEGACY, Ordering::Release);
+            {
+                let mut slot = self.owner.lock().unwrap_or_else(|e| e.into_inner());
+                if matches!(*slot, OwnerSlot::Transferring) {
+                    *slot = OwnerSlot::Legacy;
+                    self.owner_mode.store(OWNER_LEGACY, Ordering::Release);
+                }
+            }
+            {
+                let mut w = self.active_writer.lock().unwrap_or_else(|e| e.into_inner());
+                if matches!(*w, WriterEndpoint::Transferring) {
+                    *w = WriterEndpoint::Legacy {
+                        control_stop: rollback.saved_legacy_stop.take(),
+                        safe_hold: Arc::clone(&self.legacy_safe_hold),
+                    };
+                }
             }
             rollback.armed = false;
         };
@@ -13972,6 +14098,19 @@ impl ArmSupervisor {
                     let mut slot = self.owner.lock().unwrap_or_else(|e| e.into_inner());
                     *slot = OwnerSlot::Failed;
                     self.owner_mode.store(OWNER_FAILED, Ordering::Release);
+                }
+                {
+                    // `Fatal` only fires after `armd-control` confirmed disarmed/driverless and
+                    // dropped `core`; publish a terminal exited endpoint so `active_writer` does
+                    // not remain stuck in `Transferring`.
+                    let exited_sh = Arc::new(crate::rt_core::safe_hold::SafeHoldControl::new());
+                    exited_sh.record_process_exit_outcome_lockfree(&PanicDisableOutcome::NoDriver);
+                    exited_sh.mark_exited();
+                    let mut w = self.active_writer.lock().unwrap_or_else(|e| e.into_inner());
+                    *w = WriterEndpoint::DetachedSafeHold {
+                        safe_hold: exited_sh,
+                        control_stop: Arc::new(AtomicBool::new(true)),
+                    };
                 }
                 rollback.armed = false;
                 drop(guard);
@@ -17179,24 +17318,33 @@ impl ArmSupervisor {
     /// Bounded legacy `DisableProtective { ProcessExit }` helper. Requires explicit owner-bound
     /// `ProcessExit` authorization (`emergency_process_exit_disable_until`, `shutdown_committed`,
     /// or `authorize_process_exit_for_test`) so ad-hoc callers cannot issue a protective cut
-    /// outside process exit (DRV-F1 B7).
+    /// outside process exit (DRV-F1 B7). Never returns `NoDriver` from a detached shell.
     pub fn attempt_legacy_panic_disable(&self, timeout: Duration) -> PanicDisableOutcome {
+        match self.attempt_legacy_panic_disable_step(timeout) {
+            LegacyPanicDisableStep::Outcome(outcome) => outcome,
+            LegacyPanicDisableStep::Detached => PanicDisableOutcome::Failed(
+                "legacy supervisor shell is detached; active writer owns driver".into(),
+            ),
+        }
+    }
+
+    fn attempt_legacy_panic_disable_step(&self, timeout: Duration) -> LegacyPanicDisableStep {
         let exit_authorized = self.process_exit_requested.load(Ordering::Acquire)
             || self
                 .inner
                 .try_read()
                 .is_ok_and(|g| !g.detached && g.shutdown_committed);
         if !exit_authorized {
-            return PanicDisableOutcome::Failed(
+            return LegacyPanicDisableStep::Outcome(PanicDisableOutcome::Failed(
                 "legacy protective disable requires explicit ProcessExit authorization".into(),
-            );
+            ));
         }
         self.estop_state.request_and_latch();
         let run_inline = |inner: Arc<SupervisorLock<SupervisorInner>>,
                           coop_deadline: Instant,
                           hard_deadline: Instant,
                           coop_budget: Duration|
-         -> PanicDisableOutcome {
+         -> LegacyPanicDisableStep {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut guard = loop {
                     if let Ok(g) = inner.try_write() {
@@ -17204,19 +17352,29 @@ impl ArmSupervisor {
                     }
                     let rem = hard_deadline.saturating_duration_since(Instant::now());
                     if rem.is_zero() {
-                        return PanicDisableOutcome::TimedOut;
+                        return LegacyPanicDisableStep::Outcome(PanicDisableOutcome::TimedOut);
                     }
                     std::thread::sleep(rem.min(Duration::from_millis(2)));
                 };
                 if guard.detached {
-                    return PanicDisableOutcome::NoDriver;
+                    // Ownership moved out of the Legacy shell (to Executor or DetachedSafeHold);
+                    // NEVER falsely report `NoDriver` from the detached shell.
+                    return LegacyPanicDisableStep::Detached;
                 }
                 if Instant::now() >= hard_deadline {
-                    return PanicDisableOutcome::TimedOut;
+                    return LegacyPanicDisableStep::Outcome(PanicDisableOutcome::TimedOut);
                 }
-                guard.attempt_panic_disable_until(coop_deadline, hard_deadline, coop_budget)
+                LegacyPanicDisableStep::Outcome(guard.attempt_panic_disable_until(
+                    coop_deadline,
+                    hard_deadline,
+                    coop_budget,
+                ))
             }))
-            .unwrap_or_else(|_| PanicDisableOutcome::Failed("panic during legacy panic-disable".into()))
+            .unwrap_or_else(|_| {
+                LegacyPanicDisableStep::Outcome(PanicDisableOutcome::Failed(
+                    "panic during legacy panic-disable".into(),
+                ))
+            })
         };
 
         let origin = Instant::now();
@@ -17229,39 +17387,48 @@ impl ArmSupervisor {
             match std::thread::Builder::new()
                 .name("armd-panic-disable".into())
                 .spawn(move || {
-                    let (outcome, done_at) = {
+                    let (step, done_at) = {
                         let res = run_inline(inner.clone(), coop_deadline, hard_deadline, coop_budget);
                         (res, Instant::now())
                     };
                     // Seal and deliver the live outcome FIRST before touching shadow recording.
-                    let _ = tx.send((outcome.clone(), done_at));
-                    if let Ok(mut g) = inner.try_write() {
-                        if !g.detached {
-                            g.record_post_panic_disable_shadow(true, &outcome);
+                    let _ = tx.send((step.clone(), done_at));
+                    if let LegacyPanicDisableStep::Outcome(outcome) = step {
+                        if let Ok(mut g) = inner.try_write() {
+                            if !g.detached {
+                                g.record_post_panic_disable_shadow(true, &outcome);
+                            }
                         }
                     }
                 }) {
                 Ok(_) => {
                     let wait = hard_deadline.saturating_duration_since(Instant::now());
                     match rx.recv_timeout(wait) {
-                        Ok((outcome, completed_at)) if completed_at < hard_deadline => outcome,
-                        Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => PanicDisableOutcome::TimedOut,
+                        Ok((step, completed_at)) if completed_at < hard_deadline => step,
+                        Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            LegacyPanicDisableStep::Outcome(PanicDisableOutcome::TimedOut)
+                        }
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                            PanicDisableOutcome::Failed("panic-disable helper thread disconnected".into())
+                            LegacyPanicDisableStep::Outcome(PanicDisableOutcome::Failed(
+                                "panic-disable helper thread disconnected".into(),
+                            ))
                         }
                     }
                 }
                 Err(e) => {
                     // Never fall back to an unbounded inline driver call when the bounded
-                    // helper thread cannot be spawned; only confirm NoDriver via non-blocking try_write.
+                    // helper thread cannot be spawned; only confirm NoDriver when NOT detached.
                     if let Ok(guard) = self.inner.try_write() {
-                        if guard.detached || guard.driver.is_none() {
-                            return PanicDisableOutcome::NoDriver;
+                        if guard.detached {
+                            return LegacyPanicDisableStep::Detached;
+                        }
+                        if guard.driver.is_none() {
+                            return LegacyPanicDisableStep::Outcome(PanicDisableOutcome::NoDriver);
                         }
                     }
-                    PanicDisableOutcome::Failed(format!(
+                    LegacyPanicDisableStep::Outcome(PanicDisableOutcome::Failed(format!(
                         "failed to spawn bounded panic-disable helper thread: {e}"
-                    ))
+                    )))
                 }
             }
         }
@@ -17326,6 +17493,8 @@ impl ArmSupervisor {
 
     /// Deliberate process-exit protective disable routed through the authoritative active writer
     /// endpoint (`Executor`, `Legacy`, or `DetachedSafeHold`) under ONE absolute `deadline` (B3/B4/B11).
+    /// Waits across `WriterEndpoint::Transferring` and re-resolves if the Legacy shell was detached
+    /// during extraction or an Executor handback completed concurrently.
     pub async fn emergency_process_exit_disable_until(
         self: &Arc<Self>,
         deadline: Instant,
@@ -17333,8 +17502,19 @@ impl ArmSupervisor {
         self.process_exit_requested.store(true, Ordering::Release);
         self.estop_state.latch();
         self.internal_fault_lane.latch_control_safe_hold_fence();
-        for _attempt in 0..2 {
+        loop {
+            let rem = deadline.saturating_duration_since(Instant::now());
+            if rem.is_zero() {
+                return PanicDisableOutcome::TimedOut;
+            }
             match self.active_writer_endpoint() {
+                WriterEndpoint::Transferring => {
+                    // Ownership extraction/transfer is in progress; wait for the authoritative
+                    // endpoint (`Executor`, `DetachedSafeHold`, or rolled-back `Legacy`) rather
+                    // than selecting Legacy or touching the detached shell.
+                    tokio::time::sleep(rem.min(Duration::from_millis(2))).await;
+                    continue;
+                }
                 WriterEndpoint::DetachedSafeHold {
                     safe_hold,
                     control_stop,
@@ -17378,16 +17558,25 @@ impl ArmSupervisor {
                         .unwrap_or_else(|je| PanicDisableOutcome::Failed(je.to_string()));
                     }
                     let sup = Arc::clone(self);
-                    return tokio::task::spawn_blocking(move || {
+                    let step = tokio::task::spawn_blocking(move || {
                         let rem = deadline.saturating_duration_since(Instant::now());
-                        sup.attempt_legacy_panic_disable(rem)
+                        sup.attempt_legacy_panic_disable_step(rem)
                     })
                     .await
-                    .unwrap_or_else(|je| PanicDisableOutcome::Failed(je.to_string()));
+                    .map_err(|je| PanicDisableOutcome::Failed(je.to_string()));
+                    match step {
+                        Ok(LegacyPanicDisableStep::Outcome(outcome)) => return outcome,
+                        Ok(LegacyPanicDisableStep::Detached) => {
+                            // Shell was detached by a concurrent extraction into `Executor` or
+                            // `DetachedSafeHold`: re-resolve the authoritative writer endpoint.
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                            continue;
+                        }
+                        Err(outcome) => return outcome,
+                    }
                 }
             }
         }
-        PanicDisableOutcome::TimedOut
     }
 
     pub async fn is_at_safe_resting_pose(&self) -> bool {

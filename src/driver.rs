@@ -16333,8 +16333,11 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             self.panic_disable_tx_boundary.fill(None);
             self.panic_disable_confirmed.fill(false);
 
-            // Drain any pre-disable RX frames before sending CMD_DISABLE so buffered stale
-            // `state == 0` frames are consumed prior to capturing each axis's causal TX boundary.
+            // Fence any undrained pre-disable RX frames BEFORE draining so stale `state == 0`
+            // frames still sitting in the queue are discarded rather than updating `motor_status`
+            // or `enable_state`, while reaching an empty queue clears `awaiting_rx_boundary`
+            // prior to capturing each axis's causal TX boundary.
+            self.awaiting_rx_boundary = !self.last_read_drained;
             self.last_poll_rx = None;
             self.rx_deadline = Some(deadline);
             self.rx_frame_limit = Some(64);

@@ -2015,3 +2015,411 @@ async fn drv_f1_blocker2_energized_handback_rejects_stale_or_unverified_hold_cov
         assert_eq!(outcome, PanicDisableOutcome::Confirmed);
     }
 }
+
+/// Shared drop-tracking wrapper around `DamiaoArmDriver<FakeBus>` for Blocker 3 ownership tests.
+struct DropWatchDamiaoDriver {
+    inner: DamiaoArmDriver<FakeBus>,
+    dropped: Arc<AtomicBool>,
+}
+
+impl Drop for DropWatchDamiaoDriver {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::Release);
+    }
+}
+
+impl ArmDriver for DropWatchDamiaoDriver {
+    fn capabilities(&self) -> DriverCapabilities { self.inner.capabilities() }
+    fn enable_state(&self) -> EnableState { self.inner.enable_state() }
+    fn is_hardware_disarmed_confirmed(&self) -> bool { self.inner.is_hardware_disarmed_confirmed() }
+    fn has_driver_fresh_position_api(&self) -> bool { self.inner.has_driver_fresh_position_api() }
+    fn fresh_measured_position_for(&self, joint: usize, max_age: Duration) -> Option<f32> {
+        self.inner.fresh_measured_position_for(joint, max_age)
+    }
+    fn fresh_measured_sample_for(&self, joint: usize, max_age: Duration) -> Option<(f32, u64)> {
+        self.inner.fresh_measured_sample_for(joint, max_age)
+    }
+    fn joint_hold_mode_verified(&self, joint: usize) -> bool {
+        self.inner.joint_hold_mode_verified(joint)
+    }
+    fn is_feedback_valid(&self) -> bool { self.inner.is_feedback_valid() }
+    fn is_enabled(&self) -> bool { self.inner.is_enabled() }
+    fn has_any_joint_enabled(&self) -> bool { self.inner.has_any_joint_enabled() }
+    fn has_known_partial_enable(&self) -> bool { self.inner.has_known_partial_enable() }
+    fn torque_transition_pending(&self) -> bool { self.inner.torque_transition_pending() }
+    fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) { self.inner.feedback_ages_into(out) }
+    fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool {
+        self.inner.feedback_all_within(dof, max_age)
+    }
+    fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+        self.inner.read_joint_states()
+    }
+    fn read_joint_states_budgeted(
+        &mut self,
+        out: &mut Vec<JointState>,
+        deadline: Instant,
+        max_rx_frames: u16,
+    ) -> Result<(u16, bool), ArmDriverError> {
+        self.inner.read_joint_states_budgeted(out, deadline, max_rx_frames)
+    }
+    fn read_joint_states_safe_hold(
+        &mut self,
+        out: &mut Vec<JointState>,
+        deadline: Instant,
+        max_rx_frames: u16,
+    ) -> Result<(u16, bool), ArmDriverError> {
+        self.inner.read_joint_states_safe_hold(out, deadline, max_rx_frames)
+    }
+    fn read_cached_joint_states_into(&self, out: &mut Vec<JointState>) -> Option<()> {
+        self.inner.read_cached_joint_states_into(out)
+    }
+    fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
+        self.inner.write_joint_targets(targets)
+    }
+    fn write_joint_targets_bounded(
+        &mut self,
+        targets: &[JointTarget],
+    ) -> Result<armd::driver::TxBatchOutcome, ArmDriverError> {
+        self.inner.write_joint_targets_bounded(targets)
+    }
+    fn write_measured_hold_masked(
+        &mut self,
+        hold_mask: u64,
+        targets: &[JointTarget],
+    ) -> Result<HoldPassReport, ArmDriverError> {
+        self.inner.write_measured_hold_masked(hold_mask, targets)
+    }
+    fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> {
+        self.inner.set_torque(enabled)
+    }
+    fn begin_torque(&mut self, enabled: bool) -> Result<TorqueProgress, ArmDriverError> {
+        self.inner.begin_torque(enabled)
+    }
+    fn poll_torque(&mut self, deadline: Instant) -> Result<TorqueProgress, ArmDriverError> {
+        self.inner.poll_torque(deadline)
+    }
+    fn begin_torque_budgeted(
+        &mut self,
+        enabled: bool,
+        max_rx_frames: u16,
+    ) -> Result<TorqueProgress, ArmDriverError> {
+        self.inner.begin_torque_budgeted(enabled, max_rx_frames)
+    }
+    fn poll_torque_budgeted(
+        &mut self,
+        deadline: Instant,
+        max_rx_frames: u16,
+    ) -> Result<TorqueProgress, ArmDriverError> {
+        self.inner.poll_torque_budgeted(deadline, max_rx_frames)
+    }
+    fn panic_disable_step(
+        &mut self,
+        first: bool,
+        deadline: Instant,
+    ) -> Option<Result<Vec<usize>, ArmDriverError>> {
+        self.inner.panic_disable_step(first, deadline)
+    }
+    fn unconfirmed_disable_joints(&self) -> Vec<usize> {
+        self.inner.unconfirmed_disable_joints()
+    }
+    fn supports_rt_executor(&self) -> Result<(), &'static str> {
+        self.inner.supports_rt_executor()
+    }
+    fn set_rt_mode(&mut self, rt: bool) { self.inner.set_rt_mode(rt) }
+    fn set_tx_release_deadline(&mut self, deadline: Option<Instant>) {
+        self.inner.set_tx_release_deadline(deadline)
+    }
+    fn set_estop_state(&mut self, state: Arc<armd::rt_core::urgent::EstopState>) {
+        self.inner.set_estop_state(state)
+    }
+    fn set_estop_gate(&mut self, gate: armd::rt_core::urgent::EstopGate) {
+        self.inner.set_estop_gate(gate)
+    }
+    fn prepare_safe_hold(&mut self) { self.inner.prepare_safe_hold() }
+    fn clock_now(&self) -> Instant { self.inner.clock_now() }
+    fn clock_pause(&self, d: Duration) { self.inner.clock_pause(d) }
+    fn position_limits(&self, joint: usize) -> Option<(f32, f32)> {
+        self.inner.position_limits(joint)
+    }
+}
+
+fn make_watched_energized_sup(q_init: [f32; 7]) -> (Arc<ArmSupervisor>, FakeBus, Arc<AtomicBool>) {
+    let limits = dm_limits();
+    let bus = FakeBus::new(&limits, q_init, None);
+    let dropped = Arc::new(AtomicBool::new(false));
+    let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(limits)
+        .unwrap();
+    bus.with(|s| s.push_all_feedback());
+    let _ = drv.read_joint_states().unwrap();
+    bus.with(|s| s.push_all_feedback());
+    let _ = drv.read_joint_states().unwrap();
+    drv.check_mapping_ranges();
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(
+        DropWatchDamiaoDriver {
+            inner: drv,
+            dropped: Arc::clone(&dropped),
+        },
+    )));
+    (sup, bus, dropped)
+}
+
+/// Blocker 3A regression (spawn-failure fault injection):
+/// When `ArmSupervisor::drop` fails to spawn the SAFE-HOLD retention thread while holding an
+/// energized Legacy driver, the driver MUST NOT be dropped; ownership is retained in inline
+/// SAFE-HOLD until deliberate `ProcessExit` confirms physical disarm.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drv_f1_blocker3_legacy_drop_spawn_failure_retains_driver_in_safe_hold() {
+    let (sup, bus, dropped) = make_watched_energized_sup([0.35, -0.25, 0.45, 0.15, -0.15, 0.05, 0.0]);
+    sup.set_lease_enabled(false).await;
+    sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
+    sup.set_fail_drop_safe_hold_spawn_for_test(true);
+    let sh = sup.legacy_safe_hold_control();
+    bus.with(|s| s.tx_log.clear());
+
+    let drop_jh = thread::spawn(move || {
+        drop(sup);
+    });
+
+    wait_until_async(
+        Duration::from_secs(2),
+        "inline SAFE-HOLD active after drop spawn failure",
+        || sh.is_active() && sh.ticks() >= 2 && sh.hold_tx_count() >= 1,
+    )
+    .await;
+    assert!(
+        !dropped.load(Ordering::Acquire),
+        "spawn failure on ArmSupervisor::drop MUST NOT drop an energized driver"
+    );
+    let disables = bus.with(|s| {
+        s.tx_log
+            .iter()
+            .filter(|f| f.data == damiao::CMD_DISABLE)
+            .count()
+    });
+    assert_eq!(disables, 0, "inline SAFE-HOLD must emit 0 CMD_DISABLE before ProcessExit");
+
+    // Deliberate ProcessExit confirms physical disarm and releases the driver cleanly.
+    let dl = Instant::now() + Duration::from_secs(2);
+    sh.request_process_exit_disable(dl);
+    let outcome = tokio::task::spawn_blocking(move || sh.wait_process_exit_until(dl))
+        .await
+        .unwrap();
+    assert_eq!(outcome, PanicDisableOutcome::Confirmed);
+    drop_jh.join().unwrap();
+    assert!(dropped.load(Ordering::Acquire));
+}
+
+/// Blocker 3B regression (outer-unwind fault injection):
+/// Panics in BOTH executor startup setup (before `init_res`) AND release-tail work (after
+/// `diag_tx.push` and tail allocation accounting) must be caught by the outer unwind boundary
+/// while retaining sole driver ownership in SAFE-HOLD (never dropping an energized driver).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drv_f1_blocker3_executor_outer_unwind_startup_setup_and_release_tail_retains_driver() {
+    // Part A: Panic in executor startup setup (outside `init_res`).
+    {
+        let (sup, bus, dropped) =
+            make_watched_energized_sup([0.30, -0.20, 0.40, 0.10, -0.10, 0.05, 0.0]);
+        sup.set_lease_enabled(false).await;
+        sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
+        bus.with(|s| s.tx_log.clear());
+
+        let mut cfg = ExecutorConfig::for_tests(Duration::from_millis(5));
+        cfg.panic_policy = PanicPolicy::StopExecutor;
+        let res = sup
+            .start_executor_with_hooks(
+                cfg,
+                PersistTestHooks {
+                    panic_in_startup_setup: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(res.is_err(), "startup setup panic must fail start_executor");
+        assert!(
+            sup.has_detached_safe_hold(),
+            "startup setup panic with energized driver must publish DetachedSafeHold"
+        );
+        wait_until_async(
+            Duration::from_secs(2),
+            "startup setup outer unwind entered SAFE-HOLD",
+            || {
+                sup.is_detached_safe_hold_active()
+                    && sup.active_safe_hold_control().hold_tx_count() >= 1
+            },
+        )
+        .await;
+        assert!(
+            !dropped.load(Ordering::Acquire),
+            "startup setup outer unwind MUST NOT drop an energized driver"
+        );
+        let disables = bus.with(|s| {
+            s.tx_log
+                .iter()
+                .filter(|f| f.data == damiao::CMD_DISABLE)
+                .count()
+        });
+        assert_eq!(disables, 0);
+
+        let outcome = sup
+            .emergency_process_exit_disable_until(Instant::now() + Duration::from_secs(2))
+            .await;
+        assert_eq!(outcome, PanicDisableOutcome::Confirmed);
+        wait_until_async(Duration::from_secs(2), "driver dropped after ProcessExit", || {
+            dropped.load(Ordering::Acquire)
+        })
+        .await;
+    }
+
+    // Part B: Panic in executor release-tail work (after `diag_tx.push` and tail alloc accounting).
+    {
+        let (sup, bus, dropped) =
+            make_watched_energized_sup([0.25, -0.35, 0.30, 0.15, -0.05, 0.20, 0.0]);
+        sup.set_lease_enabled(false).await;
+        sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
+        let tail_panic = Arc::new(AtomicBool::new(false));
+
+        let mut cfg = ExecutorConfig::for_tests(Duration::from_millis(5));
+        cfg.panic_policy = PanicPolicy::StopExecutor;
+        let handle = sup
+            .start_executor_with_hooks(
+                cfg,
+                PersistTestHooks {
+                    panic_in_release_tail_once: Some(Arc::clone(&tail_panic)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        wait_until_async(Duration::from_secs(2), "executor running before tail panic", || {
+            handle.stats().steps.load(Ordering::Relaxed) >= 3
+        })
+        .await;
+
+        bus.with(|s| s.tx_log.clear());
+        tail_panic.store(true, Ordering::Release);
+
+        wait_until_async(
+            Duration::from_secs(2),
+            "release-tail outer unwind entered SAFE-HOLD",
+            || {
+                handle.is_in_safe_hold()
+                    && handle.safe_hold_control().ticks() >= 2
+                    && handle.safe_hold_control().hold_tx_count() >= 1
+            },
+        )
+        .await;
+        assert_eq!(
+            handle.safe_hold_control().reason(),
+            SafeHoldReason::ControlPanic
+        );
+        assert!(
+            !dropped.load(Ordering::Acquire),
+            "release-tail outer unwind MUST NOT drop an energized driver"
+        );
+        let disables = bus.with(|s| {
+            s.tx_log
+                .iter()
+                .filter(|f| f.data == damiao::CMD_DISABLE)
+                .count()
+        });
+        assert_eq!(disables, 0);
+
+        let outcome = sup
+            .emergency_process_exit_disable_until(Instant::now() + Duration::from_secs(2))
+            .await;
+        assert_eq!(outcome, PanicDisableOutcome::Confirmed);
+        wait_until_async(Duration::from_secs(2), "driver dropped after ProcessExit", || {
+            dropped.load(Ordering::Acquire)
+        })
+        .await;
+    }
+}
+
+/// Blocker 3C regression (writer-transition fault injection):
+/// During `start_executor` ownership transfer/extraction:
+/// 1. `active_writer_endpoint()` is `WriterEndpoint::Transferring` (never `Legacy`).
+/// 2. Direct `attempt_legacy_panic_disable()` against the detached shell NEVER returns `NoDriver`.
+/// 3. Concurrent `emergency_process_exit_disable_until()` waits across `Transferring` and routes
+///    to the authoritative writer to confirm physical disable across all 7 motors.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drv_f1_blocker3_process_exit_writer_transition_never_selects_legacy_or_returns_no_driver() {
+    let (sup, bus, _dropped) =
+        make_watched_energized_sup([0.40, -0.20, 0.30, 0.10, -0.10, 0.15, 0.0]);
+    sup.set_lease_enabled(false).await;
+    sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
+
+    let pause_gate = Arc::new((AtomicBool::new(false), Mutex::new(false), Condvar::new()));
+    let sup_start = Arc::clone(&sup);
+    let gate_start = Arc::clone(&pause_gate);
+    let start_task = tokio::spawn(async move {
+        let mut cfg = ExecutorConfig::for_tests(Duration::from_millis(5));
+        cfg.panic_policy = PanicPolicy::StopExecutor;
+        sup_start
+            .start_executor_with_hooks(
+                cfg,
+                PersistTestHooks {
+                    pause_in_startup_init: Some(gate_start),
+                    ..Default::default()
+                },
+            )
+            .await
+    });
+
+    // Wait until `core` has been extracted into `armd-control` (detached shell in `sup.inner`).
+    wait_until_async(Duration::from_secs(2), "paused inside startup init", || {
+        pause_gate.0.load(Ordering::Acquire)
+    })
+    .await;
+
+    assert!(
+        matches!(
+            sup.active_writer_endpoint(),
+            armd::supervisor::WriterEndpoint::Transferring
+        ),
+        "active_writer_endpoint must be Transferring during extraction, not Legacy"
+    );
+
+    // Launch ProcessExit concurrently while transfer is in progress.
+    let sup_pe = Arc::clone(&sup);
+    let pe_task = tokio::spawn(async move {
+        sup_pe
+            .emergency_process_exit_disable_until(Instant::now() + Duration::from_secs(3))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(
+        !pe_task.is_finished(),
+        "ProcessExit must wait across Transferring rather than returning NoDriver from the detached shell"
+    );
+
+    // Release startup init pause -> executor activates -> ProcessExit routes to Executor & confirms!
+    {
+        let mut open = pause_gate.1.lock().unwrap();
+        *open = true;
+        pause_gate.2.notify_all();
+    }
+    let start_res = start_task.await.unwrap();
+    if let Err(e) = &start_res {
+        panic!("start_executor should settle cleanly: {e}");
+    }
+
+    let outcome = pe_task.await.unwrap();
+    assert_eq!(
+        outcome,
+        PanicDisableOutcome::Confirmed,
+        "ProcessExit across writer transition must confirm physical disarm"
+    );
+    assert!(
+        bus.with(|s| s.motors.iter().all(|m| !m.enabled)),
+        "all 7 motors must be physically disabled"
+    );
+
+    // Direct legacy panic-disable against the now-detached shell must NEVER return NoDriver.
+    sup.authorize_process_exit_for_test();
+    let direct_detached = sup.attempt_legacy_panic_disable(Duration::from_millis(80));
+    assert!(
+        !matches!(direct_detached, PanicDisableOutcome::NoDriver),
+        "attempt_legacy_panic_disable must NEVER return NoDriver from a detached shell; got {direct_detached:?}"
+    );
+}

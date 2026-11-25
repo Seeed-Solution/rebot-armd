@@ -376,8 +376,9 @@ where
     // startup `executor_handle` once handback switched ownership to Legacy — DRV-F1 B3).
     let active = supervisor.active_writer_endpoint();
     match active {
-        armd::supervisor::WriterEndpoint::DetachedSafeHold { .. } => {
-            error!("Final shutdown with detached SAFE-HOLD writer: issuing deliberate ProcessExit protective disable");
+        armd::supervisor::WriterEndpoint::DetachedSafeHold { .. }
+        | armd::supervisor::WriterEndpoint::Transferring => {
+            error!("Final shutdown with detached SAFE-HOLD or transferring writer: issuing deliberate ProcessExit protective disable");
             server_handle.abort();
             let outcome = supervisor.emergency_process_exit_disable_until(deadline).await;
             outcome.log(
