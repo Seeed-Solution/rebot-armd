@@ -609,6 +609,9 @@ pub trait CoreOps {
     ) -> Result<(), Refusal> {
         self.consume_target(frame, ctx)
     }
+    /// Brakes a live policy run in place when a queued chunked slot is refused because RT
+    /// already refused an earlier slot (`expected_refusal_gen` mismatch; zero alloc).
+    fn on_policy_refusal_cascade(&mut self, _frame: &TargetFrame) {}
     /// Applies any pending urgent E-stop request; returns true when an E-stop was applied.
     fn apply_estop(&mut self) -> bool { false }
     /// Synchronizes any non-blocking socket-close lease fence (lock-free, zero allocations)
@@ -1405,6 +1408,10 @@ impl CoreOps for SupervisorInner {
         self.consume_target_frame_with_validity(frame, validity, ctx)
     }
 
+    fn on_policy_refusal_cascade(&mut self, frame: &TargetFrame) {
+        self.policy_target_refused("POLICY_REVOKED", frame);
+    }
+
     fn apply_estop(&mut self) -> bool { self.consume_pending_estop() }
 
     fn sync_disconnect_fence(&mut self, now: Instant) -> bool {
@@ -1553,49 +1560,30 @@ impl CoreOps for SupervisorInner {
                 ..HardwarePoll::default()
             };
         };
-        match driver.try_lock() {
-            Ok(d) => {
-                d.feedback_ages_into(&mut self.scratch.ages);
-                let oldest = self.scratch.ages.iter().copied().try_fold(Duration::ZERO, |m, a| a.map(|a| m.max(a)));
-                HardwarePoll {
-                    driverless: false,
-                    feedback_valid: d.is_feedback_valid(),
-                    enable_state: Some(d.enable_state()),
-                    oldest_feedback_age: oldest,
-                    rx_frames,
-                    budget_exhausted,
-                    torque: self.core.poll_transition(),
-                    park_wake,
-                    park_state_changed,
-                }
+        let sample = |d: &dyn crate::driver::ArmDriver, ages: &mut Vec<Option<Duration>>| {
+            d.feedback_ages_into(ages);
+            let oldest = ages.iter().copied().try_fold(Duration::ZERO, |m, a| a.map(|a| m.max(a)));
+            (d.is_feedback_valid(), d.enable_state(), oldest)
+        };
+        let (feedback_valid, enable_state, oldest) = match driver.try_with_ref(|d| sample(d, &mut self.scratch.ages)) {
+            Ok(v) => v,
+            Err(crate::supervisor_lock::DriverTryError::WouldBlock) => {
+                (false, crate::driver::EnableState::Unknown, None)
             }
-            Err(std::sync::TryLockError::WouldBlock) => HardwarePoll {
-                driverless: false,
-                feedback_valid: false,
-                enable_state: Some(crate::driver::EnableState::Unknown),
-                oldest_feedback_age: None,
-                rx_frames,
-                budget_exhausted,
-                torque: self.core.poll_transition(),
-                park_wake,
-                park_state_changed,
-            },
-            Err(std::sync::TryLockError::Poisoned(e)) => {
-                let d = e.into_inner();
-                d.feedback_ages_into(&mut self.scratch.ages);
-                let oldest = self.scratch.ages.iter().copied().try_fold(Duration::ZERO, |m, a| a.map(|a| m.max(a)));
-                HardwarePoll {
-                    driverless: false,
-                    feedback_valid: d.is_feedback_valid(),
-                    enable_state: Some(d.enable_state()),
-                    oldest_feedback_age: oldest,
-                    rx_frames,
-                    budget_exhausted,
-                    torque: self.core.poll_transition(),
-                    park_wake,
-                    park_state_changed,
-                }
+            Err(crate::supervisor_lock::DriverTryError::Poisoned) => {
+                driver.with_ref_recover(|d| sample(d, &mut self.scratch.ages))
             }
+        };
+        HardwarePoll {
+            driverless: false,
+            feedback_valid,
+            enable_state: Some(enable_state),
+            oldest_feedback_age: oldest,
+            rx_frames,
+            budget_exhausted,
+            torque: self.core.poll_transition(),
+            park_wake,
+            park_state_changed,
         }
     }
 
@@ -2412,7 +2400,21 @@ impl ReleaseEngine {
         let ctx = self.checkpoint(core, Checkpoint::BeforeTarget, &mut now_fn, &mut report);
         let mut deferred_target_outcome: Option<TargetOutcome> = None;
         if let Some((f, validity)) = self.targets.take_with_validity() {
-            let result = core.consume_target_with_validity(&f, validity, &ctx);
+            let cur_refusal_gen = self.targets.policy_refusal_gen();
+            let cascaded = f.policy_generation != 0
+                && validity
+                    .expected_refusal_gen
+                    .is_some_and(|exp| exp != cur_refusal_gen);
+            let result = if cascaded {
+                core.on_policy_refusal_cascade(&f);
+                Err(Refusal::code("POLICY_REVOKED"))
+            } else {
+                let res = core.consume_target_with_validity(&f, validity, &ctx);
+                if f.policy_generation != 0 && res.is_err() {
+                    self.targets.note_policy_refusal();
+                }
+                res
+            };
             deferred_target_outcome = Some(TargetOutcome { stream: f.stream, seq: f.seq, result });
             report.target_refusal = result.err();
             report.target = Some((f.seq, result.map_err(|r| r.code)));

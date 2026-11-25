@@ -205,15 +205,15 @@ impl PublishedConfig {
         let driver_torque_feedback = inner
             .driver
             .as_ref()
-            .is_some_and(|d| d.lock().is_ok_and(|drv| drv.capabilities().torque_feedback));
+            .is_some_and(|d| d.with_ref(|drv| drv.capabilities().torque_feedback).unwrap_or(false));
         let driver_temperature_feedback = inner
             .driver
             .as_ref()
-            .is_none_or(|d| d.lock().is_ok_and(|drv| drv.capabilities().temperature_feedback));
+            .is_none_or(|d| d.with_ref(|drv| drv.capabilities().temperature_feedback).unwrap_or(false));
         let driver_motor_current_cap = inner
             .driver
             .as_ref()
-            .and_then(|d| d.lock().ok().and_then(|drv| drv.motor_current_cap()))
+            .and_then(|d| d.with_ref(|drv| drv.motor_current_cap()).flatten())
             .and_then(|cap| serde_json::to_value(cap).ok());
         let mut sequences = inner.sequences.clone();
         sequences.pins = inner.active_sequence_pins().cloned();

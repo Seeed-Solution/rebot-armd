@@ -2999,7 +2999,7 @@ fn rt_m3_mit_batch_error_and_mit_lose_zero_alloc_and_zero_free() {
         inner.mit.owner = MitOwner::Active;
         inner.mit.joints = vec![3];
         inner.mit.last_ff = vec![0.0; 7];
-        inner.mit.last_output = Some(inner.driver.as_ref().unwrap().lock().unwrap().clock_now());
+        inner.mit.last_output = Some(inner.driver.as_ref().unwrap().read().unwrap().clock_now());
         inner.rt_executor_owned = true;
         inner.safety.set_off_thread_reclaim(true);
         // Warm up steady-state MIT ticks across triple-buffer slots.
@@ -3012,8 +3012,8 @@ fn rt_m3_mit_batch_error_and_mit_lose_zero_alloc_and_zero_free() {
         // Inject the specific batch outcome by swapping the stub driver's mode.
         let mut failing = StubMitBatchDriver::new();
         failing.outcome = outcome;
-        inner.driver = Some(std::sync::Mutex::new(Box::new(failing)));
-        inner.mit.last_output = Some(inner.driver.as_ref().unwrap().lock().unwrap().clock_now());
+        inner.driver = Some(armd::supervisor_lock::DriverSlot::exclusive(Box::new(failing)));
+        inner.mit.last_output = Some(inner.driver.as_ref().unwrap().read().unwrap().clock_now());
 
         let (published, a, f) = counted(|| inner.tick_publish(0.02, 1, false));
         assert!(published.kept.is_none());

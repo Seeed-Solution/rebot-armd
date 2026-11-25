@@ -2260,8 +2260,8 @@ async fn mit_fence_trip_confirmed_disable_stays_shutdown_ready_and_repeated_unkn
     });
     clock.advance(Duration::from_secs(1));
     {
-        let inner = sup.inner().read().await;
-        let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+        let mut inner = sup.inner().write().await;
+        let mut drv = inner.driver.as_mut().unwrap().write().unwrap();
         drv.read_joint_states().unwrap();
         assert!(!drv.is_feedback_valid(), "1 s without polls must make feedback ages stale (>250 ms)");
         assert!(drv.mit_fence_trip().is_some(), "MIT fence trip for output must stay active");
@@ -2274,6 +2274,7 @@ async fn mit_fence_trip_confirmed_disable_stays_shutdown_ready_and_repeated_unkn
             EnableState::Unknown,
             "telemetry enable_state must report Unknown after 1 s without polls"
         );
+        drop(drv);
         assert_eq!(
             inner.torque_intent(),
             armd::TorqueIntent::Off,

@@ -724,7 +724,7 @@ impl crate::supervisor::SupervisorInner {
         let velocity_feedback = self
             .driver
             .as_ref()
-            .is_some_and(|d| d.lock().is_ok_and(|drv| drv.capabilities().velocity_feedback));
+            .is_some_and(|d| d.with_ref(|drv| drv.capabilities().velocity_feedback).unwrap_or(false));
         if velocity_feedback {
             return arm.iter().all(|&j| {
                 self.measured_velocities

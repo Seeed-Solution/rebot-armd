@@ -984,10 +984,10 @@ impl ActionPrepEnv {
     /// at startup, before executor transfer, and after config mutations).
     pub fn from_inner(inner: &SupervisorInner) -> Self {
         let (has_torque_feedback, has_load_feedback) = match inner.driver.as_ref() {
-            Some(d) => d.lock().map_or((false, false), |drv| {
+            Some(d) => d.with_ref(|drv| {
                 let caps = drv.capabilities();
                 (caps.torque_feedback, caps.load_feedback)
-            }),
+            }).unwrap_or((false, false)),
             None => (true, !inner.loads.is_empty()),
         };
         let mut sequences = inner.sequences.clone();
