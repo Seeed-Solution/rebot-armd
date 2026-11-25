@@ -894,6 +894,10 @@ pub struct SupervisorInner {
     pub disable_pending: bool,
     /// The torque transition the RT started and serves from `poll_hardware` (None: none).
     pub(crate) torque_transition: Option<driver_transitions::TorqueTransition>,
+    /// Monotonic token generator for legacy WS torque transitions.
+    pub(crate) legacy_torque_seq: u64,
+    /// Preallocated per-request completion slots for legacy WS torque transitions (0 alloc/free on control release).
+    pub(crate) legacy_torque_slots: [Arc<driver_transitions::LegacyTorqueSlot>; driver_transitions::LEGACY_TORQUE_SLOTS],
     /// Persistent enable-lifecycle state owned by the single enable transition reducer.
     pub(crate) enable_lifecycle: driver_transitions::EnableLifecycle,
     /// Owner-owned torque decision state (`On` by default on hardware until an accepted disable
@@ -902,6 +906,9 @@ pub struct SupervisorInner {
     /// Monotonic control-release sequence counter pushed to the driver once per release so
     /// rest-pose K=3 ticks count control releases, never individual RX receive passes.
     pub(crate) control_release_seq: u64,
+    /// Lock-free mirror of [`Self::control_release_seq`] so off-lock legacy WS waiters can detect
+    /// whether a live control loop is ticking without contending for `SupervisorLock`.
+    pub(crate) control_release_seq_atomic: Arc<AtomicU64>,
     /// Inline per-joint measured-position hold state (zero alloc on RT).
     pub(crate) measured_hold: driver_transitions::MeasuredHoldTracker,
     /// Inline owner-held driver snapshot refreshed whenever the owner already holds the driver
@@ -2157,9 +2164,12 @@ impl SupervisorInner {
             following_error_since: None,
             disable_pending: false,
             torque_transition: None,
+            legacy_torque_seq: 0,
+            legacy_torque_slots: std::array::from_fn(|_| Arc::new(driver_transitions::LegacyTorqueSlot::new())),
             enable_lifecycle: driver_transitions::EnableLifecycle::Disarmed,
             torque_intent: driver_transitions::TorqueIntent::Off,
             control_release_seq: 0,
+            control_release_seq_atomic: Arc::new(AtomicU64::new(0)),
             measured_hold: driver_transitions::MeasuredHoldTracker::new(dof),
             owner_driver_snapshot: driver_transitions::OwnerDriverSnapshot::new(dof),
             background_disable_retry: None,
@@ -7230,6 +7240,8 @@ impl SupervisorInner {
         release_deadline: Option<Instant>,
     ) -> crate::rt_core::ops::HardwarePoll {
         self.control_release_seq = self.control_release_seq.wrapping_add(1).max(1);
+        self.control_release_seq_atomic
+            .store(self.control_release_seq, Ordering::Release);
         let was_thermal_active = self.thermal_protection_active();
         // Install the release publish-margin TX cap BEFORE enable-transition polling, background
         // disable polling, and RX feedback intake so every TX in Step 2 obeys the same cutoff.
@@ -7805,16 +7817,35 @@ impl SupervisorInner {
             std::mem::take(&mut self.pending_rx_poll)
         } else {
             self.control_release_seq = self.control_release_seq.wrapping_add(1).max(1);
+            self.control_release_seq_atomic
+                .store(self.control_release_seq, Ordering::Release);
             if self.has_non_broker_torque_transition() {
                 let now = Instant::now();
+                let deadline = now + crate::rt_core::ops::RX_TIME_BUDGET;
                 let budget = crate::rt_core::ops::ServiceBudget {
                     now,
-                    deadline: now + crate::rt_core::ops::RX_TIME_BUDGET,
+                    deadline,
                     max_rx_frames: crate::rt_core::ops::RX_FRAME_BUDGET,
                 };
-                let _ = self.service_torque_transition(&budget);
+                let trans = self.service_torque_transition(&budget);
+                let transition_rx = trans.and_then(|tp| tp.rx);
+                let use_budgeted_rx = self.driver.as_ref().is_some_and(|d| {
+                    d.try_lock().is_ok_and(|drv| drv.supports_rt_executor().is_ok())
+                });
+                if use_budgeted_rx {
+                    let after = Instant::now();
+                    let rem_budget = crate::rt_core::ops::ServiceBudget {
+                        now: after,
+                        deadline,
+                        max_rx_frames: budget.max_rx_frames,
+                    };
+                    self.poll_hardware_rx(Some(&rem_budget), transition_rx, release_deadline)
+                } else {
+                    self.poll_hardware_rx(None, None, None)
+                }
+            } else {
+                self.poll_hardware_rx(None, None, None)
             }
-            self.poll_hardware_rx(None, None, None)
         };
         let invalid_feedback = rx.invalid_feedback;
         let driver_torque_lost = rx.driver_torque_lost;
@@ -11478,6 +11509,7 @@ impl ArmSupervisor {
             self.atomic_fenced_lease_gen.clone(),
             self.pending_disconnect_hold.clone(),
         );
+        guard.settle_legacy_torque_owner_transferred();
         let real = std::mem::replace(&mut *guard, shell);
 
         match crate::rt_core::executor::spawn_executor(
@@ -13247,9 +13279,9 @@ impl ArmSupervisor {
     ) -> Result<crate::rt_core::requests::lease::TorqueWsOutcome, ArmError> {
         use crate::rt_core::broker::{Outcome, Reply, TransitionOp};
         use crate::rt_core::requests::lease::{
-            check_torque_owner_preflight, install_torque_off_legacy, install_torque_on_legacy,
-            map_torque_code_to_api_error, prepare_torque, prepare_torque_ws, OwnerAuthPolicy,
-            TorquePreflightError, TorqueWsOutcome, DEFAULT_LEASE_REQUEST_DEADLINE,
+            check_torque_owner_preflight, map_torque_code_to_api_error, prepare_torque,
+            prepare_torque_ws, OwnerAuthPolicy, TorquePreflightError, TorqueWsOutcome,
+            DEFAULT_LEASE_REQUEST_DEADLINE,
         };
         let map_preflight_err = |err: TorquePreflightError| -> TorqueWsOutcome {
             match err {
@@ -13302,42 +13334,278 @@ impl ArmSupervisor {
 
         match self.owner_mode() {
             OWNER_LEGACY => {
-                let mut inner = self.inner.write().await;
-                inner.set_command("/api/v1/torque");
-                self.check_legacy_under_guard(&inner)?;
-                if let Err(err) = check_torque_owner_preflight(
-                    &mut inner,
-                    prep_ws.connection,
-                    prep_ws.local_generation,
-                    prep_ws.supplied_epoch,
-                    prep_ws.request_id_valid,
-                    prep_ws.body_error,
-                    prep_ws.auth_policy,
-                    prep_ws.operator,
-                    Instant::now(),
-                ) {
-                    return Ok(map_preflight_err(err));
-                }
-                let enabled = prep_ws.enable.expect("checked by check_torque_owner_preflight");
-                let res = if enabled {
-                    inner
-                        .check_admission(prep_ws.stamp)
-                        .and_then(install_torque_on_legacy)
-                        .map_err(ArmError::from)
-                } else {
-                    install_torque_off_legacy(&mut inner).map_err(ArmError::from)
+                use crate::supervisor::driver_transitions::{
+                    LegacyTorqueFailure, LegacyTorqueOutcome, LegacyTorqueSlot, LegacyTorqueStart,
                 };
-                match res {
-                    Ok(_) => Ok(TorqueWsOutcome::Accepted {
-                        epoch_id: inner.safety.epoch_id(),
-                        safety_state: inner.safety.state().clone(),
-                        is_torqued: inner.is_torqued,
-                        control_mode_gravity_comp: inner.gravity_comp_active(),
+                let map_legacy_failure = |failure: LegacyTorqueFailure,
+                                          epoch_id: u64,
+                                          safety_state: &SafetyState,
+                                          joint_names: &[String]|
+                 -> TorqueWsOutcome {
+                    match failure {
+                        LegacyTorqueFailure::TorqueOffWouldDrop(refusal) => {
+                            let err = ArmError::Safety(
+                                refusal.into_safety_error(joint_names),
+                            );
+                            TorqueWsOutcome::Rejected {
+                                error: err.into(),
+                                epoch_id,
+                            }
+                        }
+                        LegacyTorqueFailure::EnableFailed {
+                            code,
+                            detail,
+                            feedback_unavailable,
+                            estop_interrupted,
+                        } => {
+                            if feedback_unavailable {
+                                TorqueWsOutcome::Rejected {
+                                    error: ArmError::Safety(SafetyError::FeedbackUnavailable).into(),
+                                    epoch_id,
+                                }
+                            } else if estop_interrupted {
+                                TorqueWsOutcome::Rejected {
+                                    error: ArmError::Safety(SafetyError::EStopActive).into(),
+                                    epoch_id,
+                                }
+                            } else if code == "ENABLE_FAILED" {
+                                let msg = if detail.as_str().is_empty() {
+                                    "Hardware torque enable failed".to_string()
+                                } else {
+                                    detail.as_str().to_string()
+                                };
+                                TorqueWsOutcome::Rejected {
+                                    error: crate::api::rest::ApiError(
+                                        axum::http::StatusCode::CONFLICT,
+                                        msg,
+                                        "ENABLE_FAILED".to_string(),
+                                    ),
+                                    epoch_id,
+                                }
+                            } else {
+                                TorqueWsOutcome::Rejected {
+                                    error: map_torque_code_to_api_error(code, Some(safety_state)),
+                                    epoch_id,
+                                }
+                            }
+                        }
+                        LegacyTorqueFailure::Stopped => TorqueWsOutcome::Rejected {
+                            error: ArmError::Safety(SafetyError::Stopped).into(),
+                            epoch_id,
+                        },
+                        LegacyTorqueFailure::LeaseLost => TorqueWsOutcome::LeaseLost { epoch_id },
+                        LegacyTorqueFailure::EpochMismatch => {
+                            TorqueWsOutcome::EpochMismatch { epoch_id }
+                        }
+                        LegacyTorqueFailure::FeedbackUnavailable => TorqueWsOutcome::Rejected {
+                            error: ArmError::Safety(SafetyError::FeedbackUnavailable).into(),
+                            epoch_id,
+                        },
+                        LegacyTorqueFailure::EStopActive => TorqueWsOutcome::Rejected {
+                            error: ArmError::Safety(SafetyError::EStopActive).into(),
+                            epoch_id,
+                        },
+                        LegacyTorqueFailure::StaticCode(code) => TorqueWsOutcome::Rejected {
+                            error: map_torque_code_to_api_error(code, Some(safety_state)),
+                            epoch_id,
+                        },
+                    }
+                };
+
+                let (enabled, start_res, pre_epoch, joint_names, tick_seq_counter, mut last_tick_seq) = {
+                    let mut inner = self.inner.write().await;
+                    let io_scope = crate::diagnostics::tick::HoldIoScope::enter();
+                    inner.set_command("/api/v1/torque");
+                    if let Err(e) = self.check_legacy_under_guard(&inner) {
+                        inner.set_io_timing(io_scope.finish());
+                        return Err(e);
+                    }
+                    if let Err(err) = check_torque_owner_preflight(
+                        &mut inner,
+                        prep_ws.connection,
+                        prep_ws.local_generation,
+                        prep_ws.supplied_epoch,
+                        prep_ws.request_id_valid,
+                        prep_ws.body_error,
+                        prep_ws.auth_policy,
+                        prep_ws.operator,
+                        Instant::now(),
+                    ) {
+                        inner.set_io_timing(io_scope.finish());
+                        return Ok(map_preflight_err(err));
+                    }
+                    let enabled = prep_ws.enable.expect("checked by check_torque_owner_preflight");
+                    inner.set_direction(if enabled { "on" } else { "off" });
+                    let joint_names = if !enabled {
+                        inner.config.joint_names.clone()
+                    } else {
+                        Vec::new()
+                    };
+                    let tick_seq_counter = Arc::clone(&inner.control_release_seq_atomic);
+                    let last_tick_seq = tick_seq_counter.load(Ordering::Acquire);
+                    let res = if enabled {
+                        inner
+                            .check_admission(prep_ws.stamp)
+                            .and_then(SupervisorInner::begin_enable_torque_transition_legacy)
+                            .map_err(ArmError::from)
+                    } else {
+                        inner
+                            .begin_disable_torque_transition_legacy()
+                            .map_err(ArmError::from)
+                    };
+                    let epoch_id = inner.safety.epoch_id();
+                    inner.set_io_timing(io_scope.finish());
+                    (enabled, res, epoch_id, joint_names, tick_seq_counter, last_tick_seq)
+                };
+
+                let (token, slot_idx, slot) = match start_res {
+                    Ok(LegacyTorqueStart::ImmediateAccepted {
+                        epoch_id,
+                        safety_state,
+                        is_torqued,
+                        control_mode_gravity_comp,
+                    }) => {
+                        return Ok(TorqueWsOutcome::Accepted {
+                            epoch_id,
+                            safety_state,
+                            is_torqued,
+                            control_mode_gravity_comp,
+                        });
+                    }
+                    Ok(LegacyTorqueStart::ImmediateRejected {
+                        failure,
+                        epoch_id,
+                        safety_state,
+                    }) => {
+                        return Ok(map_legacy_failure(
+                            failure,
+                            epoch_id,
+                            &safety_state,
+                            &joint_names,
+                        ));
+                    }
+                    Ok(LegacyTorqueStart::Pending {
+                        token,
+                        slot_idx,
+                        slot,
+                    }) => (token, slot_idx, slot),
+                    Err(err) => {
+                        return Ok(TorqueWsOutcome::Rejected {
+                            error: err.into(),
+                            epoch_id: pre_epoch,
+                        });
+                    }
+                };
+
+                struct LegacySlotGuard {
+                    slot: Arc<LegacyTorqueSlot>,
+                    token: u64,
+                    consumed: bool,
+                }
+                impl Drop for LegacySlotGuard {
+                    fn drop(&mut self) {
+                        if !self.consumed {
+                            self.slot.abandon(self.token);
+                        }
+                    }
+                }
+                let mut slot_guard = LegacySlotGuard {
+                    slot: Arc::clone(&slot),
+                    token,
+                    consumed: false,
+                };
+
+                // Bounded fallback poll interval when no live control loop is ticking (e.g.
+                // headless tests or pre-executor setup). When a live 50 Hz control loop is
+                // running, `control_release_seq_atomic` advances every 20 ms so the waiter never
+                // re-acquires the write lock.
+                const FALLBACK_STEP_INTERVAL: Duration = Duration::from_millis(25);
+                const FALLBACK_STEP_BUDGET: Duration = Duration::from_micros(500);
+
+                let outcome = loop {
+                    if let Some(done) = slot.take_settled(token) {
+                        slot_guard.consumed = true;
+                        break done;
+                    }
+                    let now_wait = Instant::now();
+                    if now_wait >= deadline {
+                        let done = {
+                            let mut inner = self.inner.write().await;
+                            let io_scope = crate::diagnostics::tick::HoldIoScope::enter();
+                            inner.set_command("/api/v1/torque");
+                            inner.set_direction(if enabled { "on" } else { "off" });
+                            let out = if inner.detached {
+                                slot.take_settled(token)
+                                    .unwrap_or(LegacyTorqueOutcome::OwnerTransferred)
+                            } else {
+                                inner.timeout_legacy_torque_transition(token, slot_idx, enabled)
+                            };
+                            inner.set_io_timing(io_scope.finish());
+                            out
+                        };
+                        slot_guard.consumed = true;
+                        break done;
+                    }
+                    let notified = slot.notified();
+                    if let Some(done) = slot.take_settled(token) {
+                        slot_guard.consumed = true;
+                        break done;
+                    }
+                    let rem = deadline.saturating_duration_since(now_wait);
+                    let wait_for = rem.min(FALLBACK_STEP_INTERVAL);
+                    if tokio::time::timeout(wait_for, notified).await.is_err() {
+                        if let Some(done) = slot.take_settled(token) {
+                            slot_guard.consumed = true;
+                            break done;
+                        }
+                        let cur_tick_seq = tick_seq_counter.load(Ordering::Acquire);
+                        if cur_tick_seq != last_tick_seq {
+                            last_tick_seq = cur_tick_seq;
+                        } else if Instant::now() < deadline {
+                            let mut inner = self.inner.write().await;
+                            let io_scope = crate::diagnostics::tick::HoldIoScope::enter();
+                            inner.set_command("/api/v1/torque");
+                            inner.set_direction(if enabled { "on" } else { "off" });
+                            if !inner.detached && inner.has_legacy_torque_transition_token(token) {
+                                let step_now = Instant::now();
+                                let budget = crate::rt_core::ops::ServiceBudget {
+                                    now: step_now,
+                                    deadline: step_now + FALLBACK_STEP_BUDGET,
+                                    max_rx_frames: crate::rt_core::ops::RX_FRAME_BUDGET,
+                                };
+                                let _ = inner.service_torque_transition(&budget);
+                            }
+                            inner.set_io_timing(io_scope.finish());
+                            last_tick_seq = tick_seq_counter.load(Ordering::Acquire);
+                        }
+                    }
+                };
+
+                match outcome {
+                    LegacyTorqueOutcome::Accepted {
+                        epoch_id,
+                        safety_state,
+                        is_torqued,
+                        control_mode_gravity_comp,
+                    } => Ok(TorqueWsOutcome::Accepted {
+                        epoch_id,
+                        safety_state: (*safety_state).clone(),
+                        is_torqued,
+                        control_mode_gravity_comp,
                     }),
-                    Err(err) => Ok(TorqueWsOutcome::Rejected {
-                        error: err.into(),
-                        epoch_id: inner.safety.epoch_id(),
-                    }),
+                    LegacyTorqueOutcome::Failed {
+                        failure,
+                        epoch_id,
+                        safety_state,
+                    } => Ok(map_legacy_failure(
+                        failure,
+                        epoch_id,
+                        &safety_state,
+                        &joint_names,
+                    )),
+                    LegacyTorqueOutcome::OwnerTransferred => {
+                        Err(ArmError::Safety(SafetyError::OwnerTransferred))
+                    }
                 }
             }
             OWNER_EXECUTOR => {

@@ -1800,6 +1800,7 @@ impl SupervisorInner {
             self.request_macro_stop();
         }
         self.advance_stop_generation();
+        self.abort_legacy_enable_on_authorized_stop();
         true
     }
 
