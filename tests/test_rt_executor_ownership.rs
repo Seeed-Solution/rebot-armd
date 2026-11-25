@@ -2972,7 +2972,8 @@ fn damiao_mid_retry_and_mode_restore_estop_and_legacy_gravity_comp_exit() {
     inner_r.register_live_connection(1).unwrap();
     inner_r.rt_executor_owned = true;
     let mut bus_r = CountingBus::new(raw_bus_r.clone(), Some(clock.clone()));
-    bus_r.estop_state_on_tx = Some((inner_r.estop_state.clone(), 9)); // 7 initial + 2 retries
+    // 7 initial CMD_ENABLE + 7 urgent watchdog POS_VEL holds at +30ms + 2 retry CMD_ENABLE = 16
+    bus_r.estop_state_on_tx = Some((inner_r.estop_state.clone(), 16));
     let mut drv_r = DamiaoArmDriver::new(bus_r.clone(), vec![1, 2, 3, 4, 5, 6, 7])
         .with_joint_limits(dm_limits())
         .unwrap();

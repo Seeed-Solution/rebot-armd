@@ -267,7 +267,6 @@ impl FakeBusState {
         for m in &mut self.motors {
             if let Some(deadline) = m.watchdog_deadline().filter(|d| now >= *d) {
                 m.enabled = false;
-                m.last_cmd_at = None;
                 m.state_override = Some(0xD);
                 m.watchdog_expired_at = Some(deadline);
                 m.watchdog_expiry_count += 1;
