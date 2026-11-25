@@ -2044,10 +2044,12 @@ async fn y8_executor_action_chunking_horizon_live_tx_and_zero_alloc_proof() {
     let mut step1 = base_q;
     let mut step2 = base_q;
     let mut step3 = base_q;
-    step0[0] += 0.04;
-    step1[0] += 0.08;
+    // Distinct per-slot targets: slot 0 only moves +0.01 rad so exceeding +0.04 rad on CAN TX
+    // proves cached / ensembled later slots (not repeated slot 0) reached the motor bus.
+    step0[0] += 0.01;
+    step1[0] += 0.06;
     step2[0] += 0.10;
-    step3[0] += 0.12;
+    step3[0] += 0.13;
     step0[6] = (base_q[6] + 0.06).min(0.0);
     step1[6] = (base_q[6] + 0.08).min(0.0);
     step2[6] = (base_q[6] + 0.10).min(0.0);
@@ -2122,11 +2124,28 @@ async fn y8_executor_action_chunking_horizon_live_tx_and_zero_alloc_proof() {
     assert_eq!(pol_done.stop_reason.as_deref(), Some("MAX_SECONDS"), "{pol_done:?}");
     assert!(pol_done.steps >= 3, "expected >= 3 live chunked steps, got {}", pol_done.steps);
 
-    let j1_moved = bus
+    let final_target = pol_done
+        .last_shadow_target
+        .as_ref()
+        .expect("live chunked run must record committed target");
+    assert!(
+        final_target[0] > base_q[0] + 0.05,
+        "chunked live policy must emit later/ensembled slots past slot 0 (+0.01): final_target[0]={}, base={}",
+        final_target[0],
+        base_q[0]
+    );
+
+    let max_j1_cmd = bus
         .tx_log()
         .iter()
-        .any(|f| f.id == 0x101 && f.data.len() >= 4 && decode_pos_f32(f) > base_q[0] + 0.02);
-    assert!(j1_moved, "chunked live policy on executor must drive J1 CAN TX");
+        .filter(|f| f.id == 0x101 && f.data.len() >= 4)
+        .map(decode_pos_f32)
+        .fold(f32::NEG_INFINITY, f32::max);
+    assert!(
+        max_j1_cmd > base_q[0] + 0.025,
+        "chunked live policy on executor must advance J1 CAN TX past slot 0 (+0.01) into later/ensembled chunk slots (max_j1_cmd={max_j1_cmd}, base={})",
+        base_q[0]
+    );
 
     let j7_vel_raws: Vec<u16> = bus
         .tx_log()

@@ -1200,6 +1200,8 @@ pub struct PreparedPolicy {
     chunk_ring: ChunkRing,
     last_step_sources: Vec<ChunkSource>,
     last_run_ctx: Option<ChunkRunContext>,
+    last_commit_slot_expires_at: Option<Instant>,
+    last_commit_handshake_expires_at: Option<Instant>,
 }
 
 impl PreparedPolicy {
@@ -1278,6 +1280,8 @@ impl PreparedPolicy {
             chunk_ring,
             last_step_sources,
             last_run_ctx: None,
+            last_commit_slot_expires_at: None,
+            last_commit_handshake_expires_at: None,
         })
     }
 
@@ -1304,6 +1308,21 @@ impl PreparedPolicy {
         self.staged_ready = false;
         self.single_step_source = None;
         self.last_step_sources.clear();
+        self.last_commit_slot_expires_at = None;
+        self.last_commit_handshake_expires_at = None;
+    }
+
+    /// Strictest remaining validity deadline across all contributing chunk sources and the
+    /// selected control period end from the most recent `commit_gate` `Submit` (`None` for
+    /// single-step policies or after `Skip` / clear).
+    pub fn last_commit_slot_expires_at(&self) -> Option<Instant> {
+        self.last_commit_slot_expires_at
+    }
+
+    /// Strictest embedding clock-handshake expiry across all contributing chunk sources from
+    /// the most recent `commit_gate` `Submit` (`None` when no embedding ticket contributed).
+    pub fn last_commit_handshake_expires_at(&self) -> Option<Instant> {
+        self.last_commit_handshake_expires_at
     }
 
     /// Number of future control periods currently buffered in the chunk ring.
@@ -1735,6 +1754,8 @@ impl PreparedPolicy {
         last_committed_period: Option<u64>,
         params: &CommitGateParams,
     ) -> Result<CommitGateDecision, PolicyError> {
+        self.last_commit_slot_expires_at = None;
+        self.last_commit_handshake_expires_at = None;
         let commit_period = (now
             .saturating_duration_since(interval_origin)
             .as_nanos()
@@ -1762,6 +1783,18 @@ impl PreparedPolicy {
                 self.clear_chunk_buffer();
                 return Ok(CommitGateDecision::Skip { commit_period });
             }
+            if let Some(ref cur_target) = params.vision_target {
+                if !src.vision_target.is_some_and(|s| s.matches(cur_target)) {
+                    self.clear_chunk_buffer();
+                    return Ok(CommitGateDecision::Skip { commit_period });
+                }
+            }
+            if let Some(max_v) = params.max_fresh_vision_age_ms {
+                if src.vision_age_ms(now).is_some_and(|age| age > max_v) {
+                    self.clear_chunk_buffer();
+                    return Ok(CommitGateDecision::Skip { commit_period });
+                }
+            }
             if let (Some(ticket), Some(live_ctx)) =
                 (src.embedding_ticket, eval_ticket_ctx.as_ref())
             {
@@ -1769,6 +1802,11 @@ impl PreparedPolicy {
                     self.clear_chunk_buffer();
                     return Ok(CommitGateDecision::Skip { commit_period });
                 }
+                let hs_rem_ms = ticket
+                    .clock_handshake_expires_at_ms()
+                    .saturating_sub(live_ctx.now_armd_ms);
+                self.last_commit_handshake_expires_at =
+                    now.checked_add(Duration::from_millis(hs_rem_ms));
             }
             self.staged_ready = false;
             self.staged_period = None;
@@ -1812,6 +1850,13 @@ impl PreparedPolicy {
             return Ok(CommitGateDecision::Skip { commit_period });
         }
         let fresh_seq = self.staged_infer_seq;
+        let mut slot_exp: Option<Instant> = None;
+        let mut hs_exp: Option<Instant> = None;
+        let tighten = |dst: &mut Option<Instant>, cand: Option<Instant>| {
+            if let Some(c) = cand {
+                *dst = Some(dst.map_or(c, |cur| cur.min(c)));
+            }
+        };
         for &src in &self.last_step_sources {
             if params.vision_generation.is_some()
                 && src.vision_generation != params.vision_generation
@@ -1831,19 +1876,32 @@ impl PreparedPolicy {
             } else {
                 params.max_cached_joint_age_ms
             };
-            if src.joint_age_ms(now) > joint_limit {
+            let joint_age_ms = src.joint_age_ms(now);
+            if joint_age_ms > joint_limit {
                 self.clear_chunk_buffer();
                 return Ok(CommitGateDecision::Skip { commit_period });
             }
+            tighten(
+                &mut slot_exp,
+                now.checked_add(Duration::from_millis(
+                    joint_limit.saturating_sub(joint_age_ms),
+                )),
+            );
             let vision_limit = if is_fresh {
                 params.max_fresh_vision_age_ms
             } else {
                 params.max_cached_vision_age_ms
             };
             if let Some(max_v) = vision_limit {
-                if src.vision_age_ms(now).is_some_and(|age| age > max_v) {
-                    self.clear_chunk_buffer();
-                    return Ok(CommitGateDecision::Skip { commit_period });
+                if let Some(age) = src.vision_age_ms(now) {
+                    if age > max_v {
+                        self.clear_chunk_buffer();
+                        return Ok(CommitGateDecision::Skip { commit_period });
+                    }
+                    tighten(
+                        &mut slot_exp,
+                        now.checked_add(Duration::from_millis(max_v.saturating_sub(age))),
+                    );
                 }
             }
             if let (Some(ticket), Some(live_ctx)) =
@@ -1857,7 +1915,29 @@ impl PreparedPolicy {
                     self.clear_chunk_buffer();
                     return Ok(CommitGateDecision::Skip { commit_period });
                 }
+                let win_dl = ticket
+                    .window_oldest_deadline_ms()
+                    .min(ticket.window_newest_deadline_ms())
+                    .saturating_add(ticket_horizon);
+                let win_rem_ms = win_dl.saturating_sub(live_ctx.now_armd_ms);
+                tighten(
+                    &mut slot_exp,
+                    now.checked_add(Duration::from_millis(win_rem_ms)),
+                );
+                let hs_rem_ms = ticket
+                    .clock_handshake_expires_at_ms()
+                    .saturating_sub(live_ctx.now_armd_ms);
+                tighten(
+                    &mut hs_exp,
+                    now.checked_add(Duration::from_millis(hs_rem_ms)),
+                );
             }
+        }
+        let period_end_ns = (commit_period as u128)
+            .saturating_add(1)
+            .saturating_mul(period_ns.max(1));
+        if let Ok(ns_u64) = u64::try_from(period_end_ns) {
+            tighten(&mut slot_exp, interval_origin.checked_add(Duration::from_nanos(ns_u64)));
         }
 
         let target = if self.staged_ready && self.staged_period == Some(commit_period) {
@@ -1874,6 +1954,8 @@ impl PreparedPolicy {
         self.staged_ready = false;
         self.staged_period = None;
         self.staged_infer_seq = None;
+        self.last_commit_slot_expires_at = slot_exp;
+        self.last_commit_handshake_expires_at = hs_exp;
         Ok(CommitGateDecision::Submit {
             target,
             commit_period,
@@ -2129,25 +2211,236 @@ fn active_run_lease_generation(inner: &SupervisorInner, action_id: u64) -> Optio
     (run.lease_generation == lease_gen).then_some(lease_gen)
 }
 
-fn verify_ticket_in_critical_section(
-    inner: &SupervisorInner,
-    action_id: u64,
-    ticket: &InferenceTicket,
-    hub_guard: &HubCommitGuard<'_>,
-) -> Result<u64, TicketViolation> {
-    let live_hub = hub_guard.live_ticket_state();
-    let live_lease = active_run_lease_generation(inner, action_id);
-    let ctx = TicketVerificationContext {
-        policy_instance_id: live_hub.policy_instance_id,
-        lease_generation: live_lease,
-        producer_epoch: live_hub.producer_epoch,
-        model_generation: live_hub.model_generation,
-        invalidation_generation: live_hub.invalidation_generation,
-        clock_handshake_generation: live_hub.clock_handshake_generation,
-        now_armd_ms: live_hub.now_armd_ms,
+enum FinalCommitGateOutcome {
+    Submit {
+        target: Vec<f32>,
+        commit_period: u64,
+        gate_now: Instant,
+        eval_now_ms: u64,
+        input_age_ms: Option<u64>,
+        post_vision_age_ms: Option<u64>,
+    },
+    Skip,
+    Hold,
+    Fail {
+        reason: &'static str,
+        message: String,
+    },
+}
+
+/// Single synchronous final commit gate shared by BOTH legacy (`spawn_policy_runner`) and
+/// RT-executor (`executor_commit_gate`) owners.
+///
+/// Reads `gate_now` ONCE and (for detector policies) `collector.latest()` ONCE, enforces
+/// current-tick detector staleness / `model_generation` and current-tick embedding
+/// `InferenceTicket` with their configured `Hold`/`Stop` dispositions at `gate_now`, and then
+/// runs `prepared.commit_gate(gate_now, ...)` with zero intervening clock reads or extra snapshots.
+#[allow(clippy::too_many_arguments)]
+fn evaluate_final_commit_gate(
+    prepared: &mut PreparedPolicy,
+    gate_now: Instant,
+    interval_origin_std: Instant,
+    period_ns: u128,
+    last_committed_period: Option<u64>,
+    max_fresh_joint_age_ms: u64,
+    max_source_joint_age_ms: u64,
+    max_fresh_vision_age_ms: Option<u64>,
+    max_source_vision_age_ms: Option<u64>,
+    horizon_ms: u64,
+    video_embedding_spec: Option<&VideoEmbeddingSpec>,
+    vision_spec: Option<&super::manifest::VisionFeatureSpec>,
+    hub_guard: Option<&HubCommitGuard<'_>>,
+    live_lease: Option<u64>,
+    collector: Option<&VisionFeatureCollector>,
+    locked_generation: Option<u64>,
+    base_input_age_ms: Option<u64>,
+    captured_at: Instant,
+    vision_captured_at: Option<Instant>,
+    vision_target: Option<DetectorTargetIdentity>,
+    emb_ticket: Option<&InferenceTicket>,
+    emb_mapped_and_unc_ms: Option<(u64, u64)>,
+) -> FinalCommitGateOutcome {
+    // 1. Single coherent detector snapshot + current-tick detector staleness / generation check.
+    let commit_vision_target = if video_embedding_spec.is_none() {
+        let latest_frame = collector.and_then(VisionFeatureCollector::latest);
+        if let (Some(spec), Some(vis_cap)) = (vision_spec, vision_captured_at) {
+            let age_ms = gate_now
+                .saturating_duration_since(vis_cap)
+                .as_millis()
+                .min(u64::MAX as u128) as u64;
+            if age_ms > spec.max_staleness_ms {
+                prepared.clear_chunk_buffer();
+                return match spec.on_stale {
+                    VisionStalePolicy::Stop => FinalCommitGateOutcome::Fail {
+                        reason: "VISION_STALE",
+                        message: format!(
+                            "Vision frame became stale before step commit ({age_ms} ms > {} ms)",
+                            spec.max_staleness_ms
+                        ),
+                    },
+                    VisionStalePolicy::Hold => FinalCommitGateOutcome::Hold,
+                };
+            }
+        }
+        if let (Some(spec), Some(ref frame)) = (vision_spec, &latest_frame) {
+            if spec.require_model_generation && frame.model_generation != locked_generation {
+                prepared.clear_chunk_buffer();
+                let (reason, message) = match frame.model_generation {
+                    None => (
+                        "VISION_GENERATION_MISSING",
+                        format!(
+                            "Vision frame {} missing required model_generation before step commit",
+                            frame.frame_id
+                        ),
+                    ),
+                    Some(new_gen) => (
+                        "VISION_GENERATION_CHANGED",
+                        format!(
+                            "Vision model generation changed from {} to {new_gen} before step commit",
+                            locked_generation
+                                .map_or_else(|| "none".to_string(), |g| g.to_string())
+                        ),
+                    ),
+                };
+                return FinalCommitGateOutcome::Fail { reason, message };
+            }
+        }
+        if let (Some(spec), Some(ref frame)) = (vision_spec, &latest_frame) {
+            Some(
+                extract_top1_target(frame, spec)
+                    .map_or(DetectorTargetIdentity::Absent, |(_, id)| id),
+            )
+        } else {
+            vision_target
+        }
+    } else {
+        vision_target
     };
-    ticket.verify(&ctx)?;
-    Ok(live_hub.now_armd_ms)
+
+    // 2. Current-tick embedding `InferenceTicket` verification at `gate_now` (preserving
+    //    `is_unbroken_active_renewal`, `on_stale=hold`, `ClockHandshakeExpired`, and `Stop`).
+    let embedding_clock_override_ms = hub_guard.and_then(HubCommitGuard::test_now_ms);
+    let eval_now_ms = embedding_clock_override_ms.unwrap_or_else(|| monotonic_ms_at(gate_now));
+    let commit_ticket_ctx = hub_guard.map(|guard| {
+        let live_hub = guard.live_ticket_state();
+        TicketVerificationContext {
+            policy_instance_id: live_hub.policy_instance_id,
+            lease_generation: live_lease,
+            producer_epoch: live_hub.producer_epoch,
+            model_generation: live_hub.model_generation,
+            invalidation_generation: live_hub.invalidation_generation,
+            clock_handshake_generation: live_hub.clock_handshake_generation,
+            now_armd_ms: eval_now_ms,
+        }
+    });
+    let hold_on_stale =
+        video_embedding_spec.is_some_and(|s| s.on_stale == VisionStalePolicy::Hold);
+    if let (Some(ticket), Some(guard), Some(ref ctx)) =
+        (emb_ticket, hub_guard, &commit_ticket_ctx)
+    {
+        match ticket.verify(ctx) {
+            Ok(()) => {}
+            Err(TicketViolation::ClockHandshakeGenerationMismatch { expected, actual }) => {
+                prepared.clear_chunk_buffer();
+                if actual != 0 && guard.is_unbroken_active_renewal(expected) {
+                    return FinalCommitGateOutcome::Hold;
+                }
+                if eval_now_ms > ticket.clock_handshake_expires_at_ms() {
+                    let exp = TicketViolation::ClockHandshakeExpired {
+                        now_ms: eval_now_ms,
+                        expires_at_ms: ticket.clock_handshake_expires_at_ms(),
+                    };
+                    return FinalCommitGateOutcome::Fail {
+                        reason: exp.code(),
+                        message: exp.message(),
+                    };
+                }
+                let v = TicketViolation::ClockHandshakeGenerationMismatch { expected, actual };
+                return FinalCommitGateOutcome::Fail {
+                    reason: v.code(),
+                    message: v.message(),
+                };
+            }
+            Err(
+                TicketViolation::WindowNewestExpired { .. }
+                | TicketViolation::WindowOldestExpired { .. },
+            ) if hold_on_stale => {
+                prepared.clear_chunk_buffer();
+                return FinalCommitGateOutcome::Hold;
+            }
+            Err(violation) => {
+                prepared.clear_chunk_buffer();
+                return FinalCommitGateOutcome::Fail {
+                    reason: violation.code(),
+                    message: violation.message(),
+                };
+            }
+        }
+    }
+
+    // 3. Final `commit_gate(gate_now, ...)` slot selection, provenance, and source-age bounds.
+    let gate_params = CommitGateParams {
+        max_fresh_joint_age_ms,
+        max_cached_joint_age_ms: max_source_joint_age_ms,
+        max_fresh_vision_age_ms,
+        max_cached_vision_age_ms: max_source_vision_age_ms,
+        horizon_ms,
+        vision_generation: locked_generation,
+        vision_target: commit_vision_target,
+        live_ticket_ctx: commit_ticket_ctx,
+        embedding_clock_override_ms,
+    };
+    match prepared.commit_gate(
+        gate_now,
+        interval_origin_std,
+        period_ns,
+        last_committed_period,
+        &gate_params,
+    ) {
+        Ok(CommitGateDecision::Submit {
+            target,
+            commit_period,
+        }) => {
+            let input_age_ms = base_input_age_ms.map(|base| {
+                base.saturating_add(
+                    gate_now
+                        .saturating_duration_since(captured_at)
+                        .as_millis()
+                        .min(u64::MAX as u128) as u64,
+                )
+            });
+            let post_vision_age_ms = if let Some((mapped_ms, unc_ms)) = emb_mapped_and_unc_ms {
+                Some(eval_now_ms.saturating_sub(mapped_ms).saturating_add(unc_ms))
+            } else {
+                vision_captured_at.map(|cap| {
+                    gate_now
+                        .saturating_duration_since(cap)
+                        .as_millis()
+                        .min(u64::MAX as u128) as u64
+                })
+            };
+            FinalCommitGateOutcome::Submit {
+                target,
+                commit_period,
+                gate_now,
+                eval_now_ms,
+                input_age_ms,
+                post_vision_age_ms,
+            }
+        }
+        Ok(CommitGateDecision::Skip { .. }) => FinalCommitGateOutcome::Skip,
+        Err(e) => {
+            prepared.clear_chunk_buffer();
+            let reason = match e {
+                PolicyError::NonFinite(_) => "NON_FINITE",
+                _ => "INFERENCE_ERROR",
+            };
+            FinalCommitGateOutcome::Fail {
+                reason,
+                message: e.to_string(),
+            }
+        }
+    }
 }
 
 pub(crate) fn verify_embedding_release_gate(
@@ -2573,66 +2866,10 @@ pub fn spawn_policy_runner(
             let step_us = step_started_at.elapsed().as_micros().min(u64::MAX as u128) as u64;
             inner.record_policy_step_timing(action_id, infer_us, step_us);
 
-            if video_embedding_spec.is_none() {
-                if let (Some(spec), Some(vis_cap)) = (&vision_spec, vision_captured_at) {
-                    let age_ms = Instant::now()
-                        .saturating_duration_since(vis_cap)
-                        .as_millis()
-                        .min(u64::MAX as u128) as u64;
-                    if age_ms > spec.max_staleness_ms {
-                        match spec.on_stale {
-                            VisionStalePolicy::Stop => {
-                                prepared.clear_chunk_buffer();
-                                inner.fail_policy_run(
-                                    action_id,
-                                    "VISION_STALE",
-                                    format!(
-                                        "Vision frame became stale before step commit ({age_ms} ms > {} ms)",
-                                        spec.max_staleness_ms
-                                    ),
-                                );
-                                break;
-                            }
-                            VisionStalePolicy::Hold => {
-                                prepared.clear_chunk_buffer();
-                                inner.hold_policy_run(action_id);
-                                continue;
-                            }
-                        }
-                    }
-                }
-                if let (Some(spec), Some(col)) = (&vision_spec, &collector) {
-                    if spec.require_model_generation {
-                        if let Some(latest_frame) = col.latest() {
-                            if latest_frame.model_generation != locked_generation {
-                                let (reason, message) = match latest_frame.model_generation {
-                                    None => (
-                                        "VISION_GENERATION_MISSING",
-                                        format!(
-                                            "Vision frame {} missing required model_generation before step commit",
-                                            latest_frame.frame_id
-                                        ),
-                                    ),
-                                    Some(new_gen) => (
-                                        "VISION_GENERATION_CHANGED",
-                                        format!(
-                                            "Vision model generation changed from {} to {new_gen} before step commit",
-                                            locked_generation
-                                                .map_or_else(|| "none".to_string(), |g| g.to_string())
-                                        ),
-                                    ),
-                                };
-                                prepared.clear_chunk_buffer();
-                                inner.fail_policy_run(action_id, reason, message);
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
             if let Some(gate) = active_gate {
                 if let Some(ref emb) = video_embedding_spec {
                     if let Err(msg) = verify_embedding_release_gate(&gate, emb) {
+                        prepared.clear_chunk_buffer();
                         inner.fail_policy_run(action_id, "RELEASE_GATE_INVALID", msg);
                         break;
                     }
@@ -2648,144 +2885,56 @@ pub fn spawn_policy_runner(
                     calibration_digest,
                 };
                 if let Err(e) = gate.verify_deployment(&cur_ctx) {
+                    prepared.clear_chunk_buffer();
                     inner.fail_policy_run(action_id, "DEPLOYMENT_CHANGED", e.to_string());
                     break;
                 }
             }
 
             // Final critical-section check (A-R2-1): hold `HubCommitGuard` together with
-            // `inner`, re-verify current-tick `InferenceTicket`, then run the single
-            // `commit_gate_now` immediately before `policy_step_with_vision`.
+            // `inner`, read `gate_now` and `collector.latest()` ONCE, enforce current-tick
+            // detector/ticket fences + `commit_gate`, and immediately submit to `policy_step_with_vision`.
             let _hub_guard = embedding_hub.as_ref().map(|hub| hub.lock_for_commit());
-            let mut hold_step = false;
-            let hold_on_stale = video_embedding_spec
-                .as_ref()
-                .is_some_and(|s| s.on_stale == VisionStalePolicy::Hold);
-            if let (Some(ref ticket), Some(ref guard)) = (&emb_ticket, &_hub_guard) {
-                match verify_ticket_in_critical_section(&inner, action_id, ticket, guard) {
-                    Ok(_) => {}
-                    Err(TicketViolation::ClockHandshakeGenerationMismatch { expected, actual }) => {
-                        if actual != 0 && guard.is_unbroken_active_renewal(expected) {
-                            hold_step = true;
-                        } else {
-                            prepared.clear_chunk_buffer();
-                            let now_armd_ms = guard.live_ticket_state().now_armd_ms;
-                            if now_armd_ms > ticket.clock_handshake_expires_at_ms() {
-                                let exp_violation = TicketViolation::ClockHandshakeExpired {
-                                    now_ms: now_armd_ms,
-                                    expires_at_ms: ticket.clock_handshake_expires_at_ms(),
-                                };
-                                inner.fail_policy_run(
-                                    action_id,
-                                    exp_violation.code(),
-                                    exp_violation.message(),
-                                );
-                            } else {
-                                let violation = TicketViolation::ClockHandshakeGenerationMismatch {
-                                    expected,
-                                    actual,
-                                };
-                                inner.fail_policy_run(
-                                    action_id,
-                                    violation.code(),
-                                    violation.message(),
-                                );
-                            }
-                            break;
-                        }
-                    }
-                    Err(
-                        TicketViolation::WindowNewestExpired { .. }
-                        | TicketViolation::WindowOldestExpired { .. },
-                    ) if hold_on_stale => {
-                        hold_step = true;
-                    }
-                    Err(violation) => {
-                        prepared.clear_chunk_buffer();
-                        inner.fail_policy_run(action_id, violation.code(), violation.message());
-                        break;
-                    }
-                }
-            }
-            if hold_step {
-                prepared.clear_chunk_buffer();
-                inner.hold_policy_run(action_id);
-                continue;
-            }
-            let embedding_clock_override_ms = _hub_guard.as_ref().and_then(|g| g.test_now_ms());
-            let commit_ticket_ctx = _hub_guard.as_ref().map(|guard| {
-                let live_hub = guard.live_ticket_state();
-                TicketVerificationContext {
-                    policy_instance_id: live_hub.policy_instance_id,
-                    lease_generation: active_run_lease_generation(&inner, action_id),
-                    producer_epoch: live_hub.producer_epoch,
-                    model_generation: live_hub.model_generation,
-                    invalidation_generation: live_hub.invalidation_generation,
-                    clock_handshake_generation: live_hub.clock_handshake_generation,
-                    now_armd_ms: live_hub.now_armd_ms,
-                }
-            });
-            let commit_vision_target = if let (Some(spec), Some(col)) = (&vision_spec, &collector) {
-                col.latest()
-                    .map(|latest| {
-                        extract_top1_target(&latest, spec)
-                            .map_or(DetectorTargetIdentity::Absent, |(_, id)| id)
-                    })
-                    .or(vision_target)
-            } else {
-                vision_target
-            };
-            let gate_params = CommitGateParams {
-                max_fresh_joint_age_ms,
-                max_cached_joint_age_ms: max_source_joint_age_ms,
-                max_fresh_vision_age_ms,
-                max_cached_vision_age_ms: max_source_vision_age_ms,
-                horizon_ms,
-                vision_generation: locked_generation,
-                vision_target: commit_vision_target,
-                live_ticket_ctx: commit_ticket_ctx,
-                embedding_clock_override_ms,
-            };
+            let live_lease = active_run_lease_generation(&inner, action_id);
             let (target, committed_period, input_age_ms, post_vision_age_ms) =
-                match prepared.commit_gate_now(
+                match evaluate_final_commit_gate(
+                    &mut prepared,
+                    Instant::now(),
                     interval_origin_std,
                     period_ns,
                     last_committed_period,
-                    &gate_params,
+                    max_fresh_joint_age_ms,
+                    max_source_joint_age_ms,
+                    max_fresh_vision_age_ms,
+                    max_source_vision_age_ms,
+                    horizon_ms,
+                    video_embedding_spec.as_ref(),
+                    vision_spec.as_ref(),
+                    _hub_guard.as_ref(),
+                    live_lease,
+                    collector.as_ref(),
+                    locked_generation,
+                    base_input_age_ms,
+                    captured_at,
+                    vision_captured_at,
+                    vision_target,
+                    emb_ticket.as_ref(),
+                    emb_mapped_and_unc_ms,
                 ) {
-                    Ok((CommitGateDecision::Submit { target, commit_period }, gate_now)) => {
-                        let input_age = base_input_age_ms.map(|base| {
-                            base.saturating_add(
-                                gate_now
-                                    .saturating_duration_since(captured_at)
-                                    .as_millis()
-                                    .min(u64::MAX as u128) as u64,
-                            )
-                        });
-                        let vis_age = if let Some((mapped_ms, unc_ms)) = emb_mapped_and_unc_ms {
-                            let now_ms = embedding_clock_override_ms
-                                .unwrap_or_else(|| monotonic_ms_at(gate_now));
-                            Some(now_ms.saturating_sub(mapped_ms).saturating_add(unc_ms))
-                        } else {
-                            vision_captured_at.map(|cap| {
-                                gate_now
-                                    .saturating_duration_since(cap)
-                                    .as_millis()
-                                    .min(u64::MAX as u128) as u64
-                            })
-                        };
-                        (target, commit_period, input_age, vis_age)
-                    }
-                    Ok((CommitGateDecision::Skip { .. }, _)) => {
+                    FinalCommitGateOutcome::Submit {
+                        target,
+                        commit_period,
+                        input_age_ms,
+                        post_vision_age_ms,
+                        ..
+                    } => (target, commit_period, input_age_ms, post_vision_age_ms),
+                    FinalCommitGateOutcome::Skip => continue,
+                    FinalCommitGateOutcome::Hold => {
+                        inner.hold_policy_run(action_id);
                         continue;
                     }
-                    Err(e) => {
-                        prepared.clear_chunk_buffer();
-                        let reason = match e {
-                            PolicyError::NonFinite(_) => "NON_FINITE",
-                            _ => "INFERENCE_ERROR",
-                        };
-                        inner.fail_policy_run(action_id, reason, e.to_string());
+                    FinalCommitGateOutcome::Fail { reason, message } => {
+                        inner.fail_policy_run(action_id, reason, message);
                         break;
                     }
                 };
@@ -2957,55 +3106,6 @@ async fn executor_commit_gate(
         }
     }
 
-    if video_embedding_spec.is_none() {
-        if let (Some(spec), Some(vis_cap)) = (vision_spec, vision_captured_at) {
-            let age_ms = Instant::now()
-                .saturating_duration_since(vis_cap)
-                .as_millis()
-                .min(u64::MAX as u128) as u64;
-            if age_ms > spec.max_staleness_ms {
-                prepared.clear_chunk_buffer();
-                return match spec.on_stale {
-                    VisionStalePolicy::Stop => ExecutorCommitOutcome::Fail {
-                        reason: "VISION_STALE",
-                        message: format!(
-                            "Vision frame became stale before step commit ({age_ms} ms > {} ms)",
-                            spec.max_staleness_ms
-                        ),
-                    },
-                    VisionStalePolicy::Hold => ExecutorCommitOutcome::Hold,
-                };
-            }
-        }
-        if let (Some(spec), Some(col)) = (vision_spec, collector) {
-            if spec.require_model_generation {
-                if let Some(latest_frame) = col.latest() {
-                    if latest_frame.model_generation != locked_generation {
-                        prepared.clear_chunk_buffer();
-                        let (reason, message) = match latest_frame.model_generation {
-                            None => (
-                                "VISION_GENERATION_MISSING",
-                                format!(
-                                    "Vision frame {} missing required model_generation before step commit",
-                                    latest_frame.frame_id
-                                ),
-                            ),
-                            Some(new_gen) => (
-                                "VISION_GENERATION_CHANGED",
-                                format!(
-                                    "Vision model generation changed from {} to {new_gen} before step commit",
-                                    locked_generation
-                                        .map_or_else(|| "none".to_string(), |g| g.to_string())
-                                ),
-                            ),
-                        };
-                        return ExecutorCommitOutcome::Fail { reason, message };
-                    }
-                }
-            }
-        }
-    }
-
     if let Some(gate) = verified_release_gate {
         if let Some(emb) = video_embedding_spec {
             if let Err(msg) = verify_embedding_release_gate(gate, emb) {
@@ -3039,270 +3139,251 @@ async fn executor_commit_gate(
         }
     }
 
-    // Synchronous critical section: hold `HubCommitGuard` across `InferenceTicket::verify`,
-    // `commit_gate_now`, and immediate `TargetPort::submit_policy_with_validity` (NO `.await`!).
+    // Synchronous critical section: hold `HubCommitGuard` across `evaluate_final_commit_gate`
+    // and immediate publication (for Live mode, inside `handle.submit_policy_gated` so no
+    // dispatcher mutex stall can happen between `gate_now` slot selection and triple-buffer
+    // publish; NO `.await` while held!).
     let hub_guard = embedding_hub.map(|hub| hub.lock_for_commit());
-    let hold_on_stale =
-        video_embedding_spec.is_some_and(|s| s.on_stale == VisionStalePolicy::Hold);
-
-    let mirror_lease = supervisor.lease_generation();
-    let fenced_lease = supervisor.atomic_fenced_lease_gen();
-    let hub_active = supervisor.hub().latest().is_some_and(|s| {
-        s.obs
-            .policy
-            .as_ref()
-            .is_some_and(|p| p.active && p.action_id == action_id)
-    });
-    let live_lease = (hub_active
-        && mirror_lease == lease_generation
-        && fenced_lease < lease_generation)
-        .then_some(lease_generation);
-
-    if let (Some(ticket), Some(ref guard)) = (emb_ticket, &hub_guard) {
-        let live_hub = guard.live_ticket_state();
-        let ctx = TicketVerificationContext {
-            policy_instance_id: live_hub.policy_instance_id,
-            lease_generation: live_lease,
-            producer_epoch: live_hub.producer_epoch,
-            model_generation: live_hub.model_generation,
-            invalidation_generation: live_hub.invalidation_generation,
-            clock_handshake_generation: live_hub.clock_handshake_generation,
-            now_armd_ms: live_hub.now_armd_ms,
-        };
-        match ticket.verify(&ctx) {
-            Ok(()) => {}
-            Err(TicketViolation::ClockHandshakeGenerationMismatch { expected, actual }) => {
-                prepared.clear_chunk_buffer();
-                if actual != 0 && guard.is_unbroken_active_renewal(expected) {
-                    return ExecutorCommitOutcome::Hold;
-                }
-                let now_armd_ms = live_hub.now_armd_ms;
-                if now_armd_ms > ticket.clock_handshake_expires_at_ms() {
-                    let exp = TicketViolation::ClockHandshakeExpired {
-                        now_ms: now_armd_ms,
-                        expires_at_ms: ticket.clock_handshake_expires_at_ms(),
-                    };
-                    return ExecutorCommitOutcome::Fail {
-                        reason: exp.code(),
-                        message: exp.message(),
-                    };
-                }
-                let v = TicketViolation::ClockHandshakeGenerationMismatch { expected, actual };
-                return ExecutorCommitOutcome::Fail {
-                    reason: v.code(),
-                    message: v.message(),
-                };
-            }
-            Err(
-                TicketViolation::WindowNewestExpired { .. }
-                | TicketViolation::WindowOldestExpired { .. },
-            ) if hold_on_stale => {
-                prepared.clear_chunk_buffer();
-                return ExecutorCommitOutcome::Hold;
-            }
-            Err(violation) => {
-                prepared.clear_chunk_buffer();
-                return ExecutorCommitOutcome::Fail {
-                    reason: violation.code(),
-                    message: violation.message(),
-                };
-            }
-        }
-    }
-
-    let embedding_clock_override_ms = hub_guard.as_ref().and_then(|g| g.test_now_ms());
-    let commit_ticket_ctx = hub_guard.as_ref().map(|guard| {
-        let live_hub = guard.live_ticket_state();
-        TicketVerificationContext {
-            policy_instance_id: live_hub.policy_instance_id,
-            lease_generation: live_lease,
-            producer_epoch: live_hub.producer_epoch,
-            model_generation: live_hub.model_generation,
-            invalidation_generation: live_hub.invalidation_generation,
-            clock_handshake_generation: live_hub.clock_handshake_generation,
-            now_armd_ms: live_hub.now_armd_ms,
-        }
-    });
-    let commit_vision_target = if let (Some(spec), Some(col)) = (vision_spec, collector) {
-        col.latest()
-            .map(|latest| {
-                extract_top1_target(&latest, spec)
-                    .map_or(DetectorTargetIdentity::Absent, |(_, id)| id)
-            })
-            .or(vision_target)
-    } else {
-        vision_target
-    };
-    let gate_params = CommitGateParams {
-        max_fresh_joint_age_ms,
-        max_cached_joint_age_ms: max_source_joint_age_ms,
-        max_fresh_vision_age_ms,
-        max_cached_vision_age_ms: max_source_vision_age_ms,
-        horizon_ms,
-        vision_generation: locked_generation,
-        vision_target: commit_vision_target,
-        live_ticket_ctx: commit_ticket_ctx,
-        embedding_clock_override_ms,
-    };
-    let (target, commit_period, gate_now) = match prepared.commit_gate_now(
-        interval_origin_std,
-        period_ns,
-        last_committed_period,
-        &gate_params,
-    ) {
-        Ok((CommitGateDecision::Submit { target, commit_period }, gate_now)) => {
-            (target, commit_period, gate_now)
-        }
-        Ok((CommitGateDecision::Skip { .. }, _)) => {
-            drop(hub_guard);
-            step_stats.record(infer_us, step_us);
-            return ExecutorCommitOutcome::Skip;
-        }
-        Err(e) => {
-            prepared.clear_chunk_buffer();
-            drop(hub_guard);
-            let reason = match e {
-                PolicyError::NonFinite(_) => "NON_FINITE",
-                _ => "INFERENCE_ERROR",
-            };
-            return ExecutorCommitOutcome::Fail {
-                reason,
-                message: e.to_string(),
-            };
-        }
-    };
-
-    let post_vision_age_ms = if let Some((mapped_ms, unc_ms)) = emb_mapped_and_unc_ms {
-        let now_ms = embedding_clock_override_ms.unwrap_or_else(|| monotonic_ms_at(gate_now));
-        Some(now_ms.saturating_sub(mapped_ms).saturating_add(unc_ms))
-    } else {
-        vision_captured_at.map(|cap| {
-            gate_now
-                .saturating_duration_since(cap)
-                .as_millis()
-                .min(u64::MAX as u128) as u64
-        })
-    };
-    let input_age_ms = base_input_age_ms.map(|base| {
-        base.saturating_add(
-            gate_now
-                .saturating_duration_since(captured_at)
-                .as_millis()
-                .min(u64::MAX as u128) as u64,
-        )
-    });
 
     if mode == PolicyMode::Shadow {
+        let mirror_lease = supervisor.lease_generation();
+        let fenced_lease = supervisor.atomic_fenced_lease_gen();
+        let hub_active = supervisor.hub().latest().is_some_and(|s| {
+            s.obs
+                .policy
+                .as_ref()
+                .is_some_and(|p| p.active && p.action_id == action_id)
+        });
+        let live_lease = (hub_active
+            && mirror_lease == lease_generation
+            && fenced_lease < lease_generation)
+            .then_some(lease_generation);
+        let outcome = evaluate_final_commit_gate(
+            prepared,
+            Instant::now(),
+            interval_origin_std,
+            period_ns,
+            last_committed_period,
+            max_fresh_joint_age_ms,
+            max_source_joint_age_ms,
+            max_fresh_vision_age_ms,
+            max_source_vision_age_ms,
+            horizon_ms,
+            video_embedding_spec,
+            vision_spec,
+            hub_guard.as_ref(),
+            live_lease,
+            collector,
+            locked_generation,
+            base_input_age_ms,
+            captured_at,
+            vision_captured_at,
+            vision_target,
+            emb_ticket,
+            emb_mapped_and_unc_ms,
+        );
         drop(hub_guard);
-        if !hub_active || handle.is_policy_closed(action_id) {
+        return match outcome {
+            FinalCommitGateOutcome::Submit {
+                target,
+                commit_period,
+                input_age_ms,
+                post_vision_age_ms,
+                ..
+            } => {
+                if !hub_active || handle.is_policy_closed(action_id) {
+                    prepared.clear_chunk_buffer();
+                    return ExecutorCommitOutcome::RtEnded;
+                }
+                *shadow_steps = shadow_steps.saturating_add(1);
+                step_stats.record(infer_us, step_us);
+                supervisor.hub().update_policy_diag(PolicyDiagUpdate {
+                    action_id,
+                    is_shadow: true,
+                    steps: *shadow_steps,
+                    stats: step_stats.report(),
+                    last_input_age_ms: input_age_ms,
+                    last_vision_age_ms: post_vision_age_ms,
+                    vision_frame_id,
+                    last_shadow_target: Some(target),
+                });
+                ExecutorCommitOutcome::Submitted { commit_period }
+            }
+            FinalCommitGateOutcome::Skip => {
+                step_stats.record(infer_us, step_us);
+                ExecutorCommitOutcome::Skip
+            }
+            FinalCommitGateOutcome::Hold => ExecutorCommitOutcome::Hold,
+            FinalCommitGateOutcome::Fail { reason, message } => {
+                ExecutorCommitOutcome::Fail { reason, message }
+            }
+        };
+    }
+
+    // Live mode: run `evaluate_final_commit_gate` and `submit` atomically under BOTH `hub_guard`
+    // and the target-dispatcher mutex (`submit_policy_gated`).
+    let outcome = handle.submit_policy_gated(action_id, |is_closed, submit| {
+        let mirror_lease = supervisor.lease_generation();
+        let fenced_lease = supervisor.atomic_fenced_lease_gen();
+        let hub_active = supervisor.hub().latest().is_some_and(|s| {
+            s.obs
+                .policy
+                .as_ref()
+                .is_some_and(|p| p.active && p.action_id == action_id)
+        });
+        let live_lease = (hub_active
+            && mirror_lease == lease_generation
+            && fenced_lease < lease_generation)
+            .then_some(lease_generation);
+        if is_closed || live_lease.is_none() {
             prepared.clear_chunk_buffer();
             return ExecutorCommitOutcome::RtEnded;
         }
-        *shadow_steps = shadow_steps.saturating_add(1);
-        step_stats.record(infer_us, step_us);
-        supervisor.hub().update_policy_diag(PolicyDiagUpdate {
-            action_id,
-            is_shadow: true,
-            steps: *shadow_steps,
-            stats: step_stats.report(),
-            last_input_age_ms: input_age_ms,
-            last_vision_age_ms: post_vision_age_ms,
-            vision_frame_id,
-            last_shadow_target: Some(target),
-        });
-        return ExecutorCommitOutcome::Submitted { commit_period };
-    }
-
-    // Live mode: submit synchronously to `TargetPort::submit_policy_with_validity` BEFORE dropping `hub_guard`.
-    if live_lease.is_none() || handle.is_policy_closed(action_id) {
-        prepared.clear_chunk_buffer();
-        drop(hub_guard);
-        return ExecutorCommitOutcome::RtEnded;
-    }
-    let vision_at = if let Some(age_ms) = post_vision_age_ms.filter(|_| video_embedding_spec.is_some()) {
-        gate_now.checked_sub(Duration::from_millis(age_ms))
-    } else {
-        vision_captured_at
-    };
-    let validity = if let (Some(ticket), Some(_)) = (emb_ticket, &hub_guard) {
-        let live_now_ms = embedding_clock_override_ms.unwrap_or_else(|| monotonic_ms_at(gate_now));
-        let win_dl_ms = ticket
-            .window_oldest_deadline_ms()
-            .min(ticket.window_newest_deadline_ms());
-        let win_rem = win_dl_ms.saturating_sub(live_now_ms);
-        let hs_rem = ticket
-            .clock_handshake_expires_at_ms()
-            .saturating_sub(live_now_ms);
-        crate::rt_core::mailbox::PolicyValidityBounds {
-            vision_window_expires_at: Some(gate_now + Duration::from_millis(win_rem)),
-            handshake_expires_at: Some(gate_now + Duration::from_millis(hs_rem)),
-        }
-    } else {
-        crate::rt_core::mailbox::PolicyValidityBounds::default()
-    };
-    let policy_target = PolicyTarget {
-        action_id,
-        stamp: PolicyStamp {
-            authority: snap_authority,
-            authorization: snap_auth_gen,
-            max_input_age,
-        },
-        targets: &target,
-        input_at: oldest_input_at,
-        vision_at,
-        vision_frame_id,
-    };
-    let sub = handle.submit_policy_with_validity(&policy_target, validity);
-    drop(hub_guard);
-
-    match sub {
-        Submitted::Accepted | Submitted::Coalesced { .. } => {
-            step_stats.record(infer_us, step_us);
-            supervisor.hub().update_policy_diag(PolicyDiagUpdate {
-                action_id,
-                is_shadow: false,
-                steps: 0,
-                stats: step_stats.report(),
-                last_input_age_ms: None,
-                last_vision_age_ms: None,
-                vision_frame_id: None,
-                last_shadow_target: None,
-            });
-            ExecutorCommitOutcome::Submitted { commit_period }
-        }
-        Submitted::Busy => {
-            step_stats.record_skipped();
-            supervisor.hub().update_policy_diag(PolicyDiagUpdate {
-                action_id,
-                is_shadow: false,
-                steps: 0,
-                stats: step_stats.report(),
-                last_input_age_ms: None,
-                last_vision_age_ms: None,
-                vision_frame_id: None,
-                last_shadow_target: None,
-            });
-            ExecutorCommitOutcome::Submitted { commit_period }
-        }
-        Submitted::OutOfOrder => {
+        let gate_now = Instant::now();
+        if deadline.is_some_and(|dl| gate_now >= dl) {
             prepared.clear_chunk_buffer();
-            if handle.is_policy_closed(action_id) {
-                ExecutorCommitOutcome::RtEnded
-            } else {
-                ExecutorCommitOutcome::Fail {
-                    reason: "POLICY_FAILED",
-                    message: "Policy target stream closed or out of order".into(),
+            return ExecutorCommitOutcome::Finish("MAX_SECONDS");
+        }
+        match evaluate_final_commit_gate(
+            prepared,
+            gate_now,
+            interval_origin_std,
+            period_ns,
+            last_committed_period,
+            max_fresh_joint_age_ms,
+            max_source_joint_age_ms,
+            max_fresh_vision_age_ms,
+            max_source_vision_age_ms,
+            horizon_ms,
+            video_embedding_spec,
+            vision_spec,
+            hub_guard.as_ref(),
+            live_lease,
+            collector,
+            locked_generation,
+            base_input_age_ms,
+            captured_at,
+            vision_captured_at,
+            vision_target,
+            emb_ticket,
+            emb_mapped_and_unc_ms,
+        ) {
+            FinalCommitGateOutcome::Submit {
+                target,
+                commit_period,
+                gate_now,
+                eval_now_ms,
+                post_vision_age_ms,
+                ..
+            } => {
+                let vision_at = if let Some(age_ms) =
+                    post_vision_age_ms.filter(|_| video_embedding_spec.is_some())
+                {
+                    gate_now.checked_sub(Duration::from_millis(age_ms))
+                } else {
+                    vision_captured_at
+                };
+                let (vision_window_expires_at, mut handshake_expires_at) =
+                    if let (Some(ticket), Some(_)) = (emb_ticket, &hub_guard) {
+                        let win_dl_ms = ticket
+                            .window_oldest_deadline_ms()
+                            .min(ticket.window_newest_deadline_ms());
+                        let win_rem = win_dl_ms.saturating_sub(eval_now_ms);
+                        let hs_rem = ticket
+                            .clock_handshake_expires_at_ms()
+                            .saturating_sub(eval_now_ms);
+                        (
+                            gate_now.checked_add(Duration::from_millis(win_rem)),
+                            gate_now.checked_add(Duration::from_millis(hs_rem)),
+                        )
+                    } else {
+                        (None, None)
+                    };
+                if let Some(src_hs_exp) = prepared.last_commit_handshake_expires_at() {
+                    handshake_expires_at = Some(
+                        handshake_expires_at.map_or(src_hs_exp, |cur| cur.min(src_hs_exp)),
+                    );
+                }
+                let validity = crate::rt_core::mailbox::PolicyValidityBounds {
+                    vision_window_expires_at,
+                    handshake_expires_at,
+                    chunk_slot_expires_at: prepared.last_commit_slot_expires_at(),
+                };
+                let policy_target = PolicyTarget {
+                    action_id,
+                    stamp: PolicyStamp {
+                        authority: snap_authority,
+                        authorization: snap_auth_gen,
+                        max_input_age,
+                    },
+                    targets: &target,
+                    input_at: oldest_input_at,
+                    vision_at,
+                    vision_frame_id,
+                };
+                let sub = submit(&policy_target, validity);
+                match sub {
+                    Submitted::Accepted | Submitted::Coalesced { .. } => {
+                        step_stats.record(infer_us, step_us);
+                        supervisor.hub().update_policy_diag(PolicyDiagUpdate {
+                            action_id,
+                            is_shadow: false,
+                            steps: 0,
+                            stats: step_stats.report(),
+                            last_input_age_ms: None,
+                            last_vision_age_ms: None,
+                            vision_frame_id: None,
+                            last_shadow_target: None,
+                        });
+                        ExecutorCommitOutcome::Submitted { commit_period }
+                    }
+                    Submitted::Busy => {
+                        prepared.clear_chunk_buffer();
+                        step_stats.record_skipped();
+                        supervisor.hub().update_policy_diag(PolicyDiagUpdate {
+                            action_id,
+                            is_shadow: false,
+                            steps: 0,
+                            stats: step_stats.report(),
+                            last_input_age_ms: None,
+                            last_vision_age_ms: None,
+                            vision_frame_id: None,
+                            last_shadow_target: None,
+                        });
+                        ExecutorCommitOutcome::Skip
+                    }
+                    Submitted::OutOfOrder => {
+                        prepared.clear_chunk_buffer();
+                        if is_closed {
+                            ExecutorCommitOutcome::RtEnded
+                        } else {
+                            ExecutorCommitOutcome::Fail {
+                                reason: "POLICY_FAILED",
+                                message: "Policy target stream closed or out of order".into(),
+                            }
+                        }
+                    }
+                    Submitted::StreamsFull => {
+                        prepared.clear_chunk_buffer();
+                        ExecutorCommitOutcome::Fail {
+                            reason: "STREAMS_FULL",
+                            message: "Target mailbox has too many open streams".into(),
+                        }
+                    }
                 }
             }
-        }
-        Submitted::StreamsFull => {
-            prepared.clear_chunk_buffer();
-            ExecutorCommitOutcome::Fail {
-                reason: "STREAMS_FULL",
-                message: "Target mailbox has too many open streams".into(),
+            FinalCommitGateOutcome::Skip => {
+                step_stats.record(infer_us, step_us);
+                ExecutorCommitOutcome::Skip
+            }
+            FinalCommitGateOutcome::Hold => ExecutorCommitOutcome::Hold,
+            FinalCommitGateOutcome::Fail { reason, message } => {
+                ExecutorCommitOutcome::Fail { reason, message }
             }
         }
-    }
+    });
+    drop(hub_guard);
+    outcome
 }
 
 /// Spawn the off-thread policy runner for `OWNER_EXECUTOR`: zero `SupervisorLock` reads,
@@ -6169,5 +6250,187 @@ mod chunking_tests {
             tgt_d[0]
         );
         exec_d.stop_and_join();
+    }
+
+    #[test]
+    fn chunking_r1_single_step_detector_identity_age_and_chunk_slot_validity_bounds() {
+        use crate::rt_core::broker::{Authority, BootId};
+        use crate::rt_core::ids::ArmId;
+        use crate::rt_core::mailbox::{
+            PolicyValidityBounds, StreamId, TargetAuthority, TargetFrame, MAX_DOF,
+        };
+
+        let state_dim = ArmConfig::default().dof;
+        let state = vec![0.0f32; state_dim];
+        let origin = Instant::now();
+        let period_ns = Duration::from_millis(50).as_nanos();
+
+        // 1. Blocker 1: single-step (chunk_size=1) commit_gate enforces detector target identity
+        //    AND detector source age against gate `now`.
+        let (snap1, contract1, cfg1) = make_chunk_snapshot_and_contract(1, 1, None);
+        let c1 = make_constant_chunk(state_dim, &[0.12]);
+        let (backend1, _) = CountingChunkBackend::new(state_dim, state_dim, vec![c1]);
+        let mut prep1 =
+            PreparedPolicy::from_backend(snap1, contract1, Box::new(backend1), &cfg1).unwrap();
+        let target_a = DetectorTargetIdentity::from_detection(None, "cube", [0.1, 0.1, 0.3, 0.3]);
+        let target_b = DetectorTargetIdentity::from_detection(None, "mug", [0.6, 0.6, 0.8, 0.8]);
+
+        let mut src_a = ChunkSource::from_joint(origin, Some(5));
+        src_a.vision_captured_at = Some(origin);
+        src_a.vision_generation = Some(1);
+        src_a.vision_target = Some(target_a);
+        prep1.plan_chunk_step(&state, None, 0, src_a, None).unwrap();
+
+        // Target replaced by B during inference -> single-step commit_gate MUST Skip.
+        let gate_replaced = CommitGateParams {
+            max_fresh_joint_age_ms: 100,
+            max_cached_joint_age_ms: 100,
+            max_fresh_vision_age_ms: Some(100),
+            max_cached_vision_age_ms: Some(100),
+            horizon_ms: 50,
+            vision_generation: Some(1),
+            vision_target: Some(target_b),
+            live_ticket_ctx: None,
+            embedding_clock_override_ms: None,
+        };
+        assert_eq!(
+            prep1
+                .commit_gate(origin + Duration::from_millis(10), origin, period_ns, None, &gate_replaced)
+                .unwrap(),
+            CommitGateDecision::Skip { commit_period: 0 }
+        );
+
+        // Detector source expired (> max_fresh_vision_age_ms=50 ms) -> single-step commit_gate MUST Skip.
+        prep1.plan_chunk_step(&state, None, 0, src_a, None).unwrap();
+        let gate_stale_vis = CommitGateParams {
+            max_fresh_vision_age_ms: Some(50),
+            vision_target: Some(target_a),
+            ..gate_replaced.clone()
+        };
+        assert_eq!(
+            prep1
+                .commit_gate(origin + Duration::from_millis(60), origin, period_ns, None, &gate_stale_vis)
+                .unwrap(),
+            CommitGateDecision::Skip { commit_period: 1 }
+        );
+
+        // Matching target within age -> single-step Submit succeeds.
+        prep1.plan_chunk_step(&state, None, 0, src_a, None).unwrap();
+        assert!(matches!(
+            prep1
+                .commit_gate(origin + Duration::from_millis(20), origin, period_ns, None, &gate_stale_vis)
+                .unwrap(),
+            CommitGateDecision::Submit { commit_period: 0, .. }
+        ));
+
+        // 2. Blocker 2 + Major 4: chunked commit_gate computes strictest contributor expiry capped
+        //    by period_end, and TargetFrame::check_policy_with_validity enforces it as DEADLINE_EXPIRED.
+        let (snap4, contract4, cfg4) = make_chunk_snapshot_and_contract(4, 2, None);
+        let c4 = make_constant_chunk(state_dim, &[0.05, 0.15, 0.25, 0.35]);
+        let (backend4, _) = CountingChunkBackend::new(state_dim, 4 * state_dim, vec![c4]);
+        let mut prep4 =
+            PreparedPolicy::from_backend(snap4, contract4, Box::new(backend4), &cfg4).unwrap();
+        let origin_ms = monotonic_ms_at(origin);
+        let ticket_tight = InferenceTicket::new(
+            1,
+            7,
+            1,
+            Some(1),
+            1,
+            1,
+            origin_ms + 40, // tight handshake expiry
+            origin_ms + 25, // tight newest deadline
+            origin_ms + 500,
+        );
+        let mut src4 = ChunkSource::from_joint(origin, Some(5));
+        src4.embedding_ticket = Some(ticket_tight);
+        prep4.plan_chunk_step(&state, None, 0, src4, None).unwrap();
+        let live_ctx = TicketVerificationContext {
+            policy_instance_id: Some(1),
+            lease_generation: Some(7),
+            producer_epoch: Some(1),
+            model_generation: Some(1),
+            invalidation_generation: 1,
+            clock_handshake_generation: 1,
+            now_armd_ms: origin_ms + 10,
+        };
+        let gate4 = CommitGateParams {
+            max_fresh_joint_age_ms: 100,
+            max_cached_joint_age_ms: 200,
+            max_fresh_vision_age_ms: None,
+            max_cached_vision_age_ms: None,
+            horizon_ms: 100,
+            vision_generation: None,
+            vision_target: None,
+            live_ticket_ctx: Some(live_ctx),
+            embedding_clock_override_ms: Some(origin_ms + 10),
+        };
+        assert!(matches!(
+            prep4
+                .commit_gate(origin + Duration::from_millis(10), origin, period_ns, None, &gate4)
+                .unwrap(),
+            CommitGateDecision::Submit { commit_period: 0, .. }
+        ));
+        let slot_exp = prep4
+            .last_commit_slot_expires_at()
+            .expect("chunked commit must record slot expiry");
+        let hs_exp = prep4
+            .last_commit_handshake_expires_at()
+            .expect("embedding contributor must record handshake expiry");
+        // Fresh slot 0 has ticket newest deadline remaining 15 ms (25 - 10) < period_end remaining 40 ms.
+        assert_eq!(slot_exp, origin + Duration::from_millis(25));
+        assert_eq!(hs_exp, origin + Duration::from_millis(40));
+
+        // RT mailbox check passes at slot_exp and refuses DEADLINE_EXPIRED 1 ms after slot_exp!
+        let mut q = [0.0f32; MAX_DOF];
+        q[0] = 0.05;
+        let auth = Authority {
+            lease_generation: 7,
+            epoch: 1,
+            stop_generation: 0,
+            config_revision: 0,
+            parent_generation: 0,
+        };
+        let frame = TargetFrame {
+            arm: ArmId(1),
+            boot: BootId(1),
+            stream: StreamId(1),
+            seq: 1,
+            authority: auth,
+            policy_generation: 1,
+            input_at: origin + Duration::from_millis(10),
+            vision_at: None,
+            vision_frame_id: None,
+            deadline: origin + Duration::from_millis(200),
+            dof: state_dim as u8,
+            q,
+            replaceable: false,
+        };
+        let ta = TargetAuthority {
+            stream: Some(StreamId(1)),
+            policy_generation: 1,
+            max_input_age: Some(Duration::from_millis(100)),
+            max_vision_age: None,
+        };
+        let validity = PolicyValidityBounds {
+            vision_window_expires_at: Some(origin + Duration::from_millis(100)),
+            handshake_expires_at: Some(hs_exp),
+            chunk_slot_expires_at: Some(slot_exp),
+        };
+        assert_eq!(
+            frame.check_policy_with_validity(ArmId(1), BootId(1), slot_exp, &auth, &ta, validity),
+            None
+        );
+        assert_eq!(
+            frame.check_policy_with_validity(
+                ArmId(1),
+                BootId(1),
+                slot_exp + Duration::from_millis(1),
+                &auth,
+                &ta,
+                validity
+            ),
+            Some("DEADLINE_EXPIRED")
+        );
     }
 }

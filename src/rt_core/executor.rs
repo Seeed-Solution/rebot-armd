@@ -3026,6 +3026,79 @@ impl ServoTargetDispatcher {
         sub
     }
 
+    /// Runs a synchronous final policy commit gate and optional mailbox publication under a
+    /// single acquisition of the dispatcher mutex (after draining outcomes and verifying stream
+    /// liveness), so no mutex stall can occur between slot selection (`gate_now`) and triple-buffer
+    /// publication.
+    #[cfg(feature = "policy-runtime")]
+    pub(crate) fn submit_policy_gated<R, F>(
+        &self,
+        hub: &StateHub,
+        action_id: u64,
+        gate: F,
+    ) -> R
+    where
+        F: FnOnce(
+            bool,
+            &mut dyn FnMut(
+                &crate::supervisor::targets::PolicyTarget<'_>,
+                super::mailbox::PolicyValidityBounds,
+            ) -> super::mailbox::Submitted,
+        ) -> R,
+    {
+        let mut resolved_cmds = Vec::new();
+        let mut stream_refusals = Vec::new();
+        let res = {
+            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            self.sync_authoritative_fence_locked(&mut g);
+            g.pop_outcomes_locked(hub, &mut resolved_cmds, &mut stream_refusals);
+            let is_closed = g.closed
+                || self.exited.load(Ordering::Acquire)
+                || g.port.is_policy_closed(action_id);
+            let mut submit_fn =
+                |target: &crate::supervisor::targets::PolicyTarget<'_>,
+                 validity: super::mailbox::PolicyValidityBounds|
+                 -> super::mailbox::Submitted {
+                    if is_closed {
+                        return super::mailbox::Submitted::OutOfOrder;
+                    }
+                    let coalesced_before = g.port.coalesced();
+                    let prev_key = g.last_inflight_key;
+                    let sub = g.port.submit_policy_with_validity(target, validity);
+                    match sub {
+                        super::mailbox::Submitted::Accepted
+                        | super::mailbox::Submitted::Coalesced { .. } => {
+                            g.policy_submitted_count = g.policy_submitted_count.saturating_add(1);
+                            if target.action_id != 0
+                                && !g.tracked_policy_streams.contains(&target.action_id)
+                            {
+                                if g.tracked_policy_streams.len() >= 64 {
+                                    g.tracked_policy_streams.pop_front();
+                                }
+                                g.tracked_policy_streams.push_back(target.action_id);
+                            }
+                            let assigned_seq = g.port.last_seq();
+                            let sid = crate::supervisor::targets::policy_stream(target.action_id);
+                            g.last_inflight_key = Some((sid, assigned_seq));
+                            if matches!(sub, super::mailbox::Submitted::Coalesced { .. })
+                                || g.port.coalesced() > coalesced_before
+                            {
+                                g.note_coalesced_locked(prev_key, &mut resolved_cmds);
+                            }
+                        }
+                        super::mailbox::Submitted::Busy => {
+                            g.policy_busy_count = g.policy_busy_count.saturating_add(1);
+                        }
+                        _ => {}
+                    }
+                    sub
+                };
+            gate(is_closed, &mut submit_fn)
+        };
+        Self::deliver_drained(hub, (resolved_cmds, stream_refusals));
+        res
+    }
+
     #[cfg(feature = "policy-runtime")]
     pub(crate) fn close_policy(&self, action_id: u64) {
         if action_id == 0 {
@@ -3614,6 +3687,25 @@ impl RtExecutorHandle {
         self.shared
             .servo_dispatcher
             .submit_policy(&self.shared.hub, target, validity)
+    }
+
+    /// Runs `gate` synchronously inside the target-dispatcher lock (after draining outcomes and
+    /// checking stream closure) so `commit_gate(now)` slot selection and triple-buffer publication
+    /// execute atomically without intervening mutex waits.
+    #[cfg(feature = "policy-runtime")]
+    pub(crate) fn submit_policy_gated<R, F>(&self, action_id: u64, gate: F) -> R
+    where
+        F: FnOnce(
+            bool,
+            &mut dyn FnMut(
+                &crate::supervisor::targets::PolicyTarget<'_>,
+                super::mailbox::PolicyValidityBounds,
+            ) -> super::mailbox::Submitted,
+        ) -> R,
+    {
+        self.shared
+            .servo_dispatcher
+            .submit_policy_gated(&self.shared.hub, action_id, gate)
     }
 
     /// Closes policy stream `action_id` off-thread (idempotent; frees stream slot in `TargetWriter`).
