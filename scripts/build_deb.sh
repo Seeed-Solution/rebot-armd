@@ -308,6 +308,7 @@ if ! grep -q "^  \"version\": \"${VERSION}\"," "${MANIFEST}"; then
 fi
 find "${STAGING_DIR}/usr/share/rebot-teleop" -type f -exec chmod 0644 {} +
 chmod 0755 "${STAGING_DIR}/usr/share/rebot-teleop/rebot-vision-run"
+chmod 0755 "${STAGING_DIR}/usr/share/rebot-teleop/rebot-models-check"
 chmod 0755 "${STAGING_DIR}/usr/share/rebot-teleop/rebot-app-run"
 chmod 0755 "${STAGING_DIR}/usr/share/rebot-teleop/rebot-app-user"
 

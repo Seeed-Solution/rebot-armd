@@ -22,8 +22,11 @@ if id rebot-app >/dev/null 2>&1; then
     chmod 0755 /userdata/rebot-apps 2>/dev/null || true
 fi
 
-# rebot-vision: config and user models live on /userdata (models are not in the package)
-mkdir -p /userdata/rebot-teleop/models
+# rebot-vision: config and user models live on /userdata; bundled models ship in /usr/share/rebot-teleop/models
+mkdir -p /userdata/rebot-teleop/models /userdata/local/models
+if [ -x /usr/share/rebot-teleop/rebot-models-check ]; then
+    /usr/share/rebot-teleop/rebot-models-check || echo "warning: vision model check reported issues (see syslog)"
+fi
 # armd (root) writes its rotating log and black box here; kept across upgrades and removal
 mkdir -p /userdata/rebot-teleop/logs /userdata/rebot-teleop/blackbox
 chown root:root /userdata/rebot-teleop/logs /userdata/rebot-teleop/blackbox 2>/dev/null || true
