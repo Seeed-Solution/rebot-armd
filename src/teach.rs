@@ -2312,12 +2312,12 @@ pub async fn lease_free(
         }
         "/api/v1/episodes/delete" => {
             let id = required(body, "id")?.to_string();
-            let Some(claim) = sup.take_episode_for_delete_claim(&id).await? else {
+            let Some(guard) = sup.take_episode_for_delete_claim(&id).await? else {
                 return Err(StoreError::NotFound(id).into());
             };
             let s2 = st.clone();
             let id2 = id.clone();
-            blocking(move || s2.delete_files_with_claim(&id2, claim)).await?;
+            blocking(move || s2.delete_files_with_claim_guard(&id2, guard)).await?;
             Ok(json!({"deleted": id}))
         }
         "/api/v1/datasets/create" => {

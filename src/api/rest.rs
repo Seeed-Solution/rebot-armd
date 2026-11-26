@@ -692,7 +692,7 @@ pub async fn dataset_episode_delete(
     let claim = supervisor.take_episode_for_delete_claim(&id).await?;
     let id2 = id.clone();
     tokio::task::spawn_blocking(move || match claim {
-        Some(tok) => store.delete_files_with_claim(&id2, tok),
+        Some(guard) => store.delete_files_with_claim_guard(&id2, guard),
         None => store.delete_files(&id2),
     })
     .await

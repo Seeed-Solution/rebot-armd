@@ -13984,9 +13984,13 @@ impl ArmSupervisor {
 
     /// Linearizably verifies episode `id` is unreferenced (saved, running, or reserved) on the
     /// live owner, removes it from the `EpisodeStore` catalog on a blocking thread (off the Tokio
-    /// worker), and returns its unique deletion claim token (`Some(claim)`) if removed, `None` if
-    /// absent, or `Err(409 IN_USE)` if referenced.
-    pub async fn take_episode_for_delete_claim(&self, id: &str) -> Result<Option<u64>, ArmError> {
+    /// worker), and returns its RAII deletion claim guard (`Some(guard)`) if removed, `None` if
+    /// absent, or `Err(409 IN_USE)` if referenced. Dropping the guard on async cancellation marks
+    /// the claim retryable so the episode ID is never stranded.
+    pub async fn take_episode_for_delete_claim(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::recording::store::EpisodeDeleteClaimGuard>, ArmError> {
         use crate::recording::store::TakeEpisodeOutcome;
         loop {
             let rev0 = self.sequences_revision();
@@ -14000,7 +14004,7 @@ impl ArmSupervisor {
             .await
             .map_err(|e| ArmError::Internal(format!("episode delete take failed: {e}")))?;
             match outcome {
-                TakeEpisodeOutcome::Removed(claim) => return Ok(Some(claim)),
+                TakeEpisodeOutcome::Removed(guard) => return Ok(Some(guard)),
                 TakeEpisodeOutcome::NotFound => return Ok(None),
                 TakeEpisodeOutcome::Pinned => {
                     let mut users = self

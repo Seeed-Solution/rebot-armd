@@ -533,10 +533,47 @@ impl Drop for EpisodePinGuard {
     }
 }
 
+/// RAII guard for a single-episode deletion claim returned by
+/// [`EpisodeStore::take_if_unpinned_and_rev_matches`]. If the async request future is cancelled
+/// before [`EpisodeStore::delete_files_with_claim_guard`] completes, dropping the guard marks the
+/// claim retryable (`retryable = true`) so a subsequent DELETE can mint a fresh token and finish
+/// cleanup without stranding the episode ID.
+#[derive(Debug)]
+pub struct EpisodeDeleteClaimGuard {
+    catalog: Arc<Mutex<Catalog>>,
+    id: String,
+    claim: u64,
+    completed: bool,
+}
+
+impl EpisodeDeleteClaimGuard {
+    pub fn token(&self) -> u64 {
+        self.claim
+    }
+
+    fn mark_completed(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for EpisodeDeleteClaimGuard {
+    fn drop(&mut self) {
+        if self.completed || self.id.is_empty() {
+            return;
+        }
+        let mut cat = self.catalog.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = cat.deleting_episodes.get_mut(&self.id) {
+            if entry.0 == self.claim {
+                entry.1 = true;
+            }
+        }
+    }
+}
+
 /// Atomic outcome of [`EpisodeStore::take_if_unpinned_and_rev_matches`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum TakeEpisodeOutcome {
-    Removed(u64),
+    Removed(EpisodeDeleteClaimGuard),
     NotFound,
     Pinned,
     SequenceRevisionChanged,
@@ -1064,7 +1101,12 @@ impl EpisodeStore {
             cat.commit_tokens.remove(id);
             let claim = next_delete_claim();
             cat.deleting_episodes.insert(id.to_string(), (claim, false));
-            TakeEpisodeOutcome::Removed(claim)
+            TakeEpisodeOutcome::Removed(EpisodeDeleteClaimGuard {
+                catalog: Arc::clone(&self.catalog),
+                id: id.to_string(),
+                claim,
+                completed: false,
+            })
         } else if let Some((old_claim, true)) = cat.deleting_episodes.get(id).copied() {
             let new_claim = next_delete_claim();
             cat.deleting_episodes
@@ -1073,7 +1115,12 @@ impl EpisodeStore {
                 list.retain(|(eid, tok)| !(eid == id && *tok == old_claim));
                 !list.is_empty()
             });
-            TakeEpisodeOutcome::Removed(new_claim)
+            TakeEpisodeOutcome::Removed(EpisodeDeleteClaimGuard {
+                catalog: Arc::clone(&self.catalog),
+                id: id.to_string(),
+                claim: new_claim,
+                completed: false,
+            })
         } else {
             TakeEpisodeOutcome::NotFound
         }
@@ -1254,6 +1301,21 @@ impl EpisodeStore {
     pub fn delete_files_with_claim(&self, id: &str, claim: u64) -> Result<(), StoreError> {
         let _w = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.delete_files_with_claim_locked(id, claim)
+    }
+
+    /// Guard-owning variant of [`Self::delete_files_with_claim`] for async DELETE handlers: marks
+    /// `guard` completed on success (or absent files) and leaves `retryable = true` on I/O error.
+    pub fn delete_files_with_claim_guard(
+        &self,
+        id: &str,
+        mut guard: EpisodeDeleteClaimGuard,
+    ) -> Result<(), StoreError> {
+        let _w = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let res = self.delete_files_with_claim_locked(id, guard.claim);
+        if matches!(res, Ok(()) | Err(StoreError::NotFound(_))) {
+            guard.mark_completed();
+        }
+        res
     }
 
     /// Remove uncataloged legacy `<id>.parquet` / sidecar files (blocking).

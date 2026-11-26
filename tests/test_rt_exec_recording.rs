@@ -1035,6 +1035,31 @@ async fn executor_idempotent_publish_delayed_writer_config_interleaving_and_auth
     store.delete_dataset_taken_files("del_guard_ds", &taken_dg, dg_guard).unwrap();
     assert!(!store.has_dataset("del_guard_ds"));
 
+    // Abandoned single-episode DELETE claim guard marks claim retryable so a repeat DELETE rotates
+    // the token and finishes cleanup without stranding the episode ID (R6 Major).
+    let mut sc_aband = sc.clone();
+    sc_aband.id = "aband_del_ep".into();
+    store.publish_complete_episode(&sc_aband, &frames, None, Some(103), true).unwrap();
+    let abandoned_guard = rig
+        .sup
+        .take_episode_for_delete_claim("aband_del_ep")
+        .await
+        .unwrap()
+        .expect("initial take must return claim guard");
+    let old_tok = abandoned_guard.token();
+    drop(abandoned_guard); // simulate async request cancellation before unlink
+    let retry_guard = rig
+        .sup
+        .take_episode_for_delete_claim("aband_del_ep")
+        .await
+        .unwrap()
+        .expect("repeat take after cancelled delete must rotate claim");
+    assert_ne!(retry_guard.token(), old_tok);
+    store.delete_files_with_claim("aband_del_ep", old_tok).unwrap();
+    assert!(store.path_of("aband_del_ep").unwrap().is_file(), "old token must not unlink");
+    store.delete_files_with_claim_guard("aband_del_ep", retry_guard).unwrap();
+    assert!(!store.path_of("aband_del_ep").unwrap().exists());
+
     // (c) Delayed parquet writer on executor: RT keeps ticking with 0 allocs/locks, dataset stays
     //     pinned during Finalizing, RECORDER_BUSY blocks concurrent start, AND force-delete does
     //     not remove existing catalog episodes when dataset is pinned (Major 7).
