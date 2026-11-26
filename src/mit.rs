@@ -3307,10 +3307,10 @@ impl crate::supervisor::SupervisorInner {
             SessionKind::Commissioning,
             crate::rt_core::broker::ClientId(req.authority.conn_id),
         );
+        let op_req = crate::auth::OperatorRequirement::Required(req.authority.operator_grant);
         prepared.deadline = Some(req.txn_deadline);
         prepared.timeout_code = Self::commissioning_deadline_error_code(req.kind);
-        prepared.operator_required = self.operator_auth_enforced;
-        prepared.operator_grant = Some(req.authority.operator_grant);
+        prepared.operator = op_req;
         prepared.revoke_on_stop = true;
         prepared.escalate_safe_hold_on_uncertain = true;
         let session_auth = SessionAuthority {
@@ -3320,8 +3320,7 @@ impl crate::supervisor::SupervisorInner {
             epoch: req.authority.expected_epoch,
             stop_generation: req.authority.expected_stop_gen,
             require_lease: self.lease_enabled,
-            operator_required: self.operator_auth_enforced,
-            operator_grant: Some(req.authority.operator_grant),
+            operator: op_req,
             revoke_on_stop: true,
             revoke_on_epoch_change: true,
         };

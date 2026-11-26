@@ -12804,8 +12804,7 @@ impl SupervisorInner {
         let mut prepared = PreparedSession::exclusive(SessionKind::ModeSwitch, req.client);
         prepared.deadline = Some(req.deadline);
         prepared.timeout_code = "TIMEOUT";
-        prepared.operator_required = req.operator_required;
-        prepared.operator_grant = Some(req.operator_grant);
+        prepared.operator = req.operator;
         prepared.revoke_on_stop = true;
         prepared.escalate_safe_hold_on_uncertain = true;
         if let Some(ticket) = terminal.as_ref() {
@@ -13025,8 +13024,9 @@ impl SupervisorInner {
                 active.authority.lease_generation,
                 now,
             );
-        let op_ok = !active.authority.operator_required
-            || self.is_session_operator_valid_at(active.authority.operator_grant, now);
+        let op_ok = self
+            .check_operator_requirement(active.authority.operator, now)
+            .is_ok();
 
         // Pre-phase live authority check via SessionDriver.
         if let Err(reason) = self.sessions.check_live_authority(
@@ -13035,7 +13035,7 @@ impl SupervisorInner {
             &rctx,
             |_| conn_closed,
             |_, _, _| lease_ok,
-            |_| op_ok,
+            |_, _| op_ok,
         ) {
             let uncertain = self.reconcile_mode_switch_on_revocation(reason.code());
             if let Some(outcome) =
@@ -13163,7 +13163,7 @@ impl SupervisorInner {
             &rctx,
             |_| false,
             |_, _, _| true,
-            |_| true,
+            |_, _| true,
             |_, _| uncertain_now,
             |_, _, _| phase_out,
         ) {
@@ -17354,8 +17354,7 @@ impl ArmSupervisor {
         let req = crate::rt_core::requests::config::ModeSwitchStartRequest {
             plan,
             admission,
-            operator_required: false,
-            operator_grant,
+            operator: crate::auth::OperatorRequirement::Required(operator_grant),
             deadline,
             client: crate::rt_core::broker::ClientId(admission.connection_id),
         };

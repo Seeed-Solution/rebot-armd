@@ -18,6 +18,7 @@
 
 use std::time::Instant;
 
+pub use crate::auth::{OperatorGrant, OperatorRequirement};
 use crate::supervisor::SupervisorInner;
 
 /// Causal owner baseline captured at session admission or recovery start.
@@ -265,5 +266,37 @@ impl SupervisorInner {
     pub(crate) fn record_applied_qualifying_fault_stop(&mut self) {
         self.authority
             .record_qualifying_fault_stop(self.safety.epoch_id());
+    }
+
+    /// Single owner-side check for [`OperatorRequirement`] at admission, before activation,
+    /// and before subsequent privileged phases (0 alloc, 0 lock).
+    #[inline]
+    pub fn check_operator_requirement(
+        &self,
+        requirement: OperatorRequirement,
+        now: Instant,
+    ) -> Result<(), &'static str> {
+        if requirement.is_satisfied_at(now, self.operator_auth_enforced) {
+            Ok(())
+        } else {
+            Err("OPERATOR_REQUIRED")
+        }
+    }
+
+    /// Like [`Self::check_operator_requirement`], failing closed when `operator_auth_enforced`
+    /// is enabled and a protected operation passed [`OperatorRequirement::NotRequired`].
+    #[inline]
+    pub fn check_protected_operator_requirement(
+        &self,
+        requirement: OperatorRequirement,
+        now: Instant,
+    ) -> Result<(), &'static str> {
+        let effective = match requirement {
+            OperatorRequirement::NotRequired if self.operator_auth_enforced => {
+                OperatorRequirement::Required(OperatorGrant::DENIED)
+            }
+            other => other,
+        };
+        self.check_operator_requirement(effective, now)
     }
 }

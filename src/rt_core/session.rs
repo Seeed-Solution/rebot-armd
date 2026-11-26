@@ -118,8 +118,7 @@ pub struct SessionAuthority {
     pub epoch: u64,
     pub stop_generation: u64,
     pub require_lease: bool,
-    pub operator_required: bool,
-    pub operator_grant: Option<crate::auth::OperatorGrant>,
+    pub operator: crate::auth::OperatorRequirement,
     pub revoke_on_stop: bool,
     pub revoke_on_epoch_change: bool,
 }
@@ -137,8 +136,7 @@ pub struct PreparedSession {
     pub route_gen: u64,
     pub client: ClientId,
     pub require_lease: bool,
-    pub operator_required: bool,
-    pub operator_grant: Option<crate::auth::OperatorGrant>,
+    pub operator: crate::auth::OperatorRequirement,
     pub revoke_on_stop: bool,
     pub revoke_on_epoch_change: bool,
     pub escalate_safe_hold_on_uncertain: bool,
@@ -158,8 +156,7 @@ impl PreparedSession {
             route_gen: 0,
             client,
             require_lease: true,
-            operator_required: false,
-            operator_grant: None,
+            operator: crate::auth::OperatorRequirement::NotRequired,
             revoke_on_stop: true,
             revoke_on_epoch_change: true,
             escalate_safe_hold_on_uncertain: true,
@@ -179,8 +176,7 @@ impl PreparedSession {
             route_gen: 0,
             client,
             require_lease: false,
-            operator_required: false,
-            operator_grant: None,
+            operator: crate::auth::OperatorRequirement::NotRequired,
             revoke_on_stop: false,
             revoke_on_epoch_change: false,
             escalate_safe_hold_on_uncertain: false,
@@ -593,7 +589,7 @@ impl SessionDriver {
         ctx: &ReleaseCtx,
         is_conn_closed: impl Fn(u64) -> bool,
         is_lease_valid: impl Fn(u64, u64, Instant) -> bool,
-        is_operator_valid: impl Fn(Instant) -> bool,
+        is_operator_valid: impl Fn(crate::auth::OperatorRequirement, Instant) -> bool,
     ) -> Result<(), SessionTerminalReason> {
         let Some(active) = self.slot(slot).filter(|a| a.id == id) else {
             return Err(SessionTerminalReason::Cancelled("CANCELLED"));
@@ -622,7 +618,7 @@ impl SessionDriver {
         if auth.require_lease && !is_lease_valid(auth.connection_id, auth.lease_generation, ctx.now) {
             return Err(SessionTerminalReason::Revoked("LEASE_LOST"));
         }
-        if auth.operator_required && !is_operator_valid(ctx.now) {
+        if !is_operator_valid(auth.operator, ctx.now) {
             return Err(SessionTerminalReason::Revoked("OPERATOR_REQUIRED"));
         }
         if let Some(code) = active.expired_code(ctx.now) {
@@ -670,7 +666,7 @@ impl SessionDriver {
         ctx: &ReleaseCtx,
         is_conn_closed: impl Fn(u64) -> bool,
         is_lease_valid: impl Fn(u64, u64, Instant) -> bool,
-        is_operator_valid: impl Fn(Instant) -> bool,
+        is_operator_valid: impl Fn(crate::auth::OperatorRequirement, Instant) -> bool,
         on_pre_phase_abort: impl FnOnce(SessionId, SessionTerminalReason) -> bool,
         phase_fn: impl FnOnce(SessionId, Instant, Option<WorkerReply>) -> PhaseStepOutcome,
     ) -> Option<SessionStep> {
@@ -866,12 +862,17 @@ impl SupervisorInner {
             }
         }
         let stamp = proof.stamp();
-        let operator_required = if prepared.kind == SessionKind::GripperZeroCheck {
-            // Conditional operator policy: `store_offset=true` requires operator when enforced;
-            // `store_offset=false` remains allowed for Program clients (legacy parity).
-            prepared.operator_required && self.operator_auth_enforced
+        let operator = if prepared.slot == SessionSlot::ExclusiveOutput
+            && !matches!(
+                prepared.kind,
+                SessionKind::GripperZeroCheck | SessionKind::MacroBacked
+            )
+            && self.operator_auth_enforced
+            && matches!(prepared.operator, crate::auth::OperatorRequirement::NotRequired)
+        {
+            crate::auth::OperatorRequirement::Required(crate::auth::OperatorGrant::DENIED)
         } else {
-            self.operator_auth_enforced || prepared.operator_required
+            prepared.operator
         };
         let authority = SessionAuthority {
             baseline: self.capture_baseline(),
@@ -880,12 +881,7 @@ impl SupervisorInner {
             epoch: stamp.estop_epoch,
             stop_generation: stamp.stop_gen,
             require_lease: prepared.require_lease && self.lease_enabled,
-            operator_required: if prepared.slot == SessionSlot::Recorder {
-                prepared.operator_required
-            } else {
-                operator_required
-            },
-            operator_grant: prepared.operator_grant,
+            operator,
             revoke_on_stop: prepared.revoke_on_stop,
             revoke_on_epoch_change: prepared.revoke_on_epoch_change,
         };
@@ -894,8 +890,8 @@ impl SupervisorInner {
         {
             return Err(SessionAdmitError::AuthorityRejected("LEASE_LOST"));
         }
-        if authority.operator_required && !self.is_session_operator_valid_at(authority.operator_grant, now) {
-            return Err(SessionAdmitError::AuthorityRejected("OPERATOR_REQUIRED"));
+        if let Err(code) = self.check_operator_requirement(authority.operator, now) {
+            return Err(SessionAdmitError::AuthorityRejected(code));
         }
         let id = self.sessions.admit_with_authority(prepared, authority, now, true)?;
         if prepared.slot == SessionSlot::ExclusiveOutput && prepared.kind != SessionKind::MacroBacked {
@@ -912,11 +908,6 @@ impl SupervisorInner {
             l.generation == lease_gen
                 && (conn_id == 0 || self.active_lease_conn_id == 0 || self.active_lease_conn_id == conn_id)
         })
-    }
-
-    #[inline]
-    pub(crate) fn is_session_operator_valid_at(&self, grant: Option<crate::auth::OperatorGrant>, now: Instant) -> bool {
-        grant.is_some_and(|g| g.is_valid_at(now, true))
     }
 
     pub(crate) fn exclusive_output_conflict_for(
@@ -1012,7 +1003,6 @@ impl SupervisorInner {
             internal_fault_fenced: self.internal_fault_lane.is_fenced(),
             safe_hold_active: self.sessions.is_safe_hold_requested(),
         };
-        let grant = active.authority.operator_grant;
         self.sessions
             .check_live_authority(
                 slot,
@@ -1020,7 +1010,7 @@ impl SupervisorInner {
                 &ctx,
                 |c| self.is_connection_closed(c),
                 |c, g, t| self.is_session_lease_valid_at(c, g, t),
-                |t| self.is_session_operator_valid_at(grant, t),
+                |req, t| self.check_operator_requirement(req, t).is_ok(),
             )
             .map_err(SessionTerminalReason::code)?;
         let effective = self.sessions.effective_tx_cutoff(slot, base_tx_cutoff);
@@ -1071,14 +1061,13 @@ impl SupervisorInner {
                             && self.is_connection_closed(active.authority.connection_id);
                         let lease_ok = !active.authority.require_lease
                             || self.is_session_lease_valid_at(active.authority.connection_id, active.authority.lease_generation, now);
-                        let op_ok = !active.authority.operator_required
-                            || self.is_session_operator_valid_at(active.authority.operator_grant, now);
+                        let op_ok = self.check_operator_requirement(active.authority.operator, now).is_ok();
                         if let Some(SessionStep::Terminal(outcome)) = self.sessions.step_slot(
                             SessionSlot::ExclusiveOutput,
                             &rctx,
                             |_| conn_closed,
                             |_, _, _| lease_ok,
-                            |_| op_ok,
+                            |_, _| op_ok,
                             |_, _| active.hw_state_uncertain,
                             |_, _, _| PhaseStepOutcome::Pending,
                         ) {
@@ -1103,14 +1092,13 @@ impl SupervisorInner {
                     && self.is_connection_closed(rec.authority.connection_id);
                 let lease_ok = !rec.authority.require_lease
                     || self.is_session_lease_valid_at(rec.authority.connection_id, rec.authority.lease_generation, now);
-                let op_ok = !rec.authority.operator_required
-                    || self.is_session_operator_valid_at(rec.authority.operator_grant, now);
+                let op_ok = self.check_operator_requirement(rec.authority.operator, now).is_ok();
                 if let Some(SessionStep::Terminal(_)) = self.sessions.step_slot(
                     SessionSlot::Recorder,
                     &rctx,
                     |_| conn_closed,
                     |_, _, _| lease_ok,
-                    |_| op_ok,
+                    |_, _| op_ok,
                     |_, _| false,
                     |_, _, _| PhaseStepOutcome::Pending,
                 ) {
@@ -1306,8 +1294,7 @@ impl SupervisorInner {
             epoch: self.safety.epoch_id(),
             stop_generation: self.current_stop_gen(),
             require_lease: false,
-            operator_required: false,
-            operator_grant: None,
+            operator: crate::auth::OperatorRequirement::NotRequired,
             revoke_on_stop: false,
             revoke_on_epoch_change: false,
         };

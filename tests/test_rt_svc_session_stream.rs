@@ -208,7 +208,7 @@ async fn cancellation_in_every_session_and_cf1_phase() {
             &rctx,
             |_| false,
             |_, _, _| true,
-            |_| true,
+            |_, _| true,
             |_, _| false,
             |_, _, _| PhaseStepOutcome::AwaitWorker,
         )
@@ -408,7 +408,7 @@ fn stale_worker_replies_deadline_expiry_and_tx_cutoff_exemption() {
             &rctx,
             |_| false,
             |_, _, _| true,
-            |_| true,
+            |_, _| true,
             |_, _| false,
             |_, _, _| PhaseStepOutcome::AwaitWorker,
         )
@@ -438,7 +438,7 @@ fn stale_worker_replies_deadline_expiry_and_tx_cutoff_exemption() {
         &make_release_ctx(now + Duration::from_millis(12), epoch, stop_gen),
         |_| false,
         |_, _, _| true,
-        |_| true,
+        |_, _| true,
         |_, _| false,
         |_, _, r| { if r.is_some() { seen_replies += 1; } PhaseStepOutcome::Pending },
     );
@@ -447,7 +447,7 @@ fn stale_worker_replies_deadline_expiry_and_tx_cutoff_exemption() {
         &make_release_ctx(now + Duration::from_millis(13), epoch, stop_gen),
         |_| false,
         |_, _, _| true,
-        |_| true,
+        |_, _| true,
         |_, _| false,
         |_, _, r| { if r.is_some() { seen_replies += 1; } PhaseStepOutcome::Pending },
     );
@@ -465,7 +465,7 @@ fn stale_worker_replies_deadline_expiry_and_tx_cutoff_exemption() {
             &exp_ctx,
             |_| false,
             |_, _, _| true,
-            |_| true,
+            |_, _| true,
             |_, _| false,
             |_, _, _| PhaseStepOutcome::Pending,
         )

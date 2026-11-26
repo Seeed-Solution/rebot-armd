@@ -538,14 +538,15 @@ impl SupervisorInner {
                         active.authority.lease_generation,
                         now,
                     );
-                let op_ok = !active.authority.operator_required
-                    || self.is_session_operator_valid_at(active.authority.operator_grant, now);
+                let op_ok = self
+                    .check_operator_requirement(active.authority.operator, now)
+                    .is_ok();
                 if let Some(SessionStep::Terminal(outcome)) = self.sessions.step_slot(
                     SessionSlot::ExclusiveOutput,
                     &rctx,
                     |_| conn_closed,
                     |_, _, _| lease_ok,
-                    |_| op_ok,
+                    |_, _| op_ok,
                     |_, _| false,
                     |_, _, _| PhaseStepOutcome::Pending,
                 ) {

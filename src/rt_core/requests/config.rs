@@ -1307,6 +1307,7 @@ pub enum GravityCompOp {
     Enter {
         admission: AdmissionStamp,
         lease_holder: Option<(HolderLabel, u64)>,
+        operator: crate::auth::OperatorRequirement,
         policy: Option<crate::model::GravityCompPolicy>,
         scale: Option<f32>,
         damping_kd: Option<[f32; 6]>,
@@ -1601,8 +1602,7 @@ pub enum ConfigReply {
 pub struct ModeSwitchStartRequest {
     pub plan: crate::motor_mode::ModeSwitchPlan,
     pub admission: AdmissionStamp,
-    pub operator_required: bool,
-    pub operator_grant: crate::auth::OperatorGrant,
+    pub operator: crate::auth::OperatorRequirement,
     pub deadline: Instant,
     pub client: ClientId,
 }
@@ -1834,7 +1834,13 @@ pub(crate) fn handle_config_exchange(
                 if core.calibration_txn_id != Some(expected_txn_id) {
                     return Err(ConfigError::Reconciling("CONFIG_BUSY"));
                 }
-                if !operator_grant.is_valid_at(ctx.now, core.operator_auth_enforced) {
+                if core
+                    .check_operator_requirement(
+                        crate::auth::OperatorRequirement::Required(operator_grant),
+                        ctx.now,
+                    )
+                    .is_err()
+                {
                     return Err(ConfigError::Reconciling("OPERATOR_REQUIRED"));
                 }
                 let recheck_proposal = ConfigProposal {
@@ -2021,7 +2027,13 @@ fn run_reserve_precheck(
             require_kinematics_disarmed,
             expected_grasp_setup_revision,
         } => {
-            if !operator_grant.is_valid_at(now, core.operator_auth_enforced) {
+            if core
+                .check_operator_requirement(
+                    crate::auth::OperatorRequirement::Required(operator_grant),
+                    now,
+                )
+                .is_err()
+            {
                 return Err(ConfigError::CalibPrecondition {
                     status: 403,
                     code: "OPERATOR_REQUIRED",
@@ -2070,7 +2082,13 @@ fn run_reserve_precheck(
             expected_gripper_calib_revision,
             is_hardware_motor_zero,
         } => {
-            if !operator_grant.is_valid_at(now, core.operator_auth_enforced) {
+            if core
+                .check_operator_requirement(
+                    crate::auth::OperatorRequirement::Required(operator_grant),
+                    now,
+                )
+                .is_err()
+            {
                 return Err(ConfigError::CalibPrecondition {
                     status: 403,
                     code: "OPERATOR_REQUIRED",
@@ -2109,7 +2127,13 @@ fn run_reserve_precheck(
             operator_grant,
             require_driver,
         } => {
-            if !operator_grant.is_valid_at(now, core.operator_auth_enforced) {
+            if core
+                .check_operator_requirement(
+                    crate::auth::OperatorRequirement::Required(operator_grant),
+                    now,
+                )
+                .is_err()
+            {
                 return Err(ConfigError::CalibPrecondition {
                     status: 403,
                     code: "OPERATOR_REQUIRED",
@@ -2332,7 +2356,13 @@ fn install_begin_calibration_txn(
     kind: CalibrationTxnKind,
 ) -> Result<CalibrationStateSample, ConfigError> {
     check_calib_live_authority_rt(core, ctx, auth, expected_epoch, expected_stop_gen)?;
-    if !operator_grant.is_valid_at(ctx.now, core.operator_auth_enforced) {
+    if core
+        .check_operator_requirement(
+            crate::auth::OperatorRequirement::Required(operator_grant),
+            ctx.now,
+        )
+        .is_err()
+    {
         return Err(ConfigError::CalibPrecondition {
             status: 403,
             code: "OPERATOR_REQUIRED",
@@ -2538,7 +2568,13 @@ fn install_sample_calibration_state(
     }
     if check_authority {
         check_calib_live_authority_rt(core, ctx, auth, expected_epoch, expected_stop_gen)?;
-        if !operator_grant.is_valid_at(ctx.now, core.operator_auth_enforced) {
+        if core
+            .check_operator_requirement(
+                crate::auth::OperatorRequirement::Required(operator_grant),
+                ctx.now,
+            )
+            .is_err()
+        {
             return Err(ConfigError::CalibPrecondition {
                 status: 403,
                 code: "OPERATOR_REQUIRED",
@@ -2698,29 +2734,19 @@ fn install_verify_authority(
             ));
         }
     }
-    if domain == ConfigDomain::Calibration {
-        let Some(op_grant) = domain_checks.operator_grant else {
-            return Err(ConfigError::CalibPrecondition {
-                status: 403,
-                code: "OPERATOR_REQUIRED",
-                message: "Operator session expired or locked during calibration",
-            });
-        };
-        if !op_grant.is_valid_at(ctx.now, core.operator_auth_enforced) {
-            return Err(ConfigError::CalibPrecondition {
-                status: 403,
-                code: "OPERATOR_REQUIRED",
-                message: "Operator session expired or locked during calibration",
-            });
+    let verify_op_req = match (domain == ConfigDomain::Calibration, domain_checks.operator_grant) {
+        (true, None) => {
+            crate::auth::OperatorRequirement::Required(crate::auth::OperatorGrant::DENIED)
         }
-    } else if let Some(op_grant) = domain_checks.operator_grant {
-        if !op_grant.is_valid_at(ctx.now, core.operator_auth_enforced) {
-            return Err(ConfigError::CalibPrecondition {
-                status: 403,
-                code: "OPERATOR_REQUIRED",
-                message: "Operator session expired or locked during calibration",
-            });
-        }
+        (_, Some(op_grant)) => crate::auth::OperatorRequirement::Required(op_grant),
+        (false, None) => crate::auth::OperatorRequirement::NotRequired,
+    };
+    if core.check_operator_requirement(verify_op_req, ctx.now).is_err() {
+        return Err(ConfigError::CalibPrecondition {
+            status: 403,
+            code: "OPERATOR_REQUIRED",
+            message: "Operator session expired or locked during calibration",
+        });
     }
     if let Some(tid) = domain_checks.expected_txn_id {
         if core.calibration_txn_id != Some(tid) {
@@ -2994,7 +3020,13 @@ fn check_candidate_domain_invariants(
             operator_grant,
             ..
         } => {
-            if !operator_grant.is_valid_at(now, core.operator_auth_enforced) {
+            if core
+                .check_operator_requirement(
+                    crate::auth::OperatorRequirement::Required(*operator_grant),
+                    now,
+                )
+                .is_err()
+            {
                 return Err("OPERATOR_REQUIRED");
             }
             if for_reconcile {
@@ -3031,7 +3063,13 @@ fn check_candidate_domain_invariants(
             operator_grant,
             ..
         } => {
-            if !operator_grant.is_valid_at(now, core.operator_auth_enforced) {
+            if core
+                .check_operator_requirement(
+                    crate::auth::OperatorRequirement::Required(*operator_grant),
+                    now,
+                )
+                .is_err()
+            {
                 return Err("OPERATOR_REQUIRED");
             }
             if for_reconcile {
@@ -3083,7 +3121,13 @@ fn check_candidate_domain_invariants(
             operator_grant,
             ..
         } => {
-            if !operator_grant.is_valid_at(now, core.operator_auth_enforced) {
+            if core
+                .check_operator_requirement(
+                    crate::auth::OperatorRequirement::Required(*operator_grant),
+                    now,
+                )
+                .is_err()
+            {
                 return Err("OPERATOR_REQUIRED");
             }
             if for_reconcile {
@@ -3550,6 +3594,7 @@ fn install_gravity_comp(
         GravityCompOp::Enter {
             admission,
             lease_holder,
+            operator,
             policy,
             scale,
             damping_kd,
@@ -3559,6 +3604,17 @@ fn install_gravity_comp(
                 return Err(ConfigError::ExecutorCapabilityUnsupported(
                     "gravity_comp hardware MIT mode-switch is not supported on the RT executor",
                 ));
+            }
+            if core
+                .check_protected_operator_requirement(operator, ctx.now)
+                .is_err()
+            {
+                retired.gravity_comp_policy = policy;
+                return Err(ConfigError::CalibPrecondition {
+                    status: 403,
+                    code: "OPERATOR_REQUIRED",
+                    message: "Operator unlock is required for /api/v1/mode/gravity_comp",
+                });
             }
             if core.calibration_busy {
                 retired.gravity_comp_policy = policy;
@@ -6027,7 +6083,14 @@ pub(crate) fn check_zero_check_authority(
         });
     }
     if let Some((gid, grant)) = core.zero_check_persisting_grant {
-        if gid == action_id && !grant.is_valid_at(ctx.now, core.operator_auth_enforced) {
+        if gid == action_id
+            && core
+                .check_operator_requirement(
+                    crate::auth::OperatorRequirement::Required(grant),
+                    ctx.now,
+                )
+                .is_err()
+        {
             return Err((
                 "failed",
                 "OPERATOR_REQUIRED",
@@ -6478,8 +6541,12 @@ pub(crate) fn zero_check_owner_finish_reconcile(
     }
     // Executor: the worker's sample is advisory; the owner validates the grant carried through
     // reconciliation at commit time. Legacy (`None`) samples and commits under one lock.
+    let reconcile_op = operator_grant.map_or(
+        crate::auth::OperatorRequirement::NotRequired,
+        crate::auth::OperatorRequirement::Required,
+    );
     if operator_revoked
-        || operator_grant.is_some_and(|g| !g.is_valid_at(ctx.now, core.operator_auth_enforced))
+        || core.check_operator_requirement(reconcile_op, ctx.now).is_err()
     {
         return Err(("OPERATOR_REQUIRED", Some(new_policy), new_jaw));
     }
@@ -7314,6 +7381,7 @@ pub async fn gravity_comp_command(
     sup: &Arc<ArmSupervisor>,
     admission: AdmissionStamp,
     lease_holder: Option<(HolderLabel, u64)>,
+    operator: crate::auth::OperatorRequirement,
     enable: bool,
     scale: Option<f32>,
     damping_kd: Option<Vec<f32>>,
@@ -7349,6 +7417,7 @@ pub async fn gravity_comp_command(
         GravityCompOp::Enter {
             admission,
             lease_holder,
+            operator,
             policy,
             scale,
             damping_kd: damping_arr,

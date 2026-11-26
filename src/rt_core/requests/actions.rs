@@ -4231,12 +4231,8 @@ fn install_gripper_zero_check_rt(
     if inner.held.is_some() {
         return Err("OBJECT_HELD");
     }
-    if store_offset
-        && inner.operator_auth_enforced
-        && !operator_grant.is_valid_at(ctx.now, true)
-    {
-        return Err("OPERATOR_REQUIRED");
-    }
+    let operator = crate::auth::OperatorRequirement::when(store_offset, operator_grant);
+    inner.check_operator_requirement(operator, ctx.now)?;
     let request = GripperRequest {
         command: GripperCommand::Seek,
         fraction: None,
@@ -4308,8 +4304,7 @@ fn install_gripper_zero_check_rt(
     );
     prepared_session.timeout_code = "GRIPPER_TIMEOUT";
     prepared_session.child_timeout_code = "GRIPPER_TIMEOUT";
-    prepared_session.operator_required = store_offset;
-    prepared_session.operator_grant = Some(operator_grant);
+    prepared_session.operator = operator;
     prepared_session.revoke_on_stop = true;
     prepared_session.escalate_safe_hold_on_uncertain = true;
 

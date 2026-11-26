@@ -27,7 +27,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use armd::auth::OperatorGrant;
+use armd::auth::{OperatorGrant, OperatorRequirement};
 use armd::diagnostics::alloc::{snapshot_counts, time_this_thread};
 use armd::driver::{gripper_drive_from_profile, ArmDriver, DamiaoArmDriver, TxBudget};
 use armd::model::ArmConfig;
@@ -906,8 +906,7 @@ async fn session_stream_saturation_stale_cancel_clear_and_inflight_revocation() 
         .start_mode_switch_session(ModeSwitchStartRequest {
             plan,
             admission: sup.capture_admission_stamp(),
-            operator_required: false,
-            operator_grant: OperatorGrant::unenforced(),
+            operator: OperatorRequirement::Required(OperatorGrant::unenforced()),
             deadline: Instant::now() + Duration::from_secs(2),
             client: ClientId(7),
         })
@@ -945,8 +944,7 @@ async fn session_stream_saturation_stale_cancel_clear_and_inflight_revocation() 
         .start_mode_switch_session(ModeSwitchStartRequest {
             plan,
             admission: sup.capture_admission_stamp(),
-            operator_required: false,
-            operator_grant: OperatorGrant::unenforced(),
+            operator: OperatorRequirement::Required(OperatorGrant::unenforced()),
             deadline: Instant::now() + Duration::from_secs(2),
             client: ClientId(7),
         })
@@ -1274,8 +1272,7 @@ async fn dual_owner_energized_mode_switch_and_rollback_parity() {
                 ModeSwitchStartRequest {
                     plan: plan_mit,
                     admission: h.sup.capture_admission_stamp(),
-                    operator_required: false,
-                    operator_grant: OperatorGrant::unenforced(),
+                    operator: OperatorRequirement::Required(OperatorGrant::unenforced()),
                     deadline: Instant::now() + Duration::from_secs(2),
                     client: ClientId(10),
                 },
@@ -1301,8 +1298,7 @@ async fn dual_owner_energized_mode_switch_and_rollback_parity() {
                 ModeSwitchStartRequest {
                     plan: plan_pv,
                     admission: h.sup.capture_admission_stamp(),
-                    operator_required: false,
-                    operator_grant: OperatorGrant::unenforced(),
+                    operator: OperatorRequirement::Required(OperatorGrant::unenforced()),
                     deadline: Instant::now() + Duration::from_secs(2),
                     client: ClientId(10),
                 },
@@ -1398,8 +1394,7 @@ async fn dual_owner_energized_mode_switch_and_rollback_parity() {
                         )
                         .unwrap(),
                         admission: sup_rb.capture_admission_stamp(),
-                        operator_required: false,
-                        operator_grant: OperatorGrant::unenforced(),
+                        operator: OperatorRequirement::Required(OperatorGrant::unenforced()),
                         deadline: Instant::now() + Duration::from_secs(2),
                         client: ClientId(11),
                     },
@@ -1465,8 +1460,7 @@ async fn dual_owner_mode_switch_authority_and_ambiguity_safe_hold_parity() {
             .start_mode_switch_session(ModeSwitchStartRequest {
                 plan,
                 admission: stale_lease,
-                operator_required: false,
-                operator_grant: OperatorGrant::unenforced(),
+                operator: OperatorRequirement::Required(OperatorGrant::unenforced()),
                 deadline: Instant::now() + Duration::from_secs(2),
                 client: ClientId(20),
             })
@@ -1485,8 +1479,7 @@ async fn dual_owner_mode_switch_authority_and_ambiguity_safe_hold_parity() {
             .start_mode_switch_session(ModeSwitchStartRequest {
                 plan,
                 admission: stale_stamp,
-                operator_required: false,
-                operator_grant: OperatorGrant::unenforced(),
+                operator: OperatorRequirement::Required(OperatorGrant::unenforced()),
                 deadline: Instant::now() + Duration::from_secs(2),
                 client: ClientId(20),
             })
@@ -1503,8 +1496,7 @@ async fn dual_owner_mode_switch_authority_and_ambiguity_safe_hold_parity() {
             .start_mode_switch_session(ModeSwitchStartRequest {
                 plan,
                 admission: h.sup.capture_admission_stamp(),
-                operator_required: true,
-                operator_grant: OperatorGrant::DENIED,
+                operator: OperatorRequirement::Required(OperatorGrant::DENIED),
                 deadline: Instant::now() + Duration::from_secs(2),
                 client: ClientId(20),
             })
@@ -1527,8 +1519,7 @@ async fn dual_owner_mode_switch_authority_and_ambiguity_safe_hold_parity() {
             .start_mode_switch_session(ModeSwitchStartRequest {
                 plan: bad_plan,
                 admission: h.sup.capture_admission_stamp(),
-                operator_required: false,
-                operator_grant: OperatorGrant::unenforced(),
+                operator: OperatorRequirement::Required(OperatorGrant::unenforced()),
                 deadline: Instant::now() + Duration::from_secs(2),
                 client: ClientId(20),
             })
@@ -1557,8 +1548,7 @@ async fn dual_owner_mode_switch_authority_and_ambiguity_safe_hold_parity() {
             .start_mode_switch_session(ModeSwitchStartRequest {
                 plan,
                 admission: h.sup.capture_admission_stamp(),
-                operator_required: false,
-                operator_grant: OperatorGrant::unenforced(),
+                operator: OperatorRequirement::Required(OperatorGrant::unenforced()),
                 deadline: Instant::now() + Duration::from_secs(2),
                 client: ClientId(20),
             })
@@ -1804,8 +1794,7 @@ async fn safe_hold_lost_recovery_reply_retries_next_tick_and_manual_legacy_safe_
         .start_mode_switch_session(ModeSwitchStartRequest {
             plan: plan_j1,
             admission: sup.capture_admission_stamp(),
-            operator_required: false,
-            operator_grant: OperatorGrant::unenforced(),
+            operator: OperatorRequirement::Required(OperatorGrant::unenforced()),
             deadline: Instant::now() + Duration::from_secs(2),
             client: ClientId(21),
         })
@@ -2127,8 +2116,7 @@ async fn mode_switch_terminal_reaches_caller_that_falls_behind_via_router_credit
         .start_mode_switch_session(ModeSwitchStartRequest {
             plan,
             admission: h.sup.capture_admission_stamp(),
-            operator_required: false,
-            operator_grant: OperatorGrant::unenforced(),
+            operator: OperatorRequirement::Required(OperatorGrant::unenforced()),
             deadline: Instant::now() + Duration::from_secs(1),
             client: caller,
         })
@@ -2266,8 +2254,7 @@ async fn ordinary_applied_stop_mid_switch_is_stopped_recovered_via_production_pr
         .start_mode_switch_session(ModeSwitchStartRequest {
             plan,
             admission: sup.capture_admission_stamp(),
-            operator_required: false,
-            operator_grant: OperatorGrant::unenforced(),
+            operator: OperatorRequirement::Required(OperatorGrant::unenforced()),
             deadline: Instant::now() + Duration::from_secs(4),
             client: ClientId(31),
         })
@@ -2370,8 +2357,7 @@ async fn infeasible_watchdog_gap_is_rejected_at_admission() {
         .start_mode_switch_session(ModeSwitchStartRequest {
             plan,
             admission: sup.capture_admission_stamp(),
-            operator_required: false,
-            operator_grant: OperatorGrant::unenforced(),
+            operator: OperatorRequirement::Required(OperatorGrant::unenforced()),
             deadline: Instant::now() + Duration::from_secs(1),
             client: ClientId(32),
         })
@@ -2405,8 +2391,7 @@ async fn mode_switch_terminal_credit_released_on_cancel_reject_close_and_handbac
     let req = |client: u64| ModeSwitchStartRequest {
         plan,
         admission: h.sup.capture_admission_stamp(),
-        operator_required: false,
-        operator_grant: OperatorGrant::unenforced(),
+        operator: OperatorRequirement::Required(OperatorGrant::unenforced()),
         deadline: Instant::now() + Duration::from_secs(4),
         client: ClientId(client),
     };
@@ -2552,8 +2537,7 @@ async fn legacy_mid_switch(lease: bool) -> (ArmSupervisor, FakeBus, u64) {
         .start_mode_switch_session(ModeSwitchStartRequest {
             plan,
             admission: sup.capture_admission_stamp(),
-            operator_required: false,
-            operator_grant: OperatorGrant::unenforced(),
+            operator: OperatorRequirement::Required(OperatorGrant::unenforced()),
             deadline: Instant::now() + Duration::from_secs(4),
             client: ClientId(31),
         })
@@ -2630,8 +2614,7 @@ async fn policy_only_stop_mid_switch_is_not_stop_proof() {
         .start_mode_switch_session(ModeSwitchStartRequest {
             plan,
             admission: h.sup.capture_admission_stamp(),
-            operator_required: false,
-            operator_grant: OperatorGrant::unenforced(),
+            operator: OperatorRequirement::Required(OperatorGrant::unenforced()),
             deadline: Instant::now() + Duration::from_secs(4),
             client: ClientId(33),
         })
