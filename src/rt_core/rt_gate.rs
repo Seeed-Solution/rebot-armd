@@ -10,17 +10,18 @@
 //!    / `SupervisorInner` harnesses, asserting that the intended phase actually executed while
 //!    recording strictly zero heap allocations, deallocations, and lock acquisitions.
 
+use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{
-    LockResult, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockResult,
+    Arc, LockResult, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockResult,
 };
 
 use crate::diagnostics::alloc::{self, AllocCounts};
 use crate::rt_core::executor::{
     assert_not_in_rt_release, assert_not_on_rt_control_thread, in_rt_release,
-    on_rt_control_thread, ControlThreadGuard, ReleaseGuard, RtExecutorHandle,
+    on_rt_control_thread, ControlThreadGuard, ExecutorStats, ReleaseGuard, RtExecutorHandle,
 };
 use crate::supervisor::ArmSupervisor;
 
@@ -30,9 +31,39 @@ use crate::supervisor::ArmSupervisor;
 /// `PublishedConfigHub`, `WsWireAckTracker`, `SerialDrainGate`, `MaintClient`,
 /// `ServoTargetDispatcher`).
 ///
-/// Incremented strictly BEFORE panicking and BEFORE touching the underlying lock so tests and
-/// diagnostics can prove zero lock attempts across all reachable boundaries.
+/// Incremented strictly BEFORE panicking and BEFORE touching the underlying lock.
+/// Per-thread (`thread_rt_lock_attempts`) and per-executor (`ExecutorStats::rt_lock_attempts`)
+/// counters are incremented alongside it so concurrent tests never cross-contaminate one another.
 static RT_LOCK_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    static THREAD_RT_LOCK_ATTEMPTS: Cell<u64> = const { Cell::new(0) };
+    static BOUND_EXECUTOR_STATS: RefCell<Option<Arc<ExecutorStats>>> = const { RefCell::new(None) };
+}
+
+/// RAII guard binding `stats.rt_lock_attempts` to the current `armd-control` thread so rejected
+/// lock attempts on this thread are attributed strictly to this executor instance.
+pub(crate) struct ExecutorLockCounterGuard {
+    prev: Option<Arc<ExecutorStats>>,
+}
+
+impl Drop for ExecutorLockCounterGuard {
+    fn drop(&mut self) {
+        let prev = self.prev.take();
+        let _ = BOUND_EXECUTOR_STATS.try_with(|slot| {
+            *slot.borrow_mut() = prev;
+        });
+    }
+}
+
+/// Binds an executor's [`ExecutorStats::rt_lock_attempts`] counter to the current thread for the
+/// lifetime of the returned guard.
+pub(crate) fn bind_executor_lock_counter(stats: Arc<ExecutorStats>) -> ExecutorLockCounterGuard {
+    let prev = BOUND_EXECUTOR_STATS
+        .try_with(|slot| slot.borrow_mut().replace(stats))
+        .unwrap_or(None);
+    ExecutorLockCounterGuard { prev }
+}
 
 /// Returns the cumulative number of lock acquisition attempts rejected across all RT-guarded
 /// lock boundaries in this process.
@@ -41,14 +72,28 @@ pub fn rt_lock_attempts() -> u64 {
     RT_LOCK_ATTEMPTS.load(Ordering::Acquire)
 }
 
-/// Records one rejected RT lock acquisition attempt in the process-wide ledger.
+/// Returns the cumulative number of lock acquisition attempts rejected on the **current thread**
+/// across all RT-guarded lock boundaries (isolated from concurrent threads/tests).
+#[inline]
+pub fn thread_rt_lock_attempts() -> u64 {
+    THREAD_RT_LOCK_ATTEMPTS.try_with(Cell::get).unwrap_or(0)
+}
+
+/// Records one rejected RT lock acquisition attempt in the process-wide, per-thread, and
+/// (when bound on `armd-control`) per-executor counters.
 ///
 /// Called by specialized locks (`SupervisorLock`, `DriverLock`, `RecorderAssembly`,
 /// `TerminalCaptureChannel`, `ExecutorRecorder`) that maintain their own per-instance counters
-/// in addition to this unified counter.
+/// in addition to these unified counters.
 #[inline]
 pub fn record_rt_lock_attempt() {
     RT_LOCK_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+    let _ = THREAD_RT_LOCK_ATTEMPTS.try_with(|c| c.set(c.get().saturating_add(1)));
+    let _ = BOUND_EXECUTOR_STATS.try_with(|slot| {
+        if let Some(stats) = slot.borrow().as_ref() {
+            stats.rt_lock_attempts.fetch_add(1, Ordering::SeqCst);
+        }
+    });
 }
 
 /// Asserts that the current thread is neither a marked RT control thread nor inside a marked
@@ -277,14 +322,15 @@ impl<'a> RtReleaseGate<'a> {
         Self { sup, handle }
     }
 
-    /// Captures the current monotonic snapshot of releases, RT heap operations, and lock attempts.
+    /// Captures the current monotonic snapshot of releases, RT heap operations, and
+    /// executor-attributed lock attempts (strictly isolated to this executor instance).
     pub fn snapshot(&self) -> RtGateSnapshot {
         let stats = self.handle.stats();
         RtGateSnapshot {
             completed_releases: stats.completed_releases.load(Ordering::Acquire),
             release_allocs: stats.release_allocs.snapshot(),
             wake_allocs: stats.wake_allocs.snapshot(),
-            rt_lock_attempts: rt_lock_attempts(),
+            rt_lock_attempts: stats.rt_lock_attempts.load(Ordering::Acquire),
             supervisor_lock_attempts: self.sup.inner().control_thread_attempts(),
             driver_lock_attempts: self.sup.driver_lock_attempts(),
         }
@@ -400,8 +446,8 @@ impl MarkedReleaseDelta {
 
 /// Measures a direct synchronous RT release body (`ReleaseFixture`, `ModeSwitch`, `SupervisorInner`)
 /// on the current thread inside both [`ControlThreadGuard`] and [`ReleaseGuard`], sampling
-/// monotonic thread-local allocation counters ([`alloc::snapshot_counts`]) and process-wide
-/// [`rt_lock_attempts`].
+/// monotonic thread-local allocation counters ([`alloc::snapshot_counts`]) and thread-local
+/// [`thread_rt_lock_attempts`] across all instrumented RT-guarded lock boundaries.
 ///
 /// Callers must have [`crate::diagnostics::alloc::TimedAlloc`] installed as the binary's global
 /// allocator and should run on a dedicated thread when asserting exact thread-local allocation
@@ -414,10 +460,10 @@ pub fn measure_marked_release<R>(
     let _thread_guard = ControlThreadGuard::enter();
     let _release_guard = ReleaseGuard::enter();
     let before_alloc = alloc::snapshot_counts();
-    let before_locks = rt_lock_attempts();
+    let before_locks = thread_rt_lock_attempts();
     let (result, phase_ran) = body();
     let after_alloc = alloc::snapshot_counts();
-    let after_locks = rt_lock_attempts();
+    let after_locks = thread_rt_lock_attempts();
     drop(_release_guard);
     drop(_thread_guard);
     let delta = MarkedReleaseDelta {

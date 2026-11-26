@@ -15,8 +15,6 @@
 //! 4. Known allocations in in-flight B3/A8-owned files are captured as `#[ignore]` tests with
 //!    exact `file:line` attribution and unblock conditions (affected families remain gated).
 
-mod mit_support;
-
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::{self, ThreadId};
@@ -2216,6 +2214,7 @@ async fn rt_gate_success_rejection_recovery_and_park_zero_alloc_zero_lock() {
 
 #[test]
 fn rt_gate_marked_release_mode_switch_success_and_rollback_zero_alloc_zero_lock() {
+    use std::collections::VecDeque;
     use armd::driver::{gripper_drive_from_profile, DamiaoArmDriver, TxBudget};
     use armd::motor_mode::{
         ControlMode, ModeProgress, ModeSwitch, ModeSwitchPlan, ModeSwitchRecovery,
@@ -2224,46 +2223,176 @@ fn rt_gate_marked_release_mode_switch_success_and_rollback_zero_alloc_zero_lock(
     use armd::protocol::damiao::{self, DamiaoLimits};
     use armd::rt_core::budget::ReleaseBudget;
     use armd::rt_core::rt_gate::measure_marked_release;
-    use armd::transport::MockClock;
-    use mit_support::FakeBus;
+    use armd::transport::{CanFrame, CanTransport, DriverClock, MockClock, TransportError};
 
-    let setup_driver = || {
-        let clock = MockClock::new();
+    /// Exclusively owned, lock-free, pre-allocated CAN transport for marked RT release proofs.
+    /// Acquires zero mutexes anywhere (not even test-harness locks) and performs zero allocations
+    /// once constructed.
+    struct LockFreeCanBus {
+        clock: Arc<MockClock>,
+        limits: [DamiaoLimits; 7],
+        enabled: [bool; 7],
+        ctrl_mode: [u32; 7],
+        tmax_override: [Option<f32>; 7],
+        rx: VecDeque<(CanFrame, Instant)>,
+    }
+
+    impl LockFreeCanBus {
+        fn new(clock: Arc<MockClock>, limits: [DamiaoLimits; 7], j2_bad_tmax: Option<f32>) -> Self {
+            let mut ctrl_mode = [damiao::CTRL_MODE_POS_VEL; 7];
+            ctrl_mode[6] = damiao::CTRL_MODE_POS_FORCE;
+            let mut tmax_override = [None; 7];
+            tmax_override[1] = j2_bad_tmax;
+            let mut bus = Self {
+                clock,
+                limits,
+                enabled: [false; 7],
+                ctrl_mode,
+                tmax_override,
+                rx: VecDeque::with_capacity(256),
+            };
+            bus.push_all_feedback();
+            bus
+        }
+
+        fn feedback_frame(&self, idx: usize) -> CanFrame {
+            let l = &self.limits[idx];
+            let p = damiao::float_to_uint(0.0, l.p_min, l.p_max, 16);
+            let v = damiao::float_to_uint(0.0, l.v_min, l.v_max, 12);
+            let t = damiao::float_to_uint(0.0, l.t_min, l.t_max, 12);
+            let state = u8::from(self.enabled[idx]);
+            let id = (idx + 1) as u8;
+            let data = [
+                ((state & 0x0F) << 4) | (id & 0x0F),
+                (p >> 8) as u8,
+                p as u8,
+                (v >> 4) as u8,
+                (((v & 0x0F) << 4) | ((t >> 8) & 0x0F)) as u8,
+                t as u8,
+                30,
+                30,
+            ];
+            CanFrame::new_standard(0x10 + u16::from(id), &data).unwrap()
+        }
+
+        fn push_all_feedback(&mut self) {
+            let now = self.clock.now();
+            for i in 0..7 {
+                self.rx.push_back((self.feedback_frame(i), now));
+            }
+        }
+    }
+
+    impl CanTransport for LockFreeCanBus {
+        fn clock(&self) -> Option<Arc<dyn DriverClock>> {
+            Some(Arc::clone(&self.clock) as Arc<dyn DriverClock>)
+        }
+        fn supports_bounded_flush(&self) -> bool {
+            true
+        }
+        fn supports_nonblocking_rt(&self) -> bool {
+            true
+        }
+        fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
+            self.clock.advance(Duration::from_micros(200));
+            let now = self.clock.now();
+            if frame.id == 0x7FF && frame.dlc == 8 {
+                let mid = u16::from_le_bytes([frame.data[0], frame.data[1]]);
+                let idx = usize::from(mid.saturating_sub(1));
+                if idx < 7 {
+                    let op = frame.data[2];
+                    let rid = frame.data[3];
+                    if op == damiao::REG_READ {
+                        let bytes: [u8; 4] = match rid {
+                            damiao::RID_CTRL_MODE => self.ctrl_mode[idx].to_le_bytes(),
+                            damiao::RID_TIMEOUT => (if idx < 6 { 2000u32 } else { 0u32 }).to_le_bytes(),
+                            damiao::RID_PMAX => self.limits[idx].p_max.to_le_bytes(),
+                            damiao::RID_VMAX => self.limits[idx].v_max.to_le_bytes(),
+                            damiao::RID_TMAX => (if self.enabled[idx] {
+                                self.tmax_override[idx].unwrap_or(self.limits[idx].t_max)
+                            } else {
+                                self.limits[idx].t_max
+                            })
+                            .to_le_bytes(),
+                            _ => 0u32.to_le_bytes(),
+                        };
+                        let data = [
+                            frame.data[0],
+                            frame.data[1],
+                            damiao::REG_READ,
+                            rid,
+                            bytes[0],
+                            bytes[1],
+                            bytes[2],
+                            bytes[3],
+                        ];
+                        self.rx
+                            .push_back((CanFrame::new_standard(0x10 + mid, &data).unwrap(), now));
+                    } else if op == damiao::REG_WRITE && rid == damiao::RID_CTRL_MODE {
+                        let val = u32::from_le_bytes([
+                            frame.data[4],
+                            frame.data[5],
+                            frame.data[6],
+                            frame.data[7],
+                        ]);
+                        self.ctrl_mode[idx] = val;
+                        self.rx.push_back((
+                            CanFrame::new_standard(0x10 + mid, &frame.data[..8]).unwrap(),
+                            now,
+                        ));
+                    } else if op == 0xCC {
+                        self.rx.push_back((self.feedback_frame(idx), now));
+                    }
+                }
+                return Ok(());
+            }
+            let base = if (0x101..=0x107).contains(&frame.id) {
+                Some((frame.id - 0x101) as usize)
+            } else if (0x301..=0x307).contains(&frame.id) {
+                Some((frame.id - 0x301) as usize)
+            } else if (0x001..=0x007).contains(&frame.id) {
+                Some((frame.id - 0x001) as usize)
+            } else {
+                None
+            };
+            if let Some(idx) = base {
+                if frame.data == damiao::CMD_ENABLE {
+                    self.enabled[idx] = true;
+                } else if frame.data == damiao::CMD_DISABLE {
+                    self.enabled[idx] = false;
+                }
+                self.rx.push_back((self.feedback_frame(idx), now));
+            }
+            Ok(())
+        }
+        fn flush(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+        fn receive(&mut self) -> Result<CanFrame, TransportError> {
+            self.receive_timestamped().map(|(f, _)| f)
+        }
+        fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<Instant>), TransportError> {
+            match self.rx.pop_front() {
+                Some((f, ts)) => Ok((f, Some(ts))),
+                None => Err(TransportError::WouldBlock),
+            }
+        }
+    }
+
+    let setup_driver = |j2_bad_tmax: Option<f32>| {
+        let clock = Arc::new(MockClock::new());
         let cfg = ArmConfig::rebot_dm();
-        let limits: Vec<DamiaoLimits> = cfg
+        let limits_vec: Vec<DamiaoLimits> = cfg
             .damiao_ranges
             .as_ref()
             .unwrap()
             .iter()
             .map(|r| r.limits())
             .collect();
-        let bus = FakeBus::with_clock(&limits, clock.clone());
-        bus.with(|s| {
-            s.tx_step = Duration::from_micros(200);
-            s.poll_feeds_watchdog = false;
-            s.immediate_replies = true;
-            s.tx_log.reserve(512);
-            s.tx_times.reserve(512);
-            s.rx.reserve(512);
-            s.pending.reserve(512);
-            for (i, m) in s.motors.iter_mut().enumerate() {
-                m.q = 0.0;
-                m.v = 0.0;
-                m.enabled = false;
-                m.set_reg_u32(damiao::RID_TIMEOUT, if i < 6 { 2000 } else { 0 });
-                m.set_reg_u32(
-                    damiao::RID_CTRL_MODE,
-                    if i == 6 {
-                        damiao::CTRL_MODE_POS_FORCE
-                    } else {
-                        damiao::CTRL_MODE_POS_VEL
-                    },
-                );
-            }
-            s.push_all_feedback();
-        });
-        let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
-            .with_joint_limits(limits)
+        let limits: [DamiaoLimits; 7] = limits_vec.clone().try_into().unwrap();
+        let bus = LockFreeCanBus::new(Arc::clone(&clock), limits, j2_bad_tmax);
+        let mut drv = DamiaoArmDriver::new(bus, vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits_vec)
             .unwrap()
             .with_gripper_drive(gripper_drive_from_profile(&cfg).unwrap())
             .unwrap();
@@ -2274,14 +2403,13 @@ fn rt_gate_marked_release_mode_switch_success_and_rollback_zero_alloc_zero_lock(
         let _ = drv.check_mapping_ranges();
         let _ = drv.read_joint_states();
         drv.set_torque(true).expect("enable torque");
-        bus.with(|s| s.push_all_feedback());
         let _ = drv.read_joint_states();
-        (clock, bus, drv)
+        (clock, drv)
     };
 
     thread::spawn(move || {
-        // 1. Success: real Damiao ModeSwitch confirm under marked RT release -> 0 allocs, 0 locks.
-        let (clock, bus, mut drv) = setup_driver();
+        // 1. Success: real Damiao ModeSwitch confirm under marked RT release (zero mutexes, zero allocs).
+        let (clock, mut drv) = setup_driver(None);
         let plan = ModeSwitchPlan::confirm_gripper(6, ControlMode::PositionForce).unwrap();
         let mut ms = ModeSwitch::new(plan);
         let mut allow_tx = || Ok(());
@@ -2290,14 +2418,14 @@ fn rt_gate_marked_release_mode_switch_success_and_rollback_zero_alloc_zero_lock(
             let mut confirmed = false;
             for seq in 1..=15u64 {
                 clock.advance(Duration::from_millis(20));
-                bus.with(|s| s.push_all_feedback());
                 drv.begin_control_release(seq);
                 let now = clock.now();
+                drv.set_tx_release_deadline(Some(now + Duration::from_millis(10)));
                 let mut ledger = ReleaseBudget::new(seq, now, now + Duration::from_millis(10), 64, 16);
                 let b = ModeSwitchBudget::from_ledger(&ledger, now, now + Duration::from_millis(10), Duration::from_millis(20), 16);
-                if ms.step_with_gate_and_stop_proof_ledger(&mut drv, &mut allow_tx, &no_stop, b, &mut ledger)
-                    == ModeProgress::Confirmed
-                {
+                let p = ms.step_with_gate_and_stop_proof_ledger(&mut drv, &mut allow_tx, &no_stop, b, &mut ledger);
+                drv.set_tx_release_deadline(None);
+                if p == ModeProgress::Confirmed {
                     confirmed = true;
                     break;
                 }
@@ -2306,13 +2434,9 @@ fn rt_gate_marked_release_mode_switch_success_and_rollback_zero_alloc_zero_lock(
         });
         delta_ok.assert_clean();
 
-        // 2. Recovery: real Damiao ModeSwitch rollback on J2 RangeMismatch after J1 switched -> 0 allocs, 0 locks.
-        let (clock_rb, bus_rb, mut drv_rb) = setup_driver();
-        // J1 switches to Impedance; J2 fails mandatory range verification before write -> J1 rolls back cleanly.
+        // 2. Recovery: real Damiao ModeSwitch rollback on J2 RangeMismatch after J1 switched (zero mutexes, zero allocs).
+        let (clock_rb, mut drv_rb) = setup_driver(Some(99.0));
         drv_rb.set_axis_impedance_ranges_verified(1, false);
-        bus_rb.with(|s| {
-            s.motors[1].regs.insert(damiao::RID_TMAX, 99.0f32.to_le_bytes());
-        });
         let plan_rb = ModeSwitchPlan::switch_axes(
             &[(0, ControlMode::Impedance), (1, ControlMode::Impedance)],
             ModeSwitchRecovery::RollbackToPrevious,
@@ -2323,13 +2447,15 @@ fn rt_gate_marked_release_mode_switch_success_and_rollback_zero_alloc_zero_lock(
             let mut rolled_back = false;
             for seq in 1..=40u64 {
                 clock_rb.advance(Duration::from_millis(20));
-                bus_rb.with(|s| s.push_all_feedback());
                 drv_rb.begin_control_release(seq);
                 let now = clock_rb.now();
+                drv_rb.set_tx_release_deadline(Some(now + Duration::from_millis(10)));
                 let mut ledger = ReleaseBudget::new(seq, now, now + Duration::from_millis(10), 64, 16);
                 let b = ModeSwitchBudget::from_ledger(&ledger, now, now + Duration::from_millis(10), Duration::from_millis(20), 16);
+                let p = ms_rb.step_with_gate_and_stop_proof_ledger(&mut drv_rb, &mut allow_tx, &no_stop, b, &mut ledger);
+                drv_rb.set_tx_release_deadline(None);
                 if matches!(
-                    ms_rb.step_with_gate_and_stop_proof_ledger(&mut drv_rb, &mut allow_tx, &no_stop, b, &mut ledger),
+                    p,
                     ModeProgress::RolledBack {
                         failed_joint: 1,
                         reason: armd::motor_mode::ModeSwitchFailure::RangeMismatch,
@@ -2339,7 +2465,7 @@ fn rt_gate_marked_release_mode_switch_success_and_rollback_zero_alloc_zero_lock(
                     break;
                 }
             }
-            let j1_restored = bus_rb.with(|s| s.motors[0].ctrl_mode() == damiao::CTRL_MODE_POS_VEL);
+            let j1_restored = drv_rb.axis_confirmed_mode(0) == Some(ControlMode::PositionVelocity);
             ((), rolled_back && j1_restored)
         });
         delta_rb.assert_clean();
@@ -2368,33 +2494,33 @@ fn rt_gate_lock_boundary_assertions_reject_before_touching_lock() {
     use armd::rt_core::reply_router::WsWireAckTracker;
     use armd::rt_core::requests::config::{PublishedConfig, PublishedConfigHub};
     use armd::rt_core::requests::lease::conn_lifecycle_channel;
-    use armd::rt_core::rt_gate::rt_lock_attempts;
+    use armd::rt_core::rt_gate::thread_rt_lock_attempts;
     use armd::rt_core::urgent::urgent_stop_channel;
     use armd::supervisor_lock::{DriverLock, SupervisorLock};
 
     fn assert_rejected_on_both_marks(label: &str, mut touch: impl FnMut()) {
         // 1. Inside ControlThreadGuard (marked RT control thread).
-        let before_t = rt_lock_attempts();
+        let before_t = thread_rt_lock_attempts();
         let res_t = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _tg = ControlThreadGuard::enter();
             touch();
         }));
         assert!(res_t.is_err(), "{label}: must panic on marked RT control thread");
         assert!(
-            rt_lock_attempts() > before_t,
-            "{label}: must increment rt_lock_attempts() strictly before panicking on RT control thread"
+            thread_rt_lock_attempts() > before_t,
+            "{label}: must increment thread_rt_lock_attempts() strictly before panicking on RT control thread"
         );
 
         // 2. Inside ReleaseGuard alone (marked RT release).
-        let before_r = rt_lock_attempts();
+        let before_r = thread_rt_lock_attempts();
         let res_r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _rg = ReleaseGuard::enter();
             touch();
         }));
         assert!(res_r.is_err(), "{label}: must panic inside marked RT release");
         assert!(
-            rt_lock_attempts() > before_r,
-            "{label}: must increment rt_lock_attempts() strictly before panicking inside RT release"
+            thread_rt_lock_attempts() > before_r,
+            "{label}: must increment thread_rt_lock_attempts() strictly before panicking inside RT release"
         );
     }
 

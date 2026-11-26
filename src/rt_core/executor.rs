@@ -581,6 +581,9 @@ pub struct ExecutorStats {
     /// Cumulative per-op heap counts across all sub-release wakes (entry through wake service,
     /// publication, reply/ack handling, and local destruction; disjoint from releases).
     pub wake_allocs: AtomicAllocCounters,
+    /// Cumulative lock acquisition attempts rejected on THIS executor's `armd-control` thread
+    /// across all RT-guarded lock boundaries (isolated per executor instance).
+    pub rt_lock_attempts: AtomicU64,
     /// True once `ARMD_ALLOC_TIMING=1` (`alloc_timing`) has been enabled on the control thread.
     pub alloc_timing_enabled: AtomicBool,
     /// Release sequence (`TickSample::release_seq`) of the most recent fault latch on `armd-control`.
@@ -6795,6 +6798,8 @@ pub(crate) fn spawn_executor(
         } else {
             thread::Builder::new().name("armd-control".into()).spawn(move || {
                 let _control_thread_guard = ControlThreadGuard::enter();
+                let _lock_counter_guard =
+                    super::rt_gate::bind_executor_lock_counter(Arc::clone(&stats));
                 let _panic_scope = crate::panic_coord::ControlPanicScope::enter();
                 let Ok(core) = core_rx.recv() else {
                     return;
