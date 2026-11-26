@@ -91,6 +91,7 @@ impl SupervisorInner {
     }
 
     fn begin_action_inner(&mut self, kind: &str, tag: Option<String>, format_superseded_msg: bool) -> u64 {
+        self.bump_motion_generation();
         let now = self.now_s();
         // Clean up old macro bookkeeping without overwriting the newly prepared motion's
         // `target_positions` or resetting `safety` back to `Armed` (caller already quiesced
@@ -406,6 +407,7 @@ impl SupervisorInner {
             }
         }
         if transitioned_terminal {
+            self.bump_motion_generation();
             self.record_terminal_transition_by_id(id);
         }
     }

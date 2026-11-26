@@ -1574,6 +1574,12 @@ pub struct SupervisorInner {
     /// Monotonic revision bumped on every change to motion planning inputs (limits, workspace,
     /// keep-out boxes, camera mount, kinematics, commissioning, gripper calibration, power).
     pub motion_config_revision: u64,
+    /// Monotonic generation bumped on every motion lifecycle transition (trajectory install/clear,
+    /// servo stream start/stop, gravity comp enter/exit, stop, E-stop, clear-fault).
+    pub(crate) motion_generation: u64,
+    /// Last motion-state fingerprint observed at publication time (catches direct field transitions
+    /// without allocating on RT).
+    last_published_motion_fp: u64,
     /// Static hardware driver capabilities cached once in [`Self::with_driver`] (0 driver lock on RT).
     pub(crate) driver_caps: DriverCapabilities,
     /// Step-2 / RX-poll cached hardware enable & freshness snapshot (0 extra driver lock on RT settle).
@@ -2686,6 +2692,8 @@ impl SupervisorInner {
             unload_settle_spare: Some(UnloadSettle::with_capacity(unload_settle_cap)),
             park_release_spare: None,
             motion_config_revision: 1,
+            motion_generation: 0,
+            last_published_motion_fp: 0,
             driver_caps: DriverCapabilities::default(),
             last_poll_enable_state: EnableState::Unknown,
             last_poll_partial_enable: false,
@@ -4611,6 +4619,7 @@ impl SupervisorInner {
             watchdog_park_pending_gen: wd_gen,
             watchdog_park_pending_attempt: wd_attempt,
         };
+        self.sync_motion_generation_for_publish();
         let owner = self.published_owner_meta();
         let next_pub_seq = self.core.next_publish_seq();
         let mid_csw = self
@@ -6730,12 +6739,16 @@ impl SupervisorInner {
             arm: self.core.id(),
             boot: self.boot_id,
             authority,
+            control_release_seq: self.control_release_seq,
+            motion_generation: self.motion_generation,
             calibration_revision: self.calibration_revision,
+            collision_revision: self.collision.revision,
             poses_revision: self.poses.revision,
             sequences_revision: self.sequences.revision,
             grasp_setup_revision: self.grasp_setup_revision,
             gripper_calib_revision: self.gripper_calib_revision,
             power_budget_revision: self.power_budget_revision,
+            tool_commissioning_revision: self.tool_commissioning_revision,
             tool_digest_hash: crate::rt_core::ops::tool_digest_hash(&self.config.active_tool.config_digest),
             motion_active: self.active_trajectory.is_some() || self.servo_target.is_some(),
             config_inhibited: self.core.motion_inhibited_by_config(),
@@ -6753,6 +6766,53 @@ impl SupervisorInner {
             held,
             macro_state,
         }
+    }
+
+    /// Zero-allocation monotonic bump of [`Self::motion_generation`] on motion lifecycle changes.
+    #[inline]
+    pub(crate) fn bump_motion_generation(&mut self) {
+        self.motion_generation = self.motion_generation.wrapping_add(1).max(1);
+    }
+
+    #[inline]
+    fn motion_state_fingerprint(&self) -> u64 {
+        let mut h = 0xcbf29ce484222325u64;
+        let mut mix = |v: u64| {
+            h ^= v;
+            h = h.wrapping_mul(0x100000001b3);
+        };
+        let traj_tag = self
+            .active_trajectory
+            .as_ref()
+            .map_or(0u64, |t| t.action_id.unwrap_or(u64::MAX));
+        mix(traj_tag);
+        mix(u64::from(self.servo_target.is_some()));
+        mix(u64::from(self.servo_stream_active));
+        let gc_tag = match self.gravity_comp.as_ref().map(|g| &g.phase) {
+            None => 0u64,
+            Some(crate::gravity_comp::GravityCompPhase::RampIn) => 1,
+            Some(crate::gravity_comp::GravityCompPhase::Active) => 2,
+            Some(crate::gravity_comp::GravityCompPhase::Exiting { .. }) => 3,
+            Some(crate::gravity_comp::GravityCompPhase::ExitFailed { .. }) => 4,
+        };
+        mix(gc_tag);
+        #[cfg(feature = "policy-runtime")]
+        let policy_tag = self.policy_run.as_ref().map_or(0u64, |p| p.action_id.max(1));
+        #[cfg(not(feature = "policy-runtime"))]
+        let policy_tag = 0u64;
+        mix(policy_tag);
+        mix(self.stop_requests.as_ref().map_or_else(|| self.current_stop_gen(), |s| s.applied()));
+        mix(self.safety.epoch_id());
+        h.max(1)
+    }
+
+    #[inline]
+    fn sync_motion_generation_for_publish(&mut self) {
+        let fp = self.motion_state_fingerprint();
+        if self.last_published_motion_fp != 0 && self.last_published_motion_fp != fp {
+            self.bump_motion_generation();
+        }
+        self.last_published_motion_fp = fp;
     }
 
     /// Pop one retired `ActiveTrajectory` for off-thread drop (0 alloc, 0 drop).
@@ -13170,6 +13230,7 @@ impl ArmSupervisor {
         #[cfg(feature = "policy-runtime")]
         hub.attach_policy_diag_seal(atomic_diag_sealed_policy_action_id.clone());
         hub.update_prep_env(Arc::new(crate::rt_core::requests::actions::ActionPrepEnv::from_inner(&inner)));
+        hub.set_service_identity(Arc::new(crate::rt_core::publish::ServiceIdentity::from_inner(&inner)));
         let control_frequency_hz = inner.config.control_frequency_hz.max(1);
         let control_period_us = (1e6 / f64::from(control_frequency_hz)) as u64;
         static NEXT_INSTANCE_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -13929,6 +13990,9 @@ impl ArmSupervisor {
             self.hub.update_prep_env(Arc::new(
                 crate::rt_core::requests::actions::ActionPrepEnv::from_inner(&inner),
             ));
+            self.hub.set_service_identity(Arc::new(
+                crate::rt_core::publish::ServiceIdentity::from_inner(&inner),
+            ));
         }
     }
 
@@ -14213,6 +14277,7 @@ impl ArmSupervisor {
                 handle.seed_connection_reply_sinks(seeded_ws_sinks);
                 self.hub.set_motion_config(ready_payload.staged_motion_cfg);
                 self.hub.update_prep_env(ready_payload.staged_prep_env);
+                self.hub.set_service_identity(ready_payload.staged_service_identity);
                 self.hub.install_prewarm_template_and_front(
                     ready_payload.staged_obs_template,
                     ready_payload.staged_front_obs,
@@ -15581,6 +15646,53 @@ impl ArmSupervisor {
                 let gen = self.inner.generation();
                 Ok(Arc::new(inner.synthesize_legacy_snapshot(gen)))
             }
+        }
+    }
+
+    /// Reads a coherent [`ServiceSnapshot`](crate::rt_core::publish::ServiceSnapshot) respecting
+    /// the active owner boundary:
+    /// - `OWNER_EXECUTOR`: reads strictly from [`StateHub`] (zero `SupervisorLock`), rejecting
+    ///   exited executors and pre-handoff cached samples (`min_generation >= executor_base_gen + 1`).
+    /// - `OWNER_LEGACY`: serves from [`StateHub`] when a live control loop is publishing, or
+    ///   synthesizes a single-guard coherent snapshot under a short read lock (rechecking
+    ///   detachment) when no ticker runs.
+    /// - `OWNER_TRANSFERRING` / `OWNER_FAILED`: fails closed with `503 EXECUTOR_UNAVAILABLE`.
+    pub async fn read_services(
+        &self,
+        mut req: crate::rt_core::publish::ReadRequirements,
+    ) -> Result<Arc<crate::rt_core::publish::ServiceSnapshot>, ArmError> {
+        match self.owner_mode() {
+            OWNER_EXECUTOR => {
+                if self.executor_handle().is_none_or(|h| h.is_exited()) {
+                    return Err(observation_unavailable());
+                }
+                let base_want = self.executor_base_gen.load(Ordering::Acquire).saturating_add(1);
+                req.min_generation = Some(req.min_generation.map_or(base_want, |g| g.max(base_want)));
+                self.hub.read_services(req).map_err(ArmError::from)
+            }
+            OWNER_LEGACY => {
+                if let Ok(svc) = self.hub.read_services(req) {
+                    return Ok(svc);
+                }
+                let inner = self.inner.read().await;
+                self.check_legacy_under_guard(&inner)?;
+                let gen = self.inner.generation();
+                let snap = Arc::new(inner.synthesize_legacy_snapshot(gen));
+                let identity = Arc::new(crate::rt_core::publish::ServiceIdentity::from_inner(&inner));
+                let prep_env = req.require_prep_env.then(|| {
+                    Arc::new(crate::rt_core::requests::actions::ActionPrepEnv::from_inner(&inner))
+                });
+                drop(inner);
+                crate::rt_core::publish::StateHub::build_service_snapshot_from(
+                    snap,
+                    identity,
+                    prep_env,
+                    req,
+                    Instant::now(),
+                )
+                .map_err(ArmError::from)
+            }
+            _ => Err(executor_unavailable()),
         }
     }
 

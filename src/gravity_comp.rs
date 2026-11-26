@@ -341,6 +341,7 @@ impl SupervisorInner {
             prev_measured: None,
             lease_generation: this.active_lease.as_ref().map(|l| l.generation),
         });
+        this.bump_motion_generation();
         let _ = this.collision.hold.take();
         Ok(None)
     }
@@ -368,6 +369,7 @@ impl SupervisorInner {
             message: crate::model::HolderLabel::new(message),
             at,
         });
+        self.bump_motion_generation();
     }
 
     fn enter_gravity_comp_inner(&mut self, request: GravityCompRequest) -> Result<(), ArmError> {
@@ -454,6 +456,7 @@ impl SupervisorInner {
             prev_measured: None,
             lease_generation: self.active_lease.as_ref().map(|l| l.generation),
         });
+        self.bump_motion_generation();
         // Hand guiding is the way out of a collision hold: the guard does not watch while
         // floating, so the hold ends here.
         if let Some(h) = self.collision.hold.take() {
@@ -494,6 +497,7 @@ impl SupervisorInner {
             tracing::warn!("Gravity compensation exit: {code} {message}");
         }
         self.gravity_comp_last_exit = Some(GravityCompExit { code: code.into(), message: message.into(), at });
+        self.bump_motion_generation();
         if write_now {
             self.gravity_comp_write_now();
         }
@@ -945,6 +949,7 @@ impl SupervisorInner {
                     if self.rt_executor_owned {
                         self.retired_gravity_comp = Some(old);
                     }
+                    self.bump_motion_generation();
                 }
                 for i in 0..ARM {
                     self.commanded_positions[i] = hold[i];

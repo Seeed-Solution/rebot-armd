@@ -23,6 +23,7 @@ impl SupervisorInner {
     /// Clears the servo target, keeping its buffer for the next one (no free).
     pub(crate) fn release_servo_target(&mut self) {
         if let Some(v) = self.servo_target.take() {
+            self.bump_motion_generation();
             // the spare is empty (capacity 0) while a target holds the buffer: nothing is freed
             if v.capacity() >= self.servo_target_spare.capacity() { self.servo_target_spare = v; }
         }
@@ -32,6 +33,7 @@ impl SupervisorInner {
     /// has the capacity).
     fn set_servo_target(&mut self, src: &[f32]) {
         if self.servo_target.is_none() {
+            self.bump_motion_generation();
             let mut v = std::mem::take(&mut self.servo_target_spare);
             copy_into(&mut v, src);
             self.servo_target = Some(v);
