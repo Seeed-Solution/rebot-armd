@@ -1622,6 +1622,9 @@ pub struct PersistTestHooks {
     pub reconcile_retry_interval: Option<Duration>,
     /// Overrides the maximum reconciliation retry attempts for `armd-persist` dir-fsync recovery.
     pub reconcile_max_attempts: Option<u32>,
+    /// Runs on `armd-persist` in zero-check reconciliation after the worker-side operator sample
+    /// and before `FinishReconcile` is queued (tests owner-side grant validation at commit time).
+    pub before_finish_reconcile: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Fault-injection hook: panics in `control_thread_main` startup setup BEFORE `init_res`
     /// `catch_unwind` to verify outer unwind ownership retention.
     pub panic_in_startup_setup: bool,
@@ -6615,6 +6618,9 @@ struct ControlState {
     offload_reclaim_tx: Producer<OffloadReclaim>,
     persist_wake: Thread,
     persist_granted: Option<(u64, ConfigDomain)>,
+    /// Operator grant of the zero-check whose dir fsync failed, kept for the owner-side
+    /// validation in `FinishReconcile` (the session settle clears `zero_check_persisting_grant`).
+    reconcile_operator_grant: Option<crate::auth::OperatorGrant>,
     next_persist_req: u64,
     disconnect_code_buf: Option<String>,
     disconnect_msg_buf: Option<String>,
@@ -7926,6 +7932,11 @@ impl ControlState {
                 msg_buf,
             } => {
                 self.persist_granted = None;
+                // Carry the grant itself into reconciliation; settling the session below clears it.
+                self.reconcile_operator_grant = core
+                    .zero_check_persisting_grant
+                    .filter(|(gid, _)| *gid == action_id)
+                    .map(|(_, g)| g);
                 let (old_msg, old_warn) =
                     super::requests::config::zero_check_owner_reconcile_dir_sync_failed(
                         core,
@@ -8044,6 +8055,11 @@ impl ControlState {
                 operator_revoked,
             } => {
                 let probe = self.take_reply_probe();
+                let operator_grant = Some(
+                    self.reconcile_operator_grant
+                        .take()
+                        .unwrap_or(crate::auth::OperatorGrant::DENIED),
+                );
                 match super::requests::config::zero_check_owner_finish_reconcile(
                     core,
                     ctx,
@@ -8054,6 +8070,7 @@ impl ControlState {
                     new_policy,
                     new_jaw,
                     operator_revoked,
+                    operator_grant,
                 ) {
                     Ok((old_policy, old_jaw)) => {
                         let activated_revision = core.gripper_calib_revision;
@@ -8086,6 +8103,7 @@ impl ControlState {
                 }
             }
             PersistCmd::LatchConfigReconcileFault { message } => {
+                self.reconcile_operator_grant = None;
                 super::requests::config::install_latch_config_reconcile_fault(
                     core,
                     ConfigDomain::GripperCalibration,
@@ -8770,6 +8788,9 @@ impl super::requests::config::CommonCommitWorker for ExecutorPersistBackend<'_> 
                             }
                         };
                         let operator_revoked = !self.op_auth_ok();
+                        if let Some(h) = self.hooks.before_finish_reconcile.as_ref() {
+                            h();
+                        }
                         let Some(pol) = policy_opt.take() else {
                             return ZeroCheckCommitStop::Aborted;
                         };
@@ -10164,6 +10185,7 @@ fn control_thread_main_inner(
         offload_reclaim_tx,
         persist_wake,
         persist_granted: None,
+        reconcile_operator_grant: None,
         next_persist_req: 0,
         disconnect_code_buf: Some(String::with_capacity(64)),
         disconnect_msg_buf: Some(String::with_capacity(160)),
@@ -12481,6 +12503,7 @@ mod tests {
             offload_reclaim_tx,
             persist_wake: thread::current(),
             persist_granted: Some((action_id, ConfigDomain::GripperCalibration)),
+            reconcile_operator_grant: None,
             next_persist_req: 1,
             disconnect_code_buf: Some(String::from("buf")),
             disconnect_msg_buf: Some(String::from("msg")),
@@ -12589,6 +12612,7 @@ mod tests {
             offload_reclaim_tx,
             persist_wake: thread::current(),
             persist_granted: None,
+            reconcile_operator_grant: None,
             next_persist_req: 1,
             disconnect_code_buf: None,
             disconnect_msg_buf: None,
@@ -12845,6 +12869,7 @@ mod tests {
             offload_reclaim_tx,
             persist_wake: thread::current(),
             persist_granted: None,
+            reconcile_operator_grant: None,
             next_persist_req: 0,
             disconnect_code_buf: None,
             disconnect_msg_buf: None,
@@ -13020,6 +13045,7 @@ mod tests {
             offload_reclaim_tx,
             persist_wake: thread::current(),
             persist_granted: None,
+            reconcile_operator_grant: None,
             next_persist_req: 0,
             disconnect_code_buf: Some(String::with_capacity(64)),
             disconnect_msg_buf: Some(String::with_capacity(160)),

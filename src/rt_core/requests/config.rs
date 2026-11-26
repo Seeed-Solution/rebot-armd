@@ -6362,6 +6362,7 @@ pub(crate) fn zero_check_owner_finish_reconcile(
     new_policy: GripperPolicy,
     new_jaw: Option<JawOpening>,
     operator_revoked: bool,
+    operator_grant: Option<crate::auth::OperatorGrant>,
 ) -> Result<(Option<GripperPolicy>, Option<JawOpening>), (&'static str, Option<GripperPolicy>, Option<JawOpening>)> {
     let is_reconciling = core
         .core
@@ -6370,7 +6371,11 @@ pub(crate) fn zero_check_owner_finish_reconcile(
     if !is_reconciling {
         return Err(("NOT_HELD", Some(new_policy), new_jaw));
     }
-    if operator_revoked {
+    // Executor: the worker's sample is advisory; the owner validates the grant carried through
+    // reconciliation at commit time. Legacy (`None`) samples and commits under one lock.
+    if operator_revoked
+        || operator_grant.is_some_and(|g| !g.is_valid_at(ctx.now, core.operator_auth_enforced))
+    {
         return Err(("OPERATOR_REQUIRED", Some(new_policy), new_jaw));
     }
     if core.safety.state().is_stopped() {
@@ -6687,6 +6692,7 @@ impl CommonCommitWorker for LegacyZeroCheckBackend {
                             pol,
                             jaw,
                             operator_revoked,
+                            None,
                         )
                     };
                     match finish_res {

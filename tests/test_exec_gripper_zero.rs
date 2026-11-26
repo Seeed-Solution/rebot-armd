@@ -1755,6 +1755,117 @@ async fn executor_zero_check_prc_revocation_before_rename_dir_sync_retry_and_wor
     }
 }
 
+/// Dir-fsync failure settles the action and its session; the background reconciliation must not
+/// activate the stored offset once the operator grant of that action is no longer valid, even
+/// when the worker sampled the operator session as valid just before queueing `FinishReconcile`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executor_zero_check_reconcile_refuses_activation_after_operator_revoked() {
+    let client = reqwest::Client::new();
+    let auth = OperatorAuth::enforced("123456", 1800);
+    let auth_hook = auth.clone();
+    let tok_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let tok_hook = Arc::clone(&tok_slot);
+    let revoked = Arc::new(AtomicBool::new(false));
+    let revoked_h = Arc::clone(&revoked);
+    let sync_calls = Arc::new(AtomicUsize::new(0));
+    let sync_calls_h = Arc::clone(&sync_calls);
+    let hooks = PersistTestHooks {
+        dir_sync_override: Some(Arc::new(move |_| {
+            if sync_calls_h.fetch_add(1, Ordering::AcqRel) == 0 {
+                Err(std::io::Error::from_raw_os_error(libc::EIO))
+            } else {
+                Ok(())
+            }
+        })),
+        reconcile_retry_interval: Some(Duration::from_millis(20)),
+        reconcile_max_attempts: Some(5),
+        // Revoke strictly after the worker sampled the session as valid.
+        before_finish_reconcile: Some(Arc::new(move || {
+            if let Some(tok) = tok_hook.lock().unwrap().as_deref() {
+                auth_hook.lock(Some(tok));
+                revoked_h.store(true, Ordering::Release);
+            }
+        })),
+        ..Default::default()
+    };
+    let rig = DualRig::start(
+        RtOwner::Executor,
+        auth,
+        |_| {},
+        |inner| {
+            inner.set_mock_gripper_stall_offset(Some(0.05));
+        },
+        hooks,
+    )
+    .await;
+    let base = format!("http://{}", rig.addr);
+    let unlock: Value = client
+        .post(format!("{base}/api/v1/auth/unlock"))
+        .json(&json!({"pin": "123456"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = unlock["token"].as_str().unwrap().to_string();
+    *tok_slot.lock().unwrap() = Some(token.clone());
+    let cal_rev = || async {
+        let v: Value = client
+            .get(format!("{base}/api/v1/gripper/calibration"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        v["revision"].as_u64().unwrap()
+    };
+    let rev_before = cal_rev().await;
+
+    let mut ws = connect_ws(rig.addr, Some(&token)).await;
+    let gen = acquire_lease(&mut ws, "c-rec-rev", false).await;
+    let ep = rig.sup.get_observation().await.epoch_id;
+    let _ = send_cmd(&mut ws, gen, ep, "/api/v1/torque", json!({"enable": true})).await;
+    let ep = rig.sup.get_observation().await.epoch_id;
+    let (_, term, _) = run_cmd_to_terminal(
+        &mut ws,
+        gen,
+        ep,
+        "/api/v1/action/gripper_zero_check",
+        json!({"store_offset": true}),
+        Duration::from_secs(8),
+    )
+    .await;
+    assert_eq!(term["state"], "failed", "{term}");
+    assert_eq!(term["code"], "PERSIST_FAILED", "{term}");
+
+    let dl = Instant::now() + Duration::from_secs(4);
+    while !revoked.load(Ordering::Acquire) {
+        assert!(Instant::now() < dl, "reconciliation never reached FinishReconcile");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Give the owner time to process FinishReconcile and the worker to publish any activation.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        cal_rev().await,
+        rev_before,
+        "reconciliation activated the offset after the operator grant was revoked"
+    );
+    let reply = rig
+        .sup
+        .dispatch_config_request(ConfigRequest::InspectHold(ConfigDomain::GripperCalibration))
+        .await
+        .unwrap();
+    assert!(
+        matches!(reply, ConfigReply::HoldInspected { state: Some(_), .. }),
+        "GripperCalibration must stay held (reconciliation refused)"
+    );
+    rig.wait_zero_check_ctx_empty("reconcile_revoked").await;
+    rig.shutdown().await;
+}
+
 // ---------------------------------------------------------------------------
 // 10. Stream saturation, 20x repeated failure zero-leak proof, PlanSlot size
 // ---------------------------------------------------------------------------
