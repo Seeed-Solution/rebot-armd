@@ -146,6 +146,68 @@ impl DualRig {
         }
     }
 
+    fn enter_gravity_comp(&mut self) {
+        use armd::auth::OperatorRequirement;
+        use armd::rt_core::ops::CommitCtx;
+        use armd::rt_core::requests::config::{
+            handle_config_exchange, ConfigExchange, ConfigReply, ConfigRequest,
+            GravityCompEnterOutcome,
+        };
+        let now = match &self.owner {
+            RigOwner::Legacy(_) => self.clock.now(),
+            RigOwner::Executor { fx, .. } => fx.now(),
+        };
+        let mut ex = {
+            let inner = self.inner_mut();
+            let stamp = inner.current_admission_stamp();
+            let policy = inner.config.gravity_comp.clone();
+            let ctx = CommitCtx {
+                arm: inner.core.id(),
+                boot: BootId(77),
+                now,
+                stop_generation: inner.current_stop_gen(),
+            };
+            let mut ex = ConfigExchange::new(ConfigRequest::StartGravityCompEnter {
+                admission: stamp,
+                lease_holder: None,
+                policy,
+                scale: None,
+                damping_kd: None,
+                operator: OperatorRequirement::NotRequired,
+                deadline: now + Duration::from_secs(5),
+                client: ClientId(0),
+                reservation: None,
+            });
+            handle_config_exchange(inner, &ctx, &mut ex);
+            ex
+        };
+        assert!(
+            matches!(
+                ex.reply.take(),
+                Some(ConfigReply::GravityCompEnterStarted(Ok(
+                    GravityCompEnterOutcome::Session(_) | GravityCompEnterOutcome::Immediate(_)
+                )))
+            ),
+            "StartGravityCompEnter must succeed"
+        );
+        let prev_imm = self.bus.with(|s| {
+            let prev = s.immediate_replies;
+            s.immediate_replies = true;
+            prev
+        });
+        for _ in 0..40 {
+            if self.inner().gravity_comp.is_some() {
+                break;
+            }
+            self.step();
+        }
+        self.bus.with(|s| s.immediate_replies = prev_imm);
+        assert!(
+            self.inner().gravity_comp.is_some(),
+            "gravity_comp ModeSwitch entry must complete within 40 steps"
+        );
+    }
+
     fn step(&mut self) {
         self.step_dt(DT, true);
     }
@@ -1023,12 +1085,7 @@ fn dual_owner_deferred_action_gravity_and_park_gates() {
 
         // 2. Gravity-comp Exiting: deferred stiff holds must NOT advance exit_hold or switch back.
         let mut rig_gc = DualRig::new(owner, base_cfg(), None);
-        {
-            let inner = rig_gc.inner_mut();
-            let stamp = inner.current_admission_stamp();
-            let admitted = inner.check_admission(stamp).unwrap();
-            SupervisorInner::enter_gravity_comp(admitted, Default::default()).expect("enter gravity comp");
-        }
+        rig_gc.enter_gravity_comp();
         rig_gc.step();
         rig_gc.inner_mut().exit_gravity_comp("REQUESTED", "test");
         assert!(rig_gc.inner().gravity_comp.is_some());
@@ -1154,12 +1211,7 @@ fn dual_owner_deferred_action_gravity_and_park_gates() {
                 ..base_cfg()
             };
             let mut rig_jt = DualRig::new(owner, cfg_jt, None);
-            {
-                let inner = rig_jt.inner_mut();
-                let stamp = inner.current_admission_stamp();
-                let admitted = inner.check_admission(stamp).unwrap();
-                SupervisorInner::enter_gravity_comp(admitted, Default::default()).expect("enter gravity comp");
-            }
+            rig_jt.enter_gravity_comp();
             rig_jt.step();
             rig_jt.inner_mut().exit_gravity_comp("REQUESTED", "major2");
             // Keep arm moving for 6 ticks (120 ms > 100 ms exit_hold_ms).
@@ -1204,12 +1256,7 @@ fn dual_owner_deferred_action_gravity_and_park_gates() {
             let mut cfg_s2 = base_cfg();
             cfg_s2.tx_stall_ticks = Some(4); // minimum at 50 Hz = ceil(45/20) + 1
             let mut rig_s2 = DualRig::new(owner, cfg_s2, None);
-            {
-                let inner = rig_s2.inner_mut();
-                let stamp = inner.current_admission_stamp();
-                let admitted = inner.check_admission(stamp).unwrap();
-                SupervisorInner::enter_gravity_comp(admitted, Default::default()).expect("enter gravity comp");
-            }
+            rig_s2.enter_gravity_comp();
             rig_s2.step();
             // Inject ENOBUFS during off-tick `exit_gravity_comp` -> immediate write defers,
             // must NOT increment periodic `tx_deferral_streak`!
@@ -3637,16 +3684,7 @@ fn pos_force_gravity_comp_and_real_flush_j7_staleness() {
     }
     let mut rig = DualRig::new_pos_force(Owner::Legacy, cfg, None);
     rig.bus.with(|s| s.immediate_replies = true);
-    {
-        let inner = rig.inner_mut();
-        let stamp = inner.current_admission_stamp();
-        let admitted = inner.check_admission(stamp).expect("admit enter gravity comp");
-        SupervisorInner::enter_gravity_comp(
-            admitted,
-            armd::gravity_comp::GravityCompRequest::default(),
-        )
-        .expect("enter gravity comp");
-    }
+    rig.enter_gravity_comp();
     rig.bus.with(|s| s.immediate_replies = false);
     for _ in 0..5 {
         rig.step();
@@ -3685,16 +3723,7 @@ fn pos_force_gravity_comp_and_real_flush_j7_staleness() {
         s.push_all_feedback();
     });
     rig.step();
-    {
-        let inner = rig.inner_mut();
-        let stamp = inner.current_admission_stamp();
-        let admitted = inner.check_admission(stamp).expect("admit re-enter gravity comp");
-        SupervisorInner::enter_gravity_comp(
-            admitted,
-            armd::gravity_comp::GravityCompRequest::default(),
-        )
-        .expect("re-enter gravity comp");
-    }
+    rig.enter_gravity_comp();
     rig.bus.with(|s| s.immediate_replies = false);
     for _ in 0..4 {
         rig.step();

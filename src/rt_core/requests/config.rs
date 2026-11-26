@@ -1731,7 +1731,7 @@ impl ConfigExchange {
 
 /// Executes one [`ConfigExchange`] in-place on the single owner (`SupervisorInner`).
 /// Called identically by `armd-control` (`MaintenanceOp::Config`) and Legacy (`SupervisorLock`).
-pub(crate) fn handle_config_exchange(
+pub fn handle_config_exchange(
     core: &mut SupervisorInner,
     ctx: &CommitCtx,
     ex: &mut ConfigExchange,
