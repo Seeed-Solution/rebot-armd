@@ -2507,6 +2507,46 @@ impl<'a> WorkspaceEvaluator<'a> {
         }
     }
 
+    /// Materializes a zero-allocation [`WorkspaceFailureRt`] into a detailed [`WorkspaceFailure`]
+    /// for rejection paths that carry formatted diagnostics.
+    pub fn materialize_failure(&self, f: WorkspaceFailureRt) -> WorkspaceFailure {
+        match f.kind {
+            WorkspaceFailureKindRt::Invalid(msg) => WorkspaceFailure::invalid(f.phase, msg),
+            WorkspaceFailureKindRt::UnknownCapsule(ci) => {
+                let cap = &self.ws.link_capsules[ci];
+                WorkspaceFailure {
+                    point: self.num_end_pts + ci,
+                    limit: "invalid".into(),
+                    value: f64::NAN,
+                    bound: 0.0,
+                    detail: Box::new(k::WorkspaceViolationDetail {
+                        constraint_id: Some("invalid".into()),
+                        geometry_id: Some(format!("capsule:{}", cap.id)),
+                        violation_phase: Some(f.phase.into()),
+                        reason: Some(format!(
+                            "unknown frame '{}' for capsule '{}'",
+                            cap.frame, cap.id
+                        )),
+                    }),
+                }
+            }
+            WorkspaceFailureKindRt::InvalidSelfPair(pi) => {
+                let msg = self.ws.self_collision_pairs.get(pi).map_or_else(
+                    || "invalid self-collision pair".to_string(),
+                    |[a, b]| format!("unknown or invalid self_collision pair ['{a}', '{b}']"),
+                );
+                WorkspaceFailure::invalid(f.phase, msg)
+            }
+            WorkspaceFailureKindRt::BudgetExceeded { max_budget } => {
+                self.budget_failure(max_budget, f.phase)
+            }
+            WorkspaceFailureKindRt::Constraint { slot, depth, min_d } => {
+                let clr = if depth.is_finite() { -depth } else { f64::NAN };
+                self.describe_failure(slot, clr, depth, min_d, f.phase)
+            }
+        }
+    }
+
     /// Verify a linear joint-space step `a -> b`, given `a`'s clearances `c_a` and running
     /// `min_depths`. Zero heap allocations when no subdivision is needed.
     /// Returns `(c_b)` on success and advances `min_depths` through `b`.

@@ -3267,3 +3267,434 @@ async fn rt_gate_tracking_fallback_full_workspace_sweep_and_rejection_zero_alloc
             .unwrap();
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rt_gate_power_static_load_tracking_paths_zero_alloc_zero_lock() {
+    use armd::model::MotionLimitReason;
+    use armd::power::{predict_static_holding_current_a, STATIC_LOAD_EPS_A};
+    use armd::rt_core::rt_gate::RtReleaseGate;
+    use armd::tracking::{
+        FallbackRamp, JointTrackingConfig, JointTrackingJoint, TrackingHistoryState,
+        TrackingStrategy,
+    };
+
+    // Part A: Tracking ramp-out output static-load refusal (`src/supervisor.rs` tracking output
+    // gate) with `nominal_worse == true`, rolling arm joints back to `last_issued_positions` via
+    // fixed stack storage and `enter_servo_static_load_hold_rt` with zero allocs/deallocs/locks.
+    {
+        let mut cfg = ArmConfig::rebot_dm();
+        cfg.control_frequency_hz = 50;
+        cfg.power_budget.as_mut().unwrap().planning.enabled = false;
+        cfg.power_budget.as_mut().unwrap().static_admission_fraction = Some(0.85);
+        cfg.power_budget.as_mut().unwrap().static_reserve_a = 0.0;
+        let arm = cfg.arm_model.clone();
+        let raw_cap = cfg.power_budget.as_ref().unwrap().static_admission_cap_a().unwrap();
+        let q_low = [0.0f32, -0.35, 1.4, 0.0, 0.0, 0.0, 0.0];
+        let q_nom_worse = [0.0f32, -0.37, 1.4, 0.0, 0.0, 0.0, 0.0];
+        let i_low = predict_static_holding_current_a(cfg.power_budget.as_ref().unwrap(), &arm, &q_low).unwrap();
+        let i_nom = predict_static_holding_current_a(cfg.power_budget.as_ref().unwrap(), &arm, &q_nom_worse).unwrap();
+        assert!(i_nom > i_low + 0.01, "expected higher static load at q_nom_worse: {i_low:.4} -> {i_nom:.4}");
+        // Place cap just above `q_low` so even the first ramp-out step toward `q_nom_worse`
+        // exceeds cap and `q_nom_worse` itself fails `check_static_load_tracking_output`.
+        cfg.power_budget.as_mut().unwrap().static_reserve_a = raw_cap - i_low - 0.001;
+        let budget = cfg.power_budget.clone().unwrap();
+        let cap = budget.static_admission_cap_a().unwrap();
+        assert!(
+            predict_static_holding_current_a(&budget, &arm, &q_low).unwrap() < cap
+                && predict_static_holding_current_a(&budget, &arm, &q_nom_worse).unwrap() > cap
+        );
+
+        let mut joints = vec![JointTrackingJoint::default(); cfg.arm_dof()];
+        joints[1] = JointTrackingJoint {
+            strategy: TrackingStrategy::PositionLead,
+            lag_s: 0.05,
+            max_lead_rad: 0.03,
+            ..Default::default()
+        };
+        cfg.joint_tracking = Some(JointTrackingConfig { enabled: true, joints });
+
+        let clock = ScriptedClock::new();
+        let (mut drv, _fail) = WakeDriver::new(7, Duration::from_millis(2), Some(clock.clone()));
+        drv.enabled = true;
+        drv.q[..7].copy_from_slice(&q_low);
+        let sup = Arc::new(ArmSupervisor::new(cfg).with_driver(Box::new(drv)));
+        sup.set_lease_enabled(false).await;
+        {
+            let mut inner = sup.inner().write().await;
+            inner.is_torqued = true;
+            inner.torque_intent = armd::supervisor::TorqueIntent::On;
+            inner.safety.set_torque(true).unwrap();
+            inner.measured_positions = q_low.to_vec();
+            inner.commanded_positions = q_nom_worse.to_vec();
+            inner.target_positions = q_nom_worse.to_vec();
+            inner.commanded_velocities = vec![0.0; 7];
+            inner.tracking.record_issued_in_place(&q_low, &[0.0; 7], None, None);
+            inner.tracking.history_state = TrackingHistoryState::Issued;
+            inner.servo_stream_active = true;
+            inner.prewarm_rt_buffers();
+        }
+        let period_ns = 20_000_000u64;
+        let handle = sup
+            .start_executor_with_hooks(
+                alloc_cfg(Duration::from_nanos(period_ns)),
+                PersistTestHooks {
+                    clock: Some(clock.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let gate = RtReleaseGate::new(&sup, &handle);
+        let ((saw_power_limit, emitted_q, cmd_q, obs_dbg), delta) =
+            gate.run_phase("power_static_load_tracking_servo_nominal_worse", || {
+                let mut saw_power_limit = false;
+                for _ in 0..4 {
+                    clock.run_steps(period_ns, 1);
+                    if let Some(s) = sup.hub().latest() {
+                        if s.obs.motion_limit.as_ref().map(|m| m.reason)
+                            == Some(MotionLimitReason::Power)
+                        {
+                            saw_power_limit = true;
+                        }
+                    }
+                }
+                let s = sup.hub().latest().unwrap();
+                let emitted_q = s.rt.positions.clone();
+                let cmd_q = s.rt.commanded_positions.clone();
+                let obs_dbg = format!(
+                    "safety={:?} motion_limit={:?} torqued={} emitted_j2={:.5} cmd_j2={:.5}",
+                    s.obs.safety_state,
+                    s.obs.motion_limit,
+                    s.obs.is_torqued,
+                    emitted_q[1],
+                    cmd_q[1]
+                );
+                ((saw_power_limit, emitted_q, cmd_q, obs_dbg), saw_power_limit)
+            });
+        assert!(saw_power_limit, "expected MotionLimitReason::Power on tracking static-load refusal ({obs_dbg})");
+        assert!(
+            delta.is_clean(),
+            "tracking static-load refusal (nominal_worse) must be zero-alloc/zero-lock: {delta:?}"
+        );
+        assert!(
+            (cmd_q[1] - q_low[1]).abs() < 1e-4,
+            "nominal_worse must roll commanded J2 back to last_issued_positions ({:.4}), got {:.4} ({obs_dbg})",
+            q_low[1],
+            cmd_q[1]
+        );
+        let emitted_a = predict_static_holding_current_a(&budget, &arm, &emitted_q).unwrap();
+        assert!(
+            emitted_a <= cap + STATIC_LOAD_EPS_A,
+            "emitted tracking refusal hold exceeded static cap: {emitted_a:.4} A > {cap:.4} A"
+        );
+
+        tokio::task::spawn_blocking(move || handle.stop_and_join())
+            .await
+            .unwrap();
+    }
+
+    // Part B: Planned jog (`Submit::Install` with real `action_id`) where nominal trajectory stays
+    // below cap while position-lead tracking output exceeds cap, invoking
+    // `abort_planned_motion_static_load_rt(Some(action_id))` on `armd-control` with zero allocs.
+    {
+        use armd::rt_core::requests::motion::{
+            prepare_motion, stage_jog, MotionConfigSnapshot, MotionPlanSnapshot, MotionRequest,
+        };
+
+        let mut cfg = ArmConfig::rebot_dm();
+        cfg.control_frequency_hz = 50;
+        if let Some(ws) = cfg.workspace.as_mut() {
+            ws.floor_z_m = -1.5;
+            ws.box_min_m = [-1.5, -1.5, -1.5];
+            ws.box_max_m = [1.5, 1.5, 1.5];
+            ws.max_reach_m = Some(1.5);
+            ws.keepout_boxes.clear();
+        }
+        cfg.power_budget.as_mut().unwrap().planning.enabled = false;
+        cfg.power_budget.as_mut().unwrap().static_admission_fraction = Some(0.85);
+        cfg.power_budget.as_mut().unwrap().static_reserve_a = 0.0;
+        let arm = cfg.arm_model.clone();
+        let raw_cap = cfg.power_budget.as_ref().unwrap().static_admission_cap_a().unwrap();
+        let q_low = [0.0f32, -0.20, 1.4, 0.0, 0.0, 0.0, 0.0];
+        let q_end = [0.0f32, -0.50, 1.4, 0.0, 0.0, 0.0, 0.0];
+        let q_lead_est = [0.0f32, -0.505, 1.4, 0.0, 0.0, 0.0, 0.0];
+        let i_end = predict_static_holding_current_a(cfg.power_budget.as_ref().unwrap(), &arm, &q_end).unwrap();
+        let i_lead = predict_static_holding_current_a(cfg.power_budget.as_ref().unwrap(), &arm, &q_lead_est).unwrap();
+        assert!(i_lead > i_end + 0.002);
+        // Set cap strictly above `q_end` (so nominal jog admission and nominal steps pass) and
+        // strictly below `q_lead_est` (so position-lead overshoot triggers the tracking gate).
+        cfg.power_budget.as_mut().unwrap().static_reserve_a = raw_cap - 0.5 * (i_end + i_lead);
+        let budget = cfg.power_budget.clone().unwrap();
+        let cap = budget.static_admission_cap_a().unwrap();
+        assert!(
+            predict_static_holding_current_a(&budget, &arm, &q_end).unwrap() < cap
+                && predict_static_holding_current_a(&budget, &arm, &q_lead_est).unwrap() > cap
+        );
+
+        let mut joints = vec![JointTrackingJoint::default(); cfg.arm_dof()];
+        joints[1] = JointTrackingJoint {
+            strategy: TrackingStrategy::PositionLead,
+            lag_s: 0.10,
+            max_lead_rad: 0.03,
+            ..Default::default()
+        };
+        cfg.joint_tracking = Some(JointTrackingConfig { enabled: true, joints });
+
+        let clock = ScriptedClock::new();
+        let (mut drv, _fail) = WakeDriver::new(7, Duration::from_millis(2), Some(clock.clone()));
+        drv.q[..7].copy_from_slice(&q_low);
+        let sup = Arc::new(ArmSupervisor::new(cfg).with_driver(Box::new(drv)));
+        sup.set_lease_enabled(false).await;
+        sup.register_ws_connection(1).await.unwrap();
+        let motion_cfg = {
+            let inner = sup.inner().read().await;
+            Arc::new(MotionConfigSnapshot::from_supervisor(&inner))
+        };
+        let period_ns = 20_000_000u64;
+        let handle = sup
+            .start_executor_with_hooks(
+                alloc_cfg(Duration::from_nanos(period_ns)),
+                PersistTestHooks {
+                    clock: Some(clock.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // Warm up and enable torque cleanly so `tracking` is seeded at `q_low`.
+        clock.run_steps(period_ns, 2);
+        wait_until(Duration::from_secs(2), || sup.hub().latest().is_some()).await;
+        let s0 = sup.hub().latest().unwrap();
+        let auth_en = Authority {
+            lease_generation: 0,
+            epoch: s0.obs.epoch_id,
+            stop_generation: handle.stop_requests().current(),
+            config_revision: 0,
+            parent_generation: 0,
+        };
+        let req_en = handle
+            .broker()
+            .lock()
+            .unwrap()
+            .submit(
+                ClientId(1),
+                1,
+                auth_en,
+                clock.now() + Duration::from_secs(5),
+                Submit::Transition(TransitionOp::TorqueOn),
+            )
+            .unwrap();
+        for _ in 0..20 {
+            clock.run_steps(period_ns, 1);
+            let rs = drain_broker(&handle);
+            if rs.iter().any(|r| {
+                matches!(r, Reply::Terminal { request, outcome: Outcome::Completed, .. } if *request == req_en)
+            }) {
+                break;
+            }
+        }
+        assert!(sup.hub().latest().unwrap().obs.is_torqued);
+
+        let snap = sup.hub().latest().unwrap();
+        let msnap = MotionPlanSnapshot::from_published(&snap, Arc::clone(&motion_cfg)).unwrap();
+        let prepared = prepare_motion(
+            &msnap,
+            &MotionRequest::jog(q_end.to_vec(), Some(1.0), None),
+        )
+        .unwrap();
+
+        let gate = RtReleaseGate::new(&sup, &handle);
+        let ((aborted, emitted_q, max_emitted_a), delta) =
+            gate.run_phase("power_static_load_tracking_planned_abort", || {
+                let s_now = sup.hub().latest().unwrap();
+                let auth = Authority {
+                    lease_generation: 0,
+                    epoch: s_now.obs.epoch_id,
+                    stop_generation: handle.stop_requests().current(),
+                    config_revision: 0,
+                    parent_generation: 0,
+                };
+                let req = handle
+                    .broker()
+                    .lock()
+                    .unwrap()
+                    .submit(
+                        ClientId(1),
+                        2,
+                        auth,
+                        clock.now() + Duration::from_secs(5),
+                        Submit::Install(&|s: &mut PlanSlot| stage_jog(s, &prepared.slot)),
+                    )
+                    .unwrap();
+                let mut aborted = false;
+                let mut max_a = 0.0f32;
+                for _ in 0..80 {
+                    clock.run_steps(period_ns, 1);
+                    if let Some(s) = sup.hub().latest() {
+                        if let Ok(a) = predict_static_holding_current_a(&budget, &arm, &s.rt.positions) {
+                            max_a = max_a.max(a);
+                        }
+                        if s.obs.motion_limit.as_ref().map(|m| m.reason)
+                            == Some(MotionLimitReason::Power)
+                            && s.obs.action.as_ref().is_some_and(|a| {
+                                a.state == "failed"
+                                    && a.code.as_deref() == Some("STATIC_LOAD_LIMIT")
+                            })
+                        {
+                            aborted = true;
+                            break;
+                        }
+                    }
+                    let rs = drain_broker(&handle);
+                    if rs.iter().any(|r| {
+                        matches!(r, Reply::Terminal { request, outcome: Outcome::Failed("STATIC_LOAD_LIMIT"), .. } if *request == req)
+                    }) {
+                        aborted = true;
+                        break;
+                    }
+                }
+                let emitted_q = sup.hub().latest().unwrap().rt.positions.clone();
+                ((aborted, emitted_q, max_a), aborted)
+            });
+        assert!(
+            delta.is_clean(),
+            "planned-motion tracking static-load abort must be zero-alloc/zero-lock: {delta:?}"
+        );
+        assert!(aborted, "expected planned jog to fail with STATIC_LOAD_LIMIT");
+        assert!(
+            max_emitted_a <= cap + STATIC_LOAD_EPS_A,
+            "wire pose during planned tracking abort exceeded static cap: {max_emitted_a:.4} A > {cap:.4} A (final={emitted_q:?})"
+        );
+
+        tokio::task::spawn_blocking(move || handle.stop_and_join())
+            .await
+            .unwrap();
+    }
+
+    // Part C: Tracking rejection fallback braking step static-load refusal
+    // (`apply_tracking_fallback_step_into` in `src/supervisor/streams.rs`) recycles `ramp` into
+    // `spare_fallback_ramp` and holds `fallback_prev_confirmed` with zero allocs/deallocs/locks.
+    {
+        let mut cfg = ArmConfig::rebot_dm();
+        cfg.control_frequency_hz = 50;
+        if let Some(ws) = cfg.workspace.as_mut() {
+            ws.floor_z_m = -1.5;
+            ws.box_min_m = [-1.5, -1.5, -1.5];
+            ws.box_max_m = [1.5, 1.5, 1.5];
+            ws.max_reach_m = Some(1.5);
+            ws.keepout_boxes.clear();
+        }
+        cfg.power_budget.as_mut().unwrap().planning.enabled = false;
+        cfg.power_budget.as_mut().unwrap().static_admission_fraction = Some(0.85);
+        cfg.power_budget.as_mut().unwrap().static_reserve_a = 0.0;
+        let arm = cfg.arm_model.clone();
+        let raw_cap = cfg.power_budget.as_ref().unwrap().static_admission_cap_a().unwrap();
+        let q_start = [0.0f32, -0.35, 1.4, 0.0, 0.0, 0.0, 0.0];
+        let q_hold = [0.0f32, -0.75, 1.4, 0.0, 0.0, 0.0, 0.0];
+        let v_start = [0.0f32, -0.50, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let i_start = predict_static_holding_current_a(cfg.power_budget.as_ref().unwrap(), &arm, &q_start).unwrap();
+        let i_hold = predict_static_holding_current_a(cfg.power_budget.as_ref().unwrap(), &arm, &q_hold).unwrap();
+        assert!(i_hold > i_start + 0.3);
+        cfg.power_budget.as_mut().unwrap().static_reserve_a = raw_cap - i_start - 0.002;
+        let budget = cfg.power_budget.clone().unwrap();
+        let cap = budget.static_admission_cap_a().unwrap();
+        assert!(
+            predict_static_holding_current_a(&budget, &arm, &q_start).unwrap() < cap
+                && predict_static_holding_current_a(&budget, &arm, &q_hold).unwrap() > cap
+        );
+
+        cfg.joint_tracking = Some(JointTrackingConfig {
+            enabled: true,
+            joints: (0..6)
+                .map(|_| JointTrackingJoint {
+                    strategy: TrackingStrategy::PositionLead,
+                    lag_s: 0.08,
+                    max_lead_rad: 0.03,
+                    ..Default::default()
+                })
+                .collect(),
+        });
+
+        let clock = ScriptedClock::new();
+        let (mut drv, _fail) = WakeDriver::new(7, Duration::from_millis(2), Some(clock.clone()));
+        drv.enabled = true;
+        drv.q[..7].copy_from_slice(&q_start);
+        let sup = Arc::new(ArmSupervisor::new(cfg.clone()).with_driver(Box::new(drv)));
+        sup.set_lease_enabled(false).await;
+        {
+            let mut inner = sup.inner().write().await;
+            inner.is_torqued = true;
+            inner.torque_intent = armd::supervisor::TorqueIntent::On;
+            inner.safety.set_torque(true).unwrap();
+            inner.commanded_positions = q_start.to_vec();
+            inner.target_positions = q_start.to_vec();
+            inner.measured_positions = q_start.to_vec();
+            inner.commanded_velocities = v_start.to_vec();
+            inner.tracking.record_issued_in_place(&q_start, &v_start, None, None);
+            inner.tracking.history_state = TrackingHistoryState::Issued;
+            inner.tracking.fallback_ramp = Some(FallbackRamp {
+                hold: q_hold.to_vec(),
+                keepout_only: false,
+                limits: cfg.limits.clone(),
+            });
+            inner.prewarm_rt_buffers();
+        }
+        let period_ns = 20_000_000u64;
+        let handle = sup
+            .start_executor_with_hooks(
+                alloc_cfg(Duration::from_nanos(period_ns)),
+                PersistTestHooks {
+                    clock: Some(clock.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let gate = RtReleaseGate::new(&sup, &handle);
+        let ((saw_power_limit, emitted_q, safety_state), delta) =
+            gate.run_phase("power_static_load_tracking_fallback_braking", || {
+                let mut saw_power_limit = false;
+                for _ in 0..5 {
+                    clock.run_steps(period_ns, 1);
+                    if let Some(s) = sup.hub().latest() {
+                        if s.obs.motion_limit.as_ref().map(|m| m.reason)
+                            == Some(MotionLimitReason::Power)
+                        {
+                            saw_power_limit = true;
+                        }
+                    }
+                }
+                let s = sup.hub().latest().unwrap();
+                let emitted_q = s.rt.positions.clone();
+                let safety_state = s.obs.safety_state.clone();
+                ((saw_power_limit, emitted_q, safety_state), saw_power_limit)
+            });
+        assert!(
+            delta.is_clean(),
+            "tracking fallback static-load refusal must be zero-alloc/zero-lock: {delta:?}"
+        );
+        assert!(saw_power_limit, "expected MotionLimitReason::Power on fallback static-load refusal");
+        assert!(
+            !matches!(safety_state, armd::safety::SafetyState::Fault(_)),
+            "fallback static-load refusal must hold without faulting, got {safety_state:?}"
+        );
+        assert!(
+            (emitted_q[1] - q_start[1]).abs() < 1e-4,
+            "fallback static-load refusal must hold fallback_prev_confirmed J2 ({:.4}), got {:.4}",
+            q_start[1],
+            emitted_q[1]
+        );
+        let emitted_a = predict_static_holding_current_a(&budget, &arm, &emitted_q).unwrap();
+        assert!(
+            emitted_a <= cap + STATIC_LOAD_EPS_A,
+            "emitted fallback refusal hold exceeded static cap: {emitted_a:.4} A > {cap:.4} A"
+        );
+
+        tokio::task::spawn_blocking(move || handle.stop_and_join())
+            .await
+            .unwrap();
+    }
+}
