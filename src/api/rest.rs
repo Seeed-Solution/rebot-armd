@@ -809,10 +809,17 @@ pub async fn episodes_import(
             .map_err(|e| import_invalid(e.reason, e.message))?;
         let mut sc = checked.sidecar;
         sc.id = crate::recording::new_ulid();
-        let _cap_slot = store.reserve_capacity_slot().map_err(ArmError::from)?;
+        let mut cap_slot = store.reserve_capacity_slot().map_err(ArmError::from)?;
         store.check_free_for_start().map_err(ArmError::from)?;
         let _dataset_pin = store.ensure_and_pin_dataset(&sc.dataset).map_err(ArmError::from)?;
-        if let Err(first_err) = store.publish_complete_episode(&sc, &frames, None, Some(import_token), false) {
+        if let Err(first_err) = store.publish_complete_episode_with_slot(
+            &sc,
+            &frames,
+            None,
+            Some(import_token),
+            false,
+            Some(&mut cap_slot),
+        ) {
             if store.path_of(&sc.id).is_ok_and(|p| p.is_file()) {
                 store
                     .publish_complete_episode(&sc, &frames, None, Some(import_token), false)

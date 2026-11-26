@@ -1392,7 +1392,10 @@ impl TerminalCaptureChannel {
         let consumed_seq = latest_snap.map_or(0, |s| s.meta.seq);
         let latest_obs = latest_snap.map(|s| &s.obs);
         while let Ok(head) = rx.peek() {
-            if respect_publish_barrier && self.is_sequence_commit_inflight(head.action_id) {
+            // Keep the sequence repeat commit barrier active in EVERY drain (including shutdown
+            // drains where `respect_publish_barrier == false`) so a terminal never omits an
+            // RT-committed repeat episode.
+            if self.is_sequence_commit_inflight(head.action_id) {
                 break;
             }
             if enforce_barrier {

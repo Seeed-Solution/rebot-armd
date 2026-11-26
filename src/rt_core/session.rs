@@ -1119,7 +1119,7 @@ impl SupervisorInner {
         let Some(run) = self.macro_run.as_ref().filter(|m| m.id == id) else {
             return false;
         };
-        if run.deadline.is_some_and(|d| now > d) {
+        if run.deadline.is_some_and(|d| now >= d) {
             return false;
         }
         if self.estop_request_unapplied()
@@ -1306,5 +1306,52 @@ impl SupervisorInner {
 
     pub(crate) fn flush_published_session_terminals(&mut self) -> usize {
         self.sessions.flush_published_terminals()
+    }
+}
+
+#[cfg(test)]
+mod recorder_deadline_tests {
+    use super::*;
+    use crate::macro_action::MacroRun;
+    use crate::model::ArmConfig;
+    use crate::rt_core::recorder::{RecorderSample, RecorderStopError};
+    use crate::rt_core::stream;
+    use crate::supervisor::AdmissionStamp;
+
+    #[test]
+    fn exact_parent_deadline_instant_rejects_recorder_save_and_closes_slot() {
+        let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());
+        inner.lease_enabled = false;
+        let (tx, _rx) = stream::channel::<RecorderSample>(8);
+        inner.rt_recorder.attach_producer(tx);
+        let t0 = Instant::now();
+        let deadline = t0 + std::time::Duration::from_secs(5);
+        let id = inner.begin_action("sequence", None);
+        let stamp = AdmissionStamp {
+            connection_id: 0,
+            lease_gen: 0,
+            estop_epoch: inner.safety.epoch_id(),
+            stop_gen: inner.current_stop_gen(),
+            request_id: 1,
+        };
+        inner.macro_run = Some(MacroRun::new(id, inner.safety.epoch_id(), stamp).with_deadline(
+            Some(deadline),
+            "SEQUENCE_TIMEOUT",
+        ));
+
+        let ack = inner
+            .admit_rt_recorder_session(1, 100, id, t0)
+            .expect("admit strictly before parent deadline must succeed");
+        assert!(inner.rt_recorder.try_push_sample(1, 0.0, &[0.0; 7], &[0.0; 7]));
+
+        // Exact inclusive boundary `now == deadline` MUST reject save and close/revoke the slot.
+        let err = inner
+            .stop_rt_recorder_session(1, ack.session_id, true, "saved", id, deadline)
+            .expect_err("exact deadline instant must reject recorder save");
+        assert!(
+            matches!(err, RecorderStopError::ParentNotAlive { fence } if fence.revoked),
+            "expected revoked ParentNotAlive at exact deadline, got {err:?}"
+        );
+        assert!(!inner.sessions.is_slot_occupied(SessionSlot::Recorder));
     }
 }

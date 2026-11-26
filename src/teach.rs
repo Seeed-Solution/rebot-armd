@@ -542,6 +542,64 @@ async fn start_recording_executor(
         .map_err(|_| ArmError::Internal("executor recorder start task terminated unexpectedly".into()))?
 }
 
+/// Retries RT discard until RT confirms a frozen close fence for `(op_id, session_id)` or the
+/// executor exits, ensuring a failed start never orphans an occupied `SessionSlot::Recorder`.
+async fn reconcile_discard_rt_session(
+    ctx: &ExecutorRecorderCtx,
+    op_id: u64,
+    session_id: SessionId,
+    reason: &'static str,
+    rt_shared: &Arc<RtRecorderShared>,
+    assembly: &Arc<RecorderAssembly>,
+) {
+    loop {
+        if let Some(fence) = rt_shared.load_closed_fence_for(op_id, session_id) {
+            let asm = Arc::clone(assembly);
+            let _ = tokio::task::spawn_blocking(move || asm.collect_session(fence)).await;
+            return;
+        }
+        if ctx.handle.is_exited() {
+            return;
+        }
+        let sid = if session_id.0 != 0 {
+            session_id
+        } else {
+            SessionId(rt_shared.live_session.load(Ordering::Acquire))
+        };
+        if sid.0 == 0 && rt_shared.live_op_id.load(Ordering::Acquire) != op_id {
+            return;
+        }
+        match ctx
+            .handle
+            .stop_recorder_session(op_id, sid, false, reason, 0)
+            .await
+        {
+            Ok(Ok(fence)) => {
+                let asm = Arc::clone(assembly);
+                let _ = tokio::task::spawn_blocking(move || asm.collect_session(fence)).await;
+                return;
+            }
+            Ok(Err(RecorderStopError::NotActive | RecorderStopError::SessionMismatch)) => {
+                if let Some(fence) = rt_shared.load_closed_fence_for(op_id, sid) {
+                    let asm = Arc::clone(assembly);
+                    let _ = tokio::task::spawn_blocking(move || asm.collect_session(fence)).await;
+                    return;
+                }
+                if rt_shared.live_op_id.load(Ordering::Acquire) != op_id {
+                    return;
+                }
+            }
+            Ok(Err(_)) => return,
+            Err(OwnerError::QueueFull | OwnerError::TimedOut) => {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Err(OwnerError::Stopped | OwnerError::ShutdownNotConfirmed | OwnerError::Protocol) => {
+                return;
+            }
+        }
+    }
+}
+
 async fn run_start_recording_executor(
     ctx: ExecutorRecorderCtx,
     op_id: u64,
@@ -618,18 +676,14 @@ async fn run_start_recording_executor(
             });
         }
         Err(owner_err) => {
-            // Reconcile uncertain completion: if RT accepted `op_id` before reply failed, discard it.
+            // Reconcile uncertain completion: retain `pending_start` and `dataset_pin` until RT
+            // confirms a close fence for `op_id` or exits so the slot can never be orphaned.
             if rt_shared.live_op_id.load(Ordering::Acquire) == op_id {
                 let sid = SessionId(rt_shared.live_session.load(Ordering::Acquire));
-                if let Ok(Ok(fence)) = ctx
-                    .handle
-                    .stop_recorder_session(op_id, sid, false, "aborted", 0)
-                    .await
-                {
-                    let asm = Arc::clone(&assembly);
-                    let _ = tokio::task::spawn_blocking(move || asm.collect_session(fence)).await;
-                }
+                reconcile_discard_rt_session(&ctx, op_id, sid, "aborted", &rt_shared, &assembly)
+                    .await;
             }
+            drop(dataset_pin);
             clear_pending(&ctx.recorder);
             return Err(match owner_err {
                 OwnerError::Stopped => executor_unavailable(),
@@ -642,7 +696,8 @@ async fn run_start_recording_executor(
     };
 
     // Bind start-boundary `joint_zero` to the exact `start_calib_rev` active on RT at admission.
-    // Fail closed if published identity never matches `ack.start_calib_rev` within the bounded wait.
+    // Fail closed if published identity never matches `ack.start_calib_rev` within the bounded wait,
+    // retaining `pending_start` and `dataset_pin` until RT confirms close fence or exit.
     let start_svc = if svc.revisions.calibration == ack.start_calib_rev {
         svc
     } else if let Some(matched) = ctx
@@ -651,14 +706,16 @@ async fn run_start_recording_executor(
     {
         matched
     } else {
-        if let Ok(Ok(fence)) = ctx
-            .handle
-            .stop_recorder_session(op_id, ack.session_id, false, "calib_mismatch", 0)
-            .await
-        {
-            let asm = Arc::clone(&assembly);
-            let _ = tokio::task::spawn_blocking(move || asm.collect_session(fence)).await;
-        }
+        reconcile_discard_rt_session(
+            &ctx,
+            op_id,
+            ack.session_id,
+            "calib_mismatch",
+            &rt_shared,
+            &assembly,
+        )
+        .await;
+        drop(dataset_pin);
         clear_pending(&ctx.recorder);
         return Err(rejected(
             409,
@@ -1034,17 +1091,26 @@ async fn run_stop_recording_executor(
 
     let sc = sidecar.clone();
     let store = ctx.store.clone();
-    // Manual saves already hold a `CapacitySlotGuard` acquired before RT stop; monitor saves bypass cap.
+    // Manual saves already hold a `CapacitySlotGuard` acquired before RT stop (consumed atomically
+    // into `in_progress_tokens` inside Phase 1 so 1 episode occupies strictly 1 slot).
     let enforce_capacity = !monitor && capacity_slot.is_none();
     let commit_token = Some(rec.op_id);
+    let mut cap_slot = capacity_slot;
     let write_res = tokio::task::spawn_blocking(move || {
-        match store.publish_complete_episode(&sc, &frames, writer, commit_token, enforce_capacity) {
+        match store.publish_complete_episode_with_slot(
+            &sc,
+            &frames,
+            writer,
+            commit_token,
+            enforce_capacity,
+            cap_slot.as_mut(),
+        ) {
             Ok(p) => Ok(p),
             Err(first_err) => {
                 // If parquet rename already succeeded and sidecar/dir-sync failed transiently,
                 // retry once with the same `commit_token` to complete post-rename recovery.
                 if store.path_of(&sc.id).is_ok_and(|p| p.is_file()) {
-                    store.publish_complete_episode(&sc, &frames, None, commit_token, enforce_capacity)
+                    store.publish_complete_episode(&sc, &frames, None, commit_token, false)
                 } else {
                     Err(first_err)
                 }
@@ -1075,7 +1141,6 @@ async fn run_stop_recording_executor(
         }
     }
     drop(rec.dataset_pin);
-    drop(capacity_slot);
 
     let path = write_res?;
     if require_alive_action_id != 0 {
@@ -1971,10 +2036,29 @@ async fn stop_recording(
         has_gripper_motion: Some(has_gripper_motion),
         frames_dropped: (dropped > 0).then_some(dropped),
     };
+    static NEXT_LEGACY_COMMIT_TOKEN: AtomicU64 = AtomicU64::new(1 << 61);
     let sc = sidecar.clone();
     let enforce_capacity = !monitor && _capacity_slot.is_none();
+    let legacy_token = Some(NEXT_LEGACY_COMMIT_TOKEN.fetch_add(1, Ordering::Relaxed));
+    let mut cap_slot = _capacity_slot;
     let (frames, result) = tokio::task::spawn_blocking(move || {
-        let result = st.publish_complete_episode(&sc, &frames, writer, None, enforce_capacity);
+        let result = match st.publish_complete_episode_with_slot(
+            &sc,
+            &frames,
+            writer,
+            legacy_token,
+            enforce_capacity,
+            cap_slot.as_mut(),
+        ) {
+            Ok(p) => Ok(p),
+            Err(first_err) => {
+                if st.path_of(&sc.id).is_ok_and(|p| p.is_file()) {
+                    st.publish_complete_episode(&sc, &frames, None, legacy_token, false)
+                } else {
+                    Err(first_err)
+                }
+            }
+        };
         (frames, result)
     })
     .await
@@ -1998,7 +2082,6 @@ async fn stop_recording(
         .await
         .recorder
         .finish_save(frames, parquet_result);
-    drop(_capacity_slot);
     // Preserve typed `StoreError` (e.g. `507 EPISODES_FULL`) instead of wrapping it into `RECORDING_ERROR`.
     let path = result?;
     finish_res?;
@@ -2267,13 +2350,14 @@ pub async fn lease_free(
             }
             if force {
                 let ids = st.episodes_of(&name);
-                if !st.has_dataset(&name) && ids.is_empty() {
+                if !st.has_dataset(&name) && ids.is_empty() && !st.has_pending_delete_files(&name) {
                     return Err(StoreError::DatasetNotFound(name).into());
                 }
-                let (taken, _del_guard) = sup.take_dataset_episodes_for_delete(&name).await?;
+                let (taken, del_guard) = sup.take_dataset_episodes_for_delete(&name).await?;
                 let s2 = st.clone();
-                let deleted = blocking(move || s2.delete_dataset_taken_files(&name, &taken)).await?;
-                drop(_del_guard);
+                let deleted =
+                    blocking(move || s2.delete_dataset_taken_files(&name, &taken, del_guard))
+                        .await?;
                 Ok(json!({"deleted_episodes": deleted}))
             } else {
                 let s2 = st.clone();

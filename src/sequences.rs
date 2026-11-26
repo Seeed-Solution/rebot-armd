@@ -1252,7 +1252,7 @@ async fn begin_executor_inner(
     use crate::rt_core::requests::actions::{ActionStamp, DEFAULT_ACTION_DEADLINE};
     if let Some((dataset, _)) = &plan.request.record {
         sup.ensure_episodes_loaded().await?;
-        let st = sup.episode_store().await;
+        let st = sup.try_episode_store().await?;
         if !st.enabled() {
             return Err(crate::recording::StoreError::Disabled.into());
         }

@@ -919,22 +919,100 @@ async fn executor_idempotent_publish_delayed_writer_config_interleaving_and_auth
         .publish_complete_episode(&sc_rec, &frames, None, Some(88), true)
         .unwrap_err();
     assert_eq!(wrong_tok.status_code(), (409, "EPISODE_EXISTS"));
+    // Same token with altered sidecar metadata must fail closed (Major 5).
+    let mut sc_rec_altered = sc_rec.clone();
+    sc_rec_altered.task = "tampered_task".into();
+    let mismatch_meta = store
+        .publish_complete_episode(&sc_rec_altered, &frames, None, Some(77), true)
+        .unwrap_err();
+    assert_eq!(mismatch_meta.status_code(), (409, "EPISODE_EXISTS"));
+    // In-progress publication claim blocks raw deletion and replay adoption (Blocker 2).
+    assert_eq!(
+        store.delete_files(&sc_rec.id).unwrap_err().status_code(),
+        (404, "EPISODE_NOT_FOUND")
+    );
+    assert_eq!(
+        store
+            .get_or_adopt(&sc_rec.id, &[0.0; 7], &sc_rec.joint_names, sc_rec.profile_id.as_deref(), 50.0)
+            .unwrap_err()
+            .status_code(),
+        (404, "EPISODE_NOT_FOUND")
+    );
     let recovered_path = store
         .publish_complete_episode(&sc_rec, &frames, None, Some(77), true)
-        .expect("retry with same commit_token must complete post-rename recovery");
+        .expect("retry with same (commit_token, sidecar) must complete post-rename recovery");
     assert!(recovered_path.is_file());
     assert!(store.get(&sc_rec.id).is_some(), "recovered episode must be cataloged");
 
-    // Capacity slot reservation prevents two concurrent writers at cap-1 from both passing (Major 6).
+    // Capacity slot reservation consumes atomically into in_progress_tokens without double-counting (Major 4/6).
     let (_, cur_files) = store.usage().unwrap();
-    let slot_guard = store
-        .reserve_capacity_slot_with(u64::MAX, cur_files + 1)
-        .expect("first slot at cap-1 must reserve");
-    let cap_race = store
-        .reserve_capacity_slot_with(u64::MAX, cur_files + 1)
+    let max_two_more = cur_files + 2;
+    let mut slot1 = store
+        .reserve_capacity_slot_with(u64::MAX, max_two_more)
+        .expect("slot 1 at cap-2 must reserve");
+    let (pub_entered_rx, pub_release_tx) = store.arm_test_publish_pause();
+    let store_p = store.clone();
+    let mut sc_cap = sc.clone();
+    sc_cap.id = "idem_ep_cap_slot".into();
+    let frames_p = frames.clone();
+    let pub_handle = tokio::task::spawn_blocking(move || {
+        store_p.publish_complete_episode_with_slot(
+            &sc_cap,
+            &frames_p,
+            None,
+            Some(91),
+            false,
+            Some(&mut slot1),
+        )
+    });
+    let _ = tokio::task::spawn_blocking(move || pub_entered_rx.recv_timeout(Duration::from_secs(5)).unwrap())
+        .await
+        .unwrap();
+    // While episode 1 is mid-publication, exactly 1 slot remains: slot 2 MUST succeed, slot 3 MUST fail 507!
+    let slot2 = store
+        .reserve_capacity_slot_with(u64::MAX, max_two_more)
+        .expect("slot 2 must succeed (slot 1 must not double-count)");
+    let slot3_err = store
+        .reserve_capacity_slot_with(u64::MAX, max_two_more)
         .unwrap_err();
-    assert_eq!(cap_race.status_code(), (507, "EPISODES_FULL"));
-    drop(slot_guard);
+    assert_eq!(slot3_err.status_code(), (507, "EPISODES_FULL"));
+    let _ = pub_release_tx.send(());
+    pub_handle.await.unwrap().unwrap();
+    drop(slot2);
+
+    // Force-delete membership revalidation, single-owner guard, and episode move guard (Blocker 3 + Major 3).
+    store.create_dataset("del_guard_ds", "").unwrap();
+    store.create_dataset("del_other_ds", "").unwrap();
+    let mut sc_dg = sc.clone();
+    sc_dg.id = "dg_ep_1".into();
+    sc_dg.dataset = "del_guard_ds".into();
+    store.publish_complete_episode(&sc_dg, &frames, None, Some(102), true).unwrap();
+    let seq_rev = std::sync::atomic::AtomicU64::new(0);
+    // Stale membership list (missing `dg_ep_1`) must trigger SequenceRevisionChanged retry instead of deleting!
+    assert!(matches!(
+        store.take_dataset_if_unpinned_and_rev_matches("del_guard_ds", &[], &seq_rev, 0),
+        armd::recording::store::TakeDatasetOutcome::SequenceRevisionChanged
+    ));
+    let (taken_dg, dg_guard) = match store.take_dataset_if_unpinned_and_rev_matches(
+        "del_guard_ds",
+        &["dg_ep_1".to_string()],
+        &seq_rev,
+        0,
+    ) {
+        armd::recording::store::TakeDatasetOutcome::Removed(ids, g) => (ids, g),
+        other => panic!("expected Removed, got {other:?}"),
+    };
+    // Concurrent second force-delete and episode move into deleting dataset both fail RECORDER_BUSY!
+    assert!(matches!(
+        store.take_dataset_if_unpinned_and_rev_matches("del_guard_ds", &[], &seq_rev, 0),
+        armd::recording::store::TakeDatasetOutcome::DatasetRecordingBusy
+    ));
+    assert_eq!(
+        store.update(&sc_rec.id, None, Some("del_guard_ds")).unwrap_err().status_code(),
+        (409, "RECORDER_BUSY")
+    );
+    store.delete_dataset_taken_files("del_guard_ds", &taken_dg, dg_guard).unwrap();
+    assert!(!store.has_dataset("del_guard_ds"));
 
     // (c) Delayed parquet writer on executor: RT keeps ticking with 0 allocs/locks, dataset stays
     //     pinned during Finalizing, RECORDER_BUSY blocks concurrent start, AND force-delete does
