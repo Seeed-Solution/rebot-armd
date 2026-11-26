@@ -2226,3 +2226,95 @@ fn safe_hold_keeps_holding_unconfirmed_while_axis_unheld_without_verified_mode()
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// 7. Review round 6 regressions
+// ---------------------------------------------------------------------------
+
+/// Round 6 B1: an ordinary STOP applied by the owner mid-switch (production `urgent_stop`, no
+/// E-stop, no fault) is applied-stop proof through the production callback: J1 already switched
+/// forward and awaits post-confirm feedback, so the session recovers (`StoppedRecovered`) and
+/// does not escalate to SAFE-HOLD.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ordinary_applied_stop_mid_switch_is_stopped_recovered_via_production_proof() {
+    let mut cfg = ArmConfig::rebot_dm();
+    cfg.control_frequency_hz = 50;
+    let bus = configure_damiao_bus(None, Duration::ZERO, true, TIMEOUT_2000_COUNTS);
+    let mut drv = build_damiao_driver(bus.clone(), &cfg, 16);
+    bus.with(|s| {
+        s.immediate_replies = true;
+        s.push_all_feedback();
+    });
+    let _ = drv.check_mapping_ranges();
+    let _ = drv.read_joint_states();
+    let sup = ArmSupervisor::new(cfg).with_driver(Box::new(drv));
+    sup.set_lease_enabled(true).await;
+    let lease_gen = sup.acquire_lease("client-1").await.unwrap();
+    sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
+    bus.with(|s| {
+        s.immediate_replies = false;
+        s.push_all_feedback();
+    });
+    let _ = sup.tick(0.02).await;
+    // J1 accepts the mode write, then sends no post-confirm feedback: it stays switched forward.
+    bus.with(|s| s.motors[0].mute_feedback_after_mode_ack = true);
+    let mut plan =
+        ModeSwitchPlan::switch_axes(&[(0, ControlMode::Impedance)], ModeSwitchRecovery::FailClosed)
+            .unwrap();
+    plan.per_axis_timeout = Duration::from_secs(2);
+    let sid = sup
+        .start_mode_switch_session(ModeSwitchStartRequest {
+            plan,
+            admission: sup.capture_admission_stamp(),
+            operator_required: false,
+            operator_grant: OperatorGrant::unenforced(),
+            deadline: Instant::now() + Duration::from_secs(4),
+            client: ClientId(31),
+        })
+        .await
+        .unwrap();
+    let mut acked_ticks = 0;
+    for _ in 0..30 {
+        bus.with(|s| s.push_all_feedback());
+        let _ = sup.tick(0.02).await;
+        let snap = sup.poll_mode_switch_session(sid).await.unwrap().unwrap();
+        assert!(snap.running, "switch ended early: {:?}", snap.progress);
+        if bus.with(|s| s.motors[0].ctrl_mode()) == damiao::CTRL_MODE_MIT {
+            acked_ticks += 1;
+            if acked_ticks >= 3 {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(acked_ticks >= 3, "J1 must have switched forward");
+    // Ordinary authorized STOP (`/api/v1/motion/stop` semantics): no E-stop, no fault.
+    let out = sup
+        .urgent_stop(armd::rt_core::urgent::UrgentStop {
+            connection: armd::model::HolderLabel::new("client-1"),
+            lease_generation: lease_gen,
+            epoch: Some(sup.estop_epoch()),
+            request_id: 1,
+            request_id_valid: true,
+            body_error: None,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(out, armd::rt_core::urgent::UrgentStopOutcome::Applied { .. }), "{out:?}");
+    let mut done = None;
+    for _ in 0..10 {
+        bus.with(|s| s.push_all_feedback());
+        let _ = sup.tick(0.02).await;
+        if let Some(s) = sup.poll_mode_switch_session(sid).await.unwrap() {
+            if !s.running {
+                done = Some(s.progress);
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        done,
+        Some(ModeProgress::StoppedRecovered { reason: ModeSwitchFailure::Stopped }),
+        "an ordinary applied STOP must not end the switch Ambiguous (spurious SAFE-HOLD)"
+    );
+}

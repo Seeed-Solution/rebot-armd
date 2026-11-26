@@ -12589,11 +12589,26 @@ impl SupervisorInner {
         self.mode_switch.find_terminal(session_id)
     }
 
-    /// Owner proof that a stop has been APPLIED (safety state stopped), as opposed to an urgent
-    /// stop that is only pending. Shared by in-step gate revocation and external revocation.
+    /// Owner proof that a stop has been APPLIED, as opposed to an urgent stop that is only
+    /// pending. Shared by in-step gate revocation and external revocation. True when the safety
+    /// state is stopped (E-stop, fault), or when an ordinary STOP advanced the stop generation
+    /// past the active `ModeSwitch` session's admission generation and no requested stop is
+    /// still unapplied by the owner.
     #[inline]
     pub(crate) fn mode_switch_stop_applied(&self) -> bool {
-        self.safety.state().is_stopped()
+        use crate::rt_core::session::{SessionKind, SessionSlot};
+        if self.safety.state().is_stopped() {
+            return true;
+        }
+        let Some(admitted_gen) = self
+            .sessions
+            .slot(SessionSlot::ExclusiveOutput)
+            .filter(|s| s.kind == SessionKind::ModeSwitch)
+            .map(|s| s.authority.stop_generation)
+        else {
+            return false;
+        };
+        !self.urgent_stop_unapplied() && self.current_stop_gen() > admitted_gen
     }
 
     /// Reconciles active `ModeSwitch` state and driver `mode_write_uncertain_mask` /
