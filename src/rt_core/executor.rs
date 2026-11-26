@@ -10251,7 +10251,6 @@ fn control_thread_main_inner(
                 session_uncertain_safe_hold = true;
                 estop_state.request_and_latch();
                 internal_fault_lane.latch_control_safe_hold_fence();
-                tracing::error!("RT session reported uncertain hardware state; transitioning to SAFE-HOLD");
                 break;
             }
         }

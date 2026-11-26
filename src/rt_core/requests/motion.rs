@@ -998,7 +998,6 @@ pub fn install_watchdog_park(
     if !inner.is_torqued || inner.pending_rearm || inner.disable_pending || inner.torque_transition.is_some()
         || inner.mit_active() || inner.handover_settling_since.is_some() || inner.collision.hold.is_some()
         || inner.core.motion_inhibited_by_config() || inner.calibration_busy
-        || inner.sessions.blocks_ordinary_output(None)
     {
         return Err(MotionInstallError::MotionBusy);
     }
@@ -1006,6 +1005,14 @@ pub fn install_watchdog_park(
         return Err(MotionInstallError::UnsupportedUnload);
     }
     let _ = verify_motion_freshness(inner, slot)?;
+    #[cfg(not(target_arch = "wasm32"))]
+    if inner.sessions.blocks_ordinary_output(None) {
+        // Safety watchdog park preempts any ordinary non-safety session cleanly.
+        inner.revoke_sessions_on_stop("LEASE_LOST");
+        if inner.sessions.is_safe_hold_requested() {
+            return Err(MotionInstallError::EStopActive);
+        }
+    }
     inner.watchdog_park_pending = None;
     let installed = install_park_trajectory(inner, ParkActionMode::Watchdog, slot, heap_traj)?;
     let budget = inner.watchdog_park_timeout();

@@ -3311,7 +3311,7 @@ impl crate::supervisor::SupervisorInner {
         prepared.operator_required = self.operator_auth_enforced;
         prepared.operator_grant = Some(req.authority.operator_grant);
         prepared.revoke_on_stop = true;
-        prepared.escalate_safe_hold_on_uncertain = false;
+        prepared.escalate_safe_hold_on_uncertain = true;
         let session_auth = SessionAuthority {
             connection_id: req.authority.conn_id,
             lease_generation: req.authority.lease_holder.map_or(0, |(_, gen)| gen),
@@ -3884,6 +3884,13 @@ impl crate::supervisor::SupervisorInner {
         let Some(sid) = self.commissioning.session_id else {
             return;
         };
+        if self
+            .sessions
+            .slot(SessionSlot::ExclusiveOutput)
+            .is_some_and(|s| s.id == sid && !s.is_live())
+        {
+            return;
+        }
         let reason = match self.commissioning.state {
             CommissioningOpState::Done => SessionTerminalReason::Completed,
             CommissioningOpState::Cancelled => {
@@ -3912,9 +3919,12 @@ impl crate::supervisor::SupervisorInner {
         let uncertain = self.commissioning.has_uncertain_outcome()
             || (self.commissioning.state != CommissioningOpState::Done
                 && (self.commissioning.hw_mutated || self.commissioning.disk_mutated));
-        let _ = self
+        if let Some(outcome) = self
             .sessions
-            .finish_slot(SessionSlot::ExclusiveOutput, sid, reason, uncertain);
+            .finish_slot(SessionSlot::ExclusiveOutput, sid, reason, uncertain)
+        {
+            self.maybe_escalate_session_safe_hold(outcome, true);
+        }
     }
 
     /// Drives one joint's 8-register identity read (`COMM_IDENTITY_RIDS`), sending ONE register

@@ -213,6 +213,10 @@ async fn cancellation_in_every_session_and_cf1_phase() {
         )
         .unwrap();
     let SessionStep::AwaitWorker(ticket) = step else { panic!("expected AwaitWorker") };
+    assert_eq!(
+        inner.check_session_pre_tx(SessionSlot::ExclusiveOutput, sid2, now, now + Duration::from_millis(20)),
+        Err("MOTION_BUSY")
+    );
     assert!(inner
         .sessions_mut()
         .cancel_slot(SessionSlot::ExclusiveOutput, sid2, SessionTerminalReason::Cancelled("STOPPED"), false)
@@ -375,10 +379,22 @@ fn stale_worker_replies_deadline_expiry_and_tx_cutoff_exemption() {
     let rec_id = admit_session(adm_rec, PreparedSession::recorder(ClientId(22)), now).unwrap();
     assert_ne!(sid, rec_id);
 
-    // Pre-TX gate passes while live, rejects once child deadline elapses.
-    assert_eq!(inner.check_session_pre_tx(SessionSlot::ExclusiveOutput, sid, now + Duration::from_millis(10)), Ok(()));
+    // Pre-TX gate passes while Running within cutoff, rejects Recorder, expired cutoff, AwaitWorker, and cancelled!
+    let base_cutoff = now + Duration::from_millis(50);
     assert_eq!(
-        inner.check_session_pre_tx(SessionSlot::ExclusiveOutput, sid, now + Duration::from_millis(35)),
+        inner.check_session_pre_tx(SessionSlot::ExclusiveOutput, sid, now + Duration::from_millis(10), base_cutoff),
+        Ok(now + Duration::from_millis(30))
+    );
+    assert_eq!(
+        inner.check_session_pre_tx(SessionSlot::Recorder, rec_id, now + Duration::from_millis(10), base_cutoff),
+        Err("INVALID_COMMAND")
+    );
+    assert_eq!(
+        inner.check_session_pre_tx(SessionSlot::ExclusiveOutput, sid, now + Duration::from_millis(10), now + Duration::from_millis(5)),
+        Err("DEADLINE_EXPIRED")
+    );
+    assert_eq!(
+        inner.check_session_pre_tx(SessionSlot::ExclusiveOutput, sid, now + Duration::from_millis(35), base_cutoff),
         Err("CHILD_TIMEOUT")
     );
 
@@ -397,6 +413,11 @@ fn stale_worker_replies_deadline_expiry_and_tx_cutoff_exemption() {
         )
         .unwrap();
     let SessionStep::AwaitWorker(ticket) = step else { panic!("expected AwaitWorker") };
+    // Pre-TX gate rejects AwaitingWorker state.
+    assert_eq!(
+        inner.check_session_pre_tx(SessionSlot::ExclusiveOutput, sid, now + Duration::from_millis(10), base_cutoff),
+        Err("MOTION_BUSY")
+    );
 
     let mk = |t: WorkerTicket| WorkerReply { slot: SessionSlot::ExclusiveOutput, ticket: t, ok: true, code: "", value: 7 };
     assert_eq!(inner.sessions_mut().deliver_worker_reply(mk(WorkerTicket { session: SessionId(999), ..ticket }), now, Ok(())), Err(WorkerReplyError::Stale));
@@ -406,10 +427,30 @@ fn stale_worker_replies_deadline_expiry_and_tx_cutoff_exemption() {
     assert_eq!(inner.sessions_mut().deliver_worker_reply(mk(ticket), now + Duration::from_millis(35), Ok(())), Err(WorkerReplyError::Stale));
     assert_eq!(inner.sessions().slot(SessionSlot::ExclusiveOutput).unwrap().state, SessionState::AwaitingWorker(ticket));
 
-    // One-shot acceptance + duplicate rejection.
+    // One-shot acceptance + duplicate rejection + single consumption in step_slot.
     assert_eq!(inner.sessions_mut().deliver_worker_reply(mk(ticket), now + Duration::from_millis(10), Ok(())), Ok(mk(ticket)));
     assert_eq!(inner.sessions_mut().deliver_worker_reply(mk(ticket), now + Duration::from_millis(11), Ok(())), Err(WorkerReplyError::Stale));
     assert_eq!(inner.sessions().stats().stale_worker_replies_rejected, 6);
+    let mut seen_replies = 0usize;
+    let _ = inner.sessions_mut().step_slot(
+        SessionSlot::ExclusiveOutput,
+        &make_release_ctx(now + Duration::from_millis(12), epoch, stop_gen),
+        |_| false,
+        |_, _, _| true,
+        |_| true,
+        |_, _| false,
+        |_, _, r| { if r.is_some() { seen_replies += 1; } PhaseStepOutcome::Pending },
+    );
+    let _ = inner.sessions_mut().step_slot(
+        SessionSlot::ExclusiveOutput,
+        &make_release_ctx(now + Duration::from_millis(13), epoch, stop_gen),
+        |_| false,
+        |_, _, _| true,
+        |_| true,
+        |_, _| false,
+        |_, _, r| { if r.is_some() { seen_replies += 1; } PhaseStepOutcome::Pending },
+    );
+    assert_eq!(seen_replies, 1, "accepted worker reply must be consumed once");
 
     // Zero-alloc & zero-free proof across RT terminal retention & slot reuse gating.
     let (tx, mut rx) = stream::channel::<SessionTerminalRecord>(1);
@@ -459,17 +500,29 @@ fn stale_worker_replies_deadline_expiry_and_tx_cutoff_exemption() {
     assert_eq!(inner.sessions_mut().flush_published_terminals(), 1);
     assert!(inner.sessions_mut().clear_terminal_slot(SessionSlot::ExclusiveOutput, id2));
     assert_eq!(rx.try_pop().unwrap().payload.request, RequestId(SESSION_REQUEST_ID_BIT | 2));
+    // Verify pre-TX gate rejects explicitly cancelled session even while lease/epoch/stop are live.
+    let mut p_cancel = PreparedSession::exclusive(SessionKind::Custom(23), ClientId(22));
+    p_cancel.deadline = Some(now + Duration::from_millis(200));
+    let a_cancel = inner.check_admission(make_admit_stamp(22, lease_gen, epoch, stop_gen, 7)).unwrap();
+    let id_cancel = admit_session(a_cancel, p_cancel, now).unwrap();
+    assert!(inner.sessions_mut().cancel_slot(SessionSlot::ExclusiveOutput, id_cancel, SessionTerminalReason::Cancelled("STOPPED"), false).is_some());
+    assert_eq!(
+        inner.check_session_pre_tx(SessionSlot::ExclusiveOutput, id_cancel, now, now + Duration::from_millis(20)),
+        Err("CANCELLED")
+    );
+    assert!(inner.sessions_mut().clear_terminal_slot(SessionSlot::ExclusiveOutput, id_cancel));
+
     // Verify E-stop immediately revokes pre-TX gate and marks safety stopped (which keeps
     // safety/stopped holds exempt from session deadlines in `install_effective_tx_cutoff`).
     let mut p_stop = PreparedSession::exclusive(SessionKind::Custom(22), ClientId(22));
     p_stop.deadline = Some(now + Duration::from_millis(200));
     let a_stop = inner.check_admission(make_admit_stamp(22, lease_gen, epoch, stop_gen, 6)).unwrap();
     let id_stop = admit_session(a_stop, p_stop, now).unwrap();
-    assert_eq!(inner.check_session_pre_tx(SessionSlot::ExclusiveOutput, id_stop, now), Ok(()));
+    assert!(inner.check_session_pre_tx(SessionSlot::ExclusiveOutput, id_stop, now, now + Duration::from_millis(20)).is_ok());
     let _ = inner.safety.trigger_e_stop();
     assert!(inner.safety.state().is_stopped());
     assert_eq!(
-        inner.check_session_pre_tx(SessionSlot::ExclusiveOutput, id_stop, now),
+        inner.check_session_pre_tx(SessionSlot::ExclusiveOutput, id_stop, now, now + Duration::from_millis(20)),
         Err("EPOCH_MISMATCH")
     );
 }
@@ -499,7 +552,7 @@ async fn pf1_router_terminal_credit_saturation_rollback_and_duplicate_suppressio
     let t1 = exec
         .reserve_session_terminal_direct(c1, ActionId(1), ExternalDestinationPolicy::ConnectionOnly)
         .unwrap();
-    assert_ne!(t1.request.0 & SESSION_REQUEST_ID_BIT, 0);
+    assert_ne!(t1.request().0 & SESSION_REQUEST_ID_BIT, 0);
     let t2 = exec
         .reserve_session_terminal_direct(c1, ActionId(2), ExternalDestinationPolicy::ConnectionOnly)
         .unwrap();

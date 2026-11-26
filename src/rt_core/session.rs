@@ -105,6 +105,7 @@ pub struct PreparedSession {
     pub child_timeout_code: &'static str,
     pub action_id: Option<ActionId>,
     pub request_id: Option<RequestId>,
+    pub route_gen: u64,
     pub client: ClientId,
     pub operator_required: bool,
     pub operator_grant: Option<crate::auth::OperatorGrant>,
@@ -123,6 +124,7 @@ impl PreparedSession {
             child_timeout_code: "TIMEOUT",
             action_id: None,
             request_id: None,
+            route_gen: 0,
             client,
             operator_required: false,
             operator_grant: None,
@@ -141,12 +143,22 @@ impl PreparedSession {
             child_timeout_code: "TIMEOUT",
             action_id: None,
             request_id: None,
+            route_gen: 0,
             client,
             operator_required: false,
             operator_grant: None,
             revoke_on_stop: false,
             escalate_safe_hold_on_uncertain: false,
         }
+    }
+
+    /// Binds a P-F1 [`super::reply_router::SessionTerminalTicket`] (request, client, action_id,
+    /// route_gen) into this prepared session so RT terminal handoff carries exact identity.
+    pub fn bind_terminal_ticket(&mut self, ticket: &super::reply_router::SessionTerminalTicket) {
+        self.request_id = Some(ticket.request());
+        self.client = ticket.client();
+        self.action_id = Some(ticket.action_id());
+        self.route_gen = ticket.route_gen();
     }
 }
 
@@ -260,6 +272,7 @@ pub struct SessionTerminalRecord {
     pub session: SessionId,
     pub slot: SessionSlot,
     pub request: RequestId,
+    pub route_gen: u64,
     pub client: ClientId,
     pub action_id: ActionId,
     pub outcome: SessionOutcome,
@@ -284,6 +297,7 @@ pub struct ActiveSession {
     pub child_timeout_code: &'static str,
     pub action_id: Option<ActionId>,
     pub request_id: Option<RequestId>,
+    pub route_gen: u64,
     pub client: ClientId,
     pub escalate_safe_hold_on_uncertain: bool,
     pub hw_state_uncertain: bool,
@@ -467,6 +481,7 @@ impl SessionDriver {
             child_timeout_code: prepared.child_timeout_code,
             action_id: prepared.action_id,
             request_id: prepared.request_id,
+            route_gen: prepared.route_gen,
             client: prepared.client,
             escalate_safe_hold_on_uncertain: prepared.escalate_safe_hold_on_uncertain,
             hw_state_uncertain: false,
@@ -514,6 +529,9 @@ impl SessionDriver {
         let Some(active) = self.slot(slot).filter(|a| a.id == id) else {
             return Err(SessionTerminalReason::Cancelled("CANCELLED"));
         };
+        if !active.is_live() {
+            return Err(SessionTerminalReason::Cancelled("CANCELLED"));
+        }
         if ctx.safe_hold_active { return Err(SessionTerminalReason::Revoked("SAFE_HOLD")); }
         if ctx.internal_fault_fenced { return Err(SessionTerminalReason::Revoked("INTERNAL_FAULT")); }
         let auth = active.authority;
@@ -562,6 +580,7 @@ impl SessionDriver {
                 session: id,
                 slot,
                 request,
+                route_gen: active.route_gen,
                 client: active.client,
                 action_id,
                 outcome,
@@ -581,9 +600,9 @@ impl SessionDriver {
         phase_fn: impl FnOnce(SessionId, Instant, Option<WorkerReply>) -> PhaseStepOutcome,
     ) -> Option<SessionStep> {
         let idx = slot.index();
-        let (id, state, last_reply) = {
+        let (id, state) = {
             let active = self.slots[idx].as_ref()?;
-            (active.id, active.state, active.last_worker_reply)
+            (active.id, active.state)
         };
         if let SessionState::Terminal(outcome) = state {
             self.duplicate_terminals_suppressed = self.duplicate_terminals_suppressed.saturating_add(1);
@@ -598,7 +617,10 @@ impl SessionDriver {
             return Some(SessionStep::AwaitWorker(ticket));
         }
         let effective_cutoff = self.effective_tx_cutoff(slot, ctx.base_tx_cutoff);
-        match phase_fn(id, effective_cutoff, last_reply) {
+        let consumed_reply = self.slots[idx]
+            .as_mut()
+            .and_then(|a| a.last_worker_reply.take());
+        match phase_fn(id, effective_cutoff, consumed_reply) {
             PhaseStepOutcome::Pending => Some(SessionStep::Pending),
             PhaseStepOutcome::AwaitWorker => {
                 let active = self.slots[idx].as_mut().expect("active above");
@@ -665,11 +687,12 @@ impl SessionDriver {
     ) -> [Option<SessionOutcome>; 2] {
         let mut out = [None, None];
         for slot in [SessionSlot::ExclusiveOutput, SessionSlot::Recorder] {
-            let id = self.slot(slot).and_then(|s| {
-                (s.is_live() && (!is_ordinary_stop || s.authority.revoke_on_stop)).then_some(s.id)
+            let live = self.slot(slot).and_then(|s| {
+                (s.is_live() && (!is_ordinary_stop || s.authority.revoke_on_stop))
+                    .then_some((s.id, s.hw_state_uncertain))
             });
-            if let Some(id) = id {
-                out[slot.index()] = self.finish_slot(slot, id, reason, false);
+            if let Some((id, uncertain)) = live {
+                out[slot.index()] = self.finish_slot(slot, id, reason, uncertain);
             }
         }
         out
@@ -683,11 +706,12 @@ impl SessionDriver {
         let mut out = [None, None];
         if connection_id == 0 { return out; }
         for slot in [SessionSlot::ExclusiveOutput, SessionSlot::Recorder] {
-            let id = self.slot(slot).and_then(|s| {
-                (s.is_live() && s.authority.connection_id == connection_id).then_some(s.id)
+            let live = self.slot(slot).and_then(|s| {
+                (s.is_live() && s.authority.connection_id == connection_id)
+                    .then_some((s.id, s.hw_state_uncertain))
             });
-            if let Some(id) = id {
-                out[slot.index()] = self.finish_slot(slot, id, reason, false);
+            if let Some((id, uncertain)) = live {
+                out[slot.index()] = self.finish_slot(slot, id, reason, uncertain);
             }
         }
         out
@@ -767,7 +791,12 @@ impl SupervisorInner {
         if authority.operator_required && !self.is_session_operator_valid_at(authority.operator_grant, now) {
             return Err(SessionAdmitError::AuthorityRejected("OPERATOR_REQUIRED"));
         }
-        self.sessions.admit_with_authority(prepared, authority, now, true)
+        let id = self.sessions.admit_with_authority(prepared, authority, now, true)?;
+        if prepared.slot == SessionSlot::ExclusiveOutput && prepared.kind != SessionKind::MacroBacked {
+            self.release_servo_target();
+            self.servo_stream_active = false;
+        }
+        Ok(id)
     }
 
     #[inline]
@@ -799,7 +828,13 @@ impl SupervisorInner {
                 || self.quintic_settle.is_some()
                 || self.park_release.is_some()
                 || self.watchdog_park.is_some()
-                || self.macro_run.as_ref().is_some_and(|m| !m.stop_requested && !m.finishing)
+                || self.servo_target.is_some()
+                || self.servo_stream_active
+                || self.gravity_comp.is_some()
+                || self.mit_active()
+                || self.mit.park_after_hand_back
+                || self.mit.revoke_pending
+                || self.macro_run.is_some()
             {
                 return Some("MOTION_BUSY");
             }
@@ -835,13 +870,32 @@ impl SupervisorInner {
     }
 
     /// Live transmit-point gate for generic output sessions (equivalent to C-F1's per-TX gate).
-    pub fn check_session_pre_tx(&self, slot: SessionSlot, id: SessionId, now: Instant) -> Result<(), &'static str> {
+    /// Requires a `Running` `ExclusiveOutput` owner matching `id`, live authority, and a live
+    /// effective TX cutoff (`now < min(base_tx_cutoff, session_deadline, child_deadline)`).
+    pub fn check_session_pre_tx(
+        &self,
+        slot: SessionSlot,
+        id: SessionId,
+        now: Instant,
+        base_tx_cutoff: Instant,
+    ) -> Result<Instant, &'static str> {
+        if slot != SessionSlot::ExclusiveOutput {
+            return Err("INVALID_COMMAND");
+        }
+        let Some(active) = self.sessions.slot(slot).filter(|a| a.id == id) else {
+            return Err("CANCELLED");
+        };
+        match active.state {
+            SessionState::Running => {}
+            SessionState::AwaitingWorker(_) => return Err("MOTION_BUSY"),
+            SessionState::Terminal(_) => return Err("CANCELLED"),
+        }
         let ctx = ReleaseCtx {
             arm: self.core.id(),
             boot: BootId::process(),
             now,
-            release_deadline: now,
-            base_tx_cutoff: now,
+            release_deadline: base_tx_cutoff,
+            base_tx_cutoff,
             epoch: self.safety.epoch_id(),
             stop_generation: self.current_stop_gen(),
             estop_latched: self.estop_request_unapplied()
@@ -850,7 +904,7 @@ impl SupervisorInner {
             internal_fault_fenced: self.internal_fault_lane.is_fenced(),
             safe_hold_active: self.sessions.is_safe_hold_requested(),
         };
-        let grant = self.sessions.slot(slot).and_then(|s| s.authority.operator_grant);
+        let grant = active.authority.operator_grant;
         self.sessions
             .check_live_authority(
                 slot,
@@ -860,7 +914,12 @@ impl SupervisorInner {
                 |c, g, t| self.is_session_lease_valid_at(c, g, t),
                 |t| self.is_session_operator_valid_at(grant, t),
             )
-            .map_err(SessionTerminalReason::code)
+            .map_err(SessionTerminalReason::code)?;
+        let effective = self.sessions.effective_tx_cutoff(slot, base_tx_cutoff);
+        if now >= effective {
+            return Err("DEADLINE_EXPIRED");
+        }
+        Ok(effective)
     }
 
     pub(crate) fn maybe_escalate_session_safe_hold(&mut self, outcome: SessionOutcome, escalate: bool) {
@@ -952,8 +1011,30 @@ impl SupervisorInner {
 
     pub(crate) fn revoke_sessions_on_stop(&mut self, reason: &'static str) {
         self.cancel_active_commissioning_on_stop(reason);
+        let escalate = self
+            .sessions
+            .slot(SessionSlot::ExclusiveOutput)
+            .is_some_and(|s| s.escalate_safe_hold_on_uncertain);
         let is_ordinary_stop = reason == "STOPPED";
-        let _ = self.sessions.revoke_live_sessions(SessionTerminalReason::Revoked(reason), is_ordinary_stop);
+        let outcomes = self
+            .sessions
+            .revoke_live_sessions(SessionTerminalReason::Revoked(reason), is_ordinary_stop);
+        if let Some(outcome) = outcomes[SessionSlot::ExclusiveOutput.index()] {
+            self.maybe_escalate_session_safe_hold(outcome, escalate);
+        }
+    }
+
+    pub(crate) fn revoke_sessions_for_connection(&mut self, conn_id: u64, reason: &'static str) {
+        let escalate = self
+            .sessions
+            .slot(SessionSlot::ExclusiveOutput)
+            .is_some_and(|s| s.escalate_safe_hold_on_uncertain);
+        let outcomes = self
+            .sessions
+            .revoke_for_connection(conn_id, SessionTerminalReason::Revoked(reason));
+        if let Some(outcome) = outcomes[SessionSlot::ExclusiveOutput.index()] {
+            self.maybe_escalate_session_safe_hold(outcome, escalate);
+        }
     }
 
     pub(crate) fn flush_published_session_terminals(&mut self) -> usize {

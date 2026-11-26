@@ -390,10 +390,21 @@ pub const SESSION_REQUEST_ID_BIT: u64 = 1u64 << 63;
 /// Generation-tagged reservation ticket proving 1 P-F1 terminal credit was reserved for a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionTerminalTicket {
-    pub request: RequestId,
-    pub client: ClientId,
-    pub action_id: ActionId,
+    request: RequestId,
+    client: ClientId,
+    action_id: ActionId,
     route_gen: u64,
+}
+
+impl SessionTerminalTicket {
+    #[inline]
+    pub fn request(&self) -> RequestId { self.request }
+    #[inline]
+    pub fn client(&self) -> ClientId { self.client }
+    #[inline]
+    pub fn action_id(&self) -> ActionId { self.action_id }
+    #[inline]
+    pub fn route_gen(&self) -> u64 { self.route_gen }
 }
 
 /// Result of attempting to emit a session terminal through [`ActionReplyRouter`].
@@ -1319,22 +1330,54 @@ impl ActionReplyRouter {
         false
     }
 
-    /// Emits a terminal for a validated [`SessionTerminalTicket`]. First call consumes the route
-    /// and enqueues `Reply::Terminal` using the reserved credit; duplicate calls are suppressed
-    /// without double delivery or credit leaks.
+    fn validate_session_route_identity(
+        &self,
+        request: RequestId,
+        client: ClientId,
+        action_id: ActionId,
+        route_gen: u64,
+    ) -> Result<(), SessionTerminalEmit> {
+        if (request.0 & SESSION_REQUEST_ID_BIT) == 0 || route_gen == 0 {
+            return Err(SessionTerminalEmit::IdentityMismatch);
+        }
+        let Some(route) = self.external_routes.get(&request) else {
+            return Err(SessionTerminalEmit::DuplicateSuppressed);
+        };
+        let expected_action = match &route.state {
+            ExternalRouteState::AckCommitted { action_id: aid }
+            | ExternalRouteState::AwaitingAckCommit { action_id: aid, .. } => Some(*aid),
+            ExternalRouteState::AwaitingAck { .. } | ExternalRouteState::Abandoned { .. } => None,
+        };
+        if route.client != client
+            || route.route_gen != route_gen
+            || expected_action.is_some_and(|aid| aid != action_id)
+        {
+            return Err(SessionTerminalEmit::IdentityMismatch);
+        }
+        Ok(())
+    }
+
+    /// Emits a terminal for a validated [`SessionTerminalTicket`]. Validates full `(request,
+    /// client, action_id, route_gen)` identity BEFORE mutating any route or credit; duplicate
+    /// calls are suppressed without double delivery or credit leaks.
     pub(crate) fn emit_session_terminal(
         &mut self,
         ticket: &SessionTerminalTicket,
         outcome: super::broker::Outcome,
         children: u32,
     ) -> SessionTerminalEmit {
-        let Some(route) = self.external_routes.get(&ticket.request) else {
-            self.protocol_anomalies += 1;
-            return SessionTerminalEmit::DuplicateSuppressed;
-        };
-        if route.client != ticket.client || route.route_gen != ticket.route_gen {
-            self.mapping_mismatches += 1;
-            return SessionTerminalEmit::IdentityMismatch;
+        if let Err(err) = self.validate_session_route_identity(
+            ticket.request,
+            ticket.client,
+            ticket.action_id,
+            ticket.route_gen,
+        ) {
+            match err {
+                SessionTerminalEmit::IdentityMismatch => self.mapping_mismatches += 1,
+                SessionTerminalEmit::DuplicateSuppressed => self.protocol_anomalies += 1,
+                _ => {}
+            }
+            return err;
         }
         let reply = Reply::Terminal {
             request: ticket.request,
@@ -1351,14 +1394,23 @@ impl ActionReplyRouter {
     }
 
     /// Routes an RT-emitted [`super::session::SessionTerminalRecord`] drained from the bounded
-    /// SPSC terminal ring into the reserved P-F1 route (suppressing duplicates cleanly).
+    /// SPSC terminal ring into the reserved P-F1 route after non-destructive full-identity check.
     pub(crate) fn route_session_terminal_record(
         &mut self,
         rec: super::session::SessionTerminalRecord,
     ) -> SessionTerminalEmit {
-        if !self.external_routes.contains_key(&rec.request) {
-            self.protocol_anomalies += 1;
-            return SessionTerminalEmit::DuplicateSuppressed;
+        if let Err(err) = self.validate_session_route_identity(
+            rec.request,
+            rec.client,
+            rec.action_id,
+            rec.route_gen,
+        ) {
+            match err {
+                SessionTerminalEmit::IdentityMismatch => self.mapping_mismatches += 1,
+                SessionTerminalEmit::DuplicateSuppressed => self.protocol_anomalies += 1,
+                _ => {}
+            }
+            return err;
         }
         let reply = Reply::Terminal {
             request: rec.request,
