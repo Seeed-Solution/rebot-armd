@@ -367,8 +367,16 @@ async fn ambiguous_post_pending_swap_blocks_measure_and_reconciles_when_settled(
         .expect("begin_measure must reject while provider swap is running");
     assert!(format!("{err:?}").contains("VISION_BUSY"), "{err:?}");
 
+    // Missing or non-string models.swap.state must fail closed (never treated as idle).
+    p.mode.lock().unwrap()["models"]["swap"] = json!({});
+    let err = armd::vision_detector::begin_measure(p.as_ref())
+        .await
+        .err()
+        .expect("missing models.swap.state must not clear pending swap");
+    assert!(format!("{err:?}").contains("VISION_BUSY"), "{err:?}");
+
     // Once provider settles idle, begin_measure reconciles and admits capture.
-    p.mode.lock().unwrap()["models"]["swap"]["state"] = json!("idle");
+    p.mode.lock().unwrap()["models"]["swap"] = json!({"state": "idle", "generation": 0});
     let _guard = armd::vision_detector::begin_measure(p.as_ref())
         .await
         .expect("begin_measure must succeed after provider settles idle");

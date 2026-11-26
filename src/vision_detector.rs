@@ -482,12 +482,18 @@ enum PendingSwapKind {
     Generation(u64),
 }
 
+/// Maximum time an unsettled `PendingSwap::Generation(gen)` keeps fencing a provider that
+/// explicitly reports `swap.state` in `idle | failed` with `generation < gen` (e.g. after a
+/// provider restart that reset generation back to 0).
+const PENDING_SWAP_RECOVERY_TTL: Duration = Duration::from_secs(15);
+
 /// Unsettled provider-side model swap tagged with a monotonic attempt sequence so a concurrent
 /// reconciliation can never clear a newer attempt's pending record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PendingSwap {
     seq: u64,
     kind: PendingSwapKind,
+    recorded_at: Instant,
 }
 
 /// Single-view depth measurements (`POST /api/v1/grasp/measure`), vision macro actions
@@ -570,6 +576,7 @@ impl SwapAttemptGuard {
         let rec = PendingSwap {
             seq: st.swap_attempt_seq,
             kind: PendingSwapKind::Unknown,
+            recorded_at: Instant::now(),
         };
         st.pending_swap = Some(rec);
         Self { recorded: Some(rec) }
@@ -580,6 +587,7 @@ impl SwapAttemptGuard {
         let next = PendingSwap {
             seq: prev.seq,
             kind: PendingSwapKind::Generation(generation),
+            recorded_at: Instant::now(),
         };
         let mut st = VISION_USE.lock().unwrap_or_else(|e| e.into_inner());
         if st.pending_swap == Some(prev) {
@@ -611,8 +619,19 @@ fn pending_swap_is_settled(pending: PendingSwap, pm: &crate::grasp::ProviderMode
     }
     match pending.kind {
         PendingSwapKind::Unknown => true,
-        PendingSwapKind::Generation(gen) => pm.generation >= gen,
+        PendingSwapKind::Generation(gen) => {
+            pm.generation >= gen || pending.recorded_at.elapsed() >= PENDING_SWAP_RECOVERY_TTL
+        }
     }
+}
+
+/// Fast non-blocking check for whether an unsettled provider swap is currently recorded.
+pub(crate) fn has_pending_swap() -> bool {
+    VISION_USE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .pending_swap
+        .is_some()
 }
 
 /// Reconcile a previously fetched `ProviderModels` against any unsettled `pending_swap` while

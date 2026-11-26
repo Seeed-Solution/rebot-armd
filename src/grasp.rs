@@ -1219,7 +1219,7 @@ impl ProviderModels {
         Some(Self {
             generation: m.get("generation").and_then(Value::as_u64)?,
             resident: ResidentModels { detector: name(resident.and_then(|r| r.get("detector"))), depth: name(resident.and_then(|r| r.get("depth"))) },
-            swap_state: name(swap.and_then(|s| s.get("state"))).unwrap_or_else(|| "idle".into()),
+            swap_state: name(swap.and_then(|s| s.get("state"))).unwrap_or_else(|| "unknown".into()),
             swap_error: name(swap.and_then(|s| s.get("error"))),
             catalogue,
             catalogue_kinds,

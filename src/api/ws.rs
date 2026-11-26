@@ -3247,6 +3247,12 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 }
                 continue;
             }
+            if frame_kind == FrameKind::Command
+                && value.get("path").and_then(Value::as_str) == Some(crate::measure_multiview::PATH)
+                && crate::vision_detector::has_pending_swap()
+            {
+                let _ = crate::vision_detector::reconcile_pending_swap(recv_deps.source.as_ref()).await;
+            }
             let mut response: Option<Value>;
             let mut response_sent = false;
             let evicted_notify: Option<(String, u64)> = None;
