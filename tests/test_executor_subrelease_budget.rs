@@ -1941,6 +1941,9 @@ async fn production_executor_urgent_stop_bypass_zero_alloc_and_zero_locks() {
         stats_handle: Arc<Mutex<Option<Arc<armd::rt_core::executor::ExecutorStats>>>>,
         stop_handle: Arc<Mutex<Option<armd::rt_core::urgent::StopRequests>>>,
         sup_handle: Arc<Mutex<Option<Arc<ArmSupervisor>>>>,
+        disconnect_fire: Arc<AtomicBool>,
+        disconnect_done: Arc<AtomicBool>,
+        disconnect_thread: Arc<Mutex<Option<std::thread::Thread>>>,
     }
     impl ArmDriver for CountingPollDriver {
         fn capabilities(&self) -> DriverCapabilities {
@@ -2085,11 +2088,14 @@ async fn production_executor_urgent_stop_bypass_zero_alloc_and_zero_locks() {
                     }
                 }
                 3 => {
-                    if let Some(sup) = self.sup_handle.lock().unwrap().as_ref() {
-                        sup.disconnect_ws_connection_detached(
-                            armd::rt_core::requests::lease::ConnectionHandle::from_ws_id(1)
-                                .unwrap(),
-                        );
+                    // Dispatch disconnect strictly off `armd-control` via the pre-spawned helper
+                    // thread so the RT control thread never touches `ConnLifecycleClient::inner`.
+                    self.disconnect_fire.store(true, Ordering::Release);
+                    if let Some(t) = self.disconnect_thread.lock().unwrap().as_ref() {
+                        t.unpark();
+                    }
+                    while !self.disconnect_done.load(Ordering::Acquire) {
+                        std::hint::spin_loop();
                     }
                 }
                 _ => {}
@@ -2138,6 +2144,10 @@ async fn production_executor_urgent_stop_bypass_zero_alloc_and_zero_locks() {
         let stop_handle: Arc<Mutex<Option<armd::rt_core::urgent::StopRequests>>> =
             Arc::new(Mutex::new(None));
         let sup_handle: Arc<Mutex<Option<Arc<ArmSupervisor>>>> = Arc::new(Mutex::new(None));
+        let disconnect_fire = Arc::new(AtomicBool::new(false));
+        let disconnect_done = Arc::new(AtomicBool::new(false));
+        let disconnect_stop = Arc::new(AtomicBool::new(false));
+        let disconnect_thread: Arc<Mutex<Option<std::thread::Thread>>> = Arc::new(Mutex::new(None));
         let now = Instant::now();
         let drv = CountingPollDriver {
             q: vec![0.0; 7],
@@ -2153,9 +2163,32 @@ async fn production_executor_urgent_stop_bypass_zero_alloc_and_zero_locks() {
             stats_handle: stats_handle.clone(),
             stop_handle: stop_handle.clone(),
             sup_handle: sup_handle.clone(),
+            disconnect_fire: disconnect_fire.clone(),
+            disconnect_done: disconnect_done.clone(),
+            disconnect_thread: disconnect_thread.clone(),
         };
 
         let sup = Arc::new(ArmSupervisor::new(build_sg2002_config()).with_driver(Box::new(drv)));
+        let disconnect_jh = {
+            let sup_c = sup.clone();
+            let fire_c = disconnect_fire.clone();
+            let done_c = disconnect_done.clone();
+            let stop_c = disconnect_stop.clone();
+            std::thread::spawn(move || {
+                while !stop_c.load(Ordering::Acquire) {
+                    if fire_c.swap(false, Ordering::AcqRel) {
+                        sup_c.disconnect_ws_connection_detached(
+                            armd::rt_core::requests::lease::ConnectionHandle::from_ws_id(1)
+                                .unwrap(),
+                        );
+                        done_c.store(true, Ordering::Release);
+                    } else {
+                        std::thread::park();
+                    }
+                }
+            })
+        };
+        *disconnect_thread.lock().unwrap() = Some(disconnect_jh.thread().clone());
         sup.set_lease_enabled(false).await;
         sup.inner().write().await.register_live_connection(1).unwrap();
         {
@@ -2303,5 +2336,8 @@ async fn production_executor_urgent_stop_bypass_zero_alloc_and_zero_locks() {
             "{label}: production RT executor must perform 0 SupervisorLock attempts"
         );
         handle.stop_and_join();
+        disconnect_stop.store(true, Ordering::Release);
+        disconnect_jh.thread().unpark();
+        let _ = disconnect_jh.join();
     }
 }
