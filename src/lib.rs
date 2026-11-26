@@ -4,6 +4,7 @@
 #[cfg(not(target_arch = "wasm32"))] pub mod calib_hover;
 #[cfg(not(target_arch = "wasm32"))] pub mod calibration_sessions;
 pub mod backlash;
+pub mod cell;
 pub mod chain;
 pub mod collision;
 #[cfg(not(target_arch = "wasm32"))] pub mod depth_measure;
@@ -63,6 +64,7 @@ pub mod wasm_api;
     ArmDriver, ArmDriverError, DamiaoArmDriver, FashionStarArmDriver, FeetechArmDriver,
     HoldPassReport, JointHoldStatus, JointMode, JointTarget, RobStrideArmDriver,
 };
+pub use cell::{CellCapabilities, CellConfig, CellContext, CellStatusResponse};
 pub use gravity::{compute_gravity_torques, GravityError};
 #[cfg(not(target_arch = "wasm32"))]
 pub use gravity::verify_urdf_sha256;
