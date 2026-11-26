@@ -1427,6 +1427,9 @@ pub mod switch {
         fn latch_axis_mode_uncertain(&mut self, joint: usize);
         fn mode_write_uncertain_mask(&self) -> u32;
         fn set_mode_switch_active_mask(&mut self, mask: u32);
+        /// Owner proof that a stop/E-stop has been APPLIED (not merely pending). Defaults to
+        /// `false`: without proof a revoked energized partial switch escalates to SAFE-HOLD.
+        fn stop_applied(&self) -> bool { false }
         fn axis_last_ctrl_tx(&self, joint: usize) -> Option<Instant>;
         fn axis_impedance_ranges_verified(&self, joint: usize) -> bool;
         fn axis_configured_impedance_ranges(&self, joint: usize) -> Option<[f32; 3]>;
@@ -1495,6 +1498,7 @@ pub mod switch {
     pub struct ArmDriverModeAdapter<'a> {
         drv: &'a mut dyn crate::driver::ArmDriver,
         pre_tx_gate: &'a mut dyn FnMut() -> Result<(), &'static str>,
+        stop_applied: Option<&'a dyn Fn() -> bool>,
     }
 
     impl<'a> ArmDriverModeAdapter<'a> {
@@ -1502,7 +1506,13 @@ pub mod switch {
             drv: &'a mut dyn crate::driver::ArmDriver,
             pre_tx_gate: &'a mut dyn FnMut() -> Result<(), &'static str>,
         ) -> Self {
-            Self { drv, pre_tx_gate }
+            Self { drv, pre_tx_gate, stop_applied: None }
+        }
+
+        /// Attaches the owner's "stop applied" proof consulted when the pre-TX gate revokes.
+        pub fn with_stop_proof(mut self, stop_applied: &'a dyn Fn() -> bool) -> Self {
+            self.stop_applied = Some(stop_applied);
+            self
         }
     }
 
@@ -1527,6 +1537,7 @@ pub mod switch {
         }
         fn mode_write_uncertain_mask(&self) -> u32 { self.drv.mode_write_uncertain_mask() }
         fn set_mode_switch_active_mask(&mut self, mask: u32) { self.drv.set_mode_switch_active_mask(mask); }
+        fn stop_applied(&self) -> bool { self.stop_applied.is_some_and(|f| f()) }
         fn axis_last_ctrl_tx(&self, joint: usize) -> Option<Instant> { self.drv.axis_last_ctrl_tx(joint) }
         fn axis_impedance_ranges_verified(&self, joint: usize) -> bool { self.drv.axis_impedance_ranges_verified(joint) }
         fn axis_configured_impedance_ranges(&self, joint: usize) -> Option<[f32; 3]> { self.drv.axis_configured_impedance_ranges(joint) }
@@ -1859,6 +1870,59 @@ pub mod switch {
             None
         }
 
+        /// Single revocation decision shared by in-step pre-TX gate revocation and external
+        /// revocation. `stop_applied` must be owner proof that the stop/E-stop was APPLIED; a
+        /// pending stop (or a bare `"STOPPED"` code) never qualifies. Without that proof an
+        /// energized partial switch escalates to `Ambiguous` (SAFE-HOLD).
+        fn revocation_outcome(
+            &mut self,
+            drv_energized: bool,
+            drv_uncertain: u32,
+            reason: ModeSwitchFailure,
+            stop_applied: bool,
+        ) -> ModeProgress {
+            let len = usize::from(self.plan.len).min(MAX_MODE_SWITCH_AXES);
+            let mut in_flight_write_joint: Option<u8> = None;
+            for i in 0..len {
+                match self.slots[i].phase {
+                    AxisPhase::AwaitingWriteAck { .. }
+                    | AxisPhase::NeedReadback { from_write: true, .. }
+                    | AxisPhase::AwaitingReadback { from_write: true, .. }
+                    | AxisPhase::AwaitingFeedback { from_write: true, .. } => {
+                        let j = self.slots[i].target.joint;
+                        self.ambiguous_mask |= 1u32 << j;
+                        in_flight_write_joint.get_or_insert(j);
+                    }
+                    AxisPhase::AwaitingFeedback {
+                        fenced_pending_feedback: true,
+                        ..
+                    } if drv_energized => {
+                        let j = self.slots[i].target.joint;
+                        self.ambiguous_mask |= 1u32 << j;
+                        in_flight_write_joint.get_or_insert(j);
+                    }
+                    _ => {}
+                }
+            }
+            if !stop_applied && drv_energized {
+                if let Some(j) = self.first_switched_forward_joint() {
+                    self.ambiguous_mask |= 1u32 << j;
+                    in_flight_write_joint.get_or_insert(j);
+                }
+            }
+            self.ambiguous_mask |= drv_uncertain & self.active_mask;
+            if self.ambiguous_mask != 0 {
+                let fj = in_flight_write_joint
+                    .unwrap_or_else(|| self.ambiguous_mask.trailing_zeros() as u8);
+                ModeProgress::Ambiguous {
+                    failed_joint: fj,
+                    reason,
+                }
+            } else {
+                ModeProgress::StoppedRecovered { reason }
+            }
+        }
+
         /// Reconciles an external revocation (stop, cancel, disconnect, deadline expiry, epoch or
         /// operator revocation, fault, SAFE-HOLD, handback) even if `step` does not run again.
         ///
@@ -1883,61 +1947,21 @@ pub mod switch {
             } else {
                 0
             };
-            let len = usize::from(self.plan.len).min(MAX_MODE_SWITCH_AXES);
-            let mut in_flight_write_joint: Option<u8> = None;
-            for i in 0..len {
-                match self.slots[i].phase {
-                    AxisPhase::AwaitingWriteAck { .. }
-                    | AxisPhase::NeedReadback { from_write: true, .. }
-                    | AxisPhase::AwaitingReadback { from_write: true, .. }
-                    | AxisPhase::AwaitingFeedback { from_write: true, .. } => {
-                        let j = self.slots[i].target.joint;
-                        self.ambiguous_mask |= 1u32 << j;
-                        in_flight_write_joint.get_or_insert(j);
-                    }
-                    AxisPhase::AwaitingFeedback {
-                        fenced_pending_feedback: true,
-                        ..
-                    } if drv_energized => {
-                        let j = self.slots[i].target.joint;
-                        self.ambiguous_mask |= 1u32 << j;
-                        in_flight_write_joint.get_or_insert(j);
-                    }
-                    _ => {}
-                }
-            }
-            // R3 Blocker 1: NEVER release an energized partial switch back to ordinary output
-            // unless an actual stop is applied (`stop_applied == true`); never trust a caller
-            // reason string like `"STOPPED"` without an applied stop!
-            if !stop_applied && drv_energized {
-                if let Some(j) = self.first_switched_forward_joint() {
-                    self.ambiguous_mask |= 1u32 << j;
-                    in_flight_write_joint.get_or_insert(j);
-                }
-            }
-            self.ambiguous_mask |= drv_uncertain & self.active_mask;
-            let outcome = if self.ambiguous_mask != 0 {
-                let fj = in_flight_write_joint
-                    .unwrap_or_else(|| self.ambiguous_mask.trailing_zeros() as u8);
-                self.push_event(
+            let outcome = self.revocation_outcome(drv_energized, drv_uncertain, reason, stop_applied);
+            match outcome {
+                ModeProgress::Ambiguous { failed_joint, .. } => self.push_event(
                     ModeSwitchEventKind::TerminalAmbiguous,
-                    fj,
+                    failed_joint,
                     None,
                     Some(reason),
-                );
-                ModeProgress::Ambiguous {
-                    failed_joint: fj,
-                    reason,
-                }
-            } else {
-                self.push_event(
+                ),
+                _ => self.push_event(
                     ModeSwitchEventKind::TerminalStoppedRecovered,
                     0,
                     None,
                     Some(reason),
-                );
-                ModeProgress::StoppedRecovered { reason }
-            };
+                ),
+            }
             self.phase = RunnerPhase::Done(outcome);
             outcome
         }
@@ -1962,6 +1986,20 @@ pub mod switch {
             budget: ReleaseBudget,
         ) -> ModeProgress {
             let mut adapter = ArmDriverModeAdapter::new(drv, pre_tx_gate);
+            self.step_driver(&mut adapter, budget)
+        }
+
+        /// [`Self::step_with_gate`] plus the owner's "stop applied" proof (see
+        /// [`ModeSwitchDriver::stop_applied`]); a gate revocation without proof is treated as a
+        /// pending stop.
+        pub fn step_with_gate_and_stop_proof(
+            &mut self,
+            drv: &mut dyn crate::driver::ArmDriver,
+            pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+            stop_applied: &dyn Fn() -> bool,
+            budget: ReleaseBudget,
+        ) -> ModeProgress {
+            let mut adapter = ArmDriverModeAdapter::new(drv, pre_tx_gate).with_stop_proof(stop_applied);
             self.step_driver(&mut adapter, budget)
         }
 
@@ -3150,31 +3188,15 @@ pub mod switch {
             drv: &mut dyn ModeSwitchDriver,
             code: &'static str,
         ) -> ModeProgress {
+            // Blocker 1 (R5): the gate code says only that a stop is pending or applied; the
+            // "applied" proof comes from the owner via `stop_applied()`, through the same
+            // decision as external revocation.
             let reason = ModeSwitchFailure::from_revoke_code(code);
-            let drv_uncertain = drv.mode_write_uncertain_mask() & self.active_mask;
-            self.ambiguous_mask |= drv_uncertain;
-            // R3 Blocker 1: unified energized partial-switch guard across pre-TX revocations too!
-            // Only an actually applied stop/E-stop from the pre-TX gate permits `StoppedRecovered`
-            // after `>= 1` axis has already switched forward; lease/operator/timeout revocation on
-            // an energized partial switch escalates to `Ambiguous` (SAFE-HOLD).
-            let stop_applied = matches!(code, "STOPPED" | "ESTOP_ACTIVE");
-            if !stop_applied && drv.any_axis_energized() {
-                if let Some(j) = self.first_switched_forward_joint() {
-                    self.ambiguous_mask |= 1u32 << j;
-                }
-            }
-            if self.ambiguous_mask != 0 {
-                let fj = self.ambiguous_mask.trailing_zeros() as u8;
-                self.finish(
-                    drv,
-                    ModeProgress::Ambiguous {
-                        failed_joint: fj,
-                        reason,
-                    },
-                )
-            } else {
-                self.finish(drv, ModeProgress::StoppedRecovered { reason })
-            }
+            let drv_energized = drv.any_axis_energized();
+            let drv_uncertain = drv.mode_write_uncertain_mask();
+            let stop_applied = drv.stop_applied();
+            let outcome = self.revocation_outcome(drv_energized, drv_uncertain, reason, stop_applied);
+            self.finish(drv, outcome)
         }
 
         fn handle_axis_failure(

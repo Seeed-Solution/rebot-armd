@@ -12585,6 +12585,13 @@ impl SupervisorInner {
         self.mode_switch.find_terminal(session_id)
     }
 
+    /// Owner proof that a stop has been APPLIED (safety state stopped), as opposed to an urgent
+    /// stop that is only pending. Shared by in-step gate revocation and external revocation.
+    #[inline]
+    pub(crate) fn mode_switch_stop_applied(&self) -> bool {
+        self.safety.state().is_stopped()
+    }
+
     /// Reconciles active `ModeSwitch` state and driver `mode_write_uncertain_mask` /
     /// `mode_switch_active_mask` on ANY revocation path (stop, E-stop, disconnect, expiry,
     /// cancel, fault, SAFE-HOLD, handback), syncing `hw_state_uncertain` into `SessionDriver`.
@@ -12597,7 +12604,7 @@ impl SupervisorInner {
         };
         let reason = crate::motor_mode::ModeSwitchFailure::from_revoke_code(reason_code);
         let mut drv_uncertain = 0u32;
-        let stop_applied = self.safety.state().is_stopped();
+        let stop_applied = self.mode_switch_stop_applied();
         let progress = if let Some(slot) = self.driver.as_mut() {
             let mut p = None;
             let _ = slot.try_with_mut(|drv| {
@@ -12787,7 +12794,8 @@ impl SupervisorInner {
                     )
                     .map(|_| ())
                 };
-                out = machine.step_with_gate(drv, &mut gate, budget);
+                let stop_proof = || self.mode_switch_stop_applied();
+                out = machine.step_with_gate_and_stop_proof(drv, &mut gate, &stop_proof, budget);
                 drv_uncertain = drv.mode_write_uncertain_mask();
             });
             if locked.is_err() {

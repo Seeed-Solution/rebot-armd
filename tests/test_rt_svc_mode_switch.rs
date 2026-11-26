@@ -1861,3 +1861,136 @@ async fn safe_hold_lost_recovery_reply_retries_next_tick_and_manual_legacy_safe_
         assert!(*count >= 1, "manual Legacy SAFE-HOLD must emit holds on J{} (got {count})", j + 1);
     }
 }
+
+// ---------------------------------------------------------------------------
+// 6. Review round 5 regressions
+// ---------------------------------------------------------------------------
+
+/// Runs one 50 Hz-style release on a raw Damiao driver with a caller-supplied pre-TX gate.
+fn step_raw_with_gate(
+    drv: &mut DamiaoArmDriver<FakeBus>,
+    ms: &mut ModeSwitch,
+    clock: &MockClock,
+    budget_of: impl Fn(Instant, Instant) -> ReleaseBudget,
+    period: Duration,
+    seq: u64,
+    gate: &mut dyn FnMut() -> Result<(), &'static str>,
+) -> ModeProgress {
+    let tick_start = clock.now();
+    drv.begin_control_release(seq);
+    let cutoff = tick_start + period.saturating_sub(Duration::from_millis(3));
+    drv.set_tx_release_deadline(Some(cutoff));
+    let _ = drv.read_joint_states();
+    let budget = budget_of(clock.now(), cutoff);
+    let prog = ms.step_with_gate(drv, gate, budget);
+    drv.set_tx_release_deadline(None);
+    prog
+}
+
+/// Blocker 1: a stop that is only PENDING (not yet applied by the owner) revokes the next register
+/// TX after J1 has already switched forward. The pre-TX gate code `"STOPPED"` is not proof that the
+/// stop was applied, so the partial energized switch must escalate to SAFE-HOLD (`Ambiguous`)
+/// instead of reporting `StoppedRecovered`.
+#[test]
+fn pending_stop_after_first_axis_confirms_is_not_stopped_recovered() {
+    let clock = MockClock::new();
+    let cfg = ArmConfig::rebot_dm();
+    let bus = configure_damiao_bus(Some(clock.clone()), Duration::from_micros(500), true, TIMEOUT_2000_COUNTS);
+    let mut drv = build_damiao_driver(bus.clone(), &cfg, 8);
+    enable_driver_sync(&mut drv, &bus, Some(&clock));
+    let plan = ModeSwitchPlan::switch_axes(
+        &[(0, ControlMode::Impedance), (1, ControlMode::Impedance)],
+        ModeSwitchRecovery::RollbackToPrevious,
+    )
+    .unwrap();
+    let mut ms = ModeSwitch::new(plan);
+    // The stop becomes pending once J1 runs in MIT on the wire; the next register TX (J2's first)
+    // is revoked by the live gate before the owner applies the stop.
+    let revoked = std::cell::Cell::new(0u32);
+    let gate_bus = bus.clone();
+    let mut prog = ModeProgress::Pending { wake: None };
+    let mut seq = 1u64;
+    for _ in 0..40 {
+        clock.advance(PERIOD_50HZ);
+        bus.with(|s| s.run_watchdogs());
+        seq += 1;
+        let mut gate = || {
+            if gate_bus.with(|s| s.motors[0].ctrl_mode()) == damiao::CTRL_MODE_MIT {
+                revoked.set(revoked.get() + 1);
+                Err("STOPPED")
+            } else {
+                Ok(())
+            }
+        };
+        prog = step_raw_with_gate(
+            &mut drv,
+            &mut ms,
+            &clock,
+            |now, cutoff| ReleaseBudget::new(now, cutoff, PERIOD_50HZ, 8),
+            PERIOD_50HZ,
+            seq,
+            &mut gate,
+        );
+        if prog.is_terminal() {
+            break;
+        }
+    }
+    pending_stop_race_asserts(&bus, &revoked, prog);
+}
+
+fn pending_stop_race_asserts(bus: &FakeBus, revoked: &std::cell::Cell<u32>, prog: ModeProgress) {
+    let is_mode_write_to = |log: &[CanFrame], id: u8| {
+        log.iter().any(|f| {
+            f.id == 0x7FF && f.data[0] == id && f.data[2] == damiao::REG_WRITE && f.data[3] == damiao::RID_CTRL_MODE
+        })
+    };
+    let log = bus.tx_log();
+    assert!(is_mode_write_to(&log, 1), "J1 must have switched forward");
+    assert!(!is_mode_write_to(&log, 2), "J2 register TX must have been revoked");
+    assert!(revoked.get() >= 1, "the live gate must have revoked a register TX");
+    assert!(
+        prog.is_ambiguous(),
+        "pending (unapplied) stop with an energized partial switch must escalate to SAFE-HOLD, got {prog:?}"
+    );
+}
+
+/// Blocker 1 control: the same race with owner proof that the stop was applied recovers cleanly.
+#[test]
+fn applied_stop_proof_after_first_axis_confirms_is_stopped_recovered() {
+    let clock = MockClock::new();
+    let cfg = ArmConfig::rebot_dm();
+    let bus = configure_damiao_bus(Some(clock.clone()), Duration::from_micros(500), true, TIMEOUT_2000_COUNTS);
+    let mut drv = build_damiao_driver(bus.clone(), &cfg, 8);
+    enable_driver_sync(&mut drv, &bus, Some(&clock));
+    let plan = ModeSwitchPlan::switch_axes(
+        &[(0, ControlMode::Impedance), (1, ControlMode::Impedance)],
+        ModeSwitchRecovery::RollbackToPrevious,
+    )
+    .unwrap();
+    let mut ms = ModeSwitch::new(plan);
+    let gate_bus = bus.clone();
+    let mut prog = ModeProgress::Pending { wake: None };
+    for seq in 2..42u64 {
+        clock.advance(PERIOD_50HZ);
+        bus.with(|s| s.run_watchdogs());
+        let mut gate = || {
+            if gate_bus.with(|s| s.motors[0].ctrl_mode()) == damiao::CTRL_MODE_MIT {
+                Err("STOPPED")
+            } else {
+                Ok(())
+            }
+        };
+        let applied = || gate_bus.with(|s| s.motors[0].ctrl_mode()) == damiao::CTRL_MODE_MIT;
+        drv.begin_control_release(seq);
+        let cutoff = clock.now() + Duration::from_millis(17);
+        drv.set_tx_release_deadline(Some(cutoff));
+        let _ = drv.read_joint_states();
+        let budget = ReleaseBudget::new(clock.now(), cutoff, PERIOD_50HZ, 8);
+        prog = ms.step_with_gate_and_stop_proof(&mut drv, &mut gate, &applied, budget);
+        drv.set_tx_release_deadline(None);
+        if prog.is_terminal() {
+            break;
+        }
+    }
+    assert_eq!(prog, ModeProgress::StoppedRecovered { reason: ModeSwitchFailure::Stopped });
+}
