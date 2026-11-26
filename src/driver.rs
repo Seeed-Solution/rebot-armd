@@ -21800,6 +21800,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             }
         }
         let managed_recovery_cap = self.control_release_managed || self.tx_release_deadline.is_some();
+        // When a managed release already runs Step 5 normal output every tick without joint
+        // tracking (`!self.strict_mode_handover`), Step 5 will immediately emit a fresh control
+        // frame to every joint in this release (and end-of-release watchdog fallback covers any
+        // deferred/absent motor). Skip redundant Step-2 recovery holds here so no motor receives
+        // duplicate control frames in the same release.
+        let skip_redundant_step2_recovery =
+            managed_recovery_cap && self.output_ran_since_rx && !self.strict_mode_handover;
         if rx_drained
             && self.is_enabled
             && !self.is_enabling
@@ -21811,6 +21818,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             && self.recovery_tx_allowed()
             && self.is_feedback_valid()
             && !(self.output_ran_since_rx && self.has_class1_transition_pending())
+            && !skip_redundant_step2_recovery
             && (!managed_recovery_cap || self.has_optional_release_budget())
         {
             let n = self.motor_ids.len();
