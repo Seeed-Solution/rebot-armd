@@ -12479,10 +12479,17 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         } else {
             max_frames
         };
+        let mut effective_deadline = deadline.map(|d| d.at);
+        if let Some(tx_dl) = self.tx_release_deadline {
+            effective_deadline = Some(effective_deadline.map_or(tx_dl, |d| d.min(tx_dl)));
+        }
+        if let Some(rx_dl) = self.rx_deadline {
+            effective_deadline = Some(effective_deadline.map_or(rx_dl, |d| d.min(rx_dl)));
+        }
         let mut frames = 0usize;
         let mut drained = false;
         while frames < limit {
-            if deadline.is_some_and(|d| d.passed(self.now())) {
+            if effective_deadline.is_some_and(|d| self.now() >= d) {
                 break;
             }
             let attempt = self.now();
@@ -17496,10 +17503,17 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         };
         self.last_read_drained = false;
         let start = self.now();
+        let mut effective_deadline = start + Duration::from_millis(5);
+        if let Some(tx_dl) = self.tx_release_deadline {
+            effective_deadline = effective_deadline.min(tx_dl);
+        }
+        if let Some(rx_dl) = self.rx_deadline {
+            effective_deadline = effective_deadline.min(rx_dl);
+        }
         let mut frames_processed = 0usize;
         let mut rx_drained = false;
         let mut hit_err = false;
-        while frames_processed < limit && self.since(start) < Duration::from_millis(5) {
+        while frames_processed < limit && self.now() < effective_deadline {
             let attempt = self.now();
             match self.receive_with_rx_time_timed() {
                 Ok((frame, rx_time)) => {

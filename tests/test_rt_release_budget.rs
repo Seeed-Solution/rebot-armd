@@ -1194,3 +1194,117 @@ fn zero_remaining_rx_still_runs_inline_watchdog_holds_and_protective_disable_ret
         "Window 2 transition wake at 0 RX must still transmit protective CMD_DISABLE retries (sent {wake_disable_tx})"
     );
 }
+
+#[test]
+fn pre_command_drain_bounded_by_release_deadline_minus_publish_margin() {
+    use armd::driver::{DisableKind, TorqueProgress, DAMIAO_TX_RELEASE_PUBLISH_MARGIN};
+
+    let clock = MockClock::new();
+    let (bus, drv, cfg) = make_bus_and_driver(Some(clock.clone()), 16, true);
+    let mut core = SupervisorInner::new(cfg).with_driver(Box::new(drv));
+    core.lease_enabled = false;
+    core.rt_executor_owned = true;
+    let margin = DAMIAO_TX_RELEASE_PUBLISH_MARGIN;
+
+    // Seed a 20-frame RX backlog with 1 ms per receive step: an unbounded 5 ms pre-command
+    // drain would read 5 frames and advance the clock by 5 ms, crossing `ledger.deadline() - margin`.
+    bus.with(|s| {
+        s.rx_step = Duration::from_millis(1);
+        s.rx.clear();
+        for i in 0..20u8 {
+            s.rx.push_back(stray_frame(i));
+        }
+    });
+
+    // 1. Enable pre-command drain under a `(margin + 2 ms)` release ledger (cutoff = t0 + 2 ms):
+    //    must stop at <= t0 + 2 ms (<= 2 frames), never running the full 5 ms drain window.
+    let t0 = clock.now();
+    let release_deadline = t0 + margin + Duration::from_millis(2);
+    let expected_cutoff = release_deadline - margin;
+    let rx_before = bus.with(|s| s.rx.len());
+    let enable_res = core
+        .driver
+        .as_mut()
+        .unwrap()
+        .try_with_mut(|d| {
+            d.begin_control_release(400);
+            d.set_tx_release_deadline(Some(expected_cutoff));
+            let res = d.begin_torque_budgeted(true, 64);
+            d.set_tx_release_deadline(None);
+            res
+        })
+        .unwrap();
+    assert!(
+        matches!(enable_res, Err(armd::driver::ArmDriverError::RxDrainTimeout)),
+        "pre-command drain interrupted by release cutoff must return RxDrainTimeout, got {enable_res:?}"
+    );
+    let after_enable = clock.now();
+    assert!(
+        after_enable <= expected_cutoff,
+        "enable pre-command drain crossed ledger deadline - publish_margin: elapsed {:?} > 2ms",
+        after_enable.saturating_duration_since(t0)
+    );
+    let enable_consumed = rx_before - bus.with(|s| s.rx.len());
+    assert_eq!(
+        enable_consumed, 2,
+        "enable pre-command drain must stop at 2 frames (2 ms cutoff), not 5 frames (5 ms window)"
+    );
+
+    // 2. Disable pre-command drain under a `(margin + 1 ms)` release ledger (cutoff = t1 + 1 ms):
+    //    must stop at <= t1 + 1 ms (<= 1 frame) and hold in Pending (`AwaitRestGate`).
+    bus.with(|s| {
+        s.rx_step = Duration::ZERO;
+        s.rx.clear();
+        s.push_all_feedback();
+    });
+    core.driver
+        .as_mut()
+        .unwrap()
+        .try_with_mut(|d| {
+            d.set_tx_release_deadline(None);
+            d.set_torque(true).expect("enable torque");
+        })
+        .unwrap();
+    bus.with(|s| {
+        s.rx_step = Duration::from_millis(1);
+        s.immediate_replies = false;
+        s.rx.clear();
+        for i in 0..20u8 {
+            s.rx.push_back(stray_frame(i));
+        }
+    });
+    let t1 = clock.now();
+    let disable_release_deadline = t1 + margin + Duration::from_millis(1);
+    let expected_disable_cutoff = disable_release_deadline - margin;
+    let rx_before_dis = bus.with(|s| s.rx.len());
+    let dis_res = core
+        .driver
+        .as_mut()
+        .unwrap()
+        .try_with_mut(|d| {
+            d.begin_control_release(401);
+            d.set_tx_release_deadline(Some(expected_disable_cutoff));
+            let res = d.begin_disable_torque_budgeted(
+                DisableKind::DisableRequested { started_at: t1 },
+                64,
+            );
+            d.set_tx_release_deadline(None);
+            res
+        })
+        .unwrap();
+    assert!(
+        matches!(dis_res, Ok(TorqueProgress::Pending { .. })),
+        "disable pre-command drain truncated by release cutoff must remain Pending, got {dis_res:?}"
+    );
+    let after_dis = clock.now();
+    assert!(
+        after_dis <= expected_disable_cutoff,
+        "disable pre-command drain crossed ledger deadline - publish_margin: elapsed {:?} > 1ms",
+        after_dis.saturating_duration_since(t1)
+    );
+    let dis_consumed = rx_before_dis - bus.with(|s| s.rx.len());
+    assert_eq!(
+        dis_consumed, 1,
+        "disable pre-command drain must stop at 1 frame (1 ms cutoff), not 5 frames"
+    );
+}
