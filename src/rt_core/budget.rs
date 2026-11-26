@@ -297,32 +297,35 @@ impl ReleaseBudget {
     #[inline]
     pub fn sub_budget(&mut self, deadline: Instant, max_rx: u16, max_tx: u16) -> SubBudget<'_> {
         let clamped_deadline = self.deadline.min(deadline);
-        let rx_cap = self.rx_remaining().min(max_rx);
-        let tx_cap = self.tx_remaining().min(max_tx);
+        let rx_start = self.rx_used;
+        let tx_start = self.tx_used;
+        let rx_ceiling = self.rx_limit.min(rx_start.saturating_add(max_rx));
+        let tx_ceiling = self.tx_limit.min(tx_start.saturating_add(max_tx));
         SubBudget {
             parent: self,
             deadline: clamped_deadline,
-            rx_cap,
-            rx_used: 0,
-            tx_cap,
-            tx_used: 0,
+            rx_start,
+            rx_ceiling,
+            tx_start,
+            tx_ceiling,
         }
     }
 }
 
 /// Tightened sub-budget view drawing from a parent [`ReleaseBudget`] ledger.
 ///
-/// Every RX frame or TX attempt charged on a `SubBudget` is immediately charged to the parent
-/// ledger as well, guaranteeing that combined consumption across phases can never exceed the
-/// parent ledger's bounds.
+/// Scoped ceilings (`rx_ceiling`, `tx_ceiling`) are anchored to absolute root-ledger consumption
+/// counters (`parent.rx_used`, `parent.tx_used`), so any charge made through a nested
+/// [`SubBudget::tighten`] view automatically debits every enclosing sub-budget as well as the
+/// root [`ReleaseBudget`].
 #[derive(Debug)]
 pub struct SubBudget<'a> {
     parent: &'a mut ReleaseBudget,
     deadline: Instant,
-    rx_cap: u16,
-    rx_used: u16,
-    tx_cap: u16,
-    tx_used: u16,
+    rx_start: u16,
+    rx_ceiling: u16,
+    tx_start: u16,
+    tx_ceiling: u16,
 }
 
 impl<'a> SubBudget<'a> {
@@ -335,29 +338,31 @@ impl<'a> SubBudget<'a> {
     /// Remaining RX frames available to this sub-budget (`<= parent.rx_remaining()`).
     #[inline]
     pub fn rx_remaining(&self) -> u16 {
-        self.rx_cap
-            .saturating_sub(self.rx_used)
-            .min(self.parent.rx_remaining())
+        self.rx_ceiling
+            .min(self.parent.rx_limit)
+            .saturating_sub(self.parent.rx_used)
     }
 
     /// Remaining TX attempts available to this sub-budget (`<= parent.tx_remaining()`).
     #[inline]
     pub fn tx_remaining(&self) -> u16 {
-        self.tx_cap
-            .saturating_sub(self.tx_used)
-            .min(self.parent.tx_remaining())
+        self.tx_ceiling
+            .min(self.parent.tx_limit)
+            .saturating_sub(self.parent.tx_used)
     }
 
-    /// RX frames charged through this sub-budget so far.
+    /// Cumulative RX frames consumed from the root ledger since this sub-budget was opened
+    /// (including charges through nested sub-budgets).
     #[inline]
-    pub const fn rx_used(&self) -> u16 {
-        self.rx_used
+    pub fn rx_used(&self) -> u16 {
+        self.parent.rx_used.saturating_sub(self.rx_start)
     }
 
-    /// TX attempts charged through this sub-budget so far.
+    /// Cumulative TX attempts consumed from the root ledger since this sub-budget was opened
+    /// (including charges through nested sub-budgets).
     #[inline]
-    pub const fn tx_used(&self) -> u16 {
-        self.tx_used
+    pub fn tx_used(&self) -> u16 {
+        self.parent.tx_used.saturating_sub(self.tx_start)
     }
 
     /// True when `now` has reached or passed this sub-budget's deadline.
@@ -389,29 +394,29 @@ impl<'a> SubBudget<'a> {
     /// Further tightens this sub-budget's remaining RX cap (never loosens).
     #[inline]
     pub fn tighten_rx_remaining(&mut self, max_remaining_rx: u16) {
-        let tightened = self.rx_used.saturating_add(max_remaining_rx);
-        if tightened < self.rx_cap {
-            self.rx_cap = tightened;
+        let tightened = self.parent.rx_used.saturating_add(max_remaining_rx);
+        if tightened < self.rx_ceiling {
+            self.rx_ceiling = tightened;
         }
     }
 
     /// Further tightens this sub-budget's remaining TX cap (never loosens).
     #[inline]
     pub fn tighten_tx_remaining(&mut self, max_remaining_tx: u16) {
-        let tightened = self.tx_used.saturating_add(max_remaining_tx);
-        if tightened < self.tx_cap {
-            self.tx_cap = tightened;
+        let tightened = self.parent.tx_used.saturating_add(max_remaining_tx);
+        if tightened < self.tx_ceiling {
+            self.tx_ceiling = tightened;
         }
     }
 
-    /// Charges `frames` RX frames to both this sub-budget and the parent ledger.
+    /// Charges `frames` RX frames to the root ledger (immediately reflected in this and all
+    /// enclosing sub-budgets).
     #[inline]
     pub fn charge_rx(&mut self, frames: u16, exhausted: bool) {
-        self.rx_used = self.rx_used.saturating_add(frames);
         self.parent.charge_rx(frames, exhausted);
     }
 
-    /// Attempts to charge one RX frame to both this sub-budget and the parent ledger.
+    /// Attempts to charge one RX frame to the root ledger within this sub-budget's bounds.
     #[inline]
     pub fn try_charge_rx_one(&mut self, now: Instant) -> bool {
         if now >= self.deadline || self.rx_remaining() == 0 {
@@ -420,19 +425,18 @@ impl<'a> SubBudget<'a> {
             }
             return false;
         }
-        self.rx_used = self.rx_used.saturating_add(1);
         self.parent.charge_rx(1, false);
         true
     }
 
-    /// Charges `attempts` TX attempts to both this sub-budget and the parent ledger.
+    /// Charges `attempts` TX attempts to the root ledger (immediately reflected in this and all
+    /// enclosing sub-budgets).
     #[inline]
     pub fn charge_tx(&mut self, attempts: u16) {
-        self.tx_used = self.tx_used.saturating_add(attempts);
         self.parent.charge_tx(attempts);
     }
 
-    /// Attempts to charge one TX attempt to both this sub-budget and the parent ledger.
+    /// Attempts to charge one TX attempt to the root ledger within this sub-budget's bounds.
     #[inline]
     pub fn try_charge_tx_one(&mut self, now: Instant) -> bool {
         if now >= self.deadline || self.tx_remaining() == 0 {
@@ -441,24 +445,33 @@ impl<'a> SubBudget<'a> {
             }
             return false;
         }
-        self.tx_used = self.tx_used.saturating_add(1);
         self.parent.charge_tx(1);
         true
     }
 
     /// Creates a nested tightened [`SubBudget`] drawing from the same root [`ReleaseBudget`].
+    /// Any charge through the nested view advances `parent.rx_used` / `parent.tx_used`, so
+    /// enclosing sub-budgets automatically enforce their own ceilings when the nested view drops.
     #[inline]
     pub fn tighten(&mut self, deadline: Instant, max_rx: u16, max_tx: u16) -> SubBudget<'_> {
         let clamped_deadline = self.deadline.min(deadline);
-        let rx_cap = self.rx_remaining().min(max_rx);
-        let tx_cap = self.tx_remaining().min(max_tx);
+        let rx_start = self.parent.rx_used;
+        let tx_start = self.parent.tx_used;
+        let rx_ceiling = self
+            .rx_ceiling
+            .min(self.parent.rx_limit)
+            .min(rx_start.saturating_add(max_rx));
+        let tx_ceiling = self
+            .tx_ceiling
+            .min(self.parent.tx_limit)
+            .min(tx_start.saturating_add(max_tx));
         SubBudget {
             parent: self.parent,
             deadline: clamped_deadline,
-            rx_cap,
-            rx_used: 0,
-            tx_cap,
-            tx_used: 0,
+            rx_start,
+            rx_ceiling,
+            tx_start,
+            tx_ceiling,
         }
     }
 
@@ -552,5 +565,79 @@ mod tests {
         assert!(!ledger.try_charge_tx_one(t0 + Duration::from_millis(5)));
         assert_eq!(ledger.rx_used(), 0);
         assert_eq!(ledger.tx_used(), 0);
+    }
+
+    #[test]
+    fn nested_sub_budget_charges_propagate_to_enclosing_and_sibling_scopes() {
+        let t0 = Instant::now();
+        let dl = t0 + Duration::from_millis(20);
+        let mut root = ReleaseBudget::new(3, t0, dl, 10, 10);
+
+        {
+            let mut outer = root.sub_budget(dl, 2, 2);
+            assert_eq!(outer.rx_remaining(), 2);
+            assert_eq!(outer.tx_remaining(), 2);
+
+            // Nested child consumes outer's entire RX and TX allowance (2 each).
+            {
+                let mut inner = outer.tighten(dl, 2, 2);
+                assert!(inner.try_charge_rx_one(t0));
+                assert!(inner.try_charge_rx_one(t0));
+                assert!(!inner.try_charge_rx_one(t0));
+                assert!(inner.try_charge_tx_one(t0));
+                assert!(inner.try_charge_tx_one(t0));
+                assert!(!inner.try_charge_tx_one(t0));
+            }
+
+            // Enclosing sub-budget must now observe 0 remaining RX and 0 remaining TX.
+            assert_eq!(outer.rx_used(), 2);
+            assert_eq!(outer.tx_used(), 2);
+            assert_eq!(outer.rx_remaining(), 0);
+            assert_eq!(outer.tx_remaining(), 0);
+            assert!(!outer.try_charge_rx_one(t0));
+            assert!(!outer.try_charge_tx_one(t0));
+
+            // A sibling nested scope opened from `outer` must also see 0 remaining.
+            {
+                let mut sibling = outer.tighten(dl, 5, 5);
+                assert_eq!(sibling.rx_remaining(), 0);
+                assert_eq!(sibling.tx_remaining(), 0);
+                assert!(!sibling.try_charge_rx_one(t0));
+                assert!(!sibling.try_charge_tx_one(t0));
+            }
+        }
+
+        // Root ledger reflects exact total consumption (2 RX, 2 TX) with 8 remaining each.
+        assert_eq!(root.rx_used(), 2);
+        assert_eq!(root.tx_used(), 2);
+        assert_eq!(root.rx_remaining(), 8);
+        assert_eq!(root.tx_remaining(), 8);
+
+        // Partial consumption across nested + direct + sibling scopes sums against outer cap.
+        {
+            let mut outer = root.sub_budget(dl, 3, 3);
+            {
+                let mut child1 = outer.tighten(dl, 2, 2);
+                child1.charge_rx(1, false);
+                child1.charge_tx(1);
+            }
+            assert_eq!(outer.rx_remaining(), 2);
+            assert_eq!(outer.tx_remaining(), 2);
+            assert!(outer.try_charge_rx_one(t0));
+            assert!(outer.try_charge_tx_one(t0));
+            {
+                let mut child2 = outer.tighten(dl, 5, 5);
+                assert_eq!(child2.rx_remaining(), 1);
+                assert_eq!(child2.tx_remaining(), 1);
+                assert!(child2.try_charge_rx_one(t0));
+                assert!(!child2.try_charge_rx_one(t0));
+                assert!(child2.try_charge_tx_one(t0));
+                assert!(!child2.try_charge_tx_one(t0));
+            }
+            assert_eq!(outer.rx_remaining(), 0);
+            assert_eq!(outer.tx_remaining(), 0);
+        }
+        assert_eq!(root.rx_used(), 5);
+        assert_eq!(root.tx_used(), 5);
     }
 }

@@ -9714,9 +9714,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     }
 
     /// Effective budgeted TX attempt cap for the current control release (tightened monotonically
-    /// by the owner's [`crate::rt_core::budget::ReleaseBudget`]).
+    /// by the owner's [`crate::rt_core::budget::ReleaseBudget`] only while inside an active
+    /// managed control release; standalone off-tick driver operations use `self.tx_budget.max_frames`).
     #[inline]
     fn effective_tx_max_frames(&self) -> usize {
+        if !self.in_active_control_release() {
+            return self.tx_budget.max_frames;
+        }
         match self.release_tx_limit {
             Some(lim) => self.tx_budget.max_frames.min(usize::from(lim)),
             None => self.tx_budget.max_frames,

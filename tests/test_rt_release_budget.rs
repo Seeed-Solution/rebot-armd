@@ -563,3 +563,52 @@ async fn dual_owner_parity_under_tight_release_budget() {
         "legacy owner must stay within tight TX budget of 8 frames/tick (saw {leg_max_tx})"
     );
 }
+
+#[test]
+fn tightened_zero_tx_release_does_not_leak_to_standalone_driver_tx() {
+    use armd::driver::{JointTarget, TxBatchOutcome};
+
+    let clock = MockClock::new();
+    let (bus, mut drv, _cfg) = make_bus_and_driver(Some(clock.clone()), 16, true);
+    drv.set_torque(true).expect("enable torque");
+
+    // Simulate a managed release tightened to 0 TX attempts.
+    let t0 = clock.now();
+    drv.begin_control_release(42);
+    drv.set_tx_release_deadline(Some(t0 + Duration::from_millis(10)));
+    drv.sync_release_budget_limits(64, 0);
+    let targets = vec![JointTarget::position(0.0); 7];
+    bus.with(|s| s.tx_log.clear());
+    let in_rel = drv.write_joint_targets_bounded(&targets).unwrap();
+    assert!(
+        matches!(in_rel, TxBatchOutcome::Deferred { .. }),
+        "active release tightened to tx_limit=0 must defer TX, got {in_rel:?}"
+    );
+    assert_eq!(
+        bus.with(|s| s.tx_log.len()),
+        0,
+        "active release tightened to tx_limit=0 must emit 0 CAN TX frames"
+    );
+
+    // End the managed release window (`set_tx_release_deadline(None)`):
+    // standalone driver operations must immediately regain full `tx_budget.max_frames` (16),
+    // never starved by stale per-release tightening.
+    drv.set_tx_release_deadline(None);
+    clock.advance(Duration::from_millis(20));
+    bus.with(|s| {
+        s.tx_log.clear();
+        s.push_all_feedback();
+    });
+    let _ = drv.read_joint_states().unwrap();
+    let standalone = drv.write_joint_targets_bounded(&targets).unwrap();
+    assert_eq!(
+        standalone,
+        TxBatchOutcome::Complete,
+        "standalone TX after a zero-TX release must not inherit stale release_tx_limit"
+    );
+    assert_eq!(
+        bus.with(|s| s.tx_log.len()),
+        7,
+        "standalone TX must send all 7 motor frames"
+    );
+}
