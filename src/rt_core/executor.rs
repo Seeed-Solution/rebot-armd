@@ -8666,6 +8666,12 @@ impl ExecutorPersistBackend<'_> {
     /// fsync the directory, and report the outcome to the owner via `PersistCmd::Published`.
     /// A rename failure leaves the old file (restart loads the old calibration).
     fn publish_pending(&mut self, mirror_to_action: bool) -> PublishPendingResult {
+        if self.persist_stop.load(Ordering::Acquire)
+            || self.control_exited.load(Ordering::Acquire)
+            || self.cmd_tx.is_abandoned()
+        {
+            return PublishPendingResult::WorkerDisconnected;
+        }
         let Some(official) = self.official_path.clone() else {
             if !self.push_cmd_inner(
                 PersistCmd::Published {
@@ -11719,7 +11725,12 @@ fn control_thread_main_inner(
             }
             if let Some(action_id) = core_ref.zero_check_persisting.take() {
                 // `armd-persist` is stopping with this executor; do not hand back a running
-                // action or `zero_check_persisting` marker that Legacy cannot settle (0 alloc).
+                // action, `zero_check_persisting` marker, or pre-activation `.pending` hold that
+                // Legacy cannot settle (0 alloc).
+                core_ref
+                    .core
+                    .config_mut()
+                    .clear_orphaned_staged_hold(ConfigDomain::GripperCalibration);
                 if let Some(a) = core_ref
                     .last_action
                     .as_mut()

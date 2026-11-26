@@ -2313,9 +2313,12 @@ async fn two_phase_persistence_b1_race_persistence5_and_saturation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn handback_while_awaiting_publish_clears_zero_check_persisting_and_fails_action_closed() {
+    // (a) Handback after live activation, while awaiting `PersistCmd::Published`:
+    //     clears `zero_check_persisting`, fails the action closed, clears the session, and the
+    //     stopped worker must NOT rename `.pending` over the official file.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("gripper_calib.json");
-    let (sup, action_id) = prepare_zero_check_supervisor(path).await;
+    let (sup, action_id) = prepare_zero_check_supervisor(path.clone()).await;
     let (at_pause_tx, at_pause_rx) = mpsc::sync_channel::<()>(1);
     let (resume_tx, resume_rx) = mpsc::sync_channel::<()>(1);
     let resume_rx = Arc::new(Mutex::new(resume_rx));
@@ -2355,6 +2358,10 @@ async fn handback_while_awaiting_publish_clears_zero_check_persisting_and_fails_
             inner.zero_check_persisting.is_none(),
             "handback must clear zero_check_persisting so Legacy is not stranded in MOTION_BUSY"
         );
+        assert!(
+            !inner.core.motion_inhibited_by_config(),
+            "handback must not leave a config hold inhibiting motion on Legacy"
+        );
         let a = inner.last_action.as_ref().expect("last_action present");
         assert_eq!(a.id, action_id);
         assert_eq!(a.state, "failed", "{a:?}");
@@ -2368,9 +2375,65 @@ async fn handback_while_awaiting_publish_clears_zero_check_persisting_and_fails_
             "ExclusiveOutput session must be cleared on handback"
         );
     }
+    assert!(
+        !path.exists(),
+        "stopped worker must not rename .pending over the official file after handback"
+    );
 
     legacy_stop.store(true, Ordering::Release);
     let _ = legacy_join.join();
+
+    // (b) Handback before activation (after `.pending` staged, while `PersistedAwaitingActivation`
+    //     hold is active): clears the orphaned pre-activation hold on Legacy as well.
+    let dir_b = tempfile::tempdir().unwrap();
+    let path_b = dir_b.path().join("gripper_calib_pre_act.json");
+    let (sup_b, action_id_b) = prepare_zero_check_supervisor(path_b.clone()).await;
+    let (at_b_tx, at_b_rx) = mpsc::sync_channel::<()>(1);
+    let (resume_b_tx, resume_b_rx) = mpsc::sync_channel::<()>(1);
+    let resume_b_rx = Arc::new(Mutex::new(resume_b_rx));
+    let hooks_b = PersistTestHooks {
+        after_rename_before_activate: Some(Arc::new(move || {
+            let _ = at_b_tx.send(());
+            let _ = resume_b_rx.lock().unwrap().recv();
+            false
+        })),
+        ..Default::default()
+    };
+    let h_b = sup_b
+        .start_executor_with_hooks(ExecutorConfig::for_tests(Duration::from_millis(5)), hooks_b)
+        .await
+        .unwrap();
+
+    tokio::task::spawn_blocking(move || at_b_rx.recv_timeout(Duration::from_secs(5)).unwrap())
+        .await
+        .unwrap();
+    let resume_b_handle = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let _ = resume_b_tx.send(());
+    });
+    let (legacy_stop_b, legacy_join_b) = sup_b
+        .handback_to_legacy_with_live_loop(Duration::from_secs(3), Duration::from_millis(5))
+        .await
+        .expect("handback to legacy must succeed before activation");
+    resume_b_handle.await.unwrap();
+    h_b.stop_and_join();
+
+    {
+        let inner = sup_b.inner().read().await;
+        assert!(inner.zero_check_persisting.is_none());
+        assert!(
+            !inner.core.motion_inhibited_by_config(),
+            "handback before activation must clear orphaned staged GripperCalibration hold"
+        );
+        let a = inner.last_action.as_ref().expect("last_action present");
+        assert_eq!(a.id, action_id_b);
+        assert_eq!(a.state, "failed", "{a:?}");
+        assert_eq!(a.code.as_deref(), Some("PERSIST_FAILED"), "{a:?}");
+    }
+    assert!(!path_b.exists(), "unactivated candidate must never reach the official path");
+
+    legacy_stop_b.store(true, Ordering::Release);
+    let _ = legacy_join_b.join();
 }
 
 // ============================================================================

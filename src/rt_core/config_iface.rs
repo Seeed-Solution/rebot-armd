@@ -368,6 +368,25 @@ impl ConfigHold {
         }
     }
 
+    /// Clears a pre-activation hold (`Reserved` or `PersistedAwaitingActivation`) for `domain`
+    /// when the executor hands ownership back to Legacy and its persistence worker is stopping
+    /// (the candidate was only staged at `.pending`, so the official file is intact). Never
+    /// clears `HoldState::Reconciling` or another domain.
+    pub fn clear_orphaned_staged_hold(&mut self, domain: ConfigDomain) -> bool {
+        if self.held.is_some_and(|h| {
+            h.domain == domain
+                && matches!(
+                    h.state,
+                    HoldState::Reserved | HoldState::PersistedAwaitingActivation { .. }
+                )
+        }) {
+            self.held = None;
+            self.marker_bound_grant = None;
+            return true;
+        }
+        false
+    }
+
     /// Start-up reconciliation of `domain` (replaces nothing: false when another hold exists).
     pub fn begin_reconcile(&mut self, domain: ConfigDomain, active: u64) -> bool {
         match &mut self.held {
