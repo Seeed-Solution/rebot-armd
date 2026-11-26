@@ -2702,10 +2702,10 @@ fn mit_expiry_recovery_final_check_uses_post_recovery_feedback() {
         bus.with(|s| {
             s.motors[0].q = cfg.home_positions[0];
             s.on_disable_state = Some(Arc::new(move |st| {
-                // R10 disable sends 3 repeats x 7 motors = 21 CMD_DISABLE frames.
-                // Move J0 over limit on the 15th frame (J0 on the 3rd/final pass) so
-                // passes 1-2 pass Rule A' at rest and post-recovery feedback reports over_limit.
-                if disable_frames_cb.fetch_add(1, Ordering::Relaxed) + 1 >= 15 {
+                // R10/PR2-LEDGER disable sends 1 CMD_DISABLE per motor (7 total, followed by
+                // causal barrier + 0xCC refresh). Move J0 over limit on the 7th/final disable
+                // frame so post-recovery feedback reports over_limit and clear refuses.
+                if disable_frames_cb.fetch_add(1, Ordering::Relaxed) + 1 >= 7 {
                     st.motors[0].q = over_limit;
                 }
             }));
@@ -3801,6 +3801,13 @@ fn mit_recovery_final_read_rejects_cached_feedback_without_post_recovery_rx_seq(
             self.recovered_called.store(true, Ordering::SeqCst);
             // Intentionally does NOT advance `self.seqs` (simulates stale/cached readback).
             Ok(())
+        }
+        fn mit_expiry_recover_with_gate(
+            &mut self,
+            pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+        ) -> Result<(), String> {
+            pre_tx_gate().map_err(|e| e.to_string())?;
+            self.mit_expiry_recover()
         }
     }
 

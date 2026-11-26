@@ -573,8 +573,23 @@ impl LiveRig {
     }
 
     fn clear_bus_log(&self) {
-        self.bus.clear_log();
-        self.tx_wall_times.lock().unwrap().clear();
+        self.bus.with(|s| {
+            let mut times = self.tx_wall_times.lock().unwrap();
+            s.tx_log.clear();
+            s.tx_times.clear();
+            times.clear();
+        });
+    }
+
+    fn snapshot_bus_log(&self) -> (Vec<CanFrame>, Vec<Option<(Instant, u64)>>, usize, bool) {
+        self.bus.with(|s| {
+            let times = self.tx_wall_times.lock().unwrap();
+            s.run_watchdogs();
+            let exp: usize = s.motors.iter().map(|m| m.watchdog_expiry_count).sum();
+            let en = s.motors.iter().all(|m| m.enabled);
+            let tx_meta: Vec<Option<(Instant, u64)>> = times.iter().copied().map(Some).collect();
+            (s.tx_log.clone(), tx_meta, exp, en)
+        })
     }
 
     fn assert_rt_clean(&self, context: &str) {
@@ -1112,20 +1127,7 @@ async fn dual_owner_ws_gravity_comp_hardware_lifecycle_and_auth_parity() {
         assert_eq!(ack_reexit["control_mode"], "position", "{owner:?}: {ack_reexit}");
 
         let audit_end = Instant::now();
-        let (tx_log, expiries, all_enabled) = rig.bus.with(|s| {
-            s.run_watchdogs();
-            let exp: usize = s.motors.iter().map(|m| m.watchdog_expiry_count).sum();
-            let en = s.motors.iter().all(|m| m.enabled);
-            (s.tx_log.clone(), exp, en)
-        });
-        let tx_meta: Vec<Option<(Instant, u64)>> = rig
-            .tx_wall_times
-            .lock()
-            .unwrap()
-            .iter()
-            .copied()
-            .map(Some)
-            .collect();
+        let (tx_log, tx_meta, expiries, all_enabled) = rig.snapshot_bus_log();
         assert_eq!(expiries, 0, "{owner:?}: 0 Damiao TIMEOUT=2000 watchdog expiries allowed");
         assert!(all_enabled, "{owner:?}: all motors must stay enabled");
 
@@ -3999,11 +4001,18 @@ fn mit_expiry_recover_causal_confirmation_and_flush_failure_retry() {
         assert!(inner.with(|s| s.motors.iter().all(|m| !m.enabled && m.state_override.is_none())));
     }
 
-    // (c) R1 Blocker 2: Delayed-wire transport (`flush_is_noop() == true`) separating host
-    //     `transmit()` enqueue from actual wire delivery to motors. A delayed `state == 0`
-    //     feedback arriving strictly AFTER host `tx_at` while `CMD_DISABLE` + `REG_READ(RID_CTRL_MODE)`
-    //     are still queued in `pending_wire` MUST NOT falsely commit; only after `CMD_DISABLE` +
-    //     barrier + `0xCC` are delivered onto the wire does recovery commit.
+    // (c) R1 Blocker 2 + R2 Blocker 1: Delayed-wire transport (`flush_is_noop() == true`)
+    //     separating host `transmit()` enqueue from actual wire delivery to motors.
+    //     Verifies:
+    //     1. Delayed `state == 0` feedback after host `tx_at` while `CMD_DISABLE` + barrier sit
+    //        in `pending_wire` MUST NOT commit.
+    //     2. Older pre-TX matching `REG_READ(RID_CTRL_MODE)` reply (timestamp strictly before
+    //        `b_tx_at`) injected while `CMD_DISABLE` is still queued MUST be rejected as
+    //        `Ambiguous` by `harvest_mit_expiry_barrier_acks_into` and MUST NOT commit.
+    //     3. Selective delivery of `CMD_CLEAR_FAULTS` + `CMD_DISABLE` without barrier MUST NOT commit.
+    //     4. Delivering barrier `REG_READ(RID_CTRL_MODE)` while `0xCC` stays queued in
+    //        `pending_wire` MUST NOT commit even if `state == 0` feedback advances past
+    //        `barrier_ack_seq` BEFORE the explicit post-barrier `0xCC` reaches wire and replies.
     {
         #[derive(Clone)]
         struct DelayedWireBus {
@@ -4013,13 +4022,28 @@ fn mit_expiry_recover_causal_confirmation_and_flush_failure_retry() {
         }
 
         impl DelayedWireBus {
-            fn deliver_wire(&mut self) -> usize {
-                let frames: Vec<CanFrame> = self.pending_wire.lock().unwrap().drain(..).collect();
-                let n = frames.len();
-                for f in frames {
+            fn deliver_only_matching(&mut self, mut pred: impl FnMut(&CanFrame) -> bool) -> usize {
+                let mut q = self.pending_wire.lock().unwrap();
+                let mut matched = Vec::new();
+                let mut kept = VecDeque::with_capacity(q.len());
+                while let Some(f) = q.pop_front() {
+                    if pred(&f) {
+                        matched.push(f);
+                    } else {
+                        kept.push_back(f);
+                    }
+                }
+                *q = kept;
+                drop(q);
+                let n = matched.len();
+                for f in matched {
                     self.inner.transmit(&f).unwrap();
                 }
                 n
+            }
+
+            fn deliver_wire(&mut self) -> usize {
+                self.deliver_only_matching(|_| true)
             }
         }
 
@@ -4098,6 +4122,9 @@ fn mit_expiry_recover_causal_confirmation_and_flush_failure_retry() {
         // Switch to delayed-wire mode: host transmit() enqueues into `pending_wire` only.
         hold_wire.store(true, Ordering::Release);
         clock.advance(Duration::from_millis(25));
+        // Timestamp strictly BEFORE release 4's `b_tx_at`.
+        let pre_b_tx_ts = clock.now();
+        clock.advance(Duration::from_millis(1));
         drv.begin_control_release(4);
         inner.with(|s| s.push_all_feedback());
         drv.read_joint_states().unwrap();
@@ -4124,7 +4151,7 @@ fn mit_expiry_recover_causal_confirmation_and_flush_failure_retry() {
         );
         assert!(
             inner.with(|s| s.motors.iter().enumerate().all(|(i, m)| i == 3 || m.enabled)),
-            "motors must still be enabled on wire before deliver_wire()"
+            "motors must still be enabled on wire before deliver_only_matching"
         );
 
         // Advance clock by 2 ms (strictly AFTER host `tx_at`!) and inject delayed `state == 0`
@@ -4158,17 +4185,119 @@ fn mit_expiry_recover_causal_confirmation_and_flush_failure_retry() {
         );
         assert!(inner.with(|s| s.rx.is_empty()), "all 7 delayed state==0 frames must be drained");
 
-        // Deliver ONLY ClearFault + CMD_DISABLE + REG_READ(RID_CTRL_MODE) -> 0x33 barrier replies arrive,
-        // release 6 enqueues 0xCC refreshes (still held in pending_wire) -> MUST still return Ok(false)!
-        assert_eq!(bus.deliver_wire(), 15);
+        // R2 Blocker 1a: Inject older pre-TX matching REG_READ(RID_CTRL_MODE) replies
+        // (timestamp `pre_b_tx_ts < b_tx_at`) while `CMD_DISABLE` is still queued ->
+        // `harvest_mit_expiry_barrier_acks_into` rejects as Ambiguous and MUST NOT commit!
         clock.advance(Duration::from_millis(2));
+        let post_pre_reg_fb_ts = clock.now();
+        inner.with(|s| {
+            let reg_reps: Vec<CanFrame> = s
+                .motors
+                .iter()
+                .map(|m| {
+                    let [lo, hi] = m.id.to_le_bytes();
+                    let val = m.ctrl_mode().to_le_bytes();
+                    CanFrame::new_standard(
+                        m.reply_id,
+                        &[lo, hi, damiao::REG_READ, damiao::RID_CTRL_MODE, val[0], val[1], val[2], val[3]],
+                    )
+                    .unwrap()
+                })
+                .collect();
+            for reg_rep in reg_reps {
+                s.push_rx_at(reg_rep, Some(pre_b_tx_ts));
+            }
+            let mut fb_frames = Vec::with_capacity(s.motors.len());
+            for m in s.motors.iter_mut() {
+                let prev_en = m.enabled;
+                let prev_ovr = m.state_override;
+                m.enabled = false;
+                m.state_override = None;
+                fb_frames.push(m.feedback_frame());
+                m.enabled = prev_en;
+                m.state_override = prev_ovr;
+            }
+            for fb in fb_frames {
+                s.push_rx_at(fb, Some(post_pre_reg_fb_ts));
+            }
+        });
         drv.begin_control_release(6);
         drv.read_joint_states().unwrap();
         let dl6 = clock.now() + Duration::from_millis(500);
         drv.set_tx_release_deadline(Some(dl6));
         let r6 = drv.mit_expiry_recover_budgeted(dl6, started_at, &mut gate).unwrap();
         drv.set_tx_release_deadline(None);
-        assert!(!r6, "recovery must not commit while 0xCC refreshes still sit in pending_wire");
+        assert!(
+            !r6,
+            "pre-TX RID_CTRL_MODE reply (rx_at < b_tx_at) must be rejected as Ambiguous and NOT commit"
+        );
+        // Remove the superseded Release 4 CMD_DISABLE (7) and REG_READ(RID_CTRL_MODE) (7)
+        // frames from the front of `pending_wire` (keeping ClearFault for J4), leaving
+        // Release 6's fresh 7 CMD_DISABLE + 7 REG_READ barrier frames on the wire.
+        {
+            let mut q = pending_wire.lock().unwrap();
+            let mut drop_dis = 7usize;
+            let mut drop_reg = 7usize;
+            let mut kept = VecDeque::with_capacity(q.len());
+            while let Some(f) = q.pop_front() {
+                if f.data == damiao::CMD_DISABLE && drop_dis > 0 {
+                    drop_dis -= 1;
+                } else if f.id == 0x7FF
+                    && f.data[2] == damiao::REG_READ
+                    && f.data[3] == damiao::RID_CTRL_MODE
+                    && drop_reg > 0
+                {
+                    drop_reg -= 1;
+                } else {
+                    kept.push_back(f);
+                }
+            }
+            *q = kept;
+        }
+        // Deliver ONLY ClearFault + CMD_DISABLE onto wire while holding barriers in pending_wire.
+        let delivered_dis = bus.deliver_only_matching(|f| {
+            f.data == damiao::CMD_CLEAR_FAULTS || f.data == damiao::CMD_DISABLE
+        });
+        assert_eq!(delivered_dis, 8, "1 ClearFault + 7 CMD_DISABLE must be delivered onto wire");
+        clock.advance(Duration::from_millis(2));
+        drv.begin_control_release(7);
+        drv.read_joint_states().unwrap();
+        let dl7 = clock.now() + Duration::from_millis(500);
+        drv.set_tx_release_deadline(Some(dl7));
+        let r7 = drv.mit_expiry_recover_budgeted(dl7, started_at, &mut gate).unwrap();
+        drv.set_tx_release_deadline(None);
+        assert!(
+            !r7,
+            "recovery must not commit while barrier REG_READ(RID_CTRL_MODE) stays queued in pending_wire"
+        );
+
+        // Deliver ONLY REG_READ(RID_CTRL_MODE) barrier frames -> 0x33 replies arrive, AND
+        // push `state == 0` feedback AFTER the 0x33 replies (so `last_feedback_seq` advances past
+        // `barrier_ack_seq` BEFORE 0xCC is sent!). Release 8 still MUST enqueue 0xCC refreshes
+        // (held in pending_wire) and return Ok(false)!
+        let delivered_bar = bus.deliver_only_matching(|f| {
+            f.id == 0x7FF && f.data[2] == damiao::REG_READ && f.data[3] == damiao::RID_CTRL_MODE
+        });
+        assert!(delivered_bar >= 7, "barrier REG_READ(RID_CTRL_MODE) must be delivered onto wire");
+        clock.advance(Duration::from_millis(1));
+        let pre_cc_fb_ts = clock.now();
+        inner.with(|s| {
+            for i in 0..s.motors.len() {
+                let fb = s.motors[i].feedback_frame();
+                s.push_rx_at(fb, Some(pre_cc_fb_ts));
+            }
+        });
+        clock.advance(Duration::from_millis(1));
+        drv.begin_control_release(8);
+        drv.read_joint_states().unwrap();
+        let dl8 = clock.now() + Duration::from_millis(500);
+        drv.set_tx_release_deadline(Some(dl8));
+        let r8 = drv.mit_expiry_recover_budgeted(dl8, started_at, &mut gate).unwrap();
+        drv.set_tx_release_deadline(None);
+        assert!(
+            !r8,
+            "recovery must not commit when state==0 advanced past barrier_ack_seq while 0xCC sits in pending_wire"
+        );
         assert_eq!(
             pending_wire
                 .lock()
@@ -4180,17 +4309,285 @@ fn mit_expiry_recover_causal_confirmation_and_flush_failure_retry() {
             "7 0xCC post-barrier refreshes must be queued in pending_wire"
         );
 
-        // Now deliver 0xCC refreshes onto wire -> post-barrier state==0 feedback arrives -> Ok(true)!
+        // R2 Blocker 1b: Even if a delayed pre-0xCC `state == 0` feedback arrives after
+        // `ref_tx_seq` (with `rx_at == pre_cc_fb_ts < ref_tx_at`) while `0xCC` stays queued
+        // in `pending_wire`, recovery MUST NOT commit!
+        clock.advance(Duration::from_millis(2));
+        inner.with(|s| {
+            for i in 0..s.motors.len() {
+                let fb = s.motors[i].feedback_frame();
+                s.push_rx_at(fb, Some(pre_cc_fb_ts));
+            }
+        });
+        drv.begin_control_release(9);
+        drv.read_joint_states().unwrap();
+        let dl9 = clock.now() + Duration::from_millis(500);
+        drv.set_tx_release_deadline(Some(dl9));
+        let r9 = drv.mit_expiry_recover_budgeted(dl9, started_at, &mut gate).unwrap();
+        drv.set_tx_release_deadline(None);
+        assert!(
+            !r9,
+            "delayed pre-0xCC state==0 feedback arriving before post-barrier 0xCC delivery MUST NOT commit"
+        );
+        assert_eq!(
+            pending_wire
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|f| f.id == 0x7FF && f.data[2] == 0xCC)
+                .count(),
+            7,
+            "0xCC probes must still be pending on wire"
+        );
+
+        // Now deliver 0xCC refreshes onto wire -> post-refresh state==0 feedback arrives -> Ok(true)!
         assert_eq!(bus.deliver_wire(), 7);
         clock.advance(Duration::from_millis(2));
-        drv.begin_control_release(7);
+        drv.begin_control_release(10);
         drv.read_joint_states().unwrap();
-        let dl7 = clock.now() + Duration::from_millis(500);
-        drv.set_tx_release_deadline(Some(dl7));
-        let r7 = drv.mit_expiry_recover_budgeted(dl7, started_at, &mut gate).unwrap();
+        let dl10 = clock.now() + Duration::from_millis(500);
+        drv.set_tx_release_deadline(Some(dl10));
+        let r10 = drv.mit_expiry_recover_budgeted(dl10, started_at, &mut gate).unwrap();
         drv.set_tx_release_deadline(None);
-        assert!(r7, "recovery must commit once post-barrier 0xCC reaches wire and confirms state==0");
+        assert!(r10, "recovery must commit once post-barrier 0xCC reaches wire and confirms state==0");
         assert!(inner.with(|s| s.motors.iter().all(|m| !m.enabled && m.state_override.is_none())));
+    }
+
+    // (d) R2 Major 2: Dropped barrier REG_READ(RID_CTRL_MODE) reply & dropped 0xCC status refresh
+    //     reply are retried after 50 ms (`REGISTER_REPLY_TIMEOUT`) and complete cleanly.
+    {
+        #[derive(Clone)]
+        struct DropOnceReplyBus {
+            inner: FakeBus,
+            drop_reg_read_motor_once: Arc<Mutex<Option<u16>>>,
+            drop_cc_motor_once: Arc<Mutex<Option<u16>>>,
+        }
+
+        impl CanTransport for DropOnceReplyBus {
+            fn clock(&self) -> Option<Arc<dyn DriverClock>> {
+                self.inner.clock()
+            }
+            fn rx_clock_now(&self) -> Option<CanRxTime> {
+                self.inner.rx_clock_now()
+            }
+            fn rx_clock_sample(&self) -> Option<RxClockSample> {
+                self.inner.rx_clock_sample()
+            }
+            fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
+                if frame.id == 0x7FF {
+                    let mid = u16::from_le_bytes([frame.data[0], frame.data[1]]);
+                    let drop_reg = frame.data[2] == damiao::REG_READ
+                        && frame.data[3] == damiao::RID_CTRL_MODE
+                        && self
+                            .drop_reg_read_motor_once
+                            .lock()
+                            .unwrap()
+                            .take_if(|id| *id == mid)
+                            .is_some();
+                    let drop_cc = frame.data[2] == 0xCC
+                        && self
+                            .drop_cc_motor_once
+                            .lock()
+                            .unwrap()
+                            .take_if(|id| *id == mid)
+                            .is_some();
+                    if drop_reg || drop_cc {
+                        self.inner.with(|s| {
+                            let t = s.now();
+                            s.tx_log.push(*frame);
+                            s.tx_times.push(t);
+                        });
+                        return Ok(());
+                    }
+                }
+                self.inner.transmit(frame)
+            }
+            fn receive(&mut self) -> Result<CanFrame, TransportError> {
+                self.inner.receive()
+            }
+            fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<Instant>), TransportError> {
+                self.inner.receive_timestamped()
+            }
+            fn receive_with_rx_time(&mut self) -> Result<(CanFrame, Option<CanRxTime>), TransportError> {
+                self.inner.receive_with_rx_time()
+            }
+            fn flush(&mut self) -> Result<(), TransportError> {
+                self.inner.flush()
+            }
+            fn supports_bounded_flush(&self) -> bool {
+                self.inner.supports_bounded_flush()
+            }
+            fn supports_nonblocking_rt(&self) -> bool {
+                self.inner.supports_nonblocking_rt()
+            }
+            fn flush_is_noop(&self) -> bool {
+                self.inner.flush_is_noop()
+            }
+        }
+
+        // Subcase (d1): Drop 1 REG_READ(RID_CTRL_MODE) barrier reply for J4 (motor_id=4) once.
+        {
+            let clock = MockClock::new();
+            let inner = FakeBus::with_clock(&limits, clock.clone());
+            inner.with(|s| {
+                s.poll_feeds_watchdog = false;
+                s.immediate_replies = true;
+                for (i, m) in s.motors.iter_mut().enumerate() {
+                    m.q = rest[i];
+                    m.v = 0.0;
+                    m.enabled = i != 3;
+                    if i == 3 {
+                        m.state_override = Some(0xD);
+                    }
+                }
+                s.push_all_feedback();
+            });
+            let drop_reg = Arc::new(Mutex::new(None));
+            let bus = DropOnceReplyBus {
+                inner: inner.clone(),
+                drop_reg_read_motor_once: Arc::clone(&drop_reg),
+                drop_cc_motor_once: Arc::new(Mutex::new(None)),
+            };
+            let mut drv = build_standalone_mit_recovery_driver(bus, &rest);
+            let started_at = clock.now();
+            for rel in 1..=3 {
+                clock.advance(Duration::from_millis(25));
+                drv.begin_control_release(rel);
+                inner.with(|s| s.push_all_feedback());
+                drv.read_joint_states().unwrap();
+            }
+
+            inner.clear_log();
+            *drop_reg.lock().unwrap() = Some(4);
+            clock.advance(Duration::from_millis(25));
+            drv.begin_control_release(4);
+            inner.with(|s| s.push_all_feedback());
+            drv.read_joint_states().unwrap();
+            let dl4 = clock.now() + Duration::from_millis(500);
+            let mut gate = || Ok(());
+            drv.set_tx_release_deadline(Some(dl4));
+            let r4 = drv.mit_expiry_recover_budgeted(dl4, started_at, &mut gate).unwrap();
+            drv.set_tx_release_deadline(None);
+            assert!(!r4, "dropped J4 barrier reply must prevent premature commit");
+
+            // Advance past 50 ms (`REGISTER_REPLY_TIMEOUT`) so J4 barrier read retries.
+            clock.advance(Duration::from_millis(55));
+            let mut finished = false;
+            for rel in 5..=8 {
+                if rel > 5 {
+                    clock.advance(Duration::from_millis(5));
+                }
+                drv.begin_control_release(rel);
+                inner.with(|s| s.push_all_feedback());
+                drv.read_joint_states().unwrap();
+                let dl = clock.now() + Duration::from_millis(500);
+                drv.set_tx_release_deadline(Some(dl));
+                let r = drv.mit_expiry_recover_budgeted(dl, started_at, &mut gate).unwrap();
+                drv.set_tx_release_deadline(None);
+                if r {
+                    finished = true;
+                    break;
+                }
+            }
+            assert!(finished, "J4 barrier read retry after 50 ms timeout must complete recovery");
+            let j4_barrier_reads = inner.with(|s| {
+                s.tx_log
+                    .iter()
+                    .filter(|f| {
+                        f.id == 0x7FF
+                            && u16::from_le_bytes([f.data[0], f.data[1]]) == 4
+                            && f.data[2] == damiao::REG_READ
+                            && f.data[3] == damiao::RID_CTRL_MODE
+                    })
+                    .count()
+            });
+            assert_eq!(
+                j4_barrier_reads, 2,
+                "J4 barrier REG_READ(RID_CTRL_MODE) must be retried exactly once after 50 ms timeout"
+            );
+            assert!(inner.with(|s| s.motors.iter().all(|m| !m.enabled && m.state_override.is_none())));
+        }
+
+        // Subcase (d2): Drop 1 post-barrier 0xCC refresh reply for J4 (motor_id=4) once.
+        {
+            let clock = MockClock::new();
+            let inner = FakeBus::with_clock(&limits, clock.clone());
+            inner.with(|s| {
+                s.poll_feeds_watchdog = false;
+                s.immediate_replies = true;
+                for (i, m) in s.motors.iter_mut().enumerate() {
+                    m.q = rest[i];
+                    m.v = 0.0;
+                    m.enabled = i != 3;
+                    if i == 3 {
+                        m.state_override = Some(0xD);
+                    }
+                }
+                s.push_all_feedback();
+            });
+            let drop_cc = Arc::new(Mutex::new(None));
+            let bus = DropOnceReplyBus {
+                inner: inner.clone(),
+                drop_reg_read_motor_once: Arc::new(Mutex::new(None)),
+                drop_cc_motor_once: Arc::clone(&drop_cc),
+            };
+            let mut drv = build_standalone_mit_recovery_driver(bus, &rest);
+            let started_at = clock.now();
+            for rel in 1..=3 {
+                clock.advance(Duration::from_millis(10));
+                drv.begin_control_release(rel);
+                inner.with(|s| s.push_all_feedback());
+                drv.read_joint_states().unwrap();
+            }
+
+            inner.clear_log();
+            *drop_cc.lock().unwrap() = Some(4);
+            clock.advance(Duration::from_millis(10));
+            drv.begin_control_release(4);
+            inner.with(|s| s.push_all_feedback());
+            drv.read_joint_states().unwrap();
+            let dl4 = clock.now() + Duration::from_millis(500);
+            let mut gate = || Ok(());
+            drv.set_tx_release_deadline(Some(dl4));
+            let r4 = drv.mit_expiry_recover_budgeted(dl4, started_at, &mut gate).unwrap();
+            drv.set_tx_release_deadline(None);
+            assert!(!r4, "release 4 runs ClearFault + Disable + Barrier (15 frames), pending 0xCC");
+
+            clock.advance(Duration::from_millis(2));
+            drv.begin_control_release(5);
+            drv.read_joint_states().unwrap();
+            let dl5 = clock.now() + Duration::from_millis(500);
+            drv.set_tx_release_deadline(Some(dl5));
+            let r5 = drv.mit_expiry_recover_budgeted(dl5, started_at, &mut gate).unwrap();
+            drv.set_tx_release_deadline(None);
+            assert!(!r5, "dropped J4 0xCC refresh reply must prevent commit on release 5");
+
+            // Advance past 50 ms (`REGISTER_REPLY_TIMEOUT`) without injecting unsolicited J4 feedback,
+            // so ONLY J4's retried 0xCC refresh can satisfy post-refresh causality.
+            clock.advance(Duration::from_millis(55));
+            drv.begin_control_release(6);
+            drv.read_joint_states().unwrap();
+            let dl6 = clock.now() + Duration::from_millis(500);
+            drv.set_tx_release_deadline(Some(dl6));
+            let r6 = drv.mit_expiry_recover_budgeted(dl6, started_at, &mut gate).unwrap();
+            drv.set_tx_release_deadline(None);
+            assert!(r6, "J4 0xCC retry after 50 ms timeout must complete recovery");
+            let j4_cc_count = inner.with(|s| {
+                s.tx_log
+                    .iter()
+                    .filter(|f| {
+                        f.id == 0x7FF
+                            && u16::from_le_bytes([f.data[0], f.data[1]]) == 4
+                            && f.data[2] == 0xCC
+                    })
+                    .count()
+            });
+            assert_eq!(
+                j4_cc_count, 2,
+                "J4 post-barrier 0xCC must be retried exactly once after 50 ms timeout"
+            );
+            assert!(inner.with(|s| s.motors.iter().all(|m| !m.enabled && m.state_override.is_none())));
+        }
     }
 }
 
@@ -4819,6 +5216,44 @@ async fn dual_owner_mit_recovery_authority_revocation_and_new_estop_abort() {
             rig.shutdown().await;
         }
     }
+
+    // R2 Major 1: A driver implementing only legacy `mit_expiry_recover()` without
+    // overriding `mit_expiry_recover_with_gate()` MUST fail closed (never fall back
+    // to ungated recovery).
+    {
+        struct LegacyOnlyMitRecoverDriver {
+            legacy_called: Arc<AtomicBool>,
+        }
+        impl ArmDriver for LegacyOnlyMitRecoverDriver {
+            fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+                Ok(Vec::new())
+            }
+            fn write_joint_targets(&mut self, _targets: &[JointTarget]) -> Result<(), ArmDriverError> {
+                Ok(())
+            }
+            fn set_torque(&mut self, _enabled: bool) -> Result<(), ArmDriverError> {
+                Ok(())
+            }
+            fn mit_expiry_recover(&mut self) -> Result<(), String> {
+                self.legacy_called.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        let legacy_called = Arc::new(AtomicBool::new(false));
+        let mut drv = LegacyOnlyMitRecoverDriver {
+            legacy_called: Arc::clone(&legacy_called),
+        };
+        let mut gate = || Ok(());
+        let res = drv.mit_expiry_recover_with_gate(&mut gate);
+        assert!(
+            res.is_err(),
+            "mit_expiry_recover_with_gate default must fail closed when not overridden, got {res:?}"
+        );
+        assert!(
+            !legacy_called.load(Ordering::SeqCst),
+            "default mit_expiry_recover_with_gate must NOT call ungated mit_expiry_recover()"
+        );
+    }
 }
 
 // ============================================================================
@@ -5373,6 +5808,11 @@ async fn executor_whole_release_and_wake_zero_alloc_lock_stalled_consumers_gravi
     rig.bus.with(|s| {
         s.follow_commands = true;
     });
+    let retired_before_7a = {
+        let mut b = exec.broker().lock().unwrap();
+        b.reclaim_plans();
+        b.stats().retired
+    };
     let ep_ret = rig.sup.get_observation().await.epoch_id;
     let mut jog_t = rest.to_vec();
     jog_t[0] += 0.02;
@@ -5390,11 +5830,29 @@ async fn executor_whole_release_and_wake_zero_alloc_lock_stalled_consumers_gravi
 
     let seq_ret0 = rig.sup.hub().published_seq();
     let (rel_ret, jh_ret) = pause_hub(&rig.sup);
-    let dl_ret = Instant::now() + Duration::from_secs(2);
-    while rig.sup.hub().published_seq() < seq_ret0 + 8 {
-        assert!(Instant::now() < dl_ret);
+    let dl_ret = Instant::now() + Duration::from_secs(3);
+    while rig.sup.hub().published_seq() < seq_ret0 + 16
+        || {
+            let mut b = exec.broker().lock().unwrap();
+            b.reclaim_plans();
+            b.stats().retired <= retired_before_7a
+        }
+    {
+        assert!(
+            Instant::now() < dl_ret,
+            "jog action {jog_action_id} did not finish and retire while StateHub reader_guard was held"
+        );
         tokio::time::sleep(Duration::from_millis(15)).await;
     }
+    let retired_during_stall = {
+        let mut b = exec.broker().lock().unwrap();
+        b.reclaim_plans();
+        b.stats().retired
+    };
+    assert!(
+        retired_during_stall > retired_before_7a,
+        "jog action {jog_action_id} plan must retire in broker strictly BEFORE dropping StateHub::reader_guard() ({retired_during_stall} vs {retired_before_7a})"
+    );
     rel_ret.send(()).unwrap();
     jh_ret.join().unwrap();
 
@@ -5413,8 +5871,9 @@ async fn executor_whole_release_and_wake_zero_alloc_lock_stalled_consumers_gravi
         tokio::time::sleep(Duration::from_millis(15)).await;
     }
 
-    // (b) Stalled router sink (`DeliveryDecision::Backpressured`): verify exact terminal
-    //     retirement into `reply_router` happens BEFORE `stall_sink` is released!
+    // (b) Stalled router sink (`DeliveryDecision::Backpressured`): verify exact `stall_action_id`
+    //     is observed in `backpressured_ids` and retired BEFORE `stall_sink` is released, and
+    //     that exact `stall_action_id` is delivered after releasing backpressure!
     let _ = ws_send_wait_types(
         &mut ws,
         json!({"type": "release_lease", "client_id": "whole-rel-gc-mit", "generation": gen, "seq": 11}),
@@ -5426,6 +5885,8 @@ async fn executor_whole_release_and_wake_zero_alloc_lock_stalled_consumers_gravi
         exec.open_connection_sync(910).unwrap().unwrap();
         let stall_sink = Arc::new(AtomicBool::new(true));
         let stall_cb = Arc::clone(&stall_sink);
+        let backpressured_ids = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let backpressured_cb = Arc::clone(&backpressured_ids);
         let delivered_ids = Arc::new(Mutex::new(Vec::<u64>::new()));
         let delivered_cb = Arc::clone(&delivered_ids);
         let _stall_guard = exec
@@ -5433,9 +5894,12 @@ async fn executor_whole_release_and_wake_zero_alloc_lock_stalled_consumers_gravi
                 client_stall,
                 Arc::new(move |_, reply| {
                     if stall_cb.load(Ordering::Acquire) {
+                        if let Reply::Terminal { action, .. } = reply {
+                            backpressured_cb.lock().unwrap().push(action.0);
+                        }
                         return DeliveryDecision::Backpressured;
                     }
-                    if let armd::rt_core::broker::Reply::Terminal { action, .. } = reply {
+                    if let Reply::Terminal { action, .. } = reply {
                         delivered_cb.lock().unwrap().push(action.0);
                     }
                     DeliveryDecision::Delivered
@@ -5513,15 +5977,20 @@ async fn executor_whole_release_and_wake_zero_alloc_lock_stalled_consumers_gravi
             exec.pump_broker_replies();
             let ret_now = exec.broker().lock().unwrap().stats().retired;
             let st_now = exec.reply_router_stats();
-            if ret_now > retired_before && st_now.pending_external_deliveries > 0 {
+            let bp_seen = backpressured_ids.lock().unwrap().contains(&stall_action_id);
+            if ret_now > retired_before && st_now.pending_external_deliveries > 0 && bp_seen {
                 break;
             }
             assert!(
                 Instant::now() < dl_retire,
-                "jog action {stall_action_id} terminal did not retire while router sink stalled (retired {ret_now} vs {retired_before}, st={st_now:?})"
+                "action {stall_action_id} terminal did not hit Backpressured and retire while router sink stalled (retired {ret_now} vs {retired_before}, st={st_now:?})"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        assert!(
+            backpressured_ids.lock().unwrap().contains(&stall_action_id),
+            "exact target action_id {stall_action_id} must be observed in backpressured_ids STRICTLY BEFORE releasing backpressure"
+        );
         assert!(
             delivered_ids.lock().unwrap().is_empty(),
             "terminal must NOT be delivered while router sink returns Backpressured"
@@ -5532,7 +6001,7 @@ async fn executor_whole_release_and_wake_zero_alloc_lock_stalled_consumers_gravi
         let dl_deliv = Instant::now() + Duration::from_secs(2);
         while !delivered_ids.lock().unwrap().contains(&stall_action_id) {
             exec.pump_broker_replies();
-            assert!(Instant::now() < dl_deliv, "jog action {stall_action_id} terminal was not delivered after un-stall");
+            assert!(Instant::now() < dl_deliv, "action {stall_action_id} terminal was not delivered after un-stall");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(exec.reply_router_stats().terminals_delivered > delivered_before);
@@ -5580,6 +6049,15 @@ async fn executor_whole_release_and_wake_zero_alloc_lock_stalled_consumers_gravi
                     s = next;
                 }
             }
+            fn step_if_parked(&self, period_ns: u64) {
+                let mut s = self.state.lock().unwrap();
+                if let Some(parked) = s.2 {
+                    s.1 = parked;
+                } else {
+                    s.1 = s.1.saturating_add(period_ns);
+                }
+                self.cv.notify_all();
+            }
         }
         impl ExecutorClock for ScriptedClock {
             fn now(&self) -> Instant {
@@ -5621,6 +6099,39 @@ async fn executor_whole_release_and_wake_zero_alloc_lock_stalled_consumers_gravi
         }
 
         let dir = tempfile::tempdir().unwrap();
+        let offload_cap = MAINT_QUEUE_CAPACITY
+            + 1
+            + 6
+            + 12
+            + ESTOP_ACK_CAPACITY
+            + RECLAIM_STATE_CAPACITY
+            + URGENT_STOP_CAPACITY
+            + RECLAIM_TRAJ_CAPACITY
+            + 4
+            + 2;
+        let mk_bp_job = |id: u64| PendingZeroCheckPersist {
+            action_id: id,
+            offset_rad: 0.01,
+            base_revision: 1,
+            connection_id: 0,
+            lease_owner: None,
+            estop_epoch: 1,
+            stop_gen: 0,
+            deadline: Instant::now() + Duration::from_secs(5),
+            ctx: Box::new(ZeroCheckPersistContext {
+                path: dir.path().join(format!("bp_{id}.json")),
+                jaw_opening: None,
+                stale: None,
+                tool_id: "stock".into(),
+                tool_config_digest: String::new(),
+                active_tool_is_stock: true,
+                base_gripper_policy: Some(armd::model::GripperPolicy::rebot_dm()),
+                gripper_limit: None,
+                operator_auth: None,
+                sat_msg_buf: String::with_capacity(64),
+            }),
+        };
+
         let mut cfg_bp = ArmConfig::rebot_dm();
         cfg_bp.lease_timeout_ms = 600_000;
         if let Some(gc) = cfg_bp.gravity_comp.as_mut() {
@@ -5637,7 +6148,7 @@ async fn executor_whole_release_and_wake_zero_alloc_lock_stalled_consumers_gravi
             inject_pending_persist_job_once: Some(job_slot.clone()),
             ..Default::default()
         };
-        let sup_bp = Arc::new(ArmSupervisor::new(cfg_bp));
+        let sup_bp = Arc::new(ArmSupervisor::new(cfg_bp.clone()));
         sup_bp.set_lease_enabled(false).await;
         sup_bp.enable_torque(sup_bp.capture_admission_stamp()).await.unwrap();
 
@@ -5657,48 +6168,16 @@ async fn executor_whole_release_and_wake_zero_alloc_lock_stalled_consumers_gravi
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
 
-        // Fill `persist_job_tx` (4) + `offload_reclaim_tx` (OFFLOAD_RECLAIM_CAPACITY - 8)
-        // leaving 8 slots in `offload_reclaim_tx` so we never overflow into `retained_persist_job`.
-        let offload_cap = MAINT_QUEUE_CAPACITY
-            + 1
-            + 6
-            + 12
-            + ESTOP_ACK_CAPACITY
-            + RECLAIM_STATE_CAPACITY
-            + URGENT_STOP_CAPACITY
-            + RECLAIM_TRAJ_CAPACITY
-            + 4
-            + 2;
-        for id in 1..=(4 + offload_cap - 8) as u64 {
-            let job = PendingZeroCheckPersist {
-                action_id: id,
-                offset_rad: 0.01,
-                base_revision: 1,
-                connection_id: 0,
-                lease_owner: None,
-                estop_epoch: 1,
-                stop_gen: 0,
-                deadline: Instant::now() + Duration::from_secs(5),
-                ctx: Box::new(ZeroCheckPersistContext {
-                    path: dir.path().join(format!("bp_{id}.json")),
-                    jaw_opening: None,
-                    stale: None,
-                    tool_id: "stock".into(),
-                    tool_config_digest: String::new(),
-                    active_tool_is_stock: true,
-                    base_gripper_policy: Some(armd::model::GripperPolicy::rebot_dm()),
-                    gripper_limit: None,
-                    operator_auth: None,
-                    sat_msg_buf: String::with_capacity(64),
-                }),
-            };
-            *job_slot.lock().unwrap() = Some((job, None));
+        // Saturate `persist_job_tx` (4) + `offload_reclaim_tx` (OFFLOAD_RECLAIM_CAPACITY) completely
+        // so all retired `GravityCompRun`s remain inside `SupervisorInner::retired_gravity_comp` (cap 8).
+        for id in 1..=(4 + offload_cap) as u64 {
+            *job_slot.lock().unwrap() = Some((mk_bp_job(id), None));
             clock_bp.run_steps(period_ns, 1);
         }
 
-        let run_gc_cmd = |enable: bool| {
-            let sup_c = Arc::clone(&sup_bp);
-            let clk_c = Arc::clone(&clock_bp);
+        let run_gc_cmd = |sup_arg: &Arc<ArmSupervisor>, clk_arg: &Arc<ScriptedClock>, enable: bool| {
+            let sup_c = Arc::clone(sup_arg);
+            let clk_c = Arc::clone(clk_arg);
             async move {
                 let adm = capture_config_admission(&sup_c, 0, 0, None);
                 let fut = tokio::spawn(async move {
@@ -5722,52 +6201,229 @@ async fn executor_whole_release_and_wake_zero_alloc_lock_stalled_consumers_gravi
             }
         };
 
-        // Cycle enter+exit until `offload_reclaim_tx` + `retired_gravity_comp` (cap 8) fill,
-        // proving the next gravity_comp entry fails closed with `503 RECLAIM_BACKPRESSURE`!
-        let mut saw_backpressure = false;
-        for _ in 0..20 {
-            match run_gc_cmd(true).await {
-                Ok(rep) => {
-                    assert!(rep.active);
-                    clock_bp.run_steps(period_ns, 4);
-                    let _ex = run_gc_cmd(false).await.unwrap();
-                    clock_bp.run_steps(period_ns, 6);
-                }
-                Err(armd::ArmError::Rejected { status: 503, code, .. })
-                    if code == "RECLAIM_BACKPRESSURE" =>
-                {
-                    saw_backpressure = true;
-                    break;
-                }
-                Err(other) => panic!("unexpected gravity_comp error under reclaim stall: {other:?}"),
-            }
+        // Run EXACTLY 8 gravity-comp enter+exit cycles (all 8 must succeed, filling `retired_gravity_comp` to 8).
+        for cycle in 1..=8 {
+            let rep = run_gc_cmd(&sup_bp, &clock_bp, true)
+                .await
+                .unwrap_or_else(|e| panic!("gravity_comp cycle {cycle} enter must succeed: {e:?}"));
+            assert!(rep.active, "cycle {cycle} enter must activate gravity_comp");
+            clock_bp.run_steps(period_ns, 4);
+            let _ex = run_gc_cmd(&sup_bp, &clock_bp, false)
+                .await
+                .unwrap_or_else(|e| panic!("gravity_comp cycle {cycle} exit must succeed: {e:?}"));
+            clock_bp.run_steps(period_ns, 6);
         }
-        assert!(saw_backpressure, "9th retired gravity_comp entry must fail closed with 503 RECLAIM_BACKPRESSURE");
+
+        // The 9th entry MUST IMMEDIATELY reject with 503 RECLAIM_BACKPRESSURE (0 RT allocs/deallocs).
+        match run_gc_cmd(&sup_bp, &clock_bp, true).await {
+            Err(armd::ArmError::Rejected { status: 503, code, .. })
+                if code == "RECLAIM_BACKPRESSURE" => {}
+            other => panic!("9th gravity_comp entry must fail closed immediately with 503 RECLAIM_BACKPRESSURE, got {other:?}"),
+        }
         assert_eq!(exec_bp.stats().total_allocs(), AllocCounts::ZERO);
 
-        // Resume reclaim consumer & persistence worker, drain retired queues, and verify recovery!
+        // Resume reclaim consumer & persistence worker and drain all 8 retired items LIVE BEFORE `stop_and_join()`.
         pause_persist.store(false, Ordering::Release);
         rel_bp.send(()).unwrap();
         jh_bp.join().unwrap();
-        for _ in 0..10 {
+        for _ in 0..16 {
             clock_bp.run_steps(period_ns, 1);
-            tokio::time::sleep(Duration::from_millis(2)).await;
+            tokio::time::sleep(Duration::from_millis(3)).await;
         }
-        let resumed_enter = run_gc_cmd(true).await.expect("gravity_comp enter must succeed after reclaim resumes");
+        // Re-pause and re-saturate `offload_reclaim_tx` while live to prove all 8 slots of
+        // `retired_gravity_comp` drained to (0, 0) LIVE BEFORE calling `stop_and_join()`:
+        // all 8 new cycles must succeed before the next 9th rejects with 503 RECLAIM_BACKPRESSURE!
+        pause_persist.store(true, Ordering::Release);
+        let (rel_bp2, jh_bp2) = pause_hub(&sup_bp);
+        let dl_wait2 = Instant::now() + Duration::from_secs(5);
+        while sup_bp.hub().latest_waiters() < 1 {
+            assert!(Instant::now() < dl_wait2, "dispatcher did not re-block on StateHub::latest()");
+            sup_bp.hub().wake();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        for id in 1001..=(1000 + 4 + offload_cap) as u64 {
+            *job_slot.lock().unwrap() = Some((mk_bp_job(id), None));
+            clock_bp.run_steps(period_ns, 1);
+        }
+        for cycle in 1..=8 {
+            let rep = run_gc_cmd(&sup_bp, &clock_bp, true)
+                .await
+                .unwrap_or_else(|e| panic!("post-drain cycle {cycle} enter must succeed (proving live drain to 0/8): {e:?}"));
+            assert!(rep.active);
+            clock_bp.run_steps(period_ns, 4);
+            let _ex = run_gc_cmd(&sup_bp, &clock_bp, false).await.unwrap();
+            clock_bp.run_steps(period_ns, 6);
+        }
+        match run_gc_cmd(&sup_bp, &clock_bp, true).await {
+            Err(armd::ArmError::Rejected { status: 503, code, .. })
+                if code == "RECLAIM_BACKPRESSURE" => {}
+            other => panic!("9th post-drain entry must reject with 503 RECLAIM_BACKPRESSURE, got {other:?}"),
+        }
+        pause_persist.store(false, Ordering::Release);
+        rel_bp2.send(()).unwrap();
+        jh_bp2.join().unwrap();
+        for _ in 0..16 {
+            clock_bp.run_steps(period_ns, 1);
+            tokio::time::sleep(Duration::from_millis(3)).await;
+        }
+        let resumed_enter = run_gc_cmd(&sup_bp, &clock_bp, true)
+            .await
+            .expect("gravity_comp enter must succeed after live reclaim");
         assert!(resumed_enter.active);
         clock_bp.run_steps(period_ns, 4);
-        let _resumed_exit = run_gc_cmd(false).await.unwrap();
+        let _resumed_exit = run_gc_cmd(&sup_bp, &clock_bp, false).await.unwrap();
         clock_bp.run_steps(period_ns, 6);
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::sleep(Duration::from_millis(15)).await;
 
         assert_eq!(exec_bp.stats().total_allocs(), AllocCounts::ZERO);
         assert_eq!(sup_bp.inner().control_thread_attempts(), 0);
         tokio::task::spawn_blocking(move || exec_bp.stop_and_join()).await.unwrap();
-        assert_eq!(
-            sup_bp.inner().read().await.retired_gravity_comp_queue_lens(),
-            (0, 0),
-            "all retired gravity_comp runs and policies must be reclaimed off-thread (0 mem::forget)"
-        );
+
+        // Full-ring shutdown non-leaking reclamation tests:
+        // (1) Handback while `offload_reclaim_tx` is 100% saturated and 2 `GravityCompRun`s are in
+        //     `retired_gravity_comp`: 0 RT allocs/frees, `retired_gravity_comp_queue_lens() == (2, 0)`
+        //     preserved and inspectable before `ArmSupervisor` drops cleanly.
+        {
+            let clock_full = ScriptedClock::new();
+            let pause_full = Arc::new(AtomicBool::new(true));
+            let slot_full: Arc<Mutex<Option<(PendingZeroCheckPersist, Option<Box<dyn std::any::Any + Send>>)>>> =
+                Arc::new(Mutex::new(None));
+            let hooks_full = PersistTestHooks {
+                clock: Some(clock_full.clone()),
+                pause_persist_worker: Some(pause_full.clone()),
+                inject_pending_persist_job_once: Some(slot_full.clone()),
+                ..Default::default()
+            };
+            let sup_full = Arc::new(ArmSupervisor::new(cfg_bp.clone()));
+            sup_full.set_lease_enabled(false).await;
+            sup_full.enable_torque(sup_full.capture_admission_stamp()).await.unwrap();
+            let mut ecfg_full = ExecutorConfig::for_tests(Duration::from_nanos(period_ns));
+            ecfg_full.alloc_timing = true;
+            ecfg_full.panic_policy = PanicPolicy::StopExecutor;
+            let exec_full = sup_full.start_executor_with_hooks(ecfg_full, hooks_full).await.unwrap();
+            clock_full.run_steps(period_ns, 2);
+
+            let (rel_full, jh_full) = pause_hub(&sup_full);
+            let mut jh_full = Some(jh_full);
+            let dl_w = Instant::now() + Duration::from_secs(5);
+            while sup_full.hub().latest_waiters() < 1 {
+                assert!(Instant::now() < dl_w);
+                sup_full.hub().wake();
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            for id in 2001..=(2000 + 4 + offload_cap) as u64 {
+                *slot_full.lock().unwrap() = Some((mk_bp_job(id), None));
+                clock_full.run_steps(period_ns, 1);
+            }
+            for _ in 0..2 {
+                let rep = run_gc_cmd(&sup_full, &clock_full, true).await.unwrap();
+                assert!(rep.active);
+                clock_full.run_steps(period_ns, 4);
+                let _ex = run_gc_cmd(&sup_full, &clock_full, false).await.unwrap();
+                clock_full.run_steps(period_ns, 6);
+            }
+
+            let hb_fut = tokio::spawn({
+                let sup_c = Arc::clone(&sup_full);
+                async move {
+                    sup_c
+                        .handback_to_legacy_with_live_loop(
+                            Duration::from_secs(2),
+                            Duration::from_millis(10),
+                        )
+                        .await
+                }
+            });
+            while !hb_fut.is_finished() {
+                if exec_full.is_exited() {
+                    if let Some(jh) = jh_full.take() {
+                        pause_full.store(false, Ordering::Release);
+                        rel_full.send(()).unwrap();
+                        jh.join().unwrap();
+                    }
+                }
+                clock_full.step_if_parked(period_ns);
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            if let Some(jh) = jh_full.take() {
+                pause_full.store(false, Ordering::Release);
+                rel_full.send(()).unwrap();
+                jh.join().unwrap();
+            }
+            let (legacy_stop, legacy_jh) = hb_fut
+                .await
+                .unwrap()
+                .expect("handback under full offload_reclaim_tx must succeed");
+            assert_eq!(exec_full.stats().total_allocs(), AllocCounts::ZERO);
+            assert_eq!(
+                sup_full.inner().read().await.retired_gravity_comp_queue_lens(),
+                (2, 0),
+                "full-ring shutdown/handback must preserve retired_gravity_comp (never mem::forget)"
+            );
+            legacy_stop.store(true, Ordering::Release);
+            let _ = tokio::task::spawn_blocking(move || legacy_jh.join()).await;
+            drop(sup_full);
+        }
+
+        // (2) Direct `stop_and_join()` while `offload_reclaim_tx` is 100% full and 2 `GravityCompRun`s
+        //     are in `retired_gravity_comp`: 0 RT frees during shutdown.
+        {
+            let clock_stop = ScriptedClock::new();
+            let pause_stop = Arc::new(AtomicBool::new(true));
+            let slot_stop: Arc<Mutex<Option<(PendingZeroCheckPersist, Option<Box<dyn std::any::Any + Send>>)>>> =
+                Arc::new(Mutex::new(None));
+            let hooks_stop = PersistTestHooks {
+                clock: Some(clock_stop.clone()),
+                pause_persist_worker: Some(pause_stop.clone()),
+                inject_pending_persist_job_once: Some(slot_stop.clone()),
+                ..Default::default()
+            };
+            let sup_stop = Arc::new(ArmSupervisor::new(cfg_bp));
+            sup_stop.set_lease_enabled(false).await;
+            sup_stop.enable_torque(sup_stop.capture_admission_stamp()).await.unwrap();
+            let mut ecfg_stop = ExecutorConfig::for_tests(Duration::from_nanos(period_ns));
+            ecfg_stop.alloc_timing = true;
+            ecfg_stop.panic_policy = PanicPolicy::StopExecutor;
+            let exec_stop = sup_stop.start_executor_with_hooks(ecfg_stop, hooks_stop).await.unwrap();
+            clock_stop.run_steps(period_ns, 2);
+
+            let (rel_stop, jh_stop) = pause_hub(&sup_stop);
+            let dl_w = Instant::now() + Duration::from_secs(5);
+            while sup_stop.hub().latest_waiters() < 1 {
+                assert!(Instant::now() < dl_w);
+                sup_stop.hub().wake();
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            for id in 3001..=(3000 + 4 + offload_cap) as u64 {
+                *slot_stop.lock().unwrap() = Some((mk_bp_job(id), None));
+                clock_stop.run_steps(period_ns, 1);
+            }
+            for _ in 0..2 {
+                let rep = run_gc_cmd(&sup_stop, &clock_stop, true).await.unwrap();
+                assert!(rep.active);
+                clock_stop.run_steps(period_ns, 4);
+                let _ex = run_gc_cmd(&sup_stop, &clock_stop, false).await.unwrap();
+                clock_stop.run_steps(period_ns, 6);
+            }
+
+            let stats_stop = Arc::clone(exec_stop.stats());
+            let exec_stop_watch = exec_stop.clone();
+            let stop_jh = tokio::task::spawn_blocking(move || exec_stop.stop_and_join());
+            let dl_exit = Instant::now() + Duration::from_secs(5);
+            while !exec_stop_watch.is_exited() {
+                assert!(Instant::now() < dl_exit, "armd-control did not exit on full-ring stop_and_join");
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            assert_eq!(
+                stats_stop.total_allocs(),
+                AllocCounts::ZERO,
+                "full-ring stop_and_join must execute 0 RT allocs/frees"
+            );
+            pause_stop.store(false, Ordering::Release);
+            rel_stop.send(()).unwrap();
+            jh_stop.join().unwrap();
+            stop_jh.await.unwrap();
+        }
     }
 }
 
