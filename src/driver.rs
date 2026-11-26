@@ -1163,6 +1163,11 @@ pub enum PosForceEmitOutcome {
     AwaitingFirstFresh { joint: usize, pf_status: PosForceTxStatus },
     /// J7 `0x307` frame was transmitted and flushed to the transport.
     Sent { joint: usize, freeze: bool, pf_status: PosForceTxStatus },
+    /// A requested J7 `Target` motion intent hit the per-release cutoff or budget under an armed
+    /// MIT fence and degraded to a stationary continuity `Hold` frame that was transmitted and
+    /// flushed. Continuity is preserved, while the requested `Target` was NOT accepted and stays
+    /// pending/deferred for the next release.
+    SentHoldInsteadOfTarget { joint: usize, freeze: bool, pf_status: PosForceTxStatus },
     /// J7 `0x307` frame was deferred by per-tick TX budget or backpressure.
     Deferred { joint: usize, pf_status: PosForceTxStatus },
 }
@@ -1279,6 +1284,21 @@ pub trait ArmDriver: Send {
     /// coalescing ledger (`release_ctrl_tx_mask`, `refresh_scheduler`, `release_recovery_tx_count`),
     /// and mark that Step 5 normal output will NOT run again in this release.
     fn begin_wake_tx_pass(&mut self) {}
+
+    /// Exit any prior managed control release and open a fresh standalone TX pass (used by
+    /// direct off-release `clear_fault` calls that are not sharing a `ReleaseBudget` ledger).
+    fn reset_standalone_tx_pass(&mut self) {}
+
+    /// Configured per-release budgeted TX attempt cap, if this driver enforces one.
+    fn tx_budget_max_frames(&self) -> Option<u16> { None }
+
+    /// Cumulative `(rx_frames_consumed, budgeted_tx_attempts_started)` accounted by this driver
+    /// during the current control release (including discarded RX frames).
+    fn release_budget_consumed(&self) -> (u16, u16) { (0, 0) }
+
+    /// Monotonically tightens this driver's remaining RX frame and budgeted TX attempt caps for
+    /// the current control release from the owner's [`crate::rt_core::budget::ReleaseBudget`].
+    fn sync_release_budget_limits(&mut self, _rx_remaining: u16, _tx_remaining: u16) {}
 
     /// Earliest next wake instant needed to keep already-enabled arm joints refreshed within the
     /// hardware watchdog window while a transition is pending (`None` if no motor is energized).
@@ -7960,8 +7980,17 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     /// Bitmask of joints currently owned by an active `ModeSwitch` transaction (suppresses
     /// legacy `mode_readback_boundary` auto-verification in `process_rx_frame`).
     mode_switch_active_mask: u32,
-    /// Per-release RX frame counter shared between Step 2 RX and ModeSwitch RX drain (one ledger).
+    /// Per-release RX frame counter shared across Step 2 RX, transition polls, ModeSwitch, and commissioning (one ledger).
     release_rx_frames: u16,
+    /// Per-release RX frame cap tightened by the owner's [`crate::rt_core::budget::ReleaseBudget`] (default 64).
+    release_rx_limit: u16,
+    /// Optional per-release budgeted TX cap tightened by the owner's [`crate::rt_core::budget::ReleaseBudget`].
+    release_tx_limit: Option<u16>,
+    /// Bounded extra recovery attempt slots (at most 1 per failed axis, capped at arm DOF, reset
+    /// each release) granted exclusively during `ContinuityBypass::LedgerAndReleaseDeadline` so an
+    /// exact-cap (`tx_budget.max_frames == batch_size`) mid-batch transient transport error does
+    /// not starve the final uncovered axis.
+    watchdog_continuity_recovery_budget: usize,
     /// Per-joint `CLOCK_REALTIME - monotonic` decode offset (ns) of the latest causal feedback.
     last_feedback_decode_offset_ns: Vec<Option<i128>>,
     /// Per-joint causal `REG_READ(RID_CTRL_MODE)` probe boundary
@@ -9338,6 +9367,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             mode_write_uncertain_mask: 0,
             mode_switch_active_mask: 0,
             release_rx_frames: 0,
+            release_rx_limit: crate::rt_core::ops::RX_FRAME_BUDGET,
+            release_tx_limit: None,
+            watchdog_continuity_recovery_budget: 0,
             last_feedback_decode_offset_ns: vec![None; dof],
             uncertain_readback_probe: [None; MAX_MODE_JOINTS],
             mit_limits_verified: vec![false; dof],
@@ -9481,13 +9513,25 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.tx_budget = budget;
         self.tick_tx = None;
         self.tx_release_deadline = None;
+        self.release_tx_limit = None;
     }
 
     /// Open a fresh per-tick TX budget window. Called automatically at the start of
     /// `receive_feedback()`; exposed for direct driver tests and executors that step TX
     /// independently of `read_joint_states()`.
+    ///
+    /// While executing inside an active managed control release that already opened its TX pass,
+    /// `begin_tx_tick` preserves attempts and coalescing state already spent in this release so
+    /// intra-release maintenance or recovery calls can never regain spent TX slots.
     pub fn begin_tx_tick(&mut self) {
+        if self.in_active_control_release()
+            && self.release_tx_pass_release_id == self.control_release_id
+        {
+            self.discard_staged_ctrl_tx();
+            return;
+        }
         self.tick_tx = None;
+        self.watchdog_continuity_recovery_budget = 0;
         self.refresh_scheduler.begin_tick();
         self.release_ctrl_tx_mask = 0;
         self.discard_staged_ctrl_tx();
@@ -9840,28 +9884,185 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             })))
     }
 
+    /// Effective budgeted TX attempt cap for the current control release (tightened monotonically
+    /// by the owner's [`crate::rt_core::budget::ReleaseBudget`] only while inside an active
+    /// managed control release; standalone off-tick driver operations and non-deferrable
+    /// watchdog-continuity Hold/Stop frames use `self.tx_budget.max_frames`).
+    #[inline]
+    fn effective_tx_max_frames(&self) -> usize {
+        self.effective_tx_max_frames_with_bypass(ContinuityBypass::None)
+    }
+
+    #[inline]
+    fn effective_tx_max_frames_with_bypass(&self, bypass: ContinuityBypass) -> usize {
+        if !self.in_active_control_release() || bypass.bypasses_ledger() {
+            return if bypass.bypasses_release_deadline() {
+                self.tx_budget
+                    .max_frames
+                    .saturating_add(self.watchdog_continuity_recovery_budget)
+            } else {
+                self.tx_budget.max_frames
+            };
+        }
+        match self.release_tx_limit {
+            Some(lim) => self.tx_budget.max_frames.min(usize::from(lim)),
+            None => self.tx_budget.max_frames,
+        }
+    }
+
+    /// Per-call continuity bypass policy for stationary J7 `Hold`/`Stop` frames.
+    /// Never applied to motion `Target` intents (enforced inside `pos_force_emitter` and `send`).
+    #[inline]
+    fn j7_hold_continuity_bypass(&self) -> ContinuityBypass {
+        if self.mit_fence.is_some() && self.mit_fence_trip.is_none() {
+            if self.in_active_control_release() {
+                ContinuityBypass::LedgerAndReleaseDeadline
+            } else {
+                ContinuityBypass::Ledger
+            }
+        } else {
+            ContinuityBypass::None
+        }
+    }
+
+    /// Explicit release cutoff deadline combining `tx_release_deadline` and the active tick pass
+    /// deadline so `send()` enforces the cutoff immediately before final CAN submission.
+    #[inline]
+    fn active_release_cutoff_deadline(&self) -> Option<Deadline> {
+        match (self.tx_release_deadline, self.tick_tx.map(|p| p.deadline)) {
+            (Some(cap), Some(pass_dl)) => Some(Deadline { at: cap.min(pass_dl) }),
+            (Some(cap), None) => Some(Deadline { at: cap }),
+            (None, Some(pass_dl)) => Some(Deadline { at: pass_dl }),
+            (None, None) => None,
+        }
+    }
+
+    /// Number of TX slots reserved first in this active control release for enabled axes that
+    /// still need a watchdog-continuity frame within their watchdog / MIT fence window.
+    #[inline]
+    fn watchdog_continuity_reserved_slots(&self) -> usize {
+        if !self.in_active_control_release() {
+            return 0;
+        }
+        let n = self.motor_ids.len().min(MAX_MODE_JOINTS);
+        let pf_joint = self.active_pos_force_joint();
+        let armed_mit = self.mit_fence.is_some() && self.mit_fence_trip.is_none();
+        let now = self.now();
+        let mut reserved = 0usize;
+        for i in 0..n {
+            if i < 64 && (self.disable_dispatched_mask & (1u64 << i)) != 0 {
+                continue;
+            }
+            if (self.release_ctrl_tx_mask & (1u32 << i)) != 0 {
+                continue;
+            }
+            if pf_joint == Some(i) || self.base_mode(i) == DamiaoControlMode::PosForce {
+                continue;
+            }
+            if armed_mit
+                || ((self.motor_energized_mask & (1u32 << i)) != 0
+                    && self.verified_hold_mode(i).is_some()
+                    && self.motor_last_ctrl_tx[i].is_some_and(|t| {
+                        now.saturating_duration_since(t) >= WATCHDOG_DISABLE_FALLBACK_INTERVAL
+                    }))
+            {
+                reserved += 1;
+            }
+        }
+        if armed_mit {
+            if let Some(pf_j) = pf_joint {
+                if pf_j < 32
+                    && (self.release_ctrl_tx_mask & (1u32 << pf_j)) == 0
+                    && (self.disable_dispatched_mask & (1u64 << pf_j)) == 0
+                {
+                    reserved += 1;
+                }
+            }
+        }
+        reserved
+    }
+
+    /// Remaining per-release RX frames allowed on this driver under the active control release.
+    #[inline]
+    fn driver_remaining_release_rx(&self) -> u16 {
+        if self.in_active_control_release() {
+            self.release_rx_limit.saturating_sub(self.release_rx_frames)
+        } else {
+            crate::rt_core::ops::RX_FRAME_BUDGET
+        }
+    }
+
+    /// Tightens a caller-supplied RX frame limit against the active control release ledger.
+    #[inline]
+    fn clamp_release_rx_limit(&self, max_rx_frames: u16) -> u16 {
+        if self.in_active_control_release() {
+            max_rx_frames.min(self.driver_remaining_release_rx())
+        } else {
+            max_rx_frames.min(crate::rt_core::ops::RX_FRAME_BUDGET)
+        }
+    }
+
     #[inline]
     fn can_start_tick_tx_n(&self, needed: usize) -> bool {
-        let Some(pass) = self.tick_tx else {
-            return needed <= self.tx_budget.max_frames
-                && self.tx_release_deadline.is_none_or(|cap| self.now() < cap);
+        self.can_start_tick_tx_n_with_bypass(needed, ContinuityBypass::None)
+    }
+
+    #[inline]
+    fn can_start_tick_tx_n_with_bypass(&self, needed: usize, bypass: ContinuityBypass) -> bool {
+        let max_frames = self.effective_tx_max_frames_with_bypass(bypass);
+        let release_cap = if bypass.bypasses_release_deadline() {
+            None
+        } else {
+            self.tx_release_deadline
         };
-        let effective_deadline = self
-            .tx_release_deadline
-            .map_or(pass.deadline, |cap| pass.deadline.min(cap));
+        let Some(pass) = self.tick_tx else {
+            return needed <= max_frames && release_cap.is_none_or(|cap| self.now() < cap);
+        };
+        let effective_deadline = release_cap.map_or(pass.deadline, |cap| pass.deadline.min(cap));
         !pass.backpressured
-            && pass.attempts.saturating_add(needed) <= self.tx_budget.max_frames
-            && self.now() < effective_deadline
+            && pass.attempts.saturating_add(needed) <= max_frames
+            && (bypass.bypasses_release_deadline() || self.now() < effective_deadline)
+    }
+
+    #[inline]
+    fn can_start_tick_tx_for_kind(
+        &self,
+        kind: TxKind,
+        _fenced: bool,
+        bypass: ContinuityBypass,
+    ) -> bool {
+        // Continuity bypass is valid ONLY for stationary Hold/Stop frames; never for Target motion.
+        let effective_bypass = bypass.for_tx_kind(kind);
+        if !self.can_start_tick_tx_n_with_bypass(1, effective_bypass) {
+            return false;
+        }
+        if effective_bypass.bypasses_ledger() || !self.in_active_control_release() {
+            return true;
+        }
+        let is_continuity = matches!(
+            kind,
+            TxKind::Target | TxKind::MeasuredHold(_) | TxKind::RollbackHold(_)
+        );
+        if is_continuity {
+            return true;
+        }
+        let reserved = self.watchdog_continuity_reserved_slots();
+        if reserved == 0 {
+            return true;
+        }
+        let attempts = self.tick_tx.map_or(0, |p| p.attempts);
+        attempts.saturating_add(1).saturating_add(reserved) <= self.tx_budget.max_frames
     }
 
     /// Remaining TX frame slots in the active tick pass (`0` if backpressured or past deadline).
     #[inline]
     fn remaining_tick_tx_slots(&self) -> usize {
+        let max_frames = self.effective_tx_max_frames();
         let Some(pass) = self.tick_tx else {
             if self.tx_release_deadline.is_some_and(|cap| self.now() >= cap) {
                 return 0;
             }
-            return self.tx_budget.max_frames;
+            return max_frames;
         };
         let effective_deadline = self
             .tx_release_deadline
@@ -9869,7 +10070,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if pass.backpressured || self.now() >= effective_deadline {
             return 0;
         }
-        self.tx_budget.max_frames.saturating_sub(pass.attempts)
+        max_frames.saturating_sub(pass.attempts)
     }
 
     /// Priority `(class, slot_last_tx_seq)` of the active `PosForce` J7 joint's `0x307` frame
@@ -10322,9 +10523,38 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         fenced: bool,
         build: impl FnOnce(&Self) -> Option<CanFrame>,
     ) -> Result<CanFrame, TxRefusal> {
+        self.send_with_lease_and_bypass(
+            kind,
+            expected_stamp,
+            expected_lease_gen,
+            deadline,
+            fenced,
+            ContinuityBypass::None,
+            build,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn send_with_lease_and_bypass(
+        &mut self,
+        kind: impl DamiaoTxKind,
+        expected_stamp: Option<StopStamp>,
+        expected_lease_gen: u64,
+        deadline: Option<Deadline>,
+        fenced: bool,
+        continuity_bypass: ContinuityBypass,
+        build: impl FnOnce(&Self) -> Option<CanFrame>,
+    ) -> Result<CanFrame, TxRefusal> {
         let prev = self.send_lease_gen;
         self.send_lease_gen = expected_lease_gen;
-        let res = self.send_plain(kind, expected_stamp, deadline, fenced, build);
+        let res = self.send_plain_with_bypass(
+            kind,
+            expected_stamp,
+            deadline,
+            fenced,
+            continuity_bypass,
+            build,
+        );
         self.send_lease_gen = prev;
         res
     }
@@ -10432,9 +10662,37 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         fenced: bool,
         build: impl FnOnce(&Self) -> Option<CanFrame>,
     ) -> Result<CanFrame, TxRefusal> {
+        self.send_plain_with_bypass(
+            kind,
+            expected_stamp,
+            deadline,
+            fenced,
+            ContinuityBypass::None,
+            build,
+        )
+    }
+
+    fn send_plain_with_bypass(
+        &mut self,
+        kind: impl DamiaoTxKind,
+        expected_stamp: Option<StopStamp>,
+        deadline: Option<Deadline>,
+        fenced: bool,
+        continuity_bypass: ContinuityBypass,
+        build: impl FnOnce(&Self) -> Option<CanFrame>,
+    ) -> Result<CanFrame, TxRefusal> {
         let mut revoked: Option<&'static str> = None;
-        self.send(kind, expected_stamp, deadline, fenced, None, &mut revoked, build)
-            .map(|(f, _, _, _)| f)
+        self.send(
+            kind,
+            expected_stamp,
+            deadline,
+            fenced,
+            continuity_bypass,
+            None,
+            &mut revoked,
+            build,
+        )
+        .map(|(f, _, _, _)| f)
     }
 
     fn send_with_commissioning_gate(
@@ -10446,7 +10704,16 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         build: impl FnOnce(&Self) -> Option<CanFrame>,
     ) -> Result<(CanFrame, u64, Instant, Option<i128>), Result<&'static str, TxRefusal>> {
         let mut revoked: Option<&'static str> = None;
-        match self.send(kind, expected_stamp, deadline, false, Some(pre_tx_gate), &mut revoked, build) {
+        match self.send(
+            kind,
+            expected_stamp,
+            deadline,
+            false,
+            ContinuityBypass::None,
+            Some(pre_tx_gate),
+            &mut revoked,
+            build,
+        ) {
             Ok(ok) => Ok(ok),
             Err(r) => {
                 if let Some(code) = revoked {
@@ -10465,11 +10732,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         expected_stamp: Option<StopStamp>,
         deadline: Option<Deadline>,
         fenced: bool,
+        continuity_bypass: ContinuityBypass,
         mut pre_tx_gate: Option<&mut dyn FnMut() -> Result<(), &'static str>>,
         revoked_out: &mut Option<&'static str>,
         build: impl FnOnce(&Self) -> Option<CanFrame>,
     ) -> Result<(CanFrame, u64, Instant, Option<i128>), TxRefusal> {
         let tx_kind = kind.tx_kind();
+        let effective_bypass = continuity_bypass.for_tx_kind(tx_kind);
         #[cfg(not(target_arch = "wasm32"))]
         let mut built_frame_for_shadow: Option<CanFrame> = None;
         let res = 'send_body: {
@@ -10485,7 +10754,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             let budgeted = !Self::is_disable_tx_kind(kind);
             if budgeted {
                 let _ = self.ensure_tx_pass();
-                if !self.can_start_tick_tx() {
+                if !self.can_start_tick_tx_for_kind(kind, fenced, effective_bypass) {
                     break 'send_body Err(TxRefusal::Deferred);
                 }
             }
@@ -10595,7 +10864,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             if deadline.is_some_and(|d| d.passed(submit_now)) {
                 break 'send_body Err(TxRefusal::DeadlinePassed);
             }
-            if budgeted && !self.can_start_tick_tx() {
+            if budgeted && !self.can_start_tick_tx_for_kind(kind, fenced, effective_bypass) {
                 break 'send_body Err(TxRefusal::Deferred);
             }
             if let Some(gate) = pre_tx_gate.as_mut() {
@@ -12512,12 +12781,25 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     /// Pure RX-only drain (no autonomous recovery/refresh TX, no `begin_tx_tick`, zero heap
     /// allocation). Returns `true` when the transport explicitly reported an empty RX queue.
     fn drain_rx_frames_only(&mut self, deadline: Option<Deadline>, max_frames: usize) -> bool {
+        let limit = if self.in_active_control_release() {
+            max_frames.min(usize::from(self.driver_remaining_release_rx()))
+        } else {
+            max_frames
+        };
+        let mut effective_deadline = deadline.map(|d| d.at);
+        if let Some(tx_dl) = self.tx_release_deadline {
+            effective_deadline = Some(effective_deadline.map_or(tx_dl, |d| d.min(tx_dl)));
+        }
+        if let Some(rx_dl) = self.rx_deadline {
+            effective_deadline = Some(effective_deadline.map_or(rx_dl, |d| d.min(rx_dl)));
+        }
         let mut frames = 0usize;
-        while frames < max_frames {
-            if deadline.is_some_and(|d| d.passed(self.now())) {
-                return false;
-            }
+        let mut drained = false;
+        while frames < limit {
             let attempt = self.now();
+            if effective_deadline.is_some_and(|d| attempt >= d) {
+                break;
+            }
             match self.receive_with_rx_time_timed() {
                 Ok((frame, rx_time)) => {
                     frames += 1;
@@ -12525,12 +12807,22 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 }
                 Err(TransportError::Timeout) | Err(TransportError::WouldBlock) => {
                     self.mark_rx_empty(attempt);
-                    return true;
+                    drained = true;
+                    break;
                 }
-                Err(_) => return false,
+                Err(_) => break,
             }
         }
-        false
+        if frames > 0 {
+            let f_u16 = u16::try_from(frames).unwrap_or(u16::MAX);
+            if self.in_active_control_release() {
+                self.release_rx_frames = self.release_rx_frames.saturating_add(f_u16);
+            }
+            if let Some(rem) = self.rx_frame_limit.as_mut() {
+                *rem = rem.saturating_sub(f_u16);
+            }
+        }
+        drained
     }
 
     /// Transmit a read-only `0xCC` status refresh probe on an empty software queue through the
@@ -12583,10 +12875,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             return Err(ArmDriverError::Transport(TransportError::Timeout));
         }
         self.tx_probe = None;
-        // Preserve any active `self.tx_release_deadline` cap installed by the release owner so
-        // the clear-fault probe uses the exact same `release_deadline - publish_margin` cutoff
-        // as every other TX in the release.
-        self.begin_tx_tick();
+        // Preserve any active `self.tx_release_deadline` cap and already-spent release TX
+        // attempts installed by the release owner so the clear-fault probe uses the exact same
+        // release ledger and cutoff as every other TX in the release.
+        self.ensure_release_tx_tick();
         let probe_joint = 0usize;
         match self.send_plain(TxKind::Refresh, Some(start_stamp), deadline, false, |d| {
             Some(damiao::build_refresh_frame(d.motor_ids[probe_joint]))
@@ -13052,7 +13344,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
         let cur_intent_stamp = self.current_j7_intent_stamp();
         let intent = self.pf_deferred_intent.unwrap_or_else(|| PosForceIntent::hold(cur_intent_stamp));
-        match pos_force_emitter::emit_tick(self, intent, cur_intent_stamp)? {
+        let hold_bypass = self.j7_hold_continuity_bypass();
+        match pos_force_emitter::emit_tick(self, intent, cur_intent_stamp, hold_bypass)? {
             PosForceEmitOutcome::NotApplicable => Ok(arm_out),
             PosForceEmitOutcome::AwaitingFirstFresh { pf_status, .. } => {
                 self.last_tx_pf_status = pf_status;
@@ -13062,7 +13355,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 self.last_tx_pf_status = pf_status;
                 Ok(arm_out)
             }
-            PosForceEmitOutcome::Deferred { pf_status, .. } => {
+            PosForceEmitOutcome::SentHoldInsteadOfTarget { pf_status, .. }
+            | PosForceEmitOutcome::Deferred { pf_status, .. } => {
                 self.last_tx_pf_status = pf_status;
                 Ok(match arm_out {
                     TxBatchOutcome::Complete => TxBatchOutcome::Deferred { pending: 1 },
@@ -13778,7 +14072,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let budget_armed = match max_rx_frames {
             Some(limit) => {
                 self.last_poll_rx = None;
-                self.rx_frame_limit = Some(limit.min(64));
+                self.rx_frame_limit = Some(self.clamp_release_rx_limit(limit));
                 true
             }
             None => false,
@@ -14434,15 +14728,28 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         Ok(TorqueProgress::Pending { wake })
     }
 
-    /// Remaining frames allowed in the current budgeted RX pass (defaults to 64 when unbudgeted).
+    /// Remaining frames allowed in the current budgeted RX pass (defaults to 64 when unbudgeted,
+    /// tightened by the active control release ledger when `control_release_managed`).
     fn remaining_rx_frame_limit(&self) -> usize {
-        usize::from(self.rx_frame_limit.unwrap_or(64).min(64))
+        let base = self
+            .rx_frame_limit
+            .unwrap_or(crate::rt_core::ops::RX_FRAME_BUDGET)
+            .min(crate::rt_core::ops::RX_FRAME_BUDGET);
+        usize::from(if self.in_active_control_release() {
+            base.min(self.driver_remaining_release_rx())
+        } else {
+            base
+        })
     }
 
-    /// Account frames consumed by an RX pass into `last_poll_rx` and deduct them from the active
-    /// `rx_frame_limit` so multiple drains within one release share a single frame budget.
+    /// Account frames consumed by an RX pass (including discarded frames) into the per-release
+    /// counter, `last_poll_rx`, and active `rx_frame_limit` so all drains in one release share a
+    /// single frame ledger.
     fn account_rx_pass(&mut self, frames_processed: usize, exhausted: bool) {
         let frames = u16::try_from(frames_processed).unwrap_or(u16::MAX);
+        if self.in_active_control_release() {
+            self.release_rx_frames = self.release_rx_frames.saturating_add(frames);
+        }
         if let Some(rem) = self.rx_frame_limit.as_mut() {
             *rem = rem.saturating_sub(frames);
         }
@@ -15054,6 +15361,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         self.enable_stop_stamp,
                         Some(r.deadline),
                         false,
+                        ContinuityBypass::None,
                         None,
                         &mut revoked,
                         |_| Some(damiao::build_read_register_frame(id, rid)),
@@ -16293,10 +16601,14 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         // holding the request pending (`DamiaoTorque::AwaitRestGate`) to retry on subsequent
         // releases inside the 1 s lifetime (0 `CMD_DISABLE` frames). Protective disables bypass Rule A′.
         let new_awaiting_rx_boundary = match max_rx_frames {
+            Some(0) if matches!(kind, DisableKind::DisableProtective { .. }) => {
+                // Protective disables bypass Rule A' and must run safety TX even at 0 RX.
+                self.awaiting_rx_boundary
+            }
             Some(0) => self.awaiting_rx_boundary || !self.last_read_drained,
             Some(limit) => {
                 self.last_poll_rx = None;
-                self.rx_frame_limit = Some(limit.min(64));
+                self.rx_frame_limit = Some(self.clamp_release_rx_limit(limit));
                 let drained = self.drain_rx_before_command_limit(usize::from(limit));
                 self.rx_frame_limit = None;
                 !drained
@@ -17768,14 +18080,31 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     }
 
     fn drain_rx_before_command_limit(&mut self, max_frames: usize) -> bool {
-        let limit = self.rx_frame_limit.map_or(max_frames, |rem| max_frames.min(usize::from(rem)));
+        let base = self
+            .rx_frame_limit
+            .map_or(max_frames, |rem| max_frames.min(usize::from(rem)));
+        let limit = if self.in_active_control_release() {
+            base.min(usize::from(self.driver_remaining_release_rx()))
+        } else {
+            base
+        };
         self.last_read_drained = false;
         let start = self.now();
+        let mut effective_deadline = start + Duration::from_millis(5);
+        if let Some(tx_dl) = self.tx_release_deadline {
+            effective_deadline = effective_deadline.min(tx_dl);
+        }
+        if let Some(rx_dl) = self.rx_deadline {
+            effective_deadline = effective_deadline.min(rx_dl);
+        }
         let mut frames_processed = 0usize;
         let mut rx_drained = false;
         let mut hit_err = false;
-        while frames_processed < limit && self.since(start) < Duration::from_millis(5) {
+        while frames_processed < limit {
             let attempt = self.now();
+            if attempt >= effective_deadline {
+                break;
+            }
             match self.receive_with_rx_time_timed() {
                 Ok((frame, rx_time)) => {
                     frames_processed += 1;
@@ -17794,6 +18123,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
         if self.rx_frame_limit.is_some() {
             self.account_rx_pass(frames_processed, !rx_drained && !hit_err);
+        } else if frames_processed > 0 && self.in_active_control_release() {
+            let f_u16 = u16::try_from(frames_processed).unwrap_or(u16::MAX);
+            self.release_rx_frames = self.release_rx_frames.saturating_add(f_u16);
         }
         rx_drained
     }
@@ -17846,6 +18178,120 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         )
     }
 
+    /// Sends valid stationary hold frames for every armed axis in `active_mask & !covered_mask`
+    /// under an armed MIT fence, bypassing per-release ledger tightening (`release_tx_limit`)
+    /// and (when `complete_partial` is true) `tx_release_deadline` so watchdog continuity is
+    /// never broken by ledger deferral or a mid-batch release-deadline/transient-TX interruption.
+    ///
+    /// Uses ONLY driver-authorized stationary hold references (never a pending motion target's
+    /// position, gains, or feedforward torque) so a lease-exempt continuity hold cannot carry
+    /// motion data past lease revocation.
+    ///
+    /// Still strictly enforces `fence_check()`, stop gates, verified hold modes, and
+    /// `self.tx_budget.max_frames`.
+    #[allow(clippy::too_many_arguments)]
+    fn send_mit_continuity_holds_for_uncovered(
+        &mut self,
+        active_mask: u64,
+        covered_mask: u64,
+        hold_positions: Option<&[Option<f32>]>,
+        start_stamp: StopStamp,
+        complete_partial: bool,
+        started: &mut [Option<Instant>; 16],
+        sent_any: &mut bool,
+        sent_mask: &mut u64,
+        sent_slot_mask: &mut u64,
+    ) -> Result<(), (usize, TxRefusal)> {
+        let hold_bypass = if complete_partial {
+            ContinuityBypass::LedgerAndReleaseDeadline
+        } else {
+            ContinuityBypass::Ledger
+        };
+        if complete_partial {
+            if let Some(pass) = self.tick_tx.as_mut() {
+                pass.backpressured = false;
+            }
+        }
+        let n = self.motor_ids.len().min(MAX_MODE_JOINTS);
+        for i in 0..n {
+            let bit_i = 1u64 << i;
+            if (active_mask & bit_i) == 0 || (covered_mask & bit_i) != 0 {
+                continue;
+            }
+            let pos_opt = hold_positions
+                .and_then(|hp| hp.get(i).copied().flatten())
+                .filter(|p| p.is_finite())
+                .or_else(|| self.fresh_measured_position(i, STOPPED_DISABLE_FEEDBACK_MAX_AGE))
+                .or(self.motor_keepalive_hold_pos[i])
+                .or_else(|| {
+                    self.cached_states
+                        .get(i)
+                        .map(|s| s.position)
+                        .filter(|p| p.is_finite())
+                });
+            let Some(hold_pos) = pos_opt else {
+                return Err((i, TxRefusal::BuildRefused));
+            };
+            let (kp, kd) = self
+                .last_mit_params
+                .get(i)
+                .copied()
+                .flatten()
+                .map_or((None, None), |(kp, kd, _)| (Some(kp), Some(kd)));
+            let hold_target = JointTarget {
+                position: hold_pos,
+                velocity: Some(0.0),
+                kp,
+                kd,
+                torque: Some(0.0),
+            };
+            if started[i].is_none() {
+                started[i] = Some(self.now());
+            }
+            let mut retried_transport = false;
+            loop {
+                match self.send_plain_with_bypass(
+                    TxKind::MeasuredHold(i),
+                    Some(start_stamp),
+                    None,
+                    true,
+                    hold_bypass,
+                    |d| d.build_verified_hold_frame(i, &hold_target),
+                ) {
+                    Ok(sent_frame) => {
+                        let mit_params = self.resolved_mit_params(&hold_target);
+                        self.record_sent_target(i, sent_frame, Some(mit_params));
+                        *sent_any = true;
+                        *sent_mask |= bit_i;
+                        let bit = i.saturating_mul(2);
+                        if bit < 64 {
+                            *sent_slot_mask |= 1u64 << bit;
+                        }
+                        break;
+                    }
+                    Err(TxRefusal::Transport(e))
+                        if complete_partial && !retried_transport && e.is_tx_backpressure() =>
+                    {
+                        if self.pending_stop_check(Some(start_stamp)).is_err() {
+                            return Err((i, TxRefusal::StopInhibited));
+                        }
+                        if let Err(ArmDriverError::MitFenceTripped(reason)) = self.fence_check() {
+                            return Err((i, TxRefusal::MitFenceTripped(reason)));
+                        }
+                        retried_transport = true;
+                        self.watchdog_continuity_recovery_budget =
+                            self.watchdog_continuity_recovery_budget.saturating_add(1).min(n);
+                        if let Some(pass) = self.tick_tx.as_mut() {
+                            pass.backpressured = false;
+                        }
+                    }
+                    Err(r) => return Err((i, r)),
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn service_energized_watchdog_holds_with_targets(
         &mut self,
         min_age: Duration,
@@ -17857,11 +18303,95 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if self.motor_energized_mask == 0 {
             return Ok(false);
         }
-        // Preserve an active MIT deadline fence during tracking; during re-arm (`is_enabling`),
-        // `verified_hold_mode(i)` already blocks MIT axes while allowing verified POS_VEL axes
-        // to remain watchdog-serviced and starvation-checked even while `mit_fence_trip` is set.
+        // When an MIT fence is actively armed (untripped) outside re-arm (`!is_enabling`), never
+        // silently decline watchdog continuity: emit valid stationary holds for all uncovered
+        // armed axes (bypassing per-release ledger tightening) and update `mit_fence_last_cmd`.
         if self.mit_fence.is_some() && !self.is_enabling {
-            return Ok(false);
+            if self.mit_fence_trip.is_some() {
+                return Ok(false);
+            }
+            let n = self.motor_ids.len().min(MAX_MODE_JOINTS);
+            let pf_joint = self.active_pos_force_joint();
+            let now = self.now();
+            let effective_exclude = exclude_mask | self.release_ctrl_tx_mask;
+            let mut active_mask = 0u64;
+            let mut any_due = false;
+            for i in 0..n {
+                if (self.motor_energized_mask & (1u32 << i)) == 0
+                    || (effective_exclude & (1u32 << i)) != 0
+                {
+                    continue;
+                }
+                if i < 64 && (self.disable_dispatched_mask & (1u64 << i)) != 0 {
+                    continue;
+                }
+                if pf_joint == Some(i) || self.base_mode(i) == DamiaoControlMode::PosForce {
+                    continue;
+                }
+                if self.verified_hold_mode(i).is_none() {
+                    continue;
+                }
+                active_mask |= 1u64 << i;
+                let age = self.motor_last_ctrl_tx[i]
+                    .map_or(Duration::MAX, |t| now.saturating_duration_since(t));
+                if age >= min_age {
+                    any_due = true;
+                }
+            }
+            if active_mask == 0 || !any_due {
+                return Ok(false);
+            }
+            if self.fence_check().is_err() || self.pending_stop_check(None).is_err() {
+                return Ok(false);
+            }
+            let start_stamp = self.current_stop_stamp();
+            let _ = self.ensure_tx_pass();
+            self.discard_staged_ctrl_tx();
+            let mut started = [None::<Instant>; 16];
+            let mut sent_any = false;
+            let mut sent_mask = 0u64;
+            let mut sent_slot_mask = 0u64;
+            self.in_urgent_watchdog_hold = true;
+            let complete_partial = self.in_active_control_release();
+            let send_res = self.send_mit_continuity_holds_for_uncovered(
+                active_mask,
+                0,
+                hold_targets,
+                start_stamp,
+                complete_partial,
+                &mut started,
+                &mut sent_any,
+                &mut sent_mask,
+                &mut sent_slot_mask,
+            );
+            self.in_urgent_watchdog_hold = false;
+            if send_res.is_err()
+                || !sent_any
+                || self.pending_stop_check(Some(start_stamp)).is_err()
+                || self.flush_can_and_commit().is_err()
+                || self.fence_check().is_err()
+            {
+                // On noop-flush transports (e.g. SocketCAN), any frame whose `send_plain` already
+                // succeeded reached the wire: keep `mit_fence_last_cmd` and `record_flushed_joint_tx`
+                // reconciled with actually transmitted frames while discarding any uncommitted staging.
+                if self.can.flush_is_noop() && sent_mask != 0 {
+                    for (i, t) in started.into_iter().enumerate().take(n) {
+                        if t.is_some() && (sent_mask & (1u64 << i)) != 0 {
+                            self.mit_fence_last_cmd[i] = t;
+                            self.record_flushed_joint_tx(i, 0, false);
+                        }
+                    }
+                }
+                self.discard_staged_ctrl_tx();
+                return Ok(false);
+            }
+            for (i, t) in started.into_iter().enumerate().take(n) {
+                if t.is_some() && (sent_mask & (1u64 << i)) != 0 {
+                    self.mit_fence_last_cmd[i] = t;
+                    self.record_flushed_joint_tx(i, 0, false);
+                }
+            }
+            return Ok(true);
         }
         let n = self.motor_ids.len().min(MAX_MODE_JOINTS);
         let pf_joint = self.active_pos_force_joint();
@@ -17911,6 +18441,15 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.discard_staged_ctrl_tx();
         let mut sent_mask = 0u32;
         let mut aborted_flush = false;
+        let urgent_continuity = abort_on_starve
+            || due[..due_len]
+                .iter()
+                .any(|&(_, age)| age >= WATCHDOG_HOLD_URGENT_INTERVAL);
+        let hold_bypass = if urgent_continuity {
+            ContinuityBypass::Ledger
+        } else {
+            ContinuityBypass::None
+        };
         self.in_urgent_watchdog_hold = true;
         for &(i, _) in &due[..due_len] {
             let Some(pos) = (match hold_targets {
@@ -17925,9 +18464,14 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 continue;
             };
             let target = JointTarget::position(pos);
-            match self.send_plain(TxKind::MeasuredHold(i), Some(start_stamp), deadline, false, |d| {
-                d.build_verified_hold_frame(i, &target)
-            }) {
+            match self.send_plain_with_bypass(
+                TxKind::MeasuredHold(i),
+                Some(start_stamp),
+                deadline,
+                false,
+                hold_bypass,
+                |d| d.build_verified_hold_frame(i, &target),
+            ) {
                 Ok(_) => {
                     sent_mask |= 1u32 << i;
                 }
@@ -18005,8 +18549,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         );
         if is_disable_pre_all
             && (self.mit_fence_trip.is_some()
-                || !self.last_read_drained
-                || self.awaiting_rx_boundary)
+                || ((!self.last_read_drained || self.awaiting_rx_boundary)
+                    && !(self.in_active_control_release() && self.driver_remaining_release_rx() == 0)))
         {
             return None;
         }
@@ -18047,7 +18591,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.in_poll_torque = true;
         self.last_poll_rx = None;
         self.rx_deadline = Some(deadline);
-        self.rx_frame_limit = Some(max_rx_frames.min(64));
+        let effective_rx_limit = self.clamp_release_rx_limit(max_rx_frames);
+        self.rx_frame_limit = Some(effective_rx_limit);
         let is_enable_hs = matches!(
             self.torque_hs,
             Some(
@@ -18179,8 +18724,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 }
             } else if is_disable_pre_all
                 && self.mit_fence_trip.is_none()
-                && self.last_read_drained
-                && !self.awaiting_rx_boundary
+                && ((self.last_read_drained && !self.awaiting_rx_boundary)
+                    || effective_rx_limit == 0)
             {
                 if let Ok(TorqueProgress::Pending { wake }) = r {
                     let _ = self.service_energized_watchdog_holds(
@@ -18706,6 +19251,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         if self.control_release_id != release_seq {
             self.control_release_id = release_seq;
             self.release_rx_frames = 0;
+            self.release_rx_limit = crate::rt_core::ops::RX_FRAME_BUDGET;
+            self.release_tx_limit = None;
             self.begin_tx_tick();
             self.output_step_pending_in_release = true;
         }
@@ -18722,6 +19269,35 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         self.output_step_pending_in_release = false;
     }
 
+    fn reset_standalone_tx_pass(&mut self) {
+        self.control_release_managed = false;
+        self.begin_tx_tick();
+    }
+
+    fn tx_budget_max_frames(&self) -> Option<u16> {
+        Some(self.tx_budget.max_frames.min(u16::MAX as usize) as u16)
+    }
+
+    fn release_budget_consumed(&self) -> (u16, u16) {
+        let tx = self
+            .tick_tx
+            .map_or(0, |p| p.attempts.min(u16::MAX as usize) as u16);
+        (self.release_rx_frames, tx)
+    }
+
+    fn sync_release_budget_limits(&mut self, rx_remaining: u16, tx_remaining: u16) {
+        let new_rx_lim = self.release_rx_frames.saturating_add(rx_remaining);
+        self.release_rx_limit = self.release_rx_limit.min(new_rx_lim);
+        let cur_tx = self
+            .tick_tx
+            .map_or(0, |p| p.attempts.min(u16::MAX as usize) as u16);
+        let new_tx_lim = cur_tx.saturating_add(tx_remaining);
+        self.release_tx_limit = Some(
+            self.release_tx_limit
+                .map_or(new_tx_lim, |prev| prev.min(new_tx_lim)),
+        );
+    }
+
     fn next_watchdog_hold_wake(&self) -> Option<Instant> {
         DamiaoArmDriver::next_watchdog_hold_wake(self)
     }
@@ -18735,20 +19311,17 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         if authorized_mask == 0
             || self.motor_energized_mask == 0
             || self.is_enabling
-            || self.mit_fence.is_some()
+            || self.mit_fence_trip.is_some()
             || self.tick_tx.is_some_and(|p| p.backpressured)
         {
             return;
         }
         let exclude_mask = !(authorized_mask as u32);
-        // During an active torque transition (where Window 2 may defer sub-release watchdog wakes),
-        // use `Duration::ZERO` so any authorized energized arm joint missed in Step 5 — even with
-        // a phase-offset age < 18 ms (e.g. last refreshed at t=10 ms, fallback at t=27 ms) — is
-        // refreshed inside Window 1 before `tx_release_deadline` (`release_ctrl_tx_mask` excludes
-        // joints already refreshed in this release, so normal ticks emit 0 extra frames). Outside
-        // torque transitions, preserve `WATCHDOG_DISABLE_FALLBACK_INTERVAL` (30 ms) so single-tick
-        // recovery/invalid-target suppression contracts emit 0 unexpected arm holds.
-        let min_age = if self.torque_hs.is_some() {
+        // When an MIT fence is armed (untripped), any authorized energized arm axis that missed
+        // its frame in this release must receive a valid continuity hold in the same release
+        // (`Duration::ZERO` since `release_ctrl_tx_mask` already excludes axes refreshed in this
+        // release) so a 50 Hz release never opens a 40 ms gap that trips the fence.
+        let min_age = if self.torque_hs.is_some() || self.mit_fence.is_some() {
             Duration::ZERO
         } else {
             WATCHDOG_DISABLE_FALLBACK_INTERVAL
@@ -18838,9 +19411,16 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             let mut revoked: Option<&'static str> = None;
             // Use `self.send(...)` directly so `seq_before`, `tx_started`, and `tx_offset_ns`
             // reflect the actual TX submission boundary (never a pre-send sample).
-            match self.send(TxKind::Refresh, None, None, false, None, &mut revoked, |_| {
-                Some(damiao::build_read_register_frame(id, damiao::RID_CTRL_MODE))
-            }) {
+            match self.send(
+                TxKind::Refresh,
+                None,
+                None,
+                false,
+                ContinuityBypass::None,
+                None,
+                &mut revoked,
+                |_| Some(damiao::build_read_register_frame(id, damiao::RID_CTRL_MODE)),
+            ) {
                 Ok((_frame, seq_before, tx_started, tx_offset_ns)) => {
                     if uncertain && i < MAX_MODE_JOINTS {
                         let retry_at = tx_started
@@ -19296,7 +19876,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         if !self.can.supports_nonblocking_rt() {
             return Err(ArmDriverError::Protocol("non-blocking CAN RX unsupported".into()));
         }
-        let limit = usize::from(max_frames.min(64));
+        let limit = usize::from(self.clamp_release_rx_limit(max_frames));
         let mut frames = 0u16;
         let mut drained = false;
         self.last_read_drained = false;
@@ -19305,7 +19885,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             match self.can.receive_with_rx_time() {
                 Ok((frame, rx_time)) => {
                     frames = frames.saturating_add(1);
-                    self.release_rx_frames = self.release_rx_frames.saturating_add(1);
+                    if self.in_active_control_release() {
+                        self.release_rx_frames = self.release_rx_frames.saturating_add(1);
+                    }
                     self.process_rx_frame(&frame, true, rx_time);
                 }
                 Err(TransportError::Timeout) | Err(TransportError::WouldBlock) => {
@@ -19864,11 +20446,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     }
 
     fn mode_switch_remaining_rx_budget(&self, default_max: u16) -> u16 {
-        if self.in_active_control_release() {
-            default_max.saturating_sub(self.release_rx_frames)
-        } else {
-            default_max
-        }
+        default_max.min(self.driver_remaining_release_rx())
     }
 
     fn axis_confirmed_mode(&self, joint: usize) -> Option<crate::motor_mode::ControlMode> {
@@ -20150,8 +20728,10 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     && (self.release_ctrl_tx_mask & (1u32 << pf_j)) == 0
                 {
                     let stamp = self.current_j7_intent_stamp();
-                    if let Ok(PosForceEmitOutcome::Sent { .. }) =
-                        self.emit_pos_force_j7(PosForceIntent::hold(stamp), stamp)
+                    if let Ok(
+                        PosForceEmitOutcome::Sent { .. }
+                        | PosForceEmitOutcome::SentHoldInsteadOfTarget { .. },
+                    ) = self.emit_pos_force_j7(PosForceIntent::hold(stamp), stamp)
                     {
                         frames_sent = frames_sent.saturating_add(1);
                         if pf_j < 32 {
@@ -20812,7 +21392,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         let mut tx_boundary_seq = [0u64; 64];
         let mut sent_mask: u64 = 0;
         self.discard_all_pending_tx();
-        self.begin_tx_tick();
+        self.ensure_release_tx_tick();
         let mut tx_err: Option<ArmDriverError> = None;
         for idx in 0..n {
             if (affected_mask & (1u64 << idx)) == 0 {
@@ -20993,7 +21573,13 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
     fn disable_torque(&mut self, kind: DisableKind) -> Result<(), ArmDriverError> {
         let prev_managed = self.control_release_managed;
+        let prev_rx_frames = self.release_rx_frames;
+        let prev_rx_limit = self.release_rx_limit;
+        let prev_tx_limit = self.release_tx_limit;
         self.control_release_managed = true;
+        self.release_rx_frames = 0;
+        self.release_rx_limit = crate::rt_core::ops::RX_FRAME_BUDGET;
+        self.release_tx_limit = None;
         let mut last_release_at = self.now();
         let res = (|| {
             let mut progress = self.begin_disable_torque(kind)?;
@@ -21007,11 +21593,15 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     last_release_at = now;
                     self.control_release_id = self.control_release_id.wrapping_add(1).max(1);
                 }
+                self.release_rx_frames = 0;
                 let deadline = self.now() + DAMIAO_RX_PASS;
                 progress = self.poll_torque(deadline)?;
             }
         })();
         self.control_release_managed = prev_managed;
+        self.release_rx_frames = prev_rx_frames;
+        self.release_rx_limit = prev_rx_limit;
+        self.release_tx_limit = prev_tx_limit;
         res
     }
 
@@ -21246,6 +21836,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 None,
                 Some(tx_deadline),
                 false,
+                ContinuityBypass::None,
                 None,
                 &mut revoked,
                 |_| Some(damiao::build_disable_frame(id)),
@@ -21527,7 +22118,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 }
                 let mut batch_frames = 0usize;
                 let mut due_mask: u64 = 0;
+                let mut active_mask: u64 = 0;
                 let mut sent_any = false;
+                let mut sent_mask: u64 = 0;
                 let mut sent_slot_mask: u64 = 0;
                 for (i, target) in targets.iter().enumerate() {
                     if self.joint_modes.get(i).copied().flatten() == Some(DamiaoControlMode::PosForce) {
@@ -21544,6 +22137,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                             return Err(e);
                         }
                     };
+                    if count > 0 && i < 64 {
+                        active_mask |= 1u64 << i;
+                    }
                     batch_frames += count;
                     for slot in 0..count.min(2) {
                         let bit = i.saturating_mul(2).saturating_add(slot);
@@ -21567,132 +22163,261 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     self.trip_fence(reason);
                     return Err(ArmDriverError::MitFenceTripped(reason));
                 }
-                if self.now() >= self.effective_tx_pass_deadline(pass) {
+                if !self.in_active_control_release() && self.now() >= self.effective_tx_pass_deadline(pass) {
                     let reason = MitFenceTripReason::TxBudgetDeadlineBeforeBatch;
                     self.trip_fence(reason);
                     return Err(ArmDriverError::MitFenceTripped(reason));
                 }
-                for (i, target) in targets.iter().enumerate() {
-                    if self.joint_modes.get(i).copied().flatten() == Some(DamiaoControlMode::PosForce) {
-                        continue;
-                    }
-                    let slot_count = match self.target_frames_checked(i, target) {
-                        Ok((frames, _)) => frames.into_iter().flatten().count(),
-                        Err(e) => {
-                            self.trip_fence(MitFenceTripReason::TargetUnavailable {
-                                joint: (i + 1) as u8,
-                                completed_joints: i as u8,
-                                total_joints,
-                            });
-                            return Err(e);
+                if self.now() >= pass.deadline {
+                    let reason = MitFenceTripReason::TxBudgetDeadlineBeforeBatch;
+                    self.trip_fence(reason);
+                    return Err(ArmDriverError::MitFenceTripped(reason));
+                }
+                // Watchdog-continuity holds for an armed MIT fence are NEVER deferrable by the
+                // per-release ledger (`release_tx_limit`): send the complete hold batch within
+                // `self.tx_budget.max_frames`.
+                let hold_bypass = if self.in_active_control_release()
+                    && self.tx_release_deadline.is_some_and(|cap| self.now() >= cap)
+                {
+                    ContinuityBypass::LedgerAndReleaseDeadline
+                } else {
+                    ContinuityBypass::Ledger
+                };
+                let mut fell_back_partial = false;
+                let loop_res: Result<(), ArmDriverError> = (|| {
+                    for (i, target) in targets.iter().enumerate() {
+                        if self.joint_modes.get(i).copied().flatten() == Some(DamiaoControlMode::PosForce) {
+                            continue;
                         }
-                    };
-                    for slot in 0..slot_count {
-                        if started[i].is_none() {
-                            started[i] = Some(self.now());
-                        }
-                        match self.send_plain(TxKind::RollbackHold(i), Some(start_stamp), None, true, |d| {
-                            let fresh_pos = d.fresh_measured_position(i, POS_FORCE_FEEDBACK_MAX_AGE)?;
-                            let hold_target = JointTarget {
-                                position: fresh_pos,
-                                velocity: Some(0.0),
-                                kp: target.kp,
-                                kd: target.kd,
-                                torque: target.torque,
-                            };
-                            d.target_frames_checked(i, &hold_target)
-                                .ok()?
-                                .0
-                                .get(slot)
-                                .copied()
-                                .flatten()
-                        }) {
-                            Ok(sent_frame) => {
-                                let mit_params = self.resolved_mit_params(target);
-                                self.record_sent_target(i, sent_frame, Some(mit_params));
-                                sent_any = true;
-                                let bit = i.saturating_mul(2).saturating_add(slot);
-                                if bit < 64 {
-                                    sent_slot_mask |= 1u64 << bit;
-                                }
-                            }
-                            Err(TxRefusal::PosForceFeedbackExpired(joint)) => {
-                                self.trip_fence(MitFenceTripReason::TargetUnavailable {
-                                    joint: (joint + 1) as u8,
-                                    completed_joints: i as u8,
-                                    total_joints,
-                                });
-                                return Err(ArmDriverError::PosForceFeedbackStaleBeforeTransmit { joint });
-                            }
-                            Err(TxRefusal::Deferred) => {
-                                let reason = MitFenceTripReason::TxBudgetExhausted {
-                                    completed_joints: i as u8,
-                                    total_joints,
-                                };
-                                self.trip_fence(reason);
-                                return Err(ArmDriverError::MitFenceTripped(reason));
-                            }
-                            Err(TxRefusal::MitFenceTripped(reason)) => {
-                                return Err(ArmDriverError::MitFenceTripped(reason));
-                            }
-                            Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged) => {
-                                self.trip_fence(MitFenceTripReason::EstopDuringBatch {
-                                    completed_joints: i as u8,
-                                    total_joints,
-                                });
-                                return Err(ArmDriverError::EstopInhibited);
-                            }
-                            Err(TxRefusal::BuildRefused) => {
+                        let slot_count = match self.target_frames_checked(i, target) {
+                            Ok((frames, _)) => frames.into_iter().flatten().count(),
+                            Err(e) => {
                                 self.trip_fence(MitFenceTripReason::TargetUnavailable {
                                     joint: (i + 1) as u8,
                                     completed_joints: i as u8,
                                     total_joints,
                                 });
-                                if self.fresh_measured_position(i, POS_FORCE_FEEDBACK_MAX_AGE).is_none() {
-                                    return Err(ArmDriverError::PosForceFeedbackStaleBeforeTransmit { joint: i });
-                                }
-                                return Err(ArmDriverError::PosForceTargetUnavailable { joint: i });
+                                return Err(e);
                             }
-                            Err(TxRefusal::Transport(e)) => {
-                                self.mark_tx_pass_backpressured();
-                                if self.pending_stop_check(Some(start_stamp)).is_err() {
-                                    self.trip_fence(MitFenceTripReason::EstopBetweenAttempts {
-                                        joint: (i + 1) as u8,
+                        };
+                        for slot in 0..slot_count {
+                            if started[i].is_none() {
+                                started[i] = Some(self.now());
+                            }
+                            match self.send_plain_with_bypass(
+                                TxKind::RollbackHold(i),
+                                Some(start_stamp),
+                                None,
+                                true,
+                                hold_bypass,
+                                |d| {
+                                    let fresh_pos = d.fresh_measured_position(i, POS_FORCE_FEEDBACK_MAX_AGE)?;
+                                    let hold_target = JointTarget {
+                                        position: fresh_pos,
+                                        velocity: Some(0.0),
+                                        kp: target.kp,
+                                        kd: target.kd,
+                                        torque: target.torque,
+                                    };
+                                    d.target_frames_checked(i, &hold_target)
+                                        .ok()?
+                                        .0
+                                        .get(slot)
+                                        .copied()
+                                        .flatten()
+                                },
+                            ) {
+                                Ok(sent_frame) => {
+                                    let mit_params = self.resolved_mit_params(target);
+                                    self.record_sent_target(i, sent_frame, Some(mit_params));
+                                    sent_any = true;
+                                    if i < 64 {
+                                        sent_mask |= 1u64 << i;
+                                    }
+                                    let bit = i.saturating_mul(2).saturating_add(slot);
+                                    if bit < 64 {
+                                        sent_slot_mask |= 1u64 << bit;
+                                    }
+                                }
+                                Err(TxRefusal::PosForceFeedbackExpired(joint)) => {
+                                    self.trip_fence(MitFenceTripReason::TargetUnavailable {
+                                        joint: (joint + 1) as u8,
+                                        completed_joints: i as u8,
+                                        total_joints,
+                                    });
+                                    return Err(ArmDriverError::PosForceFeedbackStaleBeforeTransmit { joint });
+                                }
+                                Err(TxRefusal::MitFenceTripped(reason)) => {
+                                    return Err(ArmDriverError::MitFenceTripped(reason));
+                                }
+                                Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged) => {
+                                    self.trip_fence(MitFenceTripReason::EstopDuringBatch {
                                         completed_joints: i as u8,
                                         total_joints,
                                     });
                                     return Err(ArmDriverError::EstopInhibited);
                                 }
-                                self.last_hold_tx_due_mask = due_mask;
-                                self.last_hold_tx_sent_mask = if self.can.flush_is_noop() { sent_slot_mask } else { 0 };
-                                self.trip_fence(MitFenceTripReason::TransmitFailed {
-                                    joint: (i + 1) as u8,
-                                    completed_joints: i as u8,
-                                    total_joints,
-                                    kind: TxFailKind::from_transport(&e),
-                                });
-                                return Err(e.into());
-                            }
-                            Err(TxRefusal::DeadlinePassed) => {
-                                let reason = MitFenceTripReason::TxBudgetDeadlineBeforeBatch;
-                                self.trip_fence(reason);
-                                return Err(ArmDriverError::MitFenceTripped(reason));
-                            }
-                            Err(r @ (TxRefusal::TorqueOffWouldDrop | TxRefusal::DisableWaitEvidence | TxRefusal::DisableRequestExpired)) => {
-                                return Err(Self::refusal_to_driver_err(r));
-                            }
-                            Err(TxRefusal::LeaseFenced | TxRefusal::EnableAuthorityExpired) => {
-                                unreachable!("TxKind::RollbackHold is exempt from lease fence");
+                                Err(TxRefusal::BuildRefused) => {
+                                    self.trip_fence(MitFenceTripReason::TargetUnavailable {
+                                        joint: (i + 1) as u8,
+                                        completed_joints: i as u8,
+                                        total_joints,
+                                    });
+                                    if self.fresh_measured_position(i, POS_FORCE_FEEDBACK_MAX_AGE).is_none() {
+                                        return Err(ArmDriverError::PosForceFeedbackStaleBeforeTransmit { joint: i });
+                                    }
+                                    return Err(ArmDriverError::PosForceTargetUnavailable { joint: i });
+                                }
+                                Err(TxRefusal::Deferred | TxRefusal::DeadlinePassed)
+                                    if self.in_active_control_release() && sent_mask != 0 =>
+                                {
+                                    if self.pending_stop_check(Some(start_stamp)).is_err() {
+                                        self.trip_fence(MitFenceTripReason::EstopDuringBatch {
+                                            completed_joints: i as u8,
+                                            total_joints,
+                                        });
+                                        return Err(ArmDriverError::EstopInhibited);
+                                    }
+                                    self.fence_check()?;
+                                    let covered = sent_mask;
+                                    match self.send_mit_continuity_holds_for_uncovered(
+                                        active_mask,
+                                        covered,
+                                        None,
+                                        start_stamp,
+                                        true,
+                                        &mut started,
+                                        &mut sent_any,
+                                        &mut sent_mask,
+                                        &mut sent_slot_mask,
+                                    ) {
+                                        Ok(()) => {
+                                            fell_back_partial = true;
+                                            return Ok(());
+                                        }
+                                        Err((fj, TxRefusal::StopInhibited | TxRefusal::StopStampChanged)) => {
+                                            self.trip_fence(MitFenceTripReason::EstopDuringBatch {
+                                                completed_joints: fj as u8,
+                                                total_joints,
+                                            });
+                                            return Err(ArmDriverError::EstopInhibited);
+                                        }
+                                        Err((_, TxRefusal::MitFenceTripped(reason))) => {
+                                            return Err(ArmDriverError::MitFenceTripped(reason));
+                                        }
+                                        Err((fj, TxRefusal::Transport(e))) => {
+                                            self.mark_tx_pass_backpressured();
+                                            self.trip_fence(MitFenceTripReason::TransmitFailed {
+                                                joint: (fj + 1) as u8,
+                                                completed_joints: fj as u8,
+                                                total_joints,
+                                                kind: TxFailKind::from_transport(&e),
+                                            });
+                                            return Err(e.into());
+                                        }
+                                        Err((fj, _)) => {
+                                            let reason = MitFenceTripReason::TxBudgetExhausted {
+                                                completed_joints: fj as u8,
+                                                total_joints,
+                                            };
+                                            self.trip_fence(reason);
+                                            return Err(ArmDriverError::MitFenceTripped(reason));
+                                        }
+                                    }
+                                }
+                                Err(TxRefusal::Deferred) => {
+                                    let reason = MitFenceTripReason::TxBudgetExhausted {
+                                        completed_joints: i as u8,
+                                        total_joints,
+                                    };
+                                    self.trip_fence(reason);
+                                    return Err(ArmDriverError::MitFenceTripped(reason));
+                                }
+                                Err(TxRefusal::Transport(e)) => {
+                                    if self.in_active_control_release() && sent_mask != 0 {
+                                        if self.pending_stop_check(Some(start_stamp)).is_err() {
+                                            self.trip_fence(MitFenceTripReason::EstopBetweenAttempts {
+                                                joint: (i + 1) as u8,
+                                                completed_joints: i as u8,
+                                                total_joints,
+                                            });
+                                            return Err(ArmDriverError::EstopInhibited);
+                                        }
+                                        if self.fence_check().is_ok() {
+                                            let covered = sent_mask;
+                                            let n_cap = self.motor_ids.len().min(MAX_MODE_JOINTS);
+                                            self.watchdog_continuity_recovery_budget = self
+                                                .watchdog_continuity_recovery_budget
+                                                .saturating_add(1)
+                                                .min(n_cap);
+                                            if self
+                                                .send_mit_continuity_holds_for_uncovered(
+                                                    active_mask,
+                                                    covered,
+                                                    None,
+                                                    start_stamp,
+                                                    true,
+                                                    &mut started,
+                                                    &mut sent_any,
+                                                    &mut sent_mask,
+                                                    &mut sent_slot_mask,
+                                                )
+                                                .is_ok()
+                                            {
+                                                fell_back_partial = true;
+                                                return Ok(());
+                                            }
+                                        }
+                                    }
+                                    self.mark_tx_pass_backpressured();
+                                    if self.pending_stop_check(Some(start_stamp)).is_err() {
+                                        self.trip_fence(MitFenceTripReason::EstopBetweenAttempts {
+                                            joint: (i + 1) as u8,
+                                            completed_joints: i as u8,
+                                            total_joints,
+                                        });
+                                        return Err(ArmDriverError::EstopInhibited);
+                                    }
+                                    self.last_hold_tx_due_mask = due_mask;
+                                    self.last_hold_tx_sent_mask = if self.can.flush_is_noop() { sent_slot_mask } else { 0 };
+                                    self.trip_fence(MitFenceTripReason::TransmitFailed {
+                                        joint: (i + 1) as u8,
+                                        completed_joints: i as u8,
+                                        total_joints,
+                                        kind: TxFailKind::from_transport(&e),
+                                    });
+                                    return Err(e.into());
+                                }
+                                Err(TxRefusal::DeadlinePassed) => {
+                                    let reason = MitFenceTripReason::TxBudgetDeadlineBeforeBatch;
+                                    self.trip_fence(reason);
+                                    return Err(ArmDriverError::MitFenceTripped(reason));
+                                }
+                                Err(r @ (TxRefusal::TorqueOffWouldDrop | TxRefusal::DisableWaitEvidence | TxRefusal::DisableRequestExpired)) => {
+                                    return Err(Self::refusal_to_driver_err(r));
+                                }
+                                Err(TxRefusal::LeaseFenced | TxRefusal::EnableAuthorityExpired) => {
+                                    unreachable!("TxKind::RollbackHold is exempt from lease fence");
+                                }
                             }
                         }
                     }
-                }
+                    Ok(())
+                })();
+                loop_res?;
                 if self.pending_stop_check(Some(start_stamp)).is_err() {
                     self.trip_fence(MitFenceTripReason::EstopBeforeFlush { total_joints });
                     return Err(ArmDriverError::EstopInhibited);
                 }
                 if sent_any {
-                    if self.flush_cutoff_exceeded() {
+                    let flush_blocked = if self.in_active_control_release() {
+                        !self.can.flush_is_noop()
+                            && self.tick_tx.is_some_and(|p| self.now() >= p.deadline)
+                            && !fell_back_partial
+                    } else {
+                        self.flush_cutoff_exceeded()
+                    };
+                    if flush_blocked {
                         self.mark_tx_pass_backpressured();
                         self.discard_staged_ctrl_tx();
                         self.last_hold_tx_sent_any = false;
@@ -22072,13 +22797,22 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             return arm_res;
         }
         let stop_intent_stamp = self.current_j7_intent_stamp();
-        match pos_force_emitter::emit_tick(self, PosForceIntent::stop(stop_intent_stamp), stop_intent_stamp) {
+        let hold_bypass = self.j7_hold_continuity_bypass();
+        match pos_force_emitter::emit_tick(
+            self,
+            PosForceIntent::stop(stop_intent_stamp),
+            stop_intent_stamp,
+            hold_bypass,
+        ) {
             Ok(PosForceEmitOutcome::NotApplicable) => arm_res,
             Ok(PosForceEmitOutcome::AwaitingFirstFresh { pf_status, .. }) => {
                 self.last_tx_pf_status = pf_status;
                 arm_res
             }
-            Ok(PosForceEmitOutcome::Sent { joint, pf_status, .. }) => {
+            Ok(
+                PosForceEmitOutcome::Sent { joint, pf_status, .. }
+                | PosForceEmitOutcome::SentHoldInsteadOfTarget { joint, pf_status, .. },
+            ) => {
                 let pf_bit = joint.saturating_mul(2);
                 let pf_mask = if pf_bit < 64 { 1u64 << pf_bit } else { 0 };
                 self.last_hold_tx_sent_any = true;
@@ -22161,12 +22895,18 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 }
             }
         }
-        let res = pos_force_emitter::emit_tick(self, intent, current);
-        if self.control_release_managed && self.control_release_id != 0 {
-            if let Ok(PosForceEmitOutcome::Sent { joint, .. }) = res {
-                if joint < 32 {
-                    self.release_ctrl_tx_mask |= 1u32 << joint;
-                }
+        let hold_bypass = self.j7_hold_continuity_bypass();
+        let res = pos_force_emitter::emit_tick(self, intent, current, hold_bypass);
+        if let Ok(
+            PosForceEmitOutcome::Sent { joint, .. }
+            | PosForceEmitOutcome::SentHoldInsteadOfTarget { joint, .. },
+        ) = res
+        {
+            if self.mit_fence.is_some() && joint < self.mit_fence_last_cmd.len() {
+                self.mit_fence_last_cmd[joint] = Some(self.now());
+            }
+            if self.control_release_managed && self.control_release_id != 0 && joint < 32 {
+                self.release_ctrl_tx_mask |= 1u32 << joint;
             }
         }
         res
@@ -22350,113 +23090,234 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     self.trip_fence(reason);
                     return Err(ArmDriverError::MitFenceTripped(reason));
                 }
+                // Watchdog-continuity measured holds under an armed MIT fence are NEVER deferrable
+                // by the per-release ledger (`release_tx_limit`): send valid holds for every armed
+                // axis in the same release.
                 let mut sent_any = false;
                 let mut sent_mask = 0u64;
                 let mut sent_slot_mask = 0u64;
-                for (i, target) in targets.iter().enumerate() {
-                    if (active_mask & (1u64 << i)) == 0 {
-                        continue;
-                    }
-                    if self.build_verified_hold_frame(i, target).is_none() {
-                        report.joint_status[i] = JointHoldStatus::UnheldNoVerifiedMode;
-                        continue;
-                    }
-                    let captured_pos = target.position;
-                    if started[i].is_none() {
-                        started[i] = Some(self.now());
-                    }
-                    match self.send_plain(TxKind::MeasuredHold(i), Some(start_stamp), None, true, |d| {
-                        if !captured_pos.is_finite() {
-                            return None;
+                let mut fell_back_partial = false;
+                let hold_bypass = if self.in_active_control_release()
+                    && self.tx_release_deadline.is_some_and(|cap| self.now() >= cap)
+                {
+                    ContinuityBypass::LedgerAndReleaseDeadline
+                } else {
+                    ContinuityBypass::Ledger
+                };
+                let loop_res: Result<(), ArmDriverError> = (|| {
+                    for (i, target) in targets.iter().enumerate() {
+                        if (active_mask & (1u64 << i)) == 0 {
+                            continue;
                         }
-                        let hold_target = JointTarget {
-                            position: captured_pos,
-                            velocity: Some(0.0),
-                            kp: target.kp,
-                            kd: target.kd,
-                            torque: target.torque,
-                        };
-                        d.build_verified_hold_frame(i, &hold_target)
-                    }) {
-                        Ok(sent_frame) => {
-                            let mit_params = self.resolved_mit_params(target);
-                            self.record_sent_target(i, sent_frame, Some(mit_params));
-                            sent_any = true;
-                            sent_mask |= 1u64 << i;
-                            let bit = i.saturating_mul(2);
-                            if bit < 64 {
-                                sent_slot_mask |= 1u64 << bit;
-                            }
+                        if self.build_verified_hold_frame(i, target).is_none() {
+                            report.joint_status[i] = JointHoldStatus::UnheldNoVerifiedMode;
+                            continue;
                         }
-                        Err(TxRefusal::BuildRefused | TxRefusal::PosForceFeedbackExpired(_)) => {
-                            let bit = i.saturating_mul(2);
-                            if bit < 64 {
-                                due_mask &= !(1u64 << bit);
-                            }
-                            report.joint_status[i] =
-                                if self.fresh_measured_position(i, STOPPED_DISABLE_FEEDBACK_MAX_AGE).is_none() {
-                                    JointHoldStatus::UnheldNoFreshFeedback
-                                } else {
-                                    JointHoldStatus::UnheldNoVerifiedMode
+                        let captured_pos = target.position;
+                        if started[i].is_none() {
+                            started[i] = Some(self.now());
+                        }
+                        match self.send_plain_with_bypass(
+                            TxKind::MeasuredHold(i),
+                            Some(start_stamp),
+                            None,
+                            true,
+                            hold_bypass,
+                            |d| {
+                                if !captured_pos.is_finite() {
+                                    return None;
+                                }
+                                let hold_target = JointTarget {
+                                    position: captured_pos,
+                                    velocity: Some(0.0),
+                                    kp: target.kp,
+                                    kd: target.kd,
+                                    torque: target.torque,
                                 };
-                        }
-                        Err(TxRefusal::Deferred) => {
-                            let reason = MitFenceTripReason::TxBudgetExhausted {
-                                completed_joints: i as u8,
-                                total_joints,
-                            };
-                            self.trip_fence(reason);
-                            return Err(ArmDriverError::MitFenceTripped(reason));
-                        }
-                        Err(TxRefusal::MitFenceTripped(reason)) => {
-                            return Err(ArmDriverError::MitFenceTripped(reason));
-                        }
-                        Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged) => {
-                            self.trip_fence(MitFenceTripReason::EstopDuringBatch {
-                                completed_joints: i as u8,
-                                total_joints,
-                            });
-                            return Err(ArmDriverError::EstopInhibited);
-                        }
-                        Err(TxRefusal::Transport(e)) => {
-                            self.mark_tx_pass_backpressured();
-                            if self.pending_stop_check(Some(start_stamp)).is_err() {
-                                self.trip_fence(MitFenceTripReason::EstopBetweenAttempts {
-                                    joint: (i + 1) as u8,
+                                d.build_verified_hold_frame(i, &hold_target)
+                            },
+                        ) {
+                            Ok(sent_frame) => {
+                                let mit_params = self.resolved_mit_params(target);
+                                self.record_sent_target(i, sent_frame, Some(mit_params));
+                                sent_any = true;
+                                sent_mask |= 1u64 << i;
+                                let bit = i.saturating_mul(2);
+                                if bit < 64 {
+                                    sent_slot_mask |= 1u64 << bit;
+                                }
+                            }
+                            Err(TxRefusal::BuildRefused | TxRefusal::PosForceFeedbackExpired(_)) => {
+                                let bit = i.saturating_mul(2);
+                                if bit < 64 {
+                                    due_mask &= !(1u64 << bit);
+                                }
+                                report.joint_status[i] =
+                                    if self.fresh_measured_position(i, STOPPED_DISABLE_FEEDBACK_MAX_AGE).is_none() {
+                                        JointHoldStatus::UnheldNoFreshFeedback
+                                    } else {
+                                        JointHoldStatus::UnheldNoVerifiedMode
+                                    };
+                            }
+                            Err(TxRefusal::Deferred | TxRefusal::DeadlinePassed)
+                                if self.in_active_control_release() && sent_mask != 0 =>
+                            {
+                                if self.pending_stop_check(Some(start_stamp)).is_err() {
+                                    self.trip_fence(MitFenceTripReason::EstopDuringBatch {
+                                        completed_joints: i as u8,
+                                        total_joints,
+                                    });
+                                    return Err(ArmDriverError::EstopInhibited);
+                                }
+                                self.fence_check()?;
+                                let covered = sent_mask;
+                                match self.send_mit_continuity_holds_for_uncovered(
+                                    active_mask,
+                                    covered,
+                                    None,
+                                    start_stamp,
+                                    true,
+                                    &mut started,
+                                    &mut sent_any,
+                                    &mut sent_mask,
+                                    &mut sent_slot_mask,
+                                ) {
+                                    Ok(()) => {
+                                        fell_back_partial = true;
+                                        return Ok(());
+                                    }
+                                    Err((fj, TxRefusal::StopInhibited | TxRefusal::StopStampChanged)) => {
+                                        self.trip_fence(MitFenceTripReason::EstopDuringBatch {
+                                            completed_joints: fj as u8,
+                                            total_joints,
+                                        });
+                                        return Err(ArmDriverError::EstopInhibited);
+                                    }
+                                    Err((_, TxRefusal::MitFenceTripped(reason))) => {
+                                        return Err(ArmDriverError::MitFenceTripped(reason));
+                                    }
+                                    Err((fj, TxRefusal::Transport(e))) => {
+                                        self.mark_tx_pass_backpressured();
+                                        self.trip_fence(MitFenceTripReason::TransmitFailed {
+                                            joint: (fj + 1) as u8,
+                                            completed_joints: fj as u8,
+                                            total_joints,
+                                            kind: TxFailKind::from_transport(&e),
+                                        });
+                                        return Err(e.into());
+                                    }
+                                    Err((fj, _)) => {
+                                        let reason = MitFenceTripReason::TxBudgetExhausted {
+                                            completed_joints: fj as u8,
+                                            total_joints,
+                                        };
+                                        self.trip_fence(reason);
+                                        return Err(ArmDriverError::MitFenceTripped(reason));
+                                    }
+                                }
+                            }
+                            Err(TxRefusal::Deferred) => {
+                                let reason = MitFenceTripReason::TxBudgetExhausted {
+                                    completed_joints: i as u8,
+                                    total_joints,
+                                };
+                                self.trip_fence(reason);
+                                return Err(ArmDriverError::MitFenceTripped(reason));
+                            }
+                            Err(TxRefusal::MitFenceTripped(reason)) => {
+                                return Err(ArmDriverError::MitFenceTripped(reason));
+                            }
+                            Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged) => {
+                                self.trip_fence(MitFenceTripReason::EstopDuringBatch {
                                     completed_joints: i as u8,
                                     total_joints,
                                 });
                                 return Err(ArmDriverError::EstopInhibited);
                             }
-                            self.last_hold_tx_due_mask = due_mask;
-                            self.last_hold_tx_sent_mask = if self.can.flush_is_noop() { sent_slot_mask } else { 0 };
-                            self.trip_fence(MitFenceTripReason::TransmitFailed {
-                                joint: (i + 1) as u8,
-                                completed_joints: i as u8,
-                                total_joints,
-                                kind: TxFailKind::from_transport(&e),
-                            });
-                            return Err(e.into());
-                        }
-                        Err(TxRefusal::DeadlinePassed) => {
-                            let reason = MitFenceTripReason::TxBudgetDeadlineBeforeBatch;
-                            self.trip_fence(reason);
-                            return Err(ArmDriverError::MitFenceTripped(reason));
-                        }
-                        Err(r @ (TxRefusal::TorqueOffWouldDrop | TxRefusal::DisableWaitEvidence | TxRefusal::DisableRequestExpired)) => {
-                            return Err(Self::refusal_to_driver_err(r));
-                        }
-                        Err(TxRefusal::LeaseFenced | TxRefusal::EnableAuthorityExpired) => {
-                            unreachable!("TxKind::MeasuredHold is exempt from lease fence");
+                            Err(TxRefusal::Transport(e)) => {
+                                if self.in_active_control_release() && sent_mask != 0 {
+                                    if self.pending_stop_check(Some(start_stamp)).is_err() {
+                                        self.trip_fence(MitFenceTripReason::EstopBetweenAttempts {
+                                            joint: (i + 1) as u8,
+                                            completed_joints: i as u8,
+                                            total_joints,
+                                        });
+                                        return Err(ArmDriverError::EstopInhibited);
+                                    }
+                                    if self.fence_check().is_ok() {
+                                        let covered = sent_mask;
+                                        let n_cap = self.motor_ids.len().min(MAX_MODE_JOINTS);
+                                        self.watchdog_continuity_recovery_budget = self
+                                            .watchdog_continuity_recovery_budget
+                                            .saturating_add(1)
+                                            .min(n_cap);
+                                        if self
+                                            .send_mit_continuity_holds_for_uncovered(
+                                                active_mask,
+                                                covered,
+                                                None,
+                                                start_stamp,
+                                                true,
+                                                &mut started,
+                                                &mut sent_any,
+                                                &mut sent_mask,
+                                                &mut sent_slot_mask,
+                                            )
+                                            .is_ok()
+                                        {
+                                            fell_back_partial = true;
+                                            return Ok(());
+                                        }
+                                    }
+                                }
+                                self.mark_tx_pass_backpressured();
+                                if self.pending_stop_check(Some(start_stamp)).is_err() {
+                                    self.trip_fence(MitFenceTripReason::EstopBetweenAttempts {
+                                        joint: (i + 1) as u8,
+                                        completed_joints: i as u8,
+                                        total_joints,
+                                    });
+                                    return Err(ArmDriverError::EstopInhibited);
+                                }
+                                self.last_hold_tx_due_mask = due_mask;
+                                self.last_hold_tx_sent_mask = if self.can.flush_is_noop() { sent_slot_mask } else { 0 };
+                                self.trip_fence(MitFenceTripReason::TransmitFailed {
+                                    joint: (i + 1) as u8,
+                                    completed_joints: i as u8,
+                                    total_joints,
+                                    kind: TxFailKind::from_transport(&e),
+                                });
+                                return Err(e.into());
+                            }
+                            Err(TxRefusal::DeadlinePassed) => {
+                                let reason = MitFenceTripReason::TxBudgetDeadlineBeforeBatch;
+                                self.trip_fence(reason);
+                                return Err(ArmDriverError::MitFenceTripped(reason));
+                            }
+                            Err(r @ (TxRefusal::TorqueOffWouldDrop | TxRefusal::DisableWaitEvidence | TxRefusal::DisableRequestExpired)) => {
+                                return Err(Self::refusal_to_driver_err(r));
+                            }
+                            Err(TxRefusal::LeaseFenced | TxRefusal::EnableAuthorityExpired) => {
+                                unreachable!("TxKind::MeasuredHold is exempt from lease fence");
+                            }
                         }
                     }
-                }
+                    Ok(())
+                })();
+                loop_res?;
                 if self.pending_stop_check(Some(start_stamp)).is_err() {
                     self.trip_fence(MitFenceTripReason::EstopBeforeFlush { total_joints });
                     return Err(ArmDriverError::EstopInhibited);
                 }
                 if sent_any {
-                    if self.flush_cutoff_exceeded() {
+                    let flush_blocked = if self.in_active_control_release() {
+                        !self.can.flush_is_noop()
+                            && self.tick_tx.is_some_and(|p| self.now() >= p.deadline)
+                            && !fell_back_partial
+                    } else {
+                        self.flush_cutoff_exceeded()
+                    };
+                    if flush_blocked {
                         self.mark_tx_pass_backpressured();
                         self.discard_staged_ctrl_tx();
                         self.last_hold_tx_sent_any = false;
@@ -22848,7 +23709,10 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 self.last_tx_pf_status = pf_status;
                 arm_res.map(|()| report)
             }
-            Ok(PosForceEmitOutcome::Sent { joint, pf_status, .. }) => {
+            Ok(
+                PosForceEmitOutcome::Sent { joint, pf_status, .. }
+                | PosForceEmitOutcome::SentHoldInsteadOfTarget { joint, pf_status, .. },
+            ) => {
                 let pf_bit = joint.saturating_mul(2);
                 let pf_mask = if pf_bit < 64 { 1u64 << pf_bit } else { 0 };
                 self.last_hold_tx_sent_any = true;
@@ -23034,12 +23898,19 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 }
                 let start_stamp = self.current_stop_stamp();
                 let mut batch_frames = 0usize;
+                let mut active_mask: u64 = 0;
                 for (i, target) in targets.iter().enumerate() {
                     if self.joint_modes.get(i).copied().flatten() == Some(DamiaoControlMode::PosForce) {
                         continue;
                     }
                     match self.target_frames_checked(i, target) {
-                        Ok((frames, _)) => batch_frames += frames.into_iter().flatten().count(),
+                        Ok((frames, _)) => {
+                            let cnt = frames.into_iter().flatten().count();
+                            batch_frames += cnt;
+                            if cnt > 0 && i < 64 {
+                                active_mask |= 1u64 << i;
+                            }
+                        }
                         Err(e) => {
                             self.trip_fence(MitFenceTripReason::TargetUnavailable {
                                 joint: (i + 1) as u8,
@@ -23069,12 +23940,103 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     self.trip_fence(reason);
                     return Err(ArmDriverError::MitFenceTripped(reason));
                 }
-                if self.now() >= self.effective_tx_pass_deadline(pass) {
+                if self.now() >= pass.deadline {
                     let reason = MitFenceTripReason::TxBudgetDeadlineBeforeBatch;
                     self.trip_fence(reason);
                     return Err(ArmDriverError::MitFenceTripped(reason));
                 }
-                for (i, target) in targets.iter().enumerate() {
+                // Watchdog-continuity frames for an armed MIT fence are NEVER deferrable by the
+                // per-release ledger: when the ledger tightens `effective_tx_max_frames` or
+                // `tx_release_deadline` below the target batch, defer the motion target and emit
+                // valid stationary holds for every armed axis in the same release so no axis
+                // misses its watchdog/fence window.
+                let ledger_defers_targets = self.in_active_control_release()
+                    && (pass.attempts.saturating_add(batch_frames) > self.effective_tx_max_frames()
+                        || self.tx_release_deadline.is_some_and(|cap| self.now() >= cap));
+                if ledger_defers_targets {
+                    let mut sent_any = false;
+                    let mut sent_mask = 0u64;
+                    let mut sent_slot_mask = 0u64;
+                    match self.send_mit_continuity_holds_for_uncovered(
+                        active_mask,
+                        0,
+                        None,
+                        start_stamp,
+                        true,
+                        &mut started,
+                        &mut sent_any,
+                        &mut sent_mask,
+                        &mut sent_slot_mask,
+                    ) {
+                        Ok(()) => {}
+                        Err((fj, TxRefusal::StopInhibited | TxRefusal::StopStampChanged)) => {
+                            self.trip_fence(MitFenceTripReason::EstopDuringBatch {
+                                completed_joints: fj as u8,
+                                total_joints,
+                            });
+                            return Err(ArmDriverError::EstopInhibited);
+                        }
+                        Err((_, TxRefusal::MitFenceTripped(reason))) => {
+                            return Err(ArmDriverError::MitFenceTripped(reason));
+                        }
+                        Err((fj, TxRefusal::Transport(e))) => {
+                            self.mark_tx_pass_backpressured();
+                            self.trip_fence(MitFenceTripReason::TransmitFailed {
+                                joint: (fj + 1) as u8,
+                                completed_joints: fj as u8,
+                                total_joints,
+                                kind: TxFailKind::from_transport(&e),
+                            });
+                            return Err(e.into());
+                        }
+                        Err((fj, _)) => {
+                            let reason = MitFenceTripReason::TxBudgetExhausted {
+                                completed_joints: fj as u8,
+                                total_joints,
+                            };
+                            self.trip_fence(reason);
+                            return Err(ArmDriverError::MitFenceTripped(reason));
+                        }
+                    }
+                    if self.pending_stop_check(Some(start_stamp)).is_err() {
+                        self.discard_staged_ctrl_tx();
+                        self.trip_fence(MitFenceTripReason::EstopBeforeFlush { total_joints });
+                        return Err(ArmDriverError::EstopInhibited);
+                    }
+                    if sent_any {
+                        if let Err(e) = self.flush_can_and_commit() {
+                            self.mark_tx_pass_backpressured();
+                            if self.pending_stop_check(Some(start_stamp)).is_err() {
+                                self.trip_fence(MitFenceTripReason::EstopAfterFlush { total_joints });
+                                return Err(ArmDriverError::EstopInhibited);
+                            }
+                            self.trip_fence(MitFenceTripReason::FlushFailed {
+                                kind: TxFailKind::from_transport(&e),
+                            });
+                            return Err(e.into());
+                        }
+                    }
+                    self.fence_check()?;
+                    for (i, t) in started.into_iter().enumerate().take(targets.len()) {
+                        if t.is_some() && (sent_mask & (1u64 << i)) != 0 {
+                            self.mit_fence_last_cmd[i] = t;
+                            self.record_flushed_joint_tx(i, 0, false);
+                        }
+                    }
+                    self.last_target_tx_sent_mask = 0;
+                    return Ok(TxBatchOutcome::Deferred { pending: batch_frames });
+                }
+                if (!self.in_active_control_release()
+                    && self.now() >= self.effective_tx_pass_deadline(pass))
+                    || self.now() >= pass.deadline
+                {
+                    let reason = MitFenceTripReason::TxBudgetDeadlineBeforeBatch;
+                    self.trip_fence(reason);
+                    return Err(ArmDriverError::MitFenceTripped(reason));
+                }
+                let mut sent_mask: u64 = 0;
+                let mut fell_back_partial_uncovered: usize = 0;
+                'target_batch: for (i, target) in targets.iter().enumerate() {
                     if self.joint_modes.get(i).copied().flatten() == Some(DamiaoControlMode::PosForce) {
                         continue;
                     }
@@ -23104,6 +24066,73 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                             Ok(sent_frame) => {
                                 let mit_params = self.resolved_mit_params(target);
                                 self.record_sent_target(i, sent_frame, Some(mit_params));
+                                if i < 64 {
+                                    sent_mask |= 1u64 << i;
+                                }
+                            }
+                            Err(TxRefusal::Deferred | TxRefusal::DeadlinePassed)
+                                if self.in_active_control_release()
+                                    && (sent_mask != 0
+                                        || self
+                                            .tick_tx
+                                            .is_none_or(|p| !p.backpressured && self.now() < p.deadline)) =>
+                            {
+                                if self.strict_stop_check(Some(start_stamp)).is_err() {
+                                    self.trip_fence(MitFenceTripReason::EstopDuringBatch {
+                                        completed_joints: i as u8,
+                                        total_joints,
+                                    });
+                                    return Err(ArmDriverError::EstopInhibited);
+                                }
+                                self.fence_check()?;
+                                let covered = sent_mask;
+                                let uncovered = (active_mask & !covered).count_ones() as usize;
+                                let mut dummy_any = false;
+                                let mut dummy_slot = 0u64;
+                                match self.send_mit_continuity_holds_for_uncovered(
+                                    active_mask,
+                                    covered,
+                                    None,
+                                    start_stamp,
+                                    true,
+                                    &mut started,
+                                    &mut dummy_any,
+                                    &mut sent_mask,
+                                    &mut dummy_slot,
+                                ) {
+                                    Ok(()) => {
+                                        fell_back_partial_uncovered = uncovered.max(1);
+                                        break 'target_batch;
+                                    }
+                                    Err((fj, TxRefusal::StopInhibited | TxRefusal::StopStampChanged)) => {
+                                        self.trip_fence(MitFenceTripReason::EstopDuringBatch {
+                                            completed_joints: fj as u8,
+                                            total_joints,
+                                        });
+                                        return Err(ArmDriverError::EstopInhibited);
+                                    }
+                                    Err((_, TxRefusal::MitFenceTripped(reason))) => {
+                                        return Err(ArmDriverError::MitFenceTripped(reason));
+                                    }
+                                    Err((fj, TxRefusal::Transport(e))) => {
+                                        self.mark_tx_pass_backpressured();
+                                        self.trip_fence(MitFenceTripReason::TransmitFailed {
+                                            joint: (fj + 1) as u8,
+                                            completed_joints: fj as u8,
+                                            total_joints,
+                                            kind: TxFailKind::from_transport(&e),
+                                        });
+                                        return Err(e.into());
+                                    }
+                                    Err((fj, _)) => {
+                                        let reason = MitFenceTripReason::TxBudgetExhausted {
+                                            completed_joints: fj as u8,
+                                            total_joints,
+                                        };
+                                        self.trip_fence(reason);
+                                        return Err(ArmDriverError::MitFenceTripped(reason));
+                                    }
+                                }
                             }
                             Err(TxRefusal::Deferred) => {
                                 let reason = MitFenceTripReason::TxBudgetExhausted {
@@ -23146,6 +24175,44 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                                 return Err(ArmDriverError::PosForceTargetUnavailable { joint: i });
                             }
                             Err(TxRefusal::Transport(e)) => {
+                                if self.in_active_control_release() && sent_mask != 0 {
+                                    if self.strict_stop_check(Some(start_stamp)).is_err() {
+                                        self.trip_fence(MitFenceTripReason::EstopBetweenAttempts {
+                                            joint: (i + 1) as u8,
+                                            completed_joints: i as u8,
+                                            total_joints,
+                                        });
+                                        return Err(ArmDriverError::EstopInhibited);
+                                    }
+                                    if self.fence_check().is_ok() {
+                                        let covered = sent_mask;
+                                        let uncovered = (active_mask & !covered).count_ones() as usize;
+                                        let mut dummy_any = false;
+                                        let mut dummy_slot = 0u64;
+                                        let n_cap = self.motor_ids.len().min(MAX_MODE_JOINTS);
+                                        self.watchdog_continuity_recovery_budget = self
+                                            .watchdog_continuity_recovery_budget
+                                            .saturating_add(1)
+                                            .min(n_cap);
+                                        if self
+                                            .send_mit_continuity_holds_for_uncovered(
+                                                active_mask,
+                                                covered,
+                                                None,
+                                                start_stamp,
+                                                true,
+                                                &mut started,
+                                                &mut dummy_any,
+                                                &mut sent_mask,
+                                                &mut dummy_slot,
+                                            )
+                                            .is_ok()
+                                        {
+                                            fell_back_partial_uncovered = uncovered.max(1);
+                                            break 'target_batch;
+                                        }
+                                    }
+                                }
                                 self.mark_tx_pass_backpressured();
                                 if self.strict_stop_check(Some(start_stamp)).is_err() {
                                     self.trip_fence(MitFenceTripReason::EstopBetweenAttempts {
@@ -23183,7 +24250,14 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     self.discard_staged_ctrl_tx();
                     return Err(ArmDriverError::LeaseFenced);
                 }
-                if self.flush_cutoff_exceeded() {
+                let flush_blocked = if self.in_active_control_release() {
+                    !self.can.flush_is_noop()
+                        && self.tick_tx.is_some_and(|p| self.now() >= p.deadline)
+                        && fell_back_partial_uncovered == 0
+                } else {
+                    self.flush_cutoff_exceeded()
+                };
+                if flush_blocked {
                     self.mark_tx_pass_backpressured();
                     self.discard_staged_ctrl_tx();
                     self.trip_fence(MitFenceTripReason::FlushFailed {
@@ -23210,18 +24284,26 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     return Err(ArmDriverError::LeaseFenced);
                 }
                 self.fence_check()?;
-                let mut sent_mask: u64 = 0;
+                let mut sent_mask_final: u64 = 0;
                 for (i, t) in started.into_iter().enumerate().take(targets.len()) {
                     if t.is_some() {
                         self.mit_fence_last_cmd[i] = t;
-                        self.record_flushed_joint_tx(i, 0, true);
+                        self.record_flushed_joint_tx(i, 0, fell_back_partial_uncovered == 0);
                         if i < 64 {
-                            sent_mask |= 1u64 << i;
+                            sent_mask_final |= 1u64 << i;
                         }
                     }
                 }
-                self.last_target_tx_sent_mask = sent_mask;
-                Ok(TxBatchOutcome::Complete)
+                self.last_target_tx_sent_mask = if fell_back_partial_uncovered == 0 {
+                    sent_mask_final
+                } else {
+                    0
+                };
+                if fell_back_partial_uncovered > 0 {
+                    Ok(TxBatchOutcome::Deferred { pending: fell_back_partial_uncovered })
+                } else {
+                    Ok(TxBatchOutcome::Complete)
+                }
             })();
 
             if self.external_pos_force_emitter || matches!(arm_res, Err(ArmDriverError::EstopInhibited)) {
@@ -23240,7 +24322,14 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 _ => PosForceIntent::hold(pre_arm_intent_stamp),
             };
             let current_intent_stamp = self.current_j7_intent_stamp();
-            return match pos_force_emitter::emit_tick(self, j7_intent, current_intent_stamp) {
+            let hold_bypass = self.j7_hold_continuity_bypass();
+            let j7_res = pos_force_emitter::emit_tick(
+                self,
+                j7_intent,
+                current_intent_stamp,
+                hold_bypass,
+            );
+            return match j7_res {
                 Ok(PosForceEmitOutcome::NotApplicable) => arm_res,
                 Ok(PosForceEmitOutcome::AwaitingFirstFresh { pf_status, .. }) => {
                     self.last_tx_pf_status = pf_status;
@@ -23268,6 +24357,33 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         }
                     }
                     arm_res
+                }
+                Ok(PosForceEmitOutcome::SentHoldInsteadOfTarget { pf_status, .. }) => {
+                    self.last_tx_pf_status = pf_status;
+                    if arm_res.is_ok() {
+                        self.mit_fence_last_cmd[pf_j] = Some(self.now());
+                        if let PosForceTxStatus::Stale { .. } = pf_status {
+                            self.trip_fence(MitFenceTripReason::TargetUnavailable {
+                                joint: (pf_j + 1) as u8,
+                                completed_joints: pf_j as u8,
+                                total_joints,
+                            });
+                            return Err(ArmDriverError::PosForceFeedbackStaleBeforeTransmit { joint: pf_j });
+                        }
+                    }
+                    match arm_res {
+                        Ok(TxBatchOutcome::Complete) => Ok(TxBatchOutcome::Deferred { pending: 1 }),
+                        Ok(TxBatchOutcome::Deferred { pending }) => {
+                            Ok(TxBatchOutcome::Deferred { pending: pending.saturating_add(1) })
+                        }
+                        Ok(TxBatchOutcome::Expired { dropped, pending }) => {
+                            Ok(TxBatchOutcome::Expired {
+                                dropped,
+                                pending: pending.saturating_add(1),
+                            })
+                        }
+                        Err(e) => Err(e),
+                    }
                 }
                 Ok(PosForceEmitOutcome::Deferred { pf_status, .. }) => {
                     self.last_tx_pf_status = pf_status;
@@ -23387,7 +24503,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             ),
         };
         let current_intent_stamp = self.current_j7_intent_stamp();
-        match pos_force_emitter::emit_tick(self, j7_intent, current_intent_stamp)? {
+        let hold_bypass = self.j7_hold_continuity_bypass();
+        match pos_force_emitter::emit_tick(self, j7_intent, current_intent_stamp, hold_bypass)? {
             PosForceEmitOutcome::NotApplicable => Ok(arm_out),
             PosForceEmitOutcome::AwaitingFirstFresh { pf_status, .. } => {
                 self.last_tx_pf_status = pf_status;
@@ -23397,7 +24514,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 self.last_tx_pf_status = pf_status;
                 Ok(arm_out)
             }
-            PosForceEmitOutcome::Deferred { pf_status, .. } => {
+            PosForceEmitOutcome::SentHoldInsteadOfTarget { pf_status, .. }
+            | PosForceEmitOutcome::Deferred { pf_status, .. } => {
                 self.last_tx_pf_status = pf_status;
                 Ok(match arm_out {
                     TxBatchOutcome::Complete => TxBatchOutcome::Deferred { pending: 1 },
@@ -23503,7 +24621,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
         self.last_poll_rx = None;
         self.rx_deadline = Some(deadline);
-        self.rx_frame_limit = Some(max_rx_frames.min(64));
+        let effective_rx_limit = self.clamp_release_rx_limit(max_rx_frames);
+        self.rx_frame_limit = Some(effective_rx_limit);
         let r = self.receive_feedback();
         self.rx_deadline = None;
         self.rx_frame_limit = None;
@@ -24136,9 +25255,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             }
         }
         self.account_rx_pass(frames_processed, !rx_drained && !hit_err);
-        self.release_rx_frames = self
-            .release_rx_frames
-            .saturating_add(frames_processed.min(u16::MAX as usize) as u16);
 
         // R2 Blocker 1: Resolve SAFE-HOLD / stopped recovery `REG_READ(RID_CTRL_MODE)` probes for
         // mode-uncertain joints strictly AFTER observed empty RX queue closure using the timed
@@ -24497,6 +25613,42 @@ impl DamiaoTxKind for TxKind {
     }
 }
 
+/// Explicit per-call watchdog-continuity bypass mode (NEVER ambient state on `DamiaoArmDriver`).
+/// Valid ONLY for stationary Hold/Stop frames (`TxKind::Hold`, `TxKind::RollbackHold`,
+/// `TxKind::MeasuredHold`); ignored (forced to `None`) for all motion (`Target`) and other kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ContinuityBypass {
+    /// Normal per-release ledger and release cutoff enforcement.
+    #[default]
+    None,
+    /// Bypass per-release ledger tightening (`release_tx_limit`), keeping `tx_budget.max_frames`
+    /// and `tx_release_deadline`.
+    Ledger,
+    /// Bypass both per-release ledger tightening and `tx_release_deadline` (and allow bounded
+    /// `watchdog_continuity_recovery_budget` slots) for non-deferrable continuity holds.
+    LedgerAndReleaseDeadline,
+}
+
+impl ContinuityBypass {
+    #[inline]
+    const fn bypasses_ledger(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    #[inline]
+    const fn bypasses_release_deadline(self) -> bool {
+        matches!(self, Self::LedgerAndReleaseDeadline)
+    }
+
+    #[inline]
+    const fn for_tx_kind(self, kind: TxKind) -> Self {
+        match kind {
+            TxKind::Hold | TxKind::RollbackHold(_) | TxKind::MeasuredHold(_) => self,
+            _ => Self::None,
+        }
+    }
+}
+
 /// Private single-emitter module for Damiao J7 `PosForce` (`0x300 + motor_id`) frames.
 ///
 /// Type-system enforcement:
@@ -24575,6 +25727,7 @@ mod pos_force_emitter {
     /// - `stale` (`allow_freeze == true`) -> FREEZE / documented boot-fallback parameters.
     /// - `stale` (`allow_freeze == false`) -> fails closed (`BuildRefused` /
     ///   `PosForceFeedbackExpired`), emitting 0 frames.
+    #[allow(clippy::too_many_arguments)]
     fn send_frame<C: CanTransport>(
         driver: &mut DamiaoArmDriver<C>,
         kind: TxKind,
@@ -24584,7 +25737,15 @@ mod pos_force_emitter {
         allow_freeze: bool,
         retry: bool,
         fenced: bool,
+        deadline: Option<Deadline>,
+        continuity_bypass: ContinuityBypass,
     ) -> Result<CanFrame, TxRefusal> {
+        let effective_bypass = match intent {
+            PosForceIntentKind::Hold | PosForceIntentKind::Stop => {
+                continuity_bypass.for_tx_kind(kind)
+            }
+            PosForceIntentKind::Target { .. } => ContinuityBypass::None,
+        };
         let token = PosForceSendToken(());
         let build = |d: &DamiaoArmDriver<C>| -> Option<CanFrame> {
             let pf = d.pos_force.as_ref()?;
@@ -24634,14 +25795,15 @@ mod pos_force_emitter {
             Some(build_wire_frame(&token, motor_id, pos, vel_raw, cur_raw))
         };
         if retry {
-            driver.send_with_retry_inner(kind, expected_stamp, None, fenced, Some(&token), build)
+            driver.send_with_retry_inner(kind, expected_stamp, deadline, fenced, Some(&token), build)
         } else {
-            driver.send_with_lease(
+            driver.send_with_lease_and_bypass(
                 authorize_kind(&token, kind),
                 expected_stamp,
                 expected_lease_gen,
-                None,
+                deadline,
                 fenced,
+                effective_bypass,
                 build,
             )
         }
@@ -24665,6 +25827,8 @@ mod pos_force_emitter {
             false,
             false,
             false,
+            None,
+            ContinuityBypass::None,
         )
     }
 
@@ -24680,7 +25844,18 @@ mod pos_force_emitter {
         fenced: bool,
     ) -> Result<CanFrame, TxRefusal> {
         let kind = if is_rollback { TxKind::RollbackHold(joint) } else { TxKind::Hold };
-        send_frame(driver, kind, expected_stamp, 0, intent, false, true, fenced)
+        send_frame(
+            driver,
+            kind,
+            expected_stamp,
+            0,
+            intent,
+            false,
+            true,
+            fenced,
+            None,
+            ContinuityBypass::None,
+        )
     }
 
     /// Narrow standalone-driver recovery API: called ONLY from `DamiaoArmDriver::receive_feedback`
@@ -24708,6 +25883,8 @@ mod pos_force_emitter {
             false,
             false,
             false,
+            None,
+            ContinuityBypass::None,
         )
     }
 
@@ -24722,10 +25899,14 @@ mod pos_force_emitter {
     /// Single stop-generation / E-stop epoch / lease-generation enforcement rule: any `Target`
     /// intent whose `(stop_gen, estop_epoch, lease_gen)` stamp is stale or lease-fenced is
     /// degraded to `Hold` and is NEVER re-stamped with a newer generation.
+    ///
+    /// `hold_bypass` is an explicit per-call parameter valid ONLY for stationary `Hold`/`Stop`
+    /// frames (never applied to motion `Target` frames).
     pub(super) fn emit_tick<C: CanTransport>(
         driver: &mut DamiaoArmDriver<C>,
         intent: PosForceIntent,
         current: PosForceIntentStamp,
+        hold_bypass: ContinuityBypass,
     ) -> Result<PosForceEmitOutcome, ArmDriverError> {
         let Some(pf_j) = driver.active_pos_force_joint() else {
             return Ok(PosForceEmitOutcome::NotApplicable);
@@ -24822,14 +26003,31 @@ mod pos_force_emitter {
             }
         }
 
+        let armed_mit = driver.mit_fence.is_some() && driver.mit_fence_trip.is_none();
         let mut active_kind = effective_kind;
         let mut retried = false;
+        let mut degraded_target_to_continuity_hold = false;
         let sent_frame = loop {
             let (kind, target_lease_gen) = match active_kind {
                 PosForceIntentKind::Target { .. } => (TxKind::Target, intent.stamp.lease_gen),
                 PosForceIntentKind::Hold | PosForceIntentKind::Stop => (TxKind::RollbackHold(pf_j), 0),
             };
-            match send_frame(
+            // Only stationary Hold/Stop continuity frames receive `hold_bypass`; Target motion
+            // frames ALWAYS run with `ContinuityBypass::None` and an explicit release cutoff
+            // deadline checked immediately before `can.transmit`.
+            let is_hold_intent = matches!(active_kind, PosForceIntentKind::Hold | PosForceIntentKind::Stop);
+            let attempt_bypass = if is_hold_intent {
+                hold_bypass
+            } else {
+                ContinuityBypass::None
+            };
+            let explicit_deadline = if attempt_bypass.bypasses_release_deadline() {
+                None
+            } else {
+                driver.active_release_cutoff_deadline()
+            };
+            let attempts_before = driver.tick_tx.map_or(0, |p| p.attempts);
+            let send_res = send_frame(
                 driver,
                 kind,
                 Some(start_stamp),
@@ -24838,7 +26036,10 @@ mod pos_force_emitter {
                 true,
                 false,
                 false,
-            ) {
+                explicit_deadline,
+                attempt_bypass,
+            );
+            match send_res {
                 Ok(frame) => break Some(frame),
                 Err(TxRefusal::LeaseFenced) => {
                     if !retried && matches!(active_kind, PosForceIntentKind::Target { .. }) {
@@ -24864,12 +26065,32 @@ mod pos_force_emitter {
                         // An invalid/unencodable target never suppresses J7: degrade to Hold.
                         if matches!(active_kind, PosForceIntentKind::Target { .. }) {
                             active_kind = PosForceIntentKind::Hold;
+                            is_target_intent = false;
                         }
                         continue;
                     }
                     break None;
                 }
                 Err(TxRefusal::Deferred | TxRefusal::DeadlinePassed) => {
+                    if armed_mit
+                        && !retried
+                        && matches!(active_kind, PosForceIntentKind::Target { .. })
+                    {
+                        if driver.in_active_control_release()
+                            && driver.tick_tx.map_or(0, |p| p.attempts) > attempts_before
+                        {
+                            let n_cap = driver.motor_ids.len().min(MAX_MODE_JOINTS);
+                            driver.watchdog_continuity_recovery_budget = driver
+                                .watchdog_continuity_recovery_budget
+                                .saturating_add(1)
+                                .min(n_cap);
+                        }
+                        retried = true;
+                        active_kind = PosForceIntentKind::Hold;
+                        is_target_intent = false;
+                        degraded_target_to_continuity_hold = true;
+                        continue;
+                    }
                     if !driver.pos_force_feedback_valid(pf_j, driver.now()) {
                         let _ = driver.check_pos_force_freshness_for_tx();
                     }
@@ -24963,7 +26184,12 @@ mod pos_force_emitter {
             driver.discard_staged_ctrl_tx();
             return Err(ArmDriverError::EstopInhibited);
         }
-        if driver.flush_cutoff_exceeded() {
+        let flush_blocked = if !is_target_intent && hold_bypass.bypasses_release_deadline() {
+            !driver.can.flush_is_noop() && driver.tick_tx.is_some_and(|p| driver.now() >= p.deadline)
+        } else {
+            driver.flush_cutoff_exceeded()
+        };
+        if flush_blocked {
             driver.mark_tx_pass_backpressured();
             driver.discard_staged_ctrl_tx();
             return Err(TransportError::Timeout.into());
@@ -24981,20 +26207,32 @@ mod pos_force_emitter {
         }
 
         driver.pf_hold_on_first_fresh = false;
-        driver.pf_deferred_ticks = 0;
-        driver.pf_deferred_motion = false;
-        driver.pf_deferred_since = None;
-        driver.pf_deferred_intent = None;
         let sent_vel_raw = u16::from_le_bytes([sent_frame.data[4], sent_frame.data[5]]);
         driver.record_flushed_joint_tx(pf_j, 0, sent_vel_raw > 0);
-        if pf_j < 64 {
-            driver.last_target_tx_sent_mask |= 1u64 << pf_j;
-        }
         if driver.mit_fence.is_some() && driver.mit_fence_trip.is_none() {
             driver.mit_fence_last_cmd[pf_j] = Some(entry_now);
         }
         let pf_status = driver.take_last_pos_force_tx_status();
-        Ok(PosForceEmitOutcome::Sent { joint: pf_j, freeze: is_freeze, pf_status })
+        if degraded_target_to_continuity_hold {
+            driver.pf_deferred_ticks = driver.pf_deferred_ticks.saturating_add(1);
+            driver.pf_deferred_motion = true;
+            driver.pf_deferred_since.get_or_insert(entry_now);
+            driver.pf_deferred_intent = Some(intent);
+            Ok(PosForceEmitOutcome::SentHoldInsteadOfTarget {
+                joint: pf_j,
+                freeze: is_freeze,
+                pf_status,
+            })
+        } else {
+            driver.pf_deferred_ticks = 0;
+            driver.pf_deferred_motion = false;
+            driver.pf_deferred_since = None;
+            driver.pf_deferred_intent = None;
+            if pf_j < 64 {
+                driver.last_target_tx_sent_mask |= 1u64 << pf_j;
+            }
+            Ok(PosForceEmitOutcome::Sent { joint: pf_j, freeze: is_freeze, pf_status })
+        }
     }
 }
 
@@ -27461,6 +28699,7 @@ mod tx_chokepoint_tests {
             &mut drv,
             PosForceIntent::target(-0.8, Some(0.30), None, stamp),
             stamp,
+            ContinuityBypass::None,
         )
         .expect("emit_tick target");
         assert!(matches!(out_t, PosForceEmitOutcome::Sent { joint: 0, freeze: false, .. }));
@@ -27470,8 +28709,13 @@ mod tx_chokepoint_tests {
 
         bus.clear_tx();
         drv.begin_tx_tick();
-        let out_h = pos_force_emitter::emit_tick(&mut drv, PosForceIntent::hold(stamp), stamp)
-            .expect("emit_tick hold");
+        let out_h = pos_force_emitter::emit_tick(
+            &mut drv,
+            PosForceIntent::hold(stamp),
+            stamp,
+            ContinuityBypass::None,
+        )
+        .expect("emit_tick hold");
         assert!(matches!(out_h, PosForceEmitOutcome::Sent { joint: 0, .. }));
         let tx_h = bus.tx.lock().unwrap().clone();
         assert_eq!(tx_h.len(), 1);

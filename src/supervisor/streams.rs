@@ -1125,16 +1125,23 @@ impl SupervisorInner {
     /// latch a fault and send no frame this tick; the command stays on the last issued
     /// output so the following fault-hold frames repeat what the motors already hold.
     /// Returns the classified [`crate::supervisor::TickOutput`].
-    pub(super) fn apply_tracking_fallback_step(
+    /// Zero-allocation RT counterpart to [`Self::apply_tracking_fallback_step`], reading output
+    /// positions/velocities from preallocated `scratch` and recycling completed `FallbackRamp`
+    /// buffers into `tracking.spare_fallback_ramp` so completion performs zero frees.
+    pub(super) fn apply_tracking_fallback_step_into(
         &mut self,
-        pending: crate::tracking::PendingFallback,
+        pending: crate::tracking::PendingFallbackScratch,
+        scratch: &crate::rt_core::scratch::TrackingScratch,
         gravity_output_enabled: bool,
     ) -> crate::supervisor::TickOutput {
         use crate::supervisor::TickOutput;
-        let crate::tracking::PendingFallback { step, ramp, other_depths } = pending;
+        let crate::tracking::PendingFallbackScratch { step, ramp, other_depths } = pending;
         match step {
             Ok(fb) => {
-                if self.check_static_load_tracking_output(&fb.positions, true).is_err() {
+                if self.check_static_load_tracking_output(&scratch.out_positions, true).is_err() {
+                    if self.tracking.spare_fallback_ramp.is_none() {
+                        self.tracking.spare_fallback_ramp = Some(ramp);
+                    }
                     if self.scratch.fallback_prev_confirmed_valid
                         && self.scratch.fallback_prev_confirmed.len() == self.commanded_positions.len()
                     {
@@ -1178,16 +1185,17 @@ impl SupervisorInner {
                     let dt = 1.0 / f64::from(self.config.control_frequency_hz.max(1));
                     return self.write_output_scratch(dt);
                 }
-                crate::rt_core::scratch::copy_into(&mut self.commanded_positions, &fb.positions);
-                crate::rt_core::scratch::copy_into(&mut self.target_positions, &fb.positions);
-                crate::rt_core::scratch::copy_into(&mut self.commanded_velocities, &fb.velocities);
+                crate::rt_core::scratch::copy_into(&mut self.commanded_positions, &scratch.out_positions);
+                crate::rt_core::scratch::copy_into(&mut self.target_positions, &scratch.out_positions);
+                crate::rt_core::scratch::copy_into(&mut self.commanded_velocities, &scratch.out_velocities);
                 self.commanded_accelerations.fill(0.0);
                 let mut targets = std::mem::take(&mut self.scratch.targets);
                 targets.clear();
                 targets.extend(
-                    fb.positions
+                    scratch
+                        .out_positions
                         .iter()
-                        .zip(fb.velocities.iter())
+                        .zip(scratch.out_velocities.iter())
                         .enumerate()
                         .map(|(i, (&p, &v))| JointTarget {
                             position: p,
@@ -1210,20 +1218,28 @@ impl SupervisorInner {
                         if done {
                             self.commanded_velocities.fill(0.0);
                         }
-                        // Commit the step's escape depths to the workspace it was checked
-                        // against; the other workspace's depths stay as they were.
                         let (full, park) = if ramp.keepout_only {
                             (other_depths, fb.ws_min_depths)
                         } else {
                             (fb.ws_min_depths, other_depths)
                         };
-                        self.tracking.record_issued_with_ws_depths(fb.positions, fb.velocities, full, park);
-                        self.tracking.fallback_ramp = (!done).then_some(ramp);
+                        self.tracking.record_issued_in_place(
+                            &scratch.out_positions,
+                            &scratch.out_velocities,
+                            full,
+                            park,
+                        );
+                        if done {
+                            if self.tracking.spare_fallback_ramp.is_none() {
+                                self.tracking.spare_fallback_ramp = Some(ramp);
+                            }
+                            self.tracking.fallback_ramp = None;
+                        } else {
+                            self.tracking.fallback_ramp = Some(ramp);
+                        }
                         self.tracking.holding_fallback_pose = done;
                     }
                     TickOutput::Deferred { .. } => {
-                        // Keep the in-progress braking ramp intact across transient deferral
-                        // without advancing issued history or marking the ramp done.
                         self.tracking.fallback_ramp = Some(ramp);
                     }
                     TickOutput::Expired { .. }
@@ -1232,12 +1248,18 @@ impl SupervisorInner {
                     | TickOutput::LeaseFenced
                     | TickOutput::ActionDeadlineRefused { .. }
                     | TickOutput::None => {
+                        if self.tracking.spare_fallback_ramp.is_none() {
+                            self.tracking.spare_fallback_ramp = Some(ramp);
+                        }
                         self.tracking.invalidate();
                     }
                 }
                 write_res
             }
             Err(why) => {
+                if self.tracking.spare_fallback_ramp.is_none() {
+                    self.tracking.spare_fallback_ramp = Some(ramp);
+                }
                 tracing::error!("Joint tracking fallback cannot brake within the limits ({why}): no frame sent");
                 if self.scratch.fallback_prev_confirmed_valid
                     && self.scratch.fallback_prev_confirmed.len() == self.commanded_positions.len()

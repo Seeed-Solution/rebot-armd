@@ -13,7 +13,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt::{self, Write as _};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use rtrb::{Consumer, Producer, RingBuffer};
@@ -1216,6 +1216,67 @@ pub(crate) fn install_lease_clear_fault_rt_with_clock(
     }
 }
 
+/// Like [`install_lease_clear_fault_rt_with_clock`], threading the shared per-release
+/// [`crate::rt_core::budget::ReleaseBudget`] ledger through driver probes and motor resets.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn install_lease_clear_fault_rt_with_budget(
+    inner: &mut SupervisorInner,
+    connection: ConnectionHandle,
+    lease_generation: u64,
+    supplied_epoch: Option<u64>,
+    request_id_valid: bool,
+    body_error: Option<&'static str>,
+    auth_policy: OwnerAuthPolicy,
+    operator: OperatorGrant,
+    now: Instant,
+    release_budget: &mut crate::rt_core::budget::ReleaseBudget,
+    now_fn: &mut dyn FnMut() -> Instant,
+) -> LeaseClearFaultOutcome {
+    let auth = match check_lease_clear_fault_owner_preflight(
+        inner,
+        connection,
+        lease_generation,
+        supplied_epoch,
+        request_id_valid,
+        body_error,
+        auth_policy,
+        operator,
+        now,
+    ) {
+        Ok(a) => a,
+        Err(out) => return out,
+    };
+    match inner.clear_fault_executor_bounded_for_release_with_authority_budget(
+        now,
+        release_budget,
+        auth,
+        now_fn,
+    ) {
+        Ok(safety_state) => LeaseClearFaultOutcome::Cleared {
+            safety_state,
+            epoch_id: inner.safety.epoch_id(),
+            is_torqued: inner.is_torqued,
+            control_mode_gravity_comp: inner.gravity_comp_active(),
+        },
+        Err(crate::supervisor::ClearFaultWithAuthError::Authority(auth_err)) => {
+            map_clear_fault_authority_err(inner, auth, auth_err)
+        }
+        Err(crate::supervisor::ClearFaultWithAuthError::Clear(
+            crate::safety::ClearFaultError::EpochMismatch { expected, received },
+        )) => LeaseClearFaultOutcome::EpochMismatch {
+            expected,
+            received,
+            consumed_request_id: true,
+        },
+        Err(crate::supervisor::ClearFaultWithAuthError::Clear(err)) => {
+            LeaseClearFaultOutcome::ClearFailed {
+                err,
+                epoch_id: inner.safety.epoch_id(),
+            }
+        }
+    }
+}
+
 /// Single legacy owner-side install function for WS `/api/v1/safety/clear_fault`, sharing the
 /// exact same authority/operator preflight and mid-transaction reset/clear re-checks as
 /// [`install_lease_clear_fault_rt`].
@@ -2158,7 +2219,7 @@ impl ConnLifecycleClientInner {
 
 /// Off-thread priority connection lifecycle client (never touched by `armd-control`).
 pub struct ConnLifecycleClient {
-    inner: Mutex<ConnLifecycleClientInner>,
+    inner: crate::rt_core::rt_gate::RtGuardedMutex<ConnLifecycleClientInner>,
 }
 
 /// Creates a matched priority connection lifecycle client and RT intake with capacity
@@ -2167,7 +2228,7 @@ pub fn conn_lifecycle_channel(exited: Arc<AtomicBool>) -> (ConnLifecycleClient, 
     let (req_tx, req_rx) = RingBuffer::new(CONN_LIFECYCLE_CAPACITY);
     let (rep_tx, rep_rx) = RingBuffer::new(CONN_LIFECYCLE_CAPACITY);
     let client = ConnLifecycleClient {
-        inner: Mutex::new(ConnLifecycleClientInner {
+        inner: crate::rt_core::rt_gate::RtGuardedMutex::new("ConnLifecycleClient::inner", ConnLifecycleClientInner {
             req_tx,
             rep_rx,
             slots: HashMap::with_capacity(MAX_LIVE_CONNECTIONS),

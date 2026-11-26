@@ -14,7 +14,7 @@
 use std::cell::UnsafeCell;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::recording::RecordFrame;
 
@@ -60,7 +60,7 @@ pub struct RecordRing {
     /// Samples consumed so far (consumer; Release). Written only with `assembly` held.
     tail: AtomicU64,
     /// Consumer state; the mutex also makes the consumer side single.
-    assembly: Mutex<Assembly>,
+    assembly: super::rt_gate::RtGuardedMutex<Assembly>,
 }
 
 // SAFETY: slot `i % CAP` is written by the producer only while `i >= tail` and
@@ -79,9 +79,13 @@ impl RecordRing {
             slots,
             head: AtomicU64::new(0),
             tail: AtomicU64::new(0),
-            assembly: Mutex::new(Assembly::default()),
+            assembly: super::rt_gate::RtGuardedMutex::new("RecordRing::assembly", Assembly::default()),
         }
     }
+
+    /// Constructs a standalone ring for RT lock-boundary tests.
+    #[doc(hidden)]
+    pub fn new_for_test(dof: usize) -> Self { Self::new(dof) }
 
     /// Holds the consumer mutex (tests: a preempted dispatcher).
     #[doc(hidden)]

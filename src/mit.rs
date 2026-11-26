@@ -1219,10 +1219,20 @@ impl crate::supervisor::SupervisorInner {
         });
         let mut computed_j7_intent: Option<PosForceIntent> = None;
         let cutoff = self.active_tx_cutoff;
+        let conservative_cap = self.pending_conservative_tx_cap;
+        let mut cons_rx_delta = 0u16;
+        let mut cons_tx_delta = 0u16;
         #[cfg(not(target_arch = "wasm32"))]
         let shadow_rt = &mut self.torque_shadow;
         let res = self.driver.as_mut().and_then(|d| {
             d.with_mut(|drv| {
+                let before_cons = if conservative_cap {
+                    let b = drv.release_budget_consumed();
+                    drv.sync_release_budget_limits(0, 0);
+                    Some(b)
+                } else {
+                    None
+                };
                 // Resolve the J7 PosForce intent (never writing a 0x307 frame here: the tick
                 // epilogue's ONE J7 emitter writes every 0x307 frame after arm output finishes).
                 // - In stopped hold (`is_hold`), caller's J7 target is ignored and intent is `Stop`.
@@ -1309,6 +1319,11 @@ impl crate::supervisor::SupervisorInner {
                     drv.set_output_lease_gen(0);
                     r
                 };
+                if let Some(b) = before_cons {
+                    let after = drv.release_budget_consumed();
+                    cons_rx_delta = cons_rx_delta.saturating_add(after.0.saturating_sub(b.0));
+                    cons_tx_delta = cons_tx_delta.saturating_add(after.1.saturating_sub(b.1));
+                }
                 let now = drv.clock_now();
                 #[cfg(not(target_arch = "wasm32"))]
                 shadow_rt.drain_from_driver(drv);
@@ -1332,6 +1347,12 @@ impl crate::supervisor::SupervisorInner {
             })
         })
         .unwrap_or(TickOutput::None);
+        if conservative_cap {
+            self.conservative_step_rx_delta =
+                self.conservative_step_rx_delta.saturating_add(cons_rx_delta);
+            self.conservative_step_tx_delta =
+                self.conservative_step_tx_delta.saturating_add(cons_tx_delta);
+        }
         if let Some(intent) = computed_j7_intent {
             self.j7_intent = Some(intent);
         }
@@ -3512,30 +3533,63 @@ impl crate::supervisor::SupervisorInner {
     /// Advances the single preallocated commissioning state machine by one bounded non-blocking
     /// step inside Step 2b of a control release (strictly under `release_deadline - publish_margin`,
     /// sharing Step 2's RX/TX pass budgets; 0 heap allocs and 0 heap frees on `armd-control`).
-    pub(crate) fn service_commissioning_release(
+    pub(crate) fn service_commissioning_release_with_budget(
         &mut self,
         ctx: &crate::rt_core::ops::CommitCtx,
-        release_deadline: std::time::Instant,
+        release_budget: &mut crate::rt_core::budget::ReleaseBudget,
         owner_now_fn: &dyn Fn() -> std::time::Instant,
     ) {
         if self.commissioning.state != CommissioningOpState::Running {
             return;
         }
         let owner_now = owner_now_fn();
+        let release_deadline = release_budget.deadline();
         let total_span = release_deadline.saturating_duration_since(owner_now);
         let publish_margin = self.tx_release_publish_margin().min(total_span / 2);
         let owner_cutoff = release_deadline
             .checked_sub(publish_margin)
             .unwrap_or(owner_now);
         let mut now_mut = || owner_now_fn();
-        let _ = self.service_commissioning_step_with_cutoff(
+        let _ = self.service_commissioning_step_with_cutoff_and_rx(
             ctx,
             owner_cutoff,
             COMM_MAX_TX_PER_RELEASE,
             None,
+            16,
             true,
+            Some(release_budget),
             &mut now_mut,
         );
+    }
+
+    /// Advances the single preallocated commissioning state machine by one bounded non-blocking
+    /// step while drawing from and charging a shared per-release [`crate::rt_core::budget::ReleaseBudget`].
+    ///
+    /// Pre-cap installation, per-op TX caps (including `MotorZeroWriteVerify`), and post-step
+    /// `(rx, tx)` counter deltas are all captured inside the single driver borrow so lock
+    /// contention before or after the step cannot bypass caps or lose ledger usage.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn service_commissioning_step_with_budget(
+        &mut self,
+        ctx: &crate::rt_core::ops::CommitCtx,
+        release_budget: &mut crate::rt_core::budget::ReleaseBudget,
+        owner_cutoff: std::time::Instant,
+        max_tx: u8,
+        probe_tx_cap: Option<u8>,
+        is_new_release: bool,
+        owner_now_fn: &mut dyn FnMut() -> std::time::Instant,
+    ) -> CommissioningStepProgress {
+        let eff_cutoff = owner_cutoff.min(release_budget.deadline());
+        self.service_commissioning_step_with_cutoff_and_rx(
+            ctx,
+            eff_cutoff,
+            max_tx,
+            probe_tx_cap,
+            16,
+            is_new_release,
+            Some(release_budget),
+            owner_now_fn,
+        )
     }
 
     /// Advances the single preallocated commissioning state machine by one bounded non-blocking
@@ -3546,10 +3600,37 @@ impl crate::supervisor::SupervisorInner {
     pub(crate) fn service_commissioning_step_with_cutoff(
         &mut self,
         ctx: &crate::rt_core::ops::CommitCtx,
-        mut owner_cutoff: std::time::Instant,
+        owner_cutoff: std::time::Instant,
         max_tx: u8,
         probe_tx_cap: Option<u8>,
         is_new_release: bool,
+        owner_now_fn: &mut dyn FnMut() -> std::time::Instant,
+    ) -> CommissioningStepProgress {
+        let rx_cap = crate::rt_core::ops::RX_FRAME_BUDGET
+            .saturating_sub(self.pending_rx_poll.rx_frames)
+            .min(16);
+        self.service_commissioning_step_with_cutoff_and_rx(
+            ctx,
+            owner_cutoff,
+            max_tx,
+            probe_tx_cap,
+            rx_cap,
+            is_new_release,
+            None,
+            owner_now_fn,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn service_commissioning_step_with_cutoff_and_rx(
+        &mut self,
+        ctx: &crate::rt_core::ops::CommitCtx,
+        mut owner_cutoff: std::time::Instant,
+        max_tx: u8,
+        probe_tx_cap: Option<u8>,
+        remaining_rx: u16,
+        is_new_release: bool,
+        release_budget: Option<&mut crate::rt_core::budget::ReleaseBudget>,
         owner_now_fn: &mut dyn FnMut() -> std::time::Instant,
     ) -> CommissioningStepProgress {
         if self.commissioning.state != CommissioningOpState::Running {
@@ -3598,9 +3679,6 @@ impl crate::supervisor::SupervisorInner {
                 ..CommissioningStepProgress::default()
             };
         }
-        let remaining_rx = crate::rt_core::ops::RX_FRAME_BUDGET
-            .saturating_sub(self.pending_rx_poll.rx_frames)
-            .min(16);
 
         let kind = self.commissioning.kind;
         let joint_len = self.commissioning.joint_len;
@@ -3692,10 +3770,28 @@ impl crate::supervisor::SupervisorInner {
         let mut reg_tx_attempted = 0u8;
         let mut probe_tx_attempted = 0u8;
         let mut backpressured = false;
+        let mut drv_rx_delta = 0u16;
+        let mut drv_tx_delta = 0u16;
+        let budget_caps = release_budget
+            .as_deref()
+            .map(|b| (b.rx_remaining(), b.tx_remaining()));
         let mut taken = self.driver.take();
         let step_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             #[allow(clippy::result_large_err)] // RT zero-alloc path; BoundedText stays inline
             let mut run_with_drv = |drv: &mut dyn crate::driver::ArmDriver| {
+                let (before_counters, eff_rx, eff_max_tx, eff_probe_tx) =
+                    if let Some((rx_rem, tx_rem)) = budget_caps {
+                        let before = drv.release_budget_consumed();
+                        drv.sync_release_budget_limits(rx_rem, tx_rem);
+                        let rx = remaining_rx.min(rx_rem.min(16));
+                        let reg_tx = u16::from(max_tx).min(tx_rem).min(u16::from(u8::MAX)) as u8;
+                        let probe_tx = probe_tx_cap
+                            .map(|p| u16::from(p).min(tx_rem).min(u16::from(u8::MAX)) as u8);
+                        (Some(before), rx, reg_tx, probe_tx)
+                    } else {
+                        (None, remaining_rx, max_tx, probe_tx_cap)
+                    };
+
                 let drv_now = drv.clock_now();
                 let span = owner_cutoff.saturating_duration_since(owner_now_fn());
                 let drv_cutoff = drv_now + span;
@@ -3706,8 +3802,8 @@ impl crate::supervisor::SupervisorInner {
                         drv,
                         &auth,
                         drv_cutoff,
-                        remaining_rx,
-                        max_tx,
+                        eff_rx,
+                        eff_max_tx,
                         &mut reg_tx_attempted,
                         &mut backpressured,
                         owner_now_fn,
@@ -3716,23 +3812,24 @@ impl crate::supervisor::SupervisorInner {
                         drv,
                         &auth,
                         drv_cutoff,
-                        remaining_rx,
-                        max_tx,
-                        probe_tx_cap,
+                        eff_rx,
+                        eff_max_tx,
+                        eff_probe_tx,
                         &mut reg_tx_attempted,
                         &mut probe_tx_attempted,
                         &mut backpressured,
                         owner_now_fn,
                     ),
                     CommissioningOpKind::MotorZeroDisable => {
-                        self.step_motor_zero_disable_with_drv(drv, &auth, drv_cutoff, remaining_rx, owner_now_fn)
+                        self.step_motor_zero_disable_with_drv(drv, &auth, drv_cutoff, eff_rx, owner_now_fn)
                     }
                     CommissioningOpKind::MotorZeroWriteVerify => {
                         self.step_motor_zero_write_verify_with_drv(
                             drv,
                             &auth,
                             drv_cutoff,
-                            remaining_rx,
+                            eff_rx,
+                            eff_max_tx,
                             &mut reg_tx_attempted,
                             &mut backpressured,
                             owner_now_fn,
@@ -3743,6 +3840,11 @@ impl crate::supervisor::SupervisorInner {
                 drv.set_tx_release_deadline(None);
                 #[cfg(not(target_arch = "wasm32"))]
                 self.torque_shadow.drain_from_driver(drv);
+                if let Some(before) = before_counters {
+                    let after = drv.release_budget_consumed();
+                    drv_rx_delta = after.0.saturating_sub(before.0);
+                    drv_tx_delta = after.1.saturating_sub(before.1);
+                }
                 res
             };
             match taken.as_mut() {
@@ -3767,6 +3869,19 @@ impl crate::supervisor::SupervisorInner {
             Ok(r) => r,
             Err(payload) => std::panic::resume_unwind(payload),
         };
+        if let Some(budget) = release_budget {
+            if matches!(step_result, DriverCommStep::Ran(_)) {
+                let reported_tx = u16::from(reg_tx_attempted.saturating_add(probe_tx_attempted));
+                let tx_delta = drv_tx_delta.max(reported_tx);
+                let rx_exhausted = budget.rx_remaining() == 0;
+                if drv_rx_delta > 0 || rx_exhausted {
+                    budget.charge_rx(drv_rx_delta, rx_exhausted);
+                }
+                if tx_delta > 0 {
+                    budget.charge_tx(tx_delta);
+                }
+            }
+        }
         let _ = ctx;
         let mut contended = false;
         match step_result {
@@ -4915,13 +5030,14 @@ impl crate::supervisor::SupervisorInner {
         Ok(())
     }
 
-    #[allow(clippy::result_large_err)]
+    #[allow(clippy::result_large_err, clippy::too_many_arguments)]
     fn step_motor_zero_write_verify_with_drv(
         &mut self,
         drv: &mut dyn crate::driver::ArmDriver,
         auth: &CommissioningAuthority,
         drv_cutoff: std::time::Instant,
         mut remaining_rx: u16,
+        max_tx: u8,
         reg_tx_attempted: &mut u8,
         backpressured: &mut bool,
         owner_now_fn: &mut dyn FnMut() -> std::time::Instant,
@@ -4940,6 +5056,9 @@ impl crate::supervisor::SupervisorInner {
                         if now < next_at {
                             return Ok(());
                         }
+                    }
+                    if max_tx == 0 {
+                        return Ok(());
                     }
                     let joint = self.commissioning.joints[idx];
                     // Recheck safety, stationary, torque confirmed off, and fresh rest evidence BEFORE TX.

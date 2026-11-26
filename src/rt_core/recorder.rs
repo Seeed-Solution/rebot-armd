@@ -479,9 +479,13 @@ impl RecorderAssembly {
     fn lock_inner(&self) -> MutexGuard<'_, AssemblyInner> {
         if super::executor::on_rt_control_thread() {
             self.control_thread_lock_attempts.fetch_add(1, Ordering::SeqCst);
+            super::rt_gate::record_rt_lock_attempt();
             super::executor::assert_not_on_rt_control_thread("RecorderAssembly::inner.lock");
         }
-        super::executor::assert_not_in_rt_release("RecorderAssembly::inner.lock");
+        if super::executor::in_rt_release() {
+            super::rt_gate::record_rt_lock_attempt();
+            super::executor::assert_not_in_rt_release("RecorderAssembly::inner.lock");
+        }
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -506,9 +510,13 @@ impl RecorderAssembly {
     pub fn try_drain_bounded(&self, max: usize) -> usize {
         if super::executor::on_rt_control_thread() {
             self.control_thread_lock_attempts.fetch_add(1, Ordering::SeqCst);
+            super::rt_gate::record_rt_lock_attempt();
             super::executor::assert_not_on_rt_control_thread("RecorderAssembly::inner.try_lock");
         }
-        super::executor::assert_not_in_rt_release("RecorderAssembly::inner.try_lock");
+        if super::executor::in_rt_release() {
+            super::rt_gate::record_rt_lock_attempt();
+            super::executor::assert_not_in_rt_release("RecorderAssembly::inner.try_lock");
+        }
         match self.inner.try_lock() {
             Ok(mut g) => g.drain_up_to(max),
             Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner().drain_up_to(max),

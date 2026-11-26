@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use rtrb::{Consumer, Producer, RingBuffer};
@@ -672,7 +672,7 @@ impl UrgentStopClientInner {
 /// even if the calling waiter disconnects, preserving strict SPSC producer semantics and
 /// bounded RT reply storage.
 pub struct UrgentStopClient {
-    inner: Mutex<UrgentStopClientInner>,
+    inner: super::rt_gate::RtGuardedMutex<UrgentStopClientInner>,
 }
 
 impl UrgentStopClient {
@@ -741,7 +741,7 @@ pub fn urgent_stop_channel(capacity: usize, exited: Arc<AtomicBool>) -> (UrgentS
     let (req_tx, req_rx) = RingBuffer::<UrgentStopRequest>::new(cap);
     let (rep_tx, rep_rx) = RingBuffer::<UrgentStopReply>::new(cap);
     let client = UrgentStopClient {
-        inner: Mutex::new(UrgentStopClientInner {
+        inner: super::rt_gate::RtGuardedMutex::new("UrgentStopClient::inner", UrgentStopClientInner {
             req_tx, rep_rx, capacity: cap, in_flight: 0, next_id: 1, closed: false, waiters: HashMap::new(), exited,
         }),
     };

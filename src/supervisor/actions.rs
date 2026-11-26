@@ -444,12 +444,13 @@ impl SupervisorInner {
     ///   / `zero_check_owner_*`) owns the disk reservation, rename/fsync boundary, reconciliation,
     ///   and action terminal; `service_gripper_zero_check_session` never prematurely aborts or
     ///   overwrites `last_action` while `zero_check_persisting == Some(action_id)`.
-    pub(crate) fn service_gripper_zero_check_session(
+    pub(crate) fn service_gripper_zero_check_session_with_budget(
         &mut self,
         ctx: &crate::rt_core::ops::CommitCtx,
-        release_deadline: Instant,
+        release_budget: &mut crate::rt_core::budget::ReleaseBudget,
         owner_now_fn: &dyn Fn() -> Instant,
     ) {
+        let release_deadline = release_budget.deadline();
         use crate::rt_core::session::{
             PhaseStepOutcome, SessionKind, SessionSlot, SessionState, SessionStep,
             SessionTerminalReason,

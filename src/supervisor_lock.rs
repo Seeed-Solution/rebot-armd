@@ -184,9 +184,13 @@ impl Holds {
     fn check_not_on_control_thread(&self, site: &'static str) {
         if crate::rt_core::executor::on_rt_control_thread() {
             self.control_thread_attempts.fetch_add(1, Ordering::SeqCst);
+            crate::rt_core::rt_gate::record_rt_lock_attempt();
             crate::rt_core::executor::assert_not_on_rt_control_thread(site);
         }
-        crate::rt_core::executor::assert_not_in_rt_release(site);
+        if crate::rt_core::executor::in_rt_release() {
+            crate::rt_core::rt_gate::record_rt_lock_attempt();
+            crate::rt_core::executor::assert_not_in_rt_release(site);
+        }
     }
 }
 
@@ -643,9 +647,13 @@ impl DriverLock {
     fn check_not_on_control_thread(&self, site: &'static str) {
         if crate::rt_core::executor::on_rt_control_thread() {
             self.control_thread_attempts.fetch_add(1, Ordering::SeqCst);
+            crate::rt_core::rt_gate::record_rt_lock_attempt();
             crate::rt_core::executor::assert_not_on_rt_control_thread(site);
         }
-        crate::rt_core::executor::assert_not_in_rt_release(site);
+        if crate::rt_core::executor::in_rt_release() {
+            crate::rt_core::rt_gate::record_rt_lock_attempt();
+            crate::rt_core::executor::assert_not_in_rt_release(site);
+        }
     }
 
     pub fn lock(

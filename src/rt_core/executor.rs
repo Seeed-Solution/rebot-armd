@@ -581,6 +581,9 @@ pub struct ExecutorStats {
     /// Cumulative per-op heap counts across all sub-release wakes (entry through wake service,
     /// publication, reply/ack handling, and local destruction; disjoint from releases).
     pub wake_allocs: AtomicAllocCounters,
+    /// Cumulative lock acquisition attempts rejected on THIS executor's `armd-control` thread
+    /// across all RT-guarded lock boundaries (isolated per executor instance).
+    pub rt_lock_attempts: AtomicU64,
     /// True once `ARMD_ALLOC_TIMING=1` (`alloc_timing`) has been enabled on the control thread.
     pub alloc_timing_enabled: AtomicBool,
     /// Release sequence (`TickSample::release_seq`) of the most recent fault latch on `armd-control`.
@@ -1244,7 +1247,7 @@ impl MaintClientInner {
 
 /// Off-thread client for the pre-reserved 1-to-1 maintenance channel.
 pub(crate) struct MaintClient {
-    inner: Mutex<MaintClientInner>,
+    inner: super::rt_gate::RtGuardedMutex<MaintClientInner>,
 }
 
 impl MaintClient {
@@ -1255,7 +1258,7 @@ impl MaintClient {
         hub: Arc<StateHub>,
     ) -> Self {
         Self {
-            inner: Mutex::new(MaintClientInner {
+            inner: super::rt_gate::RtGuardedMutex::new("MaintClient::inner", MaintClientInner {
                 req_tx,
                 rep_rx,
                 in_flight: 0,
@@ -4170,7 +4173,7 @@ impl ServoTargetDispatcherInner {
 /// Off-thread coordinator owning [`TargetPort`], `close_servo` dispatch, streaming outcome
 /// delivery, and `/api/v1/motion/servo` command reply correlation (never touched by `armd-control`).
 pub(crate) struct ServoTargetDispatcher {
-    inner: Mutex<ServoTargetDispatcherInner>,
+    inner: super::rt_gate::RtGuardedMutex<ServoTargetDispatcherInner>,
     exited: Arc<AtomicBool>,
     atomic_fenced_lease_gen: Arc<AtomicU64>,
     #[cfg(feature = "policy-runtime")]
@@ -4192,7 +4195,7 @@ impl ServoTargetDispatcher {
         #[cfg(feature = "policy-runtime")]
         let policy_refusal_gen = writer.policy_refusal_gen_arc();
         Self {
-            inner: Mutex::new(ServoTargetDispatcherInner {
+            inner: super::rt_gate::RtGuardedMutex::new("ServoTargetDispatcher::inner", ServoTargetDispatcherInner {
                 port: crate::supervisor::targets::TargetPort::new(writer, arm, boot),
                 last_inflight_key: None,
                 command_waiters: std::collections::HashMap::new(),
@@ -6831,6 +6834,8 @@ pub(crate) fn spawn_executor(
         } else {
             thread::Builder::new().name("armd-control".into()).spawn(move || {
                 let _control_thread_guard = ControlThreadGuard::enter();
+                let _lock_counter_guard =
+                    super::rt_gate::bind_executor_lock_counter(Arc::clone(&stats));
                 let _panic_scope = crate::panic_coord::ControlPanicScope::enter();
                 let Ok(core) = core_rx.recv() else {
                     return;
@@ -7435,7 +7440,7 @@ impl ControlState {
         &mut self,
         core: &mut SupervisorInner,
         ctx: &super::ops::CommitCtx,
-        release_deadline: Instant,
+        release_budget: &mut super::budget::ReleaseBudget,
         step_num: u64,
         release_flags: &mut u32,
         maint_req_id: &mut u64,
@@ -7499,9 +7504,9 @@ impl ControlState {
                 self.shutdown_committed = false;
                 let clock_hook = self.hooks.clock.clone();
                 let mut live_now = || clock_hook.as_ref().map_or_else(Instant::now, |c| c.now());
-                let res = core.clear_fault_executor_bounded_for_release_with_clock(
+                let res = core.clear_fault_executor_bounded_for_release_with_budget(
                     ctx.now,
-                    release_deadline,
+                    release_budget,
                     expected_epoch,
                     &mut live_now,
                 );
@@ -7524,7 +7529,7 @@ impl ControlState {
             } => {
                 let clock_hook = self.hooks.clock.clone();
                 let mut live_now = || clock_hook.as_ref().map_or_else(Instant::now, |c| c.now());
-                let out = super::requests::lease::install_lease_clear_fault_rt_with_clock(
+                let out = super::requests::lease::install_lease_clear_fault_rt_with_budget(
                     core,
                     connection,
                     lease_generation,
@@ -7534,7 +7539,7 @@ impl ControlState {
                     auth_policy,
                     operator,
                     ctx.now,
-                    release_deadline,
+                    release_budget,
                     &mut live_now,
                 );
                 if matches!(out, super::requests::lease::LeaseClearFaultOutcome::Cleared { .. }) {
@@ -11155,13 +11160,13 @@ fn control_thread_main_inner(
                     core.begin_tick_phases(body_start);
                     core.service_internal_fault_lane();
 
-                    let report = engine.step_with_pre_commit(
+                    let report = engine.step_with_pre_commit_budget(
                         &mut *core,
                         now_inst,
                         dt,
                         release_deadline,
                         publish_gen,
-                        |core, ctx| {
+                        |core, ctx, release_budget| {
                             // Run persistence reconciliation and at most one bounded maintenance op
                             // strictly AFTER Step 2 fresh feedback intake and strictly BEFORE Step 3
                             // commit, Step 5 output, and Step 6 publication. Hold E-stop acknowledgements
@@ -11172,13 +11177,13 @@ fn control_thread_main_inner(
                             state.service_one_maintenance(
                                 core,
                                 ctx,
-                                release_deadline,
+                                release_budget,
                                 step_num,
                                 &mut release_flags,
                                 &mut maint_req_id,
                             );
                             if !control_stop.load(Ordering::Acquire) && !core.internal_fault_lane.is_fenced() {
-                                core.service_sessions_release(ctx, release_deadline, &now_inst);
+                                core.service_sessions_release_with_budget(ctx, release_budget, &now_inst);
                             }
                             control_stop.load(Ordering::Acquire)
                                 || core.sessions.is_safe_hold_requested()
@@ -11670,7 +11675,12 @@ fn control_thread_main_inner(
             .hooks
             .post_publish_delay_once
             .as_ref()
-            .and_then(|d| d.lock().ok().and_then(|mut g| g.take()))
+            .and_then(|d| {
+                if on_rt_control_thread() || in_rt_release() {
+                    crate::rt_core::rt_gate::record_rt_lock_attempt();
+                }
+                d.lock().ok().and_then(|mut g| g.take())
+            })
         {
             sleep_dur(delay);
         }
@@ -13926,7 +13936,13 @@ mod tests {
         // Under saturation: neither maint nor persist pops or drops its payload.
         let mut flags = 0u32;
         let mut req_id = 0u64;
-        state.service_one_maintenance(&mut core, &ctx, Instant::now() + Duration::from_millis(20), 1, &mut flags, &mut req_id);
+        let maint_now = Instant::now();
+        let mut maint_budget = crate::rt_core::budget::ReleaseBudget::for_release(
+            1,
+            maint_now,
+            maint_now + Duration::from_millis(20),
+        );
+        state.service_one_maintenance(&mut core, &ctx, &mut maint_budget, 1, &mut flags, &mut req_id);
         state.service_persistence(&mut core, &ctx);
         assert!(!maint_probe_dropped.load(Ordering::SeqCst), "maint payload must not drop under full reply ring");
         assert!(!persist_probe_dropped.load(Ordering::SeqCst), "persist payload must not drop when slots() < 2");

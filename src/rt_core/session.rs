@@ -1151,22 +1151,24 @@ impl SupervisorInner {
         }
     }
 
-    pub(crate) fn service_sessions_release(
+    pub(crate) fn service_sessions_release_with_budget(
         &mut self,
         ctx: &super::ops::CommitCtx,
-        release_deadline: Instant,
+        budget: &mut super::budget::ReleaseBudget,
         owner_now_fn: &dyn Fn() -> Instant,
     ) {
+        let release_deadline = budget.deadline();
         if let Some(active) = self.sessions.slot(SessionSlot::ExclusiveOutput).copied() {
             if active.kind == SessionKind::GripperZeroCheck {
-                self.service_gripper_zero_check_session(ctx, release_deadline, owner_now_fn);
+                self.service_gripper_zero_check_session_with_budget(ctx, budget, owner_now_fn);
             } else if active.is_live() {
                 match active.kind {
                     SessionKind::Commissioning => {
-                        self.service_commissioning_release(ctx, release_deadline, owner_now_fn);
+                        self.service_commissioning_release_with_budget(ctx, budget, owner_now_fn);
                     }
                     SessionKind::ModeSwitch => {
-                        self.service_mode_switch_release(ctx, release_deadline, owner_now_fn);
+                        let mut f = || owner_now_fn();
+                        self.service_mode_switch_release_with_budget(ctx, budget, &mut f);
                     }
                     SessionKind::GripperZeroCheck => unreachable!(),
                     _ => {
@@ -1199,7 +1201,7 @@ impl SupervisorInner {
                 }
             }
         } else if self.commissioning.is_running() {
-            self.service_commissioning_release(ctx, release_deadline, owner_now_fn);
+            self.service_commissioning_release_with_budget(ctx, budget, owner_now_fn);
         }
 
         if let Some(rec) = self.sessions.slot(SessionSlot::Recorder).copied() {

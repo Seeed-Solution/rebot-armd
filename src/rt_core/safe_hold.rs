@@ -461,6 +461,16 @@ impl SafeHoldBuffers {
         let release_seq = ctrl.ticks.load(Ordering::Acquire).saturating_add(1);
         drv.begin_control_release(0x8000_0000_0000_0000u64 | release_seq);
         drv.set_tx_release_deadline(Some(drv_cap));
+        let tx_cap = drv
+            .tx_budget_max_frames()
+            .unwrap_or(super::budget::DEFAULT_TX_ATTEMPT_BUDGET);
+        let mut ledger = super::budget::ReleaseBudget::new(
+            release_seq,
+            drv_now,
+            drv_cap,
+            RX_FRAME_BUDGET,
+            tx_cap,
+        );
         let thermal_confirmed = ctrl.thermal_disable_confirmed.load(Ordering::Acquire);
         if let Some(ref mut sh) = shadow {
             sh.enqueue(crate::torque::shadow::ShadowInputKind::Release {
@@ -473,10 +483,26 @@ impl SafeHoldBuffers {
 
         // 2. Zero-alloc live RX intake across all supported drivers (Damiao, RobStride, Feetech).
         let rx_deadline = drv_cap.min(drv_now + crate::rt_core::ops::RX_TIME_BUDGET);
-        let rx_ok = drv
-            .read_joint_states_safe_hold(&mut self.rx_states, rx_deadline, RX_FRAME_BUDGET)
-            .is_ok()
-            || drv.read_cached_joint_states_into(&mut self.rx_states).is_some();
+        drv.sync_release_budget_limits(ledger.rx_remaining(), ledger.tx_remaining());
+        let before_rx = drv.release_budget_consumed();
+        let rx_ok = match drv.read_joint_states_safe_hold(
+            &mut self.rx_states,
+            rx_deadline,
+            ledger.rx_remaining(),
+        ) {
+            Ok((frames, exhausted)) => {
+                let after = drv.release_budget_consumed();
+                ledger.charge_rx(after.0.saturating_sub(before_rx.0).max(frames), exhausted);
+                ledger.charge_tx(after.1.saturating_sub(before_rx.1));
+                true
+            }
+            Err(_) => {
+                let after = drv.release_budget_consumed();
+                ledger.charge_rx(after.0.saturating_sub(before_rx.0), true);
+                ledger.charge_tx(after.1.saturating_sub(before_rx.1));
+                drv.read_cached_joint_states_into(&mut self.rx_states).is_some()
+            }
+        };
         if let Some(ref mut sh) = shadow {
             sh.drain_from_driver(drv);
         }
@@ -573,7 +599,9 @@ impl SafeHoldBuffers {
                 if self.thermal_disable_started
                     && !ctrl.thermal_disable_confirmed.load(Ordering::Acquire)
                 {
-                    match drv.poll_torque_budgeted(drv_cap, RX_FRAME_BUDGET) {
+                    drv.sync_release_budget_limits(ledger.rx_remaining(), ledger.tx_remaining());
+                    let before_poll = drv.release_budget_consumed();
+                    match drv.poll_torque_budgeted(ledger.deadline(), ledger.rx_remaining()) {
                         Ok(TorqueProgress::Done(crate::driver::TorqueOutcome::Confirmed))
                             if drv.is_hardware_disarmed_confirmed() =>
                         {
@@ -589,6 +617,13 @@ impl SafeHoldBuffers {
                             }
                         }
                     }
+                    let after_poll = drv.release_budget_consumed();
+                    let (rep_rx, rep_ex) = drv.take_last_poll_rx().unwrap_or((0, false));
+                    ledger.charge_rx(
+                        after_poll.0.saturating_sub(before_poll.0).max(rep_rx),
+                        rep_ex,
+                    );
+                    ledger.charge_tx(after_poll.1.saturating_sub(before_poll.1));
                 }
                 if let Some(ref mut sh) = shadow {
                     sh.drain_from_driver(drv);
@@ -642,11 +677,19 @@ impl SafeHoldBuffers {
                 }
             }
         }
+        let j7_bit = self
+            .gripper_index
+            .filter(|&j| j < 64)
+            .map_or(0u64, |j| 1u64 << j);
+        let arm_hold_mask = hold_mask & !j7_bit;
+        let has_arm_axes = (0..dof).any(|j| self.gripper_index != Some(j));
         let mut sent_hold_mask = 0u64;
+        let mut sent_arm_hold_mask = 0u64;
         let mut stale_hold_mask = 0u64;
         let mut unverified_mask = 0u64;
-        // A required axis whose hold frame failed (write error or `UnheldTxFailed`).
+        // A required arm axis whose hold frame failed/deferred (write error or unheld/queued).
         let mut hold_tx_failed = false;
+        let mut hold_outcome_incomplete = false;
         if hold_mask != 0 || self.gripper_is_pos_force {
             // Acknowledge any pending external E-stop/stop generations while keeping LATCH_BIT set
             // so `EstopGate::pending()` never suppresses SAFE-HOLD measured-position hold frames.
@@ -655,31 +698,48 @@ impl SafeHoldBuffers {
             let hold_res = drv.write_measured_hold_masked(hold_mask, &self.hold_targets[..dof]);
             hold_tx_failed = hold_res.is_err();
             if let Ok(report) = hold_res {
+                let outcome_complete =
+                    matches!(report.outcome, crate::driver::TxBatchOutcome::Complete);
+                if !outcome_complete {
+                    hold_outcome_incomplete = true;
+                }
                 if report.sent_any {
                     ctrl.hold_tx_count.fetch_add(1, Ordering::Release);
                 }
                 for j in 0..dof.min(report.dof) {
+                    let is_j7 = self.gripper_index == Some(j);
                     match report.joint_status[j] {
                         crate::driver::JointHoldStatus::Held => {
                             sent_hold_mask |= 1u64 << j;
+                            if !is_j7 {
+                                sent_arm_hold_mask |= 1u64 << j;
+                            }
                         }
                         crate::driver::JointHoldStatus::HeldStaleTarget => {
                             sent_hold_mask |= 1u64 << j;
                             stale_hold_mask |= 1u64 << j;
+                            if !is_j7 {
+                                sent_arm_hold_mask |= 1u64 << j;
+                            }
                         }
                         crate::driver::JointHoldStatus::UnheldNoVerifiedMode if j < 64 => {
                             unverified_mask |= 1u64 << j;
                         }
                         crate::driver::JointHoldStatus::UnheldTxFailed
-                            if j < 64 && hold_mask & (1u64 << j) != 0 =>
+                        | crate::driver::JointHoldStatus::UnheldNoFreshFeedback
+                        | crate::driver::JointHoldStatus::Queued
+                            if j < 64 && !is_j7 && (arm_hold_mask & (1u64 << j)) != 0 =>
                         {
                             hold_tx_failed = true;
                         }
                         _ => {}
                     }
                 }
-                if sent_hold_mask == 0 && report.sent_any {
+                // Fallback only for minimal drivers that do not populate `joint_status` when the
+                // batch completed with frames transmitted; never mask a deferred/expired outcome.
+                if sent_hold_mask == 0 && report.sent_any && outcome_complete {
                     sent_hold_mask = hold_mask;
+                    sent_arm_hold_mask = arm_hold_mask;
                 }
                 if let Some(j7) = self.gripper_index {
                     if self.gripper_is_pos_force
@@ -711,10 +771,18 @@ impl SafeHoldBuffers {
             }
         }
         if all_bus_fresh {
-            // Fresh feedback confirms holding only when no required axis is left without verified
-            // hold output (`UnheldNoVerifiedMode`); set once per tick, never cleared then re-set.
-            ctrl.holding_unconfirmed
-                .store(unverified_mask != 0 || hold_tx_failed, Ordering::Release);
+            // Fresh feedback confirms holding only when:
+            // - no required axis lacks verified hold output (`UnheldNoVerifiedMode`),
+            // - no required arm axis failed/deferred (`hold_tx_failed`),
+            // - the hold batch outcome is `TxBatchOutcome::Complete` (not `Deferred`/`Expired`),
+            // - and non-J7 arm-axis continuity actually transmitted at least one arm frame
+            //   (J7 gripper traffic alone never confirms arm holding).
+            let zero_arm_frames = has_arm_axes && sent_arm_hold_mask == 0;
+            let unconfirmed = unverified_mask != 0
+                || hold_tx_failed
+                || hold_outcome_incomplete
+                || zero_arm_frames;
+            ctrl.holding_unconfirmed.store(unconfirmed, Ordering::Release);
         }
         if let Some(ref mut sh) = shadow {
             // One checkpoint per tick; with no hold attempted both masks are empty.
