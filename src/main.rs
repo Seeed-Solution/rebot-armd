@@ -901,8 +901,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "mock" => info!("Follower configured as mock simulation"),
         _ => unreachable!(),
     }
+    let gripper_calib_path = armd::gripper_calib::path_from_env();
     if !pending_calib_commit {
-        armd::gripper_calib::load_into(&supervisor, &armd::gripper_calib::path_from_env()).await;
+        armd::gripper_calib::load_into(&supervisor, &gripper_calib_path).await;
+    } else {
+        armd::gripper_calib::cleanup_staged_artifacts(&gripper_calib_path);
     }
     // Complete all startup configuration BEFORE transferring ownership or starting the control loop.
     let operator_auth = resolve_operator_auth(follower, &cli)?;
