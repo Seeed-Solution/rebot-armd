@@ -2599,8 +2599,10 @@ fn replay_for_violation(cfg: TorqueConfig, events: &[Event]) -> Option<(usize, V
 fn set_event_now_us(ev: &mut Event, new_now: u64) {
     match ev {
         Event::Release { now_us }
+        | Event::TransitionWake { now_us }
         | Event::HandshakeResult { now_us, .. }
         | Event::EnableStart { now_us, .. }
+        | Event::EnableCancelledPreTx { now_us, .. }
         | Event::DisableRequest { now_us, .. }
         | Event::Stop { now_us, .. }
         | Event::FaultClear { now_us, .. }

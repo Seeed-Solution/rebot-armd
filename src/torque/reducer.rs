@@ -27,6 +27,7 @@ pub fn step(state: &mut TorqueState, event: Event) -> ActionSet {
 
     match event {
         Event::Release { now_us: _ } => handle_release(state, now_us, &mut actions),
+        Event::TransitionWake { now_us: _ } => handle_transition_wake(state, now_us, &mut actions),
         Event::CausalSample(sample) => handle_causal_sample(state, sample, now_us, &mut actions),
         Event::WriteResult(wr) => handle_write_result(state, wr, now_us, &mut actions),
         Event::HandshakeResult {
@@ -47,6 +48,11 @@ pub fn step(state: &mut TorqueState, event: Event) -> ActionSet {
         Event::EnableStart { group, now_us: _ } => {
             handle_enable_start(state, group, now_us, &mut actions)
         }
+        Event::EnableCancelledPreTx {
+            group,
+            attempt_id,
+            now_us: _,
+        } => handle_enable_cancelled_pre_tx(state, group, attempt_id, now_us, &mut actions),
         Event::DisableRequest {
             group,
             now_us: _,
@@ -190,8 +196,10 @@ pub fn is_disable_authorized(
 pub const fn event_now_us(event: &Event) -> u64 {
     match *event {
         Event::Release { now_us }
+        | Event::TransitionWake { now_us }
         | Event::HandshakeResult { now_us, .. }
         | Event::EnableStart { now_us, .. }
+        | Event::EnableCancelledPreTx { now_us, .. }
         | Event::DisableRequest { now_us, .. }
         | Event::Stop { now_us, .. }
         | Event::FaultClear { now_us, .. }
@@ -432,6 +440,7 @@ fn anchor_group_captures(state: &mut TorqueState, group: u8, now_us: u64) {
                     if pos.is_finite() {
                         rt.captured_position_rad = Some(pos);
                         rt.captured_at_us = Some(ts);
+                        rt.had_valid_capture = true;
                     }
                 }
             }
@@ -461,6 +470,7 @@ fn capture_latest_for_stop(state: &mut TorqueState, group: u8, now_us: u64) {
                 if pos.is_finite() {
                     rt.captured_position_rad = Some(pos);
                     rt.captured_at_us = Some(ts);
+                    rt.had_valid_capture = true;
                 }
             }
         } else {
@@ -472,6 +482,57 @@ fn capture_latest_for_stop(state: &mut TorqueState, group: u8, now_us: u64) {
             JointRole::ActiveTool(ActiveToolSafeOutput::BoundedRetention { .. })
         ) {
             rt.retention_started_us.get_or_insert(now_us);
+        }
+    }
+}
+
+/// Expire an orphaned `pending_disable_dispatch` once its owning transaction is no longer active
+/// and its effective wire deadline has elapsed (prevents permanent `DisableInProgress` wedging).
+#[inline]
+fn expire_orphaned_pending_disable_dispatch(state: &mut TorqueState, gi: usize, now_us: u64) {
+    if let Some(pend) = state.groups[gi].pending_disable_dispatch {
+        if !pend.tx_still_active && now_us >= pend.deadline_us {
+            state.groups[gi].pending_disable_dispatch = None;
+        }
+    }
+}
+
+/// Sub-release transition-wake handler (Window 2 / headless transition polling): advances in-flight
+/// disable repeats, rest-gate authorization, transaction deadlines, and orphaned dispatch expiry
+/// without incrementing `current_release_id` or touching hold contention streaks.
+fn handle_transition_wake(state: &mut TorqueState, now_us: u64, actions: &mut ActionSet) {
+    refresh_captures_and_windows(state, now_us);
+
+    for g in 0..state.config.group_count {
+        let gi = g as usize;
+        expire_orphaned_pending_disable_dispatch(state, gi, now_us);
+
+        if state.groups[gi].drive_state == DriveState::ProtectiveDisabling {
+            step_protective_disabling_progress(state, g, now_us, false, actions);
+            expire_orphaned_pending_disable_dispatch(state, gi, now_us);
+            continue;
+        }
+        if state.groups[gi].drive_state == DriveState::ProtectiveDamping
+            || state.groups[gi].drive_state == DriveState::ProtectiveDisabled
+        {
+            continue;
+        }
+
+        if state.groups[gi].drive_state == DriveState::ReadyToSwitchOn {
+            let expired = state.groups[gi]
+                .enable_tx
+                .is_some_and(|etx| now_us >= etx.deadline_us);
+            if expired {
+                enter_failed_hold(state, g, now_us, actions);
+            }
+        }
+
+        if state.groups[gi]
+            .disable_tx
+            .is_some_and(|tx| !tx.origin.is_protective())
+        {
+            step_non_protective_disable_progress(state, g, now_us, false, actions);
+            expire_orphaned_pending_disable_dispatch(state, gi, now_us);
         }
     }
 }
@@ -562,6 +623,7 @@ fn handle_release(state: &mut TorqueState, now_us: u64, actions: &mut ActionSet)
 
     for g in 0..state.config.group_count {
         let gi = g as usize;
+        expire_orphaned_pending_disable_dispatch(state, gi, now_us);
 
         // 1. Protective states preempt everything else on this group.
         if state.groups[gi].drive_state == DriveState::ProtectiveDamping {
@@ -569,7 +631,8 @@ fn handle_release(state: &mut TorqueState, now_us: u64, actions: &mut ActionSet)
             continue;
         }
         if state.groups[gi].drive_state == DriveState::ProtectiveDisabling {
-            step_protective_disabling_on_release(state, g, now_us, actions);
+            step_protective_disabling_progress(state, g, now_us, true, actions);
+            expire_orphaned_pending_disable_dispatch(state, gi, now_us);
             continue;
         }
         if state.groups[gi].drive_state == DriveState::ProtectiveDisabled {
@@ -616,7 +679,8 @@ fn handle_release(state: &mut TorqueState, now_us: u64, actions: &mut ActionSet)
             .disable_tx
             .is_some_and(|tx| !tx.origin.is_protective())
         {
-            step_non_protective_disable_on_release(state, g, now_us, actions);
+            step_non_protective_disable_progress(state, g, now_us, true, actions);
+            expire_orphaned_pending_disable_dispatch(state, gi, now_us);
         }
 
         // 5. Hold emission for stopped / FailedHold / SafeHold / unaccepted-park groups with TorqueIntent::On.
@@ -698,10 +762,11 @@ fn emit_damping_commands(
     }
 }
 
-fn step_protective_disabling_on_release(
+fn step_protective_disabling_progress(
     state: &mut TorqueState,
     g: u8,
     now_us: u64,
+    is_release: bool,
     actions: &mut ActionSet,
 ) {
     let gi = g as usize;
@@ -710,7 +775,10 @@ fn step_protective_disabling_on_release(
     let Some(tx) = state.groups[gi].disable_tx else {
         // M13 / B12: If a previous protective attempt expired and thermal is STILL active, open a
         // fresh bounded attempt with a new tx_id and deadline.
-        if !state.groups[gi].thermal_tripped_mask.is_empty() && group_has_unresolved_off(state, g) {
+        if is_release
+            && !state.groups[gi].thermal_tripped_mask.is_empty()
+            && group_has_unresolved_off(state, g)
+        {
             trigger_protective_disable(state, g, DisableOrigin::ProtectiveThermal, now_us, actions);
         }
         return;
@@ -725,23 +793,25 @@ fn step_protective_disabling_on_release(
                 // If an initial protective dispatch from an earlier release received zero callbacks
                 // (e.g. Thermal fired between releases and owner dispatches synchronously on Release),
                 // re-surface the SAME dispatch_id on the N=1 serviced release without losing correlation!
-                if pend.tx_still_active
+                if is_release
+                    && pend.tx_still_active
                     && pend.tx_id == tx.tx_id
                     && pend.remaining_recipients == pend.target_recipients
                     && pend.release_id < state.current_release_id
                 {
-                    if let Some(p_mut) = state.groups[gi].pending_disable_dispatch.as_mut() {
-                        p_mut.release_id = state.current_release_id;
-                    }
-                    if let Some(tx_mut) = state.groups[gi].disable_tx.as_mut() {
-                        tx_mut.last_dispatched_release_id = Some(state.current_release_id);
-                    }
                     let eff_dl = effective_disable_deadline_us(
                         state,
                         pend.target_recipients,
                         now_us,
                         tx.deadline_us,
                     );
+                    if let Some(p_mut) = state.groups[gi].pending_disable_dispatch.as_mut() {
+                        p_mut.release_id = state.current_release_id;
+                        p_mut.deadline_us = eff_dl;
+                    }
+                    if let Some(tx_mut) = state.groups[gi].disable_tx.as_mut() {
+                        tx_mut.last_dispatched_release_id = Some(state.current_release_id);
+                    }
                     actions.disables[gi] = Some(DisableCommand {
                         group: g,
                         tx_id: tx.tx_id,
@@ -757,7 +827,7 @@ fn step_protective_disabling_on_release(
                         use_reserved_budget: true,
                     });
                 }
-            } else {
+            } else if is_release {
                 emit_disable_attempt(state, g, DisableKind::Protective, now_us, actions);
             }
         }
@@ -807,10 +877,11 @@ fn close_protective_zero_write_expiry(
     }
 }
 
-fn step_non_protective_disable_on_release(
+fn step_non_protective_disable_progress(
     state: &mut TorqueState,
     g: u8,
     now_us: u64,
+    emit_refresh: bool,
     actions: &mut ActionSet,
 ) {
     let gi = g as usize;
@@ -837,6 +908,9 @@ fn step_non_protective_disable_on_release(
                     }
                     try_authorize_rest_gate(state, g, now_us, actions);
                 }
+            } else if now_us >= tx.deadline_us {
+                let code = rest_timeout_code(state, &tx);
+                abort_non_protective_tx(state, g, code, true, actions);
             }
         }
         DisablePhase::AwaitRestGate => {
@@ -847,13 +921,15 @@ fn step_non_protective_disable_on_release(
                 abort_non_protective_tx(state, g, code, true, actions);
             } else if state.groups[gi].pending_disable_dispatch.is_none() {
                 try_authorize_rest_gate(state, g, now_us, actions);
-                if let Some(tx_now) = state.groups[gi].disable_tx {
-                    if matches!(tx_now.phase, DisablePhase::AwaitRestGate) {
-                        for r in tx_now.recipient_mask.iter() {
-                            if !recipient_passes_gate(state, r, &tx_now, now_us) {
-                                actions.refresh_requests = actions
-                                    .refresh_requests
-                                    .union(state.config.recipients[r as usize].channels);
+                if emit_refresh {
+                    if let Some(tx_now) = state.groups[gi].disable_tx {
+                        if matches!(tx_now.phase, DisablePhase::AwaitRestGate) {
+                            for r in tx_now.recipient_mask.iter() {
+                                if !recipient_passes_gate(state, r, &tx_now, now_us) {
+                                    actions.refresh_requests = actions
+                                        .refresh_requests
+                                        .union(state.config.recipients[r as usize].channels);
+                                }
                             }
                         }
                     }
@@ -917,6 +993,7 @@ fn emit_disable_attempt(
         deferred_mask: ChannelMask::EMPTY,
         rejected_stale_mask: ChannelMask::EMPTY,
         tx_still_active: true,
+        deadline_us: eff_dl,
     });
     actions.disables[gi] = Some(DisableCommand {
         group: g,
@@ -1052,7 +1129,9 @@ pub fn predict_group_hold_mask(state: &TorqueState, group: u8, now_us: u64) -> C
         let rt = &state.joints[c as usize];
         let uses_cap = rt.captured_position_rad.is_some()
             && rt.captured_at_us.is_some()
-            && rt.last_sample_us.is_some();
+            && rt
+                .last_sample_us
+                .is_some_and(|ts| is_sample_fresh(ts, now_us, ch_cfg.max_capture_age_us));
         let held = match ch_cfg.role {
             JointRole::PassiveSensor => false,
             JointRole::ActiveTool(ActiveToolSafeOutput::StopOutput) => true,
@@ -1219,10 +1298,12 @@ fn handle_causal_sample(
             if rt.captured_position_rad.is_none() {
                 rt.captured_position_rad = Some(sample.position_rad);
                 rt.captured_at_us = Some(sample.rx_timestamp_us);
+                rt.had_valid_capture = true;
             }
         } else {
             rt.captured_position_rad = Some(sample.position_rad);
             rt.captured_at_us = Some(sample.rx_timestamp_us);
+            rt.had_valid_capture = true;
         }
     }
 
@@ -1252,6 +1333,156 @@ fn handle_causal_sample(
     feed_rest_gate_sample(state, g, sample, now_us, actions);
 }
 
+fn push_rest_window_sample(state: &mut TorqueState, sample: CausalSample) {
+    let ch = sample.channel as usize;
+    let ch_cfg = state.config.channels[ch];
+    let rec = ch_cfg.recipient;
+    let rec_idx = rec as usize;
+    let rec_cfg = state.config.recipients[rec_idx];
+
+    // B8: Per-channel unused sample_id & distinct release check before contributing to snapshot.
+    let current_rel = state.current_release_id;
+    let rt = &state.joints[ch];
+    if rt.last_window_sample_id == Some(sample.sample_id)
+        || rt.last_window_release_id == Some(current_rel)
+    {
+        // Duplicate sample_id or already counted in this release for this channel.
+        return;
+    }
+
+    let snap_ts = sample.rx_timestamp_us;
+    let win = &mut state.rest_windows[rec_idx];
+    if win.pending_release_id != current_rel || win.pending_agreed_channels.is_empty() {
+        win.pending_release_id = current_rel;
+        win.pending_agreed_channels = ChannelMask::EMPTY;
+        win.pending_min_ts_us = snap_ts;
+        win.pending_max_ts_us = snap_ts;
+    }
+    if win.pending_agreed_channels.contains(sample.channel) {
+        return;
+    }
+    win.pending_agreed_channels.insert(sample.channel);
+    win.pending_min_ts_us = win.pending_min_ts_us.min(snap_ts);
+    win.pending_max_ts_us = win.pending_max_ts_us.max(snap_ts);
+
+    // Record per-channel sample_id as consumed for this release's pending snapshot.
+    state.joints[ch].last_window_sample_id = Some(sample.sample_id);
+    state.joints[ch].last_window_release_id = Some(current_rel);
+
+    if state.rest_windows[rec_idx].pending_agreed_channels == rec_cfg.channels {
+        let min_age = recipient_min_capture_age_us(state, rec);
+        let snap = RestSnapshot {
+            release_id: current_rel,
+            min_ts_us: state.rest_windows[rec_idx].pending_min_ts_us,
+            max_ts_us: state.rest_windows[rec_idx].pending_max_ts_us,
+        };
+        let win = &mut state.rest_windows[rec_idx];
+        if win.count == 0 {
+            win.push_snapshot(snap);
+        } else if win.latest_release_id() == current_rel {
+            // Counts once per release.
+        } else if snap.min_ts_us < win.latest_ts_us() {
+            // Non-monotonic snapshot timestamp resets the window.
+            reset_recipient_window(state, rec);
+        } else if snap.min_ts_us.saturating_sub(win.latest_ts_us()) > min_age {
+            // Stale blackout gap: restart window at this fresh snapshot.
+            win.count = 0;
+            win.push_snapshot(snap);
+        } else {
+            win.push_snapshot(snap);
+        }
+    }
+}
+
+fn check_sample_settle_causality(state: &TorqueState, sample: CausalSample) -> bool {
+    let ch = sample.channel as usize;
+    let ch_cfg = state.config.channels[ch];
+    let dev_rt = state.devices[ch_cfg.device as usize];
+
+    // B7: Feetech requires explicit correlated poll_issued_us AND correlated_after_write_done_us,
+    // with poll issued strictly AFTER the 20 ms post-motion settle and AFTER poison silence.
+    let causal_ts_for_settle = if matches!(ch_cfg.vendor, VendorKind::Feetech) {
+        let (Some(poll_us), Some(wd_us)) = (
+            sample.poll_issued_us,
+            sample.correlated_after_write_done_us,
+        ) else {
+            return false;
+        };
+        if poll_us < wd_us
+            || poll_us < dev_rt.poisoned_until_us
+            || sample.rx_timestamp_us < poll_us
+        {
+            return false;
+        }
+        poll_us
+    } else {
+        sample.rx_timestamp_us
+    };
+
+    // Strict post-motion settle: strictly > 20 ms after last motion write.
+    if let Some(last_mw) = state.joints[ch].last_motion_write_us {
+        if causal_ts_for_settle <= last_mw.saturating_add(REST_SETTLE_US) {
+            return false;
+        }
+    }
+    true
+}
+
+fn feed_passive_rest_window_sample(state: &mut TorqueState, g: u8, sample: CausalSample) {
+    let gi = g as usize;
+    if state.groups[gi].torque_intent != TorqueIntent::On
+        || state.groups[gi].drive_state.is_protective()
+        || state.groups[gi].drive_state == DriveState::ReadyToSwitchOn
+    {
+        return;
+    }
+    let ch = sample.channel as usize;
+    let ch_cfg = state.config.channels[ch];
+    let rec = ch_cfg.recipient;
+    let rec_cfg = state.config.recipients[rec as usize];
+
+    if !check_sample_settle_causality(state, sample) {
+        reset_recipient_window(state, rec);
+        return;
+    }
+
+    let agrees = match ch_cfg.role {
+        JointRole::LoadBearing => {
+            if !rec_cfg.rest_evidence_qualified {
+                false
+            } else {
+                let pos_ok = (sample.position_rad - ch_cfg.rest_position_rad).abs()
+                    <= ch_cfg.rest_tolerance_rad;
+                let vel_ok = match (ch_cfg.rest_max_velocity_rad_s, sample.velocity_rad_s) {
+                    (Some(max_v), Some(v)) => v.abs() <= max_v,
+                    _ => true,
+                };
+                pos_ok && vel_ok
+            }
+        }
+        JointRole::Gripper(GripperReleasePolicy::LegacyJ7) => true,
+        JointRole::Gripper(GripperReleasePolicy::ExplicitHand)
+        | JointRole::ActiveTool(ActiveToolSafeOutput::BoundedRetention { .. }) => matches!(
+            sample.release_evidence,
+            Some(ReleaseEvidence::SupportedObject | ReleaseEvidence::VerifiedEmptyGrasp)
+        ),
+        JointRole::ActiveTool(ActiveToolSafeOutput::StopOutput) => {
+            match (ch_cfg.rest_max_velocity_rad_s, sample.velocity_rad_s) {
+                (Some(max_v), Some(v)) => v.abs() <= max_v,
+                _ => true,
+            }
+        }
+        JointRole::PassiveSensor => false,
+    };
+
+    if !agrees {
+        reset_recipient_window(state, rec);
+        return;
+    }
+
+    push_rest_window_sample(state, sample);
+}
+
 fn feed_rest_gate_sample(
     state: &mut TorqueState,
     g: u8,
@@ -1261,6 +1492,9 @@ fn feed_rest_gate_sample(
 ) {
     let gi = g as usize;
     let Some(tx) = state.groups[gi].disable_tx else {
+        // Continuously accumulate valid rest-window evidence while armed/holding so a subsequent
+        // DisableRequest at an already-stationary rest pose matches live driver K=3 accumulation.
+        feed_passive_rest_window_sample(state, g, sample);
         return;
     };
     if tx.origin.is_protective() || tx.committed_off {
@@ -1288,45 +1522,13 @@ fn feed_rest_gate_sample(
     }
 
     let rec_cfg = state.config.recipients[rec_idx];
-    let dev_rt = state.devices[ch_cfg.device as usize];
 
-    // B7: Feetech requires explicit correlated poll_issued_us AND correlated_after_write_done_us,
-    // with poll issued strictly AFTER the 20 ms post-motion settle and AFTER poison silence.
-    let causal_ts_for_settle = if matches!(ch_cfg.vendor, VendorKind::Feetech) {
-        let (Some(poll_us), Some(wd_us)) = (
-            sample.poll_issued_us,
-            sample.correlated_after_write_done_us,
-        ) else {
-            reset_recipient_window(state, rec);
-            if was_authorized {
-                revoke_unconsumed_rest_auth(state, g);
-            }
-            return;
-        };
-        if poll_us < wd_us
-            || poll_us < dev_rt.poisoned_until_us
-            || sample.rx_timestamp_us < poll_us
-        {
-            reset_recipient_window(state, rec);
-            if was_authorized {
-                revoke_unconsumed_rest_auth(state, g);
-            }
-            return;
+    if !check_sample_settle_causality(state, sample) {
+        reset_recipient_window(state, rec);
+        if was_authorized {
+            revoke_unconsumed_rest_auth(state, g);
         }
-        poll_us
-    } else {
-        sample.rx_timestamp_us
-    };
-
-    // Strict post-motion settle: strictly > 20 ms after last motion write.
-    if let Some(last_mw) = state.joints[ch].last_motion_write_us {
-        if causal_ts_for_settle <= last_mw.saturating_add(REST_SETTLE_US) {
-            reset_recipient_window(state, rec);
-            if was_authorized {
-                revoke_unconsumed_rest_auth(state, g);
-            }
-            return;
-        }
+        return;
     }
 
     // Role-specific agreement check (B6: affirmative fresh release evidence required on sample!).
@@ -1462,58 +1664,7 @@ fn feed_rest_gate_sample(
         return;
     }
 
-    // B8: Per-channel unused sample_id & distinct release check before contributing to snapshot.
-    let current_rel = state.current_release_id;
-    let rt = &state.joints[ch];
-    if rt.last_window_sample_id == Some(sample.sample_id)
-        || rt.last_window_release_id == Some(current_rel)
-    {
-        // Duplicate sample_id or already counted in this release for this channel.
-        return;
-    }
-
-    let snap_ts = sample.rx_timestamp_us;
-    let win = &mut state.rest_windows[rec_idx];
-    if win.pending_release_id != current_rel || win.pending_agreed_channels.is_empty() {
-        win.pending_release_id = current_rel;
-        win.pending_agreed_channels = ChannelMask::EMPTY;
-        win.pending_min_ts_us = snap_ts;
-        win.pending_max_ts_us = snap_ts;
-    }
-    if win.pending_agreed_channels.contains(sample.channel) {
-        return;
-    }
-    win.pending_agreed_channels.insert(sample.channel);
-    win.pending_min_ts_us = win.pending_min_ts_us.min(snap_ts);
-    win.pending_max_ts_us = win.pending_max_ts_us.max(snap_ts);
-
-    // Record per-channel sample_id as consumed for this release's pending snapshot.
-    state.joints[ch].last_window_sample_id = Some(sample.sample_id);
-    state.joints[ch].last_window_release_id = Some(current_rel);
-
-    if state.rest_windows[rec_idx].pending_agreed_channels == rec_cfg.channels {
-        let min_age = recipient_min_capture_age_us(state, rec);
-        let snap = RestSnapshot {
-            release_id: current_rel,
-            min_ts_us: state.rest_windows[rec_idx].pending_min_ts_us,
-            max_ts_us: state.rest_windows[rec_idx].pending_max_ts_us,
-        };
-        let win = &mut state.rest_windows[rec_idx];
-        if win.count == 0 {
-            win.push_snapshot(snap);
-        } else if win.latest_release_id() == current_rel {
-            // Counts once per release.
-        } else if snap.min_ts_us < win.latest_ts_us() {
-            // Non-monotonic snapshot timestamp resets the window.
-            reset_recipient_window(state, rec);
-        } else if snap.min_ts_us.saturating_sub(win.latest_ts_us()) > min_age {
-            // Stale blackout gap: restart window at this fresh snapshot.
-            win.count = 0;
-            win.push_snapshot(snap);
-        } else {
-            win.push_snapshot(snap);
-        }
-    }
+    push_rest_window_sample(state, sample);
 
     if state.groups[gi].pending_disable_dispatch.is_none() {
         try_authorize_rest_gate(state, g, now_us, actions);
@@ -1739,6 +1890,17 @@ fn handle_write_result(
                     .enable_tx
                     .is_some_and(|etx| etx.attempt_id == wr.dispatch_id);
                 if matches_attempt {
+                    let any_sent_or_ambiguous = wr.target_mask.iter().any(|c| {
+                        matches!(
+                            wr.outcomes[c as usize],
+                            MotorWriteOutcome::Sent | MotorWriteOutcome::Ambiguous
+                        )
+                    });
+                    if any_sent_or_ambiguous {
+                        if let Some(etx_mut) = state.groups[wr.group as usize].enable_tx.as_mut() {
+                            etx_mut.any_write_sent = true;
+                        }
+                    }
                     let any_fatal = wr.target_mask.iter().any(|c| {
                         matches!(
                             wr.outcomes[c as usize],
@@ -1993,10 +2155,7 @@ fn handle_enable_start(state: &mut TorqueState, group: u8, now_us: u64, actions:
         });
         return;
     }
-    if matches!(
-        grp.drive_state,
-        DriveState::ReadyToSwitchOn | DriveState::OperationEnabled
-    ) {
+    if grp.drive_state == DriveState::ReadyToSwitchOn {
         actions.refusals[gi] = Some(RefusalEvent {
             group,
             code: RefusalCode::AlreadyEnabled,
@@ -2033,7 +2192,10 @@ fn handle_enable_start(state: &mut TorqueState, group: u8, now_us: u64, actions:
         }
     }
 
-    // Accept EnableStart: allocate unique attempt_id, set TorqueIntent::On immediately.
+    // Accept EnableStart (including idempotent re-enable from OperationEnabled): allocate unique
+    // attempt_id and set TorqueIntent::On immediately. When already OperationEnabled, mark
+    // `any_write_sent = true` so pre-TX cancellation can never disarm an already-energized arm.
+    let was_already_enabled = grp.drive_state == DriveState::OperationEnabled;
     let attempt_id = state.alloc_capability_id();
     let deadline_us = now_us.saturating_add(grp_cfg.enable_deadline_us);
     let gen = grp.stop_generation;
@@ -2048,10 +2210,19 @@ fn handle_enable_start(state: &mut TorqueState, group: u8, now_us: u64, actions:
         generation: gen,
         target_channels: active,
         confirmed_channels: ChannelMask::EMPTY,
+        any_write_sent: was_already_enabled,
     });
+    if !was_already_enabled {
+        for r in grp_cfg.recipients.iter() {
+            reset_recipient_window(state, r);
+        }
+    }
     for c in active.iter() {
         state.joints[c as usize].retention_started_us = None;
         state.joints[c as usize].last_release_evidence = ReleaseEvidence::Unknown;
+        if !was_already_enabled {
+            state.joints[c as usize].had_valid_capture = false;
+        }
     }
     actions.enables[gi] = Some(EnableCommand {
         group,
@@ -2060,6 +2231,42 @@ fn handle_enable_start(state: &mut TorqueState, group: u8, now_us: u64, actions:
         generation: gen,
         deadline_us,
     });
+}
+
+fn handle_enable_cancelled_pre_tx(
+    state: &mut TorqueState,
+    group: u8,
+    attempt_id: u64,
+    now_us: u64,
+    actions: &mut ActionSet,
+) {
+    if group >= state.config.group_count {
+        set_refusal_safe(actions, group, RefusalCode::GroupOutOfRange, None);
+        return;
+    }
+    let gi = group as usize;
+    if state.groups[gi].drive_state != DriveState::ReadyToSwitchOn {
+        return;
+    }
+    let Some(etx) = state.groups[gi].enable_tx else {
+        return;
+    };
+    if etx.attempt_id != attempt_id {
+        return;
+    }
+    if !etx.any_write_sent && etx.confirmed_channels.is_empty() {
+        state.groups[gi].drive_state = DriveState::SwitchOnDisabled;
+        state.groups[gi].enable_phase = EnablePhase::Idle;
+        state.groups[gi].enable_tx = None;
+        state.groups[gi].torque_intent = TorqueIntent::Off;
+        state.groups[gi].stop_generation = state.groups[gi].stop_generation.saturating_add(1);
+        let active = group_active_channels(state, group);
+        for c in active.iter() {
+            state.joints[c as usize].had_valid_capture = false;
+        }
+    } else {
+        enter_failed_hold(state, group, now_us, actions);
+    }
 }
 
 fn handle_handshake_result(
@@ -2547,6 +2754,7 @@ fn handle_disable_request(
         explicit_release_authorized,
         now_us,
     );
+    try_authorize_rest_gate(state, group, now_us, actions);
 }
 
 fn open_rest_gated_disable(
@@ -2560,9 +2768,9 @@ fn open_rest_gated_disable(
     let gi = group as usize;
     let grp_cfg = state.config.groups[gi];
     let tx_id = state.alloc_capability_id();
-    for r in actual_recipients.iter() {
-        reset_recipient_window(state, r);
-    }
+    // Prune any stale rest windows at `now_us` while preserving valid continuously-accumulated
+    // K=3 windows so already-stationary arms authorize immediately like live drivers.
+    refresh_captures_and_windows(state, now_us);
     state.groups[gi].disable_tx = Some(DisableTransaction {
         tx_id,
         origin,
@@ -3260,6 +3468,7 @@ fn handle_bus_loss(state: &mut TorqueState, device: u8, now_us: u64, actions: &m
             rt.last_measured_vel_rad_s = None;
             rt.last_release_evidence = ReleaseEvidence::Unknown;
             rt.verified_timeout_session = None;
+            rt.had_valid_capture = false;
         }
     }
     for r in 0..state.config.recipient_count {
@@ -3355,6 +3564,10 @@ fn finish_disable_tx(
 
 fn update_post_off_drive_state(state: &mut TorqueState, g: u8, is_protective: bool) {
     let gi = g as usize;
+    let active = group_active_channels(state, g);
+    for c in active.iter() {
+        state.joints[c as usize].had_valid_capture = false;
+    }
     if is_protective || state.groups[gi].protective_latch {
         state.groups[gi].drive_state = DriveState::ProtectiveDisabled;
     } else if !state.groups[gi].faults.is_empty() {
