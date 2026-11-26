@@ -3928,7 +3928,7 @@ async fn rt_gate_power_static_load_tracking_paths_zero_alloc_zero_lock() {
                     .action
                     .as_ref()
                     .filter(|a| a.id == act_id)
-                    .map(|a| (a.state.clone(), a.code.clone()))
+                    .map(|a| (a.state, a.code))
                     .unwrap_or_default();
                 let failed = st == "failed" && code.as_deref() == Some("STATIC_LOAD_LIMIT");
                 ((st, code, saw_power_limit), failed && saw_power_limit)
@@ -4406,7 +4406,7 @@ async fn rt_gate_power_static_load_tracking_paths_zero_alloc_zero_lock() {
                     .action
                     .as_ref()
                     .filter(|a| a.id == act_id)
-                    .map(|a| (a.state.clone(), a.code.clone()))
+                    .map(|a| (a.state, a.code))
                     .unwrap_or_default();
                 let failed = st == "failed" && code.as_deref() == Some("STATIC_LOAD_LIMIT");
                 ((st, code, saw_power_limit), failed && saw_power_limit)
