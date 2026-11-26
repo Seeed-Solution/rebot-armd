@@ -1248,6 +1248,11 @@ pub struct SupervisorInner {
     /// Preallocated tick-driven PR0C `ModeSwitch` session runner (0 RT allocs).
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) mode_switch: ModeSwitchRunner,
+    /// `control_release_seq` on which `service_mode_switch_release` last stepped a live session
+    /// (keeps `mode_switch_owns_bus` latched for the remainder of the terminal release so ordinary
+    /// output and the J7 tick epilogue never emit duplicate frames after ModeSwitch finishes).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) mode_switch_ran_release_seq: u64,
     /// True when startup found an incomplete or unreadable pending calibration commit marker.
     pub(crate) calibration_quarantined: bool,
     /// Cached raw driver position limits (updated off-RT / on bounded driver-limit commits) so
@@ -2543,6 +2548,8 @@ impl SupervisorInner {
             sessions: crate::rt_core::session::SessionDriver::new(),
             #[cfg(not(target_arch = "wasm32"))]
             mode_switch: ModeSwitchRunner::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            mode_switch_ran_release_seq: 0,
             calibration_quarantined: false,
             cached_driver_pos_limits: [None; crate::rt_core::mailbox::MAX_DOF],
             calibration_load_error: None,
@@ -6750,12 +6757,21 @@ impl SupervisorInner {
         #[cfg(not(target_arch = "wasm32"))]
         let (mode_switch, prev_mode_switch_terminal) = if self.mode_switch.is_idle() {
             (None, None)
-        } else {
+        } else if self.mode_switch.active_session.is_some() {
             (
                 self.current_mode_switch_snapshot()
                     .map(crate::rt_core::publish::PublishedModeSwitch::from),
                 self.mode_switch
                     .latest_terminal()
+                    .map(crate::rt_core::publish::PublishedModeSwitch::from),
+            )
+        } else {
+            (
+                self.mode_switch
+                    .latest_terminal()
+                    .map(crate::rt_core::publish::PublishedModeSwitch::from),
+                self.mode_switch
+                    .previous_terminal()
                     .map(crate::rt_core::publish::PublishedModeSwitch::from),
             )
         };
@@ -11295,8 +11311,20 @@ impl SupervisorInner {
         // i.e. rest gate passed and the first disable frame has been dispatched).
         let transition_owns_bus = self.torque_transition.is_some();
         #[cfg(not(target_arch = "wasm32"))]
-        let mode_switch_owns_bus =
-            self.mode_switch_owns_bus() || self.sessions.is_safe_hold_requested();
+        let mode_switch_ran_this_release = self.control_release_seq != 0
+            && self.mode_switch_ran_release_seq == self.control_release_seq;
+        #[cfg(target_arch = "wasm32")]
+        let mode_switch_ran_this_release = false;
+        #[cfg(not(target_arch = "wasm32"))]
+        let safe_hold_inline_fallback = self.sessions.is_safe_hold_requested()
+            && !self.mode_switch_owns_bus()
+            && !mode_switch_ran_this_release;
+        #[cfg(target_arch = "wasm32")]
+        let safe_hold_inline_fallback = false;
+        #[cfg(not(target_arch = "wasm32"))]
+        let mode_switch_owns_bus = self.mode_switch_owns_bus()
+            || mode_switch_ran_this_release
+            || self.sessions.is_safe_hold_requested();
         #[cfg(target_arch = "wasm32")]
         let mode_switch_owns_bus = false;
         let enable_transition_owns_bus = matches!(
@@ -11745,6 +11773,79 @@ impl SupervisorInner {
                 tick_output = TickOutput::None;
             }
         }
+        // R4 Blocker 3: when Legacy is driven manually via `tick()` / `control_tick()` (without
+        // the threaded `legacy_safe_hold_handoff` loop) after a session requested SAFE-HOLD,
+        // execute bounded measured-position holds for all verified-mode axes + causal CTRL_MODE
+        // readback probes for uncertain axes directly in the release (0 heap alloc, 0 CMD_DISABLE).
+        #[cfg(not(target_arch = "wasm32"))]
+        if safe_hold_inline_fallback
+            && !self.shutdown_committed
+            && !self.detached
+            && self.torque_intent == TorqueIntent::On
+        {
+            let dof = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
+            let mut hold_targets: [crate::driver::JointTarget; crate::rt_core::mailbox::MAX_DOF] =
+                std::array::from_fn(|_| crate::driver::JointTarget::position(0.0));
+            let mut hold_mask = 0u64;
+            let feedback_ok = self.commit_feedback_valid();
+            for j in 0..dof {
+                let pos = self
+                    .measured_hold
+                    .captured_positions
+                    .get(j)
+                    .copied()
+                    .flatten()
+                    .filter(|p| p.is_finite())
+                    .or_else(|| {
+                        feedback_ok
+                            .then(|| self.measured_positions.get(j).copied())
+                            .flatten()
+                            .filter(|p| p.is_finite())
+                    });
+                if let Some(p) = pos {
+                    hold_targets[j] = crate::driver::JointTarget::position(p);
+                    if j < 64 {
+                        hold_mask |= 1u64 << j;
+                    }
+                }
+            }
+            let release_cap = self.active_tx_cutoff.map(|c| c.drv_release_cap);
+            let use_try = self.rt_executor_owned || self.nonblocking_driver_release;
+            let shadow_rt = &mut self.torque_shadow;
+            if let Some(d) = self.driver.as_mut() {
+                let run_inline_sh = |drv: &mut dyn ArmDriver| {
+                    if let Some(cap) = release_cap {
+                        drv.set_tx_release_deadline(Some(cap));
+                    }
+                    drv.set_pending_pos_force_hold_hint(true);
+                    let mut unverified_mask = 0u64;
+                    if hold_mask != 0 {
+                        if let Ok(report) =
+                            drv.write_measured_hold_masked(hold_mask, &hold_targets[..dof])
+                        {
+                            for j in 0..dof.min(report.dof) {
+                                if matches!(
+                                    report.joint_status[j],
+                                    crate::driver::JointHoldStatus::UnheldNoVerifiedMode
+                                ) && j < 64
+                                {
+                                    unverified_mask |= 1u64 << j;
+                                }
+                            }
+                        }
+                    }
+                    if unverified_mask != 0 {
+                        let _ = drv.request_mode_readback_budgeted(unverified_mask);
+                    }
+                    shadow_rt.drain_from_driver(drv);
+                };
+                if use_try {
+                    let _ = d.try_with_mut(run_inline_sh);
+                } else {
+                    let _ = d.with_mut(run_inline_sh);
+                }
+            }
+        }
         // Tick epilogue (BOTH Legacy and RT Executor owners): invoke the ONE J7 PosForce emitter
         // exactly once per control tick AFTER whatever arm-write path ran (whether arm output
         // succeeded, deferred, expired, errored, hit action deadline cutoff, tripped the MIT fence
@@ -11753,7 +11854,8 @@ impl SupervisorInner {
         // deadline; stop/hold/freeze-class frames restore `drv_release_cap` so a deadline never
         // suppresses a stop, hold, or freeze.
         let is_stopped_or_failed_hold_epilogue = self.safety.state().is_stopped()
-            || self.enable_lifecycle == driver_transitions::EnableLifecycle::FailedHold;
+            || self.enable_lifecycle == driver_transitions::EnableLifecycle::FailedHold
+            || safe_hold_inline_fallback;
         let pending_disable_hold_epilogue =
             (self.disable_pending || transition_owns_bus) && self.torque_intent == TorqueIntent::On;
         let j7_eligible = self.torque_intent == TorqueIntent::On
@@ -11763,7 +11865,7 @@ impl SupervisorInner {
         if !self.shutdown_committed
             && !output_tx_cap_expired
             && j7_eligible
-            && !enable_transition_owns_bus
+            && !(enable_transition_owns_bus && !safe_hold_inline_fallback)
             && !self.urgent_stop_unapplied()
         {
             let current_stamp = self.current_j7_intent_stamp();
@@ -12259,6 +12361,14 @@ impl ModeSwitchRunner {
         self.recent_terminals[idx]
     }
 
+    pub(crate) fn previous_terminal(&self) -> Option<crate::motor_mode::ModeSwitchSnapshot> {
+        if self.recent_terminal_cursor < 2 {
+            return None;
+        }
+        let idx = self.recent_terminal_cursor.wrapping_sub(2) % self.recent_terminals.len();
+        self.recent_terminals[idx]
+    }
+
     #[inline]
     pub(crate) fn is_idle(&self) -> bool {
         self.active_session.is_none() && self.recent_terminal_cursor == 0
@@ -12647,6 +12757,7 @@ impl SupervisorInner {
         // Temporarily take driver out (restored unconditionally even on unwind) so the live
         // pre-TX gate closure can borrow `&*self` right before `can.transmit` (0 alloc).
         let mut taken_drv = self.driver.take();
+        self.mode_switch_ran_release_seq = self.control_release_seq;
         let mut drv_uncertain = 0u32;
         let step_progress = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let Some(slot) = taken_drv.as_mut() else {

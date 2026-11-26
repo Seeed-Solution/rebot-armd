@@ -1008,6 +1008,28 @@ async fn session_stream_saturation_stale_cancel_clear_and_inflight_revocation() 
         }
     );
     assert!(sup.clear_mode_switch_session(sid2).await.unwrap());
+    // R4 Major 2 proof: after sid2 ALSO completes, BOTH sid2 (latest terminal) AND sid1 (previous
+    // terminal) remain readable from StateHub::read_services!
+    let wait_both = Instant::now() + Duration::from_secs(1);
+    loop {
+        let p2 = sup.poll_mode_switch_session(sid2).await.unwrap();
+        let p1 = sup.poll_mode_switch_session(sid1).await.unwrap();
+        if p2.as_ref().is_some_and(|s| !s.running) && p1.as_ref().is_some_and(|s| !s.running) {
+            assert_eq!(
+                p2.unwrap().progress,
+                ModeProgress::StoppedRecovered {
+                    reason: ModeSwitchFailure::Stopped
+                }
+            );
+            assert_eq!(p1.unwrap().progress, ModeProgress::Confirmed);
+            break;
+        }
+        assert!(
+            Instant::now() < wait_both,
+            "both sid1 and sid2 terminals must remain readable after sid2 finishes: p1={p1:?} p2={p2:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     let after_allocs = exec.stats().release_allocs.snapshot();
     assert_eq!(
         (
@@ -1624,4 +1646,218 @@ async fn dual_owner_mode_switch_authority_and_ambiguity_safe_hold_parity() {
         h.shutdown(true).await;
     }
     assert_eq!(results[0], results[1], "Legacy and Executor authority & SAFE-HOLD parity");
+}
+
+/// R4 Blocker 1 + Blocker 2 + Blocker 3 regression test:
+/// 1. When a SAFE-HOLD recovery `REG_READ(RID_CTRL_MODE)` reply is lost at 50 Hz (20 ms ticks),
+///    `request_mode_readback_budgeted` retries on the very next 20 ms tick (15 ms retry window)
+///    and recovers J1 well before Damiao's 100 ms `TIMEOUT = 2000` watchdog expires.
+/// 2. Manually ticked Legacy (`sup.tick(0.02)` without threaded `legacy_safe_hold_handoff`) after
+///    `ModeSwitch` requests SAFE-HOLD still holds all confirmed axes, causally probes/recovers
+///    uncertain J1, and emits 0 `CMD_DISABLE` frames.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn safe_hold_lost_recovery_reply_retries_next_tick_and_manual_legacy_safe_hold_keeps_holding() {
+    // Part 1: FakeBus + MockClock at 50 Hz — drop write ACK + drop 1st SAFE-HOLD REG_READ reply.
+    let clock = MockClock::new();
+    let cfg = ArmConfig::rebot_dm();
+    let bus = configure_damiao_bus(Some(clock.clone()), Duration::from_micros(200), true, TIMEOUT_2000_COUNTS);
+    let mut drv = build_damiao_driver(bus.clone(), &cfg, 16);
+    enable_driver_sync(&mut drv, &bus, Some(&clock));
+
+    // Confirm J1 in PosVel, then latch J1 uncertain via a lost REG_WRITE ACK.
+    let plan_j1 =
+        ModeSwitchPlan::switch_axes(&[(0, ControlMode::Impedance)], ModeSwitchRecovery::FailClosed)
+            .unwrap();
+    let mut ms = ModeSwitch::new(plan_j1);
+    bus.with(|s| {
+        s.motors[0].no_write_ack = true;
+        s.immediate_replies = false;
+    });
+    let mut rel = 1u64;
+    let mut entered_ambiguous = false;
+    for _ in 0..8 {
+        clock.advance(PERIOD_50HZ);
+        bus.with(|s| s.push_all_feedback());
+        drv.begin_control_release(rel);
+        rel += 1;
+        let _ = drv.read_joint_states();
+        let now = clock.now();
+        let mut gate = || Ok(());
+        let mut adapter = armd::motor_mode::ArmDriverModeAdapter::new(&mut drv, &mut gate);
+        let p = ms.step_driver(&mut adapter, ReleaseBudget::new(now, now + Duration::from_millis(12), PERIOD_50HZ, 16));
+        if p.is_ambiguous() {
+            entered_ambiguous = true;
+            break;
+        }
+    }
+    assert!(entered_ambiguous, "dropped REG_WRITE ACK must terminate ModeSwitch as Ambiguous");
+    assert_ne!(drv.mode_write_uncertain_mask() & 1, 0, "J1 must be mode-uncertain");
+
+    // Re-enable register replies (realistic CAN RTT: replies arrive before the next 20 ms tick),
+    // then simulate SAFE-HOLD tick 1 whose REG_READ reply is LOST on the wire.
+    let hold_targets: Vec<armd::driver::JointTarget> = [0.30, -0.25, 0.40, 0.15, -0.15, 0.10, -0.14]
+        .into_iter()
+        .map(armd::driver::JointTarget::position)
+        .collect();
+    let reg_reads_before = bus.with(|s| {
+        s.motors[0].no_write_ack = false;
+        s.immediate_replies = true;
+        s.tx_log
+            .iter()
+            .filter(|f| f.id == 0x7FF && f.data[0] == 1 && f.data[2] == damiao::REG_READ && f.data[3] == damiao::RID_CTRL_MODE)
+            .count()
+    });
+
+    // Tick 1 (+20 ms): sends recovery REG_READ #1, then drop its reply from bus RX/pending queues!
+    clock.advance(PERIOD_50HZ);
+    bus.with(|s| s.push_all_feedback());
+    drv.begin_control_release(rel);
+    rel += 1;
+    let _ = drv.read_joint_states();
+    let rep1 = drv.write_measured_hold_masked(0b11_1111, &hold_targets).unwrap();
+    assert!(matches!(rep1.joint_status[0], armd::driver::JointHoldStatus::UnheldNoVerifiedMode));
+    assert!(drv.request_mode_readback_budgeted(1), "tick 1 must send recovery REG_READ #1");
+    bus.with(|s| {
+        // Drop the reply to probe #1 (master_id reply with REG_READ/RID_CTRL_MODE) to simulate a
+        // lost recovery CAN frame on the wire.
+        let is_mode_read_reply = |f: &CanFrame| {
+            f.dlc == 8 && f.data[2] == damiao::REG_READ && f.data[3] == damiao::RID_CTRL_MODE
+        };
+        s.rx.retain(|f| !is_mode_read_reply(f));
+        s.pending.retain(|f| !is_mode_read_reply(f));
+    });
+
+    // Tick 2 (+20 ms): retry interval (15 ms) elapsed -> MUST immediately retry REG_READ #2 on the
+    // very next 50 Hz release instead of stalling 50 ms!
+    clock.advance(PERIOD_50HZ);
+    bus.with(|s| {
+        s.run_watchdogs();
+        s.push_all_feedback();
+    });
+    drv.begin_control_release(rel);
+    rel += 1;
+    let _ = drv.read_joint_states();
+    let _ = drv.write_measured_hold_masked(0b11_1111, &hold_targets).unwrap();
+    assert!(
+        drv.request_mode_readback_budgeted(1),
+        "tick 2 (+20 ms >= 15 ms) MUST immediately retry recovery REG_READ #2 after lost reply #1"
+    );
+    let reg_reads_after_tick2 = bus.with(|s| {
+        s.tx_log
+            .iter()
+            .filter(|f| f.id == 0x7FF && f.data[0] == 1 && f.data[2] == damiao::REG_READ && f.data[3] == damiao::RID_CTRL_MODE)
+            .count()
+    });
+    assert_eq!(
+        reg_reads_after_tick2 - reg_reads_before,
+        2,
+        "expected exactly 2 recovery REG_READ probes across 2 ticks"
+    );
+
+    // Tick 3 (+20 ms, t = 80 ms total from last hold): reply #2 clears J1 uncertainty and tick 3
+    // emits confirmed-mode hold on J1 (< 100 ms Damiao TIMEOUT = 2000 -> 0 watchdog expiries!).
+    clock.advance(PERIOD_50HZ);
+    bus.with(|s| {
+        s.run_watchdogs();
+        s.push_all_feedback();
+    });
+    drv.begin_control_release(rel);
+    let _ = drv.read_joint_states();
+    assert_eq!(drv.mode_write_uncertain_mask() & 1, 0, "J1 uncertainty must clear on tick 3");
+    let rep3 = drv.write_measured_hold_masked(0b11_1111, &hold_targets).unwrap();
+    assert!(
+        matches!(rep3.joint_status[0], armd::driver::JointHoldStatus::Held | armd::driver::JointHoldStatus::HeldStaleTarget),
+        "J1 must resume confirmed-mode hold on tick 3, got {:?}",
+        rep3.joint_status[0]
+    );
+    bus.with(|s| s.run_watchdogs());
+    let expiries = bus.with(|s| s.motors.iter().map(|m| m.watchdog_expiry_count).sum::<usize>());
+    assert_eq!(expiries, 0, "0 watchdog expiries even with lost ACK + lost first recovery reply");
+
+    // Part 2: Manually ticked Legacy (`sup.tick(0.02)` without threaded handoff loop) after
+    // `ModeSwitch` requests SAFE-HOLD must keep holding confirmed axes and recover uncertain J1.
+    let mut cfg2 = cfg.clone();
+    cfg2.control_frequency_hz = 50;
+    let bus2 = configure_damiao_bus(None, Duration::ZERO, true, TIMEOUT_2000_COUNTS);
+    let mut drv2 = build_damiao_driver(bus2.clone(), &cfg2, 16);
+    bus2.with(|s| {
+        s.immediate_replies = true;
+        s.push_all_feedback();
+    });
+    let _ = drv2.check_mapping_ranges();
+    let _ = drv2.read_joint_states();
+    let sup = ArmSupervisor::new(cfg2).with_driver(Box::new(drv2));
+    sup.set_lease_enabled(false).await;
+    sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
+    bus2.with(|s| {
+        s.immediate_replies = false;
+        s.push_all_feedback();
+    });
+    let _ = sup.tick(0.02).await;
+
+    // Drop write ACK so ModeSwitch enters Ambiguous and sets `sessions.is_safe_hold_requested()`.
+    bus2.with(|s| {
+        s.motors[0].no_write_ack = true;
+        s.immediate_replies = false;
+    });
+    let sid = sup
+        .start_mode_switch_session(ModeSwitchStartRequest {
+            plan: plan_j1,
+            admission: sup.capture_admission_stamp(),
+            operator_required: false,
+            operator_grant: OperatorGrant::unenforced(),
+            deadline: Instant::now() + Duration::from_secs(2),
+            client: ClientId(21),
+        })
+        .await
+        .unwrap();
+    let mut saw_ambig = false;
+    for _ in 0..8 {
+        bus2.with(|s| s.push_all_feedback());
+        let _ = sup.tick(0.02).await;
+        if let Some(s) = sup.poll_mode_switch_session(sid).await.unwrap() {
+            if !s.running {
+                assert!(s.progress.is_ambiguous(), "expected Ambiguous, got {:?}", s.progress);
+                saw_ambig = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(saw_ambig, "manual Legacy ModeSwitch must enter Ambiguous on dropped write ACK");
+
+    // Re-enable register replies and continue manual `sup.tick(0.02)` calls; inline SAFE-HOLD
+    // fallback must hold J2..J6 AND causally recover + hold J1 with 0 CMD_DISABLE.
+    let tx_before_manual_sh = bus2.with(|s| {
+        s.motors[0].no_write_ack = false;
+        s.immediate_replies = false;
+        s.tx_log.len()
+    });
+    for _ in 0..4 {
+        bus2.with(|s| s.push_all_feedback());
+        let _ = sup.tick(0.02).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let (disables, expiries, per_axis_after, saw_rb) = bus2.with(|s| {
+        let dis = s.tx_log.iter().filter(|f| f.data == damiao::CMD_DISABLE).count();
+        let exp: usize = s.motors.iter().map(|m| m.watchdog_expiry_count).sum();
+        let mut per_axis = [0usize; 6];
+        for f in &s.tx_log[tx_before_manual_sh..] {
+            if (0x101..=0x106).contains(&f.id) {
+                per_axis[(f.id - 0x101) as usize] += 1;
+            } else if (1..=6).contains(&f.id) && f.data != damiao::CMD_ENABLE {
+                per_axis[(f.id - 1) as usize] += 1;
+            }
+        }
+        let rb = s.tx_log[tx_before_manual_sh..].iter().any(|f| {
+            f.id == 0x7FF && f.data[0] == 1 && f.data[2] == damiao::REG_READ && f.data[3] == damiao::RID_CTRL_MODE
+        });
+        (dis, exp, per_axis, rb)
+    });
+    assert_eq!(disables, 0, "manual Legacy SAFE-HOLD must emit 0 CMD_DISABLE frames");
+    assert_eq!(expiries, 0, "manual Legacy SAFE-HOLD must suffer 0 watchdog expiries");
+    assert!(saw_rb, "manual Legacy SAFE-HOLD must causally probe REG_READ(RID_CTRL_MODE) for J1");
+    for (j, count) in per_axis_after.iter().enumerate() {
+        assert!(*count >= 1, "manual Legacy SAFE-HOLD must emit holds on J{} (got {count})", j + 1);
+    }
 }

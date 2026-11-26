@@ -7881,9 +7881,10 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     release_rx_frames: u16,
     /// Per-joint `CLOCK_REALTIME - monotonic` decode offset (ns) of the latest causal feedback.
     last_feedback_decode_offset_ns: Vec<Option<i128>>,
-    /// Per-joint causal `REG_READ(RID_CTRL_MODE)` probe boundary `(after_seq, tx_at, deadline, tx_offset_ns)`
-    /// used by SAFE-HOLD / stopped recovery for joints in `mode_write_uncertain_mask` (0 alloc).
-    uncertain_readback_probe: [Option<(u64, Instant, Instant, Option<i128>)>; MAX_MODE_JOINTS],
+    /// Per-joint causal `REG_READ(RID_CTRL_MODE)` probe boundary
+    /// `(after_seq, tx_at, retry_at, deadline, tx_offset_ns)` used by SAFE-HOLD / stopped recovery
+    /// for joints in `mode_write_uncertain_mask` (0 alloc).
+    uncertain_readback_probe: [Option<(u64, Instant, Instant, Instant, Option<i128>)>; MAX_MODE_JOINTS],
     /// PMAX / VMAX / TMAX read back from the motor and equal to `limits[i]`.
     mit_limits_verified: Vec<bool>,
     /// Register replies seen by `read_joint_states` since the last clear.
@@ -18074,6 +18075,17 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     }
 
     fn request_mode_readback_budgeted(&mut self, unverified_mask: u64) -> bool {
+        /// Retry spacing (< one 20 ms 50 Hz tick) so a lost SAFE-HOLD recovery `REG_READ` reply
+        /// retries on the very next control release (t = 60 ms) and confirmed-mode holding resumes
+        /// at t = 80 ms, safely below Damiao's 100 ms `TIMEOUT = 2000` hardware watchdog.
+        const SAFE_HOLD_PROBE_RETRY_INTERVAL: Duration = Duration::from_millis(15);
+        /// Maximum causal reply window for a SAFE-HOLD recovery probe (allows one 20 ms 50 Hz tick
+        /// plus scheduling jitter while rejecting stale replies beyond 35 ms).
+        const SAFE_HOLD_PROBE_DEADLINE: Duration = Duration::from_millis(35);
+
+        // Never issue background/Step-2 recovery readbacks or clear `comm_reg_replies` for any
+        // axis currently owned by an active `ModeSwitch` transaction.
+        let unverified_mask = unverified_mask & !u64::from(self.mode_switch_active_mask);
         if unverified_mask == 0
             || self.torque_hs.is_some()
             || self.awaiting_rx_boundary
@@ -18083,21 +18095,39 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
         let mut sent_any = false;
         let mut cleared_comm_log = false;
-        let mut staged_uncertain = [None::<(u64, Instant, Instant, Option<i128>)>; MAX_MODE_JOINTS];
+        let mut drained_before_retry = false;
+        let mut staged_uncertain =
+            [None::<(u64, Instant, Instant, Instant, Option<i128>)>; MAX_MODE_JOINTS];
         let dof = self.motor_ids.len().min(64);
         for i in 0..dof {
             if (unverified_mask & (1u64 << i)) == 0 || self.verified_hold_mode(i).is_some() {
                 continue;
             }
             let uncertain = self.is_axis_mode_uncertain(i);
-            let tx_started = self.now();
+            let now = self.now();
             if uncertain
                 && i < MAX_MODE_JOINTS
-                && self.uncertain_readback_probe[i].is_some_and(|(_, _, dl, _)| tx_started < dl)
+                && self.uncertain_readback_probe[i]
+                    .is_some_and(|(_, _, retry_at, _, _)| now < retry_at)
             {
-                // Avoid sending duplicate in-flight REG_READ probes while awaiting the current
-                // probe's causal reply window.
+                // Avoid sending duplicate in-flight REG_READ probes within the same retry interval,
+                // while retrying promptly on the very next 50 Hz release if the reply was lost.
                 continue;
+            }
+            if uncertain && i < MAX_MODE_JOINTS && self.uncertain_readback_probe[i].is_some() {
+                // Before issuing a retry probe, perform one bounded RX drain so any late/promoted
+                // reply to the prior probe is matched (or cleared out of RX) BEFORE capturing the
+                // retry's causal TX boundary.
+                if !drained_before_retry {
+                    let _ = self.receive_feedback();
+                    drained_before_retry = true;
+                }
+                if !self.last_read_drained {
+                    break;
+                }
+                if self.verified_hold_mode(i).is_some() {
+                    continue;
+                }
             }
             if uncertain && !cleared_comm_log {
                 self.comm_reg_reply_len = 0;
@@ -18105,17 +18135,27 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 cleared_comm_log = true;
             }
             let id = self.motor_ids[i];
-            let seq_before = self.rx_seq;
-            let (_, tx_offset_ns) = self.capture_rx_clock_sample(tx_started);
-            let probe_deadline = tx_started
-                .checked_add(REGISTER_REPLY_TIMEOUT)
-                .unwrap_or(tx_started);
-            match self.send_plain(TxKind::Refresh, None, None, false, |_| {
+            let mut revoked: Option<&'static str> = None;
+            // Use `self.send(...)` directly so `seq_before`, `tx_started`, and `tx_offset_ns`
+            // reflect the actual TX submission boundary (never a pre-send sample).
+            match self.send(TxKind::Refresh, None, None, false, None, &mut revoked, |_| {
                 Some(damiao::build_read_register_frame(id, damiao::RID_CTRL_MODE))
             }) {
-                Ok(_) => {
+                Ok((_frame, seq_before, tx_started, tx_offset_ns)) => {
                     if uncertain && i < MAX_MODE_JOINTS {
-                        staged_uncertain[i] = Some((seq_before, tx_started, probe_deadline, tx_offset_ns));
+                        let retry_at = tx_started
+                            .checked_add(SAFE_HOLD_PROBE_RETRY_INTERVAL)
+                            .unwrap_or(tx_started);
+                        let probe_deadline = tx_started
+                            .checked_add(SAFE_HOLD_PROBE_DEADLINE)
+                            .unwrap_or(tx_started);
+                        staged_uncertain[i] = Some((
+                            seq_before,
+                            tx_started,
+                            retry_at,
+                            probe_deadline,
+                            tx_offset_ns,
+                        ));
                     } else {
                         self.mode_readback_boundary[i].get_or_insert(seq_before);
                     }
@@ -21385,7 +21425,22 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         intent: PosForceIntent,
         current: PosForceIntentStamp,
     ) -> Result<PosForceEmitOutcome, ArmDriverError> {
-        pos_force_emitter::emit_tick(self, intent, current)
+        if self.control_release_managed && self.control_release_id != 0 {
+            if let Some(pf) = self.pos_force.as_ref() {
+                if pf.joint < 32 && (self.release_ctrl_tx_mask & (1u32 << pf.joint)) != 0 {
+                    return Ok(PosForceEmitOutcome::NotApplicable);
+                }
+            }
+        }
+        let res = pos_force_emitter::emit_tick(self, intent, current);
+        if self.control_release_managed && self.control_release_id != 0 {
+            if let Ok(PosForceEmitOutcome::Sent { joint, .. }) = res {
+                if joint < 32 {
+                    self.release_ctrl_tx_mask |= 1u32 << joint;
+                }
+            }
+        }
+        res
     }
 
     /// Masked per-joint measured-position hold pass (§2/§3, zero heap allocation):
@@ -23367,7 +23422,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 if !self.is_axis_mode_uncertain(j) {
                     continue;
                 }
-                let Some((after_seq, tx_at, probe_deadline, tx_offset_ns)) =
+                let Some((after_seq, tx_at, _retry_at, probe_deadline, tx_offset_ns)) =
                     self.uncertain_readback_probe[j]
                 else {
                     continue;
