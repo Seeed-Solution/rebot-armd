@@ -2603,14 +2603,16 @@ async fn stop_generation_not_applied_by_owner_is_not_stop_proof() {
         stops.mark_applied(g);
     }
     let done = legacy_tick_until_terminal(&sup, &bus, sid).await;
-    assert!(
-        matches!(done, Some(ModeProgress::Ambiguous { .. })),
-        "a generation the owner did not apply must not prove a stop, got {done:?}"
+    assert_eq!(
+        done,
+        Some(ModeProgress::Ambiguous { failed_joint: 0, reason: ModeSwitchFailure::Stopped }),
+        "a generation the owner did not apply must not prove a stop"
     );
 }
 
 /// Round 7: a policy-only STOP (no policy running) advances and acknowledges the stop generation
 /// without a general stop; mid-switch it must take the SAFE-HOLD path, not `StoppedRecovered`.
+#[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn policy_only_stop_mid_switch_is_not_stop_proof() {
     use armd::rt_core::broker::{Authority, Reply};
@@ -2674,9 +2676,10 @@ async fn policy_only_stop_mid_switch_is_not_stop_proof() {
         assert!(Instant::now() < dl, "switch must end after the policy stop");
         tokio::time::sleep(Duration::from_millis(5)).await;
     };
-    assert!(
-        matches!(done, ModeProgress::Ambiguous { .. }),
-        "a policy-only STOP must not prove a general stop, got {done:?}"
+    assert_eq!(
+        done,
+        ModeProgress::Ambiguous { failed_joint: 0, reason: ModeSwitchFailure::Stopped },
+        "a policy-only STOP must not prove a general stop"
     );
     h.shutdown(true).await;
 }
