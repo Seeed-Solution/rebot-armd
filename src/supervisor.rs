@@ -7135,7 +7135,8 @@ impl SupervisorInner {
     /// Otherwise defers the non-urgent flush to the next release so it cannot push this release
     /// past its deadline. Returns `true` if a flush ran.
     #[inline]
-    pub(crate) fn flush_torque_shadow_if_budget(
+    #[doc(hidden)]
+    pub fn flush_torque_shadow_if_budget(
         &mut self,
         urgent: bool,
         now: Instant,
@@ -8710,7 +8711,10 @@ impl SupervisorInner {
                 };
                 let torque_poll = self.core.poll_transition();
                 let urgent_wake = if torque_poll.is_some() || park_wake.is_some() {
+                    let owner_now = now_fn();
+                    let drv_now = d.clock_now();
                     d.next_watchdog_hold_wake()
+                        .map(|w| owner_now + w.saturating_duration_since(drv_now))
                 } else {
                     None
                 };

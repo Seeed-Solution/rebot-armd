@@ -23,7 +23,10 @@ use super::broker::{BootId, Broker, Capacities, ClientId};
 use super::config_iface::{ConfigAuthority, ConfigDomain, ConfigProposal, Reservation};
 use super::ids::ArmId;
 use super::mailbox::TargetWriter;
-use super::ops::{CoreOps, PlanSlot, PlanningSnapshot, ReleaseEngine, MAX_SERVICE_WAKES};
+use super::ops::{
+    CoreOps, PlanSlot, PlanningSnapshot, ReleaseEngine, SubReleaseBudget, SubReleaseWakeKind,
+    MAX_SERVICE_WAKES, SUB_RELEASE_SHADOW_MARGIN,
+};
 use super::publish::{Snapshot, StateHub};
 use super::sched::{self, MemoryLock, RtReadiness, RtSchedConfig};
 use super::urgent::{
@@ -222,6 +225,9 @@ pub struct ExecutorConfig {
     pub alloc_timing: bool,
     pub panic_policy: PanicPolicy,
     pub apply_rt_sched: bool,
+    /// Safety margin reserved before `release_deadline` so Window-2 sub-release wakes
+    /// (sleep + poll) complete before `period - sub_release_margin` (`>= 4 ms` on SG2002).
+    pub sub_release_margin: Duration,
 }
 
 impl ExecutorConfig {
@@ -236,7 +242,14 @@ impl ExecutorConfig {
             alloc_timing: false,
             panic_policy: PanicPolicy::StopExecutor,
             apply_rt_sched: false,
+            sub_release_margin: SubReleaseBudget::default_margin_for_period(period),
         }
+    }
+
+    /// Overrides the Window-2 sub-release safety margin (`period - margin`).
+    pub fn with_sub_release_margin(mut self, margin: Duration) -> Self {
+        self.sub_release_margin = margin;
+        self
     }
 }
 
@@ -9550,7 +9563,7 @@ fn control_thread_main_inner(
         // (sub-release wakes) and the single release-completion point, ensuring zero uncounted destruction.
         const _: () = {
             const fn assert_copy<T: Copy>() {}
-            assert_copy::<(TickSample, u64, Option<(super::ops::ReleaseReport, Instant, u64, Instant, Duration)>)>();
+            assert_copy::<(TickSample, u64, (super::ops::ReleaseReport, Instant, u64, SubReleaseBudget))>();
         };
 
         loop {
@@ -9609,7 +9622,7 @@ fn control_thread_main_inner(
                     u64,
                     u64,
                     u64,
-                    Option<(super::ops::ReleaseReport, Instant, u64, Instant, Instant, Duration)>,
+                    (super::ops::ReleaseReport, Instant, u64, SubReleaseBudget),
                 )> {
                     let _guard = ReleaseGuard::enter();
                     assert!(
@@ -9873,19 +9886,12 @@ fn control_thread_main_inner(
                     );
                     let shadow_flush_ns = now_ns_fn().saturating_sub(shadow_t0_ns);
 
-                    let optional_wake_margin = crate::driver::OPTIONAL_WAKE_RELEASE_MARGIN
-                        .min(Duration::from_nanos(release_period_ns / 2));
-                    let optional_wake_cutoff = release_deadline
-                        .checked_sub(optional_wake_margin)
-                        .unwrap_or(release_start);
-                    let urgent_wake_cutoff = release_deadline
-                        .checked_sub(crate::driver::DAMIAO_TX_RELEASE_PUBLISH_MARGIN)
-                        .unwrap_or(release_start);
-                    let next_wake = if engine.has_pending_urgent(&*core) && now_inst() < urgent_wake_cutoff {
-                        Some((now_inst(), true))
-                    } else {
-                        report.poll.admitted_wake_before(optional_wake_cutoff, urgent_wake_cutoff)
-                    };
+                    let wake_budget = SubReleaseBudget::for_release(
+                        release_start,
+                        release_deadline,
+                        Duration::from_nanos(release_period_ns),
+                        cfg.sub_release_margin,
+                    );
                     drop(_guard);
                     Some((
                         sample,
@@ -9893,22 +9899,13 @@ fn control_thread_main_inner(
                         step_return_ns,
                         post_cpu_start_ns,
                         shadow_flush_ns,
-                        next_wake.map(|_| {
-                            (
-                                report,
-                                release_deadline,
-                                next_release_ns,
-                                optional_wake_cutoff,
-                                urgent_wake_cutoff,
-                                optional_margin,
-                            )
-                        }),
+                        (report, release_deadline, next_release_ns, wake_budget),
                     ))
                 },
             ))
         };
 
-        // ---- Window 2: Disjoint sub-release transition/urgent wakes ----
+        // ---- Window 2: Disjoint sub-release transition/urgent wake (at most MAX_SERVICE_WAKES = 1) ----
         let mut step_sample: Option<TickSample> = None;
         let mut step_post_t0: Option<Instant> = None;
         let mut step_return_ns: Option<u64> = None;
@@ -9919,164 +9916,147 @@ fn control_thread_main_inner(
         let step_res: Result<(), Box<dyn Any + Send>> = match release_res {
             Err(err) => Err(err),
             Ok(None) => Ok(()),
-            Ok(Some((sample, post_t0, ret_ns, cpu_ns, shadow_ns, None))) => {
-                step_sample = Some(sample);
-                step_post_t0 = Some(post_t0);
-                step_return_ns = Some(ret_ns);
-                step_post_cpu_start_ns = Some(cpu_ns);
-                step_shadow_flush_ns = shadow_ns;
-                Ok(())
-            }
             Ok(Some((
                 sample,
                 post_t0,
                 ret_ns,
                 cpu_ns,
                 shadow_ns,
-                Some((
-                    mut report,
-                    release_deadline,
-                    next_release_ns,
-                    optional_wake_cutoff,
-                    urgent_wake_cutoff,
-                    optional_margin,
-                )),
+                (mut report, release_deadline, next_release_ns, wake_budget),
             ))) => {
                 step_sample = Some(sample);
                 step_post_t0 = Some(post_t0);
                 step_return_ns = Some(ret_ns);
                 step_post_cpu_start_ns = Some(cpu_ns);
                 step_shadow_flush_ns = shadow_ns;
-                let mut wakes = 0u32;
-                let mut next_wake = if engine.has_pending_urgent(&*core) && now_inst() < urgent_wake_cutoff {
-                    Some((now_inst(), true))
-                } else {
-                    report.poll.admitted_wake_before(optional_wake_cutoff, urgent_wake_cutoff)
-                };
+                let wake_deadline_ns = next_release_ns.saturating_sub(
+                    release_deadline
+                        .saturating_duration_since(wake_budget.wake_deadline)
+                        .as_nanos()
+                        .min(u128::from(u64::MAX)) as u64,
+                );
                 let mut wake_err: Option<Box<dyn Any + Send>> = None;
-                while let Some((wake, is_urgent)) = next_wake {
-                    if wakes >= MAX_SERVICE_WAKES || control_stop.load(Ordering::Acquire) {
-                        break;
-                    }
-                    let now = now_inst();
-                    let exec_cutoff = if is_urgent || engine.has_pending_urgent(&*core) {
-                        urgent_wake_cutoff
-                    } else {
-                        optional_wake_cutoff
-                    };
-                    if now >= exec_cutoff || wake > exec_cutoff {
-                        break;
-                    }
-                    if wake > now {
-                        let wake_ns = now_ns_fn().saturating_add(
-                            wake.saturating_duration_since(now)
-                                .as_nanos()
-                                .min(u128::from(u64::MAX)) as u64,
-                        );
-                        let sleep_t0_ns = now_ns_fn();
-                        let _ = sleep_until(wake_ns.min(next_release_ns));
-                        step_wake_sleep_ns = step_wake_sleep_ns
-                            .saturating_add(now_ns_fn().saturating_sub(sleep_t0_ns));
-                    }
-                    let post_exec_optional_cutoff = release_deadline
-                        .checked_sub(
-                            crate::driver::OPTIONAL_WORK_RELEASE_MARGIN.min(Duration::from_nanos(
-                                next_release_ns.saturating_sub(scheduled_ns).max(1) / 3,
-                            )),
-                        )
-                        .unwrap_or(release_start);
-                    if control_stop.load(Ordering::Acquire) {
-                        break;
-                    }
-                    let post_now = now_inst();
-                    let urgent_now = is_urgent || engine.has_pending_urgent(&*core);
-                    let post_cutoff = if urgent_now {
-                        urgent_wake_cutoff
-                    } else {
-                        post_exec_optional_cutoff
-                    };
-                    if post_now >= post_cutoff {
-                        if !urgent_now && post_now < urgent_wake_cutoff {
-                            if let Some(urg) = report.poll.urgent_wake.filter(|w| *w < urgent_wake_cutoff) {
-                                next_wake = Some((urg, true));
-                                continue;
+                if MAX_SERVICE_WAKES >= 1 && !control_stop.load(Ordering::Acquire) {
+                    if let Some((wake, kind)) = wake_budget.admit_next_wake(
+                        now_inst(),
+                        engine.has_pending_urgent(&*core),
+                        &report.poll,
+                    ) {
+                        let now = now_inst();
+                        let urgent_stop_pending = kind == SubReleaseWakeKind::UrgentStop
+                            || engine.has_pending_urgent(&*core);
+                        let exec_cutoff = if urgent_stop_pending {
+                            wake_budget.urgent_stop_cutoff
+                        } else {
+                            wake_budget.transition_start_cutoff
+                        };
+                        let target_wake = if urgent_stop_pending { now } else { wake };
+                        if now < exec_cutoff && target_wake <= exec_cutoff {
+                            if target_wake > now {
+                                let wake_ns = now_ns_fn().saturating_add(
+                                    target_wake
+                                        .saturating_duration_since(now)
+                                        .as_nanos()
+                                        .min(u128::from(u64::MAX)) as u64,
+                                );
+                                let sleep_t0_ns = now_ns_fn();
+                                let _ = sleep_until(wake_ns.min(wake_deadline_ns));
+                                step_wake_sleep_ns = step_wake_sleep_ns
+                                    .saturating_add(now_ns_fn().saturating_sub(sleep_t0_ns));
                             }
-                        }
-                        break;
-                    }
-                    wakes += 1;
-                    let poll_t0_ns = now_ns_fn();
-                    let wake_res = {
-                        // Declared FIRST -> drops LAST, after ALL wake locals drop!
-                        let _wake_alloc_scope = WholeReleaseAllocGuard::enter(&stats, true);
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> (Option<(Instant, bool)>, u64) {
-                            stats.wakes.fetch_add(1, Ordering::Relaxed);
-                            let _wake_guard = ReleaseGuard::enter();
-                            assert!(
-                                tokio::runtime::Handle::try_current().is_err(),
-                                "RT executor thread must never enter a Tokio runtime during a sub-release wake"
-                            );
-                            let published = engine.service_wake_with_clock(
-                                &mut *core,
-                                &now_inst,
-                                release_deadline,
-                                publish_gen + 1,
-                                &mut report,
-                            );
-                            let urgent_flushed = engine.take_urgent_replies_flushed()
-                                || engine.take_lifecycle_replies_flushed()
-                                || engine.take_servo_closes_flushed();
-                            if published {
-                                publish_gen += 1;
+                            if !control_stop.load(Ordering::Acquire) {
+                                let post_now = now_inst();
+                                let urgent_stop_now = urgent_stop_pending
+                                    || engine.has_pending_urgent(&*core);
+                                if let Some(allow_transition_poll) = wake_budget
+                                    .post_sleep_allow_transition_poll(post_now, urgent_stop_now)
+                                {
+                                    let poll_t0_ns = now_ns_fn();
+                                    let wake_res = {
+                                        // Declared FIRST -> drops LAST, after ALL wake locals drop!
+                                        let _wake_alloc_scope =
+                                            WholeReleaseAllocGuard::enter(&stats, true);
+                                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                                            || -> u64 {
+                                                stats.wakes.fetch_add(1, Ordering::Relaxed);
+                                                let _wake_guard = ReleaseGuard::enter();
+                                                assert!(
+                                                    tokio::runtime::Handle::try_current().is_err(),
+                                                    "RT executor thread must never enter a Tokio runtime during a sub-release wake"
+                                                );
+                                                let published =
+                                                    engine.service_wake_with_clock_opts(
+                                                        &mut *core,
+                                                        &now_inst,
+                                                        wake_budget.poll_deadline,
+                                                        publish_gen + 1,
+                                                        allow_transition_poll,
+                                                        &mut report,
+                                                    );
+                                                let urgent_flushed = engine
+                                                    .take_urgent_replies_flushed()
+                                                    || engine.take_lifecycle_replies_flushed()
+                                                    || engine.take_servo_closes_flushed();
+                                                if published {
+                                                    publish_gen += 1;
+                                                }
+                                                if published || urgent_flushed {
+                                                    hub.wake();
+                                                }
+                                                if state
+                                                    .hooks
+                                                    .inject_wake_alloc_once
+                                                    .as_ref()
+                                                    .is_some_and(|f| f.swap(false, Ordering::AcqRel))
+                                                {
+                                                    let v: Vec<u8> = vec![0xA5; 64];
+                                                    std::hint::black_box(&v);
+                                                    drop(v);
+                                                }
+                                                state.emit_estop_ack_if_advanced(core);
+                                                state.drain_retired_states(core, now_inst());
+                                                let wake_shadow_urgent = published
+                                                    || report.stopped
+                                                    || report.transition_ended.is_some()
+                                                    || report.poll.park_state_changed
+                                                    || control_stop.load(Ordering::Acquire);
+                                                let ws_t0_ns = now_ns_fn();
+                                                let ws_now = now_inst();
+                                                if wake_shadow_urgent
+                                                    || wake_budget
+                                                        .wake_deadline
+                                                        .saturating_duration_since(ws_now)
+                                                        >= SUB_RELEASE_SHADOW_MARGIN
+                                                {
+                                                    let _ = core.flush_torque_shadow_if_budget(
+                                                        wake_shadow_urgent,
+                                                        ws_now,
+                                                        wake_budget.wake_deadline,
+                                                        SUB_RELEASE_SHADOW_MARGIN,
+                                                    );
+                                                }
+                                                let ws_ns =
+                                                    now_ns_fn().saturating_sub(ws_t0_ns);
+                                                let _wake_tail_local = state.run_tail_alloc_probe(
+                                                    &state.hooks.inject_wake_tail_once,
+                                                );
+                                                ws_ns
+                                            },
+                                        ))
+                                    };
+                                    step_wake_poll_ns = step_wake_poll_ns
+                                        .saturating_add(now_ns_fn().saturating_sub(poll_t0_ns));
+                                    match wake_res {
+                                        Ok(ws_ns) => {
+                                            step_shadow_flush_ns =
+                                                step_shadow_flush_ns.saturating_add(ws_ns);
+                                        }
+                                        Err(err) => {
+                                            wake_err = Some(err);
+                                        }
+                                    }
+                                }
                             }
-                            if published || urgent_flushed {
-                                hub.wake();
-                            }
-                            if state
-                                .hooks
-                                .inject_wake_alloc_once
-                                .as_ref()
-                                .is_some_and(|f| f.swap(false, Ordering::AcqRel))
-                            {
-                                let v: Vec<u8> = vec![0xA5; 64];
-                                std::hint::black_box(&v);
-                                drop(v);
-                            }
-                            state.emit_estop_ack_if_advanced(core);
-                            state.drain_retired_states(core, now_inst());
-                            let wake_shadow_urgent = published
-                                || report.stopped
-                                || report.transition_ended.is_some()
-                                || report.poll.park_state_changed
-                                || control_stop.load(Ordering::Acquire);
-                            let ws_t0_ns = now_ns_fn();
-                            let _ = core.flush_torque_shadow_if_budget(
-                                wake_shadow_urgent,
-                                now_inst(),
-                                release_deadline,
-                                optional_margin,
-                            );
-                            let ws_ns = now_ns_fn().saturating_sub(ws_t0_ns);
-                            let _wake_tail_local =
-                                state.run_tail_alloc_probe(&state.hooks.inject_wake_tail_once);
-                            let next = if engine.has_pending_urgent(&*core) && now_inst() < urgent_wake_cutoff {
-                                Some((now_inst(), true))
-                            } else {
-                                report.poll.admitted_wake_before(optional_wake_cutoff, urgent_wake_cutoff)
-                            };
-                            (next, ws_ns)
-                        }))
-                    };
-                    step_wake_poll_ns = step_wake_poll_ns
-                        .saturating_add(now_ns_fn().saturating_sub(poll_t0_ns));
-                    match wake_res {
-                        Ok((next, ws_ns)) => {
-                            step_shadow_flush_ns = step_shadow_flush_ns.saturating_add(ws_ns);
-                            next_wake = next;
-                        }
-                        Err(err) => {
-                            wake_err = Some(err);
-                            break;
                         }
                     }
                 }

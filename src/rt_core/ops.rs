@@ -530,11 +530,190 @@ impl HardwarePoll {
     }
 }
 
-/// Extra hardware services the executor runs within one release at most (a transition's
-/// retry cadence is 25 ms and its confirmation service 2 ms: a 20 ms release needs a few).
-pub const MAX_SERVICE_WAKES: u32 = 8;
+/// Maximum sub-release transition/urgent wakes the executor runs within one release.
+/// Bounded to 1 so a single release cannot stack multiple wake sleep+poll cycles past its period.
+pub const MAX_SERVICE_WAKES: u32 = 1;
 
-impl HardwarePoll {
+/// Default safety margin reserved before `release_deadline` so any sub-release wake
+/// (sleep + poll + publish + shadow flush) completes by `period - margin`
+/// (`>= 4 ms` on 50 Hz / 20 ms SG2002 releases, configurable via `ExecutorConfig::sub_release_margin`
+/// or `ARMD_SUB_RELEASE_MARGIN_MS`).
+pub const DEFAULT_SUB_RELEASE_MARGIN: Duration = Duration::from_millis(4);
+
+/// Estimated worst-case sub-release transition poll duration on SG2002 (RX drain + transition TX +
+/// publish + shadow flush). Combined with [`DEFAULT_SUB_RELEASE_MARGIN`] (4 ms), this reserves
+/// 9 ms ahead of `release_deadline` on 20 ms releases (`t + 11 ms` start cutoff -> `<= 16 ms` end).
+pub const SUB_RELEASE_POLL_RESERVE: Duration = Duration::from_millis(5);
+
+/// Tail reserve kept between the Window-2 hardware poll deadline and `wake_deadline`
+/// (`period - margin`) on 50 Hz (`>= 20 ms`) releases to cover observation publish, reply flush,
+/// shadow flush, and diagnostic ring push/seal (measured ~0.35 ms on SG2002).
+pub const SUB_RELEASE_TAIL_RESERVE: Duration = Duration::from_millis(1);
+
+/// Minimum positive headroom before `wake_deadline` required to flush non-urgent torque-shadow
+/// steps during Window 2 so a delayed poll cannot spill non-urgent shadow work past `wake_deadline`.
+pub const SUB_RELEASE_SHADOW_MARGIN: Duration = Duration::from_micros(500);
+
+/// Single-authority sub-release wake budget shared by the RT executor and [`ReleaseFixture`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubReleaseBudget {
+    /// Target release completion deadline (`release_deadline - effective_margin`).
+    pub wake_deadline: Instant,
+    /// Deadline passed into the Window-2 hardware transition poll (`wake_deadline - tail_reserve`)
+    /// so driver TX/RX finishes with enough tail headroom to complete publish/shadow/seal by `wake_deadline`.
+    pub poll_deadline: Instant,
+    /// Admission cutoff for starting/sleeping to a CAN transition or watchdog-hold wake:
+    /// `wake_deadline - poll_reserve`, so `wake_sleep + wake_poll + tail` completes by `wake_deadline`.
+    pub transition_start_cutoff: Instant,
+    /// Post-sleep cutoff for a transition or watchdog-hold wake (allows up to 1 ms OS timer slack
+    /// past `transition_start_cutoff` on 20 ms releases while still guaranteeing headroom before `poll_deadline`).
+    pub transition_post_sleep_cutoff: Instant,
+    /// Cutoff for immediate in-memory urgent Stop / E-Stop / Disconnect wakes (no sleep, no CAN poll):
+    /// always anchored to `release_deadline - publish_margin` (independent of `sub_release_margin`).
+    pub urgent_stop_cutoff: Instant,
+}
+
+impl SubReleaseBudget {
+    /// Default (and minimum safe) safety margin for `period`: 4 ms on 50 Hz (`>= 20 ms`) SG2002
+    /// releases, scaled proportionally (`period / 5`) for faster test periods so short-period mock
+    /// tests keep consistent 20% tail headroom.
+    pub fn default_margin_for_period(period: Duration) -> Duration {
+        DEFAULT_SUB_RELEASE_MARGIN.min(period / 5)
+    }
+
+    /// Computes all Window-2 sub-release cutoffs for one release from its period and configured
+    /// `sub_release_margin`. Enforces the minimum safe floor (`default_margin_for_period(period)`,
+    /// i.e. `>= 4 ms` on 50 Hz / 20 ms releases) so neither env nor direct config can bypass it.
+    pub fn for_release(
+        release_start: Instant,
+        release_deadline: Instant,
+        period: Duration,
+        sub_release_margin: Duration,
+    ) -> Self {
+        let min_margin = Self::default_margin_for_period(period);
+        let effective_margin = sub_release_margin.max(min_margin).min(period);
+        let wake_deadline = release_deadline
+            .checked_sub(effective_margin)
+            .unwrap_or(release_start);
+        let tail_reserve = if period >= Duration::from_millis(20) {
+            SUB_RELEASE_TAIL_RESERVE
+        } else {
+            Duration::ZERO
+        };
+        let poll_deadline = wake_deadline
+            .checked_sub(tail_reserve)
+            .unwrap_or(release_start);
+        let poll_reserve = if period >= Duration::from_millis(20) {
+            SUB_RELEASE_POLL_RESERVE
+        } else {
+            (period / 2)
+                .saturating_sub(effective_margin)
+                .min(SUB_RELEASE_POLL_RESERVE)
+        };
+        let transition_start_cutoff = wake_deadline
+            .checked_sub(poll_reserve)
+            .unwrap_or(release_start);
+        let post_sleep_reserve = if period >= Duration::from_millis(20) {
+            poll_reserve.saturating_sub(Duration::from_millis(1))
+        } else {
+            Duration::ZERO
+        };
+        let transition_post_sleep_cutoff = wake_deadline
+            .checked_sub(post_sleep_reserve)
+            .unwrap_or(release_start);
+        // Immediate in-memory urgent Stop / E-Stop / Disconnect intake is NEVER disabled by larger
+        // `sub_release_margin` overrides (e.g. margin = 20 ms), while still reserving the minimum
+        // safe completion margin (`min_margin`, 4 ms at 50 Hz) + `SUB_RELEASE_SHADOW_MARGIN`
+        // (0.5 ms at 50 Hz -> cutoff at `t + 15.5 ms`, vs 2 ms `DAMIAO_TX_RELEASE_PUBLISH_MARGIN`
+        // for shorter periods) so even an urgent in-memory wake (typical service < 0.2 ms, 0 CAN
+        // I/O) completes strictly before `release_deadline - min_margin` (<= 16 ms at 50 Hz).
+        let publish_margin = crate::driver::DAMIAO_TX_RELEASE_PUBLISH_MARGIN.min(period / 2);
+        let urgent_headroom = if period >= Duration::from_millis(20) {
+            SUB_RELEASE_SHADOW_MARGIN
+        } else {
+            Duration::ZERO
+        };
+        let urgent_margin = min_margin
+            .max(publish_margin)
+            .saturating_add(urgent_headroom)
+            .min(period / 2);
+        let urgent_stop_cutoff = release_deadline
+            .checked_sub(urgent_margin)
+            .unwrap_or(release_start);
+        Self {
+            wake_deadline,
+            poll_deadline,
+            transition_start_cutoff,
+            transition_post_sleep_cutoff,
+            urgent_stop_cutoff,
+        }
+    }
+
+    /// Single-authority Window-2 wake admission shared by the RT executor and [`ReleaseFixture`].
+    pub fn admit_next_wake(
+        &self,
+        now: Instant,
+        has_pending_urgent: bool,
+        poll: &HardwarePoll,
+    ) -> Option<(Instant, SubReleaseWakeKind)> {
+        if has_pending_urgent && now < self.urgent_stop_cutoff {
+            Some((now, SubReleaseWakeKind::UrgentStop))
+        } else {
+            poll.admitted_wake_before(self.transition_start_cutoff, self.transition_start_cutoff)
+                .map(|(w, _)| (w, SubReleaseWakeKind::Transition))
+        }
+    }
+
+    /// Single-authority post-sleep gate shared by the RT executor and [`ReleaseFixture`].
+    /// Returns `Some(allow_transition_poll)` if the wake should execute at `post_now`, or `None`
+    /// if the cutoff has already passed.
+    pub fn post_sleep_allow_transition_poll(
+        &self,
+        post_now: Instant,
+        urgent_stop_now: bool,
+    ) -> Option<bool> {
+        if urgent_stop_now {
+            (post_now < self.urgent_stop_cutoff).then_some(false)
+        } else {
+            (post_now < self.transition_post_sleep_cutoff).then_some(true)
+        }
+    }
+}
+
+/// Parses an optional `ARMD_SUB_RELEASE_MARGIN_MS` override (in milliseconds), falling back to
+/// [`SubReleaseBudget::default_margin_for_period`] when unset or empty and failing closed when
+/// below the minimum safe margin for `period` (`>= 4 ms` at 50 Hz / 20 ms).
+pub fn parse_sub_release_margin_ms(
+    raw: Option<&str>,
+    period: Duration,
+) -> Result<Duration, String> {
+    let min_margin = SubReleaseBudget::default_margin_for_period(period);
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(min_margin),
+        Some(s) => {
+            let ms = s.parse::<u64>().map_err(|_| {
+                format!("ARMD_SUB_RELEASE_MARGIN_MS must be a non-negative integer in ms, got {s:?}")
+            })?;
+            let parsed = Duration::from_millis(ms);
+            if parsed < min_margin {
+                return Err(format!(
+                    "ARMD_SUB_RELEASE_MARGIN_MS must be >= {:.3} ms for period {:.3} ms, got {ms} ms",
+                    min_margin.as_secs_f64() * 1e3,
+                    period.as_secs_f64() * 1e3,
+                ));
+            }
+            Ok(parsed)
+        }
+    }
+}
+
+/// Kind of admitted Window-2 sub-release wake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubReleaseWakeKind {
+    /// Driver transition or watchdog-hold poll (may sleep and run bounded CAN RX/TX).
+    Transition,
+    /// Immediate in-memory urgent Stop / E-Stop / Disconnect intake (no sleep).
+    UrgentStop,
 }
 
 /// The narrow operations of one arm's core.
@@ -777,6 +956,19 @@ pub trait CoreOps {
     ) -> f64 {
         let now = now_fn();
         self.advance_output_with_deadline(dt, generation, now, release_deadline)
+    }
+    /// Refreshes `HardwarePoll::urgent_wake` strictly AFTER Step 5 output so control/hold frames
+    /// transmitted in Step 5 supersede any stale Step-2 watchdog wake before Window 2 admission.
+    /// Translates driver-clock instants onto `owner_now` by elapsed duration so mismatched test
+    /// clocks cannot manufacture spurious past-due urgent wakes.
+    fn post_output_urgent_wake(
+        &self,
+        transition_active: bool,
+        owner_now: Instant,
+        step2_urgent: Option<Instant>,
+    ) -> Option<Instant> {
+        let _ = owner_now;
+        if transition_active { step2_urgent } else { None }
     }
     /// Publishes the state computed by [`Self::advance_output`] at `timestamp` with `generation`.
     fn publish(&mut self, _timestamp: f64, _generation: u64) {}
@@ -1705,9 +1897,12 @@ impl CoreOps for SupervisorInner {
         let sample = |d: &dyn crate::driver::ArmDriver, ages: &mut Vec<Option<Duration>>| {
             d.feedback_ages_into(ages);
             let oldest = ages.iter().copied().try_fold(Duration::ZERO, |m, a| a.map(|a| m.max(a)));
-            (d.is_feedback_valid(), d.enable_state(), oldest, d.next_watchdog_hold_wake())
+            let wd_rem = d
+                .next_watchdog_hold_wake()
+                .map(|w| w.saturating_duration_since(d.clock_now()));
+            (d.is_feedback_valid(), d.enable_state(), oldest, wd_rem)
         };
-        let (feedback_valid, enable_state, oldest, next_wd_wake) = match driver.try_with_ref(|d| sample(d, &mut self.scratch.ages)) {
+        let (feedback_valid, enable_state, oldest, next_wd_rem) = match driver.try_with_ref(|d| sample(d, &mut self.scratch.ages)) {
             Ok(v) => v,
             Err(crate::supervisor_lock::DriverTryError::WouldBlock) => {
                 (false, crate::driver::EnableState::Unknown, None, None)
@@ -1718,7 +1913,8 @@ impl CoreOps for SupervisorInner {
         };
         let torque_poll = self.core.poll_transition();
         let urgent_wake = if torque_poll.is_some() || park_wake.is_some() {
-            next_wd_wake
+            let owner_now = now_fn();
+            next_wd_rem.map(|rem| owner_now + rem)
         } else {
             None
         };
@@ -1762,6 +1958,24 @@ impl CoreOps for SupervisorInner {
         release_deadline: Instant,
     ) -> f64 {
         self.tick_control_with_clock(dt, now_fn, release_deadline)
+    }
+
+    fn post_output_urgent_wake(
+        &self,
+        transition_active: bool,
+        owner_now: Instant,
+        _step2_urgent: Option<Instant>,
+    ) -> Option<Instant> {
+        if !transition_active {
+            return None;
+        }
+        let driver = self.driver.as_ref()?;
+        driver
+            .try_with_ref_recover(|d| {
+                d.next_watchdog_hold_wake()
+                    .map(|w| owner_now + w.saturating_duration_since(d.clock_now()))
+            })
+            .flatten()
     }
 
     fn publish(&mut self, timestamp: f64, generation: u64) {
@@ -2199,9 +2413,16 @@ impl ReleaseEngine {
     /// bounded urgent `Stop` handoffs (authorized against the owner's lease at `now`), and/or
     /// direct `StopRequests`; true when any urgent stop applied.
     pub fn apply_pending_urgent_at<O: CoreOps>(&mut self, core: &mut O, now: Instant) -> bool {
+        self.apply_pending_urgent_detailed(core, now).0
+    }
+
+    /// Like [`Self::apply_pending_urgent_at`], returning `(stop_applied, any_urgent_consumed)` where
+    /// `any_urgent_consumed` also covers connection lifecycle (`Open`/`Disconnect`) and disconnect-fence
+    /// transitions so Window-2 wakes suppress CAN polling whenever any urgent intake was consumed.
+    fn apply_pending_urgent_detailed<O: CoreOps>(&mut self, core: &mut O, now: Instant) -> (bool, bool) {
         let estop = core.apply_estop();
-        let _lifecycle = self.drain_conn_lifecycle_at(core, now);
-        let _fence = core.sync_disconnect_fence(now);
+        let lifecycle = self.drain_conn_lifecycle_at(core, now);
+        let fence = core.sync_disconnect_fence(now);
         let urgent_handoff = if let Some(intake) = self.urgent_stops.as_mut() {
             let stops = &self.stop;
             intake.drain_requests(|req| core.handle_urgent_stop(req, stops, now))
@@ -2209,7 +2430,9 @@ impl ReleaseEngine {
             false
         };
         let stop = self.apply_pending_stop(core);
-        estop || urgent_handoff || stop
+        let stopped = estop || urgent_handoff || stop;
+        let consumed_any = stopped || lifecycle || fence;
+        (stopped, consumed_any)
     }
 
     /// Drains pending priority connection lifecycle commands (`Open` / `Disconnect`) at `now`.
@@ -2601,6 +2824,16 @@ impl ReleaseEngine {
         } else {
             None
         };
+        // Refresh `report.poll.urgent_wake` strictly AFTER Step 5 output (and transition abort
+        // settlement) so control/hold frames transmitted in Step 5 supersede any stale Step-2
+        // watchdog wake before Window 2 admission.
+        let transition_active = (self.transition.is_some()
+            && finished_transition.is_none()
+            && aborted_transition.is_none())
+            || report.poll.park_wake.is_some();
+        let post_out_now = now_fn();
+        report.poll.urgent_wake =
+            core.post_output_urgent_wake(transition_active, post_out_now, report.poll.urgent_wake);
         // 6. Publish
         core.publish(timestamp, publish_generation);
         // 7. Deliver aborted/finished transition terminals, urgent stop replies, lifecycle replies,
@@ -2685,22 +2918,40 @@ impl ReleaseEngine {
     pub fn service_wake_with_clock<O: CoreOps>(
         &mut self,
         core: &mut O,
-        mut now_fn: impl FnMut() -> Instant,
+        now_fn: impl FnMut() -> Instant,
         release_deadline: Instant,
         publish_generation: u64,
         report: &mut ReleaseReport,
     ) -> bool {
+        self.service_wake_with_clock_opts(core, now_fn, release_deadline, publish_generation, true, report)
+    }
+
+    /// Runs one sub-release wake. When `allow_transition_poll` is `false` (urgent Stop / E-Stop /
+    /// Disconnect wake outside the CAN transition poll budget), applies urgent stops/disconnects,
+    /// publishes, and flushes replies strictly in-memory without invoking hardware transition polling.
+    pub fn service_wake_with_clock_opts<O: CoreOps>(
+        &mut self,
+        core: &mut O,
+        mut now_fn: impl FnMut() -> Instant,
+        release_deadline: Instant,
+        publish_generation: u64,
+        allow_transition_poll: bool,
+        report: &mut ReleaseReport,
+    ) -> bool {
         let now = now_fn();
-        let urgent_applied = self.apply_pending_urgent_at(core, now);
+        let (urgent_stopped, urgent_consumed) = self.apply_pending_urgent_detailed(core, now);
         let lifecycle_pending = self.has_pending_lifecycle_replies();
-        if urgent_applied { report.stopped = true; }
-        let budget = ServiceBudget::for_release(now, release_deadline);
-        report.poll = core.poll_transition_wake_for_release_with_clock(&budget, release_deadline, &mut now_fn);
+        if urgent_stopped { report.stopped = true; }
+        if allow_transition_poll && !urgent_consumed && !lifecycle_pending {
+            let budget = ServiceBudget::for_release(now, release_deadline);
+            report.poll = core.poll_transition_wake_for_release_with_clock(&budget, release_deadline, &mut now_fn);
+        }
         let finished = self
             .take_finished_transition(report)
             .or_else(|| self.take_aborted_transition(core, report));
         let active_ended = self.active().and_then(|a| core.action_outcome(a).map(|o| (a, o)));
-        if urgent_applied
+        if urgent_stopped
+            || urgent_consumed
             || lifecycle_pending
             || core.has_pending_servo_closes()
             || core.has_pending_policy_close()
@@ -2753,6 +3004,9 @@ pub struct ReleaseFixture<O: CoreOps> {
     engine: ReleaseEngine,
     clock: VirtualClock,
     pub dt: f64,
+    /// Optional explicit Window-2 sub-release safety margin override (`None` uses
+    /// [`SubReleaseBudget::default_margin_for_period`]).
+    pub sub_release_margin: Option<Duration>,
 }
 
 /// The points of a release where the fixture re-reads the stop generation and the time
@@ -2786,7 +3040,13 @@ impl<O: CoreOps> ReleaseFixture<O> {
         #[cfg(not(target_arch = "wasm32"))]
         core.attach_closed_bitset(broker.closed_bitset());
         core.set_boot_id(boot);
-        (Self { core, engine, clock, dt: 0.02 }, broker, tw, stop)
+        (Self { core, engine, clock, dt: 0.02, sub_release_margin: None }, broker, tw, stop)
+    }
+
+    /// Configures an explicit Window-2 sub-release safety margin (`period - margin`).
+    pub fn with_sub_release_margin(mut self, margin: Duration) -> Self {
+        self.sub_release_margin = Some(margin);
+        self
     }
 
     /// [`Self::new`] with a freshly generated non-zero executor [`BootId`].
@@ -2837,66 +3097,69 @@ impl<O: CoreOps> ReleaseFixture<O> {
     /// (`BeforeCommit`, `BeforeTarget`, `BeforeOutput`, pre-step, transmit, and post-output),
     /// while release scheduling/deadline remains anchored to `self.clock`.
     pub fn step_with_clock(&mut self, mut now_fn: impl FnMut() -> Instant) -> ReleaseReport {
-        let started = self.clock.now();
-        let release_deadline = started + Duration::from_secs_f64(self.dt);
-        let next_gen = self.engine.releases() + 1;
-        let mut report = self.engine.step(&mut self.core, &mut now_fn, self.dt, release_deadline, next_gen);
-        // Extra sub-release hardware services in Window 2:
-        // - Optional transition polls are admitted only before `optional_cutoff` (leaving at least
-        //   `OPTIONAL_WORK_RELEASE_MARGIN` before `release_deadline`).
-        // - Watchdog-required holds (`urgent_wake`) and pending stop/E-stop/disconnect work remain
-        //   eligible up to `urgent_cutoff` (never deferred by optional-work margins).
+        let fixture_started = self.clock.now();
         let period = Duration::from_secs_f64(self.dt);
-        let wake_margin = crate::driver::OPTIONAL_WAKE_RELEASE_MARGIN.min(period / 2);
-        let optional_cutoff = release_deadline.checked_sub(wake_margin).unwrap_or(started);
-        let urgent_cutoff = release_deadline
-            .checked_sub(crate::driver::DAMIAO_TX_RELEASE_PUBLISH_MARGIN)
-            .unwrap_or(started);
-        let mut next = if self.engine.has_pending_urgent(&self.core) && self.clock.now() < urgent_cutoff {
-            Some((self.clock.now(), true))
-        } else {
-            report.poll.admitted_wake_before(optional_cutoff, urgent_cutoff)
-        };
-        while let Some((wake, is_urgent)) = next {
-            let exec_cutoff = if is_urgent || self.engine.has_pending_urgent(&self.core) {
-                urgent_cutoff
-            } else {
-                optional_cutoff
-            };
-            if report.wakes == MAX_SERVICE_WAKES || self.clock.now() >= exec_cutoff { break; }
-            report.wakes += 1;
-            self.clock.advance(wake.saturating_duration_since(self.clock.now()));
-            let post_exec_optional_cutoff = release_deadline
-                .checked_sub(crate::driver::OPTIONAL_WORK_RELEASE_MARGIN.min(period / 3))
-                .unwrap_or(started);
-            let post_now = self.clock.now();
-            let urgent_now = is_urgent || self.engine.has_pending_urgent(&self.core);
-            let post_cutoff = if urgent_now {
-                urgent_cutoff
-            } else {
-                post_exec_optional_cutoff
-            };
-            if post_now >= post_cutoff {
-                if !urgent_now && post_now < urgent_cutoff {
-                    if let Some(urg) = report.poll.urgent_wake.filter(|w| *w < urgent_cutoff) {
-                        next = Some((urg, true));
-                        continue;
+        let fixture_deadline = fixture_started + period;
+        // Anchor release admission, cutoffs, sleep, and polling to one consistent owner timeline
+        // (`now_fn()`) so tests driving a separate `MockClock` never compare wakes across clocks.
+        let owner_started = now_fn();
+        let owner_deadline = owner_started + period;
+        let next_gen = self.engine.releases() + 1;
+        let mut report = self.engine.step(&mut self.core, &mut now_fn, self.dt, owner_deadline, next_gen);
+        // Extra sub-release hardware services in Window 2 (bounded to MAX_SERVICE_WAKES = 1):
+        // - Transition and watchdog-hold polls run only if sleep + poll + tail can complete before
+        //   `owner_deadline - margin` (`wake_budget.transition_start_cutoff`, bounded by
+        //   `wake_budget.poll_deadline`); otherwise deferred to the start of the next release.
+        // - Immediate in-memory urgent Stop / E-Stop / Disconnect wakes remain eligible up to
+        //   `wake_budget.urgent_stop_cutoff` without entering hardware CAN polling.
+        let margin = self
+            .sub_release_margin
+            .unwrap_or_else(|| SubReleaseBudget::default_margin_for_period(period));
+        let wake_budget = SubReleaseBudget::for_release(owner_started, owner_deadline, period, margin);
+        if let Some((wake, kind)) = wake_budget.admit_next_wake(
+            now_fn(),
+            self.engine.has_pending_urgent(&self.core),
+            &report.poll,
+        ) {
+            if report.wakes < MAX_SERVICE_WAKES {
+                let now = now_fn();
+                let urgent_stop_pending = kind == SubReleaseWakeKind::UrgentStop
+                    || self.engine.has_pending_urgent(&self.core);
+                let exec_cutoff = if urgent_stop_pending {
+                    wake_budget.urgent_stop_cutoff
+                } else {
+                    wake_budget.transition_start_cutoff
+                };
+                let target_wake = if urgent_stop_pending { now } else { wake };
+                if now < exec_cutoff && target_wake <= exec_cutoff {
+                    let target = target_wake.min(wake_budget.wake_deadline);
+                    if target > now {
+                        self.clock.advance(target.saturating_duration_since(now));
+                    }
+                    let post_now = now_fn();
+                    let urgent_stop_now = urgent_stop_pending
+                        || self.engine.has_pending_urgent(&self.core);
+                    if let Some(allow_transition_poll) =
+                        wake_budget.post_sleep_allow_transition_poll(post_now, urgent_stop_now)
+                    {
+                        report.wakes += 1;
+                        self.engine.service_wake_with_clock_opts(
+                            &mut self.core,
+                            &mut now_fn,
+                            wake_budget.poll_deadline,
+                            next_gen,
+                            allow_transition_poll,
+                            &mut report,
+                        );
                     }
                 }
-                break;
             }
-            self.engine.service_wake_with_clock(&mut self.core, &mut now_fn, release_deadline, next_gen, &mut report);
-            next = if self.engine.has_pending_urgent(&self.core) && self.clock.now() < urgent_cutoff {
-                Some((self.clock.now(), true))
-            } else {
-                report.poll.admitted_wake_before(optional_cutoff, urgent_cutoff)
-            };
         }
-        // Sample `now_fn` strictly AFTER Window 2 wakes and BEFORE advancing to `release_deadline`
+        // Sample `now_fn` strictly AFTER Window 2 wakes and BEFORE advancing to `fixture_deadline`
         // so callers timing full release duration observe all Window 2 sleep + poll work.
         let _ = now_fn();
         // The next release starts one period later
-        self.clock.advance(release_deadline.saturating_duration_since(self.clock.now()));
+        self.clock.advance(fixture_deadline.saturating_duration_since(self.clock.now()));
         report
     }
 }

@@ -597,6 +597,17 @@ async fn start_control_owner_with_hooks(
         armd::rt_core::executor::RtOwner::Executor => {
             let fallback_sched = rt_sched;
             let fallback_mlock = memory_lock.clone();
+            let raw_sub_release_margin = match std::env::var("ARMD_SUB_RELEASE_MARGIN_MS") {
+                Ok(v) => Some(v),
+                Err(std::env::VarError::NotPresent) => None,
+                Err(std::env::VarError::NotUnicode(_)) => {
+                    return Err("ARMD_SUB_RELEASE_MARGIN_MS must be valid UTF-8".into());
+                }
+            };
+            let sub_release_margin = armd::rt_core::ops::parse_sub_release_margin_ms(
+                raw_sub_release_margin.as_deref(),
+                period,
+            )?;
             let cfg = armd::rt_core::executor::ExecutorConfig {
                 period,
                 boot: armd::rt_core::broker::BootId(1),
@@ -606,6 +617,7 @@ async fn start_control_owner_with_hooks(
                 alloc_timing,
                 panic_policy,
                 apply_rt_sched,
+                sub_release_margin,
             };
             match supervisor.start_executor_with_hooks(cfg, hooks).await {
                 Ok(handle) => {
