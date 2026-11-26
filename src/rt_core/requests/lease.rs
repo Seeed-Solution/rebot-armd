@@ -378,6 +378,10 @@ pub enum OwnerAuthPolicy {
     /// Clear-fault rule: requires a live operator session when E-stop is latched or safety is in
     /// a non-recoverable stopped/fault state.
     ClearFault,
+    /// Gravity-comp rule: requires a live operator session on `enable: true`, while keeping
+    /// `enable: false` (`OperatorRequirement::NotRequired`) unblocked, enforced in
+    /// `dispatch_gravity_comp_async` + owner admission.
+    GravityCompEnter,
 }
 
 /// Zero-allocation refusal returned by [`evaluate_owner_auth_policy`].
@@ -445,6 +449,8 @@ pub fn evaluate_owner_auth_policy(
             }
             Ok(())
         }
+        // Enforced per-direction (enable: true only) in `dispatch_gravity_comp_async` + owner admission.
+        OwnerAuthPolicy::GravityCompEnter => Ok(()),
     }
 }
 

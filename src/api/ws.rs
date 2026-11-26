@@ -2901,8 +2901,10 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 }
             }
             // Unified table-bound async command handlers (`/api/v1/torque`, `/api/v1/arm`,
-            // `/api/v1/safety/clear_fault`) routed identically across legacy and RT executor.
-            // Both `entry.lease` and `entry.auth` are enforced directly from the dispatch table row.
+            // `/api/v1/safety/clear_fault`, `/api/v1/mode/gravity_comp`) routed identically across
+            // legacy and RT executor. `entry.lease` is enforced by `ws.rs`, while `entry.auth`
+            // (`OwnerAuthPolicy`) is forwarded to the async handler/owner (where `GravityCompEnter`
+            // enforces operator privilege on `enable: true` only and keeps `enable: false` unblocked).
             if let Some((lease_req, auth_req, DispatchHandler::CommandAsync(handler))) =
                 entry.map(|e| (e.lease, e.auth, e.handler))
             {

@@ -70,7 +70,7 @@ pub(super) const ENTRIES: &[DispatchEntry] = &[
         handler_name: "ws::motion::dispatch_gravity_comp_async",
         admission: AdmissionClass::Ordinary,
         lease: LeaseRequirement::Required,
-        auth: AuthRequirement::Operator(None),
+        auth: AuthRequirement::OwnerGrant(crate::rt_core::requests::lease::OwnerAuthPolicy::GravityCompEnter),
         reply: ReplyPolicy::CommandImmediate,
         ownership: RouteOwnership::ExecutorRequest,
         fault: FaultAvailability::Fenced,

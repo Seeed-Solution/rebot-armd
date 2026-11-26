@@ -501,6 +501,12 @@ impl SupervisorInner {
             Ok(v) => v,
             Err(r) => return Err((r, Some(policy))),
         };
+        if this.rt_executor_owned && !this.has_gravity_comp_reclaim_capacity() {
+            return Err((
+                reason("RECLAIM_BACKPRESSURE", "gravity_comp reclaim queue is full; wait for off-thread reclaim"),
+                Some(policy),
+            ));
+        }
         let pose = arm6(&this.measured_positions);
         let entry_torque = this.gravity_comp_entry_torque(&policy, model);
         let lease_gen = this.active_lease.as_ref().map(|l| l.generation);
@@ -551,6 +557,12 @@ impl SupervisorInner {
             Ok(v) => v,
             Err(r) => return Err((r, Some(policy))),
         };
+        if this.rt_executor_owned && !this.has_gravity_comp_reclaim_capacity() {
+            return Err((
+                reason("RECLAIM_BACKPRESSURE", "gravity_comp reclaim queue is full; wait for off-thread reclaim"),
+                Some(policy),
+            ));
+        }
         if this.driver.is_none() {
             let pose = arm6(&this.measured_positions);
             let entry_torque = this.gravity_comp_entry_torque(&policy, model);
@@ -918,6 +930,13 @@ impl SupervisorInner {
         };
         let model = self.gravity_comp_model_torque(&policy, scale)
             .ok_or_else(|| Self::reject("GRAVITY_MODEL_UNAVAILABLE", "Gravity torque could not be computed".into()))?;
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.driver.is_some() && self.driver_supports_nonblocking_mode_switch() {
+            return Err(Self::reject(
+                "UNSUPPORTED",
+                "non-blocking ModeSwitch drivers must enter gravity_comp via StartGravityCompEnter".into(),
+            ));
+        }
         // hand guiding and MIT tracking own the output exclusively: once the request is valid,
         // hand back first (confirmed, at rest); a refused request never changes the owner
         if self.mit_active() {

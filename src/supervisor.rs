@@ -13273,15 +13273,39 @@ impl SupervisorInner {
         self.mode_switch.latest_terminal()
     }
 
+    /// True when both bounded gravity-comp retirement queues have headroom for one more
+    /// `GravityCompRun` and/or `PendingGravityCompEnter` policy without exceeding capacity.
+    pub(crate) fn has_gravity_comp_reclaim_capacity(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        let pending_enter = usize::from(self.pending_gravity_enter.is_some());
+        #[cfg(target_arch = "wasm32")]
+        let pending_enter = 0usize;
+        let runs_needed = self.retired_gravity_comp.len()
+            + usize::from(self.gravity_comp.is_some())
+            + pending_enter;
+        let policies_needed = self.retired_gravity_comp_policies.len() + pending_enter;
+        runs_needed < self.retired_gravity_comp.capacity()
+            && policies_needed < self.retired_gravity_comp_policies.capacity()
+    }
+
+    /// Read-only inspection helper returning `(retired_runs_len, retired_policies_len)`.
+    pub fn retired_gravity_comp_queue_lens(&self) -> (usize, usize) {
+        (
+            self.retired_gravity_comp.len(),
+            self.retired_gravity_comp_policies.len(),
+        )
+    }
+
     /// Queues a retired `GravityCompRun` for off-thread drop without allocating or freeing on RT.
     pub(crate) fn retire_gravity_comp_run(&mut self, run: crate::gravity_comp::GravityCompRun) {
         if self.retired_gravity_comp.len() < self.retired_gravity_comp.capacity() {
             self.retired_gravity_comp.push_back(run);
-        } else if !self.rt_executor_owned {
-            drop(run);
         } else {
-            // Never drop on armd-control if the bounded queue is full (keep retained).
-            std::mem::forget(run);
+            debug_assert!(
+                !self.rt_executor_owned,
+                "retired_gravity_comp capacity exhausted on RT executor despite admission reservation"
+            );
+            drop(run);
         }
     }
 
@@ -13293,10 +13317,12 @@ impl SupervisorInner {
     pub(crate) fn retire_gravity_comp_policy(&mut self, policy: crate::model::GravityCompPolicy) {
         if self.retired_gravity_comp_policies.len() < self.retired_gravity_comp_policies.capacity() {
             self.retired_gravity_comp_policies.push_back(policy);
-        } else if !self.rt_executor_owned {
-            drop(policy);
         } else {
-            std::mem::forget(policy);
+            debug_assert!(
+                !self.rt_executor_owned,
+                "retired_gravity_comp_policies capacity exhausted on RT executor despite admission reservation"
+            );
+            drop(policy);
         }
     }
 
@@ -19683,6 +19709,86 @@ impl ArmSupervisor {
                         },
                     }
                 };
+
+                #[cfg(not(target_arch = "wasm32"))]
+                if prep_ws.enable == Some(true)
+                    && self
+                        .published_config()
+                        .await?
+                        .driver_supports_nonblocking_mode_switch
+                {
+                    let needs_handback = {
+                        let mut inner = self.inner.write().await;
+                        let io_scope = crate::diagnostics::tick::HoldIoScope::enter();
+                        inner.set_command("/api/v1/torque");
+                        inner.set_direction("on");
+                        if let Err(e) = self.check_legacy_under_guard(&inner) {
+                            inner.set_io_timing(io_scope.finish());
+                            return Err(e);
+                        }
+                        if let Err(err) = check_torque_owner_preflight(
+                            &mut inner,
+                            prep_ws.connection,
+                            prep_ws.local_generation,
+                            prep_ws.supplied_epoch,
+                            prep_ws.request_id_valid,
+                            prep_ws.body_error,
+                            prep_ws.auth_policy,
+                            prep_ws.operator,
+                            Instant::now(),
+                        ) {
+                            inner.set_io_timing(io_scope.finish());
+                            return Ok(map_preflight_err(err));
+                        }
+                        if Instant::now() >= deadline {
+                            let epoch_id = inner.safety.epoch_id();
+                            let safety_state = inner.safety.state().clone();
+                            inner.set_io_timing(io_scope.finish());
+                            return Ok(map_legacy_failure(
+                                LegacyTorqueFailure::StaticCode("DEADLINE_EXPIRED"),
+                                epoch_id,
+                                &safety_state,
+                                &[],
+                            ));
+                        }
+                        let active =
+                            inner.driver_supports_nonblocking_mode_switch() && inner.mit_active();
+                        inner.set_io_timing(io_scope.finish());
+                        active
+                    };
+                    if needs_handback {
+                        let lease_holder = (prep_ws.local_generation != 0).then(|| {
+                            (
+                                prep_ws.connection.to_holder_label(),
+                                prep_ws.local_generation,
+                            )
+                        });
+                        let mut qual_stamp = prep_ws.stamp;
+                        qual_stamp.request_id = next_admission_request_id();
+                        qual_stamp.connection_id = prep_ws.connection.id();
+                        qual_stamp.lease_gen = prep_ws.local_generation;
+                        if let Some(ep) = prep_ws.supplied_epoch {
+                            qual_stamp.estop_epoch = ep;
+                        }
+                        if let Err(err) = crate::rt_core::requests::config::run_executor_mit_hand_back(
+                            self,
+                            crate::supervisor::MitHandBackReason::Rearm,
+                            qual_stamp,
+                            lease_holder,
+                            crate::auth::OperatorRequirement::NotRequired,
+                            crate::rt_core::broker::ClientId(prep_ws.connection.id()),
+                            Duration::from_secs(2),
+                        )
+                        .await
+                        {
+                            let epoch_id = self.inner.read().await.safety.epoch_id();
+                            return Ok(TorqueWsOutcome::Rejected {
+                                error: err.into(),
+                                epoch_id,
+                            });
+                        }
+                    }
+                }
 
                 let (enabled, start_res, pre_epoch, joint_names, tick_seq_counter, mut last_tick_seq) = {
                     let mut inner = self.inner.write().await;

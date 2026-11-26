@@ -965,6 +965,7 @@ impl ConfigError {
                     "UNSUPPORTED" | "GRAVITY_MODEL_UNAVAILABLE" => 422,
                     "NOT_ARMED" => 412,
                     "INVALID_COMMAND" => 400,
+                    "RECLAIM_BACKPRESSURE" => 503,
                     _ => 409,
                 };
                 ArmError::Rejected {

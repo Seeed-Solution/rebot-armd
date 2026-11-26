@@ -2178,6 +2178,16 @@ pub trait ArmDriver: Send {
         Err("MIT expiry recovery is not supported by this driver".into())
     }
 
+    /// Operator recovery after an MIT loss, enforcing `pre_tx_gate` immediately before EVERY
+    /// `ClearFault`, `CMD_DISABLE`, barrier `REG_READ`, and `0xCC` CAN submission (after
+    /// `before_final_tx_gate_hook`). Defaults to [`Self::mit_expiry_recover`].
+    fn mit_expiry_recover_with_gate(
+        &mut self,
+        _pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> Result<(), String> {
+        self.mit_expiry_recover()
+    }
+
     /// Fresh state of every motor for the MIT expiry recovery decision: a read-only status poll
     /// to each motor after a receive boundary, and the state codes of feedback received after it.
     /// Err names the motors without fresh feedback.
@@ -8051,8 +8061,17 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     mit_expiry_cleared_mask: u64,
     /// Per-joint causal `(tx_seq, tx_started)` of `CMD_DISABLE` sent during budgeted MIT expiry
     /// recovery; each axis requires fresh `state == 0` feedback strictly after its own disable TX
-    /// AND an observed-empty post-disable RX drain before recovery can commit.
+    /// AND a post-disable `REG_READ(RID_CTRL_MODE)` causal delivery barrier ack before commit.
     mit_expiry_disable_tx_seq: [Option<(u64, Instant)>; MAX_MODE_JOINTS],
+    /// Per-joint `tx_seq` of the read-only `REG_READ(RID_CTRL_MODE)` delivery barrier queued
+    /// strictly after `CMD_DISABLE` during budgeted MIT expiry recovery.
+    mit_expiry_barrier_tx_seq: [Option<u64>; MAX_MODE_JOINTS],
+    /// Per-joint `rx_seq` of the causal `REG_READ(RID_CTRL_MODE)` barrier reply confirming wire
+    /// delivery of `CMD_DISABLE` ahead of it.
+    mit_expiry_barrier_ack_seq: [Option<u64>; MAX_MODE_JOINTS],
+    /// Per-joint `tx_seq` of the post-barrier `0xCC` status refresh during budgeted MIT expiry
+    /// recovery.
+    mit_expiry_refresh_tx_seq: [Option<u64>; MAX_MODE_JOINTS],
     /// Per-release RX frame counter shared between Step 2 RX and ModeSwitch RX drain (one ledger).
     release_rx_frames: u16,
     /// Per-joint `CLOCK_REALTIME - monotonic` decode offset (ns) of the latest causal feedback.
@@ -8541,6 +8560,9 @@ enum TxKind {
     /// unconditionally subject in every safety state to send-time K=3 rest-pose evaluation from
     /// fresh (`<= 100 ms`) feedback and the single 1 s request lifetime.
     DisableRequested { started_at: Instant },
+    /// Budgeted MIT expiry recovery disable (`CMD_DISABLE`): subject to BOTH the shared
+    /// per-release TX budget (`is_disable_tx_kind` returns `false`) AND Rule A′ (`started_at`).
+    MitRecoveryDisable { started_at: Instant },
     /// Per-motor disable frame of a client-initiated park (`CMD_DISABLE`): exempt from the motion
     /// TX budget, subject to the exact same K=3 rest-pose gate and 1 s request lifetime as
     /// `DisableRequested`, AND stop-gated (pending Stop/E-stop, E-stop latch, and stop-generation
@@ -9434,6 +9456,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             mit_expiry_budgeted_boundary: None,
             mit_expiry_cleared_mask: 0,
             mit_expiry_disable_tx_seq: [None; MAX_MODE_JOINTS],
+            mit_expiry_barrier_tx_seq: [None; MAX_MODE_JOINTS],
+            mit_expiry_barrier_ack_seq: [None; MAX_MODE_JOINTS],
+            mit_expiry_refresh_tx_seq: [None; MAX_MODE_JOINTS],
             release_rx_frames: 0,
             last_feedback_decode_offset_ns: vec![None; dof],
             uncertain_readback_probe: [None; MAX_MODE_JOINTS],
@@ -10109,6 +10134,66 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         Ok(())
     }
 
+    fn harvest_mit_expiry_barrier_acks_into(
+        &self,
+        n: usize,
+        barrier_tx_seq: &[Option<u64>; MAX_MODE_JOINTS],
+        barrier_ack_seq: &mut [Option<u64>; MAX_MODE_JOINTS],
+    ) {
+        if self.comm_reg_reply_overflow {
+            return;
+        }
+        for i in 0..n {
+            if barrier_ack_seq[i].is_some() {
+                continue;
+            }
+            let Some(b_tx_seq) = barrier_tx_seq[i] else {
+                continue;
+            };
+            let motor_id = self.motor_ids[i];
+            for r in self.comm_reg_replies[..self.comm_reg_reply_len].iter().flatten() {
+                if !r.write
+                    && r.rid == damiao::RID_CTRL_MODE
+                    && r.motor_id == motor_id
+                    && self.valid_register_reply_id(i, r.reply_id)
+                    && r.rx_seq > b_tx_seq
+                {
+                    barrier_ack_seq[i] = Some(r.rx_seq);
+                    break;
+                }
+            }
+        }
+    }
+
+    fn is_mit_expiry_axis_causally_disabled(
+        &self,
+        now: Instant,
+        idx: usize,
+        req_boundary: u64,
+        dis_tx: &[Option<(u64, Instant)>; MAX_MODE_JOINTS],
+        barrier_ack: &[Option<u64>; MAX_MODE_JOINTS],
+    ) -> bool {
+        let Some((dis_seq, dis_at)) = dis_tx[idx] else {
+            return false;
+        };
+        let Some(barrier_ack_seq) = barrier_ack[idx] else {
+            return false;
+        };
+        barrier_ack_seq > dis_seq
+            && !self.awaiting_rx_boundary
+            && self.last_read_drained
+            && self.last_feedback_seq[idx] > req_boundary
+            && self.last_feedback_seq[idx] > barrier_ack_seq
+            && self.motor_status[idx] == 0
+            && self.last_feedback_instant[idx].is_some_and(|t| {
+                t >= dis_at
+                    && now.saturating_duration_since(t) <= STOPPED_DISABLE_FEEDBACK_MAX_AGE
+            })
+            && self.feedback_queue_bound[idx].is_some_and(|b| {
+                now.saturating_duration_since(b) <= STOPPED_DISABLE_FEEDBACK_MAX_AGE
+            })
+    }
+
     fn abort_enable_for_estop(&mut self) {
         if matches!(self.torque_hs, Some(DamiaoTorque::DrainBeforeEnable(_))) {
             self.awaiting_rx_boundary = false;
@@ -10382,7 +10467,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let pending = self.is_stop_pending();
         let latched = self.is_stop_latched();
         match kind {
-            TxKind::DisableRequested { started_at } => {
+            TxKind::DisableRequested { started_at }
+            | TxKind::MitRecoveryDisable { started_at } => {
                 self.check_stopped_disable_requested(started_at)?;
             }
             TxKind::ClientParkDisable { started_at } => {
@@ -10488,7 +10574,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             _ => crate::torque::ChannelMask::from_count(n),
         };
         let (wk, mask) = match kind {
-            TxKind::DisableRequested { .. } | TxKind::ClientParkDisable { .. } => {
+            TxKind::DisableRequested { .. }
+            | TxKind::MitRecoveryDisable { .. }
+            | TxKind::ClientParkDisable { .. } => {
                 (crate::torque::WriteKind::DisableRequested, scoped_mask)
             }
             TxKind::DisableProtective { .. } => {
@@ -10651,6 +10739,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             let skip_stamp_check = matches!(
                 kind,
                 TxKind::DisableRequested { .. }
+                    | TxKind::MitRecoveryDisable { .. }
                     | TxKind::DisableProtective { .. }
                     | TxKind::DisableProbe
             );
@@ -10862,6 +10951,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         | TxKind::ModeWrite
                         | TxKind::ClearFault
                         | TxKind::DisableRequested { .. }
+                        | TxKind::MitRecoveryDisable { .. }
                         | TxKind::ClientParkDisable { .. }
                         | TxKind::DisableProtective { .. } => {
                             crate::diagnostics::tick::TxFrameKind::EnableDisable
@@ -10935,7 +11025,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             #[cfg(not(target_arch = "wasm32"))]
             if self.shadow_staging.is_enabled() {
                 let shadow_info = match kind {
-                    TxKind::DisableRequested { .. } | TxKind::ClientParkDisable { .. } => self
+                    TxKind::DisableRequested { .. }
+                    | TxKind::MitRecoveryDisable { .. }
+                    | TxKind::ClientParkDisable { .. } => self
                         .motor_ids
                         .iter()
                         .position(|&id| u32::from(id) == frame.id)
@@ -18922,6 +19014,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         let unverified_mask = unverified_mask & !u64::from(self.mode_switch_active_mask);
         if unverified_mask == 0
             || self.torque_hs.is_some()
+            || self.mit_expiry_budgeted_boundary.is_some()
             || self.awaiting_rx_boundary
             || !self.last_read_drained
         {
@@ -19307,6 +19400,272 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
         self.last_mit_recovery_rx_seq = Some(boundary);
         self.mit_fence = None;
+        Ok(())
+    }
+
+    fn mit_expiry_recover_with_gate(
+        &mut self,
+        pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> Result<(), String> {
+        self.last_mit_recovery_rx_seq = None;
+        let n = self.motor_ids.len().min(MAX_MODE_JOINTS);
+        if n == 0 {
+            self.mit_fence = None;
+            return Ok(());
+        }
+        self.discard_all_pending_tx();
+        self.begin_tx_tick();
+        let start_stamp = self.current_stop_stamp();
+        let req_boundary = self
+            .rx_boundary()
+            .map_err(|e| format!("receive boundary before MIT recovery: {e}"))?;
+        self.comm_reg_reply_len = 0;
+        self.comm_reg_reply_overflow = false;
+
+        // Phase 1: ClearFault to every motor reporting a fault state (>= 8) via pre_tx_gate.
+        let mut clear_sent = false;
+        for i in 0..n {
+            if self.motor_status[i] >= 8 {
+                match self.send_with_commissioning_gate(
+                    TxKind::ClearFault,
+                    Some(start_stamp),
+                    None,
+                    pre_tx_gate,
+                    |d| Some(damiao::build_clear_faults_frame(d.motor_ids[i])),
+                ) {
+                    Ok(_) => clear_sent = true,
+                    Err(Ok(code)) => return Err(format!("PRE_TX_GATE:{code}")),
+                    Err(Err(TxRefusal::Deferred)) => {
+                        return Err(format!("clear-error to J{} not sent: TX budget exhausted", i + 1));
+                    }
+                    Err(Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged)) => {
+                        return Err(format!(
+                            "clear-error to J{} inhibited: {}",
+                            i + 1,
+                            ArmDriverError::EstopInhibited
+                        ));
+                    }
+                    Err(Err(r)) => {
+                        return Err(format!(
+                            "clear-error to J{} not sent: {}",
+                            i + 1,
+                            Self::refusal_to_driver_err(r)
+                        ));
+                    }
+                }
+            }
+        }
+        if clear_sent {
+            self.pending_stop_check(Some(start_stamp))
+                .map_err(|e| format!("clear-error flush inhibited: {e}"))?;
+            self.flush_can_and_commit()
+                .map_err(|e| format!("flush: {e}"))?;
+        }
+
+        // Ensure Rule A′ rest-pose evidence is confirmed before transmitting CMD_DISABLE.
+        self.disable_rest_established = false;
+        self.disable_dispatched_mask = 0;
+        let started_at = self.now();
+        loop {
+            if let Err(code) = pre_tx_gate() {
+                return Err(format!("PRE_TX_GATE:{code}"));
+            }
+            match self.check_stopped_disable_requested(started_at) {
+                Ok(()) => break,
+                Err(TxRefusal::DisableWaitEvidence) => {
+                    if self.since(started_at) >= STOPPED_DISABLE_REQUEST_LIFETIME {
+                        return Err(ArmDriverError::DisableRequestExpired.to_string());
+                    }
+                    if !self.in_active_control_release() {
+                        self.begin_tx_tick();
+                    }
+                    for i in 0..n {
+                        match self.send_with_commissioning_gate(
+                            TxKind::DisableProbe,
+                            Some(start_stamp),
+                            None,
+                            pre_tx_gate,
+                            |d| Some(damiao::build_refresh_frame(d.motor_ids[i])),
+                        ) {
+                            Ok(_) => {}
+                            Err(Ok(code)) => return Err(format!("PRE_TX_GATE:{code}")),
+                            Err(Err(_)) => break,
+                        }
+                    }
+                    let _ = self.flush_can_and_commit();
+                    self.pause(EVIDENCE_PROBE_INTERVAL);
+                    let _ = self.read_joint_states();
+                }
+                Err(r) => return Err(Self::refusal_to_driver_err(r).to_string()),
+            }
+        }
+
+        // Phase 2a: Send CMD_DISABLE to every motor directly through send_with_commissioning_gate.
+        self.clear_cached_targets();
+        if !self.in_active_control_release() {
+            self.begin_tx_tick();
+        }
+        let mut dis_tx: [Option<(u64, Instant)>; MAX_MODE_JOINTS] = [None; MAX_MODE_JOINTS];
+        for i in 0..n {
+            match self.send_with_commissioning_gate(
+                TxKind::DisableRequested { started_at },
+                Some(start_stamp),
+                None,
+                pre_tx_gate,
+                |d| Some(damiao::build_disable_frame(d.motor_ids[i])),
+            ) {
+                Ok((_, tx_seq, tx_started, _)) => {
+                    dis_tx[i] = Some((tx_seq, tx_started));
+                    if i < 64 {
+                        self.disable_dispatched_mask |= 1u64 << i;
+                    }
+                }
+                Err(Ok(code)) => return Err(format!("PRE_TX_GATE:{code}")),
+                Err(Err(r)) => return Err(Self::refusal_to_driver_err(r).to_string()),
+            }
+        }
+        if let Err(code) = pre_tx_gate() {
+            return Err(format!("PRE_TX_GATE:{code}"));
+        }
+        self.flush_can_and_commit()
+            .map_err(|e| format!("disable flush: {e}"))?;
+
+        // Phase 2b: Causal wire-delivery barrier via read-only REG_READ(RID_CTRL_MODE) on 0x7FF.
+        if !self.in_active_control_release() {
+            self.begin_tx_tick();
+        }
+        let mut barrier_tx_seq: [Option<u64>; MAX_MODE_JOINTS] = [None; MAX_MODE_JOINTS];
+        for i in 0..n {
+            match self.send_with_commissioning_gate(
+                TxKind::Refresh,
+                Some(start_stamp),
+                None,
+                pre_tx_gate,
+                |d| Some(damiao::build_read_register_frame(d.motor_ids[i], damiao::RID_CTRL_MODE)),
+            ) {
+                Ok((_, tx_seq, _, _)) => barrier_tx_seq[i] = Some(tx_seq),
+                Err(Ok(code)) => return Err(format!("PRE_TX_GATE:{code}")),
+                Err(Err(r)) => {
+                    return Err(format!(
+                        "barrier read to J{} failed: {}",
+                        i + 1,
+                        Self::refusal_to_driver_err(r)
+                    ));
+                }
+            }
+        }
+        self.pending_stop_check(Some(start_stamp))
+            .map_err(|e| format!("barrier flush inhibited: {e}"))?;
+        self.flush_can_and_commit()
+            .map_err(|e| format!("barrier flush: {e}"))?;
+
+        let mut barrier_ack_seq: [Option<u64>; MAX_MODE_JOINTS] = [None; MAX_MODE_JOINTS];
+        let barrier_wait_start = self.now();
+        loop {
+            let _ = self.read_joint_states();
+            if self.last_read_drained {
+                self.harvest_mit_expiry_barrier_acks_into(n, &barrier_tx_seq, &mut barrier_ack_seq);
+                if (0..n).all(|i| barrier_ack_seq[i].is_some()) {
+                    break;
+                }
+            }
+            if let Err(code) = pre_tx_gate() {
+                return Err(format!("PRE_TX_GATE:{code}"));
+            }
+            if self.since(barrier_wait_start) >= REGISTER_REPLY_TIMEOUT {
+                break;
+            }
+            self.pause(Duration::from_micros(500));
+        }
+
+        // Phase 2c: Post-barrier 0xCC status refresh for any acked axis lacking post-barrier feedback.
+        if !self.in_active_control_release() {
+            self.begin_tx_tick();
+        }
+        let mut refresh_sent = false;
+        for i in 0..n {
+            let Some(ack_seq) = barrier_ack_seq[i] else {
+                continue;
+            };
+            if self.last_feedback_seq[i] <= ack_seq {
+                match self.send_with_commissioning_gate(
+                    TxKind::Refresh,
+                    Some(start_stamp),
+                    None,
+                    pre_tx_gate,
+                    |d| Some(damiao::build_refresh_frame(d.motor_ids[i])),
+                ) {
+                    Ok(_) => refresh_sent = true,
+                    Err(Ok(code)) => return Err(format!("PRE_TX_GATE:{code}")),
+                    Err(Err(r)) => {
+                        return Err(format!(
+                            "status refresh to J{} failed: {}",
+                            i + 1,
+                            Self::refusal_to_driver_err(r)
+                        ));
+                    }
+                }
+            }
+        }
+        if refresh_sent {
+            self.pending_stop_check(Some(start_stamp))
+                .map_err(|e| format!("refresh flush inhibited: {e}"))?;
+            self.flush_can_and_commit()
+                .map_err(|e| format!("refresh flush: {e}"))?;
+        }
+
+        let confirm_wait_start = self.now();
+        loop {
+            let _ = self.read_joint_states();
+            let now = self.now();
+            if (0..n).all(|i| {
+                self.is_mit_expiry_axis_causally_disabled(
+                    now,
+                    i,
+                    req_boundary,
+                    &dis_tx,
+                    &barrier_ack_seq,
+                )
+            }) {
+                break;
+            }
+            if let Err(code) = pre_tx_gate() {
+                return Err(format!("PRE_TX_GATE:{code}"));
+            }
+            if self.since(confirm_wait_start) >= REGISTER_REPLY_TIMEOUT {
+                break;
+            }
+            self.pause(Duration::from_micros(500));
+        }
+
+        let check_now = self.now();
+        let missing: Vec<String> = (0..n)
+            .filter(|&i| {
+                !self.is_mit_expiry_axis_causally_disabled(
+                    check_now,
+                    i,
+                    req_boundary,
+                    &dis_tx,
+                    &barrier_ack_seq,
+                )
+            })
+            .map(|i| format!("J{}", i + 1))
+            .collect();
+        if !missing.is_empty() {
+            return Err(format!(
+                "{} did not report post-recovery feedback after disable",
+                missing.join(", ")
+            ));
+        }
+        let boundary = self
+            .last_enable_command_rx_seq
+            .map_or(req_boundary, |s| s.max(req_boundary));
+        self.last_mit_recovery_rx_seq = Some(boundary);
+        self.mit_fence = None;
+        self.is_enabled = false;
+        self.is_enabling = false;
+        self.motor_energized_mask = 0;
+        self.disable_dispatched_mask = 0;
         Ok(())
     }
 
@@ -20103,6 +20462,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         self.mit_expiry_budgeted_boundary = None;
         self.mit_expiry_cleared_mask = 0;
         self.mit_expiry_disable_tx_seq = [None; MAX_MODE_JOINTS];
+        self.mit_expiry_barrier_tx_seq = [None; MAX_MODE_JOINTS];
+        self.mit_expiry_barrier_ack_seq = [None; MAX_MODE_JOINTS];
+        self.mit_expiry_refresh_tx_seq = [None; MAX_MODE_JOINTS];
     }
 
     // PR2-LEDGER: draws TX from the release's existing TX budget via `ensure_tx_pass()` (never
@@ -20148,7 +20510,12 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     self.mit_expiry_budgeted_boundary = Some(self.rx_empty_seq);
                     self.mit_expiry_cleared_mask = 0;
                     self.mit_expiry_disable_tx_seq = [None; MAX_MODE_JOINTS];
+                    self.mit_expiry_barrier_tx_seq = [None; MAX_MODE_JOINTS];
+                    self.mit_expiry_barrier_ack_seq = [None; MAX_MODE_JOINTS];
+                    self.mit_expiry_refresh_tx_seq = [None; MAX_MODE_JOINTS];
                     self.last_mit_recovery_rx_seq = None;
+                    self.comm_reg_reply_len = 0;
+                    self.comm_reg_reply_overflow = false;
                 }
                 Ok((_, false)) | Err(_) => return Ok(false),
             }
@@ -20204,9 +20571,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             return Ok(false);
         }
 
-        // If a prior release already transmitted `CMD_DISABLE`, drain RX to empty FIRST so
-        // causal post-disable replies from earlier releases are observed before deciding whether
-        // to retry or commit.
+        // Drain existing replies whenever any axis already transmitted CMD_DISABLE, then harvest
+        // barrier acks and reset any axis that reported an adverse post-barrier status.
         if self.mit_expiry_disable_tx_seq[..n].iter().any(Option::is_some) {
             let rx_budget = self.remaining_release_rx_budget(crate::rt_core::ops::RX_FRAME_BUDGET);
             if rx_budget == 0 {
@@ -20220,41 +20586,57 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             }
         }
 
-        let is_axis_causally_disabled = |d: &Self, now: Instant, idx: usize| -> bool {
-            let Some((tx_seq, tx_at)) = d.mit_expiry_disable_tx_seq[idx] else {
-                return false;
-            };
-            !d.awaiting_rx_boundary
-                && d.last_read_drained
-                && d.last_feedback_seq[idx] > req_boundary
-                && d.last_feedback_seq[idx] > tx_seq
-                && d.motor_status[idx] == 0
-                && d.last_feedback_instant[idx].is_some_and(|t| {
-                    t >= tx_at
-                        && now.saturating_duration_since(t) <= STOPPED_DISABLE_FEEDBACK_MAX_AGE
-                })
-                && d.feedback_queue_bound[idx]
-                    .is_some_and(|b| now.saturating_duration_since(b) <= STOPPED_DISABLE_FEEDBACK_MAX_AGE)
+        let harvest_and_reset_adverse = |d: &mut Self| {
+            if d.comm_reg_reply_overflow {
+                d.comm_reg_reply_len = 0;
+                d.comm_reg_reply_overflow = false;
+                for i in 0..n {
+                    if d.mit_expiry_barrier_ack_seq[i].is_none() {
+                        d.mit_expiry_barrier_tx_seq[i] = None;
+                    }
+                }
+            }
+            let mut acks = d.mit_expiry_barrier_ack_seq;
+            d.harvest_mit_expiry_barrier_acks_into(n, &d.mit_expiry_barrier_tx_seq, &mut acks);
+            d.mit_expiry_barrier_ack_seq = acks;
+            for i in 0..n {
+                if let Some(ack_seq) = d.mit_expiry_barrier_ack_seq[i] {
+                    if d.last_feedback_seq[i] > ack_seq && d.motor_status[i] != 0 {
+                        d.mit_expiry_disable_tx_seq[i] = None;
+                        d.mit_expiry_barrier_tx_seq[i] = None;
+                        d.mit_expiry_barrier_ack_seq[i] = None;
+                        d.mit_expiry_refresh_tx_seq[i] = None;
+                        if i < 64 {
+                            d.disable_dispatched_mask &= !(1u64 << i);
+                            if d.motor_status[i] >= 8 {
+                                d.mit_expiry_cleared_mask &= !(1u64 << i);
+                            }
+                        }
+                    }
+                }
+            }
         };
 
-        // Phase 2: send CMD_DISABLE via TxKind::DisableRequested (enforcing Rule A′ AND final
-        // `pre_tx_gate` authority/E-stop checks at transmit time on every frame) to every motor
-        // not yet causally confirmed disabled after its own disable TX.
+        harvest_and_reset_adverse(self);
+
+        // Phase 2a: Send CMD_DISABLE via TxKind::MitRecoveryDisable (budgeted against TxBudget
+        // AND enforcing Rule A′ + pre_tx_gate at CAN submission).
         self.clear_cached_targets();
         let mut dis_sent = false;
+        let mut any_disable_pending = false;
         let mut pass_dispatched_mask = 0u64;
         let mut pass_disable_tx_seq: [Option<(u64, Instant)>; MAX_MODE_JOINTS] =
             [None; MAX_MODE_JOINTS];
-        let check_now = self.now();
         for i in 0..n {
-            if rx_empty_after_disable && is_axis_causally_disabled(self, check_now, i) {
+            if self.mit_expiry_disable_tx_seq[i].is_some() {
                 continue;
             }
             if self.now() >= deadline {
+                any_disable_pending = true;
                 break;
             }
             match self.send_with_commissioning_gate(
-                TxKind::DisableRequested { started_at },
+                TxKind::MitRecoveryDisable { started_at },
                 Some(start_stamp),
                 Some(Deadline { at: deadline }),
                 pre_tx_gate,
@@ -20265,19 +20647,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     if i < 64 {
                         pass_dispatched_mask |= 1u64 << i;
                     }
-                    // Record causal TX boundary for this axis. If an earlier disable in this
-                    // recovery already received an adverse (non-zero) reply, advance to this
-                    // fresh disable's boundary; if no reply has arrived yet, keep the earliest
-                    // disable boundary so an in-flight delayed disable reply still satisfies it.
-                    let advance = match self.mit_expiry_disable_tx_seq[i] {
-                        None => true,
-                        Some((prev_seq, _)) => {
-                            self.last_feedback_seq[i] > prev_seq && self.motor_status[i] != 0
-                        }
-                    };
-                    if advance {
-                        pass_disable_tx_seq[i] = Some((tx_seq, tx_started));
-                    }
+                    pass_disable_tx_seq[i] = Some((tx_seq, tx_started));
                 }
                 Err(Ok(_revoked)) => return Ok(false),
                 Err(Err(TxRefusal::TorqueOffWouldDrop)) => return Err(ArmDriverError::TorqueOffWouldDrop),
@@ -20286,9 +20656,13 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     return Err(ArmDriverError::DisableRequestExpired);
                 }
                 Err(Err(TxRefusal::DisableWaitEvidence | TxRefusal::Deferred | TxRefusal::DeadlinePassed)) => {
+                    any_disable_pending = true;
                     break;
                 }
-                Err(Err(TxRefusal::Transport(e))) if e.is_tx_backpressure() => break,
+                Err(Err(TxRefusal::Transport(e))) if e.is_tx_backpressure() => {
+                    any_disable_pending = true;
+                    break;
+                }
                 Err(Err(r)) => return Err(Self::refusal_to_driver_err(r)),
             }
         }
@@ -20303,8 +20677,6 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 }
             }
             self.disable_dispatched_mask |= pass_dispatched_mask;
-            // Must observe an empty RX queue AFTER flushing disable frames before declaring
-            // any axis confirmed disabled (never ignore incomplete drain or exhausted budget).
             let rx_budget = self.remaining_release_rx_budget(crate::rt_core::ops::RX_FRAME_BUDGET);
             if rx_budget == 0 {
                 return Ok(false);
@@ -20316,12 +20688,169 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 Ok((_, false)) | Err(_) => return Ok(false),
             }
         }
+        if any_disable_pending {
+            return Ok(false);
+        }
+
+        // Phase 2b: Causal delivery barrier — one read-only REG_READ(RID_CTRL_MODE) on 0x7FF
+        // strictly after CMD_DISABLE for each disabled axis that has not yet sent its barrier.
+        let mut barrier_sent = false;
+        let mut any_barrier_pending = false;
+        let mut pass_barrier_tx_seq: [Option<u64>; MAX_MODE_JOINTS] = [None; MAX_MODE_JOINTS];
+        for i in 0..n {
+            if self.mit_expiry_disable_tx_seq[i].is_none()
+                || self.mit_expiry_barrier_tx_seq[i].is_some()
+            {
+                continue;
+            }
+            if self.now() >= deadline {
+                any_barrier_pending = true;
+                break;
+            }
+            match self.send_with_commissioning_gate(
+                TxKind::Refresh,
+                Some(start_stamp),
+                Some(Deadline { at: deadline }),
+                pre_tx_gate,
+                |d| Some(damiao::build_read_register_frame(d.motor_ids[i], damiao::RID_CTRL_MODE)),
+            ) {
+                Ok((_, tx_seq, _, _)) => {
+                    barrier_sent = true;
+                    pass_barrier_tx_seq[i] = Some(tx_seq);
+                }
+                Err(Ok(_revoked)) => return Ok(false),
+                Err(Err(TxRefusal::Deferred | TxRefusal::DeadlinePassed)) => {
+                    any_barrier_pending = true;
+                    break;
+                }
+                Err(Err(TxRefusal::Transport(e))) if e.is_tx_backpressure() => {
+                    any_barrier_pending = true;
+                    break;
+                }
+                Err(Err(r)) => return Err(Self::refusal_to_driver_err(r)),
+            }
+        }
+        if barrier_sent {
+            self.pending_stop_check(Some(start_stamp))?;
+            if self.flush_cutoff_exceeded() || self.flush_can_and_commit().is_err() {
+                return Ok(false);
+            }
+            for i in 0..n {
+                if let Some(tx_seq) = pass_barrier_tx_seq[i] {
+                    self.mit_expiry_barrier_tx_seq[i] = Some(tx_seq);
+                }
+            }
+            let rx_budget = self.remaining_release_rx_budget(crate::rt_core::ops::RX_FRAME_BUDGET);
+            if rx_budget == 0 {
+                return Ok(false);
+            }
+            match self.commissioning_drain_rx_step(rx_budget, deadline) {
+                Ok((_, true)) => {
+                    rx_empty_after_disable = true;
+                }
+                Ok((_, false)) | Err(_) => return Ok(false),
+            }
+            harvest_and_reset_adverse(self);
+        }
+        if any_barrier_pending {
+            return Ok(false);
+        }
+
+        // Phase 2c: Post-barrier 0xCC status refresh for any acked axis whose feedback has not yet
+        // advanced past its barrier ack (or whose post-ack state-0 sample aged past 100 ms).
+        let mut refresh_sent = false;
+        let mut any_refresh_pending = false;
+        let mut pass_refresh_tx_seq: [Option<u64>; MAX_MODE_JOINTS] = [None; MAX_MODE_JOINTS];
+        let check_now_2c = self.now();
+        for i in 0..n {
+            let Some(ack_seq) = self.mit_expiry_barrier_ack_seq[i] else {
+                continue;
+            };
+            let stale_post_ack = self.last_feedback_seq[i] > ack_seq
+                && self.motor_status[i] == 0
+                && !self.is_mit_expiry_axis_causally_disabled(
+                    check_now_2c,
+                    i,
+                    req_boundary,
+                    &self.mit_expiry_disable_tx_seq,
+                    &self.mit_expiry_barrier_ack_seq,
+                );
+            if stale_post_ack
+                && self
+                    .mit_expiry_refresh_tx_seq[i]
+                    .is_some_and(|r_seq| self.last_feedback_seq[i] > r_seq)
+            {
+                self.mit_expiry_refresh_tx_seq[i] = None;
+            }
+            if (self.last_feedback_seq[i] <= ack_seq || stale_post_ack)
+                && self.mit_expiry_refresh_tx_seq[i].is_none()
+            {
+                if self.now() >= deadline {
+                    any_refresh_pending = true;
+                    break;
+                }
+                match self.send_with_commissioning_gate(
+                    TxKind::Refresh,
+                    Some(start_stamp),
+                    Some(Deadline { at: deadline }),
+                    pre_tx_gate,
+                    |d| Some(damiao::build_refresh_frame(d.motor_ids[i])),
+                ) {
+                    Ok((_, tx_seq, _, _)) => {
+                        refresh_sent = true;
+                        pass_refresh_tx_seq[i] = Some(tx_seq);
+                    }
+                    Err(Ok(_revoked)) => return Ok(false),
+                    Err(Err(TxRefusal::Deferred | TxRefusal::DeadlinePassed)) => {
+                        any_refresh_pending = true;
+                        break;
+                    }
+                    Err(Err(TxRefusal::Transport(e))) if e.is_tx_backpressure() => {
+                        any_refresh_pending = true;
+                        break;
+                    }
+                    Err(Err(r)) => return Err(Self::refusal_to_driver_err(r)),
+                }
+            }
+        }
+        if refresh_sent {
+            self.pending_stop_check(Some(start_stamp))?;
+            if self.flush_cutoff_exceeded() || self.flush_can_and_commit().is_err() {
+                return Ok(false);
+            }
+            for i in 0..n {
+                if let Some(tx_seq) = pass_refresh_tx_seq[i] {
+                    self.mit_expiry_refresh_tx_seq[i] = Some(tx_seq);
+                }
+            }
+            let rx_budget = self.remaining_release_rx_budget(crate::rt_core::ops::RX_FRAME_BUDGET);
+            if rx_budget == 0 {
+                return Ok(false);
+            }
+            match self.commissioning_drain_rx_step(rx_budget, deadline) {
+                Ok((_, true)) => {
+                    rx_empty_after_disable = true;
+                }
+                Ok((_, false)) | Err(_) => return Ok(false),
+            }
+            harvest_and_reset_adverse(self);
+        }
+        if any_refresh_pending {
+            return Ok(false);
+        }
+
         if !rx_empty_after_disable || !self.last_read_drained {
             return Ok(false);
         }
         let post_now = self.now();
         for i in 0..n {
-            if !is_axis_causally_disabled(self, post_now, i) {
+            if !self.is_mit_expiry_axis_causally_disabled(
+                post_now,
+                i,
+                req_boundary,
+                &self.mit_expiry_disable_tx_seq,
+                &self.mit_expiry_barrier_ack_seq,
+            ) {
                 return Ok(false);
             }
         }
@@ -20331,6 +20860,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         self.is_enabled = false;
         self.is_enabling = false;
         self.motor_energized_mask = 0;
+        self.disable_dispatched_mask = 0;
         Ok(true)
     }
 
@@ -26660,9 +27190,10 @@ mod tx_chokepoint_tests {
         }
     }
 
-    fn all_tx_kinds(started_at: Instant) -> [TxKind; 13] {
+    fn all_tx_kinds(started_at: Instant) -> [TxKind; 14] {
         [
             TxKind::DisableRequested { started_at },
+            TxKind::MitRecoveryDisable { started_at },
             TxKind::ClientParkDisable { started_at },
             TxKind::DisableProtective { reason: DisableProtectiveReason::Thermal },
             TxKind::DisableProtective { reason: DisableProtectiveReason::ProcessExit },
@@ -26730,6 +27261,7 @@ mod tx_chokepoint_tests {
         // Step 3: Stop gate by TxKind.
         match kind {
             TxKind::DisableRequested { .. }
+            | TxKind::MitRecoveryDisable { .. }
             | TxKind::DisableProtective { .. }
             | TxKind::DisableProbe => Expected::Sent,
             TxKind::ClientParkDisable { .. } => match stop {
@@ -26807,6 +27339,9 @@ mod tx_chokepoint_tests {
                         let kind = match kind {
                             TxKind::DisableRequested { .. } => {
                                 TxKind::DisableRequested { started_at: clock.now() }
+                            }
+                            TxKind::MitRecoveryDisable { .. } => {
+                                TxKind::MitRecoveryDisable { started_at: clock.now() }
                             }
                             TxKind::ClientParkDisable { .. } => {
                                 TxKind::ClientParkDisable { started_at: clock.now() }
@@ -26966,6 +27501,9 @@ mod tx_chokepoint_tests {
                 TxKind::DisableRequested { .. } => {
                     TxKind::DisableRequested { started_at: clock.now() }
                 }
+                TxKind::MitRecoveryDisable { .. } => {
+                    TxKind::MitRecoveryDisable { started_at: clock.now() }
+                }
                 other => other,
             };
             let stops = StopRequests::new();
@@ -26983,6 +27521,7 @@ mod tx_chokepoint_tests {
             if matches!(
                 kind,
                 TxKind::DisableRequested { .. }
+                    | TxKind::MitRecoveryDisable { .. }
                     | TxKind::DisableProtective { .. }
                     | TxKind::DisableProbe
             ) {

@@ -607,6 +607,12 @@ impl ArmDriver for ZeroOffsetDriver {
         (count, dropped)
     }
     fn mit_expiry_recover(&mut self) -> Result<(), String> { self.inner.mit_expiry_recover() }
+    fn mit_expiry_recover_with_gate(
+        &mut self,
+        pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> Result<(), String> {
+        self.inner.mit_expiry_recover_with_gate(pre_tx_gate)
+    }
     fn mit_fresh_status(&mut self) -> Result<Vec<u8>, String> { self.inner.mit_fresh_status() }
     fn acknowledge_mit_fence_trip(&mut self) { self.inner.acknowledge_mit_fence_trip() }
     fn mit_feedback_after_recovery(&self, dof: usize) -> bool { self.inner.mit_feedback_after_recovery(dof) }

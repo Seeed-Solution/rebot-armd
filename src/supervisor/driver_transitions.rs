@@ -3569,6 +3569,16 @@ impl SupervisorInner {
         // register readback below nor the driver's enable runs under an active MIT owner
         // (no dynamic output during the reads, no silent mode restore).
         if self.mit_active() {
+            #[cfg(not(target_arch = "wasm32"))]
+            if self.driver.is_some() && self.driver_supports_nonblocking_mode_switch() {
+                self.mit.armed_ok = false;
+                self.active_trajectory = None;
+                self.servo_target = None;
+                self.mit.revoke_pending = true;
+                return Err(SafetyError::ClearFaultRejected(
+                    "MIT_HAND_BACK_REQUIRED: MIT tracking must hand back via PosVelHandback before rearm".into(),
+                ));
+            }
             self.mit.armed_ok = false;
             if let Err(e) = self.mit_hand_back("rearm") {
                 // not at rest: the authorization is gone, so the motion brakes to rest and MIT

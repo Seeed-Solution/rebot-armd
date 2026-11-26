@@ -2568,6 +2568,12 @@ impl crate::supervisor::SupervisorInner {
     /// Hand the MIT joints back to confirmed stationary position control (gravity compensation
     /// entry, park, rearm). Needs fresh stationary feedback. Nothing to do when MIT is not active.
     pub fn mit_hand_back(&mut self, why: &str) -> Result<(), String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.driver.is_some()
+            && (self.rt_executor_owned || self.driver_supports_nonblocking_mode_switch())
+        {
+            return Err("synchronous mit_hand_back is forbidden for non-blocking ModeSwitch drivers; use PosVelHandback session".into());
+        }
         if self.mit.owner != MitOwner::Active { return Ok(()); }
         if !self.mit_feedback_fresh() || !self.tracking_stationary_evidence() || self.commanded_velocities.iter().any(|v| *v != 0.0) {
             return Err(format!("MIT tracking hands back ({why}) only at rest with fresh feedback"));
@@ -2765,8 +2771,32 @@ impl crate::supervisor::SupervisorInner {
                         return PreRecoveryOutcome::Authority(auth_err);
                     }
                 }
+                let recovery_baseline = owner.capture_baseline();
+                let mut auth_abort: Option<crate::rt_core::requests::lease::ClearFaultAuthorityError> = None;
+                let mut estop_abort = false;
+                let mut pre_tx_gate = || -> Result<(), &'static str> {
+                    if owner.new_estop_since(recovery_baseline) {
+                        estop_abort = true;
+                        return Err("ESTOP_ACTIVE");
+                    }
+                    if let Some(auth) = authority {
+                        if let Err(auth_err) =
+                            recheck_clear_fault_authority_readonly(owner, auth, std::time::Instant::now())
+                        {
+                            auth_abort = Some(auth_err);
+                            return Err("AUTH_REVOKED");
+                        }
+                    }
+                    Ok(())
+                };
                 let pre = drv.feedback_seqs();
-                let r = drv.mit_expiry_recover();
+                let r = drv.mit_expiry_recover_with_gate(&mut pre_tx_gate);
+                if let Some(auth_err) = auth_abort {
+                    return PreRecoveryOutcome::Authority(auth_err);
+                }
+                if estop_abort {
+                    return PreRecoveryOutcome::ClearRefusal(ClearRefusal::EStopActive);
+                }
                 PreRecoveryOutcome::Ran(pre, r)
             });
             match outcome {
