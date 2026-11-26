@@ -671,7 +671,7 @@ pub async fn dataset_episodes(
     let svc = supervisor
         .read_services(crate::rt_core::publish::ReadRequirements::identity())
         .await?;
-    let store = supervisor.episode_store().await;
+    let store = supervisor.try_episode_store().await?;
     let offsets = svc.identity.joint_zero_offsets.clone();
     let list = tokio::task::spawn_blocking(move || store.list_with(&offsets)).await
         .map_err(|e| ArmError::Internal(format!("episode listing failed: {e}")))?
@@ -687,7 +687,7 @@ pub async fn dataset_episode_delete(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     supervisor.ensure_episodes_loaded().await?;
-    let store = supervisor.episode_store().await;
+    let store = supervisor.try_episode_store().await?;
     store.path_of(&id).map_err(ArmError::from)?;
     supervisor.take_episode_for_delete(&id).await?;
     let id2 = id.clone();
@@ -713,7 +713,7 @@ pub async fn get_episodes(
     let svc = supervisor
         .read_services(crate::rt_core::publish::ReadRequirements::identity())
         .await?;
-    let store = supervisor.episode_store().await;
+    let store = supervisor.try_episode_store().await?;
     let episodes = store.list_episodes(
         q.dataset.as_deref(),
         q.limit,
@@ -733,7 +733,7 @@ pub async fn get_episode(
     let svc = supervisor
         .read_services(crate::rt_core::publish::ReadRequirements::identity())
         .await?;
-    let store = supervisor.episode_store().await;
+    let store = supervisor.try_episode_store().await?;
     store.view(&id, &svc.identity.joint_zero_offsets).map(Json)
         .ok_or_else(|| ArmError::from(crate::recording::StoreError::NotFound(id)).into())
 }
@@ -744,7 +744,7 @@ pub async fn get_episode_data(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Response, ApiError> {
     supervisor.ensure_episodes_loaded().await?;
-    let store = supervisor.episode_store().await;
+    let store = supervisor.try_episode_store().await?;
     if !store.contains(&id) { return Err(ArmError::from(crate::recording::StoreError::NotFound(id)).into()); }
     let path = store.path_of(&id).map_err(ArmError::from)?;
     let bytes = tokio::task::spawn_blocking(move || std::fs::read(path)).await
@@ -770,6 +770,8 @@ pub async fn episodes_import(
     State(supervisor): State<Arc<ArmSupervisor>>,
     mut multipart: axum::extract::Multipart,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    static NEXT_IMPORT_TOKEN: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(1 << 62);
     supervisor.ensure_episodes_loaded().await?;
     let (mut parquet, mut sidecar) = (None, None);
     while let Some(field) = multipart.next_field().await.map_err(|e| import_invalid("multipart", e.to_string()))? {
@@ -787,7 +789,7 @@ pub async fn episodes_import(
     let svc = supervisor
         .read_services(crate::rt_core::publish::ReadRequirements::identity())
         .await?;
-    let store = supervisor.episode_store().await;
+    let store = supervisor.try_episode_store().await?;
     let ctx = crate::recording::import::ImportContext {
         joint_names: svc.identity.joint_names.clone(),
         limits: svc.identity.limits.clone(),
@@ -798,6 +800,7 @@ pub async fn episodes_import(
         fps: f64::from(svc.identity.control_frequency_hz),
     };
     if !store.enabled() { return Err(ArmError::from(crate::recording::StoreError::Disabled).into()); }
+    let import_token = NEXT_IMPORT_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let result = tokio::task::spawn_blocking(move || -> Result<(crate::recording::EpisodeSidecar, bool), ApiError> {
         let parquet_kv = crate::recording::read_parquet_kv_from_bytes(parquet.clone())
             .map_err(|e| import_invalid("schema", format!("parquet: {e}")))?;
@@ -806,10 +809,18 @@ pub async fn episodes_import(
             .map_err(|e| import_invalid(e.reason, e.message))?;
         let mut sc = checked.sidecar;
         sc.id = crate::recording::new_ulid();
-        store.check_capacity().map_err(ArmError::from)?;
+        let _cap_slot = store.reserve_capacity_slot().map_err(ArmError::from)?;
         store.check_free_for_start().map_err(ArmError::from)?;
-        if !store.has_dataset(&sc.dataset) { store.create_dataset(&sc.dataset, "").map_err(ArmError::from)?; }
-        store.publish_complete_episode(&sc, &frames, None, None, true).map_err(ArmError::from)?;
+        let _dataset_pin = store.ensure_and_pin_dataset(&sc.dataset).map_err(ArmError::from)?;
+        if let Err(first_err) = store.publish_complete_episode(&sc, &frames, None, Some(import_token), false) {
+            if store.path_of(&sc.id).is_ok_and(|p| p.is_file()) {
+                store
+                    .publish_complete_episode(&sc, &frames, None, Some(import_token), false)
+                    .map_err(ArmError::from)?;
+            } else {
+                return Err(ArmError::from(first_err).into());
+            }
+        }
         Ok((sc, checked.stale))
     }).await.map_err(|e| ArmError::Internal(format!("import failed: {e}")))?;
     let (sc, stale) = result?;
@@ -840,7 +851,7 @@ pub async fn get_sequence(
 /// `GET /api/v1/datasets`: `{datasets: [{name, episodes, duration_s, bytes, created_at, description}]}`.
 pub async fn get_datasets(State(supervisor): State<Arc<ArmSupervisor>>) -> Result<Json<serde_json::Value>, ApiError> {
     supervisor.ensure_episodes_loaded().await?;
-    let store = supervisor.episode_store().await;
+    let store = supervisor.try_episode_store().await?;
     Ok(Json(serde_json::json!({"enabled": store.enabled(), "datasets": store.datasets()})))
 }
 

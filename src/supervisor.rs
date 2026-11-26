@@ -13990,7 +13990,7 @@ impl ArmSupervisor {
         loop {
             let rev0 = self.sequences_revision();
             self.check_episode_delete_allowed(id).await?;
-            let store = self.episode_store().await;
+            let store = self.try_episode_store().await?;
             match store.take_if_unpinned_and_rev_matches(id, &self.sequences_revision, rev0) {
                 TakeEpisodeOutcome::Removed => return Ok(true),
                 TakeEpisodeOutcome::NotFound => return Ok(false),
@@ -14016,18 +14016,35 @@ impl ArmSupervisor {
     }
 
     /// Linearizably verifies every episode in `dataset` is unreferenced (saved, running, or
-    /// reserved) and atomically removes all of them from the `EpisodeStore` catalog.
-    pub async fn take_dataset_episodes_for_delete(&self, dataset: &str) -> Result<Vec<String>, ArmError> {
+    /// reserved) and no recording/import pins `dataset`, then atomically removes all of them from
+    /// the `EpisodeStore` catalog while returning a [`DatasetDeleteGuard`] blocking new pins.
+    pub async fn take_dataset_episodes_for_delete(
+        &self,
+        dataset: &str,
+    ) -> Result<(Vec<String>, crate::recording::store::DatasetDeleteGuard), ArmError> {
         use crate::recording::store::TakeDatasetOutcome;
         loop {
             let rev0 = self.sequences_revision();
-            let store = self.episode_store().await;
+            let store = self.try_episode_store().await?;
             let ids = store.episodes_of(dataset);
             for id in &ids {
                 self.check_episode_delete_allowed(id).await?;
             }
-            match store.take_dataset_if_unpinned_and_rev_matches(&ids, &self.sequences_revision, rev0) {
-                TakeDatasetOutcome::Removed(taken) => return Ok(taken),
+            match store.take_dataset_if_unpinned_and_rev_matches(
+                dataset,
+                &ids,
+                &self.sequences_revision,
+                rev0,
+            ) {
+                TakeDatasetOutcome::Removed(taken, guard) => return Ok((taken, guard)),
+                TakeDatasetOutcome::DatasetRecordingBusy => {
+                    return Err(ArmError::detailed(
+                        409,
+                        "RECORDER_BUSY",
+                        "a recording into this dataset is running",
+                        serde_json::json!({}),
+                    ));
+                }
                 TakeDatasetOutcome::Pinned(pinned_id) => {
                     let mut users = self
                         .published_config()
@@ -15633,7 +15650,8 @@ impl ArmSupervisor {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn executor_recorder(&self) -> &Arc<crate::teach::ExecutorRecorder> {
+    #[doc(hidden)]
+    pub fn executor_recorder(&self) -> &Arc<crate::teach::ExecutorRecorder> {
         &self.executor_recorder
     }
 

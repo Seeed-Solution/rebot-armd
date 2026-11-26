@@ -1475,15 +1475,10 @@ async fn run(
             if !ctx.alive().await { return end(&ctx, Err(Stop::Cancelled), current).await; }
             match sup.stop_recording_as(crate::teach::Stopper::Owner(owner.clone()), true, Some("ok"), None).await {
                 Ok(crate::teach::Stopped::Saved { sidecar, .. }) => {
+                    // On executor, `run_stop_recording_executor` attaches `sidecar.id` to
+                    // `rich_action_cache` inside its `SequenceCommitGuard` before releasing the barrier.
                     if !ctx.is_executor() {
                         sup.inner().write().await.update_action(id, |a| a.episodes.push(sidecar.id.clone()));
-                    } else {
-                        let ep_id = sidecar.id.clone();
-                        sup.update_sequence_rich_status_off_rt(id, |a| {
-                            if !a.episodes.iter().any(|existing| existing == &ep_id) {
-                                a.episodes.push(ep_id);
-                            }
-                        });
                     }
                 }
                 Ok(_) => {}

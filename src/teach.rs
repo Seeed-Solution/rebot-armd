@@ -149,10 +149,12 @@ fn executor_unavailable() -> ArmError {
 struct SidecarMeta {
     joint_names: Vec<String>,
     profile_id: Option<String>,
+    dof: usize,
     arm_dof: usize,
     gripper_joint: Option<usize>,
     tool_id: String,
     tool_config_digest: String,
+    tool_digest_hash: u64,
 }
 
 impl SidecarMeta {
@@ -160,10 +162,12 @@ impl SidecarMeta {
         Self {
             joint_names: id.joint_names.clone(),
             profile_id: id.profile_id.clone(),
+            dof: id.dof,
             arm_dof: id.arm_dof,
             gripper_joint: id.gripper_joint,
             tool_id: id.tool_id.clone(),
             tool_config_digest: id.tool_config_digest.clone(),
+            tool_digest_hash: crate::rt_core::ops::tool_digest_hash(&id.tool_config_digest),
         }
     }
 }
@@ -346,12 +350,14 @@ impl ExecutorRecorder {
             client_id: caller.client_id.clone().unwrap_or_default(),
         };
         let mut st = self.lock_state();
+        let stopping = st.stopping;
         if let Some(r) = st.active.as_mut() {
             if let RecorderOwner::Client { connection, client_id } = &mut r.owner {
                 if *connection == caller.connection {
                     return r.owner.clone();
                 }
-                if r.owner_lost_at.is_some()
+                if !stopping
+                    && r.owner_lost_at.is_some()
                     && caller.client_id.as_deref() == Some(client_id.as_str())
                 {
                     *connection = caller.connection.clone();
@@ -361,6 +367,24 @@ impl ExecutorRecorder {
                         r.id
                     );
                     return r.owner.clone();
+                }
+            }
+        }
+        if let Some(p) = st.pending_start.as_mut() {
+            if let RecorderOwner::Client { connection, client_id } = &mut p.owner {
+                if *connection == caller.connection {
+                    return p.owner.clone();
+                }
+                if p.owner_lost_at.is_some()
+                    && caller.client_id.as_deref() == Some(client_id.as_str())
+                {
+                    *connection = caller.connection.clone();
+                    p.owner_lost_at = None;
+                    tracing::info!(
+                        "Pending recording start {} taken back by '{client_id}' on a new connection",
+                        p.op_id
+                    );
+                    return p.owner.clone();
                 }
             }
         }
@@ -413,13 +437,31 @@ impl ExecutorRecorderCtx {
             .ok()
             .or_else(|| self.hub.read_services(ReadRequirements::identity()).ok())
     }
+
+    async fn wait_identity_matching(
+        &self,
+        mut predicate: impl FnMut(&crate::rt_core::publish::ServiceSnapshot) -> bool,
+    ) -> Option<Arc<crate::rt_core::publish::ServiceSnapshot>> {
+        for attempt in 0..50 {
+            if let Some(svc) = self.read_identity_or_latest() {
+                if predicate(&svc) {
+                    return Some(svc);
+                }
+            }
+            if attempt < 49 {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+        None
+    }
 }
 
 fn validate_stop_target(
     st: &ExecutorRecorderState,
     by: &Stopper,
     save: bool,
-) -> Result<(), ArmError> {
+    expected_op_id: Option<u64>,
+) -> Result<u64, ArmError> {
     let Some(r) = st.active.as_ref() else {
         return Err(crate::recording::RecordingError::InvalidState {
             action: if save { "save".into() } else { "discard".into() },
@@ -427,6 +469,15 @@ fn validate_stop_target(
         }
         .into());
     };
+    if let Some(exp) = expected_op_id {
+        if r.op_id != exp {
+            return Err(rejected(
+                409,
+                "RECORDING_REPLACED",
+                "the targeted recording ended; another one runs",
+            ));
+        }
+    }
     match by {
         Stopper::Owner(o) => {
             if o != &r.owner {
@@ -460,7 +511,7 @@ fn validate_stop_target(
             }
         }
     }
-    Ok(())
+    Ok(r.op_id)
 }
 
 async fn start_recording_executor(
@@ -591,23 +642,42 @@ async fn run_start_recording_executor(
     };
 
     // Bind start-boundary `joint_zero` to the exact `start_calib_rev` active on RT at admission.
+    // Fail closed if published identity never matches `ack.start_calib_rev` within the bounded wait.
     let start_svc = if svc.revisions.calibration == ack.start_calib_rev {
         svc
+    } else if let Some(matched) = ctx
+        .wait_identity_matching(|s| s.revisions.calibration == ack.start_calib_rev)
+        .await
+    {
+        matched
     } else {
-        ctx.read_identity_or_latest().unwrap_or(svc)
+        if let Ok(Ok(fence)) = ctx
+            .handle
+            .stop_recorder_session(op_id, ack.session_id, false, "calib_mismatch", 0)
+            .await
+        {
+            let asm = Arc::clone(&assembly);
+            let _ = tokio::task::spawn_blocking(move || asm.collect_session(fence)).await;
+        }
+        clear_pending(&ctx.recorder);
+        return Err(rejected(
+            409,
+            "CALIBRATION_CHANGED",
+            "calibration revision changed during recording start; retry",
+        ));
     };
     let joint_zero = JointZeroStamp::of(&start_svc.identity.joint_zero_offsets);
     let start_meta = SidecarMeta::from_identity(&start_svc.identity);
     let recorded_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let label = owner.label();
 
-    {
+    let label = {
         let mut st = ctx.recorder.lock_state();
-        let inherited_lost = st
-            .pending_start
-            .take()
-            .filter(|p| p.op_id == op_id)
-            .and_then(|p| p.owner_lost_at);
+        let pending = st.pending_start.take().filter(|p| p.op_id == op_id);
+        let (effective_owner, inherited_lost) = match pending {
+            Some(p) => (p.owner, p.owner_lost_at),
+            None => (owner, None),
+        };
+        let label = effective_owner.label();
         st.phase = EpisodeState::Recording;
         st.last_episode_id = id.clone();
         st.last_output_path = path.clone();
@@ -616,7 +686,7 @@ async fn run_start_recording_executor(
             op_id,
             id: id.clone(),
             session_id: ack.session_id,
-            owner,
+            owner: effective_owner,
             options,
             recorded_at,
             started: Instant::now(),
@@ -629,7 +699,8 @@ async fn run_start_recording_executor(
             assembly,
             dataset_pin: Some(Arc::new(dataset_pin)),
         });
-    }
+        label
+    };
 
     tracing::info!("Recording {id} started on executor (owner {label}, session {})", ack.session_id.0);
     let mon_id = id.clone();
@@ -646,6 +717,7 @@ async fn stop_recording_executor(
     save: bool,
     outcome: Option<&str>,
     writer: Option<ParquetWriter>,
+    expected_op_id: Option<u64>,
 ) -> Result<Stopped, ArmError> {
     let outcome_str = outcome.unwrap_or("ok");
     if !["ok", "aborted"].contains(&outcome_str) {
@@ -653,21 +725,26 @@ async fn stop_recording_executor(
     }
     let outcome_owned = outcome_str.to_string();
     let monitor = matches!(by, Stopper::Monitor { .. });
-    {
+    let target_op_id = {
         let st = ctx.recorder.lock_state();
-        validate_stop_target(&st, &by, save)?;
-    }
-    if save && !monitor {
-        // Pre-fence capacity check: refused while still recording so episodes can be deleted and retried.
+        validate_stop_target(&st, &by, save, expected_op_id)?
+    };
+    let capacity_slot = if save && !monitor {
+        // Pre-fence capacity reservation: refused while still recording so episodes can be deleted
+        // and retried, and reserves a slot so a concurrent import cannot steal it before publish.
         let s2 = ctx.store.clone();
-        tokio::task::spawn_blocking(move || s2.check_capacity())
-            .await
-            .map_err(|e| ArmError::Internal(format!("episode check failed: {e}")))??;
-    }
+        Some(
+            tokio::task::spawn_blocking(move || s2.reserve_capacity_slot())
+                .await
+                .map_err(|e| ArmError::Internal(format!("episode check failed: {e}")))??,
+        )
+    } else {
+        None
+    };
 
     let (op_id, session_id, require_alive_action_id, rt_shared) = {
         let mut st = ctx.recorder.lock_state();
-        validate_stop_target(&st, &by, save)?;
+        let cur_op_id = validate_stop_target(&st, &by, save, Some(target_op_id))?;
         if st.stopping {
             return Err(crate::recording::RecordingError::InvalidState {
                 action: if save { "save".into() } else { "discard".into() },
@@ -677,7 +754,7 @@ async fn stop_recording_executor(
         }
         let r = st.active.as_ref().expect("validated above");
         let req_action = if save { r.owner.bound_action_id() } else { 0 };
-        let tup = (r.op_id, r.session_id, req_action, Arc::clone(&r.rt_shared));
+        let tup = (cur_op_id, r.session_id, req_action, Arc::clone(&r.rt_shared));
         st.stopping = true;
         tup
     };
@@ -694,6 +771,7 @@ async fn stop_recording_executor(
             session_id,
             require_alive_action_id,
             rt_shared,
+            capacity_slot,
         )
         .await;
         let _ = reply_tx.send(res);
@@ -714,11 +792,25 @@ async fn run_stop_recording_executor(
     session_id: SessionId,
     require_alive_action_id: u64,
     rt_shared: Arc<RtRecorderShared>,
+    capacity_slot: Option<store::CapacitySlotGuard>,
 ) -> Result<Stopped, ArmError> {
     let monitor = matches!(by, Stopper::Monitor { .. });
     let stop_reason: &'static str = match &by {
         Stopper::Monitor { reason, .. } => reason,
         Stopper::Owner(_) => if save { "saved" } else { "discarded" },
+    };
+
+    // Acquire sequence commit barrier BEFORE sending `stop_recorder_session` to RT so even if a
+    // STOP arrives immediately after RT accepts the repeat commit (before this task resumes),
+    // `armd-dispatch` holds the sequence terminal until publication finishes (or this guard drops
+    // on RT refusal/error).
+    let _commit_guard = if save && require_alive_action_id != 0 {
+        Some(
+            ctx.terminal_capture
+                .acquire_sequence_commit_guard(require_alive_action_id, Arc::clone(&ctx.hub)),
+        )
+    } else {
+        None
     };
 
     let rt_reply = ctx
@@ -747,8 +839,7 @@ async fn run_stop_recording_executor(
             }
             return Err(crate::safety::SafetyError::Stopped.into());
         }
-        Ok(Err(RecorderStopError::NotActive | RecorderStopError::SessionMismatch))
-        | Err(_) => {
+        Ok(Err(RecorderStopError::NotActive | RecorderStopError::SessionMismatch)) => {
             if let Some(closed) = rt_shared.load_closed_fence_for(op_id, session_id) {
                 closed
             } else {
@@ -761,6 +852,35 @@ async fn run_stop_recording_executor(
                     return Ok(Stopped::Discarded);
                 }
                 return Err(executor_unavailable());
+            }
+        }
+        Err(owner_err) => {
+            if let Some(closed) = rt_shared.load_closed_fence_for(op_id, session_id) {
+                closed
+            } else {
+                match owner_err {
+                    // Never clear `active` or report `Discarded` without an RT close fence when
+                    // RT is still running and the maintenance queue was saturated or timed out.
+                    OwnerError::QueueFull => {
+                        ctx.recorder.lock_state().stopping = false;
+                        return Err(rejected(503, "MOTION_BUSY", "RT maintenance queue is full"));
+                    }
+                    OwnerError::TimedOut => {
+                        ctx.recorder.lock_state().stopping = false;
+                        return Err(rejected(503, "DEADLINE_EXPIRED", "RT recorder stop timed out"));
+                    }
+                    OwnerError::Stopped | OwnerError::ShutdownNotConfirmed | OwnerError::Protocol => {
+                        let mut st = ctx.recorder.lock_state();
+                        st.stopping = false;
+                        st.active = None;
+                        st.phase = EpisodeState::Discarded;
+                        st.last_frame_count = 0;
+                        if !save {
+                            return Ok(Stopped::Discarded);
+                        }
+                        return Err(executor_unavailable());
+                    }
+                }
             }
         }
     };
@@ -780,17 +900,6 @@ async fn run_stop_recording_executor(
         }
         return Err(crate::safety::SafetyError::Stopped.into());
     }
-
-    // Acquire sequence commit barrier BEFORE transitioning so terminal delivery waits until
-    // the RT-committed repeat episode is durably published and mirrored into `rich_action_cache`.
-    let _commit_guard = if save && require_alive_action_id != 0 {
-        Some(
-            ctx.terminal_capture
-                .acquire_sequence_commit_guard(require_alive_action_id, Arc::clone(&ctx.hub)),
-        )
-    } else {
-        None
-    };
 
     let Some(rec) = ({
         let mut st = ctx.recorder.lock_state();
@@ -831,6 +940,7 @@ async fn run_stop_recording_executor(
 
     if !save {
         drop(rec.dataset_pin);
+        drop(capacity_slot);
         tracing::info!("Recording {} discarded", rec.id);
         return Ok(Stopped::Discarded);
     }
@@ -843,6 +953,7 @@ async fn run_stop_recording_executor(
         st.finalizing_dataset = None;
         st.last_frame_count = 0;
         drop(rec.dataset_pin);
+        drop(capacity_slot);
         return Err(crate::recording::RecordingError::EmptyEpisode.into());
     }
     if dropped > 0 {
@@ -854,18 +965,32 @@ async fn run_stop_recording_executor(
     }
 
     // Bind stop-boundary metadata (`joint_names`, `profile_id`, `arm_dof`, `gripper_joint`, `fps`,
-    // `tool_id`, `tool_config_digest`) coherently to the RT stop fence.
-    let stop_meta = match ctx.read_identity_or_latest() {
-        Some(svc)
-            if svc.revisions.tool_digest_hash == fence.stop_tool_digest_hash
-                && svc.identity.dof == usize::from(fence.stop_dof) =>
-        {
-            SidecarMeta::from_identity(&svc.identity)
-        }
-        Some(svc) if svc.identity.dof == usize::from(fence.stop_dof) => {
-            SidecarMeta::from_identity(&svc.identity)
-        }
-        _ => rec.start_meta.clone(),
+    // `tool_id`, `tool_config_digest`) strictly to the RT stop fence (`stop_tool_digest_hash`,
+    // `stop_dof`). Fail closed if metadata diverges rather than stamping mismatched tool identity.
+    let stop_meta = if let Some(svc) = ctx
+        .wait_identity_matching(|s| {
+            s.revisions.tool_digest_hash == fence.stop_tool_digest_hash
+                && s.identity.dof == usize::from(fence.stop_dof)
+        })
+        .await
+    {
+        SidecarMeta::from_identity(&svc.identity)
+    } else if rec.start_meta.tool_digest_hash == fence.stop_tool_digest_hash
+        && rec.start_meta.dof == usize::from(fence.stop_dof)
+    {
+        rec.start_meta.clone()
+    } else {
+        let mut st = ctx.recorder.lock_state();
+        st.phase = EpisodeState::Discarded;
+        st.finalizing_dataset = None;
+        st.last_frame_count = 0;
+        drop(rec.dataset_pin);
+        drop(capacity_slot);
+        return Err(rejected(
+            409,
+            "TOOL_MISMATCH",
+            "tool metadata diverged from RT stop fence; episode discarded",
+        ));
     };
 
     let has_gripper_motion = store::episode_has_gripper_motion(&frames, stop_meta.gripper_joint);
@@ -909,10 +1034,22 @@ async fn run_stop_recording_executor(
 
     let sc = sidecar.clone();
     let store = ctx.store.clone();
-    let enforce_capacity = !monitor;
+    // Manual saves already hold a `CapacitySlotGuard` acquired before RT stop; monitor saves bypass cap.
+    let enforce_capacity = !monitor && capacity_slot.is_none();
     let commit_token = Some(rec.op_id);
     let write_res = tokio::task::spawn_blocking(move || {
-        store.publish_complete_episode(&sc, &frames, writer, commit_token, enforce_capacity)
+        match store.publish_complete_episode(&sc, &frames, writer, commit_token, enforce_capacity) {
+            Ok(p) => Ok(p),
+            Err(first_err) => {
+                // If parquet rename already succeeded and sidecar/dir-sync failed transiently,
+                // retry once with the same `commit_token` to complete post-rename recovery.
+                if store.path_of(&sc.id).is_ok_and(|p| p.is_file()) {
+                    store.publish_complete_episode(&sc, &frames, None, commit_token, enforce_capacity)
+                } else {
+                    Err(first_err)
+                }
+            }
+        }
     })
     .await
     .unwrap_or_else(|e| {
@@ -938,6 +1075,7 @@ async fn run_stop_recording_executor(
         }
     }
     drop(rec.dataset_pin);
+    drop(capacity_slot);
 
     let path = write_res?;
     if require_alive_action_id != 0 {
@@ -1018,6 +1156,7 @@ async fn executor_monitor(
             save,
             None,
             None,
+            Some(op_id),
         )
         .await
         {
@@ -1029,7 +1168,6 @@ async fn executor_monitor(
                 return;
             }
             Err(ArmError::Rejected { ref code, .. }) if code == "RECORDING_REPLACED" => {
-                // Reconnected owner or replaced recording: re-check loop if still same id.
                 let still_same = {
                     let st = ctx.recorder.lock_state();
                     st.active.as_ref().is_some_and(|r| r.id == id && r.op_id == op_id)
@@ -1037,6 +1175,18 @@ async fn executor_monitor(
                 if !still_same {
                     return;
                 }
+            }
+            Err(ArmError::Rejected { ref code, .. })
+                if code == "MOTION_BUSY" || code == "DEADLINE_EXPIRED" =>
+            {
+                tracing::warn!("Recording {id}: transient stop ({reason}) error ({code}); retrying");
+                continue;
+            }
+            Err(ArmError::Recording(crate::recording::RecordingError::InvalidState {
+                state: EpisodeState::Finalizing,
+                ..
+            })) => {
+                continue;
             }
             Err(e) => {
                 tracing::warn!("Recording {id}: stop ({reason}) failed: {e}");
@@ -1122,7 +1272,7 @@ impl ArmSupervisor {
         if handle.is_exited() {
             return Err(executor_unavailable());
         }
-        let store = self.episode_store().await;
+        let store = self.try_episode_store().await?;
         Ok(ExecutorRecorderCtx {
             recorder: Arc::clone(self.executor_recorder()),
             handle,
@@ -1301,7 +1451,7 @@ impl ArmSupervisor {
         match self.owner_mode() {
             OWNER_EXECUTOR => {
                 let ctx = self.executor_recorder_ctx().await?;
-                stop_recording_executor(ctx, by, save, outcome, writer).await
+                stop_recording_executor(ctx, by, save, outcome, writer, None).await
             }
             OWNER_LEGACY => stop_recording(self.inner(), by, save, outcome, writer).await,
             _ => Err(executor_unavailable()),
@@ -1420,7 +1570,11 @@ impl ArmSupervisor {
 
     /// True if a recording targeting `dataset` is starting, running, or finalizing.
     pub async fn is_recording_dataset(&self, dataset: &str) -> bool {
-        if self.episode_store().await.is_dataset_pinned(dataset) {
+        if self
+            .try_episode_store()
+            .await
+            .is_ok_and(|s| s.is_dataset_pinned(dataset))
+        {
             return true;
         }
         match self.owner_mode() {
@@ -1575,9 +1729,23 @@ impl ArmSupervisor {
         });
     }
 
+    /// Fail-closed episode store lookup: NEVER falls back to `SupervisorLock` when
+    /// `owner_mode != OWNER_LEGACY` (returns `503 CONFIG_UNAVAILABLE` if executor exited or
+    /// ownership is transitioning).
+    pub async fn try_episode_store(&self) -> Result<EpisodeStore, ArmError> {
+        self.published_config().await.map(|c| c.episodes.clone())
+    }
+
     pub async fn episode_store(&self) -> EpisodeStore {
         if let Ok(pub_cfg) = self.published_config().await {
             return pub_cfg.episodes.clone();
+        }
+        if self.owner_mode() != OWNER_LEGACY {
+            return self
+                .published_config_hub()
+                .latest()
+                .map(|c| c.episodes.clone())
+                .unwrap_or_else(|| EpisodeStore::new(None));
         }
         self.inner().read().await.episodes.clone()
     }
@@ -1656,14 +1824,18 @@ async fn stop_recording(
         }
         inner.episodes.clone()
     };
-    if save && !monitor {
+    let _capacity_slot = if save && !monitor {
         // refused before the frames leave the recorder, so the recording can still be
-        // saved after episodes were deleted, or discarded
+        // saved after episodes were deleted, or discarded; reserves a slot against concurrent imports
         let s2 = st.clone();
-        tokio::task::spawn_blocking(move || s2.check_capacity())
-            .await
-            .map_err(|e| ArmError::Internal(format!("episode check failed: {e}")))??;
-    }
+        Some(
+            tokio::task::spawn_blocking(move || s2.reserve_capacity_slot())
+                .await
+                .map_err(|e| ArmError::Internal(format!("episode check failed: {e}")))??,
+        )
+    } else {
+        None
+    };
     let (rec, _path, direct_frames, sidecar_base, fence) = {
         let mut inner = lock.write().await;
         let Some(r) = inner.recording.clone() else {
@@ -1800,7 +1972,7 @@ async fn stop_recording(
         frames_dropped: (dropped > 0).then_some(dropped),
     };
     let sc = sidecar.clone();
-    let enforce_capacity = !monitor;
+    let enforce_capacity = !monitor && _capacity_slot.is_none();
     let (frames, result) = tokio::task::spawn_blocking(move || {
         let result = st.publish_complete_episode(&sc, &frames, writer, None, enforce_capacity);
         (frames, result)
@@ -1821,11 +1993,15 @@ async fn stop_recording(
             e.to_string(),
         ))),
     };
-    lock.write()
+    let finish_res = lock
+        .write()
         .await
         .recorder
-        .finish_save(frames, parquet_result)?;
+        .finish_save(frames, parquet_result);
+    drop(_capacity_slot);
+    // Preserve typed `StoreError` (e.g. `507 EPISODES_FULL`) instead of wrapping it into `RECORDING_ERROR`.
     let path = result?;
+    finish_res?;
     tracing::info!(
         "Recording {} saved ({} frames, {:.1} s{})",
         rec.id,
@@ -1981,7 +2157,7 @@ pub async fn lease_free(
         ));
     }
     sup.ensure_episodes_loaded().await?;
-    let st = sup.episode_store().await;
+    let st = sup.try_episode_store().await?;
     if !st.enabled() {
         return Err(StoreError::Disabled.into());
     }
@@ -2094,9 +2270,10 @@ pub async fn lease_free(
                 if !st.has_dataset(&name) && ids.is_empty() {
                     return Err(StoreError::DatasetNotFound(name).into());
                 }
-                let taken = sup.take_dataset_episodes_for_delete(&name).await?;
+                let (taken, _del_guard) = sup.take_dataset_episodes_for_delete(&name).await?;
                 let s2 = st.clone();
                 let deleted = blocking(move || s2.delete_dataset_taken_files(&name, &taken)).await?;
+                drop(_del_guard);
                 Ok(json!({"deleted_episodes": deleted}))
             } else {
                 let s2 = st.clone();

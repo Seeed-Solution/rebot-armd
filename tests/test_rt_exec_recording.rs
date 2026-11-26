@@ -742,7 +742,64 @@ async fn dual_owner_run_sequence_with_record_repeats_and_stop_discard() {
         assert_eq!(of_run[0].sidecar.repeat_index, Some(0));
         assert_eq!(rig.sup.get_recording_state().await.0, EpisodeState::Discarded);
 
+        // Executor-only deterministic race proof (Blocker 2): STOP arrives immediately after RT
+        // commits repeat 0 while the off-thread parquet writer is held open. `SequenceCommitGuard`
+        // must hold sequence terminal delivery until publication completes so the terminal still
+        // carries the RT-committed repeat episode ID.
         if owner == Owner::Executor {
+            let (entered_rx, release_tx) = st.arm_test_publish_pause();
+            let ack3 = common::rpc(
+                &mut ws,
+                gen,
+                ep,
+                "/api/v1/action/run_sequence",
+                json!({"id": sid2, "repeat": 2, "record": {"dataset": "default"}}),
+            )
+            .await;
+            assert_eq!(ack3["type"], "command_ack", "executor delayed-writer run: {ack3}");
+            let aid3 = ack3["action_id"].as_u64().unwrap();
+
+            // Wait until repeat 0 has passed RT stop fence and entered Phase 2 parquet publish.
+            let paused_ep_id = tokio::task::spawn_blocking(move || {
+                entered_rx
+                    .recv_timeout(Duration::from_secs(15))
+                    .expect("repeat 0 never entered publish pause")
+            })
+            .await
+            .unwrap();
+
+            // Issue STOP while repeat 0's parquet write is still held open!
+            let stop_r3 = common::rpc(&mut ws, gen, ep, "/api/v1/motion/stop", json!({})).await;
+            assert_eq!(stop_r3["type"], "command_ack", "stop during delayed writer: {stop_r3}");
+
+            // Hold writer briefly and assert observation does NOT leak a premature terminal missing `paused_ep_id`.
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            let obs_held = rig.sup.get_observation().await;
+            if let Some(a) = obs_held.action.as_ref().filter(|a| a.id == aid3) {
+                assert!(
+                    a.is_running() || a.episodes.contains(&paused_ep_id),
+                    "sequence terminal leaked before RT-committed episode published: {a:?}"
+                );
+            }
+            let _ = release_tx.send(());
+
+            let done3 = wait_action_done(&rig.sup, aid3, 10.0).await;
+            assert_eq!(
+                (done3.state.as_str(), done3.code.as_deref()),
+                ("cancelled", Some("STOPPED")),
+                "delayed writer STOP terminal: {done3:?}"
+            );
+            assert_eq!(
+                done3.episodes,
+                vec![paused_ep_id.clone()],
+                "RT-committed repeat episode must never be omitted from terminal: {done3:?}"
+            );
+            assert!(
+                st.get(&paused_ep_id).is_some(),
+                "committed repeat episode must exist in store"
+            );
+            rig.wait_idle(Duration::from_secs(3)).await;
+
             assert_eq!(rig.sup.inner().control_thread_attempts(), 0);
             assert_eq!(rig.exec.as_ref().unwrap().stats().total_allocs(), AllocCounts::ZERO);
         }
@@ -780,8 +837,8 @@ async fn executor_idempotent_publish_delayed_writer_config_interleaving_and_auth
         .unwrap();
     assert_eq!(rest_unauth.status().as_u16(), 403);
 
-    // (b) Idempotent publish_complete_episode by (id, commit_token) + post-parquet-rename recovery
-    //     + strict Exists for separate operation reusing id + empty frames rejected
+    // (b) Idempotent publish_complete_episode by (id, commit_token) + real post-parquet-rename
+    //     recovery + custom-writer missing-file refusal + capacity slot reservation + strict Exists
     let frames = vec![
         RecordFrame { timestamp: 0.0, observation_state: vec![0.0; 7], action: vec![0.0; 7] },
         RecordFrame { timestamp: 0.02, observation_state: vec![0.1; 7], action: vec![0.1; 7] },
@@ -824,9 +881,71 @@ async fn executor_idempotent_publish_delayed_writer_config_interleaving_and_auth
     let err_none = store.publish_complete_episode(&sc, &frames, None, None, true).unwrap_err();
     assert_eq!(err_none.status_code(), (409, "EPISODE_EXISTS"));
 
+    // Custom writer returning Ok(()) without creating parquet must fail closed (Minor 1).
+    let mut sc_noop = sc.clone();
+    sc_noop.id = "idem_ep_noop_writer".into();
+    let noop_err = store
+        .publish_complete_episode(
+            &sc_noop,
+            &frames,
+            Some(Box::new(|_p, _f| Ok(()))),
+            Some(55),
+            true,
+        )
+        .unwrap_err();
+    assert_eq!(noop_err.status_code(), (500, "EPISODES_IO_ERROR"));
+    assert!(store.get(&sc_noop.id).is_none());
+
+    // Real post-parquet-rename recovery: writer creates parquet file on disk then returns a fault
+    // before sidecar/catalog commit; different token fails EPISODE_EXISTS; same token recovers!
+    let mut sc_rec = sc.clone();
+    sc_rec.id = "idem_ep_post_rename".into();
+    let first_fail = store.publish_complete_episode(
+        &sc_rec,
+        &frames,
+        Some(Box::new(|p, f| {
+            armd::recording::write_episode_parquet(p, f, None, &[])?;
+            Err(armd::recording::ParquetRecordingError::Io(std::io::Error::other(
+                "simulated fault after parquet rename",
+            )))
+        })),
+        Some(77),
+        true,
+    );
+    assert!(first_fail.is_err(), "first attempt must fail after parquet rename");
+    assert!(store.path_of(&sc_rec.id).unwrap().is_file(), "parquet file must exist on disk");
+    assert!(store.get(&sc_rec.id).is_none(), "catalog must not expose incomplete episode before sidecar");
+    let wrong_tok = store
+        .publish_complete_episode(&sc_rec, &frames, None, Some(88), true)
+        .unwrap_err();
+    assert_eq!(wrong_tok.status_code(), (409, "EPISODE_EXISTS"));
+    let recovered_path = store
+        .publish_complete_episode(&sc_rec, &frames, None, Some(77), true)
+        .expect("retry with same commit_token must complete post-rename recovery");
+    assert!(recovered_path.is_file());
+    assert!(store.get(&sc_rec.id).is_some(), "recovered episode must be cataloged");
+
+    // Capacity slot reservation prevents two concurrent writers at cap-1 from both passing (Major 6).
+    let (_, cur_files) = store.usage().unwrap();
+    let slot_guard = store
+        .reserve_capacity_slot_with(u64::MAX, cur_files + 1)
+        .expect("first slot at cap-1 must reserve");
+    let cap_race = store
+        .reserve_capacity_slot_with(u64::MAX, cur_files + 1)
+        .unwrap_err();
+    assert_eq!(cap_race.status_code(), (507, "EPISODES_FULL"));
+    drop(slot_guard);
+
     // (c) Delayed parquet writer on executor: RT keeps ticking with 0 allocs/locks, dataset stays
-    //     pinned during Finalizing, and RECORDER_BUSY blocks concurrent start until writer completes.
+    //     pinned during Finalizing, RECORDER_BUSY blocks concurrent start, AND force-delete does
+    //     not remove existing catalog episodes when dataset is pinned (Major 7).
     store.create_dataset("pin_ds", "").unwrap();
+    let mut sc_existing = sc.clone();
+    sc_existing.id = "pin_ds_existing_ep".into();
+    sc_existing.dataset = "pin_ds".into();
+    store
+        .publish_complete_episode(&sc_existing, &frames, None, Some(101), true)
+        .unwrap();
     rig.sup
         .start_recording_as(
             armd::teach::RecorderOwner::LegacyRest,
@@ -856,9 +975,19 @@ async fn executor_idempotent_publish_delayed_writer_config_interleaving_and_auth
     tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(5)).unwrap())
         .await
         .unwrap();
-    // While finalizing: new start -> RECORDER_BUSY, dataset delete -> RECORDER_BUSY
+    // While finalizing: new start -> RECORDER_BUSY, dataset force-delete -> RECORDER_BUSY without removing catalog!
     let busy_err = rig.sup.start_recording(None, None).await.unwrap_err();
     assert_eq!(armd::api::rest::ApiError::from(busy_err).code.as_deref(), Some("RECORDER_BUSY"));
+    let ds_take_err = rig
+        .sup
+        .take_dataset_episodes_for_delete("pin_ds")
+        .await
+        .unwrap_err();
+    assert_eq!(armd::api::rest::ApiError::from(ds_take_err).code.as_deref(), Some("RECORDER_BUSY"));
+    assert!(
+        store.contains("pin_ds_existing_ep"),
+        "failed force-delete while pinned must preserve existing catalog entries"
+    );
     let ds_pin_err = store.delete_dataset("pin_ds", true).unwrap_err();
     assert_eq!(ds_pin_err.status_code(), (409, "RECORDER_BUSY"));
 
@@ -952,15 +1081,43 @@ async fn executor_idempotent_publish_delayed_writer_config_interleaving_and_auth
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn executor_recorder_rt_zero_alloc_zero_lock_saturation_and_teardown_proof() {
+    // 0) Empty-episode save refusal on RT: long period ensures 0 samples pushed when save arrives;
+    //    RT must refuse EMPTY_EPISODE while keeping the session live so subsequent frames save!
+    {
+        let slow_rig = DualRig::new(Owner::Executor, Duration::from_millis(80), None).await;
+        let slow_exec = slow_rig.exec.as_ref().unwrap().clone();
+        let slow_shared = slow_exec.recorder_shared();
+        // Start right after a tick publish so the next tick is ~80 ms away.
+        slow_rig.sup.start_recording(None, None).await.unwrap();
+        if slow_shared.live_pushed() == 0 {
+            let empty_err = slow_rig.sup.save_recording().await.unwrap_err();
+            assert_eq!(
+                armd::api::rest::ApiError::from(empty_err).code.as_deref(),
+                Some("EMPTY_EPISODE"),
+                "empty save must be refused with EMPTY_EPISODE"
+            );
+            assert_eq!(
+                slow_rig.sup.get_recording_state().await.0,
+                EpisodeState::Recording,
+                "empty save refusal must leave session live"
+            );
+        }
+        slow_rig.wait_frames(2).await;
+        let saved = slow_rig.sup.save_recording().await.unwrap();
+        assert!(saved.is_file());
+        slow_rig.shutdown();
+        assert_eq!(slow_exec.stats().total_allocs(), AllocCounts::ZERO);
+    }
+
     let rig = DualRig::new(Owner::Executor, Duration::from_millis(2), None).await;
     let exec = rig.exec.as_ref().unwrap().clone();
     let assembly = exec.recorder_assembly();
+    let shared = exec.recorder_shared();
 
     // 1) Hold RecorderAssembly mutex to force stream ring overflow (> RECORDER_STREAM_CAPACITY)
     //    while armd-control ticks: proves drop-newest with 0 RT alloc and 0 lock attempts!
     rig.sup.start_recording(None, None).await.unwrap();
     let guard = assembly.lock_for_test();
-    let shared = exec.recorder_shared();
     let dl = Instant::now() + Duration::from_secs(5);
     while shared.live_dropped.load(Ordering::Acquire) < 20 {
         assert!(
@@ -988,11 +1145,33 @@ async fn executor_recorder_rt_zero_alloc_zero_lock_saturation_and_teardown_proof
     assert!(sc2.frames >= 15);
     assert_eq!(sc2.frames_dropped, None, "clean session after saturation must report 0 drops: {sc2:?}");
 
-    // 3) Leave an active recording open across executor teardown -> clean revocation & 0 allocs
+    // 3) Leave an active recording open across ordinary executor teardown -> must revoke
+    //    SessionSlot::Recorder with a frozen close fence (Major 1), fail closed on post-exit
+    //    store lookup with 0 SupervisorLock fallback (Major 11), and keep 0 RT allocs/locks!
     rig.sup.start_recording(None, None).await.unwrap();
     rig.wait_frames(4).await;
-    assert_eq!(rig.sup.inner().control_thread_attempts(), 0, "0 SupervisorLock attempts on armd-control");
-    assert_eq!(assembly.control_thread_lock_attempts(), 0, "0 RecorderAssembly lock attempts on armd-control");
-    assert_eq!(exec.stats().total_allocs(), AllocCounts::ZERO, "0 RT heap allocs/frees across start/sample/overflow/save/restart");
+    let active_op_id = shared.live_op_id.load(Ordering::Acquire);
+    let active_sid = armd::rt_core::session::SessionId(shared.live_session.load(Ordering::Acquire));
+    assert!(active_op_id != 0 && active_sid.0 != 0);
+
+    let sup_after = rig.sup.clone();
     rig.shutdown();
+
+    let closed_fence = shared
+        .load_closed_fence_for(active_op_id, active_sid)
+        .expect("ordinary executor teardown must freeze a close fence for active recorder");
+    assert!(closed_fence.revoked, "teardown close fence must be marked revoked");
+    assert_eq!(shared.live_session.load(Ordering::Acquire), 0);
+
+    // Post-exit store lookup must fail closed (503 CONFIG_UNAVAILABLE) without touching SupervisorLock.
+    let post_exit_err = sup_after.try_episode_store().await.unwrap_err();
+    assert_eq!(
+        armd::api::rest::ApiError::from(post_exit_err).code.as_deref(),
+        Some("CONFIG_UNAVAILABLE")
+    );
+
+    assert_eq!(sup_after.inner().control_thread_attempts(), 0, "0 SupervisorLock attempts on armd-control (including teardown)");
+    assert_eq!(assembly.control_thread_lock_attempts(), 0, "0 RecorderAssembly lock attempts on armd-control");
+    assert_eq!(sup_after.executor_recorder().control_thread_lock_attempts(), 0, "0 ExecutorRecorder lock attempts on armd-control");
+    assert_eq!(exec.stats().total_allocs(), AllocCounts::ZERO, "0 RT heap allocs/frees across start/sample/overflow/save/restart/teardown");
 }

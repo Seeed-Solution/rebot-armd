@@ -1007,6 +1007,9 @@ pub(crate) struct TerminalCaptureChannel {
     /// whose RT-committed repeat episode is still finishing disk/catalog publication so terminal
     /// delivery waits until `episodes` and `EpisodeStore` are finalized (never touched on RT).
     sequence_commit_inflight: AtomicU64,
+    /// Condvar pair signaled when `sequence_commit_inflight` clears, allowing normal shutdown
+    /// finalization to wait boundedly for an already-committed repeat episode before draining.
+    sequence_commit_wait: (Mutex<()>, std::sync::Condvar),
 }
 
 /// Off-RT RAII guard holding [`TerminalCaptureChannel::sequence_commit_inflight`] while an
@@ -1026,6 +1029,14 @@ impl Drop for SequenceCommitGuard {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             );
+            let _g = self
+                .channel
+                .sequence_commit_wait
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            self.channel.sequence_commit_wait.1.notify_all();
+            drop(_g);
             self.hub.wake();
         }
     }
@@ -1048,6 +1059,7 @@ impl TerminalCaptureChannel {
             test_push_cap: AtomicUsize::new(TERMINAL_CAPTURE_RING_CAPACITY),
             drain_paused: AtomicBool::new(false),
             sequence_commit_inflight: AtomicU64::new(0),
+            sequence_commit_wait: (Mutex::new(()), std::sync::Condvar::new()),
         });
         let tx = TerminalCaptureTx {
             producer,
@@ -1062,6 +1074,11 @@ impl TerminalCaptureChannel {
         hub: Arc<StateHub>,
     ) -> SequenceCommitGuard {
         if action_id != 0 {
+            let _g = self
+                .sequence_commit_wait
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             self.sequence_commit_inflight.store(action_id, Ordering::Release);
         }
         SequenceCommitGuard {
@@ -1074,6 +1091,35 @@ impl TerminalCaptureChannel {
     #[inline]
     pub(crate) fn is_sequence_commit_inflight(&self, action_id: u64) -> bool {
         action_id != 0 && self.sequence_commit_inflight.load(Ordering::Acquire) == action_id
+    }
+
+    /// Bounded off-RT wait used by normal shutdown drain so an RT-committed sequence repeat
+    /// finishes publishing its episode ID into `rich_action_cache` before the terminal drains.
+    pub(crate) fn wait_for_sequence_commit_idle(&self, timeout: std::time::Duration) {
+        if self.sequence_commit_inflight.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        let mut g = self
+            .sequence_commit_wait
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        while self.sequence_commit_inflight.load(Ordering::Acquire) != 0 {
+            let rem = deadline.saturating_duration_since(std::time::Instant::now());
+            if rem.is_zero() {
+                break;
+            }
+            let (ng, res) = self
+                .sequence_commit_wait
+                .1
+                .wait_timeout(g, rem)
+                .unwrap_or_else(|e| e.into_inner());
+            g = ng;
+            if res.timed_out() && self.sequence_commit_inflight.load(Ordering::Acquire) != 0 {
+                break;
+            }
+        }
     }
 
     #[inline]
@@ -1208,15 +1254,26 @@ impl TerminalCaptureChannel {
         if action.id == 0 || action.kind.as_str() != "sequence" {
             return;
         }
+        // Acquire-load `sequence_commit_inflight` BEFORE locking `rich_action_cache`:
+        // - If true, hold back any terminal state to `"running"` so polling clients never observe
+        //   a terminal missing an RT-committed repeat episode.
+        // - If false, Acquire synchronizes with `SequenceCommitGuard::drop`'s Release, guaranteeing
+        //   `rich_action_cache` already holds the committed episode ID.
+        let commit_inflight = self.is_sequence_commit_inflight(action.id);
         let cache = self.lock_rich_cache();
-        let Some(cached) = cache
+        if let Some(cached) = cache
             .iter()
             .find(|e| e.id == action.id)
             .and_then(|e| e.status.as_ref())
-        else {
-            return;
-        };
-        merge_sequence_rich_fields(action, cached);
+        {
+            merge_sequence_rich_fields(action, cached);
+        }
+        drop(cache);
+        if commit_inflight && !action.is_running() {
+            action.state = HolderLabel::new("running");
+            action.code = None;
+            action.finished_at = None;
+        }
     }
 
     /// Off-RT mirror for >256-byte persistence worker error messages so delayed recovery past
@@ -1335,10 +1392,10 @@ impl TerminalCaptureChannel {
         let consumed_seq = latest_snap.map_or(0, |s| s.meta.seq);
         let latest_obs = latest_snap.map(|s| &s.obs);
         while let Ok(head) = rx.peek() {
+            if respect_publish_barrier && self.is_sequence_commit_inflight(head.action_id) {
+                break;
+            }
             if enforce_barrier {
-                if self.is_sequence_commit_inflight(head.action_id) {
-                    break;
-                }
                 if let Some(req_seq) = head.publish_seq {
                     if consumed_seq < req_seq {
                         break;

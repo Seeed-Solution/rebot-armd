@@ -2720,6 +2720,7 @@ impl BrokerDispatcher {
         //    callbacks so a slow or stalled sink cannot defeat the emergency deadline.
         if allow_callbacks {
             if let Some((ch, terminals, template_obs)) = self.terminal_capture_drain.as_ref() {
+                ch.wait_for_sequence_commit_idle(Duration::from_secs(5));
                 let final_snap = self.hub.latest();
                 let _ = ch.drain_into(
                     terminals,
@@ -2926,10 +2927,10 @@ impl OffThreadSinks {
         tick_stats: &crate::diagnostics::tick::LockFreeTickStats,
     ) {
         self.drain_diag(tick_stats);
+        self.estop_reg.lock().unwrap_or_else(|e| e.into_inner()).drain();
         let _ = self
             .recorder_assembly
-            .drain_bounded(super::recorder::RECORDER_DISPATCH_DRAIN_BOUND);
-        self.estop_reg.lock().unwrap_or_else(|e| e.into_inner()).drain();
+            .try_drain_bounded(super::recorder::RECORDER_DISPATCH_DRAIN_BOUND);
         {
             let mut rx = self.reclaim_state_rx.lock().unwrap_or_else(|e| e.into_inner());
             let mut ret_tx = self.reclaim_return_tx.lock().unwrap_or_else(|e| e.into_inner());
@@ -6925,6 +6926,7 @@ impl ControlState {
                 save,
                 reason,
                 require_alive_action_id,
+                ctx.now,
             )),
             MaintenanceOp::ProbeOwnedPayload { payload } => {
                 returned_probe = Some(payload);
@@ -10519,6 +10521,13 @@ fn control_thread_main_inner(
         } else {
             "STOPPED"
         });
+        core.revoke_recorder_for_teardown(if panicked {
+            "CONTROL_PANIC"
+        } else if session_uncertain_safe_hold {
+            "SAFE_HOLD"
+        } else {
+            "SHUTDOWN"
+        });
         let _ = core.flush_published_session_terminals();
         state.drain_maintenance_stopped();
         state.drain_persistence_stopped(core);
@@ -10692,6 +10701,7 @@ fn control_thread_main_inner(
         let has_live_receiver = lifecycle.handback_has_live_receiver();
         let prep_ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let core_ref = core_slot.as_deref_mut().expect("core owned");
+            core_ref.revoke_recorder_for_teardown("HANDBACK");
             let disarmed = core_is_confirmed_disarmed(core_ref);
             if !disarmed
                 && (!has_live_receiver || !core_ref.quiesce_motion_and_refresh_hold_for_handback())

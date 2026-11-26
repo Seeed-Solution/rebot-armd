@@ -1110,6 +1110,82 @@ impl SupervisorInner {
         }
     }
 
+    /// Zero-alloc, zero-lock RT check verifying that macro parent `id` is alive, within its
+    /// whole-macro deadline at `now`, and still holds valid connection/lease/epoch/stop authority.
+    pub(crate) fn is_macro_parent_authoritative_at(&self, id: u64, now: Instant) -> bool {
+        if id == 0 || !self.macro_alive(id) {
+            return false;
+        }
+        let Some(run) = self.macro_run.as_ref().filter(|m| m.id == id) else {
+            return false;
+        };
+        if run.deadline.is_some_and(|d| now > d) {
+            return false;
+        }
+        if self.estop_request_unapplied()
+            || self.urgent_stop_unapplied()
+            || self.internal_fault_lane.is_fenced()
+            || self.sessions.is_safe_hold_requested()
+        {
+            return false;
+        }
+        if matches!(
+            self.safety.state(),
+            crate::safety::SafetyState::EStop | crate::safety::SafetyState::Fault(_)
+        ) {
+            return false;
+        }
+        if run.stamp.estop_epoch != self.safety.epoch_id() {
+            return false;
+        }
+        if run.stamp.stop_gen != self.current_stop_gen() {
+            return false;
+        }
+        if run.stamp.connection_id != 0 {
+            if self.is_connection_closed(run.stamp.connection_id)
+                || !self.is_connection_live(run.stamp.connection_id)
+            {
+                return false;
+            }
+        } else if self.lease_enabled && run.stamp.lease_gen != 0 {
+            return false;
+        }
+        if self.lease_enabled {
+            if run.stamp.lease_gen == 0
+                || !self.is_session_lease_valid_at(
+                    run.stamp.connection_id,
+                    run.stamp.lease_gen,
+                    now,
+                )
+            {
+                return false;
+            }
+        } else if run.stamp.lease_gen != 0
+            && self
+                .check_descriptor_lease_owner(run.stamp.connection_id, run.stamp.lease_gen)
+                .is_err()
+        {
+            return false;
+        }
+        true
+    }
+
+    /// Unconditionally revokes and closes any active `SessionSlot::Recorder` during executor
+    /// teardown or handback so a close fence is always frozen and no occupied slot leaks across
+    /// executor lifecycles (0 alloc, 0 lock).
+    pub(crate) fn revoke_recorder_for_teardown(&mut self, reason: &'static str) {
+        if let Some(rec) = self.sessions.slot(SessionSlot::Recorder).copied() {
+            let _ = self.sessions.finish_slot(
+                SessionSlot::Recorder,
+                rec.id,
+                SessionTerminalReason::Revoked(reason),
+                false,
+            );
+            let _ = self.sessions.clear_terminal_slot(SessionSlot::Recorder, rec.id);
+        }
+        let _ = self.close_rt_recorder_session(true);
+    }
+
     /// Admits a lease-free RT recorder session onto `SessionSlot::Recorder` (0 alloc, 0 lock).
     pub(crate) fn admit_rt_recorder_session(
         &mut self,
@@ -1125,7 +1201,7 @@ impl SupervisorInner {
         if !self.rt_recorder.has_producer() {
             return Err(RecorderStartError::StreamUnattached);
         }
-        if bound_action_id != 0 && !self.macro_alive(bound_action_id) {
+        if bound_action_id != 0 && !self.is_macro_parent_authoritative_at(bound_action_id, now) {
             return Err(RecorderStartError::ParentNotAlive);
         }
         if self.sessions.is_slot_occupied(SessionSlot::Recorder) {
@@ -1172,8 +1248,9 @@ impl SupervisorInner {
 
     /// Stops an active RT recorder session (0 alloc, 0 lock).
     /// - If `save && pushed == 0`: refuses `EmptyEpisode` WITHOUT stopping the session.
-    /// - If `save && require_alive_action_id != 0 && !macro_alive(require_alive_action_id)`:
-    ///   atomically closes/discards the session at the RT boundary and returns `ParentNotAlive { fence }`.
+    /// - For a bound sequence recorder (`bound_action_id != 0`) or explicit `require_alive_action_id`,
+    ///   when `save` is true, verifies full parent liveness, deadline, and authority at `now`;
+    ///   if expired/revoked, atomically closes/discards at the RT boundary and returns `ParentNotAlive`.
     pub(crate) fn stop_rt_recorder_session(
         &mut self,
         op_id: u64,
@@ -1181,6 +1258,7 @@ impl SupervisorInner {
         save: bool,
         reason: &'static str,
         require_alive_action_id: u64,
+        now: Instant,
     ) -> Result<super::recorder::RecorderStopFence, super::recorder::RecorderStopError> {
         use super::recorder::RecorderStopError;
         let Some(active) = self.sessions.slot(SessionSlot::Recorder).copied() else {
@@ -1194,7 +1272,16 @@ impl SupervisorInner {
         {
             return Err(RecorderStopError::SessionMismatch);
         }
-        if save && require_alive_action_id != 0 && !self.macro_alive(require_alive_action_id) {
+        let bound_id = self.rt_recorder.bound_action_id();
+        if save && bound_id != 0 && require_alive_action_id != 0 && require_alive_action_id != bound_id {
+            return Err(RecorderStopError::SessionMismatch);
+        }
+        let required_parent = if bound_id != 0 {
+            bound_id
+        } else {
+            require_alive_action_id
+        };
+        if save && required_parent != 0 && !self.is_macro_parent_authoritative_at(required_parent, now) {
             let term_reason = SessionTerminalReason::Cancelled("STOPPED");
             let _ = self.sessions.finish_slot(SessionSlot::Recorder, active.id, term_reason, false);
             let _ = self.sessions.clear_terminal_slot(SessionSlot::Recorder, active.id);

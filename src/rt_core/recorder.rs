@@ -501,6 +501,21 @@ impl RecorderAssembly {
         g.drain_up_to(max)
     }
 
+    /// Non-blocking bounded drain for `armd-dispatch`: if a blocking `collect_session` currently
+    /// holds the assembly mutex, yields immediately so unrelated E-stop/broker replies never stall.
+    pub fn try_drain_bounded(&self, max: usize) -> usize {
+        if super::executor::on_rt_control_thread() {
+            self.control_thread_lock_attempts.fetch_add(1, Ordering::SeqCst);
+            super::executor::assert_not_on_rt_control_thread("RecorderAssembly::inner.try_lock");
+        }
+        super::executor::assert_not_in_rt_release("RecorderAssembly::inner.try_lock");
+        match self.inner.try_lock() {
+            Ok(mut g) => g.drain_up_to(max),
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner().drain_up_to(max),
+            Err(std::sync::TryLockError::WouldBlock) => 0,
+        }
+    }
+
     /// Collects all samples belonging to `fence.session_id` (blocking-thread safe; leaves later
     /// sessions intact). Call strictly AFTER RT has closed `fence.session_id`.
     pub fn collect_session(&self, fence: RecorderStopFence) -> CollectedSession {
