@@ -154,37 +154,21 @@ impl Holds {
             .then(HoldUsageStart::sample)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn record(
-        &self,
-        kind: HoldKind,
-        location: &'static Location<'static>,
-        command: Option<&'static str>,
-        direction: Option<&'static str>,
-        action_id: Option<u64>,
-        io_timing: Option<HoldIoTiming>,
-        called: Instant,
-        acquired: Instant,
-        released: Instant,
-        cpu_hold: Option<Duration>,
-        voluntary_csw: u32,
-        involuntary_csw: u32,
-    ) {
-        let r = HoldRecord {
-            kind,
-            location,
-            command,
-            direction,
-            action_id,
-            io_timing,
-            called,
-            acquired,
-            released,
-            cpu_hold,
-            voluntary_csw,
-            involuntary_csw,
-        };
+    /// Commit `r` to the zero-alloc `HoldLog` BEFORE dropping the underlying `RwLock` guard.
+    ///
+    /// Restores the documented happens-before edge for `write_tick()` -> `take_log()`: once a
+    /// waiting control tick acquires the exclusive write lock, every prior guard has already
+    /// finished updating and releasing `self.log`, so `take_log()` never observes `WouldBlock`
+    /// or misses `last_release`.
+    #[inline]
+    fn record_log(&self, r: HoldRecord) {
         self.log.lock().unwrap_or_else(|e| e.into_inner()).add(r);
+    }
+
+    /// Append `r` to the opt-in test hold history AFTER dropping the underlying `RwLock` guard
+    /// so `Vec::push` / history mutex locking never extends the guard hold.
+    #[inline]
+    fn record_history(&self, r: HoldRecord) {
         if self.history_enabled.load(Ordering::Relaxed) {
             self.history.lock().unwrap_or_else(|e| e.into_inner()).push(r);
         }
@@ -448,6 +432,24 @@ impl Timing {
     fn finish_usage(&self) -> (Option<Duration>, u32, u32) {
         self.usage_start.map_or((None, 0, 0), HoldUsageStart::finish)
     }
+    #[inline]
+    fn to_record(self, kind: HoldKind, released: Instant) -> HoldRecord {
+        let (cpu_hold, voluntary_csw, involuntary_csw) = self.finish_usage();
+        HoldRecord {
+            kind,
+            location: self.location,
+            command: self.command,
+            direction: self.direction,
+            action_id: self.action_id,
+            io_timing: self.io_timing,
+            called: self.called,
+            acquired: self.acquired,
+            released,
+            cpu_hold,
+            voluntary_csw,
+            involuntary_csw,
+        }
+    }
 }
 
 pub struct SupReadGuard<'a, T> {
@@ -458,27 +460,14 @@ pub struct SupReadGuard<'a, T> {
 
 impl<T> Drop for SupReadGuard<'_, T> {
     fn drop(&mut self) {
-        // Sample `released` right before dropping the underlying guard (so post-unlock scheduling
-        // delay never inflates `hold()`), then unlock BEFORE acquiring hold-log / history mutexes
-        // so lock recording never extends the actual hold duration.
-        let released = Instant::now();
-        let (cpu_hold, vcsw, ivcsw) = self.t.finish_usage();
+        // Sample `released` and commit to the zero-alloc `HoldLog` BEFORE releasing the RwLock
+        // guard so a waking `write_tick()` -> `take_log()` always observes this release with zero
+        // lock contention; append to opt-in `history` (`Vec::push`) after unlocking.
+        let r = self.t.to_record(HoldKind::Read, Instant::now());
+        self.holds.record_log(r);
         // SAFETY: dropped once, here; the field is not used afterwards.
         unsafe { ManuallyDrop::drop(&mut self.guard) };
-        self.holds.record(
-            HoldKind::Read,
-            self.t.location,
-            self.t.command,
-            self.t.direction,
-            self.t.action_id,
-            self.t.io_timing,
-            self.t.called,
-            self.t.acquired,
-            released,
-            cpu_hold,
-            vcsw,
-            ivcsw,
-        );
+        self.holds.record_history(r);
     }
 }
 
@@ -521,24 +510,11 @@ impl<T> SupWriteGuard<'_, T> {
 
 impl<T> Drop for SupWriteGuard<'_, T> {
     fn drop(&mut self) {
-        let released = Instant::now();
-        let (cpu_hold, vcsw, ivcsw) = self.t.finish_usage();
+        let r = self.t.to_record(HoldKind::Write, Instant::now());
+        self.holds.record_log(r);
         // SAFETY: dropped once, here; the field is not used afterwards.
         unsafe { ManuallyDrop::drop(&mut self.guard) };
-        self.holds.record(
-            HoldKind::Write,
-            self.t.location,
-            self.t.command,
-            self.t.direction,
-            self.t.action_id,
-            self.t.io_timing,
-            self.t.called,
-            self.t.acquired,
-            released,
-            cpu_hold,
-            vcsw,
-            ivcsw,
-        );
+        self.holds.record_history(r);
     }
 }
 
@@ -585,24 +561,11 @@ impl<T> SupOwnedWriteGuard<T> {
 
 impl<T> Drop for SupOwnedWriteGuard<T> {
     fn drop(&mut self) {
-        let released = Instant::now();
-        let (cpu_hold, vcsw, ivcsw) = self.t.finish_usage();
+        let r = self.t.to_record(HoldKind::Write, Instant::now());
+        self.holds.record_log(r);
         // SAFETY: dropped once, here; the field is not used afterwards.
         unsafe { ManuallyDrop::drop(&mut self.guard) };
-        self.holds.record(
-            HoldKind::Write,
-            self.t.location,
-            self.t.command,
-            self.t.direction,
-            self.t.action_id,
-            self.t.io_timing,
-            self.t.called,
-            self.t.acquired,
-            released,
-            cpu_hold,
-            vcsw,
-            ivcsw,
-        );
+        self.holds.record_history(r);
     }
 }
 
