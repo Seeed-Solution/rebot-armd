@@ -408,11 +408,38 @@ pub enum FallbackStepErr {
     NoBoundedStep { joint: u8 },
     StepOutsideLimits { joint: u8, q: f32 },
     ExceedsDynamics { joint: u8, v: f32, max_v: f32, a: f32, max_a: f32 },
-    WorkspaceStartViolation,
-    WorkspaceStepViolation,
-    WorkspaceMeasuredViolation,
-    WorkspaceMeasuredSweepViolation,
+    WorkspaceStartViolation(crate::chain::WorkspaceFailureRt),
+    WorkspaceStepViolation(crate::chain::WorkspaceFailureRt),
+    WorkspaceMeasuredViolation(crate::chain::WorkspaceFailureRt),
+    WorkspaceMeasuredSweepViolation(crate::chain::WorkspaceFailureRt),
     NoFeasibleStep,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn fmt_ws_failure_rt(
+    f: &mut core::fmt::Formatter<'_>,
+    prefix: &str,
+    err: crate::chain::WorkspaceFailureRt,
+) -> core::fmt::Result {
+    use crate::chain::WorkspaceFailureKindRt;
+    match err.kind {
+        WorkspaceFailureKindRt::Invalid(msg) => write!(f, "{prefix}: {msg}"),
+        WorkspaceFailureKindRt::UnknownCapsule(ci) => {
+            write!(f, "{prefix}: unknown capsule frame (index {ci})")
+        }
+        WorkspaceFailureKindRt::InvalidSelfPair(pi) => {
+            write!(f, "{prefix}: invalid self-collision pair (index {pi})")
+        }
+        WorkspaceFailureKindRt::BudgetExceeded { max_budget } => {
+            write!(f, "{prefix}: sweep exceeded {max_budget} FK evaluations")
+        }
+        WorkspaceFailureKindRt::Constraint { slot, depth, min_d } => {
+            write!(
+                f,
+                "{prefix} (slot {slot}, depth={depth:.4}m, min_depth={min_d:.4}m)"
+            )
+        }
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -438,13 +465,17 @@ impl core::fmt::Display for FallbackStepErr {
                     "joint {joint} fallback step exceeds dynamics (v={v:.3}/{max_v:.3}, a={a:.3}/{max_a:.3})"
                 )
             }
-            Self::WorkspaceStartViolation => f.write_str("fallback start violates the workspace"),
-            Self::WorkspaceStepViolation => f.write_str("fallback step violates the workspace"),
-            Self::WorkspaceMeasuredViolation => {
-                f.write_str("measured pose violates the workspace")
+            Self::WorkspaceStartViolation(err) => {
+                fmt_ws_failure_rt(f, "fallback start violates the workspace", err)
             }
-            Self::WorkspaceMeasuredSweepViolation => {
-                f.write_str("fallback step from measured violates the workspace")
+            Self::WorkspaceStepViolation(err) => {
+                fmt_ws_failure_rt(f, "fallback step violates the workspace", err)
+            }
+            Self::WorkspaceMeasuredViolation(err) => {
+                fmt_ws_failure_rt(f, "measured pose violates the workspace", err)
+            }
+            Self::WorkspaceMeasuredSweepViolation(err) => {
+                fmt_ws_failure_rt(f, "fallback step from measured violates the workspace", err)
             }
             Self::NoFeasibleStep => f.write_str("no feasible tracking fallback step"),
         }
@@ -2343,27 +2374,43 @@ impl crate::supervisor::SupervisorInner {
         let mut committed = None;
         if let Some(pq) = prev {
             let mut c_prev = eval.alloc_buf();
-            eval.eval_into(pq, &mut c_prev, "tracking_fallback")
-                .map_err(|_| FallbackStepErr::WorkspaceStartViolation)?;
+            eval.eval_into_slotbuf_rt(pq, &mut c_prev, "tracking_fallback")
+                .map_err(FallbackStepErr::WorkspaceStartViolation)?;
             let mut min_d = match prev_depths {
                 Some((rev, md)) if *rev == self.workspace_revision && md.as_slice().len() == eval.total_slots => md.clone(),
                 _ => eval.init_min_depths(&c_prev),
             };
-            eval.sweep_linear_step(pq, q, &c_prev, &mut min_d, budget, MAX_KEEPOUT_EVALS_PER_TICK,
-                "tracking_fallback", "tracking_fallback")
-                .map_err(|_| FallbackStepErr::WorkspaceStepViolation)?;
+            eval.sweep_linear_step_slotbuf_rt(
+                pq,
+                q,
+                &c_prev,
+                &mut min_d,
+                budget,
+                MAX_KEEPOUT_EVALS_PER_TICK,
+                "tracking_fallback",
+                "tracking_fallback",
+            )
+            .map_err(|(_, err)| FallbackStepErr::WorkspaceStepViolation(err))?;
             committed = Some((self.workspace_revision, min_d));
         }
         if !fresh_meas {
             return Ok(committed);
         }
         let mut c_meas = eval.alloc_buf();
-        eval.eval_into(&self.measured_positions, &mut c_meas, "tracking_fallback")
-            .map_err(|_| FallbackStepErr::WorkspaceMeasuredViolation)?;
+        eval.eval_into_slotbuf_rt(&self.measured_positions, &mut c_meas, "tracking_fallback")
+            .map_err(FallbackStepErr::WorkspaceMeasuredViolation)?;
         let mut min_d_meas = eval.init_min_depths(&c_meas);
-        eval.sweep_linear_step(&self.measured_positions, q, &c_meas, &mut min_d_meas, budget,
-            MAX_KEEPOUT_EVALS_PER_TICK, "tracking_fallback", "tracking_fallback")
-            .map_err(|_| FallbackStepErr::WorkspaceMeasuredSweepViolation)?;
+        eval.sweep_linear_step_slotbuf_rt(
+            &self.measured_positions,
+            q,
+            &c_meas,
+            &mut min_d_meas,
+            budget,
+            MAX_KEEPOUT_EVALS_PER_TICK,
+            "tracking_fallback",
+            "tracking_fallback",
+        )
+        .map_err(|(_, err)| FallbackStepErr::WorkspaceMeasuredSweepViolation(err))?;
         Ok(committed.or(Some((self.workspace_revision, min_d_meas))))
     }
 

@@ -2998,3 +2998,228 @@ async fn rt_gate_tracking_fallback_error_and_candidate_retry_zero_alloc_zero_loc
         .await
         .unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rt_gate_tracking_fallback_full_workspace_sweep_and_rejection_zero_alloc_zero_lock() {
+    use armd::model::WorkspacePolicy;
+    use armd::rt_core::rt_gate::RtReleaseGate;
+    use armd::tracking::{
+        FallbackRamp, JointTrackingConfig, JointTrackingJoint, TrackingHistoryState,
+        TrackingStrategy,
+    };
+
+    // Part A: Full workspace (< 256 slots) where braking steps stay valid while passing within
+    // ~0.5 mm of the floor boundary, forcing adaptive subdivision in the RT tracking fallback sweep.
+    {
+        let clock = ScriptedClock::new();
+        let (mut drv, _fail) = WakeDriver::new(7, Duration::from_millis(2), Some(clock.clone()));
+        drv.enabled = true;
+        let q_start = vec![0.10f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let v_start = vec![0.40f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let q_hold = vec![0.0f32; 7];
+        drv.q[..7].copy_from_slice(&q_start);
+
+        let mut cfg = ArmConfig::rebot_dm();
+        cfg.camera_mount.offset_m = None;
+        let p_start = cfg.arm_model.frames_f32(&q_start).unwrap().end.p;
+        let p_hold = cfg.arm_model.frames_f32(&q_hold).unwrap().end.p;
+        let min_z = p_start[2].min(p_hold[2]) as f32;
+        cfg.workspace = Some(WorkspacePolicy {
+            // 0.8 mm below the arm's end-effector Z so endpoints are valid while travel bound
+            // exceeds endpoint clearances and forces adaptive subdivision within the 64-eval budget.
+            floor_z_m: min_z - 0.0008,
+            box_min_m: [-1.5, -1.5, min_z - 0.5],
+            box_max_m: [1.5, 1.5, 1.5],
+            max_reach_m: Some(1.5),
+            check_points_end_m: vec![[0.0, 0.0, 0.0]],
+            keepout_boxes: vec![],
+            link_capsules: vec![],
+            self_collision_enabled: false,
+            self_collision_min_clearance_m: 0.0,
+            self_collision_pairs: vec![],
+        });
+        cfg.joint_tracking = Some(JointTrackingConfig {
+            enabled: true,
+            joints: (0..6)
+                .map(|_| JointTrackingJoint {
+                    strategy: TrackingStrategy::PositionLead,
+                    lag_s: 0.08,
+                    max_lead_rad: 0.03,
+                    ..Default::default()
+                })
+                .collect(),
+        });
+
+        let sup = Arc::new(ArmSupervisor::new(cfg.clone()).with_driver(Box::new(drv)));
+        sup.set_lease_enabled(false).await;
+        {
+            let mut inner = sup.inner().write().await;
+            inner.is_torqued = true;
+            inner.torque_intent = armd::supervisor::TorqueIntent::On;
+            inner.commanded_positions = q_start.clone();
+            inner.target_positions = q_start.clone();
+            inner.measured_positions = q_start.clone();
+            inner.commanded_velocities = v_start.clone();
+            inner.tracking.record_issued_in_place(&q_start, &v_start, None, None);
+            inner.tracking.history_state = TrackingHistoryState::Issued;
+            inner.tracking.fallback_ramp = Some(FallbackRamp {
+                hold: q_hold.clone(),
+                keepout_only: false,
+                limits: cfg.limits.clone(),
+            });
+        }
+
+        let period_ns = 20_000_000u64;
+        let handle = sup
+            .start_executor_with_hooks(
+                alloc_cfg(Duration::from_nanos(period_ns)),
+                PersistTestHooks {
+                    clock: Some(clock.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let gate = RtReleaseGate::new(&sup, &handle);
+        let ((saw_step, settled_at_hold, safety_state), delta) =
+            gate.run_phase("tracking_fallback_full_ws_subdivision", || {
+                let mut saw_step = false;
+                let mut prev_q0 = q_start[0];
+                for _ in 0..40 {
+                    clock.run_steps(period_ns, 1);
+                    if let Some(s) = sup.hub().latest() {
+                        if (s.rt.commanded_positions[0] - prev_q0).abs() > 1e-4 {
+                            saw_step = true;
+                        }
+                        prev_q0 = s.rt.commanded_positions[0];
+                    }
+                }
+                let s_end = sup.hub().latest().unwrap();
+                let settled_at_hold = s_end.rt.commanded_positions[0].abs() < 0.02;
+                let safety_state = s_end.obs.safety_state.clone();
+                ((saw_step, settled_at_hold, safety_state), saw_step && settled_at_hold)
+            });
+        assert!(
+            saw_step && settled_at_hold,
+            "fallback braking must advance and settle at hold (saw_step={saw_step}, settled={settled_at_hold}, safety={safety_state:?}, delta={delta:?})"
+        );
+        assert!(
+            !matches!(safety_state, armd::safety::SafetyState::Fault(_)),
+            "Part A subdivision braking must not fault, got {safety_state:?}"
+        );
+        assert!(
+            delta.is_clean(),
+            "full-workspace tracking fallback subdivision must be zero-alloc/zero-lock: {delta:?}"
+        );
+
+        tokio::task::spawn_blocking(move || handle.stop_and_join())
+            .await
+            .unwrap();
+    }
+
+    // Part B: Full workspace (< 256 slots) where candidate braking steps violate the workspace
+    // boundary, forcing rejection detail construction (`WorkspaceFailureRt` -> `FallbackStepErr`)
+    // on `armd-control` with zero heap allocations.
+    {
+        let clock = ScriptedClock::new();
+        let (mut drv, _fail) = WakeDriver::new(7, Duration::from_millis(2), Some(clock.clone()));
+        drv.enabled = true;
+        let q_start = vec![0.10f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let v_start = vec![0.40f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let q_hold = vec![0.0f32; 7];
+        drv.q[..7].copy_from_slice(&q_start);
+
+        let mut cfg = ArmConfig::rebot_dm();
+        cfg.camera_mount.offset_m = None;
+        let p_start = cfg.arm_model.frames_f32(&q_start).unwrap().end.p;
+        // Put a box wall directly ahead of the braking step along +J1 so `q_start` is legal
+        // and every candidate braking step violates the workspace, exercising rejection details.
+        let q_probe = vec![0.106f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let p_probe = cfg.arm_model.frames_f32(&q_probe).unwrap().end.p;
+        let mut box_min = [-1.5f32, -1.5, -1.5];
+        let mut box_max = [1.5f32, 1.5, 1.5];
+        if p_probe[1] > p_start[1] {
+            box_max[1] = p_start[1] as f32 + 0.0001;
+        } else {
+            box_min[1] = p_start[1] as f32 - 0.0001;
+        }
+        cfg.workspace = Some(WorkspacePolicy {
+            floor_z_m: -1.5,
+            box_min_m: box_min,
+            box_max_m: box_max,
+            max_reach_m: Some(1.5),
+            check_points_end_m: vec![[0.0, 0.0, 0.0]],
+            keepout_boxes: vec![],
+            link_capsules: vec![],
+            self_collision_enabled: false,
+            self_collision_min_clearance_m: 0.0,
+            self_collision_pairs: vec![],
+        });
+        cfg.joint_tracking = Some(JointTrackingConfig {
+            enabled: true,
+            joints: (0..6)
+                .map(|_| JointTrackingJoint {
+                    strategy: TrackingStrategy::PositionLead,
+                    lag_s: 0.08,
+                    max_lead_rad: 0.03,
+                    ..Default::default()
+                })
+                .collect(),
+        });
+
+        let sup = Arc::new(ArmSupervisor::new(cfg.clone()).with_driver(Box::new(drv)));
+        sup.set_lease_enabled(false).await;
+        {
+            let mut inner = sup.inner().write().await;
+            inner.is_torqued = true;
+            inner.torque_intent = armd::supervisor::TorqueIntent::On;
+            inner.commanded_positions = q_start.clone();
+            inner.target_positions = q_start.clone();
+            inner.measured_positions = q_start.clone();
+            inner.commanded_velocities = v_start.clone();
+            inner.tracking.record_issued_in_place(&q_start, &v_start, None, None);
+            inner.tracking.history_state = TrackingHistoryState::Issued;
+            inner.tracking.fallback_ramp = Some(FallbackRamp {
+                hold: q_hold,
+                keepout_only: false,
+                limits: cfg.limits.clone(),
+            });
+        }
+
+        let period_ns = 20_000_000u64;
+        let handle = sup
+            .start_executor_with_hooks(
+                alloc_cfg(Duration::from_nanos(period_ns)),
+                PersistTestHooks {
+                    clock: Some(clock.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let gate = RtReleaseGate::new(&sup, &handle);
+        let (_, delta) = gate.run_phase("tracking_fallback_full_ws_rejection", || {
+            let mut saw_fault = false;
+            for _ in 0..10 {
+                clock.run_steps(period_ns, 1);
+                if let Some(s) = sup.hub().latest() {
+                    if matches!(s.obs.safety_state, armd::safety::SafetyState::Fault(_)) {
+                        saw_fault = true;
+                        break;
+                    }
+                }
+            }
+            ((), saw_fault)
+        });
+        assert!(
+            delta.is_clean(),
+            "full-workspace tracking fallback rejection must be zero-alloc/zero-lock: {delta:?}"
+        );
+
+        tokio::task::spawn_blocking(move || handle.stop_and_join())
+            .await
+            .unwrap();
+    }
+}
