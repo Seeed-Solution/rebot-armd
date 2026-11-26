@@ -2016,7 +2016,7 @@ pub mod switch {
                 let exclude_mask = drv.mode_write_uncertain_mask();
                 let effective_gap = self.effective_max_watchdog_gap(budget);
                 match drv.service_watchdog_holds(
-                    budget.watchdog_proactive_interval,
+                    self.hold_due_age(budget),
                     exclude_mask,
                     0,
                     budget.cutoff,
@@ -2134,7 +2134,7 @@ pub mod switch {
                 let exclude_mask = drv.mode_write_uncertain_mask();
                 let force_mask = self.next_write_force_refresh_mask(drv, remaining_tx);
                 let wd = match drv.service_watchdog_holds(
-                    budget.watchdog_proactive_interval,
+                    self.hold_due_age(budget),
                     exclude_mask,
                     force_mask,
                     budget.cutoff,
@@ -2179,6 +2179,18 @@ pub mod switch {
 
         fn effective_max_watchdog_gap(&self, budget: ReleaseBudget) -> Duration {
             self.plan.max_watchdog_gap.min(budget.max_watchdog_gap)
+        }
+
+        /// Control-frame age at which an energized watchdog axis is due for a hold on THIS release
+        /// (Major 1, R5): the latest age from which waiting one more release period plus the
+        /// delivery margin still lands inside the effective gap, capped by the proactive interval.
+        /// Applies to every armed axis the driver services, inside or outside the plan.
+        fn hold_due_age(&self, budget: ReleaseBudget) -> Duration {
+            let latest_safe = self
+                .effective_max_watchdog_gap(budget)
+                .saturating_sub(budget.period)
+                .saturating_sub(budget.hold_delivery_margin);
+            budget.watchdog_proactive_interval.min(latest_safe)
         }
 
         fn current_joint(&self) -> u8 {

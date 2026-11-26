@@ -2033,3 +2033,73 @@ fn confirm_only_reply_contradicting_cached_mode_on_energized_axis_escalates() {
     assert_eq!(ex_drv.get_ref().axis_confirmed_mode(0), None, "contradicting reply must not be published");
     assert_ne!(ex_drv.get_ref().mode_write_uncertain_mask() & 1, 0, "J1 must be fenced");
 }
+
+/// Major 1: 20 ms accepted gap, 10 ms release, 15 ms proactive interval, 5 ms delivery margin.
+/// Every energized watchdog axis (all outside the J7-only plan) must get a hold each release so
+/// no control gap exceeds `gap - margin`; a fixed 15 ms interval skips the 10 ms hold and lands
+/// the next one past the deadline.
+#[test]
+fn watchdog_hold_due_time_derives_from_gap_period_and_margin_for_axes_outside_plan() {
+    let clock = MockClock::new();
+    let cfg = ArmConfig::rebot_dm();
+    let bus = configure_damiao_bus(Some(clock.clone()), Duration::from_micros(200), false, TIMEOUT_2000_COUNTS);
+    let mut drv = build_damiao_driver(bus.clone(), &cfg, 8);
+    enable_driver_sync(&mut drv, &bus, Some(&clock));
+    let period = Duration::from_millis(10);
+    let gap = Duration::from_millis(20);
+    let margin = Duration::from_millis(5);
+    // J7 never answers, so the session stays pending for the whole window.
+    bus.with(|s| s.motors[6].silent = true);
+    let mut plan = ModeSwitchPlan::empty(ModeSwitchIntent::ConfirmOnly);
+    plan.axes[0] = AxisTarget::new(6, ControlMode::PositionVelocity);
+    plan.len = 1;
+    plan.per_axis_timeout = Duration::from_millis(500);
+    let mut ms = ModeSwitch::new(plan);
+    let mut seq = 1u64;
+    // Warm-up release seeds a hold on every arm axis.
+    let budget_of = |now: Instant, cutoff: Instant| {
+        let mut b = ReleaseBudget::new(now, cutoff, period, 8);
+        b.max_watchdog_gap = gap;
+        b.watchdog_proactive_interval = Duration::from_millis(15);
+        b.hold_delivery_margin = margin;
+        b
+    };
+    let mut allow = || Ok(());
+    let _ = step_raw_with_gate(&mut drv, &mut ms, &clock, budget_of, period, seq, &mut allow);
+    let window_start = clock.now();
+    bus.clear_log();
+    let mut pending_ticks = 0;
+    for _ in 0..8 {
+        clock.advance(period);
+        bus.with(|s| s.run_watchdogs());
+        seq += 1;
+        let p = step_raw_with_gate(&mut drv, &mut ms, &clock, budget_of, period, seq, &mut allow);
+        if p.is_terminal() {
+            break;
+        }
+        pending_ticks += 1;
+    }
+    let end = clock.now();
+    assert!(pending_ticks >= 6, "session must stay pending across the window ({pending_ticks})");
+    let (tx_log, tx_times) = bus.with(|s| (s.tx_log.clone(), s.tx_times.clone()));
+    let mut last = [window_start; 6];
+    let mut max_gap = [Duration::ZERO; 6];
+    for (f, t) in tx_log.iter().zip(tx_times.iter()) {
+        let Some(t) = *t else { continue };
+        if (0x101..=0x106).contains(&f.id) {
+            let j = (f.id - 0x101) as usize;
+            max_gap[j] = max_gap[j].max(t.saturating_duration_since(last[j]));
+            last[j] = t;
+        }
+    }
+    for j in 0..6 {
+        max_gap[j] = max_gap[j].max(end.saturating_duration_since(last[j]));
+        assert!(
+            max_gap[j] <= gap - margin,
+            "J{} hold gap {:?} exceeds gap - margin {:?} (all: {max_gap:?})",
+            j + 1,
+            max_gap[j],
+            gap - margin
+        );
+    }
+}
