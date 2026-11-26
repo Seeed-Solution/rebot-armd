@@ -13983,15 +13983,23 @@ impl ArmSupervisor {
     }
 
     /// Linearizably verifies episode `id` is unreferenced (saved, running, or reserved) on the
-    /// live owner, removes it from the `EpisodeStore` catalog, and returns its unique deletion
-    /// claim token (`Some(claim)`) if removed, `None` if absent, or `Err(409 IN_USE)` if referenced.
+    /// live owner, removes it from the `EpisodeStore` catalog on a blocking thread (off the Tokio
+    /// worker), and returns its unique deletion claim token (`Some(claim)`) if removed, `None` if
+    /// absent, or `Err(409 IN_USE)` if referenced.
     pub async fn take_episode_for_delete_claim(&self, id: &str) -> Result<Option<u64>, ArmError> {
         use crate::recording::store::TakeEpisodeOutcome;
         loop {
             let rev0 = self.sequences_revision();
             self.check_episode_delete_allowed(id).await?;
             let store = self.try_episode_store().await?;
-            match store.take_if_unpinned_and_rev_matches(id, &self.sequences_revision, rev0) {
+            let id_owned = id.to_string();
+            let seq_rev = Arc::clone(&self.sequences_revision);
+            let outcome = tokio::task::spawn_blocking(move || {
+                store.take_if_unpinned_and_rev_matches(&id_owned, &seq_rev, rev0)
+            })
+            .await
+            .map_err(|e| ArmError::Internal(format!("episode delete take failed: {e}")))?;
+            match outcome {
                 TakeEpisodeOutcome::Removed(claim) => return Ok(Some(claim)),
                 TakeEpisodeOutcome::NotFound => return Ok(None),
                 TakeEpisodeOutcome::Pinned => {
@@ -19447,7 +19455,8 @@ fn dispatch_loop(
     // and emit any final safety overflow summary. Drain `terminal_capture` BEFORE
     // `flush_and_report_shutdown` so final broker reply routing sees every captured entry.
     if let Some(ring) = hub.record_ring() { ring.drain(); }
-    terminal_capture.wait_for_sequence_commit_idle();
+    let _ = terminal_capture
+        .wait_for_sequence_commit_idle_until(Instant::now() + Duration::from_secs(5));
     let final_snap = hub.latest().or(latest_snap);
     terminal_capture.drain_into(
         terminals,

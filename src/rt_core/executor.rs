@@ -2711,6 +2711,13 @@ impl BrokerDispatcher {
         delivered
     }
 
+    fn wait_sequence_commit_until(&self, deadline: Instant) -> bool {
+        match self.terminal_capture_drain.as_ref() {
+            Some((ch, _, _)) => ch.wait_for_sequence_commit_idle_until(deadline),
+            None => true,
+        }
+    }
+
     fn finalize_stopped_under_gate(&self, rt_joined: bool, allow_callbacks: bool) {
         // 1. On normal shutdown (`allow_callbacks == true`), drain any in-flight records from the
         //    authoritative `TerminalCaptureChannel` against the final snapshot BEFORE the final
@@ -2720,7 +2727,6 @@ impl BrokerDispatcher {
         //    callbacks so a slow or stalled sink cannot defeat the emergency deadline.
         if allow_callbacks {
             if let Some((ch, terminals, template_obs)) = self.terminal_capture_drain.as_ref() {
-                ch.wait_for_sequence_commit_idle();
                 let final_snap = self.hub.latest();
                 let _ = ch.drain_into(
                     terminals,
@@ -4586,20 +4592,29 @@ impl RtExecutorShared {
         }
 
         // Final off-thread drain and reclamation (single finalization owner for broker/router):
-        // - Normal teardown (`!is_process_exit` within `deadline`): drains P-F1's
-        //   `TerminalCaptureChannel` before final broker reply delivery and route retirement.
-        // - Emergency / `ProcessExit` or expired deadline: strictly bounded by the remaining
-        //   shared `deadline` without invoking slow callbacks.
+        // 1. Close maintenance/stop/lifecycle clients first so any recorder coordinator still
+        //    awaiting an RT stop reply wakes immediately and drops its `SequenceCommitGuard`.
+        // 2. On normal teardown (`!is_process_exit`) with time remaining before `deadline`, wait
+        //    strictly within `deadline` for any RT-committed sequence repeat to finish local
+        //    publication. If it completes in time, normal finalization drains and delivers every
+        //    terminal and originating WS reply before retiring the router; if disk publication
+        //    stalls past `deadline`, fall into the bounded emergency branch so the public shutdown
+        //    deadline is never violated and no incomplete terminal is emitted.
+        self.maint_client.finish_stopped();
+        self.urgent_stop_client.finish_stopped();
+        self.conn_lifecycle_client.finish_stopped();
+        let commit_idle = if !is_process_exit && Instant::now() < deadline {
+            self.broker_dispatcher.wait_sequence_commit_until(deadline)
+        } else {
+            true
+        };
         let emergency_bound = if is_process_exit {
             Some(deadline.saturating_duration_since(Instant::now()))
-        } else if Instant::now() >= deadline {
+        } else if !commit_idle || Instant::now() >= deadline {
             Some(Duration::ZERO)
         } else {
             None
         };
-        self.maint_client.finish_stopped();
-        self.urgent_stop_client.finish_stopped();
-        self.conn_lifecycle_client.finish_stopped();
         self.broker_dispatcher
             .finish_stopped_inner(emergency_bound, rt_joined);
         if !is_process_exit || Instant::now() < deadline {

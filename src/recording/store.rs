@@ -412,10 +412,12 @@ struct Catalog {
     /// encountered an unlink error, preserved across retries so a retry validates exact claim
     /// ownership and still removes stranded parquet/sidecar files.
     pending_delete_files: HashMap<String, Vec<(String, u64)>>,
-    /// Per-episode deletion claims (`episode_id -> delete_claim_token`) active from catalog
-    /// removal until all on-disk files are unlinked (or through failed-unlink retry). Blocks
-    /// concurrent `get_or_adopt`, `new_episode`, `publish_complete_episode`, and stale unlinks.
-    deleting_episodes: HashMap<String, u64>,
+    /// Per-episode deletion claims (`episode_id -> (delete_claim_token, retryable_after_io_err)`)
+    /// active from catalog removal until all on-disk files are unlinked. Blocks concurrent
+    /// `get_or_adopt`, `new_episode`, `publish_complete_episode`, and stale unlinks; when an
+    /// unlink encounters an I/O error, `retryable` flips to `true` so a repeat DELETE can mint a
+    /// fresh claim token and retry safely while rejecting the old token.
+    deleting_episodes: HashMap<String, (u64, bool)>,
     /// Reserved capacity slots held by in-flight manual saves and imports between precheck and
     /// publication Phase 1 claim so concurrent writers cannot race past `MAX_EPISODE_FILES`.
     reserved_slots: usize,
@@ -998,7 +1000,7 @@ impl EpisodeStore {
         if cat.episodes.remove(id).is_some() {
             cat.commit_tokens.remove(id);
             let claim = next_delete_claim();
-            cat.deleting_episodes.insert(id.to_string(), claim);
+            cat.deleting_episodes.insert(id.to_string(), (claim, false));
             Some(claim)
         } else {
             None
@@ -1041,7 +1043,9 @@ impl EpisodeStore {
 
     /// Atomically checks that `id` is not pinned and `seq_rev` still equals `expected_rev`,
     /// then removes `id` from the catalog and installs its unique deletion claim token under
-    /// `write_lock` (serialized against `EpisodeStore::update` sidecar writes).
+    /// `write_lock` (serialized against `EpisodeStore::update` sidecar writes). If a prior
+    /// single-episode unlink failed with an I/O error (`retryable == true`), mints a fresh claim
+    /// token so a repeat DELETE can retry cleanup safely while invalidating the stale claim.
     pub fn take_if_unpinned_and_rev_matches(
         &self,
         id: &str,
@@ -1059,8 +1063,17 @@ impl EpisodeStore {
         if cat.episodes.remove(id).is_some() {
             cat.commit_tokens.remove(id);
             let claim = next_delete_claim();
-            cat.deleting_episodes.insert(id.to_string(), claim);
+            cat.deleting_episodes.insert(id.to_string(), (claim, false));
             TakeEpisodeOutcome::Removed(claim)
+        } else if let Some((old_claim, true)) = cat.deleting_episodes.get(id).copied() {
+            let new_claim = next_delete_claim();
+            cat.deleting_episodes
+                .insert(id.to_string(), (new_claim, false));
+            cat.pending_delete_files.retain(|_, list| {
+                list.retain(|(eid, tok)| !(eid == id && *tok == old_claim));
+                !list.is_empty()
+            });
+            TakeEpisodeOutcome::Removed(new_claim)
         } else {
             TakeEpisodeOutcome::NotFound
         }
@@ -1104,18 +1117,23 @@ impl EpisodeStore {
             return TakeDatasetOutcome::SequenceRevisionChanged;
         }
         cat.deleting_datasets.insert(dataset.to_string());
-        let mut all_claims: Vec<(String, u64)> = cat
-            .pending_delete_files
-            .remove(dataset)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|(id, tok)| cat.deleting_episodes.get(id).copied() == Some(*tok))
-            .collect();
+        let mut all_claims: Vec<(String, u64)> = Vec::new();
+        for (id, old_tok) in cat.pending_delete_files.remove(dataset).unwrap_or_default() {
+            if cat
+                .deleting_episodes
+                .get(&id)
+                .is_some_and(|(tok, _)| *tok == old_tok)
+            {
+                let new_claim = next_delete_claim();
+                cat.deleting_episodes.insert(id.clone(), (new_claim, false));
+                all_claims.push((id, new_claim));
+            }
+        }
         for id in ids {
             if cat.episodes.remove(id).is_some() {
                 cat.commit_tokens.remove(id);
                 let claim = next_delete_claim();
-                cat.deleting_episodes.insert(id.clone(), claim);
+                cat.deleting_episodes.insert(id.clone(), (claim, false));
                 all_claims.push((id.clone(), claim));
             }
         }
@@ -1189,20 +1207,46 @@ impl EpisodeStore {
             if cat.in_progress_tokens.contains_key(id) {
                 return Err(StoreError::NotFound(id.into()));
             }
-            if cat.deleting_episodes.get(id).copied() != Some(claim) {
+            if !cat
+                .deleting_episodes
+                .get(id)
+                .is_some_and(|(tok, _)| *tok == claim)
+            {
                 return Ok(());
             }
         }
-        let found = self.unlink_episode_files_raw(id)?;
-        let mut cat = self.cat();
-        if cat.deleting_episodes.get(id).copied() == Some(claim) {
-            cat.deleting_episodes.remove(id);
+        match self.unlink_episode_files_raw(id) {
+            Ok(found) => {
+                let mut cat = self.cat();
+                if cat
+                    .deleting_episodes
+                    .get(id)
+                    .is_some_and(|(tok, _)| *tok == claim)
+                {
+                    cat.deleting_episodes.remove(id);
+                }
+                cat.pending_delete_files.retain(|_, list| {
+                    list.retain(|(eid, tok)| !(eid == id && *tok == claim));
+                    !list.is_empty()
+                });
+                if found {
+                    Ok(())
+                } else {
+                    Err(StoreError::NotFound(id.into()))
+                }
+            }
+            Err(e) => {
+                // Mark claim retryable so a repeat DELETE can mint a fresh claim and recover once
+                // the transient I/O error clears, while continuing to block ID reuse and adoption.
+                let mut cat = self.cat();
+                if let Some(entry) = cat.deleting_episodes.get_mut(id) {
+                    if entry.0 == claim {
+                        entry.1 = true;
+                    }
+                }
+                Err(e)
+            }
         }
-        cat.pending_delete_files.retain(|_, list| {
-            list.retain(|(eid, tok)| !(eid == id && *tok == claim));
-            !list.is_empty()
-        });
-        if found { Ok(()) } else { Err(StoreError::NotFound(id.into())) }
     }
 
     /// Remove on-disk files for an episode taken via `take_for_delete` /

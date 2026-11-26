@@ -1094,13 +1094,12 @@ impl TerminalCaptureChannel {
         action_id != 0 && self.sequence_commit_inflight.load(Ordering::Acquire) == action_id
     }
 
-    /// Off-RT wait used by normal (non-emergency) shutdown finalization so any in-flight
-    /// RT-committed sequence repeat finishes local disk publication and updates `rich_action_cache`
-    /// BEFORE `drain_into` and `deliver_ready_under_gate` run (never called on emergency shutdown
-    /// and never holds any lock depended upon by the publisher).
-    pub(crate) fn wait_for_sequence_commit_idle(&self) {
+    /// Bounded off-RT wait used by normal shutdown finalization: waits up to `deadline` for any
+    /// in-flight RT-committed sequence repeat to finish local disk publication and update
+    /// `rich_action_cache`. Returns `true` if idle before `deadline`, `false` if still active.
+    pub(crate) fn wait_for_sequence_commit_idle_until(&self, deadline: std::time::Instant) -> bool {
         if self.sequence_commit_inflight.load(Ordering::Acquire) == 0 {
-            return;
+            return true;
         }
         let mut g = self
             .sequence_commit_wait
@@ -1108,12 +1107,18 @@ impl TerminalCaptureChannel {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         while self.sequence_commit_inflight.load(Ordering::Acquire) != 0 {
-            g = self
+            let rem = deadline.saturating_duration_since(std::time::Instant::now());
+            if rem.is_zero() {
+                return false;
+            }
+            let (ng, _) = self
                 .sequence_commit_wait
                 .1
-                .wait(g)
+                .wait_timeout(g, rem)
                 .unwrap_or_else(|e| e.into_inner());
+            g = ng;
         }
+        true
     }
 
     #[inline]
