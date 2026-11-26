@@ -73,6 +73,7 @@ fn so_arm101_config() -> ArmConfig {
     c.gravity_comp = None;
     c.torque_guard = None;
     c.damiao_ranges = None;
+    c.expected_timeout_counts = None;
     c.servo_max_velocity = None;
     c.resting_pose = None;
     c.power_budget = None;
@@ -117,6 +118,7 @@ fn config_6_plus_0() -> ArmConfig {
     c.gravity_comp = None;
     c.torque_guard = None;
     c.damiao_ranges = None;
+    c.expected_timeout_counts = None;
     c.servo_max_velocity = None;
     c.resting_pose = None;
     c.power_budget = None;

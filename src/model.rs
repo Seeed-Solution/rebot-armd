@@ -1496,6 +1496,11 @@ pub struct ArmConfig {
     /// POS_VEL base mode without being reported (profiles from before this field).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub damiao_gripper: Option<DamiaoGripperDrive>,
+    /// Opt-in expected Damiao `RID_TIMEOUT` register value per axis (raw counts, e.g. 2000 for
+    /// J1–J6 and 0 for position-force J7). Absent by default: pre-enable still requires fresh
+    /// causal `TIMEOUT` replies on startup and after BusLoss without enforcing specific values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_timeout_counts: Option<Vec<Option<u32>>>,
     /// Optional per-joint control-mode declarations with typed limits (length `dof`, each entry
     /// `null` to translate from existing follower/profile settings). Omitting this field keeps
     /// existing behaviour identically.
@@ -1668,6 +1673,7 @@ impl Default for ArmConfig {
             joint_tracking: None,
             damiao_ranges: None,
             damiao_gripper: None,
+            expected_timeout_counts: None,
             control_mode: None,
             tx_budget_ms: None,
             tx_stall_ticks: None,
@@ -2183,6 +2189,25 @@ impl ArmConfig {
             }
         }
         if let Some(p) = &self.power_budget { p.validate(self.dof)?; }
+        if let Some(expected) = &self.expected_timeout_counts {
+            const MAX_EXPECTED_TIMEOUT_COUNTS: u32 = 20_000;
+            if expected.len() != self.dof {
+                return Err(format!(
+                    "expected_timeout_counts needs {} entries (one per joint), got {}",
+                    self.dof,
+                    expected.len()
+                ));
+            }
+            for (j, entry) in expected.iter().enumerate() {
+                if let Some(c) = *entry {
+                    if c > MAX_EXPECTED_TIMEOUT_COUNTS {
+                        return Err(format!(
+                            "expected_timeout_counts[{j}] ({c}) must be in 0..={MAX_EXPECTED_TIMEOUT_COUNTS}"
+                        ));
+                    }
+                }
+            }
+        }
         if let Some(caps) = &self.servo_max_velocity {
             if caps.len() != self.dof || caps.iter().flatten().any(|v| !v.is_finite() || *v <= 0.0) {
                 return Err(format!("servo_max_velocity needs {} entries, each null or positive finite", self.dof));
@@ -3472,6 +3497,9 @@ impl ArmConfig {
                 DamiaoRange::REBOT_DM_J4_J7,
             ]),
             damiao_gripper: Some(DamiaoGripperDrive::rebot_dm()),
+            expected_timeout_counts: Some(vec![
+                Some(2000), Some(2000), Some(2000), Some(2000), Some(2000), Some(2000), Some(0),
+            ]),
             control_mode: None,
             tx_budget_ms: Some(10),
             tx_stall_ticks: None,

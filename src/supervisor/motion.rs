@@ -707,7 +707,16 @@ impl SupervisorInner {
                 if self.bus_loss_instant.is_none() {
                     self.bus_loss_instant = Some(Instant::now());
                 }
-                self.safety.latch(crate::safety::FaultKind::BusLoss, crate::safety::FaultDetail::BusLoss);
+                let bus_loss_detail = self.classify_bus_loss_detail();
+                if bus_loss_detail.is_some() {
+                    self.last_bus_loss_detail = bus_loss_detail;
+                }
+                let fault_detail = match bus_loss_detail {
+                    Some(d) => crate::safety::FaultDetail::BusLossAnnotated(d),
+                    None => crate::safety::FaultDetail::BusLoss,
+                };
+                self.safety.latch(crate::safety::FaultKind::BusLoss, fault_detail);
+                self.notify_driver_bus_loss();
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     let multi_device_gap = self

@@ -555,6 +555,9 @@ pub struct GripperStreamContact {
 /// CAN gaps observed on the reBot rig (2026-11-06, coinciding with 24 V sags);
 /// a real power loss drops the arm regardless of this bound.
 pub const BUS_LOSS_TIMEOUT: Duration = Duration::from_millis(500);
+/// Maximum spread (ms) between previously reporting motors' last valid RX timestamps to
+/// classify a BusLoss as a suspected synchronized motor power loss or shared CAN interruption.
+pub const POWER_LOSS_SYNC_WINDOW_MS: u64 = 100;
 /// A control tick arriving later than this after the previous one (or a non-finite /
 /// non-positive step) latches Fault `CONTROL_DEADLINE` while torqued and operational.
 /// Same bound as the hardware feedback freshness limit of the drivers.
@@ -1307,6 +1310,13 @@ pub struct SupervisorInner {
     pub gravity_scale: f32,
     pub gravity_torques_ramped: Vec<f32>,
     pub last_can_feedback_instant: Option<Instant>,
+    /// Per-motor last valid RX timestamp (driver clock), preserved across stale periods and
+    /// `J7FeedbackStale` faults so `BusLoss` can classify synchronized power/CAN interruptions.
+    pub(crate) last_valid_motor_rx: [Option<Instant>; crate::model::MAX_MOTION_DOF],
+    /// Deferred `ArmDriver::notify_bus_loss` if the driver slot could not be locked during BusLoss.
+    pub(crate) pending_driver_bus_loss_notify: bool,
+    /// Last classified synchronized BusLoss evidence (cleared on successful `clear_fault`).
+    pub(crate) last_bus_loss_detail: Option<crate::safety::BusLossDetail>,
     /// RT-owned state of this arm (`crate::rt_core`): per-joint feedback receive instants and
     /// sequence counters, the state publisher and the recording ring.
     pub core: crate::rt_core::ArmCore,
@@ -2590,6 +2600,9 @@ impl SupervisorInner {
             gravity_scale: 0.5,
             gravity_torques_ramped: vec![0.0; dof],
             last_can_feedback_instant: None,
+            last_valid_motor_rx: [None; crate::model::MAX_MOTION_DOF],
+            pending_driver_bus_loss_notify: false,
+            last_bus_loss_detail: None,
             core: crate::rt_core::ArmCore::new(dof),
             joint_feedback_queue_bounds: Vec::with_capacity(dof),
             scratch: crate::rt_core::scratch::TickScratch::with_dof(dof),
@@ -7203,6 +7216,9 @@ impl SupervisorInner {
         driver.set_external_pos_force_emitter(true);
         driver.set_stopped_disable_gate(self.stopped_disable_gate());
         self.driver_clock = driver.driver_clock();
+        self.last_valid_motor_rx = [None; crate::model::MAX_MOTION_DOF];
+        self.pending_driver_bus_loss_notify = false;
+        self.last_bus_loss_detail = None;
         let caps = driver.capabilities();
         self.driver_has_torque_feedback = caps.torque_feedback;
         self.driver_has_load_feedback = caps.load_feedback;
@@ -8366,6 +8382,63 @@ impl SupervisorInner {
     ///   staleness duration on the driver clock; at or above `damiao_gripper.feedback_stale_fault_ms`
     ///   (default 250 ms, 200..=450 ms), halts motion zero-alloc and latches recoverable
     ///   [`FaultKind::J7FeedbackStale`] once per fault episode.
+    /// Classify whether a `BusLoss` matches a synchronized multi-motor feedback drop (all
+    /// previously reporting motors stale, with their last valid RX timestamps clustered within
+    /// [`POWER_LOSS_SYNC_WINDOW_MS`]). Zero heap allocations, O(dof) timestamp comparisons.
+    pub(crate) fn classify_bus_loss_detail(&self) -> Option<crate::safety::BusLossDetail> {
+        let dof = self.config.dof.min(crate::model::MAX_MOTION_DOF);
+        let mut reported = 0u8;
+        let mut min_ts: Option<Instant> = None;
+        let mut max_ts: Option<Instant> = None;
+        for i in 0..dof {
+            if let Some(ts) = self.last_valid_motor_rx[i] {
+                reported = reported.saturating_add(1);
+                min_ts = Some(min_ts.map_or(ts, |m| m.min(ts)));
+                max_ts = Some(max_ts.map_or(ts, |m| m.max(ts)));
+            }
+        }
+        if reported < 2 {
+            return None;
+        }
+        let (min_ts, max_ts) = (min_ts?, max_ts?);
+        let now = self.cached_driver_clock_now();
+        // Every previously reporting motor must have gone stale (older than the 250 ms feedback
+        // validity window), not merely experienced a single-axis silence or immediate read error
+        // while other motors are still answering fresh frames.
+        if now.saturating_duration_since(max_ts) < Duration::from_millis(250) {
+            return None;
+        }
+        let spread = max_ts.saturating_duration_since(min_ts);
+        if spread > Duration::from_millis(POWER_LOSS_SYNC_WINDOW_MS) {
+            return None;
+        }
+        let last_power_a = self
+            .power
+            .last_valid_bus_a
+            .or(self.power.last_valid_fast_a)
+            .filter(|a| a.is_finite());
+        Some(crate::safety::BusLossDetail {
+            synchronized: true,
+            reporting_motors: reported,
+            spread_ms: spread.as_millis().min(u128::from(u64::MAX)) as u64,
+            last_power_a,
+        })
+    }
+
+    /// Notify the active driver that `BusLoss` latched so the next enable re-verifies `CTRL_MODE`
+    /// and `TIMEOUT` causally across all motors. Non-blocking: defers via
+    /// `pending_driver_bus_loss_notify` if the driver slot is currently contended.
+    pub(crate) fn notify_driver_bus_loss(&mut self) {
+        let notified = self
+            .driver
+            .as_mut()
+            .and_then(|d| d.try_with_mut(|drv| drv.notify_bus_loss()).ok())
+            .is_some();
+        if !notified && self.driver.is_some() {
+            self.pending_driver_bus_loss_notify = true;
+        }
+    }
+
     fn handle_j7_feedback_staleness(
         &mut self,
         pf_status: crate::driver::PosForceTxStatus,
@@ -9119,6 +9192,42 @@ impl SupervisorInner {
                         self.capture_driver_cache = cap_cache;
                         let all_fresh_age = sc.ages.len() == self.config.dof
                             && sc.ages.iter().all(|a| a.is_some_and(|age| age <= Duration::from_millis(250)));
+                        driver.feedback_receive_instants_into(&mut sc.rx);
+                        let rx_dof = self.config.dof.min(crate::model::MAX_MOTION_DOF);
+                        for i in 0..rx_dof {
+                            let st_ok = sc.states.get(i).is_some_and(|st| {
+                                st.position.is_finite()
+                                    && (!caps.velocity_feedback || st.velocity.is_finite())
+                                    && (!caps.torque_feedback || st.torque.is_finite())
+                            });
+                            if !st_ok {
+                                continue;
+                            }
+                            let ts = sc
+                                .rx
+                                .get(i)
+                                .copied()
+                                .flatten()
+                                .or_else(|| {
+                                    sc.rx
+                                        .is_empty()
+                                        .then(|| {
+                                            sc.ages
+                                                .get(i)
+                                                .copied()
+                                                .flatten()
+                                                .filter(|&age| age <= BUS_LOSS_TIMEOUT)
+                                                .and_then(|age| poll_before.checked_sub(age))
+                                        })
+                                        .flatten()
+                                });
+                            if let Some(ts) = ts {
+                                self.last_valid_motor_rx[i] = Some(match self.last_valid_motor_rx[i] {
+                                    Some(prev) => prev.max(ts),
+                                    None => ts,
+                                });
+                            }
+                        }
                         if self.feedback_numeric_valid && sc.ages.len() == self.config.dof && driver_valid {
                             let oldest = sc.ages.iter().try_fold(Duration::ZERO, |m, a| a.map(|a| m.max(a)));
                             self.last_can_feedback_instant = oldest
@@ -9146,7 +9255,6 @@ impl SupervisorInner {
                             );
                         }
                         if self.feedback_numeric_valid && all_fresh_age && driver_valid {
-                            driver.feedback_receive_instants_into(&mut sc.rx);
                             if sc.rx.len() == self.config.dof && sc.rx.iter().all(Option::is_some) {
                                 sc.rx_vals.clear();
                                 sc.rx_vals.extend(sc.rx.iter().map(|t| t.unwrap()));
@@ -9224,6 +9332,10 @@ impl SupervisorInner {
                             );
                         }
                     }
+                }
+                if self.pending_driver_bus_loss_notify {
+                    driver.notify_bus_loss();
+                    self.pending_driver_bus_loss_notify = false;
                 }
                 if self.is_torqued
                     && !self.disable_pending
@@ -11329,7 +11441,16 @@ impl SupervisorInner {
                 self.commanded_velocities.fill(0.0);
                 self.commanded_accelerations.fill(0.0);
                 self.output_suspended = false;
-                self.safety.latch(crate::safety::FaultKind::BusLoss, crate::safety::FaultDetail::BusLoss);
+                let bus_loss_detail = self.classify_bus_loss_detail();
+                if bus_loss_detail.is_some() {
+                    self.last_bus_loss_detail = bus_loss_detail;
+                }
+                let fault_detail = match bus_loss_detail {
+                    Some(d) => crate::safety::FaultDetail::BusLossAnnotated(d),
+                    None => crate::safety::FaultDetail::BusLoss,
+                };
+                self.safety.latch(crate::safety::FaultKind::BusLoss, fault_detail);
+                self.notify_driver_bus_loss();
             }
         }
         // MIT tracking (Phase 2): deadline supervision, park hand back at rest, handover at rest.

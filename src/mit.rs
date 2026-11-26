@@ -1479,6 +1479,7 @@ impl crate::supervisor::SupervisorInner {
                         );
                     }),
                 );
+                self.notify_driver_bus_loss();
             }
             return;
         }

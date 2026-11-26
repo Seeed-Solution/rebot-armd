@@ -4020,11 +4020,16 @@ impl SupervisorInner {
         let expected_lease_gen = authority
             .and_then(|a| (a.lease_generation != 0).then_some(a.lease_generation));
         let measured_positions = &self.measured_positions;
+        let pending_bus_loss_notify = &mut self.pending_driver_bus_loss_notify;
         let res = {
             #[cfg(not(target_arch = "wasm32"))]
             let shadow_rt = &mut self.torque_shadow;
             let d = self.driver.as_mut().expect("checked is_some");
             let run_start = |drv: &mut dyn crate::driver::ArmDriver| {
+                if *pending_bus_loss_notify {
+                    drv.notify_bus_loss();
+                    *pending_bus_loss_notify = false;
+                }
                 let enable_fb = drv.capabilities().enable_feedback;
                 let drv_now = drv.clock_now();
                 let tx_dl = owner_dl.map(|dl| drv_now + dl.saturating_duration_since(owner_now));
@@ -9833,6 +9838,7 @@ impl SupervisorInner {
         self.following_error_since = None;
         self.watchdog_park_blocked_reason = None;
         self.bus_loss_instant = None;
+        self.last_bus_loss_detail = None;
         self.output_suspended = false;
         self.reset_gripper_stall();
         self.handover_settling_since = None;

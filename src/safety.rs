@@ -114,6 +114,38 @@ impl FaultCode {
     }
 }
 
+/// Inline, allocation-free numeric diagnostics for [`FaultCode::BusLoss`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BusLossDetail {
+    pub synchronized: bool,
+    pub reporting_motors: u8,
+    pub spread_ms: u64,
+    pub last_power_a: Option<f32>,
+}
+
+impl BusLossDetail {
+    /// Formats a human-readable bus-loss message directly into a [`core::fmt::Write`] sink
+    /// without heap allocation.
+    pub fn write_message_into(&self, out: &mut impl core::fmt::Write) {
+        if !self.synchronized {
+            let _ = out.write_str("No fresh feedback from every joint (bus loss)");
+            return;
+        }
+        let _ = match self.last_power_a.filter(|a| a.is_finite()) {
+            Some(a) => write!(
+                out,
+                "No fresh feedback from every joint (bus loss). Suspected motor power loss or shared CAN interruption. ({} motors silent within {} ms; last power estimate {a:.2} A)",
+                self.reporting_motors, self.spread_ms
+            ),
+            None => write!(
+                out,
+                "No fresh feedback from every joint (bus loss). Suspected motor power loss or shared CAN interruption. ({} motors silent within {} ms)",
+                self.reporting_motors, self.spread_ms
+            ),
+        };
+    }
+}
+
 /// Inline, allocation-free numeric diagnostics for [`FaultCode::J7FeedbackStale`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct J7StaleDetail {
@@ -587,6 +619,8 @@ pub enum FaultDetail {
     Estop,
     /// CAN / actuator feedback lost on one or more joints.
     BusLoss,
+    /// CAN / actuator feedback lost with inline synchronized-loss diagnostics (0 heap ops).
+    BusLossAnnotated(BusLossDetail),
     /// Control lease expired while torqued.
     WatchdogTimeout,
     /// Bounded CAN TX stalled (optional inline numeric diagnostics, 0 heap ops).
@@ -652,7 +686,7 @@ impl FaultDetail {
     pub const fn code(self, kind: FaultKind) -> FaultCode {
         match self {
             Self::Estop => FaultCode::Estop,
-            Self::BusLoss => FaultCode::BusLoss,
+            Self::BusLoss | Self::BusLossAnnotated(_) => FaultCode::BusLoss,
             Self::WatchdogTimeout => FaultCode::WatchdogTimeout,
             Self::CanTxStalled(_) => FaultCode::CanTxStalled,
             Self::J7FeedbackStale(_) => FaultCode::J7FeedbackStale,
@@ -671,6 +705,7 @@ impl FaultDetail {
         match self {
             Self::Estop => BoundedFaultReason::Other(BoundedText::new("E-stop latched")),
             Self::BusLoss => BoundedFaultReason::BusLoss,
+            Self::BusLossAnnotated(detail) => BoundedFaultReason::BusLossAnnotated(detail),
             Self::WatchdogTimeout => BoundedFaultReason::WatchdogTimeout,
             Self::CanTxStalled(detail) => BoundedFaultReason::CanTxStalled(detail),
             Self::J7FeedbackStale(detail) => BoundedFaultReason::J7FeedbackStale(detail),
@@ -800,6 +835,7 @@ pub enum BoundedFaultReason {
     JointLimitExceeded { joint_idx: usize, joint_name: BoundedText<SAFETY_JOINT_NAME_CAPACITY>, value: f32, min: f32, max: f32 },
     ThermalTrip { joint_idx: usize, temperature: f32, limit: f32 },
     BusLoss,
+    BusLossAnnotated(BusLossDetail),
     WatchdogTimeout,
     CanTxStalled(Option<TxStallDetail>),
     J7FeedbackStale(Option<J7StaleDetail>),
@@ -834,6 +870,9 @@ impl BoundedFaultReason {
             Self::BusLoss => {
                 let _ = w.write_str("No fresh feedback from every joint (bus loss)");
             }
+            Self::BusLossAnnotated(detail) => {
+                detail.write_message_into(w);
+            }
             Self::WatchdogTimeout => {
                 let _ = w.write_str("Control lease expired while torqued");
             }
@@ -866,7 +905,7 @@ impl std::fmt::Debug for BoundedFaultReason {
             Self::ThermalTrip { joint_idx, temperature, limit } => f
                 .debug_struct("ThermalTrip")
                 .field("joint_idx", joint_idx).field("temperature", temperature).field("limit", limit).finish(),
-            Self::BusLoss => f.write_str("BusLoss"),
+            Self::BusLoss | Self::BusLossAnnotated(_) => f.write_str("BusLoss"),
             Self::WatchdogTimeout => f.write_str("WatchdogTimeout"),
             Self::CanTxStalled(_) => f.write_str("CanTxStalled"),
             Self::J7FeedbackStale(_) => f.write_str("J7FeedbackStale"),
@@ -2151,7 +2190,7 @@ impl SafetyManager {
     fn acquire_state_arc(&mut self, kind: FaultKind, detail: FaultDetail) -> Option<Arc<SafetyState>> {
         match detail {
             FaultDetail::Estop => Some(Arc::clone(&self.estop_arc)),
-            FaultDetail::BusLoss => Some(Arc::clone(&self.bus_loss_arc)),
+            FaultDetail::BusLoss | FaultDetail::BusLossAnnotated(_) => Some(Arc::clone(&self.bus_loss_arc)),
             FaultDetail::WatchdogTimeout => Some(Arc::clone(&self.watchdog_timeout_arc)),
             FaultDetail::CanTxStalled(_) => Some(Arc::clone(&self.can_tx_stalled_arc)),
             FaultDetail::J7FeedbackStale(_) => Some(Arc::clone(&self.j7_feedback_stale_arc)),
@@ -2293,7 +2332,16 @@ impl SafetyManager {
                 (!d.code.recoverable() && code.recoverable())
                     || (d.code == FaultCode::EnableFailed && code == FaultCode::HardwareFault)
             });
-        if !keep_prev_other_detail {
+        let keep_prev_bus_loss_detail = kind == FaultKind::BusLoss
+            && matches!(
+                prev_detail,
+                Some(LatchedFaultDetail {
+                    reason: BoundedFaultReason::BusLossAnnotated(d),
+                    ..
+                }) if d.synchronized
+            )
+            && matches!(bounded_reason, BoundedFaultReason::BusLoss);
+        if !keep_prev_other_detail && !keep_prev_bus_loss_detail {
             self.latched_fault_details[kind as usize] = Some(LatchedFaultDetail {
                 code,
                 reason: bounded_reason,

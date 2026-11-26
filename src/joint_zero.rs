@@ -444,6 +444,7 @@ impl ArmDriver for ZeroOffsetDriver {
     fn disable_dispatched_mask(&self) -> u64 { self.inner.disable_dispatched_mask() }
     fn finish_dispatched_disable(&mut self) -> Result<(), ArmDriverError> { self.inner.finish_dispatched_disable() }
     fn abort_enable(&mut self) { self.inner.abort_enable() }
+    fn notify_bus_loss(&mut self) { self.inner.notify_bus_loss() }
     fn prepare_safe_hold(&mut self) { self.inner.prepare_safe_hold() }
     fn enable_frames_dispatched(&self) -> bool { self.inner.enable_frames_dispatched() }
     fn abort_pending_disable(&mut self) -> bool { self.inner.abort_pending_disable() }

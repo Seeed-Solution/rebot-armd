@@ -486,6 +486,9 @@ pub struct PowerMonitor {
     pub max_at_s: f64,
     /// Time with `fast_a` above the supply rating (s).
     pub over_rated_s: f64,
+    /// Last valid display/fast estimates preserved across invalidation (e.g. BusLoss diagnostics).
+    pub last_valid_bus_a: Option<f32>,
+    pub last_valid_fast_a: Option<f32>,
     pub gov: Governor,
     primed: bool,
     /// Time since the last fresh feedback (s).
@@ -497,7 +500,7 @@ impl Default for PowerMonitor {
         Self {
             valid: false, raw_a: 0.0, fast_a: 0.0, bus_a: 0.0, regen_w: 0.0, joint_a: [0.0; MAX_JOINTS],
             peak_5s: PeakWindow::new(PEAK_WINDOW_S / 10.0), peak_60s: PeakWindow::new(1.0),
-            max_a: 0.0, max_at_s: 0.0, over_rated_s: 0.0, gov: Governor::default(), primed: false, stale_s: 0.0,
+            max_a: 0.0, max_at_s: 0.0, over_rated_s: 0.0, last_valid_bus_a: None, last_valid_fast_a: None, gov: Governor::default(), primed: false, stale_s: 0.0,
         }
     }
 }
@@ -518,6 +521,8 @@ impl PowerMonitor {
         self.valid = true;
         self.stale_s = 0.0;
         self.raw_a = e.bus_a;
+        if self.bus_a.is_finite() { self.last_valid_bus_a = Some(self.bus_a); }
+        if self.fast_a.is_finite() { self.last_valid_fast_a = Some(self.fast_a); }
         self.peak_5s.push(now_s, self.fast_a);
         self.peak_60s.push(now_s, self.fast_a);
         if self.fast_a > self.max_a { self.max_a = self.fast_a; self.max_at_s = now_s; }
@@ -795,6 +800,8 @@ impl SupervisorInner {
             "observation": self.power_observation(),
             "fast_a": r3(m.fast_a),
             "raw_a": r3(m.raw_a),
+            "last_valid_bus_a": m.last_valid_bus_a.map(r3),
+            "last_valid_fast_a": m.last_valid_fast_a.map(r3),
             "peak_5s_a": r3(m.peak_5s.max()),
             "peak_60s_a": r3(m.peak_60s.max()),
             "max_a": r3(m.max_a),

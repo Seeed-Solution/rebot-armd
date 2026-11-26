@@ -1049,6 +1049,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gripper_drive = armd::driver::gripper_drive_from_profile(&config)?;
     #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
     let damiao_tx_budget = config.damiao_tx_budget();
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+    let expected_timeout_counts = config.expected_timeout_counts.clone();
     let supervisor = Arc::new(ArmSupervisor::new(config));
     supervisor.set_owner_reason(resolved_owner.reason).await;
     // Install the process-wide lock-free/zero-alloc tiered panic coordinator strictly BEFORE
@@ -1123,6 +1125,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         driver = driver.with_joint_limits(limits)?;
                     }
                     driver = driver.with_gripper_drive(gripper_drive)?;
+                    if let Some(expected) = expected_timeout_counts {
+                        driver = driver.with_expected_timeout_counts(expected)?;
+                    }
                     // Read-only register check before anything can enable the motors.
                     driver.check_mapping_ranges();
                     supervisor.set_driver(Box::new(driver)).await;

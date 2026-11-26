@@ -2351,6 +2351,7 @@ fn nine_dof_urdf_plus_gripper_config(urdf_path: &std::path::Path) -> ArmConfig {
     cfg.gravity_comp = None;
     cfg.torque_guard = None;
     cfg.damiao_ranges = None;
+    cfg.expected_timeout_counts = None;
     cfg.servo_max_velocity = None;
     cfg.planned_max_velocity = None;
     cfg.speed_cap = None;

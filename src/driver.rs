@@ -234,6 +234,15 @@ pub enum ArmDriverError {
     #[error("joint {} CTRL_MODE readback: request not sent: {kind}; capped operation unavailable", joint + 1)]
     PosForceReadbackTxFailed { joint: usize, kind: TxFailKind },
 
+    #[error("joint {} TIMEOUT readback mismatch: expected {expected} counts, observed {observed} counts", joint + 1)]
+    TimeoutReadbackMismatch { joint: usize, expected: u32, observed: u32 },
+
+    #[error("joint {} TIMEOUT readback: no fresh reply within {timeout_ms} ms", joint + 1)]
+    TimeoutReadbackMissing { joint: usize, timeout_ms: u64 },
+
+    #[error("joint {} TIMEOUT readback: request not sent: {kind}", joint + 1)]
+    TimeoutReadbackTxFailed { joint: usize, kind: TxFailKind },
+
     #[error("joint {} CTRL_MODE readback: pre-enable hold not sent: TX budget exhausted; capped operation unavailable", joint + 1)]
     PosForcePreEnableHoldBudgetExhausted { joint: usize },
 
@@ -1786,6 +1795,9 @@ pub trait ArmDriver: Send {
     /// Aborts any pending enable handshake without transmitting further enable frames
     /// (called when E-stop or a fault intervenes mid-enable).
     fn abort_enable(&mut self) {}
+    /// Notify the driver that `BusLoss` latched so the next enable must re-verify registers
+    /// (`CTRL_MODE` and `TIMEOUT`) causally before energizing any motor.
+    fn notify_bus_loss(&mut self) {}
     /// Prepares an exclusively owned driver on SAFE-HOLD entry: aborts any interrupted enable
     /// handshake AND reconciles any abandoned disable handshake while preserving
     /// `disable_dispatched_mask` so remaining energized axes keep receiving measured-position holds
@@ -7927,6 +7939,18 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     uncertain_readback_probe: [Option<(u64, Instant, Instant, Instant, Option<i128>)>; MAX_MODE_JOINTS],
     /// PMAX / VMAX / TMAX read back from the motor and equal to `limits[i]`.
     mit_limits_verified: Vec<bool>,
+    /// Opt-in expected Damiao `RID_TIMEOUT` counts per joint (`None` = any fresh reply accepted).
+    expected_timeout_counts: Vec<Option<u32>>,
+    /// True when pre-enable `RID_TIMEOUT` readback verification is opted in (via
+    /// [`Self::with_expected_timeout_counts`], wired from profile `expected_timeout_counts`).
+    timeout_check_enabled: bool,
+    /// Per-joint causal `RID_TIMEOUT` verification state (cleared on startup and after BusLoss).
+    timeout_verified: Vec<bool>,
+    /// Last causally observed `RID_TIMEOUT` raw register value per joint.
+    observed_timeout_counts: Vec<Option<u32>>,
+    /// True when opted-in startup or post-BusLoss register verification is pending: next enable
+    /// must run fresh causal `CTRL_MODE` and `TIMEOUT` readbacks across all motors before energizing.
+    startup_register_check_pending: bool,
     /// Register replies seen by `read_joint_states` since the last clear.
     register_replies: Vec<damiao::RegisterReply>,
     /// Last mapping-range check (`check_mapping_ranges`); None = not run.
@@ -9121,13 +9145,21 @@ enum RefreshStep {
     TimedOut,
 }
 
-/// CTRL_MODE readback before enable (L2): verifies `verified_modes[j] == Some(base_mode(j))`
-/// for every unverified joint (and always for a configured position-force gripper) before any
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadbackStage {
+    CtrlMode,
+    Timeout,
+}
+
+/// Pre-enable `CTRL_MODE` and `TIMEOUT` readback (L2 + power-overload PR 1): verifies
+/// `verified_modes[j] == Some(base_mode(j))` and fresh causal `RID_TIMEOUT` replies before any
 /// `CMD_ENABLE` frame is transmitted. Stored inline with bitmasks (zero heap allocation).
 #[derive(Debug)]
 struct ModeReadback {
+    stage: ReadbackStage,
     remaining_mask: u32,
     sent_mask: u32,
+    timeout_pending_mask: u32,
     boundary: Option<u64>,
     deadline: Deadline,
 }
@@ -9272,6 +9304,11 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             last_feedback_decode_offset_ns: vec![None; dof],
             uncertain_readback_probe: [None; MAX_MODE_JOINTS],
             mit_limits_verified: vec![false; dof],
+            expected_timeout_counts: vec![None; dof],
+            timeout_check_enabled: false,
+            timeout_verified: vec![false; dof],
+            observed_timeout_counts: vec![None; dof],
+            startup_register_check_pending: false,
             register_replies: Vec::with_capacity(64),
             range_check: None,
             recovery_written_joints: Vec::with_capacity(dof.max(16)),
@@ -10938,6 +10975,20 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.limits = limits;
         self.mit_limits_verified.fill(false);
         self.range_check = None;
+        Ok(self)
+    }
+
+    /// Opt-in expected Damiao `RID_TIMEOUT` raw counts per axis (`None` skips value matching
+    /// for that axis while still requiring a fresh causal reply on startup and after BusLoss).
+    pub fn with_expected_timeout_counts(mut self, expected: Vec<Option<u32>>) -> Result<Self, ArmDriverError> {
+        if expected.len() != self.motor_ids.len() {
+            return Err(ArmDriverError::JointCountMismatch { expected: self.motor_ids.len(), actual: expected.len() });
+        }
+        self.expected_timeout_counts = expected;
+        self.timeout_check_enabled = true;
+        self.timeout_verified.fill(false);
+        self.observed_timeout_counts.fill(None);
+        self.startup_register_check_pending = true;
         Ok(self)
     }
 
@@ -13484,10 +13535,12 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         // normal control batch for this release without duplicate holds.
         if self.mit_fence_trip.is_none()
             && !self.pending_rearm
+            && !self.startup_register_check_pending
             && self.is_enabled
             && (0..self.motor_ids.len()).all(|i| {
                 self.verified_modes.get(i).copied().flatten() == Some(self.base_mode(i))
                     && self.joint_modes.get(i).copied().flatten() == Some(self.base_mode(i))
+                    && (!self.timeout_check_enabled || self.timeout_verified.get(i).copied().unwrap_or(false))
             })
             && self.pos_force.as_ref().is_none_or(|pf| {
                 self.pos_force_verified
@@ -14647,33 +14700,53 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     }
 
     /// Every enable requires causal `verified_modes[j] == Some(base_mode(j))` for every joint it
-    /// energizes (L2), plus a fresh CTRL_MODE readback for a position-force gripper (a motor
-    /// power cycle resets the RAM mode).
+    /// energizes (L2), fresh causal `CTRL_MODE` and `TIMEOUT` replies from all motors on startup
+    /// and after BusLoss, plus a fresh `CTRL_MODE` readback for a position-force gripper on every
+    /// enable (a motor power cycle resets RAM registers).
     fn readback_or_enable(&mut self) -> Result<TorqueProgress, ArmDriverError> {
         let dof = self.motor_ids.len().min(handshake::MAX_MASK_JOINTS);
         let pf_joint = self.pos_force.as_ref().map(|p| p.joint);
-        let mut remaining_mask = 0u32;
+        let mut mode_mask = 0u32;
+        let mut timeout_mask = 0u32;
         for i in 0..dof {
             let base = self.base_mode(i);
-            if self.verified_modes.get(i).copied().flatten() != Some(base)
+            if self.startup_register_check_pending
+                || self.verified_modes.get(i).copied().flatten() != Some(base)
                 || self.joint_modes.get(i).copied().flatten() != Some(base)
                 || pf_joint == Some(i)
             {
-                remaining_mask |= 1u32 << i;
+                mode_mask |= 1u32 << i;
+            }
+            if self.timeout_check_enabled
+                && (self.startup_register_check_pending
+                    || !self.timeout_verified.get(i).copied().unwrap_or(false))
+            {
+                timeout_mask |= 1u32 << i;
             }
         }
         if pf_joint.is_some() {
             self.pos_force_verified = false;
         }
-        if remaining_mask == 0 {
+        if mode_mask == 0 && timeout_mask == 0 {
             return self.send_enable();
         }
         let now = self.now();
+        let mut dl_at = now + REGISTER_REPLY_TIMEOUT;
+        if let Some(auth_dl) = self.enable_tx_deadline {
+            dl_at = dl_at.min(auth_dl);
+        }
+        let (stage, remaining_mask, timeout_pending_mask) = if mode_mask != 0 {
+            (ReadbackStage::CtrlMode, mode_mask, timeout_mask)
+        } else {
+            (ReadbackStage::Timeout, timeout_mask, 0)
+        };
         self.torque_hs = Some(DamiaoTorque::Readback(ModeReadback {
+            stage,
             remaining_mask,
             sent_mask: 0,
+            timeout_pending_mask,
             boundary: None,
-            deadline: Deadline::after(now, REGISTER_REPLY_TIMEOUT),
+            deadline: Deadline { at: dl_at },
         }));
         Ok(TorqueProgress::Pending { wake: now })
     }
@@ -14712,144 +14785,227 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         )))
     }
 
-    /// Serve the pre-enable `RID_CTRL_MODE` readback for all joints in `r.remaining_mask` (L2):
+    /// Serve the pre-enable `RID_CTRL_MODE` and `RID_TIMEOUT` readbacks (L2 + power-overload PR 1):
     /// requests go out once a receive pass observes an empty queue; only causal post-boundary read
-    /// replies matching `base_mode(j)` (and expected master CAN ID for PosForce) recorded strictly
-    /// before the 50 ms deadline count. Zero heap allocations on the polling path.
+    /// replies matching `base_mode(j)` (and expected master CAN ID for PosForce) or configured
+    /// `expected_timeout_counts[j]` recorded strictly before the 50 ms stage deadline count.
+    /// Zero heap allocations on the polling path.
     fn poll_readback(&mut self, mut r: ModeReadback) -> Result<TorqueProgress, ArmDriverError> {
-        self.enable_estop_inhibited()?;
-        let expired_before_read = r.deadline.passed(self.now());
-        if !expired_before_read {
-            let _ = self.receive_feedback();
+        loop {
             self.enable_estop_inhibited()?;
-        }
-        if r.boundary.is_none() && !expired_before_read && !r.deadline.passed(self.now()) && self.last_read_drained {
-            r.boundary = Some(self.rx_empty_seq);
-            self.register_reply_log.clear();
-        }
-        if r.boundary.is_some() && !expired_before_read && !r.deadline.passed(self.now()) {
-            let unsent = r.remaining_mask & !r.sent_mask;
-            if self.motor_energized_mask != 0 {
-                self.service_urgent_enable_watchdog_holds(0, unsent != 0)?;
-            }
-            let mut sent_any = false;
-            let mut first_sent_joint = None;
-            for j in handshake::mask_joints(unsent) {
-                let id = self.motor_ids[j];
-                match self.send_plain(TxKind::Handshake, self.enable_stop_stamp, Some(r.deadline), false, |_| {
-                    Some(damiao::build_read_register_frame(id, damiao::RID_CTRL_MODE))
-                }) {
-                    Ok(_) => {
-                        r.sent_mask |= 1u32 << j;
-                        sent_any = true;
-                        if first_sent_joint.is_none() {
-                            first_sent_joint = Some(j);
-                        }
-                    }
-                    Err(TxRefusal::DeadlinePassed | TxRefusal::Deferred) => break,
-                    Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged) => {
-                        self.abort_enable_for_estop();
-                        return Err(ArmDriverError::EstopInhibited);
-                    }
-                    Err(TxRefusal::Transport(e)) if e.is_tx_backpressure() => break,
-                    Err(TxRefusal::Transport(e)) => {
-                        return self.readback_failed_err(
-                            j,
-                            ArmDriverError::PosForceReadbackTxFailed {
-                                joint: j,
-                                kind: TxFailKind::from_transport(&e),
-                            },
-                        );
-                    }
-                    Err(r_err) => {
-                        return self.readback_failed_err(j, Self::refusal_to_driver_err(r_err));
-                    }
-                }
-            }
-            if sent_any {
+            let expired_before_read = r.deadline.passed(self.now());
+            if !expired_before_read {
+                let _ = self.receive_feedback();
                 self.enable_estop_inhibited()?;
-                if let Err(e) = self.flush_can_and_commit() {
-                    let j = first_sent_joint.unwrap_or(0);
-                    return self.readback_failed_err(
-                        j,
-                        ArmDriverError::PosForceReadbackTxFailed {
-                            joint: j,
-                            kind: TxFailKind::from_transport(&e),
-                        },
-                    );
-                }
             }
-        }
-        if let Some(b) = r.boundary {
-            let awaiting = r.remaining_mask & r.sent_mask;
-            for j in handshake::mask_joints(awaiting) {
-                let id = self.motor_ids[j];
-                let base_mode = self.base_mode(j);
-                let want = Self::mode_value(base_mode);
-                let expected_id = self.expected_reply_id(j);
-                let check_id = base_mode == DamiaoControlMode::PosForce;
-                let reply = self
-                    .register_reply_log
-                    .iter()
-                    .rev()
-                    .find(|(rep, fid, rx_at, seq, _)| {
-                        !r.deadline.passed(*rx_at)
-                            && (!check_id || *fid == expected_id)
-                            && rep.motor_id == id
-                            && !rep.write
-                            && rep.rid == damiao::RID_CTRL_MODE
-                            && *seq > b
-                    })
-                    .map(|(rep, ..)| rep.as_u32());
-                match reply {
-                    Some(v) if v == want => {
-                        self.verified_modes[j] = Some(base_mode);
-                        self.joint_modes[j] = Some(base_mode);
-                        self.mode_readback_boundary[j] = None;
-                        if j < 32 {
-                            self.mode_write_uncertain_mask &= !(1u32 << j);
+            if r.boundary.is_none() && !expired_before_read && !r.deadline.passed(self.now()) && self.last_read_drained {
+                r.boundary = Some(self.rx_empty_seq);
+                self.register_reply_log.clear();
+            }
+            let rid = match r.stage {
+                ReadbackStage::CtrlMode => damiao::RID_CTRL_MODE,
+                ReadbackStage::Timeout => damiao::RID_TIMEOUT,
+            };
+            if r.boundary.is_some() && !expired_before_read && !r.deadline.passed(self.now()) {
+                let unsent = r.remaining_mask & !r.sent_mask;
+                if self.motor_energized_mask != 0 {
+                    self.service_urgent_enable_watchdog_holds(0, unsent != 0)?;
+                }
+                let mut sent_any = false;
+                let mut first_sent_joint = None;
+                for j in handshake::mask_joints(unsent) {
+                    let id = self.motor_ids[j];
+                    match self.send_plain(TxKind::Handshake, self.enable_stop_stamp, Some(r.deadline), false, |_| {
+                        Some(damiao::build_read_register_frame(id, rid))
+                    }) {
+                        Ok(_) => {
+                            r.sent_mask |= 1u32 << j;
+                            sent_any = true;
+                            if first_sent_joint.is_none() {
+                                first_sent_joint = Some(j);
+                            }
                         }
-                        #[cfg(not(target_arch = "wasm32"))]
-                        self.stage_damiao_mode_verified(j, base_mode);
-                        r.remaining_mask &= !(1u32 << j);
+                        Err(TxRefusal::DeadlinePassed | TxRefusal::Deferred) => break,
+                        Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged) => {
+                            self.abort_enable_for_estop();
+                            return Err(ArmDriverError::EstopInhibited);
+                        }
+                        Err(TxRefusal::Transport(e)) if e.is_tx_backpressure() => break,
+                        Err(TxRefusal::Transport(e)) => {
+                            let kind = TxFailKind::from_transport(&e);
+                            return match r.stage {
+                                ReadbackStage::CtrlMode => self.readback_failed_err(
+                                    j,
+                                    ArmDriverError::PosForceReadbackTxFailed { joint: j, kind },
+                                ),
+                                ReadbackStage::Timeout => {
+                                    self.enable_failed();
+                                    Err(ArmDriverError::TimeoutReadbackTxFailed { joint: j, kind })
+                                }
+                            };
+                        }
+                        Err(r_err) => {
+                            let err = Self::refusal_to_driver_err(r_err);
+                            return match r.stage {
+                                ReadbackStage::CtrlMode => self.readback_failed_err(j, err),
+                                ReadbackStage::Timeout => {
+                                    self.enable_failed();
+                                    Err(err)
+                                }
+                            };
+                        }
                     }
-                    Some(v) => {
-                        return self.readback_failed_mismatch(j, format!("reads {v}, expected {want}"));
+                }
+                if sent_any {
+                    self.enable_estop_inhibited()?;
+                    if let Err(e) = self.flush_can_and_commit() {
+                        let j = first_sent_joint.unwrap_or(0);
+                        let kind = TxFailKind::from_transport(&e);
+                        return match r.stage {
+                            ReadbackStage::CtrlMode => self.readback_failed_err(
+                                j,
+                                ArmDriverError::PosForceReadbackTxFailed { joint: j, kind },
+                            ),
+                            ReadbackStage::Timeout => {
+                                self.enable_failed();
+                                Err(ArmDriverError::TimeoutReadbackTxFailed { joint: j, kind })
+                            }
+                        };
                     }
-                    None => {}
                 }
             }
-            if r.remaining_mask == 0 {
-                if let Some(pf_j) = self.pos_force.as_ref().map(|p| p.joint) {
-                    if self.last_read_drained
-                        && self.fresh_measured_position(pf_j, POS_FORCE_READBACK_FRESH_MARGIN).is_some()
-                    {
-                        return self.finish_pos_force_readback(pf_j, None);
+            if let Some(b) = r.boundary {
+                let awaiting = r.remaining_mask & r.sent_mask;
+                for j in handshake::mask_joints(awaiting) {
+                    let id = self.motor_ids[j];
+                    let base_mode = self.base_mode(j);
+                    let expected_id = self.expected_reply_id(j);
+                    let check_id = base_mode == DamiaoControlMode::PosForce;
+                    let reply = self
+                        .register_reply_log
+                        .iter()
+                        .rev()
+                        .find(|(rep, fid, rx_at, seq, _)| {
+                            !r.deadline.passed(*rx_at)
+                                && (!check_id || *fid == expected_id)
+                                && rep.motor_id == id
+                                && !rep.write
+                                && rep.rid == rid
+                                && *seq > b
+                        })
+                        .map(|(rep, ..)| rep.as_u32());
+                    match r.stage {
+                        ReadbackStage::CtrlMode => {
+                            let want = Self::mode_value(base_mode);
+                            match reply {
+                                Some(v) if v == want => {
+                                    self.verified_modes[j] = Some(base_mode);
+                                    self.joint_modes[j] = Some(base_mode);
+                                    self.mode_readback_boundary[j] = None;
+                                    if j < 32 {
+                                        self.mode_write_uncertain_mask &= !(1u32 << j);
+                                    }
+                                    #[cfg(not(target_arch = "wasm32"))]
+                                    self.stage_damiao_mode_verified(j, base_mode);
+                                    r.remaining_mask &= !(1u32 << j);
+                                }
+                                Some(v) => {
+                                    return self.readback_failed_mismatch(j, format!("reads {v}, expected {want}"));
+                                }
+                                None => {}
+                            }
+                        }
+                        ReadbackStage::Timeout => {
+                            if let Some(observed) = reply {
+                                self.observed_timeout_counts[j] = Some(observed);
+                                #[cfg(not(target_arch = "wasm32"))]
+                                if self.shadow_staging.is_enabled() && j < crate::torque::MAX_CHANNELS {
+                                    let now = self.now();
+                                    self.shadow_staging.push(
+                                        crate::torque::shadow::ShadowDriverObs::TimeoutReadback {
+                                            channel: j as u8,
+                                            raw_reg: observed,
+                                            now,
+                                        },
+                                    );
+                                }
+                                if let Some(expected) = self.expected_timeout_counts.get(j).copied().flatten() {
+                                    if observed != expected {
+                                        self.enable_failed();
+                                        return Err(ArmDriverError::TimeoutReadbackMismatch {
+                                            joint: j,
+                                            expected,
+                                            observed,
+                                        });
+                                    }
+                                }
+                                self.timeout_verified[j] = true;
+                                r.remaining_mask &= !(1u32 << j);
+                            }
+                        }
                     }
-                    let drained_now = !expired_before_read && self.last_read_drained;
-                    let refresh = match self.start_feedback_refresh(pf_j, drained_now) {
-                        Ok(ref_state) => ref_state,
-                        Err(e) if is_estop_inhibited(&e) => return Err(e),
-                        Err(e) => return self.readback_failed(pf_j, format!("pre-enable refresh not sent: {e}")),
-                    };
-                    let wake = self.now().min(refresh.deadline.at);
-                    self.torque_hs = Some(DamiaoTorque::PreEnableRefresh(refresh));
-                    return Ok(TorqueProgress::Pending { wake });
                 }
-                return self.send_enable();
+                if r.remaining_mask == 0 {
+                    if r.stage == ReadbackStage::CtrlMode && r.timeout_pending_mask != 0 {
+                        self.check_enable_tx_authority()?;
+                        let now = self.now();
+                        let mut dl_at = now + REGISTER_REPLY_TIMEOUT;
+                        if let Some(auth_dl) = self.enable_tx_deadline {
+                            dl_at = dl_at.min(auth_dl);
+                        }
+                        r = ModeReadback {
+                            stage: ReadbackStage::Timeout,
+                            remaining_mask: r.timeout_pending_mask,
+                            sent_mask: 0,
+                            timeout_pending_mask: 0,
+                            boundary: None,
+                            deadline: Deadline { at: dl_at },
+                        };
+                        continue;
+                    }
+                    self.startup_register_check_pending = false;
+                    if let Some(pf_j) = self.pos_force.as_ref().map(|p| p.joint) {
+                        if self.last_read_drained
+                            && self.fresh_measured_position(pf_j, POS_FORCE_READBACK_FRESH_MARGIN).is_some()
+                        {
+                            return self.finish_pos_force_readback(pf_j, None);
+                        }
+                        let drained_now = !expired_before_read && self.last_read_drained;
+                        let refresh = match self.start_feedback_refresh(pf_j, drained_now) {
+                            Ok(ref_state) => ref_state,
+                            Err(e) if is_estop_inhibited(&e) => return Err(e),
+                            Err(e) => return self.readback_failed(pf_j, format!("pre-enable refresh not sent: {e}")),
+                        };
+                        let wake = self.now().min(refresh.deadline.at);
+                        self.torque_hs = Some(DamiaoTorque::PreEnableRefresh(refresh));
+                        return Ok(TorqueProgress::Pending { wake });
+                    }
+                    return self.send_enable();
+                }
             }
+            if r.deadline.passed(self.now()) {
+                let j = r.remaining_mask.trailing_zeros() as usize;
+                return match r.stage {
+                    ReadbackStage::CtrlMode => {
+                        self.readback_failed(j, format!("no fresh reply within {} ms", REGISTER_REPLY_TIMEOUT.as_millis()))
+                    }
+                    ReadbackStage::Timeout => {
+                        self.enable_failed();
+                        Err(ArmDriverError::TimeoutReadbackMissing {
+                            joint: j,
+                            timeout_ms: REGISTER_REPLY_TIMEOUT.as_millis() as u64,
+                        })
+                    }
+                };
+            }
+            let wake = if (r.remaining_mask & !r.sent_mask) != 0 {
+                self.now().min(r.deadline.at)
+            } else {
+                r.deadline.at
+            };
+            self.torque_hs = Some(DamiaoTorque::Readback(r));
+            return Ok(TorqueProgress::Pending { wake });
         }
-        if r.deadline.passed(self.now()) {
-            let j = r.remaining_mask.trailing_zeros() as usize;
-            return self.readback_failed(j, format!("no fresh reply within {} ms", REGISTER_REPLY_TIMEOUT.as_millis()));
-        }
-        let wake = if (r.remaining_mask & !r.sent_mask) != 0 {
-            self.now().min(r.deadline.at)
-        } else {
-            r.deadline.at
-        };
-        self.torque_hs = Some(DamiaoTorque::Readback(r));
-        Ok(TorqueProgress::Pending { wake })
     }
 
     fn poll_pre_enable_refresh(&mut self, refresh: FeedbackRefresh) -> Result<TorqueProgress, ArmDriverError> {
@@ -20625,6 +20781,17 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
     }
 
+    fn notify_bus_loss(&mut self) {
+        // Require fresh causal pre-enable CTRL_MODE (and opted-in TIMEOUT) verification across
+        // all motors on the next enable without stripping `verified_modes` / `pos_force_verified`
+        // from active stopped holds while the BusLoss fault is still holding.
+        self.startup_register_check_pending = true;
+        if self.timeout_check_enabled {
+            self.timeout_verified.fill(false);
+            self.observed_timeout_counts.fill(None);
+        }
+    }
+
     fn prepare_safe_hold(&mut self) {
         self.abort_enable();
         // Also clear any abandoned in-flight disable handshake while preserving
@@ -25147,6 +25314,11 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
 
     fn feedback_receive_instants(&self) -> Vec<Option<Instant>> {
         self.last_feedback_instant.clone()
+    }
+
+    fn feedback_receive_instants_into(&self, out: &mut Vec<Option<Instant>>) {
+        out.clear();
+        out.extend_from_slice(&self.last_feedback_instant);
     }
 
     fn feedback_joints_within(&self, joints: &[usize], max_age: Duration) -> bool {

@@ -596,6 +596,15 @@
     "close_speed_rad_s": 0.3,
     "calibrated": false
   },
+  "expected_timeout_counts": [
+    2000,
+    2000,
+    2000,
+    2000,
+    2000,
+    2000,
+    0
+  ],
   "tx_budget_ms": 10,
   "backlash_approach": {
     "enabled": true,
