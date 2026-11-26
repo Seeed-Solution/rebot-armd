@@ -112,6 +112,7 @@ impl RevocationScope {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionAuthority {
+    pub baseline: super::authority::AuthorityBaseline,
     pub connection_id: u64,
     pub lease_generation: u64,
     pub epoch: u64,
@@ -289,6 +290,7 @@ pub enum PhaseStepOutcome {
 pub struct ReleaseCtx {
     pub arm: ArmId,
     pub boot: BootId,
+    pub owner_generation: u64,
     pub now: Instant,
     pub release_deadline: Instant,
     pub base_tx_cutoff: Instant,
@@ -602,6 +604,12 @@ impl SessionDriver {
         if ctx.safe_hold_active { return Err(SessionTerminalReason::Revoked("SAFE_HOLD")); }
         if ctx.internal_fault_fenced { return Err(SessionTerminalReason::Revoked("INTERNAL_FAULT")); }
         let auth = active.authority;
+        if ctx.owner_generation != 0
+            && auth.baseline.owner_generation != 0
+            && ctx.owner_generation != auth.baseline.owner_generation
+        {
+            return Err(SessionTerminalReason::Revoked("OWNER_CHANGED"));
+        }
         if auth.revoke_on_epoch_change && (ctx.estop_latched || ctx.epoch != auth.epoch) {
             return Err(SessionTerminalReason::Revoked("EPOCH_MISMATCH"));
         }
@@ -866,6 +874,7 @@ impl SupervisorInner {
             self.operator_auth_enforced || prepared.operator_required
         };
         let authority = SessionAuthority {
+            baseline: self.capture_baseline(),
             connection_id: if prepared.slot == SessionSlot::Recorder { 0 } else { stamp.connection_id },
             lease_generation: if prepared.require_lease { stamp.lease_gen } else { 0 },
             epoch: stamp.estop_epoch,
@@ -953,6 +962,7 @@ impl SupervisorInner {
         ReleaseCtx {
             arm: ctx.arm,
             boot: ctx.boot,
+            owner_generation: self.owner_generation(),
             now: ctx.now,
             release_deadline,
             base_tx_cutoff,
@@ -990,6 +1000,7 @@ impl SupervisorInner {
         let ctx = ReleaseCtx {
             arm: self.core.id(),
             boot: BootId::process(),
+            owner_generation: self.owner_generation(),
             now,
             release_deadline: base_tx_cutoff,
             base_tx_cutoff,
@@ -1289,6 +1300,7 @@ impl SupervisorInner {
         }
         let prepared = PreparedSession::recorder(ClientId(0));
         let authority = SessionAuthority {
+            baseline: self.capture_baseline(),
             connection_id: 0,
             lease_generation: 0,
             epoch: self.safety.epoch_id(),

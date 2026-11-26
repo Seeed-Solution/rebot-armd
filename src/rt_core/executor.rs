@@ -10674,6 +10674,7 @@ fn control_thread_main_inner(
         core.attach_closed_bitset(closed_bitset_init);
         let staged_prep_env = Arc::new(super::requests::actions::ActionPrepEnv::from_inner(core));
         core.rt_executor_owned = true;
+        core.advance_owner_generation();
         core.before_publish_hook = hooks.before_publish.clone();
         core.safety.set_off_thread_reclaim(true);
         core.prewarm_rt_buffers();

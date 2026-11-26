@@ -53,6 +53,8 @@ pub mod ops;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod requests;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod authority;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod session;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod stream;

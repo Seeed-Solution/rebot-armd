@@ -84,6 +84,7 @@ fn make_release_ctx(now: Instant, epoch: u64, stop_gen: u64) -> ReleaseCtx {
     ReleaseCtx {
         arm: ArmId::LOCAL,
         boot: BootId::process(),
+        owner_generation: 1,
         now,
         release_deadline: now + Duration::from_millis(20),
         base_tx_cutoff: now + Duration::from_millis(16),

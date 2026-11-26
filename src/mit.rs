@@ -3314,6 +3314,7 @@ impl crate::supervisor::SupervisorInner {
         prepared.revoke_on_stop = true;
         prepared.escalate_safe_hold_on_uncertain = true;
         let session_auth = SessionAuthority {
+            baseline: self.capture_baseline(),
             connection_id: req.authority.conn_id,
             lease_generation: req.authority.lease_holder.map_or(0, |(_, gen)| gen),
             epoch: req.authority.expected_epoch,
