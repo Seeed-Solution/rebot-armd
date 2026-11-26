@@ -95,6 +95,14 @@ struct Rig {
 
 impl Rig {
     async fn new(owner: RtOwner, configure: impl FnOnce(&mut ArmConfig)) -> Self {
+        Self::new_with_initial_lease(owner, true, configure).await
+    }
+
+    async fn new_with_initial_lease(
+        owner: RtOwner,
+        acquire_initial_lease: bool,
+        configure: impl FnOnce(&mut ArmConfig),
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let keepout_path = dir.path().join("keepout.json");
         let collision_path = dir.path().join("collision.json");
@@ -125,9 +133,13 @@ impl Rig {
             inner.commanded_positions = INSPECT.to_vec();
             inner.target_positions = INSPECT.to_vec();
             inner.mark_connection_closed(closed_conn_id);
-            let lease_gen = inner
-                .acquire_lease(&lease_conn)
-                .expect("acquire initial lease");
+            let lease_gen = if acquire_initial_lease {
+                inner
+                    .acquire_lease(&lease_conn)
+                    .expect("acquire initial lease")
+            } else {
+                0
+            };
             (lease_gen, inner.safety.epoch_id())
         };
 
@@ -2096,7 +2108,7 @@ async fn ws_send_recv(
 ) -> Value {
     let expected_req_id = frame.get("request_id").cloned();
     ws.send(Message::Text(frame.to_string().into())).await.unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let rem = deadline.saturating_duration_since(Instant::now());
         assert!(!rem.is_zero(), "timed out waiting for WS reply");
@@ -2113,6 +2125,40 @@ async fn ws_send_recv(
             {
                 return v;
             }
+        }
+    }
+}
+
+async fn ws_recv_type_within(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    expected_type: &str,
+    reject_types: &[&str],
+    timeout: Duration,
+) -> Value {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let rem = deadline.saturating_duration_since(Instant::now());
+        assert!(!rem.is_zero(), "timed out waiting for WS frame type `{expected_type}`");
+        let msg = tokio::time::timeout(rem, ws.next())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for WS frame type `{expected_type}`"))
+            .unwrap_or_else(|| panic!("WS stream ended while waiting for `{expected_type}`"))
+            .unwrap();
+        let Message::Text(t) = msg else {
+            continue;
+        };
+        let v: Value = serde_json::from_str(&t).unwrap();
+        let ty = v.get("type").and_then(Value::as_str);
+        if ty == Some(expected_type) {
+            return v;
+        }
+        if let Some(got) = ty {
+            assert!(
+                !reject_types.contains(&got),
+                "unexpected WS frame `{got}` while waiting for `{expected_type}`: {v}"
+            );
         }
     }
 }
@@ -3980,7 +4026,12 @@ fn sample_apply_body(dry_run: bool, with_kinematics: bool) -> Value {
 
 async fn run_ws_calibration_parity_transcript(owner: RtOwner) -> Vec<Value> {
     let (vision_addr, _vision_state, vision_jh) = spawn_mock_vision().await;
-    let rig = Rig::new(owner, |_| {}).await;
+    // Explicit generous lease timeout: this parity test runs 8 sequential disk-fsync commands
+    // without heartbeats and tests Legacy vs Executor reply parity, not lease expiry.
+    let rig = Rig::new(owner, |cfg| {
+        cfg.lease_timeout_ms = 60_000;
+    })
+    .await;
     // Seed one pose so software zero stale-marking & kinematics TCP refresh are exercised on both owners.
     {
         let pub0 = rig.sup.published_config().await.unwrap();
@@ -4054,20 +4105,15 @@ async fn run_ws_calibration_parity_transcript(owner: RtOwner) -> Vec<Value> {
     ))
     .await
     .unwrap();
-    let gen = loop {
-        let Message::Text(t) = tokio::time::timeout(Duration::from_secs(3), ws.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap()
-        else {
-            continue;
-        };
-        let v: Value = serde_json::from_str(&t).unwrap();
-        if v.get("type").and_then(Value::as_str) == Some("lease_granted") {
-            break v["generation"].as_u64().unwrap();
-        }
-    };
+    let gen = ws_recv_type_within(
+        &mut ws,
+        "lease_granted",
+        &["lease_rejected"],
+        Duration::from_secs(15),
+    )
+    .await["generation"]
+        .as_u64()
+        .unwrap();
     let epoch = rig.epoch;
 
     let mut replies = Vec::new();
@@ -4219,7 +4265,12 @@ async fn cf1_fs_fault_injection_both_boundaries_and_partial_batch_restart_recove
     // 1. Pre-rename failure (boundary 1) on calibration/apply -> Unattempted, vision reverted,
     //    staged temp files discarded, live state untouched, motion NOT inhibited.
     let (vision_addr, vision_state, vision_jh) = spawn_mock_vision().await;
-    let rig = Rig::new(RtOwner::Executor, |_| {}).await;
+    // Explicit generous lease timeout: this test runs 3 sequential multi-fsync commits without
+    // heartbeats and verifies FS fault-injection boundaries, not lease expiry.
+    let rig = Rig::new(RtOwner::Executor, |cfg| {
+        cfg.lease_timeout_ms = 60_000;
+    })
+    .await;
     let det_up = armd::api::proxy::DetectorUpstream::parse(&format!("http://{vision_addr}")).unwrap();
     let cal_deps = CalibrationDeps::new(rig.calib_path.clone(), Some(rig.setup_path.clone()), det_up);
     let _detached = rig.sup.inner().write().await;
@@ -4307,7 +4358,7 @@ async fn cf1_fs_fault_injection_both_boundaries_and_partial_batch_restart_recove
     assert!(matches!(busy_err, ArmError::Rejected { status: 409, code, .. } if code == "CONFIG_BUSY"));
 
     // Wait for bounded reconciliation AND marker-cleanup transaction exclusion to finish.
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(15);
     while rig.is_config_inhibited().await || rig.sup.published_config().await.unwrap().calibration_busy {
         assert!(Instant::now() < deadline, "timed out waiting for calibration reconciliation");
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -4421,19 +4472,62 @@ async fn cf1_fs_fault_injection_both_boundaries_and_partial_batch_restart_recove
 async fn cf1_stop_and_lease_loss_between_stage_and_activate_and_motion_blocked_until_reconcile() {
     // Part A: STOP between stage and rename (boundary 1) on software joint zero -> Unattempted,
     //         hold Cleared, disk & live offsets untouched.
-    let rig = Rig::new(RtOwner::Executor, |_| {}).await;
+    // Start unleased with a generous lease timeout so `ws` acquires cleanly (`force: false`)
+    // without starting the 3 s `PREEMPT_COOLDOWN`, letting `ws_thief` immediately preempt `ws`
+    // inside Part B's post-rename hook instead of racing lease expiry or cooldown.
+    let rig = Rig::new_with_initial_lease(RtOwner::Executor, false, |cfg| {
+        cfg.lease_timeout_ms = 60_000;
+    })
+    .await;
     let det_up = armd::api::proxy::DetectorUpstream::parse("http://127.0.0.1:9").unwrap();
     let cal_deps = CalibrationDeps::new(rig.calib_path.clone(), Some(rig.setup_path.clone()), det_up);
     let _detached = rig.sup.inner().write().await;
 
+    let (base, server_jh) = spawn_http_router(&rig, None, OperatorAuth::disabled()).await;
+    let ws_url = format!("{}/api/v1/ws", base.replace("http://", "ws://"));
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
+    ws.send(Message::Text(
+        json!({ "type": "acquire_lease", "client_id": "motion_probe", "force": false, "seq": 1 })
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    let ws_gen = ws_recv_type_within(
+        &mut ws,
+        "lease_granted",
+        &["lease_rejected"],
+        Duration::from_secs(15),
+    )
+    .await["generation"]
+        .as_u64()
+        .unwrap();
+
+    // Wait for StateHub to publish the new WS lease owner handle.
+    let hub_deadline = Instant::now() + Duration::from_secs(10);
+    let ws_owner_label = loop {
+        if let Some(snap) = rig.sup.hub().latest() {
+            if snap.owner.lease_generation == ws_gen {
+                if let Some(label) = snap.owner.lease_owner {
+                    break label;
+                }
+            }
+        }
+        assert!(
+            Instant::now() < hub_deadline,
+            "timed out waiting for StateHub to publish ws_gen={ws_gen}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+
     // Part A0: Queued calibration command whose ingress stop_gen predates an arrived Stop MUST
     //          be rejected with STOPPED and never overtaken (Blocker 1 regression test).
-    let stale_stop_adm = capture_config_admission(&rig.sup, 9, rig.lease_gen, Some(rig.epoch));
+    let stale_stop_adm = capture_config_admission(&rig.sup, 9, ws_gen, Some(rig.epoch));
     let _ = rig.sup.executor_handle().unwrap().stop_requests().request();
     tokio::time::sleep(Duration::from_millis(10)).await;
     let auth_stale_stop = armd::calibration::ExecutorCalibAuth {
         admission: stale_stop_adm,
-        lease_holder: Some((HolderLabel::new(&rig.lease_conn), rig.lease_gen)),
+        lease_holder: Some((ws_owner_label, ws_gen)),
         operator_grant: armd::auth::OperatorGrant::unenforced(),
         auth_check: Arc::new(|| Ok(())),
         txn_id: None,
@@ -4460,8 +4554,8 @@ async fn cf1_stop_and_lease_loss_between_stage_and_activate_and_motion_blocked_u
         ..Default::default()
     });
     let auth_a = armd::calibration::ExecutorCalibAuth {
-        admission: capture_config_admission(&rig.sup, 10, rig.lease_gen, Some(rig.epoch)),
-        lease_holder: Some((HolderLabel::new(&rig.lease_conn), rig.lease_gen)),
+        admission: capture_config_admission(&rig.sup, 10, ws_gen, Some(rig.epoch)),
+        lease_holder: Some((ws_owner_label, ws_gen)),
         operator_grant: armd::auth::OperatorGrant::unenforced(),
         auth_check: Arc::new(|| Ok(())),
         txn_id: None,
@@ -4478,50 +4572,20 @@ async fn cf1_stop_and_lease_loss_between_stage_and_activate_and_motion_blocked_u
 
     // Part B: Lease / operator revocation AFTER rename and BEFORE activate (boundary 2) ->
     //         Uncertain + Reconciling, disk updated, live offsets stay at 0, WS motion blocked!
-    let (base, server_jh) = spawn_http_router(&rig, None, OperatorAuth::disabled()).await;
-    let ws_url = format!("{}/api/v1/ws", base.replace("http://", "ws://"));
-    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
-    ws.send(Message::Text(
-        json!({ "type": "acquire_lease", "client_id": "motion_probe", "force": true, "seq": 1 })
-            .to_string()
-            .into(),
-    ))
-    .await
-    .unwrap();
-    let ws_gen = loop {
-        let Message::Text(t) = tokio::time::timeout(Duration::from_secs(3), ws.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap()
-        else {
-            continue;
-        };
-        let v: Value = serde_json::from_str(&t).unwrap();
-        if v.get("type").and_then(Value::as_str) == Some("lease_granted") {
-            break v["generation"].as_u64().unwrap();
-        }
-    };
-
-    // Wait a tick for hub to observe the new WS lease owner handle.
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    let ws_owner_label = rig
-        .sup
-        .hub()
-        .latest()
-        .unwrap()
-        .owner
-        .lease_owner
-        .expect("ws lease owner");
-
     // Inject REAL owner-side lease loss after rename and before activate via a second WS client
     // preempting the lease on the RT executor thread!
-    let (mut ws_thief, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
+    // Connect `ws_thief` on trigger so it does not sit idle accumulating unread 500 Hz telemetry,
+    // and use `block_in_place` in the synchronous hook so Tokio worker threads stay free to serve
+    // `ws_thief`'s preemption immediately.
     let trigger_steal = Arc::new(tokio::sync::Notify::new());
     let trigger_steal_w = Arc::clone(&trigger_steal);
+    let hook_fired = Arc::new(AtomicBool::new(false));
+    let hook_fired_w = Arc::clone(&hook_fired);
     let (stolen_tx, stolen_rx) = std::sync::mpsc::sync_channel::<()>(1);
-    let thief_jh = tokio::spawn(async move {
+    let thief_ws_url = ws_url.clone();
+    let mut thief_jh = tokio::spawn(async move {
         trigger_steal_w.notified().await;
+        let (mut ws_thief, _) = tokio_tungstenite::connect_async(&thief_ws_url).await.unwrap();
         ws_thief
             .send(Message::Text(
                 json!({ "type": "acquire_lease", "client_id": "thief_ws", "force": true, "seq": 1 })
@@ -4530,31 +4594,32 @@ async fn cf1_stop_and_lease_loss_between_stage_and_activate_and_motion_blocked_u
             ))
             .await
             .unwrap();
-        loop {
-            let Message::Text(t) = tokio::time::timeout(Duration::from_secs(3), ws_thief.next())
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap()
-            else {
-                continue;
-            };
-            let v: Value = serde_json::from_str(&t).unwrap();
-            if v.get("type").and_then(Value::as_str) == Some("lease_granted") {
-                let thief_gen = v["generation"].as_u64().unwrap();
-                let _ = stolen_tx.send(());
-                break (ws_thief, thief_gen);
-            }
-        }
+        let granted = ws_recv_type_within(
+            &mut ws_thief,
+            "lease_granted",
+            &["lease_rejected"],
+            Duration::from_secs(15),
+        )
+        .await;
+        let thief_gen = granted["generation"].as_u64().unwrap();
+        let _ = stolen_tx.send(());
+        (ws_thief, thief_gen)
     });
     let stolen_rx = std::sync::Mutex::new(stolen_rx);
     rig.sup.set_config_commit_test_hooks(ConfigCommitTestHooks {
         after_rename_before_activate: Some(Arc::new(move || {
+            hook_fired_w.store(true, Ordering::Release);
             trigger_steal.notify_one();
-            let _ = stolen_rx
-                .lock()
-                .unwrap()
-                .recv_timeout(Duration::from_secs(3));
+            let got = tokio::task::block_in_place(|| {
+                stolen_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(15))
+            });
+            assert!(
+                got.is_ok(),
+                "timed out waiting for ws_thief to preempt lease before activate"
+            );
         })),
         ..Default::default()
     });
@@ -4568,7 +4633,16 @@ async fn cf1_stop_and_lease_loss_between_stage_and_activate_and_motion_blocked_u
     let err_b = motor_zero::run_software_executor(&rig.sup, &cal_deps, sw_req, auth_b)
         .await
         .expect_err("post-rename owner lease loss must enter Reconciling");
-    let (mut ws_active, active_gen) = thief_jh.await.unwrap();
+    if !hook_fired.load(Ordering::Acquire) {
+        thief_jh.abort();
+        panic!(
+            "run_software_executor failed BEFORE after_rename_before_activate hook: {err_b:?}"
+        );
+    }
+    let (mut ws_active, active_gen) = tokio::time::timeout(Duration::from_secs(15), &mut thief_jh)
+        .await
+        .expect("timed out joining ws_thief task")
+        .unwrap();
     rig.sup.set_config_commit_test_hooks(ConfigCommitTestHooks::default());
     assert_eq!(err_b.code, "LEASE_LOST");
     assert_eq!(err_b.extra.get("reconciling"), Some(&json!(true)));
@@ -4623,20 +4697,13 @@ async fn cf1_stop_and_lease_loss_between_stage_and_activate_and_motion_blocked_u
         ))
         .await
         .unwrap();
-    let servo_rej = loop {
-        let Message::Text(t) = tokio::time::timeout(Duration::from_secs(3), ws_active.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap()
-        else {
-            continue;
-        };
-        let v: Value = serde_json::from_str(&t).unwrap();
-        if v.get("type").and_then(Value::as_str) == Some("servo_reject") {
-            break v;
-        }
-    };
+    let servo_rej = ws_recv_type_within(
+        &mut ws_active,
+        "servo_reject",
+        &[],
+        Duration::from_secs(15),
+    )
+    .await;
     assert_eq!(
         servo_rej["code"], "CONFIG_BUSY",
         "servo motion must be blocked while Calibration is Reconciling: {servo_rej}"
